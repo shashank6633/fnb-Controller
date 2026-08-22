@@ -6,6 +6,7 @@ import {
   collectRecordedMoves, assertNoNegativeStock, reverseGrnMovement,
   amendGrnLines, raisePoDeviationAlert, type AmendLineInput,
 } from '@/lib/grn-reversal';
+import { planPoReceiptVoid, applyPoReceiptVoid, type PoVoidPlan, type PoVoidOutcome } from '@/lib/po-void';
 
 /**
  * AMEND and VOID one inward entry (GRN).
@@ -32,27 +33,42 @@ import {
  * and material_return_items.grn_item_id point at these rows, PRAGMA foreign_keys
  * is ON, and goods_receipt_note_items cascades from the header.
  *
- * ── SCOPE LIMIT, STATED PLAINLY: AD-HOC GRNs ONLY ─────────────────────────
- * A PO-sourced GRN (po_id NOT NULL) is REFUSED, and this is a real limitation,
- * not an oversight. Reversing one needs four things this route cannot do
- * honestly on its own:
- *   1. `receivedPoItemIds()` in api/purchase-orders/[id]/receive/route.ts derives
- *      "which PO lines are already received" from goods_receipt_note_items alone,
- *      with no status filter. Keep a voided GRN's item rows (and we must — they
- *      are the bill) and that PO can NEVER be re-received. The same derivation is
- *      repeated in four places in api/purchase-orders/route.ts and once in
- *      .../[id]/edit-approved/route.ts; all six need `AND g.status <> 'void'`
- *      before a PO GRN can be voided, and all six live in files this change does
- *      not own.
- *   2. po_vendor_bills carries no grn_id — its only tie to the GRN is the
- *      sentence in `notes` — and its UNIQUE(po_id, vendor_name, bill_no) means a
- *      surviving row blocks re-receiving the same bill for ever.
- *   3. purchase_orders would have to be reopened (status, received_at,
- *      total_cost back to the ORDERED total, grn_id back to a surviving GRN).
- *   4. A PO that completed a requisition — especially purpose='party', which
- *      DEDUCTS stock a second time at receive — would need a second reversal on
- *      a different rail with its own negative-balance guard.
- * Refusing is reversible; a stray stock credit is not.
+ * ── A PO-SOURCED RECEIPT IS VOIDABLE NOW, AND WHAT THAT TOOK ──────────────
+ * It used to be refused outright, for four reasons this file stated honestly.
+ * All four are solved; the refusal is gone and the reasons are recorded here
+ * because each one is still the thing that would break if its fix were undone:
+ *
+ *   1. "WHICH PO LINES ARE ALREADY RECEIVED" was derived from
+ *      goods_receipt_note_items ALONE, with no status filter, in SIX places
+ *      across three files (nine, in seven spellings, once counted properly). A
+ *      voided GRN keeps its item rows — it must, they ARE the bill — so every
+ *      one of them said a voided receipt still claimed its line, and that PO
+ *      could never be received again. All of them now come through
+ *      src/lib/po-receipts.ts, the ONE place that states the rule, which is
+ *      void-aware BY CONSTRUCTION: it hands out the JOIN, not a condition, so a
+ *      seventh copy cannot be written without the filter. It filters 'void'
+ *      only — a receipt HELD for a kitchen quality check HAS claimed its line.
+ *   2. po_vendor_bills NOW CARRIES grn_id (db.ts, guarded + backfilled from the
+ *      sentence where it identifies exactly one receipt). Its
+ *      UNIQUE(po_id, vendor_name, bill_no) is the duplicate-bill guard, so the
+ *      void RELEASES that row — otherwise the reopened PO could never take in
+ *      the very bill it is waiting for, and since the store re-receiving the
+ *      same delivery types the SAME bill number, that is the normal case.
+ *   3. purchase_orders IS REOPENED — status, received_at, total_cost back to the
+ *      ORDERED total, grn_id to a surviving GRN. src/lib/po-void.ts.
+ *   4. THE REQUISITION CASCADE IS REVERSED, including the purpose='party'
+ *      branch that deducts stock a second time, by the inverse that lives beside
+ *      the forward (src/lib/po-requisition-fulfil.ts) and only where two
+ *      independent discriminators prove that rail wrote the rows. Its credit is
+ *      fed into the SAME negative-stock guard as the receipt's debit, as the
+ *      `replacement` term, so the guard tests the NET of the two rather than
+ *      refusing a void whose two halves cancel out.
+ *
+ * WHAT IS STILL REFUSED, and every one of these is deliberate: a LATER live
+ * receipt on the same PO (void newest first); a vendor bill row that cannot be
+ * uniquely identified; a requisition whose party deduction cannot be attributed
+ * to this cascade; and stock that has already been consumed. Refusing is
+ * reversible; a stray stock credit is not.
  *
  * ── THE WEIGHTED AVERAGE: WHAT THIS DOES, AND WHAT IT CANNOT DO ───────────
  * The reversal DELETES the `purchases` rows this GRN wrote (snapshotted into the
@@ -140,6 +156,44 @@ function poVendorBillsFor(db: ReturnType<typeof getDb>, poId: string, grnNumber:
     // the caller turns into a refusal — never into a silent skip.
     return [];
   }
+}
+
+/** One sentence per PO rail the void touched, for the audit note and the
+ *  admin's on-screen notice. Says what happened rather than that something did:
+ *  "reversed 0 material(s)" on a held receipt already reads as a silent failure,
+ *  and "the PO is open again" is the fact the storekeeper needs before they can
+ *  re-receive the delivery. */
+function poVoidNote(po: PoVoidOutcome): string {
+  const bits: string[] = [];
+  if (po.po_reopened) {
+    bits.push(`${po.po_number} is open again for receiving (total back to the ordered ₹${po.po_total_cost}).`);
+  } else if (po.po_status === 'approved') {
+    // Never closed by this receipt in the first place — a part-delivered order.
+    // Saying "stays approved — another receipt still covers every line" here
+    // would be describing a completion that never happened.
+    bits.push(`${po.po_number} was already open for receiving and stays that way; its ordered total is unchanged.`);
+  } else if (!po.po_total_restamped) {
+    bits.push(`${po.po_number} stays ${po.po_status} — a surviving receipt still covers every line this bill did. Its received total was left at ₹${po.po_total_cost} because another delivery on the order is still waiting for a quality check; it is re-derived when that one is signed off.`);
+  } else {
+    bits.push(`${po.po_number} stays ${po.po_status} — a surviving receipt still covers every line this bill did (received total re-derived to ₹${po.po_total_cost}).`);
+  }
+  if (po.bill_released) {
+    bits.push(po.bill_released.bill_no
+      ? `Bill no. "${po.bill_released.bill_no}" from ${po.bill_released.vendor_name || '(no vendor)'} was released and can be received again.`
+      : `The blank-bill receipt from ${po.bill_released.vendor_name || '(no vendor)'} was released, so that vendor can deliver against this order again.`);
+  } else {
+    bits.push(`No vendor bill row was recorded for this receipt, so there was none to release.`);
+  }
+  if (po.requisition?.unfulfilled) {
+    if (po.requisition.party_rows_deleted) {
+      bits.push(`Requisition returned to the store queue and ${po.requisition.party_rows_deleted} party-consumption movement(s) were reversed, crediting ${po.requisition.stock_restored.length} material(s) back.`);
+    } else if (po.requisition.party_rows_left_intact) {
+      bits.push(`Requisition returned to the store queue. Its ${po.requisition.party_rows_left_intact} party-consumption movement(s) were booked by a store issue rather than by this order, so they were left exactly as they are and no stock was credited back.`);
+    } else {
+      bits.push(`Requisition returned to the store queue; no party consumption had been booked.`);
+    }
+  }
+  return ` ${bits.join(' ')}`;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -782,7 +836,42 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ id
  *   404  no such GRN.
  *   409  already voided. The claim's WHERE matches nothing on a replay, so a
  *        second call reverses NOTHING — this is the idempotency guarantee.
- *   409  PO-sourced GRN (po_id NOT NULL). See the file header, reason (1)-(4).
+ *
+ *   ── PO-SOURCED RECEIPTS ONLY (po_id NOT NULL). Every one of these is raised
+ *      by src/lib/po-void.ts BEFORE any quantity moves, and each carries a
+ *      machine-readable `code` so the modal can offer the right next step.
+ *      CHECKED AFTER the bill-level refusals below, on purpose: those describe
+ *      walls this bill can never get past, these describe walls that clear.
+ *   409  po_missing — the purchase order row is gone. The order cannot be
+ *        reopened, so the goods would be reversed against nothing.
+ *   409  po_status_unexpected — the order is neither 'approved' nor 'received'.
+ *        Those are the only two states that can carry a receipt; anything else
+ *        means something this route does not understand has moved it.
+ *   409  po_later_receipt — a live receipt KEYED AFTER this one still stands on
+ *        the order. A PO cannot be received once closed, so an earlier bill is by
+ *        definition not the one that closed it, and reopening would erase a
+ *        completion date and a received total that the later bill stamped. Void
+ *        newest first. "Later" is by created_at, never by the typed receipt date
+ *        — backdating is ordinary and would otherwise let the wrong one through.
+ *   409  po_bill_ambiguous / po_bill_unidentifiable / po_bill_unreadable — the
+ *        po_vendor_bills row this receipt wrote cannot be pinned to exactly one
+ *        row. That row is the UNIQUE(po_id, vendor_name, bill_no) duplicate-bill
+ *        guard: release the wrong one and a DIFFERENT bill can be received
+ *        twice; release none and the reopened order can never take its own bill.
+ *   409  requisition_missing / requisition_moved_on — the requisition this order
+ *        fulfilled is gone, or has since moved on from 'fulfilled'. Undoing it
+ *        would overwrite whatever moved it.
+ *   409  party_unattributable / party_two_rails / party_row_shape /
+ *        party_material_missing / party_provenance_unreadable — the party
+ *        deduction on that requisition cannot be proved to be this cascade's.
+ *        TWO writers produce an identically shaped party_consumption row on the
+ *        same reference_id (this cascade and applyPartyFulfillment), and nothing
+ *        on the row says which. Crediting back the wrong one invents stock.
+ *        NOT raised where the cascade's own audit trail proves it SKIPPED its
+ *        deduction: there the void succeeds, demotes the requisition and leaves
+ *        the other rail's movements untouched — the reversal is exactly as wide
+ *        as the action was.
+ *
  *   409  the receipt is dated ON OR BEFORE a committed central-store cutover.
  *        The cutover RE-BASED current_stock to a physical count that already
  *        absorbs this receipt, and variance-report floors purchases_to_date at
@@ -802,9 +891,13 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ id
  *        lines. A destructive reversal does not fall back to matching on prose.
  *   409  a linked `purchases` row has no inventory_transactions movement behind
  *        it — the quantity that actually moved is unknown for that row.
- *   409  reversing would drive a material's current_stock below zero. REFUSED,
- *        NEVER CLAMPED (src/lib/return-stock.ts states the rule): a clamp would
- *        commit a void claiming to have reversed more than really moved.
+ *   409  would_go_negative — reversing would drive a material's current_stock
+ *        below zero, i.e. the goods have already been consumed or issued.
+ *        REFUSED, NEVER CLAMPED (src/lib/return-stock.ts states the rule): a
+ *        clamp would commit a void claiming to have reversed more than really
+ *        moved. On a PO receipt that also reverses a party requisition the test
+ *        is the NET of this reversal's debit and that cascade's credit, so a
+ *        void whose two halves cancel out is not refused for the sake of it.
  *
  * WHAT IT REVERSES BY: the RECORDED inventory_transactions.quantity, never a
  * recomputed accepted × pack_size. pack_size is mutable (that is why the
@@ -844,6 +937,12 @@ export async function DELETE(request: Request, { params }: { params: Promise<{ i
       last_purchase_kept: { material_id: string; material_name: string }[];
     } = { materials: [], purchases_deleted: 0, transactions_deleted: 0, average_price_stale: [], last_purchase_stale: [], last_purchase_kept: [] };
 
+    // The PO rails: planned inside the transaction (step 2), written at step 5b,
+    // reported afterwards. Stays null on an ad-hoc GRN, and every branch that
+    // reads it below is guarded on that — the ad-hoc path is byte-unchanged.
+    let poVoid: PoVoidPlan | null = null;
+    let poResult: PoVoidOutcome | null = null;
+
     const txn = db.transaction(() => {
       // ── 1. CLAIM FIRST. Takes the write lock AND is the replay guard: a
       //       second void matches zero rows and the throw below rolls back
@@ -860,11 +959,18 @@ export async function DELETE(request: Request, { params }: { params: Promise<{ i
       }
 
       // ── 2. REFUSALS. Every one of these throws, which rolls the claim back.
-      if (grn.po_id) {
-        throw new GrnRefused(409,
-          `${grn.grn_number} was received against a purchase order and cannot be voided here. Reversing it would also have to reopen the PO, remove its vendor bill row and unblock its received lines — and a voided GRN whose lines are kept would permanently block re-receiving that PO. Raise a vendor return for the goods, or book a back-correction GRN.`);
-      }
-
+      //
+      // THE ORDER OF THE CHECKS IS THE ORDER THE ADMIN NEEDS TO HEAR THEM IN.
+      // The four below — cutover, returns, cost-row identity, orphan cost row —
+      // are properties of THIS BILL, and three of them make it permanently
+      // unvoidable. The PO rails are properties of the ORDER AROUND IT, and
+      // every one of those is clearable (void the later receipt; fix the bill
+      // row; settle the requisition). Planning the PO rails first meant a bill
+      // that could never be voided because of a settled return was reported as
+      // `po_bill_unidentifiable`, and the admin was sent to fix a bill row that
+      // was not the problem. Nothing writes in either order — every refusal
+      // rolls the claim back — so this costs nothing and is only about telling
+      // the truth about which wall was hit.
       if (cutoverDate && String(grn.date) <= String(cutoverDate)) {
         throw new GrnRefused(409,
           `${grn.grn_number} is dated ${grn.date}, on or before the central-store cutover (${cutoverDate}). The cutover re-based on-hand stock to a physical count that already includes this receipt, so reversing it now would debit the same goods twice. Correct it with a stock adjustment instead.`);
@@ -935,6 +1041,18 @@ export async function DELETE(request: Request, { params }: { params: Promise<{ i
           `${orphanCost} cost row(s) on ${grn.grn_number} have no stock movement behind them, so the quantity that actually entered stock is unknown for them. A reversal that guessed the quantity would be a fabricated adjustment.`);
       }
 
+      // ── THE PO RAILS ARE PLANNED HERE AND WRITTEN AT STEP 5b — NO WRITES YET.
+      // Deliberately AFTER THE CLAIM, so every ledger read inside it already
+      // excludes this receipt (po-receipts.ts filters 'void' by construction)
+      // and therefore measures the state the void is about to LEAVE rather than
+      // the one it found — the completion test in particular is a subtraction
+      // that only works that way round. And deliberately AFTER the four checks
+      // above, for the reason stated at the top of this step. Its refusals — a
+      // receipt keyed later, an unidentifiable vendor bill row, an
+      // unattributable party deduction — throw exactly like the ones above and
+      // roll the claim back with them.
+      if (grn.po_id) poVoid = planPoReceiptVoid(db, grn);
+
       // ── 3. THE MOVEMENT SET, from the RECORDED rows. Never recomputed from
       //       accepted × pack_size: pack_size is mutable, so a recompute can
       //       subtract a different number than was added.
@@ -948,11 +1066,26 @@ export async function DELETE(request: Request, { params }: { params: Promise<{ i
       //       runs under the write lock the claim took). Refuse the WHOLE void
       //       if any one material would go under — a partial reversal is exactly
       //       what a single transaction exists to prevent.
-      //       The replacement map is EMPTY here, so every material's `new_in` is
+      //       ── THE REPLACEMENT TERM IS THE PARTY CREDIT, AND ONLY THAT ─────
+      //       On an ad-hoc GRN the map is EMPTY, so every material's `new_in` is
       //       0 and the shared test reduces to exactly the one this handler has
       //       always applied: r6(current_stock − qty) < −EPS. The message and the
       //       `materials: string[]` payload are the ones it has always returned.
-      assertNoNegativeStock(moves, new Map(), {
+      //
+      //       On a PO receipt whose void also reverses a party requisition, the
+      //       two rails move the SAME materials in OPPOSITE directions: this
+      //       reversal DEBITS what the receipt added, and the cascade reversal
+      //       CREDITS back what the party consumed. Guarding the debit alone
+      //       against a balance the party had already drawn down would refuse a
+      //       void whose two halves cancel out exactly — the commonest shape
+      //       there is, since the PO was raised to replenish that very
+      //       requisition. `replacement` is precisely the "what this correction
+      //       puts back" term the shared guard was built around, so the party
+      //       credit goes in there and the test becomes the NET. The credit can
+      //       never drive a balance negative on its own; it only ever makes this
+      //       test kinder, and only by the amount actually recorded.
+      const partyCredit = poVoid?.requisition.credit ?? new Map<string, number>();
+      assertNoNegativeStock(moves, partyCredit, {
         code: 'would_go_negative',
         verb: 'reversed',
         // Message and payload are the void's OWN, verbatim — not the shared
@@ -961,9 +1094,14 @@ export async function DELETE(request: Request, { params }: { params: Promise<{ i
         // richer per-material breakdown the helper can build is deliberately NOT
         // added here, because a caller already rendering this response should not
         // have its payload change shape as a side effect of a refactor.
+        // The party sentence is APPENDED only when there IS a party credit, so
+        // the ad-hoc refusal is character-for-character unchanged.
         build: (blocked) => ({
           message:
-            `Reversing ${grn.grn_number} would drive stock below zero for ${blocked.length} material(s): ${blocked.map(b => b.text).join('; ')}. The goods have already been consumed or issued, so the receipt cannot honestly be un-received. Nothing was changed.`,
+            `Reversing ${grn.grn_number} would drive stock below zero for ${blocked.length} material(s): ${blocked.map(b => b.text).join('; ')}. The goods have already been consumed or issued, so the receipt cannot honestly be un-received. Nothing was changed.`
+            + (partyCredit.size > 0
+              ? ` This already counts the ${blocked.filter(b => b.new_in > 0).length} material(s) the party consumption would credit back.`
+              : ''),
           payload: { materials: blocked.map(b => b.text) },
         }),
       });
@@ -977,7 +1115,19 @@ export async function DELETE(request: Request, { params }: { params: Promise<{ i
       //       RECORDED quantity and re-derives LPP only where this bill owns it.
       //       Read @/lib/grn-reversal for the full reasoning behind each of those
       //       — it is the text that used to live here.
-      const rev = reverseGrnMovement(db, { grnId: id, moves });
+      //
+      //       includeGrossCandidate ON THE PO BRANCH ONLY. last_purchase_price
+      //       holds the GROSS bill rate on a PO receipt (receive/route.ts writes
+      //       `price`, not `netPrice`) while purchases.unit_price is NET of the
+      //       allocated discount, so the narrow ownership test — which compares
+      //       only against the cost row — answers "cannot tell" and leaves the
+      //       column alone. That is a fail-safe, not a correct answer: on a PO
+      //       receipt this bill really does own the rate, and the flag lets the
+      //       proof see the rate its writer actually used, then re-derives on the
+      //       same GROSS basis. The ad-hoc branch stays FALSE so its shipped
+      //       behaviour is byte-unchanged. The line amendment already passes true
+      //       for exactly this case.
+      const rev = reverseGrnMovement(db, { grnId: id, moves, includeGrossCandidate: !!grn.po_id });
       const txnRows = rev.transaction_rows;
       const purchaseRows = rev.purchase_rows;
       const matBefore = rev.material_snapshot;
@@ -986,6 +1136,18 @@ export async function DELETE(request: Request, { params }: { params: Promise<{ i
       result.last_purchase_stale = rev.last_purchase_stale;
       result.last_purchase_kept = rev.last_purchase_kept;
       result.materials = rev.materials;
+
+      // ── 5b. THE THREE PO RAILS THE STOCK REVERSAL CANNOT SEE ─────────────
+      //        Release the vendor bill row (so the reopened order can take the
+      //        SAME bill number in again — the whole point), put the order back
+      //        to 'approved' with its ORDERED total, and reverse the requisition
+      //        fulfilment including the party deduction. Every refusal these
+      //        rails can raise was already raised at step 2, before a quantity
+      //        moved; this call performs, it does not re-litigate.
+      //        src/lib/po-void.ts carries the reasoning for each.
+      if (poVoid) {
+        poResult = applyPoReceiptVoid(db, poVoid, { actorEmail: me.email, grnNumber: String(grn.grn_number) });
+      }
 
       // VERIFIED, NOT BEST-EFFORT — and of the two audit writes in this file
       // this is the one that must not be allowed to fail quietly. before_json
@@ -1009,14 +1171,40 @@ export async function DELETE(request: Request, { params }: { params: Promise<{ i
           materials: matBefore,
           purchases: purchaseRows,
           inventory_transactions: txnRows,
+          // The released po_vendor_bills row and the order's pre-void state.
+          // The bill row is DELETED by step 5b and this is its ONLY copy — the
+          // same reason the purchases rows above are here.
+          ...(poResult ? (poResult as PoVoidOutcome).before : {}),
         },
         after: {
           status: 'void', voided_by: me.email, void_reason: reason,
           purchases_deleted: result.purchases_deleted,
           transactions_deleted: result.transactions_deleted,
           stock_reversed: result.materials,
+          ...(poResult ? {
+            purchase_order: {
+              id: (poResult as PoVoidOutcome).po_id,
+              po_number: (poResult as PoVoidOutcome).po_number,
+              status: (poResult as PoVoidOutcome).po_status,
+              reopened: (poResult as PoVoidOutcome).po_reopened,
+              total_cost: (poResult as PoVoidOutcome).po_total_cost,
+              total_restamped: (poResult as PoVoidOutcome).po_total_restamped,
+              received_at_cleared: (poResult as PoVoidOutcome).received_at_cleared,
+              grn_id: poVoid?.surviving_grn_id ?? null,
+              // The lines this void left with no live claim — the reason the
+              // order did or did not reopen, recorded rather than re-derivable:
+              // a later re-receive gives those lines new claims and the question
+              // can never be asked of the data again.
+              orphaned_po_item_ids: poVoid?.orphaned_po_item_ids ?? [],
+              held_siblings: poVoid?.held_siblings ?? 0,
+            },
+            bill_released: (poResult as PoVoidOutcome).bill_released,
+            bill_matched_by: (poResult as PoVoidOutcome).bill_matched_by,
+            requisition: (poResult as PoVoidOutcome).requisition,
+          } : {}),
         },
-        note: `Voided ${grn.grn_number}${reason ? ` — ${reason}` : ''}. Reversed ${result.materials.length} material(s); deleted ${result.purchases_deleted} cost row(s) and ${result.transactions_deleted} stock movement(s). Header and line items kept.`,
+        note: `Voided ${grn.grn_number}${reason ? ` — ${reason}` : ''}. Reversed ${result.materials.length} material(s); deleted ${result.purchases_deleted} cost row(s) and ${result.transactions_deleted} stock movement(s). Header and line items kept.`
+          + (poResult ? poVoidNote(poResult) : ''),
       }, 'the reversal (this row is the only copy of the deleted cost rows and stock movements)');
     });
     txn();
@@ -1073,6 +1261,7 @@ export async function DELETE(request: Request, { params }: { params: Promise<{ i
     // the read-back of its own row lost a race for the lock.
     let after: any = null;
     try { after = db.prepare('SELECT * FROM goods_receipt_notes WHERE id = ?').get(id) as any; } catch { /* reported below */ }
+    const poNotice = poResult ? poVoidNote(poResult).trim() : '';
     return Response.json({
       success: true,
       voided: true,
@@ -1087,8 +1276,24 @@ export async function DELETE(request: Request, { params }: { params: Promise<{ i
       last_purchase_stale: result.last_purchase_stale,
       last_purchase_kept: result.last_purchase_kept,
       warnings: priceWarnings,
+      // ── THE PO RAILS, ADDITIVE ────────────────────────────────────────────
+      // Absent on an ad-hoc void (poResult is null, so every key below is
+      // undefined and JSON drops it) — the shipped ad-hoc response shape is
+      // byte-unchanged.
+      po_number:      poResult ? (poResult as PoVoidOutcome).po_number : undefined,
+      po_status:      poResult ? (poResult as PoVoidOutcome).po_status : undefined,
+      po_reopened:    poResult ? (poResult as PoVoidOutcome).po_reopened : undefined,
+      po_total_cost:  poResult ? (poResult as PoVoidOutcome).po_total_cost : undefined,
+      po_total_restamped: poResult ? (poResult as PoVoidOutcome).po_total_restamped : undefined,
+      bill_released:  poResult ? (poResult as PoVoidOutcome).bill_released : undefined,
+      requisition_reversed: poResult ? ((poResult as PoVoidOutcome).requisition?.unfulfilled ?? false) : undefined,
+      party_stock_restored: poResult ? ((poResult as PoVoidOutcome).requisition?.stock_restored ?? []) : undefined,
+      /** Party movements another rail booked, deliberately left standing. On the
+       *  wire so the modal can never imply the void examined and reversed them. */
+      party_stock_left_intact: poResult ? ((poResult as PoVoidOutcome).requisition?.party_rows_left_intact ?? 0) : undefined,
       notice: [
         'The bill document is kept — header and line items are unchanged; only the stock and cost rows were reversed.',
+        poNotice,
         // ── A HELD RECEIPT VOIDS TO A CLEAN ZERO, AND THAT IS NOT A FAILURE ──
         // A GRN the kitchen QC gate was still holding never moved stock and
         // never wrote a cost row, so the reversal above legitimately finds
@@ -1113,7 +1318,14 @@ export async function DELETE(request: Request, { params }: { params: Promise<{ i
     });
   } catch (e: any) {
     if (e instanceof GrnRefused) {
-      return Response.json({ error: e.message, refused: true, ...(e.payload || {}) }, { status: e.httpStatus });
+      // `code` is ADDITIVE and appended, never inserted: the refusals raised in
+      // this file have always carried no code, so the key is `undefined` for
+      // them and JSON drops it — the shipped wire shape of every existing
+      // refusal is unchanged. The PO refusals DO carry one, because the void
+      // modal now has to branch (a later-receipt refusal offers "void that one
+      // first"; an unidentifiable bill row offers nothing but a person). PATCH
+      // in this same file already returns `code` for exactly this reason.
+      return Response.json({ error: e.message, refused: true, code: e.code, ...(e.payload || {}) }, { status: e.httpStatus });
     }
     console.error('[grn DELETE/void]', e);
     return Response.json({ error: e?.message || 'Void failed' }, { status: 500 });

@@ -700,21 +700,23 @@ function GrnActions({ g, isAdmin, canAmend, expanded, onToggle, onEdit, onVoid, 
   // null (list not loaded / load failed) and false both hide it. The server
   // gate is requireRole('admin'), which fails closed; this only decides what
   // is worth showing.
-  // A PO-SOURCED GRN CAN NEVER BE VOIDED — the server refuses it outright (a
-  // voided GRN whose lines are kept would permanently block re-receiving that
-  // PO). On the live data that is most of the register, so the control is shown
-  // DISABLED with the reason in its tooltip rather than live: leaving it live
-  // made the admin type a mandatory reason and press "Reverse stock & void"
-  // before finding out, and hiding it entirely would leave them wondering why
-  // this row has no Delete when the next one does. `g.po_id` is already on the
-  // row, so this needs no extra read.
+  //
+  // A PO-SOURCED GRN IS VOIDABLE NOW, AND THIS CONTROL USED TO SAY IT WAS NOT.
+  // It carried `disabled: !!g.po_id` and a tooltip stating the old limitation as
+  // fact. 20 of the 29 bills in this register are PO-sourced, so for most
+  // deliveries the answer to "can an admin undo a receiving mistake" was still
+  // no — the whole server-side capability sat behind a dead button. The server
+  // now reopens the order, releases the vendor bill row and reverses any
+  // requisition cascade (src/lib/po-void.ts); it still REFUSES several shapes,
+  // and every one of those refusals comes back with its own sentence which the
+  // modal prints verbatim. That is the right place for them: they depend on the
+  // state of the ORDER, which this row does not carry.
   if (!isVoid && isAdmin === true) acts.push({
     key: 'void', label: 'Delete',
     title: g.po_id
-      ? `Cannot be deleted: ${g.grn_number} was received against ${g.po_number || 'a purchase order'}. Voiding it would have to reopen the PO and remove its vendor bill row, and its kept lines would block re-receiving. Raise a vendor return, or book a back-correction GRN.`
+      ? `Delete this bill — reverses the stock it added, marks it void, and reopens ${g.po_number || 'the purchase order'} so the delivery can be received again (admin only)`
       : 'Delete this bill — reverses the stock it added and marks it void (admin only)',
     icon: <Trash2 className={sz} />, danger: true, onClick: onVoid,
-    disabled: !!g.po_id,
   });
   acts.push({
     key: 'download', label: 'Download',
@@ -3237,10 +3239,15 @@ function VoidBillModal({ g, onClose, onVoided }: { g: GRN; onClose: () => void; 
         body: { reason: reason.trim() },
       });
       const j = await res.json().catch(() => ({}));
-      // A refusal is the normal, designed outcome for a PO-sourced bill, one
-      // dated before the store cutover, one with returns against it, or one that
-      // would drive stock negative. The server's message names which and why —
-      // show it verbatim rather than replacing it with "Failed".
+      // A refusal is a normal, designed outcome — a bill dated before the store
+      // cutover, one with returns against it, one that would drive stock
+      // negative, or, on a purchase-order bill, a later receipt still standing /
+      // a vendor bill row that cannot be identified / a party deduction that
+      // cannot be traced to this order. The server's message names which and why
+      // and what to do about it — show it VERBATIM rather than replacing it with
+      // "Failed". `j.code` carries the same thing machine-readably and is
+      // deliberately not branched on here: the sentence is already the whole
+      // instruction, and a branch would be a second, drifting copy of it.
       if (!res.ok) { setErr(j?.error || `Could not delete this bill (HTTP ${res.status})`); return; }
       setResult(j);
     } catch (e: any) {
@@ -3259,6 +3266,13 @@ function VoidBillModal({ g, onClose, onVoided }: { g: GRN; onClose: () => void; 
    *  — an admin who believes that corrects it by hand on top of a reversal that
    *  already landed. */
   const postWarnings: string[] = Array.isArray(result?.warnings) ? result.warnings : [];
+  /** The PO rails, present ONLY on a PO-sourced void (the server omits every one
+   *  of these keys on an ad-hoc bill, so this whole panel disappears there).
+   *  Read off `po_number` rather than off `g.po_id`, because what matters here is
+   *  what the SERVER reports it did, not what the row said it was. */
+  const poDone: boolean = !!result?.po_number;
+  const partyBack: any[] = Array.isArray(result?.party_stock_restored) ? result.party_stock_restored : [];
+  const partyKept: number = Number(result?.party_stock_left_intact) || 0;
 
   return (
     <div className="fixed inset-0 z-50 bg-black/40 flex items-start justify-center p-4 overflow-y-auto">
@@ -3286,11 +3300,25 @@ function VoidBillModal({ g, onClose, onVoided }: { g: GRN; onClose: () => void; 
                   <li><b>Stock goes back down.</b> Every material this bill added is debited by the quantity that was actually recorded when it was received.</li>
                   <li><b>Its cost rows are removed</b> and each affected material's weighted average price is re-derived from the purchases that remain — which flows on into recipe costs.</li>
                   <li><b>The bill is kept, not erased.</b> Its header, line items and ₹ figures stay in the register, struck through and stamped with your name and the time. It stops counting towards inward value.</li>
+                  {/* THE THREE PO RAILS. A PO-sourced void does six things, not
+                      three, and this panel's whole job is to be the list of what
+                      is about to happen to live inventory and live cost. Listing
+                      half of them and letting the admin discover the rest from
+                      the result screen is exactly the shape of surprise this
+                      panel exists to prevent. Additive: absent on an ad-hoc
+                      bill, where the panel is exactly as it shipped. */}
+                  {g.po_id && <>
+                    <li><b>{g.po_number || 'The purchase order'} opens again for receiving</b> — unless another receipt on it still covers these lines. Its received date is cleared and its total goes back to what was ordered, so the delivery can be taken in again properly.</li>
+                    <li><b>The vendor bill number is released.</b> The row that stops the same bill being received twice is removed, which is what lets the store re-enter this delivery under the same bill number. It is kept in the audit trail.</li>
+                    <li><b>Any requisition this order fulfilled goes back to the store queue</b> — and for a party requisition, the stock it consumed a second time is credited back, but only where this order is provably what deducted it.</li>
+                  </>}
                 </ul>
                 <div className="pt-1 border-t border-red-200">
-                  It is refused — with nothing changed — if the bill came from a purchase order, belongs to another outlet than the one you are
-                  working in, is dated on or before the central-store cutover, has a return ticket against it, or if reversing it would push
-                  any material's stock below zero.
+                  It is refused — with nothing changed — if the bill belongs to another outlet than the one you are working in, is dated on or
+                  before the central-store cutover, has a return ticket against it, or if reversing it would push any material's stock below zero.
+                  {g.po_id && <> On a purchase-order bill it is also refused if a later receipt on the order is still standing (void that one
+                  first), if its vendor bill row cannot be identified, or if a party deduction on its requisition cannot be traced to this order.
+                  The reason comes back in full — nothing is changed while you read it.</>}
                 </div>
               </div>
 
@@ -3356,6 +3384,47 @@ function VoidBillModal({ g, onClose, onVoided }: { g: GRN; onClose: () => void; 
                   </div>
                 )}
               </div>
+
+              {/* THE PURCHASE ORDER, AFTER. The storekeeper's next question is
+                  "can I book this delivery again now?", and the answer is a fact
+                  the server just decided, not something to infer from a
+                  paragraph. Stated as its own block, above the price warnings,
+                  because it is what somebody is standing at the bay waiting for.
+                  Additive: absent on an ad-hoc void. */}
+              {poDone && (
+                <div className="rounded-lg border border-[#E8D5C4] bg-[#FFF8F0] p-3 text-[#6B5744]">
+                  <div className="font-semibold text-[#2D1B0E] mb-1">{result.po_number}</div>
+                  <div>
+                    {result.po_reopened
+                      ? <><b>Open again for receiving.</b> Its received date is cleared and its total is back to the ordered ₹{Number(result.po_total_cost) || 0}.</>
+                      : result.po_status === 'approved'
+                        ? <><b>Still open for receiving</b> — this bill never closed it. Its ordered total is unchanged.</>
+                        : <><b>Stays {String(result.po_status || 'closed')}</b> — a surviving receipt still covers every line this bill did.{result.po_total_restamped === false
+                            ? ' Its received total was left alone because another delivery on the order is still waiting for a quality check; it is re-derived at sign-off.'
+                            : ` Received total re-derived to ₹${Number(result.po_total_cost) || 0}.`}</>}
+                  </div>
+                  <div className="mt-1">
+                    {result.bill_released
+                      ? (result.bill_released.bill_no
+                          ? <>Bill no. <b>{result.bill_released.bill_no}</b> from {result.bill_released.vendor_name || '(no vendor)'} is released — the same bill number can be entered again.</>
+                          : <>The blank-bill receipt from {result.bill_released.vendor_name || '(no vendor)'} is released, so that vendor can deliver against this order again.</>)
+                      : <>No vendor bill row was recorded for this receipt, so there was none to release.</>}
+                  </div>
+                  {result.requisition_reversed && (
+                    <div className="mt-1">
+                      The requisition behind this order is back in the store queue.{' '}
+                      {partyBack.length > 0
+                        ? <>Its party consumption was reversed and {partyBack.length} material{partyBack.length === 1 ? '' : 's'} credited back: {partyBack.map((m: any) => m.material_name).filter(Boolean).join(', ')}.</>
+                        : partyKept > 0
+                          // NOT "no party consumption was booked" — some was, by
+                          // a store issue. An admin told the wrong one of those
+                          // two corrects stock that was never wrong.
+                          ? <>Its {partyKept} party-consumption movement{partyKept === 1 ? ' was' : 's were'} booked by a store issue rather than by this order, so {partyKept === 1 ? 'it was' : 'they were'} left exactly as {partyKept === 1 ? 'it is' : 'they are'} and no stock was credited back.</>
+                          : <>No party consumption had been booked against it.</>}
+                    </div>
+                  )}
+                </div>
+              )}
 
               {/* THE ONE THING IT COULD NOT PUT BACK. Nothing anywhere stores the
                   pre-receipt weighted average, so when a material has no purchase

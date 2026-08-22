@@ -11,6 +11,7 @@ import {
 import { resolveQcRequirement, undecidedQcCategories, storePreRejectBlock, QC_AWAITING } from '@/lib/grn-qc';
 import { notifyGrnAwaitingQc } from '@/lib/grn-qc-notify';
 import { fulfilRequisitionFromPo } from '@/lib/po-requisition-fulfil';
+import { receivedPoItemIds, poReceiptLines, liveValueSql } from '@/lib/po-receipts';
 
 /* ══════════════════════════════════════════════════════════════════════════
  * ONE PO, MANY VENDORS, ONE BILL EACH.
@@ -29,6 +30,14 @@ import { fulfilRequisitionFromPo } from '@/lib/po-requisition-fulfil';
  * po_item_id under a GRN whose po_id is this PO. That is sound because
  * /api/grn writes po_id = NULL and po_item_id = NULL on every ad-hoc GRN — this
  * route is the only writer of PO-linked GRN lines.
+ *   ...AND A VOIDED GRN NO LONGER CLAIMS ITS LINE. A voided receipt keeps its
+ *   goods_receipt_note_items rows — it must, they ARE the bill — so an
+ *   unfiltered ledger would leave the PO unreceivable for ever. The derivation
+ *   now lives in src/lib/po-receipts.ts (receivedPoItemIds), the ONE place that
+ *   states it, and it filters status = 'void'. It does NOT filter
+ *   'awaiting_qc': a GRN held for a kitchen quality check HAS claimed its line
+ *   (the goods and the bill exist; only the stock move is deferred), and
+ *   un-claiming it would let the same delivery be received a second time.
  *
  * THE STATUS RULE (exactly, and it is the whole of it):
  *   A PO leaves 'approved' for 'received' only when EVERY RECEIVABLE line of
@@ -56,16 +65,10 @@ const lineVendorName = (it: any, po: any): string =>
 /** Case/space-insensitive identity for a vendor group; the display name is kept separately. */
 const vendorKeyOf = (name: string): string => String(name || '').trim().toLowerCase();
 
-/** po_item_ids already covered by a GRN on this PO. THE receipt ledger. */
-function receivedPoItemIds(db: ReturnType<typeof getDb>, poId: string): Set<string> {
-  const rows = db.prepare(`
-    SELECT DISTINCT gi.po_item_id AS po_item_id
-    FROM goods_receipt_note_items gi
-    JOIN goods_receipt_notes g ON g.id = gi.grn_id
-    WHERE g.po_id = ? AND gi.po_item_id IS NOT NULL AND TRIM(gi.po_item_id) != ''
-  `).all(poId) as any[];
-  return new Set(rows.map(r => String(r.po_item_id)));
-}
+// receivedPoItemIds — THE receipt ledger — now lives in src/lib/po-receipts.ts,
+// imported above. It was module-local here and copied, unfiltered, into five
+// other queries across three files; that duplication is what made a voided
+// PO receipt impossible to undo. Do not re-inline it.
 
 interface VendorGroup {
   key: string;
@@ -131,13 +134,12 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
     }
     const done = receivedPoItemIds(db, id);
 
+    // Which GRN each received line came in on — the `grn_numbers` badge below.
+    // Same ledger as `done` above, from the same helper: a copy of this query
+    // that filtered differently would badge a line as delivered on a bill the
+    // outstanding list says is still owed.
     const grnByItem = new Map<string, any>();
-    for (const r of db.prepare(`
-      SELECT gi.po_item_id, g.grn_number, g.date AS grn_date, g.invoice_number
-      FROM goods_receipt_note_items gi
-      JOIN goods_receipt_notes g ON g.id = gi.grn_id
-      WHERE g.po_id = ? AND gi.po_item_id IS NOT NULL
-    `).all(id) as any[]) grnByItem.set(String(r.po_item_id), r);
+    for (const r of poReceiptLines(db, id)) grnByItem.set(String(r.po_item_id), r);
 
     const bills = db.prepare(`
       SELECT id, vendor_id, vendor_name, bill_no, bill_date, received_by, notes, created_at
@@ -1182,12 +1184,21 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         || (vendorKeyOf(po.vendor) === group.key ? (po.vendor_id || null) : null)
         || ((db.prepare(`SELECT id FROM vendors WHERE LOWER(TRIM(name)) = ? LIMIT 1`)
               .get(group.key) as any)?.id ?? null);
+      // grn_id IS THE LINK NOW, and the sentence in `notes` is kept beside it.
+      // The bill row is written BEFORE the GRN header (a duplicate bill number
+      // must cost nothing), so this stamps the id minted above rather than one
+      // read back — it is the same value the INSERT below uses, in the same
+      // transaction. The column is what lets an admin void this receipt: the
+      // void RELEASES this row so the reopened PO can take the same bill in
+      // again, and it will not release a row it cannot uniquely identify.
+      // `notes` stays exactly as it was: it is what the historical rows have,
+      // and api/grn/[id] still falls back to parsing it for them.
       try {
         db.prepare(`
           INSERT INTO po_vendor_bills
-            (id, po_id, vendor_id, vendor_name, bill_no, bill_date, received_by, notes, created_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-        `).run(generateId(), id, billVendorId, billVendorName, billNo, billDate, receivedByEmail,
+            (id, po_id, grn_id, vendor_id, vendor_name, bill_no, bill_date, received_by, notes, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+        `).run(generateId(), id, grnId, billVendorId, billVendorName, billNo, billDate, receivedByEmail,
                 `GRN ${grnNumber}${chargesNote ? ` — ${chargesNote}` : ''}`);
       } catch (e: any) {
         if (String(e?.code || '').startsWith('SQLITE_CONSTRAINT')) {
@@ -1560,11 +1571,24 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // `SET total_cost = total` it replaces. Read back from the GRN rows rather
       // than from purchase_orders.total_cost, which holds the ORDERED total
       // right up until the PO closes (see the two branches below).
+      //
+      // ── AND A VOIDED BILL'S MONEY IS NOT PRIOR MONEY ─────────────────────
+      // This is a VALUE question, not a claim, so it takes liveValueSql — the
+      // same predicate the other two copies of this sum already carry
+      // (grn-reversal.ts and grn-qc.ts both re-derive the PO total with it).
+      // This was the third copy and the only unfiltered one. It was harmless
+      // only for as long as no PO GRN could be voided; the moment one can be, a
+      // re-receive on a reopened PO would stamp purchase_orders.total_cost with
+      // the voided bill's money folded back in — the exact figure the void just
+      // took out of stock. 'awaiting_qc' is excluded for the reason stated in
+      // po-receipts.ts: a held line's quantity_accepted is pinned to 0, the
+      // ABSENCE of a decision, while its discount is stored in full, so counting
+      // it here subtracts a discount against no goods.
       const prior = (db.prepare(`
         SELECT COALESCE(SUM(ROUND(gi.quantity_accepted * gi.unit_price, 2) - gi.discount), 0) AS net
         FROM goods_receipt_note_items gi
         JOIN goods_receipt_notes g ON g.id = gi.grn_id
-        WHERE g.po_id = ? AND g.id != ?
+        WHERE g.po_id = ? AND g.id != ? AND ${liveValueSql('g')}
       `).get(id, grnId) as any)?.net || 0;
       // status + received_at are written ONLY when the PO is actually complete —
       // this is the sole writer of the approved→received transition, and it is

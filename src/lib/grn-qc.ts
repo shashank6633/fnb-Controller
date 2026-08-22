@@ -1306,7 +1306,10 @@ export interface QcDecisionResult {
  *     without it a held receipt caught by a cutover set AFTER it was recorded
  *     has NO way out at all. Sign refuses (cutover), override refuses (same
  *     throw), and DELETE /api/grn/[id] refuses a void on the very same date test
- *     (grn/[id]/route.ts:584) — and on a PO-sourced GRN it refuses twice over.
+ *     (grn/[id]/route.ts:584). (It used to refuse a PO-sourced GRN twice over,
+ *     on that date test AND on being PO-sourced at all. The second refusal is
+ *     gone — src/lib/po-void.ts — so a PO receipt caught by a cutover now hits
+ *     exactly the same single door as an ad-hoc one, which is the door below.)
  *     The receipt would sit in the queue for ever while the refusal told the
  *     reader to "reject the lines to clear it", which would itself have thrown.
  *     Rejecting everything is the honest end state for goods a physical count

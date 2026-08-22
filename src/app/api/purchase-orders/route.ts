@@ -12,6 +12,22 @@ import { vendorMappingError, vendorResolver, resolveVendorRef } from '@/lib/vend
 // built from; /api/stock-on-hand (the live picker feed) calls the SAME function,
 // which is what guarantees the snapshot and the picker can never disagree.
 import { stockOnHandBulk, type StockOnHand } from '@/lib/dept-stock';
+// THE receipt ledger, in one place. Four of this file's queries used to derive
+// "which PO lines are already received" for themselves, none of them aware that
+// a voided GRN keeps its item rows — so a voided receipt went on claiming its
+// line for ever. All four now come from here; see the doctrine header in that
+// file for why CLAIM ('void' only) and VALUE ('void' + 'awaiting_qc') are two
+// different predicates and must never be swapped.
+import {
+  poReceiptLines, poReceipts, receivedNet as poReceivedNet,
+  receivedLineCountSql, poLineDelivery, type PoReceipt,
+} from '@/lib/po-receipts';
+
+/** A receipt row after the fold below has priced it and tied it to its vendor
+ *  bill. Named so the fold is NOT laundered through `any[]`: receivedNet()
+ *  requires `is_void`, and an `any[]` would let a row that lost the flag past
+ *  the compiler and silently sum a voided bill back into the order's total. */
+type PricedPoReceipt = PoReceipt & { net: number; vendor_bill_id: string | null };
 
 /** Phase B store guard for PO composition (create/edit are interactive, so we
  *  reject the request with a clear message instead of silently dropping lines).
@@ -230,17 +246,15 @@ export async function GET(request: Request) {
       // po_id = NULL and po_item_id = NULL on ad-hoc GRNs), and the receive
       // route's per-line claim means one po_item can appear under at most one
       // GRN — so the rows below never double-count a line.
-      const grnItems = db.prepare(`
-        SELECT gi.po_item_id, gi.quantity_received, gi.quantity_accepted, gi.quantity_rejected,
-               gi.unit_price AS received_unit_price, gi.rejection_reason,
-               gi.discount AS received_discount, gi.delivery_charges AS received_delivery,
-               g.grn_number, g.date AS received_on, g.vendor AS received_from,
-               g.invoice_number AS received_bill_no
-        FROM goods_receipt_note_items gi
-        JOIN goods_receipt_notes g ON g.id = gi.grn_id
-        WHERE g.po_id = ? AND gi.po_item_id IS NOT NULL AND TRIM(gi.po_item_id) != ''
-        ORDER BY g.date, g.created_at, g.grn_number
-      `).all(id) as any[];
+      //
+      // A VOIDED RECEIPT IS NOT ONE OF THEM. poReceiptLines (src/lib/po-receipts.ts)
+      // is the single derivation of "which live GRN booked this PO line", shared
+      // with the receive route's ledger — so a voided bill stops overwriting the
+      // ordered line here, and the line reads as outstanding again on the detail
+      // and the print. Both consumers already fall back to the ordered figures
+      // when no GRN row matches, so a line that loses its receipt degrades to
+      // exactly what it was before the delivery.
+      const grnItems = poReceiptLines(db, id) as any[];
       if (grnItems.length > 0) {
         const byPoi = new Map<string, any>();
         for (const g of grnItems) if (g.po_item_id) byPoi.set(String(g.po_item_id), g);
@@ -278,20 +292,15 @@ export async function GET(request: Request) {
       // purchase_orders.total_cost, so Σ net over these rows IS the stored
       // total. Delivery is carried but never added: it is recorded only and
       // never enters item cost.
-      const receipts = db.prepare(`
-        SELECT g.id AS grn_id, g.grn_number, g.date AS date, g.vendor, g.vendor_id,
-               g.invoice_number AS bill_no, g.invoice_date AS bill_date,
-               g.received_by, g.status,
-               COUNT(gi.id) AS line_count,
-               COALESCE(SUM(ROUND(gi.quantity_accepted * gi.unit_price, 2)), 0) AS gross,
-               COALESCE(SUM(gi.discount), 0)         AS discount,
-               COALESCE(SUM(gi.delivery_charges), 0) AS delivery
-        FROM goods_receipt_notes g
-        LEFT JOIN goods_receipt_note_items gi ON gi.grn_id = g.id
-        WHERE g.po_id = ?
-        GROUP BY g.id
-        ORDER BY g.date, g.created_at, g.grn_number
-      `).all(id) as any[];
+      //
+      // THIS IS THE ONE PLACE A VOIDED RECEIPT STAYS. It is a HISTORY question,
+      // not a claim: /grn shows a voided bill struck through rather than deleted,
+      // and an order's printed history that silently omitted it would stop
+      // reconciling with the GRN register. So poReceipts returns every row and
+      // flags is_void, and the MONEY is what leaves — received_net below sums the
+      // receipts that still stand. Consumers must strike the voided row and must
+      // not add it to any total.
+      const receipts = poReceipts(db, id) as PricedPoReceipt[];
       // The bill rows themselves — bill_date and who signed for it are recorded
       // there, and on a legacy/blank-invoice GRN they are the only copy. Matched
       // on the GRN number the receive txn writes into notes ('GRN <number>[ — …]'),
@@ -327,7 +336,12 @@ export async function GET(request: Request) {
           r.received_by = r.received_by || b.received_by || '';
         }
       }
-      const receivedNet = Math.round(receipts.reduce((s, r) => s + Number(r.net || 0), 0) * 100) / 100;
+      // Σ net over the receipts that STILL STAND — voided bills excluded (their
+      // money is reversed out of stock and out of purchase_orders.total_cost, so
+      // counting them here would print an order at more than it cost). A HELD
+      // ('awaiting_qc') receipt is still counted, exactly as it always has been:
+      // that is a separate question and this change does not move it.
+      const receivedNet = poReceivedNet(receipts);
 
       // Role travels at the TOP level (session-derived), exactly as the list
       // branch returns it — never nested on the row, where it looked like PO data.
@@ -375,11 +389,14 @@ export async function GET(request: Request) {
              -- purchase units of DIFFERENT materials, so adding 2 kg to 3 BTL
              -- yields a number that means nothing — the same reasoning
              -- /api/grn/route.ts:99-106 spells out for rejected quantities.
-             (SELECT COUNT(DISTINCT gi.po_item_id)
-                FROM goods_receipt_note_items gi
-                JOIN goods_receipt_notes g ON g.id = gi.grn_id
-               WHERE g.po_id = po.id AND gi.po_item_id IS NOT NULL AND TRIM(gi.po_item_id) != '')
-                                                                          AS received_line_count,
+             --
+             -- The subquery is EMITTED by src/lib/po-receipts.ts, not written
+             -- here: this is a raw-SQL context that cannot call a reader, and a
+             -- hand-written copy of the join is exactly how this derivation came
+             -- to exist in five unfiltered spellings. It counts LIVE receipts, so
+             -- the PART-RECEIVED chip drops back to 0 and disappears when a
+             -- receipt is voided — which is the truth about a reopened order.
+             ${receivedLineCountSql('po.id')}                              AS received_line_count,
              (SELECT COUNT(*) FROM purchase_order_items WHERE po_id = po.id) AS total_line_count
       FROM purchase_orders po
       WHERE ${where.join(' AND ')}
@@ -404,21 +421,13 @@ export async function GET(request: Request) {
     for (const r of rows) byPo.set(String(r.id), r);
     if (byPo.size > 0) {
       // The vendor a line is FILED under, byte-for-byte the rule
-      // [id]/receive/route.ts uses: the line's own vendor, else the PO header.
-      // Anything else would name a vendor the goods will not be booked against.
-      const lineRows = db.prepare(`
-        SELECT poi.po_id AS po_id,
-               COALESCE(NULLIF(TRIM(poi.vendor), ''), NULLIF(TRIM(po.vendor), ''), '') AS vendor_name,
-               MAX(CASE WHEN g.id IS NULL THEN 0 ELSE 1 END) AS received
-        FROM purchase_order_items poi
-        JOIN purchase_orders po ON po.id = poi.po_id
-        -- g is joined ON g.po_id too, so a GRN row that happens to carry this
-        -- po_item_id under a DIFFERENT PO cannot mark the line delivered.
-        LEFT JOIN goods_receipt_note_items gi ON gi.po_item_id = poi.id
-        LEFT JOIN goods_receipt_notes g ON g.id = gi.grn_id AND g.po_id = poi.po_id
-        WHERE ${where.join(' AND ')}
-        GROUP BY poi.id
-      `).all(...params) as any[];
+      // [id]/receive/route.ts uses: the line's own vendor, else the PO header —
+      // stated once, in src/lib/po-receipts.ts, alongside the two ON-clause
+      // guards this query depends on. The void filter rides in the ON clause
+      // there, NOT in `where`: appending it to a LEFT JOIN's WHERE collapses the
+      // join to an INNER one, and every PO with no receipt at all would vanish
+      // from the tally, emptying outstanding_vendors on wholly un-received POs.
+      const lineRows = poLineDelivery(db, where.join(' AND '), params) as any[];
       for (const r of rows) {
         r.delivered_vendors   = [];
         r.outstanding_vendors = [];

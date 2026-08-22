@@ -1,6 +1,7 @@
 import type DatabaseT from 'better-sqlite3';
 import { getDb } from './db';
 import { todayIST } from './format-date';
+import { claimJoin } from './po-receipts';
 
 /**
  * PURCHASE LOG — one row per ITEM per BILL, across all three procurement
@@ -841,10 +842,23 @@ function buildUnion(f: {
         NULL AS delivery_charges, NULL AS mrp_round_off,
         -- The GRN this ordered line was received on, via po_item_id. NULL until
         -- it is received (or when the receipt fell outside this date window).
+        --
+        -- THROUGH claimJoin(), WHICH IS THE POINT. This was the eighth copy of
+        -- the PO↔GRN claim derivation and the only one left unfiltered after
+        -- src/lib/po-receipts.ts collected the rest. A voided GRN keeps its line
+        -- rows, and the ORDER BY ... LIMIT 1 below picks the OLDEST — which after
+        -- a void-and-re-receive is ALWAYS the voided one. Measured: a PO line
+        -- voided on GRN-2026-0001 and re-received as GRN-2026-0030 reported
+        -- GRN-2026-0001, a bill the GRN branch above already excludes, so the
+        -- ordered line was grouped with a receipt event that has no other rows
+        -- and separated from the delivery it actually arrived on. link_raw
+        -- becomes link_key below and is the report's whole reconciliation
+        -- promise. Money was never affected — the PO branch's value column is
+        -- the ORDERED value — but the link was pointing at a dead row.
         COALESCE((SELECT g2.grn_number
                     FROM goods_receipt_note_items gi2
-                    JOIN goods_receipt_notes g2 ON g2.id = gi2.grn_id
-                   WHERE g2.po_id = po.id AND gi2.po_item_id = poi.id
+                    ${claimJoin({ grn: 'g2', item: 'gi2', poIdCol: 'po.id' })}
+                   WHERE gi2.po_item_id = poi.id
                    ORDER BY g2.date LIMIT 1), '')         AS link_raw,
         0                                                 AS is_mirror,
         -- Status is stamped in because a PO row is a COMMITMENT, and whether it

@@ -1513,6 +1513,88 @@ function initializeSchema(db: Database.Database) {
     `);
   } catch (e) { console.error('purchasing schema (po_vendor_bills / petty_cash) failed:', e); }
 
+  // ── po_vendor_bills.grn_id — A REAL LINK WHERE THERE WAS ONLY A SENTENCE ──
+  //
+  // The bill row and the GRN it documents are written a few lines apart in ONE
+  // transaction (api/purchase-orders/[id]/receive), yet the only thing tying
+  // them together was prose: `notes = 'GRN <number>'`, optionally followed by
+  // ' — <charges note>'. Every reader that had to get from one to the other
+  // parsed that sentence. That was tolerable while nothing needed to UNDO a
+  // receipt; it is not tolerable now, because voiding a PO receipt has to
+  // RELEASE this row — uq_po_vendor_bill UNIQUE(po_id, vendor_name, bill_no)
+  // otherwise blocks the reopened PO from ever taking in the very bill it is
+  // waiting for (15 of 20 live rows carry a BLANK bill_no, so the collision is
+  // the majority case, not an edge case). Releasing the WRONG row would let a
+  // different vendor bill be received twice, so a guess is not acceptable and
+  // the column is the only honest fix.
+  //
+  // IN ITS OWN try/catch ON PURPOSE — not folded into the block above, whose
+  // failure is logged and swallowed wholesale. If the CREATE TABLE up there had
+  // ever failed, this ALTER would be the statement that says so in the log.
+  //
+  // VERIFY AFTER A BOOT:
+  //   PRAGMA table_info(po_vendor_bills);                    -- grn_id present
+  //   SELECT COUNT(*) FROM po_vendor_bills WHERE grn_id IS NULL;   -- 0 expected
+  //     (20 live rows, each matching exactly one GRN by the sentence below)
+  //   SELECT COUNT(*) FROM po_vendor_bills b JOIN goods_receipt_notes g
+  //     ON g.id = b.grn_id WHERE g.po_id <> b.po_id;         -- 0, always
+  try {
+    const cols = db.prepare("PRAGMA table_info(po_vendor_bills)").all() as any[];
+    if (cols.length > 0) {
+      if (!cols.some((c: any) => c.name === 'grn_id')) {
+        db.exec(`ALTER TABLE po_vendor_bills ADD COLUMN grn_id TEXT`);
+      }
+      db.exec(`CREATE INDEX IF NOT EXISTS idx_po_vendor_bills_grn ON po_vendor_bills(grn_id)`);
+      // BACKFILL — a pure NULL-fill, so it is self-limiting: once a row carries
+      // a grn_id it is out of scope for ever and no later boot can rewrite it.
+      // (That is also why it needs no one-shot settings flag; there is no human
+      // decision here to revert.)
+      //
+      // THE COUNT = 1 GUARD IS LOAD-BEARING. A scalar subquery that matches two
+      // GRNs returns an ARBITRARY one of them, which would stamp the wrong link
+      // silently and permanently. Where the sentence does not identify exactly
+      // one receipt the row is LEFT NULL, and the void refuses on it rather than
+      // releasing a bill it cannot prove is the right one.
+      //
+      // The match is the two EXACT forms receive writes — never
+      // LIKE 'GRN <n>%', which catches GRN-2026-00011 when looking for
+      // GRN-2026-0001 once the sequence passes four digits.
+      //
+      // GUARDED ON goods_receipt_notes EXISTING, because this block runs ~900
+      // lines BEFORE initializeSchema creates that table. On an EXISTING
+      // database it is already there and the backfill runs (20/20 filled,
+      // 0 cross-PO). On a BRAND NEW one it is not, and the UPDATE threw
+      // 'no such table: goods_receipt_notes' straight into the catch below —
+      // harmless (the ALTER and the index had already run, and an empty
+      // po_vendor_bills has nothing to backfill) but it printed
+      // "po_vendor_bills.grn_id migration failed" on every first boot for ever.
+      // This block sits in its OWN try/catch precisely so that a line in the log
+      // MEANS something; a permanent false alarm destroys that. Skipping is
+      // correct rather than merely quiet: rows written from here on carry
+      // grn_id at INSERT (receive/route.ts binds it), so a fresh database never
+      // has a row to fill.
+      const grnTableExists = !!db.prepare(
+        `SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'goods_receipt_notes'`
+      ).get();
+      if (grnTableExists) db.exec(`
+        UPDATE po_vendor_bills
+        SET grn_id = (
+          SELECT g.id FROM goods_receipt_notes g
+           WHERE g.po_id = po_vendor_bills.po_id
+             AND (po_vendor_bills.notes = 'GRN ' || g.grn_number
+                  OR po_vendor_bills.notes LIKE 'GRN ' || g.grn_number || ' — %')
+        )
+        WHERE grn_id IS NULL
+          AND (
+            SELECT COUNT(*) FROM goods_receipt_notes g
+             WHERE g.po_id = po_vendor_bills.po_id
+               AND (po_vendor_bills.notes = 'GRN ' || g.grn_number
+                    OR po_vendor_bills.notes LIKE 'GRN ' || g.grn_number || ' — %')
+          ) = 1
+      `);
+    }
+  } catch (e) { console.error('po_vendor_bills.grn_id migration failed:', e); }
+
   // SEED vendor_materials FROM REAL PURCHASE HISTORY — one-shot.
   //
   // Vendor mapping is about to become STRICT on the PO screen: a vendor offers

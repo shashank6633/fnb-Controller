@@ -17,11 +17,17 @@ const qty = (v: number) => (Number(v) || 0).toLocaleString('en-IN', { maximumFra
 // you need a date+time stamp on the PO print.
 const dt = (s?: string | null) => fmtISTDate(s, { fallback: '—' });
 
-/** One vendor receipt on this PO: their bill, their GRN, their money. */
+/** One vendor receipt on this PO: their bill, their GRN, their money.
+ *  A VOIDED receipt is still in this list, flagged — the API returns the order's
+ *  receipt HISTORY, and a printed sheet that silently dropped a bill the GRN
+ *  register still shows struck through would stop reconciling with it. It is
+ *  struck through here and it is in NO total: `received_net` from the server
+ *  already excludes it, and every fallback below filters on is_void. */
 interface Receipt {
   grn_id: string; grn_number: string; date: string;
   vendor: string; bill_no: string; bill_date: string; received_by: string;
   line_count: number; gross: number; discount: number; delivery: number; net: number;
+  status?: string; is_void?: boolean;
 }
 
 export default function POPrintPage() {
@@ -75,7 +81,14 @@ export default function POPrintPage() {
   // `isReceived ||` keeps the legacy path intact: a closed PO whose GRN rows
   // cannot be joined at all still shows the received block and falls back to the
   // stored total, exactly as before.
-  const anyReceived = isReceived || receipts.length > 0
+  // VOIDED receipts do not count as a delivery. `receipts` is the order's full
+  // history and keeps them (struck through, below); every question of the form
+  // "has anything actually arrived / what is it worth" asks liveReceipts.
+  // Without this a wholly-voided PO would still read as received and print its
+  // grand total as the ₹0 that the voided-out net correctly sums to.
+  const liveReceipts = receipts.filter(r => !r.is_void);
+  const voidedReceipts = receipts.length - liveReceipts.length;
+  const anyReceived = isReceived || liveReceipts.length > 0
     || (po.items || []).some((it: any) => it.received_line_total != null);
   // A PO may legitimately span several vendors (it is an internal approval and
   // costing document here, not a sheet sent to one vendor). When it does, the
@@ -117,7 +130,7 @@ export default function POPrintPage() {
   // Prefer the server's `received_net` (Σ per-receipt net, the same expression
   // that produced purchase_orders.total_cost, so the paper and the ledger cannot
   // disagree); fall back to the line-derived figure, then to the stored total.
-  const receiptsNet = receipts.length > 0 && receivedNet != null ? receivedNet : null;
+  const receiptsNet = liveReceipts.length > 0 && receivedNet != null ? receivedNet : null;
   const grandTotal = anyReceived
     ? (receiptsNet != null ? receiptsNet
         : hasGrnLines ? Math.round((receivedSubtotal - billDiscount) * 100) / 100
@@ -330,7 +343,12 @@ export default function POPrintPage() {
         {receipts.length > 0 && (
           <section className="mb-6 -mt-4">
             <p className="text-[10px] uppercase font-semibold text-gray-600 mb-1">
-              Vendor bills received ({receipts.length})
+              Vendor bills received ({liveReceipts.length})
+              {voidedReceipts > 0 && (
+                <span className="normal-case font-normal text-gray-500">
+                  {' '}· {voidedReceipts} voided, shown struck through and in no total
+                </span>
+              )}
             </p>
             <table className="w-full text-[11px] border border-gray-300">
               <thead className="bg-gray-100">
@@ -347,8 +365,11 @@ export default function POPrintPage() {
               </thead>
               <tbody>
                 {receipts.map(r => (
-                  <tr key={r.grn_id}>
-                    <td className="border border-gray-300 px-2 py-1">{r.vendor || '—'}</td>
+                  <tr key={r.grn_id} className={r.is_void ? 'line-through text-gray-400' : undefined}>
+                    <td className="border border-gray-300 px-2 py-1">
+                      {r.vendor || '—'}
+                      {r.is_void && <span className="no-underline ml-1 font-semibold">(VOID)</span>}
+                    </td>
                     <td className="border border-gray-300 px-2 py-1 font-mono">{r.bill_no || '—'}</td>
                     <td className="border border-gray-300 px-2 py-1">{r.bill_date ? dt(r.bill_date) : '—'}</td>
                     <td className="border border-gray-300 px-2 py-1 font-mono">{r.grn_number}</td>
@@ -367,7 +388,7 @@ export default function POPrintPage() {
                     Total received {isReceived ? '(all vendors)' : 'so far'}
                   </td>
                   <td className="border border-gray-300 px-2 py-1 text-right font-mono">
-                    {fmt(receivedNet ?? receipts.reduce((s, r) => s + Number(r.net || 0), 0))}
+                    {fmt(receivedNet ?? liveReceipts.reduce((s, r) => s + Number(r.net || 0), 0))}
                   </td>
                 </tr>
               </tfoot>

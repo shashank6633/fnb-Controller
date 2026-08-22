@@ -4,6 +4,7 @@ import { centralFlowBlock } from '@/lib/store-engine';
 import { duplicateLineError } from '@/lib/po-helpers';
 import { vendorMappingError, vendorResolver } from '@/lib/vendor-mapping';
 import { snapshotPoLines } from '@/lib/po-stock-snapshot';
+import { liveReceiptsOnPo, type PoReceiptWitnesses } from '@/lib/po-receipts';
 
 /* ══════════════════════════════════════════════════════════════════════════
  * GOODS ALREADY TAKEN IN CLOSE THIS DOOR.
@@ -33,34 +34,22 @@ import { snapshotPoLines } from '@/lib/po-stock-snapshot';
  * (receive takes an admin-only unit_price override with a deviation reason),
  * and goods that will never come are simply left un-received, which is the
  * honest record.
+ *
+ * A VOIDED RECEIPT IS NOT EVIDENCE. Both witnesses now come from
+ * liveReceiptsOnPo (src/lib/po-receipts.ts) and both skip a voided GRN — the
+ * bill witness via the prose 'GRN <number>' link that is po_vendor_bills' only
+ * tie to its GRN. `any` is an OR over the two, so the freeze lifts only when
+ * NEITHER stands: an admin who voided a wrong receipt can fix the order, and a
+ * PO with one live delivery still refuses. Both witnesses had to learn this
+ * together — making only the GRN half void-aware would have left the surviving
+ * bill row freezing a truly-voided PO for ever.
+ *   THE CONSEQUENCE, STATED: rewriting the lines after a void detaches the
+ *   voided GRN's po_item_ids (there is no FK on that column, so no error and no
+ *   cascade). The voided bill keeps its own material_id and quantities and its
+ *   audit snapshot, and the re-received PO gets fresh line ids that no live GRN
+ *   claims — which is what makes double-claiming impossible after a reopen.
  * ══════════════════════════════════════════════════════════════════════════ */
-interface PoReceipts {
-  grns: Array<{ grn_number: string; vendor: string; invoice_number: string; lines: number }>;
-  bills: Array<{ vendor_name: string; bill_no: string; bill_date: string }>;
-  any: boolean;
-}
-function receiptsOnPo(db: ReturnType<typeof getDb>, poId: string): PoReceipts {
-  const grns = db.prepare(`
-    SELECT g.grn_number, g.vendor, g.invoice_number,
-           (SELECT COUNT(*) FROM goods_receipt_note_items gi WHERE gi.grn_id = g.id) AS lines
-    FROM goods_receipt_notes g
-    WHERE g.po_id = ?
-    ORDER BY g.date, g.created_at
-  `).all(poId) as PoReceipts['grns'];
-  // Second witness. Wrapped because db.ts creates po_vendor_bills inside a
-  // try/catch — if that DDL ever failed the table would be absent, and a throw
-  // here would 500 every edit. It cannot fail OPEN by being skipped: the same
-  // missing table would make the receive txn throw at its INSERT and roll back,
-  // so no GRN would exist either and the check above still holds.
-  let bills: PoReceipts['bills'] = [];
-  try {
-    bills = db.prepare(`
-      SELECT vendor_name, bill_no, bill_date FROM po_vendor_bills
-      WHERE po_id = ? ORDER BY created_at, id
-    `).all(poId) as PoReceipts['bills'];
-  } catch { /* table absent — GRN evidence above is authoritative */ }
-  return { grns, bills, any: grns.length > 0 || bills.length > 0 };
-}
+type PoReceipts = PoReceiptWitnesses;
 
 /** The refusal, worded so a manager holding a revised quote knows what to do. */
 function receiptRefusal(poNumber: string, r: PoReceipts): string {
@@ -129,7 +118,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     // of this file). Checked here for a fast, readable refusal, and RE-ASSERTED
     // inside the txn below — a receive that commits during the awaits between
     // the two would otherwise slip past this one and leave 'approved' intact.
-    const receipts = receiptsOnPo(db, id);
+    const receipts = liveReceiptsOnPo(db, id);
     if (receipts.any) {
       return Response.json({
         error: receiptRefusal(po.po_number, receipts),
@@ -245,7 +234,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // SQLite's write lock, so this read runs under it and cannot be raced by
       // a second connection; better-sqlite3 txns are synchronous, so throwing
       // here rolls the whole edit back with nothing written.
-      const now = receiptsOnPo(db, id);
+      const now = liveReceiptsOnPo(db, id);
       if (now.any) {
         const err: any = new Error(`${receiptRefusal(po.po_number, now)} Reload the page.`);
         err.httpStatus = 409;
