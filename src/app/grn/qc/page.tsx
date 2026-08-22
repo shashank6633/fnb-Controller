@@ -706,7 +706,36 @@ export default function PendingQualityChecksPage() {
 
                 {items.map(it => {
                   const st = lines[it.id];
-                  const rejecting = !!st && (st.rejectedRaw.trim() !== '' || !!st.reason);
+                  /**
+                   * IS THE REJECT FORM OPEN? PRESENCE, NOT CONTENT.
+                   *
+                   * This asked "has a rejection been TYPED yet" and was used to
+                   * decide whether to render the form at all — so the form could
+                   * never open. "Reject some…" sets exactly
+                   * { rejectedRaw: '', reason: '' }, which is the state a checker
+                   * is in the instant they open it and before they type anything:
+                   * both halves empty, the old test false, the same branch
+                   * re-rendered. The click registered, state changed, and nothing
+                   * appeared to happen.
+                   *
+                   * It made rejection UNREACHABLE. "Reject all" lives inside this
+                   * form, so a kitchen checker's only choices were to sign off
+                   * goods they judged bad, or abandon the bill in the queue — the
+                   * QC gate failing at the one thing it exists for. The engine
+                   * behind it was always right: a full rejection waives the three
+                   * ticks, books no stock and no cost row, and records
+                   * qc_outcome='rejected' with who and when.
+                   *
+                   * An entry in `lines` means "this checker opened the reject
+                   * form for this line" and nothing else. Cancel DELETES the
+                   * entry (see the Cancel button below), which is what closes it
+                   * — so presence is the whole question. Clearing the quantity
+                   * back to blank now keeps the form open rather than silently
+                   * reverting the line to "accepting all", which was the same bug
+                   * wearing a different hat: a checker who cleared the box to
+                   * retype would have inwarded goods they meant to turn away.
+                   */
+                  const rejecting = !!st;
                   const rej = rejectedOf(it);
                   const acc = acceptedOf(it);
                   const rec = Number(it.quantity_received) || 0;
