@@ -4,7 +4,16 @@ import { centralFlowBlock, isStoreMappedMaterial } from '@/lib/store-engine';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
 import { canSeeAllDeptStock } from '@/lib/dept-stock';
 import { checkPurchaseDate } from '@/lib/purchase-guard';
-import { resolveVendorRef, isPairMapped } from '@/lib/vendor-mapping';
+// The QC gate is ONE helper, shared with both receiving routes and the bulk
+// importer. Never a second copy of the category test.
+import { resolveQcRequirement } from '@/lib/grn-qc';
+// THE VENDOR↔ITEM LEARNER LIVES IN ONE MODULE NOW — src/lib/vendor-learn.ts.
+// It used to be a ~100-line private function in THIS file, reachable from
+// exactly one screen ("Enter Full Bill"). That screen now records a GOODS
+// RECEIPT (POST /api/grn) instead of a bare purchase, so the learner had to be
+// callable from there too. It was LIFTED, not copied: see the module header for
+// why a second copy is the one thing that could not be done here.
+import { learnVendorMaterialPair, type VendorMappingOutcome } from '@/lib/vendor-learn';
 // THE DUPLICATE RULE LIVES IN ONE MODULE NOW — src/lib/line-dedupe.ts — and is
 // imported by the PO routes, the bill modal AND this route. Do NOT restate any
 // part of it inline here again: this file and src/app/purchases/page.tsx each
@@ -20,182 +29,63 @@ function inr(n: number): string {
 }
 
 /**
- * What the mapping side of a purchase did, reported back on the POST response.
+ * ═══════════════════════════════════════════════════════════════════════════
+ * THIS ROUTE NO LONGER BACKS A BILL-ENTRY FORM. ONE WRITER OWNS A VENDOR BILL.
+ * ═══════════════════════════════════════════════════════════════════════════
+ * "Enter Full Bill" — the only screen that ever POSTed here — now records a
+ * GOODS RECEIPT through POST /api/grn. A hand-typed vendor bill therefore has
+ * exactly ONE writer, and that writer is the receiving route.
  *
- * `mapped` is the field the bill modal should branch on: FALSE means the pair
- * (this vendor, this item) is still not declared on Vendor Items, and the modal
- * should say so AFTER the successful save. It is a warning, never a refusal —
- * see the header comment on learnVendorMaterialPair().
+ * WHY, IN ONE SENTENCE THE CODEBASE ALREADY LEARNED THE HARD WAY: the old
+ * single-line "Add Purchase" button was deleted on the owner's call because
+ * "it wrote the same purchases row by a second route, so the two drifted (the
+ * CASE/BTL entry-mode bug was fixed twice, once per form)". Two entry forms for
+ * one document is the defect, and it does not become safe by pointing in the
+ * other direction — so this route was NOT deleted and NOT duplicated into: it
+ * simply stopped being called by a form.
+ *
+ * WHAT THE MOVE BUYS, and none of it was reachable from here:
+ *   • the KITCHEN QC GATE (src/lib/grn-qc.ts resolveQcRequirement) — this route
+ *     has none, and its own comment below says a purchase "writes STRAIGHT to
+ *     stock and to updateMaterialPrice";
+ *   • the inward register, void and line-edit (src/lib/grn-reversal.ts);
+ *   • a real GRN document behind every cost row (purchases.grn_id).
+ *
+ * WHO STILL CALLS THIS POST — measured, repo-wide, excluding node_modules/.next:
+ *   • src/app/purchases/page.tsx:1614 — the modal being moved. After the move:
+ *     NOBODY in the browser.
+ *   • scripts/import-purchases.py:164 — a raw urllib POST with no cookie. It has
+ *     been DEAD since the auth gate landed (getCurrentUser() → 401 below, plus
+ *     the CSRF entry at src/proxy.ts:57). Its only remaining claim on this file
+ *     is the blank-bill_no carve-out in the duplicate guard, kept as documented.
+ *   • Nothing else. /api/purchases/bulk, /api/purchases/opening-stock and
+ *     /api/inward-import/commit are SEPARATE routes with their own INSERTs —
+ *     they do not pass through here and are untouched by the move.
+ * The handler is left fully working on purpose: it is the documented programmatic
+ * shape for a single purchase line, and removing a live API to make a UI change
+ * is a bigger blast radius than leaving it.
+ *
+ * GET is unchanged and is still the Purchases register's feed — that screen
+ * keeps its register, filters, exports and the GOODS VALUE vs TOTAL AMOUNT
+ * split; it just stops creating rows.
  */
-type VendorMappingOutcome = {
-  status: 'learned' | 'already_mapped' | 'vendor_not_in_master' | 'no_vendor' | 'respected_removal' | 'error';
-  /** Is the (vendor, item) pair declared in vendor_materials now that we are done? */
-  mapped: boolean;
-  vendor_id?: string;
-  vendor_name?: string;
-  /** Ready-to-show copy for the storekeeper. Present only when `mapped` is false
-   *  AND there is something a human can act on. */
-  warning?: string;
-  /** Why, for the log / for a developer. */
-  detail?: string;
-};
-
-/**
- * A BILL IS A FACT — THIS PATH NEVER APPLIES THE STRICT PO MAPPING RULE.
- *
- * DO NOT "align" this with /api/purchase-orders by calling vendorMappingError()
- * here. A PO is a document WE author, so refusing an undeclared (vendor, item)
- * pair costs nothing but a correction. A purchase is a bill the vendor has
- * ALREADY raised and goods already delivered — refusing it leaves a storekeeper
- * holding an invoice with nowhere to enter it, and the usual escape is to enter
- * it wrong (under another vendor, another item) rather than not at all. So an
- * unmapped pair here WARNS (the `vendor_mapping` block in the POST response,
- * which the bill modal surfaces) and always saves. The divergence is deliberate.
- *
- * What this function does instead is LEARN. Recording a purchase is the
- * strongest evidence there is that this vendor supplies this item, yet until
- * now NO purchase path wrote `vendor_materials` — the map could only grow from
- * the one-shot history seed, hand entry, or the backfill button, which is
- * exactly why it goes stale and the owner reads it as "sync not working".
- *
- * ─ IT MUST NEVER RESURRECT A DELETED MAPPING ─
- * `vendor_materials` has no tombstone: DELETE (/api/vendor-materials) removes
- * the row outright, so the SCHEMA CANNOT TELL "never mapped" FROM "unmapped on
- * purpose". This codebase already carries that bug shape once (a boot backfill
- * re-adding pairs an admin had deleted), so learning is gated on two durable
- * pieces of evidence instead of guessing:
- *
- *   1. AN ADDITIVE-ONCE MARKER. When (and ONLY when) this function creates a
- *      pair, it writes a `settings` row `vm_learned:<vendor_id>:<material_id>`.
- *      That row OUTLIVES the vendor_materials row, so a pair this code added
- *      can never be added by it a second time — once an admin deletes it, the
- *      deletion is final no matter how many more bills name that pair. Written
- *      on the learn path alone to keep this out of the generic settings KV:
- *      one row per pair ever auto-created, not one per pair ever purchased.
- *   2. PRE-SEED PURCHASE HISTORY. db.ts seeded the map once from `purchases`,
- *      so a pair that already had a purchase BEFORE that seed ran was offered
- *      to the map; if it is absent today, a human removed it. The seed instant
- *      is read back from the seeded rows' own created_at (settings has no
- *      timestamp column). If no seeded row survives, we fall back to treating
- *      ALL prior history as pre-seed — the conservative direction: skip the
- *      learn rather than risk the resurrection.
- *
- * A pair with only POST-seed history and no marker was never offered to
- * anybody, so creating it is genuinely additive.
- *
- * THE ONE CASE THE SCHEMA CANNOT SETTLE, stated rather than guessed at: a pair
- * typed BY HAND on Vendor Items, never purchased before the seed, and later
- * deleted, leaves no trace at all — a later bill for it will be learned once.
- * It is bounded to ONCE by rule 1, which is the deliberate difference from the
- * boot-backfill bug this codebase already had (that one re-added on every
- * restart). Closing it properly needs a tombstone column on vendor_materials
- * and a DELETE that writes one; that is a schema change, not a route change.
- *
- * Returns a short status for the response; never throws (the caller also wraps
- * it — a mapping problem must not roll back a recorded bill).
- */
-function learnVendorMaterialPair(
-  db: ReturnType<typeof getDb>,
-  args: { vendorRaw: string; materialId: string; purchaseRowId: string; invoiceId: string; actor: string },
-): VendorMappingOutcome {
-  const materialId = String(args.materialId || '').trim();
-  const rawName = String(args.vendorRaw || '').trim();
-  if (!materialId || !rawName) return { status: 'no_vendor', mapped: false };
-
-  // The SAME resolver the PO rule and the PO insert loops use — never a raw
-  // name match. A bill from someone not in the Vendor master has no vendors.id
-  // to map, and inventing a vendors row from a typed bill name is how the
-  // master fills up with near-duplicates. Skip and say so.
-  const vendor = resolveVendorRef(db, { vendor: rawName });
-  if (vendor.status !== 'known' || !vendor.id) {
-    return {
-      status: 'vendor_not_in_master', mapped: false, detail: vendor.shown,
-      warning: `The bill was saved, but "${rawName}" is not in the Vendor master, so this item could not be added to their Vendor Items list. Add the vendor under Vendors to keep vendor mapping accurate.`,
-    };
-  }
-
-  const markerKey = `vm_learned:${vendor.id}:${materialId}`;
-
-  // The common case by far: nothing to do, and nothing to warn about.
-  if (isPairMapped(db, vendor.id, materialId)) {
-    return { status: 'already_mapped', mapped: true, vendor_id: vendor.id, vendor_name: vendor.name };
-  }
-
-  // Copy shared by both "we are deliberately not re-adding this" outcomes: the
-  // bill is recorded either way, and the only correct fix is a human decision on
-  // Vendor Items — which is exactly what we must not make on their behalf.
-  const removalWarning = `The bill was saved. ${vendor.name} is not mapped to supply this item, and it was NOT added back automatically because that pair was mapped before and removed. If it should be there, add it on Vendor Items (/vendors/materials?vendor=${vendor.id}).`;
-
-  const marker = db.prepare('SELECT value FROM settings WHERE key = ?').get(markerKey) as any;
-  if (marker) {
-    return {
-      status: 'respected_removal', mapped: false, vendor_id: vendor.id, vendor_name: vendor.name,
-      warning: removalWarning,
-      detail: 'this pair was mapped before and is not mapped now — treated as a deliberate removal',
-    };
-  }
-
-  // The history seed's own timestamp, read off the rows it wrote. The
-  // 'Backfilled from vendor_contracts' rows are a DIFFERENT migration and are
-  // excluded. Sentinel '9999-12-31' = "no seeded row survives", which makes the
-  // comparison below treat every prior purchase as pre-seed (skip, don't guess).
-  const seed = db.prepare(`
-    SELECT MIN(created_at) AS t FROM vendor_materials
-    WHERE created_by = 'system' AND notes = 'seeded from purchase history'
-  `).get() as any;
-  const seedAt = String(seed?.t || '') || '9999-12-31';
-
-  // Matched the way the seed matched: on the vendor NAME stored in `purchases`,
-  // case/whitespace-insensitive — under BOTH the master's spelling and the
-  // spelling this bill used, because the row we just wrote stores the caller's
-  // string verbatim and an older row may carry either.
-  const priorPreSeed = db.prepare(`
-    SELECT 1 FROM purchases
-    WHERE material_id = ?
-      AND id <> ?
-      AND LOWER(TRIM(COALESCE(vendor, ''))) IN (?, ?)
-      AND COALESCE(created_at, '') < ?
-    LIMIT 1
-  `).get(materialId, args.purchaseRowId, vendor.name.toLowerCase(), rawName.toLowerCase(), seedAt);
-  if (priorPreSeed) {
-    // No marker written: this branch is deterministic (the history and the seed
-    // instant do not change), so it will keep answering "removed" on its own
-    // without a row per unmapped pair in the settings KV.
-    return {
-      status: 'respected_removal', mapped: false, vendor_id: vendor.id, vendor_name: vendor.name,
-      warning: removalWarning,
-      detail: 'this pair was already in purchase history when the map was seeded, so its absence is a removal',
-    };
-  }
-
-  // created_by = 'system' (not the actor's email) on purpose: lib/vendor-mapping
-  // pairSource() reads created_by='system' + a non-contract note as source
-  // 'history', which is precisely what this is — the Vendor Items screen should
-  // show it as learned from a purchase, not as somebody's hand entry. Who
-  // entered the bill is kept in the note.
-  // The note deliberately does NOT read exactly 'seeded from purchase history':
-  // that exact string identifies the db.ts seed rows, and the seed-instant query
-  // above must not start matching rows this function wrote.
-  //
-  // Keep these comments OUT of the template literal below. `//` is a JS comment,
-  // not a SQL one — inside the string SQLite parses it as an operator and throws
-  // `near "/": syntax error`, which this function catches and turns into a bland
-  // status:'error'. That is exactly how the learner shipped silently broken:
-  // every bill reported "saved", and not one pair was ever mapped.
-  db.prepare(`
-    INSERT OR IGNORE INTO vendor_materials (vendor_id, material_id, notes, created_by)
-    VALUES (?, ?, ?, 'system')
-  `).run(vendor.id, materialId, `learned from purchase ${args.invoiceId || '(no invoice id)'} entered by ${args.actor}`);
-  // THE ADDITIVE-ONCE RECORD. Written only here, and never deleted: from now on
-  // this pair is the admin's to keep or remove, and this code will not re-create
-  // it. (INSERT OR IGNORE so a re-entry of the same bill cannot fail the write.)
-  db.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)')
-    .run(markerKey, new Date().toISOString());
-  return { status: 'learned', mapped: true, vendor_id: vendor.id, vendor_name: vendor.name };
-}
 
 export async function GET(request: Request) {
   try {
+    /* ── AUTH, WHICH THIS HANDLER DID NOT HAVE ────────────────────────────────
+     * House rule: every /api route self-authenticates. src/proxy.ts guards
+     * PAGES, not APIs, and its mutating-call check is wrapped in a try/catch
+     * that falls OPEN on a DB or infra error — so it was never the thing
+     * standing between a caller and this data.
+     * getCurrentUser() was already called further down, but only INSIDE the
+     * snapshot branch and only to narrow department scope, so an anonymous
+     * request read the whole purchase register: every vendor name, every bill
+     * number and every rate per purchase unit. Unchanged for anyone signed in;
+     * this is the same 401 POST has had all along, and it is now the sole feed
+     * for the page the move makes "the record and the reports".
+     */
+    const me = await getCurrentUser();
+    if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
     const db = getDb();
     const url = new URL(request.url);
     const materialId = url.searchParams.get('material_id');
@@ -444,6 +334,37 @@ export async function POST(request: Request) {
     // (/api/stores/[id]/procure). Historical rows are untouched.
     const storeBlock = centralFlowBlock(db, material_id);
     if (storeBlock) return Response.json({ error: storeBlock }, { status: 400 });
+
+    /* ── THE QC GATE REACHES THIS ROUTE TOO ────────────────────────────────────
+     * ONE WRITER is true of the FORMS — no browser caller of this route remains.
+     * It was not true of the SYSTEM: this handler needs only a signed-in
+     * session, and it wrote perishable stock straight in with no hold. Verified
+     * against the real handler: a POST for Chicken Breast (category non-veg,
+     * gated) took current_stock 20 → 70, no receipt, no queue row. An
+     * authenticated `curl` was a complete way around the gate the move exists to
+     * make mean something.
+     *
+     * REFUSED, NOT HELD — and refusing is safe precisely BECAUSE nothing calls
+     * this any more. A hold needs a receipt document for a checker to sign
+     * against and this route creates none; and the one remaining claim on it
+     * (scripts/import-purchases.py, already dead at the auth gate above) never
+     * carried perishables. Everything else this route does is untouched, so a
+     * non-gated material still records exactly the row it always did.
+     *
+     * The wording names the screen, not the endpoint, because whoever sees this
+     * is scripting against a route the UI stopped using.
+     */
+    const purchaseQc = resolveQcRequirement(db, [String(material_id)]);
+    if (purchaseQc.required) {
+      return Response.json({
+        error: `"${material.name}" is a ${purchaseQc.categories.join(' / ')} item, and deliveries in that category are held for a `
+             + `${purchaseQc.checker === 'both' ? 'kitchen or bar' : purchaseQc.checker} check before they become stock. `
+             + `Nothing was recorded. Enter this bill on Purchases → Enter Vendor Bill (GRN), which records the receipt and waits for that signature.`,
+        qc_required: true,
+        qc_checker: purchaseQc.checker,
+        qc_categories: purchaseQc.categories,
+      }, { status: 409 });
+    }
 
     // qty/px (the validated numbers) from here down, so a numeric STRING from the
     // wire is stored as a number and can never reach the arithmetic un-coerced.

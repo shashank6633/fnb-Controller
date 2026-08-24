@@ -8,8 +8,14 @@
 import { useEffect, useMemo, useState, Fragment, type ReactNode, type WheelEvent as ReactWheelEvent } from 'react';
 import { FileCheck, ChevronDown, ChevronRight, Loader2, Plus, Trash2, X, Save, Download, Percent,
          Eye, Pencil, Printer, AlertTriangle, ChefHat, Wine, Clock, ShieldAlert, Info,
-         CheckCircle2, ShieldQuestion } from 'lucide-react';
+         CheckCircle2, ShieldQuestion, Receipt } from 'lucide-react';
 import { api } from '@/lib/api';
+// THE duplicate rule — one material = one line — lives in exactly one module.
+// src/lib/line-dedupe.ts imports NOTHING, which is the only reason a 'use client'
+// page may touch it: po-helpers.ts, where this rule used to live alone, reaches
+// @/lib/db → better-sqlite3 and would drag a native Node addon into the browser
+// bundle. Never add an import to line-dedupe.ts.
+import { duplicateLineGroups, SPLIT_RATE_REMEDY } from '@/lib/line-dedupe';
 import { todayIST, fmtIST } from '@/lib/format-date';
 import MaterialTypeahead from '@/components/MaterialTypeahead';
 import Combobox from '@/components/Combobox';
@@ -68,20 +74,72 @@ const r2 = (v: number) => Math.round((Number(v) || 0) * 100) / 100;
 interface GrnLine {
   material_id: string; quantity_received: string; quantity_accepted: string;
   rejection_reason: string; unit_price: string; notes: string;
+  /**
+   * Free text, per line — carried over from "Enter Full Bill", which had it and
+   * this form did not. Mirrored to purchases.brand by POST /api/grn.
+   * ⚠ It survives an UNHELD receipt only: goods_receipt_note_items has no brand
+   * column, so a QC-held bill's mirror (written later by grn-qc.ts) and an amend
+   * replay (grn-reversal.ts) both write ''. Stated on the field itself.
+   */
+  brand: string;
+  /**
+   * 'btl' = the typed quantity is purchase units and the rate is ₹ per purchase
+   * unit (the default). 'case' = the quantity is CASES and the rate is ₹ per
+   * CASE.
+   *
+   * ⚠ THE EXPANSION IS THE SERVER'S, NOT THIS FORM'S. `entry_mode` rides to
+   * POST /api/grn and normaliseCaseEntry() there multiplies the quantity and
+   * divides the rate. THE BUG THAT WAS FIXED TWICE was exactly this arithmetic
+   * living in two browsers; it now lives in the one writer. This form may show
+   * the toggle and label the boxes from it — it must never do the maths.
+   */
+  entry_mode: 'btl' | 'case';
   gst_rate: string;
   /** GST compensation cess %, seeded from raw_materials.cess_percent. */
   cess_rate: string;
   discount: string; cgst: string; sgst: string; special_excise_cess: string;
   tcs: string; delivery_charges: string; mrp_round_off: string;
 }
+/**
+ * A line's `gst_rate` when it FOLLOWS THE BILL-LEVEL RATE — the third state, and
+ * it has to be a third state because on this form '' already means something
+ * else and something opposite.
+ *
+ *   'bill'  → use the bill-level GST %. The default for a fresh line, and what
+ *             "Enter Full Bill" meant by its own ''.
+ *   ''      → MANUAL: no rate at all, the clerk types the CGST/SGST rupees.
+ *             This is /grn's pre-existing meaning and the manual path is live;
+ *             it must stay reachable, so it stays an explicit choice.
+ *   '5'…    → this line's own rate, whatever the bill's default is.
+ *
+ * Never posted as-is: resolveGst() below turns 'bill' into a number (or into
+ * "manual") before the payload is built. POST /api/grn reads a missing gst_rate
+ * as "store the hand-typed ₹", so sending the sentinel would silently untax the
+ * line.
+ */
+const BILL_GST = 'bill';
 const blankLine = (): GrnLine => ({
   material_id: '', quantity_received: '', quantity_accepted: '', rejection_reason: '', unit_price: '', notes: '',
-  gst_rate: '', cess_rate: '',
+  brand: '', entry_mode: 'btl',
+  gst_rate: BILL_GST, cess_rate: '',
   discount: '', cgst: '', sgst: '', special_excise_cess: '', tcs: '', delivery_charges: '', mrp_round_off: '',
 });
 const n0 = (s?: string) => { const v = Number(s); return Number.isFinite(v) ? v : 0; };
 /** SUBTOTAL = inward qty × rate. */
 const lineSubtotal = (l: GrnLine) => n0(l.quantity_received) * n0(l.unit_price);
+/**
+ * ONE LINE'S SHARE OF THE TWO BILL-LEVEL CHARGES, in rupees.
+ *
+ * "Enter Full Bill" took ONE Discount and ONE Delivery figure for the whole bill
+ * (By % or By Amount) and split them across the lines in proportion to each
+ * line's goods value; this form had per-line rupees only. Both survive: the
+ * per-line box is the line's OWN charge, the share is this line's slice of the
+ * bill-level one, and every reader below adds them. The payload sends the SUM,
+ * because `purchases.discount` and `goods_receipt_note_items.discount` are one
+ * column each and a bill cannot record two kinds of discount separately.
+ */
+interface LineShare { discount: number; delivery: number }
+const NO_SHARE: LineShare = { discount: 0, delivery: 0 };
 /** TOTAL INWARD AMOUNT for a line (same formula the server + register use).
  *  `tax` overrides the two hand-typed ₹ boxes with the figures derived from the
  *  line's GST% — pass it wherever a rate is in play, or the screen total lags
@@ -90,12 +148,16 @@ const lineSubtotal = (l: GrnLine) => n0(l.quantity_received) * n0(l.unit_price);
  *  box to fall back on — there is no `l.compensation_cess` — so it is always
  *  passed in or absent, and it is a SEPARATE term: never folded into cgst/sgst
  *  (that sum is a GST-return figure) and never into special_excise_cess (that
- *  column means the TGBCL levy). */
-const lineTotal = (l: GrnLine, tax?: { cgst: number; sgst: number }, cess?: number) =>
-  lineSubtotal(l) - n0(l.discount) + (tax ? tax.cgst : n0(l.cgst)) + (tax ? tax.sgst : n0(l.sgst))
+ *  column means the TGBCL levy).
+ *  `share` is the line's slice of the two BILL-LEVEL charges. Defaulted to zero
+ *  so every pre-existing call site (the saved-GRN views, which have no bill-level
+ *  entry at all) keeps reading exactly what it read before. */
+const lineTotal = (l: GrnLine, tax?: { cgst: number; sgst: number }, cess?: number, share: LineShare = NO_SHARE) =>
+  lineSubtotal(l) - n0(l.discount) - share.discount
+  + (tax ? tax.cgst : n0(l.cgst)) + (tax ? tax.sgst : n0(l.sgst))
   + (cess || 0)
   + n0(l.special_excise_cess)
-  + n0(l.tcs) + n0(l.delivery_charges) + n0(l.mrp_round_off);
+  + n0(l.tcs) + n0(l.delivery_charges) + share.delivery + n0(l.mrp_round_off);
 /** Same TOTAL formula for a saved GRN item row (server fields). */
 const itemInwardTotal = (it: any) =>
   (Number(it.quantity_received) || 0) * (Number(it.unit_price) || 0)
@@ -103,6 +165,61 @@ const itemInwardTotal = (it: any) =>
   + (Number(it.compensation_cess) || 0)
   + (Number(it.special_excise_cess) || 0) + (Number(it.tcs) || 0)
   + (Number(it.delivery_charges) || 0) + (Number(it.mrp_round_off) || 0);
+
+/** By % of the goods subtotal, or a flat ₹ figure. Transcribed from
+ *  purchases/page.tsx's billCalc — the two forms resolved a bill-level charge
+ *  the same way and the moved one must not start rounding differently. */
+const pctOrFlat = (mode: 'percent' | 'amount', raw: string, subtotal: number) => {
+  const v = parseFloat(raw) || 0;
+  if (v <= 0) return 0;
+  return mode === 'percent' ? r2(subtotal * v / 100) : v;
+};
+
+/**
+ * One bill-level charge row: By % / By Amount + the resolved ₹ figure.
+ * Shared by Delivery Charges and Discount so the two always look and behave the
+ * same — the only difference is what each does to cost, which `hint` states.
+ * Transcribed from src/app/purchases/page.tsx, where "Enter Full Bill" lived.
+ */
+function ChargeRow({ label, hint, mode, value, onMode, onValue, placeholder, total, tone, negative }: {
+  label: string; hint: string;
+  mode: 'percent' | 'amount'; value: string;
+  onMode: (m: 'percent' | 'amount') => void;
+  onValue: (v: string) => void;
+  placeholder: string; total: number; tone: string; negative?: boolean;
+}) {
+  const name = 'grn-' + label.replace(/\s+/g, '-').toLowerCase();
+  return (
+    <div className="flex items-center gap-3 flex-wrap">
+      <span className="text-xs font-medium text-[#6B5744] min-w-[130px]">
+        {label}
+        <span className="block text-[10px] font-normal text-[#8B7355]">{hint}</span>
+      </span>
+      <div className="flex items-center gap-2">
+        {(['percent', 'amount'] as const).map(m => (
+          <label key={m} className="flex items-center gap-1.5 cursor-pointer">
+            {/* name= groups the pair, so the two rows don't share a selection */}
+            <input type="radio" name={name} checked={mode === m} onChange={() => onMode(m)} className="accent-[#af4408]" />
+            <span className="text-xs text-[#6B5744]">{m === 'percent' ? 'By %' : 'By Amount'}</span>
+          </label>
+        ))}
+      </div>
+      <div className="flex items-center gap-1">
+        {mode === 'amount' && <span className="text-xs text-[#8B7355]">₹</span>}
+        <input
+          type="number" step="0.01" min="0" value={value}
+          onChange={e => onValue(e.target.value)}
+          placeholder={placeholder}
+          className="w-28 px-2 py-1.5 bg-white border border-[#E8D5C4] rounded-lg text-xs text-[#2D1B0E] focus:outline-none focus:ring-2 focus:ring-[#af4408]"
+        />
+        <span className="text-xs text-[#8B7355]">{mode === 'percent' ? '%' : ''}</span>
+      </div>
+      <span className={`text-xs font-medium ml-auto font-mono ${tone}`}>
+        {negative && total > 0 ? '- ' : ''}{m2(total)}
+      </span>
+    </div>
+  );
+}
 
 /* ============================================================ */
 /* THE KITCHEN QC GATE, as this page has to speak about it.     */
@@ -293,6 +410,39 @@ export default function GrnPage() {
   const [statusFilter, setStatusFilter] = useState('');
   const [expanded, setExpanded] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
+
+  /* ── /grn?new=1 OPENS THE BILL FORM STRAIGHT AWAY ───────────────────────────
+   * Purchases' "Enter Vendor Bill" button links here. Landing on the LIST meant
+   * the storekeeper pressed a second, identically-labelled button before they
+   * could type anything — an extra navigation and an extra click on the job they
+   * do every morning, added to the exact screen we want them using instead of
+   * the ungated CSV importer sitting beside that link.
+   *
+   * window.location, not useSearchParams: this is a one-shot read on mount, and
+   * the hook would put this whole page under a Suspense boundary for a prerender
+   * concern that does not apply to a flag we consume once.
+   * The flag is STRIPPED from the URL afterwards so a refresh, or a Back into
+   * this page, does not reopen the form on top of whatever is on screen.
+   * DEFERRED BY A TICK, and that is not superstition: the App Router re-syncs
+   * the address bar to its own route state after this effect commits, so a
+   * replaceState called inline is overwritten and the flag stays in the URL
+   * (observed in the running app). One tick later it sticks. The timer is
+   * cleared on unmount so a fast navigation away cannot rewrite the URL of the
+   * page that replaced this one.
+   */
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const p = new URLSearchParams(window.location.search);
+    if (p.get('new') !== '1') return;
+    setCreating(true);
+    const t = setTimeout(() => {
+      const q = new URLSearchParams(window.location.search);
+      q.delete('new');
+      const qs = q.toString();
+      window.history.replaceState(null, '', window.location.pathname + (qs ? `?${qs}` : ''));
+    }, 0);
+    return () => clearTimeout(t);
+  }, []);
   /**
    * Is the signed-in user an admin? THREE-STATE, and null (= "not answered
    * yet / the answer did not arrive") is NOT the same as false for anything but
@@ -468,7 +618,16 @@ export default function GrnPage() {
             <FileCheck className="w-6 h-6 text-[#af4408]" /> Goods Receipt Notes
           </h1>
           <p className="text-xs text-[#6B5744] mt-1">
-            Every PO receive creates a GRN. Each line records ordered / received / accepted / rejected with a reason. Use <em>Ad-hoc GRN</em> for receipts without a parent PO (cash buy, sample, donation).
+            {/* THE SENTENCE A STOREKEEPER ARRIVING FROM /purchases READS FIRST.
+                "Enter Full Bill" was moved here, so this page is no longer just
+                the PO's paperwork — it is where every hand-typed vendor bill is
+                recorded. If that is not said in the first line, somebody who
+                used that button daily reads "Goods Receipt Notes" and keeps
+                looking. */}
+            <b>Every vendor bill is recorded here</b> — press <em>Enter Vendor Bill</em> for anything typed by hand
+            (a full printed invoice, a cash buy, a sample, a donation, a vendor return). Receiving a PO creates a GRN
+            automatically. Each line records ordered / received / accepted / rejected with a reason, and perishables are
+            held for a kitchen check before any stock appears.
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -478,8 +637,9 @@ export default function GrnPage() {
             {exporting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />} Inward Register
           </button>
           <button onClick={() => setCreating(true)}
+                  title="Record a vendor bill that has no purchase order behind it — the full printed invoice, a cash buy, a sample, a donation or a return."
                   className="px-3 py-2 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm flex items-center gap-2">
-            <Plus className="w-4 h-4" /> New Ad-hoc GRN
+            <Receipt className="w-4 h-4" /> Enter Vendor Bill
           </button>
         </div>
       </div>
@@ -1389,6 +1549,10 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
   const [vendor, setVendor] = useState('');
   const [vendorId, setVendorId] = useState('');
   const [invoice, setInvoice] = useState('');
+  /** Declared: this delivery came with no vendor bill at all. Restores what
+   *  "Enter Full Bill" allowed (4 of its 13 real rows had a blank number)
+   *  without letting a blank happen by accident. See the field. */
+  const [noBill, setNoBill] = useState(false);
   const [invoiceDate, setInvoiceDate] = useState('');
   const [qcBy, setQcBy] = useState('');
   const [notes, setNotes] = useState('');
@@ -1399,6 +1563,33 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
   });
   const toggleQc = (k: keyof typeof qc) => setQc(p => ({ ...p, [k]: !p[k] }));
   const [items, setItems] = useState<GrnLine[]>([blankLine()]);
+  /* ── THE BILL-LEVEL CHARGES, CARRIED OVER FROM "ENTER FULL BILL" ──────────
+   * One Discount and one Delivery figure for the WHOLE bill, By % or By Amount,
+   * split across the lines in proportion to each line's goods value. That is
+   * how a printed vendor bill is actually written, and typing the same rupees
+   * onto twenty lines by hand is how one line silently ends up wrong.
+   *
+   * WHAT EACH DOES TO COST, and the two answers are different:
+   *   Discount REDUCES the cost basis — POST /api/grn nets it into unit_price
+   *   (byte-for-byte the arithmetic grn-qc.ts uses at sign-off), so a discount
+   *   genuinely lowers what the goods cost and every recipe built on them.
+   *   Delivery is RECORDED ONLY. It never touches unit_price on any path.
+   * Do not "align" the two — the divergence is the owner's rule. */
+  const [discountMode, setDiscountMode] = useState<'percent' | 'amount'>('percent');
+  const [discountValue, setDiscountValue] = useState('');
+  const [deliveryMode, setDeliveryMode] = useState<'percent' | 'amount'>('amount');
+  const [deliveryValue, setDeliveryValue] = useState('');
+  /**
+   * Bill-level GST % that every line on BILL_GST inherits. One vendor bill is
+   * almost always one rate; retyping it on twenty lines is how one line silently
+   * ends up on the wrong rate.
+   *
+   * DEFAULT '' = "no bill rate — each line manual unless it sets its own", which
+   * is exactly what a fresh ad-hoc GRN did before this form absorbed the bill
+   * entry. Nothing about an existing receipt's arithmetic changes until somebody
+   * picks a rate here.
+   */
+  const [billGst, setBillGst] = useState('');
   // Per-line collapsible charges panel (Discount / CGST / SGST / Cess / TCS /
   // Delivery / MRP round-off). Default collapsed — most lines carry no charges.
   const [openCharges, setOpenCharges] = useState<Set<number>>(new Set());
@@ -1575,20 +1766,56 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
    *   · store-mapped (TGBCL liquor) is zero-rated here and returns '' so no rate
    *     can ever be seeded onto it. tax_percent is a free field on the master with
    *     no liquor guard, so a manager CAN type 18 on a TGBCL item.
-   *   · a rate that is not in GST_RATES (say 7) returns '' rather than a value
-   *     matching no <option> — React renders the select blank, the clerk reads
-   *     0%, and the calc books 7%.
-   * '' here means MANUAL (type the ₹ yourself), not "inherit" — this form has no
-   * bill-level rate, so an unseeded line behaves exactly as it does today.
+   *   · a rate that is not in GST_RATES (say 7) returns the fall-back rather than
+   *     a value matching no <option> — React renders the select blank, the clerk
+   *     reads 0%, and the calc books 7%.
+   *
+   * ⚠ THE FALL-BACK IS BILL_GST, NOT ''. It used to be '' — MANUAL — because this
+   * form had no bill-level rate to inherit. Now it does, and '' means the opposite
+   * of what "Enter Full Bill" meant by its own '': there, an unseeded line
+   * followed the bill; here it would go manual and be taxed at ₹0 unless somebody
+   * typed the rupees. Seeding to BILL_GST keeps the moved form's behaviour, and
+   * with billGst defaulting to '' a fresh line still resolves to manual — so an
+   * ad-hoc receipt entered the way it always was books exactly what it always did.
    */
   const seedGstForMaterial = (materialId: string): string => {
-    if (!materialId) return '';
-    if (storeMappedLine(materialId)) return '';
+    if (!materialId) return BILL_GST;
+    if (storeMappedLine(materialId)) return BILL_GST;
     const m = materials.find(x => x.id === materialId) as any;
     const t = Number(m?.tax_percent) || 0;
-    if (t <= 0) return '';
+    if (t <= 0) return BILL_GST;
     const s = String(t);
-    return (GST_RATES as readonly string[]).includes(s) ? s : '';
+    return (GST_RATES as readonly string[]).includes(s) ? s : BILL_GST;
+  };
+
+  /**
+   * THE RATE A LINE IS ACTUALLY TAXED AT, as a string.
+   *   '' → MANUAL: no rate, the clerk's hand-typed CGST/SGST rupees stand.
+   *   otherwise a percent.
+   * The ONE place BILL_GST is resolved. Every reader — the badge, lineTax, the
+   * payload — goes through here, or the screen and the row disagree about which
+   * rate a line carried. Store-mapped (TGBCL) lines are not this form's to tax
+   * at all, so they answer manual-and-zero; lineTax's own `!storeMappedLine`
+   * guard is the authority and this sits beneath it.
+   */
+  const resolveGst = (l: GrnLine): string => {
+    if (storeMappedLine(l.material_id)) return '';
+    return l.gst_rate === BILL_GST ? billGst : l.gst_rate;
+  };
+
+  /**
+   * Is this quantity/price box on the CASE basis? The LABEL mirror of the guard
+   * inside normaliseCaseEntry() on the server: it expands ONLY when the mode is
+   * 'case' AND case_size > 1. A mode left on 'case' after switching to a
+   * non-case material falls back to purchase-unit behaviour, so a label keyed on
+   * entry_mode ALONE would announce a basis the arithmetic is not using — the
+   * exact defect that was found and fixed once per form when there were two
+   * forms (buyer read "in BTL", typed 60 cases-worth, booked 720 bottles).
+   * Every annotation on this form keys on this one helper.
+   */
+  const caseBasis = (materialId: string, mode?: 'btl' | 'case') => {
+    const cs = Number((materials.find(x => x.id === materialId) as any)?.case_size) || 1;
+    return { cs, on: mode === 'case' && cs > 1 };
   };
 
   /**
@@ -1635,13 +1862,18 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
    * CGST absorbs the odd paisa, so the house invariant tax_value === cgst + sgst
    * holds EXACTLY. Do not re-derive either half with a float divide.
    */
-  const lineTax = (l: GrnLine) => {
-    const derived = l.gst_rate !== '' && !storeMappedLine(l.material_id);
+  const lineTax = (l: GrnLine, share: LineShare = NO_SHARE) => {
+    const eff = resolveGst(l);
+    const derived = eff !== '' && !storeMappedLine(l.material_id);
     const qa = l.quantity_accepted !== '' ? n0(l.quantity_accepted) : n0(l.quantity_received);
     const q = qa > 0 ? qa : 0;
-    const taxable = r2(q * n0(l.unit_price) - n0(l.discount));
+    // The line's OWN discount plus its slice of the bill-level one. Both reduce
+    // the taxable base, because both are money the vendor did not charge — and
+    // both are summed into the single `discount` rupee the payload sends, so the
+    // screen and the stored row are looking at the same number.
+    const taxable = r2(q * n0(l.unit_price) - n0(l.discount) - share.discount);
     if (!derived) return { rate: 0, taxable, tax: 0, cgst: n0(l.cgst), sgst: n0(l.sgst), derived };
-    const rate = parseFloat(l.gst_rate) || 0;
+    const rate = parseFloat(eff) || 0;
     const taxPaise = rate > 0 ? Math.max(0, Math.round(taxable * rate)) : 0;
     const tax = taxPaise / 100;
     const sgst = Math.floor(taxPaise / 2) / 100;
@@ -1689,6 +1921,87 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
     return { rate, base, cess: cessPaise / 100, derived };
   };
 
+  /* ═══════════════════════════════════════════════════════════════════════════
+   * THE BILL, AS ONE DOCUMENT — apportionment + the figures printed on the paper
+   * ═══════════════════════════════════════════════════════════════════════════
+   * Transcribed from "Enter Full Bill"'s billCalc, with two deliberate
+   * differences that follow from where it now lives:
+   *
+   *  1. THE APPORTIONMENT BASE IS THE *RECEIVED* GOODS VALUE, not the accepted.
+   *     A bill-level discount is a fact about the paper the vendor handed over,
+   *     and the register's own subtotal is `quantity_received × unit_price`
+   *     (lineSubtotal, and the server clamps each share to exactly that). Split
+   *     on the accepted quantity and a short-accepted line would be given a
+   *     smaller slice than the vendor actually gave it.
+   *  2. IT DOES NOT NET ANYTHING INTO THE RATE. The old modal divided the
+   *     discount into unit_price in the browser and posted the net figure;
+   *     POST /api/grn does that server-side now, with grn-qc.ts's arithmetic, so
+   *     a bill books identically whether the QC gate held it or not. This is a
+   *     display + payload layer only.
+   *
+   * The discount is CLAMPED to the goods subtotal: a discount larger than the
+   * goods would drive a negative cost basis and poison average_price. Flagged
+   * on screen rather than silently absorbed.
+   */
+  const bill = useMemo(() => {
+    // rate-basis: purchase — qty and rate are BOTH in the typed basis (purchase
+    // units × ₹/purchase-unit, or cases × ₹/case), and the product is the same
+    // money either way, which is why the shares can be computed before the
+    // server expands a CASE line.
+    const goods = items.map(l => r2(lineSubtotal(l)));
+    const subtotal = r2(goods.reduce((s, v) => s + v, 0));
+    const rawDiscount = pctOrFlat(discountMode, discountValue, subtotal);
+    const discountAmount = Math.min(rawDiscount, Math.max(0, subtotal));
+    const discountClamped = rawDiscount > subtotal && subtotal > 0;
+    const deliveryAmount = pctOrFlat(deliveryMode, deliveryValue, subtotal);
+    const shares: LineShare[] = goods.map(g => {
+      const p = subtotal > 0 ? g / subtotal : 0;
+      return { discount: r2(discountAmount * p), delivery: r2(deliveryAmount * p) };
+    });
+
+    // The per-line derived figures, resolved ONCE against those shares so the
+    // row, the charges panel, the footer and the payload cannot disagree.
+    const lines = items.map((l, i) => {
+      const share = shares[i] || NO_SHARE;
+      const tax = lineTax(l, share);
+      const cess = lineCess(l);
+      const total = lineTotal(l, tax, cess.cess, share);
+      const discountAll = r2(n0(l.discount) + share.discount);
+      const deliveryAll = r2(n0(l.delivery_charges) + share.delivery);
+      // What one purchase unit ends up costing after every discount — the figure
+      // the server will store as purchases.unit_price, so it is the one number
+      // that decides what this material costs the kitchen. Shown per line.
+      const acc = l.quantity_accepted !== '' ? n0(l.quantity_accepted) : n0(l.quantity_received);
+      const netUnit = acc > 0 ? r2((r2(acc * n0(l.unit_price)) - discountAll) / acc) : 0;
+      return { share, tax, cess, total, discountAll, deliveryAll, netUnit, goods: goods[i] };
+    });
+
+    const cgstTotal = r2(lines.reduce((s, l) => s + l.tax.cgst, 0));
+    const sgstTotal = r2(lines.reduce((s, l) => s + l.tax.sgst, 0));
+    // Kept OUT of the GST total on purpose: compensation cess is a separate levy
+    // and the figure a GST return is filed on must stay exactly the GST figure.
+    const cessTotal = r2(lines.reduce((s, l) => s + l.cess.cess, 0));
+    const lineDiscounts = r2(items.reduce((s, l) => s + n0(l.discount), 0));
+    const lineDelivery  = r2(items.reduce((s, l) => s + n0(l.delivery_charges), 0));
+    const otherCharges  = r2(items.reduce(
+      (s, l) => s + n0(l.special_excise_cess) + n0(l.tcs) + n0(l.mrp_round_off), 0));
+    const totalInward = r2(lines.reduce((s, l) => s + l.total, 0));
+
+    return {
+      goods, subtotal, discountAmount, discountClamped, deliveryAmount, shares, lines,
+      cgstTotal, sgstTotal, taxTotal: r2(cgstTotal + sgstTotal), cessTotal,
+      lineDiscounts, lineDelivery, otherCharges, totalInward,
+      /** Goods less EVERY discount — the taxable figure printed on the paper. */
+      taxableTotal: r2(subtotal - discountAmount - lineDiscounts),
+    };
+    // storeCats/materials feed resolveGst + storeMappedLine; billGst is the rate
+    // every un-overridden line resolves to.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [items, discountMode, discountValue, deliveryMode, deliveryValue, billGst, materials, storeCats]);
+
+  /** This line's share of the bill-level charges — the render's shorthand. */
+  const shareAt = (i: number): LineShare => bill.shares[i] || NO_SHARE;
+
   // When a vendor is picked, fetch their MAPPED materials (vendor_materials
   // table — not contracts). User manages mappings on /vendors/materials.
   // Empty mapping → fall back to all materials.
@@ -1709,6 +2022,62 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
   const filteredMaterials = (vendorMaterialIds && !showAllMaterials)
     ? materials.filter(m => vendorMaterialIds.has(m.id))
     : materials;
+
+  /* ══ VENDOR ↔ ITEM MAPPING — CONSULTED, NEVER BLOCKING ═══════════════════
+   *
+   * A PURCHASE ORDER is a document we author, so /purchase-orders refuses an
+   * unmapped vendor↔item pair outright. A BILL IS A FACT: it already happened,
+   * the goods are at the bay, and refusing it here would only leave the
+   * storekeeper holding an invoice with nowhere to enter it. So this WARNS and
+   * still saves. That divergence from the strict PO rule is deliberate.
+   *
+   * AUTO-LEARN EXISTS, AND IT LEARNS ONCE, server-side: POST /api/grn calls
+   * learnVendorMaterialPair (src/lib/vendor-learn.ts) on every receivable line
+   * and returns `vendor_mapping[]` for the pairs it would not map. That array is
+   * surfaced after the save. The button below is therefore NOT the only path —
+   * it is for the pairs the learner will not touch: a mapping an admin
+   * deliberately deleted, or a vendor typed as free text with no master row.
+   *
+   * Carried over from "Enter Full Bill" wholesale, and it is ADDITIVE to this
+   * form's own filter: the filter narrows the picker, the ★ marks say WHY, and
+   * the chips are the shortest path to the items this vendor actually supplies. */
+
+  /** The typed vendor as a MASTER ROW id, or '' when the name is new/custom.
+   *  `vendorId` is already maintained by the Vendor combobox; this is only the
+   *  name the panels print beside it. */
+  const vendorShort = vendor.trim() || 'this vendor';
+  /** Is the typed name a real vendors row? Drives the badge under the field. */
+  const vendorKnown = !!vendorId;
+
+  /**
+   * The picker's list, with this vendor's items MARKED. MaterialTypeahead is a
+   * shared component that re-sorts internally, so array order cannot express
+   * priority and the mark has to travel on a field it renders: the category
+   * line. Marking there — not in the name — keeps the component's name-prefix
+   * relevance scoring intact, and as a bonus the mark joins its search haystack,
+   * so typing the vendor's name lists their items. NOTHING is filtered out here;
+   * the vendor filter above is the only thing that narrows the list.
+   */
+  const pickerMaterials = useMemo(() => {
+    if (!vendorMaterialIds || vendorMaterialIds.size === 0) return filteredMaterials;
+    return filteredMaterials.map((m: any) =>
+      vendorMaterialIds.has(String(m.id))
+        ? { ...m, category: `★ ${vendorShort}${m.category ? ` · ${m.category}` : ''}` }
+        : m,
+    );
+  }, [filteredMaterials, vendorMaterialIds, vendorShort]);
+
+  /** The vendor's mapped items, alphabetical — the "show these first" list. */
+  const vendorMappedMaterials = useMemo(() => {
+    if (!vendorMaterialIds || vendorMaterialIds.size === 0) return [] as any[];
+    return materials
+      .filter((m: any) => vendorMaterialIds.has(String(m.id)))
+      .sort((a: any, b: any) => String(a.name).localeCompare(String(b.name)));
+  }, [vendorMaterialIds, materials]);
+
+  const [vendorItemsOpen, setVendorItemsOpen] = useState(false);
+  const [vendorMapBusy, setVendorMapBusy] = useState(false);
+  const [mapNote, setMapNote] = useState<string | null>(null);
 
   /**
    * PURCHASE-unit basis for every quantity on this form. /api/grn POST reads
@@ -1747,7 +2116,10 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
   const pickMaterial = (i: number, id: string) => {
     const cur = items[i];
     const prevSeed = seedGstForMaterial(cur.material_id);
-    const keep = !(cur.gst_rate === '' || cur.gst_rate === prevSeed)
+    // "Still machine-set" is now BILL_GST (the fresh-line default) or the previous
+    // material's own seed. An explicit '' is MANUAL — a choice the clerk made, and
+    // silently un-choosing it would take their two hand-typed ₹ boxes read-only.
+    const keep = !(cur.gst_rate === BILL_GST || cur.gst_rate === prevSeed)
       || n0(cur.cgst) !== 0 || n0(cur.sgst) !== 0;
     // Compensation cess re-seeds under the SAME "still machine-set?" test, judged
     // against ITS OWN previous seed. The `|| n0(cgst) !== 0 || n0(sgst) !== 0`
@@ -1762,6 +2134,104 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
       cess_rate: keepCess ? cur.cess_rate : seedCessForMaterial(id),
     });
   };
+
+  /** Put a mapped item on the first empty line (else a new one). Refuses to add
+   *  an item the bill already carries — this panel must not create the very
+   *  duplicate the picker's excludeIds exists to catch. */
+  const placeMaterialOnLine = (materialId: string, name: string) => {
+    // Read the decision off current state and act OUTSIDE the updater — a
+    // setState call inside another setState's updater is not safe.
+    const at = items.findIndex(l => String(l.material_id || '').trim() === materialId);
+    if (at >= 0) {
+      setMapNote(`${name} is already on line ${at + 1} — add the quantity there.`);
+      return;
+    }
+    setMapNote(null);
+    // Seed the rates here too: this panel is the SECOND way a material lands on
+    // a line, and a line seeded only on the picker path would tax differently
+    // depending on which control the storekeeper happened to use.
+    const seeded = {
+      material_id: materialId,
+      gst_rate: seedGstForMaterial(materialId),
+      cess_rate: seedCessForMaterial(materialId),
+    };
+    setItems(prev => {
+      const empty = prev.findIndex(l => !String(l.material_id || '').trim());
+      if (empty >= 0) return prev.map((l, i) => (i === empty ? { ...l, ...seeded } : l));
+      return [...prev, { ...blankLine(), ...seeded }];
+    });
+  };
+
+  /** The one action that actually keeps the map current, offered where the gap
+   *  is noticed. Additive only (the route's INSERT OR IGNORE), one pair. */
+  const addToVendorItems = async (materialId: string, name: string) => {
+    if (!vendorId || !materialId) return;
+    setVendorMapBusy(true);
+    setMapNote(null);
+    try {
+      const res = await api('/api/vendor-materials', {
+        method: 'POST',
+        body: { vendor_id: vendorId, material_id: materialId },
+      });
+      const j = await res.json().catch(() => null);
+      if (!res.ok) { setMapNote(j?.error || `Could not add ${name} to ${vendorShort}'s items.`); return; }
+      setVendorMaterialIds(prev => new Set(prev ? [...prev, materialId] : [materialId]));
+      setMapNote(`${name} added to ${vendorShort}'s items.`);
+    } catch (err: any) {
+      setMapNote(err?.message || `Could not add ${name} to ${vendorShort}'s items.`);
+    } finally {
+      setVendorMapBusy(false);
+    }
+  };
+
+  /**
+   * LINES THIS RECEIPT CANNOT TAKE — SAID BEFORE SAVE, NOT AFTER.
+   *
+   * centralFlowBlock() drops a store-mapped (TGBCL liquor) line from the payload
+   * and reports it in `store_blocked`; the receipt otherwise SUCCEEDS. The old
+   * bill form never reached this state — /api/purchases 400s the whole request
+   * on a store-mapped line — so moving the form here introduced a way for a line
+   * to fall off a bill that saved cleanly. SaveNotices says so afterwards; this
+   * says so while there is still something to do about it.
+   *
+   * It does NOT block. A bill is a fact and the rest of it is perfectly
+   * receivable — refusing the lot would leave a storekeeper holding an invoice
+   * with nowhere to enter any of it.
+   */
+  const storeBlockedLines = useMemo(
+    () => items.map((l, i) => ({ l, i }))
+      .filter(({ l }) => l.material_id && storeMappedLine(l.material_id))
+      .map(({ l, i }) => ({
+        no: i + 1,
+        name: String((materials.find((m: any) => m.id === l.material_id) as any)?.name || l.material_id),
+      })),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [items, materials, storeCats],
+  );
+
+  /* ══ ONE MATERIAL = ONE LINE ═════════════════════════════════════════════
+   *
+   * THE RULE IS IMPORTED, NOT RESTATED — src/lib/line-dedupe.ts, the same
+   * lineKey/duplicateLineGroups the PO routes and POST /api/grn's
+   * duplicateLineError() enforce. Restating it here is exactly how the bill form
+   * and the PO drifted apart when there were two of them.
+   *
+   * The picker already greys an item that is on another row (excludeIds), so a
+   * repeat is hard to create — but a line can be filled by the vendor chips, and
+   * `excludeMode='disable'` means the greyed row is still visible and clickable.
+   * A repeat writes TWO goods_receipt_note_items rows, TWO purchases rows, TWO
+   * stock bumps and two passes through updateMaterialPrice's weighted average
+   * for one delivered item, so it is refused rather than warned about. The
+   * server refuses the same repeat, so removing this only moves the error later.
+   */
+  const dupGroups = useMemo(() => {
+    const groups = duplicateLineGroups(items.map(l => ({ material_id: l.material_id })));
+    return groups.map(g => ({
+      materialId: g.key,
+      name: String((materials.find((m: any) => String(m.id) === g.key) as any)?.name || g.key),
+      lineNos: g.lineNos,
+    }));
+  }, [items, materials]);
 
   /**
    * WHAT THE SERVER IS ABOUT TO DECIDE, decided here first — same rule, same
@@ -1886,6 +2356,21 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
    */
   const [undecided, setUndecided] = useState<any>(null);
 
+  /**
+   * THE RECEIPT THAT WENT THROUGH AND STILL HAS SOMETHING TO SAY — a liquor line
+   * that was left off the bill, or a vendor↔item pair the learner would not map.
+   *
+   * `store_blocked` was the dangerous one. POST /api/grn filters a store-mapped
+   * (TGBCL) line out of an otherwise SUCCESSFUL receipt, and this form used to
+   * render that array only inside the QC-hold panel — so on the ordinary path a
+   * line vanished off the bill under a green "✓ Created" with no word about it.
+   * `vendor_mapping` is the warn-half of the bill rule, carried over from
+   * "Enter Full Bill": the save HAS succeeded and it is for the form to say that
+   * this vendor is not declared to supply an item. Both are surfaced on EVERY
+   * outcome — held, undecided and plain success.
+   */
+  const [received, setReceived] = useState<any>(null);
+
   const submit = async () => {
     // Validate qtys BEFORE filtering so the user sees errors instead of silent drops.
     for (let i = 0; i < items.length; i++) {
@@ -1917,8 +2402,64 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
     });
     if (cleaned.length === 0) { alert('Add at least one line with a material and qty'); return; }
     if (!vendor.trim()) { alert('Vendor name required'); return; }
+    if (!invoice.trim() && !noBill) {
+      // Mandatory since 5522138 and re-checked server-side. Said here in the
+      // route's own terms so it lands before the round trip — including the way
+      // out, which is a declaration, not an empty box.
+      alert('The vendor\'s bill / invoice number is required — it is the only link back to the paper once the stock line is all that is left.\n\n'
+          + 'If this delivery genuinely came with no bill (a cash market run, a sample, a donation, a return), tick "No vendor bill number" under the field.');
+      return;
+    }
     if (isAdjustment && !adjustmentRef.trim()) {
       alert('Back-correction mode: enter the prior GRN# / PO# / invoice# you\'re correcting (for audit).');
+      return;
+    }
+    // ONE MATERIAL = ONE LINE. Refused outright, exactly like a PO and exactly
+    // like the bill form this absorbed: every repeat writes its own GRN line,
+    // its own purchases row and its own stock bump, so the item is delivered
+    // once and booked twice. The server refuses the same repeat.
+    if (dupGroups.length > 0) {
+      const g = dupGroups[0];
+      alert(
+        `${g.name} is on line ${g.lineNos.join(' and line ')}. `
+        + `One item = one line on a bill, so this receipt cannot be saved as it stands.\n\n`
+        + SPLIT_RATE_REMEDY,
+      );
+      return;
+    }
+    // A discount that swallows the whole goods value zeroes every line's cost
+    // basis. Carried over from "Enter Full Bill", which named this rather than
+    // letting the lines fall out of the filter as "no items entered".
+    if (bill.subtotal > 0 && r2(bill.discountAmount + bill.lineDiscounts) >= bill.subtotal) {
+      alert(
+        `The discount (${m2(r2(bill.discountAmount + bill.lineDiscounts))}) equals or exceeds the goods value `
+        + `(${m2(bill.subtotal)}), so every line would be booked at ₹0 and every recipe built on these items `
+        + `would be re-costed to nothing.\n\nReduce the discount, or record a free-of-charge receipt separately.`,
+      );
+      return;
+    }
+    // The same trap one line at a time: a line whose net rate rounds to ₹0 used
+    // to be dropped in silence and the success message then reported fewer items
+    // than were typed. POST /api/grn refuses a ₹0 rate outright now — this names
+    // the line first, and names the discount when the discount is the cause.
+    const zeroCost = items
+      .map((l, idx) => ({ l, idx }))
+      .filter(({ l, idx }) => {
+        if (!l.material_id) return false;
+        const acc = l.quantity_accepted !== '' ? n0(l.quantity_accepted) : n0(l.quantity_received);
+        if (!(acc > 0)) return false;
+        return bill.lines[idx].netUnit <= 0;
+      });
+    if (zeroCost.length > 0) {
+      const names = zeroCost.map(({ l, idx }) => {
+        const mat = materials.find((m: any) => String(m.id) === String(l.material_id)) as any;
+        return mat ? `line ${idx + 1} (${mat.name})` : `line ${idx + 1}`;
+      }).join(', ');
+      const many = zeroCost.length > 1;
+      alert(
+        `Net rate is ₹0 on ${names} — ${many ? 'those lines' : 'that line'} would be stocked at no cost.\n\n`
+        + `Enter a unit price, lower the discount, or remove the line${many ? 's' : ''}.`,
+      );
       return;
     }
     // Mirrors storePreRejectBlock()'s refusal so it lands before the round trip,
@@ -1948,10 +2489,13 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
     }
     setBusy(true);
     try {
-      const r = await api('/api/grn', {
-        method: 'POST',
-        body: {
-          date, vendor_id: vendorId || null, vendor, invoice_number: invoice, invoice_date: invoiceDate,
+      const payload: Record<string, unknown> = {
+          date, vendor_id: vendorId || null, vendor,
+          // Blank ONLY as a declaration — the checkbox under the field. The
+          // route refuses an undeclared blank exactly as it always did.
+          invoice_number: noBill ? '' : invoice,
+          no_invoice_number: noBill,
+          invoice_date: invoiceDate,
           qc_by: qcBy,
           // Mark back-corrections clearly in the audit trail. Prepend a tag to
           // the free-text notes so /audit and the GRN list both surface it.
@@ -1971,17 +2515,44 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
           ...(qcPreview.required
             ? { qc_quality: false, qc_temperature: false, qc_damage: false }
             : {}),
-          items: cleaned.map(i => ({
+          items: cleaned.map(i => {
+            // `cleaned` holds the SAME objects as `items`, so identity gives the
+            // row's real index — and therefore its slice of the bill-level
+            // charges. Never re-derive the share from the filtered list: a
+            // dropped blank line would shift every share by one row.
+            const share = shareAt(items.indexOf(i));
+            const eff = resolveGst(i);
+            const tx = lineTax(i, share);
+            const cs = caseBasis(i.material_id, i.entry_mode);
+            return {
             material_id: i.material_id,
+            /* ⚠ THE RAW TYPED FIGURES, NOT EXPANDED. On the CASE basis this is a
+             * count of CASES and the rate is ₹ per CASE; normaliseCaseEntry() in
+             * POST /api/grn multiplies and divides them. THE BUG THAT WAS FIXED
+             * TWICE was this arithmetic living in the browser, once per form —
+             * doing it here would put it back, in the one place it was removed
+             * from. `entry_mode` below is how the server knows. */
             quantity_received: parseFloat(i.quantity_received),
             quantity_accepted: i.quantity_accepted ? parseFloat(i.quantity_accepted) : parseFloat(i.quantity_received),
             rejection_reason:  i.rejection_reason,
             unit_price:        parseFloat(i.unit_price) || 0,
             notes:             i.notes,
+            /* Per-line brand, carried over from "Enter Full Bill". Stored on the
+             * GRN line AND mirrored to purchases.brand, so a QC sign-off and an
+             * amend replay can both read it back. */
+            brand:             i.brand,
+            /* Sent only when the guard actually holds, so a mode left on 'case'
+             * after swapping to a material with no case_size does not ask the
+             * server for an expansion it would refuse to make. The server has
+             * the same fallback either way. */
+            entry_mode:        cs.on ? 'case' : 'unit',
             // The RATE rides along so the server can re-derive the split and be
             // the authority (as /api/purchases and PO Receive already are).
-            // undefined on a Manual line → the server keeps the hand-typed ₹.
-            gst_rate:            i.gst_rate === '' ? undefined : Number(i.gst_rate),
+            // RESOLVED FIRST: a line on BILL_GST posts the bill's own percent,
+            // never the sentinel. POST /api/grn reads a MISSING gst_rate as
+            // "keep the hand-typed ₹", which is the opposite of "inherit" — so
+            // an unresolved sentinel would silently untax the line.
+            gst_rate:            eff === '' ? undefined : Number(eff),
             // The COMPENSATION CESS % rides along the same way, and ONLY the
             // percent does: no compensation_cess ₹ figure is sent. Unlike
             // cgst/sgst there is no legacy client posting one, so the server is
@@ -1991,17 +2562,44 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
             // GRN Inward per-line charges (₹). Blank → 0 on the server.
             // cgst/sgst come from lineTax so what was on screen is what is sent —
             // on a rated line these are DERIVED, never the stale box contents.
-            discount:            n0(i.discount),
-            cgst:                lineTax(i).cgst,
-            sgst:                lineTax(i).sgst,
+            //
+            // DISCOUNT AND DELIVERY ARE THE LINE'S OWN PLUS ITS SLICE OF THE
+            // BILL-LEVEL ONE. There is one `discount` column and one
+            // `delivery_charges` column per line, on both documents, so the two
+            // sources have to arrive as one number — and it must be the number
+            // the screen showed, or the taxable base the clerk read and the one
+            // the row records are different figures. The server clamps the
+            // discount to the line's own goods value.
+            discount:            r2(n0(i.discount) + share.discount),
+            cgst:                tx.cgst,
+            sgst:                tx.sgst,
             special_excise_cess: n0(i.special_excise_cess),
             tcs:                 n0(i.tcs),
-            delivery_charges:    n0(i.delivery_charges),
+            delivery_charges:    r2(n0(i.delivery_charges) + share.delivery),
             mrp_round_off:       n0(i.mrp_round_off),
-          })),
-        },
-      });
-      const j = await r.json();
+          }; }),
+      };
+      let r = await api('/api/grn', { method: 'POST', body: payload });
+      let j = await r.json();
+      /* ── THE BILL NUMBER THIS VENDOR ALSO USED LAST WEEK ────────────────────
+       * His suppliers reuse bill numbers: FAMOUS MUTTON SUPPLIER wrote `1122` on
+       * eight different dates, and `00` / `000` show up the same way. A flat
+       * refusal on (vendor, bill no) walled off 5.3% of his real bills with no
+       * valid remedy — the earlier GRN is a DIFFERENT delivery, so voiding it is
+       * wrong, and line-editing cannot add lines and is admin-only anyway.
+       * A same-day repeat is still refused outright and never reaches here; this
+       * is only the other-date case, where the honest thing is to show which
+       * delivery the number was used for and let the person holding both slips
+       * decide. Nothing was written before this prompt.
+       */
+      if (!r.ok && r.status === 409 && j?.needs_confirmation) {
+        const proceed = window.confirm(
+          `${j.error}\n\nSave this as a separate delivery?`,
+        );
+        if (!proceed) return;
+        r = await api('/api/grn', { method: 'POST', body: { ...payload, confirm_duplicate_bill: true } });
+        j = await r.json();
+      }
       if (!r.ok) { alert(j.error || 'Failed'); return; }
       // ── A HELD RECEIPT IS NOT AN alert() ──────────────────────────────────
       // "✓ Created — 0 material(s) updated" is what the old line would have said
@@ -2019,9 +2617,71 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
         setUndecided(j);
         return;
       }
-      alert(`✓ Created ${j.grn_number} — ${j.materials_touched} material(s) updated`);
+      // ── AND THE OTHER TWO THINGS A SUCCESSFUL RECEIPT CAN HAVE TO SAY ──────
+      // A liquor line the route left off the bill, or a vendor↔item pair it
+      // would not learn. Either one under a bare "✓ Created" is a line or a
+      // mapping lost in silence, so they get a panel instead of an alert. When
+      // there is nothing to report the alert is untouched — the ordinary receipt
+      // still closes in one click, as it always has.
+      if ((Array.isArray(j.store_blocked) && j.store_blocked.length > 0)
+          || (Array.isArray(j.vendor_mapping) && j.vendor_mapping.length > 0)) {
+        setReceived(j);
+        return;
+      }
+      alert(`✓ Created ${j.grn_number} — ${j.materials_touched} material(s) updated`
+            + (j.invoice_id ? ` · Invoice ID ${j.invoice_id}` : ''));
       onCreated();
     } finally { setBusy(false); }
+  };
+
+  /**
+   * THE TWO THINGS A SAVED RECEIPT CAN STILL HAVE TO SAY, rendered identically
+   * on every outcome — held, undecided and plain success.
+   *
+   * ONE renderer, deliberately. `store_blocked` used to be printed only inside
+   * the QC-hold panel, so a liquor line filtered off an otherwise-successful
+   * bill vanished without a word; writing the block twice is how that comes
+   * back. AMBER, never red: the receipt SAVED. Neither of these is a failure and
+   * neither needs anything re-typed.
+   */
+  const SaveNotices = ({ j }: { j: any }) => {
+    const blocked: any[] = Array.isArray(j?.store_blocked) ? j.store_blocked : [];
+    const mapping: any[] = Array.isArray(j?.vendor_mapping) ? j.vendor_mapping : [];
+    if (blocked.length === 0 && mapping.length === 0) return null;
+    return (
+      <>
+        {blocked.length > 0 && (
+          <div className="rounded-lg border border-amber-300 bg-amber-50 p-3 text-amber-900 space-y-1.5">
+            <div className="font-semibold flex items-center gap-1.5">
+              <AlertTriangle className="w-4 h-4 shrink-0" />
+              {blocked.length} line{blocked.length === 1 ? '' : 's'} {blocked.length === 1 ? 'was' : 'were'} left off this bill.
+            </div>
+            <div className="text-[11px]">
+              Liquor is procured on the store ledger, not into Central stock, so {blocked.length === 1 ? 'it' : 'they'} could not be
+              received here. Nothing else on the bill was affected. Record {blocked.length === 1 ? 'it' : 'them'} on{' '}
+              <b>Inventory → Liquor Store</b>.
+            </div>
+            {blocked[0]?.error && <div className="text-[11px] opacity-80">{blocked[0].error}</div>}
+          </div>
+        )}
+        {mapping.length > 0 && (
+          <div className="rounded-lg border border-amber-300 bg-amber-50 p-3 text-amber-900 space-y-1.5">
+            <div className="font-semibold flex items-center gap-1.5">
+              <AlertTriangle className="w-4 h-4 shrink-0" />
+              Saved — {mapping.length === 1 ? 'one item' : `${mapping.length} items`} could not be added to this vendor&apos;s list.
+            </div>
+            {mapping.map((m: any, i: number) => (
+              <div key={i} className="text-[11px] leading-snug">
+                {m?.material_name ? <b>{m.material_name}</b> : null}{m?.material_name ? ' — ' : ''}{m?.warning}
+              </div>
+            ))}
+            <div className="text-[11px] opacity-80">
+              The bill is recorded either way. Vendor Items only decides what this vendor&apos;s picker offers next time.
+            </div>
+          </div>
+        )}
+      </>
+    );
   };
 
   return (
@@ -2032,17 +2692,30 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
           fold on phones). The MaterialTypeahead dropdown lives inside the
           scrollable body — its absolute panel extends the body's scroll area,
           so it stays reachable. */}
+      {/* max-w-6xl (was 4xl): the line table now carries the vendor bill's full
+          reading across — goods → discount → taxable → tax → incl-tax — and at
+          4xl every bill needed sideways scrolling to see the tax it was entered
+          for. Still capped, and the table keeps its own overflow-x. */}
       <div style={{ maxHeight: 'calc(100vh - 1.5rem)' }}
-           className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-4xl shadow-xl flex flex-col overflow-hidden">
+           className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-6xl shadow-xl flex flex-col overflow-hidden">
         <div className="px-5 py-4 border-b border-[#E8D5C4] flex items-center justify-between shrink-0">
-          <h2 className="font-bold text-[#2D1B0E]">
-            {held ? `Recorded — ${held.grn_number}`
-              : undecided ? `Received — ${undecided.grn_number}`
-              : 'New Ad-hoc Goods Receipt Note'}
-          </h2>
-          {/* Both result panels close through onCreated: the receipt exists and
+          <div>
+            <h2 className="font-bold text-[#2D1B0E]">
+              {held ? `Recorded — ${held.grn_number}`
+                : undecided ? `Received — ${undecided.grn_number}`
+                : received ? `Received — ${received.grn_number}`
+                : 'Enter Vendor Bill — Goods Receipt Note'}
+            </h2>
+            {!held && !undecided && !received && (
+              <p className="text-[11px] text-[#8B7355] mt-0.5">
+                One vendor bill, many items. Delivery &amp; Discount split across the lines; enter each rate as the plain goods
+                rate — GST is worked out per line after discount and recorded on its own.
+              </p>
+            )}
+          </div>
+          {/* Every result panel closes through onCreated: the receipt exists and
               the list behind must be refetched either way. */}
-          <button onClick={held || undecided ? onCreated : onClose}><X className="w-5 h-5 text-[#8B7355]" /></button>
+          <button onClick={held || undecided || received ? onCreated : onClose}><X className="w-5 h-5 text-[#8B7355]" /></button>
         </div>
         <div className="flex-1 min-h-0 overflow-y-auto p-5 space-y-4 text-xs">
         {held ? (
@@ -2093,13 +2766,12 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
                   <>It is on the <b>Pending Quality Checks</b> queue and in the notification bell. No one could be messaged directly — go and tell them.</>
                 )}
               </div>
-              {Array.isArray(held.store_blocked) && held.store_blocked.length > 0 && (
-                <div className="text-[11px] text-amber-900 bg-amber-50 border border-amber-300 rounded p-2">
-                  {held.store_blocked.length} line(s) were not receivable here at all (liquor is procured on the store ledger)
-                  and were left out of this bill.
-                </div>
-              )}
             </div>
+
+            {/* store_blocked used to be printed HERE and only here, which is how
+                a liquor line dropped off a successful bill in silence. It is now
+                rendered by the one SaveNotices block, on every outcome. */}
+            <SaveNotices j={held} />
 
             {/* ── HELD *AND* CARRYING A CATEGORY NOBODY HAS RULED ON ────────
                 One bill can be both: the vegetables hold it, and the poultry on
@@ -2154,8 +2826,11 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
               <div className="mt-0.5 text-[11px]">
                 {undecided.materials_touched} material{Number(undecided.materials_touched) === 1 ? '' : 's'} updated.
                 The delivery is complete and nothing is waiting on anyone. You do not need to do anything with this bill.
+                {undecided.invoice_id ? <> Invoice ID <b className="font-mono">{undecided.invoice_id}</b>.</> : null}
               </div>
             </div>
+
+            <SaveNotices j={undecided} />
 
             <div className="rounded-lg border border-amber-300 bg-amber-50 p-3 text-amber-900 space-y-1.5">
               <div className="font-semibold flex items-center gap-1.5">
@@ -2190,22 +2865,57 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
               to <b>No check</b> never shows this message. That is what keeps it rare enough to be worth reading.
             </div>
           </div>
+        ) : received ? (
+          /* ── IT WENT IN, AND SOMETHING ABOUT IT IS STILL WORTH SAYING ──────
+             Green first, amber second, and the green half is the headline: the
+             receipt SUCCEEDED, the stock is on hand, nothing needs re-typing.
+             What follows is a liquor line the route could not take here, or a
+             vendor↔item pair it would not learn. Both used to be invisible
+             behind "✓ Created". */
+          <div className="space-y-3">
+            <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-emerald-900">
+              <div className="font-semibold flex items-center gap-1.5">
+                <CheckCircle2 className="w-4 h-4" /> {received.grn_number} is received — stock has been added.
+              </div>
+              <div className="mt-0.5 text-[11px]">
+                {received.materials_touched} material{Number(received.materials_touched) === 1 ? '' : 's'} updated.
+                {received.invoice_id ? <> Invoice ID <b className="font-mono">{received.invoice_id}</b>.</> : null}
+              </div>
+            </div>
+            <SaveNotices j={received} />
+          </div>
         ) : (
           <>
           <p className="text-[#6B5744] bg-[#FFF8F0] border border-[#E8D5C4] rounded p-2">
-            Use this when goods arrive WITHOUT a PO — cash purchase, sample, donation, vendor return.
+            <b>This is where a vendor bill is recorded.</b> Every hand-entered bill comes through here — a cash purchase, a
+            sample, a donation, a vendor return, or the full printed invoice that used to be typed on the Purchases screen.
             On save: creates a GRN, writes <code>purchases</code> rows, bumps stock + recipe-cost cascade.
             {/* Stated in the same breath as "bumps stock", because on a gated
                 delivery that sentence is not true and this is where the reader
                 is being told what Save does. */}
-            {' '}Perishable categories are the exception: those are recorded and <b>held until the kitchen checks them</b>.
+            {' '}Perishable categories are the exception: those are recorded and <b>held until the kitchen checks them</b> —
+            the bill is saved in full, but no stock appears until the kitchen signs.
           </p>
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+            {/* ── OF THE TWO DATES ON THIS FORM, THIS IS THE ONE THAT CARRIES
+                THE MONEY, AND IT HAS TO SAY SO. The old bill form had a single
+                "Date"; this form has Receipt Date AND Invoice date, and only
+                this one reaches purchases.date — every spend report, the
+                register's own from/to, the monthly totals. A clerk entering the
+                18th's bill on the 24th naturally types 18 Aug into the field
+                CALLED "Invoice date" (which is also the unrestricted one) and
+                leaves this at today, and the spend lands on the 24th. Naming
+                the consequence on both fields is the fix; moving the money to
+                the bill date would fork the three writers that agree on the
+                receipt date. */}
             <label className="flex flex-col gap-1 text-[#6B5744]">Receipt Date
-              <input type="date" value={date} onChange={e => setDate(e.target.value)} min={dateMin} max={dateMax} className="px-2 py-1.5 border border-[#E8D5C4] rounded bg-[#FFF8F0]" />
-              {!isAdmin && (
-                <span className="text-[10px] text-[#8B7355]">Backdating limited to {backdateLimit} day(s) (admins exempt)</span>
-              )}
+              <input type="date" value={date} onChange={e => setDate(e.target.value)} min={dateMin} max={dateMax}
+                     title="The day the goods arrived. This is the date the cost is recorded against, so it drives every spend report and the Purchases register's own date filter."
+                     className="px-2 py-1.5 border border-[#E8D5C4] rounded bg-[#FFF8F0]" />
+              <span className="text-[10px] text-[#8B7355]">
+                The day the goods arrived — <b>the cost is recorded against this date</b>, not the bill&rsquo;s.
+                {!isAdmin && <> Backdating limited to {backdateLimit} day(s) (admins exempt).</>}
+              </span>
             </label>
             <label className="flex flex-col gap-1 text-[#6B5744]">Vendor
               <Combobox
@@ -2222,6 +2932,19 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
                 className="w-full px-2 py-1.5 border border-[#E8D5C4] rounded bg-[#FFF8F0] text-sm"
               />
               <datalist id="adhoc-vendors">{vendors.map(v => <option key={v.id} value={v.name} />)}</datalist>
+              {/* IN THE MASTER, OR NOT — said plainly, and it is not a refusal.
+                  A bill is a fact and a free-typed vendor still saves. But a
+                  name that is one character off the master fragments this
+                  supplier's spend across two rows in every report, and nothing
+                  downstream can tell that from a genuinely new vendor. Carried
+                  over from "Enter Full Bill". */}
+              {vendor.trim() && (
+                <span className={`text-[10px] mt-0.5 ${vendorKnown ? 'text-emerald-700' : 'text-amber-700'}`}>
+                  {vendorKnown
+                    ? '✓ In the vendor master'
+                    : 'New vendor — check the spelling. Their items list and auto-learn need a master row.'}
+                </span>
+              )}
               {vendorId && (
                 <div className="flex items-center gap-1.5 text-[10px] text-[#8B7355] mt-0.5">
                   <input type="checkbox" id="show-all-mats" checked={showAllMaterials}
@@ -2244,15 +2967,183 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
                 the paper. It is also what the duplicate-bill guard keys on, and
                 that guard skips any row with a blank bill number. */}
             <label className="flex flex-col gap-1 text-[#6B5744]">
-              Vendor Invoice No <span className="text-red-600">*</span>
-              <input value={invoice} onChange={e => setInvoice(e.target.value)} required
-                     placeholder="the number printed on the vendor's bill"
-                     className="px-2 py-1.5 border border-[#E8D5C4] rounded bg-[#FFF8F0]" />
+              Vendor Invoice No {!noBill && <span className="text-red-600">*</span>}
+              <input value={noBill ? '' : invoice} onChange={e => setInvoice(e.target.value)}
+                     required={!noBill} disabled={noBill}
+                     placeholder={noBill ? 'no vendor bill — declared below' : "the number printed on the vendor's bill"}
+                     className="px-2 py-1.5 border border-[#E8D5C4] rounded bg-[#FFF8F0] disabled:bg-[#F0E6DA] disabled:text-[#A89680]" />
+              {/* ── THE RECEIPT THAT CAME WITH NO PAPER ────────────────────────
+                  "Enter Full Bill" never required this field, and 4 of the 13
+                  bills it actually produced have a blank number — the cash
+                  market run, the sample, the donation, the vendor return this
+                  page's own subtitle invites. Requiring it outright removed
+                  that, so the capability comes back as a DECLARATION rather
+                  than an empty box: blank-by-accident stays refused, blank
+                  -because-there-is-no-bill is something the storekeeper says.
+                  Consequence stated rather than hidden — see the note below. */}
+              <label className="flex items-start gap-1.5 text-[10px] text-[#8B7355] font-normal cursor-pointer mt-0.5">
+                <input type="checkbox" checked={noBill}
+                       onChange={e => setNoBill(e.target.checked)}
+                       className="mt-0.5 accent-[#8B5E3C]" />
+                <span>
+                  No vendor bill number — a cash market run, a sample, a donation or a return.
+                  {noBill && (
+                    <span className="block text-amber-800">
+                      This receipt cannot be matched against a vendor statement later, and the
+                      duplicate-bill check cannot see it — two entries of the same no-paper delivery
+                      will both be saved.
+                    </span>
+                  )}
+                </span>
+              </label>
             </label>
             <label className="flex flex-col gap-1 text-[#6B5744]">Invoice Date
-              <input type="date" value={invoiceDate} onChange={e => setInvoiceDate(e.target.value)} className="px-2 py-1.5 border border-[#E8D5C4] rounded bg-[#FFF8F0]" />
+              <input type="date" value={invoiceDate} onChange={e => setInvoiceDate(e.target.value)}
+                     title="The date printed on the vendor's bill. Recorded on this receipt for matching against a vendor statement — it does not move the cost, which follows the Receipt Date."
+                     className="px-2 py-1.5 border border-[#E8D5C4] rounded bg-[#FFF8F0]" />
+              {/* Says what it does NOT do, because that is the confusion: this
+                  field has no backdate limit and the money-carrying one does,
+                  so it is the field a clerk reaches for when back-entering. */}
+              <span className="text-[10px] text-[#8B7355]">
+                The date on the vendor&rsquo;s paper. Kept for matching a statement — it does <b>not</b> move the cost.
+              </span>
             </label>
           </div>
+
+          {/* ══ BILL-LEVEL CHARGES — one figure for the whole bill ═══════════
+              Carried over from "Enter Full Bill". Each is split across the lines
+              in proportion to their goods value and shows on every line's
+              charges panel; the per-line boxes stay for a charge that really
+              does belong to one line. What each does to COST is different and
+              is stated on the row, not left to be inferred. */}
+          <div className="border border-[#E8D5C4] rounded-lg bg-[#FFF8F0]/60 p-3 space-y-2.5">
+            <div className="text-[11px] font-semibold text-[#6B5744] flex items-center gap-1.5">
+              <Percent className="w-3.5 h-3.5" /> Bill charges — split across the lines
+              <span className="font-normal text-[10px] text-[#8B7355]">leave blank if the bill has none</span>
+            </div>
+            <ChargeRow
+              label="Discount" hint="reduces what the goods cost"
+              mode={discountMode} value={discountValue}
+              onMode={setDiscountMode} onValue={setDiscountValue}
+              placeholder="0" total={bill.discountAmount} tone="text-emerald-700" negative
+            />
+            {bill.discountClamped && (
+              <div className="text-[10px] text-amber-800 bg-amber-50 border border-amber-300 rounded px-2 py-1">
+                The discount is larger than the goods value on this bill, so it has been capped at {m2(bill.subtotal)}.
+                A discount bigger than the goods would give every line a negative cost.
+              </div>
+            )}
+            <ChargeRow
+              label="Delivery Charges" hint="recorded only — never enters unit cost"
+              mode={deliveryMode} value={deliveryValue}
+              onMode={setDeliveryMode} onValue={setDeliveryValue}
+              placeholder="0" total={bill.deliveryAmount} tone="text-[#6B5744]"
+            />
+            {/* THE BILL-LEVEL GST DEFAULT. One vendor bill is almost always one
+                rate; retyping it on twenty lines is how one line silently ends
+                up wrong. A line may still set its own, or go Manual. */}
+            <div className="flex items-center gap-3 flex-wrap border-t border-[#E8D5C4] pt-2.5">
+              <span className="text-xs font-medium text-[#6B5744] min-w-[130px]">
+                GST %
+                <span className="block text-[10px] font-normal text-[#8B7355]">every line follows this unless it sets its own</span>
+              </span>
+              <select value={billGst} onChange={e => setBillGst(e.target.value)}
+                      title="The bill's GST rate. Lines set to 'Bill rate' use it; a line can override it, or choose Manual and have the ₹ typed in."
+                      className="px-2 py-1.5 border border-[#E8D5C4] rounded text-xs bg-white text-[#2D1B0E]">
+                <option value="">None — each line manual</option>
+                {GST_RATES.map(r => <option key={r} value={r}>{r}%</option>)}
+              </select>
+              {billGst !== '' && (
+                <span className="text-xs text-[#6B5744] font-mono ml-auto">
+                  CGST {m2(bill.cgstTotal)} + SGST {m2(bill.sgstTotal)} = {m2(bill.taxTotal)}
+                </span>
+              )}
+            </div>
+            {/* There is deliberately NO bill-level CESS. Compensation cess is
+                item-specific — the soft-drink cases on a bill carry it and the
+                rest of the bill does not — so a bill-level default would seed it
+                onto lines that never bore it. Per line only, seeded from the
+                material master. */}
+          </div>
+
+          {/* ══ THIS VENDOR'S ITEMS — consulted, never blocking ══════════════ */}
+          {vendorMappedMaterials.length > 0 && (
+            <div className="border border-[#E8D5C4] rounded-lg bg-white">
+              <button type="button" onClick={() => setVendorItemsOpen(o => !o)}
+                      className="w-full flex items-center justify-between px-3 py-2 text-[11px] text-[#6B5744]">
+                <span className="flex items-center gap-1.5">
+                  <FileCheck className="w-3.5 h-3.5 text-[#af4408]" />
+                  <b>{vendorShort}</b>&apos;s items ({vendorMappedMaterials.length}) — click one to put it on a line
+                </span>
+                {vendorItemsOpen ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
+              </button>
+              {vendorItemsOpen && (
+                <div className="px-3 pb-3 flex flex-wrap gap-1.5">
+                  {vendorMappedMaterials.map((m: any) => {
+                    const on = items.some(l => String(l.material_id || '').trim() === String(m.id));
+                    return (
+                      <button key={m.id} type="button" disabled={on}
+                              onClick={() => placeMaterialOnLine(String(m.id), String(m.name))}
+                              title={on ? 'Already on this bill' : `Add ${m.name} to this bill`}
+                              className={`px-2 py-1 rounded-full border text-[10px] ${on
+                                ? 'border-[#E8D5C4] bg-[#F3EEE7] text-[#B8A590] cursor-not-allowed'
+                                : 'border-[#D4B896] bg-[#FFF8F0] text-[#6B5744] hover:border-[#af4408] hover:text-[#af4408]'}`}>
+                        {m.name}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+          {mapNote && (
+            <div className="text-[11px] text-[#6B5744] bg-[#FFF1E3] border border-[#E8D5C4] rounded px-2 py-1.5 flex items-start justify-between gap-2">
+              <span>{mapNote}</span>
+              <button type="button" onClick={() => setMapNote(null)} className="text-[#8B7355] shrink-0"><X className="w-3 h-3" /></button>
+            </div>
+          )}
+
+          {/* A LINE THIS RECEIPT CANNOT TAKE, said while it can still be moved. */}
+          {storeBlockedLines.length > 0 && (
+            <div className="border border-amber-400 rounded-lg bg-amber-50 p-2.5 text-[11px] text-amber-900 space-y-1">
+              <div className="font-semibold flex items-center gap-1.5">
+                <Wine className="w-3.5 h-3.5 shrink-0" />
+                Line {storeBlockedLines.map(x => x.no).join(', ')} will be left off this receipt.
+              </div>
+              <div>
+                {storeBlockedLines.map(x => x.name).join(', ')} {storeBlockedLines.length === 1 ? 'is' : 'are'} procured on the
+                store ledger, not into Central stock, so {storeBlockedLines.length === 1 ? 'it' : 'they'} cannot be received here.
+                Everything else on the bill saves normally. Record {storeBlockedLines.length === 1 ? 'it' : 'them'} on{' '}
+                <b>Inventory → Liquor Store</b>.
+              </div>
+              {(bill.discountAmount > 0 || bill.deliveryAmount > 0) && (
+                <div>
+                  The bill-level charges are still split across <b>every</b> line, including {storeBlockedLines.length === 1 ? 'this one' : 'these'} —
+                  that is deliberate, because it is the share the vendor&apos;s own bill gives the lines that DO stay here. The totals
+                  below are the whole paper; what this receipt records will be less by the dropped {storeBlockedLines.length === 1 ? 'line' : 'lines'}.
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ONE MATERIAL = ONE LINE — the same refusal the PO carries and the
+              route enforces. Raised as it is typed, not only at Save. */}
+          {dupGroups.length > 0 && (
+            <div className="border border-amber-400 rounded-lg bg-amber-50 p-2.5 text-[11px] text-amber-900 space-y-1">
+              <div className="font-semibold flex items-center gap-1.5">
+                <AlertTriangle className="w-3.5 h-3.5 shrink-0" /> The same item is on more than one line.
+              </div>
+              {dupGroups.map(g => (
+                <div key={g.materialId}>
+                  <b>{g.name}</b> — line {g.lineNos.join(' and line ')}.
+                </div>
+              ))}
+              <div>
+                Every line books its own stock movement and its own cost row, so this item would be delivered once and counted
+                twice. Put the full quantity on one line. {SPLIT_RATE_REMEDY}
+              </div>
+            </div>
+          )}
 
           {/* Back-correction toggle. Default OFF. Lets the store manager book
               negative-qty lines to fix a prior GRN where they forgot to subtract.
@@ -2461,26 +3352,82 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
                 <tbody className="block md:table-row-group">
                   {items.map((it, i) => {
                     const lu = lineUnits(it.material_id);
+                    /* THE ONE GUARD EVERY LABEL ON THIS ROW KEYS ON. `on` is true
+                       only when the mode is 'case' AND the material really has a
+                       case_size — the same test normaliseCaseEntry() applies on
+                       the server. A label keyed on entry_mode alone would announce
+                       a basis the arithmetic is not using, which is the exact
+                       misread that had to be fixed once per form when there were
+                       two forms: "in BTL" on screen, 60 cases typed, 720 booked. */
+                    const cb = caseBasis(it.material_id, it.entry_mode);
                     // Display-only hint: the raw input string is never touched here
                     // (running it through Number() on every keystroke is what made
                     // "2." untypeable), we only read it to render "= N g".
+                    // SUPPRESSED on the CASE basis — the typed figure is a count of
+                    // cases there, so "= N g" would be wrong by case_size.
                     const hint = (raw: string) => {
-                      if (lu.pf <= 1) return null;
+                      if (cb.on || lu.pf <= 1) return null;
                       const q = parseFloat(raw);
                       if (!Number.isFinite(q) || q === 0) return null;
                       return `= ${fmtQtyNum(q * lu.pf)} ${lu.ru}`;
                     };
+                    /** The unit BOTH quantity boxes are counting, in words. */
+                    const qtyUnit = cb.on ? `case (${cb.cs} ${lu.pu || 'unit'})` : lu.pu;
+                    /** How many purchase units a typed CASE figure really is. */
+                    const caseHint = (raw: string) => {
+                      if (!cb.on) return null;
+                      const q = parseFloat(raw);
+                      if (!Number.isFinite(q) || q === 0) return null;
+                      return `= ${fmtQtyNum(q * cb.cs)} ${lu.pu || 'unit'}`;
+                    };
+                    const bl = bill.lines[i];
+                    const sh = shareAt(i);
                     return (
                     <Fragment key={i}>
                     <tr className="border-t border-[#E8D5C4]/50 align-top block md:table-row rounded-lg border border-[#E8D5C4] p-3 mb-2 space-y-2 md:p-0 md:mb-0 md:border-0 md:space-y-0">
                       <td className="py-1 px-2 block md:table-cell">
                         <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Material</span>
+                        {/* excludeMode='disable', not the default 'hide': an item
+                            already on another line stays VISIBLE and greyed with
+                            the reason, instead of vanishing from a list the clerk
+                            is scanning for it. Carried over from "Enter Full
+                            Bill", where a silently-absent material read as a
+                            missing master row. */}
                         <MaterialTypeahead
-                          materials={filteredMaterials as any} purchaseBasis
+                          materials={pickerMaterials as any} purchaseBasis
                           value={it.material_id}
-                          onPick={(id) => pickMaterial(i, id)}
+                          onPick={(id) => { setMapNote(null); pickMaterial(i, id); }}
                           excludeIds={items.map(x => x.material_id).filter((id, idx) => id && idx !== i) as string[]}
+                          excludeMode="disable"
+                          onExcludedPick={(m) => {
+                            const at = items.findIndex(l => String(l.material_id || '').trim() === String(m.id));
+                            setMapNote(`${m.name} is already on line ${at + 1} — add the quantity there. One item = one line on a bill.`);
+                          }}
                         />
+                        {/* BRAND — per line, free text. It was on the bill form
+                            and not on this one, so it came across with the move.
+                            Stored on the GRN line as well as mirrored to
+                            purchases.brand, so it survives a QC hold and an
+                            amendment — it used to reach the cost row on an
+                            UNHELD receipt only. */}
+                        {it.material_id && (
+                          <input value={it.brand} onChange={e => updateLine(i, { brand: e.target.value })}
+                                 placeholder="Brand (optional)"
+                                 title="Free text. Stored on this GRN line and mirrored to the purchase row, so it survives a quality hold and an amendment."
+                                 className="mt-1 w-full px-1.5 py-1 border border-[#E8D5C4] rounded text-[11px] bg-white" />
+                        )}
+                        {/* The gap the map has, offered where it is noticed. The
+                            server learns a pair on save anyway; this is for the
+                            ones it will not touch — a mapping an admin deleted,
+                            or a vendor with no master row. */}
+                        {it.material_id && vendorId && vendorMaterialIds && !vendorMaterialIds.has(it.material_id) && (
+                          <button type="button" disabled={vendorMapBusy}
+                                  onClick={() => addToVendorItems(it.material_id,
+                                    String((materials.find((m: any) => m.id === it.material_id) as any)?.name || it.material_id))}
+                                  className="mt-1 text-[10px] text-[#af4408] hover:underline disabled:opacity-50">
+                            + Add to {vendorShort}&apos;s items
+                          </button>
+                        )}
                         {/* IN HAND, WHILE THE RECEIPT IS BEING BOOKED (owner's
                             ask #1, GRN half). Store and Departments as two
                             figures, never merged: a receiver checking a cash buy
@@ -2529,8 +3476,31 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
                                }`} />
                         {lu.pu && (
                           <div className="text-[9px] text-[#B8A590] text-right mt-0.5 md:w-20">
-                            {lu.pu}{hint(it.quantity_received) ? <> · {hint(it.quantity_received)}</> : null}
+                            {qtyUnit}
+                            {caseHint(it.quantity_received) ? <> · {caseHint(it.quantity_received)}</> : null}
+                            {hint(it.quantity_received) ? <> · {hint(it.quantity_received)}</> : null}
                           </div>
+                        )}
+                        {/* ── BTL / CASE, only where a case actually exists ──────
+                            Offered ONLY when the material has case_size > 1: a
+                            toggle on an item with no case is a control that
+                            silently does nothing. When it is on, BOTH boxes on
+                            this row change meaning — the quantity counts CASES
+                            and the rate is ₹ per CASE — and every label above
+                            and below says so.
+                            ⚠ NOTHING IS CONVERTED HERE. The raw figures are
+                            posted with entry_mode and POST /api/grn does the
+                            multiply/divide. That arithmetic lived in the browser
+                            once per form and had to be fixed twice; it lives in
+                            the one writer now. */}
+                        {cb.cs > 1 && (
+                          <select value={it.entry_mode}
+                                  onChange={e => updateLine(i, { entry_mode: e.target.value as 'btl' | 'case' })}
+                                  title={`This material comes ${cb.cs} to a case. Pick CASE to type the bill in cases — the quantity and the rate are both read per case, and the server expands them.`}
+                                  className="mt-1 w-full md:w-20 px-1 py-0.5 border border-[#E8D5C4] rounded text-[10px] bg-white text-[#2D1B0E]">
+                            <option value="btl">BTL / {lu.pu || 'unit'}</option>
+                            <option value="case">CASE ({cb.cs})</option>
+                          </select>
                         )}
                       </td>
                       <td className="py-1 px-2 block md:table-cell">
@@ -2547,7 +3517,9 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
                                }`} />
                         {lu.pu && (
                           <div className="text-[9px] text-[#B8A590] text-right mt-0.5 md:w-20">
-                            {lu.pu}{hint(it.quantity_accepted) ? <> · {hint(it.quantity_accepted)}</> : null}
+                            {qtyUnit}
+                            {caseHint(it.quantity_accepted) ? <> · {caseHint(it.quantity_accepted)}</> : null}
+                            {hint(it.quantity_accepted) ? <> · {hint(it.quantity_accepted)}</> : null}
                           </div>
                         )}
                         {/* On a held delivery this box is not the desk's to
@@ -2585,18 +3557,39 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
                                                        className="w-full md:w-20 px-1.5 py-1 border border-[#E8D5C4] rounded text-right text-xs" />
                         {/* ₹ per PURCHASE unit — the rate the vendor bills. The
                             weighted average is stored per RECIPE unit, but that
-                            division happens server-side; never type ₹/g here. */}
-                        {lu.pu && <div className="text-[9px] text-[#B8A590] text-right mt-0.5 md:w-20">₹ / {lu.pu}</div>}</td>
+                            division happens server-side; never type ₹/g here.
+                            On the CASE basis this is ₹ PER CASE, and the label
+                            keys on the same guard the quantity boxes use. */}
+                        {lu.pu && (
+                          <div className="text-[9px] text-[#B8A590] text-right mt-0.5 md:w-20">
+                            {cb.on ? `₹ / case (${cb.cs} ${lu.pu})` : `₹ / ${lu.pu}`}
+                          </div>
+                        )}
+                        {/* WHAT ONE UNIT ENDS UP COSTING — after this line's own
+                            discount and its slice of the bill's. This is the
+                            figure the server stores as purchases.unit_price, so
+                            it is the number that decides what the kitchen pays
+                            for this material and what every recipe built on it
+                            costs. Shown only when a discount actually moved it. */}
+                        {it.material_id && bl && (bl.discountAll > 0) && bl.netUnit > 0 && (
+                          <div className="text-[9px] text-emerald-700 text-right mt-0.5 md:w-20 leading-tight"
+                               title="Net of every discount — this is what is stored as the cost of one purchase unit.">
+                            net {m2(cb.on && cb.cs > 1 ? bl.netUnit / cb.cs : bl.netUnit)}
+                            <span className="block text-[8px] text-[#8B7355]">/ {lu.pu || 'unit'}</span>
+                          </div>
+                        )}</td>
                       <td className="py-1 px-2 text-right block md:table-cell">
                         <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Charges / Total</span>
                         <div className="flex items-center justify-end gap-1.5">
                           {/* The charges panel is collapsed by default, so a rate
                               seeded from the master would otherwise change the row
                               total with nothing on screen explaining it. */}
-                          {it.gst_rate !== '' && !storeMappedLine(it.material_id) && (
+                          {resolveGst(it) !== '' && !storeMappedLine(it.material_id) && (
                             <span className="px-1.5 py-0.5 rounded border border-emerald-200 bg-emerald-50 text-emerald-800 text-[10px] font-semibold"
-                                  title="GST% on this line — from the material master, editable in the charges panel">
-                              GST {it.gst_rate}%
+                                  title={it.gst_rate === BILL_GST
+                                    ? 'GST% inherited from the bill-level rate above. Override it in the charges panel for a line the vendor billed differently.'
+                                    : 'GST% on this line — from the material master, editable in the charges panel'}>
+                              GST {resolveGst(it)}%{it.gst_rate === BILL_GST ? ' (bill)' : ''}
                             </span>
                           )}
                           {/* Same reason as the GST badge: the panel is collapsed by
@@ -2615,8 +3608,12 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
                                     openCharges.has(i) ? 'bg-[#af4408] text-white border-[#af4408]' : 'bg-white text-[#6B5744] border-[#E8D5C4]'}`}>
                             <Percent className="w-2.5 h-2.5" /> {openCharges.has(i) ? 'hide' : 'charges'}
                           </button>
+                          {/* The bill-level shares are in this figure, so the row
+                              total is what the vendor actually charged for this
+                              line — not the goods value with the bill's discount
+                              still sitting somewhere else on the screen. */}
                           <span className="font-mono font-semibold text-[#2D1B0E] min-w-[64px] text-right">
-                            {(n0(it.quantity_received) && n0(it.unit_price)) ? `₹${lineTotal(it, lineTax(it), lineCess(it).cess).toLocaleString('en-IN', { maximumFractionDigits: 2 })}` : '—'}
+                            {(n0(it.quantity_received) && n0(it.unit_price)) ? `₹${(bl?.total ?? 0).toLocaleString('en-IN', { maximumFractionDigits: 2 })}` : '—'}
                           </span>
                         </div>
                       </td>
@@ -2633,7 +3630,7 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
                                 ['special_excise_cess', 'Special Excise Cess'], ['tcs', 'TCS'],
                                 ['delivery_charges', 'Delivery Charges'], ['mrp_round_off', 'MRP Round Off'],
                               ] as const).map(([k, label]) => {
-                                const tx = lineTax(it);
+                                const tx = lineTax(it, sh);
                                 const cs = lineCess(it);
                                 const isTaxBox = k === 'cgst' || k === 'sgst';
                                 return (
@@ -2661,8 +3658,18 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
                                                 if (v === '' && tx.derived) updateLine(i, { gst_rate: '', cgst: String(tx.cgst), sgst: String(tx.sgst) });
                                                 else updateLine(i, { gst_rate: v });
                                               }}
-                                              title="Seeded from the material master (raw_materials.tax_percent). Change it for a line the vendor billed at a different rate; Manual lets you type the ₹ yourself."
+                                              title="Seeded from the material master (raw_materials.tax_percent). 'Bill rate' follows the GST% set on the bill above. Change it for a line the vendor billed at a different rate; Manual lets you type the ₹ yourself."
                                               className="px-1.5 py-1 border border-[#E8D5C4] rounded text-right text-xs bg-white text-[#2D1B0E] normal-case">
+                                        {/* THREE STATES, and the sentinel is not ''.
+                                            '' here has always meant MANUAL on this form —
+                                            the opposite of what it meant on the bill form
+                                            it absorbed, where '' meant "inherit". Giving
+                                            "follow the bill" its own value is what keeps
+                                            both meanings, and resolveGst() turns it into a
+                                            real percent before anything is posted. */}
+                                        <option value={BILL_GST}>
+                                          Bill rate{billGst !== '' ? ` (${billGst}%)` : ' — none set'}
+                                        </option>
                                         <option value="">Manual (enter ₹)</option>
                                         {GST_RATES.map(r => <option key={r} value={r}>{r}%</option>)}
                                       </select>
@@ -2725,31 +3732,65 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
                                   {isTaxBox && tx.derived && (
                                     <span className="text-[8px] text-[#8B7355] normal-case">derived from GST %</span>
                                   )}
+                                  {/* THE LINE'S SLICE OF THE BILL-LEVEL CHARGE, printed
+                                      under the box it is added to. Without this the row
+                                      total would move when the bill discount changes and
+                                      nothing on the line would explain why — and a clerk
+                                      reconciling against the paper would read the box as
+                                      the whole story. */}
+                                  {k === 'discount' && sh.discount > 0 && (
+                                    <span className="text-[8px] text-emerald-700 normal-case">
+                                      + {m2(sh.discount)} share of the bill discount = {m2(bl.discountAll)}
+                                    </span>
+                                  )}
+                                  {k === 'delivery_charges' && sh.delivery > 0 && (
+                                    <span className="text-[8px] text-[#8B7355] normal-case">
+                                      + {m2(sh.delivery)} share of the bill delivery = {m2(bl.deliveryAll)}
+                                    </span>
+                                  )}
                                 </label>
                                 </Fragment>
                               ); })}
                             </div>
-                            <div className="flex flex-wrap justify-end gap-4 mt-2 text-[11px] text-[#6B5744]">
-                              <span>Subtotal <b className="text-[#2D1B0E] font-mono">₹{lineSubtotal(it).toLocaleString('en-IN', { maximumFractionDigits: 2 })}</b></span>
-                              {lineTax(it).derived && (
-                                // Named explicitly because it is NOT the Subtotal beside it:
-                                // tax rides on the ACCEPTED qty (what PO Receive books), so on a
-                                // partially-rejected line the two figures legitimately differ.
-                                <span title="GST is charged on the accepted quantity, after discount — the same base the PO → Receive path uses.">
-                                  Taxable (accepted, after discount) <b className="text-[#2D1B0E] font-mono">₹{lineTax(it).taxable.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</b>
+                            {/* ── THE READING ACROSS, AS THE PAPER READS ─────────
+                                goods → discount → taxable → tax → cess → incl-tax.
+                                Carried over from "Enter Full Bill", where it was
+                                eleven columns on the row itself; here it is one
+                                strip under the boxes it explains, so a clerk can
+                                follow the vendor's own arithmetic left to right
+                                without holding two of the figures in their head. */}
+                            <div className="flex flex-wrap justify-end gap-x-4 gap-y-1 mt-2 text-[11px] text-[#6B5744]">
+                              <span>Goods <b className="text-[#2D1B0E] font-mono">{m2(lineSubtotal(it))}</b></span>
+                              {bl.discountAll > 0 && (
+                                <span title="This line's own discount plus its share of the bill-level one. It lowers the cost basis — the server nets it into the stored unit price.">
+                                  Discount <b className="text-emerald-700 font-mono">− {m2(bl.discountAll)}</b>
                                 </span>
                               )}
-                              {lineCess(it).derived && (
+                              {bl.tax.derived && (
+                                // Named explicitly because it is NOT the Goods figure beside
+                                // it: tax rides on the ACCEPTED qty (what PO Receive books), so
+                                // on a partially-rejected line the two legitimately differ.
+                                <span title="GST is charged on the accepted quantity, after every discount — the same base the PO → Receive path uses.">
+                                  Taxable <b className="text-[#2D1B0E] font-mono">{m2(bl.tax.taxable)}</b>
+                                </span>
+                              )}
+                              {bl.tax.derived && (
+                                <span title="CGST + SGST. The house invariant is tax = cgst + sgst exactly; the odd paisa goes to CGST, as it does on the stored row.">
+                                  GST {bl.tax.rate}% <b className="text-[#2D1B0E] font-mono">{m2(bl.tax.tax)}</b>
+                                  <span className="text-[9px] text-[#8B7355]"> (C {m2(bl.tax.cgst)} + S {m2(bl.tax.sgst)})</span>
+                                </span>
+                              )}
+                              {bl.cess.derived && (
                                 // Printed BESIDE the taxable figure, not instead of it,
                                 // because on a discounted line the two are DIFFERENT
                                 // numbers and that is deliberate: cess is charged on the
                                 // gross, GST after the discount. Shown side by side so a
                                 // reader checking the bill sees the rule rather than a bug.
-                                <span title="Compensation cess is charged on the accepted quantity BEFORE the discount — a different base from GST, on purpose.">
-                                  Cess base (accepted, before discount) <b className="text-[#2D1B0E] font-mono">₹{lineCess(it).base.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</b>
+                                <span title="Compensation cess is charged on the accepted quantity BEFORE the discount — a different base from GST, on purpose. Never folded into CGST/SGST.">
+                                  Cess {bl.cess.rate}% on {m2(bl.cess.base)} <b className="text-[#2D1B0E] font-mono">{m2(bl.cess.cess)}</b>
                                 </span>
                               )}
-                              <span>Total Inward <b className="text-[#af4408] font-mono">₹{lineTotal(it, lineTax(it), lineCess(it).cess).toLocaleString('en-IN', { maximumFractionDigits: 2 })}</b></span>
+                              <span>Total Inward <b className="text-[#af4408] font-mono">{m2(bl.total)}</b></span>
                             </div>
                           </div>
                         </td>
@@ -2766,14 +3807,24 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
                   const filled = items.filter(ln => ln.material_id && (parseFloat(ln.quantity_received) || 0) !== 0);
                   const totRec = items.reduce((s, ln) => s + (parseFloat(ln.quantity_received) || 0), 0);
                   const totAcc = items.reduce((s, ln) => s + (parseFloat(ln.quantity_accepted) || parseFloat(ln.quantity_received) || 0), 0);
-                  const totInward = items.reduce((s, ln) => s + (ln.material_id ? lineTotal(ln, lineTax(ln), lineCess(ln).cess) : 0), 0);
+                  // Straight off the one `bill` memo — never re-summed here, or the
+                  // footer and the rows could disagree about the same bill.
+                  const totInward = bill.totalInward;
                   const lineCount = filled.length;
                   if (lineCount === 0) return null;
                   // A qty total only exists when every filled line is in the SAME
                   // purchase unit. 12 BTL + 3 kg is not 15 of anything — print an
-                  // em-dash and keep the ₹ total, which is always addable.
-                  const units = new Set(filled.map(ln => lineUnits(ln.material_id).pu.toLowerCase().trim()).filter(Boolean));
-                  const oneUnit = units.size === 1 ? lineUnits(filled[0].material_id).pu : null;
+                  // em-dash and keep the ₹ total, which is always addable. A CASE
+                  // line counts CASES, so its basis joins the set too: 5 cases and
+                  // 5 bottles are not 10 of anything either.
+                  const units = new Set(filled.map(ln => {
+                    const c = caseBasis(ln.material_id, ln.entry_mode);
+                    return c.on ? `case:${lineUnits(ln.material_id).pu}` : lineUnits(ln.material_id).pu.toLowerCase().trim();
+                  }).filter(Boolean));
+                  const first = caseBasis(filled[0].material_id, filled[0].entry_mode);
+                  const oneUnit = units.size === 1
+                    ? (first.on ? `case (${first.cs})` : lineUnits(filled[0].material_id).pu)
+                    : null;
                   const qtyCell = (v: number) => oneUnit
                     ? <>{v.toLocaleString('en-IN', { maximumFractionDigits: 3 })} <span className="text-[9px] font-normal text-[#B8A590]">{oneUnit}</span></>
                     : <span className="text-[#B8A590]" title="Lines are in different purchase units (e.g. kg and BTL) — a single quantity total would mix units. The ₹ total is unaffected.">—</span>;
@@ -2800,6 +3851,43 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
               sits right below the material you just added (rather than off-screen
               at the top of the box). Desktop keeps the compact top button. */}
           <button type="button" onClick={addLine} className="mt-2 w-full flex items-center justify-center gap-1.5 py-2.5 border-2 border-dashed border-[#E8D5C4] rounded-lg text-sm font-medium text-[#af4408] hover:border-[#af4408] hover:bg-[#FFF1E3] active:bg-[#FFE8D5]"><Plus className="w-4 h-4" /> Add line</button>
+
+          {/* ══ THE BILL, THE WAY THE PAPER STATES IT ═══════════════════════
+              The eight figures a storekeeper checks against the printed invoice
+              before saving, in the vendor's own reading order. Carried over from
+              "Enter Full Bill". Every one comes from the single `bill` memo the
+              rows and the payload use, so this strip cannot drift from what is
+              about to be posted. */}
+          {bill.subtotal > 0 && (
+            <div className="border border-[#E8D5C4] rounded-lg bg-[#FFF1E3]/50 p-3">
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-y-1.5 gap-x-4 text-[11px] text-[#6B5744]">
+                <span className="flex justify-between gap-2">Goods value <b className="font-mono text-[#2D1B0E]">{m2(bill.subtotal)}</b></span>
+                <span className="flex justify-between gap-2" title="Bill-level discount plus every per-line discount. It lowers the cost basis.">
+                  Discount <b className="font-mono text-emerald-700">− {m2(r2(bill.discountAmount + bill.lineDiscounts))}</b>
+                </span>
+                <span className="flex justify-between gap-2">Taxable <b className="font-mono text-[#2D1B0E]">{m2(bill.taxableTotal)}</b></span>
+                <span className="flex justify-between gap-2">CGST <b className="font-mono text-[#2D1B0E]">{m2(bill.cgstTotal)}</b></span>
+                <span className="flex justify-between gap-2">SGST <b className="font-mono text-[#2D1B0E]">{m2(bill.sgstTotal)}</b></span>
+                <span className="flex justify-between gap-2" title="A separate levy. Deliberately NOT inside the GST total — the figure a GST return is filed on must stay exactly the GST figure.">
+                  Comp. cess <b className="font-mono text-[#2D1B0E]">{m2(bill.cessTotal)}</b>
+                </span>
+                <span className="flex justify-between gap-2" title="Recorded against the bill for vendor and spend reporting. It never enters unit cost on any path.">
+                  Delivery <b className="font-mono text-[#2D1B0E]">{m2(r2(bill.deliveryAmount + bill.lineDelivery))}</b>
+                </span>
+                <span className="flex justify-between gap-2" title="Special Excise Cess + TCS + MRP round-off, summed from the per-line boxes.">
+                  Other charges <b className="font-mono text-[#2D1B0E]">{m2(bill.otherCharges)}</b>
+                </span>
+              </div>
+              <div className="flex justify-between items-baseline mt-2 pt-2 border-t border-[#E8D5C4] text-sm">
+                <span className="text-[#6B5744] font-semibold">Total Inward — what you pay this vendor</span>
+                <b className="font-mono text-[#af4408]">{m2(bill.totalInward)}</b>
+              </div>
+              <div className="text-[10px] text-[#8B7355] mt-1">
+                Rates are the plain GOODS rate. GST and cess ride alongside and are never folded into what the item costs —
+                fold them in and every recipe inflates by the tax rate and the input credit is forfeited.
+              </div>
+            </div>
+          )}
 
           <label className="flex flex-col gap-1 text-[#6B5744]">Notes
             <textarea rows={2} value={notes} onChange={e => setNotes(e.target.value)}
@@ -2828,25 +3916,36 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
               </a>
               <button onClick={onCreated} className="px-3 py-1.5 bg-[#af4408] hover:bg-[#8a3506] text-white text-sm rounded-lg">Done</button>
             </>
+          ) : received ? (
+            <>
+              {Array.isArray(received.store_blocked) && received.store_blocked.length > 0 && (
+                <a href="/inventory/liquor-store" className="px-3 py-1.5 text-sm rounded-lg border border-[#E8D5C4] text-[#6B5744] hover:border-[#af4408] hover:text-[#af4408] flex items-center gap-1.5">
+                  <Wine className="w-4 h-4" /> Liquor Store
+                </a>
+              )}
+              <button onClick={onCreated} className="px-3 py-1.5 bg-[#af4408] hover:bg-[#8a3506] text-white text-sm rounded-lg">Done</button>
+            </>
           ) : (
             <>
               <button onClick={onClose} className="px-3 py-1.5 text-sm text-[#6B5744]">Cancel</button>
               <button onClick={submit}
-                      disabled={busy || qcPreRejectLines.length > 0
+                      disabled={busy || qcPreRejectLines.length > 0 || dupGroups.length > 0
                         || (qcPreview.known && qcPreview.required && qcPreview.backCorrection)}
-                      title={qcPreRejectLines.length > 0
+                      title={dupGroups.length > 0
+                        ? 'The same item is on more than one line — it would be delivered once and booked twice. Put the full quantity on one line.'
+                        : qcPreRejectLines.length > 0
                         ? 'A held delivery\'s accepted quantity is the checking department\'s to record — enter what actually arrived as Received instead.'
                         : (qcPreview.known && qcPreview.required && qcPreview.backCorrection)
                           ? 'A back-correction and a held delivery cannot share one receipt — save them separately.'
                           : qcPreview.required
                             ? `This will be recorded and held for a ${CHECKER_LABEL[qcPreview.checker]} check — no stock will be added until they sign.`
-                            : 'Create the goods receipt note'}
+                            : 'Record this vendor bill as a goods receipt'}
                       className="px-3 py-1.5 bg-[#af4408] hover:bg-[#8a3506] text-white text-sm rounded-lg flex items-center gap-1.5 disabled:opacity-50">
                 <Save className="w-4 h-4" />
-                {/* The button says what it is about to DO. "Create GRN" on a
+                {/* The button says what it is about to DO. "Save Bill" on a
                     delivery that will move no stock is the promise this whole
                     feature exists to stop making. */}
-                {busy ? 'Creating…' : qcPreview.required ? 'Create & send for QC' : 'Create GRN'}
+                {busy ? 'Saving…' : qcPreview.required ? 'Save bill & send for QC' : 'Save Bill'}
               </button>
             </>
           )}

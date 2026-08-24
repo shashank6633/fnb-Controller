@@ -1,5 +1,9 @@
 import { getDb, generateId, updateMaterialPrice } from '@/lib/db';
 import { centralFlowBlock } from '@/lib/store-engine';
+// The QC gate is ONE helper, shared with both receiving routes — never a second
+// copy of the category test. It reads category → qc_category_checkers and
+// nothing else, so this importer is gated by exactly the map the admin edits.
+import { resolveQcRequirement } from '@/lib/grn-qc';
 import { getCurrentUser } from '@/lib/auth';
 import { checkPurchaseDate } from '@/lib/purchase-guard';
 // The "one item = one line on a bill" remedy sentence is SHARED, not restated:
@@ -43,7 +47,10 @@ interface BulkPurchaseItem {
 }
 
 /** One rejected row, echoed back with enough to re-download + fix + re-upload. */
-type SkipKind = 'missing' | 'date' | 'not_found' | 'liquor' | 'invalid' | 'duplicate' | 'unit_mismatch';
+type SkipKind = 'missing' | 'date' | 'not_found' | 'liquor' | 'invalid' | 'duplicate' | 'unit_mismatch'
+  /** A category an admin has put on the QC map — it must arrive as a receipt
+   *  somebody can sign, not as a spreadsheet row. See the gate in the loop. */
+  | 'qc_required';
 interface SkippedRow {
   row: number;
   item_name: string; sku: string; vendor: string; brand: string;
@@ -279,6 +286,46 @@ export async function POST(request: Request) {
         const storeMsg = centralFlowBlock(db, materialId);
         if (storeMsg) { skip(item, rowNum, 'liquor', storeMsg); continue; }
 
+        /* ── THE KITCHEN QC GATE APPLIES HERE TOO ──────────────────────────────
+         * THIS WAS THE DOOR LEFT OPEN BY THE BILL FORM'S MOVE. "Enter Full Bill"
+         * now records a goods receipt and a perishable delivery therefore waits
+         * for a kitchen signature — but this importer sits on the SAME page, one
+         * button along, needs only a session, and wrote perishable stock
+         * straight in. Verified against the real handler: a CSV row for Tomatoes
+         * (category veg, a gated category) took current_stock 36 → 66 with no
+         * hold, no queue row and no bell.
+         *
+         * AND IT IS BILL ENTRY, whatever the button is called. BulkPurchaseItem
+         * carries vendor, bill_no, discount, cgst, sgst, compensation_cess,
+         * special_excise_cess, tcs, delivery_charges and mrp_round_off, and this
+         * route mints its own PINV. The page's own CSV template documents the
+         * full Total Inward formula. A twelve-line sheet of a vendor's bill is a
+         * vendor's bill.
+         *
+         * REFUSED PER ROW, NOT PER FILE, and refused rather than held: this
+         * route writes `purchases` rows directly and has no receipt document for
+         * a checker to sign against, so there is nothing here that COULD hold.
+         * The honest outcome is to decline the line and say where it goes. The
+         * rest of the sheet still imports — the same per-row skip-and-report the
+         * liquor guard above uses, so the row comes back in the skipped-rows CSV
+         * ready to be re-entered on /grn.
+         *
+         * WHAT THIS DOES NOT TOUCH: a sheet of groceries, packaging, beverages
+         * or anything else with no checker configured imports exactly as before.
+         * Only the categories an admin has actually put on the QC map are
+         * declined, so the owner controls the reach of this from
+         * Settings → Quality Check Categories, not from code.
+         */
+        const rowQc = resolveQcRequirement(db, [materialId]);
+        if (rowQc.required) {
+          skip(item, rowNum, 'qc_required',
+            `"${mat.name}" is a ${rowQc.categories.join(' / ')} item, and deliveries in that category have to be checked by `
+            + `${rowQc.checker === 'both' ? 'the kitchen or the bar' : rowQc.checker === 'bar' ? 'the bar' : 'the kitchen'} before they become stock. `
+            + `A CSV cannot be signed off, so this line was NOT imported — record this bill on Purchases → Enter Vendor Bill (GRN), `
+            + `where it will wait for that signature. Everything else on this sheet was imported normally.`);
+          continue;
+        }
+
         // PURCHASE UNIT guard. `quantity` is ALWAYS in the material's configured
         // purchase unit. If the sheet names a different unit (e.g. "CASE" when
         // the item is set up in "BTL", or the recipe unit "g" instead of "kg"),
@@ -371,6 +418,40 @@ export async function POST(request: Request) {
               `"${mat.name}" is already recorded on bill ${billNo} from ${vendorLabel} dated ${item.date} — `
               + `${prior.quantity} @ ${inr(prior.unit_price)}${prior.invoice_id ? ` (${prior.invoice_id})` : ''}. `
               + `One item = one line on a bill, so row ${rowNum} was NOT imported. ${SPLIT_RATE_REMEDY}`);
+            continue;
+          }
+          /* ── THE BILL THAT IS RECORDED BUT NOT YET BOOKED ────────────────────
+           * billLineCheck reads `purchases` alone, and a QC-HELD goods receipt
+           * has NO purchases row until the kitchen signs — so a bill sitting in
+           * the check queue was invisible here. Proven before this: a held GRN
+           * for 20 units, the same bill uploaded on the CSV while it waited, and
+           * then a sign-off, credited 40 units for a 20-unit bill.
+           * The gate above already declines a perishable row, which covers the
+           * common case; this covers the MIXED bill, whose non-perishable lines
+           * are held too (the GRN is the unit) and would otherwise sail through.
+           * Voided receipts are excluded — a void is the sanctioned way to
+           * cancel and re-enter. */
+          const heldLine = db.prepare(`
+            SELECT g.grn_number, g.date, g.status
+              FROM goods_receipt_note_items gi
+              JOIN goods_receipt_notes g ON g.id = gi.grn_id
+             WHERE gi.material_id = ?
+               AND LOWER(TRIM(COALESCE(g.vendor, '')))         = ?
+               AND LOWER(TRIM(COALESCE(g.invoice_number, ''))) = ?
+               AND g.status <> 'void'
+             ORDER BY g.created_at ASC
+             LIMIT 1
+          `).get(materialId, vendorKey, billNo.toLowerCase()) as
+            { grn_number: string; date: string; status: string } | undefined;
+          if (heldLine) {
+            skip(item, rowNum, 'duplicate',
+              `"${mat.name}" on bill ${billNo} from ${vendorLabel} is already recorded as goods receipt ${heldLine.grn_number} `
+              + `dated ${heldLine.date}`
+              + (heldLine.status === 'awaiting_qc'
+                ? `, which is still waiting for a kitchen check — its cost appears on the Purchases register only once that is signed. `
+                  + `Importing it here as well would count the stock twice. `
+                : `. Importing it here as well would count the stock twice. `)
+              + `Row ${rowNum} was NOT imported.`);
             continue;
           }
         }

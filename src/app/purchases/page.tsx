@@ -2,16 +2,9 @@
 
 import { useEffect, useMemo, useState, useRef } from 'react';
 import Link from 'next/link';
-import { fmtISTDate, todayIST } from '@/lib/format-date';
-// THE duplicate rule — one material = one line — lives in exactly one module now
-// (see block A below). src/lib/line-dedupe.ts imports NOTHING, which is the only
-// reason a 'use client' page may touch it: po-helpers.ts, where this rule used to
-// live alone, reaches @/lib/db → better-sqlite3 and would drag a native Node addon
-// into the browser bundle. Never add an import to line-dedupe.ts.
-import { lineKey, duplicateLineGroups, SPLIT_RATE_REMEDY } from '@/lib/line-dedupe';
+import { fmtISTDate } from '@/lib/format-date';
 import {
   ShoppingCart,
-  Plus,
   Search,
   X,
   Calendar,
@@ -22,22 +15,17 @@ import {
   Users,
   IndianRupee,
   FileText,
-  Trash2,
   Receipt,
+  ArrowRight,
   Upload,
   FileSpreadsheet,
   CheckCircle,
   AlertCircle,
   Download,
-  Merge,
-  Link2,
 } from 'lucide-react';
 import Papa from 'papaparse';
 import type { Purchase, RawMaterial } from '@/types';
 import { api } from '@/lib/api';
-import MaterialTypeahead from '@/components/MaterialTypeahead';
-import Combobox from '@/components/Combobox';
-import { packFactor, fmtQtyNum } from '@/lib/pack-units';
 // THE ONLY renderer of an in-hand Store/Dept figure (CONTRACT §5). This page
 // converts nothing and formats nothing: it hands the snapshot to the shared
 // component, which owns toPurchaseQty() and every "not a number" wording. A
@@ -56,167 +44,15 @@ function todayString(): string {
   return d.toISOString().split('T')[0];
 }
 
-/** Subtract n days from a YYYY-MM-DD string (UTC math avoids DST/local drift). */
-function isoMinusDays(iso: string, n: number): string {
-  const [y, m, d] = iso.split('-').map(Number);
-  if (!y || !m || !d) return iso;
-  const dt = new Date(Date.UTC(y, m - 1, d));
-  dt.setUTCDate(dt.getUTCDate() - n);
-  return dt.toISOString().slice(0, 10);
-}
+/* isoMinusDays() went with the bill form's date input. src/app/grn/page.tsx
+   has its own copy for the receipt-date box, which is the only date entry left. */
 
 
-/**
- * The GST rates this kitchen's bills actually carry. A fixed list, not a free
- * number box: a typo'd "1.8" on a ₹40,000 bill is a tax figure nobody catches
- * until the return is filed.
- */
-const GST_RATES = ['0', '5', '12', '18', '28'] as const;
-
-/**
- * Client-side mirror of store-engine's SQL catNorm(): lower-case, then strip
- * spaces / hyphens / underscores, so 'Single-Malt Whiskey', 'single malt
- * whiskey' and 'singlemaltwhiskey' all compare equal. Both sides of every
- * store_category_map ↔ raw_materials.category comparison must use it, or a
- * liquor category spelled with a hyphen goes unrecognised and gets taxed.
- */
-const catKey = (s: unknown) => String(s || '').trim().toLowerCase().replace(/[\s\-_]/g, '');
-
-/** Round to paisa. Every money figure on this form goes through this one place. */
-const r2 = (n: number) => Math.round(n * 100) / 100;
-
-// ---- Bill Entry Types ----
-interface BillLineItem {
-  id: number;
-  material_id: string;
-  brand: string;
-  quantity: string;
-  unit_price: string;
-  line_total: number;
-  discount_share: number;
-  delivery_share: number;
-  final_unit_price: number;
-  /** 'btl' = qty is bottles (default; price per bottle).
-   *  'case' = qty is cases; submit-time we expand to qty × case_size bottles. */
-  entry_mode?: 'btl' | 'case';
-  /**
-   * RAW select value. '' = inherit the bill-level rate; otherwise a percent
-   * string ('5', '12', '18'). Deliberately a STRING in state and parsed only
-   * inside billCalc — Number()-ing a rate box on every keystroke is what makes
-   * a decimal untypeable, the same trap the qty/price boxes already avoid.
-   */
-  gst_rate: string;
-  /**
-   * GST COMPENSATION CESS %, per line. A separate levy from GST — never folded
-   * into gst_rate, never split into halves, and NEVER added to tax_value: doing
-   * either corrupts the CGST/SGST figure that a return is filed on.
-   * Per-line only, with no bill-level default: one bill is almost always one GST
-   * rate, but cess is item-specific (the Coke cases on a bill carry it, the rest
-   * of the bill does not), so a bill-level default would seed cess onto lines
-   * that never bore it. '' = none. Raw string, same reason as gst_rate.
-   */
-  cess_rate: string;
-}
-
-interface BillFormData {
-  vendor: string;
-  bill_number: string;
-  date: string;
-  /** Recorded against the bill for vendor/spend reporting. Never enters unit cost. */
-  delivery_mode: 'percent' | 'amount';
-  delivery_value: string;
-  /** REDUCES unit cost — a discount genuinely lowers what the goods cost. */
-  discount_mode: 'percent' | 'amount';
-  discount_value: string;
-  /**
-   * Bill-level GST % that every line inherits unless that line overrides it.
-   * One vendor bill is almost always one rate; retyping it on twenty lines is
-   * how one line silently ends up on the wrong rate. Raw string, same reason
-   * as BillLineItem.gst_rate.
-   */
-  gst_rate: string;
-  notes: string;
-  items: BillLineItem[];
-}
-
-let billLineIdCounter = 1;
-
-/**
- * One bill-level charge row: By % / By Amount + the resolved ₹ figure.
- * Shared by Delivery Charges and Discount so the two always look and behave the
- * same — the only difference is what each does to cost, which `hint` states.
- */
-function ChargeRow({ label, hint, mode, value, onMode, onValue, placeholder, total, tone, negative }: {
-  label: string; hint: string;
-  mode: 'percent' | 'amount'; value: string;
-  onMode: (m: 'percent' | 'amount') => void;
-  onValue: (v: string) => void;
-  placeholder: string; total: number; tone: string; negative?: boolean;
-}) {
-  const name = label.replace(/\s+/g, '-').toLowerCase();
-  return (
-    <div className="flex items-center gap-4 flex-wrap">
-      <span className="text-sm font-medium text-[#6B5744] min-w-[130px]">
-        {label}
-        <span className="block text-[10px] font-normal text-[#8B7355]">{hint}</span>
-      </span>
-      <div className="flex items-center gap-2">
-        {(['percent', 'amount'] as const).map(m => (
-          <label key={m} className="flex items-center gap-1.5 cursor-pointer">
-            {/* name= groups the pair, so the two rows don't share a selection */}
-            <input type="radio" name={name} checked={mode === m} onChange={() => onMode(m)} className="accent-[#af4408]" />
-            <span className="text-sm text-[#6B5744]">{m === 'percent' ? 'By %' : 'By Amount'}</span>
-          </label>
-        ))}
-      </div>
-      <div className="flex items-center gap-1">
-        {mode === 'amount' && <span className="text-sm text-[#8B7355]">₹</span>}
-        <input
-          type="number" step="0.01" min="0" value={value}
-          onChange={e => onValue(e.target.value)}
-          placeholder={placeholder}
-          className="w-28 px-3 py-1.5 bg-white border border-[#D4B896] rounded-lg text-sm text-[#2D1B0E] focus:outline-none focus:ring-2 focus:ring-[#af4408]"
-        />
-        <span className="text-sm text-[#8B7355]">{mode === 'percent' ? '%' : ''}</span>
-      </div>
-      <span className={`text-sm font-medium ml-auto ${tone}`}>
-        {negative && total > 0 ? '- ' : ''}{formatCurrency(total)}
-      </span>
-    </div>
-  );
-}
-
-function emptyBillLine(): BillLineItem {
-  return {
-    id: billLineIdCounter++,
-    material_id: '',
-    brand: '',
-    quantity: '',
-    unit_price: '',
-    line_total: 0,
-    discount_share: 0,
-    delivery_share: 0,
-    final_unit_price: 0,
-    entry_mode: 'btl',
-    gst_rate: '',   // '' = follow the bill-level rate
-    cess_rate: '',  // '' = no compensation cess (there is no bill-level cess to follow)
-  };
-}
-
-const emptyBill: BillFormData = {
-  vendor: '',
-  bill_number: '',
-  date: todayString(),
-  delivery_mode: 'amount',
-  delivery_value: '',
-  discount_mode: 'percent',
-  discount_value: '',
-  // Default 0% so a bill entered exactly the way it always was books exactly the
-  // same numbers. Tax is opt-in per bill, never assumed.
-  gst_rate: '0',
-  notes: '',
-  items: [emptyBillLine(), emptyBillLine()],
-};
+/* NOTE — GST_RATES, catKey(), r2(), the BillLineItem / BillFormData shapes,
+   ChargeRow and emptyBill() all left with "Enter Full Bill". They existed only
+   to compose a bill, and a bill is composed on /grn now (src/app/grn/page.tsx).
+   Keeping dead copies here is exactly how the two forms drifted the last time
+   there were two. This page reads purchase history; it does not price one. */
 
 /**
  * Pull the PO number out of a purchase's notes.
@@ -234,10 +70,28 @@ const emptyBill: BillFormData = {
  * put a confidently wrong stock number beside a purchase, which is the exact defect
  * that column exists to prevent.
  */
-const PO_IN_NOTES = /\bPO-[^\s)(,;]+/;
+/* ── ANCHORED ON THE SENTENCE, NOT ON THE SHAPE "PO-…" ─────────────────────────
+ * IT USED TO BE A BARE /\bPO-[^\s)(,;]+/ ACROSS THE WHOLE NOTE, and once every
+ * hand-typed bill started arriving as an ad-hoc GRN that stopped failing closed.
+ * The ad-hoc mirror's note is:
+ *     "Ad-hoc GRN GRN-2026-0031 · invoice <the vendor's own bill number>"
+ * and the vendor's bill number is now MANDATORY and free text — so a supplier
+ * whose invoice reads `PO-4471/26` produced a live link to
+ * /purchase-orders?q=PO-4471%2F26 on a purchase that has no purchase order at
+ * all. Verified against the real route.
+ *
+ * So the match is now tied to the two sentences a receive route actually writes
+ * ("Received against PO-…", "PO PO-… received via GRN …"), which is what the
+ * fallback was always documented to read. Anything after " · invoice " is the
+ * VENDOR's text and is never parsed. Still fails CLOSED: no match, no link.
+ */
+const PO_IN_NOTES = /(?:Received against|^PO)\s+(PO-[^\s)(,;]+)/;
 function poNumberFromNotes(notes: string | null | undefined): string | null {
-  const m = String(notes || '').match(PO_IN_NOTES);
-  return m ? m[0] : null;
+  // The vendor's own bill number lives after this separator and must not be
+  // read as ours, whatever it happens to look like.
+  const ours = String(notes || '').split(' · invoice ')[0];
+  const m = ours.match(PO_IN_NOTES);
+  return m ? m[1] : null;
 }
 
 /* ══ RECORDED IN-HAND STOCK — reading the snapshot (CONTRACT §5.4 / §6) ═══════
@@ -371,63 +225,11 @@ function snapshotFromRow(p: any): SnapshotCell | null {
 export default function PurchasesPage() {
   const [purchases, setPurchases] = useState<Purchase[]>([]);
   const [materials, setMaterials] = useState<RawMaterial[]>([]);
-  /**
-   * Vendor master for the bill's Vendor field. `vendorsFailed` flips that field
-   * back to plain free text with a note: an empty dropdown that can't be filled
-   * is worse than a typo — it stops a bill being entered at all.
-   */
-  const [vendors, setVendors] = useState<Array<{ id: string; name: string }>>([]);
-  const [vendorsFailed, setVendorsFailed] = useState(false);
-  /**
-   * catKey()-normalised categories owned by an ACTIVE store location. A material
-   * in one of these is TGBCL liquor: it is taxed through the store's bill charges
-   * (excise / cess / TCS), never through GST, so its line is forced to 0%.
-   * Empty set = unknown (fetch failed / no stores) — we then leave rates alone
-   * rather than guess, and /api/purchases blocks store-mapped lines regardless.
-   */
-  const [storeCats, setStoreCats] = useState<Set<string>>(new Set());
-  /**
-   * PURCHASE-unit label resolver for every quantity/rate box on this page.
-   * /api/purchases, /api/purchases/bulk and /api/purchases/opening-stock all
-   * read `quantity` as PURCHASE units and `unit_price` as ₹ per purchase unit;
-   * each applies the ×pack_size step to stock itself. So nothing here converts —
-   * this only supplies the LABEL and the "= N g" reading hint, and posting is
-   * untouched. `pf` is 1 unless BOTH halves of the guard hold (pack_size > 1 AND
-   * recipe unit ≠ purchase unit) — packFactor owns that rule.
-   */
-  const matUnits = (materialId: string) => {
-    const m = materials.find(x => x.id === materialId) as any;
-    if (!m) return { pu: '', ru: '', pf: 1 };
-    const ru = String(m.unit || '');
-    return {
-      pu: String(m.purchase_unit || ru || ''),
-      ru,
-      pf: packFactor({ unit: ru, purchase_unit: m.purchase_unit, pack_size: m.pack_size }),
-    };
-  };
-  /** "= 20,000 g" for a purchase-unit entry box. Reads the RAW string — never
-   *  writes it back (Number()-ing on each keystroke makes "2." untypeable). */
-  const recipeHint = (raw: string, u: { ru: string; pf: number }) => {
-    if (u.pf <= 1) return null;
-    const q = parseFloat(raw);
-    if (!Number.isFinite(q) || q === 0) return null;
-    return `= ${fmtQtyNum(q * u.pf)} ${u.ru}`;
-  };
-  /**
-   * Is this quantity/price box actually on the CASE basis? This is the LABEL
-   * mirror of the guard inside billSubmit(): it multiplies
-   * the typed quantity (and divide the typed rate) by case_size ONLY when the
-   * mode is 'case' AND case_size > 1. A mode left on 'case' after switching to
-   * a non-case material silently falls back to purchase-unit behaviour, so a
-   * label keyed on entry_mode ALONE would announce a basis the arithmetic is
-   * not using. Every annotation on both forms keys on this one helper — the
-   * bug being fixed here was exactly one annotation guarding and its sibling
-   * not (buyer read "in BTL", typed 60 cases-worth, booked 720 bottles).
-   */
-  const caseBasis = (materialId: string, mode?: 'btl' | 'case') => {
-    const cs = Number((materials.find(x => x.id === materialId) as any)?.case_size) || 1;
-    return { cs, on: mode === 'case' && cs > 1 };
-  };
+  /* NOTE — the vendor master, the store-category set, matUnits(), recipeHint()
+     and caseBasis() left with "Enter Full Bill". Every one of them existed to
+     LABEL or PRICE a line being typed; this page reads finished rows, and
+     /api/purchases already returns them pack-aware. src/app/grn/page.tsx now
+     holds the live copies. */
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -442,6 +244,9 @@ export default function PurchasesPage() {
    *  returns SRI SAI and SRINIVAS). */
   const [vendorFilter, setVendorFilter] = useState('');
   const [appliedFilters, setAppliedFilters] = useState({ search: '', from: '', to: '', vendor: '' });
+  /** Bills recorded but NOT yet on this register — held for a kitchen check.
+   *  Date + value only; see fetchHeldBills for why they are disclosed here. */
+  const [heldBills, setHeldBills] = useState<Array<{ date: string; value: number }>>([]);
 
   // Sort
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc');
@@ -450,32 +255,21 @@ export default function PurchasesPage() {
 
   // Toast
   const [toast, setToast] = useState<string | null>(null);
-  /** Non-blocking notes the SERVER returned on an otherwise successful bill save:
-   *  a vendor↔item pair it would not map (not in the master / deliberately
-   *  removed before), or lines it folded together. The save succeeded either
-   *  way — these must never look like failures, and must never auto-dismiss:
-   *  "N items added" followed by fewer rows is exactly the moment a storekeeper
-   *  needs the reason on screen. */
-  const [billNotices, setBillNotices] = useState<string[]>([]);
-
   // Backdate limit (configurable) + admin exemption. Server is the real guard;
-  // these drive the date-input min/max (UX only) and the admin editor below.
+  // this now drives ONLY the admin editor below — the date-input min/max it also
+  // fed went with the bill form, and /grn derives its own from the same setting.
   const [backdateLimit, setBackdateLimit] = useState(3);
   const [isAdmin, setIsAdmin] = useState(false);
   const [limitInput, setLimitInput] = useState('3');
   const [limitSaving, setLimitSaving] = useState(false);
   const [limitSaved, setLimitSaved] = useState(false);
 
-  // Non-admins are penned to [today - N, today]. Admins get no min/max.
-  const dateMin = isAdmin ? undefined : isoMinusDays(todayIST(), backdateLimit);
-  const dateMax = isAdmin ? undefined : todayIST();
-  const backdateHint = `Backdating limited to ${backdateLimit} day(s) (admins exempt)`;
-
-  // Bill Entry Modal
-  const [billModalOpen, setBillModalOpen] = useState(false);
-  const [billData, setBillData] = useState<BillFormData>({ ...emptyBill });
-  const [billSubmitting, setBillSubmitting] = useState(false);
-  const [billError, setBillError] = useState<string | null>(null);
+  /* The backdate limit is still edited here, by an admin, even though bills are
+     entered on /grn. It is a SETTING (purchase_backdate_limit_days), not a bill
+     field, and both receiving forms read the same key — /grn's ad-hoc modal
+     fetches it on mount and checkPurchaseDate() enforces it server-side on every
+     receiving route. Moving the editor to /grn would only hide it from the admin
+     who looks for it beside the purchase register. */
 
   // Recaho Inward Upload
   const [recahoOpen, setRecahoOpen] = useState(false);
@@ -559,6 +353,35 @@ export default function PurchasesPage() {
     }
   };
 
+  /* ── THE BILLS THIS REGISTER CANNOT SEE YET ────────────────────────────────
+   * A QC-held delivery is a recorded bill with NO `purchases` row: the cost is
+   * booked at sign-off, hours or days later. So this page — which the notice
+   * above calls "the record and the reports" — is silently short by every bill
+   * still in the kitchen queue, and its Total Spend card and any month-end
+   * figure pulled before the queue drains are LOW and will quietly correct
+   * themselves afterwards (the sign-off books against the RECEIPT date, so the
+   * money lands back in the period it belonged to).
+   *
+   * That is the right accounting and the wrong silence. This reads the same
+   * queue the bell reads and states the gap in the same breath as the numbers.
+   * FAILS SILENT, NOT LOUD: any error leaves the banner hidden rather than
+   * putting a scary red box on the register — a missing disclosure is a smaller
+   * harm here than a broken-looking page, and nothing on this screen depends on
+   * it. Fetched once with the rest; the queue moves in hours, not seconds.
+   */
+  const fetchHeldBills = async () => {
+    try {
+      const res = await fetch('/api/grn/qc');
+      if (!res.ok) return;
+      const json = await res.json();
+      const rows = Array.isArray(json?.rows) ? json.rows : [];
+      setHeldBills(rows.map((r: any) => ({
+        date: String(r.date || ''),
+        value: Number(r.held_value) || 0,
+      })));
+    } catch { /* disclosure only — never break the register over it */ }
+  };
+
   const fetchMaterials = async () => {
     try {
       // scope=all — Purchases is a store operation; show every material
@@ -572,108 +395,11 @@ export default function PurchasesPage() {
     }
   };
 
-  const fetchVendors = async () => {
-    try {
-      const res = await fetch('/api/vendors');
-      if (!res.ok) throw new Error('Failed to fetch vendors');
-      const json = await res.json();
-      // Read the payload EXACTLY as the ad-hoc GRN form does (src/app/grn/page.tsx
-      // ~476): the route answers { vendors: [...] }, and an inactive vendor must
-      // never be offered — picking one would fragment spend onto a dead master row.
-      setVendors((json.vendors || []).filter((v: any) => v.is_active));
-      setVendorsFailed(false);
-    } catch {
-      setVendorsFailed(true);
-    }
-  };
-
-  /**
-   * Which categories belong to an ACTIVE store location. Any signed-in user may
-   * GET /api/stores, and it already returns each store's mapped categories, so
-   * the client can recognise a TGBCL/liquor line without a new endpoint.
-   */
-  const fetchStoreCategories = async () => {
-    try {
-      const res = await fetch('/api/stores');
-      if (!res.ok) return;                       // leave the set empty = "unknown"
-      const json = await res.json();
-      const next = new Set<string>();
-      for (const st of json.stores || []) {
-        // A deactivated store releases its categories back to Central behaviour —
-        // same rule materialStoreId() applies server-side.
-        if (!st?.is_active) continue;
-        for (const c of st.categories || []) {
-          const k = catKey(c?.category);
-          if (k) next.add(k);
-        }
-      }
-      setStoreCats(next);
-    } catch {
-      // Leave empty. Rates then behave normally and the server still refuses any
-      // store-mapped line outright (centralFlowBlock in /api/purchases POST).
-    }
-  };
-
-  /** Is this line a store-mapped (TGBCL liquor) material — i.e. zero-rated here? */
-  const storeMappedLine = (materialId: string) => {
-    if (storeCats.size === 0 || !materialId) return false;
-    const m = materials.find((x) => x.id === materialId) as any;
-    return !!m && storeCats.has(catKey(m.category));
-  };
-
-  /**
-   * The GST% a line should START at when this material is picked — the master's
-   * raw_materials.tax_percent, which until now was a write-only field nobody on
-   * the purchase side ever read (the whole reported bug).
-   *
-   * It SEEDS, it does not FORCE: a bill is a fact, and the printed vendor
-   * invoice wins over a possibly-stale master. The storekeeper can change the
-   * select immediately after.
-   *
-   * Two refusals, both deliberate — do not "simplify" either away:
-   *   · store-mapped (TGBCL liquor) is zero-rated here and returns '' so no rate
-   *     can ever be seeded onto it. tax_percent is a free field on the master
-   *     with no liquor guard, so a manager CAN type 18 on a TGBCL item; the
-   *     existing zero-rate locks (billCalc + the server) stay the authority and
-   *     this sits strictly beneath them.
-   *   · a rate that is not in GST_RATES (say 7) returns '' rather than a value
-   *     matching no <option> — React would render the select blank, the
-   *     storekeeper would read 0%, and billCalc would book 7%.
-   * '' means "follow the bill-level rate", which is the pre-existing default.
-   */
-  const seedGstForMaterial = (materialId: string): string => {
-    if (!materialId) return '';
-    if (storeMappedLine(materialId)) return '';
-    const m = materials.find((x) => x.id === materialId) as any;
-    const t = Number(m?.tax_percent) || 0;
-    if (t <= 0) return '';
-    const s = String(t);
-    return (GST_RATES as readonly string[]).includes(s) ? s : '';
-  };
-
-  /**
-   * The COMPENSATION CESS % a line should start at — raw_materials.cess_percent,
-   * the other half of the reported bug ("GST % and Cess % are added in the Raw
-   * Material Master, but they are not picking automatically during Purchase
-   * Entry"). Seeds exactly like the GST rate above, and the TGBCL refusal is the
-   * same: a store-mapped line's duty rides on the store's own bill, so no rate
-   * may be seeded onto it.
-   *
-   * ONE DELIBERATE DIFFERENCE from seedGstForMaterial: there is no GST_RATES
-   * membership test. That test exists only because the GST control is a <select>
-   * — a value matching no <option> renders blank and the storekeeper reads 0%.
-   * The cess control is a free number input (mirroring the master's own free
-   * 0-100 field), so any in-range value renders honestly and refusing e.g. 12.5
-   * would silently drop real money. Only non-finite / <=0 / >100 are refused.
-   */
-  const seedCessForMaterial = (materialId: string): string => {
-    if (!materialId) return '';
-    if (storeMappedLine(materialId)) return '';
-    const m = materials.find((x) => x.id === materialId) as any;
-    const c = Number(m?.cess_percent);
-    if (!Number.isFinite(c) || c <= 0 || c > 100) return '';
-    return String(c);
-  };
+  /* NOTE — fetchVendors(), fetchStoreCategories(), storeMappedLine(),
+     seedGstForMaterial() and seedCessForMaterial() left with "Enter Full Bill".
+     They read the vendor master and the store-category map to SEED and
+     ZERO-RATE a line being typed. src/app/grn/page.tsx holds them now, verbatim,
+     and is the only place that needs them. */
 
   const fetchBackdateConfig = async () => {
     try {
@@ -697,9 +423,11 @@ export default function PurchasesPage() {
   useEffect(() => {
     const init = async () => {
       setLoading(true);
+      // The vendor master and the store-category map are no longer fetched here:
+      // both were read only to compose a bill. `materials` stays — the CSV
+      // preview and the Recaho import still resolve names against it.
       await Promise.all([
-        fetchPurchases(), fetchMaterials(), fetchBackdateConfig(),
-        fetchVendors(), fetchStoreCategories(),
+        fetchPurchases(), fetchMaterials(), fetchBackdateConfig(), fetchHeldBills(),
       ]);
       setLoading(false);
     };
@@ -826,833 +554,36 @@ export default function PurchasesPage() {
 
   const vendorCount = new Set(purchases.map((p) => p.vendor).filter(Boolean)).size;
 
-  // NOTE: the single-line "Add Purchase" form and its handlers were removed
-  // with the button. Every purchase now goes through the bill entry below, so
-  // there is one write path instead of two that could drift apart.
-
-  // ---- Bill Entry Handlers ----
-
-  const openBillModal = () => {
-    billLineIdCounter = 1;
-    setBillData({ ...emptyBill, date: todayString(), items: [emptyBillLine(), emptyBillLine()] });
-    setBillError(null);
-    // The "already added" note MUST be cleared here. billLineIdCounter resets to
-    // 1 on every open, so a note left behind by a bill that was closed without
-    // saving would reappear attached to a brand-new, unrelated line that merely
-    // happens to reuse the same id.
-    setDupPickNote(null);
-    setBillMapNote(null);
-    setVendorItemsOpen(false);
-    setBillModalOpen(true);
-  };
-
-  const updateBillField = (field: keyof Omit<BillFormData, 'items'>, value: string) => {
-    setBillData((prev) => ({ ...prev, [field]: value }));
-    setBillError(null);
-  };
-
-  const addBillLine = () => {
-    setBillData((prev) => ({ ...prev, items: [...prev.items, emptyBillLine()] }));
-  };
-
-  const removeBillLine = (id: number) => {
-    // Dropping a line frees its material, so any "already added on line N"
-    // note is now stale — and N itself may have shifted.
-    setDupPickNote(null);
-    setBillData((prev) => {
-      // A chosen material is LOCKED, so this trash is the ONLY way to correct a
-      // wrong pick. On the last remaining line there is nothing to fall back
-      // to, so reset it to a blank line rather than removing it — otherwise a
-      // one-line bill with the wrong material has no way out except closing the
-      // modal and re-typing the whole header.
-      if (prev.items.length <= 1) return { ...prev, items: [emptyBillLine()] };
-      return { ...prev, items: prev.items.filter((item) => item.id !== id) };
-    });
-  };
-
-  const updateBillLine = (id: number, field: keyof BillLineItem, value: string) => {
-    setBillData((prev) => ({
-      ...prev,
-      items: prev.items.map((item) => {
-        if (item.id !== id) return item;
-        if (field !== 'material_id') return { ...item, [field]: value };
-        // Picking/swapping the material re-seeds the line's GST% from the new
-        // material's master rate — but ONLY when the current rate is still
-        // machine-set: either untouched ('') or exactly what the PREVIOUS
-        // material would have seeded. Anything else is a rate the storekeeper
-        // deliberately typed off the printed bill, and silently resetting it is
-        // a tax error nobody notices until the return is filed. The test must
-        // stay "equals the previous seed" — a hardcoded '' would clobber every
-        // seeded line on a material swap.
-        const prevSeed = seedGstForMaterial(item.material_id);
-        const keepRate = !(item.gst_rate === '' || item.gst_rate === prevSeed);
-        // Compensation cess re-seeds under the SAME test, judged against its own
-        // previous seed — a storekeeper who typed 5% cess off the printed bill
-        // keeps it through a material swap exactly as they keep a typed GST%.
-        const prevCessSeed = seedCessForMaterial(item.material_id);
-        const keepCess = !(item.cess_rate === '' || item.cess_rate === prevCessSeed);
-        return {
-          ...item,
-          material_id: value,
-          gst_rate: keepRate ? item.gst_rate : seedGstForMaterial(value),
-          cess_rate: keepCess ? item.cess_rate : seedCessForMaterial(value),
-        };
-      }),
-    }));
-  };
-
-  /* ==============================================================
-   * A. DUPLICATE LINES ON ONE BILL
+  /* ══ THIS PAGE NO LONGER WRITES A PURCHASE ═══════════════════════════════
    *
-   * WHY IT MATTERS, in one sentence: handleBillSubmit POSTs each line to
-   * /api/purchases SEPARATELY, so the same material on two lines writes TWO
-   * purchases rows — stock is credited twice and the item passes through
-   * updateMaterialPrice's weighted average twice, which then re-costs every
-   * recipe that uses it. (The reported case: MAT-00192 CHAR COAL entered as
-   * 600 kg AND 400 kg at ₹35/kg — one bill line typed as two.)
+   * "Enter Full Bill" and its handlers (openBillModal, updateBillLine, the
+   * duplicate-line panel, the vendor<->item panel, billCalc and handleBillSubmit)
+   * were removed with the button, and the single-line "Add Purchase" form before
+   * them. Both wrote a `purchases` row DIRECTLY — that route's own comment says a
+   * purchase "writes STRAIGHT to stock and to updateMaterialPrice" — with no
+   * Kitchen QC gate, no inward register, no void, no line-edit and, for the
+   * ad-hoc shape, no duplicate-bill refusal.
    *
-   * THE RULE IS IMPORTED, NOT RESTATED. It lives in src/lib/line-dedupe.ts and
-   * nowhere else: lineKey (identity) and duplicateLineGroups (the scan) are the
-   * SAME functions the PO routes reach through po-helpers, which now merely
-   * re-exports them. This page used to MIRROR that logic inline because
-   * po-helpers' module scope imports @/lib/db → better-sqlite3 and a 'use client'
-   * file cannot drag a native Node addon into the browser bundle. The mirror is
-   * exactly why the bill and the PO drifted apart — the bill grew a split-rate
-   * escape hatch the PO never had — so line-dedupe.ts was carved out db-free to
-   * end that. DO NOT RESTATE THE RULE HERE AGAIN, in any form; extend the shared
-   * module instead. (line-dedupe.ts must keep ZERO imports, type-only ones
-   * included, or this page stops building.)
+   * A hand-typed vendor bill is recorded on /grn now, which inherits all five by
+   * construction rather than by a second implementation. The whole capability
+   * moved, field for field: vendor, invoice number and invoice date, bill-level
+   * Discount and Delivery split across the lines, per-line GST and compensation
+   * cess, the BTL/CASE entry mode, brand, and the goods -> discount -> taxable ->
+   * tax -> incl-tax reading across.
    *
-   * IDENTITY IS material_id ALONE, exactly like a PO. Rate, GST %, cess, brand
-   * and BTL/CASE basis do NOT enter it: the same item twice on one bill is
-   * refused whatever the numbers say. Blank rows stay legal and are skipped —
-   * the form opens with empty ones.
+   * ⚠ DO NOT PUT A BILL FORM BACK ON THIS PAGE, in any shape. That is the mistake
+   *   this codebase has already paid for: two forms writing one row drift, and
+   *   the CASE/BTL entry-mode bug had to be found and fixed once per form. There
+   *   is ONE writer. If a bill needs a field it does not accept, add it to
+   *   POST /api/grn and to src/app/grn/page.tsx.
    *
-   * THE ONE PLACE THIS IS LOOSER THAN A PO, deliberately: the bill only REFUSES
-   * on repeats among rows that would actually be POSTed (quantity > 0 AND rate
-   * > 0 — the `bookable` notion, i.e. what validItems keeps). A half-typed
-   * second row is dropped by validItems and never becomes a purchases row, so
-   * refusing it would be a false refusal on a line that cannot exist. A PO line
-   * with no quantity IS still ordered, which is why the PO has no such carve-out.
-   * Repeats that are not yet bookable still raise the amber panel; they just do
-   * not hold the save up. Do not "align" this away.
-   * ============================================================== */
-
-  /** Trimmed material id — the identity a duplicate is judged on. THE SHARED
-   *  function, not a local copy: BillLineItem is structurally assignable to
-   *  line-dedupe's DedupeLineLike (every field there is optional + unknown). */
-  const lineMat = lineKey;
-
-  /**
-   * NOT IDENTITY. Identity is material_id alone (lineKey, imported above) and a
-   * repeat is refused on that alone. This key answers a narrower, purely
-   * arithmetic question: would the one-click "Merge into one line" leave the
-   * money untouched? A merge sums the quantities onto the FIRST row and keeps
-   * that row's rate/GST/cess/basis/brand, so it is only neutral when all five
-   * already match:
-   *   · Rate    — the headline. Folding 600 kg @ ₹35 into 400 kg @ ₹40 would
-   *               re-price the lot at ₹35 and corrupt every recipe cost built
-   *               on the item's weighted average.
-   *   · GST %   — the merge carries the FIRST line's rate onto the summed
-   *               quantity, which would re-tax the other line's value.
-   *   · Cess %  — same trap, its own levy: merging a 12%-cess line into a
-   *               0%-cess line re-applies 12% to the summed quantity.
-   *   · BTL/CASE— a per-case rate and a per-bottle rate are different numbers
-   *               even when they read the same (billSubmit expands cases).
-   *   · Brand   — one material_id billed under two brands is two things.
-   * When these differ the repeat is still REFUSED — it simply gets no merge
-   * button, because there is no arithmetic the button could safely do.
+   * WHAT IS STILL WRITTEN FROM HERE, and none of it is bill entry:
+   *   · Generic CSV Upload      -> POST /api/purchases/bulk
+   *   · Upload Opening Stock    -> POST /api/purchases/opening-stock
+   *   · Recaho inward import    -> POST /api/inward-import/commit
+   * Each is a separate route with its own INSERT; none passed through
+   * POST /api/purchases, and none is touched by the move.
    */
-  const mergeSafeKey = (it: BillLineItem, billRate: number) => {
-    const rate = r2(parseFloat(it.unit_price) || 0);
-    // Mirrors billCalc's rate resolution exactly, TGBCL zero-rating included.
-    const zeroRated = storeMappedLine(it.material_id);
-    const gst = zeroRated
-      ? 0
-      : (it.gst_rate === '' ? billRate : (parseFloat(it.gst_rate) || 0));
-    // No bill-level fallback: '' simply means no cess on this line.
-    const cess = zeroRated ? 0 : (parseFloat(it.cess_rate) || 0);
-    const basis = caseBasis(it.material_id, it.entry_mode).on ? 'case' : 'unit';
-    const brand = String(it.brand || '').trim().toLowerCase();
-    return `${rate}|${gst}|${cess}|${basis}|${brand}`;
-  };
-
-  /** Which field(s) actually differ between two+ merge-safe keys — so the
-   *  refusal says "a different rate", not just "these are different". */
-  const keyDiffLabels = (keys: string[]) => {
-    // Order MUST track mergeSafeKey's field order — these read positionally.
-    const fields = [
-      'a different rate',
-      'a different GST %',
-      'a different Cess %',
-      'a different BTL / CASE basis',
-      'a different brand',
-    ];
-    const parts = keys.map((k) => k.split('|'));
-    return fields.filter((_, i) => new Set(parts.map((p) => p[i])).size > 1);
-  };
-
-  /**
-   * Duplicates AS THEY ARE ENTERED (recomputed every keystroke), never only at
-   * submit. The IDENTITY SCAN is the shared one — duplicateLineGroups, the same
-   * material_id-alone rule the PO routes enforce; everything added below it is
-   * presentation (name, unit, merge-safety, which rows would really be written).
-   */
-  const dupInfo = useMemo(() => {
-    const billRate = parseFloat(billData.gst_rate) || 0;
-    const bookableAt = (line: BillLineItem) =>
-      (parseFloat(line.quantity) || 0) > 0 && (parseFloat(line.unit_price) || 0) > 0;
-
-    const groups: Array<{
-      materialId: string; name: string;
-      lineNos: number[];
-      mergeable: Array<{ key: string; lineNos: number[]; parts: number[]; total: number; rate: number; bookable: number; unit: string }>;
-      differs: string[]; bookable: number;
-    }> = [];
-    const flagged = new Set<number>();
-
-    // Blank material_id rows are skipped inside the shared helper, so the two
-    // empty rows the form opens with are never a "duplicate".
-    for (const grp of duplicateLineGroups(billData.items)) {
-      const mid = grp.key;
-      const rows = grp.indices.map((idx) => ({
-        idx,
-        line: billData.items[idx],
-        key: mergeSafeKey(billData.items[idx], billRate),
-        bookable: bookableAt(billData.items[idx]),
-      }));
-      // EVERY repeated row is highlighted, bookable or not — the panel is a
-      // warning surface and a half-typed repeat is still worth seeing.
-      rows.forEach((r) => flagged.add(r.idx));
-      const mat = materials.find((m) => String(m.id) === mid) as any;
-      // The BTL-basis label only. A CASE row is captioned per sub-group below,
-      // because the basis — not the material — decides what its numbers mean.
-      const purchaseUnit = matUnits(mid).pu || String(mat?.unit || '') || 'unit';
-      const bySub = new Map<string, typeof rows>();
-      for (const r of rows) {
-        const a = bySub.get(r.key);
-        if (a) a.push(r); else bySub.set(r.key, [r]);
-      }
-      // Sub-groups that a merge would leave arithmetically untouched — the only
-      // ones that may be offered a one-click fold.
-      const mergeable = [...bySub.entries()]
-        .filter(([, rs]) => rs.length > 1)
-        .map(([key, rs]) => ({
-          key,
-          lineNos: rs.map((r) => r.idx + 1),
-          parts: rs.map((r) => parseFloat(r.line.quantity) || 0),
-          // 4 dp so 600 + 400 reads 1,000 and not 999.9999999999999.
-          total: Math.round(rs.reduce((s, r) => s + (parseFloat(r.line.quantity) || 0), 0) * 10000) / 10000,
-          rate: r2(parseFloat(rs[0].line.unit_price) || 0),
-          bookable: rs.filter((r) => r.bookable).length,
-          /**
-           * The caption for THIS sub-group's quantities and rate. mergeSafeKey
-           * folds the BTL/CASE basis into the key, so every row here shares one
-           * basis and rs[0] speaks for all of them. On the CASE basis the typed
-           * quantity is CASES and the typed rate is ₹/CASE (billSubmit expands
-           * qty × case_size and divides the rate by case_size before POSTing),
-           * so printing the material's purchase unit read "₹1,200/BTL … 5 + 3 =
-           * 8 BTL" over eight CASES — a 12× misread of both numbers.
-           */
-          unit: caseBasis(mid, rs[0].line.entry_mode).on ? 'CASE' : purchaseUnit,
-        }));
-      const keys = [...bySub.keys()];
-      groups.push({
-        materialId: mid,
-        name: mat?.name || mid,
-        lineNos: grp.lineNos,
-        mergeable,
-        differs: keys.length > 1 ? keyDiffLabels(keys) : [],
-        bookable: rows.filter((r) => r.bookable).length,
-      });
-    }
-
-    return {
-      groups,
-      flagged,
-      /**
-       * THE REFUSAL LIST — one list, no rate/GST/brand/basis exemption, because
-       * one material = one line on a bill exactly as on a PO.
-       * BOOKABLE CARVE-OUT (the single deliberate divergence from the PO, see
-       * block A): a row without a quantity or without a rate is dropped by
-       * validItems and never POSTed, so it cannot double stock and must not
-       * falsely refuse the bill. Two-or-more BOOKABLE rows of one material is
-       * the exact condition under which /api/purchases would be asked to write
-       * the item onto this bill twice.
-       */
-      blocking: groups.filter((g) => g.bookable > 1),
-    };
-    // storeCats/materials feed mergeSafeKey + the labels; billData.gst_rate is
-    // the inherited GST every un-overridden line resolves to.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [billData.items, billData.gst_rate, materials, storeCats]);
-
-  /**
-   * Fold one exact-match group into a single line: quantity SUMMED onto the
-   * FIRST occurrence, which keeps its own rate / brand / GST / basis — the same
-   * semantics as mergeDuplicateLines in the shared module. This is NOT an escape
-   * hatch from the refusal above; it is the one-click way to DO what the refusal
-   * asks for ("put the full quantity on one line"). Nothing is averaged, and the
-   * taxable base is not carried over: billCalc re-derives goods, discount share,
-   * taxable, CGST and SGST from the merged quantity × the unchanged rate, so
-   * tax can never leak into unit_price.
-   * Re-derives the group from CURRENT state (never from the memo's snapshot) so
-   * a keystroke between render and click cannot merge the wrong pair.
-   */
-  const mergeBillLines = (materialId: string, key: string) => {
-    // Merging removes rows, which moves every line number below them.
-    setDupPickNote(null);
-    setBillData((prev) => {
-      const billRate = parseFloat(prev.gst_rate) || 0;
-      const idxs = prev.items
-        .map((it, i) => ({ it, i }))
-        .filter(({ it }) => lineMat(it) === materialId && mergeSafeKey(it, billRate) === key)
-        .map(({ i }) => i);
-      if (idxs.length < 2) return prev;              // state moved on — do nothing
-      const keepAt = idxs[0];
-      const total = Math.round(
-        idxs.reduce((s, i) => s + (parseFloat(prev.items[i].quantity) || 0), 0) * 10000,
-      ) / 10000;
-      const drop = new Set(idxs.slice(1));
-      return {
-        ...prev,
-        items: prev.items
-          .map((l, i) => (i === keepAt ? { ...l, quantity: String(total) } : l))
-          .filter((_, i) => !drop.has(i)),
-      };
-    });
-    setBillError(null);
-  };
-
-  /* ==============================================================
-   * B. VENDOR ↔ ITEM MAPPING — CONSULTED, NEVER BLOCKING
-   *
-   * A PURCHASE ORDER is a document we author, so /purchase-orders refuses an
-   * unmapped vendor↔item pair outright. A BILL IS A FACT: it already happened,
-   * the goods are in the store, and refusing it here would only leave the
-   * storekeeper holding an invoice with nowhere to enter it. So this screen
-   * WARNS and still saves. That divergence from the strict PO rule is
-   * deliberate — do not "align" the two.
-   *
-   * AUTO-LEARN — IT EXISTS, AND IT LEARNS ONCE. Saving a bill DOES write
-   * vendor_materials, server-side (learnVendorMaterialPair in
-   * src/app/api/purchases/route.ts). A bill is the strongest evidence there is
-   * that a vendor supplies an item, so a pair that has NEVER existed is
-   * recorded on first sight. What it must never do is resurrect a mapping an
-   * admin deliberately deleted (the boot-backfill bug shape this codebase
-   * already had), so the server stamps a one-time
-   * `vm_learned:<vendor>:<material>` marker in `settings`:
-   * marker present + row absent == a human removed it, and the learner
-   * stays out. Do not "simplify" that marker away — it is the only thing
-   * separating learn-once from re-add-forever.
-   *
-   * The "Add to this vendor's items" button below is therefore NOT the only
-   * path; it is for the pairs the learner will not touch — a removed pair the
-   * admin now wants back, or a vendor typed as free text (no master row, so
-   * nothing to map against). The server WARNS in its response rather than
-   * blocking; handleBillSubmit surfaces those warnings after the save.
-   * ============================================================== */
-
-  /** The bill's vendor as a MASTER ROW, or '' when the typed name is new/custom.
-   *  The Vendor field is free text by design (allowCustom), and a mapping can
-   *  only be read or written against a real vendor id. */
-  const billVendorId = useMemo(() => {
-    const typed = billData.vendor.trim().toLowerCase();
-    if (!typed) return '';
-    return vendors.find((v) => v.name.trim().toLowerCase() === typed)?.id || '';
-  }, [billData.vendor, vendors]);
-
-  /** { vendorId, ids } once loaded. null = unknown (never fetched, or the fetch
-   *  failed) — in which case every mapping hint stays hidden and the form
-   *  behaves exactly as it did before. A hint is not worth blocking bill entry. */
-  const [vendorMap, setVendorMap] = useState<{ vendorId: string; ids: Set<string> } | null>(null);
-  const [vendorMapBusy, setVendorMapBusy] = useState(false);
-  const [vendorItemsOpen, setVendorItemsOpen] = useState(false);
-  const [billMapNote, setBillMapNote] = useState<string | null>(null);
-  /* "Already added" feedback for the material picker. One material = one line
-   * on a bill, so the picker greys a material that is already on another row;
-   * this names the row it is on, per line, so the message lands where the user
-   * is actually looking rather than at the top of the modal. */
-  /* Stores the MATERIAL, never a rendered sentence. An earlier version baked the
-   * line number into the text at click time, which then went stale the moment a
-   * line above it was deleted or merged away — the note kept naming line 1 after
-   * line 1 was gone. The position is now recomputed at render from the live
-   * items array, so it cannot drift, and the note self-dismisses if the material
-   * stops being a duplicate. */
-  const [dupPickNote, setDupPickNote] = useState<{ lineId: number; materialId: string; name: string } | null>(null);
-
-  useEffect(() => {
-    if (!billModalOpen || !billVendorId) { setVendorMap(null); return; }
-    let alive = true;
-    // Same endpoint and same payload shape the ad-hoc GRN form reads.
-    fetch(`/api/vendor-materials?vendor_id=${encodeURIComponent(billVendorId)}`)
-      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(String(r.status)))))
-      .then((d) => {
-        if (!alive) return;
-        setVendorMap({
-          vendorId: billVendorId,
-          ids: new Set<string>((d.mappings || []).map((m: any) => String(m.material_id))),
-        });
-      })
-      .catch(() => { if (alive) setVendorMap(null); });   // degrade to today's behaviour
-    return () => { alive = false; };
-  }, [billModalOpen, billVendorId]);
-
-  /** Only trust the map when it belongs to the vendor currently in the field —
-   *  otherwise a mid-typing vendor change would annotate lines against the
-   *  previous vendor's item list. */
-  const vendorMapIds = vendorMap && vendorMap.vendorId === billVendorId && billVendorId
-    ? vendorMap.ids : null;
-  const vendorShort = billData.vendor.trim() || 'this vendor';
-
-  /** The vendor's mapped items, alphabetical — the "show these first" list. */
-  const vendorMappedMaterials = useMemo(() => {
-    if (!vendorMapIds || vendorMapIds.size === 0) return [];
-    return materials
-      .filter((m) => vendorMapIds.has(String(m.id)))
-      .sort((a, b) => String(a.name).localeCompare(String(b.name)));
-  }, [vendorMapIds, materials]);
-
-  /**
-   * The picker's list, with this vendor's items MARKED. MaterialTypeahead is a
-   * shared component (also mounted by /recipes) that re-sorts internally, so
-   * array order cannot express priority and the mark has to travel on a field
-   * it renders: the category line. Marking there — not in the name — keeps the
-   * component's name-prefix relevance scoring intact, and as a bonus the mark
-   * joins its search haystack, so typing the vendor's name lists their items.
-   * EVERY material stays in the list; nothing is filtered out.
-   */
-  const billPickerMaterials = useMemo(() => {
-    if (!vendorMapIds || vendorMapIds.size === 0) return materials;
-    return materials.map((m: any) =>
-      vendorMapIds.has(String(m.id))
-        ? { ...m, category: `★ ${vendorShort}${m.category ? ` · ${m.category}` : ''}` }
-        : m,
-    );
-  }, [materials, vendorMapIds, vendorShort]);
-
-  /** Put a mapped item on the first empty line (else a new one). Refuses to add
-   *  an item the bill already carries — this panel must not create the very
-   *  duplicate the block above exists to catch. */
-  const placeMaterialOnLine = (materialId: string, name: string) => {
-    // The vendor quick-pick chips fill a line without going through the picker,
-    // so they bypass onPick's clear. Without this, a row still showing "already
-    // added" could be filled with a different, perfectly valid material and keep
-    // the stale duplicate warning underneath it.
-    setDupPickNote(null);
-    // Read the decision off current state and act OUTSIDE the updater — a
-    // setState call inside another setState's updater is not safe (React may
-    // re-run the updater).
-    const at = billData.items.findIndex((l) => lineMat(l) === materialId);
-    if (at >= 0) {
-      setBillMapNote(`${name} is already on line ${at + 1} — add the quantity there.`);
-      return;
-    }
-    setBillMapNote(null);
-    // Seed the GST% here too — this panel is the second way a material lands on
-    // a line, and a line seeded only on the dropdown path would tax differently
-    // depending on which control the storekeeper happened to use. Unconditional
-    // is safe on both branches: a fresh emptyBillLine() and an empty slot both
-    // carry gst_rate '' (no human edit to clobber).
-    const line = {
-      ...emptyBillLine(),
-      material_id: materialId,
-      gst_rate: seedGstForMaterial(materialId),
-      cess_rate: seedCessForMaterial(materialId),
-    };
-    setBillData((prev) => {
-      const empty = prev.items.findIndex((l) => !lineMat(l));
-      if (empty >= 0) {
-        return {
-          ...prev,
-          items: prev.items.map((l, i) => (i === empty
-            ? {
-                ...l,
-                material_id: materialId,
-                gst_rate: seedGstForMaterial(materialId),
-                cess_rate: seedCessForMaterial(materialId),
-              }
-            : l)),
-        };
-      }
-      return { ...prev, items: [...prev.items, line] };
-    });
-  };
-
-  /** The one action that actually keeps the map current, offered where the gap
-   *  is noticed. Additive only (the route's INSERT OR IGNORE), one pair, on
-   *  purpose. */
-  const addToVendorItems = async (materialId: string, name: string) => {
-    if (!billVendorId || !materialId) return;
-    setVendorMapBusy(true);
-    setBillMapNote(null);
-    try {
-      const res = await api('/api/vendor-materials', {
-        method: 'POST',
-        body: { vendor_id: billVendorId, material_id: materialId },
-      });
-      const j = await res.json().catch(() => null);
-      if (!res.ok) {
-        setBillMapNote(j?.error || `Could not add ${name} to ${vendorShort}'s items.`);
-        return;
-      }
-      setVendorMap((prev) =>
-        prev && prev.vendorId === billVendorId
-          ? { vendorId: prev.vendorId, ids: new Set(prev.ids).add(materialId) }
-          : prev);
-      setBillMapNote(`${name} added to ${vendorShort}'s items.`);
-    } catch (err: any) {
-      setBillMapNote(err?.message || `Could not add ${name} to ${vendorShort}'s items.`);
-    } finally {
-      setVendorMapBusy(false);
-    }
-  };
-
-  // Calculate bill totals, split the two bill-level charges across the lines, and
-  // derive each line's GST.
-  //
-  // GST is computed and carried ALONGSIDE the goods rate — it is NEVER folded into
-  // unit_price / line_total / final_unit_price. Input GST is reclaimable credit,
-  // not part of what the food costs: fold it in and average_price, and every
-  // recipe cost derived from it, inflates by the GST rate silently and forever.
-  // (That is exactly the bug the old bill-level GST control caused.)
-  //
-  // Order of operations, per line, in this order:
-  //   goods   = qty × rate
-  //   taxable = goods − its share of the bill discount   (a discount really does
-  //                                                       lower the cost)
-  //   tax     = taxable × gst%                           (tax is charged on the
-  //                                                       post-discount value)
-  //   cgst + sgst = tax
-  const billCalc = (() => {
-    const items = billData.items.map((item) => {
-      const qty = parseFloat(item.quantity) || 0;
-      const price = parseFloat(item.unit_price) || 0;
-      // Both halves are the SAME typed entry basis, whichever it is. The two boxes are
-      // labelled from data by caseBasis(): BTL mode prints the material's purchase unit
-      // + "₹ / {pu}", CASE mode prints "case (N pu)" + "per case". billSubmit() then
-      // expands a CASE line as qty × case_size and rate ÷ case_size before POSTing, so
-      // purchases.quantity / .unit_price land in the canon's purchase basis — and this
-      // product is the same money either way (cases × ₹/case ≡ btl × ₹/btl).
-      // rate-basis: purchase
-      return { ...item, line_total: Math.round(qty * price * 100) / 100 };
-    });
-
-    const subtotal = items.reduce((s, i) => s + i.line_total, 0);
-
-    const pctOrFlat = (mode: 'percent' | 'amount', raw: string) => {
-      const v = parseFloat(raw) || 0;
-      if (v <= 0) return 0;
-      return mode === 'percent' ? Math.round(subtotal * v / 100 * 100) / 100 : v;
-    };
-
-    // A discount can never exceed the goods value — that would produce a negative
-    // unit cost and poison average_price. Clamp and flag it instead.
-    const rawDiscount = pctOrFlat(billData.discount_mode, billData.discount_value);
-    const discountAmount = Math.min(rawDiscount, subtotal);
-    const discountClamped = rawDiscount > subtotal;
-    const deliveryAmount = pctOrFlat(billData.delivery_mode, billData.delivery_value);
-
-    // The bill-level rate is a DEFAULT that lines inherit. Parsed here, once —
-    // the selects keep raw strings so nothing round-trips through Number() while
-    // the storekeeper is still typing.
-    const billRate = parseFloat(billData.gst_rate) || 0;
-
-    const pricedItems = items.map((item) => {
-      const proportion = subtotal > 0 ? item.line_total / subtotal : 0;
-      const discountShare = Math.round(discountAmount * proportion * 100) / 100;
-      const deliveryShare = Math.round(deliveryAmount * proportion * 100) / 100;
-      // DISCOUNT lowers the cost basis; DELIVERY does not touch it. Delivery is
-      // carried per line for vendor/spend reporting only — the same rule the GRN
-      // and bulk-upload charge columns follow, so a bill costs the same whichever
-      // screen books it. (The old GST control folded tax INTO this number, which
-      // inflated average_price and every recipe cost built on it.)
-      const netTotal = item.line_total - discountShare;
-      const qty = parseFloat(item.quantity) || 0;
-      // STILL the post-discount GOODS rate. Tax is derived below and shipped in
-      // its own fields — adding it here is the one change that would break every
-      // recipe cost in the app.
-      const finalUnitPrice = qty > 0 ? Math.round(netTotal / qty * 100) / 100 : 0;
-
-      // TGBCL liquor carries excise / cess / TCS on the store's own bill, not GST.
-      // Force 0% rather than trusting whatever the select happens to hold — the
-      // material can be swapped on a line that was already set to 18%.
-      const zeroRated = storeMappedLine(item.material_id);
-      const rate = zeroRated
-        ? 0
-        : (item.gst_rate === '' ? billRate : (parseFloat(item.gst_rate) || 0));
-
-      const taxable = r2(netTotal);
-      const taxValue = r2(taxable * rate / 100);
-      // House invariant: tax_value = cgst + sgst. Rounding BOTH halves up
-      // overshoots by a paisa on odd amounts (₹1.01 → 0.51 + 0.51 = 1.02), so
-      // sgst takes the rounded half and cgst absorbs the remainder.
-      // INTEGER PAISE, and the odd paisa lands in CGST — byte-identical to the
-      // server (api/purchases/route.ts: sgstPaise = floor(taxPaise/2), cgst =
-      // remainder). r2(taxValue/2) rounds the half UP, which put the spare paisa
-      // in SGST instead: on a Rs 1.01 tax the screen said CGST 0.50 / SGST 0.51
-      // while the row stored CGST 0.51 / SGST 0.50. The totals matched, so
-      // nothing looked wrong — until someone reconciled a GST return line by line.
-      const taxPaise = Math.round(taxValue * 100);
-      const sgst = Math.floor(taxPaise / 2) / 100;
-      const cgst = r2(taxValue - sgst);
-
-      // GST COMPENSATION CESS — a SEPARATE levy on the same post-discount base.
-      // Deliberately absent from taxValue/cgst/sgst: it is not GST, it is not
-      // halved into CGST/SGST, and adding it to that sum would misstate the very
-      // figure a GST return is filed on. It is also NOT input credit against GST
-      // (only against cess output liability), so no label here may call it one.
-      // Whole paise, byte-identical to the server's expression — the ÷100 for
-      // percent and the ×100 for paise cancel, which is why there is no /100 in
-      // sight. Same zero-rate lock: TGBCL duty rides on the store's own bill.
-      const cessRate = zeroRated ? 0 : (parseFloat(item.cess_rate) || 0);
-      const cessPaise = cessRate > 0 ? Math.max(0, Math.round(taxable * cessRate)) : 0;
-      const compensationCess = cessPaise / 100;
-
-      return {
-        ...item,
-        discount_share: discountShare,
-        delivery_share: deliveryShare,
-        final_unit_price: finalUnitPrice,
-        gst_rate_effective: rate,
-        cess_rate_effective: cessRate,
-        compensation_cess: compensationCess,
-        zero_rated: zeroRated,
-        taxable,
-        tax_value: taxValue,
-        cgst,
-        sgst,
-        line_incl_tax: r2(taxable + taxValue + compensationCess),
-      };
-    });
-
-    const cgstTotal = r2(pricedItems.reduce((s, i) => s + i.cgst, 0));
-    const sgstTotal = r2(pricedItems.reduce((s, i) => s + i.sgst, 0));
-    const taxTotal = r2(cgstTotal + sgstTotal);
-    // Kept OUT of taxTotal on purpose — see the per-line note above.
-    const cessTotal = r2(pricedItems.reduce((s, i) => s + i.compensation_cess, 0));
-    // Bill-level taxable is goods − discount computed once, not the sum of the
-    // per-line shares (those can drift a paisa on rounding). This is the figure
-    // printed on the paper bill.
-    const taxableTotal = r2(subtotal - discountAmount);
-
-    // What you actually pay the vendor: goods, less discount, plus the tax the
-    // vendor charges, plus compensation cess, plus delivery. Cess belongs here
-    // — the vendor really does charge it — even though it is kept out of
-    // taxTotal so the GST figure stays exactly the GST figure.
-    const grandTotal = r2(taxableTotal + taxTotal + cessTotal + deliveryAmount);
-
-    return {
-      items: pricedItems, subtotal, discountAmount, deliveryAmount, grandTotal, discountClamped,
-      taxableTotal, cgstTotal, sgstTotal, taxTotal, cessTotal,
-    };
-  })();
-
-  const handleBillSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setBillError(null);
-    // Clear notes from the PREVIOUS bill before this one starts, or a warning
-    // about last night's vendor sits on screen looking like it belongs to this
-    // save. Collected per-line below and published once, after the save lands.
-    setBillNotices([]);
-    const notices: string[] = [];
-
-    if (!billData.vendor.trim()) {
-      setBillError('Vendor name is required.');
-      return;
-    }
-    if (!billData.date) {
-      setBillError('Date is required.');
-      return;
-    }
-
-    // DUPLICATE LINES — ONE MATERIAL = ONE LINE, refused outright, exactly like
-    // a PO. Checked before any money check because it is the one error that
-    // silently doubles STOCK as well as cost: every line below is POSTed as its
-    // own purchases row. There is no acknowledgement to tick past: a differing
-    // rate/GST/brand/basis does NOT buy a second line any more (the owner asked
-    // for the PO rule verbatim). /api/purchases refuses the same repeat
-    // server-side, so removing this gate would only move the error later.
-    // Only rows that would really be written count — see dupInfo.blocking.
-    if (dupInfo.blocking.length > 0) {
-      const g = dupInfo.blocking[0];
-      // An exact repeat has a safe one-click answer, so name it and show the sum.
-      const m = g.mergeable.find((x) => x.bookable > 1);
-      setBillError(
-        m
-          ? `${g.name} is on line ${m.lineNos.join(' and line ')} twice at the same rate ` +
-            `(₹${m.rate.toLocaleString('en-IN', { maximumFractionDigits: 2 })}/${m.unit}). ` +
-            `Each line books its own purchase row, so stock would be credited twice. ` +
-            `Use "Merge into one line" above — ${m.parts.map((p) => fmtQtyNum(p)).join(' + ')} = ${fmtQtyNum(m.total)} ${m.unit}.`
-          : `${g.name} is on line ${g.lineNos.join(' and line ')}` +
-            `${g.differs.length > 0 ? ` (${g.differs.join(' and ')})` : ''}. ` +
-            `One item = one line on a bill, so this bill cannot be saved as it stands. ` +
-            SPLIT_RATE_REMEDY
-      );
-      return;
-    }
-
-    // A discount that swallows the whole subtotal zeroes EVERY line rate, which the
-    // filter below would then read as "no items entered" — the wrong field, named
-    // wrongly. Say what actually blocked it.
-    if (billCalc.subtotal > 0 && billCalc.discountAmount >= billCalc.subtotal) {
-      setBillError(
-        `Discount (${formatCurrency(billCalc.discountAmount)}) equals or exceeds the items subtotal ` +
-        `(${formatCurrency(billCalc.subtotal)}), so every line would be booked at ₹0. ` +
-        `Reduce the discount, or record a free-of-charge receipt separately.`
-      );
-      return;
-    }
-
-    // Same trap one line at a time: a line whose net rate rounds to ₹0 (rate below
-    // ₹0.005, or its discount share eating the whole line) used to be dropped in
-    // silence, and the success toast then reported fewer items than were typed.
-    // Name the lines instead of swallowing them.
-    const zeroCostLines = billCalc.items
-      .map((i, idx) => ({ i, idx }))
-      .filter(({ i }) => i.material_id && parseFloat(i.quantity) > 0 && i.final_unit_price <= 0);
-
-    if (zeroCostLines.length > 0) {
-      const names = zeroCostLines
-        .map(({ i, idx }) => {
-          const mat = materials.find((m) => String(m.id) === String(i.material_id));
-          return mat ? `line ${idx + 1} (${mat.name})` : `line ${idx + 1}`;
-        })
-        .join(', ');
-      const many = zeroCostLines.length > 1;
-      setBillError(
-        `Net rate is ₹0 on ${names} — ${many ? 'those lines' : 'that line'} would be stocked at no cost. ` +
-        `Enter a unit price, lower the discount, or remove the line${many ? 's' : ''}.`
-      );
-      return;
-    }
-
-    const validItems = billCalc.items.filter(
-      (i) => i.material_id && parseFloat(i.quantity) > 0 && i.final_unit_price > 0
-    );
-
-    if (validItems.length === 0) {
-      setBillError('Add at least one item with material, quantity, and price.');
-      return;
-    }
-
-    setBillSubmitting(true);
-    // Lines that the server has already ACCEPTED. The loop below POSTs one
-    // request per line and is not a transaction, so a failure halfway leaves
-    // the earlier lines written. Since /api/purchases now REFUSES a repeat on
-    // the same bill instead of merging it, a naive retry of the whole bill
-    // stops dead on the first already-saved line — correct, but baffling unless
-    // we say how far the first attempt got.
-    let savedCount = 0;
-    try {
-      // Submit each line item as a separate purchase. unit_price here is the
-      // DISCOUNT-NET, GST-FREE goods rate (final_unit_price above) — nothing is
-      // folded into it, so average_price stays a true cost basis.
-      // When entry_mode='case', expand cases → bottles using the material's case_size
-      // BEFORE submitting, so the API still sees a bottle-count quantity (its native unit).
-      for (const item of validItems) {
-        const rawQty = parseFloat(item.quantity);
-        let qtyForApi = rawQty;
-        let unitPriceForApi = item.final_unit_price;
-        const noteExtras: string[] = [];
-        if (item.entry_mode === 'case') {
-          const mat = materials.find(m => m.id === item.material_id) as any;
-          const caseSize = Number(mat?.case_size) || 1;
-          if (caseSize <= 1) {
-            // No case configured for this material — fall back to bottle behaviour.
-            noteExtras.push('case_mode_requested_but_no_case_size_set');
-          } else {
-            qtyForApi      = rawQty * caseSize;             // cases → bottles
-            unitPriceForApi = item.final_unit_price / caseSize; // per-case → per-bottle
-            noteExtras.push(`Case entry: ${rawQty} × ${caseSize} = ${qtyForApi} btl`);
-          }
-        }
-        const body = {
-          material_id: item.material_id,
-          vendor: billData.vendor,
-          brand: item.brand,
-          quantity: qtyForApi,
-          unit_price: unitPriceForApi,
-          date: billData.date,
-          // The VENDOR's bill number as a real field (it also stays in notes for
-          // back-compat). The server mints our Invoice ID from it.
-          bill_no: billData.bill_number || '',
-          // DELIVERY only. Do NOT send `discount` here: unit_price above is
-          // already net of it, and purchases.discount is a RECORDED-ONLY column
-          // that every reader subtracts a second time (db.ts's "Total Inward =
-          // total_price − discount + cgst + …", this page's own Total Inward
-          // column, the bulk preview, /api/grn). Writing both netted it twice —
-          // a ₹1,000 discount on a ₹10,000 bill rendered ₹8,500 instead of
-          // ₹9,500. The rupees stay visible in the note below.
-          delivery_charges: item.delivery_share,
-          // GST, per the wire contract. These travel BESIDE unit_price, never
-          // inside it: unit_price above is the discount-net goods rate, and the
-          // server re-derives tax from (line_total − discount_share) × gst_rate
-          // rather than trusting these figures. Sent even when 0 so an exempt or
-          // zero-rated (TGBCL) line is recorded as deliberately 0%, not missing.
-          gst_rate: item.gst_rate_effective,
-          cgst: item.cgst,
-          sgst: item.sgst,
-          // COMPENSATION CESS as a RATE only. Unlike cgst/sgst — which still
-          // accept figures purely for back-compat with this modal's pre-existing
-          // wire shape — the server derives the rupees itself and does not take
-          // a client amount. There is no legacy caller to keep, so the narrower
-          // contract is the better one.
-          cess_rate: item.cess_rate_effective,
-          notes: [`Bill #${billData.bill_number || 'N/A'}`,
-                  item.discount_share > 0 ? `Discount ₹${item.discount_share} (netted off rate)` : '',
-                  item.tax_value > 0
-                    ? `GST ${item.gst_rate_effective}% ₹${item.tax_value} (CGST ₹${item.cgst} + SGST ₹${item.sgst}, not in rate)`
-                    : (item.zero_rated ? 'GST 0% (store/TGBCL item — taxed on the store bill)' : ''),
-                  item.compensation_cess > 0
-                    ? `Compensation cess ${item.cess_rate_effective}% ₹${item.compensation_cess} (not in rate)`
-                    : '',
-                  item.delivery_share > 0 ? `Delivery ₹${item.delivery_share} (not in rate)` : '',
-                  billData.notes, ...noteExtras].filter(Boolean).join(' | '),
-        };
-
-        const res = await api('/api/purchases', {
-          method: 'POST',
-          body: body,
-        });
-
-        const json = await res.json().catch(() => null);
-
-        if (!res.ok) {
-          throw new Error(json?.error || `Failed to add purchase for item`);
-        }
-
-        // The save SUCCEEDED. Anything below is the server telling us something
-        // the storekeeper needs to know anyway — e.g. a vendor↔item pair it
-        // would not map. Dropping the body (which this loop used to do) made
-        // that invisible: "4 items added" with no explanation on screen.
-        savedCount += 1;
-        const warn = json?.vendor_mapping?.warning;
-        if (warn) notices.push(warn);
-      }
-
-      setBillModalOpen(false);
-      setBillData({ ...emptyBill });
-      setDupPickNote(null);
-      setBillNotices(notices);
-      await fetchPurchases(appliedFilters);
-      // One line in = one purchases row out. The server no longer folds a line
-      // into an existing one, so the count sent IS the count landed.
-      setToast(`Bill entered: ${validItems.length} items from ${billData.vendor} added!`);
-      setTimeout(() => setToast(null), 4000);
-    } catch (err: any) {
-      // Say how far we got, or the storekeeper retries the whole bill and meets
-      // a refusal on a line they have no way of knowing is already recorded.
-      setBillError(
-        savedCount > 0
-          ? `${err.message} — ${savedCount} of ${validItems.length} lines were already saved. ` +
-            `Remove those lines from this bill before saving again.`
-          : err.message
-      );
-    } finally {
-      setBillSubmitting(false);
-    }
-  };
 
   // ---- Bulk Upload Handlers ----
 
@@ -2113,22 +1044,105 @@ export default function PurchasesPage() {
             </button>
             <input ref={openingFileRef} type="file" accept=".xlsx,.xls,.csv" className="hidden"
                    onChange={(e) => { const f = e.target.files?.[0]; if (f) handleOpeningFile(f); }} />
-            {/* "Enter Full Bill" is now the ONLY way to record a purchase here.
-                The old single-line "Add Purchase" button was removed on the
-                owner's call: it wrote the same purchases row by a second route,
-                so the two drifted (the CASE/BTL entry-mode bug was fixed twice,
-                once per form). A one-item purchase is simply a bill with one
-                line, and this way the invoice number, vendor and bill charges
-                are never optional. */}
-            <button
-              onClick={openBillModal}
+            {/* ══ WHERE "ENTER FULL BILL" WENT ═══════════════════════════════
+                This page no longer creates purchase rows. A hand-typed vendor
+                bill is now recorded on /grn as a goods receipt, so it inherits —
+                automatically, not by a second implementation — the Kitchen QC
+                gate, the inward register, void, line-edit and the duplicate-bill
+                refusal, none of which this screen ever had. Its own route said
+                what it did: a purchase "writes STRAIGHT to stock and to
+                updateMaterialPrice", with no QC gate at all.
+
+                THE BUTTON IS STILL HERE, and it still says the words a
+                storekeeper is looking for. It is a LINK now, not a form: somebody
+                who has pressed this every morning must land on the right screen,
+                not be told a feature moved and left to hunt for it. The bulk CSV
+                and Opening Stock buttons beside it stay exactly where they are.
+
+                ?new=1 OPENS THE FORM. Without it this landed on the GRN LIST,
+                where the storekeeper had to find and press a SECOND button with
+                the identical label — a page navigation and an extra click added
+                to the job they do every morning, on the one screen whose whole
+                purpose is that they use it instead of the ungated CSV beside it.
+                /grn reads the flag once on mount and strips it from the URL. */}
+            <Link
+              href="/grn?new=1"
+              title="Vendor bills are recorded on Goods Receipt Notes now — same form, plus the kitchen quality check, the inward register, void and line-edit."
               className="flex items-center gap-2 px-4 py-2.5 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-medium transition-colors"
             >
               <Receipt className="w-4 h-4" />
-              Enter Full Bill
-            </button>
+              Enter Vendor Bill
+              <ArrowRight className="w-4 h-4" />
+            </Link>
           </div>
         </div>
+
+        {/* Said in full where the button used to be, because the button alone
+            cannot explain a hold that has not happened yet. Whoever entered
+            bills here needs BOTH facts before their next delivery: where the
+            form lives, and that perishables no longer inward on the spot. */}
+        <div className="bg-[#FFF8F0] border border-[#E8D5C4] rounded-xl p-4 flex flex-col sm:flex-row sm:items-start gap-3">
+          <div className="p-2 rounded-lg bg-[#af4408]/10 shrink-0 self-start">
+            <Receipt className="w-4 h-4 text-[#af4408]" />
+          </div>
+          <div className="flex-1 space-y-1.5">
+            <p className="text-sm font-semibold text-[#2D1B0E]">
+              Bills are entered on Goods Receipt Notes now. This page is the record and the reports.
+            </p>
+            <p className="text-xs text-[#6B5744] leading-relaxed">
+              Everything the old <b>Enter Full Bill</b> form did is on <Link href="/grn?new=1" className="text-[#af4408] font-medium hover:underline">Goods Receipt Notes</Link>:
+              the vendor and invoice number, the invoice date, bill-level Discount and Delivery split across the lines,
+              per-line GST and cess, BTL / CASE entry, and brand — plus a tick for the cash buy that came with no bill number
+              at all. It adds what this screen never had — the receipt can be voided or line-edited, and it lands on the
+              inward register. If the same vendor and bill number are entered twice on one day it is refused outright;
+              on a different day it asks first, because plenty of suppliers reuse the same number on every slip.
+            </p>
+            <p className="text-xs text-amber-800 bg-amber-50 border border-amber-300 rounded px-2 py-1.5 leading-relaxed">
+              <b>One thing genuinely changes at the bay:</b> a bill carrying perishables — veg, meat, dairy, frozen, fruit —
+              is saved in full but <b>no stock appears until the kitchen checks it</b>. The bill is not lost and nothing needs
+              re-typing; the goods wait, which is what lets the vendor still take them back. The GRN screen says so before you
+              save and again after. <b>Until it is signed off that bill is on the GRN screen, not on this register</b> — this
+              page lists booked cost, so a delivery still waiting for the kitchen has not reached it yet.
+            </p>
+            <p className="text-xs text-[#6B5744]">
+              Still here, unchanged: the register and its filters, the exports, the Goods value vs Total amount split,
+              <b> Generic CSV Upload</b> and <b>Upload Opening Stock</b>. The CSV is for backfilling and correcting in bulk,
+              not for the day&rsquo;s bill — and it holds to the same rule: a perishable line is declined there with a note
+              telling you to enter that bill on Goods Receipt Notes, so the kitchen check cannot be sidestepped by uploading
+              instead of typing.
+            </p>
+          </div>
+        </div>
+
+        {/* ══ BILLS RECORDED BUT NOT YET ON THIS REGISTER ═══════════════════
+            A held delivery has a GRN and no `purchases` row until the kitchen
+            signs, so every figure below it — the spend cards, the exports, any
+            month-end total — is short by exactly this much and will grow later
+            without anyone touching it. Scoped to the SAME from/to the register
+            is filtered by, because a period total is what someone reconciles.
+            Rendered only when there is something to disclose. */}
+        {(() => {
+          const inRange = heldBills.filter(h => {
+            if (appliedFilters.from && h.date < appliedFilters.from) return false;
+            if (appliedFilters.to && h.date > appliedFilters.to) return false;
+            return true;
+          });
+          if (inRange.length === 0) return null;
+          const value = inRange.reduce((s, h) => s + h.value, 0);
+          const ranged = !!(appliedFilters.from || appliedFilters.to);
+          return (
+            <div className="bg-amber-50 border border-amber-300 rounded-xl px-4 py-3 flex flex-col sm:flex-row sm:items-center gap-2 text-xs text-amber-900">
+              <AlertTriangle className="w-4 h-4 shrink-0" />
+              <span className="flex-1 leading-relaxed">
+                <b>{inRange.length} vendor {inRange.length === 1 ? 'bill is' : 'bills are'} recorded but not on this register yet</b>
+                {ranged ? ' in the dates you have filtered to' : ''} — about <b>{formatCurrency(value)}</b> of goods
+                waiting for a kitchen check. Their cost is booked when the check is signed, against the delivery date,
+                so the totals on this page will rise for dates already past. Read a period total only once the queue is clear.
+              </span>
+              <Link href="/grn/qc" className="shrink-0 font-medium underline hover:no-underline">Open the check queue</Link>
+            </div>
+          );
+        })()}
 
         {/* Summary Cards */}
         <div className="grid grid-cols-2 md:grid-cols-3 gap-3 sm:gap-4">
@@ -2508,10 +1522,19 @@ export default function PurchasesPage() {
                 ))}
                 {paginatedPurchases.length === 0 && (
                   <tr>
-                    <td colSpan={13} className="py-12 text-center text-[#8B7355]">
+                    {/* 14, matching the header row above. It was 13, so the
+                        empty state sat one column short of the table. */}
+                    <td colSpan={14} className="py-12 text-center text-[#8B7355]">
                       <ShoppingCart className="w-10 h-10 mx-auto mb-3 opacity-40" />
                       <p>No purchases found.</p>
-                      <p className="text-xs mt-1">Add your first purchase to get started.</p>
+                      {/* This page cannot add one any more, so it must not ask.
+                          A delivery still waiting for a kitchen check is not
+                          here yet either, which is the likelier surprise. */}
+                      <p className="text-xs mt-1">
+                        Vendor bills are recorded on{' '}
+                        <Link href="/grn?new=1" className="text-[#af4408] font-medium hover:underline">Goods Receipt Notes</Link>
+                        {' '}— and a bill still waiting for its kitchen check appears here only once it is signed off.
+                      </p>
                     </td>
                   </tr>
                 )}
@@ -2569,33 +1592,9 @@ export default function PurchasesPage() {
       </div>
 
       {/* Toast */}
-      {/* Server notes from the last successful bill. AMBER, not red, and it
-          never auto-dismisses: the bill IS saved (see the "a bill is a fact"
-          rule above), but a pair the map refused to learn is a decision only a
-          human can finish, on Vendor Items. */}
-      {billNotices.length > 0 && (
-        <div className="fixed bottom-24 right-6 z-50 max-w-md rounded-lg border border-amber-300 bg-amber-50 shadow-lg">
-          <div className="flex items-start gap-2 px-4 py-3">
-            <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5 text-amber-600" />
-            <div className="flex-1 space-y-1.5">
-              <p className="text-xs font-semibold text-amber-900">
-                Bill saved — {billNotices.length === 1 ? 'one thing' : `${billNotices.length} things`} to know
-              </p>
-              {billNotices.map((n, i) => (
-                <p key={i} className="text-[11px] leading-snug text-amber-800">{n}</p>
-              ))}
-            </div>
-            <button
-              onClick={() => setBillNotices([])}
-              className="shrink-0 text-amber-700 hover:opacity-70 transition-opacity"
-              aria-label="Dismiss notes"
-            >
-              <X className="w-4 h-4" />
-            </button>
-          </div>
-        </div>
-      )}
-
+      {/* NOTE: the amber "Bill saved — N things to know" panel left with the bill
+          form. The vendor↔item warnings it rendered come back on the server's
+          `vendor_mapping[]` and are shown by /grn, where the bill is now saved. */}
       {toast && (
         <div className="fixed bottom-6 right-6 z-50 flex items-center gap-3 px-5 py-3 bg-green-600 text-white rounded-lg shadow-lg animate-[fadeIn_0.3s_ease-out]">
           <span className="text-sm font-medium">{toast}</span>
@@ -2867,766 +1866,6 @@ export default function PurchasesPage() {
         </div>
       )}
 
-      {/* ================================================================ */}
-      {/* BILL ENTRY MODAL                                                 */}
-      {/* ================================================================ */}
-      {billModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-start justify-center pt-8 pb-8 overflow-y-auto">
-          <div className="fixed inset-0 bg-black/40 backdrop-blur-sm" onClick={() => setBillModalOpen(false)} />
-          {/* maxHeight:none overrides the global mobile modal cap (globals.css §5,
-              `max-height: calc(100vh-1rem)`), which has no overflow and so spilled
-              tall bill content OUT of the card. The overlay above (items-start +
-              overflow-y-auto) scrolls the grown card, and — unlike an internal
-              scroll — never clips the material typeahead dropdown. */}
-          {/* max-w-6xl (was 4xl): the line table now carries the goods → discount →
-              taxable → tax → incl-tax reading across, and at 4xl every bill needed
-              sideways scrolling to see the tax it was entered for. Still capped, and
-              the table keeps its own overflow-x for narrower screens. */}
-          <div style={{ maxHeight: 'none' }} className="relative w-full max-w-6xl bg-white rounded-2xl shadow-xl border border-[#E8D5C4] mx-4">
-            {/* Bill Header */}
-            <div className="flex items-center justify-between px-6 py-4 border-b border-[#E8D5C4]">
-              <div className="flex items-center gap-3">
-                <div className="p-2 rounded-lg bg-[#af4408]/10">
-                  <Receipt className="w-5 h-5 text-[#af4408]" />
-                </div>
-                <div>
-                  <h2 className="text-lg font-semibold text-[#2D1B0E]">Enter Full Bill</h2>
-                  <p className="text-xs text-[#8B7355]">One vendor bill, many items — Delivery &amp; Discount auto-split across the lines. Enter each rate as the plain goods rate (no tax added in); GST is worked out per line after discount and recorded on its own.</p>
-                </div>
-              </div>
-              <button onClick={() => setBillModalOpen(false)} className="p-1 text-[#8B7355] hover:text-[#2D1B0E]">
-                <X className="w-5 h-5" />
-              </button>
-            </div>
-
-            <form onSubmit={handleBillSubmit} className="px-6 py-5 space-y-5">
-              {billError && (
-                <div className="p-3 bg-red-50 border border-red-200 text-red-700 rounded-lg text-sm flex items-center gap-2">
-                  <AlertTriangle className="w-4 h-4 shrink-0" />
-                  {billError}
-                </div>
-              )}
-
-              {/* Bill Info Row */}
-              <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
-                <div>
-                  <label className="block text-xs font-medium text-[#6B5744] mb-1">Vendor *</label>
-                  {/* Picker over the vendor master, same interaction as the ad-hoc
-                      GRN form so the two purchase-entry screens behave alike.
-                      allowCustom because a real bill can arrive from a vendor
-                      nobody has added yet — blocking it would just get the bill
-                      entered somewhere worse. The badge below makes a NEW name
-                      visible, so a typo'd second spelling of an existing vendor
-                      isn't accepted in silence and split in spend reporting.
-                      billData.vendor still carries the submitted string, so the
-                      API contract is untouched. */}
-                  {vendorsFailed ? (
-                    <>
-                      <input
-                        type="text"
-                        value={billData.vendor}
-                        onChange={(e) => updateBillField('vendor', e.target.value)}
-                        placeholder="Vendor name"
-                        className="w-full px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm text-[#2D1B0E] placeholder-[#8B7355] focus:outline-none focus:ring-2 focus:ring-[#af4408]"
-                        required
-                      />
-                      <p className="mt-1 text-[10px] text-amber-800">
-                        Vendor list unavailable — type the name exactly as it is spelled on other bills.
-                      </p>
-                    </>
-                  ) : (
-                    <>
-                      <Combobox
-                        options={vendors.map((v) => ({ value: v.name, label: v.name }))}
-                        value={billData.vendor}
-                        allowCustom
-                        placeholder="Type or pick"
-                        onChange={(typed) => updateBillField('vendor', typed)}
-                        className="w-full pr-7 px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm text-[#2D1B0E] placeholder-[#8B7355] focus:outline-none focus:ring-2 focus:ring-[#af4408]"
-                      />
-                      {(() => {
-                        const typed = billData.vendor.trim();
-                        if (!typed) return null;
-                        const known = vendors.some(
-                          (v) => v.name.toLowerCase().trim() === typed.toLowerCase()
-                        );
-                        return known ? (
-                          <p className="mt-1 text-[10px] text-emerald-700 flex items-center gap-1">
-                            <CheckCircle className="w-3 h-3 shrink-0" /> In the vendor master
-                          </p>
-                        ) : (
-                          <p className="mt-1 text-[10px] text-amber-800 flex items-start gap-1">
-                            <AlertTriangle className="w-3 h-3 shrink-0 mt-px" />
-                            <span>New vendor — check the spelling against an earlier bill before saving.</span>
-                          </p>
-                        );
-                      })()}
-                    </>
-                  )}
-                </div>
-                <div>
-                  <label className="block text-xs font-medium text-[#6B5744] mb-1">Bill Number</label>
-                  <input
-                    type="text"
-                    value={billData.bill_number}
-                    onChange={(e) => updateBillField('bill_number', e.target.value)}
-                    placeholder="INV-001"
-                    className="w-full px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm text-[#2D1B0E] placeholder-[#8B7355] focus:outline-none focus:ring-2 focus:ring-[#af4408]"
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs font-medium text-[#6B5744] mb-1">Date *</label>
-                  <input
-                    type="date"
-                    value={billData.date}
-                    onChange={(e) => updateBillField('date', e.target.value)}
-                    min={dateMin}
-                    max={dateMax}
-                    className="w-full px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm text-[#2D1B0E] focus:outline-none focus:ring-2 focus:ring-[#af4408] [color-scheme:light]"
-                    required
-                  />
-                  {!isAdmin && (
-                    <p className="mt-1 text-[10px] text-[#8B7355]">{backdateHint}</p>
-                  )}
-                </div>
-                <div>
-                  <label className="block text-xs font-medium text-[#6B5744] mb-1">Notes</label>
-                  <input
-                    type="text"
-                    value={billData.notes}
-                    onChange={(e) => updateBillField('notes', e.target.value)}
-                    placeholder="Optional notes"
-                    className="w-full px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm text-[#2D1B0E] placeholder-[#8B7355] focus:outline-none focus:ring-2 focus:ring-[#af4408]"
-                  />
-                </div>
-              </div>
-
-              {/* Bill-level charges. Delivery is RECORDED ONLY; Discount REDUCES the
-                  recorded cost of the goods. Both are split across the lines in
-                  proportion to line value. (This replaced a GST control that folded
-                  tax into every unit price — inflating average_price and every recipe
-                  cost derived from it, with the tax stored nowhere it could be
-                  reclaimed.) */}
-              <div className="bg-[#FFF8F0] border border-[#E8D5C4] rounded-xl p-4 space-y-3">
-                <ChargeRow
-                  label="Delivery Charges"
-                  hint="recorded on the bill — does not change item cost"
-                  mode={billData.delivery_mode}
-                  value={billData.delivery_value}
-                  onMode={(m) => updateBillField('delivery_mode', m)}
-                  onValue={(v) => updateBillField('delivery_value', v)}
-                  placeholder="e.g. 100"
-                  total={billCalc.deliveryAmount}
-                  tone="text-[#6B5744]"
-                />
-                <ChargeRow
-                  label="Discount"
-                  hint="reduces item cost"
-                  mode={billData.discount_mode}
-                  value={billData.discount_value}
-                  onMode={(m) => updateBillField('discount_mode', m)}
-                  onValue={(v) => updateBillField('discount_value', v)}
-                  placeholder="e.g. 10"
-                  total={billCalc.discountAmount}
-                  tone="text-emerald-700"
-                  negative
-                />
-                {billCalc.discountClamped && (
-                  <p className="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded px-2 py-1">
-                    Discount is larger than the bill&apos;s item value — capped at {formatCurrency(billCalc.subtotal)}{' '}
-                    so the cost can&apos;t go negative.
-                  </p>
-                )}
-
-                {/* GST is NOT a bill-level charge like the two rows above — it is a
-                    DEFAULT rate each line inherits, and the tax is worked out per
-                    line AFTER that line's discount share. Set once here because one
-                    bill is normally one rate; a line can still override it. The tax
-                    is recorded beside the goods rate and never inside it, so input
-                    credit stays reclaimable and item cost stays true. */}
-                <div className="flex items-center gap-4 flex-wrap border-t border-[#E8D5C4] pt-3">
-                  <span className="text-sm font-medium text-[#6B5744] min-w-[130px]">
-                    GST Rate
-                    <span className="block text-[10px] font-normal text-[#8B7355]">every line follows this unless the line overrides it</span>
-                  </span>
-                  <select
-                    value={billData.gst_rate}
-                    onChange={(e) => updateBillField('gst_rate', e.target.value)}
-                    className="px-3 py-1.5 bg-white border border-[#D4B896] rounded-lg text-sm text-[#2D1B0E] focus:outline-none focus:ring-2 focus:ring-[#af4408]"
-                  >
-                    {GST_RATES.map((r) => <option key={r} value={r}>{r}%</option>)}
-                  </select>
-                  <span className="text-sm font-medium ml-auto text-[#6B5744]">
-                    CGST {formatCurrency(billCalc.cgstTotal)} + SGST {formatCurrency(billCalc.sgstTotal)}
-                    {' = '}<span className="text-[#2D1B0E]">{formatCurrency(billCalc.taxTotal)}</span>
-                  </span>
-                </div>
-                <p className="text-[10px] text-[#8B7355]">
-                  Tax is charged on the value <strong>after</strong> discount, shown per line, and recorded separately —
-                  it is never added into the item rate, so recipe costs stay on the true goods price.
-                </p>
-              </div>
-
-              {/* Line Items */}
-              <div>
-                <div className="flex items-center justify-between mb-3">
-                  <h3 className="text-sm font-semibold text-[#2D1B0E]">Bill Items</h3>
-                  <button
-                    type="button"
-                    onClick={addBillLine}
-                    className="hidden md:flex items-center gap-1 px-3 py-1.5 text-xs font-medium text-[#af4408] border border-[#af4408] rounded-lg hover:bg-[#af4408]/10 transition-colors"
-                  >
-                    <Plus className="w-3 h-3" /> Add Item
-                  </button>
-                </div>
-
-                {/* VENDOR ↔ ITEM MAPPING — consulted, never blocking. Shown only
-                    when the typed vendor resolves to a master row AND the map
-                    actually loaded; a failed fetch leaves this whole block out
-                    and the form behaves exactly as it did before. */}
-                {billVendorId && vendorMapIds && (
-                  <div className="mb-2 rounded-lg border border-[#E8D5C4] bg-[#FFF8F0] px-3 py-2">
-                    {vendorMappedMaterials.length === 0 ? (
-                      /* Said ONCE, at the top — annotating twenty lines with the
-                         same sentence would be noise, not information. */
-                      <p className="text-[11px] text-[#6B5744] flex items-start gap-1.5">
-                        <Link2 className="w-3.5 h-3.5 shrink-0 mt-px text-[#8B7355]" />
-                        <span>
-                          No items are mapped to <strong>{vendorShort}</strong> yet, so there is nothing to
-                          suggest on these lines. Saving this bill records each new pair automatically —
-                          once. Use <strong>Add to this vendor&apos;s items</strong> on a line to bring back a
-                          pair someone removed, or manage the list on{' '}
-                          <Link
-                            href={`/vendors/materials?vendor=${encodeURIComponent(billVendorId)}`}
-                            target="_blank"
-                            className="text-[#af4408] underline"
-                          >
-                            Vendor Items
-                          </Link>.
-                        </span>
-                      </p>
-                    ) : (
-                      <>
-                        <div className="flex items-center justify-between gap-2 flex-wrap">
-                          <p className="text-[11px] text-[#6B5744] flex items-start gap-1.5">
-                            <Link2 className="w-3.5 h-3.5 shrink-0 mt-px text-[#af4408]" />
-                            <span>
-                              <strong>{vendorMappedMaterials.length}</strong> item
-                              {vendorMappedMaterials.length === 1 ? ' is' : 's are'} mapped to{' '}
-                              <strong>{vendorShort}</strong> — marked <span className="text-[#af4408]">★</span> in
-                              every picker below. Any other material can still be picked and still saves.
-                            </span>
-                          </p>
-                          <button
-                            type="button"
-                            onClick={() => setVendorItemsOpen((o) => !o)}
-                            className="px-2 py-1 text-[10px] font-medium text-[#af4408] border border-[#af4408] rounded-lg hover:bg-[#af4408]/10"
-                          >
-                            {vendorItemsOpen ? 'Hide' : 'Show'} their items
-                          </button>
-                        </div>
-                        {vendorItemsOpen && (
-                          <div className="mt-2 max-h-40 overflow-y-auto flex flex-wrap gap-1.5">
-                            {/* One click drops the item on the first empty line —
-                                the vendor's own list, reachable before touching
-                                the 900-row picker. */}
-                            {vendorMappedMaterials.slice(0, 300).map((m: any) => (
-                              <button
-                                key={m.id}
-                                type="button"
-                                onClick={() => placeMaterialOnLine(String(m.id), String(m.name))}
-                                title={`${m.sku ? m.sku + ' — ' : ''}${m.name}`}
-                                className="px-2 py-1 rounded-full border border-[#E8D5C4] bg-white text-[10px] text-[#2D1B0E] hover:border-[#af4408] hover:bg-[#FFF1E3]"
-                              >
-                                {m.name}
-                              </button>
-                            ))}
-                            {vendorMappedMaterials.length > 300 && (
-                              <span className="self-center text-[10px] text-[#8B7355]">
-                                +{(vendorMappedMaterials.length - 300).toLocaleString('en-IN')} more — use the picker
-                              </span>
-                            )}
-                          </div>
-                        )}
-                      </>
-                    )}
-                    {billMapNote && (
-                      <p className="mt-1.5 text-[10px] text-[#af4408]">{billMapNote}</p>
-                    )}
-                  </div>
-                )}
-
-                {/* Entry convention reminder */}
-                <div className="text-[11px] text-[#6B5744] bg-amber-50 border border-amber-200 rounded-lg px-3 py-1.5 mb-2">
-                  <span className="font-semibold text-amber-900">Default: enter at bottle level.</span>
-                  &nbsp;1 case of 12 bottles → qty = <code>12</code> (BTL), unit price per bottle.
-                  &nbsp;<span className="text-amber-900">Want to type cases instead?</span> If the material has a <code>case_size</code>
-                  set in inventory, a <strong>BTL / CASE</strong> toggle appears next to the qty input — pick CASE and type the case count + per-case price.
-                </div>
-                {/* SAME ITEM ON MORE THAN ONE LINE — flagged as it is typed, not
-                    at submit, and REFUSED at submit whatever the rate says. Merge
-                    is offered only for an exact repeat, where summing the
-                    quantities changes no money; a split-rate repeat gets the
-                    remedy sentence and no button. There is nothing to tick past. */}
-                {dupInfo.groups.length > 0 && (
-                  <div className="mb-2 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 space-y-2">
-                    <p className="text-[11px] text-amber-900 flex items-start gap-1.5">
-                      <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-px" />
-                      <span>
-                        <strong>The same item is on more than one line.</strong> Every line is saved as its
-                        own purchase row — so a repeated item credits stock twice and is averaged into the
-                        item&apos;s cost twice, which then re-costs every recipe that uses it.
-                      </span>
-                    </p>
-                    {dupInfo.groups.map((g) => (
-                      <div key={g.materialId} className="rounded-md border border-amber-200 bg-white px-2.5 py-2 space-y-1.5">
-                        <p className="text-xs font-medium text-[#2D1B0E]">
-                          {g.name}{' '}
-                          <span className="font-normal text-[#8B7355]">— lines {g.lineNos.join(', ')}</span>
-                        </p>
-
-                        {/* Identical in every respect → one line, one click. The
-                            quantity is summed onto the first of them; the rate is
-                            untouched, so cost and tax are unchanged. */}
-                        {g.mergeable.map((m) => (
-                          <div key={m.key} className="flex flex-wrap items-center justify-between gap-2">
-                            <span className="text-[11px] text-[#6B5744]">
-                              Lines {m.lineNos.join(' + ')} are identical at{' '}
-                              ₹{m.rate.toLocaleString('en-IN', { maximumFractionDigits: 2 })}/{m.unit} —{' '}
-                              <strong className="text-[#2D1B0E]">
-                                {m.parts.map((p) => fmtQtyNum(p)).join(' + ')} = {fmtQtyNum(m.total)} {m.unit}
-                              </strong>
-                            </span>
-                            <button
-                              type="button"
-                              onClick={() => mergeBillLines(g.materialId, m.key)}
-                              className="flex items-center gap-1 px-2.5 py-1 text-[11px] font-medium text-white bg-[#af4408] hover:bg-[#8a3506] rounded-lg"
-                            >
-                              <Merge className="w-3 h-3" /> Merge into one line
-                            </button>
-                          </div>
-                        ))}
-
-                        {/* NO MERGE BUTTON HERE, ON PURPOSE. Folding two different
-                            rates onto the first line would silently re-price the
-                            whole quantity and corrupt every recipe cost built on
-                            the item's weighted average. The save is refused either
-                            way — the user picks one of the two honest fixes. */}
-                        {g.differs.length > 0 && (
-                          <div className="rounded border border-amber-200 bg-amber-50/70 px-2 py-1.5">
-                            <p className="text-[11px] text-amber-900">
-                              These lines have {g.differs.join(' and ')}, so they cannot be merged — one item
-                              = one line on a bill, and <strong>this bill will not save</strong> while{' '}
-                              {g.name} is on two lines. {SPLIT_RATE_REMEDY}
-                            </p>
-                          </div>
-                        )}
-                      </div>
-                    ))}
-                  </div>
-                )}
-
-                <div className="overflow-x-auto rounded-xl border border-[#E8D5C4]">
-                  {/* md:min-w forces the horizontal scroll of the wrapper above
-                      instead of crushing eleven columns; on mobile the rows are
-                      block cards, where a min-width would only add a pointless
-                      sideways scroll. */}
-                  <table className="w-full md:min-w-[1180px] text-sm block md:table">
-                    <thead className="bg-[#FFF1E3] hidden md:table-header-group">
-                      <tr className="text-[#6B5744]">
-                        <th className="text-left py-2.5 px-3 font-medium w-[19%]">Material *</th>
-                        <th className="text-left py-2.5 px-3 font-medium w-[9%]">Brand</th>
-                        {/* These two headers used to be hard-coded "(bottles)" and
-                            "/btl" — true for a liquor bill, plain wrong for the kg /
-                            L / PKT lines that make up most of a grocery bill. Both
-                            columns are the material's own PURCHASE unit, printed
-                            per line under each box. */}
-                        <th className="text-right py-2.5 px-3 font-medium w-[9%]" title="In the material's purchase unit — bottles / kg / L / PKT (not cases, unless you switch the line to CASE)">Qty * <span className="text-[10px] font-normal text-[#8B7355]">(purchase units)</span></th>
-                        <th className="text-right py-2.5 px-3 font-medium w-[10%]" title="Vendor rate per purchase unit (per bottle / per kg / per L)">Unit Price (₹) * <span className="text-[10px] font-normal text-[#8B7355]">/ purchase unit</span></th>
-                        <th className="text-right py-2.5 px-3 font-medium w-[8%]">Line Total</th>
-                        <th className="text-right py-2.5 px-3 font-medium w-[8%]">Discount</th>
-                        {/* Reads left to right exactly as the arithmetic runs:
-                            goods − discount = taxable, × GST% = tax, + tax = what
-                            the bill charges. Final Unit ₹ sits last and stays the
-                            GOODS rate — it is the number that becomes cost. */}
-                        <th className="text-right py-2.5 px-3 font-medium w-[8%]" title="Line Total minus its discount share — the value GST is charged on">Taxable</th>
-                        <th className="text-right py-2.5 px-3 font-medium w-[6%]">GST %</th>
-                        <th className="text-right py-2.5 px-2 font-medium w-[6%]" title="GST Compensation Cess % — a SEPARATE levy from GST (12% on aerated drinks, other rates on tobacco). Charged on the same taxable value, recorded beside the rate, and never folded into CGST/SGST.">Cess %</th>
-                        <th className="text-right py-2.5 px-3 font-medium w-[8%]" title="Charged on the taxable value above, split into CGST + SGST. Recorded separately — never added into the item rate.">Tax (C+S)</th>
-                        <th className="text-right py-2.5 px-3 font-medium w-[8%]" title="Taxable + GST + compensation cess — what this line adds to the bill">Incl. Tax</th>
-                        <th className="text-right py-2.5 px-3 font-medium w-[10%]" title="Post-discount GOODS rate — this is what is stored as the purchase price. Tax is NOT in it.">Final Unit ₹</th>
-                        <th className="py-2.5 px-2 w-8"></th>
-                      </tr>
-                    </thead>
-                    <tbody className="block md:table-row-group">
-                      {billCalc.items.map((item, idx) => (
-                        <tr key={item.id}
-                            /* Tinted while this line shares its material with
-                               another — the panel above names the pair, this
-                               shows WHICH rows it is talking about. */
-                            className={`border-t border-[#E8D5C4]/50 block md:table-row rounded-lg border border-[#E8D5C4] p-3 mb-2 space-y-2 md:p-0 md:mb-0 md:border-0 md:border-t md:space-y-0 ${
-                              dupInfo.flagged.has(idx) ? 'bg-amber-50/70' : ''}`}>
-                          <td className="py-2 px-2 block md:table-cell">
-                            <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Material</span>
-                            {/* billPickerMaterials = the same full catalogue with
-                                this vendor's mapped items marked ★. A material
-                                already on ANOTHER line is greyed and unpickable
-                                (excludeMode='disable'), so one material = one line
-                                is enforced at the moment of choosing — not only at
-                                Save, where the refusal used to arrive after the
-                                whole bill had been typed. Greyed rather than
-                                hidden: a row that vanishes reads as "the dropdown
-                                lost my item". This row's OWN material is never
-                                excluded, so re-picking on this line still works. */}
-                            {item.material_id ? (() => {
-                              // LOCKED once chosen — read-only text, no dropdown, no clear ×.
-                              // To swap it, delete the line (trash) and add a new one, so a
-                              // line's material can never quietly become a different material
-                              // after its qty, rate, GST and cess were typed against the first
-                              // one. Identical rule and styling to the requisition composer's
-                              // locked chip, so the two screens behave the same way.
-                              const mat = materials.find((m) => String(m.id) === String(item.material_id)) as any;
-                              // Same basis as the picker's own displayUnit(): purchase_unit
-                              // first, recipe unit only as a fallback. Printing mat.unit here
-                              // would make the locked chip read "(g)" where the freshly-picked
-                              // chip read "(kg)".
-                              const pu = String(mat?.purchase_unit || mat?.unit || '');
-                              return (
-                                <div title="To change the material, delete this line and add a new one"
-                                     className="w-full text-left px-2 py-1 text-xs border border-[#E8D5C4] rounded bg-[#F5EDE3] text-[#2D1B0E] break-words leading-snug cursor-not-allowed">
-                                  {mat?.sku && <span className="text-[#8B7355] font-mono">{mat.sku} — </span>}
-                                  <span>{mat?.name || '(material removed)'}</span>
-                                  {pu && <span className="text-[#8B7355]"> ({pu})</span>}
-                                </div>
-                              );
-                            })() : (
-                              <MaterialTypeahead
-                                materials={billPickerMaterials as any} purchaseBasis
-                                value={item.material_id}
-                                onPick={(id) => { setDupPickNote(null); updateBillLine(item.id, 'material_id', id); }}
-                                excludeMode="disable"
-                                excludeIds={billData.items
-                                  .filter((x) => x.id !== item.id && x.material_id)
-                                  .map((x) => x.material_id)}
-                                onExcludedPick={(m) => setDupPickNote({ lineId: item.id, materialId: m.id, name: m.name })}
-                              />
-                            )}
-                            {(() => {
-                              // Recomputed every render from the LIVE items array, so deleting
-                              // or merging a line above this one can never leave the note
-                              // naming a position that has moved or gone. If the material has
-                              // left the bill entirely, the note stops rendering by itself.
-                              if (!dupPickNote || dupPickNote.lineId !== item.id) return null;
-                              const at = billData.items.findIndex((x) => x.material_id === dupPickNote.materialId);
-                              if (at < 0) return null;
-                              return (
-                                <div className="mt-1 text-[9px] leading-tight font-medium text-amber-800 bg-amber-50 border border-amber-200 rounded px-1.5 py-1">
-                                  {dupPickNote.name} is already added on line {at + 1}. One material, one
-                                  line — change the quantity on line {at + 1} instead.
-                                </div>
-                              );
-                            })()}
-                            {/* A bill is a fact: an unmapped pair is a NOTE with a
-                                one-click fix, never a block on saving. */}
-                            {vendorMapIds && vendorMapIds.size > 0 && item.material_id
-                              && !vendorMapIds.has(item.material_id) && (() => {
-                              const mat = materials.find((m) => String(m.id) === String(item.material_id)) as any;
-                              const nm = String(mat?.name || item.material_id);
-                              return (
-                                <div className="mt-1 text-[9px] leading-tight text-amber-800">
-                                  Not in {vendorShort}&apos;s items.{' '}
-                                  <button
-                                    type="button"
-                                    disabled={vendorMapBusy}
-                                    onClick={() => addToVendorItems(String(item.material_id), nm)}
-                                    className="underline font-medium text-[#af4408] disabled:opacity-50"
-                                  >
-                                    Add to this vendor&apos;s items
-                                  </button>
-                                </div>
-                              );
-                            })()}
-                          </td>
-                          <td className="py-2 px-2 block md:table-cell">
-                            <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Brand</span>
-                            <input
-                              type="text"
-                              value={item.brand}
-                              onChange={(e) => updateBillLine(item.id, 'brand', e.target.value)}
-                              placeholder="Brand"
-                              className="w-full px-2 py-1.5 bg-white border border-[#D4B896] rounded text-xs text-[#2D1B0E] focus:outline-none focus:ring-1 focus:ring-[#af4408]"
-                            />
-                          </td>
-                          <td className="py-2 px-2 block md:table-cell">
-                            <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Qty</span>
-                            {(() => {
-                              const mat = materials.find(m => m.id === item.material_id) as any;
-                              const caseSize = Number(mat?.case_size) || 1;
-                              const hasCase = caseSize > 1;
-                              const mode: 'btl' | 'case' = item.entry_mode || 'btl';
-                              const rawQty = parseFloat(item.quantity) || 0;
-                              const expandedBtl = mode === 'case' ? rawQty * caseSize : rawQty;
-                              return (
-                                <div className="space-y-0.5">
-                                  <div className="flex gap-1">
-                                    <input
-                                      type="number" step="0.01" min="0"
-                                      value={item.quantity}
-                                      onChange={(e) => updateBillLine(item.id, 'quantity', e.target.value)}
-                                      placeholder="0"
-                                      className="flex-1 px-2 py-1.5 bg-white border border-[#D4B896] rounded text-xs text-right text-[#2D1B0E] focus:outline-none focus:ring-1 focus:ring-[#af4408]"
-                                    />
-                                    {hasCase && (
-                                      <select
-                                        value={mode}
-                                        onChange={(e) => updateBillLine(item.id, 'entry_mode', e.target.value)}
-                                        className="px-1.5 py-1.5 bg-white border border-[#D4B896] rounded text-[10px] text-[#2D1B0E] focus:outline-none"
-                                        title={`This material has case_size = ${caseSize} bottles per case`}>
-                                        <option value="btl">BTL</option>
-                                        <option value="case">CASE</option>
-                                      </select>
-                                    )}
-                                  </div>
-                                  {hasCase && mode === 'case' && rawQty > 0 && (
-                                    <div className="text-[9px] text-emerald-700 text-right font-mono">
-                                      = {expandedBtl} btl × {caseSize}
-                                    </div>
-                                  )}
-                                  {/* Purchase unit + the recipe reading of what was
-                                      typed. Display only — the line still posts the
-                                      purchase-unit number (expanded by case_size in
-                                      CASE mode, exactly as before). */}
-                                  {(() => {
-                                    const u = matUnits(item.material_id);
-                                    // A CASE line holds CASES, not BTL — billSubmit
-                                    // posts qty × case_size. Printing the purchase
-                                    // unit unconditionally declared "5 BTL" under a
-                                    // box that meant 5 cases = 60 BTL. The recipe
-                                    // hint below was already suppressed here; the
-                                    // unit itself was not.
-                                    if (mode === 'case' && hasCase) return (
-                                      <div className="text-[9px] text-[#B8A590] text-right">
-                                        case{u.pu ? ` (${caseSize} ${u.pu})` : ''}
-                                      </div>
-                                    );
-                                    if (!u.pu) return null;
-                                    const h = recipeHint(item.quantity, u);
-                                    return (
-                                      <div className="text-[9px] text-[#B8A590] text-right">
-                                        {u.pu}{h ? ` · ${h}` : ''}
-                                      </div>
-                                    );
-                                  })()}
-                                </div>
-                              );
-                            })()}
-                          </td>
-                          <td className="py-2 px-2 block md:table-cell">
-                            <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Unit Price</span>
-                            <input
-                              type="number" step="0.01" min="0"
-                              value={item.unit_price}
-                              onChange={(e) => updateBillLine(item.id, 'unit_price', e.target.value)}
-                              placeholder="0"
-                              className="w-full px-2 py-1.5 bg-white border border-[#D4B896] rounded text-xs text-right text-[#2D1B0E] focus:outline-none focus:ring-1 focus:ring-[#af4408]"
-                              title={caseBasis(item.material_id, item.entry_mode).on ? 'Per-case rate' : 'Per-bottle rate'}
-                            />
-                            {/* Sibling of the Qty cell above — keyed on the SAME
-                                effective guard, so a line left on 'case' after
-                                switching to a material with no case_size (where
-                                billSubmit falls back to the per-unit rate) stops
-                                claiming "per case". */}
-                            {caseBasis(item.material_id, item.entry_mode).on ? (
-                              <div className="text-[9px] text-[#8B7355] text-right">per case</div>
-                            ) : (() => {
-                              // ₹ per PURCHASE unit. Stored as ₹/purchase-unit too;
-                              // the ₹/recipe-unit average is derived server-side.
-                              const u = matUnits(item.material_id);
-                              return u.pu ? <div className="text-[9px] text-[#B8A590] text-right">₹ / {u.pu}</div> : null;
-                            })()}
-                          </td>
-                          <td className="py-2 px-3 text-right text-xs font-mono text-[#6B5744] block md:table-cell">
-                            <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Line Total</span>
-                            {formatCurrency(item.line_total)}
-                          </td>
-                          <td className="py-2 px-3 text-right text-xs font-mono text-emerald-700 block md:table-cell">
-                            <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Discount</span>
-                            {item.discount_share > 0 ? `- ${formatCurrency(item.discount_share)}` : formatCurrency(0)}
-                          </td>
-                          <td className="py-2 px-3 text-right text-xs font-mono text-[#6B5744] block md:table-cell">
-                            <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Taxable (after discount)</span>
-                            {formatCurrency(item.taxable)}
-                          </td>
-                          <td className="py-2 px-2 text-right block md:table-cell">
-                            <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">GST %</span>
-                            {item.zero_rated ? (
-                              // The rate is not the storekeeper's to set here: this
-                              // material belongs to a store location, where excise /
-                              // cess / TCS are charged on the store's own bill. A
-                              // GST% on it would be tax that was never paid.
-                              <div className="text-[10px] text-blue-700 leading-tight">
-                                0%
-                                <span className="block text-[9px] text-[#8B7355]">store item — taxed on the TGBCL bill</span>
-                              </div>
-                            ) : (
-                              <select
-                                value={item.gst_rate}
-                                onChange={(e) => updateBillLine(item.id, 'gst_rate', e.target.value)}
-                                className="w-full px-1.5 py-1.5 bg-white border border-[#D4B896] rounded text-xs text-right text-[#2D1B0E] focus:outline-none focus:ring-1 focus:ring-[#af4408]"
-                                title="Blank follows the bill's GST rate. Change it only for a line the vendor billed at a different rate."
-                              >
-                                <option value="">Bill ({billData.gst_rate}%)</option>
-                                {GST_RATES.map((r) => <option key={r} value={r}>{r}%</option>)}
-                              </select>
-                            )}
-                          </td>
-                          <td className="py-2 px-2 text-right block md:table-cell">
-                            <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Cess %</span>
-                            {item.zero_rated ? (
-                              // Same reason as the GST cell: a TGBCL line's cess
-                              // is levied on the store's own bill, not ours.
-                              <div className="text-[10px] text-blue-700 leading-tight">0%</div>
-                            ) : (
-                              // A FREE number input, not a select — compensation
-                              // cess has no fixed rate card (12% on aerated
-                              // drinks, other rates on tobacco), and it mirrors
-                              // the master's own free 0-100 field. Raw string in
-                              // state so a decimal stays typeable.
-                              <input
-                                type="number" step="0.01" min="0" max="100"
-                                value={item.cess_rate}
-                                onChange={(e) => updateBillLine(item.id, 'cess_rate', e.target.value)}
-                                placeholder="0"
-                                className="w-full px-1.5 py-1.5 bg-white border border-[#D4B896] rounded text-xs text-right text-[#2D1B0E] focus:outline-none focus:ring-1 focus:ring-[#af4408]"
-                                title="GST Compensation Cess % for this line (e.g. 12 on aerated drinks). Seeded from the Raw Material master; change it if the printed bill says otherwise. A separate levy — it is NOT part of CGST/SGST."
-                              />
-                            )}
-                            {item.compensation_cess > 0 && (
-                              <span className="block text-[9px] text-[#8B7355] font-mono">
-                                {formatCurrency(item.compensation_cess)}
-                              </span>
-                            )}
-                          </td>
-                          <td className="py-2 px-3 text-right text-xs font-mono text-[#6B5744] block md:table-cell">
-                            <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Tax (CGST + SGST)</span>
-                            {formatCurrency(item.tax_value)}
-                            {item.tax_value > 0 && (
-                              <span className="block text-[9px] text-[#8B7355]">
-                                {formatCurrency(item.cgst)} + {formatCurrency(item.sgst)}
-                              </span>
-                            )}
-                          </td>
-                          <td className="py-2 px-3 text-right text-xs font-mono text-[#2D1B0E] block md:table-cell">
-                            <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Incl. Tax</span>
-                            {formatCurrency(item.line_incl_tax)}
-                          </td>
-                          <td className="py-2 px-3 text-right text-xs font-mono font-semibold text-[#af4408] block md:table-cell">
-                            <span className="md:hidden text-[9px] uppercase tracking-wide text-[#8B7355] block mb-0.5">Final Unit ₹ (goods, no tax)</span>
-                            {formatCurrency(item.final_unit_price)}
-                          </td>
-                          <td className="py-2 px-1 block md:table-cell">
-                            {/* Always offered, including on the last line. The material is
-                                locked once chosen, so this is the ONLY way to correct a wrong
-                                pick — hiding it at one line left a one-line bill unfixable.
-                                On the last line it clears the row instead of removing it. */}
-                            {(
-                              <button
-                                type="button"
-                                title={billCalc.items.length > 1
-                                  ? 'Remove this line'
-                                  : 'Clear this line (last line — the row stays, the material is cleared)'}
-                                onClick={() => removeBillLine(item.id)}
-                                className="p-1 text-red-400 hover:text-red-600 transition-colors"
-                              >
-                                <Trash2 className="w-3.5 h-3.5" />
-                              </button>
-                            )}
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-                {/* Primary Add-item — full width at the BOTTOM so on mobile it sits
-                    right below the item you just entered (the top button is desktop-only). */}
-                <button type="button" onClick={addBillLine}
-                        className="mt-2 w-full flex items-center justify-center gap-1.5 py-2.5 border-2 border-dashed border-[#E8D5C4] rounded-lg text-sm font-medium text-[#af4408] hover:border-[#af4408] hover:bg-[#FFF1E3] active:bg-[#FFE8D5]">
-                  <Plus className="w-4 h-4" /> Add line
-                </button>
-              </div>
-
-              {/* Bill Summary */}
-              {/* Reads in the same order as the paper bill in the storekeeper's
-                  hand, so the screen can be reconciled against it line by line. */}
-              <div className="bg-[#FFF8F0] border border-[#E8D5C4] rounded-xl p-4">
-                <div className="grid grid-cols-2 sm:grid-cols-4 xl:grid-cols-8 gap-4 text-center">
-                  <div>
-                    <p className="text-xs text-[#8B7355] mb-0.5">Goods Total</p>
-                    <p className="text-lg font-bold text-[#2D1B0E]">{formatCurrency(billCalc.subtotal)}</p>
-                  </div>
-                  <div>
-                    <p className="text-xs text-[#8B7355] mb-0.5">Discount</p>
-                    <p className="text-lg font-bold text-emerald-700">- {formatCurrency(billCalc.discountAmount)}</p>
-                  </div>
-                  <div>
-                    <p className="text-xs text-[#8B7355] mb-0.5">Taxable</p>
-                    <p className="text-lg font-bold text-[#2D1B0E]">{formatCurrency(billCalc.taxableTotal)}</p>
-                  </div>
-                  <div>
-                    <p className="text-xs text-[#8B7355] mb-0.5">CGST</p>
-                    <p className="text-lg font-bold text-[#6B5744]">+ {formatCurrency(billCalc.cgstTotal)}</p>
-                  </div>
-                  <div>
-                    <p className="text-xs text-[#8B7355] mb-0.5">SGST</p>
-                    <p className="text-lg font-bold text-[#6B5744]">+ {formatCurrency(billCalc.sgstTotal)}</p>
-                  </div>
-                  <div>
-                    <p className="text-xs text-[#8B7355] mb-0.5" title="GST Compensation Cess — a separate levy, deliberately NOT part of CGST/SGST above">Cess</p>
-                    <p className="text-lg font-bold text-[#6B5744]">+ {formatCurrency(billCalc.cessTotal)}</p>
-                  </div>
-                  <div>
-                    <p className="text-xs text-[#8B7355] mb-0.5">Delivery</p>
-                    <p className="text-lg font-bold text-[#6B5744]">+ {formatCurrency(billCalc.deliveryAmount)}</p>
-                  </div>
-                  <div>
-                    <p className="text-xs text-[#8B7355] mb-0.5">Bill Total</p>
-                    <p className="text-lg font-bold text-[#af4408]">{formatCurrency(billCalc.grandTotal)}</p>
-                  </div>
-                </div>
-                <p className="text-[10px] text-[#8B7355] text-center mt-2">
-                  Discount and Delivery are split across items in proportion to line value.
-                  Per line: Taxable = Line Total − Discount Share, Tax = Taxable × GST% (split half CGST, half SGST).
-                  Final Unit Price = Taxable ÷ Qty, and that is what is stored as the purchase price
-                  (case-mode lines are stored per bottle, expanded by case size: rate ÷ case size against qty × case size).
-                  So a discount lowers item cost, while delivery, GST and cess are recorded on the bill without changing it —
-                  GST is reclaimable input credit, not part of what the food costs.
-                  Compensation Cess is a separate levy (it is not GST and is not split into CGST/SGST); it is
-                  recorded beside the rate the same way and is also kept out of item cost.
-                </p>
-              </div>
-
-              {/* Actions */}
-              <div className="flex items-center justify-end gap-3 pt-1">
-                <button
-                  type="button"
-                  onClick={() => setBillModalOpen(false)}
-                  className="px-4 py-2 text-sm text-[#6B5744] hover:text-[#2D1B0E] bg-[#FFF1E3] rounded-lg transition-colors"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  disabled={billSubmitting || materials.length === 0}
-                  className="flex items-center gap-2 px-5 py-2 bg-[#af4408] hover:bg-[#8a3506] disabled:opacity-50 text-white rounded-lg text-sm font-medium transition-colors"
-                >
-                  {billSubmitting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Receipt className="w-4 h-4" />}
-                  {billSubmitting ? 'Saving...' : `Save Bill (${billCalc.items.filter(i => i.material_id).length} items)`}
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
 
       {recahoOpen && <RecahoInwardModal onClose={() => setRecahoOpen(false)} onCommitted={() => { setRecahoOpen(false); fetchPurchases(); }} />}
     </div>

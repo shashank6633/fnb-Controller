@@ -508,8 +508,8 @@ function RecordConsumptionModal({ target, onClose, onChanged }: {
                     // x. To swap it, delete the line (X button below) and add a
                     // new one. Same rule and styling as the requisition
                     // composer's locked chip (src/app/requisitions/page.tsx
-                    // ~1538-1552) and the "Enter Full Bill" locked chip
-                    // (src/app/purchases/page.tsx ~2927-2947), so a line's
+                    // ~1538-1552) and the vendor-bill composer's locked chip
+                    // (the ad-hoc GRN modal in src/app/grn/page.tsx), so a line's
                     // material can never quietly change after its qty was typed
                     // against it, and the lock behaves identically everywhere.
                     //

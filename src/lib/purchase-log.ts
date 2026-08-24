@@ -358,12 +358,16 @@ export const PURCHASE_LOG_NO_TOTAL_NOTES: PurchaseLogNoTotalNote[] = [
       + 'does record is still netted off inside Total Amount, and that deduction is shown.',
   },
   {
-    column: 'Discount / Delivery charges (across sources)',
+    column: 'Every charge column, across sources (discount, delivery, CGST, SGST, cess, excise, TCS, round-off)',
     reason:
-      'Both are BILL-level figures split across the lines of one bill, so they total correctly '
-      + 'inside a single source and only there. A PO receive writes the SAME allocated delivery '
-      + 'share onto both the GRN line and the purchases row mirroring it, so the two Delivery '
-      + 'totals are one payment counted twice — never add them.',
+      'These are BILL-level figures split across the lines of one bill, so they total correctly '
+      + 'inside a single source and only there. A GRN receipt writes the SAME allocated figure '
+      + 'onto both the GRN line and the purchases row mirroring it, so the PURCHASE block and the '
+      + 'GRN block state ONE payment twice — never add a figure from one to the same figure in '
+      + 'the other. This used to be true of Discount and Delivery alone, because those were the '
+      + 'only charges a GRN-mirrored purchases row carried; every GRN writer now mirrors all '
+      + 'eight, so the whole set is duplicated across the two blocks and the whole set is listed '
+      + 'here. Read one block or the other for a bill total, never the sum.',
   },
   {
     column: 'Compensation Cess',
@@ -586,9 +590,12 @@ const GOODS_VALUE_CAVEAT_HEADLINE =
   + 'same column this report reads as "goods value", with no CGST/SGST split recorded and no '
   + 'backfill since. On those rows GOODS VALUE and TOTAL AMOUNT print the IDENTICAL number, and '
   + 'that number still has tax hidden inside it — do not treat GOODS VALUE as pre-tax spend '
-  + 'without checking further. Separately: PURCHASE rows created by receiving a GRN carry no '
-  + 'GST/cess/TCS/round-off of their own, so their TOTAL AMOUNT reads roughly 17.6% LOW against '
-  + 'the true GRN bill — for those deliveries, trust the GRN block’s own Total Amount instead. '
+  + 'without checking further. Separately, and now HISTORICAL ONLY: PURCHASE rows created by '
+  + 'receiving a GRN used to carry no GST/cess/TCS/round-off of their own, so their TOTAL AMOUNT '
+  + 'read roughly 17.6% LOW against the true GRN bill. Every GRN writer now mirrors all eight '
+  + 'charge columns — ad-hoc receipt, QC sign-off and amendment alike — so rows recorded from '
+  + 'that change onward reconcile to the paisa against their GRN, and the PURCHASE row is the '
+  + 'one to trust. OLDER GRN-mirrored rows are still thin, and they are NOT being rewritten. '
   + 'This is a data problem, not a display bug; it is disclosed here, not fixed here.';
 
 /**

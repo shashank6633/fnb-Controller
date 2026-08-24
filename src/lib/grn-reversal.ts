@@ -701,7 +701,7 @@ const LINE_COLS = `
   gi.quantity_accepted, gi.quantity_rejected, gi.rejection_reason, gi.unit_price, gi.notes,
   gi.discount, gi.cgst, gi.sgst, gi.compensation_cess, gi.special_excise_cess, gi.tcs,
   gi.delivery_charges, gi.mrp_round_off, gi.gst_rate, gi.cess_rate, gi.cost_vendor, gi.cost_note,
-  gi.qc_applied_at
+  gi.qc_applied_at, gi.brand
 `;
 
 /**
@@ -1528,8 +1528,35 @@ export function amendGrnLines(
         //    join the void reverses by. A NEGATIVE `purchases` row is never
         //    written to express the difference (return-stock.ts): FIFO's "latest
         //    purchase" would become the correction itself.
-        db.prepare(`UPDATE purchases SET quantity = ?, unit_price = ?, total_price = ? WHERE id = ?`)
-          .run(nextAccepted, costPrice, costTotal, costRow.id);
+        /* ── THE TAX MOVES WITH THE QUANTITY, OR THE MIRROR TELLS A LIE ──────
+         * This UPDATE touched three columns while writeLine below re-derived
+         * the line's cgst / sgst / compensation_cess from the SAME amendment.
+         * So an amend left the cost row's tax standing at its pre-amendment
+         * figure: measured on a ₹1,000 line amended 10 → 6, the GRN line
+         * correctly became CGST ₹45 + SGST ₹45 while the `purchases` row kept
+         * CGST ₹81 + SGST ₹81, and the Purchases register and
+         * /reports/purchase-bill-summary — which read `purchases` alone — then
+         * printed an over-claimed input credit, permanently, with no marker.
+         * Stale figures are worse than absent ones: nothing looks wrong.
+         *
+         * Bound from the SAME `tax` object writeLine uses, so the bill document
+         * and its cost row cannot disagree by construction.
+         *
+         * ONLY the columns this amendment actually re-derives. delivery_charges,
+         * special_excise_cess, tcs and mrp_round_off are bill-level shares that
+         * do not move with a quantity — the amend does not recompute them on the
+         * GRN line either, so rewriting them here would invent a change.
+         */
+        db.prepare(`
+          UPDATE purchases
+             SET quantity = ?, unit_price = ?, total_price = ?,
+                 discount = ?, cgst = ?, sgst = ?, compensation_cess = ?
+           WHERE id = ?`)
+          .run(nextAccepted, costPrice, costTotal,
+               // Same rule as both writers: 0 when the reduction is already
+               // inside costPrice, the share itself when netting was refused.
+               (canNet && netCandidate > 0) ? 0 : discShare,
+               tax.cgst, tax.sgst, tax.compensation_cess, costRow.id);
         result.purchases_updated++;
         costAction = 'updated';
         if (txRow) {
@@ -1555,12 +1582,37 @@ export function amendGrnLines(
         //    at inward precisely so a deferred booking never has to re-compose
         //    prose (that is the failure grn_id was added to end).
         const purchaseId = generateId();
+        /* ── SAME WIDTH AS THE TWO ROUTES THAT MINT THESE ROWS ────────────────
+         * A line booking for the first time at amend time must land the row the
+         * originating route would have landed. This INSERT carried the old
+         * narrow column set, so a line rescued from a full rejection came back
+         * with no tax, no PINV and no brand — the very defect fixed in
+         * grn-qc.ts, reachable by a second door.
+         * ONE PINV PER BILL: an id already on a sibling cost row of this GRN is
+         * reused, so a partially-booked bill does not acquire two identities.
+         */
+        const priorInv = db.prepare(
+          `SELECT invoice_id FROM purchases WHERE grn_id = ? AND COALESCE(invoice_id,'') <> '' LIMIT 1`
+        ).get(grnId) as any;
+        let amendInvoiceId = String(priorInv?.invoice_id || '');
+        if (!amendInvoiceId) {
+          const yr = new Date().getFullYear();
+          const lastInv = db.prepare(
+            `SELECT MAX(CAST(substr(invoice_id, length('PINV-' || ? || '-') + 1) AS INTEGER)) AS n
+               FROM purchases WHERE invoice_id LIKE 'PINV-' || ? || '-%'`
+          ).get(String(yr), String(yr)) as any;
+          amendInvoiceId = `PINV-${yr}-${String((Number(lastInv?.n) || 0) + 1).padStart(4, '0')}`;
+        }
         db.prepare(`
           INSERT INTO purchases (id, material_id, vendor, brand, quantity, unit_price, total_price, date, notes,
                                  bill_no, is_emergency, payment_mode, emergency_reason, outlet_id,
-                                 discount, delivery_charges, grn_id, created_at)
-          VALUES (?, ?, ?, '', ?, ?, ?, ?, ?, ?, 0, '', '', ?, 0, ?, ?, datetime('now'))
+                                 discount, delivery_charges, grn_id, invoice_id,
+                                 cgst, sgst, compensation_cess, special_excise_cess, tcs, mrp_round_off,
+                                 created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '', '', ?, ?, ?, ?, ?,
+                  ?, ?, ?, ?, ?, ?, datetime('now'))
         `).run(purchaseId, materialId, String(line.cost_vendor || grn.vendor || ''),
+               String(line.brand || ''),
                nextAccepted, costPrice, costTotal, grn.date,
                // ── THE NOTE IS NOT OPTIONAL PROSE, IT IS THE JOIN. ───────────
                // src/lib/purchase-log.ts decides is_mirror and link_key from
@@ -1575,7 +1627,16 @@ export function amendGrnLines(
                // invented, the same two shapes, so the anchored regex matches.
                String(line.cost_note || '').trim() || composedCostNote,
                String(grn.invoice_number || '').trim(),
-               grn.outlet_id, Number(line.delivery_charges) || 0, grnId);
+               grn.outlet_id,
+               (canNet && netCandidate > 0) ? 0 : discShare,
+               Number(line.delivery_charges) || 0, grnId, amendInvoiceId,
+               // The re-derived tax for THIS amendment (same object writeLine
+               // stores on the line), then the three bill-level shares carried
+               // straight off the line — they do not move with a quantity.
+               tax.cgst, tax.sgst, tax.compensation_cess,
+               Number(line.special_excise_cess) || 0,
+               Number(line.tcs) || 0,
+               Number(line.mrp_round_off) || 0);
         db.prepare(`
           INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, created_at, outlet_id)
           VALUES (?, ?, 'purchase', ?, ?, ?, datetime('now'), ?)

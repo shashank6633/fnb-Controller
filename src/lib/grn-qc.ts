@@ -1653,17 +1653,91 @@ export function decideGrnQc(
          SET cgst = ?, sgst = ?, compensation_cess = ?
        WHERE id = ? AND grn_id = ?
     `);
-    // ONE INSERT for both origins. The ad-hoc route omits discount /
-    // delivery_charges and lets the column defaults (0) apply, and the PO route
-    // binds `discount` to the literal 0 with the reduction already inside
-    // unit_price — so binding 0 for discount here is byte-identical to both,
-    // and delivery_charges carries the PO path's allocated share (0 on ad-hoc).
+    /* ── ONE INSERT FOR BOTH ORIGINS — AND IT NOW CARRIES THE WHOLE BILL ─────
+     * THIS USED TO BIND 17 COLUMNS WHILE THE UNHELD PATH BOUND 25, and once
+     * "Enter Full Bill" moved onto the GRN rail that gap became the dominant
+     * case rather than an edge: the gate holds a delivery whenever ANY line on
+     * it is perishable, and the GRN is the unit. Measured on this database
+     * before the fix — 246 of 374 real vendor bills (65.8%) carry at least one
+     * gated line, so roughly two bills in three were booked by THIS statement.
+     *
+     * The seven columns it dropped — invoice_id, cgst, sgst, compensation_cess,
+     * special_excise_cess, tcs, mrp_round_off — are exactly the ones every
+     * reader adds back:
+     *
+     *   Total Inward = total_price − discount + cgst + sgst
+     *                + compensation_cess + special_excise_cess + tcs
+     *                + delivery_charges + mrp_round_off
+     *
+     * so a held bill landed on the Purchases register at GOODS VALUE ONLY, with
+     * its GST simply absent — the input-credit record for most of the year's
+     * purchasing. Worked example from the harness: a ₹2,200 vegetable bill with
+     * ₹108 GST, ₹12 TCS, ₹8 excise, ₹30 delivery and −₹1 round-off recorded
+     * ₹2,190 against a true ₹2,317. That is the 17.6%-low mirror defect
+     * src/lib/purchase-log.ts documents, reintroduced on the busiest path at the
+     * moment the busy path changed.
+     *
+     * AND A BLANK invoice_id IS NOT COSMETIC. src/lib/purchase-bill-summary.ts
+     * defines is_po_receipt as literally "blank invoice_id AND a grn_id", so
+     * every hand-typed held bill was being filed as a PO receipt — and the one
+     * report built to isolate hand-entered bills hid them the moment a user
+     * unticked "include PO/GRN receipts". Minting the PINV here is what keeps a
+     * bill's identity the same whether the kitchen held it or not.
+     *
+     * `discount` is STILL BOUND 0 ON THE NETTED PATH and that is not an
+     * omission: unit_price below is net of the allocated share, and every reader
+     * subtracts purchases.discount a SECOND time. It is bound to the real share
+     * ONLY in the fallback where the net rate could not be used — see the bind.
+     */
     const insPurchase = db.prepare(`
       INSERT INTO purchases (id, material_id, vendor, brand, quantity, unit_price, total_price, date, notes,
                              bill_no, is_emergency, payment_mode, emergency_reason, outlet_id,
-                             discount, delivery_charges, grn_id, created_at)
-      VALUES (?, ?, ?, '', ?, ?, ?, ?, ?, ?, 0, '', '', ?, 0, ?, ?, datetime('now'))
+                             discount, delivery_charges, grn_id, invoice_id,
+                             cgst, sgst, compensation_cess, special_excise_cess, tcs, mrp_round_off,
+                             created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '', '', ?, ?, ?, ?, ?,
+              ?, ?, ?, ?, ?, ?, datetime('now'))
     `);
+
+    /* ── OUR INVOICE ID (PINV) FOR A BILL THE GATE HELD ──────────────────────
+     * Byte-for-byte the mint in src/app/api/grn/route.ts, deliberately: a bill
+     * must end up with the same identity whichever side of the gate booked it,
+     * or the register tells two stories about one piece of paper.
+     *
+     * REUSED, NOT ALWAYS MINTED. An existing PINV for this (vendor, bill no,
+     * date) is taken as-is — a bill that reaches this table by two routes is
+     * still one bill — and a blank bill number falls through to a fresh number,
+     * which is right: a receipt with no vendor document has no identity to share.
+     *
+     * LAZY, AND INSIDE THE TRANSACTION. A fully-rejected sign-off books nothing,
+     * and minting there would burn a number on a row that does not exist. The
+     * read of MAX() and the inserts that consume it are in one better-sqlite3
+     * transaction, so no second sign-off can take the same number.
+     */
+    let invoiceIdIssued = '';
+    const grnBillNo = String(grn.invoice_number || '').trim();
+    const grnVendorKey = String(grn.vendor || '').toLowerCase().trim();
+    const mintInvoiceId = (): string => {
+      if (invoiceIdIssued) return invoiceIdIssued;
+      if (grnBillNo) {
+        const prior = db.prepare(`
+          SELECT invoice_id FROM purchases
+          WHERE COALESCE(invoice_id, '') <> ''
+            AND LOWER(TRIM(COALESCE(vendor, ''))) = ?
+            AND LOWER(TRIM(COALESCE(bill_no, ''))) = ?
+            AND date = ?
+          LIMIT 1
+        `).get(grnVendorKey, grnBillNo.toLowerCase(), grn.date) as any;
+        if (prior?.invoice_id) { invoiceIdIssued = String(prior.invoice_id); return invoiceIdIssued; }
+      }
+      const y = new Date().getFullYear();
+      const last = db.prepare(
+        `SELECT MAX(CAST(substr(invoice_id, length('PINV-' || ? || '-') + 1) AS INTEGER)) AS n
+           FROM purchases WHERE invoice_id LIKE 'PINV-' || ? || '-%'`
+      ).get(String(y), String(y)) as any;
+      invoiceIdIssued = `PINV-${y}-${String((Number(last?.n) || 0) + 1).padStart(4, '0')}`;
+      return invoiceIdIssued;
+    };
     const bumpStock = db.prepare(`
       UPDATE raw_materials
          SET current_stock = current_stock + ?, last_purchase_price = ?,
@@ -1707,9 +1781,23 @@ export function decideGrnQc(
       const manualSgst = Number(r.item.sgst) || 0;
       const manualCess = Number(r.item.compensation_cess) || 0;
       const hasManualTax = (manualCgst + manualSgst + manualCess) > 0;
+      // ── THE TAX THE COST ROW WILL CARRY, HELD IN ONE PLACE ────────────────
+      // Seeded from the STORED line, which is already the right figure on a full
+      // accept (the receiving route derived it at inward), and overwritten below
+      // by whichever re-derivation actually fires. Both branches run only when
+      // something was rejected, so on the ordinary sign-off these three are the
+      // stored rupees untouched. The `purchases` mirror binds THESE, never
+      // r.item.* again — reading the row a second time after upLineTax has
+      // rewritten it is how the bill document and its cost row drift apart.
+      let effCgst = manualCgst;
+      let effSgst = manualSgst;
+      let effCess = manualCess;
       if (r.rejected > EPS && gstRate <= 0 && cessRate <= 0 && hasManualTax && r.received > EPS) {
         const ratio = Math.max(0, Math.min(1, r.accepted / r.received));
-        upLineTax.run(r2(manualCgst * ratio), r2(manualSgst * ratio), r2(manualCess * ratio), r.item.id, grnId);
+        effCgst = r2(manualCgst * ratio);
+        effSgst = r2(manualSgst * ratio);
+        effCess = r2(manualCess * ratio);
+        upLineTax.run(effCgst, effSgst, effCess, r.item.id, grnId);
       } else if (r.rejected > EPS && (gstRate > 0 || cessRate > 0)) {
         // rate-basis: purchase — quantity_accepted is PURCHASE units and
         // unit_price is Rs/purchase-unit on a GRN line (canon).
@@ -1719,7 +1807,10 @@ export function decideGrnQc(
         const sgstPaise = Math.floor(taxPaise / 2);
         const cgstPaise = taxPaise - sgstPaise;   // odd paisa lands in CGST
         const cessPaise = cessRate > 0 ? Math.max(0, Math.round(grossTax * cessRate)) : 0;
-        upLineTax.run(cgstPaise / 100, sgstPaise / 100, cessPaise / 100, r.item.id, grnId);
+        effCgst = cgstPaise / 100;
+        effSgst = sgstPaise / 100;
+        effCess = cessPaise / 100;
+        upLineTax.run(effCgst, effSgst, effCess, r.item.id, grnId);
       }
 
       // ABS: a back-correction has a NEGATIVE accepted and must still be
@@ -1768,13 +1859,44 @@ export function decideGrnQc(
         // Stored at inward: the PO path books each line against its OWN line
         // vendor, which on a mixed PO is not the GRN header vendor.
         String(r.item.cost_vendor || grn.vendor || ''),
+        // Stored at inward too (db.ts added the column for exactly this): the
+        // brand used to be readable only by the unheld path, so a held bill
+        // always booked ''. Empty on every historical line, which is what those
+        // rows already wrote.
+        String(r.item.brand || ''),
         r.accepted, netPrice, netTotal, grn.date,
         // Stored at inward too: purchase-log.ts parses this sentence with an
         // anchored regex, so it must be the exact string the receiving route
         // would have written. Never re-composed here.
         String(r.item.cost_note || ''),
         String(grn.invoice_number || '').trim(),
-        grn.outlet_id, delivShare, grnId,
+        grn.outlet_id,
+        // ── discount: 0 WHEN IT IS ALREADY INSIDE unit_price, THE SHARE WHEN
+        //    IT IS NOT. `canNet && netCandidate > 0` is the exact condition
+        //    under which netPrice/netTotal above carry the reduction. In the
+        //    fallback (the share equals or exceeds the line's goods value, so
+        //    netting would write a zero or negative rate) the GROSS rate is
+        //    booked — and binding 0 here as well made the discount vanish from
+        //    the record altogether: not in the rate, not in the column, so
+        //    Total Inward read the undiscounted bill. Bound here it is
+        //    subtracted exactly ONCE, by the readers, off a gross rate.
+        (canNet && netCandidate > 0) ? 0 : discShare,
+        delivShare, grnId,
+        // OUR bill number — minted once for this sign-off, or reused from a row
+        // that already carries this vendor bill.
+        mintInvoiceId(),
+        // The recorded-only charges, in the register's own order. cgst/sgst/cess
+        // are the EFFECTIVE figures computed above (re-derived when the kitchen
+        // rejected part of the line), so this row and the GRN line state the
+        // same tax. The last three are carried straight off the line exactly as
+        // the receiving route wrote them. They stay OUT of unit_price /
+        // total_price forever — average_price is derived from those two and
+        // feeds every recipe, so folding tax in inflates every recipe by the tax
+        // rate and forfeits the input credit.
+        effCgst, effSgst, effCess,
+        Number(r.item.special_excise_cess) || 0,
+        Number(r.item.tcs) || 0,
+        Number(r.item.mrp_round_off) || 0,
       );
       // ── Unit-basis boundary (CORE CONVENTION) ────────────────────────────
       // GRN quantities are PURCHASE units; current_stock and

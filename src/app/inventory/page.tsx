@@ -1702,10 +1702,13 @@ export default function InventoryPage() {
                     <input type="number" min={0} max={100} step="any"
                            value={formData.cess_percent ?? 0}
                            onChange={e => setFormData(f => ({ ...f, cess_percent: Number(e.target.value) }))}
-                           title="Seeds the GST Compensation Cess % on new Purchase Entry lines (Enter Full Bill) for this item. The storekeeper can still change it to match the vendor bill. Liquor/store items are always 0%. This is a separate levy from the TGBCL Special Excise Cess on the Liquor Store bill — that one comes off the store bill's own charges, never from here."
+                           title="Seeds the GST Compensation Cess % on new vendor-bill lines for this item — Purchases → Enter Vendor Bill, which records the bill as a Goods Receipt Note. The storekeeper can still change it to match the vendor bill. Liquor/store items are always 0%. This is a separate levy from the TGBCL Special Excise Cess on the Liquor Store bill — that one comes off the store bill's own charges, never from here."
                            className="px-2 py-1.5 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm" />
+                    {/* Named for the screen it actually seeds. It said "Purchase
+                        Entry (Enter Full Bill)", a form that no longer exists on
+                        Purchases — anyone following it looked in the wrong place. */}
                     <span className="text-[10px] text-[#8B7355]">
-                      Used by Purchase Entry (Enter Full Bill) only — recorded beside the rate, never added into cost.
+                      Used when entering a vendor bill (Goods Receipt Note) only — recorded beside the rate, never added into cost.
                     </span>
                   </label>
                   <label className="text-xs text-[#6B5744] flex flex-col gap-1 sm:col-span-2">

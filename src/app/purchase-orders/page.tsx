@@ -76,8 +76,7 @@ const RATE_EPS = 0.005;   // ₹ — half a paisa
 
 /**
  * The GST rates a vendor bill in this kitchen actually carries. A fixed list and
- * not a free number box, for the same reason as the Enter Full Bill modal on
- * /purchases: a typo'd "1.8" on a ₹40,000 bill is a tax figure nobody catches
+ * not a free number box, for the same reason as the vendor-bill form on /grn: a typo'd "1.8" on a ₹40,000 bill is a tax figure nobody catches
  * until the return is filed. Same five values, same order — the two screens that
  * take a vendor bill must not offer different tax rates.
  *
@@ -724,7 +723,7 @@ export default function PurchaseOrdersPage() {
 /* ============================================================ */
 /**
  * One bill-level charge row: By % / By Amount + the resolved ₹ figure.
- * Same shape and behaviour as the Enter Full Bill modal on /purchases, so the
+ * Same shape and behaviour as the ad-hoc GRN bill modal on /grn, so the
  * two places a bill is entered look identical; only the effect on cost differs,
  * and `hint` is where that is stated.
  */
@@ -1718,7 +1717,7 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
                     {/* TAX, reading left to right off the goods figure the way
                         the vendor's bill does: value → less discount → taxable
                         → × GST% → tax → incl. tax. Same columns, same order and
-                        same wording as the Enter Full Bill modal on /purchases. */}
+                        same wording as the ad-hoc GRN bill modal on /grn. */}
                     <th className="text-right py-1 px-2 font-medium" title="Line Total minus this line's share of the bill discount — the value GST is charged on. Compensation cess is NOT charged on this: it is charged on the Line Total, before the discount.">Taxable</th>
                     <th className="text-right py-1 px-2 font-medium" title="GST % is charged on the Taxable value (after discount). Compensation cess % is a separate levy charged on the Line Total (before discount) — it is never part of CGST + SGST.">GST % · Cess %</th>
                     <th className="text-right py-1 px-2 font-medium" title="Charged on the taxable value, split into CGST + SGST. Recorded on the bill — never added into the rate, so recipe costs stay on the true goods price.">Tax (C+S)</th>

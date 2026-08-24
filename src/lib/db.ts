@@ -2764,6 +2764,21 @@ function initializeSchema(db: Database.Database) {
     qcAdd('goods_receipt_note_items', 'cost_vendor', `cost_vendor TEXT DEFAULT ''`, hasQI);
     qcAdd('goods_receipt_note_items', 'cost_note', `cost_note TEXT DEFAULT ''`, hasQI);
     qcAdd('goods_receipt_note_items', 'qc_applied_at', `qc_applied_at TEXT`, hasQI);
+    // ── THE BRAND, STORED SO A HELD BILL DOES NOT LOSE IT ────────────────────
+    // purchases.brand is a real column the register renders, and the bill form
+    // sends it per line. It survived an UNHELD ad-hoc receipt only, because the
+    // insert that books a HELD one runs hours later out of src/lib/grn-qc.ts and
+    // could read nothing back — this table had no brand column, so the sign-off
+    // bound '' and an amend replay bound '' again. With the QC gate holding the
+    // majority of real bills from day one, "survives only when nothing on the
+    // bill is perishable" is the same as "usually lost".
+    // Stored beside cost_vendor / cost_note for exactly their reason: everything
+    // the deferred booking needs must be ON the line at inward, never re-derived
+    // from prose later.
+    // TEXT DEFAULT '' — additive, and every historical row reads '' which is
+    // precisely what those rows already wrote. Measured before adding it:
+    // brand <> '' on 0 of 2,165 purchases rows, so nothing existing changes.
+    qcAdd('goods_receipt_note_items', 'brand', `brand TEXT DEFAULT ''`, hasQI);
     // ── THE TWO TAX RATES, AS PERCENTS. NOT RUPEES. ─────────────────────────
     // cgst / sgst / compensation_cess beside them are ₹; these two are the
     // PERCENT they were derived from (18, 12, 5 …), and 0 means "no rate was
