@@ -18,6 +18,8 @@ import { canApproveTasks } from '@/lib/tasks';
  *   - kitchen/admin    : open KOT trouble alerts (kot_alerts.resolved_at IS NULL)
  *   - HOD/store/admin  : materials at/below reorder level
  *   - admin            : closing counts parked in the variance-approval queue
+ *   - admin            : one digest per closing-count upload (what it counted,
+ *                        held, and auto-applied) — ONE item per upload, always
  *   - admin            : committed Central Store cutovers with unreviewed
  *                        variance records — ONE item per batch, never per line
  *   - plain staff      : their OWN requisitions by stage (with HOD / being
@@ -303,36 +305,60 @@ export async function GET() {
     // issue can never break the whole inbox.
     if (isAdmin) {
       try {
-        const { pendingVarianceCount, bigVarianceCount } = await import('@/lib/variance-approval');
+        const { pendingVarianceCount, recentCountDigests } = await import('@/lib/variance-approval');
         push('variance_approvals', 'Closing counts awaiting approval',
           pendingVarianceCount(db, outletId), '/variance-approvals');
 
-        // ── The IMMEDIATE alert: differences too big to wait for month end ──
-        // Closing counts are uploaded WEEKLY and reviewed MONTHLY by design, so
-        // without this the "immediate" alert WAS the month-end review — the
-        // functions existed and nothing in the app called them.
+        // ── THE UPLOAD DIGEST: one item per closing count, and it always fires ──
+        // WHAT THIS REPLACED. A per-row "large variance" alert used to live
+        // here, gated on two settings keys. It was measured against the owner's
+        // own incident sheet before it was ever armed: at ₹5,000 / 25% it fired
+        // on 390 of 451 rows (86%), and the cause is structural — "counted zero
+        // against a small book stock" is 100% BY DEFINITION, and herbs and
+        // perishables running out is what a restaurant does. Real rows it
+        // flagged: MENTHI LEAF ₹80, RAW BANANA ₹32. No threshold survives that
+        // distribution, so the threshold is gone and so are its two keys.
         //
-        // COUNT = 1, AND THE NUMBER LIVES IN THE LABEL. Same rule as the
-        // cutover bucket immediately below, for the same reason: the badge SUMS
-        // `count` across items (CaptainAlertsProvider), and `variance_approvals`
-        // above has ALREADY counted every one of these rows — they are a subset
-        // of the pending queue, not a second pile of work. Pushing the big count
-        // here would add e.g. 60 to a badge that already carries them.
+        // Now: ONE item per COUNT, unconditional. No bar decides whether he
+        // hears anything — only what is called out inside the sentence. Counts
+        // are weekly and approvals monthly, so a weekly digest is a rhythm he
+        // can keep, and a predictable one cannot become the thing he learns to
+        // dismiss.
         //
-        // Off unless an admin armed a threshold: bigVarianceCount returns 0 on
-        // an unconfigured alert without running a query, and push() drops a
-        // zero, so this bucket does not exist until someone asks for it.
+        // ONE ITEM PER COUNT, NEVER ONE PER LINE AND NEVER ONE PER SAVE. The
+        // first two are the same rule the cutover bucket below states, and for a
+        // sharper reason here: the badge SUMS `count` across items
+        // (CaptainAlertsProvider), and `variance_approvals` immediately above has
+        // ALREADY counted every held row inside these digests, so a per-row push
+        // would count them twice. The third was MEASURED: keying the item on the
+        // save's batch made /eod — which POSTs one material per keypad entry —
+        // raise 40 audit rows for one evening, filling this bucket with 8 rows of
+        // "1 counted, nothing differed" and pushing the genuine 1,033-line sheet
+        // out of the window. recentCountDigests() now keys on the COUNT itself
+        // (date + outlet + rail) and returns the newest row per key, so a day of
+        // single-line saves is ONE item.
         //
-        // Same 'outlet' scope and same destination as the bucket above — the
-        // house rule is that a badge counts what its destination shows.
-        const big = bigVarianceCount(db, outletId);
-        if (big > 0) {
-          push(
-            'variance_big',
-            `${big} large stock ${big === 1 ? 'variance' : 'variances'} — over the alert threshold, do not wait for month end`,
-            1,
-            '/variance-approvals',
-          );
+        // `count: 1` is the literal truth of the item — one count to look at —
+        // and it also makes the per-device ack behave: notif-ack re-surfaces a
+        // key whose count RISES, and a permanently-1 key acks once and prunes
+        // itself when the count ages out of the 7-day window. The cost of a
+        // stable key, stated: a later save for the SAME count date updates the
+        // sentence without re-poking an admin who already acked it. That is the
+        // right trade for a weekly sheet, and /variance-approvals always shows
+        // the current text.
+        //
+        // The figures are rebuilt at each SAVE, never on a poll (see section 6 of
+        // variance-approval.ts): this is a statement about what a count found,
+        // not a live queue count. The live number is the bucket above, and it is
+        // the one that falls as the queue is worked.
+        //
+        // Same 'outlet' scope and same destination as that bucket — the house
+        // rule is that a badge counts what its destination shows. The queue's
+        // own upload picker is how the admin narrows to one batch; this does not
+        // deep-link, because /variance-approvals does not seed its batch filter
+        // from the URL.
+        for (const d of recentCountDigests(db, { outletId })) {
+          push('closing_digest:' + d.key, d.label, 1, '/variance-approvals');
         }
       } catch (vaErr) {
         console.error('[/api/notifications/inbox] variance bucket failed:', vaErr);

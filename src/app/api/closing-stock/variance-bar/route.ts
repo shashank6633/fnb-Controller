@@ -3,26 +3,29 @@ import { getCurrentUser, requireRole } from '@/lib/auth';
 import {
   varianceBar, VARIANCE_BAR_KEYS,
   VARIANCE_BAR_MAX_VALUE, VARIANCE_BAR_MAX_QTY,
-  VARIANCE_ALERT_MAX_VALUE, VARIANCE_ALERT_MAX_PCT,
-  ALERT_MIN_VALUE, ALERT_MIN_QTY, AUTO_APPLY_HARD_VALUE_CEILING,
+  AUTO_APPLY_HARD_VALUE_CEILING,
   AUTO_APPLY_BATCH_VALUE, AUTO_APPLY_BATCH_ROWS,
 } from '@/lib/variance-approval';
 
 /**
  * THE VARIANCE BAR — read it, and (admin only) set it.
  * ═══════════════════════════════════════════════════════════════════════════
- * Four numbers, all stored in `settings` like every other tunable in this app,
- * all defaulting to 0 = OFF:
+ * TWO numbers, both stored in `settings` like every other tunable in this app,
+ * both defaulting to 0 = OFF:
  *
  *   closing_variance_bar_value   ₹ — at or under this, a variance APPLIES ITSELF
  *   closing_variance_bar_qty     purchase units — same, on the quantity axis
- *   closing_variance_alert_value ₹ — at or over this, the immediate alert fires
- *   closing_variance_alert_pct   % of the item's own system stock — same
  *
- * The bar's two axes are an AND, not an OR: a variance is only "small" when
- * every axis the admin has configured agrees it is small. The alert's two are an
- * OR — whichever fires first — because it is an alert and its job is to catch
- * the case the other axis misses.
+ * The two axes are an AND, not an OR: a variance is only "small" when every axis
+ * the admin has configured agrees it is small.
+ *
+ * THERE USED TO BE TWO MORE — `closing_variance_alert_value` and
+ * `closing_variance_alert_pct`, a per-row "large variance" alert. They are
+ * DELETED, not deprecated: measured against the owner's own incident sheet a
+ * ₹5,000 / 25% alert fired on 86% of rows, because "counted zero against a small
+ * book stock" is 100% by arithmetic and is normal in a restaurant. They were
+ * replaced by ONE always-fired digest per COUNT (date + outlet + rail) — see
+ * section 6 of src/lib/variance-approval.ts. Nothing tunes it, nothing mutes it.
  *
  * ── WHY THIS ROUTE EXISTS AT ALL ──────────────────────────────────────────
  * The generic PUT /api/settings is MANAGER-OR-ADMIN. This bar decides how much
@@ -31,7 +34,7 @@ import {
  * KEY_POLICY closes for purchase_backdate_limit_days and po_require_admin_approval
  * (src/app/api/settings/route.ts:44-59). This route is the ADMIN-ONLY door.
  *
- * ALL FOUR KEYS ARE NOW REGISTERED THERE as `write: 'admin'`, so the generic
+ * BOTH KEYS ARE REGISTERED THERE as `write: 'admin'`, so the generic
  * endpoint 403s a manager on them too. Keep both: this route validates and
  * clamps, that table is the blanket rule, and the reader varianceBar() clamps a
  * third time. Do NOT delete the KEY_POLICY rows as "redundant with this route"
@@ -39,8 +42,8 @@ import {
  * the whole mechanism.
  *
  * The clamps are NOT the containment they were once described as. They bound
- * quantity and percentage; they have no rupee opinion, so a qty-only bar
- * auto-applied ₹1.27 lakh on a single bottle line. The rupee containment is
+ * quantity; they have no rupee opinion, so a qty-only bar auto-applied
+ * ₹1.27 lakh on a single bottle line. The rupee containment is
  * AUTO_APPLY_HARD_VALUE_CEILING in the lib, enforced on every auto-apply.
  *
  * ── WHAT IT DELIBERATELY CANNOT DO ────────────────────────────────────────
@@ -54,10 +57,12 @@ import {
  *        numbers are policy, not a system-stock oracle: knowing "differences
  *        under ₹50 apply themselves" tells a counter nothing about what any
  *        item's system figure IS. Blind counts are untouched.
- * PUT  → admin only. Body: any subset of
- *        { bar_value, bar_qty, alert_value, alert_pct }. Returns the effective
- *        bar AFTER the write, so a clamped value is visible as clamped rather
- *        than echoed back as typed.
+ * PUT  → admin only. Body: any subset of { bar_value, bar_qty }. Returns the
+ *        effective bar AFTER the write, so a clamped value is visible as clamped
+ *        rather than echoed back as typed. `alert_value` / `alert_pct` are no
+ *        longer fields: they are absent from FIELD_TO_KEY, so the loop below
+ *        skips them and a PUT carrying only those gets "Nothing to change" — the
+ *        correct answer for a setting that no longer exists.
  */
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -65,15 +70,11 @@ export const revalidate = 0;
 const LIMITS = {
   bar_value: VARIANCE_BAR_MAX_VALUE,
   bar_qty: VARIANCE_BAR_MAX_QTY,
-  alert_value: VARIANCE_ALERT_MAX_VALUE,
-  alert_pct: VARIANCE_ALERT_MAX_PCT,
 } as const;
 
 const FIELD_TO_KEY = {
   bar_value: VARIANCE_BAR_KEYS.value,
   bar_qty: VARIANCE_BAR_KEYS.qty,
-  alert_value: VARIANCE_BAR_KEYS.alertValue,
-  alert_pct: VARIANCE_BAR_KEYS.alertPct,
 } as const;
 
 type Field = keyof typeof FIELD_TO_KEY;
@@ -84,35 +85,23 @@ function payload(db: ReturnType<typeof getDb>) {
     bar: {
       bar_value: bar.value,
       bar_qty: bar.qty,
-      alert_value: bar.alertValue,
-      alert_pct: bar.alertPct,
     },
     limits: LIMITS,
     keys: FIELD_TO_KEY,
     /** true when at least one auto-apply axis is armed. */
     auto_apply_enabled: bar.value > 0 || bar.qty > 0,
-    /** true when at least one alert axis is armed. */
-    alerts_enabled: bar.alertValue > 0 || bar.alertPct > 0,
     /**
      * The fixed guards around the two tunables. SERVED rather than duplicated in
-     * the page, because the queue draws its own "Large — look now" pill from a
-     * client-side twin of isBigVariance(): a literal copied into a .tsx is a
-     * drift surface, and a pill that disagrees with the bell about which rows
-     * are big is worse than no pill. Not settable — see the lib for why each is
-     * a constant.
+     * the page, so a literal copied into a .tsx cannot drift from the rule the
+     * server actually enforces. Not settable — see the lib for why each is a
+     * constant.
      *
-     *  alert_min_value / alert_min_qty  the materiality floor UNDER the alert's
-     *      share axis (₹, and purchase units for unpriced materials). A counted
-     *      0 is 100% by arithmetic; without a floor the share axis fires on
-     *      70-100% of every upload.
      *  auto_apply_max_value  no variance worth more than this may EVER apply
      *      itself, whichever axis is configured.
      *  auto_apply_batch_value / _rows  the circuit-breaker on ONE upload: past
      *      these, the rest of that upload is held rather than applied.
      */
     guards: {
-      alert_min_value: ALERT_MIN_VALUE,
-      alert_min_qty: ALERT_MIN_QTY,
       auto_apply_max_value: AUTO_APPLY_HARD_VALUE_CEILING,
       auto_apply_batch_value: AUTO_APPLY_BATCH_VALUE,
       auto_apply_batch_rows: AUTO_APPLY_BATCH_ROWS,
@@ -160,9 +149,7 @@ export async function PUT(request: Request) {
       if (n > LIMITS[field]) {
         return Response.json({
           error: `${field} may not exceed ${LIMITS[field]}. `
-            + (field === 'bar_value' || field === 'bar_qty'
-              ? 'This is the ceiling on what may move stock with no admin in the loop — a bigger difference has to be looked at.'
-              : 'That is past any useful alert threshold.'),
+            + 'This is the ceiling on what may move stock with no admin in the loop — a bigger difference has to be looked at.',
         }, { status: 400 });
       }
     }
@@ -172,7 +159,7 @@ export async function PUT(request: Request) {
 
   if (changed.length === 0) {
     return Response.json(
-      { error: 'Nothing to change — send at least one of bar_value, bar_qty, alert_value, alert_pct.' },
+      { error: 'Nothing to change — send at least one of bar_value, bar_qty.' },
       { status: 400 },
     );
   }

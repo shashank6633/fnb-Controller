@@ -3,7 +3,7 @@ import { getCurrentOutletId, getCurrentUser } from '@/lib/auth';
 import { allowedDeptSetExpanded, canSeeAllDeptStock } from '@/lib/dept-stock';
 import { materialStoreId, getStoreById } from '@/lib/store-engine';
 import {
-  recordCountVariance, readPhysicalCount, zeroPatternGuard, type CountInput,
+  recordCountVariance, recordCountDigest, readPhysicalCount, zeroPatternGuard, type CountInput,
 } from '@/lib/variance-approval';
 import { rateMap, valueCount, type RateSource } from '@/lib/closing-valuation';
 import { packFactor, toPurchaseQty, type PackMeta } from '@/lib/pack-units';
@@ -484,7 +484,7 @@ export async function POST(request: Request) {
     const batchId = generateId();
 
     const results = {
-      saved: 0, pending: 0, applied: 0, auto_applied: 0, not_counted: 0, alerts: 0,
+      saved: 0, pending: 0, applied: 0, auto_applied: 0, not_counted: 0,
       // EVERY row this route writes is a department row, so `dept_immediate` is
       // true the moment anything saves and `pending` is now structurally 0 here.
       // See the sibling comment in ../route.ts: a department count moves that
@@ -617,7 +617,6 @@ export async function POST(request: Request) {
           batch_label: 'Department closing sheet',
           pack: material as PackMeta,
         });
-        if (decided.alert) results.alerts++;
         results.dept_immediate = true;
         if (variance !== 0) {
           if (decided.outcome === 'applied') {
@@ -634,9 +633,53 @@ export async function POST(request: Request) {
     });
 
     run();
+
+    /* ══════════════════════════════════════════════════════════════════
+     * THE COUNT DIGEST — fired here, at the boundary of this save.
+     * ══════════════════════════════════════════════════════════════════
+     * AFTER the transaction, never inside it, and it swallows everything it
+     * can throw: a notification may not fail or roll back the count it is
+     * announcing. recordCountDigest() is try/catch'd end to end and returns
+     * null on any failure; ignoring the return value is correct.
+     *
+     * ALWAYS FIRES, on every save that counted at least one line. There is
+     * no threshold deciding WHETHER the owner hears about a count — only
+     * what is named inside the sentence. (A save that counted nothing — all
+     * blanks, all per-line errors — writes no digest: there is no count to
+     * digest. That is the only case, and it is not a threshold.)
+     *
+     * ONE BELL ITEM PER COUNT, NOT PER SAVE. This sheet is saved department
+     * by department, so keying the item on the save produced one bell row per
+     * department for a single evening's count. The digest is keyed on the
+     * COUNT (date + outlet + rail) and rebuilt from that date's live rows.
+     *
+     * EVERY ROW THIS ROUTE WRITES IS A DEPARTMENT ROW, and department rows
+     * raise NO approval at all (dept-ledger re-anchors the balance at save
+     * time). The digest reads them from `closing_stock` — date + non-empty
+     * department_id — and reports HOW MANY were counted, with no rupee figure
+     * and the reason in the sentence. That is not a gap: this route's own
+     * "KNOWN LIMITATION" note a few lines above says the stored system figure
+     * is the CENTRAL pool even for a department row, so its `variance` is not
+     * a department difference and valuing it would publish a confident wrong
+     * number in a headline.
+     * ────────────────────────────────────────────────────────────────── */
+    recordCountDigest(db, {
+      date,
+      rail: 'central',
+      // What THIS save wrote — the fire/don't-fire gate only. The reported
+      // "counted" is derived from closing_stock for the date, so counting
+      // department by department still adds up to one honest total.
+      saved: results.saved,
+      outlet_id: outletId,
+      actor_email: me.email || '',
+    });
+
     /* BLIND COUNTS ON THE WAY BACK OUT. This sheet is open to HODs and store
-     * managers, not just admins, and `pending` / `alerts` are system-stock
-     * oracles: save one line and watch whether it lands in the pending count.
+     * managers, not just admins, and `pending` is a system-stock oracle: save
+     * one line and watch whether it lands in the pending count. (An `alerts`
+     * counter used to be blinded alongside it. It is DELETED, not nulled — the
+     * count digest that replaced it goes to the admin-only audit trail and is
+     * never returned here. Do not re-add a variance-derived field.)
      * `saved`, `not_counted` and `errors` describe what the counter typed and
      * stay whole. Callers must not render the null branch as "everything
      * matched" — same rule as GET's blinding and as /api/stores/[id]/closing. */
@@ -645,7 +688,7 @@ export async function POST(request: Request) {
         // dept_anchored joins the blinded set (it counts only rows that
         // DIFFERED from the system figure); dept_immediate does not (it names
         // the rail, not the numbers).
-        ...results, pending: null, applied: null, auto_applied: null, alerts: null,
+        ...results, pending: null, applied: null, auto_applied: null,
         dept_anchored: null,
       });
     }

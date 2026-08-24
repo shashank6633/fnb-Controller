@@ -102,7 +102,7 @@ import { api } from '@/lib/api';
 import {
   ScrollText, ShieldCheck, Loader2, RefreshCw, CheckCircle2, XCircle,
   AlertTriangle, Info, Lock, PackageX, PackagePlus, Store, Boxes, Layers,
-  CalendarDays, Filter, Trash2, Bell, SlidersHorizontal, Save, X,
+  CalendarDays, Filter, Trash2, ClipboardList, SlidersHorizontal, Save, X,
   ChevronDown, ChevronRight, ListChecks, Zap,
 } from 'lucide-react';
 import { packFactor, toPurchaseQty, type PackMeta } from '@/lib/pack-units';
@@ -178,27 +178,48 @@ interface BulkPreview {
   sample: Approval[];
 }
 
-/** GET /api/closing-stock/variance-bar. */
+/**
+ * GET /api/closing-stock/variance-bar — TWO axes, both auto-apply.
+ *
+ * There used to be two more, `alert_value` and `alert_pct`, and a client twin of
+ * the server's isBigVariance() that read them to paint a per-row "Large — look
+ * now" pill. Both keys and both functions are DELETED. Measured against the
+ * owner's own incident sheet a ₹5,000 / 25% alert fired on 390 of 451 rows
+ * (86%), because "counted zero against a small book stock" is 100% by
+ * arithmetic and a restaurant runs out of herbs every week — no threshold
+ * survives that distribution. The replacement is the upload digest rendered
+ * below: one per count, always, with no bar deciding whether it speaks.
+ * DO NOT RE-ADD A CLIENT-SIDE ROW CLASSIFIER HERE.
+ */
 interface BarPayload {
-  bar: { bar_value: number; bar_qty: number; alert_value: number; alert_pct: number };
-  limits: { bar_value: number; bar_qty: number; alert_value: number; alert_pct: number };
+  bar: { bar_value: number; bar_qty: number };
+  limits: { bar_value: number; bar_qty: number };
   auto_apply_enabled: boolean;
-  alerts_enabled: boolean;
   /**
-   * The FIXED guards, served by the API rather than written here as literals —
-   * isBigRow() below has to apply the identical materiality floor the bell does,
-   * and a copied number is exactly how the pill and the bell start disagreeing
-   * about which rows are big. Optional so an older server (or a failed read)
-   * degrades to "no floor" rather than throwing; see the fallback in isBigRow.
+   * The FIXED guards, served by the API rather than written here as literals, so
+   * a number copied into a .tsx cannot drift from the rule the server actually
+   * enforces. Optional so an older server (or a failed read) simply omits the
+   * paragraph that quotes them rather than throwing.
    */
   guards?: {
-    alert_min_value: number;
-    alert_min_qty: number;
     auto_apply_max_value: number;
     auto_apply_batch_value: number;
     auto_apply_batch_rows: number;
   };
 }
+
+/**
+ * One Action-Inbox bucket, from GET /api/notifications/inbox. Declared here to
+ * READ the digest items the bell already carries; the shape is the server's
+ * (route.ts:38) and is duplicated the same way in NotificationBell and
+ * CaptainAlertsProvider.
+ */
+interface InboxItem { key: string; label: string; count: number; href: string }
+/**
+ * The inbox key prefix the digest bucket pushes: `closing_digest:<count key>`,
+ * where the count key is `date|outlet|rail` — one item per COUNT, not per save.
+ */
+const DIGEST_KEY = 'closing_digest:';
 
 /** How many stacked items the banner names before it rolls up the rest. */
 const STACKED_SHOWN = 8;
@@ -267,47 +288,74 @@ const monthLabel = (iso: string) => {
     .toLocaleDateString('en-IN', { timeZone: 'UTC', month: 'long', year: 'numeric' });
 };
 
-/**
- * The client-side twin of isBigVariance() (lib/variance-approval.ts) — rupee
- * value OR share of the item's own system stock, whichever fires first, both
- * axes off at 0. `ABS(system_stock) > 0` guards the share axis for the same
- * reason it does in SQL: |variance| / 0 is UNDEFINED, not infinite, and
- * treating it as a hit would flag the ordinary first count of every
- * never-stocked item and bury the ones that matter.
+/* ── THE COUNT DIGEST ───────────────────────────────────────────────────────
+ * The bell item `closing_digest:<date|outlet|rail>` lands on THIS page, and the
+ * bell is a 288px dropdown that renders a label and a count pill and nothing
+ * else — so a long digest sentence is a wall of text there and a readable block
+ * here. This is where it is meant to be read.
  *
- * AND THE MATERIALITY FLOOR, which is the half that keeps this readable. A
- * counted 0 is exactly 100% of the book by arithmetic, and two thirds of every
- * real sheet is counted 0 — so an unfloored share axis paints 70-100% of an
- * upload amber and the pill stops meaning anything. A difference has to be
- * worth `alert_min_value` before a percentage of it is worth interrupting
- * someone; for a material with NO price (variance_value ₹0, so rupees cannot
- * speak at all) the floor is `alert_min_qty` PURCHASE units instead.
+ * EVERY FIGURE IS THE SERVER'S OWN TEXT, UNPARSED AND UNFORMATTED.
+ * countDigestLabel() (lib/variance-approval.ts) builds the sentence beside the
+ * numbers it describes, precisely so the bell and the page cannot drift; the
+ * previous occupant of this spot was a client-side twin of a server rule, and
+ * re-deriving anything here would repeat that mistake. So this function does
+ * ONE thing: it cuts the sentence at separators the server itself emitted, to
+ * lay the same words out on their own lines. No number is read, rounded,
+ * re-formatted or recomputed — ₹ grouping, the − sign and the PURCHASE units
+ * are all as the server wrote them.
  *
- * THE FLOOR COMES FROM THE SERVER (`bar.guards`), never from a literal here.
- * This function and bigVarianceCount() must agree on which rows are big or the
- * bell and the page describe different queues.
+ * THE SEPARATORS ARE SAFE BECAUSE THE SERVER MAKES THEM SAFE. Material names,
+ * units and store names are typed by people and could carry a '·' or a ';';
+ * safeText() in countDigestLabel() strips those from every piece of free text
+ * before it enters the sentence. This comment used to claim instead that names
+ * "could not plausibly" carry a separator, which was simply false — a store
+ * named "BAR · FLOOR 2" split the upload's own identity in half on screen.
  *
- * It only ever DECORATES rows already on screen. The badge and the count beside
- * it therefore describe the rows the admin can see, and the copy says so — it
- * is not a claim about the whole queue, which only bigVarianceCount() (server,
- * and the notifications bell, which now reads it) can make.
+ * IT FAILS BACK TO THE WHOLE SENTENCE. Any marker it cannot find simply leaves
+ * that section empty and the remainder rendered verbatim, so a re-worded label
+ * degrades to one paragraph — never to a missing figure.
  */
-function isBigRow(bar: BarPayload | null, r: Approval): boolean {
-  if (!bar) return false;
-  const { alert_value: av, alert_pct: ap } = bar.bar;
-  const val = Math.abs(Number(r.variance_value) || 0);
-  if (av > 0 && val >= av) return true;
-  if (ap <= 0) return false;
-  const sys = Math.abs(Number(r.system_stock) || 0);
-  if (sys <= EPS) return false;
-  if ((Math.abs(Number(r.variance) || 0) / sys) * 100 < ap) return false;
-  // Guards absent (old server / failed read) ⇒ no floor, i.e. exactly the
-  // behaviour before the floor existed. Noisier, never wronger.
-  const minValue = Number(bar.guards?.alert_min_value) || 0;
-  const minQty = Number(bar.guards?.alert_min_qty) || 0;
-  if (val > 0) return minValue <= 0 || val >= minValue;
-  const pq = Math.abs(toPurchaseQty(Number(r.variance) || 0, metaOf(r)));
-  return minQty <= 0 || pq >= minQty;
+const D_LARGEST = ' Largest: ';
+const D_UNVALUED = ' Not valued: ';
+const D_BASIS = ' Valued at last purchase';
+interface DigestParts {
+  /** "Closing count <date> — N counted, M differed" */
+  head: string;
+  /** "total variance −₹6,024", "2 held for approval …", one per line. */
+  lines: string[];
+  /** The three biggest, each already named with quantity and value. */
+  largest: string[];
+  /** Real differences carrying no rupee figure, named with their quantity. */
+  unvalued: string[];
+  /** Which rung each valued line came off, and why the queue's tile differs. */
+  basis: string;
+}
+function splitDigest(label: string): DigestParts {
+  let s = String(label || '').trim();
+  // Cut from the TAIL forwards, so each marker is searched in a string that no
+  // longer contains the sections after it.
+  let basis = '';
+  const b = s.lastIndexOf(D_BASIS);
+  if (b >= 0) { basis = s.slice(b).trim(); s = s.slice(0, b).trim(); }
+  let unvalued: string[] = [];
+  const u = s.indexOf(D_UNVALUED);
+  if (u >= 0) {
+    unvalued = s.slice(u + D_UNVALUED.length)
+      .replace(/\s*—\s*listed by quantity[^.]*\.?\s*$/, '')
+      .replace(/\.\s*$/, '')
+      .split('; ').filter(Boolean);
+    s = s.slice(0, u).trim();
+  }
+  let largest: string[] = [];
+  const l = s.indexOf(D_LARGEST);
+  if (l >= 0) {
+    largest = s.slice(l + D_LARGEST.length).replace(/\.\s*$/, '').split('; ').filter(Boolean);
+    s = s.slice(0, l).trim();
+  }
+  // The head and the totals were joined with ' · ' by the server, and every
+  // piece of free text inside them went through safeText() first.
+  const parts = s.replace(/\.\s*$/, '').split(' · ').map(p => p.trim()).filter(Boolean);
+  return { head: parts[0] || s, lines: parts.slice(1), largest, unvalued, basis };
 }
 
 export default function VarianceApprovalsPage() {
@@ -353,9 +401,18 @@ export default function VarianceApprovalsPage() {
   /* ── The bar ───────────────────────────────────────────────────────────── */
   const [bar, setBar] = useState<BarPayload | null>(null);
   const [barOpen, setBarOpen] = useState(false);
-  const [barDraft, setBarDraft] = useState({ bar_value: '', bar_qty: '', alert_value: '', alert_pct: '' });
+  const [barDraft, setBarDraft] = useState({ bar_value: '', bar_qty: '' });
   const [barBusy, setBarBusy] = useState(false);
   const [barMsg, setBarMsg] = useState<{ tone: 'ok' | 'warn'; text: string } | null>(null);
+
+  /* ── The count digests ─────────────────────────────────────────────────────
+   * Read from the SAME bucket the bell reads — GET /api/notifications/inbox,
+   * items keyed `closing_digest:<date|outlet|rail>` — so the sentence on this
+   * page and the sentence in the bell are one string from one build, not two
+   * renderings of the same idea. Newest first, ONE per count (not per save) and
+   * window-bounded by recentCountDigests(); this page re-orders nothing. */
+  const [digests, setDigests] = useState<InboxItem[]>([]);
+  const [digestsMore, setDigestsMore] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true); setLoadError(null);
@@ -402,12 +459,34 @@ export default function VarianceApprovalsPage() {
       setBarDraft({
         bar_value: String(j.bar.bar_value || 0),
         bar_qty: String(j.bar.bar_qty || 0),
-        alert_value: String(j.bar.alert_value || 0),
-        alert_pct: String(j.bar.alert_pct || 0),
       });
     } catch { /* the bar panel simply does not render */ }
   }, []);
   useEffect(() => { loadBar(); }, [loadBar]);
+
+  /**
+   * The upload digests, straight off the notification bucket.
+   *
+   * A CONVENIENCE, NEVER A GATE — same rule as loadBatches above. A failed read
+   * leaves the card off the page; it cannot block the queue, and nothing here
+   * decides anything. The bucket is admin-gated server-side and this page is
+   * adminOnly, so a non-admin never reaches either.
+   *
+   * SCOPE: the inbox takes no outlet parameter — it reports for the signed-in
+   * outlet, exactly as the variance bucket beside it does. The "All outlets"
+   * tick above widens the QUEUE and not this card, so the card says so when the
+   * tick is on rather than letting the two silently describe different places.
+   */
+  const loadDigests = useCallback(async () => {
+    try {
+      const r = await fetch('/api/notifications/inbox');
+      if (!r.ok) return;
+      const j = await r.json();
+      const items: InboxItem[] = Array.isArray(j?.items) ? j.items : [];
+      setDigests(items.filter(it => typeof it?.key === 'string' && it.key.startsWith(DIGEST_KEY) && !!it.label));
+    } catch { /* the digest card simply does not render */ }
+  }, []);
+  useEffect(() => { loadDigests(); }, [loadDigests]);
 
   const filterActive = !!(from || to || batchId != null || source);
 
@@ -462,8 +541,6 @@ export default function VarianceApprovalsPage() {
     () => batches.reduce((s, b) => s + (Number(b.pending_value) || 0), 0),
     [batches],
   );
-  const bigRows = useMemo(() => visible.filter(r => r.status === 'pending' && isBigRow(bar, r)), [visible, bar]);
-
   const selectableIds = useMemo(
     () => visible.filter(r => r.status === 'pending').map(r => r.id),
     [visible],
@@ -627,8 +704,6 @@ export default function VarianceApprovalsPage() {
         body: {
           bar_value: barDraft.bar_value.trim(),
           bar_qty: barDraft.bar_qty.trim(),
-          alert_value: barDraft.alert_value.trim(),
-          alert_pct: barDraft.alert_pct.trim(),
         },
       });
       const j = await res.json();
@@ -639,8 +714,6 @@ export default function VarianceApprovalsPage() {
       setBarDraft({
         bar_value: String(j.bar.bar_value || 0),
         bar_qty: String(j.bar.bar_qty || 0),
-        alert_value: String(j.bar.alert_value || 0),
-        alert_pct: String(j.bar.alert_pct || 0),
       });
       setBarMsg({ tone: 'ok', text: 'Saved. This applies to counts saved from now on — nothing already decided or waiting here has moved.' });
     } catch (e) { setBarMsg({ tone: 'warn', text: (e as Error).message }); }
@@ -679,7 +752,7 @@ export default function VarianceApprovalsPage() {
               <input type="checkbox" className="accent-[#af4408]" checked={allOutlets} onChange={e => setAllOutlets(e.target.checked)} />
               All outlets
             </label>
-            <button onClick={() => { load(); loadBatches(); loadPreview(); loadBar(); }} disabled={loading}
+            <button onClick={() => { load(); loadBatches(); loadPreview(); loadBar(); loadDigests(); }} disabled={loading}
                     className="inline-flex items-center gap-2 px-3 py-2 border border-[#E8D5C4] rounded-lg text-sm text-[#6B5744] hover:bg-white disabled:opacity-50">
               {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />} Refresh
             </button>
@@ -719,7 +792,7 @@ export default function VarianceApprovalsPage() {
             hour: the decision is about money. ₹ pending is summed from the
             batch index (every row, including the unbatched ones), not from the
             limited slice this page holds, so it is the whole queue. */}
-        <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+        <div className="grid grid-cols-2 lg:grid-cols-3 gap-3">
           <div className="bg-white border border-[#E8D5C4] rounded-xl p-3">
             <div className="text-[10px] uppercase tracking-wide text-[#8B7355]">Waiting for you</div>
             <div className="text-2xl font-bold text-[#af4408]">{num(pendingCount)}</div>
@@ -735,20 +808,129 @@ export default function VarianceApprovalsPage() {
             <div className="text-2xl font-bold text-[#2D1B0E]">{num(batches.filter(b => b.pending > 0).length)}</div>
             <div className="text-[11px] text-[#8B7355]">with something still pending</div>
           </div>
-          {/* The alert is a THRESHOLD ON ROWS ON SCREEN, and says so. Only the
-              server (bigVarianceCount) can speak for the whole queue. */}
-          <div className={`border rounded-xl p-3 ${bigRows.length > 0 ? 'bg-amber-50 border-amber-300' : 'bg-white border-[#E8D5C4]'}`}>
-            <div className="text-[10px] uppercase tracking-wide text-[#8B7355] flex items-center gap-1">
-              <Bell className="w-3 h-3" /> Do not wait for month end
-            </div>
-            <div className={`text-2xl font-bold ${bigRows.length > 0 ? 'text-amber-800' : 'text-[#B8A590]'}`}>
-              {bar?.alerts_enabled ? num(bigRows.length) : '—'}
-            </div>
-            <div className="text-[11px] text-[#8B7355]">
-              {bar?.alerts_enabled ? 'large differences in the rows below' : 'no alert threshold set'}
-            </div>
-          </div>
+          {/* A FOURTH TILE USED TO SIT HERE: "Do not wait for month end", a count
+              of rows a per-row threshold called large. It is gone with the
+              threshold — see the note on BarPayload. The digest below replaces
+              it, and replaces it with something a tile could never be: a
+              statement about ONE COUNT, including the rows that never reach
+              this queue at all. */}
         </div>
+
+        {/* ── THE COUNT DIGEST ──────────────────────────────────────────────
+            WHERE THE BELL ITEM LANDS. `closing_digest:<date|outlet|rail>` links
+            here with count 1, and this is the block it was pointing at: the bell
+            can only render a label and a pill inside a 288px dropdown, so the
+            sentence is legible here and a wall of text there.
+
+            ONE PER COUNT, AND IT ALWAYS FIRES — no threshold decides whether
+            the admin hears anything, only what is named inside. Counts are
+            weekly, this queue is monthly, so the digest is how a week's count
+            gets seen without waiting for month end. One per COUNT and not per
+            save: /eod posts one material per keypad entry, and keying the item
+            on the save turned one evening into eight bell rows.
+
+            EVERY WORD AND EVERY FIGURE IS THE SERVER'S. splitDigest() only lays
+            the sentence out on the separators the server itself wrote; nothing
+            here parses a number, and nothing re-formats one. That is deliberate:
+            the thing this block replaced was a client-side twin of a server
+            rule, and the two disagreed. */}
+        {digests.length > 0 && (
+          <div className="bg-white border border-[#E8D5C4] rounded-xl overflow-hidden">
+            <div className="flex items-center justify-between gap-3 px-4 py-2.5 border-b border-[#E8D5C4] bg-[#FFF8F0]">
+              <span className="inline-flex items-center gap-2 font-semibold text-[#2D1B0E] text-sm">
+                <ClipboardList className="w-4 h-4 text-[#af4408]" />
+                {digests.length === 1 ? 'The last closing count' : 'Closing counts this week'}
+              </span>
+              <span className="text-[11px] text-[#8B7355]">
+                every count, whether or not anything looked unusual
+              </span>
+            </div>
+            <div className="divide-y divide-[#F0E4D6]">
+              {(digestsMore ? digests : digests.slice(0, 1)).map(d => {
+                const p = splitDigest(d.label);
+                return (
+                  <div key={d.key} className="p-4 space-y-2.5">
+                    <div className="text-[13px] font-semibold text-[#2D1B0E] leading-snug">{p.head}</div>
+                    {p.lines.length > 0 && (
+                      <ul className="grid sm:grid-cols-2 gap-x-4 gap-y-1">
+                        {p.lines.map((ln, i) => (
+                          <li key={i} className="text-[12px] text-[#6B5744] leading-snug flex gap-1.5">
+                            <span className="text-[#D4B896] shrink-0">•</span>
+                            <span>{ln}</span>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                    {p.largest.length > 0 && (
+                      <div className="bg-[#FFF1E3] border border-[#E8D5C4] rounded-lg p-2.5">
+                        <div className="text-[10px] uppercase tracking-wide text-[#8B7355] mb-1">Largest differences</div>
+                        <ol className="space-y-0.5">
+                          {p.largest.map((ln, i) => (
+                            <li key={i} className="text-[12px] text-[#2D1B0E] leading-snug flex gap-1.5">
+                              <span className="text-[#B0987F] shrink-0 font-mono text-[11px]">{i + 1}.</span>
+                              <span>{ln}</span>
+                            </li>
+                          ))}
+                        </ol>
+                      </div>
+                    )}
+                    {/* DIFFERENCES WITH NO TRUSTWORTHY RUPEE FIGURE, NAMED.
+                        Two kinds, and the server says which: a material with no
+                        rate at all (193 of 952 have none), and one whose stored
+                        rate is above anything this business has ever paid per
+                        that purchase unit — the mixed-basis fault, which used to
+                        put a 6-gram cocoa difference at the top of the list at
+                        ₹5,079. Both are left OUT of the totals and shown here by
+                        quantity instead of being guessed at. */}
+                    {p.unvalued.length > 0 && (
+                      <div className="border border-dashed border-[#E8D5C4] rounded-lg p-2.5">
+                        <div className="text-[10px] uppercase tracking-wide text-[#8B7355] mb-1">
+                          Real differences, not valued
+                        </div>
+                        <ul className="space-y-0.5">
+                          {p.unvalued.map((ln, i) => (
+                            <li key={i} className="text-[12px] text-[#6B5744] leading-snug flex gap-1.5">
+                              <span className="text-[#D4B896] shrink-0">•</span>
+                              <span>{ln}</span>
+                            </li>
+                          ))}
+                        </ul>
+                        <div className="text-[11px] text-[#8B7355] leading-snug mt-1">
+                          Listed by quantity, which cannot be compared between materials.
+                        </div>
+                      </div>
+                    )}
+                    {/* THE TWO FIGURES ARE ON DIFFERENT BASES AND THE PAGE SAYS
+                        SO. The digest values through the closing-valuation
+                        ladder (last paid price where there is one, average cost
+                        otherwise — the sentence counts which); "Value at stake"
+                        above sums variance_value, which is variance × average
+                        cost. Both are intentional, and two unexplained rupee
+                        totals on one screen is the next bug report. */}
+                    {p.basis && <div className="text-[11px] text-[#8B7355] leading-snug">{p.basis}</div>}
+                    {allOutlets && (
+                      <div className="text-[11px] text-[#8B7355] leading-snug flex gap-1.5">
+                        <Info className="w-3.5 h-3.5 text-[#af4408] shrink-0 mt-px" />
+                        <span>
+                          The queue below is showing <b>all outlets</b>; this count summary is for the outlet you are
+                          signed in to, the same as the bell.
+                        </span>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+            {digests.length > 1 && (
+              <button onClick={() => setDigestsMore(o => !o)}
+                      className="w-full flex items-center justify-center gap-1.5 px-4 py-2 text-[12px] text-[#6B5744] border-t border-[#F0E4D6] hover:bg-[#FFF8F0]">
+                {digestsMore
+                  ? <><ChevronDown className="w-3.5 h-3.5" /> Show only the latest count</>
+                  : <><ChevronRight className="w-3.5 h-3.5" /> {num(digests.length - 1)} earlier count{digests.length - 1 === 1 ? '' : 's'} in the last week</>}
+              </button>
+            )}
+          </div>
+        )}
 
         {/* ── THE BAR (admin settings, on the page it governs) ──────────────
             It lives here rather than on a new /settings route on purpose: the
@@ -762,26 +944,27 @@ export default function VarianceApprovalsPage() {
                   className="w-full flex items-center justify-between gap-3 px-4 py-3 text-left hover:bg-[#FFF8F0]">
             <span className="inline-flex items-center gap-2 font-semibold text-[#2D1B0E] text-sm">
               <SlidersHorizontal className="w-4 h-4 text-[#af4408]" />
-              How big a difference is worth your attention
+              {/* This panel used to introduce TWO settings — the auto-apply bar
+                  and a "tell me today" alert. The alert and both its keys are
+                  gone, so the heading names what is actually left; a heading
+                  about "how big a difference is worth your attention" over a
+                  panel that only decides what applies itself would be the same
+                  drift the alert died of. */}
+              How small a difference may apply itself without you
             </span>
             <span className="flex items-center gap-2 text-[11px] text-[#8B7355]">
               {bar ? (
-                <>
-                  <span className={`px-1.5 py-0.5 rounded border ${bar.auto_apply_enabled ? 'bg-emerald-50 border-emerald-200 text-emerald-800' : 'bg-[#FFF1E3] border-[#E8D5C4]'}`}>
-                    {bar.auto_apply_enabled ? 'bar on' : 'bar off — everything is held'}
-                  </span>
-                  <span className={`px-1.5 py-0.5 rounded border ${bar.alerts_enabled ? 'bg-amber-50 border-amber-200 text-amber-900' : 'bg-[#FFF1E3] border-[#E8D5C4]'}`}>
-                    {bar.alerts_enabled ? 'alerts on' : 'alerts off'}
-                  </span>
-                </>
+                <span className={`px-1.5 py-0.5 rounded border ${bar.auto_apply_enabled ? 'bg-emerald-50 border-emerald-200 text-emerald-800' : 'bg-[#FFF1E3] border-[#E8D5C4]'}`}>
+                  {bar.auto_apply_enabled ? 'bar on' : 'bar off — everything is held'}
+                </span>
               ) : <span>loading…</span>}
               {barOpen ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
             </span>
           </button>
 
           {/* AN UNREADABLE BAR IS NOT AN UNSET BAR. If the read failed, the
-              panel must not render four empty boxes that look like "everything
-              is off" — saving those would write a real 0 to all four keys. */}
+              panel must not render two empty boxes that look like "everything
+              is off" — saving those would write a real 0 to both keys. */}
           {barOpen && !bar && (
             <div className="border-t border-[#E8D5C4] p-4 text-[12px] text-[#6B5744] flex items-center justify-between gap-3">
               <span>The current limits could not be read, so they are not shown — nothing here has changed.</span>
@@ -853,51 +1036,26 @@ export default function VarianceApprovalsPage() {
                 </div>
               </div>
 
-              {/* ── ALERT ──────────────────────────────────────────────── */}
-              <div className="pt-3 border-t border-[#F0E4D6]">
-                <div className="text-[13px] font-semibold text-[#2D1B0E] flex items-center gap-2">
-                  <Bell className="w-4 h-4 text-[#af4408]" /> Big differences: tell me today
-                </div>
-                <p className="text-[12px] text-[#6B5744] mt-1 leading-relaxed">
-                  A difference this large should not wait for the month-end review. It fires on <b>either</b> a big
-                  rupee value <b>or</b> a big share of that item&apos;s own stock — whichever happens first. This is only
-                  a flag: whether the stock moved was already settled by the bar above, and nothing here changes it.
-                  When it is set, it also rings the <b>bell</b> at the top of the screen.
-                </p>
-                {bar.guards && (
-                  <p className="text-[12px] text-[#6B5744] mt-1 leading-relaxed">
-                    <b>The % box has a floor under it, and it has to.</b> A shelf counted as empty is
-                    <b> exactly 100%</b> of the book every single time, and about two thirds of a real closing sheet is
-                    counted 0 — so a bare percentage would flag most of an upload and you would stop reading it. A
-                    difference must also be worth <b>{inr0(bar.guards.alert_min_value)}</b> before a percentage of it
-                    counts as big; for an item with no purchase price at all, <b>{num(bar.guards.alert_min_qty)}</b>{' '}
-                    purchase units instead. The ₹ box has no floor — a rupee threshold is already a size.
-                  </p>
-                )}
-                <p className="text-[12px] text-[#6B5744] mt-1 leading-relaxed">
-                  Suggested starting point on your own sheets: <b>₹25,000</b> and <b>50%</b>. A typical counted line on
-                  the 1-Aug closing was worth ₹907 and nine in ten were under ₹6,480, so ₹25,000 is a genuinely unusual
-                  loss rather than a weekly one.
-                </p>
-                <div className="grid sm:grid-cols-2 gap-3 mt-3">
-                  <label className="block">
-                    <span className="text-[11px] font-medium text-[#6B5744]">Alert at — ₹ per item</span>
-                    <input type="number" min="0" step="1" value={barDraft.alert_value}
-                           onChange={e => setBarDraft(d => ({ ...d, alert_value: e.target.value }))}
-                           className={`${fieldCls} w-full mt-1 font-mono text-right`} />
-                    <span className="block text-[10px] text-[#8B7355] mt-0.5">0 = off</span>
-                  </label>
-                  <label className="block">
-                    <span className="text-[11px] font-medium text-[#6B5744]">Alert at — % of that item&apos;s stock</span>
-                    <input type="number" min="0" step="1" value={barDraft.alert_pct}
-                           onChange={e => setBarDraft(d => ({ ...d, alert_pct: e.target.value }))}
-                           className={`${fieldCls} w-full mt-1 font-mono text-right`} />
-                    <span className="block text-[10px] text-[#8B7355] mt-0.5">
-                      0 = off · items the book says we hold none of cannot fire on this axis (no share to measure)
-                    </span>
-                  </label>
-                </div>
-              </div>
+              {/* ── THERE IS NOTHING ELSE TO SET, AND THAT IS THE CHANGE ──────
+                  A second section sat here: "Big differences: tell me today",
+                  two boxes (₹ per item, % of that item's own stock) writing
+                  closing_variance_alert_value / _alert_pct, feeding a per-row
+                  "Large — look now" pill and a bell count.
+                  BOTH KEYS AND BOTH BOXES ARE DELETED. At ₹5,000 / 25% the rule
+                  fired on 390 of 451 rows of the owner's own incident sheet
+                  (86%); on the 208 genuine rows with the mistaken zeros removed
+                  it still fired on 147, and even ₹50,000 / 100% fired on 33. The
+                  cause is not a mis-tuned number — a shelf counted empty is
+                  100% of the book BY DEFINITION and herbs, garnishes and
+                  perishables run out every week, so the share axis is noise by
+                  construction and no rupee bar fits a per-line distribution
+                  running ₹432 at p25 to ₹1.31 lakh at max.
+                  What replaced it needs no setting at all: ONE digest per
+                  upload, unconditional, rendered at the top of this page and
+                  pushed once to the bell. Nothing tunes it and nothing mutes it,
+                  which is the point — a threshold decided WHETHER he heard
+                  anything, and this only decides what is named inside.
+                  DO NOT RE-ADD A THRESHOLD HERE. */}
 
               {/* THE SENTENCE THE OWNER ASKED FOR, VERBATIM IN SUBSTANCE.
                   varianceBar() is read once per save, for the count being
@@ -1162,7 +1320,6 @@ export default function VarianceApprovalsPage() {
               const shortage = row.variance < 0;
               const decided = row.status !== 'pending';
               const auto = Number(row.auto_applied) === 1;
-              const big = row.status === 'pending' && isBigRow(bar, row);
               const meta = metaOf(row);
               const pu = puOf(row);
               /** Recipe qty → the purchase-unit string this page prints. */
@@ -1197,7 +1354,13 @@ export default function VarianceApprovalsPage() {
               const useLive = !decided && projected !== null;
               const moved = live !== null && Math.abs(live - row.system_stock) > EPS;
               return (
-                <div key={row.id} className={`bg-white border rounded-xl p-4 shadow-sm ${big ? 'border-amber-300 ring-1 ring-amber-200' : 'border-[#E8D5C4]'}`}>
+                /* ONE AMBER MEANING PER ROW. The card used to take an amber ring
+                   when a per-row threshold called it "large" — the same palette
+                   the Superseded pill uses for a DEAD row, so an urgent card and
+                   a stale one were indistinguishable at a glance. The threshold
+                   is gone; amber on this page now means exactly one thing, and
+                   it is the supersede warning. */
+                <div key={row.id} className="bg-white border border-[#E8D5C4] rounded-xl p-4 shadow-sm">
                   <div className="flex flex-wrap items-start justify-between gap-3">
                     <div className="min-w-0 flex gap-2.5">
                       {/* Selection is PENDING-only, because reject is the only
@@ -1223,11 +1386,15 @@ export default function VarianceApprovalsPage() {
                               <Layers className="w-3 h-3" /> Superseded
                             </span>
                           )}
-                          {big && (
-                            <span className="inline-flex items-center gap-1 text-[11px] font-medium px-1.5 py-0.5 rounded border bg-amber-100 border-amber-300 text-amber-900">
-                              <Bell className="w-3 h-3" /> Large — look now
-                            </span>
-                          )}
+                          {/* A "Large — look now" PILL USED TO SIT HERE and is
+                              deliberately not replaced. It named no axis, no
+                              figure and no action, it shared this exact amber
+                              with the Superseded pill beside it, and it fired on
+                              86% of the owner's own sheet. What it was reaching
+                              for — "which of these actually matter" — is
+                              answered by the digest at the top of the page,
+                              which names the three biggest with their quantity
+                              and value instead of colouring hundreds of rows. */}
                           {/* AUTO-APPLIED. `reviewed_by` on these rows is the
                               literal string "system:auto-apply", so the pill has
                               to be read before the by-line below is believed. */}

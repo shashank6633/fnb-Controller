@@ -3,7 +3,7 @@ import { getCurrentOutletId, getCurrentUser } from '@/lib/auth';
 import { allowedDeptSetExpanded, canSeeAllDeptStock } from '@/lib/dept-stock';
 import { materialStoreId, getStoreById } from '@/lib/store-engine';
 import {
-  recordCountVariance, readPhysicalCount, zeroPatternGuard,
+  recordCountVariance, recordCountDigest, readPhysicalCount, zeroPatternGuard,
 } from '@/lib/variance-approval';
 import { rateMap, valueCount, valueSemiCount } from '@/lib/closing-valuation';
 import { packFactor, toPurchaseQty, type PackMeta } from '@/lib/pack-units';
@@ -952,7 +952,7 @@ export async function POST(request: Request) {
     // undo a bad upload in one call.
     const batchId = generateId();
     const batchLabel = `All-departments CSV ${date}`;
-    let saved = 0, savedSemi = 0, pending = 0, applied = 0, autoApplied = 0, alerts = 0;
+    let saved = 0, savedSemi = 0, pending = 0, applied = 0, autoApplied = 0;
     // Department rows are never parked (see recordCountVariance's header): they
     // moved that department's balance at insert time, so they are counted here
     // and NOT into `pending`, which used to claim a hold that did not exist.
@@ -1026,7 +1026,6 @@ export async function POST(request: Request) {
           batch_label: batchLabel,
           pack: m as PackMeta,
         });
-        if (decided.alert) alerts++;
         deptImmediate = true;
         if (variance !== 0) {
           if (decided.outcome === 'applied') { applied++; if (decided.auto_applied) autoApplied++; }
@@ -1064,10 +1063,52 @@ export async function POST(request: Request) {
 
     run();
 
+    /* ══════════════════════════════════════════════════════════════════════
+     * THE COUNT DIGEST — fired here, at the boundary of this upload.
+     * ══════════════════════════════════════════════════════════════════════
+     * AFTER the transaction, never inside it, and it swallows everything it can
+     * throw: a notification may not fail or roll back the count it is
+     * announcing. recordCountDigest() is try/catch'd end to end and returns null
+     * on any failure; ignoring the return value is correct.
+     *
+     * ALWAYS FIRES, on every upload that counted at least one line — no
+     * threshold decides WHETHER the owner hears about a count, only what is
+     * named inside the sentence. An upload that counted nothing writes no
+     * digest, because there is no count to digest.
+     *
+     * THIS IS THE ROUTE THE INCIDENT SHEET CAME THROUGH, and every row it
+     * writes is a DEPARTMENT row, which raises no approval at all. The digest
+     * reads those from `closing_stock` (date + non-empty department_id) and
+     * reports how many lines were counted on that rail — deliberately with NO
+     * rupee figure, because a department row's stored variance is measured
+     * against the CENTRAL pool (the "KNOWN LIMITATION" both writers carry), so
+     * a money total built from it would describe nothing. The sentence says so
+     * rather than leaving the absence to be read as an omission.
+     * ────────────────────────────────────────────────────────────────────── */
+    // `saved` is the RAW line count, deliberately not `saved + savedSemi`. A
+    // sub-recipe row lands in closing_stock_semi, has no system balance and can
+    // never appear in the "differed" half of the digest; counting it in the
+    // denominator would inflate a total against a numerator it can never reach.
+    // The semi rows are still reported in this response, and on the closing
+    // sheet, as themselves.
+    recordCountDigest(db, {
+      date,
+      rail: 'central',
+      // What THIS upload wrote — the fire/don't-fire gate only. The reported
+      // "counted" is derived from closing_stock for the date.
+      saved,
+      outlet_id: outletId,
+      actor_email: me.email || '',
+    });
+
     /* BLIND COUNTS. This route is open to anyone with a department assigned
-     * (resolveScope), and `pending` / `applied` / `alerts` answer "did my count
-     * match the system?" — a one-row CSV makes that a clean oracle, and a few
-     * bisecting uploads recover current_stock. Admins get the figures; everyone
+     * (resolveScope), and `pending` / `applied` answer "did my count match the
+     * system?" — a one-row CSV makes that a clean oracle, and a few bisecting
+     * uploads recover current_stock. (An `alerts` counter used to be blinded
+     * here too; it is DELETED, not nulled, and the count digest that replaced
+     * it is written to the admin-only audit trail, never to this response. Do
+     * not re-add a variance-derived field.)
+     * Admins get the figures; everyone
      * else gets nulls and the counts of what they actually uploaded. A caller
      * must NOT render the null branch as "all counts reconcile". */
     const blind = me.role !== 'admin';
@@ -1080,7 +1121,6 @@ export async function POST(request: Request) {
       // ── Additive (2026-08).
       applied: blind ? null : applied,
       auto_applied: blind ? null : autoApplied,
-      alerts: blind ? null : alerts,
       // Blinded with the rest — it counts only rows that DIFFERED. The rail
       // fact next to it is not variance-dependent and stays whole for everyone.
       dept_anchored: blind ? null : deptAnchored,

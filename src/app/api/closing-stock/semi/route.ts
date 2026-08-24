@@ -374,6 +374,26 @@ export async function POST(request: Request) {
 
     record();
 
+    /* NO UPLOAD DIGEST HERE, AND THAT IS NOT AN OVERSIGHT.
+     * ────────────────────────────────────────────────────
+     * The digest (section 6 of src/lib/variance-approval.ts) is derived from
+     * `variance_approvals` rows carrying a batch_id. This route raises NONE: a
+     * sub-recipe has no system balance, so a semi count produces no variance, no
+     * approval row, and no batch id at all — there is literally nothing for a
+     * digest to report but the line count.
+     *
+     * Do NOT "fix" that by minting a batch id here. It would put an item in the
+     * owner's bell that says "N counted, nothing differed" every single time, by
+     * construction and for ever — the exact wallpaper the digest was built to
+     * replace. The semi half of a sheet is already reported in this response and
+     * on the closing sheet itself.
+     *
+     * /closing-stock posts ONE sheet as TWO POSTs (raw materials to ../route.ts,
+     * sub-recipes here), and the raw half raises the digest for that sheet. It
+     * counts raw lines only — see the note beside recordCountDigest in
+     * ../dept-sheet/import/route.ts for why the semi lines stay out of that
+     * denominator. */
+
     return Response.json(results);
   } catch (e: any) {
     console.error('[closing-stock/semi POST]', e);

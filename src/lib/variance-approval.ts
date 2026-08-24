@@ -38,11 +38,15 @@
  * case; it is the reason this file grew a second guard.
  */
 import type Database from 'better-sqlite3';
-import { generateId } from '@/lib/db';
+import { generateId, logAuditEvent } from '@/lib/db';
 import { qcHoldBlockForCount } from '@/lib/grn-qc';
 import { postLedger, isStoreMappedMaterial } from '@/lib/store-engine';
 import { deptOnHand, postDeptLedger } from '@/lib/dept-ledger';
 import { packFactor, type PackMeta } from '@/lib/pack-units';
+// The digest (section 6) values EVERY figure through this ladder — last
+// purchase, else average cost, else unpriced — never raw average_price. See the
+// box on buildCountDigest for what the ladder does and does NOT repair.
+import { rateMap, valueCount, type RateSource } from '@/lib/closing-valuation';
 import {
   getCentralStoreCutoverDate,
   getCentralStoreCutoverCommittedAt,
@@ -281,28 +285,28 @@ export function zeroPatternGuard(counts: number[]): ZeroPatternVerdict {
  * number. That is deliberate: this ships onto a live queue of 1,472 rows.
  *
  * HARD CLAMPS, NOT JUST DEFAULTS — AND A CEILING BENEATH THEM. The generic
- * PUT /api/settings is manager-or-admin; these four keys are now registered in
+ * PUT /api/settings is manager-or-admin; these two keys are now registered in
  * its KEY_POLICY table as write:'admin' (src/app/api/settings/route.ts), so the
  * self-lift door is shut. The clamps below are the braces to that belt, and
  * AUTO_APPLY_HARD_VALUE_CEILING is a third layer, because the clamps alone were
- * NOT enough: they bound quantity and percentage, never money, so a qty-only
- * bar auto-applied ₹1.27 lakh on one bottle line. See that constant.
+ * NOT enough: they bound quantity, never money, so a qty-only bar auto-applied
+ * ₹1.27 lakh on one bottle line. See that constant.
+ *
+ * TWO KEYS, NOT FOUR. `closing_variance_alert_value` / `_alert_pct` — the
+ * per-row "large variance" alert — were DELETED in the digest build. They are
+ * not deprecated, not defaulted to 0, not hidden: nothing reads them and nothing
+ * can set them. See section 6 for what replaced them and why a threshold could
+ * not work here.
  */
 export const VARIANCE_BAR_KEYS = {
   /** ₹ of variance value at or under which a count applies itself. 0 = off. */
   value: 'closing_variance_bar_value',
   /** PURCHASE-unit variance at or under which a count applies itself. 0 = off. */
   qty: 'closing_variance_bar_qty',
-  /** ₹ of variance value at or over which the immediate alert fires. 0 = off. */
-  alertValue: 'closing_variance_alert_value',
-  /** % of the item's own system stock at or over which the alert fires. 0 = off. */
-  alertPct: 'closing_variance_alert_pct',
 } as const;
 
 export const VARIANCE_BAR_MAX_VALUE = 5000;   // ₹ — ceiling on the auto-apply bar
 export const VARIANCE_BAR_MAX_QTY = 100;      // purchase units — ditto
-export const VARIANCE_ALERT_MAX_VALUE = 10_000_000;
-export const VARIANCE_ALERT_MAX_PCT = 1000;
 
 /**
  * THE HARD RUPEE CEILING ON ANY AUTO-APPLY, whatever the bar says.
@@ -326,46 +330,6 @@ export const VARIANCE_ALERT_MAX_PCT = 1000;
  * the figure in front of them. It constrains the machine.
  */
 export const AUTO_APPLY_HARD_VALUE_CEILING = VARIANCE_BAR_MAX_VALUE;
-
-/* ── The materiality floor under the ALERT's share axis ──────────────────────
- * MEASURED ON THE OWNER'S OWN SHEETS (~/Downloads/closing-stock-history-
- * 2026-07-05_2026-08-03.csv, the 2026-08-01 closing: 1,026 counted lines, 311
- * of them holding stock, with real per-line rates):
- *
- *   per-line stock value   p25 ₹428 · p50 ₹907 · p75 ₹2,550 · p90 ₹6,480 ·
- *                          p95 ₹13,000 · max ₹131,425
- *   per-line stock qty     p50 5 purchase units · 48% hold ≤ 4 · 75% hold ≤ 10
- *
- * Two consequences, and they are why a percentage ALONE cannot be an alert:
- *
- *   1. A COUNTED 0 IS ALWAYS EXACTLY 100%. variance = 0 − system, so
- *      |variance|/|system| = 1 by arithmetic, on every "shelf is empty" line.
- *      Two thirds of every real sheet is counted 0 (715 of 1,026 on 2026-08-01;
- *      793 of 1,033 in the incident), so an unfloored share axis fires on
- *      roughly 70-100% of an upload and is muted inside one cycle.
- *   2. ONE PURCHASE UNIT OF MISCOUNT IS ≥25% FOR HALF THE CATALOGUE, because
- *      half the catalogue holds ≤4 purchase units. That is the rounding case,
- *      not an emergency.
- *
- * The floor is a VALUE floor: a difference has to be worth ALERT_MIN_VALUE
- * before a percentage of it means anything. Simulated against the same sheet,
- * a total-vanish count on every stocked line: 311 fire unfloored, 43 fire at
- * ₹5,000 (14%). On a 1-purchase-unit miscount of every line: 311 unfloored,
- * ONE at ₹5,000. That is the difference between a bell and wallpaper.
- *
- * ALERT_MIN_QTY is the stand-in for materials with NO price at all
- * (average_price 0 ⇒ variance_value ₹0, so the value floor would suppress them
- * for ever). It is not a second axis — it is the same floor, measured in the
- * only unit those rows have. Purchase units, per the owner's unit rule.
- *
- * DELIBERATELY CONSTANTS, NOT SETTINGS KEYS. A floor can only ever SUPPRESS an
- * alert, never raise one, so shipping it armed is safe in a way a bar is not;
- * and a tunable with no UI is a trap (the admin panel on /variance-approvals
- * shows the four bar keys and would not show these). If they need tuning, that
- * is a settings key plus a field on that panel, together.
- */
-export const ALERT_MIN_VALUE = 5000;   // ₹ — under this, a percentage is noise
-export const ALERT_MIN_QTY = 10;       // purchase units — for UNPRICED materials
 
 /* ── THE CIRCUIT-BREAKER ON ONE UPLOAD ───────────────────────────────────────
  * Every control above is PER LINE. Nothing bounded a SUBMIT, and a submit is
@@ -394,27 +358,11 @@ export const ALERT_MIN_QTY = 10;       // purchase units — for UNPRICED materi
 export const AUTO_APPLY_BATCH_VALUE = 25_000;  // ₹ of auto-applied |variance| per upload
 export const AUTO_APPLY_BATCH_ROWS = 200;      // lines auto-applied per upload
 
-/**
- * How long an AUTO-APPLIED row stays in the immediate alert.
- *
- * A pending row leaves the alert when the admin DECIDES it — approve or reject,
- * either way an action ends it. An auto-applied row has no decision left to
- * make: it is already `approved`, so with no window it would sit in the alert
- * for ever and the number could only climb. One week matches the upload cadence
- * — an auto-applied difference nobody looked at inside a week is history, and
- * it is still in the queue's approved tab and on every variance report.
- */
-export const ALERT_AUTO_APPLIED_WINDOW_DAYS = 7;
-
 export interface VarianceBar {
   /** ₹. 0 = this axis is off. */
   value: number;
   /** Purchase units. 0 = this axis is off. */
   qty: number;
-  /** ₹. 0 = the value alert is off. */
-  alertValue: number;
-  /** Percent of the item's system stock. 0 = the share alert is off. */
-  alertPct: number;
 }
 
 /** 0 for anything unreadable, negative, or non-finite; clamped to `max`. */
@@ -438,65 +386,8 @@ export function varianceBar(db: Database.Database): VarianceBar {
   return {
     value: tunable(db, VARIANCE_BAR_KEYS.value, VARIANCE_BAR_MAX_VALUE),
     qty: tunable(db, VARIANCE_BAR_KEYS.qty, VARIANCE_BAR_MAX_QTY),
-    alertValue: tunable(db, VARIANCE_BAR_KEYS.alertValue, VARIANCE_ALERT_MAX_VALUE),
-    alertPct: tunable(db, VARIANCE_BAR_KEYS.alertPct, VARIANCE_ALERT_MAX_PCT),
   };
 }
-
-/**
- * THE IMMEDIATE ALERT — rupee value OR share of that item's own stock,
- * WHICHEVER FIRES FIRST. Both tunable, both off by default.
- *
- * THIS IS AN ALERT, NEVER A SECOND GATE. Whether the stock moved was already
- * decided by the bar above; this only decides whether the admin should be told
- * TODAY instead of at month end. Nothing downstream of it writes stock.
- *
- * The share axis needs a denominator, and `system_stock` is 0 on a great many
- * live materials. `|variance| / 0` is not "infinitely big", it is UNDEFINED —
- * and treating it as a hit would fire on the ordinary first count of every
- * never-stocked item and bury the real ones. When the book says nothing, the
- * rupee axis is the one that can speak, so the share axis abstains.
- *
- * AND IT ALSO NEEDS A FLOOR. A percentage has no magnitude of its own: a
- * counted 0 is exactly 100% by arithmetic, and one purchase unit is ≥25% for
- * half this catalogue. ALERT_MIN_VALUE / ALERT_MIN_QTY are what stop the share
- * axis firing on 70-100% of every upload — see those constants for the measured
- * numbers. The RUPEE axis carries no floor because a rupee threshold IS a
- * magnitude; floor-ing it would just be a second, quieter threshold.
- *
- * `purchaseQty` is the variance in PURCHASE units (owner rule). Omitted, the
- * floor falls back to recipe units, which for a packed material is a BIGGER
- * number and therefore the noisier direction — pass it wherever it is known.
- */
-export function isBigVariance(
-  bar: VarianceBar, variance: number, varianceValue: number, systemStock: number,
-  purchaseQty?: number,
-): boolean {
-  const val = Math.abs(Number(varianceValue) || 0);
-  if (bar.alertValue > 0 && val >= bar.alertValue) return true;
-  if (bar.alertPct > 0) {
-    const base = Math.abs(Number(systemStock) || 0);
-    if (base <= 0) return false;
-    if ((Math.abs(Number(variance) || 0) / base) * 100 < bar.alertPct) return false;
-    // THE MATERIALITY FLOOR. Value where there is a value; quantity only where
-    // the material is unpriced and rupees genuinely cannot speak.
-    if (val > 0) return val >= ALERT_MIN_VALUE;
-    const qty = Math.abs(Number(purchaseQty ?? variance) || 0);
-    return qty >= ALERT_MIN_QTY;
-  }
-  return false;
-}
-
-/**
- * packFactor() as SQL, against a `raw_materials` alias. The queue-wide alert
- * has to apply the SAME purchase-unit floor as the per-save one, and it cannot
- * call packFactor() on a thousand rows one at a time. Kept beside its JS twin
- * so the two are read together; if pack-units.ts's rule changes, change both.
- */
-const PACK_FACTOR_SQL = (rm: string) => `
-  CASE WHEN ${rm}.pack_size > 1
-         AND LOWER(TRIM(${rm}.unit)) <> LOWER(TRIM(COALESCE(NULLIF(${rm}.purchase_unit, ''), ${rm}.unit)))
-       THEN ${rm}.pack_size ELSE 1 END`;
 
 /**
  * ₹ value of a variance, in the ONE basis this table has always stored:
@@ -724,8 +615,6 @@ export interface RecordVarianceResult {
   auto_applied: boolean;
   /** true on a department row — its balance already moved at save. See above. */
   dept_anchored: boolean;
-  /** true when the immediate-alert thresholds fired for this row. */
-  alert: boolean;
 }
 
 export function recordCountVariance(
@@ -743,7 +632,6 @@ export function recordCountVariance(
     dept_anchored: isDept,
     apply_error: null as string | null,
     auto_applied: false,
-    alert: false,
   };
 
   /* ── THE DEPARTMENT RAIL: NOTHING IS PARKED, BECAUSE NOTHING CAN BE HELD ──
@@ -767,8 +655,10 @@ export function recordCountVariance(
    * with no audit row, and clearing that queue is his to do (bulk reject, which
    * records status='rejected' and a reason). Do not "tidy" this.
    *
-   * `alert` is computed identically to every other rail and is deliberately
-   * unchanged here — the alert thresholds and their wiring are owned elsewhere.
+   * NOTHING IS REPORTED PER ROW FROM HERE. The per-row "large variance" alert
+   * that used to be computed on this rail is gone (section 6): every row this
+   * save writes, on every rail, is reported ONCE in the count digest that the
+   * calling route raises at its boundary.
    * ──────────────────────────────────────────────────────────────────────── */
   if (isDept) {
     if (variance === 0) {
@@ -787,9 +677,6 @@ export function recordCountVariance(
       // 900-row department sheet would bury the real errors. The rail-level
       // fact belongs in ONE sentence per save, off `dept_anchored`.
       apply_error: null,
-      alert: isBigVariance(
-        varianceBar(db), variance, deptValue, Number(inp.system_stock) || 0, purchaseQty,
-      ),
     };
   }
 
@@ -801,7 +688,6 @@ export function recordCountVariance(
 
   const { value: varianceValue, avgPrice } = varianceRupees(db, inp.material_id, variance);
   const bar = varianceBar(db);
-  const alert = isBigVariance(bar, variance, varianceValue, Number(inp.system_stock) || 0, purchaseQty);
 
   // ── UNDER THE BAR? Both CONFIGURED axes must agree that it is small. ──────
   // `priced` is the unvalued-item trap: average_price 0 makes variance_value ₹0,
@@ -855,19 +741,19 @@ export function recordCountVariance(
       if (res.ok) {
         return {
           ...base, outcome: 'applied', approval_id: approvalId,
-          variance_value: varianceValue, auto_applied: !forced, alert,
+          variance_value: varianceValue, auto_applied: !forced,
         };
       }
       return {
         ...base, outcome: 'held', approval_id: approvalId, variance_value: varianceValue,
-        apply_error: res.error || 'approval refused', alert,
+        apply_error: res.error || 'approval refused',
       };
     } catch (e) {
       // approveVariance rolls its own SAVEPOINT back; the saved count row
       // survives and the approval simply stays pending.
       return {
         ...base, outcome: 'held', approval_id: approvalId, variance_value: varianceValue,
-        apply_error: (e as Error)?.message || 'approval failed', alert,
+        apply_error: (e as Error)?.message || 'approval failed',
       };
     }
   }
@@ -877,7 +763,7 @@ export function recordCountVariance(
   // with no explanation and concludes the bar is broken.
   const ceilingHeld = !isDept && !forced && anyAxis && valueOk && qtyOk && !ceilingOk;
   return {
-    ...base, outcome: 'held', approval_id: approvalId, variance_value: varianceValue, alert,
+    ...base, outcome: 'held', approval_id: approvalId, variance_value: varianceValue,
     apply_error: breaker || (ceilingHeld
       ? `this difference is worth ₹${Math.abs(varianceValue)}, over the ₹${AUTO_APPLY_HARD_VALUE_CEILING} ` +
         `ceiling on anything that may apply itself. It passed the bar you set, but nothing this large moves ` +
@@ -2133,113 +2019,925 @@ export function listCountBatches(
 }
 
 /* ════════════════════════════════════════════════════════════════════════════
- * 6. THE IMMEDIATE ALERT — "this one should not wait for month end".
+ * 6. THE COUNT DIGEST — one notification per count, and it always fires.
  * ═══════════════════════════════════════════════════════════════════════════
- * AN ALERT, NEVER A SECOND GATE. Whether the stock moved was already decided by
- * the bar at save time; this only decides whether the admin hears about it
- * TODAY. Nothing below writes anything.
+ * WHAT THIS REPLACED, AND WHY A THRESHOLD COULD NOT WORK. A per-row "large
+ * variance" alert (two settings keys, a rupee axis and a share-of-stock axis)
+ * shipped DORMANT and was then measured against the owner's own incident sheet.
+ * At ₹5,000 / 25% it fired on 390 of 451 rows (86%), 240 of them on the share
+ * axis alone; with the mistaken zeros removed (208 genuine rows) it still fired
+ * on 147; even ₹50,000 / 100% fired on 33. The median share across queue rows
+ * was 100.0%.
  *
- * The predicate is the SQL twin of isBigVariance() and must stay in step with
- * it: rupee value OR share of the item's own system stock, whichever fires
- * first, both tunable, both off (0) by default, and the share axis carrying the
- * SAME materiality floor (ALERT_MIN_VALUE / ALERT_MIN_QTY). `ABS(va.system_stock)
- * > 0` guards the denominator — see isBigVariance for why an undefined share
- * must not count as an infinite one. Both halves live in bigVarianceWhere()
- * below so the badge and the list cannot drift apart.
+ * That is STRUCTURAL, not a tuning miss. "Counted zero against a small book
+ * stock" is 100% BY DEFINITION, and in a restaurant it is normal — herbs,
+ * garnishes and perishables run out. Real rows that fired: MENTHI LEAF ₹80,
+ * RAW BANANA ₹32, one packet of PAV BHAJI MASALA ₹48. A rupee bar cannot rescue
+ * it either: on the 2026-08-01 production closing (311 stocked lines) per-line
+ * value runs p25 ₹432 · p50 ₹920 · p75 ₹2,581 · p90 ₹6,480 · max ₹131,425 — a
+ * 300:1 spread, so ₹5,000 sits ABOVE THE WHOLE VALUE of ~90% of counted items
+ * while ₹1,000 fires whenever half a median item moves.
  *
- * OFF BY DEFAULT IS LOAD-BEARING HERE. This ships onto a live queue of 1,472
- * pending rows; any non-zero shipped default would badge hundreds of historical
- * counts on the first boot after deploy, which is how a bell stops being read.
- * The FLOORS ship armed and the thresholds do not, because a floor can only
- * ever suppress.
+ * THE SHARE AXIS IS GONE ENTIRELY. It was the noise source, and in a digest the
+ * TOTAL does its job better than a percentage ever did.
  *
- * WHICH ROWS THE ALERT CAN SEE — and the two corrections here:
+ * ── THE SHAPE ───────────────────────────────────────────────────────────────
+ * ONE item per COUNT, ALWAYS fired, never conditional on any threshold. That
+ * removes the tuning problem outright: no bar decides WHETHER he hears anything,
+ * only what is called out inside. Counts are WEEKLY and approvals MONTHLY, so
+ * once a week is a rhythm he can keep, and a predictable digest cannot become
+ * the thing he learns to dismiss.
  *
- *   · SUPERSEDED ROWS ARE EXCLUDED. Counts are weekly and approvals monthly, so
- *     one genuine shortage counted four Fridays running raised FOUR pending
- *     rows, three of which approveVariance refuses as superseded. The alert
- *     counted all four, so its number could only climb through the month and
- *     could not fall except by review — the shape of a badge people learn to
- *     ignore. Only the newest count per item is actionable, so only it alerts.
+ * AUTO-APPLIED ROWS ARE IN IT, MARKED AS SUCH. Those are the rows where stock
+ * moved with nobody in the loop, so they are the most worth seeing — but they
+ * are INFORMATION, NOT DECISIONS: a line in a sentence, never a queue. (They are
+ * dormant today because both bar axes default to 0; the line must still be
+ * correct the day one is armed. Nothing in this section reads or writes stock.)
  *
- *   · AUTO-APPLIED ROWS ARE INCLUDED, for a window. `alert` was computed at
- *     save time on EVERY outcome, but every surface filtered `status='pending'`
- *     — and a row the bar applied is `approved`. So the one class of row where
- *     stock moved with NOBODY in the loop was precisely the class whose alert
- *     was unreachable. Measured: 10 of 19 auto-applied rows raised an alert
- *     that no query could return. They are visible for
- *     ALERT_AUTO_APPLIED_WINDOW_DAYS and then age out — see that constant.
- *     `auto_applied = 1` only, never a human-approved row: a person already
- *     looked at those.
+ * ╔══════════════════════════════════════════════════════════════════════════╗
+ * ║ THE UNIT IS THE COUNT — (date, outlet, rail) — AND NOT THE HTTP POST.    ║
+ * ╚══════════════════════════════════════════════════════════════════════════╝
+ * The first build keyed the item on the save's `batch_id`, on the stated ground
+ * that "every door here is a whole-sheet POST behind an explicit Save click, so
+ * a digest per keystroke is not reachable". THAT WAS FALSE, and it was measured:
+ *
+ *   · /eod (src/app/eod/page.tsx) posts ONE material per request from a keypad
+ *     and advances. 40 keypad entries wrote 40 batches ⇒ 40 audit rows ⇒ the
+ *     bell showed its cap of 8, badge +8, each reading "1 counted, nothing
+ *     differed" — and after 12 such saves the genuine 1,033-line weekly sheet
+ *     had been pushed out of the bell entirely. The dashboard's Daily-Tracked
+ *     widget (src/app/page.tsx) has a Save button PER ROW and does the same.
+ *     /eod is not even admin-only, so a staff counter flooded the owner's bell.
+ *   · The main closing sheet submits only the ACTIVE department
+ *     (closing-stock/page.tsx), so a 13-department count was 13 items.
+ *   · A same-date RE-SAVE double-counted the money. upsertVarianceApproval()
+ *     MOVES a pending row onto the newer batch (`batch_id = ?` on the existing
+ *     id) rather than duplicating it, so the older frozen digest went on
+ *     claiming rows that no longer belonged to it: two live bell lines each
+ *     reporting the same "5 held −₹498", over a queue holding one set of 5. The
+ *     supersede filter cannot see it — both counts share a DATE, and supersede
+ *     is a strictly-newer-date-or-created_at test.
+ *
+ * None of that is tunable, and none of it should be met with a threshold. It is
+ * fixed at the DEFINITION: the item is keyed on the count itself.
+ *   · every save for one count date rewrites ONE key ⇒ 40 keypad entries, 13
+ *     department saves and a re-upload are all ONE bell item;
+ *   · the figures are REBUILT from the live rows for that date, so nothing is
+ *     ever summed across saves and a moved row is counted exactly once;
+ *   · the two RAILS stay apart (central raw materials vs the TGBCL store
+ *     ledger) because they are different stock pools with different tables, and
+ *     store_locations carries no outlet — merging them would put an
+ *     un-outlet-able figure inside an outlet-scoped sentence.
+ *
+ * WHAT THIS COSTS, STATED PLAINLY. The bell item is per-device acked by KEY at
+ * its COUNT (notif-ack), and this item's count is permanently 1 — so once the
+ * admin acks today's count, later saves for the SAME date update the sentence
+ * silently instead of re-poking him. That is the right trade for the weekly
+ * ritual (one sheet, one item, seen once) and it is the only way /eod does not
+ * ring a bell forty times. The current sentence is always on /variance-approvals.
+ *
+ * ── REBUILT AT EVERY SAVE, NEVER ON A POLL ──────────────────────────────────
+ * buildCountDigest() runs at a SAVE boundary only, and recordCountDigest()
+ * writes the finished payload to `audit_events` (entity_type 'count_day',
+ * entity_id = the count key). The bell reads back the NEWEST row per key. Two
+ * reasons, both load-bearing:
+ *   1. VALUATION IS NOT FREE. Every figure goes through the closing-valuation
+ *      ladder, which is a per-row rate resolution over every differing line. The
+ *      bell polls; doing that on every poll would be several hundred rate
+ *      lookups a minute for a number that changes only when somebody counts.
+ *   2. IT IS A STATEMENT ABOUT A COUNT, not a live queue count. The LIVE queue
+ *      number is the `variance_approvals` bucket sitting right above it in the
+ *      same bell, computed live, and it is the one that must fall as the queue
+ *      is worked. This one describes what the counting found.
+ * Between saves the sentence is therefore fixed; a later save re-reads live
+ * statuses, so a row approved in between is reported as approved. That is the
+ * honest reading of "what this count date now looks like".
+ *
+ * NO SCHEMA CHANGE. `audit_events`, `closing_stock` (date/department_id/
+ * outlet_id), `store_closing_counts` and `variance_approvals` all already
+ * exist. `idx_audit_entity` on (entity_type, entity_id) carries the read.
+ *
+ * ── WHAT COUNTS AS "COUNTED" ────────────────────────────────────────────────
+ * DERIVED from the count tables for that date, never accumulated across saves:
+ * central counts are rows in `closing_stock` (upserted per material+department,
+ * so a re-save cannot inflate it) and store counts are rows in
+ * `store_closing_counts` (UNIQUE per store+material+date, likewise). The route
+ * still passes what IT wrote, but only as the fire/don't-fire gate and as a
+ * floor if the derived read fails. This is why "1,033 counted" survives being
+ * re-saved and why a 40-entry EOD ritual reports 40 and not "1" forty times.
  */
 
-/** The shared row-set + threshold predicate. `SELECT … FROM variance_approvals va JOIN raw_materials rm …`. */
-function bigVarianceWhere(
-  bar: VarianceBar, outletId: string,
-): { sql: string; params: unknown[] } {
-  const params: unknown[] = [`-${ALERT_AUTO_APPLIED_WINDOW_DAYS} days`];
-  // Thresholds: value axis, then share axis + floor.
-  params.push(bar.alertValue, bar.alertValue, bar.alertPct, bar.alertPct, ALERT_MIN_VALUE, ALERT_MIN_QTY);
-  let sql = `
-       (
-         (va.status = 'pending' AND NOT EXISTS (
-            SELECT 1 FROM variance_approvals nv WHERE ${supersedeWhere('va')}
-         ))
-         OR (va.status = 'approved' AND COALESCE(va.auto_applied, 0) = 1
-             AND COALESCE(va.reviewed_at, '') >= datetime('now', ?))
-       )
-       AND (
-             (? > 0 AND ABS(va.variance_value) >= ?)
-          OR (? > 0 AND ABS(va.system_stock) > 0
-              AND (ABS(va.variance) / ABS(va.system_stock)) * 100 >= ?
-              AND (CASE WHEN ABS(va.variance_value) > 0
-                        THEN ABS(va.variance_value) >= ?
-                        ELSE ABS(va.variance) / (${PACK_FACTOR_SQL('rm')}) >= ?
-                   END))
-       )`;
-  if (outletId) { sql += `\n       AND (va.outlet_id = ? OR va.outlet_id = '')`; params.push(outletId); }
-  return { sql, params };
+/**
+ * How long a count's digest stays in the bell.
+ *
+ * A count digest has no "reviewed" state to retire it the way the cutover item
+ * has `reviewed_at`, and the ack is per-device localStorage — so without a
+ * lifetime the item would sit in a second device's bell for ever. One week is
+ * the counting cadence: last week's sheet is this week's history, and it is
+ * still in the audit trail, in the queue and on every variance report.
+ */
+export const COUNT_DIGEST_WINDOW_DAYS = 7;
+
+/** audit_events coordinates. The digest IS these two strings plus a count key. */
+export const COUNT_DIGEST_EVENT = 'closing.count_digest';
+export const COUNT_DIGEST_ENTITY = 'count_day';
+
+/**
+ * How many digests the bell will show at once.
+ *
+ * NOT A THRESHOLD ON WHAT IS REPORTED — every count writes its own digest and
+ * every one is in the audit trail. This bounds only how many of the most recent
+ * are rendered. Since the item is now per COUNT and not per POST, the ceiling
+ * for a week is 7 days x 2 rails, and a weekly ritual reaches 1 or 2.
+ */
+export const COUNT_DIGEST_BELL_MAX = 8;
+
+/**
+ * The two stock pools a count can belong to. They are never merged into one
+ * digest: they are different tables, different approval rails and — because
+ * store_locations has no outlet column — different outlet semantics.
+ */
+export type CountRail = 'central' | 'liquor';
+
+/** The identity of ONE count: a date, an outlet, a rail. Also the audit key. */
+export function countDayKey(
+  date: string, outletId: string | null | undefined, rail: CountRail,
+): string {
+  return `${norm(date)}|${norm(outletId)}|${rail === 'liquor' ? 'liquor' : 'central'}`;
 }
 
-export function bigVarianceCount(
-  db: Database.Database, outletId?: string | null, scope: VarianceOutletScope = 'outlet',
-): number {
-  const bar = varianceBar(db);
-  // Unconfigured ⇒ no alert, and no query either.
-  if (bar.alertValue <= 0 && bar.alertPct <= 0) return 0;
-  const { sql, params } = bigVarianceWhere(bar, scope === 'all' ? '' : norm(outletId));
-  const row = db.prepare(`
-    SELECT COUNT(*) AS n
-      FROM variance_approvals va
-      JOIN raw_materials rm ON rm.id = va.material_id
-     WHERE ${sql}
-  `).get(...params) as { n: number } | undefined;
-  return row?.n || 0;
+/* ── THE PLAUSIBILITY RUNG (mixed-basis rates) ───────────────────────────────
+ * MEASURED ON THE LIVE CATALOG, 2026-08-24, 952 active materials:
+ *   · the ladder resolves 465 on `last_purchase`, 294 on `average_cost`, 193 on
+ *     nothing at all;
+ *   · 92 of the average_cost ones are PACKED (pack_size > 1 and a purchase unit
+ *     that differs from the recipe unit), which is the only shape in which the
+ *     two bases can be confused;
+ *   · their implied ₹/purchase-unit runs p50 ₹74,770 · p75 ₹321,600 · max
+ *     ₹3,949,281 (HENDRICKS GIN, i.e. ₹3.9 lakh for one bottle);
+ *   · the HIGHEST PRICE THE BUSINESS HAS EVER ACTUALLY PAID for anything, on
+ *     any purchase row, is ₹7,909 (per CAN); per kg ₹4,800, per BTL ₹6,973.
+ * So the median packed average-cost material implies a rate ten times the
+ * dearest thing ever bought. That is `average_price` holding ₹/PURCHASE-unit
+ * where ₹/RECIPE-unit belongs (COCO POWDER 846.57 where ₹/g belongs) — the
+ * known mixed-basis fault — and rung 2 of the ladder cannot repair it, because
+ * rung 2 IS arithmetically the naive formula: (q/f) × (avg × f) = q × avg.
+ * Left alone, three ordinary spice shortfalls carried 97% of a digest headline
+ * and inflated it from −₹7,090 to −₹215,792.
+ *
+ * THE TEST IS THE BUSINESS'S OWN PURCHASE HISTORY, NOT A MAGIC NUMBER. A rate
+ * is refused when it exceeds, by a margin, the dearest price ever PAID per that
+ * purchase unit. Where that lands, measured on the same catalog:
+ *   · at the ×3 margin: 52 of the 92 refused;
+ *   · nearest KEPT   1.43× — Olive Oil, ₹1,200/L against a ₹837 cap (a real price);
+ *   · nearest REFUSED 5.47× — CHICKEN MASALA 100GRM, ₹26,280/kg against ₹4,800.
+ * There is an empty band between 1.43× and 5.47×, so the cut is not near any
+ * real rate; ×2 and ×5 both refuse the same 52.
+ *
+ * A REFUSED LINE IS REPORTED, NOT DELETED. It is named with its QUANTITY, in
+ * the "not valued" clause, exactly like a material with no rate at all. Guessing
+ * the other basis and printing a confident small number would be the same
+ * mistake in the opposite direction.
+ *
+ * IT APPLIES ONLY INSIDE THE DIGEST. closing-valuation.ts is untouched: it also
+ * feeds the closing sheet, the history CSV and the stored closing_stock
+ * .total_value, and changing what those say is a different decision with a
+ * different blast radius. The digest is the surface that prints ONE net headline
+ * the owner is asked to trust, so it is the surface that must refuse to guess.
+ * ──────────────────────────────────────────────────────────────────────────── */
+
+/** How far above the dearest price ever paid a derived rate may sit. */
+export const PLAUSIBLE_RATE_MARGIN = 3;
+/** Priced purchase rows a unit needs before its own maximum is used as the cap. */
+export const PLAUSIBLE_RATE_MIN_SAMPLE = 5;
+
+interface RateSanity {
+  /** False when there is no purchase history at all — then nothing is refused. */
+  enabled: boolean;
+  /** lower(purchase unit) → dearest unit_price ever paid in it. */
+  byUnit: Map<string, number>;
+  /** Dearest unit_price ever paid, any unit. The fallback cap. */
+  global: number;
+}
+
+const NO_SANITY: RateSanity = { enabled: false, byUnit: new Map(), global: 0 };
+
+/**
+ * The plausibility caps, read once per digest.
+ *
+ * FAILS OPEN, DELIBERATELY. With no priced purchase row anywhere there is no
+ * evidence, and an evidence-free refusal is not a check — it would blank every
+ * figure in the digest on a fresh install. Same for a query that throws.
+ */
+function rateSanity(db: Database.Database): RateSanity {
+  try {
+    const g = db.prepare(
+      `SELECT MAX(unit_price) AS mx FROM purchases WHERE COALESCE(unit_price, 0) > 0`,
+    ).get() as { mx: number | null } | undefined;
+    const global = Number(g?.mx) || 0;
+    if (global <= 0) return NO_SANITY;
+    const out: RateSanity = { enabled: true, byUnit: new Map(), global };
+    const rows = db.prepare(`
+      SELECT COALESCE(NULLIF(TRIM(LOWER(rm.purchase_unit)), ''), TRIM(LOWER(rm.unit))) AS pu,
+             COUNT(*) AS n, MAX(p.unit_price) AS mx
+        FROM purchases p
+        JOIN raw_materials rm ON rm.id = p.material_id
+       WHERE COALESCE(p.unit_price, 0) > 0
+       GROUP BY pu
+    `).all() as Array<{ pu: string | null; n: number; mx: number }>;
+    for (const r of rows) {
+      const pu = norm(r.pu).toLowerCase();
+      const mx = Number(r.mx) || 0;
+      if (!pu || mx <= 0) continue;
+      // A unit with two purchases has no distribution; fall back to the global
+      // maximum rather than letting one cheap line become a strict ceiling.
+      if ((Number(r.n) || 0) < PLAUSIBLE_RATE_MIN_SAMPLE) continue;
+      out.byUnit.set(pu, mx);
+    }
+    return out;
+  } catch (e) {
+    console.error('[count-digest] rate sanity read failed:', (e as Error)?.message);
+    return NO_SANITY;
+  }
+}
+
+/** True when a derived rate is believable against what has actually been paid. */
+function ratePlausible(
+  s: RateSanity, meta: PackMeta, source: RateSource, ratePerPurchaseUnit: number,
+): boolean {
+  if (!s.enabled) return true;
+  // last_purchase IS a price the business paid; it is evidence, not a derivation.
+  // An unpacked material (factor 1) has one basis and cannot be confused.
+  if (source !== 'average_cost') return true;
+  if (packFactor(meta) <= 1) return true;
+  const pu = norm(meta?.purchase_unit || meta?.unit).toLowerCase();
+  const cap = (s.byUnit.get(pu) ?? s.global) * PLAUSIBLE_RATE_MARGIN;
+  if (!(cap > 0)) return true;
+  return (Number(ratePerPurchaseUnit) || 0) <= cap;
+}
+
+/** Why a line carries no rupee figure. `null` = it does. */
+export type UnvaluedReason = 'no_rate' | 'implausible_rate';
+
+/** One named line in the digest. */
+export interface CountDigestLine {
+  material_id: string;
+  material_name: string;
+  /** SIGNED, in PURCHASE units (owner rule). Negative = short. */
+  qty: number;
+  /** The purchase unit `qty` is expressed in. */
+  unit: string;
+  /** SIGNED ₹ through the closing-valuation ladder. 0 when `unvalued` is set. */
+  value: number;
+  /** The ladder rung this line resolved on. */
+  rate_source: RateSource;
+  /** Set when this line has NO trustworthy rupee figure — see the rung above. */
+  unvalued: UnvaluedReason | null;
+  /**
+   * 'held'          — pending, and the live count for its item. An admin decides it.
+   * 'applied'       — the BAR applied it at count time. Nobody was in the loop.
+   * 'admin_applied' — an admin's "Adjust system stock" tick applied it. A person decided.
+   * There is no 'department' member on purpose: a department row's stored
+   * difference is measured against the CENTRAL pool, so it is not a comparable
+   * line and never becomes one. See CountDigest.dept_lines.
+   */
+  state: 'held' | 'applied' | 'admin_applied';
+}
+
+/** The payload. This is exactly what lands in audit_events.after_json. */
+export interface CountDigest {
+  /** `date|outlet|rail` — the audit entity_id and the bell key. */
+  key: string;
+  rail: CountRail;
+  /** The count date this digest is for. */
+  date: string;
+  outlet_id: string;
+  /** Lines counted for this date on this rail. Derived — see the header note. */
+  counted: number;
+  /** Lines that DIFFERED and still stand: held + applied + admin_applied. */
+  differed: number;
+  /** Net ₹ of those, ladder-valued. Negative = the shelf held less than the book. */
+  total_value: number;
+  held_count: number;
+  held_value: number;
+  /** The BAR's rows: stock already moved, nobody reviewed it. */
+  applied_count: number;
+  applied_value: number;
+  /** The admin's own tick: stock already moved, a person decided it. */
+  admin_applied_count: number;
+  admin_applied_value: number;
+  /**
+   * DEPARTMENT lines counted for this date. Reported, but NEVER given a rupee
+   * figure, and never mixed into the totals above. Both halves are deliberate.
+   *
+   * WHY THEY ARE REPORTED. recordCountVariance parks nothing on the department
+   * rail — dept-ledger's latestCount() has already re-anchored that
+   * department's balance from the closing_stock row, so there is nothing to hold
+   * and nothing an approval could do (outcome 'anchored'). A digest derived only
+   * from `variance_approvals` therefore sees ZERO rows for a 900-line department
+   * sheet and would print "nothing differed" on the exact upload class the
+   * owner's incident came through.
+   *
+   * ╔══════════════════════════════════════════════════════════════════════╗
+   * ║ WHY THEY GET NO ₹ FIGURE, AND WHY THAT IS NOT A GAP.                 ║
+   * ╚══════════════════════════════════════════════════════════════════════╝
+   * A department row's stored `variance` is (counted − raw_materials
+   * .current_stock): the CENTRAL pool, not that department's balance. Both
+   * writers say so in their own comments — "KNOWN LIMITATION … the system figure
+   * is the CENTRAL pool … even for a row tagged to a department, so a department
+   * count is not directly comparable to it" (closing-stock/route.ts, and
+   * verbatim again in dept-sheet/route.ts). A kitchen counting 3 kg against a
+   * 500 kg central pool records a −497 kg "difference" that describes nothing.
+   * Valuing that and printing it as "department differences −₹4,910" is a
+   * confident wrong number in the one place the owner is asked to trust a
+   * headline — which is exactly what this rebuild exists to stop. So the digest
+   * says HOW MANY lines were counted on that rail and says, in the sentence,
+   * why no money figure is possible. The real department difference (count
+   * against the department's OWN prior balance) is not stored anywhere; giving
+   * it one is a stock-semantics change, not a notification change.
+   */
+  dept_lines: number;
+  /**
+   * LEGACY department rows still sitting in the approval queue for this date.
+   * The rail stopped parking them, but old ones were never backfilled, and
+   * varianceApprovalBlock() refuses every one ("balance is already anchored on a
+   * closing count"). They are counted apart from `held` because calling an
+   * un-approvable row "held for approval ₹X" would be wrong twice over — it
+   * cannot be approved, and its ₹ is the same central-pool artefact above.
+   */
+  dept_stale_pending: number;
+  /** Rows this count raised that a NEWER count has already replaced. */
+  superseded_count: number;
+  /** Differing lines with no rate basis at all. */
+  unpriced_count: number;
+  /** Differing lines whose stored rate failed the plausibility rung. */
+  implausible_count: number;
+  /** How the valued lines resolved, so the basis sentence can be true. */
+  rate_mix: { last_purchase: number; average_cost: number };
+  /** The three biggest by |₹|, named, with quantity and value. */
+  largest: CountDigestLine[];
+  /** Up to three of the lines carrying no ₹, named with their quantity. */
+  unvalued: CountDigestLine[];
+  /**
+   * TRUE when a row read failed. Without this an empty result set is
+   * indistinguishable from a genuine all-matching sheet, and the digest asserted
+   * "nothing differed" — an all-clear derived from a query that never ran.
+   */
+  read_failed: boolean;
+  /** The one sentence the bell renders. Built here so it cannot drift. */
+  label: string;
+}
+
+const r2d = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
+
+/** One differing row of a count, joined to the material's pack meta. */
+interface DigestSourceRow {
+  material_id: string;
+  material_name: string | null;
+  unit: string | null;
+  purchase_unit: string | null;
+  pack_size: number | null;
+  average_price: number | null;
+  variance: number | null;
+  department_id: string | null;
+  status: string | null;
+  auto_applied: number | null;
+  /** 1 when a NEWER count for the same key already exists. See supersedeWhere. */
+  superseded: number | null;
 }
 
 /**
- * The big variances themselves, worst rupee first — what the alert links to.
- * Same predicate as bigVarianceCount() through the same function, so the badge
- * and the list can never disagree about which rows are "big".
+ * Free text on its way into a delimited sentence.
+ *
+ * The label joins its parts with ' · ' and '; ', and the page lays the sentence
+ * back out on exactly those separators. Material names and units are typed by
+ * people, so a name carrying one of them would split a figure in half on screen.
+ * Neutralised HERE, at the one place free text enters the sentence, rather than
+ * asserted to be impossible in a comment on the reader.
  */
-export function listBigVariances(
+function safeText(s: unknown): string {
+  return String(s ?? '').replace(/[·;—]+/g, '-').replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * ₹ with a sign and Indian grouping. Whole rupees, EXCEPT under ₹1, where two
+ * decimals are printed instead: rounding a real ₹0.40 difference to "₹0" made it
+ * indistinguishable from a line that could not be valued at all.
+ */
+function inrSigned(n: number): string {
+  const raw = Number(n) || 0;
+  if (raw !== 0 && Math.abs(raw) < 1) return (raw < 0 ? '−₹' : '₹') + Math.abs(raw).toFixed(2);
+  const v = Math.round(raw);
+  return (v < 0 ? '−₹' : '₹') + Math.abs(v).toLocaleString('en-IN');
+}
+
+/** A signed quantity, up to 3 dp, with the unit. */
+function qtyLabel(q: number, unit: string): string {
+  const v = Number(q) || 0;
+  const txt = (v < 0 ? '−' : '') + Math.abs(v).toLocaleString('en-IN', { maximumFractionDigits: 3 });
+  const u = safeText(unit);
+  return u ? `${txt} ${u}` : txt;
+}
+
+const plural = (n: number, one: string, many: string) => (n === 1 ? one : many);
+
+/**
+ * Build ONE count's digest: a date, an outlet, a rail.
+ *
+ * EVERY ₹ FIGURE GOES THROUGH closing-valuation.ts's LADDER (`valueCount`), not
+ * `variance_approvals.variance_value` and never raw `average_price` — the same
+ * number the closing sheet, the history CSV and `closing_stock.total_value`
+ * already print — and then through the PLAUSIBILITY RUNG above, which refuses a
+ * derived rate that exceeds what this business has ever paid per that purchase
+ * unit and reports the line by QUANTITY instead. See both notes above for the
+ * measurements behind that.
+ *
+ * TWO THINGS THAT MUST NOT BE OVERSTATED:
+ *  1. THE DIGEST TOTAL WILL NOT EQUAL THE QUEUE'S "Value at stake" TILE. That
+ *     tile sums `variance_value`, which varianceRupees() computes as
+ *     `variance × average_price` — deliberately, because it is the figure every
+ *     queue row and variance report already shows. Two bases, both intentional,
+ *     and the label SAYS so.
+ *  2. THE LADDER STILL ROUNDS THE PURCHASE QUANTITY TO 3 dp before multiplying
+ *     (toPurchaseQty), so a value here can differ from recipeQty × ₹/recipe in
+ *     the paise. Not corrected here on purpose: the alternative is a private
+ *     valuation formula that disagrees with the closing sheet, which is a worse
+ *     bug than a rounding artefact.
+ *
+ * THE SUPERSEDE FILTER, SET-BASED AND ON THE HELD LINE ONLY. Weekly counts
+ * against monthly approvals means one real shortage counted four Fridays reads
+ * as four pending rows, three of which approveVariance() REFUSES. So `held`
+ * counts only the live one — `NOT EXISTS (… supersedeWhere('va'))`, the same
+ * predicate approveVariance is refused by, in ONE statement for the whole count
+ * rather than a point lookup per row.
+ *
+ * IT IS APPLIED TO `held` AND NOTHING ELSE, ON PURPOSE. supersedeWhere() treats
+ * 'approved' as superseding too, and an auto-applied row IS approved — filtering
+ * those out would erase from the digest the rows where stock ACTUALLY MOVED,
+ * which is the one thing the applied line exists to show.
+ *
+ * READ-ONLY. Nothing in here writes a row or moves a gram.
+ */
+export function buildCountDigest(
+  db: Database.Database,
+  inp: {
+    date: string; outlet_id?: string | null; rail?: CountRail;
+    /** Lines the calling save wrote. A FLOOR only — `counted` is derived. */
+    saved?: number;
+  },
+): CountDigest {
+  const date = norm(inp.date);
+  const outletId = norm(inp.outlet_id);
+  const rail: CountRail = inp.rail === 'liquor' ? 'liquor' : 'central';
+  const digest: CountDigest = {
+    key: countDayKey(date, outletId, rail),
+    rail,
+    date,
+    outlet_id: outletId,
+    counted: Math.max(0, Math.floor(Number(inp.saved) || 0)),
+    differed: 0,
+    total_value: 0,
+    held_count: 0, held_value: 0,
+    applied_count: 0, applied_value: 0,
+    admin_applied_count: 0, admin_applied_value: 0,
+    dept_lines: 0, dept_stale_pending: 0,
+    superseded_count: 0,
+    unpriced_count: 0,
+    implausible_count: 0,
+    rate_mix: { last_purchase: 0, average_cost: 0 },
+    largest: [],
+    unvalued: [],
+    read_failed: false,
+    label: '',
+  };
+  // A digest with no date can only be a bug in a caller; scanning the whole
+  // table for `date = ''` would report every un-dated row ever written as one
+  // count. Guarded HERE and not only in the wrapper, because this is exported.
+  if (!date) {
+    digest.read_failed = true;
+    digest.label = 'Closing count — no date, nothing to report.';
+    return digest;
+  }
+
+  /* HOW MANY LINES WERE COUNTED. Derived from the count tables, so a re-save
+   * cannot inflate it and forty single-line saves report forty and not one:
+   * closing_stock is upserted per (date, material, department) and
+   * store_closing_counts is UNIQUE(store, material, date). The route's own
+   * figure is kept only as a floor for a read that throws.
+   *
+   * `dept_lines` comes off the same rows: a non-empty department_id is exactly
+   * what makes a line a department line. It counts LINES, not "differences" —
+   * a department row's stored variance is against the central pool, so the
+   * count of non-zero ones would be a number about the wrong comparison. See
+   * CountDigest.dept_lines. */
+  try {
+    if (rail === 'central') {
+      // NO OUTLET given means no outlet context to scope by, and closing_stock
+      // holds legacy rows stamped NULL — so both branches are lenient in the
+      // same direction the variance buckets are (pendingVarianceCount). On a
+      // multi-outlet install an UNSTAMPED save is therefore counted everywhere;
+      // that is the existing house rule for unstamped rows, not a new one.
+      const outletPred = outletId ? `AND (outlet_id = ? OR outlet_id IS NULL OR outlet_id = '')` : '';
+      const p: unknown[] = outletId ? [date, outletId] : [date];
+      const row = db.prepare(
+        `SELECT COUNT(*) AS n,
+                SUM(CASE WHEN COALESCE(department_id, '') <> '' THEN 1 ELSE 0 END) AS d
+           FROM closing_stock WHERE date = ? ${outletPred}`,
+      ).get(...p) as { n: number; d: number | null } | undefined;
+      digest.counted = Math.max(digest.counted, Number(row?.n) || 0);
+      digest.dept_lines = Number(row?.d) || 0;
+    } else {
+      // store_closing_counts carries no outlet, and store_locations has no
+      // outlet column to join one from, so this is the whole day's store
+      // counting. Stated rather than papered over: on a multi-outlet install the
+      // counted figure on this rail is house-wide while the differing rows below
+      // are outlet-scoped.
+      const row = db.prepare(`SELECT COUNT(*) AS n FROM store_closing_counts WHERE date = ?`)
+        .get(date) as { n: number } | undefined;
+      digest.counted = Math.max(digest.counted, Number(row?.n) || 0);
+    }
+  } catch (e) {
+    console.error('[count-digest] counted read failed:', (e as Error)?.message);
+    digest.read_failed = true;
+  }
+
+  // ── The approval rail: everything this date raised, live ──────────────────
+  let rows: DigestSourceRow[] = [];
+  try {
+    const where = [`va.date = ?`, `va.source = ?`];
+    const params: unknown[] = [date, rail];
+    if (outletId) { where.push(`(va.outlet_id = ? OR va.outlet_id = '')`); params.push(outletId); }
+    rows = db.prepare(`
+      SELECT va.material_id                     AS material_id,
+             rm.name                            AS material_name,
+             rm.unit                            AS unit,
+             rm.purchase_unit                   AS purchase_unit,
+             rm.pack_size                       AS pack_size,
+             rm.average_price                   AS average_price,
+             va.variance                        AS variance,
+             COALESCE(va.department_id, '')     AS department_id,
+             va.status                          AS status,
+             COALESCE(va.auto_applied, 0)       AS auto_applied,
+             CASE WHEN EXISTS (
+               SELECT 1 FROM variance_approvals nv WHERE ${supersedeWhere('va')}
+             ) THEN 1 ELSE 0 END                AS superseded
+        FROM variance_approvals va
+        JOIN raw_materials rm ON rm.id = va.material_id
+       WHERE ${where.join(' AND ')}
+    `).all(...params) as DigestSourceRow[];
+  } catch (e) {
+    // A digest is a notification. It may never cost the count that raised it —
+    // but it must not report an all-clear it never read either, so the failure
+    // is carried into the sentence instead of looking like "nothing differed".
+    console.error('[count-digest] row query failed:', (e as Error)?.message);
+    rows = [];
+    digest.read_failed = true;
+  }
+
+  const rates = rows.length ? rateMap(db) : new Map<string, { unit_price: number; date: string }>();
+  const sanity = rows.length ? rateSanity(db) : NO_SANITY;
+  const lines: CountDigestLine[] = [];
+
+  const addLine = (r: DigestSourceRow, state: CountDigestLine['state']) => {
+    const meta = {
+      id: String(r.material_id),
+      unit: r.unit,
+      purchase_unit: r.purchase_unit,
+      pack_size: r.pack_size,
+      average_price: r.average_price,
+    };
+    const valued = valueCount(db, meta, Number(r.variance) || 0, rates.get(String(r.material_id)) ?? null);
+    const believable = ratePlausible(sanity, meta as PackMeta, valued.source, valued.ratePerPurchaseUnit);
+    const unvalued: UnvaluedReason | null =
+      valued.source === 'none' ? 'no_rate' : (believable ? null : 'implausible_rate');
+
+    const line: CountDigestLine = {
+      material_id: String(r.material_id),
+      material_name: String(r.material_name || ''),
+      qty: valued.purchaseQty,
+      unit: String(r.purchase_unit || r.unit || '').trim(),
+      value: unvalued ? 0 : valued.totalValue,
+      rate_source: valued.source,
+      unvalued,
+      state,
+    };
+    lines.push(line);
+
+    if (unvalued === 'no_rate') digest.unpriced_count++;
+    else if (unvalued === 'implausible_rate') digest.implausible_count++;
+    else if (valued.source === 'last_purchase') digest.rate_mix.last_purchase++;
+    else digest.rate_mix.average_cost++;
+
+    digest.differed++;
+    digest.total_value = r2d(digest.total_value + line.value);
+    if (state === 'held') {
+      digest.held_count++;
+      digest.held_value = r2d(digest.held_value + line.value);
+    } else if (state === 'applied') {
+      digest.applied_count++;
+      digest.applied_value = r2d(digest.applied_value + line.value);
+    } else {
+      digest.admin_applied_count++;
+      digest.admin_applied_value = r2d(digest.admin_applied_value + line.value);
+    }
+  };
+
+  for (const r of rows) {
+    const status = String(r.status || '');
+    // A REJECTED row moved nothing and was decided by a person; a SUPERSEDED
+    // pending row is the same shortage counted again and approveVariance will
+    // refuse it. Neither is news about this count — the superseded ones are
+    // counted so the digest can say how many it set aside, and nothing else.
+    if (status === 'rejected') continue;
+    // A DEPARTMENT-TAGGED APPROVAL ROW IS NOT A COMPARABLE LINE. The rail stopped
+    // parking these, but the legacy ones were never backfilled, and
+    // varianceApprovalBlock() refuses every one of them ("balance is already
+    // anchored on a closing count") — so the queue can only reject them. Their
+    // `variance` is the central-pool artefact described on CountDigest
+    // .dept_lines, so putting them in `held` would claim both a hold that does
+    // not exist and a rupee figure that means nothing.
+    if (norm(r.department_id) !== '') {
+      if (status === 'pending') digest.dept_stale_pending++;
+      continue;
+    }
+    if (status === 'pending' && Number(r.superseded) === 1) { digest.superseded_count++; continue; }
+    addLine(r, status === 'pending' ? 'held' : Number(r.auto_applied) === 1 ? 'applied' : 'admin_applied');
+  }
+
+  digest.largest = lines
+    .filter(l => !l.unvalued && Math.abs(l.value) > 0)
+    .sort((a, b) => Math.abs(b.value) - Math.abs(a.value) || a.material_name.localeCompare(b.material_name))
+    .slice(0, 3);
+  /* THE UNVALUED LINES ARE NAMED TOO. They used to be a bare count — "1 unpriced
+   * (real differences, worth ₹0 here)" — with no material and no quantity, which
+   * is worst exactly where it matters: 193 of 952 active materials have no rate
+   * basis at all, so 100 missing bottles read as "1 unpriced, ₹0" and the item
+   * was never named. Ranked by |quantity| in the line's OWN purchase unit, which
+   * is why the sentence says so: quantities are NOT comparable across materials
+   * (pack-units.ts is explicit about it), so this ranking orders the list and
+   * claims nothing more.
+   *
+   * `Math.abs(l.qty) > 0` drops only what toPurchaseQty rounded to zero at 3 dp
+   * — under a thousandth of a purchase unit, i.e. under half a gram on a 1 kg
+   * pack. Naming one would print "0 kg", which says less than the count above
+   * already does; the line is still inside `unpriced_count` / `implausible_count`
+   * either way. */
+  digest.unvalued = lines
+    .filter(l => !!l.unvalued && Math.abs(l.qty) > 0)
+    .sort((a, b) => Math.abs(b.qty) - Math.abs(a.qty) || a.material_name.localeCompare(b.material_name))
+    .slice(0, 3);
+
+  digest.label = countDigestLabel(digest);
+  return digest;
+}
+
+/**
+ * The one sentence the bell renders — built beside the figures so the badge and
+ * the words can never disagree, exactly as unreviewedAlertBatches() does for the
+ * cutover item.
+ *
+ * IT IS LONG, AND THAT IS THE POINT. The bell row is `flex-1 min-w-0` with
+ * `leading-snug` and no truncation (NotificationBell.tsx, CaptainAlertsProvider),
+ * so it WRAPS rather than clips, and /variance-approvals lays the same string
+ * back out in blocks. One wrapped block, once a week, IS the digest.
+ *
+ * THE MARKERS ARE PART OF THE CONTRACT. ' Largest: ', ' Not valued: ' and
+ * ' Valued at last purchase' are what splitDigest() (variance-approvals/page.tsx)
+ * cuts on. Free text is put through safeText() before it can reach them.
+ */
+function countDigestLabel(d: CountDigest): string {
+  const railWord = d.rail === 'liquor' ? 'Store closing count' : 'Closing count';
+  const head = `${railWord} ${d.date} — ${d.counted.toLocaleString('en-IN')} counted`;
+
+  // A READ THAT FAILED IS NOT AN ALL-CLEAR. Said before anything else, because
+  // every figure below it would be a number nobody read.
+  if (d.read_failed && d.differed === 0) {
+    return head + ' — the list of differences could not be read, so nothing here says whether anything differed.';
+  }
+
+  /* THE DEPARTMENT CLAUSE. A count, never a difference and never a rupee — the
+   * full argument is on CountDigest.dept_lines. It says what the rail is and
+   * why the money is absent, because an unexplained absence reads as an
+   * omission and the next thing someone does about it is invent a number. */
+  const deptClause = d.dept_lines > 0
+    ? `${d.dept_lines.toLocaleString('en-IN')} department ${plural(d.dept_lines, 'line', 'lines')}, `
+      + `re-anchored to that department's own balance at save time (nothing to approve, and no difference `
+      + `figure: a department count is stored against the central pool, not that department's balance)`
+    : '';
+  const staleClause = d.dept_stale_pending > 0
+    ? `${d.dept_stale_pending.toLocaleString('en-IN')} older department `
+      + `${plural(d.dept_stale_pending, 'row', 'rows')} still in the approval queue, which can only reject them`
+    : '';
+
+  if (d.differed === 0) {
+    if (d.dept_lines === 0) {
+      return head + ', nothing differed'
+        + (d.superseded_count ? `; ${d.superseded_count} already replaced by a newer count` : '') + '.';
+    }
+    // Some of the day's lines are department lines and some may not be. Say what
+    // is true of each half rather than one "nothing differed" covering both.
+    const central = Math.max(0, d.counted - d.dept_lines);
+    const bits = [head];
+    if (central > 0) bits.push(`nothing differed on the ${central.toLocaleString('en-IN')} central ${plural(central, 'line', 'lines')}`);
+    bits.push(deptClause);
+    if (staleClause) bits.push(staleClause);
+    if (d.superseded_count) bits.push(`${d.superseded_count} already replaced by a newer count`);
+    return bits.join(' · ') + '.';
+  }
+
+  const parts = [
+    `${head}, ${d.differed.toLocaleString('en-IN')} differed`,
+    `total variance ${inrSigned(d.total_value)}`,
+    `${d.held_count.toLocaleString('en-IN')} held for approval ${inrSigned(d.held_value)}`,
+  ];
+  // Named even at zero: "0 applied automatically" is the sentence that tells him
+  // nothing moved without him, and its absence would read as an omission.
+  parts.push(`${d.applied_count.toLocaleString('en-IN')} applied automatically ${inrSigned(d.applied_value)}`);
+  if (d.admin_applied_count > 0) {
+    parts.push(`${d.admin_applied_count.toLocaleString('en-IN')} applied by the admin's own tick ${inrSigned(d.admin_applied_value)}`);
+  }
+  if (deptClause) parts.push(deptClause);
+  if (staleClause) parts.push(staleClause);
+  if (d.superseded_count > 0) {
+    parts.push(`${d.superseded_count.toLocaleString('en-IN')} already replaced by a newer count (not counted above)`);
+  }
+  const unvaluedTotal = d.unpriced_count + d.implausible_count;
+  if (unvaluedTotal > 0) {
+    const why: string[] = [];
+    if (d.unpriced_count > 0) why.push(`${d.unpriced_count.toLocaleString('en-IN')} with no rate at all`);
+    if (d.implausible_count > 0) {
+      why.push(`${d.implausible_count.toLocaleString('en-IN')} whose stored rate is above anything this business has ever paid, so it is not believed`);
+    }
+    parts.push(
+      `${unvaluedTotal.toLocaleString('en-IN')} real ${plural(unvaluedTotal, 'difference', 'differences')} `
+      + `NOT in the totals above (${why.join(', ')})`,
+    );
+  }
+  if (d.read_failed) {
+    parts.push('part of this count could not be read, so the figures above may be short');
+  }
+
+  let s = parts.join(' · ') + '.';
+  if (d.largest.length) {
+    s += ' Largest: ' + d.largest
+      .map(l => `${safeText(l.material_name)} ${qtyLabel(l.qty, l.unit)} ${inrSigned(l.value)}`
+        + (l.state === 'applied' ? ' (applied automatically)'
+          : l.state === 'admin_applied' ? ' (applied by admin)' : ''))
+      .join('; ') + '.';
+  }
+  if (d.unvalued.length) {
+    s += ' Not valued: ' + d.unvalued
+      .map(l => `${safeText(l.material_name)} ${qtyLabel(l.qty, l.unit)}`
+        + (l.unvalued === 'implausible_rate' ? ' (stored rate not believable)' : ' (no rate)'))
+      .join('; ')
+      + ' — listed by quantity, which cannot be compared between materials.';
+  }
+  // THE BASIS, ON SCREEN, AND TRUE PER COUNT. The first build ended every digest
+  // with "Valued at last-purchase rates", which was false for the 294 materials
+  // that resolve on average cost — and for those the queue's own tile is the
+  // SAME basis, so "the two totals differ" was backwards as well. Counted, not
+  // claimed.
+  const mix: string[] = [];
+  if (d.rate_mix.last_purchase > 0) mix.push(`${d.rate_mix.last_purchase.toLocaleString('en-IN')} at last purchase`);
+  if (d.rate_mix.average_cost > 0) mix.push(`${d.rate_mix.average_cost.toLocaleString('en-IN')} at average cost`);
+  s += ' Valued at last purchase where there is one'
+    + (mix.length ? ` (${mix.join(', ')})` : '')
+    + '; the approval queue prices the same rows at average cost, so the two totals can differ.';
+  return s;
+}
+
+/**
+ * FIRE AND FORGET. Writes the digest to the audit trail and returns it.
+ *
+ * ╔══════════════════════════════════════════════════════════════════════════╗
+ * ║ A NOTIFICATION MAY NEVER FAIL OR ROLL BACK THE COUNT IT ANNOUNCES.       ║
+ * ╚══════════════════════════════════════════════════════════════════════════╝
+ * Call this AFTER the count transaction has committed, never inside it. It
+ * swallows everything: the row queries are already guarded, logAuditEvent has
+ * its own try/catch, and this adds a third around the whole thing. It NEVER
+ * throws; every caller ignores the return value, which is correct. (The return
+ * is not a success signal: logAuditEvent swallows its own write failure, so a
+ * returned digest means "built", not "stored". Its `read_failed` flag is the one
+ * honest signal, and it is carried in the sentence itself.)
+ *
+ * ONE AUDIT ROW PER SAVE, ONE BELL ITEM PER COUNT. Every save appends (the audit
+ * trail is append-only and stays that way); recentCountDigests() reads back the
+ * NEWEST row per key, so forty EOD keypad saves are forty audit rows and ONE
+ * item carrying the current figures.
+ *
+ * Returns null WITHOUT writing when this save counted nothing (all blanks, all
+ * per-line errors) or carries no date: there is no count, so there is no news.
+ * That is the ONLY suppression, and it is not a threshold — no magnitude decides
+ * whether the owner hears anything.
+ */
+export function recordCountDigest(
+  db: Database.Database,
+  inp: {
+    date: string; outlet_id?: string | null; rail?: CountRail;
+    /** Lines THIS save wrote. The fire/don't-fire gate; `counted` is derived. */
+    saved: number;
+    actor_email?: string | null;
+  },
+): CountDigest | null {
+  try {
+    if (!norm(inp.date)) return null;
+    if ((Number(inp.saved) || 0) <= 0) return null;
+    const digest = buildCountDigest(db, inp);
+    logAuditEvent(db, {
+      event_type: COUNT_DIGEST_EVENT,
+      entity_type: COUNT_DIGEST_ENTITY,
+      entity_id: digest.key,
+      actor_email: norm(inp.actor_email),
+      outlet_id: norm(inp.outlet_id) || null,
+      after: digest,
+      note: digest.label,
+    });
+    return digest;
+  } catch (e) {
+    console.error('[count-digest] record failed:', (e as Error)?.message);
+    return null;
+  }
+}
+
+/**
+ * The digests the bell should show: newest first, inside the window, one per
+ * count, capped.
+ *
+ * ONE BELL ITEM PER COUNT, NEVER ONE PER LINE AND NEVER ONE PER SAVE — the rule
+ * the cutover bucket states in its own comment, for the identical reason. The
+ * badge SUMS `count` across inbox items (CaptainAlertsProvider / NotificationBell),
+ * and the `variance_approvals` bucket beside this one has ALREADY counted every
+ * held row in here; pushing a per-row count would inflate a badge that carries
+ * them twice. The caller must push `count: 1` — the literal truth of the item:
+ * one count to look at.
+ *
+ * THE NEWEST ROW PER KEY IS PICKED IN SQL, NOT BY TAKING THE FIRST N AND
+ * DE-DUPLICATING. Reading `LIMIT n*2` rows and de-duplicating in JS looks
+ * equivalent and is not: one count date that was saved forty times fills the
+ * whole window with forty rows of ONE key, and every other count silently
+ * disappears from the bell. Two indexed statements instead — the keys, then the
+ * newest row of each.
+ *
+ * THE TIE-BREAK IS LOAD-BEARING. logAuditEvent stamps datetime('now'), i.e.
+ * SECOND resolution, and twenty digests written inside one second under a plain
+ * `ORDER BY created_at DESC` came back in ROWID order — the OLDEST eight, from a
+ * function whose contract says newest first. `rowid DESC` decides those.
+ *
+ * OUTLET SCOPE matches the variance buckets ('outlet', lenient on the legacy
+ * empty value), because a badge must count what its destination shows.
+ */
+export function recentCountDigests(
   db: Database.Database,
   opts: { outletId?: string | null; outletScope?: VarianceOutletScope; limit?: number } = {},
-): VarianceRow[] {
-  const bar = varianceBar(db);
-  if (bar.alertValue <= 0 && bar.alertPct <= 0) return [];
-  const scope: VarianceOutletScope = opts.outletScope === 'all' ? 'all' : 'outlet';
-  const { sql, params } = bigVarianceWhere(bar, scope === 'all' ? '' : norm(opts.outletId));
-  const limit = Math.floor(Math.min(Math.max(Number(opts.limit) || 100, 1), 500));
-  return db.prepare(`
-    SELECT va.*, rm.name AS material_name, rm.sku AS material_sku,
-           COALESCE(sl.name,'') AS store_name, COALESCE(d.name,'') AS department_name
-      FROM variance_approvals va
-      JOIN raw_materials rm ON rm.id = va.material_id
- LEFT JOIN store_locations sl ON sl.id = va.store_id
- LEFT JOIN departments d ON d.id = va.department_id
-     WHERE ${sql}
-     ORDER BY ABS(va.variance_value) DESC, va.date DESC
-     LIMIT ${limit}
-  `).all(...params) as VarianceRow[];
+): Array<{ key: string; label: string; digest: CountDigest | null; created_at: string }> {
+  try {
+    const scope: VarianceOutletScope = opts.outletScope === 'all' ? 'all' : 'outlet';
+    const oid = scope === 'all' ? '' : norm(opts.outletId);
+    const params: unknown[] = [COUNT_DIGEST_ENTITY, COUNT_DIGEST_EVENT, `-${COUNT_DIGEST_WINDOW_DAYS} days`];
+    let outletWhere = '';
+    if (oid) {
+      outletWhere = "AND (ae.outlet_id = ? OR ae.outlet_id IS NULL OR ae.outlet_id = '')";
+      params.push(oid);
+    }
+    const limit = Math.floor(Math.min(Math.max(Number(opts.limit) || COUNT_DIGEST_BELL_MAX, 1), 50));
+    const keys = db.prepare(`
+      SELECT ae.entity_id AS key, MAX(ae.created_at) AS created_at
+        FROM audit_events ae
+       WHERE ae.entity_type = ? AND ae.event_type = ?
+         AND ae.created_at >= datetime('now', ?)
+         ${outletWhere}
+       GROUP BY ae.entity_id
+       ORDER BY created_at DESC, key DESC
+       LIMIT ${limit}
+    `).all(...params) as Array<{ key: string; created_at: string }>;
+
+    const newest = db.prepare(`
+      SELECT ae.after_json AS after_json, ae.note AS note, ae.created_at AS created_at
+        FROM audit_events ae
+       WHERE ae.entity_type = ? AND ae.event_type = ? AND ae.entity_id = ?
+       ORDER BY ae.created_at DESC, ae.rowid DESC
+       LIMIT 1
+    `);
+
+    const out: Array<{ key: string; label: string; digest: CountDigest | null; created_at: string }> = [];
+    for (const k of keys) {
+      const id = norm(k.key);
+      if (!id) continue;
+      const r = newest.get(COUNT_DIGEST_ENTITY, COUNT_DIGEST_EVENT, id) as
+        { after_json: string | null; note: string | null; created_at: string } | undefined;
+      if (!r) continue;
+      let digest: CountDigest | null = null;
+      try { digest = r.after_json ? (JSON.parse(r.after_json) as CountDigest) : null; } catch { digest = null; }
+      // `note` is the same label, written at the same instant. It is the fallback
+      // for a payload that will not parse — a digest with no label is not shown
+      // at all rather than pushed as an empty row.
+      const label = norm(digest?.label) || norm(r.note);
+      if (!label) continue;
+      out.push({ key: id, label, digest, created_at: String(r.created_at || '') });
+    }
+    return out;
+  } catch (e) {
+    console.error('[count-digest] read failed:', (e as Error)?.message);
+    return [];
+  }
 }

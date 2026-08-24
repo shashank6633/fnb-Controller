@@ -2,7 +2,7 @@ import { getDb, generateId, logAuditEvent } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
 import { getStoreById, materialStoreId, userStoreAccess, isStoreMappedMaterial, storeCategories } from '@/lib/store-engine';
 import {
-  recordCountVariance, readPhysicalCount, zeroPatternGuard,
+  recordCountVariance, recordCountDigest, readPhysicalCount, zeroPatternGuard,
 } from '@/lib/variance-approval';
 import { checkClosingDate, CLOSING_DATE_RE } from '@/lib/closing-date';
 import type { PackMeta } from '@/lib/pack-units';
@@ -314,7 +314,6 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     let pendingCount = 0;
     let appliedCount = 0;
     let autoAppliedCount = 0;
-    let alertCount = 0;
     const upsert = db.prepare(`
       INSERT INTO store_closing_counts
         (id, store_id, material_id, date, system_qty, physical_qty, variance,
@@ -361,7 +360,6 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
           batch_label: `${store.name} closing sheet`,
           pack: p.pack,
         });
-        if (decided.alert) alertCount++;
         if (decided.outcome === 'applied') {
           appliedCount++;
           if (decided.auto_applied) autoAppliedCount++;
@@ -371,6 +369,39 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       }
     });
     txn();
+
+    /* ══════════════════════════════════════════════════════════════════════
+     * THE COUNT DIGEST — fired here, at the boundary of this upload.
+     * ══════════════════════════════════════════════════════════════════════
+     * AFTER the transaction, never inside it, and it swallows everything it can
+     * throw: a notification may not fail or roll back the count it is
+     * announcing. recordCountDigest() is try/catch'd end to end and returns null
+     * on any failure; ignoring the return value is correct.
+     *
+     * ALWAYS FIRES, on every upload that counted at least one line — no
+     * threshold decides WHETHER the owner hears about a count, only what is
+     * named inside the sentence. An upload that counted nothing writes no
+     * digest, because there is no count to digest.
+     *
+     * THE STORE RAIL IS ITS OWN DIGEST, never merged with the central one: it
+     * is a different stock pool (store_stock_ledger, not raw_materials), and
+     * store_locations carries no outlet, so its counted figure cannot be
+     * outlet-scoped the way a central one can. Four floor bars counted on one
+     * date still make ONE item — the key is (date, outlet, rail), so the
+     * per-store saves coalesce instead of ringing the bell four times.
+     * The store name is deliberately NOT put in the sentence: it is free text a
+     * manager can rename, and the digest label is a delimited string the queue
+     * page splits back apart.
+     * ────────────────────────────────────────────────────────────────────── */
+    recordCountDigest(db, {
+      date,
+      rail: 'liquor',
+      // What THIS upload wrote — the fire/don't-fire gate only. The reported
+      // "counted" is derived from store_closing_counts for the date.
+      saved: prepared.length,
+      outlet_id: outletId,
+      actor_email: user.email,
+    });
 
     // BLIND COUNTS ON THE WAY BACK OUT — the same rule GET applies (see the
     // summary it builds and its `safeCounts`), which this POST was missing.
@@ -406,7 +437,6 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       // whose cell was BLANK, which are neither counted nor written.
       applied_count: appliedCount,
       auto_applied_count: autoAppliedCount,
-      alert_count: alertCount,
       not_counted: notCounted,
       batch_id: batchId,
     };
@@ -419,7 +449,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       // system figure?" per save, which bisects system_qty in a few re-saves.
       // `not_counted` and `batch_id` are NOT blinded — they describe what the
       // counter submitted, not what the system expected.
-      applied_count: null, auto_applied_count: null, alert_count: null,
+      applied_count: null, auto_applied_count: null,
     };
 
     logAuditEvent(db, {

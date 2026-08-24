@@ -73,7 +73,7 @@ const KEY_POLICY = new Map<string, KeyPolicy>([
     writeError: 'Admin role required to change when stock is deducted',
   }],
   // THE VARIANCE BAR — the sharpest self-lift in this table, and it was open.
-  // These four decide how much stock movement happens with NO admin in the
+  // These TWO decide how much stock movement happens with NO admin in the
   // loop: a count whose difference is under the bar applies itself to
   // raw_materials.current_stock / the store ledger at save time, recorded as
   // `system:auto-apply`, with the manager's name nowhere in the audit trail.
@@ -101,14 +101,15 @@ const KEY_POLICY = new Map<string, KeyPolicy>([
     write: 'admin',
     writeError: 'Admin role required to change the variance auto-apply bar',
   }],
-  ['closing_variance_alert_value', {
-    write: 'admin',
-    writeError: 'Admin role required to change the variance alert',
-  }],
-  ['closing_variance_alert_pct', {
-    write: 'admin',
-    writeError: 'Admin role required to change the variance alert',
-  }],
+  // `closing_variance_alert_value` / `closing_variance_alert_pct` USED to sit
+  // here as a third and fourth row. They are GONE, and their absence is correct
+  // rather than an oversight: the per-row "large variance" alert they tuned was
+  // deleted outright (it fired on 86% of a real sheet, because a counted zero is
+  // 100% by arithmetic), replaced by one always-fired digest per COUNT that
+  // nothing tunes. Nothing reads those keys any more, the live database holds no
+  // row for either, and an unregistered key in this table is writable by a
+  // manager — which is harmless for a key with no reader, and is exactly why
+  // they must not be re-added "for safety" instead of the feature being gone.
   // Owned keys. Each has a dedicated admin-only route that VALIDATES the value
   // (Slack host check, service-account JSON parse, printer normalisation) and
   // masks it on read — writing it through here would bypass both gate and

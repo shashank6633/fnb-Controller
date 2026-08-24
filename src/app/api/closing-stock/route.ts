@@ -5,7 +5,7 @@ import {
 } from '@/lib/dept-requested-items';
 import { materialStoreId, getStoreById } from '@/lib/store-engine';
 import {
-  recordCountVariance, readPhysicalCount, zeroPatternGuard, type CountInput,
+  recordCountVariance, recordCountDigest, readPhysicalCount, zeroPatternGuard, type CountInput,
 } from '@/lib/variance-approval';
 import { rateMap, valueCount, type RateSource } from '@/lib/closing-valuation';
 import { packFactor, toPurchaseQty, type PackMeta } from '@/lib/pack-units';
@@ -557,7 +557,7 @@ export async function POST(request: Request) {
       // stays whole for everyone: it is what lets a non-admin's screen say the
       // plain thing without answering "did my count match?".
       dept_anchored: 0, dept_immediate: false,
-      alerts: 0, errors: [] as string[], total_value: 0,
+      errors: [] as string[], total_value: 0,
       zero_guard: zeroGuard.suspicious ? { ...zeroGuard, confirmed: true } : null,
       batch_id: batchId,
     };
@@ -711,7 +711,6 @@ export async function POST(request: Request) {
             ? `Adjust system stock ticked on the closing sheet for ${dateStr} — approved at count time by the admin who saved the count.`
             : undefined,
         });
-        if (decided.alert) results.alerts++;
         // Rail-level, not count-level: true as soon as this submit wrote a
         // department-tagged row at all, whether or not it differed from the
         // book. Set outside the `variance !== 0` block on purpose — a screen
@@ -754,14 +753,58 @@ export async function POST(request: Request) {
 
     recordClosingStock();
 
+    /* ══════════════════════════════════════════════════════════════════
+     * THE COUNT DIGEST — fired here, at the boundary of this save.
+     * ══════════════════════════════════════════════════════════════════
+     * AFTER the transaction, never inside it, and it swallows everything it
+     * can throw: a notification may not fail or roll back the count it is
+     * announcing. recordCountDigest() is try/catch'd end to end and returns
+     * null on any failure; ignoring the return value is correct.
+     *
+     * ALWAYS FIRES, on every save that counted at least one line. There is
+     * no threshold deciding WHETHER the owner hears about a count — only
+     * what is named inside the sentence. (A save that counted nothing — all
+     * blanks, all per-line errors — writes no digest: there is no count to
+     * digest. That is the only case, and it is not a threshold.)
+     *
+     * ONE BELL ITEM PER COUNT, NOT PER POST, AND THIS IS THE ROUTE THAT
+     * PROVED WHY. An earlier build keyed the item on `batchId` and argued
+     * that every door here is a whole-sheet Save. It is not: /eod posts ONE
+     * material per request from a keypad and the dashboard's Daily-Tracked
+     * widget has a Save button per row — both POST here — and the main sheet
+     * submits one DEPARTMENT at a time. Measured: 40 keypad entries produced
+     * 8 bell rows and pushed the real 1,033-line sheet out of the window.
+     * The digest is now keyed on the COUNT (date + outlet + rail), so every
+     * save for one count date rewrites ONE item and the figures are rebuilt
+     * from that date's live rows rather than summed across saves.
+     * `batchId` is unchanged and still stamps every approval this save
+     * raises — it is how the queue filters "that upload".
+     * ────────────────────────────────────────────────────────────────── */
+    recordCountDigest(db, {
+      date: dateStr,
+      // The CENTRAL rail: raw_materials + closing_stock. Store (liquor) counts
+      // are a different pool and raise their own digest from their own route.
+      rail: 'central',
+      // What THIS save wrote — the fire/don't-fire gate only. The reported
+      // "counted" is derived from closing_stock for the date, so it survives a
+      // re-save and adds up across the department-by-department ritual.
+      saved: results.success,
+      outlet_id: outletId,
+      actor_email: me?.email || '',
+    });
+
     /* BLIND COUNTS ON THE WAY BACK OUT (2026-08). GET has stripped
      * system_stock/variance from non-admins since blind counts shipped; the
      * SAVE response had not caught up, and the bar makes it far sharper than it
      * was. `applied` is now a per-save answer to "was my count within ₹X of the
      * system figure?" — save one line, watch it flip between applied and
      * pending, and a handful of bisecting re-saves recovers current_stock
-     * exactly. `pending` leaks the same thing in aggregate, and `alerts` leaks
-     * "your count is more than N% off".
+     * exactly. `pending` leaks the same thing in aggregate.
+     * (An `alerts` field used to be blinded here too — a per-row "your count is
+     * more than N% off" counter. Both it and the share axis it answered are
+     * DELETED, not merely nulled; the count digest that replaced them is written
+     * to the admin-only audit trail and never returned to this caller. Do not
+     * re-add a variance-derived field to this response.)
      *
      * The /closing-stock page already renders every one of these behind
      * `isAdmin` (page.tsx:1588-1589, 2684-2694) and coerces with `|| 0`, so
@@ -778,7 +821,7 @@ export async function POST(request: Request) {
         // count DIFFERED from the system figure, so leaving it whole would leak
         // the same bit `pending` does. `dept_immediate` stays — it says which
         // RAIL the save touched, never whether anything differed.
-        pending: null, applied: null, auto_applied: null, alerts: null, dept_anchored: null,
+        pending: null, applied: null, auto_applied: null, dept_anchored: null,
       });
     }
     return Response.json(results);
