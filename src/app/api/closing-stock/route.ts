@@ -4,7 +4,9 @@ import {
   DEPT_REQUESTED_ITEM_SQL, NOT_STORE_MAPPED_SQL, deptRequestedParams, selectedDeptSet,
 } from '@/lib/dept-requested-items';
 import { materialStoreId, getStoreById } from '@/lib/store-engine';
-import { upsertVarianceApproval, approveVariance } from '@/lib/variance-approval';
+import {
+  recordCountVariance, readPhysicalCount, zeroPatternGuard, type CountInput,
+} from '@/lib/variance-approval';
 import { rateMap, valueCount, type RateSource } from '@/lib/closing-valuation';
 import { packFactor, toPurchaseQty, type PackMeta } from '@/lib/pack-units';
 import { checkClosingDate } from '@/lib/closing-date';
@@ -402,6 +404,17 @@ export async function POST(request: Request) {
     // count already re-anchors its own balance the moment it is saved, which is
     // why varianceApprovalBlock() refuses them, so ticking the box leaves those
     // rows pending exactly as before.
+    //
+    // ⚠ READ THE LINE ABOVE AS "one-CLICK", NOT AS "cannot". ONCE AN ADMIN ARMS
+    // THE BAR (closing_variance_bar_value / _qty) a non-admin's saved count DOES
+    // move central stock — automatically, up to the bar and never above
+    // AUTO_APPLY_HARD_VALUE_CEILING, recorded as `system:auto-apply`. That is
+    // the owner's approved model, not a hole: small differences apply
+    // themselves and appear on the report; anything bigger is HELD for an
+    // admin. What this flag still guarantees is that no non-admin can reconcile
+    // an ARBITRARY difference away by ticking a box. The bar ships at 0 (off),
+    // so on a fresh install the sentence above is literally true; the moment it
+    // is set, this is the sentence that describes the system.
     const authMod = await import('@/lib/auth');
     const me = await authMod.getCurrentUser();
     const isAdmin = me?.role === 'admin';
@@ -457,10 +470,97 @@ export async function POST(request: Request) {
     if (!checked.ok) return Response.json({ error: checked.error }, { status: 400 });
     const dateStr = checked.date;
 
+    /* ══════════════════════════════════════════════════════════════════════
+     * THE COUNT IS READ ONCE, BEFORE ANYTHING IS WRITTEN (2026-08)
+     * ══════════════════════════════════════════════════════════════════════
+     * `Number(item.physical_stock)` used to sit inside the write loop, and
+     * `Number('') === 0` / `Number(null) === 0` are both finite and >= 0 — so a
+     * BLANK cell passed the `isNaN || < 0` guard and was stored as a REAL
+     * COUNTED ZERO. Worse, the upsert-delete below fires for any line that gets
+     * that far, so a blank DELETED the count already saved for that
+     * (date, material, department) and replaced it with 0.
+     *
+     * readPhysicalCount() is the ONE reader (src/lib/variance-approval.ts):
+     * blank ⇒ not_counted ⇒ this line does not exist for this submit — no
+     * delete, no insert, no variance, no approval, no error. A 0 is a real
+     * count and behaves like any other number.
+     *
+     * Parsed HERE rather than in the loop so the zero-pattern guard below can
+     * judge the whole submit BEFORE the transaction opens. One parse, one
+     * array, indexed alongside `items`.
+     * ────────────────────────────────────────────────────────────────────── */
+    const parsed: CountInput[] = (items as unknown[]).map(
+      i => readPhysicalCount((i as { physical_stock?: unknown } | null)?.physical_stock),
+    );
+
+    /* THE UPLOAD PATTERN GUARD (owner requirement 7). Not a value check — a 0 is
+     * a legitimate count and stays one. This refuses a submit in which an
+     * IMPLAUSIBLE SHARE of the counted lines read 0, which is the signature of a
+     * sheet whose blanks were filled in by a spreadsheet (the incident: 793 of
+     * 1,033). It names the count, refuses before a single row is written, and a
+     * genuine all-zero stocktake still goes through on a second submit carrying
+     * `confirm_zeros: true`. Thresholds are in the lib and are generous enough
+     * that an EOD keypad entry or a small correction can never reach them. */
+    /* THE GUARD JUDGES WRITABLE LINES, NOT MERELY PARSED ONES.
+     *
+     * Counting every parsed line let unwritable lines DILUTE the share, and
+     * dilution is the dangerous direction — it makes the guard quieter, never
+     * louder. Measured: 20 real zeros plus 40 lines whose material does not
+     * exist gave 20/60 = 33%, no warning, and 20 counted zeros written. The
+     * realistic version is not a hand-built payload at all: a central sheet
+     * carrying LIQUOR materials (rejected per line, a few lines below) or stale
+     * material ids from an old export. It was also over-strict the other way —
+     * 30 zeros that could never be written still 409'd.
+     *
+     * So the denominator is the two per-line refusals that sit above the
+     * upsert-delete in the loop below: material not found, and store-mapped
+     * material. Those lookups are by primary key on a set already in memory;
+     * the loop keeps doing its OWN read (it must — an auto-applied line changes
+     * current_stock, and a later line of the same material has to see it). */
+    const guardCounts: number[] = [];
+    for (let i = 0; i < items.length; i++) {
+      const pc = parsed[i];
+      if (pc.kind !== 'count') continue;
+      const mid = String(items[i]?.material_id || '').trim();
+      if (!mid) continue;
+      const m = db.prepare('SELECT id, category FROM raw_materials WHERE id = ?').get(mid) as
+        { id: string; category?: string | null } | undefined;
+      if (!m) continue;                          // per-line "Material not found"
+      if (materialStoreId(db, m)) continue;      // per-line "use <store> closing"
+      guardCounts.push(pc.qty);
+    }
+    const zeroGuard = zeroPatternGuard(guardCounts);
+    if (zeroGuard.suspicious && body.confirm_zeros !== true) {
+      return Response.json(
+        { error: zeroGuard.message, zero_guard: { ...zeroGuard, confirm_field: 'confirm_zeros' } },
+        { status: 409 },
+      );
+    }
+
+    // ONE id for this whole save, stamped on every approval it raises, so the
+    // monthly review can address "that upload" instead of a date range.
+    const batchId = generateId();
+    const batchLabel = topDeptId ? 'Closing sheet (department)' : 'Closing sheet';
+
     // `pending` = variances left for an admin to clear later; `applied` = variances
-    // this submit already posted to stock (adjust_stock, admin, central rows only).
-    // Every non-zero variance lands in exactly one of the two.
-    const results = { success: 0, pending: 0, applied: 0, errors: [] as string[], total_value: 0 };
+    // this submit already posted to stock (the admin's adjust_stock tick, or the
+    // bar's auto-apply — central rows only). Every non-zero variance lands in
+    // exactly one of the two. `not_counted` = blank lines, which are neither.
+    const results = {
+      success: 0, pending: 0, applied: 0, auto_applied: 0, not_counted: 0,
+      // DEPARTMENT ROWS. `dept_anchored` counts the counts whose DEPARTMENT
+      // balance moved at save time and which are therefore neither pending nor
+      // reviewable — they used to be added to `pending`, which told the screen a
+      // hold existed that never did. Variance-dependent, so it is blinded with
+      // the rest below. `dept_immediate` is the rail-level fact (this submit
+      // carried department rows at all) and is NOT variance-dependent, so it
+      // stays whole for everyone: it is what lets a non-admin's screen say the
+      // plain thing without answering "did my count match?".
+      dept_anchored: 0, dept_immediate: false,
+      alerts: 0, errors: [] as string[], total_value: 0,
+      zero_guard: zeroGuard.suspicious ? { ...zeroGuard, confirmed: true } : null,
+      batch_id: batchId,
+    };
 
     // ONE purchase lookup for the entire submit, resolved BEFORE the write
     // transaction opens. A sheet posts several hundred lines; a per-line
@@ -477,8 +577,20 @@ export async function POST(request: Request) {
         "DELETE FROM closing_stock WHERE date = ? AND material_id = ? AND COALESCE(department_id, '') = COALESCE(?, '')"
       );
 
-      for (const item of items) {
+      for (let idx = 0; idx < items.length; idx++) {
+        const item = items[idx];
         if (!item.material_id) continue;
+
+        // BLANK = NOT COUNTED, and it is decided FIRST — before the material
+        // lookup, before the store guard, and above all before the
+        // upsert-delete. A line nobody counted is not a line: it must not
+        // produce a row, must not remove the row that IS there, and must not
+        // produce an error either (a blank cell on a stale material id is not
+        // something to complain about). A counted 0 is not blank and falls
+        // through to the normal path.
+        const pc = parsed[idx];
+        if (pc.kind === 'not_counted') { results.not_counted++; continue; }
+
         // Per-item department_id overrides the top-level one when present.
         const deptId = item.department_id !== undefined ? normDept(item.department_id) : topDeptId;
 
@@ -510,12 +622,16 @@ export async function POST(request: Request) {
         // src/lib/variance-approval.ts. Counting a department against its own
         // computed balance is a separate build.
         const systemStock = material.current_stock;
-        const physicalStock = Number(item.physical_stock);
 
-        if (isNaN(physicalStock) || physicalStock < 0) {
-          results.errors.push(`Invalid physical stock for ${material.name}`);
+        // Anything that was TYPED but is not a count (letters, a unit suffix, a
+        // negative) is still a per-line error and still leaves the stored count
+        // alone — only blanks are silent. Same rejection as before; the reason
+        // is now specific instead of "Invalid physical stock".
+        if (pc.kind === 'error') {
+          results.errors.push(`${material.name}: ${pc.reason}`);
           continue;
         }
+        const physicalStock = pc.qty;
 
         // THE UPSERT-DELETE RUNS ONLY AFTER THE LINE IS KNOWN GOOD. It used to
         // run before this validation, so a typo'd quantity DELETED the count
@@ -551,62 +667,85 @@ export async function POST(request: Request) {
 
         results.total_value = r2(results.total_value + valued.totalValue);
 
-        // A non-zero variance never changes stock from HERE — it creates a
-        // PENDING approval, and stock moves only when that approval is granted.
-        // A re-count that now matches clears any stale pending row and returns
-        // null (handled inside).
-        const approvalId = upsertVarianceApproval(db, {
+        /* ══════════════════════════════════════════════════════════════════
+         * THE ONE DOOR FROM A SAVED COUNT TO A MOVED STOCK FIGURE
+         * ══════════════════════════════════════════════════════════════════
+         * recordCountVariance() parks the PENDING approval and then decides,
+         * against the admin's configured BAR, whether this difference is small
+         * enough to apply itself:
+         *   · under the bar → applied NOW, through the queue's own
+         *     approveVariance() — never a second UPDATE of current_stock — so
+         *     the delta, the floors, the supersede guard and the
+         *     inventory_transactions log are identical to approving it a month
+         *     from now.
+         *   · above the bar → HELD. The count is saved and visible; the stock
+         *     figure does not move until an admin approves it.
+         * Bar unset (the shipped default) ⇒ nothing auto-applies and this
+         * behaves exactly as it did before.
+         *
+         * `force_apply` is the admin's "Adjust system stock" tick, which used
+         * to call approveVariance() inline here. It now goes through the same
+         * function so there is ONE place a variance reaches raw_materials.
+         * DEPARTMENT rows are carved out inside recordCountVariance (their
+         * balance is already re-anchored by dept-ledger at save time), which is
+         * why this passes `adjustStock` and not `adjustStock && !deptId` — the
+         * carve-out moved into the shared rule instead of being repeated here.
+         * ────────────────────────────────────────────────────────────────── */
+        const decided = recordCountVariance(db, {
           source: 'central',
           material_id: item.material_id,
           department_id: deptId || '',
-          date,
+          date: dateStr,
           system_stock: systemStock,
           physical_stock: physicalStock,
           unit: material.unit,
           counted_by: item.recorded_by || me?.email || '',
           count_note: item.notes || '',
           outlet_id: outletId,
+          batch_id: batchId,
+          batch_label: batchLabel,
+          pack: material,
+          force_apply: adjustStock,
+          applied_by: adjustStock ? (me?.email || 'admin') : undefined,
+          applied_reason: adjustStock
+            ? `Adjust system stock ticked on the closing sheet for ${dateStr} — approved at count time by the admin who saved the count.`
+            : undefined,
         });
+        if (decided.alert) results.alerts++;
+        // Rail-level, not count-level: true as soon as this submit wrote a
+        // department-tagged row at all, whether or not it differed from the
+        // book. Set outside the `variance !== 0` block on purpose — a screen
+        // must be able to say "department counts apply immediately" without
+        // that sentence doubling as an answer to "did my counts match?".
+        if (deptId) results.dept_immediate = true;
         if (variance !== 0) {
-          // `adjust_stock` ticked by an admin on a CENTRAL row = grant that
-          // approval right now, in the same breath, as the admin who saved.
-          // It is the queue's own approveVariance() — never a second
-          // UPDATE of raw_materials.current_stock — so the delta posted, the
-          // negative-stock behaviour, the inventory_transactions log and the
-          // reviewed_by trail are byte-for-byte what "approve later" produces.
+          // An apply that was ATTEMPTED and REFUSED (cutover floor, QC hold, a
+          // newer count) must not be silent and must not cost the count: the
+          // closing_stock row survives — better-sqlite3 nests approveVariance's
+          // transaction as a SAVEPOINT inside ours, so its rollback unwinds only
+          // its own writes — and the approval simply stays pending.
           //
-          // It lands exactly on the counted figure because `systemStock` above
-          // IS live current_stock at this instant, so approveVariance's
-          // (physical − system-at-count) delta is (physical − current):
-          // before + delta == physical. That equality is only true here, at
-          // save time — which is precisely why the deferred path posts a delta
-          // instead of an absolute set.
-          //
-          // DEPARTMENT rows are excluded on purpose: saving the count has
-          // already re-anchored that department's own balance (dept-ledger
-          // prefers the count as anchor), so approving would take the same
-          // difference off twice — varianceApprovalBlock() refuses them for
-          // exactly this reason. They stay pending, and central is not touched.
-          let applied = false;
-          if (adjustStock && !deptId && approvalId) {
-            // Failure must NOT be silent and must NOT cost the count: the
-            // approval simply stays pending and the admin is told why. The
-            // saved closing_stock row survives because better-sqlite3 nests
-            // approveVariance's transaction as a SAVEPOINT inside ours, so its
-            // rollback unwinds only its own writes.
-            try {
-              const res = approveVariance(
-                db, approvalId, me?.email || 'admin',
-                `Adjust system stock ticked on the closing sheet for ${date} — approved at count time by the admin who saved the count.`,
-              );
-              if (res.ok) applied = true;
-              else results.errors.push(`${material.name}: count saved, but system stock was NOT adjusted — ${res.error}`);
-            } catch (e: any) {
-              results.errors.push(`${material.name}: count saved, but system stock was NOT adjusted — ${e?.message || 'approval failed'}`);
-            }
+          // ADMINS ONLY. The reason names the system figure's provenance and,
+          // more sharply, its very presence tells a counter that their count was
+          // small enough to try to auto-apply — which bisects system stock in a
+          // few saves. Blind counts are load-bearing on every closing surface;
+          // a non-admin's count is saved either way and there is nothing for
+          // them to act on.
+          if (decided.apply_error && isAdmin) {
+            results.errors.push(`${material.name}: count saved, but system stock was NOT adjusted — ${decided.apply_error}`);
           }
-          if (applied) results.applied++;
-          else results.pending++;
+          if (decided.outcome === 'applied') {
+            results.applied++;
+            if (decided.auto_applied) results.auto_applied++;
+          } else if (decided.outcome === 'anchored') {
+            // NOT pending. A department count re-anchored that department's
+            // balance the moment the closing_stock row above was written, so
+            // there is nothing parked and nothing to approve. Counting it as
+            // pending is exactly the false hold this branch exists to stop.
+            results.dept_anchored++;
+          } else {
+            results.pending++;
+          }
         }
 
         results.success++;
@@ -615,6 +754,33 @@ export async function POST(request: Request) {
 
     recordClosingStock();
 
+    /* BLIND COUNTS ON THE WAY BACK OUT (2026-08). GET has stripped
+     * system_stock/variance from non-admins since blind counts shipped; the
+     * SAVE response had not caught up, and the bar makes it far sharper than it
+     * was. `applied` is now a per-save answer to "was my count within ₹X of the
+     * system figure?" — save one line, watch it flip between applied and
+     * pending, and a handful of bisecting re-saves recovers current_stock
+     * exactly. `pending` leaks the same thing in aggregate, and `alerts` leaks
+     * "your count is more than N% off".
+     *
+     * The /closing-stock page already renders every one of these behind
+     * `isAdmin` (page.tsx:1588-1589, 2684-2694) and coerces with `|| 0`, so
+     * nulls change nothing on screen for anyone. `success`, `not_counted`,
+     * `total_value` and `errors` stay whole: they describe what the counter
+     * TYPED and what their count is worth, never what the system expected —
+     * the same line GET already draws (cost data ships, variance data does not).
+     * A caller must NOT render the null branch as "everything matched".
+     */
+    if (!isAdmin) {
+      return Response.json({
+        ...results,
+        // dept_anchored is blinded with the rest: it only counts rows whose
+        // count DIFFERED from the system figure, so leaving it whole would leak
+        // the same bit `pending` does. `dept_immediate` stays — it says which
+        // RAIL the save touched, never whether anything differed.
+        pending: null, applied: null, auto_applied: null, alerts: null, dept_anchored: null,
+      });
+    }
     return Response.json(results);
   } catch (error: any) {
     return Response.json({ error: error.message }, { status: 500 });

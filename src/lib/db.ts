@@ -1840,6 +1840,53 @@ function initializeSchema(db: Database.Database) {
     if (!cols.has('total_value'))            db.exec(`ALTER TABLE closing_stock ADD COLUMN total_value REAL`);
   } catch (e) { console.error('closing_stock valuation columns failed:', e); }
 
+  /* ══════════════════════════════════════════════════════════════════════════
+   * VARIANCE APPROVALS — the bar, the batch, and nothing retroactive (2026-08)
+   * ══════════════════════════════════════════════════════════════════════════
+   * Three additive columns, each guarded on its own so a partial apply on one
+   * boot completes on the next (schema errors in this file are SWALLOWED — the
+   * catch below prints and moves on, so a half-applied block must be able to
+   * finish later rather than depend on all three landing together).
+   *
+   *   auto_applied  0/1 — 1 means the BAR applied this row at count time and NO
+   *                 HUMAN reviewed it. Needed because reviewed_by/review_reason
+   *                 otherwise claim a person decided. NOT set for the admin's
+   *                 "Adjust system stock" tick: that is a person choosing.
+   *   batch_id      the SUBMIT this count arrived in. Closing stock is uploaded
+   *                 weekly and reviewed monthly, so the review needs a handle on
+   *                 "that upload" — a date range also sweeps up anything else
+   *                 counted the same day.
+   *   batch_label   human name for that submit ("All-departments CSV").
+   *
+   * DEFAULTS, NOT BACKFILLS. Every existing row keeps auto_applied 0 and an
+   * empty batch, which is the truth: nobody knows which upload they came from
+   * and no machine applied them. THERE IS DELIBERATELY NO UPDATE HERE — the
+   * owner's 1,472 pending rows are his to decide, and a migration that rewrote
+   * their status, their batch or their applied flag would be exactly the silent
+   * revert this codebase has been bitten by before. Nothing in this block
+   * touches an existing row's meaning.
+   *
+   * VERIFY AFTER ONE BOOT (schema failures here are silent, so this is not
+   * optional — run it against a VACUUM INTO snapshot, never the live file):
+   *   PRAGMA table_info(variance_approvals);
+   *     → auto_applied INTEGER, batch_id TEXT, batch_label TEXT all present
+   *   SELECT COUNT(*) FROM variance_approvals WHERE auto_applied <> 0;   -- 0
+   *   SELECT COUNT(*) FROM variance_approvals WHERE COALESCE(batch_id,'') <> ''; -- 0 before any new save
+   *   SELECT name FROM sqlite_master WHERE name='idx_variance_appr_batch';       -- present
+   * If a column is missing, the app still RUNS but every write naming it throws
+   * — the closing-stock POST would 500 rather than corrupt anything.
+   * ═════════════════════════════════════════════════════════════════════════ */
+  try {
+    const vaCols = new Set((db.prepare(`PRAGMA table_info(variance_approvals)`).all() as any[]).map(c => c.name));
+    if (!vaCols.has('auto_applied')) db.exec(`ALTER TABLE variance_approvals ADD COLUMN auto_applied INTEGER NOT NULL DEFAULT 0`);
+    if (!vaCols.has('batch_id'))     db.exec(`ALTER TABLE variance_approvals ADD COLUMN batch_id TEXT NOT NULL DEFAULT ''`);
+    if (!vaCols.has('batch_label'))  db.exec(`ALTER TABLE variance_approvals ADD COLUMN batch_label TEXT NOT NULL DEFAULT ''`);
+    // LAST, and only reachable once the ALTER above has either run or been found
+    // unnecessary — an ALTER that throws jumps straight to the catch, so this
+    // line can never index a column that does not exist.
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_variance_appr_batch ON variance_approvals(batch_id)`);
+  } catch (e) { console.error('variance_approvals bar/batch columns failed:', e); }
+
   // Butchering — track whole-carcass breakdown into named cuts.
   // Buys carcass at vendor rate (per kg of dressed weight); cuts inherit
   // pro-rata cost (default by weight). Waste is tracked separately so the

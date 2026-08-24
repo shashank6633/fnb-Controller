@@ -226,9 +226,17 @@ export default function EODPage() {
       <div className="px-4 py-3">
         <div className="bg-white border-2 border-[#D4B896] rounded-2xl p-5 text-center">
           <div className="text-[10px] uppercase tracking-wide text-[#8B7355]">Physical count</div>
+          {/* THE EMPTY STATE MUST NOT LOOK LIKE A ZERO. It printed a faded "0"
+              at 4xl in the middle of the screen — the single biggest instance of
+              the ambiguity this whole change removes. Nothing typed means
+              nothing counted; a real 0 is a deliberate keypress and reads solid
+              black beside the "counted, none left" note below. */}
           <div className="text-4xl font-bold text-[#2D1B0E] mt-1 font-mono min-h-[3rem]">
-            {keypad || <span className="text-[#D4B896]">0</span>}
+            {keypad || <span className="text-2xl font-medium text-[#C4B09A]">not counted yet</span>}
           </div>
+          {keypad.trim() !== '' && Number(keypad) === 0 && (
+            <div className="text-[11px] font-medium text-amber-800">counted — none left on the shelf</div>
+          )}
           {/* The box is always in the purchase unit; saveCount converts back
               with the same packFactor(), so label and storage cannot disagree. */}
           <div className="text-xs text-[#6B5744] mt-1">
@@ -257,9 +265,12 @@ export default function EODPage() {
 
       {/* Action bar */}
       <div className="bg-white border-t border-[#E8D5C4] px-3 py-3 grid grid-cols-2 gap-2">
+        {/* "Skip" is the NOT-COUNTED answer, and saying so is what keeps it
+            distinct from tapping 0 and saving. Nothing is written for a skip. */}
         <button onClick={skipItem}
-                className="py-4 bg-[#FFF1E3] text-[#6B5744] rounded-xl font-semibold flex items-center justify-center gap-2">
-          <SkipForward size={18} /> Skip
+                className="py-4 bg-[#FFF1E3] text-[#6B5744] rounded-xl font-semibold flex flex-col items-center justify-center leading-tight">
+          <span className="flex items-center gap-2"><SkipForward size={18} /> Skip</span>
+          <span className="text-[10px] font-normal text-[#8B7355]">did not count this</span>
         </button>
         <button onClick={saveCount} disabled={saving || !keypad}
                 className="py-4 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-40 text-white rounded-xl font-semibold flex items-center justify-center gap-2">

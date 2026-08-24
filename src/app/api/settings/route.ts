@@ -72,6 +72,43 @@ const KEY_POLICY = new Map<string, KeyPolicy>([
     write: 'admin',
     writeError: 'Admin role required to change when stock is deducted',
   }],
+  // THE VARIANCE BAR — the sharpest self-lift in this table, and it was open.
+  // These four decide how much stock movement happens with NO admin in the
+  // loop: a count whose difference is under the bar applies itself to
+  // raw_materials.current_stock / the store ledger at save time, recorded as
+  // `system:auto-apply`, with the manager's name nowhere in the audit trail.
+  // Saving a count is open to every signed-in user, so a manager who could
+  // write these would be arming an unreviewed write path for the whole staff —
+  // the identical shape as purchase_backdate_limit_days and
+  // po_require_admin_approval above, one table over.
+  //
+  // MEASURED before this row existed: a manager PUT bar_qty=100 through this
+  // endpoint, then saved a counted 0 on a 35-piece gas line and
+  // ₹202,947.50 left the books with no admin anywhere in the chain.
+  //
+  // /api/closing-stock/variance-bar is the dedicated door and is admin-only,
+  // but it is NOT registered `owner:` here on purpose: it writes nothing this
+  // endpoint cannot write and adds no masking, so shutting the generic door for
+  // admins too would buy nothing and break any admin client that PUTs settings
+  // generically. write:'admin' is exactly the rule that was missing.
+  // READ stays open — the numbers are policy, not a system-stock oracle, and
+  // /variance-approvals shows managers nothing anyway (it is adminOnly).
+  ['closing_variance_bar_value', {
+    write: 'admin',
+    writeError: 'Admin role required to change the variance auto-apply bar',
+  }],
+  ['closing_variance_bar_qty', {
+    write: 'admin',
+    writeError: 'Admin role required to change the variance auto-apply bar',
+  }],
+  ['closing_variance_alert_value', {
+    write: 'admin',
+    writeError: 'Admin role required to change the variance alert',
+  }],
+  ['closing_variance_alert_pct', {
+    write: 'admin',
+    writeError: 'Admin role required to change the variance alert',
+  }],
   // Owned keys. Each has a dedicated admin-only route that VALIDATES the value
   // (Slack host check, service-account JSON parse, printer normalisation) and
   // masks it on read — writing it through here would bypass both gate and

@@ -2,7 +2,9 @@ import { getDb, generateId } from '@/lib/db';
 import { getCurrentOutletId, getCurrentUser } from '@/lib/auth';
 import { allowedDeptSetExpanded, canSeeAllDeptStock } from '@/lib/dept-stock';
 import { materialStoreId, getStoreById } from '@/lib/store-engine';
-import { upsertVarianceApproval } from '@/lib/variance-approval';
+import {
+  recordCountVariance, readPhysicalCount, zeroPatternGuard,
+} from '@/lib/variance-approval';
 import { rateMap, valueCount, valueSemiCount } from '@/lib/closing-valuation';
 import { packFactor, toPurchaseQty, type PackMeta } from '@/lib/pack-units';
 import { todayIST } from '@/lib/format-date';
@@ -221,19 +223,24 @@ const OWNER_COLUMN_ALIASES: Record<string, string> = {
 /**
  * A count cell → a non-negative number, or null when it is not one.
  *
- * parseFloat is NOT good enough here. Excel hands back grouped numbers
- * ("1,200") and stray unit suffixes ("3 kg"); parseFloat reads those as 1 and 3
- * and writes a silent 1000x / unit error into the ledger. Grouping separators
- * are accepted only in the exact 1,200,000.5 shape; anything else is refused so
- * the counter is told rather than quietly mis-read.
+ * THIS IS NOW A THIN WRAPPER OVER THE SHARED READER, not a second rule.
+ * readPhysicalCount() (src/lib/variance-approval.ts) was written FROM this
+ * function — it was the only one of the five intake paths that already knew a
+ * blank is not a zero, and that "1,200" and "3 kg" must be refused rather than
+ * read as 1 and 3. Keeping a local copy is how the two doors into one file
+ * start disagreeing about it, so the rule now lives in one place and this
+ * adapts its three-state answer to the `number | null` shape the callers below
+ * already branch on.
+ *
+ * The distinction between not_counted and error is not lost at the call sites:
+ * a blank cell never reaches here at all — `if (v !== '')` at :714 has always
+ * dropped it before the parse — so a null returned here can only ever mean
+ * "typed, and not a count", which is exactly the per-line error the callers
+ * raise. `raw` is already trimmed by cell().
  */
 function parseCount(raw: string): number | null {
-  let s = String(raw ?? '').trim();
-  if (s === '') return null;
-  if (/^\d{1,3}(,\d{3})+(\.\d+)?$/.test(s)) s = s.replace(/,/g, '');
-  if (!/^\d+(\.\d+)?$/.test(s)) return null;
-  const n = Number(s);
-  return isFinite(n) ? n : null;
+  const pc = readPhysicalCount(raw);
+  return pc.kind === 'count' ? pc.qty : null;
 }
 
 /* ── scope ────────────────────────────────────────────────────────────────── */
@@ -450,7 +457,7 @@ interface SemiEntry {
 
 /** Read the CSV whichever way it arrives: the agreed JSON body, or multipart
  *  from a plain <input type=file> form. */
-async function readBody(req: Request): Promise<{ date: string; csv: string; mode: string }> {
+async function readBody(req: Request): Promise<{ date: string; csv: string; mode: string; confirmZeros: boolean }> {
   const ct = req.headers.get('content-type') || '';
   if (ct.includes('multipart/form-data')) {
     const fd = await req.formData();
@@ -459,6 +466,11 @@ async function readBody(req: Request): Promise<{ date: string; csv: string; mode
       date: String(fd.get('date') || ''),
       csv: file instanceof Blob ? await file.text() : String(fd.get('csv') || ''),
       mode: String(fd.get('mode') || 'preview'),
+      // A form field is a STRING, so the only accepted spellings are the two
+      // explicit ones. Anything else — including the empty value a browser
+      // sends for an unchecked box — is a no, which is the direction a
+      // confirmation must fail in.
+      confirmZeros: ['1', 'true'].includes(String(fd.get('confirm_zeros') || '').trim().toLowerCase()),
     };
   }
   const body = await req.json().catch(() => ({} as Record<string, unknown>));
@@ -466,6 +478,9 @@ async function readBody(req: Request): Promise<{ date: string; csv: string; mode
     date: String((body as Record<string, unknown>)?.date || ''),
     csv: String((body as Record<string, unknown>)?.csv || ''),
     mode: String((body as Record<string, unknown>)?.mode || 'preview'),
+    // Strict `=== true` on the JSON path: a truthy string from an old client
+    // must not silently confirm a mass-zeroed sheet.
+    confirmZeros: (body as Record<string, unknown>)?.confirm_zeros === true,
   };
 }
 
@@ -476,7 +491,7 @@ export async function POST(request: Request) {
     if ('error' in scope) return scope.error;
     const me = scope.me;
 
-    const { date: rawDate, csv, mode: rawMode } = await readBody(request);
+    const { date: rawDate, csv, mode: rawMode, confirmZeros } = await readBody(request);
     const mode = rawMode === 'apply' ? 'apply' : 'preview';
     // ONE date check per UPLOAD — before the CSV is even parsed, and long before
     // the transaction opens. The file carries one date for up to ~1,025 rows x 8
@@ -820,6 +835,39 @@ export async function POST(request: Request) {
 
     const willWrite = rawEntries.length + semiEntries.length;
 
+    /* ══════════════════════════════════════════════════════════════════════
+     * 4b. THE ZERO-PATTERN GUARD — the check that would have caught the
+     *     incident, and the only one of the seven fixes aimed at the FILE.
+     * ══════════════════════════════════════════════════════════════════════
+     * Everything above already got blanks right: `if (v !== '')` at :714 drops
+     * an empty cell, so a blank department column has never been counted here.
+     * That is exactly why this importer did NOT prevent the incident — the 793
+     * cells arrived carrying a literal typed `0`, which is a real count by the
+     * owner's own rule and must stay one. No value check can tell those apart.
+     *
+     * What CAN be told apart is the PATTERN. 793 zeros out of 1,033 counted
+     * cells (77%) is not a stocktake, it is a spreadsheet that filled its own
+     * blanks. So this counts the zeros across every department column of the
+     * whole file, and refuses BEFORE anything is written, NAMING THE COUNT.
+     *
+     * A GENUINE ALL-ZERO STOCKTAKE MUST STILL BE POSSIBLE — and is: the same
+     * file re-submitted with confirm_zeros writes all 793 as counted zeros.
+     * This is a speed bump in front of an irreversible bulk write, not a rule
+     * about what a count may contain.
+     *
+     * PREVIEW REPORTS IT AND DOES NOT REFUSE. Preview writes nothing, and its
+     * whole job is to show the owner what is about to happen — a refusal there
+     * would hide the mapping, the sample and the error list behind a warning
+     * about them. Apply is where the refusal belongs.
+     * ────────────────────────────────────────────────────────────────────── */
+    const zeroGuard = zeroPatternGuard([
+      ...rawEntries.map(e => e.entered),
+      ...semiEntries.map(e => e.entered),
+    ]);
+    // `entered` (what the counter TYPED), not recipeQty: a conversion cannot
+    // turn a zero into a non-zero or back, so the two agree on which cells are
+    // zero — and `entered` is the number the message quotes back at the owner.
+
     /* ── 5. PREVIEW — resolve everything, write nothing ────────────────────── */
     if (mode === 'preview') {
       // Both figures in the sample: `entered` is what the counter typed and
@@ -859,10 +907,14 @@ export async function POST(request: Request) {
         ignored_columns: ignoredColumns,
         total_rows: dataRows.length,
         will_write: willWrite,
-        // Rows where no department column carried a count at all.
+        // Rows where no department column carried a count at all. BLANK = NOT
+        // COUNTED: these are not zeros and nothing is written for them.
         skipped: Math.max(0, dataRows.length - rowsWithCounts),
         errors,
         sample,
+        // Shown, not enforced, at preview. `suspicious` true ⇒ apply will refuse
+        // this file unless it is re-sent with confirm_zeros.
+        zero_guard: { ...zeroGuard, confirm_field: 'confirm_zeros' },
       });
     }
 
@@ -871,6 +923,17 @@ export async function POST(request: Request) {
       // Refuse the whole file. A partial apply of a 1,025-row sheet leaves a
       // count nobody can trust and no way to tell which half landed.
       return Response.json({ mode: 'apply', saved: 0, pending: 0, refused: true, errors });
+    }
+    // THE ZERO-PATTERN REFUSAL — before the transaction opens, so not one row
+    // is written. 409, not 400: the file is not malformed, it is implausible,
+    // and the caller has a way to proceed (re-send with confirm_zeros: true).
+    if (zeroGuard.suspicious && !confirmZeros) {
+      return Response.json({
+        mode: 'apply', saved: 0, pending: 0, refused: true,
+        error: zeroGuard.message,
+        zero_guard: { ...zeroGuard, confirm_field: 'confirm_zeros' },
+        errors: [] as ImportError[],
+      }, { status: 409 });
     }
     if (willWrite === 0) {
       return Response.json({
@@ -882,7 +945,18 @@ export async function POST(request: Request) {
 
     const outletId = await getCurrentOutletId();
     const rates = rateMap(db);
-    let saved = 0, savedSemi = 0, pending = 0;
+    // ONE id for this upload, stamped on every approval it raises. This is what
+    // makes the monthly review a batch job: "clear the sheet uploaded on the
+    // 8th" is a filter on this id, where a date range would also sweep up
+    // anything else counted that day. It is also the handle bulk reject uses to
+    // undo a bad upload in one call.
+    const batchId = generateId();
+    const batchLabel = `All-departments CSV ${date}`;
+    let saved = 0, savedSemi = 0, pending = 0, applied = 0, autoApplied = 0, alerts = 0;
+    // Department rows are never parked (see recordCountVariance's header): they
+    // moved that department's balance at insert time, so they are counted here
+    // and NOT into `pending`, which used to claim a hold that did not exist.
+    let deptAnchored = 0, deptImmediate = false;
 
     const run = db.transaction(() => {
       /* ── RAW half — replicated from ../route.ts (see the header note) ───── */
@@ -922,10 +996,22 @@ export async function POST(request: Request) {
           valued.ratePerPurchaseUnit, valued.source, valued.totalValue,
         );
 
-        // A non-zero variance never moves stock — it raises a PENDING approval,
-        // through the SAME call the single-entry writer makes, so bulk counts
-        // land in the same admin queue.
-        upsertVarianceApproval(db, {
+        // THE ONE DOOR — the SAME call the single-entry writer makes, so bulk
+        // counts are judged against the same rule.
+        //
+        // Every row here is a DEPARTMENT row (this importer has one column per
+        // department and refuses a column with no department prefix), so none
+        // of them can auto-apply AND none of them can be held: dept-ledger's
+        // latestCount() has already re-anchored that department's balance from
+        // the closing_stock row inserted immediately above. They come back
+        // 'anchored' and are counted into `dept_anchored`. `applied` and
+        // `pending` therefore both stay 0 on this route, and are returned anyway
+        // so the shape does not change the day that anchor is fixed.
+        //
+        // THIS IS THE ROUTE THE INCIDENT SHEET CAME THROUGH. Its 13 department
+        // columns × ~930 materials is where the bulk of a 1,472-row queue came
+        // from, and not one of those rows could ever have been approved.
+        const decided = recordCountVariance(db, {
           source: 'central',
           material_id: m.id,
           department_id: e.department_id,
@@ -936,8 +1022,17 @@ export async function POST(request: Request) {
           counted_by: me.email || '',
           count_note: e.notes,
           outlet_id: outletId,
+          batch_id: batchId,
+          batch_label: batchLabel,
+          pack: m as PackMeta,
         });
-        if (variance !== 0) pending++;
+        if (decided.alert) alerts++;
+        deptImmediate = true;
+        if (variance !== 0) {
+          if (decided.outcome === 'applied') { applied++; if (decided.auto_applied) autoApplied++; }
+          else if (decided.outcome === 'anchored') deptAnchored++;
+          else pending++;
+        }
         saved++;
       }
 
@@ -969,12 +1064,32 @@ export async function POST(request: Request) {
 
     run();
 
+    /* BLIND COUNTS. This route is open to anyone with a department assigned
+     * (resolveScope), and `pending` / `applied` / `alerts` answer "did my count
+     * match the system?" — a one-row CSV makes that a clean oracle, and a few
+     * bisecting uploads recover current_stock. Admins get the figures; everyone
+     * else gets nulls and the counts of what they actually uploaded. A caller
+     * must NOT render the null branch as "all counts reconcile". */
+    const blind = me.role !== 'admin';
     return Response.json({
       mode: 'apply',
       saved: saved + savedSemi,
-      pending,
+      pending: blind ? null : pending,
       saved_raw: saved,
       saved_semi: savedSemi,
+      // ── Additive (2026-08).
+      applied: blind ? null : applied,
+      auto_applied: blind ? null : autoApplied,
+      alerts: blind ? null : alerts,
+      // Blinded with the rest — it counts only rows that DIFFERED. The rail
+      // fact next to it is not variance-dependent and stays whole for everyone.
+      dept_anchored: blind ? null : deptAnchored,
+      dept_immediate: deptImmediate,
+      batch_id: batchId,
+      batch_label: batchLabel,
+      // Echoed when the owner confirmed a mass-zeroed file, so the confirmation
+      // is on the record in the response as well as in the counts themselves.
+      zero_guard: zeroGuard.suspicious ? { ...zeroGuard, confirmed: true } : null,
       errors: [] as ImportError[],
     });
   } catch (error: unknown) {

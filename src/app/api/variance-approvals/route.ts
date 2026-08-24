@@ -12,6 +12,11 @@ import {
  * GET ?status=pending|approved|rejected|all   (default pending)
  *     ?outlet=all      → read every outlet, not just the reviewer's current one
  *     ?limit=<1..1000> → how many rows to return (default 500)
+ *     ?from= &to=      → count date range (YYYY-MM-DD, inclusive) — the monthly view
+ *     ?batch_id=       → one upload. SENDING IT EMPTY selects the UNBATCHED rows,
+ *                        which is a real and useful selection (every row saved
+ *                        before batches existed). Omitting it means "any upload".
+ *     ?source=central|liquor → one rail
  *
  *  → {
  *      approvals, pending_count,          // unchanged meaning — see below
@@ -68,7 +73,34 @@ export async function GET(request: Request) {
   const asked = Math.floor(Number(url.searchParams.get('limit')));
   const limit = Number.isFinite(asked) && asked > 0 ? asked : 500;
 
-  const list = listVarianceApprovals(db, { status, outletId, limit, outletScope: scope });
+  /* ── THE MONTHLY FILTER, on the server where it can reach every row ────────
+   * Counts are uploaded weekly and reviewed once a month, so the queue is read
+   * as "last month's uploads", not as "everything pending". Without these the
+   * page could only narrow the newest `limit` rows it had already received —
+   * fine for reading, useless for a monthly review, because the rows a month-old
+   * period selects are exactly the ones that fell past the limit.
+   *
+   * `batch_id` is bound only when the parameter is PRESENT, because '' is a real
+   * selector here (rows saved before batches existed) and applyScopeWhere reads
+   * `!= null`. `url.searchParams.get` returns null when absent and '' when the
+   * caller sent `?batch_id=`, which is precisely the distinction needed — do not
+   * "tidy" this into `|| undefined`, that would turn "the unbatched rows" into
+   * "every row".
+   *
+   * Same four names as GET /api/variance-approvals/bulk takes, so a preview
+   * there and the list here describe the same selection. */
+  const from = (url.searchParams.get('from') || '').trim();
+  const to = (url.searchParams.get('to') || '').trim();
+  const batchParam = url.searchParams.get('batch_id');
+  const source = (url.searchParams.get('source') || '').trim();
+  const filters = {
+    from: from || null,
+    to: to || null,
+    ...(batchParam == null ? {} : { batchId: batchParam.trim() }),
+    source: source || null,
+  };
+
+  const list = listVarianceApprovals(db, { ...filters, status, outletId, limit, outletScope: scope });
 
   // Counted twice on purpose: "here" is the badge every existing client reads,
   // and "everywhere" is what makes an empty queue honest. Without the pair, a
@@ -84,6 +116,13 @@ export async function GET(request: Request) {
   // Same status and outlet scope as the list above, so the banner can never
   // describe rows the queue below it is not showing. It resolves to an empty
   // array on the approved/rejected tabs — nothing is pending there to stack.
+  //
+  // DELIBERATELY NOT narrowed by from/to/batch_id. "This item holds more than
+  // one pending count" is a fact about the item's whole history, and the danger
+  // it warns about — approving two frozen baselines for one item — does not go
+  // away because the admin is looking at one month. Narrowing it would report
+  // "1 pending count" for an item that has four, which is the reassuring
+  // version of the exact mistake this banner exists to prevent.
   const stacked = stackedPendingCounts(db, { status, outletId, outletScope: scope });
 
   return Response.json({
@@ -98,6 +137,17 @@ export async function GET(request: Request) {
     limit: list.limit,
     pending_count_all_outlets: pendingEverywhere,
     pending_count_other_outlets: pendingElsewhere,
+    // ── Additive (2026-08). What the server ACTUALLY filtered on, echoed so a
+    // page cannot label a filtered list as the whole queue (or the reverse).
+    // `pending_count*` above are deliberately UNFILTERED — they are the badge
+    // numbers and have always meant "everything pending here / everywhere";
+    // `total` is the filtered figure.
+    filters: {
+      from: filters.from || '',
+      to: filters.to || '',
+      batch_id: batchParam == null ? null : batchParam.trim(),
+      source: filters.source || '',
+    },
     // ── Additive (2026-08). [{ material_id, material_name, pending_count,
     // latest_date }], newest date first. Only the newest count per item is
     // approvable; the rest are refused and must be rejected deliberately.

@@ -303,9 +303,37 @@ export async function GET() {
     // issue can never break the whole inbox.
     if (isAdmin) {
       try {
-        const { pendingVarianceCount } = await import('@/lib/variance-approval');
+        const { pendingVarianceCount, bigVarianceCount } = await import('@/lib/variance-approval');
         push('variance_approvals', 'Closing counts awaiting approval',
           pendingVarianceCount(db, outletId), '/variance-approvals');
+
+        // ── The IMMEDIATE alert: differences too big to wait for month end ──
+        // Closing counts are uploaded WEEKLY and reviewed MONTHLY by design, so
+        // without this the "immediate" alert WAS the month-end review — the
+        // functions existed and nothing in the app called them.
+        //
+        // COUNT = 1, AND THE NUMBER LIVES IN THE LABEL. Same rule as the
+        // cutover bucket immediately below, for the same reason: the badge SUMS
+        // `count` across items (CaptainAlertsProvider), and `variance_approvals`
+        // above has ALREADY counted every one of these rows — they are a subset
+        // of the pending queue, not a second pile of work. Pushing the big count
+        // here would add e.g. 60 to a badge that already carries them.
+        //
+        // Off unless an admin armed a threshold: bigVarianceCount returns 0 on
+        // an unconfigured alert without running a query, and push() drops a
+        // zero, so this bucket does not exist until someone asks for it.
+        //
+        // Same 'outlet' scope and same destination as the bucket above — the
+        // house rule is that a badge counts what its destination shows.
+        const big = bigVarianceCount(db, outletId);
+        if (big > 0) {
+          push(
+            'variance_big',
+            `${big} large stock ${big === 1 ? 'variance' : 'variances'} — over the alert threshold, do not wait for month end`,
+            1,
+            '/variance-approvals',
+          );
+        }
       } catch (vaErr) {
         console.error('[/api/notifications/inbox] variance bucket failed:', vaErr);
       }

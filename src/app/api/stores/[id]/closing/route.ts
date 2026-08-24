@@ -1,8 +1,11 @@
 import { getDb, generateId, logAuditEvent } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
 import { getStoreById, materialStoreId, userStoreAccess, isStoreMappedMaterial, storeCategories } from '@/lib/store-engine';
-import { upsertVarianceApproval } from '@/lib/variance-approval';
+import {
+  recordCountVariance, readPhysicalCount, zeroPatternGuard,
+} from '@/lib/variance-approval';
 import { checkClosingDate, CLOSING_DATE_RE } from '@/lib/closing-date';
+import type { PackMeta } from '@/lib/pack-units';
 
 /**
  * /api/stores/[id]/closing — INDEPENDENT store closing stock (Phase C, spec F6).
@@ -228,22 +231,43 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     // Validate everything BEFORE writing anything (all-or-nothing save).
     const prepared: {
       material_id: string; name: string; unit: string;
+      /** Pack meta, so the qty axis of the bar reads in PURCHASE units. */
+      pack: PackMeta;
       system_qty: number; physical_qty: number; variance: number;
       variance_value: number; avg_cost: number; note: string;
     }[] = [];
     const seen = new Set<string>();
+    /** Lines whose count cell was BLANK — recorded, never written. */
+    let notCounted = 0;
     for (const item of b.items) {
       const materialId = String(item?.material_id || '').trim();
-      const physical = Number(item?.physical_qty);
+      /* BLANK = NOT COUNTED, read through the ONE shared reader
+       * (readPhysicalCount, src/lib/variance-approval.ts).
+       *
+       * `Number(item?.physical_qty)` turned `''`, `'   '` and `null` into a
+       * finite, non-negative 0 that passed the `!Number.isFinite || < 0` guard
+       * and was stored as a real counted zero — and storage here is an
+       * `ON CONFLICT(store_id, material_id, date) DO UPDATE`, so that phantom
+       * zero OVERWROTE a real same-day count in place rather than sitting
+       * beside it. A blank now produces no upsert at all. A 0 is a real count
+       * and behaves exactly as it always has. */
+      const pc = readPhysicalCount(item?.physical_qty);
       if (!materialId) return Response.json({ error: 'Every item needs a material_id' }, { status: 400 });
       if (seen.has(materialId)) {
         return Response.json({ error: 'Duplicate material in items — count each material once' }, { status: 400 });
       }
       seen.add(materialId);
-      if (!Number.isFinite(physical) || physical < 0) {
-        return Response.json({ error: 'physical_qty must be a number ≥ 0 (recipe units)' }, { status: 400 });
+      if (pc.kind === 'not_counted') { notCounted++; continue; }
+      if (pc.kind === 'error') {
+        // WHOLE-SUBMIT REFUSAL, UNCHANGED. This route has always been
+        // all-or-nothing (see the comment above the loop) and the liquor page
+        // posts one floor's grid as one save; turning it into a per-line skip
+        // here would let a bar's sheet half-land with no record of which half.
+        // Only the WORDING changes — it now names what was typed.
+        return Response.json({ error: `physical_qty must be a number ≥ 0 (recipe units) — ${pc.reason}` }, { status: 400 });
       }
-      const mat = db.prepare('SELECT id, name, category, unit FROM raw_materials WHERE id = ?').get(materialId) as any;
+      const physical = pc.qty;
+      const mat = db.prepare('SELECT id, name, category, unit, purchase_unit, pack_size, case_size FROM raw_materials WHERE id = ?').get(materialId) as any;
       if (!mat) return Response.json({ error: `Material not found: ${materialId}` }, { status: 404 });
       // A store may count a material it OWNS (category-mapped) OR one it actually
       // HOLDS via its ledger — receiving FLOORS own no categories, so a
@@ -264,13 +288,33 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       const variance = Math.round((physical - system_qty) * 1000) / 1000;
       const variance_value = Math.round(variance * avg_cost * 100) / 100;
       prepared.push({
-        material_id: materialId, name: mat.name, unit: mat.unit,
+        material_id: materialId, name: mat.name, unit: mat.unit, pack: mat,
         system_qty, physical_qty: physical, variance, variance_value, avg_cost,
         note: itemNote,
       });
     }
 
+    /* THE UPLOAD PATTERN GUARD (owner requirement 7). The liquor grid and its
+     * CSV both post through here, so this is the door a mass-zeroed bar sheet
+     * would arrive at. Judged on the PATTERN — a 0 is a real count and stays
+     * one — refused BEFORE the transaction opens, and re-submittable with
+     * confirm_zeros for a genuine all-empty stocktake. Placed after `prepared`
+     * so it counts what will actually be written, and before `txn()` so nothing
+     * is. */
+    const zeroGuard = zeroPatternGuard(prepared.map(p => p.physical_qty));
+    if (zeroGuard.suspicious && b.confirm_zeros !== true) {
+      return Response.json(
+        { error: zeroGuard.message, zero_guard: { ...zeroGuard, confirm_field: 'confirm_zeros' } },
+        { status: 409 },
+      );
+    }
+
+    // One id for this save — the handle the monthly review and bulk reject use.
+    const batchId = generateId();
     let pendingCount = 0;
+    let appliedCount = 0;
+    let autoAppliedCount = 0;
+    let alertCount = 0;
     const upsert = db.prepare(`
       INSERT INTO store_closing_counts
         (id, store_id, material_id, date, system_qty, physical_qty, variance,
@@ -293,9 +337,16 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
           p.system_qty, p.physical_qty, p.variance, p.variance_value,
           user.email, p.note,
         );
-        // Non-zero variance → PENDING approval (stock unchanged until approved);
-        // a corrected count that now matches clears any stale pending row.
-        const vaId = upsertVarianceApproval(db, {
+        // THE ONE DOOR — the same call every other count path makes.
+        //
+        // ABOVE THE BAR the stock is HELD: the count row above is a pure
+        // REGISTER (it posts no ledger movement), so the store's on-hand does
+        // not move until an admin approves. UNDER THE BAR the same approval is
+        // granted now, through approveVariance(), which posts a signed
+        // 'adjustment' to store_stock_ledger — the identical write, and the
+        // identical audit row, that approving it next month would produce.
+        // A corrected count that now matches clears any stale pending row.
+        const decided = recordCountVariance(db, {
           source: 'liquor',
           material_id: p.material_id,
           store_id: storeId,
@@ -306,8 +357,17 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
           counted_by: user.email,
           count_note: p.note,
           outlet_id: outletId,
+          batch_id: batchId,
+          batch_label: `${store.name} closing sheet`,
+          pack: p.pack,
         });
-        if (vaId) pendingCount++;
+        if (decided.alert) alertCount++;
+        if (decided.outcome === 'applied') {
+          appliedCount++;
+          if (decided.auto_applied) autoAppliedCount++;
+        } else if (decided.outcome === 'held') {
+          pendingCount++;
+        }
       }
     });
     txn();
@@ -341,11 +401,25 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       match_count: prepared.filter(p => p.variance === 0).length,
       total_variance_value: Math.round(prepared.reduce((s, p) => s + p.variance_value, 0) * 100) / 100,
       pending_count: pendingCount,
+      // ── Additive (2026-08). `applied_count` = variances the BAR (or an
+      // admin's tick) posted to the ledger at count time; `not_counted` = lines
+      // whose cell was BLANK, which are neither counted nor written.
+      applied_count: appliedCount,
+      auto_applied_count: autoAppliedCount,
+      alert_count: alertCount,
+      not_counted: notCounted,
+      batch_id: batchId,
     };
     const safeSummary = postIsAdmin ? summary : {
       ...summary,
       shortage_count: null, excess_count: null, match_count: null,
       total_variance_value: null, pending_count: null,
+      // Blinded for the same reason pending_count is, and more sharply: with a
+      // bar configured, `applied_count` answers "was my count within ₹X of the
+      // system figure?" per save, which bisects system_qty in a few re-saves.
+      // `not_counted` and `batch_id` are NOT blinded — they describe what the
+      // counter submitted, not what the system expected.
+      applied_count: null, auto_applied_count: null, alert_count: null,
     };
 
     logAuditEvent(db, {
@@ -362,7 +436,11 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
           variance: p.variance, variance_value: p.variance_value,
         })),
       },
-      note: `${store.name}: closing count ${date} — ${prepared.length} item(s), variance ₹${summary.total_variance_value}${pendingCount ? ` (${pendingCount} sent for approval)` : ''}`,
+      note: `${store.name}: closing count ${date} — ${prepared.length} item(s) counted`
+        + (notCounted ? `, ${notCounted} left blank (not counted)` : '')
+        + `, variance ₹${summary.total_variance_value}`
+        + (pendingCount ? ` (${pendingCount} held for approval)` : '')
+        + (appliedCount ? ` (${appliedCount} applied at count time${autoAppliedCount ? `, ${autoAppliedCount} under the bar` : ''})` : ''),
     });
 
     // `results` is the bluntest leak of the three: per item it carried

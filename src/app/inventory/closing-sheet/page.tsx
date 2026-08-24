@@ -72,6 +72,8 @@ import {
   csvQty, dualQty, fmtQtyNum, packFactor, toPurchaseQty, type PackMeta,
 } from '@/lib/pack-units';
 import { todayIST, fmtIST } from '@/lib/format-date';
+import ZeroCountGuard, { readZeroGuard, type ZeroGuardInfo } from '@/components/ZeroCountGuard';
+import CountState, { countKind } from '@/components/CountState';
 
 /* ── Wire types (the /api/closing-stock/dept-sheet contract) ─────────────── */
 
@@ -143,6 +145,13 @@ interface ImportPreview {
   errors: ImportIssue[];
   /** What the counter typed vs what will actually be stored, per the route. */
   sample: { label: string; department: string; entered: string; unit: string; stored_purchase_qty: number; stored_unit: string }[];
+  /**
+   * THE ZERO PATTERN, reported at preview and ENFORCED at apply. The preview
+   * always carries this block (it writes nothing, so refusing there would hide
+   * the column mapping behind a warning about it); `suspicious: true` means the
+   * Apply will refuse unless it is re-sent with confirm_zeros.
+   */
+  zeroGuard: { counted: number; zeros: number; share: number; suspicious: boolean; message: string } | null;
 }
 
 /* ── Helpers ─────────────────────────────────────────────────────────────── */
@@ -219,7 +228,15 @@ const arr = (v: unknown): unknown[] => (Array.isArray(v) ? v : []);
 
 const normalisePreview = (payload: unknown, fallbackDate: string): ImportPreview => {
   const j = rec(payload);
+  const zg = rec(j.zero_guard);
   return {
+    zeroGuard: Object.keys(zg).length === 0 ? null : {
+      counted: Number(zg.counted) || 0,
+      zeros: Number(zg.zeros) || 0,
+      share: Number(zg.share) || 0,
+      suspicious: zg.suspicious === true,
+      message: str(zg.message),
+    },
     date: str(j.date) || fallbackDate,
     departments: arr(j.departments).map(d => {
       const o = rec(d);
@@ -269,6 +286,11 @@ export default function ClosingSheetPage() {
   const [preview, setPreview] = useState<ImportPreview | null>(null);
   const [importBusy, setImportBusy] = useState<'' | 'preview' | 'apply'>('');
   const [importErr, setImportErr] = useState('');
+  /* THE ZERO-PATTERN REFUSAL (owner requirement 7). Both write paths on this
+     page reach it — the grid Save and the all-departments CSV Apply. Nothing is
+     written when it fires; `onConfirm` re-sends the SAME payload with
+     confirm_zeros so a genuinely empty section can still be recorded. */
+  const [zeroGuard, setZeroGuard] = useState<(ZeroGuardInfo & { what: string; onConfirm: () => void }) | null>(null);
 
   /* History window — last 30 days inclusive, in IST. */
   const [histFrom, setHistFrom] = useState(() => shiftDays(todayIST(), -29));
@@ -356,8 +378,12 @@ export default function ClosingSheetPage() {
       for (const it of items) {
         const meta = packMeta(it);
         const raw = entries[key(dept.id, it.material_id)];
-        const typed = raw !== undefined && raw !== '' && isFinite(Number(raw));
-        const recipeQty = typed ? toRecipeQty(Number(raw), meta) : null;
+        // countKind, not `!== ''`: a whitespace-only box is a BLANK box, and
+        // `isFinite(Number('   '))` is true, so the old test read it as a
+        // counted zero and folded it into this department's totals.
+        const kind = countKind(raw);
+        const typed = kind === 'count' || kind === 'zero';
+        const recipeQty = typed ? toRecipeQty(Number(String(raw).trim()), meta) : null;
         const changed = typed && (!it.counted || Math.abs(recipeQty! - (it.physical_stock ?? 0)) > 1e-6);
         if (changed) dirty++;
         if (!typed && !it.counted) continue;
@@ -388,15 +414,22 @@ export default function ClosingSheetPage() {
 
   /* ── Save ──────────────────────────────────────────────────────────────── */
 
-  const saveAll = async () => {
+  const saveAll = async (confirmZeros = false) => {
     if (!data) return;
     const payload: { department_id: string; material_id: string; physical_stock: number }[] = [];
     for (const dept of departments) {
       for (const it of dept.items) {
         const raw = entries[key(dept.id, it.material_id)];
-        if (raw === undefined || raw === '' || !isFinite(Number(raw))) continue;
-        const n = Number(raw);
-        if (n < 0) continue;
+        /* BLANK IS NOT A COUNT — and this line is where that used to break on
+           this page. `raw === ''` let a whitespace-only box through, and
+           `isFinite(Number('   '))` is TRUE, so it posted a hard 0: a count of
+           "we have none" for a row nobody looked at. countKind() trims first,
+           so 'blank' covers '', '   ' and undefined alike; 'bad' (negative or
+           unparseable) is dropped here exactly as before, and 'zero' still
+           posts, because a typed 0 is a real measurement. */
+        const kind = countKind(raw);
+        if (kind === 'blank' || kind === 'bad') continue;
+        const n = Number(String(raw).trim());
         const recipeQty = toRecipeQty(n, packMeta(it));
         if (it.counted && Math.abs(recipeQty - (it.physical_stock ?? 0)) <= 1e-6) continue;
         payload.push({ department_id: dept.id, material_id: it.material_id, physical_stock: recipeQty });
@@ -407,15 +440,38 @@ export default function ClosingSheetPage() {
     try {
       const res = await api('/api/closing-stock/dept-sheet', {
         method: 'POST',
-        body: { date, entries: payload },
+        body: { date, entries: payload, confirm_zeros: confirmZeros },
       });
       const json = await res.json();
+      // THE ZERO-PATTERN REFUSAL. 409 + zero_guard, nothing written — a question
+      // to ask, not a red banner to print. Confirming re-runs this same save.
+      if (!res.ok && res.status === 409) {
+        const guard = readZeroGuard(json);
+        if (guard) {
+          setZeroGuard({
+            ...guard, what: 'this sheet',
+            onConfirm: () => { setZeroGuard(null); saveAll(true); },
+          });
+          return;
+        }
+      }
       if (!res.ok) throw new Error(json?.error || `HTTP ${res.status}`);
       const errs: string[] = Array.isArray(json?.errors) ? json.errors : [];
       setFlash({
         tone: errs.length ? 'warn' : 'ok',
+        // BLIND COUNTS: `pending` arrives NULL for a non-admin, and `null` is
+        // falsy, so the clause simply does not render — it must never be turned
+        // into "0 sent for approval", which would answer "did my count match?".
+        // EVERY row this sheet writes is a DEPARTMENT row, so `pending` is now
+        // structurally 0 and the clause below never renders here — kept only so
+        // the two save paths read alike. The department sentence replaces it:
+        // saving re-anchors that department's balance immediately, so there is
+        // no hold and never was one. Not role-gated (it names the rail, not the
+        // figures); see the note on `dept_immediate` in the API route.
         text: `Saved ${json?.saved ?? 0} count${json?.saved === 1 ? '' : 's'}`
           + (json?.pending ? ` · ${json.pending} sent for variance approval` : '')
+          + (json?.dept_immediate ? ' · department stock moves on save — these are not held for approval' : '')
+          + (json?.not_counted ? ` · ${json.not_counted} left blank (not counted, nothing written)` : '')
           + (errs.length ? ` · ${errs.length} skipped: ${errs.slice(0, 2).join(' | ')}` : ''),
       });
       await load(date);
@@ -548,16 +604,30 @@ export default function ClosingSheetPage() {
     setUploadOpen(false); setFile(null); setCsvText(''); setPreview(null); setImportErr('');
   };
 
-  const runImport = async (mode: 'preview' | 'apply') => {
+  const runImport = async (mode: 'preview' | 'apply', confirmZeros = false) => {
     if (!csvText.trim()) { setImportErr('Choose a filled-in CSV file first.'); return; }
     if (mode === 'apply' && !preview) { setImportErr('Check the file before applying.'); return; }
     setImportBusy(mode); setImportErr('');
     try {
       const res = await api('/api/closing-stock/dept-sheet/import', {
         method: 'POST',
-        body: { date, csv: csvText, mode },
+        body: { date, csv: csvText, mode, confirm_zeros: confirmZeros },
       });
       const json = await res.json().catch(() => null);
+      /* THE ZERO-PATTERN REFUSAL — THIS is the door the incident came through:
+         an all-departments sheet whose blank cells exported as 0. The apply
+         answers 409 with `zero_guard` and writes NOTHING (the transaction never
+         opens). Ask; confirming re-sends the SAME csvText with confirm_zeros. */
+      if (!res.ok && res.status === 409) {
+        const guard = readZeroGuard(json);
+        if (guard) {
+          setZeroGuard({
+            ...guard, what: 'this file',
+            onConfirm: () => { setZeroGuard(null); runImport('apply', true); },
+          });
+          return;
+        }
+      }
       if (!res.ok) throw new Error(json?.error || `HTTP ${res.status}`);
       if (mode === 'preview') { setPreview(normalisePreview(json, date)); return; }
 
@@ -585,7 +655,12 @@ export default function ClosingSheetPage() {
       setFlash({
         tone: saved === 0 ? 'warn' : 'ok',
         text: `Uploaded for ${date} — saved ${saved.toLocaleString('en-IN')} count${saved === 1 ? '' : 's'}`
-          + (pending ? ` · ${pending.toLocaleString('en-IN')} sent for variance approval` : ''),
+          + (pending ? ` · ${pending.toLocaleString('en-IN')} sent for variance approval` : '')
+          // The all-departments CSV is the door the 1,472-row queue came
+          // through, and not one of the rows it used to raise could ever be
+          // approved. It raises none now; say what it did instead of leaving
+          // the counter to read silence as "everything matched".
+          + (json?.dept_immediate ? ' · department stock moves on save — these are not held for approval' : ''),
       });
       await load(date);
     } catch (e: unknown) {
@@ -650,6 +725,12 @@ export default function ClosingSheetPage() {
             Every active department on one sheet — count each item where it sits.
             {data?.generated_at && <span className="text-[#B9A896]"> · as of {fmtIST(data.generated_at)}</span>}
           </p>
+          {/* THE RULE, ONCE, WHERE COUNTING STARTS. It governs the boxes below
+              and the all-departments CSV alike. */}
+          <p className="text-xs text-[#6B5744] mt-0.5">
+            Leave a box <b>blank</b> for anything you did not count. Type <b>0</b> only when you counted it and there
+            is none left — a 0 is a real count and is compared against the system.
+          </p>
         </div>
         <div className="flex items-center gap-1.5">
           <CalendarDays className="w-4 h-4 text-[#8B7355]" />
@@ -673,7 +754,7 @@ export default function ClosingSheetPage() {
                 className="px-3 py-2 bg-white border border-[#af4408] text-[#af4408] hover:bg-[#af4408]/10 disabled:opacity-40 rounded-lg text-sm font-medium flex items-center gap-1.5">
           <Download className="w-4 h-4" /> Export CSV
         </button>
-        <button onClick={saveAll} disabled={saving || sheetCalc.dirty === 0}
+        <button onClick={() => saveAll()} disabled={saving || sheetCalc.dirty === 0}
                 className="px-3 py-2 bg-[#af4408] text-white hover:bg-[#903905] disabled:opacity-40 rounded-lg text-sm font-medium flex items-center gap-1.5">
           {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
           Save {sheetCalc.dirty > 0 ? `${sheetCalc.dirty} count${sheetCalc.dirty === 1 ? '' : 's'}` : 'counts'}
@@ -925,8 +1006,11 @@ export default function ClosingSheetPage() {
                       const pf = packFactor(meta);
                       const k = key(dept.id, it.material_id);
                       const raw = entries[k] ?? '';
-                      const typed = raw !== '' && isFinite(Number(raw));
-                      const pv = typed ? Number(raw) : 0;
+                      // Three states, never two — a whitespace-only box is
+                      // BLANK, not a zero. See CountState / countKind.
+                      const kind = countKind(raw);
+                      const typed = kind === 'count' || kind === 'zero';
+                      const pv = typed ? Number(raw.trim()) : 0;
                       const recipeQty = typed ? toRecipeQty(pv, meta) : null;
                       const changed = typed && (!it.counted || Math.abs(recipeQty! - (it.physical_stock ?? 0)) > 1e-6);
                       const rate = it.rate_per_purchase_unit;
@@ -959,15 +1043,22 @@ export default function ClosingSheetPage() {
                               below is the number that is actually posted. */}
                           <td className="px-3 py-1.5">
                             <div className="flex items-center gap-1">
+                              {/* The placeholder read "0", which told the counter
+                                  that an untouched box already said "none". It
+                                  is the opposite: an empty box says nothing at
+                                  all, and only a TYPED 0 records an empty shelf. */}
                               <input type="number" step="any" min={0} value={raw}
                                      onChange={e => setEntries(p => ({ ...p, [k]: e.target.value }))}
-                                     placeholder="0"
+                                     placeholder="not counted"
                                      className="w-24 px-2 py-1 border border-[#D4B896] rounded text-xs text-right font-mono bg-white focus:outline-none focus:ring-1 focus:ring-[#af4408]" />
                               <span className="text-[10px] text-[#8B7355]">{it.purchase_unit}</span>
                             </div>
                             {pf > 1 && typed && (
                               <div className="text-[9px] text-[#B8A590]">= {fmtQtyNum(recipeQty ?? 0)} {it.unit}</div>
                             )}
+                            <CountState raw={raw} className="max-w-[7.5rem]"
+                                        onZero={() => setEntries(p => ({ ...p, [k]: '0' }))}
+                                        onClear={() => setEntries(p => ({ ...p, [k]: '' }))} />
                           </td>
 
                           <td className="px-3 py-1.5 text-right tabular-nums">
@@ -999,14 +1090,26 @@ export default function ClosingSheetPage() {
                             </td>
                           )}
 
+                          {/* SAVED STATE. `it.counted` is the server's own
+                              row-exists verdict, and `physical_stock === 0` on a
+                              counted row is a real "we have none" — the two are
+                              named separately, because telling them apart is the
+                              whole point of this change. An uncounted row says
+                              "not counted", never "pending", which read as a
+                              queue position rather than an answer. */}
                           <td className="px-3 py-1.5">
                             {changed ? (
                               <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-100 text-amber-800">↻ unsaved</span>
                             ) : it.counted ? (
-                              <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700"
-                                    title={it.recorded_by ? `By ${it.recorded_by}` : undefined}>✓ counted</span>
+                              (it.physical_stock ?? 0) === 0 ? (
+                                <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-100 text-amber-800"
+                                      title={it.recorded_by ? `By ${it.recorded_by}` : undefined}>✓ counted · none</span>
+                              ) : (
+                                <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700"
+                                      title={it.recorded_by ? `By ${it.recorded_by}` : undefined}>✓ counted</span>
+                              )
                             ) : (
-                              <span className="text-[10px] text-[#B9A896]">pending</span>
+                              <span className="text-[10px] text-[#B9A896]">not counted</span>
                             )}
                           </td>
                         </tr>
@@ -1069,7 +1172,7 @@ export default function ClosingSheetPage() {
                 className="px-2.5 py-1.5 bg-white border border-[#af4408] text-[#af4408] hover:bg-[#af4408]/10 rounded-lg text-xs font-medium flex items-center gap-1">
             Overview board <ArrowUpRight className="w-3.5 h-3.5" />
           </Link>
-          <button onClick={saveAll} disabled={saving || sheetCalc.dirty === 0}
+          <button onClick={() => saveAll()} disabled={saving || sheetCalc.dirty === 0}
                   className="px-3 py-2 bg-[#af4408] text-white hover:bg-[#903905] disabled:opacity-40 rounded-lg text-sm font-medium flex items-center gap-1.5">
             {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />} Save
           </button>
@@ -1163,13 +1266,40 @@ export default function ClosingSheetPage() {
                   set the date at the top of the page, and check the file again.
                 </div>
               )}
-              <div className="grid grid-cols-3 gap-2">
+              <div className="grid grid-cols-4 gap-2">
                 <PreviewStat label="Rows in file" value={preview.total_rows} />
                 <PreviewStat label="Will be written" value={preview.will_write}
                              tone={preview.will_write > 0 ? 'ok' : 'warn'} />
-                <PreviewStat label="Skipped" value={preview.skipped}
-                             tone={preview.skipped > 0 ? 'warn' : 'muted'} />
+                {/* "Skipped" is not a failure — it is every row where no
+                    department column carried anything, i.e. BLANK = NOT
+                    COUNTED. Labelled as such so it is never read as data loss. */}
+                <PreviewStat label="Blank (not counted)" value={preview.skipped} tone="muted" />
+                {/* AND ITS OPPOSITE, which is the number that mattered in the
+                    incident: rows that DO carry a count, and that count is 0. */}
+                <PreviewStat label="Counted as 0"
+                             value={preview.zeroGuard?.zeros ?? 0}
+                             tone={preview.zeroGuard?.suspicious ? 'warn' : 'muted'} />
               </div>
+
+              {/* THE PATTERN WARNING, AT PREVIEW. The route reports it here and
+                  ENFORCES it at Apply, so this is the moment to fix the file —
+                  before anything is written and before a confirmation is needed. */}
+              {preview.zeroGuard?.suspicious && (
+                <div className="rounded-lg p-2.5 text-xs bg-amber-50 border border-amber-300 text-amber-900 space-y-1.5">
+                  <div className="flex items-start gap-2 font-semibold">
+                    <AlertCircle className="w-4 h-4 shrink-0 mt-px" />
+                    {preview.zeroGuard.zeros.toLocaleString('en-IN')} of{' '}
+                    {preview.zeroGuard.counted.toLocaleString('en-IN')} counted cells in this file are 0
+                    ({Math.round(preview.zeroGuard.share * 100)}%).
+                  </div>
+                  <p className="leading-relaxed">
+                    A <b>blank</b> cell means <b>not counted</b> — nothing is recorded for it. A <b>0</b> means
+                    <b> counted and found empty</b>, and is treated like any other count. If those cells were meant to
+                    be blank, fix the sheet and check it again. <b>Apply will refuse this file</b> and ask you to
+                    confirm before writing {preview.zeroGuard.zeros.toLocaleString('en-IN')} empty shelves.
+                  </p>
+                </div>
+              )}
 
               {/* Column → department mapping. An unmatched column is the exact
                   failure that costs a recount, so it is called out in red. */}
@@ -1301,6 +1431,14 @@ export default function ClosingSheetPage() {
             </div>
           )}
         </ModalShell>
+      )}
+
+      {/* THE ZERO-PATTERN REFUSAL — grid Save and CSV Apply both land here.
+          Outside the upload ModalShell on purpose: it must sit above whichever
+          surface raised it, and it owns the only way through. */}
+      {zeroGuard && (
+        <ZeroCountGuard guard={zeroGuard} what={zeroGuard.what} busy={saving || !!importBusy}
+                        onCancel={() => setZeroGuard(null)} onConfirm={zeroGuard.onConfirm} />
       )}
     </div>
   );

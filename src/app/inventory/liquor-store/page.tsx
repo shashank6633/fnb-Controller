@@ -30,6 +30,8 @@ import { api } from '@/lib/api';
 import { todayIST } from '@/lib/format-date';
 import TabScroller from '@/components/TabScroller';
 import MaterialTypeahead, { MaterialLite } from '@/components/MaterialTypeahead';
+import ZeroCountGuard, { readZeroGuard, type ZeroGuardInfo } from '@/components/ZeroCountGuard';
+import CountState from '@/components/CountState';
 import {
   packFactor, caseFactor, entryMode, tripleToRecipe, breakdownQty, fmtBreakdown,
   toPurchaseQty, csvQty, PackMeta,
@@ -2584,7 +2586,13 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
   // `pending` mirrors summary.pending_count so the import panel can say the same
   // thing the manual Save toast says. Optional because every failure path sets a
   // result with nothing imported — and therefore nothing queued for approval.
-  const [csvResult, setCsvResult] = useState<{ success: number; pending?: number; errors: string[] } | null>(null);
+  const [csvResult, setCsvResult] = useState<{ success: number; pending?: number; errors: string[]; notCounted?: number } | null>(null);
+  /* THE ZERO-PATTERN REFUSAL (owner requirement 7). Both write paths here — the
+     manual Save and the CSV upload — post to /api/stores/[id]/closing, which
+     answers 409 with `zero_guard` when an implausible share of the counted lines
+     read 0. Nothing is written; `onConfirm` re-sends the SAME payload with
+     confirm_zeros so a bar that really was emptied can still be recorded. */
+  const [zeroGuard, setZeroGuard] = useState<(ZeroGuardInfo & { what: string; onConfirm: () => void }) | null>(null);
   // Filters
   const [catFilter, setCatFilter] = useState('');
   const [q, setQ] = useState('');
@@ -2686,10 +2694,30 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
   // Physical qty in RECIPE units from the Cases/Bottles/loose entry (null =
   // untouched row): cases × case_size × pack + bottles × pack + loose.
   const physicalFor = (r: StockRow): number | null => {
-    const num = (s?: string) => (s != null && s !== '' && !isNaN(Number(s))) ? Number(s) : null;
+    // `.trim()` before the emptiness test: a whitespace-only box is a BLANK box,
+    // and Number('   ') is 0, so without it one stray space in any of the three
+    // slots turned "nobody counted this" into a counted zero for the whole row.
+    const num = (s?: string) => {
+      const t = (s ?? '').trim();
+      return t !== '' && !isNaN(Number(t)) ? Number(t) : null;
+    };
     const c = num(cases[r.material_id]), w = num(whole[r.material_id]), l = num(loose[r.material_id]);
     if (c == null && w == null && l == null) return null;
     return tripleToRecipe(c ?? 0, w ?? 0, l ?? 0, r);
+  };
+
+  /* BLANK vs ZERO, made an explicit action rather than a typing convention.
+     "None left" fills the row's primary box with a literal 0, which makes
+     physicalFor() return 0 — a real count of an empty shelf. "Clear" empties all
+     three boxes, which makes it return null — not counted, nothing posted. */
+  const markNone = (r: StockRow, hasWholeBox: boolean) => {
+    if (hasWholeBox) setWhole(p => ({ ...p, [r.material_id]: '0' }));
+    else setLoose(p => ({ ...p, [r.material_id]: '0' }));
+  };
+  const clearCount = (r: StockRow) => {
+    setCases(p => ({ ...p, [r.material_id]: '' }));
+    setWhole(p => ({ ...p, [r.material_id]: '' }));
+    setLoose(p => ({ ...p, [r.material_id]: '' }));
   };
   // As-of-date ledger sum for the chosen closing date (0 when the material has
   // no ledger rows on/before that date). Must NOT fall back to the live
@@ -2705,8 +2733,11 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
     .filter((x): x is { r: StockRow; phys: number } => x.phys != null);
   const pendingVarianceValue = pending.reduce(
     (s, { r, phys }) => s + (phys - systemFor(r)) * (Number(r.avg_cost) || 0), 0);
+  /** How many of the counts about to be saved read 0 — the pattern the server
+   *  guards on, surfaced before the save rather than only in its refusal. */
+  const pendingZeros = pending.filter(p => p.phys === 0).length;
 
-  const save = async () => {
+  const save = async (confirmZeros = false) => {
     if (pending.length === 0) return;
     if (pending.some(p => p.phys < 0)) { setErr('Physical counts cannot be negative'); return; }
     setErr(null); setBusy(true);
@@ -2724,9 +2755,23 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
             note: (notes[r.material_id] || '').trim(),
           })),
           note: '',
+          confirm_zeros: confirmZeros,
         },
       });
       const j = await r.json();
+      // THE ZERO-PATTERN REFUSAL. 409 + zero_guard and nothing was written —
+      // a bar count of 200 lines can reach the guard's floors easily. Ask.
+      if (!r.ok && r.status === 409) {
+        const guard = readZeroGuard(j);
+        if (guard) {
+          setZeroGuard({
+            ...guard, what: `${storeName}'s count`,
+            onConfirm: () => { setZeroGuard(null); save(true); },
+          });
+          setBusy(false);
+          return;
+        }
+      }
       if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
       await loadDay(date, true);
       // BLIND COUNTS: the server now returns pending_count as null for non-admins,
@@ -2812,21 +2857,56 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
         setCsvResult({ success: 0, errors: errors.length ? errors : ['No counts found in the file (fill Cases / Bottles / Loose)'] });
         return;
       }
+      await sendClosingItems(items, errors, false);
+    } catch (e: any) { setCsvResult({ success: 0, errors: [e.message] }); }
+    finally { setBusy(false); }
+  };
+
+  /**
+   * POST a parsed file. A zero-guard retry re-sends THIS payload — the file is
+   * not re-read and the rows are not re-derived, so the number the dialog quoted
+   * is the number that gets written.
+   */
+  const sendClosingItems = async (
+    items: { material_id: string; physical_qty: number; note: string }[],
+    parseErrors: string[],
+    confirmZeros: boolean,
+  ) => {
+    setBusy(true);
+    const errors = [...parseErrors];
+    try {
       const r = await api(`/api/stores/${storeId}/closing`, {
         method: 'POST',
         // `adjust_to_physical` is retired — the route ignores it and sends every
         // non-zero variance to the approval queue. Kept pinned to false so the
         // bulk path can never opt into an inline reconcile if the flag returns.
-        body: { date, items, adjust_to_physical: false },
+        body: { date, items, adjust_to_physical: false, confirm_zeros: confirmZeros },
       });
       const j = await r.json();
+      // THE ZERO-PATTERN REFUSAL — the spreadsheet door, and the one the
+      // incident came through on the central rail. Nothing was written.
+      if (!r.ok && r.status === 409) {
+        const guard = readZeroGuard(j);
+        if (guard) {
+          setZeroGuard({
+            ...guard, what: 'this file',
+            onConfirm: () => { setZeroGuard(null); sendClosingItems(items, parseErrors, true); },
+          });
+          return;
+        }
+      }
       if (!r.ok) { setCsvResult({ success: 0, errors: [...errors, j.error || `HTTP ${r.status}`] }); return; }
       // Same POST as the manual Save, so the same thing happened to the counts —
       // say so in the SAME words, or a spreadsheet counter (the usual path here)
       // never learns their variances are sitting in a queue.
       const imported = j.summary?.items || 0;
       const queued = j.summary?.pending_count || 0;
-      setCsvResult({ success: imported, pending: queued, errors });
+      // Blank rows the server refused to invent a zero for. Not an error and not
+      // a loss — but a file of 300 rows answering "imported 40" reads as one
+      // unless the rest is accounted for. Safe for everyone: it counts what the
+      // file CONTAINED, never how those figures compare to system stock.
+      const notCounted = Number(j.summary?.not_counted) || 0;
+      setCsvResult({ success: imported, pending: queued, errors, notCounted });
       await loadDay(date, true);
       // BLIND COUNTS: the "N queued" / "all match the system" pair is an exact
       // oracle for the figure this screen deliberately withholds — upload one
@@ -2957,6 +3037,11 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
                         : ' — recorded; any difference goes to Variance Approvals for review, and stock changes only after approval.'}
                     </p>
                   )}
+                  {(csvResult.notCounted ?? 0) > 0 && (
+                    <p className="text-xs text-[#6B5744]">
+                      {csvResult.notCounted} row{csvResult.notCounted === 1 ? ' was' : 's were'} left blank — recorded as <b>not counted</b>, not as zero. Nothing was written for them.
+                    </p>
+                  )}
                   {csvResult.errors.map((e, i) => <p key={i} className="text-red-600 text-xs">{e}</p>)}
                 </div>
               </div>
@@ -3013,9 +3098,14 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
                             <td className="px-3 py-2">
                               <div className="text-[#2D1B0E] font-medium">{r.material_name}</div>
                               {r.sku && <div className="text-[10px] font-mono text-[#8B7355]">{r.sku}</div>}
+                              {/* A SAVED ZERO IS NOT A SAVED COUNT OF SOMETHING.
+                                  "✓ saved" alone read the same for both, which
+                                  is the ambiguity this change exists to end. */}
                               {existing && (
-                                <div className="text-[10px] text-emerald-700 mt-0.5"
-                                     title={`Counted by ${existing.counted_by}`}>✓ saved</div>
+                                <div className={`text-[10px] mt-0.5 ${Number(existing.physical_qty) === 0 ? 'text-amber-800' : 'text-emerald-700'}`}
+                                     title={`Counted by ${existing.counted_by}`}>
+                                  {Number(existing.physical_qty) === 0 ? '✓ saved · none left' : '✓ saved'}
+                                </div>
                               )}
                             </td>
                             <td className="px-3 py-2 text-[#6B5744] text-xs">{r.category}</td>
@@ -3067,6 +3157,14 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
                                   <span className="text-[10px] font-mono text-[#af4408] whitespace-nowrap">= {fq(phys)} {r.unit}</span>
                                 )}
                               </div>
+                              {/* Which of the two this row currently says, plus
+                                  the one-click way to say the other. Three empty
+                                  boxes and three boxes reading 0 are completely
+                                  different statements and used to look alike. */}
+                              <CountState raw={phys == null ? '' : String(phys)}
+                                          className="max-w-[12rem]"
+                                          onZero={() => markNone(r, showWholeBox)}
+                                          onClear={() => clearCount(r)} />
                             </td>
                             {isAdmin && (
                               <td className={`px-3 py-2 text-right whitespace-nowrap font-mono ${vTone}`}>
@@ -3120,7 +3218,9 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
                           )}
                         </div>
                         {existing && (
-                          <span className="shrink-0 text-[10px] px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700">✓ saved</span>
+                          <span className={`shrink-0 text-[10px] px-1.5 py-0.5 rounded ${Number(existing.physical_qty) === 0 ? 'bg-amber-100 text-amber-800' : 'bg-emerald-100 text-emerald-700'}`}>
+                            {Number(existing.physical_qty) === 0 ? '✓ saved · none' : '✓ saved'}
+                          </span>
                         )}
                       </div>
                       <div className="mt-2 flex items-center gap-1 flex-wrap">
@@ -3150,6 +3250,12 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
                           </span>
                         )}
                       </div>
+                      {/* Same tri-state as the desktop table — a phone counter
+                          needs it more, not less: the boxes are smaller and a
+                          stray 0 is easier to leave behind. */}
+                      <CountState raw={phys == null ? '' : String(phys)}
+                                  onZero={() => markNone(r, showWholeBox)}
+                                  onClear={() => clearCount(r)} />
                       <input type="text" value={notes[r.material_id] ?? ''}
                              onChange={e => setNotes(p => ({ ...p, [r.material_id]: e.target.value }))}
                              placeholder="Note (optional)" aria-label={`${r.material_name} — note`}
@@ -3161,15 +3267,25 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
 
               {/* Save bar */}
               <div className="bg-[#FFF1E3] border border-[#E8D5C4] rounded-xl p-3 flex flex-wrap items-center gap-x-4 gap-y-2 text-xs text-[#6B5744]">
-                <span><b className="text-[#2D1B0E]">{pending.length}</b> of {stock.length} material{stock.length === 1 ? '' : 's'} counted</span>
+                {/* THE TALLY SPLITS THE TWO — a row counted at 0 and a row
+                    nobody counted are different answers, and "N counted" alone
+                    hid exactly that difference. */}
+                <span>
+                  <b className="text-[#2D1B0E]">{pending.length}</b> of {stock.length} material{stock.length === 1 ? '' : 's'} counted
+                  {pendingZeros > 0 && <span className="text-amber-800"> ({pendingZeros} at 0 — counted, none left)</span>}
+                </span>
                 <span className="basis-full text-[11px] text-[#8B7355]">
-                  To set a count to <b>zero</b>, type <b>0</b> — leaving all boxes blank keeps the previously saved count unchanged.
+                  <b>Blank = not counted</b> — nothing is written and the previously saved count stays as it is.
+                  <b> A typed 0 = counted and found empty</b>, which is a real count and is compared against the system.
                 </span>
                 {isAdmin && pending.length > 0 && (
                   <span>Variance <b className={pendingVarianceValue < 0 ? 'text-red-700' : 'text-[#2D1B0E]'}>
                     {pendingVarianceValue < 0 ? '−' : ''}{inr(Math.abs(pendingVarianceValue))}</b></span>
                 )}
-                <button onClick={save} disabled={busy || pending.length === 0}
+                {/* NOT `onClick={save}` — React would hand the click event in as
+                    `confirmZeros`, and an event object is truthy, which would
+                    wave a mass-zero count past the guard on the first click. */}
+                <button onClick={() => save()} disabled={busy || pending.length === 0}
                         className="ml-auto px-4 py-2 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-semibold flex items-center gap-1.5 disabled:opacity-50">
                   {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
                   Save counts{pending.length > 0 ? ` (${pending.length})` : ''}
@@ -3292,6 +3408,12 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
             )}
           </div>
         )
+      )}
+
+      {/* THE ZERO-PATTERN REFUSAL — manual Save and CSV upload both land here. */}
+      {zeroGuard && (
+        <ZeroCountGuard guard={zeroGuard} what={zeroGuard.what} busy={busy}
+                        onCancel={() => setZeroGuard(null)} onConfirm={zeroGuard.onConfirm} />
       )}
     </div>
   );

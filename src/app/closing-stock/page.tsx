@@ -37,6 +37,8 @@ import { api } from '@/lib/api';
 import { csvQty, fmtQtyNum, packFactor, toPurchaseQty } from '@/lib/pack-units';
 import { todayIST } from '@/lib/format-date';
 import TabScroller from '@/components/TabScroller';
+import ZeroCountGuard, { readZeroGuard, type ZeroGuardInfo } from '@/components/ZeroCountGuard';
+import CountState, { countKind } from '@/components/CountState';
 
 const fmt = (v: number) => '₹' + Math.round(v || 0).toLocaleString('en-IN');
 const today = () => new Date().toISOString().slice(0, 10);
@@ -564,7 +566,23 @@ export default function ClosingStockByLocationPage() {
      the variance queue for an admin to clear later. Both optional: the early-exit
      error paths below set neither, and only the raw-material leg reports them (a
      semi-finished count never moves raw stock). */
-  const [closingResult, setClosingResult] = useState<{ success: number; errors: string[]; semi?: number; pending?: number; applied?: number } | null>(null);
+  /* `deptImmediate` is NOT blinded and must not be treated as if it were. It
+     says the save was scoped to a DEPARTMENT, which the counter chose and can
+     see in the picker — it reveals nothing about whether their figure matched.
+     It exists because a department count moves that department's balance the
+     instant it is saved (see recordCountVariance's header): there is no hold on
+     that rail, so the screen must not stay silent and let the absence of
+     "sent for variance approval" read as "nothing differed". */
+  const [closingResult, setClosingResult] = useState<{ success: number; errors: string[]; semi?: number; pending?: number; applied?: number; notCounted?: number; deptImmediate?: boolean } | null>(null);
+  /* THE ZERO-PATTERN REFUSAL (owner requirement 7). Every save path on this page
+     — the modal, the CSV upload and the per-area keypad — posts to a route that
+     answers 409 + `zero_guard` when an implausible share of the filled-in lines
+     read 0. NOTHING is written when that happens, so the dialog's job is to say
+     so, show the count, and offer ONE deliberate way through.
+     `onConfirm` is a closure that re-sends the SAME payload with
+     confirm_zeros: true — never a re-derivation from the screen, or the number
+     in the dialog would authorise a different submit than the one it describes. */
+  const [zeroGuard, setZeroGuard] = useState<(ZeroGuardInfo & { what: string; onConfirm: () => void }) | null>(null);
   /* The saved sheet, re-read from the server after a save/upload so the rate and
      Quantity × Rate shown are exactly the ones the server RESOLVED AND STORED
      (req 2/3) — never a browser-side recomputation. */
@@ -840,28 +858,36 @@ export default function ClosingStockByLocationPage() {
     forDate: string,
     rows: { sub_recipe_id: string; physical_stock: number; notes: string }[],
     errors: string[],
-  ): Promise<number> => {
-    if (rows.length === 0) return 0;
+    confirmZeros = false,
+  ): Promise<{ saved: number; guard: ZeroGuardInfo | null }> => {
+    if (rows.length === 0) return { saved: 0, guard: null };
     try {
       const res = await api('/api/closing-stock/semi', {
         method: 'POST',
-        body: { date: forDate, department_id: activeDeptId, items: rows },
+        body: { date: forDate, department_id: activeDeptId, items: rows, confirm_zeros: confirmZeros },
       });
       const json = await res.json().catch(() => ({}));
       if (!res.ok) {
+        // The zero-pattern refusal is not an error to print — it is a question
+        // to ask, and the caller owns the dialog. Nothing was written.
+        const guard = res.status === 409 ? readZeroGuard(json) : null;
+        if (guard) return { saved: 0, guard };
         errors.push(`Semi-finished counts were NOT saved: ${json.error || `HTTP ${res.status}`}`);
-        return 0;
+        return { saved: 0, guard: null };
       }
       for (const e of json.errors || []) errors.push(e);
       const saved = Number(json.success) || 0;
-      if (saved < rows.length) {
-        const missed = rows.length - saved;
+      // `not_counted` lines are blanks the server correctly refused to invent a
+      // zero for — they are not a failure and must not be reported as one.
+      const skippedBlank = Number(json.not_counted) || 0;
+      if (saved + skippedBlank < rows.length) {
+        const missed = rows.length - saved - skippedBlank;
         errors.push(`${missed} semi-finished count${missed === 1 ? ' was' : 's were'} not saved.`);
       }
-      return saved;
+      return { saved, guard: null };
     } catch (e: any) {
       errors.push(`Semi-finished counts were NOT saved: ${e.message}`);
-      return 0;
+      return { saved: 0, guard: null };
     }
   };
 
@@ -1084,15 +1110,25 @@ export default function ClosingStockByLocationPage() {
     const out: { sub_recipe_id: string; physical_stock: number; notes: string }[] = [];
     for (const s of subRecipes) {
       const v = closingSemi[s.id];
-      if (!v || v.physical_stock === '') continue;
-      const q = parseFloat(v.physical_stock);
+      // TRIMMED FIRST. `'   ' !== ''` passed this filter and then parseFloat'd
+      // to NaN, which JSON.stringify sends as null — a blank arriving at the
+      // API as a value rather than as nothing. A whitespace-only cell is a
+      // blank cell: not counted, no row, no variance.
+      const raw = (v?.physical_stock ?? '').trim();
+      if (raw === '') continue;
+      const q = parseFloat(raw);
       if (isNaN(q) || q < 0) { errors.push(`${s.name}: invalid count "${v.physical_stock}"`); continue; }
       out.push({ sub_recipe_id: s.id, physical_stock: q, notes: v.notes || '' });
     }
     return out;
   };
 
-  const submitClosingStock = async () => {
+  /**
+   * @param confirmZeros re-run of a submit the zero-pattern guard refused. The
+   * payload is rebuilt from the SAME on-screen entries, which have not changed
+   * — the dialog is modal and the grid is behind it.
+   */
+  const submitClosingStock = async (confirmZeros = false) => {
     setClosingSubmitting(true);
     setClosingResult(null);
     try {
@@ -1102,7 +1138,9 @@ export default function ClosingStockByLocationPage() {
       const allowedIds = new Set(deptScopedMaterials.map((m: any) => String(m.id)));
       const byIdSubmit = new Map(deptScopedMaterials.map((m: any) => [String(m.id), m]));
       const itemsToSubmit = Object.entries(closingItems)
-        .filter(([id, v]) => v.physical_stock !== '' && allowedIds.has(String(id)))
+        // TRIMMED, not just `!== ''`. A whitespace-only cell used to survive this
+        // filter, parseFloat to NaN and reach the API as null. Blank is blank.
+        .filter(([id, v]) => (v.physical_stock ?? '').trim() !== '' && allowedIds.has(String(id)))
         .map(([materialId, v]) => {
           // The modal takes counts in PURCHASE units; storage stays RECIPE
           // (canon). ×packFactor here, once, at the storage boundary.
@@ -1110,7 +1148,7 @@ export default function ClosingStockByLocationPage() {
           const pf = mat ? packFactor(mat) : 1;
           return {
             material_id: materialId,
-            physical_stock: Math.round(parseFloat(v.physical_stock) * pf * 1e6) / 1e6,
+            physical_stock: Math.round(parseFloat(v.physical_stock.trim()) * pf * 1e6) / 1e6,
             notes: v.notes,
           };
         });
@@ -1128,17 +1166,31 @@ export default function ClosingStockByLocationPage() {
       let rawSaved = 0;
       // Read the server's own verdict on each variance instead of assuming one.
       // The tick does NOT decide this on its own: department rows are carved out
-      // server-side and stay pending even when it is on, and a blocked approval
-      // falls back to pending with a reason in `errors`.
-      let rawPending = 0, rawApplied = 0;
+      // server-side — they are not applied AND not parked, because their balance
+      // already moved at save time — and a blocked approval falls back to
+      // pending with a reason in `errors`.
+      let rawPending = 0, rawApplied = 0, rawNotCounted = 0, rawDeptImmediate = false;
       if (itemsToSubmit.length > 0) {
         const res = await api('/api/closing-stock', {
           method: 'POST',
           // department_id scopes this batch of counts to the active department
           // ('' = store/overall). Plain users are pinned to their own department.
-          body: { date: closingDate, items: itemsToSubmit, adjust_stock: adjustStockModal, department_id: activeDeptId },
+          body: { date: closingDate, items: itemsToSubmit, adjust_stock: adjustStockModal, department_id: activeDeptId, confirm_zeros: confirmZeros },
         });
         const json = await res.json();
+        /* THE ZERO-PATTERN REFUSAL, BEFORE the generic error path. It is a 409
+           with `zero_guard` and NOTHING was written — printing its message as a
+           red "save failed" line would be true but useless, because the counter
+           has no way to act on it. Raise the dialog instead; confirming re-runs
+           this same function with confirm_zeros. */
+        if (!res.ok && res.status === 409) {
+          const guard = readZeroGuard(json);
+          if (guard) {
+            setZeroGuard({ ...guard, what: 'this sheet', onConfirm: () => { setZeroGuard(null); submitClosingStock(true); } });
+            setClosingSubmitting(false);
+            return;
+          }
+        }
         // A REJECTED REQUEST ANSWERS { error: "..." }, NOT { errors: [...] }.
         // Reading only the plural array meant a 400 pushed nothing, every count
         // fell to 0, and the banner said "0 saved" with no reason given — the
@@ -1157,11 +1209,26 @@ export default function ClosingStockByLocationPage() {
         }
         for (const e of json.errors || []) errors.push(e);
         rawSaved = json.success || 0;
+        // BLIND COUNTS: `pending` / `applied` arrive as NULL for a non-admin.
+        // `|| 0` is what turns that null into a harmless 0 for the isAdmin-gated
+        // banner below — it must never be rendered as "everything matched".
         rawPending = json.pending || 0;
         rawApplied = json.applied || 0;
+        rawNotCounted = json.not_counted || 0;
+        rawDeptImmediate = json.dept_immediate === true;
       }
-      const semiSaved = await postSemiCounts(closingDate, semiToSubmit, errors);
-      setClosingResult({ success: rawSaved, errors, semi: semiSaved, pending: rawPending, applied: rawApplied });
+      const semi = await postSemiCounts(closingDate, semiToSubmit, errors, confirmZeros);
+      if (semi.guard) {
+        // The raw half may already be saved; re-running the whole submit is
+        // safe because each count is keyed (date, material, department) and is
+        // delete-then-inserted, and the server re-reads live stock, so a count
+        // that already reconciled produces no second variance.
+        setZeroGuard({ ...semi.guard, what: 'the sub-recipe counts', onConfirm: () => { setZeroGuard(null); submitClosingStock(true); } });
+        setClosingSubmitting(false);
+        return;
+      }
+      const semiSaved = semi.saved;
+      setClosingResult({ success: rawSaved, errors, semi: semiSaved, pending: rawPending, applied: rawApplied, notCounted: rawNotCounted, deptImmediate: rawDeptImmediate });
       if (rawSaved > 0 || semiSaved > 0) {
         await fetchMaterials();
         await fetchClosingHistory();
@@ -1376,18 +1443,51 @@ export default function ClosingStockByLocationPage() {
         setClosingResult({ success: 0, errors: errors.length ? errors : ['No physical counts found in the file'] });
         return;
       }
+      /* THE PARSED FILE IS SENT FROM HERE, and a zero-guard retry re-sends THIS
+         payload — the file is not re-read and the rows are not re-derived, so
+         the number the dialog quoted is the number that gets written. */
+      await sendParsedCsv(items, semiItems, errors, false);
+    } catch (err: any) {
+      setClosingResult({ success: 0, errors: [err.message] });
+    } finally {
+      setClosingSubmitting(false);
+    }
+  };
+
+  const sendParsedCsv = async (
+    items: { material_id: string; physical_stock: number }[],
+    semiItems: { sub_recipe_id: string; physical_stock: number; notes: string }[],
+    parseErrors: string[],
+    confirmZeros: boolean,
+  ) => {
+    setClosingSubmitting(true);
+    // Copy, so a retry does not accumulate the first attempt's messages.
+    const errors = [...parseErrors];
+    try {
       let rawSaved = 0;
       // `applied` is structurally 0 on this path — adjust_stock is forced off for
       // a bulk file (see the header comment), so every variance in the sheet goes
       // to the approval queue. Still read it from the reply rather than hard-coding
       // 0, so the banner cannot drift from what the server actually did.
-      let rawPending = 0, rawApplied = 0;
+      let rawPending = 0, rawApplied = 0, rawNotCounted = 0, rawDeptImmediate = false;
       if (items.length > 0) {
         const res = await api('/api/closing-stock', {
           method: 'POST',
-          body: { date: closingDate, items, adjust_stock: false, department_id: activeDeptId },
+          body: { date: closingDate, items, adjust_stock: false, department_id: activeDeptId, confirm_zeros: confirmZeros },
         });
         const json = await res.json();
+        // THE ZERO-PATTERN REFUSAL — this is the path the incident came in on
+        // (a spreadsheet whose blanks exported as 0). Nothing was written; ask.
+        if (!res.ok && res.status === 409) {
+          const guard = readZeroGuard(json);
+          if (guard) {
+            setZeroGuard({
+              ...guard, what: 'this file',
+              onConfirm: () => { setZeroGuard(null); sendParsedCsv(items, semiItems, parseErrors, true); },
+            });
+            return;
+          }
+        }
         // Same as the modal path: a rejection is { error }, not { errors }, and
         // the semi route shares this date. Report the reason and abandon the
         // whole upload rather than half-writing the day — see the note there
@@ -1401,10 +1501,20 @@ export default function ClosingStockByLocationPage() {
         rawSaved = json.success || 0;
         rawPending = json.pending || 0;
         rawApplied = json.applied || 0;
+        rawNotCounted = json.not_counted || 0;
+        rawDeptImmediate = json.dept_immediate === true;
       }
       // Sub-recipe rows from the same file go to the semi route.
-      const semiSaved = await postSemiCounts(closingDate, semiItems, errors);
-      setClosingResult({ success: rawSaved, errors, semi: semiSaved, pending: rawPending, applied: rawApplied });
+      const semi = await postSemiCounts(closingDate, semiItems, errors, confirmZeros);
+      if (semi.guard) {
+        setZeroGuard({
+          ...semi.guard, what: 'the sub-recipe rows in this file',
+          onConfirm: () => { setZeroGuard(null); sendParsedCsv(items, semiItems, parseErrors, true); },
+        });
+        return;
+      }
+      const semiSaved = semi.saved;
+      setClosingResult({ success: rawSaved, errors, semi: semiSaved, pending: rawPending, applied: rawApplied, notCounted: rawNotCounted, deptImmediate: rawDeptImmediate });
       if (rawSaved > 0 || semiSaved > 0) {
         await fetchMaterials();
         await fetchClosingHistory();
@@ -1414,7 +1524,7 @@ export default function ClosingStockByLocationPage() {
         await loadValuedSheet(closingDate);
       }
     } catch (err: any) {
-      setClosingResult({ success: 0, errors: [err.message] });
+      setClosingResult({ success: 0, errors: [...errors, err.message] });
     } finally {
       setClosingSubmitting(false);
     }
@@ -1437,7 +1547,23 @@ export default function ClosingStockByLocationPage() {
     if (closingCategory && (s.category || 'sub-recipe') !== closingCategory) return false;
     return true;
   });
-  const semiFilledCount = subRecipes.filter(s => (closingSemi[s.id]?.physical_stock ?? '') !== '').length;
+  /* WHAT THIS SHEET CURRENTLY SAYS, in the three states that matter. Counted
+     against `deptScopedMaterials` (the rows this user is actually being asked
+     to count and the only ones submitClosingStock will post), never against the
+     whole seeded map — otherwise "not counted" would include every material
+     hidden by the department scope and the number would be meaningless. */
+  const tally = (values: (string | undefined)[]) => {
+    let counted = 0, zeros = 0, blank = 0, bad = 0;
+    for (const v of values) {
+      const k = countKind(v);
+      if (k === 'blank') blank++;
+      else if (k === 'bad') bad++;
+      else { counted++; if (k === 'zero') zeros++; }
+    }
+    return { counted, zeros, blank, bad };
+  };
+  const closingTally = tally(deptScopedMaterials.map((m: any) => closingItems[m.id]?.physical_stock));
+  const semiTally = tally(subRecipes.map(s => closingSemi[s.id]?.physical_stock));
 
   /* HISTORY VALUATION (req 4) — every figure below comes from the stored row:
      closing_stock.rate_per_purchase_unit / rate_source / total_value, written
@@ -1535,10 +1661,26 @@ export default function ClosingStockByLocationPage() {
     // /api/purchases) — kg/kg pack rows like BUTCHERY COVER 15KG convert ×1.
     const packSize = packFactor(it);
     const caseSize = it.case_size && it.case_size > 1 ? it.case_size : 1;
-    const num = (s?: string) => (s != null && s !== '' && !isNaN(Number(s))) ? Number(s) : null;
+    // `.trim()` before the emptiness test: Number('   ') is 0 and not NaN, so
+    // without it a whitespace-only box turned "not counted" into a counted zero.
+    const num = (s?: string) => {
+      const t = (s ?? '').trim();
+      return t !== '' && !isNaN(Number(t)) ? Number(t) : null;
+    };
     const c = num(casesRaw), b = num(bottlesRaw), l = num(looseRaw);
     if (c == null && b == null && l == null) return null;
     return (c ?? 0) * caseSize * packSize + (b ?? 0) * packSize + (l ?? 0);
+  };
+
+  /* BLANK vs ZERO on the per-area sheet, as an explicit action. "None left"
+     writes a literal 0 into the whole-unit box (the box every layout has), so
+     physicalFor() returns 0 — a real count of an empty shelf. "Clear" empties
+     all three, so it returns null and nothing is posted for the row. */
+  const markNoneHere = (it: Item) => setEntries(p => ({ ...p, [it.id]: '0' }));
+  const clearHere = (it: Item) => {
+    setEntries(p => ({ ...p, [it.id]: '' }));
+    setCases(p => ({ ...p, [it.id]: '' }));
+    setLoose(p => ({ ...p, [it.id]: '' }));
   };
 
   const pendingEntries = useMemo(() => {
@@ -1551,7 +1693,7 @@ export default function ClosingStockByLocationPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [items, cases, entries, loose]);
 
-  const saveAll = async () => {
+  const saveAll = async (confirmZeros = false) => {
     if (pendingEntries.length === 0) return;
     setSaving(true);
     try {
@@ -1559,16 +1701,35 @@ export default function ClosingStockByLocationPage() {
       const r = await api('/api/closing-stock', {
         method: 'POST',
         // Scope these location counts to the active department ('' = store/overall).
-        body: { date, items: payload, adjust_stock: adjustStock, department_id: activeDeptId },
+        body: { date, items: payload, adjust_stock: adjustStock, department_id: activeDeptId, confirm_zeros: confirmZeros },
       });
       const j = await r.json().catch(() => ({}));
+      // THE ZERO-PATTERN REFUSAL. A big area (the dry store runs to 200+ items)
+      // can reach the guard's floors, and an `alert()` carrying that sentence
+      // would give the counter no way to proceed with a genuinely empty section.
+      // Nothing was written; ask properly.
+      if (!r.ok && r.status === 409) {
+        const guard = readZeroGuard(j);
+        if (guard) {
+          setZeroGuard({
+            ...guard, what: `this area (${active})`,
+            onConfirm: () => { setZeroGuard(null); saveAll(true); },
+          });
+          setSaving(false);
+          return;
+        }
+      }
       if (!r.ok) {
         alert(j.error || 'Save failed');
       } else {
         /* Say what became of the variances, not just how many rows were written.
            One save can produce both outcomes: with the tick on, central rows are
-           approved on the spot (`applied`) while a department-scoped count — or
-           a row the server refused to approve — stays in the queue (`pending`).
+           approved on the spot (`applied`) while a row the server refused to
+           approve stays in the queue (`pending`). A DEPARTMENT-scoped count is
+           neither — it is not applied and not parked, because that department's
+           balance already moved when the row was written; `dept_immediate` is
+           what says so, and it is deliberately outside the isAdmin gate because
+           it describes the rail, not the figures.
            The errors the route pushes ("count saved, but system stock was NOT
            adjusted — …") were being dropped on the floor here; they are the only
            place the counter learns why a row they expected to move did not. */
@@ -1587,6 +1748,7 @@ export default function ClosingStockByLocationPage() {
           text: `✓ Saved ${j.success} count${j.success === 1 ? '' : 's'} for "${active}"`
             + (isAdmin && j.applied ? ` · ${j.applied} applied to stock` : '')
             + (isAdmin && j.pending ? ` · ${j.pending} sent for variance approval` : '')
+            + (j.dept_immediate ? ' · department count — the department figure moved on save, nothing is held for approval' : '')
             + (errs.length ? ` · ${errs.length} skipped: ${errs.slice(0, 2).join(' | ')}` : ''),
         };
         setEntries({});
@@ -1657,7 +1819,11 @@ export default function ClosingStockByLocationPage() {
               Adjust system stock to match
             </label>
           )}
-          <button onClick={saveAll} disabled={saving || pendingEntries.length === 0}
+          {/* NOT `onClick={saveAll}` — React hands the click event as the first
+              argument, and the first argument is now `confirmZeros`. An event
+              object is truthy, so that spelling would silently confirm a
+              mass-zero sheet on the very first click. */}
+          <button onClick={() => saveAll()} disabled={saving || pendingEntries.length === 0}
                   className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-[#af4408] hover:bg-[#933807] text-white rounded text-sm disabled:opacity-40">
             {saving ? <Loader2 className="animate-spin" size={14} /> : <Save size={14} />}
             Save {pendingEntries.length > 0 ? `(${pendingEntries.length})` : 'All'}
@@ -1741,7 +1907,10 @@ export default function ClosingStockByLocationPage() {
                     {/* Blind count: only admins see the system number + variance, so
                         staff can't just type back the expected figure to hide a loss. */}
                     {isAdmin && <th className="text-right py-2 px-3 font-medium">System</th>}
-                    <th className="text-left  py-2 px-3 font-medium w-[280px]">Physical count <span className="font-normal text-[9px] text-[#8B7355]">(packs + loose)</span></th>
+                    <th className="text-left  py-2 px-3 font-medium w-[300px]">
+                      Physical count <span className="font-normal text-[9px] text-[#8B7355]">(packs + loose)</span>
+                      <span className="block font-normal text-[9px] text-[#8B7355]">all boxes blank = not counted · a typed 0 = counted, none</span>
+                    </th>
                     {isAdmin && <th className="text-right py-2 px-3 font-medium">Variance</th>}
                     <th className="text-left  py-2 px-3 font-medium">Status</th>
                   </tr>
@@ -1852,6 +2021,15 @@ export default function ClosingStockByLocationPage() {
                               </div>
                             );
                           })()}
+                          {/* Which of the two this row currently says — and the
+                              one-click way to say the other. An empty box and a
+                              box holding 0 are opposite statements. */}
+                          <CountState
+                            raw={(() => { const p = physicalFor(it, cases[it.id], entries[it.id], loose[it.id]); return p == null ? '' : String(p); })()}
+                            className="max-w-[14rem]"
+                            onZero={() => markNoneHere(it)}
+                            onClear={() => clearHere(it)}
+                          />
                         </td>
                         {isAdmin && (
                           <td className="py-1.5 px-3 text-right font-mono">
@@ -1874,17 +2052,23 @@ export default function ClosingStockByLocationPage() {
                             })()}
                           </td>
                         )}
+                        {/* SAVED STATE, WITH THE ZERO CALLED OUT. `today_count`
+                            is null when nobody counted this row and 0 when
+                            somebody counted it and found the shelf empty — the
+                            same two states the entry boxes distinguish, read
+                            back from what was stored. "pending" was ambiguous
+                            enough to mean either; it now says which. */}
                         <td className="py-1.5 px-3">
                           {it.today_count != null ? (
-                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700"
+                            <span className={`text-[10px] px-1.5 py-0.5 rounded ${it.today_count === 0 ? 'bg-amber-100 text-amber-800' : 'bg-emerald-100 text-emerald-700'}`}
                                   title={[it.today_by ? `By ${it.today_by}` : '', hintLine(it.today_count, it) || '']
                                     .filter(Boolean).join(' · ')}>
-                              ✓ counted: {todayDisplay}
+                              {it.today_count === 0 ? '✓ counted: none left' : `✓ counted: ${todayDisplay}`}
                             </span>
                           ) : (cases[it.id] || entries[it.id] || loose[it.id]) ? (
                             <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-100 text-amber-800">↻ unsaved</span>
                           ) : (
-                            <span className="text-[10px] text-[#8B7355]">pending</span>
+                            <span className="text-[10px] text-[#8B7355]">not counted</span>
                           )}
                         </td>
                       </tr>
@@ -1895,6 +2079,13 @@ export default function ClosingStockByLocationPage() {
             </div>
           )}
         </div>
+
+        {/* The zero-pattern refusal reaches this view too — a big storage area
+            can pass the guard's floors on its own. */}
+        {zeroGuard && (
+          <ZeroCountGuard guard={zeroGuard} what={zeroGuard.what} busy={saving}
+                          onCancel={() => setZeroGuard(null)} onConfirm={zeroGuard.onConfirm} />
+        )}
       </div>
     );
   }
@@ -2054,6 +2245,13 @@ export default function ClosingStockByLocationPage() {
                   <h2 className="text-lg font-semibold text-[#2D1B0E]">Record Closing Stock</h2>
                   <p className="text-xs text-[#8B7355]">
                     Enter physical count for each material — in the <strong>purchase unit</strong> shown in the Unit column
+                  </p>
+                  {/* THE RULE, WHERE COUNTING STARTS — and it applies equally to
+                      the boxes below and to the CSV going through the Upload
+                      button beside it. */}
+                  <p className="text-xs text-[#6B5744] mt-0.5">
+                    Leave a row <strong>blank</strong> if you did not count it. Type <strong>0</strong> only when you
+                    counted it and there is none left — a 0 is a real count.
                   </p>
                 </div>
               </div>
@@ -2485,9 +2683,16 @@ export default function ClosingStockByLocationPage() {
                             a counter who can read the system number can copy it back. */}
                         {isAdmin && <th className="text-right py-2.5 px-3 font-medium">System Stock</th>}
                         <th className="text-right py-2.5 px-3 font-medium">Unit</th>
-                        <th className="text-right py-2.5 px-3 font-medium w-32">
+                        {/* BLANK vs ZERO, stated where the typing happens. This
+                            is the whole fix: a sheet whose blanks became zeros
+                            put 1,472 counts in the approval queue, and the
+                            counter had no way to see which of the two they had
+                            said. The rule is in the header, the state is under
+                            every box, and the footer totals both. */}
+                        <th className="text-right py-2.5 px-3 font-medium w-36">
                           Physical Count *
                           <span className="block font-normal text-[9px] text-[#8B7355]">in purchase units</span>
+                          <span className="block font-normal text-[9px] text-[#8B7355]">blank = not counted · 0 = counted, none</span>
                         </th>
                         {isAdmin && <th className="text-right py-2.5 px-3 font-medium">Variance</th>}
                         <th className="text-left py-2.5 px-3 font-medium w-40">Notes</th>
@@ -2526,14 +2731,25 @@ export default function ClosingStockByLocationPage() {
                             )}
                             <td className="py-1.5 px-3 text-right text-xs text-[#8B7355]" title={pf > 1 ? `1 ${m.purchase_unit} = ${pf} ${m.unit}` : undefined}>{m.purchase_unit || m.unit}</td>
                             <td className="py-1.5 px-2">
+                              {/* The placeholder used to print the system figure
+                                  for admins. A greyed number inside an empty box
+                                  is exactly the ambiguity this column now exists
+                                  to remove — an uncounted row looked like it
+                                  held a count. The System Stock column beside it
+                                  still shows that figure, unchanged. */}
                               <input
                                 type="number"
                                 step="0.01"
                                 min="0"
                                 value={ci?.physical_stock || ''}
                                 onChange={e => updateClosingItem(m.id, 'physical_stock', e.target.value)}
-                                placeholder={isAdmin && sysPU != null ? sysPU.toString() : ''}
+                                placeholder="not counted"
                                 className="w-full px-2 py-1 bg-white border border-[#D4B896] rounded text-xs text-right font-mono text-[#2D1B0E] focus:outline-none focus:ring-1 focus:ring-[#af4408] placeholder-[#C4B09A]"
+                              />
+                              <CountState
+                                raw={ci?.physical_stock}
+                                onZero={() => updateClosingItem(m.id, 'physical_stock', '0')}
+                                onClear={() => updateClosingItem(m.id, 'physical_stock', '')}
                               />
                             </td>
                             {isAdmin && <td className={`py-1.5 px-3 text-right text-xs font-mono font-semibold ${isShortage ? 'text-red-500' : isExcess ? 'text-blue-500' : variance === 0 ? 'text-green-600' : 'text-[#8B7355]'}`}>
@@ -2612,8 +2828,17 @@ export default function ClosingStockByLocationPage() {
                                 type="number" step="0.01" min="0"
                                 value={sv?.physical_stock || ''}
                                 onChange={e => updateClosingSemi(s.id, 'physical_stock', e.target.value)}
-                                placeholder=""
+                                placeholder="not counted"
                                 className="w-full px-2 py-1 bg-white border border-[#D4B896] rounded text-xs text-right font-mono text-[#2D1B0E] focus:outline-none focus:ring-1 focus:ring-[#af4408] placeholder-[#C4B09A]"
+                              />
+                              {/* Sub-recipes need the blank/zero distinction as
+                                  much as raw materials: an empty prep container
+                                  is a counted zero, a container nobody opened is
+                                  not counted at all. */}
+                              <CountState
+                                raw={sv?.physical_stock}
+                                onZero={() => updateClosingSemi(s.id, 'physical_stock', '0')}
+                                onClear={() => updateClosingSemi(s.id, 'physical_stock', '')}
                               />
                             </td>
                             {isAdmin && (
@@ -2638,11 +2863,21 @@ export default function ClosingStockByLocationPage() {
                 </div>
 
                 {/* Submit */}
-                <div className="flex items-center justify-between">
+                <div className="flex items-center justify-between gap-3 flex-wrap">
+                  {/* THE TALLY SPLITS THE TWO. "N of M filled" hid the whole
+                      problem: 793 zeros and 793 real counts read identically.
+                      Zeros are called out on their own line, because a large
+                      zero count is the shape of a sheet whose blanks were filled
+                      in — the same pattern the server refuses on save. */}
                   <p className="text-xs text-[#8B7355]">
-                    {deptScopedMaterials.filter((m: any) => (closingItems[m.id]?.physical_stock ?? '') !== '').length} of {deptScopedMaterials.length} items filled
+                    <b className="text-[#2D1B0E]">{closingTally.counted}</b> counted
+                    {closingTally.zeros > 0 && (
+                      <span className="text-amber-800"> ({closingTally.zeros} of them 0 — counted, none left)</span>
+                    )}
+                    {' · '}{closingTally.blank} not counted
+                    {closingTally.bad > 0 && <span className="text-red-600"> · {closingTally.bad} not a number</span>}
                     {subRecipes.length > 0 && (
-                      <> · {semiFilledCount} of {subRecipes.length} sub-recipes</>
+                      <> · sub-recipes: {semiTally.counted} counted{semiTally.zeros > 0 ? ` (${semiTally.zeros} at 0)` : ''}, {semiTally.blank} not counted</>
                     )}
                   </p>
                   <div className="flex gap-3">
@@ -2652,8 +2887,12 @@ export default function ClosingStockByLocationPage() {
                     >
                       Cancel
                     </button>
+                    {/* NOT `onClick={submitClosingStock}` — the click event would
+                        arrive as `confirmZeros`, and an event object is truthy,
+                        which would wave a mass-zero sheet straight past the
+                        guard on the first click. */}
                     <button
-                      onClick={submitClosingStock}
+                      onClick={() => submitClosingStock()}
                       disabled={closingSubmitting}
                       className="flex items-center gap-2 px-5 py-2 bg-green-600 hover:bg-green-700 disabled:opacity-50 text-white rounded-lg text-sm font-medium transition-colors"
                     >
@@ -2670,6 +2909,18 @@ export default function ClosingStockByLocationPage() {
                       {(closingResult.success > 0 || (closingResult.semi ?? 0) > 0) ? <CheckCircle className="w-4 h-4 text-green-600 mt-0.5" /> : <AlertCircle className="w-4 h-4 text-red-500 mt-0.5" />}
                       <div>
                         {closingResult.success > 0 && <p className="text-green-700">Closing stock recorded for {closingResult.success} items!</p>}
+                        {/* NOT AN ERROR, AND NOT A SILENT DROP. Blank lines are
+                            the counter's own "I did not count this" and the
+                            server writes nothing for them — but a sheet that
+                            comes back saying only "40 recorded" out of 200 rows
+                            reads as data loss unless the rest is accounted for.
+                            Safe for everyone: it counts what was TYPED, never
+                            how the figures compare to system stock. */}
+                        {(closingResult.notCounted ?? 0) > 0 && (
+                          <p className="text-xs text-[#6B5744]">
+                            {closingResult.notCounted} row{closingResult.notCounted === 1 ? ' was' : 's were'} left blank — recorded as <b>not counted</b>, not as zero. Nothing was written for them.
+                          </p>
+                        )}
                         {/* "Recorded" is not "posted". Split the same save by what
                             became of each variance so the two are never mistaken
                             for one another: amber = stock has moved and there is
@@ -2693,6 +2944,23 @@ export default function ClosingStockByLocationPage() {
                             {isAdmin && (closingResult.pending ?? 0) > 0 && (
                               <span className="text-[#8B7355]">· {closingResult.pending} sent for variance approval</span>
                             )}
+                          </p>
+                        )}
+                        {/* SAY THE THING THE ABSENCE OF A CLAUSE WOULD OTHERWISE
+                            IMPLY. On a department-scoped save there is no
+                            "sent for variance approval" clause, because a
+                            department count is never parked — it re-anchors that
+                            department's balance the moment it is written
+                            (recordCountVariance → outcome 'anchored'). Without
+                            this line the silence reads as "nothing differed",
+                            which is the false hold in its quietest form.
+                            NOT role-gated: it names the rail the counter chose,
+                            never whether their figure matched. */}
+                        {closingResult.deptImmediate && closingResult.success > 0 && (
+                          <p className="text-xs text-[#6B5744]">
+                            This is a <b>department</b> count. A department&apos;s stock figure moves the moment the
+                            count is saved — it is not held for approval, so there is nothing waiting in the
+                            variance queue for these rows. To correct one, count it again.
                           </p>
                         )}
                         {(closingResult.semi ?? 0) > 0 && (
@@ -2825,6 +3093,13 @@ export default function ClosingStockByLocationPage() {
             )}
           </div>
         </div>
+      )}
+
+      {/* THE ZERO-PATTERN REFUSAL — modal save, CSV upload, both land here.
+          `busy` is the save flag so the confirm cannot be double-fired. */}
+      {zeroGuard && (
+        <ZeroCountGuard guard={zeroGuard} what={zeroGuard.what} busy={closingSubmitting}
+                        onCancel={() => setZeroGuard(null)} onConfirm={zeroGuard.onConfirm} />
       )}
     </div>
   );

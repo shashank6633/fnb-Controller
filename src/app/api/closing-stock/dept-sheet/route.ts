@@ -2,7 +2,9 @@ import { getDb, generateId } from '@/lib/db';
 import { getCurrentOutletId, getCurrentUser } from '@/lib/auth';
 import { allowedDeptSetExpanded, canSeeAllDeptStock } from '@/lib/dept-stock';
 import { materialStoreId, getStoreById } from '@/lib/store-engine';
-import { upsertVarianceApproval } from '@/lib/variance-approval';
+import {
+  recordCountVariance, readPhysicalCount, zeroPatternGuard, type CountInput,
+} from '@/lib/variance-approval';
 import { rateMap, valueCount, type RateSource } from '@/lib/closing-valuation';
 import { packFactor, toPurchaseQty, type PackMeta } from '@/lib/pack-units';
 import { todayIST } from '@/lib/format-date';
@@ -437,7 +439,62 @@ export async function POST(request: Request) {
       return Response.json({ error: 'entries array is required' }, { status: 400 });
     }
 
-    const results = { saved: 0, pending: 0, errors: [] as string[] };
+    /* THE COUNT IS READ ONCE, BEFORE ANY WRITE — same rule, same CALL as the
+     * other four count paths (readPhysicalCount, src/lib/variance-approval.ts).
+     * `Number(e?.physical_stock)` here turned `''`, `'   '` and `null` into a
+     * finite, non-negative 0 that passed the `!isFinite || < 0` guard and was
+     * stored as a real counted zero — and the delete at :492 fired first, so a
+     * blank cell wiped that department's real count for the day. Blank now
+     * produces nothing at all: no delete, no row, no variance, no approval.
+     * ────────────────────────────────────────────────────────────────────── */
+    const parsed: CountInput[] = entries.map(e => readPhysicalCount((e as { physical_stock?: unknown })?.physical_stock));
+
+    /* THE UPLOAD PATTERN GUARD (owner requirement 7) — refuse on the PATTERN,
+     * never on the value. This sheet posts every department at once, so it is
+     * one of the two doors a mass-zeroed file can come through. */
+    /* Judged on the lines that will actually be WRITTEN — see the same block in
+     * ../route.ts. A line with no department, a department this user may not
+     * count for, an unknown material or a LIQUOR material is refused per line in
+     * the loop below and must not dilute the share; dilution is the direction
+     * that makes the guard quieter. */
+    const guardCounts: number[] = [];
+    for (let i = 0; i < entries.length; i++) {
+      const pc = parsed[i];
+      if (pc.kind !== 'count') continue;
+      const e = entries[i] as { department_id?: unknown; material_id?: unknown };
+      const dId = String(e?.department_id || '').trim();
+      const mId = String(e?.material_id || '').trim();
+      if (!mId || !dId) continue;                       // per-line refusals below
+      if (scopedIds && !scopedIds.has(dId)) continue;   // not this user's department
+      const m = db.prepare('SELECT id, category FROM raw_materials WHERE id = ?').get(mId) as
+        { id: string; category?: string | null } | undefined;
+      if (!m) continue;                                 // "Material not found"
+      if (materialStoreId(db, m)) continue;             // "use <store> closing"
+      guardCounts.push(pc.qty);
+    }
+    const zeroGuard = zeroPatternGuard(guardCounts);
+    if (zeroGuard.suspicious && (body as { confirm_zeros?: unknown })?.confirm_zeros !== true) {
+      return Response.json(
+        { error: zeroGuard.message, zero_guard: { ...zeroGuard, confirm_field: 'confirm_zeros' } },
+        { status: 409 },
+      );
+    }
+
+    // One id for this whole save — the handle the monthly review filters on.
+    const batchId = generateId();
+
+    const results = {
+      saved: 0, pending: 0, applied: 0, auto_applied: 0, not_counted: 0, alerts: 0,
+      // EVERY row this route writes is a department row, so `dept_immediate` is
+      // true the moment anything saves and `pending` is now structurally 0 here.
+      // See the sibling comment in ../route.ts: a department count moves that
+      // department's balance at save time, so it is neither held nor approvable
+      // and must never be reported as "sent for variance approval".
+      dept_anchored: 0, dept_immediate: false,
+      errors: [] as string[],
+      zero_guard: zeroGuard.suspicious ? { ...zeroGuard, confirmed: true } : null,
+      batch_id: batchId,
+    };
     const rates = rateMap(db);
 
     const run = db.transaction(() => {
@@ -448,10 +505,16 @@ export async function POST(request: Request) {
         "DELETE FROM closing_stock WHERE date = ? AND material_id = ? AND COALESCE(department_id,'') = ?",
       );
 
-      for (const e of entries) {
+      for (let idx = 0; idx < entries.length; idx++) {
+        const e = entries[idx];
         const deptId = String(e?.department_id || '').trim();
         const materialId = String(e?.material_id || '').trim();
         if (!materialId) continue;
+
+        // BLANK = NOT COUNTED. First, so a blank line cannot reach delOne and
+        // cannot raise "A department is required" for a cell nobody filled in.
+        const pc = parsed[idx];
+        if (pc.kind === 'not_counted') { results.not_counted++; continue; }
 
         // This sheet is department-wise by definition. A Store/Overall count
         // (no department) is a different record and stays on /closing-stock.
@@ -483,11 +546,13 @@ export async function POST(request: Request) {
           continue;
         }
 
-        const physicalStock = Number(e?.physical_stock);
-        if (!isFinite(physicalStock) || physicalStock < 0) {
-          results.errors.push(`Invalid physical stock for ${material.name}`);
+        // Typed-but-not-a-count stays a per-line refusal, upstream of the
+        // delete, so a typo never costs the count already stored for the day.
+        if (pc.kind === 'error') {
+          results.errors.push(`${material.name}: ${pc.reason}`);
           continue;
         }
+        const physicalStock = pc.qty;
 
         delOne.run(date, materialId, deptId);
 
@@ -524,10 +589,20 @@ export async function POST(request: Request) {
           valued.ratePerPurchaseUnit, valued.source, valued.totalValue,
         );
 
-        // A non-zero variance never moves stock here — it raises a PENDING
-        // approval for an admin. Same call the existing writer makes, so counts
-        // from this sheet land in the same queue.
-        upsertVarianceApproval(db, {
+        // THE ONE DOOR — same call as every other count path, so a count from
+        // this sheet is judged against the same bar and lands in the same queue.
+        //
+        // EVERY row here is a DEPARTMENT row (a Store/Overall count is refused
+        // above), so recordCountVariance parks NOTHING for any of them: a
+        // department count already re-anchors its own balance through
+        // dept-ledger's latestCount() the moment the row above is inserted.
+        // `dept_anchored` comes back true on all of them and the outcome is
+        // 'anchored' — not 'held'. It used to be 'held', and this route counted
+        // it into `pending`, so the sheet told the counter their difference was
+        // waiting for an admin when the department figure had already moved and
+        // no admin could ever act on it. See the department block in the header
+        // above recordCountVariance for the measurement and the real fix.
+        const decided = recordCountVariance(db, {
           source: 'central',
           material_id: materialId,
           department_id: deptId,
@@ -538,13 +613,42 @@ export async function POST(request: Request) {
           counted_by: me.email || '',
           count_note: String(e?.notes || ''),
           outlet_id: outletId,
+          batch_id: batchId,
+          batch_label: 'Department closing sheet',
+          pack: material as PackMeta,
         });
-        if (variance !== 0) results.pending++;
+        if (decided.alert) results.alerts++;
+        results.dept_immediate = true;
+        if (variance !== 0) {
+          if (decided.outcome === 'applied') {
+            results.applied++;
+            if (decided.auto_applied) results.auto_applied++;
+          } else if (decided.outcome === 'anchored') {
+            results.dept_anchored++;
+          } else {
+            results.pending++;
+          }
+        }
         results.saved++;
       }
     });
 
     run();
+    /* BLIND COUNTS ON THE WAY BACK OUT. This sheet is open to HODs and store
+     * managers, not just admins, and `pending` / `alerts` are system-stock
+     * oracles: save one line and watch whether it lands in the pending count.
+     * `saved`, `not_counted` and `errors` describe what the counter typed and
+     * stay whole. Callers must not render the null branch as "everything
+     * matched" — same rule as GET's blinding and as /api/stores/[id]/closing. */
+    if (me.role !== 'admin') {
+      return Response.json({
+        // dept_anchored joins the blinded set (it counts only rows that
+        // DIFFERED from the system figure); dept_immediate does not (it names
+        // the rail, not the numbers).
+        ...results, pending: null, applied: null, auto_applied: null, alerts: null,
+        dept_anchored: null,
+      });
+    }
     return Response.json(results);
   } catch (error: unknown) {
     return Response.json({ error: (error as Error)?.message || 'Failed' }, { status: 500 });

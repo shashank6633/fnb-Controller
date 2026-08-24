@@ -1,6 +1,7 @@
 import { getDb, generateId } from '@/lib/db';
 import { valueSemiCount } from '@/lib/closing-valuation';
 import { checkClosingDate } from '@/lib/closing-date';
+import { readPhysicalCount, zeroPatternGuard, type CountInput } from '@/lib/variance-approval';
 
 /**
  * CLOSING COUNTS FOR SEMI-FINISHED ITEMS (sub_recipes)
@@ -269,7 +270,50 @@ export async function POST(request: Request) {
     // a clean save was due.
     const date = checked.date;
 
-    const results = { success: 0, errors: [] as string[], total_value: 0 };
+    /* THE COUNT IS READ ONCE, BEFORE ANY WRITE — the same rule and the same
+     * CALL as the raw-material sheet (src/lib/variance-approval.ts).
+     *
+     * This route's GET has carried the `counted` concept since it shipped
+     * (`counted ? Number(r.physical_stock) : null` at :165, derived from row
+     * presence) and its POST had none of it: `Number(item.physical_stock)` made
+     * `''`, `'   '` and `null` all a finite, non-negative 0 that walked past the
+     * `isNaN || < 0` guard and was stored as a counted zero — then the
+     * delete-then-insert below replaced the sub-recipe's real count for that day
+     * with it. The read side could tell "nobody counted this" from "we counted
+     * zero"; the write side could not, and the write side is the one that
+     * decides. Same rule on both halves now.
+     * ────────────────────────────────────────────────────────────────────── */
+    const parsed: CountInput[] = (items as unknown[]).map(
+      i => readPhysicalCount((i as { physical_stock?: unknown } | null)?.physical_stock),
+    );
+
+    // The pattern guard, identical to the raw sheet's. A sub-recipe sheet is 68
+    // lines, so it only ever trips on a wholesale fill-down; the floors in the
+    // lib keep an ordinary partial count well clear.
+    // Judged on the lines that will actually be WRITTEN — a line whose
+    // sub-recipe does not exist is refused per line in the loop below and must
+    // not dilute the share (dilution only ever makes the guard quieter).
+    const guardCounts: number[] = [];
+    for (let i = 0; i < items.length; i++) {
+      const pc = parsed[i];
+      if (pc.kind !== 'count') continue;
+      const sid = String(items[i]?.sub_recipe_id || '').trim();
+      if (!sid) continue;
+      if (!db.prepare('SELECT 1 FROM sub_recipes WHERE id = ?').get(sid)) continue;
+      guardCounts.push(pc.qty);
+    }
+    const zeroGuard = zeroPatternGuard(guardCounts);
+    if (zeroGuard.suspicious && body.confirm_zeros !== true) {
+      return Response.json(
+        { error: zeroGuard.message, zero_guard: { ...zeroGuard, confirm_field: 'confirm_zeros' } },
+        { status: 409 },
+      );
+    }
+
+    const results = {
+      success: 0, not_counted: 0, errors: [] as string[], total_value: 0,
+      zero_guard: zeroGuard.suspicious ? { ...zeroGuard, confirmed: true } : null,
+    };
 
     const record = db.transaction(() => {
       const delOne = db.prepare(
@@ -282,8 +326,17 @@ export async function POST(request: Request) {
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
       `);
 
-      for (const item of items) {
+      for (let idx = 0; idx < items.length; idx++) {
+        const item = items[idx];
         if (!item.sub_recipe_id) continue;
+
+        // BLANK = NOT COUNTED. Decided before the sub-recipe lookup and long
+        // before delOne — a line nobody counted must not delete the count that
+        // is already stored for that (date, sub-recipe, department), and must
+        // not raise an error either.
+        const pc = parsed[idx];
+        if (pc.kind === 'not_counted') { results.not_counted++; continue; }
+
         const deptId = item.department_id !== undefined ? normDept(item.department_id) : topDeptId;
 
         const sub = getSub.get(item.sub_recipe_id) as any;
@@ -292,11 +345,12 @@ export async function POST(request: Request) {
           continue;
         }
 
-        const physicalStock = Number(item.physical_stock);
-        if (isNaN(physicalStock) || physicalStock < 0) {
-          results.errors.push(`Invalid physical stock for ${sub.name}`);
+        // Typed-but-not-a-count is still a per-line refusal; only blank is silent.
+        if (pc.kind === 'error') {
+          results.errors.push(`${sub.name}: ${pc.reason}`);
           continue;
         }
+        const physicalStock = pc.qty;
 
         // Value at count time and STORE rate + unit + value on the row. No pack
         // factor: a sub-recipe is counted and costed in the same yield_unit.

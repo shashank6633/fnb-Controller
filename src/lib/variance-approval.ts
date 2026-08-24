@@ -42,6 +42,7 @@ import { generateId } from '@/lib/db';
 import { qcHoldBlockForCount } from '@/lib/grn-qc';
 import { postLedger, isStoreMappedMaterial } from '@/lib/store-engine';
 import { deptOnHand, postDeptLedger } from '@/lib/dept-ledger';
+import { packFactor, type PackMeta } from '@/lib/pack-units';
 import {
   getCentralStoreCutoverDate,
   getCentralStoreCutoverCommittedAt,
@@ -61,15 +62,474 @@ export interface CreateVarianceInput {
   counted_by?: string;
   count_note?: string;
   outlet_id?: string | null;
+  /**
+   * ADDITIVE (2026-08). The SUBMIT this count arrived in — one id per upload /
+   * sheet save, stamped on every row it produces. This is what makes the queue a
+   * MONTHLY activity: closing stock is uploaded weekly, so "clear last month"
+   * means "clear these four uploads", and without an id per upload the only
+   * handle on a batch is a date range that also sweeps up anything else counted
+   * that day. Empty string = a save made before this existed, or one that did
+   * not bother; it never changes behaviour, only what can be filtered.
+   */
+  batch_id?: string | null;
+  /** Human label for that submit ("All-departments CSV", "Liquor store sheet"). */
+  batch_label?: string | null;
 }
 
 const norm = (v?: string | null): string => (v == null ? '' : String(v).trim());
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * 1. THE ONE `counted` CONCEPT — BLANK IS NOT A COUNT.
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ *      BLANK = NOT COUNTED.      0 = COUNTED AND FOUND EMPTY.
+ *
+ * THE DEFECT THIS CLOSES. Every intake path read a physical count with a bare
+ * `Number(x)`, and `Number('') === 0`, `Number('   ') === 0`, `Number(null) === 0`
+ * — all finite, all non-negative, so all sailed past the `isNaN || < 0` guard and
+ * were STORED AS A REAL COUNTED ZERO. Only a MISSING KEY (`undefined`) yielded
+ * NaN, so "the cell was empty" and "the counter wrote 0" were the same event on
+ * four of the five writers. A weekly sheet carrying 793 blanks-typed-as-0
+ * therefore produced 793 "we have zero" counts, each with a full-shelf variance
+ * and each demanding an admin decision.
+ *
+ * A blank is worse than an extra approval: the upsert-delete on every writer
+ * fires for any line that passes validation, so a blank-become-0 DELETES the
+ * real count already stored for that (date, material, department) and replaces
+ * it with 0. And on department rows dept-ledger's latestCount() anchors the
+ * department balance on the newest closing_stock row, so the phantom zero moves
+ * that department's on-hand to nil at SAVE time, before anyone approves.
+ *
+ * THE REPRESENTATION IS ROW ABSENCE, NOT A NULL. closing_stock.physical_stock,
+ * closing_stock_semi.physical_stock and store_closing_counts.physical_qty are
+ * all `REAL NOT NULL DEFAULT 0` — NULL is not merely unused there, it is
+ * impossible. Every READER already speaks the tri-state through row presence:
+ * semi/route.ts:146 `const counted = r.count_id != null` → `:165 physical_stock:
+ * counted ? Number(...) : null`, dept-sheet/route.ts:317 `counted: !!saved`,
+ * overview's `counted_items`, by-location's LEFT JOIN. Making the column
+ * nullable would rebuild a NOT NULL column across live history AND silently
+ * break eleven `|| 0` readers (dept-ledger:508/611, dept-stock:333/337,
+ * store-engine:1522/1527/1730/1732, closing-valuation:122/145, …), all of which
+ * would turn "not counted" back into a hard zero one layer down.
+ *
+ * So NOT_COUNTED means: write NOTHING. No INSERT, and — this is the half that is
+ * easy to miss — NO DELETE and NO `ON CONFLICT` upsert either, or "not counted"
+ * would erase the count that IS stored for that day. No variance, no approval,
+ * no error line.
+ *
+ * MODELLED ON THE TWO PLACES THAT ALREADY GOT IT RIGHT: semi/route.ts:165 (the
+ * `counted` concept) and dept-sheet/import/route.ts:230 `parseCount()` (which
+ * already returns null for a blank and refuses "1,200"/"3 kg" rather than
+ * mis-reading them as 1 and 3). This is the same RULE as one CALL, not a second
+ * scheme beside them — the importer now calls this and deletes its local copy.
+ * ═════════════════════════════════════════════════════════════════════════ */
+
+/** What one physical-count cell turned out to be. Three states, never two. */
+export type CountInput =
+  /** The cell was empty. Not a zero. Write nothing at all for this line. */
+  | { kind: 'not_counted' }
+  /** A real measurement, `qty >= 0`. **A counted 0 lands here**, like any number. */
+  | { kind: 'count'; qty: number }
+  /** Something was typed and it is not a count. Name it; never guess. */
+  | { kind: 'error'; reason: string };
+
+const NOT_COUNTED: CountInput = { kind: 'not_counted' };
+
+/**
+ * THE ONE READER of a physical-count cell. Every writer calls THIS — the same
+ * call, not a copied rule — so blank can never mean two things again.
+ *
+ * | input                                   | result                          |
+ * |-----------------------------------------|---------------------------------|
+ * | `undefined`, `null`                     | not_counted                     |
+ * | `''`, `'   '`, `'\t'`                   | not_counted                     |
+ * | `0`, `'0'`, `'0.00'`                    | **count 0** (a real measurement) |
+ * | `12.5`, `'12.5'`, `'1,200'`             | count                           |
+ * | `'abc'`, `'3 kg'`, `'1,20'`, `'1e3'`    | error                           |
+ * | `-5`, `'-5'`                            | error                           |
+ * | `NaN`, `Infinity`                       | error                           |
+ * | `true`, `[]`, `[5]`, `{}`               | error                           |
+ *
+ * The last row matters more than it looks: `Number(true) === 1`, `Number([]) === 0`
+ * and `Number([5]) === 5`, so every one of those used to store a count. They are
+ * refused by TYPE here, before any coercion can invent a number from them.
+ *
+ * Grouping separators are accepted only in the exact `1,200,000.5` shape — the
+ * rule parseCount() already applied in the CSV importer, kept byte-for-byte so
+ * the two doors read one file identically. A malformed group (`1,20`) is an
+ * error rather than a silent 120 or 1.
+ */
+export function readPhysicalCount(raw: unknown): CountInput {
+  if (raw === undefined || raw === null) return NOT_COUNTED;
+
+  if (typeof raw === 'number') {
+    if (!Number.isFinite(raw)) return { kind: 'error', reason: 'physical count is not a number' };
+    if (raw < 0) return { kind: 'error', reason: 'physical count cannot be negative' };
+    return { kind: 'count', qty: raw };
+  }
+
+  if (typeof raw !== 'string') {
+    // Booleans, arrays and objects all coerce to a NUMBER in JS and would
+    // otherwise be stored as a count. Refuse the type, never the coercion.
+    return { kind: 'error', reason: 'physical count must be a number' };
+  }
+
+  let s = raw.trim();
+  if (s === '') return NOT_COUNTED;               // ← the whole point of this file
+  if (/^\d{1,3}(,\d{3})+(\.\d+)?$/.test(s)) s = s.replace(/,/g, '');
+  if (!/^\d+(\.\d+)?$/.test(s)) {
+    return {
+      kind: 'error',
+      reason: raw.trim().startsWith('-')
+        ? `physical count cannot be negative ("${raw.trim()}")`
+        : `invalid physical count "${raw.trim()}" — write a plain number (0 means counted and empty; leave the cell blank if it was not counted)`,
+    };
+  }
+  const n = Number(s);
+  if (!Number.isFinite(n)) return { kind: 'error', reason: `invalid physical count "${raw.trim()}"` };
+  return { kind: 'count', qty: n };
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * 2. THE UPLOAD PATTERN GUARD — refuse on the PATTERN, never on the value.
+ * ═══════════════════════════════════════════════════════════════════════════
+ * A 0 is a legitimate count and must stay one, so nothing here rejects a zero.
+ * What it rejects is an IMPLAUSIBLE SHARE of them arriving at once, which is the
+ * signature of a sheet whose blanks were filled in by a spreadsheet, an export
+ * `defval`, or a fill-down. The incident was 793 zeros in 1,033 rows — 77%.
+ *
+ * It refuses BEFORE anything is written and NAMES THE COUNT, and a genuine
+ * all-zero stocktake is still possible: the caller re-submits with an explicit
+ * confirmation. This is a pattern check, not a value check — the same 793 zeros
+ * typed deliberately go through on the second submit.
+ *
+ * The floors are deliberately generous so ordinary work never trips it: a
+ * department counting a handful of items, an EOD keypad entry, a single-material
+ * correction. Only a bulk sheet can reach the thresholds at all.
+ */
+export const ZERO_GUARD_MIN_COUNTS = 25;   // below this, a submit is not a "sheet"
+export const ZERO_GUARD_MIN_ZEROS = 15;    // a handful of real zeros is normal
+export const ZERO_GUARD_SHARE = 0.6;       // 60% of counted lines reading 0
+
+export interface ZeroPatternVerdict {
+  /** Lines that carried a real count (blanks are not counted and not included). */
+  counted: number;
+  /** How many of those were exactly 0. */
+  zeros: number;
+  /** zeros / counted, 0..1. */
+  share: number;
+  /** true ⇒ refuse the write unless the caller explicitly confirmed. */
+  suspicious: boolean;
+  /** The sentence to show. Empty when not suspicious. */
+  message: string;
+}
+
+/**
+ * Judge a whole submit's zero pattern. `counts` is every value that parsed as a
+ * real count — blanks must already have been dropped, since a blank is not a
+ * zero and including them would make the guard fire on an ordinary sparse sheet.
+ */
+export function zeroPatternGuard(counts: number[]): ZeroPatternVerdict {
+  const counted = counts.length;
+  let zeros = 0;
+  for (const n of counts) if (n === 0) zeros++;
+  const share = counted > 0 ? zeros / counted : 0;
+  const suspicious =
+    counted >= ZERO_GUARD_MIN_COUNTS &&
+    zeros >= ZERO_GUARD_MIN_ZEROS &&
+    share >= ZERO_GUARD_SHARE;
+  return {
+    counted,
+    zeros,
+    share: Math.round(share * 1000) / 1000,
+    suspicious,
+    message: suspicious
+      ? `${zeros} of ${counted} counted lines (${Math.round(share * 100)}%) are 0. ` +
+        `A 0 is recorded as "counted and found empty" and will be held or applied like any other count — ` +
+        `blank cells are what mean "not counted". If those cells were meant to be BLANK, fix the file and ` +
+        `upload again. If the shelves really were empty, confirm and this will be saved as counted zeros.`
+      : '',
+  };
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * 3. THE BAR — how big a difference is worth an admin's attention.
+ * ═══════════════════════════════════════════════════════════════════════════
+ * Until now there was NO tolerance at all: upsertVarianceApproval() cleared the
+ * row at `variance === 0` exactly and raised one for anything else, so a 0.001 kg
+ * flour difference became an admin decision. That is what filled the queue.
+ *
+ * BELOW THE BAR the variance APPLIES IMMEDIATELY and simply shows up on the
+ * report. ABOVE THE BAR the count is recorded and visible but THE STOCK IS HELD
+ * — the figure does not move until an admin approves it, so a wrong count can
+ * never reach the books.
+ *
+ * BOTH AXES MUST AGREE THAT IT IS SMALL. `variance_value` is
+ * `variance × raw_materials.average_price`, and average_price is 0 for
+ * unpriced materials — so a rupee-only bar reads EVERY unpriced variance as ₹0,
+ * i.e. under the bar, whatever the quantity. That is the mechanical reason the
+ * owner's "value and/or quantity" is a requirement and not a preference, and it
+ * is closed two ways: a configured rupee bar can only pass a material that
+ * actually has a price basis, and a configured quantity bar must pass too.
+ *
+ * THE QUANTITY BAR IS IN PURCHASE UNITS (owner rule). "2" means 2 BTL / 2 kg,
+ * not 2 ml — a recipe-unit bar would mean 2 ml on one material and 2 pcs on the
+ * next. Converted per material through packFactor().
+ *
+ * DEFAULT IS OFF — every key defaults to 0 and 0 means "no bar". A fresh deploy
+ * behaves EXACTLY as today (everything above zero is held) until an admin sets a
+ * number. That is deliberate: this ships onto a live queue of 1,472 rows.
+ *
+ * HARD CLAMPS, NOT JUST DEFAULTS — AND A CEILING BENEATH THEM. The generic
+ * PUT /api/settings is manager-or-admin; these four keys are now registered in
+ * its KEY_POLICY table as write:'admin' (src/app/api/settings/route.ts), so the
+ * self-lift door is shut. The clamps below are the braces to that belt, and
+ * AUTO_APPLY_HARD_VALUE_CEILING is a third layer, because the clamps alone were
+ * NOT enough: they bound quantity and percentage, never money, so a qty-only
+ * bar auto-applied ₹1.27 lakh on one bottle line. See that constant.
+ */
+export const VARIANCE_BAR_KEYS = {
+  /** ₹ of variance value at or under which a count applies itself. 0 = off. */
+  value: 'closing_variance_bar_value',
+  /** PURCHASE-unit variance at or under which a count applies itself. 0 = off. */
+  qty: 'closing_variance_bar_qty',
+  /** ₹ of variance value at or over which the immediate alert fires. 0 = off. */
+  alertValue: 'closing_variance_alert_value',
+  /** % of the item's own system stock at or over which the alert fires. 0 = off. */
+  alertPct: 'closing_variance_alert_pct',
+} as const;
+
+export const VARIANCE_BAR_MAX_VALUE = 5000;   // ₹ — ceiling on the auto-apply bar
+export const VARIANCE_BAR_MAX_QTY = 100;      // purchase units — ditto
+export const VARIANCE_ALERT_MAX_VALUE = 10_000_000;
+export const VARIANCE_ALERT_MAX_PCT = 1000;
+
+/**
+ * THE HARD RUPEE CEILING ON ANY AUTO-APPLY, whatever the bar says.
+ * ═══════════════════════════════════════════════════════════════════════════
+ * The clamps above were documented as meaning "the most a badly-written bar can
+ * auto-apply is small on any single item". THAT WAS FALSE FOR THE QUANTITY AXIS
+ * and it was measured: `valueOk` is `bar.value <= 0 || …`, so a bar with ONLY
+ * `closing_variance_bar_qty` set leaves the rupee axis unconditionally true.
+ * 100 purchase units of RESERVA DE DON JULIO (₹12,716.83/unit) auto-applied at
+ * **₹1,271,683** with nobody in the loop — a qty bar has no rupee opinion at
+ * all, and VARIANCE_BAR_MAX_QTY bounds bottles, not money.
+ *
+ * So the ceiling is enforced HERE instead of being asserted in a comment: no
+ * variance worth more than VARIANCE_BAR_MAX_VALUE may EVER apply itself,
+ * whichever axis the admin configured and whatever they typed. An unpriced
+ * material values at ₹0 and is unaffected — the qty axis still governs it, as
+ * `priced` below requires.
+ *
+ * This does NOT constrain the admin's own "Adjust system stock" tick
+ * (`force_apply`): that is a person deciding, in an admin-only surface, with
+ * the figure in front of them. It constrains the machine.
+ */
+export const AUTO_APPLY_HARD_VALUE_CEILING = VARIANCE_BAR_MAX_VALUE;
+
+/* ── The materiality floor under the ALERT's share axis ──────────────────────
+ * MEASURED ON THE OWNER'S OWN SHEETS (~/Downloads/closing-stock-history-
+ * 2026-07-05_2026-08-03.csv, the 2026-08-01 closing: 1,026 counted lines, 311
+ * of them holding stock, with real per-line rates):
+ *
+ *   per-line stock value   p25 ₹428 · p50 ₹907 · p75 ₹2,550 · p90 ₹6,480 ·
+ *                          p95 ₹13,000 · max ₹131,425
+ *   per-line stock qty     p50 5 purchase units · 48% hold ≤ 4 · 75% hold ≤ 10
+ *
+ * Two consequences, and they are why a percentage ALONE cannot be an alert:
+ *
+ *   1. A COUNTED 0 IS ALWAYS EXACTLY 100%. variance = 0 − system, so
+ *      |variance|/|system| = 1 by arithmetic, on every "shelf is empty" line.
+ *      Two thirds of every real sheet is counted 0 (715 of 1,026 on 2026-08-01;
+ *      793 of 1,033 in the incident), so an unfloored share axis fires on
+ *      roughly 70-100% of an upload and is muted inside one cycle.
+ *   2. ONE PURCHASE UNIT OF MISCOUNT IS ≥25% FOR HALF THE CATALOGUE, because
+ *      half the catalogue holds ≤4 purchase units. That is the rounding case,
+ *      not an emergency.
+ *
+ * The floor is a VALUE floor: a difference has to be worth ALERT_MIN_VALUE
+ * before a percentage of it means anything. Simulated against the same sheet,
+ * a total-vanish count on every stocked line: 311 fire unfloored, 43 fire at
+ * ₹5,000 (14%). On a 1-purchase-unit miscount of every line: 311 unfloored,
+ * ONE at ₹5,000. That is the difference between a bell and wallpaper.
+ *
+ * ALERT_MIN_QTY is the stand-in for materials with NO price at all
+ * (average_price 0 ⇒ variance_value ₹0, so the value floor would suppress them
+ * for ever). It is not a second axis — it is the same floor, measured in the
+ * only unit those rows have. Purchase units, per the owner's unit rule.
+ *
+ * DELIBERATELY CONSTANTS, NOT SETTINGS KEYS. A floor can only ever SUPPRESS an
+ * alert, never raise one, so shipping it armed is safe in a way a bar is not;
+ * and a tunable with no UI is a trap (the admin panel on /variance-approvals
+ * shows the four bar keys and would not show these). If they need tuning, that
+ * is a settings key plus a field on that panel, together.
+ */
+export const ALERT_MIN_VALUE = 5000;   // ₹ — under this, a percentage is noise
+export const ALERT_MIN_QTY = 10;       // purchase units — for UNPRICED materials
+
+/* ── THE CIRCUIT-BREAKER ON ONE UPLOAD ───────────────────────────────────────
+ * Every control above is PER LINE. Nothing bounded a SUBMIT, and a submit is
+ * how this system is actually used: one CSV, a thousand lines. Measured before
+ * this existed — a 20-row all-zero submit is below the zero-guard's floor (25
+ * counted lines), so no guard saw it at all, and it applied straight through:
+ * 3 materials zeroed, ₹6,230, no admin. Scale that to 200 lines under a ₹5,000
+ * bar and one upload could move ₹1,000,000 with nobody in the loop.
+ *
+ * So an upload gets a budget. Once a batch has auto-applied more than
+ * AUTO_APPLY_BATCH_VALUE (₹, absolute) or AUTO_APPLY_BATCH_ROWS lines, the REST
+ * OF THAT UPLOAD IS HELD — recorded, visible, pending, with the reason on the
+ * row. Nothing is undone; the breaker only stops the machine going further.
+ *
+ * ORDER-DEPENDENT, AND THAT IS THE POINT. Which lines land before the breaker
+ * trips depends on their order in the file. That would be indefensible for a
+ * BUDGET ("you may spend ₹25,000 per sheet") and is exactly right for a
+ * BREAKER: the question it answers is "is this upload behaving like an ordinary
+ * weekly sheet?", and the answer is the same whichever line asks it. An upload
+ * that trips it needs a human, and after it trips one is guaranteed to get one.
+ *
+ * Sized against the owner's real sheets: routine weekly noise on a 1,000-line
+ * sheet is a few hundred rupees a line on a few dozen lines. ₹25,000 / 200 rows
+ * is generous for that and a hard stop on a wholesale event.
+ */
+export const AUTO_APPLY_BATCH_VALUE = 25_000;  // ₹ of auto-applied |variance| per upload
+export const AUTO_APPLY_BATCH_ROWS = 200;      // lines auto-applied per upload
+
+/**
+ * How long an AUTO-APPLIED row stays in the immediate alert.
+ *
+ * A pending row leaves the alert when the admin DECIDES it — approve or reject,
+ * either way an action ends it. An auto-applied row has no decision left to
+ * make: it is already `approved`, so with no window it would sit in the alert
+ * for ever and the number could only climb. One week matches the upload cadence
+ * — an auto-applied difference nobody looked at inside a week is history, and
+ * it is still in the queue's approved tab and on every variance report.
+ */
+export const ALERT_AUTO_APPLIED_WINDOW_DAYS = 7;
+
+export interface VarianceBar {
+  /** ₹. 0 = this axis is off. */
+  value: number;
+  /** Purchase units. 0 = this axis is off. */
+  qty: number;
+  /** ₹. 0 = the value alert is off. */
+  alertValue: number;
+  /** Percent of the item's system stock. 0 = the share alert is off. */
+  alertPct: number;
+}
+
+/** 0 for anything unreadable, negative, or non-finite; clamped to `max`. */
+function tunable(db: Database.Database, key: string, max: number): number {
+  let raw: string | undefined;
+  try {
+    raw = (db.prepare(`SELECT value FROM settings WHERE key = ?`).get(key) as { value?: string } | undefined)?.value;
+  } catch { /* no settings table yet ⇒ the bar is off, which is the safe answer */ }
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.min(max, n);
+}
+
+/**
+ * The effective bar. Read fresh on every save — NEVER cached and NEVER swept
+ * over rows that already exist. See the requirement-7 note on
+ * recordCountVariance(): changing this tomorrow cannot move a gram of yesterday's
+ * held stock.
+ */
+export function varianceBar(db: Database.Database): VarianceBar {
+  return {
+    value: tunable(db, VARIANCE_BAR_KEYS.value, VARIANCE_BAR_MAX_VALUE),
+    qty: tunable(db, VARIANCE_BAR_KEYS.qty, VARIANCE_BAR_MAX_QTY),
+    alertValue: tunable(db, VARIANCE_BAR_KEYS.alertValue, VARIANCE_ALERT_MAX_VALUE),
+    alertPct: tunable(db, VARIANCE_BAR_KEYS.alertPct, VARIANCE_ALERT_MAX_PCT),
+  };
+}
+
+/**
+ * THE IMMEDIATE ALERT — rupee value OR share of that item's own stock,
+ * WHICHEVER FIRES FIRST. Both tunable, both off by default.
+ *
+ * THIS IS AN ALERT, NEVER A SECOND GATE. Whether the stock moved was already
+ * decided by the bar above; this only decides whether the admin should be told
+ * TODAY instead of at month end. Nothing downstream of it writes stock.
+ *
+ * The share axis needs a denominator, and `system_stock` is 0 on a great many
+ * live materials. `|variance| / 0` is not "infinitely big", it is UNDEFINED —
+ * and treating it as a hit would fire on the ordinary first count of every
+ * never-stocked item and bury the real ones. When the book says nothing, the
+ * rupee axis is the one that can speak, so the share axis abstains.
+ *
+ * AND IT ALSO NEEDS A FLOOR. A percentage has no magnitude of its own: a
+ * counted 0 is exactly 100% by arithmetic, and one purchase unit is ≥25% for
+ * half this catalogue. ALERT_MIN_VALUE / ALERT_MIN_QTY are what stop the share
+ * axis firing on 70-100% of every upload — see those constants for the measured
+ * numbers. The RUPEE axis carries no floor because a rupee threshold IS a
+ * magnitude; floor-ing it would just be a second, quieter threshold.
+ *
+ * `purchaseQty` is the variance in PURCHASE units (owner rule). Omitted, the
+ * floor falls back to recipe units, which for a packed material is a BIGGER
+ * number and therefore the noisier direction — pass it wherever it is known.
+ */
+export function isBigVariance(
+  bar: VarianceBar, variance: number, varianceValue: number, systemStock: number,
+  purchaseQty?: number,
+): boolean {
+  const val = Math.abs(Number(varianceValue) || 0);
+  if (bar.alertValue > 0 && val >= bar.alertValue) return true;
+  if (bar.alertPct > 0) {
+    const base = Math.abs(Number(systemStock) || 0);
+    if (base <= 0) return false;
+    if ((Math.abs(Number(variance) || 0) / base) * 100 < bar.alertPct) return false;
+    // THE MATERIALITY FLOOR. Value where there is a value; quantity only where
+    // the material is unpriced and rupees genuinely cannot speak.
+    if (val > 0) return val >= ALERT_MIN_VALUE;
+    const qty = Math.abs(Number(purchaseQty ?? variance) || 0);
+    return qty >= ALERT_MIN_QTY;
+  }
+  return false;
+}
+
+/**
+ * packFactor() as SQL, against a `raw_materials` alias. The queue-wide alert
+ * has to apply the SAME purchase-unit floor as the per-save one, and it cannot
+ * call packFactor() on a thousand rows one at a time. Kept beside its JS twin
+ * so the two are read together; if pack-units.ts's rule changes, change both.
+ */
+const PACK_FACTOR_SQL = (rm: string) => `
+  CASE WHEN ${rm}.pack_size > 1
+         AND LOWER(TRIM(${rm}.unit)) <> LOWER(TRIM(COALESCE(NULLIF(${rm}.purchase_unit, ''), ${rm}.unit)))
+       THEN ${rm}.pack_size ELSE 1 END`;
+
+/**
+ * ₹ value of a variance, in the ONE basis this table has always stored:
+ * `variance × raw_materials.average_price` (₹ per RECIPE unit). Extracted so the
+ * bar and the stored `variance_value` column can never be computed two ways.
+ *
+ * Deliberately NOT closing-valuation.ts's ladder. That prices the COUNT at
+ * ₹/purchase-unit for the closing sheet's rupee total; this prices the
+ * DIFFERENCE, and it is the figure the queue, the bell and every variance report
+ * already display. Two rupee figures on one row is how a bar starts disagreeing
+ * with the number the admin is looking at.
+ */
+function varianceRupees(db: Database.Database, materialId: string, variance: number): {
+  value: number; avgPrice: number;
+} {
+  let avg = 0;
+  try {
+    const mat = db.prepare('SELECT average_price FROM raw_materials WHERE id = ?').get(materialId) as
+      { average_price: number } | undefined;
+    avg = Number(mat?.average_price) || 0;
+  } catch { /* unpriced ⇒ 0, and `priced` below then refuses a rupee-only bar */ }
+  return { value: Math.round(variance * avg * 100) / 100, avgPrice: avg };
+}
 
 /**
  * Create or refresh a PENDING variance approval. Idempotent per
  * (source, material, store, dept, date): re-counting the same item before it is
  * approved updates the SAME pending row instead of stacking duplicates. A zero
  * variance is a no-op (nothing to approve) and returns null.
+ *
+ * PARKING ONLY. It does not read the bar and it never moves stock — that
+ * decision belongs to recordCountVariance() below, which is what every writer
+ * now calls. Kept exported because it is the narrow, side-effect-free half.
  */
 export function upsertVarianceApproval(db: Database.Database, inp: CreateVarianceInput): string | null {
   const variance = Math.round((Number(inp.physical_stock) - Number(inp.system_stock)) * 1000) / 1000;
@@ -87,10 +547,9 @@ export function upsertVarianceApproval(db: Database.Database, inp: CreateVarianc
     return null;
   }
 
-  const mat = db.prepare('SELECT average_price FROM raw_materials WHERE id = ?').get(inp.material_id) as
-    { average_price: number } | undefined;
-  const avg = Number(mat?.average_price) || 0;
-  const varianceValue = Math.round(variance * avg * 100) / 100;
+  const varianceValue = varianceRupees(db, inp.material_id, variance).value;
+  const batchId = norm(inp.batch_id);
+  const batchLabel = norm(inp.batch_label);
 
   const existing = db.prepare(`
     SELECT id FROM variance_approvals
@@ -98,14 +557,17 @@ export function upsertVarianceApproval(db: Database.Database, inp: CreateVarianc
   `).get(inp.source, inp.material_id, storeId, deptId, inp.date, outletId) as { id: string } | undefined;
 
   if (existing) {
+    // The batch moves to the LATEST submit that touched this pending row. A
+    // re-count belongs to the upload that re-counted it, or "clear last week's
+    // upload" would silently clear a row corrected this week.
     db.prepare(`
       UPDATE variance_approvals SET
         system_stock = ?, physical_stock = ?, variance = ?, variance_value = ?, unit = ?,
-        counted_by = ?, count_note = ?, created_at = datetime('now')
+        counted_by = ?, count_note = ?, batch_id = ?, batch_label = ?, created_at = datetime('now')
       WHERE id = ?
     `).run(
       inp.system_stock, inp.physical_stock, variance, varianceValue, norm(inp.unit),
-      norm(inp.counted_by), norm(inp.count_note), existing.id,
+      norm(inp.counted_by), norm(inp.count_note), batchId, batchLabel, existing.id,
     );
     return existing.id;
   }
@@ -114,13 +576,326 @@ export function upsertVarianceApproval(db: Database.Database, inp: CreateVarianc
   db.prepare(`
     INSERT INTO variance_approvals
       (id, source, material_id, store_id, department_id, date, system_stock, physical_stock,
-       variance, variance_value, unit, counted_by, count_note, status, outlet_id, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, datetime('now'))
+       variance, variance_value, unit, counted_by, count_note, status, outlet_id,
+       batch_id, batch_label, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, datetime('now'))
   `).run(
     id, inp.source, inp.material_id, storeId, deptId, inp.date, inp.system_stock, inp.physical_stock,
     variance, varianceValue, norm(inp.unit), norm(inp.counted_by), norm(inp.count_note), outletId,
+    batchId, batchLabel,
   );
   return id;
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * 4. THE DECISION — the ONE door from "a count was saved" to "stock moved".
+ * ═══════════════════════════════════════════════════════════════════════════
+ * Every writer calls THIS instead of upsertVarianceApproval(). It parks the row,
+ * reads the bar, and — when the difference is under the bar — grants that same
+ * approval immediately through approveVariance(), the identical function the
+ * admin queue calls.
+ *
+ * ONE PATH TO raw_materials, NOT TWO. The auto-apply is NOT a second
+ * `UPDATE raw_materials SET current_stock`; it is the queue's own approval,
+ * fired a few milliseconds earlier. So the delta posted, the negative-stock
+ * behaviour, the inventory_transactions log, the cutover floor, the QC-hold
+ * floor and the supersede guard are byte-for-byte what "approve next month"
+ * produces. Nothing here can drift from the reviewed path, because nothing here
+ * writes stock.
+ *
+ * WHY AUTO-APPLY IS ONLY SAFE AT SAVE TIME. A pending row FREEZES system_stock
+ * and approveVariance posts (physical − that frozen figure) onto LIVE stock.
+ * Called here, inside the save, `system_stock` IS live current_stock this
+ * instant, so `before + delta == physical` exactly. A later batch sweep of
+ * "small" rows would post a stale delta on top of everything that moved since —
+ * the double-apply supersedeWhere() exists to stop. Hence the next paragraph,
+ * which is a REQUIREMENT and not an implementation note:
+ *
+ * ╔══════════════════════════════════════════════════════════════════════════╗
+ * ║ CHANGING THE BAR MUST NOT RETROACTIVELY MOVE STOCK.                      ║
+ * ║ The bar is read HERE and only here, at save time, for the row being      ║
+ * ║ saved. Nothing anywhere sweeps existing rows against it. A row already   ║
+ * ║ pending stays pending until a human decides it, and lowering the bar     ║
+ * ║ tomorrow cannot silently apply yesterday's held variances. If a sweep is ║
+ * ║ ever added it must re-read each row's rail and re-run the supersede      ║
+ * ║ guard — do not add one because it "looks equivalent".                    ║
+ * ╚══════════════════════════════════════════════════════════════════════════╝
+ *
+ * AUTO-APPLY MAY FAIL, AND THAT IS A FEATURE. The cutover floor and the QC-hold
+ * floor refuse small variances too, and they should. When they do, the count
+ * still saves, the approval stays PENDING, and `apply_error` carries the reason
+ * — the existing precedent at closing-stock/route.ts:597-606.
+ *
+ * ╔══════════════════════════════════════════════════════════════════════════╗
+ * ║ DEPARTMENT ROWS ARE NOT PARKED AT ALL, BECAUSE THEY CANNOT BE HELD.      ║
+ * ╚══════════════════════════════════════════════════════════════════════════╝
+ * dept-ledger's latestCount() anchors a department balance on the newest
+ * closing_stock row with NO approval-status test, so a department count has
+ * ALREADY moved that department's on-hand the moment it was SAVED — before any
+ * bar, any hold, any approval. MEASURED: opening 5000 → save an UNAPPROVED
+ * count of 4800 → deptOnHand returns 4800 with the approval still 'pending'.
+ *
+ * A pending row on that rail was therefore a claim the system could not honour:
+ *   · it said "stock is held pending your approval" when the balance had
+ *     already moved;
+ *   · it could never be APPROVED — varianceApprovalBlock() refuses every one of
+ *     them (anchorSource === 'count'), and approveVariance()'s post-condition
+ *     would throw if it somehow got through, because the correction would land
+ *     on top of the anchor and double;
+ *   · REJECT did not recover anything either — measured: reject a department
+ *     count of 0 against an on-hand of 40 and the balance stays 0. The only
+ *     honest verb the queue offered was one that changed nothing.
+ * So the row was pure noise with a false label on it, and thousands of them
+ * were the bulk of the queue this whole build exists to drain.
+ *
+ * WHAT HAPPENS NOW: the count still SAVES (closing_stock keeps the dated record,
+ * with its variance and variance_value, which is what /api/department-variance
+ * reports from). No pending approval is created — outcome 'anchored', and
+ * `dept_anchored` is true. A matching re-count still CLEARS a stale pending row
+ * exactly as it always did, so the legacy rows drain the way they always have;
+ * nothing here rewrites or deletes an existing decision.
+ *
+ * THIS IS NOT THE FIX, IT IS THE HONEST STATE. The real fix is in
+ * src/lib/dept-ledger.ts: latestCount() must not let a count re-base a balance
+ * before it is approved. That change re-bases every department balance in the
+ * system retroactively (every historical count carries an approval row) and has
+ * a mandated twin in dept-stock.ts's computeDeptStock, so it is its own build
+ * with its own cutover — not something to slip into a safety pass. Until it
+ * lands, requirement 3 ("above the bar the stock is HELD") is simply NOT
+ * DELIVERED on the department rail, and no screen may pretend otherwise.
+ */
+
+/** Recorded as `reviewed_by` when the BAR applied a count, never a person. */
+export const AUTO_REVIEWER = 'system:auto-apply';
+
+export interface RecordVarianceInput extends CreateVarianceInput {
+  /**
+   * Pack meta of the material, so the QUANTITY bar can be read in PURCHASE
+   * units (owner rule). Omit it and the qty axis falls back to recipe units,
+   * which is stricter for packed materials and never looser: packFactor >= 1
+   * always, so a missing pack meta can only make a variance look BIGGER
+   * against the bar, i.e. more likely to be held.
+   */
+  pack?: PackMeta | null;
+  /**
+   * The admin's "Adjust system stock" tick — apply regardless of the bar. Still
+   * goes through approveVariance() and is still refused by every floor.
+   */
+  force_apply?: boolean;
+  /** Who to record on a forced apply. Defaults to AUTO_REVIEWER. */
+  applied_by?: string | null;
+  /** Reason recorded on a forced apply. Defaults to a self-describing sentence. */
+  applied_reason?: string | null;
+}
+
+export interface RecordVarianceResult {
+  /**
+   *  'match'    — the count agrees with the book. Nothing parked, nothing moved.
+   *  'applied'  — under the bar (or force-applied): stock has ALREADY moved.
+   *  'held'     — above the bar: recorded and visible, stock NOT moved, waiting
+   *               for an admin. The default, and the safe one.
+   *  'anchored' — A DEPARTMENT ROW. The department's own balance moved the
+   *               instant the closing_stock row was written, before this
+   *               function was even called. Nothing is parked, because there is
+   *               nothing left to hold and nothing an approval could do. NEVER
+   *               report this as 'held': it is the opposite. See the department
+   *               section of the header block above recordCountVariance().
+   */
+  outcome: 'match' | 'applied' | 'held' | 'anchored';
+  approval_id: string | null;
+  variance: number;
+  variance_value: number;
+  /** The variance in PURCHASE units — the basis the qty bar is written in. */
+  variance_purchase_qty: number;
+  /**
+   * Why the stock did not move even though the bar would otherwise have moved
+   * it. Admin-facing text, and admin-only on every surface (it names the system
+   * figure's provenance — blind counts).
+   *
+   * Two causes, deliberately sharing one field because they read identically to
+   * the admin ("the count saved; the figure did not move; here is why"):
+   *   · an apply was ATTEMPTED and a floor refused it (cutover, QC hold, a
+   *     newer count) — the count stays pending;
+   *   · the difference passed the configured bar but is worth more than
+   *     AUTO_APPLY_HARD_VALUE_CEILING, so no apply was attempted at all.
+   */
+  apply_error: string | null;
+  /** true when the bar (not a force tick) is what applied it. */
+  auto_applied: boolean;
+  /** true on a department row — its balance already moved at save. See above. */
+  dept_anchored: boolean;
+  /** true when the immediate-alert thresholds fired for this row. */
+  alert: boolean;
+}
+
+export function recordCountVariance(
+  db: Database.Database, inp: RecordVarianceInput,
+): RecordVarianceResult {
+  const variance = Math.round((Number(inp.physical_stock) - Number(inp.system_stock)) * 1000) / 1000;
+  const deptId = norm(inp.department_id);
+  const isDept = String(inp.source) === 'central' && deptId !== '';
+  const pf = packFactor((inp.pack || {}) as PackMeta);
+  const purchaseQty = Math.round((variance / (pf > 0 ? pf : 1)) * 1000) / 1000;
+
+  const base = {
+    variance,
+    variance_purchase_qty: purchaseQty,
+    dept_anchored: isDept,
+    apply_error: null as string | null,
+    auto_applied: false,
+    alert: false,
+  };
+
+  /* ── THE DEPARTMENT RAIL: NOTHING IS PARKED, BECAUSE NOTHING CAN BE HELD ──
+   * Taken BEFORE the upsert, on purpose. The full argument is in the header
+   * block above; the short version is that the closing_stock row written by the
+   * caller a few lines ago has ALREADY re-anchored this department's balance
+   * (dept-ledger latestCount(), no status test), so a "pending" row here would
+   * be a hold that does not exist — un-approvable by varianceApprovalBlock()
+   * and un-rejectable in any sense that restores the figure.
+   *
+   * A ZERO VARIANCE STILL GOES THROUGH upsertVarianceApproval(). That call is
+   * the DELETE that clears a stale pending row for this exact key when a
+   * corrected re-count now matches — the one way the legacy department rows
+   * leave the queue on their own, and shipped behaviour we are not taking away.
+   * It cannot insert: upsertVarianceApproval returns null without writing when
+   * variance === 0.
+   *
+   * NOTHING ELSE IS DELETED. A non-matching re-count leaves any existing
+   * pending row exactly where it is — stale figures and all. Widening the
+   * delete would have the system quietly clearing the owner's queue behind him
+   * with no audit row, and clearing that queue is his to do (bulk reject, which
+   * records status='rejected' and a reason). Do not "tidy" this.
+   *
+   * `alert` is computed identically to every other rail and is deliberately
+   * unchanged here — the alert thresholds and their wiring are owned elsewhere.
+   * ──────────────────────────────────────────────────────────────────────── */
+  if (isDept) {
+    if (variance === 0) {
+      upsertVarianceApproval(db, inp);   // clear-only; returns null, writes nothing new
+      return { ...base, outcome: 'match', approval_id: null, variance_value: 0 };
+    }
+    const { value: deptValue } = varianceRupees(db, inp.material_id, variance);
+    return {
+      ...base,
+      outcome: 'anchored',
+      approval_id: null,
+      variance_value: deptValue,
+      // apply_error stays NULL. It is the "an apply was attempted and a floor
+      // refused it" channel, and every caller pushes it into a per-line error
+      // list — filling that list with one identical sentence per line on a
+      // 900-row department sheet would bury the real errors. The rail-level
+      // fact belongs in ONE sentence per save, off `dept_anchored`.
+      apply_error: null,
+      alert: isBigVariance(
+        varianceBar(db), variance, deptValue, Number(inp.system_stock) || 0, purchaseQty,
+      ),
+    };
+  }
+
+  // A count that agrees with the book clears any stale pending row and is done.
+  const approvalId = upsertVarianceApproval(db, inp);
+  if (approvalId === null) {
+    return { ...base, outcome: 'match', approval_id: null, variance_value: 0 };
+  }
+
+  const { value: varianceValue, avgPrice } = varianceRupees(db, inp.material_id, variance);
+  const bar = varianceBar(db);
+  const alert = isBigVariance(bar, variance, varianceValue, Number(inp.system_stock) || 0, purchaseQty);
+
+  // ── UNDER THE BAR? Both CONFIGURED axes must agree that it is small. ──────
+  // `priced` is the unvalued-item trap: average_price 0 makes variance_value ₹0,
+  // which is under ANY rupee bar however many kilos moved. An unpriced material
+  // can therefore only pass on the QUANTITY axis.
+  const priced = avgPrice > 0;
+  const anyAxis = bar.value > 0 || bar.qty > 0;
+  const valueOk = bar.value <= 0 || (priced && Math.abs(varianceValue) <= bar.value);
+  const qtyOk = bar.qty <= 0 || Math.abs(purchaseQty) <= bar.qty;
+  // THE HARD RUPEE CEILING, and it is not redundant with `valueOk`. When the
+  // admin configured ONLY the quantity axis, `valueOk` is unconditionally true
+  // and nothing else in this expression has a rupee opinion — that is how a
+  // 100-bottle bar auto-applied ₹1.27 lakh. Nothing may apply ITSELF above this
+  // figure, whatever is configured. See AUTO_APPLY_HARD_VALUE_CEILING.
+  const ceilingOk = Math.abs(varianceValue) <= AUTO_APPLY_HARD_VALUE_CEILING;
+  const underBar = anyAxis && valueOk && qtyOk && ceilingOk;
+
+  const forced = inp.force_apply === true;
+  // THE PER-UPLOAD BREAKER. Read only when the bar would otherwise apply this
+  // line, so an unarmed bar and a forced admin apply both cost nothing. The
+  // aggregate is over rows the BAR applied in this same batch — never over a
+  // human's decisions, and never across uploads. An unstamped batch ('') is a
+  // single-line save (every bulk writer stamps one); it is skipped rather than
+  // aggregated, because '' would otherwise pool every unbatched row ever
+  // written into one budget and trip permanently.
+  const batchKey = norm(inp.batch_id);
+  let breaker: string | null = null;
+  if (!isDept && !forced && underBar && batchKey) {
+    const so = db.prepare(`
+      SELECT COUNT(*) AS n, COALESCE(SUM(ABS(variance_value)), 0) AS v
+        FROM variance_approvals
+       WHERE batch_id = ? AND auto_applied = 1 AND status = 'approved'
+    `).get(batchKey) as { n: number; v: number } | undefined;
+    const rows = Number(so?.n) || 0;
+    const spent = Number(so?.v) || 0;
+    if (rows >= AUTO_APPLY_BATCH_ROWS || spent + Math.abs(varianceValue) > AUTO_APPLY_BATCH_VALUE) {
+      breaker =
+        `this upload has already applied ${rows} differences worth ₹${Math.round(spent * 100) / 100} on its own. ` +
+        `That is past the ${AUTO_APPLY_BATCH_ROWS}-line / ₹${AUTO_APPLY_BATCH_VALUE} limit for ONE upload, so the ` +
+        `rest of it is being held for you instead of applied. Nothing already applied was undone.`;
+    }
+  }
+  // Department rows are excluded from BOTH doors — see the header note.
+  const attempt = !isDept && (forced || (underBar && !breaker));
+
+  if (attempt) {
+    const reviewer = norm(inp.applied_by) || AUTO_REVIEWER;
+    const reason = norm(inp.applied_reason) || autoApplyReason(bar, varianceValue, purchaseQty, inp.unit);
+    try {
+      const res = approveVariance(db, approvalId, reviewer, reason, { auto: !forced });
+      if (res.ok) {
+        return {
+          ...base, outcome: 'applied', approval_id: approvalId,
+          variance_value: varianceValue, auto_applied: !forced, alert,
+        };
+      }
+      return {
+        ...base, outcome: 'held', approval_id: approvalId, variance_value: varianceValue,
+        apply_error: res.error || 'approval refused', alert,
+      };
+    } catch (e) {
+      // approveVariance rolls its own SAVEPOINT back; the saved count row
+      // survives and the approval simply stays pending.
+      return {
+        ...base, outcome: 'held', approval_id: approvalId, variance_value: varianceValue,
+        apply_error: (e as Error)?.message || 'approval failed', alert,
+      };
+    }
+  }
+
+  // Held. When the CEILING is the only thing that held it, say so — otherwise
+  // an admin who set a 100-unit bar sees a ₹200,000 row sitting in the queue
+  // with no explanation and concludes the bar is broken.
+  const ceilingHeld = !isDept && !forced && anyAxis && valueOk && qtyOk && !ceilingOk;
+  return {
+    ...base, outcome: 'held', approval_id: approvalId, variance_value: varianceValue, alert,
+    apply_error: breaker || (ceilingHeld
+      ? `this difference is worth ₹${Math.abs(varianceValue)}, over the ₹${AUTO_APPLY_HARD_VALUE_CEILING} ` +
+        `ceiling on anything that may apply itself. It passed the bar you set, but nothing this large moves ` +
+        `stock without an admin approving it.`
+      : null),
+  };
+}
+
+/** The audit sentence a machine-applied row carries, naming the bar it passed. */
+function autoApplyReason(bar: VarianceBar, varianceValue: number, purchaseQty: number, unit?: string): string {
+  const bits: string[] = [];
+  if (bar.value > 0) bits.push(`₹${Math.abs(varianceValue)} within the ₹${bar.value} value bar`);
+  if (bar.qty > 0) bits.push(`${Math.abs(purchaseQty)} within the ${bar.qty}-unit quantity bar`);
+  return (
+    `Applied automatically at count time: ${bits.join(' and ') || 'under the configured bar'}` +
+    `${unit ? ` (counted in ${unit})` : ''}. No admin reviewed this — it was below the bar an admin set, ` +
+    `and it appears on the variance report like any other difference.`
+  );
 }
 
 /**
@@ -425,6 +1200,19 @@ export interface VarianceRow {
   date: string; system_stock: number; physical_stock: number; variance: number; variance_value: number;
   unit: string; counted_by: string; count_note: string;
   status: string; reviewed_by: string; reviewed_at: string; review_reason: string; created_at: string;
+  /**
+   * ADDITIVE (2026-08). 1 ⇒ the BAR applied this row at count time; no human
+   * decided it. Read it before rendering `reviewed_by` as a person: on these
+   * rows it is AUTO_REVIEWER, and "approved by system:auto-apply" is the literal
+   * truth rather than a name. 0 on every pending row and on every human
+   * decision, including the admin's "Adjust system stock" tick — that one is a
+   * person choosing, so it is NOT auto.
+   */
+  auto_applied?: number;
+  /** ADDITIVE (2026-08). The submit this count arrived in. '' = unbatched. */
+  batch_id?: string;
+  /** ADDITIVE (2026-08). Human label for that submit. */
+  batch_label?: string;
   /** Set only when approval is refused — the reason. See varianceApprovalBlock(). */
   approve_blocked?: string | null;
   /**
@@ -467,6 +1255,54 @@ export interface VarianceListResult {
   outletScope: VarianceOutletScope;
 }
 
+/* ────────────────────────────────────────────────────────────────────────────
+ * THE MONTHLY BATCH — how a queue of 1,472 becomes a once-a-month job.
+ * ──────────────────────────────────────────────────────────────────────────
+ * Closing stock is uploaded WEEKLY and reviewed ONCE A MONTH, so the queue has
+ * to be addressable as "this upload" and "this period", not just "everything
+ * pending". Until now listVarianceApprovals() took status, outlet and limit and
+ * nothing else — there was no way to say "last month's four uploads" and no way
+ * to act on them together, which is why clearing a bad sheet meant 1,472 clicks.
+ *
+ * ONE shared filter shape, used by the list, the count, the batch index and the
+ * bulk reject — so what an admin PREVIEWS and what the bulk call ACTS ON are
+ * described by the same object and cannot select different rows.
+ */
+export interface VarianceQueryOpts {
+  /** 'pending' (default at the call sites) | 'approved' | 'rejected' | 'all'. */
+  status?: string;
+  /** Count date >= this (YYYY-MM-DD). Inclusive. */
+  from?: string | null;
+  /** Count date <= this (YYYY-MM-DD). Inclusive. */
+  to?: string | null;
+  /** Exactly one upload. '' is a REAL value here — it selects unbatched rows. */
+  batchId?: string | null;
+  /** 'central' | 'liquor'. Omit for both rails. */
+  source?: string | null;
+  outletId?: string | null;
+  outletScope?: VarianceOutletScope;
+}
+
+/**
+ * Append the period / upload / rail clauses. `where` and `params` are appended
+ * in lockstep; the caller adds its outlet clause AFTER this and binds the same
+ * array to every statement it runs.
+ *
+ * `batchId` uses `!= null` rather than truthiness on purpose: '' is a real
+ * selector (rows saved before batches existed, or by a path that did not stamp
+ * one), and reading it as "no filter" would make "clear the unbatched rows"
+ * silently mean "clear everything".
+ */
+function applyScopeWhere(opts: VarianceQueryOpts, where: string[], params: unknown[]): void {
+  const from = norm(opts.from);
+  const to = norm(opts.to);
+  if (from) { where.push('va.date >= ?'); params.push(from); }
+  if (to) { where.push('va.date <= ?'); params.push(to); }
+  if (opts.batchId != null) { where.push("COALESCE(va.batch_id,'') = ?"); params.push(norm(opts.batchId)); }
+  const src = norm(opts.source);
+  if (src) { where.push('va.source = ?'); params.push(src); }
+}
+
 /**
  * List approvals (default: pending first, newest first) WITH the honest total.
  *
@@ -488,11 +1324,16 @@ export interface VarianceListResult {
  */
 export function listVarianceApprovals(
   db: Database.Database,
-  opts: { status?: string; outletId?: string | null; limit?: number; outletScope?: VarianceOutletScope } = {},
+  opts: VarianceQueryOpts & { limit?: number } = {},
 ): VarianceListResult {
   const where: string[] = [];
   const params: unknown[] = [];
   if (opts.status && opts.status !== 'all') { where.push('va.status = ?'); params.push(opts.status); }
+  // ── PERIOD + UPLOAD (2026-08). Appended AFTER the status clause and BEFORE
+  // the outlet clause, and pushed onto `params` in the same order they are
+  // appended — both the list and the COUNT bind this one array, so a clause
+  // added out of order silently shifts every later `?`.
+  applyScopeWhere(opts, where, params);
   // Outlet scope. 'all' drops the filter entirely so rows stamped with ANOTHER
   // outlet become reachable — see VarianceOutletScope for why that is needed
   // and why it is opt-in.
@@ -773,8 +1614,11 @@ export function varianceApprovalBlock(
     return (
       `${who}'s balance is already anchored on a closing count, so this count has ALREADY moved the ` +
       `department's stock on its own. Approving would take the difference off a second time. ` +
-      `Reject it — and note the department balance has moved regardless, which is a bug to fix in the ` +
-      `department ledger (a count must not re-base a balance before it is approved).`
+      `REJECTING DOES NOT PUT IT BACK EITHER — the balance moved when the count was saved, and reject ` +
+      `only closes this row. Reject it to clear the queue, then correct the figure with a fresh count. ` +
+      `New department counts are no longer parked here at all (they cannot be held, so claiming a hold ` +
+      `was the lie this row is left over from); the underlying fix is in the department ledger, where a ` +
+      `count must not re-base a balance before it is approved.`
     );
   }
   return null;
@@ -844,6 +1688,16 @@ function deptMovementsAfter(db: Database.Database, deptId: string, matId: string
  */
 export function approveVariance(
   db: Database.Database, id: string, reviewer: string, reason: string,
+  /**
+   * ADDITIVE (2026-08). `auto: true` stamps auto_applied = 1 — this row was
+   * applied by the BAR at count time, not decided by a person. It changes
+   * NOTHING about what is written to stock: same delta, same floors, same
+   * supersede guard, same inventory_transactions row. It only stops the audit
+   * trail claiming a human reviewed it. Default false, so every existing caller
+   * (the queue's approve route, and the admin's "Adjust system stock" tick,
+   * which IS a person choosing) keeps recording a human decision.
+   */
+  opts?: { auto?: boolean },
 ): DecisionResult {
   const row = db.prepare(`SELECT * FROM variance_approvals WHERE id = ?`).get(id) as (VarianceRow & Record<string, unknown>) | undefined;
   if (!row) return { ok: false, error: 'Variance approval not found' };
@@ -876,7 +1730,7 @@ export function approveVariance(
   const apply = db.transaction(() => {
     if (row.source === 'liquor') {
       // Reconcile the store ledger to the physical count as of the count date.
-      postLedger(db, {
+      const ledgerId = postLedger(db, {
         store_id: row.store_id,
         material_id: row.material_id,
         txn_type: 'adjustment',
@@ -886,6 +1740,51 @@ export function approveVariance(
         notes: `Approved variance ${row.date}: system ${row.system_stock} → physical ${row.physical_stock} ${row.unit}`,
         created_by: reviewer,
       });
+      /* ══════════════════════════════════════════════════════════════════════
+       * THE CORRECTION IS STAMPED IN THE PERIOD IT CORRECTS, NOT TODAY.
+       * ══════════════════════════════════════════════════════════════════════
+       * THE LIQUOR RAIL IS THE ONE PATH WHERE `system_stock` IS NOT LIVE. It is
+       * the ledger AS OF THE COUNT DATE — asOfStats() in
+       * src/app/api/stores/[id]/closing/route.ts:39 sums
+       * `WHERE date(created_at) <= date(?)`. postLedger() stamps
+       * `created_at = datetime('now')` (store-engine.ts:365) and takes no date,
+       * so a correction for a BACKDATED count landed OUTSIDE its own as-of
+       * window: the next read of that date, and of every date between it and
+       * today, saw the same stale baseline and raised the same variance again.
+       *
+       * MEASURED — three weekly counts, shelf genuinely 73,500 all month:
+       *   08-02 system 75000 counted 73500 → applied → live 73500
+       *   08-09 system 75000 (stale!)      → applied → live 72000
+       *   08-16 system 75000 (stale!)      → applied → live 70500
+       *   shelf 73500, book 70500 — over-corrected by 3,000, nobody in the loop.
+       * It corrupted the reviewed path too: an auto-applied week-1 row left a
+       * stale baseline frozen into a HELD week-2 row, and supersedeWhere()
+       * cannot catch that (the poisoning row is OLDER, so it does not supersede).
+       *
+       * Re-stamping the row it just wrote closes it at the source, for every
+       * reader rather than for this function only: the next as-of read of any
+       * date on or after the count date now includes the correction, so a
+       * re-count of that week reports `match` instead of the same difference a
+       * second time. It is one UPDATE of one column on the ONE row postLedger
+       * returned — postLedger keeps every validation it has (store active,
+       * material known, signed non-zero quantity); nothing here writes a ledger
+       * row of its own.
+       *
+       * NEVER INTO THE FUTURE: MIN(count-date day-end, now). A count dated today
+       * or (impossibly) later keeps `now`, so the ordinary same-day correction
+       * is stamped exactly as it always was and only backdated counts move.
+       * The central rail is deliberately NOT given this treatment — it has no
+       * as-of read at all (its system figure is live current_stock), so there is
+       * nothing there for a stamp to line up with.
+       * ──────────────────────────────────────────────────────────────────── */
+      const countDate = String(row.date ?? '').trim();
+      if (/^\d{4}-\d{2}-\d{2}$/.test(countDate)) {
+        db.prepare(`
+          UPDATE store_stock_ledger
+             SET created_at = MIN(?, datetime('now'))
+           WHERE id = ?
+        `).run(`${countDate} 23:59:59`, ledgerId);
+      }
     } else if (norm(row.department_id)) {
       // ── DEPARTMENT count → the department's own ledger. CENTRAL IS NOT TOUCHED.
       //
@@ -1031,8 +1930,9 @@ export function approveVariance(
       }
     }
     db.prepare(`
-      UPDATE variance_approvals SET status='approved', reviewed_by=?, reviewed_at=datetime('now'), review_reason=? WHERE id=?
-    `).run(norm(reviewer), norm(reason), id);
+      UPDATE variance_approvals SET status='approved', reviewed_by=?, reviewed_at=datetime('now'),
+             review_reason=?, auto_applied=? WHERE id=?
+    `).run(norm(reviewer), norm(reason), opts?.auto === true ? 1 : 0, id);
   });
 
   try { apply(); } catch (e) { return { ok: false, error: (e as Error).message }; }
@@ -1057,4 +1957,289 @@ export function rejectVariance(
     UPDATE variance_approvals SET status='rejected', reviewed_by=?, reviewed_at=datetime('now'), review_reason=? WHERE id=?
   `).run(norm(reviewer), norm(reason), id);
   return { ok: true, applied: false };
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * 5. BULK REJECT — and why there is deliberately no bulk approve.
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ *      REJECT MEANS DISCARD THE COUNT AND LEAVE STOCK EXACTLY AS IT IS.
+ *
+ * That is not a claim, it is the shape of the code: the function below runs ONE
+ * statement, an UPDATE of variance_approvals.status, and it references no other
+ * table. There is no call to approveVariance, postLedger, postDeptLedger or
+ * raw_materials anywhere in it or below it. Nothing it can do moves a gram.
+ * (rejectVariance() above is deliberately not supersede-gated for the same
+ * reason — rejecting is how a stale count leaves the queue, and it moves
+ * nothing, so there is nothing to double-apply.)
+ *
+ * THE ASYMMETRY IS THE POINT. Approving 793 rows that read "we have zero" would
+ * write 793 empty shelves into the books in one click — the single most
+ * destructive action this module can perform. Rejecting the same 793 changes no
+ * number anywhere; it only stops them nagging. So bulk exists on exactly one
+ * side, and the caller cannot cross over: the HTTP route that fronts this
+ * (src/app/api/variance-approvals/bulk/route.ts) does not import approveVariance
+ * at all, so there is no argument, typo or `action` string that reaches an
+ * approval from there. Keep it that way — the day someone adds "and approve too"
+ * for symmetry is the day this becomes the most dangerous endpoint in the app.
+ *
+ * ONLY PENDING ROWS MOVE. `status = 'pending'` is in the UPDATE's own WHERE, not
+ * merely in the preview that selected the ids, so a row decided between the
+ * preview and the execute is skipped rather than re-decided.
+ */
+export interface BulkRejectResult {
+  ok: boolean;
+  /** How many pending rows were actually rejected. */
+  rejected: number;
+  /** How many of the requested ids were not pending (already decided / gone). */
+  skipped: number;
+  error?: string;
+}
+
+/**
+ * Reject many pending variances in one call. Stock is untouched — see above.
+ *
+ * Exactly one of `ids` or `filter` selects the rows. Both, or neither, is a
+ * refusal rather than a guess: "ids plus a filter" has two obvious meanings
+ * (intersection or union) and picking one silently is how a bulk action rejects
+ * rows nobody looked at.
+ */
+export function rejectVarianceBulk(
+  db: Database.Database,
+  sel: { ids?: string[]; filter?: VarianceQueryOpts },
+  reviewer: string,
+  reason: string,
+): BulkRejectResult {
+  const ids = Array.isArray(sel.ids) ? sel.ids.map(v => norm(v)).filter(Boolean) : null;
+  const hasIds = !!ids && ids.length > 0;
+  const hasFilter = !!sel.filter;
+  if (hasIds === hasFilter) {
+    return { ok: false, rejected: 0, skipped: 0, error: 'Select rows either by id list or by filter — not both, and not neither.' };
+  }
+  const why = norm(reason);
+  if (why.length < 2) {
+    return { ok: false, rejected: 0, skipped: 0, error: 'A reason is required to reject (why are these counts being discarded?).' };
+  }
+
+  const run = db.transaction((): BulkRejectResult => {
+    // ── THE ONLY WRITE IN THIS FUNCTION, on the only table it names. ────────
+    const upd = db.prepare(`
+      UPDATE variance_approvals
+         SET status='rejected', reviewed_by=?, reviewed_at=datetime('now'), review_reason=?
+       WHERE id = ? AND status = 'pending'
+    `);
+    let rejected = 0;
+    let target: string[];
+
+    if (hasIds) {
+      target = ids!;
+    } else {
+      // Resolve the filter to ids FIRST, then reject them one by one through the
+      // same statement. A single `UPDATE ... WHERE <filter>` would be one query
+      // shorter and would also make `rejected` unverifiable and the row set
+      // unreportable — and this is the call that clears a thousand rows.
+      target = pendingIdsForFilter(db, sel.filter!);
+    }
+    for (const id of target) rejected += upd.run(norm(reviewer), why, id).changes;
+    return { ok: true, rejected, skipped: Math.max(0, target.length - rejected) };
+  });
+
+  try { return run(); } catch (e) { return { ok: false, rejected: 0, skipped: 0, error: (e as Error).message }; }
+}
+
+/**
+ * The pending ids a filter selects, in queue order. Shared by the bulk preview
+ * and the bulk execute, so "you are about to reject 793" and "793 were
+ * rejected" are the same query and cannot describe different rows.
+ *
+ * Status is FORCED to pending regardless of what the caller passed: an
+ * approved row cannot be rejected (approveVariance already moved stock), and
+ * letting a filter reach one would silently mark a completed decision as
+ * discarded while the stock stayed moved.
+ */
+export function pendingIdsForFilter(db: Database.Database, filter: VarianceQueryOpts): string[] {
+  const where: string[] = ["va.status = 'pending'"];
+  const params: unknown[] = [];
+  applyScopeWhere(filter, where, params);
+  const scope: VarianceOutletScope = filter.outletScope === 'all' ? 'all' : 'outlet';
+  const oid = scope === 'all' ? '' : norm(filter.outletId);
+  if (oid) { where.push("(va.outlet_id = ? OR va.outlet_id = '')"); params.push(oid); }
+  return (db.prepare(`
+    SELECT va.id AS id
+      FROM variance_approvals va
+      JOIN raw_materials rm ON rm.id = va.material_id
+     WHERE ${where.join(' AND ')}
+     ORDER BY va.date DESC, va.created_at DESC
+  `).all(...params) as { id: string }[]).map(r => r.id);
+}
+
+/** One upload, as the monthly review sees it. */
+export interface CountBatch {
+  batch_id: string;
+  batch_label: string;
+  /** Earliest and latest COUNT date in the batch. */
+  first_date: string;
+  last_date: string;
+  /** When the upload happened. */
+  uploaded_at: string;
+  pending: number;
+  approved: number;
+  rejected: number;
+  /** Sum of |variance_value| over the PENDING rows — what is still undecided. */
+  pending_value: number;
+}
+
+/**
+ * The uploads, newest first — the index the monthly review picks from.
+ *
+ * Unbatched rows (batch_id '') are reported as their own entry rather than
+ * hidden: on the owner's live data every existing row is unbatched, so dropping
+ * them would render an empty batch list over a queue of 1,472 and read as
+ * "nothing to review".
+ */
+export function listCountBatches(
+  db: Database.Database,
+  opts: { outletId?: string | null; outletScope?: VarianceOutletScope; limit?: number } = {},
+): CountBatch[] {
+  const scope: VarianceOutletScope = opts.outletScope === 'all' ? 'all' : 'outlet';
+  const oid = scope === 'all' ? '' : norm(opts.outletId);
+  const params: unknown[] = [];
+  let outletWhere = '';
+  if (oid) { outletWhere = "WHERE (va.outlet_id = ? OR va.outlet_id = '')"; params.push(oid); }
+  const limit = Math.floor(Math.min(Math.max(Number(opts.limit) || 60, 1), 500));
+  return (db.prepare(`
+    SELECT COALESCE(va.batch_id,'')                                        AS batch_id,
+           COALESCE(MAX(NULLIF(va.batch_label,'')),'')                     AS batch_label,
+           MIN(va.date)                                                    AS first_date,
+           MAX(va.date)                                                    AS last_date,
+           MAX(va.created_at)                                              AS uploaded_at,
+           SUM(CASE WHEN va.status='pending'  THEN 1 ELSE 0 END)           AS pending,
+           SUM(CASE WHEN va.status='approved' THEN 1 ELSE 0 END)           AS approved,
+           SUM(CASE WHEN va.status='rejected' THEN 1 ELSE 0 END)           AS rejected,
+           SUM(CASE WHEN va.status='pending' THEN ABS(va.variance_value) ELSE 0 END) AS pending_value
+      FROM variance_approvals va
+      JOIN raw_materials rm ON rm.id = va.material_id
+      ${outletWhere}
+     GROUP BY COALESCE(va.batch_id,'')
+     ORDER BY uploaded_at DESC
+     LIMIT ${limit}
+  `).all(...params) as CountBatch[]).map(b => ({
+    ...b,
+    pending: Number(b.pending) || 0,
+    approved: Number(b.approved) || 0,
+    rejected: Number(b.rejected) || 0,
+    pending_value: Math.round((Number(b.pending_value) || 0) * 100) / 100,
+  }));
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * 6. THE IMMEDIATE ALERT — "this one should not wait for month end".
+ * ═══════════════════════════════════════════════════════════════════════════
+ * AN ALERT, NEVER A SECOND GATE. Whether the stock moved was already decided by
+ * the bar at save time; this only decides whether the admin hears about it
+ * TODAY. Nothing below writes anything.
+ *
+ * The predicate is the SQL twin of isBigVariance() and must stay in step with
+ * it: rupee value OR share of the item's own system stock, whichever fires
+ * first, both tunable, both off (0) by default, and the share axis carrying the
+ * SAME materiality floor (ALERT_MIN_VALUE / ALERT_MIN_QTY). `ABS(va.system_stock)
+ * > 0` guards the denominator — see isBigVariance for why an undefined share
+ * must not count as an infinite one. Both halves live in bigVarianceWhere()
+ * below so the badge and the list cannot drift apart.
+ *
+ * OFF BY DEFAULT IS LOAD-BEARING HERE. This ships onto a live queue of 1,472
+ * pending rows; any non-zero shipped default would badge hundreds of historical
+ * counts on the first boot after deploy, which is how a bell stops being read.
+ * The FLOORS ship armed and the thresholds do not, because a floor can only
+ * ever suppress.
+ *
+ * WHICH ROWS THE ALERT CAN SEE — and the two corrections here:
+ *
+ *   · SUPERSEDED ROWS ARE EXCLUDED. Counts are weekly and approvals monthly, so
+ *     one genuine shortage counted four Fridays running raised FOUR pending
+ *     rows, three of which approveVariance refuses as superseded. The alert
+ *     counted all four, so its number could only climb through the month and
+ *     could not fall except by review — the shape of a badge people learn to
+ *     ignore. Only the newest count per item is actionable, so only it alerts.
+ *
+ *   · AUTO-APPLIED ROWS ARE INCLUDED, for a window. `alert` was computed at
+ *     save time on EVERY outcome, but every surface filtered `status='pending'`
+ *     — and a row the bar applied is `approved`. So the one class of row where
+ *     stock moved with NOBODY in the loop was precisely the class whose alert
+ *     was unreachable. Measured: 10 of 19 auto-applied rows raised an alert
+ *     that no query could return. They are visible for
+ *     ALERT_AUTO_APPLIED_WINDOW_DAYS and then age out — see that constant.
+ *     `auto_applied = 1` only, never a human-approved row: a person already
+ *     looked at those.
+ */
+
+/** The shared row-set + threshold predicate. `SELECT … FROM variance_approvals va JOIN raw_materials rm …`. */
+function bigVarianceWhere(
+  bar: VarianceBar, outletId: string,
+): { sql: string; params: unknown[] } {
+  const params: unknown[] = [`-${ALERT_AUTO_APPLIED_WINDOW_DAYS} days`];
+  // Thresholds: value axis, then share axis + floor.
+  params.push(bar.alertValue, bar.alertValue, bar.alertPct, bar.alertPct, ALERT_MIN_VALUE, ALERT_MIN_QTY);
+  let sql = `
+       (
+         (va.status = 'pending' AND NOT EXISTS (
+            SELECT 1 FROM variance_approvals nv WHERE ${supersedeWhere('va')}
+         ))
+         OR (va.status = 'approved' AND COALESCE(va.auto_applied, 0) = 1
+             AND COALESCE(va.reviewed_at, '') >= datetime('now', ?))
+       )
+       AND (
+             (? > 0 AND ABS(va.variance_value) >= ?)
+          OR (? > 0 AND ABS(va.system_stock) > 0
+              AND (ABS(va.variance) / ABS(va.system_stock)) * 100 >= ?
+              AND (CASE WHEN ABS(va.variance_value) > 0
+                        THEN ABS(va.variance_value) >= ?
+                        ELSE ABS(va.variance) / (${PACK_FACTOR_SQL('rm')}) >= ?
+                   END))
+       )`;
+  if (outletId) { sql += `\n       AND (va.outlet_id = ? OR va.outlet_id = '')`; params.push(outletId); }
+  return { sql, params };
+}
+
+export function bigVarianceCount(
+  db: Database.Database, outletId?: string | null, scope: VarianceOutletScope = 'outlet',
+): number {
+  const bar = varianceBar(db);
+  // Unconfigured ⇒ no alert, and no query either.
+  if (bar.alertValue <= 0 && bar.alertPct <= 0) return 0;
+  const { sql, params } = bigVarianceWhere(bar, scope === 'all' ? '' : norm(outletId));
+  const row = db.prepare(`
+    SELECT COUNT(*) AS n
+      FROM variance_approvals va
+      JOIN raw_materials rm ON rm.id = va.material_id
+     WHERE ${sql}
+  `).get(...params) as { n: number } | undefined;
+  return row?.n || 0;
+}
+
+/**
+ * The big variances themselves, worst rupee first — what the alert links to.
+ * Same predicate as bigVarianceCount() through the same function, so the badge
+ * and the list can never disagree about which rows are "big".
+ */
+export function listBigVariances(
+  db: Database.Database,
+  opts: { outletId?: string | null; outletScope?: VarianceOutletScope; limit?: number } = {},
+): VarianceRow[] {
+  const bar = varianceBar(db);
+  if (bar.alertValue <= 0 && bar.alertPct <= 0) return [];
+  const scope: VarianceOutletScope = opts.outletScope === 'all' ? 'all' : 'outlet';
+  const { sql, params } = bigVarianceWhere(bar, scope === 'all' ? '' : norm(opts.outletId));
+  const limit = Math.floor(Math.min(Math.max(Number(opts.limit) || 100, 1), 500));
+  return db.prepare(`
+    SELECT va.*, rm.name AS material_name, rm.sku AS material_sku,
+           COALESCE(sl.name,'') AS store_name, COALESCE(d.name,'') AS department_name
+      FROM variance_approvals va
+      JOIN raw_materials rm ON rm.id = va.material_id
+ LEFT JOIN store_locations sl ON sl.id = va.store_id
+ LEFT JOIN departments d ON d.id = va.department_id
+     WHERE ${sql}
+     ORDER BY ABS(va.variance_value) DESC, va.date DESC
+     LIMIT ${limit}
+  `).all(...params) as VarianceRow[];
 }

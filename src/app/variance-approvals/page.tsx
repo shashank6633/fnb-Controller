@@ -3,11 +3,32 @@
 /**
  * Variance Approvals (ADMIN only).
  *
- * A closing physical count that disagrees with the system lands here as PENDING
- * — stock is NOT changed. The admin asks the staff who counted, records the
- * reason, and either APPROVES or REJECTS (stock stays; the variance stands as an
- * open loss to investigate). Route is adminOnly in the page catalog and every
- * API is admin-gated server-side.
+ * A closing physical count that disagrees with the system lands here. The admin
+ * asks the staff who counted, records the reason, and either APPROVES or REJECTS
+ * (stock stays; the variance stands as an open loss to investigate). Route is
+ * adminOnly in the page catalog and every API is admin-gated server-side.
+ *
+ * ── WHAT CHANGED, AND WHY THE OLD HEADLINE HAD TO GO ──────────────────────
+ * This page used to say, at the top, "Nothing changes stock until you approve."
+ * That is no longer true and it was never true for every row:
+ *   · THE BAR (2026-08). An admin can set a rupee and/or quantity bar. A
+ *     variance at or under it is APPLIED AT COUNT TIME and arrives here already
+ *     approved, marked `auto_applied`, reviewed by the literal string
+ *     "system:auto-apply" — not a person. Above the bar the stock is HELD: the
+ *     count is recorded and visible, and the figure does not move until an admin
+ *     approves it. Default is 0 = OFF on every axis, so an unconfigured system
+ *     behaves exactly as before (everything is held).
+ *   · DEPARTMENT COUNTS never obeyed that sentence. Saving a department count
+ *     re-anchors that department's own balance immediately (dept-ledger
+ *     latestCount), which is why varianceApprovalBlock refuses to approve them —
+ *     approving would take the difference off twice. Those rows are here to be
+ *     CLEARED, not posted; and clearing them does not put the balance back
+ *     either, because it moved when the count was saved.
+ *     AS OF 2026-08 NO NEW DEPARTMENT ROW ARRIVES HERE. recordCountVariance
+ *     refuses to park one (outcome 'anchored'), precisely because this page
+ *     could only ever lie about it. Every department row still on screen is a
+ *     LEGACY row from before that change — bulk reject is what clears them.
+ * The strip below now says both of those out loud. Do not restore the old line.
  *
  * APPROVE IS A DELTA, NEVER AN ABSOLUTE SET — and this page must not say
  * otherwise. approveVariance() posts the COUNT-TIME difference
@@ -19,8 +40,6 @@
  * lib/variance-approval.ts for why it is the only reading under which stock
  * moves exactly once — and it holds on all three rails (central, liquor ledger,
  * department ledger), because each posts the count-time difference to its own.
- * This page used to promise the counted figure outright ("set stock to counted",
- * "If approved → physical"); it now labels that a projection and caveats it.
  *
  * TWO COUNTS ON ONE ITEM DOUBLE-APPLY — the queue must say so before the click.
  * Each pending row froze its OWN system figure, and the pending-unique index is
@@ -46,18 +65,48 @@
  * caveat stay. A stale projection is what made the owner trust a number that had
  * already been overtaken — do not print one that cannot be computed.
  *
- * GET  /api/variance-approvals?status=pending|approved|rejected|all
- *        → { approvals, pending_count, stacked, … }
- * POST /api/variance-approvals/[id]/approve  { reason }
- * POST /api/variance-approvals/[id]/reject   { reason }
+ * ── A MONTHLY JOB, NOT A DAILY ONE ────────────────────────────────────────
+ * Closing stock is uploaded WEEKLY and reviewed ONCE A MONTH. So the queue is
+ * addressable by PERIOD and by UPLOAD, and clearable in BULK — 1,472 rows is
+ * not 1,472 clicks. Two API surfaces feed that:
+ *   GET  /api/variance-approvals?status=…&outlet=…&limit=…
+ *          → the rows, `total`/`truncated`, `pending_count`, `stacked`
+ *   GET  /api/variance-approvals/bulk?batches=1        → the uploads + ₹ pending
+ *   GET  /api/variance-approvals/bulk?from=&to=&batch_id=&source=&outlet=
+ *          → PREVIEW: how many PENDING rows that exact filter selects
+ *   POST /api/variance-approvals/bulk {action:'reject', reason, ids|filter, expect_count}
+ *
+ * WHY THE LIST IS FILTERED IN THE BROWSER AND THE COUNT IS NOT. The list
+ * endpoint does not yet take from/to/batch_id/source (that pass-through is a
+ * companion change in a file this page does not own), so the rows on screen are
+ * narrowed here. That is fine for READING and would be a lie for DECIDING, so
+ * every number the bulk confirmation quotes comes from the server's own preview
+ * of the identical filter, and the POST carries the `expect_count` it reported.
+ * Where the row list is a truncated slice, the ₹ figures derived from it are
+ * printed with a "≥" and say so. Never quote a client-side count in a dialog
+ * that is about to change 1,472 rows.
+ *
+ * ── APPROVE AND REJECT MUST NOT LOOK ALIKE ────────────────────────────────
+ * Approve WRITES TO STOCK. Reject discards the count and leaves every rail
+ * untouched. They are given different weight, different colour, different icon
+ * and different verbs: Approve is the solid brand-orange primary and says "write
+ * to stock"; Reject is a light neutral outline and says "discard · stock
+ * unchanged". Red is NOT used for Reject — it sits one hue from #af4408 and the
+ * two read as the same button at a glance, which is the exact confusion that
+ * would write 793 false "we have zero" counts into the books.
+ * THERE IS NO BULK APPROVE, here or in the API (the function is not imported
+ * into that route at all). The bulk bar says so, so nobody goes looking.
  */
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api } from '@/lib/api';
 import {
   ScrollText, ShieldCheck, Loader2, RefreshCw, CheckCircle2, XCircle,
   AlertTriangle, Info, Lock, PackageX, PackagePlus, Store, Boxes, Layers,
+  CalendarDays, Filter, Trash2, Bell, SlidersHorizontal, Save, X,
+  ChevronDown, ChevronRight, ListChecks, Zap,
 } from 'lucide-react';
 import { packFactor, toPurchaseQty, type PackMeta } from '@/lib/pack-units';
+import { todayIST } from '@/lib/format-date';
 
 interface Approval {
   id: string; source: 'central' | 'liquor'; material_id: string; material_name: string; material_sku: string;
@@ -87,6 +136,16 @@ interface Approval {
    * confident "projected 0" on every department count.
    */
   live_stock?: number | null;
+  /**
+   * 1 ⇒ the BAR applied this row at count time; NO HUMAN DECIDED IT. Read this
+   * before rendering `reviewed_by` as a person — on these rows it is the literal
+   * string "system:auto-apply". The admin's own "Adjust system stock" tick is
+   * NOT auto (a person chose), so it stays 0.
+   */
+  auto_applied?: number;
+  /** The submit this count arrived in. '' = saved before batches existed. */
+  batch_id?: string;
+  batch_label?: string;
 }
 
 /** One material carrying more than one pending count — GET → `stacked`. */
@@ -97,15 +156,74 @@ interface StackedItem {
   latest_date: string;
 }
 
+/** One upload, as the monthly review picks it — GET /bulk?batches=1. */
+interface CountBatch {
+  batch_id: string;
+  batch_label: string;
+  first_date: string;
+  last_date: string;
+  uploaded_at: string;
+  pending: number;
+  approved: number;
+  rejected: number;
+  /** Sum of |variance_value| over the PENDING rows of this upload. */
+  pending_value: number;
+}
+
+/** The server's preview of a filter — the ONLY count a bulk dialog may quote. */
+interface BulkPreview {
+  matched: number;
+  expect_count: number;
+  filter: { from: string | null; to: string | null; batch_id: string | null; source: string | null; outlet: string };
+  sample: Approval[];
+}
+
+/** GET /api/closing-stock/variance-bar. */
+interface BarPayload {
+  bar: { bar_value: number; bar_qty: number; alert_value: number; alert_pct: number };
+  limits: { bar_value: number; bar_qty: number; alert_value: number; alert_pct: number };
+  auto_apply_enabled: boolean;
+  alerts_enabled: boolean;
+  /**
+   * The FIXED guards, served by the API rather than written here as literals —
+   * isBigRow() below has to apply the identical materiality floor the bell does,
+   * and a copied number is exactly how the pill and the bell start disagreeing
+   * about which rows are big. Optional so an older server (or a failed read)
+   * degrades to "no floor" rather than throwing; see the fallback in isBigRow.
+   */
+  guards?: {
+    alert_min_value: number;
+    alert_min_qty: number;
+    auto_apply_max_value: number;
+    auto_apply_batch_value: number;
+    auto_apply_batch_rows: number;
+  };
+}
+
 /** How many stacked items the banner names before it rolls up the rest. */
 const STACKED_SHOWN = 8;
 /** 3 dp — the rounding approveVariance applies to the delta it posts. */
 const r3 = (n: number) => Math.round((Number(n) || 0) * 1000) / 1000;
 /** Float slack. Below this, live and the frozen system figure are the same number. */
 const EPS = 1e-6;
+/** The literal reviewer the bar writes. Not a person — see `auto_applied`. */
+const AUTO_REVIEWER = 'system:auto-apply';
+/**
+ * Rows asked for in one read — the SAME 500 this page has always requested.
+ * Deliberately not raised to the API's 1,000 ceiling: listVarianceApprovals runs
+ * varianceApprovalBlock() per row, and on department rows that means a deptOnHand
+ * window each, so doubling the read doubles that work on a queue of 1,472. There
+ * is no offset either, so a bigger number is not a page — it only moves where the
+ * cut falls. What reaches the rows past it is the FILTER (narrow to one upload or
+ * one month) and the bulk action, which the server resolves over the whole queue
+ * and not over this slice.
+ */
+const PAGE_LIMIT = 500;
 
 const inr = (v: number) => '₹' + Math.abs(Number(v) || 0).toLocaleString('en-IN', { maximumFractionDigits: 2 });
+const inr0 = (v: number) => '₹' + Math.abs(Number(v) || 0).toLocaleString('en-IN', { maximumFractionDigits: 0 });
 const qty = (v: number) => Number(Number(v || 0).toFixed(3)).toLocaleString('en-IN');
+const num = (v: number) => (Number(v) || 0).toLocaleString('en-IN');
 /**
  * The two pack fields listVarianceApprovals() joins on but `Approval` above has
  * never declared. Optional on purpose: a cached pre-conversion payload can
@@ -128,11 +246,78 @@ function istWhen(iso: string | null): string {
   return d.toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', hour12: true });
 }
 
+/**
+ * Calendar month bounds around an IST date-only string, built from UTC parts.
+ * `new Date('2026-08-01')` read with LOCAL getters lands on 31 Jul for anyone
+ * west of Greenwich, which would quietly shift a monthly review by a day.
+ */
+const pad2 = (n: number) => String(n).padStart(2, '0');
+function monthBounds(iso: string, monthsBack: number): { from: string; to: string } {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(iso || ''));
+  if (!m) return { from: '', to: '' };
+  const start = new Date(Date.UTC(+m[1], +m[2] - 1 - monthsBack, 1));
+  const end = new Date(Date.UTC(+m[1], +m[2] - monthsBack, 0));
+  const f = (d: Date) => `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`;
+  return { from: f(start), to: f(end) };
+}
+const monthLabel = (iso: string) => {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(iso || ''));
+  if (!m) return iso;
+  return new Date(Date.UTC(+m[1], +m[2] - 1, 1))
+    .toLocaleDateString('en-IN', { timeZone: 'UTC', month: 'long', year: 'numeric' });
+};
+
+/**
+ * The client-side twin of isBigVariance() (lib/variance-approval.ts) — rupee
+ * value OR share of the item's own system stock, whichever fires first, both
+ * axes off at 0. `ABS(system_stock) > 0` guards the share axis for the same
+ * reason it does in SQL: |variance| / 0 is UNDEFINED, not infinite, and
+ * treating it as a hit would flag the ordinary first count of every
+ * never-stocked item and bury the ones that matter.
+ *
+ * AND THE MATERIALITY FLOOR, which is the half that keeps this readable. A
+ * counted 0 is exactly 100% of the book by arithmetic, and two thirds of every
+ * real sheet is counted 0 — so an unfloored share axis paints 70-100% of an
+ * upload amber and the pill stops meaning anything. A difference has to be
+ * worth `alert_min_value` before a percentage of it is worth interrupting
+ * someone; for a material with NO price (variance_value ₹0, so rupees cannot
+ * speak at all) the floor is `alert_min_qty` PURCHASE units instead.
+ *
+ * THE FLOOR COMES FROM THE SERVER (`bar.guards`), never from a literal here.
+ * This function and bigVarianceCount() must agree on which rows are big or the
+ * bell and the page describe different queues.
+ *
+ * It only ever DECORATES rows already on screen. The badge and the count beside
+ * it therefore describe the rows the admin can see, and the copy says so — it
+ * is not a claim about the whole queue, which only bigVarianceCount() (server,
+ * and the notifications bell, which now reads it) can make.
+ */
+function isBigRow(bar: BarPayload | null, r: Approval): boolean {
+  if (!bar) return false;
+  const { alert_value: av, alert_pct: ap } = bar.bar;
+  const val = Math.abs(Number(r.variance_value) || 0);
+  if (av > 0 && val >= av) return true;
+  if (ap <= 0) return false;
+  const sys = Math.abs(Number(r.system_stock) || 0);
+  if (sys <= EPS) return false;
+  if ((Math.abs(Number(r.variance) || 0) / sys) * 100 < ap) return false;
+  // Guards absent (old server / failed read) ⇒ no floor, i.e. exactly the
+  // behaviour before the floor existed. Noisier, never wronger.
+  const minValue = Number(bar.guards?.alert_min_value) || 0;
+  const minQty = Number(bar.guards?.alert_min_qty) || 0;
+  if (val > 0) return minValue <= 0 || val >= minValue;
+  const pq = Math.abs(toPurchaseQty(Number(r.variance) || 0, metaOf(r)));
+  return minQty <= 0 || pq >= minQty;
+}
+
 export default function VarianceApprovalsPage() {
   const [tab, setTab] = useState<'pending' | 'approved' | 'rejected'>('pending');
   const [rows, setRows] = useState<Approval[]>([]);
   const [pendingCount, setPendingCount] = useState(0);
-  // Queue-level, NOT derived from `rows`. The list carries a LIMIT (500) while
+  const [pendingElsewhere, setPendingElsewhere] = useState(0);
+  const [total, setTotal] = useState(0);
+  const [truncated, setTruncated] = useState(false);
+  // Queue-level, NOT derived from `rows`. The list carries a LIMIT while
   // stackedPendingCounts() sweeps every pending row, so deriving this client-side
   // would go quiet on exactly the overflow the limit hides — and that overflow is
   // the OLDEST pending counts, i.e. the ones most likely to be superseded.
@@ -143,26 +328,193 @@ export default function VarianceApprovalsPage() {
   const [reasons, setReasons] = useState<Record<string, string>>({});
   const [busy, setBusy] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
-  const flash = (m: string) => { setToast(m); setTimeout(() => setToast(null), 3000); };
+  const flash = (m: string) => { setToast(m); setTimeout(() => setToast(null), 4000); };
+
+  /* ── The monthly review: period + upload + rail ─────────────────────────── */
+  const [from, setFrom] = useState('');
+  const [to, setTo] = useState('');
+  /** null = every upload. '' is a REAL selector: rows saved before batches. */
+  const [batchId, setBatchId] = useState<string | null>(null);
+  const [source, setSource] = useState<'' | 'central' | 'liquor'>('');
+  const [allOutlets, setAllOutlets] = useState(false);
+  const [batches, setBatches] = useState<CountBatch[]>([]);
+  const [preview, setPreview] = useState<BulkPreview | null>(null);
+  const [previewBusy, setPreviewBusy] = useState(false);
+  const [previewErr, setPreviewErr] = useState<string | null>(null);
+
+  /* ── Bulk reject ───────────────────────────────────────────────────────── */
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [bulkMode, setBulkMode] = useState<'ids' | 'filter' | null>(null);
+  const [bulkReason, setBulkReason] = useState('');
+  const [bulkTyped, setBulkTyped] = useState('');
+  const [bulkBusy, setBulkBusy] = useState(false);
+  const [bulkErr, setBulkErr] = useState<string | null>(null);
+
+  /* ── The bar ───────────────────────────────────────────────────────────── */
+  const [bar, setBar] = useState<BarPayload | null>(null);
+  const [barOpen, setBarOpen] = useState(false);
+  const [barDraft, setBarDraft] = useState({ bar_value: '', bar_qty: '', alert_value: '', alert_pct: '' });
+  const [barBusy, setBarBusy] = useState(false);
+  const [barMsg, setBarMsg] = useState<{ tone: 'ok' | 'warn'; text: string } | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true); setLoadError(null);
     try {
-      const r = await fetch(`/api/variance-approvals?status=${tab}`);
+      const r = await fetch(`/api/variance-approvals?status=${tab}&limit=${PAGE_LIMIT}${allOutlets ? '&outlet=all' : ''}`);
       if (r.status === 401 || r.status === 403) { setForbidden(true); setRows([]); setStacked([]); return; }
       const j = await r.json();
       if (!r.ok) throw new Error(j?.error || 'Failed to load');
       setRows(j.approvals || []);
-      setPendingCount(j.pending_count || 0);
+      // With ?outlet=all the badge must be the all-outlets number, not "here" —
+      // adding the two together would double-count, since "all" contains "here".
+      setPendingCount((allOutlets ? j.pending_count_all_outlets : j.pending_count) || 0);
+      setPendingElsewhere(Number(j.pending_count_other_outlets) || 0);
+      setTotal(Number(j.total) || 0);
+      setTruncated(!!j.truncated);
       // Array.isArray, not `|| []`: an older cached/proxied payload that predates
       // this field must clear the banner, not leave the previous tab's warning
       // sitting over a queue it no longer describes.
       setStacked(Array.isArray(j.stacked) ? j.stacked : []);
+      setSelected(new Set());
     } catch (e) { setLoadError((e as Error).message); }
     finally { setLoading(false); }
-  }, [tab]);
+  }, [tab, allOutlets]);
 
   useEffect(() => { load(); }, [load]);
+
+  /** The uploads, for the "which sheet" picker and the authoritative ₹ pending. */
+  const loadBatches = useCallback(async () => {
+    try {
+      const r = await fetch(`/api/variance-approvals/bulk?batches=1${allOutlets ? '&outlet=all' : ''}`);
+      if (!r.ok) return;                       // a batch list is a convenience, never a gate
+      const j = await r.json();
+      setBatches(Array.isArray(j.batches) ? j.batches : []);
+    } catch { /* leave the previous list; the queue itself still loads */ }
+  }, [allOutlets]);
+  useEffect(() => { loadBatches(); }, [loadBatches]);
+
+  const loadBar = useCallback(async () => {
+    try {
+      const r = await fetch('/api/closing-stock/variance-bar');
+      if (!r.ok) return;
+      const j = (await r.json()) as BarPayload;
+      setBar(j);
+      setBarDraft({
+        bar_value: String(j.bar.bar_value || 0),
+        bar_qty: String(j.bar.bar_qty || 0),
+        alert_value: String(j.bar.alert_value || 0),
+        alert_pct: String(j.bar.alert_pct || 0),
+      });
+    } catch { /* the bar panel simply does not render */ }
+  }, []);
+  useEffect(() => { loadBar(); }, [loadBar]);
+
+  const filterActive = !!(from || to || batchId != null || source);
+
+  /**
+   * THE SERVER'S OWN COUNT for the current filter. Only meaningful for PENDING
+   * rows — the bulk endpoint filters `status='pending'` by construction, which
+   * is also the only status bulk reject can touch. Re-run whenever any part of
+   * the filter moves, so the confirmation can never quote a stale number; the
+   * POST additionally carries `expect_count` and 409s if the set changed.
+   */
+  const loadPreview = useCallback(async () => {
+    setPreviewErr(null);
+    setPreviewBusy(true);
+    try {
+      const p = new URLSearchParams();
+      if (from) p.set('from', from);
+      if (to) p.set('to', to);
+      if (batchId != null) p.set('batch_id', batchId);
+      if (source) p.set('source', source);
+      if (allOutlets) p.set('outlet', 'all');
+      const r = await fetch(`/api/variance-approvals/bulk?${p.toString()}`);
+      const j = await r.json();
+      if (!r.ok) throw new Error(j?.error || `HTTP ${r.status}`);
+      setPreview(j as BulkPreview);
+    } catch (e) { setPreview(null); setPreviewErr((e as Error).message); }
+    finally { setPreviewBusy(false); }
+  }, [from, to, batchId, source, allOutlets]);
+  useEffect(() => { loadPreview(); }, [loadPreview]);
+
+  /* ── The rows this filter shows ────────────────────────────────────────────
+   * Narrowed HERE because the list endpoint does not take these filters yet.
+   * Reading only — every figure a bulk dialog quotes comes from `preview`. */
+  const visible = useMemo(() => rows.filter(r => {
+    if (from && r.date < from) return false;
+    if (to && r.date > to) return false;
+    if (batchId != null && (r.batch_id || '') !== batchId) return false;
+    if (source && r.source !== source) return false;
+    return true;
+  }), [rows, from, to, batchId, source]);
+
+  /** ₹ at stake across the rows ON SCREEN. `truncated` ⇒ print it as a floor. */
+  const visibleValue = useMemo(
+    () => visible.reduce((s, r) => s + Math.abs(Number(r.variance_value) || 0), 0),
+    [visible],
+  );
+  /**
+   * ₹ still undecided across the WHOLE queue, summed from the batch index —
+   * authoritative, because listCountBatches groups every row (including the
+   * unbatched ones) rather than the limited slice this page holds.
+   */
+  const queuePendingValue = useMemo(
+    () => batches.reduce((s, b) => s + (Number(b.pending_value) || 0), 0),
+    [batches],
+  );
+  const bigRows = useMemo(() => visible.filter(r => r.status === 'pending' && isBigRow(bar, r)), [visible, bar]);
+
+  const selectableIds = useMemo(
+    () => visible.filter(r => r.status === 'pending').map(r => r.id),
+    [visible],
+  );
+
+  /* A TICK MUST NOT SURVIVE THE FILTER THAT MADE IT VISIBLE. Selecting 40 rows
+     of last month's upload and then switching to this month's would otherwise
+     leave those 40 ticked and off-screen: the dialog would say "40 counts" while
+     the ₹ figure beside it — summed over what IS on screen — described none of
+     them, and the POST would reject rows nobody was looking at. Prune to what
+     the current filter shows, every time it changes. */
+  useEffect(() => {
+    setSelected(prev => {
+      if (prev.size === 0) return prev;
+      const live = new Set(selectableIds);
+      let dropped = false;
+      const next = new Set<string>();
+      for (const id of prev) { if (live.has(id)) next.add(id); else dropped = true; }
+      return dropped ? next : prev;
+    });
+  }, [selectableIds]);
+  const selectedRows = useMemo(
+    () => visible.filter(r => selected.has(r.id)),
+    [visible, selected],
+  );
+  const selectedValue = selectedRows.reduce((s, r) => s + Math.abs(Number(r.variance_value) || 0), 0);
+  const allSelected = selectableIds.length > 0 && selectableIds.every(id => selected.has(id));
+
+  const toggleAll = () => {
+    setSelected(prev => {
+      if (allSelected) {
+        const n = new Set(prev);
+        for (const id of selectableIds) n.delete(id);
+        return n;
+      }
+      const n = new Set(prev);
+      for (const id of selectableIds) n.add(id);
+      return n;
+    });
+  };
+  const toggleOne = (id: string) => setSelected(prev => {
+    const n = new Set(prev);
+    if (n.has(id)) n.delete(id); else n.add(id);
+    return n;
+  });
+
+  const clearFilter = () => { setFrom(''); setTo(''); setBatchId(null); setSource(''); };
+  const setMonth = (monthsBack: number) => {
+    const b = monthBounds(todayIST(), monthsBack);
+    setFrom(b.from); setTo(b.to);
+  };
 
   const decide = async (row: Approval, action: 'approve' | 'reject') => {
     // The server refuses some approvals outright — a department count with no
@@ -185,12 +537,114 @@ export default function VarianceApprovalsPage() {
       // landed on is not knowable here — naming the counted figure again would
       // just repeat the old promise. Say what was applied instead.
       flash(action === 'approve'
-        ? `Approved — ${row.material_name}: counted difference applied to live stock`
-        : `Rejected — ${row.material_name} stock unchanged; logged as an open loss`);
+        ? `Approved — ${row.material_name}: counted difference written to stock`
+        : `Rejected — ${row.material_name}: count discarded, stock unchanged`);
       setReasons(p => { const n = { ...p }; delete n[row.id]; return n; });
       await load();
+      await loadBatches();
+      await loadPreview();
     } catch (e) { flash((e as Error).message); }
     finally { setBusy(null); }
+  };
+
+  /* ── BULK REJECT ───────────────────────────────────────────────────────────
+   * REJECT DISCARDS THE COUNT AND LEAVES STOCK EXACTLY AS IT IS. The endpoint
+   * runs one statement — an UPDATE of variance_approvals.status — and never
+   * imports approveVariance at all, so nothing here can move a gram on any rail.
+   * Two selections, and they are deliberately different shapes:
+   *   'ids'    → the rows ticked on screen. The caller named every one, so the
+   *              API needs no expect_count.
+   *   'filter' → everything the CURRENT filter matches, server-resolved. That is
+   *              the 1,472-row button, so it carries the previewed count back as
+   *              `expect_count` (409 if the queue moved) AND asks the admin to
+   *              type that number before the button arms. */
+  const pendingShown = selectableIds.length;
+  const pendingShownValue = visible
+    .filter(r => r.status === 'pending')
+    .reduce((s, r) => s + Math.abs(Number(r.variance_value) || 0), 0);
+  /**
+   * TRUE WHEN THE ROWS ON SCREEN ARE FEWER THAN THE ROWS THE FILTER SELECTS —
+   * which is the only condition under which a ₹ figure derived from them may be
+   * printed, and then only as a floor ("at least ₹X"). Two independent causes:
+   * the list endpoint's LIMIT, and the server counting rows this page never
+   * received. `preview.matched` is the server's own count for the identical
+   * filter, so comparing against it catches both.
+   */
+  const shownIsPartial = truncated
+    || (tab === 'pending' && !!preview && preview.matched > pendingShown);
+
+  const bulkCount = bulkMode === 'ids' ? selected.size : (preview?.matched ?? 0);
+  const bulkValueKnown = bulkMode === 'ids' ? selectedValue : pendingShownValue;
+  /** The ₹ is summed over fewer rows than the action touches — say "at least". */
+  const bulkValueIsFloor = bulkMode === 'filter' && shownIsPartial;
+
+  const openBulk = (mode: 'ids' | 'filter') => {
+    setBulkMode(mode); setBulkReason(''); setBulkTyped(''); setBulkErr(null);
+  };
+  const closeBulk = () => { if (!bulkBusy) setBulkMode(null); };
+
+  const runBulkReject = async () => {
+    if (!bulkMode) return;
+    const reason = bulkReason.trim();
+    if (reason.length < 2) { setBulkErr('Write why these counts are being discarded — it is recorded on every row.'); return; }
+    if (bulkMode === 'filter') {
+      if (!preview) { setBulkErr('Re-check the filter first.'); return; }
+      if (Number(bulkTyped.replace(/[^\d]/g, '')) !== preview.expect_count) {
+        setBulkErr(`Type ${num(preview.expect_count)} to confirm you mean all of them.`);
+        return;
+      }
+    }
+    setBulkBusy(true); setBulkErr(null);
+    try {
+      const body = bulkMode === 'ids'
+        ? { action: 'reject', reason, ids: Array.from(selected) }
+        // The filter is echoed back by the preview and handed on UNCHANGED, so
+        // "you are about to reject N" and "N were rejected" cannot describe two
+        // different row sets.
+        : { action: 'reject', reason, filter: preview!.filter, expect_count: preview!.expect_count };
+      const res = await api('/api/variance-approvals/bulk', { method: 'POST', body });
+      const j = await res.json();
+      if (!res.ok) throw new Error(j?.error || `HTTP ${res.status}`);
+      setBulkMode(null);
+      setSelected(new Set());
+      flash(
+        `${num(j.rejected || 0)} count${j.rejected === 1 ? '' : 's'} rejected — discarded, stock unchanged`
+        + (j.skipped ? ` · ${num(j.skipped)} already decided and left alone` : ''),
+      );
+      await load();
+      await loadBatches();
+      await loadPreview();
+    } catch (e) { setBulkErr((e as Error).message); }
+    finally { setBulkBusy(false); }
+  };
+
+  /* ── The bar ───────────────────────────────────────────────────────────── */
+  const saveBar = async () => {
+    setBarBusy(true); setBarMsg(null);
+    try {
+      const res = await api('/api/closing-stock/variance-bar', {
+        method: 'PUT',
+        body: {
+          bar_value: barDraft.bar_value.trim(),
+          bar_qty: barDraft.bar_qty.trim(),
+          alert_value: barDraft.alert_value.trim(),
+          alert_pct: barDraft.alert_pct.trim(),
+        },
+      });
+      const j = await res.json();
+      if (!res.ok) throw new Error(j?.error || `HTTP ${res.status}`);
+      setBar(j as BarPayload);
+      // Re-seed from the EFFECTIVE bar the server answers with, so a value it
+      // clamped is shown as clamped rather than echoed back as typed.
+      setBarDraft({
+        bar_value: String(j.bar.bar_value || 0),
+        bar_qty: String(j.bar.bar_qty || 0),
+        alert_value: String(j.bar.alert_value || 0),
+        alert_pct: String(j.bar.alert_pct || 0),
+      });
+      setBarMsg({ tone: 'ok', text: 'Saved. This applies to counts saved from now on — nothing already decided or waiting here has moved.' });
+    } catch (e) { setBarMsg({ tone: 'warn', text: (e as Error).message }); }
+    finally { setBarBusy(false); }
   };
 
   if (forbidden) {
@@ -205,6 +659,8 @@ export default function VarianceApprovalsPage() {
     );
   }
 
+  const fieldCls = 'px-2.5 py-1.5 border border-[#E8D5C4] rounded-lg text-sm bg-white text-[#2D1B0E] focus:outline-none focus:border-[#af4408]';
+
   return (
     <div className="min-h-screen bg-[#FFF8F0] text-[#2D1B0E]">
       <div className="max-w-6xl mx-auto px-4 sm:px-6 py-6 space-y-5">
@@ -215,22 +671,32 @@ export default function VarianceApprovalsPage() {
               <ScrollText className="w-7 h-7" /> Variance Approvals
             </h1>
             <p className="text-[#8B7355] text-sm mt-1">
-              Physical counts that disagree with the system wait here. Nothing changes stock until you approve.
+              Counts are uploaded weekly; this queue is a monthly job. Filter to a period or an upload, then decide.
             </p>
           </div>
-          <button onClick={load} disabled={loading}
-                  className="self-start inline-flex items-center gap-2 px-3 py-2 border border-[#E8D5C4] rounded-lg text-sm text-[#6B5744] hover:bg-white disabled:opacity-50">
-            {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />} Refresh
-          </button>
+          <div className="flex items-center gap-2 self-start">
+            <label className="inline-flex items-center gap-1.5 text-[12px] text-[#6B5744] px-2.5 py-2 border border-[#E8D5C4] rounded-lg bg-white cursor-pointer">
+              <input type="checkbox" className="accent-[#af4408]" checked={allOutlets} onChange={e => setAllOutlets(e.target.checked)} />
+              All outlets
+            </label>
+            <button onClick={() => { load(); loadBatches(); loadPreview(); loadBar(); }} disabled={loading}
+                    className="inline-flex items-center gap-2 px-3 py-2 border border-[#E8D5C4] rounded-lg text-sm text-[#6B5744] hover:bg-white disabled:opacity-50">
+              {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />} Refresh
+            </button>
+          </div>
         </div>
 
-        {/* How it works */}
+        {/* WHAT THE TWO BUTTONS DO — rewritten. The old strip opened with
+            "Nothing changes stock until you approve", which the bar and the
+            department rail both falsify (see the file header). Approve's
+            consequence is named first because it is the one that writes. */}
         <div className="bg-[#FFF1E3] border border-[#E8D5C4] rounded-xl p-3 text-[12px] text-[#6B5744] flex gap-2">
           <ShieldCheck className="w-4 h-4 text-[#af4408] shrink-0 mt-0.5" />
           <span>
-            <b>Approve</b> = the count is correct → the counted difference is applied to live stock (loss written off with your reason).
+            <b>Approve WRITES TO STOCK</b> — the counted difference is applied to live stock and the loss is written off with your reason.
             It lands on the counted number only if nothing has moved since the count.
-            <b className="ml-2">Reject</b> = keep system stock → the shortage stands as an open loss to chase. Staff never see the system number, so the count is blind.
+            <b className="ml-2">Reject DISCARDS the count and changes nothing</b> — no stock on any rail moves, and the shortage stands as an open loss to chase.
+            Staff never see the system number, so the count is blind.
             {/* "per item" ALONE WOULD BE FALSE AND EXPENSIVE. The supersede key
                 is (source, material, store, department) — Curd counted in the
                 kitchen and Curd counted centrally are two rails with two
@@ -239,7 +705,227 @@ export default function VarianceApprovalsPage() {
                 strip must not put the conflation back in prose, or an admin
                 rejects a good count and leaves a real shortage un-booked. */}
             <b className="ml-2">Only the newest count per item, per store or department, can be approved</b> — an older one for the same place would apply the same correction twice, so reject it. The same item counted in two different places is two separate counts, and both can be approved.
+            {bar?.auto_apply_enabled && (
+              <>
+                <b className="ml-2">A bar is set</b> — a difference at or under it was already applied when the count was saved and arrives here marked <i>applied automatically</i>. Everything above the bar is <b>held</b>: recorded, visible, and not in the books until you approve it.
+              </>
+            )}
+            <b className="ml-2">Department counts are here only to be cleared.</b> Saving one already re-anchored that department&apos;s own balance, so approving it would take the difference off twice — the server refuses them. <b>Rejecting does not put the balance back</b> either; it only closes the row. New department counts no longer land here at all — to correct one, count it again.
           </span>
+        </div>
+
+        {/* ── THE MONTH AT A GLANCE ─────────────────────────────────────────
+            A row count alone does not tell an admin whether this is worth an
+            hour: the decision is about money. ₹ pending is summed from the
+            batch index (every row, including the unbatched ones), not from the
+            limited slice this page holds, so it is the whole queue. */}
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+          <div className="bg-white border border-[#E8D5C4] rounded-xl p-3">
+            <div className="text-[10px] uppercase tracking-wide text-[#8B7355]">Waiting for you</div>
+            <div className="text-2xl font-bold text-[#af4408]">{num(pendingCount)}</div>
+            <div className="text-[11px] text-[#8B7355]">count{pendingCount === 1 ? '' : 's'} pending{allOutlets ? ' · all outlets' : ''}</div>
+          </div>
+          <div className="bg-white border border-[#E8D5C4] rounded-xl p-3">
+            <div className="text-[10px] uppercase tracking-wide text-[#8B7355]">Value at stake</div>
+            <div className="text-2xl font-bold text-[#2D1B0E]">{inr0(queuePendingValue)}</div>
+            <div className="text-[11px] text-[#8B7355]">undecided, whole queue</div>
+          </div>
+          <div className="bg-white border border-[#E8D5C4] rounded-xl p-3">
+            <div className="text-[10px] uppercase tracking-wide text-[#8B7355]">Uploads</div>
+            <div className="text-2xl font-bold text-[#2D1B0E]">{num(batches.filter(b => b.pending > 0).length)}</div>
+            <div className="text-[11px] text-[#8B7355]">with something still pending</div>
+          </div>
+          {/* The alert is a THRESHOLD ON ROWS ON SCREEN, and says so. Only the
+              server (bigVarianceCount) can speak for the whole queue. */}
+          <div className={`border rounded-xl p-3 ${bigRows.length > 0 ? 'bg-amber-50 border-amber-300' : 'bg-white border-[#E8D5C4]'}`}>
+            <div className="text-[10px] uppercase tracking-wide text-[#8B7355] flex items-center gap-1">
+              <Bell className="w-3 h-3" /> Do not wait for month end
+            </div>
+            <div className={`text-2xl font-bold ${bigRows.length > 0 ? 'text-amber-800' : 'text-[#B8A590]'}`}>
+              {bar?.alerts_enabled ? num(bigRows.length) : '—'}
+            </div>
+            <div className="text-[11px] text-[#8B7355]">
+              {bar?.alerts_enabled ? 'large differences in the rows below' : 'no alert threshold set'}
+            </div>
+          </div>
+        </div>
+
+        {/* ── THE BAR (admin settings, on the page it governs) ──────────────
+            It lives here rather than on a new /settings route on purpose: the
+            person reading this queue is the person who decides how much of it
+            should have been here at all, and a new route would need an entry in
+            BOTH page-catalog.ts and Sidebar.tsx (catalog-only = gated but
+            invisible — the drift that hid 8 pages once already). This page is
+            already adminOnly in both, and the PUT is admin-only server-side. */}
+        <div className="bg-white border border-[#E8D5C4] rounded-xl overflow-hidden">
+          <button onClick={() => setBarOpen(o => !o)}
+                  className="w-full flex items-center justify-between gap-3 px-4 py-3 text-left hover:bg-[#FFF8F0]">
+            <span className="inline-flex items-center gap-2 font-semibold text-[#2D1B0E] text-sm">
+              <SlidersHorizontal className="w-4 h-4 text-[#af4408]" />
+              How big a difference is worth your attention
+            </span>
+            <span className="flex items-center gap-2 text-[11px] text-[#8B7355]">
+              {bar ? (
+                <>
+                  <span className={`px-1.5 py-0.5 rounded border ${bar.auto_apply_enabled ? 'bg-emerald-50 border-emerald-200 text-emerald-800' : 'bg-[#FFF1E3] border-[#E8D5C4]'}`}>
+                    {bar.auto_apply_enabled ? 'bar on' : 'bar off — everything is held'}
+                  </span>
+                  <span className={`px-1.5 py-0.5 rounded border ${bar.alerts_enabled ? 'bg-amber-50 border-amber-200 text-amber-900' : 'bg-[#FFF1E3] border-[#E8D5C4]'}`}>
+                    {bar.alerts_enabled ? 'alerts on' : 'alerts off'}
+                  </span>
+                </>
+              ) : <span>loading…</span>}
+              {barOpen ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
+            </span>
+          </button>
+
+          {/* AN UNREADABLE BAR IS NOT AN UNSET BAR. If the read failed, the
+              panel must not render four empty boxes that look like "everything
+              is off" — saving those would write a real 0 to all four keys. */}
+          {barOpen && !bar && (
+            <div className="border-t border-[#E8D5C4] p-4 text-[12px] text-[#6B5744] flex items-center justify-between gap-3">
+              <span>The current limits could not be read, so they are not shown — nothing here has changed.</span>
+              <button onClick={loadBar} className="px-2.5 py-1.5 border border-[#E8D5C4] rounded-lg text-[#6B5744] hover:bg-[#FFF1E3]">
+                Try again
+              </button>
+            </div>
+          )}
+
+          {barOpen && bar && (
+            <div className="border-t border-[#E8D5C4] p-4 space-y-4">
+              {/* ── AUTO-APPLY ─────────────────────────────────────────── */}
+              <div>
+                <div className="text-[13px] font-semibold text-[#2D1B0E] flex items-center gap-2">
+                  <Zap className="w-4 h-4 text-[#af4408]" /> Small differences: apply them, don&apos;t ask
+                </div>
+                <p className="text-[12px] text-[#6B5744] mt-1 leading-relaxed">
+                  A difference <b>at or under</b> the bar is applied to stock the moment the count is saved and simply
+                  appears on the reports — nobody is troubled by a ₹12 flour difference. Anything <b>above</b> it is
+                  <b> held</b>: the count is recorded and visible, and the stock figure does not move until you approve
+                  it here. Set a box to <b>0</b> to switch that axis off. With both at 0 nothing is applied
+                  automatically — every difference waits for you, exactly as before.
+                </p>
+                <p className="text-[12px] text-[#6B5744] mt-1 leading-relaxed">
+                  If you fill in <b>both</b> boxes, a difference has to be small on <b>both</b> counts to apply itself.
+                  That pairing is not decoration: a material with no purchase price values every difference at ₹0, so a
+                  rupee bar on its own would wave through any quantity of it.
+                </p>
+                {/* THE TWO GUARDS THAT ARE NOT TUNABLE. The admin has to be told
+                    what will happen anyway, or a held row under a bar they set
+                    reads as the bar being broken — and the qty axis genuinely
+                    had no rupee opinion until the ceiling existed (a 100-unit
+                    bar auto-applied ₹1.27 lakh on one bottle line). Figures come
+                    from the API's `guards`, never from literals here. */}
+                {bar.guards && (
+                  <p className="text-[12px] text-[#6B5744] mt-1 leading-relaxed">
+                    <b>Two limits you cannot raise.</b> Nothing worth more than{' '}
+                    <b>{inr0(bar.guards.auto_apply_max_value)}</b> ever applies itself, whichever box you fill in —
+                    a quantity bar has no rupee opinion of its own, so without this &quot;100 bottles&quot; could mean
+                    lakhs on one line. And one upload may apply at most{' '}
+                    <b>{inr0(bar.guards.auto_apply_batch_value)}</b> or{' '}
+                    <b>{num(bar.guards.auto_apply_batch_rows)} lines</b> on its own; past that the rest of that upload
+                    is held for you. Nothing already applied is undone — the sheet just stops applying itself and waits.
+                  </p>
+                )}
+                <div className="grid sm:grid-cols-2 gap-3 mt-3">
+                  <label className="block">
+                    <span className="text-[11px] font-medium text-[#6B5744]">Rupee bar — ₹ per item</span>
+                    <input type="number" min="0" step="1" value={barDraft.bar_value}
+                           onChange={e => setBarDraft(d => ({ ...d, bar_value: e.target.value }))}
+                           className={`${fieldCls} w-full mt-1 font-mono text-right`} />
+                    <span className="block text-[10px] text-[#8B7355] mt-0.5">
+                      0 = off · most ₹{num(bar.limits.bar_value)} (the ceiling on what may move with no admin in the loop)
+                    </span>
+                  </label>
+                  <label className="block">
+                    <span className="text-[11px] font-medium text-[#6B5744]">Quantity bar — in purchase units</span>
+                    <input type="number" min="0" step="0.01" value={barDraft.bar_qty}
+                           onChange={e => setBarDraft(d => ({ ...d, bar_qty: e.target.value }))}
+                           className={`${fieldCls} w-full mt-1 font-mono text-right`} />
+                    <span className="block text-[10px] text-[#8B7355] mt-0.5">
+                      0 = off · most {num(bar.limits.bar_qty)} · &quot;2&quot; means 2 bottles / 2 kg — the unit you buy in, never ml or g
+                    </span>
+                    <span className="block text-[10px] text-[#8B7355] mt-0.5">
+                      A safe first setting is <b>₹500</b> and <b>2</b>: on your catalogue a typical item costs ₹140 a
+                      unit, so that covers an ordinary one- or two-unit miscount and holds everything else.
+                    </span>
+                  </label>
+                </div>
+              </div>
+
+              {/* ── ALERT ──────────────────────────────────────────────── */}
+              <div className="pt-3 border-t border-[#F0E4D6]">
+                <div className="text-[13px] font-semibold text-[#2D1B0E] flex items-center gap-2">
+                  <Bell className="w-4 h-4 text-[#af4408]" /> Big differences: tell me today
+                </div>
+                <p className="text-[12px] text-[#6B5744] mt-1 leading-relaxed">
+                  A difference this large should not wait for the month-end review. It fires on <b>either</b> a big
+                  rupee value <b>or</b> a big share of that item&apos;s own stock — whichever happens first. This is only
+                  a flag: whether the stock moved was already settled by the bar above, and nothing here changes it.
+                  When it is set, it also rings the <b>bell</b> at the top of the screen.
+                </p>
+                {bar.guards && (
+                  <p className="text-[12px] text-[#6B5744] mt-1 leading-relaxed">
+                    <b>The % box has a floor under it, and it has to.</b> A shelf counted as empty is
+                    <b> exactly 100%</b> of the book every single time, and about two thirds of a real closing sheet is
+                    counted 0 — so a bare percentage would flag most of an upload and you would stop reading it. A
+                    difference must also be worth <b>{inr0(bar.guards.alert_min_value)}</b> before a percentage of it
+                    counts as big; for an item with no purchase price at all, <b>{num(bar.guards.alert_min_qty)}</b>{' '}
+                    purchase units instead. The ₹ box has no floor — a rupee threshold is already a size.
+                  </p>
+                )}
+                <p className="text-[12px] text-[#6B5744] mt-1 leading-relaxed">
+                  Suggested starting point on your own sheets: <b>₹25,000</b> and <b>50%</b>. A typical counted line on
+                  the 1-Aug closing was worth ₹907 and nine in ten were under ₹6,480, so ₹25,000 is a genuinely unusual
+                  loss rather than a weekly one.
+                </p>
+                <div className="grid sm:grid-cols-2 gap-3 mt-3">
+                  <label className="block">
+                    <span className="text-[11px] font-medium text-[#6B5744]">Alert at — ₹ per item</span>
+                    <input type="number" min="0" step="1" value={barDraft.alert_value}
+                           onChange={e => setBarDraft(d => ({ ...d, alert_value: e.target.value }))}
+                           className={`${fieldCls} w-full mt-1 font-mono text-right`} />
+                    <span className="block text-[10px] text-[#8B7355] mt-0.5">0 = off</span>
+                  </label>
+                  <label className="block">
+                    <span className="text-[11px] font-medium text-[#6B5744]">Alert at — % of that item&apos;s stock</span>
+                    <input type="number" min="0" step="1" value={barDraft.alert_pct}
+                           onChange={e => setBarDraft(d => ({ ...d, alert_pct: e.target.value }))}
+                           className={`${fieldCls} w-full mt-1 font-mono text-right`} />
+                    <span className="block text-[10px] text-[#8B7355] mt-0.5">
+                      0 = off · items the book says we hold none of cannot fire on this axis (no share to measure)
+                    </span>
+                  </label>
+                </div>
+              </div>
+
+              {/* THE SENTENCE THE OWNER ASKED FOR, VERBATIM IN SUBSTANCE.
+                  varianceBar() is read once per save, for the count being
+                  saved, and nothing sweeps existing rows — so this is a
+                  statement about the code, not a promise about intent. */}
+              <div className="bg-[#FFF1E3] border border-[#E8D5C4] rounded-lg p-2.5 text-[11px] text-[#6B5744] flex gap-2">
+                <Info className="w-3.5 h-3.5 text-[#af4408] shrink-0 mt-0.5" />
+                <span>
+                  <b>Changing these numbers never moves stock.</b> They are read only when a count is saved, for that
+                  count. Nothing already applied is undone, nothing waiting in this queue is applied, and no past row is
+                  re-decided — raising the bar tomorrow leaves every held count exactly where it is.
+                  Department counts are not affected either way: saving one already re-anchors that department&apos;s balance.
+                </span>
+              </div>
+
+              {barMsg && (
+                <div className={`rounded-lg p-2.5 text-[12px] border ${barMsg.tone === 'ok' ? 'bg-emerald-50 border-emerald-200 text-emerald-800' : 'bg-red-50 border-red-200 text-red-700'}`}>
+                  {barMsg.text}
+                </div>
+              )}
+              <div className="flex justify-end">
+                <button onClick={saveBar} disabled={barBusy}
+                        className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-sm font-semibold bg-[#af4408] hover:bg-[#8a3506] text-white disabled:opacity-50">
+                  {barBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />} Save these limits
+                </button>
+              </div>
+            </div>
+          )}
         </div>
 
         {/* Tabs */}
@@ -255,6 +941,140 @@ export default function VarianceApprovalsPage() {
             </button>
           ))}
         </div>
+
+        {/* ── PERIOD · UPLOAD · RAIL ────────────────────────────────────────
+            The three axes a monthly review actually uses. Everything here
+            narrows the list on screen; the bulk action beside it is resolved by
+            the server against the same filter. */}
+        <div className="bg-white border border-[#E8D5C4] rounded-xl p-3 space-y-3">
+          <div className="flex flex-wrap items-end gap-3">
+            <label className="flex flex-col gap-1">
+              <span className="text-[10px] uppercase tracking-wide text-[#8B7355] flex items-center gap-1">
+                <CalendarDays className="w-3 h-3" /> Count date from
+              </span>
+              <input type="date" value={from} onChange={e => setFrom(e.target.value)} className={fieldCls} />
+            </label>
+            <label className="flex flex-col gap-1">
+              <span className="text-[10px] uppercase tracking-wide text-[#8B7355]">to</span>
+              <input type="date" value={to} onChange={e => setTo(e.target.value)} className={fieldCls} />
+            </label>
+            <div className="flex gap-1.5">
+              <button onClick={() => setMonth(1)} className="px-2.5 py-1.5 text-[12px] border border-[#E8D5C4] rounded-lg text-[#6B5744] hover:bg-[#FFF1E3]">
+                {monthLabel(monthBounds(todayIST(), 1).from)}
+              </button>
+              <button onClick={() => setMonth(0)} className="px-2.5 py-1.5 text-[12px] border border-[#E8D5C4] rounded-lg text-[#6B5744] hover:bg-[#FFF1E3]">
+                This month
+              </button>
+            </div>
+            <label className="flex flex-col gap-1 min-w-[16rem] flex-1">
+              <span className="text-[10px] uppercase tracking-wide text-[#8B7355]">Upload</span>
+              <select
+                value={batchId == null ? '__any__' : batchId}
+                onChange={e => setBatchId(e.target.value === '__any__' ? null : e.target.value)}
+                className={fieldCls}>
+                <option value="__any__">Every upload</option>
+                {batches.map(b => (
+                  <option key={b.batch_id || '__unbatched__'} value={b.batch_id}>
+                    {(b.batch_label || (b.batch_id ? 'Upload' : 'Saved before uploads were tracked'))}
+                    {' · '}{b.first_date === b.last_date ? b.first_date : `${b.first_date} → ${b.last_date}`}
+                    {' · '}{b.pending} pending
+                    {b.pending > 0 ? ` · ${inr0(b.pending_value)}` : ''}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="flex flex-col gap-1">
+              <span className="text-[10px] uppercase tracking-wide text-[#8B7355]">Rail</span>
+              <select value={source} onChange={e => setSource(e.target.value as '' | 'central' | 'liquor')} className={fieldCls}>
+                <option value="">Central + liquor</option>
+                <option value="central">Central store / departments</option>
+                <option value="liquor">Liquor stores</option>
+              </select>
+            </label>
+            {filterActive && (
+              <button onClick={clearFilter} className="inline-flex items-center gap-1 px-2.5 py-1.5 text-[12px] border border-[#E8D5C4] rounded-lg text-[#6B5744] hover:bg-[#FFF1E3]">
+                <X className="w-3.5 h-3.5" /> Clear filter
+              </button>
+            )}
+          </div>
+
+          {/* What this filter selects, in rows AND rupees. The row count on the
+              left is the SERVER's (pending only); the ₹ is summed from the rows
+              on screen and is printed as a floor when they are a slice. */}
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[12px] text-[#6B5744] border-t border-[#F0E4D6] pt-2.5">
+            <span className="inline-flex items-center gap-1.5 font-medium">
+              <Filter className="w-3.5 h-3.5 text-[#af4408]" />
+              {filterActive ? 'This selection' : 'Whole queue'}
+            </span>
+            {/* THREE DIFFERENT NUMBERS, NEVER BLURRED INTO ONE:
+                `visible.length` is what is on screen after the client-side
+                filter, `rows.length` is what the server actually sent, `total`
+                is what exists. Printing "N of total" while a filter is active
+                would silently compare a filtered slice against an unfiltered
+                whole and read as data loss. */}
+            <span>
+              Showing <b>{num(visible.length)}</b> {tab} row{visible.length === 1 ? '' : 's'}
+              {truncated && <> · read {num(rows.length)} of {num(total)}</>}
+            </span>
+            {tab === 'pending' && (
+              previewBusy
+                ? <span className="inline-flex items-center gap-1 text-[#8B7355]"><Loader2 className="w-3 h-3 animate-spin" /> counting…</span>
+                : preview
+                  ? <span><b>{num(preview.matched)}</b> pending on the server for this filter</span>
+                  : previewErr
+                    ? <span className="text-red-700">Could not count this selection: {previewErr}</span>
+                    : null
+            )}
+            <span>
+              {shownIsPartial ? 'at least ' : ''}<b>{inr(visibleValue)}</b> at stake in the rows shown
+            </span>
+          </div>
+
+          {/* ── BULK BAR. One verb only. ──────────────────────────────────── */}
+          {tab === 'pending' && (
+            <div className="flex flex-wrap items-center gap-2 border-t border-[#F0E4D6] pt-2.5">
+              <button onClick={toggleAll} disabled={selectableIds.length === 0}
+                      className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-[12px] border border-[#E8D5C4] rounded-lg text-[#6B5744] hover:bg-[#FFF1E3] disabled:opacity-40">
+                <ListChecks className="w-3.5 h-3.5" />
+                {allSelected ? 'Clear selection' : `Select the ${num(selectableIds.length)} shown`}
+              </button>
+              {selected.size > 0 && (
+                <span className="text-[12px] text-[#6B5744]">
+                  <b>{num(selected.size)}</b> selected · {inr(selectedValue)}
+                </span>
+              )}
+              <div className="flex-1" />
+              <button onClick={() => openBulk('ids')} disabled={selected.size === 0}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12px] font-medium border border-[#D4B896] text-[#6B5744] bg-white hover:bg-[#FFF1E3] disabled:opacity-40">
+                <Trash2 className="w-3.5 h-3.5" /> Reject selected
+              </button>
+              <button onClick={() => openBulk('filter')} disabled={!preview || preview.matched === 0}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12px] font-semibold bg-[#6B5744] hover:bg-[#54432f] text-white disabled:opacity-40">
+                <Trash2 className="w-3.5 h-3.5" />
+                Reject all {preview ? num(preview.matched) : '—'} {filterActive ? 'in this selection' : 'pending'}
+              </button>
+            </div>
+          )}
+
+          {tab === 'pending' && (
+            <p className="text-[11px] text-[#8B7355] leading-relaxed">
+              Rejecting discards the counts and <b>changes no stock on any rail</b> — the rows move to the Rejected tab
+              and stay readable. <b>There is no bulk approve, and there will not be one</b>: approving writes to stock,
+              and doing that to a whole sheet at once could book &quot;we have zero&quot; against hundreds of items in one
+              click. Approve one count at a time, below.
+            </p>
+          )}
+        </div>
+
+        {pendingElsewhere > 0 && !allOutlets && (
+          <div className="bg-[#FFF1E3] border border-[#E8D5C4] rounded-lg p-2.5 text-[12px] text-[#6B5744] flex gap-2">
+            <Info className="w-4 h-4 text-[#af4408] shrink-0 mt-0.5" />
+            <span>
+              {num(pendingElsewhere)} pending count{pendingElsewhere === 1 ? '' : 's'} {pendingElsewhere === 1 ? 'is' : 'are'} stamped
+              with another outlet and are not in this list. Tick <b>All outlets</b> above to include them.
+            </span>
+          </div>
+        )}
 
         {loadError && (
           <div className="bg-red-50 border border-red-200 rounded-lg p-3 text-sm text-red-700 flex items-center gap-2">
@@ -273,8 +1093,9 @@ export default function VarianceApprovalsPage() {
             `stacked` is empty on the approved/rejected tabs (nothing is pending
             there to stack), so no tab check is needed — but it is hidden while
             loading, because the array in state still describes the previous
-            read. It is also queue-wide while the list below carries a LIMIT, so
-            the copy never promises that every named item is visible in it. */}
+            read. It is also queue-wide while the list below carries a LIMIT and
+            a client-side filter, so the copy never promises that every named
+            item is visible in it. */}
         {!loading && stacked.length > 0 && (
           <div className="bg-amber-50 border border-amber-200 rounded-xl p-3.5 text-[12px] text-amber-900">
             <div className="flex gap-2">
@@ -313,17 +1134,35 @@ export default function VarianceApprovalsPage() {
           <div className="flex items-center gap-2 text-[#8B7355] text-sm py-10 justify-center">
             <Loader2 className="w-5 h-5 animate-spin" /> Loading…
           </div>
-        ) : rows.length === 0 ? (
+        ) : visible.length === 0 ? (
           <div className="bg-white border border-[#E8D5C4] rounded-xl p-10 text-center text-[#8B7355]">
             <CheckCircle2 className="w-10 h-10 text-emerald-500 mx-auto mb-3" />
-            <p className="font-medium text-[#2D1B0E]">Nothing {tab}.</p>
-            {tab === 'pending' && <p className="text-sm mt-1">All counts reconcile with the system — no variances to review.</p>}
+            <p className="font-medium text-[#2D1B0E]">
+              {filterActive ? `Nothing ${tab} in this selection.` : `Nothing ${tab}.`}
+            </p>
+            {/* AN EMPTY LIST IS NOT A CLEAN BILL OF HEALTH when the read was cut
+                short: the filter narrows the slice this page received, it does
+                not fetch further back. The server's own count for the identical
+                filter is the honest answer, and the bulk action below still
+                reaches every one of those rows. */}
+            {filterActive && tab === 'pending' && preview && preview.matched > 0 ? (
+              <p className="text-sm mt-1">
+                The server counts <b>{num(preview.matched)}</b> pending {preview.matched === 1 ? 'count' : 'counts'} for
+                this selection, but they fall outside the newest {num(PAGE_LIMIT)} rows this page could read, so none
+                are listed. <b>Reject all {num(preview.matched)}</b> above still covers every one of them.
+              </p>
+            ) : filterActive ? (
+              <p className="text-sm mt-1">Widen the period or pick another upload.</p>
+            ) : null}
+            {!filterActive && tab === 'pending' && <p className="text-sm mt-1">Every count reconciles with the system — no variances to review.</p>}
           </div>
         ) : (
           <div className="space-y-3">
-            {rows.map(row => {
+            {visible.map(row => {
               const shortage = row.variance < 0;
               const decided = row.status !== 'pending';
+              const auto = Number(row.auto_applied) === 1;
+              const big = row.status === 'pending' && isBigRow(bar, row);
               const meta = metaOf(row);
               const pu = puOf(row);
               /** Recipe qty → the purchase-unit string this page prints. */
@@ -358,28 +1197,51 @@ export default function VarianceApprovalsPage() {
               const useLive = !decided && projected !== null;
               const moved = live !== null && Math.abs(live - row.system_stock) > EPS;
               return (
-                <div key={row.id} className="bg-white border border-[#E8D5C4] rounded-xl p-4 shadow-sm">
+                <div key={row.id} className={`bg-white border rounded-xl p-4 shadow-sm ${big ? 'border-amber-300 ring-1 ring-amber-200' : 'border-[#E8D5C4]'}`}>
                   <div className="flex flex-wrap items-start justify-between gap-3">
-                    <div className="min-w-0">
-                      <div className="flex items-center gap-2 flex-wrap">
-                        <span className="font-semibold text-[#2D1B0E]">{row.material_name}</span>
-                        {row.material_sku && <span className="text-[11px] text-[#B0987F]">#{row.material_sku}</span>}
-                        <span className="inline-flex items-center gap-1 text-[11px] px-1.5 py-0.5 rounded border bg-[#FFF8F0] border-[#E8D5C4] text-[#6B5744]">
-                          {row.source === 'liquor' ? <Store className="w-3 h-3" /> : <Boxes className="w-3 h-3" />}
-                          {row.source === 'liquor' ? (row.store_name || 'Store') : (row.department_name || 'Store / Overall')}
-                        </span>
-                        {/* Scannable mark of the refusal. 963 pending rows are
-                            read by scrolling, not by opening each card, so the
-                            verdict has to be visible in the row header too. */}
-                        {supDate && (
-                          <span className="inline-flex items-center gap-1 text-[11px] font-medium px-1.5 py-0.5 rounded border bg-amber-50 border-amber-200 text-amber-900">
-                            <Layers className="w-3 h-3" /> Superseded
+                    <div className="min-w-0 flex gap-2.5">
+                      {/* Selection is PENDING-only, because reject is the only
+                          bulk verb and it only moves pending rows. */}
+                      {!decided && (
+                        <input type="checkbox" className="accent-[#af4408] mt-1 w-4 h-4 shrink-0"
+                               checked={selected.has(row.id)} onChange={() => toggleOne(row.id)}
+                               aria-label={`Select ${row.material_name}`} />
+                      )}
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <span className="font-semibold text-[#2D1B0E]">{row.material_name}</span>
+                          {row.material_sku && <span className="text-[11px] text-[#B0987F]">#{row.material_sku}</span>}
+                          <span className="inline-flex items-center gap-1 text-[11px] px-1.5 py-0.5 rounded border bg-[#FFF8F0] border-[#E8D5C4] text-[#6B5744]">
+                            {row.source === 'liquor' ? <Store className="w-3 h-3" /> : <Boxes className="w-3 h-3" />}
+                            {row.source === 'liquor' ? (row.store_name || 'Store') : (row.department_name || 'Store / Overall')}
                           </span>
-                        )}
-                      </div>
-                      <div className="text-[12px] text-[#8B7355] mt-0.5">
-                        Count date {row.date} · counted by {row.counted_by || '—'}
-                        {row.count_note && <> · note: <span className="italic">{row.count_note}</span></>}
+                          {/* Scannable mark of the refusal. 963 pending rows are
+                              read by scrolling, not by opening each card, so the
+                              verdict has to be visible in the row header too. */}
+                          {supDate && (
+                            <span className="inline-flex items-center gap-1 text-[11px] font-medium px-1.5 py-0.5 rounded border bg-amber-50 border-amber-200 text-amber-900">
+                              <Layers className="w-3 h-3" /> Superseded
+                            </span>
+                          )}
+                          {big && (
+                            <span className="inline-flex items-center gap-1 text-[11px] font-medium px-1.5 py-0.5 rounded border bg-amber-100 border-amber-300 text-amber-900">
+                              <Bell className="w-3 h-3" /> Large — look now
+                            </span>
+                          )}
+                          {/* AUTO-APPLIED. `reviewed_by` on these rows is the
+                              literal string "system:auto-apply", so the pill has
+                              to be read before the by-line below is believed. */}
+                          {auto && (
+                            <span className="inline-flex items-center gap-1 text-[11px] font-medium px-1.5 py-0.5 rounded border bg-emerald-50 border-emerald-200 text-emerald-800">
+                              <Zap className="w-3 h-3" /> Applied automatically
+                            </span>
+                          )}
+                        </div>
+                        <div className="text-[12px] text-[#8B7355] mt-0.5">
+                          Count date {row.date} · counted by {row.counted_by || '—'}
+                          {row.batch_label && <> · {row.batch_label}</>}
+                          {row.count_note && <> · note: <span className="italic">{row.count_note}</span></>}
+                        </div>
                       </div>
                     </div>
                     <div className={`text-right shrink-0 ${shortage ? 'text-red-700' : 'text-emerald-700'}`}>
@@ -387,7 +1249,7 @@ export default function VarianceApprovalsPage() {
                         {shortage ? <PackageX className="w-4 h-4" /> : <PackagePlus className="w-4 h-4" />}
                         {shortage ? 'Shortage' : 'Surplus'} {inr(row.variance_value)}
                       </div>
-                      <div className="text-[12px]">{row.variance > 0 ? '+' : '−'}{qty(toPurchaseQty(Math.abs(row.variance), { unit: row.unit, purchase_unit: (row as any).material_purchase_unit, pack_size: (row as any).material_pack_size }))} {(row as any).material_purchase_unit || row.unit}</div>
+                      <div className="text-[12px]">{row.variance > 0 ? '+' : '−'}{qty(toPurchaseQty(Math.abs(row.variance), meta))} {pu}</div>
                     </div>
                   </div>
 
@@ -395,11 +1257,18 @@ export default function VarianceApprovalsPage() {
                   <div className="grid grid-cols-3 gap-2 mt-3 text-center">
                     <div className="bg-[#FFF8F0] border border-[#E8D5C4] rounded-lg py-2">
                       <div className="text-[10px] uppercase tracking-wide text-[#8B7355]">System</div>
-                      <div className="font-semibold" title={packFactor({ unit: row.unit, purchase_unit: (row as any).material_purchase_unit, pack_size: (row as any).material_pack_size }) > 1 ? `= ${qty(row.system_stock)} ${row.unit}` : undefined}>{qty(toPurchaseQty(row.system_stock, { unit: row.unit, purchase_unit: (row as any).material_purchase_unit, pack_size: (row as any).material_pack_size }))} <span className="text-[11px] font-normal text-[#8B7355]">{(row as any).material_purchase_unit || row.unit}</span></div>
+                      <div className="font-semibold" title={packFactor(meta) > 1 ? `= ${qty(row.system_stock)} ${row.unit}` : undefined}>{qty(toPurchaseQty(row.system_stock, meta))} <span className="text-[11px] font-normal text-[#8B7355]">{pu}</span></div>
                     </div>
                     <div className="bg-[#FFF8F0] border border-[#E8D5C4] rounded-lg py-2">
                       <div className="text-[10px] uppercase tracking-wide text-[#8B7355]">Counted</div>
-                      <div className="font-semibold">{qty(toPurchaseQty(row.physical_stock, { unit: row.unit, purchase_unit: (row as any).material_purchase_unit, pack_size: (row as any).material_pack_size }))} <span className="text-[11px] font-normal text-[#8B7355]">{(row as any).material_purchase_unit || row.unit}</span></div>
+                      <div className="font-semibold">{qty(toPurchaseQty(row.physical_stock, meta))} <span className="text-[11px] font-normal text-[#8B7355]">{pu}</span></div>
+                      {/* BLANK vs ZERO, on the review side too. A stored row is
+                          by definition a count; a 0 in it means the shelf was
+                          counted and found empty, never "nobody looked". Say so
+                          — this queue is where a mass-zeroed sheet is judged. */}
+                      {row.physical_stock === 0 && (
+                        <div className="text-[9px] text-[#B8A590] leading-tight">counted, found empty</div>
+                      )}
                     </div>
                     <div className={`rounded-lg py-2 border ${shortage ? 'bg-red-50 border-red-200' : 'bg-emerald-50 border-emerald-200'}`}>
                       {/* PROJECTION, NOT A PROMISE. This tile read "If approved
@@ -424,7 +1293,19 @@ export default function VarianceApprovalsPage() {
                           right and the framing was a lie, which is the exact
                           defect this whole change exists to remove. Say the
                           state instead; the amber block below explains it. */}
-                      {row.approve_blocked ? (
+                      {decided ? (
+                        <>
+                          <div className="text-[10px] uppercase tracking-wide text-[#8B7355]">
+                            {row.status === 'approved' ? 'Written to stock' : 'Discarded'}
+                          </div>
+                          <div className="font-semibold text-[#8B7355]">
+                            {row.status === 'approved' ? `${delta > 0 ? '+' : '−'}${pq(Math.abs(delta))}` : '—'}
+                          </div>
+                          <div className="text-[9px] text-[#B8A590] leading-tight">
+                            {row.status === 'approved' ? 'counted difference applied' : 'stock never moved'}
+                          </div>
+                        </>
+                      ) : row.approve_blocked ? (
                         <>
                           <div className="text-[10px] uppercase tracking-wide text-[#8B7355]">Not approvable</div>
                           <div className="font-semibold text-[#8B7355]">—</div>
@@ -496,11 +1377,18 @@ export default function VarianceApprovalsPage() {
 
                   {decided ? (
                     <div className="mt-3 text-[12px] border-t border-[#F0E4D6] pt-2 flex flex-wrap items-center gap-x-3 gap-y-1">
-                      <span className={`inline-flex items-center gap-1 font-medium ${row.status === 'approved' ? 'text-emerald-700' : 'text-red-700'}`}>
+                      <span className={`inline-flex items-center gap-1 font-medium ${row.status === 'approved' ? 'text-emerald-700' : 'text-[#6B5744]'}`}>
                         {row.status === 'approved' ? <CheckCircle2 className="w-3.5 h-3.5" /> : <XCircle className="w-3.5 h-3.5" />}
-                        {row.status === 'approved' ? 'Approved' : 'Rejected'}
+                        {row.status === 'approved' ? 'Approved · written to stock' : 'Rejected · stock unchanged'}
                       </span>
-                      <span className="text-[#8B7355]">by {row.reviewed_by || '—'} · {istWhen(row.reviewed_at)}</span>
+                      {/* NOT A NAME ON AN AUTO ROW. reviewed_by is literally
+                          "system:auto-apply" there; printing "by system:auto-apply"
+                          reads as a user account that does not exist. */}
+                      <span className="text-[#8B7355]">
+                        {auto || row.reviewed_by === AUTO_REVIEWER
+                          ? <>applied by the bar, no one reviewed it · {istWhen(row.reviewed_at)}</>
+                          : <>by {row.reviewed_by || '—'} · {istWhen(row.reviewed_at)}</>}
+                      </span>
                       {row.review_reason && <span className="text-[#6B5744]">Reason: <span className="italic">{row.review_reason}</span></span>}
                     </div>
                   ) : (
@@ -549,19 +1437,23 @@ export default function VarianceApprovalsPage() {
                         placeholder="Reason (ask the staff who counted — e.g. spillage, breakage, miscount, theft…)"
                         className="w-full px-3 py-2 border border-[#E8D5C4] rounded-lg text-sm bg-[#FFF8F0] focus:outline-none focus:border-[#af4408]"
                       />
+                      {/* TWO BUTTONS THAT MUST NOT LOOK ALIKE.
+                          Approve WRITES TO STOCK: solid brand orange, semibold,
+                          and its label says so. Reject changes nothing: a light
+                          neutral outline. Red is deliberately NOT used on Reject
+                          — it sits one hue from #af4408, so the pair read as the
+                          same button in a hurry, and the harmless action wearing
+                          the danger colour taught the wrong instinct besides.
+                          DOM order is unchanged from the version before this, so
+                          the buttons never swap under a hand already moving. */}
                       <div className="flex flex-wrap gap-2 justify-end">
-                        {/* REJECT IS NEVER GATED and, on a superseded row, it is
-                            the action — so there it takes the solid treatment
-                            the (disabled) Approve can no longer carry. Only
-                            there: a department-blocked row keeps the outline it
-                            has always had. DOM order is unchanged either way, so
-                            the buttons never swap under a hand already moving. */}
                         <button onClick={() => decide(row, 'reject')} disabled={busy === row.id}
-                                className={`inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-sm border disabled:opacity-50 ${
+                                className={`inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-sm border bg-white disabled:opacity-50 ${
                                   supDate
-                                    ? 'font-semibold bg-red-600 border-red-600 text-white hover:bg-red-700'
-                                    : 'font-medium border-red-300 text-red-700 hover:bg-red-50'}`}>
-                          {busy === row.id ? <Loader2 className="w-4 h-4 animate-spin" /> : <XCircle className="w-4 h-4" />} Reject (keep stock)
+                                    ? 'font-semibold border-[#6B5744] text-[#4A3B2C] hover:bg-[#F5EDE2]'
+                                    : 'font-medium border-[#D4B896] text-[#6B5744] hover:bg-[#FFF1E3]'}`}>
+                          {busy === row.id ? <Loader2 className="w-4 h-4 animate-spin" /> : <XCircle className="w-4 h-4" />}
+                          Reject — discard, stock unchanged
                         </button>
                         <button onClick={() => decide(row, 'approve')} disabled={busy === row.id || !!row.approve_blocked}
                                 title={row.approve_blocked || undefined}
@@ -578,7 +1470,7 @@ export default function VarianceApprovalsPage() {
                             ? 'Approve blocked (superseded count)'
                             : row.approve_blocked
                               ? 'Approve blocked (department count)'
-                              : 'Approve → apply counted difference'}
+                              : 'Approve → write to stock'}
                         </button>
                       </div>
                     </div>
@@ -586,12 +1478,133 @@ export default function VarianceApprovalsPage() {
                 </div>
               );
             })}
+            {truncated && (
+              <div className="bg-[#FFF1E3] border border-[#E8D5C4] rounded-lg p-3 text-[12px] text-[#6B5744] flex gap-2">
+                <Info className="w-4 h-4 text-[#af4408] shrink-0 mt-0.5" />
+                {/* THE PERIOD/UPLOAD FILTER NARROWS THIS SLICE, IT DOES NOT
+                    RE-QUERY (the list endpoint does not take those filters yet),
+                    so a filter cannot reach a row the read limit already cut.
+                    Say that plainly — a "Nothing in this selection" over a
+                    truncated read would otherwise read as "nothing exists". */}
+                <span>
+                  The server read the newest {num(rows.length)} of {num(total)} {tab} rows; the rest are older counts
+                  past the read limit.
+                  {filterActive
+                    ? ' The period and upload filters narrow what was read — they do not fetch further back, so older rows matching them are not on this page.'
+                    : ' Narrow the period or pick one upload to work through them in groups.'}
+                  {' '}The bulk action above is resolved by the server and <b>does</b> cover every row it matches,
+                  read or not.
+                </span>
+              </div>
+            )}
           </div>
         )}
       </div>
 
+      {/* ══ BULK REJECT CONFIRMATION ═══════════════════════════════════════
+          It has to state, in plain words, what happens and what does not — the
+          whole risk here is an admin believing this is the other button. */}
+      {bulkMode && (
+        <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4" onClick={closeBulk}>
+          <div className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-lg shadow-xl" onClick={e => e.stopPropagation()}>
+            <div className="px-5 py-4 border-b border-[#E8D5C4] flex items-center justify-between">
+              <h2 className="font-bold text-[#2D1B0E] flex items-center gap-2">
+                <Trash2 className="w-5 h-5 text-[#6B5744]" /> Reject {num(bulkCount)} count{bulkCount === 1 ? '' : 's'}
+              </h2>
+              <button onClick={closeBulk} disabled={bulkBusy} className="text-[#8B7355] hover:text-[#2D1B0E] disabled:opacity-50">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="p-5 space-y-3 text-sm text-[#2D1B0E]">
+              <div className="bg-[#FFF1E3] border border-[#E8D5C4] rounded-lg p-3 space-y-1.5 text-[13px] leading-relaxed">
+                <p>
+                  <b>{num(bulkCount)} count{bulkCount === 1 ? '' : 's'}</b> worth{' '}
+                  <b>{bulkValueIsFloor ? 'at least ' : ''}{inr(bulkValueKnown)}</b> of difference will be{' '}
+                  <b>discarded</b>.
+                </p>
+                <p>
+                  <b>No stock changes.</b> Not one gram, on any rail — not central stock, not a liquor store ledger, not
+                  a department balance. Nothing is written to your books.
+                </p>
+                {/* "Nothing moves" is true of REJECT and false as a description
+                    of where a department row leaves things: that balance moved
+                    when the count was saved, and this button does not reverse
+                    it. Say it here, next to the reassurance, or the reassurance
+                    is the thing that misleads. */}
+                <p className="text-[#6B5744]">
+                  It does not <b>undo</b> anything either. A department count already moved that department&apos;s own
+                  balance when it was saved — rejecting closes the row, it does not put the figure back. Re-count to
+                  correct one.
+                </p>
+                <p>
+                  The counts stay readable on the <b>Rejected</b> tab with your reason on every row. The differences
+                  stand as open losses to chase.
+                </p>
+                <p className="text-[#6B5744]">
+                  This is <b>not</b> the Approve button. Approving is what writes a count into stock, and it is done one
+                  row at a time.
+                </p>
+              </div>
+
+              {bulkMode === 'filter' && preview && (
+                <div className="text-[12px] text-[#6B5744]">
+                  Selection:{' '}
+                  {preview.filter.from || preview.filter.to
+                    ? <>count dates {preview.filter.from || 'the beginning'} → {preview.filter.to || 'today'}</>
+                    : <>every count date</>}
+                  {preview.filter.batch_id != null && (
+                    <> · upload <b>{batches.find(b => b.batch_id === preview.filter.batch_id)?.batch_label
+                      || (preview.filter.batch_id ? preview.filter.batch_id : 'saved before uploads were tracked')}</b></>
+                  )}
+                  {preview.filter.source && <> · {preview.filter.source === 'liquor' ? 'liquor stores' : 'central store / departments'} only</>}
+                  {preview.filter.outlet === 'all' && <> · all outlets</>}
+                </div>
+              )}
+
+              <label className="block">
+                <span className="text-[12px] font-medium text-[#6B5744]">Why are these being discarded? (recorded on every row)</span>
+                <input value={bulkReason} onChange={e => setBulkReason(e.target.value)} autoFocus
+                       placeholder="e.g. blank cells came through as 0 — sheet re-uploaded"
+                       className="w-full mt-1 px-3 py-2 border border-[#E8D5C4] rounded-lg text-sm bg-[#FFF8F0] focus:outline-none focus:border-[#af4408]" />
+              </label>
+
+              {/* THE TYPED NUMBER, FILTER MODE ONLY. An id list was ticked row by
+                  row; a filter can be thousands of rows nobody has looked at. */}
+              {bulkMode === 'filter' && (
+                <label className="block">
+                  <span className="text-[12px] font-medium text-[#6B5744]">
+                    Type <b className="font-mono">{num(bulkCount)}</b> to confirm you mean all of them
+                  </span>
+                  <input value={bulkTyped} onChange={e => setBulkTyped(e.target.value)} inputMode="numeric"
+                         className="w-full mt-1 px-3 py-2 border border-[#E8D5C4] rounded-lg text-sm bg-[#FFF8F0] font-mono focus:outline-none focus:border-[#af4408]" />
+                </label>
+              )}
+
+              {bulkErr && (
+                <div className="bg-red-50 border border-red-200 rounded-lg p-2.5 text-[12px] text-red-700 flex gap-2">
+                  <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" /> {bulkErr}
+                </div>
+              )}
+            </div>
+
+            <div className="px-5 py-4 border-t border-[#E8D5C4] flex flex-wrap justify-end gap-2">
+              <button onClick={closeBulk} disabled={bulkBusy}
+                      className="px-4 py-2 text-sm text-[#6B5744] bg-[#FFF1E3] rounded-lg hover:bg-[#E8D5C4] disabled:opacity-50">
+                Cancel
+              </button>
+              <button onClick={runBulkReject} disabled={bulkBusy || bulkCount === 0}
+                      className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-sm font-semibold bg-[#6B5744] hover:bg-[#54432f] text-white disabled:opacity-50">
+                {bulkBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Trash2 className="w-4 h-4" />}
+                Reject {num(bulkCount)} — stock unchanged
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {toast && (
-        <div className="fixed bottom-5 left-1/2 -translate-x-1/2 z-50 bg-[#2D1B0E] text-white text-sm px-4 py-2.5 rounded-lg shadow-lg">
+        <div className="fixed bottom-5 left-1/2 -translate-x-1/2 z-50 bg-[#2D1B0E] text-white text-sm px-4 py-2.5 rounded-lg shadow-lg max-w-[92vw] text-center">
           {toast}
         </div>
       )}
