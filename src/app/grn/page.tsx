@@ -5,10 +5,10 @@
  * Listing + drill-down detail. GRNs are auto-created on PO receive.
  */
 
-import { useEffect, useMemo, useState, Fragment, type ReactNode, type WheelEvent as ReactWheelEvent } from 'react';
+import { useEffect, useMemo, useRef, useState, Fragment, type ReactNode, type WheelEvent as ReactWheelEvent } from 'react';
 import { FileCheck, ChevronDown, ChevronRight, Loader2, Plus, Trash2, X, Save, Download, Percent,
          Eye, Pencil, Printer, AlertTriangle, ChefHat, Wine, Clock, ShieldAlert, Info,
-         CheckCircle2, ShieldQuestion, Receipt } from 'lucide-react';
+         CheckCircle2, ShieldQuestion, Receipt, Link2 } from 'lucide-react';
 import { api } from '@/lib/api';
 // THE duplicate rule — one material = one line — lives in exactly one module.
 // src/lib/line-dedupe.ts imports NOTHING, which is the only reason a 'use client'
@@ -373,6 +373,81 @@ const STATUS_TONE: Record<string, string> = {
 const STATUS_LABEL: Record<string, string> = { awaiting_qc: 'awaiting kitchen QC' };
 const statusLabel = (s: string) => STATUS_LABEL[s] || s;
 
+/* ══ WHERE THE DOCUMENT CAME FROM ═══════════════════════════════════════════
+   Every hand-typed vendor bill is a GRN now, so this register holds two
+   genuinely different documents side by side:
+     · DIRECT     — a bill with no purchase order behind it (a cash buy, a
+                    standing vegetable supplier, a sample, a donation)
+     · AGAINST PO — goods received against something that was ordered
+   Until now the only thing separating them was an em-dash in the Linked PO
+   column, which is an ABSENCE: you had to already know what a blank meant, and
+   after the move the blanks became the majority.
+
+   THE FACT IS `po_id` AND NOTHING ELSE — the same column DELETE keys its PO
+   reversal off, and the same column the server's ?source filter, the print
+   sheet and the register CSV read. TRIMMED rather than truthy, deliberately:
+   an empty string is a direct bill, and matching the server's
+   `TRIM(g.po_id) <> ''` here is the only way the four surfaces can never
+   disagree about one row. Never re-derive this from `po_number` — that comes
+   off a LEFT JOIN and is null for a PO row whose order was removed, which
+   would relabel a PO receipt as direct. */
+const isPoSourced = (g: { po_id?: string | null }) => String(g?.po_id ?? '').trim() !== '';
+
+/** THE TWO WORDS, WRITTEN ONCE. The picker's buttons, the chip, the empty
+ *  state, the QC banner and the export filename all read them from here, so a
+ *  sentence about the filter can never call it something the button does not
+ *  say. (The CSV's own BILL TYPE cell is deliberately NOT one of these — it is
+ *  the server's uppercase DIRECT / AGAINST PO, computed by BILL_TYPE_SQL, so
+ *  the file keeps one authority and never re-derives its own label.) */
+const SOURCE_LABEL: Record<'direct' | 'po', string> = { direct: 'Direct', po: 'Against PO' };
+
+/** The source chip. LABELLED ON EVERY ROW, never a blank to interpret.
+ *
+ *  DELIBERATELY NOT A STATUS CHIP, and not by colour alone. The status chips
+ *  beside it are SOLID TINTS (emerald / blue / amber / red / slate) carrying a
+ *  stored status word; the amber Superseded-and-QC pills elsewhere are solid
+ *  amber. This one is an OUTLINE on a light ground, in small caps with letter
+ *  spacing and its own icon — a different family of thing, readable as "what
+ *  kind of document" rather than "what state it is in". The two variants then
+ *  differ by WORD and by ICON as well as by colour, so a reader who cannot
+ *  separate terracotta from clay still reads DIRECT vs AGAINST PO.
+ *
+ *  Terracotta for AGAINST PO is not decoration: it is the same #af4408 as the
+ *  PO number link printed immediately beside it, which ties the chip and the
+ *  number together as one statement. No status uses it.
+ *
+ *  NEVER STRUCK THROUGH on a voided row. The strike says the RECEIPT no longer
+ *  counts; where the bill came from is still true, and a line through 9px small
+ *  caps is unreadable anyway.
+ *
+ *  MUTED — NOT STRUCK, NOT DROPPED — ON A VOIDED ROW. A void row is greyed to
+ *  #8B7355 with every other cell struck through; a full-strength terracotta chip
+ *  in the middle of that would be the brightest thing in a row whose whole
+ *  design says "this no longer counts", and the eye would land on the withdrawn
+ *  bills first. `muted` keeps the WORD and the ICON at full legibility (the
+ *  label must never become a blank again — that is the entire point of the chip)
+ *  and takes the colour out, which is the part that was shouting. The two
+ *  variants still differ by word and icon when muted, so the distinction
+ *  survives the greying. */
+function SourceChip({ poSourced, muted = false, className = '' }:
+                    { poSourced: boolean; muted?: boolean; className?: string }) {
+  return (
+    <span
+      title={poSourced
+        ? 'Against a purchase order — these goods were ordered first, and this receipt is booked against that order.'
+        : 'Direct bill — no purchase order behind it (a cash buy, a standing supplier, a sample, a donation or a return). Recorded straight onto the register.'}
+      className={`inline-flex items-center gap-1 shrink-0 whitespace-nowrap rounded-sm border px-1.5 py-px text-[9px] font-sans font-semibold uppercase tracking-[0.08em] ${
+        muted
+          ? 'border-[#C9B9A5] bg-white/70 text-[#8B7355]'
+          : poSourced
+            ? 'border-[#af4408] bg-white text-[#af4408]'
+            : 'border-[#B8A590] bg-[#FFF8F0] text-[#6B5744]'} ${className}`}>
+      {poSourced ? <Link2 className="w-2.5 h-2.5" /> : <Receipt className="w-2.5 h-2.5" />}
+      {poSourced ? SOURCE_LABEL.po : SOURCE_LABEL.direct}
+    </span>
+  );
+}
+
 /** Is this receipt still holding its goods at the bay? */
 const isHeld = (g: { status: string }) => g.status === 'awaiting_qc';
 /** Was this receipt EVER put through the gate — including after it cleared?
@@ -408,6 +483,12 @@ export default function GrnPage() {
   const [from, setFrom] = useState(minusDays(30));
   const [to, setTo] = useState(today());
   const [statusFilter, setStatusFilter] = useState('');
+  /** '' | 'direct' | 'po' — WHERE the document came from, filtered SERVER-SIDE
+   *  (?source=) rather than in the browser, so the list, the counters and the
+   *  Inward Register download are all the same slice. It COMPOSES with the date
+   *  range and the status buttons — it is its own picker and never touches
+   *  them, so "direct bills that are still awaiting QC" is one screen. */
+  const [sourceFilter, setSourceFilter] = useState<'' | 'direct' | 'po'>('');
   const [expanded, setExpanded] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
 
@@ -516,10 +597,21 @@ export default function GrnPage() {
     return () => { alive = false; };
   }, [dataVersion]);
 
+  /** ONLY THE NEWEST REQUEST MAY PAINT. There are now three pickers firing this
+   *  (dates, status, source) plus every post-write refresh, and two clicks in
+   *  quick succession are two fetches racing: without this the SLOWER one can
+   *  land last and paint a list that disagrees with the button lit above it —
+   *  a filter that lies, and the harder kind to spot because nothing looks
+   *  broken. A stale response now returns without touching state, and `loading`
+   *  is left ON for the request still in flight to clear. */
+  const reqSeq = useRef(0);
   const reload = async () => {
+    const seq = ++reqSeq.current;
     setLoading(true);
     const qs = new URLSearchParams({ from, to }); if (statusFilter) qs.set('status', statusFilter);
+    if (sourceFilter) qs.set('source', sourceFilter);
     const d = await fetch(`/api/grn?${qs}`).then(r => r.json()).catch(() => null);
+    if (seq !== reqSeq.current) return;
     setList(d?.grns || []);
     // Absent / non-boolean → false. The row actions fail closed on anything but
     // a literal true from a payload that actually arrived.
@@ -527,20 +619,29 @@ export default function GrnPage() {
     setCanAmend(d ? d.can_amend === true : null);
     setLoading(false);
   };
-  useEffect(() => { reload(); /* eslint-disable-next-line */ }, [from, to, statusFilter]);
+  useEffect(() => { reload(); /* eslint-disable-next-line */ }, [from, to, statusFilter, sourceFilter]);
   /** One post-write refresh path: re-read the list AND invalidate row details. */
   const afterWrite = () => { setDataVersion(v => v + 1); reload(); };
 
   // Download the flat inward register (one row per LINE) in the sheet's column
-  // order + our extras, for the current date range + status filter.
+  // order + our extras, for the current date range + status filter + source.
   const [exporting, setExporting] = useState(false);
   const downloadRegister = async () => {
     setExporting(true);
     try {
       const qs = new URLSearchParams({ register: '1', from, to }); if (statusFilter) qs.set('status', statusFilter);
+      // The register follows the SAME source picker as the screen — a register
+      // that quietly re-included the PO bills the reader had just filtered out
+      // would be a different document from the one they were looking at.
+      if (sourceFilter) qs.set('source', sourceFilter);
       const d = await fetch(`/api/grn?${qs}`).then(r => r.json());
       const rows: any[] = d.rows || [];
-      if (!rows.length) { alert('No inward lines in this date range.'); return; }
+      if (!rows.length) {
+        alert(sourceFilter
+          ? `No ${sourceFilter === 'po' ? 'against-PO' : 'direct'} inward lines in this date range.`
+          : 'No inward lines in this date range.');
+        return;
+      }
       // Formula-injection guard — but only for genuinely non-numeric cells, so
       // signed numbers (negative MRP round-off, back-correction qtys/totals)
       // stay as real numbers Excel can sum (not text). Number('') is 0 → fine.
@@ -550,20 +651,39 @@ export default function GrnPage() {
       // levies and must never be read as one: COMPENSATION CESS is the GST-regime
       // cess (raw_materials.cess_percent, charged on the gross line value before
       // discount), SPECIAL EXCISE CESS is the TGBCL liquor levy off the store bill.
+      // BILL TYPE is APPENDED, never inserted. The 26 columns before it match a
+      // sheet the owner already works in, and a filed register whose columns
+      // moved is a register nobody trusts — so the distinction arrives as a 27th
+      // column at the end. It is its own column and overloads none of the
+      // others: STATUS is what happened to the receipt, BILL TYPE is what kind
+      // of document it is, and folding the two together would lose one of them.
       const header = ['GRN No.', 'INVOICE ID', 'INWARD DATE', 'SUPPLIER NAME', 'CATEGORY NAME', 'ITEM NAME',
         'PO QTY', 'INWARD QTY', 'PURCHASE UNIT', 'RATE', 'SUBTOTAL', 'DISCOUNT', 'CGST', 'SGST',
         'COMPENSATION CESS', 'SPECIAL EXCISE CESS', 'TCS', 'DELIVERY CHARGES', 'MRP ROUND OFF', 'TOTAL INWARD AMOUNT',
-        'ACCEPTED QTY', 'REJECTED QTY', 'REJECT REASON', 'STATUS', 'RECEIVED BY', 'INVOICE DATE'];
+        'ACCEPTED QTY', 'REJECTED QTY', 'REJECT REASON', 'STATUS', 'RECEIVED BY', 'INVOICE DATE', 'BILL TYPE'];
       const lines = [header.join(',')];
       for (const r of rows) lines.push([
         r.grn_number, r.invoice_number, r.inward_date, r.supplier, r.category_name, r.item_name,
         r.po_qty, r.inward_qty, r.purchase_unit, r.rate, r.subtotal, r.discount, r.cgst, r.sgst,
         r.compensation_cess, r.special_excise_cess, r.tcs, r.delivery_charges, r.mrp_round_off, r.total_inward_amount,
         r.quantity_accepted, r.quantity_rejected, r.rejection_reason, r.status, r.received_by, r.invoice_date,
+        // Computed by the register SQL (one CASE over g.po_id), never re-derived
+        // here — one rule, one place, so the file and the screen cannot drift.
+        r.bill_type,
       ].map(clean).join(','));
       const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8;' });
       const url = URL.createObjectURL(blob); const a = document.createElement('a');
-      a.href = url; a.download = `GRN-inward-register-${from}_to_${to}.csv`;
+      // THE FILENAME SAYS WHAT SLICE THIS IS. A register downloaded under Source
+      // = Direct is not the register — it is part of it — and two files that
+      // differ by twenty rows landing in the same folder as
+      // "…register-A_to_B.csv" and "…register-A_to_B (1).csv" is a filing
+      // hazard on exactly the file the owner asked to be able to file. The
+      // BILL TYPE column tells a reader what each ROW is; only the name can tell
+      // them the FILE is a slice. Unfiltered keeps the name it has always had,
+      // so nothing that already points at that file moves. Kept in step with the
+      // server's own csv branch in src/app/api/grn/route.ts.
+      const slice = sourceFilter ? `-${sourceFilter === 'po' ? 'against-PO' : 'direct'}` : '';
+      a.href = url; a.download = `GRN-inward-register-${from}_to_${to}${slice}.csv`;
       document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
     } finally { setExporting(false); }
   };
@@ -593,6 +713,15 @@ export default function GrnPage() {
     }
     return c;
   }, [list]);
+
+  /** Every counter above is computed off `list`, which is now narrowed by Source
+   *  as well as by the dates and the status. Their tooltips said "in this range"
+   *  — true of the dates, silent about the new picker, so a Σ that had just
+   *  dropped by the PO bills' worth would read as a range that had changed. One
+   *  sentence, appended wherever a tooltip states what it is counting. */
+  const sliceNote = sourceFilter
+    ? ` Source is set to ${SOURCE_LABEL[sourceFilter]}, so this counts only those bills — switch Source to All for the whole range.`
+    : '';
 
   /** The held rows IN THE CURRENT VIEW, newest wait first. The banner counts
    *  these — not qcCtx.pending — because a banner that says "3 waiting" over a
@@ -632,7 +761,7 @@ export default function GrnPage() {
         </div>
         <div className="flex items-center gap-2">
           <button onClick={downloadRegister} disabled={exporting}
-                  title="Download the inward register (one row per line, sheet column order) as CSV/Excel. Voided bills are left out — their stock and cost were reversed, so counting them would overstate the period. Pick the 'void' filter to export those on their own."
+                  title="Download the inward register (one row per line, sheet column order) as CSV/Excel. It follows the filters above, including Source — and carries a BILL TYPE column (DIRECT / AGAINST PO) as its last column. A filtered download says so in its filename, so a slice is never filed as the whole register. Voided bills are left out — their stock and cost were reversed, so counting them would overstate the period. Pick the 'void' filter to export those on their own."
                   className="px-3 py-2 bg-white border border-[#af4408] text-[#af4408] hover:bg-[#af4408]/10 rounded-lg text-sm flex items-center gap-2 disabled:opacity-50">
             {exporting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />} Inward Register
           </button>
@@ -648,7 +777,17 @@ export default function GrnPage() {
           wait clock, the overdue flag, the queue size). Bumping dataVersion is
           what re-reads it — and it also drops any cached row detail, which was
           always the right thing to do after a write. */}
-      {creating && <AdHocGrnModal onClose={() => setCreating(false)} onCreated={() => { setCreating(false); afterWrite(); }} />}
+      {/* AND THE SOURCE PICKER STANDS DOWN IF IT WOULD HIDE WHAT WAS JUST SAVED.
+          A bill typed in this modal is DIRECT by construction — POST /api/grn
+          writes po_id as a literal NULL — so under Source = Against PO the row
+          the user has this second created can never be in the reloaded list.
+          Not "sometimes", the way a status filter can: 100% of the time. Widening
+          to All is the only direction that is always safe (it can hide nothing
+          that was showing), and it is done ONLY on a successful write, so the
+          picker still composes freely while the user is driving it. Direct and
+          All are left exactly as the user set them. */}
+      {creating && <AdHocGrnModal onClose={() => setCreating(false)}
+                                  onCreated={() => { setCreating(false); setSourceFilter(s => (s === 'po' ? '' : s)); afterWrite(); }} />}
       {/* Mounted at PAGE level, not inside the row: the row lives in a table with
           `overflow-x-auto` on its wrapper, and a fixed overlay rendered inside a
           scroll container is clipped by it on some browsers. */}
@@ -704,12 +843,28 @@ export default function GrnPage() {
                   )}
                 </div>
                 {/* The outlet-wide figure, and ONLY when it differs from what is
-                    on screen — the date filter can hide a held delivery, and a
-                    store person who cleared their own range should still learn
-                    that three more are waiting outside it. */}
+                    on screen — a filter can hide a held delivery, and a store
+                    person who cleared their own range should still learn that
+                    three more are waiting outside it.
+                    WHICH FILTER IS HIDING THEM IS NOT GUESSED. This sentence
+                    used to name the dates unconditionally, which was true while
+                    the date range was the only picker that could BOTH leave this
+                    banner up AND take held rows out of it: every status value
+                    except '' and 'awaiting_qc' empties heldHere and the banner
+                    disappears with it. Source is the first picker that can hide
+                    a held bill while the banner stays up, so with Source set the
+                    line names Source instead of sending a store person off to
+                    widen a date range that was never the problem — the exact
+                    hunt this banner exists to end.
+                    NO NUMBER IS SPLIT BETWEEN THE TWO CAUSES: qcCtx is the
+                    outlet-wide queue and carries no po_id, so the split is not
+                    knowable here, and inventing it would be the same false
+                    sentence one step further on. */}
                 {qcCtx && qcCtx.pending > heldHere.length && (
                   <div className="mt-0.5 opacity-80">
-                    {qcCtx.pending} are waiting in total at this outlet — {qcCtx.pending - heldHere.length} of them outside the dates filtered above.
+                    {qcCtx.pending} are waiting in total at this outlet — {qcCtx.pending - heldHere.length} of them {sourceFilter
+                      ? <>not listed here: Source is set to <b>{SOURCE_LABEL[sourceFilter]}</b>, and the dates above may be hiding some as well. Pending Quality Checks shows every one of them.</>
+                      : <>outside the dates filtered above.</>}
                   </div>
                 )}
               </div>
@@ -744,20 +899,43 @@ export default function GrnPage() {
             </button>
           ))}
         </div>
+        {/* ── SOURCE ────────────────────────────────────────────────────────────
+            A SECOND, INDEPENDENT PICKER — the same button shape as the status
+            group beside it, and it composes with it rather than resetting it:
+            picking Direct leaves the dates and the status exactly where they
+            were, so "direct bills still awaiting QC" is one screen. Captioned
+            because two unlabelled "All" buttons in a row would be a riddle.
+            Server-side (?source=), so the counters and the register download
+            below describe the same slice as the table. */}
+        <div className="flex gap-1 flex-wrap items-center ml-2 pl-2 border-l border-[#E8D5C4]">
+          <span className="text-[#8B7355]" title="Where the document came from: a bill entered with no purchase order behind it, or goods received against one that was ordered.">Source</span>
+          {/* Labels come from SOURCE_LABEL so the button, the chip on the row and
+              every sentence written about this picker say the same two words. */}
+          {([
+            ['', 'All', 'Both kinds of document.'],
+            ['direct', SOURCE_LABEL.direct, 'Bills with no purchase order behind them — a cash buy, a standing supplier, a sample, a donation or a return.'],
+            ['po', SOURCE_LABEL.po, 'Receipts booked against a purchase order.'],
+          ] as const).map(([v, label, tip]) => (
+            <button key={v || 'all'} onClick={() => setSourceFilter(v)} title={tip}
+                    className={`px-2 py-0.5 rounded border ${sourceFilter === v ? 'bg-[#af4408] text-white border-[#af4408]' : 'bg-white text-[#6B5744] border-[#E8D5C4]'}`}>
+              {label}
+            </button>
+          ))}
+        </div>
         <div className="ml-auto text-[#6B5744] flex gap-3 flex-wrap">
           <span>✓ {counts.received}</span>
           {counts.awaiting_qc > 0 && (
             // Sits FIRST among the exception counters and carries its own ₹,
             // because "waiting" is money at the bay, not a grade of receipt —
             // and Σ accepted beside it deliberately excludes every rupee of it.
-            <span className="text-blue-800" title="Recorded, waiting for a kitchen / bar check. No stock has been added for these, so they contribute ₹0 to Σ accepted — the figure here is the BILL value sitting at the bay.">
+            <span className="text-blue-800" title={'Recorded, waiting for a kitchen / bar check. No stock has been added for these, so they contribute ₹0 to Σ accepted — the figure here is the BILL value sitting at the bay.' + sliceNote}>
               ⏱ {counts.awaiting_qc} awaiting QC · <b className="font-mono">{fmt(counts.awaiting_value)}</b>
             </span>
           )}
           <span className="text-amber-700">⚠ {counts.partial}</span>
           <span className="text-red-700">✗ {counts.rejected}</span>
-          {counts.void > 0 && <span className="text-[#8B7355]" title="Voided bills — their stock and cost rows were reversed, so they are excluded from the Σ beside this AND from the Inward Register download. Pick the 'void' filter to list them, or use a row's own Download to get one.">⊘ {counts.void} void</span>}
-          <span title="Accepted value of the NON-VOID bills in this range.">Σ accepted: <b className="font-mono">{fmt(counts.accepted_value)}</b></span>
+          {counts.void > 0 && <span className="text-[#8B7355]" title={"Voided bills — their stock and cost rows were reversed, so they are excluded from the Σ beside this AND from the Inward Register download. Pick the 'void' filter to list them, or use a row's own Download to get one." + sliceNote}>⊘ {counts.void} void</span>}
+          <span title={'Accepted value of the NON-VOID bills in this range.' + sliceNote}>Σ accepted: <b className="font-mono">{fmt(counts.accepted_value)}</b></span>
         </div>
       </div>
 
@@ -765,15 +943,29 @@ export default function GrnPage() {
         {loading ? (
           <div className="p-8 text-center text-sm text-[#8B7355]"><Loader2 className="w-5 h-5 animate-spin inline mr-2" /> Loading…</div>
         ) : list.length === 0 ? (
-          <div className="p-8 text-center text-sm text-[#8B7355]">No GRNs in this range. They're created automatically when you receive a PO.</div>
+          <div className="p-8 text-center text-sm text-[#8B7355]">
+            {/* The stock message says GRNs "are created when you receive a PO",
+                which is exactly the wrong sentence to show somebody who has just
+                filtered to DIRECT — the bills that by definition have no PO. */}
+            {sourceFilter === 'direct'
+              ? <>No direct bills in this range. Press <em>Enter Vendor Bill</em> for one typed by hand, or switch Source to <em>All</em>.</>
+              : sourceFilter === 'po'
+                ? <>No PO-sourced receipts in this range. Switch Source to <em>All</em> to see the direct bills too.</>
+                : <>No GRNs in this range. They&apos;re created automatically when you receive a PO.</>}
+          </div>
         ) : (
           <div className="overflow-x-auto">
-          {/* min-w grows with the column count — the wrapper scrolls horizontally
-              rather than letting a 13th column squeeze the others into wrapping.
-              Widened from 980 when the trailing cell went from one "Print" link
-              to a five-icon action group; under-size it and the group wraps onto
-              two rows and every row grows a second line. */}
-          <table className="w-full text-xs min-w-[1150px]">
+          {/* min-w grows with the column WIDTH, not just the column count — the
+              wrapper scrolls horizontally rather than letting a cell squeeze the
+              others into wrapping. Widened from 980 when the trailing cell went
+              from one "Print" link to a five-icon action group; under-size it
+              and the group wraps onto two rows and every row grows a second
+              line. Widened again from 1150 for the same reason on a different
+              cell: Source / PO went from a single unbreakable PO token to a chip
+              PLUS that token, roughly a hundred pixels more, and left at 1150
+              every AGAINST PO row would wrap its number under its chip and grow
+              the second line this floor exists to prevent. */}
+          <table className="w-full text-xs min-w-[1250px]">
             <thead className="bg-[#FFF1E3] text-[#6B5744]">
               <tr>
                 <th className="w-6"></th>
@@ -781,7 +973,11 @@ export default function GrnPage() {
                 <th className="text-left py-1.5 px-3 font-medium">Date</th>
                 <th className="text-left py-1.5 px-3 font-medium">Vendor</th>
                 <th className="text-left py-1.5 px-3 font-medium">Bill No.</th>
-                <th className="text-left py-1.5 px-3 font-medium">Linked PO</th>
+                {/* Renamed from "Linked PO": the cell no longer holds only a PO
+                    number, it holds the LABEL for both kinds of document — and
+                    a DIRECT chip under a heading that says "Linked PO" reads
+                    like a contradiction. The PO number still lives here. */}
+                <th className="text-left py-1.5 px-3 font-medium">Source / PO</th>
                 <th className="text-right py-1.5 px-3 font-medium">Lines</th>
                 <th className="text-right py-1.5 px-3 font-medium">Rejected qty</th>
                 <th className="text-right py-1.5 px-3 font-medium">Accepted ₹</th>
@@ -1050,7 +1246,25 @@ function GrnRow({ g, expanded, onToggle, isAdmin, canAmend, dataVersion, onEdit,
             paper against. Our own GRN # is two columns left; these are different
             numbers and mixing them up is how a bill gets paid twice. */}
         <td className={`py-2 px-3 font-mono text-[#6B5744] ${strike}`}>{g.invoice_number || '—'}</td>
-        <td className="py-2 px-3 font-mono">{g.po_number ? <a href="/purchase-orders" className={`text-[#af4408] hover:underline ${strike}`}>{g.po_number}</a> : <span className="text-[#8B7355]">—</span>}</td>
+        {/* SOURCE — the chip is on EVERY row, and the PO number sits beside it
+            rather than being replaced by it: the chip says what kind of document
+            this is, the number says which order it belongs to, and a PO row
+            needs both. The old cell said this with an em-dash, which is an
+            absence rather than a label.
+            The chip is NOT given `strike` on a voided row (see SourceChip) —
+            the void withdrew the receipt, not the fact that it came in without
+            an order; the PO link keeps its strike, as before. It IS muted there,
+            so the one unstruck thing in a greyed-out row is not also the
+            brightest thing in it. */}
+        <td className="py-2 px-3">
+          <div className="flex items-center gap-1.5 flex-wrap">
+            <SourceChip poSourced={isPoSourced(g)} muted={isVoid} />
+            {/* Shown only when the order could be resolved. A PO-sourced row
+                whose order row has gone still reads "Against PO" — the chip is
+                keyed off po_id, so it never quietly downgrades to "Direct". */}
+            {g.po_number && <a href="/purchase-orders" className={`font-mono text-[#af4408] hover:underline ${strike}`}>{g.po_number}</a>}
+          </div>
+        </td>
         <td className={`py-2 px-3 text-right font-mono ${strike}`}>{g.line_count}</td>
         {/* Rejected qty is a SUM ACROSS MATERIALS and GRN qtys are PURCHASE units,
             so it can only be printed as a quantity when every rejected line shares

@@ -158,16 +158,22 @@ const csvCell = (v: any): string => {
   return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 };
 
-/** The Inward Register column order. THE SAME 26 HEADINGS, IN THE SAME ORDER,
+/** The Inward Register column order. THE SAME 27 HEADINGS, IN THE SAME ORDER,
  *  as the client-side bulk export at src/app/grn/page.tsx — keep the two in
  *  step: two "inward register" files that disagree about column order are worse
  *  than one. COMPENSATION CESS sits between SGST and SPECIAL EXCISE CESS (the
  *  order db.ts's Total Inward term list uses); the two cesses are DIFFERENT
  *  levies and must never be folded together. */
+/*  BILL TYPE IS THE 27TH COLUMN AND IS APPENDED, NEVER INSERTED. The 26 ahead
+ *  of it match a sheet the owner already works in; moving them would break every
+ *  formula pointing at the file. It is also its OWN column rather than a suffix
+ *  on STATUS or SUPPLIER: status is what happened to the receipt, bill type is
+ *  what kind of document it is, and one cell cannot carry both without losing
+ *  one of them to the reader. */
 const REGISTER_HEADER = ['GRN No.', 'INVOICE ID', 'INWARD DATE', 'SUPPLIER NAME', 'CATEGORY NAME', 'ITEM NAME',
   'PO QTY', 'INWARD QTY', 'PURCHASE UNIT', 'RATE', 'SUBTOTAL', 'DISCOUNT', 'CGST', 'SGST',
   'COMPENSATION CESS', 'SPECIAL EXCISE CESS', 'TCS', 'DELIVERY CHARGES', 'MRP ROUND OFF', 'TOTAL INWARD AMOUNT',
-  'ACCEPTED QTY', 'REJECTED QTY', 'REJECT REASON', 'STATUS', 'RECEIVED BY', 'INVOICE DATE'];
+  'ACCEPTED QTY', 'REJECTED QTY', 'REJECT REASON', 'STATUS', 'RECEIVED BY', 'INVOICE DATE', 'BILL TYPE'];
 
 /** Same field order as REGISTER_HEADER, against a row of the register query. */
 const registerRow = (r: any) => [
@@ -175,7 +181,34 @@ const registerRow = (r: any) => [
   r.po_qty, r.inward_qty, r.purchase_unit, r.rate, r.subtotal, r.discount, r.cgst, r.sgst,
   r.compensation_cess, r.special_excise_cess, r.tcs, r.delivery_charges, r.mrp_round_off, r.total_inward_amount,
   r.quantity_accepted, r.quantity_rejected, r.rejection_reason, r.status, r.received_by, r.invoice_date,
+  r.bill_type,
 ];
+
+/* ── DIRECT vs AGAINST PO ────────────────────────────────────────────────────
+ * The distinction is `goods_receipt_notes.po_id` and nothing else — the same
+ * column the void path keys its PO reversal off. Now that every hand-typed
+ * vendor bill is a GRN, the register holds both kinds of document side by side
+ * and the reader has to be able to say which is which, and to look at one kind
+ * at a time.
+ *
+ * ONE RULE, WRITTEN ONCE, USED BY BOTH THE FILTER AND THE LABEL — so a row can
+ * never be filtered in as "direct" and then labelled "AGAINST PO" in the file
+ * it lands in. TRIM(...) <> '' rather than IS NOT NULL: an empty-string po_id
+ * is a direct bill, and the client's own `isPoSourced` trims for the same
+ * reason. No schema change and no new query — this is a WHERE clause and a
+ * CASE over a column that was already there.
+ */
+const SOURCE_WHERE: Record<'direct' | 'po', string> = {
+  direct: `(g.po_id IS NULL OR TRIM(g.po_id) = '')`,
+  po:     `(g.po_id IS NOT NULL AND TRIM(g.po_id) <> '')`,
+};
+/** The printed label, in the words the screen and the print sheet use. */
+const BILL_TYPE_SQL = `CASE WHEN g.po_id IS NOT NULL AND TRIM(g.po_id) <> '' THEN 'AGAINST PO' ELSE 'DIRECT' END`;
+/** Anything that is not one of the two known values filters NOTHING — an unknown
+ *  ?source is ignored exactly like an unknown ?status, so a stale link or a typo
+ *  returns the whole list rather than an empty one that reads as "no bills". */
+const sourceClause = (v: string | null): string | null =>
+  v === 'direct' || v === 'po' ? SOURCE_WHERE[v] : null;
 
 export async function GET(request: Request) {
   try {
@@ -283,6 +316,9 @@ export async function GET(request: Request) {
     const to   = url.searchParams.get('to');
     const vendorId = url.searchParams.get('vendor_id');
     const status   = url.searchParams.get('status');
+    // DIRECT vs AGAINST PO. Optional and additive: absent → unfiltered, which is
+    // every caller that existed before this parameter did.
+    const source   = sourceClause(url.searchParams.get('source'));
     const register = url.searchParams.get('register');   // flat line-level inward register (export)
     const where: string[] = ['1=1']; const params: any[] = [];
     const outletId = await getCurrentOutletId();
@@ -322,6 +358,13 @@ export async function GET(request: Request) {
       if (to)       { rw.push('g.date <= ?'); rp.push(to); }
       if (vendorId) { rw.push('g.vendor_id = ?'); rp.push(vendorId); }
       if (status)   { rw.push('g.status = ?'); rp.push(status); }
+      // The source picker is one of the LIST's filters, so it belongs in this
+      // branch beside the dates and the status and is dropped by the per-entry
+      // branch above for the same reason they are: a Download on a row must
+      // return that row's lines whatever the screen behind it was filtered to.
+      // No parameter is bound — the clause is one of two fixed strings chosen by
+      // sourceClause(), never interpolated user input.
+      if (source)   { rw.push(source); }
       // ── VOIDED BILLS ARE OUT OF THE RANGE REGISTER ────────────────────────
       // This file is what gets reconciled against vendor paperwork and summed
       // in Excel; a voided bill's stock and cost rows have been reversed, so
@@ -349,7 +392,11 @@ export async function GET(request: Request) {
                      + gi.compensation_cess
                      + gi.special_excise_cess + gi.tcs + gi.delivery_charges + gi.mrp_round_off, 2) AS total_inward_amount,
                gi.quantity_accepted, gi.quantity_rejected, gi.rejection_reason,
-               g.status, g.received_by, g.invoice_date
+               g.status, g.received_by, g.invoice_date,
+               -- The 27th register column. Computed here rather than in the
+               -- browser so the bulk download, the per-entry Download and the
+               -- screen all read one rule off one column (see BILL_TYPE_SQL).
+               ${BILL_TYPE_SQL} AS bill_type
         FROM goods_receipt_note_items gi
         JOIN goods_receipt_notes g  ON g.id  = gi.grn_id
         JOIN raw_materials       rm ON rm.id = gi.material_id
@@ -366,10 +413,17 @@ export async function GET(request: Request) {
         // Named off the GRN when it is one entry (that is the document's own
         // identity, and the number is what an auditor searches for), off the
         // date range otherwise — matching the bulk export's filename exactly.
+        // A RANGE FILE ALSO CARRIES ITS SOURCE SLICE, because a direct-only
+        // register is part of the register rather than the register, and two
+        // differently-sized files under one name is a filing hazard. The
+        // per-entry name is untouched: that branch ignores every picker, so
+        // there is no slice to declare. Unfiltered keeps the historic name.
         const one = grnId ? String(rows[0]?.grn_number || grnId) : '';
+        const slice = source === SOURCE_WHERE.direct ? '-direct'
+                    : source === SOURCE_WHERE.po     ? '-against-PO' : '';
         const filename = one
           ? `GRN-inward-${one}.csv`
-          : `GRN-inward-register-${from || 'all'}_to_${to || 'all'}.csv`;
+          : `GRN-inward-register-${from || 'all'}_to_${to || 'all'}${slice}.csv`;
         return new Response(lines.join('\n'), {
           status: 200,
           headers: {
@@ -388,6 +442,10 @@ export async function GET(request: Request) {
     if (to)        { where.push('g.date <= ?'); params.push(to); }
     if (vendorId)  { where.push('g.vendor_id = ?'); params.push(vendorId); }
     if (status)    { where.push('g.status = ?'); params.push(status); }
+    // Composes with all of the above rather than replacing any of them: "direct
+    // bills still awaiting QC, this week" is one query. No bound parameter — a
+    // fixed clause chosen by sourceClause().
+    if (source)    { where.push(source); }
     const rows = db.prepare(`
       SELECT g.*,
              po.po_number AS po_number,

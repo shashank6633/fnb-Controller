@@ -179,6 +179,19 @@ export default function GrnPrintPage({ params }: { params: Promise<{ id: string 
      without it a released bill is indistinguishable from a checked one. */
   const isOverride = String(grn.qc_outcome || '') === 'override';
 
+  /* ── WHAT KIND OF DOCUMENT THIS IS ─────────────────────────────────────────
+     DIRECT (no purchase order behind it) or AGAINST PO. This is the sheet that
+     gets filed, and on paper the only thing that ever said which was an em-dash
+     beside "PO Number" — an absence, readable only by somebody who already knew
+     the convention. Now that every hand-typed vendor bill is a GRN, most filed
+     sheets are direct ones, so the label has to travel with the paper.
+
+     KEYED OFF po_id, TRIMMED — the same rule as the /grn list's isPoSourced and
+     the register's BILL_TYPE_SQL, so screen, file and paper cannot disagree.
+     Never off po_number: that comes from a LEFT JOIN and is blank when the order
+     row is gone, which would print a PO receipt as a direct bill. */
+  const poSourced = String(grn.po_id ?? '').trim() !== '';
+
   return (
     <div className="bg-white text-[#1a1a1a] mx-auto max-w-[820px] p-8 print:p-6 text-[12px] leading-relaxed">
       {/* Print-only stylesheet */}
@@ -243,6 +256,21 @@ export default function GrnPrintPage({ params }: { params: Promise<{ id: string 
             <div>
               <div className="text-[10px] uppercase tracking-widest text-[#666]">Goods Receipt Note</div>
               <div className="text-2xl font-bold mt-1">{grn.grn_number}</div>
+              {/* THE BILL TYPE, ON THE PAPER, BESIDE THE NUMBER IT DESCRIBES.
+                  Drawn in ink rather than colour — solid rule for AGAINST PO,
+                  dashed for DIRECT, and the word spelled out in both — so it
+                  survives a mono laser printer and a photocopy, where every
+                  coloured treatment on this sheet degrades to grey. It is a
+                  bordered caption, not one of the banners: a direct bill is
+                  perfectly normal, and a banner would read as a warning. */}
+              <div className="mt-1.5">
+                <span className={`inline-block px-1.5 py-px text-[9px] font-semibold uppercase tracking-[0.14em] ${
+                  poSourced ? 'border border-[#1a1a1a] text-[#1a1a1a]' : 'border border-dashed border-[#555] text-[#333]'}`}>
+                  {poSourced
+                    ? `Against PO${grn.po_number ? ` · ${grn.po_number}` : ''}`
+                    : 'Direct bill · no purchase order'}
+                </span>
+              </div>
             </div>
             <div className="text-right">
               <div className="text-[10px] uppercase tracking-widest text-[#666]">Status</div>
@@ -333,7 +361,13 @@ export default function GrnPrintPage({ params }: { params: Promise<{ id: string 
         {/* Meta grid */}
         <div className="grid grid-cols-2 gap-x-6 gap-y-2 mb-4">
           <div><span className="text-[#666]">Date:</span> <span className="font-medium">{grn.date}{grn.time ? ' ' + grn.time : ''}</span></div>
-          <div><span className="text-[#666]">PO Number:</span> <span className="font-mono">{grn.po_number || '— (Ad-hoc receipt)'}</span></div>
+          {/* Says which of the three cases it is instead of leaving one dash to
+              cover all of them: a direct bill (no order exists), a PO receipt
+              (here is the order), or a PO receipt whose order record has gone —
+              which is a fact worth printing, not a blank. */}
+          <div><span className="text-[#666]">PO Number:</span> <span className="font-mono">
+            {grn.po_number || (poSourced ? '— (order record not found)' : '— none · direct bill')}
+          </span></div>
           <div><span className="text-[#666]">Vendor:</span> <span className="font-medium">{grn.vendor || '—'}</span></div>
           <div><span className="text-[#666]">Invoice:</span> <span className="font-mono">{grn.invoice_number || '—'}{grn.invoice_date ? ' · ' + grn.invoice_date : ''}</span></div>
           <div><span className="text-[#666]">Received by:</span> <span className="font-medium">{grn.received_by || '—'}</span></div>
