@@ -242,6 +242,30 @@ function reqPackFactor(riUnit: string | null, unit: string, purchaseUnit: string
  * quantity_issued > 0, not rejected) UNION materials ever counted by the
  * deptSet in closing_stock. Binds TWO params, each the SAME JSON array of
  * dept ids — pass deptItemSetParams(deptSet).
+ *
+ * ── THIS CONSTANT HAS NO IMPORTERS. IT IS KEPT IN STEP ANYWAY. ─────────────
+ * Verified 2026-08-27 across src/ and scripts/: every remaining mention of
+ * DEPT_ITEM_SET_SQL / deptItemSetParams outside this file is PROSE in a
+ * comment. The closing surfaces that used to import it moved to the owner's
+ * broader ever-REQUESTED rule in src/lib/dept-requested-items.ts, and the live
+ * department sheet (/api/closing-stock/dept-sheet) inlines its own copy.
+ * The store-reject clause below was still updated with those two, and is NOT
+ * deleted: a dead copy that silently disagrees with the live ones is exactly
+ * what the next reader would copy back in. If you are about to import this,
+ * read src/lib/dept-requested-items.ts first and decide which set you want.
+ *
+ * ── THE STORE-REJECT CLAUSE ───────────────────────────────────────────────
+ * Excluded only when the rejected line DELIVERED NOTHING. Since the Option-A
+ * reject (434b070) cancels only the outstanding balance and keeps what was
+ * handed over, `store_rejected = 1` no longer implies `quantity_issued = 0`.
+ * Written out in full so every copy of the rule reads the same way, even though
+ * the `quantity_issued > 0` conjunct above already satisfies the OR arm here —
+ * i.e. store-rejection disqualifies nothing at THIS site. The copies are NOT
+ * byte-identical: dept-requested-items.ts uses `COALESCE(ri.store_rejected, 0)`
+ * with spaces, and it is the only site with no quantity conjunct, so it is the
+ * only one where the clause actually filters. The full site map is in the note
+ * over the query in src/app/api/closing-stock/dept-sheet/route.ts.
+ * The chef's is_rejected keeps no quantity test — see dept-requested-items.ts.
  */
 export const DEPT_ITEM_SET_SQL = `rm.id IN (
   SELECT ri.material_id
@@ -252,7 +276,7 @@ export const DEPT_ITEM_SET_SQL = `rm.id IN (
     AND COALESCE(r.purpose,'internal') <> 'party'
     AND ri.quantity_issued > 0
     AND COALESCE(ri.is_rejected,0) = 0
-    AND COALESCE(ri.store_rejected,0) = 0
+    AND (COALESCE(ri.store_rejected,0) = 0 OR COALESCE(ri.quantity_issued,0) > 0)
   UNION
   SELECT cs.material_id FROM closing_stock cs
   WHERE cs.department_id IN (SELECT value FROM json_each(?))
@@ -380,6 +404,30 @@ export function computeDeptStock(db: Database.Database, deptId: string): { rows:
   // Historic requisition issues — the pre_cutover_issued column ONLY. Same
   // qualifying rules as DEPT_ITEM_SET_SQL so this screen lists the same items
   // the dept's closing-count sheet does. These lines produce NO balance.
+  //
+  // NOT ONLY A COLUMN: every material here is also ensure()'d into `acc` below,
+  // so this query is one of the three arms that decide which ROWS this screen
+  // has at all. The other two arms are EMPTY on today's live data —
+  // department_material_transactions holds 0 rows and closing_stock 0 — so this
+  // arm alone currently supplies every row /api/department-stock returns, and a
+  // material dropped here vanishes from the screen outright.
+  //   DO NOT restate that as a claim about the old deduct-at-issue setting.
+  //   That key is DEAD, nothing reads it, and the deduct is UNCONDITIONAL (see
+  //   the header of src/lib/issue-stock.ts). The two arms are empty because the
+  //   14,149 issued lines predate the ledger — not because a switch is off. A
+  //   fresh issue today DOES write a ledger row, so this arm's monopoly is a
+  //   fact about the current data, not a guarantee.
+  // Measured on a fixture through the real routes: store-rejecting a real
+  // single-line pair that had issued 50 pcs removed the material from
+  // /api/department-stock ENTIRELY — the row went from an object to absent —
+  // and dropped 100,000 ml off another material's pre_cutover_issued. Hence the
+  // same store-reject clause as the live item-set copies: excluded only when the
+  // line DELIVERED NOTHING. A store-rejected line that kept its issued quantity
+  // IS issued history.
+  // TAUTOLOGY: `ri.quantity_issued > 0` below already satisfies the OR arm, so
+  // store-rejection disqualifies nothing HERE. The clause is spelled out in
+  // full only so this copy reads like the others; the one place it genuinely
+  // filters is src/lib/dept-requested-items.ts, which has no quantity conjunct.
   const issueLines = db.prepare(`
     SELECT ri.material_id, COALESCE(ri.department_id, r.department_id) AS owner_dept,
            ri.quantity_issued, ri.issue_history, ri.unit AS req_unit,
@@ -393,7 +441,7 @@ export function computeDeptStock(db: Database.Database, deptId: string): { rows:
       AND COALESCE(r.purpose,'internal') <> 'party'
       AND ri.quantity_issued > 0
       AND COALESCE(ri.is_rejected,0) = 0
-      AND COALESCE(ri.store_rejected,0) = 0
+      AND (COALESCE(ri.store_rejected,0) = 0 OR COALESCE(ri.quantity_issued,0) > 0)
   `).all(setJson) as any[];
 
   interface Acc {

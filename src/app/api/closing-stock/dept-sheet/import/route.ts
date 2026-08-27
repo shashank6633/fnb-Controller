@@ -367,6 +367,21 @@ export async function GET(request: Request) {
     // house definition: ever issued to, UNION ever counted by). Store-mapped
     // (liquor) materials are excluded: they are counted in their own store's
     // closing, and the POST rejects them too.
+    //
+    // THIS IS THE ON-SCREEN DEPARTMENT SHEET'S ITEM SET, ON PAPER, and the
+    // store-reject clause is kept in step with the copy in ../route.ts for that
+    // reason — see the full five-site map in the note over the query there.
+    // NOTE the predicate below already requires quantity_issued > 0, so the OR
+    // arm is always satisfied and store-rejection disqualifies nothing HERE;
+    // the clause is spelled out in full only so this copy reads like the rest.
+    // The item set only bites under `items=requested`, but that is the scope
+    // where a missing row means a missing count: a material
+    // absent from this file is a material nobody counts on the walk. Since the
+    // Option-A reject (434b070) keeps what was physically handed over, a
+    // store-rejected line can hold real department stock, so it is excluded
+    // only when it DELIVERED NOTHING. Measured on a fixture through the real
+    // routes: store-rejecting one real line took the material off this template
+    // (694 rows -> 693) while the department ledger still held the goods.
     const mats = db.prepare(`
       ${wholeCatalogue ? '' : `WITH pairs AS (
         SELECT ri.material_id AS material_id
@@ -377,7 +392,7 @@ export async function GET(request: Request) {
            AND COALESCE(r.purpose,'internal') <> 'party'
            AND ri.quantity_issued > 0
            AND COALESCE(ri.is_rejected,0) = 0
-           AND COALESCE(ri.store_rejected,0) = 0
+           AND (COALESCE(ri.store_rejected,0) = 0 OR COALESCE(ri.quantity_issued,0) > 0)
         UNION
         SELECT cs.material_id
           FROM closing_stock cs

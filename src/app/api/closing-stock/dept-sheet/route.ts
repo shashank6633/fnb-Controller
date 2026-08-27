@@ -35,7 +35,10 @@ import { checkClosingDate } from '@/lib/closing-date';
  * ISSUED to that department, UNION materials ever COUNTED by it
  * (dept-stock.DEPT_ITEM_SET_SQL). Deliberately NOT rolled up to the parent —
  * see above. Store-mapped (liquor) materials are excluded: they are counted in
- * their own store's closing, and the POST here rejects them too.
+ * their own store's closing, and the POST here rejects them too. A line the
+ * STORE rejected is excluded only when it delivered nothing — see the long
+ * note over the query itself; since the Option-A reject, a rejected line can
+ * still be holding real department stock.
  *
  * ── VALUATION ──────────────────────────────────────────────────────────────
  * Rates come from '@/lib/closing-valuation' only. raw_materials
@@ -181,6 +184,42 @@ export async function GET(request: Request) {
     // ONE query for every (department, material) pair on the sheet. The pair set
     // is the house DEPT_ITEM_SET definition, expanded across all departments at
     // once rather than 19 separate round-trips.
+    //
+    // THE STORE-REJECT CLAUSE IS A RULE ABOUT DELIVERY, NOT ABOUT THE FLAG.
+    // It used to read `COALESCE(ri.store_rejected,0) = 0`, and that was correct
+    // for as long as a store-reject zeroed quantity_issued: rejected meant the
+    // department never got the goods, so the material was not theirs to count.
+    // The Option-A reject (434b070) ended that. A reject now cancels only the
+    // OUTSTANDING balance and KEEPS what was physically handed over, so
+    // store_rejected = 1 no longer implies quantity_issued = 0 — and a line
+    // reading `store_rejected = 1, quantity_issued = 200` is a department
+    // holding 200 units. Measured on a fixture through the real routes: issue
+    // 200, dept ledger 100,000 ml, sheet lists the material; press reject, the
+    // ledger still says 100,000 ml and the material DROPPED OFF THIS SHEET
+    // while /api/department-stock went on reporting unanchored_moved 100000 /
+    // never_counted true — "count this" with no row to count it on. 372 of the
+    // 1,157 (dept, material) pairs on this database rest on exactly one
+    // qualifying line, so for a third of the estate one reject is the whole
+    // difference between countable and invisible.
+    // A CHEF rejection is a separate, untouched conjunct: is_rejected still
+    // excludes the line outright however much it issued.
+    // NOTE this predicate already requires quantity_issued > 0, so the OR arm
+    // is satisfied by every line that reaches it — i.e. store-rejection no
+    // longer disqualifies anything HERE. It is written out in full anyway so
+    // every copy of the rule reads the same way.
+    //
+    // THE FIVE COPIES, and which one actually filters:
+    //   1. this file, below            — quantity_issued > 0 above ⇒ TAUTOLOGY
+    //   2. src/lib/dept-requested-items.ts (DEPT_REQUESTED_ITEM_SQL)
+    //                                  — NO quantity conjunct ⇒ THE ONE THAT BITES
+    //   3. src/lib/dept-stock.ts (DEPT_ITEM_SET_SQL, no importers) ⇒ tautology
+    //   4. ./import/route.ts           — tautology
+    //   5. src/lib/dept-stock.ts (issueLines in computeDeptStock) ⇒ tautology
+    // They must not drift. WARNING: they are NOT byte-identical. Site 2 spells
+    // it `COALESCE(ri.store_rejected, 0)` WITH spaces, matching its own file's
+    // local style, so grepping the literal text of the line below finds four
+    // sites and MISSES the only one where the clause changes behaviour. Grep
+    // for `store_rejected` instead.
     const matRows = db.prepare(`
       WITH pairs AS (
         SELECT COALESCE(ri.department_id, r.department_id) AS dept_id, ri.material_id AS material_id
@@ -191,7 +230,7 @@ export async function GET(request: Request) {
            AND COALESCE(r.purpose,'internal') <> 'party'
            AND ri.quantity_issued > 0
            AND COALESCE(ri.is_rejected,0) = 0
-           AND COALESCE(ri.store_rejected,0) = 0
+           AND (COALESCE(ri.store_rejected,0) = 0 OR COALESCE(ri.quantity_issued,0) > 0)
         UNION
         SELECT cs.department_id AS dept_id, cs.material_id AS material_id
           FROM closing_stock cs
