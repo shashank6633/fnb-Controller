@@ -109,6 +109,13 @@ export default function MenuItemsPage() {
   // Edit modal
   const [editItem, setEditItem] = useState<MenuItem | null>(null);
 
+  // Bulk category rename (admin only). The server gate on
+  // /api/menu-items/rename-category is the real boundary — this only decides
+  // whether to offer a button that a non-admin's click would always 403.
+  const [renameOpen, setRenameOpen] = useState(false);
+  const [me, setMe] = useState<{ role?: string } | null>(null);
+  const isAdmin = me?.role === 'admin';
+
   const [toast, setToast] = useState<{ msg: string; error?: boolean } | null>(null);
 
   const showToast = useCallback((msg: string, error = false) => {
@@ -147,6 +154,13 @@ export default function MenuItemsPage() {
       setLoading(false);
     })();
   }, [fetchItems]);
+
+  // Effective role — used ONLY to decide whether to show the "Rename category"
+  // control. Failure is silent and simply hides it; the API's own 403 is the
+  // boundary, never this.
+  useEffect(() => {
+    fetch('/api/auth/me').then(r => r.json()).then(d => setMe(d?.user || null)).catch(() => {});
+  }, []);
 
   // Filtering
   const filteredItems = useMemo(() => {
@@ -194,6 +208,16 @@ export default function MenuItemsPage() {
     return { noPrice, noVeg, noLink, total: bad.size };
   }, [items]);
 
+  // TRUE per-category counts, taken from the UNFILTERED list. The chip counts
+  // further down are view-scoped (they honour the active/station/search
+  // filters); a rename moves every row on the old string regardless, so the
+  // rename dialog must quote these or it promises "12 items" and renames 30.
+  const globalCatCounts = useMemo(() => {
+    const m: Record<string, number> = {};
+    for (const it of items) { const k = it.category; if (k) m[k] = (m[k] || 0) + 1; }
+    return m;
+  }, [items]);
+
   // Activating a health filter also drops the active-only scope, so the drill-down
   // reveals every flagged item the banner counted (incl. inactive ones).
   const reviewIssue = (key: string) => {
@@ -210,7 +234,7 @@ export default function MenuItemsPage() {
   // "/" focuses the search box (but never while a modal is open)
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (editItem || importOpen) return;
+      if (editItem || importOpen || renameOpen) return;
       const tag = (document.activeElement?.tagName || '').toLowerCase();
       if (e.key === '/' && tag !== 'input' && tag !== 'textarea' && tag !== 'select') {
         e.preventDefault(); searchRef.current?.focus();
@@ -218,7 +242,7 @@ export default function MenuItemsPage() {
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [editItem, importOpen]);
+  }, [editItem, importOpen, renameOpen]);
 
   // Import handling
   const openImport = () => {
@@ -462,6 +486,31 @@ export default function MenuItemsPage() {
     return null;
   };
 
+  // Bulk category rename. Same contract as saveEdit: returns null on success or
+  // an error STRING, so the server's refusal ("that name already exists") lands
+  // in the dialog's error banner with the admin's typing intact instead of
+  // vanishing into a toast behind a closed modal.
+  const renameCategory = async (from: string, toRaw: string): Promise<string | null> => {
+    const to = sanitizeCategoryName(toRaw);
+    let renamed = 0;
+    try {
+      const res = await api('/api/menu-items/rename-category', { method: 'POST', body: { from, to } });
+      const j = await res.json().catch(() => ({} as any));
+      if (!res.ok) return j.error || `Rename failed (HTTP ${res.status})`;
+      renamed = Number(j.renamed) || 0;
+    } catch {
+      return 'Rename failed — check your connection';
+    }
+    setRenameOpen(false);
+    // Re-point the active filter at the new name. Without this the filter still
+    // holds the old string, the grid goes empty and a phantom chip re-pins at
+    // count 0 — which reads as data loss, not a rename.
+    setCategoryFilter(cf => (cf === from ? to : cf));
+    await fetchItems();
+    showToast(`Renamed "${from}" to "${to}" across ${renamed} item${renamed === 1 ? '' : 's'}`);
+    return null;
+  };
+
   if (loading) {
     return (
       <div className="min-h-screen bg-[#FFF8F0] p-6 animate-pulse">
@@ -575,6 +624,13 @@ export default function MenuItemsPage() {
                 <CatChip active={!categoryFilter} label="All" count={baseList.length} onClick={() => setCategoryFilter('')} />
                 {inline.map(c => <CatChip key={c} active={categoryFilter === c} label={c} count={countByCat[c] || 0} onClick={() => setCategoryFilter(categoryFilter === c ? '' : c)} />)}
               </TabScroller>
+              {isAdmin && (
+                <button onClick={() => setRenameOpen(true)} title="Rename a category across every item in it"
+                        className="flex items-center gap-1.5 px-3 py-1.5 rounded-full border border-[#E0D0BE] bg-white text-[#6B5744] hover:bg-[#FFF1E3] text-xs font-medium whitespace-nowrap transition-colors shrink-0">
+                  <Edit className="w-3.5 h-3.5" />
+                  <span className="hidden sm:inline">Rename category</span><span className="sm:hidden">Rename</span>
+                </button>
+              )}
               <div className="relative shrink-0">
                 <button onClick={() => setCatMenuOpen(!catMenuOpen)} className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full border text-xs font-medium whitespace-nowrap transition-colors ${catMenuOpen ? 'bg-[#af4408] text-white border-[#af4408]' : 'bg-white text-[#6B5744] border-[#E0D0BE] hover:bg-[#FFF1E3]'}`}>
                   All {categories.length} categories <ChevronDown className="w-3.5 h-3.5" />
@@ -803,6 +859,17 @@ export default function MenuItemsPage() {
       {/* Edit Modal */}
       {editItem && (
         <EditItemModal item={editItem} onClose={() => setEditItem(null)} onSave={saveEdit} categories={categories} stations={stations} isNew={!editItem.id} />
+      )}
+
+      {/* Bulk category rename (admin) */}
+      {renameOpen && isAdmin && (
+        <RenameCategoryModal
+          categories={categories}
+          counts={globalCatCounts}
+          initial={categoryFilter}
+          onClose={() => setRenameOpen(false)}
+          onRename={renameCategory}
+        />
       )}
     </div>
   );
@@ -1066,6 +1133,159 @@ function textToOptions(t: string): Array<{ label: string; choices: string[] }> {
     const choices = line.slice(i + 1).split(',').map(c => c.trim()).filter(Boolean);
     return label && choices.length >= 2 ? { label, choices } : null;
   }).filter((x): x is { label: string; choices: string[] } => !!x);
+}
+
+/**
+ * The dialog's copy of the server's name cleaning, kept character-for-character
+ * in step with `sanitizeCategoryName` / `foldCategoryName` in
+ * src/app/api/menu-items/rename-category/route.ts. If the two ever drift the
+ * dialog starts promising something the endpoint refuses (or worse, stops
+ * warning about a duplicate the endpoint will still create) — the server is
+ * always the boundary, this only decides what the admin is told before they
+ * press the button.
+ *
+ * Invisible characters are the whole reason this is not just `.trim()`: a
+ * pasted zero-width space made "breads" and "breads<U+200B>" two different
+ * categories that render identically, and neither the old client warning nor
+ * the old server refusal noticed.
+ */
+const SPACEY_CAT = /[\p{Zs}\t\n\r\f\v]+/gu;
+const FORMAT_OR_CONTROL_CAT = /[\p{Cf}\p{Cc}]/gu;
+function sanitizeCategoryName(s: string): string {
+  return String(s ?? '')
+    .normalize('NFC')
+    .replace(SPACEY_CAT, ' ')
+    .replace(FORMAT_OR_CONTROL_CAT, '')
+    .replace(/ {2,}/g, ' ')
+    .trim();
+}
+function foldCategoryName(s: string): string {
+  return sanitizeCategoryName(s).normalize('NFKC').toLowerCase();
+}
+
+/**
+ * Bulk-rename one menu category across every item in it.
+ *
+ * `counts` MUST be the unfiltered per-category totals (see globalCatCounts in
+ * the page): the rename moves every row on the old string, active or inactive,
+ * so quoting the view-scoped chip counts here would understate what happens.
+ *
+ * The dialog mirrors the server's refusal rather than pre-empting it: a target
+ * name already in use — exactly or ignoring case — disables the button and says
+ * why, and if the server refuses anyway (another admin created that name a
+ * second ago, or the CSV import did) the message lands in the error banner with
+ * the typing intact. It never offers to merge, because the endpoint will not.
+ */
+function RenameCategoryModal({ categories, counts, initial, onClose, onRename }: {
+  categories: string[];
+  counts: Record<string, number>;
+  initial: string;
+  onClose: () => void;
+  onRename: (from: string, to: string) => Promise<string | null>;
+}) {
+  const [from, setFrom] = useState(() => (initial && categories.includes(initial) ? initial : categories[0] || ''));
+  const [to, setTo] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const target = sanitizeCategoryName(to);
+  const count = counts[from] || 0;
+  // Source excluded on purpose: re-casing the SAME category ("Beer" → "BEER")
+  // is a rename, not a collision with itself. The server applies the same rule.
+  // Same fold as the server's refusal (see foldCategoryName above), so the
+  // dialog and the endpoint never disagree about what counts as an existing
+  // name — including names that differ only by invisible characters.
+  const clash = target
+    ? categories.find(c => c !== from && foldCategoryName(c) === foldCategoryName(target))
+    : undefined;
+  const unchanged = !!target && target === from;
+  const canRename = !!from && !!target && !clash && !unchanged && !saving;
+
+  const submit = async () => {
+    if (!canRename) return;
+    setSaving(true);
+    setError(null);
+    const err = await onRename(from, target);
+    // On success the parent closes this dialog, so only the failure path has to
+    // put the form back in a usable state.
+    if (err) { setError(err); setSaving(false); }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+      <div className="absolute inset-0 bg-black/40 backdrop-blur-sm" onClick={onClose} />
+      <div style={{ maxHeight: 'calc(100vh - 1.5rem)' }}
+           className="relative w-full max-w-lg bg-white border border-[#E8D5C4] rounded-2xl shadow-2xl flex flex-col overflow-hidden">
+        <div className="flex items-center justify-between px-6 py-4 border-b border-[#E8D5C4] shrink-0">
+          <div className="flex items-center gap-3">
+            <div className="p-2 rounded-lg bg-[#af4408]/10"><Edit className="w-5 h-5 text-[#af4408]" /></div>
+            <div>
+              <h2 className="text-lg font-semibold text-[#2D1B0E]">Rename Category</h2>
+              <p className="text-xs text-[#8B7355]">Renames it on every item at once. Names already in use are refused, never merged.</p>
+            </div>
+          </div>
+          <button onClick={onClose} className="p-1.5 rounded-lg hover:bg-[#FFF1E3]"><X className="w-5 h-5" /></button>
+        </div>
+
+        <div className="flex-1 min-h-0 overflow-y-auto px-6 py-5 space-y-4">
+          <div>
+            <label className="block text-xs font-medium text-[#6B5744] mb-1">Category to rename</label>
+            <select value={from} onChange={e => { setFrom(e.target.value); setError(null); }}
+                    className="w-full px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm">
+              {categories.map(c => <option key={c} value={c}>{c} · {counts[c] || 0} item{(counts[c] || 0) === 1 ? '' : 's'}</option>)}
+            </select>
+            <p className="text-[10px] text-[#8B7355] mt-0.5">
+              {count} item{count === 1 ? '' : 's'} carry this category, active and inactive — all of them move.
+            </p>
+          </div>
+
+          <div>
+            <label className="block text-xs font-medium text-[#6B5744] mb-1">New name</label>
+            <input type="text" value={to} autoFocus
+                   onChange={e => { setTo(e.target.value); setError(null); }}
+                   onKeyDown={e => { if (e.key === 'Enter') submit(); }}
+                   placeholder="e.g. small-plates-veg"
+                   className="w-full px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm" />
+            {clash && (
+              <p className="text-[11px] text-red-600 mt-1">
+                “{clash}” already exists ({counts[clash] || 0} item{(counts[clash] || 0) === 1 ? '' : 's'}). Renaming into it would merge the two categories, which this tool will not do — pick a name that is not in use. The check ignores capitalisation.
+              </p>
+            )}
+            {unchanged && !clash && (
+              <p className="text-[11px] text-[#8B7355] mt-1">That is already the name of this category.</p>
+            )}
+          </div>
+
+          <div className="rounded-xl border border-[#E8D5C4] bg-[#FFFBF5] p-3 space-y-1.5">
+            <p className="text-[11px] font-semibold text-[#8B5A2B] uppercase tracking-wide">What this changes</p>
+            <ul className="text-[11px] text-[#6B5744] space-y-1 list-disc pl-4">
+              <li>The <b>menu only</b>. Raw-material and liquor-store categories are a different list and are not touched, even where the name is identical.</li>
+              <li>Reports that read the live menu will show the new name for <b>past sales too</b> — that is what a rename means. Sales rows imported from the POS keep their own label, so the Sales page filter may still list the old one.</li>
+              <li>The guest QR menu heading changes — and because the guest menu&apos;s section order is a fixed list in the code, a renamed section <b>drops to the end</b> of its part of that menu. Only a developer can put it back in place, so avoid renaming a section you are happy with the position of.</li>
+              <li>Re-importing an <b>older menu CSV</b> puts the old name straight back on every item still listed in it (the import matches on Item ID and overwrites the category). Export a fresh CSV before your next import.</li>
+              <li>KOT routing, the kitchen display and stock deduction are keyed on <b>station</b>, not category — they are unaffected.</li>
+            </ul>
+          </div>
+        </div>
+
+        {error && (
+          <div className="flex items-start gap-2 mx-6 mt-3 px-3 py-2 bg-red-50 border border-red-200 rounded-lg shrink-0">
+            <AlertCircle className="w-4 h-4 text-red-500 shrink-0 mt-0.5" />
+            <p className="text-xs text-red-700">{error}</p>
+          </div>
+        )}
+
+        <div className="flex justify-end gap-3 px-6 py-3 border-t border-[#E8D5C4] shrink-0">
+          <button onClick={onClose} className="px-4 py-2 text-sm text-[#6B5744] bg-[#FFF1E3] rounded-lg hover:bg-[#E8D5C4]">Cancel</button>
+          <button onClick={submit} disabled={!canRename}
+                  className="flex items-center gap-2 px-5 py-2 bg-[#af4408] hover:bg-[#8a3506] disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg text-sm font-medium">
+            {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle className="w-4 h-4" />}
+            {saving ? 'Renaming…' : `Rename ${count} item${count === 1 ? '' : 's'}`}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 function EditItemModal({ item, onClose, onSave, categories, stations, isNew }: { item: MenuItem; onClose: () => void; onSave: (updates: any) => Promise<string | null>; categories: string[]; stations: string[]; isNew: boolean }) {
