@@ -165,6 +165,52 @@ import { todayIST } from './format-date';
  *     which is Rs per RECIPE unit, and never read the mixed-basis LPP column at
  *     all (see src/lib/closing-valuation.ts).
  *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * 7. THE DAY-WISE ROLLUP — a THIRD wrapper over the SAME base, never a re-key
+ * ═══════════════════════════════════════════════════════════════════════════
+ * getPurchaseBillDaySummary() answers "what did we buy on each date" for the
+ * store person reconciling a day's paperwork. It is deliberately in THIS file
+ * and calls the SAME private buildBase(), so both views are literally the same
+ * CASE expression and can never disagree about what a bill is. Do not export
+ * buildBase or copy billKeyExpr into another module.
+ *
+ * AGGREGATE PER BILL FIRST, THEN PER DAY. Grouping the base rows straight by
+ * p.date would count a bill once for every day it touches. Each bill is
+ * attributed to MIN(row_date) — the very value PurchaseBillRow.date already
+ * carries, so the two views agree by construction. MEASURED: 0 groups span more
+ * than one day today, so this costs nothing now and forecloses the bug later; a
+ * spanning bill lands WHOLE on its first day and the day row reports how many
+ * such bills it holds (spanning_bills) rather than splitting money across dates.
+ *
+ * THE BILL COUNT IS TWO NUMBERS, NEVER ONE. MEASURED: 33 of 34 purchase days on
+ * live hold ZERO numbered bills — April, which is 99.3% of the spend, is 100%
+ * DAY_RUN. A single "Bills" column would print 0 for the month that matters, so
+ * every day row carries `bills` (INV + GRN + BILL — identified documents) and
+ * `day_runs` (the DAY/ROW branch — a vendor's purchases that day, NOT a paper
+ * bill) separately, and `groups` only as their sum for reconciliation. The split
+ * is by KIND PREFIX, exactly as totals.day_run_bills is counted — never by
+ * bill_no_missing, which also catches the 28 GRN/INV bills that simply carry no
+ * vendor number.
+ *
+ * "TOTAL ITEMS" IS A LINE COUNT. `lines` is COUNT(*) of `purchases` rows, per §6.
+ * No quantity is summed anywhere here either.
+ *
+ * DO NOT SUM AN EM-DASH INTO A ZERO. A day that mixes PO/GRN receipts with
+ * hand-entered bills has charge columns that are PARTIAL, not complete: the
+ * receipts' tax and gross discount are on the GRN. MEASURED on 2026-08-07 a
+ * naive day GST cell prints Rs 1,125 while 29 taxed bills contribute a
+ * structural 0. So every day row ships po_receipt_bills / po_receipt_lines /
+ * po_receipt_value and charges_partial, the on-screen day table shows NO charge
+ * columns at all, and the day CSV carries a per-row charges note. Total purchase
+ * value is still the one legal grand total — with the booked-cost share printed
+ * beside it, never folded silently in.
+ *
+ * RECONCILIATION IS THE ACCEPTANCE TEST. With identical filters:
+ *   SUM(day.groups) = totals.bills · SUM(day.day_runs) = totals.day_run_bills
+ *   SUM(day.lines)  = totals.lines · SUM(day.total_bill_value) = totals.total_bill_value
+ * to the rupee. The totals themselves come from the SAME computeTotals() the
+ * bill view uses, so the strip above a day table is not a second opinion.
+ *
  * READ-ONLY. This file issues SELECTs and nothing else: no write statement of
  * any kind, no migration. Keep it that way — a report that mutates is a report
  * nobody can safely re-run, and a grep for the three SQL write verbs finding
@@ -286,6 +332,111 @@ export interface PurchaseBillSummaryResult {
   include_po_receipts: boolean;
 }
 
+/**
+ * ONE ROW PER PURCHASE DATE — the day-wise rollup, §7. Every count below is a
+ * count of BILLS (groups), not of `purchases` rows, except `lines`.
+ */
+export interface PurchaseBillDayRow {
+  /** The date, YYYY-MM-DD. A bill is attributed to MIN(date) of its group. */
+  day: string;
+  /** bills + day_runs. The reconciling figure: Σ groups = totals.bills. */
+  groups: number;
+  /**
+   * IDENTIFIED DOCUMENTS only — kinds INV, GRN and BILL. On live this is 0 on
+   * 33 of 34 days, which is exactly why it may never be merged with day_runs
+   * into a single "Bills" column.
+   */
+  bills: number;
+  /**
+   * The DAY/ROW branch: that vendor's purchases for that day, consolidated for
+   * reading. NOT paper bills — one may cover several physical bills. Counted by
+   * key prefix, the same test as totals.day_run_bills.
+   */
+  day_runs: number;
+  /**
+   * COUNT(DISTINCT LOWER(vendor)) across the day's bills, each bill counted
+   * under its own MIN(vendor). On a SINGLE-OUTLET all-DAY_RUN day this equals
+   * `day_runs` — the DAY key is vendor|date|outlet, so one vendor makes one
+   * group. That identity is expected, not a bug. It is NOT an invariant: the
+   * outlet is in the key, so one vendor buying for two outlets on one day makes
+   * TWO day-runs under ONE vendor (verified on a two-outlet fixture: day_runs 2,
+   * vendors 1). Never derive one of these two figures from the other.
+   */
+  vendors: number;
+  /** Bills whose lines name more than one vendor (0 today). Makes `vendors` honest. */
+  multi_vendor_bills: number;
+  /** Bills on this day whose lines also fall on a later date. See §7. */
+  spanning_bills: number;
+  /** COUNT(*) of `purchases` rows — the owner's "total items". Never a quantity. */
+  lines: number;
+  /** SUM(total_price) AS STORED. */
+  goods: number;
+  discount: number;
+  cgst: number;
+  sgst: number;
+  /** cgst + sgst. Neither cess is in here. */
+  gst: number;
+  compensation_cess: number;
+  special_excise_cess: number;
+  tcs: number;
+  delivery_charges: number;
+  mrp_round_off: number;
+  /** The day's total purchase value, same arithmetic as the bill view. */
+  total_bill_value: number;
+  /** How many of `groups` are PO/GRN receipts whose tax sits on the GRN. */
+  po_receipt_bills: number;
+  po_receipt_lines: number;
+  /** Their share of total_bill_value — BOOKED COST, not bill face value. */
+  po_receipt_value: number;
+  /**
+   * true when po_receipt_bills > 0: the charge figures above are PARTIAL for
+   * this day. Consumers must say so rather than printing them clean. See §7.
+   */
+  charges_partial: boolean;
+}
+
+/** One row per (day, vendor) — the owner's "vendor-wise bills", drilled down. */
+export interface PurchaseBillDayVendorRow {
+  day: string;
+  vendor: string;
+  groups: number;
+  bills: number;
+  day_runs: number;
+  lines: number;
+  goods: number;
+  discount: number;
+  cgst: number;
+  sgst: number;
+  gst: number;
+  compensation_cess: number;
+  special_excise_cess: number;
+  tcs: number;
+  delivery_charges: number;
+  mrp_round_off: number;
+  total_bill_value: number;
+  po_receipt_bills: number;
+  po_receipt_value: number;
+  charges_partial: boolean;
+}
+
+export interface PurchaseBillDaySummaryResult {
+  days: PurchaseBillDayRow[];
+  /** The per-day, per-vendor breakdown behind `days`. Ordered day DESC, value DESC. */
+  vendor_rows: PurchaseBillDayVendorRow[];
+  /** The SAME totals the bill view prints — Σ of `days` must equal them. */
+  totals: PurchaseBillTotals;
+  /** Distinct purchase days in the period, counted in SQL BEFORE any cap. */
+  day_count: number;
+  /** true when day_count exceeded BILL_SUMMARY_MAX_DAYS and `days` was capped. */
+  truncated: boolean;
+  /** true when the vendor breakdown hit its own cap — days are still complete. */
+  vendor_rows_truncated: boolean;
+  from: string;
+  to: string;
+  unnumbered: UnnumberedMode;
+  include_po_receipts: boolean;
+}
+
 export interface PurchaseBillFilters {
   from?: string | null;
   to?: string | null;
@@ -302,6 +453,22 @@ export interface PurchaseBillFilters {
  * computed by SQL over the FULL filtered set — the cap can never distort one.
  */
 export const BILL_SUMMARY_MAX_BILLS = 5_000;
+
+/**
+ * Hard cap on returned DAY rows. A day view returns at most one row per date
+ * that actually has purchases, so on live (34 days for the whole table) this can
+ * never bite; it exists so a decade-wide range cannot page the whole history
+ * into one response. `day_count` is counted in SQL before the cap, so
+ * `truncated` is exact rather than inferred.
+ */
+export const BILL_SUMMARY_MAX_DAYS = 1_100;
+
+/**
+ * Hard cap on the (day, vendor) breakdown rows. Live: ~350 for the whole table.
+ * Capped separately from the days so a wide range still returns COMPLETE day
+ * rows — the reconciling figures — and only loses drill-down detail.
+ */
+export const BILL_SUMMARY_MAX_DAY_VENDOR_ROWS = 20_000;
 
 const TOTALS_BASIS =
   'One source (the purchases table), so this grand total counts every rupee exactly once. '
@@ -462,15 +629,18 @@ function buildBase(f: {
 }
 
 /**
- * Build the purchase bill summary for a date range.
- *
- * SELECT only. The caller owns the management gate.
+ * Normalise the caller's filters ONCE, so the bill view and the day view run
+ * the same window, the same vendor match and the same PO-receipt default. Two
+ * copies of this parsing would be two chances for one view to answer for a
+ * period the other did not.
  */
-export function getPurchaseBillSummary(
-  filters: PurchaseBillFilters = {},
-  dbArg?: DatabaseT.Database,
-): PurchaseBillSummaryResult {
-  const db = dbArg || getDb();
+function normaliseFilters(filters: PurchaseBillFilters): {
+  from: string;
+  to: string;
+  vendor: string;
+  unnumbered: UnnumberedMode;
+  includePoReceipts: boolean;
+} {
   const { from, to } = resolveBillSummaryRange(filters.from, filters.to);
   const vendor = String(filters.vendor || '').trim();
   const unnumbered: UnnumberedMode =
@@ -482,11 +652,23 @@ export function getPurchaseBillSummary(
   const incStr = String(rawInc === undefined || rawInc === null ? '' : rawInc).trim().toLowerCase();
   const includePoReceipts = !(rawInc === false || incStr === '0' || incStr === 'false' || incStr === 'no');
 
-  const { sql: base, params } = buildBase({ from, to, vendor, unnumbered, includePoReceipts });
+  return { from, to, vendor, unnumbered, includePoReceipts };
+}
 
-  // ── TOTALS FIRST, over the FULL filtered set ──────────────────────────────
-  // Computed by the database, never by summing the (possibly capped) rows, so
-  // the cap can never quietly understate the spend.
+/**
+ * The period totals — a single aggregate over the FULL filtered set.
+ *
+ * Computed by the database, never by summing the (possibly capped) rows, so the
+ * cap can never quietly understate the spend. Shared by BOTH views so the strip
+ * above a day table is the same arithmetic as the strip above a bill table, and
+ * the day rows can be checked against it: a second copy of this SQL would be a
+ * second opinion about the same money.
+ */
+function computeTotals(
+  db: DatabaseT.Database,
+  base: string,
+  params: any[],
+): PurchaseBillTotals {
   const agg = db.prepare(`
     SELECT
       COUNT(DISTINCT bill_key)                                        AS bills,
@@ -510,7 +692,7 @@ export function getPurchaseBillSummary(
 
   const cgstT = num(agg?.cgst);
   const sgstT = num(agg?.sgst);
-  const totals: PurchaseBillTotals = {
+  return {
     bills: num(agg?.bills),
     lines: num(agg?.lines),
     goods: r2(agg?.goods),
@@ -530,6 +712,23 @@ export function getPurchaseBillSummary(
     day_run_bills: num(agg?.day_run_bills),
     basis: TOTALS_BASIS,
   };
+}
+
+/**
+ * Build the purchase bill summary for a date range.
+ *
+ * SELECT only. The caller owns the management gate.
+ */
+export function getPurchaseBillSummary(
+  filters: PurchaseBillFilters = {},
+  dbArg?: DatabaseT.Database,
+): PurchaseBillSummaryResult {
+  const db = dbArg || getDb();
+  const { from, to, vendor, unnumbered, includePoReceipts } = normaliseFilters(filters);
+  const { sql: base, params } = buildBase({ from, to, vendor, unnumbered, includePoReceipts });
+
+  // TOTALS FIRST, over the FULL filtered set — see computeTotals().
+  const totals = computeTotals(db, base, params);
 
   // ── ROWS ──────────────────────────────────────────────────────────────────
   // Newest bill first. vendor then bill_key are the tie-breaks, so the LIMIT
@@ -606,6 +805,231 @@ export function getPurchaseBillSummary(
     rows,
     totals,
     truncated: totals.bills > rows.length,
+    from,
+    to,
+    unnumbered,
+    include_po_receipts: includePoReceipts,
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DAY-WISE ROLLUP (§7) — the SAME base, aggregated per bill and then per day
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * ONE ROW PER BILL, carrying the day it belongs to. The day rollup and the
+ * vendor breakdown both wrap THIS, so they cannot disagree with each other or
+ * with the bill view about which day a bill fell on.
+ *
+ * `bill_day` is MIN(row_date) — the same value PurchaseBillRow.date carries.
+ * Grouping the base rows straight by p.date instead would count a bill that
+ * straddles midnight once per day it touches, and the day column would stop
+ * adding up to the period bill count. `bill_spans_days` rides along so the day
+ * that owns such a bill can say so rather than silently absorbing it.
+ *
+ * `is_day_run` is read off the KEY PREFIX, the identical test computeTotals()
+ * uses for day_run_bills — never off bill_no_missing, which would also catch the
+ * GRN/INV bills that merely carry no vendor number.
+ */
+function buildPerBill(base: string): string {
+  return `
+    SELECT
+      bill_key,
+      MIN(row_date)                                                        AS bill_day,
+      MIN(vendor)                                                          AS bill_vendor,
+      COUNT(DISTINCT LOWER(vendor))                                        AS bill_vendors,
+      CASE WHEN MAX(row_date) > MIN(row_date) THEN 1 ELSE 0 END            AS bill_spans_days,
+      CASE WHEN substr(bill_key, 1, 4) IN ('DAY:', 'ROW:') THEN 1 ELSE 0 END AS is_day_run,
+      MAX(is_po_receipt)                                                   AS is_po_receipt,
+      COUNT(*)                                                             AS lines,
+      COALESCE(SUM(goods), 0)                                              AS goods,
+      COALESCE(SUM(discount), 0)                                           AS discount,
+      COALESCE(SUM(cgst), 0)                                               AS cgst,
+      COALESCE(SUM(sgst), 0)                                               AS sgst,
+      COALESCE(SUM(compensation_cess), 0)                                  AS compensation_cess,
+      COALESCE(SUM(special_excise_cess), 0)                                AS special_excise_cess,
+      COALESCE(SUM(tcs), 0)                                                AS tcs,
+      COALESCE(SUM(delivery_charges), 0)                                   AS delivery_charges,
+      COALESCE(SUM(mrp_round_off), 0)                                      AS mrp_round_off,
+      COALESCE(SUM(line_total), 0)                                         AS total_bill_value
+    FROM (${base})
+    GROUP BY bill_key
+  `;
+}
+
+/**
+ * Build the DAY-WISE purchase rollup for a date range: one row per purchase
+ * date, for the store person reconciling a day's paperwork. See §7.
+ *
+ * SELECT only. The caller owns the management gate.
+ */
+export function getPurchaseBillDaySummary(
+  filters: PurchaseBillFilters = {},
+  dbArg?: DatabaseT.Database,
+): PurchaseBillDaySummaryResult {
+  const db = dbArg || getDb();
+  const { from, to, vendor, unnumbered, includePoReceipts } = normaliseFilters(filters);
+  const { sql: base, params } = buildBase({ from, to, vendor, unnumbered, includePoReceipts });
+
+  // The SAME totals object the bill view prints, from the SAME function — so a
+  // reader can add the day column up and check it against the strip above.
+  const totals = computeTotals(db, base, params);
+
+  const perBill = buildPerBill(base);
+
+  // Distinct purchase days BEFORE the cap, so `truncated` is exact rather than
+  // inferred from a full page of rows.
+  const dayCountRow = db.prepare(`
+    SELECT COUNT(*) AS days FROM (
+      SELECT bill_day FROM (${perBill}) GROUP BY bill_day
+    )
+  `).get(...params) as any;
+  const day_count = num(dayCountRow?.days);
+
+  // ── DAYS ──────────────────────────────────────────────────────────────────
+  // Newest day first, so a capped response keeps the days a reconciler is most
+  // likely to be looking for.
+  const rawDays = db.prepare(`
+    SELECT
+      bill_day                                                              AS day,
+      COUNT(*)                                                              AS groups,
+      COALESCE(SUM(CASE WHEN is_day_run = 1 THEN 0 ELSE 1 END), 0)          AS bills,
+      COALESCE(SUM(is_day_run), 0)                                          AS day_runs,
+      COUNT(DISTINCT LOWER(bill_vendor))                                    AS vendors,
+      COALESCE(SUM(CASE WHEN bill_vendors > 1 THEN 1 ELSE 0 END), 0)        AS multi_vendor_bills,
+      COALESCE(SUM(bill_spans_days), 0)                                     AS spanning_bills,
+      COALESCE(SUM(lines), 0)                                               AS lines,
+      COALESCE(SUM(goods), 0)                                               AS goods,
+      COALESCE(SUM(discount), 0)                                            AS discount,
+      COALESCE(SUM(cgst), 0)                                                AS cgst,
+      COALESCE(SUM(sgst), 0)                                                AS sgst,
+      COALESCE(SUM(compensation_cess), 0)                                   AS compensation_cess,
+      COALESCE(SUM(special_excise_cess), 0)                                 AS special_excise_cess,
+      COALESCE(SUM(tcs), 0)                                                 AS tcs,
+      COALESCE(SUM(delivery_charges), 0)                                    AS delivery_charges,
+      COALESCE(SUM(mrp_round_off), 0)                                       AS mrp_round_off,
+      COALESCE(SUM(total_bill_value), 0)                                    AS total_bill_value,
+      COALESCE(SUM(CASE WHEN is_po_receipt = 1 THEN 1 ELSE 0 END), 0)       AS po_receipt_bills,
+      COALESCE(SUM(CASE WHEN is_po_receipt = 1 THEN lines ELSE 0 END), 0)   AS po_receipt_lines,
+      COALESCE(SUM(CASE WHEN is_po_receipt = 1 THEN total_bill_value ELSE 0 END), 0) AS po_receipt_value
+    FROM (${perBill})
+    GROUP BY bill_day
+    ORDER BY day DESC
+    LIMIT ?
+  `).all(...params, BILL_SUMMARY_MAX_DAYS) as any[];
+
+  const days: PurchaseBillDayRow[] = rawDays.map((r) => {
+    const cgst = num(r.cgst);
+    const sgst = num(r.sgst);
+    const poBills = num(r.po_receipt_bills);
+    return {
+      day: String(r.day || ''),
+      groups: num(r.groups),
+      bills: num(r.bills),
+      day_runs: num(r.day_runs),
+      vendors: num(r.vendors),
+      multi_vendor_bills: num(r.multi_vendor_bills),
+      spanning_bills: num(r.spanning_bills),
+      lines: num(r.lines),
+      goods: r2(r.goods),
+      discount: r2(r.discount),
+      cgst: r2(cgst),
+      sgst: r2(sgst),
+      gst: r2(cgst + sgst),
+      compensation_cess: r2(r.compensation_cess),
+      special_excise_cess: r2(r.special_excise_cess),
+      tcs: r2(r.tcs),
+      delivery_charges: r2(r.delivery_charges),
+      mrp_round_off: r2(r.mrp_round_off),
+      total_bill_value: r2(r.total_bill_value),
+      po_receipt_bills: poBills,
+      po_receipt_lines: num(r.po_receipt_lines),
+      po_receipt_value: r2(r.po_receipt_value),
+      // Not "the tax is 0" but "part of this day's tax is not on these rows".
+      // Derived from the PO-receipt count for the same reason PurchaseBillRow
+      // derives tax_on_grn from the kind: a day of genuinely untaxed hand
+      // entries must keep printing its real zero. See §4 and §7.
+      charges_partial: poBills > 0,
+    };
+  });
+
+  // ── VENDOR BREAKDOWN ──────────────────────────────────────────────────────
+  // The owner's "vendor-wise bills". Kept as its own rows rather than a second
+  // count column on the day, because on an all-DAY_RUN day the group count IS
+  // the vendor count (the DAY key is vendor|date|outlet) and a column that
+  // always equals its neighbour tells a reconciler nothing. Highest value first
+  // inside a day: the day that looks wrong is usually one large indent.
+  const rawVendors = db.prepare(`
+    SELECT
+      bill_day                                                              AS day,
+      MIN(bill_vendor)                                                      AS vendor,
+      COUNT(*)                                                              AS groups,
+      COALESCE(SUM(CASE WHEN is_day_run = 1 THEN 0 ELSE 1 END), 0)          AS bills,
+      COALESCE(SUM(is_day_run), 0)                                          AS day_runs,
+      COALESCE(SUM(lines), 0)                                               AS lines,
+      COALESCE(SUM(goods), 0)                                               AS goods,
+      COALESCE(SUM(discount), 0)                                            AS discount,
+      COALESCE(SUM(cgst), 0)                                                AS cgst,
+      COALESCE(SUM(sgst), 0)                                                AS sgst,
+      COALESCE(SUM(compensation_cess), 0)                                   AS compensation_cess,
+      COALESCE(SUM(special_excise_cess), 0)                                 AS special_excise_cess,
+      COALESCE(SUM(tcs), 0)                                                 AS tcs,
+      COALESCE(SUM(delivery_charges), 0)                                    AS delivery_charges,
+      COALESCE(SUM(mrp_round_off), 0)                                       AS mrp_round_off,
+      COALESCE(SUM(total_bill_value), 0)                                    AS total_bill_value,
+      COALESCE(SUM(CASE WHEN is_po_receipt = 1 THEN 1 ELSE 0 END), 0)       AS po_receipt_bills,
+      COALESCE(SUM(CASE WHEN is_po_receipt = 1 THEN total_bill_value ELSE 0 END), 0) AS po_receipt_value
+    FROM (${perBill})
+    GROUP BY bill_day, LOWER(bill_vendor)
+    ORDER BY day DESC, total_bill_value DESC, vendor COLLATE NOCASE ASC
+    LIMIT ?
+  `).all(...params, BILL_SUMMARY_MAX_DAY_VENDOR_ROWS + 1) as any[];
+
+  // CAP + 1 fetched, then trimmed: asking for one row more than the cap is what
+  // makes `vendor_rows_truncated` EXACT. Testing `length >= CAP` on a CAP-sized
+  // fetch cannot tell "exactly full" from "there was more", so an exactly-full
+  // page printed "the breakdown is incomplete" over a complete one (reproduced
+  // on a 20,000-vendor-row fixture). The days have their own SQL pre-count and
+  // need no such trick; a second COUNT here would be a second scan of the same
+  // aggregate for one boolean.
+  const vendorRowsTruncated = rawVendors.length > BILL_SUMMARY_MAX_DAY_VENDOR_ROWS;
+  if (vendorRowsTruncated) rawVendors.length = BILL_SUMMARY_MAX_DAY_VENDOR_ROWS;
+
+  const vendor_rows: PurchaseBillDayVendorRow[] = rawVendors.map((r) => {
+    const cgst = num(r.cgst);
+    const sgst = num(r.sgst);
+    const poBills = num(r.po_receipt_bills);
+    return {
+      day: String(r.day || ''),
+      vendor: String(r.vendor || ''),
+      groups: num(r.groups),
+      bills: num(r.bills),
+      day_runs: num(r.day_runs),
+      lines: num(r.lines),
+      goods: r2(r.goods),
+      discount: r2(r.discount),
+      cgst: r2(cgst),
+      sgst: r2(sgst),
+      gst: r2(cgst + sgst),
+      compensation_cess: r2(r.compensation_cess),
+      special_excise_cess: r2(r.special_excise_cess),
+      tcs: r2(r.tcs),
+      delivery_charges: r2(r.delivery_charges),
+      mrp_round_off: r2(r.mrp_round_off),
+      total_bill_value: r2(r.total_bill_value),
+      po_receipt_bills: poBills,
+      po_receipt_value: r2(r.po_receipt_value),
+      charges_partial: poBills > 0,
+    };
+  });
+
+  return {
+    days,
+    vendor_rows,
+    totals,
+    day_count,
+    truncated: day_count > days.length,
+    vendor_rows_truncated: vendorRowsTruncated,
     from,
     to,
     unnumbered,
@@ -694,4 +1118,215 @@ export function purchaseBillSummaryToCsv(rows: PurchaseBillRow[]): string {
 /** Filename the download must use: purchase-bill-summary-<from>_<to>.csv */
 export function purchaseBillSummaryFilename(from: string, to: string): string {
   return `purchase-bill-summary-${from}_${to}.csv`;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DAY-WISE CSV — its OWN columns. PURCHASE_BILL_COLUMNS is not widened to serve
+// both: the route pads its caption rows to a column array's length, so one
+// array feeding two shapes would put a period total under the wrong heading.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * The flat shape the day CSV writes. ONE width for both kinds of row so the file
+ * stays a rectangle Excel can sort and filter: a DAY row is the reconciling
+ * line, and the VENDOR rows immediately beneath it break that same day down.
+ * `Row Type` is column one so a reader can filter to DAY and get exactly the
+ * day table they saw on screen.
+ */
+export interface PurchaseBillDayCsvRow {
+  row_type: 'DAY' | 'VENDOR';
+  day: string;
+  /** '' on a DAY row. */
+  vendor: string;
+  bills: number;
+  day_runs: number;
+  groups: number;
+  /** '' on a VENDOR row — a vendor breakdown line is one vendor by definition. */
+  vendors: number | '';
+  /**
+   * '' on a VENDOR row. Both of these are properties of the DAY's set of bills,
+   * and both exist to stop a neighbouring column being read as more than it is:
+   * `vendors` counts each bill under its MIN(vendor) and the VENDOR rows below
+   * are grouped the same way, so a bill naming two vendors is filed wholly under
+   * the first and the second appears NOWHERE in this file unless this count says
+   * so. `spanning_bills` says the same about the Date column.
+   */
+  multi_vendor_bills: number | '';
+  spanning_bills: number | '';
+  lines: number;
+  goods: number;
+  discount: number;
+  gst: number;
+  cgst: number;
+  sgst: number;
+  compensation_cess: number;
+  special_excise_cess: number;
+  tcs: number;
+  delivery_charges: number;
+  mrp_round_off: number;
+  total_bill_value: number;
+  po_receipt_bills: number;
+  po_receipt_value: number;
+  charges_note: string;
+}
+
+export interface PurchaseBillDayColumn {
+  key: string;
+  label: string;
+  numeric?: boolean;
+  value: (r: PurchaseBillDayCsvRow) => unknown;
+}
+
+/**
+ * Day columns, in the order the screen shows them, then the charge split.
+ *
+ * "Bills (numbered)" and "Vendor day-runs" are deliberately TWO columns with a
+ * "Groups" total beside them, never one "Bills" figure — 33 of 34 purchase days
+ * on live hold zero numbered bills, so a single column would hand the store
+ * person a month of zeros to reconcile against (§7).
+ *
+ * "Item Lines" is a COUNT of purchase rows. It is NOT a quantity and must never
+ * become one: a day spans kg, BTL and CASE lines (§6).
+ *
+ * The trailing charge columns are PARTIAL on any day holding a PO/GRN receipt,
+ * which is why every such row carries the Charges Note — this file gets opened
+ * cold by someone who never saw the screen's badges.
+ */
+export const PURCHASE_BILL_DAY_COLUMNS: PurchaseBillDayColumn[] = [
+  { key: 'row_type',            label: 'Row Type',                            value: r => r.row_type },
+  { key: 'day',                 label: 'Date',                                value: r => r.day },
+  { key: 'vendor',              label: 'Vendor',                              value: r => r.vendor },
+  { key: 'bills',               label: 'Bills (numbered)', numeric: true,     value: r => r.bills },
+  { key: 'day_runs',            label: 'Vendor Day-Runs (no bill no)', numeric: true, value: r => r.day_runs },
+  { key: 'groups',              label: 'Groups (bills + day-runs)', numeric: true,    value: r => r.groups },
+  { key: 'vendors',             label: 'Vendors', numeric: true,              value: r => r.vendors },
+  // These two qualify the columns beside them and are written PER ROW, not as a
+  // footer: a reader who filters this sheet to one date keeps its caveats and
+  // loses only other days'. Zero on live today, which is exactly when a silent
+  // column is easiest to leave out and hardest to notice missing later.
+  { key: 'multi_vendor_bills',  label: 'Multi-Vendor Bills (Vendor col names the first only)', numeric: true, value: r => r.multi_vendor_bills },
+  { key: 'spanning_bills',      label: 'Bills Also Dated Later (counted whole on this date)', numeric: true,  value: r => r.spanning_bills },
+  { key: 'lines',               label: 'Item Lines', numeric: true,           value: r => r.lines },
+  { key: 'goods',               label: 'Goods (Rs)', numeric: true,             value: r => r.goods },
+  { key: 'discount',            label: 'Discount (Rs)', numeric: true,          value: r => r.discount },
+  { key: 'gst',                 label: 'GST = CGST+SGST (Rs)', numeric: true,   value: r => r.gst },
+  { key: 'cgst',                label: 'CGST (Rs)', numeric: true,              value: r => r.cgst },
+  { key: 'sgst',                label: 'SGST (Rs)', numeric: true,              value: r => r.sgst },
+  { key: 'compensation_cess',   label: 'Compensation Cess (Rs)', numeric: true, value: r => r.compensation_cess },
+  { key: 'special_excise_cess', label: 'Spl Excise Cess (Rs)', numeric: true,   value: r => r.special_excise_cess },
+  { key: 'tcs',                 label: 'TCS (Rs)', numeric: true,               value: r => r.tcs },
+  { key: 'delivery_charges',    label: 'Delivery Charges (Rs)', numeric: true,  value: r => r.delivery_charges },
+  { key: 'mrp_round_off',       label: 'MRP Round Off (Rs)', numeric: true,     value: r => r.mrp_round_off },
+  { key: 'total_bill_value',    label: 'Total Purchase Value (Rs)', numeric: true, value: r => r.total_bill_value },
+  { key: 'po_receipt_bills',    label: 'Of Which PO/GRN Bills', numeric: true,  value: r => r.po_receipt_bills },
+  { key: 'po_receipt_value',    label: 'Of Which Booked Cost (Rs)', numeric: true, value: r => r.po_receipt_value },
+  { key: 'charges_note',        label: 'Charges Note',                        value: r => r.charges_note },
+];
+
+/**
+ * The one sentence that stops a partial charge column being read as a complete
+ * one. Written per row, not once in a caption, because a reader filtering the
+ * sheet to a single day would otherwise lose the caveat with the other rows.
+ */
+function dayChargesNote(poBills: number, poValue: number): string {
+  if (poBills <= 0) return '';
+  return `${poBills} of these came from a PO receipt / GRN — their tax and gross discount are recorded on the GRN, `
+    + `NOT on these cost rows, so the charge columns are PARTIAL and Rs ${poValue} of the total is BOOKED COST.`;
+}
+
+function dayToCsvRow(d: PurchaseBillDayRow): PurchaseBillDayCsvRow {
+  return {
+    row_type: 'DAY',
+    day: d.day,
+    vendor: '',
+    bills: d.bills,
+    day_runs: d.day_runs,
+    groups: d.groups,
+    vendors: d.vendors,
+    multi_vendor_bills: d.multi_vendor_bills,
+    spanning_bills: d.spanning_bills,
+    lines: d.lines,
+    goods: d.goods,
+    discount: d.discount,
+    gst: d.gst,
+    cgst: d.cgst,
+    sgst: d.sgst,
+    compensation_cess: d.compensation_cess,
+    special_excise_cess: d.special_excise_cess,
+    tcs: d.tcs,
+    delivery_charges: d.delivery_charges,
+    mrp_round_off: d.mrp_round_off,
+    total_bill_value: d.total_bill_value,
+    po_receipt_bills: d.po_receipt_bills,
+    po_receipt_value: d.po_receipt_value,
+    charges_note: dayChargesNote(d.po_receipt_bills, d.po_receipt_value),
+  };
+}
+
+function dayVendorToCsvRow(v: PurchaseBillDayVendorRow): PurchaseBillDayCsvRow {
+  return {
+    row_type: 'VENDOR',
+    day: v.day,
+    vendor: v.vendor,
+    bills: v.bills,
+    day_runs: v.day_runs,
+    groups: v.groups,
+    vendors: '',
+    // Blank, NOT 0. The vendor breakdown groups bills by MIN(vendor) exactly as
+    // `vendors` counts them, so a multi-vendor or spanning bill is a fact about
+    // the DAY row above; printing 0 here would assert this vendor's slice is
+    // free of both, which this query never established.
+    multi_vendor_bills: '',
+    spanning_bills: '',
+    lines: v.lines,
+    goods: v.goods,
+    discount: v.discount,
+    gst: v.gst,
+    cgst: v.cgst,
+    sgst: v.sgst,
+    compensation_cess: v.compensation_cess,
+    special_excise_cess: v.special_excise_cess,
+    tcs: v.tcs,
+    delivery_charges: v.delivery_charges,
+    mrp_round_off: v.mrp_round_off,
+    total_bill_value: v.total_bill_value,
+    po_receipt_bills: v.po_receipt_bills,
+    po_receipt_value: v.po_receipt_value,
+    charges_note: dayChargesNote(v.po_receipt_bills, v.po_receipt_value),
+  };
+}
+
+/**
+ * Serialise the day rollup: each DAY row followed immediately by the VENDOR rows
+ * that make it up, so the sheet reads top-down the way the screen expands.
+ * Returns the body WITHOUT the UTF-8 BOM — the caller prepends it.
+ *
+ * Vendor rows for a day the `days` cap dropped are dropped too: a breakdown with
+ * no day above it would read as an orphan total.
+ */
+export function purchaseBillDaySummaryToCsv(
+  days: PurchaseBillDayRow[],
+  vendorRows: PurchaseBillDayVendorRow[],
+): string {
+  const byDay = new Map<string, PurchaseBillDayVendorRow[]>();
+  for (const v of vendorRows) {
+    const list = byDay.get(v.day);
+    if (list) list.push(v); else byDay.set(v.day, [v]);
+  }
+
+  const out: string[] = [PURCHASE_BILL_DAY_COLUMNS.map(c => csvCell(c.label, false)).join(',')];
+  const write = (r: PurchaseBillDayCsvRow) =>
+    out.push(PURCHASE_BILL_DAY_COLUMNS.map(c => csvCell(c.value(r), !!c.numeric)).join(','));
+
+  for (const d of days) {
+    write(dayToCsvRow(d));
+    for (const v of byDay.get(d.day) || []) write(dayVendorToCsvRow(v));
+  }
+  return out.join('\r\n');
+}
+
+/** Filename the day download must use — distinct from the bill view's, so a
+ *  forwarded file never claims to be the other report. */
+export function purchaseBillDaySummaryFilename(from: string, to: string): string {
+  return `purchase-bill-day-summary-${from}_${to}.csv`;
 }

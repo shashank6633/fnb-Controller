@@ -2,9 +2,13 @@ import { getCurrentUser, isManagement } from '@/lib/auth';
 import { todayIST } from '@/lib/format-date';
 import {
   getPurchaseBillSummary,
+  getPurchaseBillDaySummary,
   purchaseBillSummaryToCsv,
   purchaseBillSummaryFilename,
+  purchaseBillDaySummaryToCsv,
+  purchaseBillDaySummaryFilename,
   PURCHASE_BILL_COLUMNS,
+  PURCHASE_BILL_DAY_COLUMNS,
 } from '@/lib/purchase-bill-summary';
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -79,6 +83,38 @@ import {
  * product anywhere in it and nothing for scripts/check-rate-basis.js to judge.
  * Adding an "avg rate" column would create that pairing; declare its basis if
  * you ever do.
+ *
+ * ─────────────────────────────────────────────────────────────────────────
+ * ?view=day — THE DAY-WISE ROLLUP (same gate, same source, same bill key)
+ * ─────────────────────────────────────────────────────────────────────────
+ * ?view=day answers "what did we buy on each date" for the store person
+ * reconciling a day's paperwork: date · numbered bills · vendor day-runs ·
+ * vendors · item lines · total purchase value, plus a per-day per-vendor
+ * breakdown. It is served by getPurchaseBillDaySummary(), a THIRD wrapper over
+ * the SAME base SELECT in the same lib file — NOT a second query, NOT a second
+ * definition of a bill, and NOT a new page (the route and the nav entry already
+ * exist, so page-catalog.ts and Sidebar.tsx are untouched). Both views run this
+ * one GET behind the one management gate.
+ *
+ * TWO COUNTS, NEVER ONE. MEASURED on live: 33 of 34 purchase days hold ZERO
+ * numbered bills, and April — 99.3% of the spend — is 100% day-runs. A single
+ * "Bills" column would hand the store person a month of zeros, so `bills`
+ * (identified documents) and `day_runs` (vendor-day consolidations) are
+ * separate on the row, in the JSON and in the CSV, with `groups` as their sum
+ * for reconciliation only.
+ *
+ * THE EM-DASH RULE SURVIVES THE AGGREGATE. A day mixing PO/GRN receipts with
+ * hand-entered bills has PARTIAL charge columns — the receipts' tax is on the
+ * GRN. Such days carry po_receipt_* and charges_partial, the screen shows no
+ * per-day charge columns at all, and every affected CSV row carries its own
+ * Charges Note. Do not "simplify" that into a clean per-day GST cell: on
+ * 2026-08-07 it would print Rs 1,125 while 29 taxed bills contribute a
+ * structural zero.
+ *
+ * RECONCILIATION: Σ day.groups = totals.bills, Σ day.lines = totals.lines,
+ * Σ day.total_bill_value = totals.total_bill_value, Σ day.day_runs =
+ * totals.day_run_bills — to the rupee, because `totals` is the SAME object the
+ * bill view returns, from the same function.
  * ══════════════════════════════════════════════════════════════════════════ */
 
 // A purchase report served from cache is a wrong purchase report — a bill keyed
@@ -130,24 +166,34 @@ function csvCell(v: unknown): string {
   return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
 
-// Where a caption's number goes: under the last money column, so a reader
-// scanning the right-hand edge of the sheet finds the period figure directly
-// beneath the column it totals.
-const TOTAL_COL = PURCHASE_BILL_COLUMNS.findIndex(c => c.key === 'total_bill_value');
-
 /**
- * A caption row with the SAME field count as the header and every data row.
- * Built from PURCHASE_BILL_COLUMNS.length rather than a hand-typed run of
- * commas: a column added to the table and not to the captions would otherwise
- * shift the totals under the wrong heading, which on a money report is the
- * worst possible silent failure.
+ * Bind a caption writer to ONE column array, so a caption row always has the
+ * SAME field count as the header and every data row of the file it is in.
+ *
+ * Built from the array's length rather than a hand-typed run of commas: a column
+ * added to the table and not to the captions would otherwise shift the totals
+ * under the wrong heading, which on a money report is the worst possible silent
+ * failure. It is a factory rather than one function because the bill view and
+ * the day view have DIFFERENT column arrays — feeding both from one array would
+ * put a day total under a bill heading, which is the same failure by another
+ * route.
+ *
+ * The caption's number goes under the last money column, so a reader scanning
+ * the right-hand edge of the sheet finds the period figure directly beneath the
+ * column it totals.
  */
-function captionRow(label: string, value?: number): string {
-  const cells = PURCHASE_BILL_COLUMNS.map(() => '');
-  cells[0] = label;
-  if (value !== undefined && TOTAL_COL >= 0) cells[TOTAL_COL] = String(value);
-  return cells.map(csvCell).join(',');
+function makeCaptionRow(columns: { key: string }[], totalKey: string) {
+  const totalCol = columns.findIndex(c => c.key === totalKey);
+  return function captionRow(label: string, value?: number): string {
+    const cells = columns.map(() => '');
+    cells[0] = label;
+    if (value !== undefined && totalCol >= 0) cells[totalCol] = String(value);
+    return cells.map(csvCell).join(',');
+  };
 }
+
+const captionRow = makeCaptionRow(PURCHASE_BILL_COLUMNS, 'total_bill_value');
+const dayCaptionRow = makeCaptionRow(PURCHASE_BILL_DAY_COLUMNS, 'total_bill_value');
 
 const r2 = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
 
@@ -233,10 +279,172 @@ export async function GET(req: Request) {
     }
     const include_po_receipts = rawIncludePo !== '0';
 
+    // Which rollup: one row per BILL (the original report) or one row per DAY
+    // (the store person's reconciliation view). Validated against the two legal
+    // values exactly like format/unnumbered above — a typo must 400, never fall
+    // back to the other view and answer a question nobody asked. Both modes sit
+    // behind the SAME management gate above; there is no second entry point.
+    const rawView = sp.get('view');
+    if (rawView !== null && rawView !== 'bill' && rawView !== 'day') {
+      return Response.json(
+        { error: `Invalid 'view' "${rawView}" — expected bill or day.` },
+        { status: 400 },
+      );
+    }
+    const view: 'bill' | 'day' = (rawView as 'bill' | 'day') ?? 'bill';
+
     // Free text, LIKE-contains in the lib — a datalist on the page constrains
     // nothing, and vendor names are keyed by hand with inconsistent case and
     // spacing. Passed through unchanged; the lib parameterises it.
     const vendor = (sp.get('vendor') || '').trim();
+
+    // ── DAY-WISE ROLLUP ───────────────────────────────────────────────────
+    // A THIRD wrapper over the same base SELECT in the same lib file, so the
+    // two views cannot disagree about what a bill is or which day it fell on.
+    // `totals` is the SAME object the bill view returns, which is what makes
+    // the day column checkable: it must add up to the strip above it.
+    if (view === 'day') {
+      const daySummary = getPurchaseBillDaySummary({
+        from,
+        to,
+        vendor,
+        unnumbered,
+        include_po_receipts,
+      });
+      const { days, vendor_rows, totals: dayTotals, day_count } = daySummary;
+
+      if (rawFormat === 'csv') {
+        const lines: string[] = [purchaseBillDaySummaryToCsv(days, vendor_rows)];
+
+        lines.push(dayCaptionRow(''));
+        lines.push(dayCaptionRow(
+          `TOTAL PURCHASE VALUE — ${day_count} purchase day${day_count === 1 ? '' : 's'}, `
+          + `${dayTotals.lines} item lines, period ${from} to ${to} (IST). `
+          + 'Goods less discount plus CGST+SGST, both cesses, TCS, delivery and MRP round-off. '
+          + 'Filter the Row Type column to DAY and this figure is the sum of that column.',
+          r2(dayTotals.total_bill_value),
+        ));
+        // THE central caveat of this view. A single "bills per day" number would
+        // be a lie on live data: most days hold no numbered bill at all.
+        lines.push(dayCaptionRow(
+          `Of the ${dayTotals.bills} groups in this period, ${dayTotals.bills - dayTotals.day_run_bills} are NUMBERED BILLS `
+          + `(our invoice id, a GRN, or the vendor's own bill number) and ${dayTotals.day_run_bills} are VENDOR DAY-RUNS with no bill `
+          + 'number anywhere — '
+          // The DEFINITION of a day-run changes with the mode, so this clause has
+          // to change with it. Under split each day-run IS one purchase line, and
+          // calling it "consolidated into one line" here — six rows above the MODE
+          // caption that says the opposite — put two contradictory definitions of
+          // the same column inside one file.
+          + (unnumbered === 'split'
+            ? 'under unnumbered=split each one is a SINGLE purchase line of that vendor rather than a day consolidation, so '
+            : "that vendor's purchases for that day consolidated into one line for reading. A day-run may cover more "
+              + 'than one physical bill or market run, so ')
+          + 'the two counts are kept in SEPARATE columns and must not be added into a '
+          + '"bills per day" figure. Both period counts are computed in SQL over the whole period, not off the rows in this file.',
+        ));
+        lines.push(dayCaptionRow(
+          '"Item Lines" is a COUNT of purchase rows, NOT a quantity. A day spans kg, BTL and CASE lines, so a summed quantity '
+          + 'would be a number with no unit. There is deliberately no quantity and no rate column in this file.',
+        ));
+        // Only when one actually occurred. Both are 0 on today's data, so this
+        // caption stays out of the file a store person normally opens — and the
+        // day it appears, it is about a row in front of them. The per-row columns
+        // carry the fact regardless; this only explains what they mean.
+        const mvBills = days.reduce((s, d) => s + (d.multi_vendor_bills || 0), 0);
+        const spBills = days.reduce((s, d) => s + (d.spanning_bills || 0), 0);
+        if (mvBills > 0 || spBills > 0) {
+          lines.push(dayCaptionRow(
+            `${mvBills} bill${mvBills === 1 ? '' : 's'} in this period name MORE THAN ONE VENDOR and ${spBills} also carry a LATER DATE. `
+            + 'Both are filed WHOLE under ONE of their vendor names and their EARLIEST date, so '
+            + 'the other vendor does NOT get a VENDOR row of its own and the later date does NOT get that money. The two columns beside '
+            + '"Vendors" count exactly which days are affected; open the By bill view for those bills line by line.',
+          ));
+        }
+        lines.push(dayCaptionRow(
+          `Goods subtotal ${r2(dayTotals.goods)} · Discount ${r2(dayTotals.discount)} · GST (CGST+SGST) ${r2(dayTotals.gst)} `
+          + `· Compensation Cess ${r2(dayTotals.compensation_cess)} · Special Excise Cess ${r2(dayTotals.special_excise_cess)} `
+          + `· TCS ${r2(dayTotals.tcs)} · Delivery ${r2(dayTotals.delivery_charges)} · MRP Round-off ${r2(dayTotals.mrp_round_off)}`,
+        ));
+        lines.push(dayCaptionRow(
+          'GST above is CGST+SGST ONLY. The two cess columns are separate levies on a different base '
+          + 'and are deliberately NOT inside the GST figure — do not add them into a GST return.',
+        ));
+        // The em-dash rule carried into the aggregate: on a day holding a PO/GRN
+        // receipt the charge columns are PARTIAL, and every such row says so in
+        // its own Charges Note rather than relying on this caption surviving a
+        // filter or a sort.
+        lines.push(dayCaptionRow(
+          `${dayTotals.po_receipt_bills} of the ${dayTotals.bills} groups came from a PO receipt or GRN. Their tax and gross discount `
+          + 'are recorded on the GRN document, NOT on these cost rows, so on any day containing one the Discount / GST / cess columns '
+          + 'are PARTIAL and that share of the value is BOOKED COST (goods + allocated delivery), not vendor bill face value. The '
+          + '"Of Which" columns and the per-row Charges Note mark exactly which days and vendors are affected.',
+          r2(dayTotals.po_receipt_value),
+        ));
+        // A bill is attributed to MIN(date) of its group, so a bill spanning
+        // midnight lands WHOLE on its first day. State the rule: a reader
+        // comparing a day against a delivery note must know it is not split.
+        lines.push(dayCaptionRow(
+          'A bill is counted ONCE, on the first date it carries. A bill whose lines span two dates is NOT split across days — its '
+          + 'whole value sits on its first day, which is why the day column adds up to the period total exactly.',
+        ));
+        // The unnumbered mode CHANGES what a per-day group count means: under
+        // split, groups collapse to lines. Echo it, or a ticked checkbox turns
+        // "bills per day" into "lines per day" with no visible change of caption.
+        lines.push(dayCaptionRow(
+          unnumbered === 'split'
+            ? 'MODE: unnumbered=SPLIT — un-numbered purchases are one group per purchase line, so the Vendor Day-Runs column counts '
+              + 'LINES, not vendor-days. Re-download with unnumbered=group for the consolidated view.'
+            : 'MODE: unnumbered=GROUP (the default) — un-numbered purchases are consolidated per vendor per day, so the Vendor '
+              + 'Day-Runs column counts vendor-days. Re-download with unnumbered=split for one group per purchase line.',
+        ));
+        lines.push(dayCaptionRow(dayTotals.basis));
+        if (!include_po_receipts) {
+          lines.push(dayCaptionRow('FILTERED: PO/GRN receipts were EXCLUDED from this file (include_po_receipts=0). Hand-entered bills only.'));
+        }
+        if (vendor) lines.push(dayCaptionRow(`FILTERED: vendor contains "${vendor}".`));
+        if (daySummary.truncated) {
+          lines.push(dayCaptionRow(
+            `!! TRUNCATED — this period holds ${day_count} purchase days and only the ${days.length} most recent were written. The totals `
+            + 'are computed in SQL over the full period and remain correct, so they will NOT equal the sum of the day rows above. '
+            + 'Narrow the date range and download again.',
+          ));
+        }
+        if (daySummary.vendor_rows_truncated) {
+          lines.push(dayCaptionRow(
+            '!! The per-vendor breakdown rows hit their limit and are incomplete. The DAY rows are still complete and correct — '
+            + 'filter the Row Type column to DAY.',
+          ));
+        }
+
+        const csv = '﻿' + lines.join('\r\n');
+        return new Response(csv, {
+          status: 200,
+          headers: {
+            'Content-Type': 'text/csv; charset=utf-8',
+            'Content-Disposition': `attachment; filename="${purchaseBillDaySummaryFilename(from, to)}"`,
+            'Cache-Control': 'no-store',
+          },
+        });
+      }
+
+      return Response.json(
+        {
+          view: 'day',
+          days,
+          vendor_rows,
+          totals: dayTotals,
+          day_count,
+          truncated: daySummary.truncated,
+          vendor_rows_truncated: daySummary.vendor_rows_truncated,
+          from,
+          to,
+          vendor,
+          unnumbered,
+          include_po_receipts: include_po_receipts ? 1 : 0,
+        },
+        { headers: { 'Cache-Control': 'no-store' } },
+      );
+    }
 
     const { rows, totals, truncated } = getPurchaseBillSummary({
       from,
@@ -325,7 +533,9 @@ export async function GET(req: Request) {
     return Response.json(
       // include_po_receipts echoes back as the 0/1 the caller sent, not a
       // boolean, so the page can round-trip its own query string unchanged.
-      { rows, totals, truncated, from, to, vendor, unnumbered, include_po_receipts: include_po_receipts ? 1 : 0 },
+      // `view` echoes too, so a client holding two responses can tell which
+      // rollup it is looking at without inspecting the shape.
+      { view: 'bill', rows, totals, truncated, from, to, vendor, unnumbered, include_po_receipts: include_po_receipts ? 1 : 0 },
       { headers: { 'Cache-Control': 'no-store' } },
     );
   } catch (e: any) {

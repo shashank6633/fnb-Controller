@@ -42,14 +42,32 @@
  * report shows a LINES count instead. That is also why the rate-basis lock has nothing
  * to judge here — there is no rate × quantity pairing on this screen. An "avg rate"
  * column would create one; do not add it without reading scripts/check-rate-basis.js.
+ *
+ * TWO VIEWS, ONE REPORT. The pill row switches between BY BILL (the original table)
+ * and BY DAY (?view=day) — the store person's reconciliation rollup: date, numbered
+ * bills, vendor day-runs, vendors, item lines and total purchase value, with a
+ * per-vendor drill-down on each day. It is a MODE on this page and not a new route, so
+ * page-catalog.ts and Sidebar.tsx stay untouched (a catalog entry without a matching
+ * Sidebar entry is gated but invisible). The day rows are aggregated in SQL, never by
+ * folding the loaded `rows` array — those are capped by the server and filtered again
+ * by the search box, so a client-side rollup would quietly disagree with the totals
+ * strip above it.
+ *
+ * THE DAY VIEW NEVER PRINTS ONE "BILLS" NUMBER. Measured on live, 33 of 34 purchase
+ * days hold ZERO numbered bills and April — 99.3% of the spend — is entirely
+ * un-numbered, so a single Bills column would be a month of zeros to reconcile
+ * against. Numbered bills and vendor day-runs are separate columns. And the day table
+ * shows NO charge columns at all: on a day mixing PO/GRN receipts with hand-entered
+ * bills the tax is partial (it lives on the GRN), so a clean per-day GST cell would be
+ * the em-dash summed into a zero. The CSV carries the charges with a per-row note.
  */
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { Fragment, useCallback, useEffect, useMemo, useState } from 'react';
 import Link from 'next/link';
 import { todayIST } from '@/lib/format-date';
 import {
   ReceiptText, Building2, Download, Loader2, Info, AlertTriangle,
-  ShoppingCart, TrendingUp, Layers,
+  ShoppingCart, TrendingUp, Layers, CalendarDays, ChevronRight, ChevronDown, Users,
 } from 'lucide-react';
 
 /* These mirror the exported shapes in src/lib/purchase-bill-summary.ts. They are
@@ -104,14 +122,84 @@ interface BillTotals {
   po_receipt_bills: number;
   po_receipt_lines: number;
   po_receipt_value: number;
+  /** How many of `bills` carry no vendor bill number — SQL over the FULL period,
+   *  so the day view can state an exact figure instead of counting loaded rows. */
+  day_run_bills: number;
   /** Rendered VERBATIM beside the grand total — it is the guard on misreading it. */
   basis: string;
 }
 
 interface BillResponse {
+  view?: 'bill';
   rows: BillRow[];
   totals: BillTotals;
   truncated: boolean;
+  from: string;
+  to: string;
+}
+
+/* ── DAY VIEW ───────────────────────────────────────────────────────────────
+ * Mirrors PurchaseBillDayRow / PurchaseBillDayVendorRow in the lib. Same
+ * re-declaration rule as above: the compiler cannot catch drift here.
+ *
+ * The API also sends discount / cgst / sgst / gst / both cesses / tcs / delivery
+ * / mrp_round_off on every day row. They are DELIBERATELY not mirrored here and
+ * deliberately not rendered: on a day holding a PO/GRN receipt those figures are
+ * PARTIAL — the receipt's tax lives on the GRN — so a clean per-day GST cell
+ * would be exactly the em-dash-summed-into-a-zero this report exists to avoid.
+ * The CSV carries them, with a per-row Charges Note attached. Do not add them to
+ * this table without reading §7 of src/lib/purchase-bill-summary.ts first. */
+
+interface DayRow {
+  day: string;
+  /** bills + day_runs. Σ groups over the days = totals.bills, exactly. */
+  groups: number;
+  /** IDENTIFIED documents only (INV / GRN / BILL). 0 on most real days. */
+  bills: number;
+  /** The no-bill-number branch: a vendor's purchases that day. NOT paper bills. */
+  day_runs: number;
+  /** On a SINGLE-OUTLET all-day-run day this equals day_runs — the key is
+   *  vendor|date|outlet, so one vendor makes one group. Expected, not a bug —
+   *  but not an invariant: one vendor buying for two outlets on one day makes
+   *  two day-runs under one vendor. Never derive one figure from the other. */
+  vendors: number;
+  multi_vendor_bills: number;
+  /** Bills on this day whose lines also fall on a later date. */
+  spanning_bills: number;
+  /** COUNT(*) of purchase rows — the owner's "total items". Never a quantity. */
+  lines: number;
+  goods: number;
+  total_bill_value: number;
+  po_receipt_bills: number;
+  po_receipt_lines: number;
+  /** BOOKED COST share of total_bill_value — not vendor bill face value. */
+  po_receipt_value: number;
+  /** true ⇒ this day's charge figures are PARTIAL. See the file header. */
+  charges_partial: boolean;
+}
+
+interface DayVendorRow {
+  day: string;
+  vendor: string;
+  groups: number;
+  bills: number;
+  day_runs: number;
+  lines: number;
+  goods: number;
+  total_bill_value: number;
+  po_receipt_bills: number;
+  po_receipt_value: number;
+  charges_partial: boolean;
+}
+
+interface DayResponse {
+  view: 'day';
+  days: DayRow[];
+  vendor_rows: DayVendorRow[];
+  totals: BillTotals;
+  day_count: number;
+  truncated: boolean;
+  vendor_rows_truncated: boolean;
   from: string;
   to: string;
 }
@@ -161,6 +249,7 @@ function KindBadge({ kind }: { kind: BillKind }) {
 
 export default function PurchaseBillSummaryPage() {
   const today = todayIST();
+  const [view, setView] = useState<'bill' | 'day'>('bill');
   const [from, setFrom] = useState(firstOfMonth(today));
   const [to, setTo] = useState(today);
   const [vendor, setVendor] = useState('');
@@ -169,6 +258,8 @@ export default function PurchaseBillSummaryPage() {
   const [splitUnnumbered, setSplitUnnumbered] = useState(false);
   const [includePoReceipts, setIncludePoReceipts] = useState(true);
   const [data, setData] = useState<BillResponse | null>(null);
+  const [dayData, setDayData] = useState<DayResponse | null>(null);
+  const [expandedDay, setExpandedDay] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [downloading, setDownloading] = useState(false);
@@ -181,28 +272,49 @@ export default function PurchaseBillSummaryPage() {
     return () => clearTimeout(id);
   }, [vendor]);
 
+  // The ONE place both fetches get their params, so the screen and the CSV can
+  // never describe different periods or different modes. `view` belongs here for
+  // the same reason — and because `load` depends on `qs`, adding it makes the
+  // pill row re-fetch on its own. There is no manual "Apply".
   const qs = useCallback((format: 'json' | 'csv') => {
     const p = new URLSearchParams({ from, to, format });
+    if (view === 'day') p.set('view', 'day');
     if (vendorQ) p.set('vendor', vendorQ);
     if (splitUnnumbered) p.set('unnumbered', 'split');
     if (!includePoReceipts) p.set('include_po_receipts', '0');
     return p.toString();
-  }, [from, to, vendorQ, splitUnnumbered, includePoReceipts]);
+  }, [view, from, to, vendorQ, splitUnnumbered, includePoReceipts]);
 
   const load = useCallback(async () => {
-    setLoading(true); setError(''); setPaintAll(false);
+    setLoading(true); setError(''); setPaintAll(false); setExpandedDay(null);
     try {
       const res = await fetch(`/api/reports/purchase-bill-summary?${qs('json')}`, { cache: 'no-store' });
-      // A failed load must NEVER look like "no bills" — clear the rows and say why.
-      if (res.status === 401) { setError('Sign in required — your session has expired.'); setData(null); return; }
-      if (res.status === 403) { setError('Management only — you don’t have access to the purchase bill summary.'); setData(null); return; }
+      // A failed load must NEVER look like "no bills" — clear BOTH shapes and say
+      // why. Leaving the other view's payload in place would let a stale table
+      // sit under a fresh error message.
+      const fail = (msg: string) => { setError(msg); setData(null); setDayData(null); };
+      if (res.status === 401) { fail('Sign in required — your session has expired.'); return; }
+      if (res.status === 403) { fail('Management only — you don’t have access to the purchase bill summary.'); return; }
       if (!res.ok) {
         const j = await res.json().catch(() => ({} as { error?: string }));
-        setError(j?.error || `Failed to load the bill summary (HTTP ${res.status}).`); setData(null); return;
+        fail(j?.error || `Failed to load the bill summary (HTTP ${res.status}).`); return;
       }
-      const j = (await res.json()) as BillResponse;
-      setData({ ...j, rows: Array.isArray(j.rows) ? j.rows : [] });
-    } catch { setError('Network error — please try again.'); setData(null); }
+      const j = await res.json();
+      // Discriminate on the echoed view, not on which array happens to be
+      // present — a response for the other mode must never be rendered as this
+      // one's rows.
+      if (j?.view === 'day') {
+        setDayData({
+          ...(j as DayResponse),
+          days: Array.isArray(j.days) ? j.days : [],
+          vendor_rows: Array.isArray(j.vendor_rows) ? j.vendor_rows : [],
+        });
+        setData(null);
+      } else {
+        setData({ ...(j as BillResponse), rows: Array.isArray(j.rows) ? j.rows : [] });
+        setDayData(null);
+      }
+    } catch { setError('Network error — please try again.'); setData(null); setDayData(null); }
     finally { setLoading(false); }
   }, [qs]);
 
@@ -222,7 +334,14 @@ export default function PurchaseBillSummaryPage() {
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
-      a.href = url; a.download = `purchase-bill-summary-${from}_${to}.csv`; a.click();
+      // Mirrors purchaseBillSummaryFilename / purchaseBillDaySummaryFilename in
+      // the lib. Two names for two shapes: a forwarded file must never claim to
+      // be the other report. Change both places or the download name will lie.
+      a.href = url;
+      a.download = view === 'day'
+        ? `purchase-bill-day-summary-${from}_${to}.csv`
+        : `purchase-bill-summary-${from}_${to}.csv`;
+      a.click();
       URL.revokeObjectURL(url);
     } catch { setError('Network error — download failed.'); }
     finally { setDownloading(false); }
@@ -230,12 +349,19 @@ export default function PurchaseBillSummaryPage() {
 
   const allRows = data?.rows || [];
 
-  // The API sends no vendor list, so the datalist is built from the rows that
-  // actually loaded — it can never offer a vendor this range has no bills for.
+  // The API sends no vendor list, so the datalist is built from whichever
+  // payload actually loaded — it can never offer a vendor this range has no
+  // purchases for. It has to read BOTH shapes: in day mode `rows` is null, and a
+  // datalist fed from it would silently go empty on the view whose whole point
+  // is vendor-wise reconciliation.
   const vendorList = useMemo(
-    () => Array.from(new Set(allRows.map(r => (r.vendor || '').trim()).filter(Boolean)))
+    () => Array.from(new Set(
+      [
+        ...(data?.rows || []).map(r => (r.vendor || '').trim()),
+        ...(dayData?.vendor_rows || []).map(v => (v.vendor || '').trim()),
+      ].filter(Boolean)))
       .sort((a, b) => a.localeCompare(b)),
-    [allRows]);
+    [data, dayData]);
 
   // Search is client-side over bill no / invoice id / vendor — the server already
   // bounded the set by date and vendor, and this keeps typing instant.
@@ -250,7 +376,24 @@ export default function PurchaseBillSummaryPage() {
   }, [allRows, search]);
 
   const shown = paintAll ? rows : rows.slice(0, ROW_PAINT_CAP);
-  const t = data?.totals;
+
+  // ── DAY VIEW derived state ────────────────────────────────────────────────
+  const days = dayData?.days || [];
+  // Grouped once, not filtered per row inside the render — a 34-day range with
+  // 350 vendor rows would otherwise be 34 full scans on every paint.
+  const vendorsByDay = useMemo(() => {
+    const m = new Map<string, DayVendorRow[]>();
+    for (const v of dayData?.vendor_rows || []) {
+      const list = m.get(v.day);
+      if (list) list.push(v); else m.set(v.day, [v]);
+    }
+    return m;
+  }, [dayData]);
+
+  // Both views print the SAME totals object, computed by SQL over the full
+  // filtered set. That is deliberate: it is what makes the day column checkable
+  // — it must add up to this strip.
+  const t = view === 'day' ? dayData?.totals : data?.totals;
   // Counted over the LOADED rows, and worded that way — if the server truncated,
   // claiming a period-wide count would be a lie.
   //
@@ -278,6 +421,24 @@ export default function PurchaseBillSummaryPage() {
           <Link href="/reports/purchases" className="text-sm font-medium text-[#af4408] hover:underline">Go to Purchase Report →</Link>
         </div>
 
+        {/* View switch — By bill (the document view) vs By day (the store person's
+            reconciliation rollup). Both are the same API, the same source table and
+            the same bill key; only the grouping changes, so the two can never
+            disagree about what a bill is. The date range and every filter below are
+            shared, so switching keeps the same window. */}
+        <div className="flex flex-wrap gap-1.5">
+          {([
+            ['bill', 'By bill', <ReceiptText key="i" className="w-3.5 h-3.5" />],
+            ['day', 'By day (reconciliation)', <CalendarDays key="i" className="w-3.5 h-3.5" />],
+          ] as const).map(([k, label, icon]) => (
+            <button key={k} onClick={() => setView(k as 'bill' | 'day')}
+              className={`inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-semibold border transition-colors ${
+                view === k ? 'bg-[#af4408] text-white border-[#af4408]' : 'bg-white text-[#6B5744] border-[#E8D5C4] hover:bg-[#FFF1E3]'}`}>
+              {icon}{label}
+            </button>
+          ))}
+        </div>
+
         {/* Filters */}
         <div className="bg-white border border-[#E8D5C4] rounded-2xl shadow-sm p-4 space-y-3">
           <div className="flex flex-wrap items-end gap-3">
@@ -293,9 +454,16 @@ export default function PurchaseBillSummaryPage() {
               <input list="bill-summary-vendors" value={vendor} onChange={e => setVendor(e.target.value)} placeholder="All vendors"
                 className="mt-1 block w-full px-3 py-2 rounded-lg border border-[#E0D0BE] bg-white text-sm outline-none focus:border-[#af4408]" />
               <datalist id="bill-summary-vendors">{vendorList.map(v => <option key={v} value={v} />)}</datalist></label>
-            <label className="block min-w-[170px]"><span className="text-[11px] font-semibold text-[#8B7355] uppercase">Search</span>
-              <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Bill no / invoice id / vendor…"
-                className="mt-1 block w-full px-3 py-2 rounded-lg border border-[#E0D0BE] bg-white text-sm outline-none focus:border-[#af4408]" /></label>
+            {/* BILL VIEW ONLY. Search filters the loaded bill rows client-side;
+                the day view has no bill rows loaded, so leaving the box on
+                screen there would be a live control that silently does nothing.
+                The Vendor box above still works in both views — it is a server
+                filter and is part of the shared query string. */}
+            {view === 'bill' && (
+              <label className="block min-w-[170px]"><span className="text-[11px] font-semibold text-[#8B7355] uppercase">Search</span>
+                <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Bill no / invoice id / vendor…"
+                  className="mt-1 block w-full px-3 py-2 rounded-lg border border-[#E0D0BE] bg-white text-sm outline-none focus:border-[#af4408]" /></label>
+            )}
             <button onClick={download} disabled={downloading}
               className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-xs font-semibold bg-[#af4408] hover:bg-[#8a3506] disabled:opacity-60 text-white">
               {downloading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Download className="w-3.5 h-3.5" />} Download CSV
@@ -319,7 +487,7 @@ export default function PurchaseBillSummaryPage() {
               <input type="checkbox" checked={includePoReceipts} onChange={e => setIncludePoReceipts(e.target.checked)} className="accent-[#af4408]" />
               Include PO/GRN receipts
             </label>
-            {(vendor || search || splitUnnumbered || !includePoReceipts) && (
+            {(vendor || (view === 'bill' && search) || splitUnnumbered || !includePoReceipts) && (
               <button onClick={() => { setVendor(''); setSearch(''); setSplitUnnumbered(false); setIncludePoReceipts(true); }}
                 className="px-3 py-1.5 rounded-lg text-xs font-medium border bg-white text-[#af4408] border-[#E8D5C4] hover:bg-[#FFF1E3]">Clear filters</button>
             )}
@@ -333,8 +501,20 @@ export default function PurchaseBillSummaryPage() {
         {t && (
           <div className="space-y-2">
             <div className="grid grid-cols-2 lg:grid-cols-5 gap-3">
-              <Card icon={<ReceiptText className="w-4 h-4" />} label="Bills" value={fmtNum(t.bills)} sub={`${fmtNum(t.lines)} lines`} />
-              <Card icon={<Layers className="w-4 h-4" />} label="Lines" value={fmtNum(t.lines)} sub="purchase rows" />
+              {/* NEVER ONE "BILLS" NUMBER IN THE DAY VIEW. `t.bills` is a count of
+                  GROUPS, and on live 308 of those 350 groups are vendor day-runs
+                  with no bill number anywhere. Printing "Bills 350" above a table
+                  whose whole purpose is to split those two apart would hand the
+                  store person a bill count that is not a bill count. The bill
+                  view keeps its original card: there each group is a row the
+                  reader can see, kind badge and all. */}
+              {view === 'day'
+                ? <Card icon={<ReceiptText className="w-4 h-4" />} label="Numbered bills"
+                    value={fmtNum(num(t.bills) - num(t.day_run_bills))}
+                    sub={`+ ${fmtNum(num(t.day_run_bills))} vendor day-runs = ${fmtNum(t.bills)} groups`} />
+                : <Card icon={<ReceiptText className="w-4 h-4" />} label="Bills" value={fmtNum(t.bills)} sub={`${fmtNum(t.lines)} lines`} />}
+              <Card icon={<Layers className="w-4 h-4" />} label={view === 'day' ? 'Item lines' : 'Lines'}
+                value={fmtNum(t.lines)} sub="purchase rows" />
               <Card icon={<ShoppingCart className="w-4 h-4" />} label="Goods" value={fmtINR(t.goods)} sub="before charges" />
               <Card icon={<TrendingUp className="w-4 h-4" />} label="Total Bill Value" value={fmtINR(t.total_bill_value)} tone="accent" />
               <Card icon={<Building2 className="w-4 h-4" />} label="Of which PO/GRN receipts"
@@ -353,25 +533,74 @@ export default function PurchaseBillSummaryPage() {
           <p className="flex gap-2"><Info className="w-3.5 h-3.5 shrink-0 mt-0.5 text-[#af4408]" />
             <span><strong>Total Bill Value = Goods − Discount + GST + Comp. Cess + Spl Excise Cess + TCS + Delivery + MRP Round-off.</strong>{' '}
               Goods is the stored line value. GST is CGST + SGST only — both cesses are separate levies and are never folded into it.</span></p>
-          <p className="flex gap-2"><Info className="w-3.5 h-3.5 shrink-0 mt-0.5 text-[#af4408]" />
-            <span><strong>{fmtNum(dayRunCount)}</strong> of the {fmtNum(allRows.length)} group{allRows.length === 1 ? '' : 's'} loaded are marked <strong>DAY RUN</strong>: no vendor
-              bill number exists for them, so they are that vendor’s purchases for that day consolidated into one line for reading. One such
-              group may cover more than one physical bill or market run — do not read it as a single document. Tick
-              <em> Split un-numbered day runs</em> to see them as single lines instead.</span></p>
-          <p className="flex gap-2"><Info className="w-3.5 h-3.5 shrink-0 mt-0.5 text-[#af4408]" />
-            <span><strong>{fmtNum(grnRowCount)}</strong> loaded bill{grnRowCount === 1 ? '' : 's'} came from a PO receive / GRN. Their discount and tax are recorded on the
-              GRN, not on this cost row, so those cells read “—” rather than ₹0 — the bill <em>was</em> taxed. For those rows the total is the
-              <strong> booked cost</strong> (goods + allocated delivery), not the vendor’s bill face value.</span></p>
+          {/* Both sentences are gated on `t`. In the DAY view the loaded `rows`
+              array is null by design, so counting it would print "0 of the 0
+              groups" under a strip showing the period's real figures — the exact
+              mismatch this panel exists to prevent. The day view therefore quotes
+              the SQL period counts (day_run_bills / po_receipt_bills, computed
+              over the whole filtered set) and says "in this period"; the bill
+              view keeps counting the rows in hand and keeps saying "loaded",
+              because there the cap can bite and a period-wide claim would be a
+              lie about the table underneath. */}
+          {t && (
+            <p className="flex gap-2"><Info className="w-3.5 h-3.5 shrink-0 mt-0.5 text-[#af4408]" />
+              {view === 'day'
+                ? <span><strong>{fmtNum(num(t.day_run_bills))}</strong> of the {fmtNum(t.bills)} group{num(t.bills) === 1 ? '' : 's'} in this period are <strong>DAY RUNS</strong>: no vendor
+                  bill number exists for them, so they are that vendor’s purchases for that day consolidated into one line for reading. One such
+                  group may cover more than one physical bill or market run — the <em>Vendor day-runs</em> column is <strong>not</strong> a bill count,
+                  which is why it is kept apart from <em>Bills</em>. Tick <em>Split un-numbered day runs</em> to count purchase lines instead.</span>
+                : <span><strong>{fmtNum(dayRunCount)}</strong> of the {fmtNum(allRows.length)} group{allRows.length === 1 ? '' : 's'} loaded are marked <strong>DAY RUN</strong>: no vendor
+                  bill number exists for them, so they are that vendor’s purchases for that day consolidated into one line for reading. One such
+                  group may cover more than one physical bill or market run — do not read it as a single document. Tick
+                  <em> Split un-numbered day runs</em> to see them as single lines instead.</span>}
+            </p>
+          )}
+          {t && (
+            <p className="flex gap-2"><Info className="w-3.5 h-3.5 shrink-0 mt-0.5 text-[#af4408]" />
+              {view === 'day'
+                ? <span><strong>{fmtNum(num(t.po_receipt_bills))}</strong> group{num(t.po_receipt_bills) === 1 ? '' : 's'} in this period came from a PO receive / GRN, carrying <strong>{fmtINR(num(t.po_receipt_value))}</strong> of
+                  the total. Their discount and tax are recorded on the GRN, not on these cost rows, so that share is <strong>booked cost</strong> (goods +
+                  allocated delivery), not vendor bill face value — and it is why this table shows <strong>no charge columns at all</strong>: a clean per-day
+                  GST cell would be those “—” cells summed into a zero. The CSV carries the charges with a per-row note. Days holding one are
+                  marked <em>partial charges</em> below.</span>
+                : <span><strong>{fmtNum(grnRowCount)}</strong> loaded bill{grnRowCount === 1 ? '' : 's'} came from a PO receive / GRN. Their discount and tax are recorded on the
+                  GRN, not on this cost row, so those cells read “—” rather than ₹0 — the bill <em>was</em> taxed. For those rows the total is the
+                  <strong> booked cost</strong> (goods + allocated delivery), not the vendor’s bill face value.</span>}
+            </p>
+          )}
         </div>
 
-        {data?.truncated && (
+        {/* Truncation is per view: the bill view caps BILLS, the day view caps
+            DAYS, and each has its own flag. Gating both on data?.truncated left
+            the day view unable to warn at all — it would simply show fewer days
+            than the totals above it describe. */}
+        {(view === 'day' ? dayData?.truncated : data?.truncated) && (
           <div className="bg-[#af4408] text-white rounded-xl px-4 py-3 text-sm font-semibold flex items-center gap-2">
             <AlertTriangle className="w-4 h-4 shrink-0" />
-            This list was TRUNCATED by the server — it is not every bill in the range. Narrow the date range or vendor, or download the CSV.
+            {view === 'day'
+              ? `This list was TRUNCATED by the server — ${fmtNum(num(dayData?.day_count))} purchase days fall in this range and only the most recent are shown, so the day rows will NOT add up to the totals above. Narrow the date range, or download the CSV.`
+              : 'This list was TRUNCATED by the server — it is not every bill in the range. Narrow the date range or vendor, or download the CSV.'}
           </div>
         )}
 
-        {/* Bill table. The row reconciles left to right: Goods − Discount + charges = Total. */}
+        {/* A SEPARATE, quieter warning: the day rows are still complete and still
+            reconcile — only the drill-down is short. Folding it into the red
+            banner above would tell a reconciler their day totals are unreliable
+            when they are not. */}
+        {view === 'day' && dayData?.vendor_rows_truncated && (
+          <div className="bg-amber-50 border border-amber-200 rounded-xl px-4 py-3 text-sm text-amber-800 flex items-start gap-2">
+            <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+            <span>The per-vendor breakdown hit its row limit, so some days will not expand to their full vendor list and the vendor rows
+              will not add up to their day. <strong>The day rows themselves are complete</strong> and still reconcile to the totals above.
+              Narrow the date range for a complete breakdown.</span>
+          </div>
+        )}
+
+        {/* Bill table. The row reconciles left to right: Goods − Discount + charges = Total.
+            GATED ON THE VIEW. Without the gate this table rendered in BOTH modes, so
+            switching to By day put "No purchase bills in this range." directly under a
+            ₹69 lakh period total — the table was not empty, it was the wrong table. */}
+        {view === 'bill' && (
         <div className="bg-white border border-[#E8D5C4] rounded-xl shadow-sm p-4 sm:p-5">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-3">
             <h2 className="text-sm font-bold flex items-center gap-2">
@@ -478,6 +707,160 @@ export default function PurchaseBillSummaryPage() {
             </div>
           )}
         </div>
+        )}
+
+        {/* ── DAY TABLE — the store person's reconciliation rollup ──────────────
+            Date · numbered bills · vendor day-runs · groups · vendors · item lines
+            · total purchase value, with the per-vendor breakdown one click away.
+
+            NO CHARGE COLUMNS, deliberately. On a day mixing PO/GRN receipts with
+            hand-entered bills the tax is partial — the receipts' tax is on the GRN —
+            so a clean per-day GST cell would be exactly the em-dashes of the bill
+            table summed into a zero. Such days are marked "partial charges" and the
+            CSV carries the figures with a per-row note.
+
+            Every number below is aggregated in SQL over the same filtered set as the
+            strip above — never folded from the bill `rows` array, which the server
+            caps and the search box filters again. That is what lets the Total column
+            be added up and checked against the period total. */}
+        {view === 'day' && (
+          <div className="bg-white border border-[#E8D5C4] rounded-xl shadow-sm p-4 sm:p-5">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-3">
+              <h2 className="text-sm font-bold flex items-center gap-2">
+                <span className="text-[#af4408]"><CalendarDays className="w-4 h-4" /></span>
+                Purchases by day — one row per purchase date
+                <span className="text-[11px] text-[#8B7355] font-normal">
+                  ({fmtNum(days.length)} day{days.length === 1 ? '' : 's'})
+                </span>
+              </h2>
+              {loading && <span className="text-xs text-[#8B7355] inline-flex items-center gap-1.5"><Loader2 className="w-3.5 h-3.5 animate-spin" /> Loading…</span>}
+            </div>
+
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm whitespace-nowrap">
+                <thead><tr className="text-left text-[11px] uppercase text-[#8B7355] border-b border-[#F0E4D6]">
+                  <th className="py-2 pr-3">Date</th>
+                  {/* TWO counts, never one. See the file header. */}
+                  <th className="py-2 px-3 text-right" title="Identified documents only — our invoice id (PINV), a GRN from a PO receive, or the vendor's own printed bill number.">Bills</th>
+                  <th className="py-2 px-3 text-right" title="No vendor bill number anywhere: one vendor's purchases for that day, consolidated for reading. NOT paper bills — one may cover several.">Vendor day-runs</th>
+                  <th className="py-2 px-3 text-right" title="Bills + vendor day-runs. This column adds up to the group count in the strip above.">Groups</th>
+                  <th className="py-2 px-3 text-right" title="Distinct vendors bought from that day. Click a date for the vendor-wise breakdown.">Vendors</th>
+                  <th className="py-2 px-3 text-right" title="A COUNT of purchase rows — not a quantity. A day spans kg, BTL and CASE lines, so a summed quantity would have no unit.">Item lines</th>
+                  <th className="py-2 pl-3 text-right">Total purchase value</th>
+                </tr></thead>
+                <tbody>
+                  {loading && days.length === 0 ? (
+                    <tr><td colSpan={7} className="py-6 text-center text-[#8B7355] animate-pulse">Loading the day rollup…</td></tr>
+                  ) : days.length === 0 ? (
+                    <tr><td colSpan={7} className="py-6 text-center text-[#8B7355]">
+                      {error ? 'Not loaded — see the message above.' : 'No purchases in this range.'}
+                    </td></tr>
+                  ) : days.map(d => {
+                    const open = expandedDay === d.day;
+                    const vrows = vendorsByDay.get(d.day) || [];
+                    return (
+                      <Fragment key={d.day}>
+                        <tr className={`border-b border-[#F7EEE3] ${open ? 'bg-[#FFF6EE]' : ''}`}>
+                          <td className="py-2 pr-3">
+                            <button onClick={() => setExpandedDay(open ? null : d.day)}
+                              className="inline-flex items-center gap-1 font-medium text-[#2D1B0E] hover:text-[#af4408]"
+                              title="Show the vendor-wise breakdown for this day">
+                              {open ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
+                              {d.day || '—'}
+                            </button>
+                            {/* A bill dated across midnight sits WHOLE on its first
+                                date. Say so on the day that holds it, or a reconciler
+                                comparing this row against one delivery note finds
+                                money they cannot place. */}
+                            {d.spanning_bills > 0 && (
+                              <span className="ml-1.5 text-[10px] text-[#8B7355]"
+                                title="These bills also carry a later date. The whole bill is counted here, on its first date — its value is NOT split across days.">
+                                +{fmtNum(d.spanning_bills)} also dated later
+                              </span>
+                            )}
+                          </td>
+                          <td className="py-2 px-3 text-right tabular-nums">{fmtNum(d.bills)}</td>
+                          <td className="py-2 px-3 text-right tabular-nums text-[#6B5744]">
+                            {d.day_runs > 0
+                              ? <span title="No vendor bill number — a vendor-day consolidation, not a paper bill.">{fmtNum(d.day_runs)}</span>
+                              : <span className="text-[#B8A48E]">—</span>}
+                          </td>
+                          <td className="py-2 px-3 text-right tabular-nums text-[#6B5744]">{fmtNum(d.groups)}</td>
+                          <td className="py-2 px-3 text-right tabular-nums text-[#6B5744]">
+                            {fmtNum(d.vendors)}
+                            {/* `vendors` files each bill under one vendor name, and so
+                                does the breakdown below it. A bill naming two vendors
+                                would otherwise make the second one vanish from this
+                                screen without a word. */}
+                            {d.multi_vendor_bills > 0 && (
+                              <span className="ml-1 text-[10px] text-[#af4408]"
+                                title="Bills on this day name more than one vendor. Each is filed whole under one of its names, so the breakdown below under-counts the others. Open the By bill view for those bills.">
+                                +{fmtNum(d.multi_vendor_bills)} multi-vendor
+                              </span>
+                            )}
+                          </td>
+                          <td className="py-2 px-3 text-right tabular-nums text-[#6B5744]">{fmtNum(d.lines)}</td>
+                          <td className="py-2 pl-3 text-right tabular-nums font-semibold">
+                            {fmtINR(d.total_bill_value)}
+                            {d.charges_partial && (
+                              <span className="block text-[10px] text-[#8B7355] font-normal"
+                                title="Their tax and gross discount are recorded on the GRN, not on these cost rows, so this day's charge figures are partial and that share of the value is booked cost.">
+                                incl. {fmtINR(d.po_receipt_value)} booked cost · {fmtNum(d.po_receipt_bills)} PO/GRN · partial charges
+                              </span>
+                            )}
+                          </td>
+                        </tr>
+
+                        {open && (vrows.length === 0 ? (
+                          <tr className="border-b border-[#F7EEE3] bg-[#FFFCF8]">
+                            <td colSpan={7} className="py-2.5 px-3 text-[12px] text-[#8B7355]">
+                              No vendor breakdown was returned for this day{dayData?.vendor_rows_truncated ? ' — the breakdown hit its row limit (see the note above).' : '.'}
+                            </td>
+                          </tr>
+                        ) : vrows.map(v => (
+                          <tr key={`${v.day}|${v.vendor}`} className="border-b border-[#F7EEE3] bg-[#FFFCF8] text-[12px]">
+                            <td className="py-1.5 pr-3 pl-5 text-[#6B5744] whitespace-normal min-w-[170px]">
+                              <span className="inline-flex items-center gap-1.5">
+                                <Users className="w-3 h-3 text-[#B8A48E]" />{v.vendor || '—'}
+                              </span>
+                            </td>
+                            <td className="py-1.5 px-3 text-right tabular-nums text-[#6B5744]">{fmtNum(v.bills)}</td>
+                            <td className="py-1.5 px-3 text-right tabular-nums text-[#6B5744]">{v.day_runs > 0 ? fmtNum(v.day_runs) : <span className="text-[#B8A48E]">—</span>}</td>
+                            <td className="py-1.5 px-3 text-right tabular-nums text-[#6B5744]">{fmtNum(v.groups)}</td>
+                            {/* One vendor by definition — a "1" here would read as a
+                                count worth adding up the column. */}
+                            <td className="py-1.5 px-3 text-right text-[#B8A48E]">·</td>
+                            <td className="py-1.5 px-3 text-right tabular-nums text-[#6B5744]">{fmtNum(v.lines)}</td>
+                            <td className="py-1.5 pl-3 text-right tabular-nums text-[#6B5744]">
+                              {fmtINR(v.total_bill_value)}
+                              {v.charges_partial && (
+                                <span className="block text-[10px] text-[#8B7355]">
+                                  incl. {fmtINR(v.po_receipt_value)} booked cost
+                                </span>
+                              )}
+                            </td>
+                          </tr>
+                        )))}
+                      </Fragment>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+
+            {/* The acceptance test, printed where the reconciler can run it. Withheld
+                when the day list was capped — there the columns genuinely do not add
+                up to the period, and the red banner above says so. */}
+            {days.length > 0 && !dayData?.truncated && (
+              <p className="pt-3 text-[11px] text-[#8B7355] flex gap-2">
+                <Info className="w-3.5 h-3.5 shrink-0" />
+                <span>Add the columns up and they equal the period figures above, to the rupee: <strong>Groups</strong>, <strong>Item lines</strong> and
+                  <strong> Total purchase value</strong> are aggregated in SQL over this same date range and vendor filter. A bill is counted once, on the
+                  first date it carries.</span>
+              </p>
+            )}
+          </div>
+        )}
 
         <p className="text-[11px] text-[#8B7355]">
           {from} to {to}. Built from the <strong>purchases</strong> table alone — GRN and PO documents restate the same money and are
