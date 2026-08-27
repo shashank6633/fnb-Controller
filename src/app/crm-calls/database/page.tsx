@@ -51,6 +51,8 @@ import {
   X,
   Loader2,
   AlertCircle,
+  AlertTriangle,
+  Trash2,
   CheckCircle2,
   XCircle,
   ChevronLeft,
@@ -233,6 +235,94 @@ interface ImportRow extends Counters {
   stamp_source?: string | null;
 }
 
+/**
+ * What "delete this upload" costs, as counted by the server.
+ *
+ * THE SAME THIRTEEN NUMBERS come back from GET …?preview=1 (before anything is
+ * touched) and from the DELETE itself (what actually went), which is what lets
+ * the confirm panel promise a figure and then report against it — and on BOTH
+ * surfaces they are nested under `counts`.
+ *
+ * The reader that used to live here looked for `json.preview` and `json.deleted`
+ * envelopes that neither endpoint has ever emitted, then coerced every miss to a
+ * confident 0. Measured against production: the server said 371 bookings / 354
+ * guests / 100 inherited and the panel rendered 0 / 0 / 0 — with the button
+ * still live, because "is there an object?" was the enable test and a zeroed
+ * object is an object. A button reading "Delete 0 bookings" destroyed 371 rows.
+ * So the parse below is strict and total: all thirteen keys, every one a finite
+ * number, or the body is rejected whole and the button stays off (readCounts).
+ *
+ * bookings_from_earlier_imports is the honest one: ct_bookings.import_id is
+ * re-stamped on every UPDATE, so a booking an earlier file created and this one
+ * merely re-confirmed now carries THIS import's id and would be deleted with
+ * it. It is shown as a warning, not a footnote — but only when `provenance`
+ * says the server was able to measure it at all.
+ */
+interface UndoCounts {
+  bookings_to_delete: number;
+  guests_to_delete: number;
+  guests_to_keep: number;
+  bookings_from_earlier_imports: number;
+  bookings_created_before_this_import: number;
+  bookings_with_older_export_stamp: number;
+  guests_affected: number;
+  guests_kept_orphan: number;
+  bookings_linked_elsewhere: number;
+  duplicates_recleared: number;
+  duplicates_redemoted: number;
+  guests_profile_cleared: number;
+  guest_fields_blanked: number;
+}
+
+/** The thirteen names the server guarantees, and the only thirteen accepted. */
+const COUNT_KEYS = [
+  'bookings_to_delete',
+  'guests_to_delete',
+  'guests_to_keep',
+  'bookings_from_earlier_imports',
+  'bookings_created_before_this_import',
+  'bookings_with_older_export_stamp',
+  'guests_affected',
+  'guests_kept_orphan',
+  'bookings_linked_elsewhere',
+  'duplicates_recleared',
+  'duplicates_redemoted',
+  'guests_profile_cleared',
+  'guest_fields_blanked',
+] as const;
+
+/**
+ * GET …?preview=1 — what the delete WOULD do.
+ *
+ * `provenance` is the one that stops this panel lying by omission. The three
+ * "did this row predate the upload" counts are only meaningful when the upload's
+ * own session row survives to be compared against; for orphaned rows carrying a
+ * dead import id there is nothing to compare to, the server sends 'unknown', and
+ * the panel must say it cannot tell rather than print a reassuring 0.
+ *
+ * `import` is a reserved word. Alias it (`const summary = preview.import`) —
+ * never destructure it.
+ */
+interface UndoPreview {
+  import: any | null;
+  counts: UndoCounts;
+  notice: string[];
+  deletable: boolean;
+  blocked_reason: string;
+  provenance: 'measured' | 'unknown';
+}
+
+/** DELETE — what actually went. */
+interface UndoResult {
+  found: boolean;
+  already_deleted: boolean;
+  counts: UndoCounts;
+  guests_refreshed: number;
+  import_deleted: boolean;
+  notice: string[];
+  provenance: 'measured' | 'unknown';
+}
+
 type Tab = 'customers' | 'bookings' | 'imports' | 'query';
 type ImportPhase = 'idle' | 'counting' | 'uploading' | 'finishing' | 'done' | 'error';
 
@@ -250,6 +340,43 @@ interface SqlResult {
 }
 
 interface BandOption { id: string; label: string }
+
+/**
+ * What the band filter actually did, as the query engine reports it back.
+ *
+ * A band is MANY nights — the engine ORs one window per night the act played —
+ * so this says how many nights answered, over what range, and what it could not
+ * use. The skipped list is not decoration: a calendar row with an unreadable
+ * start time or a broken date is left OUT of the answer, and this is the only
+ * way the person reading the number finds out. Nothing here is derived from
+ * `qBand`; it is read from the response, because the picker is a debounce ahead
+ * of the result and the two must never be shown disagreeing.
+ */
+interface BandEchoNight {
+  event_date: string;
+  type: string;
+  start_time: string;
+  match_from: string;
+  clamped: boolean;
+}
+interface BandEchoSkip {
+  event_date: string;
+  start_time: string;
+  reason: string;
+}
+interface BandEcho {
+  name: string;
+  leadIn: number;
+  nights: number;
+  windows: number;
+  firstNight: string;
+  lastNight: string;
+  clamped: boolean;
+  capped: boolean;
+  cap: number;
+  nightList: BandEchoNight[];
+  skipped: BandEchoSkip[];
+}
 
 /* ── formatting ────────────────────────────────────────────────────────────── */
 
@@ -315,6 +442,27 @@ async function errorText(res: Response): Promise<string> {
   }
 }
 
+/**
+ * errorText's sibling for the one caller that needs the machine-readable half.
+ *
+ * The delete route's 409 carries `code: 'import_running'` beside its sentence,
+ * and the force affordance keys off THAT — never off the prose, which is a
+ * human string that may be reworded at any time without anyone thinking they
+ * have changed a wire contract. errorText keeps its signature; it has other
+ * callers.
+ */
+async function errorBody(res: Response): Promise<{ message: string; code: string }> {
+  try {
+    const j = await res.json();
+    return {
+      message: String(j?.error || j?.message || `HTTP ${res.status}`),
+      code: typeof j?.code === 'string' ? j.code : '',
+    };
+  } catch {
+    return { message: `HTTP ${res.status}`, code: '' };
+  }
+}
+
 interface FailedRow { row?: number; reason: string }
 
 /** errors_json is written server-side; accept a list of strings or of objects. */
@@ -335,6 +483,84 @@ function parseFailures(raw: unknown): FailedRow[] {
       reason: String(e?.error ?? e?.reason ?? e?.message ?? JSON.stringify(e)),
     };
   });
+}
+
+/**
+ * ── THE STRICT PARSERS FOR THE DESTRUCTIVE PANEL ────────────────────────────
+ *
+ * Everywhere else on this page a tolerant reader is the right call: a shape
+ * disagreement should degrade into an empty table, not a white screen. Here it
+ * is the opposite. This panel arms a button that deletes hundreds of rows, and
+ * the only thing standing between the owner and a delete he cannot see the size
+ * of is whether these numbers are real.
+ *
+ * So: no `Number()` coercion, no `?? 0`, no synonyms, no partial acceptance.
+ * A body either matches the contract exactly or it is rejected whole and comes
+ * back as `null`, which the caller treats as "we do not know" — the same state
+ * as still-loading and as fetch-failed, and in all three the button is dead.
+ * A missing count is NOT a zero, and this is the line where the difference is
+ * enforced.
+ */
+function readCounts(raw: any): UndoCounts | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const out: Record<string, number> = {};
+  for (const k of COUNT_KEYS) {
+    const v = (raw as Record<string, unknown>)[k];
+    // Deliberately typeof-then-finite: a numeric STRING, null, undefined, NaN
+    // and Infinity all fail. Coercing any of them is the original bug.
+    if (typeof v !== 'number' || !Number.isFinite(v)) return null;
+    out[k] = v;
+  }
+  const c = out as unknown as UndoCounts;
+  // The server guarantees this partition on both paths. A body that breaks it
+  // is not this contract, and is not to be trusted with a destructive button.
+  if (c.guests_affected !== c.guests_to_delete + c.guests_to_keep + c.guests_kept_orphan) return null;
+  return c;
+}
+
+/** notice carries the server's warnings. An unreadable one is never silently
+ *  emptied to [] — that would drop the disclosure and keep the button. */
+function readNotice(v: unknown): string[] | null {
+  if (!Array.isArray(v)) return null;
+  for (const line of v) if (typeof line !== 'string') return null;
+  return v as string[];
+}
+
+function readProvenance(v: unknown): 'measured' | 'unknown' | null {
+  return v === 'measured' || v === 'unknown' ? v : null;
+}
+
+function readUndoPreview(json: any): UndoPreview | null {
+  if (!json || typeof json !== 'object' || Array.isArray(json)) return null;
+  const counts = readCounts(json.counts);
+  if (!counts) return null;
+  const notice = readNotice(json.notice);
+  if (!notice) return null;
+  const provenance = readProvenance(json.provenance);
+  if (!provenance) return null;
+  if (typeof json.deletable !== 'boolean') return null;
+  if (typeof json.blocked_reason !== 'string') return null;
+  // The session row is the only tolerated shape variation: object or null.
+  const summary = json.import ?? null;
+  return { import: summary, counts, notice, deletable: json.deletable,
+           blocked_reason: json.blocked_reason, provenance };
+}
+
+function readUndoResult(json: any): UndoResult | null {
+  if (!json || typeof json !== 'object' || Array.isArray(json)) return null;
+  const counts = readCounts(json.counts);
+  if (!counts) return null;
+  const notice = readNotice(json.notice);
+  if (!notice) return null;
+  const provenance = readProvenance(json.provenance);
+  if (!provenance) return null;
+  if (typeof json.found !== 'boolean') return null;
+  if (typeof json.already_deleted !== 'boolean') return null;
+  if (typeof json.import_deleted !== 'boolean') return null;
+  if (typeof json.guests_refreshed !== 'number' || !Number.isFinite(json.guests_refreshed)) return null;
+  return { found: json.found, already_deleted: json.already_deleted, counts,
+           guests_refreshed: json.guests_refreshed, import_deleted: json.import_deleted,
+           notice, provenance };
 }
 
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
@@ -512,6 +738,51 @@ function normalizeSchema(raw: unknown): SchemaTable[] {
   return out;
 }
 
+/**
+ * Read the band echo off a query response, or null when no band was filtered.
+ *
+ * Deliberately NOT `listOf` — the echo is an object and listOf's fallback chain
+ * would hand back [] and read as "no band". A response without `band` means the
+ * filter was not used; a response WITH it always describes what happened, even
+ * when the answer is zero nights (a band on the master that has never been put
+ * on the calendar), which is a real state the page has to be able to explain
+ * rather than leave looking like a broken filter.
+ */
+function readBandEcho(raw: unknown): BandEcho | null {
+  const b = (raw as { band?: unknown } | null | undefined)?.band;
+  if (!b || typeof b !== 'object' || Array.isArray(b)) return null;
+  const o = b as Record<string, unknown>;
+  const str = (v: unknown) => String(v ?? '').trim();
+  const num = (v: unknown) => { const n = Number(v); return Number.isFinite(n) ? n : 0; };
+  const rows = (v: unknown): Record<string, unknown>[] =>
+    (Array.isArray(v) ? v : []).map(x => (x && typeof x === 'object' ? x as Record<string, unknown> : {}));
+  return {
+    name: str(o.name) || 'That band',
+    leadIn: num(o.lead_in_minutes),
+    nights: num(o.nights_matched),
+    windows: num(o.windows_used),
+    firstNight: str(o.first_night),
+    lastNight: str(o.last_night),
+    clamped: o.lead_in_clamped === true,
+    capped: o.nights_capped === true,
+    cap: num(o.nights_cap),
+    nightList: rows(o.nights).map((n): BandEchoNight => ({
+      event_date: str(n.event_date),
+      type: str(n.type),
+      start_time: str(n.start_time),
+      match_from: str(n.match_from),
+      clamped: n.lead_in_clamped === true,
+    })),
+    // Every skipped row is printed verbatim, never truncated — a night dropped
+    // without a reason on screen is the thing this whole echo exists to prevent.
+    skipped: rows(o.skipped).map((s): BandEchoSkip => ({
+      event_date: str(s.event_date),
+      start_time: str(s.start_time),
+      reason: str(s.reason) || 'unusable calendar row',
+    })),
+  };
+}
+
 /** Column order: what the server declared, else the union of the row keys in
  *  the order they first appear (which is SQLite's SELECT order). */
 function columnsFrom(json: any, rows: Record<string, unknown>[]): string[] {
@@ -614,6 +885,31 @@ export default function ReservationDatabasePage() {
   const [impError, setImpError] = useState<string | null>(null);
   const [openImport, setOpenImport] = useState<string | null>(null);
 
+  /* ── deleting one upload ────────────────────────────────────────────────── */
+  /**
+   * No role check here on purpose. /crm-calls/database is adminOnly in
+   * page-catalog.ts and every /api/crm/reservations/* route re-checks
+   * me.role === 'admin' for itself, so a client-side gate would be a third copy
+   * of the same rule that protects nothing the server does not already refuse.
+   */
+  const [delTarget, setDelTarget] = useState<ImportRow | null>(null);
+  /** null means "we do not know what this would delete" — still loading, the
+   *  fetch failed, or the body did not parse. All three keep the button dead. */
+  const [delPreview, setDelPreview] = useState<UndoPreview | null>(null);
+  const [delPreviewLoading, setDelPreviewLoading] = useState(false);
+  const [delPreviewError, setDelPreviewError] = useState<string | null>(null);
+  const [delConfirm, setDelConfirm] = useState('');
+  const [delRunning, setDelRunning] = useState(false);
+  const [delError, setDelError] = useState<string | null>(null);
+  /** The `code` off the last failed DELETE. 'import_running' (409) is the one
+   *  that means "there IS a way past this", and it arms the force block for a
+   *  preview that was fetched before the upload was marked running. */
+  const [delErrorCode, setDelErrorCode] = useState<string>('');
+  /** The second, deliberate consent for overriding the still-running guard.
+   *  Never sticky: it resets with every panel and every target. */
+  const [delForceArmed, setDelForceArmed] = useState(false);
+  const [delDone, setDelDone] = useState<{ file: string; result: UndoResult } | null>(null);
+
   /* ── query tab ──────────────────────────────────────────────────────────── */
   const [qDow, setQDow] = useState<number[]>([]);
   const [qMeal, setQMeal] = useState('');
@@ -632,6 +928,9 @@ export default function ReservationDatabasePage() {
   const [qCols, setQCols] = useState<string[]>([]);
   const [qTotal, setQTotal] = useState(0);
   const [qAgg, setQAgg] = useState<Record<string, unknown> | null>(null);
+  /** Response-derived, NOT a filter — so it belongs in neither clearQueryFilters
+   *  nor queryFilterCount, and it is replaced or nulled on every single run. */
+  const [qBandInfo, setQBandInfo] = useState<BandEcho | null>(null);
   const [qSchema, setQSchema] = useState<SchemaTable[]>([]);
   const [qLoading, setQLoading] = useState(false);
   const [qError, setQError] = useState<string | null>(null);
@@ -778,6 +1077,154 @@ export default function ReservationDatabasePage() {
     return () => c.abort();
   }, [tab, loadImports]);
 
+  /* ── the delete flow ────────────────────────────────────────────────────── */
+
+  const askDelete = useCallback((im: ImportRow) => {
+    setDelTarget(im);
+    setDelPreview(null);
+    setDelPreviewError(null);
+    setDelConfirm('');
+    setDelError(null);
+    setDelErrorCode('');
+    setDelForceArmed(false);
+    setDelDone(null);
+  }, []);
+
+  const closeDelete = useCallback(() => {
+    setDelTarget(null);
+    setDelPreview(null);
+    setDelPreviewError(null);
+    setDelConfirm('');
+    setDelError(null);
+    setDelErrorCode('');
+    setDelForceArmed(false);
+  }, []);
+
+  /**
+   * The preview is fetched the moment the panel opens, and the Delete button
+   * stays disabled until it lands. The owner asked to be told what an undo
+   * costs BEFORE he can spend it — a panel that offered the button while the
+   * numbers were still "…" would be a panel that let him guess.
+   */
+  useEffect(() => {
+    if (!delTarget) return;
+    const c = new AbortController();
+    const id = delTarget.id;
+    setDelPreviewLoading(true);
+    setDelPreviewError(null);
+    setDelForceArmed(false);
+    (async () => {
+      try {
+        const res = await fetch(`/api/crm/reservations/imports/${encodeURIComponent(id)}?preview=1`,
+                                { signal: c.signal, cache: 'no-store' });
+        if (!res.ok) throw new Error(await errorText(res));
+        const parsed = readUndoPreview(await res.json());
+        // Rejected outright rather than patched up. A panel that cannot read the
+        // answer must not offer a button that acts on it.
+        if (!parsed) throw new Error(
+          'The server’s answer did not match what this panel knows how to read. Nothing has been deleted.');
+        setDelPreview(parsed);
+      } catch (e: any) {
+        if (e?.name === 'AbortError') return;
+        setDelPreviewError(e?.message || 'Could not work out what this would delete');
+      } finally {
+        // Guarded: an aborted fetch settles AFTER the next target has already
+        // set loading true, and clearing it here would show a ready panel with
+        // no numbers in it.
+        if (!c.signal.aborted) setDelPreviewLoading(false);
+      }
+    })();
+    return () => c.abort();
+  }, [delTarget]);
+
+  /** Typing the file name is the deliberate act; DELETE is the way out when the
+   *  name is long, or when the row has no name to type. */
+  const delFileName = (delTarget?.file_name || '').trim();
+  const delConfirmOk = (() => {
+    const t = delConfirm.trim();
+    if (!t) return false;
+    return t.toUpperCase() === 'DELETE' || (delFileName !== '' && t === delFileName);
+  })();
+
+  /**
+   * THE ONE ENABLE TEST FOR THE DESTRUCTIVE BUTTON.
+   *
+   * Derived once and handed both to the button's `disabled` and to runDelete's
+   * own guard, because two hand-written approximations of the same rule is how
+   * a guard and a button drift apart. Every clause is load-bearing:
+   *
+   *  · delPreview !== null   — a body that PASSED the strict parse. Not "is
+   *    there an object", which is the test that let a panel reading
+   *    "Delete 0 bookings" destroy 371 rows: unknown and zero are different
+   *    states now, and only one of them arms this.
+   *  · !delPreviewLoading    — numbers on screen belong to THIS target.
+   *  · delConfirmOk          — the file name or DELETE was typed.
+   *  · deletable || forceArmed — the server's refusal stands unless the owner
+   *    has deliberately, separately overridden it.
+   *
+   * A genuinely empty import (counts all zero) stays enabled on purpose:
+   * deleting nothing is harmless and idempotent, and the server answers 200
+   * already_deleted.
+   */
+  const canDelete =
+    delPreview !== null
+    && !delPreviewLoading
+    && !delRunning
+    && delConfirmOk
+    && (delPreview.deletable || delForceArmed);
+
+  const runDelete = async () => {
+    // The identical expression the button is disabled by — never a second,
+    // looser copy of it.
+    if (!canDelete) return;
+    const im = delTarget;
+    if (!im) return;
+    // Read once: the URL and the label must not disagree if state moves.
+    const forced = delForceArmed;
+    setDelRunning(true);
+    setDelError(null);
+    try {
+      // api(), not fetch(): a DELETE needs the CSRF header this wrapper adds.
+      // ?force=1 is the server's only spelling, and it goes on ONLY when the
+      // owner ticked the box — never as an automatic retry after a 409.
+      const res = await api(
+        `/api/crm/reservations/imports/${encodeURIComponent(im.id)}${forced ? '?force=1' : ''}`,
+        { method: 'DELETE' });
+      if (!res.ok) {
+        // The code, not the prose, is what arms the force block: the sentence
+        // is a human string that may be reworded without anyone thinking they
+        // changed a wire contract.
+        const body = await errorBody(res);
+        setDelError(body.message);
+        setDelErrorCode(body.code);
+        return;
+      }
+      const result = readUndoResult(await res.json());
+      if (!result) {
+        // The delete may well have run — but a receipt this panel cannot read
+        // is never painted green over numbers it had to invent.
+        setDelError('The delete may have run, but the server’s answer did not match what this panel '
+                  + 'knows how to read. Press Refresh and check Import History before trying again.');
+        setDelErrorCode('');
+        loadImports();
+        return;
+      }
+      setDelDone({ file: im.file_name || 'Unnamed file', result });
+      if (openImport === im.id) setOpenImport(null);
+      setDelTarget(null);
+      setDelPreview(null);
+      setDelConfirm('');
+      setDelErrorCode('');
+      setDelForceArmed(false);
+      loadImports();
+    } catch (e: any) {
+      setDelError(e?.message || 'That upload could not be deleted');
+      setDelErrorCode('');
+    } finally {
+      setDelRunning(false);
+    }
+  };
+
   /* ── the query runner ───────────────────────────────────────────────────── */
 
   const queryBody = useCallback(() => ({
@@ -825,6 +1272,10 @@ export default function ReservationDatabasePage() {
       setQCols(columnsFrom(json, rows));
       setQTotal(totalOf(json, rows.length));
       setQAgg(json?.aggregates && typeof json.aggregates === 'object' ? json.aggregates : null);
+      // Set UNCONDITIONALLY, exactly like the aggregates above and unlike the
+      // schema below: a band summary left on screen after the band filter was
+      // cleared is a lie about the rows underneath it.
+      setQBandInfo(readBandEcho(json));
       // A run that returns no schema (or a schema this reader cannot parse)
       // leaves the LAST good one on screen rather than emptying the panel the
       // owner asked for.
@@ -838,6 +1289,7 @@ export default function ReservationDatabasePage() {
       setQRows([]);
       setQTotal(0);
       setQAgg(null);
+      setQBandInfo(null);
       setQRan(true);
     } finally {
       setQLoading(false);
@@ -867,9 +1319,21 @@ export default function ReservationDatabasePage() {
   }, [tab, filterSig, qPage, runQuery]);
 
   /**
-   * The band picker is the ct_bands MASTER, because liveBandId is
-   * ct_bookings.live_band_id → ct_bands.id and nothing else — an entertainment
-   * calendar row id would match no booking at all.
+   * The band picker is the ct_bands MASTER, and the engine now agrees with it.
+   *
+   * ct_bands is the only complete, de-duplicated list of ACT NAMES — one row
+   * per band, `name` UNIQUE COLLATE NOCASE — and the name is the ONLY link into
+   * ct_entertainment, which has no band id column on it at all. So picking a
+   * master id is what lets the server answer "every night this band played":
+   * id → name → every calendar row carrying that name → one window per night.
+   *
+   * (The old note here said the picker was ct_bands because liveBandId is
+   * ct_bookings.live_band_id → ct_bands.id. That was never what the query
+   * engine did — it does not read b.live_band_id anywhere; it matches the
+   * booking's date and slot against the calendar. Right list, wrong reason,
+   * and the resolver on the other side was looking these ids up in
+   * ct_entertainment, so every band anyone picked came back "not on the
+   * entertainment calendar".)
    *
    * include_inactive=1 on purpose: a band that stopped playing last year still
    * has hundreds of nights attributed to it, and leaving retired acts out of
@@ -1772,6 +2236,60 @@ export default function ReservationDatabasePage() {
               </div>
             )}
 
+            {/* What the last delete actually removed, reported against the
+                numbers the confirm panel promised. */}
+            {delDone && (() => {
+              const r = delDone.result;
+              const c = r.counts;
+              // A no-op DELETE used to paint the green "was deleted" banner over
+              // real-looking numbers. It gets its own neutral box now: nothing
+              // happened, and the receipt says so rather than taking credit.
+              const nothingToDo = r.already_deleted || !r.found;
+              return (
+                <div className={`flex items-start gap-2 p-3 rounded-xl border ${
+                  nothingToDo ? 'bg-[#FFF8F0] border-[#E8D5C4]' : 'bg-green-50 border-green-200'}`}>
+                  {nothingToDo
+                    ? <AlertCircle className="w-5 h-5 text-[#8B7355] shrink-0" />
+                    : <CheckCircle2 className="w-5 h-5 text-green-600 shrink-0" />}
+                  <div className="flex-1 min-w-0 space-y-2.5">
+                    <p className={`text-sm ${nothingToDo ? 'text-[#6B5744]' : 'text-green-800'}`}>
+                      {nothingToDo ? (
+                        <>There was nothing left to delete under <strong>{delDone.file}</strong> — it had already been removed.</>
+                      ) : (
+                        <>
+                          <strong>{delDone.file}</strong> was deleted — {fmtInt(c.bookings_to_delete)} booking
+                          {c.bookings_to_delete === 1 ? '' : 's'} and {fmtInt(c.guests_to_delete)} guest
+                          {c.guests_to_delete === 1 ? '' : 's'} removed; {fmtInt(c.guests_to_keep)} guest
+                          {c.guests_to_keep === 1 ? '' : 's'} kept; {fmtInt(r.guests_refreshed)} guest total
+                          {r.guests_refreshed === 1 ? '' : 's'} recalculated
+                          {r.import_deleted
+                            ? ''
+                            : ' — no upload record was found to remove, these were orphaned rows'}.
+                        </>
+                      )}
+                    </p>
+                    {/* The server's own account of what it did, verbatim and in
+                        order. Same rule as the confirm panel: this page prints
+                        the sentences, it does not write them. */}
+                    <div className={`p-2.5 rounded-lg border ${
+                      nothingToDo ? 'bg-white border-[#F0E4D6]' : 'bg-white/70 border-green-200'}`}>
+                      <p className="text-[11px] font-semibold text-[#2D1B0E] mb-1.5">What this delete did</p>
+                      <ul className="list-disc pl-4 space-y-1.5">
+                        {r.notice.map((line, i) => (
+                          <li key={i} className="text-xs text-[#6B5744] leading-relaxed">{line}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  </div>
+                  <button onClick={() => setDelDone(null)} aria-label="Dismiss delete summary"
+                          className={`p-1 rounded-lg shrink-0 ${
+                            nothingToDo ? 'text-[#8B7355] hover:bg-[#FFF1E3]' : 'text-green-700 hover:bg-green-100'}`}>
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+              );
+            })()}
+
             {/* History */}
             <div className="flex items-center justify-between">
               <h2 className="text-sm font-semibold text-[#2D1B0E]">Previous imports</h2>
@@ -1793,9 +2311,33 @@ export default function ReservationDatabasePage() {
                     im={im}
                     open={openImport === im.id}
                     onToggle={() => setOpenImport(openImport === im.id ? null : im.id)}
+                    onDelete={() => askDelete(im)}
+                    // An upload is landing batch by batch right now. Deleting
+                    // any import mid-run would race the rows still arriving, so
+                    // the whole column waits for the upload to finish.
+                    deleteBlocked={busy}
                   />
                 ))}
               </div>
+            )}
+
+            {delTarget && (
+              <DeleteImportDialog
+                im={delTarget}
+                preview={delPreview}
+                loading={delPreviewLoading}
+                previewError={delPreviewError}
+                confirmText={delConfirm}
+                onConfirmText={setDelConfirm}
+                canDelete={canDelete}
+                running={delRunning}
+                error={delError}
+                errorCode={delErrorCode}
+                forceArmed={delForceArmed}
+                onForceArmed={setDelForceArmed}
+                onCancel={closeDelete}
+                onDelete={runDelete}
+              />
             )}
           </>
         )}
@@ -1936,6 +2478,11 @@ export default function ReservationDatabasePage() {
 
               {qError && <ErrorBox message={qError} />}
 
+              {/* What the band filter matched. Sits above the numbers because
+                  it qualifies them — how many nights they cover, and which
+                  nights were left out of them. */}
+              {qBandInfo && <BandNotice info={qBandInfo} />}
+
               {qAgg && <AggregateCards agg={qAgg} />}
 
               {/* ── results ────────────────────────────────────────────────── */}
@@ -2030,6 +2577,126 @@ function ErrorBox({ message }: { message: string }) {
     <div className="flex items-start gap-2 p-4 bg-red-50 border border-red-200 rounded-xl">
       <AlertCircle className="w-5 h-5 text-red-500 shrink-0" />
       <p className="text-sm text-red-700">{message}</p>
+    </div>
+  );
+}
+
+/**
+ * WHAT THE BAND FILTER MATCHED — the plural answer, on screen.
+ *
+ * A band is many nights, so "23 nights, Mar 2025 – Aug 2026" is the honest
+ * headline and a single date would be a lie. Three things it must never hide:
+ *
+ *  · ZERO NIGHTS. A band on the master that was never put on the calendar
+ *    returns nothing, and without this box that is indistinguishable from a
+ *    filter that is broken — which is exactly the bug this page just had.
+ *  · SKIPPED NIGHTS. A calendar row whose start time is not readable is left
+ *    out of the answer. Every one is printed, with its reason, never collapsed
+ *    behind a count and never truncated.
+ *  · THE NIGHT CAP. Past the engine's cap the oldest nights are dropped; saying
+ *    so is what lets the reader narrow the date range instead of trusting a
+ *    number that quietly answers a shorter history than they asked for.
+ *
+ * Amber, not red: none of this is an error. The query ran and the rows below
+ * are real — this says what they cover.
+ */
+function BandNotice({ info }: { info: BandEcho }) {
+  const range = info.firstNight && info.lastNight
+    ? (info.firstNight === info.lastNight
+      ? fmtDate(info.firstNight)
+      : `${fmtDate(info.firstNight)} – ${fmtDate(info.lastNight)}`)
+    : '';
+  // ZERO NIGHTS IS TWO DIFFERENT ANSWERS AND THEY NEED DIFFERENT SENTENCES.
+  // Branching on nights === 0 alone printed "has no nights on the entertainment
+  // calendar … Add its nights under What's On" DIRECTLY ABOVE this box's own
+  // list of the calendar rows it had just read and could not use — a flat
+  // contradiction, and the one remedy it named was the one that cannot help.
+  // A blank or "9:00 PM" start time is enough to land here (the What's On start
+  // time is a plain text box with no format check), so this is an ordinary
+  // state, not an exotic one.
+  const noNights = info.nights === 0;
+  const allSkipped = noNights && info.skipped.length > 0;
+  const empty = noNights && !allSkipped;
+  // The engine matches every calendar row carrying the band's name, not only
+  // the ones typed 'band'. Said out loud rather than hidden, because the
+  // live_band_id backfill elsewhere in the CRM only credits type='band' and the
+  // two surfaces would otherwise report different night counts for one act.
+  const offTypes = [...new Set(
+    info.nightList.map(n => n.type.trim()).filter(t => t && t.toLowerCase() !== 'band'),
+  )];
+  const offTypeNights = info.nightList.filter(n => n.type.trim() && n.type.trim().toLowerCase() !== 'band').length;
+  return (
+    <div className={`p-4 border rounded-xl ${noNights || info.skipped.length || info.capped
+      ? 'bg-amber-50 border-amber-200' : 'bg-[#FFF8F0] border-[#E8D5C4]'}`}>
+      <div className="flex items-start gap-2">
+        <AlertCircle className={`w-5 h-5 shrink-0 ${noNights || info.skipped.length || info.capped ? 'text-amber-500' : 'text-[#af4408]'}`} />
+        <div className="min-w-0 space-y-1.5">
+          <p className="text-sm text-[#2D1B0E]">
+            <span className="font-semibold">{info.name}</span>
+            {allSkipped ? (
+              info.skipped.length === 1 ? (
+                <> has <span className="font-semibold">one</span> row on the entertainment calendar and it could not be
+                  used, so nothing can match it. Fix it under What&apos;s On — the reason is below — then run this again.</>
+              ) : (
+                <> has <span className="font-semibold">{fmtInt(info.skipped.length)}</span> rows on the entertainment
+                  calendar and <span className="font-semibold">not one</span> of them could be used, so nothing can match
+                  it. Fix them under What&apos;s On — the reasons are below — then run this again.</>
+              )
+            ) : empty ? (
+              <> is on the band list but has no nights on the entertainment calendar, so nothing can match it. Add its nights under What&apos;s On, then run this again.</>
+            ) : (
+              <>
+                {' '}played <span className="font-semibold">{fmtInt(info.nights)}</span> night{info.nights === 1 ? '' : 's'}
+                {range && <> · {range}</>}
+                {info.windows > info.nights && <> · {fmtInt(info.windows)} calendar entries</>}
+              </>
+            )}
+          </p>
+          {!noNights && (
+            <p className="text-xs text-[#6B5744]">
+              Each night counts bookings from {fmtInt(info.leadIn)} minutes before the act starts through the end of that night
+              {info.clamped && <> — on at least one night that reached before midnight and was held at 00:00, so the evening before is not counted</>}.
+            </p>
+          )}
+          {offTypeNights > 0 && (
+            <p className="text-xs text-[#6B5744]">
+              {/* "of those" read back to the NIGHT count above, but this counts calendar
+                  ENTRIES, and an act billed twice on one night makes entries > nights —
+                  "played 4 nights … 5 of those are typed 'dj'". Counted in its own unit. */}
+              {fmtInt(offTypeNights)} calendar {offTypeNights === 1 ? 'entry is' : 'entries are'} typed{' '}
+              {offTypes.map(t => `“${t}”`).join(' / ')} on the calendar rather than “band” — counted, because it is the
+              same act on the night. The type is quoted exactly as the calendar holds it, which is what you would edit.
+            </p>
+          )}
+          {/* The cap keeps the most recent rows and drops the rest UNEXAMINED,
+              so the skipped list under it covers only what survived: an undated
+              row sorts oldest of all and is the first thing the cap discards.
+              Said out loud, because "N rows are not included" reading as the
+              complete list of what was left out is the same silent drop this
+              box exists to prevent. */}
+          {info.capped && (
+            <p className="text-xs text-amber-800">
+              This band has more than {fmtInt(info.cap)} rows on the entertainment calendar. Only the most recent{' '}
+              {fmtInt(info.cap)} were used — set a date range to ask about the rest. The older rows were never
+              examined, so any unusable ones among them are not counted here either.
+            </p>
+          )}
+          {info.skipped.length > 0 && (
+            <div className="text-xs text-amber-800">
+              <p className="font-medium">
+                {fmtInt(info.skipped.length)} calendar {info.skipped.length === 1 ? 'row is' : 'rows are'} not included:
+              </p>
+              <ul className="mt-0.5 space-y-0.5">
+                {info.skipped.map((s, i) => (
+                  <li key={`${s.event_date}-${i}`}>
+                    · {s.event_date ? fmtDate(s.event_date) || s.event_date : 'no date'} — {s.reason}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
+      </div>
     </div>
   );
 }
@@ -2230,7 +2897,9 @@ const IMPORT_STATUS_STYLES: Record<string, string> = {
   failed: 'bg-red-100 text-red-700 border-red-300',
 };
 
-function ImportCard({ im, open, onToggle }: { im: ImportRow; open: boolean; onToggle: () => void }) {
+function ImportCard({ im, open, onToggle, onDelete, deleteBlocked }: {
+  im: ImportRow; open: boolean; onToggle: () => void; onDelete: () => void; deleteBlocked: boolean;
+}) {
   const failures = useMemo(() => parseFailures(im.errors_json), [im.errors_json]);
   const status = String(im.status || '').toLowerCase();
   const partial = Number(im.rows_processed ?? 0) < Number(im.rows_total ?? 0);
@@ -2282,7 +2951,23 @@ function ImportCard({ im, open, onToggle }: { im: ImportRow; open: boolean; onTo
             <p className="text-[11px] text-[#8B7355] mt-0.5">Export taken {fmtStamp(im.source_exported_at)}</p>
           )}
         </div>
-        <div className="text-[#8B7355] shrink-0">{open ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}</div>
+        <div className="flex items-center gap-1 shrink-0">
+          {/* Inside a role="button" row, so both the click and the Enter that
+              produced it are stopped here — otherwise opening the confirm panel
+              would also toggle the card open behind it. */}
+          <button
+            onClick={e => { e.stopPropagation(); onDelete(); }}
+            onKeyDown={e => e.stopPropagation()}
+            disabled={deleteBlocked}
+            title={deleteBlocked
+              ? 'An upload is running — deleting an import now would race the rows still arriving.'
+              : 'Delete the bookings this upload wrote, so the file can be fixed and uploaded again'}
+            className="flex items-center gap-1.5 px-2.5 py-1.5 text-[11px] font-semibold text-[#8B7355] border border-[#E0D0BE] rounded-lg hover:text-red-700 hover:border-red-300 hover:bg-red-50 disabled:opacity-40 disabled:hover:text-[#8B7355] disabled:hover:border-[#E0D0BE] disabled:hover:bg-transparent transition-colors">
+            <Trash2 className="w-3.5 h-3.5" />
+            <span className="hidden sm:inline">Delete this upload</span>
+          </button>
+          <div className="text-[#8B7355] pl-1">{open ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}</div>
+        </div>
       </div>
 
       {open && (
@@ -2299,6 +2984,337 @@ function ImportCard({ im, open, onToggle }: { im: ImportRow; open: boolean; onTo
             : <p className="text-xs text-[#8B7355]">No failed rows recorded for this import.</p>}
         </div>
       )}
+    </div>
+  );
+}
+
+/**
+ * The confirm panel for "delete this upload".
+ *
+ * ONE VOICE. Every sentence here that makes a claim about what the delete does,
+ * keeps, removes or cannot tell is computed by the server and printed verbatim,
+ * in the order it arrives. This component authors NO claim-bearing prose of its
+ * own: only tile labels, one mechanical sentence assembled from the counts, and
+ * the fixed chrome around them.
+ *
+ * That rule is here because the previous build broke it. The server computed a
+ * notice, a deletable flag and a blocked reason; the panel dropped all three
+ * and printed two hardcoded paragraphs of its own beside numbers that had
+ * silently parsed to zero. One of those paragraphs promised that a surviving
+ * guest keeps an unchanged profile — while the undo was busy rewriting that
+ * profile. Two sources of truth, and the wrong one on screen.
+ *
+ * The second rule is the owner's: the numbers come first, and the button stays
+ * dead until a body has passed the strict parse. `canDelete` is computed
+ * upstream and handed in whole, so the guard and the button cannot drift.
+ */
+function DeleteImportDialog({
+  im, preview, loading, previewError, confirmText, onConfirmText, canDelete, running,
+  error, errorCode, forceArmed, onForceArmed, onCancel, onDelete,
+}: {
+  im: ImportRow;
+  preview: UndoPreview | null;
+  loading: boolean;
+  previewError: string | null;
+  confirmText: string;
+  onConfirmText: (v: string) => void;
+  canDelete: boolean;
+  running: boolean;
+  error: string | null;
+  errorCode: string;
+  forceArmed: boolean;
+  onForceArmed: (v: boolean) => void;
+  onCancel: () => void;
+  onDelete: () => void;
+}) {
+  const fileName = (im.file_name || '').trim();
+
+  // Escape closes — but never mid-delete, when the request is already gone and
+  // closing the panel would only hide what is happening.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape' && !running) onCancel(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [running, onCancel]);
+
+  // `import` is a reserved word: aliased, never destructured.
+  const summary = preview?.import ?? null;
+  const stillRunning = String(summary?.status ?? '') === 'running';
+  /**
+   * The three "did this row predate the upload" counts are only measurements
+   * when the upload's own session row survived to be compared against. With it
+   * gone the server sends 'unknown', and a 0 here would read as "nothing older
+   * is caught in this", which is the one thing nobody can know. So the whole
+   * provenance row is withheld and warning 8 takes its place.
+   */
+  const measured = preview?.provenance === 'measured';
+  const inherited = measured ? (preview?.counts.bookings_from_earlier_imports ?? 0) : 0;
+  const blocked = preview !== null && !preview.deletable;
+  // Two roads to Force: the preview already knows the server will refuse, or a
+  // DELETE came back 409 because the preview had gone stale under us.
+  const forceFromError = errorCode === 'import_running';
+
+  /**
+   * Written once, rendered under whichever of the two triggers fired. Force
+   * overrides a guard that exists for a real reason, so it carries its own
+   * consent: the typed confirmation alone will not arm it.
+   */
+  const forceBlock = (
+    <div className="p-3 bg-amber-50 border border-amber-300 rounded-xl space-y-2">
+      <p className="text-xs font-bold text-amber-900">Force this delete</p>
+      <p className="text-xs text-amber-900 leading-relaxed">
+        The server refuses this delete because the upload is still marked as running. Forcing it overrides that
+        check. If a browser is still posting batches, those rows will keep arriving under an id that no longer
+        appears in Import History and only a second delete will find them.
+      </p>
+      <label className="flex items-start gap-2 text-xs font-medium text-amber-900 cursor-pointer">
+        <input
+          type="checkbox"
+          checked={forceArmed}
+          onChange={e => onForceArmed(e.target.checked)}
+          disabled={running}
+          className="mt-0.5 w-4 h-4 shrink-0 accent-amber-600"
+        />
+        <span>I have checked that this upload is not still running.</span>
+      </label>
+    </div>
+  );
+
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label="Delete this upload"
+      onClick={() => { if (!running) onCancel(); }}
+      className="fixed inset-0 z-50 bg-black/40 flex items-start sm:items-center justify-center p-3 sm:p-6 overflow-y-auto">
+      <div
+        onClick={e => e.stopPropagation()}
+        className="w-full max-w-2xl bg-white border border-[#E8D5C4] rounded-2xl shadow-xl my-auto">
+
+        <div className="flex items-start gap-3 px-5 py-4 border-b border-[#F0E4D6]">
+          <div className="w-9 h-9 rounded-xl bg-red-50 border border-red-200 flex items-center justify-center shrink-0">
+            <Trash2 className="w-4 h-4 text-red-600" />
+          </div>
+          <div className="min-w-0 flex-1">
+            <h3 className="text-base font-bold text-[#2D1B0E]">Delete this upload</h3>
+            <p className="text-xs text-[#6B5744] truncate">{im.file_name || 'Unnamed file'}</p>
+            <p className="text-[11px] text-[#8B7355]">
+              Imported {fmtStamp(im.started_at || im.created_at) || 'at an unknown time'}
+              {im.imported_by ? ` · by ${im.imported_by}` : ''}
+            </p>
+            {stillRunning && (
+              <span className="inline-block mt-1 px-2 py-0.5 text-[10px] font-semibold text-amber-900 bg-amber-50 border border-amber-300 rounded-full">
+                Still marked running
+              </span>
+            )}
+          </div>
+          <button onClick={onCancel} disabled={running} aria-label="Cancel"
+                  className="p-2 text-[#8B7355] hover:bg-[#FFF1E3] rounded-lg disabled:opacity-40 shrink-0">
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+
+        <div className="px-5 py-4 space-y-3.5">
+
+          {/* ── the refusal, if there is one ───────────────────────────────
+              Heaviest element on the panel and above the inventory, because a
+              refusal outranks a list of what would have gone. The reason is
+              the server's sentence, printed as it arrived. */}
+          {blocked && preview && (
+            <>
+              <div className="flex items-start gap-2 p-3 bg-red-50 border-2 border-red-300 rounded-xl">
+                <AlertTriangle className="w-5 h-5 text-red-600 shrink-0" />
+                <p className="text-xs text-red-900 leading-relaxed font-medium">{preview.blocked_reason}</p>
+              </div>
+              {forceBlock}
+            </>
+          )}
+
+          {/* ── the numbers, fetched before anything can be deleted ────────── */}
+          {loading && (
+            <div className="flex items-center gap-2 p-3 bg-[#FFF8F0] border border-[#F0E4D6] rounded-xl text-sm text-[#6B5744]">
+              <Loader2 className="w-4 h-4 animate-spin text-[#af4408]" />
+              Counting exactly what this upload would take with it…
+            </div>
+          )}
+
+          {previewError && !loading && (
+            <>
+              <ErrorBox message={previewError} />
+              <p className="text-xs text-[#8B7355]">
+                Nothing can be deleted until this count comes back — close the panel, hit Refresh and try again.
+              </p>
+            </>
+          )}
+
+          {preview && !loading && (
+            <>
+              {/* Mechanical: numbers and nothing else. Every claim about what
+                  those numbers MEAN lives in the notice below, in the server's
+                  words. */}
+              <p className="text-sm text-[#2D1B0E] leading-relaxed">
+                This removes <strong>{fmtInt(preview.counts.bookings_to_delete)}</strong> booking
+                {preview.counts.bookings_to_delete === 1 ? '' : 's'} and{' '}
+                <strong>{fmtInt(preview.counts.guests_to_delete)}</strong> guest
+                {preview.counts.guests_to_delete === 1 ? '' : 's'};{' '}
+                <strong>{fmtInt(preview.counts.guests_to_keep)}</strong> guest
+                {preview.counts.guests_to_keep === 1 ? '' : 's'} keep other history and stay.
+              </p>
+
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                <DeleteTile label="Bookings deleted" value={fmtInt(preview.counts.bookings_to_delete)} tone="text-red-700" />
+                <DeleteTile label="Guests deleted" value={fmtInt(preview.counts.guests_to_delete)} tone="text-red-700" />
+                <DeleteTile label="Guests kept" value={fmtInt(preview.counts.guests_to_keep)} />
+                <DeleteTile label="Kept with no bookings left" value={fmtInt(preview.counts.guests_kept_orphan)}
+                            tone={preview.counts.guests_kept_orphan > 0 ? 'text-amber-700' : undefined} />
+              </div>
+
+              {/* Second weight: everything else the server counted. None of it
+                  is dropped, and the ones that mean "look here" go amber. */}
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                <DeleteTile size="sm" label="Guests affected" value={fmtInt(preview.counts.guests_affected)} />
+                <DeleteTile size="sm" label="Still linked elsewhere" value={fmtInt(preview.counts.bookings_linked_elsewhere)}
+                            tone={preview.counts.bookings_linked_elsewhere > 0 ? 'text-amber-700' : undefined} />
+                <DeleteTile size="sm" label="Profiles cleared" value={fmtInt(preview.counts.guests_profile_cleared)}
+                            tone={preview.counts.guests_profile_cleared > 0 ? 'text-amber-700' : undefined} />
+                <DeleteTile size="sm" label="Duplicates re-counted"
+                            value={fmtInt(preview.counts.duplicates_recleared + preview.counts.duplicates_redemoted)}
+                            tone={preview.counts.duplicates_recleared + preview.counts.duplicates_redemoted > 0
+                              ? 'text-amber-700' : undefined} />
+              </div>
+
+              {/* Provenance, and ONLY when the server could measure it. The
+                  older-export-stamp half is structurally near-always 0, so it
+                  never appears alone: beside its sibling a 0 reads as "this
+                  half did not fire", not as "nothing here is inherited". */}
+              {measured && (
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                  <DeleteTile size="sm" label="From earlier uploads" value={fmtInt(inherited)}
+                              tone={inherited > 0 ? 'text-amber-700' : undefined} />
+                  <DeleteTile size="sm" label="Created before this upload"
+                              value={fmtInt(preview.counts.bookings_created_before_this_import)} />
+                  <DeleteTile size="sm" label="Older export stamp"
+                              value={fmtInt(preview.counts.bookings_with_older_export_stamp)} />
+                </div>
+              )}
+            </>
+          )}
+
+          {/* ── the notice, above the confirmation ─────────────────────────
+              Every line the server sent, in its order, word for word. Never
+              indexed into, never truncated, never folded behind a "show more",
+              never summarised — the array has many shapes and any one of its
+              lines may be the one the owner needed to read. The box stays put
+              whenever a preview is loaded, so its absence always means "no
+              preview", never "no warnings". */}
+          {preview && (
+            <div className="p-3 bg-[#FFF8F0] border border-[#E8D5C4] rounded-xl space-y-2">
+              <p className="text-xs font-semibold text-[#2D1B0E]">Read this before you confirm</p>
+              <ul className="list-disc pl-4 space-y-1.5">
+                {preview.notice.map((line, i) => (
+                  <li key={i} className="text-xs text-[#6B5744] leading-relaxed">{line}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {measured && inherited > 0 && (
+            <div className="flex items-start gap-2 p-3 bg-amber-50 border border-amber-300 rounded-xl">
+              <AlertTriangle className="w-5 h-5 text-amber-600 shrink-0" />
+              <p className="text-xs text-amber-900 leading-relaxed">
+                <strong>{fmtInt(inherited)} of these {fmtInt(preview?.counts.bookings_to_delete ?? 0)} bookings
+                came from an earlier upload.</strong> This file only re-confirmed them, and deleting it takes them with
+                it. To get them back, re-upload the file that created them.
+              </p>
+            </div>
+          )}
+
+          {/* Instead of the warning above, never alongside it: where provenance
+              is unknowable, a reassuring number would be a lie of omission. */}
+          {preview && !measured && (
+            <div className="flex items-start gap-2 p-3 bg-amber-50 border border-amber-300 rounded-xl">
+              <AlertTriangle className="w-5 h-5 text-amber-600 shrink-0" />
+              <p className="text-xs text-amber-900 leading-relaxed">
+                <strong>This upload’s own record is gone.</strong> Nothing here can work out which of these bookings
+                existed before it, so treat every one of them as possibly older than this file.
+              </p>
+            </div>
+          )}
+
+          {error && <ErrorBox message={error} />}
+
+          {/* The 409 said "repeat with force" and, until now, gave the owner no
+              way to do it. Shown here only when the blocked banner has not
+              already carried it. */}
+          {forceFromError && !blocked && forceBlock}
+
+          {/* ── typed confirmation ─────────────────────────────────────────── */}
+          <div>
+            <label htmlFor="delete-import-confirm" className="block text-xs font-semibold text-[#2D1B0E] mb-1.5">
+              {fileName
+                ? <>Type the file name <span className="font-mono text-[11px] bg-[#FFF1E3] border border-[#E8D5C4] rounded px-1.5 py-0.5 break-all">{fileName}</span> or the word <span className="font-mono">DELETE</span> to confirm</>
+                : <>Type <span className="font-mono">DELETE</span> to confirm</>}
+            </label>
+            <input
+              id="delete-import-confirm"
+              type="text"
+              value={confirmText}
+              onChange={e => onConfirmText(e.target.value)}
+              // Not `!preview`: truthiness is the test that armed a button over
+              // numbers nobody could read. Only a parsed body opens this.
+              disabled={running || preview === null}
+              autoFocus
+              autoComplete="off"
+              spellCheck={false}
+              placeholder={fileName || 'DELETE'}
+              className="w-full px-3 py-2.5 bg-white border border-[#E0D0BE] rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-red-400/40 focus:border-red-400 disabled:bg-[#FBF6F0] disabled:text-[#8B7355]"
+            />
+          </div>
+        </div>
+
+        <div className="flex flex-col-reverse sm:flex-row sm:justify-end gap-2 px-5 py-4 border-t border-[#F0E4D6] bg-[#FFFDF9] rounded-b-2xl">
+          <button
+            onClick={onCancel}
+            disabled={running}
+            className="px-4 py-2.5 bg-white border border-[#E0D0BE] text-[#6B5744] rounded-xl text-sm font-medium hover:bg-[#FFF1E3] disabled:opacity-50">
+            Cancel
+          </button>
+          <button
+            onClick={onDelete}
+            // canDelete is the whole rule, computed once upstream and shared
+            // with runDelete's guard. Nothing is re-derived here.
+            disabled={!canDelete}
+            title={preview === null
+              ? 'Waiting for the count of what this would delete'
+              : blocked && !forceArmed
+                ? 'The server refuses this delete — tick the force box to override it'
+                : undefined}
+            className={`flex items-center justify-center gap-2 px-4 py-2.5 text-white rounded-xl text-sm font-semibold shadow-sm transition-colors disabled:opacity-40 ${
+              forceArmed
+                ? 'bg-red-700 hover:bg-red-800 disabled:hover:bg-red-700 ring-2 ring-amber-400 ring-offset-1'
+                : 'bg-red-600 hover:bg-red-700 disabled:hover:bg-red-600'}`}>
+            {running ? <Loader2 className="w-4 h-4 animate-spin" /> : <Trash2 className="w-4 h-4" />}
+            {running
+              ? 'Deleting…'
+              : preview
+                ? `${forceArmed ? 'Force delete' : 'Delete'} ${fmtInt(preview.counts.bookings_to_delete)} booking${preview.counts.bookings_to_delete === 1 ? '' : 's'}`
+                : 'Delete this upload'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** `size="sm"` is the secondary weight: same tile, quieter, for the counts that
+ *  are context rather than headline. Tone is how a count says "look at me". */
+function DeleteTile({ label, value, tone, size }:
+                    { label: string; value: string; tone?: string; size?: 'sm' }) {
+  const small = size === 'sm';
+  return (
+    <div className={`bg-[#FFF8F0] border border-[#F0E4D6] rounded-xl ${small ? 'px-2.5 py-1.5' : 'px-3 py-2'}`}>
+      <p className={`${small ? 'text-[9px]' : 'text-[10px]'} text-[#8B7355] uppercase tracking-wide leading-tight`}>{label}</p>
+      <p className={`${small ? 'text-sm' : 'text-lg'} font-bold ${tone || 'text-[#2D1B0E]'}`}>{value}</p>
     </div>
   );
 }

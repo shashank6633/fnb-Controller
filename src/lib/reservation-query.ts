@@ -39,7 +39,6 @@
  * Reads only. Nothing in this file writes.
  */
 import type Database from 'better-sqlite3';
-import { ctSetting } from '@/lib/ct/settings';
 
 type DB = Database.Database;
 
@@ -98,23 +97,37 @@ export type DuplicateMode = 'exclude' | 'include' | 'only';
  * band's end_time: guests who arrived for the band are still the band's guests
  * after it stops.
  *
- * Stored in ct_settings so it can be tuned per venue without a deploy. Not
- * listed in CT_SETTING_DEFAULTS — ctSetting() returns '' for an unset key, and
- * the default below is applied here, so the key is optional and adding it to
- * that map later changes nothing.
+ * STORED IN THE APP-WIDE `settings` TABLE — the same row db.ts seeds
+ * (`INSERT OR IGNORE INTO settings … 'reservation_band_lead_in_minutes','120'`)
+ * and the same row the importer reads through appSetting() before it hands a
+ * slot to pickBandForSlot(). It used to be read out of the CRM's `ct_settings`
+ * instead, which nothing writes this key to: the owner's configured value was
+ * ignored, the hard-coded default below was permanent, and the Query tab and
+ * relinkBands() would have answered with two different lead-ins the moment
+ * anybody tuned it. Read it where the house keeps it.
  */
 export const BAND_LEAD_IN_KEY = 'reservation_band_lead_in_minutes';
 export const BAND_LEAD_IN_DEFAULT_MINUTES = 120;
 /** Clamped: a negative lead-in would search forwards, and a day-long one makes the filter meaningless. */
 const BAND_LEAD_IN_MAX_MINUTES = 12 * 60;
 
+/** A row of the app-wide `settings` table, or '' — same shape as the importer's
+ *  appSetting(). A database with no settings table (a bare test db) gets the
+ *  default rather than a throw. */
+function appSetting(db: DB, key: string): string {
+  try {
+    const row = db.prepare(`SELECT value FROM settings WHERE key = ?`).get(key) as { value?: unknown } | undefined;
+    return String(row?.value ?? '');
+  } catch { return ''; }
+}
+
 export function bandLeadInMinutes(db: DB): number {
   // The blank check is load-bearing and was caught in test against the real
-  // archive: ctSetting() returns '' for an unset key and Number('') is 0, which
+  // archive: an unset key reads '' and Number('') is 0, which
   // is perfectly finite — so a bare Number() check turned "not configured" into
   // "no lead-in at all" and a 21:00 band matched only from 21:00, losing 84 of
   // the 152 bookings on the busiest Saturday in the archive.
-  const raw = ctSetting(db, BAND_LEAD_IN_KEY).trim();
+  const raw = appSetting(db, BAND_LEAD_IN_KEY).trim();
   if (!raw) return BAND_LEAD_IN_DEFAULT_MINUTES;
   const n = Number(raw);
   if (!Number.isFinite(n)) return BAND_LEAD_IN_DEFAULT_MINUTES;
@@ -128,6 +141,25 @@ export const DEFAULT_LIMIT = 50;
 export const MAX_LIMIT = 200;
 export const MAX_VALUES_PER_LIST = 40;
 const MAX_VALUE_LEN = 120;
+
+/**
+ * HOW MANY OF A BAND'S NIGHTS ONE QUESTION MAY OR TOGETHER.
+ *
+ * A band filter builds one `(night = ? AND slot_time >= ?)` term per night the
+ * act played — `night` being the reserved date, see buildWhere() — so a
+ * resident band is a long OR chain and two bound
+ * parameters per night. 400 nights is a Friday-and-Saturday residency running
+ * for four years — past that the statement text stops being free and the
+ * question has stopped being a question.
+ *
+ * The cap keeps the MOST RECENT nights (the calendar is read newest-first) and
+ * is REPORTED, never silent: `nights_capped` rides in the response echo so the
+ * page can tell the reader to add a date range instead of quietly answering a
+ * narrower question than the one asked. Undated calendar rows sort oldest under
+ * that ordering, so they are the first to fall out when the cap bites — which
+ * is also why the cap has to be visible.
+ */
+export const MAX_BAND_NIGHTS = 400;
 
 /* ── the filter ───────────────────────────────────────────────────────────── */
 
@@ -330,7 +362,26 @@ export function parseReservationFilter(input: unknown): ReservationFilter {
 
 /* ── live bands ───────────────────────────────────────────────────────────── */
 
+/**
+ * ONE OPTION IN THE BAND PICKER — a row of ct_bands, the band MASTER.
+ *
+ * Deliberately NOT a calendar row. `liveBandId` on the wire is a ct_bands id
+ * (that is what /api/crm-calls/bands hands the page, and what the page has
+ * always sent), and the whole bug this shape exists to prevent was one type
+ * standing in for both a master row and a nightly calendar row — the resolver
+ * looked the picker's id up in ct_entertainment, missed every time, and refused
+ * every band anyone chose. A master row has no date and a calendar row has no
+ * is_active, so keeping them as two types with no optional fields is what makes
+ * the compiler catch the confusion instead of the user.
+ */
 export interface BandOption {
+  id: string;
+  name: string;
+  is_active: number;
+}
+
+/** One night on ct_entertainment — one act, one date. Never a picker option. */
+export interface BandNight {
   id: string;
   name: string;
   type: string;
@@ -341,31 +392,106 @@ export interface BandOption {
 }
 
 /**
- * The acts the Query tab can filter by — ct_entertainment, the manager's
- * "What's On" calendar. Bounded and newest-first: this feeds a picker, not a
- * report, and the calendar grows one row per act forever.
+ * The bands the Query tab can filter by — ct_bands, the owner's curated band
+ * master, which is the same list /api/crm-calls/bands serves the picker.
+ *
+ * RETIRED BANDS STAY IN THE LIST (no is_active filter). An act that stopped
+ * playing last year still has every one of its nights in the archive, and
+ * hiding it here would make exactly those nights unaskable; the flag ships so
+ * the caller can label rather than drop. Same reason the page asks for
+ * include_inactive=1.
+ *
+ * NOT ct_entertainment, which is what this read until the band filter moved to
+ * the master: the calendar holds one row per act per NIGHT, so it is both the
+ * wrong grain for a picker and — since resolveBandWindow() now only accepts
+ * master ids — a list of ids the POST would refuse.
+ *
+ * A database without ct_bands yet answers "no bands", not 500. Measured on a
+ * copy of production (2026-08-13) the live database had ct_entertainment but
+ * not ct_bands; db.ts creates it on the next boot, and until then an empty
+ * picker is the honest answer. Same defence as loadBandCalendar().
+ *
+ * ONLY a missing table, though — the same distinction resolveBandWindow() draws
+ * on both of its reads. A corrupt b-tree or a half-applied migration answered as
+ * `[]` is the sentence "there are no bands" said with total confidence about a
+ * table full of bands, and an empty picker gives the reader no way to tell the
+ * two apart. Anything that is not "no such table" is re-thrown.
  */
 export function listLiveBands(db: DB, limit = 200): BandOption[] {
-  return db.prepare(`
-    SELECT id, name, type, event_date, start_time, end_time, area
-      FROM ct_entertainment
-     WHERE event_date <> ''
-     ORDER BY event_date DESC, start_time DESC
-     LIMIT ?
-  `).all(Math.min(1000, Math.max(1, limit))) as BandOption[];
+  try {
+    return db.prepare(`
+      SELECT id, name, COALESCE(is_active, 1) AS is_active
+        FROM ct_bands
+       ORDER BY name COLLATE NOCASE ASC
+       LIMIT ?
+    `).all(Math.min(1000, Math.max(1, limit))) as BandOption[];
+  } catch (e) {
+    if (!/no such table/i.test(e instanceof Error ? e.message : String(e))) throw e;
+    return [];
+  }
 }
 
+/** One night's worth of "who was in the room for this act". */
 export interface BandWindow {
-  band: BandOption;
-  leadInMinutes: number;
-  /** The earliest slot_time on the band's date that counts as "for the band". */
+  /** ct_entertainment.id — which calendar row produced this window. */
+  calendarId: string;
+  eventDate: string;
+  /** ct_entertainment.type, verbatim — see resolveBandWindow() on why it is not filtered. */
+  type: string;
+  startTime: string;
+  endTime: string;
+  /** The earliest slot_time on eventDate that counts as "for the band". */
   matchFrom: string;
   /** True when the lead-in ran off the front of the day and was clamped to 00:00. */
   clamped: boolean;
 }
 
-/** 'HH:MM' → minutes, or null if the calendar row holds free text. */
+/**
+ * A calendar row that could not become a window, and why. Never dropped
+ * silently — this is carried verbatim into the response echo and printed by the
+ * page, which is why it is spelt in the wire's snake_case rather than this
+ * module's internal camelCase.
+ */
+export interface BandSkip {
+  calendar_id: string;
+  event_date: string;
+  start_time: string;
+  reason: string;
+}
+
+/** Everything one chosen band contributes to the question. */
+export interface BandWindows {
+  bandId: string;
+  bandName: string;
+  leadInMinutes: number;
+  /** One per usable night, oldest first. Empty is legal — see buildWhere(). */
+  windows: BandWindow[];
+  /** Calendar rows this band has that could not be used, with the reason. */
+  skipped: BandSkip[];
+  /** True when the band has more than MAX_BAND_NIGHTS nights and older ones were dropped. */
+  capped: boolean;
+}
+
+/**
+ * 'HH:MM' → minutes, or null if the calendar row holds free text.
+ *
+ * A MERIDIEM IS REFUSED, NOT IGNORED. The prefix match below reads "9:00 PM" as
+ * 09:00 — a twelve-hour error that runs the WRONG WAY: a 21:00 band's window
+ * opens at 07:00 instead of 19:00 and the act is credited with the whole day's
+ * lunches, with an empty skipped[] and nothing on screen to say so. That is
+ * exactly the SILENT WIDENING resolveBandWindow()'s skip exists to prevent
+ * (measured on a fixture: 10 of that day's 10 bookings credited instead of 4),
+ * and the mirror case narrows just as quietly — "12:30 AM" reads as 10:30
+ * rather than clamping at 00:00. The What's On start-time box is a plain text
+ * input with no format check on either side, so a meridiem is ordinary typing
+ * rather than corruption: skipped and REPORTED, with the reason already written
+ * below telling the reader to set it as HH:mm.
+ *
+ * Deliberately narrow, so the forms proved correct still are: '19:00:00',
+ * '9:30', ' 21:00' and '21:00 - 23:00' carry no meridiem and are unaffected.
+ */
 function hhmmToMinutes(t: string): number | null {
+  if (/\d\s*[ap]\.?\s*m\b/i.test(String(t || ''))) return null;
   const m = /^(\d{1,2}):(\d{2})/.exec(String(t || '').trim());
   if (!m) return null;
   const h = Number(m[1]); const min = Number(m[2]);
@@ -376,55 +502,248 @@ const minutesToHHMM = (n: number): string =>
   `${String(Math.floor(n / 60)).padStart(2, '0')}:${String(n % 60).padStart(2, '0')}`;
 
 /**
- * Resolve a band into the window its audience actually books into.
+ * PICK A BAND, GET EVERY NIGHT THAT BAND PLAYED.
  *
+ * `bandId` is a ct_bands id — the band MASTER, which is what the picker offers
+ * and what the page has always sent. ct_entertainment has NO band foreign key;
+ * the ONLY link between the master and the nightly calendar is the NAME. So the
+ * resolution is: id → master name → every calendar row carrying that name → one
+ * window per night. The question the owner asks is "how did this band do", not
+ * "how did this one night do", and one band is many nights.
+ *
+ * (Before this, the resolver looked the picker's id up in ct_entertainment.
+ * Master ids and calendar ids are different ids in different tables, so the
+ * lookup missed every time and the filter refused every band ever chosen with
+ * "That act is not on the entertainment calendar".)
+ *
+ * ── MATCHING THE NAME ─────────────────────────────────────────────────────
+ * `TRIM(name) = ? COLLATE NOCASE`, and every word of that is load-bearing.
+ *
+ * COLLATE NOCASE is written EXPLICITLY, not inherited. ct_bands.name is UNIQUE
+ * COLLATE NOCASE — 'Agnee' and 'AGNEE' cannot both be bands — but
+ * ct_entertainment.name is plain BINARY TEXT, and in SQLite the LEFT operand's
+ * column collation wins. Proved on a throwaway db holding AGNEE/Agnee/agnee:
+ * `e.name = b.name` returns 1 row and `b.name = e.name` returns 3, for the same
+ * data. Relying on operand order would make the answer depend on how the
+ * comparison happened to be typed. Same collation the uniqueness was enforced
+ * under, stated so it survives a reorder. (NOCASE folds ASCII A–Z only; a band
+ * named in Devanagari is matched exactly, which SQLite cannot improve on here.)
+ *
+ * TRIM on the calendar side because the master name is the trusted spelling and
+ * a legacy calendar row written before the What's On editor trimmed its input
+ * would otherwise resolve to nothing at all — loadBandCalendar() trims the name
+ * when it READS it but joins it untrimmed, and inherits exactly that gap. Two
+ * acts whose names differ only in surrounding whitespace are one act, so the
+ * trim can only ever recover a night, never merge two bands. It does cost any
+ * future index on ct_entertainment(name) — there is none today, and this is a
+ * scan either way.
+ *
+ * ── `type` IS NOT FILTERED, AND THAT IS A DECISION ────────────────────────
+ * relinkBands()/loadBandCalendar() only credit rows with type='band', because
+ * only those feed ct_bookings.live_band_id. This resolver deliberately takes
+ * EVERY row carrying the name — a 'live_music' or 'dj' row named for the act is
+ * still that act on that night, and the approved behaviour is "every night that
+ * band played". The cost is that this surface can report more nights than the
+ * live_band_id backfill credits, so each window ships its `type` and the echo
+ * carries it to the page rather than hiding the difference.
+ *
+ * ── THE WINDOW, PER NIGHT (unchanged) ─────────────────────────────────────
  * From (start − lead-in) to the END OF SERVICE, which here means "no upper
- * bound inside the band's own date" — see BAND_LEAD_IN_KEY for why the band's
+ * bound inside that night's date" — see BAND_LEAD_IN_KEY for why the band's
  * end_time is not the ceiling. The lead-in clamps at 00:00 rather than reaching
- * back into the previous calendar day: booking_date is a date column, and a
+ * back into the previous calendar day: the night is a date column, and a
  * 00:30 act reaching back to 22:30 of the day before would pull in the whole of
- * the previous evening, which is a different night's business.
+ * the previous evening, which is a different night's business. The lead-in is
+ * read ONCE for the whole band, so every night in one answer shares it.
  *
- * ct_entertainment.start_time is free text ('HH:mm' by convention but nothing
- * enforces it). An unreadable one is a refusal, not a guess — silently treating
- * it as 00:00 would return the entire day under a band's name.
+ * ── AN UNUSABLE NIGHT IS SKIPPED AND REPORTED, NOT REFUSED ────────────────
+ * ct_entertainment.start_time is free text ('HH:mm' by convention; the write
+ * path only does .trim().slice(0,10) and validates no format at all), so an
+ * unreadable one is an ORDINARY row, not corruption. It used to be a refusal
+ * because there was one night to refuse. Under "every night that band played" a
+ * refusal scales wrong: one fat-fingered start time in 2024 would make a band's
+ * ENTIRE history permanently unaskable until someone edits the calendar.
+ *
+ * The hazard the refusal existed for does not apply to a skip. That hazard is
+ * silently treating an unreadable time as 00:00 and returning the whole day
+ * under a band's name — a SILENT WIDENING. A skip only ever narrows, and it is
+ * not silent: every skipped row rides back in `skipped[]` with its reason, and
+ * the page prints them. The house already prefers this — pickBandForSlot()
+ * treats an untimed act as a fallback and resolveLiveBand() sorts untimed rows
+ * last; neither throws.
+ *
+ * A row with no usable event_date is skipped the same way but with its own
+ * reason, because it means something different: both write paths validate
+ * event_date against /^\d{4}-\d{2}-\d{2}$/ and 400 on failure, so an undated
+ * row cannot arrive through the app at all. It is a corruption signal, and
+ * naming it separately is what lets a reader tell a typo from a broken import.
+ *
+ * ZERO usable nights is a legal answer, not an error — see buildWhere(), which
+ * turns it into an always-false predicate rather than no predicate.
  */
-export function resolveBandWindow(db: DB, bandId: string): BandWindow {
-  const band = db.prepare(`
-    SELECT id, name, type, event_date, start_time, end_time, area
-      FROM ct_entertainment WHERE id = ?
-  `).get(bandId) as BandOption | undefined;
-  if (!band) throw new ReservationQueryError('That act is not on the entertainment calendar', 404);
-  if (!band.event_date || !DATE_RE.test(band.event_date)) {
-    throw new ReservationQueryError(`"${band.name || band.id}" has no usable date on the calendar`);
-  }
-  const start = hhmmToMinutes(band.start_time);
-  if (start === null) {
+export function resolveBandWindow(db: DB, bandId: string): BandWindows {
+  let master: BandOption | undefined;
+  try {
+    master = db.prepare(`
+      SELECT id, name, COALESCE(is_active, 1) AS is_active FROM ct_bands WHERE id = ?
+    `).get(bandId) as BandOption | undefined;
+  } catch (e) {
+    // ONLY A MISSING TABLE IS "NOT SET UP YET" — the same test the calendar read
+    // below applies, and for the same reason. This catch used to be bare, so a
+    // corrupt b-tree, a half-applied migration (initializeSchema swallows schema
+    // errors, so a missing column is an ordinary state here), a garbled file and
+    // a locked database ALL came back as the one confident sentence "the band
+    // list has not been set up on this database yet" — about a table that exists
+    // and holds the band. Reproduced on fixture copies for SQLITE_CORRUPT,
+    // "no such column: is_active", SQLITE_NOTADB and SQLITE_BUSY. Fail loud with
+    // the real reason instead; this route is admin-only and the person reading
+    // it is the person who has to fix the database.
+    const why = e instanceof Error ? e.message : String(e);
+    if (!/no such table/i.test(why)) {
+      throw new ReservationQueryError(
+        `The band list could not be read, so no band can be looked up — the answer would be wrong rather than empty (${why})`,
+        500,
+      );
+    }
     throw new ReservationQueryError(
-      `"${band.name || band.id}" has no readable start time (${JSON.stringify(band.start_time)}) — set it as HH:mm to filter by it`,
+      'The band list has not been set up on this database yet, so no band can be looked up',
+      404,
     );
   }
+  if (!master) throw new ReservationQueryError('That band is not in the band list', 404);
+
+  const bandName = String(master.name || '').trim();
+  if (!bandName) {
+    // Blocked by the band master's own write path; refused rather than run,
+    // because an empty name would match every unnamed calendar row.
+    throw new ReservationQueryError('That band has no name on the band list, so its nights cannot be found');
+  }
+
+  // Newest first so the cap, when it bites, keeps the nights someone is most
+  // likely to be asking about. `id` breaks the tie so that a capped band's set
+  // is the SAME set on every request — without it two acts sharing a date and
+  // start time could swap places across the cap boundary and the same question
+  // would quietly answer differently twice running.
+  //
+  // TRIM TAKES AN EXPLICIT CHARACTER SET because bare SQL TRIM() strips U+0020
+  // and NOTHING ELSE, while the master name above went through JS .trim(),
+  // which also strips tab, newline, CR, VT, FF, NBSP and BOM. Left asymmetric,
+  // a calendar row pasted in as ' Agnee' — an ordinary WhatsApp/Word paste
+  // artefact, and the calendar's write path never normalises whitespace the way
+  // the band master's does — matches NOTHING, and because it never becomes a
+  // row this loop can see, it lands in neither `windows` nor `skipped[]`: the
+  // night simply disappears from the band's history with nothing on screen
+  // saying so. Measured on a copy: 3 of one band's 4 nights vanished that way.
+  // This set is JS .trim()'s set for every character that reaches a name in
+  // practice; verified equal to .trim() on tab/LF/CR/NBSP/BOM and on names with
+  // interior spaces, quotes, % and Devanagari, so it can only recover a night,
+  // never merge two acts. (A name of nothing but whitespace trims to '' on both
+  // sides, and an empty master name is already refused above.)
+  let nights: BandNight[] = [];
+  try {
+    nights = db.prepare(`
+      SELECT id, name, type, event_date, start_time, end_time, area
+        FROM ct_entertainment
+       WHERE TRIM(name, char(32,9,10,13,11,12,160,65279)) = ? COLLATE NOCASE
+       ORDER BY event_date DESC, start_time DESC, id DESC
+       LIMIT ?
+    `).all(bandName, MAX_BAND_NIGHTS + 1) as BandNight[];
+  } catch (e) {
+    // ONLY A MISSING TABLE IS "THIS BAND HAS NO NIGHTS". That is the
+    // half-migrated database listLiveBands() defends, and an empty answer is
+    // honest there.
+    //
+    // ANY OTHER failure must NOT be answered as zero nights. Zero windows makes
+    // buildWhere() emit `1 = 0`, the echo carries nights_matched: 0 with an
+    // EMPTY skipped[], and the page then prints the positive claim "… is on the
+    // band list but has no nights on the entertainment calendar" — a confident,
+    // wrong, narrowing answer indistinguishable from a band genuinely never put
+    // on the calendar, with no channel by which the reader learns the database
+    // failed. Reproduced on copies of the database: a corrupt ct_entertainment
+    // b-tree, and a single dropped column, each turned a healthy 39-row answer
+    // into a clean 0. Fail LOUD instead — the reason rides in the message
+    // because this route is admin-only and the person reading it is the person
+    // who has to fix the calendar.
+    const why = e instanceof Error ? e.message : String(e);
+    if (!/no such table/i.test(why)) {
+      throw new ReservationQueryError(
+        `The entertainment calendar could not be read, so this band's nights are unknown — the answer would be wrong rather than empty (${why})`,
+        500,
+      );
+    }
+    nights = [];
+  }
+
+  // One row over the cap is how the cap is DETECTED without a second scan.
+  const capped = nights.length > MAX_BAND_NIGHTS;
+  if (capped) nights = nights.slice(0, MAX_BAND_NIGHTS);
+  nights.reverse();  // oldest → newest, the order a person reads a history in
+
   const leadInMinutes = bandLeadInMinutes(db);
-  const raw = start - leadInMinutes;
-  return {
-    band,
-    leadInMinutes,
-    matchFrom: minutesToHHMM(Math.max(0, raw)),
-    clamped: raw < 0,
-  };
+  const windows: BandWindow[] = [];
+  const skipped: BandSkip[] = [];
+
+  for (const n of nights) {
+    const eventDate = String(n.event_date || '').trim();
+    const startTime = String(n.start_time || '');
+    const calendarId = String(n.id || '');
+    // isRealDate as well as the shape, the same pair parseReservationFilter()
+    // applies to from/to: 2026-02-31 and 2026-13-01 pass /^\d{4}-\d{2}-\d{2}$/
+    // and can never match a stored night, so on the shape check alone they
+    // became OR terms that inflated nights_matched and pushed an impossible
+    // date into first_night/last_night on screen, while being absent from
+    // skipped[]. Both write paths validate shape only, so this is the check
+    // that keeps an impossible date a REPORTED skip instead of a phantom night.
+    if (!eventDate || !DATE_RE.test(eventDate) || !isRealDate(eventDate)) {
+      skipped.push({
+        calendar_id: calendarId,
+        event_date: eventDate,
+        start_time: startTime,
+        reason: 'no usable date on the calendar row',
+      });
+      continue;
+    }
+    const start = hhmmToMinutes(startTime);
+    if (start === null) {
+      skipped.push({
+        calendar_id: calendarId,
+        event_date: eventDate,
+        start_time: startTime,
+        reason: `start time ${JSON.stringify(startTime)} is not readable — set it as HH:mm to include this night`,
+      });
+      continue;
+    }
+    const raw = start - leadInMinutes;
+    windows.push({
+      calendarId,
+      eventDate,
+      type: String(n.type || ''),
+      startTime,
+      endTime: String(n.end_time || ''),
+      matchFrom: minutesToHHMM(Math.max(0, raw)),
+      clamped: raw < 0,
+    });
+  }
+
+  return { bandId: String(master.id), bandName, leadInMinutes, windows, skipped, capped };
 }
 
 /* ── the statement ────────────────────────────────────────────────────────── */
 
-interface BuiltWhere { sql: string; params: unknown[]; band: BandWindow | null }
+interface BuiltWhere { sql: string; params: unknown[] }
 
 /**
  * Every clause is ANDed. Two filters that overlap (a band and a time range, a
  * meal period and a time range) INTERSECT rather than one winning — the caller
  * asked for both, and a filter that quietly stops applying is the bug that
  * makes a number untrustworthy.
+ *
+ * `opts.band` is resolved ONCE by the caller and handed in, not looked up here:
+ * this runs three times per request (rows, aggregates, duplicates) and all
+ * three must describe the same set of nights. It also keeps the refusal for an
+ * unknown band outside db.transaction(), where the duplicate pass lives.
  */
-function buildWhere(db: DB, f: ReservationFilter, opts: { forAggregate: boolean }): BuiltWhere {
+function buildWhere(f: ReservationFilter, opts: { forAggregate: boolean; band: BandWindows | null }): BuiltWhere {
   const where: string[] = [];
   const params: unknown[] = [];
 
@@ -497,14 +816,83 @@ function buildWhere(db: DB, f: ReservationFilter, opts: { forAggregate: boolean 
     params.push(f.outlet);
   }
 
-  let band: BandWindow | null = null;
   if (f.liveBandId) {
-    band = resolveBandWindow(db, f.liveBandId);
-    where.push('b.booking_date = ? AND b.slot_time >= ?');
-    params.push(band.band.event_date, band.matchFrom);
+    const nights = opts.band?.windows ?? [];
+    if (!nights.length) {
+      // ZERO NIGHTS IS NOT "NO BAND FILTER". A band on the master with nothing
+      // on the calendar — the default state of every act the owner adds before
+      // it plays, and the state left when every one of its nights was skipped —
+      // must return NOTHING, not the whole archive under that band's name. An
+      // empty OR chain pushed as an empty string would drop the clause
+      // entirely, which is the worst outcome this engine has: a narrow question
+      // answered with every row in the table. Spelt as an explicit always-false
+      // predicate so it can never be optimised away by accident, and reported
+      // as nights_matched: 0 so the page can say why the answer is empty.
+      where.push('1 = 0');
+    } else {
+      // ONE WINDOW PER NIGHT, ORed: that night's date, and everything from the
+      // lead-in onwards.
+      //
+      // THE NIGHT, NOT THE DAY THE PHONE RANG — the same correction as the
+      // weekday and date clauses above, and for the same reason. This clause
+      // used to test b.booking_date, which is the moment the booking was
+      // CREATED (reservego.ts slotStampOf: "booking_date is when it was BOOKED,
+      // reserved_date is the night they were coming"), while pairing it with
+      // b.slot_time, which is the time half of the NIGHT's stamp. Mixing the two
+      // stamps is wrong in both directions at once: a guest who booked six weeks
+      // ahead and was in the room is dropped, and a guest who merely phoned on
+      // the gig night to book a table for May is counted as audience. Measured
+      // on a fixture of 8 bookings around one 21:00 night, 3 were wrong. The
+      // house's own band-attribution tool agrees with this expression —
+      // relinkBands() (src/lib/reservego-import.ts) resolves the night with the
+      // identical COALESCE before handing the slot to pickBandForSlot().
+      //
+      // ── WHY TWO DISJUNCTS PER NIGHT AND NOT ONE COALESCE ──────────────────
+      // The night is `COALESCE(NULLIF(reserved_date,''), booking_date)`, and
+      // written that way it is also UNINDEXABLE: a function of a column cannot
+      // use idx_ct_bookings_resv_date, so every night's term is evaluated
+      // against every row. MEASURED on an archive-sized fixture (84,000
+      // bookings, 400-night residency, warm cache): the COALESCE form plans as
+      // SCAN b and takes 2,079ms for ONE of the three passes this request
+      // makes — and better-sqlite3 is synchronous, so that is the whole server
+      // stopped for seconds on one click. Spelt as the two cases instead, both
+      // operands are bare columns, SQLite plans MULTI-INDEX OR, and the same
+      // 400-night question costs 13.9ms — faster than the 33.6ms the wrong
+      // column used to manage. Counts verified identical to the COALESCE form
+      // at 1 / 10 / 50 / 200 / 400 nights on that fixture.
+      //
+      // The two cases are exhaustive and disjoint. reserved_date is either a
+      // real date — the Reservego rows, where the first disjunct answers and
+      // '' can never equal a validated event_date — or blank/NULL, which is how
+      // the 40 phone/CRM bookings are stored (they write booking_date only), and
+      // then the guarded second disjunct answers. Dropping the fallback would
+      // make every phone booking unfindable by band.
+      //
+      // ORDER OF MAGNITUDE, NOT ORDER OF PREFERENCE: a row satisfies at most one
+      // disjunct, so the OR cannot double-count.
+      //
+      // THE CAP IS WHAT KEEPS THIS LEGAL. Two OR terms per night against
+      // SQLite's expression-depth ceiling of 1000: measured, this form prepares
+      // and runs at 495 nights and throws "Expression tree is too large" at 498.
+      // MAX_BAND_NIGHTS is 400, so there is ~24% headroom — RE-MEASURE BEFORE
+      // RAISING THAT CAP; the one-disjunct form's own cliff was 996 nights.
+      //
+      // The OUTER parentheses are mandatory: without them the OR chain binds
+      // looser than the ANDs around it and would absorb every preceding clause,
+      // so the weekday, date, status and outlet filters would silently stop
+      // applying the moment a band was picked.
+      //
+      // Only the placeholder run is interpolated, sized to a list this module
+      // bounded at MAX_BAND_NIGHTS — every value stays bound, same discipline
+      // as the dow/status/source lists above.
+      const perNight = "(b.reserved_date = ? AND b.slot_time >= ?)"
+        + " OR (COALESCE(b.reserved_date, '') = '' AND b.booking_date = ? AND b.slot_time >= ?)";
+      where.push(`(${nights.map(() => perNight).join(' OR ')})`);
+      for (const w of nights) params.push(w.eventDate, w.matchFrom, w.eventDate, w.matchFrom);
+    }
   }
 
-  return { sql: where.length ? `WHERE ${where.join(' AND ')}` : '', params, band };
+  return { sql: where.length ? `WHERE ${where.join(' AND ')}` : '', params };
 }
 
 export interface ReservationAggregates {
@@ -554,7 +942,44 @@ export interface ReservationQueryResult {
   /** Duplicates inside the filter, always reported, never counted. */
   duplicate_total: number;
   aggregates: ReservationAggregates;
-  band: { id: string; name: string; event_date: string; start_time: string; end_time: string; lead_in_minutes: number; match_from: string; lead_in_clamped: boolean } | null;
+  /**
+   * WHAT THE BAND FILTER ACTUALLY DID — the page renders this.
+   *
+   * Plural by construction, because one band is many nights. It reports the
+   * SHAPE of the answer (how many nights, over what range) rather than any one
+   * night, and it carries everything that was left out: rows skipped for an
+   * unreadable time or a broken date, and whether the night cap dropped the
+   * older end of a long residency. Those are the only channel by which a
+   * skipped night reaches a human, so nothing here is optional.
+   */
+  band: {
+    /** ct_bands.id, exactly as asked for. */
+    id: string;
+    /** ct_bands.name — the master spelling, not the calendar's. */
+    name: string;
+    lead_in_minutes: number;
+    /** Distinct dates in the filter. 0 is a real answer: on the master, never on the calendar. */
+    nights_matched: number;
+    /** OR terms in the statement — more than nights_matched when an act played twice on a date. */
+    windows_used: number;
+    first_night: string | null;
+    last_night: string | null;
+    /** True when ANY night's lead-in ran off the front of the day and clamped to 00:00. */
+    lead_in_clamped: boolean;
+    /** True when the band has more nights than the cap and the oldest were dropped. */
+    nights_capped: boolean;
+    nights_cap: number;
+    nights: Array<{
+      calendar_id: string;
+      event_date: string;
+      type: string;
+      start_time: string;
+      end_time: string;
+      match_from: string;
+      lead_in_clamped: boolean;
+    }>;
+    skipped: BandSkip[];
+  } | null;
   filter: ReservationFilter;
   took_ms: number;
 }
@@ -577,8 +1002,15 @@ export interface ReservationQueryResult {
 export function runReservationQuery(db: DB, f: ReservationFilter): ReservationQueryResult {
   const t0 = Date.now();
 
-  const rowsWhere = buildWhere(db, f, { forAggregate: false });
-  const aggWhere = buildWhere(db, f, { forAggregate: true });
+  // ONCE, not once per pass. buildWhere runs three times below and a band with
+  // 200 nights is a full scan of ct_entertainment (no index on name) each time;
+  // resolving here also means the three passes cannot disagree about which
+  // nights they are counting, and that an unknown band is refused before the
+  // transaction rather than from inside it.
+  const band = f.liveBandId ? resolveBandWindow(db, f.liveBandId) : null;
+
+  const rowsWhere = buildWhere(f, { forAggregate: false, band });
+  const aggWhere = buildWhere(f, { forAggregate: true, band });
 
   const out = db.transaction(() => {
     // Aggregates in ONE pass. The CASE sums are free once the rows are walked;
@@ -615,7 +1047,7 @@ export function runReservationQuery(db: DB, f: ReservationFilter): ReservationQu
     // How many of the matching rows are duplicates — reported so the screen can
     // say "3,576 duplicates excluded" instead of leaving a gap between the row
     // count and the booking count.
-    const dupWhere = buildWhere(db, { ...f, duplicates: 'only' }, { forAggregate: false });
+    const dupWhere = buildWhere({ ...f, duplicates: 'only' }, { forAggregate: false, band });
     const duplicateTotal = Number(
       (db.prepare(`SELECT COUNT(*) AS n FROM ct_bookings b ${dupWhere.sql}`).get(...dupWhere.params) as any)?.n ?? 0,
     );
@@ -624,7 +1056,7 @@ export function runReservationQuery(db: DB, f: ReservationFilter): ReservationQu
       : f.duplicates === 'only' ? duplicateTotal
         : bookings + duplicateTotal;
 
-    if (f.offset >= total) return { rows: [] as ReservationQueryRow[], total, duplicateTotal, aggregates, band: rowsWhere.band };
+    if (f.offset >= total) return { rows: [] as ReservationQueryRow[], total, duplicateTotal, aggregates };
 
     // ID pass then hydrate by primary key — the same shape as the Bookings list
     // and for the same reason: LIMIT/OFFSET must still PRODUCE every skipped
@@ -638,7 +1070,7 @@ export function runReservationQuery(db: DB, f: ReservationFilter): ReservationQu
       ORDER BY ${SORTABLE[f.sort](d)}, b.id ${d}
       LIMIT ? OFFSET ?
     `).all(...rowsWhere.params, f.limit, f.offset) as Array<{ id: string }>).map((r) => String(r.id));
-    if (!ids.length) return { rows: [] as ReservationQueryRow[], total, duplicateTotal, aggregates, band: rowsWhere.band };
+    if (!ids.length) return { rows: [] as ReservationQueryRow[], total, duplicateTotal, aggregates };
 
     const hydrated = db.prepare(`
       SELECT b.id, b.guest_id, b.booking_date, b.slot_time, b.reserved_time, b.booking_time,
@@ -656,24 +1088,42 @@ export function runReservationQuery(db: DB, f: ReservationFilter): ReservationQu
     // the order that was asked for.
     const byId = new Map(hydrated.map((r) => [String(r.id), r]));
     const rows = ids.map((id) => byId.get(id)).filter(Boolean) as ReservationQueryRow[];
-    return { rows, total, duplicateTotal, aggregates, band: rowsWhere.band };
+    return { rows, total, duplicateTotal, aggregates };
   })();
+
+  // The band echo is built from the ONE resolution above, outside the closure,
+  // so every exit from it — offset past the end, no ids, a full page — reports
+  // the same nights. Threading it through each return is how the two used to
+  // drift apart.
+  const dates = band ? [...new Set(band.windows.map((w) => w.eventDate))].sort() : [];
 
   return {
     rows: out.rows,
     total: out.total,
     duplicate_total: out.duplicateTotal,
     aggregates: out.aggregates,
-    band: out.band
+    band: band
       ? {
-        id: out.band.band.id,
-        name: out.band.band.name,
-        event_date: out.band.band.event_date,
-        start_time: out.band.band.start_time,
-        end_time: out.band.band.end_time,
-        lead_in_minutes: out.band.leadInMinutes,
-        match_from: out.band.matchFrom,
-        lead_in_clamped: out.band.clamped,
+        id: band.bandId,
+        name: band.bandName,
+        lead_in_minutes: band.leadInMinutes,
+        nights_matched: dates.length,
+        windows_used: band.windows.length,
+        first_night: dates[0] ?? null,
+        last_night: dates[dates.length - 1] ?? null,
+        lead_in_clamped: band.windows.some((w) => w.clamped),
+        nights_capped: band.capped,
+        nights_cap: MAX_BAND_NIGHTS,
+        nights: band.windows.map((w) => ({
+          calendar_id: w.calendarId,
+          event_date: w.eventDate,
+          type: w.type,
+          start_time: w.startTime,
+          end_time: w.endTime,
+          match_from: w.matchFrom,
+          lead_in_clamped: w.clamped,
+        })),
+        skipped: band.skipped,
       }
       : null,
     filter: f,
@@ -706,10 +1156,12 @@ export const RESERVATION_QUERY_SCHEMA: { tables: Array<{ table: string; label: s
   tables: [
     { table: 'ct_bookings', label: 'Bookings', description: 'One row per booking — Reservego imports and phone/CRM bookings in one table.' },
     { table: 'ct_guests', label: 'Guests', description: 'The customer master. Joined for the name and number on each row.' },
-    { table: 'ct_entertainment', label: 'Entertainment calendar', description: 'Bands, DJs and events by date — the source of the live-band filter.' },
+    { table: 'ct_bands', label: 'Band master', description: "The owner's curated list of acts. The live-band filter is picked from here; ct_bands.name is the only link into the calendar." },
+    { table: 'ct_entertainment', label: 'Entertainment calendar', description: 'Bands, DJs and events by date. Matched to a band by NAME (there is no band id on it) — one window per night the act played.' },
   ],
   fields: [
-    { table: 'ct_bookings', column: 'booking_date', type: 'date', label: 'Reserved date', filter: 'from / to / dow', note: 'The date the table was booked FOR, not when the booking was made.' },
+    { table: 'ct_bookings', column: 'booking_date', type: 'date', label: 'Booked on (date)', note: 'When the booking was MADE, not the night it was for. Reservego\'s column names read the other way round; this one is identity (the dedupe key) and is only used as a fallback when reserved_date is blank.' },
+    { table: 'ct_bookings', column: 'reserved_date', type: 'date', label: 'Reserved date (the night)', filter: 'from / to / dow / liveBandId', note: 'The night the guest was coming — what every date filter here means. Falls back to booking_date when blank.' },
     { table: 'ct_bookings', column: 'slot_time', type: 'time', label: 'Slot time', filter: 'mealPeriod / timeFrom / timeTo / liveBandId', note: "HH:MM. Falls back to the booking's creation time for a walk-in." },
     { table: 'ct_bookings', column: 'booking_time', type: 'text', label: 'Booked at', note: 'When the booking was created — Reservego\'s unique record.' },
     { table: 'ct_bookings', column: 'reserved_time', type: 'text', label: 'Reserved for (full stamp)' },
@@ -728,8 +1180,11 @@ export const RESERVATION_QUERY_SCHEMA: { tables: Array<{ table: string; label: s
     { table: 'ct_guests', column: 'name', type: 'text', label: 'Guest name' },
     { table: 'ct_guests', column: 'phone_e164', type: 'text', label: 'Guest phone' },
     { table: 'ct_guests', column: 'phone10', type: 'text', label: 'Guest phone (10-digit)' },
-    { table: 'ct_entertainment', column: 'event_date', type: 'date', label: 'Act date', filter: 'liveBandId' },
-    { table: 'ct_entertainment', column: 'start_time', type: 'time', label: 'Act start', filter: 'liveBandId', note: 'The band filter reaches back from here by the lead-in.' },
+    { table: 'ct_bands', column: 'id', type: 'text', label: 'Band', filter: 'liveBandId', note: 'What the picker sends. Resolved to the band name, then to every night that name is on the calendar.' },
+    { table: 'ct_bands', column: 'name', type: 'text', label: 'Band name', filter: 'liveBandId', note: 'Matched to ct_entertainment.name case-insensitively (COLLATE NOCASE) and trimmed.' },
+    { table: 'ct_entertainment', column: 'name', type: 'text', label: 'Act name', filter: 'liveBandId', note: 'The only link back to the band master — the calendar has no band id.' },
+    { table: 'ct_entertainment', column: 'event_date', type: 'date', label: 'Act date', filter: 'liveBandId', note: 'One booking_date window per night the band played, ORed together.' },
+    { table: 'ct_entertainment', column: 'start_time', type: 'time', label: 'Act start', filter: 'liveBandId', note: 'The band filter reaches back from here by the lead-in, clamped at 00:00. A night whose start time is not readable as HH:mm is skipped and reported, never guessed at.' },
   ],
 };
 
