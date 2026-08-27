@@ -534,7 +534,7 @@ export async function PUT(request: Request) {
     // '0' (no ledger row can exist), so this refuses nothing today.
     if (Array.isArray(items) && requisitionHasMovedStock(db, id)) {
       return Response.json({
-        error: 'Cannot change the items on this requisition — stock has already been issued against it. Undo or store-reject the issued lines on the Store Issue desk first.',
+        error: 'Cannot change the items on this requisition — stock has already been issued against it. Undo the issued lines on the Store Issue desk first. (A store-rejected line keeps what was already handed over — un-reject it, then undo it.)',
       }, { status: 400 });
     }
 

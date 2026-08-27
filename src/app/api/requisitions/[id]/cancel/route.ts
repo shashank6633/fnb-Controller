@@ -40,15 +40,19 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     }
     // Stock guard — see the header. A requisition that has already moved stock
     // cannot be cancelled, because cancelling reverses nothing and simultaneously
-    // hides the line from the department balance. The store must undo (or
-    // store-reject) the issued lines on the Issue desk first: that path runs
-    // applyIssueDelta with the negative delta and puts the goods back in central
-    // stock, after which this returns false and the cancel goes through.
+    // hides the line from the department balance. The store must UNDO the issued
+    // lines on the Issue desk first: that path runs applyIssueDelta with the
+    // negative delta and puts the goods back in central stock, after which this
+    // returns false and the cancel goes through.
+    // NOT store-reject. A store-reject now KEEPS what was physically handed over
+    // (it cancels only the outstanding balance), so it is zero-delta and leaves
+    // this guard firing. A store-rejected line must be UN-REJECTED first, then
+    // undone — that is the only sequence that clears this.
     // Returns false for every requisition while `requisition_deduct_at_issue` is
     // '0' (no ledger row can exist), so this refuses nothing today.
     if (requisitionHasMovedStock(db, id)) {
       return Response.json({
-        error: 'Cannot cancel — stock has already been issued against this requisition. Undo or store-reject the issued lines on the Store Issue desk first, then cancel.',
+        error: 'Cannot cancel — stock has already been issued against this requisition. Undo the issued lines on the Store Issue desk first, then cancel. (A store-rejected line keeps what was already handed over — un-reject it, then undo it.)',
       }, { status: 400 });
     }
     db.prepare(`

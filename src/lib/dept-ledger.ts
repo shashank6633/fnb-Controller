@@ -57,10 +57,17 @@ import type Database from 'better-sqlite3';
  *     in the building for every mis-tagged item. Not deducting is visible;
  *     deducting from the wrong kitchen is not.
  *  2. THE NEGATIVE-BALANCE GUARD. assertReversible() THROWS, it does not clamp.
- *     Every reversal caller writes quantity_issued = 0 BEFORE asking us
- *     (store-issue/route.ts:277->278 and :289->290, store-process:384->394), so
- *     a silent clamp commits a line reading "0 issued" against grams that never
- *     came back to the store. A throw rolls that caller's transaction back.
+ *     A caller that really reverses lowers quantity_issued BEFORE asking us —
+ *     store-issue's 'undo' branch zeroes it, store-process rewrites it absolutely
+ *     — so a silent clamp would commit a line reading less issued than the grams
+ *     that actually came back to the store. A throw rolls that caller's
+ *     transaction back.
+ *     WHAT IS NO LONGER TRUE: "every reversal caller writes quantity_issued = 0".
+ *     The store-reject now KEEPS what was physically handed over and cancels only
+ *     the outstanding balance, so a reject on a part-issued line is zero-delta and
+ *     returns at issue-stock.ts's zero-delta gate without ever reaching this rail.
+ *     That is not a reason to weaken the guard — 'undo' is the path it protects,
+ *     and 'undo' still zeroes the column.
  *  3. THE LIQUOR CARVE-OUT. Store-mapped materials (TGBCL / store_stock_ledger)
  *     never reach this rail — the CALLER skips both the central debit and the
  *     department credit and stamps the ledger row's skip reason. Do not add a

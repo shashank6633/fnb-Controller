@@ -59,9 +59,16 @@ function isIssueTokenReplay(e: any): boolean {
  *   defer    → deferred_until + defer_reason set. quantity_issued unchanged.
  *   undo     → clears issued/deferred fields. Use to fix mistakes.
  *              (Does NOT clear a store rejection — use 'unreject' for that.)
- *   reject   → store-rejects the line: store_rejected=1, store_reject_reason=reason,
- *              quantity_issued=0, deferred fields cleared. DISTINCT from the chef's
- *              is_rejected — this is the store saying it cannot fulfil the line.
+ *   reject   → store-rejects the OUTSTANDING balance: store_rejected=1,
+ *              store_reject_reason=reason, deferred fields cleared. What was
+ *              ALREADY issued STAYS issued — quantity_issued, issued_at,
+ *              issued_by and issue_history are untouched and NO stock moves in
+ *              either direction (delta 0). Use 'undo' to reverse a hand-over;
+ *              the two must not overlap. On a line that issued nothing this is
+ *              byte-identical to the old behaviour, and so is a reject on a
+ *              PARTY requisition (carved out — see the branch). DISTINCT from
+ *              the chef's is_rejected — this is the store saying it cannot
+ *              fulfil the REST of the line.
  *   unreject → clears store_rejected + store_reject_reason (line becomes issuable again).
  *
  * Parent requisition status auto-advances to 'fulfilled' when every
@@ -71,23 +78,126 @@ function isIssueTokenReplay(e: any): boolean {
  * issued. Otherwise stays 'mgmt_approved' / 'chef_approved' / 'store_processed'
  * so it remains in the store queue.
  *
- * ── 'fulfilled' IS REVERSIBLE. IT IS NOT ISSUABLE. ─────────────────────────
- * The status gate accepts 'fulfilled' for 'undo' and 'reject' ONLY, and only
- * when EVERY line in the batch is one of those two. This is not a loosening for
- * convenience: the auto-advance below fires the instant the last line is
- * satisfied, so the ordinary mistake — the storekeeper issues the final line,
- * the requisition flips to 'fulfilled', he immediately sees the quantity was
- * wrong — had NO in-app correction, while store-requisitions/page.tsx still
+ * ── 'fulfilled' IS REVERSIBLE, AND SINCE 2026-08-26 IT IS UN-REJECTABLE TOO.
+ *    IT IS STILL NOT ISSUABLE. ────────────────────────────────────────────────
+ * The status gate accepts 'fulfilled' for 'undo', 'reject' and 'unreject' only,
+ * and only when EVERY line in the batch is one of those three. This is not a
+ * loosening for convenience: the auto-advance below fires the instant the last
+ * line is satisfied, so the ordinary mistake — the storekeeper issues the final
+ * line, the requisition flips to 'fulfilled', he immediately sees the quantity
+ * was wrong — had NO in-app correction, while store-requisitions/page.tsx still
  * rendered the Undo button for it. 1,620 of the 1,630 requisitions in this
  * database are 'fulfilled', so without this the spec's partial-reversal
  * requirement is unmet for 99% of them.
  *
- * 'issue', 'defer' and 'unreject' stay blocked on 'fulfilled' — all three push
- * a finished requisition FORWARD, and re-opening one by adding to it (rather
- * than by correcting it) is a different decision that nobody has taken. Mixing
- * a reversal and an issue in one batch therefore refuses too: the batch is
- * judged as a whole, deliberately, so a stray 'issue' entry cannot ride in on
- * an undo's widened window.
+ * 'unreject' JOINED THAT LIST ON 2026-08-26 BY EXPLICIT OWNER DECISION, AND
+ * THIS PARAGRAPH REPLACES THE ONE THAT RECORDED THE OPPOSITE. The superseded
+ * reasoning was: "'issue', 'defer' and 'unreject' stay blocked on 'fulfilled' —
+ * all three push a finished requisition FORWARD, and re-opening one by adding
+ * to it (rather than by correcting it) is a different decision that nobody has
+ * taken." It is kept here verbatim because it was sound at the time and is the
+ * thing a future reader will otherwise re-derive. Two things changed under it:
+ *   1. The owner has now taken that decision, on the date above, after the dead
+ *      end below was demonstrated end-to-end on live data.
+ *   2. Since the Option-A reject stopped un-issuing what was physically handed
+ *      over, an unreject is no longer purely "forward". A store-rejected line
+ *      can now carry REAL issued stock, and refusing the unreject STRANDS it:
+ *      the goods sit in the department against a line nobody can correct.
+ * An unreject moves NO stock at all (see its branch), so admitting it cannot
+ * make the two rails disagree. What it does is put the line back in play — and
+ * when its quantity is short of effective, the DEMOTION in the auto-advance
+ * below takes the requisition back to 'store_processed', which is precisely the
+ * correction being asked for.
+ *
+ * 'issue' AND 'defer' STAY BLOCKED ON 'fulfilled'. Those two genuinely do add
+ * to a finished requisition, and nobody has taken that decision. Mixing either
+ * of them with an admitted action in one batch refuses the WHOLE batch: the
+ * batch is judged as a whole, deliberately, so a stray 'issue' entry cannot
+ * ride in on an unreject's widened window.
+ *
+ * AND THE UNREJECT MUST HAVE SOMETHING TO UNREJECT (2026-08-27). The window
+ * above opened for ONE reason — a store-rejected line stranding real issued
+ * stock — so the admission asks for exactly that line and nothing less: a batch
+ * whose entry to 'fulfilled' depends on 'unreject' is admitted only when one of
+ * the line ids it names IS, right now, store_rejected on THIS requisition (and
+ * not chef-rejected, which the loop skips first). Without that clause the verb
+ * alone was the whole key, and 'unreject' on a bogus id — or on a line nobody
+ * had rejected — cleared the gate, applied nothing, and still ran the
+ * auto-advance below: a 'fulfilled' requisition demoted to 'store_processed'
+ * with fulfilled_at/fulfilled_by destroyed and store_note overwritten, on
+ * `applied: 0`. Measured on a copy of the live db 2026-08-27.
+ *
+ * THIS CLAUSE CANNOT REGRESS ANYTHING, and that is why it is safe to add here:
+ * it narrows the admission the 2026-08-26 decision ADDED, and touches no other.
+ * A batch with no 'unreject' in it never evaluates the clause, so 'undo'-only
+ * and 'reject'-only on 'fulfilled' answer exactly as they did before either
+ * change — the 1,620 fulfilled requisitions are untouched. Formally: the
+ * admitted set is now (pre-2026-08-26 set) ⊆ (with-clause set) ⊆ (2026-08-26
+ * set), so no request that used to return 200 can return 400.
+ *
+ * WHAT IT DOES NOT CLOSE, stated plainly so nobody reads more into it. The
+ * auto-advance below runs whether or not the loop applied anything, so a batch
+ * that matches no line STILL demotes a finished requisition. That is
+ * PRE-EXISTING, not a side effect of the widened window: 'undo' and 'reject'
+ * with an unknown line id do it too and always did (both measured, same day,
+ * same fixture — 200 {applied:0}, fulfilled → store_processed, fulfilled_at
+ * cleared, store_note overwritten). Gating the status writes on the batch
+ * having applied something would change 'undo'/'reject' behaviour on every one
+ * of those 1,620 rows, which is a decision for the owner and not a repair to
+ * make by side effect from here. All this clause does is refuse to be the third
+ * door. The same is true of the race: if a line is unrejected by someone else
+ * between this pre-flight read and the transaction, the batch is admitted and
+ * the unreject branch no-ops — landing back on the pre-existing behaviour, no
+ * worse than it.
+ *
+ * TWO SETS, NOT ONE, AND THE SPLIT IS LOAD-BEARING. REVERSAL_ACTIONS is still
+ * exactly {undo, reject}, because that is what the word REVERSAL means here —
+ * the two gestures that pull goods back — and it now feeds ONE thing: the
+ * wording of the PARTY refusal. The finished-window admission reads its own
+ * FINISHED_WINDOW_ACTIONS. Folding 'unreject' into REVERSAL_ACTIONS would have
+ * re-worded the party refusal ("Cannot reverse a fulfilled party requisition")
+ * for a gesture that reverses nothing, and party's window must not move in any
+ * direction — see the party paragraph below.
+ *
+ * ONE CONSEQUENCE OF THE OPTION-A REJECT, KNOWN AND ACCEPTED. It moves no gram
+ * wrongly; do not "fix" it by re-zeroing the column, which is the bug this rail
+ * was repaired for.
+ *   On a line with NOTHING OUTSTANDING (already issued in full) a reject
+ *   cancels nothing and keeps everything. It is no longer the full reversal it
+ *   used to be in the widened 'fulfilled' window above — 'undo' is.
+ *
+ * THE DEAD END, NOW CLOSED — recorded because the fix above only makes sense
+ * against it. It read: because store_rejected counts as "done" in the
+ * auto-advance, rejecting the last open line flips the requisition to
+ * 'fulfilled'; 'unreject' was then refused by the status gate, and 'undo' is
+ * skipped by the store-rejected guard below and answers
+ * {success:true, applied:0} — silently. A line that kept real issued stock had
+ * no in-app path back; the GOODS stayed recoverable (the department ledger row
+ * stands, so return-stock.ts works) but the LINE could not be corrected.
+ * Admitting 'unreject' to the finished window is the fix: unreject, then undo.
+ *
+ * THE STORE-REJECTED GUARD BELOW IS PER-ENTRY, NOT PER-BATCH, and this
+ * paragraph says so because an earlier draft of it claimed the opposite. The
+ * guard (`cur.store_rejected && action !== 'unreject'` → skip) reads the line as
+ * it stands AT THAT ENTRY, from the re-read a few lines above it. So it stops
+ * a bare 'undo' on a rejected line — which is what it is for, and what makes
+ * "unreject first, then undo" the shape of the correction — but it does NOT
+ * stop the two arriving as `[{unreject},{undo}]` in ONE body: the second entry
+ * re-reads a line the first has already cleared and proceeds. Measured
+ * 2026-08-27: 200 {applied:2}, store_rejected 1→0 and quantity_issued 200→0 in
+ * a single request.
+ *
+ * That is LEFT AS IT IS, on purpose, and the wording is what changed instead.
+ * The data outcome is right — the 'undo' goes through applyIssueDelta with
+ * every clamp intact, so no gram is manufactured — and no screen sends such a
+ * batch: unrejectLine posts exactly one entry (store-requisitions/page.tsx),
+ * and the only multi-entry body the page builds is the half-transfer
+ * [issue, defer], which the window above refuses on 'fulfilled' outright.
+ * Making the guard order-independent would also change how a
+ * 'store_processed' requisition answers the same body, which is pre-existing
+ * behaviour on a status this decision never touched. A comment asserting a
+ * safety property the code does not hold is worth less than no comment: this
+ * is what the code does.
  *
  * PARTY REQUISITIONS ARE EXCLUDED FROM THE WIDENED WINDOW, on purpose. Their
  * stock moves on the party rail (applyPartyFulfillment), which applyIssueDelta
@@ -125,8 +235,9 @@ function isIssueTokenReplay(e: any): boolean {
  * Every write to quantity_issued here is mirrored to applyIssueDelta()
  * (src/lib/issue-stock.ts), THE single writer of requisition stock. Per its
  * caller contract this route: reads the before-quantity INSIDE the transaction
- * immediately before the UPDATE (undo/reject zero the column and blank
- * issue_history in one statement — read it late and the pre-image is gone),
+ * immediately before the UPDATE (undo — and a reject on a line that issued
+ * nothing, or on the party rail — zeroes the column and blanks issue_history in
+ * one statement, so read it late and the pre-image is gone),
  * and calls the helper inside this route's own transaction so its writes roll
  * back with ours. The helper owns the party skip, the liquor carve-out, the
  * unit conversion, the inventory_transactions row, the ledger row, the
@@ -166,10 +277,50 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     // with zero lines against a dead status: the empty-lines 400 below used to
     // be unreachable there. The status refusal still wins — the gate sits ahead
     // of that check, exactly where it sat before.
+    // TWO SETS, KEPT APART ON PURPOSE — see "TWO SETS, NOT ONE" in the header.
+    //
+    // REVERSAL_ACTIONS = the gestures that pull goods BACK. Unchanged, and its
+    // one remaining consumer is the party refusal's wording below. Removing
+    // either entry turns a 200 into a 400 for the 1,620 fulfilled requisitions
+    // in this database.
     const REVERSAL_ACTIONS = new Set(['undo', 'reject']);
+    // FINISHED_WINDOW_ACTIONS = the gestures a FINISHED ('fulfilled')
+    // requisition admits. REVERSAL_ACTIONS plus 'unreject' (owner decision,
+    // 2026-08-26). 'issue' and 'defer' are deliberately absent: they add to a
+    // finished requisition, which is still nobody's decision.
+    const FINISHED_WINDOW_ACTIONS = new Set(['undo', 'reject', 'unreject']);
     const actions: string[] = lines.map((ln: { action?: unknown }) => String(ln?.action || '').toLowerCase());
-    // EVERY line, not SOME. A batch is reversal-only or it is not; `[].every()`
-    // is true, hence the length guard. See "'fulfilled' IS REVERSIBLE" above.
+    // EVERY line, not SOME. A batch clears the finished window as a whole or
+    // not at all; `[].every()` is true, hence the length guard. One 'issue' or
+    // 'defer' anywhere in the batch fails this and refuses the batch entire.
+    // See "'fulfilled' IS REVERSIBLE" above.
+    // THE VERB IS NOT THE WHOLE KEY — see "AND THE UNREJECT MUST HAVE SOMETHING
+    // TO UNREJECT" in the header. Only asked when the batch actually contains an
+    // 'unreject'; a pure {undo, reject} batch never reaches this query and is
+    // admitted exactly as it was before either 2026-08 change.
+    const hasUnreject = actions.includes('unreject');
+    const unrejectIds: string[] = hasUnreject
+      ? lines
+          .filter((ln: { action?: unknown }) => String(ln?.action || '').toLowerCase() === 'unreject')
+          .map((ln: { id?: unknown }) => String(ln?.id ?? ''))
+          .filter((s: string) => s !== '')
+      : [];
+    // store_rejected = 1 AND NOT chef-rejected, matching the loop below exactly:
+    // it skips is_rejected lines BEFORE it reaches the unreject branch, so a
+    // chef-rejected line is not something this route can unreject and must not
+    // buy entry to the finished window.
+    const unrejectHasTarget = unrejectIds.length > 0 && Number((db.prepare(`
+      SELECT COUNT(*) AS c FROM requisition_items
+      WHERE req_id = ? AND COALESCE(store_rejected, 0) = 1 AND COALESCE(is_rejected, 0) = 0
+        AND id IN (${unrejectIds.map(() => '?').join(',')})
+    `).get(id, ...unrejectIds) as { c?: number }).c || 0) > 0;
+    const finishedOnly = actions.length > 0
+      && actions.every(a => FINISHED_WINDOW_ACTIONS.has(a))
+      && (!hasUnreject || unrejectHasTarget);
+    // Strictly "is this batch a reversal?", which an unreject is not. Read ONLY
+    // by partyBlocked below, so that a party unreject-on-fulfilled keeps the
+    // generic status refusal it has always had rather than being told it cannot
+    // "reverse" something it was never going to reverse.
     const reversalOnly = actions.length > 0 && actions.every(a => REVERSAL_ACTIONS.has(a));
     const isParty = String(r.purpose || '') === 'party';
 
@@ -179,11 +330,20 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     // if they disagreed, a reversal could clear the pre-flight gate and then be
     // refused by the re-check (or worse, the reverse).
     const okStatuses = new Set(['mgmt_approved', 'chef_approved', 'store_processed']);
-    if (reversalOnly && !isParty) okStatuses.add('fulfilled');
+    // `finishedOnly`, not `reversalOnly` — the ONLY behavioural change of the
+    // 2026-08-26 decision. `!isParty` is untouched, so the party window is
+    // byte-identical to what it was: a party requisition never gains
+    // 'fulfilled' here, for any action, exactly as before.
+    if (finishedOnly && !isParty) okStatuses.add('fulfilled');
     if (!okStatuses.has(r.status)) {
       // Name the party carve-out rather than hiding it behind the generic
       // status message — otherwise the storekeeper goes looking for a status
       // problem that is not there.
+      // reversalOnly, NOT finishedOnly. This message explains why a REVERSAL is
+      // refused on the party rail; a party 'unreject' on a fulfilled req is
+      // refused too, but by the ordinary status rule and with the ordinary
+      // message — the same 400 it has always returned. Party gains nothing and
+      // loses nothing from the 2026-08-26 decision.
       const partyBlocked = reversalOnly && isParty && r.status === 'fulfilled';
       return Response.json({
         error: partyBlocked
@@ -255,14 +415,39 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           issue_history = '[]'
       WHERE id = ?
     `);
-    // Store-side rejection. Distinct from the chef's is_rejected. Reset any issue
-    // progress + deferred fields so the line reads cleanly as "store-rejected".
+    // Store-side rejection. Distinct from the chef's is_rejected.
+    //
+    // TWO STATEMENTS, AND THE SPLIT IS THE WHOLE FIX. A reject cancels the
+    // OUTSTANDING balance; it does NOT un-hand-over what the storekeeper has
+    // already physically carried to the kitchen. REQ-2026-0620: 240 eggs asked,
+    // ~200 handed over, reject pressed to kill the last 40 — the old single
+    // statement zeroed all 240 and applyIssueDelta credited 200 eggs back into a
+    // store that does not hold them while debiting a kitchen that does.
+    // 'undo' already means "reverse everything"; reject must not overlap it.
+    //
+    // updReject: nothing was handed over (or the party rail owns the line — see
+    // the reject branch). Byte-identical to the pre-fix statement, kept verbatim
+    // so a 0-issued reject writes the same row it always did.
     const updReject = db.prepare(`
       UPDATE requisition_items
       SET store_rejected = 1, store_reject_reason = ?,
           quantity_issued = 0, issued_at = NULL, issued_by = NULL,
           deferred_until = NULL, defer_reason = '',
           issue_history = '[]'
+      WHERE id = ?
+    `);
+    // updRejectKeep: something WAS handed over. quantity_issued, issued_at,
+    // issued_by and issue_history are LEFT ALONE — they are the evidence that
+    // the goods moved, and the ledger row that moved them is still standing.
+    // The defer pair IS cleared, exactly as before: a deferred_until was the
+    // store's promise to deliver the remainder later, and that promise is
+    // precisely what the reject cancels. (The auto-advance never reads it on a
+    // rejected line — store_rejected short-circuits below — so this is for the
+    // screens and for defer-due-check.)
+    const updRejectKeep = db.prepare(`
+      UPDATE requisition_items
+      SET store_rejected = 1, store_reject_reason = ?,
+          deferred_until = NULL, defer_reason = ''
       WHERE id = ?
     `);
     const updUnreject = db.prepare(`
@@ -371,26 +556,82 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           }});
         } else if (action === 'reject') {
           const reason = String(ln.reason || '').trim();
-          // Same pre-image rule as undo — updReject also zeroes the column.
+          // Same pre-image rule as undo — updReject still zeroes the column on
+          // the nothing-issued path.
           const beforeQty = Number(cur.quantity_issued) || 0;
-          updReject.run(reason, cur.id);
+          // OPTION A: cancel the OUTSTANDING balance, keep what already moved.
+          //
+          // PARTY IS CARVED OUT, deliberately. A party requisition at
+          // mgmt_approved / chef_approved / store_processed IS admitted by this
+          // route, and if the reject is the gesture that completes it the
+          // auto-advance below fires applyPartyFulfillment — which selects every
+          // line with NO store_rejected filter (party-fulfillment.ts:63-70) and
+          // transfers each one with quantity_issued > 0. Keeping the quantity
+          // there would move real grams that do not move today, on a rail this
+          // change is not allowed to touch. So a party reject keeps the old
+          // zeroing behaviour exactly, stock-neutral as it already was
+          // (applyIssueDelta leaves stockQty at 0 for party — issue-stock.ts:340).
+          // The grams a part-issued party line handed over are booked nowhere
+          // today; that is a separate, pre-existing hole and a separate owner
+          // decision, NOT something to fix by side effect here.
+          const keepIssued = !isParty && beforeQty > 0;
+          const keptQty = keepIssued ? beforeQty : 0;
+          (keepIssued ? updRejectKeep : updReject).run(reason, cur.id);
+          // Called on BOTH paths so this file's "every write to quantity_issued
+          // is mirrored to applyIssueDelta" contract stays literally true. On
+          // the keep path before === after, so deltaLine is 0 and the zero-delta
+          // gate (issue-stock.ts:316) returns before any clamp, any stock write,
+          // any inventory_transactions row, any ledger row, any department
+          // credit and any client_token burn: a kept reject moves no stock in
+          // either direction, ever. The zeroing paths pass the same
+          // beforeQty -> 0 they always did.
           applyIssueDelta(db, {
-            reqItemId: cur.id, beforeLineQty: beforeQty, afterLineQty: 0,
+            reqItemId: cur.id, beforeLineQty: beforeQty, afterLineQty: keptQty,
             reason: 'store_reject', actor: me.email, clientToken,
           });
+          // keptQty, not a hardcoded 0. audit_events is the chain of custody;
+          // an after-image claiming 0 issued on a line that kept 200 would be a
+          // false record on the one surface that must never lie.
           auditPerLine.push({ id: it.id, material: it.material_name, action, before, after: {
-            store_rejected: 1, store_reject_reason: reason, quantity_issued: 0,
+            store_rejected: 1, store_reject_reason: reason, quantity_issued: keptQty,
           }});
         } else if (action === 'unreject') {
-          // EXPLICITLY NO STOCK MOVEMENT, and applyIssueDelta is deliberately
-          // NOT called. unreject clears store_rejected + store_reject_reason
-          // and nothing else; quantity_issued is already 0 (the matching
-          // 'reject' zeroed it and already returned the negative delta), so
-          // before === after === 0 by construction and the correct delta is 0.
-          // The helper is not asked for that zero because its needs-unit-review
-          // branch (issue-stock.ts:168-172) writes a ledger row even at delta 0,
-          // which would make lineHasMovedStock() true for a line this action
-          // never moved a gram of.
+          // NOTHING TO CLEAR IS NOT AN ACTION. Without this the branch ran
+          // updUnreject on a line whose store_rejected was already 0, counted
+          // toward `applied`, and pushed a req_item.store_unreject event whose
+          // before AND after both read store_rejected: 0 — a custody entry for a
+          // change of custody that did not happen, on the one surface this file
+          // calls the chain of custody. Measured 2026-08-27: 200 {applied:1} on
+          // a line left byte-identical. `continue`, not a silent fall-through,
+          // so it is also not counted: `applied` is what the storekeeper reads
+          // back as "how many lines did that touch".
+          //
+          // The admission rule above already refuses most of these at the door
+          // on a 'fulfilled' requisition. This is the same rule stated where the
+          // write happens, and it is what covers the statuses that rule never
+          // gated (a 'store_processed' requisition admits every action) and the
+          // race the pre-flight read cannot see. It also ends the token replay:
+          // 'unreject' burns no client_token, so a re-POST used to write a
+          // second identical audit event; the second one now finds the line
+          // already clear and does nothing.
+          if (!cur.store_rejected) continue;
+          // EXPLICITLY NO STOCK MOVEMENT. unreject clears store_rejected +
+          // store_reject_reason and NOTHING else — in particular it does not
+          // touch quantity_issued, so before === after by construction whatever
+          // the value is, and the correct delta is 0. applyIssueDelta is
+          // therefore not called; calling it would be harmless (the zero-delta
+          // gate at issue-stock.ts:316 returns ahead of every write) but it
+          // would say nothing.
+          //
+          // THE VALUE IS NO LONGER NECESSARILY 0. Since reject stopped
+          // un-issuing what was physically handed over, a line can sit
+          // store_rejected carrying quantity_issued = 200 of 240. Unrejecting it
+          // restores exactly that state: 200 issued, 40 outstanding, issuable
+          // again — and the 200 never left the ledger, so there is nothing to
+          // put back. Do NOT "restore" quantity_issued from issue_history here
+          // and do NOT treat the line as fresh: the next 'issue' is INCREMENTAL
+          // (newQty = beforeQty + addQty), so issuing the remaining 40 lands on
+          // 240, which is the point.
           updUnreject.run(cur.id);
           auditPerLine.push({ id: it.id, material: it.material_name, action, before, after: {
             store_rejected: 0, store_reject_reason: '',

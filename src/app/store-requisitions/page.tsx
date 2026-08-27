@@ -29,6 +29,13 @@
  *   store_processed → fulfilled (when every non-rejected, non-deferred line
  *                                has quantity_issued >= chef_approved_qty).
  *
+ * 'fulfilled' IS A WORKFLOW STATE, NOT A DELIVERY CLAIM, and this page prints
+ * three different words for it — Fulfilled / Closed short / Closed — depending
+ * on what was actually handed over. A rejected line counts as "done" in that
+ * rule, so a requisition where the store rejected everything reached
+ * 'fulfilled' and the card said "Fulfilled" at somebody holding an empty tray.
+ * See deliveryState(): display only, no new status, the route's rule untouched.
+ *
  * The tabs are ROLL-UPS of the line columns, not a second status field, so one
  * requisition can legitimately sit in more than one: a half-issued req is in
  * "Issued Today" (goods did move) AND "Balance Pending" (goods are still owed).
@@ -114,12 +121,41 @@ interface Requisition {
    * that physically left the store disappear from the roll-up. This is the count
    * that still sees them. It is additive: nothing reads it in place of the five
    * fields above, which badges and tab predicates depend on.
+   *
+   * "WHATEVER ELSE IS TRUE OF THEM" NOW INCLUDES store_rejected. Since the
+   * Option-A reject stopped un-issuing what the storekeeper had physically
+   * handed over, a store-rejected line can carry 200 of 240 — and this counter
+   * used to skip it wholesale, so the one number meant to see every hand-over
+   * was the one that lost it.
    */
   lines_issued_any: number;
-  /** Σ max(0, effective − issued) over non-rejected lines. MIXED UNITS by
-   *  design (each line carries its own unit), so this is only ever asked
-   *  `> 0` — "is anything still owed?". Never render it as a number. */
+  /** Store-rejected lines that KEPT a real hand-over (quantity_issued > 0).
+   *  Goods went out and the line is closed. Carved out of lines_issued_any so
+   *  the "sent, not closed" chip, which promises the goods are still owed, does
+   *  not claim them. */
+  lines_rejected_kept: number;
+  /** The subset of lines_rejected_kept where the reject actually CUT something:
+   *  issued > 0 AND a remainder was still outstanding. The other kind — a line
+   *  rejected after it had already been issued in full — cancelled nothing (see
+   *  the route's "ONE CONSEQUENCE" note) and must not be advertised as if it
+   *  had. Only this count earns the "sent, then cancelled" chip. */
+  lines_rejected_cut: number;
+  /** Σ max(0, effective − issued) over lines that are still OPEN. A rejected
+   *  line (chef or store) contributes NOTHING: its balance was cancelled, not
+   *  owed. MIXED UNITS by design (each line carries its own unit), so this is
+   *  only ever asked `> 0` — "is anything still owed?". Never render it as a
+   *  number. */
   qty_outstanding: number;
+  /** Σ quantity_issued over EVERY line, rejected ones included — "did anything
+   *  physically leave the store on this requisition?". MIXED UNITS, same rule
+   *  as qty_outstanding: only ever asked `> 0`, never rendered. */
+  qty_issued: number;
+  /** Σ of what a REJECTION cancelled: max(0, asked − issued) over lines the
+   *  chef or the store rejected, where `asked` is quantity_requested for a
+   *  chef-rejected line (its effective qty is 0 by definition) and the
+   *  effective qty otherwise. MIXED UNITS, only ever asked `> 0`. This is the
+   *  number that separates "Fulfilled" from "Closed short"/"Closed". */
+  qty_cancelled: number;
   /** Did any line move goods today (IST)? Independent of `status`. */
   issued_today: boolean;
 }
@@ -734,15 +770,38 @@ export default function StoreRequisitionsPage() {
   // wrong item, etc.). Distinct from the chef's rejection. Prompts for a reason,
   // then marks the line store_rejected via the store-issue endpoint.
   const rejectLine = async (req: Requisition, line: ReqLine) => {
-    const reason = prompt(`Reject "${line.material_name}"? Give a reason (the store cannot fulfil this line):`, '');
+    /* SAY WHAT THE REJECT IS ABOUT TO DO, because it now does two different
+       things depending on the line. It cancels the OUTSTANDING balance; it does
+       NOT un-hand-over what the storekeeper has already physically carried to
+       the kitchen (Option A). On a line that issued nothing that is the same
+       sentence it always was, so that prompt is left word-for-word. On a
+       part-issued line the old prompt said nothing about the 200 eggs that are
+       staying issued, which is exactly the half the storekeeper needs to agree
+       to. Quantities in the PURCHASE unit, like every other figure on the row. */
+    const U = lineUnits(line);
+    const s = lineSplit(line);
+    const q = (v: number) => `${fmtNum(U.toPU(v))}${U.pu ? ` ${U.pu}` : ''}`;
+    const ask = s.issued > 0
+      ? `Reject the balance of "${line.material_name}"?\n\n`
+        + `• ${q(s.issued)} of ${q(s.effective)} has already been handed over — that STAYS issued, `
+        + `and the goods stay with the department.\n`
+        + `• The remaining ${q(s.outstanding)} is cancelled — the department will not get it.\n\n`
+        + `Give a reason:`
+      : `Reject "${line.material_name}"? Give a reason (the store cannot fulfil this line):`;
+    const reason = prompt(ask, '');
     if (reason === null) return;                       // cancelled
     const batch = [{ id: line.id, material_name: line.material_name }];
     setBusyLine(line.id);
     clearBlocked(line.id);
     try {
-      // A store-reject on an ALREADY-ISSUED line is a reversal too — it zeroes
-      // quantity_issued, so the goods have to come back from the kitchen exactly
-      // as an undo does. Same pre-check, same refusal panel.
+      // THE PRE-CHECK STAYS, and it stays on the 'reject' action. A reject no
+      // longer zeroes quantity_issued, so on a part-issued line it moves no
+      // stock and the server has nothing to refuse — the pre-check simply comes
+      // back empty and costs one round-trip. It is still asked because the
+      // server, not this page, owns which rejects are reversals: a PARTY line
+      // is still zeroed by the route's carve-out, and that IS a reversal the
+      // department can refuse. Deciding here would mean re-implementing that
+      // carve-out client-side, which is how the two drift apart.
       const pre = await precheckReversal(req.id, batch, 'reject');
       if (Object.keys(pre).length > 0) { setBlockedReversals(s => ({ ...s, ...pre })); return; }
       const r = await api(`/api/requisitions/${req.id}/store-issue`, {
@@ -756,6 +815,32 @@ export default function StoreRequisitionsPage() {
   };
 
   const unrejectLine = async (req: Requisition, line: ReqLine) => {
+    /* ASK FIRST, because this click stopped being cosmetic. Since 'unreject' was
+       admitted on a finished requisition (store-issue/route.ts, 2026-08-26) it
+       can put an item back below its approved quantity, which sends the whole
+       requisition from 'Fulfilled' back to the store queue and CLEARS
+       fulfilled_at / fulfilled_by — the stamp is not recoverable, a later
+       re-fulfilment writes a new one. Its two neighbours already ask (undoLine
+       confirms, rejectLine prompts for a reason); this was the only reversal on
+       the row that fired straight at the API. Named quantities, so the
+       storekeeper is agreeing to something concrete. */
+    const U = lineUnits(line);
+    const s = lineSplit(line);
+    const q = (v: number) => `${fmtNum(U.toPU(v))}${U.pu ? ` ${U.pu}` : ''}`;
+    const reopens = req.status === 'fulfilled' && s.issued < s.effective;
+    // The cancelled clause is dropped when the reject cancelled nothing (the
+    // line had already been issued in full), where "0 BTL goes back to
+    // outstanding" is noise rather than information.
+    const ask = `Clear the store rejection on "${line.material_name}"?\n\n`
+      + `• The line becomes issuable again`
+      + (s.issued > 0
+          ? ` — ${q(s.issued)} already handed over stays issued`
+            + (s.cancelled > 0 ? `, ${q(s.cancelled)} goes back to outstanding.\n` : `.\n`)
+          : `.\n`)
+      + (reopens
+          ? `• This requisition will go back to the store queue and lose its "fulfilled" timestamp.\n`
+          : '');
+    if (!confirm(ask)) return;
     setBusyLine(line.id);
     try {
       const r = await api(`/api/requisitions/${req.id}/store-issue`, {
@@ -1093,9 +1178,10 @@ function stockLevel(line: ReqLine): {
   if (raw == null) return { qty: null, dot: '', text: '', title: '' };
   const qty = Number(raw) || 0;                       // recipe units (rm.current_stock)
   const U = lineUnits(line);
-  const need = U.toRecipe(                            // line basis → recipe basis
-    Math.max(0, effectiveQty(line) - (Number(line.quantity_issued) || 0)),
-  );
+  // lineSplit, not a raw (effective − issued): on a store-rejected line the
+  // remainder was CANCELLED, so this line needs nothing more off the shelf and
+  // must not paint the material red for a demand that no longer exists.
+  const need = U.toRecipe(lineSplit(line).outstanding);  // line basis → recipe basis
   const reorder = Number(line.reorder_level) || 0;    // recipe units (rm.reorder_level)
 
   if (qty <= 0 || qty < need) {
@@ -1123,18 +1209,30 @@ function stockLevel(line: ReqLine): {
 
 function lineSplit(line: ReqLine): {
   effective: number; issued: number; outstanding: number;
-  deferred: number; open: number; isSplit: boolean;
+  deferred: number; open: number; cancelled: number; isSplit: boolean;
 } {
   const effective = effectiveQty(line);
   const issued = Math.max(0, Number(line.quantity_issued) || 0);
-  const outstanding = Math.max(0, effective - issued);
+  const remainder = Math.max(0, effective - issued);
+  // A STORE-REJECTED LINE OWES NOTHING. The reject cancelled the outstanding
+  // balance — that is the whole meaning of the gesture — so the remainder moves
+  // out of `outstanding` and into `cancelled`. It stopped being academic with
+  // the Option-A reject: a line rejected after a part hand-over sits at 200 of
+  // 240, and reading the leftover 40 as "still owed" puts the store back on the
+  // hook for goods the storekeeper has already declared it cannot supply.
+  // (A chef-rejected line already lands here with effective = 0 — see
+  // effectiveQty — so its remainder is 0 and nothing changes for it.)
+  const cancelledByStore = !!line.store_rejected;
+  const outstanding = cancelledByStore ? 0 : remainder;
   const promised = !!line.deferred_until;
   return {
     effective, issued, outstanding,
     deferred: promised ? outstanding : 0,
     open:     promised ? 0 : outstanding,
+    /** What the rejection wrote off. 0 on every line nobody rejected. */
+    cancelled: cancelledByStore ? remainder : 0,
     // The owner's case in one boolean: goods went out AND goods are still owed,
-    // on the SAME line.
+    // on the SAME line. A rejected line is never "split" — nothing is owed.
     isSplit: issued > 0 && outstanding > 0,
   };
 }
@@ -1148,7 +1246,11 @@ function openIssuableLines(req: Requisition): Array<ReqLine & { remaining: numbe
   const out: Array<ReqLine & { remaining: number }> = [];
   for (const line of req.items || []) {
     if (line.is_rejected) continue;
-    if (line.store_rejected) continue;      // store rejected — never in the Issue-All batch
+    // Store rejected — never in the Issue-All batch, and this `continue` is
+    // CORRECT under Option A rather than in spite of it. A rejected line may now
+    // carry a real hand-over, but its balance was cancelled: it owes nothing, so
+    // it is not "open". Un-reject it first if it should be issuable again.
+    if (line.store_rejected) continue;
     if (line.deferred_until) continue;
     const remaining = Math.max(0, effectiveQty(line) - (Number(line.quantity_issued) || 0));
     if (remaining > 0) out.push({ ...line, remaining });
@@ -1181,25 +1283,83 @@ function mergeStats(req: any): Requisition {
   // Counted ALONGSIDE the partition above, never instead of it — the five
   // existing fields are what the header badges and every tab predicate read.
   let issuedAny = 0;
+  let rejectedKept = 0, rejectedCut = 0;
+  let qtyIssued = 0, qtyCancelled = 0;
   let issuedToday = false;
   for (const it of items) {
-    if (it.is_rejected) continue;
-    if (it.store_rejected) continue;      // store rejected — not counted as open/issued/deferred
-    const eff = effectiveQty(it);
     const got = Number(it.quantity_issued) || 0;
+    // WHAT LEFT THE STORE IS COUNTED FIRST, BEFORE ANY SKIP. Under the Option-A
+    // reject a store-rejected line can carry a REAL hand-over (200 of 240
+    // eggs), and the old `continue` pair below dropped it from every roll-up on
+    // this page — the requisition read "nothing went out" while 200 eggs were
+    // in the kitchen. These three lines see every hand-over regardless of what
+    // else is true of the line; the partition below still does not.
+    qtyIssued += got;
+    if (got > 0) issuedAny++;
+    if (!issuedToday && issuedOnDay(it, reqStamp, today)) issuedToday = true;
+    // WHAT THE *STORE* WROTE OFF. `asked` is effectiveQty — the HOD-approved
+    // quantity when there is one — because that is the number this desk was
+    // asked to hand over.
+    //
+    // A CHEF REJECTION IS NOT COUNTED HERE, and that is the deliberate answer
+    // to a question this function got wrong first time round. It used to reach
+    // past effectiveQty back to quantity_requested for an is_rejected line, so
+    // a requisition the store served 100% read amber "Closed short" on the
+    // store's own screen because the CHEF had struck a line out. Two things are
+    // wrong with that, and the second is the decisive one:
+    //   1. It is the only place on this page that looks past effectiveQty. The
+    //      chef-rejected line is 0 to qty_outstanding, 0 to lines_open, absent
+    //      from openIssuableLines, unselectable, and struck through in the row —
+    //      by the whole file's definition it was never the store's business.
+    //   2. It made the SAME event read two opposite ways. A chef who presses
+    //      Reject and a chef who types the quantity down to 0 have done the
+    //      identical thing to the department; keyed on is_rejected the first
+    //      printed "Closed short" and the second printed "Fulfilled". A word
+    //      that flips on which button the chef pressed is not an honest word,
+    //      which is the entire point of this change.
+    // So the badge answers "did the STORE deliver what it was asked for?".
+    // A chef cut is a real thing the department needs to see, and the place it
+    // belongs is the department's own screen (/requisitions) — not this one,
+    // and not by reading a store rejection's field.
+    if (it.store_rejected) {
+      const cut = Math.max(0, effectiveQty(it) - got);
+      qtyCancelled += cut;
+      if (got > 0) {
+        rejectedKept++;
+        if (cut > 0) rejectedCut++;
+      }
+    } else if (it.is_rejected && got > 0) {
+      // A chef-rejected line that nevertheless handed goods over (the chef
+      // struck it out after the store had already carried part of it). It is
+      // counted in lines_issued_any above — goods really did leave — but it
+      // owes NOTHING (effectiveQty is 0 for it), so it has to be subtracted
+      // back out of the violet "sent, not closed" chip exactly as a
+      // store-rejected line is. Without this it claimed a balance was still
+      // owed on a row whose own action cell reads "no action — rejected by
+      // chef". It is NOT counted in rejectedCut: that chip is the store's
+      // "sent, then cancelled", and the store cancelled nothing here.
+      rejectedKept++;
+    }
+    // ── THE PARTITION. Still non-rejected lines ONLY, and still exactly three
+    // buckets. A rejected line is CLOSED, not open: it owes nothing, so it adds
+    // nothing to lines_open / lines_deferred / qty_outstanding, and it is not
+    // "issued" in the completed sense either. Do not fold it in here — every
+    // tab predicate below reads these five fields, and a rejected line joining
+    // lines_issued would pull requisitions into Balance Pending that owe
+    // nothing.
+    if (it.is_rejected) continue;
+    if (it.store_rejected) continue;
+    const eff = effectiveQty(it);
     if (got >= eff && !it.deferred_until) issued++;
     else if (it.deferred_until) deferred++;
     else open++;
     // A part-issued line is NOT the same as an untouched one — it used to be
     // filed as `open` above, which is why "some of it went out" was invisible.
     if (got > 0 && got < eff) partial++;
-    // "Did goods leave the store on this line?" — the question the partition
-    // cannot answer, because a part-issued DEFERRED line answers `deferred` to
-    // it and `lines_issued` stays 0. Deliberately not gated on `got < eff` or on
-    // deferred_until: it counts hand-overs, not completeness.
-    if (got > 0) issuedAny++;
+    // ("Did goods leave the store on this line?" — issuedAny — and "did that
+    // happen today?" both moved ABOVE the partition, where they can see a
+    // rejected line's kept hand-over. They are not re-counted here.)
     outstanding += Math.max(0, eff - got);
-    if (!issuedToday && issuedOnDay(it, reqStamp, today)) issuedToday = true;
   }
   return {
     ...req,
@@ -1210,9 +1370,57 @@ function mergeStats(req: any): Requisition {
     lines_open: open,
     lines_partial: partial,
     lines_issued_any: issuedAny,
+    lines_rejected_kept: rejectedKept,
+    lines_rejected_cut: rejectedCut,
     qty_outstanding: outstanding,
+    qty_issued: qtyIssued,
+    qty_cancelled: qtyCancelled,
     issued_today: issuedToday,
   } as Requisition;
+}
+
+/**
+ * THE HONEST WORD FOR A CLOSED REQUISITION.
+ *
+ * requisitions.status has ONE terminal value, 'fulfilled', and the store-issue
+ * route reaches it whenever nothing is still waiting on the store:
+ *
+ *     allDone = every(line => is_rejected || store_rejected || issued >= effective)
+ *
+ * As a WORKFLOW state that is right, and this function does not argue with it —
+ * it does not read a new column, it does not ask the server for one, and the
+ * route's rule is untouched. What it fixes is the WORD. REQ-2026-0620 had a
+ * single line, STORE REJECTED, zero eggs handed over, and the card said
+ * "Fulfilled" to the person holding the empty tray.
+ *
+ * Three states, derived from quantities the page already has:
+ *   'full'  nothing was cancelled → everything asked for was handed over
+ *   'short' something WAS cancelled, but goods went out too
+ *   'none'  something was cancelled and nothing went out at all
+ *
+ * THE TEST IS A CANCELLATION, NOT A SHORTFALL, and that distinction is the
+ * whole safety of this change. 737 of the 1,620 fulfilled requisitions in this
+ * database carry a plain arithmetic shortfall with no rejection anywhere on
+ * them — imported rows whose issued quantities were never fully recorded.
+ * Keying on shortfall would re-label 737 historic requisitions on the strength
+ * of import noise; keying on qty_cancelled leaves every one of them reading
+ * 'Fulfilled', exactly as it does today, and this function stays silent until
+ * somebody actually rejects something. Measured on the live db 2026-08-26:
+ * 1,620 fulfilled → 1,620 'full', 0 'short', 0 'none'. It is a provable no-op
+ * on everything that exists.
+ *
+ * 'none' is the eggs case and reads "Closed": nothing was delivered, so there
+ * is nothing to be short OF. 'short' is only reachable at all because the
+ * Option-A reject stopped un-issuing what was physically handed over — before
+ * it, a rejected line always read zero and this state could not exist on one.
+ *
+ * Returns null for a requisition that is not finished; those keep the ordinary
+ * in-flight labels, which are already honest.
+ */
+function deliveryState(req: Requisition): 'full' | 'short' | 'none' | null {
+  if (req.status !== 'fulfilled') return null;
+  if ((req.qty_cancelled || 0) <= 0) return 'full';
+  return (req.qty_issued || 0) > 0 ? 'short' : 'none';
 }
 
 /** The queue tabs. 'issued_log' is a separate panel, not a slice of the list. */
@@ -1244,10 +1452,20 @@ function matchesTab(r: Requisition, tab: StoreTab): boolean {
     // what makes this tab DISTINCT: without it every untouched requisition
     // (nothing issued, therefore everything outstanding) matches too and the
     // tab becomes a copy of Pending Issue.
+    // lines_rejected_kept is the THIRD way goods can have left the store, and
+    // it has to be here or this tab cannot see the case it exists for. The
+    // other two terms are counted inside the partition in mergeStats, AFTER a
+    // store-rejected line has been skipped — so on the owner's shape (240 eggs
+    // asked, 200 handed over, balance rejected, a second line still open) both
+    // read 0 and the requisition fell out of the one bucket whose own comment
+    // describes it exactly. Newly reachable only because the Option-A reject
+    // stopped un-issuing what was physically handed over; before it a rejected
+    // line always read 0 issued and this could not arise. Purely additive — it
+    // can only put a requisition INTO the tab, never take one out.
     case 'balance_pending':
       return r.status !== 'fulfilled'
         && r.qty_outstanding > 0
-        && (r.lines_issued > 0 || r.lines_partial > 0);
+        && (r.lines_issued > 0 || r.lines_partial > 0 || r.lines_rejected_kept > 0);
     // "Goods moved today", NOT "requisition closed" — the two are different
     // events and this tab used to conflate them under the name "Fulfilled Today".
     case 'issued_today':    return r.status === 'fulfilled' || r.issued_today;
@@ -1256,14 +1474,25 @@ function matchesTab(r: Requisition, tab: StoreTab): boolean {
 }
 
 /**
- * Requisition status in the department's words. Same vocabulary as the sister
- * page /requisitions (its STATUS_LABEL) — kept as a local map rather than an
- * import so this page doesn't pull a 2,000-line page module into its bundle for
- * a handful of strings. Keep the wording in step with that page.
+ * Requisition status in the department's words. Mostly the same vocabulary as
+ * the sister page /requisitions (its STATUS_LABEL) — kept as a local map rather
+ * than an import so this page doesn't pull a 2,000-line page module into its
+ * bundle for a handful of strings.
  *
- * ONE deliberate difference: chef_approved reads 'With Store' here, not 'With
- * Mgmt'. Anything chef_approved that reaches THIS page reached it through the
- * inbox=store query — it is, by definition, sitting on the store's counter.
+ * TWO deliberate differences from that page, and this list is the whole of it.
+ * It used to say "keep the wording in step" and "ONE deliberate difference",
+ * which stopped being true the moment deliveryState landed above:
+ *   1. chef_approved reads 'With Store' here, not 'With Mgmt'. Anything
+ *      chef_approved that reaches THIS page reached it through the inbox=store
+ *      query — it is, by definition, sitting on the store's counter.
+ *   2. 'fulfilled' is NOT always printed from this map. deliveryState()
+ *      overrides it with 'Closed short' / 'Closed' when something on the
+ *      requisition was rejected; the map's 'Fulfilled' is the fall-through for
+ *      the case where nothing was. /requisitions has no such override and still
+ *      prints a flat 'Fulfilled' — so the two screens can now show different
+ *      words for the same requisition. That is a KNOWN GAP, not an oversight
+ *      here: the department-facing page is a different file and a different
+ *      decision. If it is ever given the same treatment, this note goes.
  */
 const STATUS_LABEL: Record<string, string> = {
   draft:           'Draft',
@@ -1360,6 +1589,46 @@ function ReqCard(props: {
     store_processed: 'bg-blue-100 text-blue-800 border-blue-200',
     fulfilled:       'bg-emerald-100 text-emerald-800 border-emerald-200',
   };
+  /* THE STATUS CHIP, in delivery words rather than workflow words. DISPLAY
+     ONLY: no new status is written, requisitions.status is still the single
+     scalar the route sets, and deliveryState() returns null for everything that
+     is not 'fulfilled' — those fall straight through to the map above and read
+     exactly as they always have. Only a finished requisition that actually had
+     something REJECTED gets a different word, and today there are none in the
+     database (see deliveryState). The emerald tone is kept for 'full' and
+     dropped for the other two, because emerald is the colour this page uses for
+     "the goods are there". */
+  const delivered = deliveryState(req);
+  const doneLabel = delivered === 'short' ? 'Closed short'
+                  : delivered === 'none'  ? 'Closed'
+                  : null;
+  /* THE PARTY CAVEAT. On a party requisition the store-issue route deliberately
+     keeps the OLD reject behaviour and zeroes quantity_issued (its party rail
+     moves stock through applyPartyFulfillment, which this screen does not
+     unwind) — so a party line that handed 200 of 240 over and was then rejected
+     is RECORDED as 0 issued. deliveryState reads that record faithfully and
+     says 'none'. The record is what it is and this page does not argue with it,
+     but the sentence must not turn a gap in the record into the flat assertion
+     "nothing was handed over": on a party requisition that may be false, and it
+     is the storekeeper's own hand-over it would be denying. So the party card
+     says what is actually knowable and points at the screen that knows. The
+     route's zeroing is a separate, documented owner decision and is untouched
+     here. */
+  const isPartyReq = req.purpose === 'party';
+  const doneTitle = delivered === 'short'
+    ? 'Nothing is still waiting on the store, but part of this requisition was '
+      + 'rejected: some goods went out and the rest was cancelled.'
+    : delivered === 'none'
+      ? (isPartyReq
+          ? 'Closed — every line was rejected, and nothing is recorded as issued. '
+            + 'On a PARTY requisition a rejection also clears the issued quantity, so '
+            + 'anything physically handed over before it will not show here — check the '
+            + 'department reconcile screen.'
+          : 'Closed with nothing handed over — every line was rejected.')
+      : undefined;
+  const doneTone = delivered === 'short' ? 'bg-amber-100 text-amber-900 border-amber-300'
+                 : delivered === 'none'  ? 'bg-red-100 text-red-800 border-red-300'
+                 : null;
   return (
     <div className="bg-white border border-[#E8D5C4] rounded-xl overflow-hidden">
       <button onClick={onToggle}
@@ -1400,10 +1669,31 @@ function ReqCard(props: {
               without this the 2 kg that left the counter on a deferred line is
               nowhere on the card. Purely additive: it reads lines_issued_any and
               changes none of them. */}
-          {req.lines_issued_any > req.lines_issued && (
+          {/* MINUS lines_rejected_kept. lines_issued_any now sees a rejected
+              line's kept hand-over (it has to — that is the whole Option-A
+              fix), but this chip promises the goods are STILL OWED and a
+              rejected line owes nothing. It gets its own chip below instead of
+              silently inflating this one. */}
+          {req.lines_issued_any - req.lines_rejected_kept > req.lines_issued && (
             <span title="Goods went out on these lines, but they are still owed (part-issued, or deferred with a promised time)"
                   className="px-1.5 py-0.5 rounded bg-violet-50 text-violet-700 border border-violet-200">
-              {req.lines_issued_any - req.lines_issued} sent, not closed
+              {req.lines_issued_any - req.lines_rejected_kept - req.lines_issued} sent, not closed
+            </span>
+          )}
+          {/* Lines the store rejected AFTER handing part of them over. Goods
+              left the counter, the balance was cancelled, the line is closed —
+              a state that did not exist before the Option-A reject and that
+              every other chip on this card would otherwise be silent about. */}
+          {/* lines_rejected_cut, NOT lines_rejected_kept: a line the store
+              rejected AFTER issuing it in full cancelled nothing, and saying
+              "sent, then cancelled" at it would invent a shortfall. It is still
+              subtracted from the violet chip above (it owes nothing either), so
+              it simply shows no chip — the row's own STORE REJECTED line says
+              what happened. */}
+          {req.lines_rejected_cut > 0 && (
+            <span title="Part of these lines was handed over before the store rejected the balance — the goods that went out stand, the remainder is cancelled"
+                  className="px-1.5 py-0.5 rounded bg-amber-50 text-amber-900 border border-amber-300">
+              {req.lines_rejected_cut} sent, then cancelled
             </span>
           )}
           {/* What actually went out, in the store's own units. The card used to
@@ -1412,8 +1702,9 @@ function ReqCard(props: {
           {partialText && (
             <span className="px-1.5 py-0.5 rounded bg-rose-50 text-rose-700 border border-rose-200">{partialText}</span>
           )}
-          <span className={`px-2 py-0.5 rounded border ${statusTone[req.status] || 'bg-gray-50 text-gray-700 border-gray-200'}`}>
-            {STATUS_LABEL[req.status] || req.status}
+          <span title={doneTitle}
+                className={`px-2 py-0.5 rounded border ${doneTone || statusTone[req.status] || 'bg-gray-50 text-gray-700 border-gray-200'}`}>
+            {doneLabel || STATUS_LABEL[req.status] || req.status}
           </span>
         </div>
       </button>
@@ -1591,12 +1882,18 @@ function LineRow(props: {
   const { line, busy } = props;
   const eff = effectiveQty(line);
   const issued = Number(line.quantity_issued) || 0;
-  const outstanding = Math.max(0, eff - issued);
-  // The same three numbers as above, named — split.effective / .issued /
-  // .outstanding are identical to eff / issued / outstanding by construction;
-  // what it adds is WHICH BUCKET the remainder sits in. eff, issued and
-  // outstanding stay in place because the over-issue maths below reads them.
+  // The same three numbers as above, named — split.effective / .issued are
+  // identical to eff / issued by construction; what it adds is WHICH BUCKET the
+  // remainder sits in, including the bucket a rejection puts it in.
   const split = lineSplit(line);
+  // split.outstanding, NOT (eff − issued). On a store-rejected line the reject
+  // cancelled the balance, so this row owes 0 — printing the leftover 40 under
+  // a column headed "Still owed" is the same lie the parent badge was telling.
+  // Every other reader of `outstanding` below sits inside the not-rejected
+  // branch (the issue box, the over-issue maths, the action buttons) or already
+  // excludes rejected lines by name (isCheckable, rowTone), so this changes the
+  // rejected row and nothing else.
+  const outstanding = split.outstanding;
   // Everything reads in PURCHASE units (owner rule) — the store hands over
   // bottles/kg, not ml/g — regardless of which unit the composer stored the
   // line in. `hint` carries the recipe equivalent for packed materials.
@@ -1667,9 +1964,22 @@ function LineRow(props: {
           ) : null}
         </div>
         {line.store_rejected ? (
-          <div className="text-[10px] text-red-700 mt-0.5 flex items-center gap-1 no-underline">
+          <div className="text-[10px] text-red-700 mt-0.5 flex flex-wrap items-center gap-1 no-underline">
             <XCircle className="w-3 h-3" /> Rejected by store
             {line.store_reject_reason && <span className="text-[#6B5744]">— {line.store_reject_reason}</span>}
+            {/* WHAT THE REJECT ACTUALLY DID, when it did two things. Under the
+                Option-A reject a rejection cancels the OUTSTANDING balance and
+                leaves what was physically handed over standing, so "Rejected by
+                store" on its own reads as "you got nothing" on a line where 200
+                of 240 eggs are in the kitchen. Both halves are named, in the
+                purchase unit the rest of the row uses. Silent on a line that
+                issued nothing — there the old sentence was already complete. */}
+            {split.issued > 0 && (
+              <span className="text-[#6B5744]">
+                · <b className="text-emerald-700">{fmtNum(U.toPU(split.issued))}{u ? ` ${u}` : ''}</b> already handed over stands
+                {split.cancelled > 0 && <> · <b>{fmtNum(U.toPU(split.cancelled))}{u ? ` ${u}` : ''}</b> cancelled</>}
+              </span>
+            )}
           </div>
         ) : null}
         {line.chef_note && <div className="text-[9px] text-amber-700">Chef: {line.chef_note}</div>}
@@ -1766,8 +2076,23 @@ function LineRow(props: {
           it always did — no extra markup, no second figure. Both parts lead with
           the PURCHASE unit (unitTag = U.pu) and carry the recipe hint. */}
       <td className="py-1.5 px-2 text-right font-mono font-semibold">
-        <span className={outstanding === 0 ? 'text-emerald-700' : 'text-[#af4408]'}>{puNum(outstandingPU, outstanding)}{unitTag}</span>
+        {/* A CANCELLED BALANCE IS NOT A DELIVERED ONE. Zero is the honest figure
+            for "still owed" on a rejected line, but printing it in the emerald
+            this column uses for "all handed over" would swap one wrong claim
+            for another — so a rejected line reads a grey 0 with the written-off
+            quantity named under it. */}
+        <span className={split.cancelled > 0 ? 'text-[#8B7355]'
+                       : outstanding === 0 ? 'text-emerald-700' : 'text-[#af4408]'}>
+          {puNum(outstandingPU, outstanding)}{unitTag}
+        </span>
         {hint(outstanding)}
+        {split.cancelled > 0 && (
+          <div className="mt-0.5 font-normal text-[10px] text-red-700"
+               title="The store rejected this line — the balance was cancelled, not delivered and not owed">
+            Cancelled {puNum(U.toPU(split.cancelled), split.cancelled)}{unitTag}
+            {hint(split.cancelled)}
+          </div>
+        )}
         {(split.isSplit || split.deferred > 0) && (
           <>
             {split.deferred > 0 && (
@@ -2172,17 +2497,44 @@ function IssuedLogPanel({ loading, log, from, to, onFromChange, onToChange }: {
     // Column names say WHICH basis each figure is in — an unqualified "Qty"/"Unit"
     // next to a "Qty (recipe)" invites the reader to assume the first pair is the
     // recipe one too. Header text only; the values are unchanged.
-    const headers = ['When', 'Material', 'Qty (purchase)', 'Purchase Unit', 'Qty (recipe)', 'Recipe Unit',
-                     'Department', 'Req #', 'Issuer', 'Unit Cost', 'Value', 'Purpose', 'Event', 'Note'];
+    //
+    // The two "incl. GST" columns are ADDITIVE — they sit next to their ex-tax
+    // counterparts, which are unchanged. Value / Unit Cost stay the ex-tax goods
+    // price the recipe costing depends on; the new pair is a DERIVED estimate.
+    // Headers say so, and say exactly which levy:
+    //   · "incl. GST", not "incl. tax" — compensation cess is NOT folded in.
+    //     "Incl. Tax" already means taxable + GST on the PO screen, cess on its
+    //     own line; and on an issue there is no pre-discount gross for the cess
+    //     base to exist on. See api/store-issued-log/route.ts for the full note.
+    //   · "(est.)" — the money comes off the closing-valuation ladder
+    //     (last purchase price, else average cost), not off a specific bill.
+    //   · "(master)" — the rate is the material master's default, not the rate
+    //     on the bill this stock actually arrived on.
+    // The rate cell is BLANK when no rate was ever entered: tax_percent is
+    // NOT NULL DEFAULT 0, so a printed "0" would assert "GST does not apply"
+    // when the data only ever said "nobody typed a rate". Same call as
+    // api/inventory/export/route.ts (BLANK_WHEN_ZERO). The money columns still
+    // print — equal to their ex-tax twin — because that IS the right figure when
+    // no rate is stated.
+    const headers = ['When', 'Material', 'Category', 'Qty (purchase)', 'Purchase Unit', 'Qty (recipe)', 'Recipe Unit',
+                     'Department', 'Req #', 'Issuer', 'Unit Cost', 'Unit Cost incl. GST (est.)',
+                     'Value', 'Value incl. GST (est.)', 'GST % (master)', 'Purpose', 'Event', 'Note'];
     const escape = (v: any) => {
-      const s = v == null ? '' : String(v);
-      return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+      let s = v == null ? '' : String(v);
+      // Formula-injection guard (CWE-1236), the house form used elsewhere in
+      // this app: genuinely-numeric cells are skipped so signed numbers stay
+      // summable in Excel instead of being coerced to text. Category, material
+      // name and note are free text off the master and can start with '='.
+      if (/^[=+\-@\t\r]/.test(s) && !Number.isFinite(Number(s))) s = "'" + s;
+      return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
     };
     const lines = [headers.join(',')];
     for (const e of events) {
-      lines.push([e.at, e.material_name, e.qty_purchase ?? e.qty, e.purchase_unit || e.unit,
+      lines.push([e.at, e.material_name, e.category ?? '', e.qty_purchase ?? e.qty, e.purchase_unit || e.unit,
                   e.qty, e.unit, e.department_name, e.req_number,
-                  e.issuer, e.unit_cost?.toFixed?.(2), e.value?.toFixed?.(2),
+                  e.issuer, e.unit_cost?.toFixed?.(2), (e.unit_cost_incl_gst ?? e.unit_cost)?.toFixed?.(2),
+                  e.value?.toFixed?.(2), (e.value_incl_gst ?? e.value)?.toFixed?.(2),
+                  e.tax_known ? e.tax_percent : '',
                   e.purpose, e.event_name, e.note].map(escape).join(','));
     }
     const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8' });

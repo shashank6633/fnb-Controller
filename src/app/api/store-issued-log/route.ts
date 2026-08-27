@@ -2,6 +2,7 @@ import { getDb } from '@/lib/db';
 import { getCurrentUser, canProcessAsStore } from '@/lib/auth';
 import { packFactor } from '@/lib/pack-units';
 import { rateMap, materialRate } from '@/lib/closing-valuation';
+import { isStoreMappedMaterial } from '@/lib/store-engine';
 
 /**
  * Cross-requisition issued-items log.
@@ -73,6 +74,7 @@ export async function GET(request: Request) {
              ri.issue_history, ri.notes, ri.unit AS line_unit,
              rm.name AS material_name, rm.unit, rm.average_price,
              rm.purchase_unit AS rm_purchase_unit, COALESCE(rm.pack_size, 1) AS rm_pack_size,
+             rm.category AS rm_category, COALESCE(rm.tax_percent, 0) AS rm_tax_percent,
              r.req_number, r.department_id AS req_dept_id, r.purpose, r.event_name,
              COALESCE(d_line.name, d_req.name) AS department_name
       FROM requisition_items ri
@@ -92,6 +94,31 @@ export async function GET(request: Request) {
     // the hit (or an explicit null) into materialRate as `preloaded` keeps it from
     // running its own per-material SELECT inside the loop.
     const rates = rows.length ? rateMap(db) : new Map<string, { unit_price: number; date: string }>();
+
+    // ── LIQUOR ZERO-RATE LOCK for the derived GST columns ────────────────────
+    // Both receiving routes hard-zero-rate store-mapped (TGBCL) materials —
+    // api/grn/route.ts and purchase-orders/[id]/receive/route.ts both do
+    // `isStoreMappedMaterial(...) ? 0 : rate` — because liquor duty rides on the
+    // TGBCL bill as excise / cess / TCS, never as GST. The master is NOT a safe
+    // unguarded source here: it already carries 18% on at least one liquor row
+    // ('Vodka', category 'bar'), and this log carries liquor issues, so without
+    // this lock the log would add a GST the venue never paid on top of duty it
+    // already paid. Memoised per CATEGORY (isStoreMappedMaterial resolves an id
+    // to its category anyway), the same shape as api/department-variance.
+    // A failed check counts as ZERO-RATED: we cannot prove GST applies, and
+    // inventing a tax is worse than omitting one on a derived column.
+    const storeMappedMemo = new Map<string, boolean>();
+    const zeroRated = (category: string): boolean => {
+      const key = String(category || '').trim();
+      if (!key) return false;
+      const cached = storeMappedMemo.get(key);
+      if (cached !== undefined) return cached;
+      let v = true;
+      try { v = isStoreMappedMaterial(db, key); }
+      catch (e) { console.error(`[store-issued-log] store-mapped check failed for '${key}' — treating as zero-rated`, e); }
+      storeMappedMemo.set(key, v);
+      return v;
+    };
 
     for (const row of rows) {
       // PackMeta + average_price, the shape closing-valuation reads. `unit` is the
@@ -113,6 +140,33 @@ export async function GET(request: Request) {
       // PURCHASE unit by construction on every rung of the ladder.
       const rate = materialRate(db, mat, preloaded);
       const ratePU = rate.ratePerPurchaseUnit;
+
+      // GST ONLY — compensation cess is deliberately NOT folded in. Three
+      // reasons, all of them already settled elsewhere in this codebase:
+      //   1. "Incl. Tax" ALREADY has a shipped meaning here and it excludes
+      //      cess (purchase-orders/page.tsx: `incl_tax = taxable + tax_value`,
+      //      "Cess is shown on its own line instead of being buried inside a
+      //      column headed 'Incl. Tax'"). A second meaning on this screen would
+      //      put the two at odds. The CSV header therefore says GST, not "tax".
+      //   2. The two levies have DIFFERENT taxable bases (owner ruling
+      //      2026-08-07: GST on goods MINUS discount, cess on the PRE-discount
+      //      gross). An issue is not a bill — there is no gross and no discount
+      //      share, the discount is already netted into unit_price and averaged
+      //      into average_price — so the cess base does not exist on this side.
+      //   3. GST is reclaimable input credit; compensation cess is not
+      //      creditable against GST. Summing them into one number states the
+      //      opposite of both facts.
+      // The rate is the MATERIAL MASTER's default, not the rate on the bill this
+      // stock arrived on (nothing in the purchase/GRN/receive flow ever writes a
+      // rate back onto raw_materials — those columns are read-only seeds), and
+      // the money it loads is a ladder-derived cost, not an amount paid on a
+      // specific invoice. Hence "(master)" and "(est.)" in the CSV headers.
+      // 0 is indistinguishable from "never filled in" (tax_percent is
+      // NOT NULL DEFAULT 0 and there is no *_set flag), so `tax_known` travels
+      // with it and the CSV prints a BLANK rate cell rather than a confident
+      // "0" — the same call api/inventory/export/route.ts already makes.
+      const rmCategory = String(row.rm_category || '');
+      const taxPct = zeroRated(rmCategory) ? 0 : Math.max(0, Number(row.rm_tax_percent) || 0);
 
       let history: Array<{ qty: number; at: string; by: string; note?: string }> = [];
       try { history = JSON.parse(row.issue_history || '[]'); } catch { continue; }
@@ -158,6 +212,25 @@ export async function GET(request: Request) {
         // valueCount stays right for closing stock, where counts are whole packs.
         const unitCost = matPackFactor > 1 ? ratePU / matPackFactor : ratePU;
         const lineValue = Math.round(recipeQty * unitCost * 100) / 100;
+        // ── DERIVED "incl. GST" — a SCALAR on the ex-tax figures, nothing more ─
+        // A percent carries NO basis of its own, so multiplying by (1 + gst/100)
+        // cannot re-introduce the basis mismatch guarded above: both halves of
+        // the multiplication that produced `lineValue` were RECIPE basis, and a
+        // scalar leaves that untouched. What is FORBIDDEN — and what would
+        // reopen the bug — is building a tax-loaded PURCHASE-unit rate and
+        // re-multiplying `qtyPurchase` by it: qtyPurchase is rounded to 3 dp for
+        // display, so 12 ml of a pack-50,000 material is 0.000 purchase units and
+        // the whole line, tax and all, collapses to Rs 0.00. Derive from
+        // `lineValue`, never from the purchase pair.
+        // Derived from the ALREADY-ROUNDED lineValue on purpose, so
+        // (value_incl_gst - value) is exactly the GST on the Value that is
+        // printed, mirroring the house invariant incl_tax = taxable + tax_value.
+        // At taxPct 0 both are returned BIT-IDENTICAL to their ex-tax
+        // counterparts (no float round-trip) — on today's master that is ~97% of
+        // materials, and an incl. column equal to its ex-tax column is the
+        // CORRECT answer there, not a bug to paper over.
+        const unitCostInclGst = taxPct > 0 ? unitCost * (1 + taxPct / 100) : unitCost;
+        const valueInclGst = taxPct > 0 ? Math.round(lineValue * (1 + taxPct / 100) * 100) / 100 : lineValue;
         totalValue += lineValue;
         dists.materials.add(row.material_id);
         if (row.department_name) dists.departments.add(row.department_name);
@@ -174,6 +247,10 @@ export async function GET(request: Request) {
           pack_factor: (vPack > 1 && vDiffer) ? vPack : 1,
           material_id: row.material_id,
           material_name: row.material_name,
+          // raw_materials.category, verbatim. 952/952 populated on this DB, but
+          // 'other' IS the schema default (141 rows), so it doubles as the
+          // unfilled state. super_category is blank on 44% and is not used.
+          category: row.rm_category || '',
           department_id: row.line_dept_id || row.req_dept_id,
           department_name: row.department_name || '',
           issuer: h.by || '',
@@ -197,6 +274,16 @@ export async function GET(request: Request) {
           rate_source: rate.source,
           rate_as_of: rate.asOf || null,
           value: lineValue,
+          // ── ADDITIVE, GST-ONLY, EX-TAX FIGURES ABOVE ARE UNTOUCHED ──────────
+          // unit_cost / unit_cost_purchase / value / totals.total_value stay the
+          // ex-tax goods cost forever: average_price is derived from those and
+          // feeds every recipe, so folding tax in would inflate every recipe by
+          // the tax rate and forfeit the input credit (api/grn/route.ts).
+          // These four are a DERIVED estimate that sits BESIDE them.
+          tax_percent: taxPct,             // 0 also means "master never filled in"
+          tax_known: taxPct > 0,           // ...so consumers print blank, not 0
+          unit_cost_incl_gst: unitCostInclGst,   // RECIPE basis, pairs with unit_cost
+          value_incl_gst: valueInclGst,          // == value when taxPct is 0
         });
       }
     }
