@@ -7,6 +7,10 @@ import {
   amendGrnLines, raisePoDeviationAlert, type AmendLineInput,
 } from '@/lib/grn-reversal';
 import { planPoReceiptVoid, applyPoReceiptVoid, type PoVoidPlan, type PoVoidOutcome } from '@/lib/po-void';
+// The same "is there a bill number here?" the receive route and the receive
+// modal use — see the header of @/lib/bill-no. An amendment that may not REMOVE
+// the number must not be satisfiable by an invisible one either.
+import { normalizeBillNo } from '@/lib/bill-no';
 
 /**
  * AMEND and VOID one inward entry (GRN).
@@ -305,7 +309,15 @@ export async function PUT(request: Request, { params }: { params: Promise<{ id: 
     // reference, it turns the guard off for those rows.
     let invoiceChanged = false;
     if (has('invoice_number')) {
-      const next = String(b.invoice_number ?? '').trim();
+      // normalizeBillNo, NOT `?? ''` + .trim(). Proven against this route before
+      // the change: `""`, `"   "` and `null` were all refused, and a single ZERO
+      // WIDTH SPACE was ACCEPTED — it replaced a real bill number on a received,
+      // PO-sourced GRN across goods_receipt_notes, po_vendor_bills AND the
+      // purchases mirror, which is precisely the removal this guard exists to
+      // stop, done in a way nothing on any screen can show. `||` rather than
+      // `??` also means a numeric 0 now reads as "no number" here, the same as
+      // it already did on the receive route.
+      const next = normalizeBillNo(b.invoice_number);
       if (!next) {
         return Response.json({
           error: 'Vendor invoice / bill number is required — an amendment cannot remove the only link back to the vendor\'s paperwork.',

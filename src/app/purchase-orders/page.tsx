@@ -9,6 +9,12 @@ import {
 import { api } from '@/lib/api';
 import { allocateBillCharges, resolveCharge, r2, MIN_NET_RATE, NON_ADMIN_DISCOUNT_CAP_PCT } from '@/lib/po-charges';
 import { packFactor, toPurchaseQty, fmtQtyNum, type PackMeta } from '@/lib/pack-units';
+// THE SAME "is there a bill number here?" THE RECEIVE ROUTE USES — imported,
+// never restated, so this gate and that one can never disagree about what blank
+// means. @/lib/bill-no imports nothing, which is the only reason a 'use client'
+// file may import it; never add an import to it. See its header for what a bare
+// .trim() let through on both sides.
+import { normalizeBillNo } from '@/lib/bill-no';
 import StockOnHandNote, { StockOnHandLegend } from '@/components/StockOnHandNote';
 import { useStockOnHand, type StockOnHandState } from '@/lib/use-stock-on-hand';
 
@@ -1244,7 +1250,42 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
   const overDiscountCap = !isAdmin && alloc.subtotal > 0
     && alloc.discount_applied - (alloc.subtotal * NON_ADMIN_DISCOUNT_CAP_PCT) / 100 > 0.005;
   const zeroCost = alloc.zero_cost_lines;
+  /* THE VENDOR'S BILL NUMBER — MANDATORY, AND ACTUALLY BLOCKED NOW.
+     The input has carried a `required` attribute and a "(required)" placeholder
+     for a long time, and both were decoration: this modal has no <form>, no
+     onSubmit and no type="submit", so nothing ever evaluated `required` and
+     Confirm posted a blank number happily. Every blank vendor-bill row in the
+     live data came from this screen. It joins chargeBlockers so it behaves like
+     every other gate here — named in the red list under the panel, Confirm
+     disabled, reason in the button's title — and submit() re-checks it with the
+     full sentence. The receive route refuses a blank independently (a direct
+     POST does not come through this page).
+
+     normalizeBillNo, NOT .trim() — the SAME function the route now calls. With a
+     bare trim on both sides the two agreed on the wrong answer: a pasted zero
+     width space (or word joiner, LTR mark, soft hyphen, Hangul filler, braille
+     blank) cleared this gate AND the route's, so Confirm went live on a box that
+     looked empty and the receipt stored a bill number nothing can display. */
+  const billNoMissing = !normalizeBillNo(billNo);
+  /* …AND THE BLOCK HAS TO BE ON SCREEN. chargeBlockers renders inside the
+     scrolling body, at the BOTTOM of it. Measured in a real browser on a 10-line
+     PO at 1280×900 with the modal freshly opened: the scroll body ends at y=842,
+     the bill-no input sits at y=1673 and its red bullet at y=1917 — both about
+     900 px below the fold. The only thing the receiver could see was a dead
+     green Confirm at y=855 whose reason lived in a `title` tooltip, and a tablet
+     at the receiving bay has no hover to show it. That state is NEW: this gate
+     is the first one that is armed the moment the modal opens, so every receive
+     now starts blocked. The footer below is outside the scroller (shrink-0), so
+     the notice goes there, carries the way out for a genuinely paperless
+     delivery — which was otherwise only in two messages the disabled button
+     makes unreachable — and jumps to the field. */
+  const billNoRef = useRef<HTMLInputElement>(null);
+  const jumpToBillNo = () => {
+    billNoRef.current?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    billNoRef.current?.focus({ preventScroll: true });
+  };
   const chargeBlockers: string[] = [
+    ...(billNoMissing ? ['Enter the vendor\'s bill number — it is required to receive.'] : []),
     ...(needsChargeNote ? ['Say why the vendor gave the discount (min 3 characters).'] : []),
     ...(overDiscountCap ? [`A discount above ${NON_ADMIN_DISCOUNT_CAP_PCT}% of the bill needs an admin to receive.`] : []),
     ...(zeroCost.length > 0 ? [`The discount is bigger than these lines are worth: ${zeroCost.map(l => l.name).join(', ')}.`] : []),
@@ -1272,6 +1313,20 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
     }
     if (missingReason.length > 0) {
       alert(missingList('Add a reason for these lines before receiving:\n'));
+      return;
+    }
+    // THE BILL NUMBER, said in full before the round trip. It is also in
+    // chargeBlockers (so Confirm is disabled and the panel names it), but that
+    // list is one-liners and this is the gate a storekeeper is most likely to
+    // hit, so it gets the route's own words and the way out. Checked before the
+    // chargeBlockers alert so the specific message wins over the generic one.
+    if (!normalizeBillNo(billNo)) {
+      alert('Enter the vendor\'s bill number before receiving.\n\n'
+          + 'It is the only way back to the vendor\'s paper once the stock line is all that is left, '
+          + 'and it is what the duplicate-bill check keys on.\n\n'
+          + 'If the truck came on a delivery challan and the invoice follows, enter the challan number. '
+          + 'If there is genuinely no vendor document at all (a cash market run, a sample, a donation), '
+          + 'record it at Purchasing → Goods Receipt (GRN), where "No vendor bill number" can be declared.');
       return;
     }
     // Same belt-and-braces as the reason gate — the route re-checks every one of
@@ -1623,9 +1678,30 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
               <div className="grid gap-2 sm:grid-cols-2">
                 {stakes.map(v => {
                   const active = v.key === vendorKey;
+                  /* THE BILL NUMBER DOES NOT CROSS THE TAB (the setBillNo('')
+                     below). One vendor's invoice number may never be filed
+                     against another's delivery, and `uq_po_vendor_bill (po_id,
+                     vendor_name, bill_no)` cannot catch it — a different
+                     vendor_name is a different key, so the mis-file is accepted
+                     silently. Observed in the running app before this line
+                     existed: typed ALPHA-111 for VENDOR ALPHA, clicked the
+                     VENDOR BETA tab, and the field still read ALPHA-111 with
+                     aria-invalid=false and Confirm enabled and re-labelled
+                     "Receive VENDOR BETA"; confirming filed VENDOR BETA's goods
+                     under ALPHA-111. The reset at load() states the invariant
+                     ("none of it may carry over to the next vendor") but only
+                     runs on open and after a receive. Latent while the box was
+                     usually left blank; mandatory entry makes a filled box the
+                     norm, which is what turns it into an everyday mis-file.
+                     Clearing it also re-arms the gate, so the next vendor's
+                     number has to be typed.
+                     NOTE, NOT FIXED HERE: chargesNote / discount / delivery /
+                     billDate / reasons / rateDraft / excluded still carry over
+                     the same way. That is pre-existing and belongs to a separate
+                     decision — this change is the bill number. */
                   return (
                     <button key={v.key} type="button" disabled={v.done}
-                            onClick={() => setVendorKey(v.key)}
+                            onClick={() => { setVendorKey(v.key); setBillNo(''); }}
                             className={`text-left px-2.5 py-2 rounded-lg border text-[11px] transition-colors ${
                               v.done ? 'border-[#E8D5C4] bg-white/50 opacity-70 cursor-default'
                               : active ? 'border-[#af4408] bg-white ring-1 ring-[#af4408]'
@@ -2007,7 +2083,13 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
           {!loading && stake && (
             <div className="rounded-lg border border-[#E8D5C4] bg-[#FFF8F0] px-3 py-2.5 space-y-2">
               <div className="text-xs font-semibold text-[#2D1B0E]">
-                Bill charges (optional)
+                {/* It said "(optional)" while the box below it was mandatory in
+                    name and unenforced in fact. The charges ARE optional; the
+                    bill number is not, and the heading now separates the two. */}
+                Vendor bill
+                <span className="ml-1 font-normal text-[10px] text-[#8B7355]">
+                  — bill no. required; discount / delivery optional
+                </span>
                 {isMultiVendor && (
                   <span className="ml-2 font-normal text-[10px] text-[#8B7355]">
                     — {stake.vendor_name || '(no vendor)'}&apos;s bill only. Allocated across their {visibleItems.length} line(s);
@@ -2053,9 +2135,14 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
                 separate levy, never part of CGST + SGST. It is recorded beside the rate the same way.
               </p>
               <div className="flex flex-col sm:flex-row gap-2">
-                <input value={billNo} onChange={e => setBillNo(e.target.value)}
+                {/* `required` is kept but is NOT the gate — there is no <form>
+                    around this input, so nothing evaluates it. billNoMissing is
+                    the gate: it reddens this box, names itself in the blocker
+                    list below, disables Confirm, and submit() re-checks it. */}
+                <input ref={billNoRef} value={billNo} onChange={e => setBillNo(e.target.value)}
                        placeholder="Vendor bill no. (required)" required
-                       className="sm:w-48 px-2 py-1 border border-[#E8D5C4] rounded text-[11px] bg-white" />
+                       aria-invalid={billNoMissing}
+                       className={`sm:w-48 px-2 py-1 border rounded text-[11px] bg-white ${billNoMissing ? 'border-red-400' : 'border-[#E8D5C4]'}`} />
                 {alloc.discount_applied > 0 && (
                   <input value={chargesNote} onChange={e => setChargesNote(e.target.value)}
                          placeholder="Why the discount? e.g. 5% scheme on bill #4471"
@@ -2150,6 +2237,20 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
           )}
         </div>
         <div className="px-5 py-3 border-t border-[#E8D5C4] flex items-center justify-end gap-2 shrink-0">
+          {/* The one gate that is armed before the receiver has done anything,
+              said where they are actually looking. Gated on `stake` because the
+              bill belongs to a vendor: with no vendor picked the modal's own
+              "Choose the vendor who is delivering" stands and Confirm already
+              says "Pick which vendor is delivering". */}
+          {!loading && stake && billNoMissing && (
+            <button type="button" onClick={jumpToBillNo}
+                    className="mr-auto text-left text-[11px] text-red-700 hover:underline basis-full sm:basis-auto sm:max-w-[62%]">
+              <span className="font-semibold">Enter the vendor&apos;s bill number to receive.</span>{' '}
+              Tap to jump to it. On a delivery challan with the invoice to follow, enter the challan number;
+              if there is genuinely no vendor document at all, record it at Purchasing → Goods Receipt (GRN),
+              where &ldquo;No vendor bill number&rdquo; can be declared.
+            </button>
+          )}
           <button onClick={dismiss} className="px-3 py-2 text-sm text-[#6B5744]">
             {didReceive ? 'Done' : 'Cancel'}
           </button>

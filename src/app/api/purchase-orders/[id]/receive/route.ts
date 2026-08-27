@@ -12,6 +12,10 @@ import { resolveQcRequirement, undecidedQcCategories, storePreRejectBlock, QC_AW
 import { notifyGrnAwaitingQc } from '@/lib/grn-qc-notify';
 import { fulfilRequisitionFromPo } from '@/lib/po-requisition-fulfil';
 import { receivedPoItemIds, poReceiptLines, liveValueSql } from '@/lib/po-receipts';
+// "Is there a bill number here?" is ONE definition, shared with the receive
+// modal — see the header of @/lib/bill-no. `.trim()` alone said yes to a zero
+// width space, and both halves of the gate said yes together.
+import { normalizeBillNo } from '@/lib/bill-no';
 
 /* ══════════════════════════════════════════════════════════════════════════
  * ONE PO, MANY VENDORS, ONE BILL EACH.
@@ -403,7 +407,55 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     let chargeDiscount = chargeAmounts.discount_amount;
     let chargeDelivery = chargeAmounts.delivery_amount;
     const chargesNote    = String((billCharges as any).charges_note || '').trim();
-    const billNo         = String((billCharges as any).bill_no || '').trim();
+    // normalizeBillNo, NOT .trim(): the trim on its own accepted a zero width
+    // space, a word joiner, an LTR mark, a soft hyphen, a Hangul filler and a
+    // braille blank — six values that store fine, render as nothing everywhere,
+    // and are not counted by the app's own TRIM(bill_no)='' blank query. Both
+    // gates now read the same definition. (It still trims, so "   " still fails.)
+    const billNo         = normalizeBillNo((billCharges as any).bill_no);
+    /* ── THE VENDOR'S BILL NUMBER IS MANDATORY ON THIS ROUTE ─────────────────
+     * Every one of the 15 blank `po_vendor_bills` rows in the live data came
+     * through HERE — zero ad-hoc GRNs are blank, because POST /api/grn has
+     * demanded the number since 5522138. This was the last door still making
+     * blanks, and it made them silently: `bill_date` had its shape checked and
+     * `charges_note` was conditionally required, but `bill_no` was trimmed and
+     * nothing else, so a receiver who tabbed past the box booked the stock and
+     * lost the only link back to the paper. The `required` attribute on the
+     * input was inert (the modal has no <form> and Confirm is an onClick), so
+     * the browser was not stopping it either — both halves are now closed, and
+     * this half is the one that counts: /api/* routes are not behind the page
+     * gate, so a direct POST must be refused here.
+     *
+     * normalizeBillNo above is what makes "   " fail — and what makes a
+     * zero-width space fail, which a bare .trim() did not.
+     *
+     * NO DECLARED-BLANK ESCAPE HERE, unlike POST /api/grn. That escape works
+     * there because `goods_receipt_notes` has no unique index on
+     * invoice_number, so a vendor can have many declared-no-bill receipts.
+     * `po_vendor_bills` DOES have one — uq_po_vendor_bill (po_id, vendor_name,
+     * bill_no) — so the SECOND declared-blank delivery from one vendor on one
+     * PO would hit the constraint and be told "Enter the vendor's bill number
+     * to record a second delivery", advice the receiver has just declared
+     * impossible. A truly paperless delivery therefore goes to the ad-hoc GRN
+     * form, which already supports the declaration, and the message says so.
+     *
+     * NOTHING STORED CHANGES. This refuses new blanks only; the 15 existing
+     * blank bill rows keep every behaviour they have — they are still read,
+     * amended (PUT /api/grn/[id] only demands a number when one is SENT),
+     * voided and released, and the blank arm of the 409 below stays live for
+     * them. A non-blank value can never collide with a stored '' on
+     * uq_po_vendor_bill, so no backfill, migration or re-index is involved. */
+    if (!billNo) {
+      return Response.json({
+        error: `Enter the vendor's bill number before receiving ${po.po_number}. `
+             + `It is the only way back to the vendor's paper once the stock line is all that is left, `
+             + `and it is what the duplicate-bill check keys on. `
+             + `If the truck came on a delivery challan and the invoice follows, enter the challan number. `
+             + `If there is genuinely no vendor document at all — a cash market run, a sample, a donation — `
+             + `record it at Purchasing → Goods Receipt (GRN), where "No vendor bill number" can be declared.`,
+        field: 'bill_no',
+      }, { status: 400 });
+    }
     // The VENDOR'S invoice date, which is a property of their document and is
     // routinely older than the day the truck arrives — so it is NOT put through
     // checkPurchaseDate (that guards the date this receive POSTS money on, which

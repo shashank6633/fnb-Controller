@@ -218,6 +218,53 @@ export async function POST(request: Request) {
       LIMIT 1
     `);
 
+    /* ── THE MIRROR OF THAT WILDCARD, FOR AN INCOMING ROW WITH NO BILL NUMBER ─
+     * The wildcard above is on the STORED side only. While every PO-receipt cost
+     * row stored bill_no '' that was enough — the receipt WAS the blank row the
+     * wildcard protects. The vendor bill number is now mandatory on
+     * POST /api/purchase-orders/[id]/receive, so a receipt stores the vendor's
+     * number, and a sheet uploaded with the bill_no column EMPTY stops matching
+     * it: `COALESCE(bill_no,'')=''` is false for the stored row and
+     * `LOWER(bill_no)=LOWER('')` is false too. Driven end to end on a copy of
+     * the live database before this statement existed — receive 10 units on bill
+     * INV-ADJ-A, re-upload the same material + vendor + date + qty + rate with a
+     * blank column: {"success":1,"duplicates":0}, a second row, stock 10 → 20.
+     * The Generic-CSV template marks that column optional, so an empty column is
+     * the ordinary case, not a contrived one.
+     *
+     * So when the INCOMING row has no bill number, the wildcard goes on the
+     * OTHER side: judge it against a stored row under ANY bill number, on the
+     * SAME six-part key. That is symmetric with what the wildcard already does
+     * in the other direction, and it inherits the same safety argument — behind
+     * qty AND rate it can only match a genuinely identical line.
+     *
+     * IT IS A SEPARATE STATEMENT AND MUST STAY ONE. Do not widen dupCheck's
+     * wildcard to reach this case, and do not widen this key to material level:
+     * both are the trap the note above billLineCheck describes.
+     *
+     * WHAT IT COSTS, STATED RATHER THAN HIDDEN: two genuinely separate
+     * deliveries of one material from one vendor on one day at the SAME quantity
+     * AND the same rate, the second uploaded with an empty bill column, are read
+     * as one. That is exactly what already happens in the other direction when
+     * the stored row is blank, and the skip reason names the bill it matched and
+     * how to import it anyway (put its bill number in the column) so a human can
+     * act on it rather than wonder.
+     *
+     * A DIFFERENT NAMED BILL IS NOT COVERED HERE, ON PURPOSE. Incoming "INV-99"
+     * against a stored "INV-77" inserts, and that is this file's stated rule —
+     * two lines that differ only by a NON-empty bill number are two documents
+     * and both are kept. It was masked before only because the stored side
+     * happened to be blank. */
+    const dupCheckAnyBill = db.prepare(`
+      SELECT COALESCE(bill_no, '') AS bill_no FROM purchases
+      WHERE material_id = ?
+        AND LOWER(COALESCE(vendor, '')) = LOWER(?)
+        AND date = ?
+        AND ROUND(quantity, 3)   = ROUND(?, 3)
+        AND ROUND(unit_price, 2) = ROUND(?, 2)
+      LIMIT 1
+    `);
+
     // ── ONE MATERIAL = ONE LINE ON A NAMED BILL. The rule /api/purchase-orders
     // has always had and that POST /api/purchases took on when the owner said
     // "YES WANT LIKE PO". Identity is material_id ALONE, scoped to one document.
@@ -462,6 +509,23 @@ export async function POST(request: Request) {
             `"${mat.name}"${billNo ? ` (bill ${billNo})` : ''} from ${vendorLabel} dated ${item.date} — `
             + `already uploaded: same item + vendor + bill no + date + qty (${quantity}) + rate (${inr(unitPrice)}). `
             + `Row ${rowNum} was skipped so the stock is not counted twice.`);
+          continue;
+        }
+        /* STRICTLY ADDITIVE — it runs only after the check above has already
+         * said no, and only for a row that carries no bill number of its own.
+         * Everything the six-part check used to catch, it still catches, with
+         * the same words; this only reaches the rows it started missing when the
+         * receipt on the other side stopped being blank. See dupCheckAnyBill. */
+        const priorAnyBill = billNo ? undefined
+          : dupCheckAnyBill.get(materialId, item.vendor || '', item.date, quantity, unitPrice) as
+            { bill_no: string } | undefined;
+        if (priorAnyBill) {
+          skip(item, rowNum, 'duplicate',
+            `"${mat.name}" from ${vendorLabel} dated ${item.date} is already recorded`
+            + `${priorAnyBill.bill_no ? ` on bill ${priorAnyBill.bill_no}` : ''} — `
+            + `same item + vendor + date + qty (${quantity}) + rate (${inr(unitPrice)}), and this row has no bill `
+            + `number of its own to tell the two apart. Row ${rowNum} was skipped so the stock is not counted twice. `
+            + `If it really is a second, separate delivery, put its bill number in the bill_no column and upload it again.`);
           continue;
         }
         seenInFile.add(key);
