@@ -10,6 +10,14 @@ import { notifyGrnAwaitingQc } from '@/lib/grn-qc-notify';
 // Full Bill") into src/lib/vendor-learn.ts when the bill form moved here. It was
 // NOT copied: see that module's header, and see the ONE-WRITER note below.
 import { learnVendorMaterialPair, type VendorMappingOutcome } from '@/lib/vendor-learn';
+// THE MONEY LEG OF A CASH BILL. Not a second bill writer — see the ONE-WRITER
+// block below and the header of src/lib/cash-purchase.ts. It writes to
+// petty_cash_ledger and to nothing else.
+import { cashRunAlreadyPaid, cashVoucherOwner, isMintedCashVoucher, mintCashVoucherNo, recordCashPurchase } from '@/lib/cash-purchase';
+import { normalizeBillNo } from '@/lib/bill-no';
+import { MAX_PAISE, mayRecordPettyCash, outflowWarning, fmtRs } from '@/lib/petty-cash';
+import { canAccessPage } from '@/lib/page-catalog';
+import { todayIST } from '@/lib/format-date';
 
 /**
  * GRN read API. Listing + detail.
@@ -24,7 +32,7 @@ import { learnVendorMaterialPair, type VendorMappingOutcome } from '@/lib/vendor
  *                  inventory_transactions.
  *   body: {
  *     date, vendor_id?, vendor, invoice_number (REQUIRED), invoice_date?,
- *     qc_by?, notes?,
+ *     qc_by?, notes?, cash_purchase?, confirm_duplicate_cash?,
  *     items: [{
  *       material_id, quantity_received, quantity_accepted?, rejection_reason?,
  *       unit_price, brand?, entry_mode?, notes?, gst_rate?, cess_rate?,
@@ -114,6 +122,53 @@ import { learnVendorMaterialPair, type VendorMappingOutcome } from '@/lib/vendor
  *       value can't justify.
  *   Like the other recorded-only charges it never touches unit_price /
  *   total_price / the weighted average — it joins Total Inward on read.
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * cash_purchase — THE BILL WAS PAID OUT OF THE PETTY CASH BOX
+ * ═══════════════════════════════════════════════════════════════════════════
+ * The owner's design, verbatim: "Keep it in Enter Vendor Bill, add an option of
+ * Cash purchase. If they click on it, it will be added on petty cash."
+ *
+ * So this is NOT a new bill form and NOT a second writer of `purchases` — the
+ * capitalised prohibition below still stands and this change goes through the
+ * existing door. Everything about the INWARD rail is unchanged: same GRN, same
+ * QC gate, same stock bump, same price cascade, same void. Ticking the option
+ * adds exactly ONE petty_cash_ledger row inside this transaction, plus a
+ * payment_mode = 'cash' stamp on the cost rows.
+ *
+ * FIVE THINGS IT DOES, EACH FOR A STATED REASON:
+ *
+ *  1. THE MONEY IS UNCONDITIONAL. The cash row is written whether or not the
+ *     Kitchen QC gate holds the goods, because the money left the box at the
+ *     stall and the kitchen's opinion of the tomatoes cannot change that. A held
+ *     cash bill therefore means: cash out NOW, stock and Purchase Report line on
+ *     sign-off. The response says so and the form prints it before saving.
+ *  2. THE AMOUNT IS THE BILL TOTAL ACTUALLY HANDED OVER, not the goods value.
+ *     Total Inward — Σ(received × rate − discount + cgst + sgst + comp. cess +
+ *     excise + tcs + delivery + mrp round-off) — the same expression the inward
+ *     register prints and the same one src/lib/purchase-bill-summary.ts settles
+ *     on. Goods value alone would understate every bill carrying GST or an auto
+ *     fare, and the cash box would not reconcile against the notes handed over.
+ *     RECEIVED, not accepted: the vendor charged for what he handed over, and a
+ *     held receipt carries accepted = 0 — an accepted-based figure would record
+ *     ₹0 of cash for a bill that emptied the box.
+ *  3. THE LINK IS petty_cash_ledger.grn_id. NOT purchase_id, which is per-LINE
+ *     and cannot represent a basket, and which a void HARD-DELETES.
+ *  4. THE CASH BOX'S OWN GATES ARE RE-APPLIED, not inherited. This route needs
+ *     only a signed-in session; the cash book needs page access AND management-
+ *     or-store-manager. Without the re-check, "can record a goods receipt" would
+ *     become "can move money out of the one ledger with no DELETE".
+ *  5. A MINTED VOUCHER NUMBER SATISFIES THE BILL MANDATE HONESTLY. A market run
+ *     has no vendor paper, so the receipt takes a PCV-yyyy-#### of ours —
+ *     pre-filled, overwritable with a real bill number, unique by construction.
+ *  6. AND IT IS GUARDED TWICE, because a number of OURS cannot on its own tell
+ *     one market run from two. cashVoucherOwner() refuses the same preview
+ *     posted twice (the double click); cashRunAlreadyPaid() refuses a second
+ *     payment of the same amount, to the same vendor, on the same day — which is
+ *     the only identity a run has when the bill-number box was cleared, or when
+ *     the two saves came from two form opens holding two different previews.
+ *     The second is CONFIRMABLE (`confirm_duplicate_cash: true`): four fields
+ *     agreeing is strong evidence, not the vendor's own document.
  */
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -123,6 +178,12 @@ export const revalidate = 0;
  *  inward and at QC sign-off — the two must never disagree about whether a line
  *  is empty. */
 const EPS = 1e-6;
+
+/** Thrown to abort a receipt whose CASH leg cannot be recorded, from inside the
+ *  transaction (a Response cannot be returned from a db.transaction() closure).
+ *  The throw is what rolls the goods back with it — a refused cash bill must
+ *  write nothing at all, not a receipt whose payment silently went missing. */
+class CashRefused extends Error {}
 
 /**
  * The amendment stamps are ADMIN-ONLY on the wire.
@@ -227,6 +288,26 @@ export async function GET(request: Request) {
     // re-derives it from the session and fails closed.
     const canAmend = canProcessAsStore(me) || isManagement(me);
     const url = new URL(request.url);
+    /* ── THE CASH-PURCHASE OPTION'S TWO ANSWERS, IN ONE CHEAP READ ───────────
+     * `may` decides whether the form may OFFER the option at all, and it is the
+     * cash box's own membership rule — the same one the POST re-applies and
+     * fails closed on. ADVISORY: hiding a control the server would refuse is a
+     * courtesy, never the gate.
+     *
+     * `next_cash_voucher` is a PREVIEW so the number is visible and editable
+     * before saving rather than appearing out of nowhere afterwards. It is NOT
+     * a reservation: two storekeepers with the form open would see the same
+     * number, so the POST mints a fresh authoritative one inside its own
+     * transaction whenever what arrives is still PCV-shaped. Typing a real
+     * vendor bill number over it stores that instead.
+     */
+    if (url.searchParams.get('cash_option') === '1') {
+      const mayRecord = mayRecordPettyCash(me) && canAccessPage('/petty-cash', me);
+      return Response.json({
+        can_record_cash: mayRecord,
+        next_cash_voucher: mayRecord ? mintCashVoucherNo(db) : '',
+      });
+    }
     const id = url.searchParams.get('id');
     if (id) {
       const grn = db.prepare(`
@@ -494,8 +575,70 @@ export async function POST(request: Request) {
     const b = await request.json();
     const { date, vendor_id, vendor, invoice_number, invoice_date, qc_by, notes, items,
             qc_quality, qc_temperature, qc_expiry, qc_damage, qc_weight, qc_invoice_match,
-            no_invoice_number, confirm_duplicate_bill } = b;
+            no_invoice_number, confirm_duplicate_bill, confirm_duplicate_cash, cash_purchase } = b;
     if (!date)  return Response.json({ error: 'date required' }, { status: 400 });
+
+    /* ═══════════════════════════════════════════════════════════════════════
+     * WAS THIS BILL PAID OUT OF THE PETTY CASH BOX?
+     * ═══════════════════════════════════════════════════════════════════════
+     * Everything about the goods rail below is unchanged when this is false —
+     * which is every existing caller, since the flag did not exist. `paidInCash`
+     * is resolved HERE, before anything is validated, because two of the checks
+     * further down depend on it (the bill-number mandate and the date rule).
+     */
+    /* REFUSED, NOT COERCED, AND NOT SILENTLY DROPPED. `=== true` alone turned a
+     * client sending `"true"`, `1` or `"on"` into a CREDIT bill with no money
+     * movement at all — the exact failure the permission check below refuses to
+     * commit ("nobody would ever know the box was short"), arrived at by a
+     * different road. The shipped form sends a real boolean; anything else is a
+     * caller that has misunderstood the flag, and it is told so. */
+    if (cash_purchase !== undefined && cash_purchase !== null && typeof cash_purchase !== 'boolean') {
+      return Response.json({
+        error: 'cash_purchase must be true or false. Nothing was saved — a bill that may or may not have been paid out of the cash box is not something this route will guess at.',
+        cash_denied: true,
+      }, { status: 400 });
+    }
+    const paidInCash = cash_purchase === true;
+
+    /* ── THE CASH BOX'S OWN GATES, RE-APPLIED RATHER THAN INHERITED ──────────
+     * POST /api/grn needs a signed-in session and nothing else. POST
+     * /api/petty-cash needs page access to /petty-cash AND management-or-store-
+     * manager membership, and its own header explains why both: "you may record
+     * a movement only in a book you may see". Letting the receipt door write the
+     * cash row on the receipt door's gate would turn "can record a goods
+     * receipt" into "can move money out of the one ledger in the app that has no
+     * DELETE" — a privilege escalation shipped as a convenience.
+     *
+     * REFUSED, NOT SILENTLY DOWNGRADED TO A CREDIT BILL. Dropping the tick and
+     * saving anyway would record goods the venue paid cash for as if they were
+     * on credit, and nobody would ever know the box was short. The receipt is
+     * unaffected — untick the option and it saves exactly as it always did.
+     */
+    if (paidInCash && !(mayRecordPettyCash(me) && canAccessPage('/petty-cash', me))) {
+      return Response.json({
+        error: 'This bill is marked as paid from the petty cash box, and recording a cash movement is limited to Management and the Store Manager. '
+             + 'Nothing was saved. Untick "Paid in cash from petty cash" to record the bill on credit, or ask someone who holds the box to enter it.',
+        cash_denied: true,
+      }, { status: 403 });
+    }
+
+    /* ── CASH IS RECORDED WHEN IT MOVES, SO IT CANNOT BE DATED AHEAD ─────────
+     * checkPurchaseDate below exempts admins entirely, so an admin may date a
+     * GRN in the FUTURE. That is fine for goods and fatal for a cash box:
+     * cashInHandPaise() is deliberately unbounded by date and documents its own
+     * safety as "the POST route refuses a future-dated movement". A future cash
+     * row would put money in the headline balance the box does not hold yet, and
+     * every figure computed from it would be wrong until that day arrived.
+     * Refused for the CASH option only — the receipt itself keeps the admin
+     * exemption it has always had.
+     */
+    if (paidInCash && String(date) > todayIST()) {
+      return Response.json({
+        error: `A cash purchase cannot be dated ${date} — that is in the future, and cash is recorded when it physically moves. `
+             + 'Nothing was saved. Use the day the money was handed over, or untick "Paid in cash from petty cash".',
+        cash_denied: true,
+      }, { status: 400 });
+    }
     // MANDATORY, ENFORCED HERE TOO. The form marks it required, but a `required`
     // attribute is a courtesy to the person typing, not a rule — anything posting
     // straight at this route bypasses it. POST /api/grn has exactly ONE caller (the
@@ -527,8 +670,39 @@ export async function POST(request: Request) {
      * /api/purchases documents), and each such receipt takes its own fresh PINV
      * rather than sharing one.
      */
+    /* ── AND THE THIRD ANSWER: A NUMBER OF OUR OWN ──────────────────────────
+     * A cash market run is the case the declared blank above was written for,
+     * and a declared blank costs the duplicate guard and shares no PINV. Now
+     * that the run has a HOME — a petty cash row keyed to this receipt — it can
+     * have an identity too: PCV-yyyy-####, minted by us, in the shape PINV is
+     * minted in, and stored in the vendor-bill column exactly as a real number
+     * would be. The box is reconciled against that string.
+     *
+     * `cashMint` is true when the option is ticked AND what arrived is either
+     * blank or still PCV-shaped, i.e. the form's own preview came back
+     * untouched. A REAL vendor bill number typed over the preview is not
+     * PCV-shaped, so it falls through here and is treated as any other bill
+     * number: stored verbatim, and inside the duplicate-bill guard.
+     *
+     * MINTED INSIDE THE TRANSACTION, never here — see the mint call below.
+     * Deciding it here and writing it there is what keeps two concurrent saves
+     * off the same number.
+     */
+    /* ── "BLANK" IS normalizeBillNo's QUESTION, NOT `.trim()`'s ─────────────
+     * src/lib/bill-no.ts exists because `.trim()` is the wrong emptiness test
+     * for this field: a lone ZERO WIDTH SPACE survives it, and one arriving here
+     * with the cash option ticked skipped the mint entirely and stored an
+     * INVISIBLE string as the number the cash box is reconciled against — a
+     * reference on no screen and outside the app's own blank-bill census.
+     * Applied to the CASH decision and the cash stored value only: the non-cash
+     * mandate below keeps its historical `.trim()` test byte-for-byte, because
+     * tightening it would start refusing bills this route accepts today, which
+     * is a separate change on a rail this one must leave alone.
+     */
+    const cashBillNo = paidInCash ? normalizeBillNo(invoice_number) : '';
+    const cashMint = paidInCash && (!cashBillNo || isMintedCashVoucher(cashBillNo));
     const noBill = no_invoice_number === true;
-    if (!String(invoice_number || '').trim() && !noBill) {
+    if (!String(invoice_number || '').trim() && !noBill && !cashMint) {
       return Response.json(
         { error: 'Vendor invoice / bill number is required on an ad-hoc GRN — it is the only link back to the vendor\'s paperwork. '
                + 'If this delivery genuinely came with no bill (a cash market run, a sample, a donation), tick "No vendor bill number" and say so.' },
@@ -761,6 +935,31 @@ export async function POST(request: Request) {
       }
     }
 
+    /* ── A BACK-CORRECTION IS NOT A CASH PAYMENT ────────────────────────────
+     * A negative line UNDOES an earlier over-booking; no money changes hands
+     * for it in either direction. Riding one on a cash bill would NET IT OFF
+     * the amount recorded as leaving the box — a ₹2,000 run carrying a −₹300
+     * correction would book ₹1,700 of cash out, and the box would be short by
+     * ₹300 with nothing on screen to explain it. Refused rather than skipped,
+     * because skipping the line would silently drop a correction the person
+     * typed. The remedy is the one the QC gate already names two blocks below:
+     * two receipts. The correction saves on its own and applies immediately.
+     */
+    if (paidInCash) {
+      const negatives = receivable.filter((it: any) =>
+        (Number(it.quantity_received) || 0) < 0
+        || (it.quantity_accepted != null && Number(it.quantity_accepted) < 0));
+      if (negatives.length > 0) {
+        return Response.json({
+          error: 'This bill is marked as paid in cash but carries a back-correction line, and the two cannot share one receipt — '
+               + 'a correction moves no money, so it would be netted off the cash recorded as leaving the box. Nothing was saved. '
+               + 'Save the correction on its own (it is never held and applies immediately), then this cash bill.',
+          cash_denied: true,
+          back_correction_conflict: true,
+        }, { status: 400 });
+      }
+    }
+
     /* ═══════════════════════════════════════════════════════════════════════
      * THE DUPLICATE-BILL REFUSAL — BUILT HERE, BECAUSE IT WAS NOT INHERITED
      * ═══════════════════════════════════════════════════════════════════════
@@ -837,7 +1036,24 @@ export async function POST(request: Request) {
      * no second request can slip between the check and the write — keep it that
      * way; an await added in here reopens that window.
      */
-    const billNo = String(invoice_number || '').trim();
+    /* A MINTED VOUCHER IS TREATED AS A BLANK BY BOTH DUPLICATE GUARDS, and
+     * that is the honest reading rather than a convenience: the guards key on
+     * THE VENDOR'S DOCUMENT ("a vendor does not issue the same bill number
+     * twice"), and a PCV is not the vendor's document — it is ours, minted for
+     * a run that came with no paper at all. Two market runs from one vendor on
+     * one day are two real purchases, which is the exact carve-out the blank
+     * already has three paragraphs above.
+     *
+     * It also has to be blank here for a mechanical reason: the number in the
+     * payload is only a PREVIEW and the authoritative one is minted inside the
+     * transaction below, so matching on the preview could refuse a bill over a
+     * number this receipt will never carry.
+     *
+     * A REAL vendor bill number typed over the preview is NOT PCV-shaped, so
+     * cashMint is false and a cash bill is inside both guards exactly like any
+     * other bill. Paying cash does not make a duplicate bill less duplicated.
+     */
+    const billNo = cashMint ? '' : (paidInCash ? cashBillNo : String(invoice_number || '').trim());
     const vendorKey = String(vendor || '').toLowerCase().trim();
     // SAME-DATE MATCHES FIRST, so the hard refusal always wins over the
     // confirmable one when a vendor has used this number on several days
@@ -921,6 +1137,44 @@ export async function POST(request: Request) {
           needs_confirmation: true,
           existing_grn_number: dupBill.grn_number,
           existing_grn_date: dupBill.date,
+        }, { status: 409 });
+      }
+    }
+
+    /* ── AND THE ONE GUARD BLANKING billNo TURNED OFF: THE SAME VOUCHER TWICE ─
+     * Treating a PCV as blank switches BOTH guards above off, and that left the
+     * cash rail — the one that also moves money — as the only door with no
+     * double-submit protection at all. Measured: one market run saved twice from
+     * one open form, 201/201, stock doubled AND ₹290.10 out of the box twice,
+     * while the identical string posted as a credit bill was refused 409.
+     *
+     * So the voucher gets its own guard rather than being forced through the
+     * vendor-scoped bill guard: a PCV is OURS and globally unique, so "this
+     * number is already on the books" is a complete answer on its own and does
+     * not need the vendor to agree. It is a HARD refusal with no
+     * needs_confirmation escape — there is no honest "yes, save it anyway" for a
+     * number the next form open would issue differently.
+     *
+     * A BLANK cash payload (a direct POST with no preview at all) still has no
+     * number to key on and keeps the pre-existing declared-blank carve-out. The
+     * shipped form always sends the preview, so the real path is covered.
+     *
+     * Placed with the other guards, BEFORE the transaction, for the reason the
+     * block above states: a throw inside db.transaction() reaches the
+     * storekeeper as a bland 500.
+     */
+    if (cashMint && cashBillNo) {
+      const owner = cashVoucherOwner(db, cashBillNo);
+      if (owner) {
+        return Response.json({
+          error:
+            `Voucher ${cashBillNo} has already been issued — it is on ${owner.grn_number} `
+            + `(${owner.vendor || 'no vendor'}, ${owner.date}). Nothing was saved.\n\n`
+            + `If you are re-trying after a save that seemed to fail, it did not: the bill is already in, and the cash is already out of the box. `
+            + `If this is a genuinely different market run, close this form and open Enter Vendor Bill again — it will pre-fill the next free voucher number.`,
+          duplicate_cash_voucher: true,
+          existing_grn_number: owner.grn_number,
+          existing_grn_date: owner.date,
         }, { status: 409 });
       }
     }
@@ -1047,8 +1301,48 @@ export async function POST(request: Request) {
     // quote it. Stays '' on a QC-held receipt, where no `purchases` row is
     // written and therefore no number is issued.
     let invoiceIdIssued = '';
+    /* ── THE CASH LEG'S THREE OUTPUTS, DECLARED OUT HERE FOR THE RESPONSE ────
+     * `cashVoucherIssued` is the PCV actually stored (blank unless one was
+     * minted); `cashPaise` is the bill total the box paid, accumulated from the
+     * SAME per-line figures the GRN lines are written from so it cannot drift
+     * from a SUM over the stored rows; `cashWarning` is the overdraft sentence.
+     * `cashRefusal` carries a refusal OUT of the closure — a Response cannot be
+     * returned from inside db.transaction(), and the throw beside it is what
+     * rolls the whole receipt back so a refused cash bill writes nothing at all.
+     */
+    let cashVoucherIssued = '';
+    let cashPaise = 0;
+    let cashWarning = '';
+    let cashRowId = '';
+    let cashRefusal = '';
+    /* Set INSTEAD of cashRefusal when the refusal is "this run looks like one
+     * already paid for" — a 409 the caller can confirm past, not a 400. Carried
+     * out of the closure the same way and by the same throw, so the whole
+     * receipt rolls back either way.
+     * HELD ON AN OBJECT, not a `let`, for the reason POST /api/petty-cash states
+     * in its own comment: the transaction body is a closure, and a narrowed
+     * `let` assigned only inside one reads as `never` afterwards. */
+    const cashDup: { twin?: { grn_number: string; date: string; recorded_by: string } } = {};
 
     const txn = db.transaction(() => {
+      /* ── OUR VOUCHER NUMBER, MINTED HERE FOR THE SAME REASON PINV IS ───────
+       * Inside the transaction, so two saves racing in this process cannot take
+       * the same number — better-sqlite3 is synchronous, so the whole closure
+       * runs uninterrupted between the read and the write. mintCashVoucherNo
+       * additionally walks past any number already on the books, which closes
+       * the cross-process window a deferred BEGIN leaves open and is what makes
+       * the number unique by construction rather than merely by convention.
+       *
+       * TWO STORED FORMS, because the two columns already disagree on trimming
+       * and the non-cash path must stay byte-identical: the header has always
+       * stored `invoice_number || ''` raw, while purchases.bill_no stores the
+       * trimmed `billNo`. Only the cash branch collapses them onto one value.
+       */
+      const billNoStored = cashMint ? mintCashVoucherNo(db) : billNo;
+      const invoiceNumberStored = cashMint ? billNoStored
+                                : paidInCash ? cashBillNo
+                                : (invoice_number || '');
+      if (cashMint) cashVoucherIssued = billNoStored;
       // ── THE HELD HEADER ────────────────────────────────────────────────
       // 'awaiting_qc' instead of 'received' is the WHOLE gate: it is what the
       // sign-off's conditional claim matches on, what the queue lists, and what
@@ -1098,7 +1392,7 @@ export async function POST(request: Request) {
                 -- disagree, and datetime('now') rather than a JS clock so every
                 -- stamp in this table is on one clock.
                 ?, CASE WHEN ? = 1 THEN datetime('now') ELSE NULL END, datetime('now'))
-      `).run(grnId, grnNumber, date, vendor_id || null, vendor || '', invoice_number || '', invoice_date || '',
+      `).run(grnId, grnNumber, date, vendor_id || null, vendor || '', invoiceNumberStored, invoice_date || '',
               me.email,
               // qc_by is the LEGACY single QC signature the print sheet renders
               // under "QC verified by". On a held receipt it is not the store's
@@ -1231,7 +1525,18 @@ export async function POST(request: Request) {
                                is_emergency, payment_mode, emergency_reason, outlet_id, grn_id, invoice_id,
                                discount, cgst, sgst, compensation_cess, special_excise_cess, tcs,
                                delivery_charges, mrp_round_off, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '', '', ?, ?, ?,
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0,
+                -- ── payment_mode: 'cash' WHEN THE BOX PAID, '' OTHERWISE ──────
+                -- The column has existed, unused and blank on all 2,165 live
+                -- rows, since long before this. /api/reports/purchases ALREADY
+                -- groups by it ("Spend by Payment Mode"), so stamping it here is
+                -- the whole of "the Purchase Report can tell cash from credit" —
+                -- no report code changes. is_emergency stays 0 DELIBERATELY: it
+                -- drives a 🚨 EMRG badge and an "Emergency Spend" headline card
+                -- that mean something else, and a routine market run is not an
+                -- emergency. src/lib/grn-qc.ts binds the same value at sign-off,
+                -- so a held cash bill reaches the register marked as cash too.
+                ?, '', ?, ?, ?,
                 -- discount is bound 0 WHENEVER THE REDUCTION IS ALREADY INSIDE
                 -- unit_price, which is the ordinary case: the net-rate block in
                 -- the loop puts it there, and purchases.discount is a
@@ -1396,9 +1701,14 @@ export async function POST(request: Request) {
         // parsing prose to write prose, which is the failure grn_id was added to
         // end. On an UNHELD GRN it is the identical string the insert below
         // already used, so nothing about that path changes.
+        // invoiceNumberStored, not the payload's invoice_number: on a cash run
+        // the number in the payload was only the form's preview and the one this
+        // receipt actually carries was minted a few lines above. Quoting the
+        // preview would put a number in the cost row's prose that appears
+        // nowhere else in the database. Identical on every other path.
         const noteTag = accepted < 0
-          ? `BACK-CORRECTION GRN ${grnNumber}${invoice_number ? ' · invoice ' + invoice_number : ''}`
-          : `Ad-hoc GRN ${grnNumber}${invoice_number ? ' · invoice ' + invoice_number : ''}`;
+          ? `BACK-CORRECTION GRN ${grnNumber}${invoiceNumberStored ? ' · invoice ' + invoiceNumberStored : ''}`
+          : `Ad-hoc GRN ${grnNumber}${invoiceNumberStored ? ' · invoice ' + invoiceNumberStored : ''}`;
 
         // ── WHAT quantity_accepted MEANS ON A HELD LINE: 0, AND NOT "REJECTED" ──
         // The store records what ARRIVED; the checking department records what is
@@ -1446,6 +1756,39 @@ export async function POST(request: Request) {
                        // read it back from hours later. Same reason cost_vendor
                        // and cost_note are stored here (db.ts).
                        String(it.brand || ''));
+
+        /* ── WHAT LEFT THE CASH BOX FOR THIS LINE, IN INTEGER PAISE ───────────
+         * TOTAL INWARD, the settled definition — the SAME expression the GRN
+         * list computes as `inward_value`, the register prints as Total Inward,
+         * and src/lib/purchase-bill-summary.ts sums. Built from the very values
+         * bound into insGrnItem two statements above, so this figure and a
+         * SUM(...) over the stored rows are the same number by construction
+         * rather than by two people writing the same formula twice.
+         *
+         * RECEIVED × rate, NOT ACCEPTED × rate, and that is the whole point: the
+         * vendor charged for what he handed over, and a QC-HELD line stores
+         * quantity_accepted = 0. An accepted-based figure would record ₹0 of
+         * cash for a bill that emptied the box — the exact failure requirement 3
+         * exists to prevent. It also matches the discount's own apportionment
+         * base, which is the received goods value.
+         *
+         * INTEGER PAISE THROUGHOUT. petty_cash_ledger is REAL-typed and every
+         * sum over it is done in paise (src/lib/petty-cash.ts), so accumulating
+         * in rupees here would hand it a figure a paisa out on a long bill.
+         * Every term except received × rate is already a 2-dp rupee figure.
+         */
+        if (paidInCash) {
+          const rp = (v: number) => Math.round((Number(v) || 0) * 100);
+          cashPaise += Math.round(received * price * 100)
+                     - rp(discountLine)
+                     + rp(hasGst ? cgstPaise / 100 : chg(it.cgst))
+                     + rp(hasGst ? sgstPaise / 100 : chg(it.sgst))
+                     + rp(cessPaise / 100)
+                     + rp(chg(it.special_excise_cess))
+                     + rp(chg(it.tcs))
+                     + rp(chg(it.delivery_charges))
+                     + rp(chgSigned(it.mrp_round_off));
+        }
 
         // Mirror into purchases + inventory_transactions for ANY non-zero
         // accepted qty (including negatives, which represent reversal of a
@@ -1525,7 +1868,9 @@ export async function POST(request: Request) {
                           // replay write the same value instead of ''.
                           String(it.brand || ''),
                           accepted, netPrice, netTotal, date,
-                          noteTag, billNo, outletId, grnId,
+                          noteTag, billNoStored,
+                          paidInCash ? 'cash' : '',
+                          outletId, grnId,
                           // OUR bill number for this receipt, minted once (or
                           // reused) — lazily, so a held receipt burns none.
                           mintInvoiceId(),
@@ -1580,8 +1925,137 @@ export async function POST(request: Request) {
       // hasReject is false), and this is the second lock. decideGrnQc sets
       // 'partial' itself, by the same rule, when the kitchen rejects.
       if (!qc.required && hasReject) db.prepare(`UPDATE goods_receipt_notes SET status = 'partial' WHERE id = ?`).run(grnId);
+
+      /* ═══════════════════════════════════════════════════════════════════════
+       * THE MONEY LEG — OUTSIDE THE `!qc.required` BRANCH, DELIBERATELY
+       * ═══════════════════════════════════════════════════════════════════════
+       * Every write above this line is conditional on the kitchen not holding
+       * the delivery. THIS ONE IS NOT, and that is the requirement: the cash
+       * left the box at the stall, and whether the kitchen likes the tomatoes
+       * tomorrow cannot make that untrue. So a gated cash bill records the money
+       * NOW and the stock and the Purchase Report line on sign-off — which the
+       * form states at the moment of saving, so the storekeeper is not surprised
+       * to find the purchase missing from the report.
+       *
+       * It is the LAST write in the transaction so that a failure anywhere on
+       * the goods rail takes the cash row with it: the money and the receipt
+       * commit together or neither exists. That is the entire reason this option
+       * lives on the bill form rather than being a second gesture on /petty-cash.
+       *
+       * NOTHING HERE CAN REFUSE ON THE BALANCE. The overdraft is read and
+       * reported, never enforced — see outflowWarning() in src/lib/petty-cash.ts
+       * for why a refusal on this path would leave a storekeeper holding
+       * vegetables the system insists were never bought.
+       */
+      if (paidInCash) {
+        if (!(cashPaise > 0)) {
+          cashRefusal = 'Nothing was saved: this bill totals ' + fmtRs(cashPaise) + ', so there is no cash payment to record. '
+                      + 'A cash purchase is money leaving the box — check the rates, the discount and the charges, or untick "Paid in cash from petty cash".';
+          throw new CashRefused(cashRefusal);
+        }
+        if (cashPaise > MAX_PAISE) {
+          cashRefusal = `Nothing was saved: ${fmtRs(cashPaise)} is over the ₹10,00,000 ceiling on a single petty-cash entry. `
+                      + 'Check for an extra zero on a rate — or, if the bill really is that size, it did not come out of a cash box: '
+                      + 'untick "Paid in cash from petty cash" and record the payment where it actually happened.';
+          throw new CashRefused(cashRefusal);
+        }
+        /* ── AND HAS THIS EXACT RUN ALREADY BEEN PAID FOR TODAY? ─────────────
+         * The last guard, and the only one that works when the run has no
+         * number to key on. cashVoucherOwner (before the transaction) catches
+         * one preview posted twice; this catches the two vectors it cannot —
+         * the bill-number box cleared, and two form opens previewing two
+         * different vouchers. Both were measured saving one market run twice,
+         * with the money leaving the box twice.
+         *
+         * IT HAS TO BE HERE, INSIDE THE TRANSACTION: the key is the AMOUNT, and
+         * the amount is accumulated line by line above from the very figures the
+         * GRN rows were written from. Re-deriving it before the transaction
+         * would be the same arithmetic written a second time — the thing this
+         * route's own comments refuse to do — and it would be read outside the
+         * write lock, so two saves racing could both find nothing.
+         *
+         * Confirmable, and the throw rolls the goods back with the money: a
+         * receipt that is refused must write nothing at all.
+         */
+        if (confirm_duplicate_cash !== true) {
+          const twin = cashRunAlreadyPaid(db, {
+            outletId: outletId ?? null, date: String(date),
+            vendor: String(vendor || ''), amountPaise: cashPaise, excludeGrnId: grnId,
+          });
+          if (twin) {
+            cashDup.twin = { grn_number: twin.grn_number, date: String(twin.date), recorded_by: String(twin.recorded_by || '') };
+            throw new CashRefused('duplicate_cash_purchase');
+          }
+        }
+        // READ BEFORE THE INSERT, or the scan would count this very payment
+        // twice and overstate the overdraft by its own amount.
+        const od = outflowWarning(db, outletId, date, 'out', cashPaise);
+        if (od.overdrawn) cashWarning = od.message;
+        cashRowId = recordCashPurchase(db, {
+          grnId, grnNumber, date: String(date), amountPaise: cashPaise,
+          vendor: String(vendor || ''),
+          // The number the box is reconciled against — the vendor's own if one
+          // was typed, otherwise the PCV minted at the top of this transaction.
+          reference: billNoStored,
+          lineCount: receivable.length,
+          outletId: outletId ?? null,
+          actorEmail: me.email,
+        });
+      }
     });
-    txn();
+    try {
+      /* ── DEFERRED FOR A CREDIT BILL, IMMEDIATE FOR A CASH ONE ──────────────
+       * `txn()` — the plain deferred BEGIN — is what this route has always
+       * used, and a bill on credit still takes exactly that path: no lock is
+       * taken until the first statement, byte for byte as before.
+       *
+       * A CASH bill is a different shape of transaction. It READS the petty
+       * cash ledger and then WRITES it, twice over: mintCashVoucherNo scans for
+       * the next free voucher, and outflowWarning sums the box to compose a
+       * sentence the storekeeper will act on. POST /api/petty-cash uses
+       * .immediate() for precisely that reason and says so in its own comment —
+       * a deferred BEGIN takes a read lock first and tries to upgrade at the
+       * INSERT, so two payments racing from different processes are decided
+       * after the fact and the loser gets SQLITE_BUSY_SNAPSHOT, i.e. a 500 on a
+       * receipt that was perfectly recordable. The two doors into the one
+       * ledger with no DELETE now hold the same lock discipline.
+       *
+       * The deployed topology is a single Node process, where better-sqlite3's
+       * synchronous closure already makes this indivisible; this closes the
+       * cross-process window without touching the credit rail at all.
+       */
+      if (paidInCash) txn.immediate(); else txn();
+    } catch (e) {
+      // A cash refusal rolls the WHOLE receipt back — no GRN row, no cost row,
+      // no stock — and comes back as the 400 it would have been if a Response
+      // could be returned from inside a better-sqlite3 transaction. Anything
+      // else rethrows to the handler's own catch, unchanged.
+      if (e instanceof CashRefused) {
+        /* THE ONE CASH REFUSAL THAT IS NOT A 400. "This looks like a run you
+         * have already paid for" is a question, not a verdict — the caller says
+         * yes and it saves. Kept as its own status and its own flag so a client
+         * cannot confirm past it with the flag that confirms a duplicate BILL
+         * number: those are two different facts and two different decisions. */
+        if (cashDup.twin) {
+          const d = cashDup.twin;
+          return Response.json({
+            error:
+              `${fmtRs(cashPaise)} was already paid out of the cash box to ${vendor || 'this vendor'} on ${d.date} `
+              + `for ${d.grn_number}${d.recorded_by ? ` (recorded by ${d.recorded_by})` : ''} — the same day, the same vendor and the same amount. `
+              + `Nothing has been saved.\n\n`
+              + `If you are re-trying after a save that seemed to fail, stop: it did not fail. The bill is already in and the cash is already out of the box — `
+              + `a held delivery does not show on the Purchase Report until the kitchen signs, which is what usually makes a saved bill look missing.\n\n`
+              + `If this really is a second market run, say so and it will be saved.`,
+            duplicate_cash_purchase: true,
+            needs_confirmation: true,
+            existing_grn_number: d.grn_number,
+            existing_grn_date: d.date,
+          }, { status: 409 });
+        }
+        return Response.json({ error: cashRefusal, cash_denied: true }, { status: 400 });
+      }
+      throw e;
+    }
 
     // Cascade weighted-avg + recipe re-cost. `touched` is EMPTY on a held GRN
     // (nothing was booked), so this is a no-op there rather than a special case.
@@ -1610,11 +2084,20 @@ export async function POST(request: Request) {
      * not the supplier. On a held line there is no `purchases` row yet, so ''
      * is passed as the row id — the learner's pre-seed history probe then
      * excludes nothing, which errs toward SKIPPING the learn. The safe direction.
+     *
+     * ── AND NOT AT ALL ON A CASH RUN ────────────────────────────────────────
+     * The map is a statement about who SUPPLIES what, and /grn's own material
+     * picker filters by it. A market run is bought from whoever had it that
+     * morning — "Rythu Bazaar", a stall, a kirana — and learning those pairs
+     * would permanently declare a one-off stall a supplier of everything anyone
+     * ever bought in a hurry, then narrow the picker to it. The bill is recorded
+     * either way; only the picker's future suggestions are affected, and the
+     * honest answer for a cash market run is to suggest nothing.
      */
     const vendorMapping: VendorMappingOutcome[] = [];
     try {
       const nameOf = db.prepare('SELECT name FROM raw_materials WHERE id = ?');
-      for (const it of receivable) {
+      for (const it of paidInCash ? [] : receivable) {
         const mid = String(it.material_id || '');
         if (!mid) continue;
         const out = learnVendorMaterialPair(db, {
@@ -1694,6 +2177,30 @@ export async function POST(request: Request) {
                            // one (no cost row exists to carry it yet — see the
                            // minting note). Shown so the storekeeper can quote it.
                            invoice_id: invoiceIdIssued,
+                           /* ── THE CASH LEG ────────────────────────────────
+                            * `paid_in_cash` false on every existing caller (the
+                            * flag did not exist), so a client that ignores these
+                            * behaves exactly as it did. When true the form MUST
+                            * print all four:
+                            *   · the amount, so the storekeeper can check it
+                            *     against the notes he handed over;
+                            *   · the voucher number, because it is the string
+                            *     the box is reconciled against and it did not
+                            *     exist until this save;
+                            *   · the overdraft warning, when the box is now
+                            *     under water — recorded, not refused;
+                            *   · and, on a HELD receipt, the fact that the money
+                            *     is out while the goods are not yet in. That one
+                            *     is the whole reason this is on the wire: a
+                            *     storekeeper who is not told will look for the
+                            *     purchase on the report, not find it, and enter
+                            *     the bill a second time.
+                            */
+                           paid_in_cash: paidInCash,
+                           cash_amount: paidInCash ? Math.round(cashPaise) / 100 : undefined,
+                           cash_voucher_no: cashVoucherIssued || undefined,
+                           cash_entry_id: cashRowId || undefined,
+                           cash_warning: cashWarning || undefined,
                            // ⚠ store_blocked above is NOT only a held-panel field.
                            // A liquor line is filtered out of a receipt that
                            // otherwise SUCCEEDS, so a form that renders this array

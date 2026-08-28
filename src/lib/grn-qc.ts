@@ -5,6 +5,10 @@ import { getCentralStoreCutoverDate } from './central-cutover';
 import { packFactor } from './pack-units';
 import { mainDeptOf } from './dept-hierarchy';
 import { fulfilRequisitionFromPo } from './po-requisition-fulfil';
+// READ-ONLY here: "was this receipt paid out of the petty cash box?". Nothing in
+// this file writes to petty_cash_ledger — the money was recorded when the bill
+// was entered, and a sign-off never touches it. See the payment_mode bind below.
+import { grnPaidInCash } from './cash-purchase';
 import type { SessionUser } from './auth';
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -1689,13 +1693,29 @@ export function decideGrnQc(
      * subtracts purchases.discount a SECOND time. It is bound to the real share
      * ONLY in the fallback where the net rate could not be used — see the bind.
      */
+    /* ── payment_mode: THE ONE FIELD A HELD CASH BILL WOULD OTHERWISE LOSE ───
+     * This statement bound the literal '' and the unheld path now binds 'cash'
+     * (api/grn/route.ts), so a bill paid out of the petty cash box reached the
+     * Purchase Report marked as cash if it happened to contain no perishable,
+     * and unmarked if it did — the same bill, filed two ways, decided by whether
+     * a bag of tomatoes was on it. /api/reports/purchases groups by this column,
+     * so the difference is visible on the owner's own screen.
+     *
+     * Resolved from the RECEIPT, not from the payload: grnPaidInCash() asks
+     * whether a petty_cash_ledger row is keyed to this GRN, which is the fact
+     * itself rather than a copy of it. A cash row is written in the receipt's
+     * own transaction hours earlier and the ledger is append-only, so the answer
+     * cannot have drifted. is_emergency stays 0, deliberately — see the bind in
+     * api/grn/route.ts for why a market run is not an emergency.
+     */
+    const paidInCash = grnPaidInCash(db, grnId);
     const insPurchase = db.prepare(`
       INSERT INTO purchases (id, material_id, vendor, brand, quantity, unit_price, total_price, date, notes,
                              bill_no, is_emergency, payment_mode, emergency_reason, outlet_id,
                              discount, delivery_charges, grn_id, invoice_id,
                              cgst, sgst, compensation_cess, special_excise_cess, tcs, mrp_round_off,
                              created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '', '', ?, ?, ?, ?, ?,
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, '', ?, ?, ?, ?, ?,
               ?, ?, ?, ?, ?, ?, datetime('now'))
     `);
 
@@ -1870,6 +1890,8 @@ export function decideGrnQc(
         // would have written. Never re-composed here.
         String(r.item.cost_note || ''),
         String(grn.invoice_number || '').trim(),
+        // payment_mode — 'cash' when this receipt was paid out of the box.
+        paidInCash ? 'cash' : '',
         grn.outlet_id,
         // ── discount: 0 WHEN IT IS ALREADY INSIDE unit_price, THE SHARE WHEN
         //    IT IS NOT. `canNet && netCandidate > 0` is the exact condition

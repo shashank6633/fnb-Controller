@@ -11,6 +11,10 @@ import { planPoReceiptVoid, applyPoReceiptVoid, type PoVoidPlan, type PoVoidOutc
 // modal use — see the header of @/lib/bill-no. An amendment that may not REMOVE
 // the number must not be satisfiable by an invisible one either.
 import { normalizeBillNo } from '@/lib/bill-no';
+// READ-ONLY. The void NEVER writes to petty_cash_ledger — see the void's own
+// cash paragraph below for why reversing the cash automatically would be a
+// fabricated refund.
+import { cashLedgerForGrn } from '@/lib/cash-purchase';
 
 /**
  * AMEND and VOID one inward entry (GRN).
@@ -538,6 +542,21 @@ export async function PUT(request: Request, { params }: { params: Promise<{ id: 
           `${blankBillRows} cost row(s) on this receipt had no bill number until now. Until today they matched ANY bill number in the CSV importer's duplicate check; from now on they only match "${String(changes.invoice_number.to ?? '')}". If you re-upload an inward sheet that covers these lines, make sure its bill-number column says exactly that — otherwise the importer will treat them as new lines and add the stock a second time.`
         );
       }
+      /* ── THE CASH BOOK'S COPY OF THIS NUMBER DOES NOT MOVE ─────────────────
+       * petty_cash_ledger is append-only ON PURPOSE (no PUT, no DELETE), so the
+       * `reference` the box is reconciled against stays as recorded while the
+       * receipt and its cost rows take the vendor's real number. There is no
+       * silent correction available and none is invented — but the amend used to
+       * say nothing at all, leaving the vendor's statement carrying a number the
+       * cash row does not. The grn_id link keeps the two findable either way,
+       * and the Petty Cash log prints the GRN number under the reference. */
+      const cashRowAmend = cashLedgerForGrn(db, id);
+      if (cashRowAmend) {
+        warnings.push(
+          `This bill was paid in cash and its petty-cash entry still quotes "${cashRowAmend.reference}" as the reference — that is deliberate: the cash book is append-only, so a recorded payment is never rewritten. `
+          + `The receipt now reads "${String(changes.invoice_number.to ?? '')}". Both stay tied to ${grn.grn_number} on the Petty Cash log, so reconcile that payment by the receipt number rather than the reference.`
+        );
+      }
     }
 
     const after = db.prepare('SELECT * FROM goods_receipt_notes WHERE id = ?').get(id) as any;
@@ -728,6 +747,11 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ id
       return Response.json({ error: 'expect_edit_count must be a number.', code: 'bad_number' }, { status: 400 });
     }
 
+    /* READ BEFORE THE CORRECTION, so the amount quoted is the one that was
+     * recorded rather than anything this handler might be thought to have
+     * touched. It does not touch it: petty_cash_ledger is append-only. */
+    const cashRowPatch = cashLedgerForGrn(db, id);
+
     const result = amendGrnLines(db, {
       grnId: id, actorEmail: me.email, reason, lines, expectStatus, expectEditCount,
     });
@@ -806,7 +830,26 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ id
       average_price_stale: averagePriceStale,
       po_deviation_event: poDeviationEvent,
       warnings,
+      /** The petty-cash payment this receipt was bought with, LEFT STANDING.
+       *  Absent on a credit bill, so the shipped response shape is unchanged for
+       *  every receipt that existed before the cash option. */
+      cash_entry: cashRowPatch
+        ? { id: cashRowPatch.id, date: cashRowPatch.date, amount: cashRowPatch.amount, reference: cashRowPatch.reference }
+        : undefined,
       notice: [
+        // ── A CORRECTION DOES NOT MOVE THE MONEY, AND SILENCE HERE WAS A BUG ──
+        // The VOID path names the amount, the voucher and both remedies. The
+        // CORRECTION path — which is the more likely one, and the one that does
+        // not need an admin — said nothing at all, so a receipt corrected from
+        // 8 kg to 5 kg quietly left ₹756 in the cash book against ₹450 of goods.
+        // Nothing is adjusted on anyone's behalf: the box either is short or it
+        // is not, and only the person who handed the notes over knows which.
+        cashRowPatch
+          ? `This bill was paid in cash: ₹${Number(cashRowPatch.amount || 0).toFixed(2)} on ${cashRowPatch.date}`
+            + `${cashRowPatch.reference ? ` (voucher ${cashRowPatch.reference})` : ''}. That payment is unchanged — correcting a line cannot know `
+            + 'whether the vendor gave any money back. If the corrected bill is worth less and the money was returned, record a Return on Petty Cash; '
+            + 'if it was not, the box is genuinely short and an Adjustment says so.'
+          : '',
         result.state === 'held'
           ? 'This receipt is still waiting for a quality check, so it had never moved stock — only the bill lines were corrected. The corrected quantities and rates will be applied when the checking department signs it off.'
           : 'Stock, the cost rows and the stock movements were corrected together in one transaction.',
@@ -937,6 +980,28 @@ export async function DELETE(request: Request, { params }: { params: Promise<{ i
     // synchronous and nothing may be awaited inside one.
     let reason = '';
     try { const b = await request.json(); reason = String(b?.reason ?? '').trim(); } catch { /* no body is fine */ }
+
+    /* ── WAS THIS RECEIPT PAID OUT OF THE PETTY CASH BOX? ────────────────────
+     * Read here, and read ONLY. This void reverses stock and DELETES the cost
+     * rows; it does not, and must not, reverse the cash.
+     *
+     * WHY NOT. The money physically left the box. Voiding the receipt says
+     * nothing about whether the vendor gave it back — on a cash market run he
+     * almost certainly did not, because the storekeeper carried the goods away
+     * and paid at the stall. Auto-writing a 'return' row here would invent a
+     * refund that never happened and make the ledger stop describing the box,
+     * which is the one thing petty cash exists to prevent. The ledger is also
+     * append-only ON PURPOSE (api/petty-cash/route.ts: "There is no PUT and no
+     * DELETE"), so there is no honest silent correction available.
+     *
+     * WHAT HAPPENS INSTEAD: the cash row stays exactly as recorded, the petty
+     * cash log MARKS it (the goods_state derivation in src/lib/petty-cash.ts
+     * reads this receipt's live status and prints "receipt voided — cash not
+     * returned"), and the response below names the amount and the two real
+     * remedies. THE LINK DOES NOT DANGLE: the cost rows are deleted but the GRN
+     * HEADER survives a void, and the ledger points at the header.
+     */
+    const cashRow = cashLedgerForGrn(db, id);
 
     const cutoverDate = getCentralStoreCutoverDate(db);
 
@@ -1193,6 +1258,10 @@ export async function DELETE(request: Request, { params }: { params: Promise<{ i
           purchases_deleted: result.purchases_deleted,
           transactions_deleted: result.transactions_deleted,
           stock_reversed: result.materials,
+          // Recorded as a DELIBERATE non-action, not an omission: somebody
+          // reading this audit row a month later must be able to see that the
+          // cash was examined and left standing on purpose.
+          ...(cashRow ? { petty_cash_left_standing: { id: cashRow.id, amount: cashRow.amount, date: cashRow.date } } : {}),
           ...(poResult ? {
             purchase_order: {
               id: (poResult as PoVoidOutcome).po_id,
@@ -1216,7 +1285,8 @@ export async function DELETE(request: Request, { params }: { params: Promise<{ i
           } : {}),
         },
         note: `Voided ${grn.grn_number}${reason ? ` — ${reason}` : ''}. Reversed ${result.materials.length} material(s); deleted ${result.purchases_deleted} cost row(s) and ${result.transactions_deleted} stock movement(s). Header and line items kept.`
-          + (poResult ? poVoidNote(poResult) : ''),
+          + (poResult ? poVoidNote(poResult) : '')
+          + (cashRow ? ` Petty cash of ₹${Number(cashRow.amount || 0).toFixed(2)} was NOT reversed — a Return or an Adjustment is a human decision.` : ''),
       }, 'the reversal (this row is the only copy of the deleted cost rows and stock movements)');
     });
     txn();
@@ -1288,6 +1358,12 @@ export async function DELETE(request: Request, { params }: { params: Promise<{ i
       last_purchase_stale: result.last_purchase_stale,
       last_purchase_kept: result.last_purchase_kept,
       warnings: priceWarnings,
+      /** The petty-cash payment this receipt was bought with, LEFT STANDING.
+       *  Absent on a credit bill, so the shipped response shape is unchanged for
+       *  every receipt that existed before the cash option. */
+      cash_entry: cashRow
+        ? { id: cashRow.id, date: cashRow.date, amount: cashRow.amount, reference: cashRow.reference }
+        : undefined,
       // ── THE PO RAILS, ADDITIVE ────────────────────────────────────────────
       // Absent on an ad-hoc void (poResult is null, so every key below is
       // undefined and JSON drops it) — the shipped ad-hoc response shape is
@@ -1306,6 +1382,17 @@ export async function DELETE(request: Request, { params }: { params: Promise<{ i
       notice: [
         'The bill document is kept — header and line items are unchanged; only the stock and cost rows were reversed.',
         poNotice,
+        // ── THE CASH IS NOT REVERSED, AND SILENCE HERE WOULD BE THE BUG ──────
+        // Said on the void screen at the moment of the void, because this is
+        // the only moment somebody is looking. The two remedies are the ones
+        // that already exist on /petty-cash and they are opposite facts: a
+        // Return says the vendor gave the money back, an Adjustment says he did
+        // not and the box is genuinely short. Nothing here guesses which.
+        cashRow
+          ? `₹${Number(cashRow.amount || 0).toFixed(2)} of petty cash was paid for this bill on ${cashRow.date}`
+            + `${cashRow.reference ? ` (voucher ${cashRow.reference})` : ''}. That payment has NOT been reversed — voiding a receipt cannot know whether the vendor refunded. `
+            + 'The petty cash log now shows it as "receipt voided". If the money came back, record a Return; if it did not, record an Adjustment.'
+          : '',
         // ── A HELD RECEIPT VOIDS TO A CLEAN ZERO, AND THAT IS NOT A FAILURE ──
         // A GRN the kitchen QC gate was still holding never moved stock and
         // never wrote a cost row, so the reversal above legitimately finds

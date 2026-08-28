@@ -8,7 +8,7 @@
 import { useEffect, useMemo, useRef, useState, Fragment, type ReactNode, type WheelEvent as ReactWheelEvent } from 'react';
 import { FileCheck, ChevronDown, ChevronRight, Loader2, Plus, Trash2, X, Save, Download, Percent,
          Eye, Pencil, Printer, AlertTriangle, ChefHat, Wine, Clock, ShieldAlert, Info,
-         CheckCircle2, ShieldQuestion, Receipt, Link2 } from 'lucide-react';
+         CheckCircle2, ShieldQuestion, Receipt, Link2, Banknote } from 'lucide-react';
 import { api } from '@/lib/api';
 // THE duplicate rule — one material = one line — lives in exactly one module.
 // src/lib/line-dedupe.ts imports NOTHING, which is the only reason a 'use client'
@@ -19,6 +19,10 @@ import { duplicateLineGroups, SPLIT_RATE_REMEDY } from '@/lib/line-dedupe';
 import { todayIST, fmtIST } from '@/lib/format-date';
 import MaterialTypeahead from '@/components/MaterialTypeahead';
 import Combobox from '@/components/Combobox';
+// The house on/off switch. Used for "Paid in cash from petty cash" rather than a
+// bare <input type="checkbox"> so the option reads as the deliberate, stateful
+// choice it is — and so it matches every other toggle in the app.
+import Toggle from '@/components/Toggle';
 import { packFactor, fmtQtyNum } from '@/lib/pack-units';
 import StockOnHandNote, { StockOnHandLegend } from '@/components/StockOnHandNote';
 import { useStockOnHand } from '@/lib/use-stock-on-hand';
@@ -1767,6 +1771,22 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
    *  "Enter Full Bill" allowed (4 of its 13 real rows had a blank number)
    *  without letting a blank happen by accident. See the field. */
   const [noBill, setNoBill] = useState(false);
+  /* ── PAID OUT OF THE PETTY CASH BOX ────────────────────────────────────────
+   * The owner's design: "Keep it in Enter Vendor Bill, add an option of Cash
+   * purchase. If they click on it, it will be added on petty cash." Nothing
+   * about the inward rail changes — same GRN, same QC gate, same stock, same
+   * price cascade. Ticking this adds ONE petty_cash_ledger row for the money.
+   *
+   * `cashVoucher` is a PREVIEW the server hands over on mount. It is pre-filled
+   * into the bill-number field so a market run satisfies the mandatory bill
+   * number honestly, and it is EDITABLE — type the vendor's real number over it
+   * and that number is what gets stored. The server re-mints an authoritative
+   * one at save time whenever what arrives is still PCV-shaped, so two people
+   * with the form open cannot take the same number.
+   */
+  const [cashPurchase, setCashPurchase] = useState(false);
+  const [canRecordCash, setCanRecordCash] = useState(false);
+  const [cashVoucher, setCashVoucher] = useState('');
   const [invoiceDate, setInvoiceDate] = useState('');
   const [qcBy, setQcBy] = useState('');
   const [notes, setNotes] = useState('');
@@ -1860,6 +1880,13 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
   useEffect(() => {
     fetch('/api/vendors').then(r => r.json()).then(d => setVendors((d.vendors || []).filter((v: any) => v.is_active)));
     fetch('/api/inventory?scope=all').then(r => r.json()).then(d => setMaterials(d.materials || []));
+    // Whether this user may move money out of the cash box, and the next free
+    // voucher number. ADVISORY: POST /api/grn re-applies both petty-cash gates
+    // and fails closed, so hiding the control is a courtesy, never the rule.
+    fetch('/api/grn?cash_option=1', { credentials: 'same-origin' })
+      .then(r => r.json())
+      .then(d => { setCanRecordCash(!!d?.can_record_cash); setCashVoucher(String(d?.next_cash_voucher || '')); })
+      .catch(() => { /* option simply stays hidden */ });
   }, []);
 
   /**
@@ -2215,6 +2242,43 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
 
   /** This line's share of the bill-level charges — the render's shorthand. */
   const shareAt = (i: number): LineShare => bill.shares[i] || NO_SHARE;
+
+  /* ── WHAT WILL ACTUALLY LEAVE THE CASH BOX ────────────────────────────────
+   * `bill.totalInward` is the whole typed bill, and the cash panel used to print
+   * it under the words "the whole bill". POST /api/grn accumulates the cash from
+   * `receivable` — the lines that survive centralFlowBlock — so a mixed basket
+   * promised ₹2,200 before the save and recorded ₹200 after it (measured:
+   * one liquor line at ₹2,000 plus one grocery line at ₹200). Store-mapped
+   * (TGBCL liquor) lines are therefore taken out of the figure HERE, using the
+   * same storeMappedLine() the rest of this form zero-rates them with, and the
+   * money paid for them at the counter is named rather than folded in — the
+   * Liquor Store rail writes no petty-cash row, so it is genuinely recorded
+   * nowhere and the storekeeper has to know that before handing the notes over.
+   *
+   * DEGRADES TO TODAY'S NUMBER: storeMappedLine answers false when /api/stores
+   * could not be read, so an unreadable map gives exactly bill.totalInward.
+   *
+   * `shortAccepted` counts lines the STORE refused at the bay. The cash is
+   * recorded on the RECEIVED quantity (see the accumulation in POST /api/grn),
+   * which is right for a market run paid at the stall and wrong for goods that
+   * went back on the truck — so the panel says which it is rather than leaving
+   * it to be discovered on the Purchase Report.
+   */
+  const cashBill = useMemo(() => {
+    let total = 0, blockedTotal = 0, blocked = 0, shortAccepted = 0;
+    bill.lines.forEach((l, i) => {
+      const it = items[i];
+      if (!it?.material_id) return;
+      if (storeMappedLine(it.material_id)) { blocked++; blockedTotal = r2(blockedTotal + l.total); return; }
+      total = r2(total + l.total);
+      const qr = n0(it.quantity_received);
+      const qa = it.quantity_accepted !== '' ? n0(it.quantity_accepted) : qr;
+      if (qa < qr) shortAccepted++;
+    });
+    return { total, blocked, blockedTotal, shortAccepted };
+    // storeCats/materials feed storeMappedLine, exactly as the bill memo above.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bill, items, materials, storeCats]);
 
   // When a vendor is picked, fetch their MAPPED materials (vendor_materials
   // table — not contracts). User manages mappings on /vendors/materials.
@@ -2585,6 +2649,29 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
    */
   const [received, setReceived] = useState<any>(null);
 
+  /**
+   * TICKING / UNTICKING "Paid in cash from petty cash".
+   *
+   * Turning it ON pre-fills the mandatory bill-number field with our own voucher
+   * number, because a market run has no vendor paper and an empty required field
+   * is how a real receipt gets turned away. It also clears "No vendor bill
+   * number": a minted voucher IS a bill number, so declaring there is none would
+   * be a contradiction — and a declared blank costs the duplicate guard.
+   *
+   * Turning it OFF removes the voucher again, but ONLY if the field still holds
+   * exactly the voucher. A number the storekeeper typed himself is his, and
+   * wiping it because a toggle moved would lose the vendor's real bill number.
+   */
+  const setCashOption = (next: boolean) => {
+    setCashPurchase(next);
+    if (next) {
+      setNoBill(false);
+      if (!invoice.trim() && cashVoucher) setInvoice(cashVoucher);
+    } else if (invoice.trim() && invoice.trim() === cashVoucher) {
+      setInvoice('');
+    }
+  };
+
   const submit = async () => {
     // Validate qtys BEFORE filtering so the user sees errors instead of silent drops.
     for (let i = 0; i < items.length; i++) {
@@ -2616,7 +2703,13 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
     });
     if (cleaned.length === 0) { alert('Add at least one line with a material and qty'); return; }
     if (!vendor.trim()) { alert('Vendor name required'); return; }
-    if (!invoice.trim() && !noBill) {
+    // A CASH RUN HAS ITS OWN WAY OUT, AND THIS GATE DID NOT KNOW ABOUT IT.
+    // The server mints a PCV for a blank cash bill, so a storekeeper who ticked
+    // "Paid in cash" and then cleared the pre-filled voucher was blocked here
+    // and told to tick a checkbox that setCashOption deliberately clears — wrong
+    // advice at the only moment it is read. The condition mirrors the payload's
+    // own `cashPurchase && !isAdjustment` exactly.
+    if (!invoice.trim() && !noBill && !(cashPurchase && !isAdjustment)) {
       // Mandatory since 5522138 and re-checked server-side. Said here in the
       // route's own terms so it lands before the round trip — including the way
       // out, which is a declaration, not an empty box.
@@ -2703,12 +2796,38 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
     }
     setBusy(true);
     try {
+      /* ── A CLEARED BOX ON A CASH RUN STILL SENDS THE VOUCHER ────────────────
+       * The server mints a PCV for a blank cash bill either way, so this changes
+       * nothing about what is STORED. What it changes is whether the save can be
+       * recognised as a repeat: a blank payload carries no number, which switches
+       * off the duplicate-bill guard, its register mirror AND the voucher guard
+       * at once. Measured in a browser — tick the option, clear the pre-filled
+       * number, press Save twice: 201/201, ₹300 out of the box twice and the
+       * stock doubled. Sending the preview the form already holds puts that save
+       * back inside the voucher guard, which refuses the second one.
+       * Only when there is a preview to send, and only on a cash run: a credit
+       * bill's blank is a declaration and is untouched. */
+      const invoiceOut = (cashPurchase && !isAdjustment && !invoice.trim() && cashVoucher)
+        ? cashVoucher : invoice;
       const payload: Record<string, unknown> = {
           date, vendor_id: vendorId || null, vendor,
           // Blank ONLY as a declaration — the checkbox under the field. The
           // route refuses an undeclared blank exactly as it always did.
-          invoice_number: noBill ? '' : invoice,
+          invoice_number: noBill ? '' : invoiceOut,
           no_invoice_number: noBill,
+          /* ── THE MONEY LEG, SENT ONLY WHEN IT IS REAL ────────────────────
+           * Spread conditionally rather than sent as `false`, so the payload a
+           * CREDIT bill puts on the wire is byte-identical to the one this form
+           * has always sent — the key is simply absent, exactly as it was before
+           * the option existed. POST /api/grn tests `cash_purchase === true`.
+           *
+           * `&& !isAdjustment` is belt AND braces: the Toggle is disabled on a
+           * back-correction and setIsAdjustment unticks this, so both would have
+           * to fail for a stale `true` to reach here. A correction moves no
+           * money, and the server refuses the combination outright — this just
+           * means the refusal is never reached by a screen that showed the
+           * option greyed out. */
+          ...(cashPurchase && !isAdjustment ? { cash_purchase: true } : {}),
           invoice_date: invoiceDate,
           qc_by: qcBy,
           // Mark back-corrections clearly in the audit trail. Prepend a tag to
@@ -2806,12 +2925,32 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
        * delivery the number was used for and let the person holding both slips
        * decide. Nothing was written before this prompt.
        */
-      if (!r.ok && r.status === 409 && j?.needs_confirmation) {
+      /* ── AND THE SAME MARKET RUN, ALREADY PAID FOR TODAY ────────────────────
+       * A SECOND confirmable refusal, with its OWN flag. The two look alike and
+       * are not: a repeated bill number is the vendor's document saying "same
+       * paper", while this is four fields agreeing that the box has already paid
+       * this amount to this vendor today. Confirming one must never confirm the
+       * other, which is exactly what sharing confirm_duplicate_bill would do.
+       *
+       * A LOOP, NOT TWO `if`s IN A ROW, because a bill can trip BOTH and the
+       * server answers them in its own order — the bill guard runs before the
+       * transaction, the cash guard inside it. Two sequential blocks would take
+       * the second refusal with no prompt left to answer it, and the storekeeper
+       * would be stuck re-confirming the first for ever. Each answered question
+       * is REMEMBERED in `confirms` and re-sent with the next attempt, so
+       * confirming the bill does not un-confirm the cash. Bounded at two, which
+       * is the number of questions that exist; nothing is written before a
+       * prompt is answered. */
+      const confirms: Record<string, unknown> = {};
+      for (let attempt = 0; attempt < 2 && !r.ok && r.status === 409; attempt++) {
+        const cashDup = j?.duplicate_cash_purchase === true;
+        if (!cashDup && !j?.needs_confirmation) break;
         const proceed = window.confirm(
-          `${j.error}\n\nSave this as a separate delivery?`,
+          `${j.error}\n\n${cashDup ? 'Record this as a SECOND cash payment?' : 'Save this as a separate delivery?'}`,
         );
         if (!proceed) return;
-        r = await api('/api/grn', { method: 'POST', body: { ...payload, confirm_duplicate_bill: true } });
+        confirms[cashDup ? 'confirm_duplicate_cash' : 'confirm_duplicate_bill'] = true;
+        r = await api('/api/grn', { method: 'POST', body: { ...payload, ...confirms } });
         j = await r.json();
       }
       if (!r.ok) { alert(j.error || 'Failed'); return; }
@@ -2837,8 +2976,16 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
       // mapping lost in silence, so they get a panel instead of an alert. When
       // there is nothing to report the alert is untouched — the ordinary receipt
       // still closes in one click, as it always has.
+      // ── AND A THIRD: MONEY LEFT THE PETTY CASH BOX ────────────────────────
+      // A cash bill never closes on an alert(). The amount, the voucher number
+      // and any overdraft have to stay on screen long enough to be checked
+      // against the notes that were handed over — an alert is gone the instant
+      // it is dismissed, and the voucher number exists nowhere else on this
+      // screen. `paid_in_cash` is absent on every credit bill, so the ordinary
+      // receipt keeps the one-click alert it has always had.
       if ((Array.isArray(j.store_blocked) && j.store_blocked.length > 0)
-          || (Array.isArray(j.vendor_mapping) && j.vendor_mapping.length > 0)) {
+          || (Array.isArray(j.vendor_mapping) && j.vendor_mapping.length > 0)
+          || j.paid_in_cash === true) {
         setReceived(j);
         return;
       }
@@ -2861,9 +3008,74 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
   const SaveNotices = ({ j }: { j: any }) => {
     const blocked: any[] = Array.isArray(j?.store_blocked) ? j.store_blocked : [];
     const mapping: any[] = Array.isArray(j?.vendor_mapping) ? j.vendor_mapping : [];
-    if (blocked.length === 0 && mapping.length === 0) return null;
+    const cash = j?.paid_in_cash === true;
+    if (blocked.length === 0 && mapping.length === 0 && !cash) return null;
     return (
       <>
+        {/* ══ THE MONEY LEFT THE BOX ═══════════════════════════════════════
+            GREEN, not amber: this is a thing that SUCCEEDED, and it is printed
+            on every outcome — held, undecided and plain success — because the
+            cash row is written on all three. The amount is here so it can be
+            checked against the notes handed over, and the voucher number
+            because it did not exist until this save and it is the string the
+            cash box is reconciled against.
+
+            THE HELD CASE IS THE REASON THIS PANEL EXISTS. A storekeeper who is
+            not told that the money is out while the goods are not in will look
+            for the purchase on the report, fail to find it, and enter the bill
+            a second time. `j.qc_required` is the server's own answer, so the
+            sentence tracks what actually happened rather than what the form
+            predicted before saving. */}
+        {cash && (
+          <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-emerald-900 space-y-1.5">
+            <div className="font-semibold flex items-center gap-1.5">
+              <Banknote className="w-4 h-4 shrink-0" />
+              Petty cash — {m2(j.cash_amount)} recorded as paid out.
+            </div>
+            <div className="text-[11px] leading-snug">
+              {/* NOT "the whole bill" WHEN A LINE WAS DROPPED. A store-mapped
+                  liquor line never reaches this receipt, so the figure beside it
+                  is everything that WAS received, charges and the received
+                  quantity included — the amber panel below names what was left
+                  off and what it was worth. */}
+              {blocked.length > 0
+                ? <>Everything received on this bill, charges included &mdash; the {blocked.length === 1 ? 'line' : 'lines'} left off below {blocked.length === 1 ? 'is' : 'are'} not in it.</>
+                : <>The whole bill, charges included, on the quantity received.</>}
+              {' '}It is on the Petty Cash log against{' '}
+              <b>{j.grn_number}</b>
+              {j.cash_voucher_no
+                ? <> under our voucher <b className="font-mono">{j.cash_voucher_no}</b>, because this run came with no vendor bill.</>
+                : <>.</>}
+              {' '}These lines are marked <b>cash</b> on the Purchase Report.
+            </div>
+            {j.qc_required && (
+              <div className="text-[11px] leading-snug bg-amber-50 border border-amber-300 rounded px-2 py-1.5 text-amber-900">
+                <b>The cash is out; the goods are not in yet.</b> This delivery is held for a quality
+                check, so it is not in stock and not on the Purchase Report — both arrive when the
+                check is signed. <b>Do not enter this bill again.</b>
+              </div>
+            )}
+            {/* THE BOX IS UNDER WATER. Recorded, never refused — so the only
+                failure available here is saying nothing about it.
+
+                NO HEADLINE ASSERTING A BALANCE. It used to read "The box is now
+                overdrawn." in bold, and that is a claim about TODAY which the
+                warning is not: outflowWarning fires on the lowest point from
+                this bill's date to the END of the book, so a cash bill dated
+                three days back (inside the purchase window) warns while the box
+                today holds ₹19,116 — measured. A storekeeper who reads the bold
+                line, counts the box and finds it full either stops trusting the
+                ledger or posts a float top-up that was never needed, and that
+                top-up is itself a real cash movement. The server's sentence
+                already names the day, the figure and the remedy; it is left to
+                speak for itself under a neutral label. */}
+            {j.cash_warning && (
+              <div className="text-[11px] leading-snug bg-red-50 border border-red-300 rounded px-2 py-1.5 text-red-800">
+                <b>Check the cash box.</b> {j.cash_warning}
+              </div>
+            )}
+          </div>
+        )}
         {blocked.length > 0 && (
           <div className="rounded-lg border border-amber-300 bg-amber-50 p-3 text-amber-900 space-y-1.5">
             <div className="font-semibold flex items-center gap-1.5">
@@ -3195,12 +3407,27 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
                   than an empty box: blank-by-accident stays refused, blank
                   -because-there-is-no-bill is something the storekeeper says.
                   Consequence stated rather than hidden — see the note below. */}
-              <label className="flex items-start gap-1.5 text-[10px] text-[#8B7355] font-normal cursor-pointer mt-0.5">
-                <input type="checkbox" checked={noBill}
+              {/* ── AND IT IS OFF THE TABLE WHILE THE CASH OPTION IS ON ────────
+                  setCashOption already clears this box, because a minted voucher
+                  IS a bill number. Ticking it back afterwards was still allowed,
+                  and the server's mint silently won: the storekeeper declared
+                  "there is no number" and a PCV was stored anyway. Disabling it
+                  is the honest half of a rule that was already one-directional —
+                  the declaration and the voucher cannot both be true, and the
+                  voucher is the better record because it keeps a guard. */}
+              <label className={`flex items-start gap-1.5 text-[10px] text-[#8B7355] font-normal mt-0.5 ${cashPurchase ? 'opacity-60 cursor-not-allowed' : 'cursor-pointer'}`}>
+                <input type="checkbox" checked={noBill} disabled={cashPurchase}
                        onChange={e => setNoBill(e.target.checked)}
                        className="mt-0.5 accent-[#8B5E3C]" />
                 <span>
                   No vendor bill number — a cash market run, a sample, a donation or a return.
+                  {cashPurchase && (
+                    <span className="block text-[#8B7355]">
+                      Not available while <b>Paid in cash from petty cash</b> is ticked: the run already has a
+                      number of ours (the voucher below), which is a better record than a declared blank
+                      because the duplicate check can still see it.
+                    </span>
+                  )}
                   {noBill && (
                     <span className="block text-amber-800">
                       This receipt cannot be matched against a vendor statement later, and the
@@ -3365,7 +3592,14 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
               banner shows on the modal. */}
           <div className={`border rounded-lg p-3 ${isAdjustment ? 'border-amber-300 bg-amber-50/60' : 'border-[#E8D5C4] bg-[#FFF8F0]/40'}`}>
             <label className="flex items-start gap-2 text-xs cursor-pointer">
-              <input type="checkbox" checked={isAdjustment} onChange={e => { setIsAdjustment(e.target.checked); if (!e.target.checked) setAdjustmentRef(''); }}
+              {/* Turning a receipt into a back-correction CLEARS the cash option.
+                  A correction undoes an earlier over-booking and moves no money
+                  in either direction, so the two cannot share one receipt — the
+                  server refuses the combination. Clearing it here means the
+                  refusal is never reached from a screen that has already greyed
+                  the option out, and no stale `true` survives behind a disabled
+                  control. */}
+              <input type="checkbox" checked={isAdjustment} onChange={e => { setIsAdjustment(e.target.checked); if (e.target.checked) setCashOption(false); if (!e.target.checked) setAdjustmentRef(''); }}
                      className="mt-0.5 accent-amber-700" />
               <div className="flex-1">
                 <div className={`font-semibold ${isAdjustment ? 'text-amber-900' : 'text-[#6B5744]'}`}>
@@ -3386,6 +3620,129 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
               </div>
             </label>
           </div>
+
+          {/* ══ PAID IN CASH FROM PETTY CASH ═══════════════════════════════
+              The owner's option, on the form he asked for it on. It changes
+              NOTHING about the goods: same receipt, same QC gate, same stock,
+              same price cascade, same void. It adds one petty-cash row for the
+              money and stamps the cost rows as cash so the Purchase Report's
+              existing "Spend by Payment Mode" split finally separates them.
+
+              Hidden entirely from anyone who may not move money out of the box
+              — the server re-checks and refuses either way, so this only stops
+              a control being offered that would be refused. */}
+          {canRecordCash && (
+            <div className={`border rounded-lg p-3 ${cashPurchase ? 'border-[#af4408] bg-[#FFF1E3]' : 'border-[#E8D5C4] bg-[#FFF8F0]/60'}`}>
+              <div className="flex items-start gap-2.5">
+                <Toggle
+                  checked={cashPurchase}
+                  disabled={isAdjustment}
+                  onChange={setCashOption}
+                  label="Paid in cash from petty cash"
+                />
+                <div className="min-w-0">
+                  <div className="text-xs font-semibold text-[#2D1B0E]">
+                    Paid in cash from petty cash
+                    {isAdjustment && <span className="ml-2 font-normal text-[10px] text-[#8B7355]">— not available on a back-correction (it moves no money)</span>}
+                  </div>
+                  <div className="text-[10px] text-[#6B5744] mt-0.5">
+                    Tick this when the money came out of the store cash box. One payment is recorded on
+                    Petty Cash against this receipt, and these lines are marked <b>cash</b> on the Purchase Report.
+                  </div>
+
+                  {cashPurchase && (
+                    <div className="mt-2 space-y-1.5 text-[11px] text-[#6B5744]">
+                      {/* THE AMOUNT, NAMED — the owner's instruction was that
+                          nobody should have to guess whether charges are in it,
+                          or which quantity it is taken on. Total Inward is:
+                          goods − discount + GST + cess + excise + TCS + delivery
+                          + round-off, on the RECEIVED quantity. That sentence
+                          used to live in this comment, where nobody reads it; it
+                          is rendered now. */}
+                      <div className="flex justify-between gap-2 bg-white border border-[#E8D5C4] rounded px-2 py-1.5">
+                        <span>Cash out of the box — <b>{cashBill.blocked > 0 ? 'everything received here' : 'the whole bill'}</b>, charges included</span>
+                        <b className="font-mono text-[#af4408]">{m2(cashBill.total)}</b>
+                      </div>
+                      <div className="text-[10px] text-[#8B7355]">
+                        {/* THE SIX TERMS ARE THE WHOLE BILL — `bill` is every
+                            line typed, while the figure above excludes the
+                            store-mapped ones. On a mixed bill they therefore do
+                            NOT add up to the headline, and reading as an
+                            itemisation of it they looked wrong by the value of
+                            the liquor. Said plainly instead; the amber panel
+                            below names those lines and what they are worth. */}
+                        {cashBill.blocked > 0 ? <>Across <b>every line typed</b>: g</> : <>G</>}oods {m2(bill.subtotal)} − discount {m2(r2(bill.discountAmount + bill.lineDiscounts))}
+                        {' '}+ GST {m2(bill.taxTotal)} + cess {m2(bill.cessTotal)}
+                        {' '}+ delivery {m2(r2(bill.deliveryAmount + bill.lineDelivery))} + other {m2(bill.otherCharges)},
+                        {' '}on the quantity <b>received</b>.
+                        {cashBill.blocked > 0 && <> The figure above is that <b>less</b> the {cashBill.blocked === 1 ? 'line' : 'lines'} named below.</>}
+                        {' '}The Purchase Report shows the <b>goods</b> figure; the cash box shows what you handed over. They are not the same number and neither is wrong.
+                      </div>
+
+                      {/* A LINE THE STORE REFUSED AT THE BAY. The cash is taken
+                          on RECEIVED, which is right when the notes were handed
+                          over at the stall for the whole lot and wrong when the
+                          vendor drove away with the refused goods and gave money
+                          back. Only the person who paid knows which. */}
+                      {cashBill.shortAccepted > 0 && (
+                        <div className="text-[10px] text-amber-900 bg-amber-50 border border-amber-300 rounded px-2 py-1.5">
+                          {cashBill.shortAccepted} line{cashBill.shortAccepted === 1 ? '' : 's'} accepted less than
+                          {' '}arrived. This figure is still the <b>received</b> quantity, because that is what the vendor
+                          was paid for. If he took the refused goods back and returned the money, lower the received
+                          quantity too — or record a Return on Petty Cash afterwards.
+                        </div>
+                      )}
+
+                      {/* THE LIQUOR LINE THE SERVER WILL DROP. It is not received
+                          here at all (Inventory → Liquor Store owns that rail),
+                          so it is not in the cash figure — and that rail writes
+                          no petty-cash row, so cash paid for it is recorded
+                          nowhere unless somebody enters it by hand. */}
+                      {cashBill.blocked > 0 && (
+                        <div className="text-[10px] text-amber-900 bg-amber-50 border border-amber-300 rounded px-2 py-1.5">
+                          {cashBill.blocked} liquor / store-ledger line{cashBill.blocked === 1 ? '' : 's'} worth
+                          {' '}<b className="font-mono">{m2(cashBill.blockedTotal)}</b> {cashBill.blocked === 1 ? 'is' : 'are'} not
+                          {' '}received here and {cashBill.blocked === 1 ? 'is' : 'are'} <b>not</b> in the figure above.
+                          {' '}Record {cashBill.blocked === 1 ? 'it' : 'them'} on <b>Inventory → Liquor Store</b>; if that money also
+                          came out of this box, enter it on <b>Petty Cash</b> separately.
+                        </div>
+                      )}
+
+                      {/* THE HELD CASE, SAID BEFORE THE SAVE. A gated cash bill
+                          means the money is out now and the goods are not in —
+                          a storekeeper who is not told will look for the
+                          purchase on the report, not find it, and enter the
+                          bill a second time. */}
+                      {qcPreview.known && qcPreview.required && (
+                        <div className="text-[11px] text-amber-900 bg-amber-50 border border-amber-300 rounded px-2 py-1.5">
+                          <b>The cash is recorded now; the goods are not.</b> This delivery is held for a
+                          {' '}{CHECKER_LABEL[qcPreview.checker]} check, so {m2(cashBill.total)} leaves the petty cash box
+                          immediately while the stock and the Purchase Report line arrive only when the check is signed.
+                          That is not an error — the money really left the box.
+                        </div>
+                      )}
+
+                      <div className="text-[10px] text-[#8B7355]">
+                        {/* THE EMPTY BOX IS ITS OWN CASE, and it used to read
+                            "Recorded against bill no. —" — which was wrong twice
+                            over: a cash run always ends up with a number (the
+                            server mints one), and saying there is none is what
+                            made clearing the field look harmless. It is not
+                            harmless: the payload's number is what the repeat
+                            guards key on, so the form sends this voucher even
+                            when the box is empty (see submit()). */}
+                        {!invoice.trim() && cashVoucher
+                          ? <>Left blank, so this run will be recorded under our own voucher <b className="font-mono">{cashVoucher}</b> &mdash; the number the cash box is reconciled against. Type the vendor&rsquo;s real number in if there is one.</>
+                          : invoice.trim() && invoice.trim() === cashVoucher
+                          ? <>Bill no. is pre-filled with <b className="font-mono">{cashVoucher}</b>, our own voucher number for a run that came with no vendor bill. Type the vendor&rsquo;s real number over it if there is one.</>
+                          : <>Recorded against bill no. <b className="font-mono">{invoice.trim() || '—'}</b>, which is the number the cash box is reconciled against.</>}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
 
           {/* ── BEFORE YOU SAVE: WILL THIS BE HELD? ────────────────────────
               The owner's ask, in his words: the store person should be told in

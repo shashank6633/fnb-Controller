@@ -18,8 +18,23 @@
  *   2. Print a period summary that does not add up. opened + in − out = closing
  *      is asserted server-side; if it ever fails, the page prints the reason
  *      instead of the numbers.
- *   3. Record a payment the box cannot fund. The API refuses it and this page
- *      shows the refusal verbatim — physical cash cannot be negative.
+ *   3. Hide an overdrawn box. A payment the box cannot fund is RECORDED, by the
+ *      owner's ruling, and the resulting negative balance is shown in red and
+ *      explained. What this page refuses to do is stay quiet about it: the API
+ *      returns a `warning` beside the 201 and the page prints it.
+ *
+ * ── ITEM 3 USED TO SAY THE OPPOSITE ─────────────────────────────────────────
+ * "Record a payment the box cannot fund. The API refuses it and this page shows
+ * the refusal verbatim — physical cash cannot be negative." That refusal is gone
+ * (src/lib/petty-cash.ts outflowWarning holds the reasoning). A negative balance
+ * is now an ordinary business state meaning the box is owed a top-up, or a person
+ * is owed a reimbursement — NOT evidence that somebody edited the database.
+ *
+ * ── THE SECOND DOOR ─────────────────────────────────────────────────────────
+ * Rows can also arrive from Enter Vendor Bill with "Cash purchase" ticked, which
+ * writes ONE row here inside the receipt's own transaction. Those carry a grn_id,
+ * and the log shows what became of the GOODS beside the money — held for a
+ * kitchen check, or on a receipt that was later voided.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -53,6 +68,18 @@ interface Row {
   signed: number;
   running_balance: number;
   anomaly: string | null;
+  /* ── WHAT THE MONEY BOUGHT, when it came from Enter Vendor Bill ───────────
+   * All four are null/'' on every row recorded through the form on this page,
+   * which is every row that existed before the Cash purchase option. The money
+   * columns do not read them — the balance is petty_cash_ledger alone — so a
+   * voided or missing receipt can never move a rupee of the cash box. */
+  grn_id?: string | null;
+  grn_number?: string | null;
+  grn_status?: string | null;
+  goods_state?: 'in_stock' | 'awaiting_qc' | 'voided' | 'rejected' | 'partial' | 'unknown' | null;
+  goods_note?: string;
+  goods_amended?: boolean;
+  goods_amended_note?: string;
 }
 interface Summary {
   from: string; to: string;
@@ -114,6 +141,13 @@ export default function PettyCashPage() {
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState('');
   const [formOk, setFormOk] = useState('');
+  /* HELD APART FROM formOk ON PURPOSE. The overdraft sentence used to be
+     appended to the success line and printed inside the emerald "it worked" box
+     — so "Cash in hand is now −₹750.00" arrived dressed as good news, while the
+     identical sentence from the other door (Enter Vendor Bill) gets an amber
+     panel. Both facts are true and both belong on screen; they are not the same
+     kind of fact and must not share one colour. */
+  const [formWarn, setFormWarn] = useState('');
   /** Set when the API returns 409 duplicate — the next submit confirms it. */
   const [confirmDup, setConfirmDup] = useState(false);
 
@@ -198,7 +232,7 @@ export default function PettyCashPage() {
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (saving) return;
-    setFormError(''); setFormOk('');
+    setFormError(''); setFormOk(''); setFormWarn('');
     const amt = Number(fAmount);
     // Client-side mirror of the server's rules — the server is still the
     // authority (it re-checks all of this); this only saves a round trip.
@@ -225,7 +259,14 @@ export default function PettyCashPage() {
         if (res.status === 409 && d?.duplicate) setConfirmDup(true);
         return;
       }
+      // ── RECORDED, AND POSSIBLY OVERDRAWN ─────────────────────────────────
+      // The API used to answer a payment the box could not fund with a 400 and
+      // this line was never reached. It now answers 201 with a `warning`, so the
+      // success message has to carry it — a box that has gone under water with
+      // nobody told is exactly the failure that replacing the refusal risked.
+      // Absent on an ordinary entry, so the everyday message is unchanged.
       setFormOk(`Recorded — ${fDirection === 'in' ? 'cash in' : 'cash out'} ${rs(amt)}. Cash in hand is now ${rs(d.cash_in_hand)}.`);
+      setFormWarn(d?.warning ? String(d.warning) : '');
       resetForm();
       await load(from, to, category);
     } catch (err) {
@@ -278,7 +319,7 @@ export default function PettyCashPage() {
             </a>
             {data?.can_record && (
               <button
-                onClick={() => { setFormOpen(o => !o); setFormOk(''); }}
+                onClick={() => { setFormOpen(o => !o); setFormOk(''); setFormWarn(''); }}
                 className="flex items-center gap-2 px-4 py-2.5 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-medium"
               >
                 {formOpen ? <X className="w-4 h-4" /> : <Plus className="w-4 h-4" />}
@@ -311,10 +352,29 @@ export default function PettyCashPage() {
               Derived live as cash in − cash out; never stored, so it cannot drift from the log.
               {today && <> As at {today}.</>}
             </div>
+            {/* ── THE BOX IS UNDER WATER ───────────────────────────────────
+                THIS COPY USED TO ACCUSE THE READER OF EDITING THE DATABASE:
+                "A physical cash box cannot hold negative cash. New payments are
+                already blocked; this figure means rows were written directly to
+                the database, bypassing this page." Both halves of that became
+                FALSE the day the refusal was removed — payments are NOT blocked,
+                and a negative figure is now the ordinary consequence of
+                recording a payment the box could not fund. Leaving it would have
+                sent a storekeeper hunting for tampering that never happened.
+
+                What it says instead is what the figure MEANS and what clears it.
+                Red is kept: this still needs attention, it is just no longer an
+                accusation. */}
             {(data?.cash_in_hand ?? 0) < 0 && (
-              <div className="mt-3 text-[11px] text-red-700 bg-red-100 border border-red-200 rounded-lg px-3 py-2">
-                A physical cash box cannot hold negative cash. New payments are already blocked;
-                this figure means rows were written directly to the database, bypassing this page.
+              <div className="mt-3 text-[11px] text-red-700 bg-red-100 border border-red-200 rounded-lg px-3 py-2 leading-relaxed">
+                <b>The box has paid out more than it took in.</b> Payments are recorded even when the
+                box cannot fund them — the money really moved, and refusing the entry would not
+                un-spend it. This usually means a float top-up has not been recorded yet, or
+                somebody paid out of their own pocket and is owed it back.
+                <div className="mt-1">
+                  Record the top-up (<b>Cash in → Float top-up</b>) and the balance comes back up.
+                  Nothing is blocked in the meantime.
+                </div>
               </div>
             )}
           </div>
@@ -375,6 +435,17 @@ export default function PettyCashPage() {
         {/* ── Record a movement ────────────────────────────────────────────── */}
         {formOk && (
           <div className="bg-emerald-50 border border-emerald-200 rounded-xl px-4 py-3 text-sm text-emerald-800">{formOk}</div>
+        )}
+        {/* THE OVERDRAFT, IN ITS OWN BOX. It used to be appended to the line
+            above and printed emerald, so the one sentence on this page that
+            needs acting on arrived in the colour of "all good". Amber and
+            captioned, matching the panel the same sentence gets when it comes
+            from Enter Vendor Bill — the entry still SUCCEEDED, so it is not red
+            either. whitespace-pre-line stays with the text that needs it. */}
+        {formWarn && (
+          <div className="bg-amber-50 border border-amber-300 rounded-xl px-4 py-3 text-sm text-amber-900 whitespace-pre-line">
+            <span className="font-semibold">⚠ Check the cash box. </span>{formWarn}
+          </div>
         )}
         {data && !data.can_record && (
           <div className="bg-[#FFF1E3] border border-[#E8D5C4] rounded-xl px-4 py-3 text-xs text-[#6B5744]">
@@ -580,7 +651,7 @@ export default function PettyCashPage() {
                   <tr className="bg-[#FFF8F0]/60 border-t border-[#E8D5C4]/50">
                     <td className="py-1.5 px-3 text-[#8B7355] whitespace-nowrap">{s?.from}</td>
                     <td className="py-1.5 px-3 text-[#8B7355] italic" colSpan={6}>Opening balance for this period</td>
-                    <td className="py-1.5 px-3 text-right font-mono font-semibold text-[#2D1B0E]">{rs(s?.opening ?? 0)}</td>
+                    <td className={`py-1.5 px-3 text-right font-mono font-semibold ${(s?.opening ?? 0) < 0 ? 'text-red-700' : 'text-[#2D1B0E]'}`}>{rs(s?.opening ?? 0)}</td>
                   </tr>
                   {data!.rows.map(r => {
                     const isIn = r.direction === 'in';
@@ -607,15 +678,87 @@ export default function PettyCashPage() {
                         </td>
                         <td className="py-1.5 px-3 text-[#6B5744] whitespace-nowrap">{r.category_label}</td>
                         <td className="py-1.5 px-3 text-[#6B5744]">{r.vendor || '—'}</td>
-                        <td className="py-1.5 px-3 font-mono text-[#8B7355]">{r.reference || '—'}</td>
+                        {/* Reference is the number the box is reconciled against —
+                            the vendor's bill, or our own PCV voucher on a market
+                            run that came with no paper. The receipt it paid for
+                            hangs underneath it, because they are the same fact. */}
+                        <td className="py-1.5 px-3 font-mono text-[#8B7355]">
+                          {r.reference || '—'}
+                          {r.grn_number && (
+                            <div className="text-[10px] text-[#B8A590] not-italic">{r.grn_number}</div>
+                          )}
+                        </td>
                         <td className="py-1.5 px-3 text-[#8B7355]">
                           {r.recorded_by || '—'}
                           {r.notes && <div className="text-[10px] text-[#B8A590] max-w-[220px] truncate" title={r.notes}>{r.notes}</div>}
                           {r.anomaly && (
                             <div className="text-[10px] text-amber-800 font-medium">⚠ {r.anomaly}</div>
                           )}
+                          {/* ── WHAT BECAME OF THE GOODS ────────────────────────
+                              Derived live from the receipt's own status, never
+                              stored, so this can never carry a stale "awaiting
+                              check" on a bill the kitchen signed an hour ago.
+
+                              VOIDED IS THE ONE THAT MATTERS and it is red: the
+                              stock was reversed and the cost rows deleted, and
+                              this cash was NOT returned by that void. Without
+                              this line the payment reconciles as an ordinary
+                              purchase and the box silently stops matching the
+                              notes in it. The full sentence — including the two
+                              remedies — is the server's `goods_note`, on hover.
+                              THE AMOUNT IS UNTOUCHED IN EVERY STATE: the row
+                              stands exactly as recorded. */}
+                          {r.goods_state === 'voided' && (
+                            <div className="text-[10px] text-red-700 font-medium max-w-[240px]" title={r.goods_note}>
+                              ⚠ Receipt voided — cash not returned
+                            </div>
+                          )}
+                          {/* REJECTED IS THE SAME EVENT AS VOIDED — money out,
+                              nothing in stock, no cost row — so it is red and it
+                              is named. It used to render as nothing at all. */}
+                          {r.goods_state === 'rejected' && (
+                            <div className="text-[10px] text-red-700 font-medium max-w-[240px]" title={r.goods_note}>
+                              ⚠ Rejected at quality check — nothing in stock, cash not returned
+                            </div>
+                          )}
+                          {r.goods_state === 'partial' && (
+                            <div className="text-[10px] text-amber-800 font-medium max-w-[240px]" title={r.goods_note}>
+                              Part of the delivery was refused — cash covers the received quantity
+                            </div>
+                          )}
+                          {r.goods_state === 'awaiting_qc' && (
+                            <div className="text-[10px] text-amber-800 font-medium max-w-[240px]" title={r.goods_note}>
+                              Awaiting kitchen check — not in stock yet
+                            </div>
+                          )}
+                          {r.goods_state === 'unknown' && (
+                            <div className="text-[10px] text-amber-800 font-medium max-w-[240px]" title={r.goods_note}>
+                              ⚠ Receipt not found
+                            </div>
+                          )}
+                          {/* A CORRECTION IS ITS OWN LINE, not another state.
+                              The receipt can be corrected in ANY state, and the
+                              state above is still true — what this adds is that
+                              the payment and the receipt no longer agree, which
+                              on an ordinary `in_stock` row was the whole of what
+                              the cash book had to say and said nothing about.
+                              The figures are in the server's sentence, on hover. */}
+                          {r.goods_amended && (
+                            <div className="text-[10px] text-amber-800 font-medium max-w-[240px]" title={r.goods_amended_note}>
+                              ⚠ Receipt corrected after payment — no longer worth what was paid
+                            </div>
+                          )}
                         </td>
-                        <td className="py-1.5 px-3 text-right font-mono font-semibold text-[#2D1B0E] tabular-nums">
+                        {/* RED WHEN THE BOX WAS UNDER WATER ON THIS ROW. The
+                            footer promises exactly this, and without it the one
+                            day the box was actually empty renders in the same
+                            dark brown as every healthy figure — including the
+                            common case where a later top-up has already brought
+                            the headline balance back above zero, so nothing else
+                            on the page marks it at all. */}
+                        <td className={`py-1.5 px-3 text-right font-mono font-semibold tabular-nums ${
+                          r.running_balance < 0 ? 'text-red-700' : 'text-[#2D1B0E]'
+                        }`}>
                           {rs(r.running_balance)}
                         </td>
                       </tr>
@@ -627,7 +770,7 @@ export default function PettyCashPage() {
                       Closing balance for this period
                       {data?.filtered && <span className="font-normal italic"> (all categories — the rows above are filtered)</span>}
                     </td>
-                    <td className="py-2 px-3 text-right font-mono font-bold text-[#2D1B0E]">{rs(s?.closing ?? 0)}</td>
+                    <td className={`py-2 px-3 text-right font-mono font-bold ${(s?.closing ?? 0) < 0 ? 'text-red-700' : 'text-[#2D1B0E]'}`}>{rs(s?.closing ?? 0)}</td>
                   </tr>
                 </tbody>
               </table>
@@ -636,9 +779,15 @@ export default function PettyCashPage() {
         </div>
 
         <p className="text-[11px] text-[#8B7355] pb-4">
+          {/* THE LAST SENTENCE USED TO PROMISE THE OPPOSITE: "Payments that the
+              box cannot fund are refused at the moment of entry, so the running
+              balance can never go below zero." It stopped being true the day the
+              refusal was removed, and a footer that promises a floor the ledger
+              does not have is worse than no footer. */}
           This ledger is append-only: there is no edit and no delete. Corrections are recorded as an
-          Adjustment, which is itself visible, dated and attributed. Payments that the box cannot fund
-          are refused at the moment of entry, so the running balance can never go below zero.
+          Adjustment, which is itself visible, dated and attributed. A payment the box cannot fund is
+          still recorded — the money moved, so the running balance is allowed to go below zero and is
+          shown in red until a top-up brings it back up.
         </p>
       </div>
     </div>
@@ -646,10 +795,19 @@ export default function PettyCashPage() {
 }
 
 function SummaryTile({ label, value, tone }: { label: string; value?: number; tone: 'neutral' | 'in' | 'out' | 'closing' }) {
+  // A negative CLOSING is the same fact as a negative running balance and is
+  // painted the same way. `total_in` / `total_out` are magnitudes and cannot be
+  // negative, so those two can never take the branch.
+  // "OPENED WITH" CAN, and used to be the one figure that did not. A period
+  // beginning under water opened brown here while the identical figure was red
+  // in the opening row of the table two panels below — the same number, two
+  // colours, on the page whose footer promises red means under water. Possible
+  // only since a payment the box cannot fund stopped being refused.
   const toneCls =
     tone === 'in' ? 'text-emerald-700' :
     tone === 'out' ? 'text-[#af4408]' :
-    tone === 'closing' ? 'text-[#2D1B0E]' : 'text-[#6B5744]';
+    tone === 'closing' ? ((value ?? 0) < 0 ? 'text-red-700' : 'text-[#2D1B0E]')
+    : ((value ?? 0) < 0 ? 'text-red-700' : 'text-[#6B5744]');
   const boxCls =
     tone === 'closing' ? 'bg-[#FFF1E3] border-[#D4B896]' : 'bg-[#FFF8F0] border-[#E8D5C4]';
   return (

@@ -3,8 +3,9 @@ import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
 import { canAccessPage } from '@/lib/page-catalog';
 import { todayIST } from '@/lib/format-date';
 import {
-  PETTY_CATEGORIES, buildLedgerView, cashInHandPaise, categoryDef, guardOutflow,
-  isPettyCategory, ledgerCsv, pettyCashAdjustGate, pettyCashWriteGate, toPaise, toRupees,
+  MAX_PAISE, PETTY_CATEGORIES, buildLedgerView, cashInHandPaise, categoryDef,
+  isPettyCategory, ledgerCsv, outflowWarning, pettyCashAdjustGate, pettyCashWriteGate,
+  toPaise, toRupees,
   type PettyDirection,
 } from '@/lib/petty-cash';
 
@@ -23,6 +24,19 @@ import {
  * way to correct it is an 'adjustment' row that is itself visible and attributed,
  * not a silent edit of yesterday's figure. Deleting rows is how a balance stops
  * matching the notes in the box with nothing on screen to explain it.
+ *
+ * ── THE SECOND DOOR ─────────────────────────────────────────────────────────
+ * A vendor bill paid from the box is recorded on Enter Vendor Bill (POST
+ * /api/grn) with "Cash purchase" ticked, which writes ONE row here inside the
+ * receipt's own transaction — see src/lib/cash-purchase.ts. That path sets
+ * `grn_id`; this route never does, and it never accepts one from a caller. The
+ * money and the goods have to commit together, so a cash bill cannot be composed
+ * out of two separate requests.
+ *
+ * ── A PAYMENT THE BOX CANNOT FUND IS RECORDED, NOT REFUSED ──────────────────
+ * The owner's rule as of this change. The entry lands, the balance goes
+ * negative, the response carries a `warning`, and a later float top-up brings it
+ * back up. src/lib/petty-cash.ts outflowWarning() holds the reasoning.
  *
  * BALANCE IS NEVER STORED — every figure here is Σ(in) − Σ(out) computed by
  * src/lib/petty-cash.ts. See that file's header for the money/rounding rules.
@@ -53,10 +67,6 @@ const minusDays = (iso: string, n: number) => {
   d.setUTCDate(d.getUTCDate() - n);
   return d.toISOString().slice(0, 10);
 };
-
-/** Absurdity ceiling — a petty-cash box does not move ₹10,00,000 in one entry.
- *  This catches an extra zero, not a real movement; the message says to split it. */
-const MAX_PAISE = 1_000_000_00;
 
 /**
  * PAGE GATE — the one rule, called by BOTH the read path and the write path.
@@ -271,7 +281,7 @@ export async function POST(request: Request) {
     const id = generateId();
     // Held on an object, not two `let`s: the transaction body is a closure, and a
     // narrowed `let` assigned only inside it reads as `never` afterwards.
-    const outcome: { refusal?: string; duplicate?: string } = {};
+    const outcome: { warning?: string; duplicate?: string } = {};
 
     const txn = db.transaction(() => {
       // DOUBLE-SUBMIT GUARD: a second click on "Record" is a second real payment
@@ -294,11 +304,20 @@ export async function POST(request: Request) {
         }
       }
 
-      // NEGATIVE-CASH GUARD, inside the transaction so the balance it read cannot
-      // change between the check and the insert. See the .immediate() below for
-      // why the transaction has to hold the WRITE lock while it reads.
-      const guard = guardOutflow(db, outletId, date, direction, paise);
-      if (!guard.ok) { outcome.refusal = guard.message; return; }
+      // ── OVERDRAFT NOTICE — READ, RECORD, THEN REPORT ────────────────────
+      // THIS USED TO REFUSE. The owner's ruling is that a payment the box cannot
+      // fund is still a payment that happened, so it is recorded and the
+      // resulting negative balance is shown — see outflowWarning() in
+      // src/lib/petty-cash.ts for the full reasoning and for what a refusal cost.
+      //
+      // STILL READ INSIDE THE TRANSACTION, and still before the INSERT, for a
+      // reason that survived the change: the sentence quotes a balance, and a
+      // balance read outside the write lock could be stale by the time the row
+      // lands — the storekeeper would be told the box stands at a figure it
+      // never stood at. It also must run BEFORE the insert or the scan would
+      // count this very payment twice.
+      const overdraft = outflowWarning(db, outletId, date, direction, paise);
+      if (overdraft.overdrawn) outcome.warning = overdraft.message;
 
       db.prepare(`
         INSERT INTO petty_cash_ledger
@@ -316,27 +335,34 @@ export async function POST(request: Request) {
         note: `${direction === 'in' ? 'Cash in' : 'Cash out'} ₹${toRupees(paise).toFixed(2)} — ${def.label}`,
       });
     });
-    // IMMEDIATE, not the default deferred BEGIN. Both guards above are
+    // IMMEDIATE, not the default deferred BEGIN. Both reads above are
     // read-then-write: they SELECT the balance (and the recent-duplicate window)
     // and then INSERT based on what they read. A deferred transaction takes only
     // a read lock at its first SELECT and tries to upgrade at the INSERT, so two
     // payments racing from different processes against the same file are decided
     // by SQLite after the fact — the loser aborts with SQLITE_BUSY_SNAPSHOT and
-    // the storekeeper sees a 500 on a payment that was correctly refusable or
-    // correctly recordable, with no way to tell which. BEGIN IMMEDIATE takes the
-    // write lock BEFORE the first read, so the check and the insert are one
-    // indivisible step: the second payment waits (better-sqlite3's default 5s
-    // busy timeout), then re-reads a balance that already includes the first.
-    // A cash box cannot be overdrawn by two people clicking at the same moment.
+    // the storekeeper sees a 500 on a payment that was in fact recordable, with
+    // no way to tell whether it landed. BEGIN IMMEDIATE takes the write lock
+    // BEFORE the first read, so the check and the insert are one indivisible
+    // step: the second payment waits (better-sqlite3's default 5s busy timeout),
+    // then re-reads a balance that already includes the first.
+    // STILL IMMEDIATE NOW THAT THE BALANCE NO LONGER REFUSES ANYTHING: the
+    // duplicate window is read-then-write in its own right, and the overdraft
+    // sentence quotes a balance the storekeeper will act on — both need to see
+    // a figure that cannot change under them.
     txn.immediate();
 
     if (outcome.duplicate) return Response.json({ error: outcome.duplicate, duplicate: true }, { status: 409 });
-    if (outcome.refusal)   return Response.json({ error: outcome.refusal, insufficient_cash: true }, { status: 400 });
 
     const entry = db.prepare('SELECT * FROM petty_cash_ledger WHERE id = ?').get(id);
     return Response.json({
       entry,
       cash_in_hand: toRupees(cashInHandPaise(db, outletId)),
+      // 201 WITH a warning, never a 4xx: the movement WAS recorded. `warning` is
+      // absent on an ordinary entry, so a client that does not read it behaves
+      // exactly as it did — but the page prints it, because an overdrawn box
+      // that nobody is told about is the failure this replaced a refusal with.
+      ...(outcome.warning ? { warning: outcome.warning, overdrawn: true } : {}),
     }, { status: 201 });
   } catch (e: any) {
     // LOCK CONTENTION IS NOT A CRASH, AND THE ANSWER MUST BE UNAMBIGUOUS.

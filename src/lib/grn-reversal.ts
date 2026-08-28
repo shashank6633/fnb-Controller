@@ -4,6 +4,7 @@ import { packFactor } from './pack-units';
 import { getCentralStoreCutoverDate } from './central-cutover';
 import { alreadyReturnedByGrnItem } from './returns';
 import { centralFlowBlock } from './store-engine';
+import { grnPaidInCash } from './cash-purchase';
 
 /**
  * ╔══════════════════════════════════════════════════════════════════════════╗
@@ -967,6 +968,12 @@ export function amendGrnLines(
         `Cannot confirm whether anything on ${grnNumber} has already been returned (${e?.message || 'returns ledger unreadable'}). Refusing rather than risk moving the same stock twice.`);
     }
 
+    /* WAS THIS BILL PAID OUT OF THE PETTY CASH BOX? Read ONCE, here, and not
+     * per line: it is a fact about the RECEIPT, it cannot change inside this
+     * transaction, and the cost-row INSERT below is per line. src/lib/grn-qc.ts
+     * hoists the identical call for the identical reason. */
+    const paidInCash = grnPaidInCash(db, grnId);
+
     for (const req of lines) {
       const line = getLine.get(req.id, grnId) as any;
       if (!line) {
@@ -1609,7 +1616,7 @@ export function amendGrnLines(
                                  discount, delivery_charges, grn_id, invoice_id,
                                  cgst, sgst, compensation_cess, special_excise_cess, tcs, mrp_round_off,
                                  created_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '', '', ?, ?, ?, ?, ?,
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, '', ?, ?, ?, ?, ?,
                   ?, ?, ?, ?, ?, ?, datetime('now'))
         `).run(purchaseId, materialId, String(line.cost_vendor || grn.vendor || ''),
                String(line.brand || ''),
@@ -1627,6 +1634,22 @@ export function amendGrnLines(
                // invented, the same two shapes, so the anchored regex matches.
                String(line.cost_note || '').trim() || composedCostNote,
                String(grn.invoice_number || '').trim(),
+               /* ── THE THIRD DOOR ONTO `purchases`, AND IT WAS DROPPING THE
+                *    CASH STAMP ────────────────────────────────────────────────
+                * POST /api/grn stamps payment_mode = 'cash' when the bill was
+                * paid out of the petty cash box, and src/lib/grn-qc.ts stamps it
+                * again on the deferred sign-off. This INSERT is the THIRD writer
+                * — it re-creates a cost row from scratch whenever a correction
+                * moves a line from accepted 0 to accepted > 0 — and it bound the
+                * literal ''. Measured: one cash bill ended up filed under BOTH
+                * 'cash' and '(unspecified)' on the owner's own Spend by Payment
+                * Mode split, which is the exact "same bill, filed two ways"
+                * failure grn-qc.ts's own comment describes.
+                * READ, NOT PASSED IN: the fact lives on petty_cash_ledger.grn_id
+                * and the helper degrades to "no cash row" if the boot migration
+                * has not run, which understates rather than inventing a payment.
+                * Resolved once above the loop — see `paidInCash`. */
+               paidInCash ? 'cash' : '',
                grn.outlet_id,
                (canNet && netCandidate > 0) ? 0 : discShare,
                Number(line.delivery_charges) || 0, grnId, amendInvoiceId,

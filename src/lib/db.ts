@@ -1501,7 +1501,8 @@ function initializeSchema(db: Database.Database) {
         direction    TEXT NOT NULL,              -- 'in' | 'out'
         amount       REAL NOT NULL DEFAULT 0,    -- always POSITIVE; direction carries the sign
         category     TEXT NOT NULL DEFAULT '',   -- float_topup | cash_purchase | delivery | return | adjustment
-        purchase_id  TEXT,                       -- set when the cash paid for a recorded purchase
+        purchase_id  TEXT,                       -- set when the cash paid for a recorded purchase LINE (API-only; see api/petty-cash)
+        grn_id       TEXT,                       -- set when the cash paid for a whole vendor bill (Enter Vendor Bill → Cash purchase)
         vendor       TEXT NOT NULL DEFAULT '',
         reference    TEXT NOT NULL DEFAULT '',   -- bill / voucher number
         notes        TEXT NOT NULL DEFAULT '',
@@ -1594,6 +1595,43 @@ function initializeSchema(db: Database.Database) {
       `);
     }
   } catch (e) { console.error('po_vendor_bills.grn_id migration failed:', e); }
+
+  // ── petty_cash_ledger.grn_id — THE LINK A CASH PURCHASE ACTUALLY NEEDS ────
+  //
+  // The table already carries `purchase_id`, and the route that writes it says
+  // in its own comment why that column cannot do this job: "`purchases` rows are
+  // per-MATERIAL lines, not bills, so one purchase_id cannot honestly represent
+  // a cash payment against a multi-line vendor bill" (api/petty-cash/route.ts).
+  // A market run buys five things and writes five cost rows.
+  //
+  // AND THE COST ROWS DO NOT SURVIVE A CORRECTION. Voiding a receipt HARD
+  // DELETES every `purchases` row carrying its grn_id (src/lib/grn-reversal.ts),
+  // so a purchase_id link would dangle at the first void — silently, because
+  // there is no FK and the write-time existence check has long since passed. The
+  // GRN HEADER is never deleted; a void only marks it 'void'. So grn_id is the
+  // one link that stays true for the life of the record, which is what lets the
+  // petty cash log say "the goods on this payment were voided" instead of
+  // showing a payment with nothing behind it.
+  //
+  // ADDITIVE AND SOFT, exactly like po_vendor_bills.grn_id above: no FK (SQLite
+  // cannot ADD one, and rebuilding a live table is not a trade worth making),
+  // NULL on every existing row, and NO BACKFILL — a cash payment recorded before
+  // this feature has no receipt to point at, and guessing one from a matching
+  // amount would invent a link nobody made.
+  //
+  // VERIFY AFTER A BOOT:
+  //   PRAGMA table_info(petty_cash_ledger);                      -- grn_id present
+  //   SELECT COUNT(*) FROM petty_cash_ledger p LEFT JOIN goods_receipt_notes g
+  //     ON g.id = p.grn_id WHERE p.grn_id IS NOT NULL AND g.id IS NULL;  -- 0, always
+  try {
+    const cols = db.prepare("PRAGMA table_info(petty_cash_ledger)").all() as any[];
+    if (cols.length > 0) {
+      if (!cols.some((c: any) => c.name === 'grn_id')) {
+        db.prepare(`ALTER TABLE petty_cash_ledger ADD COLUMN grn_id TEXT`).run();
+      }
+      db.prepare(`CREATE INDEX IF NOT EXISTS idx_petty_grn ON petty_cash_ledger(grn_id)`).run();
+    }
+  } catch (e) { console.error('petty_cash_ledger.grn_id migration failed:', e); }
 
   // SEED vendor_materials FROM REAL PURCHASE HISTORY — one-shot.
   //
