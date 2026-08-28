@@ -2516,7 +2516,40 @@ function IssuedLogPanel({ loading, log, from, to, onFromChange, onToChange }: {
     // api/inventory/export/route.ts (BLANK_WHEN_ZERO). The money columns still
     // print — equal to their ex-tax twin — because that IS the right figure when
     // no rate is stated.
-    const headers = ['When', 'Material', 'Category', 'Qty (purchase)', 'Purchase Unit', 'Qty (recipe)', 'Recipe Unit',
+    //
+    // ── THE THREE LINE-LEVEL COLUMNS, SITTING WITH THE QUANTITY BLOCK ────────
+    // Requested / Approved-Effective / Issued describe the requisition LINE, not
+    // this hand-over, so they REPEAT identically across every event row of the
+    // same line. That is the intent: read across a row and it says "asked 240,
+    // approved 200, issued 200 so far" beside "this hand-over was 50". They sit
+    // next to Qty (purchase) rather than at the end because that comparison is
+    // the reason they exist.
+    //   · All three are PURCHASE units (owner rule 2026-07-29), the same basis
+    //     as "Issued Qty" two columns to their left, so nothing on the row needs
+    //     converting in the reader's head.
+    //   · NO "(purchase)" suffix on any of them — OWNER RULING 2026-08-27, after
+    //     he read a download and asked why the issued column said "purchase":
+    //     "Qty (purchase)" names the UNIT but reads as "quantity purchased",
+    //     which is a different thing entirely and not what the column holds.
+    //     The suffix was also redundant — "Purchase Unit" is the very next
+    //     column and already states the unit. The old ambiguity note argued an
+    //     unqualified "Issued Qty" beside "Qty (recipe)" would mislead; that is
+    //     answered by naming the PAIR consistently ("Issued Qty" / "Issued Qty
+    //     (recipe)") rather than by suffixing every column. The recipe twin
+    //     keeps its qualifier only because two columns cannot share a header.
+    //   · "to Date" on the Issued column, matching the label the sibling report
+    //     already ships (src/lib/issue-log.ts: 'Issued To Date'). Without it,
+    //     "Issued Qty to Date" beside the per-event "Issued Qty" would read as
+    //     this hand-over's quantity — it is the LINE's cumulative
+    //     quantity_issued, repeated on every event row of that line.
+    //   · "Approved/Effective" because the figure is chef_approved_qty when the
+    //     chef set one and quantity_requested when he did not — the effective
+    //     quantity the fulfilment status itself is judged on. The rule lives in
+    //     api/store-issued-log/route.ts, copied from store-issue/route.ts.
+    // Blank, not 0, if a field is absent from the response: 0 would assert
+    // "nothing was requested", the same call the GST rate cell makes below.
+    const headers = ['When', 'Material', 'Category', 'Issued Qty', 'Purchase Unit', 'Issued Qty (recipe)', 'Recipe Unit',
+                     'Requested Qty', 'Approved/Effective Qty', 'Issued Qty to Date',
                      'Department', 'Req #', 'Issuer', 'Unit Cost', 'Unit Cost incl. GST (est.)',
                      'Value', 'Value incl. GST (est.)', 'GST % (master)', 'Purpose', 'Event', 'Note'];
     const escape = (v: any) => {
@@ -2531,7 +2564,9 @@ function IssuedLogPanel({ loading, log, from, to, onFromChange, onToChange }: {
     const lines = [headers.join(',')];
     for (const e of events) {
       lines.push([e.at, e.material_name, e.category ?? '', e.qty_purchase ?? e.qty, e.purchase_unit || e.unit,
-                  e.qty, e.unit, e.department_name, e.req_number,
+                  e.qty, e.unit,
+                  e.requested_qty_purchase ?? '', e.effective_qty_purchase ?? '', e.issued_qty_purchase ?? '',
+                  e.department_name, e.req_number,
                   e.issuer, e.unit_cost?.toFixed?.(2), (e.unit_cost_incl_gst ?? e.unit_cost)?.toFixed?.(2),
                   e.value?.toFixed?.(2), (e.value_incl_gst ?? e.value)?.toFixed?.(2),
                   e.tax_known ? e.tax_percent : '',

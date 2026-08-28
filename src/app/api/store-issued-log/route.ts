@@ -168,6 +168,82 @@ export async function GET(request: Request) {
       const rmCategory = String(row.rm_category || '');
       const taxPct = zeroRated(rmCategory) ? 0 : Math.max(0, Number(row.rm_tax_percent) || 0);
 
+      // ── LINE UNIT BASIS — resolved ONCE per requisition line ───────────────
+      // h.qty is stored IN THE LINE'S OWN UNIT (requisition_items.unit) — the
+      // reqPackFactor convention. An earlier comment here claimed "h.qty is
+      // RECIPE units"; that was only true of blank-unit lines. The composer
+      // stamps the PURCHASE unit on every line (and a 2026-07-27 backfill
+      // stamped the 16k Recaho-imported ones), so a "5" against unit 'kg' is
+      // FIVE KILOS — reading it as grams understated qty and value pack_size×.
+      //
+      // These six were computed INSIDE the event loop below until the line-level
+      // fulfilment columns arrived. Every one of them is a function of the
+      // MATERIAL and the LINE alone — never of the individual hand-over — so
+      // they are hoisted rather than copied: a second local copy of the
+      // both-halves guard is the exact failure pack-units.ts warns about
+      // ("local copies keep dropping the second half"). Hoisting is
+      // behaviour-neutral for the event rows; the loop reads the same values it
+      // used to compute for itself.
+      const vPack = Number(row.rm_pack_size) || 1;
+      const puNorm = String(row.rm_purchase_unit || row.unit || '').toLowerCase().trim();
+      const ruNorm = String(row.unit || '').toLowerCase().trim();
+      const luNorm = String(row.line_unit || '').toLowerCase().trim();
+      const vDiffer = ruNorm !== puNorm;
+      // Both-halves guard, applied to the LINE unit: the qty is purchase-basis
+      // only when the line was requested in the purchase unit of a real pack.
+      const lineIsPU = vPack > 1 && vDiffer && luNorm !== '' && luNorm === puNorm;
+
+      // ── LINE-LEVEL FULFILMENT, IN PURCHASE UNITS ───────────────────────────
+      // requisition_items.quantity_requested / chef_approved_qty / quantity_issued
+      // are all stored in the LINE's own unit (Option B), the same basis as
+      // h.qty — so they take the SAME restatement `qtyPurchase` takes below, and
+      // they take it from the SAME hoisted guard rather than a re-derivation.
+      //
+      // Rounded to 6 dp, NOT the 3 dp the per-event `qty_purchase` uses. 3 dp is
+      // enough for a hand-over a human counted out, but these columns also carry
+      // the small pours this log exists to record: 12 ml of a pack-50,000 keg is
+      // 0.00024 CAN, which 3 dp prints as a flat "0.000" — a quantity column that
+      // renders a real issue as nothing is worse than a long decimal. This is a
+      // DISPLAY precision only; no money is derived from these three (the money
+      // columns still come off the recipe-basis pair above, deliberately — see
+      // the MONEY note in the loop), so the rounding hazard that bans
+      // toPurchaseQty()/valueCount() from the value math does not reach here.
+      const toPurchaseBasis = (v: any): number => {
+        const n = Number(v) || 0;
+        const pu = lineIsPU ? n : n / ((vPack > 1 && vDiffer) ? vPack : 1);
+        return Math.round(pu * 1e6) / 1e6;
+      };
+      // THE APPROVED RULE IS COPIED, NOT INVENTED. Verbatim from the requisition
+      // status logic — api/requisitions/[id]/store-issue/route.ts:652, the
+      // `allDone` test that decides whether a requisition flips to 'fulfilled':
+      //
+      //     const eff = (it.chef_approved_qty != null ? Number(it.chef_approved_qty)
+      //                                               : Number(it.quantity_requested)) || 0;
+      //
+      // `!= null` is the rule, NOT `> 0` (requisitions/page.tsx:179 spells out
+      // why: the store-issue MODAL's `> 0` variant answers a different question,
+      // and copying it here would silently re-inflate a line the chef
+      // deliberately cut to 0 back to the department's original ask). The same
+      // rule again as SQL in api/requisitions/route.ts:218 and src/lib/issue-log.ts
+      // (COALESCE(ri.chef_approved_qty, ri.quantity_requested, 0)), whose report
+      // exports these same three columns as Requested / Approved-Effective /
+      // Issued-To-Date. Four sites, one rule, so the CSV and the app cannot
+      // disagree about what was approved.
+      //
+      // NO is_rejected CLAUSE, deliberately. The status logic short-circuits a
+      // chef-rejected line as "done" BEFORE this expression runs, so the rule
+      // itself has no rejection term, and issue-log.ts — the sibling report —
+      // likewise reports the numbers and carries the rejection in its own
+      // status column. Zeroing here would be re-inventing the rule, and would
+      // erase what the chef actually approved on a line that nonetheless has
+      // hand-over events against it.
+      const effectiveLineQty = (row.chef_approved_qty != null
+        ? Number(row.chef_approved_qty)
+        : Number(row.quantity_requested)) || 0;
+      const requestedQtyPurchase = toPurchaseBasis(row.quantity_requested);
+      const effectiveQtyPurchase = toPurchaseBasis(effectiveLineQty);
+      const issuedQtyPurchase    = toPurchaseBasis(row.quantity_issued);
+
       let history: Array<{ qty: number; at: string; by: string; note?: string }> = [];
       try { history = JSON.parse(row.issue_history || '[]'); } catch { continue; }
       if (!Array.isArray(history) || history.length === 0) continue;
@@ -178,20 +254,6 @@ export async function GET(request: Request) {
         const isoDay = at.slice(0, 10);
         if (isoDay < from || isoDay > to) continue;
         if (issuer && !String(h.by || '').toLowerCase().includes(issuer)) continue;
-        // h.qty is stored IN THE LINE'S OWN UNIT (requisition_items.unit) — the
-        // reqPackFactor convention. The earlier comment here claimed "h.qty is
-        // RECIPE units"; that was only true of blank-unit lines. The composer
-        // stamps the PURCHASE unit on every line (and a 2026-07-27 backfill
-        // stamped the 16k Recaho-imported ones), so a "5" against unit 'kg' is
-        // FIVE KILOS — reading it as grams understated qty and value pack_size×.
-        const vPack = Number(row.rm_pack_size) || 1;
-        const puNorm = String(row.rm_purchase_unit || row.unit || '').toLowerCase().trim();
-        const ruNorm = String(row.unit || '').toLowerCase().trim();
-        const luNorm = String(row.line_unit || '').toLowerCase().trim();
-        const vDiffer = ruNorm !== puNorm;
-        // Both-halves guard, applied to the LINE unit: the qty is purchase-basis
-        // only when the line was requested in the purchase unit of a real pack.
-        const lineIsPU = vPack > 1 && vDiffer && luNorm !== '' && luNorm === puNorm;
         const rawQty = Number(h.qty) || 0;
         const recipeQty   = lineIsPU ? rawQty * vPack : rawQty;
         const qtyPurchase = Math.round((lineIsPU ? rawQty : rawQty / ((vPack > 1 && vDiffer) ? vPack : 1)) * 1000) / 1000;
@@ -245,6 +307,22 @@ export async function GET(request: Request) {
           qty_purchase: qtyPurchase,
           purchase_unit: row.rm_purchase_unit || row.unit,
           pack_factor: (vPack > 1 && vDiffer) ? vPack : 1,
+          // ── LINE-LEVEL CONTEXT — REPEATS ON EVERY EVENT ROW OF THIS LINE ────
+          // PURCHASE basis, like qty_purchase beside them, so the four can be
+          // read across without a mental conversion. They are facts about the
+          // LINE, not about this hand-over: a line issued in three parts emits
+          // three rows carrying the SAME requested / approved / issued beside
+          // three DIFFERENT qty_purchase values, which is the whole point —
+          // "asked 240, approved 200, issued 200 so far" next to "this
+          // hand-over was 50". issued_qty_purchase is the line's CUMULATIVE
+          // quantity_issued, NOT the sum of the rows in the current date range
+          // and NOT this event: either of those would just restate qty_purchase.
+          // It is also the honest figure on a STORE-REJECTED line, which since
+          // 2026-08-26 keeps what was physically handed over (store-issue's
+          // 'reject' leaves quantity_issued untouched and moves no stock).
+          requested_qty_purchase: requestedQtyPurchase,
+          effective_qty_purchase: effectiveQtyPurchase,
+          issued_qty_purchase: issuedQtyPurchase,
           material_id: row.material_id,
           material_name: row.material_name,
           // raw_materials.category, verbatim. 952/952 populated on this DB, but
