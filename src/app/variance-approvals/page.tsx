@@ -96,6 +96,37 @@
  * would write 793 false "we have zero" counts into the books.
  * THERE IS NO BULK APPROVE, here or in the API (the function is not imported
  * into that route at all). The bulk bar says so, so nobody goes looking.
+ *
+ * ── AND THEY MUST NOT BE ORDERED SO THAT ONLY ONE OF THEM IS ON SCREEN ────
+ * Giving the two verbs different weight was not enough while only the wrong
+ * one was VISIBLE. The bulk strip lived in the filter card, above the queue;
+ * the per-row Approve lives at the foot of a ~340px card. Measured on this
+ * page at 1280x900 with a single pending count: "Reject selected" y=738,
+ * "Reject all 1 pending" y=739, "Approve → write to stock" y=1151 — 251px
+ * below the bottom of the screen. So an admin opening his own queue was shown
+ * two ways to discard a count and no way to accept one, and reported that the
+ * page "just shows where we can't take any action". He was wrong about the
+ * page and right about the layout; the bulk dialog had already grown the line
+ * "This is not the Approve button", which is the tell.
+ * THE ROWS COME FIRST NOW. The bulk strip moved BELOW the list (its filter
+ * keeps a one-line pointer down to it, which scrolls and nothing else), and a
+ * line under the title — above the rules card, and above the tiles, which
+ * stack on a phone and pushed it off a 414x896 screen — names the per-row
+ * Approve, quotes its exact label and jumps to the first card that has one.
+ * Both are LAYOUT AND COPY: no API changed, no eligibility changed, no guard
+ * moved. In particular the jump button decides nothing — a count is still
+ * approved in exactly one place, its own card, one at a time. It moves focus
+ * onto that CARD (never onto its Approve, which would be one keystroke from
+ * writing to stock) so the jump works for a keyboard as well as a mouse.
+ * THAT LINE COUNTS APPROVABLE ROWS, NOT PENDING ONES. A queue where every row
+ * is a department count or a superseded one is fully pending and fully
+ * un-approvable, and is the ordinary shape of the legacy backlog; promising an
+ * orange Approve there reprints the very complaint this change answers. When
+ * nothing is approvable it says so and names reject instead.
+ * If you re-order this page again, keep the invariant: a destructive control
+ * must never be the only control above the fold — including for the second or
+ * two while the list is loading, which is why the strip and both pointers are
+ * gated on `!loading` together.
  */
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api } from '@/lib/api';
@@ -103,7 +134,7 @@ import {
   ScrollText, ShieldCheck, Loader2, RefreshCw, CheckCircle2, XCircle,
   AlertTriangle, Info, Lock, PackageX, PackagePlus, Store, Boxes, Layers,
   CalendarDays, Filter, Trash2, ClipboardList, SlidersHorizontal, Save, X,
-  ChevronDown, ChevronRight, ListChecks, Zap,
+  ChevronDown, ChevronRight, ListChecks, Zap, ArrowDown,
 } from 'lucide-react';
 import { packFactor, toPurchaseQty, type PackMeta } from '@/lib/pack-units';
 import { todayIST } from '@/lib/format-date';
@@ -545,6 +576,25 @@ export default function VarianceApprovalsPage() {
     () => visible.filter(r => r.status === 'pending').map(r => r.id),
     [visible],
   );
+  /**
+   * THE PENDING ROWS THAT ACTUALLY CARRY A LIVE APPROVE BUTTON.
+   * `selectableIds` is every pending row, and that is right for reject — the
+   * one verb every row accepts. It is wrong for anything that talks about
+   * approving: the server refuses two whole families outright and sends them
+   * here pre-resolved as `approve_blocked` (a department count with no honest
+   * ledger to correct, and a count a newer one supersedes). Both are ordinary
+   * residents of this queue — the file header calls the legacy department rows
+   * "the bulk of the queue this whole build exists to drain" — so a queue in
+   * which NOTHING is approvable is a normal state, not an edge case.
+   * The pointer below is written off this list, not off `selectableIds`, so it
+   * can never promise an orange Approve that no card on screen carries, and
+   * never jumps to a greyed-out one. Selection, bulk reject and every ₹ figure
+   * still run off `selectableIds` — none of them are about approving.
+   */
+  const approvableIds = useMemo(
+    () => visible.filter(r => r.status === 'pending' && !r.approve_blocked).map(r => r.id),
+    [visible],
+  );
 
   /* A TICK MUST NOT SURVIVE THE FILTER THAT MADE IT VISIBLE. Selecting 40 rows
      of last month's upload and then switching to this month's would otherwise
@@ -636,6 +686,52 @@ export default function VarianceApprovalsPage() {
    *              `expect_count` (409 if the queue moved) AND asks the admin to
    *              type that number before the button arms. */
   const pendingShown = selectableIds.length;
+  const approvableShown = approvableIds.length;
+  /**
+   * WHERE THE JUMP LANDS. `visible` renders in this order and both id lists are
+   * derived from it, so [0] is literally the topmost such card.
+   * THE FIRST APPROVABLE CARD, NOT THE FIRST PENDING ONE. Rows sort newest
+   * first and a blocked count is often the newest, so "first pending" landed
+   * the admin on a greyed-out `Approve blocked (department count)` while the
+   * live Approve was still below the fold — the complaint this page was
+   * rewritten to answer, rebuilt one scroll further down.
+   * The fallback matters too: when NOTHING is approvable the pointer says so
+   * (see below) and still offers the jump, because the rows are then where the
+   * refusal reasons are, and that is what the admin needs to read.
+   */
+  const jumpTargetId = approvableIds[0] || selectableIds[0] || null;
+  /**
+   * LAYOUT ONLY — it moves the viewport and nothing else. No selection, no
+   * submit, no decision: the two verbs still live exactly where they lived,
+   * on the row card and in the bulk strip, and both still need their own
+   * click. Guarded for the server render, where there is no document.
+   *
+   * NO `behavior: 'smooth'`. It was written that way first and measured not to
+   * move the page at all in a throttled/background tab — the animated scroll is
+   * driven by the compositor and is simply dropped there, leaving a button that
+   * looks broken. `block: 'center'` with the default instant behaviour lands the
+   * whole card on screen every time, is what a reduced-motion user would get
+   * anyway, and is the version proved below. A jump control that sometimes does
+   * nothing is worse than no jump control.
+   *
+   * IT ALSO MOVES FOCUS, or the jump is mouse-only: `scrollIntoView` shifts the
+   * viewport and leaves the caret where it was, so the next Tab used to go to
+   * the control AFTER the jump button — measured at y=-79, i.e. back above the
+   * screen, undoing the jump, with 18 tab stops still to go. The targets carry
+   * `tabIndex={-1}` (out of the tab ORDER, focusable programmatically), so this
+   * lands the caret on the card and the next Tab is inside it. `preventScroll`
+   * because the scroll above already framed it — letting focus() scroll again
+   * would re-align the card to the edge and undo `block: 'center'`.
+   * Focusing the CARD, never its Approve: a focused primary button is one
+   * keystroke from firing, and approving writes to stock.
+   */
+  const scrollToId = (id: string) => {
+    if (typeof document === 'undefined') return;
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.scrollIntoView({ block: 'center' });
+    el.focus({ preventScroll: true });
+  };
   const pendingShownValue = visible
     .filter(r => r.status === 'pending')
     .reduce((s, r) => s + Math.abs(Number(r.variance_value) || 0), 0);
@@ -758,6 +854,108 @@ export default function VarianceApprovalsPage() {
             </button>
           </div>
         </div>
+
+        {/* ── WHERE THE DECISION IS ACTUALLY MADE ───────────────────────────
+            THE ONLY BUTTONS ABOVE THE FOLD USED TO BE TWO WAYS TO REJECT.
+            The bulk strip — "Reject selected" and "Reject all N pending" —
+            sat inside the filter card, i.e. ABOVE the queue, while the
+            constructive per-row Approve is at the foot of a ~340px card.
+            Measured on this page at 1280x900 with ONE pending count:
+            Reject selected at y=738, Reject all at y=739, Approve at
+            y=1151 — 251px past the bottom of the screen. An admin arriving
+            on his own queue therefore saw two ways to discard a count, no
+            way to accept one, and concluded there was no action available.
+            That is the owner's report verbatim, and the bulk dialog had
+            already grown a line reading "This is not the Approve button",
+            which is what a layout looks like after it has been misread for
+            a while.
+            Two changes fix it and neither touches a guard: the bulk strip
+            now sits BELOW the rows (rows first — read the counts, then
+            clear what is left), and this line names the per-row Approve,
+            quotes its exact label, and jumps to the first count.
+            DIRECTLY UNDER THE TITLE, ABOVE THE RULES — not below the tiles,
+            where it was first written. On a phone the tiles stack, and from
+            there the jump button measured y=952 on a 414x896 screen: the one
+            control that answers "what can I do here" was itself off the
+            bottom of the exact screen most likely to ask. The rules card
+            below is unchanged and still lands above the fold on arrival; it
+            explains the verbs, while this says where they are, which is the
+            question that was actually being asked.
+            NOTHING IS APPROVED HERE, AND THIS IS NOT A BULK ANYTHING. The
+            button scrolls; it selects nothing, submits nothing and decides
+            nothing. A count is still approved in exactly one place — its
+            own card, one at a time — and there is still no bulk approve.
+            IT MUST NEVER PROMISE AN APPROVE THAT IS NOT THERE. A queue of
+            department counts, or of counts a newer one supersedes, is fully
+            pending and fully un-approvable — the server refuses every one —
+            and that is the ordinary shape of the legacy backlog this build
+            exists to drain. Written off `pendingShown` alone it stated in
+            bold, above the fold, that an orange Approve was waiting at the
+            bottom of cards that all read "Approve blocked (department
+            count)", disabled: the owner's own sentence, reprinted by the fix
+            for it. So the count that leads this line is `approvableShown`,
+            and when that is zero the line says plainly that nothing here can
+            be approved and names the verb that does apply.
+            RENDERED ONLY WHEN THERE IS SOMETHING TO POINT AT: pending tab,
+            not loading, and at least one pending row actually on screen. An
+            empty queue (or a filter that matches none of the rows this page
+            read) gets no pointer, because a jump to a row that is not there
+            is worse than no jump. */}
+        {!loading && tab === 'pending' && pendingShown > 0 && (
+          <div className="bg-white border border-[#E8D5C4] border-l-4 border-l-[#af4408] rounded-xl p-3 flex flex-wrap items-center gap-x-3 gap-y-2">
+            {approvableShown > 0
+              ? <CheckCircle2 className="w-4 h-4 text-[#af4408] shrink-0" />
+              : <AlertTriangle className="w-4 h-4 text-[#af4408] shrink-0" />}
+            <span className="text-[12px] text-[#6B5744] flex-1 min-w-[15rem] leading-relaxed">
+              {approvableShown === 0 ? (
+                <>
+                  {/* WRITTEN OUT IN BOTH NUMBERS. "None of the 1 count … the
+                      server refuses every one … clears them" is not English,
+                      and a one-row queue is the ordinary size of this one — it
+                      is the shape the owner was looking at when he reported
+                      that no action was available. */}
+                  <b className="text-[#2D1B0E]">
+                    {pendingShown === 1
+                      ? 'The one count below cannot be approved.'
+                      : `None of the ${num(pendingShown)} counts below can be approved.`}
+                  </b>{' '}
+                  {pendingShown === 1
+                    ? 'The server refuses it, and the card says why'
+                    : 'The server refuses every one, and each card carries its own reason'} — a department count, or a
+                  count a newer one supersedes. <b>Reject</b> is what clears {pendingShown === 1 ? 'it' : 'them'}, and
+                  rejecting changes no stock on any rail.
+                </>
+              ) : approvableShown < pendingShown ? (
+                <>
+                  <b className="text-[#2D1B0E]">
+                    {num(approvableShown)} of the {num(pendingShown)} counts below {approvableShown === 1 ? 'is' : 'are'} waiting
+                    for your decision.
+                  </b>{' '}
+                  Each is decided on its own card: the orange <b>Approve → write to stock</b> button is at the bottom of
+                  the card, with <b>Reject</b> beside it. Approving is one count at a time — there is no bulk approve.
+                  The other {num(pendingShown - approvableShown)} cannot be approved at all: those cards say why, and
+                  reject is all they take.
+                </>
+              ) : (
+                <>
+                  <b className="text-[#2D1B0E]">
+                    {num(pendingShown)} count{pendingShown === 1 ? '' : 's'} below {pendingShown === 1 ? 'is' : 'are'} waiting
+                    for your decision.
+                  </b>{' '}
+                  Each one is decided on its own card: the orange <b>Approve → write to stock</b> button is at the bottom of
+                  the card, with <b>Reject</b> beside it. Approving is one count at a time — there is no bulk approve.
+                </>
+              )}
+            </span>
+            <button onClick={() => jumpTargetId && scrollToId(`vrow-${jumpTargetId}`)}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12px] font-semibold border border-[#af4408] text-[#af4408] bg-white hover:bg-[#FFF1E3]">
+              {approvableShown > 0 && approvableShown < pendingShown
+                ? 'Go to the first count you can approve'
+                : 'Go to the first count'}
+              <ArrowDown className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        )}
 
         {/* WHAT THE TWO BUTTONS DO — rewritten. The old strip opened with
             "Nothing changes stock until you approve", which the bar and the
@@ -1188,39 +1386,37 @@ export default function VarianceApprovalsPage() {
             </span>
           </div>
 
-          {/* ── BULK BAR. One verb only. ──────────────────────────────────── */}
-          {tab === 'pending' && (
+          {/* WHERE THE BULK STRIP USED TO BE — a pointer, not a button.
+              The strip itself (Select the N shown · Reject selected · Reject
+              all N) moved BELOW the rows; only its address is left here, so
+              the filter and the action it feeds stay connected without
+              putting two destructive buttons above the queue again. This
+              scrolls and nothing else. It also carries the selection count,
+              because rows are ticked UP HERE on each card and the button
+              that acts on them is now down there — say so rather than
+              letting a tick look like it went nowhere.
+              SHOWN ONLY WHEN THERE IS SOMETHING DOWN THERE TO USE: rows on
+              screen to tick, or a server-side match to reject wholesale. On a
+              cleared queue the strip below is three disabled buttons, and
+              pointing at them is the same defect in miniature. `preview` is the
+              server's own count for the current filter, so this also covers the
+              case the empty state names — nothing listed, because the matching
+              rows fell past the read limit, but "Reject all N" still reaches
+              every one of them.
+              `!loading` for the same reason the strip itself carries it (see
+              there): while the list is being re-read there is nothing under
+              the list to point AT. */}
+          {!loading && tab === 'pending' && (pendingShown > 0 || (preview?.matched ?? 0) > 0) && (
             <div className="flex flex-wrap items-center gap-2 border-t border-[#F0E4D6] pt-2.5">
-              <button onClick={toggleAll} disabled={selectableIds.length === 0}
-                      className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-[12px] border border-[#E8D5C4] rounded-lg text-[#6B5744] hover:bg-[#FFF1E3] disabled:opacity-40">
-                <ListChecks className="w-3.5 h-3.5" />
-                {allSelected ? 'Clear selection' : `Select the ${num(selectableIds.length)} shown`}
-              </button>
-              {selected.size > 0 && (
-                <span className="text-[12px] text-[#6B5744]">
-                  <b>{num(selected.size)}</b> selected · {inr(selectedValue)}
-                </span>
-              )}
-              <div className="flex-1" />
-              <button onClick={() => openBulk('ids')} disabled={selected.size === 0}
-                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12px] font-medium border border-[#D4B896] text-[#6B5744] bg-white hover:bg-[#FFF1E3] disabled:opacity-40">
-                <Trash2 className="w-3.5 h-3.5" /> Reject selected
-              </button>
-              <button onClick={() => openBulk('filter')} disabled={!preview || preview.matched === 0}
-                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12px] font-semibold bg-[#6B5744] hover:bg-[#54432f] text-white disabled:opacity-40">
+              <button onClick={() => scrollToId('bulk-reject')}
+                      className="inline-flex items-center gap-1.5 text-[12px] text-[#6B5744] hover:text-[#2D1B0E] underline decoration-[#D4B896] underline-offset-2">
                 <Trash2 className="w-3.5 h-3.5" />
-                Reject all {preview ? num(preview.matched) : '—'} {filterActive ? 'in this selection' : 'pending'}
+                {selected.size > 0
+                  ? <><b>{num(selected.size)}</b> selected · {inr(selectedValue)} — reject them from the bulk controls under the list</>
+                  : <>Clearing a whole upload? The bulk reject controls are under the list</>}
+                <ArrowDown className="w-3.5 h-3.5" />
               </button>
             </div>
-          )}
-
-          {tab === 'pending' && (
-            <p className="text-[11px] text-[#8B7355] leading-relaxed">
-              Rejecting discards the counts and <b>changes no stock on any rail</b> — the rows move to the Rejected tab
-              and stay readable. <b>There is no bulk approve, and there will not be one</b>: approving writes to stock,
-              and doing that to a whole sheet at once could book &quot;we have zero&quot; against hundreds of items in one
-              click. Approve one count at a time, below.
-            </p>
           )}
         </div>
 
@@ -1307,7 +1503,7 @@ export default function VarianceApprovalsPage() {
               <p className="text-sm mt-1">
                 The server counts <b>{num(preview.matched)}</b> pending {preview.matched === 1 ? 'count' : 'counts'} for
                 this selection, but they fall outside the newest {num(PAGE_LIMIT)} rows this page could read, so none
-                are listed. <b>Reject all {num(preview.matched)}</b> above still covers every one of them.
+                are listed. <b>Reject all {num(preview.matched)}</b> below still covers every one of them.
               </p>
             ) : filterActive ? (
               <p className="text-sm mt-1">Widen the period or pick another upload.</p>
@@ -1360,7 +1556,17 @@ export default function VarianceApprovalsPage() {
                    a stale one were indistinguishable at a glance. The threshold
                    is gone; amber on this page now means exactly one thing, and
                    it is the supersede warning. */
-                <div key={row.id} className="bg-white border border-[#E8D5C4] rounded-xl p-4 shadow-sm">
+                /* The jump target for "Go to the first count" above. An id per
+                   card rather than a ref to the first one: `visible` re-orders
+                   with the filter and the tab, and an id that is just the row's
+                   own id cannot go stale against it.
+                   `tabIndex={-1}` puts the card out of the tab ORDER but makes
+                   it focusable programmatically, which is what lets the jump
+                   move the caret here as well as the viewport — otherwise the
+                   next Tab went to the control after the jump button, back
+                   above the screen. It adds no stop for anyone tabbing past,
+                   and the focus lands on the CARD, never on its Approve. */
+                <div key={row.id} id={`vrow-${row.id}`} tabIndex={-1} className="bg-white border border-[#E8D5C4] rounded-xl p-4 shadow-sm scroll-mt-4">
                   <div className="flex flex-wrap items-start justify-between gap-3">
                     <div className="min-w-0 flex gap-2.5">
                       {/* Selection is PENDING-only, because reject is the only
@@ -1659,11 +1865,76 @@ export default function VarianceApprovalsPage() {
                   {filterActive
                     ? ' The period and upload filters narrow what was read — they do not fetch further back, so older rows matching them are not on this page.'
                     : ' Narrow the period or pick one upload to work through them in groups.'}
-                  {' '}The bulk action above is resolved by the server and <b>does</b> cover every row it matches,
+                  {' '}The bulk action below is resolved by the server and <b>does</b> cover every row it matches,
                   read or not.
                 </span>
               </div>
             )}
+          </div>
+        )}
+
+        {/* ══ BULK REJECT — ONE VERB, AND IT LIVES UNDER THE QUEUE ══════════
+            IT USED TO SIT IN THE FILTER CARD, ABOVE THE ROWS. That put the
+            only two buttons on screen — "Reject selected" and "Reject all N
+            pending" — above a per-row Approve that starts 251px past the
+            bottom of a 1280x900 screen, so the page read as "you may discard
+            these counts and that is all". Rows first now: read the counts,
+            decide the ones that need deciding, then clear what is left with
+            one action. That is also the order the monthly job is actually
+            done in.
+            NOTHING ABOUT WHAT IT DOES CHANGED — same two selections ('ids'
+            from the ticks on the cards, 'filter' resolved by the server),
+            same preview, same typed confirmation, same API. It stays a
+            deliberately quieter pair than the row's Approve: a light outline
+            and a neutral #6B5744 solid, never red and never brand orange.
+            AND THERE IS STILL NO BULK APPROVE — not here, not in the API.
+            The paragraph below says so, next to the buttons that would be
+            the place to look for one.
+            HIDDEN WHILE THE LIST IS LOADING, like the pointer at the top and
+            the list itself. `rows` is not cleared during a re-read, so this
+            strip used to stay behind — offering "Select the 2 shown" over a
+            spinner where no row was shown, and putting an enabled "Reject all
+            2 pending" back above the fold (measured y=866 on a 1920x1080
+            screen during a 3s read) with no pointer beside it. That is the
+            state this whole change exists to prevent, restored for the length
+            of the read. Nothing is hidden FROM the admin by this: no row is
+            rendered then either.
+            `tabIndex={-1}` is for the pointer above, which focuses this card
+            after scrolling to it — out of the tab ORDER, focusable only
+            programmatically, so it adds no stop for anyone tabbing past. */}
+        {!loading && tab === 'pending' && (
+          <div id="bulk-reject" tabIndex={-1} className="bg-white border border-[#E8D5C4] rounded-xl p-3 space-y-2.5 scroll-mt-4">
+            <div className="text-[10px] uppercase tracking-wide text-[#8B7355] flex items-center gap-1.5">
+              <Trash2 className="w-3.5 h-3.5" /> Clear counts in bulk — reject only
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <button onClick={toggleAll} disabled={selectableIds.length === 0}
+                      className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-[12px] border border-[#E8D5C4] rounded-lg text-[#6B5744] hover:bg-[#FFF1E3] disabled:opacity-40">
+                <ListChecks className="w-3.5 h-3.5" />
+                {allSelected ? 'Clear selection' : `Select the ${num(selectableIds.length)} shown`}
+              </button>
+              {selected.size > 0 && (
+                <span className="text-[12px] text-[#6B5744]">
+                  <b>{num(selected.size)}</b> selected · {inr(selectedValue)}
+                </span>
+              )}
+              <div className="flex-1" />
+              <button onClick={() => openBulk('ids')} disabled={selected.size === 0}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12px] font-medium border border-[#D4B896] text-[#6B5744] bg-white hover:bg-[#FFF1E3] disabled:opacity-40">
+                <Trash2 className="w-3.5 h-3.5" /> Reject selected
+              </button>
+              <button onClick={() => openBulk('filter')} disabled={!preview || preview.matched === 0}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12px] font-semibold bg-[#6B5744] hover:bg-[#54432f] text-white disabled:opacity-40">
+                <Trash2 className="w-3.5 h-3.5" />
+                Reject all {preview ? num(preview.matched) : '—'} {filterActive ? 'in this selection' : 'pending'}
+              </button>
+            </div>
+            <p className="text-[11px] text-[#8B7355] leading-relaxed">
+              Rejecting discards the counts and <b>changes no stock on any rail</b> — the rows move to the Rejected tab
+              and stay readable. <b>There is no bulk approve, and there will not be one</b>: approving writes to stock,
+              and doing that to a whole sheet at once could book &quot;we have zero&quot; against hundreds of items in one
+              click. Approve one count at a time, on its own card above.
+            </p>
           </div>
         )}
       </div>
