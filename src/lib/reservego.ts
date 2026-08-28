@@ -308,10 +308,140 @@ export function normalizeLeadIn(raw: unknown): number {
   return Number.isFinite(n) && n >= 0 ? Math.min(1440, Math.round(n)) : BAND_LEAD_IN_DEFAULT;
 }
 
-/** 'HH:MM' → minutes since midnight, or null. ct_entertainment.start_time is
- *  free text ("9 PM", "late"), so this refuses rather than guesses. */
+/**
+ * A CLOCK STRING → MINUTES SINCE MIDNIGHT, or null.
+ *
+ * THE ONE PARSER IN THE HOUSE, and the reason it is spelt out at this length.
+ * ct_entertainment.start_time is a free-text box — the What's On write path does
+ * .trim().slice(0,10) and validates no format at all — so this has to read what
+ * people actually type. It used to read the 24-hour form only, on a PREFIX
+ * match, which meant "09:00pm" (ordinary typing, not corruption) came back as
+ * 09:00 and a 21:00 act's window opened TWELVE HOURS EARLY, crediting the whole
+ * day's lunches to the band with nothing on screen saying so. The Query tab grew
+ * a second copy that REFUSED any meridiem instead, so the same calendar row was
+ * silently mis-stamped on the write path and silently dropped on the read path,
+ * and the two surfaces disagreed about the same night. Refusing is safe but it
+ * is not understanding, and a band whose every row carries a meridiem became
+ * unqueryable — 18 nights of one act, on production.
+ *
+ * Both paths now go through THIS function; there is no second copy left to
+ * drift. (reservation-query.ts keeps its own local name and delegates straight
+ * here — see the note there.) This repo's recurring failure is paired
+ * definitions drifting apart, and these two parsers were exactly that pair.
+ *
+ * ── WHAT IT UNDERSTANDS ───────────────────────────────────────────────────
+ *  · TWELVE-HOUR, with a meridiem: "9pm", "9 pm", "9:00pm", "09:00pm",
+ *    "9:00 PM", "09:00 p.m.", "9 a m", "9:05Pm". Minutes optional, space
+ *    optional, dots optional, case free. Noon and midnight are the two a
+ *    careless conversion gets wrong, so they are named: "12:00am" → 0,
+ *    "12:30 AM" → 30, "12:00pm" → 720.
+ *  · TWENTY-FOUR-HOUR, exactly as before: "19:00", "19:00:00", " 21:00",
+ *    "9:30", "21:00 - 23:00". Byte for byte unchanged — these are the forms
+ *    already proven correct across the archive and they must not move.
+ *
+ * ── WHAT IT REFUSES, RATHER THAN GUESSING ─────────────────────────────────
+ * The twelve-hour clock runs 1 to 12, so an out-of-range hour BESIDE a meridiem
+ * is a typo and is refused outright: "13:00pm", "0:30am", "19:00 pm" → null.
+ * Deliberately NOT retried as a 24-hour string, because reading "13:00pm" as
+ * 13:00 is the same act of guessing that produced this bug in the first place.
+ * "25:00", "9:60", "9:99pm", "pm", "abc" and "" are null for the same reason.
+ *
+ * A null is never silent: resolveBandWindow() reports the calendar row with its
+ * reason, and pickBandForSlot() treats such an act as untimed. Note the second
+ * of those WIDENS — an untimed act is the whole-night fallback there — so
+ * refusing "13:00pm" moves that act off a wrong 13:00 window and onto the whole
+ * night whenever no timed act qualifies. Refusing is still right; it is written
+ * down here so nobody discovers it by surprise later.
+ *
+ * ── BOTH BRANCHES MATCH ON THE PREFIX, AND THAT IS LOAD-BEARING ───────────
+ * The 24-hour branch has always been a prefix match — that is what makes
+ * "21:00 - 23:00" and "19:00:00" work. The meridiem branch matches the same
+ * way, so "09:00pm - 11:00pm" reads 21:00. Anchoring the meridiem branch to the
+ * END of the string instead would drop that spelling through to the 24-hour
+ * branch and read it as 09:00 — reintroducing the exact twelve-hour error, on
+ * the exact form a person is most likely to type into a What's On box.
+ *
+ * (Both branches are read with String.match rather than RegExp.exec. For a
+ * non-global, non-sticky pattern the two are the same call and neither carries
+ * lastIndex state; spelt this way so a repo-wide `exec(` search never has to
+ * pause on a time parser.)
+ *
+ * ── AND A MERIDIEM THE PREFIX BRANCH CANNOT REACH REFUSES THE WHOLE STRING ──
+ * The paragraph above is only half the rule, and the missing half is the bug
+ * this parser exists to kill. MERIDIEM_RE is anchored at ^, so it only sees a
+ * meridiem sitting ON the leading hour. Write the SAME twelve-hour night as a
+ * range — "09:00 - 11:30pm", "9:00 to 11:00 pm", "8:30 - 11:30 p.m." — and the
+ * meridiem is behind a dash where that pattern can never reach it, the match
+ * fails, and the string falls into the 24-hour branch to be read as 09:00. That
+ * is the original twelve-hour error verbatim, on the very spelling this fix was
+ * written for, and it would arrive with an EMPTY skipped[] and a calm box.
+ *
+ * So: if the meridiem branch did not match and a meridiem is still there
+ * anywhere the guard can SEE it (which is not everywhere — the limits are spelt
+ * out at the end of this note, and they matter), refuse. This is HEAD's
+ * whole-string guard from reservation-query.ts, kept exactly, and demoted from
+ * "refuse everything with a meridiem" to "refuse only what the meridiem branch
+ * could not read". The read path therefore loses nothing it had at HEAD — every
+ * string HEAD refused and reported is still refused and reported — while the
+ * adjacent forms people actually type are now understood.
+ *
+ * "09:00 - 11:30pm" is NOT guessed at as 21:00, though a person would read it
+ * that way, because the same shape is genuinely ambiguous elsewhere
+ * ("12:00 - 03:00 am") and the house rule is to refuse rather than guess. It is
+ * reported as unreadable, and the Slot-time fallback in resolveBandWindow()
+ * still lets the reader query those nights.
+ *
+ * The guard needs a digit before the meridiem, so it cannot fire on ordinary
+ * 24-hour text: "21:00hrs" keeps reading 1260.
+ *
+ * ── WHAT THE GUARD STILL CANNOT SEE ───────────────────────────────────────
+ * Written down because the paragraph above reads like a closure and is not one,
+ * and a comment that overstates its own cover is how the next reader stops
+ * checking. Two classes still fall through to the 24-hour branch and read
+ * TWELVE HOURS EARLY, silently, with an empty skipped[] and a calm box:
+ *
+ *  1. A MERIDIEM GLUED TO A FOLLOWING WORD CHARACTER. Both patterns end in \b,
+ *     which needs a non-word character after the "m". "9:00pmish", "9:00pmIST",
+ *     "9:00 pmx", "9:00 PM10:" therefore match neither, and all read 540.
+ *  2. A MERIDIEM ALREADY AMPUTATED BEFORE IT GOT HERE. The What's On write path
+ *     stores String(body.start_time).trim().slice(0, 10) (entertainment/route.ts
+ *     and entertainment/[id]/route.ts), so "09:00 - 11:30pm" — the worked
+ *     example three paragraphs up — arrives as "09:00 - 11", carrying no
+ *     meridiem for any guard to find, and reads 540.
+ *
+ * NEITHER IS A REGRESSION: HEAD read every one of these identically, on BOTH
+ * parsers, so this change neither creates nor widens them. They are left alone
+ * DELIBERATELY. The \b is what keeps ordinary venue text readable, and every
+ * variant that closes class 1 was measured to move a 24-hour string that parses
+ * today — dropping \b or adding a glued-digit guard turns "20:00Amphitheatre"
+ * from 1200 into null; anchoring a looser 1–12 meridiem at ^ turns
+ * "12:00 Amphitheatre" from 720 into 0, which is the very twelve-hour error
+ * this function exists to kill. Class 2 cannot be closed here at all: the
+ * meridiem is gone before the call. Closing either one needs the store limit
+ * raised and a format check on the What's On box — a change in those two route
+ * files, not a wider regex in this one.
+ */
+const MERIDIEM_RE = /^(\d{1,2})(?::(\d{2}))?\s*([ap])\.?\s*m\b/i;
+const HH_MM_PREFIX_RE = /^(\d{1,2}):(\d{2})/;
+/** A meridiem ANYWHERE, not just on the leading hour. See the note above. */
+const MERIDIEM_ANYWHERE_RE = /\d\s*[ap]\.?\s*m\b/i;
+
 export function minutesOfDay(hhmm: unknown): number | null {
-  const m = /^(\d{1,2}):(\d{2})/.exec(String(hhmm ?? '').trim());
+  const s = String(hhmm ?? '').trim();
+  const mer = s.match(MERIDIEM_RE);
+  if (mer) {
+    const h = Number(mer[1]);
+    const mi = mer[2] === undefined ? 0 : Number(mer[2]);
+    // 1–12 only, and no fallthrough to the 24-hour branch — see above.
+    if (h < 1 || h > 12 || mi > 59) return null;
+    const pm = mer[3].toLowerCase() === 'p';
+    const h24 = h === 12 ? (pm ? 12 : 0) : (pm ? h + 12 : h);
+    return h24 * 60 + mi;
+  }
+  // A twelve-hour string the branch above could not read is NOT a 24-hour one.
+  // Without this, "09:00 - 11:30pm" reads 09:00 — see the note above.
+  if (MERIDIEM_ANYWHERE_RE.test(s)) return null;
+  const m = s.match(HH_MM_PREFIX_RE);
   if (!m) return null;
   const h = Number(m[1]), mi = Number(m[2]);
   return h <= 23 && mi <= 59 ? h * 60 + mi : null;

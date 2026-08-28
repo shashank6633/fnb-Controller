@@ -358,6 +358,16 @@ interface BandEchoNight {
   start_time: string;
   match_from: string;
   clamped: boolean;
+  /**
+   * True when this night's own start time could not be read and `match_from` is
+   * the Slot time the reader typed instead. It has to ride on the wire: a
+   * borrowed floor and a real one are the same kind of string, so `match_from`
+   * alone cannot tell them apart, and a night counted from somebody else's time
+   * without saying so is the same silent substitution the skipped list exists
+   * to prevent. These nights ARE included, so they belong here in nightList and
+   * never in skipped[] — that array drives the all-skipped headline below.
+   */
+  usedFilterTime: boolean;
 }
 interface BandEchoSkip {
   event_date: string;
@@ -374,6 +384,14 @@ interface BandEcho {
   clamped: boolean;
   capped: boolean;
   cap: number;
+  /** At least one night borrowed the Slot time as its floor. */
+  filterTimeUsed: boolean;
+  /** The floor those nights used ('HH:MM'), '' when none did. Comes back through
+   *  the echo rather than being read off qTimeFrom on purpose — see the note
+   *  above: the Slot box is a debounce ahead of the result, and printing the
+   *  box's current value beside rows produced by its previous one is exactly the
+   *  disagreement this whole echo is built to avoid. */
+  filterTime: string;
   nightList: BandEchoNight[];
   skipped: BandEchoSkip[];
 }
@@ -766,12 +784,15 @@ function readBandEcho(raw: unknown): BandEcho | null {
     clamped: o.lead_in_clamped === true,
     capped: o.nights_capped === true,
     cap: num(o.nights_cap),
+    filterTimeUsed: o.filter_time_used === true,
+    filterTime: str(o.filter_time),
     nightList: rows(o.nights).map((n): BandEchoNight => ({
       event_date: str(n.event_date),
       type: str(n.type),
       start_time: str(n.start_time),
       match_from: str(n.match_from),
       clamped: n.lead_in_clamped === true,
+      usedFilterTime: n.used_filter_time === true,
     })),
     // Every skipped row is printed verbatim, never truncated — a night dropped
     // without a reason on screen is the thing this whole echo exists to prevent.
@@ -2625,11 +2646,56 @@ function BandNotice({ info }: { info: BandEcho }) {
     info.nightList.map(n => n.type.trim()).filter(t => t && t.toLowerCase() !== 'band'),
   )];
   const offTypeNights = info.nightList.filter(n => n.type.trim() && n.type.trim().toLowerCase() !== 'band').length;
+  // NIGHTS COUNTED FROM THE READER'S OWN SLOT TIME, because the calendar row
+  // could not say when the act started. They are INCLUDED — which is the point,
+  // and also the danger: without this they arrive inside "played 18 nights" and
+  // read as ordinary nights measured from the act, and the box quietly describes
+  // a floor nobody was told about. The same silent-substitution failure as the
+  // twelve-hour parse that put them here.
+  //
+  // A NIGHT IS A DATE, AND nightList IS ONE ENTRY PER CALENDAR ROW. Filtering
+  // the rows and printing the count as nights told three separate lies on a
+  // date billed twice, all measured on the real engine:
+  //  · "played 1 night" printed directly above "2 nights were counted from your
+  //    Slot time", with the same date listed twice — the identical unit bug
+  //    already fixed once below for offTypeNights;
+  //  · a date holding one READABLE row beside an unreadable one was named as
+  //    "counted from your Slot time, NOT from the act" while the act's own
+  //    17:00 window was in the SQL and answering — the mirror of the very
+  //    substitution this paragraph exists to disclose;
+  //  · "clear the Slot time and it drops out" was false for that date — it does
+  //    not drop out, it comes back LARGER (32 rows → 34), because its own
+  //    earlier floor takes over once the global slot clause goes.
+  // So: group by date, and a date borrowed only when EVERY row on it did. All
+  // three sentences become true, and each one counts in the unit it names.
+  const byDate = new Map<string, BandEchoNight[]>();
+  for (const n of info.nightList) {
+    const rows = byDate.get(n.event_date);
+    if (rows) rows.push(n); else byDate.set(n.event_date, [n]);
+  }
+  const borrowed = [...byDate.entries()]
+    .filter(([, rows]) => rows.every(n => n.usedFilterTime))
+    .map(([event_date, rows]) => ({ event_date, rows }));
+  // Dates that DID read an act start and ALSO carry an extra row that could not
+  // be read and took the Slot time as well. Nothing was substituted FOR the act
+  // on these, so they do not belong in the list above — but the extra row can
+  // still reach below the act's own floor, so they get their own sentence
+  // rather than silence.
+  const mixedNights = [...byDate.values()]
+    .filter(rows => rows.some(n => n.usedFilterTime) && rows.some(n => !n.usedFilterTime)).length;
+  // Nights that read their own start time — a DATE count, so it reads back to
+  // the headline. A mixed date counts here: it did read an act start.
+  const timedNights = byDate.size - borrowed.length;
+  // ONE expression, read twice. The box tint and the icon tint were separate
+  // copies of this condition; extending one and not the other desyncs them, and
+  // a borrowed floor has to light the box or the substitution reads as calm.
+  const needsAttention = noNights || info.skipped.length > 0 || info.capped
+    || borrowed.length > 0 || mixedNights > 0;
   return (
-    <div className={`p-4 border rounded-xl ${noNights || info.skipped.length || info.capped
+    <div className={`p-4 border rounded-xl ${needsAttention
       ? 'bg-amber-50 border-amber-200' : 'bg-[#FFF8F0] border-[#E8D5C4]'}`}>
       <div className="flex items-start gap-2">
-        <AlertCircle className={`w-5 h-5 shrink-0 ${noNights || info.skipped.length || info.capped ? 'text-amber-500' : 'text-[#af4408]'}`} />
+        <AlertCircle className={`w-5 h-5 shrink-0 ${needsAttention ? 'text-amber-500' : 'text-[#af4408]'}`} />
         <div className="min-w-0 space-y-1.5">
           <p className="text-sm text-[#2D1B0E]">
             <span className="font-semibold">{info.name}</span>
@@ -2652,10 +2718,89 @@ function BandNotice({ info }: { info: BandEcho }) {
               </>
             )}
           </p>
-          {!noNights && (
+          {/* "Each night counts bookings from N minutes before the act starts"
+              is an UNCONDITIONAL PROMISE, and a borrowed-floor night makes it
+              false — there is no act start on one, and no lead-in is subtracted.
+              So it is qualified when some nights borrowed, and dropped entirely
+              when they all did (nothing was counted from an act start, and the
+              paragraph below explains what was counted instead). */}
+          {!noNights && timedNights > 0 && (
             <p className="text-xs text-[#6B5744]">
-              Each night counts bookings from {fmtInt(info.leadIn)} minutes before the act starts through the end of that night
-              {info.clamped && <> — on at least one night that reached before midnight and was held at 00:00, so the evening before is not counted</>}.
+              {borrowed.length > 0 ? <>Each night that could read its own start time</> : <>Each night</>} counts bookings
+              from {fmtInt(info.leadIn)} minutes before the act starts through the end of that night
+              {/* The clamp costs the reader BOTH halves of a day and this used to
+                  name only the one it loses. A small-hours act (00:30, or the
+                  same time typed "12:30 AM" — a spelling that only became
+                  readable with the meridiem fix, so more nights reach this
+                  sentence now) lands its floor at 00:00, and a floor at 00:00 is
+                  the WHOLE calendar day: that day's lunch is counted for a band
+                  that played after midnight. Saying only "the evening before is
+                  not counted" describes the missing half and leaves the reader
+                  to discover the added one in the totals.
+                  The lunch clause is about the WINDOW, not about the answer, and
+                  is qualified accordingly: buildWhere ANDs the Slot time
+                  globally, outside the band's OR chain, so a Slot time later
+                  than 00:00 keeps that lunch out. Measured on a "12:30 AM"
+                  night: no Slot filter → 34 lunch/afternoon rows returned; Slot
+                  19:00 → 0. Stated flat, the sentence was false in the second
+                  run — a claim contradicted by the numbers beside it, which is
+                  the one thing this box may never do. */}
+              {info.clamped && <> — on at least one night that reached before midnight and was held at 00:00, so the evening before is not counted and that night is counted from midnight, its lunch inside the window unless your Slot time starts later</>}.
+            </p>
+          )}
+          {borrowed.length > 0 && (
+            <div className="text-xs text-amber-800">
+              <p className="font-medium">
+                {borrowed.length === 1 ? 'One night was' : `${fmtInt(borrowed.length)} nights were`} counted from your
+                Slot time{info.filterTime && <> of <span className="font-semibold">{info.filterTime}</span></>}, not from
+                the act:
+              </p>
+              {/* One line per NIGHT, not per calendar row — see the grouping
+                  note above. A date billed twice with neither start time
+                  readable used to print the same date twice, which read as two
+                  nights. Both raw start times are still shown verbatim, because
+                  they are what the reader has to go and edit. */}
+              <ul className="mt-0.5 space-y-0.5">
+                {borrowed.map((b) => (
+                  <li key={b.event_date}>
+                    · {b.event_date ? fmtDate(b.event_date) || b.event_date : 'no date'} — {b.rows.length === 1 ? (
+                      <>start time {b.rows[0].start_time ? `“${b.rows[0].start_time}”` : 'is blank and'} could not be read</>
+                    ) : (
+                      <>{fmtInt(b.rows.length)} calendar entries, none with a readable start time
+                        {' '}({b.rows.map(r => (r.start_time ? `“${r.start_time}”` : 'blank')).join(', ')})</>
+                    )}
+                  </li>
+                ))}
+              </ul>
+              <p className="mt-0.5">
+                {borrowed.length === 1 ? 'That night is' : 'Those nights are'} included because you said where to start
+                counting. The {fmtInt(info.leadIn)}-minute lead-in is <span className="font-semibold">not</span> applied
+                to {borrowed.length === 1 ? 'it' : 'them'} — your time is used exactly as you set it. Fix the start{' '}
+                {borrowed.length === 1 ? 'time' : 'times'} under What&apos;s On to count{' '}
+                {borrowed.length === 1 ? 'that night' : 'those nights'} from the act instead. Clear the first Slot time
+                (the &ldquo;from&rdquo; box) and {borrowed.length === 1 ? 'it drops' : 'they drop'} out of the answer.
+                {/* Named exactly, because the Slot label sits over a from/to
+                    PAIR and only the "from" box produced this paragraph — the
+                    engine ignores timeTo here on purpose. "Clear the Slot time"
+                    sent a reader to a box that would change nothing and leave
+                    the same screen and the same advice in front of them. */}
+              </p>
+            </div>
+          )}
+          {/* A DATE THAT READ THE ACT **AND** BORROWED, in its own sentence.
+              Folding it into the list above named a night as "not counted from
+              the act" when the act's own window was answering for it; leaving it
+              out altogether hid that an extra entry took the Slot time and can
+              reach below the act's floor. Neither is the truth, so it is said
+              separately and counted in nights, like everything else here. */}
+          {mixedNights > 0 && (
+            <p className="text-xs text-amber-800">
+              {mixedNights === 1 ? 'One night was' : `${fmtInt(mixedNights)} nights were`} counted from the act and{' '}
+              {mixedNights === 1 ? 'also carries' : 'also carry'} a second calendar entry whose start time could not be
+              read — that entry was counted from your Slot time
+              {info.filterTime && <> of <span className="font-semibold">{info.filterTime}</span></>} as well, so{' '}
+              {mixedNights === 1 ? 'the night' : 'those nights'} can reach earlier than the act&apos;s own floor. Fix the
+              start {mixedNights === 1 ? 'time' : 'times'} under What&apos;s On to count everything from the act.
             </p>
           )}
           {offTypeNights > 0 && (

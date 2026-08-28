@@ -39,6 +39,12 @@
  * Reads only. Nothing in this file writes.
  */
 import type Database from 'better-sqlite3';
+// THE TIME PARSER IS IMPORTED, NOT COPIED. This module and reservego.ts each
+// used to carry their own reading of ct_entertainment.start_time and they
+// disagreed by twelve hours on the same row — see minutesOfDay's own comment.
+// reservego.ts is a pure leaf module (it imports nothing), so this edge cannot
+// cycle, and this file stays read-only: nothing on that side touches a database.
+import { minutesOfDay } from '@/lib/reservego';
 
 type DB = Database.Database;
 
@@ -444,6 +450,15 @@ export interface BandWindow {
   matchFrom: string;
   /** True when the lead-in ran off the front of the day and was clamped to 00:00. */
   clamped: boolean;
+  /**
+   * True when this night's own start_time could not be read and `matchFrom` is
+   * the SLOT TIME THE USER TYPED instead. Not inferrable from matchFrom — a
+   * borrowed floor and a real one are the same kind of string — and the notice
+   * has to be able to say which nights these were, so it is carried explicitly.
+   * A fallback night never subtracts the lead-in, so `clamped` is always false
+   * on one: nothing was offset, nothing ran off the front of the day.
+   */
+  usedFilterTime: boolean;
 }
 
 /**
@@ -475,28 +490,27 @@ export interface BandWindows {
 /**
  * 'HH:MM' → minutes, or null if the calendar row holds free text.
  *
- * A MERIDIEM IS REFUSED, NOT IGNORED. The prefix match below reads "9:00 PM" as
- * 09:00 — a twelve-hour error that runs the WRONG WAY: a 21:00 band's window
- * opens at 07:00 instead of 19:00 and the act is credited with the whole day's
- * lunches, with an empty skipped[] and nothing on screen to say so. That is
- * exactly the SILENT WIDENING resolveBandWindow()'s skip exists to prevent
- * (measured on a fixture: 10 of that day's 10 bookings credited instead of 4),
- * and the mirror case narrows just as quietly — "12:30 AM" reads as 10:30
- * rather than clamping at 00:00. The What's On start-time box is a plain text
- * input with no format check on either side, so a meridiem is ordinary typing
- * rather than corruption: skipped and REPORTED, with the reason already written
- * below telling the reader to set it as HH:mm.
+ * ONE LINE, AND THAT IS THE POINT. This used to be a second, hand-kept copy of
+ * the write path's parser, and the copies disagreed: reservego.ts read
+ * "09:00pm" as 09:00 (a twelve-hour error the WRONG WAY — a 21:00 band's window
+ * opening at 07:00 and taking the whole day's lunches with it), while this one
+ * REFUSED every meridiem outright to stop that silent widening reaching the
+ * Query tab. Refusing was the safe half of the answer and the wrong whole one:
+ * a band whose calendar rows all carry a meridiem had every night skipped and
+ * became unqueryable, while the write path went on stamping those same nights
+ * twelve hours early. Both now read the string the same way, because there is
+ * only one reading left. See minutesOfDay() in src/lib/reservego.ts for what is
+ * understood, what is refused, and why an out-of-range meridiem hour is not
+ * retried as a 24-hour time.
  *
- * Deliberately narrow, so the forms proved correct still are: '19:00:00',
- * '9:30', ' 21:00' and '21:00 - 23:00' carry no meridiem and are unaffected.
+ * The local name is kept so the call site below still reads in this file's own
+ * vocabulary, and so the diff that introduced the shared parser is one import
+ * plus one line rather than a rename across a module nothing else may touch.
+ * (src/lib/hr-attendance.ts has an unrelated private function of this name for
+ * HR shift strings — a different function on a different table. Not this one.)
  */
 function hhmmToMinutes(t: string): number | null {
-  if (/\d\s*[ap]\.?\s*m\b/i.test(String(t || ''))) return null;
-  const m = /^(\d{1,2}):(\d{2})/.exec(String(t || '').trim());
-  if (!m) return null;
-  const h = Number(m[1]); const min = Number(m[2]);
-  if (h > 23 || min > 59) return null;
-  return h * 60 + min;
+  return minutesOfDay(t);
 }
 const minutesToHHMM = (n: number): string =>
   `${String(Math.floor(n / 60)).padStart(2, '0')}:${String(n % 60).padStart(2, '0')}`;
@@ -580,8 +594,59 @@ const minutesToHHMM = (n: number): string =>
  *
  * ZERO usable nights is a legal answer, not an error — see buildWhere(), which
  * turns it into an always-false predicate rather than no predicate.
+ *
+ * ── …UNLESS THE CALLER TYPED A TIME OF THEIR OWN ──────────────────────────
+ * `filterTimeFrom` is the Slot "from" box on the Query tab (ReservationFilter
+ * .timeFrom), already hard-validated to zero-padded 24-hour 'HH:MM' or null —
+ * the identical shape as matchFrom, so it drops in with no conversion.
+ *
+ * THE BAND SAYS WHICH NIGHTS; THE START TIME ONLY SAYS WHERE THE NIGHT STARTS.
+ * When a night cannot say that for itself and the caller HAS said it, dropping
+ * the night answers a narrower question than the one asked: the act played, the
+ * bookings exist, and the only thing missing is a floor the caller has already
+ * supplied. So the night is included with the caller's own time as its floor.
+ *
+ * WHY THIS CANNOT WIDEN, WHICH IS THE WHOLE REASON IT IS ALLOWED. buildWhere()
+ * ANDs `b.slot_time >= f.timeFrom` GLOBALLY, outside the band's parenthesised OR
+ * chain, so every row this fallback can return was already floored at that time
+ * by the caller's own filter. The fallback's real work is emitting the night's
+ * OR disjunct at all — a night absent from that chain can never match, whatever
+ * the slot filter says. Storing the caller's time as matchFrom rather than
+ * '00:00' changes no row; it is stored so the echo can PRINT the floor it
+ * actually used and have that be true.
+ *
+ * NO LEAD-IN IS SUBTRACTED. The lead-in means "this many minutes before the act
+ * starts", and on these nights there is no act start — subtracting 120 minutes
+ * from a time the caller typed would answer from 17:00 when they said 19:00,
+ * silently, which is the same class of lie as the twelve-hour parse. They said
+ * what they wanted; it is used as given.
+ *
+ * `timeFrom` ONLY. `timeTo` alone is not a floor — a night admitted under it
+ * would run from 00:00, exactly the silent widening the skip guard exists for,
+ * so that case stays a reported skip. `mealPeriod` is not a floor either: its
+ * 17:00 would be equally SAFE by the AND argument above, but "Dinner" is a
+ * service band, not a time anybody typed, and treating it as consent to include
+ * nights whose calendar is broken is a widening nobody asked for.
+ *
+ * A WRAPPED SLOT FILTER (timeFrom 21:00 → timeTo 02:00, which this venue asks
+ * for nightly) makes the global clause an OR, and a per-night `>= 21:00` floor
+ * keeps only the late half on a fallback night. That is exactly how a PARSED
+ * night already behaves — matchFrom is a plain floor with no wrap awareness —
+ * and the 00:00–04:59 rows carry the FOLLOWING calendar date anyway (see
+ * MEAL_PERIODS), so they were never on this night's date term. Matching the
+ * parsed behaviour is the consistent call and is chosen deliberately.
+ *
+ * A FALLBACK NIGHT IS NOT A SILENT ONE. It rides back flagged
+ * (BandWindow.usedFilterTime) and the page names every one of them beside the
+ * skipped list. Substituting a different floor without saying so would be the
+ * same failure as the parser bug this fix exists to close.
+ *
+ * The parameter is REQUIRED, not defaulted: a future caller that forgets it
+ * would quietly go back to dropping those nights, and this file's whole
+ * discipline is that a filter which stops applying is the bug that makes a
+ * number untrustworthy. Pass null explicitly to mean "no time was typed".
  */
-export function resolveBandWindow(db: DB, bandId: string): BandWindows {
+export function resolveBandWindow(db: DB, bandId: string, filterTimeFrom: string | null): BandWindows {
   let master: BandOption | undefined;
   try {
     master = db.prepare(`
@@ -705,11 +770,33 @@ export function resolveBandWindow(db: DB, bandId: string): BandWindows {
     }
     const start = hhmmToMinutes(startTime);
     if (start === null) {
+      // THE CALLER'S OWN SLOT TIME IS THIS NIGHT'S FLOOR, when they set one.
+      // See the header: additive at the night level, already floored by the
+      // global timeFrom clause, no lead-in subtracted, and flagged so the page
+      // can say which nights these were. Without a typed time it stays a skip.
+      if (filterTimeFrom) {
+        windows.push({
+          calendarId,
+          eventDate,
+          type: String(n.type || ''),
+          startTime,
+          endTime: String(n.end_time || ''),
+          matchFrom: filterTimeFrom,
+          clamped: false,
+          usedFilterTime: true,
+        });
+        continue;
+      }
       skipped.push({
         calendar_id: calendarId,
         event_date: eventDate,
         start_time: startTime,
-        reason: `start time ${JSON.stringify(startTime)} is not readable — set it as HH:mm to include this night`,
+        // "a Slot time" named a control that is TWO boxes — the Slot label sits
+        // over a from/to pair — and only the FROM box reaches here (see the
+        // header: timeTo alone is not a floor). A reader who typed into the
+        // second box got this identical line back with nothing changed and no
+        // way to tell why, so the box is named exactly.
+        reason: `start time ${JSON.stringify(startTime)} is not readable — set it as HH:mm to include this night, or set the first Slot time (the "from" box) to count it from that instead`,
       });
       continue;
     }
@@ -722,6 +809,7 @@ export function resolveBandWindow(db: DB, bandId: string): BandWindows {
       endTime: String(n.end_time || ''),
       matchFrom: minutesToHHMM(Math.max(0, raw)),
       clamped: raw < 0,
+      usedFilterTime: false,
     });
   }
 
@@ -969,6 +1057,17 @@ export interface ReservationQueryResult {
     /** True when the band has more nights than the cap and the oldest were dropped. */
     nights_capped: boolean;
     nights_cap: number;
+    /**
+     * True when at least one night could not read its own start time and was
+     * counted from the Slot time the caller typed instead. The page MUST say so:
+     * without it those nights read as ordinary ones and the answer quietly
+     * describes a floor nobody was told about.
+     */
+    filter_time_used: boolean;
+    /** The floor those nights actually used, '' when none did. Read back out of
+     *  the resolved windows, not off the filter, so it cannot disagree with the
+     *  SQL that produced the rows. */
+    filter_time: string;
     nights: Array<{
       calendar_id: string;
       event_date: string;
@@ -977,6 +1076,8 @@ export interface ReservationQueryResult {
       end_time: string;
       match_from: string;
       lead_in_clamped: boolean;
+      /** True when match_from is the caller's Slot time, not this night's own. */
+      used_filter_time: boolean;
     }>;
     skipped: BandSkip[];
   } | null;
@@ -1007,7 +1108,11 @@ export function runReservationQuery(db: DB, f: ReservationFilter): ReservationQu
   // resolving here also means the three passes cannot disagree about which
   // nights they are counting, and that an unknown band is refused before the
   // transaction rather than from inside it.
-  const band = f.liveBandId ? resolveBandWindow(db, f.liveBandId) : null;
+  // f.timeFrom rides along so a night whose calendar start time is unreadable
+  // can still be counted from the Slot time the caller typed — see
+  // resolveBandWindow(). Passed here and only here, so the rows pass, the
+  // aggregate pass and the duplicate pass all describe the same nights.
+  const band = f.liveBandId ? resolveBandWindow(db, f.liveBandId, f.timeFrom) : null;
 
   const rowsWhere = buildWhere(f, { forAggregate: false, band });
   const aggWhere = buildWhere(f, { forAggregate: true, band });
@@ -1096,6 +1201,13 @@ export function runReservationQuery(db: DB, f: ReservationFilter): ReservationQu
   // the same nights. Threading it through each return is how the two used to
   // drift apart.
   const dates = band ? [...new Set(band.windows.map((w) => w.eventDate))].sort() : [];
+  // THE BORROWED-FLOOR NIGHTS, read back off the windows that produced the SQL
+  // rather than off f.timeFrom. Same reason `dates` is derived here: the echo
+  // must describe what the query DID, and a value taken from the filter would
+  // still print '19:00' on a run where no night actually needed it. Every
+  // fallback window carries the same matchFrom (they all borrow the one typed
+  // time), so the first is the floor they all used.
+  const borrowed = band ? band.windows.filter((w) => w.usedFilterTime) : [];
 
   return {
     rows: out.rows,
@@ -1114,6 +1226,8 @@ export function runReservationQuery(db: DB, f: ReservationFilter): ReservationQu
         lead_in_clamped: band.windows.some((w) => w.clamped),
         nights_capped: band.capped,
         nights_cap: MAX_BAND_NIGHTS,
+        filter_time_used: borrowed.length > 0,
+        filter_time: borrowed[0]?.matchFrom ?? '',
         nights: band.windows.map((w) => ({
           calendar_id: w.calendarId,
           event_date: w.eventDate,
@@ -1122,6 +1236,7 @@ export function runReservationQuery(db: DB, f: ReservationFilter): ReservationQu
           end_time: w.endTime,
           match_from: w.matchFrom,
           lead_in_clamped: w.clamped,
+          used_filter_time: w.usedFilterTime,
         })),
         skipped: band.skipped,
       }
