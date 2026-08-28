@@ -95,6 +95,25 @@ export const liveValueSql = (grn = 'g'): string =>
   `COALESCE(${grn}.status, '') NOT IN ('${VOID}', '${AWAITING_QC}')`;
 
 /**
+ * "Is this receipt still waiting on the checking department?" — the READING
+ * side of the same fact liveValueSql excludes, for the surfaces that must SHOW
+ * a held line rather than drop it.
+ *
+ * IT EXISTS SO NO SCREEN SPELLS THE STATUS ITSELF. A display that hard-codes
+ * 'awaiting_qc' is a tenth copy of a string this file already owns, and the one
+ * that drifts is the one nobody re-reads. The purchase-order detail table is
+ * the first caller: it must tell "0 accepted because the kitchen has not looked
+ * yet" apart from "0 accepted because the kitchen turned it away", and those
+ * two differ ONLY by this status — quantity_accepted is 0 in both.
+ *
+ * Safe for a 'use client' file to import: this module has no runtime imports
+ * (see the note on AWAITING_QC above), so pulling the predicate into the
+ * browser bundle drags nothing else with it.
+ */
+export const isReceiptHeldForQc = (status: unknown): boolean =>
+  String(status ?? '') === AWAITING_QC;
+
+/**
  * THE JOIN. A caller cannot reach goods_receipt_notes from a GRN line without
  * spelling the filter, because the filter is inside the string they must use.
  *
@@ -194,6 +213,27 @@ export interface PoReceiptLine {
   received_on: string;
   received_from: string;
   received_bill_no: string | null;
+  /**
+   * The RECEIPT's own header status — 'received' | 'partial' | 'rejected' |
+   * 'awaiting_qc' (grn-qc.ts writes exactly those; 'void' can never appear here
+   * because claimJoin() has already dropped it).
+   *
+   * WHY A CONSUMER NEEDS IT. quantity_accepted alone is ambiguous while a
+   * receipt is held: grn-qc.ts pins it to 0 as the ABSENCE of a decision, and 0
+   * is also what a real rejection leaves. Its own header comment says it —
+   * "read one without the other and you will misreport the delivery" — and the
+   * PO detail table did exactly that, printing Received 0 and a full negative
+   * variance over goods that were on the shelf. Read the two together, through
+   * isReceiptHeldForQc().
+   *
+   * A COLUMN THAT HAS ALWAYS EXISTED: goods_receipt_notes.status is in the
+   * original DDL and is NOT NULL DEFAULT 'received', so this cannot throw on an
+   * un-migrated database the way a qc_* column could. The other half of the QC
+   * story (WHO is checking, qc_checker) is deliberately NOT selected for that
+   * reason — this file is also read by the receive route, and a query that can
+   * throw there is a receive that cannot be taken.
+   */
+  grn_status: string;
 }
 
 /**
@@ -210,7 +250,11 @@ export function poReceiptLines(db: Db, poId: string): PoReceiptLine[] {
            gi.unit_price AS received_unit_price, gi.rejection_reason,
            gi.discount AS received_discount, gi.delivery_charges AS received_delivery,
            g.grn_number, g.date AS received_on, g.vendor AS received_from,
-           g.invoice_number AS received_bill_no
+           g.invoice_number AS received_bill_no,
+           -- COALESCE for the same reason liveClaimSql() carries one: the column
+           -- is NOT NULL today and has been loosened elsewhere before. A NULL
+           -- must read as an ordinary receipt, never as a held one.
+           COALESCE(g.status, '') AS grn_status
     FROM goods_receipt_note_items gi
     ${claimJoin()}
     WHERE g.po_id = ? AND ${HAS_PO_ITEM}

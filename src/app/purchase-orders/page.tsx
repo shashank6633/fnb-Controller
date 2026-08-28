@@ -5,8 +5,14 @@ import { createPortal } from 'react-dom';
 import {
   ClipboardList, Plus, Trash2, Search, Loader2, CheckCircle2, XCircle, Send,
   ShieldCheck, PackageCheck, RefreshCw, AlertTriangle, ChevronDown, Printer, Lock,
+  Clock,
 } from 'lucide-react';
 import { api } from '@/lib/api';
+// THE ONE SPELLING OF "this receipt is still waiting on the kitchen", imported
+// from the file that owns every PO↔GRN derivation rather than restated here.
+// @/lib/po-receipts has NO runtime imports (see its header), which is the only
+// reason a 'use client' file may import it; never add an import to it.
+import { isReceiptHeldForQc } from '@/lib/po-receipts';
 import { allocateBillCharges, resolveCharge, r2, MIN_NET_RATE, NON_ADMIN_DISCOUNT_CAP_PCT } from '@/lib/po-charges';
 import { packFactor, toPurchaseQty, fmtQtyNum, type PackMeta } from '@/lib/pack-units';
 // THE SAME "is there a bill number here?" THE RECEIVE ROUTE USES — imported,
@@ -2320,6 +2326,56 @@ function PODetail({ po, editing, materials, onCancelEdit, onSaved }: {
   // line has a GRN row. (received_line_total is the API's "matched to a GRN"
   // marker; it is set even for a truthful ₹0 line, unlike a > 0 sum test.)
   const anyReceived = isReceived || items.some(it => (it as any).received_line_total != null);
+  /* ── THE LINES WHOSE RECEIPT IS STILL HELD FOR A QUALITY CHECK ────────────
+     A held GRN has its rows — the goods are in the building and the bill exists
+     — but grn-qc.ts pins quantity_accepted to 0 until the checking department
+     signs, as the ABSENCE of a decision (src/lib/grn-qc.ts:60-88). This table
+     reads the accepted quantity, so every held line printed Received 0,
+     Received ₹0.00 and a variance equal to the whole ordered value, while the
+     list row above it said the line was in. Both were internally correct and
+     together they read as a contradiction.
+       Derived ONCE here and reused by the rows and the totals, so the footer
+     can never disagree with the lines it sums. `received_line_total != null` is
+     this table's existing "a GRN row matched" marker — the status alone would
+     be undefined on a line with no receipt at all. */
+  /* AND NOTHING ARRIVED MEANS NOTHING IS BEING HELD. A line can be ticked into
+     a receipt at quantity 0 — the receive route allows it deliberately and says
+     what it means ([id]/receive/route.ts:613-616: "a 0-qty receive books the
+     line as received-and-short forever"). On such a line the money variance is
+     already SETTLED, not pending: grn-qc.ts:1454 refuses accepted > received,
+     so the checking department can only ever sign 0 and the full ordered value
+     is a genuine shortfall. Badging it "held" would withhold a figure that is
+     known and call a total non-delivery a delivery waiting on a signature —
+     the reported bug pointing the other way. It therefore renders exactly as it
+     did before: a plain 0 with its real −(ordered) variance.
+     1e-6 is the receive route's own QTY_EPS ([id]/receive/route.ts), so "did
+     anything arrive" is answered here with the same slack the ledger uses. */
+  const HELD_QTY_EPS = 1e-6;
+  const isHeldLine = (it: POItem) =>
+    (it as any).received_line_total != null
+    && isReceiptHeldForQc((it as any).received_grn_status)
+    && Number((it as any).quantity_received || 0) > HELD_QTY_EPS;
+  const heldLines = items.filter(isHeldLine);
+  /* What the vendor's bill says the held goods are worth: RECEIVED × the bill's
+     own rate. NOT booked money — nothing is in stock, purchases or average_price
+     until the sign-off — so it is never added into the Received ₹ total, only
+     stated beside it. r2 is the same rounding the receive route books with.
+     ROUNDED PER LINE AND THEN SUMMED, not summed and then rounded: each row
+     prints r2(qty × rate), so a footer that rounds the raw sum can disagree
+     with the column it totals by a paisa (0.251 × ₹4 twice → rows ₹1.00 +
+     ₹1.00, raw sum ₹2.008 → ₹2.01). The Received ₹ total beside it is already
+     Σ of server-rounded line totals; this makes the held figure the same kind
+     of number, so adding the column up gives the footer. */
+  const heldBillValue = r2(heldLines.reduce((s, it) =>
+    s + r2(Number((it as any).quantity_received || 0) * Number((it as any).received_unit_price ?? it.unit_price)), 0));
+  /* How much of the variance total is still open. A held line contributes
+     −(its ordered value) to `rec − ord` because none of it is booked yet.
+     That is NOT the same as "not a shortfall": sign-off books only what
+     arrived, so at most heldBillValue of this comes back and any quantity that
+     never came stays short. The footer's tooltip states the ceiling rather than
+     absolving the whole bucket. */
+  const heldOrderedValue = r2(heldLines.reduce((s, it) => s + Number(it.total_price || 0), 0));
+  const heldGrns = [...new Set(heldLines.map(it => String((it as any).received_grn_number || '')).filter(Boolean))];
   return (
     <tr><td colSpan={8} className="py-3 px-3 bg-[#FFF8F0]">
       <div className="flex items-start gap-6">
@@ -2343,6 +2399,20 @@ function PODetail({ po, editing, materials, onCancelEdit, onSaved }: {
           {po.approved_at  && <div><span className="font-semibold">Approved:</span>  {dateLabel(po.approved_at)} by {po.approved_by}</div>}
           {po.received_at  && <div><span className="font-semibold">Received:</span>  {dateLabel(po.received_at)}</div>}
           {po.rejected_reason && <div className="text-red-600"><span className="font-semibold">Rejected:</span> {po.rejected_reason}</div>}
+          {/* WHY THE RECEIVED COLUMN LOOKS THE WAY IT DOES, NAMED ONCE at the
+              top rather than only inferred from chips down the table — a
+              storekeeper who reads "Received 0" concludes the delivery failed.
+              Blue, not amber or red, matching /grn: the desk did nothing wrong;
+              the receipt is waiting on somebody else. */}
+          {heldLines.length > 0 && (
+            <div className="text-blue-800 max-w-[22rem]">
+              <Clock className="w-3 h-3 inline-block align-[-2px] mr-1" />
+              <span className="font-semibold">{heldGrns.join(', ') || 'This receipt'}</span>{' '}
+              {heldLines.length === 1 ? 'has 1 line' : `has ${heldLines.length} lines`} held for a quality check —
+              the goods are in and the bill is recorded, but no stock has been added and
+              the accepted quantity is not decided yet.
+            </div>
+          )}
         </div>
         <div className="flex-1 min-w-0 overflow-x-auto">
         <table className="text-xs w-full min-w-[640px]">
@@ -2370,17 +2440,52 @@ function PODetail({ po, editing, materials, onCancelEdit, onSaved }: {
               // received_* fields come from /api/purchase-orders when grn_id is set
               // (server folds the linked GRN items into the response). See the
               // PO API GET handler for the join logic.
-              const recQty   = (it as any).quantity_accepted ?? (it as any).quantity_received;
-              const recPrice = (it as any).received_unit_price ?? it.unit_price;
-              const recTotal = (it as any).received_line_total ?? (recQty != null ? Number(recQty) * Number(recPrice) : null);
               // On a part-received PO the un-delivered lines carry no GRN row, and
               // recPrice falls back to the ORDERED rate — printing that would make
               // an outstanding line look delivered at its ordered price. lineIn is
               // the per-line "this one actually arrived" test.
               const lineIn = (it as any).received_line_total != null;
+              /* ── THREE STATES IN THIS COLUMN, NOT TWO ──────────────────────
+                 · no GRN row at all      → "—"   (nothing was delivered)
+                 · receipt held for QC    → what ARRIVED, in blue, badged
+                 · receipt signed off     → the ACCEPTED quantity, as always,
+                                            INCLUDING a truthful 0 when the
+                                            kitchen turned the whole line away.
+                 The first two used to render as "—" and "0", which is the same
+                 visual weight for opposite facts; the last two were both "0",
+                 which is the same glyph for "nobody has looked" and "we refused
+                 it". Only the receipt's status separates them — accepted is 0 in
+                 both — so it is read here, through the ledger's own predicate.
+                 ONE predicate for the rows and the footer (see isHeldLine
+                 above), so a line the totals treat as held can never render as
+                 settled, or the reverse. */
+              const heldForQc = isHeldLine(it);
+              // The signed-off answer, unchanged: accepted first, and 0 is a real
+              // value so `??` must not fall through it.
+              const acceptedQty = (it as any).quantity_accepted ?? (it as any).quantity_received;
+              const recQty   = heldForQc ? (it as any).quantity_received : acceptedQty;
+              const recPrice = (it as any).received_unit_price ?? it.unit_price;
+              /* Money follows the same split. `received_line_total` is BOOKED
+                 money (accepted × rate) and stays that for every settled line and
+                 for every total. A held line's booked money is genuinely ₹0 —
+                 printing that as its worth asserts a delivery of nothing, so the
+                 cell shows the BILL value of what arrived instead, marked as not
+                 booked. */
+              const recTotal = heldForQc
+                ? (recQty != null && recPrice != null ? r2(Number(recQty) * Number(recPrice)) : null)
+                : ((it as any).received_line_total ?? (acceptedQty != null ? Number(acceptedQty) * Number(recPrice) : null));
               const qtyDiff   = lineIn && recQty != null ? Number(recQty) - Number(it.quantity) : 0;
               const priceDiff = lineIn && recPrice != null ? Number(recPrice) - Number(it.unit_price) : 0;
-              const valDiff   = lineIn && recTotal != null ? Number(recTotal) - Number(it.total_price) : 0;
+              /* A HELD LINE HAS NO SETTLED MONEY VARIANCE, so it prints none.
+                 The two candidates are both false statements: booked-minus-ordered
+                 is the full negative order value (the reported bug — it asserts a
+                 shortfall that has not happened), and bill-minus-ordered asserts a
+                 final figure the checking department has not agreed to. The QTY
+                 delta is still shown, because THAT is settled — it is what came
+                 off the truck against what was ordered, and no sign-off can
+                 change it; acceptance can only reduce the accepted quantity
+                 later, and that surfaces as a Rejected note on this row. */
+              const valDiff   = !heldForQc && lineIn && recTotal != null ? Number(recTotal) - Number(it.total_price) : 0;
               const rejected  = Number((it as any).quantity_rejected) || 0;
               // A PO line is expressed in the PURCHASE unit (kg/BTL/CASE) at
               // ₹/purchase-unit — never the recipe unit (g/ml), which differs by
@@ -2418,17 +2523,43 @@ function PODetail({ po, editing, materials, onCancelEdit, onSaved }: {
                   <td className="py-1 px-2 text-right font-mono">{fmt(it.unit_price)}</td>
                   <td className="py-1 px-2 text-right font-mono font-semibold">{fmt(it.total_price)}</td>
                   {anyReceived && <>
-                    <td className={`py-1 px-2 text-right font-mono ${qtyDiff !== 0 ? (qtyDiff > 0 ? 'bg-amber-50 text-amber-900 font-semibold' : 'bg-red-50 text-red-700 font-semibold') : 'bg-emerald-50/30'}`}>
+                    {/* BLUE, not the amber/red diff scale, on a held line: the
+                        number in the cell is a RECEIVED quantity, and colouring
+                        it on the accepted-vs-ordered legend would grade a
+                        decision nobody has made. Same family /grn gives the
+                        held state, so the two screens read as one thing. */}
+                    <td className={`py-1 px-2 text-right font-mono ${heldForQc ? 'bg-blue-50 text-blue-900 font-semibold' : qtyDiff !== 0 ? (qtyDiff > 0 ? 'bg-amber-50 text-amber-900 font-semibold' : 'bg-red-50 text-red-700 font-semibold') : 'bg-emerald-50/30'}`}>
                       {lineIn && recQty != null ? Number(recQty).toLocaleString('en-IN') : '—'}
                       {lineIn && rcvHint && <div className={HINT_CLS}>{rcvHint}</div>}
+                      {heldForQc && (
+                        <div className="mt-0.5 font-sans font-normal">
+                          <span className="inline-flex items-center gap-0.5 px-1 py-px rounded border border-blue-200 bg-blue-100 text-blue-800 text-[9px]"
+                                title={`${(it as any).received_grn_number || 'This receipt'} is recorded and waiting for a quality check. `
+                                     + `${qfmt(Number(recQty) || 0)} ${u} arrived; no stock has been added and the accepted quantity is not decided yet. `
+                                     + `A 0 here would mean the goods were turned away, which has not happened.`}>
+                            <Clock className="w-2.5 h-2.5" /> held for QC
+                          </span>
+                        </div>
+                      )}
                     </td>
                     <td className={`py-1 px-2 text-right font-mono ${priceDiff !== 0 ? (priceDiff > 0 ? 'bg-red-50 text-red-700 font-semibold' : 'bg-emerald-50 text-emerald-800 font-semibold') : 'bg-emerald-50/30'}`}>
                       {lineIn && recPrice != null ? fmt(Number(recPrice)) : '—'}
                     </td>
-                    <td className="py-1 px-2 text-right font-mono bg-emerald-50/30">
+                    <td className={`py-1 px-2 text-right font-mono ${heldForQc ? 'bg-blue-50 text-blue-900' : 'bg-emerald-50/30'}`}>
                       {lineIn && recTotal != null ? fmt(Number(recTotal)) : '—'}
+                      {/* Says what the figure IS, so it is never read as money
+                          already in the books: the vendor's bill for what
+                          arrived, which enters stock and cost only on sign-off.
+                          The Totals row keeps this out of the Received ₹ sum
+                          and states it separately for the same reason. */}
+                      {heldForQc && (
+                        <div className="text-[9px] font-sans text-blue-800"
+                             title="The vendor's bill value of the goods that arrived. Nothing has been booked into stock, purchases or average price — that happens when the checking department signs off.">
+                          bill value · not booked
+                        </div>
+                      )}
                     </td>
-                    <td className={`py-1 px-2 text-right font-mono text-[10px] ${valDiff === 0 ? 'text-[#8B7355]' : valDiff > 0 ? 'text-red-700' : 'text-amber-700'}`}>
+                    <td className={`py-1 px-2 text-right font-mono text-[10px] ${heldForQc ? 'text-blue-800' : valDiff === 0 ? 'text-[#8B7355]' : valDiff > 0 ? 'text-red-700' : 'text-amber-700'}`}>
                       {/* qfmt, not the raw float: 2.4 − 2.5 prints as
                           −0.09999999999999964 straight out of the subtraction.
                           Purchase basis on both sides, so the delta is too. */}
@@ -2440,7 +2571,15 @@ function PODetail({ po, editing, materials, onCancelEdit, onSaved }: {
                       {valDiff !== 0 && (
                         <div>{valDiff > 0 ? '+' : ''}{fmt(valDiff)}</div>
                       )}
-                      {qtyDiff === 0 && valDiff === 0 && '—'}
+                      {/* The money half, withheld rather than guessed. See the
+                          valDiff note above for why neither candidate figure is
+                          true yet. */}
+                      {heldForQc
+                        ? <div className="font-sans"
+                               title="No money variance is settled on this line yet: what is booked depends on how much the checking department accepts.">
+                            ₹ pending QC
+                          </div>
+                        : (qtyDiff === 0 && valDiff === 0 && '—')}
                     </td>
                   </>}
                 </tr>
@@ -2458,7 +2597,18 @@ function PODetail({ po, editing, materials, onCancelEdit, onSaved }: {
                 </td>
                 <td colSpan={2}></td>
                 <td className="py-1.5 px-2 text-right font-mono bg-emerald-50">
+                  {/* BOOKED money only, unchanged: this sum is what has actually
+                      entered stock and cost. A held line's bill value is stated
+                      under it rather than added into it — the two are different
+                      facts and adding them would make the footer disagree with
+                      every line above it. */}
                   {fmt(items.reduce((s, it) => s + Number((it as any).received_line_total || 0), 0))}
+                  {heldLines.length > 0 && (
+                    <div className="text-[9px] font-sans font-normal text-blue-800"
+                         title={`${heldGrns.join(', ') || 'A receipt'} is held for a quality check. This is the vendor's bill value of the goods that arrived; it enters the received total when the check is signed off.`}>
+                      + {fmt(heldBillValue)} held for QC
+                    </div>
+                  )}
                 </td>
                 <td className="py-1.5 px-2 text-right font-mono text-[10px] bg-amber-50">
                   {(() => {
@@ -2467,6 +2617,26 @@ function PODetail({ po, editing, materials, onCancelEdit, onSaved }: {
                     const d = rec - ord;
                     return d === 0 ? '—' : (d > 0 ? '+' : '') + fmt(d);
                   })()}
+                  {/* The arithmetic above is untouched — it is still exactly
+                      received-minus-ordered, so the row still reconciles column
+                      by column. What is added is HOW MUCH OF IT IS STILL OPEN:
+                      a held line contributes its whole ordered value as
+                      negative because nothing of it is booked yet.
+                      IT IS NOT "not a shortfall". Sign-off can only book what
+                      actually arrived, so it improves this figure by AT MOST the
+                      bill value in the cell to the left; a held line that came
+                      short (11 kg against 12 ordered) keeps that kilo as a real
+                      shortfall no matter who signs. Naming the ceiling instead
+                      of declaring the whole bucket innocent is the difference
+                      between the two, and it is the same over-claim as showing
+                      a 0-quantity line as held. */}
+                  {heldLines.length > 0 && (
+                    <div className="text-[9px] font-sans font-normal text-blue-800"
+                         title={`Goods that have arrived and are waiting on a quality check count as nothing received until they are signed off, so the full ordered value of those lines sits in this figure. `
+                              + `Signing off books at most ${fmt(heldBillValue)} — the bill value of what actually arrived — back against it; anything left after that, including quantity that never came, is a real shortfall.`}>
+                      incl. −{fmt(heldOrderedValue)} awaiting QC
+                    </div>
+                  )}
                 </td>
               </tr>
             </tfoot>

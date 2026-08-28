@@ -275,6 +275,14 @@ export async function GET(request: Request) {
             // WHOSE delivery this line came in on. On a mixed PO the reader
             // cannot otherwise tell which of three bills a received line sits on.
             it.received_grn_number   = g.grn_number;
+            // WHETHER THAT RECEIPT HAS BEEN SIGNED OFF YET. Carried because
+            // quantity_accepted = 0 has two opposite meanings — the kitchen
+            // turned the goods away, or the kitchen has not looked yet
+            // (src/lib/grn-qc.ts:78-81) — and this column is the only thing
+            // that separates them. Both consumers of this payload render an
+            // accepted quantity, so both need it; the detail table reads it
+            // through isReceiptHeldForQc() rather than testing the string.
+            it.received_grn_status   = g.grn_status;
             it.received_on           = g.received_on;
             it.received_from         = g.received_from;
             it.received_bill_no      = g.received_bill_no || '';
