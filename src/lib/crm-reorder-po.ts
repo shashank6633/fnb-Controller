@@ -22,6 +22,7 @@
 import type Database from 'better-sqlite3';
 import { generateId } from '@/lib/db';
 import { mergeDuplicateLines } from '@/lib/po-helpers';
+import { headerVendorFromLines } from '@/lib/vendor-mapping';
 
 type DB = Database.Database;
 
@@ -59,23 +60,23 @@ function recalcTotal(db: DB, poId: string) {
   db.prepare(`UPDATE purchase_orders SET total_cost = ?, updated_at = datetime('now') WHERE id = ?`).run(r.t, poId);
 }
 
-/** Mirrors deriveHeaderVendor in /api/purchase-orders/route.ts. */
+/** Mirrors deriveHeaderVendor in /api/purchase-orders/route.ts — and now shares
+ *  its counting rule instead of restating it. Vendors are counted BY IDENTITY
+ *  (vendor_id), never by the (name, id) pair: see headerVendorFromLines. Every
+ *  PO this file writes carries one vendor on every line by construction (the
+ *  groups below), so this cannot produce a different answer than the old copy
+ *  did — it is shared so the two cannot drift apart later. */
 function deriveHeaderVendor(db: DB, poId: string) {
   const rows = db.prepare(`
-    SELECT vendor, vendor_id, COUNT(*) AS n
+    SELECT vendor, vendor_id
     FROM purchase_order_items
     WHERE po_id = ? AND vendor IS NOT NULL AND TRIM(vendor) != ''
-    GROUP BY vendor, vendor_id
-    ORDER BY n DESC
+    ORDER BY rowid
   `).all(poId) as any[];
-  if (rows.length === 0) return;
-  if (rows.length === 1) {
-    db.prepare(`UPDATE purchase_orders SET vendor = ?, vendor_id = ? WHERE id = ?`)
-      .run(rows[0].vendor, rows[0].vendor_id, poId);
-  } else {
-    db.prepare(`UPDATE purchase_orders SET vendor = ?, vendor_id = NULL WHERE id = ?`)
-      .run(`Mixed (${rows.length} vendors)`, poId);
-  }
+  const hdr = headerVendorFromLines(db, rows);
+  if (hdr.kind === 'none') return;
+  db.prepare(`UPDATE purchase_orders SET vendor = ?, vendor_id = ? WHERE id = ?`)
+    .run(hdr.vendor, hdr.vendor_id, poId);
 }
 
 /**

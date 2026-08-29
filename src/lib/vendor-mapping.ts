@@ -260,6 +260,166 @@ export function resolveVendorRef(db: DB, ref: VendorRefLike | null | undefined):
   return vendorResolver(db)(ref);
 }
 
+/* ────────────────────────────────────────────────────────────────────────────
+ * COUNTING VENDORS — THE IDENTITY IS THE ID, NEVER THE LABEL
+ * ──────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * Owner's rule, verbatim: "Vendor Id is the unique Id for Vendors which it
+ * should use Vendor Id to normalise and show the number of vendors if it is
+ * more than 1."
+ *
+ * WHY THIS EXISTS: the PO header used to be derived with
+ *   `GROUP BY vendor, vendor_id` over purchase_order_items,
+ * which counts the PAIR. One supplier whose lines disagree about the id column
+ * — most commonly some lines carrying the id and some carrying NULL — therefore
+ * split into two groups and the header was written "Mixed (2 vendors)" over
+ * nineteen lines that every screen renders as the same vendor. PO-2026-0079 is
+ * that bug (19 lines, all DKM ENTERPRISE, header "Mixed (2 vendors)", and only
+ * ONE DKM ENTERPRISE in the vendor master).
+ *
+ * The name is a LABEL. Two labels for one id are one vendor; one label under
+ * two ids is two vendors.
+ */
+
+/** The comparable form of a vendor NAME — ONE fold, deliberately the same one
+ *  the rest of the app already uses:
+ *    · `vendorResolver` above: `LOWER(TRIM(name)) = LOWER(TRIM(?))` — what the
+ *      rule CHECKS and what the PO insert loops STORE.
+ *    · `[id]/receive/route.ts`: `vendorKeyOf = String(name).trim().toLowerCase()`
+ *      — which supplier a delivery is grouped, billed and stocked under.
+ *  JS `.trim()` strips NBSP and tabs at the ENDS, exactly as `vendorKeyOf` does.
+ *
+ *  IT DOES NOT COLLAPSE INNER WHITESPACE, and that is the point. A tolerant fold
+ *  was tried here (`\s+` → ' ') on the argument that HTML collapses the extra
+ *  space anyway. It does — which is precisely the danger: the header then said
+ *  "one vendor" over lines `[id]/receive` still splits into TWO bill groups, and
+ *  because both groups render the same name the receiver sees two identical tabs,
+ *  no "Mixed" warning, and `uq_po_vendor_bill (po_id, vendor_name, bill_no)`
+ *  cannot catch the same bill filed twice — a different `vendor_name` is a
+ *  different key, so the mis-file is accepted silently. Fuzzed over every 3-line
+ *  combination of 16 line shapes, that fold accounted for EVERY header-vs-receive
+ *  disagreement it introduced and nothing else did; with it gone the count is
+ *  zero. A PO whose lines are spelled two ways genuinely takes two receipts, so
+ *  it keeps reading "Mixed" — the truth — until the line rows are repaired, and
+ *  deriveHeaderVendor logs which spelling to repair. */
+export function normalizeVendorName(name: unknown): string {
+  return String(name ?? '').trim().toLowerCase();
+}
+
+/**
+ * ONE VENDOR = ONE KEY. Id when there is one, the normalized name only when
+ * there is not.
+ *
+ * Exported because the PO composer (a client component) has to answer the same
+ * question about the draft it is about to POST, and a second spelling of "are
+ * these the same vendor" on the client is exactly how the draft header and the
+ * saved header come to disagree. This module has no runtime imports — the db
+ * import is `import type` — so a client bundle may take it.
+ */
+export function vendorIdentityKey(ref: { id?: string | null; name?: unknown }): string {
+  const id = String(ref.id ?? '').trim();
+  return id ? `id:${id}` : `name:${normalizeVendorName(ref.name)}`;
+}
+
+/**
+ * THE IDENTITY OF ONE REFERENCE, given what `vendorResolver` made of it.
+ *
+ * A KNOWN ref is its MASTER ROW: `id:<vendors.id>`. Two spellings of one vendor
+ * are one vendor; one spelling under two master rows is two.
+ *
+ * An UNKNOWN ref has no master row, so `ResolvedVendor.id` is null — but the
+ * LINE may still carry a `vendor_id`, and the owner's rule is that the id is the
+ * identity. Two lines carrying two DIFFERENT (dangling) ids are two different
+ * things and must not be merged just because they are spelled alike; the old
+ * `GROUP BY vendor, vendor_id` separated them too. Hence the raw ref beside the
+ * resolution, rather than the resolution alone.
+ */
+function identityKeyOf(ref: VendorRefLike | null | undefined, v: ResolvedVendor): string {
+  return v.status === 'known'
+    ? vendorIdentityKey({ id: v.id, name: v.shown })
+    : vendorIdentityKey({ id: String(ref?.vendor_id ?? '').trim() || null, name: v.shown });
+}
+
+/** What the PO header should read, derived from the vendors its LINES name. */
+export interface HeaderVendorDerivation {
+  /** 'none'   — no line names a vendor; the header must be LEFT ALONE (the
+   *             documented manual-entry case, and Smart Reorder's unassigned
+   *             draft).
+   *  'vendor' — every line is the same vendor.
+   *  'mixed'  — genuinely several. */
+  kind: 'none' | 'vendor' | 'mixed';
+  /** The string to write into purchase_orders.vendor, or null when kind is
+   *  'none'. For 'mixed' this is the "Mixed (N vendors)" label twelve readers
+   *  and [id]/receive/route.ts already parse — that contract does not move. */
+  vendor: string | null;
+  /** purchase_orders.vendor_id. NULL for 'mixed' (it is not a vendor) and for a
+   *  single vendor the master does not know. */
+  vendor_id: string | null;
+  /** Distinct vendor IDENTITIES on the lines — the N in "Mixed (N vendors)". */
+  count: number;
+  /** Line vendor names no master row matches, in first-seen order. Each is a
+   *  real data problem: every vendor-keyed join downstream (contracts, terms,
+   *  purchase history) is already broken for it. They are COUNTED as vendors of
+   *  their own rather than dropped — dropping one would head a two-vendor PO
+   *  with the one name the master happens to know, and `inheritedVendorFor`
+   *  below already counts them, so dropping them here would make the "the PO
+   *  covers N vendors" refusal name a different N than the header written in
+   *  the very same transaction. Surfaced so the caller can say so out loud. */
+  unresolved: string[];
+}
+
+/**
+ * THE header derivation, in one place.
+ *
+ * Hand it the vendor refs of a PO's lines (the caller owns the SELECT, because
+ * WHICH lines count is a PO question — see the WHERE clause in
+ * api/purchase-orders/route.ts). A ref carrying neither a name nor an id is
+ * skipped, exactly as `vendorResolver` reports it 'empty'.
+ */
+export function headerVendorFromLines(
+  db: DB,
+  lines: readonly (VendorRefLike | null | undefined)[],
+): HeaderVendorDerivation {
+  // THE STRICT RESOLVER — the same one the rule checks with and the insert loops
+  // store with. The header must not be counted by a looser notion of "same
+  // vendor" than the one that decides what is stored and what receiving groups,
+  // or the label describes a PO nobody else can see (see normalizeVendorName).
+  const resolve = vendorResolver(db);
+  // key → what to write if this turns out to be the only identity. The RAW ref
+  // is kept beside the resolution so an unresolved vendor's header is written
+  // exactly as the line spells it (and with whatever id the line carried),
+  // which is byte-for-byte what the old GROUP BY wrote for that case.
+  const seen = new Map<string, { v: ResolvedVendor; ref: VendorRefLike }>();
+  const unresolved: string[] = [];
+  for (const ln of lines) {
+    if (!ln) continue;
+    const v = resolve(ln);
+    if (v.status === 'empty') continue;
+    const key = identityKeyOf(ln, v);
+    if (seen.has(key)) continue;
+    seen.set(key, { v, ref: ln });
+    if (v.status === 'unknown') unresolved.push(v.shown);
+  }
+  if (seen.size === 0) return { kind: 'none', vendor: null, vendor_id: null, count: 0, unresolved };
+  if (seen.size === 1) {
+    const { v, ref } = [...seen.values()][0];
+    return v.status === 'known'
+      // The MASTER row's own spelling and its id — the same pair the insert
+      // loops store on the lines, so the header and its lines cannot disagree.
+      ? { kind: 'vendor', vendor: v.name, vendor_id: v.id, count: 1, unresolved }
+      : { kind: 'vendor', vendor: String(ref.vendor ?? '').trim(),
+          vendor_id: String(ref.vendor_id ?? '').trim() || null, count: 1, unresolved };
+  }
+  return {
+    kind: 'mixed',
+    vendor: `Mixed (${seen.size} vendors)`,
+    vendor_id: null,
+    count: seen.size,
+    unresolved,
+  };
+}
+
 /** What a line carrying NO vendor of its own will actually be filed under. */
 type InheritedVendor =
   | { kind: 'none' }                        // nothing to inherit — see Smart Reorder
@@ -302,7 +462,10 @@ function inheritedVendorFor(
     for (const it of list) {
       const v = resolve(it);
       if (v.status === 'empty') continue;
-      const key = v.status === 'known' ? `id:${v.id}` : `raw:${v.shown.toLowerCase()}`;
+      // THE SAME KEY, off THE SAME RESOLVER, that `headerVendorFromLines`
+      // counts with — or the "the PO covers N vendors" refusal below would name
+      // a different N than the header written in the very same transaction.
+      const key = identityKeyOf(it, v);
       if (!seen.has(key)) seen.set(key, v);
     }
     if (seen.size === 1) return { kind: 'vendor', vendor: [...seen.values()][0] };

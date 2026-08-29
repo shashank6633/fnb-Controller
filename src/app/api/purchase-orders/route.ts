@@ -3,7 +3,7 @@ import { snapshotPoLines } from '@/lib/po-stock-snapshot';
 import { getCurrentOutletId, getCurrentUser } from '@/lib/auth';
 import { centralFlowBlock } from '@/lib/store-engine';
 import { effectiveRole, effectiveActor, recalcTotal, poWriteGate, duplicateLineError } from '@/lib/po-helpers';
-import { vendorMappingError, vendorResolver, resolveVendorRef } from '@/lib/vendor-mapping';
+import { vendorMappingError, vendorResolver, resolveVendorRef, headerVendorFromLines } from '@/lib/vendor-mapping';
 // THE definition of the figure, and THE writer of the frozen copy. Both are
 // imported, never restated here: if this route computed "in-hand stock" itself
 // there would be two definitions of it — the one the picker shows while you
@@ -151,26 +151,57 @@ function normalizeDeliveryDate(deliveryDate: unknown): string | null {
 
 /**
  * Recompute the PO's header vendor from its line items.
- * - If all lines share one vendor → that's the PO vendor.
- * - If multiple → header reads "Mixed (N)" so reports/printouts make sense.
- * - If no items have vendors → leave header vendor untouched (manual entry case).
+ * - If all lines are ONE VENDOR → that vendor's master name AND its vendor_id.
+ * - If several → header reads "Mixed (N vendors)", vendor_id NULL, so reports,
+ *   printouts and [id]/receive (which parses exactly that shape) still work.
+ * - If no line names a vendor → leave the header untouched (manual entry case).
+ *
+ * "ONE VENDOR" IS AN IDENTITY QUESTION, AND THE IDENTITY IS vendor_id.
+ * This used to be `GROUP BY vendor, vendor_id`, which counts the PAIR: one
+ * supplier whose lines disagree about the id column — some carrying it, some
+ * NULL — split into two groups, and the header was written "Mixed (2 vendors)"
+ * over lines that every screen renders as the same vendor. That is the
+ * PO-2026-0079 report (19 lines, all DKM ENTERPRISE, one DKM ENTERPRISE in the
+ * master). The counting now goes through @/lib/vendor-mapping — the module that
+ * already owns "which vendor is this really", that the POST body and every line
+ * insert in this file already resolve through, and that spells the same rule for
+ * the composer's draft header.
+ *
+ * THE LINE FILTER IS UNCHANGED — a line "carries a vendor" when it carries a
+ * NAME. That is the same test [id]/receive uses to decide whether a line is
+ * filed under itself or under this header (`(it.vendor && trim) || po.vendor`),
+ * so widening it here would make the header describe a grouping receiving does
+ * not perform. Neither is the NAME FOLD widened: vendor-mapping counts with the
+ * same `LOWER(TRIM())` the rule and receive's `vendorKeyOf` use, so a PO that
+ * really does need two receipts keeps saying "Mixed".
+ *
+ * ORDER BY rowid because the old statement was `GROUP BY … ORDER BY n DESC` and
+ * read `rows[0]`: ordering was part of the answer. It still is for exactly one
+ * case — a single identity the master does not know, whose header is written as
+ * the FIRST line spells it — and an unordered SELECT would leave that label to
+ * SQLite's scan order.
  */
 function deriveHeaderVendor(db: ReturnType<typeof getDb>, poId: string) {
   const rows = db.prepare(`
-    SELECT vendor, vendor_id, COUNT(*) AS n
+    SELECT vendor, vendor_id
     FROM purchase_order_items
     WHERE po_id = ? AND vendor IS NOT NULL AND TRIM(vendor) != ''
-    GROUP BY vendor, vendor_id
-    ORDER BY n DESC
+    ORDER BY rowid
   `).all(poId) as any[];
-  if (rows.length === 0) return;
-  if (rows.length === 1) {
-    db.prepare(`UPDATE purchase_orders SET vendor = ?, vendor_id = ? WHERE id = ?`)
-      .run(rows[0].vendor, rows[0].vendor_id, poId);
-  } else {
-    db.prepare(`UPDATE purchase_orders SET vendor = ?, vendor_id = NULL WHERE id = ?`)
-      .run(`Mixed (${rows.length} vendors)`, poId);
+  const hdr = headerVendorFromLines(db, rows);
+  if (hdr.kind === 'none') return;
+  // A LINE VENDOR THE MASTER HAS NEVER HEARD OF IS NOT SWALLOWED. It counts as
+  // a vendor of its own (see HeaderVendorDerivation.unresolved), and it is said
+  // out loud here rather than thrown: this runs INSIDE the write transaction,
+  // after vendorMappingError() has already accepted the PO, so throwing would
+  // roll back an order the rule passed. The rule is where such a line is
+  // refused (it 400s "not in the Vendor master"), which is why every live write
+  // path reaches this with an empty list — a non-empty one means legacy rows.
+  if (hdr.unresolved.length > 0) {
+    console.warn(`[deriveHeaderVendor] PO ${poId}: line vendor(s) not in the Vendor master — ${hdr.unresolved.join(', ')}`);
   }
+  db.prepare(`UPDATE purchase_orders SET vendor = ?, vendor_id = ? WHERE id = ?`)
+    .run(hdr.vendor, hdr.vendor_id, poId);
 }
 
 // ---------- GET ----------

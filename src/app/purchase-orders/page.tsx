@@ -21,6 +21,12 @@ import { packFactor, toPurchaseQty, fmtQtyNum, type PackMeta } from '@/lib/pack-
 // file may import it; never add an import to it. See its header for what a bare
 // .trim() let through on both sides.
 import { normalizeBillNo } from '@/lib/bill-no';
+// THE SERVER'S OWN "are these the same vendor?" — imported so the composer's
+// draft header and the header deriveHeaderVendor() writes on save cannot
+// disagree. @/lib/vendor-mapping has NO runtime imports (its db import is
+// `import type`), which is the only reason a 'use client' file may import it;
+// never add a runtime import to it.
+import { vendorIdentityKey, normalizeVendorName } from '@/lib/vendor-mapping';
 import StockOnHandNote, { StockOnHandLegend } from '@/components/StockOnHandNote';
 import { useStockOnHand, type StockOnHandState } from '@/lib/use-stock-on-hand';
 
@@ -3104,13 +3110,55 @@ function CreatePOModal({ materials, onClose, onCreated }: {
   // rate-basis: purchase (composer PURCHASE units x Rs/purchase-unit)
   const total = items.reduce((s, i) => s + (Number(i.quantity) || 0) * (Number(i.unit_price) || 0), 0);
 
-  // Header derives "Vendor(s) used" from line items so user has a quick visual summary
-  const vendorSummary = (() => {
-    const set = new Set(items.map(i => i.vendor.trim()).filter(Boolean));
-    if (set.size === 0) return null;
-    if (set.size === 1) return [...set][0];
-    return `Mixed (${set.size} vendors)`;
-  })();
+  /* Header derives "Vendor(s) used" from the line items, so the buyer sees now
+     what the saved PO will read.
+     BY VENDOR IDENTITY, WHICH IS vendor_id — the owner's rule, and byte-for-byte
+     what deriveHeaderVendor() writes on save. This used to be
+     `new Set(items.map(i => i.vendor.trim()))`: a NAME set, blind to the id and
+     with no case fold, so one supplier whose lines differ only in the id column
+     — or only in capitals — drafted "Mixed (2 vendors)" for a PO that is one
+     vendor. `vendorIdentityKey` / `normalizeVendorName` are imported from the
+     server's own rule rather than restated, so the draft header and the saved
+     header cannot disagree.
+
+     EVERY STEP BELOW MIRRORS ONE STEP OF THE SERVER, in the same order:
+       · A LINE COUNTS WHEN IT CARRIES A NAME — deriveHeaderVendor's SELECT says
+         `vendor IS NOT NULL AND TRIM(vendor) != ''`, so a line holding only an id
+         is invisible to it. Counting it here would draft "Mixed (2 vendors)" for
+         a PO that saves under one vendor.
+       · id first, name second — `vendorResolver`, exactly.
+       · the name match is `LOWER(TRIM())`, and where two master rows collide on
+         it the server takes `ORDER BY is_active DESC, LENGTH(name) ASC LIMIT 1`.
+         `vendors` here is the ACTIVE list, so that reduces to the shortest name.
+         Mirroring the tie-break (rather than refusing to choose) is what keeps
+         the two answers equal on a master with duplicate names; picking a
+         different row than the server would show a count the save contradicts. */
+  const vendorSummary = useMemo(() => {
+    const byNorm = new Map<string, { id: string; name: string }>();
+    for (const v of vendors) {
+      const k = normalizeVendorName(v.name);
+      if (!k) continue;
+      const prev = byNorm.get(k);
+      if (!prev || String(v.name).length < String(prev.name).length) byNorm.set(k, v);
+    }
+    const seen = new Map<string, string>();
+    for (const it of items) {
+      const rawId   = String(it.vendor_id || '').trim();
+      const rawName = String(it.vendor || '').trim();
+      if (!rawName) continue;
+      const master = (rawId ? vendors.find(v => v.id === rawId) : undefined)
+                  || byNorm.get(normalizeVendorName(rawName));
+      // A line the master list cannot place keys on its own id when it has one,
+      // then on its name — `identityKeyOf` on the server, for the same reason:
+      // two different ids are two different things however they are spelled.
+      const key = master ? vendorIdentityKey({ id: master.id })
+                         : vendorIdentityKey({ id: rawId || null, name: rawName });
+      if (!seen.has(key)) seen.set(key, master?.name || rawName);
+    }
+    if (seen.size === 0) return null;
+    if (seen.size === 1) return [...seen.values()][0];
+    return `Mixed (${seen.size} vendors)`;
+  }, [items, vendors]);
 
   const submit = async () => {
     // Validate PER ROW instead of silently filtering: a blank qty/rate box looks
