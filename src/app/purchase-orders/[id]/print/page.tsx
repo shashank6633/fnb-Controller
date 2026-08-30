@@ -4,6 +4,15 @@ import { useParams } from 'next/navigation';
 import { Printer } from 'lucide-react';
 
 import { fmtIST, fmtISTDate } from '@/lib/format-date';
+// THE ONE SPELLING OF "this receipt is still waiting on the kitchen". Imported,
+// never restated: po-receipts.ts owns the status string and has no runtime
+// imports, which is the only reason a 'use client' file may pull from it (see
+// its header). The PO detail table reads the same predicate, so screen and
+// paper cannot drift apart on what a held line is.
+import { isReceiptHeldForQc } from '@/lib/po-receipts';
+// The same 2-dp rounding the receive route books money with. po-charges.ts has
+// no imports at all, so this is client-safe too.
+import { r2 } from '@/lib/po-charges';
 // Fixed 2 dp, deliberately the same formatter as the /purchase-orders list page,
 // so the same PO reads identically on screen and on paper (max-only would print
 // ₹354 here and ₹354.00 there).
@@ -139,6 +148,90 @@ export default function POPrintPage() {
   // Lines still owed — a mixed PO prints while vendor B is still to come.
   const outstandingLines = (po.items || []).filter((it: any) => it.received_line_total == null).length;
 
+  /* ── LINES WHOSE RECEIPT IS STILL HELD FOR A QUALITY CHECK ────────────────
+     Same derivation as the PO detail table (purchase-orders/page.tsx), because
+     paper and screen must say the same thing about the same delivery. A held
+     GRN has its rows — the goods are in the building and the bill exists — but
+     grn-qc.ts pins quantity_accepted to 0 until the checking department signs,
+     as the ABSENCE of a decision. This sheet used to read that 0 straight into
+     the Received Qty column, so a delivery sitting in the cold room printed
+     "Received 0" on the paper the storekeeper signs.
+       AND NOTHING ARRIVED MEANS NOTHING IS BEING HELD. A line can be ticked
+     into a receipt at quantity 0 — the receive route allows it deliberately
+     and says what it means ("a 0-qty receive books the line as received-and-
+     short forever") — and grn-qc refuses accepted > received, so the checking
+     department can only ever sign 0 on such a line. Its shortfall is SETTLED,
+     not pending; it must keep printing a plain 0. 1e-6 is the receive route's
+     own QTY_EPS, so "did anything arrive" is answered with the ledger's slack. */
+  const HELD_QTY_EPS = 1e-6;
+  const isHeldLine = (it: any) =>
+    it.received_line_total != null
+    && isReceiptHeldForQc(it.received_grn_status)
+    && Number(it.quantity_received || 0) > HELD_QTY_EPS;
+  const heldLines = (po.items || []).filter(isHeldLine);
+  /* What the vendor's bill says the held goods are worth: RECEIVED × the bill's
+     own rate. NOT booked money — nothing is in stock, purchases or average
+     price until sign-off — so it is never added into any total on this sheet,
+     only stated beside them. Rounded per line and then summed, the same way the
+     rows print, so adding the column up gives the footer. */
+  const heldBillValue = r2(heldLines.reduce((s: number, it: any) =>
+    s + r2(Number(it.quantity_received || 0) * Number(it.received_unit_price ?? it.unit_price)), 0));
+  const heldGrns = [...new Set(heldLines.map((it: any) => String(it.received_grn_number || '')).filter(Boolean))];
+
+  /* ── THE PRINTED COLUMN MODEL ─────────────────────────────────────────────
+     The item table is `table-fixed`, and these ARE its columns on paper. It was
+     `auto` before, which lets a table grow past its own container to fit its
+     content: on the owner's 11-line, 2-vendor PO it measured 204mm inside a
+     165mm box, and the whole right-hand "Received ₹" column printed off the
+     edge of the sheet — a signed purchase order with the received value missing.
+     Fixed layout cannot do that: the columns below sum to 100% of the sheet, so
+     the table is exactly as wide as the paper and no column can be pushed off.
+       Percentages, not millimetres, so the same sheet also renders correctly
+     when a browser prints at Letter or with a wider margin.
+       Material carries no width: under `table-fixed` the unsized column takes
+     whatever the sized ones leave, so the longest thing on the sheet — the
+     material name — is the thing that gets the slack, and it wraps rather than
+     shoving a money column off the paper.
+       Each width below is the widest REAL value that column has to hold, at the
+     size it prints, plus its padding: a money column is sized for ₹1,18,731.50
+     (12 characters of a monospaced figure), a rate for ₹5,100.00, a quantity
+     for 1,234.5.
+       A received sheet carries 10 or 11 columns in the width a 7-column ordered
+     sheet has to itself, so it prints a size smaller. Below ~9px a rate stops
+     being readable across a desk, which is why the width came from the page
+     margins and the fixed layout first and from the type size only last. */
+  const denseTable = anyReceived;
+  const showVendorCol = isMixedVendor;
+  /* TWO WIDTH SETS, BECAUSE THERE ARE TWO TYPE SIZES. Sharing one set meant the
+     10px figures fitted and the 12px ones did not: on an ordered-only PO,
+     ₹28,800.00 printed as "₹28,800.0" over "0" while the Material column sat on
+     100mm of the sheet doing nothing with it. Same shape, sized for its own
+     type. */
+  const colWidths: (string | undefined)[] = denseTable ? [
+    // Wide enough for a THREE-digit line number. At 3.2% a 40-line PO printed
+    // its line 22 as "2" over "2" and its line 40 as "4" over "0".
+    '4.2%',                                   // #
+    '7.2%',                                   // SKU
+    undefined,                                // Material — takes the remainder
+    ...(showVendorCol ? ['12.6%'] : []),      // Vendor (mixed-vendor POs only)
+    '7.2%',                                   // Ordered Qty
+    '6.2%',                                   // Unit
+    '9.2%',                                   // Rate (Ord)
+    '11.4%',                                  // Ordered ₹
+    '7.4%',                                   // Received Qty
+    '9.2%',                                   // Rate (Act)
+    '11.4%',                                  // Received ₹
+  ] : [
+    '5%',                                     // #
+    '9%',                                     // SKU
+    undefined,                                // Material — takes the remainder
+    ...(showVendorCol ? ['15%'] : []),        // Vendor (mixed-vendor POs only)
+    '9.5%',                                   // Ordered Qty
+    '8%',                                     // Unit
+    '12%',                                    // Rate (Ord)
+    '13.5%',                                  // Ordered ₹
+  ];
+
   return (
     <div className="min-h-screen bg-gray-100 print:bg-white">
       {/* Toolbar (hidden on print) */}
@@ -150,11 +243,37 @@ export default function POPrintPage() {
         </button>
       </div>
 
-      {/* Print area — A4 sized */}
-      <div className="max-w-[210mm] mx-auto bg-white p-10 my-6 print:my-0 print:shadow-none shadow-lg text-black text-sm">
-        <header className="border-b-2 border-black pb-4 mb-6 flex items-start justify-between">
+      {/* ── THE SHEET ────────────────────────────────────────────────────────
+          ON SCREEN this is an A4 page: 210mm wide with 8mm/10mm of white
+          standing in for the printer's own margin, so the preview is the same
+          194mm of usable width the paper gives and what fits here fits there.
+          ON PAPER the @page rule owns the margin, so the sheet drops its own
+          padding entirely — carrying both cost 21mm of the 186mm the printer
+          offered, and that missing width is why the received money column used
+          to fall off the edge.
+
+          THE SHEET IS NEVER SQUEEZED NARROWER THAN THE PAPER. It used to carry
+          `max-w-full`, which on a phone shrank the 210mm sheet to the viewport
+          and took every table-fixed percentage column down with it — a money
+          column that needs 85px got 41px, and because a FIGURE is deliberately
+          exempt from wrapping (see the numeric rule in the print block below) it
+          overflowed leftwards across its neighbour instead of breaking. Measured
+          on the 11-line fixture at 390px: 88 cells overprinting, worst 44.2px,
+          rendering "₹640.5₹640.50 9". A fixed-geometry document cannot be
+          reflowed to a phone, so it is SCROLLED to one instead: the wrapper below
+          takes the horizontal scroll, which also keeps it off the page body (at
+          794px that used to be 171px of whole-page scroll). Print is untouched —
+          the wrapper goes overflow-visible and the sheet still drops to
+          `w-auto`, so a scroll container can never clip the paper. */}
+      {/* NB: these classNames stay on ONE line each. Turbopack emits a JSX string
+          attribute verbatim into the SSR chunk, so a line break inside it ships
+          a raw newline in a JS string literal and the whole route 500s with
+          "Invalid or unexpected token" — measured, not guessed. */}
+      <div className="overflow-x-auto print:overflow-visible print:m-0 print:p-0">
+      <div data-print-sheet className="w-[210mm] mx-auto bg-white px-[8mm] py-[10mm] my-6 shadow-lg text-black text-sm print:w-auto print:max-w-none print:m-0 print:p-0 print:shadow-none">
+        <header className="border-b-2 border-black pb-3 mb-4 flex items-start justify-between">
           <div>
-            <h1 className="text-3xl font-bold">{biz.name}</h1>
+            <h1 className="text-2xl font-bold">{biz.name}</h1>
             <p className="text-xs text-gray-600 mt-1">PURCHASE ORDER</p>
           </div>
           <div className="text-right">
@@ -177,7 +296,7 @@ export default function POPrintPage() {
           </div>
         </header>
 
-        <section className="grid grid-cols-2 gap-6 mb-6">
+        <section className="grid grid-cols-2 gap-6 mb-4">
           <div>
             <p className="text-[10px] uppercase font-semibold text-gray-600 mb-1">Vendor</p>
             <div className="text-base font-semibold">{po.vendor || '—'}</div>
@@ -204,69 +323,135 @@ export default function POPrintPage() {
           </div>
         </section>
 
-        <table className="w-full text-xs border border-gray-300 mb-6">
+        <table className={`po-sheet-table w-full table-fixed border border-gray-300 mb-4 leading-tight ${denseTable ? 'text-[10px]' : 'text-xs'}`}>
+          <colgroup>
+            {colWidths.map((w, i) => <col key={i} style={w ? { width: w } : undefined} />)}
+          </colgroup>
           <thead className="bg-gray-100">
             <tr>
-              <th className="border border-gray-300 px-2 py-1.5 text-left">#</th>
-              <th className="border border-gray-300 px-2 py-1.5 text-left">SKU</th>
-              <th className="border border-gray-300 px-2 py-1.5 text-left">Material</th>
-              {isMixedVendor && <th className="border border-gray-300 px-2 py-1.5 text-left">Vendor</th>}
-              <th className="border border-gray-300 px-2 py-1.5 text-right">Ordered Qty</th>
+              <th className="border border-gray-300 px-1.5 py-1.5 text-left">#</th>
+              <th className="border border-gray-300 px-1.5 py-1.5 text-left">SKU</th>
+              <th className="border border-gray-300 px-1.5 py-1.5 text-left">Material</th>
+              {isMixedVendor && <th className="border border-gray-300 px-1.5 py-1.5 text-left">Vendor</th>}
+              <th className="border border-gray-300 px-1 py-1.5 text-right">Ordered Qty</th>
               {/* Named outright: every qty + rate on this sheet is in the
-                  PURCHASE unit, so nobody reads a "10" as ten grams. */}
-              <th className="border border-gray-300 px-2 py-1.5 text-left">Unit (purchase)</th>
-              <th className="border border-gray-300 px-2 py-1.5 text-right">Rate (Ord)</th>
-              <th className="border border-gray-300 px-2 py-1.5 text-right">Ordered ₹</th>
+                  PURCHASE unit, so nobody reads a "10" as ten grams. The
+                  qualifier sits on its own line at a smaller size because the
+                  column is only as wide as a unit name needs to be — spelling
+                  "Unit (purchase)" across one line was holding 10mm of the
+                  sheet hostage for a word that is not data. */}
+              <th className="border border-gray-300 px-1.5 py-1.5 text-left">
+                Unit<span className="block font-normal text-[8px] leading-tight text-gray-600">purchase</span>
+              </th>
+              <th className="border border-gray-300 px-1 py-1.5 text-right">Rate (Ord)</th>
+              <th className="border border-gray-300 px-1 py-1.5 text-right">Ordered ₹</th>
               {anyReceived && <>
-                <th className="border border-gray-300 px-2 py-1.5 text-right bg-emerald-50">Received Qty</th>
-                <th className="border border-gray-300 px-2 py-1.5 text-right bg-emerald-50">Rate (Act)</th>
-                <th className="border border-gray-300 px-2 py-1.5 text-right bg-emerald-50">Received ₹</th>
+                <th className="border border-gray-300 px-1 py-1.5 text-right bg-emerald-50">Received Qty</th>
+                <th className="border border-gray-300 px-1 py-1.5 text-right bg-emerald-50">Rate (Act)</th>
+                <th className="border border-gray-300 px-1 py-1.5 text-right bg-emerald-50">Received ₹</th>
               </>}
             </tr>
           </thead>
           <tbody>
             {(po.items || []).map((it: any, i: number) => {
-              const recQty   = it.quantity_accepted ?? it.quantity_received;
-              const recPrice = it.received_unit_price ?? it.unit_price;
-              const recTotal = it.received_line_total ?? (recQty != null ? recQty * recPrice : null);
-              // Highlight cells that actually differ from the order so the
-              // accounting eye lands on the variances immediately.
               // A line nobody has delivered yet has NO received figures at all —
               // `received_line_total` is the API's marker for "matched to a GRN
               // row" — so it must not fall back to the ordered rate and print as
               // though it had arrived at the quoted price.
               const lineIn = it.received_line_total != null;
-              const qtyDiffers   = lineIn && recQty != null && Number(recQty) !== Number(it.quantity);
+              const heldForQc = isHeldLine(it);
+              /* ── THREE STATES IN THE RECEIVED COLUMN, NOT TWO ──────────────
+                   · no GRN row at all   → "—"  (nothing was delivered)
+                   · receipt held for QC → what ARRIVED, marked held
+                   · receipt signed off  → the ACCEPTED quantity, INCLUDING a
+                                           truthful 0 when the kitchen turned
+                                           the whole line away.
+                 This read `quantity_accepted ?? quantity_received` — accepted
+                 FIRST — and 0 is a real value, so `??` never fell through: a
+                 held delivery printed "Received 0" and "₹0.00" against its full
+                 ordered value. The detail screen was fixed in ea817cf and this
+                 sheet then contradicted it on paper. */
+              const recQty   = heldForQc ? it.quantity_received
+                                         : (it.quantity_accepted ?? it.quantity_received);
+              const recPrice = it.received_unit_price ?? it.unit_price;
+              /* On a held line the money shown is the VENDOR'S BILL for what
+                 arrived, not booked money — received_line_total is accepted ×
+                 rate, which is a pinned 0 until the check is signed. It is
+                 labelled as such in the cell and kept out of every total below,
+                 exactly as the detail screen does. */
+              const recTotal = heldForQc
+                ? (recQty != null && recPrice != null ? r2(Number(recQty) * Number(recPrice)) : null)
+                : (it.received_line_total ?? (recQty != null ? recQty * recPrice : null));
+              // Highlight cells that actually differ from the order so the
+              // accounting eye lands on the variances immediately. A held line
+              // is NOT graded on that scale — the number in the cell is a
+              // received quantity, and shading it against the accepted-vs-ordered
+              // legend would mark a decision nobody has made.
+              const qtyDiffers   = !heldForQc && lineIn && recQty != null && Number(recQty) !== Number(it.quantity);
               const priceDiffers = lineIn && recPrice != null && Number(recPrice) !== Number(it.unit_price);
               return (
                 <tr key={it.id}>
-                  <td className="border border-gray-300 px-2 py-1.5">{i + 1}</td>
-                  <td className="border border-gray-300 px-2 py-1.5 font-mono text-[10px]">{it.material_sku || '—'}</td>
-                  <td className="border border-gray-300 px-2 py-1.5">
+                  <td className="border border-gray-300 px-1.5 py-1">{i + 1}</td>
+                  {/* break-WORDS, not break-all. The column is 38.7px of
+                      content and a 9-character SKU needs about 53, so it always
+                      wraps; the question is only where. `break-all` breaks at
+                      any character and gave MAT-006 / 36 and MEAT-MU / T-OFFAL,
+                      which a storekeeper cannot reassemble by eye.
+                      `overflow-wrap: break-word` takes the hyphen it is already
+                      offered first — MAT- / 00636 — and only splits mid-token
+                      when a segment genuinely cannot fit. */}
+                  <td className="border border-gray-300 px-1.5 py-1 font-mono text-[9px] break-words">{it.material_sku || '—'}</td>
+                  <td className="border border-gray-300 px-1.5 py-1 break-words">
                     {it.material_name}
                     {anyReceived && (it.quantity_rejected || 0) > 0 && (
-                      <div className="text-[10px] text-red-700 mt-0.5">
+                      <div className="text-[9px] text-red-700 mt-0.5">
                         Rejected: {qty(it.quantity_rejected)} {it.material_purchase_unit || it.material_unit}
                         {it.rejection_reason && <span className="capitalize"> ({it.rejection_reason.replace(/_/g, ' ')})</span>}
                       </div>
                     )}
                   </td>
-                  {isMixedVendor && <td className="border border-gray-300 px-2 py-1.5">{it.vendor || '—'}</td>}
-                  <td className="border border-gray-300 px-2 py-1.5 text-right font-mono">{qty(it.quantity)}</td>
+                  {/* A size down: this column repeats the SAME long trading
+                      name on every line, and at the table's own size it wrapped
+                      to five lines and made a 10mm row 21mm tall — which is what
+                      pushed an 11-line PO onto a second sheet, and a 40-line one
+                      onto a third whose only other content was the signature
+                      block. Two lines is the target, and it is what decides how
+                      many sheets a long PO takes. The name is printed IN FULL
+                      and unabbreviated; only the type is smaller, and the vendor
+                      bills table below carries it at full size against the
+                      invoice number.
+                      MEASURED: the size DOES decide the sheet count, so do not
+                      put it back up without re-measuring on a long PO. The
+                      absolute figures depend on the fixture and the earlier
+                      "8px prints on TWO sheets" note does not reproduce — on a
+                      40-line, 2-vendor, 2-receipt PO the shipped 8px prints on
+                      THREE sheets (HEAD's layout printed the same PO on four).
+                      Re-run the fixture; do not trust a remembered number. */}
+                  {isMixedVendor && <td className="border border-gray-300 px-1.5 py-1 break-words text-[8px] leading-tight">{it.vendor || '—'}</td>}
+                  <td className="border border-gray-300 px-1 py-1 text-right font-mono">{qty(it.quantity)}</td>
                   {/* PO qty/rate are in the PURCHASE unit (kg, BTL, CASE), not
                       the recipe unit (g, ml) — the vendor orders in the former. */}
-                  <td className="border border-gray-300 px-2 py-1.5">{it.material_purchase_unit || it.material_unit}</td>
-                  <td className="border border-gray-300 px-2 py-1.5 text-right font-mono">{fmt(it.unit_price)}</td>
-                  <td className="border border-gray-300 px-2 py-1.5 text-right font-mono">{fmt(it.total_price)}</td>
+                  <td className="border border-gray-300 px-1.5 py-1 break-words">{it.material_purchase_unit || it.material_unit}</td>
+                  <td className="border border-gray-300 px-1 py-1 text-right font-mono">{fmt(it.unit_price)}</td>
+                  <td className="border border-gray-300 px-1 py-1 text-right font-mono">{fmt(it.total_price)}</td>
                   {anyReceived && <>
-                    <td className={`border border-gray-300 px-2 py-1.5 text-right font-mono ${qtyDiffers ? 'bg-amber-50 font-semibold' : 'bg-emerald-50/30'}`}>
+                    <td className={`border border-gray-300 px-1 py-1 text-right font-mono ${qtyDiffers ? 'bg-amber-50 font-semibold' : heldForQc ? 'bg-blue-50' : 'bg-emerald-50/30'}`}>
                       {lineIn && recQty != null ? qty(recQty) : '—'}
+                      {/* SAID IN WORDS, not in colour: this sheet is signed off
+                          a mono laser as often as not, and a blue cell that
+                          prints grey says nothing. */}
+                      {heldForQc && (
+                        <span className="block font-sans font-normal text-[8px] leading-tight text-blue-900">held for QC</span>
+                      )}
                     </td>
-                    <td className={`border border-gray-300 px-2 py-1.5 text-right font-mono ${priceDiffers ? 'bg-amber-50 font-semibold' : 'bg-emerald-50/30'}`}>
+                    <td className={`border border-gray-300 px-1 py-1 text-right font-mono ${priceDiffers ? 'bg-amber-50 font-semibold' : heldForQc ? 'bg-blue-50' : 'bg-emerald-50/30'}`}>
                       {lineIn && recPrice != null ? fmt(Number(recPrice)) : '—'}
                     </td>
-                    <td className="border border-gray-300 px-2 py-1.5 text-right font-mono bg-emerald-50/30">
+                    <td className={`border border-gray-300 px-1 py-1 text-right font-mono ${heldForQc ? 'bg-blue-50' : 'bg-emerald-50/30'}`}>
                       {lineIn && recTotal != null ? fmt(Number(recTotal)) : '—'}
+                      {heldForQc && (
+                        <span className="block font-sans font-normal text-[8px] leading-tight text-blue-900">bill value · not booked</span>
+                      )}
                     </td>
                   </>}
                 </tr>
@@ -276,11 +461,23 @@ export default function POPrintPage() {
           <tfoot className="font-bold bg-gray-50">
             <tr>
               {/* +1 for the Vendor column that only a mixed-vendor PO renders. */}
-              <td colSpan={isMixedVendor ? 7 : 6} className="border border-gray-300 px-2 py-2 text-right">Total Ordered</td>
-              <td className="border border-gray-300 px-2 py-2 text-right font-mono">{fmt(orderedSubtotal)}</td>
+              <td colSpan={isMixedVendor ? 7 : 6} className="border border-gray-300 px-1.5 py-1.5 text-right">Total Ordered</td>
+              <td className="border border-gray-300 px-1 py-1.5 text-right font-mono">{fmt(orderedSubtotal)}</td>
               {anyReceived && <>
-                <td colSpan={2} className="border border-gray-300 px-2 py-2 text-right bg-emerald-50">Total Received</td>
-                <td className="border border-gray-300 px-2 py-2 text-right font-mono bg-emerald-50">{fmt(receivedSubtotal)}</td>
+                <td colSpan={2} className="border border-gray-300 px-1.5 py-1.5 text-right bg-emerald-50">Total Received</td>
+                <td className="border border-gray-300 px-1 py-1.5 text-right font-mono bg-emerald-50">
+                  {/* BOOKED money only: this is what has actually entered stock
+                      and cost. A held line's bill value is stated under it
+                      rather than added into it — otherwise the footer would
+                      disagree with the column it totals, since the held rows
+                      above print a bill value the books have not taken up. */}
+                  {fmt(receivedSubtotal)}
+                  {heldLines.length > 0 && (
+                    <span className="block font-sans font-normal text-[8px] leading-tight text-blue-900">
+                      + {fmt(heldBillValue)} held for QC
+                    </span>
+                  )}
+                </td>
               </>}
             </tr>
             {/* Variance only once the PO is CLOSED. On a part-received PO
@@ -288,10 +485,10 @@ export default function POPrintPage() {
                 yet, and printing that as a variance reads as a short delivery. */}
             {isReceived && Math.abs(receivedSubtotal - orderedSubtotal) > 0.01 && (
               <tr className="bg-amber-50">
-                <td colSpan={(anyReceived ? 9 : 6) + (isMixedVendor ? 1 : 0)} className="border border-gray-300 px-2 py-1.5 text-right text-amber-900 text-[11px]">
+                <td colSpan={(anyReceived ? 9 : 6) + (isMixedVendor ? 1 : 0)} className="border border-gray-300 px-1.5 py-1.5 text-right text-amber-900">
                   Variance (Received − Ordered)
                 </td>
-                <td className="border border-gray-300 px-2 py-1.5 text-right font-mono text-amber-900">
+                <td className="border border-gray-300 px-1 py-1.5 text-right font-mono text-amber-900">
                   {receivedSubtotal - orderedSubtotal >= 0 ? '+' : ''}{fmt(receivedSubtotal - orderedSubtotal)}
                 </td>
               </tr>
@@ -302,22 +499,22 @@ export default function POPrintPage() {
                 cost — so it is shown, but not added into the Grand Total. */}
             {anyReceived && billDiscount > 0.005 && (
               <tr>
-                <td colSpan={(anyReceived ? 9 : 6) + (isMixedVendor ? 1 : 0)} className="border border-gray-300 px-2 py-1.5 text-right text-[11px]">
+                <td colSpan={(anyReceived ? 9 : 6) + (isMixedVendor ? 1 : 0)} className="border border-gray-300 px-1.5 py-1 text-right">
                   Less: bill discount
                 </td>
-                <td className="border border-gray-300 px-2 py-1.5 text-right font-mono">− {fmt(billDiscount)}</td>
+                <td className="border border-gray-300 px-1 py-1 text-right font-mono">− {fmt(billDiscount)}</td>
               </tr>
             )}
             {anyReceived && billDelivery > 0.005 && (
               <tr>
-                <td colSpan={(anyReceived ? 9 : 6) + (isMixedVendor ? 1 : 0)} className="border border-gray-300 px-2 py-1.5 text-right text-[11px] text-gray-600">
+                <td colSpan={(anyReceived ? 9 : 6) + (isMixedVendor ? 1 : 0)} className="border border-gray-300 px-1.5 py-1 text-right text-gray-600">
                   Delivery charges (recorded — not in item cost)
                 </td>
-                <td className="border border-gray-300 px-2 py-1.5 text-right font-mono text-gray-600">{fmt(billDelivery)}</td>
+                <td className="border border-gray-300 px-1 py-1 text-right font-mono text-gray-600">{fmt(billDelivery)}</td>
               </tr>
             )}
             <tr className="bg-gray-100">
-              <td colSpan={(anyReceived ? 9 : 6) + (isMixedVendor ? 1 : 0)} className="border border-gray-300 px-2 py-2 text-right uppercase tracking-wider text-[11px]">
+              <td colSpan={(anyReceived ? 9 : 6) + (isMixedVendor ? 1 : 0)} className={`border border-gray-300 px-1.5 py-1.5 text-right uppercase tracking-wider ${denseTable ? '' : 'text-[11px]'}`}>
                 {/* The label has to match what the number IS. A part-received PO
                     is not "Final" — that word on a figure covering one of three
                     vendors is exactly how the wrong total got reconciled before. */}
@@ -327,7 +524,12 @@ export default function POPrintPage() {
                     ? `(Received so far${outstandingLines ? ` — ${outstandingLines} line${outstandingLines > 1 ? 's' : ''} still to come` : ''})`
                     : '(Ordered)'}
               </td>
-              <td className="border border-gray-300 px-2 py-2 text-right font-mono text-[13px]">{fmt(grandTotal)}</td>
+              {/* The grand total sits in a money column sized for 12 mono
+                  characters at the table's own size. Printing it a size LARGER,
+                  as it was, is exactly how ₹1,18,731.50 would push itself out of
+                  its cell and off the sheet; the bold weight and the shaded row
+                  are what make it the figure the eye lands on. */}
+              <td className={`border border-gray-300 px-1 py-1.5 text-right font-mono ${denseTable ? '' : 'text-[13px]'}`}>{fmt(grandTotal)}</td>
             </tr>
           </tfoot>
         </table>
@@ -341,7 +543,7 @@ export default function POPrintPage() {
             receive route accumulates into purchase_orders.total_cost, so the
             column sums to the Grand Total above. */}
         {receipts.length > 0 && (
-          <section className="mb-6 -mt-4">
+          <section className="mb-4 -mt-2">
             <p className="text-[10px] uppercase font-semibold text-gray-600 mb-1">
               Vendor bills received ({liveReceipts.length})
               {voidedReceipts > 0 && (
@@ -350,49 +552,80 @@ export default function POPrintPage() {
                 </span>
               )}
             </p>
-            <table className="w-full text-[11px] border border-gray-300">
+            {/* Fixed columns here too, for the same reason as the item table:
+                "Discount ₹" was wrapping onto two lines while the vendor name
+                took whatever it liked, and an auto table's idea of a good
+                column split changes with every PO printed. */}
+            <table className="po-sheet-table w-full table-fixed text-[10px] border border-gray-300">
+              <colgroup>
+                <col /><col style={{ width: '14.5%' }} /><col style={{ width: '10.5%' }} />
+                <col style={{ width: '13.5%' }} /><col style={{ width: '10.5%' }} />
+                <col style={{ width: '12.5%' }} /><col style={{ width: '10.5%' }} /><col style={{ width: '12.5%' }} />
+              </colgroup>
               <thead className="bg-gray-100">
                 <tr>
-                  <th className="border border-gray-300 px-2 py-1 text-left">Vendor</th>
-                  <th className="border border-gray-300 px-2 py-1 text-left">Bill no.</th>
-                  <th className="border border-gray-300 px-2 py-1 text-left">Bill date</th>
-                  <th className="border border-gray-300 px-2 py-1 text-left">GRN</th>
-                  <th className="border border-gray-300 px-2 py-1 text-left">Received</th>
-                  <th className="border border-gray-300 px-2 py-1 text-right">Gross ₹</th>
-                  <th className="border border-gray-300 px-2 py-1 text-right">Discount ₹</th>
-                  <th className="border border-gray-300 px-2 py-1 text-right">Net ₹</th>
+                  <th className="border border-gray-300 px-1.5 py-1 text-left">Vendor</th>
+                  <th className="border border-gray-300 px-1.5 py-1 text-left">Bill no.</th>
+                  <th className="border border-gray-300 px-1.5 py-1 text-left">Bill date</th>
+                  <th className="border border-gray-300 px-1.5 py-1 text-left">GRN</th>
+                  <th className="border border-gray-300 px-1.5 py-1 text-left">Received</th>
+                  <th className="border border-gray-300 px-1.5 py-1 text-right">Gross ₹</th>
+                  <th className="border border-gray-300 px-1.5 py-1 text-right">Discount ₹</th>
+                  <th className="border border-gray-300 px-1.5 py-1 text-right">Net ₹</th>
                 </tr>
               </thead>
               <tbody>
-                {receipts.map(r => (
+                {receipts.map(r => {
+                  /* A HELD BILL IS WORTH ₹0 IN THIS TABLE AND IT IS NOT WORTH
+                     ₹0. Gross and Net are accepted × rate, and a receipt waiting
+                     on the kitchen has its accepted quantity pinned to 0, so the
+                     bill prints as a row of zeroes with no explanation — beside
+                     item lines that now (correctly) show what arrived. Named
+                     here so the two halves of the sheet agree. */
+                  const held = !r.is_void && isReceiptHeldForQc(r.status);
+                  return (
                   <tr key={r.grn_id} className={r.is_void ? 'line-through text-gray-400' : undefined}>
-                    <td className="border border-gray-300 px-2 py-1">
+                    <td className="border border-gray-300 px-1.5 py-1 break-words">
                       {r.vendor || '—'}
                       {r.is_void && <span className="no-underline ml-1 font-semibold">(VOID)</span>}
                     </td>
-                    <td className="border border-gray-300 px-2 py-1 font-mono">{r.bill_no || '—'}</td>
-                    <td className="border border-gray-300 px-2 py-1">{r.bill_date ? dt(r.bill_date) : '—'}</td>
-                    <td className="border border-gray-300 px-2 py-1 font-mono">{r.grn_number}</td>
-                    <td className="border border-gray-300 px-2 py-1">{dt(r.date)}</td>
-                    <td className="border border-gray-300 px-2 py-1 text-right font-mono">{fmt(r.gross)}</td>
-                    <td className="border border-gray-300 px-2 py-1 text-right font-mono">
+                    <td className="border border-gray-300 px-1.5 py-1 font-mono break-all">{r.bill_no || '—'}</td>
+                    <td className="border border-gray-300 px-1.5 py-1">{r.bill_date ? dt(r.bill_date) : '—'}</td>
+                    <td className="border border-gray-300 px-1.5 py-1 font-mono break-all">{r.grn_number}</td>
+                    <td className="border border-gray-300 px-1.5 py-1">{dt(r.date)}</td>
+                    <td className="border border-gray-300 px-1.5 py-1 text-right font-mono">{fmt(r.gross)}</td>
+                    <td className="border border-gray-300 px-1.5 py-1 text-right font-mono">
                       {Number(r.discount) > 0.005 ? `− ${fmt(r.discount)}` : '—'}
                     </td>
-                    <td className="border border-gray-300 px-2 py-1 text-right font-mono">{fmt(r.net)}</td>
+                    <td className="border border-gray-300 px-1.5 py-1 text-right font-mono">
+                      {fmt(r.net)}
+                      {held && (
+                        <span className="block font-sans font-normal text-[8px] leading-tight text-blue-900">held for QC</span>
+                      )}
+                    </td>
                   </tr>
-                ))}
+                  );
+                })}
               </tbody>
               <tfoot className="font-bold bg-gray-50">
                 <tr>
-                  <td colSpan={7} className="border border-gray-300 px-2 py-1 text-right">
+                  <td colSpan={7} className="border border-gray-300 px-1.5 py-1 text-right">
                     Total received {isReceived ? '(all vendors)' : 'so far'}
                   </td>
-                  <td className="border border-gray-300 px-2 py-1 text-right font-mono">
+                  <td className="border border-gray-300 px-1.5 py-1 text-right font-mono">
                     {fmt(receivedNet ?? liveReceipts.reduce((s, r) => s + Number(r.net || 0), 0))}
                   </td>
                 </tr>
               </tfoot>
             </table>
+            {heldLines.length > 0 && (
+              <p className="text-[9px] text-blue-900 mt-1">
+                {heldGrns.join(', ') || 'One receipt'} {heldLines.length === 1 ? 'has 1 line' : `has ${heldLines.length} lines`} held
+                for a quality check: the goods are in and the bill is recorded, but no stock has been added and the accepted
+                quantity is not decided yet. {fmt(heldBillValue)} of vendor bill value sits outside every total on this sheet
+                until the check is signed off.
+              </p>
+            )}
             {billDelivery > 0.005 && (
               <p className="text-[10px] text-gray-600 mt-1">
                 Delivery charges of {fmt(billDelivery)} were recorded against these bills and are NOT included above —
@@ -408,13 +641,19 @@ export default function POPrintPage() {
         )}
 
         {po.notes && (
-          <section className="mb-6">
+          <section className="po-sheet-notes mb-4">
             <p className="text-[10px] uppercase font-semibold text-gray-600 mb-1">Notes</p>
             <p className="text-xs whitespace-pre-line">{po.notes}</p>
           </section>
         )}
 
-        <footer className="grid grid-cols-2 gap-12 pt-12 mt-12 border-t border-gray-300">
+        {/* THE SIGNATURE BLOCK MUST NOT BREAK, AND MUST NOT GO IT ALONE.
+            `break-inside: avoid` (in the print rules below) keeps the two rules
+            and their captions on one page; the standing room above them is cut
+            from 48px+48px to 24px+20px on paper, which is what stops a sheet
+            that ends near the foot of a page from pushing the whole block onto
+            a second one with nothing else on it. */}
+        <footer className="po-sheet-signoff grid grid-cols-2 gap-12 pt-8 mt-6 border-t border-gray-300 print:pt-5 print:mt-4">
           <div>
             <div className="border-t border-gray-700 pt-1 text-xs text-center">Authorised Signatory</div>
           </div>
@@ -423,11 +662,81 @@ export default function POPrintPage() {
           </div>
         </footer>
       </div>
+      </div>
 
       <style jsx global>{`
         @media print {
-          @page { size: A4; margin: 12mm; }
+          /* A4, with a narrow SIDE margin and a deeper foot.
+             12mm all round left 186mm of paper, of which the sheet's own p-10
+             padding took another 21mm — 165mm for eleven columns, which is how
+             the received money column ended up printed off the edge. 8mm sides
+             give the table 194mm and still clear the non-printable border of an
+             office laser (typically 4–5mm). The foot stays deeper so the
+             signature rules never sit on the very edge of the sheet. */
+          @page { size: A4; margin: 10mm 8mm 12mm; }
           body { background: white !important; }
+
+          /* A tbody row that splits across a page break puts a material name on
+             one sheet and its money on the next. */
+          .po-sheet-table tr { break-inside: avoid; page-break-inside: avoid; }
+          /* The column headings repeat at the top of every page of a long PO —
+             this is the browser default for thead, restated because the same
+             default makes tfoot repeat at the FOOT of every page, and a "Grand
+             Total" printed under page 1 of a 3-page order, above forty more
+             lines that are also in it, is a figure someone will key into a
+             ledger. table-row-group prints the totals once, where they belong. */
+          .po-sheet-table thead { display: table-header-group; }
+          .po-sheet-table tfoot { display: table-row-group; }
+          /* Keep the totals block together with itself. */
+          .po-sheet-table tfoot tr { break-inside: avoid; page-break-inside: avoid; }
+          .po-sheet-signoff { break-inside: avoid; page-break-inside: avoid; }
+          /* And the notes with them: a page carrying only the word NOTES and
+             two signature rules is a wasted sheet in the file. */
+          .po-sheet-notes { break-inside: avoid; page-break-inside: avoid; }
+
+          /* Nothing on this sheet may be wider than the sheet. A long material
+             name, a 20-character SKU or a ₹1,18,731.50 has to wrap inside its
+             own column — under a fixed table layout an unbreakable string would
+             otherwise hang out over the edge of the paper.
+             DATA CELLS ONLY. Applied to the headings as well, this splits
+             "Ordered Qty" into "Ordere / d Qty" and "purchase" into "purchas /
+             e" — Chrome takes the licence the moment a word is close to the
+             column width, not only when it genuinely cannot fit. Headings break
+             between words like ordinary prose. */
+          .po-sheet-table td { overflow-wrap: anywhere; }
+          .po-sheet-table th { overflow-wrap: normal; word-break: normal; }
+
+          /* ...BUT A NUMBER IS NOT A WORD, AND MUST NOT BE BROKEN INSIDE.
+             The rule above is what stops a long material name hanging off the
+             paper. Applied to a FIGURE it does something worse than overflow —
+             it splits the figure itself, because "anywhere" needs no break
+             opportunity and a digit group offers none. Measured on a
+             seven-figure PO: the money column holds 73.4px of content,
+             ₹10,47,420.59 needs 77.8px, and the sheet printed
+                 GRAND TOTAL (FINAL, NET OF DISCOUNT)   ₹72,47,862.8
+                                                        1
+             — the most important number on a signed purchase order, carried
+             onto a second line. Also seen: ₹60,00,000.0 / 0 and 12,345. / 75.
+             Thresholds are real, not theoretical: money >= ₹10,00,000, rate >=
+             ₹10,000, discount >= ₹1,00,000, quantity >= 10,000.
+             The cure is to put these cells back to NORMAL wrapping, NOT to
+             nowrap them. Normal still breaks where the text genuinely offers a
+             break — which is why "− ₹1,25,000.00" keeps splitting after its
+             minus sign, harmlessly, as it always did — and never inside a digit
+             group. Forbidding the break outright was tried and is worse: it
+             drove the vendor-bills Discount figure 20px into the Net column and
+             printed the two totals on top of each other.
+             A figure with nowhere to break now overflows instead of splitting,
+             and since every one of these cells is text-right it overflows
+             LEFTWARDS — into its own padding, away from the paper edge — so the
+             alignment fix this file exists for cannot be undone by it.
+             THE SELECTOR IS THE CONTRACT: text-right AND font-mono together is
+             exactly the set of numeric cells. The SKU and the bill-number cells
+             are font-mono but LEFT-aligned and MUST keep breaking anywhere,
+             which is why the mono class alone is not enough.
+             (No backticks in this block: it lives inside a styled-jsx template
+             literal and one would end the string.) */
+          .po-sheet-table td.text-right.font-mono { overflow-wrap: normal; word-break: normal; }
         }
       `}</style>
     </div>

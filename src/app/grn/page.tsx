@@ -8,8 +8,21 @@
 import { useEffect, useMemo, useRef, useState, Fragment, type ReactNode, type WheelEvent as ReactWheelEvent } from 'react';
 import { FileCheck, ChevronDown, ChevronRight, Loader2, Plus, Trash2, X, Save, Download, Percent,
          Eye, Pencil, Printer, AlertTriangle, ChefHat, Wine, Clock, ShieldAlert, Info,
-         CheckCircle2, ShieldQuestion, Receipt, Link2, Banknote } from 'lucide-react';
+         CheckCircle2, ShieldQuestion, Receipt, Link2, Banknote, GitCompareArrows } from 'lucide-react';
 import { api } from '@/lib/api';
+/* THE OFF-PO ALERT'S OWN VOCABULARY — types and pure formatters, from a module
+   that imports NOTHING (the same constraint line-dedupe.ts carries, and for the
+   same reason: po-deviation-alerts.ts, where the reading lives, reaches
+   better-sqlite3 and must never be pulled into the browser bundle).
+   deviationHeadline / deviationMoneySummary are the ONLY sanctioned way to put
+   a net figure on screen — they will not print one except after the axis counts
+   and the gross pair. See that file's header for why that rule exists. */
+import {
+  type GrnDeviationAlert, deviationHeadline, deviationAxisSummary,
+  deviationRowBadgeText, deviationRowTooltip,
+  deviationLineWhat, signedMoney, plainMoney, isMoneyMove, rollUpDeviationCounts,
+  deviationChipParts, isChargesOnly,
+} from '@/lib/po-deviation-format';
 // THE duplicate rule — one material = one line — lives in exactly one module.
 // src/lib/line-dedupe.ts imports NOTHING, which is the only reason a 'use client'
 // page may touch it: po-helpers.ts, where this rule used to live alone, reaches
@@ -601,6 +614,102 @@ export default function GrnPage() {
     return () => { alive = false; };
   }, [dataVersion]);
 
+  /* ── THE OFF-PO ALERTS, WHICH NOBODY HAS EVER SEEN ─────────────────────────
+   * Every line that arrived differently from the approved PO — short, over,
+   * arrived-but-not-accepted, or at a changed rate — has ALWAYS raised an alert
+   * at the receiving desk: an audit_event, a `notifications` row and an optional
+   * Slack ping. Seventeen of those rows sit in the live database — all of them
+   * BILL-DISCOUNT-ONLY, so what this register shows today is "Bill charges ·
+   * discount" seventeen times; the off-PO line path is covered by fixtures, not
+   * by live rows (evidence note in src/lib/po-deviation-alerts.ts). Nothing on
+   * this register, on the detail panel, or in the bell has ever read one, so a
+   * receipt that came in 9× over and one that never came at all both looked
+   * exactly like an ordinary delivery.
+   *
+   * ONE CALL FOR THE WHOLE PAGE, exactly like the QC context above — the row
+   * must not fetch its own badge or the list would fire a request per receipt
+   * and the badges would appear one at a time.
+   *
+   * WHY NOT COMPUTE IT HERE, from the PO and the GRN lines: because the
+   * receive route already decided. It applied the tolerances (QTY_EPS,
+   * RATE_EPS), it classified each line on four axes, it computed the money on
+   * ACCEPTED (rejected units are never paid for), and it captured the reason the
+   * receiver was made to type. A second implementation on this page would
+   * disagree with the alert the admin was actually sent, and the alert is the
+   * one that is right.
+   *
+   * Failure is silent by design: a null context simply means no badges, and the
+   * register renders exactly as it did before this feature existed.
+   */
+  const [devAlerts, setDevAlerts] = useState<Record<string, GrnDeviationAlert[]>>({});
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const qs = new URLSearchParams({ from, to });
+        const d = await fetch(`/api/grn/deviations?${qs}`).then(r => (r.ok ? r.json() : null));
+        if (!alive) return;
+        setDevAlerts(d && d.alerts && typeof d.alerts === 'object' ? d.alerts : {});
+      } catch { if (alive) setDevAlerts({}); }
+    })();
+    return () => { alive = false; };
+  }, [from, to, dataVersion]);
+
+  /* ── "SHOW ME ONLY THE ONES THAT CAME IN WRONG" ────────────────────────────
+   * A CLIENT-SIDE narrowing of the rows already fetched, unlike the status and
+   * source pickers which are server-side (?status=, ?source=). It has to be:
+   * the deviation lives in `notifications` / `audit_events`, not on the GRN row,
+   * so /api/grn cannot filter on it without joining two tables it has no other
+   * reason to know about — and this lane must not reshape that route.
+   *
+   * The consequence is stated on screen rather than hidden: the ₹ counters and
+   * the Inward Register download keep describing the SERVER's slice (the dates,
+   * the status, the source), not this narrowing. A filter that quietly changed
+   * what a downloaded register contained would be the worse bug.
+   *
+   * Seeded from ?deviations=1 so the bell's bucket deep-links straight into it,
+   * then stripped from the URL so a refresh or a Back does not silently
+   * re-narrow a register the reader has since widened.
+   *
+   * ── WHY THIS WATCHES THE ADDRESS BAR INSTEAD OF READING IT ONCE ───────────
+   * MEASURED, not theorised. The bell (CaptainAlertsProvider) navigates with
+   * router.push('/grn?deviations=1'). When the reader is ALREADY standing on
+   * /grn — which is exactly where somebody reviewing receipts is — that is a
+   * same-route query change, and the App Router does NOT remount this
+   * component: a mount-time read never re-runs, the filter never turns on, and
+   * the bell appears to do nothing. That is the same "nothing tells a human"
+   * failure this whole feature exists to end, so it cannot be shipped inside
+   * the fix for it. Observed live before this loop was added: 37 rows, no
+   * banner, no narrowing.
+   *
+   * NOT useSearchParams: the hook would put this entire 6,000-line page under a
+   * Suspense boundary, which the ?new=1 read above and /vendors/materials both
+   * deliberately avoid. usePathname() is no help — the PATH does not change.
+   * There is no public router-change event, so the address bar itself is the
+   * signal. The cost is one string comparison twice a second while this page is
+   * open, which is nothing next to the two fetches it already polls.
+   */
+  const [devOnly, setDevOnly] = useState(false);
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const check = () => {
+      const q = new URLSearchParams(window.location.search);
+      if (q.get('deviations') !== '1') return;
+      setDevOnly(true);
+      q.delete('deviations');
+      const qs = q.toString();
+      window.history.replaceState(null, '', window.location.pathname + (qs ? `?${qs}` : ''));
+    };
+    // One tick's delay on the FIRST read, for the same reason ?new=1 defers its
+    // strip: the App Router re-syncs the address bar to its own route state
+    // after this effect commits, so a replaceState called inline is overwritten
+    // and the flag stays in the URL.
+    const first = setTimeout(check, 0);
+    const t = setInterval(check, 500);
+    return () => { clearTimeout(first); clearInterval(t); };
+  }, []);
+  const alertsFor = (id: string): GrnDeviationAlert[] => devAlerts[id] || [];
+
   /** ONLY THE NEWEST REQUEST MAY PAINT. There are now three pickers firing this
    *  (dates, status, source) plus every post-write refresh, and two clicks in
    *  quick succession are two fetches racing: without this the SLOWER one can
@@ -742,6 +851,25 @@ export default function GrnPage() {
   /** Overdue is the SERVER's judgement (it owns the threshold) — never guessed
    *  locally, so a row can never be red here and calm on the queue. */
   const isOverdue = (g: GRN) => qcCtx?.rows[g.id]?.overdue === true;
+
+  /** The receipts IN THE CURRENT VIEW that carry an off-PO alert. */
+  const devHere = useMemo(() => list.filter(g => (devAlerts[g.id] || []).length > 0), [list, devAlerts]);
+  /** THE ROLL-UP FOR THE COUNTER CHIP — per-AXIS counts, and NO rupee total.
+   *  A cross-document ₹ figure is the owner's own complaint one level up: one
+   *  GRN +₹820 over and another −₹820 short would roll to a tidy ₹0 across the
+   *  register and hide both. Counts do not cancel, so counts are what a
+   *  one-line chip carries; the rupees, always with their gross pair, live on
+   *  the row that produced them. rollUpDeviationCounts refuses to total money
+   *  for exactly this reason. */
+  const devRoll = useMemo(
+    () => rollUpDeviationCounts(devHere.flatMap(g => devAlerts[g.id] || [])),
+    [devHere, devAlerts],
+  );
+  /** What the table actually renders. `devOnly` narrows in the BROWSER (see the
+   *  state's own note) — every server-side counter above still describes the
+   *  unnarrowed slice, which the chip says out loud rather than leaving to be
+   *  discovered. */
+  const shown = devOnly ? devHere : list;
 
   return (
     <div className="p-6 max-w-7xl mx-auto space-y-5">
@@ -936,6 +1064,34 @@ export default function GrnPage() {
               ⏱ {counts.awaiting_qc} awaiting QC · <b className="font-mono">{fmt(counts.awaiting_value)}</b>
             </span>
           )}
+          {/* ── RECEIVED OFF-PO ────────────────────────────────────────────
+              Sits beside the QC counter because it answers the same shape of
+              question — "which of these needs a human?" — and it is the one
+              exception counter whose fact is not a status column.
+              COUNTS, NEVER A NET: the chip says "2 off-PO · 1 over, 1 short",
+              not a rupee figure, because a +₹820 over and a −₹820 short cancel
+              to ₹0 and that single tidy number is exactly what hid a 9× over-
+              receipt and a total non-delivery on PO-2026-0028. The money, with
+              its gross pair, is on each row. */}
+          {devRoll.grns > 0 && (
+            <button type="button" onClick={() => setDevOnly(v => !v)}
+              title={`${devRoll.grns} ${devRoll.grns === 1 ? 'receipt' : 'receipts'} in this range raised an alert at the receiving desk`
+                + `${deviationAxisSummary(devRoll) ? ` — ${deviationAxisSummary(devRoll)} across ${devRoll.lines} line(s)` : ''}`
+                // discount_only is per RECEIPT and disjoint from off_po, so this
+                // sentence can no longer call a receipt that came in over
+                // "arrived exactly as ordered" just because it was later
+                // discounted. See rollUpDeviationCounts.
+                + `${devRoll.discount_only > 0 ? `, and ${devRoll.discount_only} arrived exactly as ordered but carried bill charges that moved the cost` : ''}`
+                + `${devRoll.unclassified > 0 ? `, and ${devRoll.unclassified} raised an alert whose line detail could not be read back` : ''}.`
+                + ' No rupee total is shown here on purpose: an over and a short of the same size cancel to zero and hide each other.'
+                + ' Expand a row for the ordered-vs-received detail and the value impact.'
+                + (devOnly ? ' Click to show every receipt again.' : ' Click to show only these.')}
+              className={`inline-flex items-center gap-1 rounded border px-1.5 py-0.5 ${
+                devOnly ? 'border-[#af4408] bg-[#af4408] text-white' : 'border-amber-300 bg-amber-50 text-amber-900 hover:bg-amber-100'}`}>
+              <GitCompareArrows className="w-3 h-3" />
+              {deviationChipParts(devRoll).join(' · ')}
+            </button>
+          )}
           <span className="text-amber-700">⚠ {counts.partial}</span>
           <span className="text-red-700">✗ {counts.rejected}</span>
           {counts.void > 0 && <span className="text-[#8B7355]" title={"Voided bills — their stock and cost rows were reversed, so they are excluded from the Σ beside this AND from the Inward Register download. Pick the 'void' filter to list them, or use a row's own Download to get one." + sliceNote}>⊘ {counts.void} void</span>}
@@ -943,19 +1099,52 @@ export default function GrnPage() {
         </div>
       </div>
 
+      {/* ── OFF-PO NARROWING: SAID OUT LOUD, WITH ITS ONE HONEST CAVEAT ──────
+          Unlike Status and Source, this one filters in the BROWSER (see the
+          devOnly state) — so the ₹ counters above and the Inward Register
+          download still describe the server's slice. That is a real difference
+          in behaviour between two pickers that look alike, so it is printed
+          rather than left to be discovered by somebody reconciling a download
+          against a screen. The counts are repeated here per axis, never netted. */}
+      {devOnly && (
+        <div className="rounded-xl border border-amber-300 bg-amber-50 px-3 py-2 text-[11px] text-amber-900 flex items-start gap-2 flex-wrap">
+          <GitCompareArrows className="w-3.5 h-3.5 shrink-0 mt-px" />
+          <span className="flex-1 min-w-[16rem]">
+            Showing only the <b>{devHere.length}</b> {devHere.length === 1 ? 'receipt' : 'receipts'} that raised an alert at the receiving desk —
+            {' '}<b>{deviationChipParts(devRoll).join(' · ') || 'flagged for review'}</b>
+            {devRoll.lines > 0 ? <> across {devRoll.lines} line{devRoll.lines === 1 ? '' : 's'}</> : null}.
+            {' '}The counters and the <em>Inward Register</em> download above still cover all <b>{list.length}</b> receipts in this date range — this narrowing is on screen only.
+          </span>
+          <button type="button" onClick={() => setDevOnly(false)}
+                  className="shrink-0 px-2 py-1 rounded border border-current bg-white/70 hover:bg-white font-semibold">
+            Show all {list.length}
+          </button>
+        </div>
+      )}
+
       <div className="bg-white border border-[#E8D5C4] rounded-xl overflow-hidden">
         {loading ? (
           <div className="p-8 text-center text-sm text-[#8B7355]"><Loader2 className="w-5 h-5 animate-spin inline mr-2" /> Loading…</div>
-        ) : list.length === 0 ? (
+        ) : shown.length === 0 ? (
           <div className="p-8 text-center text-sm text-[#8B7355]">
             {/* The stock message says GRNs "are created when you receive a PO",
                 which is exactly the wrong sentence to show somebody who has just
                 filtered to DIRECT — the bills that by definition have no PO. */}
-            {sourceFilter === 'direct'
-              ? <>No direct bills in this range. Press <em>Enter Vendor Bill</em> for one typed by hand, or switch Source to <em>All</em>.</>
-              : sourceFilter === 'po'
-                ? <>No PO-sourced receipts in this range. Switch Source to <em>All</em> to see the direct bills too.</>
-                : <>No GRNs in this range. They&apos;re created automatically when you receive a PO.</>}
+            {/* THE OFF-PO NARROWING GETS ITS OWN EMPTY STATE, and it comes
+                FIRST: arriving from the bell into "No GRNs in this range" would
+                read as a broken deep link, when in fact the alert is real and
+                simply older than the dates above. It names the filter that is
+                hiding the rows and offers the way out, rather than leaving a
+                reader to work out which of four pickers emptied the screen. */}
+            {devOnly
+              ? <>No receipt in this range came in off its purchase order.{' '}
+                  <button type="button" onClick={() => setDevOnly(false)} className="underline text-[#af4408] font-semibold">Show every receipt</button>
+                  , or widen the dates above — an alert fires the day the goods are booked, and the register is filtered by the delivery date.</>
+              : sourceFilter === 'direct'
+                ? <>No direct bills in this range. Press <em>Enter Vendor Bill</em> for one typed by hand, or switch Source to <em>All</em>.</>
+                : sourceFilter === 'po'
+                  ? <>No PO-sourced receipts in this range. Switch Source to <em>All</em> to see the direct bills too.</>
+                  : <>No GRNs in this range. They&apos;re created automatically when you receive a PO.</>}
           </div>
         ) : (
           <div className="overflow-x-auto">
@@ -995,11 +1184,12 @@ export default function GrnPage() {
               </tr>
             </thead>
             <tbody>
-              {list.map(g => (
+              {shown.map(g => (
                 <GrnRow key={g.id} g={g} expanded={expanded === g.id}
                         onToggle={() => setExpanded(expanded === g.id ? null : g.id)}
                         isAdmin={isAdmin} canAmend={canAmend} dataVersion={dataVersion}
                         onEdit={() => setEditing(g)} onVoid={() => setVoiding(g)}
+                        deviations={alertsFor(g.id)}
                         waitHours={waitHours(g)} overdue={isOverdue(g)}
                         escalationHours={qcCtx?.escalationHours ?? null}
                         canSignQc={qcCtx?.rows[g.id]?.can_sign === true}
@@ -1139,10 +1329,14 @@ function GrnActions({ g, isAdmin, canAmend, expanded, onToggle, onEdit, onVoid, 
 }
 
 function GrnRow({ g, expanded, onToggle, isAdmin, canAmend, dataVersion, onEdit, onVoid,
-                  waitHours, overdue, escalationHours, canSignQc, canOverrideQc, onOverride }: {
+                  deviations, waitHours, overdue, escalationHours, canSignQc, canOverrideQc, onOverride }: {
   g: GRN; expanded: boolean; onToggle: () => void;
   isAdmin: boolean | null; canAmend: boolean | null; dataVersion: number;
   onEdit: () => void; onVoid: () => void;
+  /** Off-PO alerts already raised for THIS receipt, newest first. Empty on an
+   *  ordinary delivery, and then nothing about this feature renders — a badge
+   *  on every row would be worth exactly as much as a badge on none. */
+  deviations: GrnDeviationAlert[];
   /** Hours this receipt has waited for its check, or null when unknowable. */
   waitHours: number | null;
   overdue: boolean;
@@ -1193,6 +1387,18 @@ function GrnRow({ g, expanded, onToggle, isAdmin, canAmend, dataVersion, onEdit,
   const strike = isVoid ? 'line-through decoration-[#8B7355]' : '';
   const editCount = Number(g.edit_count) || 0;
   const held = isHeld(g);
+  /* ── THE OFF-PO ALERTS ON THIS RECEIPT ───────────────────────────────────
+     The row caption and its tooltip describe the RECEIPT, rolled up across
+     every alert on it — not the newest alert alone. The newest is often the
+     benign one (a bill correction raises a second alert AFTER the goods were
+     booked), and rendering it alone put "Bill charges · discount" on a receipt
+     that came in 15 kg over, and "1 rate change" on one that came in 3 lines
+     over. The roll-up is per AXIS and never a netted rupee figure; the panel
+     below still prints every alert in full, and agrees with this caption
+     because both read rollUpDeviationCounts. */
+  const devAll = Array.isArray(deviations) ? deviations : [];
+  const dev = devAll[0] || null;
+  const devRollRow = devAll.length ? rollUpDeviationCounts(devAll) : null;
   /** Who owes the check on THIS receipt, read off the row's own qc_checker —
    *  never guessed. Unset (a receipt from before the gate) falls back to
    *  "Kitchen", which is what the server's own refusal messages say. */
@@ -1241,6 +1447,38 @@ function GrnRow({ g, expanded, onToggle, isAdmin, canAmend, dataVersion, onEdit,
               {overdue && (
                 <span className="ml-1 px-1 py-px rounded border border-amber-300 bg-amber-50 text-amber-900">overdue</span>
               )}
+            </span>
+          )}
+          {/* ── RECEIVED OFF-PO ─────────────────────────────────────────────
+              THE ALERT THAT ALREADY FIRED, GIVEN A FACE. It sits exactly where
+              the void note and the "waiting on the kitchen" note sit — under
+              the GRN number, on the row itself — because those are the two
+              existing house treatments for "a human needs to look at this
+              document", and this is the third fact of that kind. Same 9px
+              block, same read-without-expanding weight.
+
+              AMBER, and the choice is as load-bearing as the QC badge's blue.
+              Blue there means "somebody else owes an answer and nothing is
+              wrong". This is not that: money and stock have already moved on
+              terms nobody approved. Red would say the receiving desk made a
+              mistake — they did not; they recorded what turned up and were
+              made to type a reason. Amber is the register's existing caution
+              colour (partial, overdue) and reads as "check this", which is the
+              whole ask.
+
+              THE CAPTION IS AXIS COUNTS — "Off-PO · 1 over, 1 short" — and
+              never a rupee figure. On PO-2026-0028 a +₹820 over and a −₹820
+              short net to zero, and any single money figure in this space
+              would have printed a calm number over a 9× over-receipt and a
+              total non-delivery. Counts cannot cancel. The gross pair and the
+              net are in the tooltip and, in full, one expand away. */}
+          {dev && (
+            <span className="block text-[9px] font-sans font-normal mt-0.5 text-amber-900"
+                  title={deviationRowTooltip(devAll)
+                    + ' Expand the row for which lines, ordered vs received vs accepted, and the reason recorded at the bay.'}>
+              <GitCompareArrows className="w-2.5 h-2.5 inline-block align-[-1px] mr-0.5" />
+              {deviationRowBadgeText(devAll)}
+              {devAll.length > 1 && <span className="ml-1 opacity-80">{devAll.length} alerts</span>}
             </span>
           )}
         </td>
@@ -1414,6 +1652,12 @@ function GrnRow({ g, expanded, onToggle, isAdmin, canAmend, dataVersion, onEdit,
               </div>
             </div>
           )}
+          {/* ── RECEIVED OFF-PO, IN FULL ───────────────────────────────────
+              Below the hold banner and above the override note, which is the
+              order of urgency on this document: goods that are not ours yet,
+              then goods that came in on terms nobody approved, then how a past
+              hold was released. */}
+          {devAll.length > 0 && <DeviationPanel alerts={devAll} roll={devRollRow} />}
           {/* THE OVERRIDE, AFTER THE FACT. A permanent property of the bill
               (qc_override_* are committed columns, not a prunable audit row) and
               it shows on every reader's screen — the store person included, so
@@ -1658,6 +1902,252 @@ function GrnRow({ g, expanded, onToggle, isAdmin, canAmend, dataVersion, onEdit,
         </td></tr>
       )}
     </>
+  );
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+   RECEIVED OFF THE PURCHASE ORDER — the alert, opened up.
+
+   THE OWNER'S CASE, WHICH THIS PANEL IS SHAPED BY. PO-2026-0028 had eleven
+   lines. DRAGON FRUIT was ordered 1 pcs @ ₹80 and received 9 pcs @ ₹100
+   (+₹820). THAI BIRD RED CHILLI was ordered 1 @ ₹820 and never came (−₹820).
+   The printed variance read a tidy −₹76.00, and inside that number sat a 9×
+   over-receipt and a total non-delivery. Every fact needed to see that was
+   already recorded at the receiving desk; the only thing missing was a screen.
+
+   SO THE RULE THIS PANEL IS BUILT AROUND: the summary strip leads with the
+   AXIS COUNTS (which cannot cancel), then the two GROSS movements side by
+   side, and only then the net — greyed, in its own cell, labelled as the
+   figure that hides the other two. A reader who looks at nothing else sees
+   "1 over · 1 short" before any rupee at all. deviationMoneySummary() and
+   deviationHeadline() in src/lib/po-deviation-format.ts enforce the same
+   ordering everywhere else this appears, so the badge, the tooltip, the bell
+   and this panel cannot drift into netting.
+
+   READ-ONLY. Nothing here approves, dismisses or acknowledges anything — that
+   is a decision with no home in this app yet, and a button that only looked
+   like one would be worse than none. The panel points at /purchase-orders and
+   /audit, which is where the alert's own body already sends the reader.
+   ══════════════════════════════════════════════════════════════════════════ */
+function DeviationPanel({ alerts, roll }: {
+  alerts: GrnDeviationAlert[];
+  /** Per-axis roll-up across every alert on this bill. Never a money total. */
+  roll: ReturnType<typeof rollUpDeviationCounts> | null;
+}) {
+  if (!alerts.length) return null;
+  const multi = alerts.length > 1;
+  /* WHAT THIS BILL IS ACTUALLY ACCUSED OF. A receipt whose lines came in wrong
+     and a clean receipt that carried a bill discount raise the SAME alert (the
+     discount moves the cost basis of every line, so it is the admin's call by
+     the same argument as a rate change) — but they are not the same sentence.
+     "This delivery came in differently from the purchase order" printed over a
+     delivery that arrived exactly as ordered is a false statement about the
+     goods, and it is the kind of false statement that teaches a reader to stop
+     believing the banner. */
+  const anyLines = alerts.some(a => a.counts.lines > 0);
+  /* And the THIRD case, which is neither: an alert whose structured detail
+     could not be read back. It must not borrow either sentence — one would
+     claim the goods came in wrong, the other would claim they came in right. */
+  const chargesOnly = !anyLines && alerts.every(a => isChargesOnly(a));
+  return (
+    <div className="mb-2 rounded border border-amber-300 bg-amber-50 px-2.5 py-2 text-[11px] text-amber-900">
+      <div className="font-semibold flex items-center gap-1.5 flex-wrap">
+        <GitCompareArrows className="w-3.5 h-3.5" />
+        {anyLines
+          ? 'This delivery came in differently from the purchase order'
+          : chargesOnly
+            ? 'This bill carried charges that moved the cost of the goods'
+            : 'An alert was raised for this receipt'}
+        {multi && roll && (
+          <span className="font-normal opacity-90">
+            · {alerts.length} alerts on this bill{deviationAxisSummary(roll) ? ` — ${deviationAxisSummary(roll)} in total` : ''}
+          </span>
+        )}
+      </div>
+      <div className="mt-1 font-normal">
+        {anyLines
+          ? <>The receiving desk recorded this and an alert was raised for the admin at the time. Nothing here changes the bill —
+              the quantities and rates below are what was actually booked.</>
+          : chargesOnly
+            ? <>Every line arrived exactly as ordered. What moved was the money: a discount on the bill is netted into the cost of
+                each line, so it changes <b>average_price</b> and every recipe costed from these materials. An alert was raised for
+                the admin at the time.</>
+            : <>The alert below is the record as it was written. Its per-line detail could not be read back, so what follows is the
+                alert&apos;s own text rather than a table — read it before assuming anything about what arrived.</>}
+      </div>
+      {alerts.map((a, i) => <DeviationAlertBlock key={`${a.created_at}-${i}`} a={a} showHeader={multi} />)}
+      <div className="mt-1.5 flex items-center gap-2 flex-wrap">
+        <a href="/purchase-orders" className="px-2 py-1 rounded border border-current bg-white/70 hover:bg-white font-semibold flex items-center gap-1">
+          <Receipt className="w-3 h-3" /> Open the purchase order
+        </a>
+        <a href="/audit" className="px-2 py-1 rounded border border-current bg-white/70 hover:bg-white font-semibold flex items-center gap-1">
+          <FileCheck className="w-3 h-3" /> Audit trail
+        </a>
+      </div>
+    </div>
+  );
+}
+
+/** ONE alert: its summary strip, its lines, and the reason recorded at the bay. */
+function DeviationAlertBlock({ a, showHeader }: { a: GrnDeviationAlert; showHeader: boolean }) {
+  const when = a.created_at ? fmtIST(a.created_at) : '';
+  return (
+    <div className={`mt-2 rounded border border-amber-200 bg-white/70 px-2 py-1.5 ${showHeader ? '' : 'border-0 bg-transparent px-0 py-0'}`}>
+      {showHeader && (
+        <div className="text-[10px] font-semibold flex items-center gap-1.5 flex-wrap mb-1">
+          {a.source === 'amendment'
+            ? <><Pencil className="w-3 h-3" /> Raised by a bill correction after the receipt</>
+            : <><FileCheck className="w-3 h-3" /> Raised at the receiving desk</>}
+          {when && <span className="font-normal opacity-80">· {when}</span>}
+          {a.actor_email && <span className="font-normal opacity-80">· {a.actor_email}</span>}
+        </div>
+      )}
+
+      {/* ── THE SUMMARY STRIP. COUNTS, THEN GROSS, THEN NET — IN THAT ORDER ──
+          The one arrangement a cancelling pair cannot survive. "1 over, 1 short"
+          is stated before any money; the two gross movements are given equal,
+          separate cells so neither can absorb the other; and the net comes last,
+          muted, captioned as what it is. Never render the net cell without the
+          two beside it. */}
+      <div className="flex flex-wrap gap-1.5">
+        <div className="rounded border border-amber-300 bg-amber-100/70 px-2 py-1">
+          <div className="text-[9px] uppercase tracking-wide opacity-70">Lines off-PO</div>
+          <div className="font-semibold">
+            {a.counts.lines > 0
+              ? <>{a.counts.lines}{deviationAxisSummary(a.counts) ? <span className="font-normal"> · {deviationAxisSummary(a.counts)}</span> : null}</>
+              : <span className="font-normal">{isChargesOnly(a) ? 'none — the bill charges moved the cost' : 'none recorded'}</span>}
+          </div>
+        </div>
+        {a.detail_available && a.counts.lines > 0 && (
+          <>
+            <div className="rounded border border-red-200 bg-red-50 px-2 py-1 text-red-800"
+                 title="Gross ₹ of the lines that cost MORE than the purchase order said. Shown on its own so it can never be cancelled by the line below.">
+              <div className="text-[9px] uppercase tracking-wide opacity-70">Above PO</div>
+              {/* isMoneyMove, not `> 0`: the same half-paisa epsilon the
+                  sentence below uses, so a cell and the sentence can never
+                  disagree about whether anything moved. */}
+              <div className="font-mono font-semibold">{isMoneyMove(a.above_value) && a.above_value > 0 ? signedMoney(a.above_value) : '—'}</div>
+            </div>
+            <div className="rounded border border-blue-200 bg-blue-50 px-2 py-1 text-blue-900"
+                 title="Gross ₹ of the lines that cost LESS than the purchase order said — goods that were ordered and paid for in the plan but did not arrive, or were not accepted.">
+              <div className="text-[9px] uppercase tracking-wide opacity-70">Below PO</div>
+              <div className="font-mono font-semibold">{isMoneyMove(a.below_value) && a.below_value < 0 ? signedMoney(a.below_value) : '—'}</div>
+            </div>
+            <div className="rounded border border-[#E8D5C4] bg-white px-2 py-1 text-[#8B7355]"
+                 title="The two figures beside this, added together. Deliberately last and deliberately muted: an over and a short of the same size cancel here to a calm number — on PO-2026-0028 a 9× over-receipt and a total non-delivery netted to a tidy figure and nobody looked. Read the two gross figures, not this one.">
+              <div className="text-[9px] uppercase tracking-wide opacity-70">Net (hides the two above)</div>
+              <div className="font-mono font-semibold">{signedMoney(a.net_value)}</div>
+            </div>
+          </>
+        )}
+        {a.bill_discount > 0 && (
+          <div className="rounded border border-amber-300 bg-white px-2 py-1"
+               title="Knocked off the whole bill and netted into the cost of every line — it moves average_price and therefore every recipe costed from these materials, which is why it raises this alert on its own.">
+            <div className="text-[9px] uppercase tracking-wide opacity-70">Bill discount</div>
+            <div className="font-mono font-semibold">{plainMoney(a.bill_discount)}</div>
+          </div>
+        )}
+      </div>
+
+      {/* THE ALERT EXISTS BUT ITS DETAIL COULD NOT BE READ. Say so, and print
+          the alert's own words — a panel that silently showed zeros here would
+          be the original defect wearing a badge. */}
+      {!a.detail_available && (
+        <div className="mt-1.5 rounded border border-amber-200 bg-white px-2 py-1.5">
+          <div className="flex items-start gap-1.5">
+            <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-px" />
+            <span>
+              The per-line detail for this alert could not be read back, so the figures above are incomplete.
+              The alert itself is real — this is what was recorded:
+            </span>
+          </div>
+          <div className="mt-1 font-mono text-[10px] whitespace-pre-wrap break-words text-[#2D1B0E]">{a.title}</div>
+          {a.body && <div className="mt-1 font-mono text-[10px] whitespace-pre-wrap break-words text-[#6B5744]">{a.body}</div>}
+        </div>
+      )}
+
+      {a.lines.length > 0 && (
+        <div className="mt-1.5 overflow-x-auto">
+          <table className="w-full text-[10px] min-w-[46rem]">
+            <thead className="text-[#6B5744]">
+              <tr className="border-b border-amber-200">
+                <th className="text-left py-1 pr-2 font-medium">Item</th>
+                <th className="text-right py-1 px-2 font-medium">Ordered</th>
+                <th className="text-right py-1 px-2 font-medium">Received</th>
+                {/* ACCEPTED IS ITS OWN COLUMN and is never folded into Received:
+                    a full delivery part-rejected at QC moves money without
+                    being short, and 0 accepted on a held receipt means "nobody
+                    has decided yet", not "all refused". */}
+                <th className="text-right py-1 px-2 font-medium">Accepted</th>
+                <th className="text-right py-1 px-2 font-medium">Rate on PO</th>
+                <th className="text-right py-1 px-2 font-medium">Rate billed</th>
+                <th className="text-left py-1 px-2 font-medium">What happened</th>
+                <th className="text-right py-1 px-2 font-medium">Value impact</th>
+                <th className="text-left py-1 pl-2 font-medium">Reason recorded at the bay</th>
+              </tr>
+            </thead>
+            <tbody>
+              {a.lines.map((l, i) => {
+                const what = deviationLineWhat(l);
+                return (
+                  <tr key={`${l.material_id}-${i}`} className="border-b border-amber-100 last:border-0 align-top">
+                    <td className="py-1 pr-2 text-[#2D1B0E] font-medium">{l.material_name || '—'}</td>
+                    {/* Every quantity here is a PURCHASE unit and every rate is
+                        ₹/purchase-unit — the pair the receive route computed the
+                        impact from. Printing a recipe unit beside these rupees
+                        would restate a ₹900 surplus as ₹900,000 on a 1 kg pack. */}
+                    <td className="py-1 px-2 text-right font-mono">{q2(l.ordered)} <span className="text-[9px] text-[#B8A590]">{l.unit_pu}</span></td>
+                    <td className={`py-1 px-2 text-right font-mono ${l.qty_excess ? 'text-red-700 font-semibold' : l.qty_short ? 'text-blue-800 font-semibold' : ''}`}>
+                      {q2(l.received)} <span className="text-[9px] text-[#B8A590]">{l.unit_pu}</span>
+                    </td>
+                    <td className={`py-1 px-2 text-right font-mono ${l.acc_short && !l.qty_short ? 'text-blue-800 font-semibold' : ''}`}>
+                      {q2(l.accepted)} <span className="text-[9px] text-[#B8A590]">{l.unit_pu}</span>
+                    </td>
+                    <td className="py-1 px-2 text-right font-mono">{m2(l.ordered_rate)}</td>
+                    <td className={`py-1 px-2 text-right font-mono ${l.rate_changed ? 'text-red-700 font-semibold' : ''}`}>{m2(l.actual_rate)}</td>
+                    <td className="py-1 px-2">
+                      <div className="flex flex-wrap gap-1">
+                        {what.length ? what.map((w, j) => (
+                          <span key={j} className="px-1 py-px rounded border border-amber-300 bg-amber-50 text-amber-900 whitespace-nowrap">{w}</span>
+                        )) : <span className="text-[#8B7355]">—</span>}
+                      </div>
+                    </td>
+                    <td className={`py-1 px-2 text-right font-mono font-semibold ${l.value_impact > 0 ? 'text-red-700' : l.value_impact < 0 ? 'text-blue-800' : 'text-[#8B7355]'}`}
+                        title={`(accepted ${l.accepted} × ₹${l.actual_rate}) − (ordered ${l.ordered} × ₹${l.ordered_rate}) = ₹${l.value_impact}. Computed on ACCEPTED, because rejected units are never paid for.`}>
+                      {signedMoney(l.value_impact)}
+                    </td>
+                    <td className="py-1 pl-2 text-[#6B5744] max-w-[16rem] break-words">
+                      {l.reason || <span className="text-[#B8A590]">(none recorded)</span>}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {a.source === 'amendment' && (
+        <div className="mt-1.5">
+          <b>Corrected after the receipt.</b>{' '}
+          These figures did not go through the receiving desk&apos;s deviation gate — they were typed as a bill correction.
+          {a.amendment_reason ? <> Reason given: <i>{a.amendment_reason}</i></> : null}
+        </div>
+      )}
+
+      {/* The one-sentence version, in the same order the strip uses: counts,
+          gross pair, net last. Kept because it is what the admin's own alert
+          said, and a reader comparing the two must find the same sentence.
+          deviationHeadline() ALREADY carries the money summary — appending
+          deviationMoneySummary() here as well printed "−₹168 below PO — −₹168
+          below PO", which is how a sentence about not double-counting ends up
+          double-counting itself. */}
+      {a.detail_available && (
+        <div className="mt-1.5 text-[10px] opacity-80">
+          Alert{when ? ` · ${when}` : ''}: {deviationHeadline(a)}.
+        </div>
+      )}
+    </div>
   );
 }
 

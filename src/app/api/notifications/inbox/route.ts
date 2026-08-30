@@ -22,6 +22,11 @@ import { canApproveTasks } from '@/lib/tasks';
  *                        held, and auto-applied) — ONE item per upload, always
  *   - admin            : committed Central Store cutovers with unreviewed
  *                        variance records — ONE item per batch, never per line
+ *   - admin            : deliveries received OFF the purchase order in the last
+ *                        7 days (short / over / short-accepted / rate change) —
+ *                        ONE item, count = receipts, never lines. The ONE bucket
+ *                        whose source is the `notifications` table rather than a
+ *                        live pending state; see its own block for why.
  *   - plain staff      : their OWN requisitions by stage (with HOD / being
  *                        issued / fulfilled today)
  *
@@ -275,6 +280,63 @@ export async function GET() {
       }
     } catch (qcErr) {
       console.error('[/api/notifications/inbox] grn-qc bucket failed:', qcErr);
+    }
+
+    // ── Deliveries that came in OFF the purchase order ────────────────────
+    // THE BUCKET THAT WAS MISSING, AND WHY IT WAS MISSING. Every bucket in this
+    // file is a live COUNT over a pending STATE — that is the file's founding
+    // rule ("NO new tables") and it is why nothing here has ever read the
+    // `notifications` table. The receiving desk writes a row into exactly that
+    // table when a line arrives off-PO (api/purchase-orders/[id]/receive's
+    // deviation block, and grn-reversal.ts for a later bill correction), so
+    // `po_received_deviation` was not filtered out of the bell — it was never a
+    // candidate for it. Seventeen such rows sit in this database and no screen
+    // has ever read one. Detection worked; delivery did not.
+    // (Measured: all 17 are BILL-DISCOUNT-ONLY alerts dated 2026-08-07, so on
+    // today's data this bucket labels them "bills with charges that moved cost"
+    // and — being older than the 7-day window — contributes nothing at all.
+    // See the evidence note in src/lib/po-deviation-alerts.ts before citing
+    // them as off-PO line deviations.)
+    //
+    // This bucket is still a COUNT, not an inbox: it counts RECEIPTS with an
+    // alert in the last 7 days, one row per queue, never one per line — the
+    // badge SUMS `count` across items (CaptainAlertsProvider), so a per-line
+    // count would bury every other bucket. Same rule the cutover and
+    // closing-digest buckets state above.
+    //
+    // A STANDING STATE, like `reorder`: there is no server-side "reviewed" flag
+    // on a deviation, so the 7-day window is what makes the count fall again.
+    // Clearing the bell acks it per device and it re-surfaces when the count
+    // grows (src/lib/notif-ack.ts).
+    //
+    // ADMIN-ONLY, matching the alert itself: the notifications row is written
+    // with recipient = 'admin', the Slack copy goes to the admin webhook, and
+    // the receive route states the rule in as many words — a short is a vendor
+    // service issue, a surplus is stock nobody ordered, a short-accept is money
+    // the PO expected to spend and didn't, and a rate change rewrites
+    // average_price through every recipe, so "all four are the admin's call".
+    // /grn itself is NOT admin-only and the badge on its rows is not gated
+    // (every quantity and rate in it is already on that page) — this is about
+    // who gets NAGGED, not who may look.
+    //
+    // THE LABEL CARRIES COUNTS AND NEVER A NET. A +₹820 over and a −₹820 short
+    // cancel to a tidy ₹0 — the owner's actual complaint — so a rupee figure in
+    // a one-line label is the one thing that could hide the pair. Counts do not
+    // cancel: "2 deliveries received off-PO (1 over, 1 short)". The rupees, with
+    // their gross pair, are one click away on /grn. deviationBucketLabel() is
+    // the only thing that writes this sentence, shared with the page.
+    //
+    // Isolated behind its own try/catch + dynamic import like every other
+    // additive bucket, so a notifications-schema fault can never darken the bell.
+    if (isAdmin) {
+      try {
+        const { recentDeviationAlerts } = await import('@/lib/po-deviation-alerts');
+        const { rollUpDeviationCounts, deviationBucketLabel } = await import('@/lib/po-deviation-format');
+        const roll = rollUpDeviationCounts(recentDeviationAlerts(db, { outletId, days: 7 }));
+        push('po_deviations', deviationBucketLabel(roll), roll.grns, '/grn?deviations=1');
+      } catch (devErr) {
+        console.error('[/api/notifications/inbox] po-deviation bucket failed:', devErr);
+      }
     }
 
     // ── Closing counts parked in the variance-approval queue ──────────────
