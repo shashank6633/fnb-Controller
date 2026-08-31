@@ -23,6 +23,10 @@ import {
   MoreVertical,
   ChevronLeft,
   ChevronRight,
+  ChevronUp,
+  ListOrdered,
+  EyeOff,
+  Eye,
 } from 'lucide-react';
 
 function formatCurrency(value: number): string {
@@ -67,6 +71,24 @@ interface Summary {
   foods: number; liquors: number; beverages: number;
   withRecipe: number; withMaterial: number;
   noPrice: number; noCategory: number; noStation: number; noDietaryTag: number;
+}
+
+/**
+ * A row of the CATEGORY MASTER (`menu_categories`, via
+ * /api/menu-items/categories). This list decides what the item form OFFERS —
+ * it is not where an item's category is stored. `menu_items.category` is still
+ * the plain string, so an item can legitimately carry a name that is
+ * deactivated here, or absent from here entirely.
+ */
+interface MenuCategory {
+  id: string;
+  name: string;
+  sort_order: number;
+  is_active: number;
+  item_count: number;
+  /** Distinct strings the items actually store, when they are NOT all exactly
+   *  this row's name (a CSV import can create that drift). Empty when they agree. */
+  spellings: string[];
 }
 
 const PAGE_SIZE = 25;
@@ -116,6 +138,16 @@ export default function MenuItemsPage() {
   const [me, setMe] = useState<{ role?: string } | null>(null);
   const isAdmin = me?.role === 'admin';
 
+  // The CATEGORY MASTER. Loaded for EVERY user, not just admins: the item form's
+  // dropdown is built from it, so a non-admin editing a price still needs it.
+  // include_inactive=1 because a deactivated category must still be recognised —
+  // an item sitting on one has to be shown its own value, marked, or opening the
+  // item to change its price would silently change its category on save.
+  const [menuCats, setMenuCats] = useState<MenuCategory[]>([]);
+  const [catOrphans, setCatOrphans] = useState<{ name: string; item_count: number }[]>([]);
+  const [manageCatsOpen, setManageCatsOpen] = useState(false);
+  const [renameInitial, setRenameInitial] = useState('');
+
   const [toast, setToast] = useState<{ msg: string; error?: boolean } | null>(null);
 
   const showToast = useCallback((msg: string, error = false) => {
@@ -147,13 +179,32 @@ export default function MenuItemsPage() {
     }
   }, [showToast]);
 
+  // The category master. A failure here is NOT silent: without it the item
+  // form's dropdown would be empty, and an empty dropdown next to a stored
+  // category is exactly the situation that loses data on save.
+  const fetchCats = useCallback(async () => {
+    try {
+      const res = await fetch('/api/menu-items/categories?include_inactive=1');
+      if (!res.ok) {
+        const j: { error?: string } = await res.json().catch(() => ({}));
+        showToast(j.error || `Failed to load categories (HTTP ${res.status})`, true);
+        return;
+      }
+      const json: { categories?: MenuCategory[]; orphans?: { name: string; item_count: number }[] } = await res.json();
+      setMenuCats(json.categories || []);
+      setCatOrphans(json.orphans || []);
+    } catch {
+      showToast('Failed to load categories — check your connection', true);
+    }
+  }, [showToast]);
+
   useEffect(() => {
     (async () => {
       setLoading(true);
-      await fetchItems();
+      await Promise.all([fetchItems(), fetchCats()]);
       setLoading(false);
     })();
-  }, [fetchItems]);
+  }, [fetchItems, fetchCats]);
 
   // Effective role — used ONLY to decide whether to show the "Rename category"
   // control. Failure is silent and simply hides it; the API's own 403 is the
@@ -218,6 +269,21 @@ export default function MenuItemsPage() {
     return m;
   }, [items]);
 
+  // What the rename dialog may pick FROM, and what it treats as a clash: the
+  // master's names UNION the strings items actually carry. Both halves are
+  // needed. A master row with no items yet (just added, or emptied) has to be
+  // renameable — the server allows it. A string that is on items but absent from
+  // the master (a legacy value) has to be renameable too, and must still block a
+  // rename onto it. Exact strings, never folded: the fold belongs to the clash
+  // check, and picking a folded name would rename a different set of rows.
+  const renameCandidates = useMemo(() => {
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const c of menuCats) if (!seen.has(c.name)) { seen.add(c.name); out.push(c.name); }
+    for (const c of categories) if (!seen.has(c)) { seen.add(c); out.push(c); }
+    return out.sort((a, b) => a.localeCompare(b));
+  }, [menuCats, categories]);
+
   // Activating a health filter also drops the active-only scope, so the drill-down
   // reveals every flagged item the banner counted (incl. inactive ones).
   const reviewIssue = (key: string) => {
@@ -234,7 +300,7 @@ export default function MenuItemsPage() {
   // "/" focuses the search box (but never while a modal is open)
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (editItem || importOpen || renameOpen) return;
+      if (editItem || importOpen || renameOpen || manageCatsOpen) return;
       const tag = (document.activeElement?.tagName || '').toLowerCase();
       if (e.key === '/' && tag !== 'input' && tag !== 'textarea' && tag !== 'select') {
         e.preventDefault(); searchRef.current?.focus();
@@ -242,7 +308,7 @@ export default function MenuItemsPage() {
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [editItem, importOpen, renameOpen]);
+  }, [editItem, importOpen, renameOpen, manageCatsOpen]);
 
   // Import handling
   const openImport = () => {
@@ -420,6 +486,10 @@ export default function MenuItemsPage() {
       if (json.items_created > 0 || json.items_updated > 0) {
         await fetchItems();
       }
+      // Independently of items: a file can add categories to the master (an
+      // unknown category is accepted and created) even on a run where every row
+      // was an unchanged update, so the picker must refresh either way.
+      if (json.created_categories?.length) await fetchCats();
     } catch (err: any) {
       setImportResult({ error: err.message });
     } finally {
@@ -506,10 +576,61 @@ export default function MenuItemsPage() {
     // holds the old string, the grid goes empty and a phantom chip re-pins at
     // count 0 — which reads as data loss, not a rename.
     setCategoryFilter(cf => (cf === from ? to : cf));
-    await fetchItems();
+    await Promise.all([fetchItems(), fetchCats()]);
     showToast(`Renamed "${from}" to "${to}" across ${renamed} item${renamed === 1 ? '' : 's'}`);
     return null;
   };
+
+  /**
+   * CATEGORY MASTER writes. Same contract as saveEdit/renameCategory: resolve to
+   * null on success, or an error STRING that the manage screen shows inline —
+   * a refused add ("that name already exists") must land next to the admin's
+   * typing, not in a toast behind a closed dialog.
+   *
+   * None of these touch a menu item. Adding makes a name pickable; deactivating
+   * stops it being offered and leaves every item that carries it untouched;
+   * reordering only moves the picker. Renaming is NOT here — it goes through
+   * renameCategory above and the one server route that may write
+   * menu_items.category.
+   */
+  /** Exactly the three shapes the master route accepts. Spelled out rather
+   *  than `any` so the compiler is the first thing that refuses a `name` here:
+   *  a rename must go through renameCategory, never this path. */
+  const catWrite = useCallback(async (
+    body: { name: string } | { id: string; is_active: boolean } | { order: string[] },
+    method: 'POST' | 'PUT',
+  ): Promise<string | null> => {
+    try {
+      const res = await api('/api/menu-items/categories', { method, body });
+      const j = (await res.json().catch(() => ({}))) as { error?: string };
+      if (!res.ok) return j.error || `Failed (HTTP ${res.status})`;
+    } catch {
+      return 'Failed — check your connection';
+    }
+    await fetchCats();
+    return null;
+  }, [fetchCats]);
+
+  const addCategory = useCallback(async (name: string) => {
+    const err = await catWrite({ name }, 'POST');
+    if (!err) showToast(`Added "${name.trim()}"`);
+    return err;
+  }, [catWrite, showToast]);
+
+  const setCategoryActive = useCallback(async (c: MenuCategory, active: boolean) => {
+    const err = await catWrite({ id: c.id, is_active: active }, 'PUT');
+    if (err) showToast(err, true);
+    else showToast(active
+      ? `"${c.name}" is offered again`
+      : `"${c.name}" is no longer offered — its ${c.item_count} item${c.item_count === 1 ? '' : 's'} keep it`);
+    return err;
+  }, [catWrite, showToast]);
+
+  const reorderCategories = useCallback(async (order: string[]) => {
+    const err = await catWrite({ order }, 'PUT');
+    if (err) showToast(err, true);
+    return err;
+  }, [catWrite, showToast]);
 
   if (loading) {
     return (
@@ -624,11 +745,15 @@ export default function MenuItemsPage() {
                 <CatChip active={!categoryFilter} label="All" count={baseList.length} onClick={() => setCategoryFilter('')} />
                 {inline.map(c => <CatChip key={c} active={categoryFilter === c} label={c} count={countByCat[c] || 0} onClick={() => setCategoryFilter(categoryFilter === c ? '' : c)} />)}
               </TabScroller>
+              {/* The category master. Admin-only, because every write behind it
+                  is (POST/PUT /api/menu-items/categories and the rename route
+                  both require admin) — the server gate is the boundary, this
+                  only avoids offering a button whose every click would 403. */}
               {isAdmin && (
-                <button onClick={() => setRenameOpen(true)} title="Rename a category across every item in it"
+                <button onClick={() => setManageCatsOpen(true)} title="Add, rename, reorder or retire the categories the item form offers"
                         className="flex items-center gap-1.5 px-3 py-1.5 rounded-full border border-[#E0D0BE] bg-white text-[#6B5744] hover:bg-[#FFF1E3] text-xs font-medium whitespace-nowrap transition-colors shrink-0">
-                  <Edit className="w-3.5 h-3.5" />
-                  <span className="hidden sm:inline">Rename category</span><span className="sm:hidden">Rename</span>
+                  <ListOrdered className="w-3.5 h-3.5" />
+                  <span className="hidden sm:inline">Manage categories</span><span className="sm:hidden">Categories</span>
                 </button>
               )}
               <div className="relative shrink-0">
@@ -837,8 +962,62 @@ export default function MenuItemsPage() {
                           {importResult.items_skipped_duplicate > 0 && <StatBlock label="Skipped Duplicate" value={importResult.items_skipped_duplicate} color="text-amber-600" />}
                           {importResult.typos_fixed?.length > 0 && <StatBlock label="Typos Fixed" value={importResult.typos_fixed.length} color="text-amber-600" />}
                           {importResult.spaces_fixed > 0 && <StatBlock label="Spaces Fixed" value={importResult.spaces_fixed} color="text-amber-600" />}
+                          {importResult.created_categories?.length > 0 && <StatBlock label="New Categories" value={importResult.created_categories.length} color="text-[#af4408]" />}
                         </div>
                       </div>
+                      {/* An unknown category in the file is ACCEPTED and added to
+                          the category list, so it can be corrected afterwards —
+                          never refused, never silently dropped. Name them, or the
+                          admin has no way to know what the file just added. */}
+                      {importResult.created_categories?.length > 0 && (
+                        <div className="bg-[#FFF8F0] border border-[#E8D5C4] rounded-lg p-3 text-xs">
+                          <p className="font-medium text-[#8B5A2B]">
+                            {importResult.created_categories.length} new categor{importResult.created_categories.length === 1 ? 'y was' : 'ies were'} added to the category list from this file:
+                          </p>
+                          <p className="mt-1 text-[#6B5744]">
+                            {importResult.created_categories.map((c: { name: string }) => c.name).join(' · ')}
+                          </p>
+                          <p className="mt-1 text-[#8B7355]">Open <b>Manage categories</b> to rename, reorder or retire any of them. The items already carry the name either way.</p>
+                        </div>
+                      )}
+                      {/* The file spelled a category the list already has, with
+                          different capitalisation. No second entry is created —
+                          the list treats the two as one name — but the ITEMS keep
+                          the file's spelling, so they sit off the list's exact
+                          string and the item form marks them. Say so: creating
+                          nothing and saying nothing was how this hid. */}
+                      {importResult.categories_spelled_differently?.length > 0 && (
+                        <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 text-xs">
+                          <p className="font-medium text-amber-800">
+                            {importResult.categories_spelled_differently.length} categor{importResult.categories_spelled_differently.length === 1 ? 'y is' : 'ies are'} spelled differently in this file than in the category list:
+                          </p>
+                          <p className="mt-1 text-amber-700 break-words">
+                            {importResult.categories_spelled_differently.map((c: { file: string; list: string }) => `“${c.file}” (list has “${c.list}”)`).join(' · ')}
+                          </p>
+                          <p className="mt-1 text-amber-700">No duplicate entry was added — the list treats those as one category. The imported items kept the file’s spelling, so they show as “not in the category list” until you open one and pick the listed name.</p>
+                        </div>
+                      )}
+                      {/* Only an admin may grow the category list (its own
+                          endpoint is admin-only). The items were still written
+                          with their category exactly as the file gave it. */}
+                      {importResult.categories_need_admin?.length > 0 && (
+                        <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 text-xs">
+                          <p className="font-medium text-amber-800">
+                            {importResult.categories_need_admin.length} new categor{importResult.categories_need_admin.length === 1 ? 'y' : 'ies'} in this file {importResult.categories_need_admin.length === 1 ? 'is' : 'are'} not in the category list, and only an admin can add {importResult.categories_need_admin.length === 1 ? 'it' : 'them'}:
+                          </p>
+                          <p className="mt-1 text-amber-700 break-words">{importResult.categories_need_admin.join(' · ')}</p>
+                          <p className="mt-1 text-amber-700">The items were imported and carry the name already — ask an admin to add {importResult.categories_need_admin.length === 1 ? 'it' : 'them'} under <b>Manage categories</b> so the item form offers {importResult.categories_need_admin.length === 1 ? 'it' : 'them'}.</p>
+                        </div>
+                      )}
+                      {importResult.categories_too_long?.length > 0 && (
+                        <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 text-xs">
+                          <p className="font-medium text-amber-800">
+                            {importResult.categories_too_long.length} categor{importResult.categories_too_long.length === 1 ? 'y was' : 'ies were'} too long for the category list (over 60 characters), so {importResult.categories_too_long.length === 1 ? 'it was' : 'they were'} not added:
+                          </p>
+                          <p className="mt-1 text-amber-700 break-words">{importResult.categories_too_long.join(' · ')}</p>
+                          <p className="mt-1 text-amber-700">The items still carry the name — they simply are not offered in the picker. Rename them to something shorter to fix that.</p>
+                        </div>
+                      )}
                       {importResult.typos_fixed?.length > 0 && (
                         <details className="bg-amber-50 border border-amber-200 rounded-lg p-3 text-xs">
                           <summary className="cursor-pointer font-medium text-amber-800">🔧 {importResult.typos_fixed.length} typos fixed (click to view)</summary>
@@ -858,16 +1037,34 @@ export default function MenuItemsPage() {
 
       {/* Edit Modal */}
       {editItem && (
-        <EditItemModal item={editItem} onClose={() => setEditItem(null)} onSave={saveEdit} categories={categories} stations={stations} isNew={!editItem.id} />
+        <EditItemModal item={editItem} onClose={() => setEditItem(null)} onSave={saveEdit} menuCategories={menuCats} stations={stations} isNew={!editItem.id} />
       )}
 
-      {/* Bulk category rename (admin) */}
+      {/* Category master (admin) */}
+      {manageCatsOpen && isAdmin && (
+        <ManageCategoriesModal
+          categories={menuCats}
+          orphans={catOrphans}
+          onClose={() => setManageCatsOpen(false)}
+          onAdd={addCategory}
+          onSetActive={setCategoryActive}
+          onReorder={reorderCategories}
+          onRename={(name) => { setRenameInitial(name); setRenameOpen(true); }}
+        />
+      )}
+
+      {/* Bulk category rename (admin). Reached from the manage screen; it is the
+          ONE path that writes menu_items.category, and the server moves the
+          master row with the items in the same transaction. The picker list it
+          is given merges the master with the strings items actually carry, so a
+          category that exists only in one of the two is still renameable and
+          still counts as a clash. */}
       {renameOpen && isAdmin && (
         <RenameCategoryModal
-          categories={categories}
+          categories={renameCandidates}
           counts={globalCatCounts}
-          initial={categoryFilter}
-          onClose={() => setRenameOpen(false)}
+          initial={renameInitial || categoryFilter}
+          onClose={() => { setRenameOpen(false); setRenameInitial(''); }}
           onRename={renameCategory}
         />
       )}
@@ -1138,11 +1335,13 @@ function textToOptions(t: string): Array<{ label: string; choices: string[] }> {
 /**
  * The dialog's copy of the server's name cleaning, kept character-for-character
  * in step with `sanitizeCategoryName` / `foldCategoryName` in
- * src/app/api/menu-items/rename-category/route.ts. If the two ever drift the
- * dialog starts promising something the endpoint refuses (or worse, stops
- * warning about a duplicate the endpoint will still create) — the server is
- * always the boundary, this only decides what the admin is told before they
- * press the button.
+ * src/lib/menu-category.ts — the shared module the rename route, the category
+ * master route and the CSV importer all import them from. (This is client code
+ * and must not pull a server module in, which is why the copy exists at all.)
+ * If the two ever drift the dialog starts promising something the endpoint
+ * refuses (or worse, stops warning about a duplicate the endpoint will still
+ * create) — the server is always the boundary, this only decides what the admin
+ * is told before they press the button.
  *
  * Invisible characters are the whole reason this is not just `.trim()`: a
  * pasted zero-width space made "breads" and "breads<U+200B>" two different
@@ -1161,6 +1360,218 @@ function sanitizeCategoryName(s: string): string {
 }
 function foldCategoryName(s: string): string {
   return sanitizeCategoryName(s).normalize('NFKC').toLowerCase();
+}
+
+/**
+ * THE CATEGORY MASTER SCREEN — add, rename, retire, reorder.
+ *
+ * It lives here as a dialog on Menu Items rather than as its own page, beside
+ * the list it governs and behind the same admin gate. Every write goes to
+ * /api/menu-items/categories except RENAME, which is handed back to the page so
+ * it goes through /api/menu-items/rename-category — the one route allowed to
+ * write `menu_items.category`, which moves the items and this master row in a
+ * single transaction. There is deliberately no second rename path.
+ *
+ * WHAT DEACTIVATE MEANS, AND WHY IT IS NOT DELETE. Retiring a category stops it
+ * being OFFERED. Every item already in it keeps the category, stays on the
+ * guest QR menu, on the POS, and in every report — nothing is rewritten. That
+ * is the honest behaviour: `menu_items.category` stores the string, so the only
+ * alternatives would be orphaning those items or rewriting live menu data, and
+ * rewriting is what Rename is for. The screen says so out loud, because "remove
+ * from the list" reads like "delete" unless you are told otherwise.
+ *
+ * Reorder is ↑/↓ rather than drag-and-drop: it works with a keyboard, on a
+ * phone, and inside a scrolling dialog, and it saves the WHOLE order after each
+ * move so a half-applied sequence cannot survive a dropped connection.
+ */
+function ManageCategoriesModal({ categories, orphans, onClose, onAdd, onSetActive, onReorder, onRename }: {
+  categories: MenuCategory[];
+  orphans: { name: string; item_count: number }[];
+  onClose: () => void;
+  onAdd: (name: string) => Promise<string | null>;
+  onSetActive: (c: MenuCategory, active: boolean) => Promise<string | null>;
+  onReorder: (order: string[]) => Promise<string | null>;
+  onRename: (name: string) => void;
+}) {
+  const [newName, setNewName] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [filter, setFilter] = useState('');
+
+  // Server order, exactly as stored. Reorder saves the full list, so what is on
+  // screen and what is in the table never drift.
+  const ordered = useMemo(
+    () => [...categories].sort((a, b) => (a.sort_order - b.sort_order) || a.name.localeCompare(b.name)),
+    [categories],
+  );
+  const shown = useMemo(() => {
+    const q = filter.trim().toLowerCase();
+    return q ? ordered.filter(c => c.name.toLowerCase().includes(q)) : ordered;
+  }, [ordered, filter]);
+
+  const target = sanitizeCategoryName(newName);
+  // Same fold as the server's refusal, so the button never promises an add the
+  // endpoint will bounce. Inactive rows count — the answer there is Reactivate.
+  const clash = target ? categories.find(c => foldCategoryName(c.name) === foldCategoryName(target)) : undefined;
+  const canAdd = !!target && !clash && !busy;
+
+  const add = async () => {
+    if (!canAdd) return;
+    setBusy(true); setError(null);
+    const err = await onAdd(target);
+    if (err) setError(err); else setNewName('');
+    setBusy(false);
+  };
+
+  // Move one row and persist the WHOLE order. `ordered` is the full list even
+  // when the search box is filtering, so moving a row while filtered still
+  // produces a coherent order rather than shuffling the hidden ones.
+  const move = async (id: string, dir: -1 | 1) => {
+    const idx = ordered.findIndex(c => c.id === id);
+    const to = idx + dir;
+    if (idx < 0 || to < 0 || to >= ordered.length) return;
+    const next = ordered.map(c => c.id);
+    [next[idx], next[to]] = [next[to], next[idx]];
+    setBusy(true); setError(null);
+    const err = await onReorder(next);
+    if (err) setError(err);
+    setBusy(false);
+  };
+
+  const toggle = async (c: MenuCategory) => {
+    setBusy(true); setError(null);
+    const err = await onSetActive(c, !c.is_active);
+    if (err) setError(err);
+    setBusy(false);
+  };
+
+  const activeCount = categories.filter(c => c.is_active).length;
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+      <div className="absolute inset-0 bg-black/40 backdrop-blur-sm" onClick={onClose} />
+      <div style={{ maxHeight: 'calc(100vh - 1.5rem)' }}
+           className="relative w-full max-w-2xl bg-white border border-[#E8D5C4] rounded-2xl shadow-2xl flex flex-col overflow-hidden">
+        <div className="flex items-center justify-between px-6 py-4 border-b border-[#E8D5C4] shrink-0">
+          <div className="flex items-center gap-3">
+            <div className="p-2 rounded-lg bg-[#af4408]/10"><ListOrdered className="w-5 h-5 text-[#af4408]" /></div>
+            <div>
+              <h2 className="text-lg font-semibold text-[#2D1B0E]">Menu Categories</h2>
+              {/* ONE expression, not text-around-{}. As three children
+                  ({n} offered · {n} retired — …) JSX dropped the space in front
+                  of "retired" and the header read "1retired"; proven in the
+                  rendered DOM, where the last text node arrived as
+                  "retired — …". Building the whole sentence in a single
+                  template literal leaves no JSX whitespace to lose. */}
+              <p className="text-xs text-[#8B7355]">
+                {`${activeCount} offered · ${categories.length - activeCount} retired — this is the list the item form offers, not where an item’s category is stored.`}
+              </p>
+            </div>
+          </div>
+          <button onClick={onClose} className="p-1.5 rounded-lg hover:bg-[#FFF1E3]"><X className="w-5 h-5" /></button>
+        </div>
+
+        <div className="px-6 pt-4 pb-2 shrink-0 space-y-2">
+          <div className="flex gap-2">
+            <input type="text" value={newName} autoFocus
+                   onChange={e => { setNewName(e.target.value); setError(null); }}
+                   onKeyDown={e => { if (e.key === 'Enter') add(); }}
+                   placeholder="Add a category — e.g. small-plates-veg"
+                   className="flex-1 min-w-0 px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm" />
+            <button onClick={add} disabled={!canAdd}
+                    className="flex items-center gap-1.5 px-4 py-2 bg-[#af4408] hover:bg-[#8a3506] disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg text-sm font-medium shrink-0">
+              {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}Add
+            </button>
+          </div>
+          {clash && (
+            <p className="text-[11px] text-red-600">
+              “{clash.name}” is already in the list{clash.is_active ? '' : ' but retired — reactivate it instead of adding a second one'}. The check ignores capitalisation.
+            </p>
+          )}
+          {categories.length > 8 && (
+            <input type="text" value={filter} onChange={e => setFilter(e.target.value)} placeholder="Filter this list…"
+                   className="w-full px-3 py-1.5 bg-white border border-[#E0D0BE] rounded-lg text-xs" />
+          )}
+        </div>
+
+        <div className="flex-1 min-h-0 overflow-y-auto px-6 pb-4">
+          <div className="divide-y divide-[#F0E4D6] border border-[#E8D5C4] rounded-xl overflow-hidden">
+            {shown.map((c) => {
+              const idx = ordered.findIndex(o => o.id === c.id);
+              return (
+                <div key={c.id} className={`flex items-center gap-2 px-3 py-2 ${c.is_active ? 'bg-white' : 'bg-[#FFFBF5]'}`}>
+                  <div className="flex flex-col shrink-0">
+                    <button onClick={() => move(c.id, -1)} disabled={busy || idx <= 0} aria-label={`Move ${c.name} up`}
+                            className="p-0.5 text-[#8B7355] hover:text-[#af4408] disabled:opacity-25"><ChevronUp className="w-3.5 h-3.5" /></button>
+                    <button onClick={() => move(c.id, 1)} disabled={busy || idx >= ordered.length - 1} aria-label={`Move ${c.name} down`}
+                            className="p-0.5 text-[#8B7355] hover:text-[#af4408] disabled:opacity-25"><ChevronDown className="w-3.5 h-3.5" /></button>
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <p className={`text-sm font-medium truncate ${c.is_active ? 'text-[#2D1B0E]' : 'text-[#8B7355] line-through decoration-[#D4B896]'}`}>{c.name}</p>
+                    <p className="text-[11px] text-[#8B7355]">
+                      {c.item_count} item{c.item_count === 1 ? '' : 's'}
+                      {!c.is_active && ' · retired — they keep it, it is just not offered'}
+                      {c.spellings.length > 0 && ` · items store it as: ${c.spellings.join(', ')}`}
+                    </p>
+                  </div>
+                  <button onClick={() => onRename(c.name)} disabled={busy} title="Rename this category on every item in it"
+                          className="p-1.5 rounded-lg text-[#af4408] hover:bg-[#af4408]/10 shrink-0 disabled:opacity-40"><Edit className="w-4 h-4" /></button>
+                  <button onClick={() => toggle(c)} disabled={busy} title={c.is_active ? 'Stop offering this category' : 'Offer this category again'}
+                          className={`p-1.5 rounded-lg shrink-0 disabled:opacity-40 ${c.is_active ? 'text-[#8B7355] hover:bg-[#FFF1E3]' : 'text-green-600 hover:bg-green-50'}`}>
+                    {c.is_active ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                  </button>
+                </div>
+              );
+            })}
+            {shown.length === 0 && (
+              <p className="px-3 py-6 text-center text-xs text-[#8B7355]">
+                {categories.length === 0 ? 'No categories yet — add the first one above.' : 'No categories match that filter.'}
+              </p>
+            )}
+          </div>
+
+          {orphans.length > 0 && (
+            <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50 p-3">
+              <p className="text-[11px] font-semibold text-amber-800 uppercase tracking-wide">On items, but not in this list</p>
+              <p className="text-[11px] text-amber-700 mt-1">
+                These names are stored on menu items but are not categories anybody can pick. Rename one onto a name in the list above, or add it here.
+              </p>
+              <ul className="mt-2 text-[11px] text-amber-800 space-y-1">
+                {orphans.map(o => (
+                  <li key={o.name} className="flex items-center justify-between gap-2">
+                    <span className="truncate">{o.name} <span className="text-amber-600">· {o.item_count} item{o.item_count === 1 ? '' : 's'}</span></span>
+                    <button onClick={() => onRename(o.name)} className="shrink-0 text-[#af4408] hover:underline font-medium">Rename</button>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          <div className="mt-4 rounded-xl border border-[#E8D5C4] bg-[#FFFBF5] p-3 space-y-1.5">
+            <p className="text-[11px] font-semibold text-[#8B5A2B] uppercase tracking-wide">What this list does</p>
+            <ul className="text-[11px] text-[#6B5744] space-y-1 list-disc pl-4">
+              <li>It decides what the <b>item form offers</b>. Items store the category as text, so nothing here rewrites a menu item.</li>
+              <li><b>Retiring</b> a category leaves every item in it exactly as it is — on the guest menu, on the POS and in every report. It just stops being offered for new items, and an item already in it still shows its own value when you open it.</li>
+              <li><b>Renaming</b> goes through the same tool as before: it moves every item onto the new name and moves this entry with them, in one step.</li>
+              <li>The <b>order</b> here is the order of the dropdown. It is not the guest QR menu&apos;s section order, which is fixed in code.</li>
+              <li>A <b>CSV import</b> that names a category this list does not have will add it here, so you can correct it afterwards.</li>
+            </ul>
+          </div>
+        </div>
+
+        {error && (
+          <div className="flex items-start gap-2 mx-6 mb-3 px-3 py-2 bg-red-50 border border-red-200 rounded-lg shrink-0">
+            <AlertCircle className="w-4 h-4 text-red-500 shrink-0 mt-0.5" />
+            <p className="text-xs text-red-700">{error}</p>
+          </div>
+        )}
+
+        <div className="flex justify-end gap-3 px-6 py-3 border-t border-[#E8D5C4] shrink-0">
+          <button onClick={onClose} className="px-4 py-2 text-sm text-[#6B5744] bg-[#FFF1E3] rounded-lg hover:bg-[#E8D5C4]">Done</button>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 /**
@@ -1212,7 +1623,10 @@ function RenameCategoryModal({ categories, counts, initial, onClose, onRename }:
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+    /* z-[60], not z-50: this dialog is opened FROM the category master screen and
+       has to sit above it. Still below the toast (z-96) so a server refusal is
+       never hidden behind the dialog that caused it. */
+    <div className="fixed inset-0 z-[60] flex items-center justify-center p-4">
       <div className="absolute inset-0 bg-black/40 backdrop-blur-sm" onClick={onClose} />
       <div style={{ maxHeight: 'calc(100vh - 1.5rem)' }}
            className="relative w-full max-w-lg bg-white border border-[#E8D5C4] rounded-2xl shadow-2xl flex flex-col overflow-hidden">
@@ -1260,6 +1674,7 @@ function RenameCategoryModal({ categories, counts, initial, onClose, onRename }:
             <p className="text-[11px] font-semibold text-[#8B5A2B] uppercase tracking-wide">What this changes</p>
             <ul className="text-[11px] text-[#6B5744] space-y-1 list-disc pl-4">
               <li>The <b>menu only</b>. Raw-material and liquor-store categories are a different list and are not touched, even where the name is identical.</li>
+              <li>The entry in <b>Menu Categories</b> moves with the items in the same step, so the new name is the one the item form offers and the old one stops being offered. Whether it was retired stays as it was.</li>
               <li>Reports that read the live menu will show the new name for <b>past sales too</b> — that is what a rename means. Sales rows imported from the POS keep their own label, so the Sales page filter may still list the old one.</li>
               <li>The guest QR menu heading changes — and because the guest menu&apos;s section order is a fixed list in the code, a renamed section <b>drops to the end</b> of its part of that menu. Only a developer can put it back in place, so avoid renaming a section you are happy with the position of.</li>
               <li>Re-importing an <b>older menu CSV</b> puts the old name straight back on every item still listed in it (the import matches on Item ID and overwrites the category). Export a fresh CSV before your next import.</li>
@@ -1280,7 +1695,10 @@ function RenameCategoryModal({ categories, counts, initial, onClose, onRename }:
           <button onClick={submit} disabled={!canRename}
                   className="flex items-center gap-2 px-5 py-2 bg-[#af4408] hover:bg-[#8a3506] disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg text-sm font-medium">
             {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle className="w-4 h-4" />}
-            {saving ? 'Renaming…' : `Rename ${count} item${count === 1 ? '' : 's'}`}
+            {/* A category can legitimately have NO items — one just added, or one
+                whose items were moved away. "Rename 0 items" reads like a bug; it
+                is a rename of the category-list entry alone, and says so. */}
+            {saving ? 'Renaming…' : (count > 0 ? `Rename ${count} item${count === 1 ? '' : 's'}` : 'Rename category')}
           </button>
         </div>
       </div>
@@ -1288,7 +1706,7 @@ function RenameCategoryModal({ categories, counts, initial, onClose, onRename }:
   );
 }
 
-function EditItemModal({ item, onClose, onSave, categories, stations, isNew }: { item: MenuItem; onClose: () => void; onSave: (updates: any) => Promise<string | null>; categories: string[]; stations: string[]; isNew: boolean }) {
+function EditItemModal({ item, onClose, onSave, menuCategories, stations, isNew }: { item: MenuItem; onClose: () => void; onSave: (updates: any) => Promise<string | null>; menuCategories: MenuCategory[]; stations: string[]; isNew: boolean }) {
   // Normalize legacy dirty types ('beverages.') so the Type select never
   // renders blank — and a save writes the clean value back.
   const [form, setForm] = useState({ ...item, item_type: normalizeType(item.item_type) || item.item_type });
@@ -1299,6 +1717,57 @@ function EditItemModal({ item, onClose, onSave, categories, stations, isNew }: {
   const tagArr: string[] = Array.isArray(F.tags) ? F.tags : (F.tags ? (() => { try { const j = JSON.parse(F.tags); return Array.isArray(j) ? j : String(F.tags).split(','); } catch { return String(F.tags).split(','); } })() : []);
   const toggleTag = (tg: string) => setForm({ ...form, tags: (tagArr.indexOf(tg) >= 0 ? tagArr.filter(x => x !== tg) : tagArr.concat(tg)) } as any);
   const TAGS: [string, string][] = [['most-ordered', 'Most Ordered'], ['chef', "Chef's"], ['bestseller', 'Bestseller'], ['popular', 'Popular']];
+
+  // What the Category dropdown offers.
+  const activeCategories = useMemo(
+    () => menuCategories.filter(c => c.is_active),
+    [menuCategories],
+  );
+  /**
+   * The item's OWN category, when it is not among the active options.
+   *
+   * Returned so it can be added to the dropdown as an extra, clearly-marked
+   * choice. Comparison is on the EXACT stored string, deliberately: if the
+   * master says "Pizzas" and this row stores "PIZZAS", they are two different
+   * values as far as every report and the guest menu are concerned, and quietly
+   * selecting the master's spelling on the next save would rewrite live menu
+   * data nobody asked to change.
+   */
+  const heldCategory = useMemo(() => {
+    const value = form.category || '';
+    if (!value) return null;
+    if (activeCategories.some(c => c.name === value)) return null;
+    const retired = menuCategories.find(c => c.name === value && !c.is_active);
+    return {
+      value,
+      why: retired ? 'no longer offered (deactivated)' : 'not in the category list',
+    };
+  }, [form.category, activeCategories, menuCategories]);
+
+  /**
+   * The category the item HAD when this modal opened, kept selectable for as
+   * long as it is open.
+   *
+   * `heldCategory` follows the CURRENT selection, which is right for the
+   * marking but meant the held value vanished from the list the moment anything
+   * else was picked: an item on a retired "shooters" showed 48 options, and one
+   * stray pick dropped it to 47 with no way back except Cancel — which throws
+   * away every other edit too. The old free-text box could simply be typed back
+   * into. So the original is offered as well, always. Captured in state at
+   * mount rather than derived, so the master reloading underneath (Manage
+   * Categories can be open at the same time) cannot move it — and, unlike a
+   * ref, it is a render-safe read.
+   *
+   * Strictly ADDITIVE: `heldCategory` above is untouched, so the guarantee that
+   * the item's current value is always an option — the one that must not go
+   * wrong — is exactly as it was.
+   */
+  const [openedWith] = useState<string>(item.category || '');
+  const restorableOriginal = useMemo(() => {
+    if (!openedWith || openedWith === (form.category || '')) return null;  // already selected & marked
+    if (activeCategories.some(c => c.name === openedWith)) return null;    // already in the list
+    return openedWith;
+  }, [openedWith, form.category, activeCategories]);
 
   // onSave (parent saveEdit) handles both create and update, checks res.ok,
   // and returns an error message on failure — modal stays open with the
@@ -1330,8 +1799,42 @@ function EditItemModal({ item, onClose, onSave, categories, stations, isNew }: {
           <div className="grid grid-cols-2 gap-3">
             <div>
               <label className="block text-xs font-medium text-[#6B5744] mb-1">Category</label>
-              <input type="text" list="categories" value={form.category} onChange={e => setForm({ ...form, category: e.target.value })} className="w-full px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm" />
-              <datalist id="categories">{categories.map(c => <option key={c} value={c} />)}</datalist>
+              <select value={form.category || ''} onChange={e => setForm({ ...form, category: e.target.value })}
+                      className="w-full px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm">
+                <option value="">— No category —</option>
+                {/* THE ONE THAT MUST NOT GO WRONG. An item can sit on a category
+                    that is now DEACTIVATED, or on a string with no master row at
+                    all (a legacy value, or one a CSV brought in). If its own
+                    value were not an option, the select would render with
+                    nothing selected and the first careless click — or a browser
+                    that snaps to the first option — would rewrite the category
+                    of an item somebody opened only to fix its PRICE. So the
+                    stored string is ALWAYS offered, matched EXACTLY (never
+                    folded: "PIZZAS" and "Pizzas" are different stored strings
+                    and saving must return the one the row already has), and
+                    labelled with why it is not in the list. */}
+                {heldCategory && (
+                  <option value={heldCategory.value}>
+                    {heldCategory.value} — {heldCategory.why}
+                  </option>
+                )}
+                {/* And the value it had when this modal opened, so a stray pick
+                    is undoable without Cancelling the whole edit. */}
+                {restorableOriginal && (
+                  <option value={restorableOriginal}>
+                    {restorableOriginal} — put it back (its original category)
+                  </option>
+                )}
+                {activeCategories.map(c => <option key={c.id} value={c.name}>{c.name}</option>)}
+              </select>
+              {heldCategory && (
+                <p className="text-[10px] text-amber-700 mt-0.5">
+                  This item keeps “{heldCategory.value}” — {heldCategory.why}. Leave it alone and it stays exactly as it is; pick another only if you mean to move the item.
+                </p>
+              )}
+              {!heldCategory && activeCategories.length === 0 && (
+                <p className="text-[10px] text-[#8B7355] mt-0.5">No categories are active yet — an admin can add one under <b>Manage categories</b>.</p>
+              )}
             </div>
             <div>
               <label className="block text-xs font-medium text-[#6B5744] mb-1">Station</label>

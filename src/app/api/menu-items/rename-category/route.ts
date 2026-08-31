@@ -1,13 +1,23 @@
-import { getDb, logAuditEvent } from '@/lib/db';
+import { getDb, generateId, logAuditEvent } from '@/lib/db';
 import { requireRole, getCurrentOutletId } from '@/lib/auth';
+import {
+  MAX_CATEGORY_LEN,
+  sanitizeCategoryName,
+  foldCategoryName,
+  findMenuCategory,
+} from '@/lib/menu-category';
 
 /**
  * BULK-RENAME A MENU CATEGORY across every item that carries it.
  *
- * There is no `menu_categories` table. `menu_items.category` is a plain TEXT
- * column and the item form writes it as free text (`<input list="categories">`),
- * so a category exists only because items use it and vanishes when none do.
- * A rename is therefore one UPDATE across `menu_items` — nothing else.
+ * `menu_items.category` is a plain TEXT column holding the string; a rename is
+ * therefore one UPDATE across `menu_items`. There is now also a
+ * `menu_categories` MASTER — the list of names the item form offers — and this
+ * route is the ONLY place allowed to move a name on both. It does so in ONE
+ * transaction, so the master and the items can never disagree:
+ * /api/menu-items/categories deliberately refuses a `name` change and points
+ * back here. (Master rows carry an id that nothing else references, so a rename
+ * there is a plain UPDATE, not a re-key.)
  *
  * ── IT REFUSES TO MERGE ─────────────────────────────────────────────────────
  * If the new name already belongs to another category — exactly, or ignoring
@@ -47,55 +57,22 @@ import { requireRole, getCurrentOutletId } from '@/lib/auth';
  *   · Reports that join live to `menu_items` relabel history. That is what a
  *     rename means and it is correct.
  *
+ * ── IT ALSO MOVES THE MASTER ROW ────────────────────────────────────────────
+ * `menu_categories` is the list the item form offers. A rename that moved the
+ * items but not the master would leave the new name unpickable and the old one
+ * still on offer — so the master row is renamed in the SAME transaction, and a
+ * name already in the master (even one no item uses) is a 409 just like a name
+ * already on items. A category that exists ONLY in the master, with no items
+ * yet, is renameable: that is a freshly-added category being corrected, not the
+ * "renamed or emptied by someone else" race the 404 is for.
+ *
  * Body: { from: string, to: string }
  * 200 { renamed, from, to } · 400 bad input · 404 source gone · 409 name taken
+ *
+ * MAX_CATEGORY_LEN / sanitizeCategoryName / foldCategoryName live in
+ * src/lib/menu-category.ts — shared, because the master routes and the CSV
+ * importer now write category names too and a second copy would drift.
  */
-
-/** Long enough for the longest live category (28 chars), short enough to stay
- *  legible in the category chips and the guest menu's section heading. */
-const MAX_CATEGORY_LEN = 60;
-
-/**
- * Clean an incoming category name before it is stored OR compared.
- *
- * `trim().toLowerCase()` alone is not enough: a name can carry characters that
- * take no space on screen, and those defeat the whole point of the refusal
- * below. Proven on a copy of the live DB before this existed — `beer` renamed
- * to `"breads" + U+200B` returned 200 and left `breads` (4 items) and a second
- * `breads` (24 items) side by side, indistinguishable in the picker, on the
- * guest QR menu and in the audit note. A lone U+200B passed the "cannot be
- * blank" guard and produced a category that renders as nothing; `beer` ->
- * `"beer" + U+200B` passed the "nothing to rename" guard and silently changed
- * the key while every surface still read `Renamed "beer" to "beer"`.
- *
- *   · NFC first, so `café` typed as e + U+0301 is the same string as `café`.
- *   · Every kind of whitespace (NBSP, U+3000, tab, newline) becomes one plain
- *     space — a category name is a heading, not a paragraph.
- *   · Format and control characters (U+200B/200C/200D/2060/00AD/180E/FEFF and
- *     friends — Unicode Cf and Cc) are removed outright. They are invisible, so
- *     nobody can have meant to type one.
- *
- * Identity on all 47 live category names (verified), so nothing existing moves.
- */
-const SPACEY = /[\p{Zs}\t\n\r\f\v]+/gu;
-const FORMAT_OR_CONTROL = /[\p{Cf}\p{Cc}]/gu;
-function sanitizeCategoryName(s: unknown): string {
-  return String(s ?? '')
-    .normalize('NFC')
-    .replace(SPACEY, ' ')
-    .replace(FORMAT_OR_CONTROL, '')
-    .replace(/ {2,}/g, ' ')
-    .trim();
-}
-
-/** The comparison key for "does this name already exist?". Sanitised, then
- *  NFKC (folds compatibility look-alikes such as the ﬁ ligature) and lowercased
- *  — JS toLowerCase, never SQLite's LOWER(), which is ASCII-only and lets CAFÉ
- *  through against café. On the live all-ASCII category list this is exactly
- *  the old trim().toLowerCase(), so no existing name starts colliding. */
-function foldCategoryName(s: unknown): string {
-  return sanitizeCategoryName(s).normalize('NFKC').toLowerCase();
-}
 
 export async function POST(req: Request) {
   // Admin only. The single-item menu-item writes (POST/PUT/DELETE on
@@ -148,7 +125,25 @@ export async function POST(req: Request) {
     const run = db.transaction(() => {
       const src = db.prepare('SELECT COUNT(*) AS n FROM menu_items WHERE category = ?').get(from) as any;
       const count = Number(src?.n || 0);
-      if (count === 0) {
+      // The master row for the source, matched on the EXACT string for the same
+      // reason `from` is: a padded "mains " and a clean "mains" are two
+      // different categories, and a NOCASE lookup would hand back the wrong one.
+      //
+      // COLLATE BINARY IS LOAD-BEARING, NOT DECORATION. `menu_categories.name`
+      // is declared COLLATE NOCASE, and a bare `=` INHERITS THE COLUMN'S
+      // COLLATION — so `WHERE name = ?` here was case-insensitive and did
+      // precisely what the paragraph above says it must not. Proven on a copy
+      // of the live DB: {"from":"BREADS","to":"BREADS-ZZ"} returned
+      // 200 {"renamed":0} while the unrelated master row `breads` was renamed
+      // out from under its 4 items — the 404 guard below was bypassed because
+      // `srcMaster` wrongly matched, a live category silently stopped being
+      // pickable, and the audit note said the entry "was renamed with them"
+      // when the entry that moved was a different one. The explicit COLLATE on
+      // the right operand overrides the column's implicit collation (SQLite
+      // datatype rules §7.1), which is the only way to ask this column an
+      // exact-string question.
+      const srcMaster = db.prepare('SELECT * FROM menu_categories WHERE name = ? COLLATE BINARY').get(from) as { id: string; name: string; is_active: number } | undefined;
+      if (count === 0 && !srcMaster) {
         return {
           ok: false as const,
           status: 404,
@@ -195,10 +190,43 @@ export async function POST(req: Request) {
         };
       }
 
+      // THE SAME REFUSAL, ON THE MASTER. A name can sit in `menu_categories`
+      // with no item using it yet (just added, or deactivated after its items
+      // moved away), and the items-only check above cannot see it. Without this
+      // the UPDATE below would hit the master's UNIQUE COLLATE NOCASE index and
+      // surface as a bare 500; worse, if it did not, the picker would end up
+      // offering two rows that render identically. `id <> ` excludes the source
+      // row so re-casing the same category stays legal, exactly as above.
+      const masterClash = findMenuCategory(db, to);
+      if (masterClash && (!srcMaster || masterClash.id !== srcMaster.id)) {
+        const used = Number((db.prepare('SELECT COUNT(*) AS n FROM menu_items WHERE category = ? COLLATE NOCASE').get(masterClash.name) as { n?: number } | undefined)?.n || 0);
+        return {
+          ok: false as const,
+          status: 409,
+          error: `"${masterClash.name}" is already in the category list${masterClash.is_active ? '' : ' (deactivated)'}${used ? ` and ${used} item${used === 1 ? ' uses' : 's use'} it` : ' — no items use it yet'}. Renaming "${from}" to it would merge the two, which this tool will not do. Pick a name that is not already in use.`,
+        };
+      }
+
       // No is_active scoping — see the header. Every row on the old string moves.
       const res = db.prepare(
         `UPDATE menu_items SET category = ?, updated_at = datetime('now') WHERE category = ?`
       ).run(to, from);
+
+      // The master moves WITH the items, in this same transaction. If the source
+      // has no master row (a category that predates the master, or one whose
+      // name is only on items) the new name is created instead, so the rename
+      // always ends with the result pickable — never a rename into a category
+      // nobody can choose. is_active is NOT touched either way: renaming a
+      // retired category leaves it retired.
+      let masterAction: 'renamed' | 'created' | 'none' = 'none';
+      if (srcMaster) {
+        db.prepare(`UPDATE menu_categories SET name = ?, updated_at = datetime('now') WHERE id = ?`).run(to, srcMaster.id);
+        masterAction = 'renamed';
+      } else {
+        const next = db.prepare(`SELECT COALESCE(MAX(sort_order), -1) + 1 AS n FROM menu_categories`).get() as { n?: number } | undefined;
+        db.prepare(`INSERT INTO menu_categories (id, name, sort_order) VALUES (?, ?, ?)`).run(generateId(), to, Number(next?.n || 0));
+        masterAction = 'created';
+      }
 
       // Append-only audit, inside the transaction so it cannot survive a
       // rolled-back rename. logAuditEvent swallows its own errors and never
@@ -209,9 +237,9 @@ export async function POST(req: Request) {
         entity_id: from,
         actor_email: actorEmail,
         outlet_id: outletId,
-        before: { category: from, items: count },
-        after: { category: to, items: res.changes },
-        note: `Renamed menu category "${from}" to "${to}" across ${res.changes} menu item${res.changes === 1 ? '' : 's'} (active and inactive). menu_items only — no raw-material, store or sales row was touched.`,
+        before: { category: from, items: count, master_id: srcMaster?.id || null },
+        after: { category: to, items: res.changes, master: masterAction },
+        note: `Renamed menu category "${from}" to "${to}" across ${res.changes} menu item${res.changes === 1 ? '' : 's'} (active and inactive); the category list entry was ${masterAction === 'renamed' ? 'renamed with them' : 'created so the new name stays pickable'}. menu_items and menu_categories only — no raw-material, store or sales row was touched.`,
       });
 
       return { ok: true as const, renamed: res.changes, from, to };

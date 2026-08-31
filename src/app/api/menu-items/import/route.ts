@@ -1,5 +1,7 @@
-import { getDb, generateId } from '@/lib/db';
+import { getDb, generateId, logAuditEvent } from '@/lib/db';
+import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
 import { buildRecipeMatcher } from '@/lib/recipe-matcher';
+import { MAX_CATEGORY_LEN, ensureMenuCategory, sanitizeCategoryName, findMenuCategory } from '@/lib/menu-category';
 
 interface ImportRow {
   category?: string;
@@ -67,8 +69,25 @@ function normalizeItemType(v: unknown): string {
 }
 
 export async function POST(request: Request) {
+  // NO NEW GATE ON THE IMPORT ITSELF. This route has never carried one (it
+  // leans on the proxy, which authenticates and demands CSRF but checks no
+  // role), the Import button on /menu-items is not admin-only either, and
+  // taking that away from whoever uses it today is not this change's business.
+  // What IS this change's business: it taught this route to write
+  // `menu_categories`, whose own endpoint is requireRole('admin') on both
+  // POST and PUT. Growing an admin-owned master from an ungated route is the
+  // hole, so the MINTING is re-gated at admin — exactly the shape the HR
+  // employee importer uses ("creating masters is admin-only even though the
+  // import itself is canManageHr").
   try {
     const db = getDb();
+    // Resolved here — INSIDE the try, so a session read that throws still comes
+    // back as this route's own {error} shape, and BEFORE the transaction opens,
+    // because better-sqlite3 is synchronous and no `await` may appear inside one.
+    const me = await getCurrentUser();
+    const canMintCategories = me?.role === 'admin';
+    const actorEmail = me?.email || '';
+    const outletId = await getCurrentOutletId();
     const body = await request.json();
     const { rows, overwrite_existing = false, fix_typos = true, strip_spaces = true, skip_inactive = false, skip_zero_price = false, link_materials = true } = body as {
       rows: ImportRow[];
@@ -103,6 +122,33 @@ export async function POST(request: Request) {
       materials_unmatched_items: [] as string[],
       typos_fixed: [] as string[],
       spaces_fixed: 0,
+      // Categories in the file that the master did not have and this import
+      // ADDED (owner's instruction: an unknown category is accepted and created
+      // so it can be edited afterwards — never refused, never silently dropped).
+      // Reported the way the HR employee importer reports created_designations,
+      // so the admin can see exactly what the file added to the master.
+      created_categories: [] as { id: string; name: string }[],
+      // Named but NOT added: the master has a 60-character ceiling so a name
+      // still fits the category chips and the guest-menu heading. The item keeps
+      // the string it was given (nothing about menu_items changes), it just is
+      // not offered in the picker — say so rather than let it vanish.
+      categories_too_long: [] as string[],
+      // The file spells a category the list already has, differently. The master
+      // identifies a name case-insensitively (menu_categories.name is UNIQUE
+      // COLLATE NOCASE), so no row is created — but the ITEM keeps the file's own
+      // capitalisation, deliberately, because rewriting it would be this import
+      // silently re-casing live menu data. That leaves the item off the master's
+      // exact string, which the item form marks as "not in the category list".
+      // Reported so the admin SEES it instead of finding it later: creating
+      // nothing AND saying nothing was the hole here.
+      categories_spelled_differently: [] as { file: string; list: string }[],
+      // Unknown categories a NON-ADMIN's file named. The master is admin-owned
+      // state (POST/PUT /api/menu-items/categories are both requireRole('admin')),
+      // and this route carries no role gate, so a non-admin import must not grow
+      // it. Same shape as the HR employee importer, which lets a manager import
+      // but re-gates "create a new designation" at admin. The items still get
+      // their category string exactly as before; only the picker entry waits.
+      categories_need_admin: [] as string[],
       duplicates_found: [] as string[],
       recipe_links: [] as { item: string; recipe: string; score: number }[],
       unlinked_items: [] as string[],
@@ -153,6 +199,86 @@ export async function POST(request: Request) {
 
     // Track what we've inserted in this batch (by normalized name) to detect in-batch duplicates
     const batchNames = new Map<string, number>();
+
+    /**
+     * MASTER-CATEGORY UPSERT for one row's category. RETURNS the string the
+     * item is to store.
+     *
+     * IT RETURNS THE CLEANED NAME, AND THE ITEM WRITE USES IT. The first cut
+     * sanitised the name it put in the MASTER and wrote the RAW cell onto the
+     * ITEM, so a file spelling "Nitro  Cold  Brews" (two interior double
+     * spaces) reported `created_categories: ["Nitro Cold Brews"]` and then gave
+     * its own items a category that row does not cover — an orphan of the entry
+     * the same import had just minted, and two guest-menu sections whose
+     * headings render identically. sanitizeCategoryName only collapses runs of
+     * whitespace and strips invisible Cf/Cc characters; it is IDENTITY on all
+     * 47 category strings live menu items carry today (verified against the
+     * live DB), so no existing row moves. Case is deliberately NOT folded — see
+     * `categories_spelled_differently`.
+     *
+     * Called only for rows that actually WRITE an item. A row skipped as an
+     * existing duplicate, as inactive or as ₹0 never lands its category on any
+     * item, so minting a master entry for it would put a category in the picker
+     * that nothing uses and nobody asked for.
+     *
+     * Already-known names (including DEACTIVATED ones) are left exactly as they
+     * are: a file naming a retired category is not a request to un-retire it.
+     *
+     * TWO SEPARATE "ONLY ONCE"S, AND THEY ARE NOT THE SAME ONCE. What must
+     * happen once per CATEGORY is the decision — create it / report it too long
+     * / report it as needing an admin. What must happen once per SPELLING is the
+     * `categories_spelled_differently` warning. Collapsing both onto the folded
+     * key (one `seenCats` set, checked first) meant only the FIRST spelling in a
+     * file was ever examined, and every later one landed on an item and was
+     * reported nowhere. Proven on a copy of the live DB: a file spelling a NEW
+     * category three ways (`zz-case`, `ZZ-CASE`, `Zz-Case`) created one row and
+     * reported NOTHING, leaving two items off the master string the same import
+     * had just minted; a file naming an existing `beer` as `BeEr` then `BEER`
+     * reported one of the two. That is the hole the warning exists to close, so
+     * the spelling check now runs for every distinct spelling in the file and
+     * compares against `canon` — the name the picker will actually offer, which
+     * is the master's spelling for a known category and the created row's for a
+     * new one. `canon` is null when this file is putting NO row in the master
+     * (over-long, or a non-admin's unknown category): there is no list entry to
+     * be spelled differently from, and the row is already reported in its own
+     * bucket.
+     */
+    const catCanon = new Map<string, string | null>();
+    const seenSpellings = new Set<string>();
+    const noteCategory = (raw: unknown): string => {
+      const clean = sanitizeCategoryName(raw);
+      if (!clean) return '';                    // blank behaves exactly as it does today
+      const key = clean.toLowerCase();
+      if (!catCanon.has(key)) {
+        // ── ONCE PER CATEGORY ───────────────────────────────────────────────
+        if (clean.length > MAX_CATEGORY_LEN) {
+          report.categories_too_long.push(clean);
+          catCanon.set(key, null);
+        } else {
+          // Already in the master under another capitalisation? Create nothing
+          // (the NOCASE unique index would refuse a second row anyway) and let
+          // the spelling check below say so.
+          const known = findMenuCategory(db, clean);
+          if (known) {
+            catCanon.set(key, known.name);
+          } else if (!canMintCategories) {
+            report.categories_need_admin.push(clean);
+            catCanon.set(key, null);
+          } else {
+            const made = ensureMenuCategory(db, clean);
+            if (made?.created) report.created_categories.push({ id: made.row.id, name: made.row.name });
+            catCanon.set(key, made ? made.row.name : null);
+          }
+        }
+      }
+      // ── ONCE PER SPELLING ─────────────────────────────────────────────────
+      const canon = catCanon.get(key);
+      if (canon && canon !== clean && !seenSpellings.has(clean)) {
+        seenSpellings.add(clean);
+        report.categories_spelled_differently.push({ file: clean, list: canon });
+      }
+      return clean;
+    };
 
     const doImport = db.transaction(() => {
       for (const row of rows) {
@@ -235,10 +361,11 @@ export async function POST(request: Request) {
             report.items_skipped_duplicate++;
             continue;
           }
+          const cleanCat = noteCategory(row.category);
           const ug = gstSplit(Number(row.tax_value) || 0);
           updateItem.run(
             normalized,
-            row.category || '', row.station || '', normalizeItemType(row.item_type) || 'foods', row.dietary_tag || '',
+            cleanCat, row.station || '', normalizeItemType(row.item_type) || 'foods', row.dietary_tag || '',
             sellingPrice, Number(row.listing_price) || 0, row.item_code || '',
             ug.tax, ug.cgst, ug.sgst, isActive ? 1 : 0, recipeId, materialId, row.pos_id || '',
             existing.id
@@ -248,10 +375,11 @@ export async function POST(request: Request) {
           existingMap.set(nameKey, existing);
           report.items_updated++;
         } else {
+          const cleanCat = noteCategory(row.category);
           const id = generateId();
           const ig = gstSplit(Number(row.tax_value) || 0);
           insertItem.run(
-            id, normalized, row.category || '', row.station || '',
+            id, normalized, cleanCat, row.station || '',
             normalizeItemType(row.item_type) || 'foods', row.dietary_tag || '',
             sellingPrice, Number(row.listing_price) || 0, row.item_code || '',
             ig.tax, ig.cgst, ig.sgst, isActive ? 1 : 0, recipeId, materialId, row.pos_id || ''
@@ -259,6 +387,26 @@ export async function POST(request: Request) {
           report.items_created++;
           existingMap.set(nameKey, { id, name: normalized });
         }
+      }
+
+      // The admin UI path logs `menu_category.create` for every row it adds and
+      // the rename route logs its own event; a CSV that grew the same master
+      // left nothing behind at all. One event for the batch, INSIDE the
+      // transaction so a file that throws half way through takes the audit row
+      // down with the categories it minted. logAuditEvent swallows its own
+      // errors and never throws, so it cannot take the import down with it.
+      // Mirrors the HR importer's hr.designation.import_create.
+      if (report.created_categories.length) {
+        logAuditEvent(db, {
+          event_type: 'menu_category.import_create',
+          entity_type: 'menu_category',
+          entity_id: report.created_categories[0].id,
+          actor_email: actorEmail,
+          outlet_id: outletId,
+          before: null,
+          after: { created: report.created_categories, names: report.created_categories.map(c => c.name) },
+          note: `Menu-items CSV import added ${report.created_categories.length} categor${report.created_categories.length === 1 ? 'y' : 'ies'} to the category list: ${report.created_categories.map(c => `"${c.name}"`).join(', ')}. The list decides what the item form offers; no menu item was re-categorised by this.`,
+        });
       }
     });
 
@@ -269,6 +417,8 @@ export async function POST(request: Request) {
     report.duplicates_found = [...new Set(report.duplicates_found)];
     report.unlinked_items = [...new Set(report.unlinked_items)];
     report.materials_unmatched_items = [...new Set(report.materials_unmatched_items)];
+    report.categories_too_long = [...new Set(report.categories_too_long)];
+    report.categories_need_admin = [...new Set(report.categories_need_admin)];
 
     return Response.json(report);
   } catch (error: any) {

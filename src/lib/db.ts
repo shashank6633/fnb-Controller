@@ -556,6 +556,129 @@ function initializeSchema(db: Database.Database) {
     db.exec(`CREATE INDEX IF NOT EXISTS idx_menu_items_direct_reviewed ON menu_items(direct_reviewed)`);
   } catch (e) { console.error('direct_reviewed migration failed:', e); }
 
+  // ── menu_categories — the MENU CATEGORY MASTER ────────────────────────────
+  //
+  // WHAT IT GOVERNS, AND WHAT IT DELIBERATELY DOES NOT.
+  // `menu_items.category` stays a plain TEXT column and keeps STORING THE
+  // STRING. No foreign key, no column change, no data migration. This table
+  // governs exactly one thing: WHAT AN ADMIN CAN PICK in the item form (the old
+  // `<input list="categories">` free text becomes a dropdown of the ACTIVE rows
+  // here). Eight surfaces read menu_items.category — the QR customer menu
+  // (src/lib/customer.ts), the POS/dine-in item list, KDS, dine-in
+  // reconciliation, sales analytics, src/lib/sales-reports.ts, and the
+  // menu-items CSV import + export — and NOT ONE of them joins this table.
+  // That is the whole design: it is why a picker change is a picker change and
+  // not a system-wide one.
+  //
+  // name is UNIQUE COLLATE NOCASE, the same shape as ct_bands.name and for the
+  // same reason: the collation IS the point of the table, not decoration on it.
+  // Free text let "Beer" and "beer" both exist and no GROUP BY could put them
+  // back together; NOCASE makes the second spelling impossible to insert rather
+  // than merely discouraged. The name stays stored exactly as first typed.
+  //
+  // is_active RETIRES a category without deleting it. Items already carrying
+  // that string KEEP it — nothing here ever rewrites menu_items — the category
+  // simply stops being offered. Deleting the row instead would either orphan
+  // those items or force a rewrite of live menu data, and rewriting is what a
+  // RENAME is for: /api/menu-items/rename-category stays the one and only path
+  // that touches menu_items.category, and it now moves this master row in the
+  // same transaction so the two can never disagree.
+  //
+  // sort_order orders the PICKER only. It is NOT the guest QR menu's section
+  // order — that is a fixed list in src/lib/customer.ts, untouched by this.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS menu_categories (
+        id         TEXT PRIMARY KEY,
+        name       TEXT NOT NULL UNIQUE COLLATE NOCASE,
+        sort_order INTEGER NOT NULL DEFAULT 0,
+        is_active  INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_menu_categories_active ON menu_categories(is_active, sort_order);
+    `);
+    // ONE-SHOT SEED — the categories the live menu is already using become the
+    // starting master, so the dropdown opens on day one showing exactly what the
+    // old free-text datalist showed (alphabetical, all 47 of them).
+    //
+    // The settings flag is what makes it a MIGRATION rather than a recompute.
+    // Without it this would re-derive the master from menu_items on EVERY boot,
+    // and a deploy restarts the process: an admin who deactivates "shooters"
+    // would find it offered again the next morning, because the items still
+    // carry the string and the SELECT cannot tell "never seeded" from
+    // "deliberately retired". That is the exact class of bug
+    // scripts/check-boot-migrations.js exists to catch (see its header, and
+    // direct_reviewed_backfill_v1 just above). The flag is written INSIDE the
+    // transaction, so a crash between seed and flag leaves neither and the next
+    // boot retries cleanly.
+    const menuCatSeeded = db.prepare("SELECT value FROM settings WHERE key = 'menu_categories_seed_v1'").get() as any;
+    if (!menuCatSeeded) {
+      const seedMenuCategories = db.transaction(() => {
+        // Blank is not a category. Items may legitimately carry '' (the picker
+        // keeps a "— None —" choice), and seeding '' would put an unnameable row
+        // in the master.
+        //
+        // COUNT(*) rides along because it decides WHICH SPELLING WINS. Two
+        // spellings differing only by case are one category to the NOCASE
+        // unique index, so exactly one of them can be seeded — and the loser's
+        // items become orphans of the picker. Left to INSERT OR IGNORE in
+        // SQLite's own order, the winner was whichever sorted first: on a
+        // fixture carrying one "BAOS" beside the live "baos", the master kept
+        // BAOS and the real items were the ones stranded. The MAJORITY spelling
+        // wins here instead, with the NOCASE sort as a deterministic tie-break.
+        const rows = db.prepare(`
+          SELECT category AS name, COUNT(*) AS n
+            FROM menu_items
+           WHERE category IS NOT NULL AND TRIM(category) <> ''
+           GROUP BY category
+        `).all() as any[];
+        // The seed is the ONE writer that put a name into this table without
+        // cleaning it, and SQLite's TRIM() only strips ASCII spaces — a category
+        // of nothing but a zero-width space passed the blank guard above and
+        // seeded a row that renders as nothing and cannot be typed; a padded
+        // "  soups  " seeded a second row indistinguishable from "soups" in the
+        // picker and on the guest menu. This is the same rule as
+        // sanitizeCategoryName/foldCategoryName in src/lib/menu-category.ts,
+        // repeated here rather than imported because that module imports from
+        // THIS file (generateId) and a cycle in the boot path is not worth
+        // paying for a one-shot. It is IDENTITY on all 47 category strings the
+        // live menu carries, so nothing existing moves. Keep the two in step.
+        const SEED_SPACEY = /[\p{Zs}\t\n\r\f\v]+/gu;
+        const SEED_FORMAT_OR_CONTROL = /[\p{Cf}\p{Cc}]/gu;
+        const cleanCat = (s: unknown) => String(s ?? '')
+          .normalize('NFC').replace(SEED_SPACEY, ' ').replace(SEED_FORMAT_OR_CONTROL, '')
+          .replace(/ {2,}/g, ' ').trim();
+        const best = new Map<string, { name: string; n: number }>();
+        for (const r of rows) {
+          const name = cleanCat(r.name);
+          // 60 is MAX_CATEGORY_LEN: POST /api/menu-items/categories and the CSV
+          // importer both refuse a longer name, so the seed must not be the one
+          // door that lets one in. The items keep their string either way.
+          if (!name || name.length > 60) continue;
+          const key = name.normalize('NFKC').toLowerCase();
+          const n = Number(r.n) || 0;
+          const cur = best.get(key);
+          if (!cur || n > cur.n || (n === cur.n && name.localeCompare(cur.name, undefined, { sensitivity: 'base' }) < 0)) {
+            best.set(key, { name, n });
+          }
+        }
+        // Alphabetical sort_order, so the dropdown opens showing exactly what
+        // the old free-text datalist showed.
+        const names = [...best.values()].map(v => v.name)
+          .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }) || a.localeCompare(b));
+        // OR IGNORE stays, as the belt to the fold's braces: if the JS fold and
+        // SQLite's NOCASE ever disagreed about two names, the second must lose
+        // to the unique index rather than throw and roll the whole seed back.
+        const insMenuCat = db.prepare(`INSERT OR IGNORE INTO menu_categories (id, name, sort_order) VALUES (?, ?, ?)`);
+        names.forEach((n, i) => insMenuCat.run(generateId(), n, i));
+        db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('menu_categories_seed_v1', '1')").run();
+        return names.length;
+      });
+      console.log(`[db] menu_categories_seed_v1: seeded ${seedMenuCategories()} menu categor(ies) from menu_items`);
+    }
+  } catch (e) { console.error('menu_categories migration failed:', e); }
+
   // Migration: extend raw_materials with vendor + recipe-unit + conversion factor + yield (Inventory Module spec)
   try {
     const cols = db.prepare("PRAGMA table_info(raw_materials)").all() as any[];

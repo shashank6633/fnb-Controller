@@ -70,6 +70,14 @@ const ADMIN_OWNED = [
   { re: /\bmaterial_categories\b/,            what: 'department category access' },
   { re: /\bstation\b/,                        what: 'station assignment' },
   { re: /\bDELETE\s+FROM\s+(roles|users)\b/i, what: 'roles/users deletion' },
+  // The menu category master. `is_active` is exactly the shape this lock
+  // exists for: no WHERE clause can tell "never seeded" from "an admin retired
+  // it", so a boot-time UPDATE / INSERT OR REPLACE / DELETE here would put
+  // "shooters" back in the item form's dropdown on the morning after a deploy.
+  // The seed itself is INSERT OR IGNORE — which cannot overwrite or reactivate
+  // an existing row, so it is not in WRITE_RE's scope — but a later edit that
+  // reached for a heavier statement is, and that is the edit worth catching.
+  { re: /\bmenu_categories\b/,                what: 'menu category master (is_active is an admin decision)' },
 ];
 
 /**
