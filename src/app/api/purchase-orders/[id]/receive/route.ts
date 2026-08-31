@@ -10,6 +10,11 @@ import {
 } from '@/lib/po-charges';
 import { resolveQcRequirement, undecidedQcCategories, storePreRejectBlock, QC_AWAITING } from '@/lib/grn-qc';
 import { notifyGrnAwaitingQc } from '@/lib/grn-qc-notify';
+// Turns the ONE unaddressed 'admin' row this route has always written into one
+// row per real person — every active admin, plus the HOD of the department the
+// material belongs to — and reports who could NOT be resolved. See the header of
+// @/lib/po-deviation-alert. It never throws, by contract.
+import { raiseDeviationAlert, type DeviationDeliveryReport } from '@/lib/po-deviation-alert';
 import { fulfilRequisitionFromPo } from '@/lib/po-requisition-fulfil';
 import { receivedPoItemIds, poReceiptLines, liveValueSql } from '@/lib/po-receipts';
 // "Is there a bill number here?" is ONE definition, shared with the receive
@@ -324,6 +329,87 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     // a `compensation_cess` in the body is deliberately NOT read here and cannot
     // write money this line's goods value can't justify (same stance as
     // /api/purchases:310-312).
+    /* ── THE STORE CHECKLIST, ON THE PATH THAT HAS A PO TO CHECK AGAINST ────
+     * The receiving desk's own three, IDENTICAL to the ones POST /api/grn takes
+     * off the ad-hoc form (src/app/api/grn/route.ts:570) and to STORE_QC_FIELDS
+     * on /grn — same keys, same meaning, same signing rule:
+     *
+     *   qc_expiry        Expiry / use-by date checked
+     *   qc_weight        Weight / count verified vs invoice
+     *   qc_invoice_match Invoice matches PO (rate, qty, vendor)
+     *
+     * The third is the one that only makes sense HERE. On an ad-hoc GRN there is
+     * no purchase order, so "invoice matches PO" is a check against a document
+     * that does not exist; on this route the PO is the thing being received
+     * against, and its ordered qty and rate are on screen beside the typed ones.
+     * PO-2026-0028 ordered 1 pcs of DRAGON FRUIT and GRN-2026-0038 took in 9 at a
+     * higher rate — the exact mismatch this box names — and the receive form has
+     * never asked. That is why the checklist is being added to the ONE surface
+     * where a PO exists to match against, rather than left to the ad-hoc form
+     * that cannot perform the check at all.
+     *
+     * ABSENT IS UNTICKED, NEVER SIGNED. Every existing client (and any replayed
+     * payload) sends none of these, so they read undefined -> falsy -> unsigned,
+     * which is exactly the state this route has recorded since it was written.
+     * Adding the fields cannot retro-sign a single historical receipt.
+     */
+    const qcExpiry       = !!body?.qc_expiry;
+    const qcWeight       = !!body?.qc_weight;
+    const qcInvoiceMatch = !!body?.qc_invoice_match;
+    /* ONE SIGNATURE, NOT THREE BOOLEANS — the rule /api/grn:1290 states and this
+     * route must not restate differently: "All three together are what stamps
+     * qc_store_by/qc_store_at; a partial tick is deliberately left unsigned
+     * rather than stamped with a name." Two ticks is not a signature. */
+    const storeSigned = !!(qcExpiry && qcWeight && qcInvoiceMatch);
+    /* ══════════════════════════════════════════════════════════════════════
+     * DECISION: AN UNTICKED "INVOICE MATCHES PO" **RECORDS**. IT DOES NOT BLOCK.
+     * ══════════════════════════════════════════════════════════════════════
+     * Blocking is the more obvious answer and it is the wrong one here, for
+     * three reasons that are about THIS codebase, not about strictness:
+     *
+     * 1. A BLOCK ON A SELF-TICKED BOX BUYS NOTHING. The box is ticked by the
+     *    same person doing the receiving, with no second party. Refusing to
+     *    commit until it is ticked does not produce a check — it produces a
+     *    click, every time, on every receipt, because the alternative is that
+     *    the goods cannot be booked and the vendor's truck is waiting. That is
+     *    the "receiver self-certifying their own receipt" this feature's own
+     *    comments (see /api/grn:1376) exist to end, rebuilt as a mandatory
+     *    field. A tick that cannot be withheld is not evidence.
+     *
+     * 2. THE REAL BLOCK ALREADY EXISTS AND IS STRONGER. Every off-PO line on
+     *    this route already refuses to commit without a TYPED deviation_reason
+     *    of >= 3 characters (the gate ~430 lines below). That cannot be cleared
+     *    by clicking; it makes the receiver write down why 9 arrived against an
+     *    order for 1, and it is on the LINE, not the bill. Adding a second gate
+     *    that one click satisfies would sit in front of the typed one and train
+     *    people to clear both without reading either.
+     *
+     * 3. BLOCKING PUNISHES THE LEGITIMATE CASE. An over-delivery a manager
+     *    already agreed on the phone, an agreed rate change, a short delivery —
+     *    all are receipts where the invoice legitimately does NOT match the PO
+     *    and the honest answer to this box is "no". A block would force the
+     *    receiver to LIE (tick it) to book goods that are genuinely on the bay.
+     *    A control that makes the truthful answer the impossible one produces
+     *    false data, not compliance.
+     *
+     * SO THE CONSEQUENCE IS MADE VISIBLE INSTEAD, IN THREE PLACES:
+     *   · the GRN is filed UNSIGNED (qc_store_by '' / qc_store_at NULL) and
+     *     every surface that reads those columns says so;
+     *   · `qc_store` in the response lets the receive screen state it before and
+     *     after Confirm, so nobody discovers it later;
+     *   · on a receipt that ALSO deviated, the unticked answer is written into
+     *     the deviation alert body (see `note` at the raiseDeviationAlert call),
+     *     so the admins and the department's HOD are told, in words, that this
+     *     over-receipt was recorded and NOT reconciled against the order.
+     * That last one is the pairing that makes recording work: it only became a
+     * real consequence when the alert started reaching actual people, which is
+     * what the same lane's po-deviation-alert.ts fixed.
+     *
+     * IF A FUTURE OWNER WANTS A HARD BLOCK, it belongs on a SECOND person
+     * (a manager counter-sign on a deviating receipt), not on this checkbox —
+     * a one-click gate in front of the typed reason is a downgrade, not an
+     * upgrade.
+     * ══════════════════════════════════════════════════════════════════════ */
     const overrides: Map<string, { quantity?: number; unit_price?: number; accepted?: number; rejection_reason?: string; deviation_reason?: string; gst_rate?: any; cgst?: any; sgst?: any; cess_rate?: any }> = new Map();
     if (Array.isArray(body?.item_overrides)) {
       for (const o of body.item_overrides) {
@@ -1278,27 +1364,36 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // it learned 'void'. qc_required / qc_checker record that this receipt WAS
       // gated and by whom, so the fact survives the status returning to
       // received/partial once the kitchen signs.
-      // ── AND NO STORE SIGNATURE, BECAUSE THIS SCREEN ASKS FOR NONE ────────
-      // THE SIX LEGACY qc_* TICKS ARE STILL NOT WRITTEN ON THIS PATH — they
-      // never were, and the receive screen has no checklist. qc_store_by /
-      // qc_store_at are therefore ALSO left empty, and that is the honest state
-      // rather than an omission: they are the STORE half of the owner's
-      // decision-4 split (expiry / use-by, weight-and-count vs invoice, invoice
-      // matches PO), and stamping a name for three checks the receiver was never
-      // shown would be the same worthless self-certification the kitchen half of
-      // this feature exists to replace — a signature nobody gave, on a screen
-      // that never asked. received_by already records who took the delivery in,
-      // and poWriteGate() already proves they were entitled to; neither is a
-      // statement that the goods were checked against the bill.
-      // POST /api/grn does stamp it, because that form DOES carry the three
-      // boxes — and only when all three are ticked. To make it stampable here,
-      // add the same three to the receive screen and bind them the same way.
+      // ── AND THE STORE'S OWN SIGNATURE, NOW THAT THIS SCREEN ASKS ─────────
+      // The receive form carries the SAME THREE store checks the ad-hoc GRN form
+      // does (see qcExpiry/qcWeight/qcInvoiceMatch above), so this path can and
+      // does stamp qc_store_by / qc_store_at — bound exactly the way
+      // /api/grn:1394 binds them, because two forms writing one pair of columns
+      // by two different rules is how a signature stops meaning one thing.
+      //
+      // THE KITCHEN'S THREE ARE STILL NOT WRITTEN HERE, deliberately.
+      // qc_quality / qc_temperature / qc_damage belong to the checking
+      // department and are stamped by decideGrnQc at sign-off; the whole point
+      // of the decision-4 split is that the person who takes the delivery in
+      // does not also certify its quality. Only the STORE half is the receiving
+      // desk's to answer, and only the store half is written.
+      //
+      // ALL THREE OR UNSIGNED. `storeSigned` is the single AND of the three;
+      // a partial tick writes the ticks it was given and leaves qc_store_by ''
+      // and qc_store_at NULL, which reads as what it is — the store did not
+      // finish answering — rather than putting a name against a half-done check.
+      // CASE, not a JS ternary, so the name and the timestamp can never
+      // disagree; datetime('now') so every stamp in this table is on one clock.
       db.prepare(`
         INSERT INTO goods_receipt_notes
           (id, grn_number, date, po_id, vendor_id, vendor, invoice_number, invoice_date,
            received_by, status, notes, outlet_id,
-           qc_required, qc_checker, qc_outcome, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+           qc_required, qc_checker, qc_outcome,
+           qc_expiry, qc_weight, qc_invoice_match, qc_store_by, qc_store_at,
+           created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, CASE WHEN ? = 1 THEN datetime('now') ELSE NULL END,
+                datetime('now'))
       `).run(grnId, grnNumber, receivedAt, id, billVendorId, billVendorName || po.vendor || '',
               billNo, billNo ? billDate : '',
               receivedByEmail,
@@ -1307,7 +1402,9 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
                 + (isMultiVendorPo ? ` — ${billVendorName || '(no vendor)'} only` : ''),
               po.outlet_id,
               qc.required ? 1 : 0, qc.required ? qc.checker : '',
-              qc.required ? 'pending' : '');
+              qc.required ? 'pending' : '',
+              qcExpiry ? 1 : 0, qcWeight ? 1 : 0, qcInvoiceMatch ? 1 : 0,
+              storeSigned ? receivedByEmail : '', storeSigned ? 1 : 0);
 
       // ── The BILL row (gross basis) ─────────────────────────────────────
       // The exact opposite basis to the purchases row above, and it has to be.
@@ -1795,7 +1892,22 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     // guessing from its own line counters. Stays null when nothing was logged
     // (no deviation, or the whole alert block threw and was swallowed).
     let loggedEventType: string | null = null;
+    // WHO WAS ACTUALLY TOLD. Stays null when nothing deviated (a bill-charge-only
+    // receipt raises the broadcast row but addresses nobody — the charge is not a
+    // line deviation and has no material, so it has no department to route to).
+    let deviationNotified: DeviationDeliveryReport | null = null;
+    // Hoisted so the ADDRESSED delivery can run outside the audit/broadcast
+    // block's own try/catch — see where they are assigned.
+    let devNotifKey: string | null = null;
+    let devExcessOnly = false;
     if (deviationLines.length > 0 || chargeAlloc.discount_applied > 0) {
+      // THE DEDUP KEY, MINTED ONCE, BEFORE ANYTHING CAN THROW.
+      // Both rails hang off it — the broadcast row below uses it verbatim, and
+      // the addressed copies suffix it with ':to:<userId>'. It is built HERE
+      // rather than inside the try because the addressed rail must survive a
+      // failure of the audit write; when it was assigned mid-block, a throwing
+      // logAuditEvent left it null and silenced the very alert this work adds.
+      devNotifKey = `po:${id}:grn:${(result as any).grn_id}`;
       try {
         const totalExcessValue = excessLines.reduce((s, l) => s + l.excess_value, 0);
         const netValueImpact = Math.round(deviationLines.reduce((s, l) => s + l.value_impact, 0) * 100) / 100;
@@ -1855,6 +1967,12 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           && shortLines.length === 0 && rateChangedLines.length === 0 && accShortLines.length === 0;
         const eventType  = excessOnly ? 'po.received_excess'  : 'po.received_deviation';
         const notifKind  = excessOnly ? 'po_received_excess'  : 'po_received_deviation';
+        // Handed to the ADDRESSED delivery below, which runs in its own try/catch
+        // OUTSIDE this block. Telling the admins and the HOD must not depend on
+        // the audit payload serialising or the broadcast INSERT succeeding — if
+        // either threw, this block's catch would swallow it and nobody would be
+        // told, which is the exact defect being fixed.
+        devExcessOnly = excessOnly;
 
         // 1. Audit event — always written, surfaces on /audit page
         logAuditEvent(db, {
@@ -1967,7 +2085,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         // still mints exactly one row (it has exactly one GRN), and a second
         // receive of the same PO is now refused outright by the claim above, so
         // nothing is lost by dropping the PO-level dedup.
-        const notifKey = `po:${id}:grn:${(result as any).grn_id}`;
+        const notifKey = devNotifKey;
         db.prepare(`
           INSERT OR IGNORE INTO notifications
             (id, kind, party_unique_id, channel, recipient, title, body)
@@ -1999,7 +2117,129 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         console.error('[receive PO] deviation notification failed:', e);
         /* swallow — the receive itself is already committed */
       }
+
+      // ── THE SAME NEWS, ADDRESSED TO ACTUAL PEOPLE ───────────────────────
+      // The notifications row above is a BROADCAST: its recipient is the literal
+      // string 'admin', which is not a user id, not an email and not a role
+      // lookup, and nothing in the app ever resolved it into anybody. Seventeen
+      // of them sit in this database, every one with sent_at NULL — detection
+      // worked, delivery never existed. That row is kept EXACTLY as it is (the
+      // /grn badge lane reads it by that key and kind); this adds the delivery it
+      // never had: one row per active admin, plus the head of the department each
+      // material belongs to, addressed by email and stamped sent_at.
+      //
+      // ITS OWN try/catch, OUTSIDE the block above, deliberately. If the audit
+      // payload failed to serialise or the broadcast INSERT threw, that block's
+      // catch would swallow it — and telling people would be lost with it, which
+      // is precisely the defect being fixed. The two now fail independently.
+      //
+      // ONLY WHEN A LINE ACTUALLY DEVIATED. A receipt whose only entry here is a
+      // bill discount has no material and therefore no department to route to; it
+      // keeps the broadcast row and addresses nobody.
+      //
+      // AWAITED, AND THAT IS SAFE: raiseDeviationAlert never throws by contract
+      // (and this catch is the belt to that braces), and the WhatsApp rail returns
+      // without touching the network while its settings are incomplete. The
+      // receive COMMITTED long before this line — nothing here can roll back a
+      // delivery that is already in the books, and the catch guarantees a failure
+      // to tell anyone still returns a successful receipt.
+      if (deviationLines.length > 0 && devNotifKey) {
+        try {
+          deviationNotified = await raiseDeviationAlert(db, {
+            baseKey:    devNotifKey,       // the broadcast row's key, + ':to:<userId>'
+            lines:      deviationLines,    // this route's own detection, passed through untouched
+            excessOnly: devExcessOnly,
+            poNumber:   String(po.po_number || ''),
+            grnNumber:  String((result as any).grn_number || ''),
+            vendor:     group.vendor_name || po.vendor || '',
+            billNo,
+            receivedBy: receivedByEmail,
+            // ── WHAT THE STORE CHECKLIST IS *FOR*, ON A DEVIATING RECEIPT ────
+            // The three boxes RECORD rather than BLOCK (see the decision note
+            // where they are read). Recording only has teeth if somebody reads
+            // it, so the answer travels in the alert that now actually reaches
+            // people — the admins and the department's HOD. An over-receipt
+            // whose "Invoice matches PO" was left unticked reads, to the person
+            // who has to act on it, as a delivery NOBODY reconciled against the
+            // order; one that was ticked reads as a difference somebody looked
+            // at and accepted, with a name against it. Those are two very
+            // different pieces of news about the same 1-vs-9 line, and the
+            // alert would otherwise report them identically.
+            note: storeSigned
+              ? `Store check at the bay: SIGNED by ${receivedByEmail || 'the receiver'} `
+                + `— expiry, weight/count and invoice-vs-PO all confirmed against this bill.`
+              : `Store check at the bay: NOT SIGNED — `
+                + [
+                    ...(qcInvoiceMatch ? [] : ['invoice-vs-PO (rate, qty, vendor) was NOT confirmed']),
+                    ...(qcWeight ? [] : ['weight/count was NOT verified against the invoice']),
+                    ...(qcExpiry ? [] : ['expiry / use-by was NOT checked']),
+                  ].join('; ')
+                + `. This difference was recorded, not reconciled.`,
+          });
+        } catch (e) {
+          console.error('[receive PO] addressed deviation alert failed (non-fatal):', e);
+          /* swallow — a lost alert is bad; a lost receipt is far worse */
+        }
+      }
     }
+
+    /* ── THE "WHO WAS TOLD" SUMMARY, BUILT WHERE IT CANNOT COST A RECEIPT ────
+     * This used to be drilled inline in the response literal below —
+     * `deviationNotified.delivered.map(...)`, `.audience.departments.map(...)` —
+     * OUTSIDE every try/catch and AFTER the money committed. raiseDeviationAlert
+     * *throwing* was fully guarded; raiseDeviationAlert returning a shape one
+     * field short was not, and a report with no `audience` turned a receipt that
+     * had already landed 9 pcs of stock, a GRN and a purchases row into an
+     * HTTP 500 — telling the receiver their delivery failed when it had not, and
+     * inviting a retry that the atomic claim then refuses with a 409.
+     *
+     * Nothing live can produce that shape today (all four return paths in
+     * raiseDeviationAlert yield a full report). That is exactly the point: the
+     * route leans on a promise — "never returns anything but a complete report"
+     * — that is written down nowhere, in the one place a broken promise is paid
+     * for by the receipt rather than by the alert. Every read below is now
+     * shape-checked, and the whole build is inside a catch that degrades to a
+     * stated gap. A receipt is never lost to a bad alert report. */
+    const deviationNotifiedSummary = (() => {
+      if (!deviationNotified) return null;
+      try {
+        const rep = deviationNotified as Partial<DeviationDeliveryReport>;
+        const delivered = Array.isArray(rep.delivered) ? rep.delivered : [];
+        const audience = (rep.audience ?? {}) as Partial<DeviationDeliveryReport['audience']>;
+        const depts = Array.isArray(audience.departments) ? audience.departments : [];
+        return {
+          recipients: delivered.map(d => ({
+            email: d?.recipient ?? '', scope: d?.scope ?? '',
+            // EVERY department this person's copy covers. A head who runs two of
+            // them used to be reported under one, while the other department's
+            // lines reached nobody and `gaps` stayed empty.
+            departments: Array.isArray(d?.department_names) ? d.department_names : [],
+            lines: d?.lines ?? 0,
+          })),
+          departments: depts.map(d => ({
+            department: d?.department_name ?? '',
+            lines: Array.isArray(d?.lines) ? d.lines.length : 0,
+            // NAMED, NOT EMAILED — the same rule composeAlert states for the
+            // alert body itself. This route is gated to management OR a store
+            // manager (po-helpers.ts), so returning addresses handed the whole
+            // HOD roster to a manager-tier receiver for no gain: the name is
+            // what answers "who was told", and the address is a lookup away for
+            // anyone entitled to it.
+            heads: Array.isArray(d?.heads) ? d.heads.map(h => h?.name || h?.email || '') : [],
+          })),
+          gaps: Array.isArray(audience.gaps) ? audience.gaps : [],
+          whatsapp: rep.whatsapp ?? null,
+          errors: Array.isArray(rep.errors) ? rep.errors : [],
+        };
+      } catch (e) {
+        console.error('[receive PO] deviation alert report could not be summarised (non-fatal):', e);
+        return {
+          recipients: [], departments: [],
+          gaps: ['the alert report could not be read — who was told is unknown for this receipt'],
+          whatsapp: null, errors: [String((e as any)?.message || e)],
+        };
+      }
+    })();
 
     return Response.json({
       success: true,
@@ -2027,6 +2267,17 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // the honest answer to "who did you tell" — on today's data (no user
       // resolves to main department Kitchen) that list is often the admins only.
       qc_required: qc.required,
+      // ── THE STORE'S OWN THREE, AND WHETHER THEY ADDED UP TO A SIGNATURE ───
+      // Returned so the screen can say what was just filed rather than leaving
+      // the receiver to assume a checklist they half-answered counted. `signed`
+      // is the AND of the three, i.e. exactly what decided qc_store_by — one
+      // field, so a reader can never re-derive the rule a fourth way.
+      // `signed_by` is the name actually stamped, or '' when unsigned.
+      qc_store: {
+        expiry: qcExpiry, weight: qcWeight, invoice_match: qcInvoiceMatch,
+        signed: storeSigned,
+        signed_by: storeSigned ? receivedByEmail : '',
+      },
       // The QC STATE, not the GRN's status: 'awaiting_qc' when held, and
       // 'not_required' when this delivery took the pre-existing path (whose
       // final status is 'received' or 'partial' and is read from /api/grn, as
@@ -2061,6 +2312,15 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // deviation" from these must not read "none" for a short-accept that moved
       // real stock and money.
       deviation_lines: deviationLines.length,
+      // WHO WAS TOLD, and who could not be — the honest answer to "the admin was
+      // alerted", which this route has been claiming in its copy while the row it
+      // wrote reached nobody. Mirrors qc_notified above: emails actually written
+      // to, the department each line routed to, and the gaps in plain words (no
+      // head set, or a category in no department's list). null when nothing
+      // deviated. The WhatsApp half reports which SETTING kept it dark.
+      // Built above, where a malformed report costs a field rather than the
+      // receipt; heads are NAMED, not emailed.
+      deviation_notified: deviationNotifiedSummary,
       short_lines: shortLines.length,
       over_lines: overLines.length,
       acc_short_lines: accShortLines.length,

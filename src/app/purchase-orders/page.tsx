@@ -782,6 +782,28 @@ function ChargeRow({ label, hint, mode, value, onMode, onValue, placeholder, res
   );
 }
 
+/** One line of the store checklist. A LABEL wraps the input, so the whole row is
+ *  the hit target — this is used on a tablet at the receiving bay, where a bare
+ *  13px checkbox is a miss waiting to happen. `tone='warn'` is worn only by
+ *  "Invoice matches PO" when the screen can already see a mismatch, so the box
+ *  that is about to be asked a harder question looks like it. */
+function StoreCheck({ checked, onChange, label, tone = 'plain' }: {
+  checked: boolean; onChange: (v: boolean) => void; label: string; tone?: 'plain' | 'warn';
+}) {
+  return (
+    <label className={`flex items-start gap-2 cursor-pointer rounded px-2 py-1.5 border ${
+      tone === 'warn' && !checked
+        ? 'border-amber-300 bg-amber-50/60'
+        : 'border-transparent hover:bg-[#F5EDE3]'}`}>
+      <input type="checkbox" checked={checked} onChange={e => onChange(e.target.checked)}
+             className="mt-0.5 w-3.5 h-3.5 shrink-0 accent-[#af4408]" />
+      <span className={`text-[11px] leading-snug ${tone === 'warn' && !checked ? 'text-amber-900' : 'text-[#2D1B0E]'}`}>
+        {label}
+      </span>
+    </label>
+  );
+}
+
 function ReceiveModal({ poId, role, onClose, onReceived }: {
   poId: string; role: 'admin' | 'manager'; onClose: () => void; onReceived: () => void;
 }) {
@@ -839,6 +861,16 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
   const [chargesNote, setChargesNote] = useState('');
   const [billNo, setBillNo] = useState('');
   const [billDate, setBillDate] = useState<string>(new Date().toISOString().slice(0, 10));
+  /* ── THE STORE CHECKLIST — the receiving desk's own three ────────────────
+     Identical in key, wording and signing rule to STORE_QC_FIELDS on /grn
+     (src/app/grn/page.tsx:280), because the ad-hoc form and this one are two
+     doors into the same three columns. All three together stamp
+     qc_store_by/qc_store_at server-side; a partial tick is recorded and left
+     UNSIGNED. They start false — unticked is the honest default and it is what
+     every receipt on this route has recorded until now. */
+  const [qcExpiry, setQcExpiry] = useState(false);
+  const [qcWeight, setQcWeight] = useState(false);
+  const [qcInvoiceMatch, setQcInvoiceMatch] = useState(false);
   /* ── ONE PO, MANY VENDORS, ONE BILL EACH ────────────────────────────────
      A PO here is an internal approval document, so it legitimately spans
      several vendors — each of whom turns up on their own day with their own
@@ -917,6 +949,11 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
     // of it may carry over to the next vendor, so it is cleared with the reload.
     setReasons({}); setRateDraft({}); setExcluded({});
     setBillNo(''); setChargesNote('');
+    /* THE STORE CHECKLIST IS PER BILL, so it is cleared with everything else.
+       Carrying it across a vendor switch would sign vendor B's delivery with the
+       ticks somebody gave for vendor A's — goods they never had in front of
+       them. Same reason setBillNo('') sits on this line. */
+    setQcExpiry(false); setQcWeight(false); setQcInvoiceMatch(false);
     setDiscountValue(''); setDeliveryValue('');
     setDiscountMode('amt'); setDeliveryMode('amt');
     // Tax belongs to the vendor's bill, not to the PO — the next vendor's bill
@@ -1279,6 +1316,45 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
      blank) cleared this gate AND the route's, so Confirm went live on a box that
      looked empty and the receipt stored a bill number nothing can display. */
   const billNoMissing = !normalizeBillNo(billNo);
+
+  /* ══════════════════════════════════════════════════════════════════════════
+   * DECISION: "INVOICE MATCHES PO" **PRE-FLAGS** THE MISMATCH IT CAN ALREADY SEE.
+   * ══════════════════════════════════════════════════════════════════════════
+   * This form already holds both halves of the comparison — `d.it.quantity` and
+   * `d.it.unit_price` are what the PO ordered, `d.ov` is what the receiver has
+   * typed — and the `deviations` memo above has ALREADY computed the difference
+   * for the reason gate. So the screen knows "PO says 1 pcs, you have entered 9
+   * pcs" with certainty, before anybody ticks anything.
+   *
+   * Not saying so would be the whole failure again. PO-2026-0028 ordered 1 and
+   * GRN-2026-0038 took in 9 at a higher rate, and it sailed through precisely
+   * because the mismatch was sitting in the data with nothing drawing a human
+   * eye to it. A checkbox that silently waits to be ticked is the same passive
+   * surface: it asks the receiver to notice, unaided, the exact thing they have
+   * just demonstrably failed to notice.
+   *
+   * So the box NAMES what it can see, and — this is the part that matters — the
+   * QUESTION CHANGES when there is a mismatch. On a clean receipt "Invoice
+   * matches PO" means "I compared them and they agree". On a deviating one that
+   * sentence would be a lie, so the box instead asks the receiver to confirm the
+   * difference is a KNOWN and AGREED one. Those are different statements and the
+   * label must not conflate them, or a tick means two things and evidences
+   * neither.
+   *
+   * It is a FLAG, not a gate — nothing here disables Confirm. See the block-vs-
+   * record decision in the receive route for why.
+   */
+  const poMismatches = useMemo(
+    () => activeDeviations.filter(d => d.deviates).map(d => {
+      const u = d.u ? ` ${d.u}` : '';
+      const bits: string[] = [];
+      // The owner's own sentence shape: what the PO says, then what is on screen.
+      if (d.qtyOff) bits.push(`PO says ${qfmt(d.it.quantity)}${u}, you have entered ${qfmt(Number(d.ov.quantity) || 0)}${u}`);
+      if (d.rateOff) bits.push(`PO rate ₹${d.it.unit_price.toFixed(2)}${d.u ? `/${d.u}` : ''}, you have entered ₹${(Number(d.ov.unit_price) || 0).toFixed(2)}${d.u ? `/${d.u}` : ''}`);
+      return { id: d.it.id, name: d.it.material_name, text: bits.join(' · ') };
+    }),
+    [activeDeviations],
+  );
   /* …AND THE BLOCK HAS TO BE ON SCREEN. chargeBlockers renders inside the
      scrolling body, at the BOTTOM of it. Measured in a real browser on a 10-line
      PO at 1280×900 with the modal freshly opened: the scroll body ends at y=842,
@@ -1405,6 +1481,15 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
           // server's scope is exactly the set of rows on screen; anything the
           // receiver took off stays outstanding and keeps the PO open.
           line_ids: activeDeviations.map(d => d.it.id),
+          /* THE STORE'S OWN THREE. Sent flat, under the SAME keys POST /api/grn
+             takes from the ad-hoc form, so one payload shape describes the
+             checklist on both doors. All three true is what stamps
+             qc_store_by/qc_store_at server-side; anything less is recorded and
+             filed unsigned — the server is the one that decides that, not this
+             screen, which only reports what it will do. */
+          qc_expiry: qcExpiry,
+          qc_weight: qcWeight,
+          qc_invoice_match: qcInvoiceMatch,
           // Rupees, resolved from the %/₹ toggle here. The server re-allocates
           // from its own effective line values — it never trusts these shares.
           // bill_charges is the ONLY carrier for bill_date, so gate it on the
@@ -1572,12 +1657,64 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
         );
       }
       if (deviating.length > 0) {
-        // Counted from what we SENT rather than a response field, so this stays
-        // true whatever the route names its counters. Short qty and rate changes
-        // raise the same admin alert as excess.
+        /* WHO WAS ACTUALLY TOLD — read off j.deviation_notified, never asserted.
+           This line used to end "…and the admin has been notified for review"
+           unconditionally, while the very response it was built from could carry
+           `departments:[{"department":"Kitchen","heads":[]}]` and
+           `gaps:["no HOD is resolvable for Kitchen — nobody in that department
+           was told"]`. On today's data that made the sentence false on every
+           Kitchen deviation, and it stayed just as confident when the alert rail
+           failed outright (`deviation_notified: null`, zero rows written). The
+           whole record-don't-block decision rests on the consequence being made
+           VISIBLE instead of enforced, so this is the one sentence that may not
+           be a guess. The COUNT still comes from what we sent — that meaning is
+           unchanged — but every claim about people now comes from the server.
+           `null` is ambiguous on its own (it is also the value when nothing
+           deviated), so the server's own deviation_lines disambiguates it. */
+        const dn = j.deviation_notified;
+        const told: any[] = Array.isArray(dn?.recipients) ? dn.recipients : [];
+        const admins = told.filter(r => r?.scope === 'admin').length;
+        const heads = told.length - admins;
+        const gaps: string[] = Array.isArray(dn?.gaps) ? dn.gaps : [];
+        const who = !dn
+          ? (Number(j.deviation_lines) > 0
+              ? 'The off-PO alert could NOT be raised — nobody has been told. Tell the purchasing admin directly.'
+              : 'The server recorded no off-PO difference on this receipt, so no alert was raised.')
+          : told.length === 0
+            ? 'The alert reached NOBODY. Tell the purchasing admin directly.'
+            : `Alerted: ${admins} admin(s)`
+              + (heads > 0 ? ` and ${heads} department head(s).` : ', and NO department head.');
         notes.push(
           `${deviating.length} line(s) differed from the PO (qty and/or rate). ` +
-          'The reason you gave has been recorded and the admin has been notified for review.'
+          'The reason you gave has been recorded. ' + who +
+          (gaps.length ? ` Not everyone could be reached — ${gaps.join('; ')}` : '')
+        );
+      }
+      /* THE STORE CHECK, AS THE SERVER FILED IT — read off j.qc_store, not off
+         this screen's own three booleans. The server owns the AND that decides
+         a signature, and a receipt filed unsigned must not be reported as signed
+         because the client re-derived the rule and disagreed. Stated on BOTH
+         outcomes: "signed" is the receiver's confirmation that their name went
+         on it, and "unsigned" is the fact they most need to leave with, because
+         it is the one they cannot see once the modal closes. */
+      if (j.qc_store) {
+        const s = j.qc_store;
+        notes.push(
+          s.signed
+            ? `Store check: SIGNED by ${s.signed_by || 'you'} — expiry, weight/count and invoice-vs-PO all confirmed.`
+            : `Store check: filed UNSIGNED — `
+              + [
+                  ...(s.invoice_match ? [] : ['invoice-vs-PO not confirmed']),
+                  ...(s.weight ? [] : ['weight/count not verified']),
+                  ...(s.expiry ? [] : ['expiry not checked']),
+                ].join(', ')
+              + `. The receipt stands; the GRN records that the store did not complete the check`
+              // WHO was told is stated once, above, from the server's own answer
+              // — this line says only what this receipt DID, which is the part
+              // the receiver cannot see again once the modal closes.
+              + (deviating.length > 0 && !s.invoice_match
+                  ? `, and the off-PO line(s) go out on the alert as recorded but NOT reconciled.`
+                  : '.')
         );
       }
       if (j.excess_lines > 0) {
@@ -1707,13 +1844,31 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
                      norm, which is what turns it into an everyday mis-file.
                      Clearing it also re-arms the gate, so the next vendor's
                      number has to be typed.
+                     THE STORE CHECKLIST DOES NOT CROSS THE TAB EITHER, and for a
+                     stronger reason than the bill number. Its reset was written
+                     into load(), which does NOT run on a tab switch — so ticking
+                     all three for VENDOR ALPHA and then clicking VENDOR BETA left
+                     the three ticked, the footer still reading "filed signed by
+                     you", and a Confirm then stamped qc_store_by against BETA's
+                     bill. A stale discount is a number the next reader can
+                     re-check; a stale signature is a NAME on a document asserting
+                     that a human physically checked goods they never saw, and it
+                     is the only carry-over that can turn a deliberate half-answer
+                     ("I could not verify the count") into a full signature on
+                     someone else's delivery. Reproduced in the running app:
+                     ticks [true,true,true] survived the switch while the bill
+                     cleared to "", and GRN-2026-0032 filed VENDOR BETA / BETA-222
+                     as 1/1/1 signed by admin@local.
                      NOTE, NOT FIXED HERE: chargesNote / discount / delivery /
                      billDate / reasons / rateDraft / excluded still carry over
                      the same way. That is pre-existing and belongs to a separate
-                     decision — this change is the bill number. */
+                     decision — this change is the bill number and the checklist. */
                   return (
                     <button key={v.key} type="button" disabled={v.done}
-                            onClick={() => { setVendorKey(v.key); setBillNo(''); }}
+                            onClick={() => {
+                              setVendorKey(v.key); setBillNo('');
+                              setQcExpiry(false); setQcWeight(false); setQcInvoiceMatch(false);
+                            }}
                             className={`text-left px-2.5 py-2 rounded-lg border text-[11px] transition-colors ${
                               v.done ? 'border-[#E8D5C4] bg-white/50 opacity-70 cursor-default'
                               : active ? 'border-[#af4408] bg-white ring-1 ring-[#af4408]'
@@ -2226,6 +2381,102 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
                   (floor {fmt(MIN_NET_RATE)}). Reduce the discount, or record it as a credit note instead.
                 </div>
               )}
+            </div>
+          )}
+
+          {/* ══════════════════════════════════════════════════════════════════
+              STORE CHECK AT THE BAY — the receiving desk's own three.
+              ══════════════════════════════════════════════════════════════════
+              The SAME three checks the ad-hoc GRN form asks (STORE_QC_FIELDS,
+              src/app/grn/page.tsx:280), asked here for the first time. The third
+              — "Invoice matches PO" — is the one that can only be answered on
+              THIS screen: an ad-hoc GRN has no purchase order to match against,
+              and this route does. It is the check that catches 9 delivered
+              against an order for 1, at the bay, while the vendor is still there.
+
+              ALL THREE OR UNSIGNED. The server ANDs them into one signature
+              (qc_store_by / qc_store_at); two ticks is recorded and left
+              unsigned. The footer below says which of the two is about to
+              happen, so a half-answered checklist is never a surprise found
+              later on the GRN.
+
+              NOTHING HERE DISABLES CONFIRM — see the block-vs-record decision in
+              the receive route. The gate on a deviating line is the typed
+              reason, which is already mandatory and cannot be cleared by
+              clicking. */}
+          {!loading && stake && (
+            <div className="rounded-lg border border-[#E8D5C4] bg-[#FFF8F0] px-3 py-2.5 space-y-2">
+              <div className="text-xs font-semibold text-[#2D1B0E]">
+                Store check at the bay
+                <span className="ml-1 font-normal text-[10px] text-[#8B7355]">
+                  — all three together are your signature on this receipt
+                </span>
+              </div>
+
+              {/* THE PRE-FLAG. What the form can already see, said out loud
+                  BEFORE the box is ticked, rather than waiting to be noticed. */}
+              {poMismatches.length > 0 && (
+                <div className="flex items-start gap-2 rounded border border-amber-300 bg-amber-50 px-2 py-1.5 text-[11px] text-amber-900">
+                  <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" />
+                  <div>
+                    <div className="font-semibold">
+                      This delivery does NOT match the purchase order on {poMismatches.length} line(s):
+                    </div>
+                    <ul className="mt-0.5 space-y-0.5">
+                      {poMismatches.map(m => (
+                        <li key={m.id}>• <span className="font-medium">{m.name}</span> — {m.text}</li>
+                      ))}
+                    </ul>
+                  </div>
+                </div>
+              )}
+
+              <div className="space-y-1.5">
+                <StoreCheck checked={qcExpiry} onChange={setQcExpiry}
+                            label="Expiry / use-by date checked" />
+                <StoreCheck checked={qcWeight} onChange={setQcWeight}
+                            label="Weight / count verified vs invoice" />
+                {/* THE QUESTION CHANGES WHEN THERE IS A MISMATCH. Asking "does
+                    the invoice match the PO?" on a receipt the screen has just
+                    proved does not match would be asking for a false answer;
+                    what is actually being confirmed there is that the difference
+                    is known and agreed. Two different statements, two labels. */}
+                <StoreCheck checked={qcInvoiceMatch} onChange={setQcInvoiceMatch}
+                            tone={poMismatches.length > 0 ? 'warn' : 'plain'}
+                            label={poMismatches.length > 0
+                              ? 'I have checked the invoice against this PO — the difference above is known and agreed'
+                              : 'Invoice matches PO (rate, qty, vendor)'} />
+              </div>
+
+              {/* THE CONSEQUENCE, STATED BEFORE CONFIRM — not discovered later. */}
+              <div className={`text-[10px] rounded px-2 py-1 ${
+                qcExpiry && qcWeight && qcInvoiceMatch
+                  ? 'bg-emerald-50 text-emerald-800 border border-emerald-200'
+                  : 'bg-[#F5EDE3] text-[#6B5744] border border-[#E8D5C4]'}`}>
+                {qcExpiry && qcWeight && qcInvoiceMatch ? (
+                  <>All three checked — this receipt will be filed <strong>signed by you</strong> as the store check.</>
+                ) : (
+                  <>
+                    This receipt will be filed <strong>UNSIGNED</strong> by the store
+                    {(qcExpiry || qcWeight || qcInvoiceMatch) ? ' (a partial checklist is recorded, but is not a signature)' : ''}.
+                    {' '}You can still receive.
+                    {/* BEFORE Confirm, nobody can know who will be reachable —
+                        that answer only exists in the response. The admins are
+                        the one guarantee the alert module makes (they are told
+                        on every deviating receipt, including when the department
+                        half fails outright); a department head is conditional on
+                        one being set, which on today's data is usually not the
+                        case. So this promises the guarantee and names the
+                        condition, and the receipt's own answer — counted, with
+                        the gaps in words — is reported after Confirm. */}
+                    {poMismatches.length > 0 && !qcInvoiceMatch && (
+                      <> The off-PO line(s) above go out as
+                        <strong> recorded but not reconciled</strong> — to the admins, and to the
+                        department&apos;s head if one is set. You are told who was reached once this is filed.</>
+                    )}
+                  </>
+                )}
+              </div>
             </div>
           )}
 

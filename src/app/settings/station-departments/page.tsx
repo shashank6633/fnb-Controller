@@ -55,6 +55,21 @@
  * is what makes the "skipped in the last 30 days" figure fall on its own once a
  * station is mapped. Do not add SWR/route caching for a 13-row table.
  *
+ * ── IT IS ALSO THE STATION MASTER ─────────────────────────────────────────
+ * `station_departments` is not only the map — `station` is its PRIMARY KEY and
+ * every station in use has a row, so this table IS the list of stations. Add and
+ * Rename therefore live here, on PATCH (POST is an alias for PUT on that route
+ * and had to stay that way). No second table was created, and none should be.
+ *
+ * STATION IS NOT CATEGORY, and the difference is why Rename is guarded harder
+ * than the category equivalent: category is what kind of dish it is on the menu,
+ * station is WHICH SECTION COOKS IT. The name drives KOT grouping, the printer
+ * the ticket comes out of, which KDS board it appears on, and which kitchen's
+ * stock the recipe leaves. So the page never carries out a rename on its own
+ * reading of the consequences — it asks the server (`action: 'impact'`), shows
+ * the SERVER's sentence, and lets the server refuse. Same reason rule 2 above
+ * exists: one copy of the reasoning, in the file that acts on it.
+ *
  * ── WHY THE PAGE READS `can_edit` INSTEAD OF /api/auth/me ─────────────────
  * One fetch, no race. The route already resolves the session and answers
  * `can_edit: me.role === 'admin'`; taking it from there means the gate on
@@ -69,9 +84,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api } from '@/lib/api';
 import Toggle from '@/components/Toggle';
+// The SAME module the route validates with, so the on-screen preview of what
+// will be stored cannot drift from what actually gets stored. The server stays
+// the authority — this is a preview, never a substitute for its answer.
+import {
+  canonStationName, validateStationName, STATION_CONVENTION, MAX_STATION_LEN,
+} from '@/lib/station-master';
 import {
   Network, RefreshCw, Loader2, Lock, AlertTriangle, Info, CheckCircle2,
-  CircleSlash, Wine, ChefHat, XCircle,
+  CircleSlash, Wine, ChefHat, XCircle, Plus, Pencil, Check, X,
 } from 'lucide-react';
 
 /* ── the server's row, verbatim ──────────────────────────────────────────── */
@@ -115,6 +136,36 @@ type SaveResponse = {
   message?: string;
   warnings?: string[];
   code?: string;
+  error?: string;
+};
+
+/**
+ * The PATCH answers — add / rename / impact. Optional for the same reason
+ * SaveResponse is: this is a parsed HTTP body, and the refusal paths (409
+ * KDS_SECTION_SHIFT, 409 SENTINEL_RENAME, 400 bad name) carry only some of it.
+ */
+type MasterResponse = {
+  station?: string;
+  from?: string;
+  to?: string;
+  typed?: string;
+  normalized?: boolean;
+  created?: boolean;
+  moved?: { master: number; menu_items: number; printers: number; order_lines_live: number; kots_live: number };
+  message?: string;
+  warnings?: string[];
+  code?: string;
+  error?: string;
+};
+
+type ImpactResponse = {
+  station?: string;
+  in_master?: boolean;
+  department_name?: string | null;
+  kds_section?: 'bar' | 'kitchen';
+  usage?: { menu_items: number; live_menu_items: number; live_recipe_items: number };
+  deactivate_warning?: string;
+  rename_note?: string;
   error?: string;
 };
 
@@ -176,6 +227,35 @@ function reservedReason(station: string, p: Payload | null) {
   };
 }
 
+/**
+ * What the typed name will actually do — shown under both name boxes.
+ *
+ * Runs the SERVER'S OWN validator (`validateStationName`, the same call
+ * /api/settings/station-departments PATCH makes), so the line under the box
+ * cannot promise a name the server will refuse. Three outcomes, and each has to
+ * be said differently: refused (say why, in the validator's words), rewritten
+ * (say what will be stored), or accepted unchanged (say nothing — a preview that
+ * repeats what was typed is noise).
+ */
+function namePreview(typed: string) {
+  const raw = typed.trim();
+  if (!raw) return null;
+  const v = validateStationName(raw);
+  if (!v.ok) {
+    return (
+      <p className="text-[11px] text-red-700 mt-1.5 flex items-start gap-1.5">
+        <XCircle className="w-3.5 h-3.5 shrink-0 mt-px" /><span>{v.error}</span>
+      </p>
+    );
+  }
+  if (!v.changed) return null;
+  return (
+    <p className="text-[11px] text-amber-800 mt-1.5">
+      Will be stored as <b>{v.canon}</b>.
+    </p>
+  );
+}
+
 const nf = (n: number) => Number(n || 0).toLocaleString('en-IN');
 const qf = (n: number) =>
   Number(n || 0).toLocaleString('en-IN', { maximumFractionDigits: 3 });
@@ -198,6 +278,16 @@ export default function StationDepartmentsPage() {
   const [busy, setBusy] = useState<string | null>(null);
   const [onlyAttention, setOnlyAttention] = useState(false);
   const [toast, setToast] = useState<{ ok: boolean; msg: string } | null>(null);
+
+  /* Master-list state. `renaming` holds the station being renamed (never an
+   * index — the list re-sorts on every reload and an index would move the edit
+   * onto a different station), `renameNote` holds the SERVER's account of what
+   * the rename would touch. */
+  const [newStation, setNewStation] = useState('');
+  const [addBusy, setAddBusy] = useState(false);
+  const [renaming, setRenaming] = useState<string | null>(null);
+  const [renameTo, setRenameTo] = useState('');
+  const [renameNote, setRenameNote] = useState<string | null>(null);
 
   // ONE timer, cleared before each new toast. Two quick edits (map continental,
   // then switch it off) would otherwise leave the FIRST toast's timeout running,
@@ -280,12 +370,34 @@ export default function StationDepartmentsPage() {
       }
       if (!res.ok) { flash(false, j?.error || `Could not save (HTTP ${res.status})`); return; }
 
+      /* PAUSED IS NOT UNMAPPED, AND THE ANSWER CANNOT SAY SO.
+       *
+       * PUT builds its reply by re-reading through resolveStationDepartment(),
+       * which returns departmentId:null for an is_active = 0 row — correctly,
+       * because that IS what the next sale will resolve. But the row still HOLDS
+       * its department (verified: the stored department_id survives a pause),
+       * and the reply cannot express the difference. Applied verbatim, a pause
+       * made the dropdown snap to "Not mapped" and the toggle DELETE ITSELF (it
+       * only renders for a mapped row) — the exact symptom the toggle fix was
+       * made to remove, arriving one call later.
+       *
+       * So for `effective === 'inactive'` the page keeps the department it
+       * already knows about. `effective` still comes from the server: what is
+       * kept is the mapping, never the resolved state.
+       *
+       * That test is exact, not a guess. resolveStationDepartment() reaches
+       * reason 'inactive' ONLY after department_id is non-null AND the
+       * department row exists (dept-ledger.ts:747-749) — a cleared mapping
+       * answers 'unmapped' and a dangling one answers 'unmapped' too. So
+       * 'inactive' is reachable only when the row really does still hold a live
+       * department, which is precisely when keeping the local value is right. */
+      const paused = j.effective === 'inactive';
       setData((prev) => prev && ({
         ...prev,
         stations: prev.stations.map((s) => s.station !== station ? s : {
           ...s,
-          department_id: j.department_id ?? null,
-          department_name: j.department_name ?? null,
+          department_id: paused ? s.department_id : (j.department_id ?? null),
+          department_name: paused ? s.department_name : (j.department_name ?? null),
           is_active: !!j.is_active,
           note: String(j.note ?? s.note),
           // The SERVER's resolved state, never the dropdown's. Falling back to
@@ -301,7 +413,14 @@ export default function StationDepartmentsPage() {
       }));
 
       const warnings: string[] = Array.isArray(j.warnings) ? j.warnings : [];
-      const message = j.message || 'Saved.';
+      // Same reason as above, and the ONLY sentence this page writes instead of
+      // the server's: PUT's "is not mapped … no department will be deducted"
+      // would contradict the confirmation the admin accepted a second earlier
+      // ("the mapping is kept, only the deduction stops"), and the confirmation
+      // is the one that is true.
+      const message = paused
+        ? `'${station}' is paused. The department mapping is kept — only the stock deduction stops, and it is recorded as a skip. KOTs still print and still reach the section.`
+        : (j.message || 'Saved.');
       flash(true, warnings.length ? `${message} ${warnings.join(' ')}` : message);
       // Counts (skips, sold-vs-deducted, the attention banner) are re-derived
       // server-side; pull them quietly so the page stops reporting the state the
@@ -311,6 +430,209 @@ export default function StationDepartmentsPage() {
       flash(false, 'Network error — nothing was saved');
     } finally { setBusy(null); }
   }, [load, flash]);
+
+  /**
+   * "What would this cost" — asked of the SERVER, never worked out here.
+   *
+   * The sentence the owner reads before pausing or renaming a station is
+   * produced by the same file that carries the change out, so the screen cannot
+   * promise a consequence the server does not deliver. Returns null on any
+   * failure; every caller then falls back to a confirm built from the counts the
+   * GET already supplied. A failed lookup must never BLOCK an action the admin
+   * is entitled to take — it only costs the better wording.
+   */
+  const impact = useCallback(async (station: string): Promise<ImpactResponse | null> => {
+    try {
+      const res = await api('/api/settings/station-departments', {
+        method: 'PATCH', body: { action: 'impact', station },
+      });
+      if (!res.ok) return null;
+      const j = (await res.json().catch(() => null)) as ImpactResponse | null;
+      return j && !j.error ? j : null;
+    } catch { return null; }
+  }, []);
+
+  /**
+   * Pausing a station. Deactivation ALREADY worked — what was missing was the
+   * consequence being visible, so the toggle now names how many menu items still
+   * route to the station and says the half people fear is not true: the items
+   * KEEP their station string, so KOTs still print and still reach the section.
+   * Only the stock deduction stops. Switching a station back ON needs no
+   * confirmation — restoring a deduction is not a destructive act.
+   */
+  const setDeducting = useCallback(async (r: StationRow, next: boolean) => {
+    /* department_id IS RE-SENT, and that is a FIX, not decoration.
+     *
+     * On the PUT contract an ABSENT department_id means CLEAR ("'' / null /
+     * undefined all mean CLEAR" — route.ts), while an absent is_active means
+     * PRESERVE. This toggle used to send is_active alone, so switching a station
+     * to "Paused" did not pause it: it CLEARED the mapping, the row dropped to
+     * "Not mapped", and the toggle itself disappeared because it only renders
+     * for a mapped row — leaving no way back to Deducting except re-picking the
+     * department, which then came back already paused. Proven against the real
+     * route on a copy of the live DB: PUT {station:'continental',
+     * is_active:false} answered effective:'unmapped' and wrote the audit event
+     * station_department.clear.
+     *
+     * Sending the station's CURRENT department alongside makes the request say
+     * what the toggle says: keep this mapping, stop deducting. The PUT is
+     * untouched — the contract was always that both axes are stated together.
+     *
+     * EXCEPT ON A DANGLING ROW. The toggle renders for any non-null
+     * department_id, INCLUDING a pointer at a department that has since been
+     * deleted (the row is painted red, "Department deleted — skipped"). PUT
+     * refuses a dangling department outright — correctly, since storing one
+     * shows "mapped" in Settings while production skips — so re-sending that
+     * dead id turns the toggle into a control that can only ever error. There is
+     * no mapping to preserve on such a row, so the id is left out and PUT's
+     * absent-means-CLEAR path both clears the dead pointer and applies the
+     * switch. */
+    const keepMapping = r.department_id && !r.dangling ? { department_id: r.department_id } : {};
+    if (next) { save(r.station, { ...keepMapping, is_active: true }); return; }
+    setBusy(r.station);
+    const imp = await impact(r.station);
+    setBusy(null);
+    const warn = imp?.deactivate_warning
+      ?? `${nf(r.live_menu_items)} live menu item${r.live_menu_items === 1 ? '' : 's'} still route to '${r.station}'`
+        + `${r.live_recipe_items ? `, ${nf(r.live_recipe_items)} of them cooking from a recipe` : ''}.`
+        + ' Their station is NOT changed — KOTs still print and still reach the section. Only the stock deduction stops.';
+    if (!window.confirm(`Pause deduction for '${r.station}'?\n\n${warn}`)) return;
+    save(r.station, { ...keepMapping, is_active: false });
+  }, [impact, save]);
+
+  /**
+   * ADD. The name is canonicalised on the way in — "Pan Asian" is stored as
+   * "pan-asian" — and the server says so in its own answer rather than the
+   * screen claiming it. A new station arrives UNMAPPED on purpose: an unmapped
+   * station skips and records, which is the recoverable failure; a station
+   * pre-pointed at a plausible department is the one that is not.
+   */
+  const addStation = useCallback(async (force = false) => {
+    const typed = newStation.trim();
+    if (!typed) return;
+    setAddBusy(true);
+    try {
+      const res = await api('/api/settings/station-departments', {
+        method: 'PATCH', body: { action: 'add', station: typed, ...(force ? { force: true } : {}) },
+      });
+      const j = (await res.json().catch(() => ({}))) as MasterResponse;
+
+      /* The hyphen twin — 'Terrace Grill' beside the existing 'terracegrill'.
+         Refused once with the consequence named, allowed on the second click:
+         two stations CAN differ only by a hyphen, but that is never the likely
+         reading on this data, and the twin lands unmapped so anything moved onto
+         it skips silently. Same shape as the KDS refusal below. */
+      if (res.status === 409 && j?.code === 'NEAR_DUPLICATE') {
+        setAddBusy(false);
+        if (window.confirm(`${j.error}\n\nAdd it anyway?`)) { await addStation(true); return; }
+        flash(false, 'Nothing was added.');
+        return;
+      }
+      if (!res.ok) { flash(false, j?.error || `Could not add the station (HTTP ${res.status})`); return; }
+      setNewStation('');
+      const warnings = Array.isArray(j.warnings) ? j.warnings : [];
+      flash(true, [j.message || 'Added.', ...warnings].join(' '));
+      load(true);
+    } catch {
+      flash(false, 'Network error — nothing was added');
+    } finally { setAddBusy(false); }
+  }, [newStation, flash, load]);
+
+  /**
+   * Open the inline rename editor and ask the server what it would touch.
+   *
+   * The ref is the guard, not the state: a slow impact answer for the row the
+   * admin has since closed (or moved on from) must not paint its sentence into
+   * the panel now showing a DIFFERENT station. Reading `renaming` inside the
+   * callback would read the value captured when it was created, and a state
+   * updater is not the place for a side effect.
+   */
+  const renameReq = useRef<string | null>(null);
+  const beginRename = useCallback(async (station: string) => {
+    renameReq.current = station;
+    setRenaming(station);
+    setRenameTo(station);
+    setRenameNote(null);
+    const imp = await impact(station);
+    if (renameReq.current === station) setRenameNote(imp?.rename_note ?? null);
+  }, [impact]);
+
+  const cancelRename = useCallback(() => {
+    renameReq.current = null;
+    setRenaming(null); setRenameTo(''); setRenameNote(null);
+  }, []);
+
+  /**
+   * RENAME. Every refusal belongs to the server and is rendered verbatim:
+   *   409 SENTINEL_RENAME    — 'kitchen' is written by kot-fire.ts itself; there
+   *                            is no force, because a rename cannot work.
+   *   409 KDS_SECTION_SHIFT  — the new name lands on the other KDS board. THIS is
+   *                            the one that gets the informed second click: a
+   *                            ticket that prints but never appears in front of
+   *                            the section that has to cook it is the worst
+   *                            failure this screen can cause.
+   *   409 HISTORY_NAME      — the new name is not a station any more but is
+   *                            still the label on closed bills, served tickets
+   *                            or the stock ledger. THIS IS THE UNDO PATH: a
+   *                            rename leaves the old name on exactly those rows,
+   *                            so without this confirmation every rename of a
+   *                            station that had ever been sold was permanent.
+   *   409 (merge)            — the name is a LIVE station; never folded together,
+   *                            and there is no override for it.
+   *
+   * Each refusal carries its OWN flag — `force` for the board shift,
+   * `adopt_history` for the old label — because one flag answering two questions
+   * is a confirmation the admin was never shown.
+   */
+  const commitRename = useCallback(async (
+    station: string,
+    opts: { force?: boolean; adoptHistory?: boolean } = {},
+  ) => {
+    const to = renameTo.trim();
+    if (!to) return;
+    setBusy(station);
+    try {
+      const res = await api('/api/settings/station-departments', {
+        method: 'PATCH',
+        body: {
+          action: 'rename', from: station, to,
+          ...(opts.force ? { force: true } : {}),
+          ...(opts.adoptHistory ? { adopt_history: true } : {}),
+        },
+      });
+      const j = (await res.json().catch(() => ({}))) as MasterResponse;
+
+      if (res.status === 409 && j?.code === 'KDS_SECTION_SHIFT') {
+        if (window.confirm(`${j.error}\n\nRename it anyway?`)) {
+          setBusy(null);
+          await commitRename(station, { ...opts, force: true });
+          return;
+        }
+        flash(false, 'Left as it was.');
+        return;
+      }
+      if (res.status === 409 && j?.code === 'HISTORY_NAME') {
+        if (window.confirm(`${j.error}\n\nUse '${to}' anyway?`)) {
+          setBusy(null);
+          await commitRename(station, { ...opts, adoptHistory: true });
+          return;
+        }
+        flash(false, 'Left as it was.');
+        return;
+      }
+      if (!res.ok) { flash(false, j?.error || `Could not rename (HTTP ${res.status})`); return; }
+
+      cancelRename();
+      const warnings = Array.isArray(j.warnings) ? j.warnings : [];
+      flash(true, [j.message || 'Renamed.', ...warnings].join(' '));
+      // A full reload, not a local patch: a rename moves the PRIMARY KEY and
+      // re-derives every count on the row, and the page must show what the
+      // server now holds rather than what this screen assumed it wrote.
+      load(true);
+    } catch {
+      flash(false, 'Network error — nothing was renamed');
+    } finally { setBusy(null); }
+  }, [renameTo, flash, load, cancelRename]);
 
   /* Stations are rendered in the server's alphabetical order and are NOT
    * re-sorted by state. Attention-first sorting would move a row out from under
@@ -449,6 +771,64 @@ export default function StationDepartmentsPage() {
           </div>
         )}
 
+        {/* ADD A STATION.
+            The convention is stated ON SCREEN and the canonical form is
+            previewed as it is typed, because the alternative — letting someone
+            type "Pan Asian" and finding out later — creates a SECOND station
+            that every reader folds onto the first, and the resolver then picks
+            between two rows arbitrarily. The preview and the server's validator
+            are the same module (src/lib/station-master.ts), so what is shown is
+            what will be stored.
+
+            GATED ON can_edit, which is null until the first GET answers, so the
+            card does not paint before the gate resolves. The page already
+            replaces itself with a "read only" view for a non-admin, but this is
+            the first always-rendered interactive control above the grid and a
+            flash of an Add box for someone who cannot add reads as a bug. */}
+        {data?.can_edit && (
+        <div className="bg-white border border-[#E8D5C4] rounded-2xl p-3.5 shadow-sm">
+          <p className="font-semibold text-[#2D1B0E] text-sm flex items-center gap-2">
+            <Plus className="w-4 h-4 text-[#af4408]" />Add a station
+          </p>
+          <p className="text-[11px] text-[#8B7355] mt-1">
+            A station is the <b>kitchen section that cooks the dish</b> — it groups the KOT, picks the printer and
+            decides which kitchen&apos;s stock the recipe leaves. It is not the menu category.
+            Names are {STATION_CONVENTION}.
+          </p>
+          <div className="flex flex-col sm:flex-row sm:items-center gap-2 mt-2.5">
+            <input
+              value={newStation}
+              onChange={(e) => setNewStation(e.target.value.slice(0, MAX_STATION_LEN * 2))}
+              onKeyDown={(e) => { if (e.key === 'Enter' && !addBusy) addStation(); }}
+              placeholder="e.g. pan-asian"
+              disabled={addBusy || !data?.schema_ready}
+              className="w-full sm:flex-1 min-w-0 px-3 py-2.5 bg-white border border-[#D4B896] rounded-xl text-sm text-[#2D1B0E] focus:outline-none focus:ring-2 focus:ring-[#af4408]/40 disabled:opacity-60"
+            />
+            <button
+              // WRAPPED, not passed by reference: addStation's first argument is
+              // the near-duplicate override, and onClick would hand it a
+              // MouseEvent — truthy — silently forcing every add.
+              onClick={() => addStation()}
+              disabled={addBusy || !newStation.trim() || !data?.schema_ready}
+              className="shrink-0 flex items-center justify-center gap-2 px-4 py-2.5 bg-[#af4408] hover:bg-[#8f3606] disabled:opacity-50 text-white rounded-xl text-sm font-medium"
+            >
+              {addBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}Add
+            </button>
+          </div>
+          {/* THE VALIDATOR'S VERDICT, not just the canonicaliser's output.
+              Showing "will be stored as 'café!'" for a name the server then
+              refuses is guidance that is wrong before the click and right after
+              it. validateStationName() is the SAME call the route makes, so the
+              two cannot disagree; the button is deliberately left enabled — the
+              server stays the authority, this is only the earlier warning. */}
+          {namePreview(newStation)}
+          <p className="text-[11px] text-[#8B7355] mt-1.5">
+            A new station starts <b>unmapped</b> — nothing is deducted for it until you pick a department below.
+            Menu items reach it once their station is set to it.
+          </p>
+        </div>
+        )}
+
         {/* Grid.
             CARDS, not a table, and that is a layout decision with a reason: this
             row carries a station, five counts, a dropdown and a paragraph of
@@ -479,6 +859,11 @@ export default function StationDepartmentsPage() {
               const reserved = reservedReason(r.station, data);
               const mapped = r.effective === 'mapped';
               const isBusy = busy === r.station;
+              // WHICH stations may not be renamed comes from the server's
+              // `reserved.sentinel`, exactly as the copy above does — the page
+              // never keeps its own list of what the server blocks.
+              const isSentinel = (data?.reserved?.sentinel ?? []).includes(r.station);
+              const isRenaming = renaming === r.station;
               // AMBER for every deliberate non-mapped state; RED only for a
               // pointer at a department that has been deleted. See rule 1.
               const tone = r.dangling
@@ -512,6 +897,35 @@ export default function StationDepartmentsPage() {
                       <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-slate-100 text-slate-600 border border-slate-200">
                         Not on the live menu
                       </span>
+                    )}
+                    {/* The sentinel carries no Rename button at all: the server
+                        refuses it outright (kot-fire.ts writes that literal
+                        itself), and offering a control that can only ever fail
+                        reads as a bug rather than as a rule.
+
+                        NOR DOES A ROW THAT IS NOT ON THE LIST (`configured`
+                        false). The grid is a UNION of stations found in DATA and
+                        stations on the list, so a name that survives only on
+                        past bills — which is exactly what every rename leaves
+                        behind — is still shown. It has no master row to move, so
+                        Rename could only ever 404. The row says what to do
+                        instead; the Add box adopts it. */}
+                    {!isSentinel && !isRenaming && !r.configured && (
+                      <span
+                        className="ml-auto shrink-0 text-[11px] text-[#8B7355]"
+                        title="This name is only a label on past bills and tickets. Add it above to put it on the station list."
+                      >
+                        not on the list
+                      </span>
+                    )}
+                    {!isSentinel && !isRenaming && r.configured && (
+                      <button
+                        onClick={() => beginRename(r.station)}
+                        disabled={isBusy || !data?.schema_ready || !data?.can_edit}
+                        className="ml-auto shrink-0 flex items-center gap-1 px-2 py-1 rounded-lg border border-[#E0D0BE] bg-white hover:bg-[#FFF1E3] text-[11px] font-medium text-[#6B5744] disabled:opacity-50"
+                      >
+                        <Pencil className="w-3 h-3" />Rename
+                      </button>
                     )}
                   </div>
 
@@ -568,6 +982,57 @@ export default function StationDepartmentsPage() {
                       )
                   )}
 
+                  {/* RENAME, inline on the row being renamed.
+                      The paragraph under the heading is the SERVER's account of
+                      what the rename would move and what it would leave alone —
+                      fetched before the edit, not composed here. If that lookup
+                      fails the editor still opens: a missing sentence must not
+                      block an admin from a rename the server will happily
+                      police on its own. */}
+                  {isRenaming && (
+                    <div className="mt-2.5 p-3 rounded-xl border border-[#D4B896] bg-[#FFF1E3]">
+                      <p className="text-[12px] font-semibold text-[#2D1B0E]">Rename ‘{r.station}’</p>
+                      <p className="text-[11px] text-[#6B5744] mt-1">
+                        {renameNote ?? 'Checking what this would move…'}
+                      </p>
+                      <div className="flex flex-col sm:flex-row sm:items-center gap-2 mt-2">
+                        <input
+                          autoFocus
+                          value={renameTo}
+                          onChange={(e) => setRenameTo(e.target.value.slice(0, MAX_STATION_LEN * 2))}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter' && !isBusy) commitRename(r.station);
+                            if (e.key === 'Escape') cancelRename();
+                          }}
+                          disabled={isBusy}
+                          className="w-full sm:flex-1 min-w-0 px-3 py-2.5 bg-white border border-[#D4B896] rounded-xl text-sm text-[#2D1B0E] focus:outline-none focus:ring-2 focus:ring-[#af4408]/40 disabled:opacity-60"
+                        />
+                        <div className="flex items-center gap-2 sm:shrink-0">
+                          <button
+                            onClick={() => commitRename(r.station)}
+                            disabled={isBusy || !renameTo.trim() || canonStationName(renameTo) === r.station}
+                            className="flex-1 sm:flex-none flex items-center justify-center gap-1.5 px-3 py-2.5 bg-[#af4408] hover:bg-[#8f3606] disabled:opacity-50 text-white rounded-xl text-sm font-medium"
+                          >
+                            {isBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />}Rename
+                          </button>
+                          <button
+                            onClick={cancelRename}
+                            disabled={isBusy}
+                            className="flex-1 sm:flex-none flex items-center justify-center gap-1.5 px-3 py-2.5 bg-white border border-[#E0D0BE] hover:bg-white text-[#6B5744] rounded-xl text-sm font-medium disabled:opacity-50"
+                          >
+                            <X className="w-4 h-4" />Cancel
+                          </button>
+                        </div>
+                      </div>
+                      {namePreview(renameTo)}
+                      <p className="text-[11px] text-[#8B7355] mt-1.5">
+                        Past KOTs, settled bills and the department stock ledger keep ‘{r.station}’ — that is the
+                        label they were recorded under. Menu items, printer bindings and anything still on the
+                        board move with the name.
+                      </p>
+                    </div>
+                  )}
+
                   {/* Controls. Stacked on a phone, inline from sm up — never a
                       row that needs sideways scrolling. */}
                   <div className="flex flex-col sm:flex-row sm:items-center gap-2 mt-2.5">
@@ -599,11 +1064,14 @@ export default function StationDepartmentsPage() {
                         switched back on from this screen. */}
                     {!!r.department_id && (
                       <div className="flex items-center gap-2 sm:shrink-0">
+                        {/* Switching OFF now asks first and names the count —
+                            see setDeducting(). Switching back ON does not:
+                            restoring a deduction is not destructive. */}
                         <Toggle
                           size="sm"
                           checked={r.is_active}
                           disabled={isBusy || !data?.schema_ready}
-                          onChange={(next) => save(r.station, { is_active: next })}
+                          onChange={(next) => setDeducting(r, next)}
                           label={r.is_active ? 'Deducting' : 'Paused'}
                           title="Pause deduction without losing the mapping"
                         />

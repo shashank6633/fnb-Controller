@@ -5,6 +5,10 @@ import { getCentralStoreCutoverDate } from './central-cutover';
 import { alreadyReturnedByGrnItem } from './returns';
 import { centralFlowBlock } from './store-engine';
 import { grnPaidInCash } from './cash-purchase';
+// The addressed half of the off-PO alert. See raisePoDeviationAlert below for
+// why this file — which only ever wrote the unaddressed 'admin' broadcast — now
+// calls it too. Never throws, by contract.
+import { raiseDeviationAlert } from './po-deviation-alert';
 
 /**
  * ╔══════════════════════════════════════════════════════════════════════════╗
@@ -2173,6 +2177,38 @@ export function raisePoDeviationAlert(
         (id, kind, party_unique_id, channel, recipient, title, body)
       VALUES (?, ?, ?, 'inapp', 'admin', ?, ?)
     `).run(generateId(), notifKind, notifKey, title, body);
+
+    // ── THE SAME NEWS, ADDRESSED TO ACTUAL PEOPLE ─────────────────────────
+    // The row above is a BROADCAST: recipient is the literal string 'admin',
+    // which is not a user id, not an email and not a role lookup, and nothing
+    // ever resolved it into anybody. The receiving desk's own copy of this alert
+    // now also writes one row per active admin and per HOD of the department
+    // each material belongs to — and WITHOUT this call a storekeeper who
+    // receives 1 and a manager who later corrects the bill to 9 produce
+    // identical stock and money and completely different notification outcomes:
+    // the first tells five people, the second tells nobody. Same rail, same
+    // dedup key (the :amend: suffix keeps each correction distinct), so a
+    // correction and a receipt read the same on every surface.
+    //
+    // NOT AWAITED, AND THAT IS SAFE AND DELIBERATE. raiseDeviationAlert writes
+    // every in-app row SYNCHRONOUSLY — its first `await` is the WhatsApp rail,
+    // which is after the rows are in — so the notifications land before this
+    // function returns even though the promise is not. Awaiting instead would
+    // mean making this function async and changing its one caller's signature,
+    // in a route this change does not own. It never throws by contract; the
+    // .catch is the belt to that braces.
+    void raiseDeviationAlert(db, {
+      baseKey: notifKey,
+      lines: args.lines,
+      excessOnly,
+      poNumber: poLabel,
+      grnNumber: args.grnNumber,
+      vendor: args.vendor || '',
+      billNo: '',
+      receivedBy: args.actorEmail,
+      note: `Source: a bill CORRECTION made after ${args.grnNumber} was received — reason given: ${args.reason || '(none)'}`,
+    }).catch(e => console.error('[grn PATCH] addressed deviation alert failed (non-fatal):', e));
+
     const webhookRow = db.prepare(`SELECT value FROM settings WHERE key = 'slack_webhook_url'`).get() as { value?: string } | undefined;
     const webhook = webhookRow?.value?.trim();
     if (webhook && webhook.startsWith('http')) {
