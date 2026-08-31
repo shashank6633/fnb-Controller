@@ -1,11 +1,16 @@
 import { getDb } from '@/lib/db';
 import { getCurrentUser, canManageKitchenProduction } from '@/lib/auth';
 import { enrichBatch, ProductionBatch } from '@/lib/production-batch';
+import { batchDepartment } from '@/lib/production-departments';
 
 /**
  * GET /api/kitchen-production/[id]
- *   → { batch: {…, remaining_quantity, expiry_status, batch_age_hours},
+ *   → { batch: {…, remaining_quantity, expiry_status, batch_age_hours,
+ *                department_key, department_name, department_id, department_inactive},
  *       transactions: [ …ordered newest first ] }
+ *
+ * The department fields are empty for any batch made before the field existed —
+ * the drawer renders its stored `kitchen_section` string exactly as before.
  */
 export async function GET(_request: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
@@ -20,7 +25,14 @@ export async function GET(_request: Request, { params }: { params: Promise<{ id:
     if (!row) return Response.json({ error: 'Batch not found' }, { status: 404 });
 
     const now = new Date();
-    const batch = enrichBatch(row, now);
+    const dep = batchDepartment(db, id);
+    const batch = {
+      ...enrichBatch(row, now),
+      department_id: dep?.department_id ?? null,
+      department_key: dep?.department_key ?? null,
+      department_name: dep?.department_name ?? '',
+      department_inactive: dep?.department_inactive ?? false,
+    };
 
     const transactions = db.prepare(
       `SELECT * FROM batch_transactions WHERE batch_id = ? ORDER BY created_at DESC, rowid DESC`

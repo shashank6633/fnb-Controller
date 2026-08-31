@@ -218,8 +218,28 @@ export const PAGE_CATALOG: PageSection[] = [
   {
     label: 'Production',
     pages: [
-      { path: '/kitchen-production',   label: 'Kitchen Production', hodOnly: true },
-      { path: '/kitchen-production/dashboard', label: 'Kitchen Production — Dashboard', hodOnly: true },
+      // hodOnly REMOVED from these two on the owner's instruction (2026-08-31).
+      // They now follow the normal page_access grant like any other page, which
+      // is what /kitchen-production/scan below has always done.
+      //
+      // WHAT THIS DOES AND DOES NOT CHANGE — read before restoring the flag.
+      // hodOnly is one line in canAccessPage: `if (isHodOnlyPath(pathname) &&
+      // !user.is_head_chef) return false`. It gated the PAGE only. It never
+      // protected the DATA: every /api/kitchen-production/* handler calls
+      // getCurrentUser (identity) and none calls requireRole (authority), and
+      // proxy.ts step 2c only proves the SESSION IS VALID for state-changing API
+      // calls — it does not check page access. So any signed-in user could
+      // already create, print, dispose and consume batches by calling those
+      // endpoints directly; the flag only stopped them seeing the screen.
+      // Removing it therefore opens no new data path — it stops hiding one that
+      // was already open. Gating those routes is the real fix and is tracked
+      // separately.
+      //
+      // Note page_access FAILS OPEN: `if (!user.page_access) return true`, and
+      // an empty array means "follow role", not "deny all". So every user with
+      // no explicit grant now sees these two pages.
+      { path: '/kitchen-production',   label: 'Kitchen Production' },
+      { path: '/kitchen-production/dashboard', label: 'Kitchen Production — Dashboard' },
       { path: '/kitchen-production/scan', label: 'Kitchen Production — Scan' },
       { path: '/butchering',          label: 'Butchering' },
     ],

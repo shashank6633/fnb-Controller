@@ -1504,7 +1504,23 @@ function GrnRow({ g, expanded, onToggle, isAdmin, canAmend, dataVersion, onEdit,
             {/* Shown only when the order could be resolved. A PO-sourced row
                 whose order row has gone still reads "Against PO" — the chip is
                 keyed off po_id, so it never quietly downgrades to "Direct". */}
-            {g.po_number && <a href="/purchase-orders" className={`font-mono text-[#af4408] hover:underline ${strike}`}>{g.po_number}</a>}
+            {/* Deep-links into the PO list's own "PO number or vendor" search,
+                because there is no /purchase-orders/[id] detail page to open.
+                The ?q= is not decoration: the PO list defaults to its PENDING
+                tab, and a PO that a GRN exists against is RECEIVED — so a bare
+                /purchase-orders href landed the reader on a list with this very
+                PO filtered out of it. A non-empty q widens that tab to 'all'
+                and seeds the search box (purchase-orders/page.tsx:312-318).
+                Same contract Purchases already uses (purchases/page.tsx). */}
+            {g.po_number && (
+              <a
+                href={`/purchase-orders?q=${encodeURIComponent(g.po_number)}`}
+                title={`Open ${g.po_number} on Purchase Orders`}
+                className={`font-mono text-[#af4408] hover:underline ${strike}`}
+              >
+                {g.po_number}
+              </a>
+            )}
           </div>
         </td>
         <td className={`py-2 px-3 text-right font-mono ${strike}`}>{g.line_count}</td>
@@ -1657,7 +1673,7 @@ function GrnRow({ g, expanded, onToggle, isAdmin, canAmend, dataVersion, onEdit,
               order of urgency on this document: goods that are not ours yet,
               then goods that came in on terms nobody approved, then how a past
               hold was released. */}
-          {devAll.length > 0 && <DeviationPanel alerts={devAll} roll={devRollRow} />}
+          {devAll.length > 0 && <DeviationPanel alerts={devAll} roll={devRollRow} poNumber={g.po_number} />}
           {/* THE OVERRIDE, AFTER THE FACT. A permanent property of the bill
               (qc_override_* are committed columns, not a prunable audit row) and
               it shows on every reader's screen — the store person included, so
@@ -1929,10 +1945,19 @@ function GrnRow({ g, expanded, onToggle, isAdmin, canAmend, dataVersion, onEdit,
    like one would be worse than none. The panel points at /purchase-orders and
    /audit, which is where the alert's own body already sends the reader.
    ══════════════════════════════════════════════════════════════════════════ */
-function DeviationPanel({ alerts, roll }: {
+function DeviationPanel({ alerts, roll, poNumber }: {
   alerts: GrnDeviationAlert[];
   /** Per-axis roll-up across every alert on this bill. Never a money total. */
   roll: ReturnType<typeof rollUpDeviationCounts> | null;
+  /** The GRN row's OWN po_number, threaded down from the one call site so the
+   *  "Open the purchase order" button can name the order it promises to open.
+   *  Deliberately NOT read off `alerts[0].po_number`: that field is rebuilt
+   *  from the audit payload (po-deviation-alerts.ts) and is null on any alert
+   *  whose structured row could not be zipped back — the `detail_available:
+   *  false` case this panel's own copy already handles — whereas the row's
+   *  po_number comes from the GRN list query's join through po_id and is there
+   *  whenever the order is. Optional, because that join can still miss. */
+  poNumber?: string;
 }) {
   if (!alerts.length) return null;
   const multi = alerts.length > 1;
@@ -1977,8 +2002,20 @@ function DeviationPanel({ alerts, roll }: {
       </div>
       {alerts.map((a, i) => <DeviationAlertBlock key={`${a.created_at}-${i}`} a={a} showHeader={multi} />)}
       <div className="mt-1.5 flex items-center gap-2 flex-wrap">
-        <a href="/purchase-orders" className="px-2 py-1 rounded border border-current bg-white/70 hover:bg-white font-semibold flex items-center gap-1">
-          <Receipt className="w-3 h-3" /> Open the purchase order
+        {/* "Open THE purchase order" has to actually open THAT order. A bare
+            /purchase-orders href landed on the PENDING tab, and the order a
+            deviation alert is about has been received against — so the one PO
+            this button names was the one the list filtered out. ?q= widens the
+            tab to 'all' and seeds the search (purchase-orders/page.tsx:312-318).
+            With no PO number to hand the button stops promising a specific
+            order and says so, rather than sending ?q=undefined and landing the
+            reader on an empty list that looks like the PO is gone. */}
+        <a
+          href={poNumber ? `/purchase-orders?q=${encodeURIComponent(poNumber)}` : '/purchase-orders'}
+          title={poNumber ? `Open ${poNumber} on Purchase Orders` : 'Open the Purchase Orders list'}
+          className="px-2 py-1 rounded border border-current bg-white/70 hover:bg-white font-semibold flex items-center gap-1"
+        >
+          <Receipt className="w-3 h-3" /> {poNumber ? `Open ${poNumber}` : 'Purchase orders'}
         </a>
         <a href="/audit" className="px-2 py-1 rounded border border-current bg-white/70 hover:bg-white font-semibold flex items-center gap-1">
           <FileCheck className="w-3 h-3" /> Audit trail

@@ -679,6 +679,85 @@ function initializeSchema(db: Database.Database) {
     }
   } catch (e) { console.error('menu_categories migration failed:', e); }
 
+
+  // ── KITCHEN PRODUCTION — WHICH DEPARTMENT A BATCH WAS MADE FOR ────────────
+  //
+  // The New Production Batch form used to ask for a free-typed "Kitchen
+  // Section" (2 values ever entered in production: 'Hot Kitchen' and 'asian').
+  // It now asks for a DEPARTMENT, chosen from a dropdown.
+  //
+  // WHY THE DROPDOWN READS `departments` AND DOES NOT COPY IT.
+  // The app already owns the department hierarchy (see src/lib/dept-hierarchy.ts):
+  // three mains — Kitchen, Bar, Operations — each with sub-departments. That is
+  // the list the owner means by "from kitchen to departments or from Bar", so
+  // the picker READS those rows live and stores their id. It deliberately does
+  // NOT mirror them into a table of its own: a copy drifts the moment someone
+  // renames a department, and this module has already been bitten by exactly
+  // that class of bug (production_items exists because a free-typed item name
+  // split an item's FIFO chain).
+  //
+  // WHY `production_departments` EXISTS ANYWAY — AND WHY IT IS NOT A DEPARTMENT.
+  // The owner also asked to be able to "add a new line in drop down". Doing that
+  // by INSERTing into `departments` would be the destructive reading: a
+  // `departments` row is a requisition target, a dept-stock ledger holder, a
+  // dept-consumption bucket and a variance subject, so a line typed on a
+  // production screen would appear in the requisition picker and in the
+  // department variance report as a real place material can be issued to. This
+  // table is the non-destructive reading instead: production-only extra LABELS
+  // for the batch dropdown, with no ledger, no parent, and no reachability from
+  // any material-movement path. Central Store --issue--> Department Stock
+  // --recipe consumption--> consumed is untouched by everything in this block.
+  // If the owner wants a real new department, /departments is still the door.
+  //
+  // WHY A SIDE TABLE INSTEAD OF A COLUMN ON `production_batches`.
+  // Ordering. `production_batches` is created ~3,100 lines BELOW this point in
+  // this same function, so an `ALTER TABLE production_batches ADD COLUMN` here
+  // would throw on a fresh database's FIRST boot — and every migration in this
+  // file swallows its error, so that failure would be silent and the batch
+  // INSERT would then 500 on the missing column until the next restart. A
+  // standalone CREATE TABLE has no such dependency. It also makes the
+  // legacy-safety claim structural rather than a promise: the 9 batches that
+  // exist today simply have no row here, `production_batches` is not touched by
+  // one byte, and every existing batch query, report, CSV export and label keeps
+  // running against exactly the columns it ran against before.
+  //
+  // The batch ALSO keeps writing the chosen name into its existing
+  // `kitchen_section` column. That is the same display-label + machine-link pair
+  // the module already uses for `item_name` + `production_item_id`, and it is
+  // what lets the three surfaces that print a section today (the Production CSV
+  // report, the batch detail drawer, the scan screen) show the department with
+  // no change to their code. `label` below is a snapshot for the same reason a
+  // receipt keeps the name it was printed with — the join resolves the LIVE name
+  // so a rename propagates, and the snapshot is only the floor under it.
+  //
+  // No seed, and no write of any kind on boot: an empty `production_departments`
+  // means "no extra lines yet", which is the correct starting state, and it
+  // keeps this block outside the boot-migration lock entirely.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS production_departments (
+        id          TEXT PRIMARY KEY,
+        outlet_id   TEXT,
+        name        TEXT NOT NULL UNIQUE COLLATE NOCASE,
+        is_active   INTEGER NOT NULL DEFAULT 1,
+        sort_order  INTEGER NOT NULL DEFAULT 0,
+        created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+
+      CREATE TABLE IF NOT EXISTS production_batch_departments (
+        batch_id                 TEXT PRIMARY KEY,
+        department_id            TEXT,
+        production_department_id TEXT,
+        label                    TEXT NOT NULL DEFAULT '',
+        created_at               TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at               TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_pbd_department ON production_batch_departments(department_id);
+      CREATE INDEX IF NOT EXISTS idx_pbd_option     ON production_batch_departments(production_department_id);
+    `);
+  } catch (e) { console.error('production_departments migration failed:', e); }
+
   // Migration: extend raw_materials with vendor + recipe-unit + conversion factor + yield (Inventory Module spec)
   try {
     const cols = db.prepare("PRAGMA table_info(raw_materials)").all() as any[];

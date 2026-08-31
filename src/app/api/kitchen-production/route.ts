@@ -1,17 +1,42 @@
 import { getDb, generateId } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId, canManageKitchenProduction } from '@/lib/auth';
 import { enrichBatch, ProductionBatch } from '@/lib/production-batch';
+import { batchDepartmentMap, resolveBatchDepartment, saveBatchDepartment } from '@/lib/production-departments';
 
 /**
  * Kitchen Production — prepared-item batches.
  *
  * GET  /api/kitchen-production?status=active|all&category=&search=
- *        → { batches: [ {…columns}, remaining_quantity, expiry_status, batch_age_hours, fifo_priority ] }
+ *        → { batches: [ {…columns}, remaining_quantity, expiry_status, batch_age_hours, fifo_priority,
+ *                       department_key, department_name, department_id, department_inactive ] }
  * POST /api/kitchen-production
  *        body: { item_name, category, material_id?, recipe_id?, production_date, production_time,
  *                expiry_date, expiry_time, shelf_life?, quantity_produced, unit, prepared_by,
- *                kitchen_section, storage_location, remarks? }
+ *                kitchen_section, storage_location, remarks?,
+ *                department_key? | department_id? | production_department_id? }
  *        → { batch }
+ *
+ * ── THE DEPARTMENT A BATCH WAS MADE FOR ───────────────────────────────────
+ * Optional, and its absence is a first-class state: every batch created before
+ * this field existed has no link, reads back with department_name '' and behaves
+ * exactly as it did. The link lives in its own table (see
+ * src/lib/production-departments.ts) — `production_batches` gains no column, so
+ * the reports, CSV exports, labels and FIFO queries all still run against the
+ * columns they always ran against.
+ *
+ * The chosen name is ALSO written into the existing `kitchen_section` column,
+ * which is the field this replaced in the form. That is the display-label +
+ * machine-link pair the module already uses for item_name + production_item_id,
+ * and it is what makes the Production CSV, the detail drawer and the scan screen
+ * show the department without a line of change in any of them.
+ *
+ * NOTHING HERE MOVES MATERIAL. Kitchen Production is a separate ledger: no route
+ * under /api/kitchen-production writes raw_materials, department stock, or a
+ * requisition (the only raw_materials reads are a reorder-level lookup on the
+ * dashboard and a cost join in reports). Naming a department on a batch records
+ * WHO IT WAS MADE FOR; it does not debit that department, and Central Store
+ * --issue--> Department Stock --recipe consumption at KOT complete--> consumed
+ * is not touched by it.
  */
 
 // Next unique 'PROD' + 6-digit barcode (max existing suffix + 1, start PROD000001).
@@ -86,6 +111,11 @@ export async function GET(request: Request) {
 
     const now = new Date();
 
+    // One batched lookup for the whole page — a batch with no link is simply
+    // absent from the map and reads back with the same empty department fields
+    // as every batch made before this feature.
+    const deptMap = batchDepartmentMap(db, rows.map((b) => b.id));
+
     // fifo_priority: rank ACTIVE batches of the same item oldest-first (1,2,3…).
     const fifoCounter: Record<string, number> = {};
     const batches = rows.map((b) => {
@@ -97,7 +127,15 @@ export async function GET(request: Request) {
         fifoCounter[key] = (fifoCounter[key] || 0) + 1;
         fifo_priority = fifoCounter[key];
       }
-      return { ...enriched, fifo_priority };
+      const dep = deptMap.get(b.id);
+      return {
+        ...enriched,
+        fifo_priority,
+        department_id: dep?.department_id ?? null,
+        department_key: dep?.department_key ?? null,
+        department_name: dep?.department_name ?? '',
+        department_inactive: dep?.department_inactive ?? false,
+      };
     });
 
     return Response.json({ batches });
@@ -152,6 +190,20 @@ export async function POST(request: Request) {
     const department = me.department_id || '';
     const userLabel = me.name || me.email || '';
 
+    // Which department this batch was made FOR. null = not stated, which is the
+    // supported legacy state — the field is optional and always has been.
+    // resolveBatchDepartment throws a chef-readable message rather than storing
+    // a dangling id when the choice names something retired or gone.
+    let deptLink;
+    try {
+      deptLink = resolveBatchDepartment(db, body);
+    } catch (e) {
+      return Response.json({ error: e instanceof Error ? e.message : 'Invalid department' }, { status: 400 });
+    }
+    // The chosen name is the section label from here on. A client that sent no
+    // department keeps whatever it put in kitchen_section — unchanged behaviour.
+    const kitchen_section = deptLink ? deptLink.label : String(body?.kitchen_section || '');
+
     const insert = db.transaction(() => {
       const id = generateId();
       const barcode = nextBarcode(db);
@@ -183,11 +235,15 @@ export async function POST(request: Request) {
         0,
         String(body?.unit || '') || String(pItem?.unit || ''),
         String(body?.prepared_by || ''),
-        String(body?.kitchen_section || ''),
+        kitchen_section,
         String(body?.storage_location || '') || String(pItem?.default_storage_location || ''),
         String(body?.remarks || ''),
         'active',
       );
+
+      // Same transaction as the batch: a batch can never exist with a half-
+      // written department link, and no link is written when none was chosen.
+      saveBatchDepartment(db, id, deptLink);
 
       db.prepare(
         `INSERT INTO batch_transactions (
@@ -211,7 +267,15 @@ export async function POST(request: Request) {
     const id = insert();
     const row = db.prepare('SELECT * FROM production_batches WHERE id = ?').get(id) as ProductionBatch;
     const now = new Date();
-    const batch = { ...enrichBatch(row, now), fifo_priority: null };
+    const dep = batchDepartmentMap(db, [id]).get(id);
+    const batch = {
+      ...enrichBatch(row, now),
+      fifo_priority: null,
+      department_id: dep?.department_id ?? null,
+      department_key: dep?.department_key ?? null,
+      department_name: dep?.department_name ?? '',
+      department_inactive: dep?.department_inactive ?? false,
+    };
 
     return Response.json({ batch });
   } catch (e: any) {

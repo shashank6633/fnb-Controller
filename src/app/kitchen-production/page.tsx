@@ -79,6 +79,13 @@ interface Batch {
   expiry_status: 'green' | 'yellow' | 'red';
   batch_age_hours: number;
   fifo_priority: number | null;
+  // Which department the batch was made for. Empty on every batch created
+  // before the field existed — those render their stored kitchen_section string
+  // exactly as they did, which is why both are read below.
+  department_id?: string | null;
+  department_key?: string | null;
+  department_name?: string;
+  department_inactive?: boolean;
 }
 interface Txn {
   id: string;
@@ -168,7 +175,10 @@ type FormState = {
   production_date: string; production_time: string;
   expiry_date: string; expiry_time: string; expiry_manual: boolean;
   shelf_life: string; quantity_produced: string; unit: string;
-  prepared_by: string; kitchen_section: string; storage_location: string;
+  // `department_key` is the namespaced option key (`dept:<id>` / `custom:<id>`)
+  // that replaced the free-typed Kitchen Section box. Blank = not stated, which
+  // is a supported save — the field never was mandatory.
+  prepared_by: string; department_key: string; storage_location: string;
   recipe_id: string; remarks: string;
 };
 
@@ -177,9 +187,20 @@ const blankForm = (preparedBy = ''): FormState => ({
   production_date: todayIST(), production_time: nowHHMM(),
   expiry_date: '', expiry_time: '', expiry_manual: false,
   shelf_life: '', quantity_produced: '', unit: '',
-  prepared_by: preparedBy, kitchen_section: '', storage_location: '',
+  prepared_by: preparedBy, department_key: '', storage_location: '',
   recipe_id: '', remarks: '',
 });
+
+// The New Production Batch department dropdown (src/lib/production-departments.ts).
+interface DepartmentOption {
+  key: string; label: string; group: string;
+  source: 'department' | 'custom';
+  department_id: string | null;
+  production_department_id: string | null;
+}
+interface DepartmentOptionGroup { label: string; options: DepartmentOption[] }
+/** A production-only extra line, as managed in Production Settings. */
+interface ProductionDeptExtra { id: string; name: string; is_active: number; sort_order: number }
 
 // The Production Items master (fixed list the batch form selects from).
 interface ProductionItem {
@@ -301,6 +322,24 @@ export default function KitchenProductionPage() {
       .catch(() => {});
   }, []);
   useEffect(() => { loadPItems(); }, [loadPItems]);
+
+  // Departments for the New Production Batch dropdown, plus whether THIS user may
+  // manage the extra lines. The GET is open to any signed-in user (the owner has
+  // removed hodOnly from this page, so staff reach it too); `can_manage` mirrors
+  // the server's own write gate so we never render a control that would 403.
+  const [deptGroups, setDeptGroups] = useState<DepartmentOptionGroup[]>([]);
+  const [canManageProduction, setCanManageProduction] = useState(false);
+  const [showProdSettings, setShowProdSettings] = useState(false);
+  const loadDepartments = useCallback(() => {
+    fetch('/api/kitchen-production/departments', { credentials: 'same-origin' })
+      .then(r => r.json())
+      .then(d => {
+        setDeptGroups(Array.isArray(d?.groups) ? d.groups : []);
+        setCanManageProduction(!!d?.can_manage);
+      })
+      .catch(() => {});
+  }, []);
+  useEffect(() => { loadDepartments(); }, [loadDepartments]);
 
   // Toast
   const [toast, setToast] = useState<{ msg: string; kind: 'ok' | 'err' } | null>(null);
@@ -499,7 +538,9 @@ export default function KitchenProductionPage() {
           quantity_produced: qty,
           unit: form.unit.trim(),
           prepared_by: form.prepared_by.trim(),
-          kitchen_section: form.kitchen_section.trim(),
+          // The server re-reads the row this key names and writes the resolved
+          // name into kitchen_section itself — we never send a label to be trusted.
+          department_key: form.department_key || undefined,
           storage_location: form.storage_location.trim(),
           recipe_id: form.recipe_id || undefined,
           remarks: form.remarks.trim(),
@@ -545,6 +586,14 @@ export default function KitchenProductionPage() {
                   title="Production Items master list"
                   className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm flex items-center gap-2">
             <Package className="w-4 h-4" /> <span className="hidden sm:inline">Items</span>
+          </button>
+          {/* Shown to everyone who reaches the page: the departments list is
+              readable by any signed-in user, and the modal itself hides the
+              write controls when the server says this user may not manage it. */}
+          <button onClick={() => setShowProdSettings(true)}
+                  title="Production settings — the department list on New Production Batch"
+                  className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm flex items-center gap-2">
+            <Settings className="w-4 h-4" /> <span className="hidden sm:inline">Production Settings</span>
           </button>
           {isAdmin && (
             <button onClick={() => setShowPrinterSettings(true)}
@@ -681,8 +730,10 @@ export default function KitchenProductionPage() {
           saving={saving} error={formError}
           recipes={recipes}
           pItems={pItems}
+          deptGroups={deptGroups}
           onPickItem={pickItem}
           onManageItems={() => setShowItems(true)}
+          onManageDepartments={() => setShowProdSettings(true)}
           onCancel={() => { if (!saving) setShowForm(false); }}
           onSave={save}
         />
@@ -738,6 +789,14 @@ export default function KitchenProductionPage() {
       {/* Production Items master list */}
       {showItems && (
         <ProductionItemsModal onClose={() => { setShowItems(false); loadPItems(); }} />
+      )}
+
+      {/* Production Settings — the department list behind New Production Batch */}
+      {showProdSettings && (
+        <ProductionSettingsModal
+          canManage={canManageProduction}
+          onClose={() => { setShowProdSettings(false); loadDepartments(); }}
+        />
       )}
 
       {/* Toast */}
@@ -877,14 +936,16 @@ function QtyChip({ label, value, tone }: { label: string; value: string; tone: s
 }
 
 // ─── New-batch modal ────────────────────────────────────────────────────
-function BatchFormModal({ form, setField, saving, error, recipes, pItems, onPickItem, onManageItems, onCancel, onSave }: {
+function BatchFormModal({ form, setField, saving, error, recipes, pItems, deptGroups, onPickItem, onManageItems, onManageDepartments, onCancel, onSave }: {
   form: FormState;
   setField: (k: keyof FormState, v: string) => void;
   saving: boolean; error: string | null;
   recipes: RecipeOpt[];
   pItems: ProductionItem[];
+  deptGroups: DepartmentOptionGroup[];
   onPickItem: (id: string) => void;
   onManageItems: () => void;
+  onManageDepartments: () => void;
   onCancel: () => void; onSave: () => void;
 }) {
   return (
@@ -965,9 +1026,26 @@ function BatchFormModal({ form, setField, saving, error, recipes, pItems, onPick
               <input value={form.prepared_by} onChange={e => setField('prepared_by', e.target.value)}
                      placeholder="Chef name" className={inputCls} />
             </Field>
-            <Field label="Kitchen Section">
-              <input value={form.kitchen_section} onChange={e => setField('kitchen_section', e.target.value)}
-                     placeholder="e.g. Hot Kitchen / Bakery" className={inputCls} />
+            {/* Department this batch is made FOR. Replaced the free-typed
+                "Kitchen Section" box: the options are the app's real
+                departments (grouped by their main — Kitchen, Bar, Operations)
+                plus any production-only extra lines. Optional on purpose —
+                "— none —" is a valid save and is what every existing batch
+                carries. Choosing one records who it was made for; it moves no
+                stock and debits no department. */}
+            <Field label="Department">
+              <select value={form.department_key} onChange={e => setField('department_key', e.target.value)} className={inputCls}>
+                <option value="">— none —</option>
+                {deptGroups.map(g => (
+                  <optgroup key={g.label} label={g.label}>
+                    {g.options.map(o => <option key={o.key} value={o.key}>{o.label}</option>)}
+                  </optgroup>
+                ))}
+              </select>
+              <button type="button" onClick={onManageDepartments}
+                      className="mt-1 text-[11px] text-[#af4408] hover:underline">
+                Department not in the list? Production Settings…
+              </button>
             </Field>
 
             <Field label="Storage Location">
@@ -1124,7 +1202,15 @@ function BatchDetailDrawer({ id, onClose, onChanged, showToast }: {
               <Detail label="Shelf Life" value={batch.shelf_life || '—'} />
               <Detail label="Batch Age" value={`${fmtNum(batch.batch_age_hours)} hrs`} />
               <Detail label="Prepared By" value={batch.prepared_by || '—'} />
-              <Detail label="Kitchen Section" value={batch.kitchen_section || '—'} />
+              {/* Linked department first, stored section string second. A batch
+                  made before the department field existed has no link and so
+                  shows exactly the string it always showed. The live name is
+                  preferred over the snapshot so a department rename shows here. */}
+              <Detail
+                label="Department / Section"
+                value={(batch.department_name || batch.kitchen_section || '—')
+                  + (batch.department_inactive ? ' (retired)' : '')}
+              />
               <Detail label="Storage" value={batch.storage_location || '—'} />
               <Detail label="Logged" value={fmtIST(batch.created_at)} />
             </div>
@@ -1812,6 +1898,214 @@ function ProductionItemsModal({ onClose }: { onClose: () => void }) {
               </table>
             </div>
           )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Production Settings ────────────────────────────────────────────────
+/**
+ * The department list behind New Production Batch.
+ *
+ * Two sources, shown as two sections, because they are two different KINDS of
+ * thing and the difference matters:
+ *
+ *  1. DEPARTMENTS — read-only here, on purpose. A `departments` row is a
+ *     requisition target, a department-stock holder and a variance subject.
+ *     Creating or renaming one from a production screen would put a new
+ *     receiver into Central Store --issue--> Department Stock --recipe
+ *     consumption--> consumed, so the only door for that stays /departments.
+ *     This section exists so the owner can SEE what the dropdown will offer.
+ *
+ *  2. EXTRA LINES — the owner's "add a new line in drop down". Production-only
+ *     labels: they appear in the batch dropdown and nowhere else in the app, own
+ *     no stock and receive no issue. Deactivate rather than delete, so a batch
+ *     that named one stays readable (same rule as Production Items).
+ *
+ * Read is open to any signed-in user; the write controls render only when the
+ * server said `can_manage` (head chef or admin — the same gate every other
+ * production write uses). Non-managers get the list and a line saying who can
+ * change it, not a button that 403s.
+ */
+function ProductionSettingsModal({ canManage, onClose }: { canManage: boolean; onClose: () => void }) {
+  const [groups, setGroups] = useState<DepartmentOptionGroup[]>([]);
+  const [extras, setExtras] = useState<ProductionDeptExtra[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [draft, setDraft] = useState<{ id: string; name: string }>({ id: '', name: '' });
+
+  const load = () => {
+    // all=1 so a deactivated extra line is still listed and can be brought back.
+    fetch('/api/kitchen-production/departments?all=1', { credentials: 'same-origin' })
+      .then(r => r.json())
+      .then(d => {
+        setGroups(Array.isArray(d?.groups) ? d.groups : []);
+        setExtras(Array.isArray(d?.extras) ? d.extras : []);
+        setError(d?.error || null);
+      })
+      .catch(e => setError(e?.message || 'Failed to load'))
+      .finally(() => setLoading(false));
+  };
+  useEffect(load, []);
+
+  const saveDraft = async () => {
+    if (!draft.name.trim()) { setError('Name is required'); return; }
+    setSaving(true); setError(null);
+    try {
+      const body: { name: string; id?: string } = { name: draft.name.trim() };
+      if (draft.id) body.id = draft.id;
+      const r = await api('/api/kitchen-production/departments', { method: draft.id ? 'PUT' : 'POST', body });
+      const j = await r.json();
+      if (!r.ok) { setError(j.error || `HTTP ${r.status}`); return; }
+      setDraft({ id: '', name: '' });
+      load();
+    } catch (e) { setError(e instanceof Error ? e.message : 'Failed to save'); }
+    finally { setSaving(false); }
+  };
+
+  const toggleActive = async (x: ProductionDeptExtra) => {
+    setError(null);
+    try {
+      const r = await api('/api/kitchen-production/departments', { method: 'PUT', body: { id: x.id, is_active: !x.is_active } });
+      if (!r.ok) { const j = await r.json(); setError(j.error || `HTTP ${r.status}`); return; }
+      load();
+    } catch (e) { setError(e instanceof Error ? e.message : 'Failed to update'); }
+  };
+
+  // Real departments only — the extras have their own editable section below.
+  // Filtered on the option's SOURCE rather than the group's label, so renaming
+  // the custom heading in production-departments.ts can never silently make the
+  // extras show up twice on this screen.
+  const deptGroups = groups.filter(g => g.options.some(o => o.source === 'department'));
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/40 flex items-start sm:items-center justify-center p-3 sm:p-4 overflow-y-auto" onClick={onClose}>
+      <div className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-3xl shadow-xl flex flex-col overflow-hidden"
+           style={{ maxHeight: 'calc(100vh - 1.5rem)' }} onClick={e => e.stopPropagation()}>
+        <div className="px-5 py-3 border-b border-[#E8D5C4] flex items-center justify-between shrink-0">
+          <div className="font-semibold text-[#2D1B0E] flex items-center gap-2">
+            <Settings className="w-5 h-5 text-[#af4408] shrink-0" /> <span className="truncate">Production Settings — Departments</span>
+          </div>
+          <button onClick={onClose} className="text-[#8B7355] hover:text-[#2D1B0E]"><X className="w-5 h-5" /></button>
+        </div>
+
+        <div className="flex-1 min-h-0 overflow-y-auto p-5 space-y-5">
+          <p className="text-xs text-[#8B7355]">
+            What the <b>Department</b> dropdown offers on New Production Batch. Choosing a
+            department on a batch records who it was made for — it moves no stock and
+            debits no department.
+          </p>
+
+          {error && <div className="bg-red-50 border border-red-200 rounded-lg p-2.5 text-sm text-red-700">{error}</div>}
+
+          {/* ── Real departments (read-only) ── */}
+          <div className="space-y-2">
+            <div className="text-xs font-semibold text-[#8B7355] uppercase tracking-wide">Departments</div>
+            <p className="text-[11px] text-[#8B7355]">
+              Live from the app&apos;s own department list, grouped by main department. Read-only
+              here: a department is also a requisition and stock destination, so it is created
+              and renamed on the <Link href="/departments" className="text-[#af4408] hover:underline">Departments</Link> page,
+              never from a production screen. Deactivated departments are not offered.
+            </p>
+            {loading ? (
+              <div className="py-6 text-center text-sm text-[#8B7355]"><Loader2 className="w-5 h-5 animate-spin inline mr-2" /> Loading…</div>
+            ) : deptGroups.length === 0 ? (
+              <div className="py-6 text-center text-sm text-[#8B7355]">No active departments found.</div>
+            ) : (
+              <div className="rounded-xl border border-[#E8D5C4] divide-y divide-[#F0E4D6]">
+                {deptGroups.map(g => (
+                  <div key={g.label} className="px-3 py-2">
+                    <div className="text-[11px] font-semibold text-[#af4408] uppercase tracking-wide mb-1">{g.label}</div>
+                    <div className="flex flex-wrap gap-1.5">
+                      {g.options.map(o => (
+                        <span key={o.key} className="text-xs bg-[#FFF1E3] border border-[#E8D5C4] text-[#6B5744] rounded-full px-2 py-0.5">
+                          {o.label}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* ── Production-only extra lines (editable) ── */}
+          <div className="space-y-2">
+            <div className="text-xs font-semibold text-[#8B7355] uppercase tracking-wide">Extra lines (production only)</div>
+            <p className="text-[11px] text-[#8B7355]">
+              Add a line to the dropdown that is <b>not</b> one of the departments above. These
+              appear on New Production Batch and nowhere else — they hold no stock and can
+              never receive a requisition. Deactivate instead of deleting: batches that named
+              one keep showing it.
+            </p>
+
+            {canManage ? (
+              <div className="rounded-xl border border-[#E8D5C4] bg-[#FFF8F0] p-3">
+                <div className="flex flex-col sm:flex-row gap-2">
+                  <input value={draft.name} onChange={e => setDraft(d => ({ ...d, name: e.target.value }))}
+                         onKeyDown={e => { if (e.key === 'Enter') saveDraft(); }}
+                         maxLength={60}
+                         placeholder={draft.id ? 'New name' : 'New line (e.g. Hot Kitchen)'} className={inputCls} />
+                  <div className="flex items-center gap-2 shrink-0">
+                    <button onClick={saveDraft} disabled={saving}
+                            className="px-4 py-2 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-semibold flex items-center gap-1.5 disabled:opacity-50 whitespace-nowrap">
+                      {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />} {draft.id ? 'Save changes' : 'Add line'}
+                    </button>
+                    {draft.id && (
+                      <button onClick={() => setDraft({ id: '', name: '' })}
+                              className="px-3 py-2 bg-white border border-[#E8D5C4] text-[#6B5744] rounded-lg text-sm">Cancel</button>
+                    )}
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <div className="rounded-xl border border-[#E8D5C4] bg-[#FFF8F0] p-3 text-xs text-[#8B7355]">
+                You can see this list but not change it — adding or retiring a line is a head
+                chef or admin action, the same as adding a Production Item.
+              </div>
+            )}
+
+            {loading ? null : extras.length === 0 ? (
+              <div className="py-6 text-center text-sm text-[#8B7355]">
+                No extra lines — the dropdown shows the departments above.
+              </div>
+            ) : (
+              <div className="overflow-x-auto rounded-xl border border-[#E8D5C4]">
+                <table className="w-full text-sm">
+                  <thead className="bg-[#FFF1E3] text-[11px] uppercase tracking-wide text-[#8B7355]">
+                    <tr>
+                      <th className="text-left px-3 py-2">Line</th>
+                      <th className="text-right px-3 py-2">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-[#F0E4D6]">
+                    {extras.map(x => (
+                      <tr key={x.id} className={x.is_active ? '' : 'opacity-50'}>
+                        <td className="px-3 py-2 font-medium text-[#2D1B0E]">
+                          {x.name}
+                          {!x.is_active && <span className="ml-1.5 text-[9px] bg-gray-100 text-gray-500 px-1.5 py-0.5 rounded-full">inactive</span>}
+                        </td>
+                        <td className="px-3 py-2 text-right whitespace-nowrap">
+                          {canManage ? (
+                            <>
+                              <button onClick={() => setDraft({ id: x.id, name: x.name })}
+                                      className="text-[#af4408] hover:underline text-xs font-medium mr-3">Rename</button>
+                              <button onClick={() => toggleActive(x)}
+                                      className="text-[#8B7355] hover:underline text-xs font-medium">{x.is_active ? 'Deactivate' : 'Activate'}</button>
+                            </>
+                          ) : (
+                            <span className="text-xs text-[#B9A491]">—</span>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
         </div>
       </div>
     </div>
