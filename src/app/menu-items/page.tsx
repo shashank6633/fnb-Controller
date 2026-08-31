@@ -1037,7 +1037,24 @@ export default function MenuItemsPage() {
 
       {/* Edit Modal */}
       {editItem && (
-        <EditItemModal item={editItem} onClose={() => setEditItem(null)} onSave={saveEdit} menuCategories={menuCats} stations={stations} isNew={!editItem.id} />
+        // THE KEY IS LOAD-BEARING. EditItemModal seeds `form` with
+        // useState({ ...item }), which runs ONLY on mount — so if this element
+        // stays mounted while `editItem` changes from one row to another, React
+        // reuses the instance and the form keeps showing, and SAVES, the
+        // previous item's values against the new item's id.
+        //
+        // Mouse users cannot reach that: the modal is `fixed inset-0` over a
+        // full-screen backdrop whose onClick is onClose, so any click aimed at
+        // another row's Edit button closes this one first and the next open is a
+        // fresh mount. KEYBOARD USERS CAN. Focus is not trapped in the card, so
+        // Tab walks into the page behind and Enter on another row's Edit fires
+        // setEditItem(other) with no unmount in between.
+        //
+        // Keying on the item's id makes the swap a remount, so `form` is reseeded
+        // from the row actually being edited whatever route got us here. NEW_ITEM
+        // has no id; 'new' keeps its key stable so typing into the add form does
+        // not remount it out from under the user.
+        <EditItemModal key={editItem.id || 'new'} item={editItem} onClose={() => setEditItem(null)} onSave={saveEdit} menuCategories={menuCats} stations={stations} isNew={!editItem.id} />
       )}
 
       {/* Category master (admin) */}
