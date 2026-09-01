@@ -94,8 +94,16 @@
  * unchanged". Red is NOT used for Reject — it sits one hue from #af4408 and the
  * two read as the same button at a glance, which is the exact confusion that
  * would write 793 false "we have zero" counts into the books.
- * THERE IS NO BULK APPROVE, here or in the API (the function is not imported
- * into that route at all). The bulk bar says so, so nobody goes looking.
+ * THERE IS NO APPROVE-BY-FILTER, here or in the API — the bulk route still
+ * never imports approveVariance, so "Reject all N" can never grow an approving
+ * twin. What DOES exist (owner ask, 2026-09) is APPROVE SELECTED: the rows the
+ * admin ticked himself, sent as EXPLICIT IDS to their own route
+ * (/api/variance-approvals/approve-selected), which loops the same
+ * approveVariance() the card button calls — so every guard (supersede,
+ * department, cutover, QC hold, already-decided) still runs per row, and each
+ * row succeeds or is refused INDEPENDENTLY, by name. A filter can sweep in a
+ * count nobody looked at; a tick cannot — that is the whole distinction, and
+ * the strip below spells it out beside the buttons.
  *
  * ── AND THEY MUST NOT BE ORDERED SO THAT ONLY ONE OF THEM IS ON SCREEN ────
  * Giving the two verbs different weight was not enough while only the wrong
@@ -134,7 +142,7 @@ import {
   ScrollText, ShieldCheck, Loader2, RefreshCw, CheckCircle2, XCircle,
   AlertTriangle, Info, Lock, PackageX, PackagePlus, Store, Boxes, Layers,
   CalendarDays, Filter, Trash2, ClipboardList, SlidersHorizontal, Save, X,
-  ChevronDown, ChevronRight, ListChecks, Zap, ArrowDown,
+  ChevronDown, ChevronRight, ListChecks, Zap, ArrowDown, Search as SearchIcon,
 } from 'lucide-react';
 import { packFactor, toPurchaseQty, type PackMeta } from '@/lib/pack-units';
 import { todayIST } from '@/lib/format-date';
@@ -207,6 +215,19 @@ interface BulkPreview {
   expect_count: number;
   filter: { from: string | null; to: string | null; batch_id: string | null; source: string | null; outlet: string };
   sample: Approval[];
+}
+
+/**
+ * POST /api/variance-approvals/approve-selected — the per-row verdicts, which
+ * are the whole point of that endpoint: each ticked row was judged on its own
+ * (supersede, department, already-decided…), so "8 approved, 2 refused with
+ * these two sentences" is a NORMAL outcome and must be rendered as one, never
+ * collapsed into a success toast that hides the refusals.
+ */
+interface ApproveSelectedResult {
+  requested: number;
+  approved: { id: string; material: string }[];
+  refused: { id: string; material: string; reason: string }[];
 }
 
 /**
@@ -421,13 +442,32 @@ export default function VarianceApprovalsPage() {
   const [previewBusy, setPreviewBusy] = useState(false);
   const [previewErr, setPreviewErr] = useState<string | null>(null);
 
-  /* ── Bulk reject ───────────────────────────────────────────────────────── */
+  /* ── The selection (feeds bulk reject AND approve selected) ────────────── */
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [bulkMode, setBulkMode] = useState<'ids' | 'filter' | null>(null);
   const [bulkReason, setBulkReason] = useState('');
   const [bulkTyped, setBulkTyped] = useState('');
   const [bulkBusy, setBulkBusy] = useState(false);
   const [bulkErr, setBulkErr] = useState<string | null>(null);
+
+  /* ── Approve selected (owner ask, 2026-09) ─────────────────────────────────
+   * Its own dialog state, deliberately NOT reusing bulkMode: the reject dialog
+   * and the approve dialog must never be one component wearing two labels —
+   * that is exactly the "same button at a glance" confusion the file header
+   * forbids. `apprResult` holds the server's per-row verdicts and switches the
+   * dialog into its results phase; the refusals are rendered there by name. */
+  const [apprOpen, setApprOpen] = useState(false);
+  const [apprReason, setApprReason] = useState('');
+  const [apprBusy, setApprBusy] = useState(false);
+  const [apprErr, setApprErr] = useState<string | null>(null);
+  const [apprResult, setApprResult] = useState<ApproveSelectedResult | null>(null);
+
+  /* ── Material search ───────────────────────────────────────────────────────
+   * Client-side name/SKU narrowing of the rows ON SCREEN, so "select the
+   * materials I care about" is a search-and-tick, not a 500-row scroll. It is
+   * NOT part of the server filter: the bulk "Reject all N" and the preview
+   * count ignore it entirely, and the strip says so while it is active. */
+  const [q, setQ] = useState('');
 
   /* ── The bar ───────────────────────────────────────────────────────────── */
   const [bar, setBar] = useState<BarPayload | null>(null);
@@ -558,10 +598,28 @@ export default function VarianceApprovalsPage() {
     return true;
   }), [rows, from, to, batchId, source]);
 
-  /** ₹ at stake across the rows ON SCREEN. `truncated` ⇒ print it as a floor. */
-  const visibleValue = useMemo(
-    () => visible.reduce((s, r) => s + Math.abs(Number(r.variance_value) || 0), 0),
-    [visible],
+  /* ── THE SEARCH NARROWS `shown`, NEVER `visible` ───────────────────────────
+   * Two layers on purpose. `visible` (period/upload/rail) is what the
+   * selection-pruning effect below is keyed on, what `selectedRows` reads, and
+   * what the server preview describes. The search sits ON TOP and narrows only
+   * what is RENDERED — so a tick made under one search survives the next one.
+   * That survival is the owner's whole flow: search "chicken", tick it, search
+   * "paneer", tick that, then act on both. Pruning on the search would wipe
+   * the first tick the moment the second search was typed. The honesty cost
+   * (a ticked row can be off screen while a search is active) is paid where
+   * it belongs: both ids-mode dialogs NAME every ticked row before the click,
+   * so nothing is ever acted on that was not printed in front of the admin. */
+  const qNorm = q.trim().toLowerCase();
+  const shown = useMemo(() => !qNorm ? visible : visible.filter(r =>
+    (r.material_name || '').toLowerCase().includes(qNorm)
+    || (r.material_sku || '').toLowerCase().includes(qNorm)
+  ), [visible, qNorm]);
+
+  /** ₹ at stake across the rows ON SCREEN (after the search, since that is
+   *  what "shown" means to the person reading the line that prints this). */
+  const shownValue = useMemo(
+    () => shown.reduce((s, r) => s + Math.abs(Number(r.variance_value) || 0), 0),
+    [shown],
   );
   /**
    * ₹ still undecided across the WHOLE queue, summed from the batch index —
@@ -572,9 +630,22 @@ export default function VarianceApprovalsPage() {
     () => batches.reduce((s, b) => s + (Number(b.pending_value) || 0), 0),
     [batches],
   );
+  /**
+   * Every pending row the FILTER shows (search NOT applied) — the basis of the
+   * selection itself: ticks are pruned to this set, so a tick can outlive a
+   * search but never outlive the period/upload/rail filter that made its row
+   * visible. Do not swap `visible` for `shown` here without reading the search
+   * note above — that swap silently kills the search-and-tick flow.
+   */
   const selectableIds = useMemo(
     () => visible.filter(r => r.status === 'pending').map(r => r.id),
     [visible],
+  );
+  /** The pending rows literally rendered below (search applied) — what
+   *  "Select the N shown" selects and what the pointer line counts. */
+  const shownPendingIds = useMemo(
+    () => shown.filter(r => r.status === 'pending').map(r => r.id),
+    [shown],
   );
   /**
    * THE PENDING ROWS THAT ACTUALLY CARRY A LIVE APPROVE BUTTON.
@@ -588,12 +659,17 @@ export default function VarianceApprovalsPage() {
    * which NOTHING is approvable is a normal state, not an edge case.
    * The pointer below is written off this list, not off `selectableIds`, so it
    * can never promise an orange Approve that no card on screen carries, and
-   * never jumps to a greyed-out one. Selection, bulk reject and every ₹ figure
-   * still run off `selectableIds` — none of them are about approving.
+   * never jumps to a greyed-out one. Derived from `shown` (search applied),
+   * because it points at cards that are literally rendered. Selection pruning
+   * and the server-preview comparison still run off `selectableIds`.
+   * Approve-selected deliberately does NOT act off this list: it sends every
+   * ticked id and lets the SERVER refuse the blocked ones per row — the list
+   * here is advisory (it tells the dialog how many refusals to expect), never
+   * a client-side gate standing in for the server's.
    */
   const approvableIds = useMemo(
-    () => visible.filter(r => r.status === 'pending' && !r.approve_blocked).map(r => r.id),
-    [visible],
+    () => shown.filter(r => r.status === 'pending' && !r.approve_blocked).map(r => r.id),
+    [shown],
   );
 
   /* A TICK MUST NOT SURVIVE THE FILTER THAT MADE IT VISIBLE. Selecting 40 rows
@@ -601,7 +677,11 @@ export default function VarianceApprovalsPage() {
      leave those 40 ticked and off-screen: the dialog would say "40 counts" while
      the ₹ figure beside it — summed over what IS on screen — described none of
      them, and the POST would reject rows nobody was looking at. Prune to what
-     the current filter shows, every time it changes. */
+     the current filter shows, every time it changes.
+     KEYED ON `selectableIds` (filter), NOT the search: a tick made under one
+     search must survive the next one — see the note on `shown`. The honesty
+     this pruning protects is preserved another way there: both ids-mode
+     dialogs name every ticked row before anything runs. */
   useEffect(() => {
     setSelected(prev => {
       if (prev.size === 0) return prev;
@@ -617,17 +697,19 @@ export default function VarianceApprovalsPage() {
     [visible, selected],
   );
   const selectedValue = selectedRows.reduce((s, r) => s + Math.abs(Number(r.variance_value) || 0), 0);
-  const allSelected = selectableIds.length > 0 && selectableIds.every(id => selected.has(id));
+  // "All" here means all the rows literally on screen — the search-narrowed
+  // set, because "Select the N shown" must select exactly the N it counted.
+  const allSelected = shownPendingIds.length > 0 && shownPendingIds.every(id => selected.has(id));
 
   const toggleAll = () => {
     setSelected(prev => {
       if (allSelected) {
         const n = new Set(prev);
-        for (const id of selectableIds) n.delete(id);
+        for (const id of shownPendingIds) n.delete(id);
         return n;
       }
       const n = new Set(prev);
-      for (const id of selectableIds) n.add(id);
+      for (const id of shownPendingIds) n.add(id);
       return n;
     });
   };
@@ -637,7 +719,7 @@ export default function VarianceApprovalsPage() {
     return n;
   });
 
-  const clearFilter = () => { setFrom(''); setTo(''); setBatchId(null); setSource(''); };
+  const clearFilter = () => { setFrom(''); setTo(''); setBatchId(null); setSource(''); setQ(''); };
   const setMonth = (monthsBack: number) => {
     const b = monthBounds(todayIST(), monthsBack);
     setFrom(b.from); setTo(b.to);
@@ -685,7 +767,7 @@ export default function VarianceApprovalsPage() {
    *              the 1,472-row button, so it carries the previewed count back as
    *              `expect_count` (409 if the queue moved) AND asks the admin to
    *              type that number before the button arms. */
-  const pendingShown = selectableIds.length;
+  const pendingShown = shownPendingIds.length;
   const approvableShown = approvableIds.length;
   /**
    * WHERE THE JUMP LANDS. `visible` renders in this order and both id lists are
@@ -699,7 +781,7 @@ export default function VarianceApprovalsPage() {
    * (see below) and still offers the jump, because the rows are then where the
    * refusal reasons are, and that is what the admin needs to read.
    */
-  const jumpTargetId = approvableIds[0] || selectableIds[0] || null;
+  const jumpTargetId = approvableIds[0] || shownPendingIds[0] || null;
   /**
    * LAYOUT ONLY — it moves the viewport and nothing else. No selection, no
    * submit, no decision: the two verbs still live exactly where they lived,
@@ -742,9 +824,12 @@ export default function VarianceApprovalsPage() {
    * the list endpoint's LIMIT, and the server counting rows this page never
    * received. `preview.matched` is the server's own count for the identical
    * filter, so comparing against it catches both.
+   * Compared against `selectableIds` (pre-search), because this is about the
+   * FILTER selecting more than the page read — a search narrowing the render
+   * must not make the whole-queue figures start hedging with "at least".
    */
   const shownIsPartial = truncated
-    || (tab === 'pending' && !!preview && preview.matched > pendingShown);
+    || (tab === 'pending' && !!preview && preview.matched > selectableIds.length);
 
   const bulkCount = bulkMode === 'ids' ? selected.size : (preview?.matched ?? 0);
   const bulkValueKnown = bulkMode === 'ids' ? selectedValue : pendingShownValue;
@@ -789,6 +874,45 @@ export default function VarianceApprovalsPage() {
       await loadPreview();
     } catch (e) { setBulkErr((e as Error).message); }
     finally { setBulkBusy(false); }
+  };
+
+  /* ── APPROVE SELECTED ──────────────────────────────────────────────────────
+   * WRITES TO STOCK, so it earns the same care the single-row Approve gets and
+   * none of the shortcuts. Explicit ids only — Array.from(selected), in the
+   * order the admin ticked them — to its own route, never through bulk/route.ts
+   * (which stays reject-only by structure). The server loops approveVariance()
+   * per id: every guard runs per row, and the response's per-row verdicts are
+   * rendered in the dialog's results phase — a refusal is a NAMED sentence, not
+   * a silent skip. No client-side pre-filtering of blocked rows: the ids go as
+   * ticked and the SERVER refuses what it refuses, so a row decided or
+   * superseded between render and click is judged by the one place that knows.
+   * `selBlockedCount` below is advisory copy only ("K will come back refused"),
+   * never a gate. */
+  const selBlockedCount = selectedRows.filter(r => !!r.approve_blocked).length;
+  const openAppr = () => { setApprOpen(true); setApprReason(''); setApprErr(null); setApprResult(null); };
+  const closeAppr = () => { if (!apprBusy) { setApprOpen(false); setApprResult(null); } };
+  const runApproveSelected = async () => {
+    const reason = apprReason.trim();
+    if (reason.length < 2) { setApprErr('Write why these counts are being approved — ask the staff who counted; it is recorded on every row.'); return; }
+    const ids = Array.from(selected);
+    if (ids.length === 0) { setApprErr('Nothing is selected.'); return; }
+    setApprBusy(true); setApprErr(null);
+    try {
+      const res = await api('/api/variance-approvals/approve-selected', { method: 'POST', body: { ids, reason } });
+      const j = await res.json();
+      if (!res.ok) throw new Error(j?.error || `HTTP ${res.status}`);
+      setApprResult({
+        requested: Number(j.requested) || ids.length,
+        approved: Array.isArray(j.approved) ? j.approved : [],
+        refused: Array.isArray(j.refused) ? j.refused : [],
+      });
+      // Reload BEHIND the results dialog, so the queue underneath is current the
+      // moment it closes. load() clears the selection.
+      await load();
+      await loadBatches();
+      await loadPreview();
+    } catch (e) { setApprErr((e as Error).message); }
+    finally { setApprBusy(false); }
   };
 
   /* ── The bar ───────────────────────────────────────────────────────────── */
@@ -883,8 +1007,9 @@ export default function VarianceApprovalsPage() {
             question that was actually being asked.
             NOTHING IS APPROVED HERE, AND THIS IS NOT A BULK ANYTHING. The
             button scrolls; it selects nothing, submits nothing and decides
-            nothing. A count is still approved in exactly one place — its
-            own card, one at a time — and there is still no bulk approve.
+            nothing. A count is approved on its own card, or through Approve
+            selected below for rows the admin ticked himself — and there is
+            still no approve-by-filter anywhere.
             IT MUST NEVER PROMISE AN APPROVE THAT IS NOT THERE. A queue of
             department counts, or of counts a newer one supersedes, is fully
             pending and fully un-approvable — the server refuses every one —
@@ -931,8 +1056,9 @@ export default function VarianceApprovalsPage() {
                     {num(approvableShown)} of the {num(pendingShown)} counts below {approvableShown === 1 ? 'is' : 'are'} waiting
                     for your decision.
                   </b>{' '}
-                  Each is decided on its own card: the orange <b>Approve → write to stock</b> button is at the bottom of
-                  the card, with <b>Reject</b> beside it. Approving is one count at a time — there is no bulk approve.
+                  Each is decided on its own card — the orange <b>Approve → write to stock</b> button is at the bottom
+                  of the card, with <b>Reject</b> beside it — or tick the ones you mean and use <b>Approve selected</b>{' '}
+                  under the list; the server still checks every ticked count one at a time.
                   The other {num(pendingShown - approvableShown)} cannot be approved at all: those cards say why, and
                   reject is all they take.
                 </>
@@ -942,8 +1068,9 @@ export default function VarianceApprovalsPage() {
                     {num(pendingShown)} count{pendingShown === 1 ? '' : 's'} below {pendingShown === 1 ? 'is' : 'are'} waiting
                     for your decision.
                   </b>{' '}
-                  Each one is decided on its own card: the orange <b>Approve → write to stock</b> button is at the bottom of
-                  the card, with <b>Reject</b> beside it. Approving is one count at a time — there is no bulk approve.
+                  Each one is decided on its own card — the orange <b>Approve → write to stock</b> button is at the
+                  bottom of the card, with <b>Reject</b> beside it — or tick the ones you mean and use{' '}
+                  <b>Approve selected</b> under the list; the server still checks every ticked count one at a time.
                 </>
               )}
             </span>
@@ -1347,7 +1474,18 @@ export default function VarianceApprovalsPage() {
                 <option value="liquor">Liquor stores</option>
               </select>
             </label>
-            {filterActive && (
+            {/* THE MATERIAL SEARCH — the pick-and-tick lens the owner asked
+                for. Narrows the RENDERED list only (see the `shown` note):
+                ticks survive it, and the server-side "Reject all N" ignores
+                it — the caption under the bulk strip says so while it is on. */}
+            <label className="flex flex-col gap-1 min-w-[12rem]">
+              <span className="text-[10px] uppercase tracking-wide text-[#8B7355] flex items-center gap-1">
+                <SearchIcon className="w-3 h-3" /> Material
+              </span>
+              <input value={q} onChange={e => setQ(e.target.value)} placeholder="Search name or SKU…"
+                     className={fieldCls} />
+            </label>
+            {(filterActive || qNorm) && (
               <button onClick={clearFilter} className="inline-flex items-center gap-1 px-2.5 py-1.5 text-[12px] border border-[#E8D5C4] rounded-lg text-[#6B5744] hover:bg-[#FFF1E3]">
                 <X className="w-3.5 h-3.5" /> Clear filter
               </button>
@@ -1369,7 +1507,10 @@ export default function VarianceApprovalsPage() {
                 would silently compare a filtered slice against an unfiltered
                 whole and read as data loss. */}
             <span>
-              Showing <b>{num(visible.length)}</b> {tab} row{visible.length === 1 ? '' : 's'}
+              Showing <b>{num(shown.length)}</b> {tab} row{shown.length === 1 ? '' : 's'}
+              {/* The search is a lens on `visible`, so say what it is hiding —
+                  a bare "Showing 3" over a 500-row filter reads as data loss. */}
+              {qNorm && <> matching &ldquo;{q.trim()}&rdquo; of {num(visible.length)}</>}
               {truncated && <> · read {num(rows.length)} of {num(total)}</>}
             </span>
             {tab === 'pending' && (
@@ -1382,7 +1523,9 @@ export default function VarianceApprovalsPage() {
                     : null
             )}
             <span>
-              {shownIsPartial ? 'at least ' : ''}<b>{inr(visibleValue)}</b> at stake in the rows shown
+              {/* With a search on, the sum IS exactly the rows shown — the
+                  "at least" hedge belongs to truncation, not to the lens. */}
+              {!qNorm && shownIsPartial ? 'at least ' : ''}<b>{inr(shownValue)}</b> at stake in the rows shown
             </span>
           </div>
 
@@ -1410,10 +1553,10 @@ export default function VarianceApprovalsPage() {
             <div className="flex flex-wrap items-center gap-2 border-t border-[#F0E4D6] pt-2.5">
               <button onClick={() => scrollToId('bulk-reject')}
                       className="inline-flex items-center gap-1.5 text-[12px] text-[#6B5744] hover:text-[#2D1B0E] underline decoration-[#D4B896] underline-offset-2">
-                <Trash2 className="w-3.5 h-3.5" />
+                {selected.size > 0 ? <ListChecks className="w-3.5 h-3.5" /> : <Trash2 className="w-3.5 h-3.5" />}
                 {selected.size > 0
-                  ? <><b>{num(selected.size)}</b> selected · {inr(selectedValue)} — reject them from the bulk controls under the list</>
-                  : <>Clearing a whole upload? The bulk reject controls are under the list</>}
+                  ? <><b>{num(selected.size)}</b> selected · {inr(selectedValue)} — approve or reject them from the controls under the list</>
+                  : <>Clearing a whole upload? The bulk controls are under the list</>}
                 <ArrowDown className="w-3.5 h-3.5" />
               </button>
             </div>
@@ -1488,6 +1631,18 @@ export default function VarianceApprovalsPage() {
           <div className="flex items-center gap-2 text-[#8B7355] text-sm py-10 justify-center">
             <Loader2 className="w-5 h-5 animate-spin" /> Loading…
           </div>
+        ) : qNorm && shown.length === 0 && visible.length > 0 ? (
+          /* AN EMPTY SEARCH IS NOT AN EMPTY QUEUE. The green-tick card below
+             says "everything reconciles", which would be a lie over rows the
+             lens is merely hiding — say what is hidden, and that ticks kept. */
+          <div className="bg-white border border-[#E8D5C4] rounded-xl p-10 text-center text-[#8B7355]">
+            <SearchIcon className="w-10 h-10 text-[#D4B896] mx-auto mb-3" />
+            <p className="font-medium text-[#2D1B0E]">No {tab} rows match &ldquo;{q.trim()}&rdquo;.</p>
+            <p className="text-sm mt-1">
+              {num(visible.length)} row{visible.length === 1 ? ' is' : 's are'} hidden by the search — clear it to see
+              them{selected.size > 0 ? <> (your <b>{num(selected.size)}</b> tick{selected.size === 1 ? ' is' : 's are'} kept)</> : null}.
+            </p>
+          </div>
         ) : visible.length === 0 ? (
           <div className="bg-white border border-[#E8D5C4] rounded-xl p-10 text-center text-[#8B7355]">
             <CheckCircle2 className="w-10 h-10 text-emerald-500 mx-auto mb-3" />
@@ -1512,7 +1667,7 @@ export default function VarianceApprovalsPage() {
           </div>
         ) : (
           <div className="space-y-3">
-            {visible.map(row => {
+            {shown.map(row => {
               const shortage = row.variance < 0;
               const decided = row.status !== 'pending';
               const auto = Number(row.auto_applied) === 1;
@@ -1569,8 +1724,13 @@ export default function VarianceApprovalsPage() {
                 <div key={row.id} id={`vrow-${row.id}`} tabIndex={-1} className="bg-white border border-[#E8D5C4] rounded-xl p-4 shadow-sm scroll-mt-4">
                   <div className="flex flex-wrap items-start justify-between gap-3">
                     <div className="min-w-0 flex gap-2.5">
-                      {/* Selection is PENDING-only, because reject is the only
-                          bulk verb and it only moves pending rows. */}
+                      {/* Selection is PENDING-only: both verbs that act on a
+                          tick (reject selected, approve selected) only move
+                          pending rows. A blocked pending row is still
+                          tickable ON PURPOSE — the server refuses it per row
+                          and the refusal comes back named, which is how the
+                          admin learns why, instead of a checkbox that
+                          silently will not tick. */}
                       {!decided && (
                         <input type="checkbox" className="accent-[#af4408] mt-1 w-4 h-4 shrink-0"
                                checked={selected.has(row.id)} onChange={() => toggleOne(row.id)}
@@ -1873,7 +2033,7 @@ export default function VarianceApprovalsPage() {
           </div>
         )}
 
-        {/* ══ BULK REJECT — ONE VERB, AND IT LIVES UNDER THE QUEUE ══════════
+        {/* ══ THE ACTION STRIP — TICKED ROWS FIRST, THE WHOLE FILTER BELOW ══
             IT USED TO SIT IN THE FILTER CARD, ABOVE THE ROWS. That put the
             only two buttons on screen — "Reject selected" and "Reject all N
             pending" — above a per-row Approve that starts 251px past the
@@ -1882,14 +2042,21 @@ export default function VarianceApprovalsPage() {
             decide the ones that need deciding, then clear what is left with
             one action. That is also the order the monthly job is actually
             done in.
-            NOTHING ABOUT WHAT IT DOES CHANGED — same two selections ('ids'
-            from the ticks on the cards, 'filter' resolved by the server),
-            same preview, same typed confirmation, same API. It stays a
-            deliberately quieter pair than the row's Approve: a light outline
-            and a neutral #6B5744 solid, never red and never brand orange.
-            AND THERE IS STILL NO BULK APPROVE — not here, not in the API.
-            The paragraph below says so, next to the buttons that would be
-            the place to look for one.
+            TWO KINDS OF SELECTION, AND THEY DO NOT SHARE VERBS. The ticked
+            rows (explicit ids the admin named himself) take BOTH verbs:
+            Reject selected, and — owner ask, 2026-09 — Approve selected,
+            which goes to its own route and is judged per row by the same
+            guards as the card button. The FILTER (server-resolved, possibly
+            thousands of rows nobody scrolled to) takes exactly ONE verb,
+            reject, same preview, same typed confirmation, same API as ever.
+            THERE IS NO APPROVE-BY-FILTER AND THERE WILL NOT BE ONE — a
+            filter is resolved after the click, so it can sweep in a count
+            nobody looked at; that is precisely what may never happen to the
+            verb that writes to stock. The paragraph below says so, next to
+            the buttons that would be the place to look for one.
+            THE VOICE LAW HOLDS IN MINIATURE: Approve selected is the ONLY
+            solid brand-orange in this strip and its label says it writes;
+            both rejects stay the light outline / neutral #6B5744, never red.
             HIDDEN WHILE THE LIST IS LOADING, like the pointer at the top and
             the list itself. `rows` is not cleared during a re-read, so this
             strip used to stay behind — offering "Select the 2 shown" over a
@@ -1905,13 +2072,14 @@ export default function VarianceApprovalsPage() {
         {!loading && tab === 'pending' && (
           <div id="bulk-reject" tabIndex={-1} className="bg-white border border-[#E8D5C4] rounded-xl p-3 space-y-2.5 scroll-mt-4">
             <div className="text-[10px] uppercase tracking-wide text-[#8B7355] flex items-center gap-1.5">
-              <Trash2 className="w-3.5 h-3.5" /> Clear counts in bulk — reject only
+              <ListChecks className="w-3.5 h-3.5" /> The counts you ticked · then the whole filter
             </div>
+            {/* ── ROW 1: THE TICKED ROWS — the admin named every one of these. */}
             <div className="flex flex-wrap items-center gap-2">
-              <button onClick={toggleAll} disabled={selectableIds.length === 0}
+              <button onClick={toggleAll} disabled={shownPendingIds.length === 0}
                       className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-[12px] border border-[#E8D5C4] rounded-lg text-[#6B5744] hover:bg-[#FFF1E3] disabled:opacity-40">
                 <ListChecks className="w-3.5 h-3.5" />
-                {allSelected ? 'Clear selection' : `Select the ${num(selectableIds.length)} shown`}
+                {allSelected ? 'Clear selection' : `Select the ${num(shownPendingIds.length)} shown`}
               </button>
               {selected.size > 0 && (
                 <span className="text-[12px] text-[#6B5744]">
@@ -1921,19 +2089,40 @@ export default function VarianceApprovalsPage() {
               <div className="flex-1" />
               <button onClick={() => openBulk('ids')} disabled={selected.size === 0}
                       className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12px] font-medium border border-[#D4B896] text-[#6B5744] bg-white hover:bg-[#FFF1E3] disabled:opacity-40">
-                <Trash2 className="w-3.5 h-3.5" /> Reject selected
+                <Trash2 className="w-3.5 h-3.5" /> Reject selected — stock unchanged
               </button>
+              {/* THE ONE ORANGE BUTTON IN THIS STRIP. Same voice as the card's
+                  own Approve, because it is the same action multiplied: it
+                  writes to stock, and the label must say so. */}
+              <button onClick={openAppr} disabled={selected.size === 0}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12px] font-semibold bg-[#af4408] hover:bg-[#8a3506] text-white disabled:opacity-40 disabled:cursor-not-allowed">
+                <CheckCircle2 className="w-3.5 h-3.5" />
+                Approve selected ({num(selected.size)}) → write to stock
+              </button>
+            </div>
+            {/* ── ROW 2: THE WHOLE FILTER — reject only, deliberately. */}
+            <div className="flex flex-wrap items-center gap-2 border-t border-[#F0E4D6] pt-2.5">
               <button onClick={() => openBulk('filter')} disabled={!preview || preview.matched === 0}
                       className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12px] font-semibold bg-[#6B5744] hover:bg-[#54432f] text-white disabled:opacity-40">
                 <Trash2 className="w-3.5 h-3.5" />
                 Reject all {preview ? num(preview.matched) : '—'} {filterActive ? 'in this selection' : 'pending'}
               </button>
+              {qNorm && (
+                <span className="text-[11px] text-[#8B7355]">
+                  &ldquo;Reject all&rdquo; is resolved by the server from the period / upload / rail filter — the
+                  material search does not narrow it.
+                </span>
+              )}
             </div>
             <p className="text-[11px] text-[#8B7355] leading-relaxed">
               Rejecting discards the counts and <b>changes no stock on any rail</b> — the rows move to the Rejected tab
-              and stay readable. <b>There is no bulk approve, and there will not be one</b>: approving writes to stock,
-              and doing that to a whole sheet at once could book &quot;we have zero&quot; against hundreds of items in one
-              click. Approve one count at a time, on its own card above.
+              and stay readable. <b>Approve selected writes to stock</b>, and it only ever takes rows you ticked
+              yourself: the server still checks each one and refuses a superseded or department count <i>by name</i>,
+              so approving 8 of 10 with 2 named refusals is a normal outcome, not an error.{' '}
+              <b>There is no approve-by-filter, and there will not be one</b>: a filter is resolved after you click, so
+              it could sweep in a count nobody looked at — and approving a mass-zeroed sheet wholesale would book
+              &quot;we have zero&quot; against hundreds of items in one click. Tick what you mean, or approve on the
+              row&apos;s own card above.
             </p>
           </div>
         )}
@@ -1980,10 +2169,30 @@ export default function VarianceApprovalsPage() {
                   stand as open losses to chase.
                 </p>
                 <p className="text-[#6B5744]">
-                  This is <b>not</b> the Approve button. Approving is what writes a count into stock, and it is done one
-                  row at a time.
+                  This is <b>not</b> the Approve button. Approving is what writes a count into stock — on the
+                  row&apos;s own card, or through <b>Approve selected</b> for rows you ticked. Nothing here writes
+                  anything.
                 </p>
               </div>
+
+              {/* IDS MODE NAMES EVERY TICKED ROW. Added when ticks were allowed
+                  to survive the material search (see the `shown` note): a row
+                  ticked under an earlier search can be off screen right now, so
+                  the dialog prints the full list — nothing is rejected that was
+                  not named in front of the admin. */}
+              {bulkMode === 'ids' && selectedRows.length > 0 && (
+                <div className="border border-[#E8D5C4] rounded-lg divide-y divide-[#F0E4D6] max-h-40 overflow-y-auto">
+                  {selectedRows.map(r => (
+                    <div key={r.id} className="px-3 py-1.5 text-[12px] flex flex-wrap items-baseline gap-x-2">
+                      <b className="text-[#2D1B0E]">{r.material_name}</b>
+                      <span className="text-[#8B7355]">
+                        {r.source === 'liquor' ? (r.store_name || 'Store') : (r.department_name || 'Store / Overall')} · {r.date}
+                      </span>
+                      <span className="text-[#6B5744]">{r.variance < 0 ? 'shortage' : 'surplus'} {inr(r.variance_value)}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
 
               {bulkMode === 'filter' && preview && (
                 <div className="text-[12px] text-[#6B5744]">
@@ -2037,6 +2246,144 @@ export default function VarianceApprovalsPage() {
                 Reject {num(bulkCount)} — stock unchanged
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* ══ APPROVE SELECTED — CONFIRMATION, THEN THE PER-ROW VERDICTS ═════
+          Its own dialog, never a mode of the reject one: these two must not
+          look alike anywhere, including here. Before the click it quotes N and
+          the summed ₹, NAMES every ticked row (a tick can be off screen while
+          a search is active — see the `shown` note — so the list is the
+          honesty), and warns how many the server is already known to refuse.
+          After the click it stays open and renders the server's own verdicts:
+          the approved by name, and every refusal with the server's sentence
+          verbatim — "8 approved, 2 refused" is the normal shape of this
+          feature working, and it must be READ, not toasted away. */}
+      {apprOpen && (
+        <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4" onClick={closeAppr}>
+          <div className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-lg shadow-xl max-h-[90vh] flex flex-col" onClick={e => e.stopPropagation()}>
+            <div className="px-5 py-4 border-b border-[#E8D5C4] flex items-center justify-between">
+              <h2 className="font-bold text-[#2D1B0E] flex items-center gap-2">
+                <CheckCircle2 className="w-5 h-5 text-[#af4408]" />
+                {apprResult
+                  ? 'Approve selected — what happened'
+                  : <>Approve {num(selected.size)} count{selected.size === 1 ? '' : 's'} → write to stock</>}
+              </h2>
+              <button onClick={closeAppr} disabled={apprBusy} className="text-[#8B7355] hover:text-[#2D1B0E] disabled:opacity-50">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {apprResult ? (
+              <>
+                <div className="p-5 space-y-3 text-sm text-[#2D1B0E] overflow-y-auto">
+                  <div className="bg-emerald-50 border border-emerald-200 rounded-lg p-3 text-[13px] text-emerald-800 leading-relaxed">
+                    <b>{num(apprResult.approved.length)}</b> of {num(apprResult.requested)} count{apprResult.requested === 1 ? '' : 's'}{' '}
+                    <b>written to stock</b>
+                    {apprResult.approved.length > 0 && (
+                      <>: {apprResult.approved.map(a => a.material).join(', ')}</>
+                    )}.
+                  </div>
+                  {apprResult.refused.length > 0 && (
+                    <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 text-[12px] text-amber-900 space-y-2">
+                      <div className="font-semibold text-[13px]">
+                        {num(apprResult.refused.length)} refused — stock unchanged for {apprResult.refused.length === 1 ? 'this one' : 'these'}:
+                      </div>
+                      {/* THE SERVER'S SENTENCE, VERBATIM PER ROW — same rule as
+                          the card's amber notice: re-wording it here is how the
+                          page and the API start telling different stories. */}
+                      <ul className="space-y-1.5 leading-relaxed">
+                        {apprResult.refused.map(r => (
+                          <li key={r.id}><b>{r.material}</b> — {r.reason}</li>
+                        ))}
+                      </ul>
+                      <p className="leading-relaxed">
+                        {apprResult.refused.length === 1 ? 'It stays' : 'They stay'} in the queue. Reject is how a
+                        superseded or department count leaves it — and rejecting moves no stock.
+                      </p>
+                    </div>
+                  )}
+                </div>
+                <div className="px-5 py-4 border-t border-[#E8D5C4] flex justify-end">
+                  <button onClick={closeAppr}
+                          className="px-4 py-2 text-sm font-semibold text-white bg-[#6B5744] hover:bg-[#54432f] rounded-lg">
+                    Done
+                  </button>
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="p-5 space-y-3 text-sm text-[#2D1B0E] overflow-y-auto">
+                  <div className="bg-[#FFF1E3] border border-[#E8D5C4] rounded-lg p-3 space-y-1.5 text-[13px] leading-relaxed">
+                    <p>
+                      <b>{num(selected.size)} count{selected.size === 1 ? '' : 's'}</b> worth <b>{inr(selectedValue)}</b> of
+                      difference will be <b>written to stock</b> — each applies its own counted difference to its own
+                      rail (central stock, a liquor store ledger, or a department balance), on top of whatever that rail
+                      holds when it lands.
+                    </p>
+                    <p>
+                      The server checks every count <b>one at a time</b>, exactly as the card&apos;s own Approve does.
+                      One it refuses — superseded by a newer count, a department count, already decided — comes back
+                      named with the reason, and <b>the others still apply</b>. Nothing is all-or-nothing.
+                    </p>
+                    {selBlockedCount > 0 && (
+                      <p className="text-amber-900">
+                        <b>{num(selBlockedCount)} of these {selBlockedCount === 1 ? 'is' : 'are'} already marked
+                        un-approvable</b> on {selBlockedCount === 1 ? 'its card' : 'their cards'} — expect{' '}
+                        {selBlockedCount === 1 ? 'it' : 'them'} back refused, with the reason, not approved.
+                      </p>
+                    )}
+                  </div>
+
+                  {/* EVERY TICKED ROW, NAMED — see the dialog comment above. */}
+                  <div className="border border-[#E8D5C4] rounded-lg divide-y divide-[#F0E4D6] max-h-56 overflow-y-auto">
+                    {selectedRows.map(r => (
+                      <div key={r.id} className="px-3 py-1.5 text-[12px] flex flex-wrap items-baseline gap-x-2">
+                        <b className="text-[#2D1B0E]">{r.material_name}</b>
+                        <span className="text-[#8B7355]">
+                          {r.source === 'liquor' ? (r.store_name || 'Store') : (r.department_name || 'Store / Overall')} · {r.date}
+                        </span>
+                        <span className={r.variance < 0 ? 'text-red-700' : 'text-emerald-700'}>
+                          {r.variance < 0 ? 'shortage' : 'surplus'} {inr(r.variance_value)}
+                        </span>
+                        {r.approve_blocked && (
+                          <span className="text-[11px] text-amber-900 bg-amber-50 border border-amber-200 rounded px-1">
+                            will be refused
+                          </span>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+
+                  <label className="block">
+                    <span className="text-[12px] font-medium text-[#6B5744]">
+                      Why are these being approved? (recorded on every count it approves)
+                    </span>
+                    <input value={apprReason} onChange={e => setApprReason(e.target.value)} autoFocus
+                           placeholder="Ask the staff who counted — e.g. spillage, breakage, miscount, theft…"
+                           className="w-full mt-1 px-3 py-2 border border-[#E8D5C4] rounded-lg text-sm bg-[#FFF8F0] focus:outline-none focus:border-[#af4408]" />
+                  </label>
+
+                  {apprErr && (
+                    <div className="bg-red-50 border border-red-200 rounded-lg p-2.5 text-[12px] text-red-700 flex gap-2">
+                      <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" /> {apprErr}
+                    </div>
+                  )}
+                </div>
+                <div className="px-5 py-4 border-t border-[#E8D5C4] flex flex-wrap justify-end gap-2">
+                  <button onClick={closeAppr} disabled={apprBusy}
+                          className="px-4 py-2 text-sm text-[#6B5744] bg-[#FFF1E3] rounded-lg hover:bg-[#E8D5C4] disabled:opacity-50">
+                    Cancel
+                  </button>
+                  <button onClick={runApproveSelected} disabled={apprBusy || selected.size === 0}
+                          className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg text-sm font-semibold bg-[#af4408] hover:bg-[#8a3506] text-white disabled:opacity-50">
+                    {apprBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle2 className="w-4 h-4" />}
+                    Approve {num(selected.size)} → write to stock
+                  </button>
+                </div>
+              </>
+            )}
           </div>
         </div>
       )}

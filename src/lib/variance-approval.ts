@@ -1872,6 +1872,15 @@ export function rejectVariance(
  * ONLY PENDING ROWS MOVE. `status = 'pending'` is in the UPDATE's own WHERE, not
  * merely in the preview that selected the ids, so a row decided between the
  * preview and the execute is skipped rather than re-decided.
+ *
+ * WHAT "NO BULK APPROVE" MEANS PRECISELY, AS OF 2026-09: no approve-by-FILTER,
+ * anywhere, ever — a filter resolved at execute time can sweep in a count
+ * nobody looked at. Approving rows the admin ticked HIMSELF is a different
+ * thing and now exists at /api/variance-approvals/approve-selected (owner ask):
+ * explicit ids only, and it loops the same approveVariance() above one id at a
+ * time — its own transaction per row, every guard judged per row, one refusal
+ * never rolling back a neighbour. It adds NOTHING to this function and imports
+ * nothing from this section; the bulk route below still cannot approve.
  */
 export interface BulkRejectResult {
   ok: boolean;
