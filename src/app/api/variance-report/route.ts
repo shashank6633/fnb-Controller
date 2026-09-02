@@ -1,6 +1,7 @@
 import { getDb } from '@/lib/db';
 import { getCurrentOutletId, getCurrentUser } from '@/lib/auth';
 import { cutoverReportBasis, cutoverStampedWithoutBatch } from '@/lib/central-cutover';
+import { purchasesHasDirectIssueCol } from '@/lib/direct-issue';
 
 /**
  * CENTRAL STORE variance report (closing count vs the store's own book).
@@ -211,6 +212,14 @@ export async function GET(request: Request) {
       : '';
     const CUT_P  = basis ? ` AND p.date > ${FLOOR}` : '';
     const CUT_IT = basis ? ` AND DATE(it.created_at) > ${FLOOR}` : '';
+    // DIRECT-ISSUE purchases never touched the central shelf (their stock
+    // posted to a department ledger — see src/lib/direct-issue.ts), so they
+    // must not count as central inflow or every flagged delivery reads as a
+    // central shortage of exactly its size. The stamp is on the ROW, written
+    // at receipt time, so history stays right however the config changes.
+    // Guarded on the column existing: an un-migrated database keeps the
+    // original query byte-for-byte (nothing can be direct-routed on it either).
+    const DI_P = purchasesHasDirectIssueCol(db) ? ` AND COALESCE(p.direct_issue_dept_id, '') = ''` : '';
     const CUT_COLS = basis
       ? `,
              -- OPENING TERM. The cutover's counted figure for this material, in
@@ -249,7 +258,7 @@ export async function GET(request: Request) {
              -- 1.5KG (unit = purchase_unit) gets multiplied and reads 1.5x high.
              -- Factor is a per-material constant, so scaling the SUM is exact.
              COALESCE((SELECT SUM(p.quantity) FROM purchases p
-                        WHERE p.material_id = cs.material_id AND p.date <= cs.date${CUT_P}), 0)
+                        WHERE p.material_id = cs.material_id AND p.date <= cs.date${CUT_P}${DI_P}), 0)
                * CASE WHEN COALESCE(rm.pack_size, 1) > 1
                            AND LOWER(rm.unit) <> LOWER(COALESCE(rm.purchase_unit, rm.unit))
                       THEN rm.pack_size ELSE 1 END AS purchases_to_date,

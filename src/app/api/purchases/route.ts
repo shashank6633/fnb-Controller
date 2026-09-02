@@ -7,6 +7,9 @@ import { checkPurchaseDate } from '@/lib/purchase-guard';
 // The QC gate is ONE helper, shared with both receiving routes and the bulk
 // importer. Never a second copy of the category test.
 import { resolveQcRequirement } from '@/lib/grn-qc';
+// Direct-issue routing: a flagged material's purchase posts to its DEPARTMENT
+// ledger instead of central stock; the cost row and price rails are untouched.
+import { resolveDirectIssue, postDirectReceipt } from '@/lib/direct-issue';
 // THE VENDOR↔ITEM LEARNER LIVES IN ONE MODULE NOW — src/lib/vendor-learn.ts.
 // It used to be a ~100-line private function in THIS file, reachable from
 // exactly one screen ("Enter Full Bill"). That screen now records a GOODS
@@ -616,19 +619,40 @@ export async function POST(request: Request) {
       const pu = String(material.purchase_unit || material.unit || '').toLowerCase().trim();
       const stockQty = (packSize > 1 && ru !== pu) ? qty * packSize : qty;
 
-      // Update stock
-      db.prepare(`
-        UPDATE raw_materials SET current_stock = current_stock + ?, updated_at = datetime('now') WHERE id = ?
-      `).run(stockQty, material_id);
+      // ── DIRECT ISSUE (Settings → Direct Issue): flagged materials never
+      //    reach the central shelf. The purchases row above, the PINV, the
+      //    taxes and updateMaterialPrice below are byte-identical to a central
+      //    purchase; only the stock destination branches. No central
+      //    inventory_transactions row is written — central never moved, and
+      //    the central variance report reverses purchases against that log.
+      //    stockQty is already RECIPE units (the pack conversion above).
+      const direct = resolveDirectIssue(db, material_id);
+      if (direct) {
+        postDirectReceipt(db, {
+          target: direct,
+          materialId: material_id,
+          recipeQty: stockQty,
+          purchaseRowId: recordedId,
+          outletId,
+          user: me?.email || '',
+          source: 'purchase',
+          notes: `Direct issue: purchase from ${vendor || 'unknown'}`,
+        });
+      } else {
+        // Update stock
+        db.prepare(`
+          UPDATE raw_materials SET current_stock = current_stock + ?, updated_at = datetime('now') WHERE id = ?
+        `).run(stockQty, material_id);
 
-      // Create inventory transaction. reference_id points at the row this line
-      // was written to, which is now always the row this request inserted.
-      db.prepare(`
-        INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, created_at, outlet_id)
-        VALUES (?, ?, 'purchase', ?, ?, ?, datetime('now'), ?)
-      `).run(generateId(), material_id, stockQty, recordedId,
-              `Purchase from ${vendor || 'unknown'}`,
-              outletId);
+        // Create inventory transaction. reference_id points at the row this line
+        // was written to, which is now always the row this request inserted.
+        db.prepare(`
+          INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, created_at, outlet_id)
+          VALUES (?, ?, 'purchase', ?, ?, ?, datetime('now'), ?)
+        `).run(generateId(), material_id, stockQty, recordedId,
+                `Purchase from ${vendor || 'unknown'}`,
+                outletId);
+      }
 
       // Update material price and cascade
       updateMaterialPrice(db, material_id);

@@ -9,6 +9,11 @@ import { fulfilRequisitionFromPo } from './po-requisition-fulfil';
 // this file writes to petty_cash_ledger — the money was recorded when the bill
 // was entered, and a sign-off never touches it. See the payment_mode bind below.
 import { grnPaidInCash } from './cash-purchase';
+// Direct-issue routing: at sign-off a flagged line releases into its
+// DEPARTMENT's ledger instead of central stock. See src/lib/direct-issue.ts
+// (which deliberately does not import this file — its diCatKey is the
+// byte-equivalent restatement of catKeyOf below).
+import { resolveDirectIssueBulk, postDirectReceipt, stampLastPurchase } from './direct-issue';
 import type { SessionUser } from './auth';
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -1774,6 +1779,18 @@ export function decideGrnQc(
       ? String((db.prepare(`SELECT po_number FROM purchase_orders WHERE id = ?`).get(grn.po_id) as any)?.po_number || '')
       : '';
 
+    // ── DIRECT-ISSUE DESTINATIONS, resolved AT SIGN-OFF TIME ────────────────
+    // The sign-off is when a held delivery's goods actually enter a ledger, so
+    // the routing decision belongs to THIS moment, not to the day the truck
+    // arrived — the kitchen carries the goods off under today's rule. A
+    // flagged line's release swaps ONLY the central bump for a department
+    // post below; the purchases row, tax re-derivation, PINV, PO total
+    // restamp and the price cascade are untouched. Note the destination comes
+    // from the CONFIG, never from who signed: a 'both' checker means EITHER
+    // kitchen or bar may sign, so the signer's identity says nothing about
+    // where the goods go.
+    const directTargets = resolveDirectIssueBulk(db, resolved.map(r => String(r.item.material_id || '')));
+
     for (const r of resolved) {
       upLine.run(r.accepted, r.rejected, r.reason, r.item.id, grnId);
 
@@ -1931,12 +1948,40 @@ export function decideGrnQc(
       // last_purchase_price keeps the GROSS rate on BOTH paths — it is the
       // vendor's list rate and it seeds the next PO's rate; seeding it net
       // would ratchet the ordered rate down every cycle (receive/route.ts:1370).
-      bumpStock.run(stockQty, gross, grn.date, r.item.material_id);
-      insTx.run(
-        generateId(), r.item.material_id, stockQty, purchaseId,
-        poNumber ? `PO ${poNumber} received via GRN ${grn.grn_number}` : `Ad-hoc GRN ${grn.grn_number}`,
-        grn.outlet_id,
-      );
+      const direct = directTargets.get(String(r.item.material_id));
+      if (direct) {
+        // ── DIRECT ISSUE: released INTO THE DEPARTMENT, not onto the shelf. ─
+        // The GROSS list-rate stamp is KEPT; current_stock is NOT bumped and
+        // NO central inventory_transactions row is written — central never
+        // held these goods, and both the central variance report and the GRN
+        // void reverse from that log. stockQty is already RECIPE units (the
+        // packFactor above). The cost row written just above is the tie:
+        // reference_id = purchaseId on the department row, and the row itself
+        // is stamped direct_issue_dept_id, so a void or amend reverses the
+        // department rail no matter how the config changes later. Exactly
+        // once by construction: the awaiting_qc claim at the top of this
+        // transaction is what admits a line here at all.
+        stampLastPurchase(db, r.item.material_id, gross, grn.date);
+        postDirectReceipt(db, {
+          target: direct,
+          materialId: String(r.item.material_id),
+          recipeQty: stockQty,
+          purchaseRowId: purchaseId,
+          outletId: grn.outlet_id,
+          user: actorEmail,
+          source: 'grn_qc_signoff',
+          notes: poNumber
+            ? `Direct issue: PO ${poNumber} released at QC sign-off (GRN ${grn.grn_number})`
+            : `Direct issue: Ad-hoc GRN ${grn.grn_number} released at QC sign-off`,
+        });
+      } else {
+        bumpStock.run(stockQty, gross, grn.date, r.item.material_id);
+        insTx.run(
+          generateId(), r.item.material_id, stockQty, purchaseId,
+          poNumber ? `PO ${poNumber} received via GRN ${grn.grn_number}` : `Ad-hoc GRN ${grn.grn_number}`,
+          grn.outlet_id,
+        );
+      }
       stampLine.run(r.item.id);
       touched.add(String(r.item.material_id));
       result.lines_applied++;

@@ -5,6 +5,14 @@ import { getCentralStoreCutoverDate } from './central-cutover';
 import { alreadyReturnedByGrnItem } from './returns';
 import { centralFlowBlock } from './store-engine';
 import { grnPaidInCash } from './cash-purchase';
+// Direct-issue rail (Settings → Direct Issue): a cost row stamped
+// purchases.direct_issue_dept_id booked its stock on a DEPARTMENT ledger with
+// NO inventory_transactions row, so every unwind here must reverse THAT rail
+// for those rows and leave central alone. See src/lib/direct-issue.ts.
+import {
+  directRowsForGrn, reverseDirectReceiptRow, directReceiptNetPosted,
+  resolveDirectIssue, postDirectReceipt, postDirectDelta,
+} from './direct-issue';
 // The addressed half of the off-PO alert. See raisePoDeviationAlert below for
 // why this file — which only ever wrote the unaddressed 'admin' broadcast — now
 // calls it too. Never throws, by contract.
@@ -497,6 +505,11 @@ export interface ReversalOutcome {
    *  amendment does, so a removal can say what the rate became instead of leaving
    *  the caller to guess it was silently rewritten. */
   last_purchase_rederived: Array<{ material_id: string; material_name: string; rate: number; date: string }>;
+  /** ADDITIVE — cost rows that were DIRECT-ISSUE routed (stamped
+   *  purchases.direct_issue_dept_id): their goods were taken back out of the
+   *  DEPARTMENT ledger, not central. qty is the signed recipe-unit posting
+   *  (negative = out of the department). Empty on every pre-feature receipt. */
+  direct_issue_reversed: Array<{ material_id: string; department_id: string; qty: number }>;
 }
 
 /**
@@ -528,6 +541,9 @@ export function reverseGrnMovement(
      *  change to a shipped path for no gain. The line amendment DOES meet it and
      *  passes true. */
     includeGrossCandidate?: boolean;
+    /** Who is unwinding — stamped on the department-rail reversal rows of any
+     *  direct-issue cost row this receipt carries. Audit only. */
+    actor?: string;
   },
 ): ReversalOutcome {
   const { grnId, materialId, moves } = opts;
@@ -570,7 +586,38 @@ export function reverseGrnMovement(
     materials: [], purchases_deleted: 0, transactions_deleted: 0,
     purchase_rows, transaction_rows, material_snapshot,
     last_purchase_stale: [], last_purchase_kept: [], last_purchase_rederived: [],
+    direct_issue_reversed: [],
   };
+
+  // ── DIRECT-ISSUE ROWS FIRST, while they still exist. ─────────────────────
+  // A cost row stamped direct_issue_dept_id put its goods on a DEPARTMENT
+  // ledger and wrote NO inventory_transactions row, so nothing below can see
+  // it: `moves` (derived from inv-txns, or passed qty 0 by the amendment) will
+  // not debit central for it — correctly — and the dept credit would survive
+  // the delete as stock a deleted bill left behind. Reversed here from the
+  // LEDGER's own net (never accepted × today's pack factor — pack_size is
+  // mutable, the same rule the central unwind follows via the recorded
+  // inv-txn). The department balance MAY go negative — the goods may already
+  // be cooked — and that surfaces on the department variance report, exactly
+  // as a post-consumption central void surfaces on the central count.
+  {
+    const grnNo = String((db.prepare(`SELECT grn_number FROM goods_receipt_notes WHERE id = ?`).get(grnId) as any)?.grn_number || grnId);
+    for (const row of directRowsForGrn(db, grnId, materialId || undefined)) {
+      const posted = reverseDirectReceiptRow(db, row, {
+        user: opts.actor || '',
+        source: 'grn_reversal',
+        notes: `Direct issue reversed — ${grnNo} ${scoped ? 'line amended' : 'voided'}`,
+        outletId: null,
+      });
+      if (posted !== 0) {
+        out.direct_issue_reversed.push({
+          material_id: String(row.material_id),
+          department_id: String(row.direct_issue_dept_id),
+          qty: posted,
+        });
+      }
+    }
+  }
 
   // Movements first — the subquery still needs the purchases rows to resolve
   // reference_id. Both use a SUBQUERY rather than an IN list, so a GRN with
@@ -1272,19 +1319,35 @@ export function amendGrnLines(
       }
       const costRow = costRows[0] || null;
 
+      // ── WHICH RAIL DID THIS COST ROW BOOK ON? Answered by the ROW's own
+      //    stamp, never by today's config — a direct-issue rule added or
+      //    removed since the receipt must not re-route the unwind. A stamped
+      //    row wrote NO inventory_transactions row (central never moved); its
+      //    recorded movement lives on the department ledger instead, keyed by
+      //    reference_id = the cost row id.
+      const isDirectRow = !!(costRow && String((costRow as any).direct_issue_dept_id || '').trim());
       let txRow: any = null;
       if (costRow) {
         const txRows = db.prepare(
           `SELECT * FROM inventory_transactions WHERE type = 'purchase' AND reference_id = ?`
         ).all(costRow.id) as any[];
-        if (txRows.length !== 1) {
+        if (isDirectRow) {
+          // A direct row with a CENTRAL movement behind it is mixed evidence —
+          // two rails claiming one receipt. Refuse rather than pick a side.
+          if (txRows.length !== 0) {
+            throw refuse(409, 'movement_unidentifiable',
+              `The cost row for ${materialName} on ${grnNumber} is stamped as a direct-to-department receipt but ${txRows.length} central stock movement(s) also reference it. The two rails disagree about where these goods went; correcting either would falsify the other. Investigate before amending.`,
+              { grn_item_id: req.id, movements: txRows.length });
+          }
+        } else if (txRows.length !== 1) {
           throw refuse(409, 'movement_unidentifiable',
             txRows.length === 0
               ? `The cost row for ${materialName} on ${grnNumber} has no stock movement behind it, so the quantity that actually entered stock is unknown. A correction that guessed the quantity would be a fabricated adjustment.`
               : `The cost row for ${materialName} on ${grnNumber} has ${txRows.length} stock movements behind it. Correcting one of them would leave the others stating a movement that no longer happened.`,
             { grn_item_id: req.id, movements: txRows.length });
+        } else {
+          txRow = txRows[0];
         }
-        txRow = txRows[0];
       }
 
       // ── THE TWO BASES MUST AGREE, OR THE CORRECTION IS REFUSED. ───────────
@@ -1305,7 +1368,11 @@ export function amendGrnLines(
       // against a recorded 10 and silently credited 9,990 g of stock that never
       // arrived. A correction that moves no quantity must move no quantity.
       const factor = packFactor({ pack_size: material.pack_size, unit: material.unit, purchase_unit: material.purchase_unit } as any);
-      const recordedIn = txRow ? Number(txRow.quantity) || 0 : 0;
+      // A direct-issue row's RECORDED movement is the department ledger's net
+      // for this cost row — the same "unwind what was recorded" rule, on the
+      // rail the row actually moved.
+      const recordedIn = txRow ? Number(txRow.quantity) || 0
+        : (isDirectRow && costRow ? directReceiptNetPosted(db, costRow.id) : 0);
       if (acceptedMoves && costRow) {
         const impliedNow = r6(oldAccepted * factor);
         if (Math.abs(r6(recordedIn) - impliedNow) > QTY_EPS) {
@@ -1317,7 +1384,15 @@ export function amendGrnLines(
       const newIn = wantsRemove ? 0 : (acceptedMoves ? r6(nextAccepted * factor) : recordedIn);
 
       // ── THE NEGATIVE-STOCK GUARD, on the NET delta, before any write. ─────
-      if (costRow || Math.abs(newIn) > QTY_EPS) {
+      // SKIPPED for a direct-issue row: this guard reads the CENTRAL pool
+      // (material.current_stock), which never held those goods — judging a
+      // department debit against the central balance refuses corrections the
+      // shelf has nothing to do with and waves through ones it should not.
+      // The department balance MAY go negative on a downward correction (the
+      // goods may already be cooked); that surfaces on the department variance
+      // report, exactly as a post-consumption central void surfaces on the
+      // central count.
+      if (!isDirectRow && (costRow || Math.abs(newIn) > QTY_EPS)) {
         const moves: RecordedMove[] = [{
           material_id: materialId, material_name: materialName,
           qty: recordedIn, current_stock: Number(material.current_stock),
@@ -1501,9 +1576,16 @@ export function amendGrnLines(
               .run(String(costRow.vendor), req.id, grnId);
           }
           const moves: RecordedMove[] = [{
-            material_id: materialId, material_name: materialName, qty: recordedIn, current_stock: onHandBefore,
+            // qty 0 on a direct-issue row: central recorded NO movement for it,
+            // so the helper must debit central by nothing — it finds the
+            // stamped row itself and takes the goods back off the DEPARTMENT
+            // ledger (see the direct-issue block at the top of
+            // reverseGrnMovement). The LPP ownership proof still runs off the
+            // cost row's rate exactly as on a central line.
+            material_id: materialId, material_name: materialName,
+            qty: isDirectRow ? 0 : recordedIn, current_stock: onHandBefore,
           }];
-          const rev = reverseGrnMovement(db, { grnId, materialId, moves, includeGrossCandidate: true });
+          const rev = reverseGrnMovement(db, { grnId, materialId, moves, includeGrossCandidate: true, actor: actorEmail });
           result.purchases_deleted += rev.purchases_deleted;
           result.transactions_deleted += rev.transactions_deleted;
           result.last_purchase_stale.push(...rev.last_purchase_stale);
@@ -1575,7 +1657,22 @@ export function amendGrnLines(
           result.transactions_updated++;
         }
         const delta = r6(newIn - recordedIn);
-        if (Math.abs(delta) > EPS) {
+        if (isDirectRow) {
+          // The correction moves on the rail the row booked on: the delta is a
+          // signed department posting against the SAME cost row (a no-op when
+          // the quantity did not move — a rate-only correction). Central is
+          // untouched, exactly as it was at receipt.
+          postDirectDelta(db, {
+            departmentId: String((costRow as any).direct_issue_dept_id),
+            materialId,
+            recipeDelta: delta,
+            purchaseRowId: String(costRow.id),
+            outletId: grn.outlet_id ?? null,
+            user: actorEmail,
+            source: 'grn_amend',
+            notes: `Direct issue corrected — ${grnNumber} amended`,
+          });
+        } else if (Math.abs(delta) > EPS) {
           db.prepare(`UPDATE raw_materials SET current_stock = current_stock + ?, updated_at = datetime('now') WHERE id = ?`)
             .run(delta, materialId);
         }
@@ -1664,15 +1761,36 @@ export function amendGrnLines(
                Number(line.special_excise_cess) || 0,
                Number(line.tcs) || 0,
                Number(line.mrp_round_off) || 0);
-        db.prepare(`
-          INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, created_at, outlet_id)
-          VALUES (?, ?, 'purchase', ?, ?, ?, datetime('now'), ?)
-        `).run(generateId(), materialId, newIn, purchaseId,
-               `Amended ${grnNumber}`, grn.outlet_id);
-        db.prepare(`UPDATE raw_materials SET current_stock = current_stock + ?, updated_at = datetime('now') WHERE id = ?`)
-          .run(newIn, materialId);
+        // ── WHERE DOES A FIRST-TIME BOOKING'S STOCK GO? By TODAY's config,
+        //    like any other booking event: this line never entered any ledger
+        //    (accepted was 0), so there is no recorded rail to honour — the
+        //    goods enter one NOW, under the rule in force now, exactly as the
+        //    originating route would book them today. A flagged material posts
+        //    to its department (stamping the new cost row); anything else
+        //    books central, byte-identically to before.
+        const rescueDirect = resolveDirectIssue(db, materialId);
+        if (rescueDirect) {
+          postDirectReceipt(db, {
+            target: rescueDirect,
+            materialId,
+            recipeQty: newIn,
+            purchaseRowId: purchaseId,
+            outletId: grn.outlet_id ?? null,
+            user: actorEmail,
+            source: 'grn_amend',
+            notes: `Direct issue: line booked by bill amendment (${grnNumber})`,
+          });
+        } else {
+          db.prepare(`
+            INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, created_at, outlet_id)
+            VALUES (?, ?, 'purchase', ?, ?, ?, datetime('now'), ?)
+          `).run(generateId(), materialId, newIn, purchaseId,
+                 `Amended ${grnNumber}`, grn.outlet_id);
+          db.prepare(`UPDATE raw_materials SET current_stock = current_stock + ?, updated_at = datetime('now') WHERE id = ?`)
+            .run(newIn, materialId);
+          result.transactions_created++;
+        }
         result.purchases_created++;
-        result.transactions_created++;
         costAction = 'created';
         lppRate = nextPrice;
         writeLine.run(nextReceived, nextAccepted, nextRejected, nextRejectReason,

@@ -5,7 +5,7 @@ import { createPortal } from 'react-dom';
 import {
   ClipboardList, Plus, Trash2, Search, Loader2, CheckCircle2, XCircle, Send,
   ShieldCheck, PackageCheck, RefreshCw, AlertTriangle, ChevronDown, Printer, Lock,
-  Clock,
+  Clock, Truck,
 } from 'lucide-react';
 import { api } from '@/lib/api';
 // THE ONE SPELLING OF "this receipt is still waiting on the kitchen", imported
@@ -849,6 +849,14 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
      so they are forced to 0% in the COMPUTE below — a rate typed against one
      would be tax that was never paid. */
   const [storeBlocked, setStoreBlocked] = useState<Record<string, string>>({});
+  /* po_item_id → destination department name for DIRECT-ISSUE lines (the
+     server's own verdict from GET …/receive, resolved by the SAME
+     src/lib/direct-issue.ts rules the POST books with — a client-side re-guess
+     is how a badge disagrees with where the stock actually lands). These lines
+     inward normally in every respect — bill, GRN, taxes, QC checklist — but
+     their accepted quantity posts to the named department's stock, never to
+     the central shelf, so the storeman must not carry them into the store. */
+  const [directIssue, setDirectIssue] = useState<Record<string, string>>({});
   /* BILL CHARGES — entered once for the whole delivery, allocated per line by
      the server. Discount REDUCES cost (it is netted into the rate written to
      purchases.unit_price, which is what average_price averages); Delivery is
@@ -969,6 +977,12 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
       if (b?.po_item_id) sb[String(b.po_item_id)] = String(b.error || 'store item — taxed on the TGBCL bill');
     }
     setStoreBlocked(sb);
+    // Direct-issue badge lines — same source-of-truth rule as `sb` above.
+    const di: Record<string, string> = {};
+    for (const d of (Array.isArray(recv?.direct_issue) ? recv.direct_issue : [])) {
+      if (d?.po_item_id && d?.department_name) di[String(d.po_item_id)] = String(d.department_name);
+    }
+    setDirectIssue(di);
     /* SEED each line's GST% from raw_materials.tax_percent (delivered as
        material_tax_percent by the PO detail API). Until now the master's Tax %
        was a write-only field — nothing in the purchase / PO / GRN flow ever read
@@ -2007,6 +2021,17 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
                                 {it.material_sku} · {u}
                                 {!included && <span className="text-amber-700"> · not on this bill — stays outstanding</span>}
                               </span>
+                              {/* DIRECT ISSUE — the storeman's cue that these
+                                  goods do not go to the shelf. Server-resolved
+                                  (see setDirectIssue above); rendered even on
+                                  an excluded line so the routing is visible
+                                  while deciding what is on this bill. */}
+                              {directIssue[it.id] && (
+                                <span className="mt-0.5 inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full border border-[#af4408]/40 bg-[#FFF3E6] text-[#af4408] text-[9px] font-semibold"
+                                      title={`Direct issue: on booking, this line's accepted quantity goes straight to ${directIssue[it.id]}'s stock. The bill, GRN and quality checks record here exactly as normal — but the goods do NOT go to the central shelf.`}>
+                                  <Truck className="w-2.5 h-2.5" /> → {directIssue[it.id]}
+                                </span>
+                              )}
                             </span>
                           </label>
                         </td>

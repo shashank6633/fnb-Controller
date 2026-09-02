@@ -8,7 +8,7 @@
 import { useEffect, useMemo, useRef, useState, Fragment, type ReactNode, type WheelEvent as ReactWheelEvent } from 'react';
 import { FileCheck, ChevronDown, ChevronRight, Loader2, Plus, Trash2, X, Save, Download, Percent,
          Eye, Pencil, Printer, AlertTriangle, ChefHat, Wine, Clock, ShieldAlert, Info,
-         CheckCircle2, ShieldQuestion, Receipt, Link2, Banknote, GitCompareArrows } from 'lucide-react';
+         CheckCircle2, ShieldQuestion, Receipt, Link2, Banknote, GitCompareArrows, Truck } from 'lucide-react';
 import { api } from '@/lib/api';
 /* THE OFF-PO ALERT'S OWN VOCABULARY — types and pure formatters, from a module
    that imports NOTHING (the same constraint line-dedupe.ts carries, and for the
@@ -2508,6 +2508,43 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
     return !!m && storeCats.has(catKey(m.category));
   };
 
+  /**
+   * ── DIRECT-ISSUE BADGES ("→ Main Kitchen") ────────────────────────────────
+   * Which materials/categories route straight to a department's stock on
+   * booking (Settings → Direct Issue). ADVISORY, exactly like qcMap above: the
+   * server re-resolves the same rules inside POST /api/grn at the stock write
+   * (src/lib/direct-issue.ts), so a stale or unreadable map here mislabels
+   * nothing — it only hides the courtesy badge. GET is any-signed-in and
+   * returns the flag maps alone for a non-admin. Keyed on the SAME catKey()
+   * normalisation as the server (diCatKey ≡ catKeyOf ≡ catNorm).
+   */
+  const [diFlags, setDiFlags] = useState<{ materials: Record<string, string>; categories: Record<string, string> } | null>(null);
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const res = await fetch('/api/settings/direct-issue');
+        if (!alive || !res.ok) return;           // badge simply stays hidden
+        const d = await res.json();
+        if (d?.flags) setDiFlags({ materials: d.flags.materials || {}, categories: d.flags.categories || {} });
+      } catch { /* badge stays hidden */ }
+    })();
+    return () => { alive = false; };
+  }, []);
+
+  /** Destination department name for a direct-issue line, or null. Material
+   *  rule beats category rule — the server's own precedence. Store-mapped
+   *  lines answer null: they never reach a central receipt at all. */
+  const directDest = (materialId: string): string | null => {
+    if (!diFlags || !materialId) return null;
+    if (storeMappedLine(materialId)) return null;
+    const byMat = diFlags.materials[materialId];
+    if (byMat) return byMat;
+    const m = materials.find(x => x.id === materialId) as any;
+    if (!m) return null;
+    return diFlags.categories[catKey(m.category)] || null;
+  };
+
   /** The checker for ONE line, or null when the map is unreadable / unknown.
    *  Store-mapped (TGBCL) lines answer 'none' because centralFlowBlock drops
    *  them from `receivable` before the gate ever sees them — a checker on a
@@ -4556,6 +4593,20 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
                                   title={`This category needs a ${CHECKER_LABEL[c]} check. Because of it the WHOLE receipt is held — no stock is added until they sign.`}>
                               {c === 'bar' ? <Wine className="w-2.5 h-2.5" /> : <ChefHat className="w-2.5 h-2.5" />}
                               {CHECKER_LABEL[c]} check
+                            </span>
+                          );
+                        })()}
+                        {/* DIRECT ISSUE — the storeman's cue that these goods
+                            do not go to the shelf. Advisory only (see diFlags
+                            above): the server re-resolves the rules at the
+                            stock write, so a hidden badge never mis-books. */}
+                        {(() => {
+                          const dest = directDest(it.material_id);
+                          if (!dest) return null;
+                          return (
+                            <span className="mt-1 ml-1 inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full border border-[#af4408]/40 bg-[#FFF3E6] text-[#af4408] text-[9px] font-semibold"
+                                  title={`Direct issue: on booking, this line's accepted quantity goes straight to ${dest}'s stock. The bill, GRN and quality checks record here exactly as normal — but the goods do NOT go to the central shelf.`}>
+                              <Truck className="w-2.5 h-2.5" /> → {dest}
                             </span>
                           );
                         })()}

@@ -4,6 +4,11 @@ import { centralFlowBlock, isStoreMappedMaterial } from '@/lib/store-engine';
 import { checkPurchaseDate } from '@/lib/purchase-guard';
 import { duplicateLineError } from '@/lib/po-helpers';
 import { resolveQcRequirement, undecidedQcCategories, storePreRejectBlock, QC_AWAITING } from '@/lib/grn-qc';
+// Direct-issue routing (Settings → Direct Issue): a flagged material's accepted
+// quantity posts to its DEPARTMENT's ledger instead of central stock; the
+// purchases row, GRN document, taxes and price rails are untouched. The branch
+// lives at the bump site below. See src/lib/direct-issue.ts.
+import { resolveDirectIssueBulk, postDirectReceipt, stampLastPurchase } from '@/lib/direct-issue';
 import { notifyGrnAwaitingQc } from '@/lib/grn-qc-notify';
 // THE VENDOR↔ITEM LEARNER — ONE COPY, SHARED WITH /api/purchases. It was lifted
 // out of that route (where it was a private function reachable only from "Enter
@@ -1289,6 +1294,14 @@ export async function POST(request: Request) {
     // or empty checklist must not be stamped with a name.
     const storeSigned = !!(qc_expiry && qc_weight && qc_invoice_match);
 
+    // ── DIRECT-ISSUE DESTINATIONS, resolved ONCE for this bill ──────────────
+    // Over ALL receivable lines (a back-correction of a flagged material must
+    // reverse the DEPARTMENT it was booked into, not central). Unflagged
+    // materials are absent and book to central exactly as always. On a QC-HELD
+    // bill this map is deliberately unused — nothing books at save time, and
+    // the sign-off (decideGrnQc) resolves afresh when the goods actually move.
+    const directTargets = resolveDirectIssueBulk(db, receivable.map((it: any) => String(it.material_id || '')));
+
     // Generate GRN number
     const yr = String(date).slice(0, 4);
     const lastGrn = db.prepare(`SELECT grn_number FROM goods_receipt_notes WHERE grn_number LIKE 'GRN-' || ? || '-%' ORDER BY grn_number DESC LIMIT 1`).get(yr) as any;
@@ -1911,10 +1924,40 @@ export async function POST(request: Request) {
           const ru = String(mat?.unit || '').toLowerCase().trim();
           const pu = String(mat?.purchase_unit || mat?.unit || '').toLowerCase().trim();
           const stockQty = (packSize > 1 && ru !== pu) ? accepted * packSize : accepted;
-          bumpStock.run(stockQty, price, date, it.material_id);
-          insTx.run(generateId(), it.material_id, stockQty, purchaseId,
-                    accepted < 0 ? `BACK-CORRECTION ${grnNumber}` : `Ad-hoc GRN ${grnNumber}`,
-                    outletId);
+          const direct = directTargets.get(String(it.material_id));
+          if (direct) {
+            // ── DIRECT ISSUE: the shelf never sees these goods. ─────────────
+            // The GROSS list-rate stamp is KEPT; current_stock is NOT bumped
+            // and NO central inventory_transactions row is written — central
+            // never moved, and both the central variance report and the GRN
+            // void reverse from that log. The quantity lands on the DEPARTMENT
+            // ledger in RECIPE units (stockQty already carries the pack
+            // factor), tied to the cost row (reference_id = purchaseId, and
+            // the row is stamped direct_issue_dept_id so void/amend reverse
+            // the right rail forever after). A NEGATIVE line (back-correction)
+            // posts a 'direct_receipt_reversal' against TODAY's destination —
+            // the same judgement today's receipts get; a correction that
+            // straddles a routing change is visible on both variance reports
+            // rather than silently filed on either.
+            stampLastPurchase(db, it.material_id, price, date);
+            postDirectReceipt(db, {
+              target: direct,
+              materialId: String(it.material_id),
+              recipeQty: stockQty,
+              purchaseRowId: purchaseId,
+              outletId,
+              user: me?.email || '',
+              source: 'grn',
+              notes: accepted < 0
+                ? `Direct issue BACK-CORRECTION ${grnNumber}`
+                : `Direct issue: Ad-hoc GRN ${grnNumber}`,
+            });
+          } else {
+            bumpStock.run(stockQty, price, date, it.material_id);
+            insTx.run(generateId(), it.material_id, stockQty, purchaseId,
+                      accepted < 0 ? `BACK-CORRECTION ${grnNumber}` : `Ad-hoc GRN ${grnNumber}`,
+                      outletId);
+          }
           touched.add(it.material_id);
         }
       }

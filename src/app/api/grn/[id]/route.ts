@@ -7,6 +7,10 @@ import {
   amendGrnLines, raisePoDeviationAlert, type AmendLineInput,
 } from '@/lib/grn-reversal';
 import { planPoReceiptVoid, applyPoReceiptVoid, type PoVoidPlan, type PoVoidOutcome } from '@/lib/po-void';
+// Direct-issue rail: a cost row stamped purchases.direct_issue_dept_id booked
+// its stock on a DEPARTMENT ledger with no central movement row — the void's
+// orphan test must not read that as an unidentifiable receipt.
+import { purchasesHasDirectIssueCol } from '@/lib/direct-issue';
 // The same "is there a bill number here?" the receive route and the receive
 // modal use — see the header of @/lib/bill-no. An amendment that may not REMOVE
 // the number must not be satisfiable by an invisible one either.
@@ -1107,9 +1111,17 @@ export async function DELETE(request: Request, { params }: { params: Promise<{ i
             : `${grn.grn_number} has ${acceptedLines} accepted line(s) but ${linkedPurchases} linked cost row(s). Something else has already changed this receipt's cost rows; reversing a set that does not match the bill would corrupt the average. Investigate before voiding.`);
       }
 
+      // DIRECT-ISSUE rows are exempt from the orphan test BY CONSTRUCTION: a
+      // cost row stamped direct_issue_dept_id wrote NO central movement — its
+      // recorded movement is on the department ledger, and reverseGrnMovement
+      // takes it back off that rail itself. Guarded on the column existing so
+      // a database whose boot ALTER was swallowed keeps the original test
+      // byte-for-byte (on such a database nothing can be direct-routed anyway
+      // — the resolver fails to central without the column).
       const orphanCost = (db.prepare(`
         SELECT COUNT(*) AS n FROM purchases p
         WHERE p.grn_id = ?
+          ${purchasesHasDirectIssueCol(db) ? `AND COALESCE(p.direct_issue_dept_id, '') = ''` : ''}
           AND NOT EXISTS (SELECT 1 FROM inventory_transactions it
                            WHERE it.type = 'purchase' AND it.reference_id = p.id)
       `).get(id) as any)?.n || 0;
@@ -1204,7 +1216,7 @@ export async function DELETE(request: Request, { params }: { params: Promise<{ i
       //       same GROSS basis. The ad-hoc branch stays FALSE so its shipped
       //       behaviour is byte-unchanged. The line amendment already passes true
       //       for exactly this case.
-      const rev = reverseGrnMovement(db, { grnId: id, moves, includeGrossCandidate: !!grn.po_id });
+      const rev = reverseGrnMovement(db, { grnId: id, moves, includeGrossCandidate: !!grn.po_id, actor: me.email });
       const txnRows = rev.transaction_rows;
       const purchaseRows = rev.purchase_rows;
       const matBefore = rev.material_snapshot;

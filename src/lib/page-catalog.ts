@@ -457,6 +457,12 @@ export const PAGE_CATALOG: PageSection[] = [
       { path: '/settings/roles',      label: 'Settings — Roles' },
       { path: '/settings/print-design', label: 'Settings — Print Design' },
       { path: '/settings/stores',     label: 'Settings — Store Locations' },
+      // Direct-issue routing: which categories/materials bypass central stock at
+      // receipt and land straight on a department's ledger (Kitchen / Bar).
+      // adminOnly matches the API — /api/settings/direct-issue writes are
+      // requireRole('admin'), so a lower tier seeing the page would only meet
+      // 403s. Remember the drift trap: this row's twin lives in Sidebar.tsx.
+      { path: '/settings/direct-issue', label: 'Settings — Direct Issue Routing', adminOnly: true },
       // Station → Department map. Recipe consumption leaves the DEPARTMENT, not
       // central, so every sold line has to answer "which kitchen cooked this?"
       // from order_items.station — free text, and the department names do not

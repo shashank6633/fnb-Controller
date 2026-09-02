@@ -4,6 +4,10 @@ import { centralFlowBlock } from '@/lib/store-engine';
 // copy of the category test. It reads category → qc_category_checkers and
 // nothing else, so this importer is gated by exactly the map the admin edits.
 import { resolveQcRequirement } from '@/lib/grn-qc';
+// Direct-issue routing: a flagged material's row posts to its DEPARTMENT
+// ledger instead of central stock; the purchases row and price rails are
+// untouched. See src/lib/direct-issue.ts.
+import { resolveDirectIssueBulk, postDirectReceipt } from '@/lib/direct-issue';
 import { getCurrentUser } from '@/lib/auth';
 import { checkPurchaseDate } from '@/lib/purchase-guard';
 // The "one item = one line on a bill" remedy sentence is SHARED, not restated:
@@ -109,6 +113,12 @@ export async function POST(request: Request) {
       const pu = String(m.purchase_unit || m.unit || '').toLowerCase().trim();
       return (packSize > 1 && ru !== pu) ? qty * packSize : qty;
     };
+
+    // ── DIRECT-ISSUE DESTINATIONS, one snapshot for the whole sheet ─────────
+    // Resolved over the full catalogue (a few chunked reads; empty map when no
+    // rules exist) so the per-row branch below is a Map lookup, and every row
+    // of one upload is judged against one snapshot of the config.
+    const directTargets = resolveDirectIssueBulk(db, allMaterials.map(m => String(m.id)));
 
     const results: {
       success: number; skipped: number; duplicates: number;
@@ -565,8 +575,28 @@ export async function POST(request: Request) {
           chg(item.special_excise_cess), chg(item.tcs), chg(item.delivery_charges), chgSigned(item.mrp_round_off),
           chg(item.po_qty));
         const stockQty = toStockQty(mat, quantity);
-        updateStock.run(stockQty, materialId);
-        insertTransaction.run(generateId(), materialId, stockQty, id, `Bulk import: ${item.vendor || 'unknown'}`);
+        // ── DIRECT ISSUE (Settings → Direct Issue): flagged materials never
+        //    reach the central shelf. The purchases row above and the
+        //    average_price recompute below are byte-identical to a central
+        //    import; only the stock destination branches, and no central
+        //    inventory_transactions row is written — central never moved.
+        //    stockQty is already RECIPE units (toStockQty above).
+        const direct = directTargets.get(materialId);
+        if (direct) {
+          postDirectReceipt(db, {
+            target: direct,
+            materialId,
+            recipeQty: stockQty,
+            purchaseRowId: id,
+            outletId: null,
+            user: me?.email || '',
+            source: 'purchase_bulk',
+            notes: `Direct issue: bulk import from ${item.vendor || 'unknown'}`,
+          });
+        } else {
+          updateStock.run(stockQty, materialId);
+          insertTransaction.run(generateId(), materialId, stockQty, id, `Bulk import: ${item.vendor || 'unknown'}`);
+        }
         touchedMaterials.add(materialId);
         results.success++;
       }

@@ -400,6 +400,11 @@ const navTree: NavEntry[] = [
       { kind: "link", label: "Roles",          href: "/settings/roles",         icon: Users },
       { kind: "link", label: "Print Design",   href: "/settings/print-design",  icon: Printer },
       { kind: "link", label: "Store Locations", href: "/settings/stores",       icon: Warehouse },
+      // Twin of the page-catalog row (drift trap: a page in only ONE of the two
+      // files is either invisible or ungated). Warehouse icon reused on purpose —
+      // adding a new lucide import would land in the same import hunk the held
+      // liquor work is editing, and the two diffs must stay separable.
+      { kind: "link", label: "Direct Issue",   href: "/settings/direct-issue",  icon: Warehouse },
       { kind: "link", label: "Page Access",    href: "/settings/page-access",   icon: ShieldAlert },
       // Impact Preview — read-only simulation of the page-access tightening
       // (who would lose which pages). adminOnly in the page-catalog, so

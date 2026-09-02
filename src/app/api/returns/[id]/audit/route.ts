@@ -282,12 +282,23 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
       //   internal + accepted + reusable -> a central credit MUST exist
       //   internal + accepted + write-off-> NO central row is CORRECT: unusable
       //                                     goods must never re-enter the pool
-      //   vendor   + accepted            -> a central debit MUST exist and
-      //                                     there must be NO department leg
+      //   vendor   + accepted            -> EITHER a central debit (the goods
+      //                                     were on the central shelf) OR a
+      //                                     department 'direct_receipt_reversal'
+      //                                     (a DIRECT-ISSUE line — the goods
+      //                                     were booked straight onto the
+      //                                     department ledger and central never
+      //                                     held them). Exactly one; both would
+      //                                     take the same goods out twice, and
+      //                                     neither is a movement that never
+      //                                     happened.
+      const directVendorLeg = isVendor && !!deptTxn && String((deptTxn as { type?: unknown }).type || '') === 'direct_receipt_reversal';
       if (!rejected && acceptedRecipe > 0) {
-        if (isVendor) {
-          if (!invTxnId) faults.push({ line_id: lineId, material_name: name, fault: 'Vendor line accepted but no inventory_transactions receipt — central stock may not have been debited.' });
-          if (deptTxnId) faults.push({ line_id: lineId, material_name: name, fault: 'Vendor line carries a department ledger receipt. A vendor return has no department leg.' });
+        if (isVendor && directVendorLeg) {
+          if (invTxnId) faults.push({ line_id: lineId, material_name: name, fault: 'Direct-issue vendor line carries a central receipt as well as the department reversal — central never held these goods, so both moving means the same quantity left two ledgers.' });
+        } else if (isVendor) {
+          if (!invTxnId) faults.push({ line_id: lineId, material_name: name, fault: 'Vendor line accepted but no movement receipt — neither central stock nor a direct-issue department ledger was debited.' });
+          if (deptTxnId) faults.push({ line_id: lineId, material_name: name, fault: 'Vendor line carries a department ledger receipt that is not a direct-issue reversal. A central-booked vendor return has no department leg.' });
         } else {
           if (!deptTxnId) faults.push({ line_id: lineId, material_name: name, fault: 'Internal line accepted but no department ledger receipt — the department may not have been debited.' });
           if (!writeOff && !invTxnId) faults.push({ line_id: lineId, material_name: name, fault: 'Internal reusable line accepted but no inventory_transactions receipt — central stock may not have been credited.' });
@@ -334,6 +345,11 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
         material_purchase_unit: l.material_purchase_unit ?? null,
         material_pack_size: l.material_pack_size ?? null,
         pack_factor_drifted: packFactorDrifted,
+
+        /** TRUE when this vendor line's goods arrived under Direct Issue: the
+         *  movement receipt is the department's 'direct_receipt_reversal' and
+         *  central was — correctly — never touched. */
+        direct_issue: directVendorLeg,
 
         // THE MOVEMENT RECEIPTS, RESOLVED. `quantity` on each is the SIGNED
         // ledger quantity in RECIPE units, so the direction is visible: the
@@ -455,9 +471,14 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
         /**
          * Stated on the payload so a client cannot get the direction wrong by
          * accident, and so it reads the same in a log as it does on screen.
+         * A vendor ticket says which rail the goods actually left on: a line
+         * received under DIRECT ISSUE never reached central, so its return
+         * debits the receiving department's ledger and central stays flat.
          */
         central_stock_effect: isVendor
-          ? 'VENDOR return — goods leave the building. Central stock DECREASES. No department leg.'
+          ? (lines.some((l) => l.direct_issue)
+              ? 'VENDOR return — goods leave the building. Direct-issue lines debit the receiving DEPARTMENT ledger (central never held them); any central-booked lines decrease central stock.'
+              : 'VENDOR return — goods leave the building. Central stock DECREASES. No department leg.')
           : 'INTERNAL return — department to central store. Department stock DECREASES, central stock INCREASES.',
         stock_moves_at: 'store_verify',
       },

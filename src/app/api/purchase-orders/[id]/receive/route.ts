@@ -9,6 +9,12 @@ import {
   type AllocatedLine,
 } from '@/lib/po-charges';
 import { resolveQcRequirement, undecidedQcCategories, storePreRejectBlock, QC_AWAITING } from '@/lib/grn-qc';
+// Direct-issue routing (Settings → Direct Issue): a flagged material's accepted
+// quantity posts to its DEPARTMENT's ledger instead of central stock. The
+// purchases row, GRN, taxes, last_purchase_price and average_price are written
+// exactly as on a central receipt — only the stock destination branches, at the
+// bump site below. See src/lib/direct-issue.ts.
+import { resolveDirectIssueBulk, postDirectReceipt, stampLastPurchase } from '@/lib/direct-issue';
 import { notifyGrnAwaitingQc } from '@/lib/grn-qc-notify';
 // Turns the ONE unaddressed 'admin' row this route has always written into one
 // row per real person — every active admin, plus the HOD of the department the
@@ -200,6 +206,22 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
         const it = items.find(i => String(i.id) === lineId);
         return { po_item_id: lineId, material_id: it?.material_id, material_name: it?.material_name, error };
       }),
+      // ── DIRECT-ISSUE BADGES ("→ Main Kitchen") ──────────────────────────────
+      // The server's own verdict, from the same resolver the POST books with,
+      // so the badge on screen can never disagree with where the stock lands.
+      // Store-blocked lines are excluded — they never reach a central receipt.
+      direct_issue: (() => {
+        const eligible = items.filter(i => !blocked.has(String(i.id)));
+        const targets = resolveDirectIssueBulk(db, eligible.map(i => String(i.material_id || '')));
+        return eligible
+          .filter(i => targets.has(String(i.material_id)))
+          .map(i => ({
+            po_item_id: String(i.id),
+            material_id: String(i.material_id),
+            material_name: i.material_name,
+            department_name: targets.get(String(i.material_id))!.departmentName,
+          }));
+      })(),
     });
   } catch (e: any) {
     console.error('[receive PO GET]', e);
@@ -761,6 +783,15 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       receiving.map((it: any) => String(it.material_id || '')),
       { held: !!qc.required },
     );
+
+    // ── DIRECT-ISSUE DESTINATIONS, resolved ONCE for this delivery ──────────
+    // Item rule beats category rule; unflagged materials are absent from the
+    // map and book to central exactly as always. Resolved here — not inside
+    // the loop — so every line of one delivery is judged against one snapshot
+    // of the config. On a QC-HELD delivery this map is deliberately UNUSED:
+    // no stock moves at receive time, and the sign-off (decideGrnQc) resolves
+    // afresh at release time, which is when the goods actually enter a ledger.
+    const directTargets = resolveDirectIssueBulk(db, receiving.map((it: any) => String(it.material_id || '')));
 
     // Reject negative qty / price BEFORE the txn starts.
     // Receiving is an additive workflow — stock corrections (negative qtys) live
@@ -1675,8 +1706,34 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           // would ratchet the ordered rate down every cycle and then trip the
           // rate lock the moment the vendor bills their unchanged list price.
           // Cost lives in purchases.unit_price; this is what we expect to pay.
-          bumpStock.run(stockQty, price, receivedAt, it.material_id);
-          insTx.run(generateId(), it.material_id, stockQty, purchaseId, `PO ${po.po_number} received via GRN ${grnNumber}`, po.outlet_id);
+          const direct = directTargets.get(String(it.material_id));
+          if (direct) {
+            // ── DIRECT ISSUE: the shelf never sees these goods. ─────────────
+            // The GROSS list-rate stamp is KEPT (it seeds the next PO exactly
+            // as above); current_stock is NOT bumped and NO central
+            // inventory_transactions row is written — central never moved, and
+            // the central variance report reverses purchases against that log.
+            // The accepted quantity lands on the DEPARTMENT ledger instead, in
+            // RECIPE units (stockQty already carries the pack factor), tied to
+            // the cost row just written (reference_id = purchaseId, and the
+            // row itself is stamped direct_issue_dept_id so a void or amend
+            // years from now reverses the right rail regardless of what the
+            // config says by then).
+            stampLastPurchase(db, it.material_id, price, receivedAt);
+            postDirectReceipt(db, {
+              target: direct,
+              materialId: String(it.material_id),
+              recipeQty: stockQty,
+              purchaseRowId: purchaseId,
+              outletId: po.outlet_id,
+              user: me?.email || '',
+              source: 'po_receive',
+              notes: `Direct issue: PO ${po.po_number} received via GRN ${grnNumber}`,
+            });
+          } else {
+            bumpStock.run(stockQty, price, receivedAt, it.material_id);
+            insTx.run(generateId(), it.material_id, stockQty, purchaseId, `PO ${po.po_number} received via GRN ${grnNumber}`, po.outlet_id);
+          }
           touchedMaterials.add(it.material_id);
         }
       }

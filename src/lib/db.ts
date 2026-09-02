@@ -556,6 +556,68 @@ function initializeSchema(db: Database.Database) {
     db.exec(`CREATE INDEX IF NOT EXISTS idx_menu_items_direct_reviewed ON menu_items(direct_reviewed)`);
   } catch (e) { console.error('direct_reviewed migration failed:', e); }
 
+  // ── direct_issue_rules — VENDOR DELIVERIES ROUTED STRAIGHT TO A DEPARTMENT ─
+  //
+  // The owner's rule: some categories/items (DAIRY, VEGETABLES, MEAT, …) are
+  // "supplied by the vendor and transferred directly to the Main Kitchen" (or
+  // the Bar) — the central store does the paperwork and its 3-tick checklist
+  // but never shelves the goods. A row here says: on RECEIPT, the accepted
+  // quantity of a matching material posts to the DEPARTMENT ledger
+  // (department_material_transactions, type 'direct_receipt', RECIPE units)
+  // instead of raw_materials.current_stock. EVERYTHING ELSE about the receipt
+  // — the purchases cost row, GRN document, PINV, taxes, charges,
+  // last_purchase_price and the average_price recompute — is byte-identical
+  // to a central receipt. Only the stock destination moves.
+  //
+  // rule_type 'category' keys on catNorm(category) — the SAME normalisation as
+  // qc_category_checkers (lower-case, strip space/hyphen/underscore), so
+  // "english-vegetables" and "ENGLISH VEGETABLES" are one rule. rule_type
+  // 'material' pins ONE material and BEATS any category rule for it (the
+  // owner asked for "some items OR category-wise"). category_label keeps the
+  // display spelling; the KEY is what matches.
+  //
+  // ADMIN-OWNED STATE, EMPTY AT BOOT — deliberately NO seed of the owner's
+  // eight motivating categories. Which goods bypass the shelf is a human
+  // decision (see scripts/check-boot-migrations.js); the settings page
+  // surfaces those categories prominently instead. Config affects FUTURE
+  // receipts only: stock already in central stays there until issued normally.
+  //
+  // The resolver, the receiving-route branches and the reversal handling all
+  // live in src/lib/direct-issue.ts — this block is schema only.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS direct_issue_rules (
+        id             TEXT PRIMARY KEY,
+        rule_type      TEXT NOT NULL CHECK (rule_type IN ('category', 'material')),
+        category_key   TEXT NOT NULL DEFAULT '',
+        category_label TEXT NOT NULL DEFAULT '',
+        material_id    TEXT NOT NULL DEFAULT '',
+        department_id  TEXT NOT NULL,
+        created_by     TEXT NOT NULL DEFAULT '',
+        created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at     TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_direct_issue_rules_cat
+        ON direct_issue_rules(category_key) WHERE rule_type = 'category';
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_direct_issue_rules_mat
+        ON direct_issue_rules(material_id) WHERE rule_type = 'material';
+    `);
+    // purchases.direct_issue_dept_id — WHERE THE STOCK OF THIS COST ROW WENT.
+    // '' / NULL = central (every historical row). Stamped at write time by the
+    // receiving branches, so the answer is TIME-CORRECT: a rule added later
+    // never re-labels an old central receipt, and un-flagging never orphans a
+    // department receipt. Read by the central variance report (which must NOT
+    // count these rows as central inflow) and by the GRN void/amend machinery
+    // (which must reverse them on the DEPARTMENT rail, not central).
+    // `purchases` is created near the top of this function, ~500 lines above,
+    // so the ALTER can never run before the CREATE on a fresh database.
+    const pCols = db.prepare(`PRAGMA table_info(purchases)`).all() as Array<{ name: string }>;
+    const pNames = new Set(pCols.map(c => String(c.name)));
+    if (!pNames.has('direct_issue_dept_id')) {
+      db.exec(`ALTER TABLE purchases ADD COLUMN direct_issue_dept_id TEXT`);
+    }
+  } catch (e) { console.error('direct_issue_rules migration failed:', e); }
+
   // ── menu_categories — the MENU CATEGORY MASTER ────────────────────────────
   //
   // WHAT IT GOVERNS, AND WHAT IT DELIBERATELY DOES NOT.

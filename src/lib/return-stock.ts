@@ -1,6 +1,7 @@
 import type Database from 'better-sqlite3';
 import { generateId } from './db';
 import { assertReversible, postDeptLedger } from './dept-ledger';
+import { directRowsForGrn } from './direct-issue';
 import { centralFlowBlock } from './store-engine';
 
 /**
@@ -28,6 +29,12 @@ import { centralFlowBlock } from './store-engine';
  *   acceptVendorReturnLine()    CENTRAL STORE --> OUT THE DOOR, back to the vendor.
  *                               The goods LEAVE the building.
  *                               current_stock DOWN. No department leg at all.
+ *                               EXCEPTION: a GRN line stamped
+ *                               purchases.direct_issue_dept_id was booked on
+ *                               the DEPARTMENT ledger (central never held it),
+ *                               so its return debits THAT ledger and leaves
+ *                               central untouched — see the direct-issue fork
+ *                               documented on the function itself.
  *
  * Requirement 76 — "accepted returns should be added back to Store stock as
  * Returned Stock, and Department stock should be reduced automatically" —
@@ -172,10 +179,12 @@ export function isReturnStockRefused(e: unknown): e is ReturnStockRefused {
  *  material_return_items so a verified line with a quantity and a NULL receipt
  *  is a DETECTABLE integrity fault rather than a silent zero-credit. */
 export interface ReturnMoveResult {
-  /** department_material_transactions.id — internal lines only, else null. */
+  /** department_material_transactions.id — internal lines AND direct-issue
+   *  vendor lines (whose goods sat on the department ledger); else null. */
   deptTxnId: string | null;
   /** inventory_transactions.id — null on an internal wastage/disposal line,
-   *  which by design never touches central. */
+   *  which by design never touches central, and on a DIRECT-ISSUE vendor line,
+   *  whose goods central never held (see acceptVendorReturnLine). */
   invTxnId: string | null;
   /** The rounded RECIPE quantity actually moved. Never clamped — equals what
    *  was asked for, or the call threw. */
@@ -216,6 +225,17 @@ export interface VendorReturnLine {
   recipeQty: number;
   /** material_return_items.id — inventory_transactions.reference_id. */
   returnItemId: string;
+  /** material_returns.id — the department ledger row's reference_id on a
+   *  direct-issue line, mirroring acceptInternalReturnLine. */
+  returnId?: string | null;
+  /** goods_receipt_notes.id the ticket is anchored on (material_returns.grn_id).
+   *  REQUIRED for the direct-issue check: it is how this mover finds the
+   *  stamped `purchases.direct_issue_dept_id` cost rows and reverses the rail
+   *  the goods ACTUALLY arrived on. Omitting it on a direct-routed line would
+   *  debit central for goods it never held — the exact defect this field
+   *  exists to prevent. Absent/blank falls back to the central path (the
+   *  pre-direct-issue behaviour), which is only correct for central goods. */
+  grnId?: string | null;
   retNumber?: string | null;
   outletId?: string | null;
   actor?: string;
@@ -458,6 +478,30 @@ export function acceptInternalReturnLine(db: Database.Database, p: InternalRetur
  *   1. raw_materials.current_stock DOWN.
  *   2. one inventory_transactions row, NEGATIVE, type 'vendor_return'.
  *
+ * ── EXCEPT WHEN THE GOODS NEVER TOUCHED CENTRAL: THE DIRECT-ISSUE FORK ────
+ * A GRN line whose cost row is stamped `purchases.direct_issue_dept_id`
+ * (Settings → Direct Issue) booked its accepted quantity on the DEPARTMENT
+ * ledger — src/lib/direct-issue.ts, type 'direct_receipt' — and central's
+ * book never moved. Returning such a line to the vendor must therefore
+ * reverse the DEPARTMENT rail, not central: debiting current_stock here
+ * would leave central short goods it never held AND leave the department
+ * holding a phantom balance for bottles that left on the lorry — two
+ * mis-statements that nothing ever ties together at the next counts.
+ *
+ * The fork is decided by the ROW'S STAMP, never by the rule table of the
+ * day (rules affect future receipts only; the stamp is where THIS receipt's
+ * stock actually went — the same time-correctness rule grn-reversal.ts
+ * follows). On the direct branch:
+ *   1. assertReversible — the DEPARTMENT must still hold the grams, and a
+ *      refusal speaks about the department, not about central holdings that
+ *      are meaningless for kitchen-held goods.
+ *   2. one department ledger row, NEGATIVE, type 'direct_receipt_reversal' —
+ *      the canonical "direct delivery going back out" type; central's
+ *      current_stock and inventory_transactions are NOT touched, which is
+ *      exactly what keeps the central variance report (whose purchases term
+ *      already excludes direct-routed cost rows) in balance.
+ * centralDelta is 0 on this branch, honestly: central did not move.
+ *
  * And three things it deliberately does NOT do — see rule 3 in the header:
  *   - no `purchases` row, positive or negative (it would become the material's
  *     price and cascade into every recipe cost),
@@ -488,6 +532,65 @@ export function acceptVendorReturnLine(db: Database.Database, p: VendorReturnLin
 
   refuseStoreMapped(db, FN, materialId);
   const qty = normQty(FN, db, materialId, p.recipeQty);
+
+  // ── THE DIRECT-ISSUE FORK (see the header block above) ───────────────────
+  // Decided by the stamped cost rows of THIS GRN + material, read inside the
+  // caller's transaction. directRowsForGrn fails-to-empty when the marker
+  // column is absent, which correctly falls through to the central path — a
+  // database without the direct-issue schema cannot have direct-routed rows.
+  const grnId = String(p.grnId || '').trim();
+  const directRows = grnId ? directRowsForGrn(db, grnId, materialId) : [];
+  if (directRows.length > 0) {
+    const depts = [...new Set(directRows.map((r) => String(r.direct_issue_dept_id)))];
+    if (depts.length > 1) {
+      // Should be impossible (one resolution per material per receipt), but if
+      // two cost rows ever disagree the movement cannot be attributed to one
+      // ledger — refuse and roll back rather than guess a department.
+      throw new Error(
+        `${FN}: the direct-issue cost rows for ${materialName(db, materialId)} on this GRN are stamped for ` +
+        `${depts.length} different departments, so the return cannot be attributed to one ledger. ` +
+        `Correct the stamps before verifying this return.`,
+      );
+    }
+    const departmentId = depts[0];
+
+    // THE DEPARTMENT-BALANCE GUARD — the direct branch's analogue of the
+    // central guard below, and it throws DeptReversalBlocked whose message
+    // names the DEPARTMENT ("<kitchen> holds only X"), not central holdings
+    // that mean nothing for goods that never crossed the central shelf. The
+    // department may legitimately have cooked part of the delivery while the
+    // ticket waited; the balance AT ACCEPT is the only authoritative one.
+    // Deliberately no reqItemId: no requisition line exists on this rail.
+    assertReversible(db, { departmentId, materialId, qty });
+
+    const outletId = p.outletId || null;
+    const note = (p.notes || '').trim()
+      || `${p.retNumber ? `Return ${p.retNumber}` : 'Vendor return'}: direct-issue goods returned to vendor from the department`;
+
+    // ONE department ledger row, NEGATIVE, and nothing on the central rail.
+    // 'direct_receipt_reversal' is the canonical sign-'-' type of the direct
+    // purchase rail (dept-ledger.ts) — the delivery going back out the way it
+    // came in — so every balance reader and /api/department-ledger/check
+    // accept the row without edits. reference_id mirrors
+    // acceptInternalReturnLine (the ticket), and the caller writes deptTxnId
+    // back onto the line, so the movement is traceable from both ends. Note
+    // the GRN void/amend rails can never race this into a double-reversal:
+    // both refuse to touch a line that has any return ticket anchored to it.
+    const deptTxn = postDeptLedger(db, {
+      departmentId,
+      materialId,
+      type: 'direct_receipt_reversal',
+      quantity: -qty,
+      outletId,
+      referenceId: p.returnId || returnItemId,
+      source: 'material-return',
+      notes: note,
+      user: p.actor || '',
+    });
+
+    // centralDelta 0, honestly: central never held these goods and did not move.
+    return { deptTxnId: deptTxn.id, invTxnId: null, recipeQty: qty, centralDelta: 0, disposition: 'reusable' };
+  }
 
   // THE CENTRAL-BALANCE GUARD. Read fresh inside the caller's transaction, for
   // the same reason assertReversible is: the ticket may have sat at

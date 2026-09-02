@@ -46,6 +46,14 @@ export async function POST(request: Request) {
       INSERT INTO purchases (id, material_id, vendor, brand, quantity, unit_price, total_price, date, notes, created_at)
       VALUES (?, ?, 'Opening Stock', '', ?, ?, ?, ?, 'Opening stock (go-live)', datetime('now'))
     `);
+    // DIRECT-ISSUE RULES DELIBERATELY DO NOT APPLY HERE (nor on the Recaho
+    // inward backfill). This CSV is a statement about what is PHYSICALLY ON
+    // THE CENTRAL SHELF at go-live — not a vendor delivery arriving today —
+    // and the routed departments get their own opening via the department
+    // ledger's cutover count. Routing an opening row would book shelf stock
+    // onto a ledger the storeman is looking at the shelf to verify. The four
+    // live receiving paths (PO receive, ad-hoc GRN, cash purchase, bulk
+    // import) all consult src/lib/direct-issue.ts; this one must not.
     const updStock = db.prepare(`UPDATE raw_materials SET current_stock = current_stock + ?, updated_at = datetime('now') WHERE id = ?`);
     const insTxn = db.prepare(`
       INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, created_at)

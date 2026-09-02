@@ -149,7 +149,7 @@ function nowMs(): string {
  * ──────────────────────────────────────────────────────────────────────────*/
 
 /**
- * The ten canonical department movement types and their SIGN CONTRACT.
+ * The canonical department movement types and their SIGN CONTRACT.
  *
  * THE SIGN IS WHAT THE BALANCE SUMS. THE TYPE IS WHAT THE AUDIT READS. Those
  * are two different jobs and confusing them is the live bug this vocabulary
@@ -203,6 +203,31 @@ export const DEPT_TXN_TYPES = {
    *      issue stands, and some of it came back later.
    *  Do not collapse this into either of them. */
   store_return: { sign: '-', rail: 'returns', doc: 'Returned from department to central store' },
+  /** A vendor delivery routed STRAIGHT to the department under a
+   *  direct_issue_rules row (Settings → Direct Issue) — central never held it.
+   *  Written only by the receiving routes / QC sign-off via
+   *  src/lib/direct-issue.ts, with reference_id = the `purchases` cost-row id
+   *  (which carries the matching direct_issue_dept_id stamp).
+   *
+   *  ITS OWN TYPE FOR THE SAME REASONS store_return is:
+   *    · 'issued' is the REQUISITION rail — the issue register and the
+   *      reversal cap are per-requisition-line questions, and a vendor receipt
+   *      typed 'issued' would appear as a store issue that no requisition made.
+   *    · 'received' is the PARTY rail, and /api/admin/reset credits central
+   *      for SUM over ('received','consumed','returned') — a direct receipt
+   *      typed that way would be credited to central on a reset, inventing
+   *      stock central never held. po-requisition-fulfil.ts also discriminates
+   *      on type='received' as its replay witness.
+   *  Every balance reader sums ALL types, so this row counts everywhere
+   *  without further edits; only per-type report buckets file it under their
+   *  catch-all. */
+  direct_receipt: { sign: '+', rail: 'purchase', doc: 'Vendor delivery routed directly to the department' },
+  /** The undo of a direct_receipt — a GRN void or a downward bill amendment
+   *  taking back goods that were booked straight into the department. NEVER a
+   *  negative 'direct_receipt' (the sign contract above), and NOT
+   *  'issue_reversal' (no issue happened) or 'store_return' (nothing physically
+   *  moved to central — the receipt itself is being unwound). */
+  direct_receipt_reversal: { sign: '-', rail: 'purchase', doc: 'Direct vendor delivery voided or amended back out' },
   /** Signed correction: an approved department variance count, or the Unit Audit
    *  pack-factor rebase. Never rewrite a historical row to correct a balance —
    *  post one of these, so the reason stays on the record. */

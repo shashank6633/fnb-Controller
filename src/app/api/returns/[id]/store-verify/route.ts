@@ -518,6 +518,13 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
             materialId: line.material_id,
             recipeQty,
             returnItemId: line.id,
+            returnId: id,
+            // The ticket's GRN anchor, which is how the mover finds the
+            // stamped direct-issue cost rows and reverses the rail the goods
+            // ACTUALLY arrived on: a direct-routed line debits the receiving
+            // DEPARTMENT's ledger (central never held it, centralDelta 0);
+            // everything else debits central exactly as before.
+            grnId: r.grn_id || null,
             retNumber: r.ret_number,
             outletId: r.outlet_id || null,
             actor: me.email,
@@ -606,7 +613,10 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       /** Signed RECIPE-unit change to central stock across the whole ticket:
        *  POSITIVE for an internal return (goods came back in), NEGATIVE for a
        *  vendor return (goods went out), 0 when everything was rejected or
-       *  written off. There is deliberately no unsigned "total returned". */
+       *  written off — and 0 for a vendor line received under DIRECT ISSUE,
+       *  whose goods central never held (the department ledger is debited
+       *  instead; see the per-line dept_txn_id). There is deliberately no
+       *  unsigned "total returned". */
       central_delta_recipe_units: out.centralDelta,
       items: out.results,
     });
