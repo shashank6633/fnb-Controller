@@ -55,6 +55,24 @@ interface RawMaterial {
   storage_location?: string;
 }
 
+/** One DIRECT-FLAGGED material's destination + department-held balance, from
+ *  GET /api/inventory/direct-dept-stock (Settings → Direct Issue rules resolved
+ *  via src/lib/direct-issue.ts; balance from the dept-ledger derivation).
+ *  DISPLAY-ONLY, and NEVER summed with central — the owner's no-double-count
+ *  law: two labelled figures side by side, no total anywhere. */
+interface DirectDeptStock {
+  department_id: string;
+  department_name: string;
+  /** Which rule matched — a material rule beats a category rule. */
+  via: 'material' | 'category';
+  /** RECIPE units (converted once through the pack layer for display).
+   *  NULL — never 0 — when the department has no count/opening anchor yet. */
+  on_hand: number | null;
+  never_counted: boolean;
+  /** RECIPE units. Uncounted ledger movement; tooltip context only. */
+  movements_since: number;
+}
+
 interface FormData {
   id?: string;
   name: string;
@@ -305,6 +323,20 @@ export default function InventoryPage() {
       .catch(() => setMe(null));
   }, []);
   const canBulkPriority = !!me && (me.role === 'admin' || me.is_store_manager);
+
+  // DIRECT-FLAGGED materials: material_id → destination department + its held
+  // balance. Fetched from its own authenticated route — NOT from /api/inventory,
+  // which stays byte-identical for its 22 readers and must never carry
+  // department figures (it answers even without a valid session). Any failure
+  // (401/403/500/network) leaves this map empty and every row renders exactly
+  // as it did before this feature existed.
+  const [directDept, setDirectDept] = useState<Record<string, DirectDeptStock>>({});
+  useEffect(() => {
+    fetch('/api/inventory/direct-dept-stock')
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error('unavailable'))))
+      .then((j) => setDirectDept(j?.targets && typeof j.targets === 'object' ? j.targets : {}))
+      .catch(() => setDirectDept({}));
+  }, []);
 
   // Inline per-row priority setter — same apply path as the bulk tool, so a
   // single item's level can be set straight from the list (optimistic; reverts
@@ -1079,6 +1111,49 @@ export default function InventoryPage() {
                           {(() => {
                             const ps = packFactor(m as any);
                             const pu = (m as any).purchase_unit || m.unit;
+                            // DIRECT-FLAGGED material (Settings → Direct Issue):
+                            // print the DEPARTMENT-HELD figure beside central —
+                            // "Central 0 PKT · Main Kitchen 4 PKT". Two labelled
+                            // figures, NEVER summed (owner's no-double-count law):
+                            // current_stock stays central-only, and the dept figure
+                            // feeds no valuation / low-stock / deficit / export.
+                            // Non-flagged materials (and `sub:` semi rows, which can
+                            // never be flagged) miss this map and fall through to the
+                            // exact pre-feature rendering below.
+                            const dd = directDept[m.id];
+                            if (dd) {
+                              return (
+                                <>
+                                  <span className="text-[10px] text-[#8B7355]">Central </span>
+                                  <span>{fmtPU(m.current_stock, m)}</span>
+                                  <span className="ml-1 text-[10px] text-[#8B7355]">{pu}</span>
+                                  <span className="text-[#B8A590]"> · </span>
+                                  <span className="text-[10px] text-[#8B7355]"
+                                        title={`Direct-issue ${dd.via === 'material' ? 'item' : 'category'} rule — vendor deliveries book straight to ${dd.department_name}. This figure is held BY that department (department ledger), separate from central; the two are never added together.`}>
+                                    {dd.department_name}{' '}
+                                  </span>
+                                  {dd.on_hand != null ? (
+                                    <>
+                                      <span>{fmtPU(dd.on_hand, m)}</span>
+                                      <span className="ml-1 text-[10px] text-[#8B7355]">{pu}</span>
+                                    </>
+                                  ) : (
+                                    // NULL is not zero: no closing count / cutover
+                                    // opening anchors this pair yet, so the balance is
+                                    // unknown — say so rather than print a false 0.
+                                    <span className="text-[10px] text-[#B8A590] italic"
+                                          title={`${dd.department_name} has no closing count or cutover opening for this material yet — its balance is unknown, not zero.${dd.movements_since ? ` Uncounted ledger movement so far: ${fmtPU(dd.movements_since, m)} ${pu}.` : ''}`}>
+                                      not counted
+                                    </span>
+                                  )}
+                                  {ps > 1 && (
+                                    <div className="text-[9px] text-[#B8A590]">
+                                      = {fmtQtyNum(m.current_stock)} {m.unit}{dd.on_hand != null ? ` · ${fmtQtyNum(dd.on_hand)} ${m.unit} dept` : ''}
+                                    </div>
+                                  )}
+                                </>
+                              );
+                            }
                             if (ps > 1) {
                               return (
                                 <>

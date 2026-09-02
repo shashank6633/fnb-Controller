@@ -11,6 +11,12 @@ import { isStoreMappedMaterial } from '@/lib/store-engine';
  * Built by unrolling the `issue_history` JSON on every requisition_item, so
  * split-issues (e.g. 30 kg now + 20 kg later) appear as two distinct rows.
  *
+ * PLUS one row per DIRECT-ISSUE vendor receipt (`source: 'direct'`) — goods
+ * the vendor delivered straight to a department under Settings → Direct
+ * Issue, read from department_material_transactions and valued on the SAME
+ * closing-valuation ladder as the requisition rows. See the RAIL 2 note in
+ * the handler.
+ *
  * Query params:
  *   from           ISO date (inclusive). Defaults to today.
  *   to             ISO date (inclusive). Defaults to today.
@@ -86,14 +92,69 @@ export async function GET(request: Request) {
       ORDER BY r.req_number DESC
     `).all(...params) as any[];
 
+    // ── RAIL 2: DIRECT-ISSUE VENDOR RECEIPTS ──────────────────────────────────
+    // Under Settings → Direct Issue, whole categories are delivered by the
+    // vendor STRAIGHT to a kitchen and never cross the central shelf, so a log
+    // built from requisitions alone systematically understates what actually
+    // went out to departments. Those movements live on the department ledger:
+    // `department_material_transactions` rows of type 'direct_receipt' (and
+    // their 'direct_receipt_reversal' twins — voids, downward bill amendments,
+    // vendor returns), RECIPE units, reference_id = the `purchases` cost row.
+    //
+    // ONE LOG ROW PER LEDGER ROW — the same granularity as the requisition
+    // side's one-row-per-hand-over: a reversal renders as its own NEGATIVE row
+    // rather than silently shrinking the receipt it undoes, exactly the call
+    // api/department-consumption already made ("a reversal dated after its
+    // receipt shows as a negative entry on its own day, which is the honest
+    // movement log").
+    //
+    // DAY — the movement date the range filter runs on — is the PROVEN
+    // PRECEDENT from directInflowRows() in api/department-consumption/route.ts,
+    // verbatim: the stamped cost row's bill date (purchases.date via
+    // reference_id — honours backdating) falling back to the ledger row's own
+    // UTC date (a vendor-return reversal references its return ticket, not a
+    // purchases row, so it falls back). try/catch to [] so a database from
+    // before the department ledger existed still answers with the requisition
+    // rail alone — the same fail-open directInflowRows ships.
+    let directRows: any[] = [];
+    try {
+      const DAY = `COALESCE(SUBSTR(p.date, 1, 10), SUBSTR(REPLACE(dmt.created_at, 'T', ' '), 1, 10))`;
+      const dWhere: string[] = [`dmt.type IN ('direct_receipt', 'direct_receipt_reversal')`, `${DAY} BETWEEN ? AND ?`];
+      const dParams: any[] = [from, to];
+      if (departmentId) { dWhere.push('dmt.department_id = ?'); dParams.push(departmentId); }
+      if (materialId)   { dWhere.push('dmt.material_id = ?');   dParams.push(materialId); }
+      directRows = db.prepare(`
+        SELECT dmt.id AS dmt_id, dmt.material_id, dmt.department_id,
+               dmt.quantity AS recipe_qty, dmt.type AS dmt_type,
+               dmt.created_at AS posted_at, dmt.user AS posted_by,
+               COALESCE(dmt.notes, '') AS dmt_notes,
+               ${DAY} AS day,
+               COALESCE(d.name, '') AS department_name,
+               rm.name AS material_name, rm.unit, rm.average_price,
+               rm.purchase_unit AS rm_purchase_unit, COALESCE(rm.pack_size, 1) AS rm_pack_size,
+               rm.category AS rm_category, COALESCE(rm.tax_percent, 0) AS rm_tax_percent,
+               g.grn_number, COALESCE(p.bill_no, '') AS bill_no, COALESCE(p.invoice_id, '') AS invoice_id
+        FROM department_material_transactions dmt
+        JOIN raw_materials rm ON rm.id = dmt.material_id
+        LEFT JOIN departments d ON d.id = dmt.department_id
+        LEFT JOIN purchases  p ON p.id = dmt.reference_id
+        LEFT JOIN goods_receipt_notes g ON g.id = p.grn_id
+        WHERE ${dWhere.join(' AND ')}
+      `).all(...dParams) as any[];
+    } catch (e) {
+      console.error('[store-issued-log] direct-receipt rail unavailable — requisition rows only', e);
+      directRows = [];
+    }
+
     const events: any[] = [];
     let totalValue = 0;
     const dists = { materials: new Set<string>(), departments: new Set<string>() };
 
     // ONE query for the whole log: the latest priced purchase per material. Passing
     // the hit (or an explicit null) into materialRate as `preloaded` keeps it from
-    // running its own per-material SELECT inside the loop.
-    const rates = rows.length ? rateMap(db) : new Map<string, { unit_price: number; date: string }>();
+    // running its own per-material SELECT inside the loop. Direct rows ride the
+    // same map, so both rails cost from one snapshot.
+    const rates = (rows.length || directRows.length) ? rateMap(db) : new Map<string, { unit_price: number; date: string }>();
 
     // ── LIQUOR ZERO-RATE LOCK for the derived GST columns ────────────────────
     // Both receiving routes hard-zero-rate store-mapped (TGBCL) materials —
@@ -362,8 +423,127 @@ export async function GET(request: Request) {
           tax_known: taxPct > 0,           // ...so consumers print blank, not 0
           unit_cost_incl_gst: unitCostInclGst,   // RECIPE basis, pairs with unit_cost
           value_incl_gst: valueInclGst,          // == value when taxPct is 0
+          // Which rail this row came off. ADDITIVE — every field above is
+          // byte-identical to the pre-direct payload.
+          source: 'requisition',
         });
       }
+    }
+
+    // ── DIRECT-RECEIPT EVENTS — same row shape, same valuation, second rail ──
+    // Costing is a MIRROR of the requisition loop above, not a re-derivation:
+    // the same closing-valuation ladder (rateMap + materialRate → ₹ per
+    // PURCHASE unit), the same single ÷packFactor to the recipe basis, the
+    // same both-halves pack guard, the same GST scalar under the same liquor
+    // zero-rate lock. The dept-consumption register values its direct rows at
+    // average_price instead (its requisition rail is average_price-based too);
+    // HERE the requisition rows are ladder-valued, so the direct rows take the
+    // ladder as well — one log, one basis, and a material issued both ways on
+    // the same day carries the same unit cost on both rows. (The zero-rate
+    // lock is belt-and-braces on this rail: store-mapped materials cannot be
+    // direct-routed at all — direct-issue.ts refuses the rules — but the lock
+    // costs one memoised lookup and keeps the two loops symmetrical.)
+    //
+    // The APPROVAL COLUMNS ARE NULL, DELIBERATELY. A vendor-direct transfer
+    // has no requested quantity, no chef approval and no cumulative
+    // issued-to-date on a requisition line — those numbers describe the
+    // approval flow this row never went through, and inventing a stand-in
+    // (echoing the quantity into "approved", say) would fabricate an approval
+    // that never happened. Consumers render '—'. `issued_qty_purchase`
+    // ("Issued Qty to Date") therefore stays a REQUISITION-LINE aggregate and
+    // never mixes in direct receipts.
+    for (const row of directRows) {
+      const qtyRecipe = Number(row.recipe_qty) || 0;
+      if (Math.abs(qtyRecipe) < 1e-9) continue;
+      const postedBy = String(row.posted_by || '');
+      if (issuer && !postedBy.toLowerCase().includes(issuer)) continue;
+
+      const mat = {
+        id: row.material_id as string,
+        unit: row.unit,
+        purchase_unit: row.rm_purchase_unit,
+        pack_size: row.rm_pack_size,
+        average_price: row.average_price,
+      };
+      const preloaded = rates.get(row.material_id) ?? null;
+      const matPackFactor = packFactor(mat);
+      const rate = materialRate(db, mat, preloaded);
+      const ratePU = rate.ratePerPurchaseUnit;
+      const rmCategory = String(row.rm_category || '');
+      const taxPct = zeroRated(rmCategory) ? 0 : Math.max(0, Number(row.rm_tax_percent) || 0);
+
+      // Ledger quantities are RECIPE units by construction (postDirectReceipt:
+      // accepted × packFactor), so the display divisor is the plain both-halves
+      // pack guard — no line-unit question exists on this rail.
+      const vPack = Number(row.rm_pack_size) || 1;
+      const puNorm = String(row.rm_purchase_unit || row.unit || '').toLowerCase().trim();
+      const ruNorm = String(row.unit || '').toLowerCase().trim();
+      const packDiv = (vPack > 1 && ruNorm !== puNorm) ? vPack : 1;
+      const qtyPurchase = Math.round((qtyRecipe / packDiv) * 1000) / 1000;
+
+      const unitCost = matPackFactor > 1 ? ratePU / matPackFactor : ratePU;
+      const lineValue = Math.round(qtyRecipe * unitCost * 100) / 100;
+      const unitCostInclGst = taxPct > 0 ? unitCost * (1 + taxPct / 100) : unitCost;
+      const valueInclGst = taxPct > 0 ? Math.round(lineValue * (1 + taxPct / 100) * 100) / 100 : lineValue;
+
+      // WHEN. The receipt's own posting timestamp when it belongs to the same
+      // calendar day the range filter files the row under; the BILL DATE alone
+      // (day precision) when the entry was backdated — gluing the posting
+      // TIME onto the bill DAY would print a timestamp that never happened.
+      // posted_at travels alongside so the UI can still say when a backdated
+      // row was actually entered.
+      const postedRaw = String(row.posted_at || '');
+      const postedIso = /Z$|[+-]\d{2}:\d{2}$/.test(postedRaw)
+        ? postedRaw
+        : postedRaw.replace(' ', 'T') + (postedRaw.length > 10 ? 'Z' : '');
+      const day = String(row.day || '').slice(0, 10);
+      const backdated = !!day && postedIso.slice(0, 10) !== day;
+      const at = backdated ? day : postedIso;
+
+      totalValue += lineValue;
+      dists.materials.add(row.material_id);
+      if (row.department_name) dists.departments.add(row.department_name);
+      events.push({
+        at,
+        posted_at: postedIso,
+        backdated,
+        qty: qtyRecipe,                       // RECIPE basis — SIGNED; negative = reversal
+        unit: row.unit,
+        qty_purchase: qtyPurchase,            // PURCHASE basis, what the vendor delivered
+        purchase_unit: row.rm_purchase_unit || row.unit,
+        pack_factor: packDiv,
+        requested_qty_purchase: null,         // no requisition line — see the header note
+        effective_qty_purchase: null,
+        issued_qty_purchase: null,
+        material_id: row.material_id,
+        material_name: row.material_name,
+        category: row.rm_category || '',
+        department_id: row.department_id,
+        department_name: row.department_name || '',
+        issuer: postedBy,                     // who booked the receipt (GRN/receive user)
+        note: row.dmt_notes || '',
+        req_id: null,
+        req_number: '',
+        purpose: '',
+        event_name: '',
+        item_id: row.dmt_id,
+        unit_cost: unitCost,
+        unit_cost_purchase: ratePU,
+        rate_source: rate.source,
+        rate_as_of: rate.asOf || null,
+        value: lineValue,                     // SIGNED with qty — a reversal is negative
+        tax_percent: taxPct,
+        tax_known: taxPct > 0,
+        unit_cost_incl_gst: unitCostInclGst,
+        value_incl_gst: valueInclGst,
+        source: 'direct',
+        // The document the goods arrived on: GRN number first (the receiving
+        // paper), else the vendor's bill number, else our PINV id. Blank for a
+        // ledger row whose reference is not a purchases row (vendor-return
+        // tickets); the notes column still carries the writer's context line.
+        source_ref: row.grn_number || row.bill_no || row.invoice_id || '',
+        reversal: String(row.dmt_type) === 'direct_receipt_reversal',
+      });
     }
 
     // Newest first

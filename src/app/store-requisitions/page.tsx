@@ -54,7 +54,7 @@ import {
   Hourglass, Split,
 } from 'lucide-react';
 import { api } from '@/lib/api';
-import { fmtIST, fmtISTIsoDate, todayIST } from '@/lib/format-date';
+import { fmtIST, fmtISTDate, fmtISTIsoDate, fmtISTShort, todayIST } from '@/lib/format-date';
 import TabScroller from '@/components/TabScroller';
 import { packFactor } from '@/lib/pack-units';
 
@@ -2479,6 +2479,12 @@ function HistoryDrawer({ line, onClose }: { line: ReqLine; onClose: () => void }
  * Rows are unrolled from issue_history JSON across all requisition_items, so a
  * 30+20 kg split-issue appears as two distinct rows with their own timestamps.
  * Lets a store manager / admin audit "what went out today, to whom, and by who."
+ *
+ * DIRECT-ISSUE vendor receipts ride inline too (tagged "Direct"): goods the
+ * vendor delivered straight to a department under Settings → Direct Issue.
+ * They carry the GRN/bill number where a requisition row carries its Req #,
+ * and '—' in the approval columns — no requisition ever existed for them.
+ * The All / Requisitions / Direct filter slices the two rails apart.
  */
 function IssuedLogPanel({ loading, log, from, to, onFromChange, onToChange }: {
   loading: boolean;
@@ -2488,10 +2494,46 @@ function IssuedLogPanel({ loading, log, from, to, onFromChange, onToChange }: {
   onToChange: (v: string) => void;
 }) {
   const events = log?.events || [];
-  const totals = log?.totals || { events: 0, total_value: 0, distinct_materials: 0, distinct_departments: 0 };
+
+  // ── SOURCE FILTER — All / Requisitions / Direct ──────────────────────────
+  // The log now carries TWO rails: hand-overs against a requisition
+  // (source 'requisition') and vendor deliveries routed straight to a
+  // department under Settings → Direct Issue (source 'direct', tagged on the
+  // row). `?? 'requisition'` keeps an older payload — rows minted before the
+  // source field existed — filing under Requisitions instead of vanishing.
+  const [srcFilter, setSrcFilter] = useState<'all' | 'requisition' | 'direct'>('all');
+  const srcOf = (e: any) => (e?.source === 'direct' ? 'direct' : 'requisition');
+  const shown = useMemo(
+    () => (srcFilter === 'all' ? events : events.filter(e => srcOf(e) === srcFilter)),
+    [events, srcFilter],
+  );
+  const counts = useMemo(() => {
+    let req = 0, dir = 0;
+    for (const e of events) srcOf(e) === 'direct' ? dir++ : req++;
+    return { all: events.length, requisition: req, direct: dir };
+  }, [events]);
+
+  // Summary cards describe WHAT IS LISTED. Computed from the filtered rows —
+  // the same sums/sets the server totals run over, so with the filter on All
+  // the numbers match the server's — because cards frozen on the unfiltered
+  // totals would contradict the table the moment a filter is applied.
+  const totals = useMemo(() => {
+    const mats = new Set<string>(); const depts = new Set<string>(); let val = 0;
+    for (const e of shown) {
+      val += Number(e.value) || 0;
+      if (e.material_id) mats.add(e.material_id);
+      if (e.department_name) depts.add(e.department_name);
+    }
+    return {
+      events: shown.length,
+      total_value: Math.round(val * 100) / 100,
+      distinct_materials: mats.size,
+      distinct_departments: depts.size,
+    };
+  }, [shown]);
 
   const downloadCsv = () => {
-    if (events.length === 0) return;
+    if (shown.length === 0) return;
     // Both bases: the purchase figure is what was handed over, the recipe
     // figure is what Value and the stock deduction were computed from.
     // Column names say WHICH basis each figure is in — an unqualified "Qty"/"Unit"
@@ -2548,10 +2590,26 @@ function IssuedLogPanel({ loading, log, from, to, onFromChange, onToChange }: {
     //     api/store-issued-log/route.ts, copied from store-issue/route.ts.
     // Blank, not 0, if a field is absent from the response: 0 would assert
     // "nothing was requested", the same call the GST rate cell makes below.
+    // ── 'Source' IS APPENDED, NEVER INSERTED ─────────────────────────────────
+    // The owner has saved spreadsheets built on this header order; every
+    // existing column keeps its position and its text byte-for-byte, and the
+    // one new column rides at the END. Values are 'Requisition' / 'Direct'.
+    //
+    // On a DIRECT row the three approval columns and 'Req #' print '—': a
+    // vendor-direct delivery has no requested quantity, no chef approval and
+    // no requisition number, and echoing anything else into them would
+    // fabricate an approval that never happened. 'Issued Qty to Date' in
+    // particular REMAINS a requisition-line aggregate (the line's cumulative
+    // quantity_issued) and deliberately does NOT absorb direct transfers —
+    // it sits between Requested and Approved on the same row and is read
+    // against them; mixing vendor deliveries into it would break that
+    // reconciliation. The '—' on every Direct row is what keeps the column
+    // unmistakably requisition-only without moving a header byte.
     const headers = ['When', 'Material', 'Category', 'Issued Qty', 'Purchase Unit', 'Issued Qty (recipe)', 'Recipe Unit',
                      'Requested Qty', 'Approved/Effective Qty', 'Issued Qty to Date',
                      'Department', 'Req #', 'Issuer', 'Unit Cost', 'Unit Cost incl. GST (est.)',
-                     'Value', 'Value incl. GST (est.)', 'GST % (master)', 'Purpose', 'Event', 'Note'];
+                     'Value', 'Value incl. GST (est.)', 'GST % (master)', 'Purpose', 'Event', 'Note',
+                     'Source'];
     const escape = (v: any) => {
       let s = v == null ? '' : String(v);
       // Formula-injection guard (CWE-1236), the house form used elsewhere in
@@ -2562,20 +2620,26 @@ function IssuedLogPanel({ loading, log, from, to, onFromChange, onToChange }: {
       return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
     };
     const lines = [headers.join(',')];
-    for (const e of events) {
+    for (const e of shown) {
+      const isDirect = srcOf(e) === 'direct';
       lines.push([e.at, e.material_name, e.category ?? '', e.qty_purchase ?? e.qty, e.purchase_unit || e.unit,
                   e.qty, e.unit,
-                  e.requested_qty_purchase ?? '', e.effective_qty_purchase ?? '', e.issued_qty_purchase ?? '',
-                  e.department_name, e.req_number,
+                  isDirect ? '—' : (e.requested_qty_purchase ?? ''),
+                  isDirect ? '—' : (e.effective_qty_purchase ?? ''),
+                  isDirect ? '—' : (e.issued_qty_purchase ?? ''),
+                  e.department_name, isDirect ? '—' : e.req_number,
                   e.issuer, e.unit_cost?.toFixed?.(2), (e.unit_cost_incl_gst ?? e.unit_cost)?.toFixed?.(2),
                   e.value?.toFixed?.(2), (e.value_incl_gst ?? e.value)?.toFixed?.(2),
                   e.tax_known ? e.tax_percent : '',
-                  e.purpose, e.event_name, e.note].map(escape).join(','));
+                  e.purpose, e.event_name, e.note,
+                  isDirect ? 'Direct' : 'Requisition'].map(escape).join(','));
     }
     const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8' });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
-    a.download = `store-issued-log-${from}_to_${to}.csv`;
+    // The filename says when the export is a FILTERED slice of the log.
+    const slice = srcFilter === 'all' ? '' : (srcFilter === 'direct' ? '-direct' : '-requisitions');
+    a.download = `store-issued-log-${from}_to_${to}${slice}.csv`;
     a.click();
     URL.revokeObjectURL(a.href);
   };
@@ -2594,11 +2658,33 @@ function IssuedLogPanel({ loading, log, from, to, onFromChange, onToChange }: {
           <input type="date" value={to} onChange={e => onToChange(e.target.value)}
                  className="ml-2 px-2 py-1 border border-[#E8D5C4] rounded text-sm bg-[#FFF8F0]" />
         </label>
+        {/* Source filter — Direct rows are vendor deliveries routed straight to a
+            department (Settings → Direct Issue); they never crossed the store shelf
+            but they ARE goods issued to a department, so they belong on this log. */}
+        <div className="flex items-center gap-1 rounded-lg border border-[#E8D5C4] bg-[#FFF8F0] p-0.5"
+             role="group" aria-label="Filter by source">
+          {([['all', 'All', counts.all], ['requisition', 'Requisitions', counts.requisition], ['direct', 'Direct', counts.direct]] as const).map(([key, label, n]) => (
+            <button key={key} onClick={() => setSrcFilter(key)}
+                    className={`px-2.5 py-1 rounded-md text-xs transition-colors ${srcFilter === key
+                      ? 'bg-[#6B5744] text-white'
+                      : 'text-[#6B5744] hover:bg-[#FFF1E3]'}`}>
+              {label}{n > 0 && <span className="ml-1 opacity-70">({n})</span>}
+            </button>
+          ))}
+        </div>
         <div className="flex-1" />
-        <button onClick={downloadCsv} disabled={events.length === 0}
+        <button onClick={downloadCsv} disabled={shown.length === 0}
                 className="px-3 py-1.5 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded text-sm disabled:opacity-50">
           ⬇ Download CSV
         </button>
+        {/* Aggregation contract, spelled out where the download lives: the CSV's
+            'Issued Qty to Date' is the requisition LINE's cumulative issued
+            quantity and counts requisition hand-overs ONLY — Direct rows print
+            '—' there (and in Requested / Approved: no approval ever happened). */}
+        <div className="w-full text-[10px] text-[#8B7355]">
+          CSV: <span className="font-medium">Issued Qty to Date</span> counts requisition hand-overs only — Direct vendor
+          transfers are excluded and show &ldquo;—&rdquo; in the approval columns.
+        </div>
       </div>
 
       {/* Summary cards */}
@@ -2615,10 +2701,12 @@ function IssuedLogPanel({ loading, log, from, to, onFromChange, onToChange }: {
           <div className="p-8 text-center text-sm text-[#8B7355]">
             <Loader2 className="w-5 h-5 animate-spin inline mr-2" /> Loading…
           </div>
-        ) : events.length === 0 ? (
+        ) : shown.length === 0 ? (
           <div className="p-10 text-center text-sm text-[#8B7355]">
             <CheckCircle2 className="w-7 h-7 mx-auto mb-2 text-emerald-500" />
-            No issue events in this date range.
+            {srcFilter === 'all' ? 'No issue events in this date range.'
+              : srcFilter === 'direct' ? 'No direct vendor transfers in this date range.'
+              : 'No requisition hand-overs in this date range.'}
           </div>
         ) : (
           <div className="overflow-x-auto max-h-[70vh] overflow-y-auto">
@@ -2629,16 +2717,27 @@ function IssuedLogPanel({ loading, log, from, to, onFromChange, onToChange }: {
                   <th className="text-left  py-2 px-2 font-medium">Material</th>
                   <th className="text-right py-2 px-2 font-medium" title="Handed over, in the PURCHASE unit. The small grey line is the recipe equivalent that Value was computed from.">Qty</th>
                   <th className="text-left  py-2 px-2 font-medium">To Dept</th>
-                  <th className="text-left  py-2 px-2 font-medium">Req #</th>
+                  <th className="text-left  py-2 px-2 font-medium"
+                      title="Requisition number — or, on a row tagged Direct, the GRN/bill the vendor-direct delivery arrived on.">Req # / Source</th>
                   <th className="text-left  py-2 px-2 font-medium">Issued By</th>
                   <th className="text-right py-2 px-2 font-medium">Value</th>
                   <th className="text-left  py-2 px-2 font-medium">Note</th>
                 </tr>
               </thead>
               <tbody>
-                {events.map((e, i) => (
-                  <tr key={i} className="border-t border-[#E8D5C4]/50 hover:bg-[#FFF1E3]/30">
-                    <td className="py-1.5 px-2 whitespace-nowrap">{fmtDateTime(e.at)}</td>
+                {shown.map((e, i) => {
+                  const isDirect = srcOf(e) === 'direct';
+                  return (
+                  <tr key={i} className={`border-t border-[#E8D5C4]/50 hover:bg-[#FFF1E3]/30 ${isDirect ? 'bg-amber-50/40' : ''}`}>
+                    {/* A BACKDATED direct receipt files under its BILL date (day
+                        precision — the server sends the day alone rather than
+                        inventing a time); the grey line says when it was entered. */}
+                    <td className="py-1.5 px-2 whitespace-nowrap">
+                      {typeof e.at === 'string' && e.at.length === 10 ? fmtISTDate(e.at) : fmtDateTime(e.at)}
+                      {isDirect && e.backdated && e.posted_at && (
+                        <div className="text-[9px] text-[#B8A590]">entered {fmtISTShort(e.posted_at, { withTz: false })}</div>
+                      )}
+                    </td>
                     <td className="py-1.5 px-2 font-medium text-[#2D1B0E]">
                       {e.material_name}
                       {e.purpose === 'party' && e.event_name && (
@@ -2650,8 +2749,10 @@ function IssuedLogPanel({ loading, log, from, to, onFromChange, onToChange }: {
                         reads as nonsense on a hand-over row ("issued 4 g of butter"),
                         so it is shown underneath only when the two differ, because it
                         is the number the Value column and the stock deduction use.
-                        ?? / || fallbacks keep an older payload rendering. */}
-                    <td className="py-1.5 px-2 text-right font-mono font-semibold text-emerald-700">
+                        ?? / || fallbacks keep an older payload rendering.
+                        A direct-receipt REVERSAL (void / downward amendment) is a
+                        signed negative row — rose, so it cannot read as an issue. */}
+                    <td className={`py-1.5 px-2 text-right font-mono font-semibold ${Number(e.qty) < 0 ? 'text-rose-700' : 'text-emerald-700'}`}>
                       {fmtNum(e.qty_purchase ?? e.qty)}{' '}
                       <span className="text-[9px] text-[#8B7355]">{e.purchase_unit || e.unit}</span>
                       {Number(e.pack_factor) > 1 && (
@@ -2659,14 +2760,26 @@ function IssuedLogPanel({ loading, log, from, to, onFromChange, onToChange }: {
                       )}
                     </td>
                     <td className="py-1.5 px-2 text-[#6B5744]">{e.department_name || '—'}</td>
-                    <td className="py-1.5 px-2 font-mono text-[10px] text-[#8B7355]">{e.req_number}</td>
+                    {/* Requisition number — or, tagged Direct, the GRN/bill the
+                        vendor-direct delivery arrived on. */}
+                    <td className="py-1.5 px-2 font-mono text-[10px] text-[#8B7355]">
+                      {isDirect ? (
+                        <span className="inline-flex items-center gap-1">
+                          <span className="px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 border border-amber-200 font-sans text-[9px] font-semibold uppercase tracking-wide">
+                            Direct
+                          </span>
+                          {e.source_ref || '—'}
+                        </span>
+                      ) : e.req_number}
+                    </td>
                     <td className="py-1.5 px-2 text-[#6B5744]">{e.issuer || '—'}</td>
                     <td className="py-1.5 px-2 text-right font-mono">
-                      {e.value > 0 ? '₹' + Math.round(e.value).toLocaleString('en-IN') : '—'}
+                      {Number(e.value) ? '₹' + Math.round(e.value).toLocaleString('en-IN') : '—'}
                     </td>
                     <td className="py-1.5 px-2 text-[#8B7355]">{e.note || '—'}</td>
                   </tr>
-                ))}
+                  );
+                })}
               </tbody>
             </table>
           </div>
