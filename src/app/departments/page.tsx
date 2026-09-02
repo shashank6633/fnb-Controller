@@ -9,6 +9,7 @@
 import React, { useEffect, useState } from 'react';
 import { Building, Plus, Edit, Save, X, Loader2 } from 'lucide-react';
 import { api } from '@/lib/api';
+import DeviationRoutingReadiness from '@/components/DeviationRoutingReadiness';
 
 interface User { id: string; name: string; email: string; role: string; is_active?: number; is_head_chef?: number; }
 interface CategoryCount { category: string; count: number }
@@ -177,6 +178,16 @@ export default function DepartmentsPage() {
           You're viewing the department list in read-only mode. Sign in as an admin to add or edit departments.
         </div>
       )}
+
+      {/* Off-PO deviation alert routing readiness.
+          ADMIN ONLY, matching the New / Edit / Save controls above and the
+          admin-only gate on every mutating route in /api/departments; the API
+          behind it re-checks and 403s, so this is a mirror, not the gate.
+          It deliberately does NOT read the head columns already loaded into
+          `depts` — those are empty on every department in the live database
+          while the alert still routes through the Head Chef flag, so a panel
+          built on them would report the opposite of what happens. */}
+      {!loading && isAdmin && <DeviationRoutingReadiness />}
 
       <div className="bg-white border border-[#E8D5C4] rounded-xl">
         {loading ? (

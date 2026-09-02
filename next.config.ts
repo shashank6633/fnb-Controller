@@ -57,13 +57,48 @@ const nextConfig: NextConfig = {
    * Static assets under /_next/static/* keep their long-cache headers because
    * their filenames are hash-stamped (each deploy generates new ones, so
    * stale cache hits are safe).
+   *
+   * ── /api/customer/menu-image IS THE SAME EXEMPTION, EARNED THE SAME WAY ──
+   * Dish photos for the guest QR menu are served from a BLOB by
+   * src/app/api/customer/menu-image/[id]/route.ts, and that route asks for
+   * `public, max-age=31536000, immutable`. IT DOES NOT GET IT UNLESS IT IS
+   * NAMED HERE: headers() is applied by the routing layer AFTER the handler
+   * runs and OVERWRITES a same-key header the handler set, so before this
+   * exemption existed the route's own Cache-Control was silently replaced by
+   * the no-store above. Measured on a real request, that is exactly what came
+   * back out of the route:
+   *   Cache-Control: no-store, no-cache, must-revalidate, max-age=0
+   * The effect is not cosmetic. The guest menu re-fetches on every scan, so
+   * every dish photo would be re-downloaded in full, every time, by every
+   * guest, on restaurant mobile data — tens of MB a night to serve bytes the
+   * phone already had.
+   *
+   * Immutable is honest here for the same reason the hash-stamped chunks are:
+   * THE ID IS A CONTENT HANDLE, NOT A SLOT. menu_item_images rows are only ever
+   * INSERTed — replacing an item's photo writes a NEW row under a NEW random id
+   * and repoints menu_items.image_url at it — so the bytes behind a given URL
+   * can never change, and a cached copy can never go stale. (This is also why
+   * the URL needs no ?v= token.)
+   *
+   * The carve-out is exactly as wide as that one route: every other path,
+   * including every other /api/customer/* endpoint, still gets no-store. The
+   * menu JSON itself is deliberately NOT exempt.
    */
   async headers() {
     return [
       {
+        // Long-cache the immutable dish-photo blobs. Listed BEFORE the
+        // no-store rule for readability only — the rule below cannot match
+        // this path anyway, because it is in that rule's negative lookahead.
+        source: '/api/customer/menu-image/:id',
+        headers: [
+          { key: 'Cache-Control', value: 'public, max-age=31536000, immutable' },
+        ],
+      },
+      {
         // Match every path EXCEPT _next/static (which has hash-stamped names
-        // and benefits from immutable caching).
-        source: '/((?!_next/static|_next/image|favicon|icon-|apple-touch-icon).*)',
+        // and benefits from immutable caching) and the dish-photo blobs above.
+        source: '/((?!_next/static|_next/image|favicon|icon-|apple-touch-icon|api/customer/menu-image).*)',
         headers: [
           { key: 'Cache-Control', value: 'no-store, no-cache, must-revalidate, max-age=0' },
           { key: 'Pragma',        value: 'no-cache' },

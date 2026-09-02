@@ -2,6 +2,7 @@ import { getDb, generateId, logAuditEvent } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
 import { buildRecipeMatcher } from '@/lib/recipe-matcher';
 import { MAX_CATEGORY_LEN, ensureMenuCategory, sanitizeCategoryName, findMenuCategory } from '@/lib/menu-category';
+import { findStationRow, stationSpellingForWrite } from '@/lib/station-master';
 
 interface ImportRow {
   category?: string;
@@ -18,7 +19,39 @@ interface ImportRow {
   pos_id?: string;
   /** Stable menu_items.id from our own export — preferred match key (survives renames). */
   item_id?: string;
+  /**
+   * Values the IMPORTER DERIVED for what the sheet does not say — a column it
+   * does not carry, or a cell it left blank: the recipe template's
+   * category→station map, its initials item code, its 5% tax, the dietary tag
+   * read out of the item name. A derived value is a GUESS, so it seeds a NEW
+   * item and NOTHING ELSE: an existing item preserves what it has. (It used to
+   * also fill a blank field on an existing one — that is how a sheet with no
+   * Station column silently wrote 'tandoor' onto blank-station items while the
+   * report said they "kept their station". The one surviving fill is
+   * `fallback.station`, behind the explicit fill_station_from_category opt-in
+   * below, and only for names the station master actually has.)
+   */
+  fallback?: {
+    station?: string;
+    item_code?: string;
+    tax_value?: number;
+    dietary_tag?: string;
+  };
 }
+
+/** The sheet columns this route understands, by the ImportRow field they fill. */
+const FILE_FIELDS = [
+  'category', 'selling_price', 'listing_price', 'master_status', 'item_type',
+  'tax_value', 'item_code', 'station', 'dietary_tag', 'pos_id',
+] as const;
+type FileField = (typeof FILE_FIELDS)[number];
+
+/** Column captions for the report, so it names what the file did not carry. */
+const FIELD_LABEL: Record<FileField, string> = {
+  category: 'Category', selling_price: 'Selling Price', listing_price: 'Listing Price',
+  master_status: 'Master Status', item_type: 'Item Type', tax_value: 'Tax Value',
+  item_code: 'Item Code', station: 'Station', dietary_tag: 'Dietary Tag', pos_id: 'POS ID',
+};
 
 // Typo fixes
 const TYPO_MAP: Record<string, string> = {
@@ -89,18 +122,39 @@ export async function POST(request: Request) {
     const actorEmail = me?.email || '';
     const outletId = await getCurrentOutletId();
     const body = await request.json();
-    const { rows, overwrite_existing = false, fix_typos = true, strip_spaces = true, skip_inactive = false, skip_zero_price = false, link_materials = true } = body as {
+    const { rows, overwrite_existing = false, fix_typos = true, strip_spaces = true, skip_inactive = false, skip_zero_price = false, link_materials = true, present_columns, fill_station_from_category = false } = body as {
       rows: ImportRow[];
       overwrite_existing?: boolean;
       fix_typos?: boolean;
       strip_spaces?: boolean;
       skip_inactive?: boolean;
       skip_zero_price?: boolean;
+      /**
+       * THE COLUMNS THE SHEET ACTUALLY CARRIED (ImportRow field names), as read
+       * off its header row by the importer. See `supplied()` below: this is what
+       * lets the route tell "the file has no Station column" from "the file has
+       * a Station column and this cell is blank".
+       */
+      present_columns?: string[];
       // Auto-link unmatched items to a raw material by EXACT name/SKU only.
       // Right for the POS/liquor import (BUDWEISER → material), but wrong for a
       // food menu where every item should be a recipe — a food menu sends
       // link_materials=false so a soup never links to "TOMATO KETCHUP".
       link_materials?: boolean;
+      /**
+       * EXPLICIT OPT-IN, DEFAULT OFF: let the recipe template's hard-coded
+       * category→station map (import-parse.ts, `fallback.station`) put a
+       * station on items that have NONE — new items, and existing items whose
+       * station is blank. Even opted in, a map value never OVERWRITES a
+       * station, and a name the station master cannot resolve is never written
+       * (it lands in station_fill_skipped_not_in_master instead — the map is a
+       * free-typed guess, not the master). OFF — the default, and what every
+       * caller that does not say otherwise gets — means a sheet with no
+       * Station column touches NO station at all. HIGH-A was this fill running
+       * unasked: 5 blank-station items silently became 'tandoor' while the
+       * report counted the same 5 as "kept their station".
+       */
+      fill_station_from_category?: boolean;
     };
 
     if (!rows || !Array.isArray(rows) || rows.length === 0) {
@@ -110,14 +164,66 @@ export async function POST(request: Request) {
     const report = {
       items_created: 0,
       items_updated: 0,
+      // is_active flips this import actually performed: the Master Status
+      // column was present, the CELL said something, and it differed from the
+      // stored value. A blank status cell used to read as the literal 'Active'
+      // — which re-activated all 131 retired items and was reported nowhere
+      // (HIGH-B). Blank now preserves, and a real flip is counted here.
+      items_reactivated: 0,
+      items_deactivated: 0,
       items_skipped_inactive: 0,
       items_skipped_zero_price: 0,
       items_skipped_duplicate: 0,
       items_linked_to_recipe: 0,
       items_linked_to_material: 0,
       items_unlinked: 0,
-      // Rows where material linking was requested but no EXACT name/SKU match
-      // existed — reported for manual review instead of prefix-guessing a link.
+      // ── WHAT THE FILE DID NOT SAY ──────────────────────────────────────────
+      // A column the sheet does not carry is not an instruction to erase the
+      // value (see `supplied()`), and "items_updated: 9" said nothing at all
+      // about that. These name it.
+      //
+      // Columns the sheet had no header for. Every existing item this import
+      // touched KEPT what it already had in each of them.
+      columns_absent: [] as string[],
+      // Updated items that kept their existing value, per column.
+      fields_preserved: {} as Record<string, number>,
+      // The subset of fields_preserved where the column WAS in the file and
+      // that row's CELL was blank. A blank cell is not a statement — the
+      // literals that used to be substituted there ('Active', 'foods', 5% GST,
+      // an initials code, a derived dietary tag) overwrote real values and were
+      // reported nowhere. Now the cell preserves, and is counted apart from
+      // the absent-column preserves so the report says which of the two
+      // happened.
+      blank_cells_preserved: {} as Record<string, number>,
+      // Station is the one that moves a printed ticket to a different physical
+      // printer, so it is counted on its own line rather than buried in the map.
+      stations_preserved: 0,   // file had no Station column → station untouched
+      stations_changed: 0,     // file HAD a Station column and it wrote a different station
+      stations_cleared: 0,     // file HAD a Station column and it was blank → station emptied
+      // An item with NO station given one from the recipe template's
+      // category→station map — ONLY when the user explicitly opted in
+      // (fill_station_from_category), and only with a name the station master
+      // resolves. 0 whenever the flag is off. These items are NOT counted in
+      // stations_preserved: HIGH-A was exactly that double-speak (the fill ran
+      // unasked AND its items were reported as "kept their station").
+      stations_filled_from_category: 0,
+      // Map values the opt-in fill REFUSED because the station master does not
+      // have them. The map is a hard-coded guess (see import-parse.ts) — a name
+      // off the master routes nowhere, so it is skipped and named rather than
+      // written. Empty whenever the flag is off.
+      station_fill_skipped_not_in_master: [] as string[],
+      // Items left with NO station after this import. They do not match a
+      // station printer, so their KOT falls through to the food/bar fallback.
+      items_without_station: 0,
+      // Station strings this import WROTE that station_departments (the station
+      // master) does not have. Written anyway — refusing one would be a new way
+      // for an import to lose data — but named, because nothing else on this
+      // path checks them and a station off the master routes nowhere.
+      stations_not_in_master: [] as string[],
+      // NEW items where material linking was requested but no EXACT name/SKU
+      // match existed — reported for manual review instead of prefix-guessing a
+      // link. Existing items are not counted here: an import never attempts to
+      // link one (their still-unlinked names appear in unlinked_items instead).
       materials_unmatched: 0,
       materials_unmatched_items: [] as string[],
       typos_fixed: [] as string[],
@@ -155,8 +261,109 @@ export async function POST(request: Request) {
       errors: [] as string[],
     };
 
-    // Load existing menu items, recipes & materials for linking
-    const existingItems = db.prepare('SELECT id, name, item_code FROM menu_items').all() as any[];
+    // ── WHICH COLUMNS DID THE FILE ACTUALLY CARRY? ──────────────────────────
+    // A column that is ABSENT from the sheet is not an instruction to erase the
+    // value. Only a column that is PRESENT and deliberately empty can be.
+    //
+    // This route used to write `row.station || ''` (and the same for category,
+    // item code, dietary tag, price, tax, type, status) unconditionally on
+    // every overwrite, so a sheet that never mentioned Station — a POS export, a
+    // hand-built price list — silently emptied menu_items.station on every item
+    // it matched. That string IS the KOT routing key (print.ts matches it
+    // against print_stations.station), so the ticket moved to a different
+    // physical printer and the report said only "items_updated".
+    //
+    // `present_columns` is the header the importer read, and when it is given it
+    // is the authority: a listed column writes what its cells STATE, an
+    // unlisted one is PRESERVED from the existing item.
+    //
+    // AND THE SAME RULE PER CELL: a listed column whose cell is BLANK on some
+    // row is not a statement about that row either. The importer omits the
+    // field for that row (undefined — see import-parse.ts), so `supplied()` is
+    // false and the item preserves, counted in blank_cells_preserved. The one
+    // deliberate exception is Station, where a blank cell in a present column
+    // has always been the counted, reported instruction to CLEAR
+    // (stations_cleared) — the importer sends '' there, so it still writes.
+    //
+    // When it is NOT given — an older browser tab that has not reloaded, or a
+    // script posting rows by hand — absent and blank are indistinguishable, so
+    // the reading is the conservative one: a value is written when it is
+    // non-empty and preserved when it is empty. That refuses such a caller a
+    // deliberate clear (it must send present_columns to get one); it can never
+    // erase a station nobody mentioned.
+    const declared = Array.isArray(present_columns)
+      ? new Set(present_columns.map((c) => String(c)))
+      : null;
+    /**
+     * What the importer used to put in a field whose column the sheet did NOT
+     * have: '' for the strings, 0 for the numbers, and the literals 'foods' and
+     * 'Active' for type and status. Without `present_columns` those are
+     * indistinguishable from a real value, so in that legacy path they read as
+     * "the file did not say" and the item keeps what it has. A caller that
+     * means one of them literally — price 0, tax 0, type foods, status Active —
+     * says so by sending present_columns.
+     */
+    const isLegacyFiller = (field: FileField, v: unknown): boolean => {
+      const s = String(v).trim();
+      if (s === '') return true;
+      switch (field) {
+        case 'item_type': return normalizeItemType(v) === 'foods';
+        case 'master_status': return s.toLowerCase() === 'active';
+        case 'selling_price':
+        case 'listing_price':
+        case 'tax_value': return Number(v) === 0;
+        default: return false;
+      }
+    };
+    const supplied = (row: ImportRow, field: FileField): boolean => {
+      const v = (row as unknown as Record<string, unknown>)[field];
+      if (v === undefined || v === null) return false;  // key absent ⇒ nothing to write, ever
+      if (declared) return declared.has(field);
+      return !isLegacyFiller(field, v);
+    };
+    if (declared) {
+      report.columns_absent = FILE_FIELDS.filter((f) => !declared.has(f)).map((f) => FIELD_LABEL[f]);
+    }
+    const notePreserved = (f: FileField) => {
+      report.fields_preserved[FIELD_LABEL[f]] = (report.fields_preserved[FIELD_LABEL[f]] || 0) + 1;
+    };
+    // Was this row's cell blank in a column the file DOES carry? The parser
+    // sends undefined for such a cell, so it is distinguishable from an absent
+    // column only through `declared`.
+    const blankCellIn = (row: ImportRow, f: FileField): boolean => {
+      const v = (row as unknown as Record<string, unknown>)[f];
+      return !!declared && declared.has(f) && (v === undefined || v === null);
+    };
+    // Count a preserve — and when it happened because a present column left
+    // THIS cell blank, say that too, so the report separates "no such column"
+    // from "column there, cell empty".
+    const notePreservedCell = (row: ImportRow, f: FileField) => {
+      notePreserved(f);
+      if (blankCellIn(row, f)) {
+        report.blank_cells_preserved[FIELD_LABEL[f]] = (report.blank_cells_preserved[FIELD_LABEL[f]] || 0) + 1;
+      }
+    };
+    const isBlank = (v: unknown) => v === undefined || v === null || String(v).trim() === '';
+    const noteFillSkipped = (s: string) => {
+      if (s && !report.station_fill_skipped_not_in_master.includes(s)) {
+        report.station_fill_skipped_not_in_master.push(s);
+      }
+    };
+
+    // Load existing menu items, recipes & materials for linking.
+    // The rest of the columns are read because they are what an absent column
+    // PRESERVES — the update below rewrites the whole row, so a field the file
+    // did not carry has to be written back as it stands.
+    // recipe_id/material_id ride along so "is this item still unlinked?" is
+    // answerable at the write — an import never changes an existing item's
+    // links (see the candidate block in the loop), it only NAMES the ones that
+    // remain unlinked for review.
+    const existingItems = db.prepare(`
+      SELECT id, name, category, station, item_type, dietary_tag, selling_price,
+             listing_price, item_code, tax_value, cgst_percent, sgst_percent, is_active,
+             recipe_id, material_id
+      FROM menu_items
+    `).all() as any[];
     const existingMap = new Map<string, any>();
     for (const m of existingItems) existingMap.set(m.name.toLowerCase().trim(), m);
     const existingById = new Map<string, any>(existingItems.map((m) => [String(m.id), m]));
@@ -199,6 +406,17 @@ export async function POST(request: Request) {
 
     // Track what we've inserted in this batch (by normalized name) to detect in-batch duplicates
     const batchNames = new Map<string, number>();
+
+    // Every distinct station string this import actually wrote — checked
+    // against the station master AFTER the transaction (see below).
+    const stationsWritten = new Set<string>();
+    // The station counters are counted BY ITEM, not by row: a file that lists
+    // the same item twice must not report two items keeping their station.
+    const stationPreservedIds = new Set<string>();
+    const stationChangedIds = new Set<string>();
+    const stationClearedIds = new Set<string>();
+    const stationFilledIds = new Set<string>();
+    const noStationIds = new Set<string>();
 
     /**
      * MASTER-CATEGORY UPSERT for one row's category. RETURNS the string the
@@ -301,15 +519,18 @@ export async function POST(request: Request) {
           normalized = withoutTypos;
         }
 
-        // Check status filter
+        // Check status filter. Gated on the column EXISTING: a file with no
+        // Master Status column says nothing about any item's status, so it can
+        // neither skip a row as inactive nor (below) re-activate one.
         const isActive = row.master_status?.toLowerCase() !== 'inactive';
-        if (skip_inactive && !isActive) {
+        if (skip_inactive && supplied(row, 'master_status') && !isActive) {
           report.items_skipped_inactive++;
           continue;
         }
 
+        // Same for ₹0: a file with no price column has no ₹0 in it to skip.
         const sellingPrice = Number(row.selling_price) || 0;
-        if (skip_zero_price && sellingPrice === 0) {
+        if (skip_zero_price && supplied(row, 'selling_price') && sellingPrice === 0) {
           report.items_skipped_zero_price++;
           continue;
         }
@@ -322,33 +543,27 @@ export async function POST(request: Request) {
           report.duplicates_found.push(normalized);
         }
 
-        // Link to recipe by fuzzy name match
+        // ── LINK CANDIDATES — FOR NEW ITEMS ONLY ────────────────────────────
+        // The fuzzy recipe matcher and the exact material lookup (full-name or
+        // SKU equality; the old first-word-prefix fallback mass-assigned
+        // "Mango Kulfi" → "MANGO PICKLE 5 KG" and is gone) produce CANDIDATES
+        // here, and a NEW item takes them. An EXISTING item's links are NEVER
+        // touched: no sheet carries a recipe/material column, so a derived
+        // match writing one is the same absent-column disease as the station
+        // fill — it used to re-point a hand-linked item on every reimport
+        // (COALESCE(?, recipe_id) with a fresh match), and even the fill-a-blank
+        // version wrote wrong guesses ("Margherita NSP", a pizza, filled with
+        // the "Margarita" cocktail recipe — whose stock then deducts on every
+        // KOT). Links on existing items belong to the item form and the
+        // recipe-link audit, not to a CSV that never mentioned them. The
+        // counters moved with the decision, so a skipped row — or an existing
+        // item simply keeping its links — no longer inflates
+        // items_linked_to_recipe / materials_unmatched.
         const rm = matchRecipe(normalized);
-        let recipeId: string | null = rm ? rm.id : null;
-        if (recipeId && rm) {
-          report.items_linked_to_recipe++;
-          report.recipe_links.push({ item: normalized, recipe: rm.name, score: rm.score });
-        }
-
-        // Link to material for direct-sale items (beer/wine/bottles).
-        // EXACT-ONLY: case-insensitive full-name equality or exact SKU. The old
-        // first-word-prefix fallback mass-assigned wrong materials on round-trip
-        // ("Mango Kulfi" → "MANGO PICKLE 5 KG") — a miss is reported for manual
-        // linking instead of guessed.
-        let materialId: string | null = null;
-        if (!recipeId && link_materials) {
-          materialId = materialMap.get(nameKey) || materialSkuMap.get(nameKey) || null;
-          if (materialId) {
-            report.items_linked_to_material++;
-          } else {
-            report.materials_unmatched++;
-            report.materials_unmatched_items.push(normalized);
-          }
-        }
-
-        if (!recipeId && !materialId) {
-          report.items_unlinked++;
-          report.unlinked_items.push(normalized);
+        const recipeCandidate: string | null = rm ? rm.id : null;
+        let materialCandidate: string | null = null;
+        if (!recipeCandidate && link_materials) {
+          materialCandidate = materialMap.get(nameKey) || materialSkuMap.get(nameKey) || null;
         }
 
         // Existing item? Prefer the STABLE Item ID (from our own menu export) —
@@ -356,36 +571,209 @@ export async function POST(request: Request) {
         // sheets that carry no id.
         const byId = row.item_id ? existingById.get(String(row.item_id).trim()) : undefined;
         const existing = byId || existingMap.get(nameKey);
+        const fb = row.fallback || {};
         if (existing) {
           if (!overwrite_existing) {
             report.items_skipped_duplicate++;
             continue;
           }
-          const cleanCat = noteCategory(row.category);
-          const ug = gstSplit(Number(row.tax_value) || 0);
+          // ── EVERY FIELD: WHAT THE FILE SAID, OR WHAT THE ITEM ALREADY HAS ──
+          // The UPDATE rewrites the whole row, so each column the file did not
+          // carry is written back unchanged. `existing` is the row as it stands
+          // (and is mutated at the end of this branch, so a second row for the
+          // same item later in the same file preserves what the first wrote).
+          const keep = <T,>(f: FileField, fromFile: T, current: T): T => {
+            if (supplied(row, f)) return fromFile;
+            notePreservedCell(row, f);
+            return current;
+          };
+          // Category: noteCategory() is called ONLY when the file carried the
+          // column AND this cell said something — it is what grows the category
+          // master, and neither a missing column nor a blank cell must mint
+          // anything.
+          let cleanCat: string;
+          if (supplied(row, 'category')) {
+            cleanCat = noteCategory(row.category);
+          } else {
+            notePreservedCell(row, 'category');
+            cleanCat = (existing.category ?? '') as string;
+          }
+
+          // Station.
+          //
+          // Values the FILE states go through stationSpellingForWrite(): a
+          // spelling that resolves on the master ("Tandoor", a BOM-prefixed
+          // cell) lands as the master's own bytes — the file's case split one
+          // section's KOTs in two exactly like the form path once did — and
+          // an off-master string is written cleaned-verbatim and reported in
+          // stations_not_in_master as before. A PRESERVED station is written
+          // back untouched: "kept it" means the stored string.
+          //
+          // A sheet with NO Station column touches NOTHING here (HIGH-A: the
+          // template's category→station map used to fill a blank station
+          // unasked — 5 items moved ''→'tandoor' — while stationPreservedIds
+          // had already counted those very items as "kept their station").
+          // The fill exists only behind the explicit fill_station_from_category
+          // opt-in, writes only names the station master resolves (as the
+          // master's own bytes), and its items are counted as FILLED — never
+          // as preserved.
+          const prevStation = (existing.station ?? '') as string;
+          let stationOut = prevStation;
+          if (supplied(row, 'station')) {
+            stationOut = stationSpellingForWrite(db, row.station);
+            if (stationOut !== prevStation) {
+              if (!stationOut) stationClearedIds.add(existing.id);
+              else stationChangedIds.add(existing.id);
+            }
+          } else {
+            const wantFill = fill_station_from_category && isBlank(prevStation) && !isBlank(fb.station);
+            const fillRow = wantFill ? findStationRow(db, fb.station) : null;
+            if (fillRow) {
+              stationOut = fillRow.station;       // the master's own spelling
+              stationFilledIds.add(existing.id);
+            } else {
+              if (wantFill) noteFillSkipped(String(fb.station).trim());
+              stationPreservedIds.add(existing.id);
+              notePreservedCell(row, 'station');
+            }
+          }
+          if (!stationOut) noStationIds.add(existing.id);
+          else stationsWritten.add(stationOut);
+
+          // Preserved item_type is written back RAW (not re-normalised): "kept
+          // it" has to mean the stored string, not a tidied version of it.
+          const typeOut = keep('item_type', normalizeItemType(row.item_type) || 'foods',
+                               (String(existing.item_type ?? '').trim() || 'foods'));
+          // The derived dietary tag and initials item code (fallback.*) seed
+          // NEW items only — an existing item's blank is not filled from them.
+          // Same disease as HIGH-A's station fill: a sheet that never carried
+          // the column changed the item, and the report called it preserved.
+          const dietOut = keep('dietary_tag', row.dietary_tag || '', (existing.dietary_tag ?? '') as string);
+          const priceOut = keep('selling_price', sellingPrice, Number(existing.selling_price) || 0);
+          const listOut = keep('listing_price', Number(row.listing_price) || 0, Number(existing.listing_price) || 0);
+          const codeOut = keep('item_code', row.item_code || '', (existing.item_code ?? '') as string);
+          // Tax keeps the invariant tax_value = cgst + sgst whichever way it
+          // goes: the file's number is re-split, a preserved one is written back
+          // with the item's own halves. `fallback.tax_value` (the template's
+          // flat 5%) is deliberately NOT used to fill an existing item — an
+          // existing 0 is how liquor is taxed, not a blank waiting to be filled.
+          // (row.tax_value is a real number whenever supplied() is true: the
+          // parser's numCell sends undefined for a blank or unparseable cell,
+          // and parses a literal '0' as 0 — the `Number(cell) || 5` substitution
+          // that wrote 5% GST onto liquor lines stating 0% was HIGH-C.)
+          let ug: { tax: number; cgst: number; sgst: number };
+          if (supplied(row, 'tax_value')) {
+            ug = gstSplit(Number(row.tax_value) || 0);
+          } else {
+            notePreservedCell(row, 'tax_value');
+            ug = {
+              tax: Number(existing.tax_value) || 0,
+              cgst: Number(existing.cgst_percent) || 0,
+              sgst: Number(existing.sgst_percent) || 0,
+            };
+          }
+          const prevActive = existing.is_active ? 1 : 0;
+          const activeOut = keep('master_status', isActive ? 1 : 0, prevActive);
+          if (activeOut !== prevActive) {
+            if (activeOut) report.items_reactivated++;
+            else report.items_deactivated++;
+          }
+          // pos_id has always been preserved by the SQL itself
+          // (COALESCE(NULLIF(?,''), pos_id)) — counted here only so the report
+          // is complete about what this file left alone.
+          if (!supplied(row, 'pos_id')) notePreservedCell(row, 'pos_id');
+
+          // Links: an existing item's recipe/material links are NEVER touched
+          // by an import (see the candidate block above) — NULL through the
+          // COALESCE preserves both. An item that comes out of this import
+          // still unlinked is worth a review, so it is named, but no linking
+          // was attempted on it and materials_unmatched does not count it.
+          if (!existing.recipe_id && !existing.material_id) {
+            report.items_unlinked++;
+            report.unlinked_items.push(normalized);
+          }
+
           updateItem.run(
             normalized,
-            cleanCat, row.station || '', normalizeItemType(row.item_type) || 'foods', row.dietary_tag || '',
-            sellingPrice, Number(row.listing_price) || 0, row.item_code || '',
-            ug.tax, ug.cgst, ug.sgst, isActive ? 1 : 0, recipeId, materialId, row.pos_id || '',
+            cleanCat, stationOut, typeOut, dietOut,
+            priceOut, listOut, codeOut,
+            ug.tax, ug.cgst, ug.sgst, activeOut, null, null, row.pos_id || '',
             existing.id
           );
           // Keep the name index current so a rename can't spawn a duplicate
-          // from a later row in the same file.
+          // from a later row in the same file...
           existingMap.set(nameKey, existing);
+          // ...and the row image current, so a second row for the same item in
+          // this file preserves what the first row wrote, not the pre-import
+          // value.
+          Object.assign(existing, {
+            name: normalized, category: cleanCat, station: stationOut, item_type: typeOut,
+            dietary_tag: dietOut, selling_price: priceOut, listing_price: listOut,
+            item_code: codeOut, tax_value: ug.tax, cgst_percent: ug.cgst, sgst_percent: ug.sgst,
+            is_active: activeOut,
+          });
           report.items_updated++;
         } else {
-          const cleanCat = noteCategory(row.category);
+          // NEW item: there is nothing to preserve, so an absent column falls
+          // back to the value the importer derived, then to today's default.
+          const cleanCat = supplied(row, 'category') ? noteCategory(row.category) : '';
           const id = generateId();
-          const ig = gstSplit(Number(row.tax_value) || 0);
+          // Station: what the FILE states is written (master's own bytes when
+          // the spelling resolves; cleaned-verbatim and named in
+          // stations_not_in_master when it does not). The category→station MAP
+          // seeds a new item ONLY behind the same explicit
+          // fill_station_from_category opt-in as the update branch, and only
+          // with a name the master resolves — with the flag off (the default),
+          // a sheet with no Station column creates the item with no station,
+          // which items_without_station then counts.
+          let stationNew = '';
+          if (supplied(row, 'station')) {
+            stationNew = stationSpellingForWrite(db, row.station);
+          } else if (fill_station_from_category && !isBlank(fb.station)) {
+            const fillRow = findStationRow(db, fb.station);
+            if (fillRow) {
+              stationNew = fillRow.station;
+              stationFilledIds.add(id);
+            } else {
+              noteFillSkipped(String(fb.station).trim());
+            }
+          }
+          if (!stationNew) noStationIds.add(id);
+          else stationsWritten.add(stationNew);
+          const codeNew = supplied(row, 'item_code') ? (row.item_code || '') : String(fb.item_code ?? '');
+          const dietNew = supplied(row, 'dietary_tag') ? (row.dietary_tag || '') : String(fb.dietary_tag ?? '');
+          const ig = gstSplit(supplied(row, 'tax_value') ? Number(row.tax_value) || 0 : Number(fb.tax_value) || 0);
+          // A new item takes its link candidates as-is, and that is when they
+          // are counted.
+          if (recipeCandidate && rm) {
+            report.items_linked_to_recipe++;
+            report.recipe_links.push({ item: normalized, recipe: rm.name, score: rm.score });
+          } else if (materialCandidate) {
+            report.items_linked_to_material++;
+          }
+          if (!recipeCandidate && !materialCandidate) {
+            report.items_unlinked++;
+            report.unlinked_items.push(normalized);
+            if (link_materials) {
+              report.materials_unmatched++;
+              report.materials_unmatched_items.push(normalized);
+            }
+          }
           insertItem.run(
-            id, normalized, cleanCat, row.station || '',
-            normalizeItemType(row.item_type) || 'foods', row.dietary_tag || '',
-            sellingPrice, Number(row.listing_price) || 0, row.item_code || '',
-            ig.tax, ig.cgst, ig.sgst, isActive ? 1 : 0, recipeId, materialId, row.pos_id || ''
+            id, normalized, cleanCat, stationNew,
+            normalizeItemType(row.item_type) || 'foods', dietNew,
+            sellingPrice, Number(row.listing_price) || 0, codeNew,
+            ig.tax, ig.cgst, ig.sgst, isActive ? 1 : 0, recipeCandidate, materialCandidate, row.pos_id || ''
           );
           report.items_created++;
-          existingMap.set(nameKey, { id, name: normalized });
+          existingMap.set(nameKey, {
+            id, name: normalized, category: cleanCat, station: stationNew,
+            item_type: normalizeItemType(row.item_type) || 'foods', dietary_tag: dietNew,
+            selling_price: sellingPrice, listing_price: Number(row.listing_price) || 0,
+            item_code: codeNew, tax_value: ig.tax, cgst_percent: ig.cgst, sgst_percent: ig.sgst,
+            is_active: isActive ? 1 : 0,
+            recipe_id: recipeCandidate, material_id: materialCandidate,
+          });
         }
       }
 
@@ -411,6 +799,31 @@ export async function POST(request: Request) {
     });
 
     doImport();
+
+    report.stations_preserved = stationPreservedIds.size;
+    report.stations_changed = stationChangedIds.size;
+    report.stations_cleared = stationClearedIds.size;
+    report.stations_filled_from_category = stationFilledIds.size;
+    report.items_without_station = noStationIds.size;
+
+    // ── THE STATION STRING IS A KEY, NOT A LABEL ────────────────────────────
+    // Nothing on this path REFUSES it — refusing would be a new way for an
+    // import to lose data. A spelling that RESOLVES on the master was written
+    // as the master's own bytes (stationSpellingForWrite above), so it can
+    // never appear here. What can: a hand-typed "Pan Asian", a name that was
+    // renamed in the master since the sheet was exported, or a value from the
+    // importer's hard-coded category→station map (a FOURTH copy of these
+    // names — see src/app/menu-items/import-parse.ts) — written
+    // cleaned-verbatim, matching no print_stations row and no department, so
+    // it is NAMED here. station_departments is the master (src/lib/station-master.ts).
+    try {
+      for (const s of stationsWritten) {
+        if (!findStationRow(db, s)) report.stations_not_in_master.push(s);
+      }
+    } catch {
+      // The master is unreadable (missing table on a half-migrated DB). Report
+      // nothing rather than fail an import that has already been committed.
+    }
 
     // Dedupe typos list
     report.typos_fixed = [...new Set(report.typos_fixed)];

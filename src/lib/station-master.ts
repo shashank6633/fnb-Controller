@@ -47,15 +47,17 @@ import { BAR_STATIONS } from './kot-section';
  *     inserted 'served', nothing re-runs it. The fix is in that route: resolve
  *     the station from menu_items by menu_item_id (it already re-reads the item
  *     for tax_value), not from the payload.
- *  2. src/app/api/menu-items/import/route.ts:335,349 writes menu_items.station
- *     verbatim from the CSV — no canonicalisation, no master check — so
- *     re-importing a sheet exported before a rename puts the dead name back on
- *     every row it covers, and "Pan Asian" in a hand-edited column becomes a
- *     station nothing routes.
+ *  2. src/app/api/menu-items/import/route.ts writes menu_items.station from
+ *     the CSV with no master REFUSAL (refusing there loses data; it reports
+ *     off-master strings instead) — so re-importing a sheet exported before a
+ *     rename puts the dead name back on every row it covers, and "Pan Asian"
+ *     in a hand-edited column becomes a station nothing routes. It does now
+ *     write through stationSpellingForWrite(), so a spelling that RESOLVES on
+ *     the master ("Tandoor", a BOM-prefixed cell) lands as the master's own
+ *     bytes; only genuinely unknown strings still go in verbatim.
  *
- * Both are PRE-EXISTING and both files belong to other work; neither was
- * touched. They are recorded here because they are the paths that can undo what
- * this module guarantees.
+ * Writer 1 is PRE-EXISTING and belongs to other work; it is recorded here
+ * because it is a path that can undo what this module guarantees.
  */
 
 /* ── local, defensive schema probes ─────────────────────────────────────────
@@ -106,6 +108,31 @@ const NAME_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
  * production.
  */
 export const normStationKey = (s: unknown): string => String(s ?? '').trim().toLowerCase();
+
+/**
+ * Characters that LOOK like nothing but are bytes all the same: the zero-widths
+ * (U+200B/200C/200D, U+2060 word joiner) and U+FEFF (the BOM, which a CSV
+ * saved from Excel puts in front of the first cell). JS `trim()` strips the
+ * BOM and NBSP but NOT the zero-widths; SQLite's `trim()` strips NONE of them
+ * (ASCII space only). A station that differs from a real one only by such a
+ * character passes a lower(trim()) master check on the JS side, stores
+ * verbatim, and then no SQLite-side lower(trim()) predicate — applyStationRename's
+ * UPDATEs, settings' GROUP BY — can ever reach it again: the row is STRANDED on
+ * a spelling nothing can type. So the save path removes them before it looks
+ * anything up.
+ */
+const INVISIBLE_CHARS_RE = /[\u200B\u200C\u200D\u2060\uFEFF]/g;
+
+/**
+ * The incoming value of a station WRITE, cleaned for LOOKUP: invisibles
+ * removed, Unicode whitespace (NBSP included) trimmed from the ends. Case is
+ * left alone — folding is the lookup's job (normStationKey), and what gets
+ * STORED is never this string anyway but the master row's own spelling (see
+ * checkStationOnSave).
+ */
+export function normStationInput(raw: unknown): string {
+  return String(raw ?? '').replace(INVISIBLE_CHARS_RE, '').trim();
+}
 
 /**
  * The typed name, written the house way.
@@ -206,6 +233,162 @@ export function findStationRow(db: Database.Database, name: unknown): StationMas
     ).get(key) as StationMasterRow | undefined;
     return r ? { ...r, is_active: Number(r.is_active ?? 1) } : null;
   } catch { return null; }
+}
+
+/* ── WHAT MAY BE WRITTEN ONTO A MENU ITEM ────────────────────────────────── */
+
+export type StationSaveCheck =
+  /** `store` is THE string the caller must write — never the incoming value. */
+  | { ok: true; store: string }
+  | { ok: false; error: string };
+
+/**
+ * MAY THIS STRING BE STORED IN `menu_items.station`?
+ *
+ * The item form now locks its Station control to the master, but a locked
+ * dropdown is a courtesy, not a boundary: POST/PUT /api/menu-items take
+ * `station` from the request body and write it verbatim, and everything under
+ * /api/menu-items is reachable by ANY signed-in session (proxy.ts proves the
+ * cookie and the CSRF double-submit; it does not check page access for APIs).
+ * A station matching no master row and no print_stations row falls through
+ * resolveKotPrinter()'s station match to the food/bar `kind` fallback, so the
+ * ticket PRINTS ON A DIFFERENT PHYSICAL BOX — with no error anywhere. That is
+ * the same silent unbinding applyStationRename()'s all-or-nothing exists to
+ * prevent, arriving through the front door instead. So the master is enforced
+ * where the write happens.
+ *
+ * THREE THINGS ARE ALLOWED, and what is STORED is decided here too — the
+ * caller writes `store`, never the incoming string:
+ *
+ *  1. BLANK. "No station" is a real, chosen state — the item form offers it,
+ *     628 of 628 live items are non-blank so nothing depends on it today, and
+ *     a blank simply resolves 'unmapped' and skips, which is the house rule for
+ *     a station nobody has mapped. Refusing it would be a new restriction this
+ *     guard has no business inventing. Stored as '' — the one spelling of
+ *     blank every reader agrees on — not as whatever whitespace arrived.
+ *
+ *  2. A STATION ON THE MASTER — stored as THE MASTER ROW'S OWN SPELLING.
+ *     This is the line that killed two proven production defects. The check
+ *     matches lower(trim()) (the way every reader matches), so "Tandoor",
+ *     " tandoor " and NBSP-"tandoor" all PASSED it — and the routes then
+ *     stored the client's bytes VERBATIM. kot-fire.ts groups a fired order by
+ *     the RAW string, so one order with items on "Tandoor" and "tandoor"
+ *     fired TWO KOTs, two numbers, for one physical section. Worse, a value
+ *     JS trim() strips but SQLite trim() does not (NBSP, BOM, tab, newline)
+ *     passed here, stored verbatim, and was then UNREACHABLE by every
+ *     SQLite-side lower(trim()) predicate: applyStationRename() moved
+ *     everything else and STRANDED those rows on the dead name while
+ *     reporting success, and settings' GROUP BY lower(trim(station)) split
+ *     them into phantom stations. Writing the master's exact string makes
+ *     every spelling of a station byte-identical AT THE SOURCE, which is the
+ *     only place the fix holds: every downstream comparison — JS or SQL,
+ *     case-sensitive or not — then agrees.
+ *
+ *  3. THE HELD VALUE — the EXACT string the row already stores, when it is
+ *     NOT resolvable on the master (rule 2 already covers it when it is, and
+ *     cleans its drift in passing). Without this, one legacy item whose
+ *     station is off-master (a CSV import's "Pan Asian", a value written
+ *     before this guard existed) becomes permanently UNEDITABLE: the form
+ *     posts the whole item, so fixing its PRICE would be refused for a
+ *     station field nobody touched. Borrowed straight from the menu-category
+ *     work, which offers an item's own off-master category back to it for
+ *     exactly this reason. Stored verbatim — rewriting a legacy value this
+ *     module cannot resolve would be guessing.
+ *
+ * The lookup key is normStationInput() — invisibles stripped, Unicode
+ * whitespace trimmed — folded by findStationRow() to lower case for the match
+ * ONLY. The incoming string is never stored on rules 1 and 2.
+ *
+ * ── COLLATION, SAID OUT LOUD ───────────────────────────────────────────────
+ * The category work was bitten by this: `menu_categories.name` is declared
+ * COLLATE NOCASE and a bare `=` INHERITS THE COLUMN'S COLLATION, so a lookup
+ * meant to be exact silently matched case-insensitively and renamed the wrong
+ * row. Both columns here happen to declare no collation today
+ * (`menu_items.station TEXT DEFAULT ''`, `station_departments.station TEXT
+ * PRIMARY KEY` — both BINARY, verified against the live schema), but "happens
+ * to" is precisely what that bug was made of. So:
+ *
+ *  · The HELD-VALUE test is `===` IN JAVASCRIPT, on the string read back from
+ *    the row. No SQL comparison happens at all, so there is no collation to
+ *    inherit and no way for a later `ALTER`/table rebuild that adds COLLATE
+ *    NOCASE to menu_items.station to quietly turn this exact test into a
+ *    case-insensitive one. Exact means exact bytes, permanently.
+ *  · The MASTER test is findStationRow(), whose SQL is
+ *    `lower(trim(station)) = ?`. The left operand is a FUNCTION RESULT, not a
+ *    column reference, so it carries no implicit collation and the comparison
+ *    is BINARY on the normalised key — which is deliberate: it is byte-for-byte
+ *    the match every production reader uses (resolveStationDepartment,
+ *    resolveKotPrinter, the KDS). Asking a stricter question than the readers
+ *    ask would refuse a value that routes perfectly well; asking a looser one
+ *    would accept a value they cannot route.
+ *
+ * ── FAILS CLOSED WHEN THE MASTER IS UNREADABLE ─────────────────────────────
+ * If `station_departments` is absent, every station is unverifiable and this
+ * refuses — but rules 1 and 3 still stand, so every existing item keeps saving
+ * every other field and only a station CHANGE is blocked. Accepting anything
+ * because the check could not run is how a guard becomes decorative.
+ */
+export function checkStationOnSave(
+  db: Database.Database,
+  incoming: unknown,
+  currentStored: string | null | undefined,
+): StationSaveCheck {
+  const value = String(incoming ?? '');
+  const cleaned = normStationInput(value);
+
+  // 1. Blank — "no station", a chosen state. Stored as '' whatever whitespace
+  //    or invisibles actually arrived.
+  if (!cleaned) return { ok: true, store: '' };
+
+  // 2. On the master, matched the way every reader matches — and stored as the
+  //    MASTER'S own spelling, never the client's bytes (see the header: this
+  //    line is what makes every spelling of one station byte-identical).
+  const master = findStationRow(db, cleaned);
+  if (master) return { ok: true, store: master.station };
+
+  // 3. The held value: byte-for-byte what the row already stores. JS ===, so
+  //    no column collation can ever loosen it (see the header). Only reached
+  //    when the master cannot resolve it — a resolvable held value took
+  //    rule 2 and its drift is cleaned by that very save.
+  if (currentStored != null && value === String(currentStored)) return { ok: true, store: value };
+
+  if (!tableExists(db, 'station_departments')) {
+    return {
+      ok: false,
+      error:
+        `The station list is not available on this server, so "${value}" cannot be checked and will not be stored. ` +
+        'A station that is not on the list routes nowhere — its KOT falls through to the printer fallback and prints on a different machine. ' +
+        'Leave the station as it is (an unchanged station always saves) or clear it.',
+    };
+  }
+  return {
+    ok: false,
+    error:
+      `"${value}" is not on the station list, so nothing can route it: its KOT would match no printer bound to a station and fall through to the food/bar fallback — it would print on a different machine, with no error anywhere. ` +
+      `Stations are ${STATION_CONVENTION}. Pick one an admin has added under Settings → Station → Department Map, leave the station blank, or leave it exactly as it is.`,
+  };
+}
+
+/**
+ * The spelling a WRITE should use for `raw` when the write is not allowed to
+ * refuse: the master row's own string when the value resolves on the master,
+ * otherwise the cleaned value verbatim (invisibles stripped, ends trimmed).
+ *
+ * This is the CSV importer's version of checkStationOnSave's rule 2. The
+ * importer deliberately accepts off-master stations (refusing one there is a
+ * new way for an import to lose data — it reports them in
+ * stations_not_in_master instead), but there was no reason for it to keep the
+ * FILE'S casing of a station that IS on the master: "Tandoor" in a hand-edited
+ * column was stored verbatim and split the section's KOTs exactly like the
+ * form path did. Resolvable spellings now land on the master's bytes; only a
+ * genuinely unknown string is written as it came (cleaned), and the report
+ * still names it.
+ */
+export function stationSpellingForWrite(db: Database.Database, raw: unknown): string {
+  const cleaned = normStationInput(raw);
+  if (!cleaned) return '';
+  const master = findStationRow(db, cleaned);
+  return master ? master.station : cleaned;
 }
 
 /* ── WHAT A STATION IS WORTH, AND WHAT A CHANGE WOULD TOUCH ──────────────── */

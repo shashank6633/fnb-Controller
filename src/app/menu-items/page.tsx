@@ -5,6 +5,27 @@ import { createPortal } from 'react-dom';
 import { api } from '@/lib/api';
 import TabScroller from '@/components/TabScroller';
 import Toggle from '@/components/Toggle';
+import MenuImageUpload from './_components/MenuImageUpload';
+// The admin's view of the uploaded-photo blobs, and the ONLY place in the app
+// that can delete one. It used to happen by itself on every upload, which cost
+// live photos; it is a deliberate, previewed action now. See the component and
+// src/lib/menu-image-store.ts.
+import PhotoStorageModal from './_components/PhotoStorageModal';
+// THE house normalisation, imported rather than re-typed. Every reader of a
+// station joins on lower(trim()) — resolveStationDepartment() included — so the
+// question "is this item's station the same station as that master row?" has
+// exactly one right answer and it lives in station-master.ts. (Contrast
+// sanitizeCategoryName/foldCategoryName below, which had to be DUPLICATED into
+// this client because menu-category.ts imports from db.ts and cannot cross the
+// server boundary. station-master.ts imports no value except BAR_STATIONS from
+// the pure kot-section.ts, and settings/station-departments/page.tsx already
+// imports it from a 'use client' page — so this one needs no twin, and adding
+// one would be the drift the comment down there is fighting.)
+import { normStationKey } from '@/lib/station-master';
+// The sheet parser (was inline in handleImportFile). It decides which columns
+// the file actually carried — the difference between "clear this" and "the file
+// never mentioned it", which is what used to wipe menu_items.station.
+import { parseMenuSheet, ALL_IMPORT_COLUMNS, COLUMN_LABEL } from './import-parse';
 import {
   Utensils,
   Plus,
@@ -27,6 +48,7 @@ import {
   ListOrdered,
   EyeOff,
   Eye,
+  HardDrive,
 } from 'lucide-react';
 
 function formatCurrency(value: number): string {
@@ -91,6 +113,35 @@ interface MenuCategory {
   spellings: string[];
 }
 
+/**
+ * A row of the STATION MASTER (`station_departments`, via
+ * /api/settings/station-departments?list=1).
+ *
+ * Same relationship to the item form as MenuCategory above — this decides what
+ * is OFFERED, `menu_items.station` is still the plain string that gets stored —
+ * but the stakes are different, and the difference is worth stating once here
+ * because it drove every choice in the Station control below.
+ *
+ * A CATEGORY is a LABEL: get it wrong and a dish is mis-filed on the menu.
+ * A STATION IS A KEY (src/lib/station-master.ts): kot-fire.ts groups a fired
+ * order by it (one KOT per station), offline-print/print.ts picks the PHYSICAL
+ * PRINTER by matching it against print_stations, kot-section.ts decides from it
+ * whether the ticket shows on the Bar board or the Kitchen board, and
+ * dept-ledger.ts turns it into the department whose stock the recipe leaves.
+ * Get it wrong and a ticket never reaches the section that had to cook it.
+ *
+ * That is why this control locks the value set instead of merely suggesting it,
+ * and equally why it must never rewrite a value it does not recognise.
+ */
+interface StationMasterRow {
+  /** The stored string, exactly as the master holds it — this is what a save writes. */
+  station: string;
+  /** false = "stop deducting stock for this station". NOT "stop cooking here":
+   *  KOTs still print and still reach the section. So a paused station stays
+   *  offered and is MARKED — see the Station control in EditItemModal. */
+  is_active: boolean;
+}
+
 const PAGE_SIZE = 25;
 const TOP_CATS = 8;   // category chips shown inline before the "All N categories" dropdown
 
@@ -126,6 +177,11 @@ export default function MenuItemsPage() {
   const [importSkipInactive, setImportSkipInactive] = useState(false);
   const [importSkipZero, setImportSkipZero] = useState(false);
   const [importOverwrite, setImportOverwrite] = useState(true);
+  // EXPLICIT opt-in (default OFF) for the recipe template's category→station
+  // map: only items with NO station get one, only names on the station master
+  // are written, and the server refuses the rest. Off = a sheet with no
+  // Station column touches no station at all.
+  const [importFillStation, setImportFillStation] = useState(false);
   const importFileRef = useRef<HTMLInputElement>(null);
 
   // Edit modal
@@ -147,6 +203,25 @@ export default function MenuItemsPage() {
   const [catOrphans, setCatOrphans] = useState<{ name: string; item_count: number }[]>([]);
   const [manageCatsOpen, setManageCatsOpen] = useState(false);
   const [renameInitial, setRenameInitial] = useState('');
+
+  // Dish-photo storage (admin only, like the category master beside it — the
+  // /api/menu-items/image/orphans routes require admin and this only decides
+  // whether to offer a button whose every click would otherwise 403).
+  const [photoStorageOpen, setPhotoStorageOpen] = useState(false);
+
+  // The STATION MASTER, for the item form's Station dropdown. Loaded for every
+  // signed-in user for the same reason the category master is: a non-admin
+  // editing a price still opens the form, and a form whose dropdown cannot show
+  // the item's own station is a form that loses it on save.
+  //
+  // `stationsLoaded` is NOT a formality. If this fetch fails the offered list is
+  // empty, and an empty list next to a stored value is exactly the situation
+  // that rewrites data on save — so the control DISABLES itself rather than
+  // guess. Failing closed here costs an admin one reload; failing open costs a
+  // ticket that never printed.
+  const [stationMaster, setStationMaster] = useState<StationMasterRow[]>([]);
+  const [stationSentinels, setStationSentinels] = useState<string[]>([]);
+  const [stationsLoaded, setStationsLoaded] = useState(false);
 
   const [toast, setToast] = useState<{ msg: string; error?: boolean } | null>(null);
 
@@ -198,13 +273,39 @@ export default function MenuItemsPage() {
     }
   }, [showToast]);
 
+  /**
+   * The station master. `?list=1` asks for the master alone — no union with the
+   * stations found in order/KOT data, and none of the settings dashboard's
+   * aggregates. The union is right for the Settings screen (it makes an unmapped
+   * station visible) and wrong here: it would re-offer any stray value already
+   * in the data, which is the self-fulfilling list this dropdown replaces.
+   *
+   * Failure is LOUD and leaves stationsLoaded false, which disables the control.
+   */
+  const fetchStations = useCallback(async () => {
+    try {
+      const res = await fetch('/api/settings/station-departments?list=1');
+      if (!res.ok) {
+        const j: { error?: string } = await res.json().catch(() => ({}));
+        showToast(j.error || `Failed to load stations (HTTP ${res.status})`, true);
+        return;
+      }
+      const json: { stations?: StationMasterRow[]; reserved?: { sentinel?: string[] } } = await res.json();
+      setStationMaster(json.stations || []);
+      setStationSentinels(json.reserved?.sentinel || []);
+      setStationsLoaded(true);
+    } catch {
+      showToast('Failed to load stations — check your connection', true);
+    }
+  }, [showToast]);
+
   useEffect(() => {
     (async () => {
       setLoading(true);
-      await Promise.all([fetchItems(), fetchCats()]);
+      await Promise.all([fetchItems(), fetchCats(), fetchStations()]);
       setLoading(false);
     })();
-  }, [fetchItems, fetchCats]);
+  }, [fetchItems, fetchCats, fetchStations]);
 
   // Effective role — used ONLY to decide whether to show the "Rename category"
   // control. Failure is silent and simply hides it; the API's own 403 is the
@@ -326,7 +427,29 @@ export default function MenuItemsPage() {
     try {
       const XLSX = await import('xlsx');
       const buffer = await file.arrayBuffer();
-      const wb = XLSX.read(buffer, { type: 'array' });
+      // Decode guard: xlsx treats BOM-less CSV text as CP1252, which mojibakes
+      // UTF-8 bytes — our own exports carried no BOM until 2026-09, so files
+      // downloaded before then corrupt non-ASCII names on reimport. If the
+      // upload is not a binary workbook and its bytes strictly validate as
+      // UTF-8, decode them ourselves and hand xlsx the string. Pure-ASCII text
+      // decodes identically on both paths; genuine CP1252 (Excel "CSV (ANSI)")
+      // fails the strict check and keeps the old path; .xlsx (PK zip) and .xls
+      // (CFB) never reach the text decoder.
+      const bytes = new Uint8Array(buffer);
+      const isBinaryWorkbook =
+        (bytes[0] === 0x50 && bytes[1] === 0x4b) || // .xlsx — zip magic "PK"
+        (bytes[0] === 0xd0 && bytes[1] === 0xcf);   // .xls — CFB magic
+      let decodedText: string | null = null;
+      if (!isBinaryWorkbook) {
+        try {
+          decodedText = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+        } catch {
+          decodedText = null; // not valid UTF-8 — let xlsx apply its default
+        }
+      }
+      const wb = decodedText !== null
+        ? XLSX.read(decodedText, { type: 'string' })
+        : XLSX.read(buffer, { type: 'array' });
 
       // Detect format: Akan POS export, AKAN Recipe Template, or generic
       let sheetName = wb.SheetNames.find(n => /existing.*product|products/i.test(n))
@@ -335,111 +458,22 @@ export default function MenuItemsPage() {
       const sheet = wb.Sheets[sheetName];
       const rows = XLSX.utils.sheet_to_json<any>(sheet, { header: 1, defval: null });
 
-      // Find header row — scan first 5 rows for one that has "name" or "product name" or "menu item"
-      let headerRowIdx = 0;
-      for (let i = 0; i < Math.min(5, rows.length); i++) {
-        const r = rows[i];
-        if (!r) continue;
-        const hasName = r.some((c: any) => c && /^(menu\s*item|item\s*name|product\s*name|name|category\s*name)$/i.test(String(c).trim()));
-        if (hasName) { headerRowIdx = i; break; }
-      }
-
-      const header = rows[headerRowIdx] || [];
-      const colIdx: Record<string, number> = {};
-      header.forEach((h: any, i: number) => {
-        if (!h) return;
-        const key = String(h).toLowerCase().trim();
-        // Stable identifier from OUR export — matches the exact item even on rename
-        if ((key === 'item id' || key === 'menu item id') && colIdx.itemId === undefined) colIdx.itemId = i;
-        // Category column — "Category Name" (POS) or "Category" (template)
-        else if ((key === 'category name' || key === 'category') && colIdx.category === undefined) colIdx.category = i;
-        // Name column — "Product Name" (POS) or "Menu Item" (template)
-        else if ((key === 'product name' || key === 'menu item' || key === 'item name' || key === 'name') && colIdx.name === undefined) colIdx.name = i;
-        else if (key === 'selling price' || key === 'selling price (₹)' || key === 'price') colIdx.sellingPrice = i;
-        else if (key === 'listing price') colIdx.listingPrice = i;
-        else if (key === 'master status' || key === 'status') colIdx.masterStatus = i;
-        else if (key === 'item type' || key === 'type') colIdx.itemType = i;
-        else if (key === 'tax value' || key === 'tax') colIdx.taxValue = i;
-        else if (key === 'item code' || key === 'code') colIdx.itemCode = i;
-        // Recaho POS mapped code — exported as "POS ID"; without this the
-        // round-trip re-import drops pos_id and sales-import matching breaks.
-        else if (key === 'pos id' || key === 'pos_id' || key === 'mapped code') colIdx.posId = i;
-        else if (key === 'station') colIdx.station = i;
-        else if (key === 'dietary tag' || key === 'veg/non-veg' || key === 'veg / non-veg') colIdx.dietaryTag = i;
-        else if (key === 'cuisine') colIdx.cuisine = i;
-      });
-
-      // If template format detected (has "cuisine", "menu item", or "item name"), apply category → station mapping
-      const isTemplate = colIdx.cuisine !== undefined || /menu\s*item|item\s*name/i.test(String(header[colIdx.name ?? 0] || ''));
-      const stationMap: Record<string, string> = {
-        'Bar Bites': 'bar', 'Burgers / Sandwiches': 'continental', 'Desserts': 'bakery',
-        'Dimsums/Baos': 'pan-asian', 'Grills': 'tandoor', 'Live Grills': 'terracegrill',
-        'Non-Veg Main Course': 'indian', 'Pasta': 'continental', 'Pizzas': 'pizza',
-        'Pulaos / Biryanis/ Noodles': 'indian', 'Salads': 'continental',
-        'Small Plates - Veg': 'tandoor', 'Soups': 'continental', 'Starters Non-Veg': 'tandoor',
-        'Sushi': 'sushi', 'Veg - Main Course': 'indian',
-      };
-      // Case-insensitive station lookup — this sheet's categories are UPPERCASE.
-      const stationLower: Record<string, string> = {};
-      for (const [k, v] of Object.entries(stationMap)) stationLower[k.toLowerCase()] = v;
-      const stationFor = (cat: string) => stationMap[cat] || stationLower[cat.toLowerCase()] || '';
-      const vegNormalize = (v: any): string => {
-        if (!v) return '';
-        const s = String(v).toUpperCase().trim();
-        if (s === 'VEG') return 'Veg';
-        if (s === 'NON-VEG' || s === 'NONVEG') return 'Non-Veg';
-        if (s === 'EGG') return 'Egg';
-        if (s.includes('VEG') && s.includes('NON')) return 'Non-Veg';
-        return String(v).trim();
-      };
-      // When the sheet has no dietary column, infer from the item name first, then
-      // the category (e.g. "NON-VEG MAIN COURSE", "SMALL PLATES - VEG").
-      const deriveDietary = (cat: string, name: string): string => {
-        const n = name.toLowerCase();
-        if (/\b(chicken|mutton|lamb|fish|prawn|prawns|crab|seafood|keema|kheema)\b/.test(n)) return 'Non-Veg';
-        if (/\begg\b/.test(n)) return 'Egg';
-        const c = cat.toUpperCase();
-        if (c.includes('NON-VEG') || c.includes('NON VEG')) return 'Non-Veg';
-        if (c.includes('VEG')) return 'Veg';
-        return '';
-      };
-      const slugify = (c: string) => c.toLowerCase().replace(/\s*\/\s*/g, '-').replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
-
-      // Start parsing from row after header
-      const parsedRows: any[] = [];
-      for (let i = headerRowIdx + 1; i < rows.length; i++) {
-        const r = rows[i];
-        if (!r || !r[colIdx.name]) continue;
-
-        const rawCategory = String(r[colIdx.category] || '').trim();
-        const name = String(r[colIdx.name] || '').trim();
-        const cuisine = colIdx.cuisine !== undefined ? String(r[colIdx.cuisine] || '').trim() : '';
-
-        parsedRows.push({
-          item_id: colIdx.itemId !== undefined ? String(r[colIdx.itemId] || '').trim() : '',
-          name,
-          category: isTemplate && rawCategory ? slugify(rawCategory) : rawCategory,
-          selling_price: Number(r[colIdx.sellingPrice]) || 0,
-          listing_price: Number(r[colIdx.listingPrice]) || 0,
-          master_status: String(r[colIdx.masterStatus] || 'Active').trim(),
-          item_type: String(r[colIdx.itemType] || 'foods').trim() || 'foods',
-          tax_value: Number(r[colIdx.taxValue]) || (isTemplate ? 5 : 0),
-          item_code: String(r[colIdx.itemCode] || '').trim() || (isTemplate ? name.split(' ').map((w: string) => w[0] || '').join('').toUpperCase().slice(0, 5) : ''),
-          station: String(r[colIdx.station] || '').trim() || (isTemplate ? stationFor(rawCategory) : ''),
-          // Only send pos_id when the sheet has the column — absent stays
-          // undefined (dropped by JSON.stringify) so the server preserves it.
-          pos_id: colIdx.posId !== undefined ? String(r[colIdx.posId] || '').trim() : undefined,
-          dietary_tag: vegNormalize(r[colIdx.dietaryTag]) || deriveDietary(rawCategory, name),
-          notes: isTemplate && cuisine ? `Cuisine: ${cuisine}` : '',
-        });
-      }
+      // The parser lives in ./import-parse so the "an absent column preserves,
+      // it does not erase" rule can be executed and checked outside React.
+      const { rows: parsedRows, isTemplate, presentColumns } = parseMenuSheet(rows);
+      const has = (c: string) => presentColumns.includes(c);
 
       // Compute preview stats
       const active = parsedRows.filter(r => r.master_status?.toLowerCase() !== 'inactive').length;
       const withTypos = parsedRows.filter(r => /COSMOPOLTIAN|GLENMORNGIE|HEINKEIN|HOEGARDEN|BUDWISER|VERMOTH|EXPRESSO|TOBASCO|CARDMOM|BTTL/i.test(r.name)).length;
       const withExtraSpaces = parsedRows.filter(r => r.name !== r.name.replace(/\s+/g, ' ').trim() || /  /.test(r.name)).length;
-      const withZeroPrice = parsedRows.filter(r => !r.selling_price).length;
-      const foodsNoTag = parsedRows.filter(r => r.item_type === 'foods' && !r.dietary_tag).length;
+      // Only meaningful when the sheet HAS the column: a file with no price
+      // column has no ₹0 in it, and counting one per row read as "this import
+      // will zero 600 prices" — which is exactly what it used to do. Counted as
+      // LITERAL zeros only: a blank price cell is omitted by the parser and
+      // preserves the item's price, so it is not a ₹0 the skip switch acts on.
+      const withZeroPrice = has('selling_price') ? parsedRows.filter(r => r.selling_price === 0).length : 0;
+      const foodsNoTag = has('dietary_tag') ? parsedRows.filter(r => r.item_type === 'foods' && !r.dietary_tag).length : 0;
 
       // In-file duplicates
       const nameCounts = new Map<string, number>();
@@ -455,8 +489,12 @@ export default function MenuItemsPage() {
         typos: withTypos, spaces: withExtraSpaces,
         zeroPrice: withZeroPrice, foodsNoTag, duplicates: dupes,
         categories: [...new Set(parsedRows.map(r => r.category).filter(Boolean))].length,
+        // Columns this file does NOT have. Named BEFORE the upload, because
+        // "what will this import leave alone?" is the question the Overwrite
+        // switch actually asks.
+        missingColumns: ALL_IMPORT_COLUMNS.filter(c => !presentColumns.includes(c)).map(c => COLUMN_LABEL[c]),
       });
-      setImportPayload({ rows: parsedRows, isTemplate });
+      setImportPayload({ rows: parsedRows, isTemplate, present_columns: presentColumns });
     } catch (err: any) {
       setImportResult({ error: err.message });
     }
@@ -479,6 +517,10 @@ export default function MenuItemsPage() {
           // Food menus (template format) link to recipes only — never auto-link a
           // dish to a raw material by prefix (a soup must not become "TOMATO KETCHUP").
           link_materials: !importPayload.isTemplate,
+          // The category→station map fill runs ONLY when its checkbox below is
+          // ticked. Unticked (the default), a sheet with no Station column
+          // leaves every station exactly as it is — new items included.
+          fill_station_from_category: importFillStation,
         },
       });
       const json = await res.json();
@@ -756,6 +798,13 @@ export default function MenuItemsPage() {
                   <span className="hidden sm:inline">Manage categories</span><span className="sm:hidden">Categories</span>
                 </button>
               )}
+              {isAdmin && (
+                <button onClick={() => setPhotoStorageOpen(true)} title="See how much space uploaded dish photos use, and reclaim the ones nothing points at"
+                        className="flex items-center gap-1.5 px-3 py-1.5 rounded-full border border-[#E0D0BE] bg-white text-[#6B5744] hover:bg-[#FFF1E3] text-xs font-medium whitespace-nowrap transition-colors shrink-0">
+                  <HardDrive className="w-3.5 h-3.5" />
+                  <span className="hidden sm:inline">Photo storage</span><span className="sm:hidden">Photos</span>
+                </button>
+              )}
               <div className="relative shrink-0">
                 <button onClick={() => setCatMenuOpen(!catMenuOpen)} className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full border text-xs font-medium whitespace-nowrap transition-colors ${catMenuOpen ? 'bg-[#af4408] text-white border-[#af4408]' : 'bg-white text-[#6B5744] border-[#E0D0BE] hover:bg-[#FFF1E3]'}`}>
                   All {categories.length} categories <ChevronDown className="w-3.5 h-3.5" />
@@ -926,10 +975,30 @@ export default function MenuItemsPage() {
                     {importPreview.zeroPrice > 0 && <StatBlock label="Zero Price" value={importPreview.zeroPrice} color="text-red-500" />}
                   </div>
 
+                  {/* Said BEFORE the upload, next to the Overwrite switch,
+                      because "what will this file leave alone?" is the question
+                      that switch is really asking. A column the sheet does not
+                      have is not an instruction to erase the value. */}
+                  {importPreview.missingColumns?.length > 0 && (
+                    <div className="bg-[#FFF8F0] border border-[#E8D5C4] rounded-lg p-3 text-xs">
+                      <p className="text-[#6B5744]">
+                        No {importPreview.missingColumns.join(', ')} column{importPreview.missingColumns.length === 1 ? '' : 's'} in this file. Existing items KEEP what they already have there — only the columns above are written.
+                      </p>
+                    </div>
+                  )}
+
                   <div className="space-y-2 text-xs">
                     <label className="flex items-center gap-2 cursor-pointer"><input type="checkbox" checked={importOverwrite} onChange={e => setImportOverwrite(e.target.checked)} className="accent-purple-600 w-4 h-4" /><span className="text-[#6B5744]">Overwrite existing items with same name</span></label>
                     <label className="flex items-center gap-2 cursor-pointer"><input type="checkbox" checked={importSkipInactive} onChange={e => setImportSkipInactive(e.target.checked)} className="accent-purple-600 w-4 h-4" /><span className="text-[#6B5744]">Skip inactive items ({importPreview.inactive} will be excluded)</span></label>
                     <label className="flex items-center gap-2 cursor-pointer"><input type="checkbox" checked={importSkipZero} onChange={e => setImportSkipZero(e.target.checked)} className="accent-purple-600 w-4 h-4" /><span className="text-[#6B5744]">Skip items with ₹0 selling price ({importPreview.zeroPrice} will be excluded)</span></label>
+                    {/* Offered ONLY when it could do anything: a template file
+                        with no Station column. Default OFF — the map is a
+                        hard-coded guess, so writing it must be asked for, and
+                        the server refuses any map name the station list does
+                        not have. */}
+                    {importPayload?.isTemplate && !importPayload?.present_columns?.includes('station') && (
+                      <label className="flex items-start gap-2 cursor-pointer"><input type="checkbox" checked={importFillStation} onChange={e => setImportFillStation(e.target.checked)} className="accent-purple-600 w-4 h-4 mt-0.5" /><span className="text-[#6B5744]">Give stations to items that have NONE, from the template’s category → station map (a guess — only names already on the station list are written; items that have a station always keep it)</span></label>
+                    )}
                   </div>
 
                   <div className="flex gap-3">
@@ -955,6 +1024,8 @@ export default function MenuItemsPage() {
                         <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs">
                           {importResult.items_created > 0 && <StatBlock label="Created" value={importResult.items_created} color="text-green-600" />}
                           {importResult.items_updated > 0 && <StatBlock label="Updated" value={importResult.items_updated} color="text-blue-600" />}
+                          {importResult.items_reactivated > 0 && <StatBlock label="Re-activated" value={importResult.items_reactivated} color="text-amber-600" />}
+                          {importResult.items_deactivated > 0 && <StatBlock label="Deactivated" value={importResult.items_deactivated} color="text-amber-600" />}
                           {importResult.items_linked_to_recipe > 0 && <StatBlock label="Linked to Recipes" value={importResult.items_linked_to_recipe} color="text-indigo-600" />}
                           {importResult.items_linked_to_material > 0 && <StatBlock label="Linked to Materials" value={importResult.items_linked_to_material} color="text-purple-600" />}
                           {importResult.items_skipped_inactive > 0 && <StatBlock label="Skipped Inactive" value={importResult.items_skipped_inactive} color="text-gray-500" />}
@@ -963,8 +1034,96 @@ export default function MenuItemsPage() {
                           {importResult.typos_fixed?.length > 0 && <StatBlock label="Typos Fixed" value={importResult.typos_fixed.length} color="text-amber-600" />}
                           {importResult.spaces_fixed > 0 && <StatBlock label="Spaces Fixed" value={importResult.spaces_fixed} color="text-amber-600" />}
                           {importResult.created_categories?.length > 0 && <StatBlock label="New Categories" value={importResult.created_categories.length} color="text-[#af4408]" />}
+                          {importResult.stations_preserved > 0 && <StatBlock label="Kept Their Station" value={importResult.stations_preserved} color="text-[#8B5A2B]" />}
+                          {importResult.stations_changed > 0 && <StatBlock label="Station Changed" value={importResult.stations_changed} color="text-amber-600" />}
+                          {importResult.stations_cleared > 0 && <StatBlock label="Station Cleared" value={importResult.stations_cleared} color="text-red-600" />}
                         </div>
                       </div>
+                      {/* WHAT THE FILE DID NOT SAY. A column the sheet does not
+                          have is not an instruction to erase the value — and
+                          "Updated: 9" used to be the only thing said about a run
+                          that had just emptied nine stations. menu_items.station
+                          is the KOT routing key, so name it first and by number. */}
+                      {importResult.columns_absent?.length > 0 && (
+                        <div className="bg-[#FFF8F0] border border-[#E8D5C4] rounded-lg p-3 text-xs">
+                          <p className="font-medium text-[#8B5A2B]">
+                            This file had no {importResult.columns_absent.join(', ')} column{importResult.columns_absent.length === 1 ? '' : 's'} — every item it updated KEPT what it already had there.
+                          </p>
+                          {importResult.stations_preserved > 0 && (
+                            <p className="mt-1 text-[#6B5744]">
+                              <b>{importResult.stations_preserved}</b> item{importResult.stations_preserved === 1 ? '' : 's'} kept {importResult.stations_preserved === 1 ? 'its' : 'their'} existing station, so no KOT changed printer.
+                            </p>
+                          )}
+                          {Object.keys(importResult.fields_preserved || {}).length > 0 && (
+                            <p className="mt-1 text-[#8B7355] break-words">
+                              Left untouched: {Object.entries(importResult.fields_preserved as Record<string, number>).map(([k, v]) => `${k} (${v})`).join(' · ')}
+                            </p>
+                          )}
+                        </div>
+                      )}
+                      {/* Columns the file HAS, on rows where the cell said
+                          nothing. A blank cell is not a statement — it used to
+                          be read as 'Active' / 'foods' / 0 / 5% and silently
+                          rewrote real values (131 retired items re-activated,
+                          ₹ prices zeroed, liquor GST invented). Those items
+                          keep what they have; say so by count. */}
+                      {Object.keys(importResult.blank_cells_preserved || {}).length > 0 && (
+                        <div className="bg-[#FFF8F0] border border-[#E8D5C4] rounded-lg p-3 text-xs">
+                          <p className="font-medium text-[#8B5A2B]">
+                            Blank cells in this file changed nothing — a blank is not a statement, so those items kept their existing value:
+                          </p>
+                          <p className="mt-1 text-[#6B5744] break-words">
+                            {Object.entries(importResult.blank_cells_preserved as Record<string, number>).map(([k, v]) => `${k} (${v})`).join(' · ')}
+                          </p>
+                        </div>
+                      )}
+                      {/* The other direction: the file HAD a Station column and
+                          left cells blank. That IS an instruction to clear, and
+                          a cleared station stops matching a station printer. */}
+                      {importResult.stations_cleared > 0 && (
+                        <div className="bg-red-50 border border-red-200 rounded-lg p-3 text-xs">
+                          <p className="font-medium text-red-700">
+                            {importResult.stations_cleared} item{importResult.stations_cleared === 1 ? '' : 's'} had {importResult.stations_cleared === 1 ? 'its' : 'their'} station CLEARED — this file has a Station column and those cells were blank.
+                          </p>
+                          <p className="mt-1 text-red-600">
+                            An item with no station does not match a station printer: its KOT falls through to the floor’s food/bar printer. {importResult.items_without_station > 0 ? `${importResult.items_without_station} item${importResult.items_without_station === 1 ? '' : 's'} in this file now ${importResult.items_without_station === 1 ? 'has' : 'have'} no station.` : ''} Fix them in the item form, or re-import with the station filled in.
+                          </p>
+                        </div>
+                      )}
+                      {/* A station string that the station master does not have
+                          routes nowhere — no printer matches it and no
+                          department is debited. The import writes it anyway
+                          (dropping it would be a new way to lose data) and
+                          names it here. */}
+                      {importResult.stations_not_in_master?.length > 0 && (
+                        <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 text-xs">
+                          <p className="font-medium text-amber-800">
+                            {importResult.stations_not_in_master.length} station name{importResult.stations_not_in_master.length === 1 ? '' : 's'} in this import {importResult.stations_not_in_master.length === 1 ? 'is' : 'are'} not in the station list:
+                          </p>
+                          <p className="mt-1 text-amber-700 break-words">{importResult.stations_not_in_master.join(' · ')}</p>
+                          <p className="mt-1 text-amber-700">The items were written with {importResult.stations_not_in_master.length === 1 ? 'it' : 'them'}, but a station off the list matches no KOT printer and no department. Add or correct {importResult.stations_not_in_master.length === 1 ? 'it' : 'them'} under <b>Settings → Stations</b>.</p>
+                        </div>
+                      )}
+                      {importResult.stations_filled_from_category > 0 && (
+                        <div className="bg-[#FFF8F0] border border-[#E8D5C4] rounded-lg p-3 text-xs">
+                          <p className="text-[#6B5744]">
+                            {importResult.stations_filled_from_category} item{importResult.stations_filled_from_category === 1 ? '' : 's'} that had NO station were given one from the template’s category → station map, because you ticked the map option. Only names already on the station list were written.
+                          </p>
+                        </div>
+                      )}
+                      {/* Map names the fill REFUSED: the category → station map
+                          is a hard-coded guess, and a name the station list
+                          does not have routes nowhere — so it was skipped, not
+                          written. */}
+                      {importResult.station_fill_skipped_not_in_master?.length > 0 && (
+                        <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 text-xs">
+                          <p className="font-medium text-amber-800">
+                            The category → station map suggested {importResult.station_fill_skipped_not_in_master.length === 1 ? 'a station that is' : 'stations that are'} not on the station list, so {importResult.station_fill_skipped_not_in_master.length === 1 ? 'it was' : 'they were'} NOT written:
+                          </p>
+                          <p className="mt-1 text-amber-700 break-words">{importResult.station_fill_skipped_not_in_master.join(' · ')}</p>
+                          <p className="mt-1 text-amber-700">Those items keep no station (their KOTs use the floor’s food/bar fallback printer). Add the station under <b>Settings → Stations</b> and re-import, or set it in the item form.</p>
+                        </div>
+                      )}
                       {/* An unknown category in the file is ACCEPTED and added to
                           the category list, so it can be corrected afterwards —
                           never refused, never silently dropped. Name them, or the
@@ -1054,7 +1213,8 @@ export default function MenuItemsPage() {
         // from the row actually being edited whatever route got us here. NEW_ITEM
         // has no id; 'new' keeps its key stable so typing into the add form does
         // not remount it out from under the user.
-        <EditItemModal key={editItem.id || 'new'} item={editItem} onClose={() => setEditItem(null)} onSave={saveEdit} menuCategories={menuCats} stations={stations} isNew={!editItem.id} />
+        <EditItemModal key={editItem.id || 'new'} item={editItem} onClose={() => setEditItem(null)} onSave={saveEdit} menuCategories={menuCats}
+                       stationMaster={stationMaster} stationSentinels={stationSentinels} stationsLoaded={stationsLoaded} isAdmin={isAdmin} isNew={!editItem.id} />
       )}
 
       {/* Category master (admin) */}
@@ -1083,6 +1243,16 @@ export default function MenuItemsPage() {
           initial={renameInitial || categoryFilter}
           onClose={() => { setRenameOpen(false); setRenameInitial(''); }}
           onRename={renameCategory}
+        />
+      )}
+
+      {/* Dish photo storage (admin). The one delete path for uploaded photos —
+          dry run first, thumbnails of everything it proposes to remove, and a
+          second click before anything goes. */}
+      {photoStorageOpen && isAdmin && (
+        <PhotoStorageModal
+          onClose={() => setPhotoStorageOpen(false)}
+          onToast={(msg, err) => showToast(msg, err)}
         />
       )}
     </div>
@@ -1723,7 +1893,7 @@ function RenameCategoryModal({ categories, counts, initial, onClose, onRename }:
   );
 }
 
-function EditItemModal({ item, onClose, onSave, menuCategories, stations, isNew }: { item: MenuItem; onClose: () => void; onSave: (updates: any) => Promise<string | null>; menuCategories: MenuCategory[]; stations: string[]; isNew: boolean }) {
+function EditItemModal({ item, onClose, onSave, menuCategories, stationMaster, stationSentinels, stationsLoaded, isAdmin, isNew }: { item: MenuItem; onClose: () => void; onSave: (updates: any) => Promise<string | null>; menuCategories: MenuCategory[]; stationMaster: StationMasterRow[]; stationSentinels: string[]; stationsLoaded: boolean; isAdmin: boolean; isNew: boolean }) {
   // Normalize legacy dirty types ('beverages.') so the Type select never
   // renders blank — and a save writes the clean value back.
   const [form, setForm] = useState({ ...item, item_type: normalizeType(item.item_type) || item.item_type });
@@ -1785,6 +1955,91 @@ function EditItemModal({ item, onClose, onSave, menuCategories, stations, isNew 
     if (activeCategories.some(c => c.name === openedWith)) return null;    // already in the list
     return openedWith;
   }, [openedWith, form.category, activeCategories]);
+
+  /* ── STATION: the same three pieces, and the one place they must differ ──
+   *
+   * What the Station dropdown OFFERS: every master row except the SENTINEL.
+   *
+   * 'kitchen' is not a station. It is kot-fire.ts's blank-station sentinel — a
+   * fired line carrying no station of its own is written out as the literal
+   * string 'kitchen' — and it is ALSO a real master row and a real department
+   * (the main-kitchen roll-up). Offering it would let someone pick, out of a
+   * dropdown, the one value the whole skip rule exists to keep OFF menu items:
+   * every station-less line in the building already lands there, so an item
+   * deliberately put on it becomes indistinguishable from a mistake. The list
+   * comes from the server's own `reserved.sentinel` rather than a fourth
+   * hard-coded copy of the string.
+   *
+   * PAUSED ROWS STAY OFFERED, marked. is_active on this master means "stop
+   * deducting stock", not "stop cooking here" — the Settings screen promises
+   * the owner that pausing does NOT change routing. Hiding them would make that
+   * promise false. Nor is `effective`/unmapped filtered on: 'liquor' (293 live
+   * items) is deliberately unmapped because it lives on the store rail, and a
+   * picker that dropped it would strand more than a third of the menu.
+   */
+  const offeredStations = useMemo(() => {
+    const sentinel = new Set(stationSentinels.map(normStationKey));
+    return stationMaster.filter(s => !sentinel.has(normStationKey(s.station)));
+  }, [stationMaster, stationSentinels]);
+
+  /**
+   * The item's OWN station, when no offered option carries that EXACT string.
+   *
+   * ── WHY EXACT, WHEN EVERY READER MATCHES ON THE KEY ──────────────────────
+   * A <select> selects by exact option value. If the stored string were not an
+   * option verbatim, the select would render with nothing selected and the
+   * first careless click — or a browser that snaps to the first option — would
+   * rewrite the STATION of an item somebody opened only to fix its PRICE. That
+   * is not a mis-filed dish; that is a ticket that stops reaching the section
+   * which has to cook it. So the stored bytes are always an option, and a save
+   * returns the row exactly what it already had.
+   *
+   * The KEY still does real work — in the LABEL. Because production joins on
+   * lower(trim()), an item storing 'Tandoor' routes identically to master row
+   * 'tandoor', and calling that "not on the station list" would be a lie that
+   * invites someone to "fix" a value that is not broken. So membership is
+   * judged with normStationKey (the house normalisation, imported from
+   * station-master.ts) and the option says "same station, different spelling".
+   * The canonical row is offered directly below it, so canonicalising stays a
+   * DELIBERATE pick and never a side effect of saving a price.
+   *
+   * This is the one place the mirror of the Category control diverges, and it
+   * diverges because category is a label and station is a join key. Measured on
+   * the live snapshot when this was written: 0 of 628 items store a station
+   * that differs from lower(trim()) of itself, and 0 store a station with no
+   * master row — so on today's data every branch below is unreachable and the
+   * control is a pure no-op. They exist for the data that arrives tomorrow
+   * through the two writers this master cannot reach (the CSV importer and the
+   * offline replay path, both documented in station-master.ts).
+   */
+  const heldStation = useMemo(() => {
+    const value = form.station || '';
+    if (!value) return null;
+    // THE LIST NEVER ARRIVED. offeredStations is empty, so every membership test
+    // below would come back false and label a perfectly good station "not on the
+    // station list" — a claim we have no evidence for, contradicted one line
+    // down by the notice that says the list failed to load. Say only what is
+    // true: we could not check. The option still carries the stored value, so
+    // the select renders it selected and a save returns it unchanged.
+    if (!stationsLoaded) return { value, why: 'station list unavailable — not checked' };
+    if (offeredStations.some(s => s.station === value)) return null;   // exact option exists
+    const key = normStationKey(value);
+    if (stationSentinels.map(normStationKey).includes(key)) {
+      return { value, why: 'the blank-station placeholder, not a real station' };
+    }
+    if (offeredStations.some(s => normStationKey(s.station) === key)) {
+      return { value, why: 'same station, different spelling — kept exactly as stored' };
+    }
+    return { value, why: 'not on the station list' };
+  }, [form.station, offeredStations, stationSentinels, stationsLoaded]);
+
+  /** The station the item HAD when this modal opened — same undo as category. */
+  const [stationOpenedWith] = useState<string>(item.station || '');
+  const restorableStation = useMemo(() => {
+    if (!stationOpenedWith || stationOpenedWith === (form.station || '')) return null;
+    if (offeredStations.some(s => s.station === stationOpenedWith)) return null;
+    return stationOpenedWith;
+  }, [stationOpenedWith, form.station, offeredStations]);
 
   // onSave (parent saveEdit) handles both create and update, checks res.ok,
   // and returns an error message on failure — modal stays open with the
@@ -1854,9 +2109,65 @@ function EditItemModal({ item, onClose, onSave, menuCategories, stations, isNew 
               )}
             </div>
             <div>
-              <label className="block text-xs font-medium text-[#6B5744] mb-1">Station</label>
-              <input type="text" list="stations" value={form.station} onChange={e => setForm({ ...form, station: e.target.value })} className="w-full px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm" />
-              <datalist id="stations">{stations.map(s => <option key={s} value={s} />)}</datalist>
+              <div className="flex items-baseline justify-between gap-2 mb-1">
+                <label className="block text-xs font-medium text-[#6B5744]">Station</label>
+                {/* A LINK, not a second modal. station_departments is the only
+                    station master there is (a second one is how a station ends
+                    up pickable in one screen and unroutable in the other), and
+                    its screen is adminOnly in page-catalog.ts because every
+                    write behind it is admin — so a non-admin is not offered a
+                    door they cannot open. Contrast "Manage categories", which
+                    can be a modal here because that master has a read path. */}
+                {isAdmin && (
+                  <a href="/settings/station-departments" target="_blank" rel="noopener noreferrer"
+                     title="Add, rename or map the stations this list offers"
+                     className="text-[11px] font-medium text-[#af4408] hover:underline">Manage stations ↗</a>
+                )}
+              </div>
+              {/* THE ONE THAT MUST NOT GO WRONG, and it goes wrong louder than
+                  category does. This string IS the routing: the KOT it joins,
+                  the printer it prints on, the board it appears on, the
+                  department it debits. It used to be a free-text box over a
+                  datalist built from DISTINCT menu_items.station — a list that
+                  offered back whatever had already been typed, so one typo
+                  became a permanent option in its own suggestions. It is now
+                  locked to the master, with the item's own value always
+                  offered and marked. */}
+              <select value={form.station || ''} disabled={!stationsLoaded}
+                      onChange={e => setForm({ ...form, station: e.target.value })}
+                      className="w-full px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm disabled:opacity-60 disabled:cursor-not-allowed">
+                <option value="">— No station —</option>
+                {heldStation && (
+                  <option value={heldStation.value}>
+                    {heldStation.value} — {heldStation.why}
+                  </option>
+                )}
+                {restorableStation && (
+                  <option value={restorableStation}>
+                    {restorableStation} — put it back (its original station)
+                  </option>
+                )}
+                {offeredStations.map(s => (
+                  <option key={s.station} value={s.station}>
+                    {s.station}{s.is_active ? '' : ' — paused (stock deduction off)'}
+                  </option>
+                ))}
+              </select>
+              {!stationsLoaded ? (
+                <p className="text-[10px] text-amber-700 mt-0.5">
+                  Station list didn’t load, so this is locked — the item keeps “{form.station || 'no station'}”. Reload the page to change it.
+                </p>
+              ) : heldStation ? (
+                <p className="text-[10px] text-amber-700 mt-0.5">
+                  This item keeps “{heldStation.value}” — {heldStation.why}. Leave it alone and it routes exactly as it does today; pick another only if you mean to move the item to a different section.
+                </p>
+              ) : !form.station ? (
+                <p className="text-[10px] text-amber-700 mt-0.5">
+                  No station: this item’s KOT is filed under the “kitchen” placeholder and no department’s stock is deducted for it.
+                </p>
+              ) : offeredStations.length === 0 ? (
+                <p className="text-[10px] text-[#8B7355] mt-0.5">No stations on the list yet — an admin can add one under <b>Manage stations</b>.</p>
+              ) : null}
             </div>
           </div>
           <div className="grid grid-cols-3 gap-3">
@@ -1919,10 +2230,23 @@ function EditItemModal({ item, onClose, onSave, menuCategories, stations, isNew 
           {/* Customer QR-menu presentation */}
           <div className="rounded-xl border border-[#E8D5C4] bg-[#FFFBF5] p-4 space-y-3">
             <p className="text-[11px] font-semibold text-[#8B5A2B] uppercase tracking-wide">Customer Menu (QR)</p>
+            {/* Dish photo — two ways in, ONE field out. The uploader squares +
+                shrinks the picked file in the browser and writes the URL it gets
+                back into form.image_url; the input below writes the same field
+                by hand for an externally-hosted image. Neither changes how the
+                item is saved. */}
             <div>
-              <label className="block text-xs font-medium text-[#6B5744] mb-1">Image URL</label>
+              <label className="block text-xs font-medium text-[#6B5744] mb-1">Dish photo</label>
+              <MenuImageUpload
+                value={F.image_url || ''}
+                itemId={item.id || ''}
+                onChange={url => setForm(f => ({ ...f, image_url: url } as any))}
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-[#6B5744] mb-1">…or paste an image URL</label>
               <input type="url" value={F.image_url || ''} onChange={e => setForm({ ...form, image_url: e.target.value } as any)} placeholder="https://…/paneer-tikka.jpg" className="w-full px-3 py-2 bg-white border border-[#D4B896] rounded-lg text-sm" />
-              <p className="text-[10px] text-[#8B7355] mt-0.5">Best: square ~1080×1080px, JPG/WebP, under 300 KB. It’s cropped to fit the card thumbnails and the item photo.</p>
+              <p className="text-[10px] text-[#8B7355] mt-0.5">Uploading fills this in for you. Paste here only for an image already hosted somewhere else. Square works best — it’s cropped to fit the card thumbnails and the item photo.</p>
             </div>
             <div className="grid grid-cols-2 gap-3">
               <div>

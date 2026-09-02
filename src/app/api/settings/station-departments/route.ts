@@ -168,7 +168,7 @@ function groupCount(db: Database.Database, sql: string, params: any[] = []): Map
   return m;
 }
 
-export async function GET() {
+export async function GET(request: Request) {
   try {
     // READ is open to any signed-in user, matching the settings/route.ts
     // precedent: which kitchen a station belongs to is not a secret, only the
@@ -179,6 +179,68 @@ export async function GET() {
 
     const db = getDb();
     const hasMap = tableExists(db, 'station_departments');
+
+    /* ── ?list=1 — WHAT A PICKER NEEDS, AND NOTHING ELSE ───────────────────
+     * The menu-item form builds its Station dropdown from this master (there is
+     * deliberately no second station table — see station-master.ts). But
+     * /menu-items is a hot staff page and the full answer below is a SETTINGS
+     * DASHBOARD: eight aggregate scans over order_items, kots and
+     * consumption_skips to price what each mapping is worth. A dropdown needs
+     * none of it, and making every price edit pay for it is how a page gets
+     * slow for a reason nobody can find later. So: one read of the master, no
+     * aggregates.
+     *
+     * TWO DELIBERATE DIFFERENCES FROM THE FULL ANSWER, both load-bearing:
+     *
+     *  1. THIS IS THE MASTER ALONE — no union with stations found in data. The
+     *     full GET unions menu_items/order_items/kots on purpose, so an
+     *     unmapped station is VISIBLE as unmapped rather than absent. For a
+     *     picker that union would be exactly wrong: it would re-offer any
+     *     stray value already sitting in the data (a CSV import's "Pan Asian",
+     *     a typo saved once) as a legitimate choice, which is the
+     *     self-fulfilling list the dropdown exists to end. An item on such a
+     *     value is not stranded — the form shows the item its OWN value, marked.
+     *  2. NO `effective` / resolveStationDepartment() call. Whether a station
+     *     currently maps to a department is a STOCK question; it has nothing to
+     *     do with whether the station may be cooked at, and answering it here
+     *     would invite a future edit to hide unmapped stations from the picker.
+     *     'liquor' (293 items) and 'sushi' are deliberately unmapped and must
+     *     stay pickable.
+     *
+     * `is_active` IS returned, so the picker can MARK a paused station rather
+     * than hide it: pausing means "stop deducting stock", not "stop cooking
+     * here" (deactivateWarning() promises the owner in as many words that KOTs
+     * still print and still reach the section). Hiding paused rows would make
+     * that promise false and quietly overload one flag with two meanings. */
+    if (new URL(request.url).searchParams.get('list') === '1') {
+      const rows = hasMap
+        ? (db.prepare(
+            `SELECT station, COALESCE(is_active, 1) AS is_active
+               FROM station_departments
+              WHERE trim(COALESCE(station,'')) <> ''
+              ORDER BY lower(trim(station))`,
+          ).all() as Array<{ station: unknown; is_active: unknown }>)
+        : [];
+      return Response.json({
+        mode: 'list',
+        // The STORED string, not the normalised key: it is what a save will
+        // write into menu_items.station, and the house spelling is the one the
+        // master row carries.
+        stations: rows.map((r) => ({
+          station: String(r.station),
+          is_active: Number(r.is_active) === 1,
+        })),
+        // Same shape as the full answer, so the page keys its copy off the
+        // server's list instead of hard-coding 'kitchen' a third time.
+        reserved: {
+          sentinel: [...SENTINEL_STATIONS.keys()],
+          other_rail: [...OTHER_RAIL_STATIONS.keys()],
+        },
+        can_edit: me.role === 'admin',
+        schema_ready: hasMap,
+      });
+    }
+
     const hasSkips = tableExists(db, 'consumption_skips');
     const hasOrderStation = columnExists(db, 'order_items', 'station');
     const hasKotStation = columnExists(db, 'kots', 'station');

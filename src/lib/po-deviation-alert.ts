@@ -368,6 +368,33 @@ export function impactPhrase(c: DeviationCountBreakdown): string {
  * ──────────────────────────────────────────────────────────────────────────*/
 
 /**
+ * PROBE-ONLY SWITCH — passed by routingProbe() and by departmentAlertReadiness(),
+ * NEVER by the real alert path.
+ *
+ * The resolvers below NEVER THROW on the alert path: a receipt already in the
+ * books must still reach the admins even when the department side is broken, so
+ * every internal failure is swallowed, logged, and stated as a gap. That is
+ * deliberate crash-proofing and it stays exactly as it is — no caller that
+ * omits this flag sees any change.
+ *
+ * The READINESS PROBE has the opposite contract. Its entire output is "what the
+ * router just did on this database", and a swallowed exception makes that
+ * output a LIE: an internal failure resolves to the empty audience, which the
+ * readiness view can only read as "nobody is configured" — a calm, wrong,
+ * actionable-looking answer ("Set 'Department head' on Settings ->
+ * Departments") when the truth is "the probe itself failed and the answer is
+ * UNKNOWN". MEASURED on a copy with the users table dropped: every department
+ * read `reach: 'none'` with the full no-HOD remedy sentence and not one word
+ * said anything had failed. So the probe passes `{ rethrow: true }` and the
+ * same catch blocks that swallow for the alert path rethrow for it; the throw
+ * surfaces as an explicit probe-failure state, never as advice.
+ */
+interface ResolveOpts {
+  /** Rethrow internal failures instead of swallowing them. PROBE CALLERS ONLY. */
+  rethrow?: boolean;
+}
+
+/**
  * Every ACTIVE admin, with the tier resolved the way the session resolves it.
  *
  * `roles.base_role` WINS over `users.role` when the user holds a named role —
@@ -377,7 +404,7 @@ export function impactPhrase(c: DeviationCountBreakdown): string {
  * an admin silently missing from an over-receipt alert is precisely the failure
  * being fixed.
  */
-export function activeAdmins(db: Database.Database): { admins: DeviationRecipient[]; gaps: string[] } {
+export function activeAdmins(db: Database.Database, opts?: ResolveOpts): { admins: DeviationRecipient[]; gaps: string[] } {
   const out: DeviationRecipient[] = [];
   const gaps: string[] = [];
   try {
@@ -411,6 +438,7 @@ export function activeAdmins(db: Database.Database): { admins: DeviationRecipien
       });
     }
   } catch (e) {
+    if (opts?.rethrow) throw e; // probe mode: a failure here is a failed probe, not "no admins"
     console.error('[po-deviation-alert] admin lookup failed (non-fatal):', e);
   }
   return { admins: out, gaps };
@@ -423,7 +451,7 @@ export function activeAdmins(db: Database.Database): { admins: DeviationRecipien
  *  points the admin at the wrong screen. */
 type MainDept = DeptRow & { cats: Set<string>; is_active: boolean; head_chef_user_id: string | null };
 
-function mainDepartments(db: Database.Database): MainDept[] {
+function mainDepartments(db: Database.Database, opts?: ResolveOpts): MainDept[] {
   const out: MainDept[] = [];
   try {
     // ORDER BY is not decoration: when two departments claim the same category
@@ -451,6 +479,7 @@ function mainDepartments(db: Database.Database): MainDept[] {
       });
     }
   } catch (e) {
+    if (opts?.rethrow) throw e; // probe mode: a failure here is a failed probe, not "no departments"
     console.error('[po-deviation-alert] department lookup failed (non-fatal):', e);
   }
   return out;
@@ -481,7 +510,25 @@ interface HeadChefIndex {
   /** main department id -> emails of head chefs who are switched off */
   inactive: Map<string, string[]>;
 }
-function headChefsByMainDept(db: Database.Database): HeadChefIndex {
+/**
+ * "IS THIS PERSON A HEAD CHEF?" — ONE SQL FRAGMENT, NEVER TWO.
+ *
+ * The effective flag is the UNION of the per-user column and the assigned
+ * role's column, exactly as getCurrentUser() derives it (auth.ts: `is_head_chef:
+ * !!row.is_head_chef || (hasRole && !!row.role_head_chef)`). Anything that asks
+ * the same question in its own words — a report, a readiness screen — will
+ * eventually be edited on its own and start disagreeing with the alert that
+ * actually fires. This codebase has already paid for that once: see the
+ * "THE FIVE COPIES, and which one actually filters" note in
+ * api/closing-stock/dept-sheet/route.ts, which records that the copies were NOT
+ * byte-identical and that grepping the literal text missed the one that bit.
+ *
+ * Requires the query to alias `users` as u and `roles` as r.
+ */
+const HEAD_CHEF_FLAG_SQL =
+  `(COALESCE(u.is_head_chef, 0) = 1 OR (u.role_id IS NOT NULL AND COALESCE(r.is_head_chef, 0) = 1))`;
+
+function headChefsByMainDept(db: Database.Database, opts?: ResolveOpts): HeadChefIndex {
   const active = new Map<string, string[]>();
   const inactive = new Map<string, string[]>();
   try {
@@ -491,8 +538,7 @@ function headChefsByMainDept(db: Database.Database): HeadChefIndex {
         FROM users u
         LEFT JOIN roles r ON r.id = u.role_id
        WHERE TRIM(COALESCE(u.department_id, '')) <> ''
-         AND (COALESCE(u.is_head_chef, 0) = 1
-              OR (u.role_id IS NOT NULL AND COALESCE(r.is_head_chef, 0) = 1))
+         AND ${HEAD_CHEF_FLAG_SQL}
     `).all() as any[];
     for (const row of rows) {
       const main = mainDeptOf(db, str(row.department_id));
@@ -509,9 +555,32 @@ function headChefsByMainDept(db: Database.Database): HeadChefIndex {
       }
     }
   } catch (e) {
+    if (opts?.rethrow) throw e; // probe mode: a failure here is a failed probe, not "no head chefs"
     console.error('[po-deviation-alert] head-chef lookup failed (non-fatal):', e);
   }
   return { active, inactive };
+}
+
+/**
+ * category key -> EVERY main department that claims it, in `mains` order.
+ *
+ * ONE BUILDER, shared by the alert path and the readiness view. A readiness
+ * screen that built its own copy of this map would be free to drift into
+ * telling the admin that a category is routed when the alert that actually
+ * fires disagrees — which is the one thing a readiness screen must never do.
+ * Extracted verbatim from resolveDeviationAudience(); same source array, same
+ * catKey(), same insertion order, so the behaviour is unchanged.
+ */
+function claimantsByCategory(mains: MainDept[]): Map<string, MainDept[]> {
+  const byCat = new Map<string, MainDept[]>();
+  for (const d of mains) {
+    for (const c of d.cats) {
+      const list = byCat.get(c) ?? [];
+      list.push(d);
+      byCat.set(c, list);
+    }
+  }
+  return byCat;
 }
 
 /**
@@ -525,6 +594,7 @@ function headsOf(
   db: Database.Database,
   dept: MainDept,
   headChefs: HeadChefIndex,
+  opts?: ResolveOpts,
 ): { heads: DeviationRecipient[]; gap: string } {
   const candidates: Array<{ id: string; via: string }> = [];
   const push = (id: unknown, via: string) => {
@@ -570,6 +640,7 @@ function headsOf(
         scope: 'department', department_ids: [dept.id], department_names: [dept.name],
       });
     } catch (e) {
+      if (opts?.rethrow) throw e; // probe mode: a failed lookup is a failed probe, not "no head"
       console.error('[po-deviation-alert] head lookup failed (non-fatal):', e);
       why.push(`${dept.name}'s ${c.via} could not be looked up`);
     }
@@ -581,22 +652,27 @@ function headsOf(
 /**
  * Resolve the whole audience for one receipt's deviating lines.
  *
- * NEVER THROWS. On any failure it returns whatever it managed to resolve; the
- * admins are looked up first and independently, so a department-side fault
- * still leaves an audience rather than none.
+ * NEVER THROWS on the alert path (opts omitted). On any failure it returns
+ * whatever it managed to resolve; the admins are looked up first and
+ * independently, so a department-side fault still leaves an audience rather
+ * than none. With `opts.rethrow` — the READINESS PROBE, and nothing else —
+ * internal failures are rethrown instead, because a probe whose failure
+ * resolves to the empty audience reads as "nobody is configured", which is a
+ * lie. See ResolveOpts.
  */
 export function resolveDeviationAudience(
   db: Database.Database,
   lines: DeviationAlertLine[],
+  opts?: ResolveOpts,
 ): DeviationAudience {
-  const { admins, gaps: adminGaps } = activeAdmins(db);
+  const { admins, gaps: adminGaps } = activeAdmins(db, opts);
   const departments: DeptRouting[] = [];
   const unrouted: DeviationAudience['unrouted'] = [];
   const gaps: string[] = [...adminGaps];
 
   try {
-    const mains = mainDepartments(db);
-    const headChefs = headChefsByMainDept(db);
+    const mains = mainDepartments(db, opts);
+    const headChefs = headChefsByMainDept(db, opts);
     // category -> EVERY department that claims it, in a deterministic order.
     //
     // AN OVERLAP ROUTES TO EVERY CLAIMANT, NOT TO THE FIRST ONE. This used to
@@ -612,14 +688,7 @@ export function resolveDeviationAudience(
     // (Measured on the live data: 28 categories across 3 active mains, ZERO
     // collisions — so this changes nothing about any receipt that can happen
     // today, and only differs where the old code was provably wrong.)
-    const byCat = new Map<string, MainDept[]>();
-    for (const d of mains) {
-      for (const c of d.cats) {
-        const list = byCat.get(c) ?? [];
-        list.push(d);
-        byCat.set(c, list);
-      }
-    }
+    const byCat = claimantsByCategory(mains);
 
     // Material categories for exactly the deviating lines.
     const ids = [...new Set(lines.map(l => str(l.material_id)).filter(Boolean))];
@@ -665,7 +734,7 @@ export function resolveDeviationAudience(
       for (const dept of active) {
         let r = routing.get(dept.id);
         if (!r) {
-          const { heads, gap } = headsOf(db, dept, headChefs);
+          const { heads, gap } = headsOf(db, dept, headChefs, opts);
           r = { department_id: dept.id, department_name: dept.name, heads, head_gap: gap, lines: [] };
           routing.set(dept.id, r);
         }
@@ -700,6 +769,11 @@ export function resolveDeviationAudience(
       );
     }
   } catch (e) {
+    // PROBE MODE ONLY: swallowing here would hand the probe an empty audience
+    // it cannot tell apart from "no departments are configured". The real alert
+    // path never sets the flag and keeps the swallow below — crash-proofing for
+    // a receipt that is already in the books.
+    if (opts?.rethrow) throw e;
     console.error('[po-deviation-alert] audience resolution failed (non-fatal):', e);
     gaps.push('department routing could not be computed for this receipt — only the admins were told');
   }
@@ -738,6 +812,532 @@ export function resolveDeviationAudience(
   if (!admins.length) gaps.push('no active admin user could be resolved — this alert reached nobody at admin level');
 
   return { admins, departments, unrouted, recipients, gaps };
+}
+
+/* ────────────────────────────────────────────────────────────────────────────
+ * READINESS — "IF A DEVIATION HAPPENED RIGHT NOW, WHO WOULD ACTUALLY HEAR?"
+ *
+ * Everything above answers that question ONE RECEIPT AT A TIME, after the money
+ * has already moved, in an email nobody reads until something has gone wrong.
+ * The gaps it writes ("no HOD is resolvable for Kitchen") are the truth, but
+ * they arrive attached to a deviation that has already happened, addressed to
+ * the admins — the very people who were told; the head who was NOT told, by
+ * definition, receives nothing, including the notice that they receive nothing.
+ *
+ * This function asks the same question with no receipt in hand, so the answer
+ * can be read on a screen BEFORE the first deviation instead of inferred from
+ * the silence after it.
+ *
+ * IT ASKS THE ROUTER; IT DOES NOT MODEL THE ROUTER. routingProbe() below feeds
+ * one hypothetical deviating line per live item category straight into
+ * resolveDeviationAudience() — the SAME function a real receipt calls — and the
+ * per-department verdict is read out of that run's own `departments` and
+ * `recipients`. If this screen says "Bar is covered", it is because the code
+ * that addresses the real alert addressed a department-scope copy to a named
+ * person on this very database, seconds ago.
+ *
+ * ── WHY THAT, AND NOT "does the department have a head?" ───────────────────
+ * The first version of this function answered with headsOf() alone and let the
+ * view tick green on `heads.length > 0`. MEASURED: with Bar's head correctly
+ * configured, THREE independent one-click configuration states —
+ * `departments.is_active = 0` (the plain Archived checkbox in the Departments
+ * edit modal), `material_categories = '[]'`, and a whitelist naming a category
+ * no item carries — each left `heads` non-empty while a real
+ * raiseDeviationAlert() on that department's own category wrote ZERO
+ * department-scope notification rows. The screen printed a green tick and the
+ * recipient's name and email; the recipient was told nothing. A safety
+ * indicator that is confidently wrong is worse than no indicator, because the
+ * admin stops looking. Heads are still shown — a head configured behind a
+ * blocker is worth naming — but a head can no longer make anything green:
+ * `reach` is decided by the router, and only the router.
+ *
+ * IT ALSO REPORTS THE ONE GAP THE ALERT PATH STRUCTURALLY CANNOT.
+ * headChefsByMainDept() opens with `WHERE TRIM(COALESCE(u.department_id,'')) <> ''`.
+ * Somebody holding the Head Chef flag with NO department is removed by that
+ * WHERE clause before headsOf() ever sees them, so no gap sentence can be
+ * attached to them — the alert can say "Kitchen has no head", but it can never
+ * say "and by the way, the person who believes they ARE the head is wired to no
+ * department and receives nothing anywhere." Measured on the 2026-08-28
+ * snapshot, TWO active accounts are in exactly that state. Both happen to also
+ * be admins, so they still get the admin copy today and the fault is invisible;
+ * the first non-admin put in that state is silently dark forever. This is the
+ * only place that fact can surface.
+ * ──────────────────────────────────────────────────────────────────────────*/
+
+/** How a resolved head was found. LABEL ONLY — the SET of heads comes from
+ *  headsOf(); this just re-reads which column carried the id it returned, in
+ *  the same precedence order headsOf() pushes candidates. It cannot add or
+ *  remove a recipient, so it cannot make the view claim someone is reachable. */
+export type HeadVia = 'Department head' | 'HOD' | 'Head Chef flag';
+
+export interface ReadinessHead {
+  user_id: string;
+  email: string;
+  name: string;
+  via: HeadVia;
+}
+
+/**
+ * WHAT THE ROUTER WOULD ACTUALLY DO FOR THIS DEPARTMENT — the single fact any
+ * covered/uncovered indicator is allowed to key off.
+ *
+ *   'department'  a deviation on one of this department's OWN items addresses a
+ *                 DEPARTMENT-SCOPE copy to a named person. Proven by running
+ *                 resolveDeviationAudience() and finding that recipient row.
+ *                 THE ONLY STATE THAT MAY RENDER AS COVERED.
+ *   'admin-only'  routing does reach the department and does resolve a head,
+ *                 but every head is also an admin, so the single row they get is
+ *                 the WIDER admin copy (which carries every line, theirs
+ *                 included) and no department-scope row is written. They ARE
+ *                 told — saying "nobody would be told" here would be the same
+ *                 confident lie pointing the other way — but the department rail
+ *                 is not what tells them, and the next head who is not an admin
+ *                 inherits whatever is really wired here.
+ *   'none'        nobody in this department is told anything on this rail.
+ *   'unknown'     THE PROBE ITSELF FAILED, so none of the above is proven —
+ *                 in either direction. Must render as an ERROR, never as
+ *                 covered, and never as a calm "no heads configured": the
+ *                 remedy sentences the other states carry would send the admin
+ *                 to a configuration screen for a fault that is not
+ *                 configuration. Only ever set when AlertReadiness.probe_error
+ *                 is set, and then on EVERY department.
+ */
+export type DeptReach = 'department' | 'admin-only' | 'none' | 'unknown';
+
+export interface DeptReadiness {
+  department_id: string;
+  department_name: string;
+  is_active: boolean;
+  /** The whitelist as the admin wrote it — NOT normalised, so the screen shows
+   *  the same spelling the Departments editor shows. */
+  categories: string[];
+  /** How many of those categories any live raw material is actually filed under.
+   *  A whitelist of categories nothing is filed under routes nothing. */
+  categories_with_items: number;
+  /** The heads the ROUTER resolved for this department when it consults it, or
+   *  — when it never consults this department at all — who WOULD have resolved
+   *  had it got that far. ADVISORY IN THAT SECOND CASE, and it cannot change
+   *  `reach`: a non-empty list here alongside `reach: 'none'` means exactly
+   *  "somebody is configured and it still makes no difference". */
+  heads: ReadinessHead[];
+  /** When no head resolves, the EXACT sentence the real alert would print.
+   *  Empty string when somebody resolves. */
+  gap: string;
+  /** Reasons a deviation would never reach this department even if a head IS
+   *  resolved above — routing stops before the head is ever consulted. */
+  blockers: string[];
+  /** THE ANSWER. Read out of a real resolveDeviationAudience() run over one
+   *  hypothetical deviating line per live item category (routingProbe), so it
+   *  is what the alert path does, not what a second implementation of the rule
+   *  predicts it does. The ONLY field an indicator may colour on. */
+  reach: DeptReach;
+  /** One sentence saying what that run decided, in the router's own words —
+   *  including its own gap sentence when a head could not be resolved. Always
+   *  populated, for every value of `reach`. */
+  verdict: string;
+}
+
+export interface InvisibleHeadChef {
+  user_id: string;
+  email: string;
+  name: string;
+  is_active: boolean;
+  /** Why the alert path cannot place this person in any department. */
+  reason: string;
+  /** TRUE when this person is ALSO an active admin, and so still receives the
+   *  admin copy of every deviation. Saying "they are told nothing" about an
+   *  admin would be false, and a screen that overstates one fault gets
+   *  disbelieved about the ones it has right. It also explains why this has
+   *  never been noticed: on the live database both unplaced head chefs are
+   *  admins, so the hole is real but currently masked. */
+  also_admin: boolean;
+}
+
+export interface AlertReadiness {
+  /** Everyone who gets the admin copy of EVERY deviation, whatever routes. */
+  admins: DeviationRecipient[];
+  /** Admins the alert path had to drop, with the reason (e.g. no email). */
+  admin_gaps: string[];
+  departments: DeptReadiness[];
+  /** Categories live materials are filed under that no ACTIVE main department
+   *  claims. A deviation on one of these reaches the admins and NO head. */
+  unclaimed_categories: Array<{
+    category: string;
+    material_count: number;
+    /** Non-empty when the category IS claimed, but only by a deactivated
+     *  department — a different fault with a different remedy. */
+    claimed_by_inactive: string[];
+  }>;
+  /** Categories claimed by MORE THAN ONE active main department. Every claimant
+   *  is told (see resolveDeviationAudience), which is deliberate, but the
+   *  overlap is a configuration mistake worth naming. */
+  contested_categories: Array<{ category: string; departments: string[] }>;
+  /** People the app calls head chefs whom the ALERT PATH CANNOT SEE AT ALL. */
+  invisible_head_chefs: InvisibleHeadChef[];
+  /** Non-fatal failures while computing the above. Never thrown. */
+  errors: string[];
+  /** Set ONLY when the routing probe itself failed — the exception's own
+   *  message. When present, every department's `reach` is 'unknown' and
+   *  NOTHING in this payload proves coverage either way; the view must render
+   *  a broken/red state, not a checklist. ABSENT (not empty) on a healthy run,
+   *  so a healthy response is byte-identical to one from before this field
+   *  existed. */
+  probe_error?: string;
+}
+
+/**
+ * ONE HYPOTHETICAL RECEIPT, PUT THROUGH THE REAL ROUTER.
+ *
+ * Builds one deviating line per DISTINCT live item category — the widest
+ * receipt that could ever exist on this catalogue — and hands it to
+ * resolveDeviationAudience(). Whatever that returns is, by construction, what a
+ * real receipt touching any of those categories would return: same function,
+ * same handle, same instant. So "would Bar be told?" stops being a prediction
+ * and becomes a lookup in `audience.recipients`.
+ *
+ * READ-ONLY. resolveDeviationAudience() issues SELECTs and nothing else — no
+ * INSERT, no UPDATE, no notifications row — which is what makes it safe to run
+ * from a GET. Delivery lives in deliverInApp(), which this never calls.
+ *
+ * ONE LINE PER CATEGORY, NOT PER MATERIAL: routing keys on the material's
+ * category, so a second material in the same category cannot change any
+ * department's answer, and the catalogue has ~1,000 materials across 29
+ * categories. MIN(id) rather than an arbitrary row so two runs a second apart
+ * cannot disagree.
+ *
+ * NEVER THROWS — but it no longer trusts a return value alone, either.
+ * resolveDeviationAudience() is called with `{ rethrow: true }` because on the
+ * alert path it SWALLOWS its own exceptions and returns whatever it managed to
+ * resolve — deliberate crash-proofing there, but fatal to a probe: an internal
+ * failure came back as the empty audience, indistinguishable from "nobody is
+ * configured", and the readiness view printed the no-HOD remedy sentence for
+ * every department while the truth was that the probe itself had failed.
+ * With the flag set, any internal failure lands in the catch below and is
+ * returned as `error`. A null audience therefore means THE PROBE FAILED — the
+ * answer is UNKNOWN, and every caller must render that as an error state:
+ * never as covered, never as "no heads yet".
+ */
+function routingProbe(db: Database.Database): { audience: DeviationAudience | null; categories: number; error: string } {
+  try {
+    const rows = db.prepare(`
+      SELECT MIN(id) AS id, MIN(name) AS name, category
+        FROM raw_materials
+       GROUP BY category
+    `).all() as any[];
+    const lines: DeviationAlertLine[] = [];
+    for (const r of rows) {
+      const id = str(r.id).trim();
+      if (!id) continue;
+      // The numbers are never read by the routing half — resolveDeviationAudience
+      // looks at material_id alone — but they are filled in honestly rather than
+      // left at zero so that anything which later inspects a probe line sees a
+      // coherent over-receipt rather than a malformed one.
+      lines.push({
+        material_name: str(r.name) || id,
+        material_id: id,
+        ordered: 1, received: 2, accepted: 2, unit_pu: 'unit',
+        ordered_rate: 0, actual_rate: 0,
+        qty_short: false, qty_excess: true, rate_changed: false, acc_short: false,
+        value_impact: 0, reason: 'routing readiness probe',
+      });
+    }
+    return { audience: resolveDeviationAudience(db, lines, { rethrow: true }), categories: lines.length, error: '' };
+  } catch (e) {
+    console.error('[po-deviation-alert] readiness: routing probe failed:', e);
+    return { audience: null, categories: 0, error: str((e as any)?.message || e) || 'unknown error' };
+  }
+}
+
+/**
+ * NEVER THROWS. Same contract as resolveDeviationAudience: a fault in one
+ * section still leaves the rest readable, because a readiness screen that goes
+ * blank on an edge case teaches the admin to stop trusting it. It FAILS CLOSED:
+ * anything it could not prove is reported as uncovered, never as covered — and
+ * when the PROBE ITSELF fails, as `reach: 'unknown'` with `probe_error` set,
+ * never as a calm "no heads configured" whose remedy sentence would send the
+ * admin to a configuration screen for a fault that is not configuration.
+ */
+export function departmentAlertReadiness(db: Database.Database): AlertReadiness {
+  const { admins, gaps: adminGaps } = activeAdmins(db);
+  const departments: DeptReadiness[] = [];
+  const unclaimed: AlertReadiness['unclaimed_categories'] = [];
+  const contested: AlertReadiness['contested_categories'] = [];
+  const invisible: InvisibleHeadChef[] = [];
+  const errors: string[] = [];
+
+  let mains: MainDept[] = [];
+  let headChefs: HeadChefIndex = { active: new Map(), inactive: new Map() };
+  try {
+    // rethrow: without it these two swallow internally and return empty — so
+    // this catch could never fire and a dead departments table read as "no main
+    // departments exist". A READINESS caller wants the failure named.
+    mains = mainDepartments(db, { rethrow: true });
+    headChefs = headChefsByMainDept(db, { rethrow: true });
+  } catch (e) {
+    console.error('[po-deviation-alert] readiness: department/head lookup failed:', e);
+    errors.push('departments / the head-chef index could not be read — this list is incomplete');
+  }
+
+  // Which categories any LIVE material is actually filed under. A whitelist
+  // entry nothing is filed under is not a routing target, and a category on a
+  // material that no whitelist mentions is a hole.
+  const liveCats = new Map<string, number>();
+  try {
+    const rows = db.prepare(
+      `SELECT category, COUNT(*) AS n FROM raw_materials GROUP BY category`,
+    ).all() as any[];
+    for (const r of rows) {
+      const k = catKey(r.category);
+      liveCats.set(k, (liveCats.get(k) ?? 0) + (Number(r.n) || 0));
+    }
+  } catch (e) {
+    console.error('[po-deviation-alert] readiness: material category scan failed:', e);
+    errors.push('item categories could not be read — the unrouted-category list is incomplete');
+  }
+
+  const byCat = claimantsByCategory(mains);
+
+  // ── THE ROUTER'S OWN ANSWER, NOT A MODEL OF IT ──────────────────────────
+  // Everything below that decides covered / not covered reads out of THIS run.
+  const { audience: probe, categories: probeCategories, error: probeError } = routingProbe(db);
+  if (!probe) {
+    errors.push(
+      `THE ROUTING PROBE ITSELF FAILED (${probeError}) — whether anyone would be told is UNKNOWN. `
+      + `Every department below is marked unknown: not proven covered, and NOT "no heads configured"`,
+    );
+  }
+  /** department id -> the routing entry the real alert built for it. Absent =
+   *  the router never consults this department, whatever its heads say. */
+  const routedById = new Map<string, DeptRouting>();
+  /** department id -> emails that received a DEPARTMENT-SCOPE copy. This is the
+   *  literal set deliverInApp() writes a department row for. */
+  const deptScoped = new Map<string, string[]>();
+  if (probe) {
+    for (const d of probe.departments) routedById.set(d.department_id, d);
+    for (const r of probe.recipients) {
+      if (r.scope !== 'department') continue;
+      for (const id of r.department_ids) {
+        const list = deptScoped.get(id) ?? [];
+        list.push(r.email);
+        deptScoped.set(id, list);
+      }
+    }
+  }
+
+  for (const dept of mains) {
+    const routed = routedById.get(dept.id) ?? null;
+    let heads: ReadinessHead[] = [];
+    let gap = '';
+    try {
+      // A department the router CONSULTS contributes its own resolved heads,
+      // verbatim — no second call, so no chance of a different answer. One it
+      // never consults gets an advisory resolution, purely so the screen can say
+      // "a head is configured and it still changes nothing"; `reach` is already
+      // decided by then and this list cannot move it.
+      const resolved = routed
+        ? { heads: routed.heads, gap: routed.head_gap }
+        : headsOf(db, dept, headChefs, { rethrow: true });
+      gap = resolved.gap;
+      heads = resolved.heads.map(h => {
+        // Precedence MUST match the order headsOf() pushes candidates, or a
+        // person who is both the department head and flagged would be
+        // mislabelled. It is a label, not a decision.
+        const via: HeadVia =
+          str(dept.head_user_id).trim() === h.user_id ? 'Department head'
+          : str(dept.head_chef_user_id).trim() === h.user_id ? 'HOD'
+          : 'Head Chef flag';
+        return { user_id: h.user_id, email: h.email, name: h.name, via };
+      });
+    } catch (e) {
+      console.error('[po-deviation-alert] readiness: head resolution failed:', e);
+      gap = `heads for ${dept.name} could not be resolved`;
+    }
+
+    // Categories as the admin wrote them, plus how many carry live items.
+    let categories: string[] = [];
+    try {
+      const arr = JSON.parse(str(dept.material_categories) || '[]');
+      if (Array.isArray(arr)) categories = arr.map(c => str(c)).filter(Boolean);
+    } catch { categories = []; }
+    // COUNTED OVER dept.cats — the NORMALISED keys the router matches on — not
+    // over the raw strings. `"  "` is a truthy raw entry that catKey() drops, so
+    // counting raw entries could report "1 with items" for a whitelist the
+    // router treats as empty, and the blocker explaining a dark department would
+    // never print.
+    const withItems = [...dept.cats].filter(k => (liveCats.get(k) ?? 0) > 0).length;
+
+    const blockers: string[] = [];
+    if (!dept.is_active) {
+      blockers.push(
+        `This department is archived. Routing skips archived claimants, so no deviation reaches it `
+        + `even though a head is set — reactivate it on Settings -> Departments.`,
+      );
+    }
+    if (!dept.cats.size) {
+      blockers.push(
+        `No item categories are on this department's list, so no material can ever route here. `
+        + `Add categories on Settings -> Departments -> ${dept.name}.`,
+      );
+    } else if (withItems === 0) {
+      blockers.push(
+        `None of this department's ${dept.cats.size} categories match any item in the catalogue, `
+        + `so nothing routes here today. Check the spelling against the item list.`,
+      );
+    }
+
+    // ── THE VERDICT, READ OUT OF THE PROBE ────────────────────────────────
+    // Ordered so that the strongest claim needs the strongest evidence: green
+    // requires an actual department-scope recipient row, and every path that is
+    // not that ends up somewhere other than green.
+    const scopedTo = deptScoped.get(dept.id) ?? [];
+    let reach: DeptReach;
+    let verdict: string;
+    if (!probe) {
+      // NOT 'none': 'none' is a PROVEN verdict with a remedy attached, and this
+      // is the opposite of proven. The probe crashed; whether anyone would be
+      // told is unknown in both directions, and the error is quoted so the
+      // admin reads a failure, not advice.
+      reach = 'unknown';
+      verdict = `The readiness probe itself FAILED (${probeError}), so whether anyone in ${dept.name} `
+        + `would be told is UNKNOWN — an error state, not "no heads configured". Nothing here is proven.`;
+    } else if (scopedTo.length) {
+      reach = 'department';
+      verdict = `A deviation on one of ${dept.name}'s own items addresses a copy to ${scopedTo.join(', ')}.`;
+    } else if (routed && routed.heads.length) {
+      reach = 'admin-only';
+      const who = routed.heads.map(h => h.email).join(', ');
+      verdict = `Routing does reach ${dept.name} and resolves ${who} as its head — but they are also an `
+        + `admin, so the one row they get is the wider ADMIN copy and no department copy is written. `
+        + `They are told; the department rail is not what tells them.`;
+    } else if (routed) {
+      // The router got here and found nobody. Quote ITS sentence, so the screen
+      // and the alert body say the same words.
+      reach = 'none';
+      verdict = routed.head_gap || `No head could be resolved for ${dept.name}, so nobody there would be told.`;
+    } else if (!probeCategories) {
+      reach = 'none';
+      verdict = `No item exists in the catalogue, so no deviation can be raised against ${dept.name} yet.`;
+    } else {
+      reach = 'none';
+      verdict = blockers[0]
+        ?? `Routing never consults ${dept.name}: no live item's category is on its list.`;
+    }
+
+    departments.push({
+      department_id: dept.id,
+      department_name: dept.name,
+      is_active: dept.is_active,
+      categories,
+      categories_with_items: withItems,
+      heads,
+      gap: heads.length ? '' : gap,
+      blockers,
+      reach,
+      verdict,
+    });
+  }
+
+  // Category-side holes, measured against LIVE materials rather than against
+  // the whitelists — a whitelist gap nothing is filed under harms nobody.
+  try {
+    for (const [key, n] of liveCats) {
+      const claimants = byCat.get(key) ?? [];
+      const active = claimants.filter(d => d.is_active);
+      if (active.length > 1) {
+        contested.push({ category: key, departments: active.map(d => d.name) });
+      }
+      if (!active.length) {
+        unclaimed.push({
+          category: key,
+          material_count: n,
+          claimed_by_inactive: claimants.map(d => d.name),
+        });
+      }
+    }
+    unclaimed.sort((a, b) => b.material_count - a.material_count || a.category.localeCompare(b.category));
+    contested.sort((a, b) => a.category.localeCompare(b.category));
+  } catch (e) {
+    console.error('[po-deviation-alert] readiness: category comparison failed:', e);
+    errors.push('category routing could not be compared');
+  }
+
+  // THE PEOPLE THE ALERT PATH CANNOT SEE.
+  //
+  // Read with the SAME flag fragment headChefsByMainDept() uses, but WITHOUT
+  // its department filter — that filter is exactly what makes these people
+  // invisible, so reproducing it here would reproduce the blindness. Everyone
+  // this query returns who DOES land in a main department is dropped below;
+  // what is left is the set no gap sentence anywhere can mention.
+  try {
+    const rows = db.prepare(`
+      SELECT u.id, u.email, u.name, u.is_active, u.department_id, u.is_head_chef, u.role_id,
+             r.is_head_chef AS role_head_chef
+        FROM users u
+        LEFT JOIN roles r ON r.id = u.role_id
+       WHERE ${HEAD_CHEF_FLAG_SQL}
+       ORDER BY u.name COLLATE NOCASE, u.id
+    `).all() as any[];
+    const mainIds = new Set(mains.map(d => d.id));
+    // Named from the data, never hardcoded: "move them under Kitchen, Bar or
+    // Operations" becomes a wrong instruction the day a department is renamed.
+    const mainNames = mains.filter(d => d.is_active).map(d => d.name);
+    const underOne = mainNames.length
+      ? `Move them under ${mainNames.join(' / ')} on Settings -> Users.`
+      : 'No active main department exists to move them under.';
+    const adminIds = new Set(admins.map(a => a.user_id));
+    for (const row of rows) {
+      const deptId = str(row.department_id).trim();
+      let reason = '';
+      if (!deptId) {
+        reason = 'has the Head Chef flag but is in NO department, so deviation alerts can place them '
+          + 'nowhere and they are told nothing as a HOD. Set their department on Settings -> Users.';
+      } else {
+        const main = mainDeptOf(db, deptId);
+        if (!main) {
+          reason = 'has the Head Chef flag, but the department on their account no longer exists, '
+            + 'so deviation alerts can place them nowhere. Set their department on Settings -> Users.';
+        } else if (!mainIds.has(str(main.id))) {
+          reason = `has the Head Chef flag, but their department rolls up to "${str(main.name)}", `
+            + 'which is not a main department — deviation routing only ever consults main departments. '
+            + underOne;
+        } else if (!row.is_active) {
+          // headsOf() DOES name this case, but only for a department that has
+          // no other candidate. Where a second head exists the deactivated one
+          // is silently ignored, and the admin never learns the account they
+          // think is covering the department is switched off.
+          reason = `holds the Head Chef flag for ${str(main.name)}, but the account is deactivated `
+            + '— they are never told. Reactivate them on Settings -> Users, or clear the flag.';
+        } else {
+          continue; // Genuinely reachable; already shown under their department.
+        }
+      }
+      invisible.push({
+        user_id: str(row.id),
+        email: str(row.email),
+        name: str(row.name) || str(row.email) || str(row.id),
+        is_active: !!row.is_active,
+        reason,
+        also_admin: adminIds.has(str(row.id)),
+      });
+    }
+  } catch (e) {
+    console.error('[po-deviation-alert] readiness: head-chef sweep failed:', e);
+    errors.push('the head-chef list could not be swept for unreachable people');
+  }
+
+  return {
+    admins,
+    admin_gaps: adminGaps,
+    departments,
+    unclaimed_categories: unclaimed,
+    contested_categories: contested,
+    invisible_head_chefs: invisible,
+    errors,
+    // Spread, not `probe_error: probe ? undefined : …`: the key must be ABSENT
+    // on a healthy run so the serialised response stays byte-identical to the
+    // shape from before this field existed.
+    ...(probe ? {} : { probe_error: probeError }),
+  };
 }
 
 /* ────────────────────────────────────────────────────────────────────────────

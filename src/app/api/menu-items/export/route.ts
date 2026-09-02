@@ -55,7 +55,14 @@ export async function GET(request: Request) {
       ]);
     }
 
-    const csv = [HEADERS, ...rows].map((r) => r.map(csvEscape).join(',')).join('\n') + '\n';
+    // UTF-8 BOM, deliberately: the import screen decodes the uploaded bytes with
+    // XLSX.read, and xlsx treats a BOM-less CSV as CP1252 — a round trip of our
+    // own export silently mojibaked any non-ASCII byte in a Name/Item Code
+    // (proven on the live catalogue: U+2060 in one item became "Â ").
+    // The BOM makes export → reimport byte-identical, and makes Excel open the
+    // file as UTF-8 instead of ANSI. Do not remove it to "match" the admin DB
+    // export — that CSV is never fed back through XLSX.read.
+    const csv = '\uFEFF' + [HEADERS, ...rows].map((r) => r.map(csvEscape).join(',')).join('\n') + '\n';
     const today = new Date().toISOString().slice(0, 10);
     const fname = sample ? 'menu-sample-template.csv' : `menu-items-${today}.csv`;
     return new Response(csv, {

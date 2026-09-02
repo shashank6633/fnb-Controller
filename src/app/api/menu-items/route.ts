@@ -1,4 +1,5 @@
 import { getDb, generateId } from '@/lib/db';
+import { checkStationOnSave } from '@/lib/station-master';
 
 /**
  * Reconcile an item's GST fields so they always agree (the bill engine sums the
@@ -113,6 +114,22 @@ export async function POST(request: Request) {
             image_url, spice_level, tags, taste_sour, taste_sweet, taste_spicy, taste_tangy, serves, options } = body;
 
     if (!name) return Response.json({ error: 'name is required' }, { status: 400 });
+
+    // STATION IS A ROUTING KEY, NOT A LABEL — see checkStationOnSave(). A new
+    // item has no held value to fall back on, so it is the master or nothing.
+    // Checked BEFORE the INSERT so a refusal writes nothing at all.
+    //
+    // WHAT IS WRITTEN IS `stationCheck.store`, NOT `station`. The check matches
+    // the master case-insensitively (the way every reader matches), so
+    // "Tandoor" passes it — but kot-fire.ts groups a fired order by the RAW
+    // string, so storing the client's bytes split one section's tickets into
+    // two KOTs, and an NBSP/BOM-carrying spelling was stranded forever by
+    // every SQLite-side lower(trim()) predicate (renames included). The store
+    // value is the master row's own spelling, so every accepted spelling of a
+    // station is byte-identical at the source.
+    const stationCheck = checkStationOnSave(db, station, null);
+    if (!stationCheck.ok) return Response.json({ error: stationCheck.error }, { status: 400 });
+
     const clamp = (v: any, max: number) => Math.max(0, Math.min(max, Math.floor(Number(v) || 0)));
     const asJson = (v: any) => Array.isArray(v) ? JSON.stringify(v) : (typeof v === 'string' ? v : '');
     const r2 = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
@@ -127,7 +144,7 @@ export async function POST(request: Request) {
                               image_url, spice_level, tags, taste_sour, taste_sweet, taste_spicy, taste_tangy, serves, options, created_at, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
     `).run(
-      id, name, category || '', station || '', normalizeItemType(item_type) || 'foods', dietary_tag || '',
+      id, name, category || '', stationCheck.store, normalizeItemType(item_type) || 'foods', dietary_tag || '',
       Number(selling_price) || 0, Number(listing_price) || 0, item_code || '', tax.combined, tax.cgst, tax.sgst,
       Number(prep_minutes) || 0, is_active === false ? 0 : 1, recipe_id || null, material_id || null, notes || '',
       (image_url || '').toString(), clamp(spice_level, 3), asJson(tags),
@@ -148,6 +165,29 @@ export async function PUT(request: Request) {
     const { id, ...fields } = body;
 
     if (!id) return Response.json({ error: 'id is required' }, { status: 400 });
+
+    // STATION IS A ROUTING KEY, NOT A LABEL — see checkStationOnSave().
+    //
+    // Only when `station` is actually IN THE BODY. A PUT that never mentions it
+    // (the list page's is_active toggle sends { id, is_active } and nothing
+    // else) is untouched by this, exactly as before: the loop below already
+    // skips absent keys, and re-validating a field nobody sent would turn every
+    // legacy row into an un-toggleable one.
+    //
+    // Read BEFORE the UPDATE, so the "held value" is the station the row had
+    // when the caller asked — and so a refusal writes nothing at all.
+    //
+    // On a pass, `fields.station` is REPLACED with `stationCheck.store` — the
+    // master row's own spelling (or '' for blank, or the held value verbatim
+    // for an off-master legacy row). Storing what the client sent is how
+    // "Tandoor" beside "tandoor" shipped two KOTs for one section and how an
+    // NBSP-spelled station survived every rename: see checkStationOnSave().
+    if (fields.station !== undefined) {
+      const cur = db.prepare('SELECT station FROM menu_items WHERE id = ?').get(id) as { station?: string | null } | undefined;
+      const stationCheck = checkStationOnSave(db, fields.station, cur?.station);
+      if (!stationCheck.ok) return Response.json({ error: stationCheck.error }, { status: 400 });
+      fields.station = stationCheck.store;
+    }
 
     const allowed = ['name', 'category', 'station', 'item_type', 'dietary_tag', 'selling_price', 'listing_price', 'item_code', 'tax_value', 'cgst_percent', 'sgst_percent', 'prep_minutes', 'is_active', 'recipe_id', 'material_id', 'notes',
       'image_url', 'spice_level', 'tags', 'taste_sour', 'taste_sweet', 'taste_spicy', 'taste_tangy', 'serves', 'options'];

@@ -679,6 +679,64 @@ function initializeSchema(db: Database.Database) {
     }
   } catch (e) { console.error('menu_categories migration failed:', e); }
 
+  // ── menu_item_images — DISH PHOTOS FOR THE CUSTOMER QR MENU ───────────────
+  //
+  // WHY A BLOB TABLE AND NOT A FILE ON DISK.
+  // There is no image host in this system and no asset pipeline. Disk under
+  // public/ loses the images: NOTHING backs public/ up — deploy/aws/backup-db.sh
+  // and deploy/configure-backups.sh both snapshot ONLY fnb-controller.db — so a
+  // box rebuild or a restore-from-backup would bring the menu back with every
+  // photo permanently gone, and deploy/aws/push.sh runs `rsync -az --delete`
+  // with no exclusion for public/. A BLOB rides inside every existing backup for
+  // free, and survives the GCP `sqlite3 .dump` path as an X'..' hex literal.
+  // Same reasoning, and the same shape, as task_files (see far below).
+  //
+  // WHY NOT INLINE base64 IN menu_items.image_url, the way the Task module's
+  // ImageUpload stores its photos. That is right for a per-record task photo and
+  // wrong here: /api/customer/menu is ONE JSON carrying ALL active priced
+  // items (496 today, ~175 KB), refetched on EVERY scan. Inlining 80 KB per item
+  // would make that single response ~40 MB — served to a guest on mobile data.
+  // Storing the bytes here and putting a URL in image_url adds ~45 bytes per
+  // item to that JSON instead, and each photo becomes a separate, lazily-loaded,
+  // hard-cacheable request.
+  //
+  // image_url STAYS A PLAIN TEXT COLUMN and keeps storing a string — exactly as
+  // it does today. No foreign key, no column change, no data migration. An
+  // uploaded photo simply writes the string '/api/customer/menu-image/<id>'
+  // into it; a pasted external URL writes that URL. Every consumer
+  // (src/lib/customer.ts → the guest menu) reads the string and neither knows
+  // nor cares which kind it is. That is the whole design: this table is additive
+  // storage, not a new contract.
+  //
+  // The id is the CACHE KEY. Rows are never updated — replacing an item's photo
+  // INSERTs a new row and points image_url at the new id — so a served image is
+  // immutable for its whole life and can be cached hard without a version token.
+  // The superseded row is simply left in place. NOTHING ON A WRITE PATH DELETES
+  // FROM THIS TABLE: reclaiming space is an explicit, admin-only, previewed
+  // action (Menu Items -> "Photo storage" -> /api/menu-items/image/orphans,
+  // implemented in src/lib/menu-image-store.ts). An earlier version swept on
+  // every upload and destroyed photos that live items were still showing,
+  // because it compared image_url as an exact string and missed the absolute /
+  // space-padded / '?v=' spellings that browsers resolve to the same blob. The
+  // reference test now goes through src/lib/menu-image-url.ts — the same parser
+  // the serving route uses — and searches every text column in the database.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS menu_item_images (
+        id         TEXT PRIMARY KEY,
+        item_id    TEXT,
+        mime       TEXT NOT NULL,
+        width      INTEGER NOT NULL DEFAULT 0,
+        height     INTEGER NOT NULL DEFAULT 0,
+        size       INTEGER NOT NULL DEFAULT 0,
+        data       BLOB NOT NULL,
+        created_by TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_menu_item_images_item ON menu_item_images(item_id);
+      CREATE INDEX IF NOT EXISTS idx_menu_item_images_created ON menu_item_images(created_at);
+    `);
+  } catch (e) { console.error('menu_item_images migration failed:', e); }
 
   // ── KITCHEN PRODUCTION — WHICH DEPARTMENT A BATCH WAS MADE FOR ────────────
   //

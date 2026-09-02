@@ -782,7 +782,7 @@
   function cardHTML(it){
     var q=qtyOf(it.id);
     return '<div class="card" data-card="'+esc(it.id)+'">'+
-      '<div class="thumb" style="background:'+hueGrad(it.hue||30)+'" data-open="'+esc(it.id)+'">'+(it.image?'<img src="'+esc(it.image)+'" style="width:100%;height:100%;object-fit:cover">':'<div class="init">'+esc((it.name||'?').trim().charAt(0))+'</div>')+'</div>'+
+      '<div class="thumb" style="background:'+hueGrad(it.hue||30)+'" data-open="'+esc(it.id)+'">'+(it.image?'<img src="'+esc(it.image)+'" alt="" loading="lazy" decoding="async" style="width:100%;height:100%;object-fit:cover">':'<div class="init">'+esc((it.name||'?').trim().charAt(0))+'</div>')+'</div>'+
       '<div class="card-main">'+
         '<div class="card-tags"><span class="vdot '+esc(it.veg||'v')+'"></span>'+(it.spice>0?chilis(it.spice):'')+tagsHTML(it.tags,'tag')+'</div>'+
         '<div class="card-name" data-open="'+esc(it.id)+'">'+esc(it.name)+'</div>'+
@@ -901,7 +901,7 @@
     var optHTML=groups.map(function(g,gi){return '<div class="sectlabel">'+esc(g.label)+'<span class="rl"></span></div><div class="optrow" data-optg="'+gi+'">'+g.choices.map(function(c,ci){return '<button class="optchip'+(ci===0?' on':'')+'" data-optc="'+esc(c)+'">'+esc(c)+'</button>';}).join('')+'</div>';}).join('');
     var s=document.createElement('div');s.className='sheet';s.style.maxHeight='94dvh';
     s.innerHTML='<div class="grab"></div><div class="sheet-scroll">'+
-      '<div class="ish-hero" style="background:'+hueGrad(it.hue||30)+'">'+(it.image?'<img src="'+esc(it.image)+'" alt="">':'<div class="init">'+esc((it.name||'?').charAt(0))+'</div>')+'</div>'+
+      '<div class="ish-hero" style="background:'+hueGrad(it.hue||30)+'">'+(it.image?'<img src="'+esc(it.image)+'" alt="" decoding="async">':'<div class="init">'+esc((it.name||'?').charAt(0))+'</div>')+'</div>'+
       '<div class="ish-meta"><span class="vdot '+esc(it.veg||'v')+'"></span>'+(it.spice>0?chilis(it.spice):'')+tagsHTML(it.tags,'tagchip')+'</div>'+
       '<h2 class="serif" style="font-size:31px;margin:9px 0 0;line-height:1.03">'+esc(it.name)+'</h2>'+
       (it.desc?'<p style="color:var(--inkSoft);font-size:14.5px;line-height:1.5;margin:11px 0 0">'+esc(it.desc)+'</p>':'')+
@@ -945,7 +945,7 @@
       '<div style="padding:10px 22px 0;display:flex;align-items:baseline;justify-content:space-between"><h2 class="serif" style="font-size:26px;margin:0">Your order</h2><span class="kicker">Table '+esc(S.table.number)+'</span></div>'+
       '<div class="sheet-scroll">'+
         Object.keys(S.cart).map(function(key){var x=S.cart[key];var it=x.item;return '<div style="display:flex;gap:12px;align-items:flex-start;padding:13px 0;border-bottom:1px solid var(--ruleSoft)">'+
-          '<div class="thumb" style="width:54px;height:54px;border-radius:12px;background:'+hueGrad(it.hue||30)+'">'+(it.image?'<img src="'+esc(it.image)+'" style="width:100%;height:100%;object-fit:cover">':'')+'</div>'+
+          '<div class="thumb" style="width:54px;height:54px;border-radius:12px;background:'+hueGrad(it.hue||30)+'">'+(it.image?'<img src="'+esc(it.image)+'" alt="" loading="lazy" decoding="async" style="width:100%;height:100%;object-fit:cover">':'')+'</div>'+
           '<div style="flex:1;min-width:0"><div style="display:flex;gap:6px;align-items:center"><span class="vdot '+esc(it.veg||'v')+'"></span><span class="serif" style="font-size:17px">'+esc(it.name)+'</span></div>'+
             (x.note?'<div style="font-size:11px;color:var(--terra);margin-top:2px;font-family:var(--mono);letter-spacing:.03em;text-transform:uppercase">'+esc(x.note)+'</div>':'')+
             '<div style="display:flex;align-items:center;gap:10px;margin-top:8px"><span class="stepper"><button data-cdec="'+esc(key)+'">−</button><span>'+x.qty+'</span><button data-cinc="'+esc(key)+'">+</button></span>'+
