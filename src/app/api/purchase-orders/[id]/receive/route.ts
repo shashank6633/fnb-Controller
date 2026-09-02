@@ -80,6 +80,19 @@ const lineVendorName = (it: any, po: any): string =>
 /** Case/space-insensitive identity for a vendor group; the display name is kept separately. */
 const vendorKeyOf = (name: string): string => String(name || '').trim().toLowerCase();
 
+/**
+ * HEADS ARE NAMED, NOT EMAILED — applied to the RESPONSE, not just the alert
+ * body. po-deviation-alert's composeAlert states the rule for what the alert
+ * says; this route was still returning the delivered recipients' ADDRESSES to
+ * the receive screen, handing the HOD/admin roster to whoever mans the store
+ * desk. Anything email-shaped in a response string is cut down to its local
+ * part (the bit before @): "who was told" is answered by a name, and the
+ * address is a Settings → Users lookup away for anyone entitled to it. Names
+ * that are not emails pass through untouched, so nothing renders emptier.
+ */
+const redactEmail = (v: unknown): string =>
+  String(v ?? '').replace(/([A-Za-z0-9._%+-]+)@[A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,}/g, '$1');
+
 // receivedPoItemIds — THE receipt ledger — now lives in src/lib/po-receipts.ts,
 // imported above. It was module-local here and copied, unfiltered, into five
 // other queries across three files; that duplication is what made a voided
@@ -384,53 +397,42 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
      * rather than stamped with a name." Two ticks is not a signature. */
     const storeSigned = !!(qcExpiry && qcWeight && qcInvoiceMatch);
     /* ══════════════════════════════════════════════════════════════════════
-     * DECISION: AN UNTICKED "INVOICE MATCHES PO" **RECORDS**. IT DOES NOT BLOCK.
+     * DECISION (OWNER RULING, 2026-09): THE CHECKLIST BLOCKS **ON A DEVIATING
+     * RECEIPT ONLY**. A CLEAN RECEIPT STILL ONLY RECORDS.
      * ══════════════════════════════════════════════════════════════════════
-     * Blocking is the more obvious answer and it is the wrong one here, for
-     * three reasons that are about THIS codebase, not about strictness:
+     * The original decision here was record-don't-block, on the argument that a
+     * self-ticked box a receiver cannot withhold is not evidence. The owner has
+     * since ruled the split rule instead, and it keeps the half of that argument
+     * that was right while fixing the half history disproved:
      *
-     * 1. A BLOCK ON A SELF-TICKED BOX BUYS NOTHING. The box is ticked by the
-     *    same person doing the receiving, with no second party. Refusing to
-     *    commit until it is ticked does not produce a check — it produces a
-     *    click, every time, on every receipt, because the alternative is that
-     *    the goods cannot be booked and the vendor's truck is waiting. That is
-     *    the "receiver self-certifying their own receipt" this feature's own
-     *    comments (see /api/grn:1376) exist to end, rebuilt as a mandatory
-     *    field. A tick that cannot be withheld is not evidence.
+     *   · A CLEAN receive — every line exactly as the PO ordered it, qty and
+     *     rate — files exactly as it always has. Ticks optional, absent ticks
+     *     file the GRN unsigned, and a payload sending none of the three is
+     *     byte-identical in effect to what this route has always written. No
+     *     retro-signing, no new columns, no forced click on every routine bill.
      *
-     * 2. THE REAL BLOCK ALREADY EXISTS AND IS STRONGER. Every off-PO line on
-     *    this route already refuses to commit without a TYPED deviation_reason
-     *    of >= 3 characters (the gate ~430 lines below). That cannot be cleared
-     *    by clicking; it makes the receiver write down why 9 arrived against an
-     *    order for 1, and it is on the LINE, not the bill. Adding a second gate
-     *    that one click satisfies would sit in front of the typed one and train
-     *    people to clear both without reading either.
+     *   · A DEVIATING receive — ANY line off the PO on qty or rate, judged by
+     *     THE SAME detection that demands the typed deviation_reason and fires
+     *     the admin alert (qtyOff / rateOff / accOff, QTY_EPS / RATE_EPS) —
+     *     REFUSES (400) unless ALL THREE ticks are set. The refusal names every
+     *     deviating line and every unticked box (the gate right after the
+     *     per-line loop below). The typed reason gate is NOT relaxed: an off-PO
+     *     receive now needs the written why AND the signed store check, so the
+     *     alert that goes out on it always carries a signature. On a deviating
+     *     receipt the third tick's meaning is the modal's own wording law —
+     *     "the difference above is known and agreed" — and that is what the
+     *     refusal quotes.
      *
-     * 3. BLOCKING PUNISHES THE LEGITIMATE CASE. An over-delivery a manager
-     *    already agreed on the phone, an agreed rate change, a short delivery —
-     *    all are receipts where the invoice legitimately does NOT match the PO
-     *    and the honest answer to this box is "no". A block would force the
-     *    receiver to LIE (tick it) to book goods that are genuinely on the bay.
-     *    A control that makes the truthful answer the impossible one produces
-     *    false data, not compliance.
+     * WHY SERVER-SIDE: the modal pre-flags the mismatch and disables Confirm,
+     * but a UI-only gate is cosmetic — this module's own history (the inert
+     * `required` on bill_no, the currentRole() truthiness gate) proves a direct
+     * POST walks straight past the screen. The gate lives HERE.
      *
-     * SO THE CONSEQUENCE IS MADE VISIBLE INSTEAD, IN THREE PLACES:
-     *   · the GRN is filed UNSIGNED (qc_store_by '' / qc_store_at NULL) and
-     *     every surface that reads those columns says so;
-     *   · `qc_store` in the response lets the receive screen state it before and
-     *     after Confirm, so nobody discovers it later;
-     *   · on a receipt that ALSO deviated, the unticked answer is written into
-     *     the deviation alert body (see `note` at the raiseDeviationAlert call),
-     *     so the admins and the department's HOD are told, in words, that this
-     *     over-receipt was recorded and NOT reconciled against the order.
-     * That last one is the pairing that makes recording work: it only became a
-     * real consequence when the alert started reaching actual people, which is
-     * what the same lane's po-deviation-alert.ts fixed.
-     *
-     * IF A FUTURE OWNER WANTS A HARD BLOCK, it belongs on a SECOND person
-     * (a manager counter-sign on a deviating receipt), not on this checkbox —
-     * a one-click gate in front of the typed reason is a downgrade, not an
-     * upgrade.
+     * WHAT DID NOT CHANGE: qc_store_by/qc_store_at are still stamped only by
+     * the AND of all three (a partial tick on a CLEAN receipt is still recorded
+     * unsigned); the deviation alert still reports the signature state; and the
+     * ad-hoc GRN form keeps its record-only checklist — it has no PO to deviate
+     * from, so this rule cannot apply there.
      * ══════════════════════════════════════════════════════════════════════ */
     const overrides: Map<string, { quantity?: number; unit_price?: number; accepted?: number; rejection_reason?: string; deviation_reason?: string; gst_rate?: any; cgst?: any; sgst?: any; cess_rate?: any }> = new Map();
     if (Array.isArray(body?.item_overrides)) {
@@ -804,6 +806,11 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     // Scoped to `receiving` — this vendor's outstanding lines. Another vendor's
     // line is not this receiver's to justify, and one already received is not
     // theirs to re-price.
+    // Lines this loop finds off the PO, kept for the store-check gate right
+    // after it — the SAME detection (qtyOff/rateOff/accOff at the same
+    // tolerances) that demands the typed deviation_reason, so the two gates can
+    // never disagree about which receipts count as deviating.
+    const deviatingPreflight: Array<{ material_name: string; detail: string }> = [];
     for (const it of receiving) {
       const ov = overrides.get(it.id);
       const effRcv   = ov?.quantity   != null ? Number(ov.quantity) : Number(it.quantity);
@@ -928,20 +935,59 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // against ordered too.
       const accOff  = Math.abs(effAcc - ordQty) > QTY_EPS;
       if (qtyOff || rateOff || accOff) {
+        // The per-axis sentence, built for BOTH consumers of this detection:
+        // the missing-reason refusal below (unchanged wording) and the store-
+        // check gate after this loop, which must name the same lines.
+        const u = puLabel(it) || 'unit';
+        const what: string[] = [];
+        if (qtyOff)  what.push(`received ${effRcv} ${u} vs ordered ${ordQty} ${u}`);
+        if (accOff)  what.push(`accepted ${effAcc} ${u} vs ordered ${ordQty} ${u}`);
+        if (rateOff) what.push(`rate ₹${effPrice}/${u} vs ordered ₹${ordRate}/${u}`);
         const devReason = String(ov?.deviation_reason || '').trim();
         if (devReason.length < 3) {
-          const u = puLabel(it) || 'unit';
-          const what: string[] = [];
-          if (qtyOff)  what.push(`received ${effRcv} ${u} vs ordered ${ordQty} ${u}`);
-          if (accOff)  what.push(`accepted ${effAcc} ${u} vs ordered ${ordQty} ${u}`);
-          if (rateOff) what.push(`rate ₹${effPrice}/${u} vs ordered ₹${ordRate}/${u}`);
           return Response.json({
             error: `Reason required on "${it.material_name}" — ${what.join(' and ')}. Enter why this line differs from the PO (at least 3 characters); the admin is alerted with that reason.`,
             material: it.material_name,
             field: 'deviation_reason',
           }, { status: 400 });
         }
+        deviatingPreflight.push({ material_name: String(it.material_name || ''), detail: what.join(' and ') });
       }
+    }
+
+    // ── STORE CHECK GATE — A DEVIATING RECEIPT MUST BE SIGNED ───────────────
+    // The owner ruling this route's checklist decision block states in full: a
+    // receive where ANY line is off the PO (the deviatingPreflight collected by
+    // the SAME qtyOff/rateOff/accOff detection that just demanded the typed
+    // reasons) refuses unless all three store checks are ticked. A clean
+    // receipt never reaches this return — deviatingPreflight is empty — so a
+    // tickless clean payload files exactly as it always has. Runs AFTER the
+    // per-line loop so the more specific missing-reason refusal wins, and
+    // BEFORE anything that could hold or book the delivery.
+    if (deviatingPreflight.length > 0 && !storeSigned) {
+      const unticked: string[] = [
+        ...(qcExpiry ? [] : ['Expiry / use-by date checked']),
+        ...(qcWeight ? [] : ['Weight / count verified vs invoice']),
+        // The third tick's wording law on a deviating receipt: it does not
+        // claim the invoice matches (the screen just proved it does not) — it
+        // confirms the difference is known and agreed.
+        ...(qcInvoiceMatch ? [] : ['Invoice checked against this PO — the difference above is known and agreed']),
+      ];
+      return Response.json({
+        error: `This delivery deviates from ${po.po_number} on ${deviatingPreflight.length} line(s): `
+             + deviatingPreflight.map(d => `"${d.material_name}" (${d.detail})`).join('; ')
+             + `. An off-PO receive can only be filed with all three store checks ticked — still unticked: `
+             + unticked.map(t => `"${t}"`).join(', ')
+             + `. Tick them to sign that the difference is known and agreed, then receive.`,
+        field: 'qc_store',
+        qc_store_required: true,
+        deviating_lines: deviatingPreflight,
+        unticked: [
+          ...(qcExpiry ? [] : ['qc_expiry']),
+          ...(qcWeight ? [] : ['qc_weight']),
+          ...(qcInvoiceMatch ? [] : ['qc_invoice_match']),
+        ],
+      }, { status: 400 });
     }
 
     // ── ON A HELD DELIVERY THE STORE MAY NOT PRE-REJECT ─────────────────────
@@ -1899,7 +1945,9 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     // push, and the WhatsApp ping that is dark by default.
     // Placed BEFORE the deviation alert below, deliberately: a held delivery is
     // the more urgent message and both are best-effort.
-    let qcRecipients: Array<{ email: string; name: string }> = [];
+    // NAMES ONLY on the wire (see redactEmail): the receive screen counts and
+    // names who was told; it has no use for the checker roster's addresses.
+    let qcRecipients: Array<{ name: string }> = [];
     if (qc.required) {
       try {
         const heldRow = db.prepare(`
@@ -1914,7 +1962,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           lineCount: Number(heldRow?.n) || 0, heldValue: Number(heldRow?.v) || 0,
           receivedBy: receivedByEmail, outletId: po.outlet_id ?? null,
         });
-        qcRecipients = r.recipients.map(x => ({ email: x.email, name: x.name }));
+        qcRecipients = r.recipients.map(x => ({ name: String(x.name || '').trim() || redactEmail(x.email) }));
       } catch (e) {
         console.error('[receive PO] QC notification failed (non-fatal):', e);
       }
@@ -2212,16 +2260,14 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
             billNo,
             receivedBy: receivedByEmail,
             // ── WHAT THE STORE CHECKLIST IS *FOR*, ON A DEVIATING RECEIPT ────
-            // The three boxes RECORD rather than BLOCK (see the decision note
-            // where they are read). Recording only has teeth if somebody reads
-            // it, so the answer travels in the alert that now actually reaches
-            // people — the admins and the department's HOD. An over-receipt
-            // whose "Invoice matches PO" was left unticked reads, to the person
-            // who has to act on it, as a delivery NOBODY reconciled against the
-            // order; one that was ticked reads as a difference somebody looked
-            // at and accepted, with a name against it. Those are two very
-            // different pieces of news about the same 1-vs-9 line, and the
-            // alert would otherwise report them identically.
+            // Since the owner's block-on-deviation ruling (the gate above the
+            // txn), a deviating receipt can only commit SIGNED — so on this
+            // route the SIGNED sentence below is the one that goes out, with a
+            // name against the difference. The NOT-SIGNED branch is kept
+            // deliberately: it costs nothing, and if the gate is ever relaxed
+            // (or another writer reuses this alert) an unreconciled receipt
+            // must go back to reading as exactly that, rather than silently
+            // borrowing the signed wording.
             note: storeSigned
               ? `Store check at the bay: SIGNED by ${receivedByEmail || 'the receiver'} `
                 + `— expiry, weight/count and invoice-vs-PO all confirmed against this bill.`
@@ -2264,9 +2310,25 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         const delivered = Array.isArray(rep.delivered) ? rep.delivered : [];
         const audience = (rep.audience ?? {}) as Partial<DeviationDeliveryReport['audience']>;
         const depts = Array.isArray(audience.departments) ? audience.departments : [];
+        // user_id/email → display name, off the SAME audience the copies were
+        // addressed from — DeliveredRow carries only the address, so the name
+        // it is redacted to has to come from here.
+        const nameOf = new Map<string, string>();
+        for (const r of (Array.isArray(audience.recipients) ? audience.recipients : [])) {
+          if (r?.user_id) nameOf.set(String(r.user_id), String(r?.name || ''));
+          if (r?.email)   nameOf.set(String(r.email).toLowerCase(), String(r?.name || ''));
+        }
         return {
+          // NAMED, NOT EMAILED — this used to return `email: d.recipient`,
+          // which handed every admin's and HOD's address to the store desk in
+          // the very module whose alert body enforces names-only (composeAlert,
+          // po-deviation-alert.ts). The name resolves from the audience; a
+          // recipient the audience cannot name falls back to the address's
+          // local part, never the full address.
           recipients: delivered.map(d => ({
-            email: d?.recipient ?? '', scope: d?.scope ?? '',
+            name: nameOf.get(String(d?.user_id ?? '')) || nameOf.get(String(d?.recipient ?? '').toLowerCase())
+              || redactEmail(d?.recipient ?? ''),
+            scope: d?.scope ?? '',
             // EVERY department this person's copy covers. A head who runs two of
             // them used to be reported under one, while the other department's
             // lines reached nobody and `gaps` stayed empty.
@@ -2276,17 +2338,17 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           departments: depts.map(d => ({
             department: d?.department_name ?? '',
             lines: Array.isArray(d?.lines) ? d.lines.length : 0,
-            // NAMED, NOT EMAILED — the same rule composeAlert states for the
-            // alert body itself. This route is gated to management OR a store
-            // manager (po-helpers.ts), so returning addresses handed the whole
-            // HOD roster to a manager-tier receiver for no gain: the name is
-            // what answers "who was told", and the address is a lookup away for
-            // anyone entitled to it.
-            heads: Array.isArray(d?.heads) ? d.heads.map(h => h?.name || h?.email || '') : [],
+            // Same rule. The lib already prefers the name, but its own fallback
+            // for a nameless user IS the email — redactEmail keeps that case a
+            // local part instead of an address.
+            heads: Array.isArray(d?.heads) ? d.heads.map(h => redactEmail(h?.name || h?.email || '')) : [],
           })),
-          gaps: Array.isArray(audience.gaps) ? audience.gaps : [],
+          // Gap/error sentences can quote an address ("Kitchen's HOD (x@y) is
+          // deactivated", "delivery to x@y failed") — same redaction, sentence
+          // otherwise untouched.
+          gaps: (Array.isArray(audience.gaps) ? audience.gaps : []).map(redactEmail),
           whatsapp: rep.whatsapp ?? null,
-          errors: Array.isArray(rep.errors) ? rep.errors : [],
+          errors: (Array.isArray(rep.errors) ? rep.errors : []).map(redactEmail),
         };
       } catch (e) {
         console.error('[receive PO] deviation alert report could not be summarised (non-fatal):', e);
@@ -2333,7 +2395,10 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       qc_store: {
         expiry: qcExpiry, weight: qcWeight, invoice_match: qcInvoiceMatch,
         signed: storeSigned,
-        signed_by: storeSigned ? receivedByEmail : '',
+        // The receiver's display NAME, not their address — qc_store_by in the
+        // GRN row keeps the email exactly as /api/grn writes it; the response
+        // is the surface the names-not-emails rule applies to (redactEmail).
+        signed_by: storeSigned ? ((me?.name || '').trim() || redactEmail(receivedByEmail)) : '',
       },
       // The QC STATE, not the GRN's status: 'awaiting_qc' when held, and
       // 'not_required' when this delivery took the pre-existing path (whose

@@ -1,5 +1,5 @@
 import { getDb } from '@/lib/db';
-import { getCurrentUser, getCurrentOutletId, canManageKitchenProduction } from '@/lib/auth';
+import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
 import { enrichBatch, shelfLifeRemaining, computeFifo, ProductionBatch } from '@/lib/production-batch';
 
 /**
@@ -17,9 +17,12 @@ import { enrichBatch, shelfLifeRemaining, computeFifo, ProductionBatch } from '@
  */
 export async function GET(request: Request) {
   try {
+    // READ — logged-in only. POST /scan (open to staff) already returns the
+    // same enriched batch shape to any signed-in user, so gating this lookup
+    // tighter protected nothing; the read/write split lives in
+    // canManageKitchenProduction (src/lib/auth.ts).
     const me = await getCurrentUser();
     if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-    if (!canManageKitchenProduction(me)) return Response.json({ error: 'Head chef or admin only' }, { status: 403 });
 
     const url = new URL(request.url);
     const barcode = (url.searchParams.get('barcode') || '').trim();

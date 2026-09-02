@@ -1,5 +1,6 @@
 import { getDb, generateId } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
+import { canonNameInput } from '@/lib/name-canon';
 
 // Disable any caching — the list changes immediately on import / edit and we want
 // the browser to always see a fresh count.
@@ -14,6 +15,8 @@ export const revalidate = 0;
  * POST   /api/departments               admin-only
  *        body: { name, code?, description?, head_chef_user_id? }
  * PUT    /api/departments               admin-only
+ *        409 when material_categories claims a category another MAIN department
+ *        already owns (names the category and the owner; see the block below)
  * DELETE /api/departments?id=X          admin-only — soft-delete (is_active=0)
  */
 export async function GET(request: Request) {
@@ -96,6 +99,64 @@ export async function PUT(request: Request) {
     let matCatsJson: string | null | undefined;
     if (b.material_categories !== undefined) {
       if (Array.isArray(b.material_categories) && b.material_categories.length > 0) {
+        /* ── A MATERIAL CATEGORY BELONGS TO EXACTLY ONE DEPARTMENT ──────────
+         * Nothing refused an overlapping whitelist before, so two MAIN
+         * departments could both claim "meat" (proven on a copy of the live
+         * DB: Operations claiming Kitchen's "meat" saved 200) — and the PO
+         * deviation router (src/lib/po-deviation-alert.ts) then cannot name a
+         * single owner: it alerts EVERY claimant's heads and files a routing
+         * gap for the admin on every such receipt. Refused at the ONLY door
+         * that writes this column (this PUT; the POST above never binds it),
+         * naming the clash and its owner so the fix is one screen away.
+         *
+         * The comparison key is the router's own fold (catKey =
+         * trim().toLowerCase()) hardened with the invisible-character strip
+         * (@/lib/name-canon) so a zero-width character cannot smuggle a
+         * look-identical claim past this refusal. DEACTIVATED main departments
+         * still count as owners — deactivation keeps the whitelist
+         * (DELETE below is a soft-delete), reactivation is one tick, and this
+         * check does not run on reactivation, so allowing the claim now would
+         * plant a dormant collision. The 409 says so and names the remedy.
+         * Checked against OTHER departments only (id <> b.id): re-saving a
+         * department's own list is always legal. Measured on the live DB
+         * 2026-09-02: zero collisions exist today, so nothing stored is
+         * refused by this arriving.
+         */
+        const keyOf = (v: unknown) => canonNameInput(v).toLowerCase();
+        const others = db.prepare(`
+          SELECT id, name, is_active, material_categories
+            FROM departments
+           WHERE parent_id IS NULL AND id <> ?
+        `).all(String(b.id)) as Array<{ id: string; name: string; is_active: number; material_categories: string | null }>;
+        const ownerByCat = new Map<string, { id: string; name: string; is_active: number }>();
+        for (const d of others) {
+          try {
+            const arr = JSON.parse(d.material_categories || '[]');
+            if (Array.isArray(arr)) {
+              for (const c of arr) {
+                const k = keyOf(c);
+                if (k && !ownerByCat.has(k)) ownerByCat.set(k, { id: d.id, name: d.name, is_active: d.is_active === null || d.is_active === undefined ? 1 : Number(d.is_active) });
+              }
+            }
+          } catch { /* a malformed stored whitelist owns nothing — same reading as the router's */ }
+        }
+        for (const c of b.material_categories) {
+          const k = keyOf(c);
+          if (!k) continue;
+          const owner = ownerByCat.get(k);
+          if (owner) {
+            const label = canonNameInput(c) || String(c);
+            return Response.json({
+              error: `Category "${label}" already belongs to ${owner.name}`
+                + (owner.is_active ? '' : ' (a deactivated department — its whitelist still counts, because reactivating it is one tick)')
+                + `. A material category can belong to exactly ONE department, or deviation alerts cannot name a single owner. `
+                + `Nothing was saved. Remove "${label}" from ${owner.name}'s material list first, then add it here.`,
+              conflict_category: label,
+              conflict_department_id: owner.id,
+              conflict_department: owner.name,
+            }, { status: 409 });
+          }
+        }
         matCatsJson = JSON.stringify(b.material_categories);
       } else {
         matCatsJson = null;

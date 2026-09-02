@@ -2,6 +2,12 @@ import { getDb, generateId, updateMaterialPrice } from '@/lib/db';
 import { readPoSnapshots, snapshotKey } from '@/lib/po-stock-snapshot';
 import { centralFlowBlock, isStoreMappedMaterial } from '@/lib/store-engine';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
+// THE PURCHASES ROLE GATE LIVES IN ONE MODULE — src/lib/purchases-access.ts —
+// shared with the two importer routes (/api/purchases/bulk and
+// /api/purchases/opening-stock) that write the same purchases rows. It used to
+// be a private function here, which is exactly how the importers shipped
+// without it. See the module header for the bar and the measured callers.
+import { requirePurchasesAccess } from '@/lib/purchases-access';
 import { canSeeAllDeptStock } from '@/lib/dept-stock';
 import { checkPurchaseDate } from '@/lib/purchase-guard';
 // The QC gate is ONE helper, shared with both receiving routes and the bulk
@@ -89,6 +95,8 @@ export async function GET(request: Request) {
      */
     const me = await getCurrentUser();
     if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
+    const deniedGet = requirePurchasesAccess(me);
+    if (deniedGet) return deniedGet;
     const db = getDb();
     const url = new URL(request.url);
     const materialId = url.searchParams.get('material_id');
@@ -251,6 +259,8 @@ export async function POST(request: Request) {
     // through every recipe. Mirrors the gate /api/grn already has.
     const me = await getCurrentUser();
     if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
+    const deniedPost = requirePurchasesAccess(me);
+    if (deniedPost) return deniedPost;
     const db = getDb();
     const body = await request.json();
     const { material_id, vendor, brand, quantity, unit_price, date, notes,

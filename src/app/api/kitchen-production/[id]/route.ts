@@ -1,5 +1,5 @@
 import { getDb } from '@/lib/db';
-import { getCurrentUser, canManageKitchenProduction } from '@/lib/auth';
+import { getCurrentUser } from '@/lib/auth';
 import { enrichBatch, ProductionBatch } from '@/lib/production-batch';
 import { batchDepartment } from '@/lib/production-departments';
 
@@ -14,9 +14,10 @@ import { batchDepartment } from '@/lib/production-departments';
  */
 export async function GET(_request: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
+    // READ — logged-in only (the batch drawer on a page open to all members);
+    // see canManageKitchenProduction in src/lib/auth.ts for the read/write split.
     const me = await getCurrentUser();
     if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-    if (!canManageKitchenProduction(me)) return Response.json({ error: 'Head chef or admin only' }, { status: 403 });
 
     const { id } = await params;
     const db = getDb();

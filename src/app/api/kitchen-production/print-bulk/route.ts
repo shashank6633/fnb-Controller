@@ -15,7 +15,7 @@ export async function POST(request: Request) {
   try {
     const me = await getCurrentUser();
     if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-    if (!canManageKitchenProduction(me)) return Response.json({ error: 'Head chef or admin only' }, { status: 403 });
+    if (!canManageKitchenProduction(me)) return Response.json({ error: 'Head chef, manager or admin only' }, { status: 403 });
 
     const body = await request.json().catch(() => ({}));
     const ids: string[] = Array.isArray(body?.ids) ? body.ids.map((x: any) => String(x)).filter(Boolean) : [];

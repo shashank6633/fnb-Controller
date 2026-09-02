@@ -29,7 +29,7 @@ export async function GET(request: Request) {
   try {
     const me = await getCurrentUser();
     if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-    if (!canManageKitchenProduction(me)) return Response.json({ error: 'Head chef or admin only' }, { status: 403 });
+    if (!canManageKitchenProduction(me)) return Response.json({ error: 'Head chef, manager or admin only' }, { status: 403 });
 
     const url = new URL(request.url);
     const type = (url.searchParams.get('type') || 'production').toLowerCase();

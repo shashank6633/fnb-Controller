@@ -79,9 +79,11 @@ function buildBatchNumber(
 // ---------- GET ----------
 export async function GET(request: Request) {
   try {
+    // READ — logged-in only. The page this feeds is open to every signed-in
+    // user (the owner removed hodOnly from /kitchen-production); writes below
+    // keep canManageKitchenProduction.
     const me = await getCurrentUser();
     if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-    if (!canManageKitchenProduction(me)) return Response.json({ error: 'Head chef or admin only' }, { status: 403 });
 
     const db = getDb();
     const url = new URL(request.url);
@@ -150,7 +152,7 @@ export async function POST(request: Request) {
   try {
     const me = await getCurrentUser();
     if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-    if (!canManageKitchenProduction(me)) return Response.json({ error: 'Head chef or admin only' }, { status: 403 });
+    if (!canManageKitchenProduction(me)) return Response.json({ error: 'Head chef, manager or admin only' }, { status: 403 });
 
     const body = await request.json().catch(() => ({}));
     let item_name = String(body?.item_name || '').trim();

@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { canAccessPage, firstAllowedPath } from '@/lib/page-catalog';
+import { loadHodOnlyOverrides } from '@/lib/hod-overrides';
 import { getDb } from '@/lib/db';
 
 /**
@@ -180,6 +181,13 @@ export function proxy(req: NextRequest) {
   if (!isApi) {
     try {
       const db = getDb();
+      // Admin HOD-gate overrides (settings key 'hod_only_overrides') must be in
+      // page-catalog's state BEFORE canAccessPage runs, or a switched-off gate
+      // still blocks here. TTL-cached (2s) so this costs at most one tiny
+      // settings SELECT per interval; it fails CLOSED internally (any read/parse
+      // problem → the coded hodOnly flags stand), so it cannot widen access on
+      // a DB error the way this block's own catch fails open.
+      loadHodOnlyOverrides();
       // Resolve the EFFECTIVE tier + page set from the assigned named role (if any),
       // mirroring getCurrentUser(): a role-based user's page_access lives on the
       // role, not the user row — read it here or page gating fails open.

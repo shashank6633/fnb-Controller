@@ -1,5 +1,6 @@
 import { getDb, generateId } from '@/lib/db';
 import { lockedUnitFields } from '@/lib/unit-audit-lock';
+import { canonNameInput } from '@/lib/name-canon';
 
 // Map POS categories to our system categories
 function mapCategory(posCategory: string): string {
@@ -175,10 +176,17 @@ export async function POST(request: Request) {
       // skip any material whose name already exists (in the DB, or duplicated
       // earlier in this same file). An import therefore NEVER deletes or
       // overwrites existing data — it only ADDS genuinely new items.
+      // canonNameInput on BOTH sides of the key, not `.trim()` — a CSV saved
+      // from Excel puts a BOM in front of the first cell, and a pasted name can
+      // carry a zero-width space; either made a look-identical row read as
+      // "genuinely new" here and STORED the dirty spelling (the same hole
+      // proven against POST /api/inventory's isDuplicateName — see
+      // @/lib/name-canon). Identity on all 952 live names, so the key set is
+      // exactly what it was for everything already stored.
       const existingNames = new Set<string>();
       if (!clearExisting) {
         for (const row of db.prepare(`SELECT name FROM raw_materials`).all() as any[]) {
-          existingNames.add(String(row.name || '').trim().toLowerCase());
+          existingNames.add(canonNameInput(row.name).toLowerCase());
         }
       }
       const seenInFile = new Set<string>();
@@ -188,7 +196,7 @@ export async function POST(request: Request) {
       let skippedExisting = 0;  // rows skipped because the material already exists
 
       for (const mat of materials) {
-        const name = mat.name?.trim();
+        const name = canonNameInput(mat.name);
         if (!name) { skipped++; continue; }
         const dedupKey = name.toLowerCase();
         if (!clearExisting && (existingNames.has(dedupKey) || seenInFile.has(dedupKey))) {

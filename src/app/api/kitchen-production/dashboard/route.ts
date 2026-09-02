@@ -1,5 +1,5 @@
 import { getDb } from '@/lib/db';
-import { getCurrentUser, getCurrentOutletId, canManageKitchenProduction } from '@/lib/auth';
+import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
 import { parseDateTime, expiryStatus, ProductionBatch } from '@/lib/production-batch';
 import { todayIST, fmtISTIsoDate } from '@/lib/format-date';
 import { packFactor } from '@/lib/pack-units';
@@ -46,9 +46,10 @@ import { packFactor } from '@/lib/pack-units';
  */
 export async function GET() {
   try {
+    // READ — logged-in only. The owner opened /kitchen-production/dashboard to
+    // all signed-in users (hodOnly removed, 89ecb14); this feed matches the page.
     const me = await getCurrentUser();
     if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-    if (!canManageKitchenProduction(me)) return Response.json({ error: 'Head chef or admin only' }, { status: 403 });
 
     const db = getDb();
     const outletId = await getCurrentOutletId();

@@ -146,12 +146,18 @@ export async function getCurrentUser(): Promise<SessionUser | null> {
 export function canApproveAsChef(user: SessionUser): boolean {
   return user.role === 'admin' || user.is_head_chef || user.can_approve_requisitions;
 }
-/** Kitchen Production (batches / labels / FIFO consume / dispose) is an
- *  HOD-only surface — strictly head chef or admin. Deliberately NOT
- *  canApproveAsChef: the granular can_approve_requisitions flag must not
- *  unlock production APIs (its pages are hodOnly in the catalog too). */
+/** Kitchen Production WRITES (create batch / labels / FIFO consume / dispose /
+ *  item + department masters): resolved tier head chef OR manager OR admin —
+ *  the owner's 2026-09 call, widening the earlier strict head-chef-or-admin
+ *  gate to managers. READS are deliberately NOT behind this: the owner opened
+ *  the Kitchen Production page + Dashboard to all signed-in users (89ecb14),
+ *  so their GET feeds authenticate only (reports stays management-gated to
+ *  match its hodOnly page). Still deliberately NOT canApproveAsChef: the
+ *  granular can_approve_requisitions flag must not unlock production writes.
+ *  The staff scan flow (POST /scan, POST /take) keeps its own logged-in-only
+ *  gate — taking stock at the container is the line cook's action. */
 export function canManageKitchenProduction(user: SessionUser): boolean {
-  return user.role === 'admin' || user.is_head_chef;
+  return user.role === 'admin' || user.role === 'manager' || user.is_head_chef;
 }
 /** Can this user process requisitions / raise vendor POs as store manager? Admin always true. */
 export function canProcessAsStore(user: SessionUser): boolean {

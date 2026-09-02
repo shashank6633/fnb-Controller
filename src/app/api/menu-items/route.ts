@@ -1,5 +1,24 @@
 import { getDb, generateId } from '@/lib/db';
 import { checkStationOnSave } from '@/lib/station-master';
+import { getCurrentUser, type SessionUser } from '@/lib/auth';
+
+/**
+ * WRITE GATE (owner's 2026-09 call): creating, editing or DELETING a menu item
+ * — name, price, GST, station routing, active flag — is a manager/admin action on the
+ * RESOLVED tier (an assigned role's base_role wins, so the "Head Chef" role,
+ * base_role manager, passes). GET stays open to every signed-in user: the
+ * captain POS, dine-in order pads, party menus, recipes page and the offline
+ * LAN sync all read the menu. The CSV import route
+ * (/api/menu-items/import) keeps its own existing gate and is untouched, as is
+ * /api/menu-items/categories (requireRole('admin')).
+ */
+function requireMenuWriter(me: SessionUser | null): Response | null {
+  if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
+  if (me.role !== 'admin' && me.role !== 'manager') {
+    return Response.json({ error: 'Manager or admin only' }, { status: 403 });
+  }
+  return null;
+}
 
 /**
  * Reconcile an item's GST fields so they always agree (the bill engine sums the
@@ -108,6 +127,8 @@ export async function GET(request: Request) {
 
 export async function POST(request: Request) {
   try {
+    const denied = requireMenuWriter(await getCurrentUser());
+    if (denied) return denied;
     const db = getDb();
     const body = await request.json();
     const { name, category, station, item_type, dietary_tag, selling_price, listing_price, item_code, tax_value, cgst_percent, sgst_percent, prep_minutes, is_active, recipe_id, material_id, notes,
@@ -160,6 +181,8 @@ export async function POST(request: Request) {
 
 export async function PUT(request: Request) {
   try {
+    const denied = requireMenuWriter(await getCurrentUser());
+    if (denied) return denied;
     const db = getDb();
     const body = await request.json();
     const { id, ...fields } = body;
@@ -228,6 +251,16 @@ export async function PUT(request: Request) {
 
 export async function DELETE(request: Request) {
   try {
+    // SAME WRITE GATE AS POST/PUT — deleting a menu item is strictly more
+    // destructive than editing one, and this handler had NO gate at all: any
+    // signed-in session (a captain whose whole page set is /captain) could
+    // hard-delete any menu item with nothing but the CSRF cookie every
+    // logged-in browser already holds. Only caller, measured repo-wide:
+    // src/app/menu-items/page.tsx:545 — the delete button on the manager
+    // surface whose create/edit calls already pass this gate, so no
+    // legitimate flow loses anything.
+    const denied = requireMenuWriter(await getCurrentUser());
+    if (denied) return denied;
     const db = getDb();
     const url = new URL(request.url);
     const id = url.searchParams.get('id');

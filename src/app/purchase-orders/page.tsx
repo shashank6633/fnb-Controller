@@ -1355,8 +1355,12 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
    * label must not conflate them, or a tick means two things and evidences
    * neither.
    *
-   * It is a FLAG, not a gate — nothing here disables Confirm. See the block-vs-
-   * record decision in the receive route for why.
+   * AND — owner ruling, 2026-09 — ON A DEVIATING RECEIPT IT NOW GATES. A
+   * receive with any line off the PO refuses to file until all three store
+   * checks are ticked; the receive route enforces the same rule server-side
+   * (field 'qc_store', 400), because a UI-only gate is cosmetic. A CLEAN
+   * receipt is untouched: ticks stay optional there and an unticked clean
+   * receive files unsigned exactly as before.
    */
   const poMismatches = useMemo(
     () => activeDeviations.filter(d => d.deviates).map(d => {
@@ -1369,6 +1373,12 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
     }),
     [activeDeviations],
   );
+  /* The AND the server signs on, and the gate it now refuses on. `qcBlocked`
+     is true only on a DEVIATING receipt with the checklist incomplete — the
+     exact payload the route answers 400 / field 'qc_store' to, so Confirm
+     never goes live on a receive the server is certain to refuse. */
+  const qcAllTicked = qcExpiry && qcWeight && qcInvoiceMatch;
+  const qcBlocked = poMismatches.length > 0 && !qcAllTicked;
   /* …AND THE BLOCK HAS TO BE ON SCREEN. chargeBlockers renders inside the
      scrolling body, at the BOTTOM of it. Measured in a real browser on a 10-line
      PO at 1280×900 with the modal freshly opened: the scroll body ends at y=842,
@@ -1415,6 +1425,16 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
     }
     if (missingReason.length > 0) {
       alert(missingList('Add a reason for these lines before receiving:\n'));
+      return;
+    }
+    // The store-check gate on a deviating receipt — same belt-and-braces
+    // stance: the route re-refuses this exact payload (400, field 'qc_store'),
+    // this is only so the receiver gets the sentence without the round trip.
+    if (qcBlocked) {
+      alert('This delivery differs from the purchase order:\n'
+          + poMismatches.map(m => `• ${m.name} — ${m.text}`).join('\n')
+          + '\n\nAn off-PO delivery can only be received with all three store checks ticked. '
+          + 'The third box confirms the difference above is known and agreed.');
       return;
     }
     // THE BILL NUMBER, said in full before the round trip. It is also in
@@ -2425,10 +2445,14 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
               happen, so a half-answered checklist is never a surprise found
               later on the GRN.
 
-              NOTHING HERE DISABLES CONFIRM — see the block-vs-record decision in
-              the receive route. The gate on a deviating line is the typed
-              reason, which is already mandatory and cannot be cleared by
-              clicking. */}
+              ON A DEVIATING RECEIPT THIS NOW GATES (owner ruling — see the
+              decision block in the receive route): any line off the PO makes
+              all three ticks mandatory, Confirm stays disabled (qcBlocked) and
+              the route refuses the payload anyway (400, field 'qc_store'). On
+              a CLEAN receipt nothing disables Confirm — ticks stay optional
+              and an unticked receive files unsigned, exactly as before. The
+              typed per-line reason stays mandatory on every deviating line;
+              the tick is IN ADDITION to it, never instead of it. */}
           {!loading && stake && (
             <div className="rounded-lg border border-[#E8D5C4] bg-[#FFF8F0] px-3 py-2.5 space-y-2">
               <div className="text-xs font-semibold text-[#2D1B0E]">
@@ -2452,6 +2476,12 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
                         <li key={m.id}>• <span className="font-medium">{m.name}</span> — {m.text}</li>
                       ))}
                     </ul>
+                    {/* THE RULE, STATED WHERE THE MISMATCH IS — an off-PO
+                        receive cannot be filed half-checked, and the receiver
+                        should learn that here, not from a dead Confirm. */}
+                    <div className="mt-1 font-medium">
+                      An off-PO delivery can only be received with all three store checks below ticked.
+                    </div>
                   </div>
                 </div>
               )}
@@ -2473,32 +2503,36 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
                               : 'Invoice matches PO (rate, qty, vendor)'} />
               </div>
 
-              {/* THE CONSEQUENCE, STATED BEFORE CONFIRM — not discovered later. */}
+              {/* THE CONSEQUENCE, STATED BEFORE CONFIRM — not discovered later.
+                  Three states now: signed (green), clean-and-unticked (files
+                  unsigned, still receivable), and deviating-and-unticked —
+                  which no longer files at all: Confirm is disabled and the
+                  route refuses the payload (400, field 'qc_store'). */}
               <div className={`text-[10px] rounded px-2 py-1 ${
-                qcExpiry && qcWeight && qcInvoiceMatch
+                qcAllTicked
                   ? 'bg-emerald-50 text-emerald-800 border border-emerald-200'
-                  : 'bg-[#F5EDE3] text-[#6B5744] border border-[#E8D5C4]'}`}>
-                {qcExpiry && qcWeight && qcInvoiceMatch ? (
+                  : qcBlocked
+                    ? 'bg-red-50 text-red-800 border border-red-200'
+                    : 'bg-[#F5EDE3] text-[#6B5744] border border-[#E8D5C4]'}`}>
+                {qcAllTicked ? (
                   <>All three checked — this receipt will be filed <strong>signed by you</strong> as the store check.</>
+                ) : qcBlocked ? (
+                  /* BEFORE Confirm, nobody can know who will be reachable — the
+                     admins are the alert module's one guarantee, a department
+                     head is conditional on one being set. Promise the
+                     guarantee, name the condition; the counted answer comes in
+                     the response after Confirm. */
+                  <>
+                    This delivery differs from the PO, so it <strong>cannot be received until all three
+                    checks are ticked</strong>{' '}— the third confirms the difference above is known and agreed.
+                    Once filed, the off-PO line(s) and your reasons go out signed under your name — to the
+                    admins, and to the department&apos;s head if one is set. You are told who was reached.
+                  </>
                 ) : (
                   <>
                     This receipt will be filed <strong>UNSIGNED</strong> by the store
                     {(qcExpiry || qcWeight || qcInvoiceMatch) ? ' (a partial checklist is recorded, but is not a signature)' : ''}.
                     {' '}You can still receive.
-                    {/* BEFORE Confirm, nobody can know who will be reachable —
-                        that answer only exists in the response. The admins are
-                        the one guarantee the alert module makes (they are told
-                        on every deviating receipt, including when the department
-                        half fails outright); a department head is conditional on
-                        one being set, which on today's data is usually not the
-                        case. So this promises the guarantee and names the
-                        condition, and the receipt's own answer — counted, with
-                        the gaps in words — is reported after Confirm. */}
-                    {poMismatches.length > 0 && !qcInvoiceMatch && (
-                      <> The off-PO line(s) above go out as
-                        <strong> recorded but not reconciled</strong> — to the admins, and to the
-                        department&apos;s head if one is set. You are told who was reached once this is filed.</>
-                    )}
                   </>
                 )}
               </div>
@@ -2544,10 +2578,11 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
           </button>
           <button onClick={submit}
                   disabled={saving || loading || !stake || activeDeviations.length === 0
-                            || missingReason.length > 0 || chargeBlockers.length > 0}
+                            || missingReason.length > 0 || qcBlocked || chargeBlockers.length > 0}
                   title={!stake ? 'Pick which vendor is delivering'
                        : activeDeviations.length === 0 ? 'Tick at least one line to put on this bill'
                        : missingReason.length > 0 ? missingList('Reason still needed on:\n')
+                       : qcBlocked ? 'This delivery differs from the PO — tick all three store checks to receive it'
                        : chargeBlockers.length > 0 ? chargeBlockers.join('\n') : undefined}
                   className="px-3 py-2 text-sm bg-green-600 hover:bg-green-700 text-white rounded-lg inline-flex items-center gap-1 disabled:opacity-50">
             {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <PackageCheck className="w-4 h-4" />}

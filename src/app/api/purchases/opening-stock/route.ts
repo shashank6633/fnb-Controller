@@ -1,5 +1,9 @@
 import { getDb, generateId, updateMaterialPrice } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
+// THE PURCHASES ROLE GATE — one module, shared with GET/POST /api/purchases and
+// /api/purchases/bulk. See src/lib/purchases-access.ts for the bar
+// (store manager / HOD / management) and the measured callers.
+import { requirePurchasesAccess } from '@/lib/purchases-access';
 import { centralFlowBlock } from '@/lib/store-engine';
 
 /**
@@ -27,6 +31,15 @@ export async function POST(request: Request) {
   try {
     const me = await getCurrentUser();
     if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
+    /* ── ROLE GATE, THE ONE GET/POST /api/purchases ALREADY HAVE ──────────────
+     * Seeding go-live stock writes the same purchases rows, moves the same
+     * current_stock and reruns the same updateMaterialPrice average as the
+     * register's own POST — so it carries the register's bar (store manager /
+     * HOD / management), not login-only. The only browser caller is the Upload
+     * Opening Stock button on /purchases, whose feed already requires this —
+     * every legitimate operator of that page still passes. */
+    const deniedOpen = requirePurchasesAccess(me);
+    if (deniedOpen) return deniedOpen;
 
     const db = getDb();
     const body = await request.json();

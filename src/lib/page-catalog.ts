@@ -516,6 +516,13 @@ export const PAGE_CATALOG: PageSection[] = [
       // The route behind it (requireRole('admin')) is the real lock; this entry
       // is what stops the proxy waving through a legacy null-map user.
       { path: '/admin/page-access-impact', label: 'Page Access - Impact Preview', adminOnly: true },
+      // HOD-Only Gates — the admin toggles behind the hodOnly overrides above
+      // (see the block comment over applyHodOnlyOverrides further down this
+      // file). adminOnly: switching a gate off widens who can OPEN a page, the
+      // same class of decision as editing this catalog by hand. The catalog
+      // flag is the page-level lock only — /api/settings/hod-only refuses
+      // non-admin reads AND writes with its own 403, which is the real gate.
+      { path: '/settings/hod-gates',  label: 'Settings — HOD-Only Gates', adminOnly: true },
       { path: '/settings/integrations', label: 'Settings — Integrations' },
       { path: '/settings/integrations/whatsapp', label: 'Settings — WhatsApp' },
       { path: '/settings/qr-standees', label: 'Settings — QR Standees' },
@@ -551,8 +558,62 @@ function bestEntry(pathname: string): PageEntry | null {
   }
   return best;
 }
+/* ── HOD-only gate overrides (owner pick 9B, commissioned 2026-09-02) ────────
+ * Admin-owned relaxations of the CODED hodOnly flags above, so the owner can do
+ * from a screen what the 2026-08-31 page-catalog edit did for Kitchen
+ * Production by hand: switch a page's hard HOD gate OFF so it follows the
+ * normal page_access grant, and switch it back ON to restore the coded gate.
+ *
+ * SHAPE: a map of catalog path → false. Only `false` entries are kept — the
+ * map can only ever RELAX a coded hodOnly flag, never add one, and it is
+ * consulted ONLY when the matched entry's coded flag is hodOnly: true, so
+ * mgmtOnly / adminOnly / unflagged pages are untouchable by construction.
+ *
+ * PLUMBING: this module is bundled into BOTH server and client, so the state
+ * is a per-bundle module global with a setter. The server pushes it from the
+ * settings key 'hod_only_overrides' via src/lib/hod-overrides.ts (the proxy
+ * loads it before every canAccessPage call); the client pushes it from the
+ * /api/auth/me payload (Sidebar). A bundle nothing pushed to keeps null.
+ *
+ * FAIL CLOSED: null / undefined / non-object / array / any malformed value →
+ * the state resets to null and every CODED flag stands. There is no input that
+ * widens access by accident — only a well-formed `false` on a coded-hodOnly
+ * path relaxes anything.
+ *
+ * This gates the PAGE only. Every hodOnly page's own APIs keep their
+ * server-side HOD/admin 403s (verified per page in /settings/hod-gates) —
+ * exactly the PAGE-vs-API split the Kitchen Production removal proved.
+ */
+let HOD_ONLY_OVERRIDES: Record<string, false> | null = null;
+
+/** Replace the override state. Anything malformed → null (coded flags stand). */
+export function applyHodOnlyOverrides(raw: unknown): void {
+  if (raw === null || raw === undefined || typeof raw !== 'object' || Array.isArray(raw)) {
+    HOD_ONLY_OVERRIDES = null;
+    return;
+  }
+  const clean: Record<string, false> = {};
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    // Keep ONLY literal-false values — anything else (true, 'false', 0, junk)
+    // is dropped, which leaves that page's coded flag standing.
+    if (v === false) clean[k] = false;
+  }
+  HOD_ONLY_OVERRIDES = clean;
+}
+
+/** The sanitized override state this bundle currently holds (null = none). */
+export function getHodOnlyOverrides(): Record<string, false> | null {
+  return HOD_ONLY_OVERRIDES;
+}
+
 export function isHodOnlyPath(pathname: string): boolean {
-  return !!bestEntry(pathname)?.hodOnly;
+  const entry = bestEntry(pathname);
+  if (!entry?.hodOnly) return false;
+  // An admin override may switch the coded gate OFF for this entry (matched on
+  // the ENTRY's own path, so children under it follow their parent, same as the
+  // longest-prefix rule above). Any other value → the coded flag stands.
+  if (HOD_ONLY_OVERRIDES && HOD_ONLY_OVERRIDES[entry.path] === false) return false;
+  return true;
 }
 /** Is `pathname` under a management-only catalog entry (admin/manager/HOD)? */
 export function isMgmtOnlyPath(pathname: string): boolean {

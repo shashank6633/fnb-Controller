@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { canAccessPage } from "@/lib/page-catalog";
+import { canAccessPage, applyHodOnlyOverrides } from "@/lib/page-catalog";
 import {
   LayoutDashboard,
   ShoppingCart,
@@ -412,6 +412,14 @@ const navTree: NavEntry[] = [
       // as well: this file keeps its own nav tree, and a page registered only in
       // the catalog is correctly gated and completely invisible.
       { kind: "link", label: "Page Access — Impact", href: "/admin/page-access-impact", icon: ShieldAlert },
+      // HOD-Only Gates — admin toggles that relax the catalog's hard hodOnly
+      // page gates (owner pick 9B). adminOnly in the page-catalog, so
+      // canAccessPage hides this row for everyone else. Listed here as well
+      // because this file keeps its own nav tree — a page registered only in
+      // the catalog is correctly gated and completely invisible (the
+      // /variance-approvals drift). Reuses ShieldAlert: a new lucide import
+      // would land in the import hunk the held liquor work is editing.
+      { kind: "link", label: "HOD-Only Gates", href: "/settings/hod-gates",     icon: ShieldAlert },
       { kind: "link", label: "Integrations",   href: "/settings/integrations",  icon: ShieldAlert },
       { kind: "link", label: "QR Standees",    href: "/settings/qr-standees",   icon: QrCode },
       { kind: "link", label: "Menu Design",    href: "/settings/customer-menu", icon: LayoutGrid },
@@ -480,7 +488,15 @@ export default function Sidebar() {
   // Current user — used to filter nav links by the per-user page_access map.
   const [me, setMe] = useState<{ role?: string; page_access?: string | null; is_head_chef?: boolean } | null>(null);
   useEffect(() => {
-    fetch('/api/auth/me').then(r => r.json()).then(d => setMe(d?.user || null)).catch(() => {});
+    fetch('/api/auth/me').then(r => r.json()).then(d => {
+      // Push the admin HOD-gate overrides into page-catalog's client state
+      // BEFORE setMe triggers the canAccessPage filter below, so the sidebar
+      // shows exactly what the proxy will let through (a switched-off gate that
+      // stayed hidden here would be the sidebar-vs-catalog drift trap again).
+      // applyHodOnlyOverrides fails closed on anything malformed.
+      applyHodOnlyOverrides(d?.hod_only_overrides ?? null);
+      setMe(d?.user || null);
+    }).catch(() => {});
   }, []);
 
   // Filtered tree honouring page-level access. Null user → render nothing

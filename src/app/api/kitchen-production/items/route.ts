@@ -9,14 +9,17 @@ import { getCurrentUser, canManageKitchenProduction } from '@/lib/auth';
  *   POST /api/kitchen-production/items            → create { name, category?, unit?, shelf_life_hours?, default_storage_location? }
  *   PUT  /api/kitchen-production/items            → update { id, ...fields, is_active? }
  *
- * HOD/admin only (same gate as batch creation). Items are never deleted — they
- * deactivate, so old batches always keep a valid production_item_id.
+ * GET is logged-in only (the item list feeds a page open to all members);
+ * POST/PUT are head-chef/manager/admin (same gate as batch creation). Items are
+ * never deleted — they deactivate, so old batches always keep a valid
+ * production_item_id.
  */
 export async function GET(request: Request) {
   try {
+    // READ — logged-in only (feeds the New Batch form on a page open to all
+    // members); POST/PUT below keep canManageKitchenProduction.
     const me = await getCurrentUser();
     if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-    if (!canManageKitchenProduction(me)) return Response.json({ error: 'Head chef or admin only' }, { status: 403 });
     const db = getDb();
     const all = new URL(request.url).searchParams.get('all') === '1';
     const items = db.prepare(
@@ -32,7 +35,7 @@ export async function POST(request: Request) {
   try {
     const me = await getCurrentUser();
     if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-    if (!canManageKitchenProduction(me)) return Response.json({ error: 'Head chef or admin only' }, { status: 403 });
+    if (!canManageKitchenProduction(me)) return Response.json({ error: 'Head chef, manager or admin only' }, { status: 403 });
 
     const body = await request.json().catch(() => ({}));
     const name = String(body?.name || '').trim();
@@ -64,7 +67,7 @@ export async function PUT(request: Request) {
   try {
     const me = await getCurrentUser();
     if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-    if (!canManageKitchenProduction(me)) return Response.json({ error: 'Head chef or admin only' }, { status: 403 });
+    if (!canManageKitchenProduction(me)) return Response.json({ error: 'Head chef, manager or admin only' }, { status: 403 });
 
     const body = await request.json().catch(() => ({}));
     const id = String(body?.id || '').trim();

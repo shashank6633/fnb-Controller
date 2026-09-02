@@ -9,6 +9,10 @@ import { resolveQcRequirement } from '@/lib/grn-qc';
 // untouched. See src/lib/direct-issue.ts.
 import { resolveDirectIssueBulk, postDirectReceipt } from '@/lib/direct-issue';
 import { getCurrentUser } from '@/lib/auth';
+// THE PURCHASES ROLE GATE — one module, shared with GET/POST /api/purchases and
+// /api/purchases/opening-stock. See src/lib/purchases-access.ts for the bar
+// (store manager / HOD / management) and the measured callers.
+import { requirePurchasesAccess } from '@/lib/purchases-access';
 import { checkPurchaseDate } from '@/lib/purchase-guard';
 // The "one item = one line on a bill" remedy sentence is SHARED, not restated:
 // the PO routes, the bill modal and POST /api/purchases already print it
@@ -85,6 +89,16 @@ export async function POST(request: Request) {
     // session once here and reuse it for the backdate rule.
     const me = await getCurrentUser();
     if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
+    /* ── ROLE GATE, THE ONE GET/POST /api/purchases ALREADY HAVE ──────────────
+     * Login alone was never enough here: with the register 403'd to plain
+     * staff, leaving this importer session-only meant a staffer who could not
+     * READ a single purchase row could still bulk-INSERT rows that move
+     * current_stock and rewrite average_price through every recipe. Same bar,
+     * same module, as the register: store manager / HOD / management. The only
+     * browser caller is the Generic CSV Upload button on /purchases, whose own
+     * feed already requires this — nobody who could use the button loses it. */
+    const deniedBulk = requirePurchasesAccess(me);
+    if (deniedBulk) return deniedBulk;
     const isAdmin = me.role === 'admin';
 
     const db = getDb();

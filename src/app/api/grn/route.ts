@@ -20,6 +20,7 @@ import { learnVendorMaterialPair, type VendorMappingOutcome } from '@/lib/vendor
 // petty_cash_ledger and to nothing else.
 import { cashRunAlreadyPaid, cashVoucherOwner, isMintedCashVoucher, mintCashVoucherNo, recordCashPurchase } from '@/lib/cash-purchase';
 import { normalizeBillNo } from '@/lib/bill-no';
+import { canonNameInput } from '@/lib/name-canon';
 import { MAX_PAISE, mayRecordPettyCash, outflowWarning, fmtRs } from '@/lib/petty-cash';
 import { canAccessPage } from '@/lib/page-catalog';
 import { todayIST } from '@/lib/format-date';
@@ -578,9 +579,27 @@ export async function POST(request: Request) {
     if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
     const db = getDb();
     const b = await request.json();
-    const { date, vendor_id, vendor, invoice_number, invoice_date, qc_by, notes, items,
+    const { date, vendor_id, invoice_date, qc_by, notes, items,
             qc_quality, qc_temperature, qc_expiry, qc_damage, qc_weight, qc_invoice_match,
             no_invoice_number, confirm_duplicate_bill, confirm_duplicate_cash, cash_purchase } = b;
+    /* ── THE VENDOR NAME AND THE BILL NUMBER ARE CANONICALISED ONCE, HERE ────
+     * — and every use below (the duplicate guards, the header INSERT, the
+     * `purchases` mirror, the petty-cash twin check, the vendor↔item learning,
+     * the refusal messages) sees the SAME clean value. MATCH CLEAN, STORE
+     * CLEAN. Proven on a copy of the live DB before this line existed: the
+     * duplicate-bill guard refused an exact re-post 409, then accepted the
+     * SAME bill 201 when its number carried a trailing U+200B, when the vendor
+     * did, when the vendor's space was typed as U+00A0, and when a U+200D hid
+     * INSIDE the number — four look-identical duplicates, each doubling stock
+     * and running updateMaterialPrice twice, because JS `.trim()` strips none
+     * of those interior/zero-width characters and SQLite's TRIM() strips
+     * nothing but ASCII spaces. Both canonicalisers are IDENTITY on all 29
+     * stored headers and all 2,165 purchases rows (measured 2026-09-02:
+     * zero Cf/Cc, zero NBSP, zero untrimmed edges), so nothing already
+     * recorded moves or stops matching. See @/lib/name-canon and
+     * @/lib/bill-no for the two disciplines; do not restate either inline. */
+    const vendor = canonNameInput(b.vendor);
+    const invoice_number = normalizeBillNo(b.invoice_number);
     if (!date)  return Response.json({ error: 'date required' }, { status: 400 });
 
     /* ═══════════════════════════════════════════════════════════════════════
@@ -699,15 +718,22 @@ export async function POST(request: Request) {
      * with the cash option ticked skipped the mint entirely and stored an
      * INVISIBLE string as the number the cash box is reconciled against — a
      * reference on no screen and outside the app's own blank-bill census.
-     * Applied to the CASH decision and the cash stored value only: the non-cash
-     * mandate below keeps its historical `.trim()` test byte-for-byte, because
-     * tightening it would start refusing bills this route accepts today, which
-     * is a separate change on a rail this one must leave alone.
+     * `invoice_number` is normalizeBillNo's output since the canonicalisation
+     * at the top of this handler, so EVERY branch now answers the question the
+     * same way — the cash decision, the stored value AND the non-cash mandate
+     * below. The mandate used to keep its historical `.trim()` test; the one
+     * payload that tightening refuses is a bill number made ENTIRELY of
+     * invisible characters, which previously passed as "present", skipped the
+     * duplicate guard (its normalized key is empty) and stored a number no
+     * screen can render and no census counts. Refusing it with the same 400 —
+     * type a real number, or declare "no vendor bill" — is the honest reading,
+     * and it is exactly what the PO receive route already does (its
+     * "normalizeBillNo, NOT .trim()" block).
      */
-    const cashBillNo = paidInCash ? normalizeBillNo(invoice_number) : '';
+    const cashBillNo = paidInCash ? invoice_number : '';
     const cashMint = paidInCash && (!cashBillNo || isMintedCashVoucher(cashBillNo));
     const noBill = no_invoice_number === true;
-    if (!String(invoice_number || '').trim() && !noBill && !cashMint) {
+    if (!invoice_number && !noBill && !cashMint) {
       return Response.json(
         { error: 'Vendor invoice / bill number is required on an ad-hoc GRN — it is the only link back to the vendor\'s paperwork. '
                + 'If this delivery genuinely came with no bill (a cash market run, a sample, a donation), tick "No vendor bill number" and say so.' },
@@ -1058,8 +1084,14 @@ export async function POST(request: Request) {
      * cashMint is false and a cash bill is inside both guards exactly like any
      * other bill. Paying cash does not make a duplicate bill less duplicated.
      */
-    const billNo = cashMint ? '' : (paidInCash ? cashBillNo : String(invoice_number || '').trim());
-    const vendorKey = String(vendor || '').toLowerCase().trim();
+    // Both operands of both guards below arrive pre-canonicalised (the block at
+    // the top of this handler): invoice_number/cashBillNo through normalizeBillNo,
+    // vendor through canonNameInput — so a zero-width character, a BOM or an
+    // NBSP can no longer make a look-identical bill read as a different one.
+    // The SQL side keeps its LOWER(TRIM(...)) matching against STORED rows,
+    // which the canonicalisers are measured-identity on (see that block).
+    const billNo = cashMint ? '' : (paidInCash ? cashBillNo : invoice_number);
+    const vendorKey = vendor.toLowerCase();
     // SAME-DATE MATCHES FIRST, so the hard refusal always wins over the
     // confirmable one when a vendor has used this number on several days
     // including today.
@@ -1346,15 +1378,21 @@ export async function POST(request: Request) {
        * the cross-process window a deferred BEGIN leaves open and is what makes
        * the number unique by construction rather than merely by convention.
        *
-       * TWO STORED FORMS, because the two columns already disagree on trimming
-       * and the non-cash path must stay byte-identical: the header has always
-       * stored `invoice_number || ''` raw, while purchases.bill_no stores the
-       * trimmed `billNo`. Only the cash branch collapses them onto one value.
+       * ONE STORED FORM NOW, on every branch: the clean, normalizeBillNo'd
+       * value. The header used to store `invoice_number || ''` raw while
+       * purchases.bill_no stored the trimmed `billNo`, and "store raw" is
+       * exactly how an invisible character got INTO goods_receipt_notes where
+       * no LOWER(TRIM(...)) guard could ever match it again — the stranded-row
+       * failure this route's canonicalisation block exists to end. Match
+       * clean, store clean, or the guard only protects until the first dirty
+       * save. (invoice_number is already normalized at the top of the handler,
+       * so on the non-cash branch invoiceNumberStored === billNo; both `const`s
+       * are kept because the CASH branches genuinely differ — the mint.)
        */
       const billNoStored = cashMint ? mintCashVoucherNo(db) : billNo;
       const invoiceNumberStored = cashMint ? billNoStored
                                 : paidInCash ? cashBillNo
-                                : (invoice_number || '');
+                                : invoice_number;
       if (cashMint) cashVoucherIssued = billNoStored;
       // ── THE HELD HEADER ────────────────────────────────────────────────
       // 'awaiting_qc' instead of 'received' is the WHOLE gate: it is what the

@@ -2,6 +2,7 @@ import { getDb, generateId } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
 import { effectiveCategoriesForUser } from '@/lib/dept-hierarchy';
 import { lockedUnitFields } from '@/lib/unit-audit-lock';
+import { canonNameInput } from '@/lib/name-canon';
 
 export async function GET(request: Request) {
   try {
@@ -198,11 +199,32 @@ export async function GET(request: Request) {
 }
 
 // Helper: enforce duplicate-name rule (Phase 1 §1) with case-insensitive match.
+//
+// BOTH SIDES GO THROUGH canonNameInput, AND THAT IS THE FIX, NOT A FLOURISH.
+// Callers hand this an already-canonicalised `name`, but 19 live stored names
+// are NOT canon-identity (interior double spaces name-canon collapses). The
+// previous SQL-only compare — LOWER(name) = LOWER(?) — matched canon(input)
+// against the RAW stored spelling, so POSTing "GREYGOOSE  (750ML)" (double
+// space) missed its stored double-space twin entirely and inserted a second,
+// look-identical material: HTTP 201, raw_materials 952 -> 953, proven on a
+// copy. HEAD refused that same request with a 409 — the canon work had turned
+// a guard into a hole for exactly the 7 double-space singletons it was meant
+// to protect. Canonicalising the STORED side too (the same both-sides pattern
+// import-materials/route.ts uses for its existingNames set) closes it, and
+// also closes the sibling miss: a RENAME onto a double-space singleton's
+// collapsed form went through the same helper and the same hole.
+//
+// The SQL fast path stays for the common exact case; the JS sweep is the
+// authority. ~950 rows on a write-only path — the cost is unmeasurable.
 function isDuplicateName(db: ReturnType<typeof getDb>, name: string, excludeId?: string): boolean {
   const row = db.prepare(`
     SELECT id FROM raw_materials WHERE LOWER(name) = LOWER(?) ${excludeId ? 'AND id != ?' : ''}
   `).get(...(excludeId ? [name, excludeId] : [name])) as any;
-  return !!row;
+  if (row) return true;
+  const wanted = canonNameInput(name).toLowerCase();
+  const all = db.prepare(`SELECT id, name FROM raw_materials${excludeId ? ' WHERE id != ?' : ''}`)
+    .all(...(excludeId ? [excludeId] : [])) as { id: string; name: string }[];
+  return all.some(r => canonNameInput(r.name).toLowerCase() === wanted);
 }
 
 // Helper: enforce duplicate-SKU rule (Phase 1 §1).
@@ -230,7 +252,7 @@ export async function POST(request: Request) {
     const db = getDb();
     const body = await request.json();
     const {
-      name, sku: skuInput, category, unit, purchase_unit, pack_size, case_size, reorder_level, costing_method,
+      sku: skuInput, category, unit, purchase_unit, pack_size, case_size, reorder_level, costing_method,
       // ----- Phase 1 master fields -----
       super_category, brand, yield_percent, tax_percent, cess_percent,
       standard_purchase_rate, closing_cadence,
@@ -239,12 +261,24 @@ export async function POST(request: Request) {
       priority,       // 3★ critical / 2★ standard / 1★ low (default 2)
       average_price,  // ₹/recipe-unit (the form pre-converts from ₹/purchase-unit)
     } = body;
+    // MATCH CLEAN, STORE CLEAN (see @/lib/name-canon). Proven on a copy of the
+    // live DB: "ZWSP Probe Material" + U+200B sailed past isDuplicateName's
+    // LOWER(name) = LOWER(?) — a second, look-identical material, 201 — because
+    // neither JS `.trim()` nor SQLite's LOWER touches a zero-width character.
+    // The INSERT below also used to bind the RAW payload name (not even
+    // trimmed), so the dirty spelling would then be STORED, stranded where no
+    // LOWER(TRIM(...)) join (unit-audit lock, recipe importer) reaches it.
+    // NOTE: canonNameInput is NOT identity on all stored names — 19 live names
+    // carry an interior double space it collapses (see name-canon.ts). Fine
+    // HERE (a brand-new name has no stored bytes to disagree with), but the PUT
+    // below must judge renames in canonical space on BOTH sides.
+    const name = canonNameInput(body.name);
 
     if (!name) return Response.json({ error: 'name is required' }, { status: 400 });
     if (priority != null && ![1, 2, 3].includes(Number(priority))) {
       return Response.json({ error: 'priority must be 1, 2 or 3' }, { status: 400 });
     }
-    if (isDuplicateName(db, String(name).trim())) {
+    if (isDuplicateName(db, name)) {
       return Response.json({ error: `Duplicate material name: "${name}" already exists. Phase 1 SOP: no duplicates.` }, { status: 409 });
     }
     // Phase 1 §1 — every material MUST have a SKU. If caller didn't provide one,
@@ -308,7 +342,7 @@ export async function PUT(request: Request) {
     const db = getDb();
     const body = await request.json();
     const {
-      id, name, category, unit, purchase_unit, pack_size, case_size, reorder_level, costing_method,
+      id, category, unit, purchase_unit, pack_size, case_size, reorder_level, costing_method,
       super_category, brand, yield_percent, tax_percent, cess_percent,
       standard_purchase_rate, closing_cadence,
       is_recipe_item, is_direct_sell, is_semifinished,
@@ -316,6 +350,13 @@ export async function PUT(request: Request) {
       priority,        // 3★ critical / 2★ standard / 1★ low
       average_price,   // optional manual override; expected per recipe-unit
     } = body;
+    // Same rule as the POST above: the rename gate and the stored spelling both
+    // use the canonical name, so a zero-width character can no longer rename a
+    // material to a look-identical twin of another (or store a spelling no
+    // LOWER(TRIM(...)) join can reach). A name that cleans to NOTHING now reads
+    // as "no rename" — before, an all-invisible payload name was truthy and got
+    // STORED, blanking the name on every screen.
+    const name = canonNameInput(body.name);
 
     if (!id) return Response.json({ error: 'id is required' }, { status: 400 });
     if (priority != null && ![1, 2, 3].includes(Number(priority))) {
@@ -324,10 +365,37 @@ export async function PUT(request: Request) {
     const existing = db.prepare('SELECT * FROM raw_materials WHERE id = ?').get(id) as any;
     if (!existing) return Response.json({ error: 'Material not found' }, { status: 404 });
 
-    if (name && String(name).trim() && String(name).toLowerCase() !== String(existing.name).toLowerCase()
-        && isDuplicateName(db, String(name).trim(), id)) {
+    /* ── "IS THIS A RENAME?" IS JUDGED IN CANONICAL SPACE, ON BOTH SIDES ─────
+     * canonNameInput is NOT identity on every stored name: it collapses plain
+     * ASCII double spaces, and 19 live raw_materials names carry one (measured
+     * 2026-09-02 on the live DB copy; the Cf/Cc + NBSP + edge measurement in
+     * name-canon.ts never checked interior runs). 12 of those 19 have a
+     * single-space TWIN already stored (GLENLIVET 12YRS, MONKEY SHOULDER,
+     * CHIVAS REGAL, ROKU GIN, KETEL ONE, JIMBEAM, DESMONDJI 51, SULA BRUT,
+     * KF PREMIUM DRAUGHT, AG 47 MALBEC, MALA BLUEBERRY CRUSH, PEANUT BUTTER).
+     * The edit modal always echoes the stored name back, so comparing the
+     * COLLAPSED input against the RAW stored bytes read every ordinary field
+     * edit of those rows as a rename onto the twin → 409, every time.
+     * Canonicalise the stored side too and the echo is equal again: no gate,
+     * no rename.
+     *
+     * WHAT THE ROW KEEPS when it is NOT a rename: its stored bytes, verbatim —
+     * NOT the collapsed input. Collapsing "GLENLIVET 12YRS  (700ML)" in place
+     * would store a name byte-identical to its live twin: two rows one
+     * LOWER(name) join can no longer tell apart, which is the exact corruption
+     * the duplicate gate exists to prevent. (The one deliberate exception: a
+     * pure CASE change of an already-canonical name still stores the new case,
+     * as it always has.) A REAL rename stores the canonical input, exactly as
+     * before. */
+    const existingName = String(existing.name);
+    const existingCanon = canonNameInput(existingName);
+    const isRename = !!name && name.toLowerCase() !== existingCanon.toLowerCase();
+    if (isRename && isDuplicateName(db, name, id)) {
       return Response.json({ error: `Duplicate material name: "${name}" already exists.` }, { status: 409 });
     }
+    const nameToStore = isRename ? name
+      : (name && existingCanon === existingName) ? name
+      : existingName;
 
     // average_price: optional manual override (per recipe-unit). Use COALESCE so
     // we only update when caller explicitly sets it; otherwise auto-recompute
@@ -363,7 +431,7 @@ export async function PUT(request: Request) {
           updated_at = datetime('now')
       WHERE id = ?
     `).run(
-      name || existing.name,
+      nameToStore,
       category || existing.category,
       unitVal,
       purchaseUnitVal,

@@ -117,6 +117,15 @@ const KEY_POLICY = new Map<string, KeyPolicy>([
   ['slack_webhook_url', { owner: '/api/admin/slack-webhook' }],
   ['google_sa_json', { owner: '/api/admin/google-sheets' }],
   ['label_printer', { owner: '/api/settings/label-printer' }],
+  // HOD-gate overrides (owner pick 9B): which coded hodOnly PAGE gates an
+  // admin switched off. Owned because (1) the write must be ADMIN-only and
+  // this generic PUT's floor is manager, and (2) the dedicated route validates
+  // the shape (only coded hodOnly paths, only `false` values) — a free-text
+  // write here could store junk that, while every reader fails closed to the
+  // coded flags, would silently revert the owner's toggles. Read stays open:
+  // the value names which page gates are relaxed, which the client bundle's
+  // own catalog + /api/auth/me already reveal.
+  ['hod_only_overrides', { owner: '/api/settings/hod-only' }],
 ]);
 
 /**
