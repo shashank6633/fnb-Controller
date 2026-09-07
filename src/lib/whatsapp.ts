@@ -17,8 +17,9 @@ import { reorderSuggestions } from './crm-analyst-data';
  * below is real but only reachable once config is complete.
  */
 
-/** Meta Graph API version — v19.0 EXPIRED 2026-05-21 (HTTP 400 for all calls). */
-const META_GRAPH_VERSION = 'v23.0';
+/** Meta Graph API version — v19.0 EXPIRED 2026-05-21 (HTTP 400 for all calls).
+ *  Exported so other Graph callers (wa-inbox media fetch) share ONE copy. */
+export const META_GRAPH_VERSION = 'v23.0';
 
 /** Settings keys owned by this module (whitelist for setWaConfig). */
 export const WA_CONFIG_KEYS = [

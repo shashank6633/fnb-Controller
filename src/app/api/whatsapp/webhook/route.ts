@@ -1,4 +1,6 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import { getDb } from '@/lib/db';
+import { processWebhookEvent } from '@/lib/wa-inbox';
 
 /**
  * WhatsApp webhook endpoint — PUBLIC (whitelisted in proxy.ts isPublic).
@@ -40,17 +42,31 @@ export async function GET(request: Request) {
 }
 
 export async function POST(request: Request) {
+  let eventId = 0;
+  let payload = '';
   try {
     const raw = await request.text().catch(() => '');
-    // Store whatever arrived (even non-JSON) — future processors decide.
-    let payload = raw;
+    // Store whatever arrived (even non-JSON) — the raw archive is the FIRST,
+    // never-fail step; everything downstream can be replayed from it.
+    payload = raw;
     try { payload = JSON.stringify(JSON.parse(raw)); } catch { /* keep raw text */ }
     const db = getDb();
-    db.prepare('INSERT INTO whatsapp_events_log (kind, payload) VALUES (?, ?)')
+    const info = db.prepare('INSERT INTO whatsapp_events_log (kind, payload) VALUES (?, ?)')
       .run('webhook', payload || '{}');
+    eventId = Number(info.lastInsertRowid);
   } catch (e: any) {
     // Never bubble an error to Meta — log locally, still 200.
     console.error('[/api/whatsapp/webhook POST]', e);
+  }
+  // Inbox ingest — its OWN try, so a parser bug can never lose the raw payload
+  // archived above (the admin backlog replay re-processes from the log).
+  // Idempotent (wamid dedupe), so Meta webhook retries change nothing.
+  if (eventId) {
+    try {
+      await processWebhookEvent(getDb(), eventId, payload || '{}');
+    } catch (e: any) {
+      console.error('[/api/whatsapp/webhook POST] inbox ingest failed (raw payload archived):', e);
+    }
   }
   return Response.json({ received: true });
 }

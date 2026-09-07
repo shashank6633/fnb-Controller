@@ -22,6 +22,12 @@ import {
   poReceiptLines, poReceipts, receivedNet as poReceivedNet,
   receivedLineCountSql, poLineDelivery, type PoReceipt,
 } from '@/lib/po-receipts';
+// WHAT CHANGED on a PO awaiting re-approval — the answer to "for which item is
+// the reapproval being asked?" Computed from the po.edit audit event's
+// before-state vs the live lines (see that module's header for the baseline
+// rule); attached only to pending_reapproval rows, so the cost is bounded by
+// how many POs are in that state at once (a handful).
+import { poReapprovalChanges } from '@/lib/po-diff';
 
 /** A receipt row after the fold below has priced it and tied it to its vendor
  *  bill. Named so the fold is NOT laundered through `any[]`: receivedNet()
@@ -510,6 +516,22 @@ export async function GET(request: Request) {
           vendor_name: b.vendor_name || '', bill_no: b.bill_no || '', bill_date: b.bill_date || '',
         });
       } catch { /* table absent on an un-migrated DB — the counts above still stand */ }
+    }
+
+    // ── WHAT CHANGED on POs awaiting re-approval ─────────────────────────────
+    // The approver scans this list before opening anything, so the change-set
+    // ("+1 item, 2 qty, 1 rate, +₹…") must ride the LIST row — the badge cannot
+    // wait for an expand. Attached ONLY to pending_reapproval rows (bounded: at
+    // most a handful at a time), and best-effort: this is an information layer
+    // for the person deciding, and a failure to compute it must degrade to the
+    // page's "no data → show nothing" convention, never 500 the whole list.
+    // { recorded: false } inside the payload is the HONEST case (edit predates
+    // change tracking) and is rendered as "details not recorded", not hidden.
+    for (const r of rows) {
+      if (r.status === 'pending_reapproval') {
+        try { r.reapproval_changes = poReapprovalChanges(db, String(r.id)); }
+        catch (e) { console.error('[po-diff]', r.id, e); }
+      }
     }
 
     const role = await effectiveRole();

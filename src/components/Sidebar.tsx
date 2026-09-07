@@ -70,6 +70,7 @@ import {
   CalendarCheck,
   Radar,
   HeartHandshake,
+  MessageCircle,
   Undo2,
   type LucideIcon,
 } from "lucide-react";
@@ -314,6 +315,9 @@ const navTree: NavEntry[] = [
       // the page correctly and leaves it invisible.
       { kind: "link", label: "Missed Attribution", href: "/crm-calls/missed-attribution", icon: PhoneOff },
       { kind: "link", label: "Guests",          href: "/crm-calls/guests",   icon: Users },
+      // WhatsApp Inbox — two-pane guest-service inbox over the Meta webhook
+      // ingest (wa_conversations/wa_messages). Member-open like Guests above.
+      { kind: "link", label: "WhatsApp Inbox",  href: "/crm-calls/whatsapp", icon: MessageCircle },
       // Management-only (page-catalog mgmtOnly) — canAccessPage hides it for
       // everyone else. This row must exist: the catalog entry alone gates the
       // page correctly and leaves it unreachable by anything but a typed URL.

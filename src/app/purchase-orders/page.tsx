@@ -29,6 +29,11 @@ import { normalizeBillNo } from '@/lib/bill-no';
 import { vendorIdentityKey, normalizeVendorName } from '@/lib/vendor-mapping';
 import StockOnHandNote, { StockOnHandLegend } from '@/components/StockOnHandNote';
 import { useStockOnHand, type StockOnHandState } from '@/lib/use-stock-on-hand';
+// TYPE-ONLY: the change-set a pending_reapproval row carries (computed server-
+// side by the list API from the po.edit audit trail). @/lib/po-diff has NO
+// runtime imports (its Database import is `import type`), and this import is
+// itself type-only, so nothing of it reaches the client bundle.
+import type { PoReapprovalChanges } from '@/lib/po-diff';
 
 // Always 2 dp: at 0 dp the paise were dropped per row, so the item column
 // visibly failed to add up to the footer/list total (₹235.50 + ₹118.50 showed
@@ -261,6 +266,16 @@ interface PO {
   /** Vendor bill numbers taken in against this PO (the "Bill Number" half of
    *  vendor-wise receiving). Empty on an un-migrated DB — never assumed. */
   vendor_bills?: Array<{ vendor_name: string; bill_no: string; bill_date: string }>;
+  /** "Re-approval requested by <who>: <reason>" — written by edit-approved. The
+   *  ONLY trace of who/why on a PO whose edit predates change tracking, so the
+   *  fallback panel reads it. Ships via SELECT po.* on both branches. */
+  approval_note?: string;
+  /** WHAT CHANGED since the last approval — list branch, pending_reapproval
+   *  rows only. Optional like every list aggregate: the detail branch does not
+   *  send it and a tab cached across the deploy predates it; absent = "the
+   *  server did not say" = show nothing. `recorded: false` inside it is the
+   *  honest "edit predates change tracking" case and IS shown, as words. */
+  reapproval_changes?: PoReapprovalChanges | null;
 }
 
 const STATUS_COLOR: Record<string, string> = {
@@ -580,6 +595,18 @@ export default function PurchaseOrdersPage() {
                                     {owedVendors.length > 0 && <> · awaiting {owedVendors.map(v => v.vendor_name).join(' · ')}</>}
                                   </span>
                                 </span>
+                              )}
+                              {/* WHAT the re-approval is being asked for, beside
+                                  the status — the approver scans this list before
+                                  opening anything (the owner's ask, verbatim:
+                                  "is it a newly added item or qty changed or the
+                                  price changed? No information"). Same optional-
+                                  aggregate convention as PART-RECEIVED: absent
+                                  field (cached tab, older payload) shows nothing;
+                                  recorded:false shows the honest words instead of
+                                  an empty diff. Expanding the row gives old → new. */}
+                              {p.status === 'pending_reapproval' && p.reapproval_changes && (
+                                <ReapprovalBadge rc={p.reapproval_changes} />
                               )}
                             </div>
                           </td>
@@ -2612,6 +2639,182 @@ function RoleToggle({ role, onChange }: { role: 'admin' | 'manager'; onChange: (
 /* ============================================================ */
 /* PO Detail row (expanded items table) + inline edit support    */
 /* ============================================================ */
+/* ============================================================ */
+/* WHAT CHANGED on a PO awaiting re-approval — badge + panel.
+ *
+ * Data: `reapproval_changes`, computed by the list API from the po.edit audit
+ * trail (src/lib/po-diff.ts owns the baseline rule: the before-state the last
+ * approval signed vs the live lines). Pure information for the person deciding
+ * — Approve/Reject themselves are untouched.
+ *
+ * Both bases of every old → new are PURCHASE units at ₹/purchase-unit (the
+ * basis PO lines are stored and displayed in on this whole page); `unit` on
+ * each entry is the purchase-unit label, so nothing here converts. */
+
+/** audit_events.created_at is SQLite datetime('now') = UTC without a marker;
+ *  `new Date('… …')` would read it as LOCAL and shift the time by 5½ h IST.
+ *  Anchor it to UTC, then print local. Anything unparseable prints verbatim. */
+const auditTimeLabel = (s?: string): string => {
+  const raw = String(s || '').trim();
+  if (!raw) return '—';
+  const d = new Date(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}/.test(raw) ? raw.replace(' ', 'T') + 'Z' : raw);
+  return isNaN(d.getTime()) ? raw
+    : d.toLocaleString('en-IN', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+};
+/** "+₹1,240.00" / "−₹500.00" — a DELTA, so the sign is the message. Callers
+ *  skip it for |v| below half a paisa rather than printing a signed zero. */
+const signedMoney = (v: number) => `${v > 0 ? '+' : '−'}${fmt(Math.abs(v))}`;
+/** The badge's compact segments: "+1 item · 1 removed · 2 qty · 1 rate · +₹…".
+ *  Only what actually happened — a segment for 0 changes is noise. */
+const reapprovalSummary = (rc: PoReapprovalChanges): string[] => {
+  const seg: string[] = [];
+  if (rc.added.length)          seg.push(`+${rc.added.length} item${rc.added.length === 1 ? '' : 's'}`);
+  if (rc.removed.length)        seg.push(`${rc.removed.length} removed`);
+  if (rc.qty_changes.length)    seg.push(`${rc.qty_changes.length} qty`);
+  if (rc.rate_changes.length)   seg.push(`${rc.rate_changes.length} rate`);
+  if (rc.vendor_changes.length) seg.push(`${rc.vendor_changes.length} vendor`);
+  if (Math.abs(rc.total_delta) >= 0.005) seg.push(signedMoney(rc.total_delta));
+  return seg;
+};
+
+/** Beside the PENDING_REAPPROVAL status chip: the change-set at a glance,
+ *  visible WITHOUT expanding. Same chip vocabulary as PART-RECEIVED. */
+function ReapprovalBadge({ rc }: { rc: PoReapprovalChanges }) {
+  if (!rc.recorded) {
+    return (
+      <span className="inline-block px-2 py-0.5 rounded text-[10px] font-semibold bg-amber-100 text-amber-800"
+            title={'This PO was edited after approval, but what changed was not recorded — the edit predates change tracking. '
+                 + 'Open the row and compare the lines against the vendor’s revised quote before approving.'}>
+        EDITED<span className="font-normal"> · details not recorded</span>
+      </span>
+    );
+  }
+  const seg = reapprovalSummary(rc);
+  const title = [
+    `Edited by ${rc.edited_by || '(unknown)'} · ${auditTimeLabel(rc.edited_at)}`,
+    rc.reason ? `Reason: ${rc.reason}` : '',
+    'Open the row for every change, old → new.',
+  ].filter(Boolean).join('\n');
+  return (
+    <span className="inline-block px-2 py-0.5 rounded text-[10px] font-semibold bg-amber-100 text-amber-800" title={title}>
+      EDITED
+      <span className="font-normal"> · {seg.length > 0 ? seg.join(' · ') : 'no line changes'}</span>
+    </span>
+  );
+}
+
+/** The expanded row's "What changed" panel: every change old → new, who edited,
+ *  when, and the reason they were required to type. `recorded: false` renders
+ *  the honest fallback — an edit that predates tracking must say so in words,
+ *  never show an empty list as "no changes". */
+function ReapprovalChangesPanel({ rc, approvalNote }: { rc: PoReapprovalChanges; approvalNote?: string }) {
+  if (!rc.recorded) {
+    return (
+      <div className="mb-3 border border-amber-200 bg-amber-50/60 rounded-lg p-3 space-y-1">
+        <div className="flex items-center gap-2">
+          <AlertTriangle className="w-4 h-4 text-amber-700" />
+          <span className="text-sm font-semibold text-amber-900">Awaiting re-approval — change details not recorded</span>
+        </div>
+        <p className="text-xs text-[#6B5744] max-w-prose">
+          This PO was edited after approval, but the edit predates change tracking, so which items /
+          quantities / rates moved cannot be shown. Compare the lines below against the vendor&rsquo;s
+          revised quote before approving.
+        </p>
+        {/* The one trace an old edit does leave: the approval_note edit-approved
+            has always written ("Re-approval requested by <who>: <reason>"). */}
+        {String(approvalNote || '').startsWith('Re-approval requested') && (
+          <p className="text-xs text-[#6B5744] italic">{approvalNote}</p>
+        )}
+      </div>
+    );
+  }
+  const noLineChanges = rc.added.length + rc.removed.length + rc.qty_changes.length
+    + rc.rate_changes.length + rc.vendor_changes.length === 0;
+  return (
+    <div className="mb-3 border border-amber-200 bg-amber-50/60 rounded-lg p-3 space-y-2">
+      <div className="flex items-center gap-2 flex-wrap">
+        <AlertTriangle className="w-4 h-4 text-amber-700" />
+        <span className="text-sm font-semibold text-amber-900">What changed since approval</span>
+        <span className="text-xs text-[#6B5744]">— re-approval is being asked for exactly these changes</span>
+        {Math.abs(rc.total_delta) >= 0.005 ? (
+          <span className={`ml-auto text-xs font-semibold ${rc.total_delta > 0 ? 'text-red-700' : 'text-emerald-800'}`}>
+            PO total {signedMoney(rc.total_delta)}
+            <span className="font-normal text-[#6B5744]"> · {fmt(rc.total_before)} → {fmt(rc.total_after)}</span>
+          </span>
+        ) : (
+          <span className="ml-auto text-xs font-semibold text-[#6B5744]">PO total unchanged · {fmt(rc.total_after)}</span>
+        )}
+      </div>
+      <div className="text-[11px] text-[#6B5744]">
+        Edited by <span className="font-semibold">{rc.edited_by || '(unknown)'}</span> · {auditTimeLabel(rc.edited_at)}
+        {rc.reason && <> · Reason: <span className="italic">&ldquo;{rc.reason}&rdquo;</span></>}
+      </div>
+      {/* Today at most one edit exists per approval cycle (edit-approved refuses
+          a non-approved PO), so this list only appears if that ever changes —
+          the diff above is then cumulative vs the last approved state, and each
+          individual edit still gets its who/when/reason line. */}
+      {rc.edits.length > 1 && (
+        <div className="text-[10px] text-[#6B5744] space-y-0.5">
+          {rc.edits.map((e, i) => (
+            <div key={i}>Edit {i + 1}: {e.by || '(unknown)'} · {auditTimeLabel(e.at)}{e.reason ? ` · “${e.reason}”` : ''}</div>
+          ))}
+        </div>
+      )}
+      <ul className="space-y-1 text-xs">
+        {rc.added.map(l => (
+          <li key={'a' + l.material_id} className="text-emerald-800">
+            <span className="font-semibold">+ Added</span>{' '}
+            {l.material_name} — <span className="font-mono">{qfmt(l.qty)} {l.purchase_unit}</span> @ {fmt(l.rate)}{l.purchase_unit ? `/${l.purchase_unit}` : ''} = <span className="font-mono">{fmt(l.value)}</span>
+            {l.vendor && <span className="text-[#6B5744]"> · {l.vendor}</span>}
+          </li>
+        ))}
+        {rc.removed.map(l => (
+          <li key={'r' + l.material_id} className="text-red-700">
+            <span className="font-semibold">− Removed</span>{' '}
+            {l.material_name} — <span className="line-through">{qfmt(l.qty)} {l.purchase_unit} @ {fmt(l.rate)} = {fmt(l.value)}</span>
+            {l.vendor && <span className="text-[#6B5744]"> · {l.vendor}</span>}
+          </li>
+        ))}
+        {rc.qty_changes.map(c => (
+          <li key={'q' + c.material_id} className="text-amber-900">
+            <span className="font-semibold">Qty</span>{' '}
+            {c.material_name}: <span className="font-mono">{qfmt(c.old_qty)} → {qfmt(c.new_qty)} {c.purchase_unit}</span>
+            <span className="text-[#6B5744]">
+              {' '}({c.qty_delta > 0 ? '+' : '−'}{qfmt(Math.abs(c.qty_delta))} {c.purchase_unit}
+              {Math.abs(c.value_delta) >= 0.005 ? `, line ${signedMoney(c.value_delta)}` : ''})
+            </span>
+          </li>
+        ))}
+        {rc.rate_changes.map(c => (
+          <li key={'p' + c.material_id} className="text-amber-900">
+            <span className="font-semibold">Rate</span>{' '}
+            {c.material_name}: <span className="font-mono">{fmt(c.old_rate)} → {fmt(c.new_rate)}</span>{c.purchase_unit ? ` per ${c.purchase_unit}` : ''}
+            {/* value_delta is 0 here when the SAME line also changed qty — the
+                qty entry above already carries the whole line delta once. */}
+            {Math.abs(c.value_delta) >= 0.005 && <span className="text-[#6B5744]"> (line {signedMoney(c.value_delta)})</span>}
+          </li>
+        ))}
+        {rc.vendor_changes.map(c => (
+          <li key={'v' + c.material_id} className="text-amber-900">
+            <span className="font-semibold">Vendor</span>{' '}
+            {c.material_name}: {c.old_vendor || '—'} → {c.new_vendor || '—'}
+          </li>
+        ))}
+        {noLineChanges && (
+          <li className="text-[#6B5744]">
+            {/* When the total moved but no line crossed the reporting tolerance
+                (a rate nudge under half a paisa per unit across a large qty),
+                saying "same rates" would contradict the delta shown above. */}
+            {Math.abs(rc.total_delta) >= 0.005
+              ? 'No individual line moved beyond rounding tolerance (under half a paisa per unit), yet the PO total shifted as shown above — compare rates against the vendor’s quote before approving.'
+              : 'No line changes detected — the edit re-saved the same items, quantities and rates.'}
+          </li>
+        )}
+      </ul>
+    </div>
+  );
+}
+
 function PODetail({ po, editing, materials, onCancelEdit, onSaved }: {
   po: PO; editing: boolean; materials: Material[]; onCancelEdit: () => void; onSaved: () => void;
 }) {
@@ -2693,8 +2896,17 @@ function PODetail({ po, editing, materials, onCancelEdit, onSaved }: {
      absolving the whole bucket. */
   const heldOrderedValue = r2(heldLines.reduce((s, it) => s + Number(it.total_price || 0), 0));
   const heldGrns = [...new Set(heldLines.map(it => String((it as any).received_grn_number || '')).filter(Boolean))];
+  /* ── WHAT CHANGED highlighting ─────────────────────────────────────────────
+     Only while the PO is actually awaiting re-approval, and only when the
+     change-set was recorded (an unrecorded edit must not paint arbitrary rows).
+     `po` here is the LIST row, which is where reapproval_changes rides — absent
+     on a cached payload, in which case nothing highlights (silence-safe). */
+  const rc = po.status === 'pending_reapproval' ? (po.reapproval_changes ?? null) : null;
+  const editedIds = rc?.recorded ? new Set(rc.changed_material_ids) : null;
+  const addedIds  = rc?.recorded ? new Set(rc.added.map(a => a.material_id)) : null;
   return (
     <tr><td colSpan={8} className="py-3 px-3 bg-[#FFF8F0]">
+      {rc && <ReapprovalChangesPanel rc={rc} approvalNote={po.approval_note} />}
       <div className="flex items-start gap-6">
         <div className="text-xs text-[#6B5744] space-y-1">
           {/* The two dates that bracket the order, side by side: when we raised
@@ -2816,11 +3028,21 @@ function PODetail({ po, editing, materials, onCancelEdit, onSaved }: {
               const ordHint = recipeHint(it.quantity, meta);
               const rcvHint = recQty != null ? recipeHint(Number(recQty), meta) : null;
               const rejHint = recipeHint(rejected, meta);
+              // Line touched by the pending edit? Amber-wash the row and tag it,
+              // so the approver's eye lands on exactly the lines the panel names.
+              const lineEdited = !!editedIds?.has(it.material_id);
+              const lineAdded  = !!addedIds?.has(it.material_id);
               return (
-                <tr key={it.id} className="border-t border-[#E8D5C4]/50">
+                <tr key={it.id} className={`border-t border-[#E8D5C4]/50 ${lineEdited ? 'bg-amber-50/60' : ''}`}>
                   <td className="py-1 px-2 font-mono text-[10px] text-[#8B7355]">{it.material_sku || '·'}</td>
                   <td className="py-1 px-2">
                     {it.material_name}
+                    {lineEdited && (
+                      <span className="ml-1 inline-block px-1 py-px rounded border border-amber-200 bg-amber-100 text-amber-800 text-[9px] font-semibold align-middle"
+                            title={lineAdded ? 'Added by the pending edit — not on the approved PO' : 'Changed by the pending edit — old → new in the panel above'}>
+                        {lineAdded ? 'new' : 'changed'}
+                      </span>
+                    )}
                     {anyReceived && rejected > 0 && (
                       <div className="text-[10px] text-red-700 mt-0.5">
                         {/* quantity_rejected is a GRN qty = PURCHASE units, and

@@ -330,6 +330,12 @@ export const PAGE_CATALOG: PageSection[] = [
       // 'Management only' to anyone outside isManagement() on its own.
       { path: '/crm-calls/missed-attribution', label: 'Missed-Call Attribution', mgmtOnly: true },
       { path: '/crm-calls/guests',   label: 'Guests (unified 360)' },
+      // WhatsApp Inbox — 1:1 guest-service threads over the Meta webhook ingest
+      // (wa_conversations/wa_messages). Member-open by owner policy, like the
+      // Guests 360 above: this is the GRE service desk, not bulk messaging —
+      // campaigns/win-back keep their mgmtOnly gates. The reply API enforces
+      // the 24h free-form window server-side (assessReply) regardless of UI.
+      { path: '/crm-calls/whatsapp', label: 'WhatsApp Inbox' },
       // Reservation Database — the Reservego CSV import and the customer master
       // it builds (ct_guests + ct_bookings, extended in place; no parallel
       // tables). mgmtOnly for the same reason as Win-back below: every row on

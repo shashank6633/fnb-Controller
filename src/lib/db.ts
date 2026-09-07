@@ -4395,6 +4395,85 @@ function initializeSchema(db: Database.Database) {
     db.exec(`INSERT OR IGNORE INTO settings (key, value) VALUES ('wa_interakt_api_key', '')`);
   } catch (e) { console.error('wa_interakt_api_key seed failed:', e); }
 
+  // ── WhatsApp Inbox — conversations / messages / media (additive) ──────────
+  // A PARSED view over whatsapp_events_log, which stays the raw archive (rows
+  // there are never mutated or deleted by the inbox). Ingest happens INLINE in
+  // the webhook POST for new events plus an explicit admin replay action
+  // (/api/crm-calls/inbox/process-backlog) — NOTHING processes at boot.
+  // Idempotency contract (src/lib/wa-inbox.ts): wa_messages.wamid is UNIQUE so
+  // webhook retries / backlog replays change nothing, and the outbound status
+  // ladder (sent → delivered → read / failed) only ever moves FORWARD — a late
+  // 'delivered' can never overwrite 'read'.
+  //
+  // The 24h customer-service window is NOT stored — it is COMPUTED at read
+  // time from last_inbound_at (windowState() in wa-inbox.ts) so it can never
+  // go stale.
+  //
+  // wa_media follows the menu_item_images BLOB rationale (nothing backs up
+  // public/, blobs ride inside every existing DB backup): inbound media is
+  // fetched from the Graph media endpoint AT INGEST — Meta's media URLs expire
+  // within minutes, fetching later fails — size-capped, and a failed fetch is
+  // recorded on the message (media_status/media_error) rather than thrown.
+  // Served ONLY through the authed /api/crm-calls/inbox/media/[id] route
+  // (task_files serving pattern), never a public one.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS wa_conversations (
+        id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+        phone_key            TEXT NOT NULL UNIQUE,       -- norm10 (guest-unify KEY10) when derivable, else full digits
+        wa_id                TEXT NOT NULL DEFAULT '',   -- raw msisdn Meta reports (the send target, e.g. 919876543210)
+        profile_name         TEXT NOT NULL DEFAULT '',   -- WhatsApp push name from contacts[].profile.name
+        last_inbound_at      TEXT,                       -- UTC 'YYYY-MM-DD HH:MM:SS' — the 24h-window anchor
+        last_outbound_at     TEXT,
+        last_message_at      TEXT,
+        last_message_preview TEXT NOT NULL DEFAULT '',
+        unread_count         INTEGER NOT NULL DEFAULT 0,
+        created_at           TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_wa_conversations_last ON wa_conversations(last_message_at);
+
+      CREATE TABLE IF NOT EXISTS wa_messages (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        conversation_id INTEGER NOT NULL,
+        wamid           TEXT,                            -- provider message id; NULL when unknown (UNIQUE index ignores NULLs)
+        direction       TEXT NOT NULL DEFAULT 'in',      -- 'in' | 'out'
+        msg_type        TEXT NOT NULL DEFAULT 'text',    -- text/image/video/audio/document/sticker/reaction/location/template/…
+        body            TEXT NOT NULL DEFAULT '',        -- text body / media caption / reaction emoji / rendered template
+        media_id        INTEGER,                         -- wa_media.id once stored
+        media_status    TEXT NOT NULL DEFAULT '',        -- '' (no media) | 'stored' | 'failed'
+        media_error     TEXT NOT NULL DEFAULT '',
+        status          TEXT NOT NULL DEFAULT '',        -- inbound: 'received'; outbound ladder: sent → delivered → read / failed
+        status_at       TEXT,
+        error_detail    TEXT NOT NULL DEFAULT '',        -- provider error for failed sends/statuses
+        reply_to_wamid  TEXT NOT NULL DEFAULT '',        -- context / reaction target
+        wa_timestamp    TEXT,                            -- UTC, from the provider payload's epoch timestamp
+        raw_event_id    INTEGER,                         -- whatsapp_events_log.id this row was parsed from
+        sent_by         TEXT NOT NULL DEFAULT '',        -- app user id for replies sent from the inbox
+        created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_wa_messages_wamid ON wa_messages(wamid) WHERE wamid IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS idx_wa_messages_conv ON wa_messages(conversation_id, id);
+
+      CREATE TABLE IF NOT EXISTS wa_media (
+        id                INTEGER PRIMARY KEY AUTOINCREMENT,
+        provider_media_id TEXT NOT NULL DEFAULT '',      -- Graph media id (dedupe key for retries)
+        mime              TEXT NOT NULL DEFAULT 'application/octet-stream',
+        size              INTEGER NOT NULL DEFAULT 0,
+        data              BLOB NOT NULL,
+        created_at        TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_wa_media_provider ON wa_media(provider_media_id);
+
+      CREATE TABLE IF NOT EXISTS wa_ingest_state (
+        id               INTEGER PRIMARY KEY CHECK (id = 1),
+        last_event_id    INTEGER NOT NULL DEFAULT 0,     -- backlog cursor over whatsapp_events_log.id
+        last_run_at      TEXT,
+        last_run_summary TEXT NOT NULL DEFAULT ''
+      );
+      INSERT OR IGNORE INTO wa_ingest_state (id, last_event_id) VALUES (1, 0);
+    `);
+  } catch (e) { console.error('wa inbox schema failed:', e); }
+
   // ── AKAN CRM — Guest Database + Loyalty (additive) ─────────────────────────
   // Guest directory keyed by normalized 10-digit mobile (/crm/guests). Visits
   // append to crm_guest_visits and roll up onto the guest row (visit_count /
