@@ -71,6 +71,7 @@ import {
   Radar,
   HeartHandshake,
   MessageCircle,
+  Megaphone,
   Undo2,
   type LucideIcon,
 } from "lucide-react";
@@ -323,6 +324,10 @@ const navTree: NavEntry[] = [
       // page correctly and leaves it unreachable by anything but a typed URL.
       { kind: "link", label: "Reservation DB",  href: "/crm-calls/database", icon: Database },
       { kind: "link", label: "Win-back",        href: "/crm-calls/win-back", icon: HeartHandshake },
+      // Management-only (page-catalog mgmtOnly) — canAccessPage hides it for
+      // everyone else. This row must exist: the catalog entry alone gates the
+      // page correctly but leaves it invisible (the sidebar-vs-catalog trap).
+      { kind: "link", label: "Broadcasts",      href: "/crm-calls/broadcasts", icon: Megaphone },
       { kind: "link", label: "Call Log",        href: "/crm-calls/log",      icon: PhoneCall },
       { kind: "link", label: "Topic Alerts",    href: "/crm-calls/topics",   icon: Radar },
       { kind: "link", label: "Bookings",        href: "/crm-calls/bookings", icon: CalendarCheck },

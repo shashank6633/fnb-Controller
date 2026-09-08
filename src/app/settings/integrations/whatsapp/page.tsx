@@ -20,12 +20,12 @@ import { useEffect, useMemo, useState } from 'react';
 import {
   MessageCircle, Save, Loader2, CheckCircle2, AlertTriangle, Send, Copy,
   Plus, Pencil, Trash2, Eye, Bell, Sparkles, Settings2, LayoutTemplate,
-  ArrowLeft, Bot, Workflow,
+  ArrowLeft, Bot, Workflow, Megaphone,
 } from 'lucide-react';
 import { api } from '@/lib/api';
 import PhoneField from '@/components/PhoneField';
 
-type Tab = 'config' | 'templates' | 'notifications' | 'soon';
+type Tab = 'config' | 'templates' | 'notifications' | 'broadcasts' | 'soon';
 
 interface WaConfigDto {
   wa_api_provider: string;
@@ -114,6 +114,7 @@ export default function WhatsAppIntegrationPage() {
     { id: 'config',        label: 'Configuration', icon: Settings2 },
     { id: 'templates',     label: 'Templates',     icon: LayoutTemplate },
     { id: 'notifications', label: 'Notifications', icon: Bell },
+    { id: 'broadcasts',    label: 'Broadcasts',    icon: Megaphone },
     { id: 'soon',          label: 'Coming soon',   icon: Sparkles },
   ];
 
@@ -151,6 +152,7 @@ export default function WhatsAppIntegrationPage() {
       {tab === 'config' && <ConfigTab cfg={cfg} reload={loadCfg} onError={setError} onOk={setOkMsg} />}
       {tab === 'templates' && <TemplatesTab onError={setError} onOk={setOkMsg} />}
       {tab === 'notifications' && <NotificationsTab cfg={cfg} reload={loadCfg} onError={setError} onOk={setOkMsg} />}
+      {tab === 'broadcasts' && <BroadcastsTab onError={setError} onOk={setOkMsg} />}
       {tab === 'soon' && <ComingSoonTab />}
 
       {(error || okMsg) && (
@@ -893,6 +895,151 @@ function ComingSoonTab() {
       <p className="text-[10px] text-[#8B7355]">
         Inbound events already land in the webhook log, so future features can replay history from day one.
       </p>
+    </div>
+  );
+}
+
+/* ───────────────────────── Broadcasts (campaign engine knobs) ───────────────────────── */
+
+interface BroadcastSettingsDto {
+  enabled: boolean;
+  msgs_per_min: number;
+  cooldown_days: number;
+  daily_cap: number;
+  cost_per_msg: number;
+  confirm_threshold: number;
+}
+
+/**
+ * The queued-broadcast engine's knobs (ct_settings, feature-owned keys) —
+ * lives beside the provider config because these decide whether, how fast and
+ * at what recorded cost /crm-calls/broadcasts campaigns actually deliver.
+ * GET is management; PUT is ADMIN-ONLY server-side (requireRole('admin')).
+ */
+function BroadcastsTab({ onError, onOk }: {
+  onError: (m: string | null) => void; onOk: (m: string | null) => void;
+}) {
+  const [loaded, setLoaded] = useState(false);
+  const [enabled, setEnabled] = useState(false);
+  const [msgsPerMin, setMsgsPerMin] = useState(20);
+  const [cooldownDays, setCooldownDays] = useState(7);
+  const [dailyCap, setDailyCap] = useState(500);
+  const [costPerMsg, setCostPerMsg] = useState(0.8);
+  const [confirmThreshold, setConfirmThreshold] = useState(50);
+  const [stopKeywords, setStopKeywords] = useState('');
+  const [defaultsHint, setDefaultsHint] = useState<string[]>([]);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const r = await fetch('/api/crm-calls/broadcasts/settings');
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) { onError(j.error || `HTTP ${r.status}`); return; }
+        const s: BroadcastSettingsDto = j.settings;
+        setEnabled(!!s.enabled);
+        setMsgsPerMin(s.msgs_per_min);
+        setCooldownDays(s.cooldown_days);
+        setDailyCap(s.daily_cap);
+        setCostPerMsg(s.cost_per_msg);
+        setConfirmThreshold(s.confirm_threshold);
+        setStopKeywords(Array.isArray(j.stop_keywords) ? j.stop_keywords.join(', ') : '');
+        setDefaultsHint(Array.isArray(j.stop_keywords_default) ? j.stop_keywords_default : []);
+        setLoaded(true);
+      } catch {
+        onError('Could not load broadcast settings');
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const save = async () => {
+    setBusy(true); onError(null); onOk(null);
+    try {
+      const r = await api('/api/crm-calls/broadcasts/settings', {
+        method: 'PUT',
+        body: {
+          enabled: enabled ? '1' : '0',
+          msgs_per_min: msgsPerMin,
+          cooldown_days: cooldownDays,
+          daily_cap: dailyCap,
+          cost_per_msg: costPerMsg,
+          confirm_threshold: confirmThreshold,
+          stop_keywords: stopKeywords.split(/[,\n]/).map(k => k.trim()).filter(Boolean),
+        },
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) { onError(j.error || `HTTP ${r.status}`); return; }
+      onOk('✓ Broadcast settings saved.');
+      if (j.settings) {
+        setMsgsPerMin(j.settings.msgs_per_min);
+        setCooldownDays(j.settings.cooldown_days);
+        setDailyCap(j.settings.daily_cap);
+        setCostPerMsg(j.settings.cost_per_msg);
+        setConfirmThreshold(j.settings.confirm_threshold);
+      }
+      if (Array.isArray(j.stop_keywords)) setStopKeywords(j.stop_keywords.join(', '));
+    } finally { setBusy(false); }
+  };
+
+  if (!loaded) {
+    return <div className="py-10 text-center"><Loader2 size={20} className="animate-spin text-[#af4408] mx-auto" /></div>;
+  }
+
+  const numField = (label: string, hint: string, value: number, set: (n: number) => void, min: number, max: number, step = 1) => (
+    <label className="block text-xs text-[#6B5744]">
+      {label}
+      <input type="number" min={min} max={max} step={step} value={value}
+             onChange={e => set(Number(e.target.value))}
+             className="mt-1 w-full px-3 py-2 border border-[#D4B896] rounded bg-[#FFF1E3] text-sm" />
+      <span className="text-[10px] text-[#8B7355]">{hint}</span>
+    </label>
+  );
+
+  return (
+    <div className="space-y-4">
+      <div className={`border rounded-xl p-4 space-y-3 ${enabled ? 'bg-amber-50 border-amber-200' : 'bg-white border-[#E8D5C4]'}`}>
+        <label className="flex items-start gap-2.5 cursor-pointer">
+          <input type="checkbox" checked={enabled} onChange={e => setEnabled(e.target.checked)} className="accent-[#af4408] mt-0.5" />
+          <span>
+            <span className="text-sm font-semibold text-[#2D1B0E] block">Enable broadcast sending (master switch)</span>
+            <span className="text-[11px] text-[#6B5744]">
+              OFF: campaigns can be built, previewed and even started, but the queue never moves — nothing is delivered.
+              ON: started campaigns drain at the throttle below, with consent, cooldown and the daily cap re-checked on
+              every single message. Turning this on does not send anything by itself.
+            </span>
+          </span>
+        </label>
+      </div>
+
+      <div className="bg-white border border-[#E8D5C4] rounded-xl p-4 space-y-3">
+        <h2 className="text-sm font-semibold text-[#2D1B0E]">Delivery & safety knobs</h2>
+        <div className="grid sm:grid-cols-2 gap-3">
+          {numField('Messages per minute', 'The drain budget — the queue never sends faster than this (1–240).', msgsPerMin, setMsgsPerMin, 1, 240)}
+          {numField('Per-guest cooldown (days)', 'One marketing message per guest per window, across ALL campaigns and win-back. 0 disables.', cooldownDays, setCooldownDays, 0, 365)}
+          {numField('Daily cap (messages/day)', 'Marketing messages per IST calendar day across everything. 0 or -1 disables the cap.', dailyCap, setDailyCap, -1, 100000)}
+          {numField('Cost per message (₹)', 'The Meta marketing-conversation rate — used for the "Meta will bill approximately ₹X" estimates.', costPerMsg, setCostPerMsg, 0, 100, 0.01)}
+          {numField('Typed-confirmation threshold', 'Starting a campaign with MORE than this many recipients demands a typed confirmation. 0 = always typed.', confirmThreshold, setConfirmThreshold, 0, 100000)}
+        </div>
+      </div>
+
+      <div className="bg-white border border-[#E8D5C4] rounded-xl p-4 space-y-2">
+        <h2 className="text-sm font-semibold text-[#2D1B0E]">STOP keywords (opt-out detection)</h2>
+        <p className="text-[11px] text-[#6B5744]">
+          An inbound message that IS exactly one of these (whole-message match, case/punctuation ignored) opts the guest
+          out of ALL marketing immediately. “please stop by at 8” never matches. There is deliberately no inbound
+          re-opt-in keyword — opting back in is a manual, audited management action on the Broadcasts page.
+        </p>
+        <textarea value={stopKeywords} onChange={e => setStopKeywords(e.target.value)} rows={3}
+                  className="w-full px-3 py-2 border border-[#D4B896] rounded bg-[#FFF1E3] text-sm"
+                  placeholder={defaultsHint.slice(0, 6).join(', ') + ', …'} />
+        <p className="text-[10px] text-[#8B7355]">Comma or newline separated. Clearing the box restores the defaults (English + Hindi + Telugu) — the STOP door can never be left unlocked.</p>
+      </div>
+
+      <button onClick={save} disabled={busy}
+              className="flex items-center gap-2 px-4 py-2 bg-[#af4408] hover:bg-[#8a3506] disabled:opacity-50 text-white rounded-lg text-sm font-medium">
+        {busy ? <Loader2 size={14} className="animate-spin" /> : <Save size={14} />} Save broadcast settings
+      </button>
     </div>
   );
 }

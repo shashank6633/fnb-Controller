@@ -3,6 +3,7 @@ import { getDb } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
 import { getWaConfigRaw, isWaConfigured } from '@/lib/whatsapp';
 import { guestDirectoryFor, providerNotice, windowState } from '@/lib/wa-inbox';
+import { consentFor } from '@/lib/wa-consent';
 
 /**
  * GET /api/crm-calls/inbox/[id] — one conversation thread. MARKS IT READ.
@@ -103,6 +104,10 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
       })),
       has_more: rows.length === limit,
       window: windowState(conv.last_inbound_at),
+      // Marketing-consent state for this phone (STOP keyword / Meta opt-out /
+      // manual). null = default, messageable. The thread view can badge an
+      // opted-out guest so nobody drafts them a promo by hand.
+      marketing_consent: consentFor(db, String(conv.phone_key)),
       templates,
       provider: {
         provider: raw.wa_api_provider,

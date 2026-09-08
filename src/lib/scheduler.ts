@@ -189,6 +189,24 @@ export function startSchedulerOnce(): void {
       } catch (e: any) {
         console.error('[scheduler] kitchen-expiry check failed:', e?.message);
       }
+
+      // WhatsApp broadcast queue — one budgeted drain per tick. The drain is
+      // its own quadruple gate (broadcast_enabled flag, campaign explicitly in
+      // 'sending', provider configured, per-recipient consent/cooldown/cap),
+      // so on a database that has never heard of broadcasts this is a no-op
+      // SELECT. Dynamically imported (grn-qc pattern) so a campaign-schema
+      // fault can never break the tick. Same drain also rides
+      // POST /api/cron/refresh-parties as the external backstop.
+      try {
+        const { drainBroadcasts } = await import('./wa-broadcast');
+        const { getDb } = await import('./db');
+        const bd = await drainBroadcasts(getDb());
+        if (bd.attempted > 0 || bd.skipped_optout > 0 || bd.skipped_cooldown > 0) {
+          console.log(`[scheduler] broadcasts @ IST ${istHour()}h: ${bd.sent} sent · ${bd.failed} failed · ${bd.skipped_optout} opted-out · ${bd.skipped_cooldown} cooldown${bd.cap_hit ? ' · DAILY CAP' : ''}`);
+        }
+      } catch (e: any) {
+        console.error('[scheduler] broadcast drain failed:', e?.message);
+      }
     } catch (e: any) {
       console.error('[scheduler] refresh failed:', e?.message);
       globalThis.__fnbScheduler__!.lastResult = { error: e?.message };

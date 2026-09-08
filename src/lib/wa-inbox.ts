@@ -35,6 +35,10 @@
  */
 import { norm10 } from '@/lib/ct/guest-unify';
 import { getWaConfigRaw, META_GRAPH_VERSION } from '@/lib/whatsapp';
+// Broadcast-campaign side-effects (STOP-keyword consent, recipient status
+// ladder). One-way import — wa-broadcast imports THIS module, never the
+// reverse; the hooks module only touches wa-consent + campaign tables.
+import { broadcastOnInbound, broadcastOnStatus } from '@/lib/wa-campaign-hooks';
 
 export const WA_MEDIA_MAX_BYTES = 5 * 1024 * 1024; // 5 MB cap on stored inbound media
 export const WA_WINDOW_MS = 24 * 60 * 60 * 1000;   // Meta 24h customer-service window
@@ -372,6 +376,13 @@ async function ingestInbound(db: any, eventId: number, m: any, contacts: any[], 
   sum.messages_ingested++;
 
   bumpConversation(db, conv.id, { inboundAt: ts, messageAt: ts, preview: previewOf(msgType, body), incrementUnread: true });
+
+  // Campaign signals — STOP-keyword consent + 'replied' marking. AFTER the
+  // wamid dedupe above, so a webhook retry / backlog replay fires this exactly
+  // once per message (a replayed old STOP lands late-but-once). Best-effort:
+  // a campaign-table fault must never break inbox ingest.
+  try { broadcastOnInbound(db, conv.phone_key, msgType, body, ts); }
+  catch (e: any) { sum.errors.push(`campaign-hook ${wamid}: ${e?.message || e}`); }
 }
 
 function applyStatus(db: any, eventId: number, s: any, sum: IngestSummary) {
@@ -400,6 +411,10 @@ function applyStatus(db: any, eventId: number, s: any, sum: IngestSummary) {
     `).run({ conv: conv.id, wamid, status, ts, err: errDetail, event: eventId });
     sum.stubs_created++;
     bumpConversation(db, conv.id, { outboundAt: ts, messageAt: ts, preview: '[outbound message]' });
+    // A campaign send whose recordOutbound raced this status still gets its
+    // recipient row updated — the join is the wamid, not the message row.
+    try { broadcastOnStatus(db, wamid, status, ts, errDetail); }
+    catch (e: any) { sum.errors.push(`campaign-hook status ${wamid}: ${e?.message || e}`); }
     return;
   }
 
@@ -410,6 +425,11 @@ function applyStatus(db: any, eventId: number, s: any, sum: IngestSummary) {
       .run(status, ts, errDetail, errDetail, row.id);
     sum.statuses_applied++;
     bumpConversation(db, row.conversation_id, { outboundAt: ts });
+    // Mirror the applied status onto any campaign recipient carrying this
+    // wamid (monotone there too; capped/opt-out classification lives in the
+    // hook). Best-effort — never breaks status ingest.
+    try { broadcastOnStatus(db, wamid, status, ts, errDetail); }
+    catch (e: any) { sum.errors.push(`campaign-hook status ${wamid}: ${e?.message || e}`); }
   } else {
     sum.statuses_noop++; // late/duplicate status — the ladder only moves forward
   }

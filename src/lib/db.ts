@@ -618,6 +618,112 @@ function initializeSchema(db: Database.Database) {
     }
   } catch (e) { console.error('direct_issue_rules migration failed:', e); }
 
+  // ── WhatsApp MARKETING CONSENT + BROADCAST CAMPAIGNS ──────────────────────
+  //
+  // CONSENT IS PHONE-KEYED, NOT GUEST-KEYED. A guest exists in up to three
+  // phone-keyed sources (ct_guests / crm_guests / orders.guest_mobile), and the
+  // loyalty/dining-only ones are SYNTHETIC — manufactured at read time with no
+  // row in any table to hang a column on. So consent hangs off the same join
+  // key everything else uses: phone_key = norm10 (guest-unify KEY10, the exact
+  // key wa_conversations.phone_key carries).
+  //
+  // NO ROW = MESSAGEABLE. That is the honest default for existing data: nobody
+  // ever opted out, so nobody is recorded as opted out. A row exists only for
+  // an EXPLICIT state — a STOP-class inbound message, a Meta 131050 status
+  // (user blocked marketing at WhatsApp level), or a manual management toggle.
+  // status 'opted_in' exists so a manual re-opt-in can override an earlier
+  // STOP without deleting the history (wa_consent_log keeps every flip).
+  //
+  // Inbound STOP detection rides the webhook ingest seam (wa-inbox.ts →
+  // wa-campaign-hooks.ts). The webhook is public and UNSIGNED, so a forged
+  // POST can only ever OPT SOMEONE OUT — the fail-safe direction. There is
+  // deliberately NO inbound START keyword: re-opt-in via a forgeable endpoint
+  // would be the fail-open direction, so opting back in is manual-only (mgmt).
+  //
+  // wa_campaigns / wa_campaign_recipients are the broadcast rail (engine in
+  // src/lib/wa-broadcast.ts). Sibling of ct_campaigns/ct_campaign_targets
+  // (win-back) with the two gaps that module left closed here:
+  //   • wamid IS STORED per recipient, so the async status webhook
+  //     (delivered/read/failed with error codes) joins back to the recipient
+  //     and honest capped-vs-failed counting is possible;
+  //   • recipients carry phone_key so consent + cross-campaign cooldown are
+  //     enforced SERVER-SIDE at claim time, not just filtered in a preview.
+  // Two-phase claim ('queued' → 'sending' → terminal) mirrors win-back: a
+  // crash mid-send leaves 'sending' rows that are NEVER auto-retried.
+  //
+  // ADMIN-OWNED STATE, EMPTY AT BOOT — no seeds of any kind (campaigns,
+  // consent and the engine's ct_settings knobs all default OFF/absent; see
+  // scripts/check-boot-migrations.js). Schema only, engine in wa-broadcast.ts.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS wa_marketing_consent (
+        phone_key  TEXT PRIMARY KEY,               -- norm10 (guest-unify KEY10), else full digits
+        status     TEXT NOT NULL CHECK (status IN ('opted_out', 'opted_in')),
+        source     TEXT NOT NULL DEFAULT '',       -- 'stop_keyword' | 'meta_131050' | 'manual'
+        detail     TEXT NOT NULL DEFAULT '',       -- matched keyword / provider code / operator note
+        changed_by TEXT NOT NULL DEFAULT '',       -- app user for manual flips, '' for inbound
+        changed_at TEXT NOT NULL DEFAULT (datetime('now')),
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE TABLE IF NOT EXISTS wa_consent_log (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        phone_key  TEXT NOT NULL,
+        status     TEXT NOT NULL,
+        source     TEXT NOT NULL DEFAULT '',
+        detail     TEXT NOT NULL DEFAULT '',
+        changed_by TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_wa_consent_log_phone ON wa_consent_log(phone_key, id);
+
+      CREATE TABLE IF NOT EXISTS wa_campaigns (
+        id               TEXT PRIMARY KEY,
+        name             TEXT NOT NULL,
+        template_name    TEXT NOT NULL DEFAULT '', -- provider APPROVED template (MARKETING category)
+        language         TEXT NOT NULL DEFAULT 'en',
+        param_order      TEXT NOT NULL DEFAULT '[]', -- JSON: which vars fill {{1}},{{2}},…
+        preview_body     TEXT NOT NULL DEFAULT '',   -- local copy of the approved body (preview + thread echo)
+        audience         TEXT NOT NULL DEFAULT '{}', -- JSON audience definition + resolve-time counts
+        state            TEXT NOT NULL DEFAULT 'draft', -- draft | scheduled | sending | paused | done | cancelled
+        throttle_per_min INTEGER NOT NULL DEFAULT 0,   -- 0 = use broadcast_msgs_per_min setting
+        cost_rate        REAL NOT NULL DEFAULT 0,      -- ₹/message, captured AT START time
+        cost_estimate    REAL NOT NULL DEFAULT 0,      -- queued × cost_rate, captured AT START time
+        scheduled_at     TEXT,                         -- reserved for the 'scheduled' state
+        started_at       TEXT,
+        finished_at      TEXT,
+        created_by       TEXT NOT NULL DEFAULT '',
+        created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at       TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_wa_campaigns_state ON wa_campaigns(state, started_at);
+
+      CREATE TABLE IF NOT EXISTS wa_campaign_recipients (
+        id           TEXT PRIMARY KEY,
+        campaign_id  TEXT NOT NULL,
+        guest_id     TEXT,                          -- ct_guests.id when real; NULL for synthetic guests
+        phone_e164   TEXT NOT NULL,                 -- the number actually dialled
+        phone_key    TEXT NOT NULL,                 -- norm10 — consent + cooldown + reply join key
+        name         TEXT NOT NULL DEFAULT '',
+        state        TEXT NOT NULL DEFAULT 'queued',
+          -- queued | sending (claimed) | sent | delivered | read | replied
+          -- | failed | capped (Meta per-user frequency cap)
+          -- | skipped_optout | skipped_cooldown | cancelled
+        wamid        TEXT,                          -- provider message id — the status-webhook join key
+        error_detail TEXT NOT NULL DEFAULT '',
+        queued_at    TEXT NOT NULL DEFAULT (datetime('now')),
+        sent_at      TEXT,
+        delivered_at TEXT,
+        read_at      TEXT,
+        replied_at   TEXT,
+        failed_at    TEXT,
+        UNIQUE(campaign_id, phone_key)              -- one message per guest per campaign, structurally
+      );
+      CREATE INDEX IF NOT EXISTS idx_wa_camp_recip_campaign ON wa_campaign_recipients(campaign_id, state);
+      CREATE INDEX IF NOT EXISTS idx_wa_camp_recip_phone    ON wa_campaign_recipients(phone_key, sent_at);
+      CREATE INDEX IF NOT EXISTS idx_wa_camp_recip_wamid    ON wa_campaign_recipients(wamid) WHERE wamid IS NOT NULL;
+    `);
+  } catch (e) { console.error('wa broadcast/consent schema failed:', e); }
+
   // ── menu_categories — the MENU CATEGORY MASTER ────────────────────────────
   //
   // WHAT IT GOVERNS, AND WHAT IT DELIBERATELY DOES NOT.

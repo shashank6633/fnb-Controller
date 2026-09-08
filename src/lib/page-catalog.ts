@@ -352,6 +352,13 @@ export const PAGE_CATALOG: PageSection[] = [
       // mgmtOnly — it exposes per-guest spend and it is the door that sends
       // marketing to guests. See src/lib/ct/winback.ts.
       { path: '/crm-calls/win-back', label: 'Win-back Campaigns', mgmtOnly: true },
+      // Broadcasts: queued WhatsApp marketing campaigns (audience → preview →
+      // approved template → throttled drain with consent/cooldown/daily-cap).
+      // mgmtOnly for the same reason as Win-back: this is the door that bulk-
+      // messages guests and it shows per-guest reach. Every /api/crm-calls/
+      // broadcasts/* route answers 403 to non-management on its own — the flag
+      // here is navigation gating, not the security boundary.
+      { path: '/crm-calls/broadcasts', label: 'WhatsApp Broadcasts', mgmtOnly: true },
       { path: '/crm-calls/log',      label: 'Call Log' },
       { path: '/crm-calls/topics',   label: 'Topic Alerts' },
       { path: '/crm-calls/bookings', label: 'CRM Bookings' },

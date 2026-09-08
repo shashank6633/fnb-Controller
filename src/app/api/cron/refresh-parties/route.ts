@@ -55,6 +55,20 @@ export async function POST(request: Request) {
     console.error('[/api/cron/refresh-parties] task automation failed:', e?.message);
   }
 
+  // WhatsApp broadcast queue — external-cron backstop for the in-process
+  // scheduler (which only arms after the first /api/upcoming-parties request;
+  // this POST keeps a queued campaign draining even on a box nobody has
+  // opened a page on since the last restart). Quadruple-gated inside
+  // drainBroadcasts(); dynamic import so a campaign-schema fault can't fail
+  // the refresh. Same defer-due ride-along contract as everything else here.
+  let broadcast_drain: any = null;
+  try {
+    const { drainBroadcasts } = await import('@/lib/wa-broadcast');
+    broadcast_drain = await drainBroadcasts(getDb());
+  } catch (e: any) {
+    console.error('[/api/cron/refresh-parties] broadcast drain failed:', e?.message);
+  }
+
   try {
     const result = await refreshUpcomingParties(tokenOk ? 'external_cron' : 'admin_manual');
     // Feature 4 — same pipeline also checks deferred items coming due. Fully
@@ -65,11 +79,11 @@ export async function POST(request: Request) {
     } catch (e: any) {
       console.error('[/api/cron/refresh-parties] defer-due check failed:', e?.message);
     }
-    return Response.json({ ok: true, result, defer_due, wa_daily, task_automation });
+    return Response.json({ ok: true, result, defer_due, wa_daily, task_automation, broadcast_drain });
   } catch (e: any) {
     console.error('[/api/cron/refresh-parties]', e);
     // wa_daily + task_automation ran before the refresh — report them even on
     // failure so external cron logs show whether the daily jobs dispatched.
-    return Response.json({ error: e.message, wa_daily, task_automation }, { status: 500 });
+    return Response.json({ error: e.message, wa_daily, task_automation, broadcast_drain }, { status: 500 });
   }
 }

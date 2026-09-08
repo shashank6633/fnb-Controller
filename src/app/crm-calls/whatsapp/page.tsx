@@ -38,6 +38,7 @@ import {
   Download,
   FileText,
   Loader2,
+  Megaphone,
   MessageCircle,
   Search,
   Send,
@@ -110,10 +111,18 @@ interface ThreadConv {
   last_message_at: string | null;
 }
 
+/** Standing marketing-consent row for the guest (null = default, messageable). */
+interface MarketingConsent {
+  status: 'opted_out' | 'opted_in';
+  source: string;
+  detail: string;
+  changed_at: string;
+}
+
 /* Typed (partial) response shapes — every field is optional because an error
  * body may carry none of them. */
 interface ListResp { conversations?: Conv[]; total?: number; unread_total?: number; provider?: ProviderInfo; error?: string }
-interface ThreadResp { conversation?: ThreadConv; messages?: Msg[]; window?: WindowInfo; templates?: Tpl[]; provider?: ProviderInfo; error?: string }
+interface ThreadResp { conversation?: ThreadConv; messages?: Msg[]; window?: WindowInfo; templates?: Tpl[]; provider?: ProviderInfo; marketing_consent?: MarketingConsent | null; error?: string }
 interface ReplyResp { ok?: boolean; message?: Msg; window?: WindowInfo; error?: string; detail?: string }
 
 /* ───────────────────────────── time helpers (UTC strings → IST) ───────────────────────────── */
@@ -249,7 +258,7 @@ export default function WhatsAppInboxPage() {
   const [search, setSearch] = useState('');
 
   const [selectedId, setSelectedId] = useState<number | null>(null);
-  const [thread, setThread] = useState<{ conversation: ThreadConv; messages: Msg[]; window: WindowInfo; templates: Tpl[] } | null>(null);
+  const [thread, setThread] = useState<{ conversation: ThreadConv; messages: Msg[]; window: WindowInfo; templates: Tpl[]; marketing_consent: MarketingConsent | null } | null>(null);
   const [threadLoading, setThreadLoading] = useState(false);
   const [threadError, setThreadError] = useState<string | null>(null);
 
@@ -307,6 +316,7 @@ export default function WhatsAppInboxPage() {
         messages: Array.isArray(json.messages) ? json.messages : [],
         window: json.window,
         templates: Array.isArray(json.templates) ? json.templates : [],
+        marketing_consent: json.marketing_consent ?? null,
       });
       windowAnchor.current = { at: Date.now(), w: json.window };
       setThreadError(null);
@@ -520,7 +530,7 @@ export default function WhatsAppInboxPage() {
 /* ───────────────────────────── thread pane ───────────────────────────── */
 
 function ThreadPane({ thread, window: win, provider, onBack, onSent, onWindowRefresh }: {
-  thread: { conversation: ThreadConv; messages: Msg[]; window: WindowInfo; templates: Tpl[] };
+  thread: { conversation: ThreadConv; messages: Msg[]; window: WindowInfo; templates: Tpl[]; marketing_consent: MarketingConsent | null };
   window: WindowInfo;
   provider: ProviderInfo | null;
   onBack: () => void;
@@ -568,6 +578,14 @@ function ThreadPane({ thread, window: win, provider, onBack, onSent, onWindowRef
                 ? <span className="text-green-700">window open until {istTime(win.expires_at)}</span>
                 : <span>window closed</span>}
             </span>
+            {thread.marketing_consent?.status === 'opted_out' && (
+              <span
+                className="inline-flex items-center gap-1 text-[10px] font-bold uppercase tracking-wider text-red-700 bg-red-50 border border-red-200 rounded-full px-2 py-px"
+                title={`Opted out of marketing (${thread.marketing_consent.source}${thread.marketing_consent.detail ? `: ${thread.marketing_consent.detail}` : ''}) — broadcasts skip this guest automatically. Service replies here are unaffected.`}
+              >
+                <AlertTriangle className="w-2.5 h-2.5" /> Opted out of marketing
+              </span>
+            )}
           </p>
         </div>
         <Link href={`/crm-calls/guests/${encodeURIComponent(conv.guest_handle)}`}
@@ -590,6 +608,10 @@ function ThreadPane({ thread, window: win, provider, onBack, onSent, onWindowRef
           const newDay = !prev || istDayKey(t) !== istDayKey(prevT);
           const out = m.direction === 'out';
           const isTemplate = m.msg_type === 'template';
+          // Broadcast-campaign sends are recorded with sent_by 'campaign:<id>'
+          // — label them so a GRE reading the thread knows this was bulk
+          // marketing, not a colleague's reply.
+          const isCampaign = out && m.sent_by.startsWith('campaign:');
           return (
             <div key={m.id}>
               {newDay && (
@@ -603,7 +625,14 @@ function ThreadPane({ thread, window: win, provider, onBack, onSent, onWindowRef
                 <div className={`max-w-[85%] sm:max-w-[70%] rounded-2xl px-3 py-2 border shadow-sm ${out
                   ? 'bg-[#FFE8D2] border-[#F3D5B8] rounded-br-md'
                   : 'bg-white border-[#EFE3D4] rounded-bl-md'}`}>
-                  {isTemplate && (
+                  {isCampaign ? (
+                    <span
+                      className="inline-flex items-center gap-1 text-[9px] font-bold uppercase tracking-wider text-[#7c3aed] bg-[#F3EEFB] border border-[#E0D4F5] rounded-full px-1.5 py-px mb-1"
+                      title={`Sent by broadcast ${m.sent_by.slice('campaign:'.length)} — see CRM › Broadcasts for the campaign report`}
+                    >
+                      <Megaphone className="w-2.5 h-2.5" />Campaign broadcast
+                    </span>
+                  ) : isTemplate && (
                     <span className="inline-flex items-center gap-1 text-[9px] font-bold uppercase tracking-wider text-[#a8632b] bg-[#F3E9DC] border border-[#E8D5C4] rounded-full px-1.5 py-px mb-1">
                       <FileText className="w-2.5 h-2.5" />Template
                     </span>
