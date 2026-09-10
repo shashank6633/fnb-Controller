@@ -3,6 +3,7 @@ import { getCurrentUser } from '@/lib/auth';
 import { round2 } from '@/lib/bill-calc';
 import { canDecideDiscount, listDiscountRequests } from '@/lib/discount-requests';
 import { notifyEvent } from '@/lib/whatsapp';
+import { fireDiscountAlert, fireAndForget } from '@/lib/wa-report-events';
 
 /**
  * POST /api/dine-in/discount-requests/[id]/decide  { approve: boolean, note? }
@@ -103,6 +104,18 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         decided_by: me.name,
       });
     } catch { /* notification must never break the action */ }
+
+    // THE RICHER ALERT, alongside the ping above rather than instead of it.
+    // notifyEvent carries four variables (order, pct, decision, decided_by) and
+    // goes to the Notifications-tab list; this carries eight — including the
+    // TABLE, the RUPEE IMPACT and who ASKED — and goes to the reports
+    // audience, which is addressed by role rather than by typed digits. Both
+    // are individually toggled, so neither turning the other on is a duplicate
+    // anybody gets by surprise.
+    //
+    // Detached, exactly like the ping: a manager's ruling on a bill has already
+    // been written and must not be delayed, failed or undone by WhatsApp.
+    fireAndForget(() => fireDiscountAlert(db, { requestId: id }));
 
     const rows = listDiscountRequests(db, 'WHERE dr.id = ?', [id]);
     return Response.json({ request: rows[0] || null });

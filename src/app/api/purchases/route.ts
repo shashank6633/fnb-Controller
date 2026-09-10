@@ -23,6 +23,10 @@ import { resolveDirectIssue, postDirectReceipt } from '@/lib/direct-issue';
 // callable from there too. It was LIFTED, not copied: see the module header for
 // why a second copy is the one thing that could not be done here.
 import { learnVendorMaterialPair, type VendorMappingOutcome } from '@/lib/vendor-learn';
+// Price-hike alert. Additive and DETACHED — see the call site at the end of
+// POST: the bill must complete whatever WhatsApp does. QUEUED per BILL, never
+// fired per line: this route writes one line per request.
+import { queuePriceHikeForPurchase } from '@/lib/wa-report-events';
 // THE DUPLICATE RULE LIVES IN ONE MODULE NOW — src/lib/line-dedupe.ts — and is
 // imported by the PO routes, the bill modal AND this route. Do NOT restate any
 // part of it inline here again: this file and src/app/purchases/page.tsx each
@@ -691,6 +695,25 @@ export async function POST(request: Request) {
     const { recordedId, learned } = insertPurchase();
 
     const purchase = db.prepare('SELECT * FROM purchases WHERE id = ?').get(recordedId);
+
+    // PRICE-HIKE ALERT — QUEUED for the BILL, after it has committed.
+    //
+    // ONE LINE PER REQUEST is what this route is: a six-line grocery bill is
+    // six POSTs. Firing the alert here sent six alerts — six × every recipient,
+    // about one bill, within a minute of each other. Measured on this install's
+    // own busiest day (44 lines) that is 44 alerts, and at the 20-recipient cap
+    // 880 billable WhatsApp messages from one afternoon of data entry.
+    //
+    // queuePriceHikeForPurchase() writes one 'pending' row keyed on the BILL
+    // (invoice_id — every line of one vendor bill shares it) and each further
+    // line only pushes its clock forward. The scheduler flushes it once the
+    // bill has been quiet, so exactly ONE alert goes out, covering every line
+    // on the bill rather than only the first.
+    //
+    // Synchronous, cheap, and it cannot throw — but it still runs AFTER the
+    // insert and outside it, because the bill is money that changed hands and
+    // nothing about WhatsApp may delay it, fail it, or roll it back.
+    queuePriceHikeForPurchase(db, { purchaseId: String(recordedId) });
     // `vendor_mapping` is the WARN half of the bill rule: once we get this far
     // the save HAS succeeded, and the client decides whether to tell the
     // storekeeper that this vendor is not declared to supply this item.

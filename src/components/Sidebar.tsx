@@ -73,6 +73,7 @@ import {
   MessageCircle,
   Megaphone,
   Undo2,
+  Star,
   type LucideIcon,
 } from "lucide-react";
 
@@ -315,6 +316,10 @@ const navTree: NavEntry[] = [
       // everyone else. This row must exist: a catalog entry on its own gates
       // the page correctly and leaves it invisible.
       { kind: "link", label: "Missed Attribution", href: "/crm-calls/missed-attribution", icon: PhoneOff },
+      // Management-only (page-catalog mgmtOnly) — canAccessPage hides it for
+      // everyone else. This row must exist: the catalog entry alone gates the
+      // page correctly and leaves it invisible (the sidebar-vs-catalog trap).
+      { kind: "link", label: "Google Reviews",  href: "/crm-calls/reviews",  icon: Star },
       { kind: "link", label: "Guests",          href: "/crm-calls/guests",   icon: Users },
       // WhatsApp Inbox — two-pane guest-service inbox over the Meta webhook
       // ingest (wa_conversations/wa_messages). Member-open like Guests above.
@@ -334,6 +339,10 @@ const navTree: NavEntry[] = [
       { kind: "link", label: "CRM Settings",    href: "/crm-calls/settings", icon: Settings2 },
       // Admin-only (page-catalog adminOnly) — canAccessPage hides it for everyone else.
       { kind: "link", label: "Telephony",       href: "/crm-calls/telephony", icon: Headphones },
+      // Management-only (page-catalog mgmtOnly) — canAccessPage hides it for
+      // everyone else. This row must exist: the catalog entry alone gates the
+      // page correctly and leaves it invisible (the sidebar-vs-catalog trap).
+      { kind: "link", label: "Scheduled Reports", href: "/crm-calls/reports", icon: CalendarClock },
     ],
   },
 

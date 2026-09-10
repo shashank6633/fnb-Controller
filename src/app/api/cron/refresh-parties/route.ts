@@ -5,6 +5,10 @@ import { getSchedulerStatus } from '@/lib/scheduler';
 import { runWaDailyNotifications } from '@/lib/whatsapp';
 import { getDb } from '@/lib/db';
 import { runTaskAutomation } from '@/lib/task-automation';
+import type { ReportJobStatus } from '@/lib/wa-report-jobs';
+// TYPE ONLY — erased at compile time, so the module itself is still loaded
+// dynamically below and a fault in it cannot fail this route.
+import type { EventFireResult } from '@/lib/wa-report-events';
 
 /**
  * Manual / external trigger for the party-sheet refresh + audit + notify
@@ -46,6 +50,33 @@ export async function POST(request: Request) {
     console.error('[/api/cron/refresh-parties] whatsapp daily jobs failed:', e?.message);
   }
 
+  // WhatsApp scheduled REPORTS (daily ops / stock differences / CRM overview),
+  // each with its PDF. Separate from wa_daily above because these carry an
+  // attachment and read their own settings namespace (wa_report_*), so nothing
+  // on the Notifications tab can wipe their recipient lists. Every one is OFF
+  // until an admin sets enabled + recipients + an approved DOCUMENT-header
+  // template; a report with nothing to say is skipped, never sent blank.
+  // Dynamic import so a report-schema fault cannot fail the refresh.
+  let wa_reports: Record<string, ReportJobStatus> | null = null;
+  try {
+    const { runWaReportJobs } = await import('@/lib/wa-report-jobs');
+    wa_reports = await runWaReportJobs(getDb());
+  } catch (e) {
+    console.error('[/api/cron/refresh-parties] whatsapp report jobs failed:', (e as Error)?.message);
+  }
+
+  // PRICE-HIKE ALERTS, one per BILL rather than one per purchase LINE. A
+  // purchase POST only queues its bill; this (and the in-process scheduler
+  // tick) is what actually sends, once the bill has stopped growing. Same
+  // external-cron backstop role as everything else on this route.
+  let wa_price_hikes: EventFireResult[] | null = null;
+  try {
+    const { flushPriceHikeAlerts } = await import('@/lib/wa-report-events');
+    wa_price_hikes = await flushPriceHikeAlerts(getDb());
+  } catch (e) {
+    console.error('[/api/cron/refresh-parties] price-hike alert flush failed:', (e as Error)?.message);
+  }
+
   // Task Management daily automation (recurring + maintenance generation, overdue
   // sweep + escalation). Idempotent per IST day, fully best-effort, never throws.
   let task_automation: any = null;
@@ -79,11 +110,11 @@ export async function POST(request: Request) {
     } catch (e: any) {
       console.error('[/api/cron/refresh-parties] defer-due check failed:', e?.message);
     }
-    return Response.json({ ok: true, result, defer_due, wa_daily, task_automation, broadcast_drain });
+    return Response.json({ ok: true, result, defer_due, wa_daily, wa_reports, wa_price_hikes, task_automation, broadcast_drain });
   } catch (e: any) {
     console.error('[/api/cron/refresh-parties]', e);
     // wa_daily + task_automation ran before the refresh — report them even on
     // failure so external cron logs show whether the daily jobs dispatched.
-    return Response.json({ error: e.message, wa_daily, task_automation, broadcast_drain }, { status: 500 });
+    return Response.json({ error: e.message, wa_daily, wa_reports, wa_price_hikes, task_automation, broadcast_drain }, { status: 500 });
   }
 }

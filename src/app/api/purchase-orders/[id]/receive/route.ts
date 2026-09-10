@@ -27,6 +27,9 @@ import { receivedPoItemIds, poReceiptLines, liveValueSql } from '@/lib/po-receip
 // modal — see the header of @/lib/bill-no. `.trim()` alone said yes to a zero
 // width space, and both halves of the gate said yes together.
 import { normalizeBillNo } from '@/lib/bill-no';
+// Price-hike alert. Additive and DETACHED — see the call site after the
+// price cascade: the receipt must complete whatever WhatsApp does.
+import { firePriceHikeAlert, fireAndForget } from '@/lib/wa-report-events';
 
 /* ══════════════════════════════════════════════════════════════════════════
  * ONE PO, MANY VENDORS, ONE BILL EACH.
@@ -1937,6 +1940,24 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     // touchedMaterials is EMPTY on a held receive — nothing was booked — so this
     // is a no-op there rather than a special case.
     for (const matId of touchedMaterials) updateMaterialPrice(db, matId);
+
+    // PRICE-HIKE ALERT — the second door goods come in through, so the same
+    // alert has to fire here or a PO receipt would be the silent way to bring a
+    // dearer bill into the building.
+    //
+    // AFTER the commit and the price cascade (the spike is computed against the
+    // averages this receipt just moved), scoped to the materials THIS receipt
+    // touched, and NOT awaited: a receipt books stock and closes a PO, and no
+    // WhatsApp fault may delay or undo that. touchedMaterials is empty on a
+    // held (awaiting-QC) receive, and firePriceHikeAlert returns immediately on
+    // an empty list — a delivery nobody has checked yet has not set a price.
+    if (touchedMaterials.size) {
+      fireAndForget(() => firePriceHikeAlert(db, {
+        materialIds: Array.from(touchedMaterials).map(String),
+        sourceId: `grn:${String((result as any).grn_id || id)}`,
+        period: String(receivedAt).slice(0, 10),
+      }));
+    }
 
     // ── TELL SOMEBODY, AFTER THE COMMIT ─────────────────────────────────────
     // Fire-and-forget and never throws: a notification failure must not fail —

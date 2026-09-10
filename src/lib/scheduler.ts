@@ -12,6 +12,8 @@
  *   - sweepRecordingRetention()    — call recordings past the admin's window
  *   - sweepStaleTables()           — EMPTY idle open orders (never ones with items)
  *   - checkKitchenExpiry()         — production batches at/near expiry
+ *   - runWaReportJobs()            — scheduled WhatsApp reports, each at its own
+ *                                    IST time, once per day per outlet
  *
  * Production-only by default. Set ENABLE_SCHEDULER=1 to force in dev for
  * local testing.
@@ -206,6 +208,55 @@ export function startSchedulerOnce(): void {
         }
       } catch (e: any) {
         console.error('[scheduler] broadcast drain failed:', e?.message);
+      }
+
+      // WhatsApp SCHEDULED REPORTS — the daily ops / stock differences / CRM
+      // overview PDFs, each at its own configured IST time.
+      //
+      // THIS IS WHAT MAKES A REPORT A SCHEDULE RATHER THAN A SETTING, the same
+      // argument as recording retention and idle tables above: until now these
+      // only ran when POST /api/cron/refresh-parties was called, so an install
+      // with no external cron had a fully configured 08:00 report that never
+      // arrived. The tick is the schedule; the cron POST stays as the external
+      // backstop for a box nobody has opened a page on.
+      //
+      // Sending twice is IMPOSSIBLE, not merely unlikely: runWaReportJobs
+      // claims each report's slot with one atomic upsert against the partial
+      // unique index on wa_report_runs, so this tick and a simultaneous cron
+      // POST cannot both win. Cadence is 5 min in business hours, so a report
+      // fires at or shortly after its configured time — never before it.
+      // Dynamically imported (grn-qc pattern) so a report-schema fault can
+      // never break the loop.
+      try {
+        const { runWaReportJobs } = await import('./wa-report-jobs');
+        const { getDb } = await import('./db');
+        const rep = await runWaReportJobs(getDb());
+        const acted = Object.values(rep).filter(r => !['disabled', 'not_due', 'already_sent_today'].includes(r.status));
+        if (acted.length) {
+          console.log(`[scheduler] wa-reports @ IST ${istHour()}h: `
+            + acted.map(r => `${r.key}=${r.status}${r.sent ? ` (${r.sent} sent)` : ''}`).join(' · '));
+        }
+      } catch (e) {
+        console.error('[scheduler] whatsapp report jobs failed:', e instanceof Error ? e.message : e);
+      }
+
+      // PRICE-HIKE ALERTS, ONE PER BILL. A purchase line only QUEUES its bill
+      // (POST /api/purchases writes one line per request, so firing there sent
+      // one alert per line — every recipient, several times, about one bill).
+      // This flush sends for bills that have been quiet for the debounce
+      // window, covering every line on them. Separately try/caught so it can
+      // neither be starved by, nor starve, the scheduled reports above.
+      try {
+        const { flushPriceHikeAlerts } = await import('./wa-report-events');
+        const { getDb } = await import('./db');
+        const fired = await flushPriceHikeAlerts(getDb());
+        const acted = fired.filter(r => !['nothing_to_report', 'disabled', 'already_sent'].includes(r.status));
+        if (acted.length) {
+          console.log(`[scheduler] price-hike alerts: `
+            + acted.map(r => `${r.status}${r.sent ? ` (${r.sent} sent)` : ''}`).join(' · '));
+        }
+      } catch (e) {
+        console.error('[scheduler] price-hike alert flush failed:', e instanceof Error ? e.message : e);
       }
     } catch (e: any) {
       console.error('[scheduler] refresh failed:', e?.message);

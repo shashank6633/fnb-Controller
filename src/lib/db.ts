@@ -4580,6 +4580,133 @@ function initializeSchema(db: Database.Database) {
     `);
   } catch (e) { console.error('wa inbox schema failed:', e); }
 
+  // ── WhatsApp OUTBOUND attachments — report files (additive) ───────────────
+  // The private BLOB store behind a document/image header on a template send.
+  // Follows the wa_media / task_files rationale (nothing backs up public/,
+  // blobs ride inside every existing DB backup) but is a SEPARATE table, on
+  // purpose:
+  //   • wa_media is keyed on provider_media_id as the dedupe key for INBOUND
+  //     Graph fetches, has no filename and no owner, and is served by a route
+  //     that treats its rows as guest-supplied content. These rows are the
+  //     opposite — OUR sales/stock figures, with a filename the recipient
+  //     sees. Sharing one table would put internal financials behind the
+  //     guest-media route.
+  //   • provider_media_id here is a CACHE, not an identity: Meta media ids
+  //     expire, so the row keeps its own bytes and re-uploads when the id goes
+  //     stale (WA_MEDIA_ID_TTL_MS in src/lib/wa-report-send.ts).
+  // Served ONLY through the authed, management-gated
+  // /api/crm-calls/reports/files/[id] route — NEVER a public path. That is the
+  // whole reason the send path uploads bytes to Meta (Route A) instead of
+  // handing Meta a link: Meta's link fetcher is unauthenticated, so a link
+  // route would mean a world-readable P&L.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS wa_report_files (
+        id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+        report_key           TEXT NOT NULL DEFAULT '',      -- which report ('stock_variance_daily', …)
+        period               TEXT NOT NULL DEFAULT '',      -- the day/range it covers ('2026-09-09')
+        filename             TEXT NOT NULL DEFAULT '',      -- what the WhatsApp recipient sees
+        mime                 TEXT NOT NULL DEFAULT 'application/pdf',
+        size                 INTEGER NOT NULL DEFAULT 0,
+        sha256               TEXT NOT NULL DEFAULT '',      -- content hash (audit + same-bytes reuse)
+        data                 BLOB NOT NULL,
+        provider_media_id    TEXT NOT NULL DEFAULT '',      -- Meta media id — a CACHE that expires, not an identity
+        provider_uploaded_at TEXT NOT NULL DEFAULT '',      -- UTC 'YYYY-MM-DD HH:MM:SS' of that upload
+        provider_error       TEXT NOT NULL DEFAULT '',
+        created_by           TEXT NOT NULL DEFAULT '',
+        created_at           TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_wa_report_files_key ON wa_report_files(report_key, period);
+      CREATE INDEX IF NOT EXISTS idx_wa_report_files_sha ON wa_report_files(sha256);
+    `);
+  } catch (e) { console.error('wa report files schema failed:', e); }
+
+  // Link an outbound thread bubble to the report file it carried, so the
+  // attachment a recipient received is downloadable from the thread and the
+  // send is auditable. Additive column; NULL on every message that has none.
+  try {
+    const cols = db.prepare('PRAGMA table_info(wa_messages)').all() as any[];
+    const has = (c: string) => cols.some((x: any) => x.name === c);
+    if (cols.length && !has('report_file_id')) {
+      db.exec(`ALTER TABLE wa_messages ADD COLUMN report_file_id INTEGER`);
+    }
+  } catch (e) { console.error('wa_messages.report_file_id migration failed:', e); }
+
+  // ── WhatsApp scheduled reports — THE RUN LEDGER (additive) ────────────────
+  // One row per report per outlet per IST day. This table IS the idempotency:
+  // the partial unique index below makes a second scheduled send for the same
+  // slot impossible at the DATABASE level, not at the "read then decide" level.
+  //
+  // WHY NOT KEEP READING whatsapp_events_log. The first cut of the runner asked
+  // "did a row with this report_key succeed today?" over whatsapp_events_log
+  // payload text. Three faults, and each is the kind that only shows up as a
+  // report going out twice:
+  //   • date('now') is the UTC day, and the UTC day rolls at 05:30 IST. A
+  //     report scheduled for 05:00 IST and one for 06:00 IST land on DIFFERENT
+  //     UTC days, so a schedule either side of that boundary can fire twice on
+  //     one Indian morning. The slot here is the IST calendar day, which is the
+  //     day the person reading the report is living in.
+  //   • it is not per outlet — two outlets could never both be served.
+  //   • read-then-write is a race: two ticks 200 ms apart (a restart while the
+  //     external cron POSTs, a double-clicked "run now") both read "not sent"
+  //     and both send. The claim below is ONE atomic statement, so the second
+  //     one changes nothing and stands down.
+  //
+  // WHAT STILL DOES NOT BURN THE SLOT. Only 'sent'/'partial'/'nothing_to_report'
+  // hold it. A 'failed' row is re-claimable on the very next tick, preserving
+  // the existing rule that a credentials/outage failure must not cost the day.
+  // A 'running' row that has sat past the stale window is re-claimable too, so
+  // a process killed mid-send does not wedge the report until midnight.
+  //
+  // trigger_source is on the index as a PARTIAL predicate: only scheduler runs
+  // occupy the slot. "Send test" and an admin "run now" are recorded here for
+  // the audit trail and can happen as often as an admin likes, without ever
+  // consuming (or satisfying) the day's scheduled send.
+  //
+  // NOT NAMED `trigger` — that is a SQLite keyword and would need quoting at
+  // every call site, which is exactly the sort of thing someone gets wrong once.
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS wa_report_runs (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        report_key     TEXT NOT NULL,
+        outlet_id      TEXT NOT NULL DEFAULT '',      -- '' = the single/default outlet
+        run_date       TEXT NOT NULL,                 -- the SLOT: IST calendar day 'YYYY-MM-DD'
+        period         TEXT NOT NULL DEFAULT '',      -- the day the FIGURES cover (usually run_date - 1)
+        status         TEXT NOT NULL DEFAULT 'running',
+        detail         TEXT NOT NULL DEFAULT '',
+        recipients     TEXT NOT NULL DEFAULT '',      -- JSON array of the numbers actually attempted
+        sent_count     INTEGER NOT NULL DEFAULT 0,
+        failed_count   INTEGER NOT NULL DEFAULT 0,
+        file_id        INTEGER,                       -- wa_report_files.id of what went out
+        trigger_source TEXT NOT NULL DEFAULT 'scheduler', -- scheduler | manual | test
+        actor          TEXT NOT NULL DEFAULT '',      -- who pressed it, for manual/test
+        attempts       INTEGER NOT NULL DEFAULT 0,
+        claimed_at     TEXT NOT NULL DEFAULT (datetime('now')),
+        finished_at    TEXT NOT NULL DEFAULT ''
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS ux_wa_report_runs_slot
+        ON wa_report_runs(report_key, outlet_id, run_date) WHERE trigger_source = 'scheduler';
+      CREATE INDEX IF NOT EXISTS idx_wa_report_runs_key ON wa_report_runs(report_key, run_date DESC);
+    `);
+  } catch (e) { console.error('wa report runs schema failed:', e); }
+
+  // A staff WhatsApp number against a login, so a report can be addressed to a
+  // PERSON ("the Bar HOD") instead of a number somebody typed and nobody
+  // maintains. Additive; '' on every existing row, which reads as "no number on
+  // file" and shows up as exactly that in the recipient preview.
+  //
+  // It is a SECOND source, not the only one: hr_employees.phone10 already holds
+  // staff numbers where HR is in use, and the resolver prefers this column only
+  // because it is the number somebody deliberately typed FOR WhatsApp (an HR
+  // record's phone may be a landline, or a number with no WhatsApp on it).
+  try {
+    const cols = db.prepare('PRAGMA table_info(users)').all() as any[];
+    if (cols.length && !cols.some((c: any) => c.name === 'wa_mobile')) {
+      db.exec(`ALTER TABLE users ADD COLUMN wa_mobile TEXT NOT NULL DEFAULT ''`);
+    }
+  } catch (e) { console.error('users.wa_mobile migration failed:', e); }
+
   // ── AKAN CRM — Guest Database + Loyalty (additive) ─────────────────────────
   // Guest directory keyed by normalized 10-digit mobile (/crm/guests). Visits
   // append to crm_guest_visits and roll up onto the guest row (visit_count /

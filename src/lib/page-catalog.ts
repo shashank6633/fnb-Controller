@@ -329,6 +329,20 @@ export const PAGE_CATALOG: PageSection[] = [
       // security boundary: /api/crm-calls/missed-attribution answers 403
       // 'Management only' to anyone outside isManagement() on its own.
       { path: '/crm-calls/missed-attribution', label: 'Missed-Call Attribution', mgmtOnly: true },
+      // Google Reviews — the public-reputation report: counts and average per
+      // period against the one before, the reviews that still need a reply, and
+      // what guests mention repeatedly. mgmtOnly for the same reason as
+      // Missed-Call Attribution above: the individual reviews are public on
+      // Google, but the AGGREGATE is a performance report on the floor's work
+      // ("our average fell 0.6 stars this month", the reply rate, the theme
+      // table). Importing is stricter still — /api/crm-calls/reviews/import is
+      // requireRole('admin'), because an import rewrites the venue's own review
+      // history and a wrong file lands as real rows.
+      //
+      // As with every line in this catalog the flag is navigation gating, not
+      // the security boundary: /api/crm-calls/reviews answers 403 'Management
+      // only' to anyone outside isManagement() on its own.
+      { path: '/crm-calls/reviews', label: 'Google Reviews', mgmtOnly: true },
       { path: '/crm-calls/guests',   label: 'Guests (unified 360)' },
       // WhatsApp Inbox — 1:1 guest-service threads over the Meta webhook ingest
       // (wa_conversations/wa_messages). Member-open by owner policy, like the
@@ -369,6 +383,13 @@ export const PAGE_CATALOG: PageSection[] = [
       // the routes behind it require the app secret. A manager or HOD must not
       // reach it even with an explicit page_access grant.
       { path: '/crm-calls/telephony', label: 'Telephony Console (TeleCMI)', adminOnly: true },
+      // Scheduled WhatsApp Reports — per-report switch, send time, recipients
+      // (resolved from real users/roles) and a Send Test that reaches only the
+      // person pressing it. mgmtOnly for the same reason Sales Reports is: the
+      // page shows the day's takings and who they are sent to. WRITES are
+      // admin-only, refused in /api/crm-calls/reports/config itself — the flag
+      // here is navigation gating, not the security boundary.
+      { path: '/crm-calls/reports', label: 'Scheduled WhatsApp Reports', mgmtOnly: true },
     ],
   },
   {

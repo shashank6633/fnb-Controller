@@ -491,6 +491,11 @@ export function recordOutbound(db: any, args: {
   status: 'sent' | 'failed';
   errorDetail?: string;
   sentBy?: string;
+  /** wa_report_files.id when this message carried a report attachment. The
+   *  thread then links the exact file the recipient received, so an internal
+   *  report send is auditable from the conversation rather than only from a
+   *  log line. Omitted → the column stays NULL, as on every other message. */
+  reportFileId?: number | null;
 }): any {
   const ts = utcString(Date.now());
   const wamid = String(args.wamid || '').trim() || null;
@@ -503,17 +508,22 @@ export function recordOutbound(db: any, args: {
   // stub's status came from a real provider event and already ranks >= 'sent'
   // on the monotone ladder.
   const info = db.prepare(`
-    INSERT INTO wa_messages (conversation_id, wamid, direction, msg_type, body, status, status_at, error_detail, wa_timestamp, sent_by)
-    VALUES (@conv, @wamid, 'out', @type, @body, @status, @ts, @err, @ts, @by)
+    INSERT INTO wa_messages (conversation_id, wamid, direction, msg_type, body, status, status_at, error_detail, wa_timestamp, sent_by, report_file_id)
+    VALUES (@conv, @wamid, 'out', @type, @body, @status, @ts, @err, @ts, @by, @file)
     ON CONFLICT(wamid) WHERE wamid IS NOT NULL DO UPDATE SET
       msg_type     = excluded.msg_type,
       body         = excluded.body,
       sent_by      = excluded.sent_by,
+      -- COALESCE, not a plain overwrite: a status webhook that raced this send
+      -- created the stub with no file link, and a later upsert must never blank
+      -- a link that is already there.
+      report_file_id = COALESCE(excluded.report_file_id, wa_messages.report_file_id),
       error_detail = CASE WHEN excluded.error_detail <> '' THEN excluded.error_detail ELSE wa_messages.error_detail END
   `).run({
     conv: args.conversationId, wamid, type: args.msgType || 'text',
     body: String(args.body || ''), status: args.status, ts,
     err: String(args.errorDetail || ''), by: String(args.sentBy || ''),
+    file: Number.isFinite(Number(args.reportFileId)) && Number(args.reportFileId) > 0 ? Number(args.reportFileId) : null,
   });
   if (args.status === 'sent') {
     bumpConversation(db, args.conversationId, { outboundAt: ts, messageAt: ts, preview: previewOf(args.msgType || 'text', args.body) });

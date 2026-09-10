@@ -163,7 +163,14 @@ export function buildWaMeLink(mobile: string, text: string): string {
 
 export type WaSendResult =
   | { ok: true; provider: string; message_id?: string }
-  | { ok: false; reason: 'not_configured' | 'send_failed'; detail?: string };
+  // error_code / http_status are POPULATED ONLY on the media-header path (see
+  // sendWhatsAppTemplate). The orchestrator needs Meta's numeric code to tell
+  // "this media id expired, re-upload and retry" from "this send is doomed" —
+  // and a retry must never fire on a network error, where Meta may have
+  // accepted the message we never saw the response for. Every pre-existing
+  // caller keeps the exact two-key { ok:false, reason, detail } object it gets
+  // today, so no whatsapp_events_log payload changes shape.
+  | { ok: false; reason: 'not_configured' | 'send_failed'; detail?: string; error_code?: number; http_status?: number };
 
 /**
  * Send a plain-text WhatsApp message via the configured provider.
@@ -216,23 +223,120 @@ export async function sendWhatsAppMessage(to: string, body: string): Promise<WaS
 }
 
 /**
+ * ONE media object on a template's HEADER component. `media_id` is a Meta media
+ * id from uploadWaMedia() — Route A. There is deliberately no `link` variant:
+ * Meta's link fetcher is UNAUTHENTICATED, so a link header would mean serving
+ * an internal report from a public URL. See uploadWaMedia() for the full
+ * reasoning.
+ */
+export interface WaHeaderMedia {
+  kind: 'document' | 'image';
+  media_id: string;
+  /** Document only — the filename the recipient sees in the chat. Ignored for images. */
+  filename?: string;
+}
+
+/** The Graph JSON fields this module actually reads. Everything is optional —
+ *  an error response carries no `messages`, and a parse failure carries none of
+ *  it — so every read below is already written to survive absence. */
+interface GraphJson {
+  id?: string;
+  data?: unknown[];
+  error?: { message?: string; code?: number };
+  messages?: Array<{ id?: string }>;
+}
+
+/** One template as Meta's message_templates endpoint returns it. */
+interface MetaTemplateDef {
+  name?: string;
+  language?: string;
+  status?: string;
+  components?: Array<{ type?: string; format?: string }>;
+}
+
+/** POST one built template payload to Meta. Extracted so the text path and the
+ *  media path build the byte-identical request and differ only in `template`. */
+async function postMetaTemplate(
+  raw: Record<WaConfigKey, string>,
+  toNum: string,
+  template: unknown,
+  fetchImpl?: typeof fetch,
+): Promise<{ ok: true; message_id?: string } | { ok: false; detail: string; error_code?: number; http_status: number }> {
+  const f = fetchImpl ?? fetch;
+  const r = await f(`https://graph.facebook.com/${META_GRAPH_VERSION}/${encodeURIComponent(raw.wa_phone_number_id.trim())}/messages`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${raw.wa_access_token.trim()}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      messaging_product: 'whatsapp',
+      recipient_type: 'individual',
+      to: toNum,
+      type: 'template',
+      template,
+    }),
+  });
+  const j = await r.json().catch(() => ({})) as GraphJson;
+  if (!r.ok) {
+    const code = Number(j?.error?.code);
+    return {
+      ok: false,
+      detail: j?.error?.message || `Meta API HTTP ${r.status}`,
+      ...(Number.isFinite(code) && code > 0 ? { error_code: code } : {}),
+      http_status: r.status,
+    };
+  }
+  return { ok: true, message_id: j?.messages?.[0]?.id };
+}
+
+/**
  * Send a Meta-approved TEMPLATE message — delivers ANY time (no 24h window).
  * Body params are POSITIONAL: bodyParams[0] → {{1}}, [1] → {{2}}, … and the
  * array length MUST equal the template's placeholder count. opts.headerParams
- * fill a header component's placeholders (optional). NEVER throws.
+ * fill a TEXT header component's placeholders (optional); opts.headerMedia
+ * instead attaches ONE document/image to a media header. NEVER throws.
+ *
+ * headerParams and headerMedia are MUTUALLY EXCLUSIVE — a header component
+ * carrying both a text-parameter list and a media object is a Meta 400, and a
+ * template approved with a DOCUMENT header has no text placeholders to fill
+ * anyway. Passing both is refused here rather than at Meta.
+ *
+ * This is the raw transport: it does NOT check that `templateName` was actually
+ * approved with a media header, because that costs a Graph round trip and every
+ * text send would pay it. To attach a report, call sendReportAttachment() in
+ * src/lib/wa-report-send.ts — it verifies the header format, uploads, sends and
+ * records, in that order.
  */
 export async function sendWhatsAppTemplate(
   to: string,
   templateName: string,
   languageCode: string,
   bodyParams: (string | number)[],
-  opts?: { headerParams?: (string | number)[]; otpButtonCode?: string },
+  opts?: {
+    headerParams?: (string | number)[];
+    otpButtonCode?: string;
+    headerMedia?: WaHeaderMedia;
+    /** Injected transport for tests; defaults to global fetch. */
+    fetchImpl?: typeof fetch;
+  },
 ): Promise<WaSendResult> {
   const raw = getWaConfigRaw();
   if (!isWaConfigured(raw)) return { ok: false, reason: 'not_configured' };
 
   const lang = String(languageCode || '').trim() || 'en';
   const headerParams = opts?.headerParams;
+  const headerMedia = opts?.headerMedia;
+
+  if (headerMedia && headerParams && headerParams.length) {
+    return {
+      ok: false, reason: 'send_failed',
+      detail: 'A template header carries EITHER text placeholders OR one media attachment, never both. Drop headerParams when sending an attachment.',
+    };
+  }
+  if (headerMedia && !String(headerMedia.media_id || '').trim()) {
+    return { ok: false, reason: 'send_failed', detail: 'Attachment has no media id — upload the file first (uploadWaMedia).' };
+  }
 
   try {
     if (raw.wa_api_provider === 'meta_cloud') {
@@ -240,7 +344,19 @@ export async function sendWhatsAppTemplate(
       if (!toNum || !templateName) return { ok: false, reason: 'send_failed', detail: 'Missing recipient or template name' };
 
       const components: any[] = [];
-      if (headerParams && headerParams.length) {
+      if (headerMedia) {
+        // A media header has EXACTLY ONE parameter, whose type names the media
+        // kind and whose value is an object — a different shape from the
+        // { type:'text', text } list a TEXT header takes.
+        const kind = headerMedia.kind;
+        const media: { id: string; filename?: string } = { id: String(headerMedia.media_id).trim() };
+        // filename is what the recipient sees on the document bubble. Meta
+        // ignores it for images, so it is only ever sent for documents.
+        if (kind === 'document' && String(headerMedia.filename || '').trim()) {
+          media.filename = String(headerMedia.filename).trim();
+        }
+        components.push({ type: 'header', parameters: [{ type: kind, [kind]: media }] });
+      } else if (headerParams && headerParams.length) {
         components.push({ type: 'header', parameters: headerParams.map(v => ({ type: 'text', text: String(v) })) });
       }
       if (bodyParams && bodyParams.length) {
@@ -254,29 +370,30 @@ export async function sendWhatsAppTemplate(
       const template: any = { name: templateName, language: { code: lang } };
       if (components.length) template.components = components;
 
-      const r = await fetch(`https://graph.facebook.com/${META_GRAPH_VERSION}/${encodeURIComponent(raw.wa_phone_number_id.trim())}/messages`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${raw.wa_access_token.trim()}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          messaging_product: 'whatsapp',
-          recipient_type: 'individual',
-          to: toNum,
-          type: 'template',
-          template,
-        }),
-      });
-      const j: any = await r.json().catch(() => ({}));
-      if (!r.ok) {
-        return { ok: false, reason: 'send_failed', detail: j?.error?.message || `Meta API HTTP ${r.status}` };
+      const res = await postMetaTemplate(raw, toNum, template, opts?.fetchImpl);
+      if (!res.ok) {
+        // The diagnostic fields ride out ONLY on the media path — see the
+        // WaSendResult comment. Every existing caller's failure object stays
+        // exactly { ok:false, reason:'send_failed', detail }.
+        return headerMedia
+          ? { ok: false, reason: 'send_failed', detail: res.detail, ...(res.error_code ? { error_code: res.error_code } : {}), http_status: res.http_status }
+          : { ok: false, reason: 'send_failed', detail: res.detail };
       }
-      return { ok: true, provider: 'meta_cloud', message_id: j?.messages?.[0]?.id };
+      return { ok: true, provider: 'meta_cloud', message_id: res.message_id };
     }
 
     if (raw.wa_api_provider === 'interakt') {
       if (!templateName) return { ok: false, reason: 'send_failed', detail: 'Missing template name' };
+      if (headerMedia) {
+        // Interakt's media-header field name and shape are UNPROVEN — there is
+        // no Interakt media traffic anywhere in this codebase to copy, and a
+        // guess would fail at the provider AFTER the file was uploaded and the
+        // send recorded. Refuse here, with the fix named.
+        return {
+          ok: false, reason: 'send_failed',
+          detail: 'Attachments are only supported on the Meta Cloud provider. Switch the provider in Settings → Integrations → WhatsApp to send a report as a document.',
+        };
+      }
       const { countryCode, phoneNumber } = splitWaNumber(to);
       if (!phoneNumber) return { ok: false, reason: 'send_failed', detail: 'Missing recipient' };
 
@@ -312,6 +429,233 @@ export async function sendWhatsAppTemplate(
     return { ok: false, reason: 'not_configured' };
   } catch (e: any) {
     return { ok: false, reason: 'send_failed', detail: e?.message || 'Network error' };
+  }
+}
+
+/* ═══════════════ Outbound media — upload (Route A) ═══════════════ */
+
+/**
+ * OUR ceiling on an outbound attachment, enforced BEFORE any network call.
+ *
+ * Meta's own document cap is far higher, so theirs would never bite first — and
+ * a rejection at Meta arrives as an opaque provider error after the bytes have
+ * already crossed the wire. This cap is the one that matters here for two more
+ * reasons: the bytes are stored as a SQLite BLOB that rides inside every DB
+ * backup (wa_report_files), and a report PDF that clears 10 MB is a bug in the
+ * report, not a big report. Symmetric in spirit with WA_MEDIA_MAX_BYTES (5 MB)
+ * on the inbound rail.
+ */
+export const WA_UPLOAD_MAX_BYTES = 10 * 1024 * 1024;
+
+/**
+ * What we are willing to hand to Meta. An allowlist, not a blocklist: this is
+ * an upload of OUR data to a third party, so an unexpected type is a bug to
+ * surface, never a payload to forward.
+ */
+export const WA_UPLOAD_MIME_ALLOW: Record<string, 'document' | 'image'> = {
+  'application/pdf': 'document',
+  'image/png': 'image',
+  'image/jpeg': 'image',
+};
+
+export type WaUploadResult =
+  | { ok: true; media_id: string }
+  | { ok: false; reason: 'not_configured' | 'too_large' | 'unsupported_type' | 'empty' | 'upload_failed'; detail: string };
+
+/** Human-readable byte size for the refusal messages. */
+function humanBytes(n: number): string {
+  if (n >= 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+  if (n >= 1024) return `${Math.round(n / 1024)} KB`;
+  return `${n} bytes`;
+}
+
+/**
+ * Upload one file to Meta and get back a media id — ROUTE A.
+ *
+ * WHY UPLOAD RATHER THAN LINK. Meta will also fetch a media header from a
+ * public https link, which needs no upload and no expiry handling. It is the
+ * wrong answer here: Meta's fetcher is UNAUTHENTICATED, so the link has to be
+ * world-readable while it lives. That would mean adding an internal-report PDF
+ * to isPublic() in src/proxy.ts — today a list holding only the guest menu, the
+ * quiz link, the two webhooks and the crash reporter — and inventing a
+ * public-origin setting this app does not have (the only origin helper derives
+ * from an inbound Host header, which a scheduler tick does not have). A stock
+ * variance or price-hike PDF is internal commercial data; anyone who has,
+ * guesses, forwards or logs that URL reads our numbers. Uploading keeps the
+ * bytes reachable only with the WABA token — the same trust boundary the
+ * inbound media rail already lives inside — and costs one upload per report.
+ *
+ * The returned id is a CACHE, not an identity: Meta expires media ids (the
+ * exact window is not something this codebase can prove), so callers must be
+ * able to re-upload. NEVER throws.
+ */
+export async function uploadWaMedia(
+  args: { data: Uint8Array | Buffer; filename: string; mime: string },
+  opts?: { fetchImpl?: typeof fetch },
+): Promise<WaUploadResult> {
+  const bytes = args?.data;
+  const mime = String(args?.mime || '').trim().toLowerCase();
+  const filename = String(args?.filename || '').trim() || 'attachment';
+
+  // 1. OUR limits first — no credentials read, no network touched, so an
+  //    oversize or wrong-type file is refused identically whether or not
+  //    WhatsApp is configured, and the caller gets OUR message, not Meta's.
+  if (!bytes || !bytes.byteLength) {
+    return { ok: false, reason: 'empty', detail: 'Nothing to attach — the file is empty.' };
+  }
+  if (bytes.byteLength > WA_UPLOAD_MAX_BYTES) {
+    return {
+      ok: false, reason: 'too_large',
+      detail: `${filename} is ${humanBytes(bytes.byteLength)} — over the ${humanBytes(WA_UPLOAD_MAX_BYTES)} WhatsApp attachment limit. Narrow the report's date range or send it as a link instead.`,
+    };
+  }
+  if (!WA_UPLOAD_MIME_ALLOW[mime]) {
+    return {
+      ok: false, reason: 'unsupported_type',
+      detail: `${mime || 'unknown type'} cannot be sent as a WhatsApp attachment. Allowed: ${Object.keys(WA_UPLOAD_MIME_ALLOW).join(', ')}.`,
+    };
+  }
+
+  const raw = getWaConfigRaw();
+  if (raw.wa_api_provider !== 'meta_cloud') {
+    return { ok: false, reason: 'not_configured', detail: 'Attachments are only supported on the Meta Cloud provider.' };
+  }
+  if (!isWaConfigured(raw)) {
+    return { ok: false, reason: 'not_configured', detail: 'WhatsApp is not configured — set the phone number ID and access token in Settings → Integrations → WhatsApp.' };
+  }
+
+  try {
+    // 2. POST multipart/form-data to {phone-number-id}/media. The boundary is
+    //    set by fetch from the FormData body — never hand-rolled.
+    const form = new FormData();
+    form.append('messaging_product', 'whatsapp');
+    form.append('type', mime);
+    // new Uint8Array(bytes) copies in one go — Uint8Array.from() walks element
+    // by element, which is a visible cost at multi-megabyte report sizes.
+    form.append('file', new Blob([new Uint8Array(bytes)], { type: mime }), filename);
+
+    const f = opts?.fetchImpl ?? fetch;
+    const r = await f(`https://graph.facebook.com/${META_GRAPH_VERSION}/${encodeURIComponent(raw.wa_phone_number_id.trim())}/media`, {
+      method: 'POST',
+      // NO Content-Type header: setting it by hand strips the multipart
+      // boundary fetch generates and Meta rejects the body.
+      headers: { 'Authorization': `Bearer ${raw.wa_access_token.trim()}` },
+      body: form,
+      signal: AbortSignal.timeout(60_000),
+    });
+    const j = await r.json().catch(() => ({})) as GraphJson;
+    if (!r.ok || !j?.id) {
+      return { ok: false, reason: 'upload_failed', detail: j?.error?.message || `Media upload HTTP ${r.status}` };
+    }
+    return { ok: true, media_id: String(j.id) };
+  } catch (e) {
+    return { ok: false, reason: 'upload_failed', detail: (e as Error)?.message || 'Network error during media upload' };
+  }
+}
+
+/* ═══════════════ Template shape — refuse BEFORE sending ═══════════════ */
+
+export type WaHeaderFormat = 'NONE' | 'TEXT' | 'IMAGE' | 'DOCUMENT' | 'VIDEO' | 'LOCATION' | 'UNKNOWN';
+
+/** Header formats Meta documents. Anything else reads back as 'UNKNOWN' — and
+ *  'UNKNOWN' never matches the format an attachment needs, so a shape we do not
+ *  recognise fails closed. */
+const KNOWN_HEADER_FORMATS = new Set(['TEXT', 'IMAGE', 'DOCUMENT', 'VIDEO', 'LOCATION']);
+
+export type WaTemplateShape =
+  | { ok: true; name: string; language: string; status: string; headerFormat: WaHeaderFormat }
+  | { ok: false; reason: 'not_configured' | 'lookup_failed' | 'not_found'; detail: string };
+
+/**
+ * Cached template shapes. A daily report goes to several recipients from one
+ * job; without this each send would re-ask Meta for the same definition. Short
+ * TTL because a template CAN be edited at Meta and we would rather re-ask than
+ * hold a wrong answer.
+ */
+const TEMPLATE_SHAPE_TTL_MS = 5 * 60 * 1000;
+const templateShapeCache = new Map<string, { at: number; val: WaTemplateShape }>();
+
+/** Drop every cached template shape (tests, and after an admin edits templates). */
+export function clearWaTemplateShapeCache(): void { templateShapeCache.clear(); }
+
+/**
+ * Ask Meta what a template actually looks like, so an attachment send can be
+ * refused BEFORE the file is uploaded and before a message is recorded.
+ *
+ * This deliberately does NOT read whatsapp_templates.meta_components, the local
+ * cache the template-authoring rail fills: that column is only as fresh as the
+ * last sync, and a stale row would either block a template that does carry a
+ * document header or wave through one that does not — the exact failure this
+ * check exists to prevent. Meta is the authority on its own templates.
+ */
+export async function getWaTemplateShape(
+  templateName: string,
+  languageCode?: string,
+  opts?: { fetchImpl?: typeof fetch; noCache?: boolean },
+): Promise<WaTemplateShape> {
+  const name = String(templateName || '').trim();
+  const lang = String(languageCode || '').trim();
+  if (!name) return { ok: false, reason: 'not_found', detail: 'No template name given.' };
+
+  const cacheKey = `${name}::${lang}`;
+  if (!opts?.noCache) {
+    const hit = templateShapeCache.get(cacheKey);
+    if (hit && Date.now() - hit.at < TEMPLATE_SHAPE_TTL_MS) return hit.val;
+  }
+
+  const val = await lookupTemplateShape(name, lang, opts?.fetchImpl);
+  // Only a definitive answer is cached. A lookup that failed on network or
+  // credentials must be retried, not remembered for five minutes.
+  if (val.ok || val.reason === 'not_found') templateShapeCache.set(cacheKey, { at: Date.now(), val });
+  return val;
+}
+
+async function lookupTemplateShape(name: string, lang: string, fetchImpl?: typeof fetch): Promise<WaTemplateShape> {
+  const raw = getWaConfigRaw();
+  if (raw.wa_api_provider !== 'meta_cloud') {
+    return { ok: false, reason: 'not_configured', detail: 'Template definitions can only be read from the Meta Cloud provider.' };
+  }
+  const waba = raw.wa_business_account_id.trim();
+  const token = raw.wa_access_token.trim();
+  if (!waba) {
+    return {
+      ok: false, reason: 'not_configured',
+      detail: 'Set the WhatsApp Business Account ID in Settings → Integrations → WhatsApp. Without it the template\'s header format cannot be verified, and an attachment must never be sent against a template that cannot carry one.',
+    };
+  }
+  if (!token) return { ok: false, reason: 'not_configured', detail: 'Set the Meta access token in Settings → Integrations → WhatsApp.' };
+
+  try {
+    const url = `https://graph.facebook.com/${META_GRAPH_VERSION}/${encodeURIComponent(waba)}/message_templates`
+      + `?name=${encodeURIComponent(name)}&fields=name,status,language,components&limit=50`;
+    const f = fetchImpl ?? fetch;
+    const r = await f(url, { headers: { Authorization: `Bearer ${token}` }, signal: AbortSignal.timeout(15_000) });
+    const j = await r.json().catch(() => ({})) as GraphJson;
+    if (!r.ok) return { ok: false, reason: 'lookup_failed', detail: j?.error?.message || `Meta API HTTP ${r.status}` };
+
+    // Meta's ?name= filter is a PREFIX match, so 'daily_report' also returns
+    // 'daily_report_v2'. Match the exact name, then prefer the requested
+    // language (a template exists once per language, each with its own shape).
+    const all = (Array.isArray(j?.data) ? j.data as MetaTemplateDef[] : [])
+      .filter(t => String(t?.name || '') === name);
+    if (!all.length) {
+      return { ok: false, reason: 'not_found', detail: `No template named "${name}" exists on this WhatsApp Business Account.` };
+    }
+    const t = (lang && all.find(x => String(x?.language || '') === lang)) || all[0];
+
+    let headerFormat: WaHeaderFormat = 'NONE';
+    for (const c of (Array.isArray(t?.components) ? t.components : [])) {
+      if (String(c?.type || '').toUpperCase() !== 'HEADER') continue;
+      const fmt = String(c?.format || 'TEXT').toUpperCase();
+      headerFormat = KNOWN_HEADER_FORMATS.has(fmt) ? (fmt as WaHeaderFormat) : 'UNKNOWN';
+      break;
+    }
+    return {
+      ok: true, name, language: String(t?.language || lang || ''),
+      status: String(t?.status || ''), headerFormat,
+    };
+  } catch (e) {
+    return { ok: false, reason: 'lookup_failed', detail: (e as Error)?.message || 'Network error reading the template definition' };
   }
 }
 
@@ -433,8 +777,10 @@ export function setWaNotifyRecipients(map: Record<string, unknown>): void {
   `).run(JSON.stringify(merged));
 }
 
-/** Every notifyEvent attempt (and its outcome) lands here — never throws. */
-function logWaSendAttempt(payload: Record<string, unknown>): void {
+/** Every notifyEvent attempt (and its outcome) lands here — never throws.
+ *  Exported so the attachment rail (wa-report-send.ts) audits through the SAME
+ *  door rather than growing a second, differently-shaped send log. */
+export function logWaSendAttempt(payload: Record<string, unknown>): void {
   try {
     getDb().prepare(`INSERT INTO whatsapp_events_log (kind, payload) VALUES ('send_attempt', ?)`)
       .run(JSON.stringify(payload));

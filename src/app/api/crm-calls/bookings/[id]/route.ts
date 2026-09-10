@@ -2,6 +2,10 @@
 import { getDb } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
 import { refreshGuestMetrics } from '@/lib/ct/guest-metrics';
+// Guest reservation confirmation. Additive and DETACHED — see the call site
+// after the commit: a booking is a promise to a guest and must be saved
+// whatever WhatsApp does.
+import { fireReservationConfirmation, fireAndForget } from '@/lib/wa-report-events';
 
 /**
  * CRM Call-to-Table — single booking (/api/crm-calls/bookings/:id).
@@ -150,6 +154,27 @@ export async function PUT(req: Request, { params }: { params: Promise<{ id: stri
     db.prepare(`UPDATE ct_bookings SET ${sets.join(', ')} WHERE id = ?`).run(...sqlParams);
     if (guestId) refreshGuestMetrics(db, guestId);
   })();
+
+  // ── THE GUEST'S CONFIRMATION ────────────────────────────────────────────
+  // Fired on the TRANSITION into 'confirmed', and only that transition.
+  //
+  //   · not on creation — POST inserts every booking as 'pending', which is a
+  //     request nobody has accepted yet. "Your table is confirmed" about one of
+  //     those is worse than no message at all.
+  //   · not on 'seated' or 'completed' — the guest is already standing in the
+  //     restaurant; a confirmation then is absurd.
+  //   · not on a re-save that leaves the status where it was, so editing the
+  //     notes on a confirmed booking does not re-message the guest. (The
+  //     builder's own dedupe on the booking id is the backstop for the
+  //     confirmed → pending → confirmed path.)
+  //
+  // Detached: the booking is committed above and must not be delayed, failed
+  // or rolled back by WhatsApp.
+  const wasConfirmed = String(existing.status || '').toLowerCase() === 'confirmed';
+  const nowConfirmed = body.status !== undefined && String(body.status || '').trim().toLowerCase() === 'confirmed';
+  if (nowConfirmed && !wasConfirmed) {
+    fireAndForget(() => fireReservationConfirmation(db, { bookingId: id }));
+  }
 
   const booking = db.prepare(`${GUEST_JOIN_SELECT} WHERE b.id = ?`).get(id);
   return Response.json({ success: true, booking });
