@@ -1,5 +1,8 @@
 import { getDb } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
+// The re-approval change-set is computed in THIS request so it can never
+// disagree with the lines returned beside it — see the block above the response.
+import { poReapprovalChanges } from '@/lib/po-diff';
 
 /**
  * Approval Context for a Purchase Order.
@@ -152,12 +155,35 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
       };
     });
 
+    /* ── THE CHANGE-SET SHIPS WITH THE LINES IT DESCRIBES ────────────────────
+     * Computed HERE, in the same request that read `items` above, and not taken
+     * from the list row the client already had.
+     *
+     * WHY, because the alternative was proven wrong: the Review panel joins this
+     * response's freshly-read lines to a change-set in the same table cell. When
+     * that change-set came from the client's last list fetch, a second admin who
+     * approved and re-edited the PO in the meantime left the first admin reading
+     * a single row that said "50 kg" and "was 10 kg (+20 kg)" — a row that
+     * cannot be true of anything (50 − 10 ≠ 20), under a legend certifying the
+     * "was" as the last-approved value. He would then sign it: approve/route.ts
+     * re-checks only that the status is still pending, never the content.
+     *
+     * One fetch, one truth. Both halves of every cell now age together, so the
+     * worst a stale tab can show is an old-but-CONSISTENT row rather than an
+     * impossible one. */
+    let reapprovalChanges: ReturnType<typeof poReapprovalChanges> | null = null;
+    if (String(po.status) === 'pending_reapproval') {
+      try { reapprovalChanges = poReapprovalChanges(db, String(po.id)); }
+      catch (e) { console.error('[approval-context] reapproval diff failed (non-fatal):', e); }
+    }
+
     return Response.json({
       po: {
         id: po.id, po_number: po.po_number, date: po.date,
         vendor: po.vendor, vendor_id: po.vendor_id, total_cost: po.total_cost,
         status: po.status, item_count: items.length,
       },
+      reapproval_changes: reapprovalChanges,
       items: enriched,
       summary: {
         total_flags: enriched.reduce((s, i) => s + i.flags.length, 0),

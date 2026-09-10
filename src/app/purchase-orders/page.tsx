@@ -33,7 +33,7 @@ import { useStockOnHand, type StockOnHandState } from '@/lib/use-stock-on-hand';
 // side by the list API from the po.edit audit trail). @/lib/po-diff has NO
 // runtime imports (its Database import is `import type`), and this import is
 // itself type-only, so nothing of it reaches the client bundle.
-import type { PoReapprovalChanges } from '@/lib/po-diff';
+import type { PoReapprovalChanges, PoQtyChange, PoRateChange, PoVendorChange } from '@/lib/po-diff';
 
 // Always 2 dp: at 0 dp the paise were dropped per row, so the item column
 // visibly failed to add up to the footer/list total (₹235.50 + ₹118.50 showed
@@ -712,7 +712,13 @@ export default function PurchaseOrdersPage() {
                                     onSaved={() => { setEditingId(null); fetchAll(); }} />
                         )}
                         {reviewId === p.id && (
-                          <ApprovalContextPanel key={p.id + '-r'} poId={p.id} />
+                          /* The change-set rides the LIST ROW, so it is handed
+                             down rather than re-fetched. Passing it is what
+                             makes "Review" answer the re-approver's first
+                             question — which line moved, and from what. */
+                          <ApprovalContextPanel key={p.id + '-r'} poId={p.id}
+                                                rc={reapprovalOf(p)}
+                                                approvalNote={p.approval_note} />
                         )}
                       </Fragment>
                     );
@@ -2677,6 +2683,66 @@ const reapprovalSummary = (rc: PoReapprovalChanges): string[] => {
   return seg;
 };
 
+/* THE ONE DERIVATION of "does this PO have a change-set to show?", shared by
+ * every surface that shows one. This exists because the reported bug WAS a
+ * drift between surfaces: /purchase-orders has two independent, mutually-
+ * exclusive expanders on the same row — the PO-number chevron (openDetailId →
+ * PODetail) and the amber "Review" button (reviewId → ApprovalContextPanel) —
+ * and the change panel was mounted on only the chevron. An approver reaching
+ * for the button literally named "Review", sitting beside Approve/Reject, got
+ * the stock/usage table and never saw that YELLOW LEMON went 10 → 30 kg or
+ * that GREEN LEMON was newly added. Deriving membership in one place means the
+ * next surface cannot silently forget.
+ *
+ * `po` is the LIST row: reapproval_changes rides there (attached by the list
+ * API, api/purchase-orders/route.ts), and is absent on a payload cached from
+ * before that field existed — in which case this returns null and callers show
+ * nothing rather than guessing. */
+const reapprovalOf = (po: PO): PoReapprovalChanges | null =>
+  po.status === 'pending_reapproval' ? (po.reapproval_changes ?? null) : null;
+
+/** What changed on ONE line. Built only from a RECORDED change-set: an edit
+ *  that predates tracking has no per-line truth to show and must say so in
+ *  words (the panel's fallback), never paint markers it cannot justify. */
+interface PoLineChange {
+  added: boolean;
+  qty?: PoQtyChange;
+  rate?: PoRateChange;
+  vendor?: PoVendorChange;
+}
+/** Index the change-set by material_id so a per-item table can ask "did THIS
+ *  row move, and from what?" in O(1) instead of rescanning five arrays per row.
+ *  material_id is the line identity on every PO write path (duplicateLineError
+ *  enforces one material = one line), and it is what both sides key on: the
+ *  diff's entries and approval-context's rows (route.ts:126) carry it. */
+const lineChangeIndex = (rc: PoReapprovalChanges | null): Map<string, PoLineChange> => {
+  const m = new Map<string, PoLineChange>();
+  if (!rc?.recorded) return m;
+  const at = (id: string): PoLineChange => {
+    let e = m.get(id);
+    if (!e) { e = { added: false }; m.set(id, e); }
+    return e;
+  };
+  for (const l of rc.added)          at(l.material_id).added = true;
+  /* A CHANGE THE READER CANNOT SEE IS NOT A CHANGE ON THIS SURFACE.
+     fmtQtyNum rounds for display, so a delta smaller than that rounding printed
+     the self-refuting row "30 kg / was 30 kg (+0 kg)" — a marker, a legend and
+     an amber border all insisting something moved, above two identical numbers.
+     Skipped when old and new RENDER the same AND the delta rounds away, which
+     ties the test to what is actually on screen rather than to a guessed
+     epsilon. The change stays in rc, so the summary panel above still reports
+     it honestly for anyone who needs the exact figures — it simply stops
+     shouting on a row where nothing legible differs. */
+  for (const c of rc.qty_changes) {
+    const invisible = fmtQtyNum(c.old_qty) === fmtQtyNum(c.new_qty)
+                   && fmtQtyNum(Math.abs(c.qty_delta)) === fmtQtyNum(0);
+    if (!invisible) at(c.material_id).qty = c;
+  }
+  for (const c of rc.rate_changes)   at(c.material_id).rate = c;
+  for (const c of rc.vendor_changes) at(c.material_id).vendor = c;
+  return m;
+};
+
 /** Beside the PENDING_REAPPROVAL status chip: the change-set at a glance,
  *  visible WITHOUT expanding. Same chip vocabulary as PART-RECEIVED. */
 function ReapprovalBadge({ rc }: { rc: PoReapprovalChanges }) {
@@ -2693,7 +2759,10 @@ function ReapprovalBadge({ rc }: { rc: PoReapprovalChanges }) {
   const title = [
     `Edited by ${rc.edited_by || '(unknown)'} · ${auditTimeLabel(rc.edited_at)}`,
     rc.reason ? `Reason: ${rc.reason}` : '',
-    'Open the row for every change, old → new.',
+    // Names the surfaces that actually carry the detail. The old wording,
+    // "Open the row", read to a user as the Review button — which for a long
+    // time showed the stock table and no diff at all.
+    'Every change old → new: the PO-number chevron, the Review button, or the Approve dialog.',
   ].filter(Boolean).join('\n');
   return (
     <span className="inline-block px-2 py-0.5 rounded text-[10px] font-semibold bg-amber-100 text-amber-800" title={title}>
@@ -2901,7 +2970,7 @@ function PODetail({ po, editing, materials, onCancelEdit, onSaved }: {
      change-set was recorded (an unrecorded edit must not paint arbitrary rows).
      `po` here is the LIST row, which is where reapproval_changes rides — absent
      on a cached payload, in which case nothing highlights (silence-safe). */
-  const rc = po.status === 'pending_reapproval' ? (po.reapproval_changes ?? null) : null;
+  const rc = reapprovalOf(po);
   const editedIds = rc?.recorded ? new Set(rc.changed_material_ids) : null;
   const addedIds  = rc?.recorded ? new Set(rc.added.map(a => a.material_id)) : null;
   return (
@@ -4834,7 +4903,23 @@ const FLAG_DEF: Record<string, { label: string; tone: string; help: string }> = 
   no_recent_usage:   { label: 'No recent usage',    tone: 'bg-rose-100 text-rose-700 border-rose-200',       help: 'Item has stock but zero consumption in the last 90 days' },
 };
 
-function ApprovalContextPanel({ poId }: { poId: string }) {
+/**
+ * The panel behind the amber "Review" button — the surface an approver actually
+ * reaches for, since it sits beside Approve/Reject.
+ *
+ * `rc` / `approvalNote` come from the LIST ROW (via reapprovalOf), NOT from a
+ * second fetch: reapproval_changes already rides the row this panel's PO was
+ * rendered from, so the diff costs nothing here. Before this, the panel took
+ * only `poId` and rendered stock/usage/flags — which is why a re-approver could
+ * read this entire table and still not know WHICH line moved. Both questions
+ * now get answered in one place, in the order they must be asked: "what am I
+ * re-signing" (the panel above) then "should we buy this at all" (the table).
+ */
+function ApprovalContextPanel({ poId, rc, approvalNote }: {
+  poId: string;
+  rc?: PoReapprovalChanges | null;
+  approvalNote?: string;
+}) {
   const [data, setData] = useState<any>(null);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
@@ -4845,6 +4930,31 @@ function ApprovalContextPanel({ poId }: { poId: string }) {
       .then(setData).catch(e => setErr(e.message)).finally(() => setLoading(false));
   }, [poId]);
 
+  /* THE CHANGE-SET MUST COME FROM THE SAME FETCH AS THE LINES IT ANNOTATES.
+     `rc` (the prop) rides the LIST row and is as old as the last list load;
+     `data.reapproval_changes` was computed by the approval-context request that
+     also produced `data.items` below. Prefer the fetched one, always.
+
+     This is not defensive tidying — the prop-only version was proven to render
+     an impossible row. Another admin approving and re-editing between the list
+     load and the click left a cell reading "50 kg" over "was 10 kg (+20 kg)",
+     with the legend certifying that "was" as the last-approved figure, and
+     approve/route.ts re-checks only the status, never the content, so the
+     approver would sign it. Both halves now age together: a stale tab shows an
+     old-but-CONSISTENT row instead of a self-contradictory one.
+
+     The prop is kept only as the pre-fetch fallback so the summary does not
+     flicker in during load; once `data` lands the fetched set wins. */
+  const rcLive: PoReapprovalChanges | null =
+    (data?.reapproval_changes as PoReapprovalChanges | null | undefined) ?? (data ? null : (rc ?? null));
+
+  /* Per-line markers are drawn ONLY from a recorded change-set. On a PO that is
+     not awaiting re-approval this map is empty and every cell below takes its
+     existing branch untouched — the table then renders exactly as it always
+     has, which is the property that keeps this fix additive. */
+  const changed = lineChangeIndex(rcLive);
+  const showMarkers = changed.size > 0;
+
   if (loading) return <tr><td colSpan={8} className="px-3 py-4 bg-amber-50/30 text-xs text-[#8B7355]">Loading approval context…</td></tr>;
   if (err)     return <tr><td colSpan={8} className="px-3 py-4 bg-red-50 text-xs text-red-700">Error: {err}</td></tr>;
   if (!data)   return null;
@@ -4852,6 +4962,12 @@ function ApprovalContextPanel({ poId }: { poId: string }) {
   return (
     <tr><td colSpan={8} className="bg-amber-50/30 px-3 py-3 border-b border-amber-200">
       <div className="space-y-2">
+        {/* SUMMARY FIRST, DETAIL SECOND. The same component the expanded row
+            uses — one spelling of "what changed", so the two surfaces cannot
+            word it differently — carrying who edited, when, and the reason they
+            were required to type at edit time. That reason is the approver's
+            context and existed nowhere on this surface before. */}
+        {rcLive && <ReapprovalChangesPanel rc={rcLive} approvalNote={approvalNote} />}
         <div className="flex items-center gap-2 flex-wrap">
           <AlertTriangle className="w-4 h-4 text-amber-700" />
           <span className="text-sm font-semibold text-amber-900">Approval Review</span>
@@ -4901,19 +5017,61 @@ function ApprovalContextPanel({ poId }: { poId: string }) {
                 const reqVsStock = it.current_stock > 0 && it.requested_qty > 0
                   ? `+${((reqInStockUnits / it.current_stock) * 100).toFixed(0)}%`
                   : null;
+                /* WHAT CHANGED ON THIS LINE, if anything. Undefined on every row
+                   of a PO that is not awaiting re-approval, and on the unchanged
+                   rows of one that is — those rows render exactly as before,
+                   with no marker and no tint, so a marker always means a real
+                   change rather than "this table is in change mode". */
+                const chg = changed.get(String(it.material_id));
                 return (
-                  <tr key={it.po_item_id} className={`border-t border-amber-100 ${it.flags.length > 0 ? 'bg-red-50/20' : ''}`}>
+                  <tr key={it.po_item_id}
+                      className={`border-t border-amber-100 ${it.flags.length > 0 ? 'bg-red-50/20' : ''}${chg ? ' border-l-4 border-l-amber-500' : ''}`}>
                     <td className="py-2 px-2">
                       <div className="font-medium text-[#2D1B0E]">{it.material_name}</div>
                       <div className="text-[10px] font-mono text-[#8B7355]">{it.material_sku}</div>
                     </td>
                     <td className="py-2 px-2 text-right font-mono">
+                      {/* A LINE THAT IS NOT ON THE APPROVED PO AT ALL. Stated
+                          before the quantity, because "is this item supposed to
+                          be here?" precedes "is the quantity right?" — the
+                          approver never agreed to this line in the first place. */}
+                      {chg?.added && (
+                        <div className="mb-0.5 inline-block px-1.5 py-0.5 rounded border border-emerald-300 bg-emerald-50 text-emerald-800 text-[10px] font-semibold font-sans leading-tight">
+                          NEW ITEM<span className="font-normal"> — not on the approved PO</span>
+                        </div>
+                      )}
                       {/* Already PURCHASE units (canon) — printed, never divided. */}
                       <div className="font-semibold">{fmtQtyNum(it.requested_qty)} {poUnit}</div>
+                      {/* WAS, directly under the number it replaced — purchase
+                          units first, the same basis as the figure above it, so
+                          the two are read against each other without a mental
+                          divide by pack. The delta is spelled out rather than
+                          left for the reader to subtract. */}
+                      {chg?.qty && (
+                        <div className="text-[10px] font-semibold text-amber-800">
+                          was {fmtQtyNum(chg.qty.old_qty)} {poUnit}
+                          <span className="font-normal">
+                            {' '}({chg.qty.qty_delta > 0 ? '+' : '−'}{fmtQtyNum(Math.abs(chg.qty.qty_delta))} {poUnit})
+                          </span>
+                        </div>
+                      )}
                       {/* Always state the basis: a bare "@ ₹151.50" beside the
                           recipe-unit columns reads as ₹/g. poUnit is never blank
                           — the API COALESCEs purchase_unit to the recipe unit. */}
                       <div className="text-[10px] text-[#8B7355]">@ ₹{it.requested_unit_price.toFixed(2)}/{poUnit}</div>
+                      {/* The old rate under the current rate, same basis. */}
+                      {chg?.rate && (
+                        <div className="text-[10px] font-semibold text-amber-800">
+                          was ₹{chg.rate.old_rate.toFixed(2)}/{poUnit}
+                        </div>
+                      )}
+                      {/* A re-pointed line is a change the money columns cannot
+                          show — same qty, same rate, different supplier. */}
+                      {chg?.vendor && (
+                        <div className="text-[10px] font-semibold text-amber-800 font-sans">
+                          vendor: {chg.vendor.old_vendor || '—'} → {chg.vendor.new_vendor || '—'}
+                        </div>
+                      )}
                       {/* Spell out the stock-unit equivalent so "10 kg" can be compared
                           with the recipe-unit figures the kitchen works in. */}
                       {pf > 1 && (
@@ -4990,6 +5148,45 @@ function ApprovalContextPanel({ poId }: { poId: string }) {
             </tbody>
           </table>
         </div>
+
+        {/* A DELETION CANNOT HIDE. A removed line is gone from
+            purchase_order_items, so approval-context — which reads the LIVE
+            lines — has no row for it and the table above physically cannot
+            show one. Without this block the most consequential edit of all
+            (an item dropped from an approved PO) would be the only one
+            invisible on the surface the approver signs from. Listed here,
+            struck through, in the same purchase-unit basis as the table. */}
+        {rc?.recorded && rc.removed.length > 0 && (
+          <div className="border border-red-200 bg-red-50/60 rounded-lg p-2.5">
+            <div className="text-[11px] font-semibold text-red-800">
+              REMOVED since approval — {rc.removed.length} line{rc.removed.length === 1 ? '' : 's'} dropped from this PO
+              <span className="font-normal text-[#6B5744]"> (no row above: the line no longer exists)</span>
+            </div>
+            <ul className="mt-1 space-y-0.5">
+              {rc.removed.map(l => (
+                <li key={'rm' + l.material_id} className="text-[11px] text-red-700">
+                  <span className="font-semibold">REMOVED:</span>{' '}
+                  {l.material_name}
+                  {l.material_sku && <span className="font-mono text-[10px] text-[#8B7355]"> · {l.material_sku}</span>}{' '}
+                  <span className="line-through font-mono">
+                    {qfmt(l.qty)} {l.purchase_unit} @ {fmt(l.rate)}{l.purchase_unit ? `/${l.purchase_unit}` : ''} = {fmt(l.value)}
+                  </span>
+                  {l.vendor && <span className="text-[#6B5744]"> · {l.vendor}</span>}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+
+        {/* Names the amber marks so they are not mistaken for the flag chips,
+            which mean something entirely different (a flag questions the buy;
+            a marker states what moved since the approver last signed). */}
+        {showMarkers && (
+          <div className="text-[10px] text-[#6B5744]">
+            <span className="font-semibold text-amber-800">Amber-edged rows</span> changed since approval — the
+            &ldquo;was …&rdquo; line under each figure is the last-approved value. Rows with no marker are unchanged.
+          </div>
+        )}
 
         {data.summary.total_flags > 0 && (
           <div className="text-[10px] text-[#6B5744]">
@@ -5152,6 +5349,12 @@ function ApprovePOModal({ po, onClose, onApproved }: {
   const flagCount = ctx?.summary?.total_flags || 0;
   const requiresNote = flagCount > 0;
   const canSubmit = !requiresNote || note.trim().length >= 10;
+  /* THE MOMENT OF SIGNING. This modal already receives the list row, so the
+     change-set is in hand with no extra fetch. Without it an approver going
+     badge → Approve saw the diff zero times: the header said only "Approve
+     PO-2026-0234 · Vendor · Total ₹8,200.00", which is the state AFTER the
+     edit — the one number that cannot reveal that it moved. */
+  const rc = reapprovalOf(po);
 
   const submit = async () => {
     if (!canSubmit) return;
@@ -5166,14 +5369,30 @@ function ApprovePOModal({ po, onClose, onApproved }: {
         <div className="px-5 py-4 border-b border-[#E8D5C4] flex items-center justify-between">
           <div>
             <h2 className="font-bold text-[#2D1B0E] inline-flex items-center gap-2">
-              <ShieldCheck className="w-5 h-5 text-blue-600" /> Approve {po.po_number}
+              <ShieldCheck className="w-5 h-5 text-blue-600" />
+              {/* Naming it a RE-approval in the title: "Approve PO-…" reads as a
+                  first signature, which is the wrong frame for a PO that was
+                  edited after someone already approved it. */}
+              {po.status === 'pending_reapproval' ? 'Re-approve' : 'Approve'} {po.po_number}
             </h2>
-            <p className="text-xs text-[#8B7355] mt-0.5">Vendor: {po.vendor || '—'} · Total: {fmt(po.total_cost)}</p>
+            <p className="text-xs text-[#8B7355] mt-0.5">
+              Vendor: {po.vendor || '—'} · Total: {fmt(po.total_cost)}
+              {/* The bare total is the post-edit figure — the one number that
+                  cannot show that it moved. Say where it came from. */}
+              {rc?.recorded && Math.abs(rc.total_delta) >= 0.005 && (
+                <span className="text-amber-800 font-semibold"> (was {fmt(rc.total_before)})</span>
+              )}
+            </p>
           </div>
           <button onClick={onClose} className="text-[#8B7355]">✕</button>
         </div>
 
         <div className="p-5 space-y-4">
+          {/* ABOVE the flags, and outside the `loading` branch: what is being
+              re-signed does not depend on the approval-context fetch, and must
+              not blink in after it. Same component as both row surfaces — one
+              spelling of "what changed" everywhere it is asked. */}
+          {rc && <ReapprovalChangesPanel rc={rc} approvalNote={po.approval_note} />}
           {loading ? (
             <div className="text-center text-xs text-[#8B7355] py-3">Checking flags…</div>
           ) : flagCount === 0 ? (
