@@ -714,11 +714,17 @@ export default function SalesUploadPage() {
       const copy = [...prev];
       copy[idx] = { ...copy[idx], [field]: value };
 
-      // Auto-fill selling price from recipe
+      // Auto-fill selling price from recipe.
+      //
+      // Use the EFFECTIVE price — the linked menu item's price when there is one
+      // (src/lib/recipe-price.ts), i.e. what the guest is actually charged. This
+      // value becomes sales.total_revenue, so seeding it from the recipe's own
+      // stale number booked STALE REVENUE for every hand-keyed sale: a dish
+      // listed at ₹279 whose recipe row still said ₹96 was recorded at ₹96.
       if (field === 'recipe_id' && value) {
-        const recipe = recipes.find((r) => r.id === value);
+        const recipe = recipes.find((r) => r.id === value) as any;
         if (recipe) {
-          copy[idx].selling_price = recipe.selling_price;
+          copy[idx].selling_price = Number(recipe.effective_selling_price ?? recipe.selling_price) || 0;
           copy[idx].item_name = recipe.name;
         }
       }

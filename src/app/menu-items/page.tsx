@@ -871,8 +871,20 @@ export default function MenuItemsPage() {
                           {it.recipe_cost ? formatCurrency(it.recipe_cost) : it.material_cost ? formatCurrency(it.material_cost) : <span className="text-[#C4B09A]">—</span>}
                         </td>
                         <td className="py-2.5 px-3 text-right">
+                          {/* DERIVED per row by /api/menu-items: the linked
+                              recipe's cost ÷ THIS row's own SELL, so the three
+                              numbers on this line always agree. It is never the
+                              stored recipes.food_cost_percent — that column is a
+                              cache and printed 19.47 (87.43 ÷ a stale ₹449)
+                              beside ₹499. A recipe listed on several menu items
+                              is costed against the cheapest listing for the
+                              recipe book (src/lib/recipe-price.ts); each row
+                              here still reports against its own price. */}
                           {it.recipe_food_cost_percent
-                            ? <span className={`font-medium ${fcColor(it.recipe_food_cost_percent)}`}>{it.recipe_food_cost_percent}</span>
+                            ? <span
+                                className={`font-medium ${fcColor(it.recipe_food_cost_percent)}`}
+                                title={`Linked recipe's food cost — its cost measured against the menu price. ${it.recipe_cost ? `Cost ${formatCurrency(it.recipe_cost)} ÷ ` : ''}${formatCurrency(it.selling_price)}`}
+                              >{it.recipe_food_cost_percent}</span>
                             : <span className="text-[#C4B09A]">—</span>}
                         </td>
                         <td className="py-2.5 px-3"><LinkBadge item={it} /></td>

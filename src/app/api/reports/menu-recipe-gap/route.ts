@@ -1,4 +1,4 @@
-import { getDb, logAuditEvent } from '@/lib/db';
+import { getDb, logAuditEvent, recalcRecipesForMenuItems } from '@/lib/db';
 import { getCurrentUser, isManagement, requireRole, getCurrentOutletId } from '@/lib/auth';
 import { todayIST } from '@/lib/format-date';
 import { buildRecipeMatcher, type RecipeMatch } from '@/lib/recipe-matcher';
@@ -808,6 +808,18 @@ export async function POST(req: Request) {
       }
     });
     run();
+
+    // Attaching a recipe to a menu item makes that item's price the recipe's
+    // costing denominator (src/lib/recipe-price.ts), so the recipe's stored
+    // food_cost_percent is now stale. Re-cost outside the attach transaction:
+    // the links are already committed, and a costing hiccup must not roll back
+    // an attach the user explicitly ticked.
+    try {
+      const touched = results.filter(r => r.status === 'applied').map(r => r.menu_item_id);
+      if (touched.length) recalcRecipesForMenuItems(db, touched);
+    } catch (e) {
+      console.error('recipe re-cost after attach failed', e);
+    }
 
     const applied = results.filter(r => r.status === 'applied').length;
     return Response.json(

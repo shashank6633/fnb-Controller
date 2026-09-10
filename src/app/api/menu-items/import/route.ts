@@ -1,4 +1,4 @@
-import { getDb, generateId, logAuditEvent } from '@/lib/db';
+import { getDb, generateId, logAuditEvent, recalcRecipesForMenuItems } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
 import { buildRecipeMatcher } from '@/lib/recipe-matcher';
 import { MAX_CATEGORY_LEN, ensureMenuCategory, sanitizeCategoryName, findMenuCategory } from '@/lib/menu-category';
@@ -799,6 +799,23 @@ export async function POST(request: Request) {
     });
 
     doImport();
+
+    // A menu item's price is the costing denominator for any recipe linked to
+    // it (src/lib/recipe-price.ts), and this import rewrites selling_price in
+    // bulk — so every linked recipe's stored food_cost_percent is now stale.
+    // Re-cost the whole linked set rather than tracking ids through the two
+    // write sites above: it is bounded by "recipes that have a live listing",
+    // idempotent, and cannot miss a row. Outside the transaction, and swallowed
+    // — a costing refresh must never roll back a committed import.
+    try {
+      const linked = db.prepare(`
+        SELECT DISTINCT recipe_id FROM menu_items
+        WHERE recipe_id IS NOT NULL AND recipe_id <> '' AND is_active = 1
+      `).all() as Array<{ recipe_id: string }>;
+      if (linked.length) recalcRecipesForMenuItems(db, [], linked.map(r => r.recipe_id));
+    } catch (e) {
+      console.error('recipe re-cost after menu import failed', e);
+    }
 
     report.stations_preserved = stationPreservedIds.size;
     report.stations_changed = stationChangedIds.size;

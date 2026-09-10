@@ -1,4 +1,4 @@
-import { getDb, generateId } from '@/lib/db';
+import { getDb, generateId, recalcRecipesForMenuItems } from '@/lib/db';
 import { checkStationOnSave } from '@/lib/station-master';
 import { getCurrentUser, type SessionUser } from '@/lib/auth';
 
@@ -72,7 +72,9 @@ export async function GET(request: Request) {
     let query = `
       SELECT mi.*,
         r.total_cost as recipe_cost,
-        r.food_cost_percent as recipe_food_cost_percent,
+        -- recipe_food_cost_percent is NOT selected here: it is derived below
+        -- from recipe_cost divided by this row's own price, so the stale cached
+        -- column on recipes can never reach this list. See the loop below.
         rm.name as material_name,
         CASE
           WHEN LOWER(COALESCE(rm.unit, '')) IN ('ml', 'l', 'g', 'kg')
@@ -97,6 +99,23 @@ export async function GET(request: Request) {
     query += ' ORDER BY mi.category, mi.name';
 
     const items = db.prepare(query).all(...params) as any[];
+
+    // recipe_food_cost_percent is DERIVED here, never served from the stored
+    // recipes.food_cost_percent column. That column is a cache last written the
+    // last time the recipe was re-costed; a recipe untouched since the costing
+    // rule changed still holds a percentage computed against its own stale
+    // price, which is how this list printed "₹499 · FC 19.47" (87.43 ÷ 449) on
+    // one row. The column and its tooltip both promise cost ÷ THIS row's price,
+    // so that is exactly what is computed — for every listing, whether or not it
+    // is the one that governs the recipe (a dish listed twice is costed against
+    // the cheaper listing; each row still reports honestly against its own).
+    for (const it of items) {
+      const cost = Number(it.recipe_cost);
+      const price = Number(it.selling_price) || 0;
+      it.recipe_food_cost_percent = it.recipe_id && Number.isFinite(cost) && price > 0
+        ? Math.round((cost / price) * 10000) / 100
+        : null;
+    }
 
     // Summary stats
     const allItems = db.prepare('SELECT * FROM menu_items').all() as any[];
@@ -172,6 +191,12 @@ export async function POST(request: Request) {
       clamp(taste_sour, 4), clamp(taste_sweet, 4), clamp(taste_spicy, 4), clamp(taste_tangy, 4), (serves || '').toString(), asJson(options)
     );
 
+    // Creating a listing that already points at a recipe changes that recipe's
+    // costing denominator (src/lib/recipe-price.ts) — re-cost it now.
+    if (recipe_id) {
+      try { recalcRecipesForMenuItems(db, [id]); } catch (e) { console.error('menu-item re-cost failed', e); }
+    }
+
     const item = db.prepare('SELECT * FROM menu_items WHERE id = ?').get(id);
     return Response.json({ item }, { status: 201 });
   } catch (error: any) {
@@ -239,8 +264,28 @@ export async function PUT(request: Request) {
       values.push(Math.round((cg + sg) * 100) / 100);
     }
 
+    // A linked recipe is costed against THIS price (see src/lib/recipe-price.ts),
+    // so read the link as it stands BEFORE the write: if this call moves or drops
+    // recipe_id, the recipe losing the link must fall back to its own price, and
+    // after the write we can no longer find it from here.
+    const beforeLink = db.prepare('SELECT recipe_id FROM menu_items WHERE id = ?').get(id) as
+      { recipe_id?: string | null } | undefined;
+
     values.push(id);
     db.prepare(`UPDATE menu_items SET ${updates.join(', ')}, updated_at = datetime('now') WHERE id = ?`).run(...values);
+
+    // Re-cost whenever the price or the link moved. Without this, repricing a
+    // dish here left the recipe's stored food_cost_percent computed against the
+    // OLD menu price forever — the drift that reported 30.4% for a 10.4% dish.
+    if (fields.selling_price !== undefined || fields.recipe_id !== undefined || fields.is_active !== undefined) {
+      try {
+        recalcRecipesForMenuItems(db, [id], [beforeLink?.recipe_id ?? null]);
+      } catch (e) {
+        // Never fail the menu edit over a costing refresh — the edit is the
+        // user's action; the FC% is derived and self-heals on the next recompute.
+        console.error('menu-item re-cost failed', e);
+      }
+    }
 
     const item = db.prepare('SELECT * FROM menu_items WHERE id = ?').get(id);
     return Response.json({ item });
@@ -266,7 +311,28 @@ export async function DELETE(request: Request) {
     const id = url.searchParams.get('id');
     if (!id) return Response.json({ error: 'id is required' }, { status: 400 });
 
+    // A linked recipe is costed against THIS item's price, so read the link
+    // BEFORE the row is gone — afterwards there is nothing left to find it by.
+    // Deactivating an item already re-costs (PUT above); DELETE was the one
+    // writer of menu_items that never did, leaving the recipe's food cost and
+    // profit measured against a price that no longer exists anywhere, with
+    // price_drifted false so no banner or filter caught it. That contradicts
+    // this function's own contract at src/lib/db.ts (recalcRecipesForMenuItems:
+    // "Every writer of menu_items.selling_price / recipe_id MUST call this").
+    const orphaned = (db.prepare('SELECT recipe_id FROM menu_items WHERE id = ?').get(id) as
+      { recipe_id?: string | null } | undefined)?.recipe_id ?? null;
+
     db.prepare('DELETE FROM menu_items WHERE id = ?').run(id);
+
+    if (orphaned) {
+      try {
+        recalcRecipesForMenuItems(db, [], [orphaned]);
+      } catch (e) {
+        // Never fail the delete over a costing refresh — the delete is the
+        // user's action; FC% is derived on read and self-heals on recompute.
+        console.error('menu-item delete re-cost failed', e);
+      }
+    }
     return Response.json({ success: true });
   } catch (error: any) {
     return Response.json({ error: error.message }, { status: 500 });

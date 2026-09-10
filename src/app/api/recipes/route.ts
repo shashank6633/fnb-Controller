@@ -1,6 +1,30 @@
 import { getDb, generateId, recalculateRecipeCost } from '@/lib/db';
 import { rollUpAllergens } from '@/lib/allergens';
-import { getCurrentUser } from '@/lib/auth';
+import { getCurrentUser, type SessionUser } from '@/lib/auth';
+import { resolveRecipePricesBulk, priceSourceLabel, costedFigures, figuresAreStale } from '@/lib/recipe-price';
+
+/**
+ * WRITE GATE — creating or editing a recipe.
+ *
+ * These handlers had NO gate: any signed-in session holding the CSRF cookie
+ * every logged-in browser already carries could rewrite any dish's selling
+ * price, and (since the menu link is now both the costing denominator AND the
+ * key that deducts inventory on sale) could detach a live menu item from its
+ * recipe so it silently stopped deducting stock.
+ *
+ * Same tier and same resolution as the menu writer gate
+ * (src/app/api/menu-items/route.ts:15) — an assigned role's base_role wins, so
+ * the "Head Chef" role (base_role manager) passes. GET stays open to every
+ * signed-in user: the costed recipe book is read by /menu-items, the cookbook,
+ * party menus and the sales screens.
+ */
+function requireRecipeWriter(me: SessionUser | null): Response | null {
+  if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
+  if (me.role !== 'admin' && me.role !== 'manager') {
+    return Response.json({ error: 'Manager or admin only' }, { status: 403 });
+  }
+  return null;
+}
 
 export async function GET(request: Request) {
   try {
@@ -29,6 +53,12 @@ export async function GET(request: Request) {
     query += ' ORDER BY name ASC';
 
     const recipes = db.prepare(query).all(...params) as any[];
+
+    // WHICH price each FC% is computed against. Resolved once for the whole
+    // list (two queries, not one per row) and shipped with every recipe so no
+    // surface has to guess — the ambiguity that let one screen show FC 30.4%
+    // beside the ₹279 the guest actually pays. See src/lib/recipe-price.ts.
+    const priceMap = resolveRecipePricesBulk(db, recipes.map(r => ({ id: r.id, selling_price: r.selling_price })));
 
     const result = recipes.map((recipe) => {
       const ingredients = db.prepare(`
@@ -59,7 +89,38 @@ export async function GET(request: Request) {
       }
       const allergens = rollUpAllergens(names);
 
-      return { ...recipe, ingredients, sub_recipes, allergens };
+      const priced = priceMap.get(recipe.id)!;
+      // DERIVED, NOT STORED. recipes.food_cost_percent / profit are a cache
+      // written the last time this recipe was re-costed. A recipe nobody has
+      // touched since the costing rule changed still holds the figure computed
+      // against its own stale price, so serving that column printed FC 19.47%
+      // beside the ₹499 the guest pays. Compute both from the effective price
+      // this same payload is shipping — the two can then never disagree.
+      // See src/lib/recipe-price.ts. The cache is left alone; realigning it is
+      // the admin's explicit reconcile, never a silent bulk write.
+      const derived = costedFigures(recipe.total_cost, priced.price);
+      return {
+        ...recipe,
+        food_cost_percent: derived.food_cost_percent,
+        profit: derived.profit,
+        /** What the row still holds on disk, and whether it disagrees. */
+        stored_food_cost_percent: Number(recipe.food_cost_percent) || 0,
+        stored_profit: Number(recipe.profit) || 0,
+        figures_stale: figuresAreStale(recipe, derived),
+        ingredients,
+        sub_recipes,
+        allergens,
+        // The denominator behind total_cost / food_cost_percent / profit.
+        effective_selling_price: priced.price,
+        price_source: priced.source,               // 'menu_item' | 'recipe'
+        price_source_label: priceSourceLabel(priced),
+        linked_menu_item_id: priced.menu_item_id,
+        linked_menu_item_name: priced.menu_item_name,
+        linked_menu_item_category: priced.menu_item_category,
+        linked_menu_price: priced.menu_price,
+        linked_menu_count: priced.linked_count,
+        price_drifted: priced.drifted,             // stored recipe price ≠ menu price
+      };
     });
 
     return Response.json({ recipes: result });
@@ -70,6 +131,8 @@ export async function GET(request: Request) {
 
 export async function POST(request: Request) {
   try {
+    const denied = requireRecipeWriter(await getCurrentUser());
+    if (denied) return denied;
     const db = getDb();
     const body = await request.json();
     const { name, category, selling_price, ingredients, sub_recipes, menu_item_id, instructions, image_url } = body;
@@ -79,6 +142,13 @@ export async function POST(request: Request) {
     }
 
     const id = generateId();
+
+    // A menu item can belong to exactly one recipe. Claiming one that already
+    // belongs to ANOTHER recipe leaves that recipe costed against a menu price
+    // it no longer owns, so remember whose it was and re-cost that recipe below.
+    const stolenFrom = menu_item_id
+      ? ((db.prepare('SELECT recipe_id FROM menu_items WHERE id = ?').get(menu_item_id) as { recipe_id?: string | null } | undefined)?.recipe_id ?? null)
+      : null;
 
     const create = db.transaction(() => {
       db.prepare(`
@@ -115,6 +185,14 @@ export async function POST(request: Request) {
       }
 
       recalculateRecipeCost(db, id);
+
+      // The recipe that just lost this listing falls back to its own price —
+      // re-cost it, or it keeps a food cost measured against a menu price that
+      // is now somebody else's.
+      if (stolenFrom && stolenFrom !== id) {
+        const exists = db.prepare('SELECT 1 FROM recipes WHERE id = ?').get(stolenFrom);
+        if (exists) recalculateRecipeCost(db, stolenFrom);
+      }
     });
 
     create();
@@ -143,6 +221,8 @@ export async function POST(request: Request) {
 
 export async function PUT(request: Request) {
   try {
+    const denied = requireRecipeWriter(await getCurrentUser());
+    if (denied) return denied;
     const db = getDb();
     const body = await request.json();
     const { id, name, category, selling_price, ingredients, sub_recipes, menu_item_id, instructions, image_url } = body;
@@ -154,6 +234,27 @@ export async function PUT(request: Request) {
     const existing = db.prepare('SELECT * FROM recipes WHERE id = ?').get(id) as any;
     if (!existing) {
       return Response.json({ error: 'Recipe not found' }, { status: 404 });
+    }
+
+    // Whose costing this save disturbs, besides this recipe's own.
+    //
+    // A menu item belongs to exactly one recipe. Picking one that already
+    // belongs to ANOTHER recipe silently moves it, and the recipe that lost it
+    // must fall back to its own price — it was left costed against a menu price
+    // it no longer owns, with price_drifted false, so no screen revealed it and
+    // the reconcile tool (which only looks at LINKED recipes) could not see it.
+    // Read before the write; afterwards the old owner is unfindable from here.
+    const alsoRecost = new Set<string>();
+    if (menu_item_id !== undefined) {
+      if (menu_item_id) {
+        const prevOwner = (db.prepare('SELECT recipe_id FROM menu_items WHERE id = ?').get(menu_item_id) as
+          { recipe_id?: string | null } | undefined)?.recipe_id;
+        if (prevOwner && prevOwner !== id) alsoRecost.add(prevOwner);
+      }
+      // This recipe's OTHER listings are about to be cleared too (the handler
+      // relinks only the one sent), which can hand their price back to nobody.
+      // Those rows belong to THIS recipe, so recalculateRecipeCost(id) below
+      // covers them; nothing extra to collect here.
     }
 
     const update = db.transaction(() => {
@@ -206,6 +307,11 @@ export async function PUT(request: Request) {
       }
 
       recalculateRecipeCost(db, id);
+
+      for (const rid of alsoRecost) {
+        const exists = db.prepare('SELECT 1 FROM recipes WHERE id = ?').get(rid);
+        if (exists) recalculateRecipeCost(db, rid);
+      }
     });
 
     update();

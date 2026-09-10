@@ -1,5 +1,6 @@
 import { getDb } from '@/lib/db';
 import { requireRole } from '@/lib/auth';
+import { resolveRecipePricesBulk, priceSourceLabel } from '@/lib/recipe-price';
 
 /**
  * Master data hygiene audit — surfaces gaps in raw_materials, recipes,
@@ -143,7 +144,18 @@ export async function GET() {
     ORDER BY r.name
   `).all() as any[];
 
+  // WHICH price a recipe is judged against — the same single rule /recipes and
+  // the costing engine use (src/lib/recipe-price.ts): a live, priced menu item
+  // wins, the recipe's own price otherwise. Reading r.selling_price here made
+  // this page and /recipes contradict each other on the same dish — hygiene
+  // said "no selling price, not loss-making" about a recipe /recipes was
+  // pricing at ₹659 from its menu item and listing as loss-making.
+  const recipePrices = resolveRecipePricesBulk(db, recipes.map((r) => ({ id: r.id, selling_price: r.selling_price })));
+
   for (const r of recipes) {
+    const priced = recipePrices.get(r.id)!;
+    const effPrice = priced.price;
+    const priceNote = priced.source === 'menu_item' ? ` (priced from ${priceSourceLabel(priced)})` : '';
     if (r.ing_count === 0 && r.sub_count === 0) {
       issues.push({
         category: 'Empty recipe', severity: 'blocker',
@@ -153,21 +165,21 @@ export async function GET() {
         fix_url: `/recipes`,
       });
     }
-    if (!Number(r.selling_price)) {
+    if (!effPrice) {
       issues.push({
         category: 'No selling price', severity: 'warning',
         entity_type: 'recipe', entity_id: r.id, entity_name: r.name,
-        message: 'No selling price — food-cost % cannot be computed',
-        fix_hint: 'Set selling_price on the recipe',
+        message: 'No selling price — food-cost % cannot be computed. Not linked to a priced menu item either.',
+        fix_hint: 'Set the recipe’s selling price, or link it to a priced menu item',
         fix_url: `/recipes`,
       });
     }
-    if (r.total_cost && r.selling_price && r.total_cost > r.selling_price) {
+    if (r.total_cost && effPrice && r.total_cost > effPrice) {
       issues.push({
         category: 'Cost exceeds price', severity: 'warning',
         entity_type: 'recipe', entity_id: r.id, entity_name: r.name,
-        message: `Cost ₹${Math.round(r.total_cost)} > Selling ₹${Math.round(r.selling_price)} — losing money on every sale`,
-        fix_hint: 'Review ingredient quantities or raise selling_price',
+        message: `Cost ₹${Math.round(r.total_cost)} > Selling ₹${Math.round(effPrice)} — losing money on every sale${priceNote}`,
+        fix_hint: 'Review ingredient quantities or raise the selling price',
         fix_url: `/recipes`,
       });
     }

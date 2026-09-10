@@ -1,5 +1,6 @@
 import { getDb, convertToMaterialUnit } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
+import { resolveRecipePricesBulk, costedFigures, type RecipePriceResolution } from '@/lib/recipe-price';
 import { packFactor, toPurchaseQty, purchasePrice } from '@/lib/pack-units';
 import * as XLSX from 'xlsx';
 
@@ -85,7 +86,25 @@ export async function GET(request: Request) {
       `SELECT * FROM recipes WHERE ${recipeWhere.join(' AND ')} ORDER BY category, name`
     ).all(...recipeParams) as any[];
 
-    if (format === 'csv') return emitCsv(db, recipes);
+    // WHICH price each Food Cost % is measured against. A costing workbook that
+    // prints the recipe's own stale price next to an FC% computed on the menu
+    // price is unreadable — that pairing is the whole bug. The exported
+    // "Selling Price" is the EFFECTIVE price (the linked menu item's when there
+    // is one), and "Price Source" names it. See src/lib/recipe-price.ts.
+    const priceMap = resolveRecipePricesBulk(db, recipes.map(r => ({ id: r.id, selling_price: r.selling_price })));
+    const effPrice = (r: any) => priceMap.get(r.id)?.price ?? (r.selling_price || 0);
+    // Food Cost % is DERIVED from the very price printed in the column beside
+    // it, never read from recipes.food_cost_percent — that column is a cache
+    // written the last time the recipe was re-costed, so an untouched recipe
+    // exported "Selling Price 499 / Food Cost % 19.47" (= 87.43 ÷ a stale 449).
+    const effFc = (r: any) => costedFigures(r.total_cost, effPrice(r)).food_cost_percent;
+    const priceSrc = (r: any) => {
+      const p = priceMap.get(r.id);
+      if (!p) return 'recipe';
+      return p.source === 'menu_item' ? `menu item: ${p.menu_item_name}` : 'recipe (no menu link)';
+    };
+
+    if (format === 'csv') return emitCsv(db, recipes, priceMap);
 
     // ── 1. Recipes sheet ──
     const recipeRows: any[] = [];
@@ -106,9 +125,10 @@ export async function GET(request: Request) {
       if (ings.length === 0 && subs.length === 0) {
         recipeRows.push({
           Recipe: r.name, Category: r.category || '',
-          'Selling Price (₹)': Math.round(r.selling_price || 0),
+          'Selling Price (₹)': Math.round(effPrice(r)),
+          'Price Source':      priceSrc(r),
           'Total Cost (₹)':    Math.round(r.total_cost || 0),
-          'Food Cost %':        r.food_cost_percent || 0,
+          'Food Cost %':        effFc(r),
           Ingredient: '(no ingredients)',
           Qty: '', Unit: '', 'Yield %': '', 'Wastage %': '', 'Line Cost (₹)': '',
         });
@@ -118,9 +138,10 @@ export async function GET(request: Request) {
         const lineCost = engineLineCost(ing);
         recipeRows.push({
           Recipe: r.name, Category: r.category || '',
-          'Selling Price (₹)': Math.round(r.selling_price || 0),
+          'Selling Price (₹)': Math.round(effPrice(r)),
+          'Price Source':      priceSrc(r),
           'Total Cost (₹)':    Math.round(r.total_cost || 0),
-          'Food Cost %':        r.food_cost_percent || 0,
+          'Food Cost %':        effFc(r),
           Ingredient: ing.material_name, Qty: ing.quantity, Unit: ing.unit,
           'Yield %': ing.yield_percent, 'Wastage %': ing.wastage_percent,
           'Line Cost (₹)': lineCost,
@@ -130,9 +151,10 @@ export async function GET(request: Request) {
       for (const sr of subs) {
         recipeRows.push({
           Recipe: r.name, Category: r.category || '',
-          'Selling Price (₹)': Math.round(r.selling_price || 0),
+          'Selling Price (₹)': Math.round(effPrice(r)),
+          'Price Source':      priceSrc(r),
           'Total Cost (₹)':    Math.round(r.total_cost || 0),
-          'Food Cost %':        r.food_cost_percent || 0,
+          'Food Cost %':        effFc(r),
           Ingredient: `[SUB] ${sr.sub_recipe_name}`,
           Qty: sr.quantity, Unit: sr.unit,
           'Yield %': 100, 'Wastage %': 0,
@@ -381,12 +403,24 @@ export async function GET(request: Request) {
 
 // Legacy CSV emitter — kept so any old bookmarks / scripts hitting
 // /api/recipes/export?format=csv still get a CSV back.
-function emitCsv(db: any, recipes: any[]): Response {
+function emitCsv(db: any, recipes: any[], priceMap: Map<string, RecipePriceResolution>): Response {
+  // `selling_price` is the EFFECTIVE price — the one food_cost_percent on the
+  // same row was computed against (src/lib/recipe-price.ts). `price_source` is
+  // APPENDED, never inserted, so any old script reading the first twelve
+  // columns positionally keeps working.
   const headers = [
     'recipe_name', 'category', 'selling_price', 'total_cost', 'food_cost_percent',
     'ingredient_name', 'quantity', 'unit', 'yield_percent', 'wastage_percent',
-    'line_cost', 'notes',
+    'line_cost', 'notes', 'price_source',
   ];
+  const effPrice = (r: any) => priceMap.get(r.id)?.price ?? (r.selling_price || 0);
+  // Derived from the selling_price on the same line — see effFc in GET.
+  const effFc = (r: any) => costedFigures(r.total_cost, effPrice(r)).food_cost_percent;
+  const priceSrc = (r: any) => {
+    const p = priceMap.get(r.id);
+    if (!p) return 'recipe';
+    return p.source === 'menu_item' ? `menu item: ${p.menu_item_name}` : 'recipe (no menu link)';
+  };
   const csvEscape = (val: any): string => {
     const s = String(val ?? '');
     return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
@@ -400,14 +434,14 @@ function emitCsv(db: any, recipes: any[]): Response {
       WHERE ri.recipe_id = ? ORDER BY rm.name
     `).all(r.id) as any[];
     if (ings.length === 0) {
-      lines.push([r.name, r.category, r.selling_price, r.total_cost, r.food_cost_percent,
-        '', '', '', '', '', '', '(no ingredients)'].map(csvEscape).join(','));
+      lines.push([r.name, r.category, effPrice(r), r.total_cost, effFc(r),
+        '', '', '', '', '', '', '(no ingredients)', priceSrc(r)].map(csvEscape).join(','));
       continue;
     }
     for (const ing of ings) {
       const lc = engineLineCost(ing);
-      lines.push([r.name, r.category, r.selling_price, r.total_cost, r.food_cost_percent,
-        ing.material_name, ing.quantity, ing.unit, ing.yield_percent, ing.wastage_percent, lc, ''].map(csvEscape).join(','));
+      lines.push([r.name, r.category, effPrice(r), r.total_cost, effFc(r),
+        ing.material_name, ing.quantity, ing.unit, ing.yield_percent, ing.wastage_percent, lc, '', priceSrc(r)].map(csvEscape).join(','));
     }
   }
   return new Response(lines.join('\n'), {

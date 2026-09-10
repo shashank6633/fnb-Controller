@@ -7,6 +7,10 @@ import path from 'path';
 // shapes: resolveStationDepartment returns a RESOLUTION OBJECT, not an id, and
 // reading it as an id would post "[object Object]" into a stock ledger.
 import { resolveStationDepartment, postDeptLedger, recordConsumptionSkip } from './dept-ledger';
+// Which price a recipe is costed against. Safe to import STATICALLY: recipe-price
+// imports nothing from here (only `import type Database`), so it is a leaf and
+// there is no cycle.
+import { resolveRecipePrice } from './recipe-price';
 
 const DB_PATH = path.join(process.cwd(), 'fnb-controller.db');
 
@@ -8168,13 +8172,65 @@ export function recalculateRecipeCost(db: Database.Database, recipeId: string): 
     totalCost += sr.quantity * sr.cost_per_unit;
   }
 
-  const profit = recipe.selling_price - totalCost;
-  const foodCostPercent = recipe.selling_price > 0 ? (totalCost / recipe.selling_price) * 100 : 0;
+  // WHICH price is this costed against? A recipe linked to a live menu item is
+  // costed against the MENU price — that is the number the guest is billed
+  // (api/dine-in/orders/[id]/route.ts:129,149), so it is the only denominator
+  // under which "food cost %" is a fact rather than a guess. An unlinked recipe
+  // keeps its own price. See src/lib/recipe-price.ts for the full rule.
+  //
+  // Dividing by recipes.selling_price is what reported FC 30.4% for a dish the
+  // guest buys at ₹279 (true FC 10.4%): the recipe row still held a stale ₹96
+  // and nothing on the repricing path ever reconciled the two.
+  //
+  // recipes.selling_price is READ here, never written — aligning the stored
+  // value is a reviewed admin action (/api/admin/recipe-price-reconcile).
+  const priced = resolveRecipePrice(db, recipeId, recipe.selling_price);
+  const effectivePrice = priced.price;
+
+  const profit = effectivePrice - totalCost;
+  const foodCostPercent = effectivePrice > 0 ? (totalCost / effectivePrice) * 100 : 0;
 
   db.prepare(`
     UPDATE recipes SET total_cost = ?, profit = ?, food_cost_percent = ?, updated_at = datetime('now')
     WHERE id = ?
   `).run(Math.round(totalCost * 100) / 100, Math.round(profit * 100) / 100, Math.round(foodCostPercent * 100) / 100, recipeId);
+}
+
+/**
+ * Re-cost every recipe reachable from these menu items.
+ *
+ * A recipe linked to a menu item is costed against the MENU price, so changing
+ * that price — or linking/unlinking the item — moves the recipe's stored
+ * food_cost_percent. Nothing used to fire on that path: repricing a dish on
+ * /menu-items left the recipe's FC% frozen at the old denominator forever.
+ * Every writer of menu_items.selling_price / recipe_id MUST call this with the
+ * ids it touched, passing the OLD recipe_id too when a link is being moved, so
+ * the recipe losing the link falls back to its own price.
+ *
+ * Dedupes; safe to call with junk ids; idempotent.
+ */
+export function recalcRecipesForMenuItems(
+  db: Database.Database,
+  menuItemIds: Array<string | null | undefined>,
+  extraRecipeIds: Array<string | null | undefined> = [],
+): number {
+  const ids = [...new Set(menuItemIds.filter(Boolean) as string[])];
+  const recipeIds = new Set<string>(extraRecipeIds.filter(Boolean) as string[]);
+  if (ids.length) {
+    const q = db.prepare('SELECT recipe_id FROM menu_items WHERE id = ?');
+    for (const id of ids) {
+      const row = q.get(id) as { recipe_id?: string | null } | undefined;
+      if (row?.recipe_id) recipeIds.add(row.recipe_id);
+    }
+  }
+  let n = 0;
+  for (const rid of recipeIds) {
+    const exists = db.prepare('SELECT 1 FROM recipes WHERE id = ?').get(rid);
+    if (!exists) continue;
+    recalculateRecipeCost(db, rid);
+    n++;
+  }
+  return n;
 }
 
 // Recalculate sub-recipe cost

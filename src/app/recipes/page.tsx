@@ -38,6 +38,9 @@ import {
 import Papa from 'papaparse';
 import { allergenLabel, allergenEmoji } from '@/lib/allergens';
 import { api } from '@/lib/api';
+// ONE rule for which menu listing prices a recipe, shared with the server.
+// (Type-only import of better-sqlite3 inside; nothing server-side is bundled.)
+import { costedFigures, governingListing, liveListingsFor } from '@/lib/recipe-price';
 import { convert } from '@/lib/units';
 // Sub-recipe INGREDIENT lines read in the PURCHASE basis (2 kg @ ₹180/kg), per the
 // carve-out declared in the pack-units header: a sub-recipe is batch-produced in
@@ -96,6 +99,22 @@ interface Recipe {
   allergens?: string[];    // Cookbook: auto-detected allergen keys
   created_at: string;
   updated_at: string;
+
+  // ── WHICH PRICE THIS RECIPE IS COSTED AGAINST ──────────────────────────────
+  // Served by /api/recipes (src/lib/recipe-price.ts). A recipe linked to a live
+  // menu item is costed against the MENU price — the number the guest is
+  // actually billed. `selling_price` above is the recipe's OWN stored price; it
+  // is preserved but is NOT the denominator while a link exists. Read
+  // `effective_selling_price` for anything that divides by a price.
+  effective_selling_price?: number;
+  price_source?: 'menu_item' | 'recipe';
+  price_source_label?: string;
+  linked_menu_item_id?: string | null;
+  linked_menu_item_name?: string | null;
+  linked_menu_item_category?: string | null;
+  linked_menu_price?: number | null;
+  linked_menu_count?: number;
+  price_drifted?: boolean;   // stored recipe price ≠ the menu price it is costed at
 }
 
 interface SubRecipe {
@@ -363,10 +382,43 @@ export default function RecipesPage() {
   const [formInstructions, setFormInstructions] = useState('');   // Cookbook: cooking method
   const [formImageUrl, setFormImageUrl] = useState('');           // Cookbook: recipe photo URL
 
+  // ── WHAT THE MENU LINK CHANGED ─────────────────────────────────────────────
+  // Picking a menu item now carries the item's particulars onto the form —
+  // including the SELLING PRICE, which the old handler silently refused to
+  // overwrite (`&& !formSellingPrice`), leaving a stale ₹96 beside the ₹279 the
+  // guest pays. A price is a commercial fact, so it may never move under the
+  // owner's cursor unseen: this snapshot is taken the moment the modal opens,
+  // and every field the link changed is listed old → new with a per-field
+  // "keep mine" and a whole-link Undo.
+  const [linkSnapshot, setLinkSnapshot] = useState<{
+    name: string; category: string; sellingPrice: number; menuItemId: string; posItemId: string;
+  } | null>(null);
+  // Fields the user chose to KEEP at their pre-link value — so a revert is not
+  // undone by the next pick, and so we can show "kept yours".
+  const [linkKept, setLinkKept] = useState<{ category: boolean }>({ category: false });
+
+  // --- who is signed in (the reconcile tool is admin-only) ---
+  const [me, setMe] = useState<{ role?: string; email?: string } | null>(null);
+
+  // --- price reconciliation (admin, dry-run first) ---
+  const [reconcileOpen, setReconcileOpen] = useState(false);
+  const [reconcileLoading, setReconcileLoading] = useState(false);
+  const [reconcileData, setReconcileData] = useState<any>(null);
+  const [reconcilePicked, setReconcilePicked] = useState<Set<string>>(new Set());
+  const [reconcileApplying, setReconcileApplying] = useState(false);
+  const [reconcileResult, setReconcileResult] = useState<any>(null);
+  const [reconcileError, setReconcileError] = useState<string | null>(null);
+
   // --- menu items (for recipe-name combobox) ---
+  // `is_active` is NOT optional here in spirit: the server's price rule ignores
+  // delisted listings entirely (src/lib/recipe-price.ts LINK_SQL), and this page
+  // used to match a recipe to the FIRST menu row carrying its id, delisted
+  // included. That is how the modal locked the price field to a ₹888 item the
+  // costing engine had never heard of while the list row showed a different
+  // "Linked" price and the FC% matched neither.
   const [menuItems, setMenuItems] = useState<Array<{
     id: string; name: string; category: string; selling_price: number;
-    item_code?: string; recipe_id?: string; item_type?: string;
+    item_code?: string; recipe_id?: string; item_type?: string; is_active?: number;
   }>>([]);
 
   // --- bulk upload ---
@@ -479,11 +531,51 @@ export default function RecipesPage() {
       .catch(() => {});
   }, []);
 
+  // Who's signed in — the price reconciliation tool is admin-only. The server
+  // gate is the real one (/api/admin/recipe-price-reconcile requires admin);
+  // this only decides whether to show a button that would 403.
+  useEffect(() => {
+    api('/api/auth/me').then(r => r.json()).then(d => setMe(d?.user || null)).catch(() => {});
+  }, []);
+
   // -------------------------------------------------------------------------
   // Computed / filtered
   // -------------------------------------------------------------------------
 
   const UNCAT = '__uncat__';
+
+  /**
+   * The price a recipe is COSTED AGAINST — the linked menu item's price when
+   * there is one, the recipe's own otherwise. Served by /api/recipes
+   * (src/lib/recipe-price.ts); the fallback keeps this correct against an older
+   * cached payload. Every filter, sort, stat and card that divides by a price
+   * MUST use this, or the page shows a health verdict computed from one price
+   * beside a figure computed from another — the split that let a 10.4% dish
+   * report 30.4% and sit outside every high-FC filter.
+   */
+  const effPriceOf = useCallback(
+    (r: Recipe) => Number(r.effective_selling_price ?? r.selling_price) || 0,
+    [],
+  );
+
+  /**
+   * FOOD COST % — DERIVED, never the stored column.
+   *
+   * recipes.food_cost_percent is a cache written the last time a recipe was
+   * re-costed. A recipe untouched since the costing rule changed still holds
+   * the figure computed against its own stale price, so gating a filter on it
+   * silently excluded recipes that are catastrophically over target: LOOSE
+   * PRAWNS carried 0 on disk while its true food cost at the ₹659 its menu item
+   * charges is 9561.81%, so it sat outside the high-FC and below-65%-GPM sets.
+   * /api/recipes now derives this too — this recomputes it anyway so the page
+   * is correct even against an older cached payload, and so exactly one
+   * expression decides both what a row PRINTS and what a filter SELECTS.
+   */
+  const fcOf = useCallback(
+    (r: Recipe) => costedFigures(r.total_cost, effPriceOf(r)).food_cost_percent,
+    [effPriceOf],
+  );
+
   const filteredRecipes = useMemo(() => {
     const filtered = recipes.filter((r) => {
       const matchSearch = !searchQuery || r.name.toLowerCase().includes(searchQuery.toLowerCase());
@@ -494,27 +586,52 @@ export default function RecipesPage() {
       let matchIssue = true;
       if (issueFilter) {
         const hasIngredients = (r.ingredients && r.ingredients.length > 0) || (r.sub_recipes && r.sub_recipes.length > 0);
+        // Gate on the EFFECTIVE price, the same denominator food_cost_percent
+        // was computed with — gating on the recipe's own stale number is how a
+        // linked, priced dish could sit outside every FC filter.
+        const ep = effPriceOf(r);
         switch (issueFilter) {
           case 'noIngredients': matchIssue = !hasIngredients; break;
-          case 'noPrice': matchIssue = !r.selling_price || r.selling_price === 0; break;
-          case 'lossMaking': matchIssue = r.selling_price > 0 && r.total_cost > r.selling_price; break;
-          case 'highFC':       matchIssue = r.food_cost_percent > 35 && r.selling_price > 0; break;  // GPM < 65%
-          case 'borderlineFC': matchIssue = r.food_cost_percent > 20 && r.food_cost_percent <= 35 && r.selling_price > 0; break;  // GPM 65-80% — watch
-          case 'suspicious': matchIssue = r.selling_price > 0 && r.food_cost_percent > 0 && r.food_cost_percent < 5; break;
+          case 'noPrice': matchIssue = ep === 0; break;
+          case 'lossMaking': matchIssue = ep > 0 && r.total_cost > ep; break;
+          case 'highFC':       matchIssue = fcOf(r) > 35 && ep > 0; break;  // GPM < 65%
+          case 'borderlineFC': matchIssue = fcOf(r) > 20 && fcOf(r) <= 35 && ep > 0; break;  // GPM 65-80% — watch
+          case 'suspicious': matchIssue = ep > 0 && fcOf(r) > 0 && fcOf(r) < 5; break;
           case 'noCategory': matchIssue = !r.category || r.category.trim() === '' || r.category === 'other'; break;
           case 'zeroCost': matchIssue = hasIngredients && (!r.total_cost || r.total_cost === 0); break;
           case 'noMenuLink': matchIssue = !menuItems.some(mi => mi.recipe_id === r.id); break;
           case 'priceless_ingredients': matchIssue = !!r.ingredients?.some((i: any) => !i.average_price || i.average_price === 0); break;
+          case 'dupIngredients': {
+            const seen = new Set<string>();
+            matchIssue = !!r.ingredients?.some((i: any) => {
+              if (!i.material_id) return false;
+              if (seen.has(i.material_id)) return true;
+              seen.add(i.material_id);
+              return false;
+            });
+            break;
+          }
+          case 'priceDrift': matchIssue = !!r.price_drifted; break;
           case 'anyIssue': matchIssue = (
             !hasIngredients ||
-            !r.selling_price || r.selling_price === 0 ||
-            (r.selling_price > 0 && r.total_cost > r.selling_price) ||
-            (r.food_cost_percent > 20 && r.selling_price > 0) ||
-            (r.selling_price > 0 && r.food_cost_percent > 0 && r.food_cost_percent < 5) ||
+            ep === 0 ||
+            (ep > 0 && r.total_cost > ep) ||
+            (fcOf(r) > 20 && ep > 0) ||
+            (ep > 0 && fcOf(r) > 0 && fcOf(r) < 5) ||
             !r.category || r.category.trim() === '' || r.category === 'other' ||
             (hasIngredients && (!r.total_cost || r.total_cost === 0)) ||
             !menuItems.some(mi => mi.recipe_id === r.id) ||
-            !!r.ingredients?.some((i: any) => !i.average_price || i.average_price === 0)
+            !!r.ingredients?.some((i: any) => !i.average_price || i.average_price === 0) ||
+            !!r.price_drifted ||
+            (() => {
+              const seen = new Set<string>();
+              return !!r.ingredients?.some((i: any) => {
+                if (!i.material_id) return false;
+                if (seen.has(i.material_id)) return true;
+                seen.add(i.material_id);
+                return false;
+              });
+            })()
           ); break;
         }
       }
@@ -527,13 +644,13 @@ export default function RecipesPage() {
     switch (sortBy) {
       case 'category':  sorted.sort((a, b) => catOf(a).localeCompare(catOf(b)) || a.name.localeCompare(b.name)); break;
       case 'name':      sorted.sort((a, b) => a.name.localeCompare(b.name)); break;
-      case 'fcAsc':     sorted.sort((a, b) => (a.food_cost_percent || 0) - (b.food_cost_percent || 0)); break;
-      case 'fcDesc':    sorted.sort((a, b) => (b.food_cost_percent || 0) - (a.food_cost_percent || 0)); break;
+      case 'fcAsc':     sorted.sort((a, b) => fcOf(a) - fcOf(b)); break;
+      case 'fcDesc':    sorted.sort((a, b) => fcOf(b) - fcOf(a)); break;
       case 'costDesc':  sorted.sort((a, b) => (b.total_cost || 0) - (a.total_cost || 0)); break;
       case 'priceDesc': sorted.sort((a, b) => (b.selling_price || 0) - (a.selling_price || 0)); break;
     }
     return sorted;
-  }, [recipes, searchQuery, categoryFilter, issueFilter, sortBy]);
+  }, [recipes, searchQuery, categoryFilter, issueFilter, sortBy, menuItems, effPriceOf, fcOf]);
 
   // List pagination (25/page). Gallery view shows everything (photo grid).
   const R_PAGE_SIZE = 25;
@@ -571,10 +688,14 @@ export default function RecipesPage() {
   // Build a map: recipe_id → { count, names[] } so each card knows whether it's
   // linked to a menu item (and which one). A linked recipe shows a green ✓ badge;
   // an unlinked recipe shows an amber "no menu link" hint.
+  // Only LIVE listings count — the server ignores delisted ones when it prices
+  // and costs a recipe, so a badge built from delisted rows would claim "Linked"
+  // beside a price nothing is measured against.
   const menuLinkMap = useMemo(() => {
     const m = new Map<string, { count: number; names: string[] }>();
     for (const mi of menuItems) {
       if (!mi.recipe_id) continue;
+      if (mi.is_active !== undefined && !Number(mi.is_active)) continue;
       const slot = m.get(mi.recipe_id) || { count: 0, names: [] };
       slot.count += 1;
       slot.names.push(mi.name);
@@ -587,31 +708,38 @@ export default function RecipesPage() {
   const summaryStats = useMemo(() => {
     if (!recipes.length) return {
       total: 0, avgFoodCost: 0, mostProfitable: '-', mostProfitableGpm: 0, highestCost: '-', highestCostFc: 0,
-      issues: { total: 0, noPrice: [], noIngredients: [], noCategory: [], highFC: [], borderlineFC: [], suspicious: [], lossMaking: [], zeroCost: [], noMenuLink: [], pricelessIngredients: [] }
+      issues: { total: 0, noPrice: [], noIngredients: [], noCategory: [], highFC: [], borderlineFC: [], suspicious: [], lossMaking: [], zeroCost: [], noMenuLink: [], pricelessIngredients: [], dupIngredients: [], priceDrift: [] }
     };
     const total = recipes.length;
-    const avgFoodCost = recipes.reduce((s, r) => s + (r.food_cost_percent || 0), 0) / total;
+    // AVG FOOD COST averages the DERIVED food cost (fcOf) across EVERY recipe,
+    // including the ones with no price at all (they contribute a 0). It is a
+    // headline, not an analysis — the health pills below are the real read.
+    // Averaging the stored column instead fed this card figures measured
+    // against prices that no longer exist.
+    const avgFoodCost = recipes.reduce((s, r) => s + fcOf(r), 0) / total;
     const sorted = [...recipes].sort((a, b) => {
-      const pa = (a.selling_price || 0) - (a.total_cost || 0);
-      const pb = (b.selling_price || 0) - (b.total_cost || 0);
+      const pa = effPriceOf(a) - (a.total_cost || 0);
+      const pb = effPriceOf(b) - (b.total_cost || 0);
       return pb - pa;
     });
     const mostProfitable = sorted[0]?.name || '-';
     const mp = sorted[0];
-    const mostProfitableGpm = mp && mp.selling_price > 0 ? ((mp.selling_price - mp.total_cost) / mp.selling_price) * 100 : 0;
-    const highestCostRecipe = [...recipes].sort((a, b) => (b.food_cost_percent || 0) - (a.food_cost_percent || 0));
+    const mostProfitableGpm = mp && effPriceOf(mp) > 0 ? ((effPriceOf(mp) - mp.total_cost) / effPriceOf(mp)) * 100 : 0;
+    const highestCostRecipe = [...recipes].sort((a, b) => fcOf(b) - fcOf(a));
     const highestCost = highestCostRecipe[0]?.name || '-';
-    const highestCostFc = highestCostRecipe[0]?.food_cost_percent || 0;
+    const highestCostFc = highestCostRecipe[0] ? fcOf(highestCostRecipe[0]) : 0;
 
     // Health check — recipes needing attention
-    const noPrice = recipes.filter(r => !r.selling_price || r.selling_price === 0);
+    // Every price test below uses the EFFECTIVE price — the same denominator
+    // food_cost_percent was computed with (src/lib/recipe-price.ts).
+    const noPrice = recipes.filter(r => effPriceOf(r) === 0);
     const noIngredients = recipes.filter(r => (!r.ingredients || r.ingredients.length === 0) && (!r.sub_recipes || r.sub_recipes.length === 0));
     const noCategory = recipes.filter(r => !r.category || r.category.trim() === '' || r.category === 'other');
     // Spec: highlight margins below 65% GPM in red ⇒ food cost > 35% triggers red
-    const highFC = recipes.filter(r => r.food_cost_percent > 35 && r.selling_price > 0);
-    const borderlineFC = recipes.filter(r => r.food_cost_percent > 20 && r.food_cost_percent <= 35 && r.selling_price > 0);
-    const lossMaking = recipes.filter(r => r.selling_price > 0 && r.total_cost > r.selling_price);
-    const suspicious = recipes.filter(r => r.selling_price > 0 && r.food_cost_percent > 0 && r.food_cost_percent < 5); // Unusually cheap
+    const highFC = recipes.filter(r => fcOf(r) > 35 && effPriceOf(r) > 0);
+    const borderlineFC = recipes.filter(r => fcOf(r) > 20 && fcOf(r) <= 35 && effPriceOf(r) > 0);
+    const lossMaking = recipes.filter(r => effPriceOf(r) > 0 && r.total_cost > effPriceOf(r));
+    const suspicious = recipes.filter(r => effPriceOf(r) > 0 && fcOf(r) > 0 && fcOf(r) < 5); // Unusually cheap
     // Cost = 0 BUT ingredients exist → ingredient prices likely missing or never recalculated
     const zeroCost = recipes.filter(r => {
       const has = (r.ingredients?.length || 0) + (r.sub_recipes?.length || 0) > 0;
@@ -624,21 +752,95 @@ export default function RecipesPage() {
     const pricelessIngredients = recipes.filter(r =>
       (r.ingredients || []).some((i: any) => !i.average_price || i.average_price === 0)
     );
+    // Same material on two rows of one recipe — both are costed and both are
+    // deducted, so they add up. Surfaced, never merged: a chef using a material
+    // at two stages is legitimate and the data cannot tell the two cases apart.
+    const dupIngredients = recipes.filter(r => {
+      const seen = new Set<string>();
+      return (r.ingredients || []).some((i: any) => {
+        if (!i.material_id) return false;
+        if (seen.has(i.material_id)) return true;
+        seen.add(i.material_id);
+        return false;
+      });
+    });
+    // Recipe's own stored price disagrees with the linked menu item it is costed
+    // against. FC% is already correct (it uses the menu price) — this flags the
+    // stale stored number that still feeds exports and manual sales entry.
+    const priceDrift = recipes.filter(r => r.price_drifted);
 
     // Dedupe recipes that appear in multiple issue categories
     const issueSet = new Set<string>();
     [...noPrice, ...noIngredients, ...noCategory, ...highFC, ...borderlineFC, ...lossMaking, ...suspicious,
-     ...zeroCost, ...noMenuLink, ...pricelessIngredients].forEach(r => issueSet.add(r.id));
+     ...zeroCost, ...noMenuLink, ...pricelessIngredients, ...dupIngredients, ...priceDrift].forEach(r => issueSet.add(r.id));
 
     return {
       total, avgFoodCost, mostProfitable, mostProfitableGpm, highestCost, highestCostFc,
       issues: {
         total: issueSet.size,
         noPrice, noIngredients, noCategory, highFC, borderlineFC, lossMaking, suspicious,
-        zeroCost, noMenuLink, pricelessIngredients,
+        zeroCost, noMenuLink, pricelessIngredients, dupIngredients, priceDrift,
       }
     };
-  }, [recipes, menuItems]);
+  }, [recipes, menuItems, effPriceOf, fcOf]);
+
+  // ── THE PRICE THE OPEN FORM IS COSTED AGAINST ──────────────────────────────
+  // Mirrors the server rule in src/lib/recipe-price.ts exactly: a recipe linked
+  // to a live, priced menu item is costed against the MENU price — what the
+  // guest is billed. `formSellingPrice` stays the recipe's OWN stored number
+  // (that is what a save writes), so an untouched edit of a linked recipe can
+  // never quietly overwrite his commercial figure. Aligning the stored value is
+  // either an explicit pick in this modal or the admin reconciliation tool.
+  const linkedMenuItem = useMemo(
+    () => (formMenuItemId ? menuItems.find(mi => mi.id === formMenuItemId) || null : null),
+    [formMenuItemId, menuItems],
+  );
+  const linkedMenuPrice = Number(linkedMenuItem?.selling_price) || 0;
+  /** Delisted (is_active = 0). The server's rule skips these entirely. */
+  const linkedMenuDelisted = !!linkedMenuItem
+    && linkedMenuItem.is_active !== undefined && !Number(linkedMenuItem.is_active);
+  // GOVERNS ⇔ live AND priced. Anything else and the recipe keeps its own price,
+  // so the field must stay editable and the caption must not claim otherwise —
+  // exactly the three conditions src/lib/recipe-price.ts build() applies.
+  const isFormLinked = !!linkedMenuItem && linkedMenuPrice > 0 && !linkedMenuDelisted;
+  const effectiveFormPrice = isFormLinked ? linkedMenuPrice : formSellingPrice;
+  /** The recipe's own stored price is stale relative to the menu item it is costed at. */
+  const formPriceDrifted =
+    isFormLinked && Math.round(formSellingPrice * 100) !== Math.round(linkedMenuPrice * 100);
+
+  // What the menu link changed on this form, old → new, so a price never moves
+  // under the owner's cursor unseen.
+  const linkChanges = useMemo(() => {
+    if (!linkSnapshot || !menuLinkDirty) return [];
+    const out: Array<{ key: 'name' | 'category' | 'price'; label: string; from: string; to: string }> = [];
+    if (linkSnapshot.name !== formName) {
+      out.push({ key: 'name', label: 'Recipe name', from: linkSnapshot.name || '—', to: formName || '—' });
+    }
+    if ((linkSnapshot.category || '') !== (formCategory || '')) {
+      out.push({ key: 'category', label: 'Category', from: linkSnapshot.category || '—', to: formCategory || '—' });
+    }
+    if (Math.round((linkSnapshot.sellingPrice || 0) * 100) !== Math.round((formSellingPrice || 0) * 100)) {
+      out.push({
+        key: 'price',
+        label: 'Selling price',
+        from: linkSnapshot.sellingPrice ? formatCurrency(linkSnapshot.sellingPrice) : 'not set',
+        to: formSellingPrice ? formatCurrency(formSellingPrice) : 'not set',
+      });
+    }
+    return out;
+  }, [linkSnapshot, menuLinkDirty, formName, formCategory, formSellingPrice]);
+
+  /** Duplicate ingredient rows in the OPEN form — same material listed twice. */
+  const formDuplicateIngredients = useMemo(() => {
+    const byMat = new Map<string, { name: string; rows: Array<{ quantity: number; unit: string }> }>();
+    for (const ing of formIngredients) {
+      if (!ing.material_id) continue;
+      const slot = byMat.get(ing.material_id) || { name: ing.material_name || 'this material', rows: [] };
+      slot.rows.push({ quantity: Number(ing.quantity) || 0, unit: ing.unit });
+      byMat.set(ing.material_id, slot);
+    }
+    return [...byMat.values()].filter(v => v.rows.length > 1);
+  }, [formIngredients]);
 
   // Live cost calculator for recipe form
   const liveRecipeCost = useMemo(() => {
@@ -672,10 +874,15 @@ export default function RecipesPage() {
       }
     }
     const totalCost = ingCost + srCost;
-    const profit = formSellingPrice - totalCost;
-    const foodCostPct = formSellingPrice > 0 ? (totalCost / formSellingPrice) * 100 : 0;
+    // Divide by the EFFECTIVE price — the linked menu item's price when there is
+    // one, the recipe's own otherwise. Dividing by the recipe's stale number is
+    // exactly what showed FC 30.4% for a dish sold at ₹279 (true 10.4%).
+    // Mirrors recalculateRecipeCost (src/lib/db.ts) so the live panel and the
+    // saved figure can never disagree.
+    const profit = effectiveFormPrice - totalCost;
+    const foodCostPct = effectiveFormPrice > 0 ? (totalCost / effectiveFormPrice) * 100 : 0;
     return { totalCost, profit, foodCostPct };
-  }, [formIngredients, formSubRecipes, formSellingPrice, materials, subRecipes]);
+  }, [formIngredients, formSubRecipes, effectiveFormPrice, materials, subRecipes]);
 
   // Live cost calculator for sub-recipe form
   const liveSubRecipeCost = useMemo(() => {
@@ -787,7 +994,11 @@ export default function RecipesPage() {
     setCopyFor(recipe);
     setCopyError(null);
     setCopySaving(false);
-    setCopyPrice(recipe.selling_price || 0);
+    // Seed with the price the source recipe is actually costed against — the
+    // menu price when it is linked. The copy starts UNLINKED, so it owns this
+    // number outright; seeding it with a stale recipe-row figure would mint a
+    // fresh drifted recipe on day one.
+    setCopyPrice(effPriceOf(recipe));
 
     // Heuristic name split — try to detect dual-variant names like "X Veg / Non Veg"
     const m = recipe.name.match(/^(.+?)\s*(?:[/\-–—]|\bvs\b)\s*(.+)$/i);
@@ -1209,6 +1420,55 @@ export default function RecipesPage() {
   }
 
   // -------------------------------------------------------------------------
+  // Price reconciliation (admin) — DRY RUN FIRST, apply only what he ticks
+  // -------------------------------------------------------------------------
+
+  /**
+   * Opens the reconciliation review. This ALWAYS starts as a dry run: the GET
+   * writes nothing, and no recipe changes until he ticks rows and presses
+   * Apply. There is deliberately no "fix everything" path and nothing here runs
+   * on boot, on deploy, or on a schedule.
+   */
+  const openReconcile = useCallback(async () => {
+    setReconcileOpen(true);
+    setReconcileResult(null);
+    setReconcileError(null);
+    setReconcileLoading(true);
+    setReconcilePicked(new Set());
+    try {
+      const res = await api('/api/admin/recipe-price-reconcile');
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok) { setReconcileError(j.error || `Could not load the review (HTTP ${res.status}).`); return; }
+      setReconcileData(j);
+    } catch (e: any) {
+      setReconcileError(e?.message ? `Network error: ${e.message}` : 'Network error.');
+    } finally {
+      setReconcileLoading(false);
+    }
+  }, []);
+
+  const applyReconcile = useCallback(async (ids: string[]) => {
+    if (!ids.length) return;
+    setReconcileApplying(true);
+    setReconcileError(null);
+    try {
+      const res = await api('/api/admin/recipe-price-reconcile', { method: 'POST', body: { recipe_ids: ids } });
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok) { setReconcileError(j.error || `Apply failed (HTTP ${res.status}). Nothing was changed.`); return; }
+      setReconcileResult(j);
+      setReconcilePicked(new Set());
+      // Re-read both sides so the page reflects what was just written.
+      await Promise.all([fetchRecipes(), fetchMenuItems()]);
+      const again = await api('/api/admin/recipe-price-reconcile');
+      if (again.ok) setReconcileData(await again.json());
+    } catch (e: any) {
+      setReconcileError(e?.message ? `Network error: ${e.message} — nothing was changed.` : 'Network error — nothing was changed.');
+    } finally {
+      setReconcileApplying(false);
+    }
+  }, [fetchRecipes, fetchMenuItems]);
+
+  // -------------------------------------------------------------------------
   // Modal open helpers
   // -------------------------------------------------------------------------
 
@@ -1225,6 +1485,10 @@ export default function RecipesPage() {
     setFormImageUrl('');
     setRecipeModalError(null);
     setMenuLinkDirty(false);
+    // Baseline for the "what the link changed" panel — a blank form, so every
+    // field a pick fills reads as a fill rather than an overwrite.
+    setLinkSnapshot({ name: '', category: '', sellingPrice: 0, menuItemId: '', posItemId: '' });
+    setLinkKept({ category: false });
     setShowRecipeModal(true);
   }
 
@@ -1235,13 +1499,28 @@ export default function RecipesPage() {
     setFormSellingPrice(recipe.selling_price);
     setFormInstructions((recipe as any).instructions || '');
     setFormImageUrl((recipe as any).image_url || '');
-    // Find any menu_item already linked to this recipe (display only — the link
-    // is NOT re-sent on save unless the user changes it, see menuLinkDirty).
-    const linked = menuItems.find(mi => mi.recipe_id === recipe.id);
+    // The listing that actually GOVERNS this recipe (live, priced, cheapest of
+    // them) — the same pick the server makes. Taking the first row with a
+    // matching recipe_id could seat a delisted or unpriced listing in the form,
+    // whose price the costing engine never uses. Display only: the link is NOT
+    // re-sent on save unless the user changes it (see menuLinkDirty).
+    const linked = governingListing(menuItems, recipe.id)
+      ?? liveListingsFor(menuItems, recipe.id)[0]
+      ?? null;
     setFormMenuItemId(linked?.id || '');
     setFormPosItemId(linked?.item_code || '');
     setRecipeModalError(null);
     setMenuLinkDirty(false);
+    // Baseline for the "what the link changed" panel and its Undo — the recipe
+    // exactly as it stands on disk, captured BEFORE any pick can touch it.
+    setLinkSnapshot({
+      name: recipe.name,
+      category: recipe.category,
+      sellingPrice: recipe.selling_price,
+      menuItemId: linked?.id || '',
+      posItemId: linked?.item_code || '',
+    });
+    setLinkKept({ category: false });
     setFormIngredients(
       recipe.ingredients.map((i) => ({
         material_id: i.material_id,
@@ -1380,7 +1659,15 @@ export default function RecipesPage() {
         selling_price: formSellingPrice,
         instructions: formInstructions,
         image_url: formImageUrl,
-        menu_item_id: formMenuItemId || undefined,  // link menu_items.recipe_id on save
+        // '' means UNLINK, and it has to survive JSON.stringify to say so.
+        // `formMenuItemId || undefined` collapsed the unlink case to undefined,
+        // which stringify DROPS, so the key never reached the wire and the PUT
+        // handler (which gates on `menu_item_id !== undefined`) preserved the
+        // link: "Unlink from this menu item" and its "menu link removed" banner
+        // were both no-ops, and the price the user then typed was written but
+        // ignored by costing because the link was still governing.
+        // The untouched-edit case is handled below by deleting the key outright.
+        menu_item_id: formMenuItemId,  // '' = unlink, id = link menu_items.recipe_id
         ingredients: formIngredients
           .filter((i) => i.material_id)
           .map((i) => ({
@@ -1422,7 +1709,12 @@ export default function RecipesPage() {
         return;
       }
       setShowRecipeModal(false);
-      await fetchRecipes();
+      // Menu items too, not just recipes: a save can LINK or UNLINK a listing,
+      // and the "Linked ×N" badge, the price column and the no-menu-link health
+      // pill are all built from the menuItems array. Refetching only recipes
+      // left the row still badged "Linked" one frame after the modal said
+      // "Menu link removed".
+      await Promise.all([fetchRecipes(), fetchMenuItems()]);
     } catch (e: any) {
       console.error('Save recipe failed', e);
       setRecipeModalError(e?.message ? `Network error: ${e.message} — your changes are NOT saved.` : 'Network error — your changes are NOT saved.');
@@ -1726,8 +2018,11 @@ export default function RecipesPage() {
   // ---- Recipe Detail View ----
   if (selectedRecipe) {
     const r = selectedRecipe;
-    const profit = (r.selling_price || 0) - (r.total_cost || 0);
-    const fcp = r.food_cost_percent || 0;
+    // The price this recipe is costed against (src/lib/recipe-price.ts).
+    const detailPrice = effPriceOf(r);
+    const detailFromMenu = r.price_source === 'menu_item';
+    const profit = detailPrice - (r.total_cost || 0);
+    const fcp = fcOf(r);
     return (
       <div>
         <button
@@ -1777,7 +2072,19 @@ export default function RecipesPage() {
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 sm:gap-4 mb-6">
           <div className="card">
             <p className="text-xs text-[#8B7355] uppercase tracking-wide">Selling Price</p>
-            <p className="text-xl font-bold text-[#2D1B0E] mt-1">{formatCurrency(r.selling_price || 0)}</p>
+            <p className="text-xl font-bold text-[#2D1B0E] mt-1">{formatCurrency(detailPrice)}</p>
+            {/* WHOSE price this is. Without this line the card below it could be
+                read against a number the guest is never charged. */}
+            <p className="text-[11px] text-[#8B7355] mt-0.5">
+              {detailFromMenu
+                ? <>from menu item “{r.linked_menu_item_name}”{(r.linked_menu_count || 0) > 1 ? ` (lowest of ${r.linked_menu_count})` : ''}</>
+                : 'this recipe’s own price'}
+            </p>
+            {r.price_drifted && (
+              <p className="text-[11px] text-amber-700 mt-0.5">
+                recipe’s stored price: {formatCurrency(r.selling_price || 0)} — unused while linked
+              </p>
+            )}
           </div>
           <div className="card">
             <p className="text-xs text-[#8B7355] uppercase tracking-wide">Total Cost</p>
@@ -1792,6 +2099,9 @@ export default function RecipesPage() {
           <div className="card">
             <p className="text-xs text-[#8B7355] uppercase tracking-wide">Food Cost %</p>
             <p className={`text-xl font-bold mt-1 ${foodCostColor(fcp)}`}>{fcp.toFixed(1)}%</p>
+            <p className="text-[11px] text-[#8B7355] mt-0.5">
+              {detailPrice > 0 ? <>cost ÷ {formatCurrency(detailPrice)}</> : 'no price set'}
+            </p>
           </div>
         </div>
 
@@ -2187,6 +2497,8 @@ export default function RecipesPage() {
               { key: 'borderlineFC', label: 'borderline margin', count: summaryStats.issues.borderlineFC.length, tone: 'amber' },
               { key: 'noCategory', label: 'missing category', count: summaryStats.issues.noCategory.length, tone: 'gray' },
               { key: 'priceless_ingredients', label: 'ingredient never purchased', count: summaryStats.issues.pricelessIngredients.length, tone: 'orange' },
+              { key: 'dupIngredients', label: 'material listed twice', count: summaryStats.issues.dupIngredients.length, tone: 'amber' },
+              { key: 'priceDrift', label: 'stored price ≠ menu price', count: summaryStats.issues.priceDrift.length, tone: 'blue' },
             ].filter(x => x.count > 0);
             const shown = showAllIssues ? all : all.slice(0, 4);
             return (
@@ -2198,7 +2510,17 @@ export default function RecipesPage() {
                     <button onClick={() => setShowAllIssues(true)} className="text-xs font-medium text-[#6B5744] hover:underline">+{all.length - 4} more</button>
                   )}
                 </div>
-                <button onClick={() => setIssueFilter(issueFilter ? null : 'anyIssue')} className="ml-auto text-sm font-medium text-[#af4408] hover:underline whitespace-nowrap">{issueFilter ? 'Clear filter' : 'Review all →'}</button>
+                {/* Admin-only. The server gate on /api/admin/recipe-price-reconcile
+                    is the real one; this just avoids showing a button that 403s. */}
+                {me?.role === 'admin' && summaryStats.issues.priceDrift.length > 0 && (
+                  <button
+                    onClick={openReconcile}
+                    className="ml-auto text-sm font-semibold text-[#af4408] hover:underline whitespace-nowrap inline-flex items-center gap-1"
+                  >
+                    <RefreshCw size={13} /> Reconcile prices…
+                  </button>
+                )}
+                <button onClick={() => setIssueFilter(issueFilter ? null : 'anyIssue')} className={`${me?.role === 'admin' && summaryStats.issues.priceDrift.length > 0 ? '' : 'ml-auto'} text-sm font-medium text-[#af4408] hover:underline whitespace-nowrap`}>{issueFilter ? 'Clear filter' : 'Review all →'}</button>
               </div>
             );
           })()}
@@ -2303,7 +2625,7 @@ export default function RecipesPage() {
             /* ---- Cookbook photo-card gallery ---- */
             <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
               {filteredRecipes.map((recipe) => {
-                const fcp = recipe.food_cost_percent || 0;
+                const fcp = fcOf(recipe);
                 const link = menuLinkMap.get(recipe.id);
                 const isLinked = !!link && link.count > 0;
                 const allg = recipe.allergens || [];
@@ -2343,7 +2665,15 @@ export default function RecipesPage() {
                       <h3 className="text-sm font-semibold text-[#2D1B0E] line-clamp-2 leading-snug">{recipe.name}</h3>
                       <div className="flex items-center justify-between text-xs text-[#8B7355]">
                         <span>{recipe.category || 'Uncategorised'}</span>
-                        <span className="font-medium text-[#3D2614]">{formatCurrency(recipe.selling_price || 0)}</span>
+                        {/* The price this card's FC% is measured against. */}
+                        <span
+                          className="font-medium text-[#3D2614]"
+                          title={recipe.price_source === 'menu_item'
+                            ? `From menu item "${recipe.linked_menu_item_name}" — what the guest pays`
+                            : 'This recipe’s own price (no menu link)'}
+                        >
+                          {formatCurrency(effPriceOf(recipe))}
+                        </span>
                       </div>
                       {allg.length > 0 && (
                         <div className="flex flex-wrap gap-1 mt-0.5" title={`Contains (auto-detected): ${allg.map(allergenLabel).join(', ')}`}>
@@ -2376,7 +2706,7 @@ export default function RecipesPage() {
                         <th className="text-left py-3 px-4 font-semibold">Recipe</th>
                         <th className="text-left py-3 px-3 font-semibold">Category</th>
                         <th className="text-left py-3 px-3 font-semibold">Menu Link</th>
-                        <th className="text-right py-3 px-3 font-semibold">Sell ₹</th>
+                        <th className="text-right py-3 px-3 font-semibold" title="The price food cost is measured against: the linked menu item's price when there is one, otherwise the recipe's own.">Sell ₹</th>
                         <th className="text-right py-3 px-3 font-semibold">Cost ₹</th>
                         <th className="text-left py-3 px-3 font-semibold w-56">FC% vs target {Math.round(targetFcPct * 100)}</th>
                         <th className="text-right py-3 px-3 font-semibold">GPM</th>
@@ -2385,11 +2715,17 @@ export default function RecipesPage() {
                     </thead>
                     <tbody>
                       {pagedRecipes.map((recipe) => {
-                        const fcp = recipe.food_cost_percent || 0;
-                        const gpm = recipe.selling_price > 0 ? ((recipe.selling_price - recipe.total_cost) / recipe.selling_price) * 100 : null;
+                        const fcp = fcOf(recipe);
+                        // The price FC%/GPM are measured against — the linked
+                        // menu item's when there is one (src/lib/recipe-price.ts).
+                        // Showing recipe.selling_price beside a FC% computed on
+                        // the menu price is exactly the ambiguity being removed.
+                        const effPrice = recipe.effective_selling_price ?? recipe.selling_price;
+                        const fromMenu = recipe.price_source === 'menu_item';
+                        const gpm = effPrice > 0 ? ((effPrice - recipe.total_cost) / effPrice) * 100 : null;
                         const link = menuLinkMap.get(recipe.id);
                         const isLinked = !!link && link.count > 0;
-                        const noPrice = !recipe.selling_price;
+                        const noPrice = !effPrice;
                         const ingCount = recipe.ingredients?.length || 0;
                         return (
                           <tr key={recipe.id} className="border-b border-[#F0E4D6] last:border-0 hover:bg-[#FFF8F0]">
@@ -2411,12 +2747,27 @@ export default function RecipesPage() {
                                   ? <button onClick={() => openEditRecipe(recipe)} className="text-[11px] font-semibold px-2 py-0.5 rounded-md bg-[#af4408] text-white hover:bg-[#8a3506]">Set price</button>
                                   : <span className="text-[11px] font-medium px-2 py-0.5 rounded-md bg-amber-50 text-amber-700 border border-amber-200">Not linked</span>}
                             </td>
-                            <td className="py-2.5 px-3 text-right font-semibold text-[#2D1B0E]">{noPrice ? <span className="text-red-400 font-normal">—</span> : formatCurrency(recipe.selling_price)}</td>
+                            <td className="py-2.5 px-3 text-right font-semibold text-[#2D1B0E]">
+                              {noPrice ? <span className="text-red-400 font-normal">—</span> : formatCurrency(effPrice)}
+                              {fromMenu && (
+                                <span className="block text-[10px] font-normal text-emerald-700" title={`Priced from menu item "${recipe.linked_menu_item_name}" — what the guest pays`}>
+                                  from menu
+                                </span>
+                              )}
+                              {recipe.price_drifted && (
+                                <span className="block text-[10px] font-normal text-amber-700" title="This recipe's own stored price disagrees with the menu item it is costed against. Admins can align it from Recipe health → Reconcile prices.">
+                                  stored {formatCurrency(recipe.selling_price)}
+                                </span>
+                              )}
+                            </td>
                             <td className="py-2.5 px-3 text-right text-[#6B5744]">{formatCurrency(recipe.total_cost || 0)}</td>
                             <td className="py-2.5 px-3">
                               {noPrice
                                 ? <span className="text-xs text-[#8B7355]">— needs selling price</span>
-                                : <div className="flex items-center gap-2"><FcBar fc={fcp} target={Math.round(targetFcPct * 100)} /><span className={`text-xs font-bold shrink-0 ${foodCostColor(fcp)}`}>{fcp.toFixed(0)}%</span></div>}
+                                : <div className="flex items-center gap-2" title={`Cost ÷ ${formatCurrency(effPrice)} — ${fromMenu ? `the price of menu item "${recipe.linked_menu_item_name}"` : 'this recipe’s own price (no menu link)'}`}>
+                                    <FcBar fc={fcp} target={Math.round(targetFcPct * 100)} />
+                                    <span className={`text-xs font-bold shrink-0 ${foodCostColor(fcp)}`}>{fcp.toFixed(0)}%</span>
+                                  </div>}
                             </td>
                             <td className="py-2.5 px-3 text-right font-bold">{gpm == null ? <span className="text-[#C4B09A]">—</span> : <span className={gpm >= 65 ? 'text-green-600' : gpm >= 50 ? 'text-amber-600' : 'text-red-500'}>{gpm.toFixed(0)}%</span>}</td>
                             <td className="py-2.5 px-2 text-center whitespace-nowrap">
@@ -2443,11 +2794,14 @@ export default function RecipesPage() {
               {/* Mobile cards */}
               <div className="md:hidden space-y-2.5">
                 {pagedRecipes.map((recipe) => {
-                  const fcp = recipe.food_cost_percent || 0;
-                  const gpm = recipe.selling_price > 0 ? ((recipe.selling_price - recipe.total_cost) / recipe.selling_price) * 100 : null;
+                  const fcp = fcOf(recipe);
+                  // Same effective-price rule as the desktop table above.
+                  const effPrice = effPriceOf(recipe);
+                  const fromMenu = recipe.price_source === 'menu_item';
+                  const gpm = effPrice > 0 ? ((effPrice - recipe.total_cost) / effPrice) * 100 : null;
                   const link = menuLinkMap.get(recipe.id);
                   const isLinked = !!link && link.count > 0;
-                  const noPrice = !recipe.selling_price;
+                  const noPrice = !effPrice;
                   const ingCount = recipe.ingredients?.length || 0;
                   return (
                     <div key={recipe.id} className="bg-white border border-[#E8D5C4] rounded-2xl p-3 shadow-sm">
@@ -2481,7 +2835,10 @@ export default function RecipesPage() {
                           : noPrice
                             ? <button onClick={() => openEditRecipe(recipe)} className="text-[11px] font-semibold px-2 py-0.5 rounded-md bg-[#af4408] text-white">Set price</button>
                             : <span className="text-[11px] font-medium px-2 py-0.5 rounded-md bg-amber-50 text-amber-700 border border-amber-200">Not linked</span>}
-                        <span className="ml-auto font-bold text-[#2D1B0E]">{noPrice ? <span className="text-red-400">—</span> : formatCurrency(recipe.selling_price)}</span>
+                        <span className="ml-auto font-bold text-[#2D1B0E] text-right">
+                          {noPrice ? <span className="text-red-400">—</span> : formatCurrency(effPrice)}
+                          {fromMenu && <span className="block text-[10px] font-normal text-emerald-700">from menu</span>}
+                        </span>
                       </div>
                       <div className="flex items-center justify-between mt-2 pt-2 border-t border-[#F0E4D6] text-[11px] text-[#8B7355]">
                         <span>Cost {formatCurrency(recipe.total_cost || 0)}</span>
@@ -2577,6 +2934,219 @@ export default function RecipesPage() {
       )}
 
       {/* ================================================================= */}
+      {/* PRICE RECONCILIATION (admin) — DRY RUN, then apply what he ticks    */}
+      {/* ================================================================= */}
+      {reconcileOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm p-4">
+          <div className="bg-white border border-[#E8D5C4] rounded-xl w-full max-w-5xl max-h-[90vh] flex flex-col">
+            <div className="flex items-start justify-between px-6 py-4 border-b border-[#E8D5C4] shrink-0 gap-4">
+              <div>
+                <h2 className="text-lg font-bold text-[#2D1B0E]">Reconcile recipe prices with the menu</h2>
+                <p className="text-xs text-[#8B7355] mt-0.5">
+                  Review first. Nothing is written until you tick rows and press Apply.
+                </p>
+              </div>
+              <button onClick={() => setReconcileOpen(false)} className="text-[#8B7355] hover:text-[#3D2614] shrink-0">
+                <X size={20} />
+              </button>
+            </div>
+
+            <div className="flex-1 overflow-y-auto px-6 py-4 space-y-4">
+              {reconcileLoading && (
+                <p className="text-sm text-[#8B7355] flex items-center gap-2"><Loader2 size={15} className="animate-spin" /> Loading the review…</p>
+              )}
+
+              {reconcileError && (
+                <div className="flex items-start gap-2 bg-red-50 border border-red-200 rounded-lg px-3 py-2 text-xs text-red-700">
+                  <AlertCircle size={14} className="shrink-0 mt-0.5" /><span>{reconcileError}</span>
+                </div>
+              )}
+
+              {reconcileResult && (
+                <div className="bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2.5 text-xs text-emerald-900">
+                  <p className="font-semibold flex items-center gap-1.5">
+                    <CheckCircle2 size={14} /> Applied to {reconcileResult.applied} recipe{reconcileResult.applied === 1 ? '' : 's'}
+                    {reconcileResult.skipped > 0 && <span className="font-normal">· {reconcileResult.skipped} skipped</span>}
+                  </p>
+                  <ul className="mt-1 pl-5 space-y-0.5">
+                    {(reconcileResult.applied_rows || []).map((a: any) => (
+                      <li key={a.recipe_id}>
+                        <span className="font-medium">{a.recipe_name}</span>: {formatCurrency(a.from)} → {formatCurrency(a.to)}
+                      </li>
+                    ))}
+                  </ul>
+                  {(reconcileResult.skipped_rows || []).map((s: any) => (
+                    <p key={s.recipe_id} className="mt-1 text-[11px] text-emerald-800">Skipped {s.recipe_id}: {s.reason}</p>
+                  ))}
+                </div>
+              )}
+
+              {reconcileData && !reconcileLoading && (
+                <>
+                  <div className="bg-[#FFF8F0] border border-[#E8D5C4] rounded-lg px-3 py-2.5 text-xs text-[#6B5744]">
+                    {reconcileData.notice}
+                  </div>
+
+                  {reconcileData.count === 0 ? (
+                    <p className="text-sm text-[#6B5744] flex items-center gap-2">
+                      <CheckCircle size={16} className="text-emerald-600" />
+                      Every linked recipe’s stored price already matches its menu item. Nothing to reconcile.
+                    </p>
+                  ) : (
+                    <>
+                      <div className="flex flex-wrap items-center gap-3">
+                        <button
+                          type="button"
+                          onClick={() => setReconcilePicked(new Set((reconcileData.rows || []).map((r: any) => r.recipe_id)))}
+                          className="text-xs font-medium text-[#af4408] hover:underline"
+                        >
+                          Select all {reconcileData.count}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setReconcilePicked(new Set())}
+                          className="text-xs font-medium text-[#6B5744] hover:underline"
+                        >
+                          Clear selection
+                        </button>
+                        <span className="text-xs text-[#8B7355]">{reconcilePicked.size} selected</span>
+                      </div>
+
+                      <div className="overflow-x-auto border border-[#E8D5C4] rounded-lg">
+                        <table className="w-full text-sm">
+                          <thead>
+                            <tr className="text-[11px] uppercase tracking-wide text-[#8B7355] bg-[#FFF8F0] border-b border-[#E8D5C4]">
+                              <th className="w-10 py-2.5 px-3"></th>
+                              <th className="text-left py-2.5 px-3 font-semibold">Recipe</th>
+                              <th className="text-left py-2.5 px-3 font-semibold">Linked menu item</th>
+                              <th className="text-right py-2.5 px-3 font-semibold">Recipe ₹<br /><span className="font-normal normal-case">(stored)</span></th>
+                              <th className="text-right py-2.5 px-3 font-semibold">Menu ₹<br /><span className="font-normal normal-case">(guest pays)</span></th>
+                              <th className="text-right py-2.5 px-3 font-semibold">Cost ₹</th>
+                              <th className="text-right py-2.5 px-3 font-semibold">FC% at<br /><span className="font-normal normal-case">recipe ₹</span></th>
+                              <th className="text-right py-2.5 px-3 font-semibold">FC% at<br /><span className="font-normal normal-case">menu ₹</span></th>
+                              <th className="text-right py-2.5 px-3 font-semibold">FC% still<br /><span className="font-normal normal-case">on disk</span></th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {(reconcileData.rows || []).map((row: any) => {
+                              const picked = reconcilePicked.has(row.recipe_id);
+                              return (
+                                <tr key={row.recipe_id} className={`border-b border-[#F0E4D6] last:border-0 ${picked ? 'bg-[#FFF1E3]' : 'hover:bg-[#FFF8F0]'}`}>
+                                  <td className="py-2.5 px-3 text-center">
+                                    <input
+                                      type="checkbox"
+                                      checked={picked}
+                                      onChange={(e) => setReconcilePicked(prev => {
+                                        const next = new Set(prev);
+                                        if (e.target.checked) next.add(row.recipe_id); else next.delete(row.recipe_id);
+                                        return next;
+                                      })}
+                                      className="accent-[#af4408]"
+                                      aria-label={`Align ${row.recipe_name}`}
+                                    />
+                                  </td>
+                                  <td className="py-2.5 px-3">
+                                    <p className="font-semibold text-[#2D1B0E] text-[13px]">{row.recipe_name}</p>
+                                    <p className="text-[11px] text-[#8B7355]">{row.recipe_category || 'uncategorised'}</p>
+                                  </td>
+                                  <td className="py-2.5 px-3 text-[13px] text-[#3D2614]">
+                                    {row.menu_item_name}
+                                    {row.linked_count > 1 && (
+                                      <span className="ml-1 text-[10px] text-[#8B7355]">(lowest of {row.linked_count})</span>
+                                    )}
+                                    {row.category_differs && (
+                                      <p className="text-[10px] text-[#8B7355]">category here: {row.menu_item_category || '—'}</p>
+                                    )}
+                                  </td>
+                                  <td className="py-2.5 px-3 text-right text-[#6B5744]">
+                                    {row.recipe_price_unset ? <span className="text-red-400">not set</span> : formatCurrency(row.recipe_price)}
+                                  </td>
+                                  <td className="py-2.5 px-3 text-right font-semibold text-[#2D1B0E]">{formatCurrency(row.menu_price)}</td>
+                                  <td className="py-2.5 px-3 text-right text-[#6B5744]">{formatCurrency(row.total_cost)}</td>
+                                  <td className="py-2.5 px-3 text-right text-[#A08B72] line-through">
+                                    {row.recipe_price_unset ? '—' : `${row.fc_at_recipe_price.toFixed(1)}%`}
+                                  </td>
+                                  <td className={`py-2.5 px-3 text-right font-bold ${foodCostColor(row.fc_at_menu_price)}`}>
+                                    {row.fc_at_menu_price.toFixed(1)}%
+                                  </td>
+                                  {/* The CACHE. Screens derive their percentage
+                                      from the menu price, so they already read
+                                      the bold column; this is the number sitting
+                                      in the database, which is behind on any
+                                      recipe not re-costed since. Applying the row
+                                      rewrites it. */}
+                                  <td className="py-2.5 px-3 text-right text-[#6B5744]">
+                                    {row.stored_fc_stale ? (
+                                      <span className="text-amber-700" title="The stored figure in the database is out of date. What you see on the Recipes page is already the bold column.">
+                                        {Number(row.stored_fc || 0).toFixed(1)}% <span className="text-[10px]">stale</span>
+                                      </span>
+                                    ) : (
+                                      <span className="text-[#A08B72]">matches</span>
+                                    )}
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+
+                      <p className="text-[11px] text-[#8B7355]">
+                        The struck-through column is what food cost <em>used</em> to be measured against. The bold column is what the
+                        Recipes page, the Menu Items page and every export show you today — they all measure against the menu price,
+                        the price the guest pays. The last column is the figure still sitting in the database: where it says
+                        <span className="text-amber-700 font-medium"> stale</span>, that recipe has not been re-costed since, so the
+                        stored number is behind what you are shown. Applying a row aligns the recipe’s own stored price
+                        (so exports and manual sales entry stop quoting the old one) and rewrites that stored figure.
+                      </p>
+                    </>
+                  )}
+
+                  {reconcileData.category_mismatches > 0 && (
+                    <details className="bg-[#FFF8F0] border border-[#E8D5C4] rounded-lg px-3 py-2.5">
+                      <summary className="text-xs font-semibold text-[#3D2614] cursor-pointer">
+                        {reconcileData.category_mismatches} linked pair{reconcileData.category_mismatches === 1 ? '' : 's'} also disagree on category — not changed
+                      </summary>
+                      <p className="mt-2 text-[11px] text-[#6B5744]">{reconcileData.category_notice}</p>
+                      <ul className="mt-2 space-y-0.5 text-[11px] text-[#6B5744] max-h-40 overflow-y-auto">
+                        {(reconcileData.category_rows || []).map((c: any, i: number) => (
+                          <li key={i}>
+                            <span className="font-medium text-[#2D1B0E]">{c.recipe_name}</span>: “{c.recipe_category || '—'}” vs menu “{c.menu_item_category || '—'}”
+                          </li>
+                        ))}
+                      </ul>
+                    </details>
+                  )}
+                </>
+              )}
+            </div>
+
+            <div className="flex items-center justify-between gap-3 px-6 py-4 border-t border-[#E8D5C4] shrink-0">
+              <p className="text-[11px] text-[#8B7355]">
+                Writes <code>recipes.selling_price</code> for ticked rows only. Every change is audited.
+              </p>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => setReconcileOpen(false)}
+                  className="px-4 py-2 rounded-lg border border-[#E0D0BE] text-sm font-medium text-[#6B5744] hover:bg-[#FFF1E3]"
+                >
+                  Close
+                </button>
+                <button
+                  onClick={() => applyReconcile([...reconcilePicked])}
+                  disabled={reconcileApplying || reconcilePicked.size === 0}
+                  className="px-4 py-2 rounded-lg bg-[#af4408] text-white text-sm font-semibold hover:bg-[#8a3506] disabled:opacity-40 inline-flex items-center gap-2"
+                >
+                  {reconcileApplying && <Loader2 size={14} className="animate-spin" />}
+                  Apply to {reconcilePicked.size} recipe{reconcilePicked.size === 1 ? '' : 's'}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ================================================================= */}
       {/* ADD / EDIT RECIPE MODAL */}
       {/* ================================================================= */}
       {showRecipeModal && (
@@ -2612,7 +3182,11 @@ export default function RecipesPage() {
                   formPosItemId={formPosItemId}
                   onTextChange={(typed) => {
                     setFormName(typed);
-                    // Drop the link as soon as the user starts editing
+                    // Drop the link as soon as the user starts editing. The price
+                    // and category the link brought over are KEPT (nothing is
+                    // yanked back mid-edit) — but the recipe now owns its own
+                    // price again, so the field becomes editable and the panel
+                    // below says exactly that, with Undo still available.
                     setFormMenuItemId('');
                     setFormPosItemId('');
                     setMenuLinkDirty(true);   // user touched the link in this session
@@ -2622,10 +3196,116 @@ export default function RecipesPage() {
                     setFormMenuItemId(picked.id);
                     setFormPosItemId(picked.item_code || '');
                     setMenuLinkDirty(true);   // user touched the link in this session
-                    if (picked.category) setFormCategory(picked.category);
-                    if (picked.selling_price && !formSellingPrice) setFormSellingPrice(picked.selling_price);
+
+                    // CARRY THE ITEM'S PARTICULARS ACROSS — unconditionally.
+                    //
+                    // The old handler wrote the price only `&& !formSellingPrice`,
+                    // i.e. fill-if-blank. On any recipe that already had a price
+                    // the menu figure was discarded, so a dish linked to a ₹279
+                    // listing kept a stale ₹96 and reported FC 30.4% instead of
+                    // 10.4%. Category had no such guard — the asymmetry WAS the
+                    // bug. Both now travel, and `linkChanges` renders every one
+                    // of them old → new with a per-field "keep mine", because a
+                    // price is a commercial fact and must never move unseen.
+                    // Category can be declined ("keep mine"); once declined it stays
+                    // declined for the rest of this edit, so a second pick does not
+                    // silently re-impose the menu's spelling on him.
+                    if (!linkKept.category && picked.category) setFormCategory(picked.category);
+                    // Price always travels — that is the fix.
+                    if (picked.selling_price) setFormSellingPrice(picked.selling_price);
                   }}
                 />
+
+                {/* WHAT THE LINK CHANGED — old → new, with per-field revert. */}
+                {menuLinkDirty && (linkChanges.length > 0 || !formMenuItemId) && (
+                  <div className="rounded-lg border border-[#D4B896] bg-white px-3 py-2.5 text-xs space-y-2">
+                    <div className="flex items-start gap-2">
+                      {formMenuItemId
+                        ? <Link2 size={14} className="text-emerald-600 shrink-0 mt-0.5" />
+                        : <Link2Off size={14} className="text-amber-600 shrink-0 mt-0.5" />}
+                      <p className="font-semibold text-[#2D1B0E]">
+                        {formMenuItemId
+                          ? <>Linked to menu item <span className="text-[#af4408]">{linkedMenuItem?.name || formName}</span>{linkChanges.length > 0 ? ' — this changed:' : '.'}</>
+                          : <>Menu link removed — this recipe now owns its own selling price.{linkChanges.length > 0 ? ' Values the link had set are kept:' : ''}</>}
+                      </p>
+                    </div>
+
+                    {linkChanges.length > 0 && (
+                      <ul className="space-y-1 pl-5">
+                        {linkChanges.map((c) => (
+                          <li key={c.key} className="flex flex-wrap items-center gap-1.5">
+                            <span className="text-[#6B5744]">{c.label}:</span>
+                            <span className="line-through text-[#A08B72]">{c.from}</span>
+                            <span className="text-[#8B7355]">→</span>
+                            <span className="font-semibold text-[#2D1B0E]">{c.to}</span>
+                            {/* CATEGORY is the recipe's own filing — his call, so it
+                                can be declined. 13 of 18 linked pairs disagree only
+                                in spelling (Title Case vs slug), and accepting every
+                                one would split the recipe book across two taxonomies.
+
+                                PRICE gets no "keep mine": while a live menu item is
+                                linked, ITS price is the denominator whatever this
+                                field holds, so declining would only re-create the
+                                drift being removed — and leave a stale number in the
+                                export and in manual sales entry. Undo below drops the
+                                whole link if he does not want it. */}
+                            {c.key === 'category' && (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setFormCategory(linkSnapshot?.category || '');
+                                  setLinkKept(k => ({ ...k, category: true }));
+                                }}
+                                className="text-[11px] font-medium text-[#af4408] hover:underline"
+                              >
+                                keep mine
+                              </button>
+                            )}
+                            {c.key === 'price' && isFormLinked && (
+                              <span className="text-[11px] text-[#8B7355]">— the guest-facing price now governs food cost</span>
+                            )}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+
+                    {/* Nothing is saved until Save — Undo restores the whole
+                        pre-link state, link included, so a mis-click costs nothing. */}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (!linkSnapshot) return;
+                        setFormName(linkSnapshot.name);
+                        setFormCategory(linkSnapshot.category);
+                        setFormSellingPrice(linkSnapshot.sellingPrice);
+                        setFormMenuItemId(linkSnapshot.menuItemId);
+                        setFormPosItemId(linkSnapshot.posItemId);
+                        setLinkKept({ category: false });
+                        setMenuLinkDirty(false);
+                      }}
+                      className="text-[11px] font-semibold text-[#6B5744] hover:text-[#af4408] hover:underline"
+                    >
+                      ↩ Undo — put everything back as it was
+                    </button>
+                    <p className="text-[10px] text-[#8B7355]">Nothing is written until you press Save.</p>
+                  </div>
+                )}
+
+                {/* An existing link the user has NOT touched — offer an explicit
+                    unlink rather than making him delete the name to break it. */}
+                {formMenuItemId && !menuLinkDirty && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setFormMenuItemId('');
+                      setFormPosItemId('');
+                      setMenuLinkDirty(true);
+                    }}
+                    className="text-[11px] font-medium text-[#6B5744] hover:text-[#af4408] hover:underline inline-flex items-center gap-1"
+                  >
+                    <Link2Off size={12} /> Unlink from this menu item
+                  </button>
+                )}
               </div>
 
               {/* Basic fields */}
@@ -2656,14 +3336,49 @@ export default function RecipesPage() {
                   <p className="mt-1 text-[11px] text-[#8B7355]">Pick an existing category to keep filters tidy, or type a new one.</p>
                 </div>
                 <div>
-                  <label className="block text-sm text-[#6B5744] mb-1">Selling Price (&#8377;)</label>
-                  <input
-                    type="number"
-                    step="any"
-                    className="w-full bg-[#FFF1E3] border border-[#D4B896] rounded-lg px-3 py-2.5 text-sm text-[#2D1B0E] focus:outline-none focus:border-[#af4408]"
-                    value={formSellingPrice || ''}
-                    onChange={(e) => setFormSellingPrice(parseFloat(e.target.value) || 0)}
-                  />
+                  <label className="block text-sm text-[#6B5744] mb-1">
+                    Selling Price (&#8377;)
+                    {isFormLinked && <span className="ml-1 text-[10px] font-normal text-emerald-700">· from menu item</span>}
+                  </label>
+                  {isFormLinked ? (
+                    <>
+                      {/* SINGLE SOURCE OF TRUTH. While a live menu item is
+                          linked, the guest-facing price IS the price — costing
+                          divides by it (src/lib/recipe-price.ts), so an editable
+                          second price here could only ever create the drift this
+                          whole change exists to remove. */}
+                      <div className="w-full bg-[#F3EDE5] border border-[#D4B896] rounded-lg px-3 py-2.5 text-sm text-[#2D1B0E] font-semibold flex items-center justify-between gap-2">
+                        <span>{formatCurrency(linkedMenuPrice)}</span>
+                        <Link2 size={13} className="text-emerald-600 shrink-0" />
+                      </div>
+                      <p className="mt-1 text-[11px] text-[#8B7355]">
+                        Set by the linked menu item — that is what the guest pays, so it is what food cost is measured against.
+                        Change it on the Menu Items page.
+                      </p>
+                      {formPriceDrifted && (
+                        <p className="mt-1 text-[11px] text-amber-700">
+                          This recipe’s own stored price is {formSellingPrice ? formatCurrency(formSellingPrice) : '₹0'} — kept, but unused while linked.
+                        </p>
+                      )}
+                    </>
+                  ) : (
+                    <>
+                      <input
+                        type="number"
+                        step="any"
+                        className="w-full bg-[#FFF1E3] border border-[#D4B896] rounded-lg px-3 py-2.5 text-sm text-[#2D1B0E] focus:outline-none focus:border-[#af4408]"
+                        value={formSellingPrice || ''}
+                        onChange={(e) => setFormSellingPrice(parseFloat(e.target.value) || 0)}
+                      />
+                      <p className="mt-1 text-[11px] text-[#8B7355]">
+                        {linkedMenuDelisted
+                          ? `“${linkedMenuItem?.name}” is switched OFF on the Menu Items page, so it is not on sale and does not set this price. This recipe’s own price is what food cost is measured against until it is switched back on.`
+                          : formMenuItemId
+                            ? 'The linked menu item has no price, so this recipe’s own price is used.'
+                            : 'Not linked to a menu item — this recipe’s own price is what food cost is measured against.'}
+                      </p>
+                    </>
+                  )}
                 </div>
               </div>
 
@@ -2712,6 +3427,34 @@ export default function RecipesPage() {
                     <Plus size={14} /> Add Ingredient
                   </button>
                 </div>
+                {/* SAME MATERIAL LISTED TWICE. Costing SUMS every row, so both
+                    lines are charged and both are deducted from stock. That is
+                    correct when a chef genuinely uses a material at two stages
+                    (oil to marinate and oil to fry) and wrong when a row was
+                    duplicated by accident — and nothing in the data says which.
+                    So this WARNS and never merges: silently collapsing the rows
+                    would quietly change a recipe's cost and its consumption. */}
+                {formDuplicateIngredients.length > 0 && (
+                  <div className="mb-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2.5 text-xs text-amber-900">
+                    <p className="font-semibold flex items-center gap-1.5">
+                      <AlertTriangle size={13} className="shrink-0" />
+                      {formDuplicateIngredients.length} material{formDuplicateIngredients.length === 1 ? ' is' : 's are'} listed more than once
+                    </p>
+                    <ul className="mt-1 pl-5 space-y-0.5">
+                      {formDuplicateIngredients.map((d, i) => (
+                        <li key={i}>
+                          <span className="font-medium">{d.name}</span>
+                          {' — '}
+                          {d.rows.map(r => `${r.quantity} ${r.unit}`).join(' + ')}
+                        </li>
+                      ))}
+                    </ul>
+                    <p className="mt-1.5 text-[11px]">
+                      Every row is costed and deducted, so these add up. Deliberate (used at two stages) — leave it.
+                      A duplicate — delete the extra row. Nothing is merged automatically.
+                    </p>
+                  </div>
+                )}
                 {formIngredients.length === 0 ? (
                   <p className="text-sm text-[#8B7355]">No ingredients yet. Click &quot;Add Ingredient&quot; to begin.</p>
                 ) : (
@@ -2806,6 +3549,17 @@ export default function RecipesPage() {
                 <h3 className="text-sm font-semibold text-[#3D2614] flex items-center gap-2 mb-3">
                   <Calculator size={16} /> Live Cost Calculator
                 </h3>
+                {/* SAY WHICH PRICE. An unlabelled 30.42% beside a ₹279 dish is
+                    how this went unnoticed for so long — the number was true of
+                    a price nobody is ever charged. */}
+                <p className="-mt-2 mb-3 text-[11px] text-[#8B7355]">
+                  {effectiveFormPrice > 0
+                    ? <>Food cost % and GPM are measured against <strong className="text-[#6B5744]">{formatCurrency(effectiveFormPrice)}</strong>{' '}
+                        {isFormLinked
+                          ? <>— the price of linked menu item “{linkedMenuItem?.name}”, i.e. what the guest actually pays.</>
+                          : <>— this recipe’s own price (not linked to a menu item).</>}</>
+                    : <>No price set, so food cost % cannot be computed.</>}
+                </p>
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 text-center">
                   <div>
                     <p className="text-xs text-[#8B7355] uppercase">Total Cost</p>
@@ -2826,16 +3580,16 @@ export default function RecipesPage() {
                   <div>
                     <p className="text-xs text-[#8B7355] uppercase">GPM %</p>
                     {(() => {
-                      const gpm = formSellingPrice > 0 ? 100 - liveRecipeCost.foodCostPct : 0;
-                      const cls = formSellingPrice === 0 ? 'text-[#8B7355]' :
+                      const gpm = effectiveFormPrice > 0 ? 100 - liveRecipeCost.foodCostPct : 0;
+                      const cls = effectiveFormPrice === 0 ? 'text-[#8B7355]' :
                                   gpm >= 80 ? 'text-green-600' :
                                   gpm >= 65 ? 'text-amber-600' :
                                               'text-red-600';
                       return <p className={`text-lg font-bold mt-1 ${cls}`}>
-                        {formSellingPrice > 0 ? gpm.toFixed(1) + '%' : '—'}
+                        {effectiveFormPrice > 0 ? gpm.toFixed(1) + '%' : '—'}
                       </p>;
                     })()}
-                    {formSellingPrice > 0 && liveRecipeCost.foodCostPct > targetFcPct * 100 && (
+                    {effectiveFormPrice > 0 && liveRecipeCost.foodCostPct > targetFcPct * 100 && (
                       <p className="text-[10px] text-red-600 mt-0.5">⚠ Above {Math.round(targetFcPct * 100)}% target</p>
                     )}
                   </div>
@@ -2848,12 +3602,14 @@ export default function RecipesPage() {
                       Menu Price @ {Math.round(targetFcPct * 100)}% target:{' '}
                       <strong className="text-[#af4408]">{formatCurrency(liveRecipeCost.totalCost / targetFcPct)}</strong>
                     </span>
-                    {formSellingPrice > 0 && liveRecipeCost.totalCost > formSellingPrice && (
+                    {effectiveFormPrice > 0 && liveRecipeCost.totalCost > effectiveFormPrice && (
                       <span className="text-[11px] font-medium text-red-600 bg-red-500/10 px-2 py-0.5 rounded">
-                        ⚠ Loss-making — cost exceeds menu price
+                        ⚠ Loss-making — cost exceeds {isFormLinked ? 'the menu price' : 'the selling price'}
                       </span>
                     )}
-                    {formSellingPrice === 0 && (
+                    {/* Only offered when the recipe owns its price. While linked,
+                        the price lives on the menu item and is changed there. */}
+                    {effectiveFormPrice === 0 && !isFormLinked && (
                       <button
                         type="button"
                         onClick={() => setFormSellingPrice(Math.round(liveRecipeCost.totalCost / targetFcPct))}
@@ -4991,6 +5747,9 @@ function CategoryChip({
 interface MenuItemLite {
   id: string; name: string; item_code?: string; category?: string;
   selling_price?: number; recipe_id?: string;
+  /** 0 = delisted. A delisted listing does NOT price or cost a recipe
+   *  (src/lib/recipe-price.ts), so the picker must say so before it is picked. */
+  is_active?: number;
 }
 
 function MenuItemAutocomplete({
@@ -5077,6 +5836,11 @@ function MenuItemAutocomplete({
           <ul className="absolute z-30 mt-1 left-0 right-0 max-h-72 overflow-y-auto bg-white border border-[#D4B896] rounded-lg shadow-lg">
             {filtered.map((mi, i) => {
               const alreadyLinked = !!mi.recipe_id;
+              // Delisted: on the menu list but switched off, so it sells
+              // nothing and prices nothing. Marked, never hidden — the owner
+              // may well be linking a recipe to a seasonal item before it
+              // goes back on sale.
+              const delisted = mi.is_active !== undefined && !Number(mi.is_active);
               const active = i === activeIdx;
               return (
                 <li key={mi.id}
@@ -5091,6 +5855,11 @@ function MenuItemAutocomplete({
                       {mi.selling_price ? <span>₹{mi.selling_price}</span> : null}
                     </div>
                   </div>
+                  {delisted && (
+                    <span className="text-[9px] px-1.5 py-0.5 rounded bg-[#F3EDE5] text-[#6B5744] border border-[#D4B896] whitespace-nowrap">
+                      not on sale
+                    </span>
+                  )}
                   {alreadyLinked && (
                     <span className="text-[9px] px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 whitespace-nowrap">
                       already linked
@@ -5107,11 +5876,21 @@ function MenuItemAutocomplete({
           </div>
         )}
       </div>
-      {formMenuItemId && (
-        <div className="text-xs text-green-700 bg-green-50 border border-green-200 rounded-lg px-3 py-2 flex items-center gap-1 whitespace-nowrap">
-          ✓ Linked{formPosItemId && <span className="text-[#6B5744]">· POS #{formPosItemId}</span>}
-        </div>
-      )}
+      {formMenuItemId && (() => {
+        // A link to a delisted item is a real link — it just does not price
+        // anything. Saying "✓ Linked" in green over a dead listing is what let
+        // the modal claim a ₹888 governing price the server never applied.
+        const picked = menuItems.find(mi => mi.id === formMenuItemId);
+        const off = !!picked && picked.is_active !== undefined && !Number(picked.is_active);
+        return (
+          <div className={`text-xs rounded-lg px-3 py-2 flex items-center gap-1 whitespace-nowrap border ${
+            off ? 'text-[#6B5744] bg-[#F3EDE5] border-[#D4B896]' : 'text-green-700 bg-green-50 border-green-200'
+          }`}>
+            {off ? 'Linked · not on sale' : '✓ Linked'}
+            {formPosItemId && <span className="text-[#6B5744]">· POS #{formPosItemId}</span>}
+          </div>
+        );
+      })()}
     </div>
   );
 }
