@@ -1,6 +1,16 @@
 import type DatabaseT from 'better-sqlite3';
 import { getDb } from './db';
 import { todayIST } from './format-date';
+// The PO-receive cost-mirror predicate. Imported, not re-typed: the aggregate
+// reports (/api/reports/purchases) count the same rows to decide whether a
+// charge cell is "no tax" or "tax is on the GRN", and if the two definitions
+// ever drifted, one screen would blank a figure the other printed as ₹0.
+import {
+  poReceiptMirrorSql, effectiveChargeSql, effectiveBillValueSql,
+  effectiveLineTotalSql, grnLineJoinSql, grnSourcedSql, withGrnCharges,
+  chargeCell, chargeNote,
+} from './purchase-charges';
+import type { PurchaseChargeKey, PurchaseChargeColumn } from './purchase-charges';
 
 /**
  * PURCHASE BILL SUMMARY — one row per VENDOR BILL, money only.
@@ -8,9 +18,23 @@ import { todayIST } from './format-date';
  * Requirement 69: "one row per purchase bill with Bill No., Vendor, Date, Total
  * Bill Value, GST, Discount, and Delivery Charges."
  *
+ * 2026-09-11 — THE COLUMN THE REQUIREMENT CALLS "Total Bill Value" IS NOW
+ * PRINTED AS **GRAND TOTAL**, and the goods value it is built on is printed
+ * beside it as **SUBTOTAL**. The quote above is left word for word because it is
+ * a historical citation, not a caption. Nothing about the arithmetic moved: the
+ * owner asked for "the ingredients cost … as a subtotal" and for a grand total
+ * that is "what we actually need to pay the vendor", and both figures already
+ * existed on the wire (`bill_value` and `total_bill_value`). This pass is
+ * naming, column composition and documentation — no expression in this file
+ * changed, and any rupee that moves is a defect.
+ *
  * ═══════════════════════════════════════════════════════════════════════════
- * 1. ONE SOURCE, THEREFORE ONE GRAND TOTAL IS LEGAL
+ * 1. ONE SOURCE, THEREFORE ONE *PERIOD* GRAND TOTAL IS LEGAL
  * ═══════════════════════════════════════════════════════════════════════════
+ * (Since 2026-09-11 "Grand Total" is also the name of a PER-ROW column. This
+ * section is about the PERIOD figure — the one total printed for the whole
+ * filtered set. The per-row column is the same arithmetic, per bill; §1 is not a
+ * prohibition on it.)
  * This file reads the `purchases` table and NOTHING ELSE. No join to the GRN
  * header table, the GRN line table, the PO-bill table or the PO line table. No
  * join to raw_materials either.
@@ -26,7 +50,7 @@ import { todayIST } from './format-date';
  *     PO-received bills show their tax. The instant a GRN column is summed
  *     beside a `purchases` column, this report is one careless edit away from
  *     the doubled number that the purchase-log header exists to prevent, and
- *     the single grand total below stops being defensible. If a tax-inclusive
+ *     the single PERIOD grand total below stops being defensible. If a tax-inclusive
  *     purchase register is ever wanted, build it as a SEPARATE report with its
  *     own per-source totals — do not graft it onto this one.
  *
@@ -94,8 +118,8 @@ import { todayIST } from './format-date';
  * only the grouping granularity, which `lines` = 1 makes visible.
  *
  * ═══════════════════════════════════════════════════════════════════════════
- * 4. PO-RECEIVED BILLS APPEAR, AND THEIR CHARGE COLUMNS ARE NOT ZERO —
- *    THEY ARE NOT APPLICABLE. RENDER AN EM-DASH, NOT A 0.
+ * 4. PO-RECEIVED BILLS APPEAR, AND THEIR CHARGE COLUMNS CARRY THE BILL'S REAL
+ *    FIGURES — READ OFF THE GRN LINE. PRINT THE NUMBER.
  * ═══════════════════════════════════════════════════════════════════════════
  * A delivery received against a PO is a real vendor bill, so excluding it would
  * understate the period (29 bills / 31 lines / Rs 25,280 of goods on live).
@@ -110,23 +134,65 @@ import { todayIST } from './format-date';
  * = 50 (the allocated delivery share IS carried onto the mirror),
  * SUM(total_price) = 25,280.
  *
- * So printing "GST Rs 0" on those bills would assert "no tax was charged" on
- * bills that were taxed. This layer returns the figures AS STORED (they are the
- * honest content of the source table) and ships `tax_on_grn` = true beside
- * them. Every consumer must use that flag:
- *   · screen  — em-dash, not 0, in Discount / GST / both cess columns, with a
- *               "tax on GRN" badge on the row;
- *   · CSV     — a note column saying the charges are recorded on the GRN;
- *   · the row's total_bill_value is BOOKED COST (goods + allocated delivery),
- *     which is NOT the vendor's bill face value. Say so on the row, not only in
- *     a header comment.
+ * 2026-09-10 — THIS LAYER USED TO RETURN THOSE ZEROS AS STORED, flag the row
+ * `tax_on_grn` and leave every consumer to print an em-dash. That was a
+ * presentation answer to an arithmetic problem, and it made this module and the
+ * GRN inward register quote DIFFERENT MONEY FOR THE SAME BILL: GRN-2026-0007
+ * totalled Rs 450.00 here and Rs 484.90 there; across the 29 GRN-sourced bills,
+ * Rs 25,330.00 here against the register's Rs 30,732.20, with 28 of the 29
+ * individually wrong.
+ *
+ * It now READS THE CHARGE FROM WHERE IT IS RECORDED — the GRN line for a mirror
+ * row, `purchases` for everything else — via effectiveChargeSql() and the
+ * grn_line CTE in src/lib/purchase-charges.ts. Consequences:
+ *   · the eight charge figures on a PO-receipt bill are the bill's REAL ones,
+ *     so they print as numbers and no longer need an em-dash;
+ *   · `bill_value` — printed as SUBTOTAL — is the goods value as the BILL
+ *     charges for it, and `goods` — printed as BOOKED COST (Spend) — stays
+ *     SUM(total_price) as stored (§5), so both are available and neither is
+ *     mistaken for the other;
+ *   · `total_bill_value` — printed as GRAND TOTAL, "what we actually need to
+ *     pay the vendor" — is the vendor's BILL FACE VALUE and matches the GRN
+ *     register's Total Inward, per bill, on every GRN-keyed bill in the
+ *     database today. MEASURED, NOT STRUCTURAL: the register sums every GRN
+ *     LINE, while this report can only reach a line that has a `purchases`
+ *     mirror behind it, so a fully-rejected (accepted = 0) or QC-held line
+ *     would sit in the register and never here. 0 lines are in that state
+ *     today — 31 GRN lines, 0 rejected, 0 with accepted = 0, 0 awaiting QC,
+ *     0 voided. Every statement of this to a reader says "matches", not
+ *     "equals".
+ * `tax_on_grn` is still shipped — it now means "the charges on this row were
+ * read off the GRN line", which is a provenance note, not a missing figure.
  * Period totals carry po_receipt_bills / po_receipt_value so a footer can print
- * the split and the grand total can never be mistaken for tax-inclusive.
- * include_po_receipts = false drops them for anyone who wants hand-entered
- * bills alone; the default is to include.
+ * the split. include_po_receipts = false drops them for anyone who wants
+ * hand-entered bills alone; the default is to include.
+ *
+ * WHAT A CHARGE CELL MAY STILL REFUSE TO PRINT. Exactly one case: a mirror row
+ * whose GRN line is GONE (a repair, a half-finished void). It says "my charges
+ * are recorded elsewhere" and elsewhere no longer exists, so the figure is
+ * UNAVAILABLE, not zero, and both the screen and the CSV leave the cell empty —
+ * `Rs 0` in a tax column is a filing-grade lie. That is unpaired_mirror_rows on
+ * every row and isChargeSourceMissingRow() in purchase-charges.ts; 0 rows
+ * qualify today. A charge that genuinely IS zero prints as Rs 0.00. And the
+ * blank can never hide money: it is only ever allowed where the stored sum is
+ * also 0, so Σ(cells, blank = 0) is always the column total.
+ *
+ * WHAT IS STILL TRUE, AND MUST STAY ON THE SCREEN — NOW THREE FIGURES, NOT TWO:
+ *   GRAND TOTAL  (total_bill_value) is the bill's FACE VALUE: what is payable.
+ *   SUBTOTAL     (bill_value)       is the goods on that same bill's terms —
+ *                                   the base the Grand Total is built on.
+ *   BOOKED COST  (goods)            is SPEND: the figure stock valuation uses.
+ * SUBTOTAL IS NOT THE BOOKED COST, and the booked-cost column must keep its own
+ * heading on every surface. They are different numbers on a PO receipt —
+ * Rs 26,900 of subtotal against Rs 25,280 booked across the 29 — and the gap is
+ * exactly the Rs 1,620 of discount already inside the booked rates. The report
+ * prints all three, side by side, labelled. Do not delete the booked-cost column
+ * and do not quietly let the Subtotal serve as it: /reports/purchases' Spend and
+ * stock valuation both reconcile against booked cost, not against the Subtotal.
  *
  * ═══════════════════════════════════════════════════════════════════════════
- * 5. GOODS = SUM(total_price) AS STORED
+ * 5. BOOKED COST = SUM(total_price) AS STORED;
+ *    SUBTOTAL = THE SAME GOODS AS THE BILL CHARGES FOR THEM
  * ═══════════════════════════════════════════════════════════════════════════
  * Never recomputed from the line's own count x rate. MEASURED: 217 of 2,165
  * rows disagree by more than a paisa (Rs 6,926,866.40 stored vs Rs 6,770,245.24
@@ -136,10 +202,22 @@ import { todayIST } from './format-date';
  * nothing; 0 orphan purchases today, and if a material is ever deleted THIS
  * report is the one that stays right.)
  *
- * TOTAL BILL VALUE is the existing Total Inward definition, per bill, unchanged:
- *   SUM(total_price) - SUM(discount) + SUM(cgst) + SUM(sgst)
+ * THE GRAND TOTAL is the Total Inward definition, per bill, on the EFFECTIVE
+ * rail (§4) — the same shape as before, with bill_value (the Subtotal) where
+ * total_price used to be and each charge read from wherever it is recorded:
+ *
+ *   GRAND TOTAL = SUBTOTAL − Discount + GST + Comp. Cess + Spl Excise Cess
+ *                 + TCS + Delivery + MRP Round-off
+ *
+ * which in SQL is
+ *   SUM(bill_value) - SUM(discount) + SUM(cgst) + SUM(sgst)
  *   + SUM(compensation_cess) + SUM(special_excise_cess) + SUM(tcs)
  *   + SUM(delivery_charges) + SUM(mrp_round_off)
+ * On a hand-entered bill bill_value IS total_price — so the Subtotal, the booked
+ * cost and, where no charge was recorded, the Grand Total all print the SAME
+ * number, which is correct and not a sign the columns are doing nothing — and
+ * every charge is the `purchases` column, so those 2,134 rows total exactly what
+ * they always did, asserted per row by scripts/purchase-charges-tests.js §7.
  *
  * GST is cgst + sgst ONLY — the house invariant. compensation_cess (the GST
  * (Compensation to States) levy) and special_excise_cess (TGBCL's) get their
@@ -152,10 +230,26 @@ import { todayIST } from './format-date';
  * A bill spans kg + BTL + CASE lines, so adding up its item counts produces a
  * number with no unit. This report shows a `lines` count instead and reads
  * neither the per-line count column nor the Rs-per-purchase-unit rate column on
- * `purchases`. It therefore writes no rate x count product at all, and the
- * rate-basis lock (scripts/check-rate-basis.js) has nothing to judge — no
- * `rate-basis:` declaration and no ALLOW entry are needed, and none should be
- * added to "be safe".
+ * `purchases`. Nothing here is a quantity and nothing here is a per-unit rate,
+ * so the rate-basis lock (scripts/check-rate-basis.js) reports this file CLEAN
+ * — no `rate-basis:` declaration and no ALLOW entry are needed, and none should
+ * be added to "be safe".
+ *
+ *   ⚠ ONE PAIRING DOES EXIST, AND THE SENTENCE ABOVE USED TO DENY IT. This
+ *     section said the report "writes no rate x count product at all". That is
+ *     FALSE since the SUBTOTAL arrived: on a PO receipt the Subtotal IS a
+ *     product — effectiveBillValueSql() in src/lib/purchase-charges.ts forms
+ *     `COALESCE(gm.quantity_received, 0) * COALESCE(gm.unit_price, 0)` off the
+ *     GRN line. The rate-basis lock cannot see it because it lives inside a SQL
+ *     template string in another file, so "the lock says clean" is NOT evidence
+ *     that no pairing exists here.
+ *
+ *     THE MONEY IS RIGHT: both halves are PURCHASE basis (a GRN line's
+ *     quantity_received and unit_price are the vendor's own bill quantities and
+ *     rate), and p.quantity = gm.quantity_received on all 31 mirror rows today,
+ *     so the product agrees with the booked side line for line. What was wrong
+ *     was the claim of absence — the sentence a future editor would have read
+ *     before adding a quantity column and concluded there was nothing to match.
  *
  *   ⚠ ADDING AN "AVG RATE" OR "TOTAL QTY" COLUMN CREATES A PAIRING THAT DOES
  *     NOT EXIST TODAY. If you ever do, the two halves must both be purchase
@@ -195,20 +289,40 @@ import { todayIST } from './format-date';
  * "TOTAL ITEMS" IS A LINE COUNT. `lines` is COUNT(*) of `purchases` rows, per §6.
  * No quantity is summed anywhere here either.
  *
- * DO NOT SUM AN EM-DASH INTO A ZERO. A day that mixes PO/GRN receipts with
- * hand-entered bills has charge columns that are PARTIAL, not complete: the
- * receipts' tax and gross discount are on the GRN. MEASURED on 2026-08-07 a
- * naive day GST cell prints Rs 1,125 while 29 taxed bills contribute a
- * structural 0. So every day row ships po_receipt_bills / po_receipt_lines /
- * po_receipt_value and charges_partial, the on-screen day table shows NO charge
- * columns at all, and the day CSV carries a per-row charges note. Total purchase
- * value is still the one legal grand total — with the booked-cost share printed
- * beside it, never folded silently in.
+ * THE DAY'S CHARGE FIGURES ARE COMPLETE — AND THE DAY TABLE STILL DOES NOT SHOW
+ * THEM. Those are two separate facts and both matter. Until 2026-09-10 a day
+ * mixing PO/GRN receipts with hand-entered bills had PARTIAL charge columns (on
+ * 2026-08-07 a naive GST cell printed Rs 1,125 while 29 taxed bills contributed
+ * a structural 0), and the em-dash rule existed to stop that being printed
+ * clean. §4 removed the cause: every day row's charges now come off the
+ * effective rail, so 2026-08-07's GST is its real Rs 5,482.80.
+ *
+ * The on-screen day table carries SEVEN columns as of 2026-09-11 — date, two
+ * bill counts, groups, vendors, item lines, SUBTOTAL and GRAND TOTAL. It was
+ * six until the Subtotal joined it, which cost no query: bill_value is already
+ * on every day row and every vendor row below (it always was), so the change was
+ * two type declarations and two cells on the page.
+ *
+ * IT STILL SHOWS NO CHARGE COLUMNS, and that remains a layout choice rather than
+ * a correctness one: the store person is matching paperwork, not filing a
+ * return. The consequence has to be captioned, because Subtotal and Grand Total
+ * now sit ADJACENT with the eight columns that explain the gap between them not
+ * on the table — the caption must point a reader who asks "why do these differ"
+ * at the By bill view and the CSV, both of which itemise it. The eight charge
+ * columns, the Subtotal and a provenance note per row ARE in the day CSV. Every
+ * day row still ships po_receipt_bills / po_receipt_lines / po_receipt_value and
+ * charges_from_grn (renamed from charges_partial, which had become a false
+ * claim) so both surfaces can disclose provenance.
  *
  * RECONCILIATION IS THE ACCEPTANCE TEST. With identical filters:
  *   SUM(day.groups) = totals.bills · SUM(day.day_runs) = totals.day_run_bills
- *   SUM(day.lines)  = totals.lines · SUM(day.total_bill_value) = totals.total_bill_value
- * to the rupee. The totals themselves come from the SAME computeTotals() the
+ *   SUM(day.lines)  = totals.lines
+ *   SUM(day.bill_value)       = totals.bill_value        (the SUBTOTAL column)
+ *   SUM(day.total_bill_value) = totals.total_bill_value  (the GRAND TOTAL column)
+ *   SUM(day.goods)            = totals.goods             (booked cost, CSV only)
+ * to the rupee. Every printed money column has a leg here on purpose: a column
+ * a reader can add up, with no stated identity to check it against, is the next
+ * silent drift. The totals themselves come from the SAME computeTotals() the
  * bill view uses, so the strip above a day table is not a second opinion.
  *
  * READ-ONLY. This file issues SELECTs and nothing else: no write statement of
@@ -264,15 +378,54 @@ export interface PurchaseBillRow {
   /** true when the vendor's own number is absent. Drives the CSV YES/NO. */
   bill_no_missing: boolean;
   /**
-   * true on GRN-keyed bills: the discount and the four tax figures below are
-   * stored as 0 on the cost mirror because the real ones live on the GRN. Show
-   * an em-dash, NOT a zero, and label total_bill_value as booked cost. See §4.
+   * true on GRN-keyed bills: PROVENANCE, not absence. The charge figures below
+   * were read off the GRN line rather than the cost-mirror `purchases` row.
+   * They are the bill's real figures, so print them as numbers — the em-dash
+   * this flag used to mean was the bug, see §4.
    */
   tax_on_grn: boolean;
+  /**
+   * How many of this bill's `lines` took their charges from a GRN line. Ships
+   * beside tax_on_grn because the badge is a provenance claim and this is the
+   * evidence for it.
+   */
+  grn_sourced_rows: number;
+  /**
+   * PO-receipt mirror lines whose GRN line is GONE (a repair, an unfinished
+   * void). Their charges are UNAVAILABLE, not zero. When this equals `lines`
+   * the renderer must BLANK the charge cells instead of printing Rs 0 — that is
+   * isChargeSourceMissingRow() in src/lib/purchase-charges.ts, which the screen
+   * and the CSV both call so the two cannot disagree about which cell is empty.
+   * 0 rows qualify today; the rule is kept because the failure is silent.
+   */
+  unpaired_mirror_rows: number;
   /** COUNT(*) of `purchases` rows in the group. No item counts — see §6. */
   lines: number;
-  /** SUM(total_price) AS STORED. Never recomputed. See §5. */
+  /**
+   * Rendered as BOOKED COST (Spend). SUM(total_price) AS STORED — the booked
+   * goods cost that feeds valuation. NOT the bill's face value and NOT the
+   * Subtotal: on 17 of the 31 PO-receipt lines the booked rate is already net of
+   * the discount the GRN itemises (rate 90 against a bill rate of 100), so spend
+   * sits Rs 1,620 below the bill. Never recomputed. See §5.
+   *
+   * ⚠ This field must never be substituted for `bill_value`, and its column must
+   * never be dropped in favour of the Subtotal — §4's closing paragraph is the
+   * rule, and /reports/purchases' Spend plus stock valuation are what depend on
+   * it. Keep the name `goods`: the route, the page and both CSVs bind it.
+   */
   goods: number;
+  /**
+   * Rendered as SUBTOTAL — the ingredients/goods cost the owner asked for, and
+   * the base the GRAND TOTAL is built on.
+   *
+   * The goods value as the BILL charges for it. Equal to `goods` on every
+   * hand-entered bill; on a PO receipt it is the GRN line's gross, because the
+   * booked rate there may already be net of the discount the GRN itemises and
+   * subtracting that discount from it would count it twice. total_bill_value is
+   * built on THIS, which is what makes the row foot — and bill_value − goods is
+   * exactly the discount already inside the booked rate. Keep the wire name.
+   */
+  bill_value: number;
   discount: number;
   cgst: number;
   sgst: number;
@@ -283,7 +436,10 @@ export interface PurchaseBillRow {
   tcs: number;
   delivery_charges: number;
   mrp_round_off: number;
-  /** goods − discount + gst + both cesses + tcs + delivery + round-off. */
+  /**
+   * Rendered as GRAND TOTAL — what is payable to the vendor.
+   * Subtotal − Discount + GST + both cesses + TCS + Delivery + MRP round-off.
+   */
   total_bill_value: number;
 }
 
@@ -292,7 +448,11 @@ export interface PurchaseBillTotals {
   bills: number;
   /** `purchases` rows behind them. */
   lines: number;
+  /** The period BOOKED COST (Spend) — SUM(total_price) as stored, the figure
+   *  that feeds valuation. See PurchaseBillRow.goods. */
   goods: number;
+  /** The period SUBTOTAL — see PurchaseBillRow.bill_value. */
+  bill_value: number;
   discount: number;
   cgst: number;
   sgst: number;
@@ -302,21 +462,37 @@ export interface PurchaseBillTotals {
   tcs: number;
   delivery_charges: number;
   mrp_round_off: number;
-  /** The one grand total this report may legitimately print. See §1. */
+  /**
+   * The period GRAND TOTAL — the sum of every row's Grand Total, and the one
+   * period-wide total this report may legitimately print. See §1.
+   */
   total_bill_value: number;
   /** How many of `bills` are PO/GRN receipts whose tax sits on the GRN. */
   po_receipt_bills: number;
   /** `purchases` rows behind those receipts. */
   po_receipt_lines: number;
-  /** Their share of total_bill_value — booked cost, not bill face value. */
+  /** Their share of the GRAND TOTAL — bill face value, read off the GRN. NOT a
+   *  share of the Subtotal: do not subtract it from one. */
   po_receipt_value: number;
+  /** `purchases` rows in the period whose charges were read off a GRN line. */
+  grn_sourced_lines: number;
+  /**
+   * PO-receipt mirror rows with no GRN line left to read charges from. Non-zero
+   * is a defect worth naming in a caption, not a rounding detail: those rows'
+   * charge cells go blank because the figure is unavailable. 0 today.
+   */
+  unpaired_mirror_lines: number;
   /**
    * How many of `bills` carry no vendor bill number at all (the DAY branch,
    * §3). Computed by SQL over the FULL filtered set, so a footnote can state
    * the period's real figure instead of counting the capped rows in hand.
    */
   day_run_bills: number;
-  /** Render verbatim beside the grand total. It is the guard on misreading. */
+  /**
+   * Render verbatim beside the PERIOD grand total. It is the guard on
+   * misreading, and since 2026-09-11 it has three figures to keep apart —
+   * Subtotal, Grand Total and Booked Cost — not two. See TOTALS_BASIS.
+   */
   basis: string;
 }
 
@@ -369,8 +545,12 @@ export interface PurchaseBillDayRow {
   spanning_bills: number;
   /** COUNT(*) of `purchases` rows — the owner's "total items". Never a quantity. */
   lines: number;
-  /** SUM(total_price) AS STORED. */
+  /** BOOKED COST (Spend) — SUM(total_price) AS STORED. Day CSV only; the day
+   *  table on screen does not print it. Never the Subtotal. */
   goods: number;
+  /** The day's SUBTOTAL — see PurchaseBillRow.bill_value. Printed on the day
+   *  table and in the day CSV. */
+  bill_value: number;
   discount: number;
   cgst: number;
   sgst: number;
@@ -381,18 +561,37 @@ export interface PurchaseBillDayRow {
   tcs: number;
   delivery_charges: number;
   mrp_round_off: number;
-  /** The day's total purchase value, same arithmetic as the bill view. */
+  /**
+   * The day's GRAND TOTAL, same arithmetic as the bill view. Both CSVs and both
+   * screens call it Grand Total; it was "Total Purchase Value" in the day CSV
+   * and "Total Bill Value" in the bill CSV until 2026-09-11, which was two names
+   * for one figure.
+   */
   total_bill_value: number;
-  /** How many of `groups` are PO/GRN receipts whose tax sits on the GRN. */
+  /** How many of `groups` are PO/GRN receipts, whose charges are read off the GRN. */
   po_receipt_bills: number;
   po_receipt_lines: number;
-  /** Their share of total_bill_value — BOOKED COST, not bill face value. */
+  /** Their share of the GRAND TOTAL — bill face value, read off the GRN. */
   po_receipt_value: number;
+  /** Lines on this day whose charges were read off a GRN line. */
+  grn_sourced_rows: number;
+  /** Mirror lines with no GRN line left to read from — see PurchaseBillRow. */
+  unpaired_mirror_rows: number;
   /**
-   * true when po_receipt_bills > 0: the charge figures above are PARTIAL for
-   * this day. Consumers must say so rather than printing them clean. See §7.
+   * true when any of this day's lines took its charges from a GRN line.
+   * PROVENANCE, not partiality — the charge figures above are complete WHENEVER
+   * `unpaired_mirror_rows` on the same row is 0, which is every row today. It
+   * was `charges_partial` until 2026-09-10, when the report stopped reading the
+   * receive route's placeholder zeros. See §4 and §7.
+   *
+   * ⚠ THIS FLAG IS NOT A COMPLETENESS SIGNAL and must not be read as one: it
+   * says WHERE the figures came from, not whether they are all there. The
+   * completeness question is answered by `unpaired_mirror_rows` — a day holding
+   * a receipt whose GRN line was deleted has charges_from_grn = true AND a short
+   * grand total. Renderers pair the two (see hasUnpairedMirrorRows in
+   * src/lib/purchase-charges.ts).
    */
-  charges_partial: boolean;
+  charges_from_grn: boolean;
 }
 
 /** One row per (day, vendor) — the owner's "vendor-wise bills", drilled down. */
@@ -403,7 +602,10 @@ export interface PurchaseBillDayVendorRow {
   bills: number;
   day_runs: number;
   lines: number;
+  /** BOOKED COST (Spend) — see PurchaseBillRow.goods. Day CSV only. */
   goods: number;
+  /** This vendor-day's SUBTOTAL — see PurchaseBillRow.bill_value. */
+  bill_value: number;
   discount: number;
   cgst: number;
   sgst: number;
@@ -413,10 +615,14 @@ export interface PurchaseBillDayVendorRow {
   tcs: number;
   delivery_charges: number;
   mrp_round_off: number;
+  /** The vendor-day GRAND TOTAL — Subtotal − Discount + charges. */
   total_bill_value: number;
   po_receipt_bills: number;
+  /** Their share of the GRAND TOTAL — bill face value, read off the GRN. */
   po_receipt_value: number;
-  charges_partial: boolean;
+  grn_sourced_rows: number;
+  unpaired_mirror_rows: number;
+  charges_from_grn: boolean;
 }
 
 export interface PurchaseBillDaySummaryResult {
@@ -470,10 +676,38 @@ export const BILL_SUMMARY_MAX_DAYS = 1_100;
  */
 export const BILL_SUMMARY_MAX_DAY_VENDOR_ROWS = 20_000;
 
+/**
+ * Rendered VERBATIM beside the PERIOD grand total, on screen and in BOTH CSVs.
+ * It is the single highest-leverage string in this file — the only prose that
+ * reaches the reader on every surface — and it is the guard against the ways
+ * these figures get misread.
+ *
+ * 2026-09-10: it used to end "so the total is NOT a tax-inclusive purchase
+ * register", which described the old behaviour — the report was summing the
+ * receive route's placeholder zeros and the tax genuinely was not in it. The
+ * charges are now read off the GRN line, so the total IS the bill face value
+ * including tax, and that sentence had to go.
+ *
+ * 2026-09-11: the columns were renamed to SUBTOTAL and GRAND TOTAL at the
+ * owner's request, so this caption now has THREE figures to keep apart instead
+ * of two. SUBTOTAL is the bill's own goods value and NOT the booked spend, and
+ * that is not a cosmetic choice: the Grand Total foots from it precisely so the
+ * discount already sitting inside a PO-receipt's booked rate is subtracted once,
+ * in the Discount column, and not twice. Footing from booked spend instead would
+ * leave 17 real rows short. SPEND is still SUM(purchases.total_price) as booked
+ * and is still the figure that feeds valuation, so the caption must keep saying
+ * it is a different number.
+ */
 const TOTALS_BASIS =
-  'One source (the purchases table), so this grand total counts every rupee exactly once. '
-  + 'PO/GRN receipts are included at BOOKED COST: their tax and gross discount are recorded on '
-  + 'the GRN, not on this cost row, so the total is NOT a tax-inclusive purchase register.';
+  'One source for the money (the purchases table), so this period total counts every rupee exactly once. '
+  + 'GRAND TOTAL is what is payable to the vendor: Subtotal less discount, plus tax, both cesses, TCS, '
+  + 'delivery and MRP round-off. SUBTOTAL is the goods themselves at the price the bill charges for them. '
+  + 'On a PO/GRN receipt both are read from the GRN line, the bill document, so a receipt totals here '
+  + 'what the GRN inward register calls Total Inward — a match worth checking rather than a guarantee, '
+  + 'since the register sums every GRN line and this report can only reach a line that has a purchase row '
+  + 'behind it. BOOKED COST (Spend) is a THIRD figure: what '
+  + 'was booked into stock and what stock valuation is built on, which on a PO receipt can already be net '
+  + 'of a discount the bill itemises separately. Do not read the three as one.';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Small helpers
@@ -513,6 +747,83 @@ export function resolveBillSummaryRange(
   let t = isYmd(to) ? to : today;
   if (f > t) [f, t] = [t, f];
   return { from: f, to: t };
+}
+
+/**
+ * THE DATES THE BUSINESS ACTUALLY HAS PURCHASES ON — first and last.
+ *
+ * 2026-09-11. Both purchase reports opened on a calendar window (this month /
+ * this financial year) rather than on the data. On 11 September the owner's
+ * purchases ran 1 Apr – 7 Aug, so "this month" held 0 of 2,165 rows and the
+ * report opened completely blank. He read the blank page as lost data and
+ * reported it as urgent. Nothing was lost; the window was simply somewhere the
+ * data is not.
+ *
+ * A calendar default cannot be fixed by picking a wider calendar window: the
+ * financial-year default has the same cliff one day later (on 1 Apr 2027 "this
+ * FY" is a one-day window and the whole previous year's book disappears from
+ * the widest choice on the page). The only default that cannot go blank is one
+ * READ OFF THE DATA, which is what this returns.
+ *
+ * ⚠ THE SQL SHAPE IS LOAD-BEARING — do not "tidy" it into one aggregate.
+ * SQLite only applies its MIN/MAX index shortcut when the aggregate is alone in
+ * its own subquery. Measured on the live table (2,165 rows) and on a 12× copy:
+ *
+ *   SELECT MIN(date), MAX(date) FROM purchases      SCAN  (linear)
+ *   two scalar subqueries, as below                 SEARCH (two O(log n) seeks)
+ *
+ * The bounds are there to keep it a SEARCH and to stop a stray empty-string
+ * date sorting to the front and being reported as the first purchase; anything
+ * that still comes back malformed is rejected by isYmd and reported as null,
+ * and the caller falls back to today.
+ */
+export interface PurchaseDateSpan {
+  /** First date any purchase is recorded on, or null when there are none. */
+  first: string | null;
+  /** Last date any purchase is recorded on, or null when there are none. */
+  last: string | null;
+}
+
+export function getPurchaseDateSpan(dbArg?: DatabaseT.Database): PurchaseDateSpan {
+  const db = dbArg || getDb();
+  const row = db.prepare(`
+    SELECT
+      (SELECT MIN(date) FROM purchases WHERE date >= '1900-01-01' AND date <= '9999-12-31') AS first_date,
+      (SELECT MAX(date) FROM purchases WHERE date >= '1900-01-01' AND date <= '9999-12-31') AS last_date
+  `).get() as { first_date?: unknown; last_date?: unknown } | undefined;
+  const firstRaw = row?.first_date;
+  const lastRaw = row?.last_date;
+  return {
+    first: isYmd(firstRaw) ? firstRaw : null,
+    last: isYmd(lastRaw) ? lastRaw : null,
+  };
+}
+
+/**
+ * The window that shows EVERY purchase: first recorded purchase → today.
+ *
+ * The far end is today and not the last purchase, because this app allows a
+ * bill to be dated ahead (a delivery keyed in before its date). If such a row
+ * exists it sits past today, so the end stretches to cover it — "everything"
+ * has to mean everything in both directions or the reader is sent looking for
+ * rows the widest window on the page cannot reach.
+ *
+ * BOTH BOUNDS ARE REAL CALENDAR DATES, never a 1970/2099 sentinel: the two date
+ * boxes on screen show this window, and the CSV filename carries it. The owner
+ * reconciles what he reads against what he exports, so a placeholder date in
+ * either would be a document that misstates its own period.
+ *
+ * With no purchases at all, both ends are today and the report says so in
+ * words rather than printing an invented range.
+ */
+export function resolveAllTimePurchaseRange(
+  dbArg?: DatabaseT.Database,
+): { from: string; to: string; span: PurchaseDateSpan } {
+  const span = getPurchaseDateSpan(dbArg);
+  const today = todayIST();
+  const from = span.first ?? today;
+  const to = span.last && span.last > today ? span.last : today;
+  return { from, to, span };
 }
 
 /**
@@ -565,9 +876,7 @@ function buildBase(f: {
   // A PO-receive cost mirror: no invoice_id of ours, but a hard grn_id. Must
   // stay identical to branch 2 of the key below, or the flag and the grouping
   // would describe different rows.
-  const isPoReceiptExpr = `CASE WHEN TRIM(COALESCE(p.invoice_id, '')) = ''
-                                 AND TRIM(COALESCE(p.grn_id, '')) <> ''
-                                THEN 1 ELSE 0 END`;
+  const isPoReceiptExpr = poReceiptMirrorSql('p');
 
   const poFilter = f.includePoReceipts
     ? ''
@@ -589,41 +898,61 @@ function buildBase(f: {
       END`;
 
   // The settled Total Inward definition, evaluated per LINE so that both the
-  // per-bill SUM and the period SUM are the same arithmetic. COALESCE despite
-  // the NOT NULL DEFAULT 0 declarations: older rows predate several of those
-  // ALTERs and a single NULL would turn a whole bill's total into NULL.
-  const lineTotalExpr = `COALESCE(p.total_price, 0)
-                       - COALESCE(p.discount, 0)
-                       + COALESCE(p.cgst, 0)
-                       + COALESCE(p.sgst, 0)
-                       + COALESCE(p.compensation_cess, 0)
-                       + COALESCE(p.special_excise_cess, 0)
-                       + COALESCE(p.tcs, 0)
-                       + COALESCE(p.delivery_charges, 0)
-                       + COALESCE(p.mrp_round_off, 0)`;
+  // per-bill SUM and the period SUM are the same arithmetic. AFTER AGGREGATION
+  // THIS IS THE GRAND TOTAL COLUMN — the figure the owner calls "what we
+  // actually need to pay the vendor". No part of it changed when the columns
+  // were renamed on 2026-09-11.
+  //
+  // 2026-09-10: it now reads the EFFECTIVE rail. A PO-receive row's charges are
+  // NOT on `purchases` — the receive route leaves those columns at zero and the
+  // bill's real figures sit on the GRN line. Summing p.cgst here made this
+  // module report ₹450.00 for GRN-2026-0007 while the GRN inward register
+  // printed ₹484.90 for the same bill, and ₹25,330.00 against the register's
+  // ₹30,732.20 across the 29 GRN-sourced bills, 28 of them individually wrong.
+  // effectiveLineTotalSql() is the same expression /api/reports/purchases sums
+  // and the same arithmetic the register's `inward_value` uses, so the three
+  // screens now quote one number per bill. See src/lib/purchase-charges.ts.
+  const lineTotalExpr = effectiveLineTotalSql('p', 'gl');
 
-  const sql = `
+  const sql = withGrnCharges(`
     SELECT
       ${billKeyExpr}                            AS bill_key,
       ${isPoReceiptExpr}                        AS is_po_receipt,
+      -- 1 when THIS line's eight charge figures were read off the paired GRN
+      -- line rather than off the purchases row. It is the provenance every
+      -- renderer needs: a mirror row with no GRN line left (is_po_receipt = 1
+      -- and grn_sourced = 0) has charges that are UNAVAILABLE, not zero, and
+      -- its cells must go blank instead of printing a filing-grade "Rs 0".
+      ${grnSourcedSql('gl')}                    AS grn_sourced,
       p.date                                    AS row_date,
       COALESCE(TRIM(p.vendor), '')              AS vendor,
       COALESCE(TRIM(p.invoice_id), '')          AS invoice_id,
       COALESCE(TRIM(p.bill_no), '')             AS bill_no,
       COALESCE(TRIM(p.grn_id), '')              AS grn_id,
+      -- THE THREE ALIASES AND THE COLUMNS THEY BECOME:
+      --   goods      → BOOKED COST (Spend)  SUM(total_price) AS STORED (§5),
+      --                never recomputed, the figure valuation uses.
+      --   bill_value → SUBTOTAL             the same goods as the bill charges
+      --                for them; differs from goods only on a PO receipt, where
+      --                the booked rate may already be net of the discount the
+      --                GRN itemises.
+      --   line_total → GRAND TOTAL          built on bill_value, so subtracting
+      --                that discount cannot double-count it.
       COALESCE(p.total_price, 0)                AS goods,
-      COALESCE(p.discount, 0)                   AS discount,
-      COALESCE(p.cgst, 0)                       AS cgst,
-      COALESCE(p.sgst, 0)                       AS sgst,
-      COALESCE(p.compensation_cess, 0)          AS compensation_cess,
-      COALESCE(p.special_excise_cess, 0)        AS special_excise_cess,
-      COALESCE(p.tcs, 0)                        AS tcs,
-      COALESCE(p.delivery_charges, 0)           AS delivery_charges,
-      COALESCE(p.mrp_round_off, 0)              AS mrp_round_off,
+      ${effectiveBillValueSql('p', 'gl')}       AS bill_value,
+      ${effectiveChargeSql('discount', 'p', 'gl')}            AS discount,
+      ${effectiveChargeSql('cgst', 'p', 'gl')}                AS cgst,
+      ${effectiveChargeSql('sgst', 'p', 'gl')}                AS sgst,
+      ${effectiveChargeSql('compensation_cess', 'p', 'gl')}   AS compensation_cess,
+      ${effectiveChargeSql('special_excise_cess', 'p', 'gl')} AS special_excise_cess,
+      ${effectiveChargeSql('tcs', 'p', 'gl')}                 AS tcs,
+      ${effectiveChargeSql('delivery_charges', 'p', 'gl')}    AS delivery_charges,
+      ${effectiveChargeSql('mrp_round_off', 'p', 'gl')}       AS mrp_round_off,
       ${lineTotalExpr}                          AS line_total
     FROM purchases p
+    ${grnLineJoinSql('p', 'gl')}
     WHERE p.date >= ? AND p.date <= ?${venFilter}${poFilter}
-  `;
+  `);
 
   return { sql, params };
 }
@@ -674,6 +1003,7 @@ function computeTotals(
       COUNT(DISTINCT bill_key)                                        AS bills,
       COUNT(*)                                                        AS lines,
       COALESCE(SUM(goods), 0)                                         AS goods,
+      COALESCE(SUM(bill_value), 0)                                    AS bill_value,
       COALESCE(SUM(discount), 0)                                      AS discount,
       COALESCE(SUM(cgst), 0)                                          AS cgst,
       COALESCE(SUM(sgst), 0)                                          AS sgst,
@@ -686,6 +1016,9 @@ function computeTotals(
       COUNT(DISTINCT CASE WHEN is_po_receipt = 1 THEN bill_key END)   AS po_receipt_bills,
       COALESCE(SUM(CASE WHEN is_po_receipt = 1 THEN 1 ELSE 0 END), 0) AS po_receipt_lines,
       COALESCE(SUM(CASE WHEN is_po_receipt = 1 THEN line_total ELSE 0 END), 0) AS po_receipt_value,
+      COALESCE(SUM(grn_sourced), 0)                                   AS grn_sourced_lines,
+      COALESCE(SUM(CASE WHEN is_po_receipt = 1 AND grn_sourced = 0 THEN 1 ELSE 0 END), 0)
+                                                                      AS unpaired_mirror_lines,
       COUNT(DISTINCT CASE WHEN substr(bill_key, 1, 4) IN ('DAY:', 'ROW:') THEN bill_key END) AS day_run_bills
     FROM (${base})
   `).get(...params) as any;
@@ -696,6 +1029,7 @@ function computeTotals(
     bills: num(agg?.bills),
     lines: num(agg?.lines),
     goods: r2(agg?.goods),
+    bill_value: r2(agg?.bill_value),
     discount: r2(agg?.discount),
     cgst: r2(cgstT),
     sgst: r2(sgstT),
@@ -709,6 +1043,8 @@ function computeTotals(
     po_receipt_bills: num(agg?.po_receipt_bills),
     po_receipt_lines: num(agg?.po_receipt_lines),
     po_receipt_value: r2(agg?.po_receipt_value),
+    grn_sourced_lines: num(agg?.grn_sourced_lines),
+    unpaired_mirror_lines: num(agg?.unpaired_mirror_lines),
     day_run_bills: num(agg?.day_run_bills),
     basis: TOTALS_BASIS,
   };
@@ -744,8 +1080,12 @@ export function getPurchaseBillSummary(
       MAX(bill_no)                          AS bill_no,
       MAX(grn_id)                           AS grn_id,
       MAX(is_po_receipt)                    AS is_po_receipt,
+      COALESCE(SUM(grn_sourced), 0)         AS grn_sourced_rows,
+      COALESCE(SUM(CASE WHEN is_po_receipt = 1 AND grn_sourced = 0 THEN 1 ELSE 0 END), 0)
+                                            AS unpaired_mirror_rows,
       COUNT(*)                              AS lines,
       COALESCE(SUM(goods), 0)               AS goods,
+      COALESCE(SUM(bill_value), 0)          AS bill_value,
       COALESCE(SUM(discount), 0)            AS discount,
       COALESCE(SUM(cgst), 0)                AS cgst,
       COALESCE(SUM(sgst), 0)                AS sgst,
@@ -782,12 +1122,17 @@ export function getPurchaseBillSummary(
       bill_no: String(r.bill_no || ''),
       grn_id: String(r.grn_id || ''),
       bill_no_missing: String(r.bill_no || '').trim() === '',
-      // Derived from the KIND, not from "the tax happens to be 0" — a
-      // hand-entered bill that genuinely carried no tax is a real zero and must
-      // keep printing 0, not borrow the em-dash. See §4.
+      // PROVENANCE, from the KIND — "this bill's charges were read off its GRN
+      // line". It is NOT "the charges are missing": since 2026-09-10 they are
+      // the bill's real figures and print as numbers. The one row that must
+      // still blank its cells is caught by unpaired_mirror_rows below, not by
+      // this flag. See §4.
       tax_on_grn: kind === 'GRN',
+      grn_sourced_rows: num(r.grn_sourced_rows),
+      unpaired_mirror_rows: num(r.unpaired_mirror_rows),
       lines: num(r.lines),
       goods: r2(r.goods),
+      bill_value: r2(r.bill_value),
       discount: r2(r.discount),
       cgst: r2(cgst),
       sgst: r2(sgst),
@@ -841,8 +1186,12 @@ function buildPerBill(base: string): string {
       CASE WHEN MAX(row_date) > MIN(row_date) THEN 1 ELSE 0 END            AS bill_spans_days,
       CASE WHEN substr(bill_key, 1, 4) IN ('DAY:', 'ROW:') THEN 1 ELSE 0 END AS is_day_run,
       MAX(is_po_receipt)                                                   AS is_po_receipt,
+      COALESCE(SUM(grn_sourced), 0)                                        AS grn_sourced_rows,
+      COALESCE(SUM(CASE WHEN is_po_receipt = 1 AND grn_sourced = 0 THEN 1 ELSE 0 END), 0)
+                                                                           AS unpaired_mirror_rows,
       COUNT(*)                                                             AS lines,
       COALESCE(SUM(goods), 0)                                              AS goods,
+      COALESCE(SUM(bill_value), 0)                                         AS bill_value,
       COALESCE(SUM(discount), 0)                                           AS discount,
       COALESCE(SUM(cgst), 0)                                               AS cgst,
       COALESCE(SUM(sgst), 0)                                               AS sgst,
@@ -900,6 +1249,7 @@ export function getPurchaseBillDaySummary(
       COALESCE(SUM(bill_spans_days), 0)                                     AS spanning_bills,
       COALESCE(SUM(lines), 0)                                               AS lines,
       COALESCE(SUM(goods), 0)                                               AS goods,
+      COALESCE(SUM(bill_value), 0)                                          AS bill_value,
       COALESCE(SUM(discount), 0)                                            AS discount,
       COALESCE(SUM(cgst), 0)                                                AS cgst,
       COALESCE(SUM(sgst), 0)                                                AS sgst,
@@ -911,7 +1261,9 @@ export function getPurchaseBillDaySummary(
       COALESCE(SUM(total_bill_value), 0)                                    AS total_bill_value,
       COALESCE(SUM(CASE WHEN is_po_receipt = 1 THEN 1 ELSE 0 END), 0)       AS po_receipt_bills,
       COALESCE(SUM(CASE WHEN is_po_receipt = 1 THEN lines ELSE 0 END), 0)   AS po_receipt_lines,
-      COALESCE(SUM(CASE WHEN is_po_receipt = 1 THEN total_bill_value ELSE 0 END), 0) AS po_receipt_value
+      COALESCE(SUM(CASE WHEN is_po_receipt = 1 THEN total_bill_value ELSE 0 END), 0) AS po_receipt_value,
+      COALESCE(SUM(grn_sourced_rows), 0)                                    AS grn_sourced_rows,
+      COALESCE(SUM(unpaired_mirror_rows), 0)                                AS unpaired_mirror_rows
     FROM (${perBill})
     GROUP BY bill_day
     ORDER BY day DESC
@@ -932,6 +1284,7 @@ export function getPurchaseBillDaySummary(
       spanning_bills: num(r.spanning_bills),
       lines: num(r.lines),
       goods: r2(r.goods),
+      bill_value: r2(r.bill_value),
       discount: r2(r.discount),
       cgst: r2(cgst),
       sgst: r2(sgst),
@@ -945,11 +1298,14 @@ export function getPurchaseBillDaySummary(
       po_receipt_bills: poBills,
       po_receipt_lines: num(r.po_receipt_lines),
       po_receipt_value: r2(r.po_receipt_value),
-      // Not "the tax is 0" but "part of this day's tax is not on these rows".
-      // Derived from the PO-receipt count for the same reason PurchaseBillRow
-      // derives tax_on_grn from the kind: a day of genuinely untaxed hand
-      // entries must keep printing its real zero. See §4 and §7.
-      charges_partial: poBills > 0,
+      grn_sourced_rows: num(r.grn_sourced_rows),
+      unpaired_mirror_rows: num(r.unpaired_mirror_rows),
+      // PROVENANCE, not partiality. Until 2026-09-10 this said "part of this
+      // day's tax is not on these rows" and it was true; the charges are now
+      // read off the GRN line, so the flag only says where some of them were
+      // read from. It does NOT certify the day is complete — unpaired_mirror_rows
+      // beside it is what answers that, and a day can carry both. See §4 and §7.
+      charges_from_grn: num(r.grn_sourced_rows) > 0,
     };
   });
 
@@ -959,6 +1315,11 @@ export function getPurchaseBillDaySummary(
   // the vendor count (the DAY key is vendor|date|outlet) and a column that
   // always equals its neighbour tells a reconciler nothing. Highest value first
   // inside a day: the day that looks wrong is usually one large indent.
+  //
+  // THE ORDER BY BELOW SORTS ON total_bill_value — i.e. on the GRAND TOTAL, the
+  // amount payable, not on the Subtotal. That is deliberate (the vendor you owe
+  // the most is the one to look at first) and it is not an oversight left behind
+  // by the 2026-09-11 rename. Do not "fix" it to sort by the Subtotal column.
   const rawVendors = db.prepare(`
     SELECT
       bill_day                                                              AS day,
@@ -968,6 +1329,7 @@ export function getPurchaseBillDaySummary(
       COALESCE(SUM(is_day_run), 0)                                          AS day_runs,
       COALESCE(SUM(lines), 0)                                               AS lines,
       COALESCE(SUM(goods), 0)                                               AS goods,
+      COALESCE(SUM(bill_value), 0)                                          AS bill_value,
       COALESCE(SUM(discount), 0)                                            AS discount,
       COALESCE(SUM(cgst), 0)                                                AS cgst,
       COALESCE(SUM(sgst), 0)                                                AS sgst,
@@ -978,7 +1340,9 @@ export function getPurchaseBillDaySummary(
       COALESCE(SUM(mrp_round_off), 0)                                       AS mrp_round_off,
       COALESCE(SUM(total_bill_value), 0)                                    AS total_bill_value,
       COALESCE(SUM(CASE WHEN is_po_receipt = 1 THEN 1 ELSE 0 END), 0)       AS po_receipt_bills,
-      COALESCE(SUM(CASE WHEN is_po_receipt = 1 THEN total_bill_value ELSE 0 END), 0) AS po_receipt_value
+      COALESCE(SUM(CASE WHEN is_po_receipt = 1 THEN total_bill_value ELSE 0 END), 0) AS po_receipt_value,
+      COALESCE(SUM(grn_sourced_rows), 0)                                    AS grn_sourced_rows,
+      COALESCE(SUM(unpaired_mirror_rows), 0)                                AS unpaired_mirror_rows
     FROM (${perBill})
     GROUP BY bill_day, LOWER(bill_vendor)
     ORDER BY day DESC, total_bill_value DESC, vendor COLLATE NOCASE ASC
@@ -1007,6 +1371,7 @@ export function getPurchaseBillDaySummary(
       day_runs: num(r.day_runs),
       lines: num(r.lines),
       goods: r2(r.goods),
+      bill_value: r2(r.bill_value),
       discount: r2(r.discount),
       cgst: r2(cgst),
       sgst: r2(sgst),
@@ -1019,7 +1384,9 @@ export function getPurchaseBillDaySummary(
       total_bill_value: r2(r.total_bill_value),
       po_receipt_bills: poBills,
       po_receipt_value: r2(r.po_receipt_value),
-      charges_partial: poBills > 0,
+      grn_sourced_rows: num(r.grn_sourced_rows),
+      unpaired_mirror_rows: num(r.unpaired_mirror_rows),
+      charges_from_grn: num(r.grn_sourced_rows) > 0,
     };
   });
 
@@ -1051,14 +1418,57 @@ export interface PurchaseBillColumn {
 }
 
 /**
- * The columns, in the order the screen shows them, so a row reconciles
- * left-to-right: goods − discount + GST + cesses + TCS + delivery + round-off
- * = Total Bill Value.
+ * The three counts the shared blank-vs-zero rule reads, lifted off a bill or a
+ * day row. Written once so the CSV and the screen ask the SAME question of the
+ * SAME helper (src/lib/purchase-charges.ts) — two copies of "is this cell
+ * available?" is how a screen and its download start disagreeing about which
+ * cell is empty.
+ */
+type ChargeSourced = { lines: number; grn_sourced_rows: number; unpaired_mirror_rows: number };
+const chargeShape = (r: ChargeSourced) => ({
+  count: num(r.lines),
+  grn_sourced_rows: num(r.grn_sourced_rows),
+  unpaired_mirror_rows: num(r.unpaired_mirror_rows),
+});
+
+/**
+ * ONE charge cell for a CSV.
  *
- * The three trailing columns exist because a CSV gets forwarded and opened cold
- * in Excel by someone who never saw the screen's badges or footnote. "Bill No
- * Present" keeps the DAY_RUN caveat (§3) attached to the data, and the charges
- * note keeps the PO-mirror caveat (§4) attached to the zeros.
+ * A real zero goes out as 0 — a bill that carried no cess carried no cess, and
+ * blanking it would make the column unsummable. An UNAVAILABLE figure (every
+ * line behind it is a PO mirror whose GRN line is gone) goes out EMPTY, because
+ * "Rs 0" in a tax column is a claim no query here ever established. The rule
+ * lives in chargeCell(); it can only ever blank a cell whose stored sum is also
+ * 0, so Σ(cells, blank = 0) is always the column total.
+ */
+function chargeCsvCell(r: ChargeSourced, key: PurchaseChargeKey, value: number): number | '' {
+  const v = chargeCell({ ...chargeShape(r), [key]: value }, { key } as PurchaseChargeColumn);
+  return v == null ? '' : v;
+}
+
+/**
+ * The columns, in the order the screen shows them, so a row reconciles
+ * left-to-right: SUBTOTAL − Discount + GST + cesses + TCS + Delivery +
+ * Round-off = GRAND TOTAL.
+ *
+ * SUBTOTAL, NOT BOOKED COST, IS THE BASE — and that is why it is a column and
+ * not a footnote. Booked cost is Spend (SUM(total_price) as booked); on 17 of
+ * the 31 PO-receipt lines the booked rate is already net of the discount the GRN
+ * itemises, so booked cost − discount + charges lands Rs 100 short on those
+ * bills and the row does not foot. Both are printed, both are labelled, and
+ * their difference IS the discount already inside the booked rate.
+ *
+ * THE THREE MONEY COLUMNS KEEP THEIR MACHINE KEYS — `goods`, `bill_value`,
+ * `total_bill_value`. Only their labels changed on 2026-09-11. The route locates
+ * the column to hang a caption's period figure under BY KEY STRING
+ * (makeCaptionRow(..., 'total_bill_value')), and a key that matches nothing
+ * drops that figure silently, with no error and no failing test.
+ *
+ * The two trailing prose columns exist because a CSV gets forwarded and opened
+ * cold in Excel by someone who never saw the screen's badges or footnote. "Bill
+ * No Present" keeps the DAY_RUN caveat (§3) attached to the data, and the
+ * charges note keeps the provenance of the charge figures (§4) attached to the
+ * numbers.
  */
 export const PURCHASE_BILL_COLUMNS: PurchaseBillColumn[] = [
   { key: 'date',                label: 'Date',                    value: r => (r.spans_days ? `${r.date}…${r.date_to}` : r.date) },
@@ -1069,23 +1479,29 @@ export const PURCHASE_BILL_COLUMNS: PurchaseBillColumn[] = [
   { key: 'vendor',              label: 'Vendor',                  value: r => (r.vendor_count > 1 ? `${r.vendor} (+${r.vendor_count - 1} more)` : r.vendor) },
   { key: 'bill_kind',           label: 'Bill Identity',           value: r => r.bill_kind },
   { key: 'lines',               label: 'Lines', numeric: true,    value: r => r.lines },
-  { key: 'goods',               label: 'Goods (Rs)', numeric: true,             value: r => r.goods },
-  { key: 'discount',            label: 'Discount (Rs)', numeric: true,          value: r => r.discount },
-  { key: 'gst',                 label: 'GST = CGST+SGST (Rs)', numeric: true,   value: r => r.gst },
-  { key: 'cgst',                label: 'CGST (Rs)', numeric: true,              value: r => r.cgst },
-  { key: 'sgst',                label: 'SGST (Rs)', numeric: true,              value: r => r.sgst },
-  { key: 'compensation_cess',   label: 'Compensation Cess (Rs)', numeric: true, value: r => r.compensation_cess },
-  { key: 'special_excise_cess', label: 'Spl Excise Cess (Rs)', numeric: true,   value: r => r.special_excise_cess },
-  { key: 'tcs',                 label: 'TCS (Rs)', numeric: true,               value: r => r.tcs },
-  { key: 'delivery_charges',    label: 'Delivery Charges (Rs)', numeric: true,  value: r => r.delivery_charges },
-  { key: 'mrp_round_off',       label: 'MRP Round Off (Rs)', numeric: true,     value: r => r.mrp_round_off },
-  { key: 'total_bill_value',    label: 'Total Bill Value (Rs)', numeric: true,  value: r => r.total_bill_value },
+  { key: 'goods',               label: 'Booked Cost = Spend (Rs, what stock valuation uses; NOT the Subtotal)', numeric: true, value: r => r.goods },
+  { key: 'bill_value',          label: 'Subtotal (Rs, the goods/ingredients as billed — what Grand Total is built on)', numeric: true, value: r => r.bill_value },
+  { key: 'discount',            label: 'Discount (Rs)', numeric: true,          value: r => chargeCsvCell(r, 'discount', r.discount) },
+  // GST is the derived pair, so it has no chargeCell of its own; it blanks
+  // exactly when both of its parts do, which keeps the three columns consistent.
+  { key: 'gst',                 label: 'GST = CGST+SGST (Rs)', numeric: true,   value: r => (chargeCsvCell(r, 'cgst', r.cgst) === '' && chargeCsvCell(r, 'sgst', r.sgst) === '' ? '' : r.gst) },
+  { key: 'cgst',                label: 'CGST (Rs)', numeric: true,              value: r => chargeCsvCell(r, 'cgst', r.cgst) },
+  { key: 'sgst',                label: 'SGST (Rs)', numeric: true,              value: r => chargeCsvCell(r, 'sgst', r.sgst) },
+  { key: 'compensation_cess',   label: 'Compensation Cess (Rs)', numeric: true, value: r => chargeCsvCell(r, 'compensation_cess', r.compensation_cess) },
+  { key: 'special_excise_cess', label: 'Spl Excise Cess (Rs)', numeric: true,   value: r => chargeCsvCell(r, 'special_excise_cess', r.special_excise_cess) },
+  { key: 'tcs',                 label: 'TCS (Rs)', numeric: true,               value: r => chargeCsvCell(r, 'tcs', r.tcs) },
+  { key: 'delivery_charges',    label: 'Delivery Charges (Rs)', numeric: true,  value: r => chargeCsvCell(r, 'delivery_charges', r.delivery_charges) },
+  { key: 'mrp_round_off',       label: 'MRP Round Off (Rs)', numeric: true,     value: r => chargeCsvCell(r, 'mrp_round_off', r.mrp_round_off) },
+  { key: 'total_bill_value',    label: 'Grand Total (Rs, payable to the vendor = Subtotal - Discount + GST + cesses + TCS + Delivery + Round Off)', numeric: true, value: r => r.total_bill_value },
   {
+    // WHERE the charge figures on this row were read from, in the SAME words
+    // /api/reports/purchases writes into its own note column — one sentence,
+    // one source of truth (src/lib/purchase-charges.ts). It used to say the
+    // total was booked cost and the charges were elsewhere; both halves of that
+    // stopped being true on 2026-09-10.
     key: 'charges_note',
     label: 'Charges Note',
-    value: r => (r.tax_on_grn
-      ? 'Charges recorded on GRN, not on this cost row — total is BOOKED COST, not bill face value'
-      : ''),
+    value: r => chargeNote(chargeShape(r)),
   },
   { key: 'bill_key',            label: 'Bill Key',                value: r => r.bill_key },
 ];
@@ -1154,7 +1570,10 @@ export interface PurchaseBillDayCsvRow {
   multi_vendor_bills: number | '';
   spanning_bills: number | '';
   lines: number;
+  /** Printed as BOOKED COST — what stock valuation uses. Not the Subtotal. */
   goods: number;
+  /** Printed as SUBTOTAL — the goods as billed, the base of the Grand Total. */
+  bill_value: number;
   discount: number;
   gst: number;
   cgst: number;
@@ -1164,9 +1583,13 @@ export interface PurchaseBillDayCsvRow {
   tcs: number;
   delivery_charges: number;
   mrp_round_off: number;
+  /** Printed as GRAND TOTAL — Subtotal − Discount + every charge above. */
   total_bill_value: number;
   po_receipt_bills: number;
+  /** Those bills' share of the GRAND TOTAL. */
   po_receipt_value: number;
+  grn_sourced_rows: number;
+  unpaired_mirror_rows: number;
   charges_note: string;
 }
 
@@ -1188,9 +1611,17 @@ export interface PurchaseBillDayColumn {
  * "Item Lines" is a COUNT of purchase rows. It is NOT a quantity and must never
  * become one: a day spans kg, BTL and CASE lines (§6).
  *
- * The trailing charge columns are PARTIAL on any day holding a PO/GRN receipt,
- * which is why every such row carries the Charges Note — this file gets opened
- * cold by someone who never saw the screen's badges.
+ * THE TRAILING CHARGE COLUMNS ARE COMPLETE, including on a day holding a PO/GRN
+ * receipt. (This block claimed they were PARTIAL until 2026-09-11 — a leftover
+ * from before the charges moved onto the effective rail on 2026-09-10, and a
+ * straight contradiction of §4, §7 and dayChargesNote's own doc below.) What the
+ * per-row Charges Note carries is PROVENANCE: where that row's figures were
+ * read from. This file gets opened cold by someone who never saw the screen's
+ * badges, which is why the note is written per row and not once in a caption.
+ *
+ * SUBTOTAL − Discount + GST + cesses + TCS + Delivery + Round-off = GRAND TOTAL,
+ * on a DAY row and on a VENDOR row alike. Booked Cost sits outside that
+ * arithmetic on purpose: it is what stock valuation uses, not what was billed.
  */
 export const PURCHASE_BILL_DAY_COLUMNS: PurchaseBillDayColumn[] = [
   { key: 'row_type',            label: 'Row Type',                            value: r => r.row_type },
@@ -1207,31 +1638,50 @@ export const PURCHASE_BILL_DAY_COLUMNS: PurchaseBillDayColumn[] = [
   { key: 'multi_vendor_bills',  label: 'Multi-Vendor Bills (Vendor col names the first only)', numeric: true, value: r => r.multi_vendor_bills },
   { key: 'spanning_bills',      label: 'Bills Also Dated Later (counted whole on this date)', numeric: true,  value: r => r.spanning_bills },
   { key: 'lines',               label: 'Item Lines', numeric: true,           value: r => r.lines },
-  { key: 'goods',               label: 'Goods (Rs)', numeric: true,             value: r => r.goods },
-  { key: 'discount',            label: 'Discount (Rs)', numeric: true,          value: r => r.discount },
-  { key: 'gst',                 label: 'GST = CGST+SGST (Rs)', numeric: true,   value: r => r.gst },
-  { key: 'cgst',                label: 'CGST (Rs)', numeric: true,              value: r => r.cgst },
-  { key: 'sgst',                label: 'SGST (Rs)', numeric: true,              value: r => r.sgst },
-  { key: 'compensation_cess',   label: 'Compensation Cess (Rs)', numeric: true, value: r => r.compensation_cess },
-  { key: 'special_excise_cess', label: 'Spl Excise Cess (Rs)', numeric: true,   value: r => r.special_excise_cess },
-  { key: 'tcs',                 label: 'TCS (Rs)', numeric: true,               value: r => r.tcs },
-  { key: 'delivery_charges',    label: 'Delivery Charges (Rs)', numeric: true,  value: r => r.delivery_charges },
-  { key: 'mrp_round_off',       label: 'MRP Round Off (Rs)', numeric: true,     value: r => r.mrp_round_off },
-  { key: 'total_bill_value',    label: 'Total Purchase Value (Rs)', numeric: true, value: r => r.total_bill_value },
+  { key: 'goods',               label: 'Booked Cost = Spend (Rs, what stock valuation uses; NOT the Subtotal)', numeric: true, value: r => r.goods },
+  { key: 'bill_value',          label: 'Subtotal (Rs, the goods/ingredients as billed — what Grand Total is built on)', numeric: true, value: r => r.bill_value },
+  { key: 'discount',            label: 'Discount (Rs)', numeric: true,          value: r => chargeCsvCell(r, 'discount', r.discount) },
+  { key: 'gst',                 label: 'GST = CGST+SGST (Rs)', numeric: true,   value: r => (chargeCsvCell(r, 'cgst', r.cgst) === '' && chargeCsvCell(r, 'sgst', r.sgst) === '' ? '' : r.gst) },
+  { key: 'cgst',                label: 'CGST (Rs)', numeric: true,              value: r => chargeCsvCell(r, 'cgst', r.cgst) },
+  { key: 'sgst',                label: 'SGST (Rs)', numeric: true,              value: r => chargeCsvCell(r, 'sgst', r.sgst) },
+  { key: 'compensation_cess',   label: 'Compensation Cess (Rs)', numeric: true, value: r => chargeCsvCell(r, 'compensation_cess', r.compensation_cess) },
+  { key: 'special_excise_cess', label: 'Spl Excise Cess (Rs)', numeric: true,   value: r => chargeCsvCell(r, 'special_excise_cess', r.special_excise_cess) },
+  { key: 'tcs',                 label: 'TCS (Rs)', numeric: true,               value: r => chargeCsvCell(r, 'tcs', r.tcs) },
+  { key: 'delivery_charges',    label: 'Delivery Charges (Rs)', numeric: true,  value: r => chargeCsvCell(r, 'delivery_charges', r.delivery_charges) },
+  { key: 'mrp_round_off',       label: 'MRP Round Off (Rs)', numeric: true,     value: r => chargeCsvCell(r, 'mrp_round_off', r.mrp_round_off) },
+  // ONE NAME FOR ONE FIGURE. This column and the bill CSV's total both carry the
+  // identical arithmetic and used to be labelled "Total Purchase Value" here and
+  // "Total Bill Value" there. Both are now GRAND TOTAL; the route's captions say
+  // the same word.
+  { key: 'total_bill_value',    label: 'Grand Total (Rs, payable to the vendor = Subtotal - Discount + GST + cesses + TCS + Delivery + Round Off)', numeric: true, value: r => r.total_bill_value },
   { key: 'po_receipt_bills',    label: 'Of Which PO/GRN Bills', numeric: true,  value: r => r.po_receipt_bills },
-  { key: 'po_receipt_value',    label: 'Of Which Booked Cost (Rs)', numeric: true, value: r => r.po_receipt_value },
+  // Renamed TWICE, both times for the same class of misreading. It was "Of Which
+  // Booked Cost" (wrong once the charges moved onto the effective rail), then
+  // "Of Which PO/GRN Bill Value" — which turned actively wrong on 2026-09-11,
+  // when "Bill Value" became the RETIRED name of the Subtotal: the heading then
+  // read as a share of the Subtotal and invited subtracting it from one. It is,
+  // and always was, those bills' share of the GRAND TOTAL.
+  { key: 'po_receipt_value',    label: 'Of Which PO/GRN Grand Total (Rs)', numeric: true, value: r => r.po_receipt_value },
   { key: 'charges_note',        label: 'Charges Note',                        value: r => r.charges_note },
 ];
 
 /**
- * The one sentence that stops a partial charge column being read as a complete
- * one. Written per row, not once in a caption, because a reader filtering the
- * sheet to a single day would otherwise lose the caveat with the other rows.
+ * WHERE this row's charge figures were read from. Written per row, not once in
+ * a caption, because a reader filtering the sheet to a single day would
+ * otherwise lose the note with the other rows.
+ *
+ * It used to warn that the columns were PARTIAL. They are not, any more: the
+ * charges come off the GRN line, so a day holding a PO receipt totals its real
+ * tax. What the note now carries is provenance (and, if it ever happens, the
+ * count of mirror rows with no GRN line left to read) — in the SAME sentence
+ * /api/reports/purchases writes, from chargeNote() in purchase-charges.ts.
  */
-function dayChargesNote(poBills: number, poValue: number): string {
-  if (poBills <= 0) return '';
-  return `${poBills} of these came from a PO receipt / GRN — their tax and gross discount are recorded on the GRN, `
-    + `NOT on these cost rows, so the charge columns are PARTIAL and Rs ${poValue} of the total is BOOKED COST.`;
+function dayChargesNote(r: ChargeSourced, poBills: number, poValue: number): string {
+  const provenance = chargeNote(chargeShape(r));
+  if (!provenance) return '';
+  return poBills > 0
+    ? `${provenance}. ${poBills} of these groups came from a PO receipt / GRN, carrying Rs ${poValue} of the Grand Total.`
+    : provenance;
 }
 
 function dayToCsvRow(d: PurchaseBillDayRow): PurchaseBillDayCsvRow {
@@ -1247,6 +1697,7 @@ function dayToCsvRow(d: PurchaseBillDayRow): PurchaseBillDayCsvRow {
     spanning_bills: d.spanning_bills,
     lines: d.lines,
     goods: d.goods,
+    bill_value: d.bill_value,
     discount: d.discount,
     gst: d.gst,
     cgst: d.cgst,
@@ -1259,7 +1710,9 @@ function dayToCsvRow(d: PurchaseBillDayRow): PurchaseBillDayCsvRow {
     total_bill_value: d.total_bill_value,
     po_receipt_bills: d.po_receipt_bills,
     po_receipt_value: d.po_receipt_value,
-    charges_note: dayChargesNote(d.po_receipt_bills, d.po_receipt_value),
+    grn_sourced_rows: d.grn_sourced_rows,
+    unpaired_mirror_rows: d.unpaired_mirror_rows,
+    charges_note: dayChargesNote(d, d.po_receipt_bills, d.po_receipt_value),
   };
 }
 
@@ -1280,6 +1733,7 @@ function dayVendorToCsvRow(v: PurchaseBillDayVendorRow): PurchaseBillDayCsvRow {
     spanning_bills: '',
     lines: v.lines,
     goods: v.goods,
+    bill_value: v.bill_value,
     discount: v.discount,
     gst: v.gst,
     cgst: v.cgst,
@@ -1292,7 +1746,9 @@ function dayVendorToCsvRow(v: PurchaseBillDayVendorRow): PurchaseBillDayCsvRow {
     total_bill_value: v.total_bill_value,
     po_receipt_bills: v.po_receipt_bills,
     po_receipt_value: v.po_receipt_value,
-    charges_note: dayChargesNote(v.po_receipt_bills, v.po_receipt_value),
+    grn_sourced_rows: v.grn_sourced_rows,
+    unpaired_mirror_rows: v.unpaired_mirror_rows,
+    charges_note: dayChargesNote(v, v.po_receipt_bills, v.po_receipt_value),
   };
 }
 
