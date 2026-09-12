@@ -1,6 +1,7 @@
 import type Database from 'better-sqlite3';
 import { generateId, logAuditEvent } from './db';
 import { GrnRefused, logAuditOrThrow, r6 } from './grn-reversal';
+import { postCentralTxn, deptParty } from '@/lib/movement-record';
 
 /* ══════════════════════════════════════════════════════════════════════════
  * THE PO → REQUISITION FULFIL CASCADE, IN ONE PLACE.
@@ -104,10 +105,9 @@ export function fulfilRequisitionFromPo(
         UPDATE raw_materials SET current_stock = current_stock - ?, updated_at = datetime('now')
         WHERE id = ?
       `);
-      const insPartyTx = db.prepare(`
-        INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, outlet_id, created_at)
-        VALUES (?, ?, 'party_consumption', ?, ?, ?, ?, datetime('now'))
-      `);
+      // The raw INSERT that stood here is now postCentralTxn at the call site,
+      // so a party draw on central names the department it went to, the event's
+      // own date and the person whose action cascaded it.
       // The consumption belongs to the requisition's outlet (PO's as a
       // fallback); an unstamped row is backfilled to the DEFAULT outlet.
       const partyOutletId = reqRow.outlet_id || poOutletId || null;
@@ -142,7 +142,22 @@ export function fulfilRequisitionFromPo(
             ? rPack : 1;
         const issued = issuedReq * reqPackFactor;   // RECIPE units
         decStock.run(issued, it.material_id);
-        insPartyTx.run(generateId(), it.material_id, -issued, requisitionId, partyNote, partyOutletId);
+        // MOVEMENT RECORD: the party's draw on central. The destination was
+        // implicit in the type ('party_consumption'); it is now the requisition's
+        // own department when one is named, and the party sink otherwise.
+        postCentralTxn(db, {
+          materialId: it.material_id,
+          type: 'party_consumption',
+          quantity: -issued,
+          referenceId: requisitionId,
+          notes: partyNote,
+          outletId: partyOutletId,
+          counterparty: reqRow.department_id
+            ? deptParty(db, String(reqRow.department_id))
+            : { kind: 'consumption', name: partyNote },
+          txnDate: reqRow.event_date || undefined,
+          actor: actorEmail || 'system:po-requisition-fulfil',
+        });
         /* BOTH SIDES OF THIS MULTIPLICATION ARE ON THE RECIPE BASIS.
            LEFT  — `issued` is RECIPE units (ml/g): issuedReq is in the LINE's
                    own unit and reqPackFactor above lifted a purchase-unit

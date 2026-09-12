@@ -1,4 +1,11 @@
 import type Database from 'better-sqlite3';
+// THE MOVEMENT RECORD (owner's eight fields, 2026-09-10). postDeptLedger is the
+// ONE writer of department stock, so it is where fields 3/4/5/7/8 are filled for
+// the whole department rail. Semantics live in movement-record.ts.
+import {
+  movementCols, orient, deptParty, SYSTEM_ACTOR_PREFIX,
+  type MovementParty, type MovementPartyKind,
+} from './movement-record';
 
 /**
  * THE department stock rail. One table, one writer, one derivation.
@@ -169,25 +176,25 @@ function nowMs(): string {
 export const DEPT_TXN_TYPES = {
   /** Cutover count. Admin action, once per (department, material). The anchor
    *  every balance is measured from. Written only by /api/department-ledger/cutover. */
-  opening: { sign: '+', rail: 'cutover', doc: 'Cutover opening count' },
+  opening: { sign: '+', rail: 'cutover', doc: 'Cutover opening count', counterparty: 'opening' },
   /** Requisition issue from the central store. Positive, ALWAYS — a reversal is
    *  its own type below, never a negative 'issued'. */
-  issued: { sign: '+', rail: 'requisition', doc: 'Issued from central store' },
+  issued: { sign: '+', rail: 'requisition', doc: 'Issued from central store', counterparty: 'central' },
   /** Undo / store_reject of an issue: the goods go back to central. */
-  issue_reversal: { sign: '-', rail: 'requisition', doc: 'Issue reversed back to central' },
+  issue_reversal: { sign: '-', rail: 'requisition', doc: 'Issue reversed back to central', counterparty: 'central' },
   /** Recipe consumption at KOT complete / complimentary / non-chargeable. */
-  consumption: { sign: '-', rail: 'sales', doc: 'Recipe consumption at KOT completion' },
+  consumption: { sign: '-', rail: 'sales', doc: 'Recipe consumption at KOT completion', counterparty: 'consumption' },
   /** Spoilage the DEPARTMENT holds. Central spoilage keeps debiting central —
    *  wastages.department_id NULL means the store found it on its own shelf. */
-  wastage: { sign: '-', rail: 'wastage', doc: 'Spoilage written off by the department' },
+  wastage: { sign: '-', rail: 'wastage', doc: 'Spoilage written off by the department', counterparty: 'wastage' },
   /** Staff meal cooked from department stock. */
-  staff_meal: { sign: '-', rail: 'staff_meal', doc: 'Staff meal from department stock' },
+  staff_meal: { sign: '-', rail: 'staff_meal', doc: 'Staff meal from department stock', counterparty: 'staff_meal' },
   /** Party fulfilment transfer in. PARTY RAIL — owned by party-fulfillment.ts. */
-  received: { sign: '+', rail: 'party', doc: 'Party fulfilment transfer in' },
+  received: { sign: '+', rail: 'party', doc: 'Party fulfilment transfer in', counterparty: 'central' },
   /** Party post-event usage. PARTY RAIL. */
-  consumed: { sign: '-', rail: 'party', doc: 'Party post-event consumption' },
+  consumed: { sign: '-', rail: 'party', doc: 'Party post-event consumption', counterparty: 'consumption' },
   /** Party leftovers returned to the store. PARTY RAIL. */
-  returned: { sign: '-', rail: 'party', doc: 'Party leftovers returned to store' },
+  returned: { sign: '-', rail: 'party', doc: 'Party leftovers returned to store', counterparty: 'central' },
   /** A department sent goods back to the central store on an ACCEPTED return
    *  ticket (reqs 76/77). Written only by acceptInternalReturnLine() in
    *  src/lib/return-stock.ts, and only at Store Verify — never on raise, never
@@ -202,7 +209,7 @@ export const DEPT_TXN_TYPES = {
    *      what the requisition says was issued. A return is a NEW event: the
    *      issue stands, and some of it came back later.
    *  Do not collapse this into either of them. */
-  store_return: { sign: '-', rail: 'returns', doc: 'Returned from department to central store' },
+  store_return: { sign: '-', rail: 'returns', doc: 'Returned from department to central store', counterparty: 'central' },
   /** A vendor delivery routed STRAIGHT to the department under a
    *  direct_issue_rules row (Settings → Direct Issue) — central never held it.
    *  Written only by the receiving routes / QC sign-off via
@@ -221,17 +228,17 @@ export const DEPT_TXN_TYPES = {
    *  Every balance reader sums ALL types, so this row counts everywhere
    *  without further edits; only per-type report buckets file it under their
    *  catch-all. */
-  direct_receipt: { sign: '+', rail: 'purchase', doc: 'Vendor delivery routed directly to the department' },
+  direct_receipt: { sign: '+', rail: 'purchase', doc: 'Vendor delivery routed directly to the department', counterparty: 'vendor' },
   /** The undo of a direct_receipt — a GRN void or a downward bill amendment
    *  taking back goods that were booked straight into the department. NEVER a
    *  negative 'direct_receipt' (the sign contract above), and NOT
    *  'issue_reversal' (no issue happened) or 'store_return' (nothing physically
    *  moved to central — the receipt itself is being unwound). */
-  direct_receipt_reversal: { sign: '-', rail: 'purchase', doc: 'Direct vendor delivery voided or amended back out' },
+  direct_receipt_reversal: { sign: '-', rail: 'purchase', doc: 'Direct vendor delivery voided or amended back out', counterparty: 'vendor' },
   /** Signed correction: an approved department variance count, or the Unit Audit
    *  pack-factor rebase. Never rewrite a historical row to correct a balance —
    *  post one of these, so the reason stays on the record. */
-  adjustment: { sign: '±', rail: 'correction', doc: 'Approved correction / unit rebase' },
+  adjustment: { sign: '±', rail: 'correction', doc: 'Approved correction / unit rebase', counterparty: 'adjustment' },
 } as const;
 
 export type DeptTxnType = keyof typeof DEPT_TXN_TYPES;
@@ -304,9 +311,31 @@ export interface DeptLedgerPost {
   /** The route that wrote the row. Audit only. */
   source?: string;
   notes?: string;
+  /**
+   * FIELD 8 — the responsible user. The SESSION user's email, or a
+   * `system:<rail>` actor for a machine-initiated movement (the KOT-completion
+   * sweep runs on a timer and has no session; writing a person's name on it
+   * would be a lie). REFUSED IF BLANK — see the throw in postDeptLedger.
+   * Never a client-supplied name.
+   */
   user?: string;
   eventName?: string;
   eventDate?: string;
+  /**
+   * FIELDS 4 & 5 — THE COUNTERPARTY: the other end, the one that is not this
+   * department. Omit it and the type's own DEPT_TXN_TYPES.counterparty is used,
+   * which is correct for every writer in the tree today — an issue comes from
+   * central, a direct receipt from a vendor, a consumption goes to the guest.
+   * Pass one only when the type's default is not specific enough (e.g. a
+   * transfer between two departments, which no writer performs today).
+   */
+  counterparty?: MovementParty;
+  /**
+   * FIELD 7 — the BUSINESS date (YYYY-MM-DD, IST): when the movement happened,
+   * as distinct from when the row was written. Defaults to today. A count-driven
+   * correction should pass the COUNT's date, not the approval's.
+   */
+  txnDate?: string;
 }
 
 export interface DeptLedgerPostResult {
@@ -362,6 +391,33 @@ export function postDeptLedger(db: Database.Database, p: DeptLedgerPost): DeptLe
     );
   }
 
+  // ── FIELD 8 — the responsible user, ENFORCED (owner's movement record) ────
+  // Two writers used to leave this blank: the recipe-consumption rail (db.ts
+  // passed no user at all) and the sale-DELETE give-back (a hard-coded ''). A
+  // department ledger that cannot say who moved the goods is not a record.
+  // Machine-initiated movements say so with a `system:` actor — the KOT sweep
+  // runs on a timer with no session, and `system:kot-sweep` is a TRUE answer
+  // where '' is not one and a person's name would be a lie.
+  const actor = String(p.user || '').trim();
+  if (!actor) {
+    throw new Error(
+      `postDeptLedger: a responsible user is required (movement '${p.type}', dept ${deptId}, ` +
+      `material ${matId}). Pass the SESSION user's email (never a client-supplied name), ` +
+      `or '${SYSTEM_ACTOR_PREFIX}<rail>' for a machine-initiated movement.`,
+    );
+  }
+
+  // ── FIELDS 4 & 5 — both ends ─────────────────────────────────────────────
+  // This department is one end; the other comes from the type's own
+  // DEPT_TXN_TYPES.counterparty (an issue is from central, a direct receipt is
+  // from a vendor, a consumption goes to the guest), overridable per call.
+  // orient() picks which end is source and which is destination from the SIGN,
+  // which the sign contract above has already validated against the type — so
+  // an 'issued' row can only ever read "central → this department".
+  const counterparty: MovementParty =
+    p.counterparty || { kind: spec.counterparty as MovementPartyKind };
+  const ends = orient(deptParty(db, deptId), counterparty, qty);
+
   const outletId = p.outletId || null;
   const createdAt = nowMs();
 
@@ -396,7 +452,7 @@ export function postDeptLedger(db: Database.Database, p: DeptLedgerPost): DeptLe
   const vals: Array<string | number | null> = [
     newId(), outletId, deptId, matId, p.type, qty,
     cacheOnHand, p.referenceId || null, p.eventName || '', p.eventDate || '',
-    p.notes || '', p.user || '', createdAt,
+    p.notes || '', actor, createdAt,
   ];
   const addTrace = (col: string, v: string | null) => {
     if (cols.size === 0 || cols.has(col)) { names.push(col); vals.push(v); }
@@ -405,6 +461,21 @@ export function postDeptLedger(db: Database.Database, p: DeptLedgerPost): DeptLe
   addTrace('order_item_id', p.orderItemId || null);
   addTrace('station', p.station ? String(p.station).trim().toLowerCase() : null);
   addTrace('source', p.source || null);
+  // The movement record's own columns — unit snapshot, both ends, business
+  // date, immutable recorded_at. Appended, never replacing anything above;
+  // movementCols() adds nothing on a database that has not run the migration.
+  // NOTE `source` (just above) and `src_kind` (here) are DIFFERENT facts and
+  // must not be collapsed: `source` is which ROUTE wrote the row, src_kind is
+  // where the GOODS came from.
+  const mv = movementCols(db, 'department_material_transactions', {
+    materialId: matId, quantity: qty, src: ends.src, dst: ends.dst,
+    // A count-driven correction should carry the COUNT's date, and the party
+    // rail already records the event's date — both beat "today" as the business
+    // date when the caller has one.
+    txnDate: p.txnDate || p.eventDate || undefined,
+  });
+  names.push(...mv.names);
+  vals.push(...mv.values);
 
   db.prepare(
     `INSERT INTO department_material_transactions (${names.join(', ')}) VALUES (${names.map(() => '?').join(',')})`,

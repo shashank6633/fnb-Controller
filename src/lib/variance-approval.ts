@@ -51,6 +51,7 @@ import {
   getCentralStoreCutoverDate,
   getCentralStoreCutoverCommittedAt,
 } from '@/lib/central-cutover';
+import { postCentralTxn } from '@/lib/movement-record';
 
 export type VarianceSource = 'central' | 'liquor';
 
@@ -1805,14 +1806,24 @@ export function approveVariance(
       if (Math.abs(appliedDelta) > EPS) {
         db.prepare(`UPDATE raw_materials SET current_stock = ?, updated_at = datetime('now') WHERE id = ?`)
           .run(after, row.material_id);
-        db.prepare(`
-          INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, created_at)
-          VALUES (?, ?, 'adjustment', ?, ?, ?, datetime('now'))
-        `).run(
-          generateId(), row.material_id, appliedDelta, id,
-          `Approved variance ${row.date}: counted ${row.physical_stock} ${row.unit} against count-time system ` +
-          `${row.system_stock} (delta ${appliedDelta}); central ${before} → ${after}`,
-        );
+        // MOVEMENT RECORD: an approved variance is a correction against a
+        // PHYSICAL COUNT, so its counterparty is 'adjustment' — not a place.
+        // The gap table's finding was that the APPROVING REVIEWER appeared
+        // nowhere on this row (only in variance_approvals.reviewed_by); the
+        // actor is now on the movement itself. txn_date is the COUNT's date,
+        // not the approval's: the stock was wrong on the day it was counted.
+        postCentralTxn(db, {
+          materialId: row.material_id,
+          type: 'adjustment',
+          quantity: appliedDelta,
+          referenceId: id,
+          notes:
+            `Approved variance ${row.date}: counted ${row.physical_stock} ${row.unit} against count-time system ` +
+            `${row.system_stock} (delta ${appliedDelta}); central ${before} → ${after}`,
+          counterparty: { kind: 'adjustment', name: `Count ${row.date}` },
+          txnDate: row.date,
+          actor: norm(reviewer) || 'system:variance-approval',
+        });
       }
     }
     db.prepare(`

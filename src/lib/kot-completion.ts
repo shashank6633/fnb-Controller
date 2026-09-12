@@ -1,6 +1,5 @@
 import type Database from 'better-sqlite3';
 import { deductInventoryForSale } from './db';
-import { resolveFloorStore } from './store-engine';
 
 /**
  * KOT COMPLETION — the SERVED bump, its undo window, and the DEFERRED consume.
@@ -16,10 +15,11 @@ import { resolveFloorStore } from './store-engine';
  *   - the captain's per-ITEM "Complete" (orders/[id] complete_item) writes
  *     order_items.completed_at, has an UNLIMITED undo already
  *     (uncomplete_item), and moves no stock. Left alone by this change.
- *   - the KDS board's SERVED bump is the real completion: it used to deduct
- *     every recipe-linked ingredient across the central, department and
- *     (optionally) floor-store rails in one transaction, and that deduction is
- *     what makes the order un-voidable afterwards.
+ *   - the KDS board's SERVED bump is the real completion: it deducts every
+ *     recipe-linked ingredient in one transaction, and that deduction is what
+ *     makes the order un-voidable afterwards. It moves stock on the DEPARTMENT
+ *     rail only — the central and floor-store rails it once touched are both
+ *     gone (deduct-at-issue, then the floor auto-deduct removal of 2026-09-10).
  * This file is about SERVED.
  *
  * WHY DEFER AND NOT REVERSE. src/app/api/dine-in/orders/[id]/void/route.ts
@@ -205,7 +205,18 @@ export interface ConsumeResult {
  * movement have to commit or roll back together, which is what keeps STOCK
  * MOVES EXACTLY ONCE true.
  */
-export function applyKotConsumption(db: Database.Database, kotId: string): ConsumeResult {
+export function applyKotConsumption(
+  db: Database.Database,
+  kotId: string,
+  /**
+   * FIELD 8 of the movement record — the responsible user. A KDS bump has a
+   * session and passes the signed-in user's email; the DEFERRED SWEEP
+   * (commitDueKotConsumption, fired by a timer) has none, and says so with
+   * 'system:kot-sweep'. That is a true answer; a blank was not, and a
+   * borrowed person's name would be worse than either.
+   */
+  actor = 'system:kot-sweep',
+): ConsumeResult {
   const out: ConsumeResult = { deducted: 0, failed: 0, skipped: '' };
   const kot = db.prepare('SELECT id, order_id FROM kots WHERE id = ?').get(kotId) as any;
   if (!kot) { out.skipped = 'kot_not_found'; return out; }
@@ -226,17 +237,14 @@ export function applyKotConsumption(db: Database.Database, kotId: string): Consu
   `).all(kotId) as any[];
   if (!cook.length) { out.skipped = 'no_pending_lines'; return out; }
 
-  // FAIL-SAFE floor routing: map this order's table zone → floor bar store once.
-  // Any failure (or an unmapped zone) → undefined → central deduct.
-  // deductInventoryForSale still gates the store path on tm_floor_autodeduct.
-  let floorStoreId: string | undefined;
-  try {
-    floorStoreId = resolveFloorStore(db, order.zone) || undefined;
-  } catch (e) {
-    console.error('[kot-completion floor-resolve]', kot.order_id, e);
-    floorStoreId = undefined;
-  }
-
+  // NO FLOOR STORE IS RESOLVED HERE ANY MORE (owner ruling, 2026-09-10).
+  // This block used to map order.zone → floor bar store and hand it to
+  // deductInventoryForSale, which posted the pour as an OUTWARD row on that
+  // store's ledger. A KOT completion may not move stock at store level — the
+  // consumption goes to the DEPARTMENT that cooked the line, or nowhere with a
+  // recorded skip. The floor's own number is measured by counting
+  // (/inventory/reconciliation). Do not reinstate the resolve "for attribution":
+  // nothing downstream consumes it, and the wire is how the rail came back.
   const stamp = db.prepare("UPDATE order_items SET recipe_deducted_at = datetime('now') WHERE id = ?");
   for (const it of cook) {
     try {
@@ -253,7 +261,14 @@ export function applyKotConsumption(db: Database.Database, kotId: string): Consu
       // NOT add a fallback department here.
       deductInventoryForSale(
         db, it.recipe_id, it.quantity, it.id, order.bill_type || 'normal',
-        { storeId: floorStoreId, station: it.station },
+        // orderItemId IS PASSED — it was not, and that left order_item_id NULL
+        // on 100% of department consumption rows and 100% of consumption_skips,
+        // on the one rail where the question "which sold line caused this?" is
+        // asked most. saleId already carries order_items.id into reference_id,
+        // so the fact was in the row by accident; every reader had to know that
+        // coincidence to use it, and the column built to hold it stayed empty.
+        // Both are now populated, and they agree.
+        { station: it.station, orderItemId: it.id, actor },
       );
       stamp.run(it.id);   // stamp only on success → settle backstops any that threw
       out.deducted++;

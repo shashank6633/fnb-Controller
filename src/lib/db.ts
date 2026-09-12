@@ -7,10 +7,19 @@ import path from 'path';
 // shapes: resolveStationDepartment returns a RESOLUTION OBJECT, not an id, and
 // reading it as an id would post "[object Object]" into a stock ledger.
 import { resolveStationDepartment, postDeptLedger, recordConsumptionSkip } from './dept-ledger';
+// THE MOVEMENT RECORD (owner's eight fields, 2026-09-10) — the central-rail
+// choke point. movement-record.ts imports nothing from here, so this is a leaf
+// dependency and not the db.ts ↔ store-engine cycle documented further down.
+import { postCentralTxn, deptParty, type MovementParty } from './movement-record';
 // Which price a recipe is costed against. Safe to import STATICALLY: recipe-price
 // imports nothing from here (only `import type Database`), so it is a leaf and
 // there is no cycle.
 import { resolveRecipePrice } from './recipe-price';
+// THE one ingredient-cost formula, shared with the quick-recipe entry screen so a
+// previewed cost and a stored cost can never be two different calculations. Safe
+// to import STATICALLY: recipe-cost imports only './units', which imports nothing
+// at all, so both are leaves and neither can close a cycle back into db.ts.
+import { convertForCosting, ingredientLineCost } from './recipe-cost';
 
 const DB_PATH = path.join(process.cwd(), 'fnb-controller.db');
 
@@ -1045,6 +1054,25 @@ function initializeSchema(db: Database.Database) {
     // METHOD + a photo. Additive; does NOT affect recalculateRecipeCost.
     if (!has('instructions')) db.exec(`ALTER TABLE recipes ADD COLUMN instructions TEXT DEFAULT ''`);
     if (!has('image_url'))    db.exec(`ALTER TABLE recipes ADD COLUMN image_url TEXT DEFAULT ''`);
+    // APPROXIMATE RECIPES. A recipe can now be entered in under a minute — the
+    // few major cost-driving materials, a rough quantity each, no method and no
+    // yield — so a dish that costed ₹0 for want of a recipe gets a real, roughly
+    // right number instead. That number is useful only if it is never mistaken
+    // for an exact one: an approximate cost presented as exact WILL be used in a
+    // pricing decision. So the flag is a STORED COLUMN, set by the person who
+    // entered it, never inferred.
+    //
+    // It is deliberately not derived from ingredient count. On this data a
+    // finished 3-ingredient dish and a skeletal 3-ingredient stub look identical
+    // — Truffle Malai Broccoli (3 ingredients, FC 3.3%) is complete. Any
+    // threshold either libels finished recipes or lets stubs through, and a
+    // wrong "approximate" badge is as corrosive as a missing one because it
+    // teaches the owner to discount numbers that are in fact correct. Only the
+    // person entering it knows, so only they set it.
+    //
+    // Defaults to 0: every one of the 67 existing recipes stays exact, which is
+    // what they are. Nothing is back-filled and no boot seed writes this column.
+    if (!has('is_approximate')) db.exec(`ALTER TABLE recipes ADD COLUMN is_approximate INTEGER NOT NULL DEFAULT 0`);
   } catch (e) { console.error('recipes yield migration failed:', e); }
 
   // Migration: ct_specials gains a `category` (special|offer|notice|event|vip) so
@@ -1486,6 +1514,51 @@ function initializeSchema(db: Database.Database) {
     //    belongs to exactly one area; several sub-departments can share an area
     //    (e.g. Hot Kitchen + Cold Kitchen + Pastry all roll up to 'kitchen').
     if (!dCols.some((c:any)=>c.name==='area')) db.exec(`ALTER TABLE departments ADD COLUMN area TEXT DEFAULT ''`);
+    // ── RECIPE DEDUCTION PER DEPARTMENT (2026-09-11) ─────────────────────────
+    //   1 = a sale's recipe takes stock off this department at KOT-complete.
+    //   0 = this department's usage is recorded through GOODS MOVEMENT only
+    //       (issues / transfers / returns / counts); the sale records a
+    //       consumption_skip with reason 'recipe_deduction_disabled' instead.
+    //   2 = FOLLOW THE TILL — nobody has decided, so deduct exactly when a
+    //       station routes here. See DEPT_RECIPE_DEDUCTION_AUTO below.
+    // DEFAULT 1 reproduces today's behaviour exactly for every existing row, so
+    // this ALTER alone changes nothing. The deliberate 0s and 2s are written by
+    // the guarded seed and the switch in src/app/api/departments/route.ts,
+    // derived from station_departments — never from a hardcoded list of names.
+    // Full contract: the DEPT_RECIPE_DEDUCTION_KEY block above deductInventoryForSale.
+    //
+    // THE SECOND HALF OF THIS LINE IS THE HAND-OVER FROM THE SIDECAR, and it runs
+    // in the same breath as the ALTER for a reason: the column becomes
+    // AUTHORITATIVE the instant it exists (that is what shuts the generic
+    // settings endpoint out of this switch), so any decision that lived only in
+    // settings['department_recipe_deduction_v1'] — written while this column was
+    // missing — has to be in the column BEFORE the first sale reads it. Doing it
+    // here, inside the same `if`, means it happens exactly once, at creation, with
+    // no flag to guard and no window where a sale could read a DEFAULT 1 over an
+    // owner's deliberate 0. Wrapped in try/catch: a database with no settings
+    // table has no sidecar to hand over, and that must not abort the migration.
+    // NO SIDECAR HAND-OVER HERE. A hand-over stood on this line and was REMOVED
+    // (2026-09-12) after it was proven to be an attack, not a migration.
+    //
+    // It read settings['department_recipe_deduction_v1'] and copied it verbatim
+    // into this column. That settings key is writable through the GENERIC
+    // PUT /api/settings, whose floor is admin-OR-MANAGER — so a manager could
+    // store {every department: 0} on a database that has no column yet, where it
+    // sat looking inert, and the FIRST BOOT of the code that adds the column
+    // promoted it to authoritative. Measured on a copy of the owner's real
+    // database: "carried 29 decision(s) over from the settings sidecar", all 29
+    // departments 0, then a real KOT-complete booked 0 department rows and one
+    // `recipe_deduction_disabled` skip. Recipe deduction stops restaurant-wide on
+    // the first sale after deploy, and the screen shows it as the owner's own
+    // choice.
+    //
+    // It also rescued nothing: this database holds ZERO such settings rows, and
+    // the column's own DEFAULT 1 plus the AUTO seed in
+    // src/app/api/departments/route.ts already produce the right answer for every
+    // department. So the hand-over could only ever import someone else's row.
+    // The key is now refused outright by the generic endpoint (KEY_POLICY owner,
+    // src/app/api/settings/route.ts) — belt and braces. Do not re-add this.
+    if (!dCols.some((c:any)=>c.name==='recipe_deduction_enabled')) { db.exec(`ALTER TABLE departments ADD COLUMN recipe_deduction_enabled INTEGER NOT NULL DEFAULT 1`); }
     // One-time seed, guarded by a settings flag so admin edits are never clobbered.
     const deptHierSeeded = db.prepare("SELECT value FROM settings WHERE key = 'dept_hierarchy_v1'").get() as { value?: string } | undefined;
     if (!deptHierSeeded) {
@@ -5129,6 +5202,94 @@ function initializeSchema(db: Database.Database) {
     }
   } catch (e) { console.error('store_bill_charges schema failed:', e); }
 
+  // ── THE MOVEMENT RECORD — the owner's eight fields on all three rails ──────
+  // OWNER'S REQUIREMENT (2026-09-10): every store-level movement is a separate
+  // transaction identifying item, quantity, UNIT OF MEASURE, SOURCE location,
+  // DESTINATION location, MOVEMENT TYPE, transaction date and RESPONSIBLE USER.
+  //
+  // Three tables carry stock movements and none of them carried all eight:
+  //   store_stock_ledger              had no unit, no destination, no business
+  //                                   date (created_at is REWRITTEN by the four
+  //                                   backdating writers), and a blank actor on
+  //                                   the sale-driven rail (removed 2026-09-10).
+  //   department_material_transactions had no unit, no counterparty, no business
+  //                                   date, and two writers that bypass
+  //                                   postDeptLedger and leave `user` blank.
+  //   inventory_transactions          had no unit, no source, no destination, no
+  //                                   business date and NO ACTOR COLUMN AT ALL,
+  //                                   across 34 raw INSERT sites.
+  //
+  // Semantics of every column here live in ONE place — src/lib/movement-record.ts.
+  // Read that header before changing anything below; in particular why `uom`
+  // stores the RECIPE unit (it is the unit `quantity` is in) and why the unit,
+  // the pack size and both location NAMES are SNAPSHOT rather than joined.
+  //
+  // PURELY ADDITIVE, AND THAT IS LOAD-BEARING:
+  //   · every column is added by ALTER with a DEFAULT ('' or 0), so every row
+  //     written before today reads back with blank movement fields and its
+  //     original columns byte-for-byte unchanged;
+  //   · no existing column is renamed, retyped, dropped or backfilled —
+  //     created_at in particular keeps its deployed value and its deployed
+  //     meaning, because the balance arithmetic orders and windows on it;
+  //   · every deployed reader SELECTs named columns, so none of them sees a new
+  //     column at all. A `SELECT *` reader gets extra keys and ignores them.
+  //   · pack_size 0 means NOT SNAPSHOT (a pre-change row), never "a pack of
+  //     zero" — readers fall back to the live material exactly as they do today.
+  //
+  // NO BACKFILL, DELIBERATELY. Guessing a source, a destination or an actor for
+  // a historical row and writing it into the record would make the record say
+  // something nobody can vouch for. A blank field on an old row is the truth:
+  // it was not captured. History is untouched (hard rule 7).
+  try {
+    const MOVEMENT_COLS: Array<[string, string]> = [
+      // FIELD 3 — unit of measure, snapshot. See movement-record.ts.
+      ['uom',          "TEXT NOT NULL DEFAULT ''"],   // RECIPE unit: what `quantity` IS
+      ['purchase_uom', "TEXT NOT NULL DEFAULT ''"],   // purchase unit the same qty converts to
+      ['pack_size',    'REAL NOT NULL DEFAULT 0'],    // recipe units per purchase unit; 0 = unknown
+      // FIELDS 4 & 5 — the two ends, each a typed triple (kind / id / snapshot name)
+      ['src_kind',     "TEXT NOT NULL DEFAULT ''"],
+      ['src_id',       "TEXT NOT NULL DEFAULT ''"],
+      ['src_name',     "TEXT NOT NULL DEFAULT ''"],
+      ['dst_kind',     "TEXT NOT NULL DEFAULT ''"],
+      ['dst_id',       "TEXT NOT NULL DEFAULT ''"],
+      ['dst_name',     "TEXT NOT NULL DEFAULT ''"],
+      // FIELD 7 — the business date, and the recording moment the backdaters destroy
+      ['txn_date',     "TEXT NOT NULL DEFAULT ''"],   // YYYY-MM-DD (IST): when it HAPPENED
+      ['recorded_at',  "TEXT NOT NULL DEFAULT ''"],   // immutable: when it was WRITTEN
+    ];
+    const addCols = (table: string, cols: Array<[string, string]>) => {
+      const have = new Set(
+        (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map(c => String(c.name)),
+      );
+      // An empty PRAGMA means the table does not exist on this database yet.
+      // Do NOT ALTER into the void — the CREATE that owns it runs elsewhere in
+      // initDb and this block runs again on the next boot.
+      if (have.size === 0) return;
+      for (const [name, decl] of cols) {
+        if (!have.has(name)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${decl}`);
+      }
+    };
+
+    addCols('store_stock_ledger', MOVEMENT_COLS);
+    addCols('department_material_transactions', MOVEMENT_COLS);
+    // FIELD 8 on the central rail: inventory_transactions is the one table with
+    // no actor column of any kind. `created_by` matches store_stock_ledger's
+    // spelling (its nearest sibling); the department rail's column is `user`,
+    // and the movements register normalises all three at read.
+    addCols('inventory_transactions', [...MOVEMENT_COLS, ['created_by', "TEXT NOT NULL DEFAULT ''"]]);
+
+    // Indexes for the movements register (/inventory/movements), which filters
+    // by business date and by either end of the movement. Partial on <> '' so
+    // they cost nothing for the pre-change rows, which are all blank.
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_ssl_txn_date  ON store_stock_ledger(txn_date)              WHERE txn_date <> '';
+      CREATE INDEX IF NOT EXISTS idx_dmt_txn_date  ON department_material_transactions(txn_date) WHERE txn_date <> '';
+      CREATE INDEX IF NOT EXISTS idx_it_txn_date   ON inventory_transactions(txn_date)           WHERE txn_date <> '';
+      CREATE INDEX IF NOT EXISTS idx_ssl_src_dst   ON store_stock_ledger(src_id, dst_id)         WHERE src_id <> '' OR dst_id <> '';
+      CREATE INDEX IF NOT EXISTS idx_it_src_dst    ON inventory_transactions(src_id, dst_id)     WHERE src_id <> '' OR dst_id <> '';
+    `);
+  } catch (e) { console.error('movement-record schema failed:', e); }
+
   // ── Party Menu (manager-enabled LIMITED menu for selected tables, additive) ─
   // A curated subset of à-la-carte items shown ONLY on specific tables' QR menu
   // while ENABLED (e.g. a 10–20 pax party the host wants without costly liquor).
@@ -5182,11 +5343,10 @@ function initializeSchema(db: Database.Database) {
   //      row may ALSO post an 'adjustment' ledger row (handled by its API), but
   //      this table itself moves no stock. Feeds the reconciliation report as a
   //      legit non-sale reduction.
-  //   3. tm_floor_autodeduct setting — the FAIL-SAFE OPT-IN master switch for
-  //      routing a dine-in sale's liquor deduction to the floor store ledger
-  //      instead of central raw_materials.current_stock. Default "0" = OFF =
-  //      today's exact behaviour (deductInventoryForSale ignores floor routing
-  //      unless the setting is "1" AND a caller passes opts.storeId).
+  //   3. tm_floor_autodeduct setting — RETIRED 2026-09-10, see the block below.
+  //      It was the opt-in master switch for routing a dine-in sale's liquor
+  //      deduction onto the floor store ledger. The rail it switched no longer
+  //      exists; the key survives only as a historical marker.
   try {
     const slCols = db.prepare("PRAGMA table_info(store_locations)").all() as any[];
     if (!slCols.some((c: any) => c.name === 'floor_label')) {
@@ -5211,9 +5371,50 @@ function initializeSchema(db: Database.Database) {
       CREATE INDEX IF NOT EXISTS idx_bar_empties_material   ON bar_empties(material_id);
     `);
 
-    // Fail-safe master switch — OFF by default so nothing changes until an admin
-    // opts in. OR IGNORE never clobbers an admin's chosen value on redeploy.
-    db.exec(`INSERT OR IGNORE INTO settings (key, value) VALUES ('tm_floor_autodeduct', '0')`);
+    // ── tm_floor_autodeduct — RETIRED, OWNER RULING 2026-09-10 ──────────────
+    // This key used to arm the floor auto-deduct: with it at '1', a dine-in sale
+    // posted an OUTWARD store_stock_ledger row on the floor bar store. The owner
+    // ruled that a sale, a KOT completion or a recipe explosion must NEVER move
+    // stock at store level — consumption belongs to the department rail, and a
+    // floor's usage is MEASURED by counting (opening + transfers in − closing,
+    // /inventory/reconciliation), not inferred from the till.
+    //
+    // deductInventoryForSale no longer reads this key at all, so the value can
+    // no longer move stock. It is normalised to '0' ONCE, for one reason only:
+    // store-engine's floorReconciliation() still picks its ACTUAL source off it
+    // ('1' ⇒ ledger mode = sum the floor's outward sale rows). With the writer
+    // gone, ledger mode would read ACTUAL 0 and report every single pour as
+    // unexplained variance. Physical mode is the honest reading, and this is
+    // what pins the report to it.
+    //
+    // ONE-SHOT (tm_floor_autodeduct_retired_v1), never a per-boot rewrite, and
+    // the prior value is preserved in tm_floor_autodeduct_was rather than
+    // destroyed — a site that HAD it on can still see that it did, and can pair
+    // that with the historical 'Floor auto-deduct (sale …)' ledger rows, which
+    // this change deliberately leaves untouched.
+    //
+    // The key is also refused by PUT/POST /api/settings (KEY_POLICY 'retired'),
+    // so nobody can arm a switch whose rail was deleted.
+    const fadRetired = db.prepare(
+      "SELECT value FROM settings WHERE key = 'tm_floor_autodeduct_retired_v1'",
+    ).get() as { value?: string } | undefined;
+    if (!fadRetired) {
+      const prevFad = db.prepare(
+        "SELECT value FROM settings WHERE key = 'tm_floor_autodeduct'",
+      ).get() as { value?: string } | undefined;
+      const wasFad = String(prevFad?.value ?? '0').trim() || '0';
+      const putSetting = db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)');
+      putSetting.run('tm_floor_autodeduct_was', wasFad);
+      putSetting.run('tm_floor_autodeduct', '0');
+      putSetting.run('tm_floor_autodeduct_retired_v1', '2026-09-10');
+      if (wasFad === '1') {
+        console.warn(
+          '[boot] tm_floor_autodeduct was ON and has been RETIRED to 0 (owner ruling 2026-09-10). ' +
+          'Sales no longer move floor stock; the floor reconciliation now reads physical counts. ' +
+          'Existing "Floor auto-deduct" ledger rows are left untouched — prior value kept in tm_floor_autodeduct_was.',
+        );
+      }
+    }
   } catch (e) { console.error('multi-floor bar phase 2/3 schema failed:', e); }
 
   // ── Config-audit fingerprint (evidence instrumentation, 2026-07-13) ────────
@@ -8028,20 +8229,13 @@ export function convertToMaterialUnit(
    *  takes precedence over the name-regex extraction in parseMaterialVolumeMl. */
   packSize?: number | null,
 ): number {
-  const r = (recipeUnit || materialUnit || '').toLowerCase().trim();
-  const m = (materialUnit || '').toLowerCase().trim();
-  if (!r || r === m) return qty;
-  // Delegate to the central units library which knows about all volume/weight/count
-  // dimensions and bridges across them via pack_size. Unknown unit pairs return null
-  // → we fall back to the original qty so callers don't crash.
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const { convert } = require('./units') as typeof import('./units');
-  const result = convert(qty, r, m, {
-    recipe_unit: m,
-    pack_size: packSize ?? undefined,
-    name: materialName,
-  });
-  return result == null ? qty : result;
+  // Delegates to src/lib/recipe-cost.ts, which holds this conversion once so the
+  // quick-recipe entry screen can preview the SAME number this function feeds to
+  // recalculateRecipeCost. Numerically unchanged — convertForCosting is this
+  // function's old body, and it additionally reports whether the conversion
+  // actually succeeded (see ConvertedQty.convertible). Every existing caller's
+  // behaviour, fall-through included, is identical.
+  return convertForCosting(qty, recipeUnit, materialUnit, materialName, packSize).qty;
 }
 
 
@@ -8144,10 +8338,12 @@ export function recalculateRecipeCost(db: Database.Database, recipeId: string): 
 
   let totalCost = 0;
   for (const ing of ingredients) {
-    // Convert recipe-declared qty into material-stock-unit qty so cost math is correct
-    const qtyInMatUnit = convertToMaterialUnit(ing.quantity, ing.unit, ing.material_unit, ing.material_name, ing.material_pack_size);
-    const effectiveQty = qtyInMatUnit * (1 + ing.wastage_percent / 100) / (ing.yield_percent / 100);
-    totalCost += effectiveQty * ing.average_price;
+    // Convert recipe-declared qty into material-stock-unit qty so cost math is
+    // correct, then apply wastage and yield. The arithmetic lives in
+    // src/lib/recipe-cost.ts — one copy, so the cost the quick-recipe screen
+    // previews before saving is computed by this exact function rather than a
+    // re-typed lookalike that would drift from it.
+    totalCost += ingredientLineCost(ing).line_cost;
   }
 
   // Cost from sub-recipes
@@ -8401,33 +8597,405 @@ export function updateMaterialPrice(db: Database.Database, materialId: string): 
 // read, so their numbers are bit-identical through the cutover. See the warning
 // repeated at the two INSERT sites below.
 //
-// FAIL-SAFE OPT-IN FLOOR ROUTING (Multi-floor bar, Phase 2/3):
-// `opts.storeId` is passed ONLY by the two dine-in call sites (KDS bump + settle
-// backstop), resolved from the order → table.zone → floor store. The other three
-// call sites (/api/sales, /api/sales-import, /api/seed) pass nothing → unchanged.
-// For each ingredient, IF the setting tm_floor_autodeduct == "1" AND opts.storeId
-// is set AND the material is store-held (owned by a store via its category OR
-// already has a ledger row in that floor store), the deduction is posted as an
-// OUTWARD store_stock_ledger row on opts.storeId INSTEAD of decrementing central
-// raw_materials.current_stock. On ANY error the code FALLS BACK to the central
-// UPDATE (a sale must never fail because of floor routing). Setting OFF (default)
-// or no storeId => byte-identical to the original behaviour. The
-// inventory_transactions audit row is ALWAYS written, on either path.
+// ─────────────────────────────────────────────────────────────────────────────
+// A SALE NEVER MOVES STORE STOCK — OWNER RULING, 2026-09-10.
+// REMOVED ON PURPOSE. THIS IS NOT A MISSING FEATURE.
+//
+// This function used to carry a FOURTH rail ahead of the three below: an opt-in
+// "floor auto-deduct" that posted an OUTWARD store_stock_ledger row against the
+// sale's floor bar store (resolved order → table.zone → floor store) whenever
+// settings.tm_floor_autodeduct was "1". It is gone. So is `opts.storeId`, and so
+// is the floor-store resolution in all three dine-in callers.
+//
+//   THE RULE: a sale, a KOT completion or a recipe explosion must NEVER change
+//   stock at STORE level. Consumption belongs to the DEPARTMENT rail. Where no
+//   department can be named, NOTHING moves and a skip is recorded.
+//
+//   WHY: a store ledger is a RECEIVING/ISSUING record — purchase, transfer,
+//   adjustment, opening — every row a physical hand-over somebody signed for. A
+//   pour predicted from a till receipt is not a hand-over. Posting one drops the
+//   floor's book by a quantity nobody moved, and the physical count that would
+//   have caught the leak then reconciles against a figure the sale has already
+//   "explained" — the variance disappears into the very rail built to expose it.
+//   A floor's usage is MEASURED (opening + transfers in − closing), never
+//   inferred from sales. That measurement is /inventory/reconciliation
+//   (store-engine floorReconciliation, mode 'physical').
+//
+//   THE SETTING: tm_floor_autodeduct is RETIRED — normalised to '0' once in the
+//   boot block (search tm_floor_autodeduct_retired_v1), refused by
+//   /api/settings, and kept only as a historical marker. NOTHING here reads it
+//   any more, so flipping it can no longer move floor stock. Do not re-read it.
+//
+//   HISTORY IS UNTOUCHED: any 'Floor auto-deduct (sale …)' rows already sitting
+//   in store_stock_ledger stay exactly as they are — they are what the book
+//   recorded at the time. This change mutates, relabels and deletes nothing.
+//
+// If you are here to "restore floor deduction so the bar's stock updates live":
+// that is the ruling being reversed, not a bug being fixed. The floor number is
+// meant to be as fresh as its last count, and the reconciliation report is where
+// the pour is compared with it.
+//
+// The inventory_transactions audit row is STILL ALWAYS written, on every branch.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/* ══════════════════════════════════════════════════════════════════════════════
+ * RECIPE DEDUCTION, SWITCHED PER DEPARTMENT — the owner's law, made settable
+ * ══════════════════════════════════════════════════════════════════════════════
+ *
+ * "Recipe consumption should be happening at Department level where final items
+ *  are manufactured or put together for menu item." Not every department does
+ * that. Housekeeping, Valet, Stationery, Security and the store-side departments
+ * consume real goods, but they consume them by ISSUE, RETURN and COUNT — goods
+ * movement — never by a dish being sold. This switch says which is which.
+ *
+ * OFF does NOT mean "stop recording". It means "this department's usage is
+ * recorded through goods movement, not from recipes", and every line it declines
+ * still writes a consumption_skip carrying the reason
+ * 'recipe_deduction_disabled' — see the gate in applyDeduct.
+ *
+ * ── THREE VALUES, NOT TWO. THE THIRD IS THE ONE THAT MATTERS ────────────────
+ *
+ *   1  DEDUCT          — the owner said yes.
+ *   0  GOODS MOVEMENT  — the owner said no.
+ *   2  FOLLOW THE TILL — nobody has said anything, so deduct exactly when a
+ *                        station routes here, and stop when none does.
+ *
+ * 2 EXISTS BECAUSE A STORED 0 IS A LANDMINE. The first cut of this feature
+ * seeded a hard 0 against every department no station reached, on the argument
+ * that an unreachable department cannot deduct anyway, so writing 0 changes
+ * nothing. That is true at the instant of the seed and false the moment the
+ * station map moves. MEASURED, by driving the real consumption path on a
+ * snapshot of the live database: seed today's map, then re-point the stations at
+ * the "Akan …" departments (the mapping the hand-over brief documents as
+ * production) and department debits go 24 → 0 — every kitchen in the building
+ * silently stops deducting, on a decision the owner never made, because a
+ * one-shot seed had frozen a mapping that later changed underneath it.
+ *
+ * With 2, a department only ever stops deducting because a HUMAN switched it
+ * off. Re-point a station and the department it now feeds deducts on the next
+ * sale, with no screen to visit and no seed to re-run. An explicit 0 or 1 is
+ * STICKY and never re-derived — that half of the original guard was right and is
+ * kept.
+ *
+ * ── WHICH RAIL WINS ──────────────────────────────────────────────────────────
+ *   RAIL A  departments.recipe_deduction_enabled  INTEGER NOT NULL DEFAULT 1
+ *   RAIL B  settings['department_recipe_deduction_v1'] — ONE row, a JSON object
+ *           { "<department id>": 1 | 0 | 2 }
+ *
+ * THE COLUMN IS AUTHORITATIVE WHENEVER IT EXISTS. The sidecar is read ONLY on a
+ * database that has no column, and is written alongside the column so that such
+ * a database still has a record to hand over later. This replaced an AND merge
+ * (OFF wins on either rail), and the reason is security, not tidiness:
+ * settings rows are writable through the GENERIC PUT /api/settings, whose floor
+ * is admin-OR-MANAGER, while this switch is admin-only at its own door. MEASURED:
+ * a manager, refused 403 by PATCH /api/departments, wrote the sidecar through
+ * /api/settings and switched off all 7 till-fed departments in one request — and
+ * under an AND merge the column still saying 1 could not overrule it. Reading the
+ * column first makes that write inert on every database the migration has
+ * reached. (The generic endpoint should ALSO refuse the key outright — see the
+ * blocker note in the departments route; that file belongs to another lane.)
+ *
+ * NOTHING IS LOST WHEN THE COLUMN ARRIVES. The migration that creates the column
+ * carries every sidecar decision into it in the same statement (db.ts, the
+ * `recipe_deduction_enabled` ALTER), so a decision written while the column was
+ * missing survives the column's arrival — which is exactly what the old AND
+ * merge existed to protect, achieved once at migration time instead of on every
+ * read, for ever.
+ *
+ * An object, not an array of enabled ids, because unlike is_approximate the OFF
+ * state has to be REPRESENTABLE, and "absent" still means "never decided".
+ *
+ * THE DEFAULT IS ENABLED, everywhere, on every failure: missing key, missing
+ * row, unparseable JSON, missing settings table, missing column, a throw. The
+ * value that reproduces pre-feature behaviour is the only safe fallback on a
+ * path that runs while food is going out.
+ *
+ * The writer and the seed live in src/app/api/departments/route.ts — this rail
+ * READS ONLY. A write from here would run on the KOT-completion path, inside the
+ * caller's transaction, which is the collapse mode the store-engine note above
+ * already warns about.
+ * ─────────────────────────────────────────────────────────────────────────── */
+export const DEPT_RECIPE_DEDUCTION_KEY = 'department_recipe_deduction_v1';
+/** Guard key for the ORIGINAL seed (hard 0/1, frozen at first GET). Retained
+ *  only so the seed below can recognise a database that ran it and tell that
+ *  seed's defaults apart from the owner's own edits. Nothing writes it now. */
+export const DEPT_RECIPE_DEDUCTION_SEED_KEY = 'department_recipe_deduction_seed_v1';
+/** Guard key for the seed that marks never-decided departments "follow the
+ *  till". Runs once; an explicit decision is never re-derived. */
+export const DEPT_RECIPE_DEDUCTION_AUTO_KEY = 'department_recipe_deduction_auto_v1';
+/** The column both rails are named for, so the wire shape never has to change. */
+export const DEPT_RECIPE_DEDUCTION_COLUMN = 'recipe_deduction_enabled';
+/** "Follow the till": deduct iff a station routes here. Never shown to anyone —
+ *  every screen and every report sees it already resolved to a plain on/off. */
+export const DEPT_RECIPE_DEDUCTION_AUTO = 2;
+
+/**
+ * IS THE `departments.recipe_deduction_enabled` COLUMN THERE?
+ *
+ * A "yes" is cached forever (the migration runs inside getDb(), so it cannot
+ * un-happen mid-process); a "no" is re-asked every call, because a PRAGMA is
+ * free and the first request after the migration ships must be correct without
+ * a restart. Caches the SCHEMA SHAPE, never the value.
+ */
+let deptDeductColumnSeen = false;
+export function departmentsHaveRecipeDeductionColumn(db: Database.Database): boolean {
+  if (deptDeductColumnSeen) return true;
+  try {
+    const cols = db.prepare('PRAGMA table_info(departments)').all() as Array<{ name?: string }>;
+    deptDeductColumnSeen = cols.some((c) => c.name === DEPT_RECIPE_DEDUCTION_COLUMN);
+  } catch {
+    deptDeductColumnSeen = false;
+  }
+  return deptDeductColumnSeen;
+}
+
+/** Is there anywhere at all to store this decision? Either rail will do. */
+export function canStoreRecipeDeductionFlag(db: Database.Database): boolean {
+  if (departmentsHaveRecipeDeductionColumn(db)) return true;
+  try {
+    return !!db.prepare(
+      `SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'settings'`).get();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * RAIL B, read. A malformed row must never cost a kitchen its deduction, so
+ * every failure returns {} — "nobody has decided anything", which reads as
+ * enabled everywhere.
+ */
+export function departmentRecipeDeductionSidecar(db: Database.Database): Record<string, 0 | 1 | 2> {
+  try {
+    const row = db.prepare('SELECT value FROM settings WHERE key = ?')
+      .get(DEPT_RECIPE_DEDUCTION_KEY) as { value?: string } | undefined;
+    if (!row?.value) return {};
+    const parsed = JSON.parse(row.value);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    const out: Record<string, 0 | 1 | 2> = {};
+    for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+      // Anything that is not a recognised value is NOT a decision. It reads as
+      // "follow the till", which for a department a station feeds is the
+      // pre-feature answer (deduct) — never a silent switch-off from junk.
+      //
+      // MATCHED EXACTLY, never through Number(): Number(null) is 0 and Number('')
+      // is 0, so a JSON null or an empty string in this object used to read as a
+      // deliberate switch-off and stop a kitchen deducting. Junk means "nobody
+      // decided", which is the only reading that cannot lose stock silently.
+      out[String(k)] = (v === 1 || v === '1' || v === true) ? 1
+        : (v === 0 || v === '0' || v === false) ? 0
+          : 2;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * WHICH DEPARTMENTS DOES THE TILL ACTUALLY FEED? — the set "follow the till"
+ * resolves against, and the same query the seed and the screen use, so all three
+ * can never disagree about what "reachable" means.
+ *
+ * ANY mapping row counts, not just an active one. Pausing a mapping in
+ * /settings/station-departments is a temporary act; treating a paused row as
+ * "this department no longer cooks" would switch its deduction off behind the
+ * owner's back, which is the very thing "follow the till" exists to prevent.
+ * An empty set on a throw: no map means we cannot prove a department is NOT fed,
+ * and the deduct-by-default answer below is the safe one.
+ */
+export function departmentsReachableFromStations(db: Database.Database): Set<string> {
+  try {
+    return new Set((db.prepare(`
+      SELECT DISTINCT sd.department_id AS id
+        FROM station_departments sd
+        JOIN departments d ON d.id = sd.department_id
+       WHERE sd.department_id IS NOT NULL AND TRIM(sd.department_id) <> ''
+    `).all() as Array<{ id: string }>).map((r) => String(r.id)));
+  } catch (e) {
+    console.error('[departmentsReachableFromStations] station map unreadable', e);
+    return new Set<string>();
+  }
+}
+
+/**
+ * THE STORED DECISION, exactly as it stands — 1, 0 or 2 (follow the till), for
+ * every department at once. The COLUMN when there is one, the sidecar only when
+ * there is not (see "which rail wins" above). Absent anywhere = never decided =
+ * 1, the pre-feature answer.
+ *
+ * This is the accessor for anything that must tell the owner's CHOICE apart from
+ * the till's shape — the variance report leans on it, so that a department which
+ * is merely unmapped is reported as unmapped and not as "switched off".
+ */
+export function departmentRecipeDeductionSettings(db: Database.Database): Record<string, 0 | 1 | 2> {
+  const out: Record<string, 0 | 1 | 2> = {};
+  let ids: string[] = [];
+  try {
+    ids = (db.prepare('SELECT id FROM departments').all() as Array<{ id: string }>)
+      .map((r) => String(r.id));
+  } catch (e) {
+    console.error('[departmentRecipeDeductionSettings] department list unreadable', e);
+    return out;
+  }
+  const stored = new Map<string, 0 | 1 | 2>();
+  if (departmentsHaveRecipeDeductionColumn(db)) {
+    try {
+      for (const r of db.prepare(
+        `SELECT id, ${DEPT_RECIPE_DEDUCTION_COLUMN} AS v FROM departments`).all() as Array<{ id: string; v: unknown }>) {
+        if (r.v === null || r.v === undefined) continue;   // a NULL from some other writer is not a decision
+        const n = Number(r.v);
+        stored.set(String(r.id), n === 0 ? 0 : n === 2 ? 2 : 1);
+      }
+    } catch (e) {
+      console.error('[departmentRecipeDeductionSettings] column read failed — defaulting to enabled', e);
+    }
+  } else {
+    const side = departmentRecipeDeductionSidecar(db);
+    for (const [k, v] of Object.entries(side)) stored.set(k, v);
+  }
+  for (const id of ids) out[id] = stored.has(id) ? (stored.get(id) as 0 | 1 | 2) : 1;
+  return out;
+}
+
+/**
+ * THE ONE QUESTION THE CONSUMPTION PATH ASKS: may recipes take stock off this
+ * department?
+ *
+ * "FOLLOW THE TILL" NEEDS NO LOOKUP HERE, and that is not a shortcut — it is the
+ * invariant. The only department id that ever reaches this function came out of
+ * resolveStationDepartment, which reads station_departments and nothing else, so
+ * a department asked about here is BY CONSTRUCTION one the till feeds. 2 is
+ * therefore "yes" on this path, always, and correctness never waits for anyone
+ * to open a screen or for a background pass to catch up with a remapping.
+ *
+ * Read fresh on every sale — NEVER memoised. An admin flips this live, and a
+ * process-level value cache would keep deducting a department he has just
+ * switched off until the next restart. Only the PRAGMA answer is cached. The
+ * department is resolved once per sale, so this is one small indexed read per
+ * sale, not one per ingredient.
+ */
+export function recipeDeductionEnabledForDept(
+  db: Database.Database,
+  departmentId: string | null | undefined,
+): boolean {
+  const key = String(departmentId ?? '').trim();
+  if (!key) return true;                       // no department = not this switch's business
+  try {
+    if (departmentsHaveRecipeDeductionColumn(db)) {
+      const row = db.prepare(
+        `SELECT ${DEPT_RECIPE_DEDUCTION_COLUMN} AS v FROM departments WHERE id = ?`).get(key) as
+        { v?: unknown } | undefined;
+      // A row that is missing, or a NULL left by some other writer, is NOT a
+      // decision — only an explicit 0 is. THE COLUMN IS THE WHOLE ANSWER when it
+      // exists; the sidecar is deliberately not consulted, so a write through the
+      // generic settings endpoint cannot reach this decision.
+      if (!row || row.v === null || row.v === undefined) return true;
+      return Number(row.v) !== 0;
+    }
+  } catch (e) {
+    console.error('[recipeDeductionEnabledForDept] column read failed — defaulting to enabled', e);
+    return true;
+  }
+  try {
+    // No column on this database: the sidecar is the only rail there is.
+    const side = departmentRecipeDeductionSidecar(db);
+    if (!Object.prototype.hasOwnProperty.call(side, key)) return true;
+    return Number(side[key]) !== 0;
+  } catch (e) {
+    console.error('[recipeDeductionEnabledForDept] sidecar read failed — defaulting to enabled', e);
+    return true;
+  }
+}
+
+/**
+ * THE EFFECTIVE ANSWER for EVERY department at once — for the screen that shows
+ * the switches, and for any report that has to say which departments record
+ * their usage through goods movement instead.
+ *
+ * "Follow the till" is RESOLVED here, against the live station map, so no caller
+ * outside this file ever has to know the third value exists: a department no
+ * station feeds reads 0 ("goods movement only"), which is both what the screen
+ * should say and what is actually happening. Nothing is stored by this — the
+ * stored decision stays 2, so re-pointing a station changes the answer on the
+ * next read with nothing to migrate.
+ */
+/**
+ * HOW each department's answer was arrived at — 'on' and 'off' are decisions a
+ * person made; 'auto' is derived from whether a station points at the department
+ * right now.
+ *
+ * This exists because departmentRecipeDeductionMap() below FLATTENS auto into the
+ * 0/1 it currently resolves to, which is the right answer for the consumption
+ * rail and the wrong one for a screen. A department stored auto with no station
+ * pointing at it flattened to 0 and painted as a plain OFF — byte-identical to a
+ * switch the owner had set himself. Mapping a station to it on the Station →
+ * Department screen then turned it ON with no prompt and no word anywhere
+ * admitting the switch was derived. An off switch that turns itself on is worse
+ * than either state honestly labelled, so the screen gets the mode too.
+ *
+ * Keep this separate from the map: the gate must never branch on the mode, only
+ * on the effective answer.
+ */
+export function departmentRecipeDeductionModes(
+  db: Database.Database,
+): Record<string, 'on' | 'off' | 'auto'> {
+  const settings = departmentRecipeDeductionSettings(db);
+  const out: Record<string, 'on' | 'off' | 'auto'> = {};
+  for (const id of Object.keys(settings)) {
+    const v = settings[id];
+    out[id] = v === 1 ? 'on' : v === 0 ? 'off' : 'auto';
+  }
+  return out;
+}
+
+export function departmentRecipeDeductionMap(db: Database.Database): Record<string, 0 | 1> {
+  const settings = departmentRecipeDeductionSettings(db);
+  const ids = Object.keys(settings);
+  if (ids.length === 0) return {};
+  const reachable = departmentsReachableFromStations(db);
+  const out: Record<string, 0 | 1> = {};
+  for (const id of ids) {
+    const v = settings[id];
+    out[id] = v === 1 ? 1 : v === 0 ? 0 : (reachable.has(id) ? 1 : 0);
+  }
+  return out;
+}
+
 export function deductInventoryForSale(
   db: Database.Database,
   recipeId: string,
   quantity: number,
   saleId: string,
   billType: string,
-  opts?: { storeId?: string; station?: string | null; orderItemId?: string | null },
+  opts?: {
+    station?: string | null;
+    orderItemId?: string | null;
+    /**
+     * FIELD 8 of the movement record — the responsible user, from the SESSION.
+     *
+     * This rail is the one place where an honest answer is often "a machine":
+     * consumption is posted by the KOT-completion sweep, which runs on a timer
+     * with no request and no session at all. So the default is a `system:`
+     * actor naming the rail, and a caller that DOES have a session (a bump, a
+     * settle, a manual sales upload) passes the signed-in user's email instead.
+     *
+     * What it must never be is blank — that is what it was, on every
+     * consumption row this app has ever written — and never a name taken from
+     * the request body.
+     */
+    actor?: string | null;
+  },
 ): void {
-  const floorStoreId = opts?.storeId ? String(opts.storeId).trim() : '';
   // The station of the SOLD LINE (order_items.station). Never kots.station:
   // kot-fire.ts coerces a blank line station to the literal 'kitchen' when the
   // KOT is written, and 'Kitchen' is a real department, so resolving from the
   // KOT would silently debit the main kitchen for every station-less item.
   const station = String(opts?.station ?? '').trim();
   const orderItemId = opts?.orderItemId ? String(opts.orderItemId) : null;
+  // See opts.actor above. 'system:recipe-consumption' is the truthful default
+  // for the timer-driven sweep; a session-backed caller overrides it.
+  const actor = String(opts?.actor ?? '').trim() || 'system:recipe-consumption';
 
   // Load store-engine ONCE, unconditionally — the liquor carve-out needs
   // isStoreMappedMaterial on every call now, not only when a floor store was
@@ -8439,23 +9007,20 @@ export function deductInventoryForSale(
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     se = require('./store-engine') as typeof import('./store-engine');
   } catch (e) {
-    console.error('store-engine load failed — consumption will be SKIPPED, never charged to central', e);
+    // NOT fatal to consumption any more. store-engine is loaded here for ONE
+    // question — "is this material owned by a store location?" — and this file
+    // can answer it on its own (storeMappedLocal below). Treating a load
+    // failure as "skip everything" turned a module-resolution problem into
+    // 100% of department consumption silently becoming consumption_skips, with
+    // a clean audit trail and no stock movement at all. That is the collapse
+    // mode this rail exists to avoid: the owner asked for consumption to stop
+    // hitting the STORE, never for it to stop.
+    console.error('store-engine load failed — falling back to the local store-map query in this file', e);
     se = null;
   }
-  // Floor routing stays opt-in and is still only consulted when a caller asked
-  // for it. Any failure disables routing, never the sale.
-  let routeEnabled = false;
-  if (floorStoreId && se) {
-    try {
-      routeEnabled = se.floorAutoDeductEnabled(db);
-    } catch (e) {
-      console.error('floor auto-deduct: setting read failed, routing disabled for this sale', e);
-      routeEnabled = false;
-    }
-  }
-  const ledgerHasRow = db.prepare(
-    'SELECT 1 FROM store_stock_ledger WHERE store_id = ? AND material_id = ? LIMIT 1',
-  );
+  // NOTE: store-engine is loaded here for isStoreMappedMaterial (the liquor
+  // carve-out) and NOTHING ELSE. It no longer reads floorAutoDeductEnabled and
+  // must never call postLedger — see the ruling at the top of this function.
 
   // Resolve the DEPARTMENT ONCE per sale, from the station, through the
   // editable station→department map. The resolver NEVER guesses: it hands back
@@ -8469,6 +9034,12 @@ export function deductInventoryForSale(
   const resolution = resolveStationDepartment(db, station);
   const departmentId: string | null = resolution.departmentId;
   const unresolvedReason: string = resolution.reason || 'no_department';
+
+  // MAY RECIPES TAKE STOCK OFF THIS DEPARTMENT? Asked ONCE per sale, here,
+  // because the department is resolved once per sale — never inside applyDeduct,
+  // which runs per ingredient. No department resolved ⇒ this switch has nothing
+  // to say and the unresolved path below owns the answer.
+  const deductionEnabled = departmentId ? recipeDeductionEnabledForDept(db, departmentId) : true;
 
   // Audit row for a consumption that moved nothing. recordConsumptionSkip is
   // fail-soft by contract — a missing table or bad column returns false rather
@@ -8490,64 +9061,197 @@ export function deductInventoryForSale(
   };
 
   // Store-mapped lookup, memoised per call by category (one query per distinct
-  // category instead of one per ingredient). Returns null for UNKNOWN, which is
+  // category instead of one per ingredient). TWO INDEPENDENT ANSWERERS, in
+  // order: store-engine's isStoreMappedMaterial, then the identical query run
+  // from this file (storeMappedLocal). null — genuinely UNKNOWN — is still
   // treated as store-mapped by the caller: with the check unavailable we cannot
   // prove a material belongs on the department rail, and posting a liquor
   // movement into a kitchen's balance is not recoverable by a later count.
+  // Reaching null now takes BOTH answerers failing, not one import.
   const storeMappedMemo = new Map<string, boolean>();
-  const storeMapped = (materialId: string, category: string | null): boolean | null => {
-    if (!se) return null;
-    const key = String(category ?? '').trim() || materialId;
-    const cached = storeMappedMemo.get(key);
-    if (cached !== undefined) return cached;
+
+  /**
+   * THE SAME QUESTION, ASKED WITHOUT store-engine.
+   *
+   * Byte-equivalent to isStoreMappedMaterial() + materialStoreId() in
+   * src/lib/store-engine.ts: resolve a material id to its category, then look
+   * for an ACTIVE store that owns that category, matched through the same
+   * separator- and case-insensitive normalisation (lower, strip space/-/_).
+   *
+   * It exists because store-engine is loaded by `require` at runtime and its
+   * import graph is not this lane's to control — it currently pulls in
+   * ./liquor-wallet, which belongs to another in-flight lane. A missing or
+   * broken module there must not be able to switch off department consumption
+   * for the whole restaurant, so the one fact this rail needs is answerable
+   * here, from the two tables that hold it.
+   *
+   * Returns false (nothing is store-mapped) when store_category_map does not
+   * exist at all — an unmigrated database has no store mappings, which is a
+   * definite answer, not an unknown. Only a genuinely failed query returns
+   * null, and null still means "cannot prove it belongs on the department
+   * rail" → skip, exactly as before.
+   */
+  const storeMappedLocal = (key: string): boolean | null => {
     try {
-      const v = se.isStoreMappedMaterial(db, key);
-      storeMappedMemo.set(key, v);
-      return v;
+      const mat = db.prepare('SELECT category FROM raw_materials WHERE id = ?').get(key) as
+        { category?: string } | undefined;
+      const cat = String((mat ? mat.category : key) || '').trim();
+      if (!cat) return false;
+      const NORM = (col: string) =>
+        `REPLACE(REPLACE(REPLACE(LOWER(TRIM(${col})), ' ', ''), '-', ''), '_', '')`;
+      const row = db.prepare(`
+        SELECT m.store_id
+        FROM store_category_map m
+        JOIN store_locations s ON s.id = m.store_id
+        WHERE s.is_active = 1 AND ${NORM('m.category')} = ${NORM('?')}
+        ORDER BY m.created_at ASC, m.id ASC
+        LIMIT 1
+      `).get(cat) as { store_id?: string } | undefined;
+      return !!row?.store_id;
     } catch (e) {
-      console.error(`store-mapped check failed for '${key}' — treating as store-mapped (skip)`, e);
+      // No store_category_map ⇒ no store owns any category ⇒ nothing is
+      // store-mapped. That is the honest answer, not an unknown.
+      try {
+        const t = db.prepare(
+          `SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'store_category_map'`,
+        ).get();
+        if (!t) return false;
+      } catch { /* sqlite_master unreadable — fall through to unknown */ }
+      console.error(`local store-mapped query failed for '${key}' — treating as store-mapped (skip)`, e);
       return null;
     }
   };
 
+  const storeMapped = (materialId: string, category: string | null): boolean | null => {
+    const key = String(category ?? '').trim() || materialId;
+    const cached = storeMappedMemo.get(key);
+    if (cached !== undefined) return cached;
+    let v: boolean | null = null;
+    if (se) {
+      try {
+        v = se.isStoreMappedMaterial(db, key);
+      } catch (e) {
+        console.error(`store-mapped check failed for '${key}' — retrying locally`, e);
+        v = null;
+      }
+    }
+    // Either store-engine did not load, or its answer threw. Ask the same
+    // question directly rather than abandoning the department rail.
+    if (v === null) v = storeMappedLocal(key);
+    if (v !== null) storeMappedMemo.set(key, v);
+    return v;
+  };
+
+  /**
+   * "Nothing was booked, and here is why" — the SOURCE of a consumption that no
+   * rail lost. Not a place, and deliberately not dressed up as one: a pour that
+   * the owner's ruling says must be MEASURED (a liquor floor count) never left a
+   * booked location, and an unmapped station never named one. The reason rides
+   * in the name because that is the column the movement register shows.
+   */
+  const notBooked = (why: string): MovementParty =>
+    ({ kind: 'external', id: '', name: `Not booked — ${why}` });
+
+  /**
+   * WHY NOTHING WAS BOOKED, IN PLAIN ENGLISH — the string the movement register
+   * shows a manager. The raw reason stays on the skip row for the reports that
+   * group by it; an unknown reason falls through verbatim rather than being
+   * swallowed, so a new one from resolveStationDepartment cannot go silent.
+   *
+   * HOISTED OUT OF applyDeduct on purpose. It used to be declared at the very
+   * bottom of that function, AFTER the department branch — so the deduction-off
+   * gate below could not read it without hitting the temporal dead zone and
+   * throwing a ReferenceError on every single deduction. Declared here, beside
+   * notBooked, it is readable from every branch and there is one copy of each
+   * sentence.
+   *
+   * THE FIRST ENTRY IS THE IMPORTANT ONE. 'recipe_deduction_disabled' is a
+   * CHOICE — the owner said this department records its usage through goods
+   * movement. The three below it are FAILURES — nobody could work out where the
+   * stock should have come from. Those two things must never share a reason
+   * string: one is a decision to audit, the other is a data gap to fix.
+   *
+   * ('inactive' is the station→department MAPPING being paused in
+   *  /settings/station-departments, not departments.is_active. That wording
+   *  overclaims and predates this work; it lives in a region this lane may not
+   *  rewrite, so it is reported rather than changed.)
+   */
+  const WHY: Record<string, string> = {
+    recipe_deduction_disabled: 'recipe deduction is off for this department',
+    blank: 'no station on the line',
+    unmapped: 'station unmapped',
+    inactive: 'department inactive',
+  };
+
+  /**
+   * IS THERE A MOVEMENT HERE AT ALL? — the SINGLE definition of that, shared by
+   * the rail (applyDeduct) and the audit row (postCentralTxn), so the two can
+   * never disagree about one ingredient.
+   *
+   * They did disagree, and it cost a bill. applyDeduct refuses a non-finite or
+   * non-positive quantity and returns cleanly; the caller then handed the SAME
+   * value to postCentralTxn, which throws on a non-finite quantity
+   * (movement-record.ts, `quantity must be a finite number`). One recipe row
+   * with yield_percent 0 — which /api/recipes writes happily, because
+   * `ing.yield_percent ?? 100` does not catch 0 or '' — therefore aborted the
+   * whole settle transaction: HTTP 500, no sales row, and a bill that could
+   * never be closed because every retry threw in the same place.
+   *
+   * A NEGATIVE effective quantity was the mirror-image bug: applyDeduct moved
+   * nothing (totalDeduct <= 0), but the audit row was still written with
+   * `quantity: -totalDeduct`, i.e. a POSITIVE 'sale' row. Deleting that sale
+   * then read the row back as "central lost nothing, so credit it" and ran
+   * `current_stock + (-60)` — a sale DEBITING central stock, the one thing the
+   * owner's ruling forbids.
+   *
+   * So the audit row is written on every branch that MOVED something or
+   * deliberately moved nothing (skips included, which is what keeps
+   * recipe_to_date whole), and is NOT written for a quantity that is not a
+   * number at all. There is no movement to record and nothing for a reversal to
+   * give back. The audit row must never be able to abort a settle.
+   */
+  const bookable = (q: number): boolean => Number.isFinite(q) && q > 0;
+
   /**
    * Move `totalDeduct` recipe-units of one material off the rail that is
-   * entitled to lose it. Exactly one rail, or none — never central.
+   * entitled to lose it. Exactly one rail, or none — never central, NEVER a
+   * store (owner ruling 2026-09-10; the removed floor branch is documented at
+   * the top of this function).
    *
-   *   1. floor store   (opt-in, unchanged, still first)
-   *   2. store-mapped  → skip both rails, record why (liquor keeps its own rail)
-   *   3. department    → signed 'consumption' row on the department ledger
-   *   4. otherwise     → move NOTHING, record why
+   *   1. store-mapped  → skip both rails, record why (liquor keeps its own rail)
+   *   2. department    → signed 'consumption' row on the department ledger
+   *   3. otherwise     → move NOTHING, record why
    *
    * Always safe to call; never throws. The caller writes its
    * inventory_transactions row regardless of which branch runs here.
+   *
+   * RETURNS THE SOURCE OF THAT ROW — the party that actually lost the goods.
+   * The caller used to leave it to postCentralTxn's default, which is the
+   * CENTRAL STORE, so every sale row claimed an outflow from a central store
+   * this function is forbidden to touch. The rail that ran is the only thing
+   * that knows the truth, so it hands it back: the department when one was
+   * debited, and a `notBooked(...)` party — never central, never a store — when
+   * nothing moved at all.
    */
-  const applyDeduct = (materialId: string, category: string | null, totalDeduct: number): void => {
+  const applyDeduct = (materialId: string, category: string | null, totalDeduct: number): MovementParty => {
     // A zero, negative or non-finite quantity is bad recipe data, not a
     // movement. Previously it fell through to `current_stock - 0` (a no-op) or,
     // for NaN, poisoned the column. Nothing to move, nothing to record.
-    if (!Number.isFinite(totalDeduct) || totalDeduct <= 0) return;
+    if (!bookable(totalDeduct)) return notBooked('no quantity to move');
 
-    if (routeEnabled && se && floorStoreId && totalDeduct > 0) {
-      try {
-        const owned = se.materialStoreId(db, { category }) != null;
-        const held = owned || !!ledgerHasRow.get(floorStoreId, materialId);
-        if (held) {
-          se.postLedger(db, {
-            store_id: floorStoreId,
-            material_id: materialId,
-            txn_type: 'outward',
-            quantity: -totalDeduct,
-            ref: saleId,
-            notes: `Floor auto-deduct (sale ${saleId})`,
-          });
-          return; // routed to floor ledger — skip the central UPDATE
-        }
-      } catch (e) {
-        console.error(`floor auto-deduct failed for material ${materialId}, falling back to central`, e);
-        // fall through to central UPDATE below
-      }
-    }
+    // ── WHERE THE FLOOR AUTO-DEDUCT USED TO BE (removed 2026-09-10) ─────────
+    // A `postLedger({ txn_type: 'outward', notes: 'Floor auto-deduct (sale …)' })`
+    // stood here, gated on tm_floor_autodeduct + opts.storeId. THE OWNER RULED
+    // IT OUT: a sale may not move stock at store level, at all, under any
+    // setting. Do NOT re-add it, and do not add a "just for the bar" variant —
+    // the bar is the case it was written for and the case the ruling names. The
+    // floor's number comes from counting (/inventory/reconciliation, physical
+    // mode); the pour is compared with it there, not booked here.
+    //
+    // Its old error path claimed to "fall back to the central UPDATE". There was
+    // no central UPDATE left to fall back to — that debit had already moved to
+    // the department rail — so the comment was fiction and is not preserved.
+    //
     // LIQUOR KEEPS ITS OWN RAIL. Store-mapped materials live on
     // store_stock_ledger (TGBCL) and are skipped by the central debit at issue
     // too, so there is no department holding to draw down here. `null` means
@@ -8558,13 +9262,45 @@ export function deductInventoryForSale(
     const mapped = storeMapped(materialId, category);
     if (mapped !== false) {
       recordSkip(materialId, totalDeduct, mapped === null ? 'store_check_unavailable' : 'store_mapped');
-      return;
+      // NOT 'store': naming the store here would put back, on the register, the
+      // very movement the ruling removed from the ledger. The floor's pour is
+      // measured by counting, so the honest source is "no booked location".
+      return notBooked(mapped === null ? 'store check failed' : 'measured by count');
     }
 
     // THE DEPARTMENT LOSES THE GRAM. Signed, negative, recipe units — the sign
     // is what the balance sums. Central is NOT touched: it lost this gram at
     // the requisition issue.
     if (departmentId) {
+      // ── THE SWITCH ──────────────────────────────────────────────────────
+      // The department IS known and named. The owner has simply said that THIS
+      // department's usage is recorded through goods movement — issues,
+      // transfers, returns and counts — and not from recipes.
+      //
+      // WHERE THIS SITS, AND WHY EXACTLY HERE:
+      //  · AFTER the department is resolved and BEFORE the only line that
+      //    debits it, so nothing can be taken off a department that is off.
+      //  · It RETURNS. Every remaining path out of this function ends in
+      //    notBooked(...) or deptParty(...), so there is no route from here to
+      //    a central debit — and there must never be one added. Central is not
+      //    a consumption destination: it lost this gram at the requisition
+      //    issue (owner's law).
+      //  · AFTER the store-mapped check above, deliberately: a liquor material
+      //    at a switched-off department must keep reading 'store_mapped',
+      //    because it never was on the department rail at all. Turning this
+      //    department off does not move bottles onto it.
+      //  · NOT implemented by nulling departmentId at resolution time. That
+      //    would fall through to the unresolved branch and publish "no station
+      //    on the line" / "station unmapped" — a lie. We know exactly which
+      //    department this is; we chose not to debit it.
+      //
+      // THE SKIP IS THE WHOLE POINT. A distinct reason, never 'blank',
+      // 'unmapped' or 'inactive', so the owner can always tell "we CHOSE not to
+      // deduct" from "we could not work out where to deduct".
+      if (!deductionEnabled) {
+        recordSkip(materialId, totalDeduct, 'recipe_deduction_disabled');
+        return notBooked(WHY.recipe_deduction_disabled);
+      }
       try {
         postDeptLedger(db, {
           departmentId,
@@ -8576,6 +9312,10 @@ export function deductInventoryForSale(
           station,
           source: 'recipe_consumption',
           notes: `Recipe consumption (sale ${saleId})`,
+          // FIELD 8. Blank was the old value on every consumption row in this
+          // table; postDeptLedger now refuses blank outright, so this is also
+          // what keeps the rail working.
+          user: actor,
         });
       } catch (e) {
         // A sale must never fail because the ledger post failed. Record the
@@ -8583,8 +9323,12 @@ export function deductInventoryForSale(
         // at the next count; a failed settle is not.
         console.error(`dept ledger post failed for material ${materialId}, recording a skip`, e);
         recordSkip(materialId, totalDeduct, 'dept_post_failed');
+        // The department SHOULD have lost it and did not, so it must not be
+        // named as the source of goods it still holds on the books.
+        return notBooked('dept post failed');
       }
-      return;
+      // THE TRUE SOURCE of this consumption: the department that just lost it.
+      return deptParty(db, departmentId);
     }
 
     // NO DEPARTMENT COULD BE NAMED → MOVE NOTHING, ANYWHERE. Blank station,
@@ -8594,6 +9338,12 @@ export function deductInventoryForSale(
     // silently reads as theft on the department variance report; a recorded
     // skip reads as the data gap it actually is.
     recordSkip(materialId, totalDeduct, unresolvedReason);
+    // The skip reason IS the answer to "where did it come from": nowhere that
+    // was booked. Spelled out for the register (WHY, declared above beside
+    // notBooked — it used to be declared here, which put it out of reach of the
+    // deduction-off gate); the raw reason stays on the skip row for the reports
+    // that group by it.
+    return notBooked(WHY[unresolvedReason] || `no department (${unresolvedReason})`);
   };
 
   // Deduct raw ingredients
@@ -8611,17 +9361,42 @@ export function deductInventoryForSale(
     const effectiveQty = qtyInMatUnit * (1 + ing.wastage_percent / 100) / (ing.yield_percent / 100);
     const totalDeduct = effectiveQty * quantity;
 
-    applyDeduct(ing.material_id, ing.material_category, totalDeduct);
+    // The rail that ran hands back WHERE the goods actually came off, which is
+    // the one thing this row could not work out for itself.
+    const from = applyDeduct(ing.material_id, ing.material_category, totalDeduct);
 
-    // ALWAYS WRITTEN, ON EVERY BRANCH ABOVE — including the skips. This row is
-    // what the Variance Report / Daily Roll-up / Sales-vs-Purchase read.
-    // Do NOT "simplify" this by gating the transaction row too — recipe_to_date
-    // would collapse to 0 and every variance line would report the whole
-    // purchase history as shrinkage.
-    db.prepare(`
-      INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
-    `).run(generateId(), ing.material_id, txType, -totalDeduct, saleId, `Sale of ${quantity}x recipe ${recipeId}`);
+    // WRITTEN ON EVERY BRANCH ABOVE — including the skips. This row is what the
+    // Variance Report / Daily Roll-up / Sales-vs-Purchase read. Do NOT
+    // "simplify" this by gating the transaction row on a rail having run —
+    // recipe_to_date would collapse to 0 and every variance line would report
+    // the whole purchase history as shrinkage.
+    //
+    // THE ONE EXCEPTION is a quantity that is not a quantity: see `bookable`.
+    // A row applyDeduct refused as not-a-movement has nothing to record, and
+    // writing it either throws (non-finite → the settle 500s and the bill can
+    // never be closed) or inverts (negative → a 'sale' row with a POSITIVE
+    // quantity, which the sale-delete arithmetic then pays back by DEBITING
+    // central). Both are worse than a missing audit row for a recipe line that
+    // moved nothing.
+    if (!bookable(totalDeduct)) continue;
+    postCentralTxn(db, {
+      materialId: ing.material_id,
+      type: txType,
+      quantity: -totalDeduct,
+      referenceId: saleId,
+      notes: `Sale of ${quantity}x recipe ${recipeId}`,
+      // The other end of a consumption is the guest, not a place. Naming it
+      // 'consumption' rather than inventing a location is the point — see
+      // MOVEMENT_PARTY_KINDS in movement-record.ts.
+      counterparty: { kind: 'consumption' },
+      // THIS end is NOT the central store. A sale does not debit central (nor a
+      // store, by the ruling at the top of this function), so letting the
+      // default stand published an outbound Central Store movement for goods
+      // central still holds. `from` is the department that lost it, or an
+      // explicit "not booked — <reason>" when no rail did.
+      home: from,
+      actor,
+    });
   }
 
   // Deduct sub-recipe ingredients.
@@ -8657,15 +9432,25 @@ export function deductInventoryForSale(
       const effectiveQty = qtyInMatUnit * (1 + ing.wastage_percent / 100) / (ing.yield_percent / 100);
       const totalDeduct = effectiveQty * ratio * quantity;
 
-      applyDeduct(ing.material_id, ing.material_category, totalDeduct);
+      const from = applyDeduct(ing.material_id, ing.material_category, totalDeduct);
 
-      // ALWAYS WRITTEN, ON EVERY BRANCH — see the identical note in the raw
-      // ingredient loop. Gating this row collapses recipe_to_date to 0 and
+      // WRITTEN ON EVERY BRANCH — see the identical note in the raw ingredient
+      // loop, including the `bookable` exception and why it is not optional.
+      // Gating this row on a rail having run collapses recipe_to_date to 0 and
       // reports the whole purchase history as shrinkage.
-      db.prepare(`
-        INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
-      `).run(generateId(), ing.material_id, txType, -totalDeduct, saleId, `Sub-recipe usage for sale`);
+      if (!bookable(totalDeduct)) continue;
+      postCentralTxn(db, {
+        materialId: ing.material_id,
+        type: txType,
+        quantity: -totalDeduct,
+        referenceId: saleId,
+        notes: `Sub-recipe usage for sale`,
+        counterparty: { kind: 'consumption' },
+        // Same rule as the raw-ingredient loop above: the source is the rail
+        // that actually lost the goods, never the untouched central store.
+        home: from,
+        actor,
+      });
     }
   }
 }
@@ -8690,12 +9475,11 @@ export interface SaleInput {
   // when the item's recipe was already deducted at KOT-complete (see the KDS bump
   // route). Prevents double-deduction under the "consume on KOT complete" model.
   skip_inventory?: boolean;
-  // FAIL-SAFE FLOOR ROUTING (Multi-floor bar Phase 2/3): the resolved floor bar
-  // store (order → table.zone → resolveFloorStore) for the dine-in settle
-  // backstop only. Forwarded verbatim to deductInventoryForSale's opts.storeId;
-  // absent (the default, and for /api/sales/-import/seed) => central behaviour,
-  // byte-identical to before. Routing is still gated on tm_floor_autodeduct.
-  store_id?: string;
+  // `store_id` USED TO BE HERE — the resolved floor bar store, forwarded to
+  // deductInventoryForSale so a settle could post the pour onto that store's
+  // ledger. GONE with the floor auto-deduct (owner ruling 2026-09-10): a sale
+  // moves nothing at store level, so a sale has no business naming a store.
+  // Adding the field back is how the removed rail comes back — don't.
   // DEPARTMENT ROUTING (deduct-at-issue cutover). order_items.station of the
   // SOLD LINE — the only field that resolves the department that cooked it.
   // Never kots.station (blank is coerced to the literal 'kitchen' there, and
@@ -8708,6 +9492,15 @@ export interface SaleInput {
   // deductInventoryForSale directly and passes the order-item id as its
   // saleId, so that path's ledger reference_id already carries it.
   order_item_id?: string | null;
+  /**
+   * FIELD 8 of the movement record — the responsible user, from the SESSION of
+   * whoever recorded this sale. Rides through to the consumption rows on both
+   * rails so "who moved this stock" has the same answer as "who booked this
+   * sale". Blank is legitimate on machine paths (the KOT sweep, a bulk import)
+   * and becomes a `system:` actor, never an empty string. NOT a client-supplied
+   * name: every route sets this from getCurrentUser(), never from the body.
+   */
+  actor?: string | null;
 }
 
 /**
@@ -8750,15 +9543,18 @@ export function recordSale(db: Database.Database, s: SaleInput): string {
   );
 
   if (s.recipe_id && !s.skip_inventory) {
-    // Forward the caller-resolved floor store (settle backstop) and the sold
-    // line's station verbatim. opts is passed UNCONDITIONALLY so the station
-    // always reaches the deduct; a missing storeId normalises to '' inside
-    // deductInventoryForSale, which is exactly what `undefined` did before.
-    // Pass a blank station through rather than dropping it — the skip and its
-    // reason are the record that a department could not be named.
+    // Forward the sold line's station verbatim. opts is passed UNCONDITIONALLY
+    // so the station always reaches the deduct. Pass a blank station through
+    // rather than dropping it — the skip and its reason are the record that a
+    // department could not be named. No store is passed, and none may be: the
+    // deduct has no store rail any more (owner ruling 2026-09-10).
     deductInventoryForSale(
       db, s.recipe_id, s.quantity_sold, id, billType,
-      { storeId: s.store_id, station: s.station ?? null, orderItemId: s.order_item_id ?? null },
+      // actor rides through on the SaleInput so the consumption rows carry the
+      // same responsible user as the sale that caused them. Blank here means
+      // the caller had no session (an import, the sweep) and the deduct labels
+      // it 'system:recipe-consumption' rather than leaving it empty.
+      { station: s.station ?? null, orderItemId: s.order_item_id ?? null, actor: s.actor ?? null },
     );
   }
   return id;

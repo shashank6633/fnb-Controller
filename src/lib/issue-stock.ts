@@ -131,6 +131,7 @@ import { packFactor } from '@/lib/pack-units';
 import { generateId } from '@/lib/db';
 import { centralFlowBlock } from '@/lib/store-engine';
 import { postDeptLedger, assertReversible } from '@/lib/dept-ledger';
+import { postCentralTxn, deptParty } from '@/lib/movement-record';
 
 export interface IssueDeltaInput {
   reqItemId: string;
@@ -420,12 +421,22 @@ export function applyIssueDelta(db: any, input: IssueDeltaInput): IssueDeltaResu
     db.prepare(`UPDATE raw_materials SET current_stock = current_stock - ? WHERE id = ?`)
       .run(stockQty, line.material_id);
 
+    // MOVEMENT RECORD: the central debit half of an issue. The RECEIVING
+    // DEPARTMENT was never on this row — it lived only on the paired department
+    // row and on requisition_issue_ledger — so "where did central's stock go"
+    // could not be answered from the central rail alone. It can now.
     invTxnId = generateId();
-    db.prepare(`
-      INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, outlet_id)
-      VALUES (?, ?, 'requisition_issue', ?, ?, ?, ?)
-    `).run(invTxnId, line.material_id, -stockQty, line.req_id,
-           `Requisition issue (${input.reason})`, line.outlet_id || null);
+    postCentralTxn(db, {
+      id: invTxnId,          // pre-minted: the caller returns and cross-references it
+      materialId: line.material_id,
+      type: 'requisition_issue',
+      quantity: -stockQty,
+      referenceId: line.req_id,
+      notes: `Requisition issue (${input.reason})`,
+      outletId: line.outlet_id || null,
+      counterparty: deptParty(db, String(line.department_id || '')),
+      actor: String(input.actor || '').trim() || 'system:requisition-issue',
+    });
   }
 
   // Nothing to record and nothing moved. The live case is an undo of one of the
@@ -483,7 +494,17 @@ export function applyIssueDelta(db: any, input: IssueDeltaInput): IssueDeltaResu
       reqItemId: input.reqItemId,
       source: 'requisition_issue',
       notes: `Requisition issue (${input.reason})`,
-      user: input.actor || '',
+      // THE SAME FALLBACK AS THE CENTRAL HALF ABOVE, deliberately identical.
+      // These two writes are one movement — central loses it, the department
+      // gains it — and they used to disagree about a blank actor: central
+      // defaulted to 'system:requisition-issue' while this half passed '',
+      // which postDeptLedger now REFUSES. A blank-actor issue therefore debited
+      // central, wrote both audit rows, and then threw before crediting anyone:
+      // 5 kg left the store and reached nobody. Both live callers happen to
+      // wrap this in a transaction and pass a session email behind a 401, so it
+      // rolls back today — but the asymmetry is the bug, and a symmetric
+      // machine actor is a true answer where '' never was.
+      user: String(input.actor || '').trim() || 'system:requisition-issue',
     });
   }
 

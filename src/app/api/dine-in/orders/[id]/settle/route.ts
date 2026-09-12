@@ -3,7 +3,8 @@ import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
 import { settleAuthority, recordSettleOverride } from '@/lib/settle-authority';
 import { todayIST } from '@/lib/format-date';
 import { computeBill, sumItemTax, round2 } from '@/lib/bill-calc';
-import { resolveFloorStore } from '@/lib/store-engine';
+// resolveFloorStore is NOT imported any more: a settle no longer resolves — or
+// posts to — a floor bar store (owner ruling 2026-09-10, see the deduct block).
 import { completeBookingForOrder } from '@/lib/ct/seating';
 import { closeServiceRequestsForOrder } from '@/lib/service-requests';
 
@@ -147,22 +148,13 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     }
     const primaryMethod = payments.length === 1 ? payments[0].method : 'split';
 
-    // FAIL-SAFE floor routing (Multi-floor bar Phase 2/3): resolve this order's
-    // floor bar store from its table zone ONCE. The settle deduct is only a
-    // backstop for items not already deducted at KOT-complete; recordSale gates
-    // the actual store posting on tm_floor_autodeduct and ignores store_id when
-    // skip_inventory is set. Any failure / unmapped zone → undefined → central.
-    let floorStoreId: string | undefined;
-    try {
-      const zoneRow = order.table_id
-        ? db.prepare('SELECT zone FROM restaurant_tables WHERE id = ?').get(order.table_id) as any
-        : null;
-      floorStoreId = resolveFloorStore(db, zoneRow?.zone) || undefined;
-    } catch (e) {
-      console.error('[settle floor-resolve]', id, e);
-      floorStoreId = undefined;
-    }
-
+    // NO FLOOR STORE IS RESOLVED HERE ANY MORE (owner ruling, 2026-09-10).
+    // A block here mapped this order's table zone → floor bar store and passed
+    // it to recordSale as store_id, so the backstop deduct could post the pour
+    // as an OUTWARD row on that store's ledger. A settle may not move stock at
+    // store level: the backstop deduct goes to the DEPARTMENT that cooked the
+    // line, or nowhere with a recorded skip. The floor's own figure is measured
+    // by counting (/inventory/reconciliation), never inferred from the bill.
     const settle = db.transaction(() => {
       // A held bill already wrote its sales/inventory rows — don't double-write.
       const freshDeduct = db.prepare('SELECT recipe_deducted_at FROM order_items WHERE id = ?');
@@ -184,9 +176,6 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           // deduct stock again. Not-yet-completed items (e.g. quick-settled without
           // a KDS bump) still deduct here as the backstop.
           skip_inventory: alreadyDeducted,
-          // Route the backstop deduct to the floor bar store (no-op unless
-          // tm_floor_autodeduct is on and skip_inventory is false).
-          store_id: floorStoreId,
           // DEPARTMENT ROUTING (deduct-at-issue): the recipe consumption debit now
           // leaves the DEPARTMENT that cooked the dish, not central — so the
           // backstop must resolve the same department the KDS bump would have.
@@ -217,6 +206,18 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           pos_item_id: mi?.pos_id || null,
           pos_item_name: it.name,
           outlet_id: outletId,
+          // FIELD 8 — the responsible user, from the SESSION. This route 401s
+          // without `me`, so a real cashier is always available; leaving it out
+          // stamped every backstop consumption row 'system:recipe-consumption',
+          // which is a true statement about a timer and a false one about a
+          // person closing a bill. Never from the request body.
+          actor: me.email,
+          // WHICH SOLD LINE CAUSED THIS. The movement rows carry the SALES row
+          // id as their reference; the trace column that was built to name the
+          // order line was left NULL by every writer on this path, so "which
+          // dish ate this?" could only be answered by joining back through
+          // sales. It is one field and it was already plumbed.
+          order_item_id: it.id,
         });
         // Stamp the backstop deduct so a later KDS bump (the settled order still
         // passes bump's status !== 'void' check) can't deduct these items again.

@@ -1,4 +1,4 @@
-import { getDb } from '@/lib/db';
+import { getDb, departmentRecipeDeductionSettings } from '@/lib/db';
 import { getCurrentUser, isManagement } from '@/lib/auth';
 import { cutoverAt, deptKey, deptOnHandBulk, type DeptOnHandResult } from '@/lib/dept-ledger';
 import { resolveDeptSet } from '@/lib/dept-stock';
@@ -224,7 +224,24 @@ type DifferenceState =
    *  it cannot be tested against one. Fourth state beyond the three the spec
    *  names; `difference_note` carries the plain English for any UI that only
    *  knows the first three. */
-  | 'no_opening';
+  | 'no_opening'
+  /**
+   * THE OWNER SWITCHED RECIPE DEDUCTION OFF FOR THIS DEPARTMENT.
+   *
+   * Its usage is recorded through goods movement, so no 'consumption' row is
+   * ever posted here — the ledger holds issues and no usage. Run the ordinary
+   * arithmetic on that and `expectedAtCount` stays high by the department's
+   * entire intake, and the report prints its whole month's cooking as SHRINKAGE:
+   * the exact failure this file's header (lines 38-44) was written to prevent,
+   * reached through a door that header did not know about.
+   *
+   * Tested FIRST in the chain below, ahead of station_unmapped, deliberately: a
+   * switched-off department still HAS its stations mapped, so it would sail
+   * past both existing guards — and station_unmapped's note would then tell the
+   * owner to go map stations that are already mapped, which is a false
+   * instruction as well as a false number.
+   */
+  | 'deduction_off';
 
 export async function GET(request: Request) {
   try {
@@ -336,6 +353,34 @@ export async function GET(request: Request) {
       list.push(m.station);
       stationsByDept.set(m.department_id, list);
     }
+
+    // ── WHICH DEPARTMENTS DEDUCT FROM RECIPES AT ALL? ─────────────────────
+    // Read ONCE for the whole report (both rails, OFF wins — see db.ts above
+    // deductInventoryForSale), not per row. A department the owner switched off
+    // never receives a 'consumption' row, so its ledger holds issues and no
+    // usage, and the ordinary arithmetic below would print its entire intake as
+    // shrinkage. `?? 1` is the same enabled-by-default the consumption path
+    // uses: a department missing from the map has never been decided about, and
+    // that reads as deducting, exactly as this app behaved before the switch
+    // existed. Fail-soft — an unreadable map leaves every row comparable, which
+    // is today's behaviour, never a silent wall of suppressed rows.
+    let deductMap: Record<string, number> = {};
+    try {
+      // THE STORED DECISION, not the effective answer. The difference decides
+      // whether this report tells the owner "you chose this" or "this is broken",
+      // and it must never get them the wrong way round:
+      //   0  a human switched this department off → 'deduction_off', no number.
+      //   2  nobody decided; it follows the till → say nothing about the switch
+      //      and let the ordinary station_unmapped / ok arms answer, because a
+      //      department the till does not feed is UNMAPPED, which is a setup gap
+      //      the owner can fix, not a choice he made.
+      deductMap = departmentRecipeDeductionSettings(db);
+    } catch (e) {
+      console.error('[department-variance] recipe-deduction map unreadable — treating every department as deducting', e);
+      deductMap = {};
+    }
+    const deductionSwitchedOff = (id: string): boolean => Number(deductMap[String(id)] ?? 1) === 0;
+    const deductsFromRecipes = (id: string): boolean => !deductionSwitchedOff(id);
 
     // ── RECIPE REACHABILITY, per (department, material) ───────────────────
     // "Could a sale at a station mapped to this department ever consume this
@@ -525,7 +570,24 @@ export async function GET(request: Request) {
       let difference: number | null = null;
       let expectedAtCount: number | null = null;
 
-      if (mappedStations.length === 0) {
+      if (!deductsFromRecipes(departmentId)) {
+        // FIRST IN THE CHAIN, ahead of station_unmapped, and that order is the
+        // whole fix. A switched-off department still has its stations mapped
+        // and its recipes reachable, so it would pass BOTH existing guards and
+        // land on the `ok` arm — printing the department's entire month of
+        // cooking as a loss, with a badge telling the owner to go map stations
+        // that are already mapped. That is the report accusing a chef of the
+        // owner's own configuration choice.
+        //
+        // No number is published: difference and expectedAtCount stay null, so
+        // the screen shows a dash. There is nothing wrong with this
+        // department's stock — the comparison simply does not apply, because
+        // the usage side of it is recorded through goods movement.
+        state = 'deduction_off';
+        note = 'Recipe deduction is switched off for this department, so its usage is recorded '
+          + 'through goods movement (issues, transfers and counts) rather than from recipes. '
+          + 'There is no expected recipe usage to compare this count against.';
+      } else if (mappedStations.length === 0) {
         state = 'station_unmapped';
         note = mappingTableReadable
           ? 'No station is mapped to this department yet, so recipe consumption never reaches it. '
@@ -709,8 +771,14 @@ export async function GET(request: Request) {
     // Reachable = has an active mapped station that carries at least one live
     // recipe material. A mapping to a station with nothing cookable on it is
     // not consumption coverage.
+    //
+    // A department with recipe deduction switched OFF is NOT consumption
+    // coverage, whatever its stations carry: no sale will ever post a
+    // consumption row to it. Counting it would inflate the page's
+    // "X of Y departments have a station mapped to a recipe" sentence with
+    // departments that deliberately never deduct.
     let departmentsReachable = 0;
-    for (const [, set] of reachable) if (set.size > 0) departmentsReachable++;
+    for (const [depId, set] of reachable) if (set.size > 0 && deductsFromRecipes(depId)) departmentsReachable++;
 
     // Pre-cutover requisition history: counted, labelled, and summed into
     // NOTHING (decision D). Bounded by the requisition date against the cutover
@@ -733,15 +801,34 @@ export async function GET(request: Request) {
     // What the gap has actually cost in visibility since the cutover. Guarded:
     // consumption_skips arrives with the cutover migration and a report must
     // still answer on a database where it has not landed.
+    //
+    // THE REASON FILTER IS LOAD-BEARING, NOT AN OPTIMISATION. This number is
+    // printed by TWO screens inside a sentence about stations that are not
+    // mapped yet — /department-variance ("N consumption events have been
+    // recorded without a department since the cut-over for this reason") and
+    // /inventory/stock-overview ("Sales at those stations deduct from no kitchen
+    // (N skipped since the cut-over) … Map them in Settings"). A
+    // 'recipe_deduction_disabled' skip is the OWNER'S OWN CHOICE on a station
+    // that IS mapped; counting it here told him to go and fix a mapping that was
+    // never broken, and reported a decision as a data gap — the one conflation
+    // this whole feature exists to prevent. MEASURED before the filter: 4
+    // deliberate skips at the mapped 'bar' station, 0 genuine unmapped-station
+    // failures, and the banner said 4.
+    //
+    // The deliberate ones are counted separately and returned beside it, so they
+    // are still visible — suppressed from the WRONG sentence, not hidden.
     const skipsByStation = new Map<string, number>();
     let skipsTotal = 0;
+    let skipsDeductionOff = 0;
     try {
       for (const r of db.prepare(`
-        SELECT lower(trim(station)) AS station, COUNT(*) AS n
-          FROM consumption_skips WHERE created_at > ? GROUP BY lower(trim(station))
+        SELECT lower(trim(station)) AS station, reason AS reason, COUNT(*) AS n
+          FROM consumption_skips WHERE created_at > ? GROUP BY lower(trim(station)), reason
       `).all(floor) as any[]) {
         const n = Number(r.n) || 0;
-        skipsByStation.set(String(r.station || ''), n);
+        if (String(r.reason || '') === 'recipe_deduction_disabled') { skipsDeductionOff += n; continue; }
+        const k = String(r.station || '');
+        skipsByStation.set(k, (skipsByStation.get(k) || 0) + n);
         skipsTotal += n;
       }
     } catch { /* table not present yet — report zero skips rather than 500 */ }
@@ -770,8 +857,10 @@ export async function GET(request: Request) {
     }
     unmappedDetail.sort((a, b3) => b3.menu_items - a.menu_items || a.station.localeCompare(b3.station));
 
+    // Seeded, so every state the API can emit reports a real 0 rather than
+    // `undefined` — the summary strip reads these by name.
     const stateCounts: Record<string, number> = {
-      ok: 0, no_recipe: 0, station_unmapped: 0, not_counted: 0, no_opening: 0,
+      ok: 0, no_recipe: 0, station_unmapped: 0, not_counted: 0, no_opening: 0, deduction_off: 0,
     };
     for (const r of rows) stateCounts[r.difference_state] = (stateCounts[r.difference_state] || 0) + 1;
 
@@ -794,7 +883,14 @@ export async function GET(request: Request) {
         unmapped_stations: unmappedDetail.map(u => u.station),
         unmapped_station_detail: unmappedDetail,
         station_map_available: mappingTableReadable,
+        // Skips that are a GAP — the station could not be charged to any
+        // department. This is the number both banners print beside "not mapped
+        // yet"; deliberate switch-offs are excluded from it by reason.
         consumption_skips_since_cutover: skipsTotal,
+        // Skips that are a CHOICE — recipe deduction is switched off for the
+        // department the station feeds. Reported separately so no screen can add
+        // the two together again by accident.
+        consumption_skips_deduction_off: skipsDeductionOff,
         pre_cutover_excluded_lines: preCutoverLines,
         pre_cutover_included_in_any_column: false,
         liquor_materials_excluded: liquorMaterials.size,

@@ -1,4 +1,5 @@
 import type Database from 'better-sqlite3';
+import { postCentralTxn, vendorParty } from '@/lib/movement-record';
 import { generateId, updateMaterialPrice, logAuditEvent } from './db';
 import { centralFlowBlock } from './store-engine';
 import { getCentralStoreCutoverDate } from './central-cutover';
@@ -1769,10 +1770,10 @@ export function decideGrnQc(
              last_purchase_date = ?, updated_at = datetime('now')
        WHERE id = ?
     `);
-    const insTx = db.prepare(`
-      INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, created_at, outlet_id)
-      VALUES (?, ?, 'purchase', ?, ?, ?, datetime('now'), ?)
-    `);
+    // The raw central-txn INSERT that stood here is now postCentralTxn at the
+    // call site below (movement-record.ts), so a QC-released receipt records
+    // the vendor it came from, the unit it is measured in, the bill's date and
+    // the signer — none of which the bare INSERT had a column for.
     const stampLine = db.prepare(`UPDATE goods_receipt_note_items SET qc_applied_at = datetime('now') WHERE id = ?`);
 
     const poNumber = grn.po_id
@@ -1976,11 +1977,19 @@ export function decideGrnQc(
         });
       } else {
         bumpStock.run(stockQty, gross, grn.date, r.item.material_id);
-        insTx.run(
-          generateId(), r.item.material_id, stockQty, purchaseId,
-          poNumber ? `PO ${poNumber} received via GRN ${grn.grn_number}` : `Ad-hoc GRN ${grn.grn_number}`,
-          grn.outlet_id,
-        );
+        postCentralTxn(db, {
+          materialId: r.item.material_id,
+          type: 'purchase',
+          quantity: stockQty,
+          referenceId: purchaseId,
+          notes: poNumber ? `PO ${poNumber} received via GRN ${grn.grn_number}` : `Ad-hoc GRN ${grn.grn_number}`,
+          outletId: grn.outlet_id,
+          // A QC-held perishable enters stock only when the kitchen/bar signs.
+          // The movement is still a VENDOR receipt; the signer is the actor.
+          counterparty: vendorParty(grn.vendor, grn.vendor_id),
+          txnDate: grn.date,
+          actor: actorEmail,
+        });
       }
       stampLine.run(r.item.id);
       touched.add(String(r.item.material_id));

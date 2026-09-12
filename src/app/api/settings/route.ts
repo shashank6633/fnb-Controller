@@ -25,10 +25,29 @@ import { SECRET_KEY_RE } from '@/lib/secret-keys';
  *   owner: '<path>' → the key belongs to a dedicated route that validates and
  *                     masks it; this generic door is shut for EVERYONE, admins
  *                     included, so that route stays the single way in.
+ *   retired: '<why>' → the behaviour this key switched NO LONGER EXISTS in the
+ *                     code. The row survives as a historical marker, and the
+ *                     write door is shut for EVERYONE, admins included: arming
+ *                     a switch whose rail was deleted can only mislead the next
+ *                     person who reads the value. READ stays open.
  */
-type KeyPolicy = { read?: 'admin'; write?: 'admin'; writeError?: string; owner?: string };
+type KeyPolicy = { read?: 'admin'; write?: 'admin'; writeError?: string; owner?: string; retired?: string };
 
 const KEY_POLICY = new Map<string, KeyPolicy>([
+  // WHICH DEPARTMENTS DEDUCT STOCK FROM RECIPES. Owned by /api/departments, which
+  // gates writes on ADMIN. This generic endpoint's floor is admin-OR-manager, so
+  // until these keys were listed here a MANAGER could store {every department: 0}
+  // through PUT /api/settings and switch recipe deduction off for the whole
+  // restaurant — measured: 29 departments zeroed, a real KOT-complete then booked
+  // 0 department rows and one `recipe_deduction_disabled` skip. It was worse than
+  // a live bypass: on a database with no column yet the row sat looking inert and
+  // the next boot promoted it to authoritative (see src/lib/db.ts, where that
+  // hand-over has been removed). `owner` makes this route refuse the key outright
+  // and name the screen that owns it, rather than silently accepting a write
+  // nothing reads.
+  ['department_recipe_deduction_v1',      { owner: '/api/departments' }],
+  ['department_recipe_deduction_seed_v1', { owner: '/api/departments' }],
+  ['department_recipe_deduction_auto_v1', { owner: '/api/departments' }],
   // The crash-alert WhatsApp number decides WHO gets production error alerts.
   // Admin-only to read (don't hand a personal number to every signed-in staff
   // session) and to write — the /api/error-report console is admin-only, so a
@@ -126,6 +145,25 @@ const KEY_POLICY = new Map<string, KeyPolicy>([
   // the value names which page gates are relaxed, which the client bundle's
   // own catalog + /api/auth/me already reveal.
   ['hod_only_overrides', { owner: '/api/settings/hod-only' }],
+  // RETIRED 2026-09-10 (owner ruling). tm_floor_autodeduct armed the floor
+  // auto-deduct: with it at '1', a dine-in sale posted an OUTWARD
+  // store_stock_ledger row on the floor bar store. That branch has been removed
+  // from deductInventoryForSale — a sale, a KOT completion and a recipe
+  // explosion may not move stock at store level at all.
+  //
+  // This row is not decoration. The key has NO UI toggle and is not matched by
+  // SECRET_KEY_RE, so before this entry ANY admin OR MANAGER could PUT it to
+  // '1' through this generic door. That can no longer resurrect the deleted
+  // rail, but it WOULD flip store-engine's floorReconciliation() into 'ledger'
+  // mode, where ACTUAL is summed from the floor sale rows nothing writes any
+  // more — reporting every pour in the period as unexplained variance. One PUT,
+  // and the leak report reads as a total loss.
+  ['tm_floor_autodeduct', {
+    retired:
+      'floor stock is measured by counting (opening + transfers in − closing), not by sales — ' +
+      'a sale no longer moves store stock at all. The key is kept only as a historical marker; ' +
+      'its value at retirement is in tm_floor_autodeduct_was.',
+  }],
 ]);
 
 /**
@@ -213,6 +251,17 @@ export async function PUT(req: Request) {
   if (owner) {
     return Response.json(
       { error: `'${k}' is managed by ${owner} — the generic settings endpoint does not write it` },
+      { status: 403 },
+    );
+  }
+  // Retired keys are frozen for EVERYONE (admins included). The switch has no
+  // rail left to switch, and a live-looking value would only mislead the next
+  // reader — or, for tm_floor_autodeduct, silently re-point a report at a data
+  // source nothing writes any more. Refuse rather than store.
+  const retired = KEY_POLICY.get(k)?.retired;
+  if (retired) {
+    return Response.json(
+      { error: `'${k}' is retired and cannot be changed — ${retired}` },
       { status: 403 },
     );
   }

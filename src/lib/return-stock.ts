@@ -3,6 +3,7 @@ import { generateId } from './db';
 import { assertReversible, postDeptLedger } from './dept-ledger';
 import { directRowsForGrn } from './direct-issue';
 import { centralFlowBlock } from './store-engine';
+import { postCentralTxn, deptParty, vendorParty } from '@/lib/movement-record';
 
 /**
  * THE two stock movers for the Returns module (owner requirements 72-79).
@@ -392,7 +393,12 @@ export function acceptInternalReturnLine(db: Database.Database, p: InternalRetur
     referenceId: p.returnId || returnItemId,
     source: 'material-return',
     notes: note,
-    user: p.actor || '',
+    // SYMMETRIC WITH THE CENTRAL HALF of this same return (postCentralTxn
+    // below defaults to 'system:internal-return'). postDeptLedger refuses a
+    // blank actor, so an unequal fallback means one half of a two-sided
+    // movement commits and the other throws — the department is left holding
+    // goods the return already took back. Same machine actor on both sides.
+    user: String(p.actor || '').trim() || 'system:internal-return',
   });
 
   if (disposition !== 'reusable') {
@@ -455,10 +461,20 @@ export function acceptInternalReturnLine(db: Database.Database, p: InternalRetur
   // ('sale','nc','party','staff_meal','wastage') that exclude requisition_issue
   // entirely, so a positive row is inert in both.
   const invTxnId = generateId();
-  db.prepare(`
-    INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, created_at, outlet_id)
-    VALUES (?, ?, 'requisition_issue', ?, ?, ?, datetime('now'), ?)
-  `).run(invTxnId, materialId, qty, returnItemId, note, outletId);
+  // MOVEMENT RECORD: goods coming back INTO central FROM the department that
+  // held them. Positive sign, so the department is the source and central the
+  // destination — the mirror image of the issue above.
+  postCentralTxn(db, {
+    id: invTxnId,
+    materialId,
+    type: 'requisition_issue',
+    quantity: qty,
+    referenceId: returnItemId,
+    notes: note,
+    outletId,
+    counterparty: deptParty(db, departmentId),
+    actor: String(p.actor || '').trim() || 'system:internal-return',
+  });
 
   return { deptTxnId: deptTxn.id, invTxnId, recipeQty: qty, centralDelta: qty, disposition };
 }
@@ -585,7 +601,11 @@ export function acceptVendorReturnLine(db: Database.Database, p: VendorReturnLin
       referenceId: p.returnId || returnItemId,
       source: 'material-return',
       notes: note,
-      user: p.actor || '',
+      // Same rule as the internal-return rail above: postDeptLedger refuses a
+      // blank actor, and this reversal is the ONLY write on this path — a
+      // throw here loses the give-back entirely. 'system:vendor-return' is the
+      // actor the central half of the same flow already uses.
+      user: String(p.actor || '').trim() || 'system:vendor-return',
     });
 
     // centralDelta 0, honestly: central never held these goods and did not move.
@@ -628,11 +648,32 @@ export function acceptVendorReturnLine(db: Database.Database, p: VendorReturnLin
   // and whose variance term is joined to the wastages table we would not have)
   // precisely so the gap is greppable and can be closed with one term when the
   // owner approves an edit to that committed formula.
+  const returnVendor = (() => {
+    try {
+      if (!grnId) return { name: '', id: '' };
+      const g = db.prepare('SELECT vendor, vendor_id FROM goods_receipt_notes WHERE id = ?')
+        .get(grnId) as { vendor?: string; vendor_id?: string } | undefined;
+      return { name: String(g?.vendor || ''), id: String(g?.vendor_id || '') };
+    } catch { return { name: '', id: '' }; }
+  })();
   const invTxnId = generateId();
-  db.prepare(`
-    INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, created_at, outlet_id)
-    VALUES (?, ?, 'vendor_return', ?, ?, ?, datetime('now'), ?)
-  `).run(invTxnId, materialId, -qty, returnItemId, note, outletId);
+  // MOVEMENT RECORD: goods leaving the building, back to the supplier. The
+  // vendor was only ever in the note text; it is a filterable destination now.
+  postCentralTxn(db, {
+    id: invTxnId,
+    materialId,
+    type: 'vendor_return',
+    quantity: -qty,
+    referenceId: returnItemId,
+    notes: note,
+    outletId,
+    // The supplier is not on VendorReturnLine — it lives on the GRN the return
+    // is raised against. Resolved here rather than left blank, and defensively:
+    // a return with no grnId still records kind 'vendor', which is true, with
+    // the generic label. Never throws — a lookup must not fail a return.
+    counterparty: vendorParty(returnVendor.name, returnVendor.id),
+    actor: String(p.actor || '').trim() || 'system:vendor-return',
+  });
 
   return { deptTxnId: null, invTxnId, recipeQty: qty, centralDelta: -qty, disposition: 'reusable' };
 }

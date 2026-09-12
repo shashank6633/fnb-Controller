@@ -3,7 +3,8 @@ import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
 import { settleAuthority, recordSettleOverride } from '@/lib/settle-authority';
 import { todayIST } from '@/lib/format-date';
 import { computeBill, sumItemTax } from '@/lib/bill-calc';
-import { resolveFloorStore } from '@/lib/store-engine';
+// resolveFloorStore is NOT imported any more: parking a bill no longer resolves
+// — or posts to — a floor bar store (owner ruling 2026-09-10).
 
 /**
  * POST /api/dine-in/orders/[id]/hold — park a finalised bill as UNPAID.
@@ -77,12 +78,9 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     );
     const taxTotal = Math.round((bill.cgst + bill.sgst) * 100) / 100;
 
-    let floorStoreId: string | undefined;
-    try {
-      const zoneRow = order.table_id ? db.prepare('SELECT zone FROM restaurant_tables WHERE id = ?').get(order.table_id) as any : null;
-      floorStoreId = resolveFloorStore(db, zoneRow?.zone) || undefined;
-    } catch (e) { console.error('[hold floor-resolve]', id, e); floorStoreId = undefined; }
-
+    // The floor-store resolve that stood here is GONE (owner ruling 2026-09-10):
+    // a held bill's deduct may not move stock at store level. It lands on the
+    // DEPARTMENT rail via the line's station, or nowhere with a recorded skip.
     const hold = db.transaction(() => {
       const freshDeduct = db.prepare('SELECT recipe_deducted_at FROM order_items WHERE id = ?');
       const stampDeduct = db.prepare("UPDATE order_items SET recipe_deducted_at = datetime('now') WHERE id = ?");
@@ -108,10 +106,16 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           // wrong kitchen is worse than not deducting. Liquor lines land here too
           // and are carved out downstream on the store rail — not here.
           station: it.station || null,
-          skip_inventory: alreadyDeducted, store_id: floorStoreId,
+          skip_inventory: alreadyDeducted,
           bill_type: order.bill_type || 'normal', selling_price: it.unit_price, date, sale_time: saleTime,
           order_id: order.id, category: it.station || null, server: order.server_name || null,
           order_type: order.order_type || 'dine-in', pos_item_id: mi?.pos_id || null, pos_item_name: it.name, outlet_id: outletId,
+          // FIELD 8 — from the SESSION (this route 401s without `me`). Same
+          // reason as settle: a held bill's deduct was being stamped with the
+          // machine actor while a named person was standing at the till.
+          actor: me.email,
+          // The order line that caused the consumption — same reason as settle.
+          order_item_id: it.id,
         });
         if (!alreadyDeducted && it.recipe_id) stampDeduct.run(it.id);
       }

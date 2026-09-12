@@ -215,7 +215,12 @@ export function postDirectReceipt(db: Database.Database, p: DirectReceiptPost): 
     referenceId: p.purchaseRowId,
     source: p.source,
     notes: p.notes,
-    user: p.user || '',
+    // FIELD 8 — and '' is not an answer. postDeptLedger REFUSES a blank actor,
+    // and it refuses AFTER work has begun, inside the caller's transaction, so
+    // a caller with no session did not fail politely: it dragged the whole unit
+    // of work down with it. A machine actor naming the rail is a TRUE answer
+    // where '' never was, and a person's name would be a lie.
+    user: String(p.user || '').trim() || 'system:direct-issue',
   });
   db.prepare(`UPDATE purchases SET direct_issue_dept_id = ? WHERE id = ?`)
     .run(p.target.departmentId, p.purchaseRowId);
@@ -250,7 +255,10 @@ export function postDirectDelta(db: Database.Database, p: {
     referenceId: String(p.purchaseRowId),
     source: p.source,
     notes: p.notes,
-    user: p.user || '',
+    // FIELD 8 — see postDirectReceipt above. This site is the BILL-AMENDMENT
+    // delta rail, so it names itself that: the quantity on an already-stamped
+    // cost row moved, and no human necessarily asked for it.
+    user: String(p.user || '').trim() || 'system:direct-issue-amendment',
   });
 }
 
@@ -322,7 +330,12 @@ export function reverseDirectReceiptRow(
     referenceId: String(row.id),
     source: opts.source,
     notes: opts.notes,
-    user: opts.user || '',
+    // FIELD 8 — see postDirectReceipt above, and this is the site where a blank
+    // actor cost the most: a GRN void would 500 and the department was never
+    // unwound, so the voided GRN's stock stood forever in a kitchen that did
+    // not physically have it — identically on every retry, because the cause
+    // was structural. This rail is the reversal, so it says so.
+    user: String(opts.user || '').trim() || 'system:direct-issue-reversal',
   });
   return -net;
 }

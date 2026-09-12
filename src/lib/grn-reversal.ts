@@ -17,6 +17,7 @@ import {
 // why this file — which only ever wrote the unaddressed 'admin' broadcast — now
 // calls it too. Never throws, by contract.
 import { raiseDeviationAlert } from './po-deviation-alert';
+import { postCentralTxn, vendorParty } from '@/lib/movement-record';
 
 /**
  * ╔══════════════════════════════════════════════════════════════════════════╗
@@ -604,7 +605,14 @@ export function reverseGrnMovement(
     const grnNo = String((db.prepare(`SELECT grn_number FROM goods_receipt_notes WHERE id = ?`).get(grnId) as any)?.grn_number || grnId);
     for (const row of directRowsForGrn(db, grnId, materialId || undefined)) {
       const posted = reverseDirectReceiptRow(db, row, {
-        user: opts.actor || '',
+        // NEVER BLANK. reverseDirectReceiptRow hands this straight to
+        // postDeptLedger, which refuses a blank actor — so a void with no
+        // actor threw AFTER the central unwind had already run, rolled the
+        // whole void back with a 500, and left the department holding stock
+        // from a GRN that no longer exists. The route passes a session email
+        // behind a 401, so this is the belt to that braces; the machine actor
+        // is a true answer and '' never was.
+        user: String(opts.actor || '').trim() || 'system:grn-reversal',
         source: 'grn_reversal',
         notes: `Direct issue reversed — ${grnNo} ${scoped ? 'line amended' : 'voided'}`,
         outletId: null,
@@ -884,6 +892,12 @@ export function amendGrnLines(
   },
 ): AmendGrnLinesResult {
   const { grnId, actorEmail, reason, lines, expectStatus, expectEditCount } = input;
+  // THE ACTOR STAMPED ON MOVEMENTS, which is not the same obligation as the
+  // actor stamped on the GRN's own edited_by. postCentralTxn and postDeptLedger
+  // both REFUSE a blank actor, and a refusal here aborts an amendment that has
+  // already moved stock — so the movement sites below use this, never the raw
+  // field. edited_by keeps its deployed value untouched.
+  const movementActor = String(actorEmail || '').trim() || 'system:grn-amend';
 
   const grn = db.prepare(`SELECT * FROM goods_receipt_notes WHERE id = ?`).get(grnId) as any;
   if (!grn) throw refuse(404, 'not_found', 'Not found');
@@ -1585,7 +1599,7 @@ export function amendGrnLines(
             material_id: materialId, material_name: materialName,
             qty: isDirectRow ? 0 : recordedIn, current_stock: onHandBefore,
           }];
-          const rev = reverseGrnMovement(db, { grnId, materialId, moves, includeGrossCandidate: true, actor: actorEmail });
+          const rev = reverseGrnMovement(db, { grnId, materialId, moves, includeGrossCandidate: true, actor: movementActor });
           result.purchases_deleted += rev.purchases_deleted;
           result.transactions_deleted += rev.transactions_deleted;
           result.last_purchase_stale.push(...rev.last_purchase_stale);
@@ -1668,7 +1682,7 @@ export function amendGrnLines(
             recipeDelta: delta,
             purchaseRowId: String(costRow.id),
             outletId: grn.outlet_id ?? null,
-            user: actorEmail,
+            user: movementActor,
             source: 'grn_amend',
             notes: `Direct issue corrected — ${grnNumber} amended`,
           });
@@ -1776,16 +1790,22 @@ export function amendGrnLines(
             recipeQty: newIn,
             purchaseRowId: purchaseId,
             outletId: grn.outlet_id ?? null,
-            user: actorEmail,
+            user: movementActor,
             source: 'grn_amend',
             notes: `Direct issue: line booked by bill amendment (${grnNumber})`,
           });
         } else {
-          db.prepare(`
-            INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, created_at, outlet_id)
-            VALUES (?, ?, 'purchase', ?, ?, ?, datetime('now'), ?)
-          `).run(generateId(), materialId, newIn, purchaseId,
-                 `Amended ${grnNumber}`, grn.outlet_id);
+          postCentralTxn(db, {
+            materialId,
+            type: 'purchase',
+            quantity: newIn,
+            referenceId: purchaseId,
+            notes: `Amended ${grnNumber}`,
+            outletId: grn.outlet_id,
+            counterparty: vendorParty(grn.vendor, grn.vendor_id),
+            txnDate: grn.date,
+            actor: movementActor,
+          });
           db.prepare(`UPDATE raw_materials SET current_stock = current_stock + ?, updated_at = datetime('now') WHERE id = ?`)
             .run(newIn, materialId);
           result.transactions_created++;

@@ -8,7 +8,8 @@
 
 import React, { useEffect, useState } from 'react';
 import { Building, Plus, Edit, Save, X, Loader2 } from 'lucide-react';
-import { api } from '@/lib/api';
+import { api, apiJson } from '@/lib/api';
+import Toggle from '@/components/Toggle';
 import DeviationRoutingReadiness from '@/components/DeviationRoutingReadiness';
 
 interface User { id: string; name: string; email: string; role: string; is_active?: number; is_head_chef?: number; }
@@ -29,9 +30,74 @@ interface Department {
   parent_name?: string;               // resolved name of parent (main) dept
   head_user_name?: string;            // resolved name of the department head
   head_user_email?: string;
+  /**
+   * 1 = a sale's recipe takes stock off this department when the KOT is
+   * completed. 0 = this department's usage is recorded through goods movement
+   * (issues, transfers, returns and counts) instead. Always present on the
+   * wire: the API merges it onto every row, so `undefined` here means an old
+   * server, not a decision — treated as 1, which is what this app did before
+   * the switch existed.
+   */
+  recipe_deduction_enabled?: number;
+  /**
+   * HOW that answer was reached: 'on'/'off' are switches a person set; 'auto'
+   * FOLLOWS THE STATION MAPPING and can change without anyone touching this
+   * screen. Without this the page painted a derived value as the owner's own
+   * switch, so mapping a station elsewhere silently turned deduction on.
+   */
+  recipe_deduction_mode?: 'on' | 'off' | 'auto';
+  /**
+   * Which till stations route orders to this department, from
+   * station_departments. `mapped_stations` are live; `paused_stations` have a
+   * mapping row that is switched off in Settings, so nothing reaches them today.
+   * Both are always sent by the API — `undefined` here means an old server.
+   *
+   * WHY THE SCREEN NEEDS THEM: several departments shadow each other by name
+   * ("Bar" / "Akan Bar" / "Akan Perishables Bar", "Kitchen" / "Akan Main
+   * Kitchen") and only ONE of each pair is on the till. Without this the page
+   * printed the identical promise — "Takes stock off using recipes when a dish
+   * is sold" — on both, and switching it on for the wrong one was accepted, did
+   * nothing for ever, and said nothing about it.
+   */
+  mapped_stations?: string[];
+  paused_stations?: string[];
 }
 
 const empty = (): Partial<Department> => ({ name: '', code: '', description: '', head_chef_user_id: null, is_active: 1, parent_id: null, head_user_id: null, area: '' });
+
+/**
+ * WHICH ORDERS ACTUALLY LAND HERE — the line that stops this screen making a
+ * promise the till cannot keep.
+ *
+ * "Bar" and "Akan Bar" sit next to each other in this list and used to carry the
+ * identical sentence, but only "Bar" has a station pointing at it. Switching
+ * recipe deduction on for "Akan Bar" was accepted, saved, and deducted nothing —
+ * for ever — with nothing on the page to explain why. Naming the stations makes
+ * the pair tell themselves apart, and the amber line says plainly that a
+ * department nothing routes to will not deduct however this switch is set.
+ *
+ * Nothing here renames, merges or retires a department: it only reports what
+ * station_departments already says.
+ */
+function DeductReach({ d }: { d: Department }) {
+  const live = d.mapped_stations || [];
+  const paused = d.paused_stations || [];
+  if (d.mapped_stations === undefined) return null;      // older server — say nothing rather than guess
+  if (live.length > 0) {
+    return (
+      <span className="block mt-0.5 text-[#8B7355]">
+        Orders from <b className="font-medium text-[#6B5744]">{live.join(', ')}</b> land here.
+      </span>
+    );
+  }
+  return (
+    <span className="block mt-0.5 text-[#8a5a06]">
+      {paused.length > 0
+        ? <>Nothing reaches this department from the till right now — {paused.join(', ')} {paused.length === 1 ? 'is' : 'are'} switched off in Settings → Station → Department.</>
+        : <>Nothing reaches this department from the till, so recipes take nothing off it whatever this switch says. Send a station here in Settings → Station → Department first.</>}
+    </span>
+  );
+}
 
 // Coarse areas used for closing-stock rollups. A department belongs to exactly one.
 const AREA_OPTIONS: { value: string; label: string }[] = [
@@ -96,6 +162,47 @@ export default function DepartmentsPage() {
   // only admins get the New / Edit / Save actions, which are gated server-side too.
   const isAdmin = me?.role === 'admin';
 
+  /* ── RECIPE DEDUCTION, PER DEPARTMENT ───────────────────────────────────────
+   * ON  → when a dish is sold and the KOT is completed, its recipe takes the
+   *       ingredients off THIS department's stock.
+   * OFF → nothing is taken off automatically; what this department uses is
+   *       recorded through goods movement — issues, transfers, returns and
+   *       counts. Nothing goes missing: every line the switch declines is still
+   *       written down, marked as recorded-not-deducted, so it shows up on the
+   *       issued log rather than vanishing.
+   *
+   * PATCH, not the edit modal's PUT: PUT clears the HOD when a body omits it,
+   * and a one-tick switch must not be able to wipe a department's approver.
+   * The server re-checks admin and re-reads the stored value, so this is a
+   * mirror of the gate, never the gate itself.
+   * ─────────────────────────────────────────────────────────────────────── */
+  const deductOn = (d: Department): boolean => d.recipe_deduction_enabled !== 0;
+  /** True when this row is DERIVED from the station mapping, not set by hand. */
+  const deductAuto = (d: Department): boolean => (d.recipe_deduction_mode ?? 'auto') === 'auto';
+  const [deductBusy, setDeductBusy] = useState<string | null>(null);
+  const setDeduct = async (d: Department, next: boolean) => {
+    setDeductBusy(d.id);
+    // Optimistic, then corrected from the server's read-back below.
+    setDepts(prev => prev.map(x => x.id === d.id ? { ...x, recipe_deduction_enabled: next ? 1 : 0 } : x));
+    try {
+      // apiJson, not api: api() hands back a raw Response and never throws, so a
+      // 403/503 would have been swallowed and the switch left showing a change
+      // the server refused.
+      const r = await apiJson<{ department?: { recipe_deduction_enabled?: number } }>(
+        '/api/departments', { method: 'PATCH', body: { id: d.id, recipe_deduction_enabled: next } });
+      const stored = r?.department?.recipe_deduction_enabled;
+      setDepts(prev => prev.map(x => x.id === d.id
+        ? { ...x, recipe_deduction_enabled: stored === undefined ? (next ? 1 : 0) : Number(stored) }
+        : x));
+    } catch (e: any) {
+      // Put the switch back where it was and say why, in his words.
+      setDepts(prev => prev.map(x => x.id === d.id ? { ...x, recipe_deduction_enabled: next ? 0 : 1 } : x));
+      alert(e?.message || 'Could not change recipe deduction for this department.');
+    } finally {
+      setDeductBusy(null);
+    }
+  };
+
   const save = async () => {
     if (!editing?.name) { alert('Name required'); return; }
     setSaving(true);
@@ -142,6 +249,12 @@ export default function DepartmentsPage() {
   // Parent row for the dept currently being edited (used for inheritance display).
   const editingParent = editing?.parent_id ? depts.find(d => d.id === editing.parent_id) : null;
 
+  // ── Recipe deduction, at a glance ─────────────────────────────────────────
+  // With 29 departments across 13 groups this list is 42 rows; without a total
+  // the only way to answer "which of my kitchens deduct?" is to read every one.
+  const deductCount = depts.filter(d => deductOn(d)).length;
+  const onTill = (d: Department) => (d.mapped_stations?.length || 0) > 0;
+
   return (
     <div className="p-6 max-w-6xl mx-auto">
       <div className="flex items-center justify-between mb-6">
@@ -178,6 +291,19 @@ export default function DepartmentsPage() {
           You're viewing the department list in read-only mode. Sign in as an admin to add or edit departments.
         </div>
       )}
+      {/* One sentence so the answer to "which of my kitchens deduct?" does not
+          require reading 42 rows. Counted from the same values the rows show. */}
+      {!loading && depts.length > 0 && (
+        <div className="mb-3 px-1 text-xs text-[#6B5744]">
+          <b className="text-[#2D1B0E]">{deductCount}</b> of {depts.length} departments take stock off using recipes when a dish
+          is sold. The other {depts.length - deductCount} record what they use through goods movement — issues, transfers,
+          returns and counts.
+          {depts.some(d => deductOn(d) && !onTill(d)) && (
+            <span className="text-[#8a5a06]">{' '}Some of them have no station pointing at them, so nothing reaches
+              them from the till — those rows say so.</span>
+          )}
+        </div>
+      )}
 
       {/* Off-PO deviation alert routing readiness.
           ADMIN ONLY, matching the New / Edit / Save controls above and the
@@ -204,7 +330,10 @@ export default function DepartmentsPage() {
                 <th className="text-left  py-2 px-3 font-medium">HOD</th>
                 <th className="text-right py-2 px-3 font-medium">Members</th>
                 <th className="text-right py-2 px-3 font-medium">Open Reqs</th>
-                <th className="text-left  py-2 px-3 font-medium">Status</th>
+                {/* The switch lives in this column, so it gets a name. It shared
+                    the "Status" heading before, and at a glance the page still
+                    looked like it only answered "is this department active?". */}
+                <th className="text-left  py-2 px-3 font-medium">Status &amp; recipe deduction</th>
                 <th></th>
               </tr>
             </thead>
@@ -285,6 +414,65 @@ export default function DepartmentsPage() {
                       {d.is_active
                         ? <span className="text-[10px] px-2 py-0.5 rounded bg-emerald-100 text-emerald-700 font-medium">Active</span>
                         : <span className="text-[10px] px-2 py-0.5 rounded bg-[#E8D5C4] text-[#6B5744]">Archived</span>}
+                      {/* Recipe deduction. Admins get the switch; everyone else
+                          sees the state in words, because "is this kitchen's
+                          stock coming off automatically?" is a question a store
+                          manager reading this list needs answered too. */}
+                      <div className="mt-1.5">
+                        {isAdmin ? (
+                          <div className="flex items-start gap-1.5">
+                            <Toggle
+                              size="sm"
+                              /* !min-h-0 — globals.css gives every `main button` a
+                                 36px minimum height for tap targets on tablets and
+                                 phones, which on a 36px-wide track turns this switch
+                                 into a CIRCLE: at 768px it stopped reading as an
+                                 on/off switch at all and looked like a radio button.
+                                 The after:* box puts the 36px TAP area back as an
+                                 invisible overlay, so the control keeps its pill
+                                 shape and its finger-sized target. (The same clash
+                                 affects every Toggle in the app; the real fix
+                                 belongs in components/Toggle.tsx, which this lane
+                                 may not edit — reported.) */
+                              className="!min-h-0 after:absolute after:content-[''] after:-inset-2"
+                              checked={deductOn(d)}
+                              disabled={deductBusy === d.id}
+                              onChange={(next) => setDeduct(d, next)}
+                              label={deductOn(d) ? 'Take stock off using recipes' : 'Record usage through goods movement'}
+                              title={deductAuto(d)
+                                ? (deductOn(d)
+                                  ? 'Following your station mapping: a till station points here, so recipes take ingredients off this department. Nobody set this by hand — remap the stations and it changes.'
+                                  : 'Following your station mapping: no till station points here, so recipes take nothing off. Nobody set this by hand — map a station here and it changes.')
+                                : deductOn(d)
+                                ? 'On — when a dish is sold, its recipe takes the ingredients off this department’s stock.'
+                                : 'Off — nothing comes off automatically. What this department uses is recorded through goods movement: issues, transfers, returns and counts.'}
+                            />
+                            <span className="text-[10px] leading-snug text-[#8B7355] max-w-[190px]">
+                              {deductOn(d)
+                                ? <>Takes stock off <b className="font-medium text-[#6B5744]">using recipes</b> when a dish is sold.</>
+                                : <>Usage recorded through <b className="font-medium text-[#6B5744]">goods movement</b> — issues, transfers, returns and counts. Recipes take nothing off here.</>}
+                              {deductAuto(d) && (
+                                <> <b className="font-medium text-[#6B5744]">This follows your station mapping.</b>{' '}
+                                  {deductOn(d)
+                                    ? <>A till station points here, so recipes come off. Point them elsewhere and this turns itself off.</>
+                                    : <>No till station points here yet. Map one on Station → Department and this turns itself on.</>}{' '}
+                                  Use the switch to decide it yourself instead.</>
+                              )}
+                              <DeductReach d={d} />
+                            </span>
+                          </div>
+                        ) : (
+                          <span className={`text-[10px] px-2 py-0.5 rounded ${deductOn(d)
+                            ? 'bg-[#FFF1E3] text-[#8a3506]'
+                            : 'bg-[#EFE1D0] text-[#6B5744]'}`}
+                                title={deductOn(d)
+                                  ? 'When a dish is sold, its recipe takes the ingredients off this department’s stock.'
+                                  : 'Nothing comes off automatically. What this department uses is recorded through goods movement: issues, transfers, returns and counts.'}>
+                            {deductOn(d) ? 'Recipes take stock off' : 'Goods movement only'}
+                          </span>
+                        )}
+                        {!isAdmin && <div className="text-[10px] leading-snug text-[#8B7355] max-w-[190px]"><DeductReach d={d} /></div>}
+                      </div>
                     </td>
                     <td className="py-2 px-3 text-right">
                       {isAdmin && (
