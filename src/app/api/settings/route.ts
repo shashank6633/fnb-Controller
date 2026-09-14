@@ -91,6 +91,39 @@ const KEY_POLICY = new Map<string, KeyPolicy>([
     write: 'admin',
     writeError: 'Admin role required to change when stock is deducted',
   }],
+  // THE GOOGLE REVIEWS OAUTH CLIENT — the two halves of it that are NOT
+  // secret-shaped. reviews_gbp_client_secret is admin-write already because
+  // SECRET_KEY_RE matches "secret"; these two match nothing, so until this row
+  // existed a MANAGER could write them through this generic door. Measured on a
+  // copy of the live database: manager PUT reviews_gbp_client_id -> 200 stored,
+  // manager PUT reviews_gbp_redirect_uri -> 200 stored, after which BOTH the
+  // Reviews page and the Settings → Integrations panel displayed the manager's
+  // string under "paste this into Google as the authorised redirect URI —
+  // exactly".
+  //
+  // The redirect URI is the sharp one. callbackUrl() returns a non-empty pin
+  // VERBATIM (src/lib/reviews/connect-flow.ts), beginConnect() stores it on the
+  // OAuth state row and completeConnect() replays it at the token exchange — so
+  // whoever writes this key chooses the address Google is asked to return the
+  // authorisation code to, and the screen then asks the owner, in good faith, to
+  // register that address at Google. Blanking the client ID is milder and still
+  // not harmless: hasOauthApp() goes false, Connect switches off, and the module
+  // falls back to whatever GBP_CLIENT_ID the server's environment holds — a
+  // different credential from the one the admin believes is wired.
+  //
+  // write:'admin' and deliberately NOT owner:. The new Google Business Profile
+  // panel on /settings/integrations IS the door for these keys and writes them
+  // through here; shutting the generic door for admins too would leave no door.
+  // READ stays open on both: a client ID is public by construction in OAuth
+  // (connection.ts says so), and a callback URL is a URL, not a credential.
+  ['reviews_gbp_client_id', {
+    write: 'admin',
+    writeError: 'Admin role required to change the Google client ID',
+  }],
+  ['reviews_gbp_redirect_uri', {
+    write: 'admin',
+    writeError: 'Admin role required to change the Google redirect URI',
+  }],
   // THE VARIANCE BAR — the sharpest self-lift in this table, and it was open.
   // These TWO decide how much stock movement happens with NO admin in the
   // loop: a count whose difference is under the bar applies itself to
