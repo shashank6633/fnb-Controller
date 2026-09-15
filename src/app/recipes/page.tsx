@@ -42,6 +42,7 @@ import { api } from '@/lib/api';
 // (Type-only import of better-sqlite3 inside; nothing server-side is bundled.)
 import { costedFigures, governingListing, liveListingsFor } from '@/lib/recipe-price';
 import { convert } from '@/lib/units';
+import { hydrateUnitRegistry } from '@/lib/recipe-cost';
 // Sub-recipe INGREDIENT lines read in the PURCHASE basis (2 kg @ ₹180/kg), per the
 // carve-out declared in the pack-units header: a sub-recipe is batch-produced in
 // bulk, so the chef reasons in kg / L / BTL, not in grams. Display + entry only —
@@ -115,6 +116,31 @@ interface Recipe {
   linked_menu_price?: number | null;
   linked_menu_count?: number;
   price_drifted?: boolean;   // stored recipe price ≠ the menu price it is costed at
+
+  // ── APPROXIMATE ────────────────────────────────────────────────────────────
+  // A real recipe entered fast from its major cost drivers only
+  // (src/components/QuickRecipeModal.tsx). Stored on the row as
+  // recipes.is_approximate and set by whoever entered it — never inferred from
+  // ingredient count, because a finished 3-ingredient dish and a skeletal one
+  // are indistinguishable by count. Every number derived from such a recipe is
+  // an estimate and must be shown as one.
+  is_approximate?: boolean;
+
+  // ── UNIT SANITY ────────────────────────────────────────────────────────────
+  // Lines whose entered unit cannot be converted to the material's unit (so the
+  // quantity is being valued in the wrong unit), or whose money is implausible
+  // against the selling price. Served by /api/recipes from src/lib/recipe-sanity.ts.
+  sanity_findings?: SanityFinding[];
+  sanity_has_blocker?: boolean;
+}
+
+/**
+ * Named, because the badge now SORTS these (by line_cost) and an inline anonymous
+ * shape cannot be referred to by a comparator.
+ */
+interface SanityFinding {
+  code: string; severity: 'blocker' | 'warning'; index: number | null;
+  material_name: string; message: string; likely_cause: string; valuing: string; line_cost: number;
 }
 
 interface SubRecipe {
@@ -159,6 +185,105 @@ function foodCostColor(pct: number): string {
   if (pct <= 35) return 'text-amber-600';
   return 'text-red-600';
 }
+
+/**
+ * APPROXIMATE — the marker that must ride with every figure this recipe produces.
+ *
+ * An approximate cost presented as an exact one is worse than no cost at all,
+ * because it looks like something you can price against. So it is named on the
+ * row, not hidden in a tooltip, and the tooltip says what to do about it.
+ */
+function ApproxBadge({ compact = false }: { compact?: boolean }) {
+  return (
+    <span
+      title="APPROXIMATE — a quick recipe covering only the major cost drivers, with rough quantities. Its cost is real and flows through the normal costing engine, but treat it as an estimate. Edit the recipe, add the remaining ingredients, and untick “quantities are approximate” to make it exact."
+      className={`inline-flex items-center gap-0.5 font-medium rounded-md border border-amber-300 bg-amber-50 text-amber-800 ${
+        compact ? 'text-[10px] px-1 py-0' : 'text-[11px] px-1.5 py-0.5'
+      }`}
+    >≈ approx</span>
+  );
+}
+
+/**
+ * A recipe whose ingredient lines do not add up — a unit that cannot be
+ * converted (so the quantity is priced in the wrong unit), or money that is
+ * absurd against the selling price. This is how LOOSE PRAWNS shows ₹63,012:
+ * 100 pcs of prawns valued as 100 kg. The badge carries the reason.
+ */
+/**
+ * IS THE COST NOISE, OR IS IT A NOTE? — the SAME rule /api/menu-items grades by
+ * (its `recipe_cost_unusable`), applied to the same findings, so one dish cannot
+ * be "cost is wrong" on one screen and "check units" on the other. It was: this
+ * page put the identical "⚠ check units" pill on GONGURA PRAWNS' ₹63,012 and on
+ * THAI GREEN CURRY's ₹1.67-out ₹152.24, while /menu-items called the first red
+ * and the second amber. 38 rows with no order of urgency is a worklist nobody
+ * finishes.
+ *
+ * Unusable when the lines the engine could not convert are more than a quarter of
+ * the cost, or when those lines alone cost more than the dish sells for.
+ */
+function costIsUnusable(recipe: Recipe): boolean {
+  const blockers = (recipe.sanity_findings || []).filter((f) => f.severity === 'blocker');
+  if (!blockers.length) return false;
+  const suspect = blockers.reduce((sum, f) => sum + (Number(f.line_cost) || 0), 0);
+  const basis = Number(recipe.total_cost) || 0;
+  const price = Number(recipe.effective_selling_price ?? recipe.selling_price) || 0;
+  return (basis > 0 && suspect / basis > 0.25) || (price > 0 && suspect > price);
+}
+
+function SanityBadge({ recipe, compact = false }: { recipe: Recipe; compact?: boolean }) {
+  const findings = recipe.sanity_findings || [];
+  if (!findings.length) return null;
+  /**
+   * WHICH finding the badge speaks for — the most EXPENSIVE one of the highest
+   * severity present, not whichever happens to sit first in the ingredient list.
+   *
+   * Picking the first is how MUTTON MURAG SOUP led with an ₹8.37 bay-leaf note
+   * while a ₹3,890.25 line on the same recipe — 1.5 kg of cardamom, 76% of its
+   * cost — went unmentioned. Same ordering as /api/menu-items, so the badge here
+   * and the badge there name the same line.
+   */
+  const byMoney = (a: SanityFinding, b: SanityFinding) =>
+    (Number(b.line_cost) || 0) - (Number(a.line_cost) || 0);
+  const blockers = findings.filter((f) => f.severity === 'blocker').sort(byMoney);
+  const lead = blockers[0] ?? [...findings].sort(byMoney)[0];
+  const unusable = costIsUnusable(recipe);
+  /**
+   * A QUANTITY FAULT IS NOT A UNIT FAULT, AND THE TOOLTIP MUST STOP SAYING IT IS.
+   *
+   * The non-unusable branch printed "This is a small part of the cost, so the
+   * total is still broadly right" for EVERY warning. That sentence is true of a
+   * g-against-ml density note (out by density, a few percent) and it is a false
+   * reassurance about 700 g of sweet chilli sauce in one salad — which is 48% of
+   * that recipe's cost and moves its food cost by 32 points. The badge now says
+   * what it actually knows.
+   */
+  const quantityLead = lead.code === 'line_quantity_implausible';
+  const label = unusable ? 'cost is wrong' : quantityLead ? 'check quantity' : 'check units';
+  const closing = unusable
+    ? '\n\nMost of this recipe’s cost is on that line, so the cost and FC% it shows mean nothing until it is fixed.'
+    : quantityLead
+      ? '\n\nThis is NOT a rounding matter: a quantity this size is a large share of the cost, so the total and the FC% move a long way if it is wrong. Check it against the plate before pricing off it. If this recipe is written for a batch rather than one portion, it is correct as it stands.'
+      : '\n\nThis is a small part of the cost, so the total is still broadly right — but correct the unit when you can.';
+  return (
+    <span
+      title={`${lead.message}\n\n${lead.likely_cause}\n\n${lead.valuing}${closing}${findings.length > 1 ? `\n\n+${findings.length - 1} more on this recipe.` : ''}`}
+      className={`inline-flex items-center gap-0.5 font-medium rounded-md border ${
+        unusable ? 'border-red-300 bg-red-50 text-red-700'
+          : quantityLead ? 'border-orange-300 bg-orange-50 text-orange-800'
+          : 'border-amber-300 bg-amber-50 text-amber-800'
+      } ${compact ? 'text-[10px] px-1 py-0' : 'text-[11px] px-1.5 py-0.5'}`}
+    >⚠ {label}{findings.length > 1 ? ` (${findings.length})` : ''}</span>
+  );
+}
+
+/**
+ * The health-pill keys a URL may select, so ?health= can never set a filter that
+ * has no pill to clear it. /menu-items' red banner links here with costWrong.
+ */
+const HEALTH_FILTER_KEYS = ['costWrong', 'checkUnits', 'checkQuantity', 'noPrice', 'lossMaking', 'highFC',
+  'noMenuLink', 'noIngredients', 'suspicious', 'zeroCost', 'borderlineFC', 'noCategory',
+  'priceless_ingredients', 'dupIngredients', 'priceDrift', 'anyIssue'];
 
 function foodCostBg(pct: number): string {
   if (pct <= 20) return 'bg-green-500/15 text-green-600';
@@ -380,6 +505,16 @@ export default function RecipesPage() {
   const [formIngredients, setFormIngredients] = useState<Ingredient[]>([]);
   const [formSubRecipes, setFormSubRecipes] = useState<SubRecipeRef[]>([]);
   const [formInstructions, setFormInstructions] = useState('');   // Cookbook: cooking method
+  /**
+   * "Quantities are approximate" — the recipe's own claim about itself.
+   *
+   * This is the ONLY way an approximate recipe becomes a full one. It is never
+   * cleared as a side effect of editing: adding a fifth ingredient does not make
+   * a rough recipe exact, and silently dropping the marker on save would quietly
+   * promote an estimate into a figure people price against. A person ticks it
+   * off, deliberately, when the quantities are real.
+   */
+  const [formApproximate, setFormApproximate] = useState(false);
   const [formImageUrl, setFormImageUrl] = useState('');           // Cookbook: recipe photo URL
 
   // ── WHAT THE MENU LINK CHANGED ─────────────────────────────────────────────
@@ -443,6 +578,22 @@ export default function RecipesPage() {
   // --- Recipe health check filter ---
   const [issueFilter, setIssueFilter] = useState<string | null>(null);
 
+  /**
+   * THE UNIT TABLE THIS PAGE PRICES WITH MUST BE THE SERVER'S.
+   * convertQtyToMaterialUnit() below calls lib/units convert(), and in the browser
+   * that registry is the BUILT-IN one — the server replaced its copy from the
+   * `units` table at boot. On the owner's data PKT is 1,000 ml there and a count of
+   * 1 here, so the Eff. Cost column and the live editor preview could differ from
+   * the cost that gets stored by 2× to 1,000×, with no warning on either side. One
+   * fetch, once, then a re-render. See hydrateUnitRegistry in lib/recipe-cost.ts.
+   */
+  const [unitsLoaded, setUnitsLoaded] = useState(false);
+  useEffect(() => {
+    let alive = true;
+    hydrateUnitRegistry().then((ok) => { if (alive && ok) setUnitsLoaded(true); });
+    return () => { alive = false; };
+  }, []);
+
   // --- Bar Costing import ---
   const [barModalOpen, setBarModalOpen] = useState(false);
   const [barFileName, setBarFileName] = useState<string | null>(null);
@@ -486,6 +637,33 @@ export default function RecipesPage() {
     } catch (e) {
       console.error('Failed to fetch recipes', e);
     }
+  }, []);
+
+  /**
+   * ARRIVING FROM A MENU ITEM.
+   *
+   * /menu-items can now send someone here to look at the recipe behind a dish —
+   * "Open recipe" on a linked row. Without this, that journey landed on a list of
+   * 67 and left them to find it, which is the sort of half-connection that makes
+   * people stop following links. `?search=` simply seeds the box they would have
+   * typed into, so the URL does nothing the screen could not already do and there
+   * is no new state to keep in step. Read once, on mount, from the address bar —
+   * nothing here writes to it, so back/forward behave exactly as before.
+   */
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const params = new URLSearchParams(window.location.search);
+    const q = params.get('search');
+    if (q && q.trim()) setSearchQuery(q.trim());
+    /**
+     * ?health=costWrong — the other half of that journey. The red banner on
+     * /menu-items ("6 dishes have a cost that is wrong") linked to a bare
+     * /recipes, which opened 67 rows with no filter and left him to find the six
+     * he had just been told about. Only the keys the health pills already use are
+     * honoured, so this can never select a filter the screen cannot clear.
+     */
+    const health = params.get('health');
+    if (health && HEALTH_FILTER_KEYS.includes(health)) setIssueFilter(health);
   }, []);
 
   const fetchSubRecipes = useCallback(async () => {
@@ -612,7 +790,24 @@ export default function RecipesPage() {
             break;
           }
           case 'priceDrift': matchIssue = !!r.price_drifted; break;
+          // Split in two, by the same rule /api/menu-items grades dishes with —
+          // see costIsUnusable(). "costWrong" is the six the red banner on
+          // /menu-items sends him here for; "checkUnits" is the rest.
+          case 'costWrong': matchIssue = costIsUnusable(r); break;
+          case 'checkUnits': matchIssue = !costIsUnusable(r)
+            && (r.sanity_findings || []).some(f => f.severity === 'blocker' || f.code.startsWith('unit_')); break;
+          // Price-independent, so it must NOT be gated on costIsUnusable or on a
+          // price the way every case above is: 48 of the 67 recipes here have no
+          // effective price at all, and they are the ones this catches.
+          case 'checkQuantity': matchIssue =
+            (r.sanity_findings || []).some(f => f.code === 'line_quantity_implausible'); break;
           case 'anyIssue': matchIssue = (
+            // Both unit tiers, because both are counted in issues.total below —
+            // "Review all" showing fewer rows than the number beside it is how a
+            // count stops being believed.
+            (r.sanity_findings || []).some(f => f.severity === 'blocker' || f.code.startsWith('unit_')) ||
+            // Counted in issues.total, so it has to be reachable from "Review all".
+            (r.sanity_findings || []).some(f => f.code === 'line_quantity_implausible') ||
             !hasIngredients ||
             ep === 0 ||
             (ep > 0 && r.total_cost > ep) ||
@@ -708,7 +903,14 @@ export default function RecipesPage() {
   const summaryStats = useMemo(() => {
     if (!recipes.length) return {
       total: 0, avgFoodCost: 0, mostProfitable: '-', mostProfitableGpm: 0, highestCost: '-', highestCostFc: 0,
-      issues: { total: 0, noPrice: [], noIngredients: [], noCategory: [], highFC: [], borderlineFC: [], suspicious: [], lossMaking: [], zeroCost: [], noMenuLink: [], pricelessIngredients: [], dupIngredients: [], priceDrift: [] }
+      // Same reason as `checkUnits` below: a key missing from this empty shape is
+      // `possibly undefined` at every read site and the build fails.
+      approxCount: 0, mostProfitableApprox: false, highestCostApprox: false,
+      // checkUnits belongs here as well as in the populated shape below. Without
+      // it the two return shapes disagree, every read of
+      // summaryStats.issues.checkUnits is `possibly undefined`, and the build
+      // fails — the empty case must carry every key the full case does.
+      issues: { total: 0, noPrice: [], noIngredients: [], noCategory: [], highFC: [], borderlineFC: [], suspicious: [], lossMaking: [], zeroCost: [], noMenuLink: [], pricelessIngredients: [], dupIngredients: [], priceDrift: [], costWrong: [], checkUnits: [], checkQuantity: [], costWrongOnMenu: [] }
     };
     const total = recipes.length;
     // AVG FOOD COST averages the DERIVED food cost (fcOf) across EVERY recipe,
@@ -728,6 +930,31 @@ export default function RecipesPage() {
     const highestCostRecipe = [...recipes].sort((a, b) => fcOf(b) - fcOf(a));
     const highestCost = highestCostRecipe[0]?.name || '-';
     const highestCostFc = highestCostRecipe[0] ? fcOf(highestCostRecipe[0]) : 0;
+
+    /**
+     * IS THE HEADLINE AN ESTIMATE? — because these three tiles were printing one
+     * as though it were measured.
+     *
+     * Every figure above is derived from ingredient QUANTITIES, so a recipe whose
+     * quantities are rough makes the figure rough. The per-recipe cards further
+     * down this page already say so ("Total Cost (approx)", "≈₹…", amber) and the
+     * list rows carry an ApproxBadge — but the tiles at the top said "MOST
+     * PROFITABLE — Aburi Salmon Nigiri · GPM 100%" in confident green with no
+     * qualifier at all, which is the one thing R6 forbids: an estimate that reads
+     * as a measured headline.
+     *
+     * And the bias is not incidental, it is structural. A simple recipe lists only
+     * the major cost drivers, so it UNDER-states cost by construction; that
+     * maximises (price − cost) and therefore tends to put an approximate recipe at
+     * the TOP of "most profitable" and at the BOTTOM of food cost. The tile most
+     * likely to be wrong is the tile most likely to be read.
+     *
+     * Avg Food Cost is an average over the whole book, so what it needs is not one
+     * flag but a COUNT: how many of the figures inside it are estimates.
+     */
+    const approxCount = recipes.filter(r => r.is_approximate).length;
+    const mostProfitableApprox = !!mp?.is_approximate;
+    const highestCostApprox = !!highestCostRecipe[0]?.is_approximate;
 
     // Health check — recipes needing attention
     // Every price test below uses the EFFECTIVE price — the same denominator
@@ -768,18 +995,81 @@ export default function RecipesPage() {
     // against. FC% is already correct (it uses the menu price) — this flags the
     // stale stored number that still feeds exports and manual sales entry.
     const priceDrift = recipes.filter(r => r.price_drifted);
+    /**
+     * A LINE THIS RECIPE IS BEING COSTED IN THE WRONG UNIT.
+     *
+     * Every row already carries the ⚠ badge, but the badge could only be found by
+     * scrolling: there was no way to count these or to pull them up together, and
+     * on this data there are 38 of them holding 95% of the recipe book's total
+     * cost. LOOSE PRAWNS is one instance, not the exception. This is the pill that
+     * turns "something is wrong somewhere" into a list he can work through.
+     *
+     * Blockers only — a unit that cannot be converted or is not recognised, or a
+     * line costing more than the whole dish. The proportional warnings are real
+     * but they are judgement calls, and mixing them in would make the count
+     * arguable, which is the fastest way to make a number get ignored.
+     *
+     * SPLIT IN TWO, because one pill over both ends of a 40,000× range is not a
+     * worklist. `costWrong` is the recipe whose cost is noise (GONGURA PRAWNS,
+     * ₹63,000 of ₹63,012 on one line); `checkUnits` is the one with a unit worth
+     * correcting whose total is still broadly right (THAI GREEN CURRY, ₹1.67 of
+     * ₹152.24). Identical rule to /api/menu-items — see costIsUnusable().
+     */
+    const costWrong = recipes.filter(r => costIsUnusable(r));
+    const checkUnits = recipes.filter(r => !costIsUnusable(r)
+      && (r.sanity_findings || []).some(f => f.severity === 'blocker' || f.code.startsWith('unit_')));
+
+    /**
+     * A QUANTITY TOO LARGE TO BE ONE PORTION — ITS OWN PILL, not folded into
+     * `checkUnits`.
+     *
+     * These two faults are not the same and must not share a label. A unit note
+     * means the number is out by density — a few percent, "still broadly right",
+     * which is exactly what the checkUnits pill says out loud. A quantity note
+     * means somebody typed 700 g of sweet chilli sauce into one salad: the number
+     * is not broadly right, it is 48% of that recipe's cost and it moves the food
+     * cost by 32 points. Putting it under a pill captioned "cost still broadly
+     * right" would be a false reassurance printed by this page.
+     *
+     * A WARNING, not a blocker, so the figure is kept and nothing is struck
+     * through — a recipe written per batch legitimately crosses the bar and the
+     * finding says so. See PORTION_LIMIT in src/lib/recipe-sanity.ts.
+     */
+    const checkQuantity = recipes.filter(r =>
+      (r.sanity_findings || []).some(f => f.code === 'line_quantity_implausible'));
+
+    /**
+     * HOW MANY OF THOSE ARE ON A DISH HE IS SELLING TODAY.
+     *
+     * Not a pill — a reconciliation. The red banner on /menu-items counts DISHES
+     * ("4 dishes have a cost that is wrong") and links straight here, where the
+     * pill counts RECIPES and says 15. Same rule, different populations: 49 of
+     * the 67 recipes in this book are attached to no live listing at all, so
+     * they can be wrong without any dish on the menu being wrong. Arriving at
+     * "15" after clicking "4" reads as one of the two numbers being untrue, and
+     * a number he cannot reconcile is a number he stops acting on.
+     *
+     * Active listings only — the same population /api/menu-items counts. A
+     * delisted listing neither prices nor costs a recipe (src/lib/recipe-price.ts).
+     */
+    const menuLinkedActive = new Set(
+      menuItems.filter(mi => mi.recipe_id && (mi.is_active === undefined || Number(mi.is_active))).map(mi => mi.recipe_id));
+    const costWrongOnMenu = costWrong.filter(r => menuLinkedActive.has(r.id));
 
     // Dedupe recipes that appear in multiple issue categories
     const issueSet = new Set<string>();
     [...noPrice, ...noIngredients, ...noCategory, ...highFC, ...borderlineFC, ...lossMaking, ...suspicious,
-     ...zeroCost, ...noMenuLink, ...pricelessIngredients, ...dupIngredients, ...priceDrift].forEach(r => issueSet.add(r.id));
+     ...zeroCost, ...noMenuLink, ...pricelessIngredients, ...dupIngredients, ...priceDrift,
+     ...costWrong, ...checkUnits, ...checkQuantity].forEach(r => issueSet.add(r.id));
 
     return {
       total, avgFoodCost, mostProfitable, mostProfitableGpm, highestCost, highestCostFc,
+      approxCount, mostProfitableApprox, highestCostApprox,
       issues: {
         total: issueSet.size,
         noPrice, noIngredients, noCategory, highFC, borderlineFC, lossMaking, suspicious,
-        zeroCost, noMenuLink, pricelessIngredients, dupIngredients, priceDrift,
+        zeroCost, noMenuLink, pricelessIngredients, dupIngredients, priceDrift, costWrong, checkUnits,
+        checkQuantity, costWrongOnMenu,
       }
     };
   }, [recipes, menuItems, effPriceOf, fcOf]);
@@ -1483,6 +1773,9 @@ export default function RecipesPage() {
     setFormSubRecipes([]);
     setFormInstructions('');
     setFormImageUrl('');
+    // A recipe written in the FULL editor is exact unless its author says
+    // otherwise, so a new one starts unticked.
+    setFormApproximate(false);
     setRecipeModalError(null);
     setMenuLinkDirty(false);
     // Baseline for the "what the link changed" panel — a blank form, so every
@@ -1499,6 +1792,7 @@ export default function RecipesPage() {
     setFormSellingPrice(recipe.selling_price);
     setFormInstructions((recipe as any).instructions || '');
     setFormImageUrl((recipe as any).image_url || '');
+    setFormApproximate(!!recipe.is_approximate);
     // The listing that actually GOVERNS this recipe (live, priced, cheapest of
     // them) — the same pick the server makes. Taking the first row with a
     // matching recipe_id could seat a delisted or unpriced listing in the form,
@@ -1668,6 +1962,12 @@ export default function RecipesPage() {
         // ignored by costing because the link was still governing.
         // The untouched-edit case is handled below by deleting the key outright.
         menu_item_id: formMenuItemId,  // '' = unlink, id = link menu_items.recipe_id
+        // Sent explicitly on every save from this editor, both directions — this
+        // is the screen that COMPLETES an approximate recipe, so it has to be
+        // able to clear the flag as well as set it. (The PUT handler preserves
+        // the stored value when the key is absent, which is what every other
+        // caller — the workbook importer, /api/recipes/bulk — relies on.)
+        is_approximate: formApproximate,
         ingredients: formIngredients
           .filter((i) => i.material_id)
           .map((i) => ({
@@ -2043,6 +2343,12 @@ export default function RecipesPage() {
                 onPick={(c) => quickSetCategory(r.id, c)}
               />
               <span className="badge badge-primary">v{r.version}</span>
+              {/* The detail page prints Cost, Profit and FC% in large type — the
+                  most quotable numbers in the app. If they came from rough
+                  quantities that has to be said HERE, next to the name, not only
+                  back on the list the reader has already left. */}
+              {r.is_approximate && <ApproxBadge />}
+              <SanityBadge recipe={r} />
             </div>
           </div>
           <div className="flex gap-2">
@@ -2086,19 +2392,27 @@ export default function RecipesPage() {
               </p>
             )}
           </div>
+          {/* All three tiles are derived from the ingredient quantities, so an
+              approximate recipe makes all three estimates. The ≈ goes on each
+              one: a reader who looks only at Profit must not come away with an
+              exact-looking figure. */}
           <div className="card">
-            <p className="text-xs text-[#8B7355] uppercase tracking-wide">Total Cost</p>
-            <p className="text-xl font-bold text-[#2D1B0E] mt-1">{formatCurrency(r.total_cost || 0)}</p>
-          </div>
-          <div className="card">
-            <p className="text-xs text-[#8B7355] uppercase tracking-wide">Profit</p>
-            <p className={`text-xl font-bold mt-1 ${profit >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-              {formatCurrency(profit)}
+            <p className="text-xs text-[#8B7355] uppercase tracking-wide">Total Cost{r.is_approximate && ' (approx)'}</p>
+            <p className={`text-xl font-bold mt-1 ${r.is_approximate ? 'text-amber-700' : 'text-[#2D1B0E]'}`}>
+              {r.is_approximate && '≈'}{formatCurrency(r.total_cost || 0)}
             </p>
           </div>
           <div className="card">
-            <p className="text-xs text-[#8B7355] uppercase tracking-wide">Food Cost %</p>
-            <p className={`text-xl font-bold mt-1 ${foodCostColor(fcp)}`}>{fcp.toFixed(1)}%</p>
+            <p className="text-xs text-[#8B7355] uppercase tracking-wide">Profit{r.is_approximate && ' (approx)'}</p>
+            <p className={`text-xl font-bold mt-1 ${r.is_approximate ? 'text-amber-700' : profit >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+              {r.is_approximate && '≈'}{formatCurrency(profit)}
+            </p>
+          </div>
+          <div className="card">
+            <p className="text-xs text-[#8B7355] uppercase tracking-wide">Food Cost %{r.is_approximate && ' (approx)'}</p>
+            <p className={`text-xl font-bold mt-1 ${r.is_approximate ? 'text-amber-700' : foodCostColor(fcp)}`}>
+              {r.is_approximate && '≈'}{fcp.toFixed(1)}%
+            </p>
             <p className="text-[11px] text-[#8B7355] mt-0.5">
               {detailPrice > 0 ? <>cost ÷ {formatCurrency(detailPrice)}</> : 'no price set'}
             </p>
@@ -2370,7 +2684,11 @@ export default function RecipesPage() {
 
   // ---- Main List View ----
   return (
-    <div>
+    /* data-unit-registry says WHICH unit table the costs on this screen were
+       computed with — "server" once the `units` rows have arrived, "built-in"
+       before that. It is the one fact that makes a preview/stored mismatch
+       diagnosable instead of a mystery, and it is the read of `unitsLoaded`. */
+    <div data-unit-registry={unitsLoaded ? 'server' : 'built-in'}>
       {/* Header */}
       <div className="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-3 mb-5">
         <div>
@@ -2461,22 +2779,45 @@ export default function RecipesPage() {
               <p className="text-[10px] sm:text-[11px] text-[#8B7355] uppercase tracking-wide">Active Recipes</p>
               <p className="text-2xl font-bold text-[#2D1B0E] mt-1">{summaryStats.total}</p>
             </div>
+            {/* ── THE THREE DERIVED TILES CARRY THE ≈ TOO. ───────────────────
+                They are computed from ingredient quantities, so an approximate
+                recipe makes them estimates — and a simple recipe under-states
+                cost by design, which pushes it toward the top of "most
+                profitable" and the bottom of food cost. See summaryStats. */}
             <div className="px-4 py-3.5 border-r border-b lg:border-b-0 border-[#F0E4D6]">
-              <p className="text-[10px] sm:text-[11px] text-[#8B7355] uppercase tracking-wide">Avg Food Cost</p>
+              <p className="text-[10px] sm:text-[11px] text-[#8B7355] uppercase tracking-wide">Avg Food Cost{summaryStats.approxCount > 0 && ' (part approx)'}</p>
               <div className="flex items-baseline gap-2 mt-1 flex-wrap">
-                <span className={`text-2xl font-bold ${foodCostColor(summaryStats.avgFoodCost)}`}>{summaryStats.avgFoodCost.toFixed(1)}%</span>
+                <span className={`text-2xl font-bold ${summaryStats.approxCount > 0 ? 'text-amber-700' : foodCostColor(summaryStats.avgFoodCost)}`}
+                      title={summaryStats.approxCount > 0
+                        ? `${summaryStats.approxCount} of the ${summaryStats.total} recipes in this average are approximate — entered from their major ingredients only — so this figure is partly an estimate. A simple recipe under-states cost, which pulls this average DOWN.`
+                        : undefined}>
+                  {summaryStats.approxCount > 0 && <span aria-label="approximate">≈</span>}{summaryStats.avgFoodCost.toFixed(1)}%
+                </span>
                 {summaryStats.total > 0 && summaryStats.avgFoodCost > Math.round(targetFcPct * 100) && (
                   <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-red-50 text-red-600 whitespace-nowrap">{Math.round(summaryStats.avgFoodCost - Math.round(targetFcPct * 100))} pts over {Math.round(targetFcPct * 100)}% target</span>
+                )}
+                {summaryStats.approxCount > 0 && (
+                  <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-amber-50 text-amber-800 border border-amber-200 whitespace-nowrap">{summaryStats.approxCount} of {summaryStats.total} approx</span>
                 )}
               </div>
             </div>
             <div className="px-4 py-3.5 border-r border-b lg:border-b-0 border-[#F0E4D6]">
-              <p className="text-[10px] sm:text-[11px] text-[#8B7355] uppercase tracking-wide">Most Profitable</p>
-              <p className="text-sm font-bold text-green-600 mt-1.5 truncate">{summaryStats.mostProfitable}{summaryStats.mostProfitableGpm ? <span className="text-[#8B7355] font-normal"> · GPM {summaryStats.mostProfitableGpm.toFixed(0)}%</span> : null}</p>
+              <p className="text-[10px] sm:text-[11px] text-[#8B7355] uppercase tracking-wide">Most Profitable{summaryStats.mostProfitableApprox && ' (approx)'}</p>
+              <p className={`text-sm font-bold mt-1.5 truncate ${summaryStats.mostProfitableApprox ? 'text-amber-700' : 'text-green-600'}`}
+                 title={summaryStats.mostProfitableApprox
+                   ? `“${summaryStats.mostProfitable}” is an APPROXIMATE recipe — only its major ingredients are entered, so its cost is under-stated and this GPM is an estimate, not a measured figure. That under-statement is also why it is at the top of this list. Finish the recipe before pricing off it.`
+                   : undefined}>
+                {summaryStats.mostProfitableApprox && <span aria-label="approximate">≈ </span>}{summaryStats.mostProfitable}{summaryStats.mostProfitableGpm ? <span className="text-[#8B7355] font-normal"> · GPM {summaryStats.mostProfitableApprox && '≈'}{summaryStats.mostProfitableGpm.toFixed(0)}%</span> : null}
+              </p>
             </div>
             <div className="px-4 py-3.5 border-r border-b md:border-b-0 border-[#F0E4D6]">
-              <p className="text-[10px] sm:text-[11px] text-[#8B7355] uppercase tracking-wide">Highest Food Cost</p>
-              <p className="text-sm font-bold text-red-500 mt-1.5 truncate">{summaryStats.highestCost}{summaryStats.highestCostFc ? <span className="text-[#8B7355] font-normal"> · FC {summaryStats.highestCostFc.toFixed(0)}%</span> : null}</p>
+              <p className="text-[10px] sm:text-[11px] text-[#8B7355] uppercase tracking-wide">Highest Food Cost{summaryStats.highestCostApprox && ' (approx)'}</p>
+              <p className={`text-sm font-bold mt-1.5 truncate ${summaryStats.highestCostApprox ? 'text-amber-700' : 'text-red-500'}`}
+                 title={summaryStats.highestCostApprox
+                   ? `“${summaryStats.highestCost}” is an APPROXIMATE recipe — only its major ingredients are entered, so this food cost is an estimate and the real figure is HIGHER, not lower. Finish the recipe to measure it.`
+                   : undefined}>
+                {summaryStats.highestCostApprox && <span aria-label="approximate">≈ </span>}{summaryStats.highestCost}{summaryStats.highestCostFc ? <span className="text-[#8B7355] font-normal"> · FC {summaryStats.highestCostApprox && '≈'}{summaryStats.highestCostFc.toFixed(0)}%</span> : null}
+              </p>
             </div>
             <div className={`px-4 py-3.5 col-span-2 md:col-span-1 lg:col-span-1 ${summaryStats.issues.total > 0 ? 'bg-amber-50' : 'bg-green-50'}`}>
               <p className="text-[10px] sm:text-[11px] text-[#8B7355] uppercase tracking-wide flex items-center gap-1"><AlertTriangle className="w-3 h-3 text-amber-500" /> Needs Attention</p>
@@ -2487,6 +2828,21 @@ export default function RecipesPage() {
           {/* Recipe health banner */}
           {summaryStats.issues.total > 0 && (() => {
             const all = [
+              // FIRST, and red. A recipe costed in the wrong unit does not show a
+              // rough number, it shows a meaningless one — and every other pill
+              // here is about a number that is at least real.
+              //
+              // TWO PILLS, NOT ONE. A single "costed in the wrong unit · 38" put
+              // GONGURA PRAWNS (₹63,012, noise) and THAI GREEN CURRY (₹152.24,
+              // out by ₹1.67) in the same bucket and gave him 38 rows with no
+              // order of urgency. Red is the money that means nothing; amber is
+              // the unit worth correcting on a total that is still broadly right.
+              // Same rule as the /menu-items badge — see costIsUnusable().
+              { key: 'costWrong', label: 'cost is wrong — do not price off these', count: summaryStats.issues.costWrong.length, tone: 'red' },
+              { key: 'checkUnits', label: 'unit worth correcting, cost still broadly right', count: summaryStats.issues.checkUnits.length, tone: 'amber' },
+              // Its own pill. NOT under checkUnits — that pill promises the total
+              // is broadly right, and a 700 g line is 48% of a recipe's cost.
+              { key: 'checkQuantity', label: 'quantity too large for one portion', count: summaryStats.issues.checkQuantity.length, tone: 'orange' },
               { key: 'noPrice', label: 'missing selling price', count: summaryStats.issues.noPrice.length, tone: 'amber' },
               { key: 'lossMaking', label: 'loss-making', count: summaryStats.issues.lossMaking.length, tone: 'red' },
               { key: 'highFC', label: 'below 65% GPM', count: summaryStats.issues.highFC.length, tone: 'orange' },
@@ -2510,6 +2866,33 @@ export default function RecipesPage() {
                     <button onClick={() => setShowAllIssues(true)} className="text-xs font-medium text-[#6B5744] hover:underline">+{all.length - 4} more</button>
                   )}
                 </div>
+                {/* WHY THESE TWO COUNTS MOVED. They were one pill reading 38.
+                    A weight entered against a material stocked by volume (g vs ml)
+                    is now a note rather than a fault — it is valued at the
+                    system's own 1 g ≈ 1 ml rule, so the money is right to within a
+                    few percent — and only the lines that are genuinely out by a
+                    factor are called wrong. Said here, because a number on his
+                    screen changing definition without explanation is worse than
+                    the old number. */}
+                {(summaryStats.issues.costWrong.length > 0 || summaryStats.issues.checkUnits.length > 0) && (
+                  <p className="basis-full text-[11px] text-amber-800/80 leading-relaxed">
+                    The unit check is now graded: <b>cost is wrong</b> means most of the cost sits on a line the system cannot
+                    convert (100 pcs of a material priced by the kilo, valued as 100 kg). <b>Unit worth correcting</b> means
+                    grams against a material stocked in millilitres — valued at 1 g ≈ 1 ml, so the total is right to within a
+                    few percent. These were one count of {summaryStats.issues.costWrong.length + summaryStats.issues.checkUnits.length} before.
+                    {summaryStats.issues.costWrong.length > 0 && (
+                      <>
+                        {' '}Counted over the whole recipe book:{' '}
+                        <b>{summaryStats.issues.costWrongOnMenu.length}</b> of the {summaryStats.issues.costWrong.length} are
+                        on a dish currently on the menu — the number Menu Items shows —{' '}
+                        {summaryStats.issues.costWrong.length - summaryStats.issues.costWrongOnMenu.length === 0
+                          ? 'and the rest are none.'
+                          : <>the other {summaryStats.issues.costWrong.length - summaryStats.issues.costWrongOnMenu.length} are
+                            not linked to a live listing, so nothing is being sold off them.</>}
+                      </>
+                    )}
+                  </p>
+                )}
                 {/* Admin-only. The server gate on /api/admin/recipe-price-reconcile
                     is the real one; this just avoids showing a button that 403s. */}
                 {me?.role === 'admin' && summaryStats.issues.priceDrift.length > 0 && (
@@ -2731,7 +3114,11 @@ export default function RecipesPage() {
                           <tr key={recipe.id} className="border-b border-[#F0E4D6] last:border-0 hover:bg-[#FFF8F0]">
                             <td className="py-2.5 px-4">
                               <p className="font-semibold text-[#2D1B0E] text-[13px] truncate max-w-[280px]">{recipe.name}</p>
-                              <p className="text-[11px] text-[#8B7355]">v{recipe.version} · {ingCount} ingredient{ingCount === 1 ? '' : 's'}</p>
+                              <p className="text-[11px] text-[#8B7355] flex items-center gap-1.5 flex-wrap">
+                                <span>v{recipe.version} · {ingCount} ingredient{ingCount === 1 ? '' : 's'}</span>
+                                {recipe.is_approximate && <ApproxBadge compact />}
+                                <SanityBadge recipe={recipe} compact />
+                              </p>
                             </td>
                             <td className="py-2.5 px-3 text-[13px] text-[#3D2614]">
                               <CategoryChip
@@ -2760,13 +3147,21 @@ export default function RecipesPage() {
                                 </span>
                               )}
                             </td>
-                            <td className="py-2.5 px-3 text-right text-[#6B5744]">{formatCurrency(recipe.total_cost || 0)}</td>
+                            {/* The COST and the FC% are the two figures a price
+                                gets set from, so the approximate marker sits on
+                                them, not only on the name. */}
+                            <td className="py-2.5 px-3 text-right text-[#6B5744]">
+                              {recipe.is_approximate && <span className="text-amber-700" aria-label="approximate">≈</span>}
+                              {formatCurrency(recipe.total_cost || 0)}
+                            </td>
                             <td className="py-2.5 px-3">
                               {noPrice
                                 ? <span className="text-xs text-[#8B7355]">— needs selling price</span>
-                                : <div className="flex items-center gap-2" title={`Cost ÷ ${formatCurrency(effPrice)} — ${fromMenu ? `the price of menu item "${recipe.linked_menu_item_name}"` : 'this recipe’s own price (no menu link)'}`}>
+                                : <div className="flex items-center gap-2" title={`${recipe.is_approximate ? 'APPROXIMATE — rough quantities, treat as an estimate. ' : ''}Cost ÷ ${formatCurrency(effPrice)} — ${fromMenu ? `the price of menu item "${recipe.linked_menu_item_name}"` : 'this recipe’s own price (no menu link)'}`}>
                                     <FcBar fc={fcp} target={Math.round(targetFcPct * 100)} />
-                                    <span className={`text-xs font-bold shrink-0 ${foodCostColor(fcp)}`}>{fcp.toFixed(0)}%</span>
+                                    <span className={`text-xs font-bold shrink-0 ${recipe.is_approximate ? 'text-amber-700' : foodCostColor(fcp)}`}>
+                                      {recipe.is_approximate && '≈'}{fcp.toFixed(0)}%
+                                    </span>
                                   </div>}
                             </td>
                             <td className="py-2.5 px-3 text-right font-bold">{gpm == null ? <span className="text-[#C4B09A]">—</span> : <span className={gpm >= 65 ? 'text-green-600' : gpm >= 50 ? 'text-amber-600' : 'text-red-500'}>{gpm.toFixed(0)}%</span>}</td>
@@ -2815,6 +3210,8 @@ export default function RecipesPage() {
                               onPick={(c) => quickSetCategory(recipe.id, c)}
                             />
                             <span className="text-[11px] text-[#8B7355]">v{recipe.version} · {ingCount} ingredient{ingCount === 1 ? '' : 's'}</span>
+                            {recipe.is_approximate && <ApproxBadge compact />}
+                            <SanityBadge recipe={recipe} compact />
                           </div>
                         </div>
                         <div className="flex items-center shrink-0">
@@ -2841,10 +3238,10 @@ export default function RecipesPage() {
                         </span>
                       </div>
                       <div className="flex items-center justify-between mt-2 pt-2 border-t border-[#F0E4D6] text-[11px] text-[#8B7355]">
-                        <span>Cost {formatCurrency(recipe.total_cost || 0)}</span>
+                        <span>Cost {recipe.is_approximate && <span className="text-amber-700">≈</span>}{formatCurrency(recipe.total_cost || 0)}</span>
                         {!noPrice && (
                           <span className="flex items-center gap-2">
-                            <span className={`font-bold ${foodCostColor(fcp)}`}>FC {fcp.toFixed(0)}%</span>
+                            <span className={`font-bold ${recipe.is_approximate ? 'text-amber-700' : foodCostColor(fcp)}`}>FC {recipe.is_approximate && '≈'}{fcp.toFixed(0)}%</span>
                             {gpm != null && <span className={`font-bold ${gpm >= 65 ? 'text-green-600' : gpm >= 50 ? 'text-amber-600' : 'text-red-500'}`}>GPM {gpm.toFixed(0)}%</span>}
                           </span>
                         )}
@@ -3412,6 +3809,31 @@ export default function RecipesPage() {
                   />
                 </div>
               </div>
+
+              {/* ── APPROXIMATE: the switch that completes a quick recipe. ────
+                  A recipe started from the Menu Items screen arrives here with
+                  this ticked. Adding the missing ingredients does NOT untick it
+                  by itself — only a person can say the quantities are now real,
+                  because only a person knows. Untick it and every screen stops
+                  hedging this recipe's cost. */}
+              <label className={`flex items-start gap-2.5 rounded-lg border px-3 py-2.5 cursor-pointer ${
+                formApproximate ? 'bg-amber-50 border-amber-300' : 'bg-[#FFF8F0] border-[#E8D5C4]'
+              }`}>
+                <input
+                  type="checkbox"
+                  checked={formApproximate}
+                  onChange={(e) => setFormApproximate(e.target.checked)}
+                  className="mt-0.5"
+                />
+                <span className="text-[12px] leading-relaxed">
+                  <b className="text-[#2D1B0E]">Quantities are approximate</b>
+                  <span className="block text-[11px] text-[#6B5744] mt-0.5">
+                    {formApproximate
+                      ? 'This recipe’s cost is shown as an estimate (≈) everywhere it appears. Once the quantities are real, untick this — the recipe keeps its id, its menu link and its history.'
+                      : 'Tick this if the quantities are rough. The cost still flows through the normal costing engine, but every screen will mark it as an estimate so nobody prices against it as though it were exact.'}
+                  </span>
+                </span>
+              </label>
 
               {/* Ingredients */}
               <div>
@@ -5860,9 +6282,22 @@ function MenuItemAutocomplete({
                       not on sale
                     </span>
                   )}
-                  {alreadyLinked && (
-                    <span className="text-[9px] px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 whitespace-nowrap">
+                  {/* LINKED OR NOT — named on BOTH sides.
+                      This list only ever marked the linked ones, so "no badge"
+                      had to carry two different meanings at once: "this dish has
+                      no recipe" and "I have not been told". On a menu where 479
+                      of 497 listings are unlinked, the silent majority is exactly
+                      the state worth naming, and it is the state someone opening
+                      this picker is looking for. */}
+                  {alreadyLinked ? (
+                    <span className="text-[9px] px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 whitespace-nowrap"
+                          title="This menu item already has a recipe. Picking it here moves the link to this recipe.">
                       already linked
+                    </span>
+                  ) : (
+                    <span className="text-[9px] px-1.5 py-0.5 rounded bg-white text-[#6B5744] border border-[#D4B896] whitespace-nowrap"
+                          title="This menu item has no recipe, so it records ₹0 food cost when it sells. It is still on the menu and still sells.">
+                      no recipe
                     </span>
                   )}
                 </li>

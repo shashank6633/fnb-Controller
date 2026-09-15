@@ -26,6 +26,11 @@ import { normStationKey } from '@/lib/station-master';
 // the file actually carried — the difference between "clear this" and "the file
 // never mentioned it", which is what used to wipe menu_items.station.
 import { parseMenuSheet, ALL_IMPORT_COLUMNS, COLUMN_LABEL } from './import-parse';
+// THE MISSING DIRECTION. Before this, `grep href="/recipes"` in this file
+// returned nothing: a recipe could reach a menu item (/recipes → "Pick from Menu
+// Items") but a menu item could not reach a recipe, so the 479 unlinked listings
+// had no route out of this screen at all. This modal is that route.
+import QuickRecipeModal, { type QuickRecipeMaterial } from '@/components/QuickRecipeModal';
 import {
   Utensils,
   Plus,
@@ -49,6 +54,11 @@ import {
   EyeOff,
   Eye,
   HardDrive,
+  // Aliased: `Link` is also next/link, and an unaliased import of it in a file
+  // that may one day want the router component is a collision waiting to happen.
+  Link2 as LinkIcon,
+  ListChecks,
+  RefreshCw,
 } from 'lucide-react';
 
 function formatCurrency(value: number): string {
@@ -60,6 +70,54 @@ function formatCurrency(value: number): string {
 // filters/groups/counts by item_type so those rows match the clean options.
 function normalizeType(t: string): string {
   return (t || '').toLowerCase().trim().replace(/[^a-z0-9]+$/, '');
+}
+
+/**
+ * THE ONE SENTENCE THIS PAGE IS ENTITLED TO SAY ABOUT A FIGURE IT KEPT.
+ * --------------------------------------------------------------------
+ * Four places on this screen print a closing line after a recipe warning — the
+ * FC% tooltip, the Recipe badge, the Cost cell and the edit panel — and all four
+ * said the same thing: "This is a small part of the cost, so the total is still
+ * broadly right." That was written for ONE fault and then applied to every
+ * non-fatal one.
+ *
+ * It is true of a UNIT note: 100 g of an oil stocked in ml is valued at the
+ * engine's own density-1 figure, so the money is out by density — a few percent.
+ * It is FALSE of a QUANTITY note: 700 g of sweet chilli sauce on one plate of
+ * ASIAN GREEN SALAD is 48% of that recipe's cost, and correcting it to a
+ * plausible 70 g moves the dish's food cost from 74.21% to about 42%. Printing
+ * "still broadly right" over that is worse than printing nothing at all, because
+ * it actively tells the reader not to look.
+ *
+ * So the three sentences live here, once, keyed on the kind /api/menu-items
+ * reports. One rule, four call sites, nothing to drift.
+ */
+function warningHeadline(kind: MenuItem['recipe_cost_warning_kind']): string {
+  if (kind === 'quantity') return 'A QUANTITY ON THIS RECIPE IS TOO LARGE FOR ONE PORTION';
+  if (kind === 'no_quantity') return 'AN INGREDIENT ON THIS RECIPE HAS NO QUANTITY';
+  return 'Small unit problem on this recipe';
+}
+
+/** The short badge/pill wording for the same three states. */
+function warningLabel(kind: MenuItem['recipe_cost_warning_kind']): string {
+  if (kind === 'quantity') return 'check quantity';
+  if (kind === 'no_quantity') return 'missing quantity';
+  return 'check units';
+}
+
+function warningClosing(kind: MenuItem['recipe_cost_warning_kind']): string {
+  if (kind === 'quantity') {
+    return 'This is NOT a rounding matter: a quantity that size is a large share of the cost, '
+      + 'so the cost and the FC% on this row move a long way if it is wrong. Open the recipe and '
+      + 'check it against the plate before pricing off it. If the recipe is written for a BATCH '
+      + 'rather than one portion, it is correct as it stands.';
+  }
+  if (kind === 'no_quantity') {
+    return 'That line adds nothing, so this dish is costed as though the ingredient were not in '
+      + 'it. Open the recipe and type the quantity.';
+  }
+  return 'This is a small part of the cost, so the total is still broadly right — but open the '
+    + 'recipe and correct it.';
 }
 
 interface MenuItem {
@@ -84,8 +142,99 @@ interface MenuItem {
   pos_id: string;
   recipe_cost?: number;
   recipe_food_cost_percent?: number;
+  /** The linked recipe's quantities are rough — see src/components/QuickRecipeModal.tsx.
+   *  Served by /api/menu-items alongside the cost, because the cost and the FC%
+   *  on this row are derived from that recipe and are therefore rough too. */
+  recipe_is_approximate?: boolean;
+  recipe_name?: string;
   material_name?: string;
   material_cost?: number;
+  /**
+   * Why the cost on this row cannot be trusted, in the cook's own words —
+   * "PRAWNS 80/100: pcs cannot be converted to kg, so 100 pcs is being priced as
+   * 100 kg". Served by /api/menu-items, which re-runs the unit check over the
+   * linked recipe's lines. Null when the recipe's units all convert.
+   *
+   * This is NOT about stale prices. Every stored recipe cost on this database
+   * reproduces exactly from today's purchase averages, so no figure here is
+   * waiting on the price reconcile. The unit is the problem, and 11 of the 18
+   * costed dishes have one.
+   */
+  recipe_cost_warning?: string | null;
+  /** What to do about it, one line. */
+  recipe_cost_warning_fix?: string | null;
+  /**
+   * WHAT KIND of fault the warning is — because this page was VOUCHING for the
+   * total on the strength of it.
+   *
+   * Every non-unusable warning got the same closing sentence: "This is a small
+   * part of the cost, so the total is still broadly right." True of 'unit' (a
+   * weight entered against a volume: out by density, a few percent). FALSE of
+   * 'quantity' — 700 g of sweet chilli sauce in one salad is 48% of that recipe's
+   * cost and moves its food cost by 32 points. Printing the reassurance over that
+   * is worse than printing nothing, so the kind travels with the message and the
+   * page says only what it is entitled to say. Absent when there is no warning.
+   */
+  recipe_cost_warning_kind?: 'unit' | 'quantity' | 'no_quantity' | null;
+  /**
+   * True when the bad lines are more than a quarter of the cost, or cost more
+   * than the dish sells for — i.e. the figure is noise rather than merely
+   * imperfect. Gongura Prawns (₹63,000 of ₹63,012 on one line) is true; Thai
+   * Green Curry (₹1.67 of ₹152.24) is false and gets a quiet note instead, so
+   * the loud mark still means something by the time he reaches the prawns.
+   */
+  recipe_cost_unusable?: boolean;
+  /**
+   * The linked recipe has no ingredients and no sub-recipes in it at all, so this
+   * dish is linked and costs ₹0.00 — which reads exactly like a costed dish and is
+   * not one. LABANESE MIZZE PLATTER is that recipe on the live database.
+   */
+  recipe_empty?: boolean;
+}
+
+/**
+ * A recipe, as the picker needs it. /api/recipes serves a great deal more per
+ * row (every ingredient line, allergens, sanity findings); this names only the
+ * handful the picker actually reads, so a change to the rest of that payload
+ * cannot quietly change what this screen shows.
+ */
+interface RecipeLite {
+  id: string;
+  name: string;
+  category?: string;
+  total_cost?: number;
+  is_approximate?: boolean;
+  sanity_has_blocker?: boolean;
+  /** The menu item this recipe is ALREADY costed against, if any. */
+  linked_menu_item_id?: string | null;
+  linked_menu_item_name?: string | null;
+  /** How many listings point at it — >1 means it is already shared. */
+  linked_menu_count?: number;
+}
+
+/** One row of the recipe backlog — see buildBacklog() in the API route. */
+interface BacklogRow {
+  id: string;
+  name: string;
+  category: string;
+  item_type: string;
+  selling_price: number;
+  material_id: string | null;
+  material_name: string | null;
+  /** Portions that left the kitchen, every bill type — the ordering key. */
+  portions: number;
+  /** Of those, the ones nobody paid for. They cost the same to cook. */
+  portions_free: number;
+  revenue: number;
+  /** False when the sales import has never carried this name — NOT "sold zero". */
+  has_sales: boolean;
+}
+
+/** How much sales history the portions figures are drawn from. */
+interface BacklogMeta {
+  sales_days: number;
+  sales_from: string | null;
+  sales_to: string | null;
 }
 
 interface Summary {
@@ -93,6 +242,9 @@ interface Summary {
   foods: number; liquors: number; beverages: number;
   withRecipe: number; withMaterial: number;
   noPrice: number; noCategory: number; noStation: number; noDietaryTag: number;
+  /** Active foods + beverages with no recipe, and how many there are in all.
+   *  Liquor is excluded on purpose — a peg poured from a bottle wants no recipe. */
+  foodsNoRecipe: number; foodsTotal: number;
 }
 
 /**
@@ -151,9 +303,107 @@ const NEW_ITEM: MenuItem = {
   is_active: 1, recipe_id: null, material_id: null, source: 'manual', notes: '', pos_id: '',
 };
 
+/**
+ * ONE STRAY QUOTE ATE 497 OF 500 ROWS, AND THE IMPORT SAID "SUCCESS".
+ * ------------------------------------------------------------------
+ * A single unbalanced double quote in any cell — a name typed as `"Chef's Special`
+ * — opens a quoted field that RFC 4180 says runs until the NEXT quote. There is
+ * no next quote, so every following line is swallowed into that one cell. The
+ * sheet that comes out is perfectly well formed: 3 rows instead of 500, the same
+ * ten columns, `isTemplate` false. Nothing downstream can tell. Measured on a
+ * 500-row file in the app's own export format:
+ *
+ *     leading quote in row 3 → 3 data rows, 497 lost, last cell 26,778 chars
+ *     POST /api/menu-items/import → HTTP 200, errors: []
+ *
+ * Only the raw text knows, so it is checked here, before anything is previewed.
+ *
+ * THE TEST IS AN UNCLOSED QUOTE, NOT A NEWLINE IN A CELL — and it took a second
+ * pass to get right, so the reasoning is kept here rather than re-derived.
+ *
+ * This guard used to refuse on "any cell contains a line break", justified by the
+ * claim that no column this import accepts may legitimately hold one, "so a cell
+ * that holds one is a broken file with no false-positive case to weigh". The
+ * second half does not follow from the first. A CSV out of Excel or Google Sheets
+ * may carry an EXTRA column the importer ignores entirely — the accepted set is
+ * name + the ten in COLUMN_LABEL, so a "Notes" or "Description" column is read by
+ * nothing — and a properly-closed quoted cell in it may contain a line break. The
+ * parser handles that perfectly: measured on a 500-row file whose row 3 held a
+ * valid two-line quoted Notes cell, XLSX produced all 500 rows and parseMenuSheet
+ * returned 500 items — and this guard then refused the entire import, claiming an
+ * unclosed quote "and nothing after it can be read". Nothing was wrong and
+ * nothing was imported.
+ *
+ * The discriminator that actually separates the two cases was ALREADY COMPUTED
+ * in this function and then thrown away: walk the text as a CSV reader (doubled
+ * quotes are literal) and ask whether a quoted field is still OPEN at end of
+ * file. True for the stray-quote file that ate 497 rows; false for a valid
+ * multi-line cell; false for a clean file. That walk is now what decides, and
+ * the newline scan is kept only to DESCRIBE the damage.
+ *
+ * Fails closed either way — nothing is imported while a refusal stands — and the
+ * 497-row bug is still caught, which is the point: the fix narrows the refusal to
+ * the fault, it does not soften it. .xlsx and .xls never reach this at all: the
+ * caller passes csvText only for text files.
+ *
+ * Refused rather than warned. A warning on a 500-row import is a warning read
+ * after the 3 rows have already gone in.
+ */
+function findCsvQuoteFault(text: string, rows: unknown[][]): string | null {
+  // ── THE DECIDING TEST: is a quoted field still open at end of file? ────────
+  // Walked exactly as a CSV reader does, so a doubled "" inside a quoted cell is
+  // a literal quote and does not toggle the state.
+  let inQuotes = false, line = 1, openedAtLine = 0;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (c === '"') {
+      if (inQuotes && text[i + 1] === '"') { i++; continue; }
+      if (!inQuotes) openedAtLine = line;
+      inQuotes = !inQuotes;
+    } else if (c === '\n') {
+      line++;
+    }
+  }
+  // Balanced quotes ⇒ every quoted cell was closed ⇒ the parser read what the
+  // file said, line breaks inside cells included. Nothing to refuse.
+  if (!inQuotes) return null;
+
+  // ── From here the file IS broken. The rest only describes how badly. ───────
+  let worst: { rowIndex: number; colIndex: number; lines: number } | null = null;
+  rows.forEach((row, rowIndex) => {
+    if (!Array.isArray(row)) return;
+    row.forEach((cell, colIndex) => {
+      if (typeof cell !== 'string' || !/[\r\n]/.test(cell)) return;
+      const lines = cell.split(/\r\n|\r|\n/).length;
+      if (!worst || lines > worst.lines) worst = { rowIndex, colIndex, lines };
+    });
+  });
+  // An unclosed quote at the very END of the file can leave no swallowed cell to
+  // point at, so the message degrades to the fault itself rather than vanishing.
+  const { rowIndex, colIndex, lines } = (worst ?? { rowIndex: -1, colIndex: -1, lines: 0 }) as
+    { rowIndex: number; colIndex: number; lines: number };
+
+  // Physical lines in the file vs rows the parser produced: the size of the hole.
+  const physicalRows = text.split(/\r\n|\r|\n/).filter(l => l.trim() !== '').length;
+  const lost = Math.max(0, physicalRows - rows.length);
+
+  return [
+    `This file has an unclosed double quote${openedAtLine ? ` — it starts on line ${openedAtLine}` : ''}, and nothing after it can be read.`,
+    lost > 0 && lines > 0
+      ? ` ${lost.toLocaleString('en-IN')} of the ${physicalRows.toLocaleString('en-IN')} lines in the file were swallowed into a single cell (row ${rowIndex + 1}, column ${colIndex + 1}, now ${lines.toLocaleString('en-IN')} lines long), so only ${Math.max(0, rows.length - 1).toLocaleString('en-IN')} items would have been imported.`
+      : lines > 0
+        ? ` One cell (row ${rowIndex + 1}, column ${colIndex + 1}) has swallowed ${lines.toLocaleString('en-IN')} lines of the file.`
+        // No swallowed cell to point at — an unclosed quote right at the end of
+        // the file. Say the count that is actually known instead of inventing a
+        // cell reference of row 0, column 0.
+        : ` The file has ${physicalRows.toLocaleString('en-IN')} lines and the parser could read ${rows.length.toLocaleString('en-IN')}.`,
+    ' Nothing has been imported. Open the file, find the " that has no partner, and either remove it or double it ("") to keep it in the text — then upload again.',
+  ].join('');
+}
+
 export default function MenuItemsPage() {
   const [items, setItems] = useState<MenuItem[]>([]);
-  const [summary, setSummary] = useState<Summary>({ total: 0, active: 0, inactive: 0, foods: 0, liquors: 0, beverages: 0, withRecipe: 0, withMaterial: 0, noPrice: 0, noCategory: 0, noStation: 0, noDietaryTag: 0 });
+  const [summary, setSummary] = useState<Summary>({ total: 0, active: 0, inactive: 0, foods: 0, liquors: 0, beverages: 0, withRecipe: 0, withMaterial: 0, noPrice: 0, noCategory: 0, noStation: 0, noDietaryTag: 0, foodsNoRecipe: 0, foodsTotal: 0 });
   const [categories, setCategories] = useState<string[]>([]);
   const [stations, setStations] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
@@ -166,6 +416,17 @@ export default function MenuItemsPage() {
   const [vegFilter, setVegFilter] = useState('');
   const [statusFilter, setStatusFilter] = useState('active');
   const [issueFilter, setIssueFilter] = useState<string | null>(null);
+  /**
+   * RECIPE FILTER — '' | 'linked' | 'unlinked'.
+   *
+   * 479 of the 497 live listings have no recipe, so "which of these are costed?"
+   * cannot be answered by scrolling; it needs a filter. This one is on the ADMIN
+   * menu-items list and nowhere else. It does not, and must never, exist on a
+   * surface a guest or a captain orders from: a dish with no recipe still
+   * appears, still sells and still prints. It starts EMPTY (every item shown) and
+   * only an explicit click narrows it.
+   */
+  const [linkFilter, setLinkFilter] = useState<'' | 'linked' | 'unlinked'>('');
 
   // Import
   const [importOpen, setImportOpen] = useState(false);
@@ -187,12 +448,66 @@ export default function MenuItemsPage() {
   // Edit modal
   const [editItem, setEditItem] = useState<MenuItem | null>(null);
 
+  /**
+   * QUICK RECIPE. The menu item whose recipe is being written, and the material
+   * list that screen picks from.
+   *
+   * Materials are fetched LAZILY — only when the modal is first opened. This
+   * page is the menu list; loading 952 materials on every visit to pay for a
+   * modal most visits never open would be a regression for everyone.
+   */
+  const [quickFor, setQuickFor] = useState<MenuItem | null>(null);
+  const [materials, setMaterials] = useState<QuickRecipeMaterial[]>([]);
+  const [materialsState, setMaterialsState] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
+  /**
+   * Can a recipe be SAVED as approximate on this database? Served by
+   * /api/menu-items. It is false when the recipes table has no "approximate"
+   * column yet, and in that state a simple recipe must not be written at all: an
+   * unmarked rough cost is worse than no cost, because it looks measured.
+   */
+  const [approximateSupported, setApproximateSupported] = useState(true);
+
+  const openQuickRecipe = useCallback(async (item: MenuItem) => {
+    setQuickFor(item);
+    if (materialsState === 'ready' || materialsState === 'loading') return;
+    setMaterialsState('loading');
+    try {
+      // Same endpoint and same envelope /recipes already reads for its own
+      // ingredient picker (src/app/recipes/page.tsx:503), so the two screens
+      // pick from one list rather than two that can disagree.
+      const res = await fetch('/api/inventory');
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const j = await res.json();
+      // RETIRED MATERIALS STAY OUT OF THE SEARCH. The suggestion chips already
+      // skip them (src/lib/recipe-suggest.ts), but the "Add another material"
+      // typeahead searched all 952 rows including the ones nobody buys any
+      // more — so the two halves of one screen offered different lists, and the
+      // half that offered more was the wrong one. `is_active` is only trusted
+      // when the row actually carries it; a payload without the field is left
+      // alone rather than filtered to nothing.
+      const all = (j.materials || []) as QuickRecipeMaterial[];
+      setMaterials(all.filter((m) => m.is_active === undefined || m.is_active === null || !!Number(m.is_active)));
+      setMaterialsState('ready');
+    } catch {
+      setMaterialsState('error');
+    }
+  }, [materialsState]);
+
   // Bulk category rename (admin only). The server gate on
   // /api/menu-items/rename-category is the real boundary — this only decides
   // whether to offer a button that a non-admin's click would always 403.
   const [renameOpen, setRenameOpen] = useState(false);
   const [me, setMe] = useState<{ role?: string } | null>(null);
   const isAdmin = me?.role === 'admin';
+  /**
+   * May this person write a recipe? POST /api/recipes is manager/admin only, and
+   * that server gate is the real boundary — this only decides whether to offer a
+   * button. Without it a waiter could fill in a whole quick recipe and be told
+   * "Manager or admin only" at the save, having lost the lot. The badge still
+   * SAYS "no recipe" for everyone: knowing which dishes are uncosted is not a
+   * privilege, writing the recipe is.
+   */
+  const canWriteRecipes = me?.role === 'admin' || me?.role === 'manager';
 
   // The CATEGORY MASTER. Loaded for EVERY user, not just admins: the item form's
   // dropdown is built from it, so a non-admin editing a price still needs it.
@@ -223,6 +538,74 @@ export default function MenuItemsPage() {
   const [stationSentinels, setStationSentinels] = useState<string[]>([]);
   const [stationsLoaded, setStationsLoaded] = useState(false);
 
+  /**
+   * THE PROMPT. The menu item that was just created or just saved, waiting to be
+   * asked about its recipe.
+   *
+   * It is set AFTER the save has already succeeded and the form has already
+   * closed, which is the whole design: the item exists, it is on the menu, it
+   * sells and it prints, and nothing about this prompt can change that. It is a
+   * card in the corner, not a dialog — it covers nothing, blocks nothing, and
+   * "Not now" costs exactly one click and nothing else. Someone adding a dish in
+   * the middle of service is never held up by it.
+   */
+  /**
+   * Held as an ID, not as the row. POST/PUT /api/menu-items return the raw
+   * menu_items row, which has no `recipe_name` — that only exists on the GET's
+   * join — so a card built from the response would have to say "the recipe it is
+   * linked to" instead of naming it. The list is refetched a line earlier
+   * anyway, so the row is resolved at render time from `items`, where it is
+   * complete and stays current if anything else changes it.
+   */
+  const [recipePrompt, setRecipePrompt] = useState<{ id: string; created: boolean } | null>(null);
+
+  /**
+   * LINK AN EXISTING RECIPE. The menu item doing the claiming, and the recipe
+   * book to claim from.
+   *
+   * The third answer to the prompt, and the one the owner's direction actually
+   * requires. "Thecha Tandoori Murgh" may already have a recipe written under
+   * "Tandoori Chicken"; writing a second one would leave this kitchen with two
+   * recipes for one dish and two food costs to argue about. Linking is a PUT on
+   * the MENU ITEM (recipe_id) — the menu item reaches out and claims the recipe.
+   * The recipe still decides nothing about what is on the menu.
+   *
+   * Fetched lazily, like the materials above: the costed recipe book is not a
+   * payload to load on every visit to a 628-row menu list.
+   */
+  const [linkFor, setLinkFor] = useState<MenuItem | null>(null);
+  const [recipeBook, setRecipeBook] = useState<RecipeLite[]>([]);
+  const [recipeBookState, setRecipeBookState] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
+
+  const openLinkRecipe = useCallback(async (item: MenuItem) => {
+    setLinkFor(item);
+    if (recipeBookState === 'ready' || recipeBookState === 'loading') return;
+    setRecipeBookState('loading');
+    try {
+      const res = await fetch('/api/recipes');
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const j = await res.json();
+      setRecipeBook((j.recipes || []) as RecipeLite[]);
+      setRecipeBookState('ready');
+    } catch {
+      setRecipeBookState('error');
+    }
+  }, [recipeBookState]);
+
+  /**
+   * THE BACKLOG. Active dishes with no recipe, worst first — the list the owner
+   * works through.
+   *
+   * Served by /api/menu-items?backlog=1 and fetched only when the panel is
+   * opened. The plain menu read stays exactly as fast as it was, which matters
+   * because that same endpoint is what the captain POS and the dine-in order
+   * pads call on a tablet over venue wifi.
+   */
+  const [backlogOpen, setBacklogOpen] = useState(false);
+  const [backlog, setBacklog] = useState<BacklogRow[] | null>(null);
+  const [backlogMeta, setBacklogMeta] = useState<BacklogMeta | null>(null);
+  const [backlogState, setBacklogState] = useState<'idle' | 'loading' | 'ready' | 'error' | 'denied'>('idle');
+
   const [toast, setToast] = useState<{ msg: string; error?: boolean } | null>(null);
 
   const showToast = useCallback((msg: string, error = false) => {
@@ -249,10 +632,60 @@ export default function MenuItemsPage() {
       setSummary(prev => json.summary || prev);
       setCategories(json.categories || []);
       setStations(json.stations || []);
-    } catch (_) {
+      // Absent on an older server → assume it works, which is the behaviour this
+      // page had before the flag existed.
+      setApproximateSupported(json.approximate_supported !== false);
+    } catch {
       showToast('Failed to load menu items — check your connection', true);
     }
   }, [showToast]);
+
+  /**
+   * Bumped whenever a dish gains a recipe — the quick recipe saving, or an
+   * existing recipe being linked. The backlog reloads off it, so the row the
+   * owner just finished leaves the list and the count drops, without every
+   * caller of fetchItems() having to remember to refresh a panel it knows
+   * nothing about.
+   */
+  const [recipeLinkNonce, setRecipeLinkNonce] = useState(0);
+
+  /**
+   * The backlog, loaded only while its panel is open.
+   *
+   * `cancelled` is not ceremony: opening the panel, finishing a dish and having
+   * the nonce fire a second fetch leaves two responses in flight, and the slower
+   * one is the STALE one — it would put the finished dish back on the list.
+   */
+  useEffect(() => {
+    if (!backlogOpen) return;
+    let cancelled = false;
+    (async () => {
+      setBacklogState(s => (s === 'ready' ? 'ready' : 'loading'));
+      try {
+        const res = await fetch('/api/menu-items?backlog=1');
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const j = await res.json();
+        if (cancelled) return;
+        if (j.backlog_denied || !Array.isArray(j.backlog)) {
+          // The server declined to compute it (not a manager). Say so plainly
+          // rather than showing an empty list that reads as "nothing left to do".
+          setBacklogState(j.backlog_denied ? 'denied' : 'error');
+          return;
+        }
+        setBacklog(j.backlog as BacklogRow[]);
+        setBacklogMeta((j.backlog_meta as BacklogMeta) || null);
+        // The same response carries the fresh summary and rows, so the count in
+        // the panel header and the rows under it are from one read of the
+        // database and cannot disagree with each other.
+        if (j.summary) setSummary(j.summary);
+        if (Array.isArray(j.items)) setItems(j.items);
+        setBacklogState('ready');
+      } catch {
+        if (!cancelled) setBacklogState('error');
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [backlogOpen, recipeLinkNonce]);
 
   // The category master. A failure here is NOT silent: without it the item
   // form's dropdown would be empty, and an empty dropdown next to a stored
@@ -314,6 +747,20 @@ export default function MenuItemsPage() {
     fetch('/api/auth/me').then(r => r.json()).then(d => setMe(d?.user || null)).catch(() => {});
   }, []);
 
+  /**
+   * DOES THIS ITEM WANT A RECIPE AT ALL?
+   *
+   * Foods and beverages do — they are cooked or made from stock. Liquor does not:
+   * a peg is poured from a bottle and is costed on the store rail, so counting
+   * 245 liquor rows as "missing a recipe" turns a real, actionable gap of 234
+   * dishes into a wall of 479 that means nothing. One rule, used by the badge,
+   * the filter and the counts alike, so all three always agree.
+   */
+  const wantsRecipe = useCallback((it: MenuItem) => {
+    const t = normalizeType(it.item_type);
+    return t === 'foods' || t === 'beverages';
+  }, []);
+
   // Filtering
   const filteredItems = useMemo(() => {
     return items.filter((it) => {
@@ -326,6 +773,12 @@ export default function MenuItemsPage() {
       if (statusFilter === 'active' && !it.is_active) return false;
       if (statusFilter === 'inactive' && it.is_active) return false;
 
+      // Linked / Not linked. An ADMIN view filter on an admin list — it changes
+      // what this screen shows and nothing else. No menu, bill or KOT anywhere
+      // consults a recipe to decide whether an item exists.
+      if (linkFilter === 'linked' && !it.recipe_id) return false;
+      if (linkFilter === 'unlinked' && (it.recipe_id || !wantsRecipe(it))) return false;
+
       // Issue filter
       if (issueFilter) {
         switch (issueFilter) {
@@ -333,11 +786,15 @@ export default function MenuItemsPage() {
           case 'noCategory': if (it.category) return false; break;
           case 'noStation': if (it.station) return false; break;
           case 'noDietaryTag': if (normalizeType(it.item_type) !== 'foods' || it.dietary_tag) return false; break;
-          case 'noRecipe': if (it.recipe_id || it.material_id) return false; break;
+          // Matches the banner's count exactly: a DISH with no recipe. It used to
+          // treat a material_id as "linked", which counted Butter Chicken pointed
+          // at Butter as done — nothing in the sale path reads that mapping, so
+          // the dish still costs ₹0.
+          case 'noRecipe': if (it.recipe_id || !wantsRecipe(it)) return false; break;
           case 'any': {
             const bad = !(it.selling_price > 0)
               || (normalizeType(it.item_type) === 'foods' && !it.dietary_tag)
-              || (!it.recipe_id && !it.material_id);
+              || (wantsRecipe(it) && !it.recipe_id);
             if (!bad) return false;
             break;
           }
@@ -345,7 +802,7 @@ export default function MenuItemsPage() {
       }
       return true;
     });
-  }, [items, searchQuery, categoryFilter, stationFilter, typeFilter, vegFilter, statusFilter, issueFilter]);
+  }, [items, searchQuery, categoryFilter, stationFilter, typeFilter, vegFilter, statusFilter, issueFilter, linkFilter, wantsRecipe]);
 
   // Attention counts — distinct items + per-issue (drives the banner)
   const attn = useMemo(() => {
@@ -354,11 +811,25 @@ export default function MenuItemsPage() {
       let issue = false;
       if (!(it.selling_price > 0)) { noPrice++; issue = true; }
       if (normalizeType(it.item_type) === 'foods' && !it.dietary_tag) { noVeg++; issue = true; }
-      if (!it.recipe_id && !it.material_id) { noLink++; issue = true; }
+      // DISHES only, and a recipe is the only thing that counts as linked — see
+      // wantsRecipe above and the noRecipe filter that has to match this number.
+      if (wantsRecipe(it) && !it.recipe_id) { noLink++; issue = true; }
       if (issue) bad.add(it.id);
     }
     return { noPrice, noVeg, noLink, total: bad.size };
-  }, [items]);
+  }, [items, wantsRecipe]);
+
+  /**
+   * Costed dishes whose cost is provably WRONG — the linked recipe contains a
+   * quantity in a unit the system cannot convert, so the money on that line is
+   * computed in the wrong unit (100 pcs of prawns priced as 100 kg). Counted over
+   * everything loaded, not the current page, because the point is to say how many
+   * there are before he trusts a single figure on this screen.
+   */
+  const untrustedCost = useMemo(
+    () => items.filter(it => it.is_active && it.recipe_cost_unusable).length,
+    [items],
+  );
 
   // TRUE per-category counts, taken from the UNFILTERED list. The chip counts
   // further down are view-scoped (they honour the active/station/search
@@ -393,7 +864,7 @@ export default function MenuItemsPage() {
   };
 
   // Pagination (reset to page 1 whenever the filtered set changes)
-  useEffect(() => { setPage(1); }, [searchQuery, categoryFilter, stationFilter, typeFilter, vegFilter, statusFilter, issueFilter]);
+  useEffect(() => { setPage(1); }, [searchQuery, categoryFilter, stationFilter, typeFilter, vegFilter, statusFilter, issueFilter, linkFilter]);
   const pageCount = Math.max(1, Math.ceil(filteredItems.length / PAGE_SIZE));
   const safePage = Math.min(page, pageCount);
   const pageItems = filteredItems.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
@@ -401,7 +872,11 @@ export default function MenuItemsPage() {
   // "/" focuses the search box (but never while a modal is open)
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (editItem || importOpen || renameOpen || manageCatsOpen) return;
+      // `quickFor` belongs on this list as much as the others: the quick-recipe
+      // screen's suggestion chips are <button>s, so with focus on one, "/" passed
+      // the tag test and pulled focus to the search box BEHIND the backdrop —
+      // typing then went nowhere the cook could see.
+      if (editItem || importOpen || renameOpen || manageCatsOpen || quickFor) return;
       const tag = (document.activeElement?.tagName || '').toLowerCase();
       if (e.key === '/' && tag !== 'input' && tag !== 'textarea' && tag !== 'select') {
         e.preventDefault(); searchRef.current?.focus();
@@ -409,7 +884,7 @@ export default function MenuItemsPage() {
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [editItem, importOpen, renameOpen, manageCatsOpen]);
+  }, [editItem, importOpen, renameOpen, manageCatsOpen, quickFor]);
 
   // Import handling
   const openImport = () => {
@@ -450,6 +925,11 @@ export default function MenuItemsPage() {
       const wb = decodedText !== null
         ? XLSX.read(decodedText, { type: 'string' })
         : XLSX.read(buffer, { type: 'array' });
+      // The text the CSV guard reads. For a CP1252 file (decodedText null but not
+      // a workbook) decode it leniently — the guard only needs line positions.
+      const csvText = isBinaryWorkbook
+        ? null
+        : (decodedText ?? new TextDecoder('windows-1252').decode(bytes));
 
       // Detect format: Akan POS export, AKAN Recipe Template, or generic
       let sheetName = wb.SheetNames.find(n => /existing.*product|products/i.test(n))
@@ -457,6 +937,20 @@ export default function MenuItemsPage() {
         || wb.SheetNames[0];
       const sheet = wb.Sheets[sheetName];
       const rows = XLSX.utils.sheet_to_json<any>(sheet, { header: 1, defval: null });
+
+      // ── THE STRAY QUOTE. Checked BEFORE anything is previewed. ─────────────
+      // One unbalanced double quote silently ate 497 of 500 rows and the import
+      // still reported success. Nothing downstream can see it — the parser gets a
+      // well-formed 3-row sheet and says so. Only the raw text knows.
+      if (csvText !== null) {
+        const fault = findCsvQuoteFault(csvText, rows);
+        if (fault) {
+          setImportPreview(null);
+          setImportPayload(null);
+          setImportResult({ error: fault });
+          return;
+        }
+      }
 
       // The parser lives in ./import-parse so the "an absent column preserves,
       // it does not erase" rule can be executed and checked outside React.
@@ -577,9 +1071,10 @@ export default function MenuItemsPage() {
   // Handles both create (editItem.id === '') and update. Returns null on
   // success, or an error message — the modal stays open and shows it, so a
   // failed save never silently discards the user's edits.
-  const saveEdit = async (updates: Partial<MenuItem>): Promise<string | null> => {
+  const saveEdit = async (updates: Partial<MenuItem>, then?: 'quick' | 'link'): Promise<string | null> => {
     if (!editItem) return null;
     const isNew = !editItem.id;
+    let saved: MenuItem | null = null;
     try {
       const res = await api('/api/menu-items', {
         method: isNew ? 'POST' : 'PUT',
@@ -589,14 +1084,111 @@ export default function MenuItemsPage() {
         const j = await res.json().catch(() => ({} as any));
         return j.error || `Save failed (HTTP ${res.status})`;
       }
+      // The row as the SERVER stored it. Both handlers return { item }, and this
+      // used to be thrown away — which is why a newly created dish could not be
+      // offered a recipe: the screen did not have its id. A body that fails to
+      // parse is not an error; the save already succeeded, we simply skip the
+      // prompt rather than invent an id.
+      const j = await res.json().catch(() => ({} as any));
+      saved = (j?.item as MenuItem) || null;
     } catch {
       return 'Save failed — check your connection';
     }
     setEditItem(null);
     await fetchItems();
     showToast(isNew ? 'Item created' : 'Saved');
+
+    /**
+     * THE RECIPE PROMPT — raised here, AFTER the item is safely saved.
+     *
+     * The owner's rule is that the menu item comes first and the recipe is made
+     * from it, so this is the only correct moment: the dish exists, it is on the
+     * menu, it will sell and print whether or not anybody answers this. Every
+     * path out of the prompt — "Not now", the ✕, ignoring it entirely — leaves
+     * the saved item exactly as it is. There is no version of this that can
+     * cost someone a dish during service.
+     *
+     * Only for items that WANT a recipe (a bottle of whisky does not), and only
+     * for someone allowed to write one — the server lets managers and admins
+     * write recipes, and offering the button to anyone else is offering a
+     * refusal. Everyone still SEES the linked/not-linked state on the list.
+     */
+    if (saved && saved.id && wantsRecipe(saved) && canWriteRecipes) {
+      /**
+       * The editor's own recipe buttons come through here with `then` set: the
+       * person has already ANSWERED the question this prompt asks, so asking it
+       * again would be a card in the corner saying "shall we?" over the screen
+       * that is already doing it. They go straight to the screen they chose.
+       *
+       * `saved` is the server's row for this id, so both screens are bound to
+       * the item that was actually stored — not to the form that was typed.
+       */
+      if (then === 'quick') openQuickRecipe(saved);
+      else if (then === 'link') openLinkRecipe(saved);
+      else setRecipePrompt({ id: saved.id, created: isNew });
+    }
     return null;
   };
+
+  /**
+   * LINK AN EXISTING RECIPE TO THIS MENU ITEM.
+   *
+   * Written as a PUT on the MENU ITEM, not a PUT on the recipe, and that is the
+   * owner's direction expressed in the wire format: the menu item is the thing
+   * that exists, and it reaches out and claims a recipe. PUT /api/menu-items
+   * already does everything that has to happen — it reads the previous link
+   * first and re-costs BOTH recipes, so the one that just lost this listing
+   * falls back to its own price instead of keeping a food cost measured against
+   * a menu price it no longer owns (src/app/api/menu-items/route.ts).
+   *
+   * Returns null on success or the error STRING, same contract as saveEdit, so
+   * a refusal lands in the picker's own banner rather than vanishing behind a
+   * closed dialog.
+   */
+  const linkRecipe = async (itemId: string, recipeId: string): Promise<string | null> => {
+    try {
+      const res = await api('/api/menu-items', { method: 'PUT', body: { id: itemId, recipe_id: recipeId } });
+      if (!res.ok) {
+        const j = await res.json().catch(() => ({} as any));
+        return j.error || `Could not link the recipe (HTTP ${res.status})`;
+      }
+    } catch {
+      return 'Could not link the recipe — check your connection';
+    }
+    setLinkFor(null);
+    await fetchItems();
+    // The backlog is one dish shorter now. Bumping the nonce reloads it from the
+    // server rather than splicing the row out client-side — the count on screen
+    // is then the database's count, not this page's arithmetic about it.
+    setRecipeLinkNonce(n => n + 1);
+    return null;
+  };
+
+  /**
+   * A backlog row, as the recipe screens want it.
+   *
+   * Prefers the real menu_items row already in `items` — it carries the station,
+   * the tax fields and the current recipe link, and using it means the quick
+   * recipe screen is looking at exactly what the list is looking at. The
+   * synthesized fallback exists only for the case where the backlog response
+   * arrived and the items array has not (the panel can be opened before the
+   * plain list has settled); it carries every field those two screens actually
+   * read, so nothing is guessed.
+   */
+  const itemForBacklogRow = useCallback((row: BacklogRow): MenuItem => {
+    const real = items.find(i => i.id === row.id);
+    if (real) return real;
+    return {
+      ...NEW_ITEM,
+      id: row.id,
+      name: row.name,
+      category: row.category,
+      item_type: row.item_type,
+      selling_price: row.selling_price,
+      material_id: row.material_id,
+      material_name: row.material_name || undefined,
+    };
+  }, [items]);
 
   // Bulk category rename. Same contract as saveEdit: returns null on success or
   // an error STRING, so the server's refusal ("that name already exists") lands
@@ -695,6 +1287,54 @@ export default function MenuItemsPage() {
           <div>
             <p className="text-[11px] font-semibold text-[#8B7355] uppercase tracking-wider">Dine-In</p>
             <h1 className="text-2xl sm:text-3xl font-bold text-[#2D1B0E] mt-0.5">Menu Items</h1>
+            {/* THE ONE NUMBER THIS SCREEN OWES HIM, said in a sentence rather
+                than left to be counted off a list of 628 rows. Dishes only —
+                liquor is poured, not cooked. */}
+            {summary.foodsTotal > 0 && (
+              <p className="text-xs text-[#8B7355] mt-1">
+                {/* "active" is load-bearing, not padding. The attention band
+                    below carries its OWN no-recipe count over EVERY item,
+                    delisted ones included (261 against this 234 on live data),
+                    and two unqualified counts of "dishes with no recipe" sitting
+                    a hand's width apart is how a number the owner is meant to
+                    watch shrink stops being believed. Each now says its scope.
+                    Labels only — neither count and neither filter moved. */}
+                <b className="text-[#3D2614]">{summary.foodsTotal - summary.foodsNoRecipe}</b> of {summary.foodsTotal} active dishes have a recipe.
+                {summary.foodsNoRecipe > 0 && (
+                  <> The other <b className="text-[#3D2614]">{summary.foodsNoRecipe}</b> still sell — they just record no food cost.</>
+                )}
+                {/* THE WAY IN. The sentence states the backlog; this is the only
+                    control on the page that lets him actually work through it in
+                    the order that matters. Offered to managers and admins alone,
+                    because every row's action is a recipe write and the server
+                    would refuse anyone else — and because the panel carries what
+                    each dish took at the till. */}
+                {summary.foodsNoRecipe > 0 && canWriteRecipes && (
+                  <>
+                    {' '}
+                    <button
+                      onClick={() => setBacklogOpen(v => !v)}
+                      className="text-[#af4408] font-semibold hover:underline"
+                    >
+                      {backlogOpen ? 'Hide the backlog' : 'Work through them →'}
+                    </button>
+                  </>
+                )}
+              </p>
+            )}
+            {/* WHY THE OTHER REPORT SAYS A MUCH BIGGER NUMBER. He has "Menu Items
+                Without Recipe" in his sidebar and it reads 610 of 629 — because it
+                counts liquor, which is poured from a bottle and costed in the
+                store, and which no recipe will ever be written for. Two honest
+                counts of different things, one of them in his sidebar, and
+                nothing on this page reconciled them. */}
+            {summary.liquors > 0 && summary.foodsTotal > 0 && (
+              <p className="text-[11px] text-[#A08B73] mt-1">
+                Dishes only — the {summary.liquors} liquor lines are poured from a bottle and costed in the store, so they are
+                not counted here. The <b className="font-medium">Menu Items Without Recipe</b> report counts those too, which is
+                why its total is far larger.
+              </p>
+            )}
           </div>
           <div className="flex gap-2">
             {/* Round-trip: download the CURRENT menu in the exact columns the
@@ -712,6 +1352,23 @@ export default function MenuItemsPage() {
           </div>
         </div>
 
+        {/* THE BACKLOG. Opened from the sentence above; everything else on this
+            page stays exactly where it was underneath it, so opening the panel
+            never costs anyone the list they came for. */}
+        {backlogOpen && canWriteRecipes && (
+          <RecipeBacklogPanel
+            rows={backlog}
+            meta={backlogMeta}
+            state={backlogState}
+            remaining={summary.foodsNoRecipe}
+            onClose={() => setBacklogOpen(false)}
+            onRetry={() => setRecipeLinkNonce(n => n + 1)}
+            onAddRecipe={(row) => openQuickRecipe(itemForBacklogRow(row))}
+            onLinkExisting={(row) => openLinkRecipe(itemForBacklogRow(row))}
+            onEdit={(row) => setEditItem(itemForBacklogRow(row))}
+          />
+        )}
+
         {/* Stat bar */}
         <div className="bg-white border border-[#E8D5C4] rounded-2xl shadow-sm overflow-hidden grid grid-cols-3 sm:grid-cols-6">
           <Stat label="Total" value={summary.total} className="text-[#2D1B0E]" />
@@ -721,6 +1378,38 @@ export default function MenuItemsPage() {
           <Stat label="Beverages" value={summary.beverages} className="text-[#B9A48C]" />
           <Stat label="With Recipe" value={summary.withRecipe} className="text-blue-600" />
         </div>
+
+        {/* ── WHEN A COST ON THIS PAGE IS PROVABLY WRONG, SAY SO FIRST. ──────
+            Not a guess and not a general disclaimer: each of these rows has a
+            linked recipe carrying a quantity in a unit the system cannot convert,
+            so that line's money is computed in the wrong unit. LOOSE PRAWNS shows
+            ₹63,012 because 100 pcs of prawns is priced as 100 kg.
+
+            Deliberately NOT worded as "these figures may be out of date". They
+            are not: every stored recipe cost on this database reproduces to the
+            paise from today's purchase averages, so nothing here is waiting on
+            the price reconcile, and saying it was would send him to fix the wrong
+            thing. The unit is the fault, and the unit is what it names. */}
+        {untrustedCost > 0 && (
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-2 bg-red-50 border border-red-200 rounded-2xl px-4 py-3">
+            <span className="flex items-start gap-2 text-sm text-red-900">
+              <AlertTriangle className="w-4 h-4 text-red-500 shrink-0 mt-0.5" />
+              <span>
+                <b>{untrustedCost} {untrustedCost === 1 ? 'dish has a cost that is wrong' : 'dishes have a cost that is wrong'}.</b>{' '}
+                Most of what those costs are made of is a quantity in a unit the system cannot convert — for
+                example 100 pcs of a material priced by the kilo, which gets valued as 100 kg. Do not price
+                anything off those rows until the quantity or the unit is corrected. They are marked{' '}
+                <b>cost is wrong</b> below.
+              </span>
+            </span>
+            {/* LANDS ON THE ROWS, NOT ON THE LIST. A bare /recipes handed him 67
+                recipes and left him to find the six; ?health= opens the recipe
+                book with its own "cost is wrong" filter already applied. */}
+            <a href="/recipes?health=costWrong" className="ml-auto text-sm font-medium text-red-800 hover:underline whitespace-nowrap">
+              Fix in Recipes →
+            </a>
+          </div>
+        )}
 
         {/* Attention banner */}
         {attn.total > 0 && (
@@ -732,7 +1421,20 @@ export default function MenuItemsPage() {
             <div className="flex flex-wrap items-center gap-2">
               {attn.noPrice > 0 && <AttnPill tone="red" count={attn.noPrice} label="no selling price" active={issueFilter === 'noPrice'} onClick={() => reviewIssue('noPrice')} />}
               {attn.noVeg > 0 && <AttnPill tone="amber" count={attn.noVeg} label="missing veg/non-veg" active={issueFilter === 'noDietaryTag'} onClick={() => reviewIssue('noDietaryTag')} />}
-              {attn.noLink > 0 && <AttnPill tone="blue" count={attn.noLink} label="no recipe link" active={issueFilter === 'noRecipe'} onClick={() => reviewIssue('noRecipe')} />}
+              {/* ITS SCOPE, AND THE SIZE OF THE GAP, IN WORDS.
+                  This count covers EVERY dish (clicking it sets the status filter
+                  to "all"), so it reads higher than the active backlog count in
+                  the sentence at the top and on the Not-linked filter — 261
+                  against 234 on live data. "Delisted too" named the scope but
+                  left him to do the subtraction, and "delisted" is a word that
+                  appears nowhere else in this app: its own controls say "Active
+                  only" and "inactive". So the difference is stated outright. The
+                  number and the filter are untouched; only the words changed. */}
+              {attn.noLink > 0 && <AttnPill tone="blue" count={attn.noLink}
+                              label={attn.noLink > summary.foodsNoRecipe
+                                ? `dishes with no recipe, including ${attn.noLink - summary.foodsNoRecipe} no longer on the menu`
+                                : 'dishes with no recipe'}
+                              active={issueFilter === 'noRecipe'} onClick={() => reviewIssue('noRecipe')} />}
             </div>
             <button onClick={() => reviewIssue('any')} className="ml-auto text-sm font-medium text-[#af4408] hover:underline whitespace-nowrap">
               {issueFilter ? 'Clear filter' : 'Review all →'}
@@ -760,6 +1462,22 @@ export default function MenuItemsPage() {
               <option value="beverages">Beverages</option>
             </select>
             <SegmentedVeg value={vegFilter} onChange={setVegFilter} />
+            {/* RECIPE: All / Linked / Not linked. The answer to "which of my
+                dishes are costed?" on a 628-row list, one click away. An admin
+                view filter — it narrows THIS table and nothing else; no menu,
+                bill or ticket anywhere asks a recipe whether an item exists. */}
+            <SegmentedLink
+              value={linkFilter}
+              onChange={setLinkFilter}
+              /* THE COUNT, ON THE CONTROL. The owner's ask is to watch the
+                 backlog shrink, and a number he has to go and find somewhere
+                 else is a number he stops checking. This is the SERVER's count
+                 (summary.foodsNoRecipe) — the very figure the backlog list is
+                 built from, so the badge and the panel can never disagree.
+                 Active dishes only, which is what the tooltip says. */
+              unlinkedCount={summary.foodsNoRecipe}
+              linkedCount={summary.foodsTotal - summary.foodsNoRecipe}
+            />
             <ActiveToggle on={statusFilter === 'active'} onToggle={() => setStatusFilter(statusFilter === 'active' ? 'all' : 'active')} />
           </div>
         </div>
@@ -829,7 +1547,32 @@ export default function MenuItemsPage() {
         ) : (
           <>
             {/* Desktop table */}
-            <div className="hidden md:block bg-white border border-[#E8D5C4] rounded-2xl shadow-sm overflow-hidden">
+            {/* ── WHY xl, AND WHY lg WAS NOT ENOUGH ─────────────────────────
+                Measured on the iPad his floor actually uses — 1024×768 landscape.
+                At `md` that got the TABLE, and the RECIPE column was off-screen:
+                the whole point of this screen ("every Menu Item should clearly
+                indicate whether the recipe is Linked or Not Linked") sitting
+                behind a sideways swipe on the one device carried around the
+                restaurant.
+
+                Moving to `lg` did not fix it, because Tailwind's lg is
+                min-width:1024px — INCLUSIVE. 1024 is the measured width, so it
+                landed on the table side of the line by one pixel. And 1024 is the
+                worst width of all: at exactly 1024 the sidebar stops being a
+                drawer and takes 374px, so the scroll container is 650px against a
+                935px table. Measured in the browser at each width, RECIPE column
+                at x 673–797:
+
+                     1023 → cards, everything visible          (container = full)
+                     1024 → table 935 in a 650 container       RECIPE HIDDEN
+                     1280 → table 1102 in a 1102 container     RECIPE visible
+                     1440 → table 1262 in a 1262 container     RECIPE visible
+
+                The table first FITS at 1280, so that is where it starts. Every
+                tablet — 1024, iPad Air 1180, iPad Pro 1194 — gets the card
+                layout, which states the answer in words on every card. Neither
+                layout changed; only which widths get which. */}
+            <div className="hidden xl:block bg-white border border-[#E8D5C4] rounded-2xl shadow-sm overflow-hidden">
               <div className="overflow-x-auto">
                 <table className="w-full text-sm">
                   <thead>
@@ -841,7 +1584,9 @@ export default function MenuItemsPage() {
                       <th className="text-right py-3 px-3 font-semibold">Sell ₹</th>
                       <th className="text-right py-3 px-3 font-semibold">Cost ₹</th>
                       <th className="text-right py-3 px-3 font-semibold">FC %</th>
-                      <th className="text-left py-3 px-3 font-semibold">Link</th>
+                      {/* "Link" named the mechanism. This column answers "does
+                          this dish have a recipe?", so it says Recipe. */}
+                      <th className="text-left py-3 px-3 font-semibold">Recipe</th>
                       <th className="text-center py-3 px-3 font-semibold">Active</th>
                       <th className="w-10" aria-label="Actions"></th>
                     </tr>
@@ -868,7 +1613,18 @@ export default function MenuItemsPage() {
                           {it.selling_price > 0 ? formatCurrency(it.selling_price) : <span className="text-red-400 font-normal">₹0</span>}
                         </td>
                         <td className="py-2.5 px-3 text-right text-[#6B5744]">
-                          {it.recipe_cost ? formatCurrency(it.recipe_cost) : it.material_cost ? formatCurrency(it.material_cost) : <span className="text-[#C4B09A]">—</span>}
+                          {/* APPROXIMATE TRAVELS WITH THE MONEY. This cell and
+                              the FC% beside it are derived from the linked
+                              recipe; if that recipe's quantities are rough then
+                              so are these, and this list is read to make pricing
+                              decisions.
+
+                              The test is "is there a RECIPE", not "is the cost
+                              truthy". A linked recipe costing ₹0 is a real
+                              answer — it means every ingredient on it is priced
+                              at zero — and printing an em-dash for it hid that
+                              behind the same glyph used for "no recipe at all". */}
+                          <CostCell it={it} />
                         </td>
                         <td className="py-2.5 px-3 text-right">
                           {/* DERIVED per row by /api/menu-items: the linked
@@ -880,14 +1636,20 @@ export default function MenuItemsPage() {
                               is costed against the cheapest listing for the
                               recipe book (src/lib/recipe-price.ts); each row
                               here still reports against its own price. */}
-                          {it.recipe_food_cost_percent
+                          {/* `!= null`, not truthiness. A linked recipe whose cost
+                              is ₹0 has a food cost of 0%, and printing an em-dash
+                              for it put "no recipe at all" and "a recipe with
+                              nothing in it" behind the same glyph — beside a
+                              ₹0.00 in the Cost column, which reads as a costed
+                              dish. The Cost cell fixed this; this one had not. */}
+                          {typeof it.recipe_food_cost_percent === 'number'
                             ? <span
-                                className={`font-medium ${fcColor(it.recipe_food_cost_percent)}`}
-                                title={`Linked recipe's food cost — its cost measured against the menu price. ${it.recipe_cost ? `Cost ${formatCurrency(it.recipe_cost)} ÷ ` : ''}${formatCurrency(it.selling_price)}`}
-                              >{it.recipe_food_cost_percent}</span>
+                                className={`font-medium ${it.recipe_cost_unusable ? 'text-red-600 line-through decoration-red-400/60' : it.recipe_cost_warning || it.recipe_is_approximate ? 'text-amber-800' : fcColor(it.recipe_food_cost_percent)}`}
+                                title={`${it.recipe_cost_warning ? `${it.recipe_cost_unusable ? 'THIS PERCENTAGE IS WRONG' : warningHeadline(it.recipe_cost_warning_kind)} — ${it.recipe_cost_warning} ${it.recipe_cost_warning_fix || ''}\n\n` : ''}${it.recipe_is_approximate ? 'APPROXIMATE — the linked recipe\'s quantities are rough, so this percentage is an estimate. ' : ''}Linked recipe's food cost — its cost measured against the menu price. ${it.recipe_cost ? `Cost ${formatCurrency(it.recipe_cost)} ÷ ` : ''}${formatCurrency(it.selling_price)}`}
+                              >{it.recipe_is_approximate && !it.recipe_cost_unusable && <span aria-label="approximate">≈</span>}{it.recipe_food_cost_percent}</span>
                             : <span className="text-[#C4B09A]">—</span>}
                         </td>
-                        <td className="py-2.5 px-3"><LinkBadge item={it} /></td>
+                        <td className="py-2.5 px-3"><LinkBadge item={it} onAddRecipe={openQuickRecipe} canWrite={canWriteRecipes} /></td>
                         <td className="py-2.5 px-3 text-center"><RowToggle on={!!it.is_active} onClick={() => toggleActive(it)} /></td>
                         <td className="py-2.5 px-2 text-center whitespace-nowrap">
                           {/* Visible pencil first — Edit hidden behind ⋮ alone kept
@@ -906,11 +1668,42 @@ export default function MenuItemsPage() {
             </div>
 
             {/* Mobile cards */}
-            <div className="md:hidden space-y-2.5">
+            {/* Phones AND every tablet up to 1279 — see the note on the table
+                above. Must stay the exact complement of the table's `xl`, or a
+                width gets both layouts or neither. */}
+            <div className="xl:hidden space-y-2.5">
               {pageItems.map((it) => (
-                <MobileCard key={it.id} it={it} onEdit={() => setEditItem(it)} onDelete={() => deleteItem(it.id)} onToggle={() => toggleActive(it)} />
+                <MobileCard key={it.id} it={it} onEdit={() => setEditItem(it)} onDelete={() => deleteItem(it.id)} onToggle={() => toggleActive(it)} onAddRecipe={openQuickRecipe} canWrite={canWriteRecipes} />
               ))}
             </div>
+
+            {/* THE KEY, in words, on the screen. A "≈" that only a tooltip
+                explains is no warning at all on a tablet, where there is no
+                hover — and this is a tablet-first operation. */}
+            <p className="text-[11px] text-[#8B7355] leading-relaxed">
+              <span className="text-amber-800 font-medium">≈ approx</span> — cost from a simple recipe covering only the main
+              ingredients. Real, but an estimate; do not price off it as though it were measured.
+              <span className="mx-1.5 text-[#D4B896]">·</span>
+              <span className="text-red-600 font-medium">cost is wrong</span> — most of this cost is computed in a unit the
+              system cannot convert, so the figure means nothing until the recipe is fixed.
+              <span className="mx-1.5 text-[#D4B896]">·</span>
+              <span className="text-amber-800 font-medium">check units</span> — one line is weighed in grams against a material
+              stocked in millilitres (or the reverse). The total is right to within a few percent; fix the unit when you can.
+              <span className="mx-1.5 text-[#D4B896]">·</span>
+              {/* Listed because the badge can now say it, and a state with no key
+                  entry is a state the reader has to guess at. Deliberately NOT
+                  folded into "check units": that entry promises the total is right
+                  to within a few percent, which is the opposite of what this one
+                  means. */}
+              <span className="text-orange-800 font-medium">check quantity</span> — one line uses more of a single ingredient than
+              a portion plausibly holds (700 g of a sauce on one plate). The total is not a few percent out; it may be far out.
+              Correct unless the recipe is written for a batch.
+              <span className="mx-1.5 text-[#D4B896]">·</span>
+              <span className="text-red-600 font-medium">empty</span> — the linked recipe has nothing in it, so the dish is
+              linked and still costs ₹0.
+              <span className="mx-1.5 text-[#D4B896]">·</span>
+              A dish with no recipe still appears on the menu, still sells and still prints — it simply records no food cost.
+            </p>
 
             {/* Pagination */}
             <div className="flex flex-col sm:flex-row items-center justify-between gap-3 pt-1">
@@ -922,6 +1715,64 @@ export default function MenuItemsPage() {
           </>
         )}
       </div>
+
+      {/* ── THE RECIPE PROMPT ──────────────────────────────────────────────
+          Raised after a menu item is created or saved; sits in the corner above
+          the toast. Deliberately NOT a dialog: the item is already saved, so
+          there is nothing to confirm and nothing to hold up. It takes no focus,
+          and every way out of it — "Not now", the ✕, or simply carrying on —
+          leaves the item exactly as saved.
+
+          IT IS SUPPRESSED WHILE AN ITEM EDITOR IS OPEN, and that is not tidiness
+          — IT WAS AN R7 DEFECT, MEASURED. This card is z-[95]; the New/Edit modal
+          is below it. Under the `sm` breakpoint the card's own phone styling
+          (`bottom-6 left-4 right-4`) makes it full-width at the bottom of the
+          viewport, which is exactly where the modal's footer sits. At 390×844:
+
+              document.elementFromPoint(save button centre)
+                → "Add a simple recipe Link an existing recipeNot now"
+                → isSave: false,  cancelHit.clickable: false
+
+          So a manager who created one dish, left the prompt up and immediately
+          typed a second one could not press Save at all — and the press landed on
+          "Add a simple recipe" FOR THE PREVIOUS DISH, which silently discarded the
+          dish being typed. Proved in the database: of 'ZZ R7 Overlap A' and
+          'ZZ R7 Overlap B', only A existed. The boundary was exact — clickable at
+          640px, not at 639px — because the card switches to `sm:bottom-20
+          sm:right-6 sm:max-w-sm` at 640 and stops overlapping.
+
+          Suppression rather than a lower z-index or a nudged position: a prompt
+          about item A is noise while item B is being typed, whatever it covers.
+          The state is KEPT, not cleared — close the editor and the prompt is
+          there waiting, so nothing is lost either way.
+
+          A comment here used to claim "It covers no control". Below 640px it
+          covered the two most important ones on the page.
+
+          EVERY dialog, not only the editor. The editor is the one that was proved
+          to lose typed work, but the import modal and the backlog panel have
+          footers in the same place and this card outranks both of them on z-index
+          too, so the rule is "no dialog is open" rather than a list of the one
+          that was caught. quickFor / linkFor cannot actually coexist with the
+          prompt (opening either clears it — see onAddRecipe/onLinkExisting above)
+          and are named anyway, so a future caller that opens one WITHOUT clearing
+          the prompt does not silently reintroduce this. */}
+      {recipePrompt && !editItem && !importOpen && !backlogOpen && !quickFor && !linkFor && (() => {
+        // Resolved from the freshly-refetched list. If it is somehow not there,
+        // nothing is shown — an absent prompt is a non-event, and the item is
+        // saved either way.
+        const it = items.find(i => i.id === recipePrompt.id);
+        if (!it) return null;
+        return (
+          <RecipePromptCard
+            item={it}
+            created={recipePrompt.created}
+            onAddRecipe={() => { setRecipePrompt(null); openQuickRecipe(it); }}
+            onLinkExisting={() => { setRecipePrompt(null); openLinkRecipe(it); }}
+            onDismiss={() => setRecipePrompt(null)}
+          />
+        );
+      })()}
 
       {/* Toast — z above modal backdrops so error toasts stay visible */}
       {toast && (
@@ -1226,7 +2077,97 @@ export default function MenuItemsPage() {
         // has no id; 'new' keeps its key stable so typing into the add form does
         // not remount it out from under the user.
         <EditItemModal key={editItem.id || 'new'} item={editItem} onClose={() => setEditItem(null)} onSave={saveEdit} menuCategories={menuCats}
-                       stationMaster={stationMaster} stationSentinels={stationSentinels} stationsLoaded={stationsLoaded} isAdmin={isAdmin} isNew={!editItem.id} />
+                       stationMaster={stationMaster} stationSentinels={stationSentinels} stationsLoaded={stationsLoaded} isAdmin={isAdmin} isNew={!editItem.id}
+                       canWriteRecipes={canWriteRecipes} />
+      )}
+
+      {/* QUICK RECIPE. Keyed on the menu item id for the same reason
+          EditItemModal is: the modal seeds its line state on mount, so swapping
+          the target without a remount would carry one dish's ingredients onto
+          another dish's id. */}
+      {quickFor && materialsState === 'ready' && (
+        <QuickRecipeModal
+          key={quickFor.id}
+          target={{
+            id: quickFor.id,
+            name: quickFor.name,
+            category: quickFor.category,
+            selling_price: quickFor.selling_price,
+            item_type: quickFor.item_type,
+          }}
+          materials={materials}
+          approximateSupported={approximateSupported}
+          onClose={() => setQuickFor(null)}
+          onSaved={() => {
+            setQuickFor(null);
+            // Re-read the list so the new cost, FC% and badge appear on the row
+            // straight away, from the server's own numbers rather than a
+            // client-side guess at what was just saved.
+            fetchItems();
+            // …and the backlog, which is now one dish shorter. Reloaded from the
+            // server rather than spliced client-side, so the count the owner
+            // watches is the database's count.
+            setRecipeLinkNonce(n => n + 1);
+            showToast(`Approximate recipe saved for ${quickFor.name}`);
+          }}
+        />
+      )}
+      {quickFor && materialsState === 'loading' && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+          <div className="absolute inset-0 bg-black/40 backdrop-blur-sm" onClick={() => setQuickFor(null)} />
+          <div className="relative bg-white border border-[#E8D5C4] rounded-2xl shadow-2xl px-6 py-5 flex items-center gap-3">
+            <Loader2 className="w-4 h-4 animate-spin text-[#af4408]" />
+            <span className="text-sm text-[#3D2614]">Loading materials…</span>
+          </div>
+        </div>
+      )}
+      {quickFor && materialsState === 'error' && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+          <div className="absolute inset-0 bg-black/40 backdrop-blur-sm" onClick={() => setQuickFor(null)} />
+          <div className="relative bg-white border border-[#E8D5C4] rounded-2xl shadow-2xl px-6 py-5 max-w-sm">
+            <p className="text-sm text-[#3D2614] mb-3">Could not load the material list, so a recipe cannot be written right now.</p>
+            <div className="flex justify-end gap-2">
+              <button onClick={() => setQuickFor(null)} className="px-3 py-1.5 text-sm text-[#6B5744] hover:bg-[#FFF1E3] rounded-lg">Close</button>
+              <button onClick={() => { setMaterialsState('idle'); openQuickRecipe(quickFor); }}
+                      className="px-3 py-1.5 text-sm rounded-lg bg-[#af4408] text-white">Try again</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* LINK AN EXISTING RECIPE. Keyed on the menu item for the same reason the
+          two modals above are — it seeds its search box on mount. */}
+      {linkFor && recipeBookState === 'ready' && (
+        <LinkRecipeModal
+          key={linkFor.id}
+          item={linkFor}
+          recipes={recipeBook}
+          onClose={() => setLinkFor(null)}
+          onLink={(recipeId) => linkRecipe(linkFor.id, recipeId)}
+          onLinked={(recipeName) => showToast(`“${linkFor.name}” now uses ${recipeName}`)}
+        />
+      )}
+      {linkFor && recipeBookState === 'loading' && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+          <div className="absolute inset-0 bg-black/40 backdrop-blur-sm" onClick={() => setLinkFor(null)} />
+          <div className="relative bg-white border border-[#E8D5C4] rounded-2xl shadow-2xl px-6 py-5 flex items-center gap-3">
+            <Loader2 className="w-4 h-4 animate-spin text-[#af4408]" />
+            <span className="text-sm text-[#3D2614]">Loading the recipe book…</span>
+          </div>
+        </div>
+      )}
+      {linkFor && recipeBookState === 'error' && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+          <div className="absolute inset-0 bg-black/40 backdrop-blur-sm" onClick={() => setLinkFor(null)} />
+          <div className="relative bg-white border border-[#E8D5C4] rounded-2xl shadow-2xl px-6 py-5 max-w-sm">
+            <p className="text-sm text-[#3D2614] mb-3">Could not load the recipe book, so nothing can be linked right now.</p>
+            <div className="flex justify-end gap-2">
+              <button onClick={() => setLinkFor(null)} className="px-3 py-1.5 text-sm text-[#6B5744] hover:bg-[#FFF1E3] rounded-lg">Close</button>
+              <button onClick={() => { setRecipeBookState('idle'); openLinkRecipe(linkFor); }}
+                      className="px-3 py-1.5 text-sm rounded-lg bg-[#af4408] text-white">Try again</button>
+            </div>
+          </div>
+        </div>
       )}
 
       {/* Category master (admin) */}
@@ -1307,9 +2248,174 @@ function VegSquare({ tag, type }: { tag: string; type: string }) {
   return <span className="text-[#C4B09A]" aria-hidden>—</span>;
 }
 
-function LinkBadge({ item }: { item: MenuItem }) {
-  if (item.recipe_id) return <span className="text-[11px] font-medium px-2 py-0.5 rounded-md bg-blue-50 text-blue-700 border border-blue-200">Recipe</span>;
-  if (item.material_id) return <span className="text-[11px] font-medium px-2 py-0.5 rounded-md bg-purple-50 text-purple-700 border border-purple-200">Direct</span>;
+/**
+ * "Not linked" is a STATE, not an em-dash.
+ *
+ * This column used to print `—` in #C4B09A — the app's "not applicable" grey,
+ * the identical glyph the V/NV column prints for a liquor row. A dish with no
+ * recipe therefore looked exactly like a dish for which the question does not
+ * arise, and the owner's actual question ("which of my dishes are not costed?")
+ * could not be answered by reading the screen.
+ *
+ * Three things changed:
+ *   · A missing recipe on a FOOD item reads "No recipe" in amber and is a button
+ *     that opens the quick-recipe screen. On a liquor row it stays a quiet dash,
+ *     because a bottle pour genuinely does not want a recipe.
+ *   · "Direct" no longer reads as done. 88 active food items carry a material_id
+ *     and no recipe — Butter Chicken pointed at Butter — and nothing in the sale
+ *     path reads menu_items.material_id, so they cost ₹0 and deduct nothing
+ *     while reporting as linked. They are marked for what they are.
+ *   · An approximate recipe says so here as well as on the cost.
+ */
+function LinkBadge({ item, onAddRecipe, canWrite = true }: { item: MenuItem; onAddRecipe?: (it: MenuItem) => void; canWrite?: boolean }) {
+  if (item.recipe_id) {
+    /**
+     * LINKED — and now a way IN.
+     *
+     * Before this, a linked row was a dead end: the badge was a plain <span> and
+     * `grep href="/recipes"` on this file found nothing, so a menu item could
+     * never reach its own recipe. That is half of what the owner asked for —
+     * editing an item should let him UPDATE its recipe, not only add one. The
+     * recipe's name seeds the search on /recipes so the link lands on the recipe
+     * itself rather than on a list of 67.
+     */
+    const href = `/recipes?search=${encodeURIComponent(item.recipe_name || item.name)}`;
+    const base = 'text-[11px] font-medium px-2 py-0.5 rounded-md border whitespace-nowrap inline-block hover:underline';
+
+    // LINKED TO AN EMPTY RECIPE. Not a cost that is wrong — no cost at all, on a
+    // row that otherwise reads as done. This outranks everything below it,
+    // because a dish whose recipe has nothing in it is exactly as uncosted as a
+    // dish with no recipe, and only this badge can say so.
+    if (item.recipe_empty) {
+      return (
+        <a href={href}
+           title={`${item.recipe_cost_warning}\n\n${item.recipe_cost_warning_fix || ''}`}
+           className={`${base} bg-red-50 text-red-700 border-red-300`}>Recipe · empty</a>
+      );
+    }
+    // MOST of this cost is computed in the wrong unit, so the figure is noise.
+    // This outranks "approximate": an estimate is useful, noise is not.
+    if (item.recipe_cost_unusable) {
+      return (
+        <a href={href}
+           title={`${item.recipe_cost_warning}\n\n${item.recipe_cost_warning_fix || ''}\n\nOpen the recipe to fix it — until then the cost and FC% on this row mean nothing.`}
+           className={`${base} bg-red-50 text-red-700 border-red-300`}>Recipe · cost is wrong</a>
+      );
+    }
+    // A bad line whose money the engine can still use — so the figure is KEPT and
+    // the row is not struck. Named without shouting, because shouting here is what
+    // would stop the shout above being heard.
+    //
+    // The wording is no longer fixed at "check units": a quantity fault gets its
+    // own label and its own closing sentence, because the one this used to print
+    // ("the total is still broadly right") is a false reassurance about 700 g of
+    // sauce on one plate. See warningLabel / warningClosing.
+    if (item.recipe_cost_warning) {
+      const quantity = item.recipe_cost_warning_kind === 'quantity';
+      return (
+        <a href={href}
+           title={`${item.recipe_cost_warning}\n\n${item.recipe_cost_warning_fix || ''}\n\n${warningClosing(item.recipe_cost_warning_kind)}`}
+           className={`${base} ${quantity ? 'bg-orange-50 text-orange-800 border-orange-300' : 'bg-amber-50 text-amber-800 border-amber-300'}`}
+        >Recipe · {warningLabel(item.recipe_cost_warning_kind)}</a>
+      );
+    }
+    return item.recipe_is_approximate
+      ? <a href={href}
+           title={`Linked to a simple recipe${item.recipe_name ? ` (${item.recipe_name})` : ''} — only the main ingredients, with rough quantities. The cost and FC% on this row are estimates, not measured figures. Open it to finish the recipe.`}
+           className={`${base} bg-amber-50 text-amber-800 border-amber-300`}>Recipe · approx</a>
+      : <a href={href}
+           title={`Linked to ${item.recipe_name ? `the recipe “${item.recipe_name}”` : 'a full recipe'}. The cost and FC% on this row come from it. Open it to change it.`}
+           className={`${base} bg-emerald-50 text-emerald-700 border-emerald-200`}>Recipe</a>;
+  }
+
+  const isFood = normalizeType(item.item_type) === 'foods' || normalizeType(item.item_type) === 'beverages';
+
+  if (!isFood) {
+    // A peg is poured from a bottle: it is costed on the store rail and there is
+    // nothing to write a recipe for. The old text ("Not applicable for this item
+    // type") named a data model; this names the reason.
+    return <span className="text-[#C4B09A]" title="Liquor is poured from a bottle and costed in the store — no recipe needed.">—</span>;
+  }
+
+  // NOT LINKED — the state 96% of this menu is in, so it is written calmly. It
+  // is a gap to work through, not 234 alarms; red here would train the eye to
+  // ignore the column, and the genuinely alarming state (a cost that is wrong)
+  // is the one that gets red.
+  const material = item.material_id
+    // A cooked dish pointed at a single ingredient is not costed — it is a
+    // cooked dish pointed at a single ingredient. Nothing in the sale path reads
+    // menu_items.material_id, so it costs ₹0 and deducts nothing.
+    ? ` It is mapped to the material “${item.material_name || ''}”, which does not cost or deduct anything when it sells.`
+    : '';
+
+  if (onAddRecipe && canWrite) {
+    return (
+      <button
+        onClick={() => onAddRecipe(item)}
+        title={`No recipe, so this dish records ₹0 food cost and deducts no stock when sold.${material} It still appears on the menu and still sells. Click to add a simple recipe.`}
+        className="text-[11px] font-medium px-2 py-0.5 rounded-md bg-white text-[#6B5744] border border-[#D4B896] hover:border-[#af4408] hover:text-[#af4408] hover:bg-[#FFF1E3] inline-flex items-center gap-1 whitespace-nowrap"
+      ><Plus className="w-3 h-3" />Not linked</button>
+    );
+  }
+
+  // Same fact, no button — writing a recipe is a manager's job, so offering the
+  // button to anyone else is offering a refusal.
+  return (
+    <span title={`No recipe, so this dish records ₹0 food cost when sold.${material} It still appears on the menu and still sells. A manager can add a recipe for it.`}
+          className="text-[11px] font-medium px-2 py-0.5 rounded-md bg-white text-[#6B5744] border border-[#D4B896] whitespace-nowrap">Not linked</span>
+  );
+}
+
+/**
+ * The Cost cell — and the one rule it must never break: an estimate must never
+ * look like a measured figure.
+ *
+ * Three states, in order of how badly they need saying:
+ *   · the linked recipe's units do not convert → the number is WRONG, struck
+ *     through and marked, because showing it plainly is how ₹63,012 got believed;
+ *   · the recipe is a simple one → "≈", amber, with the row's Recipe badge
+ *     spelling out "approx" beside it and the key under the table saying what
+ *     that means in words (a tooltip alone is useless on a tablet);
+ *   · a full recipe, or a direct material cost → the plain figure.
+ *
+ * Keyed on whether a RECIPE EXISTS, never on the cost being non-zero: a linked
+ * recipe costing ₹0 is a real and important answer, and hiding it behind the
+ * same em-dash as "no recipe at all" is how a dish with unpriced ingredients
+ * disappears.
+ */
+function CostCell({ it }: { it: MenuItem }) {
+  if (it.recipe_id) {
+    const cost = Number(it.recipe_cost) || 0;
+    // An empty recipe's ₹0.00 is ACCURATE — it is just not a cost. Printing it
+    // plainly (which is what happened) put a costed-looking zero on a dish
+    // nobody has costed, so the zero is shown with the reason attached.
+    if (it.recipe_empty) {
+      return (
+        <span className="text-red-600" title={`${it.recipe_cost_warning}\n\n${it.recipe_cost_warning_fix || ''}`}>
+          {formatCurrency(0)}
+        </span>
+      );
+    }
+    // Struck through ONLY when the figure is noise. A dish whose bad line is
+    // ₹1.67 of ₹152 keeps its number and gets the quieter mark on its Recipe
+    // badge — see LinkBadge, and the grading in /api/menu-items.
+    if (it.recipe_cost_unusable) {
+      return (
+        <span className="text-red-600" title={`${it.recipe_cost_warning}\n\n${it.recipe_cost_warning_fix || ''}`}>
+          <span className="line-through decoration-red-400/60">{formatCurrency(cost)}</span>
+        </span>
+      );
+    }
+    return (
+      <span
+        className={it.recipe_cost_warning ? 'text-amber-800' : it.recipe_is_approximate ? 'text-amber-800' : undefined}
+        title={it.recipe_is_approximate
+          ? `Approximate — from a simple recipe covering only the main ingredients. Treat ${formatCurrency(cost)} as an estimate, not a costed figure.`
+          : undefined}
+      >{it.recipe_is_approximate && <span aria-label="approximate">≈</span>}{formatCurrency(cost)}</span>
+    );
+  }
+  if (it.material_cost) return <>{formatCurrency(it.material_cost)}</>;
   return <span className="text-[#C4B09A]">—</span>;
 }
 
@@ -1423,6 +2529,567 @@ function SegmentedVeg({ value, onChange }: { value: string; onChange: (v: string
   );
 }
 
+/**
+ * Linked / Not linked, as a filter.
+ *
+ * Same shape as the Veg control beside it so it reads as one more way of
+ * narrowing the list, which is exactly what it is. "Not linked" means a DISH
+ * with no recipe — liquor is never counted, because a poured peg does not want
+ * one and folding 245 bottles in would bury the 234 dishes that do.
+ *
+ * Nothing about this reaches a menu. It filters an admin table.
+ */
+function SegmentedLink({ value, onChange, unlinkedCount, linkedCount }: {
+  value: '' | 'linked' | 'unlinked';
+  onChange: (v: '' | 'linked' | 'unlinked') => void;
+  /**
+   * THE BACKLOG NUMBER, carried on the control that filters to it.
+   *
+   * Both are the SERVER's counts, over ACTIVE dishes — the same needsRecipe()
+   * predicate the backlog list is built from, so this badge and that panel are
+   * two views of one number and cannot drift apart. Optional so the control
+   * still renders before the first load has landed; the badge simply is not
+   * there rather than flashing a zero that reads as "nothing left to do".
+   */
+  unlinkedCount?: number;
+  linkedCount?: number;
+}) {
+  const counts: Record<string, number | undefined> = { '': undefined, linked: linkedCount, unlinked: unlinkedCount };
+  const opts: ['' | 'linked' | 'unlinked', string, string][] = [
+    ['', 'All', 'Every item, linked or not'],
+    ['linked', 'Linked', 'Active dishes that have a recipe, so they record a food cost'],
+    ['unlinked', 'Not linked', 'Active dishes with no recipe — they still sell, they just record no food cost. This is the backlog count.'],
+  ];
+  return (
+    <div className="inline-flex rounded-xl border border-[#E0D0BE] bg-white p-0.5 shadow-sm">
+      <span className="sr-only">Filter by recipe</span>
+      {opts.map(([v, label, hint]) => {
+        const on = value === v;
+        const n = counts[v];
+        return (
+          <button key={v || 'all'} onClick={() => onChange(v)} title={hint}
+                  className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors inline-flex items-center gap-1.5 ${
+                    on ? (v === 'linked' ? 'bg-emerald-600 text-white' : v === 'unlinked' ? 'bg-[#6B5744] text-white' : 'bg-[#af4408] text-white')
+                       : 'text-[#6B5744] hover:bg-[#FFF1E3]'}`}>
+            {label}
+            {typeof n === 'number' && (
+              <span className={`text-[11px] font-bold tabular-nums px-1.5 py-px rounded ${
+                on ? 'bg-white/25' : v === 'unlinked' ? 'bg-[#F0E4D6] text-[#6B5744]' : 'bg-emerald-50 text-emerald-700'}`}>
+                {n}
+              </span>
+            )}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+/**
+ * THE PROMPT, after a menu item is created or saved.
+ *
+ * It is a card in the corner and not a dialog, and that is the whole point. The
+ * item is already on the menu by the time this appears. It has no backdrop, it
+ * takes no focus, it covers no control, and dismissing it does nothing except
+ * dismiss it. A dish added in the middle of service is never held up by it.
+ *
+ * Two shapes, because the owner asked for both halves: an unlinked dish is
+ * offered a recipe; a linked one is shown what it is linked to and offered the
+ * way to go and change it — which, before this, was a journey this screen could
+ * not make at all.
+ *
+ * THREE ANSWERS on the unlinked shape, not two. "Write one" and "give up" is a
+ * false choice in a kitchen that already holds 67 recipes: a new listing of
+ * "Thecha Tandoori Murgh" may well be cooked from a recipe somebody wrote months
+ * ago, and a prompt that only offers to write a NEW one is a prompt that
+ * manufactures a second recipe for one dish — two ingredient lists to keep in
+ * step and two food costs to argue about. So: add a simple recipe, link an
+ * existing one, or not now.
+ *
+ * PROMPT, NOT BLOCK. The item was saved before this component was ever
+ * rendered. Every one of the three answers — the ✕, ignoring it, walking away
+ * — leaves it exactly as saved.
+ */
+function RecipePromptCard({ item, created, onAddRecipe, onLinkExisting, onDismiss }: {
+  item: MenuItem; created: boolean; onAddRecipe: () => void; onLinkExisting: () => void; onDismiss: () => void;
+}) {
+  const linked = !!item.recipe_id;
+  /**
+   * ESCAPE DISMISSES IT. "Not now" and the ✕ already did, so this is a convention
+   * rather than a fix for a block — but Escape is what a keyboard user presses to
+   * make a prompt go away, and a key that does nothing reads as a stuck screen.
+   *
+   * Safe on this component specifically because dismissing is a pure no-op: the
+   * menu item was saved before this card was ever rendered, so there is no path
+   * where Escape here loses anything.
+   */
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onDismiss(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onDismiss]);
+  return (
+    <div className="fixed bottom-6 left-4 right-4 sm:left-auto sm:right-6 sm:bottom-20 z-[95] sm:max-w-sm bg-white border border-[#D4B896] rounded-2xl shadow-xl px-4 py-3">
+      <div className="flex items-start gap-3">
+        <div className="min-w-0 flex-1">
+          <p className="text-[13px] font-semibold text-[#2D1B0E]">
+            {created ? `“${item.name}” is on the menu.` : `“${item.name}” saved.`}
+          </p>
+          {linked ? (
+            <p className="text-[11px] text-[#6B5744] mt-1 leading-relaxed">
+              It uses the recipe <b>{item.recipe_name || 'it is linked to'}</b>. Open it if the dish has changed — the
+              food cost on this page comes from that recipe.
+            </p>
+          ) : (
+            <p className="text-[11px] text-[#6B5744] mt-1 leading-relaxed">
+              It has no recipe yet, so it will sell and print normally but record <b>₹0 food cost</b>. Adding even the
+              two or three expensive ingredients gives it an approximate cost.
+            </p>
+          )}
+          {/* Wraps on a phone, where three controls do not fit one row. */}
+          <div className="flex items-center gap-2 mt-2.5 flex-wrap">
+            {linked ? (
+              // Seeded with the recipe's name so it lands ON the recipe rather
+              // than on a list of 67 — /recipes reads ?search= on mount.
+              <a href={`/recipes?search=${encodeURIComponent(item.recipe_name || item.name)}`}
+                 className="px-3 py-1.5 text-[12px] font-medium rounded-lg bg-[#af4408] text-white hover:bg-[#8a3506]">
+                Open recipe
+              </a>
+            ) : (
+              <>
+                <button onClick={onAddRecipe} className="px-3 py-1.5 text-[12px] font-medium rounded-lg bg-[#af4408] text-white hover:bg-[#8a3506] inline-flex items-center gap-1.5">
+                  <Plus className="w-3.5 h-3.5" /> Add a simple recipe
+                </button>
+                {/* The answer that stops this kitchen growing a second recipe
+                    for a dish it already has one for. */}
+                <button onClick={onLinkExisting}
+                        title="This dish may already be cooked from a recipe somebody wrote for another listing — link it instead of writing a second one."
+                        className="px-3 py-1.5 text-[12px] font-medium rounded-lg border border-[#D4B896] text-[#6B5744] hover:border-[#af4408] hover:text-[#af4408] hover:bg-[#FFF1E3] inline-flex items-center gap-1.5">
+                  <LinkIcon className="w-3.5 h-3.5" /> Link an existing recipe
+                </button>
+              </>
+            )}
+            {/* The exit. Costs one click and nothing else — the item is saved. */}
+            <button onClick={onDismiss} className="px-3 py-1.5 text-[12px] font-medium rounded-lg text-[#6B5744] hover:bg-[#FFF1E3]">
+              Not now
+            </button>
+          </div>
+        </div>
+        <button onClick={onDismiss} aria-label="Dismiss" className="p-1 rounded-lg text-[#8B7355] hover:bg-[#FFF1E3] shrink-0">
+          <X className="w-4 h-4" />
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * LINK AN EXISTING RECIPE TO THIS MENU ITEM.
+ *
+ * The other half of the owner's direction. "Create a recipe from the item" is
+ * the new-dish answer; this is the answer for the dish that is already cooked
+ * from something in the book. Without it the only way to cost a re-listed dish
+ * is to write its recipe a second time, and a kitchen with two recipes for one
+ * dish has two ingredient lists to keep in step and two food costs to argue
+ * about.
+ *
+ * WHAT IT WRITES: menu_items.recipe_id, via PUT /api/menu-items. The MENU ITEM
+ * claims the recipe. Nothing here edits a recipe or decides what is on a menu.
+ *
+ * SHARING IS LEGAL, AND IS SAID OUT LOUD. A recipe may serve several listings —
+ * the same dish on the à la carte menu and on a party menu. When that happens
+ * the recipe's food cost is measured against the CHEAPEST live priced listing
+ * (src/lib/recipe-price.ts), because FC% is a risk number and the cautious
+ * reading is the right one. That is a real consequence of pressing this button,
+ * so the row that is about to cause it says so before it is pressed, with the
+ * arithmetic spelled out — not afterwards in a tooltip.
+ */
+function LinkRecipeModal({ item, recipes, onClose, onLink, onLinked }: {
+  item: MenuItem;
+  recipes: RecipeLite[];
+  onClose: () => void;
+  /** Returns null on success, or the server's refusal as a string. */
+  onLink: (recipeId: string) => Promise<string | null>;
+  onLinked: (recipeName: string) => void;
+}) {
+  const [q, setQ] = useState(item.name || '');
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const price = Number(item.selling_price) || 0;
+
+  /**
+   * Ranked, not merely filtered. The recipe this dish wants is nearly always the
+   * one whose name shares words with it, so an exact name match sorts first, a
+   * prefix next, then any substring, then everything else alphabetically. The
+   * box is SEEDED with the item's own name, so the likely answer is usually the
+   * first row before anything is typed — and clearing the box still shows the
+   * whole book, because a dish is not always named after its recipe.
+   */
+  const ranked = useMemo(() => {
+    const needle = q.trim().toLowerCase();
+    const scored = recipes.map((r) => {
+      const name = (r.name || '').toLowerCase();
+      let score = 4;
+      if (needle) {
+        if (name === needle) score = 0;
+        else if (name.startsWith(needle)) score = 1;
+        else if (name.includes(needle)) score = 2;
+        else if ((r.category || '').toLowerCase().includes(needle)) score = 3;
+        else score = 9;  // filtered out below
+      }
+      return { r, score };
+    });
+    return scored
+      .filter((s) => s.score < 9)
+      .sort((a, b) => (a.score - b.score) || (a.r.name || '').localeCompare(b.r.name || ''))
+      .slice(0, 60);
+  }, [recipes, q]);
+
+  const doLink = async (r: RecipeLite) => {
+    setBusyId(r.id);
+    setError(null);
+    const err = await onLink(r.id);
+    if (err) { setError(err); setBusyId(null); return; }
+    onLinked(r.name);
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+      <div className="absolute inset-0 bg-black/40 backdrop-blur-sm" onClick={onClose} />
+      <div style={{ maxHeight: 'calc(100vh - 1.5rem)' }}
+           className="relative w-full max-w-2xl bg-white border border-[#E8D5C4] rounded-2xl shadow-2xl flex flex-col overflow-hidden">
+        <div className="flex items-start justify-between px-5 sm:px-6 py-4 border-b border-[#E8D5C4] shrink-0">
+          <div className="min-w-0">
+            <h2 className="text-lg font-semibold text-[#2D1B0E] truncate">Link a recipe — {item.name}</h2>
+            <p className="text-[11px] text-[#8B7355] mt-0.5">
+              Pick the recipe this dish is actually cooked from. Its cost becomes this item&rsquo;s food cost.
+              {price > 0
+                ? <> Measured against the <b>{formatCurrency(price)}</b> menu price.</>
+                : <> This item has no price, so no food cost % can be shown for it.</>}
+            </p>
+          </div>
+          <button onClick={onClose} className="p-1.5 rounded-lg hover:bg-[#FFF1E3] shrink-0"><X className="w-5 h-5" /></button>
+        </div>
+
+        <div className="px-5 sm:px-6 py-3 border-b border-[#F0E4D6] shrink-0">
+          <div className="relative">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-[#8B7355]" />
+            <input
+              autoFocus value={q} onChange={(e) => setQ(e.target.value)}
+              placeholder="Search the recipe book…"
+              className="w-full pl-9 pr-3 py-2 bg-white border border-[#D4B896] rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-[#af4408]/40"
+            />
+          </div>
+        </div>
+
+        <div className="flex-1 min-h-0 overflow-y-auto px-5 sm:px-6 py-4">
+          {error && (
+            <p className="text-[12px] text-red-700 bg-red-50 border border-red-200 rounded-lg px-3 py-2 mb-3">{error}</p>
+          )}
+
+          {recipes.length === 0 ? (
+            <div className="text-center py-8">
+              <p className="text-sm text-[#6B5744]">There are no recipes yet.</p>
+              <p className="text-[11px] text-[#8B7355] mt-1">Close this and choose &ldquo;Add a simple recipe&rdquo; instead.</p>
+            </div>
+          ) : ranked.length === 0 ? (
+            <div className="text-center py-8">
+              <p className="text-sm text-[#6B5744]">No recipe matches &ldquo;{q}&rdquo;.</p>
+              <button onClick={() => setQ('')} className="text-[11px] text-[#af4408] hover:underline mt-1">Show the whole book</button>
+            </div>
+          ) : (
+            <div className="space-y-1.5">
+              {ranked.map(({ r }) => {
+                const cost = Number(r.total_cost) || 0;
+                const fc = price > 0 && cost > 0 ? Math.round((cost / price) * 1000) / 10 : null;
+                const sharedWith = r.linked_menu_item_id && r.linked_menu_item_id !== item.id
+                  ? r.linked_menu_item_name || 'another menu item'
+                  : null;
+                const busy = busyId === r.id;
+                return (
+                  <button
+                    key={r.id}
+                    disabled={!!busyId}
+                    onClick={() => doLink(r)}
+                    className="w-full text-left rounded-lg border border-[#E8D5C4] bg-[#FFFBF6] hover:border-[#af4408] hover:bg-[#FFF1E3] disabled:opacity-50 px-3 py-2.5 transition-colors"
+                  >
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="text-[13px] font-medium text-[#2D1B0E] flex-1 min-w-[140px]">{r.name}</span>
+                      {/* The recipe's OWN quality marks, carried onto the choice
+                          rather than discovered after the link is made. */}
+                      {r.sanity_has_blocker && (
+                        <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-red-50 text-red-700 border border-red-300">check units</span>
+                      )}
+                      {r.is_approximate && (
+                        <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-amber-50 text-amber-800 border border-amber-300">approx</span>
+                      )}
+                      <span className="text-[12px] text-[#6B5744] tabular-nums">{formatCurrency(cost)}</span>
+                      {fc !== null && (
+                        <span className={`text-[12px] tabular-nums ${fc > 100 ? 'text-red-600 font-semibold' : fc > 40 ? 'text-amber-700' : 'text-emerald-700'}`}>
+                          {busy ? '' : `${fc}%`}
+                        </span>
+                      )}
+                      {busy && <Loader2 className="w-3.5 h-3.5 animate-spin text-[#af4408]" />}
+                    </div>
+                    <p className="text-[10px] text-[#8B7355] mt-0.5">
+                      {r.category || 'No category'}
+                      {sharedWith && (
+                        <span className="text-amber-800">
+                          {' · '}already used by <b>{sharedWith}</b> — linking it here gives one recipe two listings, and its
+                          food cost is then measured against whichever of them is cheaper
+                        </span>
+                      )}
+                    </p>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+        </div>
+
+        <div className="shrink-0 border-t border-[#E8D5C4] px-5 sm:px-6 py-3 bg-[#FFFBF6] flex items-center justify-between gap-3">
+          <p className="text-[10px] text-[#8B7355]">
+            This links the dish to a recipe. It does not change the recipe, and it does not change the menu.
+          </p>
+          <button onClick={onClose} className="px-3 py-1.5 text-sm text-[#6B5744] hover:bg-[#FFF1E3] rounded-lg shrink-0">Cancel</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * THE BACKLOG — the dishes with no recipe, in the order that costs the most to
+ * leave alone.
+ *
+ * ORDERED BY PORTIONS SOLD, and the panel says so on its face, because an
+ * unexplained order is an order nobody trusts. Revenue was the obvious key and
+ * it is the wrong one on this data: 4,732 comped portions and 863 NC portions
+ * carry quantity and zero revenue, and a comped plate costs the kitchen exactly
+ * what a sold one costs. "Staff Roti" sells 331 portions at ₹0 — last of 234 by
+ * money, eighth by food. The money still rides along on every row; it just does
+ * not decide the order. See buildBacklog() in the API route.
+ *
+ * NOT A SECOND TABLE OF THE MENU. It is one job list with the two actions that
+ * finish a row on it, and it shrinks as they are used.
+ */
+function RecipeBacklogPanel({ rows, meta, state, remaining, onClose, onRetry, onAddRecipe, onLinkExisting, onEdit }: {
+  rows: BacklogRow[] | null;
+  meta: BacklogMeta | null;
+  state: 'idle' | 'loading' | 'ready' | 'error' | 'denied';
+  /** The server's count of active dishes with no recipe — the same figure the filter badge carries. */
+  remaining: number;
+  onClose: () => void;
+  onRetry: () => void;
+  onAddRecipe: (row: BacklogRow) => void;
+  onLinkExisting: (row: BacklogRow) => void;
+  onEdit: (row: BacklogRow) => void;
+}) {
+  const [limit, setLimit] = useState(25);
+
+  const shown = (rows || []).slice(0, limit);
+  const sold = (rows || []).filter(r => r.portions > 0).length;
+
+  return (
+    <div className="bg-white border border-[#D4B896] rounded-2xl shadow-sm overflow-hidden">
+      {/* flex-nowrap is the documented opt-out from house rule 9 in
+          globals.css, which wraps every `main .flex.gap-*` so toolbar chips do
+          not squish. This is a title-and-close row, not a toolbar: without the
+          opt-out the ✕ dropped onto a second line at the LEFT edge on a 375px
+          phone, which is not where a close button lives in any other dialog in
+          this app. Measured, not guessed — getBoundingClientRect put it at
+          x=41, y=462, below the paragraph. */}
+      <div className="flex flex-nowrap items-start justify-between gap-3 px-4 sm:px-5 py-3.5 border-b border-[#F0E4D6] bg-[#FFFBF6]">
+        <div className="min-w-0">
+          <h2 className="text-[15px] font-semibold text-[#2D1B0E] inline-flex items-center gap-2">
+            <ListChecks className="w-4 h-4 text-[#af4408]" />
+            Recipe backlog
+            <span className="text-[12px] font-bold tabular-nums px-2 py-0.5 rounded-full bg-[#6B5744] text-white">{remaining}</span>
+          </h2>
+          <p className="text-[11px] text-[#8B7355] mt-1 leading-relaxed">
+            Active dishes with no recipe, <b>most portions first</b> — a comped or NC plate costs the kitchen exactly what a
+            sold one does, so portions, not revenue, decide the order.
+            {meta && meta.sales_days > 0 && (
+              <> Counted across <b>{meta.sales_days}</b> day{meta.sales_days === 1 ? '' : 's'} of imported sales
+                {meta.sales_from && meta.sales_to ? <> ({meta.sales_from} to {meta.sales_to})</> : null}.</>
+            )}
+            {rows && rows.length > 0 && <> {sold} of these {rows.length} have a recorded sale.</>}
+          </p>
+        </div>
+        <button onClick={onClose} aria-label="Close the backlog" className="p-1.5 rounded-lg text-[#8B7355] hover:bg-[#FFF1E3] shrink-0">
+          <X className="w-4 h-4" />
+        </button>
+      </div>
+
+      {state === 'loading' && (
+        <div className="px-5 py-8 flex items-center justify-center gap-2 text-sm text-[#6B5744]">
+          <Loader2 className="w-4 h-4 animate-spin text-[#af4408]" /> Working out which dishes cost the most to leave…
+        </div>
+      )}
+
+      {state === 'denied' && (
+        <div className="px-5 py-6 text-center">
+          <p className="text-sm text-[#3D2614]">This list is for managers and admins.</p>
+          <p className="text-[11px] text-[#8B7355] mt-1">
+            It carries what each dish took at the till, and every action on it writes a recipe.
+          </p>
+        </div>
+      )}
+
+      {state === 'error' && (
+        <div className="px-5 py-6 text-center">
+          <p className="text-sm text-[#3D2614]">Could not load the backlog.</p>
+          <button onClick={onRetry} className="mt-2 px-3 py-1.5 text-sm rounded-lg bg-[#af4408] text-white inline-flex items-center gap-1.5">
+            <RefreshCw className="w-3.5 h-3.5" /> Try again
+          </button>
+        </div>
+      )}
+
+      {state === 'ready' && rows && rows.length === 0 && (
+        <div className="px-5 py-8 text-center">
+          <CheckCircle className="w-6 h-6 text-emerald-600 mx-auto" />
+          <p className="text-sm font-medium text-[#2D1B0E] mt-2">Every active dish has a recipe.</p>
+          <p className="text-[11px] text-[#8B7355] mt-1">Nothing on the menu is selling at ₹0 food cost.</p>
+        </div>
+      )}
+
+      {state === 'ready' && rows && rows.length > 0 && (
+        <>
+          {/* Desktop */}
+          <div className="hidden md:block overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead className="bg-[#FFF8F0] text-[11px] uppercase tracking-wide text-[#8B7355]">
+                <tr>
+                  <th className="text-left py-2 px-4 font-medium w-10">#</th>
+                  <th className="text-left py-2 px-3 font-medium">Dish</th>
+                  <th className="text-right py-2 px-3 font-medium" title="Portions that left the kitchen, every bill type — the order of this list.">Portions</th>
+                  <th className="text-right py-2 px-3 font-medium" title="Taken at the till while recording no food cost at all.">Uncosted sales</th>
+                  <th className="text-right py-2 px-3 font-medium">Price</th>
+                  <th className="text-right py-2 px-4 font-medium">Recipe</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-[#F5EDE4]">
+                {shown.map((r, i) => (
+                  <tr key={r.id} className="hover:bg-[#FFFBF6]">
+                    <td className="py-2.5 px-4 text-[11px] text-[#B9A386] tabular-nums">{i + 1}</td>
+                    <td className="py-2.5 px-3">
+                      <button onClick={() => onEdit(r)} className="text-[13px] font-medium text-[#2D1B0E] hover:text-[#af4408] hover:underline text-left">
+                        {r.name}
+                      </button>
+                      <p className="text-[10px] text-[#8B7355]">
+                        {r.category || 'No category'}
+                        {r.material_id && (
+                          <span className="text-amber-800" title="Nothing in the sale path reads this mapping — it costs ₹0 and deducts no stock.">
+                            {' · '}mapped to {r.material_name || 'a material'}, which costs nothing
+                          </span>
+                        )}
+                      </p>
+                    </td>
+                    <td className="py-2.5 px-3 text-right tabular-nums">
+                      {r.has_sales ? (
+                        <>
+                          <span className="text-[13px] text-[#2D1B0E] font-medium">{r.portions.toLocaleString('en-IN')}</span>
+                          {r.portions_free > 0 && (
+                            <p className="text-[10px] text-[#8B7355]" title="Comped and NC portions. Nobody paid, the kitchen still cooked them.">
+                              {r.portions_free.toLocaleString('en-IN')} free
+                            </p>
+                          )}
+                        </>
+                      ) : (
+                        <span className="text-[11px] text-[#C4B09A]" title="The sales import has never carried this item's name. That is not the same as never having sold.">no record</span>
+                      )}
+                    </td>
+                    <td className="py-2.5 px-3 text-right tabular-nums text-[13px] text-[#3D2614]">
+                      {r.revenue > 0 ? formatCurrency(r.revenue) : <span className="text-[#C4B09A]">—</span>}
+                    </td>
+                    <td className="py-2.5 px-3 text-right tabular-nums text-[13px] text-[#6B5744]">
+                      {r.selling_price > 0 ? formatCurrency(r.selling_price) : <span className="text-amber-700 text-[11px]">no price</span>}
+                    </td>
+                    <td className="py-2.5 px-4">
+                      <div className="flex items-center justify-end gap-1.5">
+                        <button onClick={() => onAddRecipe(r)}
+                                className="text-[11px] font-medium px-2 py-1 rounded-md bg-[#af4408] text-white hover:bg-[#8a3506] inline-flex items-center gap-1 whitespace-nowrap">
+                          <Plus className="w-3 h-3" />Add recipe
+                        </button>
+                        <button onClick={() => onLinkExisting(r)}
+                                title="Link a recipe that already exists, instead of writing a second one for the same dish."
+                                className="text-[11px] font-medium px-2 py-1 rounded-md border border-[#D4B896] text-[#6B5744] hover:border-[#af4408] hover:text-[#af4408] inline-flex items-center gap-1 whitespace-nowrap">
+                          <LinkIcon className="w-3 h-3" />Link
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          {/* Mobile — the same rows, stacked. This is a tablet-first operation
+              and a horizontally-scrolling six-column table is not workable on a
+              phone held in one hand behind a counter. */}
+          <div className="md:hidden divide-y divide-[#F5EDE4]">
+            {shown.map((r, i) => (
+              <div key={r.id} className="px-4 py-3">
+                <div className="flex items-start gap-2">
+                  <span className="text-[11px] text-[#B9A386] tabular-nums mt-0.5 w-5 shrink-0">{i + 1}</span>
+                  <div className="min-w-0 flex-1">
+                    <button onClick={() => onEdit(r)} className="text-[13px] font-medium text-[#2D1B0E] text-left">{r.name}</button>
+                    <p className="text-[10px] text-[#8B7355] mt-0.5">
+                      {r.has_sales
+                        ? <><b className="text-[#3D2614]">{r.portions.toLocaleString('en-IN')}</b> portions
+                            {r.portions_free > 0 && <> ({r.portions_free.toLocaleString('en-IN')} free)</>}
+                            {r.revenue > 0 && <> · {formatCurrency(r.revenue)} uncosted</>}</>
+                        : 'No recorded sale'}
+                      {r.selling_price > 0 ? <> · {formatCurrency(r.selling_price)}</> : <span className="text-amber-700"> · no price</span>}
+                    </p>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2 mt-2 pl-7">
+                  <button onClick={() => onAddRecipe(r)}
+                          className="text-[11px] font-medium px-2.5 py-1.5 rounded-md bg-[#af4408] text-white inline-flex items-center gap-1">
+                    <Plus className="w-3 h-3" />Add recipe
+                  </button>
+                  <button onClick={() => onLinkExisting(r)}
+                          className="text-[11px] font-medium px-2.5 py-1.5 rounded-md border border-[#D4B896] text-[#6B5744] inline-flex items-center gap-1">
+                    <LinkIcon className="w-3 h-3" />Link existing
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+
+          {rows.length > shown.length && (
+            <div className="px-4 sm:px-5 py-3 border-t border-[#F0E4D6] text-center">
+              <button onClick={() => setLimit(n => n + 50)} className="text-[12px] text-[#af4408] font-medium hover:underline">
+                Show 50 more — {rows.length - shown.length} left below this
+              </button>
+            </div>
+          )}
+
+          {/* THE OTHER VIEW OF THE SAME GAP, named rather than left to be
+              stumbled on. /reports/menu-recipe-gap already exists and already
+              lists these dishes; it does a different job — a date window, a
+              name-matcher that proposes an existing recipe, and a tick-many-
+              and-attach button — and it ranks by REVENUE, so its order will not
+              match this one. What it cannot do is write a recipe for a dish
+              that has none, which is the state 234 of these 253 dishes are in
+              against a book of 69 recipes. Two lists that disagree about the
+              order and never explain themselves is how both stop being read. */}
+          <div className="px-4 sm:px-5 py-2.5 border-t border-[#F0E4D6] bg-[#FFFBF6]">
+            <p className="text-[10px] text-[#8B7355] leading-relaxed">
+              Looking for a date window, or to attach an existing recipe to many dishes at once?{' '}
+              <a href="/reports/menu-recipe-gap" className="text-[#af4408] font-medium hover:underline">Menu Items Without Recipe</a>{' '}
+              does that, over a chosen period and ranked by revenue rather than portions — so its order differs from this
+              one on purpose.
+            </p>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 function ActiveToggle({ on, onToggle }: { on: boolean; onToggle: () => void }) {
   return (
     <label className="inline-flex items-center gap-2 px-3 py-2 rounded-xl border border-[#E0D0BE] bg-white text-sm text-[#6B5744] shadow-sm cursor-pointer">
@@ -1467,7 +3134,7 @@ function CategoryMenu({ categories, counts, current, search, setSearch, onPick, 
   );
 }
 
-function MobileCard({ it, onEdit, onDelete, onToggle }: { it: MenuItem; onEdit: () => void; onDelete: () => void; onToggle: () => void }) {
+function MobileCard({ it, onEdit, onDelete, onToggle, onAddRecipe, canWrite = true }: { it: MenuItem; onEdit: () => void; onDelete: () => void; onToggle: () => void; onAddRecipe?: (i: MenuItem) => void; canWrite?: boolean }) {
   return (
     <div className={`bg-white border border-[#E8D5C4] rounded-2xl p-3 shadow-sm ${!it.is_active ? 'opacity-60' : ''}`}>
       <div className="flex items-start gap-3">
@@ -1485,12 +3152,35 @@ function MobileCard({ it, onEdit, onDelete, onToggle }: { it: MenuItem; onEdit: 
           <div className="flex items-center flex-wrap gap-2 mt-2">
             <TypeBadge type={it.item_type} />
             <VegSquare tag={it.dietary_tag} type={it.item_type} />
-            <LinkBadge item={it} />
+            <LinkBadge item={it} onAddRecipe={onAddRecipe} canWrite={canWrite} />
             <span className="ml-auto font-bold text-[#2D1B0E]">{it.selling_price > 0 ? formatCurrency(it.selling_price) : <span className="text-red-400">₹0</span>}</span>
           </div>
           <div className="flex items-center justify-between mt-2 pt-2 border-t border-[#F0E4D6] text-[11px] text-[#8B7355]">
-            <span>Cost {it.recipe_cost ? formatCurrency(it.recipe_cost) : it.material_cost ? formatCurrency(it.material_cost) : '—'}{it.recipe_food_cost_percent ? ` · FC ${it.recipe_food_cost_percent}%` : ''}</span>
-            <span className="flex items-center gap-1.5">{it.is_active ? 'Active' : 'Inactive'}<RowToggle on={!!it.is_active} onClick={onToggle} /></span>
+            {/* Same rule as the desktop table, and it matters MORE here: there is
+                no hover on a phone, so nothing a tooltip says can be read. The
+                qualifier is therefore spelled out in words on the card itself —
+                "estimate" and "cost is wrong" — never left to a "≈" alone. */}
+            <span className={it.recipe_cost_unusable || it.recipe_empty ? 'text-red-600' : it.recipe_cost_warning || it.recipe_is_approximate ? 'text-amber-800' : undefined}>
+              Cost <CostCell it={it} />
+              {typeof it.recipe_food_cost_percent === 'number' ? ` · FC ${it.recipe_food_cost_percent}%` : ''}
+              {it.recipe_empty
+                ? <span className="block text-red-600">the linked recipe is empty — nothing in it, so nothing is costed</span>
+                : it.recipe_cost_unusable
+                  ? <span className="block text-red-600">this cost is wrong — the recipe uses a unit that cannot be converted</span>
+                  : it.recipe_cost_warning
+                    // Spelled out per KIND — on a phone there is no tooltip to
+                    // carry the difference, and "small, but worth fixing" is the
+                    // wrong thing to say about 700 g of sauce on one plate.
+                    ? (it.recipe_cost_warning_kind === 'quantity'
+                        ? <span className="block text-orange-700">one ingredient’s quantity is too large for one portion — check it before pricing off this</span>
+                        : it.recipe_cost_warning_kind === 'no_quantity'
+                          ? <span className="block text-orange-700">an ingredient has no quantity, so it adds nothing to this cost</span>
+                          : <span className="block text-amber-800">one ingredient’s unit does not convert — small, but worth fixing</span>)
+                    : it.recipe_is_approximate
+                      ? <span className="block text-amber-800">estimate — simple recipe, main ingredients only</span>
+                      : null}
+            </span>
+            <span className="flex items-center gap-1.5 shrink-0">{it.is_active ? 'Active' : 'Inactive'}<RowToggle on={!!it.is_active} onClick={onToggle} /></span>
           </div>
         </div>
       </div>
@@ -1905,7 +3595,173 @@ function RenameCategoryModal({ categories, counts, initial, onClose, onRename }:
   );
 }
 
-function EditItemModal({ item, onClose, onSave, menuCategories, stationMaster, stationSentinels, stationsLoaded, isAdmin, isNew }: { item: MenuItem; onClose: () => void; onSave: (updates: any) => Promise<string | null>; menuCategories: MenuCategory[]; stationMaster: StationMasterRow[]; stationSentinels: string[]; stationsLoaded: boolean; isAdmin: boolean; isNew: boolean }) {
+/**
+ * IS THIS DISH COSTED? — asked and answered inside the item editor.
+ *
+ * The list has said this on every row for a while. The EDITOR never did, and
+ * the editor is the one screen where somebody is looking at a single dish and
+ * making decisions about it: you could open a ₹549 dish here, reprice it, and
+ * walk away with no idea it records ₹0 food cost every time it sells.
+ *
+ * "Linked" alone is not enough and that is the point of the middle state. A
+ * simple recipe produces a real cost through the real engine, but its
+ * quantities are rough — so a dish linked to one must never read the same as a
+ * dish linked to a measured recipe, or the estimate quietly becomes the number
+ * somebody prices off. Four states, in the order they matter:
+ *   · the linked recipe's units do not convert → the cost is WRONG, not rough;
+ *   · linked to a simple recipe → costed, approximately, and it says so;
+ *   · linked to a full recipe → costed;
+ *   · not linked → sells at ₹0 food cost, with the two ways out right here.
+ */
+function ItemRecipeState({ item, isNew, canWriteRecipes, saving, onAddRecipe, onLinkExisting }: {
+  item: MenuItem;
+  isNew: boolean;
+  canWriteRecipes: boolean;
+  saving: boolean;
+  onAddRecipe: () => void;
+  onLinkExisting: () => void;
+}) {
+  const wants = normalizeType(item.item_type) === 'foods' || normalizeType(item.item_type) === 'beverages';
+
+  // A brand-new item has no id yet, so there is nothing to link a recipe TO.
+  // Saying so is better than offering buttons that cannot work, and it states
+  // the owner's own rule: the item comes first, the recipe follows from it.
+  if (isNew) {
+    return (
+      <div className="rounded-xl border border-[#E8D5C4] bg-[#FFFBF6] px-3.5 py-2.5">
+        <p className="text-[11px] text-[#6B5744] leading-relaxed">
+          <b className="text-[#3D2614]">Recipe:</b> this item does not exist yet. Save it first — it goes on the menu
+          either way — and you will be offered a recipe for it straight afterwards.
+        </p>
+      </div>
+    );
+  }
+
+  if (!wants) {
+    return (
+      <div className="rounded-xl border border-[#E8D5C4] bg-[#FFFBF6] px-3.5 py-2.5">
+        <p className="text-[11px] text-[#8B7355] leading-relaxed">
+          <b className="text-[#6B5744]">Recipe:</b> not needed — liquor is poured from a bottle and is costed in the store.
+        </p>
+      </div>
+    );
+  }
+
+  if (item.recipe_id) {
+    /**
+     * THE SAME THREE WORDS THIS ROW USES EVERYWHERE ELSE.
+     *
+     * This panel graded on `recipe_cost_warning` — ANY unit note — while the list
+     * row, the cost cell, the FC% cell and the mobile card all grade on
+     * `recipe_cost_unusable`. So Thai Green Curry, whose suspect line is ₹1.67 of
+     * ₹152.24, read "Recipe · check units — the total is still broadly right" in
+     * the table and then, on the same dish, "Linked — but the cost is wrong … the
+     * cost and FC% on this dish mean nothing" in this form. One of those two
+     * sentences was going to be believed and it was a coin toss which.
+     *
+     * Now: red is `recipe_cost_unusable` (the figure is noise), amber is a note
+     * that keeps its number, and the amber sentence is word-for-word the
+     * tooltip the badge in the table already shows.
+     */
+    const unusable = !!item.recipe_cost_unusable;
+    const note = !unusable && !!item.recipe_cost_warning;
+    const empty = !!item.recipe_empty;
+    const approx = !!item.recipe_is_approximate;
+    const tone = unusable || empty
+      ? 'border-red-300 bg-red-50'
+      : note || approx ? 'border-amber-300 bg-amber-50' : 'border-emerald-200 bg-emerald-50';
+    return (
+      <div className={`rounded-xl border px-3.5 py-2.5 ${tone}`}>
+        <div className="flex items-start justify-between gap-3 flex-wrap">
+          <div className="min-w-0">
+            <p className="text-[12px] font-semibold inline-flex items-center gap-1.5 flex-wrap">
+              {empty ? (
+                <><AlertTriangle className="w-3.5 h-3.5 text-red-700" /><span className="text-red-800">Linked — but the recipe is empty</span></>
+              ) : unusable ? (
+                <><AlertTriangle className="w-3.5 h-3.5 text-red-700" /><span className="text-red-800">Linked — but the cost is wrong</span></>
+              ) : note ? (
+                <><AlertTriangle className="w-3.5 h-3.5 text-amber-700" /><span className="text-amber-900">Linked — {warningLabel(item.recipe_cost_warning_kind) === 'check units' ? 'check the units' : warningLabel(item.recipe_cost_warning_kind)}</span></>
+              ) : approx ? (
+                <><AlertTriangle className="w-3.5 h-3.5 text-amber-700" /><span className="text-amber-900">Linked — approximate recipe</span></>
+              ) : (
+                <><CheckCircle className="w-3.5 h-3.5 text-emerald-700" /><span className="text-emerald-800">Linked — full recipe</span></>
+              )}
+              {item.recipe_name && <span className="font-normal text-[#6B5744]">· {item.recipe_name}</span>}
+            </p>
+            <p className={`text-[11px] mt-1 leading-relaxed ${unusable || empty ? 'text-red-800' : note || approx ? 'text-amber-900' : 'text-[#6B5744]'}`}>
+              {empty
+                ? <>{item.recipe_cost_warning} {item.recipe_cost_warning_fix}</>
+                : unusable
+                  ? <>{item.recipe_cost_warning} {item.recipe_cost_warning_fix} Until that is fixed, the cost and FC% on this dish mean nothing.</>
+                  : note
+                    ? <>{item.recipe_cost_warning} {item.recipe_cost_warning_fix}{' '}
+                        {item.recipe_cost_warning_kind === 'unit'
+                          // Only the UNIT note may vouch for the total. See warningClosing.
+                          ? <>This is a small part of the cost, so the <b>{formatCurrency(Number(item.recipe_cost) || 0)}</b> total
+                              is still broadly right — but open the recipe and correct it.</>
+                          : <>The <b>{formatCurrency(Number(item.recipe_cost) || 0)}</b> total depends on
+                              it. {warningClosing(item.recipe_cost_warning_kind)}</>}</>
+                    : approx
+                      ? <>Its quantities cover only the main ingredients, so the <b>{formatCurrency(Number(item.recipe_cost) || 0)}</b> cost
+                          {typeof item.recipe_food_cost_percent === 'number' ? <> ({item.recipe_food_cost_percent}%)</> : null} is a real
+                          figure but an estimate. Do not price off it as though it were measured — finish the recipe to clear the mark.</>
+                      : <>Costs <b>{formatCurrency(Number(item.recipe_cost) || 0)}</b>
+                          {typeof item.recipe_food_cost_percent === 'number' ? <> — {item.recipe_food_cost_percent}% of this item&rsquo;s price</> : null}.</>}
+            </p>
+          </div>
+          <a href={`/recipes?search=${encodeURIComponent(item.recipe_name || item.name)}`}
+             className="text-[11px] font-medium px-2.5 py-1 rounded-md border border-[#D4B896] bg-white text-[#6B5744] hover:border-[#af4408] hover:text-[#af4408] whitespace-nowrap shrink-0">
+            Open recipe
+          </a>
+        </div>
+        {canWriteRecipes && (
+          <button onClick={onLinkExisting} disabled={saving}
+                  className="mt-2 text-[11px] text-[#8B7355] hover:text-[#af4408] hover:underline disabled:opacity-50">
+            Link a different recipe instead
+          </button>
+        )}
+      </div>
+    );
+  }
+
+  // NOT LINKED.
+  return (
+    <div className="rounded-xl border border-[#D4B896] bg-[#FFF1E3] px-3.5 py-2.5">
+      <p className="text-[12px] font-semibold text-[#3D2614] inline-flex items-center gap-1.5">
+        <AlertCircle className="w-3.5 h-3.5 text-[#af4408]" /> Not linked — no recipe
+      </p>
+      <p className="text-[11px] text-[#6B5744] mt-1 leading-relaxed">
+        This dish sells and prints normally, and records <b>₹0 food cost</b> every time it does.
+        {item.material_id && (
+          <> It is mapped to the material <b>{item.material_name || ''}</b>, which nothing in the sale path reads — that
+            mapping costs nothing and deducts nothing.</>
+        )}
+      </p>
+      {canWriteRecipes ? (
+        <>
+          <div className="flex items-center gap-2 mt-2 flex-wrap">
+            <button onClick={onAddRecipe} disabled={saving}
+                    className="text-[11px] font-medium px-2.5 py-1.5 rounded-md bg-[#af4408] text-white hover:bg-[#8a3506] disabled:opacity-50 inline-flex items-center gap-1">
+              <Plus className="w-3 h-3" />Add a simple recipe
+            </button>
+            <button onClick={onLinkExisting} disabled={saving}
+                    className="text-[11px] font-medium px-2.5 py-1.5 rounded-md border border-[#D4B896] bg-white text-[#6B5744] hover:border-[#af4408] hover:text-[#af4408] disabled:opacity-50 inline-flex items-center gap-1">
+              <LinkIcon className="w-3 h-3" />Link an existing recipe
+            </button>
+          </div>
+          {/* Said plainly, because pressing either button leaves this form. */}
+          <p className="text-[10px] text-[#8B7355] mt-1.5">
+            Either one saves this item first, so nothing typed above is lost.
+          </p>
+        </>
+      ) : (
+        <p className="text-[10px] text-[#8B7355] mt-1.5">A manager or admin can add a recipe for it.</p>
+      )}
+    </div>
+  );
+}
+
+function EditItemModal({ item, onClose, onSave, menuCategories, stationMaster, stationSentinels, stationsLoaded, isAdmin, isNew, canWriteRecipes }: { item: MenuItem; onClose: () => void; onSave: (updates: Partial<MenuItem>, then?: 'quick' | 'link') => Promise<string | null>; menuCategories: MenuCategory[]; stationMaster: StationMasterRow[]; stationSentinels: string[]; stationsLoaded: boolean; isAdmin: boolean; isNew: boolean; canWriteRecipes: boolean }) {
   // Normalize legacy dirty types ('beverages.') so the Type select never
   // renders blank — and a save writes the clean value back.
   const [form, setForm] = useState({ ...item, item_type: normalizeType(item.item_type) || item.item_type });
@@ -2056,10 +3912,19 @@ function EditItemModal({ item, onClose, onSave, menuCategories, stationMaster, s
   // onSave (parent saveEdit) handles both create and update, checks res.ok,
   // and returns an error message on failure — modal stays open with the
   // user's edits intact and the error shown.
-  const save = async () => {
+  //
+  // `then` is how the recipe block below reaches the recipe screens WITHOUT
+  // costing anyone their edits. The naive version — close the editor, open the
+  // quick-recipe modal — silently discards whatever was typed into this form,
+  // and the field most likely to have been typed is the PRICE, which is the
+  // very denominator the recipe about to be written is costed against. So those
+  // buttons save first and travel on only if the save succeeded. On a failure
+  // the modal stays open with the edits and the server's reason, exactly as
+  // pressing Save would.
+  const save = async (then?: 'quick' | 'link') => {
     setSaving(true);
     setError(null);
-    const err = await onSave(form);
+    const err = await onSave(form, then);
     if (err) setError(err);
     setSaving(false);
   };
@@ -2076,6 +3941,20 @@ function EditItemModal({ item, onClose, onSave, menuCategories, stationMaster, s
           <button onClick={onClose} className="p-1.5 rounded-lg hover:bg-[#FFF1E3]"><X className="w-5 h-5" /></button>
         </div>
         <div className="flex-1 min-h-0 overflow-y-auto px-6 py-5 space-y-4">
+          {/* LINKED / NOT LINKED, inside the editor.
+              The list already says it on every row; this says it in the one
+              place somebody is looking at a single dish and deciding things
+              about it. Without it the editor was the only screen in this flow
+              that could not answer "is this dish costed?" — you could reprice a
+              ₹549 dish here with no idea it records ₹0 food cost. */}
+          <ItemRecipeState
+            item={item}
+            isNew={isNew}
+            canWriteRecipes={canWriteRecipes}
+            saving={saving}
+            onAddRecipe={() => save('quick')}
+            onLinkExisting={() => save('link')}
+          />
           <div>
             <label className="block text-xs font-medium text-[#6B5744] mb-1">Name *</label>
             <input type="text" value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} className="w-full px-3 py-2 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm" />
@@ -2312,7 +4191,11 @@ function EditItemModal({ item, onClose, onSave, menuCategories, stationMaster, s
         )}
         <div className="flex justify-end gap-3 px-6 py-3 border-t border-[#E8D5C4] shrink-0">
           <button onClick={onClose} className="px-4 py-2 text-sm text-[#6B5744] bg-[#FFF1E3] rounded-lg hover:bg-[#E8D5C4]">Cancel</button>
-          <button onClick={save} disabled={saving || !form.name} className="flex items-center gap-2 px-5 py-2 bg-[#af4408] hover:bg-[#8a3506] disabled:opacity-50 text-white rounded-lg text-sm font-medium">
+          {/* `() => save()` and not `save` — a bare handler hands React's
+              MouseEvent straight into the `then` parameter, and a plain Save
+              would be indistinguishable from one asking to go on to a recipe
+              screen. */}
+          <button onClick={() => save()} disabled={saving || !form.name} className="flex items-center gap-2 px-5 py-2 bg-[#af4408] hover:bg-[#8a3506] disabled:opacity-50 text-white rounded-lg text-sm font-medium">
             {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle className="w-4 h-4" />}
             {saving ? 'Saving...' : 'Save'}
           </button>
