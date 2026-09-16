@@ -185,8 +185,17 @@ top costs far more than fixing it now. He is reviewing the foundation, not the f
   why). **No code.**
 - **P1 Foundation** — `fssai_` schema for the checklist engine (templates, sections, questions,
   assignments, runs, responses, evidence, approvals, corrective_actions, audit_log) in
-  `initializeSchema()`; all 20 nav entries in BOTH `Sidebar.tsx` and `page-catalog.ts` using the
-  existing `unbuilt: true` flag for pages not yet built; RBAC roles per §20; page shells that render.
+  `initializeSchema()`; all 20 nav entries in BOTH `Sidebar.tsx` and `page-catalog.ts`; RBAC per §20;
+  page shells that render.
+
+  > ⚠️ **CORRECTION, 2026-09-16 (P0 recon).** An earlier draft of this file told P1 to use an
+  > existing `unbuilt: true` flag. **There is no such flag on this branch.** `grep -rn "unbuilt" src/`
+  > returns nothing, and `PageEntry` (`src/lib/page-catalog.ts:19-35`) has exactly `path`, `label`,
+  > `hodOnly?`, `mgmtOnly?`, `adminOnly?`. The flag exists only in *uncommitted* liquor work in the
+  > live repo, which this branch forked away from. **Do not reference it.** Either register a nav
+  > entry only once its page exists, or add the flag deliberately as new work — and if you add it,
+  > it must also keep the path out of `homePathFor` / `firstAllowedPath`, or a user whose map
+  > contains only unbuilt paths gets redirected onto a 404 with no click. See RECON.md §4.5.
 - **P2 Checklist engine** — admin CRUD for templates/sections/questions. Eight question types:
   Yes/No, Pass/Fail, Numeric, Temperature, Text, Photo, Multiple Choice, Signature. Frequency,
   department, responsible role, required evidence, pass/fail conditions.
@@ -244,13 +253,27 @@ top costs far more than fixing it now. He is reviewing the foundation, not the f
 
 ## 7. OPEN DECISIONS FOR THE OWNER
 
-Anything a phase cannot settle without him goes here, and comes up at the review gate. Each entry:
-the question in one sentence, 3–4 options with real trade-offs, and a recommendation. He has asked
-for that format on every decision, so it is not optional.
+P0 recon raised ten. Full argument and evidence for each in `docs/fssai/RECON.md` §9.
 
-**Never guess a preference and never silently pick one.** An unanswered question is fine; an
-invented answer that eight phases then build on is not.
+**HOW THESE ARE HANDLED WHILE HE IS AWAY.** The owner chose an unattended, scheduler-paced build,
+so a phase must not sit and wait. Each question therefore has a **provisional default** — the P0
+recommendation — which a phase MAY build on, provided it:
+  1. writes the assumption into the code as a comment naming this section,
+  2. keeps the decision reversible (a column that can be ignored beats one that must be added later),
+  3. lists it in the review-gate report so he can overturn it before P4.
+**A provisional default is NOT an answer.** Never present one to him as settled, and never let a
+later phase cite an earlier phase's default as precedent.
 
-| # | Question | Raised by | Status |
+| # | Question | Provisional default (P0 recommendation) | Owner's answer |
 |---|---|---|---|
-| — | *(none yet — P0 will raise the first batch)* | | |
+| Q1 | Per-outlet FSSAI records? (2 outlets exist) | Add `outlet_id TEXT NOT NULL DEFAULT ''` now, defer filtering | — |
+| Q2 | Existing checklist/hygiene/maintenance overlap FSSAI | Pest + Water stay in Maintenance, FSSAI *reads* them; hide the dead `/tasks/checklists` + `/tasks/hygiene` nav once the runner ships, keep data; do NOT migrate the 56 manager items | — |
+| Q3 | Who verifies a check? | Any management may verify, but **never the person who recorded it** | — |
+| Q4 | Save a record if its audit row fails? | Yes, but raise an admin alert — never lose a check staff really did | — |
+| Q5 | FIFO/FEFO has no data (952/952 items blank) | Produced batches only for now; a data-entry phase next; capture at goods receipt only if an inspector demands lot traceability | — |
+| Q6 | What counts as a signature? | Authenticated user + timestamp. No drawing | — |
+| Q7 | Who wakes the system to say a check is due? | In-process scheduler for detection; tell him plainly a fixed-time reminder needs an external cron on the box | — |
+| Q8 | Three roles in §20 do not exist (no Maintenance, Supervisor, F&B Controller) | Staff / Manager / Admin for v1. **FSSAI must never create roles** — that is his production config | — |
+| Q9 | May a check be backdated? | Yes, within 1 day, mandatory reason, row flagged | — |
+| Q10 | Who may see compliance reports? | Staff see their own department; cross-department and inspection packs are management | — |
+
