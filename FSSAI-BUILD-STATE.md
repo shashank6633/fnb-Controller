@@ -114,18 +114,24 @@ greps for, so it is not merely a convention.
 | FSSAI needs | Existing source — READ, never duplicate |
 |---|---|
 | Items | `raw_materials` (Item Master) |
-| Suppliers | existing Vendor Master + `store_vendors` |
+| Suppliers | `vendors.id`. ⚠️ **`store_vendors` is NOT a table** — it is a JSON key computed in `api/stores/[id]/stock/route.ts:158` |
 | Receiving | `purchases`, `goods_receipt_notes`, `purchase_orders` |
 | Batches / FIFO | Kitchen Production batches + barcode (`production_batches`, `PROD######`) |
 | Departments | existing departments table — **read only** (HARD RULE 4) |
 | Employees | HRMS people tables |
-| Equipment / cold rooms | Asset Management |
+| Equipment / cold rooms | ⚠️ **There is no equipment master.** `hr_assets` is a staff-issued-item register (uniform/ID card). Cold units exist only as free text in `production_batches.storage_location` — live values: `Cold Room 1/2/3`, `walkin chiller 1`. So `fssai_equipment` is NOT duplication; seed `location_label` from those exact strings so existing batches join |
 | Maintenance tasks | existing Maintenance module |
 | Corrective-action tasks | existing Task Manager |
 | Stores | `store_locations`, `store-engine.ts` |
-| Roles / permissions | existing `roles` table + `users.role_id` RBAC |
+| Roles / permissions | `roles` + `users.role_id`. ⚠️ `roles` has **`base_role`, not `tier`** (`db.ts:2803`). And gating is **inert in production**: `role_id` set on 0 of 9 users, `page_access` NULL on 8 (NULL = all pages). Only tier flags + each route's own check actually hold |
 
 **A new item master, vendor master or employee master is an automatic CRITICAL defect.**
+
+⚠️ **`hr_employees` is EMPTY (0 rows).** Owner §21 says employee names come from HR — they cannot today.
+Use `users.email` as the actor reference until he populates HR. Raise it at the review gate.
+
+The full, measured contract with the trap for every master is `docs/fssai/RECON.md` §5. Where this
+table and RECON.md disagree, **RECON.md wins** — it was measured against the live database.
 
 ---
 
