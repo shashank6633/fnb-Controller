@@ -4573,6 +4573,68 @@ function initializeSchema(db: Database.Database) {
     if (!has('send_as_template'))       db.exec(`ALTER TABLE whatsapp_templates ADD COLUMN send_as_template INTEGER NOT NULL DEFAULT 0`); // 1 → send via provider template API, not free-form text
   } catch (e) { console.error('whatsapp_templates template-send migration failed:', e); }
 
+  // ── Migration: Meta template LIFECYCLE (authoring → submission → approval) ─
+  // Until now a template's approval state was not modelled at all: an admin
+  // typed a provider_template_name by hand and hoped Meta had approved it. A
+  // wrong guess fails at SEND time, per message, with an opaque Graph error.
+  //
+  // These columns give a local row its Meta lifecycle so the state is known
+  // BEFORE a campaign goes out. Every one is additive with an empty/0 default,
+  // so the 11 existing rows keep behaving EXACTLY as today:
+  //   meta_status = '' means "not managed by the Meta lifecycle" — a local
+  //   free-form template. Nothing gates on '' (see wa-template-authoring.ts:
+  //   templateSendability), so notifyEvent / the inbox picker / the broadcast
+  //   picker read the same 9 columns they always did.
+  //
+  // meta_category is DELIBERATELY separate from `category`: the local column is
+  // the venue's own vocabulary (notification|marketing|approval|general) and
+  // three consumers order/filter by it — the broadcast picker sorts marketing
+  // first. Meta's vocabulary (MARKETING|UTILITY|AUTHENTICATION) is a different
+  // axis with a ~7× price gap; overloading one column would break both.
+  try {
+    const cols = db.prepare("PRAGMA table_info(whatsapp_templates)").all() as any[];
+    const has = (n: string) => cols.some((c: any) => c.name === n);
+    // Meta's own id for the template — REQUIRED for the edit/delete-by-id path.
+    if (!has('meta_template_id'))       db.exec(`ALTER TABLE whatsapp_templates ADD COLUMN meta_template_id TEXT DEFAULT ''`);
+    // '' = local-only (unmanaged) | draft | pending | approved | rejected
+    // | paused | disabled | unknown_at_meta (submitted here, absent at Meta).
+    if (!has('meta_status'))            db.exec(`ALTER TABLE whatsapp_templates ADD COLUMN meta_status TEXT NOT NULL DEFAULT ''`);
+    // MARKETING | UTILITY | AUTHENTICATION — Meta's category, not the local one.
+    if (!has('meta_category'))          db.exec(`ALTER TABLE whatsapp_templates ADD COLUMN meta_category TEXT DEFAULT ''`);
+    // JSON components[] exactly as submitted (HEADER/BODY/FOOTER/BUTTONS).
+    if (!has('meta_components'))        db.exec(`ALTER TABLE whatsapp_templates ADD COLUMN meta_components TEXT DEFAULT ''`);
+    // Meta's VERBATIM rejection reason — never paraphrased on its way to the UI.
+    if (!has('meta_rejected_reason'))   db.exec(`ALTER TABLE whatsapp_templates ADD COLUMN meta_rejected_reason TEXT DEFAULT ''`);
+    // Verbatim Graph error from the last submit attempt (empty on success).
+    if (!has('meta_last_error'))        db.exec(`ALTER TABLE whatsapp_templates ADD COLUMN meta_last_error TEXT DEFAULT ''`);
+    if (!has('meta_submitted_at'))      db.exec(`ALTER TABLE whatsapp_templates ADD COLUMN meta_submitted_at TEXT DEFAULT ''`);
+    if (!has('meta_status_checked_at')) db.exec(`ALTER TABLE whatsapp_templates ADD COLUMN meta_status_checked_at TEXT DEFAULT ''`);
+    // JSON [{ index, name, example }] — the variable spec the broadcast wizard
+    // maps against. `name` is the var the wizard binds ({{1}} ← name/venue/…),
+    // `example` is what Meta requires at submission for every placeholder.
+    if (!has('var_spec'))               db.exec(`ALTER TABLE whatsapp_templates ADD COLUMN var_spec TEXT DEFAULT ''`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_wa_templates_meta ON whatsapp_templates(meta_status, name)`);
+  } catch (e) { console.error('whatsapp_templates lifecycle migration failed:', e); }
+
+  // Ground-truth marker for the broadcast approval gate. EMPTY means Meta has
+  // never been listed, so the gate cannot prove a template is unapproved and
+  // stays permissive (today's behaviour, preserved). Once a sync succeeds this
+  // holds its UTC timestamp and absence-from-Meta becomes a refusable fact.
+  try {
+    db.exec(`INSERT OR IGNORE INTO settings (key, value) VALUES ('wa_templates_last_sync_at', '')`);
+  } catch (e) { console.error('wa_templates_last_sync_at seed failed:', e); }
+
+  // Why a campaign stopped, when it was not a human who stopped it. Reuses the
+  // existing 'paused' state ON PURPOSE — every consumer (UI badge, resume
+  // button, action route) already handles 'paused', and a NEW state value would
+  // fall through CAMP_STYLE[state] and strand the campaign with no resume.
+  try {
+    const cols = db.prepare("PRAGMA table_info(wa_campaigns)").all() as any[];
+    if (!cols.some((c: any) => c.name === 'halt_reason')) {
+      db.exec(`ALTER TABLE wa_campaigns ADD COLUMN halt_reason TEXT NOT NULL DEFAULT ''`);
+    }
+  } catch (e) { console.error('wa_campaigns halt_reason migration failed:', e); }
+
   // Interakt provider API key (Basic-auth secret, used AS-IS). Additive seed.
   try {
     db.exec(`INSERT OR IGNORE INTO settings (key, value) VALUES ('wa_interakt_api_key', '')`);
