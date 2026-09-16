@@ -142,7 +142,7 @@ its evidence line is filled in with real command output.
 
 | # | Phase | Covers | Status | Evidence |
 |---|---|---|---|---|
-| P0 | Recon | owner's "inspect before coding" requirement | IN PROGRESS | fleet `wlc4zdmjh` / run `wf_b7840bea-8d6`, started 2026-09-16 |
+| P0 | Recon | owner's "inspect before coding" requirement | **DONE** | 7 agents, 0 died. `docs/fssai/RECON.md` = 4,607 lines (contract 1-961, raw lanes 962+). Read-only: worktree `git diff --stat` empty, live DB mtime unchanged. Corrected this file (no `unbuilt` flag) + 3 integration rows. 10 owner questions in §7 |
 | P1 | Foundation — schema + nav + RBAC + shells | §20, §24 | PENDING | |
 | P2 | Checklist engine — templates/sections/questions | §15 | PENDING | |
 | P3 | Mobile runner — run, evidence, signature, submit | §22 | PENDING | |
