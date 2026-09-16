@@ -140,14 +140,40 @@ its evidence line is filled in with real command output.
 | P1 | Foundation — schema + nav + RBAC + shells | §20, §24 | PENDING | |
 | P2 | Checklist engine — templates/sections/questions | §15 | PENDING | |
 | P3 | Mobile runner — run, evidence, signature, submit | §22 | PENDING | |
-| P4 | Receiving QC · Temperature Logs · Cold Room | §2, §4, §5 | PENDING | |
-| P5 | FIFO/FEFO & Expiry · Oil Quality · Water & Ice | §3, §12, §13 | PENDING | |
-| P6 | Pest Control · Documents & Certificates | §7, §17 | PENDING | |
-| P7 | Corrective Actions + Task/Maintenance + alerts | §14, §21, §23 | PENDING | |
-| P8 | Seeded checklist templates (the twelve) | §6, §8, §9, §10, §11 | PENDING | |
-| P9 | Dashboard · Inspection Mode · Reports | §1, §16, §18 | PENDING | |
-| P10 | Audit trail hardening — void, never delete | §19 | PENDING | |
-| P11 | Full adversarial verification + carve | all | PENDING | |
+| **RG** | **🛑 REVIEW GATE — STOP. Owner reviews P0–P3.** | — | **BLOCKING** | not approved |
+| P4 | Receiving QC · Temperature Logs · Cold Room | §2, §4, §5 | HELD | behind RG |
+| P5 | FIFO/FEFO & Expiry · Oil Quality · Water & Ice | §3, §12, §13 | HELD | behind RG |
+| P6 | Pest Control · Documents & Certificates | §7, §17 | HELD | behind RG |
+| P7 | Corrective Actions + Task/Maintenance + alerts | §14, §21, §23 | HELD | behind RG |
+| P8 | Seeded checklist templates (the twelve) | §6, §8, §9, §10, §11 | HELD | behind RG |
+| P9 | Dashboard · Inspection Mode · Reports | §1, §16, §18 | HELD | behind RG |
+| P10 | Audit trail hardening — void, never delete | §19 | HELD | behind RG |
+| P11 | Full adversarial verification + carve | all | HELD | behind RG |
+
+### 🛑 THE REVIEW GATE (RG) — the owner's decision, 2026-09-16
+
+The owner chose **option 1 + option 4**: the scheduler runs phases unattended, **and the build stops
+after P3** so he can judge the mobile checklist experience on his own phone before committing to the
+eight record modules.
+
+**RULE: when P0, P1, P2 and P3 are all `DONE`, the build STOPS.** Do not start P4. Do not "just make
+a start" on anything behind the gate. Put the module in a state he can open and try, then report and
+wait.
+
+**To pass the gate the owner must say so explicitly.** Only he can change the RG row to `APPROVED`.
+Until that word exists in this file, P4–P11 stay `HELD`.
+
+**What the RG report must contain** (this is what he is deciding on, so it must be real, not a
+summary of intentions):
+- How to open the module on a phone — the exact URL and which login tier reaches it.
+- A checklist he can actually run end to end: pick one, answer it, attach a photo, sign, submit.
+- The real numbers: `npx tsc --noEmit` exit, `npm run build` exit, test pass counts.
+- What the mobile runner does NOT yet do, stated plainly.
+- The open decisions from §7, each with 3–4 options, trade-offs and a recommendation.
+
+**Why this gate is where it is:** every one of P4–P11 renders through the checklist engine and the
+mobile runner. If the runner feels wrong on a phone, fixing it after eight more phases are built on
+top costs far more than fixing it now. He is reviewing the foundation, not the features.
 
 ### Phase detail
 
@@ -187,16 +213,24 @@ its evidence line is filled in with real command output.
 
 1. `cd /Users/shashankreddy/Desktop/Claude/fnb-fssai` — **never** the live repo.
 2. Read this file top to bottom. §0 and §1 bind you.
-3. Find the first phase in §4 whose status is `PENDING`.
-4. If a phase is `IN PROGRESS`, check whether its workflow is still running before starting another —
+3. **CHECK THE REVIEW GATE FIRST.** If P0–P3 are all `DONE` and the **RG** row does not say
+   `APPROVED`, **STOP IMMEDIATELY**. Run no fleet. Start no phase. End your turn by reporting that
+   the build is complete through P3 and waiting on the owner's review, and restate what he needs to
+   look at. A phase started behind a blocking gate is the single worst failure this build can have —
+   it spends hours on foundations he may want changed.
+4. Otherwise, find the first phase in §4 whose status is `PENDING`. A phase marked `HELD` is behind
+   the review gate and is not available to you, whatever its position in the table.
+5. If a phase is `IN PROGRESS`, check whether its workflow is still running before starting another —
    look for a run id on its row. Do not run two phases at once.
-5. Run that phase as an agent fleet: map → build → adversarial verify → fix. Every agent gets §0–§3
+6. Run that phase as an agent fleet: map → build → adversarial verify → fix. Every agent gets §0–§3
    of this file verbatim in its brief.
-6. When it finishes, commit to `fssai-compliance` **in this worktree only**, update the phase row to
+7. When it finishes, commit to `fssai-compliance` **in this worktree only**, update the phase row to
    `DONE`, and fill in its evidence line with real command output (tsc exit, build exit, test counts).
-7. If the phase failed, set the row back to `PENDING`, and append what failed and why to §6 so the
+8. Record anything needing the owner's ruling in §7, with 3–4 options, trade-offs and a
+   recommendation. Do not guess his preferences and do not silently pick one.
+9. If the phase failed, set the row back to `PENDING`, and append what failed and why to §6 so the
    next run does not repeat the mistake.
-8. **Never deploy. Never merge to `main`. Never push.**
+10. **Never deploy. Never merge to `main`. Never push.**
 
 ---
 
@@ -205,3 +239,18 @@ its evidence line is filled in with real command output.
 - **2026-09-16** — Worktree created at `4125237` on branch `fssai-compliance`. `node_modules`
   hardlinked via `rsync -a --link-dest` (Turbopack rejects a symlinked `node_modules` —
   *"points out of the filesystem root"*). Gate recorded in memory. Phases defined. P0 queued.
+
+---
+
+## 7. OPEN DECISIONS FOR THE OWNER
+
+Anything a phase cannot settle without him goes here, and comes up at the review gate. Each entry:
+the question in one sentence, 3–4 options with real trade-offs, and a recommendation. He has asked
+for that format on every decision, so it is not optional.
+
+**Never guess a preference and never silently pick one.** An unanswered question is fine; an
+invented answer that eight phases then build on is not.
+
+| # | Question | Raised by | Status |
+|---|---|---|---|
+| — | *(none yet — P0 will raise the first batch)* | | |
