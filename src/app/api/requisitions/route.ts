@@ -31,6 +31,30 @@ const EDITABLE_STATUSES = ['draft', 'submitted', 'chef_approved'];
  *   submit, chef-approve, chef-reject, store-process, cancel
  */
 
+/**
+ * ₹ estimate for ONE requisition, as a SQL scalar sub-select on `requisitions r`.
+ *
+ * Hoisted to a single constant because TWO queries in this file now need it —
+ * the ordinary list and the event-wise roll-up. Two hand-copied copies of this
+ * expression is exactly how a screen starts disagreeing with itself, and this
+ * one carries a rule that is easy to copy wrongly:
+ *
+ * average_price is ₹ per RECIPE unit, so a line requested in the PURCHASE unit
+ * is scaled by pack_size — and ONLY when that purchase unit really differs from
+ * the recipe unit (house pack-factor CASE, same rule as packFactor() and the
+ * page's reqPackFactor; without the ri.unit <> rm.unit half, a kg-priced
+ * kg-requested 1.5 kg pack (PICKLED GINGER 1.5KG) would value 1.5x the per-row
+ * costing shown).
+ */
+const ESTIMATED_VALUE_SQL = `(SELECT COALESCE(SUM(
+                  ri.quantity_requested
+                  * (CASE WHEN COALESCE(TRIM(ri.unit),'') <> '' AND ri.unit = rm.purchase_unit
+                               AND ri.unit <> rm.unit AND COALESCE(rm.pack_size, 1) > 1
+                          THEN rm.pack_size ELSE 1 END)
+                  * rm.average_price), 0)
+                FROM requisition_items ri JOIN raw_materials rm ON rm.id = ri.material_id
+                WHERE ri.req_id = r.id)`;
+
 function nextReqNumber(db: ReturnType<typeof getDb>, isoDate: string): string {
   const year = isoDate.slice(0, 4);
   const lastRow = db.prepare(`
@@ -144,6 +168,9 @@ export async function GET(request: Request) {
     const inbox        = url.searchParams.get('inbox');     // 'chef' | 'mgmt' | 'store'
     const purpose      = url.searchParams.get('purpose');   // 'internal' | 'party'
     const eventName    = url.searchParams.get('event_name');
+    // 'events' = the event-wise roll-up for /party-requisitions. Admin/HOD only,
+    // refused server-side below. Absent → this route behaves exactly as before.
+    const view         = url.searchParams.get('view');
 
     const where: string[] = [visSql];
     const params: any[] = [...visParams];
@@ -195,14 +222,7 @@ export async function GET(request: Request) {
              -- same rule as packFactor() and the page's reqPackFactor; without the
              -- ri.unit <> rm.unit half, a kg-priced kg-requested 1.5 kg pack
              -- (PICKLED GINGER 1.5KG) would value 1.5x the per-row costing shown).
-             (SELECT COALESCE(SUM(
-                  ri.quantity_requested
-                  * (CASE WHEN COALESCE(TRIM(ri.unit),'') <> '' AND ri.unit = rm.purchase_unit
-                               AND ri.unit <> rm.unit AND COALESCE(rm.pack_size, 1) > 1
-                          THEN rm.pack_size ELSE 1 END)
-                  * rm.average_price), 0)
-                FROM requisition_items ri JOIN raw_materials rm ON rm.id = ri.material_id
-                WHERE ri.req_id = r.id) AS estimated_value,
+             ${ESTIMATED_VALUE_SQL} AS estimated_value,
              -- ── Half-transfer split (ADDITIVE — nothing above changes) ──────────
              -- "4 requested, 2 given, 2 deferred" must read as 2 fulfilled AND
              -- 2 deferred, because only the issued half ever left the store. One
@@ -270,6 +290,87 @@ export async function GET(request: Request) {
       ...r,
       can_approve_chef: me ? (canApproveAsChef(me) || isMainDeptHead(db, me, r.department_id)) : false,
     }));
+
+    /* ── Event-wise roll-up — Admin + HOD only, refused HERE ────────────────
+     * The only new response shape this route serves. It is a separate branch
+     * with its own hard refusal, not an extra field on the list payload,
+     * because a hidden control is not a control:
+     *   - src/proxy.ts gates PAGES, never APIs (`if (!isApi)`), and its whole
+     *     block falls through on a DB error.
+     *   - canAccessPage()'s hodOnly flag is switchable OFF by an admin on
+     *     /settings/hod-gates (hod_only_overrides), so the catalog flag can
+     *     relax at runtime and cannot be the boundary.
+     * This check can do neither. It is the same expression /api/menu-engineering
+     * uses for its own hodOnly page — deliberately NOT canApproveAsChef(), which
+     * is wider: that also admits the granular can_approve_requisitions flag,
+     * which auth.ts explicitly documents as NOT granting HOD-only pages or
+     * party financials.
+     */
+    if (view === 'events') {
+      if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
+      if (!(me.role === 'admin' || me.is_head_chef)) {
+        return Response.json(
+          { error: 'The event-wise view is for Admins and Heads of Department only.' },
+          { status: 403 },
+        );
+      }
+      /* ── Why this branch re-reads WITHOUT the row-visibility filter ─────────
+       * requisitionVisibility() (dept-hierarchy.ts) hands the FULL pipeline to
+       * admin / store manager / granular approver, and narrows everybody else —
+       * including a Head of Department — to their own main-dept subtree or to
+       * the requisitions they personally drafted.
+       *
+       * That scoping is right for the ordinary list (untouched below) and wrong
+       * for THIS view, whose entire purpose is the sentence the owner wrote:
+       * "easier to check out individual event-wise every department's
+       * requisitions ... for Admin and HOD Users only". A head who is scoped to
+       * his own drafts would open a five-kitchen banquet and be shown one
+       * requisition — measured on the real user table, ₹1,334 of a ₹3,413
+       * party. Either the card lies, or it shows every department. It shows
+       * every department, and the gate two lines above is what makes that safe:
+       * nobody reaches this query who is not an Admin or a HOD.
+       *
+       * If the owner ever wants heads scoped here after all, this is the one
+       * line to change: put `visSql` back in place of '1=1' (and its params
+       * back at the head of evParams). Everything else keeps working — the
+       * screen reads `totals_complete` and stops calling the number a party
+       * total the moment this says so.
+       */
+      const evWhere  = ['1=1', ...where.slice(1)];
+      const evParams = params.slice(visParams.length);
+      const evRows = db.prepare(`
+        SELECT r.id, r.req_number, r.date, r.status, r.department_id,
+               r.event_name, r.event_date, r.guest_count, r.customer,
+               r.fp_id, r.party_unique_id, r.drafted_by,
+               d.name AS department_name, d.code AS department_code,
+               (SELECT COUNT(*) FROM requisition_items WHERE req_id = r.id) AS item_count,
+               ${ESTIMATED_VALUE_SQL} AS estimated_value
+        FROM requisitions r
+        JOIN departments d ON d.id = r.department_id
+        WHERE ${evWhere.join(' AND ')}
+        ORDER BY r.date DESC, r.created_at DESC
+      `).all(...evParams);
+
+      // Does the ordinary list this viewer sees show FEWER requisitions than the
+      // cards do? The screen says so in one plain sentence rather than letting
+      // the two halves of one page quietly disagree about how many there are.
+      const widerThanList = visSql !== '1=1';
+      // Drives the per-event status chips, exactly as /party-approvals reads it:
+      // with the gate OFF a chef-approved requisition is already with the store.
+      const mgmtGateRow = db.prepare("SELECT value FROM settings WHERE key = 'require_mgmt_approval'").get() as { value: string } | undefined;
+
+      return Response.json({
+        // The requisitions themselves — every department's, grouped by the page.
+        // One source for the rows AND the ₹, so a card's departments can never
+        // add up to something other than that card's total.
+        requisitions: evRows,
+        totals_complete: true,
+        wider_than_list: widerThanList,
+        require_mgmt_approval: mgmtGateRow?.value === '1',
+        viewer_email: me.email,
+      });
+    }
+
     return Response.json({
       requisitions: rowsWithPerm,
       viewer_role: me?.role || 'guest',
