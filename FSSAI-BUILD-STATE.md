@@ -158,7 +158,7 @@ its evidence line is filled in with real command output.
 | # | Phase | Covers | Status | Evidence |
 |---|---|---|---|---|
 | P0 | Recon | owner's "inspect before coding" requirement | **DONE** | 7 agents, 0 died. `docs/fssai/RECON.md` = 4,607 lines (contract 1-961, raw lanes 962+). Read-only: worktree `git diff --stat` empty, live DB mtime unchanged. Corrected this file (no `unbuilt` flag) + 3 integration rows. 10 owner questions in §7 |
-| P1 | Foundation — schema + nav + RBAC + shells | §20, §24 | IN PROGRESS | fleet `wgc6g12yc` / run `wf_d872141e-46a`, started 2026-09-16 |
+| P1 | Foundation — schema + nav + RBAC + shells | §20, §24 | **DONE** | 11 agents (1 errored). 11 `fssai_` tables + 34 indexes + the app's FIRST boot assertion. 20 nav rows in BOTH files, 20 page.tsx. `npx tsc --noEmit` exit 0, zero output. Real snapshot: 205→216 tables, 0 removed, purchases still 2165, 215 columns match their CREATE text exactly. db.ts 9,561→10,625. Commits 0e7b9ec·b93ee61·5268b36·21aa4c2 |
 | P2 | Checklist engine — templates/sections/questions | §15 | PENDING | |
 | P3 | Mobile runner — run, evidence, signature, submit | §22 | PENDING | |
 | **RG** | **🛑 REVIEW GATE — STOP. Owner reviews P0–P3.** | — | **BLOCKING** | not approved |
@@ -311,6 +311,9 @@ later phase cite an earlier phase's default as precedent.
 | Q8 | Three roles in §20 do not exist (no Maintenance, Supervisor, F&B Controller) | Staff / Manager / Admin for v1. **FSSAI must never create roles** — that is his production config | — |
 | Q9 | May a check be backdated? | Yes, within 1 day, mandatory reason, row flagged | — |
 | Q10 | Who may see compliance reports? | Staff see their own department; cross-department and inspection packs are management | — |
+| **Q11** | **A fix agent rewrote `getDb()` — OUTSIDE the FSSAI footprint.** It found a real app-wide hazard: if `initializeSchema` throws (read-only file, or an older DB missing `sales.bill_type`), the handle cache is already populated, so every later call returns a half-built handle **forever, silently** — no `schema_version`, no health endpoint, nothing printed. The fix moves boot into `bootDb()`, shouts on failure, and makes the next `getDb()` **re-open the file** (SQLite latches read-only at open, so reusing the handle can never recover). Measured across 901 call sites. | **Do not decide this inside FSSAI.** It fixes a whole-app hazard and arguably deserves to ship BEFORE FSSAI, as its own small change. Options: (a) carve it out to `main` separately, (b) keep it on this branch and ship with FSSAI, (c) revert it and lose a real fix. **Recommend (a).** | — |
+| **Q12** | `uq_fssai_runs_open` ends in `recorded_by`, so the schema allows **two staff to open the same checklist slot at once**, and nothing caps how many submitted runs one slot accumulates (proved: 3 submitted runs on one slot). The foundation cannot fix this — it needs a route-level rule in P2/P3. | Add the one-run-per-slot rule in P2. Flagging it now so no later phase inherits the wrong belief. | — |
+| **Q13** | `fssai_evidence.data_uri` stores photos **in-row as TEXT**. At the ~250 KB cap and 4 photos/day that is roughly **365 MB/year** inside a database file that is 34 MB today. Matches every existing image store in the app, so it is consistent — but nothing enforces a retention window because none has been decided. | Decide in P3: in-row with a retention window, or a separate BLOB table. | — |
 | Q11 | The shells print gaps measured in your OWN records. Should they, and who should see them? | Keep the facts, drop the inspector framing (**done** — see below); gate the "Worth knowing now" panel to management in P2 | — |
 
 ### Q11 — the module tells the truth about the restaurant, inside the restaurant's app
