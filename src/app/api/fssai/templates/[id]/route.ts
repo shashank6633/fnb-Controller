@@ -42,9 +42,17 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
     const template = loadFssaiTemplate(db, id, { includeRetired });
     if (!template) return Response.json({ error: 'That checklist no longer exists.' }, { status: 404 });
     if (!admin && (template.status !== 'published' || !template.is_active)) {
-      // Not 404 — it exists; it is simply not published. Saying so is honest
-      // and tells staff to ask an administrator rather than hunt for a bug.
-      return Response.json({ error: 'That checklist has not been published yet.' }, { status: 403 });
+      // Not 404 — it exists; it is simply not theirs to open yet. Saying so is
+      // honest and tells staff to ask an administrator rather than hunt for a
+      // bug. Archived and draft are different facts, so they read differently.
+      return Response.json(
+        {
+          error: template.status === 'archived'
+            ? 'That checklist has been archived.'
+            : 'That checklist has not been published yet.',
+        },
+        { status: 403 },
+      );
     }
 
     // A question whose type this build does not know must be VISIBLE as a

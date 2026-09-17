@@ -245,16 +245,29 @@ export function str(v: unknown, dflt = ''): string {
   return String(v).trim();
 }
 
-/** SQLITE_CONSTRAINT → a sentence a restaurant manager can act on. */
+/**
+ * SQLITE_CONSTRAINT → a sentence a restaurant manager can act on.
+ *
+ * MEASURED, and the reason both spellings are matched: better-sqlite3 reports
+ * a unique violation by COLUMN LIST, not by index name —
+ *   "UNIQUE constraint failed: fssai_templates.outlet_id, fssai_templates.code"
+ * — even for a partial index. Matching only `uq_fssai_templates_code` (the
+ * obvious spelling) silently fell through to the generic fallback, so a second
+ * checklist using an existing code told the admin nothing about the code. The
+ * index names are kept as well in case a future SQLite reports those instead.
+ */
 export function constraintMessage(e: any, fallback: string): string | null {
   const code = String(e?.code || '');
   if (!code.startsWith('SQLITE_CONSTRAINT')) return null;
   const m = String(e?.message || '');
-  if (m.includes('uq_fssai_templates_code')) return 'Another checklist already uses that code.';
-  if (m.includes('uq_fssai_sections_code')) return 'Another section in this checklist already uses that code.';
-  if (m.includes('uq_fssai_questions_code')) return 'Another question in this checklist already uses that code.';
-  if (m.includes('uq_fssai_runs_open')) return 'This check is already open. Reopen it from your list rather than starting a second one.';
-  if (m.includes('uq_fssai_responses_run_q')) return 'That answer was already recorded.';
-  if (m.includes('FOREIGN KEY')) return fallback;
+  const hit = (index: string, column: string) => m.includes(index) || m.includes(column);
+  if (hit('uq_fssai_templates_code', 'fssai_templates.code')) return 'Another checklist already uses that code.';
+  if (hit('uq_fssai_sections_code', 'fssai_sections.code')) return 'Another section in this checklist already uses that code.';
+  if (hit('uq_fssai_questions_code', 'fssai_questions.code')) return 'Another question in this checklist already uses that code.';
+  if (hit('uq_fssai_equipment_name', 'fssai_equipment.name')) return 'A piece of equipment with that name already exists.';
+  if (hit('uq_fssai_runs_open', 'fssai_runs.recorded_by')) {
+    return 'This check is already open. Reopen it from your list rather than starting a second one.';
+  }
+  if (hit('uq_fssai_responses_run_q', 'fssai_responses.question_id')) return 'That answer was already recorded.';
   return fallback;
 }

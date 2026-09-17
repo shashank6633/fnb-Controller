@@ -208,10 +208,13 @@ export async function POST(request: Request) {
       const tpl = db.prepare(`SELECT * FROM fssai_templates WHERE id = ?`).get(templateId) as any;
       if (!tpl) return Response.json({ error: 'That checklist no longer exists.' }, { status: 404 });
       if (tpl.status !== 'published' || !Number(tpl.is_active)) {
-        return Response.json(
-          { error: `"${tpl.name}" has not been published yet, so it cannot be run. Ask an administrator to publish it.` },
-          { status: 409 },
-        );
+        // An archived checklist and a draft are refused for different reasons,
+        // and telling a chef "not published yet" about a sheet he ran last week
+        // is a lie he cannot act on.
+        const why = tpl.status === 'archived'
+          ? `"${tpl.name}" has been archived, so no new checks can be started against it. The records already taken are still there.`
+          : `"${tpl.name}" has not been published yet, so it cannot be run. Ask an administrator to publish it.`;
+        return Response.json({ error: why }, { status: 409 });
       }
 
       const today = fssaiToday();
