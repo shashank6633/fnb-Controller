@@ -637,8 +637,16 @@ export interface FssaiRunSlot {
   shift: string;
 }
 
+/**
+ * Separator for the slot key. An ASCII unit separator, written as an escape
+ * so the source file stays plain text: a target label is free text and could
+ * legitimately contain a pipe or a colon, which would let two different slots
+ * collapse onto one key.
+ */
+const SLOT_SEP = '\u001f';
+
 export function fssaiSlotKey(slot: FssaiRunSlot): string {
-  return [slot.template_id, slot.business_date, slot.target_id || '', slot.shift || ''].join('');
+  return [slot.template_id, slot.business_date, slot.target_id || '', slot.shift || ''].join(SLOT_SEP);
 }
 
 /** The minimum a decision needs to know about a run already in the slot. */

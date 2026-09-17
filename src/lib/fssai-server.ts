@@ -233,6 +233,16 @@ export function db$(): Database.Database {
   return getDb();
 }
 
+/**
+ * A bound value no email, department id or role id can ever equal.
+ *
+ * Used wherever a scoping query substitutes a MISSING attribute. Binding ''
+ * instead would match every row whose column is blank — which is most of them
+ * — and turn "this user has no department" into "this user sees everything".
+ * RECON §5 row 12: an empty allowed set means SEES NOTHING, not NO FILTER.
+ */
+export const FSSAI_NO_MATCH = '\u0000-no-fssai-match';
+
 /** '1'/'true'/1/true → 1, else 0, with an explicit default for undefined. */
 export function toInt01(v: unknown, dflt: 0 | 1): 0 | 1 {
   if (v === undefined || v === null || v === '') return dflt;

@@ -8,7 +8,7 @@ import {
 } from '@/lib/fssai';
 import {
   requireFssaiUser, fssaiAudit, fssaiAuditBestEffort, fssaiAppAudit, parseJsonArray,
-  shapeQuestion, str, constraintMessage,
+  shapeQuestion, str, constraintMessage, FSSAI_NO_MATCH,
 } from '@/lib/fssai-server';
 
 /**
@@ -166,10 +166,12 @@ export async function GET(request: Request) {
     if (businessDate) { where.push('r.business_date = ?'); args.push(businessDate); }
     if (status) { where.push('r.status = ?'); args.push(status); }
     if (mine || !isManagement(me)) {
-      if (mine) { where.push('lower(r.recorded_by) = lower(?)'); args.push(me.email || ' '); }
+      // FSSAI_NO_MATCH, never '': a user with no email or no department must
+      // see NOTHING, not every row whose column happens to be blank.
+      if (mine) { where.push('lower(r.recorded_by) = lower(?)'); args.push(me.email || FSSAI_NO_MATCH); }
       else {
         where.push(`(lower(r.recorded_by) = lower(?) OR (r.department_id <> '' AND r.department_id = ?))`);
-        args.push(me.email || ' ', me.department_id || ' ');
+        args.push(me.email || FSSAI_NO_MATCH, me.department_id || FSSAI_NO_MATCH);
       }
     }
     const runs = db.prepare(
