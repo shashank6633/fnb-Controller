@@ -25,6 +25,12 @@ $ diff <worktree> <live> | grep -c "^[<>]"
 568
 ```
 
+> **⚠️ STALE, 2026-09-17 (P1 fix lane).** Both counts have moved and neither is a valid gate any
+> more. Live `db.ts` is now **10,158** (the liquor lane added 29 lines there on 2026-09-17 08:11;
+> `grep -c fssai` on it is still **0**, and `grep -c lq_` is still **57**). This worktree's
+> `db.ts` has grown past 9,561 with the `fssai_` block and the rebuilt boot path. Re-measure
+> before relying on either number — see the correction box at the top of `RECON.md`.
+
 The 568 differing lines are the **uncommitted liquor-reconciliation (`lq_*`) work** in the live
 repo. Tables present only in the live copy:
 

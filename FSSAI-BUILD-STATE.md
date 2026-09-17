@@ -23,6 +23,21 @@ Every deploy bundle carved from the main repo must prove, with a command and its
 **three zero-counts**: zero `lq_`/liquor paths, zero `party-manager`/`src/lib/pm/` paths, and zero
 `fssai` paths. Never assert a count. Show the `0`.
 
+> **⚠️ GREP THE SIGNATURE, NOT THE WORD (measured 2026-09-17).** A bare `grep -ri fssai src/` in the
+> live repo returns **11**, and always has. Those are the **FSSAI licence number printed on a
+> customer bill** — `src/lib/bill-pdf.ts`, `src/lib/offline-print/print.ts`,
+> `src/app/settings/print-design/page.tsx` — committed at live HEAD since 2026-07-16 and legally
+> required on an Indian restaurant bill. They are **not** this module. A carve check that greps the
+> bare word will fail forever on a clean repo, and the next person will either "fix" innocent
+> billing code or learn to ignore the gate. Check these four instead; all are `0` in the live repo
+> today:
+> ```
+> grep -r 'fssai_' src/                                   # the table prefix
+> grep -r "'/fssai" src/                                  # the twenty nav paths
+> ls -d src/app/fssai src/app/api/fssai 2>/dev/null       # the module's directories
+> ls src/lib/fssai.ts 2>/dev/null                         # its vocabulary module
+> ```
+
 **Structural protection:** this module lives in an isolated git worktree on branch
 `fssai-compliance`, never on `main`. That is deliberate — the code physically cannot enter a
 deploy bundle by accident.

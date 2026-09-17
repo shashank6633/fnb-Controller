@@ -5,6 +5,37 @@
 **Authority** This document supersedes the six raw lane reports appended below it. Where a lane and this contract disagree, this contract is right — every disagreement was re-checked against the source or the live database and is recorded in §11.
 **Every line number below is from THIS worktree**, not the live repo. The live `src/lib/db.ts` is 10,129 lines; ours is 9,561. Copying a live line number puts your code in the wrong place.
 
+> **⚠️ CORRECTION, 2026-09-17 (P1 fix lane). BOTH LINE COUNTS ABOVE ARE NOW STALE — and one of them will raise a FALSE ALARM if you use it as a gate.**
+> Measured today, read-only:
+> ```
+> $ wc -l /Users/shashankreddy/Desktop/Claude/fnb-controller/src/lib/db.ts   # live
+>    10158
+> $ grep -c lq_ /Users/shashankreddy/Desktop/Claude/fnb-controller/src/lib/db.ts
+>    57
+> ```
+> The live file grew from 10,129 to **10,158** because the *liquor* lane added 29 more lines
+> there on 2026-09-17 at 08:11. It is **not** FSSAI contamination — `grep -c fssai` on the live
+> `db.ts` is **0**, and the arithmetic closes: live HEAD `db.ts` is 9,623 lines and
+> `git diff --numstat` reports `535 0`, so 9,623 + 535 = 10,158. Do not read the 29-line delta as
+> this module leaking into the live repo. The `lq_` count of **57** is unchanged and is still the
+> right thing to check.
+> This worktree's `db.ts` is no longer 9,561 either — P1 added the `fssai_` block and this fix
+> lane rebuilt the boot path, so the section line numbers quoted throughout §3 have moved. Always
+> re-measure with `grep -n` before editing; never trust a line number in this document.
+>
+> **AND A TRAP IN THE §0 DEPLOY GATE ITSELF.** The gate says every carve must show a **zero count**
+> of `fssai` paths. A bare-word `grep -ri fssai src/` in the LIVE repo returns **11**, and always
+> has — they are the **FSSAI licence number printed on a customer bill** (`src/lib/bill-pdf.ts`,
+> `src/lib/offline-print/print.ts`, `src/app/settings/print-design/page.tsx`), committed at live
+> HEAD since 2026-07-16 and legally required on an Indian restaurant bill. They have nothing to do
+> with this module. Grep the module's **signature**, not the word — all of these are 0 in the live
+> repo today:
+> ```
+> grep -r 'fssai_' src/        # the table prefix      -> 0
+> grep -r "'/fssai" src/       # the twenty nav paths  -> 0
+> ls -d src/app/fssai src/app/api/fssai src/lib/fssai.ts   # none exist
+> ```
+
 ---
 
 # ONE-PAGE SUMMARY — THE TEN THINGS THAT MATTER
