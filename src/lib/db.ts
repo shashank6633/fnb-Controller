@@ -8187,6 +8187,671 @@ function initializeSchema(db: Database.Database) {
       CREATE INDEX IF NOT EXISTS idx_hr_notif_rcpt ON hr_notifications(recipient_email, is_read);
     `);
   } catch (e) { console.error('hrms schema failed:', e); }
+
+  /* ── FSSAI COMPLIANCE (fssai_) ─────────────────────────────────────────────
+   * Contract: docs/fssai/RECON.md §3 (how to add a table), §5 (anti-duplication),
+   * §8 (the engine is modelled on the HRMS test/SOP tables, not the Task
+   * checklist). Read those before editing anything here.
+   *
+   * WHY A PER-STATEMENT ARRAY AND NOT THE HOUSE ONE-SHOT db.exec(`...`):
+   * SQLite applies a multi-statement exec in order and ABANDONS EVERY STATEMENT
+   * AFTER THE FIRST THROW, silently — ~130 blocks in this file take that risk.
+   * Proven on a fixture with this repo's better-sqlite3: a typo in one index
+   * name destroyed the two tables declared after it. Here each statement has its
+   * own try and the catch NAMES the table that failed.
+   *
+   * WHY NO FOREIGN KEY INTO raw_materials / vendors / departments / users /
+   * goods_receipt_notes / production_batches: PRAGMA foreign_keys = ON (set in
+   * getDb above), and three shipped flows hard-delete masters —
+   * api/import-materials (clearExisting), api/admin/reset, and the vendor
+   * de-dupe in this file. Measured: with a declared FK, one referencing FSSAI
+   * row makes a DELETE FROM raw_materials throw, even under the reset route's
+   * defer_foreign_keys = 1 (deferral moves the check to COMMIT, it does not
+   * remove it). admin/reset also keeps a HAND-WRITTEN MATERIAL_REFS list that
+   * FSSAI is not on. So masters are referenced as indexed TEXT + a denormalised
+   * label, per RECON §3.3's escape clause. FKs are declared INSIDE this
+   * namespace only, where they are the storage-layer guarantee that a
+   * compliance record cannot be deleted (void it instead).
+   *
+   * FK COLUMN SHAPE RULE: an FK column is `TEXT NOT NULL` or nullable `TEXT` —
+   * NEVER `TEXT NOT NULL DEFAULT ''`. With foreign_keys = ON an insert that
+   * leaves it '' throws (the same trap the HRMS block above records). Write
+   * NULL, not ''. Master-id and actor-email columns are the opposite:
+   * `TEXT NOT NULL DEFAULT ''`, denormalised on purpose so the record survives a
+   * renamed or deleted user.
+   *
+   * NO CHECK CONSTRAINTS: ALTER cannot add one, so the shape guard below could
+   * never repair it, and a later phase adding a status value would need a table
+   * rebuild. goods_receipt_notes.status has no CHECK for exactly this reason
+   * (see the comment on that table) — vocabularies live in src/lib/fssai.ts.
+   *
+   * §7 Q1 (PROVISIONAL DEFAULT, owner has not ruled): outlet_id is present on
+   * every record table now and filtering is deferred. 2 outlets exist. Adding
+   * the column later to tables holding audit history is the painful order.
+   * §7 Q9 (PROVISIONAL): templates carry allow_backdate_days DEFAULT 1 and runs
+   * carry is_backdated + backdate_reason. Set the default to 0 to forbid it —
+   * no schema change either way.                                              */
+  const FSSAI_TABLE_DDL: string[] = [
+
+    /* 1. THE CHECKLIST. version is frozen onto every run (hr_tests.version →
+     *    hr_test_attempts.test_version, in the HRMS block above) so a later edit
+     *    cannot rewrite history. status draft|published|archived is
+     *    hr_sop_versions' publishing flow. `code` is the STABLE MACHINE KEY the
+     *    P8 seeds key on: without it INSERT OR IGNORE cannot be idempotent and
+     *    re-seeding duplicates all twelve checklists. name is deliberately NOT
+     *    unique — archive-not-delete means a replacement template reuses the
+     *    name. */
+    `CREATE TABLE IF NOT EXISTS fssai_templates (
+      id                    TEXT PRIMARY KEY,
+      code                  TEXT NOT NULL DEFAULT '',   -- stable seed key, e.g. 'CHK-COLDROOM-DAILY'
+      name                  TEXT NOT NULL,
+      description           TEXT NOT NULL DEFAULT '',
+      category              TEXT NOT NULL DEFAULT 'Compliance',  -- TASK_CATEGORIES vocabulary (tasks.ts)
+      module_key            TEXT NOT NULL DEFAULT '',   -- which of the 20 sub-modules owns this template
+      frequency             TEXT NOT NULL DEFAULT 'daily',
+      department_id         TEXT NOT NULL DEFAULT '',   -- departments.id — MATCH ON ID, live names contain double spaces
+      responsible_role_id   TEXT NOT NULL DEFAULT '',   -- roles.id, READ ONLY. FSSAI NEVER CREATES A ROLE.
+      target_kind           TEXT NOT NULL DEFAULT 'none', -- none|equipment|area|department|grn|batch
+      requires_signature    INTEGER NOT NULL DEFAULT 1,
+      requires_verification INTEGER NOT NULL DEFAULT 1,
+      allow_backdate_days   INTEGER NOT NULL DEFAULT 1, -- §7 Q9 provisional
+      pass_threshold_pct    REAL    NOT NULL DEFAULT 100,
+      version               INTEGER NOT NULL DEFAULT 1,
+      status                TEXT NOT NULL DEFAULT 'draft',  -- draft|published|archived
+      is_active             INTEGER NOT NULL DEFAULT 1,
+      is_seeded             INTEGER NOT NULL DEFAULT 0, -- 1 = shipped by P8; tells an admin edit from a seed
+      sort_order            INTEGER NOT NULL DEFAULT 0,
+      published_by          TEXT NOT NULL DEFAULT '',
+      published_at          TEXT NOT NULL DEFAULT '',
+      created_by            TEXT NOT NULL DEFAULT '',   -- users.email
+      outlet_id             TEXT NOT NULL DEFAULT '',
+      created_at            TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at            TEXT NOT NULL DEFAULT (datetime('now'))
+    );`,
+
+    /* 2. ORDERED GROUPS. Pure child of a template; no outlet_id (it is never
+     *    queried without its template). CASCADE: deleting a template with no
+     *    runs takes its structure; a template WITH runs cannot be deleted at all
+     *    (see fssai_runs' FK). */
+    `CREATE TABLE IF NOT EXISTS fssai_sections (
+      id          TEXT PRIMARY KEY,
+      template_id TEXT NOT NULL,
+      code        TEXT NOT NULL DEFAULT '',
+      title       TEXT NOT NULL,
+      description TEXT NOT NULL DEFAULT '',
+      sort_order  INTEGER NOT NULL DEFAULT 0,
+      is_active   INTEGER NOT NULL DEFAULT 1,
+      created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (template_id) REFERENCES fssai_templates(id) ON DELETE CASCADE
+    );`,
+
+    /* 3. QUESTIONS AS ROWS — the whole reason the engine copies HRMS and not the
+     *    Task checklist, whose checklist_items is label + sort_order +
+     *    requires_image with no type, unit, range, section, options or required
+     *    flag. Rows are orderable, soft-deletable and QUERYABLE, which §24
+     *    needs: the owner edits these in Settings when regulations change, with
+     *    no developer.
+     *
+     *    THE EIGHT TYPES (qtype): yes_no | pass_fail | numeric | temperature |
+     *    text | photo | multiple_choice | signature.
+     *
+     *    RANGE AS TYPED COLUMNS, OPTIONS AS JSON — deliberate, not inconsistent:
+     *      · min_value / max_value / target_value are REAL COLUMNS because the
+     *        threshold must be projected in SQL (RECON §8 point 3). "Every
+     *        out-of-range reading this month" is
+     *          WHERE resp.value_num < resp.min_used OR resp.value_num > resp.max_used
+     *        which against a JSON blob needs json_extract on every row and can
+     *        never use an index. A REAL column is also type-safe ('4' vs 4) and
+     *        the shape guard can ADD a REAL column but cannot repair a changed
+     *        JSON shape.
+     *      · options_json / fail_options_json are TEXT JSON because the list is
+     *        variable-length and ORDERED, is never filtered in SQL, and is the
+     *        exact house precedent (hr_test_questions.options_json above).
+     *        A fssai_question_options table would add a fourth level of admin
+     *        CRUD for a list the owner reorders by dragging, and buys
+     *        queryability nobody needs — reports group by the answer TEXT that
+     *        fssai_responses froze, not by an option id.
+     *      · fail_options_json names which options COUNT AS A FAIL, so the
+     *        pass/fail rule for a choice question is data, not code. */
+    `CREATE TABLE IF NOT EXISTS fssai_questions (
+      id               TEXT PRIMARY KEY,
+      template_id      TEXT NOT NULL,
+      section_id       TEXT,                        -- nullable: SET NULL = "ungrouped", never deletes the question
+      code             TEXT NOT NULL DEFAULT '',    -- stable seed key
+      qtype            TEXT NOT NULL DEFAULT 'yes_no',
+      prompt           TEXT NOT NULL,
+      help_text        TEXT NOT NULL DEFAULT '',
+      uom              TEXT NOT NULL DEFAULT '',    -- 'C' for temperature; the degree sign is added at render/PDF time
+      min_value        REAL,                        -- NULL = no lower bound
+      max_value        REAL,                        -- NULL = no upper bound
+      target_value     REAL,
+      decimals         INTEGER NOT NULL DEFAULT 1,
+      expected_value   TEXT NOT NULL DEFAULT '',    -- yes|no|pass|fail — the passing answer
+      options_json     TEXT NOT NULL DEFAULT '[]',  -- multiple_choice option labels, ordered
+      fail_options_json TEXT NOT NULL DEFAULT '[]', -- which of those options are a FAIL
+      is_required      INTEGER NOT NULL DEFAULT 1,
+      is_critical      INTEGER NOT NULL DEFAULT 0,  -- one critical fail fails the whole run
+      allow_na         INTEGER NOT NULL DEFAULT 1,
+      photo_rule       TEXT NOT NULL DEFAULT 'never', -- never|on_fail|always  (required evidence)
+      note_rule        TEXT NOT NULL DEFAULT 'never', -- never|on_fail|always
+      raise_ca_on_fail INTEGER NOT NULL DEFAULT 0,
+      ca_severity      TEXT NOT NULL DEFAULT 'medium', -- TASK_PRIORITIES vocabulary (tasks.ts)
+      sort_order       INTEGER NOT NULL DEFAULT 0,
+      is_active        INTEGER NOT NULL DEFAULT 1,  -- THE lawful way to remove a question that has answers
+      created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at       TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (template_id) REFERENCES fssai_templates(id) ON DELETE CASCADE,
+      FOREIGN KEY (section_id)  REFERENCES fssai_sections(id)  ON DELETE SET NULL
+    );`,
+
+    /* 4. EQUIPMENT / COLD UNITS. NOT a §21 duplication: RECON §5 row 7 searched
+     *    all 205 tables and there is no equipment master. hr_assets is a
+     *    staff-issued-item register (uniform|id_card|device) with no location,
+     *    class or temperature. Cold units exist today ONLY as free text in
+     *    production_batches.storage_location; the live distinct values are
+     *    'Cold Room 1', 'Cold Room 2', 'Cold Room 3', 'walkin chiller 1'
+     *    (measured on a read-only snapshot), so location_label is seeded from
+     *    those EXACT strings and existing batches join on them.
+     *    min_temp/max_temp live here as REAL, never hard-coded (§5 / owner §5).
+     *    UNIQUE(outlet_id, name COLLATE NOCASE) is what makes the seed
+     *    idempotent. NO SEED IS WRITTEN IN P1 — the HRMS block above states the
+     *    rule: a boot seed resurrects rows an admin deleted, so the equipment
+     *    seed must be one-shot behind a settings flag when Settings ships. */
+    `CREATE TABLE IF NOT EXISTS fssai_equipment (
+      id             TEXT PRIMARY KEY,
+      code           TEXT NOT NULL DEFAULT '',
+      name           TEXT NOT NULL,
+      kind           TEXT NOT NULL DEFAULT 'cold_room', -- cold_room|chiller|freezer|hot_holding|fryer|dishwasher|water_filter|other
+      location_label TEXT NOT NULL DEFAULT '',   -- seeded from production_batches.storage_location
+      department_id  TEXT NOT NULL DEFAULT '',   -- departments.id
+      store_id       TEXT NOT NULL DEFAULT '',   -- store_locations.id
+      min_temp       REAL,
+      max_temp       REAL,
+      temp_uom       TEXT NOT NULL DEFAULT 'C',
+      check_frequency TEXT NOT NULL DEFAULT 'daily',
+      is_active      INTEGER NOT NULL DEFAULT 1,
+      sort_order     INTEGER NOT NULL DEFAULT 0,
+      notes          TEXT NOT NULL DEFAULT '',
+      created_by     TEXT NOT NULL DEFAULT '',
+      outlet_id      TEXT NOT NULL DEFAULT '',
+      created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at     TEXT NOT NULL DEFAULT (datetime('now'))
+    );`,
+
+    /* 5. WHO OWES WHICH CHECKLIST, HOW OFTEN. Column-for-column the shape of
+     *    recurring_task_rules — frequency / day_of_week / day_of_month /
+     *    next_due_date / last_run_date — so the due-date maths is
+     *    nextRecurrence(freq, from, dow, dom) from src/lib/tasks.ts and NOT a
+     *    second implementation. CAUTION: RecurrenceFrequency there is ONLY
+     *    'daily'|'weekly'|'monthly'. FSSAI needs per_shift, twice_daily, hourly,
+     *    quarterly, yearly and on_event as well, so the wider vocabulary lives
+     *    in src/lib/fssai.ts and delegates to nextRecurrence for the three it
+     *    covers. Never re-derive those three. times_csv copies
+     *    departments.submission_windows' 'HH:MM,HH:MM' idiom. */
+    `CREATE TABLE IF NOT EXISTS fssai_assignments (
+      id                  TEXT PRIMARY KEY,
+      template_id         TEXT NOT NULL,
+      department_id       TEXT NOT NULL DEFAULT '',
+      assignee_email      TEXT NOT NULL DEFAULT '',   -- users.email (hr_employees is EMPTY — 0 rows)
+      responsible_role_id TEXT NOT NULL DEFAULT '',   -- roles.id, read only
+      target_kind         TEXT NOT NULL DEFAULT 'none',
+      target_id           TEXT NOT NULL DEFAULT '',
+      target_label        TEXT NOT NULL DEFAULT '',
+      shift               TEXT NOT NULL DEFAULT '',   -- ''|opening|morning|afternoon|evening|closing|night
+      frequency           TEXT NOT NULL DEFAULT 'daily',
+      day_of_week         INTEGER NOT NULL DEFAULT 0,
+      day_of_month        INTEGER NOT NULL DEFAULT 1,
+      times_csv           TEXT NOT NULL DEFAULT '',   -- 'HH:MM,HH:MM' like departments.submission_windows
+      grace_minutes       INTEGER NOT NULL DEFAULT 60,
+      next_due_date       TEXT NOT NULL DEFAULT '',
+      last_run_date       TEXT NOT NULL DEFAULT '',
+      is_active           INTEGER NOT NULL DEFAULT 1,
+      created_by          TEXT NOT NULL DEFAULT '',
+      outlet_id           TEXT NOT NULL DEFAULT '',
+      created_at          TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at          TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (template_id) REFERENCES fssai_templates(id)
+    );`,
+
+    /* 6. ONE PERFORMANCE OF A CHECKLIST — the entity the Task checklist does not
+     *    have. daily_checklist_records is keyed (template_id, item_id, date) and
+     *    upserted, so one run per template per day, overwritten on re-save, with
+     *    no submitter, signature, target, shift or version (RECON §8). A run
+     *    header is what makes an inspector's questions answerable: which version
+     *    was in force, who signed, at what time, against which cold room, on
+     *    which round of the day.
+     *
+     *    business_date is the day the check BELONGS to; created_at is when the
+     *    row was written. They differ on a backdated or past-midnight closing
+     *    check, and every report groups on business_date.
+     *
+     *    template_version is NOT NULL and is stamped inside the same transaction
+     *    that creates the run (risk R3). The FK to fssai_templates has NO
+     *    ON DELETE clause on purpose — the database then REFUSES to delete a
+     *    template that has recorded runs. Archive it instead.
+     *
+     *    target_id and shift are NOT NULL DEFAULT '' and never NULL, because
+     *    uq_fssai_runs_open below is a partial UNIQUE over them and a NULL in a
+     *    UNIQUE index does not compare equal — measured: with nullable columns
+     *    two identical open runs were both accepted.
+     *
+     *    VOID, NEVER DELETE (owner §19): status gains 'void' plus
+     *    voided_at/voided_by/void_reason, the goods_receipt_notes model, the only
+     *    complete implementation of it in this codebase. There is no CHECK on
+     *    status, so P4+ can add a value freely. */
+    `CREATE TABLE IF NOT EXISTS fssai_runs (
+      id               TEXT PRIMARY KEY,
+      template_id      TEXT NOT NULL,
+      template_version INTEGER NOT NULL DEFAULT 1,  -- frozen at create; a later template edit cannot rewrite this record
+      assignment_id    TEXT,                        -- nullable: an ad-hoc run has no assignment
+      business_date    TEXT NOT NULL,               -- YYYY-MM-DD IST — the day the check belongs to
+      shift            TEXT NOT NULL DEFAULT '',
+      target_kind      TEXT NOT NULL DEFAULT 'none',
+      target_id        TEXT NOT NULL DEFAULT '',    -- '' not NULL — the partial UNIQUE depends on it
+      target_label     TEXT NOT NULL DEFAULT '',    -- denormalised: the sheet must show what was checked
+      department_id    TEXT NOT NULL DEFAULT '',    -- departments.id
+      equipment_id     TEXT NOT NULL DEFAULT '',    -- fssai_equipment.id (no FK: keeps the '' convention uniform)
+      grn_id           TEXT NOT NULL DEFAULT '',    -- goods_receipt_notes.id — attach to the GRN, never to purchases
+      batch_id         TEXT NOT NULL DEFAULT '',    -- production_batches.id
+      status           TEXT NOT NULL DEFAULT 'in_progress', -- in_progress|submitted|verified|rejected|void
+      started_at       TEXT NOT NULL DEFAULT (datetime('now')),
+      submitted_at     TEXT NOT NULL DEFAULT '',
+      recorded_by      TEXT NOT NULL DEFAULT '',    -- users.email — the verifier may NEVER equal this (§7 Q3)
+      recorded_name    TEXT NOT NULL DEFAULT '',
+      signed_by        TEXT NOT NULL DEFAULT '',    -- §7 Q6 provisional: authenticated user + timestamp, no drawing
+      signed_at        TEXT NOT NULL DEFAULT '',
+      total_count      INTEGER NOT NULL DEFAULT 0,
+      answered_count   INTEGER NOT NULL DEFAULT 0,
+      fail_count       INTEGER NOT NULL DEFAULT 0,
+      na_count         INTEGER NOT NULL DEFAULT 0,
+      pass_pct         REAL    NOT NULL DEFAULT 0,  -- frozen at submit, NOT recomputed on read
+      outcome          TEXT NOT NULL DEFAULT '',    -- ''|pass|fail
+      is_backdated     INTEGER NOT NULL DEFAULT 0,
+      backdate_reason  TEXT NOT NULL DEFAULT '',
+      remarks          TEXT NOT NULL DEFAULT '',
+      voided_at        TEXT NOT NULL DEFAULT '',
+      voided_by        TEXT NOT NULL DEFAULT '',
+      void_reason      TEXT NOT NULL DEFAULT '',    -- mandatory in the route, never a bare DELETE
+      outlet_id        TEXT NOT NULL DEFAULT '',
+      created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at       TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (template_id)   REFERENCES fssai_templates(id),
+      FOREIGN KEY (assignment_id) REFERENCES fssai_assignments(id) ON DELETE SET NULL
+    );`,
+
+    /* 7. ONE ANSWER PER QUESTION PER RUN. uq_fssai_responses_run_q is a REAL
+     *    UNIQUE index, unlike idx_daily_checklist_records_tpl_date which is not
+     *    unique and lets two concurrent saves duplicate a row (RECON §8). The
+     *    runner upserts against it: resume, never duplicate.
+     *
+     *    THE RECORD IS SELF-DESCRIBING. prompt_snapshot, qtype, uom, min_used,
+     *    max_used and expected_used freeze WHAT WAS ASKED AND THE RULE APPLIED
+     *    at answer time. hr_test_attempts freezes only test_version, which still
+     *    needs the question row to survive; a snapshot survives even a question
+     *    the owner later rewrites. Cost ~120 bytes a row; the benefit is that an
+     *    inspector's sheet is provably what staff saw, and it is 3 columns
+     *    instead of a whole fssai_template_versions snapshot table.
+     *
+     *    is_fail is the FROZEN verdict written at submit — never a GENERATED
+     *    column, because the pass rule lives on the question and may legitimately
+     *    change with a template version. Recomputing it on read would rewrite
+     *    history (risk R3). */
+    `CREATE TABLE IF NOT EXISTS fssai_responses (
+      id              TEXT PRIMARY KEY,
+      run_id          TEXT NOT NULL,
+      question_id     TEXT NOT NULL,
+      qtype           TEXT NOT NULL DEFAULT '',
+      prompt_snapshot TEXT NOT NULL DEFAULT '',
+      sort_order      INTEGER NOT NULL DEFAULT 0,
+      value_text      TEXT NOT NULL DEFAULT '',   -- text | chosen option label | signature actor email
+      value_num       REAL,                       -- numeric | temperature. NULL = not answered
+      value_bool      INTEGER,                    -- yes_no | pass_fail. NULL = not answered, 0/1 = answered
+      is_na           INTEGER NOT NULL DEFAULT 0,
+      is_fail         INTEGER NOT NULL DEFAULT 0, -- frozen verdict
+      min_used        REAL,                       -- the threshold ACTUALLY applied
+      max_used        REAL,
+      expected_used   TEXT NOT NULL DEFAULT '',
+      uom             TEXT NOT NULL DEFAULT '',
+      note            TEXT NOT NULL DEFAULT '',
+      answered_by     TEXT NOT NULL DEFAULT '',   -- users.email
+      answered_at     TEXT NOT NULL DEFAULT (datetime('now')),
+      outlet_id       TEXT NOT NULL DEFAULT '',   -- denormalised: temperature reports query responses directly
+      created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (run_id)      REFERENCES fssai_runs(id),
+      FOREIGN KEY (question_id) REFERENCES fssai_questions(id)
+    );`,
+
+    /* 8. PHOTO AND FILE EVIDENCE. data_uri TEXT, NOT a BLOB: ImageUpload
+     *    (src/app/tasks/_components/ImageUpload.tsx) downscales to ~1200px and
+     *    caps the encoded image/jpeg data: URI at ~250 KB client-side, and the
+     *    existing stores are all TEXT (daily_checklist_records.image_url,
+     *    hygiene_audits.image_url, hr_employees.photo). Production nginx
+     *    client_max_body_size is 1 MB, so ONE photo per request and never the
+     *    task_files BLOB route (risk R7).
+     *    response_id is plain TEXT with NO FK so it can be '' for run-level
+     *    evidence (an FK column may not default to ''); run_id keeps its FK so
+     *    evidence can never be orphaned. */
+    `CREATE TABLE IF NOT EXISTS fssai_evidence (
+      id          TEXT PRIMARY KEY,
+      run_id      TEXT NOT NULL,
+      response_id TEXT NOT NULL DEFAULT '',   -- '' = attached to the run, not to one answer
+      kind        TEXT NOT NULL DEFAULT 'photo', -- photo|file|signature
+      data_uri    TEXT NOT NULL DEFAULT '',
+      filename    TEXT NOT NULL DEFAULT '',
+      mime        TEXT NOT NULL DEFAULT '',
+      size_bytes  INTEGER NOT NULL DEFAULT 0,
+      caption     TEXT NOT NULL DEFAULT '',
+      created_by  TEXT NOT NULL DEFAULT '',
+      outlet_id   TEXT NOT NULL DEFAULT '',
+      created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (run_id) REFERENCES fssai_runs(id)
+    );`,
+
+    /* 9. THE VERIFICATION STEP. §7 Q3 PROVISIONAL DEFAULT: any management may
+     *    verify, but NEVER the person who recorded the run. That rule cannot be a
+     *    CHECK (recorded_by lives on the parent row), so it is enforced by
+     *    canVerifyFssai() in src/lib/fssai.ts PLUS an explicit
+     *    run.recorded_by !== me.email test in the route (risk R4 — inheriting
+     *    canApproveTasks would let a head chef sign off his own kitchen).
+     *    uq_fssai_approvals_verified makes a run verifiable exactly once;
+     *    a 'rejected' row may still be added, so reopen/re-verify has a history. */
+    `CREATE TABLE IF NOT EXISTS fssai_approvals (
+      id          TEXT PRIMARY KEY,
+      run_id      TEXT NOT NULL,
+      decision    TEXT NOT NULL DEFAULT 'verified', -- verified|rejected
+      decided_by  TEXT NOT NULL DEFAULT '',
+      decided_at  TEXT NOT NULL DEFAULT (datetime('now')),
+      note        TEXT NOT NULL DEFAULT '',
+      outlet_id   TEXT NOT NULL DEFAULT '',
+      created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (run_id) REFERENCES fssai_runs(id)
+    );`,
+
+    /* 10. THE CORRECTIVE-ACTION SPINE. Created in P1 so P7 fills it in and
+     *     nothing has to migrate under live audit history. created_task_id links
+     *     to tasks.id with NO FK — an FK would block deleting a task in another
+     *     module. FSSAI does not build a second task system: add 'fssai' to the
+     *     Task.source union and copy the recipe in
+     *     api/tasks/checklists/route.ts inside one db.transaction.
+     *     run_id is NULLABLE and must be written as NULL for a manual action —
+     *     '' throws (measured). ca_number is the human-facing key on the
+     *     grn_number / PROD###### model; P7 owns the generator. */
+    `CREATE TABLE IF NOT EXISTS fssai_corrective_actions (
+      id              TEXT PRIMARY KEY,
+      ca_number       TEXT NOT NULL DEFAULT '',   -- 'CA-2026-0001', assigned in P7
+      source_kind     TEXT NOT NULL DEFAULT 'run', -- run|response|temperature|inspection|manual
+      run_id          TEXT,                        -- NULL for a manual action. NEVER ''.
+      response_id     TEXT NOT NULL DEFAULT '',
+      equipment_id    TEXT NOT NULL DEFAULT '',
+      department_id   TEXT NOT NULL DEFAULT '',
+      title           TEXT NOT NULL,
+      description     TEXT NOT NULL DEFAULT '',
+      root_cause      TEXT NOT NULL DEFAULT '',
+      severity        TEXT NOT NULL DEFAULT 'medium',
+      status          TEXT NOT NULL DEFAULT 'open', -- open|in_progress|done|verified|cancelled|void
+      owner_email     TEXT NOT NULL DEFAULT '',
+      due_date        TEXT NOT NULL DEFAULT '',
+      action_taken    TEXT NOT NULL DEFAULT '',
+      created_task_id TEXT NOT NULL DEFAULT '',   -- tasks.id, no FK
+      completed_at    TEXT NOT NULL DEFAULT '',
+      completed_by    TEXT NOT NULL DEFAULT '',
+      verified_by     TEXT NOT NULL DEFAULT '',
+      verified_at     TEXT NOT NULL DEFAULT '',
+      verify_note     TEXT NOT NULL DEFAULT '',
+      voided_at       TEXT NOT NULL DEFAULT '',
+      voided_by       TEXT NOT NULL DEFAULT '',
+      void_reason     TEXT NOT NULL DEFAULT '',
+      created_by      TEXT NOT NULL DEFAULT '',
+      outlet_id       TEXT NOT NULL DEFAULT '',
+      created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY (run_id) REFERENCES fssai_runs(id)
+    );`,
+
+    /* 11. THE AUDIT SPINE (owner §19: created/modified by + at, original value,
+     *     changed value, REASON for change). Shape copied from
+     *     hr_attendance_corrections above — frozen before_json + after_json +
+     *     reason — which RECON §3.4 names as the best audit shape in the
+     *     codebase.
+     *
+     *     WHY A MODULE-LOCAL TABLE WHEN audit_events EXISTS. audit_events stays
+     *     the app-wide trail and logAuditEvent() is still called with
+     *     entity_type='fssai_*' (RECON §5 row 13) — but it cannot be the
+     *     compliance trail on its own, for three measured reasons: it has NO
+     *     reason column and §19 makes a reason MANDATORY on a void; its note
+     *     is free text a report cannot filter; and logAuditEvent NEVER THROWS by
+     *     design (see its body further down this file), so a failed audit write
+     *     is invisible — which is precisely the failure §7 Q4 wants to raise an
+     *     admin alert on. A write here can fail loudly; a write there cannot.
+     *     Deliberately NO FK: this table must be able to record an attempt
+     *     against a row that no longer exists. Append-only — no UPDATE and no
+     *     DELETE path is ever written against it. */
+    `CREATE TABLE IF NOT EXISTS fssai_audit_log (
+      id           TEXT PRIMARY KEY,
+      entity_table TEXT NOT NULL,                -- 'fssai_runs' | 'fssai_templates' | ...
+      entity_id    TEXT NOT NULL,
+      action       TEXT NOT NULL,                -- create|update|submit|verify|reject|void|reopen|delete_blocked
+      field        TEXT NOT NULL DEFAULT '',     -- '' for a whole-row diff
+      before_json  TEXT NOT NULL DEFAULT '',     -- the ORIGINAL value, frozen
+      after_json   TEXT NOT NULL DEFAULT '',     -- the CHANGED value
+      reason       TEXT NOT NULL DEFAULT '',     -- mandatory on void/backdate — enforced in the route
+      actor_email  TEXT NOT NULL DEFAULT '',
+      actor_name   TEXT NOT NULL DEFAULT '',
+      outlet_id    TEXT NOT NULL DEFAULT '',
+      created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+    );`,
+  ];
+
+  let fssaiTableFailures = 0;
+  for (const stmt of FSSAI_TABLE_DDL) {
+    const named = /CREATE TABLE IF NOT EXISTS (fssai_[a-z_]+)/.exec(stmt);
+    try {
+      db.exec(stmt);
+    } catch (e) {
+      fssaiTableFailures++;
+      console.error('fssai schema failed for ' + (named ? named[1] : '?') + ':', e);
+    }
+  }
+
+  /* ── FSSAI SHAPE GUARD ─────────────────────────────────────────────────────
+   * CREATE TABLE IF NOT EXISTS answers "is there an object with this name" —
+   * never "does it have the right columns". A table that already exists in the
+   * WRONG shape survives in complete silence and throws at runtime three deploys
+   * later. That matters most for a phased build: the day P6 adds a column, dev is
+   * a fresh database and works, while testing and production already have the
+   * table and never get it.
+   *
+   * The CREATE text IS the specification: re-run each CREATE into temp.zz_* and
+   * diff, so there is no second column list to keep in sync. Technique copied
+   * from the lq_* block in the live repo (the TECHNIQUE only, never that code).
+   *
+   * RUNS BEFORE THE INDEX DDL, deliberately: an index over a column the guard
+   * has just added must be created in the SAME boot, or the assertion below
+   * reports a missing index that would only appear on the next cold start.
+   *
+   * pragma_table_xinfo, NOT table_info: table_info omits generated columns, so a
+   * guard written on it re-ALTERs them on every boot. Measured on this repo's
+   * better-sqlite3 (SQLite 3.51.3): table_info returned 3 of 4 columns and
+   * xinfo returned all 4 with hidden=2 on the generated one.
+   *
+   * dflt_value comes back WITHOUT its parentheses — xinfo reports
+   * "datetime('now')" — and DEFAULT datetime('now') unparenthesised is a
+   * SYNTAX ERROR (measured: near "(": syntax error). Re-wrap it.
+   *
+   * TWO REFUSALS, both measured on this repo's better-sqlite3 (SQLite 3.51.3),
+   * and neither is "ALTER simply cannot" — the truth is worse than that.
+   *
+   *   A NOT NULL COLUMN WITH NO DEFAULT. On a POPULATED table ALTER throws
+   *   ("Cannot add a NOT NULL column with default value NULL") — nothing to
+   *   attempt. On an EMPTY table ALTER SUCCEEDS, and that is the dangerous case:
+   *   the column lands with no default, so the very next INSERT that omits it
+   *   throws "NOT NULL constraint failed" — a repair that reports success and
+   *   breaks every future write. Refusing is the only safe answer in both cases.
+   *   CONSEQUENCE FOR THE DESIGN: such a column can only ever ship in a table's
+   *   FIRST version. Every column a later phase adds must be nullable or carry a
+   *   DEFAULT, or this guard cannot repair it and a human must rebuild the table.
+   *
+   *   A GENERATED COLUMN. ALTER *can* add one (measured — VIRTUAL and STORED
+   *   both succeed), so this refusal is about correctness, not capability:
+   *   re-deriving a generated expression from xinfo is not something to do
+   *   unattended. FSSAI declares no generated column today; this protects a
+   *   later phase that adds one. It is also why this guard reads xinfo and not
+   *   table_info — table_info never reports a generated column at all, so a
+   *   guard built on it would try to re-add g1 on EVERY cold start and log
+   *   "duplicate column name" forever (measured).
+   *
+   * Report both by name — never silently pretend the shape is correct.
+   *
+   * SHOUT WHEN IT FIRES: CHECK constraints and foreign keys cannot be added by
+   * ALTER, so a table the guard repairs is only PARTLY repaired. Columns only,
+   * only fssai_ tables, only when missing. A correct database is a silent no-op. */
+  const fssaiGuardAdded: string[] = [];
+  const fssaiGuardRefused: string[] = [];
+  for (const stmt of FSSAI_TABLE_DDL) {
+    const name = /CREATE TABLE IF NOT EXISTS (fssai_[a-z_]+)/.exec(stmt)?.[1];
+    if (!name) continue;
+    const tmp = 'zz_' + name;
+    try {
+      db.exec(`DROP TABLE IF EXISTS temp.${tmp}`);
+      db.exec(stmt.replace(`IF NOT EXISTS ${name}`, `IF NOT EXISTS temp.${tmp}`));
+      const want = db.prepare(
+        `SELECT name, type, "notnull", dflt_value, hidden FROM pragma_table_xinfo(?, 'temp')`
+      ).all(tmp) as Array<{ name: string; type: string; notnull: number; dflt_value: string | null; hidden: number }>;
+      const have = new Set(
+        (db.prepare(`SELECT name FROM pragma_table_xinfo(?)`).all(name) as Array<{ name: string }>).map(r => r.name)
+      );
+      for (const c of want) {
+        if (have.has(c.name)) continue;
+        if (c.hidden === 2 || c.hidden === 3) { fssaiGuardRefused.push(`${name}.${c.name} (generated)`); continue; }
+        if (c.notnull && c.dflt_value === null) { fssaiGuardRefused.push(`${name}.${c.name} (NOT NULL, no default)`); continue; }
+        const dflt = c.dflt_value === null ? '' : ` DEFAULT (${c.dflt_value})`;   // re-wrap: xinfo strips the parens
+        try {
+          db.exec(`ALTER TABLE ${name} ADD COLUMN ${c.name} ${c.type}${c.notnull ? ' NOT NULL' : ''}${dflt}`);
+          fssaiGuardAdded.push(`${name}.${c.name}`);
+        } catch (e) { fssaiGuardRefused.push(`${name}.${c.name} ALTER: ${String((e as Error).message)}`); }
+      }
+      db.exec(`DROP TABLE IF EXISTS temp.${tmp}`);
+    } catch (e) { fssaiGuardRefused.push(`${name} probe failed: ${String((e as Error).message)}`); }
+  }
+  if (fssaiGuardAdded.length)
+    console.warn('[db] FSSAI SHAPE GUARD repaired columns (FK/CHECK constraints are NOT restored — verify): ' + fssaiGuardAdded.join(', '));
+  if (fssaiGuardRefused.length)
+    console.error('[db] FSSAI SHAPE GUARD could not repair: ' + fssaiGuardRefused.join(' | '));
+
+  /* Indexes get their OWN array and their OWN catch, so one swallowed error
+   * cannot hide the other half (RECON §3.2). A lost index is worse than a lost
+   * table here: the uniqueness rules that stop a duplicate open run and a
+   * duplicate answer live in these statements and nothing else enforces them. */
+  const FSSAI_INDEX_DDL: string[] = [
+    // templates — the partial UNIQUE on `code` is what makes the P8 seed idempotent
+    `CREATE UNIQUE INDEX IF NOT EXISTS uq_fssai_templates_code ON fssai_templates(outlet_id, code) WHERE code <> ''`,
+    `CREATE INDEX IF NOT EXISTS idx_fssai_templates_active ON fssai_templates(is_active, status)`,
+    `CREATE INDEX IF NOT EXISTS idx_fssai_templates_dept   ON fssai_templates(department_id)`,
+    // sections / questions — always read template-scoped and in order
+    `CREATE INDEX IF NOT EXISTS idx_fssai_sections_tpl     ON fssai_sections(template_id, sort_order)`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS uq_fssai_sections_code ON fssai_sections(template_id, code) WHERE code <> ''`,
+    `CREATE INDEX IF NOT EXISTS idx_fssai_questions_tpl    ON fssai_questions(template_id, sort_order)`,
+    `CREATE INDEX IF NOT EXISTS idx_fssai_questions_section ON fssai_questions(section_id)`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS uq_fssai_questions_code ON fssai_questions(template_id, code) WHERE code <> ''`,
+    // equipment — NOCASE unique is the seed's idempotency key
+    `CREATE UNIQUE INDEX IF NOT EXISTS uq_fssai_equipment_name ON fssai_equipment(outlet_id, name COLLATE NOCASE)`,
+    `CREATE INDEX IF NOT EXISTS idx_fssai_equipment_active ON fssai_equipment(is_active, kind)`,
+    // assignments — the due/overdue sweep reads (is_active, next_due_date)
+    `CREATE INDEX IF NOT EXISTS idx_fssai_assignments_tpl   ON fssai_assignments(template_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_fssai_assignments_due   ON fssai_assignments(is_active, next_due_date)`,
+    `CREATE INDEX IF NOT EXISTS idx_fssai_assignments_email ON fssai_assignments(assignee_email)`,
+    // runs — one index per real screen: history, per-template compliance %, the
+    // verification queue, "my checks", department scoping, equipment history
+    `CREATE INDEX IF NOT EXISTS idx_fssai_runs_date      ON fssai_runs(business_date)`,
+    `CREATE INDEX IF NOT EXISTS idx_fssai_runs_tpl_date  ON fssai_runs(template_id, business_date)`,
+    `CREATE INDEX IF NOT EXISTS idx_fssai_runs_status    ON fssai_runs(status, business_date)`,
+    `CREATE INDEX IF NOT EXISTS idx_fssai_runs_recorded  ON fssai_runs(recorded_by, business_date)`,
+    `CREATE INDEX IF NOT EXISTS idx_fssai_runs_dept      ON fssai_runs(department_id, business_date)`,
+    `CREATE INDEX IF NOT EXISTS idx_fssai_runs_equipment ON fssai_runs(equipment_id, business_date)`,
+    // RESUME, NEVER DUPLICATE — but read the key before you trust it. It ends in
+    // recorded_by, so what the DATABASE guarantees is exactly one OPEN run per
+    // (template, date, target, shift, PERSON). Measured on this index:
+    //   · the same person re-opening the same slot        -> BLOCKED
+    //   · a SECOND person opening the same slot           -> ALLOWED
+    //   · the same person opening it again AFTER submit   -> ALLOWED
+    // The last two are deliberate — a rejected run must be redoable, and two
+    // staff on one shift must not deadlock each other — but they mean the SCHEMA
+    // does not cap how many SUBMITTED runs a slot can have. P2/P3 own that: the
+    // runner must warn "someone already has this check open" and the submit route
+    // must decide whether a second submitted run for a slot is a resume, a
+    // supersede, or a refusal. Do not read this index as "one record per slot".
+    // Depends on target_id/shift being NOT NULL (a NULL in a UNIQUE index does
+    // not compare equal, so nullable columns would silently allow duplicates).
+    `CREATE UNIQUE INDEX IF NOT EXISTS uq_fssai_runs_open ON fssai_runs(template_id, business_date, target_id, shift, recorded_by) WHERE status = 'in_progress'`,
+    // responses — a REAL unique, unlike the Task module's non-unique twin
+    `CREATE UNIQUE INDEX IF NOT EXISTS uq_fssai_responses_run_q ON fssai_responses(run_id, question_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_fssai_responses_fail ON fssai_responses(is_fail, answered_at)`,
+    `CREATE INDEX IF NOT EXISTS idx_fssai_responses_q    ON fssai_responses(question_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_fssai_evidence_run   ON fssai_evidence(run_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_fssai_evidence_resp  ON fssai_evidence(response_id)`,
+    // a run may be verified exactly once; a 'rejected' row may still be added
+    `CREATE UNIQUE INDEX IF NOT EXISTS uq_fssai_approvals_verified ON fssai_approvals(run_id) WHERE decision = 'verified'`,
+    `CREATE INDEX IF NOT EXISTS idx_fssai_approvals_run  ON fssai_approvals(run_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_fssai_ca_status ON fssai_corrective_actions(status, due_date)`,
+    `CREATE INDEX IF NOT EXISTS idx_fssai_ca_run    ON fssai_corrective_actions(run_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_fssai_ca_owner  ON fssai_corrective_actions(owner_email, status)`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS uq_fssai_ca_number ON fssai_corrective_actions(ca_number) WHERE ca_number <> ''`,
+    `CREATE INDEX IF NOT EXISTS idx_fssai_audit_entity  ON fssai_audit_log(entity_table, entity_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_fssai_audit_created ON fssai_audit_log(created_at DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_fssai_audit_actor   ON fssai_audit_log(actor_email)`,
+  ];
+  let fssaiIndexFailures = 0;
+  for (const stmt of FSSAI_INDEX_DDL) {
+    const named = /INDEX IF NOT EXISTS ([a-z_]+)/.exec(stmt);
+    try { db.exec(stmt); }
+    catch (e) {
+      fssaiIndexFailures++;
+      console.error('fssai index failed for ' + (named ? named[1] : '?') + ':', e);
+    }
+  }
+
+  /* ── FSSAI BOOT ASSERTION ──────────────────────────────────────────────────
+   * WHY THIS EXISTS AT ALL, for a reader who does not know this codebase: this
+   * application has no migration framework and no migration verification of any
+   * kind. Every table is created by initializeSchema() on each cold start, and
+   * ~130 blocks in this file wrap their DDL in a try whose catch only
+   * console.errors — so a schema change that FAILED and a schema change that
+   * WORKED leave the process in exactly the same state, with the app serving
+   * traffic either way. There is no schema_version table, no health endpoint,
+   * and scripts/check-boot-migrations.js only lints the TEXT of this file — it
+   * cannot tell whether a table exists. The one existing way to know is for a
+   * human to open /admin/database?view=catalog and look. That is why the
+   * previous failure mode in this project was "it worked in dev and the screen
+   * is empty in production": the missing table was never reported to anyone.
+   * These few lines are the first runtime proof in the app that a migration
+   * actually applied. They are cheap, they run once per cold start, and they
+   * make a swallowed failure NOISY instead of invisible. Do not delete them, and
+   * do not soften the error to a warn. Indexes are asserted as well as tables
+   * because they ship in a separate try/catch — and a lost index is worse than a
+   * lost table, because the uniqueness rules that stop duplicate runs and
+   * duplicate answers live there and nothing else enforces them. */
+  try {
+    const wantTables = FSSAI_TABLE_DDL
+      .map(s => /CREATE TABLE IF NOT EXISTS (fssai_[a-z_]+)/.exec(s)?.[1]).filter(Boolean) as string[];
+    const wantIndexes = FSSAI_INDEX_DDL
+      .map(s => /INDEX IF NOT EXISTS ([a-z_]+)/.exec(s)?.[1]).filter(Boolean) as string[];
+    const haveTables = new Set((db.prepare(
+      `SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'fssai_%'`
+    ).all() as Array<{ name: string }>).map(r => r.name));
+    const haveIndexes = new Set((db.prepare(
+      `SELECT name FROM sqlite_master WHERE type='index' AND (name LIKE 'idx_fssai_%' OR name LIKE 'uq_fssai_%')`
+    ).all() as Array<{ name: string }>).map(r => r.name));
+    const missingTables  = wantTables.filter(t => !haveTables.has(t));
+    const missingIndexes = wantIndexes.filter(i => !haveIndexes.has(i));
+    if (missingTables.length)  console.error('[db] FSSAI SCHEMA INCOMPLETE — missing tables: ' + missingTables.join(', '));
+    if (missingIndexes.length) console.error('[db] FSSAI INDEXES INCOMPLETE — missing: ' + missingIndexes.join(', '));
+    if (fssaiTableFailures || fssaiIndexFailures)
+      console.error(`[db] FSSAI DDL statements that threw: ${fssaiTableFailures} table, ${fssaiIndexFailures} index`);
+    if (!missingTables.length && !missingIndexes.length)
+      console.log(`[db] fssai schema OK (${wantTables.length} tables, ${wantIndexes.length} indexes)`);
+  } catch (e) { console.error('fssai boot assertion failed:', e); }
 }
 
 // ---- UTILITY FUNCTIONS ----

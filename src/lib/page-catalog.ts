@@ -462,6 +462,70 @@ export const PAGE_CATALOG: PageSection[] = [
     ],
   },
   {
+    // FSSAI Compliance — food-safety records. Additive module; the twin section
+    // lives in src/components/Sidebar.tsx and BOTH must be edited together. A
+    // catalog-only page is correctly gated and completely INVISIBLE (that drift
+    // once hid 8 pages including /variance-approvals and read as a stock bug);
+    // a sidebar-only page is visible and can never be granted or revoked.
+    //
+    // Placed after HR and before Admin because homePathFor() and
+    // firstAllowedPath() sweep this array in DECLARATION ORDER — a
+    // compliance-only user lands on /fssai, and no existing user's landing page
+    // moves, since nothing ahead of HR changes.
+    //
+    // NO hodOnly ANYWHERE IN THIS SECTION, deliberately. hodOnly excludes
+    // MANAGERS (canAccessPage: the mgmtOnly line admits a manager, the hodOnly
+    // line above it does not), and there is no FSSAI surface where "HODs but not
+    // the Floor Manager" is the right set. It is also the only flag an admin can
+    // switch OFF at runtime with no deploy (settings key hod_only_overrides, read
+    // in proxy.ts), so it cannot hold a compliance gate.
+    //
+    // The 15 unflagged rows follow the /grn/qc precedent in this same file (the
+    // owner's own words there: NOT HOD-only, because "at 6am with a truck
+    // waiting that guarantees workarounds"). A flag that stops a porter filling
+    // in a hygiene check has broken the module. Per-record scoping — own
+    // department, own record — is the ROUTE's job: canAccessPage fails open four
+    // ways and page_access is NULL on 8 of 9 live users, so this catalog is
+    // visibility and grantability, never security.
+    //
+    // §7 Q8 (PROVISIONAL DEFAULT, owner has not ruled): Staff / Manager / Admin
+    // only for v1. §20 names Maintenance, Supervisor and F&B Controller roles
+    // that DO NOT EXIST in the live roles table, and FSSAI must never create a
+    // role — that is the owner's production config. §7 Q10 (PROVISIONAL): staff
+    // see their own department; cross-department packs are management, which is
+    // what the four mgmtOnly rows below encode.
+    label: 'FSSAI Compliance',
+    pages: [
+      { path: '/fssai',                    label: 'Dashboard' },
+      { path: '/fssai/receiving',          label: 'Receiving/Receivables Quality Check' },
+      { path: '/fssai/fifo',               label: 'FIFO & Expiry Management' },
+      { path: '/fssai/cold-rooms',         label: 'Cold Room Climate Control' },
+      { path: '/fssai/temperature',        label: 'Temperature Logs' },
+      { path: '/fssai/food-quality',       label: 'Food Quality Checks' },
+      { path: '/fssai/pest-control',       label: 'Pest Control Logs' },
+      { path: '/fssai/cleaning',           label: 'Cleaning & Sanitation' },
+      { path: '/fssai/hygiene',            label: 'Personal Hygiene' },
+      { path: '/fssai/storage',            label: 'Food Storage Checks' },
+      { path: '/fssai/kitchen-safety',     label: 'Kitchen Safety Checks' },
+      { path: '/fssai/water-ice',          label: 'Water & Ice Checks' },
+      { path: '/fssai/oil-quality',        label: 'Oil Quality Checks' },
+      { path: '/fssai/corrective-actions', label: 'Corrective Actions' },
+      { path: '/fssai/checklists',         label: 'FSSAI Checklists' },
+      // Management surfaces. mgmtOnly (admin | manager | HOD), NOT adminOnly:
+      // adminOnly would mean the owner must be physically present before anyone
+      // could produce the licence or the inspection pack to an inspector.
+      { path: '/fssai/inspections',        label: 'Inspection Reports',       mgmtOnly: true },
+      { path: '/fssai/documents',          label: 'Documents & Certificates', mgmtOnly: true },
+      { path: '/fssai/reports',            label: 'Reports & Downloads',      mgmtOnly: true },
+      // Temperature standards, frequencies and template authoring live here. A
+      // wrong value here does not announce itself — it surfaces weeks later as a
+      // record an inspector rejects. Same reasoning as /hr/settings and
+      // /settings/qc-categories above.
+      { path: '/fssai/settings',           label: 'Settings',                 adminOnly: true },
+      { path: '/fssai/inspection-mode',    label: 'Inspection Mode',          mgmtOnly: true },
+    ],
+  },
+  {
     label: 'Admin',
     pages: [
       { path: '/departments',         label: 'Departments' },
@@ -860,12 +924,22 @@ export function canAccessPage(
  * The problem is that many catalog parents are ALSO the URL prefix of their
  * SIBLING catalog pages. /tasks is the Task Dashboard *and* the prefix of the
  * 14 other Task Management pages, so ticking the dashboard silently hands over
- * the whole module. Across the catalog 8 parents carry 43 such grants:
- *   /tasks +14, /crm-calls +10, /inventory +7, /reports +6,
- *   /kitchen-production +3, /dine-in/kitchen +1, /vendors +1,
- *   /settings/integrations +1
+ * the whole module. Across the catalog 11 parents carry 88 such grants:
+ *   /fssai +19, /hr +18, /crm-calls +16, /tasks +14, /inventory +8,
+ *   /reports +6, /kitchen-production +3, /dine-in/kitchen +1, /grn +1,
+ *   /settings/integrations +1, /vendors +1
  * proxy.ts imports canAccessPage rather than duplicating it, so this is real
  * server-side reach, not just a sidebar that shows too much.
+ *
+ * THESE NUMBERS ARE MEASURED, AND THEY GO STALE SILENTLY. The figure above read
+ * "8 parents carry 43 such grants" and was already wrong before the FSSAI
+ * section was added: re-measured against this array it was 10 parents / 69
+ * grants, because /hr (+18) and /grn (+1) were never added to the list and
+ * /crm-calls (16, not 10) and /inventory (8, not 7) had grown. Adding the 20
+ * FSSAI rows contributes /fssai +19 and takes it to 11 / 88, so FSSAI is now the
+ * single largest carrier in the catalog. Nothing recomputes this comment, so any
+ * section added here must re-measure it. The live figure is whatever
+ * GET /api/admin/page-access-impact reports, not whatever this comment says.
  *
  * WHY IT IS NOT ENFORCED YET
  * Switching the proxy to this function TIGHTENS access. Any role configured
