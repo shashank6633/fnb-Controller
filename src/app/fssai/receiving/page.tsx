@@ -24,15 +24,15 @@ export default function FssaiReceivingPage() {
       ]}
       today={{
         text:
-          'Deliveries are already entered as Goods Receipt Notes, and that screen already has a quality check on it — a delivery can be held as awaiting quality check until the kitchen or the store signs. Phase 4 builds on that same check. It will not ask anyone to type a delivery twice.',
+          'Deliveries are already entered as Goods Receipt Notes, and that screen already has a quality check on it — a delivery can be held as awaiting quality check until the kitchen or the store signs. The new receiving check builds on that same one. It will not ask anyone to type a delivery twice.',
         links: [
           { href: '/grn', label: 'Goods Receipt (GRN)' },
           { href: '/grn/qc', label: 'Pending Quality Checks' },
         ],
       }}
       notes={[
-        'One thing measured in the existing data, worth knowing before Phase 4 is built: the six quality tick-boxes on the goods-receipt screen are unticked on every delivery recorded so far. The thing that actually stops bad goods is the hold, not another tick-box — so Phase 4 will lead with the hold.',
-        'The chilled-goods temperature is currently stored only as a pass or a fail. There is nowhere to write the actual reading. Phase 4 gives it one.',
+        'One thing measured in the existing data, worth knowing before the receiving check is built: the six quality tick-boxes on the goods-receipt screen are unticked on every delivery recorded so far. The thing that actually stops bad goods is the hold, not another tick-box — so the new check will lead with the hold.',
+        'The chilled-goods temperature is currently stored only as a pass or a fail. There is nowhere to write the actual reading. The new check gives it one.',
       ]}
     />
   );

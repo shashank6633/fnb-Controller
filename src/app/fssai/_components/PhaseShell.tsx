@@ -4,14 +4,22 @@
  * PhaseShell — the honest screen an FSSAI sub-module shows before the phase that
  * builds it has run.
  *
- * WHY THIS EXISTS AT ALL. Twenty nav rows land in Phase 1, and a catalogued path
- * with no page.tsx returns a 404 (proven by /dine-in/order, which is in the
- * catalog with no page) — so every one of the twenty needs a real page from day
- * one. What it must NOT do is look like a working compliance screen: a fake table
- * of readings on a food-safety page is worse than an empty one, because someone
+ * WHY THIS EXISTS AT ALL. Twenty nav rows land in P1, and a catalogued path with
+ * no page.tsx returns a 404 (proven by /dine-in/order, which is in the catalog
+ * with no page) — so every one of the twenty needs a real page from day one. What
+ * it must NOT do is look like a working compliance screen: a fake table of
+ * readings on a food-safety page is worse than an empty one, because someone
  * could put it in front of an inspector. So this shell says, in plain words, that
- * nothing is recorded here yet, what the screen will do, which phase brings it,
- * and where the work is written down TODAY if it is written down anywhere.
+ * the screen is not built yet, what it will do, what has to be built first, and
+ * where the work is written down TODAY if it is written down anywhere.
+ *
+ * TWO RULES ABOUT THE WORDS, both learned the hard way:
+ *   1. No "Phase N" anywhere a person reads. The build plan's numbers live in
+ *      modules.ts and stay there; the screen says what is being built, not which
+ *      numbered phase builds it.
+ *   2. Nothing here may read as a statement about the RESTAURANT's compliance.
+ *      These screens describe the SOFTWARE. A screen that will be handed to an
+ *      outsider passes its own `notice` — see the prop below.
  *
  * It is styled off the house page skeleton (docs/fssai/RECON.md §1.3): the
  * #FFF8F0 page, the #af4408 brand heading with an icon tile, white cards with a
@@ -48,9 +56,21 @@ export interface PhaseShellProps {
   today?: { text: string; links?: PhaseShellLink[] };
   /** Anything the owner should know now — an assumption made, a limit, a question. */
   notes?: string[];
+  /**
+   * Replaces the amber headline for a screen that cannot safely carry the
+   * default one.
+   *
+   * THE ONE SCREEN THAT NEEDS THIS IS INSPECTION MODE, and the reason is worth
+   * keeping: it is the screen designed to be held out to a visiting officer. The
+   * default headline is written for the OWNER, about a SCREEN — but read over
+   * somebody's shoulder it sounds like the RESTAURANT has no records, which is a
+   * different and much more damaging claim. Any future screen meant to be shown
+   * to an outsider must pass its own notice too. See FSSAI-BUILD-STATE.md §7 Q11.
+   */
+  notice?: { title: string; body: string };
 }
 
-export default function PhaseShell({ href, title, will, today, notes }: PhaseShellProps) {
+export default function PhaseShell({ href, title, will, today, notes, notice }: PhaseShellProps) {
   const mod = fssaiModule(href);
   const phase = fssaiPhase(mod.phase);
   const Icon = mod.icon;
@@ -85,15 +105,24 @@ export default function PhaseShell({ href, title, will, today, notes }: PhaseShe
           <div className="flex items-start gap-3">
             <Hourglass className="w-5 h-5 text-amber-700 shrink-0 mt-0.5" />
             <div className="min-w-0">
-              <p className="font-bold text-amber-900">Nothing is recorded here yet</p>
+              <p className="font-bold text-amber-900">
+                {notice ? notice.title : 'This screen is not built yet'}
+              </p>
+              {/* The sentence this used to end with — "so there is nothing here to
+                  show an inspector" — was removed deliberately. It added no fact
+                  the first half does not already carry, and it was the one line on
+                  these screens that could be read, over a shoulder, as the
+                  RESTAURANT having nothing rather than the SCREEN being unbuilt.
+                  Do not put it back. §7 Q11 asks the owner the wider question. */}
               <p className="text-sm text-amber-900 mt-1">
-                {phase.name} brings {phase.brings}. Until then this screen holds no records, so there
-                is nothing here to show an inspector.
+                {notice
+                  ? notice.body
+                  : `This screen starts working when we build ${phase.brings}. Until then it holds no records of its own.`}
               </p>
               {heldBehindReview && (
                 <p className="text-sm text-amber-900 mt-2">
-                  {phase.name} is deliberately on hold. The build stops after Phase 3 so you can run a
-                  checklist on your own phone and say whether it feels right, before eight more record
+                  That work is deliberately on hold. The build stops once a checklist runs on a phone,
+                  so you can try one yourself and say whether it feels right, before eight more record
                   screens are built on top of it.
                 </p>
               )}

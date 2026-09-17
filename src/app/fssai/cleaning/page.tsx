@@ -28,8 +28,8 @@ export default function FssaiCleaningPage() {
         ],
       }}
       notes={[
-        'One of twelve ready-made checklists arriving in Phase 8. The questions, the frequency and the department responsible are all yours to change in Settings.',
-        'The areas have to be your areas. Rather than guess them, Phase 8 will start from the departments and floors already set up in the app and let you adjust the list.',
+        'One of twelve ready-made checklists, written once the checklist builder is in place. The questions, the frequency and the department responsible are all yours to change in Settings.',
+        'The areas have to be your areas. Rather than guess them, the ready-made checklists will start from the departments and floors already set up in the app and let you adjust the list.',
       ]}
     />
   );

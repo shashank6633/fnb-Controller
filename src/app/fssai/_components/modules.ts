@@ -65,30 +65,44 @@ export interface FssaiModule {
 }
 
 /**
- * What each phase actually delivers, in plain English. `brings` finishes the
- * sentence "Phase N brings …", so it starts lower-case and carries no full stop.
+ * What each stage of the build delivers, in plain English.
  *
- * These names are the phase rows in FSSAI-BUILD-STATE.md §4 — the same numbers
- * the owner sees in the build state, so a screen saying "Phase 4" and the plan
- * saying "P4" are the same thing.
+ * NO "PHASE N" IN ANYTHING A PERSON READS. The build plan numbers its phases
+ * P1-P11 and this module is keyed by those numbers — `FSSAI_MODULES[].phase: 4`
+ * IS the plan's P4, so nothing is lost and a reader of FSSAI-BUILD-STATE.md §4
+ * can still line the two up. But "Phase 8" told a chef or a manager nothing: the
+ * word is defined nowhere in the app, and a grid of numbered badges on a
+ * food-safety dashboard reads as an unfinished system. Every other word in this
+ * module is restaurant English, which is exactly what made this one stand out.
+ *
+ * So the numbers stay in the DATA and never reach the SCREEN:
+ *   · `when`   — the chip on a dashboard tile. Answers "when does this work?"
+ *                the way the build plan actually answers it: the next two pieces
+ *                of work, then everything else waits for the owner's review.
+ *   · `brings` — finishes "This screen starts working when we build …", so it
+ *                starts lower-case and carries no full stop.
+ *
+ * Reversible in one line if the owner would rather see the numbers: put
+ * `name: 'Phase N'` back and render it instead of `when`.
  */
-export const FSSAI_PHASES: Record<number, { name: string; brings: string }> = {
-  1: { name: 'Phase 1', brings: 'the foundation — the records store, the menu, the permissions and these screens' },
-  2: { name: 'Phase 2', brings: 'the checklist builder — sections, questions, and which answer counts as a pass' },
-  3: { name: 'Phase 3', brings: 'the phone runner — answer a checklist, photograph, sign and submit it' },
-  4: { name: 'Phase 4', brings: 'the receiving, temperature and cold-room records' },
-  5: { name: 'Phase 5', brings: 'the batch and expiry, oil and water records' },
-  6: { name: 'Phase 6', brings: 'pest control and the certificate cupboard' },
-  7: { name: 'Phase 7', brings: 'corrective actions, the follow-up tasks and the escalations' },
-  8: { name: 'Phase 8', brings: 'the twelve ready-made checklists' },
-  9: { name: 'Phase 9', brings: 'the dashboard figures, Inspection Mode and the reports' },
+export const FSSAI_PHASES: Record<number, { when: string; brings: string }> = {
+  1: { when: 'In place',          brings: 'the foundation — the records store, the menu, the permissions and these screens' },
+  2: { when: 'Next',              brings: 'the checklist builder — sections, questions, and which answer counts as a pass' },
+  3: { when: 'Next',              brings: 'the phone checklist — answer it, photograph, sign and submit' },
+  4: { when: 'After your review', brings: 'the receiving, temperature and cold-room records' },
+  5: { when: 'After your review', brings: 'the batch and expiry, oil and water records' },
+  6: { when: 'After your review', brings: 'pest control and the certificate cupboard' },
+  7: { when: 'After your review', brings: 'corrective actions, the follow-up tasks and the escalations' },
+  8: { when: 'After your review', brings: 'the twelve ready-made checklists' },
+  9: { when: 'After your review', brings: 'the dashboard figures, Inspection Mode and the reports' },
 };
 
 /**
  * The review gate, verbatim from FSSAI-BUILD-STATE.md §4: the build stops after
- * Phase 3 so the owner can judge the phone checklist before eight more screens
- * are built on top of it. Every screen whose phase is 4 or later says so, rather
- * than implying it is merely next in the queue.
+ * P3 so the owner can judge the phone checklist before eight more screens are
+ * built on top of it. Every screen whose phase is 4 or later says so on the
+ * screen — in words, not in a number — rather than implying it is merely next
+ * in the queue.
  */
 export const FSSAI_REVIEW_GATE_PHASE = 4;
 
@@ -294,9 +308,9 @@ export function fssaiModule(href: string): FssaiModule {
   );
 }
 
-/** The phase row, with a readable fallback for a number that has no entry. */
-export function fssaiPhase(phase: number): { name: string; brings: string } {
-  return FSSAI_PHASES[phase] || { name: 'A later phase', brings: 'this screen' };
+/** The stage row, with a readable fallback for a number that has no entry. */
+export function fssaiPhase(phase: number): { when: string; brings: string } {
+  return FSSAI_PHASES[phase] || { when: 'Later', brings: 'this screen' };
 }
 
 /** The badge wording for a screen's access mark. '' = no mark. */

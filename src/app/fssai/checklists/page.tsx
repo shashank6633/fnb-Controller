@@ -35,8 +35,8 @@ export default function FssaiChecklistsPage() {
         links: [{ href: '/tasks/checklists', label: 'Daily Checklists' }],
       }}
       notes={[
-        'This is the screen to judge at the review gate. Phase 2 builds the checklist — sections, questions, the eight kinds of answer, and which answer counts as a pass. Phase 3 makes it run on a phone. Then the build stops until you have tried it.',
-        'Said plainly so it is not a surprise later: it needs a working internet connection. This app deliberately keeps no offline copy of itself, so a check cannot be filled in while the connection is down. If checks must work through an outage, that is a bigger piece of work and worth deciding before Phase 3, not after.',
+        'This is the screen to judge at the review gate. First we build the checklist itself — sections, questions, the eight kinds of answer, and which answer counts as a pass. Then we make it run on a phone. Then the build stops until you have tried it.',
+        'Said plainly so it is not a surprise later: it needs a working internet connection. This app deliberately keeps no offline copy of itself, so a check cannot be filled in while the connection is down. If checks must work through an outage, that is a bigger piece of work and worth deciding before the phone checklist is built, not after.',
         'Photographs will be shrunk on the phone before they are sent, because the server refuses anything over one megabyte — so one photo per question, not a gallery.',
       ]}
     />

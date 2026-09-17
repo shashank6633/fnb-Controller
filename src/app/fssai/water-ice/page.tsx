@@ -27,7 +27,7 @@ export default function FssaiWaterIcePage() {
         links: [{ href: '/tasks/maintenance', label: 'Maintenance' }],
       }}
       notes={[
-        'Test certificates are files. Where the module keeps files — inside the app’s own database as it does for staff documents today, or somewhere else with a size limit — is a decision for Phase 3, because the server currently refuses any upload over one megabyte.',
+        'Test certificates are files. Where the module keeps files — inside the app’s own database as it does for staff documents today, or somewhere else with a size limit — is a decision that has to be settled when the phone checklist is built, because the server currently refuses any upload over one megabyte.',
       ]}
     />
   );

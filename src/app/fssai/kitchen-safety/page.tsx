@@ -25,7 +25,7 @@ export default function FssaiKitchenSafetyPage() {
         links: [{ href: '/tasks/maintenance', label: 'Maintenance' }],
       }}
       notes={[
-        'One of twelve ready-made checklists arriving in Phase 8; the questions are yours to edit in Settings.',
+        'One of twelve ready-made checklists, written once the checklist builder is in place; the questions are yours to edit in Settings.',
         'A fault found here will create a job in the Maintenance screen you already use. This module will not grow a second to-do list.',
       ]}
     />

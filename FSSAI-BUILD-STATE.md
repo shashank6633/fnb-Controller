@@ -254,6 +254,20 @@ top costs far more than fixing it now. He is reviewing the foundation, not the f
 - **2026-09-16** — Worktree created at `4125237` on branch `fssai-compliance`. `node_modules`
   hardlinked via `rsync -a --link-dest` (Turbopack rejects a symlinked `node_modules` —
   *"points out of the filesystem root"*). Gate recorded in memory. Phases defined. P0 queued.
+- **2026-09-17** — **P1's work was destroyed once and recovered.** All three build lanes left it
+  uncommitted; at 10:07:59 a concurrent agent's `git checkout -- .` reverted all four tracked files
+  to HEAD, losing 665 lines of schema, 78 of catalog and 54 of sidebar. Only the untracked pages
+  survived. It was recovered from the Turbopack source-map cache — which `npm run predev`
+  (`rm -rf .next`) would have deleted — and committed as `b93ee61`.
+  **RULE, ADDED TO §1.1 IN PRACTICE: commit at the END OF EVERY LANE, not at the end of the phase.**
+  This worktree is shared with other agents that run destructive git commands. Uncommitted is the
+  only place git cannot protect.
+- **2026-09-17** — P1 fix round. `npm test` went `71 passed · 3 failed` → `74 passed · 2 failed`; the
+  two survivors are **not code and not FSSAI's** — they assert that the `kitchen` and `liquor`
+  station sentinels resolve to NO department, and both are mapped in the owner's production data
+  (`station_departments`). Changing that is forbidden by HARD RULE 4. Also closed: a pre-existing
+  privilege escalation in `/api/auth/roles` (an all-unknown page list was stored as `NULL` = every
+  page — it now 400s), and the screen copy lost "Phase N" and the inspector framing (§7 Q11).
 
 ---
 
@@ -282,4 +296,46 @@ later phase cite an earlier phase's default as precedent.
 | Q8 | Three roles in §20 do not exist (no Maintenance, Supervisor, F&B Controller) | Staff / Manager / Admin for v1. **FSSAI must never create roles** — that is his production config | — |
 | Q9 | May a check be backdated? | Yes, within 1 day, mandatory reason, row flagged | — |
 | Q10 | Who may see compliance reports? | Staff see their own department; cross-department and inspection packs are management | — |
+| Q11 | The shells print gaps measured in your OWN records. Should they, and who should see them? | Keep the facts, drop the inspector framing (**done** — see below); gate the "Worth knowing now" panel to management in P2 | — |
+
+### Q11 — the module tells the truth about the restaurant, inside the restaurant's app
+
+**What is on screen today.** Four shells state a gap measured in the live database, and all four
+statements are true — each was re-verified against the data before it was written:
+
+| Screen | What it says | Measured |
+|---|---|---|
+| Receiving | the six quality tick-boxes are unticked on every delivery so far | 29 GRNs, all six `qc_` columns sum to 0 |
+| FIFO & Expiry | the shelf-life field on all 952 items is empty | 952 items, 0 with a shelf life |
+| Temperature Logs | there is no temperature record in the app at all today | no such column anywhere; GRN stores pass/fail only |
+| Cold Room | your cold units are not a list in this app yet | 4 free-text strings on `production_batches` |
+
+**The tension.** They are exactly what the owner needs while he judges the foundation. They also
+render inside the app he intends to hand to an inspector, on screens any signed-in staff member can
+open — and a sentence written *for* him, read *over his shoulder*, is a different thing entirely.
+
+**Already done, and not up for debate** (it needed no ruling, because it removed no fact):
+- The shared line *"…so there is nothing here to show an inspector"* is gone from all 19 shells. It
+  carried no information the rest of the sentence did not, and it was the one line that read as a
+  statement about the restaurant rather than about the software.
+- `/fssai/inspection-mode` — the one screen designed to be handed over — now passes its own notice
+  and can never inherit the default. **Rule for P9: nothing on Inspection Mode may describe what the
+  restaurant lacks.**
+
+**The options on the four measured facts:**
+
+1. **Leave them visible to everyone.** Most honest, no work. But every member of staff, and anyone
+   holding the tablet, can read the restaurant's weak points off a food-safety screen.
+2. **Keep them, show them to management only** — put the "Worth knowing now" panel behind
+   `isManagement`. The people who can act still see them; a porter's phone shows only what the screen
+   will do. Costs one conditional and an `/api/auth/me` call on pages that today fetch nothing.
+3. **Take them out of the app** — move them into the review-gate report and this document. Nothing
+   measured about the restaurant ever renders. You lose them at the moment you are actually looking
+   at the screen they concern.
+4. **Keep them until the review gate, delete them at P4** — treat them as scaffolding notes that die
+   when the real screens arrive.
+
+**Recommendation: 2 now, 4 in the end.** They earn their place while you are judging the foundation,
+but they belong to the person who can act on them. Once the real screens exist, an empty temperature
+register says the same thing better than a sentence about an empty temperature register.
 

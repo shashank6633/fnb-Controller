@@ -25,7 +25,7 @@ export default function FssaiStoragePage() {
         links: [{ href: '/closing-stock', label: 'Closing Stock' }],
       }}
       notes={[
-        'One of twelve ready-made checklists arriving in Phase 8; every question is yours to edit in Settings.',
+        'One of twelve ready-made checklists, written once the checklist builder is in place; every question is yours to edit in Settings.',
         'The stores in the list will be the store locations already set up in the app, so there is no second list of places to keep in step.',
       ]}
     />

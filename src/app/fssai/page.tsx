@@ -74,16 +74,17 @@ export default function FssaiDashboardPage() {
           <div className="flex items-start gap-3">
             <Hourglass className="w-5 h-5 text-amber-700 shrink-0 mt-0.5" />
             <div className="min-w-0">
-              <p className="font-bold text-amber-900">No checks have been recorded yet</p>
+              <p className="font-bold text-amber-900">No checks have been recorded here yet</p>
               <p className="text-sm text-amber-900 mt-1">
-                This dashboard shows no counts because there is nothing to count. Checklists cannot be
-                filled in until Phase 2 builds the checklist itself and Phase 3 puts it on a phone.
-                The figures you will eventually read here — due today, missed, failed and waiting on a
-                fix, certificates about to run out — arrive in Phase 9.
+                This dashboard shows no counts because there is nothing to count yet. A checklist
+                cannot be filled in until the checklist itself is built and then made to run on a
+                phone — those are the next two pieces of work. The figures you will eventually read
+                here — due today, missed, failed and waiting on a fix, certificates about to run out —
+                come last of all, because they count what the other screens record.
               </p>
               <p className="text-sm text-amber-900 mt-2">
-                The build stops after Phase 3 on purpose, so you can run a checklist on your own phone
-                and say whether it feels right before the eight record screens are built on top of it.
+                The build then stops on purpose, so you can run a checklist on your own phone and say
+                whether it feels right before the eight record screens are built on top of it.
               </p>
             </div>
           </div>
@@ -162,8 +163,10 @@ function ModuleTile({ mod }: { mod: FssaiModule }) {
         <ArrowRight className="w-4 h-4 text-[#C4B09A] group-hover:text-[#af4408] shrink-0" />
       </div>
       <div className="flex flex-wrap items-center gap-1.5 mt-auto pt-1">
+        {/* When, in words. This chip used to read "Phase 8", which is the build
+            plan's vocabulary and means nothing to a chef — see modules.ts. */}
         <span className="inline-flex items-center text-[11px] font-semibold px-2 py-0.5 rounded-full border bg-[#FFF1E3] text-[#8B7355] border-[#E8D5C4]">
-          {phase.name}
+          {phase.when}
         </span>
         {accessLabel && (
           <span className="inline-flex items-center gap-1 text-[11px] font-semibold px-2 py-0.5 rounded-full border bg-purple-100 text-purple-700 border-purple-200">

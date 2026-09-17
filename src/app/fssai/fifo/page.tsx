@@ -25,7 +25,7 @@ export default function FssaiFifoPage() {
       ]}
       today={{
         text:
-          'Kitchen Production already gives every batch it makes a barcode, a production date and an expiry, and already sorts them oldest-first. Phase 5 reads those batches. It will not create a second stock list, and it will never move material.',
+          'Kitchen Production already gives every batch it makes a barcode, a production date and an expiry, and already sorts them oldest-first. This screen will read those batches. It will not create a second stock list, and it will never move material.',
         links: [{ href: '/kitchen-production', label: 'Kitchen Production' }],
       }}
       notes={[

@@ -25,7 +25,7 @@ export default function FssaiColdRoomsPage() {
       ]}
       today={{
         text:
-          'Nowhere. Your cold units are not a list in this app yet — they exist only as free text typed on kitchen production labels, where the words used so far are Cold Room 1, Cold Room 2, Cold Room 3 and walkin chiller 1. Phase 1 built the place to register them properly; you will name them, and set each one’s safe range, on the Settings screen.',
+          'Nowhere. Your cold units are not a list in this app yet — they exist only as free text typed on kitchen production labels, where the words used so far are Cold Room 1, Cold Room 2, Cold Room 3 and walkin chiller 1. The place to register them properly is already built; you will name them, and set each one’s safe range, on the Settings screen.',
         links: [{ href: '/kitchen-production', label: 'Kitchen Production' }],
       }}
       notes={[

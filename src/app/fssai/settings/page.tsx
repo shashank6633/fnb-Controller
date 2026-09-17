@@ -25,7 +25,7 @@ export default function FssaiSettingsPage() {
       ]}
       today={{
         text:
-          'Nowhere. Phase 1 built the place to store all of this; the screens to edit it are Phase 2.',
+          'Nowhere. The place to store all of this is already built; the screens to edit it are the next piece of work.',
       }}
       notes={[
         'Every standard in this module is yours to set here. No temperature, no frequency and no pass mark is written into the software — if the rules change, or an inspector asks for something stricter, you change it here without waiting for a developer.',

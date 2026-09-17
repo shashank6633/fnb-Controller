@@ -28,8 +28,8 @@ export default function FssaiFoodQualityPage() {
         links: [{ href: '/tasks/checklists', label: 'Daily Checklists' }],
       }}
       notes={[
-        'This is one of twelve ready-made checklists that arrive in Phase 8. It is a list of questions you can change yourself in Settings — add one, reword one, change which answer counts as a fail — without waiting for a developer.',
-        'Before any of the twelve are written down, Phase 2 has to settle the question types and the pass-or-fail rules. A checklist seeded before that would have to be rebuilt.',
+        'This is one of twelve ready-made checklists, written once the checklist builder is in place. It is a list of questions you can change yourself in Settings — add one, reword one, change which answer counts as a fail — without waiting for a developer.',
+        'Before any of the twelve are written down, the checklist builder has to settle the question types and the pass-or-fail rules. A checklist seeded before that would have to be rebuilt.',
       ]}
     />
   );

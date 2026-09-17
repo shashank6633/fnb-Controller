@@ -28,7 +28,7 @@ export default function FssaiReportsPage() {
         links: [{ href: '/reports/sales', label: 'Sales Reports' }],
       }}
       notes={[
-        'One limit worth knowing before the reports are designed: in the PDFs this app generates today, a long remark inside a table cell is cut short rather than wrapped onto a second line. For a corrective-action report that matters, so Phase 9 will lay those out as paragraphs instead of table cells.',
+        'One limit worth knowing before the reports are designed: in the PDFs this app generates today, a long remark inside a table cell is cut short rather than wrapped onto a second line. For a corrective-action report that matters, so these reports will lay those out as paragraphs instead of table cells.',
       ]}
     />
   );

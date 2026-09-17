@@ -713,6 +713,9 @@ test('cache-equals-truth', () => {
     postDeptLedger(db, {
       departmentId: d, materialId: m, type: p.type, quantity: q,
       referenceId: 'fuzz-' + i, source: 'run-tests-fuzz', notes: 'fuzz',
+      // postDeptLedger REFUSES a blank responsible user (movement record,
+      // 2026-09-10). A fuzz movement is machine-made and says so.
+      user: 'system:run-tests',
     });
     posted++;
   }
