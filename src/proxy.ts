@@ -92,6 +92,16 @@ const CSRF_REQUIRED_PREFIXES = [
   '/api/crm-calls/entertainment', // GRE "What's On" entertainment calendar CRUD (management-gated writes)
   '/api/telecmi',             // TeleCMI actions (click-to-call, backfill) — webhooks are carved out in isPublic (matched there first)
   '/api/hr',                  // HRMS module (docs/HRMS_DECISIONS.md) — one prefix covers every present and future HR mutation; HR client writes must use src/lib/api.ts or they 403 here
+  // FSSAI Compliance — one prefix covers every present and future FSSAI
+  // mutation (checklists, sections, questions, assignments, runs). Landed in
+  // the same commit as the module's first write route, which is the rule: the
+  // proxy guards PAGES, not APIs (see the isApi branch below), so an FSSAI
+  // route is protected by its own getCurrentUser() check plus this line, and
+  // by nothing else. Every FSSAI client mutation must go through
+  // src/lib/api.ts (api() / apiJson()), which sets X-CSRF-Token on
+  // POST/PUT/PATCH/DELETE — a bare fetch() POST will 403 here. GETs are never
+  // checked (isStateChanging()), so plain fetch is fine for reads.
+  '/api/fssai',
 ];
 
 function isPublic(pathname: string): boolean {

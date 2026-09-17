@@ -1,0 +1,899 @@
+/**
+ * FSSAI Compliance — shared contract module.
+ *
+ * THE single source of truth for the checklist ENGINE: the eight question
+ * types, the frequency vocabulary, the status badge metadata, the permission
+ * predicates, the pass/fail evaluator, the version-bump rule and the
+ * one-run-per-slot rule. The API routes under src/app/api/fssai/** and the
+ * screens under src/app/fssai/** both import from here, so a button and the
+ * refusal behind it can never disagree (RECON §8, the variance-queue lesson).
+ *
+ * Pure module — no runtime DB import. It imports a *type* from ./auth (erased
+ * at compile time) and the recurrence maths from ./tasks (itself pure), so it
+ * is safe on both server and client. Model: src/lib/tasks.ts.
+ *
+ * WHY THE VOCABULARY IS FROZEN HERE AND NOWHERE ELSE (RECON §10 R1 — the
+ * most likely failure of this build): twelve of the twenty sub-modules ship as
+ * seeded template ROWS in P8. If the engine grows a question type or a
+ * pass/fail rule after those rows are written, the seeds silently encode the
+ * old shape, and because boot errors are swallowed and seeds are
+ * INSERT OR IGNORE, a half-migrated template looks exactly like a correct one.
+ * So: a template referencing a qtype this file does not declare must FAIL
+ * LOUDLY (qtypeMeta returns null and the caller refuses), never render a blank
+ * field.
+ */
+
+import type { SessionUser } from './auth';
+import { nextRecurrence, type RecurrenceFrequency } from './tasks';
+
+/* ------------------------------------------------------------------ *
+ * 1. THE EIGHT QUESTION TYPES
+ * ------------------------------------------------------------------ */
+
+/**
+ * The owner named these eight (FSSAI-BUILD-STATE.md §15 / the P2 brief) and
+ * fssai_questions.qtype stores the key. There is deliberately NO CHECK
+ * constraint on that column (db.ts) — the vocabulary is code-side, and this
+ * array is it.
+ */
+export type FssaiQType =
+  | 'yes_no'
+  | 'pass_fail'
+  | 'numeric'
+  | 'temperature'
+  | 'text'
+  | 'photo'
+  | 'multiple_choice'
+  | 'signature';
+
+export interface QTypeMeta {
+  key: FssaiQType;
+  label: string;
+  /** Which fssai_responses column carries the answer. */
+  value: 'bool' | 'num' | 'text' | 'evidence';
+  /** Uses min_value / max_value / target_value / decimals / uom. */
+  usesRange: boolean;
+  /** Uses options_json + fail_options_json. */
+  usesOptions: boolean;
+  /** Uses expected_value (which answer passes). */
+  usesExpected: boolean;
+  /** One line an admin reads while choosing the type. */
+  hint: string;
+}
+
+export const FSSAI_QTYPES: readonly QTypeMeta[] = [
+  { key: 'yes_no',          label: 'Yes / No',         value: 'bool',     usesRange: false, usesOptions: false, usesExpected: true,  hint: 'Two buttons. You choose which answer counts as a pass.' },
+  { key: 'pass_fail',       label: 'Pass / Fail',      value: 'bool',     usesRange: false, usesOptions: false, usesExpected: true,  hint: 'Two buttons. Normally Pass is the passing answer.' },
+  { key: 'numeric',         label: 'Number',           value: 'num',      usesRange: true,  usesOptions: false, usesExpected: false, hint: 'A reading with an optional acceptable range and a unit.' },
+  { key: 'temperature',     label: 'Temperature',      value: 'num',      usesRange: true,  usesOptions: false, usesExpected: false, hint: 'A temperature in °C with a minimum and a maximum. Never hard-coded in software.' },
+  { key: 'text',            label: 'Text',             value: 'text',     usesRange: false, usesOptions: false, usesExpected: false, hint: 'Free text. Records words; it never fails on its own.' },
+  { key: 'photo',           label: 'Photo',            value: 'evidence', usesRange: false, usesOptions: false, usesExpected: false, hint: 'A photograph is the answer. Fails if it is required and missing.' },
+  { key: 'multiple_choice', label: 'Multiple choice',  value: 'text',     usesRange: false, usesOptions: true,  usesExpected: false, hint: 'A list of answers. You mark which of them count as a fail.' },
+  { key: 'signature',       label: 'Signature',        value: 'text',     usesRange: false, usesOptions: false, usesExpected: false, hint: 'The signed-in person and the time (§7 Q6 provisional — no drawing).' },
+] as const;
+
+/** Metadata for a qtype, or null for a type this build does not know (R1). */
+export function qtypeMeta(key: string | null | undefined): QTypeMeta | null {
+  return FSSAI_QTYPES.find((t) => t.key === key) ?? null;
+}
+
+export function isFssaiQType(key: string | null | undefined): key is FssaiQType {
+  return !!qtypeMeta(key);
+}
+
+/** Evidence rules — the same three values on photo_rule and note_rule. */
+export type FssaiEvidenceRule = 'never' | 'on_fail' | 'always';
+export const FSSAI_EVIDENCE_RULES: readonly { key: FssaiEvidenceRule; label: string }[] = [
+  { key: 'never',   label: 'Not needed' },
+  { key: 'on_fail', label: 'Only when it fails' },
+  { key: 'always',  label: 'Always' },
+] as const;
+export function isEvidenceRule(v: string | null | undefined): v is FssaiEvidenceRule {
+  return v === 'never' || v === 'on_fail' || v === 'always';
+}
+
+/* ------------------------------------------------------------------ *
+ * 2. FREQUENCY
+ * ------------------------------------------------------------------ */
+
+/**
+ * FSSAI needs a wider vocabulary than the Task module's
+ * RecurrenceFrequency ('daily' | 'weekly' | 'monthly', tasks.ts:206). The
+ * three it does cover DELEGATE to nextRecurrence — a second implementation of
+ * that maths is an automatic drift defect (RECON §5, "rails FSSAI must not
+ * rebuild").
+ */
+export type FssaiFrequency =
+  | 'hourly'
+  | 'per_shift'
+  | 'twice_daily'
+  | 'daily'
+  | 'weekly'
+  | 'monthly'
+  | 'quarterly'
+  | 'yearly'
+  | 'on_event';
+
+export const FSSAI_FREQUENCIES: readonly { key: FssaiFrequency; label: string; hint: string }[] = [
+  { key: 'hourly',      label: 'Every hour',      hint: 'Times of day are listed on the assignment.' },
+  { key: 'per_shift',   label: 'Every shift',     hint: 'One run per shift named on the assignment.' },
+  { key: 'twice_daily', label: 'Twice a day',     hint: 'Typically opening and closing.' },
+  { key: 'daily',       label: 'Daily',           hint: 'Once every day.' },
+  { key: 'weekly',      label: 'Weekly',          hint: 'On the chosen day of the week.' },
+  { key: 'monthly',     label: 'Monthly',         hint: 'On the chosen day of the month.' },
+  { key: 'quarterly',   label: 'Quarterly',       hint: 'Every three months, on the chosen day.' },
+  { key: 'yearly',      label: 'Yearly',          hint: 'Once a year, on the chosen day.' },
+  { key: 'on_event',    label: 'When it happens', hint: 'No schedule — run it at a delivery, a breakdown, an inspection.' },
+] as const;
+
+export function isFssaiFrequency(v: string | null | undefined): v is FssaiFrequency {
+  return FSSAI_FREQUENCIES.some((f) => f.key === v);
+}
+
+/** How many runs a frequency expects in one day (0 = not daily-shaped). */
+export function runsPerDay(freq: FssaiFrequency, timesCsv = ''): number {
+  if (freq === 'hourly') {
+    const n = timesCsv.split(',').map((s) => s.trim()).filter(Boolean).length;
+    return n || 24;
+  }
+  if (freq === 'twice_daily') return 2;
+  if (freq === 'per_shift' || freq === 'daily') return 1;
+  return 0;
+}
+
+/**
+ * Next due date (YYYY-MM-DD) strictly after fromISODate.
+ *
+ * daily / weekly / monthly are nextRecurrence verbatim. The four FSSAI-only
+ * schedules are expressed in terms of it so there is still exactly one
+ * implementation of the calendar maths:
+ *   · hourly / per_shift / twice_daily  — several runs inside ONE day, so the
+ *     next DATE is simply the next day (the time-of-day list lives in
+ *     fssai_assignments.times_csv and is P3/P7's concern, not the date's).
+ *   · quarterly / yearly — monthly, applied 3 / 12 times.
+ *   · on_event — never scheduled; returns ''.
+ */
+export function fssaiNextDueDate(
+  freq: FssaiFrequency,
+  fromISODate: string,
+  dayOfWeek?: number,
+  dayOfMonth?: number,
+): string {
+  if (freq === 'on_event') return '';
+  if (freq === 'hourly' || freq === 'per_shift' || freq === 'twice_daily' || freq === 'daily') {
+    return nextRecurrence('daily' as RecurrenceFrequency, fromISODate, dayOfWeek, dayOfMonth);
+  }
+  if (freq === 'weekly') return nextRecurrence('weekly', fromISODate, dayOfWeek, dayOfMonth);
+  if (freq === 'monthly') return nextRecurrence('monthly', fromISODate, dayOfWeek, dayOfMonth);
+  const steps = freq === 'quarterly' ? 3 : 12;
+  let cursor = fromISODate;
+  for (let i = 0; i < steps; i++) {
+    cursor = nextRecurrence('monthly', cursor, dayOfWeek, dayOfMonth);
+    if (!cursor) return '';
+  }
+  return cursor;
+}
+
+/* ------------------------------------------------------------------ *
+ * 3. THE REST OF THE VOCABULARY
+ * ------------------------------------------------------------------ */
+
+/** What one run is performed AGAINST. fssai_runs.target_kind / target_id. */
+export type FssaiTargetKind = 'none' | 'equipment' | 'area' | 'department' | 'grn' | 'batch' | 'person';
+export const FSSAI_TARGET_KINDS: readonly { key: FssaiTargetKind; label: string; hint: string }[] = [
+  { key: 'none',       label: 'Nothing in particular', hint: 'One run per shift for the whole restaurant.' },
+  { key: 'equipment',  label: 'A piece of equipment',  hint: 'A cold room, a chiller, a fryer — one run each.' },
+  { key: 'area',       label: 'An area',               hint: 'A named place: the wash-up, the bin store.' },
+  { key: 'department', label: 'A department',          hint: 'Kitchen, Bar, Housekeeping.' },
+  { key: 'grn',        label: 'A delivery',            hint: 'Run at the door against one goods receipt.' },
+  { key: 'batch',      label: 'A production batch',    hint: 'Against one prepared batch.' },
+  // 'person' is what makes Personal Hygiene one record per person per shift
+  // with NO special case in the slot rule — the person is IN the slot key.
+  { key: 'person',     label: 'A person',              hint: 'One run per member of staff — personal hygiene.' },
+] as const;
+export function isFssaiTargetKind(v: string | null | undefined): v is FssaiTargetKind {
+  return FSSAI_TARGET_KINDS.some((t) => t.key === v);
+}
+
+/** fssai_runs.shift / fssai_assignments.shift. '' = the whole day. */
+export const FSSAI_SHIFTS: readonly { key: string; label: string }[] = [
+  { key: '',          label: 'Any time' },
+  { key: 'opening',   label: 'Opening' },
+  { key: 'morning',   label: 'Morning' },
+  { key: 'afternoon', label: 'Afternoon' },
+  { key: 'evening',   label: 'Evening' },
+  { key: 'closing',   label: 'Closing' },
+  { key: 'night',     label: 'Night' },
+] as const;
+export function isFssaiShift(v: string | null | undefined): boolean {
+  return FSSAI_SHIFTS.some((s) => s.key === (v ?? ''));
+}
+
+/**
+ * Which of the twenty sub-modules owns a template
+ * (fssai_templates.module_key). These are the FSSAI_MODULES hrefs in
+ * src/app/fssai/_components/modules.ts with the '/fssai/' prefix removed —
+ * restated as plain strings here so this module stays free of the icon import
+ * and is safe to load on the server. '' = a checklist the owner wrote himself
+ * that belongs to no record module.
+ */
+export const FSSAI_MODULE_KEYS: readonly string[] = [
+  'receiving', 'fifo', 'cold-rooms', 'temperature', 'food-quality', 'pest-control',
+  'cleaning', 'hygiene', 'storage', 'kitchen-safety', 'water-ice', 'oil-quality',
+] as const;
+
+/** fssai_equipment.kind — declared here so P4's Settings tab has one list. */
+export const FSSAI_EQUIPMENT_KINDS: readonly { key: string; label: string }[] = [
+  { key: 'cold_room',    label: 'Cold room' },
+  { key: 'chiller',      label: 'Chiller' },
+  { key: 'freezer',      label: 'Freezer' },
+  { key: 'hot_holding',  label: 'Hot holding' },
+  { key: 'fryer',        label: 'Fryer' },
+  { key: 'dishwasher',   label: 'Dishwasher' },
+  { key: 'water_filter', label: 'Water filter' },
+  { key: 'other',        label: 'Other' },
+] as const;
+
+/* ------------------------------------------------------------------ *
+ * 4. STATUS BADGES — the house metadata-array pattern (RECON §1.5)
+ * ------------------------------------------------------------------ */
+
+export interface FssaiStatusMeta { key: string; label: string; color: string }
+
+/** fssai_templates.status */
+export const FSSAI_TEMPLATE_STATUSES: readonly FssaiStatusMeta[] = [
+  { key: 'draft',     label: 'Draft',     color: 'bg-gray-100 text-gray-700 border-gray-200' },
+  { key: 'published', label: 'Published', color: 'bg-green-100 text-green-700 border-green-200' },
+  { key: 'archived',  label: 'Archived',  color: 'bg-gray-100 text-gray-600 border-gray-200' },
+] as const;
+
+/** fssai_runs.status */
+export const FSSAI_RUN_STATUSES: readonly FssaiStatusMeta[] = [
+  { key: 'in_progress', label: 'In progress',  color: 'bg-amber-100 text-amber-800 border-amber-200' },
+  { key: 'submitted',   label: 'Submitted',    color: 'bg-teal-100 text-teal-700 border-teal-200' },
+  { key: 'verified',    label: 'Verified',     color: 'bg-green-100 text-green-700 border-green-200' },
+  { key: 'rejected',    label: 'Sent back',    color: 'bg-red-100 text-red-700 border-red-200' },
+  { key: 'void',        label: 'Voided',       color: 'bg-gray-100 text-gray-600 border-gray-200' },
+] as const;
+
+function metaFrom(list: readonly FssaiStatusMeta[], key: string | null | undefined): FssaiStatusMeta {
+  const found = list.find((s) => s.key === key);
+  if (found) return found;
+  const k = String(key || '');
+  return {
+    key: k,
+    label: k ? k.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase()) : '—',
+    color: 'bg-gray-100 text-gray-700 border-gray-200',
+  };
+}
+export function fssaiTemplateStatusMeta(key: string | null | undefined): FssaiStatusMeta {
+  return metaFrom(FSSAI_TEMPLATE_STATUSES, key);
+}
+export function fssaiRunStatusMeta(key: string | null | undefined): FssaiStatusMeta {
+  return metaFrom(FSSAI_RUN_STATUSES, key);
+}
+
+/* ------------------------------------------------------------------ *
+ * 5. PERMISSIONS
+ * ------------------------------------------------------------------ */
+
+/**
+ * The subset of SessionUser the FSSAI gates read. Structural so a test can
+ * pass a literal, and so nothing here needs the whole session object.
+ */
+export type FssaiActor = Pick<SessionUser, 'role' | 'is_head_chef'> & { email?: string };
+
+/**
+ * MAY CONFIGURE THE MODULE — create and edit checklists, sections, questions,
+ * assignments and equipment.
+ *
+ * ADMIN ONLY, deliberately. Owner §20: only the administrator configures. This
+ * is narrower than canManageTasks (admin | manager | head chef | store
+ * manager) on purpose: a head chef editing the pass mark of the checklist his
+ * own kitchen is measured by is the exact failure a food-safety record exists
+ * to prevent (RECON §10 R4).
+ *
+ * §7 Q8 (PROVISIONAL DEFAULT, the owner has not ruled): FSSAI uses the three
+ * tiers that exist — Staff / Manager / Admin. It NEVER creates a role;
+ * production config is the owner's (HARD RULE 4).
+ */
+export function canAuthorFssai(me: FssaiActor | null | undefined): boolean {
+  if (!me) return false;
+  return me.role === 'admin';
+}
+
+/** MAY RUN A CHECK — any signed-in user. Staff are exactly who runs checks. */
+export function canRunFssaiCheck(me: FssaiActor | null | undefined): boolean {
+  return !!me;
+}
+
+/**
+ * MAY VERIFY A SUBMITTED RUN.
+ *
+ * §7 Q3 (PROVISIONAL DEFAULT): any management may verify, but NEVER the person
+ * who recorded the run. Strictly narrower than canApproveTasks, which is
+ * identical to canManageTasks and would let a head chef sign off his own
+ * kitchen (RECON §10 R4). The recorded_by test cannot live in the schema —
+ * it is enforced here and re-checked in the route.
+ */
+export function canVerifyFssai(
+  me: FssaiActor | null | undefined,
+  recordedByEmail?: string | null,
+): boolean {
+  if (!me) return false;
+  const isMgmt = me.role === 'admin' || me.role === 'manager' || !!me.is_head_chef;
+  if (!isMgmt) return false;
+  const mine = String(me.email || '').trim().toLowerCase();
+  const ran = String(recordedByEmail || '').trim().toLowerCase();
+  if (mine && ran && mine === ran) return false;
+  return true;
+}
+
+/** MAY TAKE OVER SOMEONE ELSE'S OPEN RUN — management only, with a reason. */
+export function canTakeOverFssaiRun(me: FssaiActor | null | undefined): boolean {
+  if (!me) return false;
+  return me.role === 'admin' || me.role === 'manager' || !!me.is_head_chef;
+}
+
+/* ------------------------------------------------------------------ *
+ * 6. QUESTION VALIDATION — one validator, used by the API and the builder
+ * ------------------------------------------------------------------ */
+
+export interface FssaiQuestionInput {
+  qtype?: string | null;
+  prompt?: string | null;
+  help_text?: string | null;
+  uom?: string | null;
+  min_value?: number | string | null;
+  max_value?: number | string | null;
+  target_value?: number | string | null;
+  decimals?: number | string | null;
+  expected_value?: string | null;
+  options?: unknown;
+  fail_options?: unknown;
+  is_required?: unknown;
+  is_critical?: unknown;
+  allow_na?: unknown;
+  photo_rule?: string | null;
+  note_rule?: string | null;
+  raise_ca_on_fail?: unknown;
+  ca_severity?: string | null;
+  code?: string | null;
+}
+
+export interface FssaiQuestionNormalized {
+  qtype: FssaiQType;
+  prompt: string;
+  help_text: string;
+  uom: string;
+  min_value: number | null;
+  max_value: number | null;
+  target_value: number | null;
+  decimals: number;
+  expected_value: string;
+  options: string[];
+  fail_options: string[];
+  is_required: 0 | 1;
+  is_critical: 0 | 1;
+  allow_na: 0 | 1;
+  photo_rule: FssaiEvidenceRule;
+  note_rule: FssaiEvidenceRule;
+  raise_ca_on_fail: 0 | 1;
+  ca_severity: string;
+  code: string;
+}
+
+export type FssaiValidation<T> = { ok: true; value: T } | { ok: false; error: string };
+
+const CA_SEVERITIES = ['low', 'medium', 'high', 'urgent'] as const;
+
+function num(v: unknown): number | null {
+  if (v === null || v === undefined) return null;
+  const s = String(v).trim();
+  if (s === '') return null;                 // blank is NOT zero (RECON §6.4)
+  const n = Number(s);
+  return Number.isFinite(n) ? n : NaN;       // NaN = "they typed something that is not a number"
+}
+
+function bool01(v: unknown, dflt: 0 | 1): 0 | 1 {
+  if (v === undefined || v === null || v === '') return dflt;
+  if (typeof v === 'string') return v === '0' || v.toLowerCase() === 'false' ? 0 : 1;
+  return v ? 1 : 0;
+}
+
+/** Trim, drop blanks, drop duplicates, keep order. */
+export function cleanFssaiOptions(v: unknown): string[] {
+  if (!Array.isArray(v)) return [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of v) {
+    const s = String(raw ?? '').trim();
+    if (!s || seen.has(s)) continue;
+    seen.add(s);
+    out.push(s);
+  }
+  return out;
+}
+
+/**
+ * Validate and normalise one question. EVERY type is checked for what it
+ * actually needs, and the error text is written for a restaurant manager
+ * (RECON §2.3 — apiJson surfaces it straight onto his screen).
+ *
+ * `existing` lets a PATCH-shaped edit merge over the stored row and then
+ * validate the FINAL shape once — the HRMS idiom (api/hr/tests/route.ts:695),
+ * so editing only the options still re-checks that the fail answers are still
+ * members of the list.
+ */
+export function normalizeFssaiQuestion(
+  input: FssaiQuestionInput,
+  existing?: Partial<FssaiQuestionNormalized>,
+): FssaiValidation<FssaiQuestionNormalized> {
+  const pick = <K extends keyof FssaiQuestionInput>(k: K, fallback: unknown) =>
+    input[k] !== undefined ? input[k] : fallback;
+
+  const qtypeRaw = String(pick('qtype', existing?.qtype ?? 'yes_no') ?? '').trim();
+  const meta = qtypeMeta(qtypeRaw);
+  if (!meta) {
+    return {
+      ok: false,
+      error:
+        `"${qtypeRaw || '(blank)'}" is not a question type this system knows. ` +
+        `The eight types are: ${FSSAI_QTYPES.map((t) => t.label).join(', ')}.`,
+    };
+  }
+  const qtype = meta.key;
+
+  const prompt = String(pick('prompt', existing?.prompt ?? '') ?? '').trim();
+  if (!prompt) return { ok: false, error: 'Type the question staff will see.' };
+  if (prompt.length > 400) return { ok: false, error: 'Keep the question under 400 characters.' };
+
+  const help_text = String(pick('help_text', existing?.help_text ?? '') ?? '').trim();
+  const code = String(pick('code', existing?.code ?? '') ?? '').trim();
+
+  let uom = String(pick('uom', existing?.uom ?? '') ?? '').trim();
+  let min_value: number | null = null;
+  let max_value: number | null = null;
+  let target_value: number | null = null;
+  let decimals = 1;
+  let expected_value = '';
+  let options: string[] = [];
+  let fail_options: string[] = [];
+
+  /* ── the range types ── */
+  if (meta.usesRange) {
+    const mn = num(pick('min_value', existing?.min_value ?? null));
+    const mx = num(pick('max_value', existing?.max_value ?? null));
+    const tg = num(pick('target_value', existing?.target_value ?? null));
+    if (Number.isNaN(mn)) return { ok: false, error: 'The lowest acceptable value must be a number, or left blank for no limit.' };
+    if (Number.isNaN(mx)) return { ok: false, error: 'The highest acceptable value must be a number, or left blank for no limit.' };
+    if (Number.isNaN(tg)) return { ok: false, error: 'The target value must be a number, or left blank.' };
+    min_value = mn; max_value = mx; target_value = tg;
+
+    if (min_value !== null && max_value !== null && min_value > max_value) {
+      return {
+        ok: false,
+        error: `The lowest acceptable value (${min_value}) is higher than the highest (${max_value}). Nothing could ever pass this check.`,
+      };
+    }
+    if (target_value !== null) {
+      if (min_value !== null && target_value < min_value) {
+        return { ok: false, error: `The target (${target_value}) is below the lowest acceptable value (${min_value}).` };
+      }
+      if (max_value !== null && target_value > max_value) {
+        return { ok: false, error: `The target (${target_value}) is above the highest acceptable value (${max_value}).` };
+      }
+    }
+
+    const d = num(pick('decimals', existing?.decimals ?? (qtype === 'temperature' ? 1 : 0)));
+    if (d === null || Number.isNaN(d) || d < 0 || d > 3 || !Number.isInteger(d)) {
+      return { ok: false, error: 'Decimal places must be a whole number between 0 and 3.' };
+    }
+    decimals = d;
+    if (qtype === 'temperature' && !uom) uom = 'C';   // the degree sign is added at render/PDF time
+    if (uom.length > 16) return { ok: false, error: 'Keep the unit short (16 characters or fewer).' };
+  } else {
+    uom = '';
+    decimals = 1;
+  }
+
+  /* ── the two-button types ── */
+  if (meta.usesExpected) {
+    const allowed = qtype === 'yes_no' ? ['yes', 'no'] : ['pass', 'fail'];
+    const raw = String(pick('expected_value', existing?.expected_value ?? allowed[0]) ?? '').trim().toLowerCase();
+    const val = raw || allowed[0];
+    if (!allowed.includes(val)) {
+      return { ok: false, error: `The passing answer must be ${allowed[0]} or ${allowed[1]}.` };
+    }
+    expected_value = val;
+  }
+
+  /* ── multiple choice ── */
+  if (meta.usesOptions) {
+    options = cleanFssaiOptions(pick('options', existing?.options ?? []));
+    if (options.length < 2) {
+      return { ok: false, error: 'A multiple-choice question needs at least 2 answers to choose from.' };
+    }
+    if (options.length > 12) {
+      return { ok: false, error: 'A multiple-choice question can have at most 12 answers.' };
+    }
+    fail_options = cleanFssaiOptions(pick('fail_options', existing?.fail_options ?? []));
+    const stray = fail_options.find((f) => !options.includes(f));
+    if (stray) {
+      return { ok: false, error: `"${stray}" is marked as a fail but is not one of the answers on the list.` };
+    }
+    if (fail_options.length === options.length) {
+      return { ok: false, error: 'Every answer is marked as a fail, so this question could never pass. Leave at least one answer as a pass.' };
+    }
+  }
+
+  /* ── evidence rules ── */
+  let photo_rule = String(pick('photo_rule', existing?.photo_rule ?? 'never') ?? '').trim() as FssaiEvidenceRule;
+  if (!isEvidenceRule(photo_rule)) return { ok: false, error: 'Photo requirement must be: not needed, only when it fails, or always.' };
+  let note_rule = String(pick('note_rule', existing?.note_rule ?? 'never') ?? '').trim() as FssaiEvidenceRule;
+  if (!isEvidenceRule(note_rule)) return { ok: false, error: 'Note requirement must be: not needed, only when it fails, or always.' };
+  // A photo QUESTION whose answer is the photograph cannot be "photo not
+  // needed" — that is a question with no answer. Corrected rather than
+  // refused, because the admin's intent is unambiguous.
+  if (qtype === 'photo' && photo_rule === 'never') photo_rule = 'always';
+  // Text questions are how a regulation asks for words; if the answer is the
+  // text itself, "note not needed" is equally meaningless only when the
+  // question is required — left alone otherwise.
+  if (qtype === 'text' && note_rule === 'on_fail') note_rule = 'never';
+
+  const ca_severity = String(pick('ca_severity', existing?.ca_severity ?? 'medium') ?? '').trim() || 'medium';
+  if (!(CA_SEVERITIES as readonly string[]).includes(ca_severity)) {
+    return { ok: false, error: `Severity must be one of: ${CA_SEVERITIES.join(', ')}.` };
+  }
+
+  return {
+    ok: true,
+    value: {
+      qtype, prompt, help_text, uom,
+      min_value, max_value, target_value, decimals,
+      expected_value, options, fail_options,
+      is_required: bool01(pick('is_required', existing?.is_required ?? 1), 1),
+      is_critical: bool01(pick('is_critical', existing?.is_critical ?? 0), 0),
+      allow_na:    bool01(pick('allow_na',    existing?.allow_na    ?? 1), 1),
+      photo_rule, note_rule,
+      raise_ca_on_fail: bool01(pick('raise_ca_on_fail', existing?.raise_ca_on_fail ?? 0), 0),
+      ca_severity, code,
+    },
+  };
+}
+
+/* ------------------------------------------------------------------ *
+ * 7. THE VERSION RULE
+ * ------------------------------------------------------------------ */
+
+/**
+ * WHICH TEMPLATE HEADER EDITS BUMP fssai_templates.version.
+ *
+ * The rule, in one sentence: bump when the edit changes WHAT WAS ASKED or HOW
+ * IT WAS JUDGED; do not bump for a cosmetic or organisational change.
+ *
+ * Every section and question mutation bumps unconditionally (see
+ * bumpTemplateVersion in the routes) — creating, editing, reordering,
+ * retiring or reactivating one all change the paper. Header fields are the
+ * only ones that need a list, and this is it. Exported so the API and the
+ * builder screen cannot disagree about what counts as a structural change.
+ */
+export const FSSAI_VERSION_BUMPING_TEMPLATE_FIELDS: readonly string[] = [
+  'pass_threshold_pct',     // how many answers must pass
+  'target_kind',            // what the run is performed against
+  'requires_signature',     // whether a signature is part of the record
+  'requires_verification',  // whether someone else must sign it off
+] as const;
+
+/** True when this set of changed header fields must bump the version. */
+export function templateEditBumpsVersion(changedFields: Iterable<string>): boolean {
+  for (const f of changedFields) {
+    if (FSSAI_VERSION_BUMPING_TEMPLATE_FIELDS.includes(f)) return true;
+  }
+  return false;
+}
+
+/* ------------------------------------------------------------------ *
+ * 8. THE ONE-RUN-PER-SLOT RULE  (§7 Q12)
+ * ------------------------------------------------------------------ */
+
+/**
+ * A SLOT is (template, business date, target, shift) — the
+ * uq_fssai_runs_open index key MINUS recorded_by.
+ *
+ * WHY THE ROUTE OWNS THIS AND THE SCHEMA CANNOT. uq_fssai_runs_open ends in
+ * recorded_by, so the DATABASE only guarantees one open run per slot PER
+ * PERSON. Measured on a fixture during P1: two staff can open the same slot
+ * concurrently, and three SUBMITTED runs accumulated on one slot. Two people
+ * filling in the same hygiene checklist for the same shift leaves two
+ * contradictory records of one round, which is precisely what a compliance
+ * file must not contain.
+ *
+ * THE RULE CHOSEN, AND WHY (the four options were weighed in the P2 map):
+ *   · ONE open run per slot, whoever opened it.
+ *   · The same person re-opening it RESUMES — never a duplicate. (HRMS
+ *     api/hr/tests/route.ts:383-392, verbatim in spirit.)
+ *   · A DIFFERENT person is REFUSED with a plain 409 that names who has it
+ *     open and how far they have got — never a silent second run, and never a
+ *     raw SQLITE_CONSTRAINT, which reads to staff as a crash.
+ *   · Once the slot holds a SUBMITTED or VERIFIED run it is closed: a second
+ *     run for the same slot is refused. This is the cap uq_fssai_runs_open
+ *     cannot express, because it is partial on status='in_progress'.
+ *   · A REJECTED or VOID prior run does NOT close the slot — a check sent
+ *     back must be redoable, and a voided one never happened.
+ *   · Per-person checks (personal hygiene) are not an exception: they are
+ *     target_kind='person' with target_id = the person's email, so the person
+ *     is inside the slot key and the same rule yields one run each.
+ *
+ * The schema index stays as the storage backstop: if this app is ever
+ * clustered, SQLITE_CONSTRAINT still fires and the route maps it to the same
+ * 409. Changing the index itself is a P11 decision for the owner, not a P2
+ * schema change.
+ */
+export interface FssaiRunSlot {
+  template_id: string;
+  business_date: string;
+  target_id: string;
+  shift: string;
+}
+
+export function fssaiSlotKey(slot: FssaiRunSlot): string {
+  return [slot.template_id, slot.business_date, slot.target_id || '', slot.shift || ''].join('');
+}
+
+/** The minimum a decision needs to know about a run already in the slot. */
+export interface FssaiSlotRunRow {
+  id: string;
+  status: string;
+  recorded_by: string;
+  recorded_name?: string;
+  started_at?: string;
+  submitted_at?: string;
+  answered_count?: number;
+  total_count?: number;
+}
+
+export type FssaiSlotDecision =
+  | { action: 'resume';  run_id: string }
+  | { action: 'create' }
+  | { action: 'refuse';  code: 'slot_open_elsewhere' | 'slot_already_recorded'; message: string; run_id: string };
+
+/**
+ * THE shared predicate. The "can I start this?" query and the POST route both
+ * call it, so the button and the refusal can never disagree.
+ *
+ * @param openRun     the in_progress run in this slot, or null
+ * @param decidedRun  a submitted/verified run in this slot, or null
+ */
+export function decideFssaiSlot(params: {
+  meEmail: string;
+  openRun: FssaiSlotRunRow | null;
+  decidedRun: FssaiSlotRunRow | null;
+}): FssaiSlotDecision {
+  const me = String(params.meEmail || '').trim().toLowerCase();
+  const open = params.openRun;
+  if (open) {
+    if (String(open.recorded_by || '').trim().toLowerCase() === me) {
+      return { action: 'resume', run_id: open.id };
+    }
+    const who = open.recorded_name || open.recorded_by || 'Someone';
+    const progress =
+      open.total_count && open.total_count > 0
+        ? ` ${open.answered_count ?? 0} of ${open.total_count} answered.`
+        : '';
+    return {
+      action: 'refuse',
+      code: 'slot_open_elsewhere',
+      run_id: open.id,
+      message:
+        `${who} already has this check open.${progress} ` +
+        `Two people filling in the same check for the same shift leaves two records of one round, so only one can be open at a time.`,
+    };
+  }
+  const decided = params.decidedRun;
+  if (decided) {
+    return {
+      action: 'refuse',
+      code: 'slot_already_recorded',
+      run_id: decided.id,
+      message:
+        `This check has already been recorded for this date and shift` +
+        `${decided.recorded_name || decided.recorded_by ? ` by ${decided.recorded_name || decided.recorded_by}` : ''}. ` +
+        `Open that record instead — a second one would contradict it.`,
+    };
+  }
+  return { action: 'create' };
+}
+
+/* ------------------------------------------------------------------ *
+ * 9. THE PASS / FAIL EVALUATOR
+ * ------------------------------------------------------------------ */
+
+/**
+ * The rule ACTUALLY APPLIED to one answer. These are the values the runner
+ * freezes onto fssai_responses (min_used / max_used / expected_used), which
+ * is what makes a submitted record self-describing and independent of the
+ * live question row.
+ */
+export interface FssaiQuestionRule {
+  qtype: string;
+  is_required?: number | boolean;
+  allow_na?: number | boolean;
+  min_value?: number | null;
+  max_value?: number | null;
+  expected_value?: string | null;
+  fail_options?: string[];
+  photo_rule?: string;
+}
+
+export interface FssaiAnswerInput {
+  /** text | chosen option label | signature actor email */
+  value_text?: string | null;
+  /** numeric | temperature. null = NOT ANSWERED — never 0 (RECON §6.4). */
+  value_num?: number | null;
+  /** yes_no | pass_fail. null = not answered. */
+  value_bool?: boolean | null;
+  is_na?: boolean;
+  /** how many evidence rows the runner attached to this answer */
+  evidence_count?: number;
+}
+
+export interface FssaiVerdict {
+  answered: boolean;
+  is_fail: boolean;
+  /** why it failed, for the runner's inline hint. '' when it passed. */
+  reason: string;
+}
+
+/**
+ * Evaluate one answer against its question. PURE: the caller freezes the
+ * result onto fssai_responses.is_fail and NEVER recomputes it on read — the
+ * pass rule may legitimately change with a later template version, and
+ * recomputing would rewrite history (risk R3).
+ *
+ * A blank numeric or temperature answer is NOT zero. Number('') === 0 stored
+ * 793 phantom "we have zero" counts in the closing-stock module; here an
+ * unanswered reading is value_num === null and `answered` is false.
+ */
+export function evaluateFssaiAnswer(q: FssaiQuestionRule, a: FssaiAnswerInput): FssaiVerdict {
+  const meta = qtypeMeta(q.qtype);
+  if (!meta) {
+    // R1: an unknown type must fail loudly, never silently pass.
+    return { answered: false, is_fail: true, reason: `Unknown question type "${q.qtype}".` };
+  }
+  const required = q.is_required === undefined ? true : !!Number(q.is_required);
+
+  if (a.is_na) {
+    const allowNa = q.allow_na === undefined ? true : !!Number(q.allow_na);
+    return allowNa
+      ? { answered: true, is_fail: false, reason: '' }
+      : { answered: true, is_fail: true, reason: 'This question cannot be marked not-applicable.' };
+  }
+
+  switch (meta.key) {
+    case 'yes_no':
+    case 'pass_fail': {
+      if (a.value_bool === null || a.value_bool === undefined) {
+        return { answered: false, is_fail: required, reason: required ? 'Not answered.' : '' };
+      }
+      const expectedRaw = String(q.expected_value || '').trim().toLowerCase();
+      const expectTrue = expectedRaw === '' ? true : expectedRaw === 'yes' || expectedRaw === 'pass';
+      const ok = a.value_bool === expectTrue;
+      return { answered: true, is_fail: !ok, reason: ok ? '' : `Expected ${expectedRaw || (meta.key === 'yes_no' ? 'yes' : 'pass')}.` };
+    }
+    case 'numeric':
+    case 'temperature': {
+      const v = a.value_num;
+      if (v === null || v === undefined || !Number.isFinite(v)) {
+        return { answered: false, is_fail: required, reason: required ? 'No reading recorded.' : '' };
+      }
+      const mn = q.min_value ?? null;
+      const mx = q.max_value ?? null;
+      if (mn !== null && v < mn) return { answered: true, is_fail: true, reason: `Below the acceptable minimum of ${mn}.` };
+      if (mx !== null && v > mx) return { answered: true, is_fail: true, reason: `Above the acceptable maximum of ${mx}.` };
+      return { answered: true, is_fail: false, reason: '' };
+    }
+    case 'multiple_choice': {
+      const chosen = String(a.value_text || '').trim();
+      if (!chosen) return { answered: false, is_fail: required, reason: required ? 'Not answered.' : '' };
+      const fails = Array.isArray(q.fail_options) ? q.fail_options : [];
+      const bad = fails.includes(chosen);
+      return { answered: true, is_fail: bad, reason: bad ? `"${chosen}" is recorded as a fail.` : '' };
+    }
+    case 'text':
+    case 'signature': {
+      const t = String(a.value_text || '').trim();
+      if (!t) return { answered: false, is_fail: required, reason: required ? 'Not answered.' : '' };
+      // Words never fail on their own — a text answer is a record, not a test.
+      return { answered: true, is_fail: false, reason: '' };
+    }
+    case 'photo': {
+      const n = a.evidence_count ?? 0;
+      if (n <= 0) return { answered: false, is_fail: required, reason: required ? 'No photograph attached.' : '' };
+      return { answered: true, is_fail: false, reason: '' };
+    }
+  }
+}
+
+/** One frozen response row, as the summariser reads it. */
+export interface FssaiResponseFacts { is_fail: number | boolean; is_na: number | boolean; answered: boolean }
+
+export interface FssaiRunSummary {
+  total_count: number;
+  answered_count: number;
+  fail_count: number;
+  na_count: number;
+  pass_pct: number;
+  outcome: 'pass' | 'fail';
+}
+
+/**
+ * The run's frozen counters. Written once at submit onto fssai_runs and never
+ * recomputed on read.
+ *
+ * pass_pct is measured over the questions that were actually judged — answered
+ * and not marked not-applicable — because a checklist with three N/A questions
+ * out of ten is not 70% compliant, it is 100% of what applied. A run with
+ * nothing judgeable scores 0 and fails: an empty sheet is not a passed check.
+ * criticalFailed short-circuits the threshold entirely (one critical failure
+ * fails the whole run).
+ */
+export function summariseFssaiRun(
+  rows: readonly FssaiResponseFacts[],
+  passThresholdPct: number,
+  criticalFailed = false,
+): FssaiRunSummary {
+  const total = rows.length;
+  const na = rows.filter((r) => !!Number(r.is_na)).length;
+  const answered = rows.filter((r) => r.answered).length;
+  const fails = rows.filter((r) => !!Number(r.is_fail)).length;
+  const judged = rows.filter((r) => r.answered && !Number(r.is_na)).length;
+  const passed = judged - rows.filter((r) => r.answered && !Number(r.is_na) && Number(r.is_fail)).length;
+  const pct = judged > 0 ? Math.round((passed / judged) * 1000) / 10 : 0;
+  const threshold = Number.isFinite(passThresholdPct) ? passThresholdPct : 100;
+  const outcome: 'pass' | 'fail' = criticalFailed || judged === 0 || pct < threshold ? 'fail' : 'pass';
+  return {
+    total_count: total,
+    answered_count: answered,
+    fail_count: fails,
+    na_count: na,
+    pass_pct: pct,
+    outcome,
+  };
+}
+
+/* ------------------------------------------------------------------ *
+ * 10. SMALL SHARED HELPERS
+ * ------------------------------------------------------------------ */
+
+/**
+ * Today in IST as YYYY-MM-DD — the business date a run belongs to.
+ * Built from the UTC instant plus 5.5h so the answer does not depend on the
+ * host timezone (a server in UTC and a phone in IST must agree on the date a
+ * closing check belongs to).
+ */
+export function fssaiToday(now: Date = new Date()): string {
+  const istDate = new Date(now.getTime() + 5.5 * 3600_000);
+  const y = istDate.getUTCFullYear();
+  const m = String(istDate.getUTCMonth() + 1).padStart(2, '0');
+  const d = String(istDate.getUTCDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
+/** YYYY-MM-DD shape test. Rejects '', '2026-13-40' and anything else. */
+export function isISODate(v: string | null | undefined): boolean {
+  const s = String(v || '');
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
+  const [y, m, d] = s.split('-').map(Number);
+  if (m < 1 || m > 12 || d < 1 || d > 31) return false;
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  return dt.getUTCFullYear() === y && dt.getUTCMonth() === m - 1 && dt.getUTCDate() === d;
+}
+
+/** Whole days between two YYYY-MM-DD dates (b - a). NaN if either is invalid. */
+export function daysBetweenISO(a: string, b: string): number {
+  if (!isISODate(a) || !isISODate(b)) return NaN;
+  const [ay, am, ad] = a.split('-').map(Number);
+  const [by, bm, bd] = b.split('-').map(Number);
+  return Math.round((Date.UTC(by, bm - 1, bd) - Date.UTC(ay, am - 1, ad)) / 86400000);
+}
