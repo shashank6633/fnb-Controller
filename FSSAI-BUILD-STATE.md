@@ -159,7 +159,7 @@ its evidence line is filled in with real command output.
 |---|---|---|---|---|
 | P0 | Recon | owner's "inspect before coding" requirement | **DONE** | 7 agents, 0 died. `docs/fssai/RECON.md` = 4,607 lines (contract 1-961, raw lanes 962+). Read-only: worktree `git diff --stat` empty, live DB mtime unchanged. Corrected this file (no `unbuilt` flag) + 3 integration rows. 10 owner questions in §7 |
 | P1 | Foundation — schema + nav + RBAC + shells | §20, §24 | **DONE** | 11 agents (1 errored). 11 `fssai_` tables + 34 indexes + the app's FIRST boot assertion. 20 nav rows in BOTH files, 20 page.tsx. `npx tsc --noEmit` exit 0, zero output. Real snapshot: 205→216 tables, 0 removed, purchases still 2165, 215 columns match their CREATE text exactly. db.ts 9,561→10,625. Commits 0e7b9ec·b93ee61·5268b36·21aa4c2 |
-| P2 | Checklist engine — templates/sections/questions | §15 | PENDING | |
+| P2 | Checklist engine — templates/sections/questions | §15 | IN PROGRESS | fleet `wjp6m5djw` / run `wf_a5a7129a-b52`, started 2026-09-17 |
 | P3 | Mobile runner — run, evidence, signature, submit | §22 | PENDING | |
 | **RG** | **🛑 REVIEW GATE — STOP. Owner reviews P0–P3.** | — | **BLOCKING** | not approved |
 | P4 | Receiving QC · Temperature Logs · Cold Room | §2, §4, §5 | HELD | behind RG |
