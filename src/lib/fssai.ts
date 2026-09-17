@@ -625,10 +625,18 @@ export function templateEditBumpsVersion(changedFields: Iterable<string>): boole
  *     target_kind='person' with target_id = the person's email, so the person
  *     is inside the slot key and the same rule yields one run each.
  *
- * The schema index stays as the storage backstop: if this app is ever
- * clustered, SQLITE_CONSTRAINT still fires and the route maps it to the same
- * 409. Changing the index itself is a P11 decision for the owner, not a P2
- * schema change.
+ * HOW FAR THE STORAGE BACKSTOP ACTUALLY REACHES — say it plainly rather than
+ * claim more than is true. uq_fssai_runs_open catches only the SAME PERSON
+ * opening the same slot twice, because recorded_by is in its key; the route
+ * maps that SQLITE_CONSTRAINT to the same 409. The cross-person rule is
+ * enforced ONLY by the SELECT-then-INSERT below, which is atomic here because
+ * better-sqlite3 is synchronous, getDb() caches one connection, and production
+ * runs a single process (deploy/fnb-controller.service: `npm run start`,
+ * Type=simple, no cluster directive). If this app were ever clustered, two
+ * different people could race past that check and the index would NOT stop
+ * them. Dropping recorded_by from the index would close it — that is a schema
+ * change on a table that will hold audit history, so it is an owner decision
+ * for P11, not something P2 does quietly.
  */
 export interface FssaiRunSlot {
   template_id: string;
