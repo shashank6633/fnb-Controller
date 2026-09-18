@@ -159,8 +159,9 @@ its evidence line is filled in with real command output.
 |---|---|---|---|---|
 | P0 | Recon | owner's "inspect before coding" requirement | **DONE** | 7 agents, 0 died. `docs/fssai/RECON.md` = 4,607 lines (contract 1-961, raw lanes 962+). Read-only: worktree `git diff --stat` empty, live DB mtime unchanged. Corrected this file (no `unbuilt` flag) + 3 integration rows. 10 owner questions in §7 |
 | P1 | Foundation — schema + nav + RBAC + shells | §20, §24 | **DONE** | 11 agents (1 errored). 11 `fssai_` tables + 34 indexes + the app's FIRST boot assertion. 20 nav rows in BOTH files, 20 page.tsx. `npx tsc --noEmit` exit 0, zero output. Real snapshot: 205→216 tables, 0 removed, purchases still 2165, 215 columns match their CREATE text exactly. db.ts 9,561→10,625. Commits 0e7b9ec·b93ee61·5268b36·21aa4c2 |
-| P2 | Checklist engine — templates/sections/questions | §15 | IN PROGRESS | fleet `wjp6m5djw` / run `wf_a5a7129a-b52`, started 2026-09-17 |
-| P3 | Mobile runner — run, evidence, signature, submit | §22 | PENDING | |
+| P2a | Checklist engine — the API: templates/sections/questions/assignments + the run engine | §15 | **DONE** | 2 lanes + 4 adversarial probes + 1 fix round. 11 files, ~4,500 lines, commits `9a10dfd`·`5373289`·`39c9e12`·`4a6f593`·`515bda9`. **NO SCHEMA CHANGE** (`git diff c6c3f1a..HEAD` does not contain `db.ts`; zero `ALTER/CREATE TABLE/CREATE INDEX` in the diff). `npx tsc --noEmit` exit 0, zero output. `npm run build` exit 0, "✓ Compiled successfully in 33.5s", 27 FSSAI entries (7 API + 20 pages), 1 warning = the pre-existing `next.config.ts` NFT trace (present at `main`). `npm test` exit 1 at `run-tests.js` with **74 passed · 2 failed** — the identical recorded baseline; both survivors are the `kitchen`/`liquor` station sentinels, mapped in the owner's production data (HARD RULE 4 forbids changing them). The five scripts the `&&` chain never reaches all pass alone: 94 · 104 · 161 · 198 · 380 = 937. Fix round closed 6 measured defects incl. two HIGH (a recorded FAILURE erased from the verdict by a mid-run retire; a Yes/No answered with the word "yes" frozen as a failure) — 34 pure assertions + 5 HTTP repro scripts, 0 regressions, record drifted after **0 of 10** template edits. DB restored: purchases 2165, all `fssai_` tables back to their pre-run counts |
+| P2b | Checklist engine — the SCREENS: settings hub, checklist library, the builder (sections · questions · the eight types · reorder · preview) | §15 | PENDING | **NOT BUILT.** 19 of the 20 `/fssai` pages are still P1 `PhaseShell` placeholders and `src/app/fssai/settings/checklists/[id]/page.tsx` does not exist, so a checklist can be authored over the API but **not on screen**. `grep -rln "api/fssai" src/app/fssai` → one hit, and it is the comment "Deliberately NO fetch". The API contract the screens must use is in the §6 log entry for 2026-09-17/18 |
+| P3 | Mobile runner — run, evidence, signature, submit | §22 | PENDING | Not started. The run ENGINE exists (`src/app/api/fssai/runs/route.ts` — open/answer/submit/takeover/void); the phone experience, the evidence/photo write route, the signature UX and the verification queue do not |
 | **RG** | **🛑 REVIEW GATE — STOP. Owner reviews P0–P3.** | — | **BLOCKING** | not approved |
 | P4 | Receiving QC · Temperature Logs · Cold Room | §2, §4, §5 | HELD | behind RG |
 | P5 | FIFO/FEFO & Expiry · Oil Quality · Water & Ice | §3, §12, §13 | HELD | behind RG |
@@ -177,8 +178,8 @@ The owner chose **option 1 + option 4**: the scheduler runs phases unattended, *
 after P3** so he can judge the mobile checklist experience on his own phone before committing to the
 eight record modules.
 
-**RULE: when P0, P1, P2 and P3 are all `DONE`, the build STOPS.** Do not start P4. Do not "just make
-a start" on anything behind the gate. Put the module in a state he can open and try, then report and
+**RULE: when P0, P1, P2a, P2b and P3 are all `DONE`, the build STOPS.** Do not start P4. Do not "just
+make a start" on anything behind the gate. Put the module in a state he can open and try, then report and
 wait.
 
 **To pass the gate the owner must say so explicitly.** Only he can change the RG row to `APPROVED`.
@@ -277,6 +278,54 @@ top costs far more than fixing it now. He is reviewing the foundation, not the f
   **RULE, ADDED TO §1.1 IN PRACTICE: commit at the END OF EVERY LANE, not at the end of the phase.**
   This worktree is shared with other agents that run destructive git commands. Uncommitted is the
   only place git cannot protect.
+- **2026-09-18** — **P2 fix round. Six measured defects closed, two of them HIGH, all on the run
+  engine; each one's own repro was re-run and the output pasted into the lane report.** Commit
+  `515bda9`, no schema change, `tsc` exit 0, `npm run build` exit 0, `npm test` unchanged at
+  74 · 2, 0 regressions across 60+ re-checks.
+  1. **A recorded FAILURE was erased from the verdict by a mid-run retire** — submit judged
+     `is_active = 1` only, while the record printed every response row. Measured before: staff answer
+     "Floor condition = Soiled" (frozen `is_fail=1`), an admin presses the ordinary delete on that
+     question, staff submit → `{fail_count:0, pass_pct:100, outcome:'pass'}` on a sheet that still
+     prints the failing line. After: `{fail_count:1, pass_pct:66.7, outcome:'fail'}`, and a retired
+     **critical** failure still fails the whole run. Submit now judges the live sheet PLUS every
+     question this round already answered, and says so (`counted_retired_questions`). Staff may
+     CORRECT such an answer; a NEW answer to a switched-off question is still refused (409).
+  2. **A Yes/No answered with the WORD "yes" was frozen as a compliance failure** (only `value_bool`
+     was read; an absent boolean means "not answered", which for a required question means a fail).
+     The words now live in the shared predicate: `'yes'` → `value_bool=1, is_fail=0`, and `"maybe"`
+     is refused **by name** (400) rather than silently counted as a fail.
+  3. **`photo_rule` / `note_rule` — the admin's "required evidence" — were never evaluated.** A
+     question demanding a photo AND a note answered, submitted and PASSED with neither. They are now
+     evaluated: such an answer is INCOMPLETE (never silently turned into a fail), and the submit
+     refusal names what it is waiting for. NOTE for P3: "Photo: Always" can only be satisfied once
+     P3 ships the evidence-write route — proved here by inserting the `fssai_evidence` row directly,
+     after which submit succeeded.
+  4. **The checklist NAME and CODE on a finished record were read live**, so renaming a checklist
+     re-labelled every record ever taken under it — and a rename does not bump the version, so
+     nothing said so. The sheet as it was asked (title, code, versions, and EVERY question including
+     the ones left blank) is now frozen into `fssai_audit_log` at submit, `action='snapshot'`, and
+     the record renders from it. **No schema change** — see §7 Q15 for the columns this would
+     otherwise have needed.
+  5. **A round answered across several versions claimed one version.** The record now carries
+     `template_version_at_open` and `template_version_at_submit`.
+  6. **Two disagreeing definitions of "answered"** (the route's own vs the evaluator's) — one
+     type-aware predicate now, `fssaiResponseAnswered`, used by the answer count and the submit gate.
+  Also landed: CSRF re-checked inside the one FSSAI route with a caller-controlled path segment
+  (`POST /api/fssai/templates/print-abc` reached the handler with no token, because `proxy.ts:135`
+  treats any `/print` path as public before routing — the fix is in FSSAI's own file and changes
+  nothing shared); a restaurant-wide record no longer refuses a colleague with "belongs to another
+  department" (a run with no department is readable by any signed-in user; a run that DOES belong to
+  another department is still 403); a recorded FAILURE is refused in its own words; option lists
+  reject anything that is not text (`[object Object]` can no longer become a choosable answer);
+  `config_warnings` say out loud when a setup means ONE person files for the whole restaurant.
+  **THE CONTRACT FOR P2b/P3, in one place:** every FSSAI mutation must go through `api()`/`apiJson()`
+  (CSRF). `GET /api/fssai/masters` feeds every dropdown. A finished run returns
+  `template` (as recorded) + `template_now` + `template_renamed_since` + `sheet_as_asked` +
+  `template_version_at_open`/`_at_submit`; a history list returns `template_name_at_record` (lead
+  with it, never with `template_name`). An answer returns `verdict.needs_photo` / `needs_note` and
+  `display_value` (`decimals` is display only — rounding before the range test would let 5.4 °C pass
+  a 0–5 rule). A 409 on open carries `code`, `run_id` and `can_view` — do not offer "View" when
+  `can_view` is false.
 - **2026-09-17** — P1 fix round. `npm test` went `71 passed · 3 failed` → `74 passed · 2 failed`; the
   two survivors are **not code and not FSSAI's** — they assert that the `kitchen` and `liquor`
   station sentinels resolve to NO department, and both are mapped in the owner's production data
@@ -315,6 +364,72 @@ later phase cite an earlier phase's default as precedent.
 | **Q12** | `uq_fssai_runs_open` ends in `recorded_by`, so the schema allows **two staff to open the same checklist slot at once**, and nothing caps how many submitted runs one slot accumulates (proved: 3 submitted runs on one slot). The foundation cannot fix this — it needs a route-level rule in P2/P3. | Add the one-run-per-slot rule in P2. Flagging it now so no later phase inherits the wrong belief. | — |
 | **Q13** | `fssai_evidence.data_uri` stores photos **in-row as TEXT**. At the ~250 KB cap and 4 photos/day that is roughly **365 MB/year** inside a database file that is 34 MB today. Matches every existing image store in the app, so it is consistent — but nothing enforces a retention window because none has been decided. | Decide in P3: in-row with a retention window, or a separate BLOB table. | — |
 | Q11 | The shells print gaps measured in your OWN records. Should they, and who should see them? | Keep the facts, drop the inspector framing (**done** — see below); gate the "Worth knowing now" panel to management in P2 | — |
+| **Q14** | **A check FAILED, the problem was fixed, and the same shift needs re-checking.** The slot is locked by the failed record, so the only path today is a manager VOIDING a true observation and filing a fresh one — and the file then reads "voided fail + fresh pass" instead of "failed, corrected, re-checked". Raised by the P2 probes; it must be settled **before P8 seeds the temperature checklists**. | Four options in §7 detail below. **Recommend (c): the fix is a CORRECTIVE ACTION against the failed record (P7), verified there — no second record of the same round** — with (b)'s linked re-check where a physical re-measurement is genuinely needed. Today's behaviour (a) is unchanged and the refusal now says the record FAILED and that a manager may void it if it was a mistake. | — |
+| **Q15** | **Should a record freeze the checklist's TITLE in a column?** The fix round froze the title, the code, both versions and the whole question set into a `fssai_audit_log` row (`action='snapshot'`) at submit — deliberately, because the alternative is a migration on a table that will hold audit history. | **Recommend (a): keep the snapshot** until P9 measures a real report; then consider (c) — columns for the two hot fields, snapshot for the sheet. Options in detail below. | — |
+| **Q16** | **A checklist that is run "against nothing in particular", every shift, means ONE person files it for the whole restaurant** — whoever starts it first. Correct for one round per restaurant, wrong for "everyone does this". | **Recommend (a): warn, do not refuse** — built: `config_warnings` is returned on create, edit and publish and must be shown on the builder screen. Options in detail below. | — |
+
+### Q14 — a failed check, a repair, and the re-check that has nowhere to go
+
+**What happens today, measured.** A slot (checklist · date · target · shift) is closed once it holds
+a submitted or verified record. So: the cold room reads 9 °C at closing → the record is submitted and
+FAILS → the engineer fixes it → the 11 pm re-check is refused, `409 slot_already_recorded`, for
+everyone including a manager. The only exit is `void` with a reason, which reopens the slot.
+
+**Why that is not good enough.** Voiding is for a record entered by mistake. Using it to make room
+for a better number is exactly the habit a compliance file must not teach, and the file ends up
+showing a voided failure beside a fresh pass rather than the true story: *failed, corrected,
+re-checked*. The design anticipated a `rejected` status that reopens the slot, but nothing sets it
+(the verification queue is P3/P7's), so `void` is the only reopening path in the build today.
+
+1. **Leave it as it is.** No work. The refusal now at least says the record FAILED and that a manager
+   may void it if it was entered by mistake. The file stays misleading in the one case that matters.
+2. **A linked RE-CHECK run.** A second run in the same slot, marked as a re-check of the first, both
+   records standing. Honest and simple to read. Needs a link between the two runs — a column, or the
+   audit row — and a rule about which one the dashboard counts.
+3. **A CORRECTIVE ACTION against the failed record (P7), verified there.** No second record of the
+   same round: the failure stands, the fix and its verification hang off it. This is how an FSSAI
+   audit trail normally reads, it is what `fssai_corrective_actions` was created for, and it needs no
+   change to the slot rule.
+4. **Build the `rejected` status.** A manager sends a record back and the slot reopens for a redo.
+   Right for "this record is wrong", not for "the fridge was mended".
+
+**Recommendation: 3, with 2 where a physical re-measurement is genuinely needed.** Whichever you
+choose, it must be settled before P8 seeds the temperature checklists — that is the module where a
+failed reading followed by a repair is an everyday event.
+
+### Q15 — where a record's own title should live
+
+The fix round froze the sheet as it was asked — title, code, `version_at_open`,
+`version_at_submit`, pass mark, and every question including the ones left blank — into one
+`fssai_audit_log` row per record (`action='snapshot'`, `field='record'`), written inside the submit
+transaction. The read path renders a finished record from it.
+
+1. **Keep the snapshot.** No migration, one row per record, and a record whose snapshot is missing or
+   unreadable still renders (it falls back to the live name and says `template_name_source:'live'`).
+   Reads cost one extra row; a history list reads the title with `json_extract`.
+2. **Add frozen `template_name` / `template_code` columns to `fssai_runs`** (and a per-response
+   `template_version`). Cheaper, more obvious reads — at the cost of a migration on a table that will
+   hold audit history, in a codebase whose `initializeSchema()` swallows errors (HARD RULE 7).
+3. **Both:** columns for the two fields every screen shows, the snapshot for the full question set.
+
+**Recommendation: 1 now; revisit at P9** when a real report says whether the extra row hurts.
+
+### Q16 — "against nothing in particular", every shift
+
+`target_kind='none'` puts nothing in the slot key, so a per-shift checklist configured that way is
+filed ONCE per shift for the whole restaurant, by whoever starts it first. For a single closing round
+that is exactly right. For personal hygiene (one record per person) or cold rooms (one per unit) it
+is wrong, and nothing in the authoring API used to say so.
+
+1. **Warn, do not refuse — BUILT.** `config_warnings` is returned on create, edit and publish, in
+   words: *"…ONE person files it for the whole restaurant each time it is due…"*. The builder screen
+   (P2b) must render it. Nothing is decided behind his back.
+2. **Refuse to publish** a `per_shift`/`daily` checklist with `target_kind='none'`. Safe, and wrong
+   the moment he genuinely wants one restaurant-wide round.
+3. **Auto-scope to the person** (one record each). Convenient, and a silent change of meaning.
+4. **Auto-scope to the department.**
+
+**Recommendation: 1.** Revisit only if a seeded checklist in P8 trips over it.
 
 ### Q11 — the module tells the truth about the restaurant, inside the restaurant's app
 
