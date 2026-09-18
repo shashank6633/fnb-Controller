@@ -64,9 +64,20 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
     if (from) { where.push("date(l.created_at) >= date(?)"); args.push(from); }
     if (to)   { where.push("date(l.created_at) <= date(?)"); args.push(to); }
 
+    // THE MOVEMENT RECORD (owner's eight fields, 2026-09-10) — ADDITIVE.
+    // The original SELECT list is unchanged, so every deployed consumer of this
+    // route reads exactly what it read before. The movement columns are
+    // APPENDED, which is what lets the Liquor Store's ledger tab show source,
+    // destination, unit and business date in place instead of sending a store
+    // person to the cross-rail register at /inventory/movements for them.
+    // Pre-change rows return '' / 0 here, which the UI must render as "not
+    // recorded" — those facts were never captured and are not guessed.
     const rows = db.prepare(`
       SELECT l.id, l.txn_type, l.quantity, l.unit_cost, l.batch_no, l.supplier,
              l.vendor_id, l.expiry_date, l.ref, l.notes, l.created_by, l.created_at,
+             l.uom, l.purchase_uom, l.pack_size AS movement_pack_size,
+             l.src_kind, l.src_id, l.src_name, l.dst_kind, l.dst_id, l.dst_name,
+             l.txn_date, l.recorded_at,
              rm.name AS material_name, rm.unit, rm.purchase_unit, rm.pack_size, rm.case_size
       FROM store_stock_ledger l
       JOIN raw_materials rm ON rm.id = l.material_id
@@ -123,6 +134,21 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
         purchase_unit: c.purchase_unit,
         pack_size: c.pack_size,
         case_size: c.case_size,
+        // MOVEMENT-RECORD KEYS ON THE SYNTHETIC ROW. A closing count is a
+        // REGISTER entry, not a movement — saving one posts no ledger row and
+        // moves no stock — so it has no source and no destination, and the
+        // keys are present-but-blank rather than absent. Absent keys would make
+        // a consumer read `undefined` on some rows and '' on others for the
+        // same field. The three that ARE true are filled: the count's own unit
+        // basis, its business date, and the person who counted (already
+        // carried above as created_by).
+        uom: c.unit,
+        purchase_uom: c.purchase_unit,
+        movement_pack_size: c.pack_size,
+        src_kind: '', src_id: '', src_name: '',
+        dst_kind: '', dst_id: '', dst_name: '',
+        txn_date: c.date,
+        recorded_at: c.created_at,
       }));
 
       // Merge, newest first ('YYYY-MM-DD HH:MM:SS' string compare), re-limit.

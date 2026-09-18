@@ -190,6 +190,18 @@ export const PAGE_CATALOG: PageSection[] = [
       // (system stock / variance) stays admin-only server-side.
       { path: '/inventory/closing-sheet', label: 'Department Closing Sheet' },
       { path: '/inventory/transfers', label: 'Store Transfers' },
+      // THE MOVEMENT REGISTER (owner's eight fields, 2026-09-10). Every stock
+      // movement on every rail, filterable by store / department / type / date,
+      // with CSV. Deliberately NOT mgmtOnly: it is an operational record a store
+      // manager and an HOD have to be able to read — who moved what, where, in
+      // what unit — and it carries no rupee figure for them (the API returns
+      // unit_cost as null to anyone outside isManagement, and scopes stores by
+      // userStoreAccess and departments by allowedDeptIds). As everywhere on
+      // this list, the flag is NOT the security boundary: the route behind it
+      // refuses anyone who is not admin / manager / store-manager / HOD with its
+      // own 403. Keep in step with src/components/Sidebar.tsx, which carries its
+      // own nav list ([[project_fnb_sidebar_catalog_drift]]).
+      { path: '/inventory/movements', label: 'Stock Movements' },
       { path: '/inventory/department-stock', label: 'Department Stock' },
       { path: '/inventory/reconciliation', label: 'Sales vs Consumption' },
       { path: '/store-dashboard',     label: 'Store Dashboard — Low Stock' },

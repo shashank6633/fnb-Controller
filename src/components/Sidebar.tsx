@@ -35,6 +35,7 @@ import {
   Boxes,
   Layers,
   ArrowLeftRight,
+  ArrowRightLeft,
   Warehouse,
   Database,
   Scissors,
@@ -202,6 +203,13 @@ const navTree: NavEntry[] = [
       // today's count instead of reading history.
       { kind: "link", label: "Closing History & Compare", href: "/inventory/closing-history", icon: History },
       { kind: "link", label: "Store Transfers",    href: "/inventory/transfers", icon: ArrowLeftRight },
+      // Sits under Store Transfers because it is the same subject one level up:
+      // a transfer is ONE kind of movement, this is the register of ALL of them
+      // across the store, department and central rails. MUST stay in step with
+      // the /inventory/movements entry in src/lib/page-catalog.ts — the catalog
+      // gates a page, this list is what makes it reachable, and a page in only
+      // one of the two is either invisible or ungated.
+      { kind: "link", label: "Stock Movements",    href: "/inventory/movements", icon: ArrowRightLeft },
       { kind: "link", label: "Department Stock",   href: "/inventory/department-stock", icon: Warehouse },
       { kind: "link", label: "Sales vs Consumption", href: "/inventory/reconciliation", icon: Scale },
       { kind: "link", label: "Low Stock — Buy List", href: "/store-dashboard",  icon: AlertTriangle },
