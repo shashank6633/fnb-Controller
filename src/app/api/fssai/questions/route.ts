@@ -327,14 +327,26 @@ export async function DELETE(request: Request) {
       if (!Number(existing.is_active)) {
         return Response.json({ error: 'That question is already switched off.' }, { status: 409 });
       }
+      /* SWITCHING A QUESTION OFF WHILE SOMEONE IS STANDING IN THE KITCHEN
+       * HOLDING IT. An answer already given on an OPEN round still counts
+       * towards that round's verdict (see the submit path — this is the defect
+       * where a recorded FAILURE vanished under a PASS stamp). So the retire is
+       * allowed — a member of staff's half-finished round must never be able to
+       * freeze the owner's configuration — but it is reported, with the count,
+       * rather than happening quietly. */
+      const openWithAnswer = (db.prepare(
+        `SELECT COUNT(*) AS n FROM fssai_responses r
+            JOIN fssai_runs u ON u.id = r.run_id
+          WHERE r.question_id = ? AND u.status = 'in_progress'`,
+      ).get(id) as any).n as number;
       const retire = db.transaction(() => {
         db.prepare(`UPDATE fssai_questions SET is_active=0, updated_at=datetime('now') WHERE id=?`).run(id);
         const version = bumpFssaiTemplateVersion(db, existing.template_id);
         fssaiAudit(db, {
           entity_table: 'fssai_questions', entity_id: id, action: 'update', field: 'is_active',
           before: { is_active: 1, prompt: existing.prompt },
-          after: { is_active: 0, answered_before: answers },
-          reason: `Question has ${answers} recorded answer${answers === 1 ? '' : 's'} — retired, not deleted (owner §19). Checklist version ${tpl.version} → ${version}`,
+          after: { is_active: 0, answered_before: answers, answered_on_open_runs: openWithAnswer },
+          reason: `Question has ${answers} recorded answer${answers === 1 ? '' : 's'}${openWithAnswer ? `, ${openWithAnswer} on a check still open` : ''} — retired, not deleted (owner §19). Checklist version ${tpl.version} → ${version}`,
           actor: { email: me.email, name: me.name }, outlet_id: tpl.outlet_id,
         });
         return version;
@@ -342,7 +354,11 @@ export async function DELETE(request: Request) {
       const version = retire();
       return Response.json({
         ok: true, retired: true, answered_count: answers,
-        message: `"${existing.prompt}" has already been answered ${answers} time${answers === 1 ? '' : 's'}, so it was switched off rather than deleted. Those records still show it exactly as it was asked.`,
+        open_runs_with_answer: openWithAnswer,
+        message: `"${existing.prompt}" has already been answered ${answers} time${answers === 1 ? '' : 's'}, so it was switched off rather than deleted. Those records still show it exactly as it was asked.`
+          + (openWithAnswer
+            ? ` ${openWithAnswer} check${openWithAnswer === 1 ? ' is' : 's are'} still open with an answer to it — ${openWithAnswer === 1 ? 'that answer' : 'those answers'} will still count when ${openWithAnswer === 1 ? 'it is' : 'they are'} submitted.`
+            : ''),
         template: loadFssaiTemplate(db, existing.template_id, { includeRetired: true }),
         version,
       });

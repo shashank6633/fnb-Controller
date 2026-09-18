@@ -401,18 +401,108 @@ function bool01(v: unknown, dflt: 0 | 1): 0 | 1 {
   return v ? 1 : 0;
 }
 
-/** Trim, drop blanks, drop duplicates, keep order. */
+/**
+ * Trim, drop blanks, drop duplicates, keep order.
+ *
+ * ONLY text and numbers are answers. An object used to be coerced with
+ * String(), which stored the literal label "[object Object]" and offered it to
+ * staff as a choosable answer on a compliance checklist (measured: POST
+ * options:[{a:1},'Fine'] → options_json ["[object Object]","Fine"]). Anything
+ * that is not a string or a finite number is DROPPED here and reported by
+ * badFssaiOptionValue() below, so the admin gets a sentence instead of a
+ * nonsense answer.
+ */
 export function cleanFssaiOptions(v: unknown): string[] {
   if (!Array.isArray(v)) return [];
   const out: string[] = [];
   const seen = new Set<string>();
   for (const raw of v) {
-    const s = String(raw ?? '').trim();
+    if (!isUsableOptionValue(raw)) continue;
+    const s = String(raw).trim();
     if (!s || seen.has(s)) continue;
     seen.add(s);
     out.push(s);
   }
   return out;
+}
+
+function isUsableOptionValue(raw: unknown): boolean {
+  if (typeof raw === 'string') return true;
+  if (typeof raw === 'number') return Number.isFinite(raw);
+  return false;
+}
+
+/** The first element of an options list that is not text or a number, if any. */
+export function badFssaiOptionValue(v: unknown): { index: number; kind: string } | null {
+  if (!Array.isArray(v)) return null;
+  for (let i = 0; i < v.length; i++) {
+    const raw = v[i];
+    if (raw === null || raw === undefined || raw === '') continue;   // blanks are dropped, not an error
+    if (!isUsableOptionValue(raw)) {
+      return { index: i, kind: Array.isArray(raw) ? 'a list' : typeof raw === 'object' ? 'a block of data' : typeof raw };
+    }
+  }
+  return null;
+}
+
+/* ------------------------------------------------------------------ *
+ * 6b. THE TWO-BUTTON ANSWER, IN WORDS
+ * ------------------------------------------------------------------ */
+
+/**
+ * WHAT COUNTS AS "yes" / "no" WHEN THE ANSWER ARRIVES AS TEXT.
+ *
+ * MEASURED DEFECT (P2 adversarial probe). A Yes/No question answered
+ * `value_text:'yes'` was recorded as a compliance FAILURE — HTTP 200, is_fail=1
+ * frozen onto the response — because the evaluator read only value_bool and an
+ * absent boolean means "not answered", which for a required question means a
+ * fail. The frozen record then read "Door seal intact? = yes" next to a FAIL
+ * verdict, which is what an inspector would have been shown.
+ *
+ * So the words live HERE, in the shared predicate, and both the evaluator and
+ * the run route use them: a client that sends the word and a client that sends
+ * the boolean must reach the same verdict. Anything outside these two lists is
+ * NOT guessed at — it is refused by name (see evaluateFssaiAnswer and the
+ * answer route), because silently treating "maybe" as a fail is the bug this
+ * exists to prevent.
+ */
+const FSSAI_YES_WORDS: readonly string[] = ['yes', 'y', 'true', '1', 'pass', 'passed', 'ok', 'okay'];
+const FSSAI_NO_WORDS: readonly string[] = ['no', 'n', 'false', '0', 'fail', 'failed', 'not ok'];
+
+/** true / false for a recognised word, null for blank or anything unrecognised. */
+export function fssaiBoolFromText(v: unknown): boolean | null {
+  const s = String(v ?? '').trim().toLowerCase();
+  if (!s) return null;
+  if (FSSAI_YES_WORDS.includes(s)) return true;
+  if (FSSAI_NO_WORDS.includes(s)) return false;
+  return null;
+}
+
+/** Is this a two-button question (its answer lives in value_bool)? */
+export function isFssaiBoolQType(qtype: string | null | undefined): boolean {
+  const meta = qtypeMeta(qtype);
+  return !!meta && meta.value === 'bool';
+}
+
+/** The two words this particular question expects, for an error message. */
+export function fssaiBoolWordsFor(qtype: string | null | undefined): string {
+  return qtype === 'pass_fail' ? 'pass or fail' : 'yes or no';
+}
+
+/**
+ * Round a reading to the decimal places the question declares.
+ *
+ * DISPLAY ONLY, deliberately. `decimals` is how the reading is written down and
+ * shown; it is NEVER applied before the pass/fail test, because rounding first
+ * can mask a genuinely out-of-range reading (5.4 °C on a 0–5 rule would round
+ * to 5 and PASS). So the stored value stays exactly what was measured, the
+ * verdict is taken on that value, and this is what a screen or a PDF prints.
+ */
+export function fssaiDisplayReading(value: number | null | undefined, decimals: number | null | undefined): string {
+  if (value === null || value === undefined || !Number.isFinite(Number(value))) return '';
+  const d = Number(decimals);
+  const places = Number.isFinite(d) && d >= 0 && d <= 3 ? Math.trunc(d) : 1;
+  return Number(value).toFixed(places);
 }
 
 /**
@@ -510,7 +600,22 @@ export function normalizeFssaiQuestion(
 
   /* ── multiple choice ── */
   if (meta.usesOptions) {
-    options = cleanFssaiOptions(pick('options', existing?.options ?? []));
+    const rawOptions = pick('options', existing?.options ?? []);
+    const badOption = badFssaiOptionValue(rawOptions);
+    if (badOption) {
+      return {
+        ok: false,
+        error: `Answer ${badOption.index + 1} on the list is ${badOption.kind}, not something staff could read. Type the answer as words.`,
+      };
+    }
+    const badFail = badFssaiOptionValue(pick('fail_options', existing?.fail_options ?? []));
+    if (badFail) {
+      return {
+        ok: false,
+        error: `Fail answer ${badFail.index + 1} is ${badFail.kind}, not something staff could read. Type the answer as words.`,
+      };
+    }
+    options = cleanFssaiOptions(rawOptions);
     if (options.length < 2) {
       return { ok: false, error: 'A multiple-choice question needs at least 2 answers to choose from.' };
     }
@@ -667,6 +772,10 @@ export interface FssaiSlotRunRow {
   submitted_at?: string;
   answered_count?: number;
   total_count?: number;
+  /** 'pass' | 'fail' | '' — a recorded FAILURE is refused in different words */
+  outcome?: string | null;
+  /** so the caller can say whether the blocked person may even open that record */
+  department_id?: string | null;
 }
 
 export type FssaiSlotDecision =
@@ -708,17 +817,69 @@ export function decideFssaiSlot(params: {
   }
   const decided = params.decidedRun;
   if (decided) {
+    const who = decided.recorded_name || decided.recorded_by
+      ? ` by ${decided.recorded_name || decided.recorded_by}`
+      : '';
+    // A RECORDED FAILURE is refused in different words. Telling someone to
+    // "open that record instead" when the record says the cold room failed
+    // reads as though the software has not noticed, and the honest remedy is
+    // not a second record — it is the manager's void if it was a mistake.
+    // How a genuine RE-CHECK after a repair should be filed is the owner's
+    // call: FSSAI-BUILD-STATE.md §7 Q14.
+    const failed = String(decided.outcome || '').toLowerCase() === 'fail';
     return {
       action: 'refuse',
       code: 'slot_already_recorded',
       run_id: decided.id,
-      message:
-        `This check has already been recorded for this date and shift` +
-        `${decided.recorded_name || decided.recorded_by ? ` by ${decided.recorded_name || decided.recorded_by}` : ''}. ` +
-        `Open that record instead — a second one would contradict it.`,
+      message: failed
+        ? `This check has already been recorded for this date and shift${who}, and it FAILED. ` +
+          `A second record would hide that. Open the failed record; a manager can void it if it was entered by mistake.`
+        : `This check has already been recorded for this date and shift${who}. ` +
+          `Open that record instead — a second one would contradict it.`,
     };
   }
   return { action: 'create' };
+}
+
+/* ------------------------------------------------------------------ *
+ * 8b. CONFIGURATION WARNINGS — said out loud, never enforced silently
+ * ------------------------------------------------------------------ */
+
+/**
+ * Things about a checklist's SETUP that will surprise the owner once staff run
+ * it. These are warnings, not refusals: the configuration is legitimate, it
+ * simply behaves in a way the builder screen must say out loud (the same
+ * predicate serves the API response and the screen, so they cannot disagree).
+ *
+ * MEASURED (P2 adversarial probe): a per-shift template with
+ * target_kind='none' collapses its slot key to (checklist, date, shift), so
+ * exactly ONE person in the restaurant can file that check per shift, and the
+ * second person is refused by a record that may not even be theirs to open.
+ * That is correct for "one round for the whole restaurant" and wrong for
+ * "everyone does this" — only the owner knows which he meant, so it is said,
+ * not decided.
+ */
+export function fssaiConfigWarnings(t: {
+  target_kind?: string | null;
+  frequency?: string | null;
+  department_id?: string | null;
+  requires_verification?: number | boolean | null;
+}): string[] {
+  const out: string[] = [];
+  const kind = String(t.target_kind || 'none');
+  const freq = String(t.frequency || '');
+  if (kind === 'none' && (freq === 'per_shift' || freq === 'hourly' || freq === 'twice_daily' || freq === 'daily')) {
+    out.push(
+      'This checklist is not run against anything in particular, so ONE person files it for the whole restaurant each time it is due — ' +
+      'whoever starts it first. If every member of staff (or every cold room) should file their own, choose what the check is run against: a person, a piece of equipment or an area.',
+    );
+  }
+  if (kind === 'none' && !String(t.department_id || '')) {
+    out.push(
+      'No department is set, so this checklist and its records belong to the whole restaurant: any signed-in member of staff can see them.',
+    );
+  }
+  return out;
 }
 
 /* ------------------------------------------------------------------ *
@@ -738,8 +899,11 @@ export interface FssaiQuestionRule {
   min_value?: number | null;
   max_value?: number | null;
   expected_value?: string | null;
+  /** the answers on the list — an answer that is not one of them is a fail */
+  options?: string[];
   fail_options?: string[];
   photo_rule?: string;
+  note_rule?: string;
 }
 
 export interface FssaiAnswerInput {
@@ -750,6 +914,8 @@ export interface FssaiAnswerInput {
   /** yes_no | pass_fail. null = not answered. */
   value_bool?: boolean | null;
   is_na?: boolean;
+  /** the words typed alongside the answer (fssai_responses.note) */
+  note?: string | null;
   /** how many evidence rows the runner attached to this answer */
   evidence_count?: number;
 }
@@ -759,6 +925,10 @@ export interface FssaiVerdict {
   is_fail: boolean;
   /** why it failed, for the runner's inline hint. '' when it passed. */
   reason: string;
+  /** the question demands a photograph that is not attached yet */
+  needs_photo?: boolean;
+  /** the question demands a written note that has not been typed yet */
+  needs_note?: boolean;
 }
 
 /**
@@ -781,21 +951,47 @@ export function evaluateFssaiAnswer(q: FssaiQuestionRule, a: FssaiAnswerInput): 
 
   if (a.is_na) {
     const allowNa = q.allow_na === undefined ? true : !!Number(q.allow_na);
+    // A question that does not apply needs no photograph and no note.
     return allowNa
       ? { answered: true, is_fail: false, reason: '' }
       : { answered: true, is_fail: true, reason: 'This question cannot be marked not-applicable.' };
   }
 
-  switch (meta.key) {
+  return withFssaiEvidenceRules(q, a, meta.key, baseVerdict(q, a, meta.key, required));
+}
+
+function baseVerdict(
+  q: FssaiQuestionRule,
+  a: FssaiAnswerInput,
+  key: FssaiQType,
+  required: boolean,
+): FssaiVerdict {
+  switch (key) {
     case 'yes_no':
     case 'pass_fail': {
-      if (a.value_bool === null || a.value_bool === undefined) {
-        return { answered: false, is_fail: required, reason: required ? 'Not answered.' : '' };
+      // The answer may arrive as the BOOLEAN or as the WORD. Both must reach
+      // the same verdict (see FSSAI_YES_WORDS — the measured defect where
+      // value_text:'yes' was frozen as a compliance failure).
+      let b: boolean | null = a.value_bool === null || a.value_bool === undefined ? null : !!a.value_bool;
+      if (b === null) {
+        b = fssaiBoolFromText(a.value_text);
+        if (b === null) {
+          const raw = String(a.value_text ?? '').trim();
+          if (raw) {
+            // Never guessed at, and never silently a fail: name it.
+            return {
+              answered: false,
+              is_fail: required,
+              reason: `"${raw}" is not an answer to this question — answer ${fssaiBoolWordsFor(key)}.`,
+            };
+          }
+          return { answered: false, is_fail: required, reason: required ? 'Not answered.' : '' };
+        }
       }
       const expectedRaw = String(q.expected_value || '').trim().toLowerCase();
       const expectTrue = expectedRaw === '' ? true : expectedRaw === 'yes' || expectedRaw === 'pass';
-      const ok = a.value_bool === expectTrue;
-      return { answered: true, is_fail: !ok, reason: ok ? '' : `Expected ${expectedRaw || (meta.key === 'yes_no' ? 'yes' : 'pass')}.` };
+      const ok = b === expectTrue;
+      return { answered: true, is_fail: !ok, reason: ok ? '' : `Expected ${expectedRaw || (key === 'yes_no' ? 'yes' : 'pass')}.` };
     }
     case 'numeric':
     case 'temperature': {
@@ -812,7 +1008,15 @@ export function evaluateFssaiAnswer(q: FssaiQuestionRule, a: FssaiAnswerInput): 
     case 'multiple_choice': {
       const chosen = String(a.value_text || '').trim();
       if (!chosen) return { answered: false, is_fail: required, reason: required ? 'Not answered.' : '' };
-      const fails = Array.isArray(q.fail_options) ? q.fail_options : [];
+      // MEMBERSHIP LIVES IN THE PREDICATE, not only in the route. An answer
+      // nobody offered used to come back is_fail=false here, so any second
+      // caller (a bulk answer, an import, a seed backfill) got a silent pass
+      // for a label that is not on the list.
+      const options = Array.isArray(q.options) ? q.options.map((o) => String(o)) : [];
+      if (options.length && !options.includes(chosen)) {
+        return { answered: true, is_fail: true, reason: `"${chosen}" is not one of the answers on the list.` };
+      }
+      const fails = Array.isArray(q.fail_options) ? q.fail_options.map((o) => String(o)) : [];
       const bad = fails.includes(chosen);
       return { answered: true, is_fail: bad, reason: bad ? `"${chosen}" is recorded as a fail.` : '' };
     }
@@ -829,6 +1033,100 @@ export function evaluateFssaiAnswer(q: FssaiQuestionRule, a: FssaiAnswerInput): 
       return { answered: true, is_fail: false, reason: '' };
     }
   }
+}
+
+/**
+ * THE ADMIN'S "REQUIRED EVIDENCE" RULE, ACTUALLY APPLIED.
+ *
+ * MEASURED DEFECT (P2 adversarial probe): photo_rule and note_rule — one of the
+ * eight things the brief says an admin must be able to set — were stored and
+ * validated but never read by anything. A question marked "Photo: Always" plus
+ * "Note: Always" was answered, submitted and PASSED with neither, so the tick
+ * box was decoration.
+ *
+ * What the rule now does: an answer that still owes a photograph or a note is
+ * NOT COMPLETE (`answered: false`), which is what the submit gate counts — so
+ * the run cannot be submitted until the evidence is there, and the person
+ * filling it in is told which answer is waiting for what. It is deliberately
+ * NOT turned into a fail: the check may be perfectly in order, the paperwork is
+ * simply unfinished, and recording a passing fridge as a failure would be a
+ * worse lie than the one this fixes. A verdict that ALREADY failed keeps its
+ * failure.
+ *
+ * WHY THIS IS CHECKED AND NOT REFUSED AT ENTRY: fssai_evidence.response_id
+ * points at the answer row, so the answer must exist BEFORE a photograph can be
+ * attached to it. Refusing the answer would make a photo question impossible to
+ * ever answer.
+ *
+ * PHASE BOUNDARY, STATED PLAINLY: P2 ships no evidence-write route (that is
+ * P3's), so today "Photo: Always" can only be satisfied by P3's runner. "Note:
+ * Always" is satisfiable now — the note travels with the answer.
+ */
+function withFssaiEvidenceRules(
+  q: FssaiQuestionRule,
+  a: FssaiAnswerInput,
+  key: FssaiQType,
+  v: FssaiVerdict,
+): FssaiVerdict {
+  if (!v.answered) return v;                       // nothing to demand evidence for yet
+  const photoRule = isEvidenceRule(q.photo_rule) ? q.photo_rule : 'never';
+  const noteRule = isEvidenceRule(q.note_rule) ? q.note_rule : 'never';
+  const photos = Number(a.evidence_count ?? 0);
+  const note = String(a.note ?? '').trim();
+  // On a `photo` question the photograph IS the answer and was already tested.
+  const needPhoto = key !== 'photo' && (photoRule === 'always' || (photoRule === 'on_fail' && v.is_fail));
+  const needNote = noteRule === 'always' || (noteRule === 'on_fail' && v.is_fail);
+  const missingPhoto = needPhoto && photos <= 0;
+  const missingNote = needNote && !note;
+  if (!missingPhoto && !missingNote) return v;
+
+  const wants: string[] = [];
+  if (missingPhoto) wants.push('a photograph');
+  if (missingNote) wants.push('a note saying what was seen');
+  return {
+    answered: false,
+    is_fail: v.is_fail,
+    reason: `${v.reason ? `${v.reason} ` : ''}This answer still needs ${wants.join(' and ')}.`,
+    ...(missingPhoto ? { needs_photo: true } : {}),
+    ...(missingNote ? { needs_note: true } : {}),
+  };
+}
+
+/**
+ * IS THERE AN ANSWER IN THIS BOX? — ONE predicate, type-aware, shared.
+ *
+ * MEASURED DEFECT (P2 adversarial probe): the run route had its own
+ * isAnswered() that counted any non-empty value_text, while the evaluator could
+ * call the same row unanswered — so a question the evaluator considered blank
+ * slipped through the "N questions still need an answer" gate. Both now read
+ * this.
+ *
+ * It answers only "is a value present", which is why it takes the FROZEN
+ * response row: the qtype on the row is the type the answer was given under,
+ * even if the live question has been changed since.
+ */
+export function fssaiResponseAnswered(
+  r: { qtype?: string | null; value_text?: unknown; value_num?: unknown; value_bool?: unknown; is_na?: unknown },
+  evidenceCount = 0,
+): boolean {
+  if (Number(r.is_na)) return true;
+  const meta = qtypeMeta(r.qtype);
+  const text = String(r.value_text ?? '').trim();
+  if (!meta) {
+    // Unknown type: any value at all counts as "something was written down".
+    // The verdict is still a loud failure (evaluateFssaiAnswer, R1).
+    return text !== '' || r.value_num !== null && r.value_num !== undefined
+      || r.value_bool !== null && r.value_bool !== undefined;
+  }
+  if (meta.value === 'bool') {
+    if (r.value_bool !== null && r.value_bool !== undefined && String(r.value_bool) !== '') return true;
+    return fssaiBoolFromText(text) !== null;
+  }
+  if (meta.value === 'num') {
+    return r.value_num !== null && r.value_num !== undefined && Number.isFinite(Number(r.value_num));
+  }
+  if (meta.value === 'evidence') return Number(evidenceCount) > 0;
+  return text !== '';
 }
 
 /** One frozen response row, as the summariser reads it. */

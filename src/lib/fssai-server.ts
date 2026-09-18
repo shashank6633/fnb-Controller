@@ -55,6 +55,60 @@ export async function requireFssaiUser(): Promise<Gate> {
 }
 
 /* ------------------------------------------------------------------ *
+ * CSRF — the belt to the proxy's braces, for dynamic-segment routes
+ * ------------------------------------------------------------------ */
+
+const CSRF_COOKIE = 'fnb_csrf';
+const CSRF_HEADER = 'x-csrf-token';
+
+/**
+ * RE-CHECK THE CSRF PAIR INSIDE THE HANDLER.
+ *
+ * MEASURED DEFECT (P2 adversarial probe). proxy.ts treats any pathname
+ * containing '/print' as PUBLIC (proxy.ts:135) and any pathname ending .json /
+ * .png / … likewise (:151), and it decides that BEFORE routing — so on the one
+ * FSSAI route with a caller-controlled path segment,
+ * `POST /api/fssai/templates/print-abc` reached the handler with NO CSRF token
+ * while `POST /api/fssai/templates` was correctly refused 403. The same bypass
+ * exists app-wide (proved on the untouched `PUT /api/returns/print-abc`), so the
+ * cause is not FSSAI's and proxy.ts is shared with three live lanes — which is
+ * exactly why the fix lives HERE, in FSSAI's own file, and changes nothing
+ * outside this module.
+ *
+ * Not exploitable today (the session cookie is httpOnly + sameSite:'lax', so a
+ * cross-site POST carries no session and the route's own getCurrentUser() 401s)
+ * — but P3 and P4 add run and evidence routes on dynamic segments that WRITE
+ * compliance records, and defence in depth is the whole point of having two
+ * checks. Idempotent with the middleware: when the proxy already checked, this
+ * re-checks the same pair and agrees.
+ *
+ * Returns a 403 Response to return immediately, or null to carry on.
+ */
+export function fssaiCsrfGuard(request: Request): Response | null {
+  const method = String(request.method || 'GET').toUpperCase();
+  if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') return null;
+  const header = request.headers.get(CSRF_HEADER);
+  const cookieHeader = request.headers.get('cookie') || '';
+  let cookieToken = '';
+  for (const part of cookieHeader.split(';')) {
+    const eq = part.indexOf('=');
+    if (eq < 0) continue;
+    if (part.slice(0, eq).trim() === CSRF_COOKIE) {
+      cookieToken = decodeURIComponent(part.slice(eq + 1).trim());
+      break;
+    }
+  }
+  if (!cookieToken || !header || cookieToken !== header) {
+    // The proxy's exact words, so a user cannot tell which of the two refused.
+    return Response.json(
+      { error: 'CSRF token missing or mismatched. Refresh the page.' },
+      { status: 403 },
+    );
+  }
+  return null;
+}
+
+/* ------------------------------------------------------------------ *
  * Audit
  * ------------------------------------------------------------------ */
 
@@ -128,6 +182,109 @@ export function fssaiAppAudit(
     after: p.after,
     note: p.note || '',
   });
+}
+
+/* ------------------------------------------------------------------ *
+ * THE RECORD SNAPSHOT — the sheet as it was asked, frozen at submit
+ * ------------------------------------------------------------------ */
+
+/**
+ * WHAT THIS FIXES, AND WHY IT IS AN AUDIT ROW RATHER THAN NEW COLUMNS.
+ *
+ * Two measured defects, one cause: a finished record froze the ANSWERS but not
+ * the SHEET.
+ *   1. The checklist's NAME and CODE were read live, so renaming a checklist
+ *      re-labelled every record ever taken under it — and a rename does not bump
+ *      the version, so nothing on screen even hinted at it.
+ *   2. Only ANSWERED questions leave a row, so a record could not say what was
+ *      on the sheet and left blank; once such a question was deleted (lawful —
+ *      it had no answers) the record could not even name it.
+ *
+ * fssai_runs has no frozen-name column and fssai_responses has no row for an
+ * unanswered question. Adding either is a migration on a table that will hold
+ * audit history, i.e. the owner's call (HARD RULE 4 / §7 Q15). fssai_audit_log
+ * already exists to hold exactly this kind of frozen JSON, so the sheet is
+ * written there ONCE, at submit, inside the submit transaction, and the read
+ * path renders the record from it. No schema change.
+ *
+ * It is written best-effort (§7 Q4: never lose a check a member of staff really
+ * performed because a log row failed). A record with no snapshot — anything
+ * submitted before this landed — reads exactly as it did before, with
+ * template_name_source:'live' saying so.
+ */
+export interface FssaiRecordSnapshotQuestion {
+  question_id: string;
+  prompt: string;
+  qtype: string;
+  section_id?: string | null;
+  sort_order?: number;
+  is_required: 0 | 1;
+  is_critical: 0 | 1;
+  /** was there an answer on the sheet when it was submitted? */
+  answered: boolean;
+  is_na: 0 | 1;
+  is_fail: 0 | 1;
+  /** the admin switched this question off while the round was being filled in */
+  retired_mid_run?: boolean;
+}
+
+export interface FssaiRecordSnapshot {
+  template: {
+    id: string;
+    name: string;
+    code: string;
+    version_at_open: number;
+    version_at_submit: number;
+    answered_across_versions: boolean;
+    pass_threshold_pct: number;
+    requires_signature: 0 | 1;
+    requires_verification: 0 | 1;
+    frequency: string;
+    module_key: string;
+    department_id: string;
+  };
+  sheet: FssaiRecordSnapshotQuestion[];
+  counts: Record<string, unknown>;
+}
+
+export const FSSAI_SNAPSHOT_ACTION = 'snapshot';
+
+export function writeFssaiRecordSnapshot(
+  db: Database.Database,
+  runId: string,
+  snap: FssaiRecordSnapshot,
+  actor: { email?: string | null; name?: string | null },
+  outletId?: string | null,
+): void {
+  fssaiAuditBestEffort(db, {
+    entity_table: 'fssai_runs',
+    entity_id: runId,
+    action: FSSAI_SNAPSHOT_ACTION,
+    field: 'record',
+    after: snap,
+    reason: 'The checklist as it was asked, frozen with the record',
+    actor,
+    outlet_id: outletId || '',
+  });
+}
+
+/** The frozen sheet for one run, or null when there is none (or it is junk). */
+export function readFssaiRecordSnapshot(db: Database.Database, runId: string): FssaiRecordSnapshot | null {
+  const row = db.prepare(
+    `SELECT after_json FROM fssai_audit_log
+      WHERE entity_table='fssai_runs' AND entity_id=? AND action=?
+      ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+  ).get(runId, FSSAI_SNAPSHOT_ACTION) as any;
+  if (!row || !row.after_json) return null;
+  try {
+    const v = JSON.parse(String(row.after_json));
+    if (!v || typeof v !== 'object' || !v.template) return null;
+    if (!Array.isArray(v.sheet)) v.sheet = [];
+    return v as FssaiRecordSnapshot;
+  } catch {
+    // A record must still render if its snapshot is unreadable.
+    return null;
+  }
 }
 
 /* ------------------------------------------------------------------ *

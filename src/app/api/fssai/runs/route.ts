@@ -4,11 +4,15 @@ import { getCurrentUser, getCurrentOutletId, isManagement } from '@/lib/auth';
 import {
   canRunFssaiCheck, canTakeOverFssaiRun, decideFssaiSlot, evaluateFssaiAnswer,
   summariseFssaiRun, fssaiToday, isISODate, daysBetweenISO, isFssaiShift, isFssaiTargetKind,
+  fssaiResponseAnswered, isFssaiBoolQType, fssaiBoolFromText, fssaiBoolWordsFor,
+  fssaiDisplayReading,
   type FssaiSlotRunRow,
 } from '@/lib/fssai';
 import {
   requireFssaiUser, fssaiAudit, fssaiAuditBestEffort, fssaiAppAudit, parseJsonArray,
   shapeQuestion, str, constraintMessage, FSSAI_NO_MATCH,
+  readFssaiRecordSnapshot, writeFssaiRecordSnapshot,
+  type FssaiRecordSnapshotQuestion,
 } from '@/lib/fssai-server';
 
 /**
@@ -45,25 +49,97 @@ import {
  */
 export const dynamic = 'force-dynamic';
 
-/** An answered response is one that carries a value or is marked N/A. */
-function isAnswered(r: any): boolean {
-  if (Number(r.is_na)) return true;
-  if (r.value_bool !== null && r.value_bool !== undefined) return true;
-  if (r.value_num !== null && r.value_num !== undefined) return true;
-  return String(r.value_text || '') !== '';
+/**
+ * IS THERE AN ANSWER IN THIS BOX? — delegated to the shared predicate.
+ *
+ * It used to be a local rule here ("any non-empty value_text"), which
+ * DISAGREED with the evaluator: a Yes/No answer sent as the word 'yes' counted
+ * as answered here and as unanswered there, so the submit gate let through a
+ * question the evaluator considered blank. One predicate now, in src/lib/fssai.ts.
+ */
+function isAnswered(r: any, evidenceCount = 0): boolean {
+  return fssaiResponseAnswered(r, evidenceCount);
 }
 
-/** May this person read this run? (§7 Q10 provisional: own + own department; management sees all.) */
+/**
+ * IS THIS ANSWER FINISHED? — a value present AND any photograph or note the
+ * question demands. The evidence rules (photo_rule / note_rule) are the admin's
+ * "required evidence" setting; they were stored and never read until this.
+ * Only `.answered` is taken from the evaluator — is_fail stays frozen on the
+ * response row and is never recomputed on read (RECON §10 R3).
+ */
+function answerComplete(q: any, r: any, evidenceCount = 0): { answered: boolean; reason: string } {
+  if (!r) return { answered: false, reason: 'Not answered.' };
+  const v = evaluateFssaiAnswer(
+    {
+      // The FROZEN type: the answer is judged complete as the type it was given
+      // under, even if the live question has been changed since.
+      qtype: String(r.qtype || q?.qtype || ''),
+      is_required: q ? q.is_required : 1,
+      allow_na: q ? q.allow_na : 1,
+      photo_rule: q?.photo_rule,
+      note_rule: q?.note_rule,
+    },
+    {
+      value_text: r.value_text,
+      value_num: r.value_num,
+      value_bool: r.value_bool === null || r.value_bool === undefined ? null : !!Number(r.value_bool),
+      is_na: !!Number(r.is_na),
+      note: r.note,
+      evidence_count: evidenceCount,
+    },
+  );
+  return { answered: v.answered, reason: v.reason };
+}
+
+/** How many evidence rows hang off each answer in this run, by question id. */
+function evidenceCountsByQuestion(db: any, runId: string): Map<string, number> {
+  const rows = db.prepare(
+    `SELECT r.question_id AS qid, COUNT(e.id) AS n
+       FROM fssai_responses r LEFT JOIN fssai_evidence e ON e.response_id = r.id
+      WHERE r.run_id = ? GROUP BY r.question_id`,
+  ).all(runId) as any[];
+  return new Map(rows.map((r) => [String(r.qid), Number(r.n) || 0]));
+}
+
+/**
+ * May this person read this run? (§7 Q10 provisional: own + own department;
+ * management sees all.)
+ *
+ * A run with NO department belongs to the whole restaurant, so any signed-in
+ * member of staff may read it. Measured defect: a restaurant-wide check
+ * (target_kind='none', no department) refused the second person with "That check
+ * belongs to another department" — about a record that belongs to no department
+ * at all, and which he was being blocked by. Blocking someone with a record he
+ * is forbidden to look at leaves him nothing he can do.
+ */
 function canSeeRun(me: any, run: any): boolean {
   if (isManagement(me)) return true;
   if (String(run.recorded_by || '').toLowerCase() === String(me.email || '').toLowerCase()) return true;
+  if (!String(run.department_id || '')) return true;
   return !!run.department_id && run.department_id === me.department_id;
+}
+
+/** Whether the caller may actually OPEN the run that is blocking them. */
+function slotViewability(
+  me: any,
+  decision: { action: string; run_id?: string },
+  openRun: FssaiSlotRunRow | null,
+  decidedRun: FssaiSlotRunRow | null,
+): { can_view?: boolean } {
+  if (decision.action !== 'refuse') return {};
+  const row = openRun && openRun.id === decision.run_id ? openRun
+    : decidedRun && decidedRun.id === decision.run_id ? decidedRun
+    : null;
+  if (!row) return {};
+  return { can_view: canSeeRun(me, row) };
 }
 
 /** The two rows the slot decision needs, read with ONE predicate everywhere. */
 function readSlot(db: any, slot: { template_id: string; business_date: string; target_id: string; shift: string }) {
   const openRun = db.prepare(
-    `SELECT id, status, recorded_by, recorded_name, started_at, answered_count, total_count
+    `SELECT id, status, recorded_by, recorded_name, started_at, answered_count, total_count,
+            outcome, department_id
        FROM fssai_runs
       WHERE template_id=? AND business_date=? AND IFNULL(target_id,'')=? AND IFNULL(shift,'')=?
         AND status='in_progress'
@@ -71,7 +147,8 @@ function readSlot(db: any, slot: { template_id: string; business_date: string; t
   ).get(slot.template_id, slot.business_date, slot.target_id, slot.shift) as FssaiSlotRunRow | undefined;
 
   const decidedRun = db.prepare(
-    `SELECT id, status, recorded_by, recorded_name, submitted_at, answered_count, total_count
+    `SELECT id, status, recorded_by, recorded_name, submitted_at, answered_count, total_count,
+            outcome, department_id
        FROM fssai_runs
       WHERE template_id=? AND business_date=? AND IFNULL(target_id,'')=? AND IFNULL(shift,'')=?
         AND status IN ('submitted','verified')
@@ -101,7 +178,10 @@ export async function GET(request: Request) {
       if (!slot.template_id) return Response.json({ error: 'Which checklist? No id was sent.' }, { status: 400 });
       const { openRun, decidedRun } = readSlot(db, slot);
       const decision = decideFssaiSlot({ meEmail: me.email || '', openRun, decidedRun });
-      return Response.json({ slot, decision });
+      // can_view tells a screen whether to offer "look at what has been filled
+      // in" at all: offering a button that then 403s is worse than not offering
+      // it (measured — a cross-department block did exactly that).
+      return Response.json({ slot, decision, ...slotViewability(me, decision, openRun, decidedRun) });
     }
 
     /* ── one run ──────────────────────────────────────────────────────────── */
@@ -124,13 +204,47 @@ export async function GET(request: Request) {
 
       if (run.status !== 'in_progress') {
         // FROZEN. No join to fssai_questions, no recomputation of anything.
+        //
+        // The TITLE is frozen too, from the snapshot written at submit. It used
+        // to be read live, so renaming a checklist today re-labelled every
+        // record ever taken under it — and because a rename does not bump the
+        // version, `edited_since` stayed false and nothing said so. The record
+        // now shows the name it was taken under; `template_now` carries what it
+        // is called today, for a screen that wants to say "now called …".
+        const snap = readFssaiRecordSnapshot(db, id);
+        const asRecorded = snap?.template;
         return Response.json({
           run,
-          template: tpl ? { id: tpl.id, name: tpl.name, code: tpl.code, current_version: tpl.version } : null,
+          template: asRecorded
+            ? {
+                id: asRecorded.id,
+                name: asRecorded.name,
+                code: asRecorded.code,
+                current_version: tpl ? tpl.version : null,
+                pass_threshold_pct: asRecorded.pass_threshold_pct,
+              }
+            : tpl
+              ? { id: tpl.id, name: tpl.name, code: tpl.code, current_version: tpl.version }
+              : null,
+          template_name_source: asRecorded ? 'snapshot' : 'live',
+          template_now: tpl ? { id: tpl.id, name: tpl.name, code: tpl.code, version: tpl.version } : null,
+          template_renamed_since: !!asRecorded && !!tpl
+            && (String(asRecorded.name) !== String(tpl.name) || String(asRecorded.code || '') !== String(tpl.code || '')),
           responses,
           questions: null,
+          // THE SHEET AS IT WAS ASKED — every question that was on it, including
+          // the ones left blank and the ones retired while it was open, so the
+          // record can say what was skipped even after the question is gone.
+          sheet_as_asked: snap ? snap.sheet : null,
           rendered_from: 'responses',
           template_version_at_record: run.template_version,
+          // A round filled in across several versions is stamped with the LAST
+          // one on fssai_runs; these two say what it was opened on and submitted
+          // under, so the record never claims a single paper it was not wholly
+          // answered against.
+          template_version_at_open: asRecorded ? asRecorded.version_at_open : null,
+          template_version_at_submit: asRecorded ? asRecorded.version_at_submit : null,
+          answered_across_versions: asRecorded ? !!asRecorded.answered_across_versions : null,
           template_version_now: tpl ? tpl.version : null,
           edited_since: !!tpl && Number(tpl.version) !== Number(run.template_version),
         });
@@ -174,8 +288,16 @@ export async function GET(request: Request) {
         args.push(me.email || FSSAI_NO_MATCH, me.department_id || FSSAI_NO_MATCH);
       }
     }
+    // template_name is what the checklist is called TODAY;
+    // template_name_at_record is what it was called when the check was taken
+    // (from the frozen snapshot, NULL for a run still open or taken before the
+    // snapshot existed). A history screen must lead with the second one.
     const runs = db.prepare(
-      `SELECT r.*, t.name AS template_name
+      `SELECT r.*, t.name AS template_name,
+              (SELECT json_extract(a.after_json, '$.template.name')
+                 FROM fssai_audit_log a
+                WHERE a.entity_table='fssai_runs' AND a.entity_id=r.id AND a.action='snapshot'
+                ORDER BY a.created_at DESC, a.rowid DESC LIMIT 1) AS template_name_at_record
          FROM fssai_runs r JOIN fssai_templates t ON t.id = r.template_id` +
       (where.length ? ` WHERE ${where.join(' AND ')}` : '') +
       ` ORDER BY r.business_date DESC, r.started_at DESC LIMIT 500`,
@@ -267,7 +389,10 @@ export async function POST(request: Request) {
       }
       if (decision.action === 'refuse') {
         return Response.json(
-          { error: decision.message, code: decision.code, run_id: decision.run_id, decision },
+          {
+            error: decision.message, code: decision.code, run_id: decision.run_id, decision,
+            ...slotViewability(me, decision, openRun, decidedRun),
+          },
           { status: 409 },
         );
       }
@@ -336,7 +461,17 @@ export async function POST(request: Request) {
         return Response.json({ error: 'That question belongs to a different checklist.' }, { status: 400 });
       }
       if (!Number(q.is_active)) {
-        return Response.json({ error: 'That question has been switched off since this check was started.' }, { status: 409 });
+        // A question switched off mid-round takes no NEW answer — it is off the
+        // sheet. But an answer ALREADY GIVEN on this round still counts towards
+        // the verdict (see submit), so the person holding the phone must be able
+        // to CORRECT it. Refusing both left a recorded failure they could
+        // neither change nor remove.
+        const already = db.prepare(
+          `SELECT id FROM fssai_responses WHERE run_id = ? AND question_id = ?`,
+        ).get(runId, questionId) as any;
+        if (!already) {
+          return Response.json({ error: 'That question has been switched off since this check was started.' }, { status: 409 });
+        }
       }
 
       // A blank reading is NOT zero (RECON §6.4 — Number('') === 0 stored 793
@@ -349,7 +484,7 @@ export async function POST(request: Request) {
         return Response.json({ error: 'That reading is not a number.' }, { status: 400 });
       }
       const rawBool = body?.value_bool;
-      const valueBool = rawBool === undefined || rawBool === null || String(rawBool).trim() === ''
+      let valueBool = rawBool === undefined || rawBool === null || String(rawBool).trim() === ''
         ? null
         : (rawBool === true || rawBool === 1 || String(rawBool) === '1' || String(rawBool).toLowerCase() === 'true' ? 1 : 0);
       const valueText = str(body?.value_text);
@@ -357,6 +492,25 @@ export async function POST(request: Request) {
       if (isNa && !Number(q.allow_na)) {
         return Response.json({ error: 'This question cannot be marked not-applicable.' }, { status: 400 });
       }
+
+      // A TWO-BUTTON ANSWER MAY ARRIVE AS THE WORD. Measured defect: 'yes' sent
+      // as value_text on a Yes/No question whose passing answer is 'yes' was
+      // frozen as a compliance FAILURE, because only value_bool was read and an
+      // absent boolean means "not answered". The word is now coerced into the
+      // boolean with the SHARED word list, so the row is self-consistent
+      // whichever way the client sends it — and a word nobody recognises is
+      // refused by name rather than silently counted as a fail.
+      if (!isNa && isFssaiBoolQType(q.qtype) && valueBool === null && valueText) {
+        const coerced = fssaiBoolFromText(valueText);
+        if (coerced === null) {
+          return Response.json(
+            { error: `"${valueText}" is not an answer to this question — answer ${fssaiBoolWordsFor(q.qtype)}.` },
+            { status: 400 },
+          );
+        }
+        valueBool = coerced ? 1 : 0;
+      }
+
       if (q.qtype === 'multiple_choice' && valueText) {
         const opts = parseJsonArray(q.options_json);
         if (!opts.includes(valueText)) {
@@ -364,6 +518,7 @@ export async function POST(request: Request) {
         }
       }
 
+      const note = str(body?.note);
       const evidenceCount = (db.prepare(
         `SELECT COUNT(*) AS n FROM fssai_evidence WHERE run_id = ? AND response_id IN
            (SELECT id FROM fssai_responses WHERE run_id = ? AND question_id = ?)`,
@@ -373,12 +528,14 @@ export async function POST(request: Request) {
         {
           qtype: q.qtype, is_required: q.is_required, allow_na: q.allow_na,
           min_value: q.min_value, max_value: q.max_value, expected_value: q.expected_value,
-          fail_options: parseJsonArray(q.fail_options_json), photo_rule: q.photo_rule,
+          options: parseJsonArray(q.options_json),
+          fail_options: parseJsonArray(q.fail_options_json),
+          photo_rule: q.photo_rule, note_rule: q.note_rule,
         },
         {
           value_text: q.qtype === 'signature' ? (valueText || me.email || '') : valueText,
           value_num: valueNum, value_bool: valueBool === null ? null : !!valueBool,
-          is_na: isNa, evidence_count: evidenceCount,
+          is_na: isNa, note, evidence_count: evidenceCount,
         },
       );
 
@@ -404,19 +561,37 @@ export async function POST(request: Request) {
           generateId(), runId, questionId, q.qtype, q.prompt, q.sort_order,
           q.qtype === 'signature' ? (valueText || me.email || '') : valueText,
           valueNum, valueBool, isNa ? 1 : 0, verdict.is_fail ? 1 : 0,
-          q.min_value, q.max_value, q.expected_value, q.uom, str(body?.note),
+          q.min_value, q.max_value, q.expected_value, q.uom, note,
           me.email || '', outletId,
         );
+        // answered_count counts FINISHED answers — a value plus whatever
+        // photograph or note the question demands — using the same predicate the
+        // submit gate uses, so the number on screen and the gate agree.
         const rows = db.prepare(`SELECT * FROM fssai_responses WHERE run_id = ?`).all(runId) as any[];
-        const answered = rows.filter(isAnswered).length;
+        const ev = evidenceCountsByQuestion(db, runId);
+        const liveQs = db.prepare(
+          `SELECT id, qtype, is_required, allow_na, photo_rule, note_rule
+             FROM fssai_questions WHERE template_id = ?`,
+        ).all(run.template_id) as any[];
+        const qById = new Map(liveQs.map((x) => [String(x.id), x]));
+        const answered = rows.filter((r) =>
+          answerComplete(qById.get(String(r.question_id)), r, ev.get(String(r.question_id)) || 0).answered,
+        ).length;
         db.prepare(
           `UPDATE fssai_runs SET answered_count=?, updated_at=datetime('now') WHERE id=? AND status='in_progress'`,
         ).run(answered, runId);
         return answered;
       });
       const answered = save();
-      const response = db.prepare(`SELECT * FROM fssai_responses WHERE run_id = ? AND question_id = ?`).get(runId, questionId);
-      return Response.json({ response, verdict, answered_count: answered });
+      const response = db.prepare(`SELECT * FROM fssai_responses WHERE run_id = ? AND question_id = ?`).get(runId, questionId) as any;
+      return Response.json({
+        response,
+        verdict,
+        answered_count: answered,
+        // `decimals` is how the reading is WRITTEN DOWN, never how it is judged:
+        // rounding before the range test would let 5.4 °C pass a 0–5 rule.
+        display_value: fssaiDisplayReading(response?.value_num, q.decimals),
+      });
     }
 
     /* ══════════════════════════════════════════════════════════════════════
@@ -458,36 +633,113 @@ export async function POST(request: Request) {
         );
       }
 
-      const questions = db.prepare(
-        `SELECT id, is_required, is_critical, prompt FROM fssai_questions
+      /* ── WHAT THIS ROUND IS JUDGED ON ─────────────────────────────────────
+       * THE QUESTIONS ON THE SHEET NOW, *PLUS* EVERY QUESTION THIS ROUND HAS
+       * ALREADY ANSWERED — including one the admin switched off while it was
+       * open.
+       *
+       * MEASURED DEFECT, the worst this phase found. The verdict was built from
+       * `is_active = 1` alone, while the record printed every response row. So:
+       * staff answer "Floor condition = Soiled" (a fail, frozen is_fail=1) → an
+       * admin presses the ordinary delete on that question → the question is
+       * lawfully RETIRED → staff submit → the failure is excluded from
+       * fail_count, total_count, pass_pct, outcome AND from the is_critical
+       * test. Measured: summary {fail_count:0, pass_pct:100, outcome:'pass'} on
+       * a record that still prints `'Floor condition' = 'Soiled' IS_FAIL=1`.
+       * One admin click turned a failed hygiene check into a passing one,
+       * silently, with the failing line still on the sheet.
+       *
+       * Nothing anyone actually recorded may leave the verdict. A retired
+       * question takes no NEW answer (the answer route still refuses that) —
+       * but an answer already given is part of the record and is counted.
+       */
+      const liveQuestions = db.prepare(
+        `SELECT id, is_required, is_critical, prompt, qtype, allow_na, photo_rule, note_rule,
+                section_id, sort_order
+           FROM fssai_questions
           WHERE template_id = ? AND is_active = 1 ORDER BY sort_order ASC`,
       ).all(run.template_id) as any[];
       const responses = db.prepare(`SELECT * FROM fssai_responses WHERE run_id = ?`).all(runId) as any[];
-      const byQ = new Map(responses.map((r) => [r.question_id, r]));
+      const byQ = new Map(responses.map((r) => [String(r.question_id), r]));
+      const evidence = evidenceCountsByQuestion(db, runId);
+      const liveIds = new Set(liveQuestions.map((q) => String(q.id)));
 
-      const missing = questions.filter((q) => {
-        if (!Number(q.is_required)) return false;
-        const r = byQ.get(q.id);
-        return !r || !isAnswered(r);
-      });
+      const answeredElsewhereIds = responses
+        .map((r) => String(r.question_id))
+        .filter((qid) => !liveIds.has(qid));
+      const retiredAnswered: any[] = [];
+      if (answeredElsewhereIds.length) {
+        const rows = db.prepare(
+          `SELECT id, is_required, is_critical, prompt, qtype, allow_na, photo_rule, note_rule,
+                  section_id, sort_order
+             FROM fssai_questions
+            WHERE id IN (${answeredElsewhereIds.map(() => '?').join(',')})`,
+        ).all(...answeredElsewhereIds) as any[];
+        const found = new Map(rows.map((x) => [String(x.id), x]));
+        for (const qid of answeredElsewhereIds) {
+          const r = byQ.get(qid);
+          if (!r) continue;
+          const row = found.get(qid);
+          // A question row that has vanished entirely (it cannot, while a
+          // response references it — the FK is declared — but a record must
+          // still add up if it ever does) is rebuilt from the frozen response.
+          retiredAnswered.push(row || {
+            id: qid, is_required: 0, is_critical: 0, prompt: r.prompt_snapshot || '(question removed)',
+            qtype: r.qtype, allow_na: 1, photo_rule: 'never', note_rule: 'never',
+            section_id: null, sort_order: r.sort_order ?? 0,
+          });
+        }
+      }
+      const judged = [...liveQuestions, ...retiredAnswered];
+
+      // Only a question STILL ON THE SHEET can block submission: a retired one
+      // is off the sheet, and every retired one here already carries an answer.
+      const missing = liveQuestions
+        .map((q) => ({ q, state: answerComplete(q, byQ.get(String(q.id)), evidence.get(String(q.id)) || 0) }))
+        .filter(({ q, state }) => Number(q.is_required) && !state.answered);
       if (missing.length) {
         return Response.json(
           {
             error: `${missing.length} question${missing.length === 1 ? '' : 's'} still need${missing.length === 1 ? 's' : ''} an answer before this check can be submitted.`,
-            missing: missing.map((q) => ({ question_id: q.id, prompt: q.prompt })),
+            missing: missing.map(({ q, state }) => ({ question_id: q.id, prompt: q.prompt, reason: state.reason })),
           },
           { status: 400 },
         );
       }
 
-      const facts = questions.map((q) => {
-        const r = byQ.get(q.id);
-        return { is_fail: r ? r.is_fail : 0, is_na: r ? r.is_na : 0, answered: r ? isAnswered(r) : false };
+      const facts = judged.map((q) => {
+        const r = byQ.get(String(q.id));
+        return {
+          is_fail: r ? r.is_fail : 0,
+          is_na: r ? r.is_na : 0,
+          answered: r ? answerComplete(q, r, evidence.get(String(q.id)) || 0).answered : false,
+        };
       });
-      const criticalFailed = questions.some((q) => Number(q.is_critical) && Number(byQ.get(q.id)?.is_fail || 0));
+      const criticalFailed = judged.some((q) => Number(q.is_critical) && Number(byQ.get(String(q.id))?.is_fail || 0));
       const summary = summariseFssaiRun(facts, Number(tpl.pass_threshold_pct ?? 100), criticalFailed);
 
       const versionDrifted = Number(tpl.version) !== Number(run.template_version);
+
+      /* THE SHEET AS IT WAS ASKED — frozen with the record (see
+       * writeFssaiRecordSnapshot). This is what lets a finished record name the
+       * questions that were SKIPPED, keep the title it was taken under, and say
+       * which versions it spans, none of which fssai_responses can express. */
+      const sheet: FssaiRecordSnapshotQuestion[] = judged.map((q) => {
+        const r = byQ.get(String(q.id));
+        return {
+          question_id: String(q.id),
+          prompt: String(q.prompt ?? ''),
+          qtype: String(r?.qtype || q.qtype || ''),
+          section_id: q.section_id ?? null,
+          sort_order: Number(q.sort_order ?? 0),
+          is_required: Number(q.is_required) ? 1 : 0,
+          is_critical: Number(q.is_critical) ? 1 : 0,
+          answered: r ? answerComplete(q, r, evidence.get(String(q.id)) || 0).answered : false,
+          is_na: r && Number(r.is_na) ? 1 : 0,
+          is_fail: r && Number(r.is_fail) ? 1 : 0,
+          ...(liveIds.has(String(q.id)) ? {} : { retired_mid_run: true }),
+        };
+      });
 
       const submit = db.transaction(() => {
         const res = db.prepare(
@@ -529,6 +781,30 @@ export async function POST(request: Request) {
           after: { status: 'submitted', ...summary, template_version: tpl.version },
           actor: { email: me.email, name: me.name }, outlet_id: run.outlet_id,
         });
+        writeFssaiRecordSnapshot(
+          db,
+          runId,
+          {
+            template: {
+              id: String(tpl.id),
+              name: String(tpl.name ?? ''),
+              code: String(tpl.code ?? ''),
+              version_at_open: Number(run.template_version ?? 0),
+              version_at_submit: Number(tpl.version ?? 0),
+              answered_across_versions: versionDrifted,
+              pass_threshold_pct: Number(tpl.pass_threshold_pct ?? 100),
+              requires_signature: Number(tpl.requires_signature) ? 1 : 0,
+              requires_verification: Number(tpl.requires_verification) ? 1 : 0,
+              frequency: String(tpl.frequency ?? ''),
+              module_key: String(tpl.module_key ?? ''),
+              department_id: String(tpl.department_id ?? ''),
+            },
+            sheet,
+            counts: { ...summary, retired_mid_run: retiredAnswered.length },
+          },
+          { email: me.email, name: me.name },
+          run.outlet_id,
+        );
       });
       try { submit(); } catch (e: any) {
         if (String(e?.message) === 'FSSAI_RUN_ALREADY_SUBMITTED') {
@@ -544,6 +820,13 @@ export async function POST(request: Request) {
         run: db.prepare(`SELECT * FROM fssai_runs WHERE id = ?`).get(runId),
         summary,
         template_edited_while_open: versionDrifted,
+        template_version_at_open: Number(run.template_version ?? 0),
+        template_version_at_submit: Number(tpl.version ?? 0),
+        // Say out loud when a question was switched off mid-round and its answer
+        // was still counted — silence is how the failure used to disappear.
+        counted_retired_questions: retiredAnswered.length,
+        retired_mid_run: retiredAnswered.map((q) => ({ question_id: q.id, prompt: q.prompt })),
+        sheet_as_asked: sheet,
       });
     }
 

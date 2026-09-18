@@ -4,6 +4,7 @@ import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
 import {
   canAuthorFssai, isFssaiFrequency, isFssaiTargetKind, normalizeFssaiQuestion,
   templateEditBumpsVersion, FSSAI_MODULE_KEYS, FSSAI_FREQUENCIES, FSSAI_TARGET_KINDS,
+  fssaiConfigWarnings,
 } from '@/lib/fssai';
 import {
   requireFssaiAdmin, loadFssaiTemplate, fssaiAudit, fssaiAppAudit,
@@ -224,7 +225,7 @@ export async function POST(request: Request) {
         event_type: 'fssai.template.duplicate', entity_type: 'fssai_templates', entity_id: newId,
         actor_email: me.email, after: { name: tpl?.name, source: srcId },
       });
-      return Response.json({ template: tpl });
+      return Response.json({ template: tpl, config_warnings: fssaiConfigWarnings(tpl || {}) });
     }
 
     /* ── create ─────────────────────────────────────────────────────────── */
@@ -319,7 +320,10 @@ export async function POST(request: Request) {
       event_type: 'fssai.template.create', entity_type: 'fssai_templates', entity_id: id,
       actor_email: me.email, after: { name: header.name },
     });
-    return Response.json({ template: tpl });
+    // config_warnings: how this SETUP will behave once staff run it (see
+    // fssaiConfigWarnings) — returned on create, edit and publish alike so the
+    // builder screen can say it at the moment the choice is made.
+    return Response.json({ template: tpl, config_warnings: fssaiConfigWarnings(tpl || {}) });
   } catch (e: any) {
     const nice = constraintMessage(e, 'That checklist could not be saved.');
     if (nice) return Response.json({ error: nice }, { status: 409 });
@@ -409,11 +413,13 @@ export async function PUT(request: Request) {
       actor_email: me.email, before: { version: existing.version }, after: { version },
       note: changed.join(','),
     });
+    const updated = loadFssaiTemplate(db, id, { includeRetired: true });
     return Response.json({
-      template: loadFssaiTemplate(db, id, { includeRetired: true }),
+      template: updated,
       version_bumped: bump,
       version,
       changed,
+      config_warnings: fssaiConfigWarnings(updated || {}),
     });
   } catch (e: any) {
     const nice = constraintMessage(e, 'That change could not be saved.');

@@ -1,9 +1,9 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { getDb } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
-import { canAuthorFssai, qtypeMeta } from '@/lib/fssai';
+import { canAuthorFssai, qtypeMeta, fssaiConfigWarnings } from '@/lib/fssai';
 import {
-  requireFssaiAdmin, loadFssaiTemplate, fssaiAudit, fssaiAppAudit, str,
+  requireFssaiAdmin, loadFssaiTemplate, fssaiAudit, fssaiAppAudit, str, fssaiCsrfGuard,
 } from '@/lib/fssai-server';
 
 /**
@@ -62,6 +62,9 @@ export async function GET(request: Request, { params }: { params: Promise<{ id: 
       template,
       can_author: admin,
       unknown_qtypes: Array.from(new Set(unknown)),
+      // Things about the SETUP that will surprise him once staff run it — said
+      // out loud on the builder screen, never enforced behind his back.
+      config_warnings: fssaiConfigWarnings(template),
     });
   } catch (e: any) {
     console.error('GET /api/fssai/templates/[id] failed:', e);
@@ -73,6 +76,13 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
   const g = await requireFssaiAdmin();
   if ('resp' in g) return g.resp;
   const me = g.me;
+  // THE ONLY FSSAI PATH WITH A CALLER-CONTROLLED SEGMENT, so the only one where
+  // proxy.ts's "/print anywhere in the path is public" rule can skip the CSRF
+  // check before routing (measured: POST /api/fssai/templates/print-abc reached
+  // this handler with no token). Checked again here, in FSSAI's own file, after
+  // auth so the order of refusals matches the proxy's (401 then 403).
+  const csrf = fssaiCsrfGuard(request);
+  if (csrf) return csrf;
 
   try {
     const { id } = await params;
@@ -134,7 +144,12 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
         event_type: 'fssai.template.publish', entity_type: 'fssai_templates', entity_id: id,
         actor_email: me.email, after: { version: tpl.version },
       });
-      return Response.json({ template: loadFssaiTemplate(db, id, { includeRetired: true }) });
+      const published = loadFssaiTemplate(db, id, { includeRetired: true });
+      // Publishing is the moment to say how this setup will behave — e.g. a
+      // per-shift checklist that is not run against anything means ONE person
+      // files it for the whole restaurant. A warning, not a refusal: only the
+      // owner knows which he meant.
+      return Response.json({ template: published, config_warnings: fssaiConfigWarnings(published || {}) });
     }
 
     /* ── UNPUBLISH — back to draft, and only while nothing has been run ──── */
