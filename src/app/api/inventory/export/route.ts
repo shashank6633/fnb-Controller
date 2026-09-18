@@ -50,6 +50,8 @@ const COLUMNS = [
   'is_recipe_item',
   'is_direct_sell',
   'is_semifinished',
+  'is_butchering_source',     // whole carcass / protein that can be broken down
+  'is_butchering_output',     // CAN be produced by breaking down a carcass (may also be bought)
   'storage_location',
   'shelf_life_days',
 ];
@@ -154,7 +156,22 @@ function csvEscape(v: any): string {
 // ("not set") and round-trips as a no-op instead. A non-zero rate still exports
 // as its number, and a user who genuinely wants 18 → 0 types 0 themselves and it
 // still writes 0 — the importer is deliberately left untouched.
-const BLANK_WHEN_ZERO = new Set(['tax_percent', 'cess_percent']);
+//
+// THE BUTCHERING FLAGS JOIN THIS SET FOR THE SAME REASON, NOT AS AN EXCEPTION.
+// is_butchering_source / is_butchering_output are the textbook case this guard
+// describes: hand-typed on the master one item at a time, and 0 on ~948 of 952
+// rows. Exported as a literal '0' they would be WRITTEN as 0, so Export today →
+// owner tags 40 items on the bulk editor next week → someone re-uploads the
+// stale sheet to fix one price = all 40 tags silently gone, with no error. Blank
+// means "not set" and round-trips as a no-op. Deliberate UNTAGGING still works:
+// a user who types 0 gets 0 written, exactly as with GST%.
+// NOTE — is_recipe_item / is_direct_sell / is_semifinished still carry that
+// hazard today. They are left as they are on purpose (not this lane's call to
+// change shipped behaviour); flagged for the owner rather than silently altered.
+const BLANK_WHEN_ZERO = new Set([
+  'tax_percent', 'cess_percent',
+  'is_butchering_source', 'is_butchering_output',
+]);
 
 function csvCell(col: string, v: any): string {
   if (BLANK_WHEN_ZERO.has(col) && (v == null || Number(v) === 0)) return '';

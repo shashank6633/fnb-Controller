@@ -4099,6 +4099,34 @@ function initializeSchema(db: Database.Database) {
     if (!has('is_recipe_item'))         db.exec(`ALTER TABLE raw_materials ADD COLUMN is_recipe_item INTEGER NOT NULL DEFAULT 0`);
     if (!has('is_direct_sell'))         db.exec(`ALTER TABLE raw_materials ADD COLUMN is_direct_sell INTEGER NOT NULL DEFAULT 0`);
     if (!has('is_semifinished'))        db.exec(`ALTER TABLE raw_materials ADD COLUMN is_semifinished INTEGER NOT NULL DEFAULT 0`);
+    // ------------------------------------------------------------
+    // Butchering role flags — the MANUAL answer to "what belongs in the
+    // butchering dropdowns". /butchering used to GUESS from a hardcoded category
+    // list plus a name/SKU regex, so CHICKEN SEASONING POWDER was offered as a
+    // carcass to break down while pork / duck / a house-named item could never
+    // appear; the Cuts picker was worse still — unfiltered, so 350ML DISPOSABLE
+    // GLASS was offerable as a cut. These two flags replace the guess with the
+    // owner's own tagging. One GLOBAL flag per item, not a per-carcass mapping.
+    //   is_butchering_source   this item is a whole carcass / protein that can be BROKEN DOWN
+    //   is_butchering_output   this item CAN BE PRODUCED by breaking down a carcass
+    // INDEPENDENT, not exclusive: a bought CHICKEN LEG BONELESS is an output of a
+    // whole bird AND could later be the source of a further cut, so both may be 1
+    // on the same row.
+    //
+    // THE OWNER'S RULE, and it is the correctness rule of this feature: an item
+    // may be BOTH BOUGHT FROM A VENDOR AND PRODUCED FROM A CARCASS. So
+    // is_butchering_output means only "this CAN be a butchering output" — it
+    // NEVER means the stock on hand came from a carcass, and it must never change
+    // how a PURCHASE of the item behaves. Only a butchering_outputs row is
+    // evidence that something actually came out of a carcass batch, and that is
+    // what the yield figures count. Do NOT make any yield / consumption / costing
+    // query filter on this flag instead of joining butchering_outputs.
+    //
+    // Both default 0 — nothing is tagged until he tags it, so no heuristic's
+    // false positives get baked into real data (see is_recipe_item's backfill,
+    // which recipe-suggest.ts:179-181 now refuses to trust).
+    if (!has('is_butchering_source'))   db.exec(`ALTER TABLE raw_materials ADD COLUMN is_butchering_source INTEGER NOT NULL DEFAULT 0`);
+    if (!has('is_butchering_output'))   db.exec(`ALTER TABLE raw_materials ADD COLUMN is_butchering_output INTEGER NOT NULL DEFAULT 0`);
     // Operational fields — where it lives + how long it lasts
     if (!has('storage_location'))       db.exec(`ALTER TABLE raw_materials ADD COLUMN storage_location TEXT DEFAULT ''`);
     if (!has('shelf_life_days'))        db.exec(`ALTER TABLE raw_materials ADD COLUMN shelf_life_days INTEGER NOT NULL DEFAULT 0`);

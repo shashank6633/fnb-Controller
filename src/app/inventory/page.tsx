@@ -20,6 +20,7 @@ import {
   Star,
   Sparkles,
   MapPin,
+  ListChecks,
 } from 'lucide-react';
 import Papa from 'papaparse';
 import { api } from '@/lib/api';
@@ -53,6 +54,18 @@ interface RawMaterial {
   sku?: string;
   /** Physical area the item lives in — free text, blank until filled. */
   storage_location?: string;
+  /** Master GST % — seeds purchase-entry lines. Never part of cost. */
+  tax_percent?: number;
+  /** Additional cess % (esp. liquor). */
+  cess_percent?: number;
+  /** This item is a whole carcass / protein that can be BROKEN DOWN. Filters the
+   *  "Source carcass" picker on /butchering. */
+  is_butchering_source?: number;
+  /** This item CAN BE PRODUCED by breaking down a carcass. Filters the "Cuts →
+   *  Material" picker on /butchering. NOT a claim that the stock on hand came
+   *  from a carcass — the same item may also be bought from a vendor, and only a
+   *  butchering_outputs row counts towards yield. */
+  is_butchering_output?: number;
 }
 
 /** One DIRECT-FLAGGED material's destination + department-held balance, from
@@ -312,6 +325,10 @@ export default function InventoryPage() {
   const [showPriority, setShowPriority] = useState(false);
   // Bulk storage-location tool (same gate as the priority tool)
   const [showStorage, setShowStorage] = useState(false);
+  // Bulk field editor — Tax % / Cess % / butchering tags on many ticked rows.
+  // Same gate as the priority + storage tools, which is also the gate on the
+  // route it posts to (/api/inventory/bulk-update: admin || store manager).
+  const [showBulkEdit, setShowBulkEdit] = useState(false);
   // Inline per-row priority save in flight (material id)
   const [savingPriorityId, setSavingPriorityId] = useState<string | null>(null);
   const [me, setMe] = useState<any>(null);
@@ -841,6 +858,16 @@ export default function InventoryPage() {
                 Storage Locations
               </button>
             )}
+            {canBulkPriority && (
+              <button
+                onClick={() => setShowBulkEdit(true)}
+                className="flex items-center gap-2 px-4 py-2.5 border border-violet-600 text-violet-700 hover:bg-violet-50 rounded-lg text-sm font-medium transition-colors"
+                title="Tick many items and set one field on all of them: Master GST %, Cess %, or the butchering source / output tags. Shows exactly which items change before anything is written."
+              >
+                <ListChecks className="w-4 h-4" />
+                Bulk Edit Items
+              </button>
+            )}
             <button
               onClick={openAddModal}
               className="flex items-center gap-2 px-4 py-2.5 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-medium transition-colors"
@@ -1070,6 +1097,28 @@ export default function InventoryPage() {
                               <span title={`Master GST ${Number((m as any).tax_percent)}% — seeds the GST% on new purchase-entry lines. Not part of cost; input credit is recorded beside the rate.`}
                                     className="text-[9px] px-1.5 py-0.5 rounded bg-[#FFF1E3] text-[#8B7355] border border-[#E8D5C4]">
                                 GST {Number((m as any).tax_percent)}%
+                              </span>
+                            )}
+                            {/* Same reasoning as the GST badge above: without a
+                                read-back the owner tags an item in Bulk Edit and
+                                has no way to tell it stuck. Hidden at 0 so the
+                                ~900 untagged rows stay uncluttered. */}
+                            {Number((m as any).cess_percent) > 0 && (
+                              <span title={`Cess ${Number((m as any).cess_percent)}% — seeds the cess on new purchase-entry lines, alongside GST.`}
+                                    className="text-[9px] px-1.5 py-0.5 rounded bg-[#FFF1E3] text-[#8B7355] border border-[#E8D5C4]">
+                                Cess {Number((m as any).cess_percent)}%
+                              </span>
+                            )}
+                            {Number((m as any).is_butchering_source) === 1 && (
+                              <span title="Butchering SOURCE — offered in the 'Source carcass' picker on /butchering as something that can be broken down."
+                                    className="text-[9px] px-1.5 py-0.5 rounded bg-rose-50 text-rose-700 border border-rose-200 font-medium">
+                                🥩 carcass
+                              </span>
+                            )}
+                            {Number((m as any).is_butchering_output) === 1 && (
+                              <span title="Butchering OUTPUT — offered as a cut inside a carcass batch. This does NOT mean the stock on hand came from a carcass: the same item can also be bought from a vendor, and only an actual batch counts towards yield."
+                                    className="text-[9px] px-1.5 py-0.5 rounded bg-orange-50 text-orange-700 border border-orange-200 font-medium">
+                                🔪 cut
                               </span>
                             )}
                           </div>
@@ -1884,6 +1933,23 @@ export default function InventoryPage() {
           materials={materials.filter((m) => !(m as any).read_only)}
           locationOptions={storageLocationOptions}
           onClose={() => setShowStorage(false)}
+          onApplied={() => fetchMaterials(true)}
+        />
+      )}
+
+      {showBulkEdit && (
+        <BulkFieldEditModal
+          /* Sub-recipe pseudo-rows ('sub:<id>') are not raw_materials: the route
+             matches WHERE id = ? and would report every one of them as skipped.
+             Same exclusion the storage tool makes, same reason. */
+          materials={materials.filter((m) => !(m as any).read_only)}
+          categories={availableCategories}
+          /* The list's own filter is carried in as a STARTING POINT (labelled,
+             with a Clear) so "filter to chicken, then bulk-tag" is one step.
+             Nothing is ticked on open — selection is always his own clicks. */
+          initialSearch={searchQuery}
+          initialCategory={categoryFilter}
+          onClose={() => setShowBulkEdit(false)}
           onApplied={() => fetchMaterials(true)}
         />
       )}
@@ -2913,6 +2979,416 @@ function SetStorageLocationModal({ materials, locationOptions, onClose, onApplie
               {busy === 'selected' ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle className="w-4 h-4" />}
               Apply selected ({tickedCount})
             </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Bulk field editor ───────────────────────────────────────────────────
+// POST /api/inventory/bulk-update (admin / store manager) — ONE field, MANY
+// explicitly-ticked rows: { field, value, material_ids, dryRun? }.
+//
+// The gap it closes: Master GST is set on 27 of 952 materials and the only rate
+// in use is 18%, so the real job is "select these 40 items, set 18%". Until now
+// the only route to that was Export CSV → Excel → Re-upload Edits, which
+// rewrites all 952 rows from a sheet that goes stale the moment anyone tags
+// anything. Tax % and Cess % were also edit-modal-only — one item at a time,
+// and invisible on the list unless the rate was non-zero.
+//
+// SELECTION IS BY MATERIAL ID AND NEVER TOUCHED BY A FILTER CHANGE. The panel
+// has its own search/category so the list underneath is left alone; filtering
+// changes only which rows are VISIBLE. Every count on screen says which set it
+// is counting, a hidden-but-ticked row is called out in amber with a way to see
+// or drop it, and Apply is a two-stage confirm whose button names the field, the
+// value and the exact row count. Nothing is written until that second click.
+const BULK_FIELDS = [
+  { key: 'tax_percent',          label: 'Master GST %',      kind: 'pct' as const,
+    hint: 'Seeds the GST% on new purchase-entry lines. Not part of cost — input credit is recorded beside the rate.' },
+  { key: 'cess_percent',         label: 'Cess %',            kind: 'pct' as const,
+    hint: 'Additional cess (esp. liquor), seeded onto purchase lines alongside GST.' },
+  { key: 'is_butchering_source', label: 'Butchering source', kind: 'flag' as const,
+    hint: 'Tagged items are the ONLY ones offered in the "Source carcass" picker on Butchering — a whole carcass / bird you break down.' },
+  { key: 'is_butchering_output', label: 'Butchering output',  kind: 'flag' as const,
+    hint: 'Tagged items are the ONLY ones offered as cuts inside a carcass batch. This never means "only comes from butchering" — a tagged item can still be bought from a vendor, and only an actual batch counts towards yield.' },
+] as const;
+
+type BulkFieldKey = typeof BULK_FIELDS[number]['key'];
+
+/** Current stored value of the chosen field on a material, as a number. */
+function bulkCurrent(m: RawMaterial, field: BulkFieldKey): number {
+  return Number((m as any)[field] ?? 0) || 0;
+}
+
+function BulkFieldEditModal({ materials, categories, initialSearch, initialCategory, onClose, onApplied }: {
+  materials: RawMaterial[];
+  categories: string[];
+  initialSearch: string;
+  initialCategory: string;
+  onClose: () => void;
+  onApplied: () => void;
+}) {
+  const [field, setField] = useState<BulkFieldKey>('tax_percent');
+  const spec = BULK_FIELDS.find(f => f.key === field)!;
+
+  // Percent value is held as the RAW input string for the same reason the edit
+  // modal does it (see FormData.avg_price_per_purchase_unit): Number() on every
+  // keystroke makes "2.5" untypeable. Parsed ONCE, at the POST boundary.
+  const [pctRaw, setPctRaw] = useState('18');
+  const [flagVal, setFlagVal] = useState<0 | 1>(1);
+
+  const [picked, setPicked] = useState<Set<string>>(new Set());
+  const [q, setQ] = useState(initialSearch);
+  const [cat, setCat] = useState(initialCategory);
+  const [onlyPicked, setOnlyPicked] = useState(false);
+  const [onlySet, setOnlySet] = useState(false);
+  const seeded = !!(initialSearch || initialCategory);
+
+  const [stage, setStage] = useState<'edit' | 'confirm'>('edit');
+  const [preview, setPreview] = useState<null | {
+    targeted: number; changed: number; skipped: number;
+    would_change: { id: string; name: string; from: number }[];
+  }>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [done, setDone] = useState<string | null>(null);
+
+  /* ---- value, parsed + validated client-side (the ROUTE is the authority;
+          this only saves a round-trip and gives a friendlier message) ---- */
+  const valueNum: number | null = (() => {
+    if (spec.kind === 'flag') return flagVal;
+    const t = pctRaw.trim();
+    if (t === '') return null;
+    const n = Number(t);
+    if (!Number.isFinite(n) || n < 0 || n > 100) return null;
+    return Math.round(n * 100) / 100;
+  })();
+  const valueLabel = spec.kind === 'flag'
+    ? (flagVal === 1 ? 'TAGGED' : 'not tagged')
+    : (valueNum == null ? '—' : `${valueNum}%`);
+
+  /* ---- rows visible under the panel's own filter ---- */
+  const shown = useMemo(() => {
+    const needle = q.trim().toLowerCase();
+    return materials.filter((m) => {
+      if (onlyPicked && !picked.has(m.id)) return false;
+      if (onlySet && bulkCurrent(m, field) === 0) return false;
+      if (cat && m.category !== cat) return false;
+      if (!needle) return true;
+      // Name OR SKU — the list's own search box is name-only, which makes an
+      // item you know by code impossible to find here.
+      return m.name.toLowerCase().includes(needle)
+        || String((m as any).sku || '').toLowerCase().includes(needle);
+    });
+  }, [materials, q, cat, onlyPicked, onlySet, picked, field]);
+
+  const shownIds = useMemo(() => new Set(shown.map(m => m.id)), [shown]);
+  const hiddenPicked = useMemo(
+    () => [...picked].filter(id => !shownIds.has(id)),
+    [picked, shownIds],
+  );
+  const byId = useMemo(() => new Map(materials.map(m => [m.id, m])), [materials]);
+  const shownPickedCount = shown.reduce((n, m) => n + (picked.has(m.id) ? 1 : 0), 0);
+
+  /** Any edit to the selection or the value invalidates a server preview — a
+   *  confirmation that describes a different set than the one Apply would send
+   *  is the exact surprise this modal exists to prevent. */
+  const invalidate = () => { setPreview(null); setStage('edit'); setDone(null); };
+
+  const toggle = (id: string) => {
+    invalidate();
+    setPicked(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  };
+  const tickAllShown = () => {
+    invalidate();
+    setPicked(prev => new Set([...prev, ...shown.map(m => m.id)]));
+  };
+  const untickShown = () => {
+    invalidate();
+    setPicked(prev => { const next = new Set(prev); for (const m of shown) next.delete(m.id); return next; });
+  };
+  const untickHidden = () => {
+    invalidate();
+    setPicked(prev => { const next = new Set(prev); for (const id of hiddenPicked) next.delete(id); return next; });
+  };
+  const clearFilters = () => { setQ(''); setCat(''); setOnlyPicked(false); setOnlySet(false); };
+
+  /* ---- server dry-run: the confirmation is built from the ROUTE's own count,
+          not from the browser's, so what it promises is what will happen ---- */
+  const review = async () => {
+    if (picked.size === 0) { setError('Tick at least one item'); return; }
+    if (valueNum == null) { setError(spec.kind === 'pct' ? 'Enter a percentage between 0 and 100' : 'Pick a value'); return; }
+    setBusy(true); setError(null); setDone(null);
+    try {
+      const r = await api('/api/inventory/bulk-update', {
+        method: 'POST',
+        body: { field, value: valueNum, material_ids: [...picked], dryRun: true },
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+      setPreview({
+        targeted: Number(j.targeted) || 0,
+        changed: Number(j.changed) || 0,
+        skipped: Number(j.skipped) || 0,
+        would_change: Array.isArray(j.would_change) ? j.would_change : [],
+      });
+      setStage('confirm');
+    } catch (e: any) { setError(e?.message || 'Preview failed'); }
+    finally { setBusy(false); }
+  };
+
+  const apply = async () => {
+    if (valueNum == null || preview == null) return;
+    setBusy(true); setError(null);
+    try {
+      const r = await api('/api/inventory/bulk-update', {
+        method: 'POST',
+        body: { field, value: valueNum, material_ids: [...picked] },
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+      setDone(
+        `${spec.label} = ${valueLabel} on ${j.updated} item${j.updated === 1 ? '' : 's'}`
+        + ` — ${j.changed} actually changed`
+        + (Number(j.skipped) > 0 ? `, ${j.skipped} id(s) matched no material` : '') + '.',
+      );
+      setPicked(new Set());
+      setPreview(null);
+      setStage('edit');
+      onApplied();
+    } catch (e: any) { setError(e?.message || 'Apply failed'); setStage('edit'); setPreview(null); }
+    finally { setBusy(false); }
+  };
+
+  const renderCurrent = (m: RawMaterial) => {
+    const v = bulkCurrent(m, field);
+    if (spec.kind === 'flag') return v === 1
+      ? <span className="text-emerald-700 font-semibold">tagged</span>
+      : <span className="text-[#B8A590]">—</span>;
+    return v > 0 ? <span className="text-[#2D1B0E]">{v}%</span> : <span className="text-[#B8A590]">0%</span>;
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/40 flex items-start sm:items-center justify-center p-3 sm:p-4 overflow-y-auto" onClick={onClose}>
+      <div className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-3xl shadow-xl flex flex-col overflow-hidden"
+           style={{ maxHeight: 'calc(100vh - 1.5rem)' }} onClick={e => e.stopPropagation()}>
+        <div className="px-5 py-3 border-b border-[#E8D5C4] flex items-center justify-between shrink-0">
+          <div className="font-semibold text-[#2D1B0E] flex items-center gap-2">
+            <ListChecks className="w-5 h-5 text-violet-600" /> Bulk Edit Items
+          </div>
+          <button onClick={onClose} className="text-[#8B7355] hover:text-[#2D1B0E]"><X className="w-5 h-5" /></button>
+        </div>
+
+        <div className="flex-1 min-h-0 overflow-y-auto p-5 space-y-4">
+          {error && <div className="bg-red-50 border border-red-200 rounded-lg p-2.5 text-sm text-red-700">{error}</div>}
+          {done && <div className="bg-green-50 border border-green-200 rounded-lg p-2.5 text-sm text-green-800 flex items-start gap-2"><CheckCircle className="w-4 h-4 mt-0.5 shrink-0" /> <span>{done}</span></div>}
+
+          {/* 1. field */}
+          <div>
+            <div className="text-xs font-medium text-[#6B5744] mb-1.5">1. Field to set</div>
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+              {BULK_FIELDS.map(f => (
+                <button key={f.key} onClick={() => { setField(f.key); invalidate(); }} title={f.hint}
+                        className={`px-2 py-2 rounded-lg border text-xs text-left ${field === f.key ? 'border-[#af4408] bg-[#af4408]/10 text-[#af4408] font-semibold' : 'border-[#D4B896] bg-[#FFF1E3] text-[#6B5744]'}`}>
+                  {f.label}
+                </button>
+              ))}
+            </div>
+            <p className="text-[11px] text-[#8B7355] mt-1.5">{spec.hint}</p>
+          </div>
+
+          {/* 2. value */}
+          <div>
+            <div className="text-xs font-medium text-[#6B5744] mb-1.5">2. Value to apply</div>
+            {spec.kind === 'pct' ? (
+              <div className="flex flex-wrap items-center gap-2">
+                {MASTER_GST_RATES.map(r => (
+                  <button key={r} onClick={() => { setPctRaw(String(r)); invalidate(); }}
+                          className={`px-2.5 py-1.5 rounded-lg border text-xs ${pctRaw.trim() === String(r) ? 'bg-[#af4408] text-white border-[#af4408]' : 'bg-white text-[#6B5744] border-[#E8D5C4]'}`}>
+                    {r}%
+                  </button>
+                ))}
+                {/* A free box beside the chips, deliberately: a legacy rate that
+                    is not one of the five (a 3% or 0.25% cess) must stay
+                    expressible, exactly as the edit modal keeps an off-list rate
+                    selectable rather than coercing it to 0 on save. */}
+                <div className="flex items-center gap-1.5">
+                  <input type="text" inputMode="decimal" value={pctRaw}
+                         onChange={e => { setPctRaw(rawNum(e.target.value)); invalidate(); }}
+                         placeholder="or type a rate"
+                         className="w-28 px-2 py-1.5 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-sm text-right focus:outline-none focus:ring-2 focus:ring-[#af4408]" />
+                  <span className="text-sm text-[#8B7355]">%</span>
+                </div>
+                {pctRaw.trim() !== '' && valueNum == null && (
+                  <span className="text-xs text-red-700">must be 0–100</span>
+                )}
+              </div>
+            ) : (
+              <div className="flex gap-2">
+                <button onClick={() => { setFlagVal(1); invalidate(); }}
+                        className={`px-3 py-1.5 rounded-lg border text-xs ${flagVal === 1 ? 'bg-[#af4408] text-white border-[#af4408]' : 'bg-white text-[#6B5744] border-[#E8D5C4]'}`}>
+                  Tag as {spec.label.replace('Butchering ', 'butchering ')}
+                </button>
+                <button onClick={() => { setFlagVal(0); invalidate(); }}
+                        className={`px-3 py-1.5 rounded-lg border text-xs ${flagVal === 0 ? 'bg-[#af4408] text-white border-[#af4408]' : 'bg-white text-[#6B5744] border-[#E8D5C4]'}`}>
+                  Remove the tag
+                </button>
+              </div>
+            )}
+          </div>
+
+          {/* 3. items */}
+          <div>
+            <div className="text-xs font-medium text-[#6B5744] mb-1.5">3. Items ({materials.length} materials)</div>
+
+            {seeded && (q || cat) && (
+              <div className="mb-2 text-[11px] text-amber-900 bg-amber-50 border border-amber-200 rounded-lg px-2.5 py-1.5 flex items-center justify-between gap-2">
+                <span>Started from the list&apos;s filter{q ? ` — search “${q}”` : ''}{cat ? `${q ? ',' : ' —'} category “${categoryLabel(cat)}”` : ''}. Nothing is ticked yet.</span>
+                <button onClick={clearFilters} className="text-[#af4408] hover:underline shrink-0">clear</button>
+              </div>
+            )}
+
+            {/* panel-local filter — does NOT touch the list underneath */}
+            <div className="flex flex-col sm:flex-row gap-2 mb-2">
+              <div className="relative flex-1 min-w-0">
+                <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-[#8B7355]" />
+                <input value={q} onChange={e => setQ(e.target.value)} placeholder="Search name or SKU…"
+                       className="w-full pl-8 pr-2 py-1.5 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-[#af4408]" />
+              </div>
+              <select value={cat} onChange={e => setCat(e.target.value)}
+                      className="w-full sm:w-44 px-2 py-1.5 bg-[#FFF1E3] border border-[#D4B896] rounded-lg text-xs focus:outline-none focus:ring-2 focus:ring-[#af4408]">
+                <option value="">All categories</option>
+                {categories.map(c => <option key={c} value={c}>{categoryLabel(c)}</option>)}
+              </select>
+              <label className="flex items-center gap-1.5 text-xs text-[#6B5744] whitespace-nowrap cursor-pointer">
+                <input type="checkbox" checked={onlyPicked} onChange={e => setOnlyPicked(e.target.checked)} className="w-3.5 h-3.5 accent-[#af4408]" />
+                Selected only
+              </label>
+              <label className="flex items-center gap-1.5 text-xs text-[#6B5744] whitespace-nowrap cursor-pointer"
+                     title={`Show only items that already have ${spec.label} set to a non-zero value`}>
+                <input type="checkbox" checked={onlySet} onChange={e => setOnlySet(e.target.checked)} className="w-3.5 h-3.5 accent-[#af4408]" />
+                Already set
+              </label>
+            </div>
+
+            {/* THE counter. Every number says which set it counts. */}
+            <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-[#6B5744] mb-1.5">
+              <span>
+                <b className="text-[#af4408]">{picked.size}</b> selected in total ·
+                {' '}showing <b>{shown.length}</b> of {materials.length}
+                {' '}({shownPickedCount} of the shown rows ticked)
+              </span>
+              <span className="flex gap-2">
+                <button onClick={tickAllShown} className="text-[#af4408] hover:underline">tick all {shown.length} shown</button>
+                <button onClick={untickShown} className="text-[#af4408] hover:underline">untick shown</button>
+              </span>
+            </div>
+
+            {/* The surprise-proofing: a ticked row you cannot see is stated, not
+                hidden, and Apply's scope is spelled out either way. */}
+            {hiddenPicked.length > 0 && (
+              <div className="mb-1.5 text-[11px] text-amber-900 bg-amber-50 border border-amber-200 rounded-lg px-2.5 py-1.5">
+                <b>{hiddenPicked.length}</b> selected item{hiddenPicked.length === 1 ? ' is' : 's are'} hidden by this panel&apos;s filter.
+                {' '}<b>Apply will change all {picked.size} selected items, including those {hiddenPicked.length}.</b>
+                {' '}<button onClick={() => setOnlyPicked(true)} className="text-[#af4408] hover:underline">show selected only</button>
+                {' · '}<button onClick={untickHidden} className="text-[#af4408] hover:underline">untick the hidden {hiddenPicked.length}</button>
+              </div>
+            )}
+
+            <div className="overflow-x-auto rounded-lg border border-[#E8D5C4] max-h-72 overflow-y-auto">
+              <table className="w-full text-xs">
+                <thead className="bg-[#FFF1E3] text-[#8B7355] sticky top-0"><tr>
+                  <th className="px-2 py-1.5 w-8"></th>
+                  <th className="text-left px-2 py-1.5">Material</th>
+                  <th className="text-left px-2 py-1.5">Category</th>
+                  <th className="text-right px-2 py-1.5 whitespace-nowrap">{spec.label} now</th>
+                </tr></thead>
+                <tbody className="divide-y divide-[#F0E4D6]">
+                  {shown.length === 0 ? (
+                    <tr><td colSpan={4} className="px-2 py-6 text-center text-[#8B7355]">No materials match this panel&apos;s filter.</td></tr>
+                  ) : shown.map(m => (
+                    <tr key={m.id} className={picked.has(m.id) ? 'bg-[#af4408]/5' : 'opacity-70'}>
+                      <td className="px-2 py-1.5">
+                        <input type="checkbox" checked={picked.has(m.id)} onChange={() => toggle(m.id)}
+                               aria-label={`Select ${m.name}`} className="w-3.5 h-3.5 accent-[#af4408]" />
+                      </td>
+                      <td className="px-2 py-1.5">
+                        <div className="text-[#2D1B0E] font-medium">{m.name}</div>
+                        <div className="text-[9px] font-mono text-[#8B7355]">{(m as any).sku || ''}</div>
+                      </td>
+                      <td className="px-2 py-1.5 text-[#6B5744]">{categoryLabel(m.category)}</td>
+                      <td className="px-2 py-1.5 text-right whitespace-nowrap">{renderCurrent(m)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          {/* 4. confirmation — built from the SERVER's dry-run, listing the rows
+                 that actually change. Apply is only reachable from here. */}
+          {stage === 'confirm' && preview && (
+            <div className="border-2 border-[#af4408] rounded-lg overflow-hidden">
+              <div className="bg-[#af4408]/10 px-3 py-2 text-sm text-[#2D1B0E]">
+                Set <b>{spec.label}</b> to <b>{valueLabel}</b> on <b>{preview.targeted}</b> item{preview.targeted === 1 ? '' : 's'}.
+                {' '}<b>{preview.changed}</b> will actually change
+                {preview.targeted - preview.changed > 0
+                  ? <> · {preview.targeted - preview.changed} already {spec.kind === 'flag' ? 'match' : 'hold'} this value</>
+                  : null}
+                {preview.skipped > 0 && <> · <span className="text-amber-800">{preview.skipped} selected id(s) are not raw materials and will be skipped</span></>}
+              </div>
+              {preview.changed > 0 && (
+                <div className="max-h-40 overflow-y-auto divide-y divide-[#F0E4D6] text-xs">
+                  {preview.would_change.map(r => (
+                    <div key={r.id} className="px-3 py-1 flex items-center justify-between gap-3">
+                      <span className="text-[#2D1B0E] truncate">{byId.get(r.id)?.name || r.name}</span>
+                      <span className="text-[#8B7355] whitespace-nowrap font-mono">
+                        {spec.kind === 'flag' ? (Number(r.from) === 1 ? 'tagged' : '—') : `${r.from}%`}
+                        {' → '}
+                        <b className="text-[#af4408]">{spec.kind === 'flag' ? (flagVal === 1 ? 'tagged' : '—') : `${valueNum}%`}</b>
+                      </span>
+                    </div>
+                  ))}
+                  {preview.changed > preview.would_change.length && (
+                    <div className="px-3 py-1 text-[#8B7355]">…and {preview.changed - preview.would_change.length} more</div>
+                  )}
+                </div>
+              )}
+              {preview.changed === 0 && (
+                <div className="px-3 py-2 text-xs text-[#6B5744]">
+                  Every selected item already holds this value — applying would change nothing.
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+
+        <div className="px-5 py-3 border-t border-[#E8D5C4] flex items-center justify-end gap-2 shrink-0">
+          <button onClick={onClose} disabled={busy} className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm disabled:opacity-50">Close</button>
+          {stage === 'edit' ? (
+            <button onClick={review} disabled={busy || picked.size === 0 || valueNum == null}
+                    title={picked.size === 0 ? 'Tick at least one item' : ''}
+                    className="px-4 py-2 bg-white border border-[#af4408] text-[#af4408] hover:bg-[#af4408]/10 rounded-lg text-sm font-medium flex items-center gap-1.5 disabled:opacity-50">
+              {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
+              Review {picked.size} selected
+            </button>
+          ) : (
+            <>
+              <button onClick={() => { setStage('edit'); setPreview(null); }} disabled={busy}
+                      className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm disabled:opacity-50">
+                Back
+              </button>
+              <button onClick={apply} disabled={busy || !preview || preview.targeted === 0}
+                      className="px-4 py-2 bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg text-sm font-semibold flex items-center gap-1.5 disabled:opacity-50">
+                {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle className="w-4 h-4" />}
+                Set {spec.label} = {valueLabel} on {preview?.targeted ?? 0} item{(preview?.targeted ?? 0) === 1 ? '' : 's'}
+              </button>
+            </>
           )}
         </div>
       </div>
