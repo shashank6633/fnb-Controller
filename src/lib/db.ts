@@ -5380,6 +5380,164 @@ function initializeSchema(db: Database.Database) {
     `);
   } catch (e) { console.error('movement-record schema failed:', e); }
 
+  /* ── party_consumption → party_issue : A TRANSFER THAT WAS CALLED A LOSS ──
+   *
+   * A party requisition's store→department hand-over wrote
+   * inventory_transactions.type = 'party_consumption'. It is not a consumption:
+   * the goods move to the department, whose on_hand is credited in the same
+   * transaction (src/lib/party-fulfillment.ts), and the kitchen draws them down
+   * afterwards. But the TYPE is what every report buckets on, and this one sat
+   * in the outflow whitelist beside 'sale' and 'wastage' — so an internal
+   * transfer read as stock consumed and gone. That is the whole defect: the
+   * movement was always right, its NAME was wrong.
+   *
+   * 'party_issue' ("Issued to a party / event") already existed in
+   * CENTRAL_TXN_TYPES and is what actually happened. This reclassifies the
+   * history so old rows and new rows say the same thing.
+   *
+   * ⚠ THIS TOUCHES A TYPE VALUE. IT MUST NEVER TOUCH THE TABLE OF THE SAME
+   *   NAME. `party_consumption` is ALSO a table (created ~line 2493 above —
+   *   the Liquor Consumption register that feeds party P&L). It is a different
+   *   object with a different purpose and it is not involved here. Note the
+   *   shape of the statement below: `inventory_transactions` is its only object
+   *   and the string 'party_consumption' appears exactly once, as a quoted
+   *   literal compared against a COLUMN. Never in a FROM / UPDATE / INTO
+   *   position. A find-and-replace that forgets this corrupts the register.
+   *
+   * IDEMPOTENT BY CONSTRUCTION, and deliberately WITHOUT a settings flag. The
+   * WHERE is self-limiting: after one run no row matches, so a second run
+   * changes 0. The house flag idiom exists to stop boot-time recomputes from
+   * reverting ADMIN decisions; nobody sets inventory_transactions.type by hand,
+   * so that rationale does not apply — and a flag would make this
+   * non-convergent, stranding any row restored from an old backup under the
+   * legacy name for ever. Unconditional + self-limiting is the safer shape.
+   *
+   * SAFE IN EITHER DIRECTION because it is NOT what makes the code correct:
+   * every predicate on both party writers matches BOTH names, permanently
+   * (movement-record.ts PARTY_TRANSFER_TYPES). New code on un-migrated rows is
+   * safe; a restored pre-migration backup is safe and re-converges on boot.
+   * THE ONE UNSAFE DIRECTION IS A CODE ROLLBACK AFTER THIS HAS RUN: old code
+   * re-arms a narrow 'party_consumption'-only guard against renamed rows, every
+   * already-fulfilled party looks un-transferred, and central is deducted a
+   * SECOND time. Roll the database back with the code, or reverse the rename
+   * first (bounded by `reference_id IN (SELECT id FROM requisitions)` — a bare
+   * reverse would capture the Party Items rail, which writes 'party_issue'
+   * natively and was never 'party_consumption').
+   */
+  try {
+    // Partial index on the LEGACY value only. In the steady state it holds ZERO
+    // entries (no row carries the old name), so it costs ~44 KB and nothing
+    // else — and it turns the convergent UPDATE below from a full scan of the
+    // largest table on every cold start into an index probe.
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_it_legacy_party_consumption
+        ON inventory_transactions(type) WHERE type = 'party_consumption';
+    `);
+    const moved = db.prepare(`
+      UPDATE inventory_transactions
+         SET type = 'party_issue'
+       WHERE type = 'party_consumption'
+    `).run().changes;
+    if (moved > 0) console.log(`[db] party_issue rename: reclassified ${moved} ledger row(s)`);
+  } catch (e) { console.error('party_issue rename migration failed:', e); }
+
+  /* ── THE ROLLBACK BACKSTOP: A GUARD THAT LIVES IN THE DATABASE ─────────────
+   *
+   * The rename above has ONE unsafe direction, and it is not reachable from the
+   * code that ships with it: roll the CODE back to a build whose idempotency
+   * guard matches only 'party_consumption', leave the DATABASE migrated, and
+   * every already-fulfilled party requisition reads as never-transferred. The
+   * old guard finds nothing, the old cascade deducts the same goods a SECOND
+   * time, and the old PO void credits back ZERO rows while still un-fulfilling
+   * the requisition. Measured at 1,592 rows and −6,095,974 units of real stock.
+   *
+   * No amount of care in THIS release can fix that, because in that world this
+   * release's code is gone. The only defence that survives a code rollback is
+   * one that lives in the database file itself — so here it is.
+   *
+   * WHAT IT BLOCKS, AND ONLY THIS: inserting a party-transfer row for a
+   * reference_id that ALREADY carries a party-transfer row under the OTHER type
+   * name. That is the exact and complete signature of the double deduction:
+   * old code writing 'party_consumption' on top of migrated 'party_issue' rows,
+   * or new code writing 'party_issue' on top of un-migrated legacy rows. The
+   * insert aborts, and because both writers deduct raw_materials.current_stock
+   * inside the same transaction as the ledger row, the deduction rolls back
+   * with it. LOUD AND INTACT beats silent and wrong.
+   *
+   * IT CANNOT FIRE IN FORWARD OPERATION, and that is structural, not hopeful:
+   *   · One fulfilment writes ONE type name for every line, so a multi-line
+   *     party requisition never trips it (same type ⇒ `type <> NEW.type` false).
+   *   · The two writers guard each other on reference_id before they insert, so
+   *     the second rail skips rather than reaching this trigger at all.
+   *   · A PO void DELETEs the party rows before any re-receive re-inserts them,
+   *     so the round trip is clean.
+   *   · The Party Items rail (api/parties/items) has only ever written
+   *     'party_issue', against a party_items id that is never a requisition id,
+   *     and its returns are typed 'party_return' — outside the WHEN clause.
+   *   · A NULL reference_id matches nothing (`= NULL` is never true), so
+   *     un-referenced rows are unaffected.
+   * Verified against the live schema: zero (reference_id, material_id) or
+   * (reference_id, type) duplicates exist among party rows, and zero
+   * (req_id, material_id) duplicates exist across all 16,353 requisition_items.
+   *
+   * THE WHEN CLAUSE IS THE COST CONTROL. inventory_transactions takes an insert
+   * on every purchase, sale and transfer; SQLite evaluates the trigger body
+   * only when NEW.type is one of the two party names, so every other insert
+   * pays a single string comparison and nothing else.
+   *
+   * IF IT EVER DOES FIRE, the fix is not to drop it. Either roll the database
+   * back alongside the code, or run the bounded reverse —
+   * `node scripts/party-issue-rollback.js <db> --apply` — which is bounded by
+   * `reference_id IN (SELECT id FROM requisitions)` precisely so it cannot drag
+   * the natively-'party_issue' Party Items rail back to a name it never had.
+   */
+  try {
+    /* THE PARTY REFERENCE INDEX — what makes all of this free.
+     *
+     * FIVE predicates now probe inventory_transactions by reference_id + the
+     * two party type names: the two idempotency guards (party-fulfillment.ts,
+     * po-requisition-fulfil.ts), the PO void's plan SELECT and its DELETE, and
+     * the trigger body below. inventory_transactions has NO index on
+     * reference_id, so every one of them was a full SCAN of the largest table —
+     * on the hot store-issue path, synchronously, once per line.
+     *
+     * PARTIAL, on purpose. Measured on a synthetic table at production's ~1:250
+     * party-row ratio, guard probe and party insert (trigger live):
+     *    12,000 rows   no index  0.4188 / 0.4804 ms   SCAN
+     *                  partial   0.0015 / 0.0044 ms   SEARCH ... USING INDEX      12 KB
+     *   500,000 rows   no index  1.3870 / 26.7795 ms  SCAN
+     *                  partial   0.0020 / 0.0045 ms   SEARCH ... USING INDEX      53 KB
+     *                  FULL      0.0041 / 0.0045 ms   same speed, 8,974,336 bytes
+     * The full index is 169× the size for no gain, because only party rows are
+     * ever looked up this way. And a non-party insert (a purchase, a sale) pays
+     * NOTHING for the partial index — 0.0030 ms with it, 0.0030 ms without —
+     * since those rows are not in it at all.
+     *
+     * Verified with EXPLAIN QUERY PLAN that SQLite really does match the index's
+     * `type IN (...)` against the guards' own `type IN (...)`:
+     *   SEARCH inventory_transactions USING INDEX idx_it_party_ref (reference_id=?)
+     */
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_it_party_ref
+        ON inventory_transactions(reference_id)
+        WHERE type IN ('party_consumption', 'party_issue');
+    `);
+    db.exec(`
+      CREATE TRIGGER IF NOT EXISTS trg_party_transfer_no_double_deduct
+      BEFORE INSERT ON inventory_transactions
+      WHEN NEW.type IN ('party_consumption', 'party_issue')
+      BEGIN
+        SELECT RAISE(ABORT,
+          'party transfer already recorded for this reference under the other type name - refusing a second central deduction (see PARTY_TRANSFER_TYPES / scripts/party-issue-rollback.js)')
+        FROM inventory_transactions
+        WHERE reference_id = NEW.reference_id
+          AND type IN ('party_consumption', 'party_issue')
+          AND type <> NEW.type
+        LIMIT 1;
+      END;
+    `);
+  } catch (e) { console.error('party transfer double-deduct trigger failed:', e); }
+
   // ── Party Menu (manager-enabled LIMITED menu for selected tables, additive) ─
   // A curated subset of à-la-carte items shown ONLY on specific tables' QR menu
   // while ENABLED (e.g. a 10–20 pax party the host wants without costly liquor).

@@ -1284,7 +1284,21 @@ function buildUnion(f: {
       FROM inventory_transactions it
       LEFT JOIN raw_materials rm ON rm.id = it.material_id
       WHERE substr(it.created_at, 1, 10) >= ? AND substr(it.created_at, 1, 10) <= ?
-        AND it.type IN ('sale', 'nc', 'party_consumption', 'staff_meal', 'wastage')
+        -- THE PARTY TRANSFER IS NOT LISTED HERE, AND THAT IS THE 2026-09-17 FIX.
+        -- This stage is recipe consumption at cook time, stamped in its own
+        -- notes as "not attributable to a specific issue". A party requisition's
+        -- store→department hand-over is the opposite of both: it moves goods to
+        -- our own kitchen, and it IS attributable to a specific issue — it
+        -- already appears on the ISSUE stage above, because issue-stock.ts
+        -- writes a requisition_issue_ledger row for every party line with
+        -- skip_reason 'party' and stock_applied 0. So the same hand-over was
+        -- being shown twice: once correctly as an issue, and once here beside
+        -- 'sale' and 'wastage' as consumed and gone. It was listed under its old
+        -- type name 'party_consumption' (renamed 'party_issue'; see
+        -- movement-record.ts PARTY_TRANSFER_TYPES). Removing it is deliberate,
+        -- not a side effect of the rename, so that a restored pre-rename backup
+        -- cannot put it back. Do not add 'party_issue' in its place.
+        AND it.type IN ('sale', 'nc', 'staff_meal', 'wastage')
         ${matFilter('it.material_id')}${deptFilter(consDeptId)}
     `);
     params.push(f.from, f.to);
