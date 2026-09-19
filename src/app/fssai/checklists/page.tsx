@@ -555,19 +555,22 @@ export default function FssaiChecklistsPage() {
     <div className="min-h-screen bg-[#FFF8F0] text-[#2D1B0E]">
       <div className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-5">
 
-        {/* Header */}
+        {/* Header. The title block takes a WHOLE row under sm: on a 390px phone a
+            single flex row squeezes it to a nine-character column (measured). */}
         <div className="flex flex-wrap items-center gap-3">
-          <div className="w-10 h-10 rounded-xl bg-[#af4408] text-white flex items-center justify-center shrink-0">
-            <ListChecks size={20} />
-          </div>
-          <div className="min-w-0 flex-1">
-            <p className="text-[11px] font-semibold text-[#8B7355] uppercase tracking-wider">FSSAI Compliance</p>
-            <h1 className="text-2xl sm:text-3xl font-bold text-[#af4408]">FSSAI Checklists</h1>
-            <p className="text-xs text-[#8B7355] mt-0.5">
-              {canAuthor
-                ? 'Every checklist the restaurant runs. Create one, say who runs it and how often, publish it — no developer involved.'
-                : 'The checklists the restaurant runs, how often each one is due and which department owns it.'}
-            </p>
+          <div className="flex items-center gap-3 w-full sm:w-auto sm:flex-1 min-w-0">
+            <div className="w-10 h-10 rounded-xl bg-[#af4408] text-white flex items-center justify-center shrink-0">
+              <ListChecks size={20} />
+            </div>
+            <div className="min-w-0 flex-1">
+              <p className="text-[11px] font-semibold text-[#8B7355] uppercase tracking-wider">FSSAI Compliance</p>
+              <h1 className="text-2xl sm:text-3xl font-bold text-[#af4408]">FSSAI Checklists</h1>
+              <p className="text-xs text-[#8B7355] mt-0.5">
+                {canAuthor
+                  ? 'Every checklist the restaurant runs. Create one, say who runs it and how often, publish it — no developer involved.'
+                  : 'The checklists the restaurant runs, how often each one is due and which department owns it.'}
+              </p>
+            </div>
           </div>
           <button onClick={() => void load()} disabled={loading}
             className="inline-flex items-center gap-1.5 text-sm border border-[#E8D5C4] bg-white rounded-lg px-3 py-2 hover:bg-[#FFF1E3] disabled:opacity-50">
@@ -589,7 +592,7 @@ export default function FssaiChecklistsPage() {
         </div>
 
         {err && (
-          <div className="bg-red-50 border border-red-200 rounded-lg p-3 text-sm text-red-800 flex items-start gap-2">
+          <div className="bg-red-50 border border-red-200 rounded-lg p-3 text-sm text-red-800 flex items-start gap-2 flex-nowrap">
             <AlertTriangle size={16} className="shrink-0 mt-0.5" /> <span className="min-w-0">{err}</span>
           </div>
         )}
@@ -604,22 +607,22 @@ export default function FssaiChecklistsPage() {
             authoring, not about running a check. */}
         {canAuthor && (
           <div className="bg-[#FFF1E3] border border-[#E8D5C4] rounded-xl p-4 text-sm text-[#3D2614] space-y-1.5">
-            <p className="flex items-start gap-2">
+            <p className="flex items-start gap-2 flex-nowrap">
               <Info size={15} className="text-[#af4408] shrink-0 mt-0.5" />
               <span>
-                <b>A checklist lives here, not in the software.</b> Build it, publish it, and staff can run it. Change it
+                <b>A checklist lives here, not in the software.</b>{' '}Build it, publish it, and staff can run it. Change it
                 whenever the rules change — you do not need a developer, and you never need to wait for a release.
               </span>
             </p>
             <p className="pl-[23px]">
-              <b>Editing never rewrites the past.</b> A finished check keeps the questions, the pass mark and the name it
+              <b>Editing never rewrites the past.</b>{' '}A finished check keeps the questions, the pass mark and the name it
               was taken under. Renaming a checklist does not change its version and does not re-label a single record
               already filed. Only {FSSAI_VERSION_BUMPING_TEMPLATE_FIELDS.length} settings — the pass mark, what the check
               is run against, and whether a signature or a second sign-off is required — plus any change to the questions
               themselves, move it to a new version.
             </p>
             <p className="pl-[23px]">
-              <b>Nothing is ever deleted.</b> Retiring a checklist archives it: no new checks can be started, the records
+              <b>Nothing is ever deleted.</b>{' '}Retiring a checklist archives it: no new checks can be started, the records
               stay readable, and it can be brought back. A checklist that has never been used can be deleted outright.
             </p>
           </div>
@@ -807,7 +810,14 @@ export default function FssaiChecklistsPage() {
                         <td className="px-3 py-2.5 text-right text-[#3D2614]">
                           {t.run_count}
                           <div className="text-[11px] text-[#8B7355]">
-                            {lastRun.get(t.id) ? `last ${fmtISTDate(lastRun.get(t.id))}` : 'none you can see'}
+                            {/* Three different facts, never conflated: nothing has
+                                ever been filed · the newest one you may see · it
+                                has been run, but not by anyone in your scope. */}
+                            {Number(t.run_count) === 0
+                              ? 'never run'
+                              : lastRun.get(t.id)
+                                ? `last ${fmtISTDate(lastRun.get(t.id))}`
+                                : 'none you can see'}
                           </div>
                         </td>
                         {canAuthor && (
@@ -832,8 +842,8 @@ export default function FssaiChecklistsPage() {
         {!loading && templates.length > 0 && (
           <div className="text-xs text-[#8B7355] space-y-1">
             <p>
-              <b>Records</b> counts every check ever filed against a checklist, including ones filed by other
-              departments. <b>Last</b> is the most recent check <i>you</i> are allowed to see — management sees every
+              <b>Records</b>{' '}counts every check ever filed against a checklist, including ones filed by other
+              departments. <b>Last</b>{' '}is the most recent check <i>you</i>{' '}are allowed to see — management sees every
               department, everyone else sees their own.
             </p>
             {!canAuthor && (
@@ -908,16 +918,20 @@ export default function FssaiChecklistsPage() {
           }
         >
           <ul className="text-sm text-[#3D2614] space-y-2">
-            <li className="flex gap-2"><CheckCircle2 size={15} className="text-green-600 shrink-0 mt-0.5" />
-              <span>The {archiving.t.run_count} check{archiving.t.run_count === 1 ? '' : 's'} already recorded against
-                it stay exactly as they are, and stay readable. Nothing is deleted.</span></li>
-            <li className="flex gap-2"><X size={15} className="text-red-600 shrink-0 mt-0.5" />
+            <li className="flex gap-2 flex-nowrap"><CheckCircle2 size={15} className="text-green-600 shrink-0 mt-0.5" />
+              {/* Plural agreement carries all the way through the sentence: "1 check
+                  … stays as it is", "3 checks … stay as they are". A compliance
+                  screen that cannot count to one is not reassuring. */}
+              <span>{Number(archiving.t.run_count) === 1
+                ? 'The 1 check already recorded against it stays exactly as it is, and stays readable. Nothing is deleted.'
+                : `The ${archiving.t.run_count} checks already recorded against it stay exactly as they are, and stay readable. Nothing is deleted.`}</span></li>
+            <li className="flex gap-2 flex-nowrap"><X size={15} className="text-red-600 shrink-0 mt-0.5" />
               <span>No new check can be started against it.</span></li>
-            <li className="flex gap-2"><X size={15} className="text-red-600 shrink-0 mt-0.5" />
-              <span>Its {archiving.t.assignment_count} live assignment{archiving.t.assignment_count === 1 ? '' : 's'} are
-                stood down, so it stops appearing in anyone&apos;s list of what is due. They are kept, not deleted, so
-                restoring it shows what it used to owe.</span></li>
-            <li className="flex gap-2"><Undo2 size={15} className="text-[#af4408] shrink-0 mt-0.5" />
+            <li className="flex gap-2 flex-nowrap"><X size={15} className="text-red-600 shrink-0 mt-0.5" />
+              <span>{Number(archiving.t.assignment_count) === 1
+                ? 'Its 1 live assignment is stood down, so it stops appearing in anyone’s list of what is due. It is kept, not deleted, so restoring it shows what it used to owe.'
+                : `Its ${archiving.t.assignment_count} live assignments are stood down, so it stops appearing in anyone’s list of what is due. They are kept, not deleted, so restoring it shows what it used to owe.`}</span></li>
+            <li className="flex gap-2 flex-nowrap"><Undo2 size={15} className="text-[#af4408] shrink-0 mt-0.5" />
               <span>You can bring it back at any time. It returns as a <b>draft</b>, so you re-read it and publish it
                 on purpose.</span></li>
           </ul>
@@ -948,7 +962,7 @@ export default function FssaiChecklistsPage() {
             This cannot be undone. The checklist, its sections and its questions go for good.
           </div>
           <p className="text-sm text-[#3D2614]">
-            It is offered because <b>no check has ever been recorded</b> against this checklist. The moment one has, this
+            It is offered because <b>no check has ever been recorded</b>{' '}against this checklist. The moment one has, this
             option disappears and archiving is the only way to retire it — a food-safety record is never deleted.
           </p>
           <p className="text-sm text-[#6B5744]">
@@ -1134,7 +1148,7 @@ function HeaderModal({ mode, draft, original, masters, saving, error, onChange, 
       {mode === 'create' && (
         <p className="text-sm text-[#6B5744]">
           This is the cover of the checklist: what it is called, how often it is due and how it is judged. The questions
-          come next, on the builder. A new checklist starts as a <b>draft</b> — nobody can run it until you publish it.
+          come next, on the builder. A new checklist starts as a <b>draft</b>{' '}— nobody can run it until you publish it.
         </p>
       )}
 
@@ -1235,7 +1249,7 @@ function HeaderModal({ mode, draft, original, masters, saving, error, onChange, 
       {warnings.length > 0 && (
         <div className="space-y-2">
           {warnings.map((w, i) => (
-            <div key={i} className="bg-amber-50 border border-amber-200 rounded-lg p-3 text-sm text-amber-900 flex gap-2">
+            <div key={i} className="bg-amber-50 border border-amber-200 rounded-lg p-3 text-sm text-amber-900 flex gap-2 flex-nowrap">
               <Info size={15} className="shrink-0 mt-0.5" /> <span className="min-w-0">{w}</span>
             </div>
           ))}
@@ -1300,20 +1314,34 @@ function HeaderModal({ mode, draft, original, masters, saving, error, onChange, 
  * is the evidence of what was owed and to whom.
  * ══════════════════════════════════════════════════════════════════════════ */
 
-const BLANK_ASSIGN = {
-  department_id: '',
-  responsible_role_id: '',
-  assignee_email: '',
-  target_kind: 'none',
-  target_label: '',
-  shift: '',
-  frequency: 'daily',
-  day_of_week: 1,
-  day_of_month: 1,
-  times_csv: '',
-  grace_minutes: 60,
-  next_due_date: '',
-};
+/**
+ * A new assignment starts from the CHECKLIST's own settings — its department,
+ * its responsible role, its frequency and what it is run against — because that
+ * is what the admin already decided, and retyping it is how a rota drifts away
+ * from the checklist it belongs to.
+ *
+ * MEASURED BUG THIS FIXES: the form used to reset to a blank object after a
+ * successful save, so the second assignment made in one sitting silently landed
+ * on "anyone signed in, any department" — the widest possible scope, created by
+ * a click that looked like a repeat of the first. One seed function now, used
+ * for the first form and every reset.
+ */
+function seedAssign(t: TemplateRow) {
+  return {
+    department_id: t.department_id || '',
+    responsible_role_id: t.responsible_role_id || '',
+    assignee_email: '',
+    target_kind: t.target_kind || 'none',
+    target_label: '',
+    shift: '',
+    frequency: t.frequency || 'daily',
+    day_of_week: 1,
+    day_of_month: 1,
+    times_csv: '',
+    grace_minutes: 60,
+    next_due_date: '',
+  };
+}
 
 function AssignmentsModal({ template, masters, onClose, flash }: {
   template: TemplateRow;
@@ -1327,7 +1355,7 @@ function AssignmentsModal({ template, masters, onClose, flash }: {
   const [err, setErr] = useState('');
   const [busy, setBusy] = useState('');
   const [adding, setAdding] = useState(false);
-  const [form, setForm] = useState({ ...BLANK_ASSIGN, frequency: template.frequency || 'daily', target_kind: template.target_kind || 'none', department_id: template.department_id || '', responsible_role_id: template.responsible_role_id || '' });
+  const [form, setForm] = useState(() => seedAssign(template));
 
   const load = useCallback(async () => {
     setLoading(true); setErr('');
@@ -1353,7 +1381,7 @@ function AssignmentsModal({ template, masters, onClose, flash }: {
         method: 'POST', body: { template_id: template.id, ...form },
       });
       setAdding(false);
-      setForm({ ...BLANK_ASSIGN, frequency: template.frequency || 'daily', target_kind: template.target_kind || 'none' });
+      setForm(seedAssign(template));   // back to the CHECKLIST's settings, never to blank
       flash(
         j.following_due_date
           ? `Assigned. After this one is done, the next is due ${fmtISTDate(j.following_due_date)}.`
@@ -1590,6 +1618,20 @@ function AssignmentsModal({ template, masters, onClose, flash }: {
                 onChange={(e) => setForm({ ...form, next_due_date: e.target.value })} className={INPUT} />
             </Field>
           </div>
+
+          {/* An assignment with nothing in any of the three "who" boxes lands on
+              every signed-in member of staff. That is occasionally what he
+              means, so it is SAID, not refused — the same rule the engine's own
+              config_warnings follow. */}
+          {!form.department_id && !form.responsible_role_id && !form.assignee_email && (
+            <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 text-sm text-amber-900 flex gap-2 flex-nowrap">
+              <Info size={15} className="shrink-0 mt-0.5" />
+              <span className="min-w-0">
+                No department, no role and no named person: this lands on <b>anyone signed in</b>, anywhere in the
+                restaurant. Pick at least one if you meant a particular team.
+              </span>
+            </div>
+          )}
 
           <div className="flex justify-end gap-2">
             <button onClick={() => setAdding(false)}

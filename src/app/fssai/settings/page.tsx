@@ -231,17 +231,20 @@ export default function FssaiSettingsPage() {
     <div className="min-h-screen bg-[#FFF8F0] text-[#2D1B0E]">
       <div className="max-w-5xl mx-auto px-4 sm:px-6 py-6 space-y-5">
 
-        {/* Header */}
+        {/* Header. The title block takes a WHOLE row under sm: on a 390px phone a
+            single flex row squeezes it to a nine-character column (measured). */}
         <div className="flex flex-wrap items-center gap-3">
-          <div className="w-10 h-10 rounded-xl bg-[#af4408] text-white flex items-center justify-center shrink-0">
-            <Settings2 size={20} />
-          </div>
-          <div className="min-w-0 flex-1">
-            <p className="text-[11px] font-semibold text-[#8B7355] uppercase tracking-wider">FSSAI Compliance</p>
-            <h1 className="text-2xl sm:text-3xl font-bold text-[#af4408]">Settings</h1>
-            <p className="text-xs text-[#8B7355] mt-0.5">
-              Your standards, in the order you would set them. Nothing here is written into the software.
-            </p>
+          <div className="flex items-center gap-3 w-full sm:w-auto sm:flex-1 min-w-0">
+            <div className="w-10 h-10 rounded-xl bg-[#af4408] text-white flex items-center justify-center shrink-0">
+              <Settings2 size={20} />
+            </div>
+            <div className="min-w-0 flex-1">
+              <p className="text-[11px] font-semibold text-[#8B7355] uppercase tracking-wider">FSSAI Compliance</p>
+              <h1 className="text-2xl sm:text-3xl font-bold text-[#af4408]">Settings</h1>
+              <p className="text-xs text-[#8B7355] mt-0.5">
+                Your standards, in the order you would set them. Nothing here is written into the software.
+              </p>
+            </div>
           </div>
           <span className="inline-flex items-center gap-1 text-xs font-semibold px-2 py-0.5 rounded-full border bg-purple-100 text-purple-700 border-purple-200">
             <Lock className="w-3 h-3" /> Admin only
@@ -253,7 +256,7 @@ export default function FssaiSettingsPage() {
         </div>
 
         {err && (
-          <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 text-sm text-amber-900 flex items-start gap-2">
+          <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 text-sm text-amber-900 flex items-start gap-2 flex-nowrap">
             <AlertTriangle size={16} className="shrink-0 mt-0.5" />
             <span className="min-w-0">{err} The rest of this screen is still accurate.</span>
           </div>
@@ -317,20 +320,20 @@ export default function FssaiSettingsPage() {
           <ul className="mt-3 space-y-2.5 text-sm text-[#3D2614]">
             <li className="flex gap-2.5">
               <CheckCircle2 size={15} className="text-green-600 shrink-0 mt-0.5" />
-              <span><b>A finished check can never change.</b> The questions, the pass mark, the limits and even the
+              <span><b>A finished check can never change.</b>{' '}The questions, the pass mark, the limits and even the
                 checklist&apos;s name are frozen onto the record when it is submitted. Edit the checklist as often as you
                 like — last month&apos;s records still read as they did last month.</span>
             </li>
             <li className="flex gap-2.5">
               <Info size={15} className="text-[#af4408] shrink-0 mt-0.5" />
-              <span><b>A new version is only for a real change.</b> Adding, editing, reordering or retiring a question
+              <span><b>A new version is only for a real change.</b>{' '}Adding, editing, reordering or retiring a question
                 moves the checklist to a new version, and so do{' '}
                 {FSSAI_VERSION_BUMPING_TEMPLATE_FIELDS.length} settings: the pass mark, what the check is run against,
                 and whether a signature or a second sign-off is required.</span>
             </li>
             <li className="flex gap-2.5">
               <Info size={15} className="text-[#af4408] shrink-0 mt-0.5" />
-              <span><b>Renaming is not a new version</b> — and it does not re-label a single record already filed.
+              <span><b>Renaming is not a new version</b>{' '}— and it does not re-label a single record already filed.
                 Correcting a spelling was never meant to rewrite your history.</span>
             </li>
             <li className="flex gap-2.5">
@@ -340,7 +343,7 @@ export default function FssaiSettingsPage() {
             </li>
             <li className="flex gap-2.5">
               <Shield size={15} className="text-[#af4408] shrink-0 mt-0.5" />
-              <span><b>Nothing is deleted.</b> Retiring a checklist archives it: no new checks, records kept, and it can
+              <span><b>Nothing is deleted.</b>{' '}Retiring a checklist archives it: no new checks, records kept, and it can
                 be brought back — as a draft, so it is re-read before it goes live again. Only a checklist that has never
                 been used can be deleted outright, and that asks you why.</span>
             </li>
@@ -489,7 +492,7 @@ function Step({ n, icon: Icon, title, what, why, href, cta, state, facts, nudge 
   const buildable = state !== 'notyet';
   return (
     <div className="bg-white rounded-xl border border-[#E8D5C4] p-4 sm:p-5">
-      <div className="flex items-start gap-3">
+      <div className="flex items-start gap-3 flex-nowrap">
         <div className={`w-8 h-8 rounded-lg flex items-center justify-center shrink-0 text-sm font-bold ${buildable ? 'bg-[#af4408] text-white' : 'bg-[#FFF1E3] text-[#8B7355] border border-[#E8D5C4]'}`}>
           {n}
         </div>
