@@ -75,6 +75,42 @@ export function startSchedulerOnce(): void {
 
   const tick = async () => {
     try {
+      // GOOGLE REVIEWS — the automatic pull. THIS IS THE DRIVER; without it
+      // there is none, and src/lib/reviews/refresh.ts says so in its own header
+      // ("NOTHING DRIVES THIS YET"). The external-cron alternative needs the
+      // refresh endpoint carved out of the proxy's protected prefixes, which is
+      // a change to a shared security file — so the in-process hook is the one
+      // that costs nothing to be wrong about.
+      //
+      // SAFE ON EVERY TICK. runReviewAutoRefresh decides for itself whether a
+      // pull is owed and returns 'not_due' in microseconds when it is not, so
+      // the 5-minute cadence costs a settings read. It also stamps a heartbeat
+      // FIRST and unconditionally, which is what lets the Reviews page show an
+      // automatic badge on evidence that a driver is alive rather than on the
+      // mere fact that a schedule was configured.
+      //
+      // IT NEVER THROWS by its own contract, and it takes an advisory lock so
+      // this tick and a future external cron cannot pull the same page twice
+      // against a quota Google does not publish a number for. The try/catch and
+      // the dynamic import are still here because every neighbour has them: a
+      // fault in the reviews module must not take the rest of the tick with it.
+      try {
+        const { runReviewAutoRefresh } = await import('./reviews/refresh');
+        const { getDb } = await import('./db');
+        const rev = await runReviewAutoRefresh({ db: getDb() });
+        // 'not_due' is the overwhelmingly common answer and says nothing worth
+        // a log line every five minutes. Everything else is worth seeing.
+        if (rev.outcome !== 'not_due') {
+          const counts = [
+            rev.inserted ? `${rev.inserted} new` : '',
+            rev.updated ? `${rev.updated} updated` : '',
+          ].filter(Boolean).join(', ');
+          console.log(`[scheduler] reviews: ${rev.outcome}${counts ? ` (${counts})` : ''} — ${rev.detail}`);
+        }
+      } catch (e) {
+        console.error('[scheduler] reviews refresh failed:', e instanceof Error ? e.message : e);
+      }
+
       const res = await refreshUpcomingParties('cron');
       globalThis.__fnbScheduler__!.lastRun = Date.now();
       globalThis.__fnbScheduler__!.lastResult = res;
