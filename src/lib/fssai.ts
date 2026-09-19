@@ -1177,7 +1177,200 @@ export function summariseFssaiRun(
 }
 
 /* ------------------------------------------------------------------ *
- * 10. SMALL SHARED HELPERS
+ * 10. EVIDENCE AND THE SIGNATURE — the numbers the phone and the server
+ *     must agree on (P3)
+ * ------------------------------------------------------------------ */
+
+/**
+ * WHY THESE NUMBERS ARE HERE AND NOT IN THE ROUTE.
+ *
+ * The phone shrinks the photograph; the server refuses one that is still too
+ * big. If those two limits disagree, a member of staff standing in a cold room
+ * gets "Payload too large" after a successful-looking compression and has no
+ * idea what to do. So the cap lives in ONE module both halves import.
+ *
+ * THE REAL CONSTRAINT IS NOT THIS CAP — IT IS nginx (HARD RULE 14). A direct
+ * probe of production measured `client_max_body_size` accepting about **1 MB**,
+ * not the 25M `deploy/nginx.conf` claims: 900 KB reached the app and 1,100 KB
+ * returned 413 before any route ran. A modern phone camera produces 3-8 MB, so
+ * an uncompressed capture can never reach this module — the resize is not an
+ * optimisation, it is the only way the feature works at all.
+ *
+ * THE BUDGET, deliberately conservative against that 1 MB wall:
+ *   · FSSAI_PHOTO_TARGET_BYTES  250 KB — what the client aims for (the figure
+ *     ImageUpload has used since the Task module shipped; ~1200 px longest edge
+ *     at JPEG q0.7).
+ *   · FSSAI_PHOTO_MAX_BYTES     400 KB — what the server will accept. Higher
+ *     than the target so a stubborn photograph is not lost, and low enough that
+ *     the base64 request body (~4/3 of this, ~533 KB, plus JSON) is barely half
+ *     of nginx's real limit. ONE photograph per request, always.
+ *   · the per-answer and per-run counts exist because §7 Q13 is undecided:
+ *     photographs live in-row as TEXT, so 4 a day is ~365 MB a year in a
+ *     database file that is 15 MB today. A cap the owner can see beats silent
+ *     growth he cannot.
+ */
+export const FSSAI_PHOTO_TARGET_BYTES = 250 * 1024;
+export const FSSAI_PHOTO_MAX_BYTES = 400 * 1024;
+export const FSSAI_PHOTO_MAX_EDGE_PX = 1200;
+export const FSSAI_EVIDENCE_MAX_PER_ANSWER = 4;
+export const FSSAI_EVIDENCE_MAX_PER_RUN = 24;
+
+/** The only image types a data: URI may carry into fssai_evidence. */
+export const FSSAI_PHOTO_MIMES: readonly string[] = ['image/jpeg', 'image/png', 'image/webp'];
+
+/** What a row of fssai_evidence can be. 'signature' is written by the sign act. */
+export type FssaiEvidenceKind = 'photo' | 'file' | 'signature';
+
+/** Human bytes for a screen: 412 KB, 1.8 MB. */
+export function fssaiBytesLabel(n: number | null | undefined): string {
+  const b = Number(n);
+  if (!Number.isFinite(b) || b <= 0) return '0 KB';
+  if (b < 1024) return `${Math.round(b)} B`;
+  if (b < 1024 * 1024) return `${Math.round(b / 1024)} KB`;
+  return `${(b / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/**
+ * Decoded byte length of a base64 data: URI payload, without decoding it.
+ * base64 is 4 characters per 3 bytes, minus the '=' padding. Same arithmetic
+ * ImageUpload uses client-side, so the two halves measure the same thing.
+ */
+export function fssaiDataUriBytes(uri: string | null | undefined): number {
+  const s = String(uri || '');
+  const comma = s.indexOf(',');
+  const b64 = comma >= 0 ? s.slice(comma + 1) : s;
+  if (!b64) return 0;
+  let pad = 0;
+  if (b64.endsWith('==')) pad = 2;
+  else if (b64.endsWith('=')) pad = 1;
+  return Math.max(0, Math.floor((b64.length * 3) / 4) - pad);
+}
+
+/**
+ * Split a data: URI into its mime and its base64 payload, or say why not.
+ *
+ * STRICT ON PURPOSE. The stored string is handed straight back to a browser as
+ * an <img src>, so `data:text/html;base64,…` in this column would be a stored
+ * XSS with a food-safety record for a delivery vehicle. Only base64 images pass,
+ * and the charset is checked rather than trusted.
+ */
+export function parseFssaiDataUri(
+  uri: string | null | undefined,
+): { ok: true; mime: string; b64: string; bytes: number } | { ok: false; error: string } {
+  const s = String(uri || '').trim();
+  if (!s) return { ok: false, error: 'No photograph was sent.' };
+  const m = s.match(/^data:([a-z]+\/[a-z0-9.+-]+);base64,([A-Za-z0-9+/=\s]+)$/i);
+  if (!m) return { ok: false, error: 'That is not a photograph this app can store. Take the picture again from the camera button.' };
+  const mime = m[1].toLowerCase();
+  const b64 = m[2].replace(/\s+/g, '');
+  if (!FSSAI_PHOTO_MIMES.includes(mime)) {
+    return { ok: false, error: `${mime} cannot be attached to a food-safety record. Use a JPG or PNG photograph.` };
+  }
+  if (b64.length % 4 !== 0) return { ok: false, error: 'That photograph did not arrive whole. Try again.' };
+  const bytes = fssaiDataUriBytes(s);
+  if (bytes <= 0) return { ok: false, error: 'That photograph is empty.' };
+  if (bytes > FSSAI_PHOTO_MAX_BYTES) {
+    return {
+      ok: false,
+      error: `That photograph is ${fssaiBytesLabel(bytes)}. A photograph attached to a record must be under ${fssaiBytesLabel(FSSAI_PHOTO_MAX_BYTES)} — the camera button shrinks it for you, so take it again from there rather than attaching the original file.`,
+    };
+  }
+  return { ok: true, mime, b64, bytes };
+}
+
+/* ------------------------------------------------------------------ *
+ * 11. WHAT A SIGNATURE IS — AND WHAT IT IS NOT
+ * ------------------------------------------------------------------ */
+
+/**
+ * §7 Q6 (PROVISIONAL DEFAULT, the owner has not ruled): a signature is the
+ * authenticated user plus a timestamp. No drawing, no biometrics.
+ *
+ * P3 makes that act EXPLICIT and binds it to the sheet. Submitting no longer
+ * stamps a signature as a side effect — the person who did the work presses
+ * "Sign", and the server records:
+ *   · who   — the signed-in user, from the session cookie, never from the body;
+ *   · when  — a server clock reading, never the phone's;
+ *   · what  — a digest of every answer and every photograph AS THEY STOOD at
+ *             that moment;
+ *   · a statement in words, stored with the row.
+ * If an answer changes afterwards the digest no longer matches, and submit
+ * refuses until it is signed again. That is the whole non-repudiation claim.
+ *
+ * WHAT IT DOES NOT PROVE, stated so nobody claims more of it in an inspection:
+ *   1. It does not prove WHO HELD THE PHONE. It proves which account was signed
+ *      in. A shared login is a shared signature, and this app has no per-act
+ *      re-authentication.
+ *   2. It is not a cryptographic signature. The digest is a plain SHA-256 kept
+ *      in the same database as the data; anyone with write access to the file
+ *      can recompute both. It detects an edit made THROUGH THE APP — which is
+ *      the case it is for — not tampering with the database.
+ *   3. It is not a handwritten mark and is not an e-signature under the IT Act.
+ *   4. It says the sheet was attested, not that the reading was true.
+ */
+export const FSSAI_SIGNATURE_STATEMENT =
+  'I recorded these answers myself and they are true to the best of my knowledge.';
+
+export function fssaiSignatureStatement(custom?: string | null): string {
+  const s = String(custom || '').trim();
+  return s || FSSAI_SIGNATURE_STATEMENT;
+}
+
+/** The things a screen shows about a signature, in one shape. */
+export interface FssaiSignature {
+  signed_by: string;
+  signed_name: string;
+  signed_at: string;
+  statement: string;
+  sheet_digest: string;
+  answers: number;
+  photos: number;
+}
+
+/* ------------------------------------------------------------------ *
+ * 12. VERIFICATION — who may, and what it may touch
+ * ------------------------------------------------------------------ */
+
+export type FssaiApprovalDecision = 'verified' | 'rejected';
+
+/**
+ * THE ONE RULE THAT MAKES A REGISTER A REGISTER: verifying a record may not
+ * change what it says.
+ *
+ * This is the list of columns the verification route is allowed to write, and it
+ * is exported so an assertion in a test and the UPDATE in the route read the
+ * same line. Nothing here touches fssai_responses, so no verifier can edit an
+ * answer — there is no route that would let them, and that is checked by a real
+ * request in the P3 proofs, not by the absence of a button.
+ */
+export const FSSAI_VERIFY_WRITABLE_RUN_COLUMNS: readonly string[] = ['status', 'updated_at'];
+
+/** Why this person cannot verify this record, in words, or '' if they can. */
+export function fssaiVerifyRefusal(
+  me: FssaiActor | null | undefined,
+  run: { status?: string | null; recorded_by?: string | null; recorded_name?: string | null } | null,
+): string {
+  if (!me) return 'Sign in required';
+  if (!run) return 'That check no longer exists.';
+  const status = String(run.status || '');
+  if (status === 'in_progress') return 'That check has not been submitted yet, so there is nothing to verify.';
+  if (status === 'verified') return 'That check has already been verified.';
+  if (status === 'rejected') return 'That check was sent back, so it has to be recorded again.';
+  if (status === 'void') return 'That check was voided, so it never happened.';
+  if (status !== 'submitted') return `A check with the status "${status}" cannot be verified.`;
+  const mine = String(me.email || '').trim().toLowerCase();
+  const ran = String(run.recorded_by || '').trim().toLowerCase();
+  if (mine && ran && mine === ran) {
+    // §7 Q3 provisional default. The point of a second pair of eyes is that they
+    // are someone else's.
+    return 'You recorded this check yourself, so somebody else has to verify it.';
+  }
+  if (!canVerifyFssai(me, run.recorded_by)) return 'Only a manager or an administrator can verify a recorded check.';
+  return '';
+}
+
+/* ------------------------------------------------------------------ *
+ * 13. SMALL SHARED HELPERS
  * ------------------------------------------------------------------ */
 
 /**
