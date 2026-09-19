@@ -73,7 +73,10 @@ import {
   UserPlus,
   X,
 } from 'lucide-react';
-import { api, apiJson } from '@/lib/api';
+// apiJson is the ONLY way this screen talks to the server: it injects the
+// fnb_csrf header on every POST/PUT/DELETE (src/lib/api.ts), and an FSSAI route
+// refuses a state-changing call without it. A bare fetch() here would 403.
+import { apiJson } from '@/lib/api';
 import {
   FSSAI_FREQUENCIES,
   FSSAI_MODULE_KEYS,
