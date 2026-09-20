@@ -163,8 +163,48 @@ export async function POST(request: Request) {
   if ('resp' in g) return g.resp;
   const me = g.me;
 
+  /* ── AN OVERSIZED PHOTOGRAPH MUST SAY SO, AND IT DID NOT ─────────────────
+   * MEASURED DEFECT, found by posting a real 12 MP photograph (14.18 MB) at this
+   * route: it answered `400 "Which check? No id was sent."` — a message about a
+   * missing field, for a request whose field was present.
+   *
+   * Two causes stacked up. Next 16 TRUNCATES a request body over 10 MB rather
+   * than rejecting it ("Request body exceeded 10MB ... Only the first 10MB will
+   * be available", printed in the server log), so `request.json()` was handed
+   * JSON cut off mid-string and threw; and the `catch` swallowed that into an
+   * empty object, after which the first missing-field check fired. In production
+   * nginx refuses at about 1 MB (HARD RULE 14) with a bare 413 that no handler in
+   * this app turns into a sentence. So every path a too-big photograph could take
+   * ended in something the person holding the phone could not act on.
+   *
+   * Now: the declared length is checked BEFORE the body is read, and a body that
+   * will not parse is reported as what it almost certainly is — a photograph too
+   * big to send — rather than as a missing id. */
+  const MAX_REQUEST_BYTES = Math.ceil((FSSAI_PHOTO_MAX_BYTES * 4) / 3) + 64 * 1024;
+  const declared = Number(request.headers.get('content-length') || 0);
+  const tooBigForOneRequest = (howBig: number) => Response.json(
+    {
+      error: `That photograph is about ${fssaiBytesLabel(Math.round((howBig * 3) / 4))}, which is too big to send. A photograph on a record has to be under ${fssaiBytesLabel(FSSAI_PHOTO_MAX_BYTES)} — use the camera button, which shrinks it for you, rather than attaching the original file from the gallery.`,
+      code: 'too_big',
+      max_bytes: FSSAI_PHOTO_MAX_BYTES,
+      max_bytes_label: fssaiBytesLabel(FSSAI_PHOTO_MAX_BYTES),
+    },
+    { status: 413 },
+  );
+  if (declared > MAX_REQUEST_BYTES) return tooBigForOneRequest(declared);
+
   let body: any = {};
-  try { body = await request.json(); } catch { /* validated below */ }
+  let bodyUnreadable = false;
+  try { body = await request.json(); } catch { bodyUnreadable = true; }
+  if (bodyUnreadable) {
+    // A truncated or malformed body. If it was large, say the size; if it was
+    // small, it is genuinely broken JSON and says that instead.
+    if (declared > 128 * 1024) return tooBigForOneRequest(declared);
+    return Response.json(
+      { error: 'That photograph did not arrive whole. Try attaching it again.', code: 'unreadable_body' },
+      { status: 400 },
+    );
+  }
 
   try {
     const db = getDb();
