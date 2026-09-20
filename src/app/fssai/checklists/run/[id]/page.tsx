@@ -53,8 +53,8 @@ import {
 import { api } from '@/lib/api';
 import type { UserRole } from '@/lib/auth';
 import {
-  FSSAI_SIGNATURE_STATEMENT, canTakeOverFssaiRun, fssaiBytesLabel, fssaiDisplayReading,
-  qtypeMeta,
+  FSSAI_SIGNATURE_STATEMENT, canTakeOverFssaiRun, evaluateFssaiAnswer, fssaiBytesLabel,
+  fssaiDisplayReading, qtypeMeta,
 } from '@/lib/fssai';
 import {
   CARD, INPUT, RUNNER_BG, Chip, Field, Note, PageHead, PrimaryButton, Progress,
@@ -659,26 +659,64 @@ export default function FssaiRunnerPage() {
 
   /* ── what is still unfinished, for the bar and the cards ──────────── */
 
+  /**
+   * IS THIS CARD FINISHED, AND WHAT IS IT WAITING FOR?
+   *
+   * TWO SOURCES, AND THE LINE BETWEEN THEM IS THE WHOLE POINT:
+   *   · WHETHER IT FAILED comes ONLY from the frozen `is_fail` on the answer row.
+   *     Never computed here, for a colour or for anything else — the pass rule
+   *     belongs to the version the answer was given under, and recomputing it on
+   *     read is how history gets rewritten (RECON §10 R3).
+   *   · WHETHER IT IS FINISHED is evaluated locally with the engine's OWN pure
+   *     predicate, over the live question and what is on screen. That is the same
+   *     function the server's completeness check calls, so the two cannot drift —
+   *     and it is why a round RESUMED after a reload still shows "still needs a
+   *     photograph" before any request has been made. Without it a resumed round
+   *     with an unfinished answer looked complete until submit refused it.
+   * The server's last verdict wins over the local one for the words, because it
+   * saw the row as stored.
+   */
   const cardState = useCallback((q: QuestionRow): { tone: 'none' | 'waiting' | 'fail' | 'done'; line: string } => {
     const qid = String(q.id);
     const r = responses[qid];
     const v = verdicts[qid];
+    const d = drafts[qid] || emptyDraft();
     const evCount = evidenceFor(qid).length;
-    const answeredHere = r
-      ? (v ? v.answered : true)
-      : draftHasValue(q, drafts[qid] || emptyDraft()) || (q.qtype === 'photo' && evCount > 0);
+
+    const local = qtypeMeta(q.qtype)
+      ? evaluateFssaiAnswer(
+        {
+          qtype: String(r?.qtype || q.qtype || ''),
+          is_required: q.is_required, allow_na: q.allow_na,
+          min_value: q.min_value, max_value: q.max_value, expected_value: q.expected_value,
+          options: q.options, fail_options: q.fail_options,
+          photo_rule: q.photo_rule, note_rule: q.note_rule,
+        },
+        {
+          value_text: d.text,
+          value_num: d.num.trim() === '' ? null : Number(d.num),
+          value_bool: d.bool,
+          is_na: d.na,
+          note: d.note,
+          evidence_count: evCount,
+        },
+      )
+      : null;
+
+    const hasAnything = draftHasValue(q, d) || (q.qtype === 'photo' && evCount > 0) || !!r;
+    const finished = v ? v.answered : (local ? local.answered : !!r);
 
     if (r && Number(r.is_fail)) {
-      return { tone: 'fail', line: v?.reason || 'Recorded as a fail.' };
+      return { tone: 'fail', line: v?.reason || local?.reason || 'Recorded as a fail.' };
     }
-    if (v && !v.answered) {
-      // INCOMPLETE, NOT FAILED — the engine's own words for what it is waiting for.
-      return { tone: 'waiting', line: v.reason || 'This answer is not finished yet.' };
-    }
-    if (!answeredHere) {
+    if (!hasAnything) {
       return Number(q.is_required)
         ? { tone: 'waiting', line: 'Still needs an answer.' }
         : { tone: 'none', line: 'Optional.' };
+    }
+    if (!finished) {
+      // INCOMPLETE, NOT FAILED — the engine's own words for what it is waiting for.
+      return { tone: 'waiting', line: v?.reason || local?.reason || 'This answer is not finished yet.' };
     }
     return { tone: 'done', line: '' };
   }, [responses, verdicts, drafts, evidenceFor]);
@@ -1111,8 +1149,10 @@ function QuestionCard({
   /* AMBER ONLY WHEN SOMETHING IS ACTUALLY WAITING. "Photo if it fails" must not
    * nag before anything has failed — the engine's verdict says when it is owed,
    * and `always` is owed from the start. */
-  const needsPhoto = (q.photo_rule === 'always' && evidence.length === 0) || !!verdict?.needs_photo;
-  const needsNote = (q.note_rule === 'always' && !String(draft.note || '').trim()) || !!verdict?.needs_note;
+  const needsPhoto = (q.photo_rule === 'always' && evidence.length === 0) || !!verdict?.needs_photo
+    || (state.tone === 'waiting' && /photograph/i.test(state.line));
+  const needsNote = (q.note_rule === 'always' && !String(draft.note || '').trim()) || !!verdict?.needs_note
+    || (state.tone === 'waiting' && /note/i.test(state.line));
   const [showNote, setShowNote] = useState(
     () => !!String(draft.note || '') || q.note_rule === 'always',
   );
