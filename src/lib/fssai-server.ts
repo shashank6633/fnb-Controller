@@ -21,8 +21,8 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import type Database from 'better-sqlite3';
 import { getDb, generateId, logAuditEvent } from '@/lib/db';
-import { getCurrentUser, type SessionUser } from '@/lib/auth';
-import { canAuthorFssai, qtypeMeta } from '@/lib/fssai';
+import { getCurrentUser, isManagement, type SessionUser } from '@/lib/auth';
+import { canAuthorFssai, evaluateFssaiAnswer, qtypeMeta } from '@/lib/fssai';
 
 export type Gate = { me: SessionUser } | { resp: Response };
 
@@ -380,6 +380,120 @@ export function bumpFssaiTemplateVersion(db: Database.Database, templateId: stri
 /** Touch updated_at without bumping the version (a cosmetic edit). */
 export function touchFssaiTemplate(db: Database.Database, templateId: string): void {
   db.prepare(`UPDATE fssai_templates SET updated_at = datetime('now') WHERE id = ?`).run(templateId);
+}
+
+/* ------------------------------------------------------------------ *
+ * RUNNING A CHECK — the four predicates the RUNNER and the EVIDENCE route
+ * both need (P3)
+ * ------------------------------------------------------------------ *
+ *
+ * WHY THESE LIVE HERE NOW. Attaching a photograph is not a second kind of
+ * answer — it COMPLETES one. So the evidence route must reach exactly the same
+ * conclusions as the answer route about (a) who may look at a run, (b) whether
+ * an answer is finished, and (c) how many answers on this run are finished. If
+ * it reaches different ones, a photograph could satisfy the runner's progress
+ * bar and not the submit gate, which is the class of defect P2's fix round
+ * spent itself on (two disagreeing definitions of "answered").
+ *
+ * ⚠️ HONEST NOTE ON DUPLICATION. `src/app/api/fssai/runs/route.ts` still holds
+ * its own private copies of the first three (canSeeRun:116, answerComplete:71,
+ * evidenceCountsByQuestion:96), written in P2a. These four are copied from
+ * there deliberately — behaviour for behaviour — rather than editing that file,
+ * because P2a's route is shared with other lanes working at the same time and a
+ * clobbered engine costs more than a duplicated predicate. THEY MUST NOT DRIFT:
+ * change one, change the other. Unifying them (delete the private copies, import
+ * these) is a three-line edit and is listed for P11.
+ */
+
+/**
+ * MAY THIS PERSON READ THIS RUN? (§7 Q10 provisional: own + own department;
+ * management sees all; a run belonging to NO department belongs to the whole
+ * restaurant and any signed-in member of staff may read it.)
+ *
+ * Verbatim from runs/route.ts:116 — see the note above.
+ */
+export function canSeeFssaiRun(
+  me: { role?: string; is_head_chef?: boolean; email?: string | null; department_id?: string | null } | null,
+  run: { recorded_by?: string | null; department_id?: string | null },
+): boolean {
+  if (!me) return false;
+  if (isManagement(me)) return true;
+  if (String(run.recorded_by || '').toLowerCase() === String(me.email || '').toLowerCase()) return true;
+  if (!String(run.department_id || '')) return true;
+  return !!run.department_id && run.department_id === me.department_id;
+}
+
+/** How many evidence rows hang off each answer in this run, by QUESTION id. */
+export function fssaiEvidenceCountsByQuestion(db: Database.Database, runId: string): Map<string, number> {
+  const rows = db.prepare(
+    `SELECT r.question_id AS qid, COUNT(e.id) AS n
+       FROM fssai_responses r LEFT JOIN fssai_evidence e ON e.response_id = r.id
+      WHERE r.run_id = ? GROUP BY r.question_id`,
+  ).all(runId) as any[];
+  return new Map(rows.map((r) => [String(r.qid), Number(r.n) || 0]));
+}
+
+/**
+ * IS THIS ANSWER FINISHED? — a value present AND whatever photograph or note the
+ * question demands. Only `.answered` is taken from the evaluator: is_fail stays
+ * frozen on the response row and is never recomputed on READ (RECON §10 R3).
+ */
+export function fssaiAnswerComplete(
+  q: any,
+  r: any,
+  evidenceCount = 0,
+): { answered: boolean; reason: string; needs_photo?: boolean; needs_note?: boolean } {
+  if (!r) return { answered: false, reason: 'Not answered.' };
+  const v = evaluateFssaiAnswer(
+    {
+      // The FROZEN type: judged complete as the type it was given under, even if
+      // the live question has been changed since.
+      qtype: String(r.qtype || q?.qtype || ''),
+      is_required: q ? q.is_required : 1,
+      allow_na: q ? q.allow_na : 1,
+      photo_rule: q?.photo_rule,
+      note_rule: q?.note_rule,
+    },
+    {
+      value_text: r.value_text,
+      value_num: r.value_num,
+      value_bool: r.value_bool === null || r.value_bool === undefined ? null : !!Number(r.value_bool),
+      is_na: !!Number(r.is_na),
+      note: r.note,
+      evidence_count: evidenceCount,
+    },
+  );
+  return {
+    answered: v.answered,
+    reason: v.reason,
+    ...(v.needs_photo ? { needs_photo: true } : {}),
+    ...(v.needs_note ? { needs_note: true } : {}),
+  };
+}
+
+/**
+ * Recount the FINISHED answers on an open run and store the number.
+ *
+ * Identical arithmetic to the answer handler (runs/route.ts:570-582), so the
+ * count a photograph moves and the count the submit gate reads are the same
+ * number. Status-guarded: a run that has been submitted in the meantime is left
+ * exactly as it was frozen.
+ */
+export function recomputeFssaiAnsweredCount(db: Database.Database, runId: string, templateId: string): number {
+  const rows = db.prepare(`SELECT * FROM fssai_responses WHERE run_id = ?`).all(runId) as any[];
+  const ev = fssaiEvidenceCountsByQuestion(db, runId);
+  const liveQs = db.prepare(
+    `SELECT id, qtype, is_required, allow_na, photo_rule, note_rule
+       FROM fssai_questions WHERE template_id = ?`,
+  ).all(templateId) as any[];
+  const qById = new Map(liveQs.map((x) => [String(x.id), x]));
+  const answered = rows.filter((r) =>
+    fssaiAnswerComplete(qById.get(String(r.question_id)), r, ev.get(String(r.question_id)) || 0).answered,
+  ).length;
+  db.prepare(
+    `UPDATE fssai_runs SET answered_count=?, updated_at=datetime('now') WHERE id=? AND status='in_progress'`,
+  ).run(answered, runId);
+  return answered;
 }
 
 /* ------------------------------------------------------------------ *
