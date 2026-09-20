@@ -23,7 +23,10 @@ import { createHash } from 'node:crypto';
 import type Database from 'better-sqlite3';
 import { getDb, generateId, logAuditEvent } from '@/lib/db';
 import { getCurrentUser, isManagement, type SessionUser } from '@/lib/auth';
-import { canAuthorFssai, evaluateFssaiAnswer, qtypeMeta, type FssaiSignature } from '@/lib/fssai';
+import {
+  canAuthorFssai, evaluateFssaiAnswer, qtypeMeta,
+  type FssaiSignature, type FssaiSignatureMode,
+} from '@/lib/fssai';
 
 export type Gate = { me: SessionUser } | { resp: Response };
 
@@ -605,6 +608,9 @@ export function readFssaiSignature(db: Database.Database, runId: string): FssaiS
       sheet_digest: String(v.sheet_digest ?? ''),
       answers: Number(v.answers) || 0,
       photos: Number(v.photos) || 0,
+      // A signature written before the mode existed is reported as what it was:
+      // the explicit two-step act, which is the only kind that existed then.
+      mode: v.mode === 'on_submit' ? 'on_submit' : 'explicit',
     };
   } catch {
     return null;
@@ -680,6 +686,7 @@ export function signFssaiRun(
   actor: { email?: string | null; name?: string | null },
   statement: string,
   outletId?: string | null,
+  mode: FssaiSignatureMode = 'explicit',
 ): FssaiSignature {
   const { digest, answers, photos } = computeFssaiSheetDigest(db, runId);
   // The SERVER's clock, never the phone's: a device with the wrong time must not
@@ -693,6 +700,7 @@ export function signFssaiRun(
     sheet_digest: digest,
     answers,
     photos,
+    mode,
   };
   db.prepare(
     `UPDATE fssai_runs SET signed_by=?, signed_at=?, updated_at=datetime('now')

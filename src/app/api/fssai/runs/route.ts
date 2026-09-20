@@ -6,6 +6,7 @@ import {
   summariseFssaiRun, fssaiToday, isISODate, daysBetweenISO, isFssaiShift, isFssaiTargetKind,
   fssaiResponseAnswered, isFssaiBoolQType, fssaiBoolFromText, fssaiBoolWordsFor,
   fssaiDisplayReading, FSSAI_SIGNATURE_STATEMENT, fssaiSignatureStatement,
+  FSSAI_REQUIRE_EXPLICIT_SIGNATURE,
   type FssaiSlotRunRow,
 } from '@/lib/fssai';
 import {
@@ -735,8 +736,17 @@ export async function POST(request: Request) {
        * /api/fssai/sign, look at the sheet again, then submit — is protected by the
        * staleness test instead. What is NOT possible any more is the third thing:
        * the server signing because nobody asked. */
-      const signNow = body?.sign === true || body?.sign === 1 || body?.sign === '1';
+      const askedToSign = body?.sign === true || body?.sign === 1 || body?.sign === '1';
       const signStatement = fssaiSignatureStatement(str(body?.signature_statement));
+      /* WHETHER AN UNSIGNED CHECK IS REFUSED OR ATTESTED ON THE SPOT — the
+       * reasoning, and how to tighten it, is written out in full at
+       * FSSAI_REQUIRE_EXPLICIT_SIGNATURE. In short: refusing would mean the owner's
+       * first tap on "Sign and submit" at the review gate met an error about the
+       * button he had just pressed, because the runner does not send sign:true yet.
+       * So the act is performed and its MODE is recorded, and every screen says
+       * which kind of attestation it was. */
+      const signNow = askedToSign || !FSSAI_REQUIRE_EXPLICIT_SIGNATURE;
+      const signMode: 'explicit' | 'on_submit' = 'on_submit';
       if (Number(tpl.requires_signature)) {
         const sig = fssaiSignatureState(db, runId);
         if (!sig.is_signed && !signNow) {
@@ -771,9 +781,13 @@ export async function POST(request: Request) {
             { status: 400 },
           );
         }
-        // A signature already on file (the two-step path). The one-tap path is
-        // signed inside the transaction below, where the sheet is final.
-        signatureForRecord = sig.signature;
+        /* ONLY A SIGNATURE THAT STILL COVERS THE SHEET IS CARRIED INTO THE RECORD.
+         * A stale one is dropped here and re-taken inside the transaction below —
+         * because freezing an attestation whose digest does not match the answers
+         * it is stapled to would be worse than having none: it would look verified
+         * and prove nothing. (Without this line a stale signature reached the
+         * record intact whenever the strict gate was off.) */
+        signatureForRecord = sig.is_signed && !sig.is_stale ? sig.signature : null;
       }
 
       const facts = judged.map((q) => {
@@ -814,9 +828,9 @@ export async function POST(request: Request) {
         /* THE ONE-TAP SIGN, inside the same transaction as the freeze, so the
          * digest covers the sheet exactly as it is about to be recorded and the
          * two writes cannot be separated by anything. */
-        if (Number(tpl.requires_signature) && signNow) {
+        if (Number(tpl.requires_signature) && signNow && !signatureForRecord) {
           signatureForRecord = signFssaiRun(
-            db, runId, run, { email: me.email, name: me.name }, signStatement, run.outlet_id,
+            db, runId, run, { email: me.email, name: me.name }, signStatement, run.outlet_id, signMode,
           );
         }
         const res = db.prepare(

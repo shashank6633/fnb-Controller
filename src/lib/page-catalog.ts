@@ -512,6 +512,12 @@ export const PAGE_CATALOG: PageSection[] = [
       { path: '/fssai/corrective-actions', label: 'Corrective Actions' },
       { path: '/fssai/checklists',         label: 'FSSAI Checklists' },
       // Management surfaces. mgmtOnly (admin | manager | HOD), NOT adminOnly:
+      // VERIFY RECORDS (P3). mgmtOnly because verifying IS a management act (§7 Q3
+      // provisional: any management may verify, but never the person who recorded
+      // it — that second half is enforced per row by the route, since a manager
+      // who ran the check himself must not sign it off). A staff member reaches
+      // their own submitted records through the checklist screens, not here.
+      { path: '/fssai/verification',       label: 'Verify Records',           mgmtOnly: true },
       // adminOnly would mean the owner must be physically present before anyone
       // could produce the licence or the inspection pack to an inspector.
       { path: '/fssai/inspections',        label: 'Inspection Reports',       mgmtOnly: true },

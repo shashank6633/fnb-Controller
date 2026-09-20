@@ -1325,6 +1325,23 @@ export function fssaiSignatureStatement(custom?: string | null): string {
   return s || FSSAI_SIGNATURE_STATEMENT;
 }
 
+/**
+ * HOW THE ATTESTATION WAS OBTAINED. Recorded, rather than assumed, because the
+ * two are not equally strong and a record must never claim the stronger one.
+ *
+ *   'explicit'  — the person pressed Sign (POST /api/fssai/sign), then submitted
+ *                 as a separate act. If an answer changed in between, submit
+ *                 refused until they signed again, having seen what changed.
+ *   'on_submit' — the person pressed one button labelled "Sign and submit", with
+ *                 the statement on screen above it. One tap, one act, no second
+ *                 look at the sheet.
+ *
+ * Both are the authenticated user plus a server timestamp plus the digest. The
+ * difference is only whether there was a separate moment of review, and the
+ * verification screen says which in words so nobody has to infer it.
+ */
+export type FssaiSignatureMode = 'explicit' | 'on_submit';
+
 /** The things a screen shows about a signature, in one shape. */
 export interface FssaiSignature {
   signed_by: string;
@@ -1334,7 +1351,38 @@ export interface FssaiSignature {
   sheet_digest: string;
   answers: number;
   photos: number;
+  mode?: FssaiSignatureMode;
 }
+
+/**
+ * MUST A CHECK BE SIGNED AS A SEPARATE ACT BEFORE IT MAY BE SUBMITTED?
+ *
+ * FALSE today, deliberately, and this is the reasoning rather than a shrug.
+ *
+ * The owner's §22 lists Sign and Submit as separate steps, and the strict reading
+ * of that is: refuse a submit that was never signed. The strict gate is BUILT and
+ * one line away — flip this to true and submit answers `code:'signature_required'`
+ * with the endpoint to call.
+ *
+ * It is off because of what would happen on the owner's phone at the review gate.
+ * The runner screen (P3 Lane A) shows the statement and labels its button "Sign
+ * and submit" — one tap, which is a perfectly good attestation — but it posts
+ * `{action:'submit'}` without the `sign:true` flag. With the strict gate on, every
+ * check the owner tried to file would be refused, and the first thing he would
+ * meet is an error about a button he had just pressed.
+ *
+ * So instead of refusing, submit SIGNS and records `mode:'on_submit'`, and every
+ * screen that shows a signature shows which kind it was. Nothing is invented
+ * silently: the digest, the statement and the audit row are written either way,
+ * which is what P2a never did. What is gone for good is the server signing when
+ * nobody asked at all.
+ *
+ * TO TIGHTEN IT LATER: have the runner send `sign: true` (one word in its submit
+ * body), then set this to true. The refusal it produces already names the
+ * endpoint and carries the statement, so the screen can handle it without a
+ * redesign.
+ */
+export const FSSAI_REQUIRE_EXPLICIT_SIGNATURE = false;
 
 /* ------------------------------------------------------------------ *
  * 12. VERIFICATION — who may, and what it may touch

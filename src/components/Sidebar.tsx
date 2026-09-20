@@ -445,6 +445,9 @@ const navTree: NavEntry[] = [
       { kind: "link", label: "Corrective Actions",                  href: "/fssai/corrective-actions", icon: Wrench },
       { kind: "link", label: "FSSAI Checklists",                    href: "/fssai/checklists",         icon: ListChecks },
       // mgmtOnly in the catalog (admin | manager | HOD).
+      // Kept in step with page-catalog.ts by hand: a row here but not there is
+      // visible and UNGATED; a row there but not here is gated and INVISIBLE.
+      { kind: "link", label: "Verify Records",                      href: "/fssai/verification",       icon: ClipboardCheck },
       { kind: "link", label: "Inspection Reports",                  href: "/fssai/inspections",        icon: ClipboardList },
       { kind: "link", label: "Documents & Certificates",            href: "/fssai/documents",          icon: FileText },
       { kind: "link", label: "Reports & Downloads",                 href: "/fssai/reports",            icon: BarChart3 },
