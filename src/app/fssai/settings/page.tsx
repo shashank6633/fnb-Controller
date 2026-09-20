@@ -98,16 +98,22 @@ export default function FssaiSettingsPage() {
   const [s, setS] = useState<HubState>({ templates: null, assignments: null, masters: null });
   const [loading, setLoading] = useState(true);
   const [forbidden, setForbidden] = useState(false);
+  const [signedOut, setSignedOut] = useState(false);
   const [err, setErr] = useState('');
 
   const load = useCallback(async () => {
     setLoading(true); setErr('');
     const problems: string[] = [];
     let refused = false;
+    // The SERVER's own verdict on whether this viewer may configure food safety
+    // (canAuthorFssai, returned by the templates route as `can_author`). It is
+    // the same predicate requireFssaiAdmin enforces on every mutation, so it is
+    // the only trustworthy answer — see the comment on `deniedByServer` below.
+    let canAuthor: boolean | null = null;
 
     const [t, a, m] = await Promise.all([
-      apiJson<{ templates: TemplateRow[] }>('/api/fssai/templates?include_archived=1')
-        .then((j) => j.templates || [])
+      apiJson<{ templates: TemplateRow[]; can_author?: boolean }>('/api/fssai/templates?include_archived=1')
+        .then((j) => { canAuthor = !!j.can_author; return j.templates || []; })
         .catch((e: unknown) => { problems.push(msgOf(e, 'the checklists')); if (is403(e)) refused = true; return null; }),
       apiJson<{ assignments: AssignmentRow[] }>('/api/fssai/assignments?include_inactive=1')
         .then((j) => j.assignments || [])
@@ -118,14 +124,67 @@ export default function FssaiSettingsPage() {
     ]);
 
     setS({ templates: t, assignments: a, masters: m });
-    // Every read refused → this viewer is not an admin, whatever the menu let
-    // them click. That is the permission panel, not an error banner.
-    if (refused && t === null && m === null) setForbidden(true);
+
+    /* THE PERMISSION GATE — why it is `can_author` and not "every read failed".
+     *
+     * The first version of this screen inferred refusal from "both reads came
+     * back null", and that is wrong for exactly the person it was meant to
+     * catch. A non-admin's GET /api/fssai/templates SUCCEEDS — the route
+     * deliberately returns the published library to everyone — and only
+     * /api/fssai/masters 403s. So `t` stayed non-null, the gate never closed,
+     * and the viewer was shown the whole administrator's console under an amber
+     * banner reading "Only an administrator can set up food-safety checklists":
+     * told they were not an admin while looking at the admin screen, with the
+     * restaurant's draft, assignment and record counts on it.
+     *
+     * Measured against the running app with real sessions, before this fix:
+     *   ADMIN → can_author=true  · templates=2 rows · masters=ok  → hub (right)
+     *   STAFF → can_author=false · templates=1 row  · masters=403 → HUB (wrong)
+     *
+     * HOW BADLY IS IT NEEDED — stated honestly, because the next reader deserves
+     * the real answer rather than a scary one. This page is `adminOnly` in
+     * page-catalog.ts (:524), and isAdminOnlyPath() is checked BEFORE all of
+     * canAccessPage's fail-open grants (the null map, the garbled map, the empty
+     * array), so a non-admin is in fact redirected by proxy.ts today — measured:
+     * a staff session on /fssai/settings gets 307 → /?forbidden=%2Ffssai%2Fsettings.
+     * This gate is therefore DEFENCE IN DEPTH, not the plugging of a live leak:
+     * it is what keeps the screen honest if that `adminOnly` flag is ever
+     * dropped from the catalog row, and it removes a genuinely confusing state.
+     * HARD RULE 10 is the reason it exists at all: proxy.ts guards PAGES, not
+     * APIs, so a screen must never assume the router vouched for its viewer.
+     *
+     * `can_author === false` is the server's own predicate (canAuthorFssai, the
+     * same one requireFssaiAdmin enforces on every mutation) saying "not yours",
+     * so it closes the gate on its own. A read that merely FAILED (offline, 500)
+     * leaves it null and must never lock an administrator out of his settings.
+     */
+    const deniedByServer = canAuthor === false;
+    if (deniedByServer || (refused && t === null && m === null)) setForbidden(true);
+    // Signed out entirely: every read 401s, so there is no hub to draw and
+    // nothing to say about permissions. The library screen already answers this
+    // case with "please sign in" and this one must not disagree with it — an
+    // empty console under an amber "could not be read" banner reads like a
+    // broken page rather than a closed session. (Unreachable through the menu,
+    // because proxy.ts sends a signed-out browser to /login first; reachable on
+    // a session that expires while the tab is open.)
+    else if (t === null && m === null && problems.some(isSignedOut)) setSignedOut(true);
     else if (problems.length) setErr(problems.join(' '));
     setLoading(false);
   }, []);
 
   useEffect(() => { void load(); }, [load]);
+
+  if (signedOut) {
+    return (
+      <div className="min-h-screen bg-[#FFF8F0] text-[#2D1B0E]">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 py-6">
+          <div className="bg-amber-50 border border-amber-200 rounded-lg p-4 text-sm text-amber-900">
+            🔒 Please sign in to open the food-safety settings.
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   if (forbidden) {
     return (
@@ -134,6 +193,13 @@ export default function FssaiSettingsPage() {
           <div className="bg-amber-50 border border-amber-200 rounded-lg p-4 text-sm text-amber-900">
             🔒 Food-safety settings are restricted to administrators. Ask an administrator for access.
           </div>
+          {/* Not a dead end: the published library IS theirs to read, and that is
+              the screen they were almost certainly looking for. */}
+          <a href="/fssai/checklists"
+            className="inline-flex items-center gap-1.5 mt-3 text-sm font-medium bg-white border border-[#E8D5C4] rounded-lg px-3 py-2 hover:border-[#af4408] hover:bg-[#FFF1E3]">
+            <ListChecks size={15} className="text-[#af4408]" /> See the checklists you can run
+            <ArrowRight size={13} className="text-[#af4408]" />
+          </a>
         </div>
       </div>
     );
@@ -407,6 +473,11 @@ export default function FssaiSettingsPage() {
 function is403(e: unknown): boolean {
   const m = e instanceof Error ? e.message : String(e);
   return m.includes('403') || /administrator|restricted|not allowed/i.test(m);
+}
+/** The library screen's own test (checklists/page.tsx), kept word for word so the
+ *  two FSSAI screens cannot disagree about what "signed out" looks like. */
+function isSignedOut(msg: string): boolean {
+  return msg.includes('401') || /sign in/i.test(msg);
 }
 function msgOf(e: unknown, what: string): string {
   const m = e instanceof Error ? e.message : '';
