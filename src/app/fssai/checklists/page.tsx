@@ -572,6 +572,17 @@ export default function FssaiChecklistsPage() {
               </p>
             </div>
           </div>
+          {/* THE ONE THING STAFF CAME HERE FOR (P3). This page lists what the
+              restaurant runs; the runner is where a check is actually filled in,
+              on a phone. It is first in the row, and full width under sm:, because
+              on a 390px screen the buttons stack and the first one is the one a
+              thumb reaches. Shown to everyone: running a check is not an
+              administrator's job. */}
+          <a href="/fssai/checklists/run"
+            className="w-full sm:w-auto inline-flex items-center justify-center gap-1.5 min-h-[44px] text-sm font-semibold
+                       bg-[#af4408] hover:bg-[#8a3606] text-white rounded-lg px-3 py-2">
+            <ClipboardList size={15} /> Run a check
+          </a>
           <button onClick={() => void load()} disabled={loading}
             className="inline-flex items-center gap-1.5 text-sm border border-[#E8D5C4] bg-white rounded-lg px-3 py-2 hover:bg-[#FFF1E3] disabled:opacity-50">
             {loading ? <Loader2 size={15} className="animate-spin" /> : <RefreshCw size={15} />} Refresh

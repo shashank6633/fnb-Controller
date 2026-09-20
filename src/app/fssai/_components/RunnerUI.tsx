@@ -24,7 +24,10 @@
  */
 
 import { AlertTriangle, CheckCircle2, Info, Loader2, X } from 'lucide-react';
-import { FSSAI_FREQUENCIES, FSSAI_SHIFTS, FSSAI_TARGET_KINDS, fssaiRunStatusMeta } from '@/lib/fssai';
+import {
+  FSSAI_FREQUENCIES, FSSAI_PHOTO_MAX_BYTES, FSSAI_PHOTO_MAX_EDGE_PX, FSSAI_PHOTO_TARGET_BYTES,
+  FSSAI_SHIFTS, FSSAI_TARGET_KINDS, fssaiBytesLabel, fssaiDataUriBytes, fssaiRunStatusMeta,
+} from '@/lib/fssai';
 
 /* ------------------------------------------------------------------ *
  * Words — one place, so the picker and the runner agree
@@ -264,4 +267,131 @@ export function Progress({ done, total }: { done: number; total: number }) {
       </div>
     </div>
   );
+}
+
+/* ------------------------------------------------------------------ *
+ * THE PHOTOGRAPH, SHRUNK ON THE PHONE
+ * ------------------------------------------------------------------ */
+
+export type ShrinkResult =
+  | { ok: true; data_uri: string; bytes: number; mime: string; filename: string; width: number; height: number; quality: number }
+  | { ok: false; error: string };
+
+/**
+ * A phone camera photograph, made small enough to actually arrive.
+ *
+ * WHY THIS IS NOT AN OPTIMISATION. Production nginx accepts about 1 MB
+ * (FSSAI-BUILD-STATE.md HARD RULE 14, measured — not the 25M the conf claims),
+ * base64 inflates a payload by 4/3, and a modern phone camera produces 3-8 MB. An
+ * uncompressed capture therefore returns a bare 413 that no error handler in this
+ * app turns into a sentence: the feature would appear to work and silently never
+ * save anything. The resize IS the feature.
+ *
+ * The three numbers come from src/lib/fssai.ts so the phone and the route cannot
+ * disagree: aim for FSSAI_PHOTO_TARGET_BYTES (250 KB), never exceed
+ * FSSAI_PHOTO_MAX_BYTES (400 KB, what the server accepts), longest edge
+ * FSSAI_PHOTO_MAX_EDGE_PX (1200 px — enough to read a thermometer display).
+ *
+ * It always produces JPEG. HEIC (an iPhone's native format) cannot be rendered
+ * back by most browsers, so storing it would give an inspector a file nobody can
+ * open; the canvas re-encode converts it on the way through. If the browser cannot
+ * decode the file at all, this says so in words rather than posting junk.
+ */
+export async function shrinkPhotoToDataUri(
+  file: File,
+  opts: { maxEdge?: number; targetBytes?: number; hardMaxBytes?: number } = {},
+): Promise<ShrinkResult> {
+  const maxEdge = opts.maxEdge ?? FSSAI_PHOTO_MAX_EDGE_PX;
+  const targetBytes = opts.targetBytes ?? FSSAI_PHOTO_TARGET_BYTES;
+  const hardMax = opts.hardMaxBytes ?? FSSAI_PHOTO_MAX_BYTES;
+
+  let bitmap: ImageBitmap | HTMLImageElement | null = null;
+  let objectUrl = '';
+  try {
+    if (typeof createImageBitmap === 'function') {
+      bitmap = await createImageBitmap(file);
+    } else {
+      // Safari fallback: an <img> decoded from an object URL.
+      objectUrl = URL.createObjectURL(file);
+      bitmap = await new Promise<HTMLImageElement>((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => resolve(img);
+        img.onerror = () => reject(new Error('decode failed'));
+        img.src = objectUrl;
+      });
+    }
+  } catch {
+    if (objectUrl) URL.revokeObjectURL(objectUrl);
+    return {
+      ok: false,
+      error: 'This phone could not read that picture. Take it again with the camera button rather than picking a file.',
+    };
+  }
+
+  const srcW = 'width' in bitmap ? Number(bitmap.width) : 0;
+  const srcH = 'height' in bitmap ? Number(bitmap.height) : 0;
+  if (!srcW || !srcH) {
+    if (objectUrl) URL.revokeObjectURL(objectUrl);
+    return { ok: false, error: 'That picture has no size the app can read. Take it again.' };
+  }
+
+  // Successive attempts: shrink the longest edge, then drop the quality. The
+  // loop exists because neither alone is predictable — a photograph of a white
+  // wall compresses to nothing, one of a busy kitchen shelf does not.
+  const edges = [maxEdge, Math.round(maxEdge * 0.8), Math.round(maxEdge * 0.6)];
+  const qualities = [0.72, 0.6, 0.5, 0.4];
+  let best: { uri: string; bytes: number; w: number; h: number; q: number } | null = null;
+
+  for (const edge of edges) {
+    const scale = Math.min(1, edge / Math.max(srcW, srcH));
+    const w = Math.max(1, Math.round(srcW * scale));
+    const h = Math.max(1, Math.round(srcH * scale));
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) break;
+    // A white ground: a PNG with transparency would otherwise go black in JPEG.
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, w, h);
+    ctx.drawImage(bitmap as CanvasImageSource, 0, 0, w, h);
+    for (const q of qualities) {
+      const uri = canvas.toDataURL('image/jpeg', q);
+      const bytes = fssaiDataUriBytes(uri);
+      if (!best || bytes < best.bytes) best = { uri, bytes, w, h, q };
+      if (bytes <= targetBytes) {
+        if (objectUrl) URL.revokeObjectURL(objectUrl);
+        if ('close' in bitmap && typeof bitmap.close === 'function') bitmap.close();
+        return {
+          ok: true, data_uri: uri, bytes, mime: 'image/jpeg', width: w, height: h, quality: q,
+          filename: photoFilename(file),
+        };
+      }
+    }
+  }
+
+  if (objectUrl) URL.revokeObjectURL(objectUrl);
+  if (bitmap && 'close' in bitmap && typeof bitmap.close === 'function') bitmap.close();
+
+  if (best && best.bytes <= hardMax) {
+    // Over the target but inside what the server accepts — keep it rather than
+    // lose the evidence.
+    return {
+      ok: true, data_uri: best.uri, bytes: best.bytes, mime: 'image/jpeg',
+      width: best.w, height: best.h, quality: best.q, filename: photoFilename(file),
+    };
+  }
+  return {
+    ok: false,
+    error: best
+      ? `That photograph is still ${fssaiBytesLabel(best.bytes)} after being shrunk, and a photograph on a record must be under ${fssaiBytesLabel(hardMax)}. Take it again from a little further back.`
+      : 'That photograph could not be shrunk on this phone. Take it again with the camera button.',
+  };
+}
+
+/** A filename that says what it is, keeping the original where there is one. */
+function photoFilename(file: File): string {
+  const base = String(file.name || '').replace(/\.[A-Za-z0-9]+$/, '').slice(0, 80);
+  const stamp = new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-');
+  return `${base || 'check'}-${stamp}.jpg`;
 }

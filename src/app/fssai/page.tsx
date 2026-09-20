@@ -69,18 +69,38 @@ export default function FssaiDashboardPage() {
           </div>
         </div>
 
+        {/* THE WAY IN (P3). This is the screen the owner opens first on a phone,
+            and the one thing a member of staff wants from it is the round they have
+            been told to do. Full width, 56px, above everything else. It needs no
+            fetch, so this page keeps its "every word is true without asking the
+            server" property. */}
+        <a
+          href="/fssai/checklists/run"
+          className="w-full min-h-[56px] inline-flex items-center justify-center gap-2 text-base font-semibold
+                     rounded-xl px-4 bg-[#af4408] hover:bg-[#8a3606] text-white"
+        >
+          <ShieldCheck size={18} /> Run a check
+        </a>
+
         {/* The honest headline. No figures, and the reason why. */}
         <div className="bg-amber-50 border border-amber-200 rounded-xl p-4 sm:p-5">
           <div className="flex items-start gap-3">
             <Hourglass className="w-5 h-5 text-amber-700 shrink-0 mt-0.5" />
             <div className="min-w-0">
               <p className="font-bold text-amber-900">No checks have been recorded here yet</p>
+              {/* UPDATED BY P3. This paragraph used to say a checklist "cannot be
+                  filled in until the checklist itself is built and then made to run
+                  on a phone — those are the next two pieces of work". Both of those
+                  pieces now exist, so the sentence would have been the one untrue
+                  line on the screen. What has NOT changed is the reason there are no
+                  figures here: counting comes last. */}
               <p className="text-sm text-amber-900 mt-1">
-                This dashboard shows no counts because there is nothing to count yet. A checklist
-                cannot be filled in until the checklist itself is built and then made to run on a
-                phone — those are the next two pieces of work. The figures you will eventually read
-                here — due today, missed, failed and waiting on a fix, certificates about to run out —
-                come last of all, because they count what the other screens record.
+                This dashboard shows no counts because there is nothing to count yet — not because it
+                cannot count. A checklist can now be written in Settings and filled in on a phone from
+                &ldquo;Run a check&rdquo; above; until somebody records one, there is nothing to add
+                up. The figures you will eventually read here — due today, missed, failed and waiting
+                on a fix, certificates about to run out — come last of all, because they count what the
+                other screens record.
               </p>
               <p className="text-sm text-amber-900 mt-2">
                 The build then stops on purpose, so you can run a checklist on your own phone and say

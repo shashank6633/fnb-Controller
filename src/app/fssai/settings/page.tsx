@@ -269,7 +269,13 @@ export default function FssaiSettingsPage() {
         `${FSSAI_QTYPES.length} kinds of answer`,
         `${FSSAI_EVIDENCE_RULES.map((r) => r.label.toLowerCase()).join(' · ')}`,
       ],
-      nudge: 'The rules are stored and enforced today, with one gap: a question that demands a photograph cannot be finished yet, because the screen that attaches one is the next piece of work. Until then, leave "photo required" off.',
+      // UPDATED BY P3: the gap this sentence used to describe is closed. A
+      // question marked "photograph: always" can now be satisfied — the runner
+      // takes the picture, shrinks it on the phone and attaches it to that answer,
+      // and the check cannot be submitted until it is there. What is still
+      // outstanding is the OTHER half of this step: "raise a corrective action on
+      // failure" is stored per question and nothing acts on it yet.
+      nudge: 'The rules are stored and enforced today: a question that demands a photograph or a remark cannot be finished without one, and the person filling it in is told which answer is waiting for what. One part is still to come — "raise a corrective action if this fails" is recorded per question, but nothing picks the fix up yet.',
     },
     {
       n: 4,
