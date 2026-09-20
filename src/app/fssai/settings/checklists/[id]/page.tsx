@@ -771,11 +771,28 @@ export default function FssaiChecklistBuilderPage() {
   }
 
   async function setSectionActive(s: SectionRow, on: boolean) {
+    /* WHAT THIS ACTUALLY DOES, measured rather than assumed. The run engine
+     * builds the sheet from fssai_questions.is_active and never reads
+     * fssai_sections.is_active (runs/route.ts:656-661), so switching a section
+     * off removes the HEADING and nothing else. This dialog used to promise
+     * "its questions go with it"; a checklist was then submitted-blocked by two
+     * questions the admin believed he had taken off, one of them critical. Say
+     * what happens, and name the count, so the promise matches the engine. */
+    const stillAsked = !on
+      ? (tpl?.questions || []).filter((q) => q.section_id === s.id && Number(q.is_active)).length
+      : 0;
     if (
       !on &&
       !window.confirm(
-        `Switch off "${s.title}"?\n\nIt disappears from every future check, and its questions go with it. ` +
-          'Nothing already recorded changes, and you can switch it back on.',
+        `Switch off the heading "${s.title}"?\n\n` +
+          (stillAsked
+            ? `Staff stop seeing this heading, but its ${stillAsked} question${
+                stillAsked === 1 ? ' is' : 's are'
+              } STILL ASKED — ${
+                stillAsked === 1 ? 'it' : 'they'
+              } simply move up to sit under no heading. To take a question off the sheet, switch off that question.\n\n`
+            : 'It has no questions still switched on, so nothing is asked under it.\n\n') +
+          'Nothing already recorded changes, and you can switch the heading back on.',
       )
     )
       return;
@@ -787,7 +804,15 @@ export default function FssaiChecklistBuilderPage() {
         body: { id: s.id, is_active: on ? 1 : 0 },
       });
       setTpl(j.template);
-      say(on ? `"${s.title}" is back on the sheet.` : `"${s.title}" is switched off.`);
+      say(
+        on
+          ? `"${s.title}" is back on the sheet.`
+          : stillAsked
+            ? `Heading off. Its ${stillAsked} question${
+                stillAsked === 1 ? '' : 's'
+              } are still asked, now under no heading.`
+            : `"${s.title}" is switched off.`,
+      );
     } catch (e) {
       setErr((e as Error).message);
     } finally {
@@ -798,8 +823,10 @@ export default function FssaiChecklistBuilderPage() {
   async function deleteSection(s: SectionRow) {
     if (
       !window.confirm(
-        `Remove the section "${s.title}"?\n\nA section can only be removed while no question sits in it. ` +
-          'Nothing in the record refers to a section, so removing an empty one rewrites no history.',
+        `Remove the heading "${s.title}"?\n\n` +
+          'It can only be removed while no question is still switched ON under it. Any question ' +
+          'switched OFF under it stays exactly as it is and simply becomes ungrouped — nothing in a ' +
+          'record refers to a heading, so removing one rewrites no history.',
       )
     )
       return;
@@ -1636,6 +1663,33 @@ export default function FssaiChecklistBuilderPage() {
                               checklist often needs none.
                             </p>
                           )}
+                          {/* A SWITCHED-OFF SECTION DOES NOT TAKE ITS QUESTIONS
+                            * OFF THE SHEET. The run engine builds the sheet from
+                            * fssai_questions.is_active alone and never reads
+                            * fssai_sections.is_active (runs/route.ts:656-661), so
+                            * a question in a retired section is still asked, still
+                            * blocks submission, and — if it is critical — still
+                            * fails the whole check. Measured: section switched
+                            * off, then a fresh round refused with "Door seal
+                            * condition" and "Any pest sighting during the round?"
+                            * still on its missing list. The heading is only a
+                            * heading; retiring a question is done per question. */}
+                          {g.section &&
+                            !Number(g.section.is_active) &&
+                            g.questions.some((q) => Number(q.is_active)) && (
+                              <p className="text-xs text-amber-900 bg-amber-50 border border-amber-200 rounded-lg p-2 mt-2">
+                                <strong>
+                                  The heading is off, but{' '}
+                                  {g.questions.filter((q) => Number(q.is_active)).length} of its
+                                  questions are still asked.
+                                </strong>{' '}
+                                Staff no longer see this heading, and the questions below move up to
+                                sit under no heading at all — but they are still on every check, they
+                                still have to be answered before one can be submitted, and a critical
+                                one still fails the whole check. To take a question off the sheet,
+                                switch off that question.
+                              </p>
+                            )}
                         </div>
                         {editable && g.section && (
                           <div className="flex items-center gap-1.5">
@@ -2387,8 +2441,13 @@ function QuestionEditor({
           <p className="text-xs font-semibold text-[#6B5744]">Which answer counts as a pass?</p>
           <div className="grid grid-cols-2 gap-2 mt-2">
             {boolWords.map((w) => {
+              /* GREEN IS THE PASS, NOT THE LEFT-HAND BUTTON. The answer he picks
+               * here IS the passing one by definition, so it is the one painted
+               * green — even when it is "no". Colouring by position instead told
+               * him "no" was a failure on the very control where he had just
+               * declared it the pass, which is exactly backwards for the
+               * questions that matter most ("Any pest sighting?"). */
               const on = (draft.expected_value || boolWords[0]) === w;
-              const good = w === boolWords[0];
               return (
                 <button
                   key={w}
@@ -2396,15 +2455,14 @@ function QuestionEditor({
                   onClick={() => set({ expected_value: w })}
                   className={`min-h-[44px] rounded-lg border text-sm font-semibold capitalize transition-colors ${
                     on
-                      ? good
-                        ? 'bg-green-600 text-white border-green-600'
-                        : 'bg-red-600 text-white border-red-600'
-                      : good
-                        ? 'bg-white text-green-700 border-green-200 hover:border-green-400'
-                        : 'bg-white text-red-700 border-red-200 hover:border-red-400'
+                      ? 'bg-green-600 text-white border-green-600'
+                      : 'bg-white text-red-700 border-red-200 hover:border-red-400'
                   }`}
                 >
                   {w}
+                  <span className="block text-[10px] font-normal opacity-80 normal-case">
+                    {on ? 'passes' : 'fails'}
+                  </span>
                 </button>
               );
             })}
@@ -3067,6 +3125,27 @@ function PreviewQuestion({
 
   const boolWords: [string, string] = q.qtype === 'pass_fail' ? ['Pass', 'Fail'] : ['Yes', 'No'];
 
+  /**
+   * WHICH OF THE TWO BUTTONS IS THE PASS — ASKED, NEVER ASSUMED.
+   *
+   * A question may be authored so that "no" is the passing answer, and the most
+   * important FSSAI questions are shaped exactly that way ("Any pest sighting
+   * during the round?", "Any staff member unwell?"). Painting the first button
+   * green regardless put a GREEN button directly above the engine's own red
+   * "Recorded as a FAIL" line — the preview contradicting itself on the one
+   * screen whose entire promise is "what it says here is what it would say
+   * there" (measured: expected_value 'no' + Yes → is_fail true, "Expected no.").
+   *
+   * So the answer comes from evaluateFssaiAnswer — the engine's own predicate,
+   * the same call the verdict line uses — rather than from a second copy of the
+   * expected_value rule living on this screen.
+   */
+  const passOnTrue =
+    !evaluateFssaiAnswer(
+      { qtype: q.qtype, is_required: 1, allow_na: 0, expected_value: q.expected_value },
+      { value_bool: true },
+    ).is_fail;
+
   return (
     <div
       className={`rounded-lg border p-3 ${
@@ -3096,7 +3175,7 @@ function PreviewQuestion({
             <div className="grid grid-cols-2 gap-2">
               {[true, false].map((b, i) => {
                 const on = answer?.value_bool === b && !na;
-                const good = i === 0;
+                const good = b === passOnTrue;
                 return (
                   <button
                     key={String(b)}
