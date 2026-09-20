@@ -19,10 +19,11 @@
  */
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
+import { createHash } from 'node:crypto';
 import type Database from 'better-sqlite3';
 import { getDb, generateId, logAuditEvent } from '@/lib/db';
 import { getCurrentUser, isManagement, type SessionUser } from '@/lib/auth';
-import { canAuthorFssai, evaluateFssaiAnswer, qtypeMeta } from '@/lib/fssai';
+import { canAuthorFssai, evaluateFssaiAnswer, qtypeMeta, type FssaiSignature } from '@/lib/fssai';
 
 export type Gate = { me: SessionUser } | { resp: Response };
 
@@ -245,6 +246,14 @@ export interface FssaiRecordSnapshot {
   };
   sheet: FssaiRecordSnapshotQuestion[];
   counts: Record<string, unknown>;
+  /**
+   * THE ATTESTATION, COPIED IN AT SUBMIT (P3). Optional because every record
+   * submitted before P3 landed has none, and because a checklist may be
+   * configured not to require one — an absent signature here means "this record
+   * was never signed", which is a fact the record should be able to state, not a
+   * hole to paper over.
+   */
+  signature?: FssaiSignature | null;
 }
 
 export const FSSAI_SNAPSHOT_ACTION = 'snapshot';
@@ -494,6 +503,213 @@ export function recomputeFssaiAnsweredCount(db: Database.Database, runId: string
     `UPDATE fssai_runs SET answered_count=?, updated_at=datetime('now') WHERE id=? AND status='in_progress'`,
   ).run(answered, runId);
   return answered;
+}
+
+/* ------------------------------------------------------------------ *
+ * THE SIGNATURE — the act, the digest, and what the digest is for (P3)
+ * ------------------------------------------------------------------ *
+ *
+ * §7 Q6 (PROVISIONAL DEFAULT — the owner has not ruled): a signature is the
+ * authenticated user plus a timestamp. No drawing.
+ *
+ * WHAT P3 CHANGED, AND WHY IT MATTERS. P2a's submit STAMPED `signed_by` with the
+ * submitter's own email as a side effect of submitting — the server invented a
+ * signature nobody was asked for. A signature the software writes by itself is
+ * exactly the thing an inspector should not be shown, because it attests to
+ * nothing: there was no moment at which a person said "these are my answers".
+ * So the act is now EXPLICIT (POST /api/fssai/sign) and submit REFUSES a
+ * checklist that requires a signature until that act has happened.
+ *
+ * WHY A DIGEST. Signing an open sheet and then changing an answer would leave an
+ * attestation attached to words it never covered. So the sign act records a
+ * SHA-256 of every answer and every photograph as they stood at that moment; if
+ * anything moves afterwards, submit refuses with `code:'signature_stale'` and the
+ * person signs again, having seen what changed. That — an edit made THROUGH THE
+ * APP after the attestation — is the entire non-repudiation claim. It is NOT
+ * tamper-proofing: the digest lives in the same database as the data, so anyone
+ * with write access to the file can recompute both. The four things a signature
+ * does NOT prove are written out in full at src/lib/fssai.ts §11.
+ *
+ * WHERE IT IS STORED, with no schema change. `fssai_runs` already has
+ * `signed_by` / `signed_at` (the two hot columns a list needs), and the digest,
+ * the statement and the counts go into ONE `fssai_audit_log` row per act
+ * (`action='sign'`) — the same pattern P2a's record snapshot uses, for the same
+ * reason (§7 Q15: no migration on a table that holds audit history). At submit
+ * the signature is copied INTO the record snapshot, so a finished record carries
+ * its attestation even if the audit row is later unreadable.
+ */
+
+export const FSSAI_SIGN_ACTION = 'sign';
+export const FSSAI_UNSIGN_ACTION = 'unsign';
+
+/**
+ * A SHA-256 over the answers and photographs of one run.
+ *
+ * DETERMINISTIC ON PURPOSE: rows are re-read in a fixed order (by question, then
+ * by evidence id) and every field is stringified explicitly, so the same sheet
+ * always produces the same digest and a re-ordered SELECT cannot invalidate a
+ * signature by accident. `updated_at` is deliberately NOT in the digest — a
+ * re-save that changes nothing a person can see must not break their signature.
+ */
+export function computeFssaiSheetDigest(
+  db: Database.Database,
+  runId: string,
+): { digest: string; answers: number; photos: number } {
+  const run = db.prepare(
+    `SELECT id, template_id, template_version FROM fssai_runs WHERE id = ?`,
+  ).get(runId) as any;
+  const responses = db.prepare(
+    `SELECT question_id, qtype, value_text, value_num, value_bool, is_na, note, is_fail
+       FROM fssai_responses WHERE run_id = ? ORDER BY question_id ASC`,
+  ).all(runId) as any[];
+  const photos = db.prepare(
+    `SELECT id, response_id, mime, size_bytes FROM fssai_evidence
+      WHERE run_id = ? ORDER BY id ASC`,
+  ).all(runId) as any[];
+
+  const h = createHash('sha256');
+  h.update(`run:${String(run?.id ?? runId)}|tpl:${String(run?.template_id ?? '')}|v:${String(run?.template_version ?? '')}\n`);
+  for (const r of responses) {
+    h.update([
+      'q', String(r.question_id ?? ''), String(r.qtype ?? ''),
+      't', String(r.value_text ?? ''),
+      'n', r.value_num === null || r.value_num === undefined ? '' : String(r.value_num),
+      'b', r.value_bool === null || r.value_bool === undefined ? '' : String(Number(r.value_bool)),
+      'na', String(Number(r.is_na) || 0),
+      'note', String(r.note ?? ''),
+      'fail', String(Number(r.is_fail) || 0),
+    ].join('') + '\n');
+  }
+  for (const p of photos) {
+    h.update(['p', String(p.id), String(p.response_id ?? ''), String(p.mime ?? ''), String(Number(p.size_bytes) || 0)].join('') + '\n');
+  }
+  return { digest: h.digest('hex'), answers: responses.length, photos: photos.length };
+}
+
+/** The signature as it was recorded, or null when this run has never been signed. */
+export function readFssaiSignature(db: Database.Database, runId: string): FssaiSignature | null {
+  const row = db.prepare(
+    `SELECT after_json, created_at FROM fssai_audit_log
+      WHERE entity_table='fssai_runs' AND entity_id=? AND action=?
+      ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+  ).get(runId, FSSAI_SIGN_ACTION) as any;
+  if (!row || !row.after_json) return null;
+  try {
+    const v = JSON.parse(String(row.after_json));
+    if (!v || typeof v !== 'object' || !v.sheet_digest) return null;
+    return {
+      signed_by: String(v.signed_by ?? ''),
+      signed_name: String(v.signed_name ?? ''),
+      signed_at: String(v.signed_at ?? row.created_at ?? ''),
+      statement: String(v.statement ?? ''),
+      sheet_digest: String(v.sheet_digest ?? ''),
+      answers: Number(v.answers) || 0,
+      photos: Number(v.photos) || 0,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * IS THIS RUN SIGNED, AND DOES THE SIGNATURE STILL COVER WHAT IT SAYS IT DOES?
+ *
+ * The one predicate the sign route, the submit gate and every screen share, so
+ * "signed" cannot mean three different things in three places. A withdrawn
+ * signature (`action='unsign'` written after the sign row) reads as unsigned.
+ */
+export function fssaiSignatureState(
+  db: Database.Database,
+  runId: string,
+): {
+  signature: FssaiSignature | null;
+  is_signed: boolean;
+  is_stale: boolean;
+  digest_now: string;
+  answers_now: number;
+  photos_now: number;
+} {
+  const now = computeFssaiSheetDigest(db, runId);
+  const sig = readFssaiSignature(db, runId);
+  // A withdrawal is a row of its own, so the two acts are both in the file. The
+  // LAST of the two wins.
+  const withdrawn = db.prepare(
+    `SELECT 1 FROM fssai_audit_log
+      WHERE entity_table='fssai_runs' AND entity_id=? AND action=?
+        AND (created_at, rowid) > (
+          SELECT created_at, rowid FROM fssai_audit_log
+           WHERE entity_table='fssai_runs' AND entity_id=? AND action=?
+           ORDER BY created_at DESC, rowid DESC LIMIT 1)
+      LIMIT 1`,
+  ).get(runId, FSSAI_UNSIGN_ACTION, runId, FSSAI_SIGN_ACTION) as any;
+  const live = sig && !withdrawn ? sig : null;
+  return {
+    signature: live,
+    is_signed: !!live,
+    is_stale: !!live && live.sheet_digest !== now.digest,
+    digest_now: now.digest,
+    answers_now: now.answers,
+    photos_now: now.photos,
+  };
+}
+
+/**
+ * PERFORM THE SIGN ACT. The ONE place a signature is ever written.
+ *
+ * Two screens reach it and they must not drift:
+ *   · POST /api/fssai/sign                       — sign, look again, then submit;
+ *   · POST /api/fssai/runs {action:'submit', sign:true}
+ *                                                — the phone's one-tap "Sign and
+ *                                                  submit", signed immediately
+ *                                                  before the record is frozen.
+ *
+ * WHY THE ONE-TAP PATH IS STILL AN EXPLICIT ACT, which is the whole point of P3:
+ * the SERVER never decides to sign. It signs because the client said the person
+ * pressed a button that showed them the statement. That is exactly as strong (and
+ * exactly as weak) as a separate call to the sign route, which could equally be
+ * made without showing anyone anything — and it is fundamentally different from
+ * what P2a did, which was to write a signature whether or not any button existed.
+ *
+ * Caller's duty: be inside a transaction, and have already checked that the run
+ * is open and belongs to this person. This function does not re-gate.
+ */
+export function signFssaiRun(
+  db: Database.Database,
+  runId: string,
+  run: { signed_by?: string | null; signed_at?: string | null; outlet_id?: string | null },
+  actor: { email?: string | null; name?: string | null },
+  statement: string,
+  outletId?: string | null,
+): FssaiSignature {
+  const { digest, answers, photos } = computeFssaiSheetDigest(db, runId);
+  // The SERVER's clock, never the phone's: a device with the wrong time must not
+  // be able to backdate an attestation.
+  const signedAt = new Date().toISOString();
+  const signature: FssaiSignature = {
+    signed_by: actor.email || '',
+    signed_name: actor.name || actor.email || '',
+    signed_at: signedAt,
+    statement,
+    sheet_digest: digest,
+    answers,
+    photos,
+  };
+  db.prepare(
+    `UPDATE fssai_runs SET signed_by=?, signed_at=?, updated_at=datetime('now')
+      WHERE id=? AND status='in_progress'`,
+  ).run(signature.signed_by, signedAt, runId);
+  /* Best-effort per §7 Q4 (never lose a check a member of staff really did), with
+   * the consequence stated: if this row is lost, fssaiSignatureState reads the run
+   * as UNSIGNED and submit asks for the signature again. It can never quietly
+   * accept an attestation it cannot produce. */
+  fssaiAuditBestEffort(db, {
+    entity_table: 'fssai_runs', entity_id: runId, action: FSSAI_SIGN_ACTION, field: 'signed_by',
+    before: { signed_by: run.signed_by || '', signed_at: run.signed_at || '' },
+    after: signature,
+    reason: statement,
+    actor, outlet_id: outletId || run.outlet_id || '',
+  });
+  return signature;
 }
 
 /* ------------------------------------------------------------------ *

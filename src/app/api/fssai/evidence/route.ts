@@ -1,7 +1,12 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { getDb, generateId } from '@/lib/db';
 import { getCurrentOutletId } from '@/lib/auth';
-import { evaluateFssaiAnswer, qtypeMeta } from '@/lib/fssai';
+import {
+  evaluateFssaiAnswer, qtypeMeta,
+  FSSAI_EVIDENCE_MAX_PER_ANSWER, FSSAI_EVIDENCE_MAX_PER_RUN,
+  FSSAI_PHOTO_MAX_BYTES, FSSAI_PHOTO_TARGET_BYTES, FSSAI_PHOTO_MIMES,
+  fssaiBytesLabel, parseFssaiDataUri,
+} from '@/lib/fssai';
 import {
   requireFssaiUser, fssaiCsrfGuard, fssaiAudit, fssaiAuditBestEffort, fssaiAppAudit,
   parseJsonArray, str, canSeeFssaiRun, fssaiEvidenceCountsByQuestion, fssaiAnswerComplete,
@@ -52,7 +57,7 @@ import {
  * 4. SIZE IS CAPPED, AND THE CAP IS THE ONE PRODUCTION ACTUALLY HAS.
  *    HARD RULE 14: nginx `client_max_body_size` is 1 MB, and a larger upload
  *    returns a bare 413 that no error handler in this app turns into a sentence.
- *    So: a data URI over MAX_DATA_URI_CHARS is refused HERE, in words, well
+ *    So: a data URI over FSSAI_PHOTO_MAX_BYTES is refused HERE, in words, well
  *    inside that limit, and the runner compresses to ~250 KB before it ever
  *    posts (§7 Q13 — photographs live in-row as TEXT, which is what every other
  *    image store in this app does; a retention window is still the owner's call).
@@ -60,32 +65,22 @@ import {
 export const dynamic = 'force-dynamic';
 
 /**
- * ~300 KB of image, ~400 KB of request. The production nginx limit is 1 MB
- * (HARD RULE 14) and base64 inflates by 4/3, so this leaves room for the JSON
- * around it and for a proxy that counts headers. The runner targets 250 KB.
+ * EVERY LIMIT ON THIS ROUTE COMES FROM src/lib/fssai.ts, NOT FROM HERE.
+ *
+ * ⚠️ THIS WAS A REAL DEFECT, FOUND AND FIXED IN THIS LANE. The vocabulary module
+ * was committed (f1223a0) precisely so "the limit that shrinks a photograph and
+ * the limit that refuses one can never disagree" — and then this route kept its
+ * own private numbers, which disagreed with it on every single one: 6 photographs
+ * per answer here against 4 there, 30 per run against 24, its own data-URI regex
+ * against parseFssaiDataUri, and a character cap (400,000 chars ≈ 293 KB decoded)
+ * against a byte cap (400 KB decoded ≈ 546,000 chars). So the server would have
+ * refused a photograph 300 KB in size while the shared vocabulary told the phone
+ * 400 KB was allowed, and the person in the cold room would have had no way to
+ * find out which was true. The numbers now have exactly one home — the import at
+ * the top of this file — and `parseFssaiDataUri` does the validation, so the
+ * stored-XSS guard (only base64 image/jpeg|png|webp, charset checked) is also
+ * shared rather than re-written here.
  */
-const MAX_DATA_URI_CHARS = 400_000;
-/** Enough to photograph a cold room, a thermometer and the door seal. */
-const MAX_PER_ANSWER = 6;
-/** §7 Q13: the database file is 34 MB today. 30 × 250 KB is one heavy round. */
-const MAX_PER_RUN = 30;
-
-/**
- * Only photographs, and only the three formats a browser can both produce with
- * canvas and render back. HEIC is deliberately absent: an iPhone's native format
- * cannot be displayed by most browsers, so the runner converts to JPEG before
- * posting. Anything else is refused BY NAME rather than stored as junk nobody
- * can open at an inspection.
- */
-const ALLOWED_MIMES = ['image/jpeg', 'image/png', 'image/webp'] as const;
-const DATA_URI_RE = /^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=\s]+)$/;
-
-/** Bytes a base64 payload decodes to, without decoding it. */
-function base64Bytes(b64: string): number {
-  const clean = b64.replace(/\s/g, '');
-  const pad = clean.endsWith('==') ? 2 : clean.endsWith('=') ? 1 : 0;
-  return Math.max(0, Math.floor((clean.length * 3) / 4) - pad);
-}
 
 function metaOf(row: any) {
   return {
@@ -146,7 +141,14 @@ export async function GET(request: Request) {
       evidence: rows.map(metaOf),
       // So the runner can show "2 of 6" without a second call, and so a client
       // that has drifted from these numbers is corrected by the server.
-      limits: { max_per_answer: MAX_PER_ANSWER, max_per_run: MAX_PER_RUN, max_data_uri_chars: MAX_DATA_URI_CHARS },
+      limits: {
+        max_per_answer: FSSAI_EVIDENCE_MAX_PER_ANSWER,
+        max_per_run: FSSAI_EVIDENCE_MAX_PER_RUN,
+        max_bytes: FSSAI_PHOTO_MAX_BYTES,
+        target_bytes: FSSAI_PHOTO_TARGET_BYTES,
+        max_bytes_label: fssaiBytesLabel(FSSAI_PHOTO_MAX_BYTES),
+        mimes: FSSAI_PHOTO_MIMES,
+      },
     });
   } catch (e: any) {
     console.error('GET /api/fssai/evidence failed:', e);
@@ -222,40 +224,36 @@ export async function POST(request: Request) {
     }
     const dataUri = String(body?.data_uri ?? '').trim();
     if (!dataUri) return Response.json({ error: 'No photograph arrived. Try taking it again.' }, { status: 400 });
-    if (dataUri.length > MAX_DATA_URI_CHARS) {
-      // Said in kilobytes, because "400000 characters" means nothing to a chef.
-      const kb = Math.round(base64Bytes(dataUri) / 1024);
+
+    /* ONE validator, shared with the phone (parseFssaiDataUri). It refuses
+     * anything that is not a base64 JPG/PNG/WebP — the stored string is handed
+     * back to a browser as an <img src>, so `data:text/html;base64,…` in this
+     * column would be a stored XSS on a food-safety record — and it refuses one
+     * over FSSAI_PHOTO_MAX_BYTES in words, well inside nginx's real 1 MB
+     * (HARD RULE 14), because a bare 413 from nginx never reaches this code and
+     * no error handler in this app turns it into a sentence. */
+    const parsed = parseFssaiDataUri(dataUri);
+    if (!parsed.ok) {
       return Response.json(
-        {
-          error: `That photograph is about ${kb} KB, which is too big to save (the limit is about ${Math.round((MAX_DATA_URI_CHARS * 3) / 4 / 1024)} KB). Take it again — the app shrinks photographs before sending them, so this usually means it was attached from a file rather than the camera.`,
-          code: 'too_big',
-        },
-        { status: 413 },
+        { error: parsed.error, code: parsed.code },
+        { status: parsed.code === 'too_big' ? 413 : 400 },
       );
     }
-    const m = dataUri.match(DATA_URI_RE);
-    if (!m) {
-      return Response.json(
-        { error: `That file is not a photograph this app can save. Use the camera, or a ${ALLOWED_MIMES.map((x) => x.replace('image/', '').toUpperCase()).join(', ')} image.` },
-        { status: 400 },
-      );
-    }
-    const mime = m[1];
-    const sizeBytes = base64Bytes(m[2]);
-    if (sizeBytes <= 0) return Response.json({ error: 'That photograph is empty. Take it again.' }, { status: 400 });
+    const mime = parsed.mime;
+    const sizeBytes = parsed.bytes;
 
     /* ── the caps ───────────────────────────────────────────────────────────── */
     const perAnswer = (db.prepare(
       `SELECT COUNT(*) AS n FROM fssai_evidence WHERE response_id = ?`,
     ).get(response.id) as any).n as number;
-    if (perAnswer >= MAX_PER_ANSWER) {
+    if (perAnswer >= FSSAI_EVIDENCE_MAX_PER_ANSWER) {
       return Response.json(
         { error: `This answer already has ${perAnswer} photographs, which is as many as one answer can hold. Remove one first.` },
         { status: 409 },
       );
     }
     const perRun = (db.prepare(`SELECT COUNT(*) AS n FROM fssai_evidence WHERE run_id = ?`).get(runId) as any).n as number;
-    if (perRun >= MAX_PER_RUN) {
+    if (perRun >= FSSAI_EVIDENCE_MAX_PER_RUN) {
       return Response.json(
         { error: `This check already has ${perRun} photographs on it, which is the most one check can hold.` },
         { status: 409 },

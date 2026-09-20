@@ -5,13 +5,13 @@ import {
   canRunFssaiCheck, canTakeOverFssaiRun, decideFssaiSlot, evaluateFssaiAnswer,
   summariseFssaiRun, fssaiToday, isISODate, daysBetweenISO, isFssaiShift, isFssaiTargetKind,
   fssaiResponseAnswered, isFssaiBoolQType, fssaiBoolFromText, fssaiBoolWordsFor,
-  fssaiDisplayReading,
+  fssaiDisplayReading, FSSAI_SIGNATURE_STATEMENT, fssaiSignatureStatement,
   type FssaiSlotRunRow,
 } from '@/lib/fssai';
 import {
   requireFssaiUser, fssaiAudit, fssaiAuditBestEffort, fssaiAppAudit, parseJsonArray,
   shapeQuestion, str, constraintMessage, FSSAI_NO_MATCH,
-  readFssaiRecordSnapshot, writeFssaiRecordSnapshot,
+  readFssaiRecordSnapshot, writeFssaiRecordSnapshot, fssaiSignatureState, signFssaiRun,
   type FssaiRecordSnapshotQuestion,
 } from '@/lib/fssai-server';
 
@@ -707,6 +707,75 @@ export async function POST(request: Request) {
         );
       }
 
+      /* ── THE SIGNATURE GATE (P3) ──────────────────────────────────────────
+       * ⚠️ CONTRACT CHANGE, AND THE REASON FOR IT. Until P3 this route WROTE a
+       * signature by itself: `signed_by = me.email` whenever the checklist had
+       * requires_signature, as a side effect of submitting. Nobody was ever
+       * asked. An inspector reading "signed by chef@akan" would reasonably
+       * believe a person attested to those readings; in fact the server typed the
+       * line the moment the last box was ticked, and there was no act to
+       * repudiate. `requires_signature` DEFAULTS TO 1, so that was every record.
+       *
+       * Now the person presses Sign (POST /api/fssai/sign), which records who,
+       * when, the statement in words, and a SHA-256 of the answers and photographs
+       * as they then stood. Submit refuses without it, and refuses again if an
+       * answer changed after signing — otherwise the attestation would cover
+       * words it never saw. Both refusals are machine-readable and name the
+       * endpoint, because a runner that meets one must know what to do next.
+       *
+       * A checklist with requires_signature = 0 submits exactly as it did before.
+       * This is the owner's own §22 order of work: Readings → Photo → Remarks →
+       * SIGN → Submit. */
+      let signatureForRecord: ReturnType<typeof fssaiSignatureState>['signature'] = null;
+      /* TWO WAYS TO HAVE SIGNED, one act. `sign:true` in the submit body is the
+       * phone's one-tap "Sign and submit": the person was shown the statement and
+       * pressed one button, so the signature is written (by the SAME helper, with
+       * the same digest and the same audit row) immediately before the record is
+       * frozen, inside the submit transaction below. The two-step path — POST
+       * /api/fssai/sign, look at the sheet again, then submit — is protected by the
+       * staleness test instead. What is NOT possible any more is the third thing:
+       * the server signing because nobody asked. */
+      const signNow = body?.sign === true || body?.sign === 1 || body?.sign === '1';
+      const signStatement = fssaiSignatureStatement(str(body?.signature_statement));
+      if (Number(tpl.requires_signature)) {
+        const sig = fssaiSignatureState(db, runId);
+        if (!sig.is_signed && !signNow) {
+          return Response.json(
+            {
+              error: 'This check has to be signed before it can be submitted. Read the statement, then sign it.',
+              code: 'signature_required',
+              sign_endpoint: '/api/fssai/sign',
+              // Or send the same submit again with sign:true, having shown this
+              // sentence to the person first.
+              sign_inline: { action: 'submit', sign: true },
+              statement: FSSAI_SIGNATURE_STATEMENT,
+            },
+            { status: 400 },
+          );
+        }
+        if (sig.is_stale && !signNow) {
+          return Response.json(
+            {
+              error: 'Something changed after you signed, so the signature no longer covers what is on the sheet. Check the answers and sign again.',
+              code: 'signature_stale',
+              sign_endpoint: '/api/fssai/sign',
+              statement: FSSAI_SIGNATURE_STATEMENT,
+              signed_at: sig.signature?.signed_at || '',
+              // What it covered, against what is there now — so the screen can
+              // say "you have added a photograph since" rather than just "stale".
+              signed_answers: sig.signature?.answers ?? 0,
+              signed_photos: sig.signature?.photos ?? 0,
+              answers_now: sig.answers_now,
+              photos_now: sig.photos_now,
+            },
+            { status: 400 },
+          );
+        }
+        // A signature already on file (the two-step path). The one-tap path is
+        // signed inside the transaction below, where the sheet is final.
+        signatureForRecord = sig.signature;
+      }
+
       const facts = judged.map((q) => {
         const r = byQ.get(String(q.id));
         return {
@@ -742,6 +811,14 @@ export async function POST(request: Request) {
       });
 
       const submit = db.transaction(() => {
+        /* THE ONE-TAP SIGN, inside the same transaction as the freeze, so the
+         * digest covers the sheet exactly as it is about to be recorded and the
+         * two writes cannot be separated by anything. */
+        if (Number(tpl.requires_signature) && signNow) {
+          signatureForRecord = signFssaiRun(
+            db, runId, run, { email: me.email, name: me.name }, signStatement, run.outlet_id,
+          );
+        }
         const res = db.prepare(
           `UPDATE fssai_runs
               SET status='submitted', submitted_at=datetime('now'),
@@ -756,10 +833,15 @@ export async function POST(request: Request) {
           // the version it was started on, so the record is honest either way.
           tpl.version,
           str(body?.remarks),
-          // §7 Q6 (PROVISIONAL): a signature is the authenticated user plus a
-          // timestamp. No drawing.
-          Number(tpl.requires_signature) ? (me.email || '') : '',
-          Number(tpl.requires_signature) ? new Date().toISOString() : '',
+          /* §7 Q6 (PROVISIONAL): a signature is the authenticated user plus a
+           * timestamp, no drawing — but it is now the one RECORDED BY THE SIGN
+           * ACT above, not one invented here. A checklist that does not require a
+           * signature keeps '' rather than being given a signature nobody asked
+           * for. `signed_by` is re-stated here (rather than left to the sign
+           * route's own UPDATE) so the submitted row is self-consistent even if
+           * the two writes were ever separated. */
+          signatureForRecord ? signatureForRecord.signed_by : '',
+          signatureForRecord ? signatureForRecord.signed_at : '',
           runId,
         );
         if (res.changes !== 1) throw new Error('FSSAI_RUN_ALREADY_SUBMITTED');
@@ -801,6 +883,11 @@ export async function POST(request: Request) {
             },
             sheet,
             counts: { ...summary, retired_mid_run: retiredAnswered.length },
+            /* THE ATTESTATION, FROZEN WITH THE SHEET IT COVERS. The digest is
+             * copied in here deliberately: a reader of the finished record can
+             * recompute it over the record's own answers and see that nothing
+             * moved, without trusting a second audit row to still be readable. */
+            signature: signatureForRecord,
           },
           { email: me.email, name: me.name },
           run.outlet_id,
@@ -827,6 +914,10 @@ export async function POST(request: Request) {
         counted_retired_questions: retiredAnswered.length,
         retired_mid_run: retiredAnswered.map((q) => ({ question_id: q.id, prompt: q.prompt })),
         sheet_as_asked: sheet,
+        // Who attested, and to what — so the "submitted" screen can show it
+        // without a second request.
+        signature: signatureForRecord,
+        awaiting_verification: !!Number(tpl.requires_verification),
       });
     }
 

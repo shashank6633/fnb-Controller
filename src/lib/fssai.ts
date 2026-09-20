@@ -1256,23 +1256,32 @@ export function fssaiDataUriBytes(uri: string | null | undefined): number {
  */
 export function parseFssaiDataUri(
   uri: string | null | undefined,
-): { ok: true; mime: string; b64: string; bytes: number } | { ok: false; error: string } {
+):
+  | { ok: true; mime: string; b64: string; bytes: number }
+  /**
+   * `code` exists so the ROUTE can pick the right HTTP status (413 for a
+   * photograph that is merely too big, 400 for one that is not an image at all)
+   * without matching on the wording of the sentence — which would break the
+   * moment somebody improved the copy.
+   */
+  | { ok: false; error: string; code: 'missing' | 'not_a_data_uri' | 'bad_mime' | 'truncated' | 'empty' | 'too_big' } {
   const s = String(uri || '').trim();
-  if (!s) return { ok: false, error: 'No photograph was sent.' };
+  if (!s) return { ok: false, error: 'No photograph was sent.', code: 'missing' };
   const m = s.match(/^data:([a-z]+\/[a-z0-9.+-]+);base64,([A-Za-z0-9+/=\s]+)$/i);
-  if (!m) return { ok: false, error: 'That is not a photograph this app can store. Take the picture again from the camera button.' };
+  if (!m) return { ok: false, error: 'That is not a photograph this app can store. Take the picture again from the camera button.', code: 'not_a_data_uri' };
   const mime = m[1].toLowerCase();
   const b64 = m[2].replace(/\s+/g, '');
   if (!FSSAI_PHOTO_MIMES.includes(mime)) {
-    return { ok: false, error: `${mime} cannot be attached to a food-safety record. Use a JPG or PNG photograph.` };
+    return { ok: false, error: `${mime} cannot be attached to a food-safety record. Use a JPG or PNG photograph.`, code: 'bad_mime' };
   }
-  if (b64.length % 4 !== 0) return { ok: false, error: 'That photograph did not arrive whole. Try again.' };
+  if (b64.length % 4 !== 0) return { ok: false, error: 'That photograph did not arrive whole. Try again.', code: 'truncated' };
   const bytes = fssaiDataUriBytes(s);
-  if (bytes <= 0) return { ok: false, error: 'That photograph is empty.' };
+  if (bytes <= 0) return { ok: false, error: 'That photograph is empty.', code: 'empty' };
   if (bytes > FSSAI_PHOTO_MAX_BYTES) {
     return {
       ok: false,
       error: `That photograph is ${fssaiBytesLabel(bytes)}. A photograph attached to a record must be under ${fssaiBytesLabel(FSSAI_PHOTO_MAX_BYTES)} — the camera button shrinks it for you, so take it again from there rather than attaching the original file.`,
+      code: 'too_big',
     };
   }
   return { ok: true, mime, b64, bytes };
