@@ -502,7 +502,7 @@ export default function FssaiRunPickerPage() {
               >
                 <div className="flex items-start gap-3 flex-nowrap">
                   <div className="min-w-0 flex-1">
-                    <p className="font-bold leading-tight">{r.template_name}</p>
+                    <p className="font-bold leading-tight break-words">{r.template_name}</p>
                     <p className="text-xs text-[#8B7355] mt-0.5">
                       {r.target_label ? `${r.target_label} · ` : ''}
                       {whenLabel(r.business_date)}{r.shift ? ` · ${shiftLabel(r.shift)}` : ''}
@@ -548,7 +548,7 @@ export default function FssaiRunPickerPage() {
               <div key={a.id} className={`${CARD} p-3.5`}>
                 <div className="flex items-start gap-3 flex-nowrap">
                   <div className="min-w-0 flex-1">
-                    <p className="font-bold leading-tight">{a.template_name}</p>
+                    <p className="font-bold leading-tight break-words">{a.template_name}</p>
                     <div className="flex flex-wrap items-center gap-1.5 mt-1.5">
                       <Chip><Clock size={11} />{freqLabel(a.frequency)}</Chip>
                       {a.shift ? <Chip>{shiftLabel(a.shift)}</Chip> : null}
@@ -633,7 +633,7 @@ export default function FssaiRunPickerPage() {
                 >
                   <div className="flex items-start gap-3 flex-nowrap">
                     <div className="min-w-0 flex-1">
-                      <p className="font-semibold leading-tight">{t.name}</p>
+                      <p className="font-semibold leading-tight break-words">{t.name}</p>
                       <div className="flex flex-wrap items-center gap-1.5 mt-1.5">
                         <Chip>{freqLabel(t.frequency)}</Chip>
                         <Chip>{t.question_count} question{Number(t.question_count) === 1 ? '' : 's'}</Chip>
@@ -713,7 +713,7 @@ export default function FssaiRunPickerPage() {
         {pick && (
           <>
             {pick.tpl.description ? (
-              <p className="text-sm text-[#3D2614]">{pick.tpl.description}</p>
+              <p className="text-sm text-[#3D2614] break-words">{pick.tpl.description}</p>
             ) : null}
 
             {/* What it is filed against */}

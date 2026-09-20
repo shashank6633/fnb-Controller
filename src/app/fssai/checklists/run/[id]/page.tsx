@@ -203,7 +203,8 @@ export default function FssaiRunnerPage() {
   const [renamedTo, setRenamedTo] = useState<string>('');
   const [editedSince, setEditedSince] = useState(false);
   const [evidence, setEvidence] = useState<EvidenceMeta[]>([]);
-  const [evLimits, setEvLimits] = useState<{ max_per_answer: number; max_per_run: number; max_data_uri_chars: number } | null>(null);
+  /** The caps the SERVER declares, so "2 of 4" on screen is never the client's guess. */
+  const [evLimits, setEvLimits] = useState<{ max_per_answer: number; max_per_run: number; max_bytes_label?: string } | null>(null);
 
   const [drafts, setDrafts] = useState<Record<string, Draft>>({});
   const [saveState, setSaveState] = useState<Record<string, SaveState>>({});
@@ -221,7 +222,7 @@ export default function FssaiRunnerPage() {
   const [submitErr, setSubmitErr] = useState('');
   const [missing, setMissing] = useState<MissingRow[]>([]);
   const [sigNotice, setSigNotice] = useState<{ message: string; statement: string; endpoint: string } | null>(null);
-  const [done, setDone] = useState<{ outcome: string; pass_pct: number; fail_count: number; counted_retired: number } | null>(null);
+  const [done, setDone] = useState<{ outcome: string; pass_pct: number; fail_count: number; counted_retired: number; awaiting_verification: boolean } | null>(null);
 
   const [takeoverOpen, setTakeoverOpen] = useState(false);
   const [takeoverReason, setTakeoverReason] = useState('');
@@ -429,26 +430,32 @@ export default function FssaiRunnerPage() {
     return () => { window.clearInterval(t); window.removeEventListener('online', on); };
   }, [canWrite, flushQueue]);
 
-  /** Debounced save, for things that are typed. */
+  /**
+   * ONE CHANGE TO ONE ANSWER: keep it, then send it.
+   *
+   * The next draft is computed OUTSIDE the state updater on purpose. A React
+   * updater must be pure — sending a request from inside one fires twice under
+   * StrictMode — and the ref is kept in step here as well as on render, so two
+   * changes in the same tick still build on each other.
+   *
+   * A TAP GOES AT ONCE; TYPING WAITS 900ms. A tap is a finished decision and the
+   * round must be safe the moment it is made. Typing is not finished until the
+   * thumb stops, and one POST per keystroke on a phone in a cold room is how you
+   * lose the connection you were trying to use.
+   */
   const timers = useRef<Record<string, number>>({});
   const setDraft = useCallback((qid: string, patch: Partial<Draft>, mode: 'now' | 'typing') => {
-    setDrafts((d) => {
-      const next = { ...(d[qid] || emptyDraft()), ...patch };
-      const out = { ...d, [qid]: next };
-      const q = questionById.get(qid);
-      if (q) {
-        const send = () => { void pushAnswer(qid, out[qid]); };
-        if (timers.current[qid]) window.clearTimeout(timers.current[qid]);
-        if (mode === 'now') {
-          // A tap is deliberate: send it at once so the round is safe.
-          send();
-        } else {
-          setSaveState((s) => ({ ...s, [qid]: 'saving' }));
-          timers.current[qid] = window.setTimeout(send, 900);
-        }
-      }
-      return out;
-    });
+    const next: Draft = { ...(draftsRef.current[qid] || emptyDraft()), ...patch };
+    draftsRef.current = { ...draftsRef.current, [qid]: next };
+    setDrafts((d) => ({ ...d, [qid]: next }));
+    if (!questionById.has(qid)) return;
+    if (timers.current[qid]) window.clearTimeout(timers.current[qid]);
+    if (mode === 'now') {
+      void pushAnswer(qid, next);
+    } else {
+      setSaveState((s) => ({ ...s, [qid]: 'saving' }));
+      timers.current[qid] = window.setTimeout(() => { void pushAnswer(qid, next); }, 900);
+    }
   }, [pushAnswer, questionById]);
 
   /* ── photographs ──────────────────────────────────────────────────── */
@@ -597,6 +604,11 @@ export default function FssaiRunnerPage() {
         pass_pct: Number(j?.summary?.pass_pct ?? 0),
         fail_count: Number(j?.summary?.fail_count ?? 0),
         counted_retired: Number(j?.counted_retired_questions ?? 0),
+        // The engine says whether somebody else still has to look at it. Said
+        // here rather than guessed from the template flag, so the two cannot
+        // disagree — the verification screen is another lane's, and this is the
+        // one sentence that hands the record over to it.
+        awaiting_verification: !!j?.awaiting_verification,
       });
       try { localStorage.removeItem(draftKey(runId)); localStorage.removeItem(queueKey(runId)); } catch { /* storage off */ }
       await load();
@@ -821,6 +833,10 @@ export default function FssaiRunnerPage() {
             canVoid={!!me && canTakeOverFssaiRun(me) && run.status !== 'void'}
             onVoid={() => setVoidOpen(true)}
             justSubmitted={done}
+            awaitingVerification={
+              (done ? done.awaiting_verification : false)
+              || (run.status === 'submitted' && !!Number(tpl?.requires_verification ?? 0))
+            }
           />
         )}
 
@@ -1140,11 +1156,11 @@ function QuestionCard({
       <div className="flex items-start gap-2.5 flex-nowrap">
         <span className="text-[11px] font-bold text-[#8B7355] tabular-nums shrink-0 mt-1">{index}/{total}</span>
         <div className="min-w-0 flex-1">
-          <p className="font-semibold leading-snug">
+          <p className="font-semibold leading-snug break-words">
             {q.prompt}
             {!Number(q.is_required) ? <span className="text-[#8B7355] font-normal"> (optional)</span> : null}
           </p>
-          {q.help_text ? <p className="text-xs text-[#8B7355] mt-1">{q.help_text}</p> : null}
+          {q.help_text ? <p className="text-xs text-[#8B7355] mt-1 break-words">{q.help_text}</p> : null}
           <div className="flex flex-wrap items-center gap-1.5 mt-1.5">
             {Number(q.is_critical) ? (
               <Chip className="bg-red-50 text-red-700 border-red-200">Critical — one failure fails the round</Chip>
@@ -1206,7 +1222,7 @@ function QuestionCard({
                   >
                     <span className="flex items-center gap-2 flex-nowrap">
                       {picked ? <Check size={17} className="shrink-0" /> : null}
-                      <span className="min-w-0">{o}</span>
+                      <span className="min-w-0 break-words">{o}</span>
                     </span>
                   </button>
                 );
@@ -1262,7 +1278,7 @@ function QuestionCard({
       {saveErr && (
         <div className="rounded-lg bg-red-50 border border-red-200 p-2.5 text-sm text-red-800">
           <p className="font-bold">That answer was not accepted</p>
-          <p className="mt-0.5">{saveErr}</p>
+          <p className="mt-0.5 break-words">{saveErr}</p>
         </div>
       )}
 
@@ -1311,7 +1327,7 @@ function QuestionCard({
                   className={INPUT}
                 />
               ) : String(response?.note || '') ? (
-                <p className="text-sm text-[#3D2614] bg-[#FFF8F0] border border-[#E8D5C4] rounded-lg p-2.5">{response?.note}</p>
+                <p className="text-sm text-[#3D2614] bg-[#FFF8F0] border border-[#E8D5C4] rounded-lg p-2.5 break-words">{response?.note}</p>
               ) : null}
             </div>
           )}
@@ -1329,6 +1345,12 @@ function QuestionCard({
                     <span>{clockOf(ev.created_at)}</span>
                   </button>
                   {canWrite && (
+                    /* THE ONE CONTROL ON THIS SCREEN DELIBERATELY UNDER 44px.
+                       Everything a person is meant to press in a kitchen is 48-56px;
+                       this removes evidence from a food-safety record, and a wet
+                       thumb brushing the corner of a thumbnail must not do that. It
+                       is 32px, off the corner of an 80px tile, and the removal is
+                       audited either way. */
                     <button
                       type="button" onClick={() => onRemovePhoto(ev)} aria-label="Remove this photograph"
                       className="absolute -top-2 -right-2 w-8 h-8 rounded-full bg-white border border-[#E8D5C4] flex items-center justify-center text-red-700 shadow-sm"
@@ -1448,7 +1470,7 @@ function ReadingAnswer({
  * ================================================================== */
 
 function FinishedRecord({
-  run, tpl, sheet, responses, evidence, onView, canVoid, onVoid, justSubmitted,
+  run, tpl, sheet, responses, evidence, onView, canVoid, onVoid, justSubmitted, awaitingVerification,
 }: {
   run: RunRow;
   tpl: TemplateRow | null;
@@ -1458,7 +1480,8 @@ function FinishedRecord({
   onView: (m: EvidenceMeta) => void;
   canVoid: boolean;
   onVoid: () => void;
-  justSubmitted: { outcome: string; pass_pct: number; fail_count: number; counted_retired: number } | null;
+  justSubmitted: { outcome: string; pass_pct: number; fail_count: number; counted_retired: number; awaiting_verification: boolean } | null;
+  awaitingVerification: boolean;
 }) {
   const rows = useMemo(() => {
     if (sheet && sheet.length) {
@@ -1546,7 +1569,12 @@ function FinishedRecord({
         <div className="mt-3 pt-3 border-t border-[#E8D5C4] text-xs text-[#6B5744] space-y-1">
           <p>Recorded by <strong>{run.recorded_name || run.recorded_by}</strong>{clockOf(run.submitted_at) ? `, submitted at ${clockOf(run.submitted_at)}` : ''}.</p>
           {run.signed_by ? <p>Signed by <strong>{run.signed_by}</strong> — the account that was signed in, and the time.</p> : null}
-          {run.remarks ? <p className="pt-1">&ldquo;{run.remarks}&rdquo;</p> : null}
+          {run.remarks ? <p className="pt-1 break-words">&ldquo;{run.remarks}&rdquo;</p> : null}
+          {awaitingVerification && run.status === 'submitted' ? (
+            <p className="pt-1">
+              Somebody else still has to verify this record — never the person who recorded it.
+            </p>
+          ) : null}
         </div>
       </div>
 
@@ -1561,11 +1589,11 @@ function FinishedRecord({
               <div className="flex items-start gap-2.5 flex-nowrap">
                 <span className="text-[11px] font-bold text-[#8B7355] tabular-nums shrink-0 mt-0.5">{i + 1}</span>
                 <div className="min-w-0 flex-1">
-                  <p className="text-sm font-semibold leading-snug">{s.prompt}</p>
-                  <p className={`text-sm mt-1 font-bold ${Number(s.is_fail) ? 'text-red-700' : Number(s.is_na) ? 'text-[#8B7355]' : 'text-[#2D1B0E]'}`}>
+                  <p className="text-sm font-semibold leading-snug break-words">{s.prompt}</p>
+                  <p className={`text-sm mt-1 font-bold break-words ${Number(s.is_fail) ? 'text-red-700' : Number(s.is_na) ? 'text-[#8B7355]' : 'text-[#2D1B0E]'}`}>
                     {answerText(r, s.qtype)}
                   </p>
-                  {r?.note ? <p className="text-xs text-[#6B5744] mt-1">{r.note}</p> : null}
+                  {r?.note ? <p className="text-xs text-[#6B5744] mt-1 break-words">{r.note}</p> : null}
                   <div className="flex flex-wrap items-center gap-1.5 mt-1.5">
                     {Number(s.is_fail) ? <Chip className="bg-red-50 text-red-700 border-red-200">Failed</Chip> : null}
                     {Number(s.is_critical) ? <Chip className="bg-red-50 text-red-700 border-red-200">Critical</Chip> : null}

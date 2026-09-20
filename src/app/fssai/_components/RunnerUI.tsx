@@ -86,8 +86,8 @@ export function PageHead({
           {eyebrow && (
             <p className="text-[11px] font-semibold text-[#8B7355] uppercase tracking-wider">{eyebrow}</p>
           )}
-          <h1 className="text-xl sm:text-2xl font-bold text-[#af4408] leading-tight">{title}</h1>
-          {sub && <p className="text-xs text-[#8B7355] mt-0.5">{sub}</p>}
+          <h1 className="text-xl sm:text-2xl font-bold text-[#af4408] leading-tight break-words">{title}</h1>
+          {sub && <p className="text-xs text-[#8B7355] mt-0.5 break-words">{sub}</p>}
         </div>
       </div>
       {right}
@@ -125,7 +125,7 @@ export function Note({
     <div className={`${t.box} border rounded-xl p-3 sm:p-4`}>
       <div className="flex items-start gap-2.5 flex-nowrap">
         <span className={`${t.icon} shrink-0 mt-0.5`}>{icon || <Fallback size={17} />}</span>
-        <div className={`min-w-0 text-sm ${t.text}`}>
+        <div className={`min-w-0 text-sm break-words ${t.text}`}>
           {title && <p className="font-bold">{title}</p>}
           {children}
         </div>
@@ -137,7 +137,7 @@ export function Note({
 /** A small status/label chip. */
 export function Chip({ children, className = '' }: { children: React.ReactNode; className?: string }) {
   return (
-    <span className={`inline-flex items-center gap-1 text-[11px] font-semibold px-2 py-0.5 rounded-full border flex-nowrap ${className || 'bg-[#FFF1E3] text-[#6B5744] border-[#E8D5C4]'}`}>
+    <span className={`inline-flex items-center gap-1 text-[11px] font-semibold px-2 py-0.5 rounded-full border flex-nowrap break-words ${className || 'bg-[#FFF1E3] text-[#6B5744] border-[#E8D5C4]'}`}>
       {children}
     </span>
   );
@@ -177,7 +177,7 @@ export function Sheet({
       <div className="w-full sm:max-w-lg bg-white rounded-t-2xl sm:rounded-2xl border border-[#E8D5C4] shadow-xl max-h-[92vh] sm:max-h-[85vh] flex flex-col">
         <div className="flex items-start gap-3 p-4 border-b border-[#E8D5C4] flex-nowrap">
           <div className="min-w-0 flex-1">
-            <h2 className="font-bold text-[#2D1B0E] leading-tight">{title}</h2>
+            <h2 className="font-bold text-[#2D1B0E] leading-tight break-words">{title}</h2>
             {subtitle && <p className="text-xs text-[#8B7355] mt-0.5">{subtitle}</p>}
           </div>
           <button
