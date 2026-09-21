@@ -1364,23 +1364,30 @@ export interface FssaiSignature {
  * one line away — flip this to true and submit answers `code:'signature_required'`
  * with the endpoint to call.
  *
- * It is off because of what would happen on the owner's phone at the review gate.
- * The runner screen (P3 Lane A) shows the statement and labels its button "Sign
- * and submit" — one tap, which is a perfectly good attestation — but it posts
- * `{action:'submit'}` without the `sign:true` flag. With the strict gate on, every
- * check the owner tried to file would be refused, and the first thing he would
- * meet is an error about a button he had just pressed.
- *
- * So instead of refusing, submit SIGNS and records `mode:'on_submit'`, and every
+ * Instead of refusing, submit SIGNS and records `mode:'on_submit'`, and every
  * screen that shows a signature shows which kind it was. Nothing is invented
  * silently: the digest, the statement and the audit row are written either way,
  * which is what P2a never did. What is gone for good is the server signing when
  * nobody asked at all.
  *
- * TO TIGHTEN IT LATER: have the runner send `sign: true` (one word in its submit
- * body), then set this to true. The refusal it produces already names the
- * endpoint and carries the statement, so the screen can handle it without a
- * redesign.
+ * ⚠️ THE ORIGINAL REASON FOR LEAVING IT OFF HAS EXPIRED — read this before the
+ * next change. It was off because P3 Lane A's runner posted `{action:'submit'}`
+ * with no `sign` flag, so the strict gate would have met the owner with an error
+ * about the button he had just pressed. **Lane A has since conformed**
+ * (`src/app/fssai/checklists/run/[id]/page.tsx`): it sends
+ * `sign: needsSignature ? true : undefined`, it has a two-step path that POSTs
+ * /api/fssai/sign, and it handles both `signature_required` and `signature_stale`
+ * by putting the server's own sentence and statement on screen with a button that
+ * signs and submits again. So the only caller is ready for the gate.
+ *
+ * It is STILL false for one reason only, and it is a discipline one rather than a
+ * design one: flipping it changes behaviour for the build the owner is about to
+ * judge, and the isolated instance the ON position was proved in has been torn
+ * down. Both positions were measured there — ON gives
+ * `code:'signature_required'` for an unsigned submit, `code:'signature_stale'`
+ * after an answer changes, and 200 for `{sign:true}` — so this is a one-word
+ * change with its evidence already taken. Flip it once somebody can watch a real
+ * phone do it.
  */
 export const FSSAI_REQUIRE_EXPLICIT_SIGNATURE = false;
 
