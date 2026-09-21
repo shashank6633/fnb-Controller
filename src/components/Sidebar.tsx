@@ -135,6 +135,12 @@ const navTree: NavEntry[] = [
   // Feedback Analytics (mgmtOnly in the catalog) disappears for everyone else
   // without needing a flag here. Do NOT hand-roll a role test in this file:
   // the catalog is the single place tier flags live.
+  //
+  // The first three rows carry the catalog's `greOnly` flag — GRE role OR
+  // management — so a Captain, a Cashier or a legacy Staff login sees no rows
+  // here at all and the whole section disappears (the filter drops a section
+  // once every item is denied). That filter reads `me.role_name`; see the note
+  // on the `me` state below before changing its type.
   {
     kind: "section",
     label: "Guest Feedback",
@@ -539,7 +545,21 @@ export default function Sidebar() {
   const installApp = async () => { if (!installEvt) return; installEvt.prompt(); try { await installEvt.userChoice; } catch {} setInstallEvt(null); };
 
   // Current user — used to filter nav links by the per-user page_access map.
-  const [me, setMe] = useState<{ role?: string; page_access?: string | null; is_head_chef?: boolean } | null>(null);
+  //
+  // ⚠️ `role_name` IS LOAD-BEARING, not decoration. The Guest Feedback floor
+  // pages carry the catalog's `greOnly` flag, which is the first flag that
+  // resolves from a NAMED ROLE rather than a tier, and canAccessPage reads it
+  // off this object. Drop the field and every GRE's three nav rows vanish while
+  // the pages themselves stay reachable by URL — the sidebar-vs-catalog drift
+  // trap wearing a different hat. /api/auth/me returns the full SessionUser, so
+  // the value is already on the wire (src/lib/auth.ts:120); this type is all
+  // that decides whether the filter can see it.
+  const [me, setMe] = useState<{
+    role?: string;
+    page_access?: string | null;
+    is_head_chef?: boolean;
+    role_name?: string | null;
+  } | null>(null);
   useEffect(() => {
     fetch('/api/auth/me').then(r => r.json()).then(d => {
       // Push the admin HOD-gate overrides into page-catalog's client state

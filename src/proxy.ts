@@ -2,6 +2,9 @@ import { NextRequest, NextResponse } from 'next/server';
 import { canAccessPage, firstAllowedPath } from '@/lib/page-catalog';
 import { loadHodOnlyOverrides } from '@/lib/hod-overrides';
 import { getDb } from '@/lib/db';
+import {
+  feedbackAccess, isFeedbackAnalyticsPath, isFeedbackPath,
+} from '@/lib/feedback/access';
 
 /**
  * Next.js 16 proxy (formerly `middleware`) — runs at the network boundary on the
@@ -215,7 +218,8 @@ export function proxy(req: NextRequest) {
       // mirroring getCurrentUser(): a role-based user's page_access lives on the
       // role, not the user row — read it here or page gating fails open.
       const row = db.prepare(`
-        SELECT u.role, u.page_access, u.role_id, u.is_head_chef,
+        SELECT u.role, u.page_access, u.role_id, u.is_head_chef, u.section,
+               r.name AS role_name, r.is_active AS role_active,
                r.base_role AS role_base, r.page_access AS role_page_access,
                r.is_head_chef AS role_head_chef
         FROM sessions s JOIN users u ON u.id = s.user_id
@@ -229,8 +233,48 @@ export function proxy(req: NextRequest) {
         // getCurrentUser EXACTLY (auth.ts): the role contributes only when it is a
         // real assigned role (role_id AND base_role present), so the two never drift.
         is_head_chef: !!row.is_head_chef || (!!row.role_id && !!row.role_base && !!row.role_head_chef),
+        // The ASSIGNED role's display name, read by the `greOnly` catalog gate
+        // (Guest Feedback floor pages). NULL whenever u.role_id is NULL — which
+        // is every user on the measured database — and the gate treats NULL as
+        // DENY, so adding this field cannot widen access for anybody. It exists
+        // so that the day a GRE role IS assigned, the proxy can see it: without
+        // it the gate would deny the one population it was built for.
+        // Mirrors getCurrentUser (auth.ts:120) including the `|| null`.
+        role_name: row.role_name || null,
+        // `users.section` grants NOTHING — no gate reads it. It is carried only
+        // so the Guest Feedback refusal below can add one extra sentence when a
+        // login's section already says GRE: that is the owner's half-finished
+        // setup, and telling him the section field is not the switch is the
+        // difference between a useful refusal and a dead end.
+        section: row.section || '',
+        // Tri-state, read ONLY by the GRE match: null when no role is assigned
+        // (nothing to judge), true/false from `roles.is_active` otherwise. Note
+        // the LEFT JOIN above has NO is_active filter, deliberately — the tier
+        // and page map must keep resolving from a deactivated role or switching
+        // a role off would fall back to a null map = every page. This field is
+        // how the feedback gate refuses a deactivated role WITHOUT disturbing
+        // that rule for anything else.
+        role_is_active: row.role_id ? !!row.role_active : null,
       } : undefined;
       if (user && !canAccessPage(pathname, user)) {
+        // ── Guest Feedback: explain, don't bounce. ────────────────────────────
+        // Everywhere else a blocked page redirects to the user's first allowed
+        // page with ?forbidden=<path>, and NOTHING in this app renders that
+        // parameter — the user simply finds themselves somewhere else. For this
+        // module that silence is the whole bug: the live failure mode is a role
+        // the owner has CREATED but not yet ASSIGNED, and a silent bounce is
+        // indistinguishable from "the feature doesn't work". So a denied
+        // feedback page answers with the reason in words. Scoped to this module
+        // by an anchored path test (never a substring — proxy.ts's own
+        // `includes('/print')` in isPublic() is the cautionary tale), so no other
+        // page's behaviour changes.
+        if (isFeedbackPath(pathname)) {
+          const d = feedbackAccess(user, { analytics: isFeedbackAnalyticsPath(pathname) });
+          return new NextResponse(feedbackDeniedPage(d.headline, d.remedy), {
+            status: 403,
+            headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' },
+          });
+        }
         // Dashboard `/` is no longer ALWAYS_ALLOWED — so a user without
         // dashboard access who hits `/` would be told to go to... `/` again,
         // looping forever. Smart fallback: send them to the first allowed
@@ -312,6 +356,41 @@ function addNoCacheHeader(res: NextResponse, isApi: boolean): void {
   if (isApi) return;   // APIs set their own Cache-Control
   res.headers.set('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
   res.headers.set('Pragma', 'no-cache');
+}
+
+/**
+ * The Guest Feedback refusal screen. Rendered by the proxy, so it cannot use a
+ * React component — this runs before any page is resolved.
+ *
+ * Deliberately plain: no script, no external asset, no session data beyond the
+ * two sentences `feedbackAccess()` produced. Both are escaped even though they
+ * are built from a compile-time constant plus `roles.name`, because `roles.name`
+ * is owner-entered text and a role called `<img onerror=...>` must render as
+ * characters, not as markup.
+ */
+function feedbackDeniedPage(headline: string, remedy: string): string {
+  const esc = (s: string) => s
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Guest Feedback — access</title>
+<style>
+  :root { color-scheme: light }
+  body { margin:0; background:#FAF7F2; color:#3D3229;
+         font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+         display:flex; align-items:center; justify-content:center; min-height:100vh; padding:24px }
+  .card { background:#fff; border:1px solid #E8D5C4; border-radius:14px; padding:24px;
+          max-width:560px; width:100%; box-shadow:0 1px 3px rgba(0,0,0,.05) }
+  h1 { font-size:17px; margin:0 0 10px; color:#8B5A2B }
+  p { margin:0 0 16px }
+  a { display:inline-block; padding:9px 16px; border-radius:9px; background:#8B5A2B;
+      color:#fff; text-decoration:none; font-weight:600; font-size:14px }
+</style></head><body><div class="card">
+<h1>${esc(headline)}</h1>
+<p>${esc(remedy)}</p>
+<a href="/">Back to the app</a>
+</div></body></html>`;
 }
 
 function randomToken(): string {

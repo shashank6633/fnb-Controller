@@ -1,25 +1,30 @@
 /**
  * Guest Feedback & Service Recovery — THE shared module.
  *
- * ⚠️ ZERO IMPORTS, AND THAT IS THE POINT. Page 2 (Take Feedback) and Page 4
- * (Analytics) are client components; the API routes and the report builders are
- * server-side. The only module that can be the single source for both is one
- * with no dependencies. `page-catalog.ts:701` documents what happens otherwise:
- * a shared module that reaches for `@/lib/db` drags better-sqlite3 into the
- * browser bundle. Never import `@/lib/db`, React, or anything else here.
+ * ⚠️ NO RUNTIME DEPENDENCIES, AND THAT IS THE POINT. Page 2 (Take Feedback) and
+ * Page 4 (Analytics) are client components; the API routes and the report
+ * builders are server-side. The only module that can be the single source for
+ * both is one with no dependencies. `page-catalog.ts:701` documents what
+ * happens otherwise: a shared module that reaches for `@/lib/db` drags
+ * better-sqlite3 into the browser bundle. Never import `@/lib/db`, React, or
+ * anything else here.
+ *
+ * The ONE exception is §3 below, which re-exports the access gate from
+ * `./feedback/access` — a sibling that is itself import-free, so the rule is
+ * kept in substance. Nothing else may be added to that list.
  *
  * Every vocabulary below is lifted VERBATIM from §3 of FEEDBACK-BUILD-STATE.md
  * (the owner's own words). Store the `v` (wire value); render the `label`.
  *
- * ── CONCURRENT-LANE NOTE (P1 Lane A, 2026-09-21) ────────────────────────────
- * `src/app/feedback/enums.ts` was created by P1 Lane B minutes before this file
- * and carries the same lists. Its own header says it is a TEMPORARY home and
- * must become a re-export. I did not edit it because `src/app/feedback/**` is
- * Lane B's lane and a concurrent edit is how work gets clobbered. Every `v`
- * below is byte-identical to Lane B's, so the repoint is a pure no-op:
- *     src/app/feedback/enums.ts  →  export * from '@/lib/feedback';
- * DO NOT leave two lists alive. This file is the one that survives — it is the
- * only one the server side can import.
+ * ── THE DUPLICATE-VOCABULARY NOTE IS CLOSED (checked 2026-09-22) ────────────
+ * P1 Lane A's header warned that `src/app/feedback/enums.ts` held a second copy
+ * of these lists and that P2 had to repoint it. That file does not exist:
+ *     $ ls src/app/feedback
+ *     analytics/  page.tsx  placeholder.ts  take/  tracker/  ui.tsx
+ * Lane B shipped `placeholder.ts` (shell FIXTURES, typed FROM here) and
+ * `ui.tsx` (presentational primitives) instead, and all five page files import
+ * their vocabulary from '@/lib/feedback'. There is exactly one list. Nothing to
+ * close — do not go looking for the file.
  */
 
 /* ════════════════════════════════════════════════════════════════════════════
@@ -278,126 +283,61 @@ export const isResolved = (x: { followUpsTotal: number; openFollowUps: number })
   x.followUpsTotal > 0 && x.openFollowUps === 0;
 
 /* ════════════════════════════════════════════════════════════════════════════
-   3. THE GATE — designed as a ONE-LINE SWAP (§7 Q1 is still the owner's)
-   ════════════════════════════════════════════════════════════════════════════ */
+   3. THE GATE — MOVED. It now lives in ./feedback/access.ts
+   ════════════════════════════════════════════════════════════════════════════
 
-/**
- * 🔑 THE ONE-LINE SWAP. §7 Q1 is unanswered: there is no "GRE" role in the
- * database today (measured — `roles` holds Administrator · Bar Manager ·
- * Captain · Cashier · Floor Manager · Head Chef · Manager · Staff · Store
- * Manager, and 0 users have `role_id` set at all).
- *
- * The recommendation, which P0 Lane A proved is the ONLY option compatible with
- * the owner's own read-only constraint, is option (a): he creates a role named
- * "GRE" in Settings → Roles at base_role 'staff' — exactly the precedent he
- * chose for Bill Handover's "Accounts". Option (b) — gating on Floor Manager —
- * must be struck: Floor Manager is base_role 'manager', and manager tier is
- * itself the key to void, settle, hold, service-charge waiver and discount
- * approval. Choosing (b) would hand the GRE five of the six powers he forbade.
- *
- * When he names the role, edit THIS LINE and nothing else. Matching is
- * case-insensitive and trimmed so "GRE ", "gre" and "Gre" all land.
- */
-export const GRE_ROLE_NAMES: readonly string[] = ['GRE'];
+   §7 Q1 IS ANSWERED. The owner created a role named "GRE" (base role Staff) in
+   PRODUCTION on 2026-09-22 — the same precedent he chose for Bill Handover's
+   "Accounts". Option (b), gating on Floor Manager, stays struck: Floor Manager
+   is `base_role` 'manager', and manager tier is itself the key to void, settle,
+   hold, service-charge waiver and discount approval, so gating on it would have
+   handed the GRE five of the six powers he forbade.
 
-/**
- * The second, zero-config marker P0 Lane B found already in the codebase:
- * `VALID_SECTIONS` in `api/auth/users/route.ts` already offers a "GRE"
- * value and `/users` already renders it as "GRE (Front Office)". Honouring it
- * costs nothing and means the owner can enable a GRE from the existing user
- * form if he prefers that to creating a role.
- *
- * ⚠️ `users.section` is NOT a spare field — `kot-section.ts` uses it to filter
- * the Kitchen Display and route KOT printing. 'GRE' is inert there
- * (`sectionMatchesStation` returns true for any non-Kitchen/Bar section), but
- * say so before recommending it.
- */
-export const GRE_SECTION = 'GRE';
+   WHY THE PREDICATES ARE NO LONGER DECLARED HERE. P1 left the gate in this
+   file, which is imported by five CLIENT components. The gate is also needed by
+   `page-catalog.ts`, by `proxy.ts` and by every future `/api/feedback/*` route,
+   and the moment two of those grow their own copy the module has two answers to
+   one question. Two gates that disagree is a worse bug than two enum lists that
+   disagree. One authority now:
 
-/** The shape every gate here reads. Deliberately structural, not `SessionUser`
- *  — importing `@/lib/auth` would pull `@/lib/db` into the client bundle. */
-export interface FeedbackActor {
-  role?: string | null;            // legacy tier: 'admin' | 'manager' | 'staff'
-  role_name?: string | null;       // named role, resolved by getCurrentUser()
-  section?: string | null;         // users.section
-  is_head_chef?: boolean | null;
-}
+       src/lib/feedback/access.ts     ← declares it
+       src/lib/feedback.ts (here)     ← re-exports it, for import convenience
 
-const norm = (s: unknown): string => String(s ?? '').trim().toLowerCase();
+   The dependency runs ONE WAY. access.ts imports nothing at all, so this
+   re-export cannot drag anything into the browser bundle and cannot cycle.
 
-const namedGre = (u: FeedbackActor): boolean =>
-  (!!u.role_name && GRE_ROLE_NAMES.some((n) => norm(n) === norm(u.role_name))) ||
-  norm(u.section) === norm(GRE_SECTION);
+   Renaming the role is still a ONE-LINE SWAP — `GRE_ROLE_NAME` in access.ts.
 
-/** Admin, any Manager tier, or an HOD — the same predicate `isMgmtOnlyPath`
- *  enforces in `canAccessPage`, restated here so the module's routes agree with
- *  its catalog without importing page-catalog. */
-export function isFeedbackManagement(u: FeedbackActor | null | undefined): boolean {
-  if (!u) return false;
-  return u.role === 'admin' || u.role === 'manager' || !!u.is_head_chef;
-}
+   ⚠️ ONE BEHAVIOUR CHANGE, DELIBERATE: `users.section === 'GRE'` NO LONGER
+   GRANTS ACCESS. It is a hint used to sharpen the refusal message, nothing
+   more. `kot-section.ts` reads that field to filter the Kitchen Display and
+   route KOT printing, and had it stayed an authorisation key the Part-2 deny
+   predicate would have turned a captain's section setting into a silent
+   revocation of that captain's ability to fire a KOT. See access.ts §1. */
 
-/**
- * May this user use the module's floor pages (1-3)?
- *
- * FAILS CLOSED on a null user. Today this resolves to management-only, because
- * no GRE exists yet — which is the correct inert default: the module is usable
- * by the people who already have every one of these powers, and nobody gains
- * anything on deploy day. The moment the owner creates the role, the line above
- * turns it on.
- *
- * ⚠️ This is a convenience, NOT the security boundary. `proxy.ts` guards PAGES,
- * NOT APIs, and `canAccessPage` fails open four ways (null map, garbled JSON,
- * empty array, prefix grant) plus a fifth in proxy.ts's own catch. EVERY
- * `/api/feedback/*` route must call this itself and 403 (hard rule 9).
- */
-export function canUseFeedback(u: FeedbackActor | null | undefined): boolean {
-  if (!u) return false;
-  return isFeedbackManagement(u) || namedGre(u);
-}
+export {
+  GRE_ROLE_NAME,
+  GRE_SECTION,
+  READ_ONLY_REFUSAL,
+  FEEDBACK_FLOOR_PATHS,
+  FEEDBACK_ANALYTICS_PATH,
+  isFeedbackAdmin,
+  isFeedbackManagement,
+  isNamedGre,
+  claimsGreSection,
+  canOpenFeedbackFloor,
+  canOpenFeedbackAnalytics,
+  isReadOnlyFeedbackUser,
+  feedbackAccess,
+  isFeedbackPath,
+  isFeedbackAnalyticsPath,
+} from './feedback/access';
 
-/** Page 4 — Admin Analytics & Reports. Management only, matching the catalog's
- *  `mgmtOnly` flag on `/feedback/analytics`. */
-export function canUseFeedbackAnalytics(u: FeedbackActor | null | undefined): boolean {
-  return isFeedbackManagement(u);
-}
-
-/**
- * 🔒 THE DENY PREDICATE for the owner's READ-ONLY constraint — P2 consumes it.
- *
- * True for a user who is in this module and is NOT management: i.e. exactly the
- * GRE. P0 Lane A measured that a staff-tier session can still reach ~13 POS
- * write handlers that gate on nothing but `if (!me) 401` — add_item, set_qty,
- * remove_item, fire, the KDS bump family, customer-orders modify, replay,
- * print-bill and request-bill. Tier alone does not close them; an explicit
- * server-side deny does.
- *
- * Deliberately a DENY-LIST keyed on the GRE marker, not an allow-list: it is
- * INERT until the owner actually creates and assigns the role (no user carries
- * `role_name` or `section` today), so it cannot regress a live captain, cashier
- * or KDS on deploy day.
- *
- * ⚠️ Read `role_name`, which `getCurrentUser()` resolves but `proxy.ts` does
- * NOT — so this belongs in route handlers, which is where hard rule 9 says
- * every gate must live anyway.
- *
- * ⚠️ print-bill and request-bill are on the deny list for a reason that is not
- * obvious: they write `bill_printed_at` and `bill_requested_at`, TWO OF THIS
- * MODULE'S OWN THREE ELIGIBILITY TRIGGERS. A GRE who can call them can
- * manufacture or suppress their own coverage, and a coverage metric the
- * measured party can write is not a metric.
- */
-export function isReadOnlyFeedbackUser(u: FeedbackActor | null | undefined): boolean {
-  if (!u) return false;
-  if (isFeedbackManagement(u)) return false;
-  return namedGre(u);
-}
-
-/** The six powers the owner forbade, verbatim from §3 — for the 403 body, so
- *  the refusal quotes the rule it is enforcing. */
-export const READ_ONLY_REFUSAL =
-  'Guest Relations has read-only access to orders. Placing orders, cancelling items, '
-  + 'changing quantity, modifying a KOT, modifying a bill and applying discounts are not permitted.';
+export type {
+  FeedbackActor,
+  FeedbackDenyReason,
+  FeedbackAccessDecision,
+} from './feedback/access';
 
 /* ════════════════════════════════════════════════════════════════════════════
    4. TUNABLES — settings keys, with CODE defaults
