@@ -326,6 +326,52 @@ top costs far more than fixing it now. He is reviewing the foundation, not the f
   `display_value` (`decimals` is display only — rounding before the range test would let 5.4 °C pass
   a 0–5 rule). A 409 on open carries `code`, `run_id` and `can_view` — do not offer "View" when
   `can_view` is false.
+- **2026-09-20** — **P3 Lane B: evidence, signature, verification queue.** Commits `4a70cff`
+  (protective rescue of the previous run's uncommitted work) · `ecf1948` (the API) · `3ffac34` (the
+  screen) · `d1e6590` (the oversized-photograph fix). **NO SCHEMA CHANGE** — `signed_by`/`signed_at`
+  and `fssai_approvals` already existed; the digest and the statement go into one `fssai_audit_log`
+  row (`action='sign'`), the pattern P2a's snapshot already uses. `npx tsc --noEmit` exit 0 zero
+  output; `npm test` **74 passed · 2 failed** (the baseline; the two are the kitchen/liquor station
+  sentinels in the owner's production data, HARD RULE 4).
+  1. **THE SERVER WAS INVENTING THE SIGNATURE.** P2a's submit wrote `signed_by = me.email` as a side
+     effect whenever `requires_signature` was set — and it **DEFAULTS TO 1**, so that was every
+     record. Nobody was ever asked. An inspector reading "signed by chef@akan" would reasonably
+     believe a person attested; the server typed it when the last box was ticked. Signing is now an
+     act (`POST /api/fssai/sign`) recording who (session cookie), when (server clock), a SHA-256 of
+     every answer and photograph as they then stood, and the statement in words. Change an answer
+     afterwards and the digest no longer matches — measured: `884cadf4…` → `98b648c3…`.
+  2. **THE EVIDENCE WRITE ROUTE EXISTS, so "Photo: Always" is satisfiable at last.** Measured: submit
+     refused with *"Photograph of the thermometer display → No photograph attached"*; after the
+     upload the answer was re-judged `is_fail 1 → 0` and submit passed. P2a had to insert the row by
+     hand; nothing has to now.
+  3. **THE 1 MB CEILING IS SETTLED (HARD RULE 14 — the decision this phase owed).** Photographs stay
+     in-row as TEXT data URIs via the Task module's `ImageUpload` (RECON §6: there is no upload
+     service in this app, and the BLOB route's caps all exceed production's real limit). Budget:
+     250 KB client target, **400 KB server ceiling**, 1200 px, 4 per answer, 24 per run. Proved with a
+     real 12 MP photograph (4032×3024, 14.18 MB): ImageUpload's own ladder gives 474→358→252→**165 KB**
+     at 1200×900, a 226,599-char body ≈ 22% of the real ceiling. A retention window is still
+     undecided (§7 Q13).
+  4. **VERIFYING CANNOT CHANGE A RECORD, proved by request and not by the absence of a button.** A
+     verify POST stuffed with `value_text:'TAMPERED'`, `is_fail`, `pass_pct`, `signed_by`, `remarks`
+     and a `responses[]` array left the SHA-256 over every answer, verdict and photograph
+     **identical** (`a1355e25…` before and after); only `status` moved. §7 Q3 holds: the recorder is
+     refused on their own record (403 `own_record`), a non-manager is refused, a rejection demands a
+     reason, and a second decision is refused 409.
+  5. **⚠️ THE ROWS ABOVE THIS ENTRY ARE STALE — the orchestrator owns the phase table (§5.7), so I did
+     not edit it.** For the next run: P2b **is** built (hub `6b406f0`, library `4148cb1`, builder
+     `7808b43`, fix rounds `0e61b6f`·`ad003b6`·`fb42540`), and P3 Lane A's phone runner landed today
+     (`9c453bb`·`efd6103`·`acd6766`). So "19 of the 20 pages are still placeholders" and
+     "`settings/checklists/[id]/page.tsx` does not exist" are both **false**, and
+     `grep -rln "api/fssai" src/app/fssai` now returns **7**, not one.
+  6. **ONE DECISION A LATER RUN MAY WANT TO REVERSE, stated plainly.** The strict gate that REFUSES an
+     unsigned submit is built and **off**, behind `FSSAI_REQUIRE_EXPLICIT_SIGNATURE` in
+     `src/lib/fssai.ts`. Lane A's runner posts `{action:'submit'}` without a `sign` flag, so with the
+     gate on every check the owner tried to file at the review gate would meet an error about the
+     button he had just pressed. Instead the act is performed and its **kind** recorded
+     (`mode:'explicit'` vs `mode:'on_submit'`), and every screen says which. Proved both ways by
+     turning it on in an isolated copy: `signature_required` and `signature_stale` both fire, and
+     `{sign:true}` submits in one tap. To tighten: add `sign: true` to the runner's submit body, then
+     flip the constant.
 - **2026-09-17** — P1 fix round. `npm test` went `71 passed · 3 failed` → `74 passed · 2 failed`; the
   two survivors are **not code and not FSSAI's** — they assert that the `kitchen` and `liquor`
   station sentinels resolve to NO department, and both are mapped in the owner's production data
