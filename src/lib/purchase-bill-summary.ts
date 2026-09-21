@@ -11,6 +11,16 @@ import {
   chargeCell, chargeNote,
 } from './purchase-charges';
 import type { PurchaseChargeKey, PurchaseChargeColumn } from './purchase-charges';
+// TAX ACTUALLY CHARGED — the owner's "Tax Value" and "Tax % Applied" columns,
+// GST only. The arithmetic, the base and the blank-not-zero rule live in ONE
+// module so this report, /reports/purchases, the purchase log and the GRN
+// inward register cannot drift into four roundings. Cess is deliberately NOT in
+// the figure: it is charged on the GROSS line value and GST on the post-discount
+// value, so the two cannot share a denominator. See src/lib/tax-applied.ts.
+import {
+  taxAppliedSumsSql, taxAppliedRollupSql, taxAppliedPercent,
+  TAX_PERCENT_CSV_HEADER,
+} from './tax-applied';
 
 /**
  * PURCHASE BILL SUMMARY — one row per VENDOR BILL, money only.
@@ -441,6 +451,15 @@ export interface PurchaseBillRow {
    * Subtotal − Discount + GST + both cesses + TCS + Delivery + MRP round-off.
    */
   total_bill_value: number;
+  /**
+   * THE "Tax % Applied (GST)" BASE for this bill: Σ(subtotal − discount) over
+   * the lines that CARRIED GST, and how many lines that was. Restricted to the
+   * taxed lines so a bill whose exempt lines outweigh its taxed ones still
+   * reports the rate the vendor actually charged, and so a mixed-rate bill can
+   * be SEEN to be a blend (`taxed_lines` > 1). See src/lib/tax-applied.ts.
+   */
+  taxed_bill_value: number;
+  taxed_lines: number;
 }
 
 export interface PurchaseBillTotals {
@@ -488,6 +507,14 @@ export interface PurchaseBillTotals {
    * the period's real figure instead of counting the capped rows in hand.
    */
   day_run_bills: number;
+  /**
+   * THE "Tax % Applied (GST)" BASE — Σ(subtotal − discount) over the lines that
+   * CARRIED GST, plus how many lines that was. See PurchaseBillRow and
+   * src/lib/tax-applied.ts: a base over ALL lines would print 0.01% for an 18%
+   * bill on a database where 7 of 2,165 purchase lines record GST.
+   */
+  taxed_bill_value: number;
+  taxed_lines: number;
   /**
    * Render verbatim beside the PERIOD grand total. It is the guard on
    * misreading, and since 2026-09-11 it has three figures to keep apart —
@@ -591,6 +618,14 @@ export interface PurchaseBillDayRow {
    * grand total. Renderers pair the two (see hasUnpairedMirrorRows in
    * src/lib/purchase-charges.ts).
    */
+  /**
+   * THE "Tax % Applied (GST)" BASE — Σ(subtotal − discount) over the lines that
+   * CARRIED GST, plus how many lines that was. See PurchaseBillRow and
+   * src/lib/tax-applied.ts: a base over ALL lines would print 0.01% for an 18%
+   * bill on a database where 7 of 2,165 purchase lines record GST.
+   */
+  taxed_bill_value: number;
+  taxed_lines: number;
   charges_from_grn: boolean;
 }
 
@@ -622,6 +657,14 @@ export interface PurchaseBillDayVendorRow {
   po_receipt_value: number;
   grn_sourced_rows: number;
   unpaired_mirror_rows: number;
+  /**
+   * THE "Tax % Applied (GST)" BASE — Σ(subtotal − discount) over the lines that
+   * CARRIED GST, plus how many lines that was. See PurchaseBillRow and
+   * src/lib/tax-applied.ts: a base over ALL lines would print 0.01% for an 18%
+   * bill on a database where 7 of 2,165 purchase lines record GST.
+   */
+  taxed_bill_value: number;
+  taxed_lines: number;
   charges_from_grn: boolean;
 }
 
@@ -1019,7 +1062,15 @@ function computeTotals(
       COALESCE(SUM(grn_sourced), 0)                                   AS grn_sourced_lines,
       COALESCE(SUM(CASE WHEN is_po_receipt = 1 AND grn_sourced = 0 THEN 1 ELSE 0 END), 0)
                                                                       AS unpaired_mirror_lines,
-      COUNT(DISTINCT CASE WHEN substr(bill_key, 1, 4) IN ('DAY:', 'ROW:') THEN bill_key END) AS day_run_bills
+      COUNT(DISTINCT CASE WHEN substr(bill_key, 1, 4) IN ('DAY:', 'ROW:') THEN bill_key END) AS day_run_bills,
+      -- THE "Tax % Applied (GST)" BASE: the post-discount value of the LINES
+      -- THAT CARRIED GST, and how many lines that was. GST is charged after the
+      -- discount (measured 18.00 / 12.00 exactly on all 29 tax-bearing GRN lines
+      -- on this base; 16.2 / 11.2 on the gross one), and restricting it to the
+      -- taxed lines is what makes an 18% bill read 18.00% instead of a blended
+      -- 0.01% over a period where 7 of 2,165 lines carry tax.
+      ${taxAppliedSumsSql('COALESCE(cgst, 0) + COALESCE(sgst, 0)',
+                          'COALESCE(bill_value, 0) - COALESCE(discount, 0)')}
     FROM (${base})
   `).get(...params) as any;
 
@@ -1046,6 +1097,8 @@ function computeTotals(
     grn_sourced_lines: num(agg?.grn_sourced_lines),
     unpaired_mirror_lines: num(agg?.unpaired_mirror_lines),
     day_run_bills: num(agg?.day_run_bills),
+    taxed_bill_value: r2(agg?.taxed_bill_value),
+    taxed_lines: num(agg?.taxed_lines),
     basis: TOTALS_BASIS,
   };
 }
@@ -1094,7 +1147,11 @@ export function getPurchaseBillSummary(
       COALESCE(SUM(tcs), 0)                 AS tcs,
       COALESCE(SUM(delivery_charges), 0)    AS delivery_charges,
       COALESCE(SUM(mrp_round_off), 0)       AS mrp_round_off,
-      COALESCE(SUM(line_total), 0)          AS total_bill_value
+      COALESCE(SUM(line_total), 0)          AS total_bill_value,
+      -- Per BILL. See computeTotals above for why the base counts only the
+      -- lines that carried GST.
+      ${taxAppliedSumsSql('COALESCE(cgst, 0) + COALESCE(sgst, 0)',
+                          'COALESCE(bill_value, 0) - COALESCE(discount, 0)')}
     FROM (${base})
     GROUP BY bill_key
     ORDER BY date_from DESC,
@@ -1143,6 +1200,8 @@ export function getPurchaseBillSummary(
       delivery_charges: r2(r.delivery_charges),
       mrp_round_off: r2(r.mrp_round_off),
       total_bill_value: r2(r.total_bill_value),
+      taxed_bill_value: r2(r.taxed_bill_value),
+      taxed_lines: num(r.taxed_lines),
     };
   });
 
@@ -1200,7 +1259,13 @@ function buildPerBill(base: string): string {
       COALESCE(SUM(tcs), 0)                                                AS tcs,
       COALESCE(SUM(delivery_charges), 0)                                   AS delivery_charges,
       COALESCE(SUM(mrp_round_off), 0)                                      AS mrp_round_off,
-      COALESCE(SUM(line_total), 0)                                         AS total_bill_value
+      COALESCE(SUM(line_total), 0)                                         AS total_bill_value,
+      -- Carried on the per-bill row so the DAY and VENDOR-DAY rollups can SUM
+      -- these two instead of re-deciding which lines were taxed from a bill's
+      -- already-summed cgst/sgst — which would count a whole bill's subtotal as
+      -- taxed because one of its lines was.
+      ${taxAppliedSumsSql('COALESCE(cgst, 0) + COALESCE(sgst, 0)',
+                          'COALESCE(bill_value, 0) - COALESCE(discount, 0)')}
     FROM (${base})
     GROUP BY bill_key
   `;
@@ -1263,7 +1328,8 @@ export function getPurchaseBillDaySummary(
       COALESCE(SUM(CASE WHEN is_po_receipt = 1 THEN lines ELSE 0 END), 0)   AS po_receipt_lines,
       COALESCE(SUM(CASE WHEN is_po_receipt = 1 THEN total_bill_value ELSE 0 END), 0) AS po_receipt_value,
       COALESCE(SUM(grn_sourced_rows), 0)                                    AS grn_sourced_rows,
-      COALESCE(SUM(unpaired_mirror_rows), 0)                                AS unpaired_mirror_rows
+      COALESCE(SUM(unpaired_mirror_rows), 0)                                AS unpaired_mirror_rows,
+      ${taxAppliedRollupSql()}
     FROM (${perBill})
     GROUP BY bill_day
     ORDER BY day DESC
@@ -1300,6 +1366,8 @@ export function getPurchaseBillDaySummary(
       po_receipt_value: r2(r.po_receipt_value),
       grn_sourced_rows: num(r.grn_sourced_rows),
       unpaired_mirror_rows: num(r.unpaired_mirror_rows),
+      taxed_bill_value: r2(r.taxed_bill_value),
+      taxed_lines: num(r.taxed_lines),
       // PROVENANCE, not partiality. Until 2026-09-10 this said "part of this
       // day's tax is not on these rows" and it was true; the charges are now
       // read off the GRN line, so the flag only says where some of them were
@@ -1342,7 +1410,8 @@ export function getPurchaseBillDaySummary(
       COALESCE(SUM(CASE WHEN is_po_receipt = 1 THEN 1 ELSE 0 END), 0)       AS po_receipt_bills,
       COALESCE(SUM(CASE WHEN is_po_receipt = 1 THEN total_bill_value ELSE 0 END), 0) AS po_receipt_value,
       COALESCE(SUM(grn_sourced_rows), 0)                                    AS grn_sourced_rows,
-      COALESCE(SUM(unpaired_mirror_rows), 0)                                AS unpaired_mirror_rows
+      COALESCE(SUM(unpaired_mirror_rows), 0)                                AS unpaired_mirror_rows,
+      ${taxAppliedRollupSql()}
     FROM (${perBill})
     GROUP BY bill_day, LOWER(bill_vendor)
     ORDER BY day DESC, total_bill_value DESC, vendor COLLATE NOCASE ASC
@@ -1386,6 +1455,8 @@ export function getPurchaseBillDaySummary(
       po_receipt_value: r2(r.po_receipt_value),
       grn_sourced_rows: num(r.grn_sourced_rows),
       unpaired_mirror_rows: num(r.unpaired_mirror_rows),
+      taxed_bill_value: r2(r.taxed_bill_value),
+      taxed_lines: num(r.taxed_lines),
       charges_from_grn: num(r.grn_sourced_rows) > 0,
     };
   });
@@ -1504,6 +1575,30 @@ export const PURCHASE_BILL_COLUMNS: PurchaseBillColumn[] = [
     value: r => chargeNote(chargeShape(r)),
   },
   { key: 'bill_key',            label: 'Bill Key',                value: r => r.bill_key },
+  /*
+   * TAX % APPLIED (GST) — APPENDED LAST, and the RUPEES ARE NOT REPEATED.
+   *
+   * The owner asked for two tax columns, "Tax Value" and "Tax % Applied". The
+   * value half ALREADY EXISTS on this report as `GST = CGST+SGST (Rs)` above,
+   * so adding a second rupee column under a second name would put the same
+   * money on the sheet twice and make the row double-foot. Only the genuinely
+   * missing half is added, and the percentage carries "(GST)" in its heading so
+   * it is unmistakably the rate behind THAT column and not behind the cesses,
+   * which sit on a different taxable base (gross, before discount).
+   *
+   * Last, not beside the GST column: every column above is already pointed at
+   * by a saved sheet, and this file's own rule is that a new column is appended.
+   * Blank, never 0, when the bill recorded no GST at all.
+   */
+  {
+    key: 'tax_percent_applied',
+    label: TAX_PERCENT_CSV_HEADER,
+    numeric: true,
+    value: r => {
+      const p = taxAppliedPercent(r);
+      return p == null ? '' : p;
+    },
+  },
 ];
 
 /**
@@ -1590,6 +1685,14 @@ export interface PurchaseBillDayCsvRow {
   po_receipt_value: number;
   grn_sourced_rows: number;
   unpaired_mirror_rows: number;
+  /**
+   * THE "Tax % Applied (GST)" BASE — Σ(subtotal − discount) over the lines that
+   * CARRIED GST, plus how many lines that was. See PurchaseBillRow and
+   * src/lib/tax-applied.ts: a base over ALL lines would print 0.01% for an 18%
+   * bill on a database where 7 of 2,165 purchase lines record GST.
+   */
+  taxed_bill_value: number;
+  taxed_lines: number;
   charges_note: string;
 }
 
@@ -1663,6 +1766,21 @@ export const PURCHASE_BILL_DAY_COLUMNS: PurchaseBillDayColumn[] = [
   // and always was, those bills' share of the GRAND TOTAL.
   { key: 'po_receipt_value',    label: 'Of Which PO/GRN Grand Total (Rs)', numeric: true, value: r => r.po_receipt_value },
   { key: 'charges_note',        label: 'Charges Note',                        value: r => r.charges_note },
+  // TAX % APPLIED (GST) — appended last, rupees NOT repeated: the value half is
+  // already on this sheet as 'GST = CGST+SGST (Rs)' above. Same reasoning, same
+  // helper and the same blank-never-0% rule as the bill CSV. On a DAY or VENDOR
+  // row the rate is money-weighted over the day's GST-bearing lines, which is
+  // why `taxed_bill_value` is rolled up from the per-bill rows rather than
+  // recomputed from the day's already-summed cgst/sgst.
+  {
+    key: 'tax_percent_applied',
+    label: TAX_PERCENT_CSV_HEADER,
+    numeric: true,
+    value: r => {
+      const p = taxAppliedPercent(r);
+      return p == null ? '' : p;
+    },
+  },
 ];
 
 /**
@@ -1712,6 +1830,8 @@ function dayToCsvRow(d: PurchaseBillDayRow): PurchaseBillDayCsvRow {
     po_receipt_value: d.po_receipt_value,
     grn_sourced_rows: d.grn_sourced_rows,
     unpaired_mirror_rows: d.unpaired_mirror_rows,
+    taxed_bill_value: d.taxed_bill_value,
+    taxed_lines: d.taxed_lines,
     charges_note: dayChargesNote(d, d.po_receipt_bills, d.po_receipt_value),
   };
 }
@@ -1748,6 +1868,8 @@ function dayVendorToCsvRow(v: PurchaseBillDayVendorRow): PurchaseBillDayCsvRow {
     po_receipt_value: v.po_receipt_value,
     grn_sourced_rows: v.grn_sourced_rows,
     unpaired_mirror_rows: v.unpaired_mirror_rows,
+    taxed_bill_value: v.taxed_bill_value,
+    taxed_lines: v.taxed_lines,
     charges_note: dayChargesNote(v, v.po_receipt_bills, v.po_receipt_value),
   };
 }

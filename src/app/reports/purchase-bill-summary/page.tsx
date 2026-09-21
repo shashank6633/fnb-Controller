@@ -124,6 +124,16 @@ import {
   chargeCell, isChargeSourceMissingRow, hasUnpairedMirrorRows, unpairedMirrorNote, fmtSignedINR,
   type PurchaseChargeKey, type PurchaseChargeColumn,
 } from '@/lib/purchase-charges';
+/* TAX % APPLIED (GST) — the derived rate, from the one module that owns the
+ * arithmetic, the base and the 2-decimal formatting. The RUPEES are not imported
+ * because this report already prints them, as GST = CGST+SGST; only the rate was
+ * missing. Cess is deliberately outside the figure: it is charged on the GROSS
+ * line value and GST on the post-discount value, so no single percentage can
+ * cover both. See src/lib/tax-applied.ts. */
+import {
+  TAX_PERCENT_LABEL, TAX_PERCENT_TITLE,
+  taxAppliedPercent, fmtTaxPercent, taxAppliedNote,
+} from '@/lib/tax-applied';
 import {
   ReceiptText, Building2, Download, Loader2, Info, AlertTriangle,
   ShoppingCart, TrendingUp, Layers, CalendarDays, ChevronRight, ChevronDown, Users,
@@ -178,6 +188,12 @@ interface BillRow {
   /** Rendered as GRAND TOTAL — what is payable to the vendor. Subtotal − Discount
    *  + GST + both cesses + TCS + Delivery + MRP round-off. */
   total_bill_value: number;
+  /** THE "Tax % Applied (GST)" BASE — Σ(subtotal − discount) over the lines that
+   *  CARRIED GST, and how many lines that was. Restricted to the taxed lines so
+   *  an 18% bill reads 18.00% and not a blended 0.01%; `taxed_lines` > 1 is how a
+   *  reader knows a figure is a blend. See src/lib/tax-applied.ts. */
+  taxed_bill_value: number;
+  taxed_lines: number;
 }
 
 interface BillTotals {
@@ -205,6 +221,12 @@ interface BillTotals {
   day_run_bills: number;
   /** Rendered VERBATIM beside the period total — it is the guard on misreading it. */
   basis: string;
+  /** THE "Tax % Applied (GST)" BASE — Σ(subtotal − discount) over the lines that
+   *  CARRIED GST, and how many lines that was. Restricted to the taxed lines so
+   *  an 18% bill reads 18.00% and not a blended 0.01%; `taxed_lines` > 1 is how a
+   *  reader knows a figure is a blend. See src/lib/tax-applied.ts. */
+  taxed_bill_value: number;
+  taxed_lines: number;
 }
 
 /**
@@ -289,6 +311,20 @@ interface DayRow {
   /** true ⇒ some of this day's charges were read off a GRN line. PROVENANCE,
    *  not partiality: the figures are complete. Renamed from charges_partial. */
   charges_from_grn: boolean;
+  /** cgst + sgst for the day. ON THE WIRE SINCE THE DAY VIEW SHIPPED and simply
+   *  never declared here — the day TABLE prints one net "Taxes & charges" bridge
+   *  figure instead of the eight charge columns, so nothing needed them. The
+   *  Tax % Applied (GST) column does: the bridge figure nets a discount and a
+   *  delivery charge into the tax and no rate can be recovered from it. */
+  gst: number;
+  cgst: number;
+  sgst: number;
+  /** THE "Tax % Applied (GST)" BASE — Σ(subtotal − discount) over the lines that
+   *  CARRIED GST, and how many lines that was. Restricted to the taxed lines so
+   *  an 18% bill reads 18.00% and not a blended 0.01%; `taxed_lines` > 1 is how a
+   *  reader knows a figure is a blend. See src/lib/tax-applied.ts. */
+  taxed_bill_value: number;
+  taxed_lines: number;
 }
 
 interface DayVendorRow {
@@ -307,6 +343,16 @@ interface DayVendorRow {
   po_receipt_bills: number;
   po_receipt_value: number;
   charges_from_grn: boolean;
+  /** Same three as DayRow — on the wire already, declared for the tax column. */
+  gst: number;
+  cgst: number;
+  sgst: number;
+  /** THE "Tax % Applied (GST)" BASE — Σ(subtotal − discount) over the lines that
+   *  CARRIED GST, and how many lines that was. Restricted to the taxed lines so
+   *  an 18% bill reads 18.00% and not a blended 0.01%; `taxed_lines` > 1 is how a
+   *  reader knows a figure is a blend. See src/lib/tax-applied.ts. */
+  taxed_bill_value: number;
+  taxed_lines: number;
 }
 
 interface DayResponse {
@@ -1181,6 +1227,15 @@ export default function PurchaseBillSummaryPage() {
                   <div className="w-[140px] px-3 py-2 text-right whitespace-normal">Subtotal <span className="normal-case font-normal text-[#B8A48E]">(goods)</span></div></th>
                 <th className="py-2 px-3 text-right" title="Discount recorded on the bill. On a PO receipt this is the GRN line's discount — the bill document's own figure.">Discount</th>
                 <th className="py-2 px-3 text-right" title="CGST + SGST only. The two cesses are different levies on a different base and are never folded in. On a PO receipt these are the GRN line's figures.">GST</th>
+                {/* THE RATE BEHIND THE COLUMN TO ITS LEFT, and it sits INSIDE the
+                    Subtotal → Grand total arithmetic without breaking it: a
+                    PERCENTAGE is not a money column, so a reader adding the money
+                    columns across the row cannot double-count it. That is also
+                    why no second rupee column was added here — the value half of
+                    the owner's pair is already the GST column, and printing the
+                    same money twice under two names is what would make this row
+                    stop footing. */}
+                <th className="py-2 px-3 text-right" title={TAX_PERCENT_TITLE}>{TAX_PERCENT_LABEL}</th>
                 <th className="py-2 px-3 text-right" title="GST Compensation Cess (aerated drinks, tobacco) — charged on the GROSS line value, before discount. A different levy from Spl Excise Cess.">Comp. Cess</th>
                 <th className="py-2 px-3 text-right" title="TGBCL Special Excise Cess — the liquor levy. Non-creditable, never folded into GST.">Spl Excise Cess</th>
                 <th className="py-2 px-3 text-right" title="Tax Collected at Source, as recorded on the bill.">TCS</th>
@@ -1201,13 +1256,14 @@ export default function PurchaseBillSummaryPage() {
                   <div className="w-[140px] px-3 py-2 text-right whitespace-normal">Grand total</div></th>
               </tr></thead>
               <tbody>
-                {/* 16 columns since the Subtotal joined them. These two colSpans
-                    are hand-kept — a stale one breaks the loading and empty rows
-                    in the commonest case of all, a range with no data. */}
+                {/* 17 columns since Tax % Applied (GST) joined the 16 the
+                    Subtotal made. These two colSpans are hand-kept — a stale one
+                    breaks the loading and empty rows in the commonest case of
+                    all, a range with no data. */}
                 {loading && rows.length === 0 ? (
-                  <tr><td colSpan={16} className="py-6 text-center text-[#8B7355] animate-pulse">Loading bill summary…</td></tr>
+                  <tr><td colSpan={17} className="py-6 text-center text-[#8B7355] animate-pulse">Loading bill summary…</td></tr>
                 ) : rows.length === 0 ? (
-                  <tr><td colSpan={16} className="py-6 text-center text-[#8B7355]">
+                  <tr><td colSpan={17} className="py-6 text-center text-[#8B7355]">
                     {error ? 'Not loaded — see the message above.'
                       : filtered ? 'No bills match that search.'
                         : 'No purchase bills in this range.'}
@@ -1331,6 +1387,12 @@ export default function PurchaseBillSummaryPage() {
                             <span title="This bill was received against a PO, so its charge figures are read from its GRN line — the bill document, and the same figures the GRN Inward Register totals as Total Inward."
                               className="px-1 py-0.5 rounded border border-[#CFE2D4] bg-[#EDF4EE] text-[#3F6B4C] text-[9px] font-bold">charges from GRN</span></span>
                           : fmtINR(r.gst)}
+                      </td>
+                      {/* An em dash, never 0.00%, on a bill that recorded no GST
+                          — and one is not the same statement as the other. */}
+                      <td className="py-2 px-3 text-right tabular-nums font-semibold text-[#6B5744]"
+                          title={TAX_PERCENT_TITLE + taxAppliedNote(r)}>
+                        {fmtTaxPercent(taxAppliedPercent(r))}
                       </td>
                       <td className="py-2 px-3 text-right tabular-nums text-[#6B5744]">{chargeText(r, 'compensation_cess', r.compensation_cess)}</td>
                       <td className="py-2 px-3 text-right tabular-nums text-[#6B5744]">{chargeText(r, 'special_excise_cess', r.special_excise_cess)}</td>
@@ -1463,17 +1525,24 @@ export default function PurchaseBillSummaryPage() {
                       delivery charge and overstate it on a day with a discount. */}
                   <th className="py-2 px-3 text-right"
                     title="GRAND TOTAL − SUBTOTAL for this day: the bills' tax, both cesses, TCS, delivery and MRP round-off, LESS their discount. One net figure, so the row adds up on screen — Subtotal + this = Grand total. The six charges behind it are itemised in the By bill view and in the CSV; a day whose bills carried a big discount can show a negative here.">Taxes &amp; charges</th>
+                  {/* THE ONE TAX FIGURE THIS PAPERWORK VIEW CARRIES. The eight
+                      charge columns stay deliberately absent here (see the bridge
+                      column above), but the rate is what the owner asked for and
+                      it cannot be recovered from the net bridge figure — that one
+                      nets a discount and a delivery charge into the tax. It is a
+                      percentage, not money, so it joins nothing this row foots. */}
+                  <th className="py-2 px-3 text-right" title={TAX_PERCENT_TITLE}>{TAX_PERCENT_LABEL}</th>
                   <th className="p-0 sticky right-0 z-20 bg-white border-l-2 border-[#E8D5C4] align-bottom"
                     title="GRAND TOTAL — what is payable to the vendors for this day: Subtotal − Discount + GST + both cesses + TCS + Delivery + MRP round-off. Pinned to the right edge so it stays visible while the row scrolls."><div className="w-[150px] px-3 py-2 text-right whitespace-normal">Grand total</div></th>
                 </tr></thead>
                 <tbody>
-                  {/* 9 columns since the Taxes & charges bridge joined the
-                      Subtotal — three hand-kept colSpans, this pair and the
-                      no-breakdown row further down. */}
+                  {/* 10 columns since Tax % Applied (GST) joined the 9 the
+                      Taxes & charges bridge made — three hand-kept colSpans,
+                      this pair and the no-breakdown row further down. */}
                   {loading && days.length === 0 ? (
-                    <tr><td colSpan={9} className="py-6 text-center text-[#8B7355] animate-pulse">Loading the day rollup…</td></tr>
+                    <tr><td colSpan={10} className="py-6 text-center text-[#8B7355] animate-pulse">Loading the day rollup…</td></tr>
                   ) : days.length === 0 ? (
-                    <tr><td colSpan={9} className="py-6 text-center text-[#8B7355]">
+                    <tr><td colSpan={10} className="py-6 text-center text-[#8B7355]">
                       {error ? 'Not loaded — see the message above.' : 'No purchases in this range.'}
                     </td></tr>
                   ) : days.map(d => {
@@ -1528,6 +1597,9 @@ export default function PurchaseBillSummaryPage() {
                               hyphen that reads as a dash between two numbers. */}
                           <td className="py-2 px-3 text-right tabular-nums text-[#6B5744]">
                             {fmtSignedINR(num(d.total_bill_value) - num(d.bill_value))}</td>
+                          <td className="py-2 px-3 text-right tabular-nums font-semibold text-[#6B5744]"
+                              title={TAX_PERCENT_TITLE + taxAppliedNote(d)}>
+                            {fmtTaxPercent(taxAppliedPercent(d))}</td>
                           <td className={`p-0 sticky right-0 z-10 border-l-2 border-[#F0E4D6] ${open ? 'bg-[#FFF6EE]' : 'bg-white'}`}>
                             <div className="w-[150px] px-3 py-2 text-right tabular-nums font-semibold whitespace-normal leading-tight">
                             {fmtINR(d.total_bill_value)}
@@ -1543,7 +1615,7 @@ export default function PurchaseBillSummaryPage() {
 
                         {open && (vrows.length === 0 ? (
                           <tr className="border-b border-[#F7EEE3] bg-[#FFFCF8]">
-                            <td colSpan={9} className="py-2.5 px-3 text-[12px] text-[#8B7355]">
+                            <td colSpan={10} className="py-2.5 px-3 text-[12px] text-[#8B7355]">
                               No vendor breakdown was returned for this day{dayData?.vendor_rows_truncated ? ' — the breakdown hit its row limit (see the note above).' : '.'}
                             </td>
                           </tr>
@@ -1568,6 +1640,9 @@ export default function PurchaseBillSummaryPage() {
                                 day column by column. */}
                             <td className="py-1.5 px-3 text-right tabular-nums text-[#6B5744]">
                               {fmtSignedINR(num(v.total_bill_value) - num(v.bill_value))}</td>
+                            <td className="py-1.5 px-3 text-right tabular-nums font-semibold text-[#6B5744]"
+                                title={TAX_PERCENT_TITLE + taxAppliedNote(v)}>
+                              {fmtTaxPercent(taxAppliedPercent(v))}</td>
                             <td className="p-0 sticky right-0 z-10 bg-[#FFFCF8] border-l-2 border-[#F0E4D6]">
                               <div className="w-[150px] px-3 py-1.5 text-right tabular-nums text-[#6B5744] whitespace-normal leading-tight">
                               {fmtINR(v.total_bill_value)}

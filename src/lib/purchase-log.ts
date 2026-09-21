@@ -2,6 +2,10 @@ import type DatabaseT from 'better-sqlite3';
 import { getDb } from './db';
 import { todayIST } from './format-date';
 import { claimJoin } from './po-receipts';
+// The "Tax % Applied (GST)" base. GST only — compensation cess sits on the
+// GROSS line value and GST on the post-discount value, so the two cannot share
+// a denominator and must never share a percentage. See src/lib/tax-applied.ts.
+import { taxAppliedSumsSql } from './tax-applied';
 
 /**
  * PURCHASE LOG — one row per ITEM per BILL, across all three procurement
@@ -319,6 +323,25 @@ export interface PurchaseLogSourceMoney {
   goods_value_tax_suspect: number;
   /** Lines behind goods_value_tax_suspect — value ≠ quantity × rate (2dp). */
   goods_value_tax_suspect_lines: number;
+  /**
+   * THE "Tax % Applied (GST)" BASE for this source: Σ(value − discount) over
+   * the lines that CARRIED GST, with `taxed_lines` being how many that was.
+   *
+   * Not Σ(value) − Σ(discount). On this database 2,158 of 2,165 PURCHASE lines
+   * record no GST — 217 of them because the old inward-import path wrote a
+   * tax-INCLUSIVE total_price and never split the tax out — so a rate over the
+   * whole source would read 0.01% where the vendor charged 18%, and on those 217
+   * rows it would be dividing tax by a tax-inclusive base as well. Restricting
+   * the base to the GST-bearing lines makes the figure the rate that was
+   * actually applied, and `taxed_lines` lets every renderer say over how many
+   * lines — so a blended multi-rate group can never read as one vendor's rate.
+   *
+   * 0 on PO, whose branch binds no charge columns at all: with no GST anywhere
+   * there is no taxed base, and the percentage renders as an em dash (never 0%).
+   */
+  taxed_bill_value: number;
+  /** Lines behind taxed_bill_value — how many recorded GST > 0. */
+  taxed_lines: number;
 }
 
 /** A column left without a total on purpose, and the reason, shipped as data. */
@@ -575,6 +598,10 @@ function emptyMoney(source: PurchaseLogSource): PurchaseLogSourceMoney {
     bill_amount: noCharges ? null : 0,
     goods_value_tax_suspect: 0,
     goods_value_tax_suspect_lines: 0,
+    // Zero lines carried GST because there are zero lines. The percentage
+    // renders as an em dash off a 0 base — never 0%.
+    taxed_bill_value: 0,
+    taxed_lines: 0,
   };
 }
 
@@ -966,7 +993,19 @@ export function getPurchaseLog(
            COALESCE(SUM(COALESCE(qty, 0) * COALESCE(rate, 0)), 0)        AS qty_rate_value,
            COALESCE(SUM(CASE
              WHEN ROUND(COALESCE(value, 0) - COALESCE(qty, 0) * COALESCE(rate, 0), 2) <> 0
-             THEN 1 ELSE 0 END), 0)                                  AS value_mismatch_lines
+             THEN 1 ELSE 0 END), 0)                                  AS value_mismatch_lines,
+           -- THE "Tax % Applied (GST)" BASE for a source's footer row: the
+           -- post-discount value of the lines that CARRIED GST, and how many
+           -- lines that was. Not SUM(value) − SUM(discount): 2,158 of the 2,165
+           -- purchase lines record no GST at all, so a rate over the whole
+           -- source would print 0.01% for an 18% bill. GST is charged on the
+           -- line value AFTER discount — measured exactly 18.00 / 12.00 on all
+           -- 29 tax-bearing GRN lines on that base and 16.2 / 11.2 on the gross
+           -- one, which is why the discount is subtracted here.
+           ${taxAppliedSumsSql(
+             'COALESCE(cgst, 0) + COALESCE(sgst, 0)',
+             'COALESCE(value, 0) - COALESCE(discount, 0)',
+           )}
     FROM (${union})
     GROUP BY source
   `).all(...params) as Array<Record<string, number> & { source: string }>;
@@ -1027,6 +1066,12 @@ export function getPurchaseLog(
       // with charge columns.
       goods_value_tax_suspect: r2(num(a.value) - num(a.qty_rate_value)),
       goods_value_tax_suspect_lines: num(a.value_mismatch_lines),
+      // Independent of noCharges as well: on PO the SQL's CASE never fires (no
+      // charge columns, so the GST expression is 0), which yields 0 here — and
+      // a 0 base renders the percentage as an em dash rather than 0%, which is
+      // exactly the right answer for an order nobody has billed.
+      taxed_bill_value: r2(a.taxed_bill_value),
+      taxed_lines: num(a.taxed_lines),
     };
   }
 
