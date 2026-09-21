@@ -28,7 +28,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { Users, Utensils, Clock, ChevronRight, RefreshCw } from 'lucide-react';
-import { STATUS_STYLE, TABLE_STATUSES, statusLabel, type TableStatus } from './enums';
+import { STATUS_STYLE, TABLE_STATUSES, statusLabel, type TableStatus } from '@/lib/feedback';
 import { FLOOR_TABLES, FLOORS, type FloorTable } from './placeholder';
 import {
   Chip, EmptyState, PageBody, PageHead, PlaceholderNote, Scroller, Select,

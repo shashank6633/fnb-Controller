@@ -22,7 +22,7 @@
  *     `rt.zone AS floor`.)
  */
 
-import type { ItemGroup, OverallRating, TableStatus } from './enums';
+import type { ItemGroup, OverallRating, TableStatus } from '@/lib/feedback';
 
 /* ── Page 1 ──────────────────────────────────────────────────────────────── */
 

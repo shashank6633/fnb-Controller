@@ -37,7 +37,7 @@ import {
 } from 'lucide-react';
 import {
   DATE_RANGES, ITEM_GROUPS, REPORTS, type ItemGroup,
-} from '../enums';
+} from '@/lib/feedback';
 import {
   ANALYTICS_SUMMARY, CAPTAIN_NAMES, COMMON_PROBLEMS, COVERAGE_ROWS, FLOORS, GRE_NAMES,
   MENU_ITEM_ROWS, MOST_APPRECIATED, RECOVERY_ROWS, type MenuItemRow,

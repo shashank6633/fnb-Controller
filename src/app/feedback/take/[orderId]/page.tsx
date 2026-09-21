@@ -37,7 +37,7 @@ import {
   REVISIT_RATINGS, closesIssue, isNegative, requiresFollowUp,
   type ActionTaken, type Category, type Happiness, type ItemIssue, type ItemRating,
   type OverallRating,
-} from '../../enums';
+} from '@/lib/feedback';
 import { TAKE_ORDER, type TakeItem } from '../../placeholder';
 import { Card, Chip, PlaceholderNote, PrimaryButton, Scroller, SectionTitle, StickyBar, elapsed } from '../../ui';
 
