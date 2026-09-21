@@ -45,12 +45,17 @@ the FSSAI licence number printed on bills — which nearly caused a false gate b
 8. **`node_modules`:** `rsync -a --link-dest=...` — Turbopack REJECTS a symlinked `node_modules`
    (*"points out of the filesystem root"*).
 9. **Auth:** `src/proxy.ts` guards **PAGES, NOT APIs**, and `canAccessPage` **fails open four ways**.
-   Every route must gate itself. No path may contain `print` — `proxy.ts:~147`
-   `pathname.includes('/print')` makes any such path PUBLICLY UNAUTHENTICATED **and CSRF-exempt**
-   (it currently exposes 14 API routes). No path may end `.png/.jpg/.json` (a second carve-out).
-   CSRF = cookie `fnb_csrf` + header `x-csrf-token`; add the module's API prefix to
-   `CSRF_REQUIRED_PREFIXES` or every write is forgeable. *(Bill Handover shipped without that line and
-   a POST with no CSRF header reached app code — measured.)*
+   **Every route must gate itself** — this remains the single most important auth fact here.
+   *Updated 2026-09-21 (`9224f6d`, deployed):* `isPublic()` now has a **hard `/api/` floor** —
+   `if (pathname.startsWith('/api/')) return false;` — so the print and file-extension patterns below
+   it can no longer make an API route public. The old `pathname.includes('/print')` substring (which
+   had exposed 7 API routes as publicly routable **and CSRF-exempt** — not 14, it needed a leading
+   slash) is gone, replaced by four anchored page regexes. So a `print` substring in a new API path is
+   no longer fatal, but **still avoid it**: the four public print PAGES are matched by pattern, and
+   `isPublic()` returns *before* the `page_access` check.
+   CSRF = cookie `fnb_csrf` + header `x-csrf-token`; **add this module's API prefix to
+   `CSRF_REQUIRED_PREFIXES`** or every write is forgeable. *(Bill Handover shipped without that line
+   and a POST with no CSRF header reached app code — measured.)*
 10. **Sidebar/catalog drift:** a page is gated by `src/lib/page-catalog.ts` but the nav list lives in
     `src/components/Sidebar.tsx`. Catalog-only = gated but invisible. **Edit BOTH.**
 11. **`tsc --noEmit` is the ONLY type gate** — `next.config.ts` sets `ignoreBuildErrors: true`.
@@ -179,7 +184,7 @@ supported, clear status indicators, sticky Submit. Minimal typing.
 |---|---|---|---|
 | P0 | Recon — read-only: POS/order/table/role wiring, Captain-app patterns, export helpers, the read-only enforcement surface | PENDING | |
 | P1 | Foundation — `gf_` schema, nav in BOTH files, RBAC, 4 page shells | PENDING | |
-| P2 | Page 1 Floor Feedback + the READ-ONLY guarantee, proved server-side | PENDING | |
+| P2 | Page 1 Floor Feedback + the READ-ONLY guarantee, proved server-side | **Lane A DONE** | §6 2026-09-22: GET-only routes (405 with CSRF, 403 without), 40 reads → census identical, 6-persona gate, all 5 statuses live, `tunable()` zero-default bug fixed, tsc 0. **Part (B) — denying the GRE on the existing POS routes — is NOT applied: owner diff still owed.** |
 | P3 | Page 2 Take Feedback + item-level complaints + action + follow-up lifecycle | PENDING | |
 | P4 | Page 3 Feedback Tracker + coverage | PENDING | |
 | P5 | Page 4 Analytics + the 8 reports | PENDING | |
@@ -239,6 +244,82 @@ supported, clear status indicators, sticky Submit. Minimal typing.
     `export * from '@/lib/feedback';`. Every wire value in `src/lib/feedback.ts` is byte-identical, so
     the repoint is a no-op — but two lists are alive right now and only the `src/lib` one can be
     imported server-side. **P2 must close this.**
+
+- **2026-09-22 — P2 Lane A (Page 1 Floor Feedback + the READ rail).** New:
+  `src/lib/feedback/read.ts` (SELECT-only), `src/lib/feedback/session.ts` (the server gate),
+  `src/app/api/feedback/floor/route.ts`, `src/app/api/feedback/order/[orderId]/route.ts`; rewritten
+  `src/app/feedback/page.tsx` (fixtures gone). Concurrent-lane note: Lane B had already moved the
+  gate to `src/lib/feedback/access.ts` with a richer `feedbackAccess()` decision — **my own
+  `feedback-gate.ts` was deleted rather than shipped as a second gate**, and `session.ts` only
+  adapts the session to that one authority (it adds `roles.is_active`, which `getCurrentUser()`
+  never reports, so a DEACTIVATED GRE role can no longer keep granting).
+  - 🐞 **DEFECT FOUND AND FIXED IN THE SHARED MODULE — `tunable()` in `src/lib/feedback.ts`.** It
+    read `Number(String(raw ?? '').trim())`, and `Number('')` is `0` — finite and ≥ 0 — so an
+    **absent key returned 0, never the fallback**. This was the `captain_area_lock` failure the
+    section's own comment was written to prevent, and it was LIVE: `feedback_item_threshold`
+    resolved to 0, so `item_count >= 0` made every table instantly **Feedback Due** (0-item tables
+    included) and **Not Ready was unreachable**; `feedback_settled_grace_minutes` resolved to 0,
+    which the board reads as *grace disabled*, so a table settled one minute ago vanished.
+    Measured before → `item_threshold 0 · grace 0 · counts {all 11, due 8, not_ready 0}`;
+    after → `item_threshold 4 · grace 30 · counts {all 12, due 5, issue 1, taken 1, follow_up 1,
+    not_ready 4}`. The blank check now precedes the numeric parse.
+  - 🐞 **SECOND TRAP CLOSED — timestamps.** `orders.created_at` is `datetime('now')` →
+    `2026-08-11 19:05:14` (UTC, space, no `Z`), and V8 parses that space form as **local** time:
+    `Date.parse` lands 5 h 30 m early in IST, so a table open 10 min would have rendered **"5h 40m"**.
+    Every stamp now leaves the API through `sqlUtcToIso()` (the same repair `bill-pdf.ts:32` and
+    `central-cutover.ts:164` already use); the client never sees the raw column.
+  - **READ-ONLY, PROVED TWICE.** Both route files export `GET` **and nothing else**, over a library
+    with zero SQL writes. Measured on the booted server: POST/PUT/PATCH/DELETE on both routes → **403**
+    (CSRF, the `/api/feedback` prefix is armed) and → **405** once a valid double-submit pair is
+    supplied, i.e. the route genuinely has no such handler. 40 authenticated reads left the census
+    byte-identical (`orders 48 · order_items 84 · gf_visits 3 · settings 64 · Σquantity 123`),
+    `integrity_check ok`, `purchases=2165 raw_materials=952`. The ordered-items read is the module's
+    OWN narrow SELECT — never a proxy to `/api/dine-in/orders/[id]`, the file that also exports the
+    `PATCH` carrying add_item/set_qty/remove_item/fire — and it returns **no money at all** (keys:
+    id, name, quantity, station, group, station_recognised, kitchen_status, fired_at, served_at,
+    created_at).
+  - **THE GATE FAILS CLOSED, measured across six personas** on `GET /api/feedback/floor`:
+    no session → **401**; `role_id` NULL → **403 `no_role_assigned`**; Captain role → **403
+    `role_not_gre`**; `users.section = 'GRE'` with no role → **403** (section is a hint, never a
+    grant); assigned **GRE** role → **200** `scope: gre, read_only: true`; Floor Manager → **200**
+    `scope: management`; Admin → **200** `scope: admin`. Every refusal carries `what_to_do`, printed
+    verbatim on screen, and it says CREATING the role is not ASSIGNING it.
+  - **Eligibility on real columns, all five statuses reachable:** `not_ready 4 · due 5 · taken 1 ·
+    issue 1 · follow_up 1`. Triggers fire independently — a 2-item table went Due on
+    `bill_requested_at`; a 5-item table went Due on `COUNT(order_items) >= 4`; a settled table
+    5 min old stayed on the board (grace) while one 200 min old did not; a voided order with 6 items
+    AND a bill request never appeared. Threshold proved administrable with **no write route in this
+    module**: admin `PUT /api/settings {feedback_item_threshold: 6}` → 200 moved a 5-item table
+    Due → Not Ready; the same PUT from a staff login → **403**.
+  - **Food vs Drinks** resolves through `BAR_STATIONS` (not `station_departments`, whose Bar mapping
+    lacks beer/wine/beverage). Unrecognised stations are **reported, never dropped**:
+    `meta.unclassified = [{'(blank)': 4}, {'zz-unknown-station': 1}]` with the reason string on
+    screen, and per-item a `?` marker — they land in Food because the shipped KDS rule says every
+    non-bar station is Kitchen. `meta.excluded` likewise counts what is off the board
+    (`takeaway_or_other 5 · table_row_missing 3`) instead of silently shrinking coverage.
+  - **Floor = `restaurant_tables.zone`**, with `''` bucketed to `'Floor'` exactly as
+    `captain-area.ts:30` does — proved live (`floors: ['Floor','Ground Floor','Rooftop']`). No filter
+    was built on `section` (0/3 populated; it would have shipped dead).
+  - **Ordering is the SERVER's** and the page only filters: `follow_up → due → issue → taken →
+    not_ready`, and inside a group the guests who are about to leave (bill requested/printed) before
+    the rest, then oldest-open first.
+  - ⚠️ **OWNER ACTION, found while testing:** the `Floor Manager` role carries an explicit
+    `page_access` list that does NOT contain `/feedback`, so that login gets **200 from the API and
+    403 on the page**. Any role the owner expects to open this module — the production **GRE** role
+    included — needs `/feedback` in its page list, or the page 403s while the gate says yes.
+  - `npx tsc --noEmit` exit **0**. ⚠️ Port 3921 was assigned but Next 16.2.2 refuses a second dev
+    server in one directory and this worktree already had Lane B's on 3922; once that one exited,
+    3921 booted and every measurement above is from it. Killed at end of lane.
+  - Fixtures live in the worktree DB only, every id prefixed `gfqa-` (7 tables, 11 orders, 49 items,
+    3 visits, 6 sessions, 5 users, and a local `GRE` role mirroring production). Remove with
+    `DELETE ... WHERE id LIKE 'gfqa-%'`.
+  - ✅ The `src/app/feedback/enums.ts` duplication flagged by P1 is **already gone** — that file no
+    longer exists; `placeholder.ts` imports its types from `@/lib/feedback`.
+  - ⚠️ **NEW RESOLUTION TRAP:** `src/lib/feedback.ts` and `src/lib/feedback/` now both exist. TS and
+    Node try the FILE first, so `@/lib/feedback` is always `feedback.ts` and a
+    `src/lib/feedback/index.ts` would be **silently unreachable — never create one**. Deep paths
+    (`@/lib/feedback/access`, `/read`, `/session`) are unambiguous; the carve grep
+    `src/lib/feedback` still matches both spellings.
 
 ---
 

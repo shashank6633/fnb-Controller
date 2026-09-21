@@ -361,10 +361,42 @@ export const FEEDBACK_ITEM_THRESHOLD_DEFAULT = 4;
 export const FEEDBACK_SETTLED_GRACE_KEY = 'feedback_settled_grace_minutes';
 export const FEEDBACK_SETTLED_GRACE_DEFAULT = 30;
 
-/** Parse a settings value to a non-negative integer, falling back to the coded
- *  default for absent / blank / non-numeric / negative values alike. */
+/**
+ * Parse a settings value to a non-negative integer, falling back to the coded
+ * default for absent / blank / non-numeric / negative values alike.
+ *
+ * ⚠️ FIXED IN P2 (measured, not theorised). The first version was
+ *
+ *     const n = Number(String(raw ?? '').trim());
+ *     return Number.isFinite(n) && n >= 0 ? Math.floor(n) : fallback;
+ *
+ * and `Number('')` is `0` — finite and >= 0 — so an ABSENT key returned **0**,
+ * never the fallback. That is precisely the `captain_area_lock` failure this
+ * section's own comment was written to prevent, and it was live: with no
+ * `feedback_item_threshold` row (there is none on the measured database), the
+ * threshold resolved to 0, so `item_count >= 0` made EVERY table instantly
+ * "Feedback Due" — including tables with zero items — and `Not Ready` became
+ * unreachable. The grace window collapsed the same way: `feedback_settled_grace
+ * _minutes` resolved to 0, which the board reads as "grace disabled", so a
+ * table settled one minute ago vanished off the GRE's board.
+ *
+ * Measured on the running server (GET /api/feedback/floor) BEFORE the fix:
+ *     meta.item_threshold = 0 · meta.grace_minutes = 0
+ *     counts = { all: 11, due: 8, issue: 1, taken: 1, follow_up: 1, not_ready: 0 }
+ *                                                     ↑ 0-item tables called "due"
+ * and AFTER, on the same fixtures:
+ *     meta.item_threshold = 4 · meta.grace_minutes = 30
+ *     counts = { all: 12, due: 5, issue: 1, taken: 1, follow_up: 1, not_ready: 4 }
+ * `all` RISES from 11 to 12 because the grace window came back: a table settled
+ * five minutes ago is visitable again instead of having silently disappeared.
+ *
+ * The blank check must come FIRST and must be its own statement: "no value" and
+ * "the value zero" are different answers, and only the second may mean zero.
+ */
 export function tunable(raw: unknown, fallback: number): number {
-  const n = Number(String(raw ?? '').trim());
+  const s = String(raw ?? '').trim();
+  if (s === '') return fallback;          // absent / null / blank ⇒ the default
+  const n = Number(s);
   return Number.isFinite(n) && n >= 0 ? Math.floor(n) : fallback;
 }
 
