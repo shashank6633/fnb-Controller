@@ -431,8 +431,10 @@ export default function FeedbackAnalyticsPage() {
       {/* Click-through to the real comments (§3: "clickable through to the real
           comments"). P5 fills it from gf_item_feedback. */}
       {openItem && (
-        <div className="fixed inset-0 z-[60] flex items-end sm:items-center justify-center">
-          <div className="absolute inset-0 bg-black/40" onClick={() => setOpenItem(null)} aria-hidden="true" />
+        // `bg-black/40` on the FIXED wrapper so globals.css:295 locks body
+        // scroll behind the sheet; on the inner click-catcher it would not match.
+        <div className="fixed inset-0 z-[60] bg-black/40 flex items-end sm:items-center justify-center">
+          <div className="absolute inset-0" onClick={() => setOpenItem(null)} aria-hidden="true" />
           <div className="relative w-full sm:max-w-lg bg-white rounded-t-3xl sm:rounded-3xl max-h-[85vh] overflow-y-auto p-4">
             <div className="flex items-start gap-2">
               <div className="min-w-0 flex-1">

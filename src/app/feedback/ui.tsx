@@ -18,13 +18,31 @@
  * `AppShell` — `src/components/AppShell.tsx:16` gives the chrome-less `bare`
  * layout only to `/login`, real `/print` segments and `/captain*`. So on a phone
  * there is a 48px-tall sticky `MobileTopBar` above us, and on `lg:` a 260px
- * in-flow sidebar beside us. Consequences:
- *   · a bottom bar must be `sticky bottom-0`, NOT `fixed … lg:left-72` the way
- *     the captain order screen does it. Fixed + a hard left offset would sit on
- *     top of the sidebar, and would be wrong again the moment the user collapses
- *     it to `w-16` (Sidebar.tsx:736). Sticky follows the main column for free.
- *   · full-bleed rows cancel AppShell's own padding with the matching negative
- *     margin (`-mx-3 sm:-mx-5 lg:-mx-8`), then re-apply it inside.
+ * in-flow sidebar beside us. Full-bleed rows therefore cancel AppShell's own
+ * padding with the matching negative margin (`-mx-3 sm:-mx-5 lg:-mx-8`) and
+ * re-apply it inside.
+ *
+ * ⚠️ AND THE ONE THAT COST AN HOUR — `position: sticky` DOES NOT WORK INSIDE
+ * `<main>` ON A PHONE. `src/app/globals.css:211` sets, under
+ * `@media (max-width: 1023.98px)`:
+ *       main { overflow-x: hidden; max-width: 100vw; }
+ * `overflow-x: hidden` makes `overflow-y` compute to `auto`, which turns `main`
+ * into the scroll container for everything inside it. `main` never scrolls (the
+ * document does), so a sticky descendant has nothing to stick to and simply
+ * sits at its flow position. Measured, not guessed: at 390px a `sticky bottom-0`
+ * bar reported `top: 1861` in a 844px viewport — i.e. far below the fold.
+ * The file's own comment at :205 documents the html/body version of this trap;
+ * this is its `main`-scoped consequence, and it is why `/captain` gets away with
+ * `fixed … md:left-72` (that route is `bare`, so there is no `<main>` at all).
+ *
+ * So the bottom bar is `fixed` up to `lg:` and `sticky` from `lg:` — where the
+ * media query no longer applies and sticky behaves. It is NOT `fixed` with a
+ * hard `lg:left-72`, which would sit on the sidebar and be wrong again the
+ * moment the user collapses it to `w-16` (Sidebar.tsx:736).
+ *
+ * The page HEADER keeps a plain `sticky`: it pins on desktop and scrolls away
+ * on a phone, which is the right trade — losing the title costs nothing, losing
+ * Submit costs the whole screen.
  */
 
 import type { ReactNode } from 'react';
@@ -85,9 +103,15 @@ export function FeedbackTabs() {
 /* ── page frame ──────────────────────────────────────────────────────────── */
 
 /**
- * The page header. `sticky top-12 lg:top-0` sits directly under the mobile
- * top bar (h-12, z-40 — MobileTopBar.tsx:60); on lg: that bar is gone so it
- * pins to the viewport. z-20 keeps it under MobileTopBar and under any sheet.
+ * The page header. `top-12` clears the mobile top bar (h-12, z-40 —
+ * MobileTopBar.tsx:60) and `lg:top-0` takes over once that bar is gone; z-20
+ * keeps it under MobileTopBar and under any sheet.
+ *
+ * It genuinely pins only from `lg:` up — below that `globals.css:211` has made
+ * `main` a scroll container and sticky is inert inside it (see the ⚠️ note at
+ * the top of this file). That is an accepted trade: the header carries the
+ * title and the tab bar, neither of which is needed mid-scroll. The bar that
+ * must not scroll away is `StickyBar`, and that one is `fixed` on phones.
  */
 export function PageHead({
   title,
@@ -116,18 +140,30 @@ export function PageHead({
   );
 }
 
-/** Wraps a page body. `pb-28` reserves room for the sticky bottom bar. */
+/** Wraps a page body. `pb-28` reserves room for the bar, which is `fixed` (and
+ *  so out of flow) below `lg:`; from `lg:` the bar is in flow and pays for its
+ *  own space, so the reserve drops back to normal padding. */
 export function PageBody({ children }: { children: ReactNode }) {
-  return <div className="pb-28 max-w-5xl">{children}</div>;
+  return <div className="pb-28 lg:pb-6 max-w-5xl">{children}</div>;
 }
 
 /**
- * The sticky bottom bar. Sticky (not fixed) so it tracks the main column at
- * every sidebar width — see the layout note at the top of this file.
+ * The bottom action bar — the one piece of chrome that must never scroll away.
+ *
+ * `fixed` below `lg:` and `sticky` from `lg:`. See the ⚠️ note at the top of
+ * this file: `globals.css:211` makes `main` a scroll container on phones, which
+ * silently disables `position: sticky` for everything inside it. `fixed` is
+ * unaffected — `main` sets no transform/filter/contain, so it is not a
+ * containing block for fixed descendants and does not clip them either.
+ *
+ * Note the insets rather than negative margins on the mobile side: a `fixed`
+ * element with both `left` and `right` set IS inset by its margins, so the
+ * `-mx-3` trick used elsewhere would make this bar 24px wider than the viewport
+ * and reintroduce the horizontal scroll it is meant to avoid.
  */
 export function StickyBar({ children }: { children: ReactNode }) {
   return (
-    <div className="sticky bottom-0 z-20 -mx-3 sm:-mx-5 lg:-mx-8 px-3 sm:px-5 lg:px-8 py-2.5 bg-white border-t border-[#E8D5C4] shadow-[0_-4px_12px_rgba(45,27,14,0.06)]">
+    <div className="fixed inset-x-0 bottom-0 z-30 px-3 sm:px-5 lg:sticky lg:inset-x-auto lg:z-20 lg:-mx-8 lg:px-8 py-2.5 bg-white border-t border-[#E8D5C4] shadow-[0_-4px_12px_rgba(45,27,14,0.06)]">
       <div className="max-w-5xl">{children}</div>
     </div>
   );

@@ -129,9 +129,13 @@ export default function TakeFeedbackPage() {
   };
 
   return (
-    <div className="pb-28">
+    <div className="pb-28 lg:pb-6">
       {/* Header — a focused task screen, so no tab bar here: the only way out is
-          Back, which is what a one-handed 15-second flow wants. */}
+          Back, which is what a one-handed 15-second flow wants. `sticky` pins it
+          from lg: up; on a phone it scrolls away, because globals.css:211 turns
+          <main> into a scroll container below lg: and kills sticky inside it.
+          Submit is the control that must survive that, and it does — see
+          StickyBar in ../../ui.tsx. */}
       <header className="sticky top-12 lg:top-0 z-20 -mx-3 sm:-mx-5 lg:-mx-8 px-3 sm:px-5 lg:px-8 py-2.5 bg-[#FFF8F0]/95 backdrop-blur border-b border-[#E8D5C4] flex items-center gap-2">
         <button
           type="button"
@@ -535,8 +539,12 @@ function ItemSheet({
   const needsFollowUp = requiresFollowUp(draft.action || '');
 
   return (
-    <div className="fixed inset-0 z-[60] flex items-end justify-center">
-      <div className="absolute inset-0 bg-black/40" onClick={onClose} aria-hidden="true" />
+    // `bg-black/40` sits on the FIXED wrapper, not on the click-catcher inside
+    // it, so that globals.css:295 — `body:has(.fixed.inset-0[class*="bg-black/"])
+    // { overflow: hidden }` — actually matches and locks the page behind the
+    // sheet. On the inner div it would not.
+    <div className="fixed inset-0 z-[60] bg-black/40 flex items-end justify-center">
+      <div className="absolute inset-0" onClick={onClose} aria-hidden="true" />
       <div className="relative w-full sm:max-w-lg bg-white rounded-t-3xl sm:rounded-3xl sm:mb-6 max-h-[88vh] flex flex-col">
         <div className="px-4 pt-3 pb-2 border-b border-[#E8D5C4] flex items-start gap-2">
           <div className="min-w-0 flex-1">
