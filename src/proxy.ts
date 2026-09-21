@@ -92,6 +92,29 @@ const CSRF_REQUIRED_PREFIXES = [
   '/api/crm-calls/entertainment', // GRE "What's On" entertainment calendar CRUD (management-gated writes)
   '/api/telecmi',             // TeleCMI actions (click-to-call, backfill) — webhooks are carved out in isPublic (matched there first)
   '/api/hr',                  // HRMS module (docs/HRMS_DECISIONS.md) — one prefix covers every present and future HR mutation; HR client writes must use src/lib/api.ts or they 403 here
+  // Guest Feedback & Service Recovery — one prefix covers every present and
+  // future feedback mutation (visits, item feedback, follow-ups, revisits).
+  // Added at P1 with the schema, BEFORE any route exists, deliberately: Bill
+  // Handover shipped without its line and a POST carrying no CSRF header
+  // reached app code — measured, not theorised.
+  //
+  // ⚠️ THIS ENTRY IS SILENTLY NULLIFIED BY A BAD PATH NAME. isPublic() runs
+  // FIRST in proxy(), and it returns true for any pathname CONTAINING '/print'
+  // and for anything matching the static-asset regex. A public path returns
+  // NextResponse.next() before both the session check and the CSRF check, so a
+  // route called e.g. /api/feedback/reports/print or /api/feedback/board.json
+  // would be publicly unauthenticated AND CSRF-exempt no matter what this list
+  // says — exactly how '/api/dine-in/offline-print' below is dead code today.
+  // No feedback path may contain 'print' or end .png/.jpg/.json. Report
+  // downloads take the report key as a QUERY PARAMETER (?report=daily), never
+  // as a path segment.
+  //
+  // CSRF is not authorisation. The cookie is httpOnly:false and src/lib/api.ts
+  // reads it straight back out, so a signed-in caller holds both halves of the
+  // double-submit pair by design. This line stops a third-party site forging a
+  // write; it does nothing about WHO is signed in. That is the route's own job
+  // (canUseFeedback / isReadOnlyFeedbackUser in src/lib/feedback.ts).
+  '/api/feedback',
 ];
 
 function isPublic(pathname: string): boolean {

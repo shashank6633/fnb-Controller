@@ -85,6 +85,67 @@ export const PAGE_CATALOG: PageSection[] = [
       { path: '/dine-in/reconciliation', label: 'Reconciliation' },
     ],
   },
+  // Guest Feedback & Service Recovery. Its own section rather than four more
+  // rows under Dine-In: the people who live on these pages (GRE / Floor
+  // Manager) are not the people who live on Order Floor and Cashier, and the
+  // whole point of the module is that the GRE has READ-ONLY access to
+  // everything in that section above.
+  //
+  // ⚠️ THREE THINGS A READER MUST KNOW BEFORE EDITING THIS BLOCK.
+  //
+  // 1. THIS IS NOT THE SECURITY BOUNDARY. proxy.ts guards PAGES, NOT APIs, and
+  //    canAccessPage fails open FOUR ways (null page_access map — true for 8 of
+  //    9 users today; garbled JSON; an empty array; a prefix grant opening every
+  //    descendant) plus a fifth in proxy.ts's own `catch { /* fail open */ }`.
+  //    Every /api/feedback/* route gates itself with canUseFeedback() /
+  //    canUseFeedbackAnalytics() from src/lib/feedback.ts. These flags decide
+  //    what is VISIBLE, nothing more.
+  //
+  // 2. THE OWNER'S READ-ONLY CONSTRAINT CANNOT BE MET BY HIDING BUTTONS, and
+  //    removing a page from a GRE's map does not close a single POS endpoint.
+  //    The enforcement is isReadOnlyFeedbackUser() called inside the POS
+  //    handlers themselves (P2). Do not "simplify" this by assuming the catalog
+  //    protects anything.
+  //
+  // 3. §7 Q1 IS STILL OPEN — there is no GRE role in the database. Pages 1-3
+  //    carry NO tier flag deliberately, so that the day the owner creates the
+  //    role he grants it these three paths and nothing else changes here. The
+  //    gate is one line: GRE_ROLE_NAMES in src/lib/feedback.ts.
+  {
+    label: 'Guest Feedback',
+    pages: [
+      // Page 1 — the mobile floor board. Path is /feedback and NOT
+      // /captain/feedback even though it borrows the Captain app's look:
+      // AppShell.tsx:16 grants the chrome-free `bare` layout to anything under
+      // /captain, and putting a GRE surface inside that prefix would hand it a
+      // Captain page-access grant by prefix (canAccessPage rule 4 opens every
+      // descendant of a granted path). The layout is worth less than the gate.
+      { path: '/feedback',            label: 'Floor Feedback' },
+      // Page 2 — one order at a time, reached as /feedback/take/<orderId>.
+      // bestEntry() is longest-prefix, so the child route resolves to this
+      // entry and inherits exactly its flags.
+      { path: '/feedback/take',       label: 'Take Feedback' },
+      // Page 3 — the shift-level tracker. Floor-facing on purpose: a GRE must
+      // see their own pending list, and the fairness ruling means coverage is
+      // not a stick to hide from them.
+      { path: '/feedback/tracker',    label: 'Feedback Tracker' },
+      // Page 4 — Admin Analytics & Reports, including all EIGHT downloads
+      // (§3 puts the reports here, not on a fifth page).
+      //
+      // mgmtOnly, for the same reason /reports/sales is: it ranks NAMED STAFF
+      // (GRE/Manager Performance) and exports guest comments and contact-level
+      // recovery history in bulk. The fairness ruling makes this stricter, not
+      // looser — "the system should not judge GRE performance based on positive
+      // feedback", and a league table left open to the floor is precisely the
+      // pressure that makes a GRE stop recording complaints.
+      //
+      // mgmtOnly = admin OR role 'manager' OR is_head_chef, and it is checked
+      // BEFORE the null-map backward-compat grant in canAccessPage, so legacy
+      // full-access staff are locked out too. Widening it later is a one-word
+      // change; starting narrow is the reversible direction.
+      { path: '/feedback/analytics',  label: 'Feedback Analytics', mgmtOnly: true },
+    ],
+  },
   {
     label: 'Parties',
     pages: [

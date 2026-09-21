@@ -122,6 +122,33 @@ const navTree: NavEntry[] = [
     ],
   },
 
+  // Guest Feedback & Service Recovery.
+  //
+  // ⚠️ THIS LIST AND src/lib/page-catalog.ts ARE SEPARATE AND BOTH ARE
+  // REQUIRED. The catalog GATES a page; this tree is what actually RENDERS the
+  // nav. A page added only to the catalog is gated but invisible — that exact
+  // drift once hid eight pages including /variance-approvals and was misread
+  // for weeks as a stock bug. Every href below has a twin entry in the
+  // 'Guest Feedback' section of page-catalog.ts. Change one, change both.
+  //
+  // Visibility is filtered by canAccessPage() further down this file, so
+  // Feedback Analytics (mgmtOnly in the catalog) disappears for everyone else
+  // without needing a flag here. Do NOT hand-roll a role test in this file:
+  // the catalog is the single place tier flags live.
+  {
+    kind: "section",
+    label: "Guest Feedback",
+    icon: HeartHandshake,
+    items: [
+      { kind: "link", label: "Floor Feedback",     href: "/feedback",           icon: MessageCircle },
+      { kind: "link", label: "Take Feedback",      href: "/feedback/take",      icon: Star },
+      { kind: "link", label: "Feedback Tracker",   href: "/feedback/tracker",   icon: ClipboardList },
+      // Management-only (page-catalog mgmtOnly) — canAccessPage hides this row
+      // for everyone else, the same way it hides Idle Tables above.
+      { kind: "link", label: "Feedback Analytics", href: "/feedback/analytics", icon: BarChart3 },
+    ],
+  },
+
   // Parties — requisition-based costing model.
   // Each party event has a P&L: cost from issued materials, revenue from sales.
   {

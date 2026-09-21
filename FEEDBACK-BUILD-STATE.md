@@ -206,6 +206,40 @@ supported, clear status indicators, sticky Submit. Minimal typing.
   real columns (`bill_requested_at`, `bill_printed_at`, `COUNT(order_items)`); tables master is
   `restaurant_tables`; `roles.base_role` (not `tier`); **no GRE role exists**. P0 queued.
 
+- **2026-09-21 — P1 Lane A (schema · nav · RBAC · CSRF).** Purely additive: +281 lines, 0 deletions,
+  across `src/lib/db.ts` (the `gf_` block, last in `initializeSchema`, own try/catch),
+  `src/lib/feedback.ts` (NEW — the shared vocabulary, lifecycle rules, gate predicates and row types,
+  **zero imports**), `src/lib/page-catalog.ts`, `src/components/Sidebar.tsx`, `src/proxy.ts`.
+  - **Schema, asserted after boot** (rule 6 — errors are swallowed silently). `gf_visits` 26/26 cols,
+    `gf_item_feedback` 19/19, `gf_follow_ups` 18/18, none unexpected; 14 indexes; all three UNIQUE
+    indexes proved to BITE (second insert refused with `UNIQUE constraint failed`).
+  - **No regression:** census of the pristine snapshot vs post-boot — tables 213 → 216 (exactly the
+    three `gf_`), **0 tables vanished, 0 columns lost** across all 213 pre-existing tables,
+    `purchases=2165 raw_materials=952`, `PRAGMA integrity_check` → `ok`.
+  - **CSRF line is live** (the one Bill Handover shipped without): valid session + NO `x-csrf-token`
+    → **403**; with the double-submit pair → 404 (route not built yet, so CSRF passed). Rule-9 trap
+    demonstrated live: a hypothetical `/api/feedback/reports/print` and `/api/feedback/board.json`
+    both answered **404 with no session at all** (public!), while `/api/feedback/visits` answered
+    **401**. No feedback path may ever contain `print` or end `.json`.
+  - **RBAC proved over HTTP:** no session → all four pages 307 → `/login`; STAFF session →
+    `/feedback` 200, `/feedback/tracker` 200, `/feedback/analytics` **307 → `/?forbidden=`** (and its
+    child `/feedback/analytics/x` too); ADMIN → all 200.
+  - **Nav pairing (rule 10):** catalog and Sidebar lists are identical and in the same order —
+    `/feedback · /feedback/take · /feedback/tracker · /feedback/analytics` — and each covers a real
+    Lane B route file. `npx tsc --noEmit` exit 0, zero output. Server on port 3913 killed, port free.
+  - **§7 answers now encoded, still reversible:** Q3 recorded (`replacement_menu_item_id` +
+    `replacement_item_name`); Q2/Q4 are code-defaulted settings keys (`feedback_item_threshold` = 4,
+    `feedback_settled_grace_minutes` = 30) so an absent key means the default, never "off" — the
+    `captain_area_lock` failure mode; Q5 settled in the DDL (**Floor is `restaurant_tables.zone`;
+    there is no `floor` column**). **Q1 is the one-line swap:** `GRE_ROLE_NAMES` in
+    `src/lib/feedback.ts`, plus `isReadOnlyFeedbackUser()` — inert until the owner creates the role,
+    which is what P2 must call inside the ~13 open POS handlers.
+  - ⚠️ **ONE THING LEFT UNDONE, deliberately:** `src/app/feedback/enums.ts` (Lane B, `9a8713c`) still
+    holds a SECOND copy of the vocabulary. Its own header says it must become
+    `export * from '@/lib/feedback';`. Every wire value in `src/lib/feedback.ts` is byte-identical, so
+    the repoint is a no-op — but two lists are alive right now and only the `src/lib` one can be
+    imported server-side. **P2 must close this.**
+
 ---
 
 ## 7. OPEN DECISIONS — owner only
