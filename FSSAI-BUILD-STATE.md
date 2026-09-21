@@ -160,9 +160,9 @@ its evidence line is filled in with real command output.
 | P0 | Recon | owner's "inspect before coding" requirement | **DONE** | 7 agents, 0 died. `docs/fssai/RECON.md` = 4,607 lines (contract 1-961, raw lanes 962+). Read-only: worktree `git diff --stat` empty, live DB mtime unchanged. Corrected this file (no `unbuilt` flag) + 3 integration rows. 10 owner questions in §7 |
 | P1 | Foundation — schema + nav + RBAC + shells | §20, §24 | **DONE** | 11 agents (1 errored). 11 `fssai_` tables + 34 indexes + the app's FIRST boot assertion. 20 nav rows in BOTH files, 20 page.tsx. `npx tsc --noEmit` exit 0, zero output. Real snapshot: 205→216 tables, 0 removed, purchases still 2165, 215 columns match their CREATE text exactly. db.ts 9,561→10,625. Commits 0e7b9ec·b93ee61·5268b36·21aa4c2 |
 | P2a | Checklist engine — the API: templates/sections/questions/assignments + the run engine | §15 | **DONE** | 2 lanes + 4 adversarial probes + 1 fix round. 11 files, ~4,500 lines, commits `9a10dfd`·`5373289`·`39c9e12`·`4a6f593`·`515bda9`. **NO SCHEMA CHANGE** (`git diff c6c3f1a..HEAD` does not contain `db.ts`; zero `ALTER/CREATE TABLE/CREATE INDEX` in the diff). `npx tsc --noEmit` exit 0, zero output. `npm run build` exit 0, "✓ Compiled successfully in 33.5s", 27 FSSAI entries (7 API + 20 pages), 1 warning = the pre-existing `next.config.ts` NFT trace (present at `main`). `npm test` exit 1 at `run-tests.js` with **74 passed · 2 failed** — the identical recorded baseline; both survivors are the `kitchen`/`liquor` station sentinels, mapped in the owner's production data (HARD RULE 4 forbids changing them). The five scripts the `&&` chain never reaches all pass alone: 94 · 104 · 161 · 198 · 380 = 937. Fix round closed 6 measured defects incl. two HIGH (a recorded FAILURE erased from the verdict by a mid-run retire; a Yes/No answered with the word "yes" frozen as a failure) — 34 pure assertions + 5 HTTP repro scripts, 0 regressions, record drifted after **0 of 10** template edits. DB restored: purchases 2165, all `fssai_` tables back to their pre-run counts |
-| P2b | Checklist engine — the SCREENS: settings hub, checklist library, the builder (sections · questions · the eight types · reorder · preview) | §15 | PENDING | **NOT BUILT.** 19 of the 20 `/fssai` pages are still P1 `PhaseShell` placeholders and `src/app/fssai/settings/checklists/[id]/page.tsx` does not exist, so a checklist can be authored over the API but **not on screen**. `grep -rln "api/fssai" src/app/fssai` → one hit, and it is the comment "Deliberately NO fetch". The API contract the screens must use is in the §6 log entry for 2026-09-17/18 |
-| P3 | Mobile runner — run, evidence, signature, submit | §22 | PENDING | Not started. The run ENGINE exists (`src/app/api/fssai/runs/route.ts` — open/answer/submit/takeover/void); the phone experience, the evidence/photo write route, the signature UX and the verification queue do not |
-| **RG** | **🛑 REVIEW GATE — STOP. Owner reviews P0–P3.** | — | **BLOCKING** | not approved |
+| P2b | Checklist engine — the SCREENS: settings hub, checklist library, the builder (sections · questions · the eight types · reorder · preview) | §15 | **PARTIAL** | **BUILT — commits `4148cb1` (library) · `6b406f0` (hub) · `7808b43` (builder) · `0e61b6f`·`ad003b6`·`fb42540` (fix rounds).** Measured 2026-09-21 by the gate lane, not taken on trust: `settings/page.tsx` 616 · `checklists/page.tsx` 1,671 · `settings/checklists/[id]/page.tsx` **3,518** (the row above said it "does not exist") · `grep -rln "api/fssai" src/app/fssai` → **7**, not one. 18 of 24 pages remain P1 placeholders — that is P4–P11, behind RG. Catalog/sidebar diff → **IDENTICAL, no drift** (21/21). **PARTIAL, not DONE, for one reason: no browser ever rendered these screens.** Both lanes hit the same wall and said so; every UI claim is code-read + API-replay. Two HIGH defects were found by exercising the engine and FIXED (the preview painted the FAILING answer green whenever pass="no" — the shape of every pest question; retiring a section did NOT retire its questions, so a critical question inside a "switched-off" section still failed the round). Open: **L-2** preview stepper starts at 0 not target, **L-3** the Critical chip's consequence is hover-only on a phone. Gates on this commit: `npx tsc --noEmit` exit 0 zero output · `npx next build` exit 0, "✓ Compiled successfully in 30.9s", 289/289 static pages, 34 FSSAI entries · `npm test` exit 1 **74 passed · 2 failed** (baseline; the 2 are the kitchen/liquor station sentinels in production data, HARD RULE 4) |
+| P3 | Mobile runner — run, evidence, signature, submit | §22 | **PARTIAL** | **BUILT — Lane A `9c453bb`·`efd6103`·`acd6766` (picker 849 + runner 1,683 + `RunnerUI.tsx`); Lane B `4a70cff`·`ecf1948`·`3ffac34`·`d1e6590`·`5d5f459`·`6aee190` (evidence + sign + approvals routes, `/fssai/verification` 952).** **NO SCHEMA CHANGE.** HARD RULE 14 SETTLED: photos stay in-row as TEXT data URIs, 250 KB client target / **400 KB server ceiling** / 1200 px / 4 per answer / 24 per run — proved with a real 14.18 MB 12 MP photograph shrinking to 165 KB ≈ 22% of production's ~1 MB nginx limit. The evidence route makes "Photo: Always" satisfiable at last (P2a could only insert the row by hand). Signing became an ACT with a SHA-256 over every answer + photograph; verifying **cannot change a record** (proved by a tampering POST — fingerprint byte-identical either side). **PARTIAL for two reasons: (1) an OPEN HIGH — `FSSAI_REQUIRE_EXPLICIT_SIGNATURE = false` (`src/lib/fssai.ts:1392`) still lets submit write a signature nobody asked for, and its stated precondition has EXPIRED (the runner now does send `sign:true`, `run/[id]/page.tsx:585`); `signMode` is hardcoded `'on_submit'` (`runs/route.ts:749`) so a deliberate signature is recorded as the un-asked kind. Two-line fix, deliberately not applied — it is an attestation policy (RG-REPORT §7 Q17). (2) no browser ever rendered the runner: the 390px fit is a static audit, and the offline queue's retry loop is unexercised.** Also not built: corrective action on failure (`raise_ca_on_fail` stored, **0** readers in the engine; `fssai_corrective_actions` written by no route), the equipment/area registers (`fssai_equipment` 0 rows), any due/overdue reminder. Gates: identical to P2b's row above, run on the same commit |
+| **RG** | **🛑 REVIEW GATE — STOP. Owner reviews P0–P3.** | — | **BLOCKING — report delivered, awaiting his word** | **`docs/fssai/RG-REPORT.md`** (2026-09-21). Carries all five things §4 requires: the phone URL + tier table, a runnable end-to-end script (incl. the fact that the DB holds NO runnable checklist — one draft test row `ZZ-P2B-COLDROOM`, 0 questions — so step 0 authors one), the three real gate numbers, what the runner does NOT do, and 20 open decisions each with options + trade-offs + a recommendation. **Not approved.** P4–P11 stay `HELD` |
 | P4 | Receiving QC · Temperature Logs · Cold Room | §2, §4, §5 | HELD | behind RG |
 | P5 | FIFO/FEFO & Expiry · Oil Quality · Water & Ice | §3, §12, §13 | HELD | behind RG |
 | P6 | Pest Control · Documents & Certificates | §7, §17 | HELD | behind RG |
@@ -244,11 +244,18 @@ top costs far more than fixing it now. He is reviewing the foundation, not the f
 
 1. `cd /Users/shashankreddy/Desktop/Claude/fnb-fssai` — **never** the live repo.
 2. Read this file top to bottom. §0 and §1 bind you.
-3. **CHECK THE REVIEW GATE FIRST.** If P0–P3 are all `DONE` and the **RG** row does not say
-   `APPROVED`, **STOP IMMEDIATELY**. Run no fleet. Start no phase. End your turn by reporting that
-   the build is complete through P3 and waiting on the owner's review, and restate what he needs to
-   look at. A phase started behind a blocking gate is the single worst failure this build can have —
-   it spends hours on foundations he may want changed.
+3. **CHECK THE REVIEW GATE FIRST.** If P0–P3 are all `DONE` **or `PARTIAL`** and the **RG** row does
+   not say `APPROVED`, **STOP IMMEDIATELY**. Run no fleet. Start no phase. End your turn by reporting
+   that the build is through P3 and waiting on the owner's review, and restate what he needs to look
+   at — point him at `docs/fssai/RG-REPORT.md`. A phase started behind a blocking gate is the single
+   worst failure this build can have: it spends hours on foundations he may want changed.
+   > ⚠️ **`PARTIAL` DOES NOT MEAN "GO AND FINISH IT" (added 2026-09-21).** P2b and P3 are `PARTIAL`
+   > because the only thing that can close them is the owner opening the module on his phone — no
+   > agent in this environment can render a screen, which is exactly what those rows are missing.
+   > There is no `PENDING` row left. **Rebuilding a `PARTIAL` phase is forbidden while RG is
+   > blocking**: two lanes already discovered their own work was built before they started and
+   > rightly switched to verifying instead of rebuilding. The one item a run MAY act on is the open
+   > HIGH in §7 Q17 — **and only if the owner has answered it.**
 4. Otherwise, find the first phase in §4 whose status is `PENDING`. A phase marked `HELD` is behind
    the review gate and is not available to you, whatever its position in the table.
 5. If a phase is `IN PROGRESS`, check whether its workflow is still running before starting another —
@@ -372,6 +379,56 @@ top costs far more than fixing it now. He is reviewing the foundation, not the f
      turning it on in an isolated copy: `signature_required` and `signature_stale` both fire, and
      `{sign:true}` submits in one tap. To tighten: add `sign: true` to the runner's submit body, then
      flip the constant.
+- **2026-09-21** — **THE REVIEW GATE REPORT IS WRITTEN, AND THE PHASE TABLE ABOVE IS NOW TRUE.**
+  `docs/fssai/RG-REPORT.md`. Four lanes had each declined to edit the phase table (§5.7 makes it the
+  orchestrator's, and they were committing into the same worktree concurrently), so P2b said "NOT
+  BUILT" and P3 said "Not started" for three days while both were in fact built. **Both rows are now
+  `PARTIAL`** — not `DONE`, and deliberately so.
+  1. **WHY NOT `DONE`.** DONE requires evidence that was measured. It was not, for the one thing this
+     gate exists to judge: **no browser has ever rendered a single FSSAI screen.** All four lanes hit
+     the same wall (no puppeteer/playwright/jsdom in `node_modules`; installing one would write
+     through the HARDLINKED `node_modules` into the owner's tree; the Browser pane was forbidden for
+     that fleet) and all four said so honestly in their reports. Every server-side claim was
+     executed over HTTP; every screen claim is code-read. And P3 carries an **open HIGH**.
+  2. **THE OPEN HIGH, NAMED SO NOBODY INHERITS IT AS SETTLED.**
+     `FSSAI_REQUIRE_EXPLICIT_SIGNATURE = false` (`src/lib/fssai.ts:1392`) — submit still writes a
+     signature nobody asked for, and `signMode` is hardcoded `'on_submit'` (`runs/route.ts:749`) so a
+     signature the person deliberately gave is recorded as the kind the server wrote unasked. **The
+     flag's own comment still says "because the runner does not send sign:true yet" — that is FALSE
+     as of `9c453bb`** (`run/[id]/page.tsx:585` sends it). Two-line fix, both paths already proved.
+     NOT applied here: it changes behaviour on the exact build the owner is about to judge, and it is
+     an attestation policy, not an engineering detail. RG-REPORT §7 Q17.
+  3. **GATES RE-RUN FIRST-HAND ON `6aee190`, not copied from a lane report:** `npx tsc --noEmit`
+     exit 0 zero output · `npx next build` exit 0 "✓ Compiled successfully in 30.9s", 289/289 static
+     pages, 34 FSSAI entries, 1 warning (the pre-existing `next.config.ts` NFT trace) · `npm test`
+     exit 1 **74 passed · 2 failed** (the baseline sentinels). Catalog/sidebar `diff` →
+     **IDENTICAL**, 21/21. **0** FSSAI paths contain `print`. The DB was opened **read-only only**:
+     purchases 2165, 216 tables, users 9 — untouched.
+     ⚠️ My first `next build` returned exit 1 — *"Another next build process is already running"*. A
+     concurrent lane held the lock. I waited for it rather than killing it; the exit-0 above is my
+     own re-run. **A build exit 1 in this worktree is more likely a lock than a break — check
+     `pgrep -f "next build"` before believing it.**
+  4. **THE THING THAT WOULD HAVE WASTED HIS FIRST TEN MINUTES.** The worktree DB contains **no
+     runnable checklist**: `fssai_templates` = 1 and it is the leftover test row `ZZ-P2B-COLDROOM`,
+     status *draft*, **0 questions**, 0 sections, 0 assignments, 0 runs. The lanes correctly cleaned
+     up after themselves and the result is an empty module. The report opens with this and gives a
+     3-minute authoring script. **I did not seed one** — a sibling lane was live in this worktree at
+     the time (its own `next dev` on 3976) and two agents seeding the same demo would have produced
+     duplicates in his data.
+  5. **FOUR NEW OPEN DECISIONS ADDED TO §7** (Q17 signature ceremony · Q18 person-target keyed on
+     email · Q19 the leftover test row · Q20 what the runner may promise about a lost signal). Also
+     noted: **§7 has two different questions both numbered Q11** (the `getDb()` rewrite and the
+     "screens print measured gaps" question). The report disambiguates them as **Q11-A** and
+     **Q11-B**; the numbering here is left alone so no scheduled run is confused by a renumber.
+  6. **STILL NOT BUILT, and the report says so plainly:** corrective action on a failed answer
+     (`raise_ca_on_fail` is stored and read by **nothing** in the engine — measured 0 hits in
+     `runs/route.ts`; `fssai_corrective_actions` is written by no route), the equipment/area
+     registers (`fssai_equipment` 0 rows, so an equipment-targeted checklist can only run if an admin
+     types the unit onto the schedule), any due/overdue reminder, and **offline**: `public/sw.js`
+     deliberately intercepts nothing — *"Let the network handle everything"* — so a round already
+     open survives a signal drop via the `localStorage` queue, but a reload with no signal loads
+     nothing at all (RECON §10 R8 — do NOT re-enable caching to "fix" this; it resurrects the
+     stale-chunk bug the disabler exists to prevent).
 - **2026-09-17** — P1 fix round. `npm test` went `71 passed · 3 failed` → `74 passed · 2 failed`; the
   two survivors are **not code and not FSSAI's** — they assert that the `kitchen` and `liquor`
   station sentinels resolve to NO department, and both are mapped in the owner's production data
@@ -413,6 +470,10 @@ later phase cite an earlier phase's default as precedent.
 | **Q14** | **A check FAILED, the problem was fixed, and the same shift needs re-checking.** The slot is locked by the failed record, so the only path today is a manager VOIDING a true observation and filing a fresh one — and the file then reads "voided fail + fresh pass" instead of "failed, corrected, re-checked". Raised by the P2 probes; it must be settled **before P8 seeds the temperature checklists**. | Four options in §7 detail below. **Recommend (c): the fix is a CORRECTIVE ACTION against the failed record (P7), verified there — no second record of the same round** — with (b)'s linked re-check where a physical re-measurement is genuinely needed. Today's behaviour (a) is unchanged and the refusal now says the record FAILED and that a manager may void it if it was a mistake. | — |
 | **Q15** | **Should a record freeze the checklist's TITLE in a column?** The fix round froze the title, the code, both versions and the whole question set into a `fssai_audit_log` row (`action='snapshot'`) at submit — deliberately, because the alternative is a migration on a table that will hold audit history. | **Recommend (a): keep the snapshot** until P9 measures a real report; then consider (c) — columns for the two hot fields, snapshot for the sheet. Options in detail below. | — |
 | **Q16** | **A checklist that is run "against nothing in particular", every shift, means ONE person files it for the whole restaurant** — whoever starts it first. Correct for one round per restaurant, wrong for "everyone does this". | **Recommend (a): warn, do not refuse** — built: `config_warnings` is returned on create, edit and publish and must be shown on the builder screen. Options in detail below. | — |
+| **Q17** | **🔴 Should an UNSIGNED check be refused? (the open HIGH, defect H-1.)** `FSSAI_REQUIRE_EXPLICIT_SIGNATURE = false` (`src/lib/fssai.ts:1392`) so submit still signs when nobody asked, and `signMode` is hardcoded `'on_submit'` (`runs/route.ts:749`) so a deliberate signature is labelled as the unasked kind. The flag's stated precondition — *"the runner does not send sign:true yet"* — **expired** at `9c453bb`. | (a) flip the flag on **and** fix the mode label · (b) fix the **mode label now**, flip the refusal after he has run one check on the phone · (c) leave both (every record keeps a signature nobody gave) · (d) go further — a separate Sign screen before submit. **Recommend (b) now, (a) the moment the runner has been used once**: the evidence is already strong (who, when, a digest that breaks on any later edit); it is the ceremony that is loose, and tightening a path nobody has pressed is the only reason to wait. | — |
+| **Q18** | **A person-targeted round is filed against the user's EMAIL**, because `hr_employees` is empty (0 rows) and email is the only stable staff key this app has (§3). | (a) keep email · (b) switch to `users.id` now · (c) wait for HR to be populated, then key on the employee record. **Recommend (a) now, (c) when HR is populated** — the two keys would not collide and existing rounds keep theirs. Flagged so it is a decision, not a discovery. | — |
+| **Q19** | **A leftover test checklist sits in his data** — `ZZ-P2B-COLDROOM`, *"Cold room temperature — closing round"*, **draft**, 0 questions. It is the only row in `fssai_templates`. | (a) delete it (`DELETE FROM fssai_templates WHERE code='ZZ-P2B-COLDROOM';`) · (b) leave it, a harmless draft · (c) finish it into the demo checklist. **Recommend (a) or (c).** Left in place by the gate lane so nothing in his data changed without his say-so. | — |
+| **Q20** | **What may the runner promise about a lost signal?** `public/sw.js` deliberately intercepts nothing app-wide. A round already on screen survives (answers queue in `localStorage`, submit refuses while anything is unsent); a reload with no signal loads nothing. | (a) say "needs a connection", keep the in-page queue (today) · (b) re-enable caching for FSSAI routes only · (c) a proper offline shell for the runner · (d) accept it — the venue's Wi-Fi is the answer. **Recommend (a).** (b)/(c) resurrect the stale-chunk bug the disabler exists to prevent (RECON §10 R8) and are far bigger than they look — worth it only if checks are really run where there is no signal. | — |
 
 ### Q14 — a failed check, a repair, and the re-check that has nowhere to go
 
