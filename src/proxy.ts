@@ -82,6 +82,17 @@ const CSRF_REQUIRED_PREFIXES = [
   '/api/dine-in/service-requests', // Captain accept/complete of table service requests
   '/api/dine-in/kds',         // KDS bump (the SSE stream is GET, exempt)
   '/api/dine-in/offline-print', // print-station config + print-job journal
+  // The counter-PC dispatcher's liveness beat. It had no prefix here because it
+  // never reached this step: isPublic()'s '/print' substring matched it first, so
+  // it was publicly unauthenticated AND CSRF-exempt. Closing that hole makes it
+  // authed, but WITHOUT this line it would stay forgeable by a cross-site page
+  // driving a signed-in staff browser — and a forged beat marks a DEAD dispatcher
+  // alive, which silences the watchdog banner while KOTs quietly stop printing.
+  // Costs the real client nothing: its only caller (src/app/print/agent/page.tsx)
+  // posts through src/lib/api.ts, which injects X-CSRF-Token, and /api/auth/login
+  // issues fnb_csrf with the SAME maxAge as fnb_session — so any browser able to
+  // authenticate necessarily holds the CSRF cookie too.
+  '/api/dine-in/print-agent',  // print-agent heartbeat (status is GET, exempt)
   '/api/dine-in/cashier-presence', // which cashier holds which floor — holding a floor decides who may settle there
   '/api/tables',              // QR standee token generation (admin)
   '/api/crm',                 // AKAN CRM (chat/training/quiz/settings) — guest-quiz is carved out in isPublic
@@ -92,6 +103,29 @@ const CSRF_REQUIRED_PREFIXES = [
   '/api/crm-calls/entertainment', // GRE "What's On" entertainment calendar CRUD (management-gated writes)
   '/api/telecmi',             // TeleCMI actions (click-to-call, backfill) — webhooks are carved out in isPublic (matched there first)
   '/api/hr',                  // HRMS module (docs/HRMS_DECISIONS.md) — one prefix covers every present and future HR mutation; HR client writes must use src/lib/api.ts or they 403 here
+];
+
+// Print PAGES that must render without bouncing through /login — the four paths
+// the old `pathname.includes('/print')` test actually existed for, now spelled out
+// and ANCHORED. A substring is the wrong tool for this job twice over: it caught
+// every API route with "print" anywhere in it (see the hard floor in isPublic),
+// and it silently adopts the next page anyone names with the word in it —
+// '/settings/printer-fleet' or '/reports/blueprint' would become public pages
+// nobody chose to publish. An explicit list can only ever match what it lists.
+//
+// These four stay public, exactly as before. That is deliberate and load-bearing:
+// isPublic() returns before the page_access check in proxy() step 2b, so '/print/agent'
+// — the counter PC's KOT dispatcher — is reachable by whatever account the counter
+// happens to be signed in as. Several seeded roles (Captain, Cashier, Head Chef,
+// Store Manager, Staff) do NOT carry a '/print/agent' grant, so gating this path
+// would redirect the counter away from the dispatcher and stop KOTs mid-service.
+// Tightening page-level access here needs the production role map checked first;
+// it is not part of closing the API hole, and the two must not be bundled.
+const PUBLIC_PRINT_PAGES: RegExp[] = [
+  /^\/print\/agent\/?$/,                   // counter-PC KOT dispatcher (see note above)
+  /^\/settings\/print-design\/?$/,         // bill/KOT layout designer
+  /^\/grn\/print\/[^/]+\/?$/,              // GRN print view
+  /^\/purchase-orders\/[^/]+\/print\/?$/,  // PO print view — the original reason for the carve-out
 ];
 
 function isPublic(pathname: string): boolean {
@@ -122,7 +156,39 @@ function isPublic(pathname: string): boolean {
   // available — so POST is public + CSRF-exempt. It's rate-limited, size-capped
   // and write-only; the GET/PATCH admin console self-checks role==='admin'.
   if (pathname === '/api/error-report') return true;
-  if (pathname.includes('/print')) return true;            // PO print pages render via cookie if present
+
+  // ───────────────────────── HARD FLOOR — /api/ stops here ─────────────────────────
+  // Every deliberately-public API route is named ABOVE this line, one by one.
+  // Everything BELOW matches by PATTERN — print pages, static files, file
+  // extensions — and a pattern must never be able to unauthenticate an API route.
+  //
+  // Why this is a security boundary and not just tidiness: proxy() consults
+  // isPublic() BEFORE its "auth required" step (2), before the session-validity
+  // check (2c) and before the CSRF step (3). So anything that matched a pattern
+  // down there was publicly readable AND exempt from CSRF — both at once.
+  //
+  // Two patterns below were doing exactly that:
+  //   · `pathname.includes('/print')` made 7 API routes public, among them
+  //     POST /api/dine-in/orders/[id]/print-bill (stamps orders.bill_printed_at and
+  //     pushes a full tax invoice to the counter printer), POST
+  //     /api/dine-in/print-agent/heartbeat (falsifies the KOT watchdog) and POST
+  //     /api/kitchen-production/[id]/print-confirm (fakes production print history).
+  //   · The file-extension regex is not limited to static files: Next's dynamic
+  //     segments match any non-slash string, so /api/<anything>/<id>.json ends in
+  //     ".json" and skipped both steps too. No API route and no caller in this repo
+  //     ends a path in one of those extensions, so nothing legitimate used it.
+  //
+  // Closing both costs printing NOTHING. All 7 print routes already open with
+  // `getCurrentUser()` and 401 without a session, so no cookie-less caller can have
+  // been relying on them — the proxy now returns the same 401 the route already did.
+  // The print bridge never calls the app at all (zero outbound fetches); the only
+  // genuinely cookie-less caller is the PowerShell installer pulling
+  // /print-bridge.mjs, /print-bridge.bat and /install-bridge-service.ps1 — all
+  // root-level static files, not /api/, so the extension rule still serves them.
+  if (pathname.startsWith('/api/')) return false;
+  // ─────────────────────────────────────────────────────────────────────────────────
+
+  if (PUBLIC_PRINT_PAGES.some(re => re.test(pathname))) return true;  // print pages render via cookie if present
   if (pathname.startsWith('/_next')) return true;
   if (pathname.startsWith('/favicon')) return true;
   // App downloads (the AKAN Captain APK): staff install it on fresh phones that
