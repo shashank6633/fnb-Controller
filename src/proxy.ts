@@ -256,6 +256,33 @@ export function proxy(req: NextRequest) {
         // that rule for anything else.
         role_is_active: row.role_id ? !!row.role_active : null,
       } : undefined;
+      // ── Guest Feedback ONLY: an unresolved session is a REFUSAL, not a pass.
+      // Measured 2026-09-22 on this branch, port 3924: with a made-up cookie
+      // value (`fnb_session=zzgc-NO-SUCH-TOKEN`) all four feedback pages
+      // answered **200** and rendered — including /feedback/analytics, which is
+      // management-only. The SELECT above returns no row for a forged token, an
+      // EXPIRED session or a DEACTIVATED user, `user` is then `undefined`, and
+      // the `user && …` guard on the next line skips the whole page gate. The
+      // API rail was never fooled (401 every time), so nothing leaked today —
+      // but the page shell, the full nav and every future server-rendered
+      // number on Page 4 did render for someone holding no valid session at
+      // all, and the module's own refusal never ran.
+      //
+      // ⚠️ THE SAME HOLE IS APP-WIDE AND IS **NOT** FIXED HERE. The same forged
+      // cookie also returns 200 on /settings/errors (adminOnly), /customers
+      // (PII), /reports/sales, /settings/roles, /variance-approvals and
+      // /cashier. That is shipped behaviour on every page in the app and
+      // closing it belongs to the owner, not to this module's fleet — a
+      // one-word change to the guard below would alter what happens to every
+      // page request in the product. So this branch is anchored to
+      // isFeedbackPath() and can change nothing outside /feedback*.
+      if (!user && isFeedbackPath(pathname)) {
+        const d = feedbackAccess(null, { analytics: isFeedbackAnalyticsPath(pathname) });
+        return new NextResponse(feedbackDeniedPage(d.headline, d.remedy), {
+          status: 403,
+          headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' },
+        });
+      }
       if (user && !canAccessPage(pathname, user)) {
         // ── Guest Feedback: explain, don't bounce. ────────────────────────────
         // Everywhere else a blocked page redirects to the user's first allowed
@@ -270,7 +297,32 @@ export function proxy(req: NextRequest) {
         // page's behaviour changes.
         if (isFeedbackPath(pathname)) {
           const d = feedbackAccess(user, { analytics: isFeedbackAnalyticsPath(pathname) });
-          return new NextResponse(feedbackDeniedPage(d.headline, d.remedy), {
+          // ⚠️ THE GATE CAN SAY YES WHILE THE PAGE MAP SAYS NO, and when it did
+          // this card rendered EMPTY. `feedbackAccess()` returns
+          // `headline: '', remedy: ''` for an ALLOWED decision, so an assigned
+          // GRE — or a real Floor Manager — whose role carries an explicit
+          // `page_access` array without "/feedback" got a blank white card
+          // reading only "Back to the app". Measured on this branch: the
+          // production `Floor Manager` row's page_access is
+          // ["/","/dine-in/floor",…,"/dine-in/reservations"] with no feedback
+          // entry, and that login answered `<h1></h1><p></p>` on all four
+          // pages while GET /api/feedback/floor answered 200. The two gates
+          // genuinely disagree — canAccessPage is honouring the owner's
+          // per-role grant — and the ONE screen built to explain a refusal was
+          // the one screen that said nothing. It now names the real remedy,
+          // which is an owner action in Settings → Roles, not a code change.
+          const [headline, remedy] = d.allowed
+            ? [
+              'This login may use Guest Feedback, but the page is not in its role\'s page list.',
+              `The Guest Feedback gate accepted this login${d.scope === 'gre' ? ' as a GRE' : ' as management'}`
+              + ` — GET /api/feedback/* answers normally — but the assigned role's PAGE LIST does not`
+              + ` include "${pathname}", so the page itself is closed. An administrator should open`
+              + ` Settings → Roles, edit this role, and tick Floor Feedback, Take Feedback and`
+              + ` Feedback Tracker (Feedback Analytics is management-only). A role whose page list is`
+              + ` left empty inherits every page and needs no change.`,
+            ]
+            : [d.headline, d.remedy];
+          return new NextResponse(feedbackDeniedPage(headline, remedy), {
             status: 403,
             headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' },
           });
