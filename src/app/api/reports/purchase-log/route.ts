@@ -5,6 +5,14 @@ import {
   type PurchaseLogRow,
   type PurchaseLogSourceMoney,
 } from '@/lib/purchase-log';
+// TAX ACTUALLY CHARGED — the owner's two columns, GST only, on this TRANSACTION
+// report. The arithmetic and the blank-not-zero rule live in ONE module so this
+// file and the screen that renders the same rows cannot round differently. See
+// src/lib/tax-applied.ts for why cess is NOT in here (different taxable base).
+import {
+  TAX_VALUE_CSV_HEADER, TAX_PERCENT_CSV_HEADER,
+  gstValue, taxAppliedPercent, taxCsvNumber,
+} from '@/lib/tax-applied';
 
 /* ══════════════════════════════════════════════════════════════════════════
  * PURCHASE LOG — GET /api/reports/purchase-log   (management only)
@@ -174,6 +182,17 @@ const COLUMNS: { header: string; cell: (r: PurchaseLogRow) => unknown; numeric?:
   { header: 'MRP Round Off INR (recorded only)',        cell: r => r.mrp_round_off, numeric: true },
   { header: 'Link Key (ties a GRN line to the purchase row it created)', cell: r => r.link_key },
   { header: 'Notes',                       cell: r => r.notes },
+  // ── THE OWNER'S TWO TAX COLUMNS, APPENDED LAST ─────────────────────────────
+  // Appended, never inserted: every column above is already pointed at by a
+  // saved sheet, and colAt() resolves by header text so nothing here shifts a
+  // total into the wrong column either. Both are DERIVED from the CGST and SGST
+  // columns above, so they sit after the arithmetic rather than inside it — a
+  // reader adding the money columns across the row must not count GST twice.
+  // Blank, never 0, when the line recorded no GST: a PO line has no charge
+  // columns at all, and on the tax-inclusive import rows the tax was never
+  // split out, so "no GST recorded" is the only supportable statement.
+  { header: TAX_VALUE_CSV_HEADER,   cell: r => taxCsvNumber(gstValue(r)),          numeric: true },
+  { header: TAX_PERCENT_CSV_HEADER, cell: r => taxCsvNumber(taxAppliedPercent(r)), numeric: true },
 ];
 
 /**
@@ -187,6 +206,10 @@ const COLUMNS: { header: string; cell: (r: PurchaseLogRow) => unknown; numeric?:
 const colAt = (headerPrefix: string) => COLUMNS.findIndex(c => c.header.startsWith(headerPrefix));
 const VALUE_COL = colAt('Value (');
 const TOTAL_COL = colAt('Total Amount (');
+// The two tax columns, located the same way. A source's totals row puts Sigma(GST)
+// under the rupee column and the money-weighted rate under the percentage one.
+const TAX_VALUE_COL = colAt('Tax Value INR');
+const TAX_PCT_COL = colAt('Tax % Applied');
 
 /**
  * A full-width CSV row: `label` in the Source column, plus any number of figures
@@ -234,6 +257,11 @@ function sourceTotalsRow(label: string, money: PurchaseLogSourceMoney): string {
   const figures: Array<[number, number | null | undefined]> = [
     [VALUE_COL, money.goods_value],
     [TOTAL_COL, money.bill_amount],
+    // Sigma(CGST+SGST) for the source, and Sigma(GST) / Sigma(taxed base) as the rate
+    // — money-weighted, computed by the SAME helper the per-line cells use, and
+    // blank (never 0) when the source recorded no GST at all.
+    [TAX_VALUE_COL, money.tax_cgst_sgst],
+    [TAX_PCT_COL, taxAppliedPercent(money)],
   ];
   for (const c of CHARGE_TOTAL_COLS) {
     const v = money[c.key];

@@ -72,6 +72,19 @@ import {
   fmtSignedINR, r2,
   type PurchaseChargeRow, type PurchaseChargeSums,
 } from '@/lib/purchase-charges';
+/**
+ * TAX ACTUALLY CHARGED — the owner's "Tax Value" and "Tax % Applied", GST only,
+ * on this TRANSACTION report and on no stock-balance surface. The arithmetic,
+ * the blank-not-zero rule and the 2-decimal formatting live in ONE module so
+ * this screen, its CSV, the purchase log, the bill summary and the GRN inward
+ * register cannot drift into five roundings. See src/lib/tax-applied.ts for why
+ * the base is the post-discount subtotal of the GST-BEARING lines only.
+ */
+import {
+  TAX_VALUE_LABEL, TAX_PERCENT_LABEL, TAX_VALUE_TITLE, TAX_PERCENT_TITLE,
+  TAX_VALUE_CSV_HEADER, TAX_PERCENT_CSV_HEADER,
+  gstValue, taxAppliedPercent, fmtTaxPercent, taxCsvNumber, taxAppliedNote,
+} from '@/lib/tax-applied';
 import {
   ShoppingCart, TrendingUp, Building2, Package, AlertTriangle, Download, CalendarDays,
   ScrollText, Info, Loader2, BarChart3, Sigma, Receipt, Truck,
@@ -152,9 +165,15 @@ interface Report {
     day_count: number; emergency_spend: number; emergency_count: number;
     count?: number; po_receipt_rows?: number;
     grn_sourced_rows?: number; unpaired_mirror_rows?: number;
+    /** The "Tax % Applied (GST)" base: post-discount subtotal of the GST-bearing
+     *  lines only, and how many lines that was. See src/lib/tax-applied.ts. */
+    taxed_bill_value?: number; taxed_lines?: number;
   };
   by_vendor: Row[]; by_category: Row[]; by_super_category: Row[]; by_month: Row[]; by_payment_mode: Row[];
-  by_item: (PurchaseChargeRow & { material_name: string; unlinked?: number; category: string; unit: string; qty: number; spend: number; count: number; avg_rate: number; last_date: string })[];
+  // taxed_bill_value / taxed_lines ride on every aggregate row the route
+  // returns — the "Tax % Applied (GST)" base and its line count. Declared here
+  // because this row type, unlike Row, has no index signature.
+  by_item: (PurchaseChargeRow & { material_name: string; unlinked?: number; category: string; unit: string; qty: number; spend: number; count: number; avg_rate: number; last_date: string; taxed_bill_value?: number; taxed_lines?: number })[];
   vendors: string[]; categories: string[];
   reconciliation?: Reconciliation;
   bill_identity?: BillIdentity;
@@ -239,6 +258,15 @@ interface SourceMoney {
   goods_value_tax_suspect: number;
   /** Lines behind goods_value_tax_suspect — value ≠ qty × rate (2dp). */
   goods_value_tax_suspect_lines: number;
+  /**
+   * The "Tax % Applied (GST)" base for this source — Σ(value − discount) over
+   * the lines that CARRIED GST — and how many lines that was. Restricted to the
+   * taxed lines because 2,158 of 2,165 PURCHASE lines record no GST, so a rate
+   * over the whole source would print 0.01% for an 18% bill. See
+   * src/lib/tax-applied.ts and PurchaseLogSourceMoney.
+   */
+  taxed_bill_value: number;
+  taxed_lines: number;
 }
 
 interface LogResponse {
@@ -603,6 +631,17 @@ export default function PurchaseReportPage() {
 
   /** Charge totals over the item rows currently listed (search-filtered). */
   const itemTotals = useMemo(() => chargeTotals(items), [items]);
+  /**
+   * The same rows' TAX footer — Σ(cgst), Σ(sgst) and Σ(taxed base), so the
+   * period rate is money-weighted rather than an average of the rows' own
+   * percentages. Same shape the charge breakdown's footer uses.
+   */
+  const itemTaxTotals = useMemo(() => ({
+    cgst: itemTotals.cgst, sgst: itemTotals.sgst,
+    taxed_bill_value: r2(items.reduce((n, r) => n + (Number((r as any).taxed_bill_value) || 0), 0)),
+    taxed_lines: items.reduce((n, r) => n + (Number((r as any).taxed_lines) || 0), 0),
+    count: items.reduce((n, r) => n + (Number(r.count) || 0), 0),
+  }), [items, itemTotals]);
 
   /**
    * ══ THE PRESETS — WIDEST FIRST, AND EVERY ONE PRINTS THE WINDOW IT APPLIES ══
@@ -686,10 +725,28 @@ export default function PurchaseReportPage() {
       rows: data?.by_payment_mode || [], file: `purchases-by-payment_${from}_${to}.csv`, head: ['Payment Mode', 'Spend', 'Purchases'] },
   ]), [data, from, to]);
 
-  /** One export path for a dimension, whichever button is pressed. */
+  /**
+   * One export path for a dimension, whichever button is pressed.
+   *
+   * THE TWO TAX COLUMNS ARE APPENDED LAST — after the charge block's own note
+   * column — for the reason src/lib/purchase-charges.ts states about every
+   * column it appends: a saved spreadsheet or a formula pointing at column D of
+   * last month's file keeps working only if nothing that already existed moves.
+   * They are also DERIVED, so they belong after the arithmetic they are derived
+   * from (Subtotal − Discount + charges = Grand Total) rather than inside it,
+   * where a reader adding the money columns across a row would count GST twice.
+   *
+   * Both cells come from the SAME two functions the screen renders, so the file
+   * and the table are the same figure to the paisa and to the same 2 decimals.
+   */
   const exportBreakdown = useCallback((b: BreakdownSpec) => {
-    downloadCsv(b.file, appendChargeCsvHeader(b.head),
-      b.rows.map(r => appendChargeCsvRow([r[b.keyName], r.spend, r.count], r)));
+    downloadCsv(b.file,
+      [...appendChargeCsvHeader(b.head), TAX_VALUE_CSV_HEADER, TAX_PERCENT_CSV_HEADER],
+      b.rows.map(r => [
+        ...appendChargeCsvRow([r[b.keyName], r.spend, r.count], r),
+        taxCsvNumber(gstValue(r)),
+        taxCsvNumber(taxAppliedPercent(r)),
+      ]));
   }, []);
 
   return (
@@ -918,9 +975,18 @@ export default function PurchaseReportPage() {
                         <option value="spend">Sort: Spend</option><option value="qty">Sort: Qty</option>
                         <option value="count">Sort: Purchases</option><option value="avg">Sort: Avg rate</option><option value="name">Sort: Name</option>
                       </select>
+                      {/* The two tax columns are APPENDED here for the same reason
+                          they are on every other export on this page: nothing that
+                          already had a column position moves, and a derived figure
+                          sits after the arithmetic it is derived from. */}
                       <button onClick={() => downloadCsv(`purchase-report-itemwise_${from}_${to}.csv`,
-                        appendChargeCsvHeader(['Item', 'Category', 'Unit', 'Total Qty', 'Purchases', 'Avg Rate (₹/unit)', 'Total Spend (₹)', 'Last Purchased']),
-                        items.map(r => appendChargeCsvRow([r.material_name, r.category, r.unit, r.qty, r.count, Math.round(r.avg_rate * 100) / 100, Math.round(r.spend * 100) / 100, r.last_date], r)))}
+                        [...appendChargeCsvHeader(['Item', 'Category', 'Unit', 'Total Qty', 'Purchases', 'Avg Rate (₹/unit)', 'Total Spend (₹)', 'Last Purchased']),
+                          TAX_VALUE_CSV_HEADER, TAX_PERCENT_CSV_HEADER],
+                        items.map(r => [
+                          ...appendChargeCsvRow([r.material_name, r.category, r.unit, r.qty, r.count, Math.round(r.avg_rate * 100) / 100, Math.round(r.spend * 100) / 100, r.last_date], r),
+                          taxCsvNumber(gstValue(r)),
+                          taxCsvNumber(taxAppliedPercent(r)),
+                        ]))}
                         className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-[#af4408] hover:bg-[#8a3506] text-white shrink-0"><Download className="w-3.5 h-3.5" /> CSV</button>
                     </div>
                   </div>
@@ -940,10 +1006,14 @@ export default function PurchaseReportPage() {
                             title="SUBTOTAL. The goods and ingredients at the price the bill charges for them, before any tax or charge. Same as Spend on a hand-entered bill; on a PO receipt it is the bill's full price.">Subtotal</th>
                         <th className="py-2 pl-3 text-right"
                             title="GRAND TOTAL — what we actually pay the vendor. Subtotal − discount + CGST + SGST + both cesses + TCS + delivery + round-off.">Grand Total</th>
+                        {/* Derived, so after the Grand Total — see the identical
+                            pair on the charge breakdown table below. */}
+                        <th className="py-2 px-3 text-right border-l-2 border-[#E8D5C4]" title={TAX_VALUE_TITLE}>{TAX_VALUE_LABEL}</th>
+                        <th className="py-2 pl-3 text-right" title={TAX_PERCENT_TITLE}>{TAX_PERCENT_LABEL}</th>
                       </tr></thead>
                       <tbody>
                         {items.length === 0 ? (
-                          <tr><td colSpan={9 + PURCHASE_CHARGE_COLUMNS.length} className="py-6 text-center text-[#8B7355]">No items match.</td></tr>
+                          <tr><td colSpan={11 + PURCHASE_CHARGE_COLUMNS.length} className="py-6 text-center text-[#8B7355]">No items match.</td></tr>
                         ) : items.map((r, i) => (
                           // An unlinked-material row is TINTED, not hidden. Before
                           // 2026-09-10 the INNER JOIN removed it from this table and
@@ -969,6 +1039,9 @@ export default function PurchaseReportPage() {
                             })}
                             <td className="py-2 px-3 text-right tabular-nums text-[#6B5744]">{fmtSignedINR(Number(r.bill_value) || 0)}</td>
                             <td className="py-2 pl-3 text-right font-bold text-[#af4408]">{fmtSignedINR(Number(r.total_amount) || 0)}</td>
+                            <td className="py-2 px-3 text-right tabular-nums text-[#6B5744] border-l-2 border-[#F0E4D6]">{fmtSignedINR(gstValue(r))}</td>
+                            <td className="py-2 pl-3 text-right tabular-nums font-semibold text-[#6B5744]"
+                                title={TAX_PERCENT_TITLE + taxAppliedNote(r)}>{fmtTaxPercent(taxAppliedPercent(r))}</td>
                           </tr>
                         ))}
                       </tbody>
@@ -996,6 +1069,11 @@ export default function PurchaseReportPage() {
                             ))}
                             <td className="py-2 px-3 text-right tabular-nums font-bold">{fmtSignedINR(itemTotals.bill_value)}</td>
                             <td className="py-2 pl-3 text-right tabular-nums font-bold text-[#af4408]">{fmtSignedINR(itemTotals.total_amount)}</td>
+                            {/* Σ(GST) and Σ(GST) ÷ Σ(taxed base) over the LISTED
+                                items — the same money-weighted rate the breakdown
+                                footer prints, never an average of percentages. */}
+                            <td className="py-2 px-3 text-right tabular-nums font-bold border-l-2 border-[#E8D5C4]">{fmtSignedINR(gstValue(itemTaxTotals))}</td>
+                            <td className="py-2 pl-3 text-right tabular-nums font-bold" title={TAX_PERCENT_TITLE + taxAppliedNote(itemTaxTotals)}>{fmtTaxPercent(taxAppliedPercent(itemTaxTotals))}</td>
                           </tr>
                         </tfoot>
                       )}
@@ -1170,8 +1248,11 @@ function PurchaseLog({ from, to, setFrom, setTo, vendors, presets }: {
   const shown = paintAll ? rows : rows.slice(0, ROW_PAINT_CAP);
   const t = data?.totals;
   const money = t?.money;
-  // LEAD_HEADS + Value + Total Amount + Rejected + charges + Link key.
-  const colCount = LEAD_HEADS.length + 3 + (showCharges ? CHARGE_COLS.length : 0) + 1;
+  // LEAD_HEADS + Value + Total Amount + Rejected + charges + Tax Value (GST)
+  // + Tax % Applied (GST) + Link key. The two tax columns are OUTSIDE the
+  // showCharges condition because they render whether or not the charge block
+  // is shown — see the <th> pair.
+  const colCount = LEAD_HEADS.length + 3 + (showCharges ? CHARGE_COLS.length : 0) + 2 + 1;
   // Only sources that actually have lines get a totals row. A source the filter
   // excluded has no business printing "0 lines, ₹0" under a spend column.
   const footSources = SOURCE_ORDER.filter(s => (money?.[s]?.lines ?? 0) > 0);
@@ -1354,6 +1435,13 @@ function PurchaseLog({ from, to, setFrom, setTo, vendors, presets }: {
               <th className="py-2 px-3 text-right" title="Value − discount + CGST + SGST + cesses + TCS + delivery + MRP round-off. Blank on PO lines: an order carries no charge columns.">Total Amount</th>
               <th className="py-2 px-3 text-right">Rejected</th>
               {showCharges && CHARGE_COLS.map(c => <th key={String(c.k)} className="py-2 px-3 text-right">{c.label}</th>)}
+              {/* THE OWNER'S TWO COLUMNS. Rendered ALWAYS, not behind the charge
+                  toggle: they are the tax question itself, not one of the eight
+                  recorded-only charge columns a reader hides to fit the table on
+                  screen. Per LINE the percentage is exact — this is one document
+                  line, so there is nothing to blend. */}
+              <th className="py-2 px-3 text-right border-l-2 border-[#E8D5C4]" title={TAX_VALUE_TITLE}>{TAX_VALUE_LABEL}</th>
+              <th className="py-2 px-3 text-right" title={TAX_PERCENT_TITLE}>{TAX_PERCENT_LABEL}</th>
               <th className="py-2 pl-3">Link key</th>
             </tr></thead>
             <tbody>
@@ -1385,6 +1473,13 @@ function PurchaseLog({ from, to, setFrom, setTo, vendors, presets }: {
                       symbol. This prints −₹0.50, to the paisa, and still an em dash
                       for a charge the source does not carry. */}
                   {showCharges && CHARGE_COLS.map(c => <td key={String(c.k)} className="py-2 px-3 text-right tabular-nums text-[#6B5744]">{fmtSignedINR(r[c.k])}</td>)}
+                  {/* An em dash on a PO line (no charge columns exist there) and
+                      on a line that recorded no GST — never ₹0 and never 0.00%.
+                      On a PURCHASE row from the old tax-inclusive import the tax
+                      IS inside Value and was never split out, so "no GST
+                      recorded" is the only honest thing this column can say. */}
+                  <td className="py-2 px-3 text-right tabular-nums text-[#6B5744] border-l-2 border-[#F0E4D6]">{fmtSignedINR(gstValue(r))}</td>
+                  <td className="py-2 px-3 text-right tabular-nums font-semibold text-[#6B5744]" title={TAX_PERCENT_TITLE}>{fmtTaxPercent(taxAppliedPercent(r))}</td>
                   <td className="py-2 pl-3 text-[11px] text-[#8B7355] font-mono">{r.link_key || '—'}
                     {r.notes && <span className="block text-[10px] text-[#B8A48E] font-sans whitespace-normal max-w-[220px]">{r.notes}</span>}</td>
                 </tr>
@@ -1433,6 +1528,18 @@ function PurchaseLog({ from, to, setFrom, setTo, vendors, presets }: {
                       {showCharges && CHARGE_COLS.map(c => (
                         <td key={String(c.k)} className="py-2 px-3 text-right tabular-nums text-[#6B5744]">{fmtSignedINR(mm[c.k])}</td>
                       ))}
+                      {/* THE SOURCE'S TAX FIGURES — server totals over the full
+                          filtered set, like every other figure on this row, so
+                          they exceed the painted rows when the list is capped.
+                          The rate is Σ(GST) ÷ Σ(taxed base), money-weighted, and
+                          `taxed_bill_value` deliberately counts only the lines
+                          that carried GST: over all 2,165 PURCHASE lines an 18%
+                          bill would read 0.01%. */}
+                      <td className="py-2 px-3 text-right tabular-nums font-bold border-l-2 border-[#F0E4D6]">{fmtSignedINR(mm.tax_cgst_sgst)}</td>
+                      <td className="py-2 px-3 text-right tabular-nums font-bold"
+                          title={TAX_PERCENT_TITLE + taxAppliedNote(mm)}>
+                        {fmtTaxPercent(taxAppliedPercent(mm))}
+                      </td>
                       <td className="py-2 pl-3" />
                     </tr>
                   );
@@ -1650,6 +1757,18 @@ function ChargeBreakdown({ breakdowns, summary, footing, onExport }: {
   // being a memo at all.
   const foot = useMemo(() => chargeTotals(b?.rows || []), [b]);
   const rows = b?.rows || [];
+  /**
+   * The footer's tax row, as a TaxAppliedRow: the summed GST and the summed
+   * TAXED base. Σ(gst) ÷ Σ(base) — a money-weighted period rate. Averaging the
+   * rows' own percentages instead would give a ₹100 line the same weight as a
+   * ₹1,00,000 one and would not foot against anything.
+   */
+  const footTax = useMemo(() => ({
+    cgst: foot.cgst, sgst: foot.sgst,
+    taxed_bill_value: r2(rows.reduce((n, r) => n + (Number(r.taxed_bill_value) || 0), 0)),
+    taxed_lines: rows.reduce((n, r) => n + (Number(r.taxed_lines) || 0), 0),
+    count: rows.reduce((n, r) => n + (Number(r.count) || 0), 0),
+  }), [foot, rows]);
   const summaryTotal = r2(Number(summary.total_amount) || 0);
   // Paise-exact comparison — never a float ===.
   const foots = Math.round(foot.total_amount * 100) === Math.round(summaryTotal * 100)
@@ -1713,10 +1832,19 @@ function ChargeBreakdown({ breakdowns, summary, footing, onExport }: {
             <th className="py-2 px-3 text-right border-l-2 border-[#E8D5C4]"
                 title="SUBTOTAL. The goods and ingredients at the price the bill charges for them, before any tax or charge. Same as Spend on a hand-entered bill; on a PO receipt it is the bill's full price, because the rate we booked there may already have the discount taken off it. NOTE: on this table the Subtotal sits AFTER the charge columns and on the Purchase Bill Summary report it sits BEFORE them. Same figure, same arithmetic, different column order — read each table's own row, do not match them column by column.">Subtotal</th>
             <th className="py-2 pl-3 text-right" title="GRAND TOTAL — what we actually pay the vendor. Subtotal − discount + CGST + SGST + both cesses + TCS + delivery + round-off. On a PO receipt this is the same figure the GRN inward register prints as Total Inward.">Grand Total</th>
+            {/* THE OWNER'S TWO COLUMNS, and they sit AFTER the Grand Total on
+                purpose. Both are DERIVED from the CGST and SGST columns already
+                on this row, so putting them inside the Subtotal − Discount +
+                charges = Grand Total chain would let a reader adding the money
+                columns across the row count the same GST twice. Behind the
+                double border they read as what they are: a restatement, not a
+                further charge. */}
+            <th className="py-2 px-3 text-right border-l-2 border-[#E8D5C4]" title={TAX_VALUE_TITLE}>{TAX_VALUE_LABEL}</th>
+            <th className="py-2 pl-3 text-right" title={TAX_PERCENT_TITLE}>{TAX_PERCENT_LABEL}</th>
           </tr></thead>
           <tbody>
             {rows.length === 0 ? (
-              <tr><td colSpan={PURCHASE_CHARGE_COLUMNS.length + 5} className="py-6 text-center text-[#8B7355]">No purchases in this range.</td></tr>
+              <tr><td colSpan={PURCHASE_CHARGE_COLUMNS.length + 7} className="py-6 text-center text-[#8B7355]">No purchases in this range.</td></tr>
             ) : rows.map((r, i) => {
               const fromGrn = hasGrnSourcedCharges(r);
               const missing = isChargeSourceMissingRow(r);
@@ -1777,6 +1905,20 @@ function ChargeBreakdown({ breakdowns, summary, footing, onExport }: {
                     {fmtSignedINR(Number(r.total_amount) || 0)}
                     {short && <span className="block text-[10px] font-bold">UNDERSTATED</span>}
                   </td>
+                  {/* TAX VALUE (GST) — cgst + sgst off this row, nothing else.
+                      fmtSignedINR gives it the same paise-always formatting as
+                      every other money cell on the table. */}
+                  <td className="py-2 px-3 text-right tabular-nums text-[#6B5744] border-l-2 border-[#F0E4D6]">
+                    {fmtSignedINR(gstValue(r))}
+                  </td>
+                  {/* TAX % APPLIED (GST) — an em dash, never 0.00%, when the row
+                      recorded no GST. The title says how many of the row's lines
+                      the rate was computed over, so a blended figure can never
+                      be read as one vendor's single rate. */}
+                  <td className="py-2 pl-3 text-right tabular-nums font-semibold text-[#6B5744]"
+                      title={TAX_PERCENT_TITLE + taxAppliedNote(r)}>
+                    {fmtTaxPercent(taxAppliedPercent(r))}
+                  </td>
                 </tr>
               );
             })}
@@ -1794,6 +1936,13 @@ function ChargeBreakdown({ breakdowns, summary, footing, onExport }: {
                 ))}
                 <td className="py-2 px-3 text-right tabular-nums font-bold border-l-2 border-[#E8D5C4]">{fmtSignedINR(foot.bill_value)}</td>
                 <td className="py-2 pl-3 text-right tabular-nums font-bold text-[#af4408]">{fmtSignedINR(foot.total_amount)}</td>
+                {/* THE FOOTER'S OWN TAX FIGURES, from the summed rows — so the
+                    Tax Value column foots like every other money column, and the
+                    period rate is Σ(GST) ÷ Σ(taxed base) rather than an average
+                    of percentages, which would weight a ₹100 line the same as a
+                    ₹1,00,000 one. */}
+                <td className="py-2 px-3 text-right tabular-nums font-bold border-l-2 border-[#E8D5C4]">{fmtSignedINR(gstValue(footTax))}</td>
+                <td className="py-2 pl-3 text-right tabular-nums font-bold" title={TAX_PERCENT_TITLE + taxAppliedNote(footTax)}>{fmtTaxPercent(taxAppliedPercent(footTax))}</td>
               </tr>
             </tfoot>
           )}

@@ -7,6 +7,12 @@ import {
   effectiveChargeSumsSql, chargeSourceCountsSql, grnLineJoinSql, withGrnCharges,
   chargeSums, PURCHASE_CHARGE_COLUMNS,
 } from '@/lib/purchase-charges';
+// TAX ACTUALLY CHARGED — the two extra sums behind the "Tax % Applied (GST)"
+// column. `taxed_bill_value` is the post-discount subtotal OF THE GST-BEARING
+// LINES ONLY, so a vendor billed at 18% reads 18.00% instead of a blended
+// 0.01% over 2,165 rows of which 7 carry tax. Built from the same effective
+// rail as the charges above — never SUM(p.cgst). See src/lib/tax-applied.ts.
+import { effectiveTaxAppliedSumsSql, taxAppliedSums } from '@/lib/tax-applied';
 // The span of dates that actually have purchases, and the window that covers
 // all of them. Shared with /api/reports/purchase-bill-summary so the two
 // reports can never disagree about what "all time" means. See the block comment
@@ -251,7 +257,8 @@ export async function GET(req: Request) {
      */
     const CHARGES = `
         ${effectiveChargeSumsSql('p', 'gl')},
-        ${chargeSourceCountsSql('p', 'gl')}`;
+        ${chargeSourceCountsSql('p', 'gl')},
+        ${effectiveTaxAppliedSumsSql('p', 'gl')}`;
 
     /**
      * Every statement below is wrapped in the grn_line CTE. It is prepared once
@@ -357,6 +364,9 @@ export async function GET(req: Request) {
       rows.map(r => ({
         ...r,
         ...chargeSums(r),
+        // The percentage base and its line count, coerced the same way the
+        // charges are, so the page divides two numbers and never a string.
+        ...taxAppliedSums(r),
         // Counts, not money — coerced to plain integers so the page can compare
         // them without Number() at every call site.
         po_receipt_rows: Number(r.po_receipt_rows) || 0,
@@ -373,6 +383,7 @@ export async function GET(req: Request) {
     const summaryOut = {
       ...summary,
       ...chargeSums(summary),
+      ...taxAppliedSums(summary),
       count: Number(summary?.purchase_count) || 0,
       po_receipt_rows: Number(summary?.po_receipt_rows) || 0,
       grn_sourced_rows: Number(summary?.grn_sourced_rows) || 0,
