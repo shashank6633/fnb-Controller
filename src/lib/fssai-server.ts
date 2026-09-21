@@ -553,13 +553,38 @@ export const FSSAI_UNSIGN_ACTION = 'unsign';
  * always produces the same digest and a re-ordered SELECT cannot invalidate a
  * signature by accident. `updated_at` is deliberately NOT in the digest — a
  * re-save that changes nothing a person can see must not break their signature.
+ *
+ * ── WHY `template_version` IS NOT IN THE DIGEST (measured defect) ──────────
+ * It used to be, and it made the tamper indicator LIE on records nobody had
+ * touched. `fssai_runs.template_version` is rewritten by submit — it is set to
+ * the version actually answered against (runs/route.ts, the freeze UPDATE) —
+ * while the signature is taken BEFORE that write, over the version the round was
+ * opened on. So on any round where an administrator edited the checklist while
+ * somebody was filling it in, the digest stored with the signature covered v_open
+ * and the digest recomputed on read covered v_submit, and the verification screen
+ * told a supervisor in red: "The signature no longer matches this record.
+ * Something differs from what was signed." Nothing differed. Measured, one
+ * variable: two identical rounds, the second with a mid-round question edit
+ * (v2 → v3) and no answer touched — signature_intact came back TRUE and FALSE.
+ * It could never be cleared, because a submitted record cannot be re-signed (409).
+ *
+ * A false alarm here is worse than no indicator at all: once this sentence is
+ * known to fire on clean records, a real one cannot be told apart from it.
+ *
+ * So the digest covers exactly what the person attested to — every answer value,
+ * its verdict, its note, and every photograph — bound to the run it belongs to.
+ * The template VERSION is not something a signer attests to and it is not lost by
+ * leaving it out: `template_version` sits on the run row, and the record snapshot
+ * freezes `version_at_open` and `version_at_submit` separately and says out loud
+ * when a round spans two (`answered_across_versions`). A template edit cannot
+ * change a frozen fssai_responses row, so no answer is left unbound.
  */
 export function computeFssaiSheetDigest(
   db: Database.Database,
   runId: string,
 ): { digest: string; answers: number; photos: number } {
   const run = db.prepare(
-    `SELECT id, template_id, template_version FROM fssai_runs WHERE id = ?`,
+    `SELECT id, template_id FROM fssai_runs WHERE id = ?`,
   ).get(runId) as any;
   const responses = db.prepare(
     `SELECT question_id, qtype, value_text, value_num, value_bool, is_na, note, is_fail
@@ -571,7 +596,7 @@ export function computeFssaiSheetDigest(
   ).all(runId) as any[];
 
   const h = createHash('sha256');
-  h.update(`run:${String(run?.id ?? runId)}|tpl:${String(run?.template_id ?? '')}|v:${String(run?.template_version ?? '')}\n`);
+  h.update(`run:${String(run?.id ?? runId)}|tpl:${String(run?.template_id ?? '')}\n`);
   for (const r of responses) {
     h.update([
       'q', String(r.question_id ?? ''), String(r.qtype ?? ''),
