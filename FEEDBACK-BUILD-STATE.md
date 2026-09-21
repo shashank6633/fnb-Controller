@@ -101,11 +101,41 @@ department mapping is the owner's production config — **read it, never write i
 is_active · sort_order · description · can_request_discount · max_discount_pct ·
 can_approve_requisitions`. Note: the tier column is **`base_role`**, not `tier`.
 
-Existing roles: `Administrator · Bar Manager · Captain · Cashier · Floor Manager · Head Chef · Manager
-· Staff · Store Manager`.
+✅ **THE GRE ROLE EXISTS AND IS ASSIGNED — production data, supplied by the owner 2026-09-21.**
+This supersedes every earlier note in this file that said otherwise, and it supersedes the local
+snapshot, which is badly out of date (it holds 9 users, all unassigned; production holds **36**).
 
-⚠️ **THERE IS NO "GRE" ROLE.** See §7 Q1 — this is an owner decision, and there is a precedent: for
-Bill Handover he said *"You create an 'Accounts' role in Settings → Roles and I gate on it."*
+| role | base_role | active | can_disc | max_pct | users_assigned |
+|---|---|---|---|---|---|
+| Administrator | admin | 1 | 1 | 100 | 2 |
+| Bar Manager | manager | 1 | 0 | 0 | 1 |
+| Captain | staff | 1 | 0 | 0 | 4 |
+| Cashier | staff | 1 | **1** | 10 | 1 |
+| **Floor Manager** | manager | 1 | 0 | 0 | **0** |
+| **GRE** | **staff** | **1** | **0** | 0 | **4** |
+| HR | manager | 1 | 0 | 0 | 2 |
+| Head Chef | manager | 1 | 0 | 0 | 4 |
+| Manager | manager | 1 | 1 | 30 | 1 |
+| Staff | staff | 1 | 0 | 0 | 8 |
+| Store Manager | manager | 1 | 0 | 0 | 1 |
+
+**The gate is satisfied on every count:** name is exactly `GRE`, `base_role` is `staff` (so it does
+NOT inherit the manager-tier powers — void, settle, hold, service-charge waiver), it is active, and
+**`can_request_discount = 0`**, so `discount/route.ts:62` refuses it.
+
+**The four GREs:** Bharath · Nisha Sharma · Pushpa · Swetha — all `tier: staff`.
+
+⚠️ **CORRECTIONS THIS DATA FORCES — do not repeat the old claims:**
+- "`role_id` is NULL for all 9 users" was true only of the **stale local snapshot**. In production
+  **28 of 36 users carry an assigned role**. The named-role gate therefore **does fire**.
+- It follows that "cashiers have never been able to print" is **FALSE in production**: Kishore holds
+  `Cashier`, so `auth.ts:184`'s `role_name === 'Cashier'` branch evaluates true for them.
+- There is an **`HR`** role (manager, 2 users) that does not exist in the local snapshot at all.
+- **`Floor Manager` has ZERO users.** The spec says "GRE or Floor Manager", but nobody holds Floor
+  Manager today, so GRE is the entire real audience. Keep Floor Manager in the allow-list, but do
+  not rely on it for testing.
+- **8 users still carry no role** (3 admins, 3 managers, 2 staff). They fall back to `users.role`,
+  so the null-role path is still a REAL state worth testing — just not the only one.
 
 **Patterns to match, not reinvent:** the Captain app (`src/app/captain`) is the mobile-first model the
 owner asked this to resemble. `src/lib/api.ts` (`api()`/`apiJson()`) injects the CSRF header on
