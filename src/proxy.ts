@@ -5,6 +5,7 @@ import { getDb } from '@/lib/db';
 import {
   feedbackAccess, isFeedbackAnalyticsPath, isFeedbackPath,
 } from '@/lib/feedback/access';
+import { refusePosWrite, posWriteRefusalBody } from '@/lib/feedback/pos-readonly';
 
 /**
  * Next.js 16 proxy (formerly `middleware`) — runs at the network boundary on the
@@ -422,12 +423,71 @@ export function proxy(req: NextRequest) {
   if (isApi && isStateChanging(req.method)) {
     try {
       const db = getDb();
-      const valid = db.prepare(`
-        SELECT 1 FROM sessions s JOIN users u ON u.id = s.user_id
+      // The SELECT that was already here, WIDENED — same one row, same one
+      // query, same WHERE clause, so this step still costs exactly what it cost
+      // before. The extra columns exist only to answer the Guest Feedback
+      // read-only question below; nothing else reads them, and the row's mere
+      // existence is still what proves the session valid.
+      const row = db.prepare(`
+        SELECT u.role, u.role_id, u.is_head_chef, u.section,
+               r.name AS role_name, r.is_active AS role_active,
+               r.base_role AS role_base, r.is_head_chef AS role_head_chef
+        FROM sessions s JOIN users u ON u.id = s.user_id
+        LEFT JOIN roles r ON r.id = u.role_id
         WHERE s.token = ? AND u.is_active = 1 AND s.expires_at > datetime('now')
-      `).get(session);
-      if (!valid) return NextResponse.json({ error: 'Sign in required' }, { status: 401 });
-    } catch { /* infra/DB error → fall through (don't hard-fail the whole app) */ }
+      `).get(session) as any;
+      if (!row) return NextResponse.json({ error: 'Sign in required' }, { status: 401 });
+
+      // ── 🔒 GUEST FEEDBACK: the owner's READ-ONLY rule, enforced server-side.
+      //
+      // "The GRE/Manager may view ordered items but has READ-ONLY ACCESS. They
+      //  cannot: place orders · cancel items · change quantity · modify KOT ·
+      //  modify bill · apply discounts. This must be enforced server-side, not
+      //  merely hidden in the UI."
+      //
+      // ONE boundary, not fourteen handler edits: `refusePosWrite()` owns the
+      // prefix list (src/lib/feedback/pos-readonly.ts) so the next POS write
+      // route inherits the denial instead of needing a fourteenth edit in a
+      // fourteenth handler. NO POS ROUTE FILE WAS TOUCHED.
+      //
+      // ⚠️ IT REFUSES NOBODY TODAY, BY CONSTRUCTION. The predicate matches only
+      // a login with the "GRE" role ASSIGNED that is not management, and
+      // `users.role_id` is NULL for every user on the measured database — the
+      // same trap that has kept auth.ts:184's `role_name === 'Cashier'` from
+      // ever firing. Captains, cashiers, Floor Managers, Managers, HODs and
+      // Admins all answer false. It starts refusing exactly one login the
+      // moment an administrator ASSIGNS the GRE role to it, which is the moment
+      // that login is supposed to become read-only. (Switching the role OFF
+      // does not lift the deny — see isPosReadOnlyActor()'s measured reason.)
+      //
+      // The actor is built to MIRROR getCurrentUser() (auth.ts:113-126) field
+      // for field — the same `hasRole` test, the same tier fallback, the same
+      // `|| null` on role_name, the same union for is_head_chef — so the proxy
+      // and the handlers can never disagree about who someone is. `role_active`
+      // is the one field getCurrentUser does not report (it resolves tier and
+      // pages from a deactivated role on purpose, auth.ts:104-107), and it is
+      // carried as the same TRI-STATE step 2b uses: null when no role is
+      // assigned, because "not looked up" must not read as "known bad".
+      const posHasRole = !!row.role_id && !!row.role_base;
+      const posActor = {
+        role: ((posHasRole ? row.role_base : row.role) as string) || 'staff',
+        role_name: row.role_name || null,
+        section: row.section || '',
+        is_head_chef: !!row.is_head_chef || (posHasRole && !!row.role_head_chef),
+        role_is_active: row.role_id ? !!row.role_active : null,
+      };
+      if (refusePosWrite(posActor, pathname, req.method)) {
+        return NextResponse.json(posWriteRefusalBody(pathname), { status: 403 });
+      }
+    } catch {
+      /* infra/DB error → fall through (don't hard-fail the whole app).
+         The deny fails OPEN here, and that is safe rather than sloppy: every
+         POS write handler downstream opens with getCurrentUser(), which calls
+         the same getDb(). A database this block could not read is a database
+         the handler cannot read either, so a POS write cannot succeed through
+         this gap — it 401s or 500s one layer later. Failing CLOSED instead
+         would refuse live captains on a transient read error. */
+    }
   }
 
   // 3. CSRF check on sensitive state-changing API calls

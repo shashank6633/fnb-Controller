@@ -248,18 +248,23 @@ export function canOpenFeedbackAnalytics(u: FeedbackActor | null | undefined): b
  * able to place orders · cancel items · change quantity · modify a KOT ·
  * modify a bill · apply discounts.
  *
- * ⚠️ NOTHING CALLS THIS YET, AND THAT IS DELIBERATE. P0 measured that
+ * ⚠️ WHERE IT IS CALLED — ONE PLACE, NOT THIRTEEN. P0 measured that
  * `PATCH /api/dine-in/orders/[id]` carries `if (!me) return 401` and nothing
  * else while serving add_item · set_qty · remove_item · fire, and that 11 of 22
- * order/KOT/bill routes are open to a staff-tier session. Closing them means
- * editing shipped POS code that captains depend on every service, so the change
- * is designed and proved in an isolated copy and handed to the owner as a diff
- * — see the Part 2 proposal. Wiring this predicate into those routes without
- * his approval is how a fleet breaks a live dinner service.
+ * order/KOT/bill routes are open to a staff-tier session. Closing them one
+ * handler at a time would mean fourteen edits to shipped POS code that captains
+ * depend on every service — and the measured failure of that approach is that
+ * it stops at `PATCH /api/dine-in/orders/[id]` (four of the owner's six powers)
+ * while `orders/replay` and `customer-orders/[id]` stay open.
  *
- * It is a DENY-LIST keyed on the GRE marker rather than an allow-list for the
- * same reason: it is inert until a role is actually assigned, so it cannot
- * regress a live captain, cashier or KDS on the day it ships.
+ * So `./pos-readonly.ts` turns the owner's rule into ONE prefix list, and
+ * `src/proxy.ts` asks it ONE question inside the query it already runs for
+ * every state-changing API call. **No POS route handler was edited.**
+ *
+ * It is a DENY-LIST keyed on the GRE marker rather than an allow-list for a
+ * reason that is the whole safety argument: it is inert until a role is
+ * actually assigned, so on the day it ships it refuses NOBODY — it cannot
+ * regress a live captain, cashier or KDS.
  */
 export function isReadOnlyFeedbackUser(u: FeedbackActor | null | undefined): boolean {
   if (!isActor(u)) return false;

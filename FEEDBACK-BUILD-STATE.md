@@ -214,7 +214,7 @@ supported, clear status indicators, sticky Submit. Minimal typing.
 |---|---|---|---|
 | P0 | Recon — read-only: POS/order/table/role wiring, Captain-app patterns, export helpers, the read-only enforcement surface | PENDING | |
 | P1 | Foundation — `gf_` schema, nav in BOTH files, RBAC, 4 page shells | PENDING | |
-| P2 | Page 1 Floor Feedback + the READ-ONLY guarantee, proved server-side | **Lane A DONE** | §6 2026-09-22: GET-only routes (405 with CSRF, 403 without), 40 reads → census identical, 6-persona gate, all 5 statuses live, `tunable()` zero-default bug fixed, tsc 0. **Part (B) — denying the GRE on the existing POS routes — is NOT applied: owner diff still owed.** |
+| P2 | Page 1 Floor Feedback + the READ-ONLY guarantee, proved server-side | **DONE (A + B)** | §6 2026-09-22: GET-only routes (405 with CSRF, 403 without), 40 reads → census identical, 6-persona gate, all 5 statuses live, `tunable()` zero-default bug fixed, tsc 0. **Part (B) IS NOW APPLIED** — one prefix deny at ONE boundary (`src/lib/feedback/pos-readonly.ts` + `src/proxy.ts`), zero POS route handlers edited, 23/23 forbidden writes refused for an assigned GRE, 115/115 non-GRE writes untouched. |
 | P3 | Page 2 Take Feedback + item-level complaints + action + follow-up lifecycle | PENDING | |
 | P4 | Page 3 Feedback Tracker + coverage | PENDING | |
 | P5 | Page 4 Analytics + the 8 reports | PENDING | |
@@ -350,6 +350,63 @@ supported, clear status indicators, sticky Submit. Minimal typing.
     `src/lib/feedback/index.ts` would be **silently unreachable — never create one**. Deep paths
     (`@/lib/feedback/access`, `/read`, `/session`) are unambiguous; the carve grep
     `src/lib/feedback` still matches both spellings.
+
+- **2026-09-22 — P2 Lane A part (B): THE POS DENY IS APPLIED.** New `src/lib/feedback/pos-readonly.ts`;
+  `src/proxy.ts` hunk; comment repair in `src/lib/feedback/access.ts`. **Zero POS route handlers were
+  edited** — the owner's read-only rule is ONE list and ONE test at ONE boundary.
+  - **Where it lives.** `POS_WRITE_PREFIXES` = `/api/dine-in/orders` · `/customer-orders` · `/kds` ·
+    `/discount-requests` · `/tables`. PREFIXES, not routes, so the next POS write route inherits the
+    denial. `isPosWritePath()` is ANCHORED (`p === path || path.startsWith(p + '/')`), never
+    `includes()` — `isPublic()`'s `'/print'` substring is the standing proof. The hunk sits INSIDE
+    proxy step 2c, the block that already ran one query for every state-changing API call: the SELECT
+    is merely widened with `LEFT JOIN roles`, so **no new query**. The actor mirrors
+    `getCurrentUser()` (auth.ts:113-126) field for field.
+  - **PROVED, as the assigned GRE (port 3951): 23 of 23 state-changing POS requests → 403
+    `feedback_read_only`.** All six powers, including the two doors a per-handler fix forgets:
+    `POST /api/dine-in/orders/replay` and `POST /api/dine-in/customer-orders/[id]`. Measured that
+    both were open to a staff GRE before (`if (!me) return 401` and nothing else), as were
+    `PATCH /api/dine-in/orders/[id]` (add_item·set_qty·remove_item·fire), print-bill and request-bill.
+  - **A KDS BUMP IS AN INVENTORY WRITE, and it is covered.** `/api/dine-in/kds/[id]/bump` runs the
+    deferred recipe consume (`kot-completion.ts`), stamping `order_items.recipe_deducted_at` and
+    deducting raw-material stock — irreversible by design ("never clear recipe_deducted_at"), and it
+    also locks the order out of being voided. Its own gate let a GRE through: the section test is
+    `!privileged && me.section && …` and `users.section` is `''` for every user, so it never fires.
+  - **CHANGED NOTHING FOR ANYONE ELSE: 115 of 115** state-changing POS requests across Captain,
+    staff-with-no-role, section='GRE'-with-no-role, Floor Manager and Admin returned the HANDLER's own
+    answer (404 · 400 · 403 "Manager role required" · 500 FK) and **0** returned `feedback_read_only`.
+    `canWorkTable()` and the KDS section gate were left inert exactly as found. Six non-dine-in write
+    families (vendors, requisitions, wastage, crm-calls, hr, kitchen-production) answer identically
+    for all three personas, and step 2c still 401s a forged and a cookie-less token.
+  - **Reads are untouched:** a GRE still gets 200 on `GET /api/dine-in/orders · /tables · /kds ·
+    /customer-orders` and on `/api/feedback/floor`, and `POST /api/dine-in/service-requests/[id]`
+    reaches the handler — answering the table's bell is the GRE's job and is DELIBERATELY not in the
+    list.
+  - 🐞 **DEFECT FOUND AND FIXED IN THE DESIGN ITSELF — deactivating the role was an ESCALATION.**
+    `isNamedGre()` refuses to match a deactivated role (right for a GRANT, which only removes pages).
+    Inherited by a DENY it meant: `UPDATE roles SET is_active=0` → the GRE lost the feedback pages
+    **and got the POS back** — measured, `PATCH /api/dine-in/orders/zz-nope` → 404 (through to the
+    handler). That is the very escalation `auth.ts:104-107` documents. `isPosReadOnlyActor()` now asks
+    the same authority with the tri-state set to "not looked up", so the deny survives the role being
+    switched off (re-measured: 403 on all four probes) while access still refuses (page → 403). No
+    second copy of the role name or the management carve-out.
+  - **WHICH WAY IT ERRS: toward ALLOWING.** Unresolved session, no role, wrong role, unreadable
+    database → `false` → the POS write proceeds to the handler's own gate. A DB error cannot leak a
+    write, because every POS handler opens with `getCurrentUser()` on the same `getDb()`.
+  - **NOT COVERED, on purpose:** `/api/dine-in/service-requests` (the GRE's own job);
+    `/api/dine-in/cashier-presence` and `/stale-tables` (already refuse a GRE on their own —
+    `tillCapable()` and a manager tier); `/api/dine-in/offline-print`, `/print-agent`, `/kot-alerts`
+    (counter-PC plumbing, not the six); every GET (the owner allows viewing); and every non-POS module
+    (`/api/tasks`, `/api/crm-calls`, … — a GRE keeps their normal app). Also NOT covered: anything that
+    does not pass through the proxy — a direct DB edit, or a future POS write placed outside
+    `/api/dine-in/*`.
+  - `npx tsc --noEmit` exit **0**, zero output. A 13-persona × 17-path predicate suite passes
+    (`refusePosWrite` false for Captain · Cashier · Floor Manager · Manager · HOD · Admin · no-role ·
+    section-only · null · string · array · GRE-with-manager-tier). Census excluding the `gfqa-`
+    fixture namespace: orders 37→37, order_items 35→35, restaurant_tables 3→3, Σqty 61→61,
+    `recipe_deducted 0→0`, `purchases 2165`, `raw_materials 952`, `integrity_check ok`. (The 28 `gfqa-`
+    rows that did appear are a CONCURRENT LANE's fixtures written straight into SQLite — every one has
+    an empty `server_id`, which an API-created order never has.) Server on 3951 killed, port free; the
+    owner's own preview on 3001 untouched.
 
 ---
 
