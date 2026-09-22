@@ -144,9 +144,14 @@ export default function FloorFeedbackPage() {
     return () => clearInterval(t);
   }, [load]);
 
-  const toggleItems = useCallback(async (orderId: string) => {
+  const toggleItems = useCallback(async (orderId: string, itemCount: number) => {
     setOpen((o) => ({ ...o, [orderId]: !o[orderId] }));
-    if (items[orderId] !== undefined) return;
+    // Re-fetch when the board says the table has a different number of items
+    // than the cached view holds. Without this the disclosure keeps showing the
+    // list as it was when first opened, while the card beside it counts the new
+    // ones — and a GRE would take feedback against a dish that is not on screen.
+    const cached = items[orderId];
+    if (cached !== undefined && !(cached && cached.item_count !== itemCount)) return;
     setItems((m) => ({ ...m, [orderId]: null }));
     try {
       const res = await api(`/api/feedback/order/${encodeURIComponent(orderId)}`);
@@ -160,20 +165,49 @@ export default function FloorFeedbackPage() {
 
   const tables = data?.tables ?? [];
   const meta = data?.meta;
-  const counts = meta?.counts ?? {};
 
-  /** FILTER ONLY — the server's ranking is the point of the board. */
+  /** FILTER ONLY — the server's ranking is the point of the board, and both
+   *  filters below preserve array order, so the ranking survives them. */
+  const onThisFloor = useMemo(
+    () => (floor === 'all' ? tables : tables.filter((t) => t.floor === floor)),
+    [tables, floor],
+  );
+
+  /**
+   * ⚠️ COUNTED ON THE FLOOR YOU ARE LOOKING AT, not on the whole venue.
+   *
+   * These numbers were `meta.counts` — the server's totals — while the board
+   * below was ALSO filtered by floor. Pick "Rooftop" and the chips said
+   * `All · 12 · Feedback Due · 5` above a grid showing three cards, and the
+   * counts a GRE is measured on disagreed with the tables in front of them.
+   * The server's ranking is still the server's; only the tally is local, and it
+   * is derived from exactly the rows the grid draws.
+   */
+  const counts = useMemo(() => {
+    const c: Record<string, number> = { all: onThisFloor.length };
+    for (const s of TABLE_STATUSES) c[s.v] = 0;
+    for (const t of onThisFloor) c[t.status] = (c[t.status] || 0) + 1;
+    return c;
+  }, [onThisFloor]);
+
   const visible = useMemo(
-    () => tables
-      .filter((t) => (status === 'all' ? true : t.status === status))
-      .filter((t) => (floor === 'all' ? true : t.floor === floor)),
-    [tables, status, floor],
+    () => onThisFloor.filter((t) => (status === 'all' ? true : t.status === status)),
+    [onThisFloor, status],
   );
 
-  const floorOptions = useMemo(
-    () => [{ v: 'all', label: 'All floors' }, ...(meta?.floors ?? []).map((f) => ({ v: f, label: f }))],
-    [meta?.floors],
-  );
+  /**
+   * `meta.floors` is derived from the tables ON the board, so a floor empties
+   * out of the list the moment its last table settles — and a <select> whose
+   * value is not among its options renders as the FIRST option, silently moving
+   * the GRE to "All floors" without telling them. The selected floor is kept in
+   * the list (marked empty) until they leave it themselves.
+   */
+  const floorOptions = useMemo(() => {
+    const live = meta?.floors ?? [];
+    const opts = [{ v: 'all', label: 'All floors' }, ...live.map((f) => ({ v: f, label: f }))];
+    if (floor !== 'all' && !live.includes(floor)) opts.push({ v: floor, label: `${floor} (none open)` });
+    return opts;
+  }, [meta?.floors, floor]);
 
   /* ── the refusal screen ───────────────────────────────────────────────────
      Printed instead of an empty board, because an empty board is exactly what
@@ -356,7 +390,7 @@ export default function FloorFeedbackPage() {
                 <div className="mt-3 flex items-center gap-2">
                   <button
                     type="button"
-                    onClick={() => toggleItems(t.order_id)}
+                    onClick={() => toggleItems(t.order_id, t.item_count)}
                     aria-expanded={isOpen}
                     disabled={t.item_count === 0}
                     className="shrink-0 min-h-[44px] px-3 rounded-xl bg-white border border-[#E8D5C4] text-[#6B5744] text-[12px] font-semibold inline-flex items-center gap-1 active:scale-95 transition disabled:opacity-40 disabled:active:scale-100"
@@ -404,16 +438,51 @@ export default function FloorFeedbackPage() {
           </EmptyState>
         ) : null}
 
+        {/* An open complaint that dropped off tonight's board is the one
+            exclusion that must never be a footnote: gf_follow_ups keeps it
+            OPEN, but no GRE can walk to that table any more, so a manager has
+            to pick it up from the Tracker. */}
+        {meta && meta.excluded.stale_with_open_issue > 0 ? (
+          <div className="mt-3 rounded-xl border border-violet-200 bg-violet-50 px-3 py-2 text-[11px] leading-snug text-violet-900">
+            <div className="flex items-start gap-1.5">
+              <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" />
+              <div>
+                <span className="font-bold">
+                  {meta.excluded.stale_with_open_issue} unresolved complaint(s) on a table from an
+                  earlier service
+                </span>{' '}
+                — still open, but off tonight&apos;s floor. The guests have gone; a manager closes
+                these from the Tracker.
+              </div>
+            </div>
+          </div>
+        ) : null}
+
         {meta ? (
           <p className="mt-3 text-[11px] leading-snug text-[#8B7355]">
             A table becomes <b>Feedback Due</b> at <b>{meta.item_threshold} items</b>
-            {meta.item_threshold_is_default ? ' (default)' : ''}, or as soon as the guest asks for
-            the bill, or the bill is printed. Settled tables stay visitable for{' '}
-            <b>{meta.grace_minutes} min</b>{meta.grace_is_default ? ' (default)' : ''}.
-            {meta.excluded.takeaway_or_other || meta.excluded.table_row_missing ? (
+            {meta.item_threshold_is_default ? ' (default)' : ''}
+            {meta.item_threshold_clamped
+              ? ' (the saved setting was below 1 and has been raised — 0 would make every table due)'
+              : ''}
+            , or as soon as the guest asks for the bill, or the bill is printed. Settled tables stay
+            visitable for <b>{meta.grace_minutes} min</b>{meta.grace_is_default ? ' (default)' : ''}.
+            {meta.business_date ? (
               <>
-                {' '}Not shown: {meta.excluded.takeaway_or_other} non-dine-in and{' '}
-                {meta.excluded.table_row_missing} order(s) whose table record no longer exists.
+                {' '}The board shows <b>tonight&apos;s service</b> ({meta.business_date}), which
+                rolls over at <b>{meta.board_cutoff}</b>
+                {meta.board_cutoff_source === 'default' ? ' (default)' : ''}: a table still open
+                from an earlier service drops off instead of queueing here forever.
+              </>
+            ) : null}
+            {meta.excluded.takeaway_or_other || meta.excluded.table_row_missing
+              || meta.excluded.stale_open_order ? (
+              <>
+                {' '}Not shown: {meta.excluded.takeaway_or_other} non-dine-in,{' '}
+                {meta.excluded.table_row_missing} order(s) whose table record no longer exists, and{' '}
+                {meta.excluded.stale_open_order} still-open order(s) left over from an earlier
+                service. Nothing was closed or changed to take them off — they are only off this
+                list.
               </>
             ) : null}
             {' '}This board is read-only — opening a table records nothing until you submit feedback.

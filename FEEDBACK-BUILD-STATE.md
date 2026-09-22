@@ -214,7 +214,7 @@ supported, clear status indicators, sticky Submit. Minimal typing.
 |---|---|---|---|
 | P0 | Recon — read-only: POS/order/table/role wiring, Captain-app patterns, export helpers, the read-only enforcement surface | PENDING | |
 | P1 | Foundation — `gf_` schema, nav in BOTH files, RBAC, 4 page shells | PENDING | |
-| P2 | Page 1 Floor Feedback + the READ-ONLY guarantee, proved server-side | **DONE (A + B)** | §6 2026-09-22: GET-only routes (405 with CSRF, 403 without), 40 reads → census identical, 6-persona gate, all 5 statuses live, `tunable()` zero-default bug fixed, tsc 0. **Part (B) IS NOW APPLIED** — one prefix deny at ONE boundary (`src/lib/feedback/pos-readonly.ts` + `src/proxy.ts`), zero POS route handlers edited, 23/23 forbidden writes refused for an assigned GRE, 115/115 non-GRE writes untouched. |
+| P2 | Page 1 Floor Feedback + the READ-ONLY guarantee, proved server-side | **DONE (A + B)** | §6 2026-09-22: GET-only routes (405 with CSRF, 403 without), 40 reads → census identical, 6-persona gate, all 5 statuses live, `tunable()` zero-default bug fixed, tsc 0. **Part (B) IS NOW APPLIED** — one prefix deny at ONE boundary (`src/lib/feedback/pos-readonly.ts` + `src/proxy.ts`), zero POS route handlers edited, 23/23 forbidden writes refused for an assigned GRE, 115/115 non-GRE writes untouched. **Lane B (read/board/catalog) closed its three HIGHs + 7 MEDIUMs** — elapsed proved against a known instant, a business-day exit for the never-settled order, tier flags proved per persona; 120 reads → census identical. |
 | P3 | Page 2 Take Feedback + item-level complaints + action + follow-up lifecycle | PENDING | |
 | P4 | Page 3 Feedback Tracker + coverage | PENDING | |
 | P5 | Page 4 Analytics + the 8 reports | PENDING | |
@@ -407,6 +407,176 @@ supported, clear status indicators, sticky Submit. Minimal typing.
     rows that did appear are a CONCURRENT LANE's fixtures written straight into SQLite — every one has
     an empty `server_id`, which an API-created order never has.) Server on 3951 killed, port free; the
     owner's own preview on 3001 untouched.
+
+- **2026-09-22 — P2 Lane B (the read rail, the board, the catalog: closing what P2 left open).**
+  Files: `src/lib/feedback/read.ts`, `src/app/feedback/page.tsx`, `src/app/feedback/take/page.tsx`,
+  `src/app/feedback/ui.tsx`. `src/lib/page-catalog.ts` needed **no change** — see (3). Nothing in
+  `src/proxy.ts` or `pos-readonly.ts` was touched (Lane A's).
+
+  - ⚠️ **AN ENVIRONMENT TRAP THAT WILL COST THE NEXT LANE AN HOUR.** The dev server in this worktree
+    had been up 8 h across a machine SLEEP (the wall clock jumped ~7 h50 m mid-session), and its
+    Turbopack **file watcher was dead**: it kept serving a module compiled hours earlier and silently
+    ignored every edit. It was not obvious — the route still answered 200 with fresh DB data, so only
+    the *code* was stale. Diagnose it in one shot: add a throwaway literal to a route's JSON response,
+    curl it, and see whether the field appears. Lane A's server also held the per-directory dev lock
+    (*"Another next dev server is already running"*), so the fix was an **isolated run copy**:
+    `rsync` of `src/` into the scratchpad + `rsync -a --link-dest` for `node_modules` (hardlinks, no
+    extra disk — same inode proved) + `VACUUM INTO` for the DB, then `next dev -p 3952` there. A
+    watcher under `/private/tmp` does not fire either, so **restart that server after every edit**.
+
+  - 🐞 **(1) HIGH — TIMESTAMPS, now proved against a known instant, and the CLIENT half closed.**
+    `sqlUtcToIso()` (server) was already correct and is unchanged; what was missing was any defence on
+    the *reading* side, and Pages 2-5 are still to be written against the same columns. `elapsed()` in
+    `ui.tsx` was `Date.parse(fromIso)` + a finite check — which **accepts** the raw SQLite form and
+    renders a confidently wrong number. New `zonedMs()` requires an explicit zone (`T` plus `Z`/`±HH:MM`);
+    anything else is `NaN` and the card shows `—`. Measured with the shipped source extracted verbatim
+    from `ui.tsx` (byte-identity asserted) and run under `TZ=Asia/Kolkata`:
+    opened `2026-08-11 19:05:14` UTC, now `19:15:14` UTC ⇒ truth **10m**;
+    OLD code on the raw column → parsed as `13:35:14Z` ⇒ **"340m"** (5 h 40 m, the lie);
+    NEW code on the raw column → **"—"**; NEW code on the repaired ISO → **"10m"**. 12/12 cases pass
+    (`Z`, fractional `Z`, `+05:30`, `+0530` all 10m/9m; space form, zone-less `T`, bare date, blank,
+    null, junk all `—`; 65 min → `1h 05m`; a future stamp clamps to `0m`).
+    Server half, end to end: raw column `2026-09-22 10:27:28` → API `2026-09-22T10:27:28Z` →
+    **epoch 1790072848000**, identical to reading the column as UTC; the same string parsed unrepaired
+    on an IST box is epoch 1790053048000 — **330 minutes apart**.
+    Also re-measured: **100 % of the five timestamp columns this module reads are the space form with
+    no fractional seconds** (0 ISO, 0 `%f`), so `sqlUtcToIso()` has no unhandled shape today.
+
+  - 🐞 **(2) HIGH — THE NEVER-SETTLED ORDER NOW HAS AN EXIT** (`read.ts` §6, new). The board had an
+    exit for `settled` (grace) and `void` (the WHERE) and **none for `open`** — and `stale-tables.ts`
+    measured eleven such orders on the live database, one idle 765 hours. **The rule chosen:** a
+    still-`open` order leaves the board when its **LAST ACTIVITY falls before the start of the current
+    business day**, where the business day is the owner's existing `hr_day_cutoff` convention
+    (default `04:00`) via HRMS's own `businessDateOf()` — no new settings key. Last activity is
+    `MAX(last item punched, opened, bill requested, bill printed, settled)`, i.e. `stale-tables.ts:110`'s
+    definition widened by the two bill stamps. Four deliberate non-properties: **it writes nothing**
+    (no void, no settle — `stale-tables.ts` is explicit that a table WITH ITEMS must never be closed by
+    a timer, and this does not); **it does not touch settled rows** (a table settled 03:59 IST would
+    otherwise vanish 6 min into a 30-min grace); it is not measured from `created_at`; and it **does
+    not close a complaint** — `gf_follow_ups` is untouched and the Tracker still carries it.
+    Guarded: `hr_day_cutoff` is honoured **only as a NIGHT rollover (00:00–07:59)**, because HR may
+    legitimately set `09:00` for payroll and a `20:00` value would blank the floor board mid-service.
+    Measured on the booted server, two orders identical but for **60 minutes**:
+    `QA203` last activity `04:30 IST` (30 min AFTER rollover) → **on the board, `due`**;
+    `QA204` last activity `03:30 IST` (30 min BEFORE) → **not on the board**. Both carry 5 items, so
+    both would be `due` if kept — the drop is the day rule, not ineligibility. Move the cutoff to
+    `03:00` and `QA204` returns (`stale_open_order` 8→7, `due` 4→5); set `09:00` or `2500` and it falls
+    back to `04:00` with `board_cutoff_source: "default"`.
+    Nothing is hidden: `meta.excluded` gained `stale_open_order` (8) and `stale_with_open_issue` (1),
+    the second rendered as its own violet banner naming the unresolved complaint. Every exclusion
+    reconciles exactly against SQL: 14 stale open orders = 4 takeaway + 2 table-row-missing + **8**.
+    After 20 board reads the four stale orders were still `open`, `voided_at` NULL,
+    `auto_close_reason` NULL; `gf_visits.open_follow_ups` still 1.
+
+  - ✅ **(3) HIGH — THE FOUR CATALOG FLAGS ARE RIGHT, and are proved per persona, not asserted.**
+    `/feedback`, `/feedback/take`, `/feedback/tracker` carry `greOnly`; `/feedback/analytics` carries
+    `mgmtOnly`; `bestEntry()` is longest-prefix so `/feedback/analytics` does NOT inherit `greOnly`,
+    and `/feedback/take/<orderId>` DOES inherit it. Both gates run **before** the null-map
+    backward-compat grant. **No code change was required.** Measured over HTTP, page by page
+    (`307→login` / `403` / `200`):
+
+    | persona | /feedback | /take | /take/&lt;id&gt; | /tracker | /analytics |
+    |---|---|---|---|---|---|
+    | no session | 307→login | 307→login | 307→login | 307→login | 307→login |
+    | **null page_access map, no role** | **403** | **403** | **403** | **403** | **403** |
+    | `users.section = 'GRE'`, no role | 403 | 403 | 403 | 403 | 403 |
+    | Captain role | 403 | 403 | 403 | 403 | 403 |
+    | **GRE role (assigned)** | **200** | **200** | **200** | **200** | **403** |
+    | Manager role (null map) | 200 | 200 | 200 | 200 | 200 |
+    | Administrator | 200 | 200 | 200 | 200 | 200 |
+
+    The second row is the point: the backward-compat grant opens every *unflagged* page to a null-map
+    user and it opens **none of these**. **Which way it errs, stated plainly:** with no role assigned
+    the answer is **NO** (403 + the "creating the role is not assigning it" remedy, printed verbatim on
+    screen), and with the role assigned the answer is YES — so the module is correct in both worlds,
+    and the failure mode before assignment is a refusal that *explains itself*, never a silent grant
+    and never a blank board. §2 now records that production has already assigned it to four people;
+    the null-role path is still real for the 8 users who carry no role. The fifth row is the fairness ruling holding — a GRE is denied
+    the league table. `GET /api/feedback/floor` agrees for all seven (401 · 403 `no_role_assigned` ·
+    403 `no_role_assigned` · 403 `role_not_gre` · 200 `scope=gre read_only=true` · 200
+    `scope=management` · 200 `scope=admin`).
+    ⚠️ **Floor Manager is 403 on all four pages while its API says 200** — re-measured and now
+    *diagnosed*: it is **role `page_access` config, not the catalog**. `Floor Manager` carries an
+    explicit `page_access` list with **no `/feedback` entry**, so `canAccessPage`'s last line refuses
+    — the four flag gates above never get a say. Proof: a fixture user on the existing **`Manager`**
+    role (`page_access` NULL) gets **200 on all four**.
+    🛑 **THIS IS NOW A FOUR-PERSON BLOCKER, NOT A FOOTNOTE.** §2 records that production has **4 users
+    assigned the `GRE` role** (Bharath · Nisha Sharma · Pushpa · Swetha) and **0 on Floor Manager**, so
+    GRE is the entire real audience. The gate and the API will say yes to all four — and if the
+    PRODUCTION `GRE` role carries an explicit `page_access` list, every one of them still gets **403 on
+    the page**. It happens to work on the local snapshot only because that copy's GRE row has
+    `page_access` NULL; §2's production table does not report the column, so this is **unverified in
+    production**. **OWNER ACTION, before this is useful to anybody:** in Settings → Roles, confirm the
+    `GRE` role grants `/feedback`, `/feedback/take` and `/feedback/tracker` (leave `/feedback/analytics`
+    off — `mgmtOnly` refuses a GRE anyway). Same for any manager role expected to open the module.
+
+  - **MEDIUMs closed (4 of them were live lies on screen):**
+    1. `/feedback/take` was still rendering **seven invented tables with invented order ids** from
+       `placeholder.ts` behind a "P1 SHELL" note. On a coverage module that is not a harmless stub —
+       tapping one routes to `/feedback/take/<id that does not exist>`, and "3 tables waiting" on a
+       quiet night is the opposite of the truth. It now reads the same `GET /api/feedback/floor`,
+       filtered to `due` + `follow_up`, with the same verbatim refusal card. Proved: `FLOOR_TABLES`
+       gone from the file, `api('/api/feedback/floor')` present, and the SSR HTML contains **0**
+       occurrences of any of the six fixture table labels (2 · 4 · 7 · 9 · 11 · 12) and no `P1 SHELL`.
+    2. **The status chips counted the whole venue while the grid showed one floor.** Pick "Rooftop" and
+       the chips read `All · 8` above 4 cards — on the numbers a GRE is measured by. Counts are now
+       derived from exactly the rows the grid draws. Proved by extracting the three `useMemo` bodies
+       **verbatim** from `page.tsx` (byte-identity asserted) and running them over a live payload:
+       all=8/8 rows, Ground Floor=4/4, Rooftop=4/4 — AGREE on every floor. The server's *ranking* is
+       still the server's; only the tally is local.
+    3. **The floor `<select>` silently reset.** `meta.floors` is derived from the tables on the board,
+       so a floor vanished from the options the moment its last table settled — and a `<select>` whose
+       value is not among its options renders the FIRST option, moving the GRE to "All floors" without
+       saying so. The selected floor is now kept, labelled `Rooftop (none open)`.
+    4. **A typed `0` in `feedback_item_threshold` re-created the exact bug P2 fixed.** `tunable()`
+       accepts any value ≥ 0, so `0` makes `item_count >= 0` true for every row — a table with nothing
+       on it becomes "Feedback Due" and `Not Ready` becomes unreachable. New `MIN_ITEM_THRESHOLD = 1`
+       clamps it and `meta.item_threshold_clamped` says so on screen. Measured:
+       absent→4 · `'0'`→**1 clamped** · `'1'`→1 · `'4'`→4 · `'6'`→6 (due 4→2, not_ready 1→3) ·
+       `'-3'`→4 · `'abc'`→4. A 0-item open table (`QA112`) stays **`not_ready`** at every setting.
+    5. **`item_threshold_is_default` lied for an unusable value.** Storing `'abc'` fell back to 4 but
+       dropped the "(default)" marker, so the footer read "becomes Feedback Due at 4 items" as if the
+       admin's value had taken effect. `usable()` now means *stored AND parseable*: `'abc'`/`'-3'` →
+       `is_default=true`, `'4'` → false, `'0'` → false + `clamped=true`.
+    6. **`board_cutoff_source` claimed a provenance the settings table did not have** —
+       `getHrDayCutoff()` returns `'04:00'` for an absent key, so the first cut credited
+       `hr_day_cutoff` when nothing was set. The raw row is now read too: absent → `"default"`,
+       `'03:00'` → `"hr_day_cutoff"`.
+    7. **The expanded items list went stale.** The card's item count refreshes every 10 s; the cached
+       detail never did, so a GRE could take feedback against a dish that was no longer on screen. It
+       re-fetches when the board's `item_count` disagrees with the cached view's.
+
+  - **MEDIUMs deliberately LEFT OPEN, with reasons:**
+    · `readOrderForFeedback()` is not scoped to the board — any non-void order in the outlet can be
+      read by id, including one months old. LOW: the read returns **no money at all** (keys verified:
+      `id · name · quantity · station · group · station_recognised · kitchen_status · fired_at ·
+      served_at · created_at`), and P3's revisit flow will legitimately need orders older than tonight.
+    · The **Sidebar's** actor carries no `role_is_active`, so a DEACTIVATED GRE role still shows the
+      three nav rows, which then 403. Cosmetic, and the fix is in `/api/auth/me` + `Sidebar.tsx` —
+      Lane A's files.
+    · `/feedback/tracker`, `/feedback/analytics` and `/feedback/take/[orderId]` still render
+      `placeholder.ts`. P4 / P5 / P3 own those.
+    · `FloorRow.in_grace` is derived from `order_status === 'settled'` alone. Correct only because the
+      SQL already bounds settled rows to the grace window — documented, not changed.
+
+  - **No regression.** 120 authenticated reads across four personas and both routes:
+    `53 orders · 104 items · 4 visits · 0 item_fb · 0 follow_ups · 64 settings · 2165 purchases ·
+    952 materials · Σquantity 150 · open 24 / settled 9 / void 20` — **identical before and after**,
+    `PRAGMA integrity_check → ok`. Read-only re-proved after the edits: POST/PUT/PATCH/DELETE on both
+    routes → **403** without a CSRF header and **405** with a valid double-submit pair (8/8); `GET` →
+    200 on both; each route file exports `GET` and nothing else; and every SQL write verb in `read.ts`
+    is inside a comment (the only non-comment hits are JavaScript `String.replace`).
+    `npx tsc --noEmit` exit **0**, zero output.
+    ⚠️ One `tsc` trap worth naming: a comment placed inside the SQL **template literal** must contain
+    no backticks — a `` `datetime('now')` `` in prose terminated the string and produced
+    `TS1005: ',' expected` 60 lines away.
+
+  - **Fixtures** (worktree DB, all `gfqa-`, removable with `DELETE ... WHERE id LIKE 'gfqa-%'`):
+    P2's set re-anchored to `datetime('now')` so the five statuses are reachable, plus **new**
+    `gfqa-s1` (3 days old), `gfqa-s2` (last night + an OPEN follow-up), `gfqa-s3`/`gfqa-s4` (the 04:00
+    boundary, 60 min apart), `gfqa-o12` (a 0-item open table), tables `gfqa-t8..t12`, and
+    `gfqa-u-mgr` / `gfqa-tok-mgr` (a user on the existing `Manager` role — **no production role config
+    was changed**). Server on **3952 killed, port free**; the owner's preview on 3001 untouched.
 
 ---
 

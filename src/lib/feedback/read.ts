@@ -62,10 +62,25 @@
  *     longer exists (hard-deleted). Both are excluded — and COUNTED in `meta`,
  *     because an order that silently vanishes from a coverage board is exactly
  *     how coverage numbers start lying.
+ *
+ *  6. AN ORDER NOBODY EVER SETTLES NEVER LEAVES. P2 gave the board an exit for
+ *     a SETTLED table (the grace window) and for a VOIDED one (the WHERE
+ *     clause), and none at all for the commonest case of the three: an `open`
+ *     order a captain simply forgot. `stale-tables.ts` measured eleven of them
+ *     on the live database — one idle 765 hours, 32 days — and nothing in this
+ *     app has ever closed one. Without an exit, each of those sits on the GRE's
+ *     board forever, and a queue that never empties is a queue nobody trusts.
+ *     §6 below is that exit. It is a FILTER, never a write: the module stays
+ *     SELECT-only, the order keeps its status, and the drop is counted in
+ *     `meta.excluded` like every other exclusion here.
  */
 
 import type Database from 'better-sqlite3';
 import { BAR_STATIONS } from '@/lib/kot-section';
+// The business-day rule is the HRMS engine's — see §6. Server-only, which this
+// file already is (its two callers are route handlers; `page.tsx` takes its
+// types with `import type`, which is erased).
+import { businessDateOf, getHrDayCutoff } from '@/lib/hr-attendance';
 import {
   FEEDBACK_ITEM_THRESHOLD_DEFAULT,
   FEEDBACK_ITEM_THRESHOLD_KEY,
@@ -105,14 +120,36 @@ export function sqlUtcToIso(raw: unknown): string | null {
    ════════════════════════════════════════════════════════════════════════════ */
 
 export interface FeedbackTunables {
-  /** §7 Q2 — "4-5 items". Admin setting `feedback_item_threshold`, default 4. */
+  /** §7 Q2 — "4-5 items". Admin setting `feedback_item_threshold`, default 4.
+   *  Never below 1 — see `MIN_ITEM_THRESHOLD`. */
   itemThreshold: number;
   /** §7 Q4 — minutes after `settled_at` during which a table still accepts a visit. */
   graceMinutes: number;
   /** True when the key is actually present, so the UI can say "default" honestly. */
   itemThresholdIsSet: boolean;
   graceIsSet: boolean;
+  /** The stored threshold was below 1 and has been raised to `MIN_ITEM_THRESHOLD`.
+   *  Reported so a fat-fingered `0` is visible on screen instead of silently
+   *  re-creating the bug P2 fixed. */
+  itemThresholdClamped: boolean;
 }
+
+/**
+ * THE FLOOR UNDER `feedback_item_threshold`, and it is not pedantry.
+ *
+ * `tunable()` accepts any value ≥ 0, so an admin typing `0` into
+ * `PUT /api/settings` reproduces EXACTLY the defect P2 measured and fixed: with
+ * the threshold at 0, `item_count >= 0` is true for every row, so a table with
+ * nothing on it at all becomes "Feedback Due" and `Not Ready` becomes
+ * unreachable. The difference is only in how it got there — a blank key then, a
+ * typed zero now — and the board is just as wrong either way.
+ *
+ * "At least one item was ordered" is the weakest trigger that still means
+ * anything; below it the word "eligible" stops carrying information. So 0 is
+ * raised to 1 and `meta.item_threshold_clamped` says so, rather than being
+ * accepted silently or rejected with an error the admin never sees.
+ */
+export const MIN_ITEM_THRESHOLD = 1;
 
 /**
  * Both keys are CODE-defaulted on purpose — `captain_area_lock` is the
@@ -137,12 +174,182 @@ export function readTunables(db: Database.Database): FeedbackTunables {
   };
   const rawThreshold = get(FEEDBACK_ITEM_THRESHOLD_KEY);
   const rawGrace = get(FEEDBACK_SETTLED_GRACE_KEY);
+  const parsedThreshold = tunable(rawThreshold, FEEDBACK_ITEM_THRESHOLD_DEFAULT);
   return {
-    itemThreshold: tunable(rawThreshold, FEEDBACK_ITEM_THRESHOLD_DEFAULT),
+    itemThreshold: Math.max(MIN_ITEM_THRESHOLD, parsedThreshold),
     graceMinutes: tunable(rawGrace, FEEDBACK_SETTLED_GRACE_DEFAULT),
-    itemThresholdIsSet: String(rawThreshold ?? '').trim() !== '',
-    graceIsSet: String(rawGrace ?? '').trim() !== '',
+    itemThresholdIsSet: usable(rawThreshold),
+    graceIsSet: usable(rawGrace),
+    itemThresholdClamped: parsedThreshold < MIN_ITEM_THRESHOLD,
   };
+}
+
+/**
+ * Did the stored value actually DECIDE anything?
+ *
+ * "Is the key present" is the wrong question, and answering it was a small lie
+ * on screen: store `feedback_item_threshold = 'abc'` and `tunable()` correctly
+ * falls back to 4, but a present-key test then dropped the "(default)" marker
+ * from the footer — so the board read "becomes Feedback Due at 4 items" with
+ * nothing to suggest the value the admin typed had been discarded. A key whose
+ * value cannot be used is, for the reader, exactly the same situation as no key
+ * at all, and the screen should say so. (`tunable()` accepts 0, so the zero the
+ * `MIN_ITEM_THRESHOLD` clamp then raises is still reported as SET — it was a
+ * real instruction, just an unusable one, and `item_threshold_clamped` is the
+ * field that says what happened to it.)
+ */
+function usable(raw: unknown): boolean {
+  const s = String(raw ?? '').trim();
+  if (s === '') return false;
+  const n = Number(s);
+  return Number.isFinite(n) && n >= 0;
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+   2b. THE BUSINESS DAY — the exit an order that is never settled needs
+   ════════════════════════════════════════════════════════════════════════════
+
+   THE PROBLEM, restated so the rule below is judged against it. `orders.status`
+   leaves the board three ways: 'void' (excluded in the WHERE), 'settled' (kept
+   only inside `graceMinutes`), and… nothing. An order that stays 'open' has no
+   exit at all, and `stale-tables.ts` measured what that means in practice on
+   the live database: eleven open orders, one of them idle 765 hours. Every one
+   of those would sit on a GRE's floor board tonight, tomorrow and next month.
+
+   WHY A BUSINESS DAY AND NOT AN IDLE TIMER. The board answers one question —
+   "which tables should I walk to NOW" — and the honest boundary for that is the
+   SERVICE, not an elapsed-hours number someone has to tune. The owner already
+   has a convention for where one service ends and the next begins, and it is
+   not midnight: `hr_day_cutoff`, default '04:00' (src/lib/hr-attendance.ts:60,
+   src/lib/db.ts:7841). A 1 a.m. table belongs to the night before, which is
+   exactly the answer a floor board wants. So:
+
+       A STILL-OPEN ORDER LEAVES THE BOARD WHEN ITS LAST ACTIVITY FALLS BEFORE
+       THE START OF THE CURRENT BUSINESS DAY.
+
+   Four things that rule deliberately does NOT do:
+
+   · IT DOES NOT WRITE. No void, no settle, no status change, nothing. This
+     module is SELECT-only and stays that way; `stale-tables.ts` owns closing
+     orders and is explicit that a table WITH ITEMS must never be closed by a
+     timer, because auto-settling invents revenue and auto-voiding writes off
+     food that was eaten. Our rule touches neither — the order is exactly as
+     stale after this filter as before it. It only stops being on a list of
+     tables to walk to.
+
+   · IT DOES NOT TOUCH SETTLED TABLES. Those already have their exit (the grace
+     window), and applying a day boundary to them would break it: a table
+     settled at 03:59 IST is in yesterday's business day, so at 04:05 it would
+     vanish six minutes into a thirty-minute grace. The grace window wins for
+     settled orders; this rule is for `open` ones, which is precisely the case
+     that had no exit.
+
+   · IT DOES NOT MEASURE FROM `created_at`. Idle is measured from the LAST
+     ACTIVITY, the same definition `stale-tables.ts:110` uses — a table that
+     punched an item ten minutes ago is not stale because it opened at seven.
+     We widen that definition by the two bill stamps: asking for the bill is
+     somebody at the table, so it counts as activity.
+
+   · IT DOES NOT SILENTLY CLOSE A COMPLAINT. `gf_follow_ups.status` is untouched
+     — an open follow-up stays open, on the Tracker and in the Analytics, for a
+     manager to deal with. What ends is the pretence that a GRE can still walk
+     over and ask. `meta.excluded.stale_with_open_issue` counts those separately
+     so the drop is a number on screen, never a disappearance. */
+
+/** The cutoff used when `hr_day_cutoff` is absent or outside the night window
+ *  below. Same value HRMS defaults to. */
+export const BOARD_CUTOFF_FALLBACK = '04:00';
+
+/** A rollover may only be set in the small hours. See `feedbackBoardCutoff()`. */
+const BOARD_CUTOFF_MAX_HOUR = 8;
+
+export interface BoardDay {
+  /** 'HH:MM' actually used. */
+  cutoff: string;
+  /** Where it came from — printed on screen, so the rule is never a mystery. */
+  source: 'hr_day_cutoff' | 'default';
+  /** The business date the board is showing, 'YYYY-MM-DD'. */
+  businessDate: string;
+}
+
+/**
+ * The cutoff this board rolls over on.
+ *
+ * It READS `hr_day_cutoff` — one venue, one idea of where the night ends, and
+ * no new settings key for the owner to discover — but it does not accept it
+ * blindly. HR owns that key for payroll reasons, and a value like '09:00' is
+ * perfectly sensible for an attendance day while being catastrophic here: the
+ * floor board would reset at 9 a.m. … and, worse, a value like '20:00' would
+ * roll the board over in the middle of dinner service and blank it while the
+ * GRE was standing on the floor. So only a NIGHT rollover (00:00–07:59) is
+ * honoured; anything else falls back to 04:00 and `source` says 'default'.
+ *
+ * Never throws: an unreadable settings table degrades to the fallback, the same
+ * direction `getStaleTableWindowHours()` degrades in.
+ */
+export function feedbackBoardCutoff(db: Database.Database, nowMs?: number): BoardDay {
+  let cutoff = BOARD_CUTOFF_FALLBACK;
+  let source: BoardDay['source'] = 'default';
+  try {
+    // `getHrDayCutoff()` already returns '04:00' for an absent or invalid key,
+    // so its answer alone cannot tell "the owner set 04:00" from "nobody ever
+    // set anything" — and `source` would then claim a provenance the settings
+    // table does not have. (`hr_day_cutoff` is NOT seeded on the measured
+    // database: `SELECT ... WHERE key='hr_day_cutoff'` returns no row.) So the
+    // raw value is read too, and the key is only credited when it supplied it.
+    const stored = String(
+      (db.prepare('SELECT value FROM settings WHERE key = ?').get('hr_day_cutoff') as any)?.value ?? '',
+    ).trim();
+    const hr = getHrDayCutoff(db);                 // already validates 'HH:MM'
+    const hour = parseInt(String(hr).slice(0, 2), 10);
+    if (Number.isFinite(hour) && hour >= 0 && hour < BOARD_CUTOFF_MAX_HOUR) {
+      cutoff = hr;
+      if (stored !== '' && stored === hr) source = 'hr_day_cutoff';
+    }
+  } catch {
+    /* fall back */
+  }
+  const businessDate = businessDateOfSafe(utcStamp(nowMs ?? Date.now()), cutoff) ?? '';
+  return { cutoff, source, businessDate };
+}
+
+/** Epoch ms → the storage shape `businessDateOf()` parses ('YYYY-MM-DD HH:MM:SS' UTC). */
+function utcStamp(ms: number): string {
+  return new Date(ms).toISOString().slice(0, 19).replace('T', ' ');
+}
+
+/**
+ * `businessDateOf()` THROWS on an unparseable timestamp — correct for an
+ * attendance punch, wrong for us: a row we cannot date must stay on the board,
+ * not fall off it. Null here means "unknown", and every caller treats unknown
+ * as KEEP.
+ */
+function businessDateOfSafe(atUtc: string, cutoff: string): string | null {
+  try {
+    const d = businessDateOf(atUtc, cutoff);
+    return /^\d{4}-\d{2}-\d{2}$/.test(d) ? d : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Is this still-open order part of the CURRENT service?
+ *
+ * `lastActivityUtc` is the raw column value (UTC, space-separated). Unknown or
+ * unparseable ⇒ true: a coverage board must over-show, never under-show.
+ * `>=` rather than `===` so a clock-skewed future stamp is kept too.
+ */
+export function isCurrentBusinessDay(
+  lastActivityUtc: unknown,
+  day: BoardDay,
+): boolean {
+  if (!day.businessDate) return true;                  // could not date "now" → keep everything
+  const s = String(lastActivityUtc ?? '').trim();
+  if (!s) return true;
+  const bd = businessDateOfSafe(s, day.cutoff);
+  if (!bd) return true;
+  return bd >= day.businessDate;
 }
 
 /* ════════════════════════════════════════════════════════════════════════════
@@ -230,6 +437,9 @@ export interface FloorRow {
   unclassified_count: number;
   /** ISO-8601 UTC. orders.created_at, repaired. */
   opened_at: string | null;
+  /** The newest of: last item punched · opened · bill requested · bill printed ·
+   *  settled. The "is this table still live" clock (§6), ISO-8601 UTC. */
+  last_activity_at: string | null;
   settled_at: string | null;
   bill_requested_at: string | null;
   bill_printed_at: string | null;
@@ -255,16 +465,32 @@ export interface FloorMeta {
   item_threshold: number;
   item_threshold_key: string;
   item_threshold_is_default: boolean;
+  /** The stored value was below 1 and was raised — see `MIN_ITEM_THRESHOLD`. */
+  item_threshold_clamped: boolean;
   grace_minutes: number;
   grace_is_default: boolean;
+  /** §6 — the service this board is showing, and the rollover that bounds it. */
+  business_date: string;
+  board_cutoff: string;
+  board_cutoff_source: BoardDay['source'];
   counts: Record<string, number>;
   floors: string[];
   /** Aggregate of every unrecognised station on the board, so a mis-stationed
    *  dish is a number on screen and not a silent reclassification. */
   unclassified: { station: string; items: number }[];
   unclassified_reason: string;
-  /** Orders deliberately kept off the board, counted rather than dropped. */
-  excluded: { takeaway_or_other: number; table_row_missing: number };
+  /** Orders deliberately kept off the board, counted rather than dropped.
+   *  `stale_open_order` is §6's exit: a still-`open` order whose last activity
+   *  predates the current business day. `stale_with_open_issue` is the subset of
+   *  those that still carry an unresolved complaint — named separately because
+   *  an open complaint leaving a board without a number beside it is the one
+   *  disappearance nobody would forgive. */
+  excluded: {
+    takeaway_or_other: number;
+    table_row_missing: number;
+    stale_open_order: number;
+    stale_with_open_issue: number;
+  };
 }
 
 /** Sort weight. Lower sorts first. Two of the five statuses are a call to
@@ -304,6 +530,7 @@ export function listFloorTables(
   opts: { outletId: string | null },
 ): { rows: FloorRow[]; meta: FloorMeta } {
   const t = readTunables(db);
+  const day = feedbackBoardCutoff(db);
   const outletId = opts.outletId ?? '';
 
   const raw = db
@@ -327,7 +554,25 @@ export function listFloorTables(
               v.created_at        AS visited_at,
               v.has_negative      AS has_negative,
               v.follow_ups_total  AS follow_ups_total,
-              v.open_follow_ups   AS open_follow_ups
+              v.open_follow_ups   AS open_follow_ups,
+              -- §6. The newest stamp that means "somebody was at this table".
+              -- MAX() is the SCALAR form and returns NULL if ANY argument is
+              -- NULL, so every one is COALESCEd to '' first — '' sorts below
+              -- every real 'YYYY-...' value, which is exactly what we want.
+              -- NOTE this is a STRING max, sound only because all five columns
+              -- are written in one shape. Measured on this database: 100% of
+              -- orders.created_at / settled_at / bill_requested_at /
+              -- bill_printed_at and order_items.created_at are the SQLite
+              -- datetime-now form YYYY-MM-DD HH:MM:SS -- zero ISO T values and
+              -- zero fractional seconds. Were one column ever written with a
+              -- T separator, T (0x54) sorts above space (0x20) and that column
+              -- would always win. Re-measure before adding a sixth.
+              MAX(COALESCE((SELECT MAX(oi_a.created_at) FROM order_items oi_a
+                             WHERE oi_a.order_id = o.id), ''),
+                  COALESCE(o.created_at, ''),
+                  COALESCE(o.bill_requested_at, ''),
+                  COALESCE(o.bill_printed_at, ''),
+                  COALESCE(o.settled_at, ''))        AS last_activity_at
          FROM orders o
          LEFT JOIN restaurant_tables t ON t.id = o.table_id
          LEFT JOIN gf_visits         v ON v.order_id = o.id
@@ -344,11 +589,25 @@ export function listFloorTables(
     )
     .all(outletId, t.graceMinutes, t.graceMinutes) as any[];
 
-  const excluded = { takeaway_or_other: 0, table_row_missing: 0 };
+  const excluded = {
+    takeaway_or_other: 0,
+    table_row_missing: 0,
+    stale_open_order: 0,
+    stale_with_open_issue: 0,
+  };
   const kept: any[] = [];
   for (const r of raw) {
     if (String(r.order_type ?? '') !== 'dine-in') { excluded.takeaway_or_other++; continue; }
     if (!r.t_id) { excluded.table_row_missing++; continue; }
+    // §6 — the exit for an order nobody ever settled. `open` ONLY: a settled
+    // order is already bounded by the grace window, and applying a day boundary
+    // to it would cut that window short for anything settled just before 04:00.
+    if (String(r.order_status ?? '') === 'open'
+        && !isCurrentBusinessDay(r.last_activity_at, day)) {
+      excluded.stale_open_order++;
+      if ((Number(r.open_follow_ups) || 0) > 0) excluded.stale_with_open_issue++;
+      continue;
+    }
     kept.push(r);
   }
 
@@ -383,6 +642,7 @@ export function listFloorTables(
       drinks_count: agg.drinks,
       unclassified_count: agg.unclassified,
       opened_at: sqlUtcToIso(r.opened_at),
+      last_activity_at: sqlUtcToIso(r.last_activity_at),
       settled_at: sqlUtcToIso(r.settled_at),
       bill_requested_at: sqlUtcToIso(r.bill_requested_at),
       bill_printed_at: sqlUtcToIso(r.bill_printed_at),
@@ -427,8 +687,12 @@ export function listFloorTables(
       item_threshold: t.itemThreshold,
       item_threshold_key: FEEDBACK_ITEM_THRESHOLD_KEY,
       item_threshold_is_default: !t.itemThresholdIsSet,
+      item_threshold_clamped: t.itemThresholdClamped,
       grace_minutes: t.graceMinutes,
       grace_is_default: !t.graceIsSet,
+      business_date: day.businessDate,
+      board_cutoff: day.cutoff,
+      board_cutoff_source: day.source,
       counts,
       floors: Array.from(new Set(rows.map((r) => r.floor))).sort((a, b) => a.localeCompare(b)),
       unclassified: Array.from(unclassified.entries())

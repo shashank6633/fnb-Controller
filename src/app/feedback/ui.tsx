@@ -383,9 +383,43 @@ export function EmptyState({ children }: { children: ReactNode }) {
 
 /* ── formatting ──────────────────────────────────────────────────────────── */
 
-/** "42m" / "2h 05m" — the Table Open elapsed display from §3 Page 1. */
+/**
+ * Epoch ms for a stamp that MUST carry a zone. NaN for anything else.
+ *
+ * ⚠️ THIS IS THE CLIENT HALF OF THE MODULE'S WORST TIMESTAMP TRAP, and it is
+ * strict on purpose. Every stamp in this database is written by SQLite's
+ * `datetime('now')`, which stores UTC as `2026-08-11 19:05:14` — a space, and
+ * no zone marker at all. V8 parses that space form as LOCAL time:
+ *
+ *     Date.parse('2026-08-11 19:05:14')   →  2026-08-11T13:35:14Z   (IST: −5h30)
+ *     Date.parse('2026-08-11T19:05:14Z')  →  2026-08-11T19:05:14Z   ✔
+ *
+ * So a table open ten minutes renders "5h 40m", on the field the owner put at
+ * the top of Page 1. The server-side repair is `sqlUtcToIso()` in
+ * `src/lib/feedback/read.ts`, and every value this module puts on the wire goes
+ * through it — but "the server always repairs it" is a promise, and Pages 2, 3
+ * and 4 are still to be written against the same columns.
+ *
+ * The original version of this function was `Date.parse(fromIso)` with a
+ * finite-check, which ACCEPTS the broken form and silently renders a wrong
+ * number. A wrong number is worse than no number here: "5h 40m" reads as a
+ * table that has been ignored all evening. So an un-zoned stamp now returns
+ * NaN, the caller renders "—", and the bug cannot be reintroduced from a page
+ * that forgets to use the repaired field — it can only be made visible.
+ */
+export function zonedMs(raw: unknown): number {
+  const s = String(raw ?? '').trim();
+  if (!s) return NaN;
+  // ISO-8601 with an explicit zone: trailing Z/z, or a ±HH:MM / ±HHMM offset.
+  if (!/[Tt]/.test(s)) return NaN;
+  if (!/([Zz]|[+-]\d{2}:?\d{2})$/.test(s)) return NaN;
+  return Date.parse(s);
+}
+
+/** "42m" / "2h 05m" — the Table Open elapsed display from §3 Page 1.
+ *  "—" when the stamp is missing or carries no timezone (see `zonedMs`). */
 export function elapsed(fromIso: string, nowMs: number): string {
-  const started = Date.parse(fromIso);
+  const started = zonedMs(fromIso);
   if (!Number.isFinite(started)) return '—';
   const mins = Math.max(0, Math.floor((nowMs - started) / 60000));
   if (mins < 60) return `${mins}m`;
