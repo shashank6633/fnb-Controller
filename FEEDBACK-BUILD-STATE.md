@@ -684,6 +684,66 @@ supported, clear status indicators, sticky Submit. Minimal typing.
     purchases 2165 · raw_materials 952 · integrity ok`). `npx tsc --noEmit` on the committed
     worktree → exit **0**, zero output. **No source file was changed by this lane.**
 
+- **2026-09-22/23 — P2 ADVERSARIAL PROBE `captains-still-work` (port 3953, no code changed).** The
+  claim under test is the one that outranks the deny itself: **nobody who works today stops working.**
+  Method: the SAME script run TWICE from a BYTE-IDENTICAL database — once with the deny REVERTED
+  (`git show 96f3b66^:src/proxy.ts`, `refusePosWrite` occurrences **0**), once with it as committed
+  (byte-identical to HEAD's `src/proxy.ts`, occurrences **3**) — in two isolated run copies, each
+  booted alone on 3953 with its own `.next`, its own `VACUUM INTO` of the same `pristine.db`
+  (**both runs started at sha256 `c3b396a2…`**), every route module warmed first so no
+  first-compile latency could move a timing-sensitive step. Everything volatile is masked
+  identically in both transcripts (UUIDs, 32-hex ids, timestamps, scan codes), so a surviving
+  difference is a real difference.
+  - **VERDICT: PHASE 1 IS IDENTICAL, LINE FOR LINE.** 91 of 91 measured HTTP lines byte-identical;
+    status histogram identical (`200 ×78 · 201 ×6 · 403 ×5 · 409 ×2`); **0** of the phase-1
+    responses in the deny build carried `feedback_read_only`. And the database agrees: a normalised
+    dump of **all 216 tables — 29,963 lines — is byte-identical**, `purchases 2165`,
+    `raw_materials 952`, `integrity_check ok` on both.
+  - **What "works" meant — real writes, not 404 probes** (74/74 steps identical, 0 changed):
+    CAPTAIN opened a table, added three dishes, changed a quantity, removed a line, fired the KOT,
+    completed and un-completed an item, recorded the guest and the party, asked for the bill twice
+    (idempotent); KDS bumped new→preparing→ready→served, **undid inside the 10s window**, reprinted,
+    resent, escalated and scanned an item out; CASHIER checked in on the floor, marked the request
+    seen, printed the bill, printed it again past the 6s coalesce window, **settled it** and
+    reprinted after settling; MANAGER voided a fired order, applied a 5% approver-verified discount,
+    waived the service charge, **held** the bill and settled it from hold; ADMIN decided a discount
+    request and settled a second bill as an override; a staff login with **no role** ran a whole
+    table and a login whose `users.section` is `'GRE'` bumped a ticket and added an item (section is
+    not the trigger — proved); FLOOR MANAGER settled and created/renamed/deleted tables; the **QR
+    flow** placed an order, the captain modified, approved (fired to the KDS) and rejected another;
+    a guest rang the service bell and the captain accepted it; **offline replay** reconstructed an
+    order and de-duplicated the re-send.
+  - **AND THEY STILL WORK AFTERWARDS.** A whole extra service (open → 2 items → fire → 3 bumps →
+    request bill → print → settle) run in phase 2 **after the deny had already refused a GRE 21
+    times**: 8 of 8 steps byte-identical, settle included.
+  - **THE ONLY DIFFERENCES ARE THE GRE'S OWN WRITES.** Phase 2: 20 of 45 lines identical, 25 changed
+    — **21 of them the GRE's forbidden writes** (403 `feedback_read_only` in the deny build against
+    the handler's own answer without it: `POST /orders`, `PATCH` add_item, `PATCH` fire, print-bill,
+    request-bill, void, settle, hold, discount, service-charge, guests, KDS bump/reprint/resend/
+    escalate/scan-out, `orders/replay`, `customer-orders/[id]` approve, discount-requests, tables
+    POST+DELETE). The remaining **4 are not behavioural**: H04/H07/H07b/H11 are the captain's own
+    steps and a field-by-field diff shows the ONLY differing leaf is `kot_number` (14/15 vs 11/12) —
+    the per-day KOT sequence, shifted by exactly the **3 KOTs the GRE itself fired** in the world
+    where nothing stopped them. Same status, same items, same money.
+  - **WHAT THE UNDENIED GRE ACTUALLY DID, from the database:** 3 orders with `server_name = 'QA Gre'`
+    (one opened from the POS, one **replayed from the offline outbox**, one QR order they approved
+    and thereby took ownership of), 3 KOTs `fired_by = 'QA Gre'`, an extra item + `bill_printed_at` +
+    `bill_requested_by = 'QA Gre'` on the CAPTAIN'S live bill (subtotal 2187 vs 1458), plus 2
+    `ct_guests`, 1 `order_guests` and 1 `kot_alerts` row. With the deny: **0 rows written by the
+    GRE**, on every one of those tables. `/api/dine-in/service-requests` stayed answerable in both
+    (G28/G29 identical) — the GRE's own job, deliberately outside the list.
+  - **Two masks, both applied identically to both runs and both the app's own randomness, not the
+    deny:** `restaurant_tables.qr_token` (db.ts:3900 back-fills a RANDOM token at boot for the one
+    fixture row whose token is NULL — `gfqa-t12`), and `sales`' bare `HH:MM` column (the two runs
+    necessarily ran in different minutes). Before masking they accounted for exactly 1 transcript
+    line and 14 dump lines, all in those two fields.
+  - Fixtures are all `capw-` prefixed and live ONLY in the scratchpad run copies (`capw-t1..t12`,
+    `capw-u-cashier` on the existing `Cashier` role, 8 sessions, and a known bcrypt password on
+    `gfqa-u-mgr` so the discount route's approver check could be exercised on its SUCCESS path).
+    **The worktree database was never booted against.** Server on **3953 killed, port FREE**, no
+    process left from this lane; the owner's preview on 3001 untouched. `npx tsc --noEmit` on the
+    committed worktree → exit **0**, zero output. **No source file was changed by this lane.**
+
 ---
 
 ## 7. OPEN DECISIONS — owner only
