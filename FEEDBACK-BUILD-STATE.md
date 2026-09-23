@@ -214,7 +214,7 @@ supported, clear status indicators, sticky Submit. Minimal typing.
 |---|---|---|---|
 | P0 | Recon — read-only: POS/order/table/role wiring, Captain-app patterns, export helpers, the read-only enforcement surface | PENDING | |
 | P1 | Foundation — `gf_` schema, nav in BOTH files, RBAC, 4 page shells | PENDING | |
-| P2 | Page 1 Floor Feedback + the READ-ONLY guarantee, proved server-side | **DONE (A + B)** | §6 2026-09-22: GET-only routes (405 with CSRF, 403 without), 40 reads → census identical, 6-persona gate, all 5 statuses live, `tunable()` zero-default bug fixed, tsc 0. **Part (B) IS NOW APPLIED** — one prefix deny at ONE boundary (`src/lib/feedback/pos-readonly.ts` + `src/proxy.ts`), zero POS route handlers edited, 23/23 forbidden writes refused for an assigned GRE, 115/115 non-GRE writes untouched. **Lane B (read/board/catalog) closed its three HIGHs + 7 MEDIUMs** — elapsed proved against a known instant, a business-day exit for the never-settled order, tier flags proved per persona; 120 reads → census identical. |
+| P2 | Page 1 Floor Feedback + the READ-ONLY guarantee, proved server-side | **DONE (A + B)** | §6 2026-09-22: GET-only routes (405 with CSRF, 403 without), 40 reads → census identical, 6-persona gate, all 5 statuses live, `tunable()` zero-default bug fixed, tsc 0. **Part (B) IS NOW APPLIED** — one prefix deny at ONE boundary (`src/lib/feedback/pos-readonly.ts` + `src/proxy.ts`), zero POS route handlers edited, 23/23 forbidden writes refused for an assigned GRE, 115/115 non-GRE writes untouched. **Lane B (read/board/catalog) closed its three HIGHs + 7 MEDIUMs** — elapsed proved against a known instant, a business-day exit for the never-settled order, tier flags proved per persona; 120 reads → census identical. **Probe `the-gre-is-denied` (2026-09-22, port 3954, no code changed): 87/87 state-changing POS requests refused against REAL rows with zero writes, the same requests measured WRITING for six other personas — but the claim is falsified once, by `POST /api/crm-calls/bookings/[id]/seat`, which opens/edits an order for any signed-in user (§6, §7 items 6-7).** |
 | P3 | Page 2 Take Feedback + item-level complaints + action + follow-up lifecycle | PENDING | |
 | P4 | Page 3 Feedback Tracker + coverage | PENDING | |
 | P5 | Page 4 Analytics + the 8 reports | PENDING | |
@@ -578,6 +578,112 @@ supported, clear status indicators, sticky Submit. Minimal typing.
     `gfqa-u-mgr` / `gfqa-tok-mgr` (a user on the existing `Manager` role — **no production role config
     was changed**). Server on **3952 killed, port free**; the owner's preview on 3001 untouched.
 
+- **2026-09-22 — P2 ADVERSARIAL PROBE `the-gre-is-denied` (port 3954, no code changed).** The claim
+  under test: *an assigned GRE cannot perform any of the owner's six forbidden actions.* Verdict:
+  **TRUE for every POS path — and FALSE once, through a door outside the prefix list.**
+
+  - **METHOD, and why it is stronger than Lane A's.** Every request was aimed at **REAL ROWS** on a
+    throw-away `VACUUM INTO` copy (`purchases 2165 · raw_materials 952 · integrity ok`), not at
+    `zz-nope`: open order `gfqa-o2` (5 items), KOT `gfqa-k1` in state `ready` (one bump from the
+    stock move), a `pending_approval` customer order `gfqa-co1`, a pending discount request, a free
+    table and a confirmed reservation. A failure of the deny is therefore a **measurable write**, not
+    a 404. Run copy in the scratchpad (`rsync` + `rsync --link-dest` node_modules, same inode
+    proved), so the worktree DB was only ever read (`?mode=ro`).
+  - **THE SIX, AS THE ASSIGNED GRE: 29 of 29 refused, three times over (87/87), with
+    `reason: feedback_read_only`.** place order · replay · customer-order approve/modify/reject ·
+    add_item · set_qty · remove_item · fire · transfer · settle · void · hold · service-charge ·
+    **print-bill** · **request-bill** · guests · discount · discount-request raise · decide · KDS
+    bump/reprint/escalate/resend/undo · scan-out · tables create/rename/delete.
+  - **NOTHING WAS WRITTEN.** Table digests (content hashes of orders, order_items, kots,
+    restaurant_tables, order_guests, discount_requests, ct_bookings, print_jobs, raw-material stock)
+    were **byte-identical before and after** each of the three 29-request runs and after the 14
+    evasion attempts — 72 refusals with zero rows changed, `integrity_check ok`,
+    `recipe_deducted 0 → 0`.
+  - 🔑 **THE CONTROL — the refusals are the deny, not broken requests.** The identical bodies, the
+    same minute: **POST /api/dine-in/orders created a real order for all six other personas**
+    (Captain · staff-no-role · section='GRE' · Floor Manager · Manager · Admin — six orders, ids
+    recorded and deleted) and was refused only for the GRE. And with the deny switched off by
+    config (below) the very requests that had just 403'd **landed**: an item was added
+    (`order_items` 106 → 107, Σqty 153 → 156), `gfqa-k1` was bumped to **served**, and `gfqa-o2` was
+    **SETTLED** (`status=settled · payment_method=cash · total ₹5601`). All restored afterwards.
+  - **CROSS-PERSONA: 0 of 29 refused** for Captain, staff-with-no-role, `section='GRE'`, Floor
+    Manager, Manager and Administrator (they got the handler's own 200/201/400/403/404/500); a
+    **forged cookie and a cookie-less request answered 401 × 29** — step 2c still holds.
+  - **TRYING TO DEFEAT THE MATCH (14 attempts).** `%2F`, `%6F`, `%2f`, a query string and a
+    `..`-segment are all **denied**. A trailing slash, a doubled leading slash and
+    `/kds/<id>/bump/` are answered by Next with **308**, and following the redirect lands on
+    **403 `feedback_read_only`** (`curl -L --post301`, three for three). Upper/mixed case and
+    `orders;x=1` are **404** — Next's router never matches them, so there is no handler to deny.
+    **The anchored negatives are proved negative:** `/api/dine-in/orders-extra`,
+    `/api/dine-in/tablesX` and `/api/reports/dine-in/orders` answer **404, never 403** — a substring
+    test would have caught all three.
+  - **READS STILL WORK** for a feedback visit: `GET /api/feedback/floor` · `/api/feedback/order/<id>`
+    · `/api/dine-in/orders` · `/orders/<id>` · `/tables` · `/kds` · `/customer-orders` ·
+    `/orders/<id>/request-bill` all **200**; `HEAD` 200 and `OPTIONS` 204 on a denied path; pages
+    **200 · 200 · 200 · 403** (analytics refused — the fairness ruling holds). The GRE's own job
+    still works: `POST /api/dine-in/service-requests/<id>` → **200**, and that route writes only
+    `service_requests` (proved by grep) so it cannot forge an eligibility trigger.
+  - **THE ELIGIBILITY TRIGGERS ARE SEALED.** Exactly three places in the repo write
+    `bill_requested_at` / `bill_printed_at`: `src/lib/bill-request.ts` (called **only** from
+    `orders/[id]/request-bill`), `orders/[id]/print-bill:121` and `orders/[id]/settle:258` — all
+    three under the denied prefix, all three measured 403. `GET …/bill-pdf` left
+    `bill_printed_at` NULL (and 403s a GRE anyway). A GRE cannot manufacture their own coverage.
+  - **THE DENY SURVIVES A DEACTIVATED ROLE** (Lane A's fix re-measured live): `is_active=0` →
+    still `403 feedback_read_only` on PATCH/bump/settle while the page 403s `role_inactive`. Also
+    unaffected by `section='Kitchen'`, by `can_request_discount=1`, and by ` gre ` (trim +
+    case-fold). Unassigning the role turns it off, as designed.
+
+  - 🐞 **HIGH — THE ONE CLAIM IS FALSIFIED BY `POST /api/crm-calls/bookings/[id]/seat`.** Its whole
+    gate is `if (!me) return 401` ("Any signed-in user", its own header says), and it calls
+    `seatBooking()` (`src/lib/ct/seating.ts:118`), which **`INSERT`s a row into `orders`**. Measured
+    as the assigned GRE on 3954:
+    `POST /api/crm-calls/bookings/9148a5f9…/seat {"table_id":"gfqa-t7"}` → **200
+    `{"ok":true,"orderId":"cbd205af-…","reused":false}`** — a live dine-in order, `status=open`,
+    `covers=2`, **`server_id=gfqa-u-gre`, `server_name="QA Gre"`** (the GRE is recorded as the
+    table's captain), plus an `order_guests` row and the booking flipped to `seated`. On a table
+    that ALREADY has an open order it takes the other branch (`seating.ts:107`) and **mutates the
+    live order**: seated onto `gfqa-t2` it wrote `guest_name`, `guest_mobile`, `booking_id` and
+    `updated_at` on **`gfqa-o2` — the same order `PATCH /api/dine-in/orders/gfqa-o2` had refused a
+    minute earlier** — and inserted the booking's guest into that table's party. It can also fill
+    `covers`, which is the **Pax** this module's own board prints.
+    **NOT FIXED, deliberately, and this is an owner question, not a code question.** The obvious
+    patch — adding `/api/crm-calls/bookings` to `POS_WRITE_PREFIXES` — would deny a GRE the entire
+    reservations subtree, and seating reservations is plausibly the GRE's *actual day job*
+    (`/dine-in/reservations`, the What's On board). Rule 5 territory. **Ask him: may a GRE seat a
+    reservation, knowing that seating opens or edits the table's order?** If yes, the prefix list
+    must say so in words; if no, deny the single `…/seat` path, not the subtree.
+  - ⚠️ **CONFIG TRAP, MEDIUM — two ticks in Settings → Roles switch the whole deny OFF.** Measured:
+    `users.is_head_chef=1` **or** `roles.is_head_chef=1` on the GRE role → `PATCH …/orders` **200**
+    and `kds/…/bump` **200**; `roles.base_role='manager'` → those plus `settle` **200**. That is
+    `isFeedbackManagement()`'s deliberate carve-out (a manager already holds those powers by tier),
+    but **"HOD" is not a tier** — it is a checkbox about approvals, and ticking it on a login that
+    still says GRE silently returns the POS write rail. Note also that the owner's own sentence is
+    *"The GRE/**Manager** may view ordered items but has READ-ONLY ACCESS"*: the shipped deny covers
+    the GRE only. Worth one line of copy next to that checkbox, or a rule that a login carrying the
+    GRE role is read-only regardless of tier.
+  - ⚠️ **ENVIRONMENT TRAP #1 — the `gfqa-tok-*` fixture sessions silently DELETE THEMSELVES, and it
+    cost this lane a whole battery.** Their `expires_at` is the space form
+    (`2026-09-22 19:40:02`). The proxy compares it in SQL (`expires_at > datetime('now')`, UTC, and
+    it passes) but `getCurrentUser()` compares it in JS — `new Date('2026-09-22 19:40:02')` parses
+    as **LOCAL** time, i.e. 5 h 30 m early on an IST box — decides the session is expired and calls
+    **`destroySession()` (auth.ts:110)**, which `DELETE`s the row. Symptom: state-changing calls
+    keep answering (the proxy sees the session) while **every GET 401s and `/api/auth/me` returns
+    `user:null`**, and the token is gone from the table. **NOT a product defect** — the only two
+    places that create sessions are `createSession()` (`expiresAt.toISOString()`, ISO+Z, parses
+    correctly) and a test script — but any fixture session must be written as
+    `strftime('%Y-%m-%dT%H:%M:%SZ','now','+2 days')`. This lane used `gfqa-tok2-*` tokens in that
+    form; the seven `gfqa-tok-*` rows in the worktree DB are, by the same arithmetic, already dead.
+  - ⚠️ **ENVIRONMENT TRAP #2 — `grep` LIES about `src/lib/bill-request.ts`.** The file contains a
+    NUL byte at line 189 (`'\0none'`, a deliberate map-key sentinel in shipped `main` code), so BSD
+    grep treats the whole file as binary and prints **nothing** — `grep -n "UPDATE orders"` on the
+    file that writes `bill_requested_at` returns exit 1. This lane nearly concluded that nothing in
+    the repo writes that column. **Use `rg -a` for any negative-result grep in this repo.**
+  - **Server on 3954 killed, port free**; the isolated run copy is the only thing that was written
+    to, and it was restored to its baseline digest after every destructive control (final:
+    `orders 54 · items 106 · Σqty 153 · recipe_deducted 0 · order_guests 0 · ct_bookings seated 0 ·
+    purchases 2165 · raw_materials 952 · integrity ok`). `npx tsc --noEmit` on the committed
+    worktree → exit **0**, zero output. **No source file was changed by this lane.**
+
 ---
 
 ## 7. OPEN DECISIONS — owner only
@@ -596,3 +702,15 @@ supported, clear status indicators, sticky Submit. Minimal typing.
    the commonest way coverage is lost. Recommend a short grace window after `settled_at`.
 5. **Floor** appears in every filter list but Floor lives on `restaurant_tables` — confirm the field
    and that it is populated before building the filter.
+6. **May a GRE seat a reservation?** 🔴 *Raised by the `the-gre-is-denied` probe, 2026-09-22, and it
+   is the one place the read-only rule is currently breached.* `POST /api/crm-calls/bookings/[id]/seat`
+   opens an order on the table (or edits the one already there) and is open to any signed-in user —
+   measured, as an assigned GRE. Seating is plausibly the GRE's own job, so the fix is his call, not
+   ours: (a) leave it and state in the code that seating is exempt; (b) deny the single `…/seat`
+   path to a GRE; (c) deny `/api/crm-calls/bookings` wholesale — which also takes away creating and
+   editing reservations. **Do not patch this without his answer** (rule 5, and the no-undo rule).
+7. **Does "HOD" outrank "GRE"?** Ticking Head Chef/HOD on a GRE login — or on the GRE role — turns
+   the POS read-only deny OFF (measured: add-item, bump and settle all 200). Same for retiering the
+   role to manager. Intended (management already holds those powers), but he should know that the
+   HOD checkbox has this side effect, and say whether a GRE-titled login should stay read-only
+   whatever its tier.
