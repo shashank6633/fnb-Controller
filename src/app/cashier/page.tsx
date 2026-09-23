@@ -219,6 +219,12 @@ export default function CashierPage() {
       flash(false, 'A 10-digit customer mobile number is required to hold a bill');
       return;
     }
+    // Name is mandatory too, and the same 2-character rule the server applies.
+    // Checked here only to fail fast with the cursor still in the field.
+    if (holdForm.name.trim().length < 2) {
+      flash(false, 'A customer name is required to hold a bill — who should we ask for when we call?');
+      return;
+    }
     act('hold', () => api(`/api/dine-in/orders/${selId}/hold`, {
       method: 'POST',
       body: { customer_name: holdForm.name, customer_mobile: digits, reason: holdForm.reason },
@@ -551,8 +557,8 @@ export default function CashierPage() {
                   Hold this bill — who is paying it later?
                 </div>
                 <div className="flex flex-wrap items-end gap-2">
-                  <label className="text-xs text-[#6B5744] min-w-[160px] flex-1">Customer name
-                    <input value={holdForm.name} onChange={e => setHoldForm({ ...holdForm, name: e.target.value })} className="block bg-white border border-[#D4B896] rounded px-2 py-1.5 text-sm w-full" placeholder="Guest name" />
+                  <label className="text-xs text-[#6B5744] min-w-[160px] flex-1">Customer name <span className="text-[#af4408]">*</span>
+                    <input value={holdForm.name} onChange={e => setHoldForm({ ...holdForm, name: e.target.value })} className="block bg-white border border-[#D4B896] rounded px-2 py-1.5 text-sm w-full" placeholder="Who is paying this later?" />
                   </label>
                   <label className="text-xs text-[#6B5744] min-w-[150px]">Mobile <span className="text-[#af4408]">*</span>
                     <input value={holdForm.mobile} onChange={e => setHoldForm({ ...holdForm, mobile: e.target.value.replace(/[^\d +\-().]/g, '') })} inputMode="tel" className="block bg-white border border-[#D4B896] rounded px-2 py-1.5 text-sm w-full" placeholder="10-digit number" />
@@ -564,7 +570,8 @@ export default function CashierPage() {
                   <button onClick={() => setHoldForm(null)} disabled={busy === 'hold'} className="border border-[#D4B896] text-[#6B5744] px-3 py-1.5 rounded text-sm">Cancel</button>
                 </div>
                 <div className="text-[11px] text-[#8A7560] mt-1.5">
-                  A mobile number is required — it is how this payment gets followed up.
+                  Name and mobile number are both required — the number is how this payment gets
+                  followed up, the name is who to ask for.
                 </div>
               </div>
             )}

@@ -136,11 +136,25 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       const req1 = db.prepare("SELECT value FROM settings WHERE key = 'boh_require_contact_at_hold'").get() as any;
       if (String(req1?.value ?? '').trim() === '0') requireContact = false;
     } catch { /* settings unreadable — the owner's rule stands, not the exception */ }
-    if (requireContact && !bohMobile) {
+    // THE OWNER'S RULING IS NAME **AND** MOBILE: "Yes Need Name And Mobile for
+    // Bill on Hold Bills for Sure". The mobile is how the payment is chased; the
+    // NAME is how anyone knows who to ask for when it rings, and it is what the
+    // accountability screen shows a manager weeks later. A held bill carrying a
+    // number and no name is a debt owed by nobody.
+    //
+    // Two characters, not one: a single letter is what gets typed to get past a
+    // required field, and it identifies no one. Trimmed, so whitespace is not a
+    // name either. Deliberately NOT stricter than that — real guests have short
+    // names, initials and one-word names, and a till at service is the wrong
+    // place to argue with somebody's name.
+    const bohNameOk = bohName.length >= 2;
+    if (requireContact && (!bohMobile || !bohNameOk)) {
       return Response.json({
-        error: bohMobileRaw
-          ? `"${bohMobileRaw}" is not a valid 10-digit mobile number. A bill on hold is chased on this number, so it has to be one that rings.`
-          : 'A customer mobile number is required to put a bill on hold — it is the only way the payment can be followed up.',
+        error: !bohMobile
+          ? (bohMobileRaw
+            ? `"${bohMobileRaw}" is not a valid 10-digit mobile number. A bill on hold is chased on this number, so it has to be one that rings.`
+            : 'A customer name and mobile number are required to put a bill on hold — they are the only way the payment can be followed up.')
+          : 'A customer name is required to put a bill on hold — the number tells you where to call, the name tells you who to ask for.',
         reason: 'boh_contact_required',
       }, { status: 400 });
     }
