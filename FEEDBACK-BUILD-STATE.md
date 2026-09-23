@@ -216,7 +216,7 @@ supported, clear status indicators, sticky Submit. Minimal typing.
 | P1 | Foundation — `gf_` schema, nav in BOTH files, RBAC, 4 page shells | PENDING | |
 | P2 | Page 1 Floor Feedback + the READ-ONLY guarantee, proved server-side | **DONE (A + B)** | §6 2026-09-22: GET-only routes (405 with CSRF, 403 without), 40 reads → census identical, 6-persona gate, all 5 statuses live, `tunable()` zero-default bug fixed, tsc 0. **Part (B) IS NOW APPLIED** — one prefix deny at ONE boundary (`src/lib/feedback/pos-readonly.ts` + `src/proxy.ts`), zero POS route handlers edited, 23/23 forbidden writes refused for an assigned GRE, 115/115 non-GRE writes untouched. **Lane B (read/board/catalog) closed its three HIGHs + 7 MEDIUMs** — elapsed proved against a known instant, a business-day exit for the never-settled order, tier flags proved per persona; 120 reads → census identical. **Probe `the-gre-is-denied` (2026-09-22, port 3954, no code changed): 87/87 state-changing POS requests refused against REAL rows with zero writes, the same requests measured WRITING for six other personas — but the claim is falsified once, by `POST /api/crm-calls/bookings/[id]/seat`, which opens/edits an order for any signed-in user (§6, §7 items 6-7).** **Probe `floor-managers-and-null-role` (2026-09-23, port 3955, no code changed): the deny is INERT in the null-role state and switches on and off with the assignment (0/27 → 26/27 → 0/27 on ONE login); 162 HTTP lines and a 33,407-line dump of all 217 tables are BYTE-IDENTICAL between the deny build and the deny reverted, for the Floor Manager and all three null-role tiers; the Page-1 truth table and the elapsed clock both pass. 🛑 But a **Floor Manager gets 403 on all four pages** while the API hands them the board — §6, and it is a config blocker, not a code one.** |
 | P3 | Page 2 Take Feedback + item-level complaints + action + follow-up lifecycle | PENDING | |
-| P4 | Page 3 Feedback Tracker + coverage | PENDING | |
+| P4 | Page 3 Feedback Tracker + coverage | **LANE A DONE** | §6 2026-09-23: `GET /api/feedback/tracker` built (GET-only, 403 without CSRF / 405 with a valid pair, 40 reads → census identical), Page 3 reads it and the placeholder import is gone, and **the door is open** — a Floor Manager / Bar Manager / Head Chef / Store Manager now gets 200 on pages 1-3 where the same build without the one-line change gives 403 on all four (control run, every other row byte-identical). Analytics stays 403 for a GRE. tsc 0. |
 | P5 | Page 4 Analytics + the 8 reports | PENDING | |
 | P6 | Full adversarial verification + carve-readiness | PENDING | |
 
@@ -871,6 +871,126 @@ supported, clear status indicators, sticky Submit. Minimal typing.
     listening at lane start had exited by the end; it was never a kill target here.
   - **NO SOURCE FILE WAS CHANGED BY THIS LANE.** Nothing was deployed; the build-only gate stands.
 
+- **2026-09-23 — P4 LANE A (Page 3 Tracker · the placeholder · the door).** Port 3981, isolated run
+  copy (`rsync` of `src/` + `rsync -a --link-dest` node_modules — same inode `252312499` proved —
+  + `VACUUM INTO` of the DB). **The worktree database was never booted against: its mtime is still
+  `Sep 22 18:41:50`.** New `src/app/api/feedback/tracker/{route.ts,query.ts}`; rewritten
+  `src/app/feedback/tracker/page.tsx`; +68 lines in `src/lib/page-catalog.ts`; a comment in
+  `src/components/Sidebar.tsx`. Fixtures are all `gftr-` and live ONLY in the run copy.
+
+  - **THE ROUTE EXISTS NOW, AND IT IS A DIFFERENT UNIVERSE FROM PAGE 1 — deliberately.** Page 1
+    answers "where do I walk now" (open + 30 min grace). Page 3 answers the Floor Manager's
+    question, and **the tables a GRE MISSED are exactly the ones that have settled and left the
+    board.** Measured on the same login, the same minute: the floor board carried 7 of the fixture
+    orders and **not** `gftr-o11` (settled 3 h ago, never visited) nor `gftr-oy` (last night, still
+    owed a revisit); the tracker carries both. Coverage off the live board would have read **4/6 =
+    66.7 %**; the truth is **4/8 = 50 %**.
+  - **THE DAY IS THE 04:00 IST BUSINESS DAY, anchored on `orders.created_at`** (Page 1 dates a row
+    by LAST ACTIVITY because it asks whether the table is alive; a ledger must not move rows between
+    days while you read it). Same `feedbackBoardCutoff()` + HRMS `businessDateOf()` as Page 1, same
+    night-window guard, no new settings key. **Proved with a 60-minute pair straddling 22:30 UTC:**
+    `gftr-ob-before` (03:30 IST) is absent from today and present under `?date=2026-09-22`;
+    `gftr-ob-after` (04:30 IST) is on today's ledger as `due`. `?date=` is format- AND real-date-
+    checked (`2026-02-31` → today + a note), refuses the future (`2030-01-01` → today + a note) and
+    is parameterised (`' OR 1=1--` → today).
+  - **EVERY FILTER IS SERVER-SIDE AND EVERY COUNT IS COMPUTED OVER THE ROWS THE LIST WILL DRAW.**
+    `filter` 6-way: all 9 · pending 4 · completed 3 · negative 4 · follow_up 2 · resolved 1, and an
+    unknown value falls back to `all` rather than blanking the page. `floor` (zone, `''` → `Floor`):
+    Rooftop 5 · Ground Floor 3 · Floor 1 · `Atlantis` 0. `captain` (Suresh 4 · Anil 2). Header
+    counts `active 8 · due 4 · taken 4 · issues 3 · follow_up 1`, coverage **50 %**.
+  - 🐞 **DEFECT FOUND AND FIXED IN THIS LANE (1) — A PERSON FILTER INVENTED A 100 % COVERAGE.**
+    First cut applied GRE/Manager to the whole page. Filtering by a person removes every UNVISITED
+    table (nobody's name is on it), so `due` went to 0 and `?gre=TR Gre One` answered **`active 2,
+    taken 2, coverage 100%`** on a floor whose real coverage was 50 % — an invented per-person score
+    under that person's own name, which is exactly what the fairness ruling forbids. The scope is
+    now TWO layers: Floor+Captain move every number; **GRE/Manager narrows the record list and its
+    chip counts only**. Re-measured: `?gre=TR Gre One` → list 3, header still `active 8 … cov 50`.
+    `meta.counts_scope` says so and the page prints it.
+  - 🐞 **DEFECT FOUND AND FIXED IN THIS LANE (2) — THE CARRIED-OVER COMPLAINT VANISHED.** The SQL
+    prefilter window is a day wider on each side (no index on `orders.created_at`, and a `T`-form
+    stamp would sort above the space form at the boundary), so last night's order was inside it,
+    was therefore already in `seen`, and its carried-over row was skipped — then the day filter
+    dropped it for belonging to another day. An OPEN guest complaint disappeared from both paths at
+    once. `seen` is now built from the rows that SURVIVED the day filter. Measured before → `carried
+    _over_follow_up 0`; after → **1**, `gftr-oy` first in the list (follow-ups sort first).
+    Carry-over is EARLIER services only (`bd < target`), so yesterday's page does not show tomorrow's
+    complaint, and carried rows are deliberately OUT of `active/due/taken/coverage` — they belong to
+    their own day's denominator — while the `follow_up` chip does include them (2 vs the header's 1).
+  - **`taken ⊆ active` IS AN INVARIANT, not a kindness:** a visited table stays in the ledger even
+    if it never met the trigger (the threshold is admin-tunable mid-service), otherwise coverage
+    could read above 100 %.
+  - **THE COVERAGE TABLE IS SEEDED FROM THE PEOPLE WHO HOLD THE ROLE, NOT FROM THE VISITS** — a GRE
+    who recorded nothing is the single most important row on this page and a visit-driven query
+    cannot produce it. Measured: `TR Gre One (gre, taken 2, tables 2, issues rec 1)` ·
+    `QA Gre (gre, taken 1, follow-ups 1 opened / 1 open)` · `QA Manager (management, taken 1, 1
+    closed)` · **`TR Gre Two (assigned, taken 0)`**. Eligible / Pending / Coverage % sit on the
+    FLOOR TOTAL row only: nothing in this app assigns a table to a person, and an invented
+    denominator in a performance table is worse than no number.
+  - 🔒 **THE FAIRNESS RULING, checked against the payload:** the per-person row carries
+    `tables_visited · taken · issues_recorded · follow_ups_opened/completed/open · share_pct` and
+    **zero** keys matching rating/score/overall/negative; ordering is by activity, never sentiment.
+    `issues_recorded` is the owner's own allowed "Issues Properly Recorded" and is labelled so more
+    is better.
+  - **READ-ONLY, PROVED THE SAME WAY PAGE 1 WAS:** the route file exports `GET` and nothing else;
+    POST/PUT/PATCH/DELETE → **403** (CSRF, `/api/feedback` prefix armed) and **405** with a valid
+    double-submit pair (8/8); GET/HEAD 200. `query.ts` contains no SQL write verb outside its own
+    header comment. **40 authenticated reads left the census byte-identical** — `orders 68 ·
+    items 174 · Σqty 220 · visits 10 · item_fb 5 · follow_ups 3 · settings 64 · purchases 2165 ·
+    materials 952 · recipe_deducted 0 · integrity ok`.
+  - **NO MONEY AND NO GUEST PII ON THE WIRE** (checked against the whole payload): no `unit_price`,
+    `line_total`, `subtotal`, `total`, tax/cgst/sgst, `discount`, `payment_method`, `guest_name` or
+    `guest_mobile`. **22 of 22 timestamps carry an explicit zone**, 0 un-zoned — raw
+    `2026-09-23 11:21:46` leaves as `…T11:21:46Z`, and the same string read as IST is 330 minutes
+    away.
+  - **THE CACHE IS NEVER THE TRUTH, and it says when it lies.** `gf_visits.open_follow_ups` forced
+    to 0 while a follow-up was open: the record still reported `open_follow_ups 1`, status
+    `follow_up`, counts unchanged, and `meta.cache_mismatch` went **0 → 1 → 0** on restore.
+  - ✅ **THE PLACEHOLDER IS GONE FROM PAGE 3** — `../placeholder` import removed, SSR HTML contains
+    **0** occurrences of `Priya`, `Kiran`, `Meera`, `Prawn Tempura`, `Biryani remade` or the invented
+    `83.3`. ⚠️ **The lane brief's item 3 was STALE: `src/app/feedback/take/page.tsx` was already
+    fixed by P2 Lane B** (it reads `GET /api/feedback/floor`, `FLOOR_TABLES` occurrences 0, SSR
+    contains 0 of the six invented table labels) — **left alone, not "re-fixed"**. The only files
+    still importing `placeholder.ts` are `take/[orderId]` (P3's) and `analytics` (Lane B's), so the
+    file must stay until those land.
+  - 🔓 **THE DOOR — `page-catalog.ts` gained ONE line, and its rule is: for `/feedback*` the
+    MODULE'S OWN GATE decides, and a role's `page_access` list can only NARROW that, never widen
+    it.** The reason absence could not mean denial: **this module has never shipped, so no role's
+    list could possibly mention it.** Measured over HTTP, 15 personas × 4 pages + the API, the SAME
+    build with and without the line (control = the line commented out, everything else identical):
+
+    | persona | /feedback /take /take/id /tracker /analytics — WITH | WITHOUT | API |
+    |---|---|---|---|
+    | Floor Manager · Bar Manager · Head Chef · Store Manager | **200 200 200 200 200** | 403 403 403 403 403 | 200 management |
+    | GRE assigned (role map NULL) | 200 200 200 200 403 | 200 200 200 200 403 | 200 gre |
+    | Manager (NULL map) · Administrator | 200 ×5 | 200 ×5 | 200 |
+    | Captain · Cashier · Staff | 403 ×5 | 403 ×5 | 403 `role_not_gre` |
+    | no role · section='GRE' no role | 403 ×5 | 403 ×5 | 403 `no_role_assigned` |
+    | junk cookie / no cookie | 403 ×5 / 307 ×5 | same | 401 |
+
+    Every row except the four management-with-an-explicit-list roles is **identical between the two
+    runs**. And the production-relevant case, measured by giving the local GRE role an explicit list:
+    **without the line an assigned GRE whose role carries a list gets 403 on all three of their
+    pages** (`["/captain","/dine-in/floor"]` → 403 403 403 403); **with it, 200 200 200 403.** §2
+    does not record the PRODUCTION `GRE` role's `page_access`, so this is the state the four real
+    GREs may be in right now.
+    **The lever, proved:** set the role's list to `["/feedback/tracker"]` → **403 403 200 403** (the
+    owner's list governs the moment it mentions the module); `["/feedback"]` → 200 200 200 403 (the
+    existing prefix grant); `["/feedback-notes"]` → 200 200 200 403 (anchored, not a substring).
+    **It cannot widen:** a Captain role with `"/feedback"` AND `"/feedback/tracker"` in its list is
+    still **403 on all four** — `greOnly` is the floor. All role-config edits were made in the RUN
+    COPY ONLY and restored (`gre=NULL`, `captain=["/captain"]`, 7 roles with a map, verified).
+    The same line is mirrored into `canAccessPageStrict()`, which is measured-but-not-wired, so
+    wiring it up later cannot silently re-close the module.
+  - **Sidebar needed no code change** — the four hrefs already twin the catalog's four paths, in the
+    same order, and the Sidebar filters with the same `canAccessPage`; `/api/auth/me` hands it
+    `role · role_name · is_head_chef · page_access` for the Floor Manager (verified live). A comment
+    now records why the rows appear. ⚠️ Still open and NOT mine to fix: that client actor carries no
+    `role_is_active`, so a DEACTIVATED GRE role still shows the nav rows, which then 403.
+  - `npx tsc --noEmit` exit **0**, zero output (with a concurrent lane's in-flight analytics files
+    present). Server on **3981 killed, port free**. ⚠️ A concurrent lane is editing this worktree
+    (`analytics/page.tsx`, `api/feedback/analytics`, `api/feedback/reports`, `lib/feedback/
+    reporting.ts`); **this commit adds only Lane A's five paths**.
+
 ---
 
 ## 7. OPEN DECISIONS — owner only
@@ -915,3 +1035,27 @@ supported, clear status indicators, sticky Submit. Minimal typing.
    that role's `page_access` in production, so the four real GREs are unverified; and (b) decide
    whether **Floor Manager** (and any other manager role he wants on this module) gets it too. The
    spec says "GRE **or Floor Manager**", and Floor Manager cannot open a single page as configured.
+   ✅ **ANSWERED IN CODE BY P4 LANE A (2026-09-23), and it is no longer a blocker — but he still has
+   the lever.** `canAccessPage` gained one anchored line: for `/feedback*` the module's own gate
+   decides, and a role's `page_access` list can only NARROW that, never widen it. So a list written
+   BEFORE this module existed (which is every list in the database) no longer reads as a refusal,
+   and Floor Manager / Bar Manager / Head Chef / Store Manager — and an assigned GRE whose role
+   carries a list — open the pages the gate admits. **Nothing was written to any role.** What is
+   still HIS: if he wants a management role kept OFF part of this module, he ticks any one feedback
+   page for that role in Settings → Roles, and from that moment his list governs that role page by
+   page (measured: `["/feedback/tracker"]` → tracker 200, the other three 403). A Captain cannot be
+   let in by adding `/feedback` to their list — `greOnly` refuses first (measured).
+
+9. **Does the Tracker's coverage table belong in front of a GRE at all?** The owner's spec puts the
+   GRE/Manager progress table on Page 3, which is a GRE-accessible page, so it ships there — but it
+   names other people's activity, and `/feedback/analytics` is management-only for exactly that
+   reason ("it ranks NAMED STAFF"). The table carries no rating, ratio or score, only activity, so
+   it satisfies the fairness ruling as written. If he would rather a GRE saw only their own row,
+   that is a one-line filter on `scope: 'gre'` — his call, not ours.
+
+10. **Eligible / Pending / Coverage % are reported for the FLOOR, never per person**, because
+    nothing in this app assigns a table to a GRE. If he wants per-person coverage, he has to tell us
+    what makes a table "theirs" — a floor/zone assignment per shift is the only honest candidate,
+    and `users.preferred_zones` already exists but is not maintained. Until then, the page shows
+    each person's real activity plus their share of the tables that were covered, and says in as
+    many words why the denominator is the room.

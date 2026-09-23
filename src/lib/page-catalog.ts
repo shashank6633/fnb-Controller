@@ -19,7 +19,7 @@
 // components (Sidebar, /customers, /settings/page-access), so an import that
 // reached for `@/lib/db` would drag better-sqlite3 into the browser. Keep it
 // that way. The dependency is one-way — access.ts must never import this file.
-import { canOpenFeedbackFloor } from './feedback/access';
+import { canOpenFeedbackFloor, isFeedbackPath } from './feedback/access';
 
 /**
  * The user shape every gate in this file reads. Structural, not `SessionUser`,
@@ -802,6 +802,58 @@ export function isGreOnlyPath(pathname: string): boolean {
 }
 
 /**
+ * Does this role's `page_access` list say ANYTHING about the Guest Feedback
+ * module?
+ *
+ * ── WHY THIS QUESTION EXISTS, AND WHAT IT DECIDES ───────────────────────────
+ * Measured on this branch (probe `floor-managers-and-null-role`, 2026-09-23): a
+ * **Floor Manager gets 403 on all four feedback pages while `GET
+ * /api/feedback/floor` answers 200 `scope=management`**. The module's own gate
+ * admits them; `canAccessPage`'s last line then refuses, because the Floor
+ * Manager role carries an explicit list — `["/","/dine-in/floor",…,
+ * "/dine-in/reservations"]` — with no `/feedback` entry. Six of the ten roles on
+ * this snapshot carry such a list, including every management role the module
+ * intends to admit, and the owner's spec names "GRE **or Floor Manager**" on
+ * every page.
+ *
+ * The reason the entry is missing is not that the owner decided against it:
+ * **this module has never shipped, so no role's list could possibly mention it.**
+ * Every one of those lists was written before `/feedback` existed. Treating
+ * "absent" as "denied" therefore reads an opinion into silence — and the result
+ * is a module whose API says yes and whose page says no, to the four people
+ * production has actually assigned.
+ *
+ * ── THE RULE, STATED ONCE ───────────────────────────────────────────────────
+ *   For `/feedback*`, the MODULE'S OWN GATE decides who may enter. A role's
+ *   `page_access` list can only NARROW that, never widen it.
+ *
+ * So:
+ *   · list never mentions the module  → the module's gate is the whole answer
+ *     (this function returns false, and `canAccessPage` grants).
+ *   · list mentions the module at all → the owner has an opinion; his list is
+ *     honoured exactly, page by page, and a feedback page he left out is
+ *     refused with the existing "tick it in Settings → Roles" card in
+ *     `proxy.ts`. **Ticking one feedback page switches that role from
+ *     module-governed to list-governed** — that is the lever, and it is the
+ *     only way to take a page away from someone the gate admits.
+ *   · the gate itself is untouched: a Captain, a Cashier or a legacy Staff
+ *     login is refused by `greOnly` LONG before this, and adding `/feedback` to
+ *     their list cannot let them in.
+ *
+ * Anchored, never a substring: `isFeedbackPath()` matches `/feedback` and
+ * `/feedback/...` only, so `/feedback-notes` in some future list is not a
+ * mention of this module. Parsing failures answer **false** (= module-governed),
+ * matching `canAccessPage`'s own "garbled value → don't lock out" direction.
+ */
+export function feedbackListedInMap(page_access: string | null | undefined): boolean {
+  if (!page_access) return false;
+  let allowed: unknown;
+  try { allowed = JSON.parse(page_access); } catch { return false; }
+  if (!Array.isArray(allowed)) return false;
+  return allowed.some((p) => typeof p === 'string' && isFeedbackPath(p.trim()));
+}
+
+/**
  * Pages that EVERY signed-in user can access regardless of their access map.
  *
  * Only /login here. The Dashboard `/` is intentionally NOT included anymore
@@ -990,6 +1042,16 @@ export function canAccessPage(
   // opened these pages to all 8 null-map users instead of closing them.
   if (isGreOnlyPath(pathname) && !canOpenFeedbackFloor(user)) return false;
 
+  // Guest Feedback governs its own door — see `feedbackListedInMap()` for the
+  // measurement and the rule. Reaching this line means the flag gates above
+  // already said YES (greOnly for pages 1-3, mgmtOnly for analytics), so the
+  // only thing left to ask is whether the owner has expressed an opinion about
+  // this module in the role's list. He cannot have, on any role written before
+  // the module existed, and "absent" must not read as "denied" — a Floor
+  // Manager was getting 403 on the page while the API served them the board.
+  // A list that DOES mention the module falls through and is honoured exactly.
+  if (isFeedbackPath(pathname) && !feedbackListedInMap(user.page_access)) return true;
+
   // No explicit map → grant everything (backward compat)
   if (!user.page_access) return true;
 
@@ -1109,6 +1171,10 @@ export function canAccessPageStrict(
   if (isMgmtOnlyPath(pathname) && !(user.role === 'manager' || user.is_head_chef)) return false;
   if (isAdminOnlyPath(pathname)) return false;
   if (isGreOnlyPath(pathname) && !canOpenFeedbackFloor(user)) return false;
+  // Kept in sync with canAccessPage deliberately: this function is MEASURED,
+  // not wired up, and the day it is wired up the feedback module must not
+  // silently go back to 403ing every management role whose list predates it.
+  if (isFeedbackPath(pathname) && !feedbackListedInMap(user.page_access)) return true;
   if (!user.page_access) return true;
 
   let allowed: string[];
