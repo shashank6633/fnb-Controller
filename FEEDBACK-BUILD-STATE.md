@@ -214,7 +214,7 @@ supported, clear status indicators, sticky Submit. Minimal typing.
 |---|---|---|---|
 | P0 | Recon — read-only: POS/order/table/role wiring, Captain-app patterns, export helpers, the read-only enforcement surface | PENDING | |
 | P1 | Foundation — `gf_` schema, nav in BOTH files, RBAC, 4 page shells | PENDING | |
-| P2 | Page 1 Floor Feedback + the READ-ONLY guarantee, proved server-side | **DONE (A + B)** | §6 2026-09-22: GET-only routes (405 with CSRF, 403 without), 40 reads → census identical, 6-persona gate, all 5 statuses live, `tunable()` zero-default bug fixed, tsc 0. **Part (B) IS NOW APPLIED** — one prefix deny at ONE boundary (`src/lib/feedback/pos-readonly.ts` + `src/proxy.ts`), zero POS route handlers edited, 23/23 forbidden writes refused for an assigned GRE, 115/115 non-GRE writes untouched. **Lane B (read/board/catalog) closed its three HIGHs + 7 MEDIUMs** — elapsed proved against a known instant, a business-day exit for the never-settled order, tier flags proved per persona; 120 reads → census identical. **Probe `the-gre-is-denied` (2026-09-22, port 3954, no code changed): 87/87 state-changing POS requests refused against REAL rows with zero writes, the same requests measured WRITING for six other personas — but the claim is falsified once, by `POST /api/crm-calls/bookings/[id]/seat`, which opens/edits an order for any signed-in user (§6, §7 items 6-7).** |
+| P2 | Page 1 Floor Feedback + the READ-ONLY guarantee, proved server-side | **DONE (A + B)** | §6 2026-09-22: GET-only routes (405 with CSRF, 403 without), 40 reads → census identical, 6-persona gate, all 5 statuses live, `tunable()` zero-default bug fixed, tsc 0. **Part (B) IS NOW APPLIED** — one prefix deny at ONE boundary (`src/lib/feedback/pos-readonly.ts` + `src/proxy.ts`), zero POS route handlers edited, 23/23 forbidden writes refused for an assigned GRE, 115/115 non-GRE writes untouched. **Lane B (read/board/catalog) closed its three HIGHs + 7 MEDIUMs** — elapsed proved against a known instant, a business-day exit for the never-settled order, tier flags proved per persona; 120 reads → census identical. **Probe `the-gre-is-denied` (2026-09-22, port 3954, no code changed): 87/87 state-changing POS requests refused against REAL rows with zero writes, the same requests measured WRITING for six other personas — but the claim is falsified once, by `POST /api/crm-calls/bookings/[id]/seat`, which opens/edits an order for any signed-in user (§6, §7 items 6-7).** **Probe `floor-managers-and-null-role` (2026-09-23, port 3955, no code changed): the deny is INERT in the null-role state and switches on and off with the assignment (0/27 → 26/27 → 0/27 on ONE login); 162 HTTP lines and a 33,407-line dump of all 217 tables are BYTE-IDENTICAL between the deny build and the deny reverted, for the Floor Manager and all three null-role tiers; the Page-1 truth table and the elapsed clock both pass. 🛑 But a **Floor Manager gets 403 on all four pages** while the API hands them the board — §6, and it is a config blocker, not a code one.** |
 | P3 | Page 2 Take Feedback + item-level complaints + action + follow-up lifecycle | PENDING | |
 | P4 | Page 3 Feedback Tracker + coverage | PENDING | |
 | P5 | Page 4 Analytics + the 8 reports | PENDING | |
@@ -744,6 +744,133 @@ supported, clear status indicators, sticky Submit. Minimal typing.
     process left from this lane; the owner's preview on 3001 untouched. `npx tsc --noEmit` on the
     committed worktree → exit **0**, zero output. **No source file was changed by this lane.**
 
+- **2026-09-23 — P2 ADVERSARIAL PROBE `floor-managers-and-null-role` (port 3955, no code changed).**
+  Two claims, and the second one outranks the deny: **a Floor Manager must still work**, and **the
+  deny must be INERT while `users.role_id` is NULL**. Method: an isolated run copy in the scratchpad
+  (`rsync` of `src/` + `rsync -a --link-dest` for `node_modules` — same inode proved,
+  `252312499` both sides — + `VACUUM INTO` for the DB), so the worktree database was only ever read
+  (`?mode=ro`). Re-vacuumed at the end of the lane: **sha256 `755affd9…` before and after, byte
+  identical, 0 `fmnr-` rows leaked into it**, `purchases 2165 · raw_materials 952 · 217 tables ·
+  integrity_check ok`. Fixtures are all `fmnr-` prefixed and live ONLY in the run copy.
+
+  - ✅ **(1) THE NULL-ROLE STATE — PROVED INERT, AND PROVED TO SWITCH ON.** The same login, the same
+    27-step POS battery, three times, restoring the DB to one baseline (`65da4d42…`) between runs:
+
+    | `users.role_id` | `roles.is_active` | battery result |
+    |---|---|---|
+    | **NULL** (unassigned) | — | **0 of 27** refused — every step got the handler's own answer |
+    | **assigned `GRE`** | 1 | **26 of 27** refused with `feedback_read_only` |
+    | **NULL again** | — | **0 of 27** refused — the login gets the POS rail straight back |
+    | **assigned `GRE`** | **0 (deactivated)** | **26 of 27** — the escalation guard holds |
+
+    The 27th step is `POST /api/dine-in/service-requests/[id]` (404 from the handler) — deliberately
+    outside the list, because answering the table's bell is the GRE's own job. **The assigned run
+    wrote NOTHING**: orders opened by that login 0, `fmnr-ov-6` still `open` with `voided_at` NULL,
+    0 KOTs, 0 `order_guests`, 0 `discount_requests`, `recipe_deducted 0`. So the property the deny
+    was designed around is real: **it refuses nobody until an administrator assigns the role, and it
+    stops refusing the moment the role is taken away.** Un-assigning is the lever, not deactivating.
+
+  - ✅ **(2) NOBODY WHO WORKS TODAY STOPS WORKING — 162 LINES AND 33,407 DUMP LINES, IDENTICAL.**
+    The same six personas, the same battery, the same order, run TWICE from the SAME baseline: once
+    with `src/proxy.ts` as committed (`refusePosWrite` ×3, byte-identical to HEAD `29dd05f`) and once
+    with it reverted to `git show 96f3b66^:src/proxy.ts` (`refusePosWrite` ×0).
+    · **Transcripts: 162 of 162 measured lines byte-identical**, status histogram identical in both
+      (`200 ×93 · 201 ×9 · 400 ×3 · 403 ×33 · 404 ×21 · 409 ×3`), **0** carrying `feedback_read_only`.
+    · **Database: a normalised `.dump` of all 217 tables — 33,407 lines — is byte-identical.** The
+      only 28 lines that ever differed are `order_items.scan_code` and `restaurant_tables.qr_token`,
+      both randomised by the app itself (the same `qr_token` mask the `captains-still-work` probe
+      names); masked identically in both runs, the difference is **0**.
+    · **The personas are the ones the claim is about:** `Floor Manager` (base_role manager),
+      `Captain`, and the three null-role tiers that production still has 8 of —
+      **null-role STAFF · null-role MANAGER · null-role ADMIN** — plus a GRE-shaped login whose role
+      is not assigned.
+    · **They did REAL WORK, not 404 probes.** Per persona, from the database: 1 order opened, items
+      punched, a quantity changed, a line removed, a KOT fired and bumped `new→preparing→ready`,
+      reprinted and escalated, a guest recorded, the bill requested and printed, held — and the three
+      manager-tier logins **settled** it, **voided** a second order and **created, renamed and deleted
+      tables**. The Floor Manager's 27 lines contain **20 successful POS writes and 0 refusals**.
+    · **The Floor Manager's existing pages are untouched:** `/` · `/dine-in/floor` · `/dine-in/tables`
+      · `/dine-in/kitchen` · `/captain` · `/reports` · `/dine-in/reservations` ·
+      `/dine-in/reconciliation` all **200**.
+    · **The deny never reaches outside `/api/dine-in/*`:** `POST` to `/api/vendors`,
+      `/api/requisitions`, `/api/wastage`, `/api/tasks`, `/api/crm-calls/bookings/[id]/seat`,
+      `/api/hr/attendance` and `/api/kitchen-production` answered identically for all five personas
+      **and for an ASSIGNED GRE** — not one cell carried `feedback_read_only`.
+
+  - 🛑 **(3) HIGH — A FLOOR MANAGER CANNOT OPEN ONE PAGE OF THIS MODULE, AND THE API DISAGREES WITH
+    THE PAGE.** Re-measured and now quantified across the whole role table. `canAccessPage` runs the
+    `greOnly` flag at line 991 — which a Floor Manager **passes**, being management — and then applies
+    the role's own `page_access` list at lines 994-1004, which refuses:
+
+    | persona | /feedback | /take | /take/&lt;id&gt; | /tracker | /analytics | `GET /api/feedback/floor` |
+    |---|---|---|---|---|---|---|
+    | no cookie at all | 307→login | 307 | 307 | 307 | 307 | `signed_out` |
+    | junk session cookie | 403 | 403 | 403 | 403 | 403 | 401 |
+    | **Floor Manager** | **403** | **403** | **403** | **403** | **403** | **200 `scope=management`** |
+    | Captain | 403 | 403 | 403 | 403 | 403 | 403 `role_not_gre` |
+    | null-role STAFF | 403 | 403 | 403 | 403 | 403 | 403 `no_role_assigned` |
+    | null-role MANAGER | 200 | 200 | 200 | 200 | 200 | 200 `scope=management` |
+    | null-role ADMIN | 200 | 200 | 200 | 200 | 200 | 200 `scope=admin` |
+    | GRE login, role NULL | 403 | 403 | 403 | 403 | 403 | 403 `no_role_assigned` |
+    | **GRE login, ASSIGNED** | **200** | **200** | **200** | **200** | **403** | 200 `scope=gre read_only=true` |
+    | GRE, role DEACTIVATED | 403 | 403 | 403 | 403 | 403 | 403 `role_inactive` |
+
+    The null-role MANAGER row is the diagnosis: it differs from the Floor Manager row **only** in
+    having `page_access` NULL. **6 of the 10 roles in this snapshot carry an explicit list and would
+    therefore 403 on all four pages** — `Floor Manager`, `Bar Manager`, `Head Chef`, `Store Manager`
+    (all management tier, all of whom the module's own gate admits), plus `Captain`, `Cashier` and
+    `Staff` (for whom the 403 is correct and intended anyway). Only `GRE` and `Manager` (NULL maps)
+    and `Administrator` (line 966) get through.
+    **CONTROL, measured:** add `/feedback` to the Floor Manager role's list and all four pages answer
+    **200** immediately (the prefix grant carries `/take` and `/tracker`; `/analytics` opens on the
+    manager tier). Reverted straight away — **production role config is the owner's, rule 5.**
+    ⚠️ §2 does not record the PRODUCTION `GRE` role's `page_access` value, so whether the four real
+    GREs can open the page is **still unverified in production**. This snapshot's GRE row is NULL,
+    which is why it passes here.
+
+  - ✅ **(4) PAGE-1 TRUTH — every line of the owner's rule, on real rows.** `GET /api/feedback/floor`
+    as a Floor Manager, one board read:
+    `3 items → not_ready` · `5 items → due (by items)` ·
+    **`2 items + bill_requested_at → due` and `eligible_by.items=false`** — the trigger is genuinely
+    independent of the count · `2 items + bill_printed_at → due` · settled 200 min ago → **off the
+    board** · settled 5 min ago → on it (grace) · voided with 6 items AND a bill request → **off the
+    board** · and the never-settled order has its exit. Threshold `4 (default)`, cutoff
+    `04:00 source=default`, business date `2026-09-23`.
+    **The stale exit is the DAY RULE, not ineligibility — proved by moving the boundary.** Two orders
+    identical but for 60 minutes straddling the 04:00 IST rollover (22:30 UTC): `fmnr-o-stale`
+    (03:30 IST) off the board, `fmnr-o-fresh` (04:30 IST) on it as `due`. Set `hr_day_cutoff='03:00'`
+    and **the stale one returns as `due`** (`stale_open_order` 17→16, `all` 9→10); set `'09:00'` and
+    it falls back to `04:00 source=default`, the night-window guard holding.
+
+  - ✅ **(5) THE CLOCK IS RIGHT, against a known instant.** Order opened at raw column
+    `2026-09-23 04:26:53`; SQL truth at read time **144 minutes**.
+    · SERVER: API `opened_at` = `2026-09-23T04:26:53Z`, `epoch 1790137613000` — **identical** to
+      reading the column as UTC; the same string parsed unrepaired on an IST box is **330 minutes**
+      away. **21 of 21 timestamps** the board emitted carry an explicit zone; 0 un-zoned.
+    · CLIENT: `zonedMs()` and `elapsed()` extracted **verbatim** from `src/app/feedback/ui.tsx`
+      (byte-identity asserted as a substring; sha256 `756f99e0…` / `17f9bcdf…`) and run under
+      `TZ=Asia/Kolkata`: **`"2h 24m"`** against a truth of 2h 24m. The OLD `Date.parse` reader on the
+      same raw column gives **`"7h 54m"`** — the 5 h 30 m lie. The raw column through the NEW reader
+      gives `"—"`. Case matrix 12/12 (note: a fractional-second stamp 10 min old correctly floors to
+      `9m`, which is arithmetic, not a defect).
+
+  - **GATES — clean.** Over the branch's whole diff vs `main` (merge-base `98e1be7`, 21 files):
+    `lq_` 1 · `src/app/party-manager` 1 · `src/lib/pm/` 1 · `src/app/fssai` 1 · `src/lib/fssai` 1 ·
+    `api/fssai` 1 · `bill-handover` 0 — and **every one of those six hits is the same two lines of
+    §0 of THIS FILE, the sentence that names the gates.** Restricted to code files (no `.md`) all
+    seven patterns are **0**, and bare-word `fssai` in code is **0** too. 0 gated module paths among
+    the changed file names.
+  - **HYGIENE.** `/Users/shashankreddy/Desktop/Claude/fnb-controller` untouched: HEAD `98e1be7` on
+    `main`, its 86 dirty files are the other gated work and **0** of them mention feedback or `fmnr`.
+    **Nothing was pushed** — `git ls-remote --heads origin guest-feedback` returns **0 rows** and the
+    branch has no upstream. `npx tsc --noEmit` on the committed worktree → exit **0**, zero output.
+    Worktree `git status` clean at `29dd05f` before this entry. Server on **3955 killed, 0 listeners,
+    no process left from this lane**; the kill selector only ever matched `-p 3955` and my own
+    `FMNR/wt` path, and both sibling lanes' servers (`BOHSEC`, `DOUBLE3963`) were verified alive
+    afterwards. ⚠️ Observation, not an action of this lane: a sibling `next start -p 3965` that was
+    listening at lane start had exited by the end; it was never a kill target here.
+  - **NO SOURCE FILE WAS CHANGED BY THIS LANE.** Nothing was deployed; the build-only gate stands.
+
 ---
 
 ## 7. OPEN DECISIONS — owner only
@@ -774,3 +901,17 @@ supported, clear status indicators, sticky Submit. Minimal typing.
    role to manager. Intended (management already holds those powers), but he should know that the
    HOD checkbox has this side effect, and say whether a GRE-titled login should stay read-only
    whatever its tier.
+8. **Which roles get `/feedback` in their page list?** 🔴 *Re-raised and quantified by the
+   `floor-managers-and-null-role` probe, 2026-09-23 — this is a CONFIG blocker on the module being
+   usable at all, not a code defect.* `canAccessPage` runs the module's `greOnly`/`mgmtOnly` gates
+   FIRST (a Floor Manager passes them) and then applies the role's own `page_access` list, which
+   refuses. Measured on this snapshot: **6 of 10 roles carry an explicit list and get 403 on all four
+   pages** — `Floor Manager`, `Bar Manager`, `Head Chef`, `Store Manager` (all management, all of
+   whom the module intends to admit), plus `Captain`, `Cashier`, `Staff` (correctly refused anyway).
+   Only `GRE` and `Manager` (NULL maps) and `Administrator` pass. A Floor Manager today gets
+   **403 on the page and 200 from `GET /api/feedback/floor`**. Adding `/feedback` to the role's list
+   opens all four immediately (measured, then reverted — rule 5).
+   **He must, in Settings → Roles:** (a) add `/feedback` to the **GRE** role — §2 does not record
+   that role's `page_access` in production, so the four real GREs are unverified; and (b) decide
+   whether **Floor Manager** (and any other manager role he wants on this module) gets it too. The
+   spec says "GRE **or Floor Manager**", and Floor Manager cannot open a single page as configured.
