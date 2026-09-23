@@ -1,7 +1,7 @@
 'use client';
 import { useState } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
-import { Loader2, LogIn, ShieldCheck, UserCog } from 'lucide-react';
+import { Eye, EyeOff, Loader2, LogIn, ShieldCheck, UserCog } from 'lucide-react';
 
 /**
  * The sign-in form. Split out of page.tsx so that page.tsx can be a SERVER
@@ -25,10 +25,20 @@ export default function LoginForm({ switchingFrom }: { switchingFrom?: string })
   const [password, setPassword] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Peek at the password while typing. Front-of-house tablets are shared and
+  // the on-screen keyboard hides half the screen, so a typo in a masked field
+  // is the commonest reason a sign-in fails twice. STARTS HIDDEN, is never
+  // persisted, and re-hides on submit so a revealed password cannot be left on
+  // screen for the next person on a shared device.
+  const [showPassword, setShowPassword] = useState(false);
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     setBusy(true); setError(null);
+    // Re-mask before the request goes out. On a shared front-of-house tablet a
+    // revealed password would otherwise stay on screen through the round trip,
+    // and stay there in full if the sign-in fails.
+    setShowPassword(false);
     try {
       const r = await fetch('/api/auth/login', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -74,8 +84,29 @@ export default function LoginForm({ switchingFrom }: { switchingFrom?: string })
           </label>
           <label className="block text-xs text-[#6B5744]">
             Password
-            <input type="password" value={password} onChange={e => setPassword(e.target.value)} required
-                   className="w-full mt-1 px-3 py-2 border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] text-sm" />
+            {/* The eye sits INSIDE a relative wrapper rather than beside the
+                input, so the field keeps its full width and the icon cannot be
+                pushed onto a second line on a narrow phone. pr-10 reserves the
+                space so a long password never runs underneath it. */}
+            <div className="relative mt-1">
+              <input type={showPassword ? 'text' : 'password'} value={password}
+                     onChange={e => setPassword(e.target.value)} required
+                     autoComplete="current-password"
+                     className="w-full px-3 py-2 pr-10 border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] text-sm" />
+              {/* type="button" is load-bearing: the default inside a <form> is
+                  "submit", so without it a peek would try to sign you in.
+                  tabIndex={-1} keeps Tab going Email → Password → Sign in, the
+                  order muscle memory expects; the control is still reachable by
+                  touch and by screen readers, which is what it is for. */}
+              <button type="button" tabIndex={-1}
+                      onClick={() => setShowPassword(v => !v)}
+                      aria-label={showPassword ? 'Hide password' : 'Show password'}
+                      aria-pressed={showPassword}
+                      title={showPassword ? 'Hide password' : 'Show password'}
+                      className="absolute inset-y-0 right-0 flex items-center justify-center w-10 text-[#8B7355] hover:text-[#af4408]">
+                {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+              </button>
+            </div>
           </label>
           {error && <p className="text-xs text-red-600 bg-red-50 border border-red-200 rounded-lg px-3 py-2">{error}</p>}
           <button type="submit" disabled={busy}
