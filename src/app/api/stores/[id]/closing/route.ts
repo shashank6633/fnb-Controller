@@ -22,7 +22,11 @@ import type { PackMeta } from '@/lib/pack-units';
  *
  * POST                    (can_close_stock)
  *      { date, items: [{ material_id, physical_qty (RECIPE units), note? }],
- *        note?, adjust_to_physical? }
+ *        note?, adjust_to_physical?, store_id? }
+ *      `store_id` is the store the CLIENT gathered these counts for. Optional;
+ *      when present it must equal the store in the URL or the whole sheet is
+ *      refused with 409 + `store_mismatch` and nothing is written (see the
+ *      wrong-floor refusal in POST).
  *      Each item's optional `note` (per-row) persists to the count row; when
  *      absent/blank it falls back to the batch-level `note` (default '').
  *      For each item: system qty = ledger SUM as-of end of `date`;
@@ -173,6 +177,46 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     }
 
     const b = await request.json();
+
+    /* ══════════════════════════════════════════════════════════════════════
+     * THE WRONG-FLOOR REFUSAL — before anything is validated or written
+     * ══════════════════════════════════════════════════════════════════════
+     * BAR FLOOR 1/2/3 and the LIQUOR STORE are separate store_locations with
+     * separate ledgers, and a count saved here raises a variance approval
+     * that an admin can turn into real stock. In Sep 2026 the liquor Closing
+     * Stock grid was found carrying typed counts across a floor switch (its
+     * per-material state was keyed on material_id alone and never reset when
+     * the store changed), so a Save taken while looking at BAR FLOOR 2 wrote
+     * a real count row AND a real pending approval for a floor nobody had
+     * counted. The screen has been fixed; this is the floor under it.
+     *
+     * The client now declares, in the body, WHICH store the figures it is
+     * sending were gathered for. If that disagrees with the store in this
+     * route's URL, the sheet is aimed at the wrong floor and NOTHING is
+     * written — no count row, no variance approval, no ledger movement.
+     *
+     * OPTIONAL BY DESIGN, and that is not a hole. A body without `store_id`
+     * asserts nothing and is treated exactly as it always was, so nothing
+     * that posts here today breaks. The field only ever ADDS a refusal: a
+     * caller that names a store is held to it. Making it mandatory would
+     * turn a defence into an outage the first time a script or an older tab
+     * posted an honest sheet.
+     *
+     * 409, not 400: the payload is well formed, it is the state behind it
+     * that has moved on. The liquor page's 409 branch looks for `zero_guard`
+     * and falls through to surfacing `error` when it is absent, so the
+     * counter reads the sentence below rather than a bare status. */
+    const claimedStoreId = String(b.store_id ?? b.storeId ?? '').trim();
+    if (claimedStoreId && claimedStoreId !== storeId) {
+      const claimed = getStoreById(db, claimedStoreId);
+      return Response.json({
+        error: `This count sheet was filled in for ${claimed ? claimed.name : 'another store'}` +
+               ` but was sent to ${store.name}. Nothing was saved — reopen Closing Stock on` +
+               ` ${claimed ? claimed.name : 'the store you counted'} and save it there.`,
+        store_mismatch: { expected: storeId, expected_name: store.name, got: claimedStoreId, got_name: claimed?.name ?? null },
+      }, { status: 409 });
+    }
+
     // The RAW body date. Trimmed HERE, at the call site, because this field has
     // always tolerated a padded paste and the shared guard deliberately does
     // not (see its "no whitespace tolerance" note). Nothing below binds this
