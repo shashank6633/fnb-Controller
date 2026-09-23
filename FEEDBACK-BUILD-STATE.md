@@ -991,6 +991,126 @@ supported, clear status indicators, sticky Submit. Minimal typing.
     (`analytics/page.tsx`, `api/feedback/analytics`, `api/feedback/reports`, `lib/feedback/
     reporting.ts`); **this commit adds only Lane A's five paths**.
 
+- **2026-09-23 — P6 ADVERSARIAL PROBE `access-and-fairness` (port 3985, no source file changed).**
+  Two claims: **the right people get in**, and **no metric rewards a GRE for staying silent.** The
+  first holds everywhere I could push it. **The second is FALSE on Page 4 and in seven of the eight
+  downloads, and it is falsified by construction, not by argument.** Isolated run copy in the
+  scratchpad (`rsync` of `src/` + `rsync -a --link-dest` node_modules — same inode `252312499` —
+  + `VACUUM INTO` of the DB); **the worktree database was never booted against** (mtime still
+  `Sep 22 18:41:50`, 0 rows carrying my `p6-`/`p6a-` prefixes, `purchases 2165 · raw_materials 952 ·
+  integrity ok`). Fixtures are all `p6-`/`p6a-` and live ONLY in the run copy.
+
+  - 🔴 **CRITICAL — SELECTING A GRE IN THE PAGE 4 FILTER BUILDS THE SCORECARD THE FAIRNESS RULING
+    FORBIDS, AND IT IMPROVES WHEN THE GRE RECORDS NOTHING.** `options.gres` populates a **GRE**
+    `<Select>` (`analytics/page.tsx:352`); picking a name narrows the WHOLE dashboard — the rating
+    split, the four `tone="bad"/"warn"` tiles, Most Complained, Service Recovery — to that person,
+    and the only filter-aware copy on the page (line 389) talks about **coverage** and nothing else.
+    **THE FLIP, one GRE, the same four tables, the same four visits, only what she wrote down
+    changed** (`P6 Gre Two`, measured, then restored byte-identically):
+
+    | filtered to `P6 Gre Two` | recorded HONESTLY | recorded "everything good" |
+    |---|---|---|
+    | Feedbacks taken | 4 | 4 |
+    | Coverage | 33.3 % | 33.3 % |
+    | Overall rating split | **Excellent 0 (0.0 %) · Average 4 (100.0 %)** | **Excellent 4 (100.0 %)** |
+    | Negative item feedbacks (red tile) | **4** of 4 | **0** |
+    | Returned/Remade/Replaced · Pending follow-ups | 4 · 2 | 0 · 0 |
+    | Most complained | Chicken Tikka, negative 100 % | — |
+
+    **It is not only on screen — it downloads.** `GET /api/feedback/reports?report=daily&format=xlsx
+    &gre=P6%20Gre%20Two` produced two workbooks, both headed `GRE: P6 Gre Two`, both `Coverage 33.3%`
+    and `Feedbacks taken 4`: the honest one reads `Excellent | 0 | 0.0%`, `Average | 4 | 100.0%`,
+    `Negative item feedbacks | 4`; the silent one reads `Excellent | 4 | 100.0%`,
+    `Negative item feedbacks | 0`. The PDF carries the same (`pdftotext`: `Excellent … 0 … 0.0%`,
+    `Average … 4 … 100.0%`, footnote `• GRE: P6 Gre Two`). **7 of the 8 reports take `&gre=`**; only
+    `gre-performance` is protected, and it says so in its own subtitle — *"Coverage and
+    follow-through only. No rating the guests gave appears in this report."* That sentence is exactly
+    right, and it is exactly what the other seven do not honour.
+    **WHAT IS NOT WRONG, measured in the same breath, so the fix is surgical:** the unfiltered
+    dashboard is venue-level; `gre_performance` carries `person · role · tables_visited ·
+    issues_recorded · follow_ups_raised/completed/open · recovery_pct` and **zero sentiment keys**;
+    Page 3's coverage table likewise (`tables_visited · taken · issues_recorded · follow_ups_* ·
+    share_pct`). Under the flip **none of the allowed metrics moved**: `tables_visited 4 → 4`,
+    `taken 4 → 4`, `share_pct 40 → 40`, venue `coverage_pct 83.3 → 83.3`. Recording a complaint costs
+    a GRE nothing on any number the owner named — it is the *person filter over the sentiment
+    sections* that reverses that, on screen and in a file that can be e-mailed.
+
+  - ⚠️ **MEDIUM — THE OWNER'S NARROWING LEVER IS PAGE-ONLY; THE API IGNORES IT.** Set the GRE role's
+    `page_access` to `["/feedback/take"]` (the lever P4 Lane A documents) and the pages answer
+    `/feedback 403 · /take 200 · /tracker 403 · /analytics 403` — while **`GET /api/feedback/tracker`
+    answers 200** with all 12 records and the per-person coverage table naming every GRE's activity
+    (`['P6 Gre One','P6 Gre Two','P6 Gre Three','QA Gre']`), and `/api/feedback/floor` and
+    `/order/<id>` answer 200 too. The routes gate on `feedbackAccess()`, which never reads
+    `page_access`; so "he ticks one page and his list governs that role page by page" is true of the
+    screen and false of the URL. No money or guest PII is in those payloads, and analytics stays 403.
+
+  - ⚠️ **MEDIUM — ON PAGE 4 THE GRE WHO TOOK NO FEEDBACK AT ALL DOES NOT EXIST.** `grePerformance()`
+    is built from visits, so a GRE with zero visits has **no row**: measured, `QA Gre` (assigned the
+    GRE role, 0 visits tonight) appears on **Page 3** as `kind=assigned · tables_visited 0 · taken 0`
+    and is **absent from Page 4's performance table and from the GRE/Manager Performance workbook**,
+    where `P6 Gre Two` appears with `Open 2`. Total silence is the one behaviour the management page
+    cannot see, while the honest recorder is the one carrying visible open work.
+
+  - ⚠️ **LOW — the two numbers on the ALLOWED list that can still read worse for a recorder.**
+    `recovery_pct = follow_ups_completed / follow_ups_raised`: `P6 Gre Three` (2 complaints recorded,
+    neither revisited yet) prints **`0.0%`** in the workbook where `P6 Gre One` (nothing recorded)
+    prints **`-`**; `Open` is 2 against 0. The denominator is "complaints you wrote down", so the
+    only way to never show a low recovery rate is to never record one. Defensible — Guest Recovery
+    Follow-Up is the owner's own metric and the remedy is to go back and close it — but it should be
+    labelled as a work queue, not a score, and "-" must never sort above "0.0%".
+
+  - ⚠️ **LOW — a venue number on a person's card.** Filtered to `P6 Gre One`, who raised **0**
+    follow-ups, the Pending follow-ups tile reads `0` with the hint **"4 open now (all dates)"** —
+    `open_follow_ups_now` is deliberately not range-bound and is also not person-bound, so a card
+    headed with one name carries the venue's open count.
+
+  - ✅ **ACCESS — THE RIGHT PEOPLE GET IN, PAGE *AND* API.** 13 personas × 5 pages × 5 API routes on
+    the committed build: **GRE (assigned) 200 200 200 200 / analytics 403** — and 403 from
+    `/api/feedback/analytics` AND all 16 `/api/feedback/reports?report=…&format=…` combinations
+    (8 keys × xlsx|pdf), reason `management_only`; **Floor Manager · Bar Manager · Head Chef · Store
+    Manager · Manager · Administrator 200 on all four pages**, 200 on every API; **Captain · Cashier
+    · Staff · no-role · section='GRE' 403 everywhere** (`role_not_gre` / `no_role_assigned`);
+    junk cookie → 403 pages / 401 API; no cookie → 307 → `/login` / 401 API.
+    **THE CONTROL PROVES THE FIX:** the same run copy with the `page-catalog.ts` door line commented
+    out in BOTH functions, server restarted, everything else identical — **Floor Manager, Bar
+    Manager, Head Chef and Store Manager go 403 403 403 403 while the API still serves them 200**;
+    every other row is unchanged (GRE 200 200 200 403, Captain 403, Admin/Manager 200). Restored,
+    server restarted, re-measured: the matrix returns to the first reading. `src` trees byte-identical
+    to the worktree afterwards (`diff -rq` clean, page-catalog sha256 `59bfb85a…` on both).
+    **THE LEVERS, re-proved on role config edited in the RUN COPY ONLY and restored:** GRE role given
+    a list that never mentions the module → still 200 200 200 403; `["/feedback/tracker"]` → 403 403
+    200 403; a **Captain** role carrying `/feedback` AND `/feedback/analytics` → **still 403 on all
+    four** (`greOnly` is the floor, the door cannot widen); GRE role `is_active=0` → 403 on all four
+    pages and the API, and the POS deny still answers `feedback_read_only` (no escalation).
+  - ✅ **EVERY ROUTE GATES ITSELF, AND NONE OF THEM ANSWERS A WRITE.** 20 of 20: POST/PUT/PATCH/DELETE
+    on all five routes → **403** with no CSRF header and **405** with a valid double-submit pair,
+    GET and HEAD 200. **12 evasion attempts as a GRE all refused:** trailing slash and `//` → 308 and
+    **403 when followed**, `..`-segment 403, query string 403, `?item_key=` 403, upper-case and
+    `%61nalytics` → 404 (no route), four spoofed headers (`x-user-role: admin`, `x-role-name`,
+    `x-forwarded-user`, `x-fnb-scope`) → 403. Cookie stuffing only ever yields the LAST
+    `fnb_session` value's own rights — not an escalation, since it needs a token you already hold.
+    The GRE's 403 page is the access card: 0 occurrences of any fixture name, item or payload key.
+  - ✅ **THE GRE READ-ONLY DENY (96f3b66) STILL HOLDS, on REAL rows.** 13 of 13 forbidden writes →
+    **403 `feedback_read_only`** (place order · add_item · set_qty · remove_item · fire · replay ·
+    settle · void · print-bill · request-bill · discount · KDS bump · create table) against open
+    order `p6a-o1` and KOT `a1bd9e7c…` in state `new`; reads still 200. Census byte-identical across
+    the battery (`orders 65 · items 164 · Σqty 270 · kots 17 · tables 27 · guests 0 ·
+    recipe_deducted 0 · purchases 2165 · materials 952`), `p6a-o1` still `open` with every bill stamp
+    NULL and the KOT still `new`. **CONTROL:** the *same* add_item body as a **Captain** returned
+    **200 and wrote the row** (`order_items 164→165, Σqty 270→271`) — so the refusals are the deny,
+    not malformed requests; the row was deleted and the census returned to `164 / 270`,
+    `integrity_check ok`.
+  - **GATES — clean.** Over the branch's CODE files vs `main` (merge-base `98e1be7`, 25 code files):
+    `lq_` 0 · `src/app/party-manager` 0 · `src/lib/pm/` 0 · `src/app/fssai` 0 · `src/lib/fssai` 0 ·
+    `api/fssai` 0 · bare `fssai` 0 · `bill-handover` 0 · `boh_` 0; 0 changed file names touch a gated
+    path. `npx tsc --noEmit` on the worktree → exit **0**. `npm run build` on the byte-identical tree
+    → **exit 0**, "Compiled successfully in 26.9s", all five `/api/feedback/*` routes and four pages
+    in the manifest; the only 2 warnings are the pre-existing `next.config.ts`/`sheets-client.ts` NFT
+    traces. Worktree clean at `7158feb`; `/Users/shashankreddy/Desktop/Claude/fnb-controller`
+    untouched (81 dirty files, **0** mentioning feedback or my prefixes). Server on **3985 killed,
+    0 listeners, no process of mine left**; the sibling fleet on 3997 was verified still alive.
+    **NO SOURCE FILE WAS CHANGED BY THIS LANE.** Nothing was deployed; the build-only gate stands.
+
 ---
 
 ## 7. OPEN DECISIONS — owner only
@@ -1053,7 +1173,23 @@ supported, clear status indicators, sticky Submit. Minimal typing.
    it satisfies the fairness ruling as written. If he would rather a GRE saw only their own row,
    that is a one-line filter on `scope: 'gre'` — his call, not ours.
 
-10. **Eligible / Pending / Coverage % are reported for the FLOOR, never per person**, because
+11. **Should Page 4's filters be allowed to build a per-person card?** 🔴 *Raised by the
+    `access-and-fairness` probe, 2026-09-23, and it is the one place the fairness ruling is currently
+    breached.* The owner's own spec lists **GRE** among Page 4's filters, and the module honours it —
+    but picking a name narrows the RATING SPLIT and the four red/amber tiles too, so the same GRE on
+    the same four tables reads `Excellent 4 (100%) · Negative 0` if she records nothing and
+    `Excellent 0 · Average 4 (100%) · Negative 4` if she records what the guests said, at identical
+    coverage (33.3%) and identical "Feedbacks taken" (4). Seven of the eight downloads accept the
+    same `&gre=` and print it into an e-mailable file. Three ways out, all cheap: (a) the GRE /
+    Manager filter narrows only the RECORD-level sections (comments, menu items, recovery) and never
+    the rating split or the negative tiles — the shape Page 3 already uses; (b) it narrows
+    everything, but the filtered state replaces the rating block with "records <name> took" and
+    carries the fairness sentence into the header and into every export; (c) the filter is limited to
+    management logins reviewing their own recovery queue. **Recommend (a)** — it is the same rule the
+    Tracker already proved, and it keeps the filter the owner asked for. Until he answers, the safe
+    reading is that Page 4 must not be used to appraise a GRE.
+
+12. **Eligible / Pending / Coverage % are reported for the FLOOR, never per person**, because
     nothing in this app assigns a table to a GRE. If he wants per-person coverage, he has to tell us
     what makes a table "theirs" — a floor/zone assignment per shift is the only honest candidate,
     and `users.preferred_zones` already exists but is not maintained. Until then, the page shows
