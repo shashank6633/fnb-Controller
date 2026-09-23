@@ -1,58 +1,108 @@
 'use client';
 
 /**
- * Page 4 — ADMIN ANALYTICS & REPORTS  (route: /feedback/analytics)
+ * Page 4 — ADMIN ANALYTICS & REPORTS  (route: /feedback/analytics)  ·  P5, LIVE
  *
- * Spec §3 Page 4. The reports live HERE, not on a fifth page: dashboard counts,
- * the date + scope filters, Menu Item Analysis, Most Common Problems / Most
- * Complained / Most Appreciated, Service Recovery Analysis, and the eight
- * Excel/PDF downloads.
+ * Spec section 3 Page 4. The reports live HERE, not on a fifth page: dashboard
+ * counts, the date + scope filters, Menu Item Analysis, Most Common Problems /
+ * Most Complained / Most Appreciated, Service Recovery Analysis, GRE/Manager
+ * performance, and the eight Excel/PDF downloads.
  *
- * TWO RATES THE OWNER NAMED, AND THEIR DENOMINATORS — "total complaints alone
- * can be misleading":
- *   · Negative Feedback %  = negative feedbacks ÷ feedbacks RECEIVED for that
- *     item. A quality measure. Using quantity sold instead would punish a
- *     popular dish for being ordered often and would silently reward an item
- *     nobody bothers to comment on.
- *   · Return / Remake Rate = (returned + remade) ÷ quantity SOLD. An operations
- *     measure: what share of plates that left the kitchen came back. Sold is
- *     the right denominator here because the question is about the kitchen's
- *     output, not about how many guests were asked.
- * Both are computed in `rates()` below so the two pages that show them cannot
- * diverge. P0 Lane B flagged the choice as worth confirming with the owner; the
- * reasoning is written down here so that conversation starts from a position.
+ * ── WHAT CHANGED FROM THE P1 SHELL ──────────────────────────────────────────
+ * Every tile, table, list and button on this page used to be inert. The page
+ * imported `../placeholder.ts` and fetched NOTHING AT ALL — zero
+ * `/api/feedback` references in 524 lines — so a manager reading it was reading
+ * invented numbers with no way to tell. It now reads
+ * `GET /api/feedback/analytics` for everything and
+ * `GET /api/feedback/reports?report=..&format=..` for the downloads, and it
+ * imports no fixture.
  *
- * 🔒 THE FAIRNESS RULING. Nothing on this page ranks a GRE by what the guests
- * said. GRE/Manager Performance is a coverage report — tables visited,
- * follow-ups completed, issues properly recorded — and the note at the foot of
- * the page says so on screen, where whoever reads the dashboard will see it.
+ * ── THE TWO RATES, AND WHY BOTH APPEAR BESIDE THEIR COUNTS ──────────────────
+ * The owner: *"This is important because total complaints alone can be
+ * misleading."* A dish sold 500 times with 7 complaints is not the dish sold 12
+ * times with 5.
+ *   · Negative %   = negative feedbacks / feedbacks received for that item.
+ *                    Both sides count feedback rows — a QUALITY measure.
+ *   · Ret/Rem %    = plates returned + remade / plates SOLD. Both sides are
+ *                    quantities — an OPERATIONS measure.
+ * Two different denominators on purpose. They are computed ONCE, server-side in
+ * `src/lib/feedback/reporting.ts`, so this page and the eight downloads cannot
+ * disagree about the restaurant's coverage.
  *
- * 390px: every table goes through `TableScroll`, so the page body itself never
- * scrolls sideways. Tiles are two per row.
+ * ── 🔒 THE FAIRNESS RULING ──────────────────────────────────────────────────
+ * Nothing here ranks a GRE by what the guests said. The performance table
+ * carries Tables Visited, Issues Recorded, Follow-Ups Completed/Open and
+ * Recovery Follow-Up % — and `meta.fairness_note` prints the reason on screen,
+ * where whoever reads the dashboard will see it. "Issues Recorded" is shown in
+ * the SAME neutral ink as every other count, deliberately: colouring it red
+ * would make recording a complaint look like a mark against the recorder, which
+ * is the exact behaviour the ruling forbids.
+ *
+ * ── MANAGEMENT ONLY ─────────────────────────────────────────────────────────
+ * `page-catalog.ts` carries `mgmtOnly` for this path, and the API gates itself
+ * with `requireFeedbackAnalyst()` — the page flag alone would not stop a GRE
+ * fetching the URL (hard rule 9: `proxy.ts` guards PAGES, NOT APIs). A refusal
+ * renders the server's own `what_to_do` verbatim rather than an empty
+ * dashboard, because an empty dashboard is indistinguishable from "nobody
+ * complained today", which is the most dangerous sentence this page could say.
+ *
+ * ── 390px ───────────────────────────────────────────────────────────────────
+ * Every table goes through `TableScroll`, so the page body itself never scrolls
+ * sideways. Tiles are two per row.
  */
 
-import { useMemo, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
 import {
   Download, FileSpreadsheet, FileText, Search, TrendingDown, ThumbsUp, RotateCcw, Smile, Frown,
+  Lock, RefreshCw, AlertTriangle, MessageSquare,
 } from 'lucide-react';
+import { api } from '@/lib/api';
+import { DATE_RANGES, ITEM_GROUPS, REPORTS, type ItemGroup } from '@/lib/feedback';
+import type { AnalyticsPayload, ItemCommentRow, MenuItemRow } from '@/lib/feedback/reporting';
 import {
-  DATE_RANGES, ITEM_GROUPS, REPORTS, type ItemGroup,
-} from '@/lib/feedback';
-import {
-  ANALYTICS_SUMMARY, CAPTAIN_NAMES, COMMON_PROBLEMS, COVERAGE_ROWS, FLOORS, GRE_NAMES,
-  MENU_ITEM_ROWS, MOST_APPRECIATED, RECOVERY_ROWS, type MenuItemRow,
-} from '../placeholder';
-import {
-  Card, Chip, EmptyState, PageBody, PageHead, PlaceholderNote, Scroller, SectionTitle, Select,
-  StickyBar, TableScroll, Tile, pct,
+  Card, Chip, EmptyState, PageBody, PageHead, Scroller, SectionTitle, Select,
+  StickyBar, TableScroll, Tile,
 } from '../ui';
 
-/** The two rates, computed once. See the header comment for the denominators. */
-function rates(r: MenuItemRow) {
-  return {
-    negativePct: pct(r.negative, r.feedbacks),
-    returnRemakePct: pct(r.returned + r.remade, r.sold),
-  };
+/** The shape `requireFeedbackAnalyst()` refuses with. `what_to_do` is printed
+ *  verbatim — the role trap (role created but never ASSIGNED) looks exactly
+ *  like a broken page unless the screen says which step is missing. */
+interface Denial {
+  error: string;
+  reason: string;
+  your_role?: string | null;
+  what_to_do?: string;
+}
+
+type Payload = AnalyticsPayload & {
+  viewer: { name: string; role_name: string | null; scope: string };
+};
+
+/** A percentage the SERVER computed, or an em dash. */
+function pctText(v: number | null | undefined): string {
+  if (v == null) return '—';
+  return `${v % 1 === 0 ? v.toFixed(0) : v.toFixed(1)}%`;
+}
+
+/**
+ * The one place this file divides, and it is the same formula the server's
+ * `rate()` uses — kept here only so a tile can show a share of two numbers that
+ * are already on screen. Null for a zero denominator, never NaN.
+ */
+function rateOf(n: number, d: number): number | null {
+  if (!Number.isFinite(n) || !Number.isFinite(d) || d <= 0) return null;
+  return Math.round((n / d) * 1000) / 10;
+}
+
+/**
+ * Bar width, with the zero denominator guarded. `(0 / 0) * 100` is NaN and
+ * `width: NaN%` is silently DROPPED by the browser, which renders as a
+ * full-width bar — a venue with no feedback at all would have shown four
+ * confident rating bars.
+ */
+function barWidth(n: number, total: number): string {
+  if (!Number.isFinite(n) || !Number.isFinite(total) || total <= 0) return '0%';
+  return `${Math.max(0, Math.min(100, (n / total) * 100))}%`;
 }
 
 export default function FeedbackAnalyticsPage() {
@@ -60,46 +110,203 @@ export default function FeedbackAnalyticsPage() {
   const [from, setFrom] = useState('');
   const [to, setTo] = useState('');
   const [floor, setFloor] = useState('all');
+  const [section, setSection] = useState('all');
   const [gre, setGre] = useState('all');
+  const [manager, setManager] = useState('all');
   const [captain, setCaptain] = useState('all');
   const [group, setGroup] = useState<'all' | ItemGroup>('all');
   const [q, setQ] = useState('');
+
+  const [data, setData] = useState<Payload | null>(null);
+  const [denial, setDenial] = useState<Denial | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+
   const [openItem, setOpenItem] = useState<MenuItemRow | null>(null);
+  const [comments, setComments] = useState<ItemCommentRow[] | null>(null);
+  const [commentsError, setCommentsError] = useState<string | null>(null);
 
-  const s = ANALYTICS_SUMMARY;
+  const [downloading, setDownloading] = useState<string>('');
+  const [downloadError, setDownloadError] = useState<string | null>(null);
 
-  const menuRows = useMemo(
-    () =>
-      MENU_ITEM_ROWS.filter((r) => (group === 'all' ? true : r.group === group))
-        .filter((r) => (q.trim() ? r.menu_item.toLowerCase().includes(q.trim().toLowerCase()) : true))
-        // Worst first — the point of the table is to find the problem dish.
-        .sort((a, b) => b.negative / (b.feedbacks || 1) - a.negative / (a.feedbacks || 1)),
-    [group, q],
-  );
+  /** The filters, as the query string BOTH the dashboard and every download are
+   *  asked for. One builder, so a download can never be run against a different
+   *  period from the one on screen. */
+  const query = useMemo(() => {
+    const sp = new URLSearchParams();
+    sp.set('range', range);
+    if (range === 'custom') { if (from) sp.set('from', from); if (to) sp.set('to', to); }
+    sp.set('floor', floor);
+    sp.set('section', section);
+    sp.set('captain', captain);
+    sp.set('gre', gre);
+    sp.set('manager', manager);
+    sp.set('group', group);
+    if (q.trim()) sp.set('item', q.trim());
+    return sp.toString();
+  }, [range, from, to, floor, section, captain, gre, manager, group, q]);
 
-  /** Most Complained Items is the same data ordered by absolute count — kept
-   *  beside Negative % deliberately, because the owner's warning cuts both
-   *  ways: a rate alone hides a high-volume item with many complaints. */
-  const mostComplained = useMemo(
-    () => [...MENU_ITEM_ROWS].sort((a, b) => b.negative - a.negative).slice(0, 5),
-    [],
-  );
+  const load = useCallback(async (quiet = false) => {
+    if (!quiet) setLoading(true);
+    setBusy(true);
+    try {
+      const res = await api(`/api/feedback/analytics?${query}`);
+      if (res.status === 401 || res.status === 403) {
+        setDenial(await res.json().catch(() => ({ error: 'Access refused', reason: 'unknown' })));
+        setData(null);
+        return;
+      }
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        setError(body?.error || `HTTP ${res.status}`);
+        return;
+      }
+      setDenial(null);
+      setError(null);
+      setData(await res.json());
+    } catch (e: any) {
+      setError(e?.message || 'Could not reach the feedback analytics');
+    } finally {
+      setLoading(false);
+      setBusy(false);
+    }
+  }, [query]);
 
-  const ratingTotal = s.excellent + s.good + s.average + s.poor;
+  useEffect(() => { void load(true); }, [load]);
 
-  const opts = (label: string, values: string[]) => [
-    { v: 'all', label },
-    ...values.map((x) => ({ v: x, label: x })),
-  ];
+  /* ── the click-through the owner asked for by name ───────────────────────
+     "management can CLICK AN ITEM TO SEE THE ACTUAL COMMENTS". The count tells
+     a chef something is wrong; the sentence the guest said is what tells them
+     what to change. Fetched on open, under the SAME filters as the row. */
+  const openComments = useCallback(async (row: MenuItemRow) => {
+    setOpenItem(row);
+    setComments(null);
+    setCommentsError(null);
+    try {
+      const res = await api(`/api/feedback/analytics?${query}&item_key=${encodeURIComponent(row.item_key)}`);
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        setCommentsError(body?.error || `HTTP ${res.status}`);
+        return;
+      }
+      const body = await res.json();
+      setComments((body.comments ?? []) as ItemCommentRow[]);
+    } catch (e: any) {
+      setCommentsError(e?.message || 'Could not load the comments');
+    }
+  }, [query]);
+
+  /**
+   * A download is FETCHED rather than linked, so a refusal or a 500 becomes a
+   * message on the page. An `<a href>` to the same URL would open a new tab and
+   * render the JSON error as text — or, worse for a report, hand over a file
+   * the reader would open, see nothing in, and read as "no complaints".
+   */
+  const download = useCallback(async (reportKey: string, format: 'xlsx' | 'pdf') => {
+    const tag = `${reportKey}:${format}`;
+    setDownloading(tag);
+    setDownloadError(null);
+    try {
+      const res = await api(`/api/feedback/reports?report=${encodeURIComponent(reportKey)}&format=${format}&${query}`);
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        setDownloadError(body?.error || `Download failed (HTTP ${res.status})`);
+        return;
+      }
+      const blob = await res.blob();
+      const named = (res.headers.get('Content-Disposition') || '').match(/filename="([^"]+)"/)?.[1];
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = named || `feedback-${reportKey}.${format}`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      // Revoked on a timer: revoking synchronously can beat the click in some
+      // browsers and hand the reader an empty file.
+      setTimeout(() => URL.revokeObjectURL(url), 10_000);
+    } catch (e: any) {
+      setDownloadError(e?.message || 'Download failed');
+    } finally {
+      setDownloading('');
+    }
+  }, [query]);
+
+  /* ── refusal ─────────────────────────────────────────────────────────── */
+  if (denial) {
+    return (
+      <>
+        <PageHead title="Feedback Analytics" subtitle="Access not confirmed" />
+        <PageBody>
+          <div className="mt-4 bg-white border border-[#E8D5C4] rounded-2xl p-4">
+            <div className="flex items-start gap-3">
+              <div className="w-10 h-10 shrink-0 rounded-xl bg-[#FFF1E3] border border-[#E8D5C4] flex items-center justify-center">
+                <Lock className="w-5 h-5 text-[#af4408]" />
+              </div>
+              <div className="min-w-0">
+                <h2 className="text-base font-extrabold text-[#2D1B0E] leading-snug">{denial.error}</h2>
+                {denial.what_to_do ? (
+                  <p className="mt-2 text-[13px] leading-relaxed text-[#6B5744]">{denial.what_to_do}</p>
+                ) : null}
+                <dl className="mt-3 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-[12px]">
+                  <dt className="text-[#8B7355] font-semibold">Access needed</dt>
+                  <dd className="text-[#2D1B0E] font-bold">Manager or Administrator</dd>
+                  <dt className="text-[#8B7355] font-semibold">Your role</dt>
+                  <dd className="text-[#2D1B0E] font-bold">{denial.your_role || 'none assigned'}</dd>
+                </dl>
+              </div>
+            </div>
+          </div>
+        </PageBody>
+      </>
+    );
+  }
+
+  const s = data?.summary;
+  const meta = data?.meta;
+  const opts = data?.options;
+  const ratingTotal = s ? s.excellent + s.good + s.average + s.poor : 0;
+  const recoveryTotal = (data?.recovery ?? []).reduce((a, b) => a + b.count, 0);
+
+  /** A value that is not among its options makes a `<select>` render the FIRST
+   *  one, silently moving the reader back to "All" — the same trap Page 1's
+   *  floor picker hit. Keep the selection visible until they leave it. */
+  const selectOpts = (label: string, values: readonly string[], current: string) => {
+    const out = [{ v: 'all', label }, ...values.map((x) => ({ v: x, label: x }))];
+    if (current !== 'all' && !values.includes(current)) out.push({ v: current, label: `${current} (none)` });
+    return out;
+  };
 
   return (
     <>
       <PageHead
         title="Feedback Analytics"
-        subtitle={`${s.feedback_taken} of ${s.eligible_tables} eligible tables · coverage ${pct(s.feedback_taken, s.eligible_tables)}`}
+        subtitle={
+          s
+            ? `${s.feedback_taken} of ${s.eligible_tables} eligible tables · coverage ${pctText(s.coverage_pct)}`
+            : loading ? 'Loading…' : 'No data'
+        }
       />
 
       <PageBody>
+        {error ? (
+          <div className="mt-3 flex items-start gap-2 rounded-2xl border border-red-200 bg-red-50 px-3 py-2.5">
+            <AlertTriangle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
+            <div className="min-w-0 text-[12px] text-red-800">
+              <div className="font-bold">Could not load the analytics.</div>
+              <div className="break-words">{error}</div>
+            </div>
+            <button
+              type="button"
+              onClick={() => void load()}
+              className="ml-auto shrink-0 rounded-lg border border-red-300 px-2.5 py-1.5 text-[11px] font-bold text-red-800"
+            >
+              Retry
+            </button>
+          </div>
+        ) : null}
+
         {/* ── Filters ──────────────────────────────────────────────────── */}
         <div className="pt-3 space-y-2">
           <Scroller label="Date range">
@@ -134,9 +341,17 @@ export default function FeedbackAnalyticsPage() {
           )}
 
           <Scroller label="Scope">
-            <Select label="Floor" value={floor} onChange={setFloor} options={opts('All floors', FLOORS)} />
-            <Select label="GRE" value={gre} onChange={setGre} options={opts('All', GRE_NAMES)} />
-            <Select label="Captain" value={captain} onChange={setCaptain} options={opts('All', CAPTAIN_NAMES)} />
+            <Select label="Floor" value={floor} onChange={setFloor} options={selectOpts('All floors', opts?.floors ?? [], floor)} />
+            {/* The Section filter appears ONLY when the data has sections. The
+                owner's production census (2026-09-23) shows 7 sections across
+                3 floors; the working snapshot has none at all, and a dropdown
+                that returns nothing is worse than no dropdown. */}
+            {opts?.sections_available ? (
+              <Select label="Section" value={section} onChange={setSection} options={selectOpts('All sections', opts.sections, section)} />
+            ) : null}
+            <Select label="GRE" value={gre} onChange={setGre} options={selectOpts('All', opts?.gres ?? [], gre)} />
+            <Select label="Manager" value={manager} onChange={setManager} options={selectOpts('All', opts?.managers ?? [], manager)} />
+            <Select label="Captain" value={captain} onChange={setCaptain} options={selectOpts('All', opts?.captains ?? [], captain)} />
             <Select
               label="Group"
               value={group}
@@ -155,286 +370,452 @@ export default function FeedbackAnalyticsPage() {
               className="flex-1 min-w-0 bg-transparent text-sm text-[#2D1B0E] outline-none"
             />
           </label>
-        </div>
 
-        {/* ── Dashboard tiles ──────────────────────────────────────────── */}
-        <SectionTitle>Dashboard</SectionTitle>
-        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-2">
-          <Tile
-            label="Coverage"
-            value={pct(s.feedback_taken, s.eligible_tables)}
-            hint={`${s.feedback_taken} of ${s.eligible_tables} eligible`}
-            tone="accent"
-          />
-          <Tile label="Negative item feedbacks" value={s.negative_item_feedbacks} tone="bad" />
-          <Tile
-            label="Returned / Remade / Replaced"
-            value={s.returned + s.remade + s.replaced}
-            hint={`${s.returned} returned · ${s.remade} remade · ${s.replaced} replaced`}
-            tone="warn"
-          />
-          <Tile label="Happy after replacement" value={s.happy_after_replacement} tone="good" />
-          <Tile label="Still unhappy" value={s.still_unhappy} tone="bad" />
-          <Tile
-            label="Pending follow-ups"
-            value={s.pending_follow_ups}
-            tone={s.pending_follow_ups ? 'warn' : 'plain'}
-          />
-          <Tile label="Feedback taken" value={s.feedback_taken} />
-          <Tile label="Eligible tables" value={s.eligible_tables} />
-        </div>
-
-        {/* ── Rating split ─────────────────────────────────────────────── */}
-        <SectionTitle hint={`${ratingTotal} rated`}>Overall rating split</SectionTitle>
-        <Card className="p-3">
-          <div className="flex h-3 w-full overflow-hidden rounded-full bg-[#F0E4D6]">
-            <span className="bg-emerald-600" style={{ width: `${(s.excellent / ratingTotal) * 100}%` }} />
-            <span className="bg-emerald-400" style={{ width: `${(s.good / ratingTotal) * 100}%` }} />
-            <span className="bg-amber-400" style={{ width: `${(s.average / ratingTotal) * 100}%` }} />
-            <span className="bg-red-500" style={{ width: `${(s.poor / ratingTotal) * 100}%` }} />
-          </div>
-          <div className="mt-2 grid grid-cols-2 sm:grid-cols-4 gap-2 text-[12px]">
-            {[
-              { label: 'Excellent', n: s.excellent, dot: 'bg-emerald-600' },
-              { label: 'Good', n: s.good, dot: 'bg-emerald-400' },
-              { label: 'Average', n: s.average, dot: 'bg-amber-400' },
-              { label: 'Poor', n: s.poor, dot: 'bg-red-500' },
-            ].map((x) => (
-              <div key={x.label} className="flex items-center gap-1.5">
-                <span className={`w-2.5 h-2.5 rounded-full ${x.dot}`} />
-                <span className="font-semibold text-[#6B5744]">{x.label}</span>
-                <span className="ml-auto font-extrabold tabular-nums text-[#2D1B0E]">
-                  {x.n} · {pct(x.n, ratingTotal)}
-                </span>
-              </div>
-            ))}
-          </div>
-        </Card>
-
-        {/* ── Menu Item Analysis ───────────────────────────────────────── */}
-        <SectionTitle hint="tap a row for the comments">Menu item analysis</SectionTitle>
-        {menuRows.length === 0 ? (
-          <EmptyState>No menu item matches that filter.</EmptyState>
-        ) : (
-          <Card className="p-3">
-            <TableScroll>
-              <table className="w-full text-[12px]">
-                <thead>
-                  <tr className="text-left text-[#8B7355]">
-                    <th className="font-extrabold uppercase tracking-wide pb-2 pr-3">Item</th>
-                    <th className="font-extrabold uppercase tracking-wide pb-2 pr-3 text-right">Sold</th>
-                    <th className="font-extrabold uppercase tracking-wide pb-2 pr-3 text-right">Feedbacks</th>
-                    <th className="font-extrabold uppercase tracking-wide pb-2 pr-3 text-right">Negative</th>
-                    <th className="font-extrabold uppercase tracking-wide pb-2 pr-3 text-right">Neg %</th>
-                    <th className="font-extrabold uppercase tracking-wide pb-2 pr-3 text-right">Ret / Rem</th>
-                    <th className="font-extrabold uppercase tracking-wide pb-2 pr-3 text-right">R/R %</th>
-                    <th className="font-extrabold uppercase tracking-wide pb-2 text-right">Happy</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {menuRows.map((r) => {
-                    const k = rates(r);
-                    return (
-                      <tr
-                        key={r.menu_item}
-                        onClick={() => setOpenItem(r)}
-                        className="border-t border-[#F0E4D6] cursor-pointer hover:bg-[#FFF8F0]"
-                      >
-                        <td className="py-2 pr-3 font-bold text-[#2D1B0E]">
-                          {r.menu_item}
-                          <span className="ml-1.5 text-[10px] font-semibold text-[#8B7355]">
-                            {r.group === 'food' ? 'Food' : 'Drinks'}
-                          </span>
-                        </td>
-                        <td className="py-2 pr-3 text-right tabular-nums">{r.sold}</td>
-                        <td className="py-2 pr-3 text-right tabular-nums">{r.feedbacks}</td>
-                        <td className="py-2 pr-3 text-right tabular-nums">{r.negative}</td>
-                        <td className="py-2 pr-3 text-right tabular-nums font-extrabold text-red-700">
-                          {k.negativePct}
-                        </td>
-                        <td className="py-2 pr-3 text-right tabular-nums">
-                          {r.returned} / {r.remade}
-                        </td>
-                        <td className="py-2 pr-3 text-right tabular-nums font-extrabold text-amber-700">
-                          {k.returnRemakePct}
-                        </td>
-                        <td className="py-2 text-right tabular-nums text-emerald-700 font-semibold">
-                          {r.happy_after}
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </TableScroll>
-            <p className="mt-2 text-[10px] leading-snug text-[#8B7355]">
-              Neg % = negative ÷ feedbacks received for that item (a quality measure). R/R % =
-              (returned + remade) ÷ quantity sold (an operations measure). Two different
-              denominators, on purpose.
+          {data ? (
+            <p className="text-[11px] leading-snug text-[#8B7355]">
+              {data.range.label}
+              {data.range.note ? ` · ${data.range.note}` : ''}
+              {opts && !opts.sections_available ? ` · ${opts.sections_note}` : ''}
             </p>
-          </Card>
-        )}
-
-        {/* ── Lists ────────────────────────────────────────────────────── */}
-        <div className="mt-5 grid grid-cols-1 lg:grid-cols-3 gap-3">
-          <RankList
-            title="Most common problems"
-            icon={<TrendingDown className="w-4 h-4 text-red-600" />}
-            rows={COMMON_PROBLEMS}
-            tone="bad"
-          />
-          <RankList
-            title="Most complained items"
-            icon={<Frown className="w-4 h-4 text-amber-600" />}
-            rows={mostComplained.map((m) => ({ label: m.menu_item, count: m.negative }))}
-            tone="warn"
-          />
-          <RankList
-            title="Most appreciated items"
-            icon={<ThumbsUp className="w-4 h-4 text-emerald-600" />}
-            rows={MOST_APPRECIATED}
-            tone="good"
-          />
+          ) : null}
         </div>
 
-        {/* ── Service recovery ─────────────────────────────────────────── */}
-        <SectionTitle hint="what happened after a negative feedback">Service recovery</SectionTitle>
-        <Card className="p-3">
-          <div className="space-y-1.5">
-            {RECOVERY_ROWS.map((r) => {
-              const total = RECOVERY_ROWS.reduce((a, b) => a + b.count, 0);
-              return (
-                <div key={r.label} className="flex items-center gap-2">
-                  <span className="w-44 shrink-0 text-[12px] font-semibold text-[#6B5744] truncate">
+        {!data && loading ? <EmptyState>Loading the period…</EmptyState> : null}
+
+        {data && s && meta ? (
+          <>
+            {/* ── Dashboard tiles ──────────────────────────────────────── */}
+            <SectionTitle
+              hint={meta.gre_filter_is_numerator_only
+                ? 'coverage is this person’s share of every eligible table in scope'
+                : undefined}
+            >
+              Dashboard
+            </SectionTitle>
+            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-2">
+              <Tile
+                label="Coverage"
+                value={pctText(s.coverage_pct)}
+                hint={`${s.feedback_taken} of ${s.eligible_tables} eligible`}
+                tone="accent"
+              />
+              <Tile
+                label="Eligible tables"
+                value={s.eligible_tables}
+                hint={`${meta.item_threshold} items${meta.item_threshold_is_default ? ' (default)' : ''}, or bill asked / printed`}
+              />
+              <Tile
+                label="Feedbacks taken"
+                value={s.feedback_taken}
+                hint={s.everything_good ? `${s.everything_good} “everything good”` : undefined}
+              />
+              <Tile
+                label="Negative item feedbacks"
+                value={s.negative_item_feedbacks}
+                hint={`${pctText(rateOf(s.negative_item_feedbacks, s.item_feedbacks))} of ${s.item_feedbacks} item feedbacks`}
+                tone="bad"
+              />
+              <Tile
+                label="Returned / Remade / Replaced"
+                value={s.returned + s.remade + s.replaced}
+                hint={`${s.returned} returned · ${s.remade} remade · ${s.replaced} replaced`}
+                tone="warn"
+              />
+              <Tile label="Happy after replacement" value={s.happy_after_replacement} tone="good" />
+              <Tile
+                label="Still unhappy"
+                value={s.still_unhappy}
+                hint={s.partially_happy ? `${s.partially_happy} partially happy` : undefined}
+                tone="bad"
+              />
+              <Tile
+                label="Pending follow-ups"
+                value={s.pending_follow_ups}
+                hint={`${s.open_follow_ups_now} open now (all dates)`}
+                tone={s.pending_follow_ups ? 'warn' : 'plain'}
+              />
+            </div>
+
+            {/* ── Rating split ─────────────────────────────────────────── */}
+            <SectionTitle hint={`${ratingTotal} rated${s.unrated ? ` · ${s.unrated} not rated` : ''}`}>
+              Overall rating split
+            </SectionTitle>
+            <Card className="p-3">
+              <div className="flex h-3 w-full overflow-hidden rounded-full bg-[#F0E4D6]">
+                <span className="bg-emerald-600" style={{ width: barWidth(s.excellent, ratingTotal) }} />
+                <span className="bg-emerald-400" style={{ width: barWidth(s.good, ratingTotal) }} />
+                <span className="bg-amber-400" style={{ width: barWidth(s.average, ratingTotal) }} />
+                <span className="bg-red-500" style={{ width: barWidth(s.poor, ratingTotal) }} />
+              </div>
+              <div className="mt-2 grid grid-cols-2 sm:grid-cols-4 gap-2 text-[12px]">
+                {[
+                  { label: 'Excellent', n: s.excellent, dot: 'bg-emerald-600' },
+                  { label: 'Good', n: s.good, dot: 'bg-emerald-400' },
+                  { label: 'Average', n: s.average, dot: 'bg-amber-400' },
+                  { label: 'Poor', n: s.poor, dot: 'bg-red-500' },
+                ].map((x) => (
+                  <div key={x.label} className="flex items-center gap-1.5">
+                    <span className={`w-2.5 h-2.5 rounded-full ${x.dot}`} />
+                    <span className="font-semibold text-[#6B5744]">{x.label}</span>
+                    <span className="ml-auto font-extrabold tabular-nums text-[#2D1B0E]">
+                      {x.n} · {pctText(rateOf(x.n, ratingTotal))}
+                    </span>
+                  </div>
+                ))}
+              </div>
+
+              {/* Food · Drinks · Service · Ambience, from the same visits. */}
+              <TableScroll>
+                <table className="w-full text-[12px] mt-3">
+                  <thead>
+                    <tr className="text-left text-[#8B7355]">
+                      <th className="font-extrabold uppercase tracking-wide pb-2 pr-3">Category</th>
+                      <th className="font-extrabold uppercase tracking-wide pb-2 pr-3 text-right">Excellent</th>
+                      <th className="font-extrabold uppercase tracking-wide pb-2 pr-3 text-right">Good</th>
+                      <th className="font-extrabold uppercase tracking-wide pb-2 pr-3 text-right">Average</th>
+                      <th className="font-extrabold uppercase tracking-wide pb-2 text-right">Poor</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {data.categories.map((c) => (
+                      <tr key={c.key} className="border-t border-[#F0E4D6]">
+                        <td className="py-2 pr-3 font-bold text-[#2D1B0E]">{c.label}</td>
+                        <td className="py-2 pr-3 text-right tabular-nums">{c.excellent}</td>
+                        <td className="py-2 pr-3 text-right tabular-nums">{c.good}</td>
+                        <td className="py-2 pr-3 text-right tabular-nums">{c.average}</td>
+                        <td className="py-2 text-right tabular-nums">{c.poor}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </TableScroll>
+            </Card>
+
+            {/* ── Menu Item Analysis ───────────────────────────────────── */}
+            <SectionTitle hint="tap a row for the comments">Menu item analysis</SectionTitle>
+            {data.menu_items.length === 0 ? (
+              <EmptyState>No menu item matches that filter.</EmptyState>
+            ) : (
+              <Card className="p-3">
+                <TableScroll>
+                  <table className="w-full text-[12px]">
+                    <thead>
+                      <tr className="text-left text-[#8B7355]">
+                        <th className="font-extrabold uppercase tracking-wide pb-2 pr-3">Item</th>
+                        <th className="font-extrabold uppercase tracking-wide pb-2 pr-3 text-right">Sold</th>
+                        <th className="font-extrabold uppercase tracking-wide pb-2 pr-3 text-right">Feedbacks</th>
+                        <th className="font-extrabold uppercase tracking-wide pb-2 pr-3 text-right">Negative</th>
+                        <th className="font-extrabold uppercase tracking-wide pb-2 pr-3 text-right">Neg %</th>
+                        <th className="font-extrabold uppercase tracking-wide pb-2 pr-3 text-right">Ret / Rem</th>
+                        <th className="font-extrabold uppercase tracking-wide pb-2 pr-3 text-right">R/R %</th>
+                        <th className="font-extrabold uppercase tracking-wide pb-2 text-right">Happy</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {data.menu_items.map((r) => (
+                        <tr
+                          key={r.item_key}
+                          onClick={() => void openComments(r)}
+                          className="border-t border-[#F0E4D6] cursor-pointer hover:bg-[#FFF8F0]"
+                        >
+                          <td className="py-2 pr-3 font-bold text-[#2D1B0E]">
+                            {r.menu_item}
+                            <span className="ml-1.5 text-[10px] font-semibold text-[#8B7355]">
+                              {r.feedbacks === 0 ? 'no feedback' : r.group === 'food' ? 'Food' : 'Drinks'}
+                            </span>
+                          </td>
+                          <td className="py-2 pr-3 text-right tabular-nums">{r.sold}</td>
+                          <td className="py-2 pr-3 text-right tabular-nums">{r.feedbacks}</td>
+                          <td className="py-2 pr-3 text-right tabular-nums">{r.negative}</td>
+                          <td className="py-2 pr-3 text-right tabular-nums font-extrabold text-red-700">
+                            {pctText(rateOf(r.negative, r.feedbacks))}
+                          </td>
+                          <td className="py-2 pr-3 text-right tabular-nums">
+                            {r.returned} / {r.remade}
+                          </td>
+                          <td className="py-2 pr-3 text-right tabular-nums font-extrabold text-amber-700">
+                            {pctText(rateOf(r.returned_qty + r.remade_qty, r.sold))}
+                          </td>
+                          <td className="py-2 text-right tabular-nums text-emerald-700 font-semibold">
+                            {r.happy_after}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </TableScroll>
+                <p className="mt-2 text-[10px] leading-snug text-[#8B7355]">
+                  {meta.negative_pct_basis} {meta.return_remake_basis}
+                </p>
+              </Card>
+            )}
+
+            {/* ── Lists ────────────────────────────────────────────────── */}
+            <div className="mt-5 grid grid-cols-1 lg:grid-cols-3 gap-3">
+              <RankList
+                title="Most common problems"
+                icon={<TrendingDown className="w-4 h-4 text-red-600" />}
+                rows={data.common_problems}
+                tone="bad"
+                empty="No issue was recorded against an item in this period."
+              />
+              <RankList
+                title="Most complained items"
+                icon={<Frown className="w-4 h-4 text-amber-600" />}
+                rows={data.most_complained.map((m) => ({
+                  label: m.label,
+                  count: m.count,
+                  sub: `${pctText(m.negative_pct)} of ${m.feedbacks}`,
+                }))}
+                tone="warn"
+                empty="No negative item feedback in this period."
+                note="Ordered by count, with the rate printed beside it: a rate alone hides a busy dish with many complaints, and a count alone hides a rare one that is always wrong."
+              />
+              <RankList
+                title="Most appreciated items"
+                icon={<ThumbsUp className="w-4 h-4 text-emerald-600" />}
+                rows={data.most_appreciated.map((m) => ({ label: m.label, count: m.count, sub: `of ${m.feedbacks}` }))}
+                tone="good"
+                empty="No positive item feedback in this period."
+              />
+            </div>
+
+            {/* ── Service recovery ─────────────────────────────────────── */}
+            <SectionTitle hint="what happened after a negative feedback">Service recovery</SectionTitle>
+            <Card className="p-3">
+              {recoveryTotal === 0 ? (
+                <p className="text-[12px] text-[#8B7355]">
+                  Nothing was returned, remade or replaced in this period, and no complaint needed a
+                  follow-up.
+                </p>
+              ) : (
+                <div className="space-y-1.5">
+                  {data.recovery.map((r) => (
+                    <div key={r.label} className="flex items-center gap-2">
+                      <span className="w-44 shrink-0 text-[12px] font-semibold text-[#6B5744] truncate">
+                        {r.label}
+                      </span>
+                      <span className="flex-1 h-2.5 rounded-full bg-[#F0E4D6] overflow-hidden">
+                        <span className="block h-full bg-[#af4408]" style={{ width: barWidth(r.count, recoveryTotal) }} />
+                      </span>
+                      <span className="w-14 shrink-0 text-right text-[12px] font-extrabold tabular-nums text-[#2D1B0E]">
+                        {r.count}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <div className="mt-3 grid grid-cols-3 gap-2">
+                <div className="rounded-xl bg-emerald-50 border border-emerald-200 px-3 py-2">
+                  <div className="flex items-center gap-1.5 text-[11px] font-bold text-emerald-800">
+                    <Smile className="w-3.5 h-3.5" /> Happy after
+                  </div>
+                  <div className="text-xl font-extrabold text-emerald-700">{s.happy_after_replacement}</div>
+                </div>
+                <div className="rounded-xl bg-amber-50 border border-amber-200 px-3 py-2">
+                  <div className="text-[11px] font-bold text-amber-800">Partially happy</div>
+                  <div className="text-xl font-extrabold text-amber-700">{s.partially_happy}</div>
+                </div>
+                <div className="rounded-xl bg-red-50 border border-red-200 px-3 py-2">
+                  <div className="flex items-center gap-1.5 text-[11px] font-bold text-red-800">
+                    <Frown className="w-3.5 h-3.5" /> Still unhappy
+                  </div>
+                  <div className="text-xl font-extrabold text-red-700">{s.still_unhappy}</div>
+                </div>
+              </div>
+              <p className="mt-2 text-[10px] leading-snug text-[#8B7355]">
+                “Guest happy after correction” closes the complaint. “Partially happy” and “still
+                unhappy” leave it open for the manager — {s.open_follow_ups_now} follow-up
+                {s.open_follow_ups_now === 1 ? ' is' : 's are'} open right now across all dates, which
+                is deliberately not bound by the period filter above.
+              </p>
+            </Card>
+
+            {/* ── By day ───────────────────────────────────────────────── */}
+            {data.daily.length > 1 ? (
+              <>
+                <SectionTitle hint={`${data.range.cutoff} IST rollover`}>By business day</SectionTitle>
+                <Card className="p-3">
+                  <TableScroll>
+                    <table className="w-full text-[12px]">
+                      <thead>
+                        <tr className="text-left text-[#8B7355]">
+                          <th className="font-extrabold uppercase tracking-wide pb-2 pr-3">Day</th>
+                          <th className="font-extrabold uppercase tracking-wide pb-2 pr-3 text-right">Eligible</th>
+                          <th className="font-extrabold uppercase tracking-wide pb-2 pr-3 text-right">Taken</th>
+                          <th className="font-extrabold uppercase tracking-wide pb-2 pr-3 text-right">Coverage</th>
+                          <th className="font-extrabold uppercase tracking-wide pb-2 pr-3 text-right">Negative</th>
+                          <th className="font-extrabold uppercase tracking-wide pb-2 text-right">Open</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {data.daily.map((d) => (
+                          <tr key={d.day} className="border-t border-[#F0E4D6]">
+                            <td className="py-2 pr-3 font-bold text-[#2D1B0E] whitespace-nowrap">{d.label}</td>
+                            <td className="py-2 pr-3 text-right tabular-nums">{d.eligible}</td>
+                            <td className="py-2 pr-3 text-right tabular-nums">{d.taken}</td>
+                            <td className="py-2 pr-3 text-right tabular-nums font-extrabold text-[#af4408]">
+                              {pctText(d.coverage_pct)}
+                            </td>
+                            <td className="py-2 pr-3 text-right tabular-nums">{d.negative}</td>
+                            <td className="py-2 text-right tabular-nums">{d.open}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </TableScroll>
+                </Card>
+              </>
+            ) : null}
+
+            {/* ── Downloads ────────────────────────────────────────────── */}
+            <SectionTitle hint="Excel · PDF">Downloads</SectionTitle>
+            {downloadError ? (
+              <div className="mb-2 flex items-start gap-2 rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-[12px] text-red-800">
+                <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+                <span className="break-words">{downloadError}</span>
+              </div>
+            ) : null}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              {REPORTS.map((r) => (
+                <div
+                  key={r.v}
+                  className="flex items-center gap-2 bg-white border border-[#E8D5C4] rounded-2xl px-3 py-2.5"
+                >
+                  <Download className="w-4 h-4 text-[#8B7355] shrink-0" />
+                  <span className="min-w-0 flex-1 text-sm font-bold text-[#2D1B0E] truncate">
                     {r.label}
                   </span>
-                  <span className="flex-1 h-2.5 rounded-full bg-[#F0E4D6] overflow-hidden">
-                    <span
-                      className="block h-full bg-[#af4408]"
-                      style={{ width: `${(r.count / total) * 100}%` }}
-                    />
-                  </span>
-                  <span className="w-14 shrink-0 text-right text-[12px] font-extrabold tabular-nums text-[#2D1B0E]">
-                    {r.count}
-                  </span>
+                  <button
+                    type="button"
+                    onClick={() => void download(r.v, 'xlsx')}
+                    disabled={downloading !== ''}
+                    className="inline-flex items-center gap-1 rounded-lg border border-[#E8D5C4] px-2.5 py-2 text-[11px] font-bold text-[#6B5744] disabled:opacity-40 active:scale-95"
+                  >
+                    <FileSpreadsheet className="w-3.5 h-3.5" />
+                    {downloading === `${r.v}:xlsx` ? '…' : 'Excel'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void download(r.v, 'pdf')}
+                    disabled={downloading !== ''}
+                    className="inline-flex items-center gap-1 rounded-lg border border-[#E8D5C4] px-2.5 py-2 text-[11px] font-bold text-[#6B5744] disabled:opacity-40 active:scale-95"
+                  >
+                    <FileText className="w-3.5 h-3.5" />
+                    {downloading === `${r.v}:pdf` ? '…' : 'PDF'}
+                  </button>
                 </div>
-              );
-            })}
-          </div>
-          <div className="mt-3 grid grid-cols-2 gap-2">
-            <div className="rounded-xl bg-emerald-50 border border-emerald-200 px-3 py-2">
-              <div className="flex items-center gap-1.5 text-[11px] font-bold text-emerald-800">
-                <Smile className="w-3.5 h-3.5" /> Guest happy after
-              </div>
-              <div className="text-xl font-extrabold text-emerald-700">
-                {s.happy_after_replacement}
-              </div>
+              ))}
             </div>
-            <div className="rounded-xl bg-red-50 border border-red-200 px-3 py-2">
-              <div className="flex items-center gap-1.5 text-[11px] font-bold text-red-800">
-                <Frown className="w-3.5 h-3.5" /> Still unhappy
-              </div>
-              <div className="text-xl font-extrabold text-red-700">{s.still_unhappy}</div>
-            </div>
-          </div>
-        </Card>
+            <p className="mt-2 text-[10px] leading-snug text-[#8B7355]">
+              Daily, Weekly and Monthly carry their own period regardless of the chips above — a
+              “Monthly” file must never quietly hold one day. Every other download uses the filters in
+              force, and each file states them on its first sheet or page.
+            </p>
 
-        {/* ── Downloads ────────────────────────────────────────────────── */}
-        <SectionTitle hint="Excel · PDF">Downloads</SectionTitle>
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-          {REPORTS.map((r) => (
-            <div
-              key={r.v}
-              className="flex items-center gap-2 bg-white border border-[#E8D5C4] rounded-2xl px-3 py-2.5"
-            >
-              <Download className="w-4 h-4 text-[#8B7355] shrink-0" />
-              <span className="min-w-0 flex-1 text-sm font-bold text-[#2D1B0E] truncate">
-                {r.label}
-              </span>
-              <button
-                type="button"
-                disabled
-                title="P5 wires the export"
-                className="inline-flex items-center gap-1 rounded-lg border border-[#E8D5C4] px-2.5 py-2 text-[11px] font-bold text-[#6B5744] disabled:opacity-40"
-              >
-                <FileSpreadsheet className="w-3.5 h-3.5" /> Excel
-              </button>
-              <button
-                type="button"
-                disabled
-                title="P5 wires the export"
-                className="inline-flex items-center gap-1 rounded-lg border border-[#E8D5C4] px-2.5 py-2 text-[11px] font-bold text-[#6B5744] disabled:opacity-40"
-              >
-                <FileText className="w-3.5 h-3.5" /> PDF
-              </button>
-            </div>
-          ))}
-        </div>
-
-        {/* ── The fairness ruling, on screen ───────────────────────────── */}
-        <Card className="mt-4 p-3 border-[#D4B896] bg-[#FFF1E3]">
-          <div className="text-[12px] font-extrabold text-[#af4408] mb-1">
-            How GRE performance is measured
-          </div>
-          <p className="text-[11px] leading-snug text-[#6B5744]">
-            Coverage, tables visited, follow-ups completed, issues properly recorded and guest
-            recovery follow-up — never the ratings the guests gave. A GRE must never have a reason to
-            avoid recording a complaint. The GRE / Manager Performance download below follows the
-            same rule.
-          </p>
-          <div className="mt-2 grid grid-cols-2 sm:grid-cols-3 gap-2">
-            {COVERAGE_ROWS.map((c) => (
-              <div key={c.person} className="rounded-xl bg-white border border-[#E8D5C4] px-2.5 py-2">
-                <div className="text-[11px] font-bold text-[#2D1B0E] truncate">{c.person}</div>
-                <div className="text-lg font-extrabold text-[#af4408] leading-tight">
-                  {pct(c.taken, c.eligible)}
+            {/* ── GRE / Manager performance + the fairness ruling ──────── */}
+            <SectionTitle hint="coverage and follow-through only">GRE / Manager performance</SectionTitle>
+            <Card className="p-3 border-[#D4B896] bg-[#FFF1E3]">
+              <p className="text-[11px] leading-snug text-[#6B5744]">{meta.fairness_note}</p>
+              <p className="mt-1 text-[11px] leading-snug text-[#8B7355]">{meta.coverage_per_gre_unavailable}</p>
+              {data.gre_performance.length === 0 ? (
+                <p className="mt-3 text-[12px] text-[#8B7355]">Nobody recorded feedback in this period.</p>
+              ) : (
+                <div className="mt-3 rounded-xl bg-white border border-[#E8D5C4] p-2">
+                  <TableScroll>
+                    <table className="w-full text-[12px]">
+                      <thead>
+                        <tr className="text-left text-[#8B7355]">
+                          <th className="font-extrabold uppercase tracking-wide pb-2 pr-3">Person</th>
+                          <th className="font-extrabold uppercase tracking-wide pb-2 pr-3">Role</th>
+                          <th className="font-extrabold uppercase tracking-wide pb-2 pr-3 text-right">Tables visited</th>
+                          <th className="font-extrabold uppercase tracking-wide pb-2 pr-3 text-right">Issues recorded</th>
+                          <th className="font-extrabold uppercase tracking-wide pb-2 pr-3 text-right">Follow-ups done</th>
+                          <th className="font-extrabold uppercase tracking-wide pb-2 pr-3 text-right">Open</th>
+                          <th className="font-extrabold uppercase tracking-wide pb-2 text-right">Recovery</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {data.gre_performance.map((g) => (
+                          <tr key={g.person} className="border-t border-[#F0E4D6]">
+                            <td className="py-2 pr-3 font-bold text-[#2D1B0E]">{g.person}</td>
+                            <td className="py-2 pr-3 text-[#6B5744]">{g.role || '—'}</td>
+                            <td className="py-2 pr-3 text-right tabular-nums font-extrabold text-[#af4408]">
+                              {g.tables_visited}
+                            </td>
+                            {/* Same neutral ink as every other count — see the
+                                header note. Colouring this red would make
+                                recording a complaint look like a mark against
+                                the recorder. */}
+                            <td className="py-2 pr-3 text-right tabular-nums">{g.issues_recorded}</td>
+                            <td className="py-2 pr-3 text-right tabular-nums">{g.follow_ups_completed}</td>
+                            <td className="py-2 pr-3 text-right tabular-nums">{g.follow_ups_open}</td>
+                            <td className="py-2 text-right tabular-nums font-semibold text-emerald-700">
+                              {pctText(g.recovery_pct)}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </TableScroll>
                 </div>
-                <div className="text-[10px] text-[#8B7355]">
-                  {c.taken}/{c.eligible} · {c.follow_ups_done} follow-ups
-                </div>
-              </div>
-            ))}
-          </div>
-        </Card>
+              )}
+            </Card>
 
-        <PlaceholderNote>
-          Every number here is invented in <code>../placeholder.ts</code>. P5 computes them over the{' '}
-          <code>gf_</code> tables joined to <code>order_items</code>, and wires the eight downloads
-          through <code>buildReportPdf()</code> (<code>src/lib/report-pdf.ts</code> — money renders as
-          &ldquo;Rs&rdquo;, not ₹) and <code>xlsx</code>. Report paths must never contain{' '}
-          <code>print</code> or end <code>.json</code>.
-        </PlaceholderNote>
+            {/* What is NOT in the denominator, so coverage is never quietly
+                shrunk by an exclusion nobody can see. */}
+            {meta.excluded.not_dine_in + meta.excluded.table_row_missing + meta.excluded.voided > 0 ? (
+              <p className="mt-3 text-[10px] leading-snug text-[#8B7355]">
+                Excluded from this period: {meta.excluded.voided} voided ·{' '}
+                {meta.excluded.not_dine_in} takeaway or other · {meta.excluded.table_row_missing} with
+                no table row. They are named rather than silently dropped, so the coverage denominator
+                can be reconciled against the POS.
+              </p>
+            ) : null}
+          </>
+        ) : null}
       </PageBody>
 
       <StickyBar>
         <div className="flex items-center gap-3">
           <div className="min-w-0 flex-1 text-[12px] leading-tight">
             <div className="font-extrabold text-[#2D1B0E]">
-              {DATE_RANGES.find((d) => d.v === range)?.label} · coverage{' '}
-              {pct(s.feedback_taken, s.eligible_tables)}
+              {DATE_RANGES.find((d) => d.v === range)?.label} · coverage {pctText(s?.coverage_pct)}
             </div>
             <div className="text-[#8B7355] truncate">
-              {s.negative_item_feedbacks} negative · {s.pending_follow_ups} follow-up open
+              {s ? `${s.negative_item_feedbacks} negative · ${s.pending_follow_ups} follow-up open` : '—'}
             </div>
           </div>
           <button
             type="button"
-            disabled
-            title="P5 wires the export"
-            className="shrink-0 inline-flex items-center gap-1.5 bg-[#af4408] text-white px-4 py-3 rounded-xl text-sm font-semibold disabled:opacity-40"
+            onClick={() => void load()}
+            disabled={busy}
+            aria-label="Refresh"
+            className="shrink-0 inline-flex items-center gap-1.5 border border-[#E8D5C4] bg-white text-[#6B5744] px-3 py-3 rounded-xl text-sm font-semibold disabled:opacity-40 active:scale-95"
+          >
+            <RefreshCw className={`w-4 h-4 ${busy ? 'animate-spin' : ''}`} />
+          </button>
+          <button
+            type="button"
+            onClick={() => void download('daily', 'xlsx')}
+            disabled={!data || downloading !== ''}
+            className="shrink-0 inline-flex items-center gap-1.5 bg-[#af4408] text-white px-4 py-3 rounded-xl text-sm font-semibold disabled:opacity-40 active:scale-95"
           >
             <Download className="w-4 h-4" /> Export
           </button>
         </div>
       </StickyBar>
 
-      {/* Click-through to the real comments (§3: "clickable through to the real
-          comments"). P5 fills it from gf_item_feedback. */}
+      {/* ── The actual comments behind one item ─────────────────────────── */}
       {openItem && (
         // `bg-black/40` on the FIXED wrapper so globals.css:295 locks body
         // scroll behind the sheet; on the inner click-catcher it would not match.
         <div className="fixed inset-0 z-[60] bg-black/40 flex items-end sm:items-center justify-center">
-          <div className="absolute inset-0" onClick={() => setOpenItem(null)} aria-hidden="true" />
+          <div
+            className="absolute inset-0"
+            onClick={() => { setOpenItem(null); setComments(null); }}
+            aria-hidden="true"
+          />
           <div className="relative w-full sm:max-w-lg bg-white rounded-t-3xl sm:rounded-3xl max-h-[85vh] overflow-y-auto p-4">
             <div className="flex items-start gap-2">
               <div className="min-w-0 flex-1">
@@ -442,13 +823,13 @@ export default function FeedbackAnalyticsPage() {
                   {openItem.menu_item}
                 </div>
                 <div className="text-[11px] text-[#8B7355]">
-                  {openItem.sold} sold · {openItem.feedbacks} feedbacks · {openItem.negative}{' '}
-                  negative ({rates(openItem).negativePct})
+                  {openItem.sold} sold · {openItem.feedbacks} feedbacks · {openItem.negative} negative
+                  ({pctText(rateOf(openItem.negative, openItem.feedbacks))})
                 </div>
               </div>
               <button
                 type="button"
-                onClick={() => setOpenItem(null)}
+                onClick={() => { setOpenItem(null); setComments(null); }}
                 className="px-3 py-2 rounded-xl border border-[#E8D5C4] text-[#6B5744] text-sm font-semibold active:scale-95"
               >
                 Close
@@ -468,12 +849,67 @@ export default function FeedbackAnalyticsPage() {
                 <div className="text-lg font-extrabold text-emerald-700">{openItem.happy_after}</div>
               </div>
             </div>
+
             <div className="mt-4 flex items-center gap-2 text-[12px] font-extrabold uppercase tracking-wide text-[#8B7355]">
-              <RotateCcw className="w-3.5 h-3.5" /> Guest comments
+              <MessageSquare className="w-3.5 h-3.5" /> Guest comments
             </div>
-            <div className="mt-2 rounded-xl border border-dashed border-[#D4B896] bg-[#FFF8F0] px-3 py-6 text-center text-[12px] text-[#8B7355]">
-              P5 lists the real comments here, from <code>gf_item_feedback</code>.
-            </div>
+
+            {commentsError ? (
+              <div className="mt-2 rounded-xl border border-red-200 bg-red-50 px-3 py-3 text-[12px] text-red-800">
+                {commentsError}
+              </div>
+            ) : comments === null ? (
+              <div className="mt-2 rounded-xl border border-dashed border-[#D4B896] bg-[#FFF8F0] px-3 py-6 text-center text-[12px] text-[#8B7355]">
+                Loading the comments…
+              </div>
+            ) : comments.length === 0 ? (
+              <div className="mt-2 rounded-xl border border-dashed border-[#D4B896] bg-[#FFF8F0] px-3 py-6 text-center text-[12px] text-[#8B7355]">
+                No item feedback was recorded against this dish in this period.
+              </div>
+            ) : (
+              <div className="mt-2 space-y-2">
+                {comments.map((c, i) => (
+                  <div key={`${c.when}-${i}`} className="rounded-xl border border-[#E8D5C4] bg-[#FFF8F0] px-3 py-2.5">
+                    <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-[#8B7355]">
+                      <span className="font-bold text-[#2D1B0E]">Table {c.table_number || '—'}</span>
+                      {c.floor ? <span>· {c.floor}</span> : null}
+                      {c.rating ? (
+                        <span
+                          className={`font-bold ${
+                            c.rating === 'poor' ? 'text-red-700'
+                              : c.rating === 'average' ? 'text-amber-700' : 'text-emerald-700'
+                          }`}
+                        >
+                          · {c.rating}
+                        </span>
+                      ) : null}
+                      {c.issue_label ? <span>· {c.issue_label}</span> : null}
+                      {c.action_label && c.action_taken !== 'none' ? <span>· {c.action_label}</span> : null}
+                      {c.replacement_item_name ? <span>· given {c.replacement_item_name}</span> : null}
+                    </div>
+                    {c.comment ? (
+                      <p className="mt-1 text-[13px] leading-snug text-[#2D1B0E]">“{c.comment}”</p>
+                    ) : (
+                      <p className="mt-1 text-[12px] italic text-[#8B7355]">No comment written — rating only.</p>
+                    )}
+                    {c.revisit_comment ? (
+                      <p className="mt-1 flex items-start gap-1 text-[12px] leading-snug text-[#6B5744]">
+                        <RotateCcw className="w-3 h-3 mt-0.5 shrink-0" />
+                        <span>After the follow-up: “{c.revisit_comment}”</span>
+                      </p>
+                    ) : null}
+                    <div className="mt-1 text-[10px] text-[#8B7355]">
+                      {c.business_day || '—'}
+                      {c.gre_name ? ` · recorded by ${c.gre_name}` : ''}
+                      {c.captain ? ` · captain ${c.captain}` : ''}
+                      {c.follow_up_status
+                        ? ` · follow-up ${c.follow_up_status}${c.happiness ? ` (${c.happiness})` : ''}`
+                        : ''}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         </div>
       )}
@@ -488,11 +924,15 @@ function RankList({
   icon,
   rows,
   tone,
+  empty,
+  note,
 }: {
   title: string;
   icon: ReactNode;
-  rows: readonly { label: string; count: number }[];
+  rows: readonly { label: string; count: number; sub?: string }[];
   tone: 'good' | 'warn' | 'bad';
+  empty: string;
+  note?: string;
 }) {
   const max = rows.reduce((a, b) => Math.max(a, b.count), 0) || 1;
   const bar = { good: 'bg-emerald-500', warn: 'bg-amber-500', bad: 'bg-red-500' }[tone];
@@ -504,21 +944,31 @@ function RankList({
           {title}
         </span>
       </div>
-      <div className="space-y-1.5">
-        {rows.map((r) => (
-          <div key={r.label} className="flex items-center gap-2">
-            <span className="w-28 shrink-0 text-[12px] font-semibold text-[#2D1B0E] truncate">
-              {r.label}
-            </span>
-            <span className="flex-1 h-2 rounded-full bg-[#F0E4D6] overflow-hidden">
-              <span className={`block h-full ${bar}`} style={{ width: `${(r.count / max) * 100}%` }} />
-            </span>
-            <span className="w-8 shrink-0 text-right text-[12px] font-extrabold tabular-nums text-[#6B5744]">
-              {r.count}
-            </span>
-          </div>
-        ))}
-      </div>
+      {rows.length === 0 ? (
+        <p className="text-[12px] text-[#8B7355]">{empty}</p>
+      ) : (
+        <div className="space-y-1.5">
+          {rows.map((r) => (
+            <div key={r.label} className="flex items-center gap-2">
+              <span className="w-28 shrink-0 text-[12px] font-semibold text-[#2D1B0E] truncate" title={r.label}>
+                {r.label}
+              </span>
+              <span className="flex-1 h-2 rounded-full bg-[#F0E4D6] overflow-hidden">
+                <span className={`block h-full ${bar}`} style={{ width: `${(r.count / max) * 100}%` }} />
+              </span>
+              <span className="w-8 shrink-0 text-right text-[12px] font-extrabold tabular-nums text-[#6B5744]">
+                {r.count}
+              </span>
+              {r.sub ? (
+                <span className="w-16 shrink-0 text-right text-[10px] tabular-nums text-[#8B7355]">
+                  {r.sub}
+                </span>
+              ) : null}
+            </div>
+          ))}
+        </div>
+      )}
+      {note ? <p className="mt-2 text-[10px] leading-snug text-[#8B7355]">{note}</p> : null}
     </Card>
   );
 }
