@@ -39,6 +39,19 @@ import Toggle from '@/components/Toggle';
 import { packFactor, fmtQtyNum } from '@/lib/pack-units';
 import StockOnHandNote, { StockOnHandLegend } from '@/components/StockOnHandNote';
 import { useStockOnHand } from '@/lib/use-stock-on-hand';
+/* ── THE BILL HANDOVER QUESTION, ASKED IN THE STORE'S OWN QUALITY CHECK ──────
+   The owner: "IT SHOULD ASK IN QUALITY CHECK FOR STORE PERSON". This form and
+   the PO receive modal are the only TWO doors into the same three store QC
+   columns, so the question, its wording, its defaulting rule and the follow-up
+   write live in ONE component + ONE helper that both doors call — exactly the
+   shape grn-qc.ts uses to gate both roads with one helper, and for the same
+   reason: two copies of a rule this small drift inside a month. */
+import BillHandoverCheck from '@/components/BillHandoverCheck';
+import {
+  BH_ANSWER_DEFAULT,
+  recordBillHandoverForReceipt,
+  type BillHandoverAnswer,
+} from '@/lib/bill-handover-client';
 
 const fmt = (v: number) => '₹' + Math.round(v || 0).toLocaleString('en-IN');
 /** ₹ with 2 decimals — for the inward register (taxes/charges carry paise). */
@@ -2323,6 +2336,14 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
     qc_damage: false, qc_weight: false, qc_invoice_match: false,
   });
   const toggleQc = (k: keyof typeof qc) => setQc(p => ({ ...p, [k]: !p[k] }));
+  /* ── THE FOURTH STORE QUESTION: WHERE IS THE VENDOR'S BILL GOING? ─────────
+     Not a seventh checkbox — a three-way answer (with the store / handed to
+     Accounts now / no vendor bill), defaulting to "with the store", which is
+     what is actually true at the instant a delivery is received. The common case
+     therefore costs the receiver ZERO taps and the bill is still registered.
+     Applied AFTER the save commits, because the handover is keyed on the GRN
+     this save mints, and it NEVER blocks the save. */
+  const [billHandover, setBillHandover] = useState<BillHandoverAnswer>(BH_ANSWER_DEFAULT);
   const [items, setItems] = useState<GrnLine[]>([blankLine()]);
   /* ── THE BILL-LEVEL CHARGES, CARRIED OVER FROM "ENTER FULL BILL" ──────────
    * One Discount and one Delivery figure for the WHOLE bill, By % or By Amount,
@@ -3518,6 +3539,37 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
         j = await r.json();
       }
       if (!r.ok) { alert(j.error || 'Failed'); return; }
+      /* ── THE BILL HANDOVER, APPLIED THE MOMENT THE GRN EXISTS ──────────────
+         The handover record is keyed on goods_receipt_notes.id, so it cannot be
+         written before this save mints one — j.grn_id is that id.
+
+         PLACED HERE, before every outcome branch below, so it runs on ALL FOUR:
+         held for a quality check, an undecided category, the store_blocked /
+         vendor-mapping / cash panel, and the plain one-click success. Putting it
+         inside any one of them would silently skip the bill on the other three,
+         and a bill that silently is not registered is the exact failure this
+         feature exists to end.
+
+         It cannot throw — recordBillHandoverForReceipt returns an outcome object
+         precisely so a bill-register hiccup can never present itself as a failed
+         receipt, and by this line the stock write is already committed. If it
+         DOES fail, the sentence says so and the delivery appears on the store
+         register's "Bill not recorded" list, which exists for this gap. The
+         durable fix is to move the write into POST /api/grn's own transaction
+         (recordBillHandoverForGrn() in src/lib/bill-handover.ts is the one line
+         for it) — not done here because that route file carries other lanes'
+         uncommitted work. */
+      const bh = await recordBillHandoverForReceipt(
+        String(j.grn_id || ''),
+        String(j.grn_number || ''),
+        billHandover,
+        !noBill && !!invoice.trim(),
+      );
+      /* Carried ON the response object so ONE renderer (SaveNotices) can print it
+         on every outcome, instead of the same paragraph being written into four
+         branches — which is how store_blocked once came to be printed in only
+         one of them and vanished from the rest. */
+      j.bill_handover = { ok: bh.ok, message: bh.message, attachment: bh.attachmentMessage || '' };
       // ── A HELD RECEIPT IS NOT AN alert() ──────────────────────────────────
       // "✓ Created — 0 material(s) updated" is what the old line would have said
       // about a delivery that entered no stock, which is exactly the sentence
@@ -3547,14 +3599,26 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
       // it is dismissed, and the voucher number exists nowhere else on this
       // screen. `paid_in_cash` is absent on every credit bill, so the ordinary
       // receipt keeps the one-click alert it has always had.
+      // ── AND A FOURTH: THE BILL WAS NOT REGISTERED ─────────────────────────
+      // A FAILED handover gets the panel, never the alert. An alert is gone the
+      // instant it is dismissed, and "the bill was not recorded — record it at
+      // Purchasing → Bill Handover" is an instruction the receiver has to be able
+      // to read twice. A SUCCESSFUL one does not force a panel: it rides in the
+      // one-click alert below, so an ordinary receipt still closes in one click
+      // exactly as it always has.
       if ((Array.isArray(j.store_blocked) && j.store_blocked.length > 0)
           || (Array.isArray(j.vendor_mapping) && j.vendor_mapping.length > 0)
-          || j.paid_in_cash === true) {
+          || j.paid_in_cash === true
+          || j.bill_handover?.ok === false) {
         setReceived(j);
         return;
       }
       alert(`✓ Created ${j.grn_number} — ${j.materials_touched} material(s) updated`
-            + (j.invoice_id ? ` · Invoice ID ${j.invoice_id}` : ''));
+            + (j.invoice_id ? ` · Invoice ID ${j.invoice_id}` : '')
+            // The bill's fate, on the same one click. Never omitted: the whole
+            // point is that there is no doubt about whether it was handed over.
+            + (j.bill_handover?.message ? `\n\n${j.bill_handover.message}` : '')
+            + (j.bill_handover?.attachment ? `\n${j.bill_handover.attachment}` : ''));
       onCreated();
     } finally { setBusy(false); }
   };
@@ -3573,9 +3637,36 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
     const blocked: any[] = Array.isArray(j?.store_blocked) ? j.store_blocked : [];
     const mapping: any[] = Array.isArray(j?.vendor_mapping) ? j.vendor_mapping : [];
     const cash = j?.paid_in_cash === true;
-    if (blocked.length === 0 && mapping.length === 0 && !cash) return null;
+    // THE VENDOR'S BILL — the fourth thing, and the one that must never be
+    // silent. It is stamped onto the response in save() so this single renderer
+    // prints it on every outcome (held / undecided / blocked / cash), rather than
+    // the same paragraph being copied into four branches.
+    const bh = j?.bill_handover as { ok?: boolean; message?: string; attachment?: string } | undefined;
+    if (blocked.length === 0 && mapping.length === 0 && !cash && !bh?.message) return null;
     return (
       <>
+        {/* ══ WHERE THE VENDOR'S BILL WENT ══════════════════════════════════
+            GREEN when it was registered, AMBER when it was not — never red, and
+            never phrased as if the receipt failed: by the time this renders the
+            goods are in stock and the GRN exists. The amber case names the exact
+            place to finish the job, because the receiver is the only person who
+            knows the bill is in their hand right now. */}
+        {bh?.message && (
+          <div
+            className={`rounded-lg border p-3 space-y-1 ${
+              bh.ok
+                ? 'border-emerald-200 bg-emerald-50 text-emerald-900'
+                : 'border-amber-300 bg-amber-50 text-amber-900'
+            }`}
+          >
+            <div className="font-semibold flex items-center gap-1.5">
+              <Receipt className="w-4 h-4 shrink-0" />
+              {bh.ok ? 'The vendor’s bill' : 'The vendor’s bill was NOT registered'}
+            </div>
+            <div className="text-[11px] leading-snug">{bh.message}</div>
+            {bh.attachment && <div className="text-[11px] leading-snug">{bh.attachment}</div>}
+          </div>
+        )}
         {/* ══ THE MONEY LEFT THE BOX ═══════════════════════════════════════
             GREEN, not amber: this is a thing that SUCCEEDED, and it is printed
             on every outcome — held, undecided and plain success — because the
@@ -4444,6 +4535,44 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
               </div>
             </div>
           </div>
+
+          {/* ── THE FOURTH STORE CHECK ─────────────────────────────────────────
+              The owner's instruction, verbatim: "IT SHOULD ASK IN QUALITY CHECK
+              FOR STORE PERSON". So it sits immediately under the store's own
+              checklist, at the point where the receiver has already typed the
+              bill number off the paper and its date off the paper — the bill is
+              in their hand.
+
+              FULL WIDTH BELOW THE TWO CARDS rather than inside the blue one, and
+              that is a layout decision with a reason: the store card is a
+              half-width column at md and up, and three thumb-sized answer
+              buttons crammed into half a column is exactly the kind of target a
+              person at 6am mis-taps. It keeps the store card's own blue so it
+              still reads as part of "Yours — the receiving desk" and not as a
+              separate feature.
+
+              Nothing here is retyped and nothing here is posted: the server reads
+              the bill number, vendor, date and value from the goods receipt this
+              save is about to mint. The component hides itself for a viewer who
+              may not record a handover (POST /api/grn gates on nothing but a
+              signed-in session, so that is a real case) and shows the register's
+              start date instead of a question for a receipt dated before it. */}
+          <BillHandoverCheck
+            receivedDate={date}
+            /* noBill is the DECLARED "there is no vendor paper" state on this
+               form, so it answers the question outright — and a blank invoice box
+               counts the same way. */
+            hasBill={!noBill && !!invoice.trim()}
+            billNo={invoice}
+            vendorName={vendor}
+            billDate={invoiceDate}
+            /* The whole typed bill — goods, charges, tax and cess — the same
+               figure this form's own footer shows. */
+            billValue={bill.totalInward}
+            value={billHandover}
+            onChange={setBillHandover}
+            disabled={busy}
+          />
 
           {/* NOTE: no overflow-hidden on the wrapper — that clips the
               MaterialTypeahead dropdown when it opens below the input.

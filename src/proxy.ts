@@ -103,6 +103,15 @@ const CSRF_REQUIRED_PREFIXES = [
   '/api/crm-calls/entertainment', // GRE "What's On" entertainment calendar CRUD (management-gated writes)
   '/api/telecmi',             // TeleCMI actions (click-to-call, backfill) — webhooks are carved out in isPublic (matched there first)
   '/api/hr',                  // HRMS module (docs/HRMS_DECISIONS.md) — one prefix covers every present and future HR mutation; HR client writes must use src/lib/api.ts or they 403 here
+  // Bill Submission Quality Check: the Store -> Accounts vendor-bill handover
+  // register. One prefix covers create / submit / confirm / void / attachment,
+  // present and future. Every client write must go through src/lib/api.ts
+  // (api()/apiJson() inject X-CSRF-Token) or it 403s here. MEASURED without this
+  // line, built from HEAD: POST /api/bill-submissions with NO x-csrf-token
+  // reached app code. The path carries no 'print' substring and no file
+  // extension, so neither isPublic() carve-out can make any of it public — and
+  // the /api/ hard floor below (9224f6d) is untouched by this edit.
+  '/api/bill-submissions',
 ];
 
 // Print PAGES that must render without bouncing through /login — the four paths

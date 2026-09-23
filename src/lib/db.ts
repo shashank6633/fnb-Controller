@@ -7745,6 +7745,40 @@ function initializeSchema(db: Database.Database) {
     }
   } catch (e) { console.error('discount_limits_v1 migration failed:', e); }
 
+  // ── BILL SUBMISSION QUALITY CHECK (bill_handover*) ────────────────────────
+  // Tables + the forward-only cutoff for the Store -> Accounts vendor-bill
+  // handover register. Owner's purpose, verbatim: "create a proper audit trail
+  // and prevent situations where there is confusion about whether a vendor bill
+  // was actually handed over to the Accounts department."
+  //
+  // THE WHOLE MODULE LIVES IN src/lib/bill-handover-schema.ts, NOT HERE. Only
+  // this call site is in db.ts, for two reasons:
+  //   1. THIS FILE HAS FOUR CONCURRENT EDITORS. Three other lanes carry
+  //      uncommitted hunks in initializeSchema right now (butchering flags
+  //      ~4102, the party_issue migration ~5384, and the gated liquor
+  //      foundation ~8439, which also owns the last ~500 lines of this
+  //      function). A 300-line DDL block here would be a fourth merge surface
+  //      in the same function; a require() is one line that cannot collide.
+  //      This spot is deliberate: it sits between the discount-limits migration
+  //      above and the HRMS namespace below, ~2,200 lines after the party_issue
+  //      hunk and with the whole HRMS block (~690 lines) between it and the
+  //      liquor hunk.
+  //   2. initializeSchema SWALLOWS ERRORS. ensureBillHandoverSchema() runs one
+  //      try/catch PER STATEMENT and then VERIFIES the tables against
+  //      sqlite_master, and every route under /api/bill-submissions calls it
+  //      again on first use — so a boot failure swallowed here is repaired on
+  //      the next request instead of becoming a permanent "no such table" 500.
+  //
+  // require(), not a top-level import, for the same reason getDb() uses one for
+  // ./units: bill-handover-schema is a leaf (better-sqlite3 types +
+  // ./format-date, which imports nothing), and keeping it out of this file's
+  // import block keeps the diff to this single hunk.
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { ensureBillHandoverSchema } = require('./bill-handover-schema') as typeof import('./bill-handover-schema');
+    ensureBillHandoverSchema(db, true);
+  } catch (e) { console.error('bill_handover schema failed:', e); }
+
   // ── HRMS module (hr_ namespace) ──────────────────────────────────────────
   // Contract: docs/HRMS_DECISIONS.md (read it before touching anything here).
   // Phase 1 tables only; later phases append INSIDE this one block.

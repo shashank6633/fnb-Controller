@@ -30,8 +30,21 @@ import { SECRET_KEY_RE } from '@/lib/secret-keys';
  *                     write door is shut for EVERYONE, admins included: arming
  *                     a switch whose rail was deleted can only mislead the next
  *                     person who reads the value. READ stays open.
+ *   frozen: '<why>'  → the key is WRITTEN ONCE, by a boot-time seeder, and its
+ *                      whole value is that it never moves again. No route may
+ *                      rewrite it — not this one, not a dedicated one, and not
+ *                      for an admin: unlike `owner`, there is no other door,
+ *                      because there is meant to be no door at all. READ stays
+ *                      open (the screens print the value).
  */
-type KeyPolicy = { read?: 'admin'; write?: 'admin'; writeError?: string; owner?: string; retired?: string };
+type KeyPolicy = {
+  read?: 'admin';
+  write?: 'admin';
+  writeError?: string;
+  owner?: string;
+  retired?: string;
+  frozen?: string;
+};
 
 const KEY_POLICY = new Map<string, KeyPolicy>([
   // WHICH DEPARTMENTS DEDUCT STOCK FROM RECIPES. Owned by /api/departments, which
@@ -197,6 +210,48 @@ const KEY_POLICY = new Map<string, KeyPolicy>([
       'a sale no longer moves store stock at all. The key is kept only as a historical marker; ' +
       'its value at retirement is in tm_floor_autodeduct_was.',
   }],
+  // THE BILL-HANDOVER START DATE. The owner's instruction for the vendor-bill
+  // register was one line: "DONT NEED TO REVIEW ANY PAST BILLS FROM THE NEXT DAY
+  // OF DEPLOYMENT". seedBillHandoverCutoff() writes these two ONCE, at first
+  // boot (INSERT OR IGNORE, src/lib/bill-handover-schema.ts), and every later
+  // boot is a no-op — so the register's start date cannot drift with the clock.
+  //
+  // It COULD drift through this door, and that is what this row closes. Neither
+  // key matches SECRET_KEY_RE, so ownerRoute() returned null and the generic
+  // INSERT OR REPLACE below ran on nothing but the admin-OR-MANAGER floor.
+  // MEASURED on a copy of the live database, as Ganesh (store manager, manager
+  // tier, NOT an admin): PUT {"key":"bill_handover_cutoff_date","value":
+  // "2026-01-01"} → 200 stored; the register's not_yet_recorded went 0 → 29, the
+  // unrecorded list filled with goods receipts from six weeks before deployment,
+  // and POST /api/bill-submissions on one of them → 201. That is precisely the
+  // 2,121-row historical backlog the owner pre-empted, re-opened by one PUT.
+  // Two more measured consequences: the committed_at stamp the screens print as
+  // "Start date recorded once … and it does not move" was equally writable, so
+  // it evidenced nothing; and a value of 'not-a-date' returned 200 and left the
+  // register ready=false with creation 503ing — a manager-tier denial of service
+  // on the feature with no in-app remedy, since nothing in src/ rewrites the key.
+  //
+  // `frozen`, NOT `owner` and NOT write:'admin'. owner: would name a route that
+  // writes these keys and no such route exists (naming one would be a lie in an
+  // error message). write:'admin' would leave the backlog one admin PUT away,
+  // and moving the cutoff is not an admin-grade decision — it is a decision to
+  // change what months of finished screens mean, retroactively. If it ever
+  // genuinely has to move, that is a deliberate DB edit by whoever deploys, made
+  // on purpose and visible in a diff. READ stays open: all three bill-handover
+  // screens print the date, and the whole point is that it is stated in plain
+  // words on every one of them.
+  ['bill_handover_cutoff_date', {
+    frozen:
+      'it is the vendor-bill register\'s start date, written once at first boot. Moving it ' +
+      'backwards re-opens the historical backlog the owner explicitly ruled out ("no past bills"); ' +
+      'moving it forwards hides bills already recorded. Changing it is a deliberate database edit, ' +
+      'not an app action.',
+  }],
+  ['bill_handover_cutoff_committed_at', {
+    frozen:
+      'it is the stamp proving WHEN the register\'s start date was fixed. A rewritable stamp is ' +
+      'not evidence of anything, and the bill-handover screens show it to the owner as evidence.',
+  }],
 ]);
 
 /**
@@ -295,6 +350,16 @@ export async function PUT(req: Request) {
   if (retired) {
     return Response.json(
       { error: `'${k}' is retired and cannot be changed — ${retired}` },
+      { status: 403 },
+    );
+  }
+  // Write-once keys are frozen for EVERYONE (admins included). A boot seeder
+  // set them and their whole value is that they do not move; there is no other
+  // door to send the caller to, because there is meant to be none.
+  const frozen = KEY_POLICY.get(k)?.frozen;
+  if (frozen) {
+    return Response.json(
+      { error: `'${k}' is written once and cannot be changed — ${frozen}` },
       { status: 403 },
     );
   }

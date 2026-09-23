@@ -21,6 +21,20 @@ import { packFactor, toPurchaseQty, fmtQtyNum, type PackMeta } from '@/lib/pack-
 // file may import it; never add an import to it. See its header for what a bare
 // .trim() let through on both sides.
 import { normalizeBillNo } from '@/lib/bill-no';
+// ── THE BILL HANDOVER QUESTION, ASKED IN THE STORE'S OWN QUALITY CHECK ──────
+// The owner: "IT SHOULD ASK IN QUALITY CHECK FOR STORE PERSON". This is one of
+// exactly TWO doors into the same three store QC columns (the other is
+// /grn's ad-hoc receipt), so the question, its wording, its defaulting rule and
+// the follow-up write all live in ONE component + ONE helper and both doors call
+// in — the same shape grn-qc.ts uses to gate both roads with one helper. It is
+// asked here and not on a separate screen because this is the moment the store
+// person is holding the vendor's paper.
+import BillHandoverCheck from '@/components/BillHandoverCheck';
+import {
+  BH_ANSWER_DEFAULT,
+  recordBillHandoverForReceipt,
+  type BillHandoverAnswer,
+} from '@/lib/bill-handover-client';
 // THE SERVER'S OWN "are these the same vendor?" — imported so the composer's
 // draft header and the header deriveHeaderVendor() writes on save cannot
 // disagree. @/lib/vendor-mapping has NO runtime imports (its db import is
@@ -912,6 +926,15 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
   const [qcExpiry, setQcExpiry] = useState(false);
   const [qcWeight, setQcWeight] = useState(false);
   const [qcInvoiceMatch, setQcInvoiceMatch] = useState(false);
+  /* ── AND THE FOURTH STORE QUESTION: WHERE IS THE VENDOR'S BILL GOING? ────
+     Not a checkbox — a three-way answer (with the store / handed to Accounts now
+     / no vendor bill), defaulting to "with the store", which is what is actually
+     true the instant a delivery is received. So the common case costs the
+     receiver ZERO taps and the bill is still registered. It is applied AFTER the
+     receipt commits (the handover is keyed on the GRN this Confirm mints) and it
+     NEVER blocks Confirm — there is a truck at the bay, and a bill-register
+     question may not be the thing that stops goods being booked in. */
+  const [billHandover, setBillHandover] = useState<BillHandoverAnswer>(BH_ANSWER_DEFAULT);
   /* ── ONE PO, MANY VENDORS, ONE BILL EACH ────────────────────────────────
      A PO here is an internal approval document, so it legitimately spans
      several vendors — each of whom turns up on their own day with their own
@@ -995,6 +1018,13 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
        ticks somebody gave for vendor A's — goods they never had in front of
        them. Same reason setBillNo('') sits on this line. */
     setQcExpiry(false); setQcWeight(false); setQcInvoiceMatch(false);
+    /* AND THE BILL-HANDOVER ANSWER, for a harder reason than the ticks: it can
+       carry a PHOTO. Left in place across a vendor switch, vendor A's bill scan
+       would be attached to vendor B's handover record — a wrong document filed
+       against a real bill, which is worse than no document. Reset to the default
+       answer ("with the store"), not to nothing, so the next bill is still
+       registered without a tap. */
+    setBillHandover(BH_ANSWER_DEFAULT);
     setDiscountValue(''); setDeliveryValue('');
     setDiscountMode('amt'); setDeliveryMode('amt');
     // Tax belongs to the vendor's bill, not to the PO — the next vendor's bill
@@ -1593,6 +1623,31 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
       }
       setDidReceive(true);
 
+      /* ── THE BILL HANDOVER, APPLIED THE MOMENT THE GRN EXISTS ──────────────
+         The handover record is keyed on goods_receipt_notes.id, so it cannot be
+         written until this receive has minted one — j.grn_id is that id.
+
+         AWAITED, not fired and forgotten: the answer is part of what the
+         receiver is told below, and "did that bill get registered?" is the one
+         question this whole feature exists to make answerable. It cannot throw
+         (recordBillHandoverForReceipt returns an outcome object precisely so a
+         bill-register hiccup can never present itself as a failed receipt — the
+         stock is in and the PO is closed by the time we get here).
+
+         IF IT FAILS the receipt still stands and the delivery turns up on the
+         store register's "Bill not recorded" list, which exists for exactly this
+         gap; the sentence in `notes` says so and names where to finish it. The
+         durable fix is to move this write INSIDE the receive route's own
+         transaction — recordBillHandoverForGrn() in src/lib/bill-handover.ts
+         exists for that one line — which is deliberately not done here because
+         that route file carries other lanes' uncommitted work. */
+      const bh = await recordBillHandoverForReceipt(
+        String(j.grn_id || ''),
+        String(j.grn_number || ''),
+        billHandover,
+        !!normalizeBillNo(billNo),
+      );
+
       /* ── THE DELIVERY IS HELD FOR A QUALITY CHECK — SAID FIRST, AND ALWAYS ──
          20 of the live GRNs come through THIS route, and until now it was the
          one that said nothing: the receive route has always returned
@@ -1935,6 +1990,9 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
                             onClick={() => {
                               setVendorKey(v.key); setBillNo('');
                               setQcExpiry(false); setQcWeight(false); setQcInvoiceMatch(false);
+                              // Clears any picked bill photo with it — see the
+                              // note on the same call inside load().
+                              setBillHandover(BH_ANSWER_DEFAULT);
                             }}
                             className={`text-left px-2.5 py-2 rounded-lg border text-[11px] transition-colors ${
                               v.done ? 'border-[#E8D5C4] bg-white/50 opacity-70 cursor-default'
@@ -2569,6 +2627,35 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
                   </>
                 )}
               </div>
+
+              {/* ── THE FOURTH STORE CHECK ─────────────────────────────────────
+                  Placed inside the store's own checklist panel, directly under
+                  the three ticks and their signing rule, because that is the
+                  owner's instruction: "IT SHOULD ASK IN QUALITY CHECK FOR STORE
+                  PERSON". At this exact point the receiver has just typed the
+                  bill number off the paper (five fields up), typed its date off
+                  the paper, and ticked "Invoice matches PO" — the bill is in
+                  their hand, and the question costs one glance.
+
+                  Everything it shows is read off this form and NOTHING is
+                  retyped or posted from here: the server reads the bill number,
+                  vendor, date and value from the goods receipt itself. The
+                  component hides itself when the viewer may not record a
+                  handover, and shows the register's start date instead of a
+                  question for a receipt dated before it. */}
+              <BillHandoverCheck
+                receivedDate={receivedAt}
+                hasBill={!!normalizeBillNo(billNo)}
+                billNo={billNo}
+                vendorName={vendorLabel}
+                billDate={billDate}
+                /* The figure the receiver has just reconciled against the paper
+                   bill — goods less discount, plus GST, cess and delivery. */
+                billValue={tax.billTotal}
+                value={billHandover}
+                onChange={setBillHandover}
+                disabled={saving}
+              />
             </div>
           )}
 

@@ -32,6 +32,7 @@ import {
   ShieldAlert,
   AlertTriangle,
   History,
+  Inbox,
   Boxes,
   Layers,
   ArrowLeftRight,
@@ -184,6 +185,47 @@ const navTree: NavEntry[] = [
       { kind: "link", label: "Vendor → Items",     href: "/vendors/materials",  icon: Building2 },
       { kind: "link", label: "Contracts",          href: "/contracts",          icon: FileText },
       { kind: "link", label: "Petty Cash",         href: "/petty-cash",         icon: Banknote },
+      // ── Bill Submission Quality Check — the STORE half ──────────────────
+      // The store's own register: what is pending, what has been handed to
+      // Accounts, and what Accounts have confirmed. Rule 7's other half — this
+      // href must match its row in src/lib/page-catalog.ts character for
+      // character, in the same commit. A page in only one of the two files is
+      // the failure that hid /variance-approvals: gated but invisible, so it
+      // reads as a bug in the feature rather than a missing nav line.
+      //
+      // Sits directly under Petty Cash and above the Accounts rows because it is
+      // the same flow read from the two ends, and because the STORE end is where
+      // a record starts: a bill is normally created by answering the question in
+      // the store quality check while receiving (Purchase Orders → Receive and
+      // Goods Receipt (GRN)), not on this page.
+      //
+      // NO tier flag in the catalog, on purpose: the storekeeper who physically
+      // takes the bill over the counter is the person who must mark it handed
+      // over, and mgmtOnly/hodOnly run BEFORE the null-map grant, so they would
+      // be a real lock on exactly the wrong people. Seeing this page is not
+      // permission to record anything — every /api/bill-submissions route
+      // re-derives that from the session (Management or the Store Manager for
+      // the store side; an Administrator or a holder of the role named
+      // "Accounts" to confirm).
+      { kind: "link", label: "Bill Handover — Store", href: "/bill-submissions", icon: Store },
+      // ── Bill Submission Quality Check — the ACCOUNTS half ───────────────
+      // The other half of rule 7: these two hrefs must match their rows in
+      // src/lib/page-catalog.ts character for character, in the same commit.
+      // A page listed in only one of the two files is the failure that hid
+      // /variance-approvals — gated but invisible, so it reads as a bug in the
+      // feature rather than a missing nav line.
+      //
+      // The STORE screen (/bill-submissions) is the store lane's and its row
+      // goes directly above these two, in BOTH files.
+      //
+      // Deliberately listed for everyone the catalog allows, including the
+      // Accounts team, who are staff tier: seeing the queue is not permission
+      // to confirm anything. POST /api/bill-submissions/:id/confirm re-derives
+      // that from the session — Administrator, or a holder of the role named
+      // "Accounts" — and refuses anyone else with its own sentence, which the
+      // page renders verbatim rather than re-wording.
+      { kind: "link", label: "Bill Handover — Accounts", href: "/bill-submissions/accounts", icon: Inbox },
+      { kind: "link", label: "Bill Handover — History",  href: "/bill-submissions/history",  icon: History },
     ],
   },
   {

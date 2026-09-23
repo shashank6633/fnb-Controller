@@ -171,6 +171,63 @@ export const PAGE_CATALOG: PageSection[] = [
       // category that can conjure or vanish cash ('adjustment') is
       // management-only server-side.
       { path: '/petty-cash',          label: 'Petty Cash (store cash box)' },
+      // ── Bill Submission Quality Check — the STORE half ──────────────────
+      // The store's own register of vendor bills and whether they have reached
+      // Accounts: Pending Submission / Submitted - Awaiting Accounts
+      // Confirmation / Received by Accounts, plus the deliveries that carry no
+      // bill record at all. This row and its twin in src/components/Sidebar.tsx
+      // must ship together, hrefs matching character for character — the two
+      // files keep separate lists, so a page in only one of them is either
+      // invisible (catalog-only) or ungated (sidebar-only).
+      //
+      // DELIBERATELY NO TIER FLAG. The storekeeper who hands the bill across the
+      // counter is the person who must record that it happened, and
+      // mgmtOnly/hodOnly run BEFORE the null-map grant — they are a real lock,
+      // not a hint, and here they would lock out the one role the page is for.
+      // Access stays opt-in per user/role, and the routes are the actual
+      // boundary: canRecordBillHandover is Management or the Store Manager and
+      // explicitly refuses an Accounts-role holder, so a grant here widens who
+      // can SEE the register, never who can assert a handover.
+      //
+      // AND THE PREFIX TRAP, stated once for all three rows: canAccessPage
+      // matches a grant by prefix, so ticking this row also grants
+      // /bill-submissions/accounts and /bill-submissions/history below. That is
+      // the documented behaviour of every parent in this catalog and it is
+      // harmless here, because confirming a receipt is gated by the route on the
+      // role NAME ("Accounts") and not by which checkbox is ticked.
+      { path: '/bill-submissions',    label: 'Bill Handover — Store' },
+      // ── Bill Submission Quality Check — the ACCOUNTS half ───────────────
+      // Two screens for the vendor-bill handover: the queue Accounts works and
+      // the history both departments read. The STORE screen (/bill-submissions)
+      // belongs to the store lane and its row goes directly above these two —
+      // this file and src/components/Sidebar.tsx must gain it in the same
+      // commit, hrefs matching character for character, or it repeats the
+      // drift that once hid /variance-approvals (catalog-only = gated and
+      // invisible; sidebar-only = visible and ungated).
+      //
+      // NO TIER FLAG, and that is deliberate rather than an omission. The
+      // Accounts role the owner creates will be STAFF tier (a manager-tier role
+      // would silently pass isManagement() everywhere and reach /reports/sales
+      // and /hr/employees), so an mgmtOnly/hodOnly flag here would lock the
+      // Accounts team out of the one page built for them — those flags run
+      // BEFORE the null-map grant and are a real lock, not a hint.
+      //
+      // THIS LINE IS NOT THE SECURITY BOUNDARY, and nothing about this feature
+      // should be reasoned about as if it were. Measured on the live database:
+      // role_id is set on 0 of 9 users and page_access is NULL on 8 of 9, so
+      // page gating is effectively INERT today; src/proxy.ts guards pages and
+      // not APIs; and canAccessPage fails open four ways. Every route under
+      // /api/bill-submissions re-derives its own answer from the session —
+      // reading is canViewBillHandovers, and only an Administrator or a holder
+      // of the role NAMED "Accounts" can confirm a receipt.
+      //
+      // ONE PREFIX TRAP WORTH KNOWING: canAccessPage matches a grant by prefix,
+      // so ticking the store's /bill-submissions also grants both rows below.
+      // That is the documented behaviour for every parent in this catalog, and
+      // it is harmless here precisely because confirming is gated by the route
+      // on the role name and not by which checkbox is ticked.
+      { path: '/bill-submissions/accounts', label: 'Bill Handover — Accounts' },
+      { path: '/bill-submissions/history',  label: 'Bill Handover — History' },
     ],
   },
   {
