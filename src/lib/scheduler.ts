@@ -19,6 +19,10 @@
  *   - runWaDailyNotifications()    — low-stock summary + owner digest, once a day
  *   - runTaskAutomation()          — recurring + maintenance task generation,
  *                                    overdue sweep + escalation, once per IST day
+ *   - runBohReminders()            — Bill-on-Hold payment follow-ups, one per
+ *                                    (BOH, expected date). Placed ABOVE
+ *                                    refreshUpcomingParties so a Sheets failure
+ *                                    can never starve the money chase.
  *   - refreshUpcomingParties() + refreshPartyBookings()
  *   - checkDeferDueSoon()          — deferred requisition items coming due
  *   - sweepRecordingRetention()    — call recordings past the admin's window
@@ -178,6 +182,42 @@ export function startSchedulerOnce(): void {
         if (ta && ta.ran) console.log(`[scheduler] task-automation @ IST ${istHour()}h: ran for ${ta.date}`);
       } catch (e) {
         console.error('[scheduler] task automation failed:', e instanceof Error ? e.message : e);
+      }
+
+      // BILL ON HOLD — the payment-follow-up reminder. Same shape as the
+      // reviews block above (dynamic import, its own try/catch, cheap when
+      // nothing is due) and deliberately in the same place: ABOVE the
+      // `refreshUpcomingParties` call below.
+      //
+      // WHY ABOVE IT. refreshUpcomingParties is a Google Sheets call; when it
+      // fails (expired ADC, org policy, Sheets quota, network) the tick has
+      // nothing useful left to do for the parties rail, and a reminder that
+      // fires only on days Sheets is reachable is not a reminder — the owner's
+      // money has to be chased on the other days too. (The try/catch that now
+      // wraps that call below came from commit 93962d2; this block sitting
+      // above it is belt and braces, not a substitute for it.)
+      //
+      // SAFE ON EVERY TICK. runBohReminders' first statement is one indexed
+      // COUNT over idx_boh_bills_due; it returns 'not_due' in microseconds on
+      // the ~1,435 ticks a day when nothing is owed. It NEVER THROWS by its own
+      // contract, and it claims each (BOH, due date) slot atomically against a
+      // UNIQUE partial index — so a reminder fires ONCE for a due date, not
+      // every five minutes, even with two ticks racing.
+      //
+      // It also stamps its own heartbeat (a boh_reminders row per slot) rather
+      // than trusting globalThis.__fnbScheduler__.lastRun, which is never
+      // stamped on exactly the ticks that half-fail below.
+      try {
+        const { runBohReminders } = await import('./boh-reminders');
+        const { getDb } = await import('./db');
+        const boh = await runBohReminders(getDb());
+        // 'not_due' is the overwhelmingly common answer and says nothing worth
+        // a log line every five minutes. Everything else is worth seeing.
+        if (boh.outcome !== 'not_due') {
+          console.log(`[scheduler] boh-reminders: ${boh.outcome} — ${boh.detail}`);
+        }
+      } catch (e) {
+        console.error('[scheduler] boh reminders failed:', e instanceof Error ? e.message : e);
       }
 
       // GUARDED — AND THAT IS THE ENTIRE POINT OF THIS try.

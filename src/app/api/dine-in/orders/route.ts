@@ -23,7 +23,46 @@ export async function GET(request: Request) {
       LEFT JOIN restaurant_tables t ON o.table_id = t.id
       WHERE ${where}
       ORDER BY o.created_at DESC
-    `).all(...params);
+    `).all(...params) as any[];
+
+    // ── WHAT IS STILL OWED ON A HELD BILL ────────────────────────────────────
+    // /cashier's Outstanding tile rendered o.total — the whole frozen bill —
+    // even when part of it had already been collected on the bill's BOH record,
+    // so the operator was shown a figure ₹200 larger than the debt and the
+    // settle route (before its own netting guard) took it. The balance is read
+    // here so the tile and the Collect button can say the truth.
+    //
+    // Separate, isolated query rather than a join: a database without the BOH
+    // tables must still list orders. On any failure every row simply carries no
+    // boh_* field, which is exactly how this endpoint behaved before.
+    //
+    // `status <> 'void'` AND NOT `status = 'open'`, MATCHING bohTillNetting()
+    // EXACTLY. A write-off CLOSES the record and deliberately leaves the bill
+    // 'on_hold', so with `= 'open'` a written-off bill that had already taken a
+    // deposit carried no boh_balance at all and this tile fell back to the whole
+    // frozen total: the server collected the netted Rs 800 while the operator was
+    // shown Rs 1,100 and would have taken Rs 1,100 in hand. The guest is safe
+    // either way now, but a drawer surplus and an argument at the counter are
+    // not. The two predicates have to be the same predicate.
+    try {
+      const held = orders.filter((o) => o.status === 'on_hold');
+      if (held.length) {
+        const paid = db.prepare(`
+          SELECT b.order_id, b.id AS boh_id,
+                 COALESCE((SELECT SUM(p.amount) FROM boh_payments p WHERE p.boh_id = b.id), 0) AS paid
+            FROM boh_bills b WHERE b.status <> 'void'
+        `).all() as any[];
+        const byOrder = new Map(paid.map((r) => [String(r.order_id), r]));
+        for (const o of held) {
+          const r = byOrder.get(String(o.id));
+          if (!r) continue;
+          o.boh_id = String(r.boh_id);
+          o.boh_paid = Math.round((Number(r.paid) || 0) * 100) / 100;
+          o.boh_balance = Math.round((Math.round(Number(o.total) || 0) - o.boh_paid) * 100) / 100;
+        }
+      }
+    } catch { /* no BOH tables on this database — the list is unchanged */ }
+
     return Response.json({ items: orders });
   } catch (e: any) {
     console.error('[/api/dine-in/orders GET]', e);

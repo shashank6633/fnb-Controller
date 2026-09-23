@@ -6635,6 +6635,46 @@ function initializeSchema(db: Database.Database) {
     }
   } catch (e) { console.error('ct (call-to-table CRM) schema failed:', e); }
 
+  // ── BILL ON HOLD (boh_*) ─────────────────────────────────────────────────
+  // The BOH lifecycle + accountability register: a held POS bill from the
+  // moment it is parked until the whole amount is collected and the record is
+  // closed. Owner's objective, verbatim: "to create a complete BOH lifecycle
+  // and accountability system — from the moment a POS bill is placed on hold
+  // until the entire payment is collected and the BOH is officially closed."
+  //
+  // THE WHOLE MODULE LIVES IN src/lib/boh-schema.ts, NOT HERE. Only this call
+  // site is in db.ts, for the two reasons the bill-handover call site ~1,100
+  // lines below already states:
+  //   1. THIS FILE HAS FIVE CONCURRENT EDITORS. Four lanes carry uncommitted
+  //      hunks inside initializeSchema right now — butchering (~4102),
+  //      party_issue (~5384), the store bill-handover call site (~7749), and
+  //      the gated liquor foundation (~8473, which owns every line to the end
+  //      of this function). A 400-line DDL block here would be a fifth merge
+  //      surface in one function; a require() is one line that cannot collide.
+  //      THIS SPOT IS DELIBERATE: it is the midpoint of the largest gap between
+  //      those hunks — ~1,100 lines after the party_issue hunk ends and ~1,100
+  //      before the bill-handover hunk begins, on the block boundary between
+  //      the ct (call-to-table CRM) schema above and RESERVEGO below.
+  //   2. initializeSchema SWALLOWS ERRORS. ensureBohSchema() runs one try/catch
+  //      PER STATEMENT and then VERIFIES its tables against sqlite_master, and
+  //      every route under /api/boh calls it again on first use — so a boot
+  //      failure swallowed here is repaired on the next request instead of
+  //      becoming a permanent "no such table" 500.
+  //
+  // require(), not a top-level import, for the same reason getDb() uses one for
+  // ./units: boh-schema is a LEAF (better-sqlite3 types only), and keeping it
+  // out of this file's import block keeps the diff to this single hunk. An
+  // import back into db.ts from there would close a cycle at module-init time.
+  //
+  // IT WRITES NO ADMIN-OWNED STATE — no users, roles, departments or
+  // page_access — so scripts/check-boot-migrations.js has nothing to flag, and
+  // every statement is CREATE ... IF NOT EXISTS, so a re-run touches no row.
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { ensureBohSchema } = require('./boh-schema') as typeof import('./boh-schema');
+    ensureBohSchema(db, true);
+  } catch (e) { console.error('boh schema failed:', e); }
+
   // ══ RESERVEGO RESERVATION IMPORT — SCHEMA ONLY (2026-08) ══════════════════
   //
   // The owner exports Reservego's reservation history as CSV and wants it to

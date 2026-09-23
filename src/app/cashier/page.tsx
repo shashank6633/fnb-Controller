@@ -46,6 +46,10 @@ interface Order {
   status: string; total: number; payment_method: string | null;
   subtotal: number; discount: number; discount_pct: number; service_charge_reason: string | null;
   items: OrderItem[];
+  /** Present only on a HELD bill that has a live Bills-on-Hold record: what has
+   *  already been collected on it, and what is therefore still due here. The
+   *  settle route nets the same figure off server-side and refuses to take more. */
+  boh?: { boh_id: string; paid: number; balance: number } | null;
 }
 interface BillDesign { serviceChargeOn?: boolean; serviceChargePct?: number; cgstPct?: number; sgstPct?: number }
 interface Req { id: string; kind: string; requested_pct: number; reason: string; status: string; decided_by?: string; decided_note?: string }
@@ -64,6 +68,12 @@ export default function CashierPage() {
   const [toast, setToast] = useState<{ ok: boolean; msg: string } | null>(null);
   const [discForm, setDiscForm] = useState<{ pct: string; reason: string } | null>(null);
   const [scForm, setScForm] = useState<{ reason: string } | null>(null);
+  // HOLD CAPTURE — the guest's name and number, asked for while they are still
+  // at the till. Non-null means the Hold button was pressed and the capture row
+  // is open; the POST only goes out from submitHold(). The mobile is MANDATORY
+  // (the owner's ruling) and the API enforces it independently — see
+  // src/app/api/dine-in/orders/[id]/hold/route.ts.
+  const [holdForm, setHoldForm] = useState<{ name: string; mobile: string; reason: string } | null>(null);
   const [payOpen, setPayOpen] = useState(false);
   const [billStations, setBillStations] = useState<{ floor: string }[] | null>(null); // active BILL printers
   const [printCounter, setPrintCounterState] = useState('');                          // where Print Bill sends
@@ -153,7 +163,15 @@ export default function CashierPage() {
     { serviceChargeOn: design.serviceChargeOn !== false, serviceChargePct: Number(design.serviceChargePct) || 0, cgstPct: design.cgstPct == null ? 2.5 : Number(design.cgstPct), sgstPct: design.sgstPct == null ? 2.5 : Number(design.sgstPct) },
   ) : null;
   // A held bill's total was frozen at hold — collect exactly that, not a recompute.
-  const grand = order?.status === 'on_hold' ? Math.round(Number(order.total) || 0) : (bill ? Math.round(bill.total) : 0);
+  const heldFrozen = order?.status === 'on_hold' ? Math.round(Number(order.total) || 0) : 0;
+  // …MINUS anything already collected on this bill's Bills-on-Hold record. The
+  // server nets the same figure off and will refuse to take more (settle's
+  // fromHold branch), so the button, the modal and the till agree. `boh` is
+  // absent on every bill with no BOH record, which is the old behaviour exactly.
+  const bohPaid = order?.status === 'on_hold' ? Math.max(Number(order?.boh?.paid) || 0, 0) : 0;
+  const grand = order?.status === 'on_hold'
+    ? Math.round(Math.max(heldFrozen - bohPaid, 0))
+    : (bill ? Math.round(bill.total) : 0);
   const counters = Array.from(new Set((billStations || []).map(s => (s.floor || '').trim()).filter(Boolean)));
   const noBillPrinter = billStations !== null && billStations.length === 0;
   const pendingDisc = reqs.find(r => r.kind !== 'service_charge' && r.status === 'pending');
@@ -180,14 +198,39 @@ export default function CashierPage() {
   };
 
   const printBill = () => selId && act('print', () => api(`/api/dine-in/orders/${selId}/print-bill`, { method: 'POST', body: { counter: printCounter } }));
-  const holdBill = () => selId && act('hold', () => api(`/api/dine-in/orders/${selId}/hold`, { method: 'POST', body: {} }), (j) => {
-    setSelId(null); setOrder(null);
-    // A management hold past a live floor cashier says so — same facts the
-    // override ledger just recorded, from the server's `override` payload.
-    flash(true, j?.override
-      ? `Held by ${j.override.by} — ${j.override.bypassed} holds this floor. Moved to Outstanding Payment.`
-      : 'Bill held — moved to Outstanding Payment');
-  });
+  // HOLD IS NOW A TWO-STEP. The button opens the capture row; nothing is posted
+  // until the guest's number is in. Pre-filled from the order when the floor
+  // already took a name/number, so the usual case is one glance and Enter.
+  const holdBill = () => {
+    if (!selId || !order) return;
+    setHoldForm({
+      name: String((order as any).guest_name || '').trim(),
+      mobile: String((order as any).guest_mobile || '').trim(),
+      reason: '',
+    });
+  };
+  const submitHold = () => {
+    if (!selId || !holdForm) return;
+    // Same 10-digit rule the server applies (bohNorm10). Checked here only to
+    // fail fast with the cursor still in the field — the API refuses
+    // independently and is the actual rule.
+    const digits = holdForm.mobile.replace(/[ \-+().\/]/g, '').slice(-10);
+    if (!/^\d{10}$/.test(digits)) {
+      flash(false, 'A 10-digit customer mobile number is required to hold a bill');
+      return;
+    }
+    act('hold', () => api(`/api/dine-in/orders/${selId}/hold`, {
+      method: 'POST',
+      body: { customer_name: holdForm.name, customer_mobile: digits, reason: holdForm.reason },
+    }), (j) => {
+      setHoldForm(null); setSelId(null); setOrder(null);
+      // A management hold past a live floor cashier says so — same facts the
+      // override ledger just recorded, from the server's `override` payload.
+      flash(true, j?.override
+        ? `Held by ${j.override.by} — ${j.override.bypassed} holds this floor. Moved to Outstanding Payment.`
+        : 'Bill held — moved to Outstanding Payment');
+    });
+  };
   const downloadBill = () => { if (selId) window.open(`/api/dine-in/orders/${selId}/bill-pdf`, '_blank'); };
   const submitDiscount = () => {
     if (!selId || !discForm) return;
@@ -377,7 +420,13 @@ export default function CashierPage() {
                     <span className={`text-[10px] uppercase px-1.5 py-0.5 rounded shrink-0 ${tab === 'closed' ? 'text-emerald-700 bg-emerald-50' : tab === 'outstanding' ? 'text-amber-700 bg-amber-100' : 'text-sky-700 bg-sky-50'}`}>{tab === 'closed' ? 'Paid' : tab === 'outstanding' ? 'On hold' : (o.order_type || 'online')}</span>
                   </div>
                   <div className="text-xs text-[#8B7355] mt-0.5 truncate">#{o.order_number}{o.server_name ? ` · ${o.server_name}` : ''}</div>
-                  <div className={`text-lg font-bold mt-1 ${tab === 'outstanding' ? 'text-amber-700' : 'text-[#af4408]'}`}>{money(o.total || 0)}</div>
+                  <div className={`text-lg font-bold mt-1 ${tab === 'outstanding' ? 'text-amber-700' : 'text-[#af4408]'}`}>{money(o.boh_balance != null ? o.boh_balance : (o.total || 0))}</div>
+                  {/* Part-paid on its bill-on-hold record: show what is still
+                      owed above, and the bill it came from, so the tile can
+                      never invite the cashier to collect the whole bill twice. */}
+                  {o.boh_balance != null && o.boh_paid > 0 && (
+                    <div className="text-[11px] text-emerald-700">{money(o.boh_paid)} already collected · bill {money(o.total || 0)}</div>
+                  )}
                   {tab === 'closed' && o.payment_method && <div className="text-[11px] text-[#8B7355] uppercase">{o.payment_method}</div>}
                 </button>
               ))}
@@ -426,8 +475,20 @@ export default function CashierPage() {
               {order.service_charge_reason && <div className="text-[11px] text-emerald-700">Service charge waived: {order.service_charge_reason}</div>}
               {bill.discount > 0 && <Line l={`Discount${order.discount_pct ? ` (${order.discount_pct}%)` : ''}`} v={'- ' + money(bill.discount)} />}
               <Line l="Tax (CGST+SGST)" v={money(bill.cgst + bill.sgst)} />
+              {/* Already collected on this bill's Bills-on-Hold record. Shown
+                  between the tax line and the amount to collect so the two
+                  numbers are never mistaken for each other. */}
+              {bohPaid > 0 && (
+                <>
+                  <Line l="Bill total (frozen at hold)" v={money(heldFrozen)} />
+                  <div className="flex items-center justify-between text-emerald-700">
+                    <span>Already collected on the bill on hold</span>
+                    <span className="tabular-nums">- {money(bohPaid)}</span>
+                  </div>
+                </>
+              )}
               <div className="flex items-center justify-between pt-1 mt-1 border-t border-[#E8D5C4]">
-                <span className="font-bold text-[#2D1B0E]">Final Amount</span>
+                <span className="font-bold text-[#2D1B0E]">{bohPaid > 0 ? 'Still to collect' : 'Final Amount'}</span>
                 <span className="font-bold text-lg text-[#af4408] tabular-nums">{money(grand)}</span>
               </div>
             </div>
@@ -478,6 +539,33 @@ export default function CashierPage() {
               <div className="px-4 py-3 border-t border-[#E8D5C4] bg-[#FFF8F0] flex flex-wrap items-end gap-2">
                 <label className="text-xs text-[#6B5744] flex-1 min-w-[200px]">Reason to waive service charge<input value={scForm.reason} onChange={e => setScForm({ reason: e.target.value })} className="block bg-white border border-[#D4B896] rounded px-2 py-1.5 text-sm w-full" placeholder="Guest complaint / manager decision" /></label>
                 <button onClick={submitSc} disabled={busy === 'sc'} className="bg-[#af4408] text-white px-3 py-1.5 rounded text-sm font-medium">Request approval</button>
+              </div>
+            )}
+            {/* HOLD CAPTURE — the guest's number, taken while they are still
+                standing here. Mandatory by the owner's ruling and enforced by
+                the API; this row exists so the rule is met at the till rather
+                than met with a 400. */}
+            {holdForm && (
+              <div className="px-4 py-3 border-t border-[#E8D5C4] bg-[#FFF8F0]">
+                <div className="text-xs font-semibold text-[#6B5744] mb-2">
+                  Hold this bill — who is paying it later?
+                </div>
+                <div className="flex flex-wrap items-end gap-2">
+                  <label className="text-xs text-[#6B5744] min-w-[160px] flex-1">Customer name
+                    <input value={holdForm.name} onChange={e => setHoldForm({ ...holdForm, name: e.target.value })} className="block bg-white border border-[#D4B896] rounded px-2 py-1.5 text-sm w-full" placeholder="Guest name" />
+                  </label>
+                  <label className="text-xs text-[#6B5744] min-w-[150px]">Mobile <span className="text-[#af4408]">*</span>
+                    <input value={holdForm.mobile} onChange={e => setHoldForm({ ...holdForm, mobile: e.target.value.replace(/[^\d +\-().]/g, '') })} inputMode="tel" className="block bg-white border border-[#D4B896] rounded px-2 py-1.5 text-sm w-full" placeholder="10-digit number" />
+                  </label>
+                  <label className="text-xs text-[#6B5744] flex-1 min-w-[160px]">Reason
+                    <input value={holdForm.reason} onChange={e => setHoldForm({ ...holdForm, reason: e.target.value })} className="block bg-white border border-[#D4B896] rounded px-2 py-1.5 text-sm w-full" placeholder="Will pay tomorrow / company account" />
+                  </label>
+                  <button onClick={submitHold} disabled={busy === 'hold'} className="bg-amber-600 hover:bg-amber-700 text-white px-3 py-1.5 rounded text-sm font-medium disabled:opacity-50">Hold bill</button>
+                  <button onClick={() => setHoldForm(null)} disabled={busy === 'hold'} className="border border-[#D4B896] text-[#6B5744] px-3 py-1.5 rounded text-sm">Cancel</button>
+                </div>
+                <div className="text-[11px] text-[#8A7560] mt-1.5">
+                  A mobile number is required — it is how this payment gets followed up.
+                </div>
               </div>
             )}
           </div>

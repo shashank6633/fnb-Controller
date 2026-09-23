@@ -150,6 +150,36 @@ export async function GET() {
       console.error('[/api/notifications/inbox] held-bill bucket failed:', hbErr);
     }
 
+    // ── Bills on hold I am responsible for chasing ────────────────────────
+    // THE READER FOR boh_notifications. The reminder job wrote correct, durable,
+    // correctly-addressed rows into that table — and until this bucket existed
+    // NOTHING IN THE APP READ IT. No screen, no API, no bell: the only surface
+    // was the individual bill's own timeline, which is the page you would open
+    // only if you had already remembered the bill. So the module's stated
+    // fallback ("the in-app reminder works immediately, the WhatsApp leg lights
+    // up when a template is approved") was not true — both rails were dark.
+    //
+    // Shape copied from the buckets above and from hr-notify's: ONE item with a
+    // COUNT, never one item per bill, in its own try/catch so a BOH schema
+    // problem can never break the whole inbox. Counted for the CALLER's own
+    // login email, which is exactly who notifyBohUser addressed the row to.
+    //
+    // A reminder for a record that has since closed or been voided is not shown:
+    // the debt is settled and nagging about it is noise. The row itself is never
+    // deleted — is_read is a read receipt, not history.
+    try {
+      const n = one(
+        `SELECT COUNT(*) AS n FROM boh_notifications bn
+           JOIN boh_bills b ON b.id = bn.boh_id
+          WHERE bn.is_read = 0 AND b.status = 'open'
+            AND lower(TRIM(bn.recipient_email)) = lower(TRIM(?))`,
+        [String(me.email || '')],
+      );
+      push('boh_followups', 'Bills on hold you are chasing', n, '/boh');
+    } catch (bohErr) {
+      console.error('[/api/notifications/inbox] BOH reminder bucket failed:', bohErr);
+    }
+
     // ── HOD approval inbox ────────────────────────────────────────────────
     if (canApproveAsChef(me)) {
       // Same dept scoping as the /requisitions page: null = see all

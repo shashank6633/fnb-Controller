@@ -100,6 +100,24 @@ export async function POST(request: Request) {
     console.error('[/api/cron/refresh-parties] broadcast drain failed:', e?.message);
   }
 
+  // BILL ON HOLD reminders — external-cron backstop for the in-process
+  // scheduler, which only arms after an AUTHENTICATED request first loads
+  // /api/upcoming-parties or /api/crm-calls/broadcasts. This POST is the only
+  // path that reaches the job on a box nobody has signed into since restart.
+  //
+  // BEFORE the refreshUpcomingParties call below, exactly like every other job
+  // in this route: a Sheets failure must never starve a payment reminder. The
+  // (BOH, due date) claim makes this safe to run alongside the in-process tick
+  // — whichever gets there first takes the slot and the other stands down, so
+  // two drivers can never produce two reminders.
+  let boh_reminders: any = null;
+  try {
+    const { runBohReminders } = await import('@/lib/boh-reminders');
+    boh_reminders = await runBohReminders(getDb());
+  } catch (e: any) {
+    console.error('[/api/cron/refresh-parties] boh reminders failed:', e?.message);
+  }
+
   try {
     const result = await refreshUpcomingParties(tokenOk ? 'external_cron' : 'admin_manual');
     // Feature 4 — same pipeline also checks deferred items coming due. Fully
@@ -110,11 +128,11 @@ export async function POST(request: Request) {
     } catch (e: any) {
       console.error('[/api/cron/refresh-parties] defer-due check failed:', e?.message);
     }
-    return Response.json({ ok: true, result, defer_due, wa_daily, wa_reports, wa_price_hikes, task_automation, broadcast_drain });
+    return Response.json({ ok: true, result, defer_due, wa_daily, wa_reports, wa_price_hikes, task_automation, broadcast_drain, boh_reminders });
   } catch (e: any) {
     console.error('[/api/cron/refresh-parties]', e);
     // wa_daily + task_automation ran before the refresh — report them even on
     // failure so external cron logs show whether the daily jobs dispatched.
-    return Response.json({ error: e.message, wa_daily, wa_reports, wa_price_hikes, task_automation, broadcast_drain }, { status: 500 });
+    return Response.json({ error: e.message, wa_daily, wa_reports, wa_price_hikes, task_automation, broadcast_drain, boh_reminders }, { status: 500 });
   }
 }

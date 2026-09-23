@@ -36,6 +36,37 @@ export interface PageEntry {
    * Errors page. Non-admins are blocked even with an explicit page_access grant.
    */
   adminOnly?: boolean;
+  /**
+   * A COMPANION GRANT: an explicit page map that opens `impliedBy` also opens
+   * THIS page, even when the map never names it.
+   *
+   * ── WHY THIS EXISTS AT ALL, AND WHY IT IS NOT A BACK DOOR ──────────────────
+   * It is for the case where some OTHER module has already made the real
+   * capability decision from a DIFFERENT fact, and this file's map test would
+   * otherwise answer a stricter, contradictory "no" — leaving a page that the
+   * API hands the user data for but the proxy bounces them off. That is not a
+   * safety margin, it is the drift settle-authority.ts's header warns about,
+   * read from the other end: two surfaces, two copies of one authority rule.
+   *
+   * THREE PROPERTIES, all load-bearing:
+   *   1. IT ONLY EVER FILLS IN. It runs AFTER the ordinary map test has already
+   *      failed, so an explicit grant still works exactly as before and nothing
+   *      any admin has ticked changes meaning.
+   *   2. IT CANNOT REACH PAST A TIER GATE. hodOnly / mgmtOnly / adminOnly all
+   *      return false ABOVE the map test, so an implied grant can never open a
+   *      management screen. /boh/dashboard and /boh/accountability stay shut.
+   *   3. IT IS ONE HOP, NOT A GRAPH. The implied path is tested against the
+   *      user's own map and never against another implication, so no chain of
+   *      rows can quietly compound into access nobody wrote down.
+   *
+   * THE COST, STATED PLAINLY: while the companion grant holds, this page cannot
+   * be revoked on its own — unticking it in Settings → Roles has no effect for
+   * a user who still holds `impliedBy`. Only use it where the page is strictly
+   * LESS than what the companion already gives, so there is nothing left to
+   * revoke separately. That is exactly true of the one row that uses it today:
+   * see the '/boh' entry below.
+   */
+  impliedBy?: string;
 }
 
 export interface PageSection {
@@ -66,6 +97,87 @@ export const PAGE_CATALOG: PageSection[] = [
       // refuses a non-management caller with its own 403, and settle/void keep
       // their own gates on top.
       { path: '/dine-in/stale-tables', label: 'Idle Tables', mgmtOnly: true },
+      // THE BILLS-ON-HOLD REGISTER — the catalog row the two management rows
+      // below say is claimed "in a separate lane". This is that row.
+      //
+      // Deliberately NOT mgmtOnly, unlike its two dashboards: a cashier has to
+      // be able to work their OWN outstanding bills, which is the whole point
+      // of the accountability model. The separation is safe because bestEntry()
+      // takes the LONGEST matching prefix — '/boh/dashboard' still resolves to
+      // its own mgmtOnly row, and '/boh/<id>' resolves to this one — and
+      // because isMgmtOnlyPath() runs BEFORE the page_access map is consulted,
+      // so granting '/boh' can never open a management screen.
+      //
+      // The real gate is the route's, as always: GET /api/boh pins a
+      // non-management caller to their own responsible_user_id and refuses
+      // anyone without an explicit '/cashier' grant (canUseBoh → tillCapable),
+      // which is STRICTER than this catalog rather than looser.
+      //
+      // ── THE CASHIER DECISION — impliedBy: '/cashier' ────────────────────
+      // THE ANSWER IS YES: a Cashier gets this page. A cashier is the person
+      // standing at the till when a guest asks to leave a bill on hold; the
+      // hold route defaults responsible_user_id to exactly that person, so the
+      // register is the ONE screen the accountability model requires them to be
+      // able to work. Denying it leaves a named debt with no way for the named
+      // person to record a payment or a follow-up against it.
+      //
+      // WHY A COMPANION GRANT AND NOT A ROLE EDIT. Measured on the owner's
+      // database (2026-09-22), the Cashier role's page map is
+      //   ["/dine-in/floor","/dine-in/tables","/dine-in/order","/captain",
+      //    "/dine-in/reservations","/cashier"]
+      // — an EXPLICIT map with no '/boh', so canAccessPage said no while
+      // GET /api/boh said yes. Both halves were measured on that snapshot:
+      //   Cashier  GET /boh      -> 307 /dine-in/floor?forbidden=%2Fboh
+      //   Cashier  GET /api/boh  -> 200 {"rows":[],"scope":"own"}
+      // and a Captain's own API refusal reads "Ask an admin to assign you the
+      // Cashier role" — advice that, before this line, did not open the page.
+      //
+      // The obvious repair is a one-shot migration adding '/boh' to that row,
+      // in the shape of db.ts's cashier_role_page_grant_v1. It is rejected for
+      // two reasons. First, roles are PRODUCTION CONFIGURATION and the owner's
+      // standing rule is that they are his to set in the app — a migration
+      // writes his mapping for him. Second and worse, it fixes one row and
+      // nothing else: the day he creates a second till role (a "Senior
+      // Cashier", an outlet-specific till) and grants it '/cashier', that role
+      // is locked out of /boh again and the same bug is back with no migration
+      // left to run. Deriving the page from the SAME fact the API derives its
+      // answer from cannot drift and cannot be out of date.
+      //
+      // WHY IT GIVES AWAY NOTHING. '/cashier' is already the app's definition
+      // of a till operator — tillCapable() in settle-authority.ts gates
+      // SETTLING A BILL on precisely this grant, and canUseBoh() reuses it. So
+      // everyone this line admits could already read their own BOH rows over
+      // the API, could already settle the underlying bill, and is already
+      // pinned by GET /api/boh to responsible_user_id = themselves. The page is
+      // strictly less than the API they already hold, which is the condition
+      // PageEntry.impliedBy requires. Management screens are unaffected:
+      // '/boh/dashboard' and '/boh/accountability' are mgmtOnly, and mgmtOnly
+      // is tested BEFORE any map or implication is consulted.
+      { path: '/boh',                 label: 'Bills on Hold', impliedBy: '/cashier' },
+      // BILLS ON HOLD — the two management surfaces of the BOH module. They sit
+      // beside Cashier because a BOH starts at the till: hold already writes the
+      // sales rows and deducts the stock, so what is left is a debt somebody has
+      // to chase.
+      //
+      // mgmtOnly on BOTH, for the reason src/lib/boh-access.ts's third tier
+      // gives: a cashier may see their OWN bills (on the register, /boh), but
+      // cross-user lists, the user-wise view and every money TOTAL are
+      // management — and each of these two screens is nothing but cross-user
+      // money totals with a customer's phone number on every row. mgmtOnly runs
+      // BEFORE canAccessPage's null-map backward-compat grant, so it is a real
+      // lock rather than a default.
+      //
+      // As everywhere in this file, the flag is NOT the security boundary:
+      // GET /api/boh/dashboard and GET /api/boh/accountability each refuse a
+      // non-management caller with their own 403, which is what actually holds
+      // when role_id is NULL on every user and page_access is NULL on 8 of 9.
+      //
+      // The register itself (/boh, /boh/[id]) is NOT registered here — it is
+      // built in a separate lane and claims its own catalog row. bestEntry()
+      // takes the LONGEST matching prefix, so these two keep their mgmtOnly
+      // whatever flag that row eventually carries.
+      { path: '/boh/dashboard',       label: 'Bills on Hold — Dashboard', mgmtOnly: true },
+      { path: '/boh/accountability',  label: 'Bills on Hold — Who is chasing', mgmtOnly: true },
       { path: '/dine-in/requests',    label: 'Customer Orders & Requests' },
       { path: '/dine-in/discount-approvals', label: 'Discount Approvals' },
       { path: '/dine-in/kitchen',     label: 'Kitchen Display' },
@@ -728,6 +840,21 @@ export function isAdminOnlyPath(pathname: string): boolean {
 }
 
 /**
+ * The companion path whose grant also opens `pathname`, or null.
+ *
+ * Same LONGEST-prefix resolution as every other flag here, so '/boh/<id>'
+ * inherits the '/boh' row's implication while '/boh/dashboard' resolves to its
+ * OWN row — which carries no `impliedBy` and is mgmtOnly besides.
+ *
+ * Deliberately NOT transitive: the caller tests the returned path against the
+ * user's literal map and stops. See PageEntry.impliedBy, property 3.
+ */
+export function impliedGrantFor(pathname: string): string | null {
+  const via = bestEntry(pathname)?.impliedBy;
+  return via ? via : null;
+}
+
+/**
  * Pages that EVERY signed-in user can access regardless of their access map.
  *
  * Only /login here. The Dashboard `/` is intentionally NOT included anymore
@@ -913,7 +1040,17 @@ export function canAccessPage(
   // Exact match OR prefix match on a controlled page (so /vendors/123 works
   // when /vendors is allowed). To avoid /audit allowing /audit-log we require
   // the next char to be '/' or end-of-string.
-  return allowed.some(p => pathname === p || pathname.startsWith(p + '/'));
+  if (allowed.some(p => pathname === p || pathname.startsWith(p + '/'))) return true;
+
+  // COMPANION GRANT, LAST. The ordinary map test has already failed, and both
+  // tier gates above have already returned, so this can only ever fill in a
+  // page whose real capability decision another module makes from a different
+  // fact — today exactly one row, '/boh', keyed on '/cashier'. Matched with the
+  // same rule as the line above so a map that opens the companion PAGE opens
+  // this one, never one without the other. See PageEntry.impliedBy.
+  const via = impliedGrantFor(pathname);
+  if (via) return allowed.some(p => via === p || via.startsWith(p + '/'));
+  return false;
 }
 
 /* ───────────────────────────────────────────────────────────────────────────
@@ -1030,6 +1167,15 @@ export function canAccessPageStrict(
 
   // 1. Explicitly granted.
   if (allowed.includes(pathname)) return true;
+
+  // 1b. COMPANION GRANT — kept in step with canAccessPage on purpose. This
+  //     function's whole job is to measure what the STRICT prefix rule would
+  //     cost, and `impliedBy` is orthogonal to prefix matching: leaving it out
+  //     would make /boh read as a loss caused by strictness when it is nothing
+  //     of the kind, and the report exists to be trusted. Explicit grant still
+  //     wins above; this only fills in, exactly as it does over there.
+  const impliedStrict = impliedGrantFor(pathname);
+  if (impliedStrict && allowed.includes(impliedStrict)) return true;
 
   // 2. A page that stands on its own in the catalog needs its own grant —
   //    it does NOT inherit from a parent that merely shares its URL prefix.

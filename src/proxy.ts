@@ -94,6 +94,21 @@ const CSRF_REQUIRED_PREFIXES = [
   // authenticate necessarily holds the CSRF cookie too.
   '/api/dine-in/print-agent',  // print-agent heartbeat (status is GET, exempt)
   '/api/dine-in/cashier-presence', // which cashier holds which floor — holding a floor decides who may settle there
+  // Bills on Hold. Its writes RECORD MONEY (payments, write-offs) and move
+  // accountability between staff (reassign), so they are forgeable targets in
+  // exactly the way /api/dine-in/orders is.
+  //
+  // MEASURED before this line existed, against a booted server: POST
+  // /api/boh/<id>/payments with the fnb_csrf COOKIE present but NO
+  // x-csrf-token header returned 200, while the control POST /api/wastage —
+  // a prefix already on this list — returned 403. src/app/api/boh/route.ts's
+  // own header comment claimed "Writes are CSRF-protected by the '/api/boh'
+  // prefix in proxy.ts's CSRF_REQUIRED_PREFIXES"; the prefix was simply never
+  // added, and no BOH route does its own check. This is that line.
+  //
+  // Costs the legitimate client nothing: every BOH screen posts through
+  // src/lib/api.ts, which injects the header on state-changing methods.
+  '/api/boh',                 // Bills on Hold: payments, follow-ups, reassign, close, void
   '/api/tables',              // QR standee token generation (admin)
   '/api/crm',                 // AKAN CRM (chat/training/quiz/settings) — guest-quiz is carved out in isPublic
   '/api/whatsapp',            // WhatsApp Integration (config/templates) — webhook is carved out in isPublic

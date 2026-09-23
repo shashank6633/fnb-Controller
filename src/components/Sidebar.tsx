@@ -104,6 +104,19 @@ const navTree: NavEntry[] = [
       // everyone else. Sits beside Cashier because it is the same job: closing
       // bills that were never closed.
       { kind: "link", label: "Idle Tables",        href: "/dine-in/stale-tables",      icon: Timer },
+      // The REGISTER itself — every bill on hold, and the one screen a cashier
+      // uses. Listed above its two management dashboards because it is the page
+      // people actually work in; the dashboards read it, not the other way
+      // round. Same rule as the note below: page-catalog.ts gates, this list is
+      // what makes it visible, and both carry a row.
+      { kind: "link", label: "Bills on Hold",      href: "/boh",                       icon: Banknote },
+      // BILLS ON HOLD (management). This list is its OWN nav source — registering
+      // a page in page-catalog.ts alone gates it but leaves it INVISIBLE, which
+      // is the sidebar-vs-catalog drift that once hid eight pages including
+      // /variance-approvals. Both files carry these two entries; edit both.
+      // canAccessPage hides them for anyone who is not a Manager, Admin or HOD.
+      { kind: "link", label: "BOH Dashboard",      href: "/boh/dashboard",             icon: Banknote },
+      { kind: "link", label: "BOH — Who is chasing", href: "/boh/accountability",      icon: ClipboardCheck },
       { kind: "link", label: "Customer Orders & Requests", href: "/dine-in/requests",  icon: Bell },
       { kind: "link", label: "Discount Approvals", href: "/dine-in/discount-approvals", icon: BadgePercent },
       { kind: "link", label: "Kitchen Display",    href: "/dine-in/kitchen",           icon: ChefHat },

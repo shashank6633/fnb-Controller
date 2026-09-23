@@ -69,6 +69,82 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     const b = await req.json().catch(() => ({}));
     const reason = String(b?.reason || '').slice(0, 200);
 
+    // ── BILL ON HOLD (BOH): CAPTURE THE CONTACT WHILE THE PERSON IS HERE ────
+    // MEASURED GAP, and the reason the whole module exists: of the owner's 37
+    // orders, ZERO carry guest_mobile and ONE carries guest_name. You cannot
+    // chase a customer you have no number for, and the moment of hold is the
+    // one moment they are standing at the till.
+    //
+    // ── THE OWNER'S RULING, ENFORCED HERE AND NOT ONLY ON THE FORM ──────────
+    // "For BOH Bills Customer Mobile Number is Mandatory And Whatsapp Reminders
+    // will be sent to User in the Restaurant who is responsible for the
+    // Payment." A bill held against a guest nobody can contact is precisely the
+    // failure that sentence exists to prevent.
+    //
+    // WHAT THIS REPLACED, AND WHY IT WAS NOT A RULE. The requirement used to sit
+    // behind the settings key `boh_require_contact_at_hold`, DEFAULTING TO OFF.
+    // MEASURED on this tree: that key is written by nothing — no migration seeds
+    // it, no settings screen sets it, and a repo-wide grep finds the string in
+    // this file and nowhere else. So the mandate could not be switched on from
+    // inside the app at all, and every hold was accepted with no number. A rule
+    // that ships in the off position, with no switch, is documentation.
+    //
+    // THE DEFAULT IS NOW ENFORCE. The key survives INVERTED, as a named escape
+    // hatch: set `boh_require_contact_at_hold` to '0' and the till reverts to
+    // the old permissive behaviour. That is for the owner, deliberately, if a
+    // real service ever needs it — it is not the shipping default and it is not
+    // something an ordinary request can reach.
+    //
+    // THE TILL IS NOT SILENTLY BLOCKED. /cashier is still this route's only
+    // caller, and it used to post `body: {}`; the same patch that flips this
+    // default gives its Hold button a Name + Mobile capture step, so the number
+    // is asked for before the request is sent and the refusal below is a
+    // backstop rather than the user's first experience of the rule.
+    //
+    // VALIDATED, NOT MERELY NON-EMPTY. bohNorm10 is the same 10-digit rule the
+    // rest of the module joins the CRM on (boh.ts:139, guest-unify norm10), so
+    // "n/a" or a 5-digit typo is refused here instead of being stored as a
+    // number nobody can ring. updateBohContact already refuses exactly this on
+    // the /api/boh side ("not a valid 10-digit Indian number"); the till door
+    // had no equivalent.
+    //
+    // EXISTING HELD BILLS ARE UNTOUCHED — this is a CREATE-path guard only. A
+    // BOH opened before this ships and carrying no mobile keeps working exactly
+    // as it did: it stays open, it still takes payments, follow-ups, reassigns,
+    // write-offs and closes, and it keeps contact_source='missing' so it stays
+    // in the dashboard's contact-missing bucket until someone fills the number
+    // in from the BOH screen. Nothing here reaches backwards to block or
+    // invalidate them, and no settle path consults this guard.
+    // NORMALISED INLINE, NOT BY IMPORTING boh.ts. The rule below is character
+    // for character bohNorm10 (src/lib/boh.ts) and guest-unify's norm10 — strip
+    // the punctuation people type, keep the last ten, demand ten digits. It is
+    // repeated here rather than imported for the same reason the BOH create
+    // below is imported lazily and wrapped: boh.ts must not become something a
+    // hold can FAIL ON. An `await import` here would put module-load failure in
+    // front of the sales rows and the stock deduct, turning a BOH problem into
+    // a till outage — exactly the direction the comment at the create site
+    // warns against. Nothing depends on the two spellings agreeing beyond
+    // "is this ten digits": createBohForHold re-normalises with the real
+    // bohNorm10 and that is what gets STORED, so the CRM join key still has
+    // exactly one author.
+    const bohName = String(b?.customer_name || '').slice(0, 120).trim();
+    const bohMobileRaw = String(b?.customer_mobile || '').slice(0, 20).trim();
+    const bohMobileKey = bohMobileRaw.replace(/[ \-+().\/]/g, '').slice(-10);
+    const bohMobile = /^\d{10}$/.test(bohMobileKey) ? bohMobileKey : '';
+    let requireContact = true;
+    try {
+      const req1 = db.prepare("SELECT value FROM settings WHERE key = 'boh_require_contact_at_hold'").get() as any;
+      if (String(req1?.value ?? '').trim() === '0') requireContact = false;
+    } catch { /* settings unreadable — the owner's rule stands, not the exception */ }
+    if (requireContact && !bohMobile) {
+      return Response.json({
+        error: bohMobileRaw
+          ? `"${bohMobileRaw}" is not a valid 10-digit mobile number. A bill on hold is chased on this number, so it has to be one that rings.`
+          : 'A customer mobile number is required to put a bill on hold — it is the only way the payment can be followed up.',
+        reason: 'boh_contact_required',
+      }, { status: 400 });
+    }
+
     const date = todayIST();
     const saleTime = new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', hour12: false }).format(new Date());
 
@@ -134,8 +210,41 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     // commit; a no-op unless the authority result was 'manager_override'.
     recordSettleOverride(db, auth, { actor: me, orderId: id, action: 'hold', outletId });
 
+    // ── OPEN THE BOH RECORD ────────────────────────────────────────────────
+    // AFTER THE COMMIT, never inside it — the same rule as recordSettleOverride
+    // above and completeBookingForOrder in settle. The hold transaction has
+    // already written the sales rows and deducted the stock; a BOH failure must
+    // never roll that back, because the bill would come back un-held with its
+    // inventory gone. createBohForHold never throws by its own contract, and
+    // this try/catch is the house rule on top of that.
+    //
+    // THE RESPONSIBLE USER DEFAULTS TO THE CASHIER WHO HELD IT (provisional,
+    // reported): that person made the forward commitment with the guest in
+    // front of them, and is the only name the system can know at this instant.
+    // It is reassignable immediately, and every reassignment is recorded with
+    // previous user / new user / changed by / when / why.
+    let boh: { id: string; contact_missing: boolean } | null = null;
+    try {
+      const { createBohForHold } = await import('@/lib/boh');
+      const res = createBohForHold(db, {
+        orderId: id, outletId,
+        responsible: { id: me.id, email: me.email, name: me.name },
+        customerName: bohName, customerMobile: bohMobile,
+        reason,
+      }, { id: me.id, email: me.email, name: me.name, role: me.role });
+      if (res.boh) boh = { id: res.boh.id, contact_missing: !res.boh.customer_mobile };
+    } catch (e) {
+      // A held bill with no BOH row is recoverable (POST /api/boh backfills it).
+      // A hold that failed to commit is not. Log and carry on.
+      console.error('[/api/dine-in/orders/[id]/hold] BOH create failed (non-fatal):', e);
+    }
+
     return Response.json({
       success: true, order_id: id, total: bill.total, status: 'on_hold', lines: items.length,
+      // The till can link straight into the follow-up record, and can say out
+      // loud when the one thing that makes it chaseable is missing.
+      boh_id: boh?.id || null,
+      boh_contact_missing: boh ? boh.contact_missing : null,
       // SURFACE THE OVERRIDE — identical to settle's success payload: when
       // management held past a live floor cashier, the client renders "Held by
       // <manager> — <cashier> holds this floor" from these recorded facts.
