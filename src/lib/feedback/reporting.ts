@@ -1029,7 +1029,9 @@ export function analytics(
 
   // The dropdowns list everyone who recorded anything in the range, BEFORE the
   // person filter - so picking a name does not empty the list it came from.
-  const gres = uniqSorted(allVisits.filter((v) => !isManagementRole(v.gre_role)).map((v) => v.gre_name).filter(Boolean));
+  // `greNamesRecorded` is only HALF of the GRE list: the silent role holders are
+  // unioned in below, once the per-person table has been built. See there.
+  const greNamesRecorded = uniqSorted(allVisits.filter((v) => !isManagementRole(v.gre_role)).map((v) => v.gre_name).filter(Boolean));
   const managers = uniqSorted(allVisits.filter((v) => isManagementRole(v.gre_role)).map((v) => v.gre_name).filter(Boolean));
 
   // 🔒 SECTION 6, LAYER 2. The person filter does NOT narrow `visits`, and this
@@ -1184,6 +1186,39 @@ export function analytics(
   // is the one behaviour a management page must be able to see. Section 4's
   // floor denominator is applied here.
   const gre = grePerformance(db, u, visits, items, followUps, eligibleIds);
+
+  // 🐞 THE FILTER THAT EXAMINES ONE PERSON MUST OFFER THE SILENT ONE. The table
+  // above is seeded from the people who HOLD the GRE role, so a GRE who recorded
+  // nothing all night still has a row — but this dropdown was built from visits
+  // alone, so that same person could not be PICKED. Measured on the tip before
+  // this change, one fixture night: the grid read [Ambika(gre), Bhavna(gre),
+  // Chandra(gre), Manjula(management), Divya(assigned), Silent Gre(assigned)]
+  // while the dropdown offered [Ambika, Bhavna, Chandra] — and for that same
+  // night PAGE 3 OFFERED 5 NAMES AND PAGE 4 OFFERED 3. The two missing were
+  // exactly the role holders who recorded nothing: the row this page's own sheet
+  // note calls the point of the table. Her data was always correct and always
+  // reachable by typing the URL, so this was reachability, never arithmetic.
+  //
+  // Page 3 unions its progress table into its own list for this reason and in
+  // these words (tracker/query.ts:744). Page 4 now does the same, from the same
+  // two sources and with Page 3's own predicate, so total silence is both
+  // VISIBLE and REACHABLE and the two pages cannot offer different names.
+  //
+  // `kind !== 'management'` is that predicate: a person who recorded carrying a
+  // management role belongs in the Manager dropdown, so this cannot leak a
+  // manager into the GRE list. Rows with kind 'gre' are already in
+  // `greNamesRecorded`, so in practice the union adds exactly the 'assigned'
+  // ones. `managers` stays visit-derived on BOTH pages because nothing in the
+  // app seeds a management roster — offering a name there that no query can
+  // answer for would be the opposite of this fix.
+  //
+  // Neither half is narrowed by the person filter — `greNamesRecorded` is built
+  // from `allVisits` and `gre` from `visits`, and section 6 layer 2 keeps those
+  // the same list — so picking a name still cannot empty the list it came from.
+  const gres = uniqSorted([
+    ...greNamesRecorded,
+    ...gre.filter((g) => g.kind !== 'management').map((g) => g.person).filter(Boolean),
+  ]);
 
   const summary: AnalyticsPayload['summary'] = {
     eligible_tables: u.eligible.length,
