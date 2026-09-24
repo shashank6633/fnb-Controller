@@ -23,13 +23,75 @@ import { convertForCosting, ingredientLineCost } from './recipe-cost';
 
 const DB_PATH = path.join(process.cwd(), 'fnb-controller.db');
 
+/* ── A HALF-BUILT HANDLE THAT NEVER HEALED ────────────────────────────────────
+ *
+ * getDb() used to assign `db` and THEN call initializeSchema(db). If the schema
+ * threw, `db` was already assigned, so the throw escaped this call and every
+ * later call found `!db` false and returned the handle whose DDL never ran —
+ * silently, for the life of the process. Two ordinary ways in:
+ *
+ *   · a read-only database file: `new Database()` succeeds, the first pragma or
+ *     exec throws, and initializeSchema may never be entered at all.
+ *   · an older database missing a column an index at the top of
+ *     initializeSchema sits over: identical silence, no unusual permissions.
+ *
+ * This matters more here than it looks, because initializeSchema SWALLOWS
+ * errors per block — so a half-built schema raises no alarm anywhere else.
+ *
+ * The boot now lives in bootDb(): every step inside one try, a LOUD error if it
+ * fails, and a flag that makes the NEXT getDb() retry instead of inheriting a
+ * broken handle. The retry is throttled — a broken database must not re-run
+ * thousands of lines of DDL on every request.
+ *
+ * THE RETRY RE-OPENS THE FILE, and that is the whole difference between a retry
+ * that works and one that only looks like it does: SQLite latches a database's
+ * read-only status when the connection is OPENED, so re-running DDL on the
+ * handle we already hold can never recover from the read-only case. Replacing
+ * the handle is safe because nothing in this app holds one across calls — every
+ * getDb() call site resolves it per call, and the module-level ones are DEFAULT
+ * PARAMETER VALUES (`db = getDb()`), evaluated per invocation. The old handle is
+ * closed before the new one is adopted, so nothing leaks; if the re-open itself
+ * throws, the previous handle is KEPT (a stale handle still serves reads; a
+ * closed one throws on every query) and the throttle is re-armed.
+ *
+ * getDb() deliberately still RETURNS rather than re-throwing: every caller
+ * assumes it returns, and turning a schema failure into a throw across hundreds
+ * of call sites is a change with its own blast radius. What this owes is that
+ * the failure is never SILENT. It is not silent now. */
 let db: Database.Database | null = null;
+let dbBootFailed = false;
+let dbBootLastAttempt = 0;
+const DB_BOOT_RETRY_MS = 30_000;
 
 export function getDb(): Database.Database {
   if (!db) {
     db = new Database(DB_PATH);
-    db.pragma('journal_mode = WAL');
-    db.pragma('foreign_keys = ON');
+    bootDb(db);
+  } else if (dbBootFailed && Date.now() - dbBootLastAttempt >= DB_BOOT_RETRY_MS) {
+    // The last attempt did not finish. Try again on a FRESH connection — see
+    // the read-only latch explained above; a same-handle retry cannot heal.
+    let fresh: Database.Database | null = null;
+    try {
+      fresh = new Database(DB_PATH);
+    } catch (e) {
+      dbBootLastAttempt = Date.now();   // re-arm the throttle; keep the old handle
+      console.error('[db] schema retry could not re-open the database (keeping the previous connection). Cause:', e);
+    }
+    if (fresh) {
+      try { db.close(); } catch { /* already closed, or never opened cleanly */ }
+      db = fresh;
+      bootDb(db);
+    }
+  }
+  return db;
+}
+
+/** One boot attempt: pragmas, schema, units registry. Never throws. */
+function bootDb(database: Database.Database) {
+  dbBootLastAttempt = Date.now();
+  try {
+    database.pragma('journal_mode = WAL');
+    database.pragma('foreign_keys = ON');
 
     /* ── Sized for the box this actually runs on: 1 GB RAM, 2 vCPU ────────────
      *
@@ -56,22 +118,29 @@ export function getDb(): Database.Database {
      * The reports sort large result sets, and this box has the RAM for it.
      *
      * If the box is ever resized, cache_size is the one to revisit. */
-    db.pragma('cache_size = -32000');
-    db.pragma('busy_timeout = 5000');
-    db.pragma('temp_store = MEMORY');
-    initializeSchema(db);
+    database.pragma('cache_size = -32000');
+    database.pragma('busy_timeout = 5000');
+    database.pragma('temp_store = MEMORY');
+    initializeSchema(database);
     // After schema is built + seeded, push the units table into the in-memory
     // registry so convert() uses user-edited values immediately.
     try {
-      const rows = db.prepare('SELECT key, label, aliases, dimension, to_base FROM units').all() as any[];
+      const rows = database.prepare('SELECT key, label, aliases, dimension, to_base FROM units').all() as any[];
       if (rows.length > 0) {
         // eslint-disable-next-line @typescript-eslint/no-var-requires
         const { applyRegistryRows } = require('./units') as typeof import('./units');
         applyRegistryRows(rows);
       }
     } catch (e) { console.error('units registry hydration failed:', e); }
+    if (dbBootFailed) console.warn('[db] schema initialisation SUCCEEDED on a retry — the failure reported earlier is cleared.');
+    dbBootFailed = false;
+  } catch (e) {
+    dbBootFailed = true;
+    console.error(
+      '[db] SCHEMA INITIALISATION FAILED — this process is about to serve traffic against a database whose schema was NOT fully applied. ' +
+      `Tables and columns may be missing. The next getDb() at least ${DB_BOOT_RETRY_MS / 1000}s from now will try again. Cause:`, e
+    );
   }
-  return db;
 }
 
 function initializeSchema(db: Database.Database) {
