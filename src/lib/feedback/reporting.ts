@@ -859,7 +859,10 @@ export function recoveryCell(completed: number, raised: number): string {
 /** The same figure with room to explain itself - for the person block and the
  *  "What <name> did" sheet, where the column is a sentence wide. */
 export function recoveryLong(completed: number, raised: number): string {
-  if (!raised) return 'No complaints raised in this period';
+  // Short on purpose: this string lands in the person sheet's Value column
+  // (73pt at the shipped weights) and a truncated explanation is worse than a
+  // brief one. The full reading is in RECOVERY_IS_A_QUEUE under the table.
+  if (!raised) return 'none raised';
   return `${pctText(rate(completed, raised))} - ${Math.round(completed)} of ${Math.round(raised)} closed`;
 }
 
@@ -1324,8 +1327,13 @@ function personScope(rows: GrePerformanceRow[], personName: string): PersonScope
   };
   return {
     ...base,
+    // Two floors fit the person sheet's Value column at the shipped weights and
+    // three do not (measured: 123.0pt into 115.9pt), so a longer list is summed
+    // instead of being silently chopped. The full list is in `area_zones`.
     area_label: base.area_assigned
-      ? base.area_zones.join(' · ') || 'assigned tables'
+      ? (base.area_zones.length > 2
+        ? `${base.area_zones[0]} +${base.area_zones.length - 1} more`
+        : base.area_zones.join(' · ') || 'assigned tables')
       : 'All floors (no assignment)',
     coverage_basis: base.area_assigned ? AREA_ASSIGNED_NOTE : AREA_UNASSIGNED_NOTE,
   };
@@ -1829,13 +1837,61 @@ export function buildReport(p: AnalyticsPayload, key: ReportKeyName): ReportDoc 
   // Section 7: the two counts are both printed, with their relationship on the
   // face of the sheet. The Summary used to say "Feedbacks taken 9" beside a
   // Rating split sheet that accounted for 10, inside ONE workbook.
+
+  /* 🐞 A VENUE NUMBER ON A PERSON'S CARD, and it carried no words at all.
+     `open_follow_ups_now` is deliberately NOT range-bound (§ the header note)
+     and it is also not person-bound — but when a GRE filter is set the whole
+     workbook is headed with that person's name, so the tile read as hers.
+     Measured on one service with three open complaints: filtered to a GRE who
+     had raised NONE, the tile printed `3` with an EMPTY sub, i.e. a file headed
+     "GRE: <name>" told a manager she had three complaints outstanding. The
+     number is worth keeping — it is the venue's live queue — so it now says
+     whose it is, and names the person's own figure beside it rather than
+     leaving the reader to assume.
+
+     A KPI `sub` is ONE hard-truncated line (see coverageKpis below), and a
+     person's NAME cannot be fitted into it — "Nisha Sharma" alone pushed the
+     sentence to 178pt against a 153pt tile, so it printed as "not Nisha Sha…".
+     The tile therefore says the SHORT, name-free truth and the naming sentence
+     goes into `footnotes`, which wrap. */
+  const openNowTile = {
+    label: 'Follow-ups open now (all dates)',
+    value: n0(s.open_follow_ups_now),
+    sub: p.person
+      ? 'Whole venue, all dates - NOT this person\'s.'
+      : 'Whole venue, right now - every date.',
+  };
+
+  /** The naming half of the tile above, for `footnotes` (which wrap). */
+  const openNowFootnote = p.person
+    ? `"Follow-ups open now (all dates)" is the WHOLE VENUE's open queue, not ${p.person.person}'s: `
+      + `${n0(p.person.follow_ups_open)} of those ${p.person.follow_ups_open === 1 ? 'is' : 'are'} theirs. `
+      + `Their own figures are on the "What ${p.person.person} did" sheet.`
+    : '';
+
+  /* ⚠️ A KPI `sub` IS ONE HARD-TRUNCATED LINE, 153.09pt WIDE. `report-pdf.ts`
+     lays the tiles out three to a row (cellW 165.09pt) and renders the sub with
+     `fit(doc, k.sub, cellW - 12)` at Helvetica 7.5 — no wrapping. Measured at
+     the owner's real scale (292 tables), two of these sentences were being cut
+     mid-word in the PDF while looking perfect in the spreadsheet:
+
+       "threshold 4 items (default), or bill asked / printed"   159.8pt
+            printed as "... or bill asked / pri…"  — losing the word PRINTED,
+            i.e. one of the owner's three eligibility triggers.
+       "213 on eligible tables + 79 on tables that never met the trigger" 205pt
+            printed as "... + 79 on tables that n…" — and that sentence is the
+            one that reconciles this tile against the Rating split sheet.
+
+     Every sub below is now measured against 153.09pt at its WORST-CASE numbers
+     (four digits everywhere), so none of them can be cut. Anything that needs
+     more words belongs in `footnotes`, which DO wrap. */
   const coverageKpis = [
-    { label: 'Eligible tables', value: n0(s.eligible_tables), sub: `threshold ${p.meta.item_threshold} items${p.meta.item_threshold_is_default ? ' (default)' : ''}, or bill asked / printed` },
+    { label: 'Eligible tables', value: n0(s.eligible_tables), sub: `${p.meta.item_threshold}+ items${p.meta.item_threshold_is_default ? ' (default)' : ''}, or bill asked / printed` },
     {
       label: 'Feedbacks recorded',
       value: n0(s.feedbacks_recorded),
       sub: s.extra_visits
-        ? `${n0(s.eligible_tables_covered)} on eligible tables + ${n0(s.extra_visits)} on tables that never met the trigger`
+        ? `${n0(s.eligible_tables_covered)} on eligible tables + ${n0(s.extra_visits)} on others`
         : 'all of them on eligible tables',
     },
     {
@@ -1859,7 +1915,10 @@ export function buildReport(p: AnalyticsPayload, key: ReportKeyName): ReportDoc 
       + 'differ, and the Summary sheet says by how much.',
       `Dates are IST business days with a ${p.range.cutoff} rollover - the same convention the floor board uses, so a complaint taken at 01:30 belongs to the previous evening's service.`,
       ISSUES_RECORDED_IS_NOT_A_PENALTY,
-    ],
+      // Empty string when no person is selected; filtered out below so the PDF
+      // never prints a bare bullet.
+      openNowFootnote,
+    ].filter(Boolean),
   };
 
   /** The "What <name> did" sheet. Present ONLY when a person filter is set, and
@@ -1868,10 +1927,13 @@ export function buildReport(p: AnalyticsPayload, key: ReportKeyName): ReportDoc 
   const personTables: ReportTable[] = p.person
     ? [{
       name: `What ${p.person.person} did`,
-      columns: [{ label: 'Measure', width: 3 }, { label: 'Value', width: 1.2, align: 'right' }, { label: 'Basis', width: 3.4 }],
+      // Value carries a FLOOR NAME as well as numbers, and "First Floor · Terrace"
+      // does not fit 73pt. Measured at the renderer's own Helvetica 8: every cell
+      // in all three columns fits at these weights, for one floor and for two.
+      columns: [{ label: 'Measure', width: 3 }, { label: 'Value', width: 1.9, align: 'right' }, { label: 'Basis', width: 3.0 }],
       rows: [
-        ['Tables visited (distinct eligible tables they recorded on)', p.person.tables_visited, 'Owner metric: Tables Visited. Same rule as the Tracker\'s "Tables".'],
-        ['Feedbacks taken on eligible tables', p.person.taken, 'Same rule as the Tracker\'s "Taken" - the coverage numerator'],
+        ['Tables visited (distinct eligible tables they covered)', p.person.tables_visited, "Owner metric. Same rule as the Tracker's Tables."],
+        ['Feedbacks taken on eligible tables', p.person.taken, "The coverage numerator. The Tracker's Taken."],
         ['Feedbacks recorded (all their visits in scope)', p.person.feedbacks_recorded, 'Includes tables that never met the trigger'],
         ['Floor they are measured against', p.person.area_label, p.person.area_assigned ? 'users.preferred_zones' : 'No assignment - measured against every eligible table in scope'],
         ['Coverage of their own floor',
@@ -1879,7 +1941,7 @@ export function buildReport(p: AnalyticsPayload, key: ReportKeyName): ReportDoc 
           p.person.area_assigned
             ? `${n0(p.person.area_covered ?? 0)} of ${n0(p.person.area_eligible ?? 0)} eligible tables on their floor`
             : COVERAGE_PER_GRE_UNAVAILABLE],
-        ['Helped on another floor', p.person.off_area_visits, 'Counted as work, never as a shortfall. Nobody is blocked from helping elsewhere.'],
+        ['Helped on another floor', p.person.off_area_visits, 'Work, never a shortfall - see the note below.'],
         ['Share of the tables that were covered', pctText(p.person.share_pct), "Their part of the room's covered tables"],
         ['Issues properly recorded', p.person.issues_recorded, 'Owner metric. A CREDIT, never a penalty.'],
         ['Follow-ups raised', p.person.follow_ups_raised, 'Complaints they opened'],
@@ -1887,7 +1949,7 @@ export function buildReport(p: AnalyticsPayload, key: ReportKeyName): ReportDoc 
         ['Follow-ups still open', p.person.follow_ups_open, 'A work queue, not a score'],
         ['Guest recovery follow-up',
           recoveryLong(p.person.follow_ups_completed, p.person.follow_ups_raised),
-          'Completed / raised. Owner metric - and a QUEUE, not a score.'],
+          'Completed / raised. A QUEUE, not a score.'],
       ] as (string | number)[][],
       note: `${ISSUES_RECORDED_IS_NOT_A_PENALTY} ${RECOVERY_IS_A_QUEUE} ${p.person.coverage_basis} `
         + 'Nothing in this sheet is a rating, and no other sheet in this file is about this person.',
@@ -1980,7 +2042,7 @@ export function buildReport(p: AnalyticsPayload, key: ReportKeyName): ReportDoc 
           { label: 'Returned / remade / replaced', value: n0(s.returned + s.remade + s.replaced), sub: `${s.returned} returned, ${s.remade} remade, ${s.replaced} replaced` },
           { label: 'Guest happy after correction', value: n0(s.happy_after_replacement) },
           { label: 'Still unhappy', value: n0(s.still_unhappy) },
-          { label: 'Follow-ups open now (all dates)', value: n0(s.open_follow_ups_now) },
+          openNowTile,
         ],
         tables: [
           ...personTables,
@@ -2130,22 +2192,48 @@ export function buildReport(p: AnalyticsPayload, key: ReportKeyName): ReportDoc 
             // completed" and "Recovery follow-up %" both truncated to
             // "Follow-ups co…" / "Recovery follo…" at the old widths; the
             // note below carries the full meaning of each short heading.
-            // Measured minimums (see the menuTable note) with the remainder to
-            // Person, which is the only free-text column here.
+            //
+            // 🐞 AND THEN A TRUNCATED PERCENTAGE INVERTED ITS OWN MEANING.
+            // Sizing the free-text columns first and giving the numbers "the
+            // measured minimum" used the HEADING as the minimum, which for a
+            // right-aligned number column is the wrong bound: the heading is
+            // short and the cell is long. `Their floor` got 45.0pt usable,
+            // and `report-pdf.ts` tail-chops, so on the owner's real floors
+            // (First Floor 188 tables, Second Floor 100, Terrace 4):
+            //
+            //     "188/188 100.0%"  printed as  "188/188 1…"
+            //     "142/188 75.5%"   printed as  "142/188 7…"
+            //
+            // A GRE who covered EVERY table on her floor printed a coverage
+            // of "1…", which a manager reads as 1%. The best possible row
+            // printed as the worst possible number, in a file that gets
+            // e-mailed — the fairness ruling breached by the renderer rather
+            // than by the query. `Recovery` did the same past 100 complaints.
+            //
+            // Every width below is now the CEILING CELL, not the heading:
+            // max(heading at Helvetica-Bold 8, worst-case cell at Helvetica 8)
+            // + 2*PAD, measured with `doc.widthOfString()` on the renderer's
+            // own document, with the remainder to Person and Floor. The
+            // ceilings are provable, not guessed: 292 tables is the whole
+            // venue, so "292/292 100.0%" (58.3pt) is the widest `Their floor`
+            // cell that can ever exist. Re-measured: 0 of 10 columns overflow,
+            // and all 9 real `Their floor` cells print in full.
             columns: [
-              { label: 'Person', width: 96, fitPrint: true }, { label: 'Floor', width: 66, fitPrint: true },
+              { label: 'Person', width: 82, fitPrint: true }, { label: 'Floor', width: 66, fitPrint: true },
               { label: 'Tables', width: 34, align: 'right' },
-              { label: 'Their floor', width: 52, align: 'right' },
-              { label: 'Off-floor', width: 46, align: 'right' },
+              { label: 'Their floor', width: 68, align: 'right' },
+              { label: 'Off-floor', width: 42, align: 'right' },
               { label: 'Issues', width: 34, align: 'right' },
               { label: 'Raised', width: 36, align: 'right' },
-              { label: 'Completed', width: 50, align: 'right' },
+              { label: 'Completed', width: 51, align: 'right' },
               { label: 'Open', width: 30, align: 'right' },
               // Not "Recovery %": a bare ratio in this column printed `0.0%`
               // for the GRE with two complaints still to revisit and `-` for
               // the one who recorded none, so the honest row read worse AND
               // sorted below. `recoveryCell()` carries its denominator.
-              { label: 'Recovery', width: 62, align: 'right' },
+              // 72, not 62: "999/999 · 100.0%" is 62.7pt, so 62 tail-chopped a
+              // three-digit recovery rate to "100/100 · 10…" — see above.
+              { label: 'Recovery', width: 72, align: 'right' },
             ],
             rows: p.gre_performance.map((g) => [
               g.person,
@@ -2203,8 +2291,18 @@ export function buildReport(p: AnalyticsPayload, key: ReportKeyName): ReportDoc 
           {
             name: 'Open complaints now (all dates)',
             columns: [{ label: 'Measure', width: 3 }, { label: 'Count', width: 1, align: 'right' }],
-            rows: [['Follow-ups still open, every date', s.open_follow_ups_now]],
-            note: 'Deliberately NOT bound by the period filter: an unresolved complaint from last week is still unresolved today, and a manager reading "Today" must not be told there are none.',
+            // Two rows when a person is selected, never one: this figure is the
+            // VENUE's and the workbook is headed with a person's name, so a
+            // single row read as theirs (measured: 3 printed against a GRE who
+            // had raised none).
+            rows: p.person
+              ? [
+                ['Follow-ups still open, every date - THE WHOLE VENUE', s.open_follow_ups_now],
+                [`Of those, raised by ${p.person.person}`, p.person.follow_ups_open],
+              ]
+              : [['Follow-ups still open, every date', s.open_follow_ups_now]],
+            note: 'Deliberately NOT bound by the period filter: an unresolved complaint from last week is still unresolved today, and a manager reading "Today" must not be told there are none.'
+              + (p.person ? ' The first row is the whole venue, not this person.' : ''),
           },
         ],
       };

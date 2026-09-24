@@ -217,7 +217,7 @@ supported, clear status indicators, sticky Submit. Minimal typing.
 | P2 | Page 1 Floor Feedback + the READ-ONLY guarantee, proved server-side | **DONE (A + B)** | §6 2026-09-22: GET-only routes (405 with CSRF, 403 without), 40 reads → census identical, 6-persona gate, all 5 statuses live, `tunable()` zero-default bug fixed, tsc 0. **Part (B) IS NOW APPLIED** — one prefix deny at ONE boundary (`src/lib/feedback/pos-readonly.ts` + `src/proxy.ts`), zero POS route handlers edited, 23/23 forbidden writes refused for an assigned GRE, 115/115 non-GRE writes untouched. **Lane B (read/board/catalog) closed its three HIGHs + 7 MEDIUMs** — elapsed proved against a known instant, a business-day exit for the never-settled order, tier flags proved per persona; 120 reads → census identical. **Probe `the-gre-is-denied` (2026-09-22, port 3954, no code changed): 87/87 state-changing POS requests refused against REAL rows with zero writes, the same requests measured WRITING for six other personas — but the claim is falsified once, by `POST /api/crm-calls/bookings/[id]/seat`, which opens/edits an order for any signed-in user (§6, §7 items 6-7).** **Probe `floor-managers-and-null-role` (2026-09-23, port 3955, no code changed): the deny is INERT in the null-role state and switches on and off with the assignment (0/27 → 26/27 → 0/27 on ONE login); 162 HTTP lines and a 33,407-line dump of all 217 tables are BYTE-IDENTICAL between the deny build and the deny reverted, for the Floor Manager and all three null-role tiers; the Page-1 truth table and the elapsed clock both pass. 🛑 But a **Floor Manager gets 403 on all four pages** while the API hands them the board — §6, and it is a config blocker, not a code one.** |
 | P3 | Page 2 Take Feedback + item-level complaints + action + follow-up lifecycle | PENDING | |
 | P4 | Page 3 Feedback Tracker + coverage | **LANE A DONE** | §6 2026-09-23: `GET /api/feedback/tracker` built (GET-only, 403 without CSRF / 405 with a valid pair, 40 reads → census identical), Page 3 reads it and the placeholder import is gone, and **the door is open** — a Floor Manager / Bar Manager / Head Chef / Store Manager now gets 200 on pages 1-3 where the same build without the one-line change gives 403 on all four (control run, every other row byte-identical). Analytics stays 403 for a GRE. tsc 0. |
-| P5 | Page 4 Analytics + the 8 reports | PENDING | |
+| P5 | Page 4 Analytics + the 8 reports | **LANE C + LANE B DONE** | §6 2026-09-24: the CRITICAL is closed — a person filter now moves **4 payload paths (`filters.gre` · `person` · `meta.counts_scope` · `meta.person_filter_active`) instead of 13**, and the flip (records honestly vs records "everything good") leaves the person-filtered page BYTE-IDENTICAL to the unfiltered one in both worlds. Page 3 and Page 4 agree (`11/8/72.7%` both, was `12/9/75.0%` vs `11/8/72.7%`) including the new floor denominator and the per-person Tables/Taken columns. The workbook no longer contradicts itself (`Feedbacks recorded 9 = Rating split 9`, was `8` vs `9`). PDF menu names: **628 of 628 printed strings distinct**, was 58 names collapsing into 28 rows. 37 reads incl. all 16 downloads → DB byte-identical. tsc 0. **NO SERVER WAS BOOTED.** **LANE B (export/PDF half, independent second measurement, 2026-09-24):** the three HIGHs re-proved with controls — Page 3 vs Page 4 `7/5/71.4%` both, and reverting only the numerator restores the brief's exact pair `8 eligible/75.0%` vs `7/71.4%`; 184 workbook assertions across 8 reports x 4 filter states, 0 contradictions; 628 of 628 menu names print distinct (widening ALONE still left 22 colliding, so the label pass is load-bearing). **Then four defects nobody had measured, all only visible at the owner's real 292-table scale:** `Their floor` printed `188/188 1…` for a GRE who covered EVERY table on her floor (a truncated percentage inverts its meaning — proved in two real rendered PDFs), `Recovery` the same past 100 complaints, 4 KPI subs cut mid-word (one losing the word PRINTED, one losing the sentence that reconciles the Summary against the Rating split), and the venue's open-follow-up count printed on a named person's card. Exhaustive audit: **36,365 rendered strings, 0 truncated, 0 ambiguous** (control at `f83b30b`: 88). tsc 0. **NO SERVER WAS BOOTED.** |
 | P6 | Full adversarial verification + carve-readiness | PENDING | |
 
 **🛑 After P6 the build STOPS and waits for "Deploy Feedback Module".**
@@ -1195,3 +1195,322 @@ supported, clear status indicators, sticky Submit. Minimal typing.
     and `users.preferred_zones` already exists but is not maintained. Until then, the page shows
     each person's real activity plus their share of the tables that were covered, and says in as
     many words why the denominator is the room.
+
+- **2026-09-24 — P5 LANE C (THE FAIRNESS CRITICAL · the owner's floor denominator · the coverage
+  disagreement · the self-contradicting workbook · the PDF column).** Files: `src/lib/feedback/
+  reporting.ts` · `src/lib/feedback/zones.ts` (NEW) · `src/lib/feedback/labels.ts` (NEW) ·
+  `src/app/api/feedback/{reports,tracker/query,floor}` · `src/app/feedback/{page,tracker/page,
+  analytics/page}.tsx`. `src/lib/captain-area.ts` was READ and **not modified** — it governs captains.
+
+  - ⚠️ **HOW THIS LANE STARTED, because the log must not read as if I wrote all of it.** The worktree
+    already held **1,270 uncommitted lines** from a P5 lane that died mid-write (7 files edited, 2 new).
+    I did **not** discard them and did not redo them: I read them in full, **reproduced every briefed
+    defect against `HEAD` (715f604)** to prove they were real, then verified the inherited fix and
+    added six of my own. Mid-lane a CONCURRENT session committed the tree as **`f83b30b`** ("Checkpoint
+    … inherited from the lane that died") — that commit contains the inherited work **plus my
+    then-in-flight edits**, and its own message says the evidence would follow in the next commit.
+    This entry is that evidence. Nothing was reverted (no-undo rule). A stray `tsconfig.rig.json` from
+    another lane's scratch build is untracked and was deliberately left alone, not committed.
+
+  - **METHOD, AND WHY NO SERVER WAS BOOTED.** Every number below comes from the SHIPPED code driven
+    directly: `src/lib/{feedback/reporting,feedback/zones,feedback/labels,hr-attendance,kot-section}`,
+    `src/lib/feedback/{read,access}` and `src/app/api/feedback/{tracker/query,reports/route,floor/
+    route}.ts` copied into a scratch harness with only the `@/` alias rewritten, `@/lib/db`,
+    `@/lib/auth` and the two session gates replaced by stubs, run under Node 25's type stripping. The
+    REPORT ROUTE IS THE REAL ONE, so the xlsx and PDF bytes are the real ones (`XLSX.write`, `pdfkit`,
+    `buildReportPdf`) — 16 files per run, all HTTP 200. **Port 3946 was never used: 0 listeners, no
+    dev server, no `.next`.** The worktree DB was only ever read (`?mode=ro` + `VACUUM INTO`); its
+    mtime is still `Sep 22 18:41:50` and `fnb-controller.db-wal` is 0 bytes. Fixtures are all `fair-`
+    and live ONLY in the scratch copy: 12 tables across **3 floors / 7 sections mirroring the
+    production shape** (FA FB FBR SA SB SO TC), 12 orders, 4 GREs — **Anita = First Floor, Bela =
+    Second Floor, Chitra = UNASSIGNED, "Silent Gre" = Terrace and records nothing.**
+    ⚠️ **AN ENVIRONMENT TRAP THAT COST THIS LANE A RUN:** the wall clock jumped ~11 h mid-session
+    (machine sleep), so fixtures stamped `14:03 UTC` fell into the PREVIOUS 04:00-IST business day and
+    every probe measured an EMPTY universe (`eligible 0`, `floors []`) while exiting 0. The fixture
+    builder now re-stamps into the current business day on every invocation.
+
+  - 🔴 **(1) THE FAIRNESS CRITICAL — REPRODUCED ON `HEAD`, THEN CLOSED.** The flip: ONE GRE, the SAME
+    six visits, the SAME tables; only what she wrote down changed. `?gre=Anita Rao`:
+
+    | | records HONESTLY | records "everything good" |
+    |---|---|---|
+    | **HEAD (715f604)** | Exc 0 · Avg **6 (100 %)** · NEG **6/6** · R/R/R 6 · pendFU 2 · complained `Chicken Tikka:6` | Exc **6 (100 %)** · NEG **0** · R/R/R 0 · pendFU 0 · complained — |
+    | **now** | Exc 2 · Good 1 · Avg 6 · NEG 7/7 — **byte-identical to the UNFILTERED page** | Exc 8 · Good 1 · NEG 1/1 — **byte-identical to the UNFILTERED page** |
+
+    Coverage read 45.5 % in BOTH HEAD columns, so the incentive was purely in the sentiment sections:
+    the honest GRE looked worse under her own name. **The structural proof, a deep diff of the whole
+    payload, filtered vs unfiltered:** HEAD moved **13 paths** (`summary.feedback_taken`,
+    `coverage_pct`, `excellent`, `good`, `everything_good`, `negative_item_feedbacks`,
+    `item_feedbacks`, `menu_items`, `common_problems`, `most_complained`, `recovery`,
+    `gre_performance`, `daily`); now it moves **4** — `filters.gre`, `person`, `meta.counts_scope`,
+    `meta.person_filter_active` — and only `person` carries data. Under the flip the person block
+    moves in **exactly three fields, all credits**: `issues_recorded` 6→0, `follow_ups_raised` 2→0,
+    `follow_ups_open` 2→0. `tables_visited 5`, `taken 6`, `feedbacks_recorded 7`,
+    `area_coverage_pct 80 %`, `off_area_visits 1` are **identical in both worlds**, and the block
+    carries **zero** keys matching rating/excellent/good/average/poor/negative/happy/score/unrated.
+  - **AND IT NO LONGER LEAVES THE BUILDING.** Same flip, through the REAL route, `daily.xlsx` headed
+    `GRE: Anita Rao`: HEAD printed `Excellent 0 / Average 6 (100.0%)` honest against
+    `Excellent 6 (100.0%)` silent. Now the **Rating split sheet is byte-identical to the unfiltered
+    workbook's** in both worlds (sha `8baf057a…` / `f590f9cb…`, filtered == unfiltered both times),
+    a **"What Anita Rao did" sheet is present on 8 of 8 reports** carrying only the owner's five
+    metrics, and every export now states in words *"it fills in the 'What <name> did' sheet and
+    changes NOTHING else in this file … Do not read this file as an appraisal of them."*
+
+  - 🔒 **(2) THE OWNER'S FLOOR RULING — A DEFAULT, NOT A RESTRICTION. `src/lib/feedback/zones.ts`,
+    SELECT-only, and `captain-area.ts` untouched.** Why it is not reused: `captainAreaFilter()` is
+    gated on `captain_area_lock`, which has **0 rows** (re-measured on the worktree DB), so it returns
+    `null` for everybody; switching it on would start restricting CAPTAINS mid-service. `zones.ts`
+    reads the same two columns and copies the same conventions (`''` ⇄ `'Floor'`, unassigned = all).
+    · **NOBODY IS RESTRICTED, measured:** `GET /api/feedback/floor` for 7 viewers (each GRE, a Floor
+      Manager, a manager assigned to the Terrace, and a viewer whose `preferred_zones` is malformed)
+      returns the **SAME 13 rows across all 3 floors** — `DISTINCT BOARDS ACROSS ALL VIEWERS: 1`. Only
+      `my_floors` / `area_label` / `area_note` differ.
+    · **PAGE 1 OPENS ON HER FLOOR, ONCE.** The default block and the `floorOptions` memo were
+      extracted **verbatim** from `src/app/feedback/page.tsx` (byte-identity asserted) and run: first
+      board → `First Floor`; nine more 10-second refreshes → still `First Floor`; **she switches to
+      Second Floor and the refresh does NOT drag her home**; unassigned → `all`; TWO assigned floors →
+      `all` (picking one would hide the other); a payload with no `viewer` block → `all`, no crash.
+      Every floor stays in the selector (`['all','First Floor','Second Floor']`), her own is marked
+      `(yours)`, and an assigned floor with nothing open is still offered as `(yours) (none open)`.
+    · **COVERAGE IS MEASURED AGAINST HER FLOOR, and both pages agree:** Anita `4/5 = 80 %` with
+      `1 off-floor`; Bela `2/4 = 50 %`; **Chitra (unassigned) `—`, measured venue-wide exactly as
+      before**; **"Silent Gre" (assigned Terrace, recorded nothing) `0/2 = 0 %`** — the row the page
+      exists to show.
+    · **WHERE THE OFF-FLOOR VISIT WENT (the brief asks this explicitly):** it counts three times and
+      vanishes nowhere — inside her `tables_visited`/`taken`, inside the ROOM's coverage numerator,
+      and named separately as `off_area_visits` so the help is visible. It is deliberately NOT in her
+      floor denominator, so helping upstairs can never read as a shortfall.
+    · **13 zone cases asserted**, including all three malformed `preferred_zones` forms (`not json`,
+      an object, a number) degrading to **unassigned = measured against everything** — over-measure,
+      never under-measure, because the other direction prints a fake 100 %.
+    · 🐞 **A COMMENT THAT PROMISED WHAT THE CODE DID NOT.** `zones.ts` claimed "a management user comes
+      back as AREA_UNASSIGNED"; nothing in it tests a tier. The comment now states the truth (the area
+      is the PERSON's own assignment, whoever they are; 0 users of any tier hold `preferred_zones`
+      today, so management comes back unassigned in fact) and says why a tier test was not added.
+
+  - 🐞 **(3) HIGH — THE COVERAGE DISAGREEMENT, REPRODUCED AND CLOSED.** Same service, no filters, same
+    database: **HEAD → Page 3 `13 eligible / 10 taken / 76.9 %` vs Page 4 `12 / 9 / 75.0 %`.**
+    **Now → `12 / 9 / 75.0 %` on both.** **PAGE 4's DEFINITION WAS THE RIGHT ONE** and Page 3 adopts
+    it: the denominator is the tables that were OWED a visit and the numerator the visits ON those
+    tables. Page 3 had padded BOTH sides with a visit to a table nobody was owed, so its ratio drifted
+    toward 100 % as a GRE visited more tables nobody asked for. Nothing disappeared — the extra visit
+    is still a row, still in the chips, and is now counted by name (`extra_visits 1`,
+    `feedbacks_recorded 10`) on BOTH pages.
+    · 🐞 **AND THE SAME DISEASE ONE LEVEL DOWN, found by this lane:** Page 3's progress table has
+      carried "Tables" (DISTINCT tables) and "Taken" (eligible visits) since 7158feb; Page 4 had one
+      field computed as Page 3's *Taken* and labelled *Tables visited*. Proved with **one table
+      seating two parties in one service**: HEAD → Page 3 `Tables 6 / Taken 7` vs Page 4 `Tables 6`
+      with no Taken and `share undefined`, **5 of 5 rows disagreeing**; now → `Tables 5 / Taken 6`
+      on both, **0 rows disagreeing**, and `share_pct` uses Page 3's rule on both.
+
+  - 🐞 **(4) HIGH — THE WORKBOOK CONTRADICTED ITSELF; NOW IT RECONCILES ON ITS OWN FACE.**
+    HEAD, one `daily.xlsx`: Summary **"Feedbacks taken 8"** beside a Rating split accounting for
+    **9** (weekly/monthly 12 vs 13; and 5 vs 6 under `&gre=`). Now: `Feedbacks recorded 10` = Rating
+    split `10` = a printed **"Total feedbacks recorded"** row, the Share column **sums to 100.0 %**
+    (HEAD divided the four ratings by "rated only" and Not-rated by "rated + unrated"), and
+    `meta.reconciles` carries the three invariants **all true on all 8 reports** — rating split,
+    coverage split, `covered <= eligible`. Two named numbers replace one overloaded one:
+    `feedbacks_recorded` (every visit) vs `eligible_tables_covered` (the coverage numerator).
+
+  - 🐞 **(5) HIGH — TWO DIFFERENT DISHES PRINTED AS THE SAME PDF ROW.** Measured over the **628 real
+    menu items** with the renderer's OWN `doc.widthOfString` at its own geometry (A4, margin 40,
+    PAD 4, Helvetica 8) and its own `fit()`:
+
+    | | Item column | printed in full | identical printed rows |
+    |---|---|---|---|
+    | HEAD widths + hard truncate | 103.2 pt | 477/628 | **28 rows swallowing 58 names** |
+    | widened columns ALONE | 127.1 pt | 562/628 | **11 rows — not enough** |
+    | widened + `fitPrint` (shipped) | 127.1 pt | 562/628 | **0 — 628 of 628 distinct** |
+
+    **END TO END in a rendered PDF**, the pair the brief names: HEAD printed `AG FORTYSEVEN CHAR…`
+    **twice** (a bottle of wine and a glass of it as one row) and `GODAWAN 01 RICH AND…` twice; now
+    `AG FORTYSEVEN …NAY BOTTLE` vs `AG FORTYSEVEN…NNAY GLASS` and `GODAWAN 01 RIC…ED - BOTTLE` vs
+    `…UNDED 30ML`. **The xlsx keeps the FULL string — 0 ellipses anywhere in the workbook** — because
+    people sort and VLOOKUP on it.
+    · 🐞 **THE UNIQUENESS PROMISE WAS PROBABLE, NOT TRUE.** One `#tag` pass sufficed for 628 items but
+      two names sharing a 3-char FNV tag AND an elided form would collide again. `printableLabels()`
+      now re-tests and widens until unique. Stressed: 40 names differing only in the middle are unique
+      at 90 pt, at 40 pt and at 12 pt (where nothing fits); and a **REAL** tag collision hunted out of
+      400,000 candidates (`COLLIDE 138 …` / `COLLIDE 466 …`, both `54c`) resolves to `#wy4` / `#y18`.
+    · **EVERY column, not just the one in the brief:** all 8 reports × filtered and unfiltered ×
+      1-floor and 3-floor GRE → **16 fitPrint columns, 0 failures, and 0 truncated cells or headings
+      anywhere.** Getting there cost three rounds of measurement (my own longer help strings
+      truncated the person sheet's Measure/Value/Basis columns, and a 3-floor `area_label` overflowed
+      at 123.0 pt into 115.9 pt — it is now summarised as `First Floor +2 more`).
+
+  - 🐞 **(6) MEDIUM/LOW CLOSED BY THIS LANE.**
+    1. **The GRE who recorded NOTHING now exists on Page 4.** `grePerformance()` is seeded from the
+       people who HOLD the role (active role, active user), not from visits — the same thing Page 3
+       does and for the same reason. Measured: `Silent Gre` and `QA Gre` both appear with
+       `kind: 'assigned'`, 0 everywhere, and the workbook note says that row is the point of the table.
+    2. 🔒 **GUEST RECOVERY WAS STILL READABLE BACKWARDS, and it is one of the owner's five metrics.**
+       A GRE with two complaints not yet revisited printed `0.0%`; a GRE who recorded none printed
+       `-` in the same column — the honest one looked worse, and `-` **sorts above** `0.0%`. It now
+       prints as a QUEUE that carries its own denominator: `0/2 · 0.0%` in tables, `0.0% - 0 of 2
+       closed` on the person sheet, and **`none raised` in words** where there is nothing to close,
+       with `RECOVERY_IS_A_QUEUE` on screen and in every export saying *"Never read 'none raised' as
+       better than an open queue — it is the OPPOSITE way round."*
+    3. **The Tracker's floor-total row printed under the wrong headings** — `N pending` sat in the
+       "Issues rec." column, so the venue looked as though it had recorded that many complaints. Every
+       cell now sits under its own heading, and the total row carries real totals.
+    4. **`COVERAGE_PER_GRE_UNAVAILABLE` had become false.** It said flatly that coverage per person
+       has no honest denominator; that is now true only of an UNASSIGNED person, and the sentence says
+       so.
+    5. **The screen says which layer each number belongs to.** `meta.counts_scope` prints above the
+       Dashboard whenever a name is selected, and the Dashboard's own hint reads *"the whole selected
+       floor / captain / period — NOT the person above"*.
+
+  - **DELIBERATELY LEFT OPEN, with reasons.** ⚠️ The brief asked for "the 12 MEDIUMs recorded in the
+    state file". **There are not 12 — this file records 2 MEDIUMs and 2 LOWs from the P6 probe plus 4
+    MEDIUMs P2 Lane B left open, and I am not inventing eight more.** Of the eight real ones, five are
+    closed above and three are left, all outside this lane's authority:
+    · **`page_access` narrows PAGES, not API routes** (P6's MEDIUM). The routes gate on
+      `feedbackAccess()`, which never reads `page_access`. Mirroring page lists into API gates is an
+      app-wide policy change affecting every module, not a feedback fix — rule 5, and it needs the
+      owner. Mitigating facts re-checked: no money and no guest PII on any of those payloads, and
+      `/api/feedback/analytics` + all 16 report combinations still 403 a GRE.
+    · **The Sidebar's actor carries no `role_is_active`**, so a DEACTIVATED GRE role still shows the
+      three nav rows, which then 403. The fix is in `/api/auth/me` + `Sidebar.tsx` — not my files.
+    · **The HOD checkbox switches the POS read-only deny off** (open decision 7) — owner's call.
+    · Also unchanged on purpose: `readOrderForFeedback()` is still not board-scoped (P3 needs older
+      orders and it returns no money), and `FloorRow.in_grace` is still derived from
+      `order_status === 'settled'` (correct because the SQL already bounds settled rows).
+    · ⚠️ **ONE THING THE OWNER MAY WANT TO RULE ON, found while measuring and NOT patched.** A
+      person's floor coverage counts the visits **they** made. When a colleague covers a table on
+      their floor, the room's coverage rises but that person's own figure does not (Bela reads
+      `2/4 = 50 %` on a floor where 3 of her 4 tables were in fact visited, one of them by Anita).
+      That does not breach the ruling — nothing improves by recording less — but it is a judgement
+      about whether "her floor's coverage" means *she* covered it or *it got covered*. `off_area_visits`
+      already shows the helper's side. Left as measured, not guessed at.
+
+  - **NO REGRESSION, and the read rail is still a read rail.** 37 reads through every entry point
+    (7 filter combinations × analytics + item-comments + tracker, then all 16 downloads) left the
+    database **byte-identical** (sha before == after), census `orders 66 · items 170 · Σqty 216 ·
+    visits 14 · item_fb 11 · follow_ups 2 · tables 27 · users 19 · purchases 2165 · raw_materials
+    952`, `integrity_check ok`. All five `/api/feedback/*` route files export **`GET` and nothing
+    else**; zero SQL write verbs outside comments in any of my six files. `npx tsc --noEmit` exit
+    **0**, zero output. Gate patterns over every changed file: `lq_` 0 · `party-manager` 0 ·
+    `lib/pm/` 0 · `fssai` 0 · `bill-handover` 0 · `boh_` 0. **Nothing was pushed and nothing
+    deployed — the build-only gate stands.**
+
+- **2026-09-24 — P5 LANE B (the export/PDF half: independent verification, and the four things the
+  PDF was still getting wrong AT PRODUCTION SCALE).** Files: `src/lib/feedback/reporting.ts` only —
+  the sheet-building and PDF-layout functions. **NO SERVER WAS BOOTED** (load average was 79 at lane
+  start). Method: `VACUUM INTO` snapshot, the real `reporting.ts` / `tracker/query.ts` / `labels.ts` /
+  `report-pdf.ts` compiled to CommonJS with `tsc` and called directly, and **real PDFs rendered
+  through the exact `pdfFor()` pipeline from `reports/route.ts`** then read back with `pdftotext`.
+  Ran CONCURRENTLY with Lane C; where we overlap this entry is an INDEPENDENT second measurement
+  with different fixtures, and it agrees with theirs.
+
+  - ✅ **THE THREE BRIEFED HIGHs — VERIFIED FIXED, EACH WITH A CONTROL.**
+    1. **The coverage disagreement.** Fixtures built to the brief's own shape (7 eligible tables, 5
+       covered, 1 visited-but-never-eligible): Page 3 and Page 4 now both read **7 eligible / 5 taken
+       / 71.4 %**, and agree on `feedbacks_recorded 6` and `extra_visits 1`. **CONTROL** — the same
+       fixture, same database, with only the numerator/denominator reverted to `today.length`:
+       **Page 3 reads `8 eligible / 75.0 %` against Page 4's `7 / 71.4 %`**, which is the brief's
+       measured pair exactly. **PAGE 4's DEFINITION IS THE RIGHT ONE** and Page 3 now uses it: the
+       denominator is the tables that were OWED a visit and the numerator is the visits on those
+       tables. The old version put a visited-but-not-owed table into BOTH sides, so coverage drifted
+       toward 100 % as a GRE visited tables nobody was owed — a coverage figure that improves without
+       covering anything, which is the fairness ruling breached from the other direction.
+       They also agree **per floor**, i.e. about the new floor-scoped denominator: First Floor
+       `3/3/100 %`, Second Floor `3/2/66.7 %`, Terrace `1/0/0 %`, P3 == P4 on every one.
+    2. **The self-contradicting workbook.** **184 assertions across all 8 reports × 4 filter states,
+       0 failures**: Summary "Feedbacks recorded" == the Rating split Total row, the rating rows sum
+       to that total, the shares sum to 100 %, `By day` Σeligible/Σtaken == the summary, and the
+       three `meta.reconciles` invariants hold. Re-run after my own edits: **32/32 combinations
+       internally consistent.**
+    3. **The PDF menu column.** Over the **628 real menu names**, measured with the renderer's own
+       `doc.widthOfString` at Helvetica 8: BEFORE **151 truncated and 58 names collapsed into 28
+       identical strings**; WIDENING ALONE still left **22 names in 11 identical strings** (so the
+       widening was NOT sufficient on its own and the `labels.ts` pass is load-bearing); SHIPPED
+       **628 of 628 distinct, 562 printed in full, 0 over the column**. Confirmed in a REAL rendered
+       PDF: 671 menu rows parsed out of `pdftotext`, **0 printed names appearing twice**, and the
+       distinguishing tail survives (`AG FORTYSEVEN …NAY BOTTLE` vs `AG FORTYSEVEN…NNAY GLASS`).
+       `printableLabels()` was also stressed adversarially: a **forced 20-way `nameTag` collision**,
+       5,000 shared-head names, unicode/emoji, duplicate and empty inputs, and order-shuffling —
+       **uniqueness held in every case** (the tag loop is genuinely a guarantee, not a probability).
+
+  - 🐞 **AND THEN THE ONE NOBODY HAD MEASURED: A TRUNCATED PERCENTAGE INVERTS ITS OWN MEANING.**
+    The briefed PDF defect was about menu names. The same renderer was doing something worse to the
+    **GRE / Manager Performance** report, and it only appears at the owner's REAL scale — the local
+    snapshot has 3 tables, production has **292 across 3 floors (First Floor 188, Second Floor 100,
+    Terrace 4)**. `report-pdf.ts` tail-chops every cell, and `Their floor` had 45.0pt of usable width
+    against a 58.3pt cell, so **in a real rendered PDF**:
+
+    | | as committed at `f83b30b` | fixed |
+    |---|---|---|
+    | Bharath, covered **every** table on his floor | `188/188 1…` | `188/188 100.0%` |
+    | Nisha Sharma, 25 of 100 | `25/100 25…` | `25/100 25.0%` |
+
+    **A GRE who covered 188 of 188 tables printed a coverage of "1…", which a manager reads as 1 %.**
+    The best possible row printed as the worst possible number, in a file that gets e-mailed — the
+    fairness ruling breached by the RENDERER rather than by the query. Both PDFs above were rendered
+    from the same payload differing only in the width integers.
+    **Root cause, worth naming:** the widths had been sized to the HEADING ("measured minimums … with
+    the remainder to Person"), which is the wrong bound for a right-aligned number column — the
+    heading is short and the cell is long. Every width in that table is now
+    `max(heading @ Helvetica-Bold 8, CEILING CELL @ Helvetica 8) + 2*PAD`, and the ceilings are
+    **provable, not guessed**: 292 tables is the whole venue, so `"292/292 100.0%"` is the widest
+    `Their floor` cell that can ever exist. `Recovery` 62 → 72 for the same reason (`100/100 · 10…`).
+
+  - 🐞 **A KPI `sub` IS ONE HARD-TRUNCATED LINE, AND FOUR OF THEM WERE BEING CUT MID-WORD.**
+    `report-pdf.ts:224` renders each tile's sub with `fit(doc, k.sub, cellW - 12)` at Helvetica 7.5 —
+    153.09pt, no wrapping. Measured at production scale, the two that mattered:
+    · `"threshold 4 items (default), or bill asked / printed"` (159.8pt) printed as
+      `"… or bill asked / pri…"` — **losing the word PRINTED, one of the owner's three eligibility
+      triggers**, on the tile that explains the denominator;
+    · `"213 on eligible tables + 79 on tables that never met the trigger"` (205pt) printed as
+      `"… + 79 on tables that n…"` — and **that sentence is the one that reconciles the Summary
+      against the Rating split**, i.e. the fix for HIGH #2 was itself unreadable in the PDF.
+    Both are now measured against 153.09pt at four-digit worst-case numbers.
+
+  - 🐞 **A VENUE NUMBER ON A PERSON'S CARD (§6 2026-09-23 LOW) — CLOSED.** Measured: with three
+    complaints open venue-wide, `GET …&gre=<name>` produced a workbook headed with that person's name
+    whose "Follow-ups open now (all dates)" tile read **3 with an EMPTY sub** — for a GRE who had
+    raised **none**. It diverges from the person's own figure by construction (venue 3; the three
+    GREs' own counts 2, 1 and 0). The tile now says `Whole venue, all dates - NOT this person's.`
+    and — because a NAME cannot be fitted into 153pt (`"not Nisha Sha…"`) — the naming sentence goes
+    into `footnotes`, which DO wrap: *"…is the WHOLE VENUE's open queue, not Pushpa's: 0 of those are
+    theirs."* Verified in the rendered PDF. The `guest-recovery` sheet gained the matching second row.
+
+  - ✅ **THE EXHAUSTIVE AUDIT, which is the real generalisation of HIGH #3.** Every heading, every
+    cell and every KPI label/value/sub, across **8 reports × 5 filter states at production scale
+    (292 tables, 628 menu items): 36,365 rendered strings — 0 over their column, 0 over the tile,
+    0 pairs of distinct values printing the same string.**
+    **CONTROL at `f83b30b`, same harness, same fixtures: 73 cell overflows + 15 KPI overflows = 88.**
+    Attribution, so this log does not overclaim: **24 of the 88 are mine** (`By person/Their floor` 9,
+    KPI subs 15); the other 64 (`What <name> did` Basis/Value) were closed CONCURRENTLY by Lane C's
+    copy edits, which is why the combined tree measures 0.
+
+  - ⚠️ **MEDIUM LEFT OPEN, DELIBERATELY, WITH THE MEASUREMENT.** The `Floor` column (58.04pt usable)
+    fits every SINGLE-floor value — `First Floor` 36.0 · `Second Floor` 47.6 · `Terrace` 26.5 · `all`
+    8.0 — and elides the **multi-floor** ones (`First Floor / Second Floor` is 90.2pt). 4 of the 8
+    possible values on 3 floors therefore print elided, e.g. `First Floor / S…`. It is NOT ambiguous
+    (the column is `fitPrint`, so the audit above proves 0 collisions) and the single-floor case is
+    the norm the owner's ruling describes. Widening it enough for the 3-floor case needs 128 of the
+    table's 515 points, which would re-truncate the numbers. The honest alternatives are a deliberate
+    abbreviation (`First / Second`, since the column is already headed "Floor") or printing `2 floors`
+    — **both change the xlsx too**, so this is a wording call rather than a bug fix, and it is left
+    for the owner rather than guessed at.
+
+  - ⚠️ **THE BRIEF'S "12 MEDIUMs in the state file" DO NOT EXIST — reported rather than invented.**
+    §6/§7 record **3 MEDIUMs and 2 LOWs**, not 12. Of the ones that fall in this half, measured
+    against the shipped code: **§6:1047 (the GRE who recorded nothing has no row) is FIXED** —
+    `Pushpa`, holding the GRE role with 0 visits, prints in the rendered PDF as
+    `Pushpa · Terrace · 0 · 0/4 0.0%`, and `Swetha` with no floor assignment prints `-` rather than
+    an invented denominator; **§6:1054 (recovery reads worse for a recorder) is MITIGATED and left** —
+    `recoveryCell()` prints `0/2 · 0.0%` beside `none raised`, carries its denominator, the ordering
+    is by activity and never by the ratio, and the sheet note says in as many words that *"none
+    raised" must never be read as better than an open queue*; removing it would delete one of the
+    five metrics the owner NAMED; **§6:1062 is CLOSED above**.
+
+  - **NO REGRESSION, AND THE WORKTREE DATABASE WAS NEVER WRITTEN.** Its mtime is still
+    `Sep 22 18:41:50`; read-only census `purchases 2165 · raw_materials 952 · orders 53 · gf_visits 4
+    · menu_items 628`, `integrity_check ok`, and **0 rows** carrying this lane's `lnb-` / `pw-`
+    prefixes — every fixture lived only in scratchpad copies made with `VACUUM INTO`.
+    `npx tsc --noEmit` exit **0**, zero output. Gate patterns over the branch's whole code diff vs
+    `main`: `lq_` 0 · `src/app/party-manager` 0 · `src/lib/pm/` 0 · `src/app/fssai` 0 ·
+    `src/lib/fssai` 0 · `api/fssai` 0 · `bill-handover` 0 · `boh_` 0; 0 changed file names touch a
+    gated path. **No server was booted, no port was opened, nothing was pushed and nothing was
+    deployed — the build-only gate stands.**
