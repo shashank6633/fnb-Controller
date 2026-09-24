@@ -1204,16 +1204,48 @@ export function summariseFssaiRun(
  *     than the target so a stubborn photograph is not lost, and low enough that
  *     the base64 request body (~4/3 of this, ~533 KB, plus JSON) is barely half
  *     of nginx's real limit. ONE photograph per request, always.
- *   · the per-answer and per-run counts exist because §7 Q13 is undecided:
- *     photographs live in-row as TEXT, so 4 a day is ~365 MB a year in a
- *     database file that is 15 MB today. A cap the owner can see beats silent
- *     growth he cannot.
+ *   · the per-answer and per-run counts bound the rate: photographs live in-row
+ *     as TEXT, so 4 a day is ~365 MB a year in a database file that is 15 MB
+ *     today. A cap the owner can see beats silent growth he cannot.
+ *
+ * §7 Q13 IS NO LONGER UNDECIDED — the owner ruled on 2026-09-25: "in-row,
+ * 12-month retention window." The caps above bound the RATE; the window below
+ * bounds the TOTAL, so the file reaches a steady state instead of growing
+ * forever. See FSSAI_PHOTO_RETENTION_MONTHS.
  */
 export const FSSAI_PHOTO_TARGET_BYTES = 250 * 1024;
 export const FSSAI_PHOTO_MAX_BYTES = 400 * 1024;
 export const FSSAI_PHOTO_MAX_EDGE_PX = 1200;
 export const FSSAI_EVIDENCE_MAX_PER_ANSWER = 4;
 export const FSSAI_EVIDENCE_MAX_PER_RUN = 24;
+
+/**
+ * HOW LONG A PHOTOGRAPH'S IMAGE IS KEPT — owner §7 Q13, ruled 2026-09-25.
+ *
+ * "In-row, 12-month retention window. Keep photos full-size for 12 months, then
+ * drop the IMAGE but KEEP the record, the fact a photo existed, and its digest.
+ * Never delete the record."
+ *
+ * So this is a window on the IMAGE BYTES ONLY. After it passes, fssai_evidence
+ * still holds the row: which answer it belonged to, who attached it, when, the
+ * filename, the mime, the original size, and the sha256 of the image that was
+ * there. An inspector a year later can still see that a photograph was taken
+ * and what it hashed to — they simply cannot look at it any more.
+ *
+ * ⚠️ THE ROW IS NEVER DELETED, AND THAT IS NOT AN IMPLEMENTATION DETAIL. A
+ * deleted row would change the answer to "was there a photograph?" from "yes,
+ * and here is its fingerprint" to "no" — which on a food-safety record is the
+ * difference between evidence that aged out and evidence that never existed.
+ *
+ * Steady state at the caps above: 24 photographs per run at 400 KB is at most
+ * ~9.4 MB per run of image, and only the last 12 months of runs hold any image
+ * at all. Nothing is dropped until the sweep runs — see
+ * sweepFssaiPhotoRetention in src/lib/fssai-retention.ts, WHICH IS NOT YET
+ * ARMED. Until somebody calls it, this constant describes an intention and the
+ * file keeps growing; the sweep's own comment says so plainly rather than
+ * letting a reader assume a cron exists.
+ */
+export const FSSAI_PHOTO_RETENTION_MONTHS = 12;
 
 /** The only image types a data: URI may carry into fssai_evidence. */
 export const FSSAI_PHOTO_MIMES: readonly string[] = ['image/jpeg', 'image/png', 'image/webp'];

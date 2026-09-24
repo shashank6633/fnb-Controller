@@ -5,6 +5,7 @@ import {
   evaluateFssaiAnswer, qtypeMeta,
   FSSAI_EVIDENCE_MAX_PER_ANSWER, FSSAI_EVIDENCE_MAX_PER_RUN,
   FSSAI_PHOTO_MAX_BYTES, FSSAI_PHOTO_TARGET_BYTES, FSSAI_PHOTO_MIMES,
+  FSSAI_PHOTO_RETENTION_MONTHS,
   fssaiBytesLabel, parseFssaiDataUri,
 } from '@/lib/fssai';
 import {
@@ -12,6 +13,7 @@ import {
   parseJsonArray, str, canSeeFssaiRun, fssaiEvidenceCountsByQuestion, fssaiAnswerComplete,
   recomputeFssaiAnsweredCount,
 } from '@/lib/fssai-server';
+import { fssaiImageDigest } from '@/lib/fssai-retention';
 
 /**
  * THE PHOTOGRAPH ON A CHECK (/api/fssai/evidence) — P3.
@@ -60,7 +62,17 @@ import {
  *    So: a data URI over FSSAI_PHOTO_MAX_BYTES is refused HERE, in words, well
  *    inside that limit, and the runner compresses to ~250 KB before it ever
  *    posts (§7 Q13 — photographs live in-row as TEXT, which is what every other
- *    image store in this app does; a retention window is still the owner's call).
+ *    image store in this app does).
+ * 5. EVERY IMAGE IS FINGERPRINTED ON THE WAY IN, AND THE FINGERPRINT OUTLIVES IT.
+ *    Owner §7 Q13 (ruled 2026-09-25): "in-row, 12-month retention window" — the
+ *    image is kept full-size for twelve months, then dropped, while the ROW, the
+ *    fact a photograph existed, and its sha256 are kept for ever. So this route
+ *    writes `digest_sha256` at upload (it can never be computed afterwards), and
+ *    GET reports `image_available:false` with `code:'image_aged_out'` in words
+ *    rather than handing back an empty data_uri for a screen to render as a
+ *    broken image. The sweep itself is `sweepFssaiPhotoRetention` in
+ *    src/lib/fssai-retention.ts — ⚠️ WHICH IS NOT ARMED: this branch has no
+ *    scheduler, so nothing drops anything until somebody calls it.
  */
 export const dynamic = 'force-dynamic';
 
@@ -82,7 +94,18 @@ export const dynamic = 'force-dynamic';
  * shared rather than re-written here.
  */
 
+/**
+ * The metadata every list returns — now including whether the IMAGE is still
+ * here (owner §7 Q13, the 12-month window).
+ *
+ * `image_available` is computed once, HERE, rather than left to each screen to
+ * infer from an empty data_uri. The distinction it carries is not cosmetic: on a
+ * food-safety record, "there is no photograph" and "the photograph aged out
+ * after twelve months, and here is its fingerprint" are different statements,
+ * and a screen that cannot tell them apart will make the first one for you.
+ */
 function metaOf(row: any) {
+  const droppedAt = String(row.image_dropped_at || '');
   return {
     id: row.id,
     run_id: row.run_id,
@@ -95,6 +118,11 @@ function metaOf(row: any) {
     caption: row.caption,
     created_by: row.created_by,
     created_at: row.created_at,
+    // The fingerprint outlives the picture. '' on a row attached before the
+    // digest column existed — reported as '' and never as a hash of nothing.
+    digest_sha256: String(row.digest_sha256 || ''),
+    image_dropped_at: droppedAt,
+    image_available: !droppedAt,
   };
 }
 
@@ -119,7 +147,22 @@ export async function GET(request: Request) {
       if (!run || !canSeeFssaiRun(me, run)) {
         return Response.json({ error: 'That check belongs to another department.' }, { status: 403 });
       }
-      return Response.json({ evidence: { ...metaOf(row), data_uri: row.data_uri } });
+      /* THE IMAGE MAY HAVE AGED OUT — owner §7 Q13. Saying so in words, with a
+       * code and the digest, rather than handing back `data_uri: ''` for a
+       * viewer to render as a broken <img>. The row is still here and still
+       * proves a photograph was taken; only the picture is gone, and the caller
+       * is told which of those two things it is looking at. 200, not 404: the
+       * attachment EXISTS, and a 404 would say it never did. */
+      if (String(row.image_dropped_at || '')) {
+        return Response.json({
+          evidence: { ...metaOf(row), data_uri: '' },
+          image_available: false,
+          code: 'image_aged_out',
+          message:
+            `This photograph was kept for ${FSSAI_PHOTO_RETENTION_MONTHS} months and the image has since been removed. The record of it stays: it was ${fssaiBytesLabel(Number(row.size_bytes) || 0)}, attached by ${row.created_by || 'a member of staff'} on ${String(row.created_at || '').slice(0, 10)}.`,
+        });
+      }
+      return Response.json({ evidence: { ...metaOf(row), data_uri: row.data_uri }, image_available: true });
     }
 
     /* ── every attachment on one run, WITHOUT the images ────────────────────── */
@@ -132,7 +175,8 @@ export async function GET(request: Request) {
     }
     const rows = db.prepare(
       `SELECT e.id, e.run_id, e.response_id, e.kind, e.filename, e.mime, e.size_bytes, e.caption,
-              e.created_by, e.created_at, r.question_id AS question_id
+              e.created_by, e.created_at, e.digest_sha256, e.image_dropped_at,
+              r.question_id AS question_id
          FROM fssai_evidence e LEFT JOIN fssai_responses r ON r.id = e.response_id
         WHERE e.run_id = ? ORDER BY e.created_at ASC`,
     ).all(runId) as any[];
@@ -148,6 +192,10 @@ export async function GET(request: Request) {
         target_bytes: FSSAI_PHOTO_TARGET_BYTES,
         max_bytes_label: fssaiBytesLabel(FSSAI_PHOTO_MAX_BYTES),
         mimes: FSSAI_PHOTO_MIMES,
+        /* Owner §7 Q13. Sent so a screen can tell somebody how long the picture
+         * will be there BEFORE they rely on it being there for ever — the record
+         * and the digest are permanent, the image is not. */
+        retention_months: FSSAI_PHOTO_RETENTION_MONTHS,
       },
     });
   } catch (e: any) {
@@ -306,12 +354,22 @@ export async function POST(request: Request) {
     const filename = str(body?.filename).slice(0, 120) || `check-${new Date().toISOString().slice(0, 10)}.${mime.replace('image/', '')}`;
     const caption = str(body?.caption).slice(0, 400);
 
+    /* THE FINGERPRINT IS TAKEN NOW, WHILE THE BYTES ARE HERE — owner §7 Q13.
+     * After the 12-month window the image is dropped and this hash is the only
+     * thing left that identifies WHICH photograph was attached. It cannot be
+     * computed later from a row whose image has gone, which is exactly why it is
+     * not a backfillable column: rows attached before it existed keep '' and are
+     * reported as "no digest recorded" rather than being given one that was
+     * never checked against any image. */
+    const digest = fssaiImageDigest(dataUri);
+
     const attach = db.transaction(() => {
       db.prepare(
         `INSERT INTO fssai_evidence
-           (id, run_id, response_id, kind, data_uri, filename, mime, size_bytes, caption, created_by, outlet_id)
-         VALUES (?, ?, ?, 'photo', ?, ?, ?, ?, ?, ?, ?)`,
-      ).run(evidenceId, runId, response.id, dataUri, filename, mime, sizeBytes, caption, me.email || '', outletId);
+           (id, run_id, response_id, kind, data_uri, filename, mime, size_bytes, caption, created_by, outlet_id,
+            digest_sha256)
+         VALUES (?, ?, ?, 'photo', ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(evidenceId, runId, response.id, dataUri, filename, mime, sizeBytes, caption, me.email || '', outletId, digest);
 
       // RULE 3 — re-judge THIS answer with the photograph counted. Without this a
       // photo question keeps the "No photograph attached" failure it was frozen
@@ -351,6 +409,9 @@ export async function POST(request: Request) {
         after: {
           run_id: runId, response_id: response.id, question_id: response.question_id,
           mime, size_bytes: sizeBytes, filename,
+          // In the append-only log too, so the fingerprint survives in two
+          // places once the image itself is dropped (§7 Q13).
+          digest_sha256: digest,
         },
         actor: { email: me.email, name: me.name }, outlet_id: outletId,
       });
@@ -360,7 +421,8 @@ export async function POST(request: Request) {
 
     const row = db.prepare(
       `SELECT e.id, e.run_id, e.response_id, e.kind, e.filename, e.mime, e.size_bytes, e.caption,
-              e.created_by, e.created_at, r.question_id AS question_id
+              e.created_by, e.created_at, e.digest_sha256, e.image_dropped_at,
+              r.question_id AS question_id
          FROM fssai_evidence e LEFT JOIN fssai_responses r ON r.id = e.response_id
         WHERE e.id = ?`,
     ).get(evidenceId) as any;

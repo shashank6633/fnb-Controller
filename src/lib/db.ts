@@ -8636,7 +8636,43 @@ const FSSAI_TABLE_DDL: string[] = [
    *    task_files BLOB route (risk R7).
    *    response_id is plain TEXT with NO FK so it can be '' for run-level
    *    evidence (an FK column may not default to ''); run_id keeps its FK so
-   *    evidence can never be orphaned. */
+   *    evidence can never be orphaned.
+   *
+   *    ── THE 12-MONTH RETENTION WINDOW (owner §7 Q13, ruled 2026-09-25) ──────
+   *    "In-row, 12-month retention window." Photographs stay full-size for 12
+   *    months; after that the IMAGE is dropped and THE ROW STAYS — so the record
+   *    still says a photograph was taken, who took it, when, how big it was and
+   *    what it hashed to. The record is never deleted. That keeps the
+   *    single-file backup habit (one .db file is still the whole file) while
+   *    stopping 4 photos a day from becoming ~365 MB a year of TEXT.
+   *
+   *    The two columns that make it possible, both added here rather than in a
+   *    migration because the FSSAI SHAPE GUARD below ALTERs in any declared
+   *    column that is merely missing (both are NOT NULL with a CONSTANT default,
+   *    which is exactly the case ALTER accepts):
+   *
+   *      digest_sha256    — sha256 of the DECODED image bytes, written at upload.
+   *                         This is what survives the image. '' on a row stored
+   *                         before this column existed: those are honestly
+   *                         reported as "no digest was recorded", never as a
+   *                         digest of nothing. NOT backfilled — a digest can only
+   *                         be computed from bytes that are still there, and
+   *                         inventing one later would be a fact about an image
+   *                         nobody checked.
+   *      image_dropped_at — when the sweep removed the image. '' = the image is
+   *                         still here. This is the ONE flag every reader uses to
+   *                         tell "no photograph" apart from "the photograph has
+   *                         aged out", which are completely different statements
+   *                         about a food-safety record.
+   *
+   *    ⚠️ WHAT THE SWEEP MUST NEVER TOUCH, and why this is load-bearing:
+   *    computeFssaiSheetDigest (fssai-server.ts) hashes evidence as
+   *    (id, response_id, mime, size_bytes) — deliberately NOT data_uri. So
+   *    clearing data_uri leaves every sheet digest bit-identical and every
+   *    signature still covering its sheet. Change any of those FOUR columns in
+   *    the sweep and you silently invalidate the signature on every aged record
+   *    in the file. size_bytes in particular keeps the ORIGINAL size after the
+   *    drop; it is not reset to 0. */
   `CREATE TABLE IF NOT EXISTS fssai_evidence (
     id          TEXT PRIMARY KEY,
     run_id      TEXT NOT NULL,
@@ -8650,6 +8686,8 @@ const FSSAI_TABLE_DDL: string[] = [
     created_by  TEXT NOT NULL DEFAULT '',
     outlet_id   TEXT NOT NULL DEFAULT '',
     created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    digest_sha256    TEXT NOT NULL DEFAULT '',  -- sha256 of the decoded image; outlives the image
+    image_dropped_at TEXT NOT NULL DEFAULT '',  -- '' = image still stored; else when retention dropped it
     FOREIGN KEY (run_id) REFERENCES fssai_runs(id)
   );`,
 
@@ -8799,6 +8837,12 @@ const FSSAI_INDEX_DDL: string[] = [
   `CREATE INDEX IF NOT EXISTS idx_fssai_responses_q    ON fssai_responses(question_id)`,
   `CREATE INDEX IF NOT EXISTS idx_fssai_evidence_run   ON fssai_evidence(run_id)`,
   `CREATE INDEX IF NOT EXISTS idx_fssai_evidence_resp  ON fssai_evidence(response_id)`,
+  /* The retention sweep asks exactly one question — "which stored images are
+   * older than the window?" — so it gets a PARTIAL index over just those rows.
+   * Once a row's image has been dropped it leaves the index entirely, so the
+   * sweep's cost falls to the number of images still held rather than the number
+   * of photographs ever taken. */
+  `CREATE INDEX IF NOT EXISTS idx_fssai_evidence_retain ON fssai_evidence(created_at) WHERE data_uri <> ''`,
   // a run may be verified exactly once; a 'rejected' row may still be added
   `CREATE UNIQUE INDEX IF NOT EXISTS uq_fssai_approvals_verified ON fssai_approvals(run_id) WHERE decision = 'verified'`,
   `CREATE INDEX IF NOT EXISTS idx_fssai_approvals_run  ON fssai_approvals(run_id)`,
