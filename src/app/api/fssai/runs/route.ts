@@ -13,7 +13,8 @@ import {
   requireFssaiUser, fssaiAudit, fssaiAuditBestEffort, fssaiAppAudit, parseJsonArray,
   shapeQuestion, str, constraintMessage, FSSAI_NO_MATCH,
   readFssaiRecordSnapshot, writeFssaiRecordSnapshot, fssaiSignatureState, signFssaiRun,
-  type FssaiRecordSnapshotQuestion,
+  raiseFssaiCorrectiveActions, readFssaiCorrectiveActions,
+  type FssaiRecordSnapshotQuestion, type FssaiCaRaised,
 } from '@/lib/fssai-server';
 
 /**
@@ -248,6 +249,11 @@ export async function GET(request: Request) {
           answered_across_versions: asRecorded ? !!asRecorded.answered_across_versions : null,
           template_version_now: tpl ? tpl.version : null,
           edited_since: !!tpl && Number(tpl.version) !== Number(run.template_version),
+          /* WHAT WAS RAISED AGAINST THIS RECORD (owner Q14). Carried on the
+           * record itself so somebody opening a failed check sees the follow-up
+           * and its state there, rather than having to know that a separate
+           * queue exists. */
+          corrective_actions: readFssaiCorrectiveActions(db, id),
         });
       }
 
@@ -655,8 +661,11 @@ export async function POST(request: Request) {
        * but an answer already given is part of the record and is counted.
        */
       const liveQuestions = db.prepare(
+        // raise_ca_on_fail / ca_severity are selected because the corrective
+        // action is raised from THIS list (owner Q14) — the same list the verdict
+        // is built from, so an action can only follow a failure that counted.
         `SELECT id, is_required, is_critical, prompt, qtype, allow_na, photo_rule, note_rule,
-                section_id, sort_order
+                section_id, sort_order, raise_ca_on_fail, ca_severity
            FROM fssai_questions
           WHERE template_id = ? AND is_active = 1 ORDER BY sort_order ASC`,
       ).all(run.template_id) as any[];
@@ -672,7 +681,7 @@ export async function POST(request: Request) {
       if (answeredElsewhereIds.length) {
         const rows = db.prepare(
           `SELECT id, is_required, is_critical, prompt, qtype, allow_na, photo_rule, note_rule,
-                  section_id, sort_order
+                  section_id, sort_order, raise_ca_on_fail, ca_severity
              FROM fssai_questions
             WHERE id IN (${answeredElsewhereIds.map(() => '?').join(',')})`,
         ).all(...answeredElsewhereIds) as any[];
@@ -688,6 +697,9 @@ export async function POST(request: Request) {
             id: qid, is_required: 0, is_critical: 0, prompt: r.prompt_snapshot || '(question removed)',
             qtype: r.qtype, allow_na: 1, photo_rule: 'never', note_rule: 'never',
             section_id: null, sort_order: r.sort_order ?? 0,
+            // Nothing survives to say this question wanted a corrective action,
+            // so it does not claim one. An honest 0, not a guess.
+            raise_ca_on_fail: 0, ca_severity: 'medium',
           });
         }
       }
@@ -840,6 +852,9 @@ export async function POST(request: Request) {
         };
       });
 
+      // Filled inside the transaction below; read after it commits, so the
+      // response can only name actions that are actually in the file.
+      let raisedActions: FssaiCaRaised[] = [];
       const submit = db.transaction(() => {
         /* THE ONE-TAP SIGN, inside the same transaction as the freeze, so the
          * digest covers the sheet exactly as it is about to be recorded and the
@@ -922,6 +937,32 @@ export async function POST(request: Request) {
           { email: me.email, name: me.name },
           run.outlet_id,
         );
+
+        /* ── CORRECTIVE ACTIONS — owner Q14, and the whole of it ─────────────
+         * LAST inside the transaction, after the record is frozen, so an action
+         * can never exist against a record that was not recorded.
+         *
+         * It is raised from `judged` — the same list the verdict was built from,
+         * live questions plus any retired mid-round — so an action can only
+         * follow a failure that COUNTED. And it reads `is_fail` off the frozen
+         * response rather than re-judging anything.
+         *
+         * THE FAILURE STANDS. Nothing in here touches this run: the summary
+         * above is already written, and raiseFssaiCorrectiveActions writes to
+         * one table only. The action is the follow-up hanging off the failure,
+         * never a way of undoing it. */
+        raisedActions = raiseFssaiCorrectiveActions(db, {
+          runId,
+          run: {
+            business_date: run.business_date, department_id: run.department_id,
+            equipment_id: run.equipment_id, target_label: run.target_label,
+            shift: run.shift, outlet_id: run.outlet_id,
+          },
+          questions: judged,
+          templateName: String(tpl.name ?? ''),
+          actor: { email: me.email, name: me.name },
+          outletId: run.outlet_id || outletId,
+        });
       });
       try { submit(); } catch (e: any) {
         if (String(e?.message) === 'FSSAI_RUN_ALREADY_SUBMITTED') {
@@ -948,6 +989,11 @@ export async function POST(request: Request) {
         // without a second request.
         signature: signatureForRecord,
         awaiting_verification: !!Number(tpl.requires_verification),
+        /* WHAT NOW HAS TO BE FIXED (owner Q14). Said in the submit response so
+         * the phone can tell the person before they put it down — an action
+         * nobody hears about until somebody opens a queue is an action that sits
+         * there. The record's own verdict is unchanged by any of these. */
+        corrective_actions: raisedActions,
       });
     }
 

@@ -9,6 +9,7 @@ import {
 import {
   requireFssaiUser, fssaiCsrfGuard, fssaiAudit, fssaiAppAudit, str,
   canSeeFssaiRun, readFssaiRecordSnapshot, readFssaiSignature, computeFssaiSheetDigest,
+  readFssaiCorrectiveActions,
 } from '@/lib/fssai-server';
 
 /**
@@ -156,6 +157,13 @@ export async function GET(request: Request) {
         approvals,
         signature,
         signature_intact: signature ? signature.sheet_digest === digestNow.digest : null,
+        /* THE FOLLOW-UP, ON THE RECORD ITSELF (owner Q14). A supervisor deciding
+         * whether to verify a FAILED check needs to see what was raised against
+         * it and whether it has been fixed — that is the question an inspector
+         * asks about a failure, more than the failure itself. Read-only here:
+         * this route writes nothing to fssai_corrective_actions, and verifying a
+         * record neither closes nor alters an action hanging off it. */
+        corrective_actions: readFssaiCorrectiveActions(db, runId),
         requires_verification: Number(run.requires_verification) ? 1 : 0,
         // '' means this person may decide. Anything else is the sentence to show.
         can_verify: refusal === '',

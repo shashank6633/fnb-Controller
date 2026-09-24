@@ -1531,6 +1531,250 @@ export function fssaiVerifyRefusal(
 }
 
 /* ------------------------------------------------------------------ *
+ * 12b. CORRECTIVE ACTIONS — the owner's §7 Q14 ruling, in vocabulary
+ * ------------------------------------------------------------------ */
+
+/**
+ * WHAT Q14 ASKED AND WHAT THE OWNER ANSWERED.
+ *
+ * A cold room reads 9 °C at closing. The record is submitted and it FAILS. The
+ * engineer mends it. The 11 pm re-check is refused — the slot is closed by the
+ * failed record — so the only exit in the build was a manager VOIDING a true
+ * observation to make room for a better number, and the file then read
+ * "voided fail + fresh pass" instead of the true story.
+ *
+ * THE RULING: **corrective action against the failed record.** In his words:
+ *
+ *   "The failure STANDS. The fix and its verification hang off it via
+ *    fssai_corrective_actions. NO change to the slot rule, no 'rejected'
+ *    status, no voiding a true observation."
+ *
+ * Everything below follows from that one sentence, and so does one thing that
+ * is NOT below: there is no vocabulary here for un-failing anything. A
+ * corrective action cannot alter a run's status, its outcome, its pass_pct or
+ * any answer on it, and the route that owns these rows holds no write against
+ * fssai_runs or fssai_responses at all. A verified corrective action means the
+ * fix was done and checked — never that the check passed after all.
+ */
+export type FssaiCaStatus = 'open' | 'in_progress' | 'done' | 'verified' | 'cancelled';
+
+/**
+ * The five states, in the order an action moves through them.
+ *
+ * 'done' vs 'verified' is the pair that matters and they are deliberately not
+ * one state: 'done' is the person who did the work saying what they did, and
+ * 'verified' is somebody else agreeing it was enough. An FSSAI file where those
+ * are the same act, by the same person, proves nothing — which is exactly why
+ * the run's own verification has the §7 Q3 rule, and why this one does too.
+ *
+ * 'cancelled' is the ONLY way out that is not a fix, it needs a written reason,
+ * and it does not remove the row: the failed check keeps pointing at it.
+ * (The schema comment also lists 'void' from the P1 spine; nothing writes it —
+ * 'cancelled' is the one closing-without-a-fix state — and a legacy row
+ * carrying it still renders, as "Cancelled", through fssaiCaStatusMeta.)
+ */
+export const FSSAI_CA_STATUSES: readonly FssaiStatusMeta[] = [
+  { key: 'open', label: 'Open', color: 'bg-red-100 text-red-700 border-red-200' },
+  { key: 'in_progress', label: 'Being fixed', color: 'bg-amber-100 text-amber-800 border-amber-200' },
+  { key: 'done', label: 'Fixed — to check', color: 'bg-blue-100 text-blue-700 border-blue-200' },
+  { key: 'verified', label: 'Fixed and checked', color: 'bg-emerald-100 text-emerald-700 border-emerald-200' },
+  { key: 'cancelled', label: 'Cancelled', color: 'bg-slate-100 text-slate-600 border-slate-200' },
+] as const;
+
+export function fssaiCaStatusMeta(key: string | null | undefined): FssaiStatusMeta {
+  const k = String(key || '');
+  // 'void' is the P1 spine's synonym for a closed-without-a-fix row. Nothing
+  // writes it; a row that already carries it must still render as something.
+  if (k === 'void') return { key: 'void', label: 'Cancelled', color: 'bg-slate-100 text-slate-600 border-slate-200' };
+  return FSSAI_CA_STATUSES.find((s) => s.key === k)
+    ?? { key: k, label: k || 'Unknown', color: 'bg-slate-100 text-slate-600 border-slate-200' };
+}
+
+export function isFssaiCaStatus(v: string | null | undefined): v is FssaiCaStatus {
+  return FSSAI_CA_STATUSES.some((s) => s.key === String(v || ''));
+}
+
+/** An action that is finished one way or the other, and takes no more work. */
+export function fssaiCaIsClosed(status: string | null | undefined): boolean {
+  const s = String(status || '');
+  return s === 'verified' || s === 'cancelled' || s === 'void';
+}
+
+/**
+ * HOW SERIOUS. The admin sets it per question (`fssai_questions.ca_severity`),
+ * and the vocabulary is the Task Manager's TASK_PRIORITIES verbatim — low /
+ * medium / high / urgent — because the schema comment says so and because the
+ * fix is eventually meant to become a task in the list staff already use. A
+ * second private word-list for the same idea is how two screens end up
+ * disagreeing about the same action.
+ */
+export type FssaiCaSeverity = 'low' | 'medium' | 'high' | 'urgent';
+
+export const FSSAI_CA_SEVERITIES: readonly FssaiStatusMeta[] = [
+  { key: 'low', label: 'Low', color: 'bg-slate-100 text-slate-600 border-slate-200' },
+  { key: 'medium', label: 'Medium', color: 'bg-blue-100 text-blue-700 border-blue-200' },
+  { key: 'high', label: 'High', color: 'bg-orange-100 text-orange-700 border-orange-200' },
+  { key: 'urgent', label: 'Urgent', color: 'bg-red-100 text-red-700 border-red-200' },
+] as const;
+
+export function fssaiCaSeverityMeta(key: string | null | undefined): FssaiStatusMeta {
+  return FSSAI_CA_SEVERITIES.find((s) => s.key === String(key || ''))
+    ?? { key: 'medium', label: 'Medium', color: 'bg-blue-100 text-blue-700 border-blue-200' };
+}
+
+export function isFssaiCaSeverity(v: string | null | undefined): v is FssaiCaSeverity {
+  return FSSAI_CA_SEVERITIES.some((s) => s.key === String(v || ''));
+}
+
+/**
+ * HOW LONG AN ACTION GETS BEFORE IT IS LATE — PROVISIONAL DEFAULT, the owner
+ * has not ruled. It is a default and not a rule: a manager can set any due date
+ * on the action, and the number below is only what it starts with, so nobody
+ * has to type a date for the common case. Change these four numbers to change
+ * the defaults; no other code reads them.
+ */
+export const FSSAI_CA_DUE_DAYS: Readonly<Record<FssaiCaSeverity, number>> = {
+  urgent: 0,   // the same day — an urgent food-safety failure is not a tomorrow job
+  high: 1,
+  medium: 3,
+  low: 7,
+};
+
+/** YYYY-MM-DD n days after the given date. '' if the date is not a real one. */
+export function addDaysISO(iso: string, days: number): string {
+  if (!isISODate(iso) || !Number.isFinite(days)) return '';
+  const [y, m, d] = iso.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d + Math.trunc(days)));
+  return `${dt.getUTCFullYear()}-${String(dt.getUTCMonth() + 1).padStart(2, '0')}-${String(dt.getUTCDate()).padStart(2, '0')}`;
+}
+
+/** The date an action of this severity is due, counting from the business date. */
+export function fssaiCaDueDate(severity: string | null | undefined, fromISO: string): string {
+  const key = (isFssaiCaSeverity(severity) ? severity : 'medium') as FssaiCaSeverity;
+  return addDaysISO(fromISO, FSSAI_CA_DUE_DAYS[key]);
+}
+
+/** The shape every screen and route reads an action through. */
+export interface FssaiCaActor {
+  status?: string | null;
+  owner_email?: string | null;
+  completed_by?: string | null;
+  due_date?: string | null;
+  run_recorded_by?: string | null;
+}
+
+/**
+ * IS IT LATE? Only an action still needing work can be — a verified or
+ * cancelled one is finished, and calling a finished action "3 days overdue"
+ * on a compliance screen is a lie that makes the whole list untrustworthy.
+ */
+export function fssaiCaIsOverdue(ca: FssaiCaActor | null | undefined, todayISO: string): boolean {
+  if (!ca || fssaiCaIsClosed(ca.status)) return false;
+  const due = String(ca.due_date || '');
+  if (!isISODate(due) || !isISODate(todayISO)) return false;
+  return daysBetweenISO(due, todayISO) > 0;
+}
+
+/**
+ * MAY THIS PERSON RECORD WHAT WAS DONE? — '' if they may, the sentence to show
+ * if they may not.
+ *
+ * PROVISIONAL DEFAULT (the owner has not ruled on this half): the assigned
+ * owner, any management, or — while the action is still unassigned — anybody
+ * who can see it. The last clause is deliberate: an unassigned action nobody is
+ * allowed to touch is an action that never gets done, and the row records
+ * `completed_by` whoever they were, so the file still names them. Assigning an
+ * owner narrows it immediately.
+ */
+export function fssaiCaCompleteRefusal(
+  me: FssaiActor | null | undefined,
+  ca: FssaiCaActor | null,
+): string {
+  if (!me) return 'Sign in required';
+  if (!ca) return 'That corrective action no longer exists.';
+  const status = String(ca.status || '');
+  if (status === 'verified') return 'That action has already been fixed and checked.';
+  if (status === 'cancelled' || status === 'void') return 'That action was cancelled, so there is nothing to record against it.';
+  const mine = String(me.email || '').trim().toLowerCase();
+  const owner = String(ca.owner_email || '').trim().toLowerCase();
+  const isMgmt = me.role === 'admin' || me.role === 'manager' || !!me.is_head_chef;
+  if (isMgmt || !owner || (mine && mine === owner)) return '';
+  return 'This action is assigned to somebody else. Ask them to record what they did, or ask a manager to reassign it.';
+}
+
+/**
+ * MAY THIS PERSON CHECK THE FIX? — '' if they may, the sentence if they may not.
+ *
+ * THREE REFUSALS, AND EACH ONE IS THE POINT OF HAVING THE STATE AT ALL:
+ *   1. Management only. Checking a food-safety fix is a supervisory act.
+ *   2. NEVER the person who recorded the fix. Otherwise 'done' and 'verified'
+ *      are one act wearing two names.
+ *   3. NEVER the person who recorded the failed check. This is the assumption
+ *      the module has been carrying in words since P1 ("the person who recorded
+ *      a check may not be the person who verifies the fix") and it is enforced
+ *      here rather than left as a note on a screen. It is REVERSIBLE — delete
+ *      the third block below — but a food-safety record where the finder of the
+ *      fault also signs off its repair is worth very little.
+ */
+export function fssaiCaVerifyRefusal(
+  me: FssaiActor | null | undefined,
+  ca: FssaiCaActor | null,
+): string {
+  if (!me) return 'Sign in required';
+  if (!ca) return 'That corrective action no longer exists.';
+  const status = String(ca.status || '');
+  if (status === 'verified') return 'That action has already been checked.';
+  if (status === 'cancelled' || status === 'void') return 'That action was cancelled, so there is nothing to check.';
+  if (status !== 'done') {
+    return 'Nobody has written down what was done yet, so there is nothing to check. The fix has to be recorded first.';
+  }
+  const isMgmt = me.role === 'admin' || me.role === 'manager' || !!me.is_head_chef;
+  if (!isMgmt) return 'Only a manager or an administrator can check that a fix was enough.';
+  const mine = String(me.email || '').trim().toLowerCase();
+  const fixer = String(ca.completed_by || '').trim().toLowerCase();
+  if (mine && fixer && mine === fixer) {
+    return 'You recorded this fix yourself, so somebody else has to check it.';
+  }
+  const finder = String(ca.run_recorded_by || '').trim().toLowerCase();
+  if (mine && finder && mine === finder) {
+    return 'You recorded the check that failed, so somebody else has to check the fix.';
+  }
+  return '';
+}
+
+/** MAY THIS PERSON ASSIGN, REOPEN OR CANCEL AN ACTION? Management only. */
+export function canManageFssaiCa(me: FssaiActor | null | undefined): boolean {
+  if (!me) return false;
+  return me.role === 'admin' || me.role === 'manager' || !!me.is_head_chef;
+}
+
+/**
+ * AN ANSWER AS A PERSON READS IT, from the FROZEN response row and nothing else.
+ *
+ * Shared because a corrective action quotes the answer that caused it, and the
+ * wording on the action must be the same wording the record shows — "Soiled" on
+ * the sheet and "Soiled" in the action, never "Soiled" in one and "fail" in the
+ * other. The order of the tests matters: `is_na` wins over everything (a
+ * not-applicable answer has no value to print), and the boolean is read before
+ * the number because a Yes/No answer carries 1/0 in value_bool, which would
+ * otherwise print as "1".
+ */
+export function fssaiAnswerInWords(r: {
+  is_na?: unknown; value_bool?: unknown; value_num?: unknown; value_text?: unknown;
+} | null | undefined): string {
+  if (!r) return '—';
+  if (Number(r.is_na)) return 'Not applicable';
+  if (r.value_bool !== null && r.value_bool !== undefined && String(r.value_bool) !== '') {
+    return Number(r.value_bool) ? 'Yes' : 'No';
+  }
+  if (r.value_num !== null && r.value_num !== undefined && String(r.value_num) !== '') {
+    return String(r.value_num);
+  }
+  if (r.value_text) return String(r.value_text);
+  return '—';
+}
+
+/* ------------------------------------------------------------------ *
  * 13. SMALL SHARED HELPERS
  * ------------------------------------------------------------------ */
 

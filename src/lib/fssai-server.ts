@@ -25,6 +25,8 @@ import { getDb, generateId, logAuditEvent } from '@/lib/db';
 import { getCurrentUser, isManagement, type SessionUser } from '@/lib/auth';
 import {
   canAuthorFssai, evaluateFssaiAnswer, qtypeMeta, fssaiSignatureModeFrom,
+  fssaiAnswerInWords, fssaiCaDueDate, fssaiCaIsOverdue, fssaiCaSeverityMeta,
+  fssaiCaStatusMeta, fssaiToday, isFssaiCaSeverity,
   type FssaiSignature, type FssaiSignatureMode,
 } from '@/lib/fssai';
 
@@ -752,6 +754,306 @@ export function signFssaiRun(
     actor, outlet_id: outletId || run.outlet_id || '',
   });
   return signature;
+}
+
+/* ------------------------------------------------------------------ *
+ * CORRECTIVE ACTIONS — owner §7 Q14
+ * ------------------------------------------------------------------ */
+
+/**
+ * THE GAP THIS CLOSES, MEASURED BEFORE THE FIX.
+ *
+ * `fssai_questions.raise_ca_on_fail` has existed since P1. The admin can switch
+ * it on per question, the builder shows it (`settings/checklists/[id]`), the
+ * templates and questions routes store it and read it back — and it was read by
+ * NOTHING that runs a check. Zero references in `api/fssai/runs/route.ts`.
+ * `fssai_corrective_actions` was written by no route at all: an empty table with
+ * a unique index on a number nothing minted.
+ *
+ * That is the inert-guard shape exactly: a setting that reads correctly, saves
+ * correctly, displays correctly and NEVER FIRES. An admin who ticked "raise a
+ * corrective action if this fails" got a tick mark and no corrective action.
+ *
+ * ── THE RULE THIS CODE EXISTS TO KEEP (owner Q14) ───────────────────────────
+ * THE FAILURE STANDS. Raising an action must not — and here cannot — change
+ * anything about the record that caused it. This function writes to exactly one
+ * table. There is no UPDATE of fssai_runs, no UPDATE of fssai_responses, no
+ * touch of status, outcome, pass_pct, fail_count or is_fail anywhere below.
+ * Grep this section for `fssai_runs` and the only hit is the SELECT that reads
+ * who recorded the check.
+ */
+
+/** 'CA-2026-0001' — the human-facing key, on the PINV / GRN / PROD model. */
+export function nextFssaiCaNumber(db: Database.Database, isoDate: string): string {
+  const year = /^\d{4}-/.test(String(isoDate || '')) ? String(isoDate).slice(0, 4) : String(new Date().getFullYear());
+  // The house allocator (purchases/route.ts:587, returns.ts:155): MAX of the
+  // numeric tail within the year's prefix. Called inside the caller's
+  // transaction, so two checks submitted at the same moment cannot both read the
+  // same MAX — and uq_fssai_ca_number is the backstop if they ever do.
+  const last = db.prepare(
+    `SELECT MAX(CAST(substr(ca_number, length('CA-' || ? || '-') + 1) AS INTEGER)) AS n
+       FROM fssai_corrective_actions WHERE ca_number LIKE 'CA-' || ? || '-%'`,
+  ).get(year, year) as any;
+  return `CA-${year}-${String((Number(last?.n) || 0) + 1).padStart(4, '0')}`;
+}
+
+/** One question as the raiser needs to see it — live or retired mid-run. */
+export interface FssaiCaRaiseQuestion {
+  id: string;
+  prompt?: string | null;
+  raise_ca_on_fail?: unknown;
+  ca_severity?: string | null;
+  is_critical?: unknown;
+}
+
+/** What was raised, so the submit response can say so out loud. */
+export interface FssaiCaRaised {
+  id: string;
+  ca_number: string;
+  question_id: string;
+  response_id: string;
+  title: string;
+  severity: string;
+  due_date: string;
+}
+
+/**
+ * RAISE AN ACTION FOR EVERY FAILED ANSWER WHOSE QUESTION ASKS FOR ONE.
+ *
+ * Called from inside the submit transaction, after the run row has been frozen,
+ * so an action can never exist against a record that was not recorded.
+ *
+ * WHICH ANSWERS COUNT. The caller passes the questions the round was JUDGED on
+ * — the live ones PLUS any retired while the round was open — which is the same
+ * list the verdict is built from. A question switched off mid-round whose answer
+ * still counts as a failure still raises its action: the failure is in the
+ * record, so the follow-up belongs in the file too. A question row that has
+ * vanished entirely is rebuilt by the caller with `raise_ca_on_fail` unset,
+ * which reads as 0 — the honest answer, since nothing survives to say otherwise.
+ *
+ * `is_fail` is read STRAIGHT OFF THE FROZEN RESPONSE and never recomputed
+ * (RECON §10 R3). An action is raised because the record says the answer failed,
+ * not because this code re-judged it.
+ *
+ * IDEMPOTENT ON (run_id, response_id). Submit is status-guarded and runs once,
+ * so this should never fire twice — but an action is a job somebody has to do,
+ * and two of them for one failure is a real cost to a real person.
+ *
+ * BEST-EFFORT, DELIBERATELY, AND HERE IS THE TRADE. It is wrapped so a failure
+ * to raise cannot roll back the submit: §7 Q4 says never lose a check a member
+ * of staff really did, and a chef who has finished a round must not be told
+ * "could not submit" because a follow-up row would not insert. The consequence
+ * is stated rather than hidden — the action is missing, the FAILURE IS STILL
+ * THERE ON THE RECORD in red, and the audit row below is what a reader checks.
+ * Nothing about the record's own truth depends on this succeeding.
+ */
+export function raiseFssaiCorrectiveActions(
+  db: Database.Database,
+  input: {
+    runId: string;
+    run: {
+      business_date?: string | null;
+      department_id?: string | null;
+      equipment_id?: string | null;
+      target_label?: string | null;
+      shift?: string | null;
+      outlet_id?: string | null;
+    };
+    questions: FssaiCaRaiseQuestion[];
+    templateName?: string | null;
+    actor: { email?: string | null; name?: string | null };
+    outletId?: string | null;
+  },
+): FssaiCaRaised[] {
+  const { runId, run, questions, actor } = input;
+  const raised: FssaiCaRaised[] = [];
+  const wanted = questions.filter((q) => Number(q.raise_ca_on_fail) === 1);
+  if (!wanted.length) return raised;
+
+  try {
+    const responses = db.prepare(
+      `SELECT id, question_id, prompt_snapshot, qtype, value_text, value_num, value_bool,
+              is_na, is_fail, uom, note
+         FROM fssai_responses WHERE run_id = ?`,
+    ).all(runId) as any[];
+    const byQ = new Map(responses.map((r) => [String(r.question_id), r]));
+    const outletId = input.outletId || run.outlet_id || '';
+    const businessDate = String(run.business_date || '');
+    const where = [String(run.target_label || ''), String(run.shift || '')].filter(Boolean).join(' · ');
+
+    for (const q of wanted) {
+      const r = byQ.get(String(q.id));
+      if (!r || !Number(r.is_fail)) continue;   // no answer, or it did not fail
+
+      const already = db.prepare(
+        `SELECT id FROM fssai_corrective_actions WHERE run_id = ? AND response_id = ? LIMIT 1`,
+      ).get(runId, String(r.id)) as any;
+      if (already) continue;
+
+      const prompt = String(q.prompt ?? r.prompt_snapshot ?? '').trim() || '(question removed)';
+      const severity = isFssaiCaSeverity(q.ca_severity) ? q.ca_severity : 'medium';
+      const answer = fssaiAnswerInWords(r);
+      const uom = String(r.uom || '').trim();
+      const id = generateId();
+      const caNumber = nextFssaiCaNumber(db, businessDate);
+
+      /* THE DESCRIPTION IS THE EVIDENCE, WRITTEN ONCE AND FROZEN. Whoever picks
+       * this action up days later may not be able to open the record — they may
+       * not even be in the right department — so the answer that caused it,
+       * where it was taken and on what date travel WITH the action. */
+      const description = [
+        `${prompt} — recorded as “${answer}${uom ? ` ${uom}` : ''}”, which failed.`,
+        input.templateName ? `Checklist: ${input.templateName}.` : '',
+        businessDate ? `Recorded for ${businessDate}${where ? ` (${where})` : ''}.` : '',
+        String(r.note || '').trim() ? `Note on the answer: “${String(r.note).trim()}”` : '',
+      ].filter(Boolean).join(' ');
+
+      db.prepare(
+        `INSERT INTO fssai_corrective_actions
+           (id, ca_number, source_kind, run_id, response_id, equipment_id, department_id,
+            title, description, severity, status, owner_email, due_date, created_by, outlet_id)
+         VALUES (?, ?, 'run', ?, ?, ?, ?, ?, ?, ?, 'open', '', ?, ?, ?)`,
+      ).run(
+        id, caNumber, runId, String(r.id),
+        String(run.equipment_id || ''), String(run.department_id || ''),
+        // The question IS the title. Inventing a summary here would put words on
+        // a compliance record that no one wrote.
+        prompt.slice(0, 300),
+        description,
+        severity,
+        /* OWNER STARTS EMPTY, ON PURPOSE. There is no rule in this app that says
+         * who mends a fridge, and guessing one — the department head, the person
+         * who found it — would put a name on a job they never accepted. The queue
+         * shows an unassigned action as needing an owner, and until one is set
+         * anybody who can see it may record the fix (fssaiCaCompleteRefusal). */
+        fssaiCaDueDate(severity, businessDate || fssaiToday()),
+        actor.email || '',
+        outletId,
+      );
+
+      /* created_task_id is left '' and nothing here writes it. The P1 spine says
+       * the fix eventually becomes a row in the EXISTING Task Manager rather than
+       * a second to-do list; that link is not built, and an empty column is an
+       * honest "not yet" where a fabricated task id would be a lie a screen would
+       * then try to follow. */
+
+      fssaiAuditBestEffort(db, {
+        entity_table: 'fssai_corrective_actions', entity_id: id, action: 'create',
+        after: {
+          ca_number: caNumber, run_id: runId, response_id: String(r.id),
+          question_id: String(q.id), severity, status: 'open', title: prompt.slice(0, 300),
+        },
+        reason: `Raised automatically: this answer failed and the question is set to raise a corrective action.`,
+        actor, outlet_id: outletId,
+      });
+
+      raised.push({
+        id, ca_number: caNumber, question_id: String(q.id), response_id: String(r.id),
+        title: prompt.slice(0, 300), severity,
+        due_date: fssaiCaDueDate(severity, businessDate || fssaiToday()),
+      });
+    }
+  } catch (e) {
+    // See the contract above: the record is already true without this.
+    console.error('raiseFssaiCorrectiveActions failed (the record stands):', e);
+  }
+  return raised;
+}
+
+/** One corrective action, shaped the single way every screen reads it. */
+export function shapeFssaiCa(row: any) {
+  return {
+    id: String(row.id),
+    ca_number: String(row.ca_number || ''),
+    source_kind: String(row.source_kind || 'run'),
+    run_id: row.run_id ? String(row.run_id) : '',
+    response_id: String(row.response_id || ''),
+    question_id: String(row.question_id || ''),
+    equipment_id: String(row.equipment_id || ''),
+    department_id: String(row.department_id || ''),
+    department_name: String(row.department_name || ''),
+    title: String(row.title || ''),
+    description: String(row.description || ''),
+    root_cause: String(row.root_cause || ''),
+    severity: String(row.severity || 'medium'),
+    severity_label: fssaiCaSeverityMeta(row.severity).label,
+    status: String(row.status || 'open'),
+    status_label: fssaiCaStatusMeta(row.status).label,
+    owner_email: String(row.owner_email || ''),
+    due_date: String(row.due_date || ''),
+    action_taken: String(row.action_taken || ''),
+    completed_at: String(row.completed_at || ''),
+    completed_by: String(row.completed_by || ''),
+    verified_by: String(row.verified_by || ''),
+    verified_at: String(row.verified_at || ''),
+    verify_note: String(row.verify_note || ''),
+    void_reason: String(row.void_reason || ''),
+    voided_by: String(row.voided_by || ''),
+    voided_at: String(row.voided_at || ''),
+    created_by: String(row.created_by || ''),
+    created_at: String(row.created_at || ''),
+    updated_at: String(row.updated_at || ''),
+    is_overdue: fssaiCaIsOverdue(
+      { status: row.status, due_date: row.due_date },
+      fssaiToday(),
+    ),
+    /* THE RECORD IT HANGS OFF, carried on every row so a list can say what
+     * failed without a second request — and so a reader can always get back to
+     * the check itself, which is the whole point of the link. */
+    run: row.run_id
+      ? {
+        id: String(row.run_id),
+        business_date: String(row.run_business_date || ''),
+        shift: String(row.run_shift || ''),
+        target_label: String(row.run_target_label || ''),
+        status: String(row.run_status || ''),
+        outcome: String(row.run_outcome || ''),
+        recorded_by: String(row.run_recorded_by || ''),
+        recorded_name: String(row.run_recorded_name || ''),
+        template_name: String(row.template_name || ''),
+      }
+      : null,
+    /** The FROZEN answer that caused it, when the response row is still there. */
+    answer: row.response_id
+      ? {
+        prompt: String(row.answer_prompt || ''),
+        text: fssaiAnswerInWords({
+          is_na: row.answer_is_na, value_bool: row.answer_value_bool,
+          value_num: row.answer_value_num, value_text: row.answer_value_text,
+        }),
+        uom: String(row.answer_uom || ''),
+        note: String(row.answer_note || ''),
+      }
+      : null,
+  };
+}
+
+/** The SELECT every corrective-action read shares, so no two lists disagree. */
+export const FSSAI_CA_SELECT = `
+  SELECT c.*,
+         d.name  AS department_name,
+         r.business_date AS run_business_date, r.shift AS run_shift,
+         r.target_label  AS run_target_label,  r.status AS run_status,
+         r.outcome       AS run_outcome,
+         r.recorded_by   AS run_recorded_by,   r.recorded_name AS run_recorded_name,
+         t.name          AS template_name,
+         resp.question_id AS question_id,
+         resp.prompt_snapshot AS answer_prompt, resp.uom AS answer_uom,
+         resp.note AS answer_note, resp.is_na AS answer_is_na,
+         resp.value_bool AS answer_value_bool, resp.value_num AS answer_value_num,
+         resp.value_text AS answer_value_text
+    FROM fssai_corrective_actions c
+    LEFT JOIN fssai_runs      r    ON r.id = c.run_id
+    LEFT JOIN fssai_templates t    ON t.id = r.template_id
+    LEFT JOIN departments     d    ON d.id = c.department_id
+    LEFT JOIN fssai_responses resp ON resp.id = c.response_id`;
+
+/** Every action hanging off one record, oldest first. */
+export function readFssaiCorrectiveActions(db: Database.Database, runId: string) {
+  const rows = db.prepare(
+    `${FSSAI_CA_SELECT} WHERE c.run_id = ? ORDER BY c.created_at ASC, c.rowid ASC`,
+  ).all(runId) as any[];
+  return rows.map(shapeFssaiCa);
 }
 
 /* ------------------------------------------------------------------ *
