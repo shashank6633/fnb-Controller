@@ -1736,3 +1736,119 @@ supported, clear status indicators, sticky Submit. Minimal typing.
   - **GATES.** `npx tsc --noEmit` exit **0**, zero diagnostics, on `224a22d`. `git status` clean
     apart from this entry. `/Users/shashankreddy/Desktop/Claude/fnb-controller` never touched. No
     port bound, no server, no Browser pane. BUILD ONLY — nothing deployed.
+
+- **2026-09-24 — P5 PROBE `the-two-pages-agree` (read-only; NOTHING in `src/` was changed).** ONE
+  claim: *Pages 3 and 4 tell the same story, and every exported file agrees with itself.* Measured
+  against `224a22d`; `015cf42` landed mid-lane and touches **only this file**, so every number below
+  stands at both commits (`git diff --stat 224a22d 015cf42` = 1 file, the log).
+
+  - **METHOD — NO SERVER, PORT 3948 NEVER OPENED** (0 listeners, 0 `next dev` / `next-server`
+    processes for the whole lane). `sync.sh` copies the 17 shipped files (`lib/feedback/{reporting,
+    read,zones,labels,access,session,pos-readonly}.ts`, `lib/{feedback,kot-section,hr,hr-attendance,
+    report-pdf}.ts` and all 5 `api/feedback` route files) into a scratch tree rewriting **only
+    module specifiers**, and ASSERTS every differing line contains `from '` — **17 files, 86
+    differing lines, 86 of them import lines, 0 others**, so no behavioural edit can hide in the
+    harness. `@/lib/db` and `@/lib/auth` are the only stubs; `session.ts` + `access.ts` are the
+    SHIPPED gate. The same script run over `git show 715f604:…` builds the CONTROL, so every
+    "before" number is measured, not quoted. DB via `VACUUM INTO` only (`purchases` 2165 ·
+    `raw_materials` 952 · `menu_items` 628 · `integrity_check ok`).
+  - **FIXTURES `tp-`, the owner's shape:** 3 floors / 7 sections (FA FB FBR SA SB SO TC) + one
+    UNZONED table that renders as `Floor`, 14 tables, 23 orders over **three business days**, 11
+    visits, 4 GRE-role holders (Anita = First Floor · Bela = Second Floor · Chitra = UNASSIGNED ·
+    **Silent Gre = Terrace, records nothing**) + 1 Manager recorder. Deliberate edges: a table
+    seated TWICE in one service, an eligible-by-bill-only table, a **visited-but-never-eligible**
+    table, a voided order, a takeaway, an order whose table row is gone, and an order with a
+    **blank `server_name`**. Re-stamped into the current business day on every invocation.
+  - ✅ **(1) THE TWO PAGES AGREE — 54 of 54.** 3 business days × 9 filter states (none · each of the
+    4 floors incl. `Floor` · each captain · two floor+captain pairs), comparing `eligible`,
+    `taken`, `coverage_pct`, `feedbacks_recorded`, `extra_visits` AND the whole per-person block
+    (14 fields × every person on either page): **0 disagreements, 0 people on one page only.**
+    Headline, no filters: **D0 `13 eligible / 7 taken / 53.8 %` · 8 recorded · 1 extra** on BOTH.
+    **CONTROL at `715f604`, same fixtures: 3 of 18 filter states DISAGREE** — `14/8/57.1 %` on
+    Page 3 against `13/7/53.8 %` on Page 4 (First Floor `7/5/71.4 %` vs `6/4/66.7 %`; Cap A
+    `7/6/85.7 %` vs `6/5/83.3 %`). Page 4's numbers are IDENTICAL at both commits, so **Page 3 is
+    the page that changed and Page 4's definition was the right one** — measured, not asserted.
+  - ✅ **(2) THE 04:00 BUSINESS DAY, ORDER BY ORDER.** `tp-o-18` opened 23:10 IST on D-1 and
+    **settled 01:30 IST on D-0** — both pages file it under D-1. `tp-o-19`, created **02:15 IST on
+    the D-0 calendar date**, likewise D-1. Carried-over complaints: D-0 carries `tp-o-21` (from
+    D-2) and `tp-o-20` (from D-1), D-1 carries `tp-o-21`, D-2 carries none — and the carried rows
+    move **neither** page's denominator (D-1 `3/2/66.7 %`, D-2 `10/4/40 %`, both pages).
+  - ✅ **(3) EVERY EXPORT RECONCILES WITH ITSELF — 56 workbooks, 1,679 invariant comparisons, 0
+    contradictions.** Parsed with **openpyxl**, never eyeballed. 8 reports × 4 filter states, plus a
+    zero-row state, plus the 628-item run. Ten invariant families: Summary `Feedbacks recorded` ==
+    the Rating-split **Total** row == the sum of its rating rows; Share sums to 100.0 %; the
+    coverage basis `A of B` matches the `Eligible tables` KPI and re-derives the printed %; the
+    `A on eligible + B on others` sub adds up; `By day` Σeligible/Σtaken == the Summary and every
+    row's own % and `taken ⊆ eligible`; Service recovery == the Summary's counts and its R/R/R sub;
+    `By person` ΣRaised/ΣCompleted == the Summary and every Recovery cell matches its own row;
+    Menu-item ΣSold/ΣNegative/Σ(Ret+Rem) == the Summary and every `Neg %` re-derives; Most-complained
+    ⊆ Menu-item analysis with identical figures. **CONTROL at `715f604`: 12 of 32 workbooks
+    contradict themselves** — `Summary feedbacks 7 but the Rating split accounts for 8` (and 3/4,
+    4/5, 5/6, 6/7, 14/15), with the Share column summing to **112.5 %** and **106.7 %**.
+  - ✅ **(4) THE FILE AGREES WITH THE SCREEN — 24 comparisons, 0 disagreements.** The coverage in
+    `daily.xlsx` and `gre-performance.xlsx` equals the Tracker's for the same day and the same
+    filters. **CONTROL: 8 of 8 disagreed** at `715f604` — the file said `7/13 = 53.8 %` while the
+    screen said `8/14 = 57.1 %`, and under `&gre=Anita Rao` the file printed **`3/13 = 23.1 %`
+    coverage under her own name**. At `224a22d` the GRE-filtered file reads `7/13 = 53.8 %`,
+    identical to the unfiltered one.
+  - ✅ **(5) NO TWO DISTINCT MENU ITEMS PRINT AS THE SAME STRING — 628 of 628.** Every fitPrint
+    column of all 8 reports, measured with the RENDERER'S OWN pdfkit document at the shipped
+    geometry (A4, margin 40, PAD 4, Helvetica 8) over the 628 REAL names: **8 columns, 628/628
+    distinct, 0 overflow, 0 collisions.** In the narrowest real Item column (127.1 pt) **562 print
+    in full and 66 are shortened** — every one of them still distinct. **END TO END:** all 628 items
+    sold on one day, the real `menu-item` PDF rendered through the real route and read back with
+    `pdftotext` **and** `pdftohtml -xml`: **627 rows parsed, 627 distinct, 0 collisions.**
+    **CONTROL at `715f604`, the same PDF: 597 distinct — 28 printed strings swallowing 58 rows**,
+    including the brief's own `AG FORTYSEVEN CHAR…` twice and `BLACK TOWER PINOT N…` twice, with
+    144 rows carrying an ellipsis.
+  - ✅ **(6) REGRESSION.** `feedbackAccess()` over 11 personas: **5 of 5 GRE logins REFUSE analytics
+    (`management_only`)** and ALLOW pages 1-3; Captain `role_not_gre`; no role `no_role_assigned`;
+    signed out `signed_out`; Floor Manager / Manager ALLOW both. Through the REAL routes as an
+    assigned GRE: **16 of 16 report key × format combinations → 403**, `/analytics` 403
+    (`management_only`), `/tracker` 200, `/floor` 200, signed out 401, manager `/analytics` 200.
+    The POS read-only deny: **9 of 9 POS write paths refused with `feedback_read_only`** for the
+    assigned GRE, **0 of 9** for a Captain and for a Manager, and **0 GET paths** caught by the
+    write deny. All **5** `/api/feedback/*` route files export `GET` and nothing else;
+    `/api/feedback` is in `CSRF_REQUIRED_PREFIXES` (`proxy.ts:132`); zero SQL write verbs outside
+    comments in any of the module's 12 library/route files. **38 reads through every entry point
+    with the database open READ-WRITE left it byte-identical** — sha256 `d116e3c33a3773b7` before
+    and after, census `orders 76 · order_items 207 · Σqty 253 · visits 15 · item_fb 5 · follow_ups 5
+    · tables 29 · users 20 · purchases 2165 · raw_materials 952` unchanged, no `-wal` left behind.
+  - ✅ **GATES.** `npx tsc --noEmit` exit **0**, zero output. `npm run build` exit **0** (all 5
+    `/api/feedback/*` routes and all 5 `/feedback` pages built; the only "error" strings in the log
+    are the unrelated `/api/error-report` and `/settings/errors` route names). Over
+    `src/lib/feedback` + `src/app/api/feedback` + `src/app/feedback`: `lq_` 0 · `party-manager` 0 ·
+    `src/lib/pm/` 0 · `boh_` 0 · `bill-handover` 0 · `src/app/fssai` 0 · `src/lib/fssai` 0 ·
+    `api/fssai` 0. The worktree DB was never written by the lane OR by the build — sha
+    `7536e9e8d60f3836`, mtime still `Sep 22 18:41:50`, `-wal` 0 bytes.
+  - 🐞 **DEFECTS FOUND, NOTHING CHANGED (probe lane).**
+    1. **MEDIUM — `reporting.ts:643` + `:649` against `tracker/query.ts:674` + `:749`: the ONE
+       captain value Page 3 offers, Page 4 cannot match.** An order with a blank `server_name` is
+       bucketed by the Tracker as `—` and that string is in `options.captains`, which
+       `tracker/page.tsx:337` renders. Page 4 drops blanks from its own list (`.filter(Boolean)`)
+       and compares `o.captain === f.captain.trim()`, where `o.captain` is the raw trimmed
+       `server_name` — so `—` matches nothing. Measured on the same service: **Page 3 `captain=—`
+       shows 1 eligible table, 0 taken, 1 record; Page 4 shows 0 eligible and prints "Coverage -"**,
+       and the 31 KB `daily.xlsx` it builds is headed **`Captain: —`** with a `By day` row of
+       `0 / 0 / -`. The file is internally consistent, states its filter, and contradicts the screen.
+       **NOT theoretical: 11 of 48 dine-in orders in the real snapshot carry a blank `server_name`.**
+    2. **MEDIUM — `reports/route.ts:166`: two of the 628 names lose their final word ON THE PAGE.**
+       `printableLabels()` is given `widths[i] - PAD*2` and guarantees uniqueness at that budget,
+       but pdfkit's `text(..., {width, lineBreak:false})` lays the line out word by word and drops
+       the last one at near-zero slack. Measured against the rendered page with `pdftohtml -xml`:
+       626 of 628 labels are drawn verbatim; `JOHNNY WALKER…OND BOTTLE` (126.98 pt of a 127.07 pt
+       budget) is drawn as **`JOHNNY WALKER…OND`** and `SULA TROPICAL B… NASHIK BTL` (127.03 pt) as
+       **`SULA TROPICAL B… NASHIK`** — in both cases the word that distinguishes the bottle from the
+       measure. 15 labels sit within 1.0 pt of the budget, 0 are over it. **It does not break the
+       uniqueness promise today (0 collisions in 628), but the promise is enforced against a
+       measurement the renderer does not honour.** A real collision was NOT demonstrated — a
+       synthetic pair in the danger band could not be constructed by this lane, and that is reported
+       as measured, not implied.
+    3. **MEDIUM — `reporting.ts:1032`, the silent GRE is in Page 4's grid but not its dropdown.**
+       INDEPENDENTLY CONFIRMED: the `filter-still-answers-what-she-did` probe (`015cf42`) found the
+       same line with different fixtures. My measurement adds the cross-page half: **Page 3 offers
+       5 GRE names, Page 4 offers 3**, and the two missing are exactly the role holders who recorded
+       nothing (`Silent Gre`, `QA Gre`) — the row the module's own sheet note calls "the point of
+       this table". Typing the name still works (`&gre=Silent Gre` → person block PRESENT,
+       `kind: assigned`, `0/2 = 0 %` of her floor), and the person filter still moves no coverage
+       (`13/7/53.8 %` with and without a name), so this is reachability, not arithmetic.
