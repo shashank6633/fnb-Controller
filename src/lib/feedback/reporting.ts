@@ -818,6 +818,51 @@ export interface PersonScope extends GrePerformanceRow {
   coverage_basis: string;
 }
 
+/* ── 🔒 THE FAIRNESS RULING, ENFORCED BY THE COMPILER ────────────────────────
+   "The system should not judge GRE performance based on positive feedback. A
+   GRE should never avoid recording negative feedback because it affects their
+   performance."
+
+   The defence of that ruling is a NEGATIVE: this payload has 21 keys and not
+   one of them is a rating, a sentiment or a happiness count. A negative is the
+   easiest thing in a codebase to lose, because losing it looks like adding a
+   useful column. A comment saying "no rating here" cannot stop that; these
+   three lines can, and they cost nothing at runtime — they are types.
+
+   `npx tsc --noEmit` FAILS if a key is added, removed or renamed without the
+   list below being changed in the same edit, and fails outright if any key name
+   carries a sentiment word. Both halves were exercised, not assumed: adding
+   `guest_rating_avg` to PersonScope raises TS2344 on _KeysCarryNoSentiment, and
+   deleting one entry from the list raises TS2344 on _KeysAreExactly21.
+   If you are here because the build broke: adding a SENTIMENT key is the thing
+   the ruling forbids. Adding a WORK key (something the GRE did) is allowed —
+   put it in the list and change the 21. */
+type _True<T extends true> = T;
+type _Exact<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
+
+/** Every key of `PersonScope`, in declaration order. Length is the 21. */
+type PersonScopeKeys = [
+  'person_id', 'person', 'role', 'kind',
+  'tables_visited', 'taken', 'feedbacks_recorded',
+  'issues_recorded', 'follow_ups_raised', 'follow_ups_completed', 'follow_ups_open',
+  'recovery_pct', 'share_pct',
+  'area_zones', 'area_assigned', 'area_eligible', 'area_covered', 'area_coverage_pct',
+  'off_area_visits', 'area_label', 'coverage_basis',
+];
+
+/** A key whose NAME is about how the guest felt, rather than what the GRE did. */
+type SentimentWord =
+  | 'rating' | 'rated' | 'excellent' | 'good' | 'average' | 'poor' | 'unrated'
+  | 'happy' | 'unhappy' | 'negative' | 'positive' | 'sentiment' | 'score'
+  | 'star' | 'complaint' | 'comment';
+type CarriesSentiment<K extends string> =
+  K extends `${string}${SentimentWord}${string}` ? K : never;
+
+type _KeysAreExactly21 = _True<_Exact<keyof PersonScope, PersonScopeKeys[number]>>;
+type _CountIs21 = _True<_Exact<PersonScopeKeys['length'], 21>>;
+type _KeysCarryNoSentiment = _True<_Exact<CarriesSentiment<keyof PersonScope & string>, never>>;
+export type PersonScopeIsFair = [_KeysAreExactly21, _CountIs21, _KeysCarryNoSentiment];
+
 export const ISSUES_RECORDED_IS_NOT_A_PENALTY =
   'Issues Recorded counts complaints a GRE wrote down. It is a CREDIT, never a penalty: '
   + "the owner's ruling is that a GRE must never have a reason to avoid recording a complaint. "
@@ -860,10 +905,21 @@ export function recoveryCell(completed: number, raised: number): string {
  *  "What <name> did" sheet, where the column is a sentence wide. */
 export function recoveryLong(completed: number, raised: number): string {
   // Short on purpose: this string lands in the person sheet's Value column
-  // (73pt at the shipped weights) and a truncated explanation is worse than a
-  // brief one. The full reading is in RECOVERY_IS_A_QUEUE under the table.
+  // (115.9pt usable at the shipped weights) and a truncated explanation is
+  // worse than a brief one. The full reading is in RECOVERY_IS_A_QUEUE under
+  // the table.
   if (!raised) return 'none raised';
-  return `${pctText(rate(completed, raised))} - ${Math.round(completed)} of ${Math.round(raised)} closed`;
+  // 🐞 THE QUEUE LEADS. THE RATE FOLLOWS. This line used to read
+  // "0.0% - 0 of 2 closed", and it was the last place in the module where the
+  // RATIO came first. Everywhere else the queue leads - the tile prints `0/2`,
+  // the By person cell prints `0/2 · 0.0%` - and in a RIGHT-ALIGNED column the
+  // leading token is what the eye lands on. So the honest GRE's row opened with
+  // "0.0%" while the GRE who raised nothing opened with a word, which is the
+  // same misreading the dash used to cause, one step milder.
+  // Identical characters, identical width (measured: 70.70pt for "0 of 2
+  // closed - 0.0%", exactly what the old order measured), so nothing about the
+  // geometry moves - only what is read first.
+  return `${Math.round(completed)} of ${Math.round(raised)} closed - ${pctText(rate(completed, raised))}`;
 }
 
 export interface AnalyticsPayload {
@@ -1982,9 +2038,17 @@ export function buildReport(p: AnalyticsPayload, key: ReportKeyName): ReportDoc 
         ['Follow-ups raised', p.person.follow_ups_raised, 'Complaints they opened'],
         ['Follow-ups completed', p.person.follow_ups_completed, 'Owner metric: Follow-Ups Completed'],
         ['Follow-ups still open', p.person.follow_ups_open, 'A work queue, not a score'],
+        // The BASIS says it in words on the row itself, not only in the note
+        // under the table: a reader who scans the Value column and stops sees
+        // "none raised" beside the sentence that forbids reading it as a good
+        // score. Measured at the renderer's own LINE LAYOUT (not widthOfString
+        // - see labels.ts): 179.7pt into the 187.7pt Basis column, one line,
+        // no ellipsis.
         ['Guest recovery follow-up',
           recoveryLong(p.person.follow_ups_completed, p.person.follow_ups_raised),
-          'Completed / raised. A QUEUE, not a score.'],
+          p.person.follow_ups_raised
+            ? 'Completed / raised. A QUEUE, not a score.'
+            : 'Nothing to close - NOT better than an open queue.'],
       ] as (string | number)[][],
       note: `${ISSUES_RECORDED_IS_NOT_A_PENALTY} ${RECOVERY_IS_A_QUEUE} ${p.person.coverage_basis} `
         + 'Nothing in this sheet is a rating, and no other sheet in this file is about this person.',
