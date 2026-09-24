@@ -43,7 +43,77 @@
  * The xlsx path. A spreadsheet cell does not truncate, and putting an
  * abbreviated name into a file people sort, filter and VLOOKUP on would be a
  * worse bug than the one being fixed.
+ *
+ * ── AND THE WIDTH THAT HAD TO BE MEASURED DIFFERENTLY ───────────────────────
+ * See `layoutMeasure` below. "Fits" was being asked of `widthOfString`, and the
+ * renderer does not lay text out with `widthOfString`.
  */
+
+/* ── THE WIDTH THE PAGE HONOURS IS NOT THE WIDTH OF THE STRING ───────────────
+   🐞 MEASURED, 25-09: two of the 628 real menu names still lost their FINAL
+   WORD on the rendered page, and the final word is what told them apart:
+
+       "JOHNNY WALKER BLOND BOTTLE"  -> label "JOHNNY WALKER…OND BOTTLE"
+                                       page   "JOHNNY WALKER…OND"   (+ "BOTTLE"
+                                       pushed onto a second line, over the row
+                                       beneath it)
+       "SULA TROPICAL BRUT CREMANT DE NASHIK BTL" -> "…BTL" likewise lost.
+
+   Both labels PASSED the fit test: widthOfString was 126.976pt and 127.032pt
+   against a 127.073pt column. The renderer disagreed, and the renderer is right,
+   because `doc.text(s, x, y, { width })` never measures `s`. pdfkit builds a
+   LineWrapper whenever `width` is set — `lineBreak: false` does not turn it off
+   — and that wrapper measures WORD BY WORD: `wordWidth(word)` per chunk,
+   subtracted from `spaceLeft`.
+
+   Word-by-word is WIDER than the whole string, because Helvetica is an AFM font
+   with KERN PAIRS and `advancesForGlyphs` adds the pair's kern to the LEFT
+   glyph's advance. A kern that straddles a chunk boundary is therefore counted
+   when the string is measured whole and LOST when it is measured in pieces:
+
+       " " + "W"  = -0.32pt  ("JOHNNY |WALKER…OND |BOTTLE": sum 127.296 > 126.976)
+       " " + "T"  = -0.40pt  ("SULA |TROPICAL |B… |NASHIK |BTL": 127.432 > 127.032)
+
+   0.32pt of a word's tail is a whole word on the page, because the overflow is
+   all-or-nothing: the wrapper moves the entire word.
+
+   `layoutMeasure` closes it by charging back, once, every negative kern the
+   string contains — an UPPER BOUND on what any chunking can lose, which is a
+   stronger promise than matching pdfkit's current UAX-14 break points and does
+   not break if those move. It costs a fraction of a point of label length: the
+   count printed in full over the 628 real names is unchanged at 562.
+
+   It is composed here, not imported here: this file stays PURE (no pdfkit), so
+   the caller passes the renderer's own `widthOfString` and nothing can drift. */
+
+/**
+ * Wrap a raw width function (`doc.widthOfString`) into the width the RENDERER's
+ * line layout will actually consume. Never returns less than `width(s)`.
+ */
+export function layoutMeasure(width: (s: string) => number): (s: string) => number {
+  // kern(a,b) = width(ab) - width(a) - width(b). Single characters cannot kern
+  // with themselves, so the two subtrahends are kern-free by construction.
+  const kerns = new Map<string, number>();
+  const kern = (pair: string): number => {
+    let k = kerns.get(pair);
+    if (k === undefined) {
+      k = width(pair) - width(pair[0]) - width(pair[1]);
+      kerns.set(pair, k);
+    }
+    return k;
+  };
+  return (s: string): number => {
+    let lost = 0;
+    for (let i = 1; i < s.length; i++) {
+      const k = kern(s[i - 1] + s[i]);
+      // Only a NEGATIVE kern can be lost at a break (a positive one is already
+      // absent from the pieces' sum). A lone surrogate half measures as junk,
+      // which can only ADD here — it can never make the bound optimistic.
+      if (k < 0) lost -= k;
+    }
+    return width(s) + lost;
+  };
+}
 
 /** FNV-1a, base36, last 3 characters. Deterministic and stable across runs. */
 export function nameTag(s: string): string {

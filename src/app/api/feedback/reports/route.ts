@@ -45,7 +45,7 @@ import { getDb } from '@/lib/db';
 import { getCurrentOutletId } from '@/lib/auth';
 import { requireFeedbackAnalyst } from '@/lib/feedback/session';
 import { buildReportPdf, istStamp } from '@/lib/report-pdf';
-import { printableLabels } from '@/lib/feedback/labels';
+import { layoutMeasure, printableLabels } from '@/lib/feedback/labels';
 import {
   analytics, buildReport, filtersFromQuery, isReportKey, rangeForReport,
   type ReportDoc, type ReportTable,
@@ -156,7 +156,12 @@ async function pdfFor(doc: ReportDoc): Promise<Buffer> {
   const { default: PDFDocument } = await import('pdfkit');
   const probe = new PDFDocument({ size: 'A4', margin: 40 });
   probe.font('Helvetica').fontSize(8);
-  const measure = (s: string) => probe.widthOfString(s);
+  // NOT `widthOfString` on its own. `doc.text(s, x, y, { width })` lays text out
+  // WORD BY WORD, and word-by-word is wider than the whole string by whatever
+  // kern straddles a word boundary — which cost two real menu names their last
+  // word on the page while measuring as a fit. `layoutMeasure` charges that
+  // back; the long comment lives in labels.ts beside the arithmetic.
+  const measure = layoutMeasure((s: string) => probe.widthOfString(s));
 
   const fitted = doc.tables.map((t) => {
     const totalW = t.columns.reduce((sum, c) => sum + (Number(c.width) || 1), 0);
