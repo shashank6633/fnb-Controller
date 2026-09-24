@@ -1327,20 +1327,67 @@ export function fssaiSignatureStatement(custom?: string | null): string {
 
 /**
  * HOW THE ATTESTATION WAS OBTAINED. Recorded, rather than assumed, because the
- * two are not equally strong and a record must never claim the stronger one.
+ * three are not equally strong and a record must never claim a stronger one.
  *
- *   'explicit'  — the person pressed Sign (POST /api/fssai/sign), then submitted
- *                 as a separate act. If an answer changed in between, submit
- *                 refused until they signed again, having seen what changed.
- *   'on_submit' — the person pressed one button labelled "Sign and submit", with
- *                 the statement on screen above it. One tap, one act, no second
- *                 look at the sheet.
+ *   'explicit'   — the person pressed Sign (POST /api/fssai/sign), then submitted
+ *                  as a separate act. If an answer changed in between, submit
+ *                  refused until they signed again, having seen what changed.
+ *   'on_submit'  — the person pressed one button labelled "Sign and submit", with
+ *                  the statement on screen above it. One tap, one act, no second
+ *                  look at the sheet.
+ *   'not_asked'  — NOBODY PRESSED ANYTHING. The client submitted with no `sign`
+ *                  flag, the strict gate (FSSAI_REQUIRE_EXPLICIT_SIGNATURE) was
+ *                  off, so the server attested on its own. It is the weakest of
+ *                  the three and the only one where there was no act to
+ *                  repudiate, so it must never be dressed up as either of the
+ *                  others.
  *
- * Both are the authenticated user plus a server timestamp plus the digest. The
- * difference is only whether there was a separate moment of review, and the
- * verification screen says which in words so nobody has to infer it.
+ * ⚠️ THE THIRD VALUE IS WHY THIS IS AN ENUM AND NOT A BOOLEAN — owner Q17.
+ * Until 2026-09-25 the submit route hardcoded `'on_submit'` for every signature
+ * it wrote (`runs/route.ts:749`), so the un-asked case above was recorded, and
+ * PRINTED on /fssai/verification, as "signed by pressing “Sign and submit”" —
+ * a sentence describing a button nobody had pressed. The one-tap and two-step
+ * paths were already labelled correctly; only this third state was not, because
+ * the enum had nowhere to put it. Measured before the fix: 0 signatures existed
+ * on this branch, so nothing had to be re-labelled.
+ *
+ * All three are the authenticated user plus a server timestamp plus the digest
+ * (owner H-1: the signature IS the authenticated session). The difference is
+ * only what the person did, and the verification screen says which in words so
+ * nobody has to infer it.
  */
-export type FssaiSignatureMode = 'explicit' | 'on_submit';
+export type FssaiSignatureMode = 'explicit' | 'on_submit' | 'not_asked';
+
+/**
+ * READ A STORED MODE BACK WITHOUT EVER UPGRADING THE CLAIM.
+ *
+ * The mode is not a column — it lives inside the JSON of an append-only audit
+ * row (fssai-server.ts, FSSAI_SIGN_ACTION), so what comes back is `unknown` and
+ * has to be narrowed. The narrowing has one rule: WHEN IN DOUBT, THE WEAKER
+ * CLAIM. Both defaults below follow from it:
+ *
+ *   · ABSENT → 'explicit'. A signature written before the mode existed can only
+ *     have come from the sign route, which was the only path then. Reporting it
+ *     as anything else would invent a fact about a real person's act.
+ *   · PRESENT BUT UNRECOGNISED → 'not_asked'. A value from a newer build this
+ *     one does not understand. Collapsing it to 'explicit' — which is what the
+ *     old two-way narrowing did to EVERYTHING that was not 'on_submit' — would
+ *     silently promote an unknown act to the strongest of the three.
+ */
+export function fssaiSignatureModeFrom(v: unknown): FssaiSignatureMode {
+  const s = String(v ?? '').trim();
+  if (s === 'explicit' || s === 'on_submit' || s === 'not_asked') return s;
+  return s === '' ? 'explicit' : 'not_asked';
+}
+
+/** How a record should describe the way it was signed, in plain words. */
+export function fssaiSignatureModeLabel(mode: FssaiSignatureMode | null | undefined): string {
+  switch (fssaiSignatureModeFrom(mode)) {
+    case 'on_submit': return 'signed by pressing “Sign and submit”';
+    case 'not_asked': return 'attested on submission — nobody was asked to sign';
+    default: return 'signed as a separate step, then submitted';
+  }
+}
 
 /** The things a screen shows about a signature, in one shape. */
 export interface FssaiSignature {
@@ -1380,14 +1427,32 @@ export interface FssaiSignature {
  * by putting the server's own sentence and statement on screen with a button that
  * signs and submits again. So the only caller is ready for the gate.
  *
- * It is STILL false for one reason only, and it is a discipline one rather than a
- * design one: flipping it changes behaviour for the build the owner is about to
- * judge, and the isolated instance the ON position was proved in has been torn
- * down. Both positions were measured there — ON gives
- * `code:'signature_required'` for an unsigned submit, `code:'signature_stale'`
- * after an answer changes, and 200 for `{sign:true}` — so this is a one-word
- * change with its evidence already taken. Flip it once somebody can watch a real
- * phone do it.
+ * ══ THE OWNER RULED ON THIS — Q17, 2026-09-25. DO NOT RE-LITIGATE. ══════════
+ *
+ *   "Fix the mode label NOW; strict refusal AFTER one real run on the phone."
+ *
+ * So the LABEL half is done (see FssaiSignatureMode above: the un-asked case is
+ * now recorded and printed as 'not_asked', not as a button press), and this flag
+ * stays FALSE on purpose, with his reason written down rather than inferred:
+ *
+ *   THE SIGNATURE PATH HAS NEVER BEEN THROUGH A REAL BROWSER. Every proof of the
+ *   ON position was taken by HTTP against the route. The runner's sign UI is a
+ *   static audit only — no browser has hydrated it. Turning the refusal on means
+ *   that if the client's sign path has so much as a hydration bug, EVERY submit
+ *   is blocked, for every member of staff, in the middle of service, with no way
+ *   round it. An honest label costs nothing if it is wrong; a hard refusal on an
+ *   unexercised path costs a shift.
+ *
+ * ⚠️ FLIPPING IT IS A FIVE-SECOND CHANGE AND NOTHING ELSE HAS TO MOVE. Change
+ * `false` to `true` on the line below. Then:
+ *   · an unsigned submit answers `code:'signature_required'` (runs/route.ts:752);
+ *   · an answer changed after signing answers `code:'signature_stale'` (:766);
+ *   · `{sign:true}` submits 200 as it does today;
+ *   · the 'not_asked' mode becomes UNREACHABLE — `signNow === askedToSign` — so
+ *     no new record can be written in the weakest kind at all.
+ * The runner already handles both refusal codes (`run/[id]/page.tsx:593-599`),
+ * and both positions were measured on an isolated instance before it was torn
+ * down. Flip it once somebody has watched a real phone sign and submit once.
  */
 export const FSSAI_REQUIRE_EXPLICIT_SIGNATURE = false;
 

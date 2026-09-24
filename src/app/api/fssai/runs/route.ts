@@ -7,7 +7,7 @@ import {
   fssaiResponseAnswered, isFssaiBoolQType, fssaiBoolFromText, fssaiBoolWordsFor,
   fssaiDisplayReading, FSSAI_SIGNATURE_STATEMENT, fssaiSignatureStatement,
   FSSAI_REQUIRE_EXPLICIT_SIGNATURE,
-  type FssaiSlotRunRow,
+  type FssaiSlotRunRow, type FssaiSignatureMode,
 } from '@/lib/fssai';
 import {
   requireFssaiUser, fssaiAudit, fssaiAuditBestEffort, fssaiAppAudit, parseJsonArray,
@@ -746,7 +746,23 @@ export async function POST(request: Request) {
        * So the act is performed and its MODE is recorded, and every screen says
        * which kind of attestation it was. */
       const signNow = askedToSign || !FSSAI_REQUIRE_EXPLICIT_SIGNATURE;
-      const signMode: 'explicit' | 'on_submit' = 'on_submit';
+      /* WHICH KIND OF ATTESTATION THIS IS — owner Q17, and the record must say
+       * so honestly.
+       *
+       * This line was hardcoded `'on_submit'`. There are TWO ways to reach the
+       * sign call below, and only one of them is a button press:
+       *   · askedToSign  → the client showed the statement and the person tapped
+       *                    "Sign and submit". That is 'on_submit', and it was
+       *                    always correct.
+       *   · !askedToSign → nobody was asked ANYTHING. The strict gate is off, so
+       *                    the server attests by itself. Recording that as
+       *                    'on_submit' made /fssai/verification print "signed by
+       *                    pressing “Sign and submit”" about a button that was
+       *                    never on screen.
+       * The two-step path (POST /api/fssai/sign first) never reaches this line at
+       * all — its signature is carried in via signatureForRecord below and keeps
+       * the 'explicit' mode the sign route wrote. */
+      const signMode: FssaiSignatureMode = askedToSign ? 'on_submit' : 'not_asked';
       if (Number(tpl.requires_signature)) {
         const sig = fssaiSignatureState(db, runId);
         if (!sig.is_signed && !signNow) {

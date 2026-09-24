@@ -24,7 +24,7 @@ import type Database from 'better-sqlite3';
 import { getDb, generateId, logAuditEvent } from '@/lib/db';
 import { getCurrentUser, isManagement, type SessionUser } from '@/lib/auth';
 import {
-  canAuthorFssai, evaluateFssaiAnswer, qtypeMeta,
+  canAuthorFssai, evaluateFssaiAnswer, qtypeMeta, fssaiSignatureModeFrom,
   type FssaiSignature, type FssaiSignatureMode,
 } from '@/lib/fssai';
 
@@ -633,9 +633,18 @@ export function readFssaiSignature(db: Database.Database, runId: string): FssaiS
       sheet_digest: String(v.sheet_digest ?? ''),
       answers: Number(v.answers) || 0,
       photos: Number(v.photos) || 0,
-      // A signature written before the mode existed is reported as what it was:
-      // the explicit two-step act, which is the only kind that existed then.
-      mode: v.mode === 'on_submit' ? 'on_submit' : 'explicit',
+      /* NARROWED BY THE SHARED HELPER, NOT BY A TERNARY HERE.
+       *
+       * This line used to read `v.mode === 'on_submit' ? 'on_submit' : 'explicit'`,
+       * which collapsed EVERY other value — including any value added to the enum
+       * later — into 'explicit', the STRONGEST of the claims. Adding the
+       * 'not_asked' mode without touching this line would have written a
+       * signature saying "nobody was asked" and read it back as "signed as a
+       * separate step, then submitted". fssaiSignatureModeFrom keeps the two
+       * defaults that matter (absent → 'explicit' for a pre-mode row; present but
+       * unrecognised → the weakest) in one place, so the next value added to the
+       * enum cannot be silently promoted here. */
+      mode: fssaiSignatureModeFrom(v.mode),
     };
   } catch {
     return null;

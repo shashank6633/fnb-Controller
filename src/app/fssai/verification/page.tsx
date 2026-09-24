@@ -60,6 +60,7 @@ import { fmtIST, fmtISTDate } from '@/lib/format-date';
 import { ImageThumb } from '@/app/tasks/_components/ImageUpload';
 import {
   FSSAI_SHIFTS, fssaiBytesLabel, fssaiRunStatusMeta, qtypeMeta,
+  fssaiSignatureModeFrom, fssaiSignatureModeLabel,
   type FssaiSignature,
 } from '@/lib/fssai';
 
@@ -893,11 +894,25 @@ function SignatureBlock({
             <p className="text-xs text-[#6B5744] mt-0.5">
               {signature.signed_at ? fmtIST(signature.signed_at) : ''}
               {' · '}
-              {/* The two kinds are not equally strong, so the record says which. */}
-              {signature.mode === 'on_submit'
-                ? 'signed by pressing “Sign and submit”'
-                : 'signed as a separate step, then submitted'}
+              {/* The three kinds are not equally strong, so the record says which
+                * — in the SHARED words, so this screen and any report cannot
+                * describe the same signature differently. */}
+              {fssaiSignatureModeLabel(signature.mode)}
             </p>
+            {/* THE WEAKEST KIND IS NOT LEFT AS A PHRASE TO PARSE. When nobody was
+              * asked, a reader is told plainly that there was no act to
+              * repudiate — the sentence this build used to print here claimed a
+              * button press instead (owner Q17). */}
+            {fssaiSignatureModeFrom(signature.mode) === 'not_asked' && (
+              <p className="text-[11px] text-amber-800 mt-1 flex flex-nowrap items-start gap-1.5">
+                <Info size={12} className="shrink-0 mt-0.5" />
+                <span>
+                  Nobody was shown the statement and asked to sign this one. The system attested it
+                  when the check was submitted, so treat it as a record of <em>who submitted</em>,
+                  not of a signature anybody gave.
+                </span>
+              </p>
+            )}
             <p className="text-xs text-[#3D2614] mt-1 italic">“{signature.statement}”</p>
             <p className="text-[11px] text-[#8B7355] mt-1">
               Covering {signature.answers} answer{signature.answers === 1 ? '' : 's'}
