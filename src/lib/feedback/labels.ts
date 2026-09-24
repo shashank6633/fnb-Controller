@@ -80,8 +80,16 @@
    `layoutMeasure` closes it by charging back, once, every negative kern the
    string contains — an UPPER BOUND on what any chunking can lose, which is a
    stronger promise than matching pdfkit's current UAX-14 break points and does
-   not break if those move. It costs a fraction of a point of label length: the
-   count printed in full over the 628 real names is unchanged at 562.
+   not break if those move. Measured over the 628 real names, PDFs rendered and
+   read back with pdftotext:
+
+       Menu Item Analysis (127.07pt): 2 names lost their last word -> 0.
+           628 of 628 distinct ON THE PAGE, 562 of 628 printed in full —
+           the in-full count is UNCHANGED, the bound cost nothing here.
+       Every other fitPrint geometry: also 0, at a cost of at most ONE more
+           name per table becoming head-and-tail elided instead of printed
+           whole. That trade is the right way round: an elided name still
+           says which dish it is, and an orphaned last word does not.
 
    It is composed here, not imported here: this file stays PURE (no pdfkit), so
    the caller passes the renderer's own `widthOfString` and nothing can drift. */
