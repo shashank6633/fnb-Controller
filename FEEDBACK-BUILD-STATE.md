@@ -1647,3 +1647,92 @@ supported, clear status indicators, sticky Submit. Minimal typing.
     a person's floor coverage counts the visits **they** made, so a colleague covering a table on
     their floor lifts the room's figure but not theirs (Bela reads `2/4 = 50 %` on a floor where 3 of
     4 were covered, one by Anita). Neither breaches the ruling; both are wording/policy calls.
+
+- **2026-09-24 — P5 PROBE `filter-still-answers-what-she-did` (read-only; NOTHING in `src/` was
+  changed).** ONE question: *fixing fairness by gutting the person filter would not be a fix — does
+  the GRE filter still answer "what did this person DO", and can any combination bring the sentiment
+  judgement back?* Measured against `224a22d`; the six files under test (`reporting.ts`, `read.ts`,
+  `access.ts`, `zones.ts`, `labels.ts`, `tracker/query.ts`) were verified **byte-identical** to the
+  committed tree before every run.
+
+  - **METHOD — NO SERVER, NO PORT.** Load average was 29 at lane start, so nothing was booted: 0
+    `next dev` / `next-server` processes for the whole lane. `VACUUM INTO` snapshot (`purchases`
+    2165 · `raw_materials` 952 · `integrity_check ok`), then the SHIPPED `analytics()`,
+    `buildReport()`, `itemComments()`, `recoveryCell()` and `readTracker()` compiled to CommonJS
+    with `tsc` and called directly with a `better-sqlite3` handle; `@/lib/db` stubbed to
+    `generateId()` only. The **PRE-FIX build from `715f604`** was compiled the same way as a
+    CONTROL, so every "0" below is paired with the number the old code gave. The worktree DB was
+    opened read-only and never written — mtime still `Sep 22 18:41:50`, `-wal` 0 bytes.
+  - **FIXTURES — the owner's real shape.** 3 floors / **7 sections / 292 tables** (FA 58 · FB 70 ·
+    FBR 60 · SA 25 · SB 25 · SO 50 · TC 4), 29 dine-in orders over TWO business days, 18 visits, 4
+    GRE-role holders + 1 Manager, all ids `fp-`. Ambika = First Floor · Bhavna = Second Floor ·
+    Chandra = UNASSIGNED · **Divya holds the role and records nothing** · one table seated TWICE ·
+    two orders that never met the trigger · one eligible-by-bill-only order. ⚠️ TRAP FOR THE NEXT
+    LANE: `gf_item_feedback` has `UNIQUE(visit_id, order_item_id)`, so fixture rows written with a
+    blank `order_item_id` SILENTLY REPLACE each other (measured: 18 rows where 36 were inserted, all
+    of them drinks). Give every item feedback the real order-line id.
+  - 🔒 **(1) THE FAIRNESS FIX CANNOT BE DEFEATED — 1,374 attempts, 0 leaks.** For every combination,
+    the payload with a name was deep-diffed against the payload with the SAME filters and no name:
+    **320 payload combinations** (2 ledgers × 16 filter shapes × 5 people × the `gre` AND `manager`
+    slots) moved **0** paths outside `{filters.gre|manager, person, meta.counts_scope,
+    meta.person_filter_active}`. **CONTROL at `715f604`: 320 of 320 leaked, 304 of them sentiment**
+    (`categories[].poor`, `common_problems`, `daily[].negative`, `most_complained`, 66-73 paths per
+    combination). Combinations tried: floor, section, floor+section, captain, yesterday, week, a
+    2-day custom range, Food, Drinks, a menu-item substring, and floor+section+captain+group
+    together. **14 evasions, all refused**: `gre`+`manager` together · a GRE's name in the MANAGER
+    field · two `gre=` values · a comma-joined pair · wrong case · padded whitespace · the user id ·
+    `all` / `ALL` / `*` / `%` · `Ambika Rao' OR 1=1 --` · the zero-visit role holder · `gre` plus
+    every other filter at once. Every one: 0 non-person paths, 0 sentiment paths.
+  - 🔒 **(2) WHAT LEAVES THE BUILDING — 960 download checks, 0 numbers moved.** All 8 report keys ×
+    6 filter shapes × 5 people × 2 slots × 2 ledgers, comparing every KPI value and every table cell
+    of the built `ReportDoc`: **0 numeric changes** and **0 rows disappeared**. Every difference is a
+    disclosure: 120× the guest-recovery row label gains "- THE WHOLE VENUE", 120× that table gains
+    an "Of those, raised by <name>" row, 360× the `Follow-ups open now` KPI sub switches to "Whole
+    venue, all dates - NOT this person's." **CONTROL: 672 of 960 downloads moved a number** — e.g.
+    `daily` printed `Feedbacks taken 13` unfiltered and `6` with a name on it.
+  - ✅ **(3) THE FILTER STILL ANSWERS, AND THE ANSWER IS RIGHT.** 14 fields × 5 people × 2 ledgers =
+    **140 assertions against independent SQL** (the eligibility rule written out again by hand, not
+    read back from the module): **0 mismatches**. The five metrics the owner named are all present
+    and all reachable per person, on screen and in the "What <name> did" sheet of **all 8**
+    downloads. Ambika reads `5/13 = 38.5 %` of HER floor (not `6/23 = 26 %` of the venue), her
+    Terrace visit counted as `off-floor 1` and still inside `taken 6`; Chandra (unassigned) reads
+    `-` with the no-denominator note; **Divya, who recorded nothing, reads `0/3 = 0.0 %`** — silence
+    is visible. THE FLIP (same person, same tables, only what she wrote down changed): the card moves
+    in **five fields, every one a credit** — `issues_recorded` 12→0, `follow_ups_raised` 12→0,
+    `completed` 3→0, `open` 9→0, `recovery` `3/12 · 25.0%`→`none raised`; `tables_visited 5`,
+    `taken 6`, `feedbacks_recorded 6`, `area_eligible 13`, `area_covered 5`, `38.5 %`,
+    `off_area_visits 1` and `share_pct` are IDENTICAL in both worlds.
+  - ✅ **(4) PAGE 3 REGRESSION + THE CROSS-PAGE HIGH, on my own fixtures.** 80 tracker checks (2
+    ledgers × 4 scopes × 5 people × 2 slots): `totals` moved **0**, the coverage table moved **0**,
+    sentiment moved **0**, while the RECORD LIST narrowed in 80 of 80 — layer 2 exactly as
+    `7158feb` ratified. Page 3 and Page 4 agree on one service with no filters: **23 eligible / 13
+    taken / 56.5 % / 15 recorded / 2 extra**, on BOTH ledgers. The click-through
+    (`?item_key=butter chicken`) returns the SAME 15 rows with and without `&gre=`, byte-identical,
+    with all four authors' names still on them.
+  - 🐞 **THREE DEFECTS FOUND, NOTHING CHANGED (probe lane).**
+    1. **MEDIUM — `reporting.ts:1319`, two GREs who share a display name collapse into one card.**
+       `personScope()` matches `rows.find(g => g.person === personName)` while the grid is keyed by
+       user id. Measured by adding a second active GRE also called "Ambika Rao" (Second Floor, 2
+       visits): the grid correctly shows TWO rows (`fp-u-a` 5/13, `fp-u-a2` 1/7), the dropdown shows
+       ONE entry, and the filter silently answers for the first row only — the namesake's 2 visits
+       are unreachable and the reader is not told. Production holds FOUR GREs; whether any two share
+       a name is the owner's data, not mine.
+    2. **MEDIUM — `reporting.ts:1032`, the silent GRE is in the grid but not in the dropdown.**
+       `options.gres` is still built from people who RECORDED something, while `grePerformance()` is
+       now seeded from role holders. Measured: grid `[Ambika(gre), Bhavna(gre), Chandra(gre),
+       Manjula(management), Divya(assigned), QA Gre(assigned)]` against dropdown `[Ambika, Bhavna,
+       Chandra]`. Her data is correct and reachable by URL (`&gre=Divya Menon` → `0/3 0.0 %`), so
+       this is reachability, not arithmetic — but the one person a manager most needs to examine
+       cannot be picked from the filter that exists to examine one person. ATTRIBUTION: pre-fix had
+       neither the row nor a person block, so the inconsistency arrived WITH the fix.
+    3. **LOW — `analytics/page.tsx:285` + `reporting.ts:1319`, a name that matches nobody prints a
+       fabricated zeros card.** `&gre=Ravi` (a CAPTAIN), `&gre=Nobody At All`, `&gre=fp-u-a`,
+       `&gre=*`, `&gre=%`, `&gre=ambika rao` and `&gre=A,B` each produce a downloadable workbook
+       headed with that string whose sheet reads "What <string> did — visited 0, taken 0, issues 0",
+       indistinguishable from the REAL card of a GRE who recorded nothing (`QA Gre` renders
+       identically and does have a row). The UI labels both "<name> (none)". The blank fallback is
+       load-bearing for a manager who recorded nothing, so the fix is to SAY whether the name
+       matched a known person, not to drop the fallback.
+  - **GATES.** `npx tsc --noEmit` exit **0**, zero diagnostics, on `224a22d`. `git status` clean
+    apart from this entry. `/Users/shashankreddy/Desktop/Claude/fnb-controller` never touched. No
+    port bound, no server, no Browser pane. BUILD ONLY — nothing deployed.
