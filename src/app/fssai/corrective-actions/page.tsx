@@ -645,8 +645,7 @@ function ActionModal({
                           onClick={() => setPanel('complete')}
                           className="flex-1 min-w-[9rem] min-h-[52px] inline-flex flex-nowrap items-center justify-center gap-2 rounded-xl bg-[#af4408] hover:bg-[#8a3606] text-white font-semibold text-sm px-4"
                         >
-                          <Check size={17} className="shrink-0" />
-                          {a.status === 'done' ? 'Change what I wrote' : 'Record what I did'}
+                          <Check size={17} className="shrink-0" /> Record what I did
                         </button>
                       </div>
                     )

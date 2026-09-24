@@ -1695,6 +1695,15 @@ export function fssaiCaCompleteRefusal(
   const status = String(ca.status || '');
   if (status === 'verified') return 'That action has already been fixed and checked.';
   if (status === 'cancelled' || status === 'void') return 'That action was cancelled, so there is nothing to record against it.';
+  if (status === 'done') {
+    /* ONE-WAY UNTIL SOMEBODY SENDS IT BACK. A recorded fix is a statement on a
+     * compliance record, not a draft, so it is not quietly editable by the
+     * person who wrote it while a supervisor is reading it. If it was wrong or
+     * not enough, a manager sends it back (`reopen`, with a written reason) and
+     * BOTH the original attempt and the reason stay in the file — which is the
+     * true story of the fault, and what a re-edit would have erased. */
+    return 'The fix has already been written down and is waiting to be checked. A manager can send it back if it was not enough.';
+  }
   const mine = String(me.email || '').trim().toLowerCase();
   const owner = String(ca.owner_email || '').trim().toLowerCase();
   const isMgmt = me.role === 'admin' || me.role === 'manager' || !!me.is_head_chef;

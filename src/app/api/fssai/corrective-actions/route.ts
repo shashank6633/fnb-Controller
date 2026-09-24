@@ -263,25 +263,44 @@ export async function POST(request: Request) {
       return Response.json({ error: 'That corrective action belongs to another department.' }, { status: 403 });
     }
 
-    /** Shared by every branch: who, what changed, and WHY (owner §19). */
-    const writeAudit = (field: string, before: any, after: any, reason: string) => {
-      // fssaiAudit THROWS, like the verification route's — an action moved
-      // without a trail is worse than a retry. Every one of these is somebody's
-      // judgement about a food-safety failure.
-      fssaiAudit(db, {
-        entity_table: 'fssai_corrective_actions', entity_id: id, action: 'update', field,
-        before, after, reason,
-        actor: { email: me.email, name: me.name }, outlet_id: outletId || ca.outlet_id || '',
+    /**
+     * MOVE THE ACTION AND RECORD WHY, AS ONE THING.
+     *
+     * TWO PROPERTIES, AND BOTH ARE LOAD-BEARING:
+     *
+     * 1. THE UPDATE IS ALWAYS STATUS-GUARDED (`WHERE id=? AND status IN (…)`),
+     *    so two people pressing the same button at the same moment leave one
+     *    move, not two — the pattern from the verification route's
+     *    `WHERE id=? AND status='submitted'`.
+     *
+     * 2. THE MOVE AND ITS AUDIT ROW ARE IN ONE TRANSACTION. fssaiAudit THROWS
+     *    on purpose (unlike fssaiAuditBestEffort): every one of these is a
+     *    person's judgement about a food-safety failure, and an action that
+     *    moved with no trail is worse than a retry. Without the transaction the
+     *    UPDATE would already be committed when the audit threw — the state
+     *    would have changed, nothing would say who by or why, AND the caller
+     *    would be told it failed, which is the worst of the three. §7 Q4's
+     *    "never lose a check" protects work a member of staff DID; it does not
+     *    extend to a supervisory decision, exactly as the verification route
+     *    reasons.
+     */
+    const apply = (
+      sql: string, args: any[], expected: string[],
+      audit: { field: string; before: any; after: any; reason: string },
+    ) => {
+      const tx = db.transaction(() => {
+        const res = db.prepare(
+          `UPDATE fssai_corrective_actions SET ${sql}, updated_at=datetime('now')
+            WHERE id=? AND status IN (${expected.map(() => '?').join(',')})`,
+        ).run(...args, id, ...expected);
+        if (res.changes !== 1) throw new Error('FSSAI_CA_MOVED');
+        fssaiAudit(db, {
+          entity_table: 'fssai_corrective_actions', entity_id: id, action: 'update',
+          field: audit.field, before: audit.before, after: audit.after, reason: audit.reason,
+          actor: { email: me.email, name: me.name }, outlet_id: outletId || ca.outlet_id || '',
+        });
       });
-    };
-
-    /** The one UPDATE shape: always status-guarded, so two people cannot race. */
-    const guarded = (sql: string, args: any[], expected: string[]) => {
-      const res = db.prepare(
-        `UPDATE fssai_corrective_actions SET ${sql}, updated_at=datetime('now')
-          WHERE id=? AND status IN (${expected.map(() => '?').join(',')})`,
-      ).run(...args, id, ...expected);
-      if (res.changes !== 1) throw new Error('FSSAI_CA_MOVED');
+      tx();
     };
 
     const movedResponse = () => {
@@ -330,21 +349,21 @@ export async function POST(request: Request) {
         }
       }
       try {
-        guarded(
+        apply(
           `owner_email=?, due_date=?, severity=?, root_cause=?`,
           [ownerEmail, dueDate, severity, rootCause],
           ['open', 'in_progress', 'done'],
+          {
+            field: 'owner_email',
+            before: { owner_email: ca.owner_email, due_date: ca.due_date, severity: ca.severity, root_cause: ca.root_cause },
+            after: { owner_email: ownerEmail, due_date: dueDate, severity, root_cause: rootCause },
+            reason: str(body?.reason) || 'Assigned',
+          },
         );
       } catch (e: any) {
         if (String(e?.message) === 'FSSAI_CA_MOVED') return movedResponse();
         throw e;
       }
-      writeAudit(
-        'owner_email',
-        { owner_email: ca.owner_email, due_date: ca.due_date, severity: ca.severity, root_cause: ca.root_cause },
-        { owner_email: ownerEmail, due_date: dueDate, severity, root_cause: rootCause },
-        str(body?.reason) || 'Assigned',
-      );
       return Response.json({ ok: true, action: readOne(db, id)?.shaped });
     }
 
@@ -352,24 +371,35 @@ export async function POST(request: Request) {
      * START — somebody has picked it up. A state, not a claim about the fix.
      * ════════════════════════════════════════════════════════════════════ */
     if (action === 'start') {
+      // The STATE test first, so "already moved on" answers 409 rather than the
+      // 403 a permission refusal would give. They are different problems and a
+      // person can only act on one of them.
+      if (String(ca.status) !== 'open') {
+        return Response.json(
+          { error: `That action already reads "${fssaiCaStatusMeta(ca.status).label}".`, code: 'already_moved' },
+          { status: 409 },
+        );
+      }
       const refusal = fssaiCaCompleteRefusal(me, { status: ca.status, owner_email: ca.owner_email });
       if (refusal) return Response.json({ error: refusal }, { status: 403 });
-      if (String(ca.status) !== 'open') {
-        return Response.json({ error: 'That action is already being worked on.' }, { status: 409 });
-      }
       try {
         // Picking up an unassigned action puts YOUR name on it — otherwise two
         // people start the same job and neither knows.
-        guarded(
+        apply(
           `status='in_progress', owner_email=CASE WHEN owner_email='' THEN ? ELSE owner_email END`,
           [me.email || ''],
           ['open'],
+          {
+            field: 'status',
+            before: { status: ca.status },
+            after: { status: 'in_progress', owner_email: ca.owner_email || me.email || '' },
+            reason: 'Picked up',
+          },
         );
       } catch (e: any) {
         if (String(e?.message) === 'FSSAI_CA_MOVED') return movedResponse();
         throw e;
       }
-      writeAudit('status', { status: ca.status }, { status: 'in_progress', owner_email: ca.owner_email || me.email || '' }, 'Picked up');
       return Response.json({ ok: true, action: readOne(db, id)?.shaped });
     }
 
@@ -377,6 +407,18 @@ export async function POST(request: Request) {
      * COMPLETE — what was actually done. IN WORDS, or not at all.
      * ════════════════════════════════════════════════════════════════════ */
     if (action === 'complete') {
+      /* THE STATE TEST FIRST — 'already recorded' is a 409, not a 403. (The
+       * shared predicate returns this same sentence, so the screen never offers
+       * a button that would land here; this is the backstop, not the gate.) */
+      if (String(ca.status) === 'done') {
+        return Response.json(
+          {
+            error: 'The fix has already been written down and is waiting to be checked. A manager can send it back if it was not enough.',
+            code: 'already_moved',
+          },
+          { status: 409 },
+        );
+      }
       const refusal = fssaiCaCompleteRefusal(me, { status: ca.status, owner_email: ca.owner_email });
       if (refusal) return Response.json({ error: refusal, code: 'not_allowed' }, { status: 403 });
       const actionTaken = str(body?.action_taken).slice(0, 4000);
@@ -392,21 +434,25 @@ export async function POST(request: Request) {
           { status: 400 },
         );
       }
-      if (String(ca.status) === 'done') {
-        return Response.json({ error: 'That fix has already been recorded and is waiting to be checked.' }, { status: 409 });
-      }
       try {
-        guarded(
+        apply(
           `status='done', action_taken=?, completed_at=datetime('now'), completed_by=?,
            owner_email=CASE WHEN owner_email='' THEN ? ELSE owner_email END`,
           [actionTaken, me.email || '', me.email || ''],
           ['open', 'in_progress'],
+          {
+            field: 'status',
+            before: { status: ca.status },
+            after: { status: 'done', completed_by: me.email || '' },
+            // The note IS the reason — §19's "reason for change" and the fix
+            // itself are one thing here.
+            reason: actionTaken,
+          },
         );
       } catch (e: any) {
         if (String(e?.message) === 'FSSAI_CA_MOVED') return movedResponse();
         throw e;
       }
-      writeAudit('status', { status: ca.status }, { status: 'done', completed_by: me.email || '' }, actionTaken);
       fssaiAppAudit(db, {
         event_type: 'fssai.ca.complete', entity_type: 'fssai_corrective_actions', entity_id: id,
         actor_email: me.email, before: { status: ca.status }, after: { status: 'done' }, note: actionTaken,
@@ -437,13 +483,21 @@ export async function POST(request: Request) {
       }
       const note = str(body?.verify_note).slice(0, 2000);
       try {
-        guarded(`status='verified', verified_by=?, verified_at=datetime('now'), verify_note=?`,
-          [me.email || '', note], ['done']);
+        apply(
+          `status='verified', verified_by=?, verified_at=datetime('now'), verify_note=?`,
+          [me.email || '', note],
+          ['done'],
+          {
+            field: 'status',
+            before: { status: 'done', completed_by: ca.completed_by },
+            after: { status: 'verified', verified_by: me.email || '' },
+            reason: note || 'Checked and accepted',
+          },
+        );
       } catch (e: any) {
         if (String(e?.message) === 'FSSAI_CA_MOVED') return movedResponse();
         throw e;
       }
-      writeAudit('status', { status: 'done' }, { status: 'verified', verified_by: me.email || '' }, note || 'Checked and accepted');
       fssaiAppAudit(db, {
         event_type: 'fssai.ca.verify', entity_type: 'fssai_corrective_actions', entity_id: id,
         actor_email: me.email, before: { status: 'done' }, after: { status: 'verified' }, note,
@@ -490,12 +544,19 @@ export async function POST(request: Request) {
       try {
         // action_taken and completed_by are KEPT. What was tried and by whom is
         // part of the story of this fault, not a draft to be overwritten.
-        guarded(`status='in_progress'`, [], ['done']);
+        apply(
+          `status='in_progress'`, [], ['done'],
+          {
+            field: 'status',
+            before: { status: 'done', action_taken: ca.action_taken, completed_by: ca.completed_by },
+            after: { status: 'in_progress' },
+            reason,
+          },
+        );
       } catch (e: any) {
         if (String(e?.message) === 'FSSAI_CA_MOVED') return movedResponse();
         throw e;
       }
-      writeAudit('status', { status: 'done', action_taken: ca.action_taken }, { status: 'in_progress' }, reason);
       return Response.json({ ok: true, action: readOne(db, id)?.shaped });
     }
 
@@ -517,16 +578,21 @@ export async function POST(request: Request) {
         return Response.json({ error: 'That action has been fixed and checked, so there is nothing to cancel.' }, { status: 409 });
       }
       try {
-        guarded(
+        apply(
           `status='cancelled', voided_at=datetime('now'), voided_by=?, void_reason=?`,
           [me.email || '', reason],
           ['open', 'in_progress', 'done'],
+          {
+            field: 'status',
+            before: { status: ca.status },
+            after: { status: 'cancelled', voided_by: me.email || '' },
+            reason,
+          },
         );
       } catch (e: any) {
         if (String(e?.message) === 'FSSAI_CA_MOVED') return movedResponse();
         throw e;
       }
-      writeAudit('status', { status: ca.status }, { status: 'cancelled' }, reason);
       fssaiAppAudit(db, {
         event_type: 'fssai.ca.cancel', entity_type: 'fssai_corrective_actions', entity_id: id,
         actor_email: me.email, before: { status: ca.status }, after: { status: 'cancelled' }, note: reason,
