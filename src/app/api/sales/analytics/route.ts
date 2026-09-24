@@ -79,24 +79,71 @@ export async function GET(request: Request) {
     `).all(...params);
 
     // ---------- HOURLY × WEEKDAY HEATMAP ----------
-    // Uses sale_time if present, else falls back to created_at HH
-    // strftime('%w', date) gives 0-6 (Sun=0)
+    //
+    // THE HOUR MUST BE THE HOUR THE GUEST WAS SERVED, NOT THE HOUR WE WROTE THE
+    // ROW. The old fallback was `substr(s.created_at, 12, 2)`, i.e. the UTC
+    // hour stamped by the importer — so on the live data 1,132 of 1,141 rows
+    // (Rs 2,17,48,234 of Rs 2,17,53,044, 99.98% of revenue) piled into a single
+    // 09:00 cell that no service ever happened in, and "Peak Hour" read 09:00.
+    //
+    // Two honest sources, in order:
+    //   1. sales.sale_time — 'HH:MM' IST, written by the settle/hold routes
+    //      (Asia/Kolkata, hour12:false) and by POS exports that carry a time.
+    //   2. the linked order's settled_at, shifted to IST.
+    // When NEITHER exists the sale hour is genuinely UNKNOWN. Those rows are
+    // EXCLUDED and reported separately as `heatmapUnattributed`, because
+    // parking them on an invented hour is what produced the 09:00 wall.
+    //
+    // dow is taken on the TRADING NIGHT (04:00–04:00 IST, owner ruling
+    // 2026-09-23): sales.date is the IST calendar
+    // day of the settle, so a 00:30 bill rolls back one day to the night that
+    // earned it.
+    // The 0..23 guard on branch 1 is load-bearing, not defensive dressing. The
+    // .xlsx importer on this very page turns a 23:59:45 bill into sale_time
+    // '24:00' (page.tsx rounds the Excel day-fraction to 1440 minutes = hour
+    // 24). An unguarded CAST returns 24, which is NOT NULL, so such a row would
+    // pass the IS NOT NULL filter below, be counted as PLACED, and then never
+    // be drawn — the grid only renders hours 0..23. It would vanish from the
+    // grid AND from heatmapUnattributed, drag `max` up so every visible cell
+    // washed out to the alpha floor, and win the Peak Hour sort, where
+    // hour12(24) prints "12:00 PM" — a near-midnight bill reported as a
+    // lunchtime peak. That is the exact lie this block exists to kill.
+    //
+    // With the guard, an out-of-range sale_time falls through to the settled
+    // order, and failing that to NULL, where heatmapUnattributed names it out
+    // loud. Branch 2 needs no guard: strftime('%H') is always '00'..'23'.
+    const SALE_HOUR = `
+      CASE
+        WHEN s.sale_time IS NOT NULL AND TRIM(s.sale_time) <> ''
+             AND CAST(substr(TRIM(s.sale_time), 1, 2) AS INTEGER) BETWEEN 0 AND 23
+             THEN CAST(substr(TRIM(s.sale_time), 1, 2) AS INTEGER)
+        WHEN o.settled_at IS NOT NULL
+             THEN CAST(strftime('%H', o.settled_at, '+330 minutes') AS INTEGER)
+        ELSE NULL
+      END`;
     const heatmap = db.prepare(`
-      SELECT strftime('%w', s.date)                                AS dow,
-             CAST(
-               CASE
-                 WHEN s.sale_time IS NOT NULL AND s.sale_time != ''
-                      THEN substr(s.sale_time, 1, 2)
-                 ELSE substr(s.created_at, 12, 2)
-               END AS INTEGER
-             )                                                     AS hour,
+      SELECT strftime('%w',
+               CASE WHEN (${SALE_HOUR}) < 4 THEN date(s.date, '-1 day') ELSE s.date END
+             )                                                     AS dow,
+             (${SALE_HOUR})                                        AS hour,
              COALESCE(SUM(s.total_revenue), 0)                     AS revenue,
              COUNT(*)                                              AS count
       FROM sales s
-      WHERE ${WHERE}
+      LEFT JOIN orders o ON o.id = s.order_id
+      WHERE ${WHERE} AND (${SALE_HOUR}) IS NOT NULL
       GROUP BY dow, hour
       ORDER BY dow, hour
     `).all(...params);
+
+    // What the heatmap could NOT place, so the screen can say so out loud
+    // instead of quietly showing a smaller total than the KPIs above it.
+    const heatmapUnattributed = db.prepare(`
+      SELECT COUNT(*)                          AS count,
+             COALESCE(SUM(s.total_revenue), 0) AS revenue
+      FROM sales s
+      LEFT JOIN orders o ON o.id = s.order_id
+      WHERE ${WHERE} AND (${SALE_HOUR}) IS NULL
+    `).get(...params);
 
     // ---------- CATEGORY MIX ----------
     const byCategory = db.prepare(`
@@ -181,6 +228,7 @@ export async function GET(request: Request) {
       },
       dailyTrend,
       heatmap,
+      heatmapUnattributed,
       byCategory,
       topByRevenue,
       topByQty,
