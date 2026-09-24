@@ -217,7 +217,7 @@ supported, clear status indicators, sticky Submit. Minimal typing.
 | P2 | Page 1 Floor Feedback + the READ-ONLY guarantee, proved server-side | **DONE (A + B)** | §6 2026-09-22: GET-only routes (405 with CSRF, 403 without), 40 reads → census identical, 6-persona gate, all 5 statuses live, `tunable()` zero-default bug fixed, tsc 0. **Part (B) IS NOW APPLIED** — one prefix deny at ONE boundary (`src/lib/feedback/pos-readonly.ts` + `src/proxy.ts`), zero POS route handlers edited, 23/23 forbidden writes refused for an assigned GRE, 115/115 non-GRE writes untouched. **Lane B (read/board/catalog) closed its three HIGHs + 7 MEDIUMs** — elapsed proved against a known instant, a business-day exit for the never-settled order, tier flags proved per persona; 120 reads → census identical. **Probe `the-gre-is-denied` (2026-09-22, port 3954, no code changed): 87/87 state-changing POS requests refused against REAL rows with zero writes, the same requests measured WRITING for six other personas — but the claim is falsified once, by `POST /api/crm-calls/bookings/[id]/seat`, which opens/edits an order for any signed-in user (§6, §7 items 6-7).** **Probe `floor-managers-and-null-role` (2026-09-23, port 3955, no code changed): the deny is INERT in the null-role state and switches on and off with the assignment (0/27 → 26/27 → 0/27 on ONE login); 162 HTTP lines and a 33,407-line dump of all 217 tables are BYTE-IDENTICAL between the deny build and the deny reverted, for the Floor Manager and all three null-role tiers; the Page-1 truth table and the elapsed clock both pass. 🛑 But a **Floor Manager gets 403 on all four pages** while the API hands them the board — §6, and it is a config blocker, not a code one.** |
 | P3 | Page 2 Take Feedback + item-level complaints + action + follow-up lifecycle | PENDING | |
 | P4 | Page 3 Feedback Tracker + coverage | **LANE A DONE** | §6 2026-09-23: `GET /api/feedback/tracker` built (GET-only, 403 without CSRF / 405 with a valid pair, 40 reads → census identical), Page 3 reads it and the placeholder import is gone, and **the door is open** — a Floor Manager / Bar Manager / Head Chef / Store Manager now gets 200 on pages 1-3 where the same build without the one-line change gives 403 on all four (control run, every other row byte-identical). Analytics stays 403 for a GRE. tsc 0. |
-| P5 | Page 4 Analytics + the 8 reports | **LANE C + LANE B DONE** | §6 2026-09-24: the CRITICAL is closed — a person filter now moves **4 payload paths (`filters.gre` · `person` · `meta.counts_scope` · `meta.person_filter_active`) instead of 13**, and the flip (records honestly vs records "everything good") leaves the person-filtered page BYTE-IDENTICAL to the unfiltered one in both worlds. Page 3 and Page 4 agree (`11/8/72.7%` both, was `12/9/75.0%` vs `11/8/72.7%`) including the new floor denominator and the per-person Tables/Taken columns. The workbook no longer contradicts itself (`Feedbacks recorded 9 = Rating split 9`, was `8` vs `9`). PDF menu names: **628 of 628 printed strings distinct**, was 58 names collapsing into 28 rows. 37 reads incl. all 16 downloads → DB byte-identical. tsc 0. **NO SERVER WAS BOOTED.** **LANE B (export/PDF half, independent second measurement, 2026-09-24):** the three HIGHs re-proved with controls — Page 3 vs Page 4 `7/5/71.4%` both, and reverting only the numerator restores the brief's exact pair `8 eligible/75.0%` vs `7/71.4%`; 184 workbook assertions across 8 reports x 4 filter states, 0 contradictions; 628 of 628 menu names print distinct (widening ALONE still left 22 colliding, so the label pass is load-bearing). **Then four defects nobody had measured, all only visible at the owner's real 292-table scale:** `Their floor` printed `188/188 1…` for a GRE who covered EVERY table on her floor (a truncated percentage inverts its meaning — proved in two real rendered PDFs), `Recovery` the same past 100 complaints, 4 KPI subs cut mid-word (one losing the word PRINTED, one losing the sentence that reconciles the Summary against the Rating split), and the venue's open-follow-up count printed on a named person's card. Exhaustive audit: **36,365 rendered strings, 0 truncated, 0 ambiguous** (control at `f83b30b`: 88). tsc 0. **NO SERVER WAS BOOTED.** |
+| P5 | Page 4 Analytics + the 8 reports | **LANE C + LANE B DONE · LANE D VERIFIED vs `715f604`** | §6 2026-09-24 (Lane D): every briefed defect reproduced on the BASELINE and confirmed closed at `5bf8fda` — the filter moves 4 payload paths (was 15); the exported Rating split is byte-identical filtered vs unfiltered in BOTH worlds; Page 3 == Page 4 (`11/8/72.7%`, was `12/9/75.0%` vs `11/8/72.7%`); the workbook reconciles (`9=9`, and Share sums to 100% where the baseline summed to **110%**); 628/628 menu names print distinct (baseline: 58 names in 28 rows); 18 of 42 truncated KPI subs → 0; 37 reads → DB byte-identical; tsc 0. NO SERVER BOOTED. §6 2026-09-24: the CRITICAL is closed — a person filter now moves **4 payload paths (`filters.gre` · `person` · `meta.counts_scope` · `meta.person_filter_active`) instead of 13**, and the flip (records honestly vs records "everything good") leaves the person-filtered page BYTE-IDENTICAL to the unfiltered one in both worlds. Page 3 and Page 4 agree (`11/8/72.7%` both, was `12/9/75.0%` vs `11/8/72.7%`) including the new floor denominator and the per-person Tables/Taken columns. The workbook no longer contradicts itself (`Feedbacks recorded 9 = Rating split 9`, was `8` vs `9`). PDF menu names: **628 of 628 printed strings distinct**, was 58 names collapsing into 28 rows. 37 reads incl. all 16 downloads → DB byte-identical. tsc 0. **NO SERVER WAS BOOTED.** **LANE B (export/PDF half, independent second measurement, 2026-09-24):** the three HIGHs re-proved with controls — Page 3 vs Page 4 `7/5/71.4%` both, and reverting only the numerator restores the brief's exact pair `8 eligible/75.0%` vs `7/71.4%`; 184 workbook assertions across 8 reports x 4 filter states, 0 contradictions; 628 of 628 menu names print distinct (widening ALONE still left 22 colliding, so the label pass is load-bearing). **Then four defects nobody had measured, all only visible at the owner's real 292-table scale:** `Their floor` printed `188/188 1…` for a GRE who covered EVERY table on her floor (a truncated percentage inverts its meaning — proved in two real rendered PDFs), `Recovery` the same past 100 complaints, 4 KPI subs cut mid-word (one losing the word PRINTED, one losing the sentence that reconciles the Summary against the Rating split), and the venue's open-follow-up count printed on a named person's card. Exhaustive audit: **36,365 rendered strings, 0 truncated, 0 ambiguous** (control at `f83b30b`: 88). tsc 0. **NO SERVER WAS BOOTED.** |
 | P6 | Full adversarial verification + carve-readiness | PENDING | |
 
 **🛑 After P6 the build STOPS and waits for "Deploy Feedback Module".**
@@ -1514,3 +1514,136 @@ supported, clear status indicators, sticky Submit. Minimal typing.
     `src/lib/fssai` 0 · `api/fssai` 0 · `bill-handover` 0 · `boh_` 0; 0 changed file names touch a
     gated path. **No server was booted, no port was opened, nothing was pushed and nothing was
     deployed — the build-only gate stands.**
+
+- **2026-09-24 — P5 LANE D: INDEPENDENT RE-VERIFICATION of Lane C + Lane B, against a BASELINE.**
+  No production code was changed by this lane. Its whole output is measurement, because two
+  concurrent lanes had edited the SAME functions in `src/lib/feedback/reporting.ts` and nobody had
+  yet proved the COMBINATION is still fair. **Port 3946 was never opened; no server was booted; the
+  worktree DB was read-only throughout** (`VACUUM INTO` snapshot; `purchases 2165 · raw_materials
+  952 · menu_items 628 · integrity_check ok`).
+
+  - **METHOD — a harness that cannot drift from what ships, plus a real control.** A sync script
+    copies the shipped `src/lib/feedback/{reporting,read,zones,access,labels}.ts`,
+    `src/lib/{feedback,kot-section,hr-attendance,hr,report-pdf}.ts` and the three real route files
+    into a scratch tree, rewriting **only** module specifiers, and **asserts that every differing
+    line contains `from '`** — so a behavioural edit cannot slip in. 13 files, 30 import lines
+    rewritten, 0 other lines different. The same script was then run against
+    **`git show 715f604:…`** to build the BASELINE the brief names, so every "before" number below
+    is measured from real baseline code, not quoted from a previous entry.
+    ⚠️ **Re-run mid-lane:** a concurrent lane committed **`5bf8fda`** while I was measuring
+    `f83b30b`+uncommitted, growing `reporting.ts` by ~5 KB in the very functions under test. Every
+    result below was **re-measured against `5bf8fda`** and holds at both points.
+
+  - ✅ **THE FAIRNESS CRITICAL — REPRODUCED ON THE BASELINE, CONFIRMED CLOSED NOW.** Same GRE, same
+    six visits, same tables; only what she wrote down differs:
+
+    | `?gre=Anita Rao` | records HONESTLY | records "everything good" |
+    |---|---|---|
+    | **715f604** | Exc **0** · Avg **6 (100 %)** · negative **6** · R/R/R 6 · pending FU 2 · coverage **45.5 %** | Exc **6 (100 %)** · negative **0** · R/R/R 0 · pending FU 0 · coverage **45.5 %** |
+    | **5bf8fda** | Exc 2 · Good 1 · Avg 6 · neg 7 — **identical to the UNFILTERED page** | Exc 8 · Good 1 · neg 1 — **identical to the UNFILTERED page** |
+
+    The baseline moved **15 payload paths** under the filter (13 carrying data: `summary.feedback_taken`,
+    `coverage_pct`, `excellent`, `good`, `everything_good`, `negative_item_feedbacks`,
+    `item_feedbacks`, `menu_items`, `common_problems`, `most_complained`, `recovery`,
+    `gre_performance`, `daily`). Now it moves **4** — `filters.gre`, `person`, `meta.counts_scope`,
+    `meta.person_filter_active` — and only `person` carries data, **in both worlds**.
+  - **THE PERSON BLOCK, KEY BY KEY UNDER THE FLIP:** 21 keys, **4 move** — `issues_recorded` 6→0,
+    `follow_ups_raised` 2→0, `follow_ups_open` 2→0, `recovery_pct` 0→null. `tables_visited 5`,
+    `taken 5`, `feedbacks_recorded 6`, `area_coverage_pct 80`, `area_covered 4`, `area_eligible 5`,
+    `off_area_visits 1`, `share_pct 62.5` are **identical in both worlds**, and **0 of 21 keys**
+    match `excellent|good|average|poor|negative|rating|happy|score|unrated`.
+    📝 **CORRECTION to the Lane C entry above** (its fixtures differed by one visit): the measured
+    values are `taken 5` and `feedbacks_recorded 6`, not 6 and 7, and **4** person fields move under
+    the flip, not 3 — the fourth is `recovery_pct`, which renders as the queue cell, not as a score.
+  - **AND IT NO LONGER LEAVES THE BUILDING — measured on real bytes from the real route** (16 files
+    per run, 16/16 HTTP 200, `XLSX.write` + `pdfkit`). Baseline `daily.xlsx` headed `GRE: Anita Rao`
+    printed `Excellent 0 / Average 6 (100.0%)` honest against `Excellent 6 (100.0%)` silent. Now the
+    Rating-split **data rows are byte-identical filtered vs unfiltered** (sha `13faaa9f1481` daily,
+    `f13e64a46eb3` weekly and monthly, filtered == unfiltered each time); a `What <name> did` sheet
+    is present on **8 of 8** reports, its 12 data rows carry **0 sentiment metrics**, and under the
+    flip exactly **4 of 12** move — the three credits plus `0.0% - 0 of 2 closed` → `none raised`.
+
+  - ✅ **THE FLOOR RULING IS A DEFAULT, NOT A RESTRICTION — re-proved.** 7 viewers (each of the four
+    GREs, a Floor Manager, a manager assigned to the Terrace, and a viewer whose `preferred_zones`
+    is malformed) get the **SAME 12-row board across all 3 floors**: `DISTINCT BOARDS ACROSS ALL
+    VIEWERS: 1`. Page 1's default, run from source extracted **verbatim** from `page.tsx`: opens on
+    `First Floor`, stays there over 9 refreshes, and **a switch to Second Floor is not dragged home**;
+    unassigned → `all`; two floors → `all`; no viewer block → `all`, no crash. Coverage denominators:
+    Anita `4/5 = 80 %` +1 off-floor · Bela `2/4 = 50 %` · Chitra (unassigned) `—` measured venue-wide
+    · **Silent Gre (Terrace, recorded nothing) `0/2 = 0 %`**. 13 zone cases incl. three malformed
+    `preferred_zones` forms all degrade to unassigned = measured against everything.
+  - **`captain-area.ts` IS UNTOUCHED** (`git diff 715f604 -- src/lib/captain-area.ts` empty; last
+    commit `cd6d6c6`, predating this work) and `captain_area_lock` still has **0 rows**. `zones.ts`
+    mentions that key **only inside a comment** and issues **no settings read at all**, so it cannot
+    inherit the inert lock.
+
+  - ✅ **THE COVERAGE DISAGREEMENT.** Baseline: Page 3 `12 / 9 / 75.0 %` vs Page 4 `11 / 8 / 72.7 %`.
+    Now: **`11 / 8 / 72.7 %` on both**, with `feedbacks_recorded 9` and `extra_visits 1` named on
+    both — Page 4's definition was the right one and nothing was dropped.
+    **One table seating two parties** (the sharper case): baseline Page 3 `Tables 6 / Taken 7` vs
+    Page 4 `Tables 6 / Taken —` and **`Share undefined%`**, **5 of 5 rows disagreeing**, and Page 4
+    listed only the 3 people who had recorded something. Now: `Tables 5 / Taken 6` on both, **0 rows
+    disagreeing**, and all **5** role-holders present including the two with zero activity.
+
+  - ✅ **THE SELF-CONTRADICTING WORKBOOK.** Baseline, one `daily.xlsx`: Summary `Feedbacks taken 8`
+    beside a Rating split accounting for **9** (weekly and monthly `12` vs `13`). Now `9 = 9` and
+    `13 = 13`, with a printed `Total feedbacks recorded` row, and **0 contradictions across 8 reports
+    × 4 filter states**.
+    · 🔬 **The Share-column half of that claim needed a sharper fixture, and it is TRUE.** With
+      `unrated = 0` both builds sum to 100 %, so the earlier entry's claim was not visible. Adding
+      **one visit with no overall rating**: the baseline's Share column sums to **110.0 %** (the four
+      ratings divided by "rated only", Not-rated by "rated + unrated"); the shipped build sums to
+      **100.0 %** and its KPI reads `10` against a split of `10`.
+
+  - ✅ **THE PDF COLUMN, over the 628 REAL menu items**, through the shipped `printableLabels()` at
+    the shipped geometry (Item column `127.1 pt`, `fitPrint`, A4/margin 40/Helvetica 8):
+    **628 of 628 printed strings DISTINCT, 0 collisions, 0 cells overflowing**, 562 printed in full.
+    Baseline geometry on the same names: **58 names collapsing into 28 identical rows**; widening the
+    columns *alone* still left **22 names in 11 rows** — the `fitPrint` pass is doing real work.
+    **End to end in rendered PDFs read back with `pdftotext`:** the baseline printed
+    `AG FORTYSEVEN CHAR…` **twice** (a bottle of wine and a glass of it) and `GODAWAN 01 RICH AND…`
+    twice; now `AG FORTYSEVEN …NAY BOTTLE` / `AG FORTYSEVEN…NNAY GLASS` and
+    `GODAWAN 01 RIC…ED - BOTTLE` / `GODAWAN 01 RIC…UNDED 30ML`. The **xlsx keeps the full string —
+    0 ellipses in any of the 8 workbooks**. Uniqueness stressed: 40 names differing only in the
+    middle stay unique at 90 pt, 40 pt and 12 pt, and a REAL 3-char tag collision resolves to
+    `#wy4` / `#y18`. **16 of 16 `fitPrint` columns pass, 0 truncated cells or headings anywhere.**
+  - **THE TWO WIDTH EDITS ARE JUSTIFIED BY MEASUREMENT, not taste.** The person sheet's Value column
+    is `115.9 pt` at the shipped weights: a three-floor label joined would be **123.0 pt (OVER)**, so
+    it is summarised to `First Floor +2 more` (67.8 pt); the old recovery string
+    `No complaints raised in this period` was **122.3 pt (OVER)**, so it is `none raised` (41.7 pt).
+    Every other candidate Value string fits — two floors joined 90.2 pt, `100.0% - 12 of 12 closed`
+    88.5 pt, `All floors (no assignment)` 90.2 pt.
+  - **AND LANE B's OWN NEW CLAIM RE-MEASURED:** a KPI `sub` is one hard-truncated line `153.09 pt`
+    wide. At `f83b30b`, **18 of 42** subs overflowed — including `threshold 4 items (default), or
+    bill asked / printed` at 159.8 pt, which printed as `…or bill asked / pri…` and **lost the word
+    PRINTED, one of the owner's three eligibility triggers**. At `5bf8fda`: **0 of 42**, and 0 empty
+    footnote bullets.
+
+  - **NO REGRESSION.** 37 reads through every entry point (7 filter combinations × analytics +
+    item-comments + tracker, then all 16 downloads) left the DB **byte-identical**
+    (sha `334a7ba46383e584` before and after; census `orders 65 · items 161 · Σqty 207 · visits 13 ·
+    item_fb 7 · follow_ups 2 · tables 27 · users 19 · purchases 2165 · raw_materials 952`;
+    `integrity_check ok`). All **five** `/api/feedback/*` route files export **`GET` and nothing
+    else**; **0** SQL write verbs in any of the changed library files. The access rail re-proved
+    through the real `access.ts` over 8 personas: an assigned GRE gets pages 1-3 and is **REFUSED
+    `management_only` on analytics** — i.e. on Page 4 and all 16 report key/format combinations — a
+    deactivated GRE role is refused `role_inactive`, Captain `role_not_gre`, no-role
+    `no_role_assigned`, no session `signed_out`, and Floor Manager / Manager / Admin get both.
+    `npx tsc --noEmit` exit **0**, zero output, at both commits. Gate patterns over all 9 changed
+    files: `lq_` 0 · `party-manager` 0 · `lib/pm/` 0 · `fssai` 0 · `bill-handover` 0 · `boh_` 0.
+
+  - ⚠️ **THE BRIEF'S "12 MEDIUMs" STILL DO NOT EXIST — a third independent count.** Grepping every
+    `MEDIUM`/`LOW` marker in this file yields **8 open items** (§6:655 config trap · §6:1038
+    `page_access` is page-only · §6:1054 and §6:1062 LOWs · the 4 P2 Lane B left-open items), of
+    which §6:1047 and §6:1062 are now **closed** and §6:1054 **mitigated**. Not 12, and none were
+    invented to reach that number.
+  - ⚠️ **THE ONE RESIDUAL JUDGEMENT FOR THE OWNER, stated plainly rather than patched.** A GRE who
+    records honestly shows `Follow-ups still open 2` and `0.0% - 0 of 2 closed`; the silent one shows
+    `0` and `none raised`. Nothing she can do by recording LESS improves a metric the owner named —
+    `Issues properly recorded` drops 6 → 0 in the same column, and the sheet says in words that
+    *"none raised" must never be read as better than an open queue* — but a manager skim-reading two
+    numbers could still prefer the emptier queue. Removing it would delete **Guest Recovery
+    Follow-Up**, one of the five metrics the owner NAMED, so it is left as measured. Also unchanged:
+    a person's floor coverage counts the visits **they** made, so a colleague covering a table on
+    their floor lifts the room's figure but not theirs (Bela reads `2/4 = 50 %` on a floor where 3 of
+    4 were covered, one by Anita). Neither breaches the ruling; both are wording/policy calls.
