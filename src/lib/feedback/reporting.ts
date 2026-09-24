@@ -98,13 +98,33 @@
  * string that ships to the screen and into every export, so the next person to
  * add a column to that table reads the rule before they do it.
  *
- * AND THE DENOMINATOR NOBODY HAS: there is no column anywhere that assigns a
- * table to a GRE. Coverage per GRE therefore has no honest denominator, and
- * inventing one - dividing by the venue's eligible tables, say - would make
- * every GRE look bad on a busy night and reward whoever clocked in alone. The
- * per-person table reports COUNTS and a recovery rate; venue coverage is shown
- * beside it as context, labelled as venue-wide. `COVERAGE_PER_GRE_UNAVAILABLE`
- * carries the reason to the screen.
+ * 🔴 AND THAT WAS NOT ENOUGH. A clean per-person TABLE does not save a page
+ * whose PERSON FILTER narrows the sentiment sections. Measured on the P5
+ * fixtures, `?gre=<name>`, the SAME person, the SAME five visits, the SAME
+ * 41.7 % coverage - the only thing changed being what she wrote down:
+ *
+ *      records what the guests said   Excellent 1 . Average 4 (80%) . Negative 4
+ *      records "everything good"      Excellent 5 (100%)            . Negative 0
+ *
+ * and both of those printed into a downloadable workbook headed with her name.
+ * The honest GRE looked worse than the silent one, under her own name. That is
+ * exactly the incentive the ruling forbids, so the fix is structural and it is
+ * section 6's TWO-LAYER SCOPE: the person filter no longer touches a single
+ * aggregate. It selects a person and answers, separately and only, the five
+ * things the owner named.
+ *
+ * AND THE DENOMINATOR NOBODY HAD - THE OWNER HAS NOW SUPPLIED IT. There used to
+ * be no column assigning a table to a GRE, so coverage per person had no honest
+ * denominator. His ruling of 2026-09-23 settles it: **the floor is a default,
+ * not a restriction** - a GRE assigned to a floor is MEASURED against that
+ * floor, may still work any other floor, and is never blocked. So a person who
+ * holds `users.preferred_zones` now has a real denominator (the eligible tables
+ * on their own floor, inside the current filters) and gets a real coverage %;
+ * a person with NO assignment keeps the old honest answer - counts, a share of
+ * what was covered, and `COVERAGE_PER_GRE_UNAVAILABLE` on screen. Visits made
+ * off their own floor are counted as work in `off_area_visits`, never dropped.
+ * `src/lib/feedback/zones.ts` holds the rule and the reason it is not
+ * `captain-area.ts`.
  *
  * ════════════════════════════════════════════════════════════════════════════
  * 5. THE MENU-ITEM JOIN KEY IS THE NAME, AND THAT IS A MEASURED DECISION
@@ -124,19 +144,63 @@
  * to click through to the menu master, taking the first non-blank value.
  *
  * ════════════════════════════════════════════════════════════════════════════
- * 6. WHAT EACH FILTER ACTUALLY FILTERS - they are not all the same rail
+ * 6. THE TWO-LAYER SCOPE - the same shape commit 7158feb proved on Page 3
  * ════════════════════════════════════════════════════════════════════════════
- *   - **Floor / Section / Captain** narrow the ORDER universe, so they move the
- *     coverage denominator as well as the numerator. Asking about the Rooftop
- *     means asking about the Rooftop's tables AND the Rooftop's visits.
- *   - **GRE / Manager** narrow the VISITS ONLY. If they narrowed the orders
- *     too, the denominator would collapse to "tables this person visited" and
- *     coverage would read 100% for everybody, always. Filtered to a person,
- *     "coverage" is *their* share of the scope's eligible tables and the screen
- *     says so.
+ * The Tracker hit this first and the fix there is ratified, so Page 4 MIRRORS
+ * it rather than inventing a second rule:
+ *
+ *   LAYER 1 - **Floor / Section / Captain** describe a part of the ROOM, so
+ *     they move EVERY number on the page: the coverage denominator, the rating
+ *     split, the tiles, the menu items, the recovery block, the daily rows.
+ *     Asking about the Terrace means asking about the Terrace's tables AND the
+ *     Terrace's visits, and that is a question about the restaurant.
+ *
+ *   LAYER 2 - **GRE / Manager** select a PERSON, and a person is not a part of
+ *     the room. They therefore narrow **nothing at all** in the aggregates.
+ *     What they do instead is fill in `person`, which carries exactly the five
+ *     figures the owner named - Feedback Coverage, Tables Visited, Follow-Ups
+ *     Completed, Issues Properly Recorded, Guest Recovery Follow-Up - and not
+ *     one sentiment number beside them.
+ *
+ *     ⚠️ THE OLD BEHAVIOUR AND WHY IT WAS A DEFECT, not a preference. The
+ *     person filter used to narrow the VISITS, which fed the rating split, the
+ *     four red/amber tiles, Most Complained and Service Recovery. Every one of
+ *     those improves when a GRE records LESS. Section 4 carries the measurement.
+ *     `person` moves under the flip only in the direction the owner wants -
+ *     `issues_recorded` 4 vs 0, which is a CREDIT - and nothing else moves at
+ *     all. Seven of the eight downloads take `&gre=`, so this had to be fixed
+ *     in THIS file, where the screen and the exports share one computation.
+ *
  *   - **Food/Drinks / Menu Item** narrow the ITEM-LEVEL rows only. They do not
  *     touch coverage at all: a table was still visited whether or not the guest
  *     mentioned a drink.
+ *
+ * ════════════════════════════════════════════════════════════════════════════
+ * 7. TWO COUNTS OF "FEEDBACKS", AND THEY ARE NOT THE SAME COUNT
+ * ════════════════════════════════════════════════════════════════════════════
+ * A visit can exist on a table that never became ELIGIBLE - the trigger is an
+ * admin setting that can be raised mid-service, and a GRE may simply choose to
+ * visit a two-item table. That visit is real work and its rating is real
+ * feedback, but it is not coverage of a table anybody was owed.
+ *
+ * The first cut had ONE field, `feedback_taken`, used for both, and the two
+ * disagreed inside a single exported workbook: the Summary sheet read
+ * "Feedbacks taken 9" while the Rating split sheet accounted for 10. So there
+ * are now two named numbers and an invariant that is asserted, not assumed:
+ *
+ *     feedbacks_recorded      every visit in scope        <- the rating split
+ *     eligible_tables_covered visits on ELIGIBLE tables   <- coverage numerator
+ *     extra_visits            the difference, always >= 0
+ *
+ *     excellent + good + average + poor + unrated === feedbacks_recorded
+ *     eligible_tables_covered + extra_visits      === feedbacks_recorded
+ *
+ * `coverage_pct` is `eligible_tables_covered / eligible_tables`, and the extra
+ * visits are in NEITHER side of it - which is what makes the ratio mean what it
+ * says. Page 3 (`tracker/query.ts`) computes the identical pair from the
+ * identical rule; before this change it put the extra visit in BOTH sides and
+ * the two pages reported 13/10/76.9 % against 12/9/75.0 % for one service with
+ * no filters set.
  *
  * FLOOR IS `restaurant_tables.zone` - there is no `floor` column and
  * `SELECT floor` errors. SECTION is `restaurant_tables.section`, and the owner
@@ -165,6 +229,14 @@ import {
   sqlUtcToIso,
   type BoardDay,
 } from './read';
+import { GRE_ROLE_NAME } from './access';
+import {
+  areaCovers,
+  readGreAreas,
+  AREA_ASSIGNED_NOTE,
+  AREA_UNASSIGNED,
+  AREA_UNASSIGNED_NOTE,
+} from './zones';
 
 /* ════════════════════════════════════════════════════════════════════════════
    1. TIME - IST business days, as exact UTC windows
@@ -425,7 +497,12 @@ export function filtersFromQuery(sp: URLSearchParams): AnalyticsFilters {
 
 /** The filters as sentences. Written into EVERY export - a spreadsheet that
  *  does not say it is one floor on one night is a spreadsheet that will be
- *  read as the whole venue for the month. */
+ *  read as the whole venue for the month.
+ *
+ *  The GRE / Manager line says what it narrows AND what it does not. Seven of
+ *  the eight downloads accept `&gre=`, and a file headed only "GRE: <name>"
+ *  reads as that person's scorecard - which is precisely the reading the
+ *  fairness ruling forbids. */
 export function filterLines(r: ResolvedRange, f: AnalyticsFilters): string[] {
   const out = [`Period: ${r.label}`];
   if (r.note) out.push(`Period note: ${r.note}`);
@@ -433,8 +510,17 @@ export function filterLines(r: ResolvedRange, f: AnalyticsFilters): string[] {
   out.push(`Floor: ${isAll(f.floor) ? 'All floors' : String(f.floor)}`);
   out.push(`Section: ${isAll(f.section) ? 'All sections' : String(f.section)}`);
   out.push(`Captain: ${isAll(f.captain) ? 'All captains' : String(f.captain)}`);
+  const person = !isAll(f.gre) ? String(f.gre).trim() : !isAll(f.manager) ? String(f.manager).trim() : '';
   out.push(`GRE: ${isAll(f.gre) ? 'All' : String(f.gre)}`);
   out.push(`Manager: ${isAll(f.manager) ? 'All' : String(f.manager)}`);
+  if (person) {
+    out.push(
+      `What the ${isAll(f.gre) ? 'Manager' : 'GRE'} filter did: it fills in the "What ${person} did" `
+      + 'sheet and changes NOTHING else in this file. Every rating, complaint, menu item and '
+      + 'recovery figure below covers the whole selected floor, section, captain and period - '
+      + 'not this person. Do not read this file as an appraisal of them.',
+    );
+  }
   out.push(`Food / Drinks: ${isAll(f.group) ? 'Both' : String(f.group)}`);
   out.push(`Menu item: ${isAll(f.item) ? 'All items' : String(f.item)}`);
   return out;
@@ -586,6 +672,9 @@ function uniqSorted(xs: string[]): string[] {
 export interface VisitRow {
   visit_id: string;
   order_id: string;
+  /** `gf_visits.gre_user_id` — the key the floor assignment is read by. */
+  gre_user_id: string;
+  table_id: string;
   table_number: string;
   floor: string;
   section: string;
@@ -675,15 +764,58 @@ export interface MenuItemRow {
 }
 
 export interface GrePerformanceRow {
+  person_id: string;
   person: string;
   role: string;
+  /** 'gre' recorded carrying the GRE role · 'management' recorded as
+   *  management · 'assigned' holds the GRE role and recorded NOTHING in this
+   *  period — the row a management page most needs and the one a visit-driven
+   *  query cannot produce. Same three values as Page 3's `kind`. */
+  kind: 'gre' | 'management' | 'assigned';
+  /** DISTINCT eligible tables they recorded on — Page 3's "Tables", same rule. */
   tables_visited: number;
+  /** Their visits on eligible tables — Page 3's "Taken", same rule. Differs
+   *  from `tables_visited` only when one table seated twice in a service. */
+  taken: number;
+  /** Every visit of theirs in scope, eligible table or not. */
+  feedbacks_recorded: number;
   issues_recorded: number;
   follow_ups_raised: number;
   follow_ups_completed: number;
   follow_ups_open: number;
   /** Completed / raised. A process measure - see section 4. */
   recovery_pct: number | null;
+  /** Their share of the tables that WERE covered. Not a coverage %. */
+  share_pct: number | null;
+  /* ── the owner's floor ruling (section 4). Null when unassigned. ───────── */
+  /** Floors assigned to this person, or [] when none. */
+  area_zones: string[];
+  area_assigned: boolean;
+  /** Eligible tables on THEIR floor, inside the current filters. */
+  area_eligible: number | null;
+  /** Of those, the ones they recorded on. */
+  area_covered: number | null;
+  /** `area_covered / area_eligible`. Null when there is no assignment — the
+   *  honest "no denominator" answer, which is what shipped before. */
+  area_coverage_pct: number | null;
+  /** Visits they made on tables that are NOT theirs. Counted, never dropped:
+   *  helping on another floor is work, and the owner's rule is that nobody is
+   *  ever blocked from it. They are inside `tables_visited`. */
+  off_area_visits: number;
+}
+
+/**
+ * What the GRE / Manager filter answers, and the ONLY thing it answers.
+ * Every field here is one of the five the owner named, or the provenance of
+ * one. There is deliberately no rating, no negative count, no ratio of
+ * complaints, and no happiness column.
+ */
+export interface PersonScope extends GrePerformanceRow {
+  /** Human sentence naming the floors this person is measured against. */
+  area_label: string;
+  /** Why the coverage figure is the shape it is — printed on screen and into
+   *  every export that carries this block. */
+  coverage_basis: string;
 }
 
 export const ISSUES_RECORDED_IS_NOT_A_PENALTY =
@@ -692,8 +824,44 @@ export const ISSUES_RECORDED_IS_NOT_A_PENALTY =
   + 'Nothing on this page ranks a GRE by the ratings guests gave.';
 
 export const COVERAGE_PER_GRE_UNAVAILABLE =
-  'No column assigns a table to a GRE, so coverage per person has no honest denominator. '
-  + 'Per-person figures are counts; the coverage % shown is venue-wide for the current filters.';
+  'A person with NO floor assigned shows "-" rather than a coverage %: nothing else in this app '
+  + 'assigns a table to a GRE, so there would be no honest denominator, and an invented one in a '
+  + 'performance table is worse than no number. Their figures are counts, and the coverage % beside '
+  + 'them is the venue\'s for the current filters.';
+
+export const RECOVERY_IS_A_QUEUE =
+  'Guest recovery is printed as a QUEUE, not a score: "1/3" means one of the three complaints '
+  + 'this person raised has been closed, and "none raised" means they raised none in this period. '
+  + 'Never read "none raised" as better than an open queue - it is the OPPOSITE way round. A GRE '
+  + 'who records two complaints and has not revisited them yet has work to do; a GRE who recorded '
+  + 'nothing has nothing to show for the same tables.';
+
+/**
+ * 🔒 THE OWNER'S METRIC, PRINTED SO IT CANNOT BE READ BACKWARDS.
+ *
+ * Guest Recovery Follow-Up is one of the five figures the owner named, so it
+ * stays on the page. What had to change is how it PRINTS. Measured on the
+ * fairness flip: a GRE who recorded two complaints and had not yet revisited
+ * them printed `0.0%`, while a GRE who recorded NOTHING printed `-` in the same
+ * column. Side by side, the honest one looks worse and the silent one looks
+ * clean - and `-` sorts above `0.0%` in a spreadsheet, which puts the silent
+ * one on top. Both readings are the incentive the fairness ruling forbids.
+ *
+ * So a ratio is never printed alone. `completed/raised` carries its own
+ * denominator, and an empty queue says so in words instead of with a dash that
+ * looks like a better number.
+ */
+export function recoveryCell(completed: number, raised: number): string {
+  if (!raised) return 'none raised';
+  return `${Math.round(completed)}/${Math.round(raised)} · ${pctText(rate(completed, raised))}`;
+}
+
+/** The same figure with room to explain itself - for the person block and the
+ *  "What <name> did" sheet, where the column is a sentence wide. */
+export function recoveryLong(completed: number, raised: number): string {
+  if (!raised) return 'No complaints raised in this period';
+  return `${pctText(rate(completed, raised))} - ${Math.round(completed)} of ${Math.round(raised)} closed`;
+}
 
 export interface AnalyticsPayload {
   range: ResolvedRange;
@@ -701,7 +869,12 @@ export interface AnalyticsPayload {
   summary: {
     eligible_tables: number;
     all_tables: number;
-    feedback_taken: number;
+    /** EVERY visit in scope. The rating split's population — see section 7. */
+    feedbacks_recorded: number;
+    /** Visits on ELIGIBLE tables. The coverage numerator — see section 7. */
+    eligible_tables_covered: number;
+    /** `feedbacks_recorded - eligible_tables_covered`. Always >= 0. */
+    extra_visits: number;
     coverage_pct: number | null;
     excellent: number;
     good: number;
@@ -731,6 +904,9 @@ export interface AnalyticsPayload {
   most_appreciated: { label: string; count: number; feedbacks: number }[];
   recovery: { label: string; count: number }[];
   gre_performance: GrePerformanceRow[];
+  /** Filled ONLY when a GRE / Manager filter is set. Null otherwise. Nothing
+   *  else on the payload moves when it is set — section 6, layer 2. */
+  person: PersonScope | null;
   daily: {
     day: string; label: string; eligible: number; taken: number;
     coverage_pct: number | null; negative: number; returned_remade: number; open: number;
@@ -751,10 +927,23 @@ export interface AnalyticsPayload {
     excluded: UniverseExclusions;
     fairness_note: string;
     coverage_per_gre_unavailable: string;
+    /** Guest recovery is a WORK QUEUE, not a score - printed on screen and in
+     *  every export that carries the per-person table. */
+    recovery_is_a_queue: string;
     negative_pct_basis: string;
     return_remake_basis: string;
     generated_at: string;
-    gre_filter_is_numerator_only: boolean;
+    /** The sentence section 6 is about, printed on screen and into every
+     *  export: which layer of the scope each number on the page belongs to. */
+    counts_scope: string;
+    /** True when a GRE / Manager filter is in force. It changes `person` and
+     *  NOTHING else — the flag exists so the screen can say so, never so a
+     *  reader has to infer it. */
+    person_filter_active: boolean;
+    /** The three reconciliations of section 7, evaluated on this payload. All
+     *  true is the only acceptable value; a false is a defect signal that
+     *  travels with the data instead of living in a test. */
+    reconciles: { rating_split: boolean; coverage_split: boolean; taken_subset: boolean };
   };
 }
 
@@ -801,8 +990,8 @@ export function analytics(
   /* -- visits ---------------------------------------------------------- */
   const visitRows = selectIn(
     db,
-    `SELECT id, order_id, table_number, floor, gre_name, gre_role, overall_rating,
-            cat_food, cat_drinks, cat_service, cat_ambience, everything_good,
+    `SELECT id, order_id, table_id, table_number, floor, gre_user_id, gre_name, gre_role,
+            overall_rating, cat_food, cat_drinks, cat_service, cat_ambience, everything_good,
             comment, status, has_negative, created_at
        FROM gf_visits WHERE order_id IN (@@)`,
     u.orders.map((o) => o.order_id),
@@ -813,6 +1002,8 @@ export function analytics(
     return {
       visit_id: String(v.id),
       order_id: String(v.order_id),
+      gre_user_id: String(v.gre_user_id ?? ''),
+      table_id: String(o?.table_id ?? v.table_id ?? ''),
       table_number: String(v.table_number ?? o?.table_number ?? ''),
       floor: o?.floor ?? floorLabel(v.floor),
       section: o?.section ?? '',
@@ -838,14 +1029,24 @@ export function analytics(
   const gres = uniqSorted(allVisits.filter((v) => !isManagementRole(v.gre_role)).map((v) => v.gre_name).filter(Boolean));
   const managers = uniqSorted(allVisits.filter((v) => isManagementRole(v.gre_role)).map((v) => v.gre_name).filter(Boolean));
 
-  // Section 6: the person filters narrow VISITS ONLY. The order universe above
-  // is untouched, so coverage stays "their share of the scope's eligible
-  // tables" instead of collapsing to a guaranteed 100%.
-  const person = !isAll(f.gre) ? String(f.gre).trim() : !isAll(f.manager) ? String(f.manager).trim() : '';
-  const visits = person ? allVisits.filter((v) => v.gre_name === person) : allVisits;
+  // 🔒 SECTION 6, LAYER 2. The person filter does NOT narrow `visits`, and this
+  // one line is the whole fairness fix. Everything below — the rating split,
+  // the four red/amber tiles, the menu items, Most Complained, Service Recovery
+  // and the daily rows — is computed over the ROOM (Floor / Section / Captain /
+  // period), exactly as it is when no name is selected. The person is answered
+  // separately, in `personScope()`, with the five figures the owner named.
+  //
+  // Measured before this change, `?gre=<name>`, the same person and the same
+  // five visits: recording honestly gave Excellent 1 / Average 4 / Negative 4;
+  // recording "everything good" gave Excellent 5 (100 %) / Negative 0 — in a
+  // downloadable workbook headed with her name. Nothing in the payload may move
+  // that way again.
+  const personName = !isAll(f.gre) ? String(f.gre).trim() : !isAll(f.manager) ? String(f.manager).trim() : '';
+  const visits = allVisits;
 
-  // Coverage counts only visits on tables that were ELIGIBLE - otherwise a
-  // visit to a two-item table would push coverage over 100%.
+  // Section 7: coverage counts only visits on tables that were ELIGIBLE —
+  // otherwise a visit to a two-item table would push coverage over 100 %. The
+  // rest are `extraVisits`, counted and named rather than dropped.
   const coveredVisits = visits.filter((v) => eligibleIds.has(v.order_id));
   const visitById = new Map(visits.map((v) => [v.visit_id, v]));
 
@@ -975,10 +1176,18 @@ export function analytics(
 
   const menuItems = buildMenuItems(items, followUps, soldByKey, groupWanted, itemWanted);
 
+  // The per-person table. Seeded from the people who HOLD the role, not from
+  // the visits, so a GRE who recorded nothing still has a row — total silence
+  // is the one behaviour a management page must be able to see. Section 4's
+  // floor denominator is applied here.
+  const gre = grePerformance(db, u, visits, items, followUps, eligibleIds);
+
   const summary: AnalyticsPayload['summary'] = {
     eligible_tables: u.eligible.length,
     all_tables: u.orders.length,
-    feedback_taken: coveredVisits.length,
+    feedbacks_recorded: visits.length,
+    eligible_tables_covered: coveredVisits.length,
+    extra_visits: visits.length - coveredVisits.length,
     coverage_pct: rate(coveredVisits.length, u.eligible.length),
     excellent: ratingCount('excellent'),
     good: ratingCount('good'),
@@ -1032,7 +1241,8 @@ export function analytics(
       { label: 'Partially happy', count: partial },
       { label: 'Still unhappy', count: unhappy },
     ],
-    gre_performance: grePerformance(visits, items, followUps, eligibleIds),
+    gre_performance: gre,
+    person: personScope(gre, personName),
     daily: daysInRange(r).map((d) => {
       const el = u.eligible.filter((o) => o.business_day === d).length;
       const tk = coveredVisits.filter((v) => v.business_day === d).length;
@@ -1065,11 +1275,59 @@ export function analytics(
       excluded: u.excluded,
       fairness_note: ISSUES_RECORDED_IS_NOT_A_PENALTY,
       coverage_per_gre_unavailable: COVERAGE_PER_GRE_UNAVAILABLE,
+      recovery_is_a_queue: RECOVERY_IS_A_QUEUE,
       negative_pct_basis: NEGATIVE_PCT_BASIS,
       return_remake_basis: RETURN_REMAKE_BASIS,
       generated_at: new Date().toISOString(),
-      gre_filter_is_numerator_only: !!person,
+      counts_scope: personName ? COUNTS_SCOPE_PERSON : COUNTS_SCOPE_ROOM,
+      person_filter_active: !!personName,
+      reconciles: {
+        rating_split:
+          summary.excellent + summary.good + summary.average + summary.poor + summary.unrated
+          === summary.feedbacks_recorded,
+        coverage_split:
+          summary.eligible_tables_covered + summary.extra_visits === summary.feedbacks_recorded,
+        taken_subset: summary.eligible_tables_covered <= summary.eligible_tables,
+      },
     },
+  };
+}
+
+export const COUNTS_SCOPE_ROOM =
+  'Every figure on this page covers the selected period, floor, section and captain.';
+
+export const COUNTS_SCOPE_PERSON =
+  'A GRE / Manager filter selects a PERSON, and a person is not a part of the room: it fills in '
+  + 'the "What this person did" block and changes NOTHING else. The rating split, the negative '
+  + 'tiles, the menu items and the recovery block still cover the whole selected floor, section, '
+  + 'captain and period. That is deliberate - narrowing them to one name made the same GRE on the '
+  + 'same tables read "Excellent 100%, Negative 0" when she recorded nothing and "Average 100%, '
+  + 'Negative 4" when she recorded what the guests said, which is exactly the incentive the '
+  + "owner's fairness ruling forbids.";
+
+/**
+ * The person block — section 6, layer 2. It is a PROJECTION of the row the
+ * per-person table already computed, never a second computation: if it were
+ * computed separately the two could disagree, and a management page that
+ * disagrees with its own table is worse than one with no table.
+ */
+function personScope(rows: GrePerformanceRow[], personName: string): PersonScope | null {
+  if (!personName) return null;
+  const row = rows.find((g) => g.person === personName);
+  const base: GrePerformanceRow = row ?? {
+    person_id: '', person: personName, role: '', kind: 'gre',
+    tables_visited: 0, taken: 0, feedbacks_recorded: 0, issues_recorded: 0,
+    follow_ups_raised: 0, follow_ups_completed: 0, follow_ups_open: 0,
+    recovery_pct: null, share_pct: null,
+    area_zones: [], area_assigned: false,
+    area_eligible: null, area_covered: null, area_coverage_pct: null, off_area_visits: 0,
+  };
+  return {
+    ...base,
+    area_label: base.area_assigned
+      ? base.area_zones.join(' · ') || 'assigned tables'
+      : 'All floors (no assignment)',
+    coverage_basis: base.area_assigned ? AREA_ASSIGNED_NOTE : AREA_UNASSIGNED_NOTE,
   };
 }
 
@@ -1198,6 +1456,8 @@ function commonProblems(items: ItemFeedbackRow[]): { label: string; count: numbe
  * owner wants encouraged.
  */
 function grePerformance(
+  db: Database.Database,
+  u: Universe,
   visits: VisitRow[],
   items: ItemFeedbackRow[],
   followUps: FollowUpRow[],
@@ -1205,21 +1465,82 @@ function grePerformance(
 ): GrePerformanceRow[] {
   const by = new Map<string, GrePerformanceRow>();
   const visitPerson = new Map<string, string>();
+  const key = (id: string, name: string) => (id ? `id:${id}` : `nm:${name.toLowerCase()}`);
 
+  const blank = (
+    person_id: string, person: string, role: string, kind: GrePerformanceRow['kind'],
+  ): GrePerformanceRow => ({
+    person_id, person, role, kind,
+    tables_visited: 0, taken: 0, feedbacks_recorded: 0, issues_recorded: 0,
+    follow_ups_raised: 0, follow_ups_completed: 0, follow_ups_open: 0,
+    recovery_pct: null, share_pct: null,
+    area_zones: [], area_assigned: false,
+    area_eligible: null, area_covered: null, area_coverage_pct: null, off_area_visits: 0,
+  });
+
+  // ── seed from the people who HOLD the role ────────────────────────────────
+  // Page 3 already does exactly this and for exactly this reason: a GRE who
+  // recorded nothing all night has no visit, so a visit-driven query cannot
+  // produce their row — and total silence is the single behaviour this page
+  // exists to make visible. Measured before this change: a GRE with the role
+  // assigned and 0 visits appeared on Page 3 and was ABSENT from Page 4 and
+  // from the GRE/Manager Performance workbook.
+  //
+  // A failure to read users/roles degrades to "only the people who recorded
+  // something" — the previous behaviour — never to an exception.
+  const seeded: { id: string; name: string; role: string }[] = [];
+  try {
+    const people = db
+      .prepare(
+        `SELECT u.id AS id, u.name AS name, r.name AS role_name
+           FROM users u
+           JOIN roles r ON r.id = u.role_id
+          WHERE LOWER(TRIM(r.name)) = LOWER(TRIM(?))
+            AND COALESCE(r.is_active, 1) = 1
+            AND COALESCE(u.is_active, 1) = 1`,
+      )
+      .all(GRE_ROLE_NAME) as any[];
+    for (const p of people) {
+      const id = String(p.id ?? '');
+      const name = String(p.name ?? '').trim() || '(unnamed)';
+      seeded.push({ id, name, role: String(p.role_name ?? GRE_ROLE_NAME) });
+      by.set(key(id, name), blank(id, name, String(p.role_name ?? GRE_ROLE_NAME), 'assigned'));
+    }
+  } catch {
+    /* degrade to visit-derived rows only */
+  }
+
+  const keyOfVisit = new Map<string, string>();
+  // 🐞 THE SAME COLUMN NAME MUST MEAN THE SAME THING ON BOTH PAGES. Page 3's
+  // progress table has carried TWO numbers since 7158feb — "Tables" = the
+  // DISTINCT tables a person recorded on, and "Taken" = their visits on
+  // eligible tables — and Page 4 had one field, `tables_visited`, computed as
+  // Page 3's `taken`. They agree on every ordinary night and disagree the
+  // moment a table seats twice in one service (two eligible orders, one table:
+  // Page 3 says Tables 1 / Taken 2, Page 4 said Tables 2). Two screens the
+  // owner reads side by side, disagreeing under one heading, is the defect the
+  // coverage split was just fixed for. So Page 4 now computes BOTH by Page 3's
+  // own rule, and `share_pct` uses the visit count, exactly as Page 3 does.
+  const tablesByPerson = new Map<string, Set<string>>();
   for (const v of visits) {
     const name = v.gre_name || '(unnamed)';
-    visitPerson.set(v.visit_id, name);
-    let row = by.get(name);
-    if (!row) {
-      row = {
-        person: name, role: v.gre_role || '',
-        tables_visited: 0, issues_recorded: 0,
-        follow_ups_raised: 0, follow_ups_completed: 0, follow_ups_open: 0,
-        recovery_pct: null,
-      };
-      by.set(name, row);
+    const k = key(v.gre_user_id, name);
+    visitPerson.set(v.visit_id, k);
+    keyOfVisit.set(v.visit_id, k);
+    const kind: GrePerformanceRow['kind'] = isManagementRole(v.gre_role) ? 'management' : 'gre';
+    const row = by.get(k) ?? blank(v.gre_user_id, name, v.gre_role || '', kind);
+    if (row.kind === 'assigned') row.kind = kind;
+    if (!row.role) row.role = v.gre_role || row.role;
+    row.feedbacks_recorded++;
+    if (eligibleIds.has(v.order_id)) {
+      row.taken++;
+      const set = tablesByPerson.get(k) ?? new Set<string>();
+      // `table_id` is the order's, falling back to the visit's snapshot — the
+      // same id Page 3 keys its set by.
+      set.add(v.table_id || v.order_id);
+      tablesByPerson.set(k, set);
     }
-    if (eligibleIds.has(v.order_id)) row.tables_visited++;
+    by.set(k, row);
   }
 
   for (const x of items) {
@@ -1236,10 +1557,55 @@ function grePerformance(
     else row.follow_ups_open++;
   }
 
-  for (const row of by.values()) row.recovery_pct = rate(row.follow_ups_completed, row.follow_ups_raised);
+  // ── the owner's floor ruling: a real denominator, for whoever has one ─────
+  const ids = [
+    ...seeded.map((p) => p.id),
+    ...visits.map((v) => v.gre_user_id),
+  ].filter(Boolean);
+  const areas = readGreAreas(db, ids);
 
+  // Eligible tables per assignment. Computed from the SAME `u.eligible` the
+  // venue denominator uses, so a person's floor total can never exceed it.
+  const eligibleOrders = u.eligible;
+
+  for (const [k, row] of by) {
+    row.tables_visited = tablesByPerson.get(k)?.size ?? 0;
+    const area = (row.person_id ? areas.get(row.person_id) : undefined) ?? AREA_UNASSIGNED;
+    row.area_zones = area.zones;
+    row.area_assigned = area.assigned;
+
+    if (area.assigned) {
+      const mine = eligibleOrders.filter((o) => areaCovers(area, o.floor, o.table_id));
+      const mineIds = new Set(mine.map((o) => o.order_id));
+      const myVisits = visits.filter((v) => keyOfVisit.get(v.visit_id) === k);
+      const covered = myVisits.filter((v) => mineIds.has(v.order_id)).length;
+      row.area_eligible = mine.length;
+      row.area_covered = covered;
+      row.area_coverage_pct = rate(covered, mine.length);
+      // Everything they recorded on an ELIGIBLE table that is not theirs.
+      // It stays inside tables_visited; this names it so the help is visible.
+      row.off_area_visits = myVisits.filter(
+        (v) => eligibleIds.has(v.order_id) && !mineIds.has(v.order_id),
+      ).length;
+    }
+
+    row.recovery_pct = rate(row.follow_ups_completed, row.follow_ups_raised);
+  }
+
+  // Page 3's rule exactly: a person's share of the VISITS that covered an
+  // eligible table, so the column sums to 100 % across the people on it.
+  const totalCovered = visits.filter((v) => eligibleIds.has(v.order_id)).length;
+  for (const row of by.values()) {
+    row.share_pct = totalCovered ? rate(row.taken, totalCovered) : null;
+  }
+
+  // Most active first, then alphabetical — NEVER by rating, and never ordered
+  // such that recording complaints sinks a name (section 4).
   return Array.from(by.values()).sort(
-    (a, b) => b.tables_visited - a.tables_visited || a.person.localeCompare(b.person),
+    (a, b) => b.tables_visited - a.tables_visited
+      || b.taken - a.taken
+      || b.feedbacks_recorded - a.feedbacks_recorded
+      || a.person.localeCompare(b.person),
   );
 }
 
@@ -1290,14 +1656,16 @@ export function itemComments(
     u.orders.map((o) => o.order_id),
   );
   const orderById = new Map(u.orders.map((o) => [o.order_id, o]));
-  const person = !isAll(opts.filters.gre)
-    ? String(opts.filters.gre).trim()
-    : !isAll(opts.filters.manager) ? String(opts.filters.manager).trim() : '';
 
+  // 🔒 SECTION 6, LAYER 2 — and it applies to the click-through too. This used
+  // to drop every row not recorded by the selected person, which made the
+  // comment list disagree with the very row that was clicked (the counts above
+  // it are room-scoped) AND turned a person filter into a per-person sentiment
+  // view. Every row carries `gre_name`, so the screen can still show who wrote
+  // each one without the list itself becoming a judgement of one name.
   const visitMeta = new Map<string, { table: string; floor: string; gre: string; captain: string; day: string }>();
   for (const v of visitRows as any[]) {
     const gre = String(v.gre_name ?? '').trim();
-    if (person && gre !== person) continue;
     const o = orderById.get(String(v.order_id));
     visitMeta.set(String(v.id), {
       table: String(v.table_number ?? o?.table_number ?? ''),
@@ -1366,9 +1734,29 @@ export function itemComments(
    tables. The xlsx writer turns each table into a sheet; the PDF writer hands
    the same tables to `buildReportPdf()`. Neither computes anything. */
 
+export interface ReportColumn {
+  label: string;
+  width?: number;
+  align?: 'left' | 'right' | 'center';
+  /**
+   * This column carries a FREE-TEXT NAME that the PDF renderer will hard-
+   * truncate to one line. `reports/route.ts` replaces the cell text of such a
+   * column with a printed label that is guaranteed UNIQUE at the width the
+   * column actually gets; the xlsx keeps the full string, because a spreadsheet
+   * cell does not truncate.
+   *
+   * Measured on the 628 real menu items: at the shipped widths the renderer
+   * truncated 151 of them and collapsed 58 DISTINCT dishes into 28 identical
+   * printed strings — "AG FORTYSEVEN CHARDONNAY BOTTLE" and
+   * "…CHARDONNAY GLASS" both printed as "AG FORTYSEVEN CHAR…". A chef reading
+   * that acts on the wrong item.
+   */
+  fitPrint?: boolean;
+}
+
 export interface ReportTable {
   name: string;
-  columns: { label: string; width?: number; align?: 'left' | 'right' | 'center' }[];
+  columns: ReportColumn[];
   rows: (string | number)[][];
   note?: string;
   emptyNote?: string;
@@ -1438,10 +1826,23 @@ export function buildReport(p: AnalyticsPayload, key: ReportKeyName): ReportDoc 
   const filters = filterLines(p.range, p.filters);
   const s = p.summary;
 
+  // Section 7: the two counts are both printed, with their relationship on the
+  // face of the sheet. The Summary used to say "Feedbacks taken 9" beside a
+  // Rating split sheet that accounted for 10, inside ONE workbook.
   const coverageKpis = [
-    { label: 'Eligible tables', value: n0(s.eligible_tables), sub: `threshold ${p.meta.item_threshold} items${p.meta.item_threshold_is_default ? ' (default)' : ''}` },
-    { label: 'Feedbacks taken', value: n0(s.feedback_taken) },
-    { label: 'Coverage', value: pctText(s.coverage_pct) },
+    { label: 'Eligible tables', value: n0(s.eligible_tables), sub: `threshold ${p.meta.item_threshold} items${p.meta.item_threshold_is_default ? ' (default)' : ''}, or bill asked / printed` },
+    {
+      label: 'Feedbacks recorded',
+      value: n0(s.feedbacks_recorded),
+      sub: s.extra_visits
+        ? `${n0(s.eligible_tables_covered)} on eligible tables + ${n0(s.extra_visits)} on tables that never met the trigger`
+        : 'all of them on eligible tables',
+    },
+    {
+      label: 'Coverage',
+      value: pctText(s.coverage_pct),
+      sub: `${n0(s.eligible_tables_covered)} of ${n0(s.eligible_tables)} eligible tables covered`,
+    },
     { label: 'Negative item feedbacks', value: n0(s.negative_item_feedbacks), sub: `of ${n0(s.item_feedbacks)} item feedbacks` },
   ];
 
@@ -1449,12 +1850,50 @@ export function buildReport(p: AnalyticsPayload, key: ReportKeyName): ReportDoc 
     period: p.range.label,
     filters,
     footnotes: [
+      p.meta.counts_scope,
       NEGATIVE_PCT_BASIS,
       RETURN_REMAKE_BASIS,
+      'Feedbacks recorded counts EVERY visit in scope; Coverage counts only the visits on tables '
+      + 'that met the eligibility trigger, over the tables that met it. A visit to a table nobody '
+      + 'was owed is real work and is in the first number, never in the second - so the two can '
+      + 'differ, and the Summary sheet says by how much.',
       `Dates are IST business days with a ${p.range.cutoff} rollover - the same convention the floor board uses, so a complaint taken at 01:30 belongs to the previous evening's service.`,
       ISSUES_RECORDED_IS_NOT_A_PENALTY,
     ],
   };
+
+  /** The "What <name> did" sheet. Present ONLY when a person filter is set, and
+   *  it is the ONLY thing that filter changes. Every column is one of the five
+   *  the owner named. */
+  const personTables: ReportTable[] = p.person
+    ? [{
+      name: `What ${p.person.person} did`,
+      columns: [{ label: 'Measure', width: 3 }, { label: 'Value', width: 1.2, align: 'right' }, { label: 'Basis', width: 3.4 }],
+      rows: [
+        ['Tables visited (distinct eligible tables they recorded on)', p.person.tables_visited, 'Owner metric: Tables Visited. Same rule as the Tracker\'s "Tables".'],
+        ['Feedbacks taken on eligible tables', p.person.taken, 'Same rule as the Tracker\'s "Taken" - the coverage numerator'],
+        ['Feedbacks recorded (all their visits in scope)', p.person.feedbacks_recorded, 'Includes tables that never met the trigger'],
+        ['Floor they are measured against', p.person.area_label, p.person.area_assigned ? 'users.preferred_zones' : 'No assignment - measured against every eligible table in scope'],
+        ['Coverage of their own floor',
+          p.person.area_assigned ? pctText(p.person.area_coverage_pct) : '-',
+          p.person.area_assigned
+            ? `${n0(p.person.area_covered ?? 0)} of ${n0(p.person.area_eligible ?? 0)} eligible tables on their floor`
+            : COVERAGE_PER_GRE_UNAVAILABLE],
+        ['Helped on another floor', p.person.off_area_visits, 'Counted as work, never as a shortfall. Nobody is blocked from helping elsewhere.'],
+        ['Share of the tables that were covered', pctText(p.person.share_pct), "Their part of the room's covered tables"],
+        ['Issues properly recorded', p.person.issues_recorded, 'Owner metric. A CREDIT, never a penalty.'],
+        ['Follow-ups raised', p.person.follow_ups_raised, 'Complaints they opened'],
+        ['Follow-ups completed', p.person.follow_ups_completed, 'Owner metric: Follow-Ups Completed'],
+        ['Follow-ups still open', p.person.follow_ups_open, 'A work queue, not a score'],
+        ['Guest recovery follow-up',
+          recoveryLong(p.person.follow_ups_completed, p.person.follow_ups_raised),
+          'Completed / raised. Owner metric - and a QUEUE, not a score.'],
+      ] as (string | number)[][],
+      note: `${ISSUES_RECORDED_IS_NOT_A_PENALTY} ${RECOVERY_IS_A_QUEUE} ${p.person.coverage_basis} `
+        + 'Nothing in this sheet is a rating, and no other sheet in this file is about this person.',
+      emptyNote: 'This person recorded nothing in this period.',
+    }]
+    : [];
 
   const dailyTable: ReportTable = {
     name: 'By day',
@@ -1489,21 +1928,34 @@ export function buildReport(p: AnalyticsPayload, key: ReportKeyName): ReportDoc 
     // "Negative %" as "Negativ…" and "Negativ…" — two different columns with
     // the SAME visible heading. Every label and a worst-case cell were measured
     // against `doc.widthOfString()` at the renderer's real font
-    // (Helvetica-Bold 8 / Helvetica 8, PAD 4, CONTENT_W 515.28); the P5
-    // evidence carries the check. Headings match the SCREEN's wording
-    // ("Neg %", "R/R %", "Happy") so a manager reading the file and a manager
-    // reading the page are looking at the same words.
+    // (Helvetica-Bold 8 / Helvetica 8, PAD 4, CONTENT_W 515.28).
+    //
+    // 🐞 THE SECOND MEASUREMENT, AND THE ONE THAT MATTERED. The HEADINGS fit;
+    // the ITEM NAMES did not. Over the 628 real menu items, 151 truncated and
+    // 58 DISTINCT dishes printed as 28 IDENTICAL strings — "AG FORTYSEVEN
+    // CHARDONNAY BOTTLE" and "AG FORTYSEVEN CHARDONNAY GLASS" both came out
+    // "AG FORTYSEVEN CHAR…", i.e. a bottle of wine and a glass of it are the
+    // same row. Two things fix it, and BOTH are applied:
+    //   (1) the weights below are now the MEASURED MINIMUM for every other
+    //       column (heading at Helvetica-Bold 8 vs worst-case cell at
+    //       Helvetica 8, + 2*PAD) with EVERY remaining point given to Item:
+    //       103.2pt -> 127.1pt usable, 477 -> 562 of 628 printed in full;
+    //   (2) `fitPrint` (see ReportColumn) hands the column to the unique-label
+    //       pass in `reports/route.ts`, which head-and-tail elides instead of
+    //       chopping the tail off — so the BOTTLE/GLASS distinction survives —
+    //       and guarantees no two distinct items print the same string.
+    // Re-measured with both applied: 628 of 628 printed strings distinct.
     columns: [
-      { label: 'Item', width: 2.6 },
-      { label: 'Group', width: 1.35 },
-      { label: 'Sold', width: 0.85, align: 'right' },
-      { label: 'Feedbacks', width: 1.2, align: 'right' },
-      { label: 'Negative', width: 1.1, align: 'right' },
-      { label: 'Neg %', width: 0.95, align: 'right' },
-      { label: 'Returned', width: 1.1, align: 'right' },
-      { label: 'Remade', width: 1, align: 'right' },
-      { label: 'R/R %', width: 0.95, align: 'right' },
-      { label: 'Happy', width: 0.95, align: 'right' },
+      { label: 'Item', width: 135, fitPrint: true },
+      { label: 'Group', width: 52 },
+      { label: 'Sold', width: 46, align: 'right' },
+      { label: 'Feedbacks', width: 50, align: 'right' },
+      { label: 'Negative', width: 42, align: 'right' },
+      { label: 'Neg %', width: 36, align: 'right' },
+      { label: 'Returned', width: 44, align: 'right' },
+      { label: 'Remade', width: 40, align: 'right' },
+      { label: 'R/R %', width: 36, align: 'right' },
+      { label: 'Happy', width: 34, align: 'right' },
     ],
     rows: rows.map((m) => [
       m.menu_item, groupLabel(m), qtyText(m.sold), m.feedbacks, m.negative,
@@ -1531,20 +1983,32 @@ export function buildReport(p: AnalyticsPayload, key: ReportKeyName): ReportDoc 
           { label: 'Follow-ups open now (all dates)', value: n0(s.open_follow_ups_now) },
         ],
         tables: [
+          ...personTables,
           dailyTable,
           {
             name: 'Rating split',
             columns: [{ label: 'Overall rating', width: 2 }, { label: 'Feedbacks', width: 1.1, align: 'right' }, { label: 'Share', width: 1, align: 'right' }],
+            // Every share is over the SAME denominator — every visit in scope,
+            // `feedbacks_recorded` — and the Total row prints it, so the sheet
+            // reconciles against the Summary on its own face. The first cut
+            // divided the four ratings by "rated only" and Not rated by
+            // "rated + unrated", so the column did not add to 100 %, and the
+            // whole sheet counted a different population from the Summary's
+            // "Feedbacks taken".
             rows: (() => {
-              const total = s.excellent + s.good + s.average + s.poor;
+              const total = s.feedbacks_recorded;
               const out: (string | number)[][] = OVERALL_RATINGS.map((o) => {
                 const v = o.v === 'excellent' ? s.excellent : o.v === 'good' ? s.good : o.v === 'average' ? s.average : s.poor;
                 return [o.label, v, pctText(rate(v, total))];
               });
-              out.push(['Not rated', s.unrated, pctText(rate(s.unrated, total + s.unrated))]);
+              out.push(['Not rated', s.unrated, pctText(rate(s.unrated, total))]);
+              out.push(['Total feedbacks recorded', total, pctText(rate(total, total))]);
               return out;
             })(),
-            note: '"Everything Good" submissions are counted under their overall rating; a visit recorded with no overall rating is listed as Not rated.',
+            note: '"Everything Good" submissions are counted under their overall rating; a visit '
+              + 'recorded with no overall rating is listed as Not rated. The Total is the same '
+              + '"Feedbacks recorded" figure as the Summary sheet - every visit in scope, '
+              + 'including any on a table that never met the eligibility trigger.',
             emptyNote: 'No feedback was recorded in this period.',
           },
           {
@@ -1573,17 +2037,18 @@ export function buildReport(p: AnalyticsPayload, key: ReportKeyName): ReportDoc 
           { label: 'Returned + remade', value: n0(s.returned + s.remade) },
         ],
         tables: [
+          ...personTables,
           menuTable(p.menu_items),
           {
             name: 'Most complained',
-            columns: [{ label: 'Item', width: 3 }, { label: 'Negative', width: 1.1, align: 'right' }, { label: 'Feedbacks', width: 1.2, align: 'right' }, { label: 'Neg %', width: 1, align: 'right' }],
+            columns: [{ label: 'Item', width: 3, fitPrint: true }, { label: 'Negative', width: 1.1, align: 'right' }, { label: 'Feedbacks', width: 1.2, align: 'right' }, { label: 'Neg %', width: 1, align: 'right' }],
             rows: p.most_complained.map((x) => [x.label, x.count, x.feedbacks, pctText(x.negative_pct)]),
             note: 'Ordered by absolute count, deliberately: a rate alone hides a high-volume dish with many complaints, and a count alone hides a rarely-ordered one that is always wrong. Read this beside Negative %.',
             emptyNote: 'No negative item feedback in this period.',
           },
           {
             name: 'Most appreciated',
-            columns: [{ label: 'Item', width: 3 }, { label: 'Good ratings', width: 1.4, align: 'right' }, { label: 'Feedbacks', width: 1.2, align: 'right' }],
+            columns: [{ label: 'Item', width: 3, fitPrint: true }, { label: 'Good ratings', width: 1.4, align: 'right' }, { label: 'Feedbacks', width: 1.2, align: 'right' }],
             rows: p.most_appreciated.map((x) => [x.label, x.count, x.feedbacks]),
             emptyNote: 'No positive item feedback in this period.',
           },
@@ -1601,10 +2066,11 @@ export function buildReport(p: AnalyticsPayload, key: ReportKeyName): ReportDoc 
           { label: 'Cancelled', value: n0(s.cancelled) },
         ],
         tables: [
+          ...personTables,
           {
             name: 'By item',
             columns: [
-              { label: 'Item', width: 2.8 }, { label: 'Sold', width: 0.9, align: 'right' },
+              { label: 'Item', width: 2.8, fitPrint: true }, { label: 'Sold', width: 0.9, align: 'right' },
               { label: 'Returned', width: 1.1, align: 'right' }, { label: 'Remade', width: 1, align: 'right' },
               { label: 'Replaced', width: 1.1, align: 'right' }, { label: 'Cancelled', width: 1.2, align: 'right' },
               { label: 'R/R %', width: 0.95, align: 'right' }, { label: 'Happy', width: 0.95, align: 'right' },
@@ -1634,6 +2100,7 @@ export function buildReport(p: AnalyticsPayload, key: ReportKeyName): ReportDoc 
           { label: 'Follow-ups still open', value: n0(s.pending_follow_ups) },
         ],
         tables: [
+          ...personTables,
           {
             name: 'Most common problems',
             columns: [{ label: 'Problem', width: 3 }, { label: 'Count', width: 1, align: 'right' }, { label: 'Share of negatives', width: 1.5, align: 'right' }],
@@ -1650,36 +2117,57 @@ export function buildReport(p: AnalyticsPayload, key: ReportKeyName): ReportDoc 
         ...base, key, slug: 'gre-manager-performance', title: 'GRE / Manager Performance Report',
         subtitle: 'Coverage and follow-through only. No rating the guests gave appears in this report.',
         kpis: [
-          { label: 'Venue coverage', value: pctText(s.coverage_pct), sub: `${n0(s.feedback_taken)} of ${n0(s.eligible_tables)} eligible tables` },
+          { label: 'Venue coverage', value: pctText(s.coverage_pct), sub: `${n0(s.eligible_tables_covered)} of ${n0(s.eligible_tables)} eligible tables` },
           { label: 'Follow-ups raised', value: n0(s.follow_ups_raised) },
           { label: 'Follow-ups completed', value: n0(s.follow_ups_completed) },
           { label: 'Still open', value: n0(s.pending_follow_ups) },
         ],
         tables: [
+          ...personTables,
           {
             name: 'By person',
             // Measured widths (see the menuTable note). "Follow-ups
             // completed" and "Recovery follow-up %" both truncated to
             // "Follow-ups co…" / "Recovery follo…" at the old widths; the
             // note below carries the full meaning of each short heading.
+            // Measured minimums (see the menuTable note) with the remainder to
+            // Person, which is the only free-text column here.
             columns: [
-              { label: 'Person', width: 2.0 }, { label: 'Role', width: 1.1 },
-              { label: 'Tables', width: 0.9, align: 'right' },
-              { label: 'Issues', width: 0.9, align: 'right' },
-              { label: 'Raised', width: 0.9, align: 'right' },
-              { label: 'Completed', width: 1.2, align: 'right' },
-              { label: 'Open', width: 0.8, align: 'right' },
-              { label: 'Recovery %', width: 1.2, align: 'right' },
+              { label: 'Person', width: 96, fitPrint: true }, { label: 'Floor', width: 66, fitPrint: true },
+              { label: 'Tables', width: 34, align: 'right' },
+              { label: 'Their floor', width: 52, align: 'right' },
+              { label: 'Off-floor', width: 46, align: 'right' },
+              { label: 'Issues', width: 34, align: 'right' },
+              { label: 'Raised', width: 36, align: 'right' },
+              { label: 'Completed', width: 50, align: 'right' },
+              { label: 'Open', width: 30, align: 'right' },
+              // Not "Recovery %": a bare ratio in this column printed `0.0%`
+              // for the GRE with two complaints still to revisit and `-` for
+              // the one who recorded none, so the honest row read worse AND
+              // sorted below. `recoveryCell()` carries its denominator.
+              { label: 'Recovery', width: 62, align: 'right' },
             ],
             rows: p.gre_performance.map((g) => [
-              g.person, g.role || '-', g.tables_visited, g.issues_recorded,
-              g.follow_ups_raised, g.follow_ups_completed, g.follow_ups_open, pctText(g.recovery_pct),
+              g.person,
+              g.area_assigned ? g.area_zones.join(' / ') : 'all',
+              g.tables_visited,
+              g.area_assigned ? `${g.area_covered ?? 0}/${g.area_eligible ?? 0} ${pctText(g.area_coverage_pct)}` : '-',
+              g.area_assigned ? g.off_area_visits : '-',
+              g.issues_recorded,
+              g.follow_ups_raised, g.follow_ups_completed, g.follow_ups_open,
+              recoveryCell(g.follow_ups_completed, g.follow_ups_raised),
             ]),
-            note: 'Tables = eligible tables this person recorded feedback on. Issues = complaints '
-              + 'they wrote down. Raised / Completed / Open = follow-ups they created, closed and '
-              + `still owe. Recovery % = completed / raised. ${ISSUES_RECORDED_IS_NOT_A_PENALTY} `
-              + `${COVERAGE_PER_GRE_UNAVAILABLE}`,
-            emptyNote: 'Nobody recorded feedback in this period.',
+            note: 'Tables = eligible tables this person recorded feedback on, anywhere. '
+              + '"Their floor" is coverage of the eligible tables on the floor assigned to them '
+              + '(users.preferred zones) - the owner\'s ruling: the floor is a DEFAULT, not a '
+              + 'restriction, so a person with no assignment shows "-" rather than an invented '
+              + 'denominator. "Off-floor" is visits they made helping on someone else\'s floor; '
+              + 'it is counted as work and is already inside Tables. Issues = complaints they '
+              + 'wrote down. Raised / Completed / Open = follow-ups they created, closed and '
+              + `still owe. ${ISSUES_RECORDED_IS_NOT_A_PENALTY} ${RECOVERY_IS_A_QUEUE} `
+              + 'A person listed with 0 everywhere holds the GRE role and recorded nothing in '
+              + 'this period - that row is the point of this table, not an error.',
+            emptyNote: 'Nobody holds the GRE role and nobody recorded feedback in this period.',
           },
           dailyTable,
         ],
@@ -1697,11 +2185,12 @@ export function buildReport(p: AnalyticsPayload, key: ReportKeyName): ReportDoc 
           { label: 'Still unhappy', value: n0(s.still_unhappy) },
         ],
         tables: [
+          ...personTables,
           recoveryTable,
           {
             name: 'By item',
             columns: [
-              { label: 'Item', width: 2.8 }, { label: 'Negative', width: 1.1, align: 'right' },
+              { label: 'Item', width: 2.8, fitPrint: true }, { label: 'Negative', width: 1.1, align: 'right' },
               { label: 'Returned', width: 1.1, align: 'right' }, { label: 'Remade', width: 1, align: 'right' },
               { label: 'Replaced', width: 1.1, align: 'right' },
               { label: 'Happy', width: 0.95, align: 'right' }, { label: 'Still unhappy', width: 1.3, align: 'right' },

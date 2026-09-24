@@ -84,16 +84,35 @@
  * such that the first looks worse. Any column added later that makes recording
  * a complaint look bad for the recorder is a DEFECT, not a feature.
  *
- * WHAT CANNOT HONESTLY BE COMPUTED PER PERSON, and is therefore not.
- * "Eligible tables" is a property of the FLOOR, not of a person: nothing in this
- * app assigns a table to a GRE, so there is no data from which to say table 24
- * was Priya's to visit. Dividing the room by the number of GREs on shift would
- * be an invented denominator, and an invented denominator in a performance
- * table is worse than no number at all. So Eligible / Pending / Coverage % are
- * reported on the FLOOR TOTAL row (`totals`), which is a real, checkable fact,
- * and each person's row carries their real activity plus `share_pct` — their
- * share of the tables that WERE covered. `coverage_scope: 'floor'` says so in
- * the payload, and the page prints it.
+ * ════════════════════════════════════════════════════════════════════════════
+ * 2a. THE PER-PERSON DENOMINATOR — the owner answered this on 2026-09-23
+ * ════════════════════════════════════════════════════════════════════════════
+ * There used to be none. Nothing in this app assigned a table to a GRE, so
+ * "Eligible / Pending / Coverage %" sat on the FLOOR TOTAL row only, and each
+ * person's row carried activity plus `share_pct`. Inventing a denominator —
+ * dividing the room by the GREs on shift, say — would have been worse than no
+ * number.
+ *
+ * His ruling, asked as *"A Floor assigned GRE should take the feedback right?"*:
+ *
+ *     THE FLOOR IS A DEFAULT, NOT A RESTRICTION.
+ *       · Page 1 OPENS on the GRE's own floor, and they can still switch.
+ *       · COVERAGE IS MEASURED AGAINST THEIR FLOOR, not the whole restaurant.
+ *       · NOBODY IS EVER BLOCKED from helping on another floor.
+ *
+ * So a person who holds `users.preferred_zones` now has a real, checkable
+ * denominator — the eligible tables on their own floor, inside the current
+ * Floor/Captain scope — and their row carries `area_eligible`, `area_covered`
+ * and `area_coverage_pct`. A person with NO assignment keeps exactly the old
+ * answer: nulls, a share, and the reason. Visits they made on someone else's
+ * floor are `off_area_visits` — counted as work, never as a shortfall, because
+ * the third line of the ruling says nobody is blocked from helping. The rule
+ * lives in `src/lib/feedback/zones.ts`, which also records why it does not use
+ * `captain-area.ts` (that helper is inert: `captain_area_lock` has zero rows,
+ * and switching it on would restrict CAPTAINS mid-service).
+ *
+ * `totals.coverage_scope: 'floor'` still says the FLOOR TOTAL is the room's,
+ * and the page prints it.
  *
  * ════════════════════════════════════════════════════════════════════════════
  * 3. COUNTS ARE COMPUTED WHERE THE ROWS ARE
@@ -118,6 +137,7 @@ import {
   type BoardDay,
 } from '@/lib/feedback/read';
 import { GRE_ROLE_NAME } from '@/lib/feedback/access';
+import { areaCovers, readGreAreas, AREA_UNASSIGNED } from '@/lib/feedback/zones';
 import { businessDateOf } from '@/lib/hr-attendance';
 import {
   isNegative,
@@ -184,6 +204,11 @@ export interface TrackerRecordRow {
   food_count: number;
   drinks_count: number;
   eligible_by: { items: boolean; bill_requested: boolean; bill_printed: boolean };
+  /** Did this table meet the owner's trigger — i.e. was a visit OWED here?
+   *  False is legitimate and visible: a GRE may visit a two-item table, and
+   *  that visit is work. It is just not coverage of something owed, so it is
+   *  in neither side of the coverage ratio (§5). */
+  eligible: boolean;
   status: TableStatus;
   /** Null until a visit exists — which is the point of the Pending filter. */
   visit_id: string | null;
@@ -218,24 +243,42 @@ export interface TrackerCoverageRow {
    *  today, which is precisely the case the Floor Manager opened this page to
    *  see. */
   kind: 'gre' | 'management' | 'assigned';
+  /** Eligible tables they recorded on. */
   tables_visited: number;
+  /** Every visit of theirs in scope, eligible table or not. `taken` counts
+   *  only the eligible ones — §5's pair, same names as Page 4. */
   taken: number;
+  feedbacks_recorded: number;
   issues_recorded: number;
   follow_ups_opened: number;
   follow_ups_completed: number;
   follow_ups_open: number;
   /** Share of the tables that WERE covered. Not a coverage %. */
   share_pct: number | null;
+  /* ── the owner's floor ruling (§2a). Null when nothing is assigned. ────── */
+  area_zones: string[];
+  area_assigned: boolean;
+  /** Eligible tables on THEIR floor, inside the current Floor/Captain scope. */
+  area_eligible: number | null;
+  area_covered: number | null;
+  area_coverage_pct: number | null;
+  /** Visits on eligible tables that are NOT theirs. Work, never a shortfall. */
+  off_area_visits: number;
 }
 
 export interface TrackerTotals {
   /** Eligible tables in scope for the business day = the coverage denominator. */
   eligible: number;
+  /** Visits on ELIGIBLE tables — the coverage numerator. */
   taken: number;
+  /** Every visit in scope, eligible or not. `taken` + `extra_visits`. */
+  feedbacks_recorded: number;
+  /** Visits on tables that never met the trigger. In neither side of the % . */
+  extra_visits: number;
   pending: number;
   coverage_pct: number | null;
-  /** Always 'floor' — see §2. Named in the payload so the page cannot quietly
-   *  start printing this number in a per-person row. */
+  /** 'floor' = the room. A PERSON's coverage lives on their own row and only
+   *  when they have a floor assignment — see §2a. */
   coverage_scope: 'floor';
 }
 
@@ -582,6 +625,7 @@ export function readTracker(
       food_count: a.food,
       drinks_count: a.drinks,
       eligible_by: { items: byItems, bill_requested: billRequested, bill_printed: billPrinted },
+      eligible,
       status: tableStatus({
         hasVisit: !!visitId,
         eligible,
@@ -639,14 +683,36 @@ export function readTracker(
   });
 
   // ── (h) the day's arithmetic — carried-over rows deliberately excluded ────
+  //
+  // 🐞 ONE DEFINITION OF COVERAGE, AND PAGE 4 USES THE SAME ONE. This used to
+  // count `today.length` as the denominator and every visited row as the
+  // numerator — which put a VISITED-BUT-NEVER-ELIGIBLE table (step (f)'s
+  // `|| visitId` invariant) into BOTH sides. Measured on one service with no
+  // filters set, Page 3 answered `13 eligible / 10 taken / 76.9 %` while
+  // Page 4 answered `12 / 9 / 75.0 %` — two screens the owner reads side by
+  // side, disagreeing about the number the module exists to produce.
+  //
+  // PAGE 4's DEFINITION IS THE RIGHT ONE and this page now uses it: the
+  // denominator is the tables that were OWED a visit, and the numerator is the
+  // visits on those tables. Padding both sides with not-owed visits made the
+  // ratio drift toward 100 % as a GRE visited more tables nobody was owed —
+  // a coverage figure that improves without covering anything.
+  //
+  // NOTHING DISAPPEARS. The extra visit is still a row in the list, still in
+  // the chips, and is now counted by name in `extra_visits`. `taken ⊆ active`
+  // still holds — it is now guaranteed by restricting the NUMERATOR instead of
+  // inflating the denominator, which is the same invariant reached honestly.
   const today = roomScope.filter((r) => !r.carried_over);
+  const eligibleToday = today.filter((r) => r.eligible);
   const counts: Record<string, number> = {
-    active: today.length,
-    due: today.filter((r) => !r.visit_id).length,
-    taken: today.filter((r) => !!r.visit_id).length,
+    active: eligibleToday.length,
+    due: eligibleToday.filter((r) => !r.visit_id).length,
+    taken: eligibleToday.filter((r) => !!r.visit_id).length,
     issues: today.filter((r) => r.issues > 0).length,
     follow_up: today.filter((r) => r.open_follow_ups > 0).length,
     carried_over_follow_up: roomScope.filter((r) => r.carried_over).length,
+    feedbacks_recorded: today.filter((r) => !!r.visit_id).length,
+    extra_visits: today.filter((r) => !!r.visit_id && !r.eligible).length,
   };
 
   const filter_counts: Record<string, number> = {};
@@ -661,6 +727,8 @@ export function readTracker(
   const totals: TrackerTotals = {
     eligible: counts.active,
     taken: counts.taken,
+    feedbacks_recorded: counts.feedbacks_recorded,
+    extra_visits: counts.extra_visits,
     pending: counts.active - counts.taken,
     coverage_pct: counts.active ? round1((counts.taken / counts.active) * 100) : null,
     coverage_scope: 'floor',
@@ -702,8 +770,8 @@ export function readTracker(
       excluded,
       counts_scope:
         scope.gre !== 'all' || scope.manager !== 'all'
-          ? 'Header counts, coverage % and the progress table cover the whole floor for this service. The GRE / Manager filter narrows the record list only — an unvisited table carries nobody\'s name, so filtering coverage by a person would always read 100%.'
-          : 'Header counts, coverage % and the progress table cover the selected Floor and Captain for this service.',
+          ? 'Header counts, coverage % and the progress table cover the whole floor for this service. The GRE / Manager filter narrows the record list only — an unvisited table carries nobody\'s name, so filtering coverage by a person would always read 100%. A person\'s OWN coverage is on their row in the progress table, measured against the floor assigned to them.'
+          : 'Header counts, coverage % and the progress table cover the selected Floor and Captain for this service. Coverage = visits on ELIGIBLE tables / eligible tables; a visit to a table that never met the trigger is counted in Feedbacks recorded and is in neither side of the ratio. Page 4 uses the identical definition.',
       section_filter: sectionFilterNote(db),
       cache_mismatch: cacheMismatch,
     },
@@ -768,9 +836,11 @@ function buildCoverage(db: Database.Database, rows: TrackerRecordRow[]): Tracker
     kind: TrackerCoverageRow['kind'],
   ): TrackerCoverageRow => ({
     person_id, person, role, kind,
-    tables_visited: 0, taken: 0, issues_recorded: 0,
+    tables_visited: 0, taken: 0, feedbacks_recorded: 0, issues_recorded: 0,
     follow_ups_opened: 0, follow_ups_completed: 0, follow_ups_open: 0,
     share_pct: null,
+    area_zones: [], area_assigned: false,
+    area_eligible: null, area_covered: null, area_coverage_pct: null, off_area_visits: 0,
   });
 
   try {
@@ -794,6 +864,7 @@ function buildCoverage(db: Database.Database, rows: TrackerRecordRow[]): Tracker
   }
 
   const tablesByPerson = new Map<string, Set<string>>();
+  const rowsByPerson = new Map<string, TrackerRecordRow[]>();
 
   for (const r of rows) {
     if (!r.visit_id) continue;
@@ -805,7 +876,11 @@ function buildCoverage(db: Database.Database, rows: TrackerRecordRow[]): Tracker
     // recorded as management stays 'management'.
     if (row.kind === 'assigned') row.kind = kind;
     if (!row.role || row.role === '—') row.role = r.gre_role || row.role;
-    row.taken += 1;
+    row.feedbacks_recorded += 1;
+    // §5: `taken` is the coverage numerator, so it counts ELIGIBLE tables only.
+    // A visit to a table nobody was owed is in feedbacks_recorded and in the
+    // list, and in neither side of any coverage ratio.
+    if (r.eligible) row.taken += 1;
     row.issues_recorded += r.issues;
     for (const line of r.items) {
       if (!line.follow_up) continue;
@@ -813,16 +888,48 @@ function buildCoverage(db: Database.Database, rows: TrackerRecordRow[]): Tracker
       if (line.follow_up.status === 'open') row.follow_ups_open += 1;
       else row.follow_ups_completed += 1;
     }
-    const set = tablesByPerson.get(k) ?? new Set<string>();
-    set.add(r.table_id);
-    tablesByPerson.set(k, set);
+    if (r.eligible) {
+      const set = tablesByPerson.get(k) ?? new Set<string>();
+      set.add(r.table_id);
+      tablesByPerson.set(k, set);
+    }
+    const list = rowsByPerson.get(k) ?? [];
+    list.push(r);
+    rowsByPerson.set(k, list);
     out.set(k, row);
   }
 
-  const totalTaken = rows.filter((r) => !!r.visit_id).length;
+  // ── §2a — THE OWNER'S FLOOR RULING, as a real per-person denominator ──────
+  // Until 2026-09-23 there was none, so this table carried counts and a share
+  // and said why (decision 12). His answer: a GRE assigned to a floor is
+  // MEASURED against that floor, may still work any other floor, and is never
+  // blocked. So a person with `users.preferred_zones` now gets a real coverage
+  // %, and a person with no assignment keeps the honest "-" and the venue
+  // denominator the module used before. `zones.ts` holds the rule and the
+  // reason it is not `captain-area.ts` (that helper is inert here: its
+  // `captain_area_lock` setting has zero rows, and switching it on would start
+  // restricting CAPTAINS mid-service).
+  const areas = readGreAreas(db, Array.from(out.values()).map((r) => r.person_id));
+  const eligibleRows = rows.filter((r) => r.eligible);
+
+  const totalTaken = eligibleRows.filter((r) => !!r.visit_id).length;
   for (const [k, row] of out) {
     row.tables_visited = (tablesByPerson.get(k)?.size) ?? 0;
     row.share_pct = totalTaken ? round1((row.taken / totalTaken) * 100) : null;
+
+    const area = (row.person_id ? areas.get(row.person_id) : undefined) ?? AREA_UNASSIGNED;
+    row.area_zones = area.zones;
+    row.area_assigned = area.assigned;
+    if (area.assigned) {
+      const mine = eligibleRows.filter((r) => areaCovers(area, r.floor, r.table_id));
+      const mineIds = new Set(mine.map((r) => r.order_id));
+      const theirs = rowsByPerson.get(k) ?? [];
+      const covered = theirs.filter((r) => mineIds.has(r.order_id)).length;
+      row.area_eligible = mine.length;
+      row.area_covered = covered;
+      row.area_coverage_pct = mine.length ? round1((covered / mine.length) * 100) : null;
+      row.off_area_visits = theirs.filter((r) => r.eligible && !mineIds.has(r.order_id)).length;
+    }
   }
 
   // Most active first, then alphabetical — NEVER by rating, and never ordered

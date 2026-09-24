@@ -26,6 +26,7 @@ import { getDb } from '@/lib/db';
 import { getCurrentOutletId } from '@/lib/auth';
 import { requireFeedbackReader } from '@/lib/feedback/session';
 import { listFloorTables } from '@/lib/feedback/read';
+import { areaLabel, greAreaOf, AREA_ASSIGNED_NOTE, AREA_UNASSIGNED_NOTE } from '@/lib/feedback/zones';
 
 export async function GET() {
   const gate = await requireFeedbackReader();
@@ -35,6 +36,17 @@ export async function GET() {
     const db = getDb();
     const outletId = await getCurrentOutletId();
     const { rows, meta } = listFloorTables(db, { outletId });
+
+    // 🔒 THE OWNER'S FLOOR RULING, 2026-09-23: "THE FLOOR IS A DEFAULT, NOT A
+    // RESTRICTION." The board below is the WHOLE venue, unfiltered, for every
+    // viewer — nobody is ever blocked from helping on another floor, and that
+    // is the third line of the ruling. What is shipped here is the DEFAULT the
+    // screen opens on, and the floors this person's coverage is measured
+    // against; `my_floors` empty means no assignment, which means all floors
+    // and a venue-wide denominator, exactly as before. The session already
+    // carries `preferred_zones`, so this costs no query.
+    const area = greAreaOf(gate.me.preferred_zones, gate.me.preferred_table_ids);
+
     return Response.json({
       tables: rows,
       meta,
@@ -43,6 +55,10 @@ export async function GET() {
         role_name: gate.me.role_name,
         read_only: gate.readOnly,
         scope: gate.decision.scope,
+        my_floors: area.zones,
+        area_assigned: area.assigned,
+        area_label: areaLabel(area),
+        area_note: area.assigned ? AREA_ASSIGNED_NOTE : AREA_UNASSIGNED_NOTE,
       },
     });
   } catch (e: any) {

@@ -41,7 +41,7 @@
  * scrolls sideways.
  */
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import {
   Users, Utensils, Clock, ChevronRight, ChevronDown, RefreshCw, Lock, AlertTriangle, Wine,
@@ -60,7 +60,20 @@ const isActionable = (s: TableStatus) => s !== 'not_ready';
 interface FloorPayload {
   tables: FloorRow[];
   meta: FloorMeta;
-  viewer: { name: string; role_name: string | null; read_only: boolean; scope: string };
+  viewer: {
+    name: string;
+    role_name: string | null;
+    read_only: boolean;
+    scope: string;
+    /** 🔒 The owner's floor ruling: the floors assigned to this person. The
+     *  board itself is NEVER filtered by them — the page just OPENS here, and
+     *  the selector still offers every floor. Empty = no assignment = the old
+     *  behaviour, all floors. */
+    my_floors?: string[];
+    area_assigned?: boolean;
+    area_label?: string;
+    area_note?: string;
+  };
 }
 
 /** The shape `requireFeedbackReader()` refuses with. `what_to_do` is printed
@@ -78,6 +91,17 @@ export default function FloorFeedbackPage() {
 
   const [status, setStatus] = useState<'all' | TableStatus>('all');
   const [floor, setFloor] = useState<string>('all');
+  /**
+   * 🔒 THE FLOOR IS A DEFAULT, NOT A RESTRICTION (owner, 2026-09-23).
+   *
+   * The page opens on the GRE's own floor and they can switch to any other one
+   * at any time — the board the server sent is the WHOLE venue and is never
+   * filtered by the assignment. This ref is what keeps "default" from becoming
+   * "restriction": the default is applied ONCE, on the first payload, so the
+   * ten-second refresh can never drag a GRE who has walked upstairs back to
+   * her own floor mid-visit.
+   */
+  const defaultedFloor = useRef(false);
 
   const [data, setData] = useState<FloorPayload | null>(null);
   const [denial, setDenial] = useState<Denial | null>(null);
@@ -129,6 +153,14 @@ export default function FloorFeedbackPage() {
       setDenial(null);
       setError(null);
       setData(body);
+      // The floor DEFAULT, applied exactly once — see `defaultedFloor`.
+      if (!defaultedFloor.current) {
+        defaultedFloor.current = true;
+        const mine = body.viewer?.my_floors ?? [];
+        if (mine.length === 1) setFloor(mine[0]);
+        // Two or more assigned floors stay on "All floors": picking one of them
+        // for her would hide the other, which is worse than showing everything.
+      }
     } catch (e: any) {
       setError(e?.message || 'Could not reach the server');
     } finally {
@@ -204,10 +236,19 @@ export default function FloorFeedbackPage() {
    */
   const floorOptions = useMemo(() => {
     const live = meta?.floors ?? [];
-    const opts = [{ v: 'all', label: 'All floors' }, ...live.map((f) => ({ v: f, label: f }))];
-    if (floor !== 'all' && !live.includes(floor)) opts.push({ v: floor, label: `${floor} (none open)` });
+    // The viewer's own floor is MARKED, never enforced: every floor stays in
+    // the list, and a floor they are assigned to is offered even when nothing
+    // is open on it — "the floor is a default, not a restriction".
+    const mine = new Set(data?.viewer?.my_floors ?? []);
+    const label = (f: string) => (mine.has(f) ? `${f} (yours)` : f);
+    const all = Array.from(new Set([...live, ...mine]));
+    const opts = [{ v: 'all', label: 'All floors' }, ...all.map((f) => ({
+      v: f,
+      label: live.includes(f) ? label(f) : `${label(f)} (none open)`,
+    }))];
+    if (floor !== 'all' && !all.includes(floor)) opts.push({ v: floor, label: `${floor} (none open)` });
     return opts;
-  }, [meta?.floors, floor]);
+  }, [meta?.floors, floor, data?.viewer?.my_floors]);
 
   /* ── the refusal screen ───────────────────────────────────────────────────
      Printed instead of an empty board, because an empty board is exactly what

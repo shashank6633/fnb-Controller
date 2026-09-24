@@ -444,9 +444,10 @@ export default function FeedbackTrackerPage() {
               <thead>
                 <tr className="text-left text-[#8B7355]">
                   <th className="font-extrabold uppercase tracking-wide pb-2 pr-3">Person</th>
-                  <th className="font-extrabold uppercase tracking-wide pb-2 pr-3">Role</th>
+                  <th className="font-extrabold uppercase tracking-wide pb-2 pr-3">Their floor</th>
                   <th className="font-extrabold uppercase tracking-wide pb-2 pr-3 text-right">Tables</th>
                   <th className="font-extrabold uppercase tracking-wide pb-2 pr-3 text-right">Taken</th>
+                  <th className="font-extrabold uppercase tracking-wide pb-2 pr-3 text-right">Coverage of their floor</th>
                   <th className="font-extrabold uppercase tracking-wide pb-2 pr-3 text-right">Share</th>
                   <th className="font-extrabold uppercase tracking-wide pb-2 pr-3 text-right">Issues rec.</th>
                   <th className="font-extrabold uppercase tracking-wide pb-2 text-right">Follow-ups</th>
@@ -457,11 +458,31 @@ export default function FeedbackTrackerPage() {
                   <tr key={c.person_id || c.person} className="border-t border-[#F0E4D6]">
                     <td className="py-2 pr-3 font-bold text-[#2D1B0E]">{c.person}</td>
                     <td className="py-2 pr-3 text-[#6B5744]">
-                      {c.role}
+                      {c.area_assigned ? c.area_zones.join(' · ') : 'all floors'}
                       {c.kind === 'assigned' ? ' · nothing yet' : ''}
                     </td>
-                    <td className="py-2 pr-3 text-right tabular-nums">{c.tables_visited}</td>
+                    <td className="py-2 pr-3 text-right tabular-nums">
+                      {c.tables_visited}
+                      {c.off_area_visits > 0 ? (
+                        <span className="ml-1 text-[10px] text-[#8B7355]">({c.off_area_visits} off-floor)</span>
+                      ) : null}
+                    </td>
                     <td className="py-2 pr-3 text-right tabular-nums">{c.taken}</td>
+                    {/* 🔒 A real per-person denominator exists at last — the
+                        owner's ruling of 2026-09-23 makes the floor assigned to
+                        a person the set they are measured against. Whoever has
+                        no assignment keeps the em dash, because an invented
+                        denominator in a performance table is worse than none. */}
+                    <td className="py-2 pr-3 text-right tabular-nums font-semibold">
+                      {c.area_assigned ? (
+                        <>
+                          {c.area_coverage_pct === null ? '—' : `${c.area_coverage_pct}%`}
+                          <span className="ml-1 text-[10px] text-[#8B7355]">
+                            {c.area_covered ?? 0}/{c.area_eligible ?? 0}
+                          </span>
+                        </>
+                      ) : '—'}
+                    </td>
                     <td className="py-2 pr-3 text-right tabular-nums">
                       {c.share_pct === null ? '—' : `${c.share_pct}%`}
                     </td>
@@ -472,19 +493,29 @@ export default function FeedbackTrackerPage() {
                     </td>
                   </tr>
                 ))}
+                {/* The floor total. Every cell sits under the heading it
+                    belongs to — the previous cut printed "N pending" in the
+                    "Issues rec." column and the row read as if the venue had
+                    recorded that many complaints. */}
                 {totals ? (
                   <tr className="border-t-2 border-[#E8D5C4] bg-[#FFF8F0]">
                     <td className="py-2 pr-3 font-extrabold text-[#2D1B0E]">Floor total</td>
-                    <td className="py-2 pr-3 text-[#6B5744]">eligible {totals.eligible}</td>
-                    <td className="py-2 pr-3 text-right tabular-nums font-bold">{totals.taken}</td>
+                    <td className="py-2 pr-3 text-[#6B5744]">all floors in scope</td>
+                    <td className="py-2 pr-3 text-right tabular-nums font-bold">{totals.eligible}</td>
                     <td className="py-2 pr-3 text-right tabular-nums font-bold">{totals.taken}</td>
                     <td className="py-2 pr-3 text-right tabular-nums font-extrabold text-[#af4408]">
                       {pct(totals.taken, totals.eligible)}
+                      <span className="ml-1 text-[10px] font-semibold text-[#8B7355]">
+                        {totals.taken}/{totals.eligible} · {totals.pending} pending
+                      </span>
                     </td>
+                    <td className="py-2 pr-3 text-right tabular-nums text-[#6B5744]">100%</td>
                     <td className="py-2 pr-3 text-right tabular-nums text-[#6B5744]">
-                      {totals.pending} pending
+                      {coverage.reduce((n, c) => n + c.issues_recorded, 0)}
                     </td>
                     <td className="py-2 text-right tabular-nums text-[#6B5744]">
+                      {coverage.reduce((n, c) => n + c.follow_ups_completed, 0)} done
+                      {' · '}
                       {coverage.reduce((n, c) => n + c.follow_ups_open, 0)} open
                     </td>
                   </tr>
@@ -502,9 +533,11 @@ export default function FeedbackTrackerPage() {
           <p className="mt-2 text-[10px] leading-snug text-[#8B7355]">
             Activity only. No rating, complaint ratio or score appears per person — recording a
             complaint must never look bad for the recorder, so “Issues rec.” counts complaints
-            PROPERLY RECORDED and more is better. Eligible / Pending / Coverage % sit on the floor
-            total because no table is assigned to a person: a per-person coverage denominator would
-            have to be invented.
+            PROPERLY RECORDED and more is better. “Coverage of their floor” is the eligible tables
+            on the floor assigned to that person (Settings → user → preferred zones); the floor is a
+            DEFAULT, not a restriction, so visits made helping elsewhere are counted as work
+            (“off-floor”) and never as a shortfall. Somebody with no floor assigned shows “—” and is
+            measured against the floor total, exactly as before.
           </p>
         </Card>
 

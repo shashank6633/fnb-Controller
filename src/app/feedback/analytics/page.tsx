@@ -266,7 +266,15 @@ export default function FeedbackAnalyticsPage() {
   const s = data?.summary;
   const meta = data?.meta;
   const opts = data?.options;
-  const ratingTotal = s ? s.excellent + s.good + s.average + s.poor : 0;
+  /**
+   * ⚠️ ONE POPULATION, NAMED. The split used to be drawn over "rated only"
+   * while the tile beside it said "Feedbacks taken", which counted a DIFFERENT
+   * set — visits on eligible tables. The same two numbers disagreed inside one
+   * exported workbook (Summary 9, Rating split 10). Both are now
+   * `feedbacks_recorded`: every visit in scope, Not rated included, which is
+   * exactly what the Rating split sheet totals.
+   */
+  const ratingTotal = s ? s.feedbacks_recorded : 0;
   const recoveryTotal = (data?.recovery ?? []).reduce((a, b) => a + b.count, 0);
 
   /** A value that is not among its options makes a `<select>` render the FIRST
@@ -284,7 +292,7 @@ export default function FeedbackAnalyticsPage() {
         title="Feedback Analytics"
         subtitle={
           s
-            ? `${s.feedback_taken} of ${s.eligible_tables} eligible tables · coverage ${pctText(s.coverage_pct)}`
+            ? `${s.eligible_tables_covered} of ${s.eligible_tables} eligible tables · coverage ${pctText(s.coverage_pct)}`
             : loading ? 'Loading…' : 'No data'
         }
       />
@@ -384,19 +392,77 @@ export default function FeedbackAnalyticsPage() {
 
         {data && s && meta ? (
           <>
+            {/* ── 🔒 WHAT THE PERSON FILTER DID, AND WHAT IT DID NOT ─────
+                Selecting a GRE used to narrow the rating split and the four
+                red/amber tiles below. The same person on the same tables then
+                read "Excellent 100%, Negative 0" if she recorded nothing and
+                "Average 100%, Negative 4" if she recorded what the guests
+                said — an appraisal that improves by staying silent, which is
+                the one thing the owner's ruling forbids. It now fills in the
+                card below and changes nothing else, and the page says so
+                where the reader is looking. */}
+            {data.person ? (
+              <>
+                <SectionTitle hint="the only thing this filter changed">
+                  What {data.person.person} did
+                </SectionTitle>
+                <Card className="p-3">
+                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                    <Tile label="Tables visited" value={data.person.tables_visited} tone="accent" />
+                    <Tile
+                      label="Coverage of their floor"
+                      value={data.person.area_assigned ? pctText(data.person.area_coverage_pct) : '—'}
+                      hint={data.person.area_assigned
+                        ? `${data.person.area_covered ?? 0} of ${data.person.area_eligible ?? 0} on ${data.person.area_label}`
+                        : 'no floor assigned — measured venue-wide'}
+                    />
+                    <Tile
+                      label="Feedbacks recorded"
+                      value={data.person.feedbacks_recorded}
+                      hint={data.person.off_area_visits
+                        ? `${data.person.off_area_visits} helping on another floor`
+                        : undefined}
+                    />
+                    <Tile label="Issues properly recorded" value={data.person.issues_recorded} hint="a credit, never a penalty" />
+                    <Tile label="Follow-ups completed" value={data.person.follow_ups_completed} hint={`${data.person.follow_ups_open} still open`} />
+                    {/* 🔒 A QUEUE, NOT A SCORE. A bare "0.0%" here for the GRE
+                        with two complaints still to revisit sat beside a "—"
+                        for the GRE who recorded none, and the honest one read
+                        worse. The cell now carries its own denominator and an
+                        empty queue says so in words. */}
+                    <Tile
+                      label="Guest recovery follow-up"
+                      value={data.person.follow_ups_raised
+                        ? `${data.person.follow_ups_completed}/${data.person.follow_ups_raised}`
+                        : 'none raised'}
+                      hint={data.person.follow_ups_raised
+                        ? `${pctText(data.person.recovery_pct)} of the complaints they recorded are closed`
+                        : 'they recorded no complaints in this period — not a better score, just nothing to close'}
+                    />
+                  </div>
+                  <p className="mt-2 text-[11px] leading-snug text-[#8B7355]">
+                    {data.person.coverage_basis}
+                  </p>
+                </Card>
+              </>
+            ) : null}
+
             {/* ── Dashboard tiles ──────────────────────────────────────── */}
             <SectionTitle
-              hint={meta.gre_filter_is_numerator_only
-                ? 'coverage is this person’s share of every eligible table in scope'
+              hint={meta.person_filter_active
+                ? 'the whole selected floor / captain / period — NOT the person above'
                 : undefined}
             >
               Dashboard
             </SectionTitle>
+            {meta.person_filter_active ? (
+              <p className="-mt-1 text-[11px] leading-snug text-[#8B7355]">{meta.counts_scope}</p>
+            ) : null}
             <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-2">
               <Tile
                 label="Coverage"
                 value={pctText(s.coverage_pct)}
-                hint={`${s.feedback_taken} of ${s.eligible_tables} eligible`}
+                hint={`${s.eligible_tables_covered} of ${s.eligible_tables} eligible`}
                 tone="accent"
               />
               <Tile
@@ -405,9 +471,13 @@ export default function FeedbackAnalyticsPage() {
                 hint={`${meta.item_threshold} items${meta.item_threshold_is_default ? ' (default)' : ''}, or bill asked / printed`}
               />
               <Tile
-                label="Feedbacks taken"
-                value={s.feedback_taken}
-                hint={s.everything_good ? `${s.everything_good} “everything good”` : undefined}
+                label="Feedbacks recorded"
+                value={s.feedbacks_recorded}
+                hint={
+                  s.extra_visits
+                    ? `${s.eligible_tables_covered} on eligible tables + ${s.extra_visits} on tables that never met the trigger`
+                    : (s.everything_good ? `${s.everything_good} “everything good”` : 'all on eligible tables')
+                }
               />
               <Tile
                 label="Negative item feedbacks"
@@ -437,7 +507,7 @@ export default function FeedbackAnalyticsPage() {
             </div>
 
             {/* ── Rating split ─────────────────────────────────────────── */}
-            <SectionTitle hint={`${ratingTotal} rated${s.unrated ? ` · ${s.unrated} not rated` : ''}`}>
+            <SectionTitle hint={`${ratingTotal} feedbacks recorded${s.unrated ? ` · ${s.unrated} not rated` : ''}`}>
               Overall rating split
             </SectionTitle>
             <Card className="p-3">
@@ -717,9 +787,17 @@ export default function FeedbackAnalyticsPage() {
             <SectionTitle hint="coverage and follow-through only">GRE / Manager performance</SectionTitle>
             <Card className="p-3 border-[#D4B896] bg-[#FFF1E3]">
               <p className="text-[11px] leading-snug text-[#6B5744]">{meta.fairness_note}</p>
-              <p className="mt-1 text-[11px] leading-snug text-[#8B7355]">{meta.coverage_per_gre_unavailable}</p>
+              <p className="mt-1 text-[11px] leading-snug text-[#8B7355]">
+                Coverage of their floor uses the floors assigned to that person (Settings &rarr; user
+                &rarr; preferred zones); the floor is a default, not a restriction, so visits they
+                made helping elsewhere are counted as work and never as a shortfall.
+                {' '}{meta.coverage_per_gre_unavailable}
+              </p>
+              <p className="mt-1 text-[11px] leading-snug text-[#8B7355]">{meta.recovery_is_a_queue}</p>
               {data.gre_performance.length === 0 ? (
-                <p className="mt-3 text-[12px] text-[#8B7355]">Nobody recorded feedback in this period.</p>
+                <p className="mt-3 text-[12px] text-[#8B7355]">
+                  Nobody holds the GRE role and nobody recorded feedback in this period.
+                </p>
               ) : (
                 <div className="mt-3 rounded-xl bg-white border border-[#E8D5C4] p-2">
                   <TableScroll>
@@ -727,8 +805,9 @@ export default function FeedbackAnalyticsPage() {
                       <thead>
                         <tr className="text-left text-[#8B7355]">
                           <th className="font-extrabold uppercase tracking-wide pb-2 pr-3">Person</th>
-                          <th className="font-extrabold uppercase tracking-wide pb-2 pr-3">Role</th>
+                          <th className="font-extrabold uppercase tracking-wide pb-2 pr-3">Their floor</th>
                           <th className="font-extrabold uppercase tracking-wide pb-2 pr-3 text-right">Tables visited</th>
+                          <th className="font-extrabold uppercase tracking-wide pb-2 pr-3 text-right">Coverage of their floor</th>
                           <th className="font-extrabold uppercase tracking-wide pb-2 pr-3 text-right">Issues recorded</th>
                           <th className="font-extrabold uppercase tracking-wide pb-2 pr-3 text-right">Follow-ups done</th>
                           <th className="font-extrabold uppercase tracking-wide pb-2 pr-3 text-right">Open</th>
@@ -738,10 +817,36 @@ export default function FeedbackAnalyticsPage() {
                       <tbody>
                         {data.gre_performance.map((g) => (
                           <tr key={g.person} className="border-t border-[#F0E4D6]">
-                            <td className="py-2 pr-3 font-bold text-[#2D1B0E]">{g.person}</td>
-                            <td className="py-2 pr-3 text-[#6B5744]">{g.role || '—'}</td>
+                            <td className="py-2 pr-3 font-bold text-[#2D1B0E]">
+                              {g.person}
+                              {g.kind === 'assigned' ? (
+                                <span className="ml-1 font-semibold text-[#8B7355]">· nothing recorded</span>
+                              ) : null}
+                            </td>
+                            <td className="py-2 pr-3 text-[#6B5744]">
+                              {g.area_assigned ? g.area_zones.join(' · ') : 'all floors'}
+                            </td>
                             <td className="py-2 pr-3 text-right tabular-nums font-extrabold text-[#af4408]">
                               {g.tables_visited}
+                              {g.off_area_visits ? (
+                                <span className="ml-1 text-[10px] font-semibold text-[#8B7355]">
+                                  ({g.off_area_visits} off-floor)
+                                </span>
+                              ) : null}
+                            </td>
+                            {/* 🔒 The owner's floor ruling gives this column a
+                                real denominator for whoever has an assignment.
+                                Whoever does not gets an em dash — an invented
+                                per-person denominator is worse than no number. */}
+                            <td className="py-2 pr-3 text-right tabular-nums font-semibold">
+                              {g.area_assigned ? (
+                                <>
+                                  {pctText(g.area_coverage_pct)}
+                                  <span className="ml-1 text-[10px] text-[#8B7355]">
+                                    {g.area_covered ?? 0}/{g.area_eligible ?? 0}
+                                  </span>
+                                </>
+                              ) : '—'}
                             </td>
                             {/* Same neutral ink as every other count — see the
                                 header note. Colouring this red would make
@@ -750,8 +855,14 @@ export default function FeedbackAnalyticsPage() {
                             <td className="py-2 pr-3 text-right tabular-nums">{g.issues_recorded}</td>
                             <td className="py-2 pr-3 text-right tabular-nums">{g.follow_ups_completed}</td>
                             <td className="py-2 pr-3 text-right tabular-nums">{g.follow_ups_open}</td>
+                            {/* Queue, not score — see the person tile above.
+                                `1/3` carries its denominator; "none raised" is
+                                words, so it cannot be misread as a good rate
+                                and cannot sort above a real one. */}
                             <td className="py-2 text-right tabular-nums font-semibold text-emerald-700">
-                              {pctText(g.recovery_pct)}
+                              {g.follow_ups_raised
+                                ? `${g.follow_ups_completed}/${g.follow_ups_raised} · ${pctText(g.recovery_pct)}`
+                                : <span className="font-normal text-[#8B7355]">none raised</span>}
                             </td>
                           </tr>
                         ))}

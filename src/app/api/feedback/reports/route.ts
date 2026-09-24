@@ -45,6 +45,7 @@ import { getDb } from '@/lib/db';
 import { getCurrentOutletId } from '@/lib/auth';
 import { requireFeedbackAnalyst } from '@/lib/feedback/session';
 import { buildReportPdf, istStamp } from '@/lib/report-pdf';
+import { printableLabels } from '@/lib/feedback/labels';
 import {
   analytics, buildReport, filtersFromQuery, isReportKey, rangeForReport,
   type ReportDoc, type ReportTable,
@@ -133,13 +134,50 @@ function workbookFor(doc: ReportDoc): Buffer {
   return XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' }) as Buffer;
 }
 
+/* ── THE PRINTED NAME IS NOT THE STORED NAME ─────────────────────────────────
+   `report-pdf.ts` truncates every cell to one line with a trailing ellipsis and
+   never wraps, and that was collapsing DISTINCT menu items into IDENTICAL
+   printed rows — 58 of the 628 real items into 28 strings, "… CHARDONNAY
+   BOTTLE" and "… CHARDONNAY GLASS" among them. `src/lib/feedback/labels.ts`
+   carries the measurement and the rule; this is where it is applied, and it is
+   applied to the PDF PATH ONLY — the xlsx keeps the full string, because a
+   spreadsheet cell does not truncate and people sort and VLOOKUP on it.
+
+   The geometry below is the renderer's own: A4 portrait, margin 40, PAD 4,
+   weights normalised over CONTENT_W, `Helvetica` 8. Measuring with the same
+   pdfkit document class is what makes "it fits here" mean "it fits there".
+   One throwaway document per PDF request, negligible beside rendering it. */
+
+const PDF_CONTENT_W = 595.28 - 40 * 2;
+const PDF_PAD = 4;
+
 async function pdfFor(doc: ReportDoc): Promise<Buffer> {
+  // Same class, font, size and geometry as the renderer — see the block above.
+  const { default: PDFDocument } = await import('pdfkit');
+  const probe = new PDFDocument({ size: 'A4', margin: 40 });
+  probe.font('Helvetica').fontSize(8);
+  const measure = (s: string) => probe.widthOfString(s);
+
+  const fitted = doc.tables.map((t) => {
+    const totalW = t.columns.reduce((sum, c) => sum + (Number(c.width) || 1), 0);
+    const widths = t.columns.map((c) => ((Number(c.width) || 1) / totalW) * PDF_CONTENT_W);
+    const maps = t.columns.map((c, i) =>
+      (c.fitPrint
+        ? printableLabels(measure, t.rows.map((r) => String(r[i] ?? '')), widths[i] - PDF_PAD * 2)
+        : null));
+    if (maps.every((m) => m === null)) return t;
+    return {
+      ...t,
+      rows: t.rows.map((r) => r.map((cell, i) => maps[i]?.get(String(cell ?? '')) ?? cell)),
+    };
+  });
+
   return buildReportPdf({
     title: doc.title,
     period: doc.period,
     subtitle: doc.subtitle,
     kpis: doc.kpis,
-    tables: doc.tables.map((t) => ({
+    tables: fitted.map((t) => ({
       title: t.name,
       columns: t.columns.map((c) => ({ label: c.label, width: c.width ?? 1, align: c.align })),
       rows: t.rows,
