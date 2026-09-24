@@ -1742,6 +1742,61 @@ export function fssaiCaVerifyRefusal(
   return '';
 }
 
+/**
+ * ONE CORRECTIVE ACTION AS EVERY SCREEN READS IT.
+ *
+ * Declared here, in the module both the server and the screens import, and
+ * `shapeFssaiCa` (fssai-server.ts) is typed as returning it — so the queue, the
+ * record view and the route cannot drift into three shapes of the same row.
+ */
+export interface FssaiCaView {
+  id: string;
+  ca_number: string;
+  source_kind: string;
+  run_id: string;
+  response_id: string;
+  question_id: string;
+  equipment_id: string;
+  department_id: string;
+  department_name: string;
+  title: string;
+  description: string;
+  root_cause: string;
+  severity: string;
+  severity_label: string;
+  status: string;
+  status_label: string;
+  owner_email: string;
+  due_date: string;
+  action_taken: string;
+  completed_at: string;
+  completed_by: string;
+  verified_by: string;
+  verified_at: string;
+  verify_note: string;
+  void_reason: string;
+  voided_by: string;
+  voided_at: string;
+  created_by: string;
+  created_at: string;
+  updated_at: string;
+  is_overdue: boolean;
+  /** The record it hangs off — null only for a source_kind that has no run. */
+  run: {
+    id: string;
+    business_date: string;
+    shift: string;
+    target_label: string;
+    status: string;
+    outcome: string;
+    recorded_by: string;
+    recorded_name: string;
+    template_name: string;
+  } | null;
+  /** The FROZEN answer that caused it, when the response row is still there. */
+  answer: { prompt: string; text: string; uom: string; note: string } | null;
+}
+
 /** MAY THIS PERSON ASSIGN, REOPEN OR CANCEL AN ACTION? Management only. */
 export function canManageFssaiCa(me: FssaiActor | null | undefined): boolean {
   if (!me) return false;

@@ -61,7 +61,8 @@ import { ImageThumb } from '@/app/tasks/_components/ImageUpload';
 import {
   FSSAI_SHIFTS, fssaiBytesLabel, fssaiRunStatusMeta, qtypeMeta,
   fssaiSignatureModeFrom, fssaiSignatureModeLabel,
-  type FssaiSignature,
+  fssaiCaStatusMeta, fssaiCaSeverityMeta,
+  type FssaiCaView, type FssaiSignature,
 } from '@/lib/fssai';
 
 /* ------------------------------------------------------------------ *
@@ -161,6 +162,8 @@ interface RecordView {
   approvals: ApprovalRow[];
   signature: FssaiSignature | null;
   signature_intact: boolean | null;
+  /** Owner Q14 — what this record raised, and how far it has got. */
+  corrective_actions: FssaiCaView[];
   requires_verification: 0 | 1;
   can_verify: boolean;
   verify_refusal: string;
@@ -747,6 +750,75 @@ function RecordSheet({
                   })}
                 </div>
               </div>
+
+              {/* WHAT WAS RAISED BY THIS RECORD, AND WHETHER IT WAS MENDED.
+                * Owner Q14. A supervisor deciding on a FAILED check needs the
+                * answer to the question an inspector actually asks — not "did it
+                * fail", but "what was done about it". Read-only here: verifying a
+                * record neither closes nor changes an action, and the actions are
+                * worked in /fssai/corrective-actions. */}
+              {(v.corrective_actions?.length ?? 0) > 0 && (
+                <div className="border border-[#E8D5C4] rounded-xl overflow-hidden">
+                  <div className="px-3 py-2 bg-[#FFF8F0] border-b border-[#E8D5C4] flex flex-nowrap items-center justify-between gap-2">
+                    <p className="text-xs font-semibold text-[#6B5744]">
+                      Raised by this check
+                    </p>
+                    <a
+                      href="/fssai/corrective-actions"
+                      className="text-xs font-semibold text-[#af4408] hover:underline shrink-0"
+                    >
+                      Open the list
+                    </a>
+                  </div>
+                  <div className="divide-y divide-[#E8D5C4]">
+                    {v.corrective_actions.map((c) => {
+                      const meta = fssaiCaStatusMeta(c.status);
+                      return (
+                        <div key={c.id} className="p-3">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className="font-mono text-xs text-[#6B5744]">{c.ca_number}</span>
+                            <span className={`text-[11px] px-1.5 py-0.5 rounded border ${meta.color}`}>{meta.label}</span>
+                            <span className={`text-[11px] px-1.5 py-0.5 rounded border ${fssaiCaSeverityMeta(c.severity).color}`}>
+                              {fssaiCaSeverityMeta(c.severity).label}
+                            </span>
+                            {c.is_overdue && (
+                              <span className="text-[11px] px-1.5 py-0.5 rounded border bg-red-100 text-red-700 border-red-200">
+                                Late
+                              </span>
+                            )}
+                          </div>
+                          <p className="text-sm text-[#2D1B0E] mt-1">{c.title}</p>
+                          {c.owner_email
+                            ? <p className="text-xs text-[#6B5744] mt-0.5">With {c.owner_email}{c.due_date ? ` · due ${fmtISTDate(c.due_date)}` : ''}</p>
+                            : <p className="text-xs text-amber-800 mt-0.5">Nobody has been given this yet.</p>}
+                          {c.action_taken && (
+                            <p className="text-xs text-[#3D2614] mt-1">
+                              <strong>What was done:</strong> {c.action_taken}
+                              {c.completed_by ? ` — ${c.completed_by}` : ''}
+                            </p>
+                          )}
+                          {c.status === 'verified' && (
+                            <p className="text-xs text-emerald-800 mt-1">
+                              Checked by {c.verified_by}{c.verified_at ? ` · ${fmtIST(c.verified_at)}` : ''}
+                              {c.verify_note ? ` — “${c.verify_note}”` : ''}
+                            </p>
+                          )}
+                          {(c.status === 'cancelled' || c.status === 'void') && c.void_reason && (
+                            <p className="text-xs text-[#6B5744] mt-1">Cancelled: {c.void_reason}</p>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                  {/* Said on the screen, not just implemented — a supervisor who
+                    * has seen "Fixed and checked" is exactly the person likely to
+                    * assume the check itself now passes. */}
+                  <p className="px-3 py-2 border-t border-[#E8D5C4] bg-white text-[11px] text-[#8B7355]">
+                    A corrective action records what was done about a failure. It does not change the
+                    check — this record still reads exactly as it was submitted.
+                  </p>
+                </div>
+              )}
 
               {/* what has already been decided about this record */}
               {v.approvals.length > 0 && (

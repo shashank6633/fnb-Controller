@@ -59,6 +59,22 @@ export interface FssaiModule {
   blurb: string;
   /** The phase that makes this screen do its job. Key into FSSAI_PHASES. */
   phase: number;
+  /**
+   * THE SCREEN IS ACTUALLY BUILT AND DOING ITS JOB NOW.
+   *
+   * WHY THIS EXISTS. The dashboard chip is rendered from `phase`, and every
+   * phase from 4 up reads "After your review". That was true of all of them when
+   * it was written. The moment a screen is finished ahead of its phase, the chip
+   * becomes a false statement about a compliance module on the dashboard —
+   * "After your review" printed under a screen the owner can use today.
+   *
+   * ADDITIVE AND OPT-IN. `phase` still says which stage of the plan OWNS the
+   * screen, so FSSAI-BUILD-STATE.md still lines up; this only overrides the
+   * word on the chip. A lane that finishes its own screen sets this on its own
+   * row — nobody sets it on somebody else's, because only the lane that built it
+   * knows whether it really works.
+   */
+  built?: true;
   icon: LucideIcon;
   access: FssaiAccess;
   group: FssaiGroup;
@@ -229,6 +245,9 @@ export const FSSAI_MODULES: FssaiModule[] = [
     label: 'Corrective Actions',
     blurb: 'Every failed check with an owner, a deadline and proof of what was done.',
     phase: 7,
+    // Built ahead of its phase for owner §7 Q14 — a failed answer raises the
+    // action, and the fix and its check are recorded there.
+    built: true,
     icon: Wrench,
     access: 'everyone',
     group: 'records',

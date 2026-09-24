@@ -27,7 +27,7 @@ import {
   canAuthorFssai, evaluateFssaiAnswer, qtypeMeta, fssaiSignatureModeFrom,
   fssaiAnswerInWords, fssaiCaDueDate, fssaiCaIsOverdue, fssaiCaSeverityMeta,
   fssaiCaStatusMeta, fssaiToday, isFssaiCaSeverity,
-  type FssaiSignature, type FssaiSignatureMode,
+  type FssaiCaView, type FssaiSignature, type FssaiSignatureMode,
 } from '@/lib/fssai';
 
 export type Gate = { me: SessionUser } | { resp: Response };
@@ -961,7 +961,7 @@ export function raiseFssaiCorrectiveActions(
 }
 
 /** One corrective action, shaped the single way every screen reads it. */
-export function shapeFssaiCa(row: any) {
+export function shapeFssaiCa(row: any): FssaiCaView {
   return {
     id: String(row.id),
     ca_number: String(row.ca_number || ''),

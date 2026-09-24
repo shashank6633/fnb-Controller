@@ -184,9 +184,18 @@ function ModuleTile({ mod }: { mod: FssaiModule }) {
       </div>
       <div className="flex flex-wrap items-center gap-1.5 mt-auto pt-1">
         {/* When, in words. This chip used to read "Phase 8", which is the build
-            plan's vocabulary and means nothing to a chef — see modules.ts. */}
-        <span className="inline-flex items-center text-[11px] font-semibold px-2 py-0.5 rounded-full border bg-[#FFF1E3] text-[#8B7355] border-[#E8D5C4]">
-          {phase.when}
+            plan's vocabulary and means nothing to a chef — see modules.ts.
+            A screen finished ahead of its phase says so instead: printing
+            "After your review" under a screen that works today is a false
+            statement about a compliance module, on the dashboard. */}
+        <span
+          className={`inline-flex items-center text-[11px] font-semibold px-2 py-0.5 rounded-full border ${
+            mod.built
+              ? 'bg-emerald-100 text-emerald-700 border-emerald-200'
+              : 'bg-[#FFF1E3] text-[#8B7355] border-[#E8D5C4]'
+          }`}
+        >
+          {mod.built ? 'Working now' : phase.when}
         </span>
         {accessLabel && (
           <span className="inline-flex items-center gap-1 text-[11px] font-semibold px-2 py-0.5 rounded-full border bg-purple-100 text-purple-700 border-purple-200">
