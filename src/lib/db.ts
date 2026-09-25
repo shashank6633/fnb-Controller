@@ -58,16 +58,54 @@ const DB_PATH = path.join(process.cwd(), 'fnb-controller.db');
  * assumes it returns, and turning a schema failure into a throw across hundreds
  * of call sites is a change with its own blast radius. What this owes is that
  * the failure is never SILENT. It is not silent now. */
+/* ── WHY THE OLD HANDLE IS NOT CLOSED, AND WHY THE RETRY BACKS OFF ───────────
+ *
+ * The first version of this retry called `db.close()` before adopting the fresh
+ * connection. That was wrong, and it was wrong in a way that only bites on the
+ * exact path this code exists for — a database whose schema boot FAILED.
+ *
+ * 102 call sites in src have this shape:
+ *
+ *     const db = getDb();                  // handle captured
+ *     const x  = await somethingAsync();   // ...which itself calls getDb()
+ *     db.prepare(...)                      // captured handle used again
+ *
+ * `auth.ts:250` getCurrentOutletId() is one, and it runs on nearly every
+ * authenticated request. 28 of those sites end in a `db.transaction(...)` —
+ * settle, hold, KDS bump, order PATCH, GRN. If the nested call is the one that
+ * crosses the retry threshold, closing the old handle makes the captured
+ * reference throw `The database connection is not open` — so a database missing
+ * one index went from "serves fine, one broken feature" to a burst of 500s on
+ * settle and KOT-bump every 30 seconds, for the life of the process.
+ *
+ * So: the old handle is LEFT OPEN and simply dropped. Anything still holding it
+ * keeps reading from a stale but working connection; everything that calls
+ * getDb() afterwards gets the fresh one. That is the same reasoning already
+ * applied to the re-open-failure path below — a stale handle still serves
+ * reads, a closed one throws on every query — it just was not applied here.
+ *
+ * Not closing means a failed boot leaks one connection per retry, so the retry
+ * now BACKS OFF: 30s, 1m, 5m, then 30m forever. A permanently broken database
+ * leaks a handful of file descriptors a day instead of 2,880, while one that is
+ * actually repaired — permissions fixed, disk freed, file restored — still
+ * heals itself within half an hour without anyone knowing to restart it. */
 let db: Database.Database | null = null;
 let dbBootFailed = false;
 let dbBootLastAttempt = 0;
-const DB_BOOT_RETRY_MS = 30_000;
+let dbBootAttempts = 0;
+/** Backoff ladder, in ms. The last entry repeats for every attempt after it. */
+const DB_BOOT_RETRY_LADDER = [30_000, 60_000, 300_000, 1_800_000] as const;
+
+function dbBootRetryDelay(): number {
+  const i = Math.min(Math.max(dbBootAttempts - 1, 0), DB_BOOT_RETRY_LADDER.length - 1);
+  return DB_BOOT_RETRY_LADDER[i];
+}
 
 export function getDb(): Database.Database {
   if (!db) {
     db = new Database(DB_PATH);
     bootDb(db);
-  } else if (dbBootFailed && Date.now() - dbBootLastAttempt >= DB_BOOT_RETRY_MS) {
+  } else if (dbBootFailed && Date.now() - dbBootLastAttempt >= dbBootRetryDelay()) {
     // The last attempt did not finish. Try again on a FRESH connection — see
     // the read-only latch explained above; a same-handle retry cannot heal.
     let fresh: Database.Database | null = null;
@@ -75,10 +113,12 @@ export function getDb(): Database.Database {
       fresh = new Database(DB_PATH);
     } catch (e) {
       dbBootLastAttempt = Date.now();   // re-arm the throttle; keep the old handle
+      dbBootAttempts++;
       console.error('[db] schema retry could not re-open the database (keeping the previous connection). Cause:', e);
     }
     if (fresh) {
-      try { db.close(); } catch { /* already closed, or never opened cleanly */ }
+      // The old handle is deliberately NOT closed — see the note above. It is
+      // dropped and collected once nothing references it any more.
       db = fresh;
       bootDb(db);
     }
@@ -134,11 +174,14 @@ function bootDb(database: Database.Database) {
     } catch (e) { console.error('units registry hydration failed:', e); }
     if (dbBootFailed) console.warn('[db] schema initialisation SUCCEEDED on a retry — the failure reported earlier is cleared.');
     dbBootFailed = false;
+    dbBootAttempts = 0;        // healed: start the ladder over if it ever fails again
   } catch (e) {
     dbBootFailed = true;
+    dbBootAttempts++;
     console.error(
       '[db] SCHEMA INITIALISATION FAILED — this process is about to serve traffic against a database whose schema was NOT fully applied. ' +
-      `Tables and columns may be missing. The next getDb() at least ${DB_BOOT_RETRY_MS / 1000}s from now will try again. Cause:`, e
+      `Tables and columns may be missing. This was attempt ${dbBootAttempts}; the next getDb() at least ` +
+      `${Math.round(dbBootRetryDelay() / 1000)}s from now will try again. Cause:`, e
     );
   }
 }
