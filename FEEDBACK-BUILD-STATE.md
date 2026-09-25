@@ -1115,6 +1115,37 @@ supported, clear status indicators, sticky Submit. Minimal typing.
 
 ## 7. OPEN DECISIONS — owner only
 
+> ## ✅ ALL SETTLED BY THE OWNER, 2026-09-25 — §7 IS NOW EMPTY
+>
+> Every decision below was put to him with options and he chose. These are
+> **ANSWERS**. Build to them; do not re-litigate. The originals are kept below
+> for their measurements and reasoning.
+>
+> | # | ANSWER |
+> |---|---|
+> | **D11** *(was a LIVE FAIRNESS BREACH)* | **(a)** The GRE/Manager filter narrows **record-level sections only** — comments, menu items, recovery queue. The **rating split and the four negative tiles stay VENUE-WIDE** whatever name is picked, and all 8 exports inherit the rule. Makes the breach *structurally impossible* rather than warning about it. Same rule Page 3 already proves works. **NOT YET BUILT.** |
+> | **D6** | **GREs MAY seat.** `POST /api/crm-calls/bookings/[id]/seat` stays open to them, marked in code as a **deliberate exemption** from the POS read-only rule. Read-only then means exactly: no orders, no quantity changes, no KOT edits, no bills, no discounts. |
+> | **D7** | **Tier wins — but DOCUMENT it.** Keep today's behaviour; add a visible note where the **HOD checkbox and tier selector** live saying plainly that either one lifts the GRE POS read-only restriction. The hazard was never the behaviour, it was the silence. |
+> | **D4** | **Grace window after `settled_at`, default 30 min, configurable.** Guests linger, pay, then talk to the GRE on the way out. A window keeps the record tied to a real, recent visit. |
+> | **D10** | **A GRE sees ONLY HER OWN ROW** in the Tracker's progress table — one-line filter on `scope: 'gre'`. Management still sees everyone. Reasoning: activity-only numbers still become a leaderboard when staff see each other's, and a leaderboard is a reason to game what you record. |
+> | **D12** | **`users.preferred_zones`, maintained BY THE OWNER in Settings.** Zones are his to set, like roles and departments — **never written by us**. A GRE with no zone is measured venue-wide and shows `-`, not an invented denominator (already ships). |
+> | **D2** | **Admin setting, DEFAULT 4.** Confirms what is built; tunable in-app without a deploy. |
+> | **D3** | **RECORD the replacement item.** One column. Menu Item Analysis then says what actually satisfied the guest, not only what failed. |
+>
+> **Already resolved earlier, not re-asked:**
+> * **D1** is obsolete — production HAS a GRE role (36 users, 28 role-assigned).
+>   The "there is no GRE role" finding was a **stale-snapshot artefact**.
+> * **D8** is fixed in code: `canAccessPage` gained an anchored line so for
+>   `/feedback*` the module's own gate decides and a role's `page_access` can
+>   only NARROW, never widen. **Nothing was written to any role.** Owner's
+>   ruling: **GRE → pages 1-3; Floor Manager / Manager / Admin → + page 4.**
+> * **Floor ruling:** a GRE's floor is a **DEFAULT, not a restriction**.
+>   Coverage is measured against their own floor, nobody is ever blocked, and
+>   off-floor visits are counted as work, never dropped.
+>
+> **THE GATE IS UNCHANGED.** Build-only until he says exactly
+> **"Deploy Feedback Module"**.
+
 1. **There is no GRE role.** Options: (a) he creates a "GRE" role in Settings → Roles and we gate on
    it — the precedent he chose for Bill Handover's "Accounts"; (b) gate on the existing
    `Floor Manager` + `Manager` + `Administrator`; (c) add an `is_gre` flag to `roles` beside
