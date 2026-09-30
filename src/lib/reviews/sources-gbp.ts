@@ -3,15 +3,29 @@
  * GOOGLE BUSINESS PROFILE — the automatic connector. THE PRIMARY PATH.
  *
  * ══════════════════════════════════════════════════════════════════════════
- * UNPROVEN. NO GOOGLE ENDPOINT WAS CALLED AND NO CREDENTIAL EXERCISED WHILE
- * THIS WAS WRITTEN.
+ * PROVEN AGAINST A LIVE ACCOUNT — 2026-09-30.
  * ══════════════════════════════════════════════════════════════════════════
- * Everything below is built from Google's published reference and wired end to
- * end, but not one line has round-tripped against a live account, because the
- * account does not exist yet — the owner has to create it. Treat the request
- * shapes as documented-correct and the RESPONSES as untested. The first real
- * pull is the test. Specific unknowns are in UNPROVEN below and are returned by
- * status() so a screen can print them rather than implying this is proven.
+ * This header used to say, correctly, that no Google endpoint had ever been
+ * called. That stopped being true on 2026-09-30: the Business Profile API
+ * allowlist came through for project 1077580169090 (300 QPM), the owner enabled
+ * Google My Business API (mybusiness.googleapis.com, listed as a Private API —
+ * the allowlist being visibly applied), and the first live pull returned
+ * 102 PAGES / 10,055 REVIEWS from
+ * accounts/113778984854595644612/locations/5410705488583350830, de-duplicating
+ * correctly against the earlier Takeout import (added 0, changed 0, already
+ * known 5070).
+ *
+ * So the read path — token refresh, account discovery, location discovery and
+ * the paged v4 reviews pull — has round-tripped. What is STILL unproven is
+ * narrower and lives in UNPROVEN below, which status() returns so the setup
+ * panel prints it. Keep that list honest in both directions: a stale "untested"
+ * on a panel that has just done the thing is its own kind of lie.
+ *
+ * STILL READ-ONLY BY CONSTRUCTION. Every call here goes through googleGet() or
+ * an equivalent bare fetch, so all of them are GET; the only POSTs in this
+ * module's neighbourhood are the OAuth token exchange and revoke. Nothing in
+ * this file can post a reply, edit the listing, upload a photo or delete
+ * anything — see the "WHAT THIS FILE DELIBERATELY DOES NOT DO" note at the end.
  *
  * ── WHAT THE OWNER ASKED FOR, AND WHAT THAT MEANS HERE ──────────────────────
  * "It should automatically retrieve the reviews data... how can we import every
@@ -90,12 +104,19 @@ export const PREREQUISITES: string[] = [
   'Paste the client ID and client secret into settings, then press Connect Google Business Profile and authorise as the account that manages the listing.',
 ];
 
+/* This list is rendered on the setup panel, so it must describe what is unknown
+ * TODAY. The first two entries used to say no Google endpoint had ever been
+ * called and that approval had no published turnaround — both were true when
+ * written and both were falsified on 2026-09-30, when the allowlist came
+ * through for project 1077580169090 and the first live pull returned 102 pages
+ * and 10,055 reviews. Leaving them would have printed "no credential
+ * exercised" on the same panel that had just exercised one. What remains below
+ * is what is still genuinely unproven. */
 export const UNPROVEN: string[] = [
-  'No Google endpoint has been called and no credential exercised — every response shape here is from documentation, not from a round trip.',
   'The v4 Reviews endpoint has no separately published quota; the 300 QPM figure Google publishes is for the newer Business Profile APIs. Do not plan against a specific number for v4 reviews.',
-  'Google publishes no turnaround time for Basic API Access approval. Third-party estimates of 2-4 weeks are not a commitment and are not a date.',
   'Whether the business.manage scope is classed sensitive or restricted (which decides how heavy consent-screen verification is) has not been confirmed.',
   'Reviews sit on the legacy v4 surface that was otherwise sunset in 2022. It is alive and not on the deprecation schedule, but it is un-replatformed and could move.',
+  'Google refusals are classified from 16 documented and observed error-body shapes, not from a live refusal. The first real 403 after this is the test; an unrecognised shape falls through to a branch that names both candidate fixes rather than guessing.',
 ];
 
 /* ── Configuration ────────────────────────────────────────────────────────── */
