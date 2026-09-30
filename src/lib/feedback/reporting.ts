@@ -451,7 +451,8 @@ export interface AnalyticsFilters {
   section?: string;
   /** `orders.server_name`. */
   captain?: string;
-  /** `gf_visits.gre_name` - narrows VISITS, never the order universe (see 6). */
+  /** `gf_visits.gre_name` - narrows the RECORD-LEVEL sections only, and never
+   *  the order universe or any venue aggregate (see 6 and `VenueFilters`). */
   gre?: string;
   /** Same column, for a recorder whose role is management. */
   manager?: string;
@@ -495,14 +496,83 @@ export function filtersFromQuery(sp: URLSearchParams): AnalyticsFilters {
   };
 }
 
+/* ────────────────────────────────────────────────────────────────────────────
+   2b. THE TWO SCOPES, MADE STRUCTURAL — D11(a)
+   ────────────────────────────────────────────────────────────────────────────
+   The owner's ruling: the GRE / Manager filter narrows ONLY the RECORD-LEVEL
+   sections (the comments, the menu items, the recovery queue). The RATING SPLIT
+   and the four red/amber negative tiles stay VENUE-WIDE no matter whose name is
+   picked, because "the system should not judge GRE performance based on
+   positive feedback" and "a GRE should never avoid recording negative feedback
+   because it affects their performance".
+
+   His word for how strong that has to be was STRUCTURALLY IMPOSSIBLE, so it is
+   not a convention and not a comment. Two things below enforce it:
+
+     · `VenueFilters` — an `AnalyticsFilters` whose `gre` and `manager` are typed
+       `never`. A computation handed one of these CANNOT read a person out of it,
+       because there is nothing there to read. `venueFilters()` is the only way
+       to make one and it deletes both keys.
+
+     · `VenueRows<T>` / `RecordRows<T>` — the row arrays, branded. The venue
+       aggregates (`venueSummary`, `venueCategories`, `venueDaily`,
+       `grePerformance`) accept `VenueRows` and nothing else; the record
+       sections accept `RecordRows` and nothing else. Handing the narrowed
+       array to the rating split is a COMPILE ERROR, not a review miss.
+
+   Before this, one line (`const visits = allVisits`) was the whole protection,
+   and it protected by never narrowing anything at all — which also left the
+   half of the ruling that SHOULD narrow unbuilt. Now both halves exist and
+   neither can leak into the other.
+   ──────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * Filters with the person REMOVED AT THE TYPE LEVEL — the "filter that cannot
+ * carry a person". Everything that must stay venue-wide is computed from one of
+ * these, so narrowing a venue figure to a name is not something a later edit
+ * can do by forgetting: `f.gre` on a `VenueFilters` is `never`.
+ */
+export type VenueFilters = Omit<AnalyticsFilters, 'gre' | 'manager'> & {
+  gre?: never;
+  manager?: never;
+};
+
+/** The only constructor. It DELETES the two keys rather than blanking them, so
+ *  a value that somehow survives the type system still cannot be read back. */
+export function venueFilters(f: AnalyticsFilters): VenueFilters {
+  const { gre: _gre, manager: _manager, ...rest } = f;
+  return rest as VenueFilters;
+}
+
+declare const VENUE_SCOPE: unique symbol;
+declare const RECORD_SCOPE: unique symbol;
+
+/** Rows covering the whole ROOM — the selected period, floor, section and
+ *  captain, and EVERY recorder in it. The venue aggregates take only these. */
+export type VenueRows<T> = readonly T[] & { readonly [VENUE_SCOPE]: true };
+
+/** Rows narrowed to the selected person (identical to `VenueRows` content when
+ *  no name is picked). The record-level sections take only these. */
+export type RecordRows<T> = readonly T[] & { readonly [RECORD_SCOPE]: true };
+
+/** The two brands, applied. These two lines are the ONLY casts: every other
+ *  place in this file is checked. Keep them next to each other so a reader can
+ *  see that neither one filters — the narrowing happens once, in `analytics()`,
+ *  and is visible there. */
+const asVenue = <T,>(rows: readonly T[]): VenueRows<T> => rows as VenueRows<T>;
+const asRecord = <T,>(rows: readonly T[]): RecordRows<T> => rows as RecordRows<T>;
+
 /** The filters as sentences. Written into EVERY export - a spreadsheet that
  *  does not say it is one floor on one night is a spreadsheet that will be
  *  read as the whole venue for the month.
  *
- *  The GRE / Manager line says what it narrows AND what it does not. Seven of
- *  the eight downloads accept `&gre=`, and a file headed only "GRE: <name>"
- *  reads as that person's scorecard - which is precisely the reading the
- *  fairness ruling forbids. */
+ *  The GRE / Manager line says what it narrows AND what it does not, sentence
+ *  by sentence. ALL EIGHT downloads accept `&gre=`, and a file headed only
+ *  "GRE: <name>" reads as that person's scorecard - which is precisely the
+ *  reading the fairness ruling forbids. Under D11(a) the filter now DOES narrow
+ *  three sections, so this line can no longer say "nothing else": it has to say
+ *  which sheets moved and which did not, or a reader will apply the wrong scope
+ *  to whichever half they happen to look at. */
 export function filterLines(r: ResolvedRange, f: AnalyticsFilters): string[] {
   const out = [`Period: ${r.label}`];
   if (r.note) out.push(`Period note: ${r.note}`);
@@ -515,10 +585,18 @@ export function filterLines(r: ResolvedRange, f: AnalyticsFilters): string[] {
   out.push(`Manager: ${isAll(f.manager) ? 'All' : String(f.manager)}`);
   if (person) {
     out.push(
-      `What the ${isAll(f.gre) ? 'Manager' : 'GRE'} filter did: it fills in the "What ${person} did" `
-      + 'sheet and changes NOTHING else in this file. Every rating, complaint, menu item and '
-      + 'recovery figure below covers the whole selected floor, section, captain and period - '
-      + 'not this person. Do not read this file as an appraisal of them.',
+      `What the ${isAll(f.gre) ? 'Manager' : 'GRE'} filter NARROWED to ${person}: the "What ${person} `
+      + 'did" sheet, the menu-item sheets (Menu item analysis, Most complained, Most appreciated, '
+      + 'Most common problems, By item) and the Service recovery sheet. Those list what THIS PERSON '
+      + 'wrote down.',
+    );
+    out.push(
+      `What the ${isAll(f.gre) ? 'Manager' : 'GRE'} filter did NOT narrow: the Summary tiles, the `
+      + 'Rating split sheet, the Category ratings sheet and the By day sheet. Those cover the WHOLE '
+      + 'selected floor, section, captain and period, whoever recorded them, and they do not move '
+      + 'when a name is picked. That is deliberate: no rating and no complaint count in this file '
+      + `is a judgement of ${person}, so recording what a guest actually said can never make their `
+      + 'numbers look worse. Do not read this file as an appraisal of them.',
     );
   }
   out.push(`Food / Drinks: ${isAll(f.group) ? 'Both' : String(f.group)}`);
@@ -574,11 +652,17 @@ export interface Universe {
   captains: string[];
 }
 
+/**
+ * The coverage denominator. It takes `VenueFilters`, NOT `AnalyticsFilters`:
+ * the order universe is the ROOM and a person is not a part of the room, so the
+ * person is removed from the argument before it arrives rather than merely left
+ * unread inside. `f.gre` in here is `never` — there is nothing to narrow by.
+ */
 export function loadUniverse(
   db: Database.Database,
   outletId: string,
   r: ResolvedRange,
-  f: AnalyticsFilters,
+  f: VenueFilters,
 ): Universe {
   const t = readTunables(db);
 
@@ -922,6 +1006,10 @@ export function recoveryLong(completed: number, raised: number): string {
   return `${Math.round(completed)} of ${Math.round(raised)} closed - ${pctText(rate(completed, raised))}`;
 }
 
+/** The seven rows of the recovery queue, by stable identity rather than wording. */
+export type RecoveryKey =
+  'negative' | 'returned' | 'remade' | 'replaced' | 'happy' | 'partial' | 'unhappy';
+
 export interface AnalyticsPayload {
   range: ResolvedRange;
   filters: AnalyticsFilters;
@@ -957,14 +1045,53 @@ export interface AnalyticsPayload {
     plates_sold: number;
   };
   categories: { key: string; label: string; excellent: number; good: number; average: number; poor: number }[];
+  /**
+   * WHICH POPULATION THE RECORD-LEVEL SECTIONS BELOW DESCRIBE — D11(a).
+   *
+   * `menu_items`, `common_problems`, `most_complained`, `most_appreciated` and
+   * `recovery` are RECORD-level: the owner ruled that a GRE / Manager filter
+   * narrows them to that person's own records. `summary`, `categories` and
+   * `daily` are VENUE-level and never narrow. Two scopes in one payload need a
+   * label or a reader will apply the wrong one, and the two rate denominators
+   * here exist so a narrowed numerator is never divided by a venue total.
+   *
+   * THIS IS NOT THE PERSON PAYLOAD. `PersonScope` / `GrePerformanceRow` stay at
+   * 21 keys with ZERO sentiment keys - that is the fairness ruling and it is
+   * unchanged. This block describes the SECTIONS, not the person: it carries no
+   * per-person score, nothing here is ordered by anybody, and it says the same
+   * words whether the person recorded everything or nothing.
+   */
+  records: {
+    /** 'venue' with no name picked; 'person' when one is. */
+    scope: 'venue' | 'person';
+    /** The name the record sections were narrowed to. '' when scope is 'venue'. */
+    person: string;
+    /** Item feedbacks BEHIND these sections. The `Neg %`-style denominator. */
+    item_feedbacks: number;
+    /** Negative item feedbacks behind these sections - the "Share of negatives"
+     *  denominator. NOT `summary.negative_item_feedbacks`, which is the venue
+     *  tile: dividing a narrowed count by the venue total printed shares that
+     *  did not add to 100 %. */
+    negative_item_feedbacks: number;
+    /** Distinct items SOLD in the room. Stays venue even when the rows narrow,
+     *  because "of N items sold" is a fact about the kitchen, not the recorder. */
+    items_sold: number;
+    /** One sentence naming the scope, for the screen and every sheet. '' when
+     *  scope is 'venue'. */
+    note: string;
+  };
   menu_items: MenuItemRow[];
   common_problems: { label: string; count: number }[];
   most_complained: { label: string; count: number; feedbacks: number; negative_pct: number | null }[];
   most_appreciated: { label: string; count: number; feedbacks: number }[];
-  recovery: { label: string; count: number }[];
+  /** THE RECOVERY QUEUE — record-level under D11(a). `key` is stable across both
+   *  scopes so a caller can read one outcome without matching on the label, which
+   *  changes wording when a name is picked (see `analytics()`). */
+  recovery: { key: RecoveryKey; label: string; count: number }[];
   gre_performance: GrePerformanceRow[];
-  /** Filled ONLY when a GRE / Manager filter is set. Null otherwise. Nothing
-   *  else on the payload moves when it is set — section 6, layer 2. */
+  /** Filled ONLY when a GRE / Manager filter is set. Null otherwise. When it is
+   *  set, the ONLY other things that move are the record-level sections named in
+   *  `records` — section 6, layer 2, as the owner amended it in D11(a). */
   person: PersonScope | null;
   daily: {
     day: string; label: string; eligible: number; taken: number;
@@ -1041,7 +1168,10 @@ export function analytics(
 ): AnalyticsPayload {
   const f = opts.filters;
   const r = resolveRange(db, f, opts.nowMs);
-  const u = loadUniverse(db, opts.outletId, r, f);
+  // The VENUE filter, built once. Section 2b: everything that must not move when
+  // a name is picked is computed from this, and it has no person in it to move to.
+  const vf = venueFilters(f);
+  const u = loadUniverse(db, opts.outletId, r, vf);
 
   const orderById = new Map(u.orders.map((o) => [o.order_id, o]));
   const eligibleIds = new Set(u.eligible.map((o) => o.order_id));
@@ -1090,25 +1220,45 @@ export function analytics(
   const greNamesRecorded = uniqSorted(allVisits.filter((v) => !isManagementRole(v.gre_role)).map((v) => v.gre_name).filter(Boolean));
   const managers = uniqSorted(allVisits.filter((v) => isManagementRole(v.gre_role)).map((v) => v.gre_name).filter(Boolean));
 
-  // 🔒 SECTION 6, LAYER 2. The person filter does NOT narrow `visits`, and this
-  // one line is the whole fairness fix. Everything below — the rating split,
-  // the four red/amber tiles, the menu items, Most Complained, Service Recovery
-  // and the daily rows — is computed over the ROOM (Floor / Section / Captain /
-  // period), exactly as it is when no name is selected. The person is answered
-  // separately, in `personScope()`, with the five figures the owner named.
+  // 🔒 SECTION 6, LAYER 2, AS THE OWNER AMENDED IT IN D11(a). THIS IS THE ONLY
+  // PLACE IN THE FILE WHERE A PERSON NARROWS ANYTHING. Read 2b first.
   //
-  // Measured before this change, `?gre=<name>`, the same person and the same
+  // `visits` is the ROOM and stays the room: the rating split, the four
+  // red/amber negative tiles, the category ratings, the daily rows, the coverage
+  // denominators and the per-person table are all computed from it, and none of
+  // them moves when a name is picked. It is branded `VenueRows` so that cannot
+  // change by accident — see 2b.
+  //
+  // `recordVisits` is the same list narrowed to the selected person, and it
+  // feeds ONLY the three sections the owner named: the menu items, the recovery
+  // queue and (in `itemComments()`) the comments. It is branded `RecordRows`, so
+  // handing it to a venue aggregate does not compile.
+  //
+  // Measured on the earlier tip, `?gre=<name>`, the same person and the same
   // five visits: recording honestly gave Excellent 1 / Average 4 / Negative 4;
   // recording "everything good" gave Excellent 5 (100 %) / Negative 0 — in a
-  // downloadable workbook headed with her name. Nothing in the payload may move
-  // that way again.
+  // downloadable workbook headed with her name. The venue lane below is what
+  // makes that unreachable, and it is unreachable for the RATINGS whatever the
+  // record lane does.
+  //
+  // ⚠️ THE FILTER IS A NAME, NOT AN ID. `f.gre` carries `gf_visits.gre_name`,
+  // which is what the dropdown offers, what `personScope()` looks up and what
+  // `filterLines()` prints, so the narrowing matches by name too — anything else
+  // would silently drop the records of a second person sharing a display name.
+  // `grePerformance()` keys by USER ID where it has one, so two people with one
+  // display name get two rows there and the person block shows the first; when
+  // that happens `records.note` says so rather than leaving the reader to
+  // discover that the two halves count different people.
   const personName = !isAll(f.gre) ? String(f.gre).trim() : !isAll(f.manager) ? String(f.manager).trim() : '';
-  const visits = allVisits;
+  const visits = asVenue(allVisits);
+  const recordVisits = asRecord(
+    personName ? allVisits.filter((v) => v.gre_name === personName) : allVisits,
+  );
+  const recordVisitIds = new Set(recordVisits.map((v) => v.visit_id));
 
-  // Section 7: coverage counts only visits on tables that were ELIGIBLE —
-  // otherwise a visit to a two-item table would push coverage over 100 %. The
-  // rest are `extraVisits`, counted and named rather than dropped.
-  const coveredVisits = visits.filter((v) => eligibleIds.has(v.order_id));
+  // Section 7's coverage numerator is derived INSIDE `venueSummary()` and
+  // `venueDaily()` from the venue rows, so there is no narrowed numerator lying
+  // around for a later edit to pick up by name. See those two functions.
   const visitById = new Map(visits.map((v) => [v.visit_id, v]));
 
   /* -- item feedback --------------------------------------------------- */
@@ -1152,10 +1302,14 @@ export function analytics(
     };
   });
 
-  const items = allItems.filter(
-    (x) =>
-      (!groupWanted || x.group === groupWanted)
-      && (!itemWanted || x.item_name.toLowerCase().includes(itemWanted)),
+  // VENUE: the Food/Drinks and Menu Item filters narrow items for everyone,
+  // because those are properties of the DISH, not of the recorder.
+  const items = asVenue(
+    allItems.filter(
+      (x) =>
+        (!groupWanted || x.group === groupWanted)
+        && (!itemWanted || x.item_name.toLowerCase().includes(itemWanted)),
+    ),
   );
 
   /* -- follow-ups ------------------------------------------------------ */
@@ -1198,10 +1352,20 @@ export function analytics(
   // follow-ups ABOUT those items too, or "Guest Happy" would answer for drinks
   // while the table above it answered for food.
   const keptItemIds = new Set(items.map((x) => x.id));
-  const followUps =
+  const followUps = asVenue(
     groupWanted || itemWanted
       ? allFollowUps.filter((x) => keptItemIds.has(x.item_feedback_id))
-      : allFollowUps;
+      : allFollowUps,
+  );
+
+  /* -- THE RECORD LANE -------------------------------------------------- */
+  // D11(a): the same rows, narrowed to the selected person, for the three
+  // sections the owner said the filter should narrow — and for nothing else.
+  // With no name picked these are the venue rows, element for element, so the
+  // record sections are the venue's own records by default and the two lanes
+  // are provably identical in the unfiltered case (measured: byte-identical).
+  const recordItems = asRecord(items.filter((x) => recordVisitIds.has(x.visit_id)));
+  const recordFollowUps = asRecord(followUps.filter((x) => recordVisitIds.has(x.visit_id)));
 
   /* -- plates sold, keyed by name (section 5) -------------------------- */
   const soldRows = selectIn(
@@ -1225,17 +1389,38 @@ export function analytics(
   }
 
   /* -- aggregates ------------------------------------------------------ */
-  const ratingCount = (v: string) => visits.filter((x) => x.overall_rating === v).length;
-
-  const act = (a: ActionTaken) => items.filter((x) => x.action_taken === a).length;
-  const replaced = act('replaced_same') + act('replaced_other');
-
-  const happy = followUps.filter((x) => x.happiness === 'happy').length;
-  const partial = followUps.filter((x) => x.happiness === 'partial').length;
-  const unhappy = followUps.filter((x) => x.happiness === 'unhappy').length;
+  // 🔒 THE VENUE AGGREGATES NO LONGER LIVE HERE. The rating split, the four
+  // red/amber negative tiles, the coverage denominators and the daily rows are
+  // computed by `venueSummary()`, `venueCategories()` and `venueDaily()` further
+  // down, which take `VenueFilters` + `VenueRows` and therefore cannot see a
+  // person at all. They used to be inline `ratingCount` / `act` / `happy` /
+  // `partial` / `unhappy` locals sitting beside the record-level ones — two sets
+  // of near-identical names in one scope, where pointing the wrong one at the
+  // rating split was a one-character mistake that compiled. Those locals are
+  // gone deliberately; do not reintroduce them here.
   const openNowAllTime = countOpenFollowUpsNow(db);
 
-  const menuItems = buildMenuItems(items, followUps, soldByKey, groupWanted, itemWanted);
+  /* -- the record-level sections (D11(a)) ------------------------------- */
+  // `menuItems` is what the screen and the sheets DRAW, so it is the narrowed
+  // one. `venueMenuItemNames` exists for the Menu item DROPDOWN only: picking a
+  // GRE must not empty the list the next filter is chosen from, which is the
+  // same law the GRE dropdown itself already follows a few lines below.
+  //
+  // The sold-but-uncommented rows are seeded ONLY in the venue list. Under a
+  // person filter a row reading "Sold 12 · Feedbacks 0" is neither that person's
+  // record nor a fact about the dish — it is 45 rows of fabricated silence that
+  // make a narrowed table look like an unnarrowed one, which is exactly the
+  // "recorded nothing, therefore looks clean" reading the owner ruled against.
+  const menuItems = buildMenuItems(recordItems, recordFollowUps, soldByKey, groupWanted, itemWanted, !personName);
+  const venueMenuItems = personName
+    ? buildMenuItems(items, followUps, soldByKey, groupWanted, itemWanted, true)
+    : menuItems;
+
+  const recAct = (a: ActionTaken) => recordItems.filter((x) => x.action_taken === a).length;
+  const recNegatives = recordItems.filter((x) => x.is_negative).length;
+  const recHappy = recordFollowUps.filter((x) => x.happiness === 'happy').length;
+  const recPartial = recordFollowUps.filter((x) => x.happiness === 'partial').length;
+  const recUnhappy = recordFollowUps.filter((x) => x.happiness === 'unhappy').length;
 
   // The per-person table. Seeded from the people who HOLD the role, not from
   // the visits, so a GRE who recorded nothing still has a row — total silence
@@ -1276,46 +1461,32 @@ export function analytics(
     ...gre.filter((g) => g.kind !== 'management').map((g) => g.person).filter(Boolean),
   ]);
 
-  const summary: AnalyticsPayload['summary'] = {
-    eligible_tables: u.eligible.length,
-    all_tables: u.orders.length,
-    feedbacks_recorded: visits.length,
-    eligible_tables_covered: coveredVisits.length,
-    extra_visits: visits.length - coveredVisits.length,
-    coverage_pct: rate(coveredVisits.length, u.eligible.length),
-    excellent: ratingCount('excellent'),
-    good: ratingCount('good'),
-    average: ratingCount('average'),
-    poor: ratingCount('poor'),
-    unrated: visits.filter((x) => !x.overall_rating).length,
-    everything_good: visits.filter((x) => x.everything_good).length,
-    negative_item_feedbacks: items.filter((x) => x.is_negative).length,
-    item_feedbacks: items.length,
-    returned: act('returned'),
-    remade: act('remade'),
-    replaced,
-    cancelled: act('cancelled'),
-    happy_after_replacement: happy,
-    partially_happy: partial,
-    still_unhappy: unhappy,
-    pending_follow_ups: followUps.filter((x) => x.status === 'open').length,
-    follow_ups_raised: followUps.length,
-    follow_ups_completed: followUps.filter((x) => x.status === 'closed').length,
-    open_follow_ups_now: openNowAllTime,
-    plates_sold: platesSold,
-  };
+  // 🔒 THE VENUE LANE, BEHIND A FUNCTION BOUNDARY. `venueSummary` takes the
+  // VENUE filter and the VENUE rows and nothing else — there is no `personName`
+  // and no `recordItems` inside its body to reach for, so the rating split and
+  // the four negative tiles cannot be narrowed to a person by any edit that
+  // still compiles. That is the owner's "structurally impossible".
+  const summary = venueSummary(vf, u, visits, items, followUps, eligibleIds, platesSold, openNowAllTime);
+
+  const recordScopeNote = personName
+    ? recordScopeSentence(personName, gre)
+    : '';
 
   return {
     range: r,
     filters: f,
     summary,
-    categories: CATEGORIES.map((c) => {
-      const col = `cat_${c.v}` as 'cat_food' | 'cat_drinks' | 'cat_service' | 'cat_ambience';
-      const n = (val: string) => visits.filter((x) => x[col] === val).length;
-      return { key: c.v, label: c.label, excellent: n('excellent'), good: n('good'), average: n('average'), poor: n('poor') };
-    }),
+    categories: venueCategories(vf, visits),
+    records: {
+      scope: personName ? 'person' : 'venue',
+      person: personName,
+      item_feedbacks: recordItems.length,
+      negative_item_feedbacks: recNegatives,
+      items_sold: venueMenuItems.length,
+      note: recordScopeNote,
+    },
     menu_items: menuItems,
-    common_problems: commonProblems(items),
+    common_problems: commonProblems(recordItems),
     most_complained: menuItems
       .filter((m) => m.negative > 0)
       .sort((a, b) => b.negative - a.negative || (rate(b.negative, b.feedbacks) ?? 0) - (rate(a.negative, a.feedbacks) ?? 0))
@@ -1326,40 +1497,38 @@ export function analytics(
       .sort((a, b) => b.good - a.good || b.feedbacks - a.feedbacks)
       .slice(0, 8)
       .map((m) => ({ label: m.menu_item, count: m.good, feedbacks: m.feedbacks })),
-    recovery: [
-      { label: 'Negative feedbacks', count: summary.negative_item_feedbacks },
-      { label: 'Items returned', count: summary.returned },
-      { label: 'Items remade', count: summary.remade },
-      { label: 'Items replaced', count: summary.replaced },
-      { label: 'Guest happy after correction', count: happy },
-      { label: 'Partially happy', count: partial },
-      { label: 'Still unhappy', count: unhappy },
-    ],
+    // 🐞 RISK 3, CLOSED IN THE LABEL. Row 0 used to BE
+    // `summary.negative_item_feedbacks` — the venue tile. Now the queue is
+    // record-scoped while the tile stays venue, so the two would print
+    // DIFFERENT numbers under the SAME words in one workbook. Under a person
+    // filter every label here says whose records it counts, so a reader cannot
+    // read the queue as the venue's or the tile as the person's.
+    recovery: ([
+      { key: 'negative', label: 'Negative feedbacks', count: recNegatives },
+      { key: 'returned', label: 'Items returned', count: recAct('returned') },
+      { key: 'remade', label: 'Items remade', count: recAct('remade') },
+      { key: 'replaced', label: 'Items replaced', count: recAct('replaced_same') + recAct('replaced_other') },
+      { key: 'happy', label: 'Guest happy after correction', count: recHappy },
+      { key: 'partial', label: 'Partially happy', count: recPartial },
+      { key: 'unhappy', label: 'Still unhappy', count: recUnhappy },
+    ] as { key: RecoveryKey; label: string; count: number }[]).map((x) => (
+      personName ? { ...x, label: `${x.label} — ${personName}'s records` } : x
+    )),
     gre_performance: gre,
     person: personScope(gre, personName),
-    daily: daysInRange(r).map((d) => {
-      const el = u.eligible.filter((o) => o.business_day === d).length;
-      const tk = coveredVisits.filter((v) => v.business_day === d).length;
-      return {
-        day: d,
-        label: humanDay(d),
-        eligible: el,
-        taken: tk,
-        coverage_pct: rate(tk, el),
-        negative: items.filter((x) => x.business_day === d && x.is_negative).length,
-        returned_remade: items.filter(
-          (x) => x.business_day === d && (x.action_taken === 'returned' || x.action_taken === 'remade'),
-        ).length,
-        open: followUps.filter((x) => x.business_day === d && x.status === 'open').length,
-      };
-    }),
+    daily: venueDaily(vf, r, u, visits, items, followUps, eligibleIds),
     options: {
       floors: u.floors,
       sections: u.sections,
       captains: u.captains,
       gres,
       managers,
-      items: uniqSorted(menuItems.map((m) => m.menu_item)).slice(0, 500),
+      // VENUE, deliberately. Picking a GRE must not shorten the Menu item
+      // dropdown — it is the list the NEXT filter is chosen from, and the same
+      // law already governs `gres` above ("picking a name does not empty the
+      // list it came from"). `venueMenuItems` is `menuItems` itself when no name
+      // is picked, so this costs a second pass only while a filter is on.
+      items: uniqSorted(venueMenuItems.map((m) => m.menu_item)).slice(0, 500),
       sections_available: u.sections.length > 0,
       sections_note: u.sections.length > 0 ? '' : NOTE_SECTIONS_EMPTY,
     },
@@ -1387,17 +1556,171 @@ export function analytics(
   };
 }
 
+/* ════════════════════════════════════════════════════════════════════════════
+   THE VENUE LANE — WHAT A PERSON FILTER CANNOT REACH
+   ════════════════════════════════════════════════════════════════════════════
+   The owner's ruling in D11(a): "The RATING SPLIT and the four red/amber
+   negative tiles stay VENUE-WIDE no matter whose name is picked." These three
+   functions are that sentence, compiled.
+
+   Each one takes a `VenueFilters` — which has no `gre` and no `manager`, at the
+   type level — and `VenueRows` arrays. Neither `personName` nor the narrowed
+   arrays are in scope inside any of them. A future edit that tries to narrow a
+   rating to a person has nothing here to narrow BY, and passing the record
+   arrays in from outside does not type-check.
+
+   The `vf` parameter is not decoration: it is the only filter these bodies can
+   see, so the day one of them needs to read a filter, the filter it reads is
+   provably person-free.
+   ──────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * THE RATING SPLIT, THE FOUR NEGATIVE TILES AND THE COVERAGE DENOMINATORS.
+ *
+ * Section 7: coverage counts only visits on tables that were ELIGIBLE —
+ * otherwise a visit to a two-item table would push coverage over 100 %. The rest
+ * are `extra_visits`, counted and named rather than dropped. The numerator is
+ * derived HERE, from the venue rows, so no narrowed numerator exists anywhere
+ * for a later edit to reach for.
+ */
+function venueSummary(
+  vf: VenueFilters,
+  u: Universe,
+  visits: VenueRows<VisitRow>,
+  items: VenueRows<ItemFeedbackRow>,
+  followUps: VenueRows<FollowUpRow>,
+  eligibleIds: Set<string>,
+  platesSold: number,
+  openNowAllTime: number,
+): AnalyticsPayload['summary'] {
+  void vf; // the person-free filter; see the block comment above
+  const covered = visits.filter((v) => eligibleIds.has(v.order_id)).length;
+  const ratingCount = (v: string) => visits.filter((x) => x.overall_rating === v).length;
+  const act = (a: ActionTaken) => items.filter((x) => x.action_taken === a).length;
+  const replaced = act('replaced_same') + act('replaced_other');
+
+  return {
+    eligible_tables: u.eligible.length,
+    all_tables: u.orders.length,
+    feedbacks_recorded: visits.length,
+    eligible_tables_covered: covered,
+    extra_visits: visits.length - covered,
+    coverage_pct: rate(covered, u.eligible.length),
+    // ── THE RATING SPLIT. Venue-wide, whoever recorded it. ──
+    excellent: ratingCount('excellent'),
+    good: ratingCount('good'),
+    average: ratingCount('average'),
+    poor: ratingCount('poor'),
+    unrated: visits.filter((x) => !x.overall_rating).length,
+    everything_good: visits.filter((x) => x.everything_good).length,
+    // ── NEGATIVE TILE 1. Venue-wide. ──
+    negative_item_feedbacks: items.filter((x) => x.is_negative).length,
+    item_feedbacks: items.length,
+    // ── NEGATIVE TILE 2. Venue-wide. ──
+    returned: act('returned'),
+    remade: act('remade'),
+    replaced,
+    cancelled: act('cancelled'),
+    // ── NEGATIVE TILE 3. Venue-wide. ──
+    happy_after_replacement: followUps.filter((x) => x.happiness === 'happy').length,
+    partially_happy: followUps.filter((x) => x.happiness === 'partial').length,
+    still_unhappy: followUps.filter((x) => x.happiness === 'unhappy').length,
+    // ── NEGATIVE TILE 4. Venue-wide. ──
+    pending_follow_ups: followUps.filter((x) => x.status === 'open').length,
+    follow_ups_raised: followUps.length,
+    follow_ups_completed: followUps.filter((x) => x.status === 'closed').length,
+    open_follow_ups_now: openNowAllTime,
+    plates_sold: platesSold,
+  };
+}
+
+/** THE CATEGORY RATINGS (Food / Drinks / Service / Ambience). Pure sentiment,
+ *  therefore venue-wide without exception. */
+function venueCategories(vf: VenueFilters, visits: VenueRows<VisitRow>): AnalyticsPayload['categories'] {
+  void vf;
+  return CATEGORIES.map((c) => {
+    const col = `cat_${c.v}` as 'cat_food' | 'cat_drinks' | 'cat_service' | 'cat_ambience';
+    const n = (val: string) => visits.filter((x) => x[col] === val).length;
+    return { key: c.v, label: c.label, excellent: n('excellent'), good: n('good'), average: n('average'), poor: n('poor') };
+  });
+}
+
+/** THE DAILY ROWS. Both halves are venue: `.eligible` / `.taken` /
+ *  `.coverage_pct` are the coverage denominators, and `.negative` /
+ *  `.returned_remade` / `.open` express sentiment. Neither may narrow. */
+function venueDaily(
+  vf: VenueFilters,
+  r: ResolvedRange,
+  u: Universe,
+  visits: VenueRows<VisitRow>,
+  items: VenueRows<ItemFeedbackRow>,
+  followUps: VenueRows<FollowUpRow>,
+  eligibleIds: Set<string>,
+): AnalyticsPayload['daily'] {
+  void vf;
+  const covered = visits.filter((v) => eligibleIds.has(v.order_id));
+  return daysInRange(r).map((d) => {
+    const el = u.eligible.filter((o) => o.business_day === d).length;
+    const tk = covered.filter((v) => v.business_day === d).length;
+    return {
+      day: d,
+      label: humanDay(d),
+      eligible: el,
+      taken: tk,
+      coverage_pct: rate(tk, el),
+      negative: items.filter((x) => x.business_day === d && x.is_negative).length,
+      returned_remade: items.filter(
+        (x) => x.business_day === d && (x.action_taken === 'returned' || x.action_taken === 'remade'),
+      ).length,
+      open: followUps.filter((x) => x.business_day === d && x.status === 'open').length,
+    };
+  });
+}
+
+/**
+ * The one sentence that tells a reader which sections moved. It goes on the
+ * screen under the narrowed sections and into every sheet note that carries
+ * record-level data, so the two scopes in one payload are never left to be
+ * inferred from a heading.
+ *
+ * ⚠️ THE SHARED-NAME CASE, NAMED RATHER THAN HIDDEN. The filter is a NAME;
+ * `grePerformance()` keys by USER ID where it has one. Two active people with
+ * one display name therefore get TWO rows in the per-person table while
+ * `personScope()` returns the first — so the record sections below (which match
+ * by name, because dropping the second person's records would be a silent loss)
+ * count both people while the person block describes one. That is a real
+ * divergence and it says so out loud instead of printing two numbers that
+ * quietly count different populations.
+ */
+function recordScopeSentence(personName: string, rows: GrePerformanceRow[]): string {
+  const shared = rows.filter((g) => g.person === personName).length;
+  const base =
+    `Narrowed to ${personName}: the menu items, the problems, the recovery queue and the item `
+    + `comments below list what ${personName} wrote down. The rating split, the category ratings, `
+    + 'the day-by-day rows and every Summary tile above them still cover the WHOLE selected floor, '
+    + 'section, captain and period — they do not move when a name is picked, so nothing a guest '
+    + `actually said can make ${personName}'s numbers look worse.`;
+  return shared > 1
+    ? `${base} NOTE: ${shared} active people share the name "${personName}", so these sections count `
+      + `all ${shared} of them while the "What ${personName} did" block describes one. Tell the owner `
+      + 'two staff records carry the same display name.'
+    : base;
+}
+
 export const COUNTS_SCOPE_ROOM =
   'Every figure on this page covers the selected period, floor, section and captain.';
 
 export const COUNTS_SCOPE_PERSON =
-  'A GRE / Manager filter selects a PERSON, and a person is not a part of the room: it fills in '
-  + 'the "What this person did" block and changes NOTHING else. The rating split, the negative '
-  + 'tiles, the menu items and the recovery block still cover the whole selected floor, section, '
-  + 'captain and period. That is deliberate - narrowing them to one name made the same GRE on the '
-  + 'same tables read "Excellent 100%, Negative 0" when she recorded nothing and "Average 100%, '
-  + 'Negative 4" when she recorded what the guests said, which is exactly the incentive the '
-  + "owner's fairness ruling forbids.";
+  'A GRE / Manager filter selects a PERSON, and this page then shows TWO scopes at once. It '
+  + 'narrows the RECORDS: the menu items, the most-complained and most-appreciated lists, the '
+  + 'problems, the service-recovery queue and the item comments are what THIS PERSON wrote down. '
+  + 'It does NOT narrow the JUDGEMENT: the rating split, the four negative tiles, the category '
+  + 'ratings, the coverage figures and the day-by-day rows still cover the whole selected floor, '
+  + 'section, captain and period, whoever recorded them. That split is deliberate and it is the '
+  + "owner's fairness ruling - narrowing the ratings to one name made the same GRE on the same "
+  + 'tables read "Excellent 100%, Negative 0" when she recorded nothing and "Average 100%, '
+  + 'Negative 4" when she recorded what the guests said. Recording a complaint fills in the lists '
+  + 'below and can never move a rating, so it can never cost the person anything.';
 
 /**
  * The person block — section 6, layer 2. It is a PROJECTION of the row the
@@ -1465,12 +1788,22 @@ function countOpenFollowUpsNow(db: Database.Database): number {
   }
 }
 
+/**
+ * The menu-item table. RECORD-LEVEL under D11(a): `analytics()` calls it once
+ * with the person-narrowed rows for what the page draws, and once with the venue
+ * rows for the Menu item dropdown. It takes plain arrays deliberately — it is
+ * the one function both lanes share, so branding its parameters would force a
+ * cast at each call and prove nothing.
+ *
+ * `seedUnmentioned` is the scope switch: see the call site.
+ */
 function buildMenuItems(
-  items: ItemFeedbackRow[],
-  followUps: FollowUpRow[],
+  items: readonly ItemFeedbackRow[],
+  followUps: readonly FollowUpRow[],
   soldByKey: Map<string, { name: string; sold: number }>,
   groupWanted: string,
   itemWanted: string,
+  seedUnmentioned: boolean,
 ): MenuItemRow[] {
   const by = new Map<string, MenuItemRow>();
 
@@ -1511,10 +1844,16 @@ function buildMenuItems(
     if (fu.happiness === 'unhappy') row.still_unhappy++;
   }
 
-  // Dishes that SOLD but drew no comment belong in the table: a manager
+  // Dishes that SOLD but drew no comment belong in the VENUE table: a manager
   // scanning for the problem dish also needs to see what nobody mentioned, and
   // leaving them out would make "Feedbacks 0" unrepresentable.
+  //
+  // They do NOT belong in a table narrowed to one person (`seedUnmentioned`
+  // false): "nobody mentioned this dish" is a venue fact, while "this GRE did
+  // not mention this dish" is not a record of anything and would pad a narrowed
+  // table with zeros until it read like the unnarrowed one.
   for (const [key, s] of soldByKey) {
+    if (!seedUnmentioned) break;
     if (by.has(key)) continue;
     if (itemWanted && !s.name.toLowerCase().includes(itemWanted)) continue;
     // The Food/Drinks answer is stored on the FEEDBACK row, not on the order
@@ -1533,7 +1872,10 @@ function buildMenuItems(
   );
 }
 
-function commonProblems(items: ItemFeedbackRow[]): { label: string; count: number }[] {
+/** RECORD-LEVEL under D11(a) — `analytics()` hands it the person-narrowed rows.
+ *  Its counts are divided by `records.negative_item_feedbacks`, never by the
+ *  venue tile: see the "Share of negatives" column in `buildReport`. */
+function commonProblems(items: readonly ItemFeedbackRow[]): { label: string; count: number }[] {
   const labels = new Map(ITEM_ISSUES.map((i) => [i.v as string, i.label]));
   const n = new Map<string, number>();
   for (const x of items) {
@@ -1557,9 +1899,14 @@ function commonProblems(items: ItemFeedbackRow[]): { label: string; count: numbe
 function grePerformance(
   db: Database.Database,
   u: Universe,
-  visits: VisitRow[],
-  items: ItemFeedbackRow[],
-  followUps: FollowUpRow[],
+  // VENUE ROWS ONLY, enforced by section 2b's brand. This table has one row per
+  // PERSON and it is the source of the GRE dropdown, so narrowing its input to
+  // the selected person would empty every other row, hide the silent role
+  // holders the table exists for, and make picking a name empty the list the
+  // name came from. `RecordRows` does not type-check here.
+  visits: VenueRows<VisitRow>,
+  items: VenueRows<ItemFeedbackRow>,
+  followUps: VenueRows<FollowUpRow>,
   eligibleIds: Set<string>,
 ): GrePerformanceRow[] {
   const by = new Map<string, GrePerformanceRow>();
@@ -1747,7 +2094,9 @@ export function itemComments(
   const item = payload.menu_items.find((m) => m.item_key === key) ?? null;
 
   const r = payload.range;
-  const u = loadUniverse(db, opts.outletId, r, opts.filters);
+  // The universe is the ROOM: `venueFilters()` strips the person before it is
+  // read, so the order list behind the comments is never narrowed by a name.
+  const u = loadUniverse(db, opts.outletId, r, venueFilters(opts.filters));
   const visitRows = selectIn(
     db,
     `SELECT id, order_id, table_number, floor, gre_name, gre_role, created_at
@@ -1756,15 +2105,32 @@ export function itemComments(
   );
   const orderById = new Map(u.orders.map((o) => [o.order_id, o]));
 
-  // 🔒 SECTION 6, LAYER 2 — and it applies to the click-through too. This used
-  // to drop every row not recorded by the selected person, which made the
-  // comment list disagree with the very row that was clicked (the counts above
-  // it are room-scoped) AND turned a person filter into a per-person sentiment
-  // view. Every row carries `gre_name`, so the screen can still show who wrote
-  // each one without the list itself becoming a judgement of one name.
+  // 🔒 D11(a) — THE COMMENTS ARE A RECORD-LEVEL SECTION, SO THEY NARROW.
+  //
+  // The owner named them: the filter narrows "comments, menu items, the recovery
+  // queue". An earlier cut of this function narrowed them, was reverted because
+  // the comment list then disagreed with the row that had been clicked (that row
+  // was room-scoped), and the note left behind said the list must never narrow.
+  // Both halves have now moved: `payload.menu_items` IS the narrowed table, so
+  // narrowing here is what makes the list AGREE with the clicked row again. The
+  // arithmetic is the same either way; only which of the two it matches changed.
+  //
+  // What still cannot narrow is anything that carries a rating: `payload.summary`
+  // and `payload.categories` above come out of the venue lane, and the person is
+  // stripped from the universe query by `venueFilters()`.
+  //
+  // Every row keeps `gre_name` so the screen can show who wrote each one, which
+  // is what makes an UNFILTERED list readable as the venue's.
+  const personName = !isAll(opts.filters.gre)
+    ? String(opts.filters.gre).trim()
+    : !isAll(opts.filters.manager) ? String(opts.filters.manager).trim() : '';
+
   const visitMeta = new Map<string, { table: string; floor: string; gre: string; captain: string; day: string }>();
   for (const v of visitRows as any[]) {
     const gre = String(v.gre_name ?? '').trim();
+    // By NAME, exactly as `analytics()` narrows the other record sections — see
+    // the "THE FILTER IS A NAME, NOT AN ID" note there.
+    if (personName && gre !== personName) continue;
     const o = orderById.get(String(v.order_id));
     visitMeta.set(String(v.id), {
       table: String(v.table_number ?? o?.table_number ?? ''),
@@ -1925,6 +2291,27 @@ export function buildReport(p: AnalyticsPayload, key: ReportKeyName): ReportDoc 
   const filters = filterLines(p.range, p.filters);
   const s = p.summary;
 
+  /* ── D11(a): TWO SCOPES IN ONE FILE, SAID ON EVERY SHEET ──────────────────
+     A workbook headed "GRE: <name>" in which some sheets are that person's
+     records and others are the venue's ratings is unreadable unless each sheet
+     says which it is. `filterLines` says it once at the top of every file; these
+     two notes say it again ON the sheet, because a reader who prints page 3 or
+     opens one tab never sees the cover.
+
+     Both are '' when no name is picked, and `withNote` then leaves every note
+     exactly as it was — so an unfiltered download is byte-identical to before
+     (measured). */
+  const recordNote = p.records.note;
+  const venueNote = p.records.scope === 'person'
+    ? `THIS SHEET IS THE WHOLE VENUE, NOT ${p.records.person}. It covers every recorder on the `
+      + 'selected floor, section, captain and period, and it does not change when a name is picked. '
+      + `No figure on it is a judgement of ${p.records.person}.`
+    : '';
+  const withNote = (base: string | undefined, extra: string): string | undefined => {
+    if (!extra) return base;
+    return base ? `${base} ${extra}` : extra;
+  };
+
   // Section 7: the two counts are both printed, with their relationship on the
   // face of the sheet. The Summary used to say "Feedbacks taken 9" beside a
   // Rating split sheet that accounted for 10, inside ONE workbook.
@@ -2068,15 +2455,19 @@ export function buildReport(p: AnalyticsPayload, key: ReportKeyName): ReportDoc 
       { label: 'Open', width: 0.85, align: 'right' },
     ],
     rows: p.daily.map((d) => [d.label, d.eligible, d.taken, pctText(d.coverage_pct), d.negative, d.returned_remade, d.open]),
-    note: 'Open = follow-ups raised on that day that are still open. A day with no eligible table shows "-" for coverage rather than 0%, which would read as "we covered nothing".',
+    // VENUE on both halves — the coverage columns AND the sentiment columns.
+    note: withNote('Open = follow-ups raised on that day that are still open. A day with no eligible table shows "-" for coverage rather than 0%, which would read as "we covered nothing".', venueNote),
     emptyNote: 'No business days in this period.',
   };
 
   const recoveryTable: ReportTable = {
     name: 'Service recovery',
     columns: [{ label: 'Outcome', width: 3 }, { label: 'Count', width: 1, align: 'right' }],
+    // RECORD-level: the owner named the recovery queue. Under a person filter the
+    // row LABELS themselves name the recorder (see `recovery` in `analytics()`),
+    // so this sheet cannot be confused with the venue tile of the same name.
     rows: p.recovery.map((x) => [x.label, x.count]),
-    note: 'What happened AFTER a negative feedback. "Guest happy after correction" closes the complaint; "partially happy" and "still unhappy" leave it open for the manager.',
+    note: withNote('What happened AFTER a negative feedback. "Guest happy after correction" closes the complaint; "partially happy" and "still unhappy" leave it open for the manager.', recordNote),
     emptyNote: 'No service recovery activity in this period.',
   };
 
@@ -2123,8 +2514,10 @@ export function buildReport(p: AnalyticsPayload, key: ReportKeyName): ReportDoc 
       pctText(rate(m.negative, m.feedbacks)), m.returned, m.remade,
       pctText(rate(m.returned_qty + m.remade_qty, m.sold)), m.happy_after,
     ]),
-    note: `${NEGATIVE_PCT_BASIS} ${RETURN_REMAKE_BASIS} ${GROUP_UNKNOWN_BASIS}`,
-    emptyNote: 'No menu items matched these filters.',
+    note: withNote(`${NEGATIVE_PCT_BASIS} ${RETURN_REMAKE_BASIS} ${GROUP_UNKNOWN_BASIS}`, recordNote),
+    emptyNote: recordNote
+      ? `${p.records.person} recorded no item feedback in this period. The dishes the venue sold are not listed here, because "this person did not mention it" is not a record of anything - the venue's own menu-item sheet is the unfiltered download.`
+      : 'No menu items matched these filters.',
   });
 
   switch (key) {
@@ -2166,14 +2559,15 @@ export function buildReport(p: AnalyticsPayload, key: ReportKeyName): ReportDoc 
               out.push(['Total feedbacks recorded', total, pctText(rate(total, total))]);
               return out;
             })(),
-            note: '"Everything Good" submissions are counted under their overall rating; a visit '
+            note: withNote('"Everything Good" submissions are counted under their overall rating; a visit '
               + 'recorded with no overall rating is listed as Not rated. The Total is the same '
               + '"Feedbacks recorded" figure as the Summary sheet - every visit in scope, '
-              + 'including any on a table that never met the eligibility trigger.',
+              + 'including any on a table that never met the eligibility trigger.', venueNote),
             emptyNote: 'No feedback was recorded in this period.',
           },
           {
             name: 'Category ratings',
+            note: venueNote || undefined,
             columns: [
               { label: 'Category', width: 2 }, { label: 'Excellent', width: 1.1, align: 'right' },
               { label: 'Good', width: 1, align: 'right' }, { label: 'Average', width: 1.05, align: 'right' },
@@ -2192,8 +2586,14 @@ export function buildReport(p: AnalyticsPayload, key: ReportKeyName): ReportDoc 
         ...base, key, slug: 'menu-item', title: 'Menu Item Feedback Report',
         subtitle: 'Every item ordered in the period, with the rates beside the counts.',
         kpis: [
-          { label: 'Items with feedback', value: n0(p.menu_items.filter((m) => m.feedbacks > 0).length), sub: `of ${n0(p.menu_items.length)} items sold` },
+          // `records.items_sold` is the VENUE count of dishes sold, not
+          // `p.menu_items.length`: under a person filter the table lists only the
+          // dishes THEY commented on, so "of 3 items sold" would have replaced the
+          // kitchen's real 45 with the length of a narrowed list.
+          { label: 'Items with feedback', value: n0(p.menu_items.filter((m) => m.feedbacks > 0).length), sub: `of ${n0(p.records.items_sold)} items sold` },
           { label: 'Plates sold', value: qtyText(s.plates_sold) },
+          // NEGATIVE TILE 1: venue, always. `records.negative_item_feedbacks` is
+          // the record-scoped twin and is used only as a rate denominator below.
           { label: 'Negative item feedbacks', value: n0(s.negative_item_feedbacks) },
           { label: 'Returned + remade', value: n0(s.returned + s.remade) },
         ],
@@ -2204,14 +2604,19 @@ export function buildReport(p: AnalyticsPayload, key: ReportKeyName): ReportDoc 
             name: 'Most complained',
             columns: [{ label: 'Item', width: 3, fitPrint: true }, { label: 'Negative', width: 1.1, align: 'right' }, { label: 'Feedbacks', width: 1.2, align: 'right' }, { label: 'Neg %', width: 1, align: 'right' }],
             rows: p.most_complained.map((x) => [x.label, x.count, x.feedbacks, pctText(x.negative_pct)]),
-            note: 'Ordered by absolute count, deliberately: a rate alone hides a high-volume dish with many complaints, and a count alone hides a rarely-ordered one that is always wrong. Read this beside Negative %.',
-            emptyNote: 'No negative item feedback in this period.',
+            note: withNote('Ordered by absolute count, deliberately: a rate alone hides a high-volume dish with many complaints, and a count alone hides a rarely-ordered one that is always wrong. Read this beside Negative %.', recordNote),
+            emptyNote: recordNote
+              ? `${p.records.person} recorded no complaint against any item in this period. An empty sheet here is NOT a clean venue - the Negative item feedbacks tile on the Report sheet is the venue's figure and it is unaffected by this filter.`
+              : 'No negative item feedback in this period.',
           },
           {
             name: 'Most appreciated',
             columns: [{ label: 'Item', width: 3, fitPrint: true }, { label: 'Good ratings', width: 1.4, align: 'right' }, { label: 'Feedbacks', width: 1.2, align: 'right' }],
             rows: p.most_appreciated.map((x) => [x.label, x.count, x.feedbacks]),
-            emptyNote: 'No positive item feedback in this period.',
+            note: recordNote || undefined,
+            emptyNote: recordNote
+              ? `${p.records.person} recorded no positive item feedback in this period.`
+              : 'No positive item feedback in this period.',
           },
         ],
       };
@@ -2243,8 +2648,10 @@ export function buildReport(p: AnalyticsPayload, key: ReportKeyName): ReportDoc 
                 m.menu_item, qtyText(m.sold), m.returned, m.remade, m.replaced, m.cancelled,
                 pctText(rate(m.returned_qty + m.remade_qty, m.sold)), m.happy_after,
               ]),
-            note: RETURN_REMAKE_BASIS,
-            emptyNote: 'Nothing was returned, remade, replaced or cancelled in this period.',
+            note: withNote(RETURN_REMAKE_BASIS, recordNote),
+            emptyNote: recordNote
+              ? `${p.records.person} recorded nothing returned, remade, replaced or cancelled in this period. The Returned / Remade / Replaced / Cancelled tiles on the Report sheet are the venue's and are unaffected by this filter.`
+              : 'Nothing was returned, remade, replaced or cancelled in this period.',
           },
           recoveryTable,
         ],
@@ -2265,8 +2672,24 @@ export function buildReport(p: AnalyticsPayload, key: ReportKeyName): ReportDoc 
           {
             name: 'Most common problems',
             columns: [{ label: 'Problem', width: 3 }, { label: 'Count', width: 1, align: 'right' }, { label: 'Share of negatives', width: 1.5, align: 'right' }],
-            rows: p.common_problems.map((x) => [x.label, x.count, pctText(rate(x.count, s.negative_item_feedbacks))]),
-            emptyNote: 'No issue was recorded against any item in this period.',
+            // 🐞 BOTH SIDES OF A RATE MUST COUNT THE SAME POPULATION.
+            // `p.common_problems` is RECORD-level, so its denominator must be
+            // `p.records.negative_item_feedbacks` and not the venue tile
+            // `s.negative_item_feedbacks`. Dividing one person's issue counts by
+            // the venue's negatives printed shares that do not add to 100 % and
+            // made an honest recorder's problems look like a rounding error.
+            rows: p.common_problems.map((x) => [x.label, x.count, pctText(rate(x.count, p.records.negative_item_feedbacks))]),
+            // The basis sentence is attached ONLY under a person filter, where
+            // the sheet's scope and the venue tile of the same name differ. With
+            // no name picked the two coincide, the sentence is redundant, and
+            // leaving it off keeps every unfiltered download byte-identical to
+            // what this module already ships (measured, all eight, old vs new).
+            note: recordNote
+              ? `Share of negatives is each problem over the negative feedbacks in the SAME scope as this sheet, so the column adds to 100%. ${recordNote}`
+              : undefined,
+            emptyNote: recordNote
+              ? `${p.records.person} recorded no issue against any item in this period.`
+              : 'No issue was recorded against any item in this period.',
           },
           menuTable(p.menu_items.filter((m) => m.negative > 0)),
           recoveryTable,
@@ -2353,7 +2776,14 @@ export function buildReport(p: AnalyticsPayload, key: ReportKeyName): ReportDoc 
               + 'wrote down. Raised / Completed / Open = follow-ups they created, closed and '
               + `still owe. ${ISSUES_RECORDED_IS_NOT_A_PENALTY} ${RECOVERY_IS_A_QUEUE} `
               + 'A person listed with 0 everywhere holds the GRE role and recorded nothing in '
-              + 'this period - that row is the point of this table, not an error.',
+              + 'this period - that row is the point of this table, not an error.'
+              // EVERY person, even when one name is picked: this table is where a
+              // manager compares, so narrowing it to one row would destroy the
+              // only thing it is for. The leading space lives INSIDE the ternary,
+              // so with no name picked this note is character-for-character the
+              // one this module already ships.
+              + (venueNote ? ' EVERY person in scope is listed here, including when a GRE / Manager '
+                + 'filter is set - this sheet never narrows to one name.' : ''),
             emptyNote: 'Nobody holds the GRE role and nobody recorded feedback in this period.',
           },
           dailyTable,
@@ -2385,7 +2815,10 @@ export function buildReport(p: AnalyticsPayload, key: ReportKeyName): ReportDoc 
             rows: p.menu_items
               .filter((m) => m.negative + m.happy_after + m.still_unhappy > 0)
               .map((m) => [m.menu_item, m.negative, m.returned, m.remade, m.replaced, m.happy_after, m.still_unhappy]),
-            emptyNote: 'No complaint needed recovery in this period.',
+            note: recordNote || undefined,
+            emptyNote: recordNote
+              ? `No complaint ${p.records.person} recorded needed recovery in this period. The venue's own recovery figures are the unfiltered download.`
+              : 'No complaint needed recovery in this period.',
           },
           {
             name: 'Open complaints now (all dates)',

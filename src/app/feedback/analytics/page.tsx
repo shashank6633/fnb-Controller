@@ -58,7 +58,7 @@ import {
 } from 'lucide-react';
 import { api } from '@/lib/api';
 import { DATE_RANGES, ITEM_GROUPS, REPORTS, type ItemGroup } from '@/lib/feedback';
-import type { AnalyticsPayload, ItemCommentRow, MenuItemRow } from '@/lib/feedback/reporting';
+import type { AnalyticsPayload, ItemCommentRow, MenuItemRow, RecoveryKey } from '@/lib/feedback/reporting';
 import {
   Card, Chip, EmptyState, PageBody, PageHead, Scroller, SectionTitle, Select,
   StickyBar, TableScroll, Tile,
@@ -276,6 +276,21 @@ export default function FeedbackAnalyticsPage() {
    */
   const ratingTotal = s ? s.feedbacks_recorded : 0;
   const recoveryTotal = (data?.recovery ?? []).reduce((a, b) => a + b.count, 0);
+  /* 🐞 THE THREE COLOURED TILES INSIDE THE RECOVERY CARD USED TO BE VENUE
+     FIGURES SITTING UNDER RECORD-LEVEL BARS. Since D11(a) made the recovery
+     queue narrow to the selected person, `s.happy_after_replacement` beside the
+     bar "Guest happy after correction — <name>'s records" printed TWO DIFFERENT
+     NUMBERS for one outcome in ONE card. They are read from the queue itself now,
+     by stable `key` rather than by row position, so the card is internally
+     consistent at both scopes. The venue's own three figures are not lost: they
+     are the Dashboard tiles further up ("Happy after replacement", "Still
+     unhappy" with its partially-happy hint), which never narrow. */
+  const recoveryBy = new Map((data?.recovery ?? []).map((r) => [r.key, r.count]));
+  const rec = (k: RecoveryKey): number => recoveryBy.get(k) ?? 0;
+  /** The name the RECORD-level sections are narrowed to, '' when venue-wide.
+   *  Safe before `data` loads, so the comments drawer (which renders outside the
+   *  payload's null guard) can say whose comments it is showing. */
+  const recordPerson = data?.records.scope === 'person' ? data.records.person : '';
 
   /** A value that is not among its options makes a `<select>` render the FIRST
    *  one, silently moving the reader back to "All" — the same trap Page 1's
@@ -507,10 +522,28 @@ export default function FeedbackAnalyticsPage() {
             </div>
 
             {/* ── Rating split ─────────────────────────────────────────── */}
-            <SectionTitle hint={`${ratingTotal} feedbacks recorded${s.unrated ? ` · ${s.unrated} not rated` : ''}`}>
+            {/* 🔒 D11(a). THE RATING BLOCK IS VENUE-WIDE AND HAS TO SAY SO ON ITS
+                OWN FACE. Below this point the page shows the RECORDS of the person
+                picked in the GRE / Manager filter, and above it the judgement of
+                the ROOM. A reader who scrolls to a name-filtered page and sees
+                "Excellent 100%" must not be able to read it as that person's, so
+                the scope is printed here rather than left to the Dashboard note
+                further up the page. */}
+            <SectionTitle
+              hint={data.records.scope === 'person'
+                ? `whole venue — ${ratingTotal} feedbacks by everyone, NOT ${data.records.person}`
+                : `${ratingTotal} feedbacks recorded${s.unrated ? ` · ${s.unrated} not rated` : ''}`}
+            >
               Overall rating split
             </SectionTitle>
             <Card className="p-3">
+              {data.records.scope === 'person' ? (
+                <p className="mb-2 rounded-lg bg-[#F7EEE4] px-2.5 py-1.5 text-[11px] font-semibold leading-snug text-[#6B5744]">
+                  Whole venue, every recorder. This block does not change when a name is
+                  picked — so recording what a guest actually said can never move
+                  {' '}{data.records.person}&rsquo;s numbers.
+                </p>
+              ) : null}
               <div className="flex h-3 w-full overflow-hidden rounded-full bg-[#F0E4D6]">
                 <span className="bg-emerald-600" style={{ width: barWidth(s.excellent, ratingTotal) }} />
                 <span className="bg-emerald-400" style={{ width: barWidth(s.good, ratingTotal) }} />
@@ -562,9 +595,22 @@ export default function FeedbackAnalyticsPage() {
             </Card>
 
             {/* ── Menu Item Analysis ───────────────────────────────────── */}
-            <SectionTitle hint="tap a row for the comments">Menu item analysis</SectionTitle>
+            {/* RECORD-LEVEL from here down to the end of Service recovery: under a
+                GRE / Manager filter these are that person's own records, which is
+                what the owner ruled in D11(a). `records.note` is the server's own
+                sentence, so the screen and all eight downloads say the same thing. */}
+            <SectionTitle hint={data.records.scope === 'person' ? `recorded by ${data.records.person} · tap a row for the comments` : 'tap a row for the comments'}>
+              Menu item analysis
+            </SectionTitle>
+            {data.records.note ? (
+              <p className="-mt-1 text-[11px] leading-snug text-[#8B7355]">{data.records.note}</p>
+            ) : null}
             {data.menu_items.length === 0 ? (
-              <EmptyState>No menu item matches that filter.</EmptyState>
+              <EmptyState>
+                {data.records.scope === 'person'
+                  ? `${data.records.person} recorded no item feedback in this period. That is not a clean venue — the Dashboard tiles and the rating split above are unaffected by this filter.`
+                  : 'No menu item matches that filter.'}
+              </EmptyState>
             ) : (
               <Card className="p-3">
                 <TableScroll>
@@ -627,7 +673,10 @@ export default function FeedbackAnalyticsPage() {
                 icon={<TrendingDown className="w-4 h-4 text-red-600" />}
                 rows={data.common_problems}
                 tone="bad"
-                empty="No issue was recorded against an item in this period."
+                empty={data.records.scope === 'person'
+                  ? `${data.records.person} recorded no issue against an item in this period.`
+                  : 'No issue was recorded against an item in this period.'}
+                note={data.records.note || undefined}
               />
               <RankList
                 title="Most complained items"
@@ -638,31 +687,55 @@ export default function FeedbackAnalyticsPage() {
                   sub: `${pctText(m.negative_pct)} of ${m.feedbacks}`,
                 }))}
                 tone="warn"
-                empty="No negative item feedback in this period."
-                note="Ordered by count, with the rate printed beside it: a rate alone hides a busy dish with many complaints, and a count alone hides a rare one that is always wrong."
+                empty={data.records.scope === 'person'
+                  ? `${data.records.person} recorded no complaint against an item. NOT a clean venue — see the Dashboard tiles.`
+                  : 'No negative item feedback in this period.'}
+                note={`Ordered by count, with the rate printed beside it: a rate alone hides a busy dish with many complaints, and a count alone hides a rare one that is always wrong.${data.records.note ? ` ${data.records.note}` : ''}`}
               />
               <RankList
                 title="Most appreciated items"
                 icon={<ThumbsUp className="w-4 h-4 text-emerald-600" />}
                 rows={data.most_appreciated.map((m) => ({ label: m.label, count: m.count, sub: `of ${m.feedbacks}` }))}
                 tone="good"
-                empty="No positive item feedback in this period."
+                empty={data.records.scope === 'person'
+                  ? `${data.records.person} recorded no positive item feedback in this period.`
+                  : 'No positive item feedback in this period.'}
+                note={data.records.note || undefined}
               />
             </div>
 
             {/* ── Service recovery ─────────────────────────────────────── */}
-            <SectionTitle hint="what happened after a negative feedback">Service recovery</SectionTitle>
+            <SectionTitle hint={data.records.scope === 'person' ? `what happened after a complaint ${data.records.person} recorded` : 'what happened after a negative feedback'}>
+              Service recovery
+            </SectionTitle>
             <Card className="p-3">
+              {data.records.note ? (
+                <p className="mb-2 rounded-lg bg-[#F7EEE4] px-2.5 py-1.5 text-[11px] font-semibold leading-snug text-[#6B5744]">
+                  {data.records.person}&rsquo;s records only. The venue&rsquo;s own negative,
+                  returned/remade and still-unhappy figures are the Dashboard tiles above, and they
+                  do not move when a name is picked.
+                </p>
+              ) : null}
               {recoveryTotal === 0 ? (
                 <p className="text-[12px] text-[#8B7355]">
-                  Nothing was returned, remade or replaced in this period, and no complaint needed a
-                  follow-up.
+                  {data.records.scope === 'person'
+                    ? `${data.records.person} recorded no complaint in this period, so there is nothing here to recover. Read the Dashboard tiles above for the venue's own figures — an empty queue here is not a clean service.`
+                    : 'Nothing was returned, remade or replaced in this period, and no complaint needed a follow-up.'}
                 </p>
               ) : (
                 <div className="space-y-1.5">
                   {data.recovery.map((r) => (
                     <div key={r.label} className="flex items-center gap-2">
-                      <span className="w-44 shrink-0 text-[12px] font-semibold text-[#6B5744] truncate">
+                      {/* NOT `truncate`. Under a GRE / Manager filter the label
+                          carries "— <name>'s records" (the server qualifies it so
+                          the e-mailed workbook cannot read the queue as the venue
+                          tile of the same name), and at w-44 a clipped label lost
+                          the OUTCOME word: "Guest happy after correcti…". It wraps
+                          instead, which costs a line and keeps every word. */}
+                      <span
+                        className="w-44 shrink-0 text-[12px] font-semibold leading-tight text-[#6B5744] break-words"
+                        title={r.label}
+                      >
                         {r.label}
                       </span>
                       <span className="flex-1 h-2.5 rounded-full bg-[#F0E4D6] overflow-hidden">
@@ -680,17 +753,17 @@ export default function FeedbackAnalyticsPage() {
                   <div className="flex items-center gap-1.5 text-[11px] font-bold text-emerald-800">
                     <Smile className="w-3.5 h-3.5" /> Happy after
                   </div>
-                  <div className="text-xl font-extrabold text-emerald-700">{s.happy_after_replacement}</div>
+                  <div className="text-xl font-extrabold text-emerald-700">{rec('happy')}</div>
                 </div>
                 <div className="rounded-xl bg-amber-50 border border-amber-200 px-3 py-2">
                   <div className="text-[11px] font-bold text-amber-800">Partially happy</div>
-                  <div className="text-xl font-extrabold text-amber-700">{s.partially_happy}</div>
+                  <div className="text-xl font-extrabold text-amber-700">{rec('partial')}</div>
                 </div>
                 <div className="rounded-xl bg-red-50 border border-red-200 px-3 py-2">
                   <div className="flex items-center gap-1.5 text-[11px] font-bold text-red-800">
                     <Frown className="w-3.5 h-3.5" /> Still unhappy
                   </div>
-                  <div className="text-xl font-extrabold text-red-700">{s.still_unhappy}</div>
+                  <div className="text-xl font-extrabold text-red-700">{rec('unhappy')}</div>
                 </div>
               </div>
               <p className="mt-2 text-[10px] leading-snug text-[#8B7355]">
@@ -698,13 +771,34 @@ export default function FeedbackAnalyticsPage() {
                 unhappy” leave it open for the manager — {s.open_follow_ups_now} follow-up
                 {s.open_follow_ups_now === 1 ? ' is' : 's are'} open right now across all dates, which
                 is deliberately not bound by the period filter above.
+                {/* 🐞 A VENUE, ALL-DATES NUMBER INSIDE A CARD THAT IS NOW THIS
+                    PERSON'S. `open_follow_ups_now` is the venue's live queue and is
+                    not even range-bound, so in a card headed with one name it read
+                    as hers. The exports have said whose it is since the first cut
+                    (`openNowFootnote`); the screen says it here, in the same words
+                    and with the person's own figure beside it. */}
+                {data.records.scope === 'person' && data.person ? (
+                  <>
+                    {' '}That figure is the WHOLE VENUE&rsquo;s open queue, not {data.records.person}
+                    &rsquo;s — {data.person.follow_ups_open} of{' '}
+                    {data.person.follow_ups_open === 1 ? 'them is' : 'them are'} theirs.
+                  </>
+                ) : null}
               </p>
             </Card>
 
             {/* ── By day ───────────────────────────────────────────────── */}
             {data.daily.length > 1 ? (
               <>
-                <SectionTitle hint={`${data.range.cutoff} IST rollover`}>By business day</SectionTitle>
+                {/* VENUE again, after the record-level block above it — so it says
+                    so, in reading order, rather than relying on a note near the top. */}
+                <SectionTitle
+                  hint={data.records.scope === 'person'
+                    ? `whole venue · ${data.range.cutoff} IST rollover — NOT ${data.records.person}`
+                    : `${data.range.cutoff} IST rollover`}
+                >
+                  By business day
+                </SectionTitle>
                 <Card className="p-3">
                   <TableScroll>
                     <table className="w-full text-[12px]">
@@ -963,6 +1057,11 @@ export default function FeedbackAnalyticsPage() {
 
             <div className="mt-4 flex items-center gap-2 text-[12px] font-extrabold uppercase tracking-wide text-[#8B7355]">
               <MessageSquare className="w-3.5 h-3.5" /> Guest comments
+              {recordPerson ? (
+                <span className="normal-case tracking-normal font-semibold text-[#af4408]">
+                  — recorded by {recordPerson}
+                </span>
+              ) : null}
             </div>
 
             {commentsError ? (
@@ -975,7 +1074,9 @@ export default function FeedbackAnalyticsPage() {
               </div>
             ) : comments.length === 0 ? (
               <div className="mt-2 rounded-xl border border-dashed border-[#D4B896] bg-[#FFF8F0] px-3 py-6 text-center text-[12px] text-[#8B7355]">
-                No item feedback was recorded against this dish in this period.
+                {recordPerson
+                  ? `${recordPerson} recorded no feedback against this dish in this period. Other staff may have — clear the GRE / Manager filter to read the venue's comments on it.`
+                  : 'No item feedback was recorded against this dish in this period.'}
               </div>
             ) : (
               <div className="mt-2 space-y-2">
