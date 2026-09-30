@@ -25,8 +25,20 @@ const nextConfig: NextConfig = {
   // better-sqlite3 is a NATIVE module (bindings loads its .node at runtime): dev
   // builds don't dead-code-eliminate the NEXT_RUNTIME guard in instrumentation.ts,
   // so webpack's edge pass followed the import chain into bindings.js and threw a
-  // blocking "Can't resolve 'fs'" overlay. Force all three to runtime require.
-  serverExternalPackages: ['pdf-parse', 'pdfkit', 'better-sqlite3'],
+  // blocking "Can't resolve 'fs'" overlay. Force all four to runtime require.
+  //
+  // web-push joined the list for the SAME reason, one commit later and by the
+  // same mechanism. Arming the scheduler in instrumentation.ts (c25844a) added
+  //   instrumentation.ts → lib/scheduler → lib/grn-qc-notify → lib/push → web-push
+  // and web-push reaches https-proxy-agent → agent-base, which does a bare
+  // `require("http")`. The NEXT_RUNTIME !== 'nodejs' guard above that import is a
+  // RUNTIME check; webpack resolves STATICALLY and follows the chain anyway. It
+  // broke `next dev` only — turbopack, which `next build` and the CI deploy use,
+  // resolves it fine, which is why production and every CI build stayed green
+  // while the local overlay showed "Can't resolve 'http'".
+  // web-push is server-only (VAPID keys live in the settings table), so it has
+  // no business in any client or edge bundle.
+  serverExternalPackages: ['pdf-parse', 'pdfkit', 'better-sqlite3', 'web-push'],
 
   // The EDGE compile (middleware + edge instrumentation pass) statically follows
   // instrumentation.ts → error-alerts → db.ts → better-sqlite3 even though the
@@ -42,7 +54,15 @@ const nextConfig: NextConfig = {
   webpack: (config, { nextRuntime }) => {
     if (nextRuntime === 'edge') {
       config.resolve = config.resolve || {};
-      config.resolve.fallback = { ...(config.resolve.fallback || {}), fs: false, path: false, crypto: false };
+      // http/https joined fs/path/crypto when the scheduler import pulled
+      // web-push → https-proxy-agent → agent-base onto this pass. Belt and
+      // braces with serverExternalPackages above: that stops webpack following
+      // into the package at all, these stub the built-ins if anything else ever
+      // reaches for them on edge.
+      config.resolve.fallback = {
+        ...(config.resolve.fallback || {}),
+        fs: false, path: false, crypto: false, http: false, https: false,
+      };
     }
     return config;
   },
