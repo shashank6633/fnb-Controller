@@ -331,6 +331,136 @@ export function parseLocationsResponse(body: string, accountName: string):
   };
 }
 
+/* ── Why Google said no ───────────────────────────────────────────────────── */
+
+/**
+ * WHAT WENT WRONG HERE BEFORE: every 401 and every 403 was answered with one
+ * sentence — "the Business Profile API application has not been approved yet —
+ * that is paperwork, not a bug". While the application really was outstanding
+ * that was true often enough to be useful. Once it is GRANTED the same sentence
+ * becomes the most expensive kind of wrong: it sends the owner back to a queue
+ * he has already left, and the fix he actually needs — one checkbox in Cloud
+ * Console, or a different Google account — is never named.
+ *
+ * A 403 from Google is not one state. It is at least four, and the status code
+ * does not tell them apart:
+ *
+ *   SERVICE_DISABLED        the APIs are not switched ON for the Cloud project.
+ *                           A toggle in Console. Being granted access does NOT
+ *                           do this for you, so an APPROVED owner can sit here.
+ *   accessNotConfigured     the project was never granted Basic API Access. The
+ *                           application — and the grant is PER PROJECT.
+ *   quota refused           either a burst against a working grant (quota above
+ *                           0) or the zero quota of a project that was never
+ *                           granted access. Google's message is identical.
+ *   PERMISSION_DENIED       credentials fine, API on, but the authorised Google
+ *                           account does not MANAGE this profile.
+ *
+ * Nothing below guesses. The cause is read from the reason codes and the message
+ * Google itself returned, and when those do not identify it the answer is
+ * 'unknown' and BOTH candidate fixes are named rather than one asserted.
+ *
+ * READ THE REASON CODES BEFORE THE PROSE, and never treat `error.status` as a
+ * cause. Two things force this:
+ *
+ *   · Google's message for SERVICE_DISABLED ("...has not been used in project
+ *     1077580169090 before or it is disabled") and for the legacy
+ *     accessNotConfigured ("...has not been used in this project before") differ
+ *     by one word. Matching prose ahead of the machine-readable reason is a
+ *     coin-flip between two fixes in two different places.
+ *   · `status: PERMISSION_DENIED` is what Google sends for SERVICE_DISABLED and
+ *     for accessNotConfigured too, so it identifies nothing on its own.
+ *
+ * And the prose pass matches only phrases specific enough to name a fix. The
+ * bare word "forbidden" is deliberately not one of them: an HTML "403 Forbidden"
+ * page from a proxy in the middle is not evidence about any of Google's states,
+ * and reading it as one (an earlier draft of this function did) points the owner
+ * at the wrong Google account for a fault that was never Google's.
+ */
+export type GoogleRefusal =
+  | 'bad_credentials'
+  | 'api_not_enabled'
+  | 'not_allowlisted'
+  | 'quota_refused'
+  | 'not_this_listing'
+  | 'unknown';
+
+export function classifyGoogleRefusal(
+  status: number,
+  body: string,
+): { cause: GoogleRefusal; detail: string } {
+  let err: any = {};
+  try { err = JSON.parse(body)?.error ?? {}; } catch { /* body is not JSON — fall back to its text */ }
+  const detail = String(err?.message || '').trim() || body.slice(0, 400);
+
+  // Machine-readable reasons only. `error.status` is deliberately NOT collected
+  // here — see the note above on why PERMISSION_DENIED identifies nothing.
+  const reasons = new Set<string>();
+  const push = (v: unknown) => { const s = String(v ?? '').trim().toLowerCase(); if (s) reasons.add(s); };
+  if (Array.isArray(err?.details)) for (const d of err.details) push(d?.reason);
+  if (Array.isArray(err?.errors)) for (const e of err.errors) push(e?.reason);
+  const has = (...keys: string[]) => keys.some(k => reasons.has(k));
+  const statusCode = String(err?.status ?? '').trim().toLowerCase();
+  const said = detail.toLowerCase();
+
+  /* ── Pass 1: what Google said in machine-readable form. Authoritative. ── */
+  if (status === 401 || statusCode === 'unauthenticated' || has('autherror', 'authenticationerror')) {
+    return { cause: 'bad_credentials', detail };
+  }
+  if (has('service_disabled')) return { cause: 'api_not_enabled', detail };
+  if (has('accessnotconfigured')) return { cause: 'not_allowlisted', detail };
+  if (statusCode === 'resource_exhausted'
+    || has('ratelimitexceeded', 'rate_limit_exceeded', 'userratelimitexceeded', 'quotaexceeded', 'quota_exceeded')) {
+    return { cause: 'quota_refused', detail };
+  }
+  if (has('insufficientpermissions', 'forbidden')) return { cause: 'not_this_listing', detail };
+
+  /* ── Pass 2: Google's prose, same order, specific phrases only. ── */
+  if (/invalid authentication|invalid credentials/.test(said)) return { cause: 'bad_credentials', detail };
+  if (/or it is disabled|enable it by visiting|api is not enabled/.test(said)) {
+    return { cause: 'api_not_enabled', detail };
+  }
+  if (/not been granted access|basic api access|access not configured/.test(said)) {
+    return { cause: 'not_allowlisted', detail };
+  }
+  if (/quota exceeded|rate limit exceeded/.test(said)) return { cause: 'quota_refused', detail };
+  if (/does not have permission|caller does not have|insufficient authentication scopes|insufficient permission/
+    .test(said)) {
+    return { cause: 'not_this_listing', detail };
+  }
+
+  return { cause: 'unknown', detail };
+}
+
+/** One sentence per cause, and each one names WHERE the fix lives. */
+export const REFUSAL_REMEDY: Record<GoogleRefusal, string> = {
+  bad_credentials:
+    'Google rejected the credentials themselves. That is an authorisation problem and not an approval one — '
+    + 'reconnect the Google account; nothing about the API application changes it.',
+  api_not_enabled:
+    'The Business Profile APIs are NOT switched on for this Google Cloud project. Being granted API access does '
+    + 'not enable them for you — in Cloud Console, on the project this OAuth client belongs to, enable Account '
+    + 'Management, Business Information and My Business v4. This is a toggle, not an application.',
+  not_allowlisted:
+    'This Cloud project has not been granted Basic API Access. The grant is PER PROJECT, so an approval already '
+    + 'held on one project does not cover a different one — check that the project these credentials belong to '
+    + 'shows a Business Profile quota above 0. (Google: a quota of 0 means access was never granted, and the fix '
+    + 'is the application, not a quota-increase request.)',
+  quota_refused:
+    'Google refused on quota, and its message reads the same for two different causes. Read the quota page for '
+    + 'THIS project before doing anything: above 0 means a burst against a working grant and the next pull will '
+    + 'get through; exactly 0 means the project was never granted access, and retrying cannot help.',
+  not_this_listing:
+    'The credentials are valid and the API is on, but the Google account that authorised this app does not MANAGE '
+    + 'this Business Profile. Being able to see the listing on Maps is not the same thing — reconnect as an owner '
+    + 'or a manager of the profile.',
+  unknown:
+    'Google refused without naming a reason this app recognises, so its own message above is the thing to read. '
+    + 'The two causes that look identical from here are the APIs not being switched on for the Cloud project (a '
+    + 'Console toggle) and the project never having been granted Basic API Access (the application, where the '
+    + 'quota reads 0 instead of 300 QPM). They are fixed in different places.',
+};
+
 async function googleGet(url: string, token: string, signal?: AbortSignal): Promise<string> {
   const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` }, signal });
   const body = await res.text();
@@ -338,10 +468,10 @@ async function googleGet(url: string, token: string, signal?: AbortSignal): Prom
     let detail = body.slice(0, 400);
     try { detail = JSON.parse(body)?.error?.message || detail; } catch { /* keep the text */ }
     if (res.status === 401 || res.status === 403) {
+      const refusal = classifyGoogleRefusal(res.status, body);
       throw new SourceNotConfiguredError(
-        `Google refused the request (HTTP ${res.status}): ${detail}. A 403 with zero quota ` +
-        'means the Business Profile API application has not been approved yet — that is ' +
-        'paperwork, not a bug, and a Takeout import works in the meantime.',
+        `Google refused the request (HTTP ${res.status}): ${refusal.detail}. `
+        + REFUSAL_REMEDY[refusal.cause],
         PREREQUISITES,
       );
     }
@@ -461,11 +591,13 @@ export async function gbpCollect(
       let detail = body.slice(0, 400);
       try { detail = JSON.parse(body)?.error?.message || detail; } catch { /* keep the text */ }
       if (res.status === 401 || res.status === 403) {
+        // Same four-way distinction as googleGet — see classifyGoogleRefusal.
+        // A single "not approved yet" here is what told an owner who HAD been
+        // approved to go and re-apply.
+        const refusal = classifyGoogleRefusal(res.status, body);
         throw new SourceNotConfiguredError(
-          `Google refused the reviews request (HTTP ${res.status}): ${detail}. ` +
-          'A 403 with zero quota means the Business Profile API application has not been ' +
-          'approved yet — that is paperwork, not a bug, and a Takeout import works in the ' +
-          'meantime.',
+          `Google refused the reviews request (HTTP ${res.status}): ${refusal.detail}. `
+          + REFUSAL_REMEDY[refusal.cause],
           PREREQUISITES,
         );
       }

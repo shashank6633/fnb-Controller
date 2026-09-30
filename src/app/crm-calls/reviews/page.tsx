@@ -226,6 +226,22 @@ interface RefreshOutcome {
   needsReconnect?: boolean;
   /** 409 + prerequisites: Google's approval process, not a fault here. */
   prerequisites?: string[];
+  /**
+   * ERROR OUTCOMES ONLY. The value of `connection.last_success_at` as the SERVER
+   * reported it at the instant this failure was raised, in milliseconds — the
+   * marker a later success has to pass before this banner may be retired.
+   *
+   * It is the server's own success clock and nothing else. Using the browser's
+   * clock, or `generated_at` from a report that may have been loaded hours
+   * earlier, would let a success that happened BEFORE the error retire it, which
+   * hides a live failure — the opposite mistake and the worse one.
+   *
+   * null/undefined means the reply carried no health (the 401 from the proxy or
+   * from this route's own admin check, or a body that did not parse). Then there
+   * is no marker, and the banner stays until it is dismissed by hand: a stale
+   * error is bad, but inventing a success that was never reported is worse.
+   */
+  successBaselineMs?: number | null;
   ingest?: {
     rows_seen: number; inserted: number; updated: number; unchanged: number;
     skipped_stale: number; errors: number; weak_identity: number;
@@ -380,25 +396,86 @@ export default function ReviewsPage() {
       }
 
       const err = String((json as { error?: string }).error || `HTTP ${res.status}`);
+      const needsReconnect = !!(json as { needs_reconnect?: boolean }).needs_reconnect;
+      // Every failing branch of the refresh route returns fresh `health` beside
+      // its error; the page used to throw it away. Its last_success_at is the
+      // marker that lets a LATER success retire this banner — see
+      // successBaselineMs, and visibleRefreshResult below.
+      const health = (json as { health?: { last_success_at?: string } }).health;
       setRefreshResult({
         tone: 'error',
         message: err,
-        needsReconnect: !!(json as { needs_reconnect?: boolean }).needs_reconnect,
+        needsReconnect,
         prerequisites: (json as { prerequisites?: string[] }).prerequisites || [],
+        // A 409 is TWO states, and one blanket "not retryable" line was wrong
+        // about one of them. A refused refresh token really is terminal. A
+        // prerequisites 409 is a setup or approval state on Google's side whose
+        // own message now says which one and where it is fixed — asserting
+        // non-retryability over the top of it contradicted the message above it.
         detail: res.status === 409
-          ? 'This is not a retryable error — pressing Refresh again will not change it.'
+          ? (needsReconnect
+            ? 'This is not a retryable error — the connection has to be re-authorised before any fetch can work.'
+            : 'This is a setup or approval state on Google’s side, not a fault in this app. The message above says which one, and where it is fixed.')
           : res.status === 401
             ? 'Only an admin can run a manual fetch.'
             : 'Google could not be reached, or answered with an error. This one is worth retrying.',
+        successBaselineMs: health
+          // '' / missing => never succeeded => 0, which is the true baseline:
+          // the first success of all time then passes it.
+          ? (Date.parse(String(health.last_success_at || '')) || 0)
+          : null,
       });
       // The health on the page is now out of date whatever happened.
       await load();
     } catch {
-      setRefreshResult({ tone: 'error', message: 'Couldn’t reach the server to start a fetch.', detail: '' });
+      // Our own server was unreachable, so nothing reported a success marker.
+      // No marker => this one is cleared by hand only.
+      setRefreshResult({
+        tone: 'error',
+        message: 'Couldn’t reach the server to start a fetch.',
+        detail: '',
+        successBaselineMs: null,
+      });
     } finally {
       setRefreshing(false);
     }
   }, [load]);
+
+  /**
+   * A SUCCESSFUL FETCH RETIRES A PREVIOUS FAILURE.
+   *
+   * The failure banner used to be cleared by exactly two things: pressing
+   * Refresh again, and pressing its own ×. Nothing else — not a period change,
+   * not a reconnect, and above all not the hourly automatic pull — so one
+   * transient 504 sat on screen for hours next to "LAST FETCH 1 minute ago" and
+   * the two halves of the same panel contradicted each other. The server had
+   * already retired the failure (recordSuccess clears last_error and zeroes the
+   * failure streak, which is why the "N consecutive failed fetches" line
+   * correctly vanished while this banner did not).
+   *
+   * The rule, stated plainly: a failure is hidden once the server reports a
+   * success STRICTLY NEWER than the one that stood when the failure was raised.
+   *
+   *   · A success that lands after the error retires it — manual or automatic,
+   *     visible at the next load() the page performs.
+   *   · A real, ongoing failure stays. The load() that runs immediately after a
+   *     failed refresh re-reads the same unchanged last_success_at, so the
+   *     baseline and the current value are equal and the banner holds. Nothing
+   *     here is time-based and nothing auto-dismisses.
+   *   · No marker (no health on the reply) => the banner is never hidden by this
+   *     rule at all; it waits for the ×, exactly as before.
+   *
+   * Derived rather than cleared with an effect: the state stays the record of
+   * WHAT failed, and what is computed is only whether it is still true.
+   */
+  const visibleRefreshResult = useMemo(() => {
+    if (!refreshResult || refreshResult.tone !== 'error') return refreshResult;
+    const baseline = refreshResult.successBaselineMs;
+    if (baseline === null || baseline === undefined) return refreshResult;
+    const latestSuccess = Date.parse(data?.connection.last_success_at || '');
+    if (Number.isFinite(latestSuccess) && latestSuccess > baseline) return null;
+    return refreshResult;
+  }, [refreshResult, data]);
 
   const banner = useMemo(
     () => (data ? connectionBanner(data.connection) : null),
@@ -610,7 +687,7 @@ export default function ReviewsPage() {
             refreshing={refreshing}
             onRefreshNow={refreshNow}
             onChanged={load}
-            lastResult={refreshResult}
+            lastResult={visibleRefreshResult}
             onDismissResult={() => setRefreshResult(null)}
           />
         )}
@@ -1388,6 +1465,21 @@ function ConnectionPanel({
             <div className="flex-1 min-w-0">
               <p className="font-semibold">{lastResult.message}</p>
               {lastResult.detail && <p className="mt-0.5 opacity-90">{lastResult.detail}</p>}
+              {/* The other half of "there's an error but it fetched 1 minute
+                  ago". A banner that is NOT stale can still sit beside a fresh
+                  last-fetch time: one manual attempt timed out while the hourly
+                  feed kept working. Both statements are true, and leaving the
+                  reader to reconcile them is how a working connector gets read
+                  as a broken one. Said only while the feed is inside its own
+                  staleness threshold — past that it would be reassurance about
+                  nothing. */}
+              {lastResult.tone === 'error' && !!health.last_success_at
+                && (health.hours_since_success ?? Infinity) < health.stale_after_hours && (
+                <p className="mt-0.5 opacity-90">
+                  This attempt failed; the feed itself has not. Reviews last arrived{' '}
+                  {agoText(health.hours_since_success)} and nothing already fetched was lost.
+                </p>
+              )}
               {!!lastResult.prerequisites?.length && (
                 <ol className="list-decimal pl-4 mt-1.5 space-y-0.5">
                   {lastResult.prerequisites.map((p, i) => <li key={i}>{p}</li>)}
