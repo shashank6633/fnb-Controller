@@ -3,9 +3,12 @@ import { getDb } from '@/lib/db';
 import { getCurrentUser, isManagement } from '@/lib/auth';
 import {
   analyzeReviews, autoDriverTickAt, computeThemes, connectionHealth, ensureReviewSchema,
-  getConnection, hasOauthApp, listReviews, listRuns, sourceReadiness,
+  getConnection, hasOauthApp, listRuns, sourceReadiness,
   type AnalysisReview, type ReviewRow,
 } from '@/lib/reviews';
+// The row universe and the scoring anchor, shared with the /list route so the
+// two surfaces cannot disagree about which reviews are MAJOR.
+import { analysisWindow, loadHistory } from '@/lib/reviews/history';
 // MajorReview is an analysis-layer type; index.ts re-exports the functions but
 // not the interfaces. Imported from the submodule rather than widening the
 // module's front door for one type.
@@ -56,15 +59,12 @@ import { istCivilToMs, istDayKey, parseIsoMs, toIsoUtc } from '@/lib/reviews/tim
 
 export const dynamic = 'force-dynamic';
 
-/** Hard ceiling on rows pulled into memory for one report. Far past any single
- *  restaurant's Google review count (a very busy venue accumulates a few
- *  thousand over a decade). Over it, the OLDEST history is dropped — the recent
- *  end is what the page is for — and `history_truncated` says so rather than
- *  the page quietly reporting an all-time average over a subset. */
-const HISTORY_CAP = 10_000;
-
-/** Cap on reviews returned in the list. The page filters this set client-side,
- *  so the cap is disclosed alongside the true totals. */
+/** Cap on reviews returned in the list, chosen MAJOR-FIRST BY SCORE. These are
+ *  the right 500 for "worst first" and the wrong 500 for any other question, so
+ *  the page no longer filters or re-orders them itself: a date window or an
+ *  oldest-first sort over a score-ranked subset is a short, confident, wrong
+ *  list. Those go to /api/crm-calls/reviews/list, which filters where all the
+ *  rows are. The cap is disclosed alongside the true totals either way. */
 const LIST_CAP = 500;
 
 /** Buckets sent for the chart, per period. Trimmed from the OLD end; the page
@@ -139,43 +139,23 @@ export async function GET(req: Request) {
 
   /* ── 1. Rows. One query; the engine takes it from here. ─────────────────── */
 
-  const totalStored = (db.prepare(
-    'SELECT COUNT(*) AS n FROM gr_reviews WHERE location_key = ?',
-  ).get(locationKey) as { n: number }).n;
-
-  let historyFrom: string | undefined;
-  if (totalStored > HISTORY_CAP) {
-    const cut = db.prepare(
-      `SELECT posted_at FROM gr_reviews WHERE location_key = ?
-        ORDER BY posted_at DESC LIMIT 1 OFFSET ?`,
-    ).get(locationKey, HISTORY_CAP - 1) as { posted_at?: string } | undefined;
-    if (cut?.posted_at) historyFrom = cut.posted_at;
-  }
-
-  const rows: ReviewRow[] = listReviews(db, { locationKey, from: historyFrom });
+  // loadHistory / analysisWindow are SHARED with /api/crm-calls/reviews/list,
+  // and that is the point. `is_major` and `score` are properties of a review
+  // WITHIN A ROW SET — computeMajorReviews compares each one with the trailing
+  // 90 days before it and with the flagged day keys of a series bounded by
+  // from/to. Two surfaces that loaded rows or anchored the series their own way
+  // would print different badges for the same review on the same screen. See
+  // the header of src/lib/reviews/history.ts.
+  const history = loadHistory(db, locationKey);
+  const totalStored = history.total_stored;
+  const historyFrom = history.history_from;
+  const rows: ReviewRow[] = history.rows;
   const analysisInput: AnalysisReview[] = rows;
 
   /* ── 2. The engine, once. ───────────────────────────────────────────────── */
 
-  // Anchor the series at NOW, not at the newest review. If the last review
-  // landed in February, a series that ends in February has no "today" bucket
-  // and the page silently reports February's numbers as this month's.
-  //
-  // The floor of 40 days back guarantees at least two buckets in every period
-  // even with an empty table, so "today" and "yesterday" always exist to be
-  // reported as zero rather than as null-with-no-label.
-  let firstMs = Number.POSITIVE_INFINITY;
-  for (const r of rows) {
-    const ms = parseIsoMs(r.posted_at);
-    if (ms != null && ms < firstMs) firstMs = ms;
-  }
-  const fromMs = Math.min(Number.isFinite(firstMs) ? firstMs : now, now - 40 * DAY_MS);
-
-  const analysis = analyzeReviews(analysisInput, {
-    now,
-    from: toIsoUtc(fromMs),
-    to: nowIso,
-  });
+  const win = analysisWindow(rows, now);
+  const analysis = analyzeReviews(analysisInput, { now, from: win.from, to: win.to });
 
   /* ── 3. Data state — computed BEFORE the headline, because the headline
    *      blocks need to know whether an import even covers them. ─────────── */

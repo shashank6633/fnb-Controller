@@ -611,6 +611,7 @@ ai.analyzePendingReviews({ db: db, limit: 5, locationKey: BULK_LOC }).then(async
   await connectorGates();
   pageGates();
   integrityGates();
+  listingGates();
 
   finish();
 }).catch((e) => {
@@ -1292,6 +1293,260 @@ function pageGates() {
     view.fmtIst('2026-09-10T18:45:00Z', false), '11 Sept 2026');
   eq('and a missing one is a dash, never "Invalid Date"', view.fmtIst('', true), '—');
   eq('as is junk', view.fmtIst('nonsense', true), '—');
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * THE ATTENTION LIST'S WINDOW, ORDER AND DRILL-DOWN — gates AG to AK.
+ *
+ * "Reviews that need attention" now opens on the LAST 30 DAYS and can be
+ * re-ordered oldest-first, and the theme table's counts are clickable. All three
+ * are ways to show a SUBSET, and a subset is where this page is easiest to make
+ * lie:
+ *
+ *   • A date window or an oldest-first sort applied to the 500 rows the report
+ *     sends — which are the top of a SCORE ranking, not a date ranking — returns
+ *     a short, confident, WRONG list. AJ proves the hazard is real on generated
+ *     data and that selecting over the full scored set answers correctly.
+ *   • A drill-down that reveals fewer rows than the number that was clicked
+ *     makes the table's own figure look wrong. AG pins the drill-down against
+ *     computeThemes() itself, theme by theme, across all three spans.
+ *   • A narrowed list that does not say what it is hiding reads as "this is
+ *     everything". AI proves the arithmetic behind "N older not shown" closes.
+ * ══════════════════════════════════════════════════════════════════════════ */
+function listingGates() {
+  const listing = lib('reviews/listing.ts');
+  const DAY = 86_400_000;
+
+  /* ── AG. THE DRILL-DOWN REVEALS EXACTLY WHAT THE TABLE COUNTED ─────────── */
+
+  section('AG. Clicking a theme count reveals exactly that many reviews');
+
+  // The report route builds each theme span as spanRows(days) -> computeThemes.
+  // Reproduced here verbatim, so the comparison is against the shipped counter
+  // and not against a restatement of it.
+  const spanRows = (rows, days, now) => {
+    if (days == null) return rows;
+    const floor = now - days * DAY;
+    return rows.filter(r => {
+      const ms = time.parseIsoMs(r.posted_at);
+      return ms != null && ms >= floor;
+    });
+  };
+
+  const bulkFull = listReviews(db, { locationKey: BULK_LOC });
+  let agChecked = 0, agMismatch = [];
+  for (const [spanKey, days] of [['d90', 90], ['d365', 365], ['all', null]]) {
+    const tally = themes.computeThemes(spanRows(bulkFull, days, BULK_NOW));
+    for (const t of tally.themes) {
+      const hit = listing.selectThemeReviews(bulkFull, t.key, spanKey, BULK_NOW);
+      const low = listing.selectThemeReviews(bulkFull, t.key, spanKey, BULK_NOW, { low: true });
+      agChecked += 2;
+      // MENTIONS: the number in the first clickable column.
+      if (hit.matched_total !== t.count || hit.theme_total !== t.count) {
+        agMismatch.push(`${spanKey}/${t.key} mentions: table ${t.count}, drill ${hit.matched_total}`);
+      }
+      // "1-2* among them": the second clickable column.
+      if (low.matched_total !== t.low_count) {
+        agMismatch.push(`${spanKey}/${t.key} low: table ${t.low_count}, drill ${low.matched_total}`);
+      }
+    }
+  }
+  truthy('every theme count in every span reveals exactly that many reviews (' +
+    agChecked + ' cells checked)', agMismatch.length === 0, agMismatch.slice(0, 6).join(' | '));
+  truthy('and there were real cells to check, not an empty table',
+    agChecked >= 20, agChecked + ' cells');
+
+  // The trap inside the trap: a rating-only review cannot mention anything, so
+  // it is in NEITHER the count nor the revealed rows. If the drill-down included
+  // it, the list would be longer than the number above it.
+  const silent = bulkFull.filter(r => !(r.text || '').trim());
+  truthy('the fixture really does contain rating-only reviews', silent.length > 0,
+    silent.length + ' without text');
+  const anySpan = listing.selectThemeReviews(bulkFull, 'food_quality', 'all', BULK_NOW);
+  eq('and none of them is revealed under a theme count',
+    anySpan.rows.some(r => !(r.text || '').trim()), false);
+
+  // The 'all' span has NO floor, which is why an undated review is inside it.
+  // The drill-down must agree with that too, or the number and the list part.
+  const undatedRows = [
+    { id: 'u1', rating: 2, posted_at: '', text: 'the food was cold and the service slow', reply_text: '', replied_at: '' },
+    { id: 'd1', rating: 5, posted_at: '2026-05-01T10:00:00Z', text: 'lovely food', reply_text: '', replied_at: '' },
+  ];
+  const undatedTally = themes.computeThemes(undatedRows);
+  const undatedFood = undatedTally.themes.find(t => t.key === 'food_quality');
+  const undatedDrill = listing.selectThemeReviews(undatedRows, 'food_quality', 'all', BULK_NOW);
+  eq('an undated review counts under "All", so the drill-down shows it too',
+    [undatedFood.count, undatedDrill.matched_total], [2, 2]);
+  const undatedD90 = listing.selectThemeReviews(undatedRows, 'food_quality', 'd90', BULK_NOW);
+  const d90Tally = themes.computeThemes(spanRows(undatedRows, 90, BULK_NOW));
+  eq('but a DATED span excludes it in both the count and the list',
+    [d90Tally.themes.find(t => t.key === 'food_quality').count, undatedD90.matched_total], [1, 1]);
+
+  /* ── AH. THE WINDOW IS AN IST CALENDAR WINDOW ──────────────────────────── */
+
+  section('AH. The date window is IST calendar days, resolved on the server');
+
+  // 23:30 IST on 30 September 2026. A browser-side window would slide; this one
+  // is anchored to IST midnight so a manager working late keeps the same set.
+  const late = Date.parse('2026-09-30T18:00:00Z');         // 23:30 IST
+  const today = listing.resolveRange('today', late);
+  eq('"today" starts at 00:00 IST, not at 00:00 UTC',
+    today.from, new Date(Date.parse('2026-09-29T18:30:00Z')).toISOString());
+  eq('and ends at the anchor, not at tomorrow', today.to, new Date(late).toISOString());
+  eq('and says so in words the screen prints verbatim', today.label, 'today');
+
+  const d30 = listing.resolveRange('d30', late);
+  eq('30 days means 30 IST calendar days INCLUDING today',
+    (Date.parse(today.from) - Date.parse(d30.from)) / DAY, 29);
+  eq('and is labelled as a window, never as "everything"', d30.label, 'the last 30 days');
+  eq('the default this list opens on is bounded', d30.unbounded, false);
+
+  const all = listing.resolveRange('all', late);
+  eq('only "All" is unbounded', [all.from, all.to, all.unbounded], [null, null, true]);
+
+  // A custom END DATE means the whole of that day. Bounding at 00:00 would drop
+  // everything posted on the day the manager actually typed.
+  const cust = listing.resolveRange('custom', late, { from: '2026-03-01', to: '2026-03-31' });
+  const marEnd = Date.parse(cust.to);
+  eq('a custom range includes every hour of its end date',
+    marEnd - listing.istDayStartOf('2026-03-31'), DAY - 1);
+  const back = listing.resolveRange('custom', late, { from: '2026-03-31', to: '2026-03-01' });
+  truthy('dates entered backwards are swapped, not silently matched to nothing',
+    Date.parse(back.from) < Date.parse(back.to) && /backwards/.test(back.label), back.label);
+  eq('and an empty custom range is honestly "every review held"',
+    listing.resolveRange('custom', late, {}).unbounded, true);
+
+  // The theme spans do NOT snap, because the theme table's own counts do not.
+  eq('the theme span floor is the rolling arithmetic the theme table uses',
+    listing.themeFloorMs('d90', late), late - 90 * DAY);
+  eq('and "all" has no floor at all', listing.themeFloorMs('all', late), null);
+
+  /* ── AI. A NARROWED LIST ADMITS WHAT IT HIDES ──────────────────────────── */
+
+  section('AI. The hidden count is exact, so "N older not shown" is trustworthy');
+
+  const scoredBulk = analysis.computeMajorReviews(
+    analysisRows(db, { locationKey: BULK_LOC }), { now: BULK_NOW },
+  ).reviews;
+
+  const win30 = listing.resolveRange('d30', BULK_NOW);
+  const f = { rating: 'all', reply: 'all', scope: 'major' };
+  const sel30 = listing.selectReviews(scoredBulk, win30, f, 'newest');
+  const selAll = listing.selectReviews(scoredBulk, listing.resolveRange('all', BULK_NOW), f, 'newest');
+
+  eq('the window hides nothing that the unbounded view does not show',
+    sel30.matched_total + sel30.older_outside + sel30.newer_outside + sel30.undated_outside,
+    selAll.matched_total);
+  truthy('and on this fixture it really is hiding a pile of them',
+    sel30.older_outside > 50, sel30.older_outside + ' older');
+  eq('every row in the window is inside the window', sel30.rows.every(r => {
+    const ms = time.parseIsoMs(r.posted_at);
+    return ms >= win30.from_ms && ms <= win30.to_ms;
+  }), true);
+  eq('scope_total is a WHOLE-DATASET figure and ignores the window',
+    sel30.scope_total, selAll.scope_total);
+  eq('and it equals the engine\'s own major_count',
+    sel30.scope_total,
+    analysis.computeMajorReviews(analysisRows(db, { locationKey: BULK_LOC }), { now: BULK_NOW }).major_count);
+
+  // The rating and reply chips still narrow INSIDE the window, and still count.
+  const selLow = listing.selectReviews(scoredBulk, win30, { rating: 'low', reply: 'no', scope: 'major' }, 'newest');
+  eq('a narrower filter never returns more rows', selLow.matched_total <= sel30.matched_total, true);
+  eq('and every row it returns really is 1-2* and unanswered',
+    selLow.rows.every(r => r.rating <= 2 && !r.replied), true);
+
+  /* ── AJ. THE BUG THIS ROUTE EXISTS TO PREVENT ──────────────────────────── */
+
+  section('AJ. Oldest-first over the top 500 by SCORE is a different answer');
+
+  // The report caps its list at 500 rows chosen major-first by score. Emulated
+  // exactly as route.ts does it, over a set big enough for the cap to bite.
+  const many = [];
+  for (let i = 0; i < 900; i++) {
+    const day = new Date(Date.parse('2024-01-01T06:00:00Z') + i * DAY).toISOString();
+    // Old reviews are mostly 5-star and answered (so they score 0 and fall
+    // outside the top 500); recent ones are angry and unanswered.
+    const old = i < 450;
+    many.push({
+      id: 'm' + i,
+      rating: old ? 5 : 1,
+      text: old ? 'great' : 'terrible food, very slow service',
+      posted_at: day,
+      reply_text: old ? 'thank you' : '',
+      replied_at: old ? day : '',
+    });
+  }
+  const manyNow = Date.parse('2026-07-01T00:00:00Z');
+  const manyScored = analysis.computeMajorReviews(many, { now: manyNow }).reviews;
+
+  const LIST_CAP = 500;
+  const capSubset = [...manyScored].sort((a, b) =>
+    Number(b.is_major) - Number(a.is_major) ||
+    b.score - a.score ||
+    a.rating - b.rating ||
+    (a.posted_at < b.posted_at ? 1 : a.posted_at > b.posted_at ? -1 : 0),
+  ).slice(0, LIST_CAP);
+  eq('the cap really does bite on 900 reviews', capSubset.length, LIST_CAP);
+
+  const winAll = listing.resolveRange('all', manyNow);
+  const every = { rating: 'all', reply: 'all', scope: 'all' };
+  const trueOldest = listing.selectReviews(manyScored, winAll, every, 'oldest').rows[0];
+  const cappedOldest = listing.selectReviews(capSubset, winAll, every, 'oldest').rows[0];
+
+  eq('the true oldest review is the first one ever posted', trueOldest.id, 'm0');
+  truthy('while the oldest of the top 500 by score is a DIFFERENT review — ' +
+    'which is exactly the wrong answer the old client-side sort produced',
+    cappedOldest.id !== trueOldest.id, 'capped oldest = ' + cappedOldest.id);
+
+  // The same hazard on a date window over a past range.
+  const early = listing.resolveRange('custom', manyNow, { from: '2024-02-01', to: '2024-02-29' });
+  const fullFeb = listing.selectReviews(manyScored, early, every, 'newest');
+  const cappedFeb = listing.selectReviews(capSubset, early, every, 'newest');
+  eq('February 2024 really holds 29 reviews', fullFeb.matched_total, 29);
+  truthy('but the capped subset would confidently report a smaller number',
+    cappedFeb.matched_total < fullFeb.matched_total,
+    'capped says ' + cappedFeb.matched_total + ' of ' + fullFeb.matched_total);
+
+  /* ── AK. ORDER, AND WHERE AN UNDATED REVIEW GOES ───────────────────────── */
+
+  section('AK. Newest / oldest first, with undated reviews last in both');
+
+  const asc = listing.selectReviews(manyScored, winAll, every, 'oldest').rows.map(r => r.posted_at);
+  const desc = listing.selectReviews(manyScored, winAll, every, 'newest').rows.map(r => r.posted_at);
+  eq('oldest-first really is ascending', asc.every((v, i) => i === 0 || asc[i - 1] <= v), true);
+  eq('newest-first really is descending', desc.every((v, i) => i === 0 || desc[i - 1] >= v), true);
+  eq('and the two are exact reverses of each other', asc.join('|'), [...desc].reverse().join('|'));
+
+  // An undated review sorted as epoch zero would present itself as the oldest
+  // review the venue ever had. It goes last in BOTH directions instead.
+  const mixed = [
+    { id: 'z', rating: 1, posted_at: '', replied: false, is_major: true },
+    { id: 'a', rating: 1, posted_at: '2026-01-01T00:00:00Z', replied: false, is_major: true },
+    { id: 'b', rating: 1, posted_at: '2026-06-01T00:00:00Z', replied: false, is_major: true },
+  ];
+  eq('undated is last when sorting oldest-first',
+    listing.selectReviews(mixed, winAll, every, 'oldest').rows.map(r => r.id), ['a', 'b', 'z']);
+  eq('and last again when sorting newest-first',
+    listing.selectReviews(mixed, winAll, every, 'newest').rows.map(r => r.id), ['b', 'a', 'z']);
+  eq('a BOUNDED window cannot place it, and counts it rather than dropping it',
+    (() => {
+      const s = listing.selectReviews(mixed, listing.resolveRange('d30', manyNow), every, 'newest');
+      return [s.matched_total, s.undated_outside];
+    })(), [0, 1]);
+
+  /* ── Budget. The window widens to "All" on every row held. ─────────────── */
+
+  const tSel = Date.now();
+  for (let i = 0; i < 20; i++) listing.selectReviews(manyScored, winAll, every, 'oldest');
+  const selMs = (Date.now() - tSel) / 20;
+  truthy('selecting and sorting 900 scored rows takes ' + selMs.toFixed(2) +
+    'ms (budget 40ms) — widening to All cannot feel broken', selMs < 40);
+
+  const tTheme = Date.now();
+  listing.selectThemeReviews(bulkFull, 'food_quality', 'all', BULK_NOW);
+  const themeMs = Date.now() - tTheme;
+  truthy('a theme drill-down over ' + bulkFull.length + ' rows takes ' + themeMs +
+    'ms (budget 250ms)', themeMs < 250);
 }
 
 function finish() {
