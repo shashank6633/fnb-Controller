@@ -35,6 +35,15 @@
  * "everything good" on the same tables. Both are complete datasets, so every
  * invariance below is asserted against two independent sets of numbers.
  *
+ * ⚠️ AND TWO FLOORS, WITH SOMEBODY ASSIGNED TO EACH - added because the fixture
+ * had ONE floor and NOBODY assigned, so `area_assigned` was false for every
+ * person and every floor-coverage cell printed the literal '-' in all ten runs.
+ * Two of the four sabotages re-run against this suite were therefore INERT:
+ * swapping the person sheet's "Coverage of their own floor" and the By person
+ * sheet's "Their floor" onto the venue's eligible-tables denominator produced
+ * BYTE-IDENTICAL output in all eight reports and all five filter states. A guard
+ * cannot catch a number the fixture never prints. See FLOORS in the fixture.
+ *
  * THE GATES
  *   A  VENUE INVARIANCE - under &gre=<name> and &manager=<name>, the rating
  *      split, all four negative tiles, coverage, the category ratings, both
@@ -66,8 +75,68 @@
  *      marked and the mark is defined, on the sheet and in the payload the
  *      screen reads; unfiltered there is no mark, because there is no second
  *      scope in the row.
+ *   I  NO HEADING TRUNCATES in the PDF, at report-pdf.ts's own metrics.
+ *   J  THE WALK - the gate that is not a list. See "THE WALK" below. It
+ *      ENUMERATES every printed string of all eight ReportDocs by the doc's own
+ *      keys, and fails on a key it has not been taught, so a new printed field
+ *      is covered the day it is added. Over that enumeration it asserts the two
+ *      properties, once each, for every printed number in every block - tiles,
+ *      table cells, footnotes, sheet notes, column headings, cover lines, the
+ *      title block:
+ *        A  FILTER INVARIANCE  - classified by the FILE'S OWN cover sentences,
+ *           not by a list here: a sheet the cover did not say it narrowed must
+ *           be character-identical in every filter state, and a prose block's
+ *           own numbers may only move if the block names the person.
+ *        B  INTERNAL AGREEMENT - a printed rate equals the rate of its own
+ *           printed pair (inside one cell, inside one tile, and ACROSS the cells
+ *           of one row); every percentage COLUMN is the rate of two numbers
+ *           printed on its own sheet, by the same basis in every filter state;
+ *           and an "N of those" claim neither exceeds the number it is 'of' nor,
+ *           summed over every person, exceeds the queue it partitions; and the
+ *           one quantity printed in three separate blocks - the business-day
+ *           rollover - is the same number in all three and is the range's own.
  *   G  HAND-COMPUTED TOTALS - the fixture's own arithmetic, so a change that
  *      keeps every invariance while breaking the numbers still fails.
+ *
+ * MEASURED BREADTH, not claimed breadth. Eleven one-line reintroductions were
+ * re-run against this file in an isolated `git archive` tree - the four the brief
+ * named (the person sheet's own-floor coverage, the By person 'Their floor' cell,
+ * menuTable's Neg %, the open-queue footnote) and seven nobody had named: the
+ * Rating split Share over the record lane, the By day Coverage over the venue's
+ * eligible tables, recoveryCell's rate over the wrong denominator, the "Of those,
+ * raised by" row over `follow_ups_raised`, a brand-new printed ReportDoc field, a
+ * hard-coded rollover in a footnote, and the 2d value/sub shape re-introduced on a
+ * NEW tile. All eleven go RED. tsc is exit 0 for every one of them, which is the
+ * point: the compiler cannot see any of this.
+ *
+ * WHAT GATE J CANNOT SEE, said out loud rather than left to be discovered:
+ *   · `rangeForReport()`. The route FORCES the period for daily / weekly /
+ *     monthly; this suite builds one payload over a custom range and asks it for
+ *     all eight reports, so the three period-forced variants are walked with the
+ *     custom range's numbers. Nothing here proves a "Monthly" file holds a month.
+ *   · FILTERS OTHER THAN THE PERSON. Every invariance above varies `&gre=` /
+ *     `&manager=` only. Floor, section, captain, group and item are SUPPOSED to
+ *     move every number, so they have no invariance to assert - but neither is
+ *     their internal agreement exercised.
+ *   · `istStamp()`. The workbook's "Generated <time> IST" line is composed in
+ *     `reports/route.ts`, not in the doc, so the walk never sees it. It is a
+ *     clock, not a figure.
+ *   · THE SCREEN'S OWN FIELDS. The walk reads the eight ReportDocs. Payload
+ *     fields the dashboard prints and no report does are covered only by gate A's
+ *     block-level equality, not number by number.
+ *   · A CELL THE PDF TRUNCATES. Gate I measures HEADINGS. `fitPrint` rewrites
+ *     only free-text name columns (Item / Person / Floor), so no number is
+ *     re-spelled on the way to the page, but no assertion here proves that.
+ *   · A WRONG CONSTANT PRINTED IN ONLY ONE BLOCK. J8 closes the one quantity this
+ *     module repeats across blocks (the rollover, printed three times). A number
+ *     hard-coded into a sentence that is the ONLY place it appears is identical in
+ *     every filter state and in both worlds, so it has nothing here to disagree
+ *     with. J3 proves prose numbers do not MOVE; it cannot prove they are right.
+ *   · A COINCIDENCE IN ONE WORLD. J6 aggregates its basis search per world, so a
+ *     break that some other pair of the sheet's own columns happens to reproduce
+ *     in world B is only caught in world A. Measured: the By day Coverage swap
+ *     fails in world A and passes in world B - the suite goes red, but on ONE
+ *     assertion rather than two. Read a single-world J6 failure as real.
  */
 
 'use strict';
@@ -126,6 +195,8 @@ require.extensions['.ts'] = function (module, filename) {
 };
 
 const R = require(path.join(SRC, 'lib', 'feedback', 'reporting.ts'));
+/** Only for its published sentences - see PUBLISHED_SENTENCES. */
+const Z = require(path.join(SRC, 'lib', 'feedback', 'zones.ts'));
 const fixture = require(path.join(REPO, 'scripts', 'feedback-scope-fixture.js'));
 const { SUBJECT, STEADY, SILENT, MGR } = fixture.PEOPLE;
 
@@ -169,7 +240,10 @@ function section(t) { console.log('\n' + t); }
 
 /** Midday the day after the fixture's night, so the range is closed. */
 const NOW = Date.parse('2026-09-29T06:30:00Z');
-const RANGE = `range=custom&from=${fixture.DAY}&to=${fixture.DAY}`;
+/** BOTH business days, so the By day sheet has TWO rows to tell apart - see the
+ *  two-day note in the fixture. A one-day range made every per-day figure equal
+ *  to the venue's, which made a per-day-over-venue swap print nothing new. */
+const RANGE = `range=custom&from=${fixture.DAY_ONE}&to=${fixture.DAY_TWO}`;
 
 /** Drive the SHIPPED entry points through a real query string. */
 function payload(db, qs) {
@@ -196,6 +270,279 @@ const FILTER_STATES = [
   [`&gre=${SILENT.name}`, `&gre=${encodeURIComponent(SILENT.name)}`],
   [`&manager=${MGR.name}`, `&manager=${encodeURIComponent(MGR.name)}`],
 ];
+
+/* ════════════════════════════════════════════════════════════════════════════
+   THE WALK - gate J's machinery
+   ════════════════════════════════════════════════════════════════════════════
+   WHY THERE IS A WALK AT ALL. The same defect - a RECORD-lane numerator printed
+   over a VENUE-lane denominator - has now been found FOUR times, and each guard
+   written for it was scoped to the shape just broken: gate D to RATES, gate E5
+   to TILES. Both of those are HAND-WRITTEN LISTS of places, and the next site
+   was never on the list. E5's own comment says tiles are "where every printed
+   'N of M' lives"; that is false, measured on this fixture - four N-of-M pairs
+   and eight rate-beside-its-own-pair cells live in TABLE CELLS, and a fifth
+   deliberately person-aware number lives in a FOOTNOTE.
+
+   So gate J does not list places. It ENUMERATES the ReportDoc by its own keys
+   and fails on a key it does not consume - `unknownKeys` below. A field added to
+   `ReportDoc`, `ReportTable`, a kpi or a column therefore fails this suite on
+   the day it is added, until the walk is taught to read it. That is the only
+   device in this file that gets WIDER on its own. */
+
+/** Every own key each printed structure is allowed to have. The walk consumes
+ *  ALL of these; anything else is reported by name rather than skipped. */
+const DOC_KEYS = ['key', 'slug', 'title', 'subtitle', 'period', 'filters', 'kpis', 'tables', 'footnotes'];
+const TABLE_KEYS = ['name', 'columns', 'rows', 'note', 'emptyNote'];
+const KPI_KEYS = ['label', 'value', 'sub'];
+const COLUMN_KEYS = ['label', 'width', 'align', 'fitPrint'];
+
+/** Every number a reader can see in a string, in order, as written. */
+const numsOf = (t) => String(t == null ? '' : t).match(/-?\d+(?:\.\d+)?/g) || [];
+
+/**
+ * THE SENTENCES THE MODULE PUBLISHES, so a note can be read for its OWN numbers.
+ *
+ * Every note and footnote in this module is a CONCATENATION: some inline words
+ * plus one or more exported basis sentences. Several of those carry digits of
+ * their own - `RECOVERY_IS_A_QUEUE` explains the queue with the literal "1/3",
+ * `COUNTS_SCOPE_PERSON` quotes "Excellent 100%" - and those digits are examples,
+ * not figures about the data. Comparing a note's raw digits across filter states
+ * therefore compares the examples too, and says a note moved when only the
+ * narration around it did.
+ *
+ * So the published sentences are STRIPPED BY IDENTITY first, and what is left is
+ * the block's own printed numbers. Collected by RULE, not by list: every string
+ * export of the two modules that is long enough to be a sentence. A new basis
+ * constant is covered the day it is exported; a new INLINE sentence carrying a
+ * number is not, and shows up as a block whose own numbers changed.
+ */
+const PUBLISHED_SENTENCES = [...Object.values(R), ...Object.values(Z)]
+  .filter((v) => typeof v === 'string' && v.length >= 60)
+  .sort((a, b) => b.length - a.length);
+
+/** One prose block's OWN numbers - the published sentences taken out first. */
+function ownNums(text) {
+  let s = String(text == null ? '' : text);
+  for (const sentence of PUBLISHED_SENTENCES) s = s.split(sentence).join(' ');
+  return numsOf(s);
+}
+
+/**
+ * The SLOT a prose block occupies, so two filter states can be compared block by
+ * block instead of string by string. A filter line is keyed by the label it
+ * prints before its colon (the two narration sentences have none, and carry no
+ * number); everything else by its walk path, which already names the sheet.
+ */
+const proseSlot = (loc) => {
+  if (!/^filters\[/.test(loc.path)) return loc.path;
+  const m = /^([^:]{1,40}):/.exec(loc.text);
+  return m ? `filters:${m[1]}` : 'filters:scope-narration';
+};
+
+/** "4 of 6", "4/6", "3 of 4 closed". A pair a reader reads as N out of M. */
+const pairsOf = (t) => {
+  const out = [];
+  const re = /(\d+(?:\.\d+)?)(?:\s*\/\s*|\s+of\s+)(\d+(?:\.\d+)?)/g;
+  let m;
+  while ((m = re.exec(String(t == null ? '' : t)))) out.push([Number(m[1]), Number(m[2])]);
+  return out;
+};
+/** "66.7%", "100%". */
+const pctsOf = (t) => {
+  const out = [];
+  const re = /(\d+(?:\.\d+)?)\s*%/g;
+  let m;
+  while ((m = re.exec(String(t == null ? '' : t)))) out.push(m[1]);
+  return out;
+};
+
+const isNumCell = (v) => /^-?\d+(?:\.\d+)?$/.test(String(v).replace(/,/g, '').trim());
+const isPctCell = (v) => /^-?\d+(?:\.\d+)?%$/.test(String(v).trim());
+/** `pctText(rate(n, d))` re-implemented on this side, so an expected string is
+ *  never read back off the code under test. */
+const pctCell = (n, d) => (!(d > 0) ? '-' : `${(Math.round((n / d) * 1000) / 10).toFixed(1)}%`);
+
+/**
+ * EVERY PRINTED STRING IN ONE DOC, with the block it lives in.
+ *
+ * `kind` is what the string IS, not where it sits:
+ *   'figure' - the whole string is a printed number or a printed rate (a kpi
+ *              value, a table cell). Invariance is strict on these.
+ *   'pair'   - a short phrase carrying a printed number and the denominator it
+ *              is "of" (a kpi sub).
+ *   'prose'  - a sentence. Its numbers are checked for internal agreement and
+ *              for shape-matched invariance; its WORDS are allowed to change,
+ *              because the scope narration legitimately does.
+ *
+ * `unit` groups the strings a reader reads TOGETHER - one table row, one tile -
+ * so "the rate must equal the rate of its own printed pair" can be asserted
+ * across two cells of the same row, which is where S1 hides.
+ */
+function walkDoc(doc, unknownKeys) {
+  const out = [];
+  const add = (path, unit, kind, text) => out.push({ path, unit, kind, text: String(text == null ? '' : text) });
+
+  for (const k of Object.keys(doc)) if (!DOC_KEYS.includes(k)) unknownKeys.push(`ReportDoc.${k}`);
+  for (const k of ['key', 'slug', 'title', 'subtitle', 'period']) add(k, `doc:${k}`, 'prose', doc[k]);
+  (doc.filters || []).forEach((l, i) => add(`filters[${i}]`, `filters[${i}]`, 'prose', l));
+  (doc.footnotes || []).forEach((l, i) => add(`footnotes[${i}]`, `footnotes[${i}]`, 'prose', l));
+
+  (doc.kpis || []).forEach((kp) => {
+    for (const k of Object.keys(kp)) if (!KPI_KEYS.includes(k)) unknownKeys.push(`ReportDoc.kpis[].${k}`);
+    const unit = `tile:${kp.label}`;
+    add(`tile["${kp.label}"].label`, unit, 'prose', kp.label);
+    add(`tile["${kp.label}"].value`, unit, 'figure', kp.value);
+    add(`tile["${kp.label}"].sub`, unit, 'pair', kp.sub);
+  });
+
+  (doc.tables || []).forEach((t) => {
+    for (const k of Object.keys(t)) if (!TABLE_KEYS.includes(k)) unknownKeys.push(`ReportDoc.tables[].${k}`);
+    add(`sheet["${t.name}"].name`, `sheet:${t.name}:name`, 'prose', t.name);
+    add(`sheet["${t.name}"].note`, `sheet:${t.name}:note`, 'prose', t.note);
+    add(`sheet["${t.name}"].emptyNote`, `sheet:${t.name}:emptyNote`, 'prose', t.emptyNote);
+    (t.columns || []).forEach((c, j) => {
+      for (const k of Object.keys(c)) if (!COLUMN_KEYS.includes(k)) unknownKeys.push(`ReportDoc.tables[].columns[].${k}`);
+      add(`sheet["${t.name}"].columns[${j}]`, `sheet:${t.name}:columns`, 'prose', c.label);
+    });
+    (t.rows || []).forEach((r, ri) => {
+      const unit = `sheet:${t.name}:row[${String(r[0])}|${ri}]`;
+      r.forEach((cell, ci) => {
+        const col = (t.columns || [])[ci];
+        add(`sheet["${t.name}"].row["${String(r[0])}"]["${col ? col.label : ci}"]`, unit, 'figure', cell);
+      });
+    });
+  });
+  return out;
+}
+
+/** The locations of one doc, by path - for a filtered-vs-unfiltered comparison
+ *  that names the exact cell that moved. */
+const byPath = (locs) => new Map(locs.map((l) => [l.path, l]));
+
+/**
+ * WHICH SHEETS MAY MOVE, READ OFF THE COVER RATHER THAN LISTED HERE.
+ *
+ * `filterLines()` prints two sentences into every file: what the filter NARROWED
+ * (and to whom) and what it did NOT narrow. Those sentences name the sheets. So
+ * the classification the invariance gate uses is the file's OWN PROMISE, parsed
+ * back out of it - which means a sheet cannot be quietly reclassified without
+ * the cover saying so, and the cover cannot promise something the sheets do not
+ * do. That is the property the 2d defect broke: the cover said the Summary tiles
+ * do not move, four rows above a Summary tile that had moved 6 -> 0.
+ */
+function coverScopes(doc) {
+  const narrowed = doc.filters.find((l) => l.includes('NARROWED to')) || '';
+  const venue = doc.filters.find((l) => l.includes('did NOT narrow')) || '';
+  return {
+    narrowed,
+    venue,
+    of(name) {
+      if (narrowed.includes(name)) return 'narrowed';
+      if (venue.includes(name)) return 'venue';
+      return 'silent';
+    },
+  };
+}
+
+/**
+ * THE SHEETS THE COVER DOES NOT CLASSIFY - named, with the reason, and each
+ * one's behaviour asserted below instead of skipped.
+ *
+ * Both of these are real gaps in `filterLines()`' two sentences, found by the
+ * walk: neither sheet is mentioned in either. They are NOT waved through - the
+ * default for an unclassified sheet is the STRICTER one (must not move), and the
+ * one that does move gets its own named assertion.
+ */
+const PERSON_ROW_SHEET = 'Open complaints now (all dates)';
+const COVER_SILENT = new Map([
+  ['By person', 'The cover names neither; this sheet never narrows (it is the sheet a manager '
+    + 'compares on), so it is held to full byte-identity like a venue sheet.'],
+  [PERSON_ROW_SHEET, 'The cover names neither; under a person filter this sheet gains exactly ONE '
+    + 'row, "Of those, raised by <name>", whose count is asserted against the venue row above it '
+    + 'by the containment rule in J5, and whose venue row must keep its number.'],
+]);
+
+/** The ONE tile whose SUB is deliberately person-aware (E5 names it too). */
+const PERSON_AWARE_TILE = 'Follow-ups open now (all dates)';
+
+/**
+ * THE PERCENTAGE COLUMNS WHOSE NUMERATOR IS NOT ON THE SHEET - named, with the
+ * reason, and NOT waved through: each still has to print the sentence that
+ * explains it, and the register is checked for staleness (an entry that turns
+ * out to be explainable everywhere fails, so it cannot rot into a blanket).
+ *
+ * Only one shape qualifies, and the module says so in its own words. `Returned`
+ * and `Remade` are ROW COUNTS ("COUNTS ONLY", reporting.ts:2100) while
+ * `return_remake_pct`'s numerator is a PLATE QUANTITY - so Mutton Biryani prints
+ * Returned 1, Sold 12 and R/R % 16.7%, because the one feedback covered two
+ * plates. `RETURN_REMAKE_BASIS` is the sentence that says it ("the numerator sums
+ * gf_item_feedback.quantity, so one feedback on a line of three counts three"),
+ * and it is asserted to be on every sheet that prints the column.
+ */
+const OFF_SHEET_RATE_BASIS = new Map([
+  ['R/R %', 'numerator is a PLATE QUANTITY; Returned / Remade print feedback ROW COUNTS'],
+  ['R/R %*', 'same column under a person filter, with the venue mark'],
+]);
+
+/**
+ * PERCENTAGE COLUMNS EXPLAINED BY NUMBERS PRINTED ON THEIR OWN SHEET.
+ *
+ * For every percentage column of a table, every way the sheet's own numbers
+ * could produce it: numerator = one numeric column or the sum of two;
+ * denominator = one numeric column (PER ROW), or that column's total or maximum
+ * (ONE denominator for the whole column - a SHARE). A basis qualifies only if it
+ * reproduces the column for EVERY row.
+ *
+ * This is property B stated once for a whole class: "a printed rate must equal
+ * the rate of its own printed numerator and denominator". S2 - swapping Neg %'s
+ * denominator from the row's own `feedbacks` to the venue's `item_feedbacks` -
+ * leaves the column explained by nothing the sheet prints, and fails here
+ * without anybody having listed 'Neg %'.
+ *
+ * ⚠️ THE TWO KINDS ARE KEPT APART, and that distinction is load-bearing. Allowing
+ * a whole-column denominator everywhere let a real swap through: putting the By
+ * day sheet's Coverage over the VENUE's eligible tables printed 16.7% / 50.0%
+ * where the days' own rows say 33.3% / 100.0%, and `Taken / total(Eligible)`
+ * reproduced it exactly, because every eligible table appears on exactly one day.
+ * So a column is allowed a single shared denominator only if it SAYS it is a
+ * share - the reader's own cue, the word in the heading ("Share of negatives",
+ * "Share"). Anything else is a per-row rate and must be explained per row.
+ */
+const isShareColumn = (label) => /^share\b/i.test(String(label).trim());
+
+function rateBases(t) {
+  const rows = t.rows || [];
+  const cols = (t.columns || []).map((c) => String(c.label));
+  if (!rows.length || !cols.length) return {};
+  const val = (r, c) => Number(String(r[c]).replace(/,/g, ''));
+  const numeric = cols.map((_, c) => c).filter((c) => rows.every((r) => isNumCell(r[c])));
+  const pctCols = cols.map((_, c) => c).filter((c) => rows.every((r) => isPctCell(r[c]) || String(r[c]).trim() === '-')
+    && rows.some((r) => isPctCell(r[c])));
+
+  const nspecs = [];
+  for (const i of numeric) nspecs.push({ tag: cols[i], get: (r) => val(r, i) });
+  for (const i of numeric) for (const j of numeric) if (i < j) nspecs.push({ tag: `${cols[i]}+${cols[j]}`, get: (r) => val(r, i) + val(r, j) });
+  const perRowD = numeric.map((k) => ({ tag: cols[k], get: (r) => val(r, k) }));
+  const wholeD = [];
+  for (const k of numeric) {
+    const total = rows.reduce((a, r) => a + val(r, k), 0);
+    const top = rows.reduce((a, r) => Math.max(a, val(r, k)), 0);
+    wholeD.push({ tag: `total(${cols[k]})`, get: () => total });
+    wholeD.push({ tag: `max(${cols[k]})`, get: () => top });
+  }
+
+  const out = {};
+  for (const P of pctCols) {
+    const explains = (ds) => nspecs.filter((ns) => rows.every((r) => pctCell(ns.get(r), ds.get(r)) === String(r[P]).trim()))
+      .map((ns) => `${ns.tag} / ${ds.tag}`);
+    out[cols[P]] = {
+      perRow: perRowD.flatMap(explains),
+      whole: wholeD.flatMap(explains),
+      isShare: isShareColumn(cols[P]),
+    };
+  }
+  return out;
+}
 
 function runWorld(which) {
   section(`════════ WORLD ${which} ════════`);
@@ -617,6 +964,395 @@ function runWorld(which) {
       truthy(`${tag}: no two headings in one table print the same string`, collided.length === 0, JSON.stringify(collided));
     }
     measure.end();
+  }
+
+  /* ── J. THE WALK: EVERY PRINTED NUMBER, WHATEVER BLOCK IT LIVES IN ──────── */
+  /* Gates D and E5 are LISTS. This one is an ENUMERATION - see "THE WALK"
+     above. It reaches the tiles E5 reaches, and also the table cells, the
+     footnotes, the sheet notes, the column headings, the cover lines and the
+     title block, and it fails on a ReportDoc key it has not been taught. */
+  section(`World ${which} - J. THE WALK - every printed number in all 8 reports, by block`);
+  {
+    const unknown = [];
+    const walked = {};        // tag -> path -> loc
+    for (const [tag, qs] of FILTER_STATES) {
+      const p = payload(ro, qs);
+      walked[tag] = {};
+      for (const key of R.REPORT_KEYS) walked[tag][key] = walkDoc(report(p, key), unknown);
+    }
+
+    /* J0. THE WALK IS COMPLETE, OR IT SAYS WHAT IT MISSED. */
+    eq('J0: the walk consumes every own key of every ReportDoc / sheet / tile / column',
+      [...new Set(unknown)].sort(), []);
+    const census = { figure: 0, pair: 0, prose: 0 };
+    const kinds = new Set();
+    for (const key of R.REPORT_KEYS) {
+      for (const l of walked['(no filter)'][key]) { census[l.kind] += 1; kinds.add(l.kind); }
+    }
+    eq('J0: every kind of printed string is reached (figure, pair, prose)',
+      [...kinds].sort(), ['figure', 'pair', 'prose']);
+    truthy(`J0: the unfiltered walk reaches ${census.figure} figures, ${census.pair} pairs, `
+      + `${census.prose} prose blocks across the 8 reports`,
+      census.figure > 100 && census.pair > 20 && census.prose > 100,
+      JSON.stringify(census));
+
+    /* J1. THE COVER CLASSIFIES EVERY SHEET, or the gap is named.
+           Property A needs to know which numbers are ALLOWED to narrow. That
+           answer is taken from the file's own two sentences, not from a list in
+           this suite - so the promise and the behaviour are checked against each
+           other rather than both against a third thing that can drift. */
+    for (const [tag, qs] of FILTER_STATES.filter(([, q]) => q !== '')) {
+      const p = payload(ro, qs);
+      const unclassified = [];
+      for (const key of R.REPORT_KEYS) {
+        const doc = report(p, key);
+        const cover = coverScopes(doc);
+        for (const t of doc.tables) {
+          if (cover.of(t.name) === 'silent' && !COVER_SILENT.has(t.name)) unclassified.push(`${key}/${t.name}`);
+        }
+      }
+      eq(`${tag}: every sheet is classified by the cover, or named in COVER_SILENT`, unclassified, []);
+    }
+
+    /* J2. FILTER INVARIANCE, LOCATION BY LOCATION, FOR EVERY BLOCK.
+           A 'figure' or 'pair' on a sheet the cover does not say it narrowed -
+           and every tile, whatever the cover says, because the cover says the
+           tiles do not move - must be character-identical in every filter state.
+           This is E5's assertion with the word TILE removed from it. */
+    const v = walked['(no filter)'];
+    for (const [tag, qs] of FILTER_STATES.filter(([, q]) => q !== '')) {
+      const p = payload(ro, qs);
+      const moved = [];
+      for (const key of R.REPORT_KEYS) {
+        const cover = coverScopes(report(p, key));
+        const base = byPath(v[key]);
+        const now = walked[tag][key];
+        // A location that exists in one state and not the other, on a sheet the
+        // cover did not say it narrowed, is itself a move.
+        const seen = new Set();
+        for (const l of now) {
+          seen.add(l.path);
+          if (l.kind === 'prose') continue;                    // J3 handles prose
+          const sheet = /^sheet\["([^"]+)"\]/.exec(l.path);
+          if (sheet && cover.of(sheet[1]) === 'narrowed') continue;
+          if (sheet && sheet[1] === PERSON_ROW_SHEET) continue;                   // J7, by name
+          if (l.path === `tile["${PERSON_AWARE_TILE}"].sub`) continue;            // the one allowance
+          const was = base.get(l.path);
+          if (!was) { moved.push(`${key}: ${l.path} APPEARED = ${JSON.stringify(l.text)}`); continue; }
+          if (was.text !== l.text) moved.push(`${key}: ${l.path} ${JSON.stringify(was.text)} -> ${JSON.stringify(l.text)}`);
+        }
+        for (const l of v[key]) {
+          if (l.kind === 'prose' || seen.has(l.path)) continue;
+          const sheet = /^sheet\["([^"]+)"\]/.exec(l.path);
+          if (sheet && cover.of(sheet[1]) === 'narrowed') continue;
+          if (sheet && sheet[1] === PERSON_ROW_SHEET) continue;                   // J7, by name
+          moved.push(`${key}: ${l.path} VANISHED (was ${JSON.stringify(l.text)})`);
+        }
+      }
+      truthy(`${tag}: every printed figure outside the cover's NARROWED sheets is identical `
+        + '- tiles AND table cells AND headings', moved.length === 0, JSON.stringify(moved.slice(0, 12)));
+    }
+
+    /* J3. PROSE CARRIES NUMBERS TOO - the footnote block is prose, and it is
+           where the fifth instance of this defect class lived.
+           Each prose SLOT (a named sheet's note, a footnote position, a cover
+           label) is compared across filter states for its OWN numbers - the
+           published basis sentences stripped out first, see `ownNums`. A slot
+           that exists only under a filter, or whose own numbers move, must NAME
+           the person; a venue number cannot appear in filtered-only prose
+           without saying whose it is, and once it names the person J5 checks the
+           claim it makes. */
+    for (const [tag, qs] of FILTER_STATES.filter(([, q]) => q !== '')) {
+      const p = payload(ro, qs);
+      const person = p.records.person;
+      const drifted = [];
+      for (const key of R.REPORT_KEYS) {
+        const was = new Map();
+        for (const l of v[key]) if (l.kind === 'prose') was.set(proseSlot(l), l.text);
+        for (const l of walked[tag][key]) {
+          if (l.kind !== 'prose') continue;
+          const slot = proseSlot(l);
+          const before = was.has(slot) ? ownNums(was.get(slot)) : [];
+          const after = ownNums(l.text);
+          if (JSON.stringify(before) === JSON.stringify(after)) continue;
+          if (person && l.text.includes(person)) continue;   // says whose number it is - J5 checks it
+          drifted.push(`${key}: ${slot} own numbers ${JSON.stringify(before)} -> ${JSON.stringify(after)} `
+            + `in ${JSON.stringify(l.text.slice(0, 120))}`);
+        }
+      }
+      eq(`${tag}: no prose block's own numbers move without naming the person`, drifted, []);
+    }
+
+    /* J4. A PRINTED RATE EQUALS THE RATE OF ITS OWN PRINTED PAIR.
+           Within one cell ("4/6 66.7%", "3/4 · 75.0%", "3 of 4 closed - 75.0%"),
+           within one tile (value 66.7% over sub "8 of 12 eligible tables"), and
+           ACROSS THE CELLS OF ONE ROW - which is the S1 shape: the Value column
+           prints the percentage and the Basis column beside it prints "4 of 6".
+           No place is named; every unit the walk produced is tried. */
+    for (const [tag] of FILTER_STATES) {
+      const disagree = [];
+      for (const key of R.REPORT_KEYS) {
+        const units = new Map();
+        for (const l of walked[tag][key]) {
+          if (!units.has(l.unit)) units.set(l.unit, []);
+          units.get(l.unit).push(l);
+        }
+        for (const [unit, locs] of units) {
+          // (a) inside one string - "4/6 66.7%", "3/4 · 75.0%", "3 of 4 closed - 75.0%"
+          const selfChecked = new Set();
+          for (const l of locs) {
+            const prs = pairsOf(l.text);
+            const pcs = pctsOf(l.text);
+            if (prs.length !== 1 || pcs.length !== 1) continue;
+            selfChecked.add(l.path);
+            const want = pctCell(prs[0][0], prs[0][1]);
+            if (`${pcs[0]}%` !== want) disagree.push(`${key}: ${l.path} prints ${JSON.stringify(l.text)} - ${prs[0][0]}/${prs[0][1]} is ${want}`);
+          }
+          // (b) ACROSS the strings a reader reads together - one table row, one
+          //     tile. This is the S1 shape: the Value column prints "66.7%" and
+          //     the Basis column beside it prints "4 of 6 eligible tables on
+          //     their floor". A sentence UNDER the table is not read as part of
+          //     the row, so notes are (a)-only.
+          const joint = locs.filter((l) => !/\.(note|emptyNote)$/.test(l.path) && !selfChecked.has(l.path));
+          const prs = joint.flatMap((l) => pairsOf(l.text));
+          const pcs = joint.flatMap((l) => pctsOf(l.text));
+          if (prs.length !== 1 || pcs.length !== 1) continue;
+          const want = pctCell(prs[0][0], prs[0][1]);
+          if (`${pcs[0]}%` !== want) {
+            disagree.push(`${key}: ${unit} prints ${pcs[0]}% beside ${prs[0][0]} of ${prs[0][1]} (which is ${want}) `
+              + `- ${JSON.stringify(joint.map((l) => l.text))}`);
+          }
+        }
+      }
+      eq(`${tag}: every printed rate equals the rate of its own printed pair`, disagree, []);
+    }
+
+    /* J5. "N OF THOSE" CANNOT EXCEED THE NUMBER IT IS 'OF'.
+           The footnote block is the SECOND deliberately person-aware printed
+           number in this module, and it is the one E5's tile sweep cannot see:
+           `reports/route.ts` writes doc.filters, then doc.kpis, then the notes
+           onto the same sheet, so the tile says "2" under ['Summary'] and four
+           rows below ['Notes'] says "4 of those are theirs" - "4 of those 2".
+           The rule is general: a sentence that QUOTES a printed label and then
+           claims "N of those" is claiming N <= that label's printed number, and
+           a row labelled "Of those, ..." claims the same against the row above
+           it. Neither is listed; both are found by the walk. */
+    for (const [tag, qs] of FILTER_STATES) {
+      const p = payload(ro, qs);
+      const over = [];
+      /** claim text -> the reports on which the quoted label IS printed. A claim
+       *  checkable nowhere is itself a failure: the footnote travels into all
+       *  eight files while the tile it quotes is on three of them, so the rule
+       *  must bite on those three and must not fall silent if it stops biting. */
+      const checked = new Map();
+      for (const key of R.REPORT_KEYS) {
+        const doc = report(p, key);
+        /** Every printed number a label can be looked up by, on this sheet. */
+        const printed = new Map();
+        for (const kp of doc.kpis) printed.set(String(kp.label), Number(String(kp.value).replace(/,/g, '')));
+        for (const t of doc.tables) {
+          for (const r of t.rows) if (isNumCell(r[1])) printed.set(String(r[0]), Number(String(r[1]).replace(/,/g, '')));
+        }
+        // (a) prose that quotes a label and then says "N of those"
+        for (const text of [...doc.footnotes, ...doc.filters, ...doc.tables.flatMap((t) => [t.note, t.emptyNote])]) {
+          const s = String(text || '');
+          const claim = /(\d+(?:\.\d+)?)\s+of\s+those\b/.exec(s);
+          if (!claim) continue;
+          if (!checked.has(s)) checked.set(s, []);
+          const quoted = [...s.matchAll(/"([^"]{4,60})"/g)].map((m) => m[1]).filter((q) => printed.has(q));
+          for (const q of quoted) {
+            checked.get(s).push(`${key}/"${q}"`);
+            if (Number(claim[1]) > printed.get(q)) {
+              over.push(`${key}: "${q}" prints ${printed.get(q)} but the note says ${claim[1]} of those `
+                + `- ${JSON.stringify(s.slice(0, 160))}`);
+            }
+          }
+        }
+        // (b) a row that says "Of those, ..." about the row above it
+        for (const t of doc.tables) {
+          t.rows.forEach((r, i) => {
+            if (!/^of those\b/i.test(String(r[0])) || i === 0) return;
+            const mine = Number(String(r[1]).replace(/,/g, ''));
+            const above = Number(String(t.rows[i - 1][1]).replace(/,/g, ''));
+            if (Number.isFinite(mine) && Number.isFinite(above) && mine > above) {
+              over.push(`${key}/${t.name}: "${r[0]}" = ${mine} exceeds the ${above} it is "of those" of`);
+            }
+          });
+        }
+      }
+      eq(`${tag}: no "N of those" exceeds the number it is 'of' (tiles, notes, footnotes, rows)`, over, []);
+      const uncheckable = [...checked.entries()].filter(([, where]) => where.length === 0)
+        .map(([s]) => s.slice(0, 90));
+      eq(`${tag}: every "N of those" claim is checkable against a printed label on at least one report`,
+        uncheckable, []);
+    }
+
+    /* J5c. THE PARTITION - the assertion that does not depend on which person
+            happens to have the bigger number.
+            "N of those are theirs" claims a SHARE of a venue queue, and an open
+            follow-up has exactly one raiser. So the same sentence, run over
+            EVERY person in turn, cannot between them claim more of the queue than
+            the queue holds. Swapping the footnote from `follow_ups_open` to
+            `follow_ups_raised` makes the four claims add to more than the venue's
+            open count in BOTH worlds, where person-by-person containment only
+            catches the people who raised more than the whole room has open. */
+    {
+      const personStatesJ = FILTER_STATES.filter(([, q]) => q !== '');
+      const overclaimed = [];
+      for (const key of R.REPORT_KEYS) {
+        const v0 = report(all, key);
+        const venue = new Map();
+        for (const kp of v0.kpis) venue.set(String(kp.label), Number(String(kp.value).replace(/,/g, '')));
+        for (const t of v0.tables) {
+          for (const r of t.rows) if (isNumCell(r[1])) venue.set(String(r[0]), Number(String(r[1]).replace(/,/g, '')));
+        }
+        const claimed = new Map();       // quoted venue label -> summed claim
+        for (const [, qs] of personStatesJ) {
+          const doc = report(payload(ro, qs), key);
+          for (const text of [...doc.footnotes, ...doc.filters, ...doc.tables.flatMap((t) => [t.note, t.emptyNote])]) {
+            const s = String(text || '');
+            const claim = /(\d+(?:\.\d+)?)\s+of\s+those\b/.exec(s);
+            if (!claim) continue;
+            for (const q of [...s.matchAll(/"([^"]{4,60})"/g)].map((m) => m[1]).filter((x) => venue.has(x))) {
+              claimed.set(q, (claimed.get(q) || 0) + Number(claim[1]));
+            }
+          }
+          // ...and the same partition for the row form of the claim.
+          for (const t of doc.tables) {
+            t.rows.forEach((r, i) => {
+              if (!/^of those\b/i.test(String(r[0])) || i === 0) return;
+              const id = `${t.name} :: ${String(t.rows[i - 1][0])}`;
+              if (!venue.has(id)) venue.set(id, Number(String(report(all, key).tables.find((x) => x.name === t.name).rows[i - 1][1]).replace(/,/g, '')));
+              claimed.set(id, (claimed.get(id) || 0) + Number(String(r[1]).replace(/,/g, '')));
+            });
+          }
+        }
+        for (const [label, sum] of claimed) {
+          if (sum > venue.get(label)) {
+            overclaimed.push(`${key}: the ${personStatesJ.length} people together claim ${sum} of "${label}", `
+              + `which prints ${venue.get(label)}`);
+          }
+        }
+      }
+      eq('J5c: the per-person claims about a venue queue add up to at most the queue', overclaimed, []);
+    }
+
+    /* J6. EVERY PERCENTAGE COLUMN IS EXPLAINED BY ITS OWN SHEET'S NUMBERS, AND
+           BY THE SAME ONE IN EVERY FILTER STATE. See `rateBases()`. "Narrows on
+           BOTH sides" is exactly this: a basis that explains the column
+           unfiltered must still explain it when the numerator narrows, which it
+           can only do if the denominator narrowed with it. */
+    {
+      const perColumn = new Map();   // "key/table/column" -> { states, common }
+      const missingBasisSentence = [];
+      for (const [tag, qs] of FILTER_STATES) {
+        const p = payload(ro, qs);
+        for (const key of R.REPORT_KEYS) {
+          for (const t of report(p, key).tables) {
+            const bases = rateBases(t);
+            for (const [col, b] of Object.entries(bases)) {
+              // A shared denominator is admissible only for a column that SAYS
+              // it is a share; everything else must be the rate of its own row.
+              const found = b.isShare ? [...b.perRow, ...b.whole] : b.perRow;
+              const id = `${key}/${t.name}/${col}`;
+              if (!perColumn.has(id)) perColumn.set(id, { col, states: [], common: null });
+              const e = perColumn.get(id);
+              e.states.push({ tag, found });
+              e.common = e.common === null ? found.slice() : e.common.filter((x) => found.includes(x));
+              // A column excused from the in-row rule must still carry, ON THE
+              // SHEET, the sentence that explains where its numerator came from.
+              if (OFF_SHEET_RATE_BASIS.has(col) && !String(t.note || '').includes(R.RETURN_REMAKE_BASIS)) {
+                missingBasisSentence.push(`${id} (${tag})`);
+              }
+            }
+          }
+        }
+      }
+      const unexplained = [];
+      const inconsistent = [];
+      /** register key -> did it ever actually need excusing, anywhere in this
+       *  world? A column that is explained on every sheet in every state does
+       *  not, and the entry has to go, or the register rots into a blanket. */
+      const registerEarnsIts = new Map([...OFF_SHEET_RATE_BASIS.keys()].map((k) => [k, false]));
+      for (const [id, e] of perColumn) {
+        const empty = e.states.filter((s) => s.found.length === 0).map((s) => s.tag);
+        if (OFF_SHEET_RATE_BASIS.has(e.col)) {
+          if (empty.length) registerEarnsIts.set(e.col, true);
+          continue;
+        }
+        if (empty.length) { unexplained.push(`${id} explained by NOTHING the sheet prints in ${JSON.stringify(empty)}`); continue; }
+        if (!e.common.length) {
+          inconsistent.push(`${id} changes basis between filter states: `
+            + JSON.stringify(e.states.map((s) => `${s.tag}=${s.found[0]}`)));
+        }
+      }
+      truthy('J6: every percentage column of all 8 reports is the rate of two numbers printed on '
+        + `its own sheet (${perColumn.size} columns walked, ${OFF_SHEET_RATE_BASIS.size} named exceptions)`,
+        unexplained.length === 0, JSON.stringify(unexplained));
+      eq('J6: and the SAME basis explains it in every filter state (both sides narrow together)',
+        inconsistent, []);
+      eq('J6: the OFF_SHEET_RATE_BASIS register is still needed (no stale entry)',
+        [...registerEarnsIts].filter(([, earned]) => !earned).map(([k]) => k), []);
+      eq('J6: every excused column prints RETURN_REMAKE_BASIS on its own sheet', missingBasisSentence, []);
+      truthy('J6: the walk actually found percentage columns to explain', perColumn.size >= 8, String(perColumn.size));
+    }
+
+    /* J8. THE SAME QUANTITY, PRINTED IN TWO BLOCKS, MUST AGREE.
+           J3 proves a prose number does not MOVE between filter states; it does
+           NOT prove the number is right, because a hard-coded one is equally
+           wrong in all five. The business-day rollover is the one quantity this
+           module prints in three different blocks - the period line, the cover's
+           "Business-day rollover:" line and the footnote that explains the
+           convention - so those three are made to agree with each other and with
+           the range the payload resolved. The reader's own cue does the finding:
+           a clock token next to the word "rollover". The illustrative "01:30" in
+           the same footnote is not next to it and is left alone.
+           ⚠️ This closes ONE instance of a general class. A quantity printed in
+           only one block still has nothing here to disagree with. */
+    for (const [tag, qs] of FILTER_STATES) {
+      const p = payload(ro, qs);
+      const wrong = [];
+      for (const key of R.REPORT_KEYS) {
+        const seen = new Map();
+        for (const l of walked[tag][key]) {
+          for (const m of String(l.text).matchAll(/(\d{1,2}:\d{2})\s+rollover|rollover[:\s]+(\d{1,2}:\d{2})/gi)) {
+            const clock = m[1] || m[2];
+            if (!seen.has(clock)) seen.set(clock, []);
+            seen.get(clock).push(l.path);
+          }
+        }
+        if (!seen.size) { wrong.push(`${key}: prints no rollover at all`); continue; }
+        if (seen.size > 1) wrong.push(`${key}: ${JSON.stringify([...seen].map(([c, w]) => `${c} at ${w.join(',')}`))}`);
+        else if (![...seen.keys()].includes(String(p.range.cutoff))) {
+          wrong.push(`${key}: prints ${[...seen.keys()][0]} but the range resolved ${p.range.cutoff}`);
+        }
+      }
+      eq(`${tag}: the rollover printed in the period line, the cover and the footnote is one number`, wrong, []);
+    }
+
+    /* J7. THE SHEETS THE COVER DOES NOT CLASSIFY, ASSERTED RATHER THAN SKIPPED. */
+    for (const [tag, qs] of FILTER_STATES.filter(([, q]) => q !== '')) {
+      const p = payload(ro, qs);
+      const bad = [];
+      for (const key of R.REPORT_KEYS) {
+        const doc = report(p, key);
+        const t = doc.tables.find((x) => x.name === PERSON_ROW_SHEET);
+        if (!t) continue;
+        const t0 = report(all, key).tables.find((x) => x.name === PERSON_ROW_SHEET);
+        if (t.rows.length !== t0.rows.length + 1) { bad.push(`${key}: ${t0.rows.length} -> ${t.rows.length} rows`); continue; }
+        // The venue row keeps its NUMBER; its label gains "- THE WHOLE VENUE",
+        // which is the whole point of the second row existing.
+        if (String(t.rows[0][1]) !== String(t0.rows[0][1])) {
+          bad.push(`${key}: the venue count moved ${t0.rows[0][1]} -> ${t.rows[0][1]}`);
+        }
+        if (!String(t.rows[0][0]).startsWith(String(t0.rows[0][0]))) bad.push(`${key}: the venue row was relabelled`);
+        if (!/WHOLE VENUE/.test(String(t.rows[0][0]))) bad.push(`${key}: the venue row does not say it is the venue's`);
+        if (!/^of those\b/i.test(String(t.rows[1][0]))) bad.push(`${key}: the added row does not say "Of those"`);
+        if (!String(t.rows[1][0]).includes(p.records.person)) bad.push(`${key}: the added row does not name the person`);
+      }
+      eq(`${tag}: "${PERSON_ROW_SHEET}" gains exactly the one named person row`, bad, []);
+    }
+    for (const reason of COVER_SILENT.values()) truthy(`J7: COVER_SILENT states a reason (${reason.slice(0, 48)}...)`, reason.length > 40);
   }
 
   /* ── G. HAND-COMPUTED TOTALS ────────────────────────────────────────────── */

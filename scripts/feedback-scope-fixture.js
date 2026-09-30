@@ -31,9 +31,34 @@
 
 'use strict';
 
-/** The business day every row lands on. Stamps are UTC, as the module stores. */
-const DAY = '2026-09-28';
-const TS = (h, m) => `${DAY} ${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:00`;
+/**
+ * TWO BUSINESS DAYS, because ONE made a second family of printed numbers
+ * unreachable. With every order and every visit on a single day, the By day
+ * sheet had exactly ONE row, and that row's `Eligible` was the VENUE's eligible
+ * count - so swapping the day's Coverage onto the venue denominator (the same
+ * record-over-venue defect, one sheet along) was BYTE-IDENTICAL output. Measured.
+ *
+ * Tables 7-12 and the two control visits on them now sit on the previous business
+ * day, which splits the room 6/6 and the visits 6/2:
+ *
+ *   DAY_ONE (27th)  tables 7-12 eligible, visits 7 + 8 taken   ->  2 of 6  33.3%
+ *   DAY_TWO (28th)  tables 1-6  eligible, visits 1-6 taken     ->  6 of 6 100.0%
+ *   both together                                              ->  8 of 12 66.7%
+ *
+ * The venue totals are unchanged by construction - the same 12 tables, the same
+ * 12 orders, the same 72 plates, the same 8 visits, the same recorders - so every
+ * hand-computed total in the suite still holds; only the DAY the row lands on
+ * differs, and now there are two rows to tell apart.
+ */
+const DAY_ONE = '2026-09-27';
+const DAY_TWO = '2026-09-28';
+/** The LAST business day in the fixture - what a single-day caller would use. */
+const DAY = DAY_TWO;
+/** Tables 1-6 (and their visits) on the later day, 7-12 on the earlier one. */
+const dayOf = (n) => (n <= 6 ? DAY_TWO : DAY_ONE);
+/** Stamps are UTC, as the module stores; 14:00-18:00 UTC is 19:30-23:30 IST, so
+ *  every row lands on its own business day under the 04:00 rollover. */
+const TS = (day, h, m) => `${day} ${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:00`;
 
 const SUBJECT = { id: 'fs-u-probe', name: 'Probe Gre', role: 'GRE' };
 const STEADY = { id: 'fs-u-steady', name: 'Steady Gre', role: 'GRE' };
@@ -53,6 +78,42 @@ const DISHES = ['Paneer Tikka', 'Mutton Biryani', 'Gulab Jamun', 'Butter Naan', 
 const TABLES = 12;
 const PLATES_PER_LINE = 2;
 const LINES_PER_ORDER = 3;
+
+/**
+ * TWO FLOORS, AND SOMEBODY ASSIGNED TO EACH - because ONE FLOOR AND NOBODY
+ * ASSIGNED made a whole family of printed numbers unreachable.
+ *
+ * `users.preferred_zones` has ZERO populated rows in the real database (zones.ts
+ * says so in its own header), and this fixture populated none either. So
+ * `area_assigned` was false for every person in both worlds, and every cell that
+ * depends on it printed the SAME literal in every state:
+ *
+ *   'By person' / 'Their floor'                 ->  '-'
+ *   'By person' / 'Off-floor'                   ->  '-'
+ *   "What <name> did" / Coverage of their floor ->  '-'
+ *
+ * Measured: swapping that coverage percentage's denominator to the VENUE's
+ * eligible tables - the exact record-over-venue defect this suite exists for -
+ * produced BYTE-IDENTICAL output in all eight reports and all five filter
+ * states, in both worlds. No guard can catch a number the fixture never prints.
+ *
+ * So the room now has two floors of six eligible tables each, and two of the
+ * four people hold an assignment. That makes the floor denominator (6) DIFFERENT
+ * from the venue denominator (12), which is what gives the swap something to
+ * change, and it exercises the off-floor counter as well:
+ *
+ *   Probe Gre   assigned Ground   visits T1-T4  ->  4 of 6 = 66.7%, off-floor 0
+ *   Steady Gre  assigned Terrace  visits T5,T6 (Ground) + T7 (Terrace)
+ *                                             ->  1 of 6 = 16.7%, off-floor 2
+ *   Probe Mgr / Silent Gre  no assignment      ->  '-' , the row that proves the
+ *                                                 owner's "floor is a DEFAULT"
+ *                                                 ruling still prints a dash.
+ */
+const FLOORS = ['Ground', 'Terrace'];
+/** Tables 1-6 Ground, 7-12 Terrace. Six eligible tables on each floor. */
+const floorOf = (n) => (n <= TABLES / 2 ? FLOORS[0] : FLOORS[1]);
+/** `users.preferred_zones`, by user id. Nobody else is assigned. */
+const AREA_ZONES = { 'fs-u-probe': ['Ground'], 'fs-u-steady': ['Terrace'] };
 
 /**
  * Seed one world into an open better-sqlite3 handle.
@@ -79,15 +140,25 @@ function build(db, which) {
   };
   ins('roles', roleCols, { id: roleId, name: 'GRE', tier: 'staff', is_active: 1, page_access: '[]' });
   ins('roles', roleCols, { id: mgrRoleId, name: 'Manager', tier: 'manager', is_active: 1, page_access: '[]' });
+  // The assignment is the POINT (see FLOORS above), so a schema that cannot hold
+  // it must stop the run rather than quietly seed everyone unassigned again.
+  if (!userCols.includes('preferred_zones')) {
+    throw new Error('feedback-scope-fixture: users.preferred_zones is missing - the floor-coverage '
+      + 'cells would all print "-" and the area assertions would be vacuous.');
+  }
   for (const p of [SUBJECT, STEADY, SILENT]) {
     ins('users', userCols, {
       id: p.id, name: p.name, email: `${p.id}@x.test`, password_hash: 'x',
       role: 'staff', role_id: roleId, is_active: 1,
+      preferred_zones: AREA_ZONES[p.id] ? JSON.stringify(AREA_ZONES[p.id]) : null,
+      preferred_table_ids: null,
     });
   }
   ins('users', userCols, {
     id: MGR.id, name: MGR.name, email: `${MGR.id}@x.test`, password_hash: 'x',
     role: 'manager', role_id: mgrRoleId, is_active: 1,
+    preferred_zones: AREA_ZONES[MGR.id] ? JSON.stringify(AREA_ZONES[MGR.id]) : null,
+    preferred_table_ids: null,
   });
 
   /* ── 12 tables, 12 dine-in orders, all eligible via bill_requested_at ───── */
@@ -104,11 +175,11 @@ function build(db, which) {
      VALUES (?,?,?,?,?,?,?,'served',?)`,
   );
   for (let i = 1; i <= TABLES; i++) {
-    tIns.run(`fs-t-${i}`, '', `T${i}`, 'Ground', 'A');
-    oIns.run(`fs-o-${i}`, '', 9000 + i, `fs-t-${i}`, 4, 'Captain One', TS(14, i), TS(15, i));
+    tIns.run(`fs-t-${i}`, '', `T${i}`, floorOf(i), 'A');
+    oIns.run(`fs-o-${i}`, '', 9000 + i, `fs-t-${i}`, 4, 'Captain One', TS(dayOf(i), 14, i), TS(dayOf(i), 15, i));
     for (let j = 0; j < LINES_PER_ORDER; j++) {
       oiIns.run(`fs-oi-${i}-${j}`, `fs-o-${i}`, DISHES[(i + j) % DISHES.length], 'kitchen',
-        PLATES_PER_LINE, 200, 200 * PLATES_PER_LINE, TS(14, i));
+        PLATES_PER_LINE, 200, 200 * PLATES_PER_LINE, TS(dayOf(i), 14, i));
     }
   }
 
@@ -118,7 +189,7 @@ function build(db, which) {
        (id,outlet_id,order_id,table_id,table_number,floor,covers,captain_name,items_ordered,
         gre_user_id,gre_email,gre_name,gre_role,everything_good,overall_rating,
         cat_food,cat_drinks,cat_service,cat_ambience,comment,status,has_negative,created_at)
-     VALUES (@id,'',@order_id,@table_id,@table_number,'Ground',4,'Captain One',3,
+     VALUES (@id,'',@order_id,@table_id,@table_number,@floor,4,'Captain One',3,
              @uid,@email,@name,@role,@eg,@rating,@cf,@cd,@cs,@ca,@comment,@status,@neg,@ts)`,
   );
   const iIns = db.prepare(
@@ -139,10 +210,11 @@ function build(db, which) {
   const visit = (n, p, o) => {
     vIns.run({
       id: `fs-v-${n}`, order_id: `fs-o-${n}`, table_id: `fs-t-${n}`, table_number: `T${n}`,
+      floor: floorOf(n),
       uid: p.id, email: `${p.id}@x.test`, name: p.name, role: p.role,
       eg: o.eg ? 1 : 0, rating: o.rating || '', cf: o.cf || '', cd: o.cd || '',
       cs: o.cs || '', ca: o.ca || '', comment: o.comment || '',
-      status: o.status || 'taken', neg: o.neg ? 1 : 0, ts: TS(16, n),
+      status: o.status || 'taken', neg: o.neg ? 1 : 0, ts: TS(dayOf(n), 16, n),
     });
     return { visitId: `fs-v-${n}`, orderId: `fs-o-${n}`, tableId: `fs-t-${n}`, n };
   };
@@ -152,7 +224,7 @@ function build(db, which) {
       id, visit_id: v.visitId, order_id: v.orderId, oiid: `fs-oi-${v.n}-${k}`, item_name: o.name,
       group: o.group || 'food', qty: o.qty == null ? 1 : o.qty, rating: o.rating || '',
       issue: o.issue || '', comment: o.comment || '', action: o.action || 'none',
-      neg: o.neg ? 1 : 0, ts: TS(16, v.n),
+      neg: o.neg ? 1 : 0, ts: TS(dayOf(v.n), 16, v.n),
     });
     return id;
   };
@@ -160,7 +232,7 @@ function build(db, which) {
     id: `fs-fu-${v.n}-${k}`, visit_id: v.visitId, ifid, order_id: v.orderId, table_id: v.tableId,
     item_name: o.name, action: o.action || '', status: o.status || 'open',
     rr: o.rr || '', happiness: o.happiness || '', rc: o.rc || '',
-    rev: o.rev || '', closed: o.closed || '', ts: TS(17, v.n),
+    rev: o.rev || '', closed: o.closed || '', ts: TS(dayOf(v.n), 17, v.n),
   });
 
   /* ── THE SUBJECT: the only thing that differs between the two worlds ────── */
@@ -168,16 +240,16 @@ function build(db, which) {
     const v1 = visit(1, SUBJECT, { rating: 'poor', cf: 'poor', cs: 'average', ca: 'good', neg: 1, status: 'follow_up', comment: 'Biryani cold, naan burnt' });
     const a1 = item(v1, 1, { name: 'Mutton Biryani', issue: 'cold', action: 'returned', neg: 1, rating: 'poor', qty: 2, comment: 'served cold' });
     const a2 = item(v1, 2, { name: 'Butter Naan', issue: 'overcooked', action: 'remade', neg: 1, rating: 'poor', qty: 2, comment: 'burnt edges' });
-    fu(v1, a1, 1, { name: 'Mutton Biryani', action: 'returned', status: 'closed', happiness: 'happy', rr: 'good', closed: TS(18, 1), rev: TS(18, 1), rc: 'happy with the fresh one' });
+    fu(v1, a1, 1, { name: 'Mutton Biryani', action: 'returned', status: 'closed', happiness: 'happy', rr: 'good', closed: TS(dayOf(1), 18, 1), rev: TS(dayOf(1), 18, 1), rc: 'happy with the fresh one' });
     fu(v1, a2, 2, { name: 'Butter Naan', action: 'remade', status: 'open' });
 
     const v2 = visit(2, SUBJECT, { rating: 'average', cs: 'poor', cf: 'average', neg: 1, status: 'issue', comment: 'slow service' });
     const b1 = item(v2, 1, { name: 'Gulab Jamun', issue: 'delay', action: 'replaced_same', neg: 1, rating: 'average', qty: 1 });
-    fu(v2, b1, 1, { name: 'Gulab Jamun', action: 'replaced_same', status: 'closed', happiness: 'unhappy', rr: 'still_poor', closed: TS(18, 2), rev: TS(18, 2), rc: 'still not right' });
+    fu(v2, b1, 1, { name: 'Gulab Jamun', action: 'replaced_same', status: 'closed', happiness: 'unhappy', rr: 'still_poor', closed: TS(dayOf(2), 18, 2), rev: TS(dayOf(2), 18, 2), rc: 'still not right' });
 
     const v3 = visit(3, SUBJECT, { rating: 'average', cf: 'average', neg: 1, status: 'issue' });
     const c1 = item(v3, 1, { name: 'Paneer Tikka', issue: 'too_salty', action: 'cancelled', neg: 1, rating: 'poor', qty: 1, comment: 'far too salty' });
-    fu(v3, c1, 1, { name: 'Paneer Tikka', action: 'cancelled', status: 'closed', happiness: 'partial', rr: 'average', closed: TS(18, 3), rev: TS(18, 3) });
+    fu(v3, c1, 1, { name: 'Paneer Tikka', action: 'cancelled', status: 'closed', happiness: 'partial', rr: 'average', closed: TS(dayOf(3), 18, 3), rev: TS(dayOf(3), 18, 3) });
 
     const v4 = visit(4, SUBJECT, { rating: 'good', cf: 'good', cs: 'good' });
     item(v4, 1, { name: 'Filter Coffee', rating: 'good', group: 'drinks', qty: 1, comment: 'lovely' });
@@ -198,7 +270,7 @@ function build(db, which) {
   const s1 = item(v5, 1, { name: 'Paneer Tikka', issue: 'cold', action: 'returned', neg: 1, rating: 'poor', qty: 2, comment: 'cold' });
   const s2 = item(v5, 2, { name: 'Old Monk', issue: 'other', action: 'remade', neg: 1, rating: 'poor', qty: 1, group: 'drinks' });
   fu(v5, s1, 1, { name: 'Paneer Tikka', action: 'returned', status: 'open' });
-  fu(v5, s2, 2, { name: 'Old Monk', action: 'remade', status: 'closed', happiness: 'unhappy', closed: TS(18, 5), rev: TS(18, 5) });
+  fu(v5, s2, 2, { name: 'Old Monk', action: 'remade', status: 'closed', happiness: 'unhappy', closed: TS(dayOf(5), 18, 5), rev: TS(dayOf(5), 18, 5) });
 
   const v6 = visit(6, STEADY, { rating: 'good', cf: 'good', cs: 'excellent' });
   item(v6, 1, { name: 'Mutton Biryani', rating: 'good', qty: 2, comment: 'very good' });
@@ -207,15 +279,22 @@ function build(db, which) {
 
   const v8 = visit(8, MGR, { rating: 'average', cs: 'average', neg: 1, status: 'issue' });
   const m1 = item(v8, 1, { name: 'Gulab Jamun', issue: 'presentation', action: 'replaced_other', neg: 1, rating: 'average', qty: 1 });
-  fu(v8, m1, 1, { name: 'Gulab Jamun', action: 'replaced_other', status: 'closed', happiness: 'happy', closed: TS(18, 8), rev: TS(18, 8) });
+  fu(v8, m1, 1, { name: 'Gulab Jamun', action: 'replaced_other', status: 'closed', happiness: 'happy', closed: TS(dayOf(8), 18, 8), rev: TS(dayOf(8), 18, 8) });
 }
 
 module.exports = {
   build,
   DAY,
+  DAY_ONE,
+  DAY_TWO,
   DISHES,
   PEOPLE,
   TABLES,
+  FLOORS,
+  AREA_ZONES,
+  /** Eligible tables on EACH floor - half the venue, which is what makes a
+   *  floor denominator distinguishable from the venue's. */
+  TABLES_PER_FLOOR: TABLES / 2,
   /** 12 orders x 3 lines x 2 plates. */
   PLATES_SOLD: TABLES * LINES_PER_ORDER * PLATES_PER_LINE,
   /** 72 plates over 6 rotating dishes - 12 of each, by construction. */

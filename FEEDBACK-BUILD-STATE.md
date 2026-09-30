@@ -217,7 +217,7 @@ supported, clear status indicators, sticky Submit. Minimal typing.
 | P2 | Page 1 Floor Feedback + the READ-ONLY guarantee, proved server-side | **DONE (A + B)** | §6 2026-09-22: GET-only routes (405 with CSRF, 403 without), 40 reads → census identical, 6-persona gate, all 5 statuses live, `tunable()` zero-default bug fixed, tsc 0. **Part (B) IS NOW APPLIED** — one prefix deny at ONE boundary (`src/lib/feedback/pos-readonly.ts` + `src/proxy.ts`), zero POS route handlers edited, 23/23 forbidden writes refused for an assigned GRE, 115/115 non-GRE writes untouched. **Lane B (read/board/catalog) closed its three HIGHs + 7 MEDIUMs** — elapsed proved against a known instant, a business-day exit for the never-settled order, tier flags proved per persona; 120 reads → census identical. **Probe `the-gre-is-denied` (2026-09-22, port 3954, no code changed): 87/87 state-changing POS requests refused against REAL rows with zero writes, the same requests measured WRITING for six other personas — but the claim is falsified once, by `POST /api/crm-calls/bookings/[id]/seat`, which opens/edits an order for any signed-in user (§6, §7 items 6-7).** **Probe `floor-managers-and-null-role` (2026-09-23, port 3955, no code changed): the deny is INERT in the null-role state and switches on and off with the assignment (0/27 → 26/27 → 0/27 on ONE login); 162 HTTP lines and a 33,407-line dump of all 217 tables are BYTE-IDENTICAL between the deny build and the deny reverted, for the Floor Manager and all three null-role tiers; the Page-1 truth table and the elapsed clock both pass. 🛑 But a **Floor Manager gets 403 on all four pages** while the API hands them the board — §6, and it is a config blocker, not a code one.** |
 | P3 | Page 2 Take Feedback + item-level complaints + action + follow-up lifecycle | PENDING | |
 | P4 | Page 3 Feedback Tracker + coverage | **LANE A DONE** | §6 2026-09-23: `GET /api/feedback/tracker` built (GET-only, 403 without CSRF / 405 with a valid pair, 40 reads → census identical), Page 3 reads it and the placeholder import is gone, and **the door is open** — a Floor Manager / Bar Manager / Head Chef / Store Manager now gets 200 on pages 1-3 where the same build without the one-line change gives 403 on all four (control run, every other row byte-identical). Analytics stays 403 for a GRE. tsc 0. |
-| P5 | Page 4 Analytics + the 8 reports | **LANE C + LANE B DONE · LANE D VERIFIED vs `715f604` · D11 `2c`+`2d` CLOSED** | §6 2026-09-30 (D11 `2d`): the FOURTH site of the mixed-population shape closed — the menu-item Summary tile was `value` off the RECORD lane over `sub` off the VENUE lane and printed **`6 of 6` / `5 of 6` / `3 of 6` / `0 of 6`** four rows under the cover's promise that the Summary tiles do not move; it is now venue over venue, `records.items_sold` is deleted in favour of one branded `{count, of}` pair, and 3 negative controls (TS2345 ×2, TS2322) were RUN. **The gate that let it through is fixed too:** gate D asserted only the denominator of the ratio it is named after and reported green on 6/5/3/0; it now reads both halves of every rate and every `value`/`sub` pair from the PRINTED strings, and gate E5 sweeps every tile of all 8 reports for filter-invariance. The repaired suite goes **RED on `399e4cc` (400 passed, 32 failed)** where the suite committed there was **green (299/0)**. 90-object payload+report diff vs the pinned baseline: only the `records` rename and the filtered tile moved; unfiltered downloads byte-identical. tsc 0, `next build` 0, suite **432/0**. NO SERVER BOOTED. §6 2026-09-24 (Lane D): every briefed defect reproduced on the BASELINE and confirmed closed at `5bf8fda` — the filter moves 4 payload paths (was 15); the exported Rating split is byte-identical filtered vs unfiltered in BOTH worlds; Page 3 == Page 4 (`11/8/72.7%`, was `12/9/75.0%` vs `11/8/72.7%`); the workbook reconciles (`9=9`, and Share sums to 100% where the baseline summed to **110%**); 628/628 menu names print distinct (baseline: 58 names in 28 rows); 18 of 42 truncated KPI subs → 0; 37 reads → DB byte-identical; tsc 0. NO SERVER BOOTED. §6 2026-09-24: the CRITICAL is closed — a person filter now moves **4 payload paths (`filters.gre` · `person` · `meta.counts_scope` · `meta.person_filter_active`) instead of 13**, and the flip (records honestly vs records "everything good") leaves the person-filtered page BYTE-IDENTICAL to the unfiltered one in both worlds. Page 3 and Page 4 agree (`11/8/72.7%` both, was `12/9/75.0%` vs `11/8/72.7%`) including the new floor denominator and the per-person Tables/Taken columns. The workbook no longer contradicts itself (`Feedbacks recorded 9 = Rating split 9`, was `8` vs `9`). PDF menu names: **628 of 628 printed strings distinct**, was 58 names collapsing into 28 rows. 37 reads incl. all 16 downloads → DB byte-identical. tsc 0. **NO SERVER WAS BOOTED.** **LANE B (export/PDF half, independent second measurement, 2026-09-24):** the three HIGHs re-proved with controls — Page 3 vs Page 4 `7/5/71.4%` both, and reverting only the numerator restores the brief's exact pair `8 eligible/75.0%` vs `7/71.4%`; 184 workbook assertions across 8 reports x 4 filter states, 0 contradictions; 628 of 628 menu names print distinct (widening ALONE still left 22 colliding, so the label pass is load-bearing). **Then four defects nobody had measured, all only visible at the owner's real 292-table scale:** `Their floor` printed `188/188 1…` for a GRE who covered EVERY table on her floor (a truncated percentage inverts its meaning — proved in two real rendered PDFs), `Recovery` the same past 100 complaints, 4 KPI subs cut mid-word (one losing the word PRINTED, one losing the sentence that reconciles the Summary against the Rating split), and the venue's open-follow-up count printed on a named person's card. Exhaustive audit: **36,365 rendered strings, 0 truncated, 0 ambiguous** (control at `f83b30b`: 88). tsc 0. **NO SERVER WAS BOOTED.** |
+| P5 | Page 4 Analytics + the 8 reports | **LANE C + LANE B DONE · LANE D VERIFIED vs `715f604` · D11 `2c`+`2d` CLOSED · GUARD WIDENED TO THE WHOLE DOC (`2e`)** | §6 2026-09-30 (D11 `2e`): the guard stopped being a LIST. Gate **J** walks each `ReportDoc` by the doc's OWN KEYS and fails on a key it has not been taught, and over that enumeration asserts filter invariance (classified by the FILE'S OWN cover sentences) and internal agreement for **every printed number in every block** - tiles, table cells, footnotes, sheet notes, column headings, cover lines. Two of the four briefed sabotages turned out **INERT on the old fixture**: `users.preferred_zones` has ZERO populated rows and the fixture set none, so every floor-coverage cell printed `'-'` and the swap was **byte-identical in all 8 reports x 5 states x 2 worlds**; one business day made `d.eligible` the venue's count for the same reason. The fixture now has **two floors and two business days** (venue totals unchanged by construction). **Eleven one-line sabotages go RED** - the 4 named (432/0 before, 4-10 failures after) and 7 nobody had named - with `tsc` exit 0 for every one. tsc 0, `next build` 0, suite **526/0**. **TEST-ONLY: no `src/` file changed.** NO SERVER BOOTED. §6 2026-09-30 (D11 `2d`): the FOURTH site of the mixed-population shape closed — the menu-item Summary tile was `value` off the RECORD lane over `sub` off the VENUE lane and printed **`6 of 6` / `5 of 6` / `3 of 6` / `0 of 6`** four rows under the cover's promise that the Summary tiles do not move; it is now venue over venue, `records.items_sold` is deleted in favour of one branded `{count, of}` pair, and 3 negative controls (TS2345 ×2, TS2322) were RUN. **The gate that let it through is fixed too:** gate D asserted only the denominator of the ratio it is named after and reported green on 6/5/3/0; it now reads both halves of every rate and every `value`/`sub` pair from the PRINTED strings, and gate E5 sweeps every tile of all 8 reports for filter-invariance. The repaired suite goes **RED on `399e4cc` (400 passed, 32 failed)** where the suite committed there was **green (299/0)**. 90-object payload+report diff vs the pinned baseline: only the `records` rename and the filtered tile moved; unfiltered downloads byte-identical. tsc 0, `next build` 0, suite **432/0**. NO SERVER BOOTED. §6 2026-09-24 (Lane D): every briefed defect reproduced on the BASELINE and confirmed closed at `5bf8fda` — the filter moves 4 payload paths (was 15); the exported Rating split is byte-identical filtered vs unfiltered in BOTH worlds; Page 3 == Page 4 (`11/8/72.7%`, was `12/9/75.0%` vs `11/8/72.7%`); the workbook reconciles (`9=9`, and Share sums to 100% where the baseline summed to **110%**); 628/628 menu names print distinct (baseline: 58 names in 28 rows); 18 of 42 truncated KPI subs → 0; 37 reads → DB byte-identical; tsc 0. NO SERVER BOOTED. §6 2026-09-24: the CRITICAL is closed — a person filter now moves **4 payload paths (`filters.gre` · `person` · `meta.counts_scope` · `meta.person_filter_active`) instead of 13**, and the flip (records honestly vs records "everything good") leaves the person-filtered page BYTE-IDENTICAL to the unfiltered one in both worlds. Page 3 and Page 4 agree (`11/8/72.7%` both, was `12/9/75.0%` vs `11/8/72.7%`) including the new floor denominator and the per-person Tables/Taken columns. The workbook no longer contradicts itself (`Feedbacks recorded 9 = Rating split 9`, was `8` vs `9`). PDF menu names: **628 of 628 printed strings distinct**, was 58 names collapsing into 28 rows. 37 reads incl. all 16 downloads → DB byte-identical. tsc 0. **NO SERVER WAS BOOTED.** **LANE B (export/PDF half, independent second measurement, 2026-09-24):** the three HIGHs re-proved with controls — Page 3 vs Page 4 `7/5/71.4%` both, and reverting only the numerator restores the brief's exact pair `8 eligible/75.0%` vs `7/71.4%`; 184 workbook assertions across 8 reports x 4 filter states, 0 contradictions; 628 of 628 menu names print distinct (widening ALONE still left 22 colliding, so the label pass is load-bearing). **Then four defects nobody had measured, all only visible at the owner's real 292-table scale:** `Their floor` printed `188/188 1…` for a GRE who covered EVERY table on her floor (a truncated percentage inverts its meaning — proved in two real rendered PDFs), `Recovery` the same past 100 complaints, 4 KPI subs cut mid-word (one losing the word PRINTED, one losing the sentence that reconciles the Summary against the Rating split), and the venue's open-follow-up count printed on a named person's card. Exhaustive audit: **36,365 rendered strings, 0 truncated, 0 ambiguous** (control at `f83b30b`: 88). tsc 0. **NO SERVER WAS BOOTED.** |
 | P6 | Full adversarial verification + carve-readiness | PENDING | |
 
 **🛑 After P6 the build STOPS and waits for "Deploy Feedback Module".**
@@ -1180,6 +1180,89 @@ supported, clear status indicators, sticky Submit. Minimal typing.
     copies in `os.tmpdir()`. `stash@{0}` *R71-CONCURRENT-other-agent-receive-route* left untouched;
     no `git stash`, `checkout --`, `reset` or `clean` was run. Nothing pushed, nothing merged,
     no workflow dispatched — **the build-only gate stands.**
+
+- **2026-09-30 — D11 `2e`: THE GUARD IS NO LONGER A LIST. Gate J walks the doc.** Baseline
+  `c326168`, branch `guest-feedback`, one commit, **TEST-ONLY — not one production file changed.**
+  - 🐞 **THE PATTERN, not a fifth instance of the bug.** The same defect — a RECORD-lane numerator
+    printed over a VENUE-lane denominator — has been found **four times across three commits**, and
+    each guard written for it was scoped to the shape just broken: `399e4cc` widened gate D to
+    **rates**, `c326168` widened gate E5 to **tiles**. Both are hand-written lists of places, and
+    E5's own comment claims tiles are *"where every printed 'N of M' lives"*. **Measured on
+    `c326168`: false.** Four `N of M` pairs and eight rate-beside-its-own-pair cells live in TABLE
+    CELLS, and a fifth deliberately person-aware number lives in a **FOOTNOTE**.
+  - 🐞 **AND TWO OF THE FOUR SABOTAGES WERE INERT, which is the more important finding.**
+    `users.preferred_zones` has **ZERO populated rows** in the database (`zones.ts` says so in its
+    own header) and the fixture populated none, so `area_assigned` was **false for every person in
+    both worlds** and every floor-coverage cell printed the literal `'-'` in all ten runs. Swapping
+    the person sheet's *"Coverage of their own floor"* and the By person *"Their floor"* cell onto
+    the venue's `eligible_tables` produced **BYTE-IDENTICAL output in all 8 reports × 5 filter
+    states × 2 worlds** — 4 independent doc dumps, `cmp` clean. The same held for the By day sheet:
+    one business day meant `d.eligible` **was** the venue's eligible count. *No guard, however wide,
+    can catch a number the fixture never prints* — the Inert-Guards pattern, in the fixture instead
+    of the code. The fixture now has **two floors of six eligible tables** with two of the four
+    people assigned (`Ground` / `Terrace`) and **two business days** split 6/6 tables and 6/2
+    visits, so the floor denominator (6) and the day denominator (6) are both distinguishable from
+    the venue's (12). Every venue total is unchanged by construction — same 12 tables, 12 orders, 72
+    plates, 8 visits, same recorders — and **every hand-computed assertion in the suite still holds
+    (432/0 on the two-floor two-day fixture before gate J was added)**.
+  - ✅ **GATE J — the enumeration.** It does not list places: it walks each `ReportDoc` **by the
+    doc's own keys** and **fails on a key it has not been taught** (`ReportDoc` / `ReportTable` /
+    kpi / column), so a new printed field fails the suite the day it is added. 526 assertions now;
+    the unfiltered walk reaches **569 figures, 44 pairs and 400 prose blocks** in world A (499 / 44 /
+    400 in world B) across the 8 reports, and **17 percentage columns** get a basis search.
+    Over that enumeration, the two properties, stated once each rather than per site:
+    **A FILTER INVARIANCE** — classified by the **FILE'S OWN cover sentences**, parsed back out of
+    `doc.filters`, not by a list in the suite: a sheet the cover did not say it narrowed must be
+    character-identical in every filter state (tiles AND cells AND headings), and a prose block's
+    own numbers may move only if the block NAMES the person. The published basis sentences are
+    stripped by identity first (collected by rule — every string export ≥ 60 chars of
+    `reporting.ts` + `zones.ts`, 11 of them), so `RECOVERY_IS_A_QUEUE`'s illustrative `"1/3"` and
+    `COUNTS_SCOPE_PERSON`'s `"Excellent 100%"` are not mistaken for figures.
+    **B INTERNAL AGREEMENT** — a printed rate equals the rate of its own printed pair inside one
+    cell, inside one tile, and **ACROSS THE CELLS OF ONE ROW**; every percentage COLUMN is the rate
+    of two numbers printed on its **own sheet** (numerator = a column or the sum of two; denominator
+    = a column per row, or — only for a column that SAYS it is a `Share` — one shared total), by the
+    same basis in every filter state, which is what *"narrows on both sides"* means; an `"N of
+    those"` claim neither exceeds the number it is `'of'` nor, **summed over every person**, exceeds
+    the queue it partitions; and the rollover printed in the period line, the cover and the footnote
+    is one number and is the range's own.
+    Two named registers, each asserted rather than waved through: `COVER_SILENT` (the 2 sheets
+    `filterLines()` classifies in **neither** sentence — a real gap in the cover, found by the walk)
+    and `OFF_SHEET_RATE_BASIS` (`R/R %` / `R/R %*`, whose numerator is a plate QUANTITY while
+    `Returned` / `Remade` print row COUNTS — the register is checked for **staleness**, and an
+    excused column must still print `RETURN_REMAKE_BASIS` on its own sheet).
+  - 📏 **ELEVEN SABOTAGES, ALL RED.** Re-run in an isolated `git archive c326168` tree (never the
+    shared worktree), each a one-line edit, `reporting.ts` restored to `c326168` byte-identical
+    afterwards. **BEFORE, on `c326168` with the committed suite, all four named ones were 432
+    passed / 0 failed.** AFTER: S1 person-sheet own-floor coverage **522/4**, S2 menuTable `Neg %`
+    **524/2**, S4 By person `Their floor` **516/10**, the footnote `follow_ups_open →
+    follow_ups_raised` **522/4**. And seven nobody had named, to test breadth rather than fit:
+    Rating split `Share` over the record lane **508/18**, By day `Coverage` over the venue's
+    eligible **525/1**, `recoveryCell`'s rate over the wrong denominator **516/10**, the *"Of those,
+    raised by"* row over `follow_ups_raised` **522/4**, a brand-new printed `ReportDoc` field
+    **524/2**, a hard-coded rollover in a footnote **516/10**, and the `2d` value/sub shape
+    re-introduced on a NEW tile **510/16**. `tsc --noEmit` is **exit 0 for every one of them** —
+    which is the point.
+  - ⚠️ **THE GAPS, NAMED IN THE FILE HEADER rather than left to be found.** `rangeForReport()` is
+    not exercised (the suite builds one payload over a custom range and asks it for all eight
+    reports, so the three period-forced variants carry the custom range's numbers); only the
+    PERSON filter is varied, never floor / section / captain / group / item; `istStamp()`'s
+    "Generated … IST" line is composed in `reports/route.ts` and never enters a doc; payload fields
+    the screen prints and no report does are covered only by gate A's block equality; gate I
+    measures HEADINGS, not cells; a wrong constant printed in only ONE block has nothing to
+    disagree with; and J6 aggregates per world, so a break another pair of columns happens to
+    reproduce in world B is caught in world A alone (measured: the By day swap, 1 failure not 2).
+  - ✅ **GATES.** `npx tsc --noEmit` exit **0**, zero output. `npx next build` exit **0**.
+    `node scripts/feedback-scope-tests.js` **526 passed, 0 failed** (was 432). `eslint` on the two
+    changed files: 10 pre-existing `no-require-imports` errors (9 at baseline + the one new
+    `zones.ts` require this gate needs), **0 warnings**. Only `scripts/feedback-scope-tests.js` and
+    `scripts/feedback-scope-fixture.js` changed — `git status` shows no `src/` file touched, so **no
+    production number moved**. **NO DEV SERVER BOOTED**; the module is loaded through the suite's own
+    TypeScript hook. The database was read only through `mode=ro` + `VACUUM INTO` copies in
+    `os.tmpdir()`; all sabotage work was done in a `git archive` tree under the scratchpad.
+    `stash@{0}` *R71-CONCURRENT-other-agent-receive-route* left untouched; no `git stash`,
+    `checkout --`, `reset` or `clean` was run. Nothing pushed, nothing merged, no workflow
+    dispatched — **the build-only gate stands.**
 
 ---
 
