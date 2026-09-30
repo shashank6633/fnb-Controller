@@ -604,14 +604,27 @@ ai.analyzePendingReviews({ db: db, limit: 5, locationKey: BULK_LOC }).then(async
   eq('the API source reports itself unconfigured', gbp.ready, false);
   truthy('and hands back the owners own to-do list instead of an error',
     gbp.prerequisites.length >= 8, gbp.prerequisites.length + ' prerequisites');
-  truthy('with its unverified assumptions declared',
-    gbp.unproven.some(u => /No Google endpoint has been called/.test(u)));
+  // WAS ASSERTING A STRING THAT NO LONGER EXISTS, and had been red since
+  // c854201: that commit correctly DELETED the "No Google endpoint has been
+  // called" entry the moment a live pull returned 10,055 reviews, but left this
+  // line matching on it. Re-pointed at the property that actually matters and
+  // that survives the list being edited again — the panel declares unproven
+  // assumptions, and the one that matters now is that the reply WRITE has never
+  // been sent. Matching on a durable phrase, not on a whole sentence.
+  truthy('with its unverified assumptions declared', gbp.unproven.length >= 4,
+    gbp.unproven.length + ' entries');
+  truthy('including the one that matters most — the reply write has never been sent to Google',
+    gbp.unproven.some(u => /reply write has NEVER been sent/.test(u)),
+    JSON.stringify(gbp.unproven.slice(0, 1)));
+  truthy('and that the OAuth scope narrows nothing, so the code is the only constraint',
+    gbp.unproven.some(u => /no read-only scope/i.test(u)));
   truthy('and points at the Takeout path meanwhile', /Takeout/.test(gbp.reason));
 
   await connectorGates();
   pageGates();
   integrityGates();
   listingGates();
+  await lockdownGates();
 
   finish();
 }).catch((e) => {
@@ -1547,6 +1560,264 @@ function listingGates() {
   const themeMs = Date.now() - tTheme;
   truthy('a theme drill-down over ' + bulkFull.length + ' rows takes ' + themeMs +
     'ms (budget 250ms)', themeMs < 250);
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * AL. THE LOCKDOWN — the one door to Google, and proof that it SLAMS.
+ *
+ * WHAT IS AT STAKE. The token this app holds carries business.manage, the FULL
+ * management scope, because Google publishes no read-only scope for Business
+ * Profile. That token could rewrite the business's address, delete its photos
+ * or publish a post. The ONLY thing preventing any of that is the allowlist in
+ * src/lib/reviews/gbp-transport.ts. So this section is not testing a helper; it
+ * is testing the entire defence.
+ *
+ * WHY IT IS TESTED THIS WAY. This project has a documented history
+ * (project_fnb_inert_guards) of guards that read correctly and NEVER FIRE — an
+ * empty settings row, a key nothing writes, a function nobody calls. Reading
+ * gbp-transport.ts and agreeing with it proves nothing whatsoever. So every
+ * assertion below drives the real gbpFetch() with an INJECTED fetch spy and
+ * asserts on the spy:
+ *
+ *   for a refused shape, the spy must have been called ZERO times.
+ *
+ * That is the assertion that distinguishes "it threw afterwards" from "the
+ * request never happened". NOTHING HERE TOUCHES THE NETWORK — there is no live
+ * host in this file, and the permitted PUT is proven only as far as the spy.
+ * A single real PUT to Google's reply endpoint is published instantly under the
+ * owner's business name across 10,055 real reviews, and Google has no undo, so
+ * no test in this repo may ever make one.
+ *
+ * The last gate is a repo grep. Without it the choke point is a CONVENTION: any
+ * future file could fetch() Google's host directly and never come through the
+ * door. Naming the host anywhere but gbp-transport.ts fails the suite.
+ * ══════════════════════════════════════════════════════════════════════════ */
+async function lockdownGates() {
+  const transport = lib('reviews/gbp-transport.ts');
+  const gbp = lib('reviews/sources-gbp.ts');
+  const types = lib('reviews/types.ts');
+
+  // Obviously fake ids on purpose. A test file must not read as if it were
+  // aimed at the owner's real listing.
+  const ACC = 'accounts/ACC1';
+  const LOC = ACC + '/locations/LOC1';
+  const REV = LOC + '/reviews/REV1';
+  const V4 = transport.GBP_REVIEWS_HOST;
+  const INFO = transport.GBP_INFO_HOST;
+  const ACCTS = transport.GBP_ACCOUNTS_HOST;
+
+  /** A fetch that records every call and never leaves the machine. */
+  function spy(status, body) {
+    const calls = [];
+    return {
+      calls,
+      impl: async (url, init) => {
+        calls.push({ url: String(url), init: init || {} });
+        return {
+          ok: status >= 200 && status < 300,
+          status,
+          text: async () => (body === undefined ? '{}' : body),
+        };
+      },
+    };
+  }
+
+  /** THE CORE ASSERTION: it refused, AND the wire was never touched. */
+  async function refuses(label, args) {
+    const s = spy(200);
+    let threw = null;
+    try {
+      await transport.gbpFetch(Object.assign({ token: 'fake-token', fetchImpl: s.impl }, args));
+    } catch (e) { threw = e; }
+    if (!threw) { bad(label, 'IT DID NOT REFUSE — gbpFetch returned normally'); return; }
+    if (threw.name !== 'GbpTransportRefusal') {
+      bad(label, 'refused with the wrong error type: ' + threw.name + ' ' + threw.message); return;
+    }
+    if (s.calls.length !== 0) {
+      bad(label, 'REFUSED BUT STILL CALLED fetch ' + s.calls.length + ' time(s) — the guard fires TOO LATE');
+      return;
+    }
+    ok(label);
+  }
+
+  /* ── AL1. Every write Google offers, except the one the owner asked for ── */
+  section('AL. The lockdown: refusals fire BEFORE the wire (spy call count 0)');
+
+  await refuses('POST to the reviews list is refused', { method: 'POST', url: V4 + '/' + LOC + '/reviews', body: {} });
+  await refuses('PUT to a REVIEW (no /reply) is refused — one segment short of the only write',
+    { method: 'PUT', url: V4 + '/' + REV, body: { comment: 'x' } });
+  await refuses('DELETE of a reply is refused — one VERB away from the permitted PUT, and deleting is not an undo',
+    { method: 'DELETE', url: V4 + '/' + REV + '/reply' });
+  await refuses('PATCH of the location is refused — this is how the name, address and hours would be rewritten',
+    { method: 'PATCH', url: INFO + '/' + LOC, body: { title: 'Renamed By Accident' } });
+  await refuses('POST of a photo is refused', { method: 'POST', url: V4 + '/' + LOC + '/media', body: {} });
+  await refuses('POST of a local post is refused', { method: 'POST', url: V4 + '/' + LOC + '/localPosts', body: {} });
+  await refuses('DELETE of the location itself is refused', { method: 'DELETE', url: INFO + '/' + LOC });
+
+  /* ── AL2. The ways an allowlist usually gets walked around ───────────── */
+  await refuses('a lowercase verb cannot smuggle a DELETE past a case-sensitive check',
+    { method: 'delete', url: V4 + '/' + REV + '/reply' });
+  await refuses('a GET of a single account is refused — the allowlist is exact, not a prefix',
+    { method: 'GET', url: ACCTS + '/' + ACC });
+  await refuses('an http:// downgrade is refused before the bearer token can go out in plaintext',
+    { method: 'GET', url: ACCTS.replace('https:', 'http:') + '/accounts' });
+  await refuses('a percent-encoded path is refused, so %2F cannot become a slash after Google decodes it',
+    { method: 'PUT', url: V4 + '/' + LOC + '/reviews/REV1%2Freply/reply', body: { comment: 'x' } });
+  await refuses('a URL with embedded credentials is refused',
+    { method: 'GET', url: 'https://user:pw@mybusinessaccountmanagement.googleapis.com/v1/accounts' });
+  await refuses('an unparseable URL is refused', { method: 'GET', url: 'not-a-url' });
+
+  /* ── AL3. The identity endpoints must NOT be reachable through this door ─
+   * They are legitimately POST and live on other hosts. If they were routed
+   * through here a "GET only" rule would have killed token refresh and taken
+   * the whole read path down with it. */
+  await refuses('the OAuth token endpoint is not reachable through this door',
+    { method: 'POST', url: 'https://oauth2.googleapis.com/token', body: {} });
+  await refuses('and neither is any other googleapis.com host — the allowlist names three hosts, not a domain',
+    { method: 'GET', url: 'https://www.googleapis.com/oauth2/v3/userinfo' });
+
+  /* ── AL4. Body discipline on the one write ───────────────────────────── */
+  await refuses('a GET carrying a body is refused', { method: 'GET', url: ACCTS + '/accounts', body: { x: 1 } });
+  await refuses('a bodiless reply PUT is refused rather than posting an empty comment publicly',
+    { method: 'PUT', url: V4 + '/' + REV + '/reply' });
+  await refuses('a reply over 4096 BYTES is refused',
+    { method: 'PUT', url: V4 + '/' + REV + '/reply', body: { comment: 'a'.repeat(4200) } });
+  // The byte/character trap, which is the reason the limit is enforced in bytes:
+  // 1,700 Telugu characters are ~5,100 bytes but would pass any length check
+  // written against .length. The owner's guests review in Telugu and Hindi.
+  const telugu = 'అ'.repeat(1700);
+  truthy('and a reply that is UNDER 4096 characters but OVER 4096 bytes is still refused ('
+    + telugu.length + ' chars = ' + Buffer.byteLength(telugu, 'utf8') + ' bytes)',
+    telugu.length < 4096 && Buffer.byteLength(telugu, 'utf8') > 4096);
+  await refuses('  ...refused, because the limit Google documents is BYTES',
+    { method: 'PUT', url: V4 + '/' + REV + '/reply', body: { comment: telugu } });
+
+  /* ── AL5. The four permitted shapes DO go through ─────────────────────
+   * A lockdown that also breaks the read path is not a lockdown, it is an
+   * outage. Each of these must reach the spy exactly once. */
+  section('AL. ...and the four permitted shapes still go through, exactly once');
+
+  async function permits(label, args, expectMethod) {
+    const s = spy(200, '{}');
+    try {
+      await transport.gbpFetch(Object.assign({ token: 'fake-token', fetchImpl: s.impl }, args));
+    } catch (e) { bad(label, 'REFUSED a permitted call: ' + String(e && e.message)); return null; }
+    if (s.calls.length !== 1) { bad(label, 'reached fetch ' + s.calls.length + ' times, expected exactly 1'); return null; }
+    if (String(s.calls[0].init.method) !== expectMethod) {
+      bad(label, 'sent method ' + s.calls[0].init.method + ', expected ' + expectMethod); return null;
+    }
+    ok(label);
+    return s.calls[0];
+  }
+
+  await permits('GET the accounts list is permitted', { method: 'GET', url: ACCTS + '/accounts' }, 'GET');
+  await permits('GET an account\'s locations is permitted', { method: 'GET', url: INFO + '/' + ACC + '/locations' }, 'GET');
+  await permits('GET a page of reviews is permitted, query string and all',
+    { method: 'GET', url: V4 + '/' + LOC + '/reviews?pageSize=50&pageToken=abc' }, 'GET');
+
+  const put = await permits('PUT one owner reply is permitted — THE ONE WRITE',
+    { method: 'PUT', url: V4 + '/' + REV + '/reply', body: { comment: 'Thank you.' } }, 'PUT');
+  if (put) {
+    eq('it carries the reply as JSON in the body', put.init.body, '{"comment":"Thank you."}');
+    eq('with a JSON content type', put.init.headers['Content-Type'], 'application/json');
+    eq('and the bearer token', put.init.headers.Authorization, 'Bearer fake-token');
+    truthy('to the reply path and nothing else', /\/v4\/accounts\/ACC1\/locations\/LOC1\/reviews\/REV1\/reply$/.test(put.url), put.url);
+  }
+
+  // The named helper, so `grep gbpPutReviewReply` really does find every place
+  // a public reply can be posted from.
+  {
+    const s = spy(200, '{"comment":"hi","reviewReplyState":"PENDING"}');
+    const r = await transport.gbpPutReviewReply({ reviewName: REV, comment: 'hi', token: 'fake-token', fetchImpl: s.impl });
+    eq('gbpPutReviewReply builds the URL itself, so no caller hand-rolls it',
+      s.calls.length === 1 && /\/reviews\/REV1\/reply$/.test(s.calls[0].url), true);
+    eq('and hands back Google\'s body, because a 2xx does NOT mean the reply is live',
+      JSON.parse(r.body).reviewReplyState, 'PENDING');
+  }
+
+  /* ── AL6. A refusal by Google is not a refusal by us ──────────────────
+   * gbpFetch must NOT throw on a non-ok response. googleGet's four-way 403
+   * classifier and gbpCollect's once-only 401 retry both read the raw status,
+   * and both would break if the transport threw first. */
+  {
+    const s = spy(403, '{"error":{"message":"denied","status":"PERMISSION_DENIED"}}');
+    const r = await transport.gbpFetch({ method: 'GET', url: ACCTS + '/accounts', token: 'fake-token', fetchImpl: s.impl });
+    eq('a 403 from Google comes back as a RESULT, not a thrown error', [r.ok, r.status], [false, 403]);
+    truthy('with the body intact for the classifier to read', /PERMISSION_DENIED/.test(r.body));
+  }
+
+  /* ── AL7. THE READ PATH DID NOT REGRESS ───────────────────────────────
+   * The wiring is only safe if the pull still works. globalThis.fetch is
+   * stubbed here — still no network — so the SHIPPED gbpListAccounts and
+   * gbpListLocations run through the new transport for real. */
+  section('AL. The read path still reads, and a 403 still classifies');
+
+  const realFetch = globalThis.fetch;
+  try {
+    const seen = [];
+    globalThis.fetch = async (url, init) => {
+      seen.push({ url: String(url), method: (init || {}).method });
+      const u = String(url);
+      const payload = /\/locations/.test(u)
+        ? '{"locations":[{"name":"locations/LOC1","title":"Akan Brewing Co","storefrontAddress":{"addressLines":["1 Road"],"locality":"Hyderabad"}}]}'
+        : '{"accounts":[{"name":"accounts/ACC1","accountName":"Akan"}]}';
+      return { ok: true, status: 200, text: async () => payload };
+    };
+
+    const accts = await gbp.gbpListAccounts('fake-token');
+    eq('gbpListAccounts still returns parsed accounts through the new door', accts.length, 1);
+    eq('and still asked with a GET', seen[0].method, 'GET');
+    const locs = await gbp.gbpListLocations('fake-token', 'accounts/ACC1');
+    eq('gbpListLocations still returns parsed locations', locs.length, 1);
+    eq('with the label the picker shows', locs[0].label, 'Akan Brewing Co');
+
+    // And the refusal classifier, which is the behaviour most likely to be lost
+    // in a transport swap: a 403 SERVICE_DISABLED must still name the Console
+    // toggle rather than sending the owner back to the approval queue.
+    globalThis.fetch = async () => ({
+      ok: false,
+      status: 403,
+      text: async () => JSON.stringify({
+        error: { message: 'Google My Business API has not been used in project 1077580169090 before or it is disabled', status: 'PERMISSION_DENIED', details: [{ reason: 'SERVICE_DISABLED' }] },
+      }),
+    });
+    let caught = null;
+    try { await gbp.gbpListAccounts('fake-token'); } catch (e) { caught = e; }
+    truthy('a 403 still raises SourceNotConfiguredError, not a bare failure',
+      caught instanceof types.SourceNotConfiguredError, caught && caught.name);
+    truthy('and still names the Cloud Console toggle, not the approval queue',
+      caught && /NOT switched on for this Google Cloud project/.test(caught.message),
+      caught && caught.message.slice(0, 160));
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+
+  /* ── AL8. THE FLOOR IS A RULE, NOT A CONVENTION ───────────────────────
+   * If any other file in src/ can name Google's host, it can fetch() it
+   * directly and the choke point is bypassed rather than enforced. This is the
+   * gate that keeps the door the only door. It also catches the googleapis npm
+   * package route (google.mybusinessaccountmanagement(...)), because that names
+   * the host too. */
+  section('AL. Only ONE file in src/ may name Google\'s business hosts');
+
+  const DOOR = path.join('lib', 'reviews', 'gbp-transport.ts');
+  const offenders = [];
+  (function walk(dir) {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) { walk(full); continue; }
+      if (!/\.(ts|tsx|js|jsx)$/.test(entry.name)) continue;
+      const rel = path.relative(SRC, full);
+      if (rel === DOOR) continue;
+      if (fs.readFileSync(full, 'utf8').includes('mybusiness')) offenders.push(rel);
+    }
+  })(SRC);
+  eq('no file outside gbp-transport.ts names a mybusiness host'
+    + (offenders.length ? ' — FOUND: ' + offenders.join(', ') : ''), offenders, []);
+  truthy('and the door itself really does name all three hosts',
+    /mybusiness\.googleapis\.com/.test(fs.readFileSync(path.join(SRC, DOOR), 'utf8'))
+    && /mybusinessaccountmanagement/.test(fs.readFileSync(path.join(SRC, DOOR), 'utf8'))
+    && /mybusinessbusinessinformation/.test(fs.readFileSync(path.join(SRC, DOOR), 'utf8')));
 }
 
 function finish() {
