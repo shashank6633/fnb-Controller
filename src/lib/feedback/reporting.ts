@@ -560,10 +560,21 @@ export type VenueRows<T> = readonly T[] & { readonly [VENUE_SCOPE]: true };
  *  no name is picked). The record-level sections take only these. */
 export type RecordRows<T> = readonly T[] & { readonly [RECORD_SCOPE]: true };
 
-/** The two brands, applied. These two lines are the ONLY casts: every other
- *  place in this file is checked. Keep them next to each other so a reader can
- *  see that neither one filters — the narrowing happens once, in `analytics()`,
- *  and is visible there. */
+/** The two ROW brands, applied. Keep them next to each other so a reader can see
+ *  that neither one filters — the narrowing happens once, in `analytics()`, and
+ *  is visible there.
+ *
+ *  A BRAND CAN ONLY BE PUT ON BY A CAST, so every cast in this file is one of
+ *  FOUR named brand appliers and there are no others. Anything else is checked:
+ *
+ *    · `asVenue` / `asRecord`      — here, the row arrays (2b / D11(a))
+ *    · `venueReturnRemakeRates()`  — the finished R/R rate (2c)
+ *    · `venueMenuItemRows()`       — the venue menu-item LIST (2d)
+ *    · `venueItemsWithFeedback()`  — a printed count AND its denominator (2d)
+ *
+ *  The last three each take `VenueRows` in, so the brand they hand out cannot be
+ *  obtained from the narrowed rows by any edit that still compiles. That is the
+ *  negative control, and each one's doc comment names the TS error it raises. */
 const asVenue = <T,>(rows: readonly T[]): VenueRows<T> => rows as VenueRows<T>;
 const asRecord = <T,>(rows: readonly T[]): RecordRows<T> => rows as RecordRows<T>;
 
@@ -615,6 +626,59 @@ export type VenueRate = (number & { readonly [VENUE_SCOPE]: true }) | null;
  *  `item_key`. Built once by `venueReturnRemakeRates()` and stamped onto every
  *  menu-item row in BOTH lanes, so the record lane cannot compute its own. */
 export type VenueRrRates = ReadonlyMap<string, VenueRate>;
+
+/* ─── 2d. THE FOURTH SHAPE: A VALUE AND THE SUB IT IS PRINTED "OF" ───────────
+   2c fixed a RATE whose two sides came from two populations. The identical
+   mistake has a second form, and it shipped in the same commit that fixed the
+   rate: a KPI TILE, whose `value` is one population and whose `sub` — the words
+   printed underneath it — is another. The menu-item report's first tile read
+
+     value: p.menu_items.filter((m) => m.feedbacks > 0).length   ← RECORD lane
+     sub:   `of ${p.records.items_sold} items sold`              ← VENUE lane
+
+   and so it moved when a name was picked. Measured on the two-worlds fixture,
+   world A, six dishes sold and all six commented on by somebody:
+
+       no filter          "6 of 6 items sold"
+       &gre=Probe Gre     "5 of 6 items sold"
+       &gre=Steady Gre    "3 of 6 items sold"
+       &gre=Silent Gre    "0 of 6 items sold"     ← reads as a silent VENUE
+
+   TWO THINGS MAKE THIS WORSE THAN THE RATE. First, `reports/route.ts` writes
+   `doc.filters` and then `doc.kpis` onto the SAME 'Report' sheet, four rows
+   apart, under the literal heading 'Summary' — so `filterLines`' own sentence,
+   "What the GRE filter did NOT narrow: the Summary tiles ... they do not move
+   when a name is picked", was printed four rows above a Summary tile that had
+   moved 6 → 0. The file contradicted itself in writing. Second, a manager
+   opening a silent GRE's e-mailed Menu Item workbook reads "Items with feedback
+   0 of 6 items sold" as THE VENUE having heard nothing all night.
+
+   THE RESOLUTION IS 2c's, for 2c's reason. A GRE does not sell plates, so
+   "how many of the dishes the kitchen sold drew a comment" has no person-scoped
+   version to have: narrowing only the numerator can only ever UNDER-report the
+   room. The tile is therefore VENUE over VENUE, which is what the printed
+   sentence already promised, so the fix makes the sentence TRUE rather than
+   rewriting it.
+
+   AND THE TWO SIDES NOW TRAVEL AS ONE VALUE. `records.items_sold` — a bare
+   venue `number` sitting in the payload next to the record lane's rows — is
+   GONE, exactly as `returned_qty` / `remade_qty` went in 2c: it was the
+   ingredient, and an inline `sub` cannot pair with a field that does not exist.
+   Both sides are read off the SAME list, in ONE place, by the one constructor
+   below.
+   ──────────────────────────────────────────────────────────────────────────── */
+
+/** A printed number AND the denominator it is printed "of", read off the SAME
+ *  `VenueRows` list in one place. The pair is one value so the two halves cannot
+ *  be sourced separately — which is the whole of 2d — and the brand means a
+ *  `{ count, of }` object assembled anywhere else is TS2322 at the field.
+ *
+ *  Phantom, like `VenueRate`: it survives `JSON.stringify` as `{count, of}`, so
+ *  the screen reads the same two numbers the sheets print. */
+export type VenueTile = {
+  readonly count: number;
+  readonly of: number;
+} & { readonly [VENUE_SCOPE]: true };
 
 /** The filters as sentences. Written into EVERY export - a spreadsheet that
  *  does not say it is one floor on one night is a spreadsheet that will be
@@ -1143,9 +1207,17 @@ export interface AnalyticsPayload {
      *  tile: dividing a narrowed count by the venue total printed shares that
      *  did not add to 100 %. */
     negative_item_feedbacks: number;
-    /** Distinct items SOLD in the room. Stays venue even when the rows narrow,
-     *  because "of N items sold" is a fact about the kitchen, not the recorder. */
-    items_sold: number;
+    /** 🔒 THE ONE VENUE TILE IN THIS BLOCK, AND BOTH ITS HALVES (2d).
+     *  `count` = dishes the room commented on, `of` = distinct dishes the kitchen
+     *  sold. BOTH are the venue's, in EVERY filter state, because a GRE does not
+     *  sell plates — so neither half has a person-scoped version to have.
+     *
+     *  It replaced a bare `items_sold: number`. That field was the ingredient of
+     *  the 2d defect: the tile's `value` was recomputed inline off the narrowed
+     *  `menu_items` while its `sub` read this venue number, and the pair moved
+     *  6 → 0 under a name. A pair that travels as ONE value cannot do that, and
+     *  there is no loose denominator left for a new inline numerator to find. */
+    items_with_feedback: VenueTile;
     /** One sentence naming the scope, for the screen and every sheet. '' when
      *  scope is 'venue'. */
     note: string;
@@ -1516,10 +1588,17 @@ export function analytics(
   //
   // `rrRates` goes to BOTH calls unchanged: it is the venue's rate either way,
   // which is the whole of the 2c fix.
-  const menuItems = buildMenuItems(recordItems, recordFollowUps, soldByKey, groupWanted, itemWanted, !personName, rrRates);
-  const venueMenuItems = personName
-    ? buildMenuItems(items, followUps, soldByKey, groupWanted, itemWanted, true, rrRates)
-    : menuItems;
+  //
+  // 2d: the VENUE list is now built FIRST and UNCONDITIONALLY, through
+  // `venueMenuItemRows()`, because the one venue tile on the menu-item report
+  // reads BOTH of its halves off it. With no name picked the record lane is the
+  // venue lane element for element (`recordItems` === `items` there), so the
+  // unfiltered `menu_items` is the same list it always was — a copy of it, so the
+  // branded array is not handed out unbranded for a caller to mutate.
+  const venueMenuItems = venueMenuItemRows(items, followUps, soldByKey, groupWanted, itemWanted, rrRates);
+  const menuItems: MenuItemRow[] = personName
+    ? buildMenuItems(recordItems, recordFollowUps, soldByKey, groupWanted, itemWanted, false, rrRates)
+    : [...venueMenuItems];
 
   const recAct = (a: ActionTaken) => recordItems.filter((x) => x.action_taken === a).length;
   const recNegatives = recordItems.filter((x) => x.is_negative).length;
@@ -1587,7 +1666,8 @@ export function analytics(
       person: personName,
       item_feedbacks: recordItems.length,
       negative_item_feedbacks: recNegatives,
-      items_sold: venueMenuItems.length,
+      // Both halves, from the venue list, in one call (2d).
+      items_with_feedback: venueItemsWithFeedback(venueMenuItems),
       note: recordScopeNote,
     },
     menu_items: menuItems,
@@ -1930,11 +2010,50 @@ function venueReturnRemakeRates(
 }
 
 /**
+ * THE VENUE MENU-ITEM LIST — the only producer of `VenueRows<MenuItemRow>` (2d).
+ *
+ * Every dish in scope, including the ones nobody mentioned, built from the VENUE
+ * feedback rows with `seedUnmentioned` on. Its parameters are branded, so the
+ * list it hands back cannot be obtained from the narrowed rows: passing
+ * `recordItems` / `recordFollowUps` here is TS2345, "Property '[VENUE_SCOPE]' is
+ * missing" — the same negative control `venueReturnRemakeRates` already passes.
+ *
+ * It exists so that `venueItemsWithFeedback()` below can demand a branded list
+ * rather than trusting a call site to hand it the right one.
+ */
+function venueMenuItemRows(
+  items: VenueRows<ItemFeedbackRow>,
+  followUps: VenueRows<FollowUpRow>,
+  soldByKey: Map<string, { name: string; sold: number }>,
+  groupWanted: string,
+  itemWanted: string,
+  rr: VenueRrRates,
+): VenueRows<MenuItemRow> {
+  return asVenue(buildMenuItems(items, followUps, soldByKey, groupWanted, itemWanted, true, rr));
+}
+
+/**
+ * THE "N OF M" TILE, BOTH HALVES, FROM ONE LIST (2d). Read 2d first.
+ *
+ * `count` and `of` are read off the SAME `VenueRows<MenuItemRow>` in the same
+ * expression, so there is no second source for either half to drift to, and the
+ * only way to obtain that list is `venueMenuItemRows()` above. Handing this the
+ * record lane's `menu_items` is TS2345 before it is ever a wrong number.
+ */
+function venueItemsWithFeedback(rows: VenueRows<MenuItemRow>): VenueTile {
+  return {
+    count: rows.filter((m) => m.feedbacks > 0).length,
+    of: rows.length,
+  } as VenueTile;
+}
+
+/**
  * The menu-item table. RECORD-LEVEL under D11(a): `analytics()` calls it once
- * with the person-narrowed rows for what the page draws, and once with the venue
- * rows for the Menu item dropdown. It takes plain arrays deliberately — it is
- * the one function both lanes share, so branding its parameters would force a
- * cast at each call and prove nothing.
+ * with the person-narrowed rows for what the page draws, and once (through
+ * `venueMenuItemRows` above) with the venue rows for the Menu item dropdown and
+ * the one venue tile. It takes plain arrays deliberately — it is the one
+ * function both lanes share, so branding its parameters would force a cast at
+ * each call and prove nothing.
  *
  * `seedUnmentioned` is the scope switch: see the call site.
  *
@@ -2762,11 +2881,15 @@ export function buildReport(p: AnalyticsPayload, key: ReportKeyName): ReportDoc 
         ...base, key, slug: 'menu-item', title: 'Menu Item Feedback Report',
         subtitle: 'Every item ordered in the period, with the rates beside the counts.',
         kpis: [
-          // `records.items_sold` is the VENUE count of dishes sold, not
-          // `p.menu_items.length`: under a person filter the table lists only the
-          // dishes THEY commented on, so "of 3 items sold" would have replaced the
-          // kitchen's real 45 with the length of a narrowed list.
-          { label: 'Items with feedback', value: n0(p.menu_items.filter((m) => m.feedbacks > 0).length), sub: `of ${n0(p.records.items_sold)} items sold` },
+          // 🔒 BOTH HALVES OUT OF ONE VENUE VALUE (2d). This tile used to compute
+          // its `value` inline off `p.menu_items` — the RECORD lane — while its
+          // `sub` read the venue's `items_sold`, so it printed "6 of 6" / "5 of 6"
+          // / "0 of 6" depending on whose name was picked, four rows under
+          // `filterLines`' promise that the Summary tiles do not move. Both
+          // numbers now come from `records.items_with_feedback`, which is read off
+          // the venue list once. Do NOT recompute either half here: the inline
+          // expression is what shipped the defect, and `p.menu_items` is narrowed.
+          { label: 'Items with feedback', value: n0(p.records.items_with_feedback.count), sub: `of ${n0(p.records.items_with_feedback.of)} items sold` },
           { label: 'Plates sold', value: qtyText(s.plates_sold) },
           // NEGATIVE TILE 1: venue, always. `records.negative_item_feedbacks` is
           // the record-scoped twin and is used only as a rate denominator below.

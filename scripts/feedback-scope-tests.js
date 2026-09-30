@@ -45,14 +45,23 @@
  *   C  ALL EIGHT DOWNLOADS - every venue sheet's ROWS and COLUMNS byte-identical
  *      filtered vs unfiltered; the person sheet present in all eight; and both
  *      scope sentences written into the file.
- *   D  BOTH SIDES OF A RATE COUNT THE SAME POPULATION - "Share of negatives"
- *      adds to 100%, and the menu-item KPI keeps the VENUE "items sold"
- *      denominator.
+ *   D  BOTH SIDES OF EVERY RATE AND EVERY value/sub PAIR - each side read out of
+ *      the PRINTED string. "Share of negatives" cell by cell against the record
+ *      denominator (and proof that the venue one would print differently), the
+ *      menu-item tile's VALUE and SUB both venue and both hand-computed, and
+ *      every other "N of M" tile checked against its own two printed numbers.
+ *      ⚠️ THIS GATE ONCE ASSERTED ONE SIDE OF THE RATIO IT IS NAMED AFTER and so
+ *      reported green while the menu-item tile printed 6/5/3/0 across the four
+ *      filter states in this very file. See the comment above gate D.
  *   E  THE RETURN / REMAKE RATE IS VENUE OVER VENUE - the regression this suite
  *      was written for. Hand-computed per dish, asserted identical across every
  *      filter state, and asserted at the printed cell in all three places the
  *      module prints it. Plus the structural half: the row carries no
- *      per-person quantity field for a future edit to divide by `sold`.
+ *      per-person quantity field for a future edit to divide by `sold`. E5
+ *      widens the printed-cell invariance from those three table cells to EVERY
+ *      TILE OF ALL EIGHT REPORTS - label, value and sub - because the fourth
+ *      site of this shape was a tile, not a cell, and the narrower sweep missed
+ *      it. One tile is deliberately person-aware; it is named and asserted.
  *   F  THE MIXED ROW SAYS SO - under a person filter the two venue columns are
  *      marked and the mark is defined, on the sheet and in the payload the
  *      screen reads; unfiltered there is no mark, because there is no second
@@ -255,17 +264,129 @@ function runWorld(which) {
   }
 
   /* ── D. BOTH SIDES OF A RATE, SAME POPULATION ───────────────────────────── */
-  section(`World ${which} - D. a rate's two sides count the same population`);
+  /* 🐞 WHAT THIS GATE USED TO DO, AND WHY IT REPORTED GREEN ON A BROKEN TILE.
+     It was headed "BOTH SIDES OF A RATE, SAME POPULATION" and then asserted
+     exactly ONE side. Its whole menu-item check was:
+
+         eq(`${tag}: menu-item KPI keeps the VENUE "items sold" denominator`,
+            mi.kpis[0].sub, `of ${all.records.items_sold} items sold`);
+
+     `sub` is the DENOMINATOR. The NUMERATOR - `kpis[0].value` - was computed
+     inline off the RECORD lane (`p.menu_items.filter(m => m.feedbacks > 0)`),
+     and nothing in this file ever looked at it. So the tile printed
+
+         no filter  "6 of 6"   Probe "5 of 6"   Steady "3 of 6"   Silent "0 of 6"
+
+     across the four filter states THIS SUITE ALREADY RAN, while this gate said
+     ok. A gate that checks one side of a ratio it is named after is worse than
+     no gate: it is the thing that let 2d ship. Every assertion below reads BOTH
+     halves of the pair, out of the PRINTED strings, in every filter state. */
+  section(`World ${which} - D. BOTH sides of every rate and every value/sub pair`);
+
+  /** The printed numbers, parsed the way a reader reads them. The comma strip is
+   *  deliberate: `n0` prints none today, but a thousands separator added later
+   *  must not turn a real assertion into NaN-compared-to-NaN. */
+  const num = (v) => Number(String(v).replace(/,/g, '').trim());
+  /** `pctText(rate(n, d))` re-implemented from the fixture side, so the expected
+   *  string is not read back off the code under test. */
+  const pct = (n, d) => (!(d > 0) ? '-' : `${(Math.round((n / d) * 1000) / 10).toFixed(1)}%`);
+
+  /** Every TILE that prints a count beside a denominator it is "of". `n` is the
+   *  capture group holding the numerator when the sub carries both numbers;
+   *  `valueIsRate` means the tile's own value is the rate of the sub's two
+   *  numbers; `rateLabel` names a second tile on the same report that must agree
+   *  with this pair. Both captures are read out of the PRINTED sub. */
+  const PAIR_TILES = [
+    { key: 'menu-item', label: 'Items with feedback', sub: /^of (\d+) items sold$/, of: 1 },
+    { key: 'negative', label: 'Negative item feedbacks', sub: /^of (\d+) item feedbacks$/, of: 1, rateLabel: 'Negative rate' },
+    { key: 'daily', label: 'Negative item feedbacks', sub: /^of (\d+) item feedbacks$/, of: 1 },
+    { key: 'daily', label: 'Coverage', sub: /^(\d+) of (\d+) eligible tables covered$/, n: 1, of: 2, valueIsRate: true },
+    { key: 'gre-performance', label: 'Venue coverage', sub: /^(\d+) of (\d+) eligible tables$/, n: 1, of: 2, valueIsRate: true },
+  ];
+
+  /* D1. HAND-COMPUTED, from the fixture, for the tile 2d was measured on. Six
+         dishes are sold in both worlds (12 plates each, by construction).
+         World A: every one of the six drew a comment from somebody - Mutton
+         Biryani (v1 subject, v6 Steady), Butter Naan (v1), Gulab Jamun (v2, v8
+         Mgr), Paneer Tikka (v3, v5 Steady), Filter Coffee (v4), Old Monk (v5).
+         World B: the subject records nothing at item level, so only Steady's
+         Paneer Tikka + Old Monk + Mutton Biryani and the Manager's Gulab Jamun
+         remain - FOUR. Neither number is a property of any recorder, which is
+         the point: it is the same in every filter state below. */
+  const EXPECT_ITEMS_WITH_FEEDBACK = which === 'A' ? 6 : 4;
+
+  // The ingredient is gone, the 2c way: a bare venue denominator sitting loose
+  // in the payload is what the old inline `sub` paired a narrowed numerator
+  // with. Asserted at runtime, because a field can be added back by anyone who
+  // has not read the comment saying not to.
+  eq('records carries no bare items_sold for a new inline sub to pair with',
+    'items_sold' in all.records, false);
+  // `|| {}` for the same reason the `String()`s in gate F exist: run against a
+  // tree where the field does not exist yet (399e4cc), this must be a NAMED
+  // failure, not a TypeError that aborts before gates E-G are reached.
+  eq('records.items_with_feedback carries BOTH halves as one value',
+    Object.keys(all.records.items_with_feedback || {}).sort(), ['count', 'of']);
+
   for (const [tag, qs] of FILTER_STATES) {
     const p = payload(ro, qs);
+
+    /* D2. "Share of negatives" - BOTH SIDES, cell by cell, not just the sum.
+           The sum alone passes if numerator and denominator are BOTH wrong by
+           the same factor, so each cell is recomputed from the record lane. */
     const t = report(p, 'negative').tables.find((x) => x.name === 'Most common problems');
+    eq(`${tag}: every "Count" cell is the RECORD lane's own count (the numerator)`,
+      t.rows.map((r) => [String(r[0]), num(r[1])]),
+      p.common_problems.map((x) => [x.label, x.count]));
+    const wantShare = p.common_problems.map((x) => pct(x.count, p.records.negative_item_feedbacks));
+    eq(`${tag}: every "Share of negatives" cell divides by the RECORD denominator`,
+      t.rows.map((r) => String(r[2])), wantShare);
+    // ...and the line above HAS TEETH: wherever the two denominators differ, the
+    // venue one would print different cells, so a swap could not pass it.
+    if (p.records.negative_item_feedbacks !== p.summary.negative_item_feedbacks && t.rows.length) {
+      const venueShare = p.common_problems.map((x) => pct(x.count, p.summary.negative_item_feedbacks));
+      truthy(`${tag}: the VENUE denominator would print different cells (this assertion has teeth)`,
+        JSON.stringify(venueShare) !== JSON.stringify(wantShare),
+        `record=${JSON.stringify(wantShare)} venue=${JSON.stringify(venueShare)}`);
+    }
     const shares = t.rows.map((r) => parseFloat(String(r[2])));
     const sum = shares.reduce((a, b) => a + (Number.isFinite(b) ? b : 0), 0);
     truthy(`${tag}: "Share of negatives" adds to 100% (got ${sum.toFixed(1)}%, ${t.rows.length} rows)`,
       t.rows.length === 0 || Math.abs(sum - 100) < 0.5);
+
+    /* D3. THE MENU-ITEM TILE - VALUE AND SUB, numerator AND denominator. */
     const mi = report(p, 'menu-item');
-    eq(`${tag}: menu-item KPI keeps the VENUE "items sold" denominator`,
-      mi.kpis[0].sub, `of ${all.records.items_sold} items sold`);
+    eq(`${tag}: menu-item tile prints BOTH halves venue-over-venue`,
+      [mi.kpis[0].label, mi.kpis[0].value, mi.kpis[0].sub],
+      ['Items with feedback', String(EXPECT_ITEMS_WITH_FEEDBACK), `of ${fixture.DISHES.length} items sold`]);
+    eq(`${tag}: menu-item tile is identical to the unfiltered tile`,
+      [mi.kpis[0].value, mi.kpis[0].sub],
+      [report(all, 'menu-item').kpis[0].value, report(all, 'menu-item').kpis[0].sub]);
+
+    /* D4. EVERY OTHER value/sub PAIR THE MODULE PRINTS, both halves, from the
+           printed strings - so a pair whose two sides drift apart fails here
+           even if nobody thinks to write a test for that particular tile. */
+    for (const spec of PAIR_TILES) {
+      const doc = report(p, spec.key);
+      const k = doc.kpis.find((x) => x.label === spec.label);
+      if (!k) { bad(`${tag}: ${spec.key} prints the "${spec.label}" tile`); continue; }
+      const m = String(k.sub == null ? '' : k.sub).match(spec.sub);
+      // A REWORDED sub must fail loudly, never silently skip the pair.
+      if (!m) { bad(`${tag}: ${spec.key}/"${spec.label}" sub still has its two numbers`, String(k.sub)); continue; }
+      const of = num(m[spec.of]);
+      const n = spec.n ? num(m[spec.n]) : num(k.value);
+      if (spec.valueIsRate) {
+        eq(`${tag}: ${spec.key}/"${spec.label}" value is the rate of its OWN sub's two numbers`,
+          String(k.value), pct(n, of));
+      } else {
+        truthy(`${tag}: ${spec.key}/"${spec.label}" numerator ${n} cannot exceed its own denominator ${of}`,
+          n <= of, `${k.value} / ${k.sub}`);
+      }
+      if (spec.rateLabel) {
+        const r2 = doc.kpis.find((x) => x.label === spec.rateLabel);
+        eq(`${tag}: ${spec.key}/"${spec.rateLabel}" agrees with the PRINTED pair above it`,
+          String(r2 && r2.value), pct(n, of));
+      }
+    }
   }
 
   /* ── E. THE RETURN / REMAKE RATE IS VENUE OVER VENUE ────────────────────── */
@@ -356,6 +477,72 @@ function runWorld(which) {
       [pt.sold, pt.return_remake_pct], [fixture.PLATES_PER_DISH, 16.7]);
   }
 
+  /* E5. THE RESIDUAL 399e4cc COULD NOT CLOSE, WIDENED TO THE SHAPE THAT ESCAPED.
+        Its own note: `rate()` takes plain numbers, so a brand-new inline rate
+        mixing a record count with venue sold would still compile, and branding
+        `sold` would not help because a branded number is assignable to number.
+        Its answer was "assert the PRINTED cell is filter-invariant however
+        computed" - and that was right, but E1-E4 above only ever look at a
+        single rate CELL inside three named TABLES. The fourth site was not a
+        cell: it was a TILE, a value/sub PAIR on the Summary block, and it walked
+        straight past every assertion here.
+
+        So the invariance is asserted over EVERY TILE OF ALL EIGHT REPORTS -
+        label, value AND sub - which is where every "N of M" the module prints
+        lives. A new tile pairing a narrowed numerator with a venue denominator
+        fails here on the day it is written, whatever it is computed from and
+        whether or not anyone adds it to PAIR_TILES above.
+
+        This is also the assertion that makes the FILE STOP CONTRADICTING
+        ITSELF. `reports/route.ts` writes `doc.filters` and then `doc.kpis` onto
+        one 'Report' sheet, four rows apart: the cover promises "the Summary
+        tiles ... do not move when a name is picked" and the tiles are four rows
+        below it. That promise is now proved, on the same sheet that makes it.
+
+        ONE tile is deliberately person-aware and it is NAMED, never skipped:
+        "Follow-ups open now (all dates)" is the venue's live queue, so its VALUE
+        must still not move while its SUB says out loud that the number is not
+        this person's. Anything else that moves is a defect. */
+  section(`World ${which} - E5. every printed TILE is filter-invariant (2d: the value/sub pair)`);
+  {
+    const PERSON_AWARE = 'Follow-ups open now (all dates)';
+    const tilesOf = (doc) => doc.kpis.map((k) => [String(k.label), String(k.value), String(k.sub == null ? '' : k.sub)]);
+    for (const [tag, qs] of personStates) {
+      const p = payload(ro, qs);
+      const moved = [];
+      for (const key of R.REPORT_KEYS) {
+        const f = tilesOf(report(p, key));
+        const v = tilesOf(report(all, key));
+        if (f.length !== v.length) { moved.push(`${key}: tile COUNT ${v.length} -> ${f.length}`); continue; }
+        f.forEach(([label, value, sub], i) => {
+          const [l0, v0, s0] = v[i];
+          if (label !== l0) moved.push(`${key}/#${i}: label "${l0}" -> "${label}"`);
+          if (value !== v0) moved.push(`${key}/"${label}": VALUE ${v0} -> ${value}`);
+          if (sub !== s0 && label !== PERSON_AWARE) moved.push(`${key}/"${label}": SUB "${s0}" -> "${sub}"`);
+        });
+      }
+      truthy(`${tag}: every tile on all 8 reports is filter-invariant - label, VALUE and SUB`,
+        moved.length === 0, JSON.stringify(moved));
+
+      // The one allowance, ASSERTED rather than skipped.
+      const k = report(p, 'daily').kpis.find((x) => x.label === PERSON_AWARE);
+      truthy(`${tag}: the one person-aware sub says the number is NOT this person's`,
+        !!k && /NOT this person/.test(String(k.sub)), String(k && k.sub));
+      eq(`${tag}: ...and that tile's VALUE is still the venue's`,
+        String(k && k.value),
+        String(report(all, 'daily').kpis.find((x) => x.label === PERSON_AWARE).value));
+
+      // The promise the invariance above discharges, on the same sheet.
+      for (const key of R.REPORT_KEYS) {
+        const line = report(p, key).filters.find((l) => l.includes('did NOT narrow'));
+        if (!String(line || '').includes('the Summary tiles')) {
+          bad(`${tag}: ${key} cover claims the Summary tiles do not move`, String(line || '').slice(0, 120));
+        }
+      }
+      ok(`${tag}: all 8 covers claim it, and the sweep above proves it`);
+    }
+  }
+
   /* ── F. THE MIXED ROW SAYS SO ───────────────────────────────────────────── */
   section(`World ${which} - F. the two venue columns inside a record row are marked and defined`);
   for (const site of RR_CELL_SITES) {
@@ -437,7 +624,10 @@ function runWorld(which) {
   const s = all.summary;
   eq('eligible tables', s.eligible_tables, fixture.TABLES);
   eq('plates sold', s.plates_sold, fixture.PLATES_SOLD);
-  eq('distinct items sold', all.records.items_sold, fixture.DISHES.length);
+  // `|| {}`: see gate D. A missing field must FAIL here, not throw here.
+  const iwf = all.records.items_with_feedback || {};
+  eq('distinct items sold', iwf.of, fixture.DISHES.length);
+  eq('distinct items the VENUE commented on', iwf.count, which === 'A' ? 6 : 4);
   if (which === 'A') {
     // 8 visits: poor, average, average, good (subject) + poor, good, excellent
     // (Steady) + average (Manager).
