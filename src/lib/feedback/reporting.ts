@@ -524,6 +524,11 @@ export function filtersFromQuery(sp: URLSearchParams): AnalyticsFilters {
    and it protected by never narrowing anything at all — which also left the
    half of the ruling that SHOULD narrow unbuilt. Now both halves exist and
    neither can leak into the other.
+
+   ⚠️ THE BRANDS COVER FUNCTION BOUNDARIES. They do NOT, on their own, cover a
+   fresh expression written inline over a row's own fields — and that is exactly
+   where the next defect landed. Read 2c: a RATE can mix the two scopes without
+   either lane ever being handed to the wrong function.
    ──────────────────────────────────────────────────────────────────────────── */
 
 /**
@@ -562,6 +567,55 @@ export type RecordRows<T> = readonly T[] & { readonly [RECORD_SCOPE]: true };
 const asVenue = <T,>(rows: readonly T[]): VenueRows<T> => rows as VenueRows<T>;
 const asRecord = <T,>(rows: readonly T[]): RecordRows<T> => rows as RecordRows<T>;
 
+/* ─── 2c. THE THIRD SHAPE THE BRAND HAS TO COVER: A RATE ─────────────────────
+   D11(a) branded the row ARRAYS, which stopped a narrowed array being handed to
+   a venue aggregate — and that guard is real (negative control: TS2345). It did
+   NOT stop the other half of the same mistake: a rate whose NUMERATOR is read
+   off a narrowed row while its DENOMINATOR is a venue cell on the same row.
+
+   That is exactly what shipped. `MenuItemRow` carried `returned_qty` /
+   `remade_qty` (narrowed under a person filter, because `buildMenuItems` is fed
+   the record rows) next to `sold` (always the venue's plates), and three call
+   sites wrote `rate(m.returned_qty + m.remade_qty, m.sold)`. One dish printed
+   three different Return / Remake Rates depending on whose name was picked —
+   measured on a fixture where Steady Gre returned 2 plates of Paneer Tikka, the
+   venue sold 12, and Probe Gre had merely cancelled one:
+
+       no filter        16.7%   (2 venue / 12 venue)   correct
+       &gre=Probe Gre    0.0%   (0 HERS  / 12 venue)   two populations
+       &gre=Steady Gre  16.7%
+
+   Return / Remake Rate is a VENUE statistic: a GRE does not sell plates, so
+   neither side of the ratio is hers, and a narrowed numerator can only ever
+   UNDER-report the dish. So the rate is computed ONCE, from the venue rows, and
+   travels on the row as a finished number:
+
+     · `returned_qty` / `remade_qty` are GONE from `MenuItemRow`. They existed
+       only to feed this rate, so removing them removes the ingredients: an edit
+       that tries the old expression now fails with TS2339 rather than printing
+       a wrong percentage.
+     · `VenueRate` is a branded number. `return_remake_pct` is typed as one, so
+       assigning a plain `rate(...)` computed anywhere else raises TS2322 even if
+       someone re-adds per-person quantities to the row.
+     · `venueReturnRemakeRates()` is the only constructor, and it takes
+       `VenueRows<ItemFeedbackRow>`. Handing it the record rows is TS2345, the
+       same negative control the row brands already pass.
+
+   Neg % is NOT this bug and is deliberately untouched: `rate(m.negative,
+   m.feedbacks)` narrows on BOTH sides, so it is one population either way.
+   ──────────────────────────────────────────────────────────────────────────── */
+
+/** A percentage whose numerator AND denominator both came from `VenueRows`.
+ *  `null` keeps the "no denominator" answer distinct from 0% — see `rate()`.
+ *  The brand is phantom: it survives `JSON.stringify` as a plain number, so the
+ *  screen reads the same field the sheets do. */
+export type VenueRate = (number & { readonly [VENUE_SCOPE]: true }) | null;
+
+/** The venue's Return / Remake Rate for every dish in scope, keyed by
+ *  `item_key`. Built once by `venueReturnRemakeRates()` and stamped onto every
+ *  menu-item row in BOTH lanes, so the record lane cannot compute its own. */
+export type VenueRrRates = ReadonlyMap<string, VenueRate>;
+
 /** The filters as sentences. Written into EVERY export - a spreadsheet that
  *  does not say it is one floor on one night is a spreadsheet that will be
  *  read as the whole venue for the month.
@@ -588,7 +642,10 @@ export function filterLines(r: ResolvedRange, f: AnalyticsFilters): string[] {
       `What the ${isAll(f.gre) ? 'Manager' : 'GRE'} filter NARROWED to ${person}: the "What ${person} `
       + 'did" sheet, the menu-item sheets (Menu item analysis, Most complained, Most appreciated, '
       + 'Most common problems, By item) and the Service recovery sheet. Those list what THIS PERSON '
-      + 'wrote down.',
+      + 'wrote down - EXCEPT the two columns marked * on Menu item analysis and By item. Sold* and '
+      + 'R/R %* are the VENUE\'S figures for that dish, because nobody records a plate being sold and '
+      + 'a return rate is not a measure of whoever wrote the complaint down. The rest of each row is '
+      + 'this person\'s.',
     );
     out.push(
       `What the ${isAll(f.gre) ? 'Manager' : 'GRE'} filter did NOT narrow: the Summary tiles, the `
@@ -830,7 +887,13 @@ export interface MenuItemRow {
   menu_item: string;
   menu_item_id: string;
   group: ItemGroup;
-  /** Plates sold in scope - SUM(order_items.quantity), not a row count. */
+  /** Plates sold in scope - SUM(order_items.quantity), not a row count.
+   *
+   *  ⚠️ ALWAYS THE VENUE'S, in both lanes. A GRE does not sell plates, so there
+   *  is no person-scoped version of this number to have. Under a person filter
+   *  this cell and `return_remake_pct` are the only two venue cells in a row
+   *  whose others are her records, and both the sheet columns and the table note
+   *  say so — see the `Sold*` / `R/R %*` headings in `buildReport`. */
   sold: number;
   feedbacks: number;
   negative: number;
@@ -838,9 +901,16 @@ export interface MenuItemRow {
   remade: number;
   replaced: number;
   cancelled: number;
-  /** Plates, not rows - the Return/Remake numerator. See section 3. */
-  returned_qty: number;
-  remade_qty: number;
+  /** THE VENUE'S Return / Remake Rate for this dish: (plates returned + plates
+   *  remade) / plates sold, both sides counted over every recorder in scope.
+   *
+   *  Branded, and computed only by `venueReturnRemakeRates()` from
+   *  `VenueRows<ItemFeedbackRow>`. This replaces the `returned_qty` /
+   *  `remade_qty` pair that used to sit here: those were narrowed by the person
+   *  filter while `sold` was not, so the three call sites that divided one by
+   *  the other printed a person-over-venue ratio under a venue-over-venue
+   *  sentence. Read 2c before adding a quantity column back. */
+  return_remake_pct: VenueRate;
   happy_after: number;
   still_unhappy: number;
   good: number;
@@ -1118,6 +1188,13 @@ export interface AnalyticsPayload {
     recovery_is_a_queue: string;
     negative_pct_basis: string;
     return_remake_basis: string;
+    /** The `Sold*` / `R/R %*` sentence (2c), or '' when no name is picked and
+     *  there is no second scope in the row to distinguish. The SCREEN cannot
+     *  import a constant out of this file — it is a client component and this
+     *  module pulls in better-sqlite3 — so the sentence travels in the payload,
+     *  which is also what keeps the screen and all eight downloads saying the
+     *  same words. Its truthiness is the single switch for the `*` marks. */
+    venue_columns_basis: string;
     generated_at: string;
     /** The sentence section 6 is about, printed on screen and into every
      *  export: which layer of the scope each number on the page belongs to. */
@@ -1141,9 +1218,28 @@ export const NEGATIVE_PCT_BASIS =
   'Negative % = negative feedbacks / feedbacks received for that item. Both sides count feedback '
   + 'rows, so a dish nobody was asked about cannot look good and a popular dish cannot look bad.';
 
+/* The sentence and the number it sits beside MUST agree about the population.
+   This one said "both sides are quantities" of "plates SOLD" — a venue-over-
+   venue sentence — while the cell next to it divided ONE RECORDER's plates by
+   the venue's. It now names the scope out loud, so a manager reading a GRE's
+   e-mailed workbook cannot read the dish's rate as that GRE's rate. See 2c. */
 export const RETURN_REMAKE_BASIS =
   'Return / Remake Rate = plates returned + remade / plates SOLD. Both sides are quantities: the '
-  + 'numerator sums gf_item_feedback.quantity, so one feedback on a line of three counts three.';
+  + 'numerator sums gf_item_feedback.quantity, so one feedback on a line of three counts three. '
+  + 'BOTH SIDES ARE THE WHOLE VENUE, always: every recorder on the selected floor, section, captain '
+  + 'and period. It is a fact about the DISH and never a measure of whoever wrote the feedback down, '
+  + 'so it does not change when a GRE or Manager name is picked.';
+
+/** Attached to the menu-item sheets ONLY under a person filter, where the table
+ *  genuinely mixes two scopes row by row. The `*` it defines is put on those two
+ *  headings in the same case: the headings are width-measured against the PDF
+ *  renderer's own font (see the `menuTable` note), and 'Sold (venue)' / 'R/R %
+ *  (venue)' do not fit the measured columns, whereas one asterisk does. */
+export const VENUE_COLUMNS_IN_RECORD_TABLE =
+  'THE TWO COLUMNS MARKED * ARE THE VENUE\'S, NOT THIS PERSON\'S. Sold* is every plate the venue '
+  + 'sold of that dish and R/R %* is the venue\'s return / remake rate for it; every other cell in '
+  + 'the row counts only what this person recorded. The two are kept side by side deliberately - a '
+  + 'rate with no denominator beside it cannot be checked - but neither is a figure about them.';
 
 /** Percentage, or null when the denominator is zero - never NaN, never a 0%
  *  that reads as "we covered nothing" when the truth is "there was nothing". */
@@ -1388,6 +1484,12 @@ export function analytics(
     platesSold += q;
   }
 
+  // 🔒 THE RETURN / REMAKE RATE, ONCE, FROM THE ROOM (2c). Built here, from the
+  // VENUE rows and the venue's plates, and handed to BOTH lanes below — so the
+  // cell is the same percentage whether or not a name is picked, and there are
+  // no per-person quantities left on a row for a later edit to divide by `sold`.
+  const rrRates = venueReturnRemakeRates(items, soldByKey);
+
   /* -- aggregates ------------------------------------------------------ */
   // 🔒 THE VENUE AGGREGATES NO LONGER LIVE HERE. The rating split, the four
   // red/amber negative tiles, the coverage denominators and the daily rows are
@@ -1411,9 +1513,12 @@ export function analytics(
   // record nor a fact about the dish — it is 45 rows of fabricated silence that
   // make a narrowed table look like an unnarrowed one, which is exactly the
   // "recorded nothing, therefore looks clean" reading the owner ruled against.
-  const menuItems = buildMenuItems(recordItems, recordFollowUps, soldByKey, groupWanted, itemWanted, !personName);
+  //
+  // `rrRates` goes to BOTH calls unchanged: it is the venue's rate either way,
+  // which is the whole of the 2c fix.
+  const menuItems = buildMenuItems(recordItems, recordFollowUps, soldByKey, groupWanted, itemWanted, !personName, rrRates);
   const venueMenuItems = personName
-    ? buildMenuItems(items, followUps, soldByKey, groupWanted, itemWanted, true)
+    ? buildMenuItems(items, followUps, soldByKey, groupWanted, itemWanted, true, rrRates)
     : menuItems;
 
   const recAct = (a: ActionTaken) => recordItems.filter((x) => x.action_taken === a).length;
@@ -1541,6 +1646,9 @@ export function analytics(
       recovery_is_a_queue: RECOVERY_IS_A_QUEUE,
       negative_pct_basis: NEGATIVE_PCT_BASIS,
       return_remake_basis: RETURN_REMAKE_BASIS,
+      // '' with no name picked: the menu table is then the venue's throughout,
+      // there is no second scope in the row, and the screen draws no `*`. See 2c.
+      venue_columns_basis: personName ? VENUE_COLUMNS_IN_RECORD_TABLE : '',
       generated_at: new Date().toISOString(),
       counts_scope: personName ? COUNTS_SCOPE_PERSON : COUNTS_SCOPE_ROOM,
       person_filter_active: !!personName,
@@ -1789,6 +1897,39 @@ function countOpenFollowUpsNow(db: Database.Database): number {
 }
 
 /**
+ * THE RETURN / REMAKE RATE, BUILT FROM THE ROOM. Read 2c first.
+ *
+ * The ONLY constructor of a `VenueRate`, and it takes `VenueRows` — so the rate
+ * cannot be built from the narrowed rows by any edit that still compiles.
+ * Negative control (run, not assumed): passing `recordItems` here fails with
+ * TS2345, "Property '[VENUE_SCOPE]' is missing".
+ *
+ * Both sides are the venue's. The numerator comes from `items`, which the Food /
+ * Drinks and Menu Item filters DO narrow — those are properties of the dish, not
+ * of a recorder — and the denominator is that dish's plates over every order in
+ * scope. Keyed by `item_key` so the record lane can look its rows up without
+ * holding any quantities of its own.
+ */
+function venueReturnRemakeRates(
+  items: VenueRows<ItemFeedbackRow>,
+  soldByKey: ReadonlyMap<string, { name: string; sold: number }>,
+): VenueRrRates {
+  const qty = new Map<string, number>();
+  for (const x of items) {
+    if (!x.item_key) continue;
+    if (x.action_taken !== 'returned' && x.action_taken !== 'remade') continue;
+    qty.set(x.item_key, (qty.get(x.item_key) ?? 0) + x.quantity);
+  }
+  const out = new Map<string, VenueRate>();
+  for (const key of new Set<string>([...qty.keys(), ...soldByKey.keys()])) {
+    // `rate()` already answers null on a zero denominator, which is the honest
+    // "this dish was never sold in scope" rather than a 0% that reads as clean.
+    out.set(key, rate(qty.get(key) ?? 0, soldByKey.get(key)?.sold ?? 0) as VenueRate);
+  }
+  return out;
+}
+
+/**
  * The menu-item table. RECORD-LEVEL under D11(a): `analytics()` calls it once
  * with the person-narrowed rows for what the page draws, and once with the venue
  * rows for the Menu item dropdown. It takes plain arrays deliberately — it is
@@ -1796,6 +1937,11 @@ function countOpenFollowUpsNow(db: Database.Database): number {
  * cast at each call and prove nothing.
  *
  * `seedUnmentioned` is the scope switch: see the call site.
+ *
+ * `rr` is the venue's Return / Remake Rate per dish, ALREADY COMPUTED (2c). This
+ * function no longer accumulates returned/remade quantities at all, because in
+ * the record lane its `items` are one person's and that rate is the venue's.
+ * Both lanes get the same map, so the cell does not move when a name is picked.
  */
 function buildMenuItems(
   items: readonly ItemFeedbackRow[],
@@ -1804,6 +1950,7 @@ function buildMenuItems(
   groupWanted: string,
   itemWanted: string,
   seedUnmentioned: boolean,
+  rr: VenueRrRates,
 ): MenuItemRow[] {
   const by = new Map<string, MenuItemRow>();
 
@@ -1814,7 +1961,9 @@ function buildMenuItems(
     group,
     sold: soldByKey.get(key)?.sold ?? 0,
     feedbacks: 0, negative: 0, returned: 0, remade: 0, replaced: 0, cancelled: 0,
-    returned_qty: 0, remade_qty: 0, happy_after: 0, still_unhappy: 0, good: 0, comments: 0,
+    // The venue's rate, looked up — never accumulated here. See 2c.
+    return_remake_pct: rr.get(key) ?? null,
+    happy_after: 0, still_unhappy: 0, good: 0, comments: 0,
   });
 
   for (const x of items) {
@@ -1829,8 +1978,11 @@ function buildMenuItems(
     if (x.is_negative) row.negative++;
     if (x.rating === 'good') row.good++;
     if (x.comment) row.comments++;
-    if (x.action_taken === 'returned') { row.returned++; row.returned_qty += x.quantity; }
-    if (x.action_taken === 'remade') { row.remade++; row.remade_qty += x.quantity; }
+    // ⚠️ COUNTS ONLY. These are rows this person wrote, and they are printed as
+    // counts in columns of their own. Do NOT add a quantity accumulator back:
+    // the Return / Remake Rate is the venue's and arrives via `rr` (2c).
+    if (x.action_taken === 'returned') row.returned++;
+    if (x.action_taken === 'remade') row.remade++;
     if (x.action_taken === 'replaced_same' || x.action_taken === 'replaced_other') row.replaced++;
     if (x.action_taken === 'cancelled') row.cancelled++;
   }
@@ -2497,24 +2649,48 @@ export function buildReport(p: AnalyticsPayload, key: ReportKeyName): ReportDoc 
     //       chopping the tail off — so the BOTTLE/GLASS distinction survives —
     //       and guarantees no two distinct items print the same string.
     // Re-measured with both applied: 628 of 628 printed strings distinct.
+    //
+    // 🔒 THE TWO SCOPES INSIDE ONE ROW, MARKED (2c). Under a person filter this
+    // table is HER records — except `Sold` and `R/R %`, which are the venue's and
+    // have no person-scoped version to have. The owner's rule is that a mixed row
+    // must say so, so the two venue headings carry a `*` that
+    // `VENUE_COLUMNS_IN_RECORD_TABLE` defines in the note below.
+    //
+    // THE MARK IS ONLY ADDED UNDER A FILTER, for two reasons. Unfiltered there is
+    // no second scope to distinguish and the download stays byte-identical to
+    // what already ships; and the widths here are MEASURED (see above), so the
+    // headings cannot simply grow. Re-measured on the renderer's own pdfkit
+    // document at Helvetica-Bold 8 with PAD 4: 'Sold*' is 20.45pt of ink into
+    // 38.03pt usable, and 'R/R %*' is 26.22pt into 28.02pt — both fit without
+    // truncation, where 'Sold (venue)' (47.93pt) and 'R/R % (venue)' (53.70pt)
+    // would not, and buying them would have to come out of `Item`, the column the
+    // measurement above was fought for. The `R/R %` cell's own ceiling, '100.0%'
+    // at Helvetica 8, is 27.13pt, so the column still holds both.
     columns: [
       { label: 'Item', width: 135, fitPrint: true },
       { label: 'Group', width: 52 },
-      { label: 'Sold', width: 46, align: 'right' },
+      { label: recordNote ? 'Sold*' : 'Sold', width: 46, align: 'right' },
       { label: 'Feedbacks', width: 50, align: 'right' },
       { label: 'Negative', width: 42, align: 'right' },
       { label: 'Neg %', width: 36, align: 'right' },
       { label: 'Returned', width: 44, align: 'right' },
       { label: 'Remade', width: 40, align: 'right' },
-      { label: 'R/R %', width: 36, align: 'right' },
+      { label: recordNote ? 'R/R %*' : 'R/R %', width: 36, align: 'right' },
       { label: 'Happy', width: 34, align: 'right' },
     ],
+    // Neg % narrows on BOTH sides (her negatives over her feedbacks), so it is
+    // one population and stays inline. R/R % is the venue's on both sides and
+    // arrives PRE-COMPUTED on the row — there is no numerator here to pair with
+    // `m.sold` by mistake any more. Read 2c.
     rows: rows.map((m) => [
       m.menu_item, groupLabel(m), qtyText(m.sold), m.feedbacks, m.negative,
       pctText(rate(m.negative, m.feedbacks)), m.returned, m.remade,
-      pctText(rate(m.returned_qty + m.remade_qty, m.sold)), m.happy_after,
+      pctText(m.return_remake_pct), m.happy_after,
     ]),
-    note: withNote(`${NEGATIVE_PCT_BASIS} ${RETURN_REMAKE_BASIS} ${GROUP_UNKNOWN_BASIS}`, recordNote),
+    note: withNote(
+      `${NEGATIVE_PCT_BASIS} ${RETURN_REMAKE_BASIS} ${GROUP_UNKNOWN_BASIS}`,
+      recordNote ? `${VENUE_COLUMNS_IN_RECORD_TABLE} ${recordNote}` : '',
+    ),
     emptyNote: recordNote
       ? `${p.records.person} recorded no item feedback in this period. The dishes the venue sold are not listed here, because "this person did not mention it" is not a record of anything - the venue's own menu-item sheet is the unfiltered download.`
       : 'No menu items matched these filters.',
@@ -2635,20 +2811,26 @@ export function buildReport(p: AnalyticsPayload, key: ReportKeyName): ReportDoc 
           ...personTables,
           {
             name: 'By item',
+            // Same two venue cells in a record row, same mark, same note (2c).
+            // These widths are WEIGHTS, not points, and both columns have room:
+            // 'Sold*' 20.45pt into 38.38pt usable, 'R/R %*' 26.22pt into 40.95pt.
             columns: [
-              { label: 'Item', width: 2.8, fitPrint: true }, { label: 'Sold', width: 0.9, align: 'right' },
+              { label: 'Item', width: 2.8, fitPrint: true }, { label: recordNote ? 'Sold*' : 'Sold', width: 0.9, align: 'right' },
               { label: 'Returned', width: 1.1, align: 'right' }, { label: 'Remade', width: 1, align: 'right' },
               { label: 'Replaced', width: 1.1, align: 'right' }, { label: 'Cancelled', width: 1.2, align: 'right' },
-              { label: 'R/R %', width: 0.95, align: 'right' }, { label: 'Happy', width: 0.95, align: 'right' },
+              { label: recordNote ? 'R/R %*' : 'R/R %', width: 0.95, align: 'right' }, { label: 'Happy', width: 0.95, align: 'right' },
             ],
             rows: p.menu_items
               .filter((m) => m.returned + m.remade + m.replaced + m.cancelled > 0)
               .sort((a, b) => (b.returned + b.remade) - (a.returned + a.remade))
               .map((m) => [
                 m.menu_item, qtyText(m.sold), m.returned, m.remade, m.replaced, m.cancelled,
-                pctText(rate(m.returned_qty + m.remade_qty, m.sold)), m.happy_after,
+                pctText(m.return_remake_pct), m.happy_after,
               ]),
-            note: withNote(RETURN_REMAKE_BASIS, recordNote),
+            note: withNote(
+              RETURN_REMAKE_BASIS,
+              recordNote ? `${VENUE_COLUMNS_IN_RECORD_TABLE} ${recordNote}` : '',
+            ),
             emptyNote: recordNote
               ? `${p.records.person} recorded nothing returned, remade, replaced or cancelled in this period. The Returned / Remade / Replaced / Cancelled tiles on the Report sheet are the venue's and are unaffected by this filter.`
               : 'Nothing was returned, remade, replaced or cancelled in this period.',

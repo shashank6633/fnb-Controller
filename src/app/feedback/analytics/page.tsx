@@ -617,13 +617,21 @@ export default function FeedbackAnalyticsPage() {
                   <table className="w-full text-[12px]">
                     <thead>
                       <tr className="text-left text-[#8B7355]">
+                        {/* 🔒 THE TWO VENUE CELLS IN A RECORD ROW, MARKED — reporting.ts 2c.
+                            Under a GRE / Manager filter every cell here is that person's
+                            EXCEPT Sold and R/R %, which are the venue's and have no
+                            person-scoped version to have. `meta.venue_columns_basis` is the
+                            server's own sentence and is '' when no name is picked, so it is
+                            the single switch for the marks and for the footnote below — the
+                            screen and all eight downloads mark the same two columns with the
+                            same words. */}
                         <th className="font-extrabold uppercase tracking-wide pb-2 pr-3">Item</th>
-                        <th className="font-extrabold uppercase tracking-wide pb-2 pr-3 text-right">Sold</th>
+                        <th className="font-extrabold uppercase tracking-wide pb-2 pr-3 text-right">{meta.venue_columns_basis ? 'Sold*' : 'Sold'}</th>
                         <th className="font-extrabold uppercase tracking-wide pb-2 pr-3 text-right">Feedbacks</th>
                         <th className="font-extrabold uppercase tracking-wide pb-2 pr-3 text-right">Negative</th>
                         <th className="font-extrabold uppercase tracking-wide pb-2 pr-3 text-right">Neg %</th>
                         <th className="font-extrabold uppercase tracking-wide pb-2 pr-3 text-right">Ret / Rem</th>
-                        <th className="font-extrabold uppercase tracking-wide pb-2 pr-3 text-right">R/R %</th>
+                        <th className="font-extrabold uppercase tracking-wide pb-2 pr-3 text-right">{meta.venue_columns_basis ? 'R/R %*' : 'R/R %'}</th>
                         <th className="font-extrabold uppercase tracking-wide pb-2 text-right">Happy</th>
                       </tr>
                     </thead>
@@ -649,8 +657,14 @@ export default function FeedbackAnalyticsPage() {
                           <td className="py-2 pr-3 text-right tabular-nums">
                             {r.returned} / {r.remade}
                           </td>
+                          {/* THE VENUE'S rate, pre-computed server-side from the venue rows
+                              (reporting.ts 2c). It used to be rateOf(r.returned_qty +
+                              r.remade_qty, r.sold) — a numerator narrowed by the GRE filter
+                              over a denominator that never narrows, so one dish showed three
+                              different rates depending on whose name was picked. The row no
+                              longer carries per-person quantities to divide by `sold`. */}
                           <td className="py-2 pr-3 text-right tabular-nums font-extrabold text-amber-700">
-                            {pctText(rateOf(r.returned_qty + r.remade_qty, r.sold))}
+                            {pctText(r.return_remake_pct)}
                           </td>
                           <td className="py-2 text-right tabular-nums text-emerald-700 font-semibold">
                             {r.happy_after}
@@ -662,6 +676,7 @@ export default function FeedbackAnalyticsPage() {
                 </TableScroll>
                 <p className="mt-2 text-[10px] leading-snug text-[#8B7355]">
                   {meta.negative_pct_basis} {meta.return_remake_basis}
+                  {meta.venue_columns_basis ? ` ${meta.venue_columns_basis}` : ''}
                 </p>
               </Card>
             )}
