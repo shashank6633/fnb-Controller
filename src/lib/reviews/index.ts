@@ -76,6 +76,34 @@ export {
 } from './sources-gbp';
 export { PERIODS, type Period } from './time';
 
+/* ── THE OWNER REPLY: the one write this module can make ───────────────────────
+ * The transport's allowlist is exported here so a reader of the front door can
+ * see that exactly one non-GET shape exists. gbpPutReviewReply itself is
+ * DELIBERATELY NOT re-exported: it is reachable only as
+ * `from '@/lib/reviews/gbp-transport'`, so `grep gbpPutReviewReply` over src/
+ * finds every place a public reply can be posted from, and a convenient
+ * re-export here would be the first step in losing that property.
+ *
+ * reply-validate.ts is safe in a client component (it imports only the
+ * transport, which imports nothing). reply.ts and reply-draft.ts are NOT —
+ * they reach the database — so a page imports them through a route, never
+ * directly. That is why they are listed separately below. */
+export {
+  GBP_REPLY_MAX_BYTES, dominantScript, greetedName, replyBytes, replyOpening,
+  replySimilarity, validateReply,
+  type ReplyFinding, type ReplyFindingCode, type ReplyValidation,
+} from './reply-validate';
+export {
+  REPLY_ORIGINS, ReplyRefusedError, checkReply, loadReviewForReply, recentSentReplies,
+  replySendHistory, requireConfirmation, resolveReplyTarget, sendReviewReply,
+  type Confirmation, type ReplyCheck, type ReplySendRow, type ReplyTarget,
+  type ReviewForReply, type SendReplyResult,
+} from './reply';
+export {
+  REVIEWS_REPLY_AI_FLAG, buildDraftPrompt, draftReply, isReplyDraftAiOn, openingsToAvoid,
+  parseDraft, type DraftResult, type ReplyDraft,
+} from './reply-draft';
+
 /* ── The automatic connector ──────────────────────────────────────────────── */
 export {
   autoDriverTickAt, connectionHealth, disconnect, driverStaleAfterMs, getConnection,

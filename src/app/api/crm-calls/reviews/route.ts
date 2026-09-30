@@ -383,6 +383,19 @@ export async function GET(req: Request) {
     location_key: locationKey,
     locations,
     can_import: isAdmin,
+    /**
+     * MAY THIS SESSION PUBLISH A REPLY ON GOOGLE. Admin only, the same gate the
+     * send route enforces for itself (/api/crm-calls/reviews/reply).
+     *
+     * A separate field from can_import even though both are `isAdmin` today,
+     * because they answer different questions and will not necessarily move
+     * together: can_import is "may this person load data into the app", and this
+     * is "may this person put words on the public listing under the business's
+     * name". A manager keeps the entire report, the attention list, the themes
+     * and the connection health, and sees no reply box. This flag only decides
+     * what is DRAWN — the route re-checks the role and is the authority.
+     */
+    can_reply: isAdmin,
     headline,
     summary: analysis.summary,
     series: {

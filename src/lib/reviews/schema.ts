@@ -193,6 +193,80 @@ const DDL = `
       updated_at           TEXT NOT NULL DEFAULT ''
     );
 
+    /* ── WHAT WE PUBLISHED, AND WHO PUBLISHED IT ─────────────────────────────
+     * One row per attempt to post an owner reply to Google. This table is the
+     * ONLY record that survives the thing it describes, and it exists because
+     * of an asymmetry that has no parallel anywhere else in this app:
+     *
+     *   gr_reviews.reply_text is GOOGLE'S copy. The hourly pull overwrites it
+     *   from whatever Google currently serves — so if a reply is rejected by
+     *   moderation, or edited, or removed on Google's side, that column stops
+     *   being evidence of what this app sent. It becomes evidence of what
+     *   Google is showing NOW, which is a different fact.
+     *
+     * So the sent text is recorded HERE, before the wire, with the actor. After
+     * a public, irreversible write under the business's own name, "what did we
+     * send and who pressed the button" must be answerable from our own data and
+     * not inferred from the listing.
+     *
+     * status:
+     *   sending  — claimed, in flight. A row stuck here is the one genuinely
+     *              ambiguous state: the PUT may or may not have reached Google.
+     *              Reclaimed as 'unknown' rather than silently retried.
+     *   sent     — Google returned 2xx. See reply_state: a 2xx does NOT mean
+     *              live. PENDING and REJECTED both arrive inside a successful
+     *              response body.
+     *   failed   — Google refused, or this app refused the shape. error says.
+     *   unknown  — we lost the process mid-flight and cannot claim either way.
+     *
+     * is_edit records that this overwrote a reply that had ALREADY BEEN PUBLIC.
+     * Google's reply endpoint is one PUT that creates or replaces, so an edit is
+     * indistinguishable on the wire; the distinction only exists if we store it,
+     * and it matters because the earlier text was readable by guests for however
+     * long it stood. */
+    CREATE TABLE IF NOT EXISTS gr_reply_sends (
+      id               TEXT PRIMARY KEY,
+      review_id        TEXT NOT NULL,
+      location_key     TEXT NOT NULL DEFAULT '',
+      /* accounts/{a}/locations/{l}/reviews/{r} — the exact resource addressed */
+      review_name      TEXT NOT NULL DEFAULT '',
+      /* The text as sent, byte for byte. Never rewritten by an ingest. */
+      comment          TEXT NOT NULL DEFAULT '',
+      comment_bytes    INTEGER NOT NULL DEFAULT 0,
+      /* Who pressed the button. An admin session's email. */
+      actor            TEXT NOT NULL DEFAULT '',
+      /* 'typed' | 'ai_draft_edited' | 'ai_draft_unchanged' — whether a model
+       * wrote any of this, which is worth knowing when reading the listing back
+       * in six months. Recorded, never used to gate anything. */
+      origin           TEXT NOT NULL DEFAULT 'typed',
+      /* Warning codes the admin explicitly acknowledged to get here. */
+      acknowledged     TEXT NOT NULL DEFAULT '',
+      is_edit          INTEGER NOT NULL DEFAULT 0,
+      /* What the previous public text was, when this overwrote one. */
+      previous_comment TEXT NOT NULL DEFAULT '',
+      status           TEXT NOT NULL DEFAULT 'sending',
+      http_status      INTEGER NOT NULL DEFAULT 0,
+      /* Google's reviewReplyState: '' | PENDING | REJECTED | APPROVED | … */
+      reply_state      TEXT NOT NULL DEFAULT '',
+      /* Only populated when reply_state is REJECTED. */
+      policy_violation TEXT NOT NULL DEFAULT '',
+      /* Google's own updateTime for the reply, when it returned one. */
+      google_update_at TEXT NOT NULL DEFAULT '',
+      error            TEXT NOT NULL DEFAULT '',
+      started_at       TEXT NOT NULL,
+      finished_at      TEXT NOT NULL DEFAULT ''
+    );
+    CREATE INDEX IF NOT EXISTS idx_gr_reply_sends_review ON gr_reply_sends(review_id, started_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_gr_reply_sends_started ON gr_reply_sends(started_at DESC);
+    /* THE DOUBLE-SEND GUARD, and the reason it is an INDEX and not an if.
+     * A partial unique index makes two simultaneous sends for one review
+     * impossible at the storage layer, which a check-then-insert in application
+     * code cannot promise across two processes. Production runs more than one.
+     * The second caller gets a constraint error and is told a send is already in
+     * flight, rather than publishing a second reply that overwrites the first. */
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_gr_reply_sends_inflight
+      ON gr_reply_sends(review_id) WHERE status = 'sending';
+
     /* Single-use CSRF nonces for the OAuth redirect. A signed state alone
      * proves the value came from us; it does not stop the same authorised
      * redirect being replayed. Consuming a row makes it one-shot. */

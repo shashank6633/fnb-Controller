@@ -38,6 +38,7 @@ import {
   Star, StarHalf, MessageSquare, RefreshCw, Lock, Info, ChevronLeft, AlertTriangle,
   CheckCircle2, Loader2, TrendingUp, TrendingDown, Minus, ExternalLink, Copy, Check,
   Upload, Database, Clock, Tag, CloudDownload, X, Link2, Power, PlugZap, MapPin, ShieldAlert,
+  Send, Sparkles, Eye, Globe, Pencil,
 } from 'lucide-react';
 import {
   ComposedChart, Bar, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend,
@@ -50,6 +51,14 @@ import {
   agoText, connectionBanner, fmtIst, intervalText, nextFetchText, periodProgress, periodTileView,
 } from '@/lib/reviews/view';
 import type { ConnectionHealth } from '@/lib/reviews/connection';
+/* CHECK 2 OF 3, running in the browser for the live counter and instant
+ * findings. Imported from the leaf module for the same reason view.ts is: it
+ * imports only gbp-transport.ts, which imports NOTHING and touches no Node
+ * global, so nothing follows it into the client bundle. It is the SAME function
+ * the send route runs — one implementation, so what an admin reads here cannot
+ * drift from what the server enforces. The server is still the authority: the
+ * route re-runs it and refuses on its own verdict. */
+import { replyBytes, validateReply, type ReplyFinding } from '@/lib/reviews/reply-validate';
 /* Every state-changing request MUST go through api(): middleware rejects a
  * POST/PUT/PATCH/DELETE without the X-CSRF-Token header read from the fnb_csrf
  * cookie. A raw fetch() here fails with "CSRF token missing or mismatched"
@@ -135,6 +144,10 @@ interface Report {
   generated_at: string; timezone: string; location_key: string;
   locations: Array<{ k: string; n: number }>;
   can_import: boolean;
+  /** May this session publish a reply on the public Google listing. Admin only,
+   *  and the send route re-checks it — this decides what is DRAWN, nothing more.
+   *  A manager sees every review and no reply box. */
+  can_reply: boolean;
   headline: {
     today: HeadBlock; week: HeadBlock; month: HeadBlock;
     all_time: {
@@ -1248,7 +1261,18 @@ export default function ReviewsPage() {
                 {/* Every row the server returned is rendered. There is no second
                     cap here, so "N on screen" is always literally true. */}
                 {list.reviews.map(r => (
-                  <ReviewRowCard key={r.id} r={r} link={data.reply_link} />
+                  <ReviewRowCard
+                    key={r.id}
+                    r={r}
+                    link={data.reply_link}
+                    canReply={data.can_reply}
+                    locationKey={data.location_key}
+                    /* A successful send changes the answered/unanswered counts
+                       and the reply rate in the header. Reload both rather than
+                       patching one card, so nothing on screen disagrees with
+                       anything else on screen. */
+                    onReplied={() => { load(); loadList(); }}
+                  />
                 ))}
                 {list.truncated && (
                   <div className="flex flex-wrap items-center gap-3 bg-[#FFFBF5] border border-[#F0E4D6] rounded-lg px-3 py-2.5 text-[12px] text-[#6B5744] mt-3">
@@ -1376,6 +1400,9 @@ export default function ReviewsPage() {
                                   loading={drillLoading}
                                   error={drillError}
                                   link={data.reply_link}
+                                  canReply={data.can_reply}
+                                  locationKey={data.location_key}
+                                  onReplied={() => { load(); loadList(); }}
                                   onClose={() => setOpenTheme(null)}
                                 />
                               </td>
@@ -2371,7 +2398,488 @@ function AllTimeTile({ all, summary }: { all: Report['headline']['all_time']; su
 
 /* ── Review card ───────────────────────────────────────────────────────────── */
 
-function ReviewRowCard({ r, link }: { r: ReviewCard; link: Report['reply_link'] }) {
+/* ── Reply composer (admin) ────────────────────────────────────────────────────
+ *
+ * THE THREE CHECKS, AS A SCREEN. The owner asked for "2-3 checks before
+ * Submiting to google so can check any mistakes before submitting to google",
+ * and they are the ONLY undo that exists: a reply is public the instant Google's
+ * PUT returns, under the business's own name, and Google offers no way to take
+ * it back.
+ *
+ *   1. PREVIEW  — stage 'preview' shows the exact words that will appear
+ *                 publicly, directly beside the review being answered, so a
+ *                 mismatch is visible rather than imagined.
+ *   2. VALIDATE — validateReply() runs here as the admin types (live byte
+ *                 counter, instant findings) AND on the server when the preview
+ *                 opens, which adds the two things a browser cannot know:
+ *                 whether the review is addressable on Google at all, and
+ *                 whether this reply nearly repeats a recently published one.
+ *   3. CONFIRM  — stage 'confirm' names the business out loud and posts nothing
+ *                 until it is pressed. The business name is echoed back to the
+ *                 route, which refuses a send that cannot name it — that is what
+ *                 makes this a check instead of a checkbox.
+ *
+ * WHY THREE STAGES AND NOT ONE FORM WITH A BUTTON: the failure this prevents is
+ * an admin with 5,564 unanswered reviews building muscle memory. A single Send
+ * button next to a textarea becomes one click; three stages that each show
+ * something different cannot be completed without reading.
+ *
+ * THE AI DRAFT IS A STARTING POINT AND NOTHING MORE. It lands in the same
+ * textarea as typed text, it is validated by the same function, and it goes
+ * through the same three stages. If AI is off or the model fails, everything
+ * here still works by typing — a drafting feature that breaks sending when it is
+ * unavailable would be worse than no drafting feature.
+ */
+
+interface ReplyCheckResponse {
+  ok?: boolean;
+  error?: string;
+  can_send?: boolean;
+  validation?: { ok: boolean; blocking: ReplyFinding[]; warnings: ReplyFinding[]; bytes: number; chars: number };
+  target?: { review_name: string; basis: string } | null;
+  target_error?: { code: string; message: string } | null;
+  is_edit?: boolean;
+  existing_reply?: string;
+  business_label?: string;
+  max_bytes?: number;
+  history?: Array<{
+    id: string; comment: string; actor: string; origin: string; status: string;
+    reply_state: string; is_edit: number; error: string; started_at: string;
+  }>;
+}
+
+interface DraftResponse {
+  ok?: boolean;
+  status?: string;
+  message?: string;
+  model?: string;
+  draft?: { reply: string; answers: string[]; return_reason: string; cautions: string[] };
+  disclaimer?: string;
+}
+
+interface SendResponse {
+  ok?: boolean;
+  error?: string;
+  code?: string;
+  findings?: ReplyFinding[];
+  published?: 'no' | 'unknown';
+  published_note?: string;
+  note?: string;
+  reply_state?: string;
+  live?: boolean;
+}
+
+function ReplyComposer({ r, locationKey, onSent }: {
+  r: ReviewCard; locationKey: string; onSent: () => void;
+}) {
+  const [stage, setStage] = useState<'closed' | 'compose' | 'preview' | 'confirm' | 'done'>('closed');
+  const [text, setText] = useState('');
+  /** Whether a model wrote the text currently in the box, and whether the admin
+   *  has edited it since. Recorded with the send: worth knowing, in six months,
+   *  which replies on the listing a model wrote. Gates nothing. */
+  const [draftedText, setDraftedText] = useState<string | null>(null);
+  const [draft, setDraft] = useState<DraftResponse | null>(null);
+  const [drafting, setDrafting] = useState(false);
+  const [check, setCheck] = useState<ReplyCheckResponse | null>(null);
+  const [checking, setChecking] = useState(false);
+  const [acked, setAcked] = useState<Record<string, boolean>>({});
+  const [sending, setSending] = useState(false);
+  const [sent, setSent] = useState<SendResponse | null>(null);
+  const [err, setErr] = useState('');
+
+  /* Check 2, live, from the same function the server runs. The counter has to be
+   * in BYTES: Google's 4096 is a byte limit, and a Telugu character is three
+   * bytes, so a character counter would lie at exactly the wrong moment. */
+  const local = useMemo(() => validateReply({
+    comment: text,
+    review: {
+      text: r.text, rating: r.rating,
+      author_name: r.author_name, author_is_anonymous: r.author_is_anonymous,
+      language: r.language,
+    },
+  }), [text, r.text, r.rating, r.author_name, r.author_is_anonymous, r.language]);
+
+  const maxBytes = check?.max_bytes ?? 4096;
+  const bytes = replyBytes(text);
+
+  const reset = () => {
+    setStage('closed'); setText(''); setDraft(null); setDraftedText(null);
+    setCheck(null); setAcked({}); setSent(null); setErr('');
+  };
+
+  const runCheck = async (): Promise<ReplyCheckResponse | null> => {
+    setChecking(true); setErr('');
+    try {
+      const res = await api('/api/crm-calls/reviews/reply/check', {
+        method: 'POST',
+        body: { review_id: r.id, comment: text, location_key: locationKey },
+      });
+      const j: ReplyCheckResponse = await res.json();
+      if (!res.ok) { setErr(j.error || `Check failed (HTTP ${res.status})`); setCheck(null); return null; }
+      setCheck(j);
+      return j;
+    } catch (e: unknown) {
+      setErr(e instanceof Error ? e.message : 'Could not reach the server to check the reply');
+      return null;
+    } finally { setChecking(false); }
+  };
+
+  const getDraft = async () => {
+    setDrafting(true); setErr(''); setDraft(null);
+    try {
+      const res = await api('/api/crm-calls/reviews/reply/draft', {
+        method: 'POST',
+        body: { review_id: r.id, location_key: locationKey },
+      });
+      const j: DraftResponse = await res.json();
+      setDraft(j);
+      if (j.ok && j.draft?.reply) {
+        setText(j.draft.reply);
+        setDraftedText(j.draft.reply);
+        // A new draft invalidates any acknowledgement made about the old text.
+        setAcked({});
+      }
+    } catch (e: unknown) {
+      setErr(e instanceof Error ? e.message : 'Could not reach the server for a draft');
+    } finally { setDrafting(false); }
+  };
+
+  const send = async () => {
+    if (!check) return;
+    setSending(true); setErr('');
+    try {
+      const res = await api('/api/crm-calls/reviews/reply', {
+        method: 'POST',
+        body: {
+          review_id: r.id,
+          comment: text,
+          location_key: locationKey,
+          origin: draftedText == null ? 'typed'
+            : draftedText === text ? 'ai_draft_unchanged' : 'ai_draft_edited',
+          confirm: {
+            public: true,
+            business: check.business_label || '',
+            acknowledged: (check.validation?.warnings || []).map(w => w.code).filter(c => acked[c]),
+            overwrite: !!check.is_edit,
+          },
+        },
+      });
+      const j: SendResponse = await res.json();
+      setSent(j);
+      if (res.ok) { setStage('done'); onSent(); }
+      else setErr(j.error || `Send failed (HTTP ${res.status})`);
+    } catch (e: unknown) {
+      // A network error here is the ambiguous case: the request may have reached
+      // Google. Say so rather than implying nothing happened.
+      setErr((e instanceof Error ? e.message : 'The request failed')
+        + ' — the connection dropped, so it is not certain whether the reply reached Google. '
+        + 'Check the review on Google before sending again.');
+    } finally { setSending(false); }
+  };
+
+  /* ── Closed: one button, and it says which of the two things it does. ───── */
+  if (stage === 'closed') {
+    return (
+      <div className="mt-2.5">
+        <button
+          onClick={() => { setStage('compose'); setText(r.replied ? r.reply_text : ''); }}
+          className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[11px] font-semibold border border-[#E0D0BE] bg-white hover:bg-[#FFF1E3] text-[#6B5744]"
+        >
+          {r.replied ? <><Pencil className="w-3.5 h-3.5" /> Edit the public reply</>
+            : <><MessageSquare className="w-3.5 h-3.5" /> Reply from here</>}
+        </button>
+      </div>
+    );
+  }
+
+  /* ── Sent. ──────────────────────────────────────────────────────────────── */
+  if (stage === 'done' && sent) {
+    const rejected = sent.reply_state === 'REJECTED';
+    return (
+      <div className={`mt-2.5 rounded-lg border p-3 ${rejected
+        ? 'border-red-300 bg-red-50' : sent.live ? 'border-emerald-300 bg-emerald-50' : 'border-amber-300 bg-amber-50'}`}>
+        <p className="text-[12px] font-semibold flex items-center gap-1.5">
+          {rejected ? <><ShieldAlert className="w-4 h-4 text-red-600" /> Google rejected it</>
+            : sent.live ? <><Globe className="w-4 h-4 text-emerald-700" /> Published on Google</>
+            : <><Clock className="w-4 h-4 text-amber-700" /> Sent — Google is holding it</>}
+        </p>
+        <p className="text-[12px] text-[#3D2A1A] mt-1">{sent.note}</p>
+        <button onClick={reset} className="mt-2 text-[11px] font-semibold text-[#af4408] underline">Close</button>
+      </div>
+    );
+  }
+
+  const warnings = check?.validation?.warnings || [];
+  const unacked = warnings.filter(w => !acked[w.code]);
+  const serverBlocking = check?.validation?.blocking || [];
+  const canContinue = !!check && !!check.target && serverBlocking.length === 0 && unacked.length === 0;
+
+  return (
+    <div className="mt-2.5 rounded-lg border border-[#E0D0BE] bg-[#FFFDFB] p-3">
+      <div className="flex items-center justify-between gap-2 mb-2">
+        <p className="text-[11px] font-bold text-[#2D1B0E] uppercase tracking-wide">
+          {stage === 'compose' ? 'Step 1 of 3 · Write' : stage === 'preview' ? 'Step 2 of 3 · Check' : 'Step 3 of 3 · Confirm'}
+        </p>
+        <button onClick={reset} title="Cancel" className="text-[#8B7355] hover:text-[#2D1B0E]">
+          <X className="w-4 h-4" />
+        </button>
+      </div>
+
+      {/* ── STAGE 1: WRITE ── */}
+      {stage === 'compose' && (
+        <>
+          {r.replied && (
+            <Note tone="warn">
+              A reply is already public on this review. Sending replaces it — the text below is what
+              guests are reading now, and Google keeps no history of what it replaced.
+            </Note>
+          )}
+          <textarea
+            value={text}
+            onChange={e => setText(e.target.value)}
+            rows={6}
+            placeholder="Write the reply this guest will read. Answer what they actually said, and give them a reason to come back."
+            className="w-full mt-2 px-3 py-2 text-[13px] rounded-lg border border-[#E0D0BE] bg-white focus:outline-none focus:border-[#af4408] resize-y"
+          />
+          <div className="flex flex-wrap items-center justify-between gap-2 mt-1.5">
+            <span className={`text-[11px] tabular-nums ${bytes > maxBytes ? 'text-red-600 font-bold' : 'text-[#8B7355]'}`}>
+              {bytes} / {maxBytes} bytes
+              <span className="text-[#A89480]"> · {[...text].length} characters</span>
+            </span>
+            <button
+              onClick={getDraft}
+              disabled={drafting}
+              title="Ask the model for a first draft written to bring this guest back. You edit it; nothing is sent."
+              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[11px] font-semibold border border-[#E0D0BE] bg-white hover:bg-[#FFF1E3] text-[#6B5744] disabled:opacity-50"
+            >
+              {drafting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Sparkles className="w-3.5 h-3.5" />}
+              {drafting ? 'Drafting…' : 'AI draft'}
+            </button>
+          </div>
+
+          {/* The draft's own account of itself. `answers` is the accountability
+              field: if it is empty for a review with real content, the model did
+              not engage with what the guest wrote. */}
+          {draft && !draft.ok && (
+            <Note tone="warn">
+              {draft.message || 'The draft is not available.'}
+              {' '}Type the reply instead — sending does not need the draft.
+            </Note>
+          )}
+          {draft?.ok && draft.draft && (
+            <div className="mt-2 rounded-lg border border-[#D9C3AC] bg-[#FFF8F0] p-2.5">
+              <p className="text-[10.5px] font-bold uppercase tracking-wide text-[#8B6B45] flex items-center gap-1">
+                <Sparkles className="w-3 h-3" /> AI draft{draft.model ? ` · ${draft.model}` : ''}
+              </p>
+              <p className="text-[11px] text-[#6B5744] mt-1">{draft.disclaimer}</p>
+              {draft.draft.answers.length > 0 ? (
+                <p className="text-[11px] text-[#3D2A1A] mt-1.5">
+                  <span className="font-semibold">It answers:</span> {draft.draft.answers.join(' · ')}
+                </p>
+              ) : r.text.trim().length > 40 && (
+                <p className="text-[11px] text-red-700 mt-1.5 font-semibold">
+                  It did not name one specific thing from this review. A reply that could sit under any
+                  review convinces nobody — rewrite it or draft again.
+                </p>
+              )}
+              {draft.draft.return_reason && (
+                <p className="text-[11px] text-[#3D2A1A] mt-1">
+                  <span className="font-semibold">Reason to come back:</span> {draft.draft.return_reason}
+                  <span className="text-[#8B7355]"> — check this is something the restaurant really offers.</span>
+                </p>
+              )}
+              {draft.draft.cautions.length > 0 && (
+                <p className="text-[11px] text-amber-800 mt-1">
+                  <span className="font-semibold">For you to decide:</span> {draft.draft.cautions.join(' · ')}
+                </p>
+              )}
+            </div>
+          )}
+
+          <FindingList findings={[...local.blocking, ...local.warnings]} />
+
+          <div className="flex items-center gap-2 mt-2.5">
+            <button
+              onClick={async () => { const j = await runCheck(); if (j) setStage('preview'); }}
+              disabled={!local.ok || checking}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[11px] font-bold bg-[#af4408] text-white hover:bg-[#963a06] disabled:opacity-40"
+            >
+              {checking ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Eye className="w-3.5 h-3.5" />}
+              Preview what guests will see
+            </button>
+            {!local.ok && (
+              <span className="text-[11px] text-red-700 font-semibold">Fix the items above first.</span>
+            )}
+          </div>
+        </>
+      )}
+
+      {/* ── STAGE 2: CHECK — the exact words, beside the review ── */}
+      {stage === 'preview' && (
+        <>
+          <div className="grid gap-2.5 md:grid-cols-2">
+            <div className="rounded-lg border border-[#E8D5C4] bg-white p-2.5">
+              <p className="text-[10.5px] font-bold uppercase tracking-wide text-[#8B7355]">
+                {r.author_is_anonymous || !r.author_name ? 'A Google user' : r.author_name} · {r.rating}★
+              </p>
+              <p className="text-[12px] text-[#3D2A1A] mt-1 whitespace-pre-wrap">
+                {r.text || 'Rating only — the guest left no words.'}
+              </p>
+            </div>
+            <div className="rounded-lg border-2 border-[#af4408] bg-white p-2.5">
+              <p className="text-[10.5px] font-bold uppercase tracking-wide text-[#af4408]">
+                Your reply, exactly as it will appear
+              </p>
+              <p className="text-[12px] text-[#2D1B0E] mt-1 whitespace-pre-wrap">{text}</p>
+            </div>
+          </div>
+
+          {check?.target_error && (
+            <Note tone="warn">{check.target_error.message}</Note>
+          )}
+
+          <FindingList findings={serverBlocking} />
+
+          {/* Warnings are acknowledged ONE BY ONE. A single "I understand" box
+              would be ticked without reading; a box per finding makes the admin
+              look at each one. The route re-checks every code. */}
+          {warnings.length > 0 && (
+            <div className="mt-2 rounded-lg border border-amber-300 bg-amber-50 p-2.5">
+              <p className="text-[11px] font-bold text-amber-900 uppercase tracking-wide">
+                Accept each of these before it can be published
+              </p>
+              {warnings.map(w => (
+                <label key={w.code} className="flex items-start gap-2 mt-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={!!acked[w.code]}
+                    onChange={e => setAcked(a => ({ ...a, [w.code]: e.target.checked }))}
+                    className="mt-0.5 shrink-0"
+                  />
+                  <span className="text-[11.5px] text-[#3D2A1A]">
+                    <span className="font-bold">{w.label}.</span> {w.detail}
+                  </span>
+                </label>
+              ))}
+            </div>
+          )}
+
+          {check?.history && check.history.length > 0 && (
+            <div className="mt-2 rounded-lg border border-[#E8D5C4] bg-white p-2.5">
+              <p className="text-[10.5px] font-bold uppercase tracking-wide text-[#8B7355]">
+                Already sent from this app
+              </p>
+              {check.history.slice(0, 3).map(h => (
+                <p key={h.id} className="text-[11px] text-[#6B5744] mt-1">
+                  {fmtDateTime(h.started_at)} · {h.actor || 'unknown'} · {h.status}
+                  {h.reply_state ? ` (${h.reply_state})` : ''}
+                  {h.is_edit ? ' · replaced an earlier public reply' : ''}
+                </p>
+              ))}
+            </div>
+          )}
+
+          <div className="flex flex-wrap items-center gap-2 mt-2.5">
+            <button
+              onClick={() => setStage('compose')}
+              className="px-3 py-1.5 rounded-lg text-[11px] font-semibold border border-[#E0D0BE] bg-white text-[#6B5744]"
+            >
+              Back to editing
+            </button>
+            <button
+              onClick={() => setStage('confirm')}
+              disabled={!canContinue}
+              className="px-3 py-1.5 rounded-lg text-[11px] font-bold bg-[#af4408] text-white hover:bg-[#963a06] disabled:opacity-40"
+            >
+              This is right — continue
+            </button>
+            {!check?.target && !check?.target_error && (
+              <span className="text-[11px] text-[#8B7355]">Checking whether this review can be answered…</span>
+            )}
+          </div>
+        </>
+      )}
+
+      {/* ── STAGE 3: CONFIRM — name the business out loud ── */}
+      {stage === 'confirm' && (
+        <>
+          <div className="rounded-lg border-2 border-red-400 bg-red-50 p-3">
+            <p className="text-[12px] font-bold text-red-900 flex items-center gap-1.5">
+              <Globe className="w-4 h-4" /> This becomes public immediately
+            </p>
+            <p className="text-[12px] text-[#3D2A1A] mt-1.5">
+              The reply below will be posted on Google as{' '}
+              <span className="font-bold">{check?.business_label || 'the connected business'}</span>,
+              where every future guest reading this review will see it.{' '}
+              <span className="font-bold">Google has no undo</span> — it cannot be withdrawn from here
+              or anywhere else. {check?.is_edit
+                ? 'It replaces the reply that is on the listing now, which guests have already been reading.'
+                : ''}
+            </p>
+            <p className="text-[12px] text-[#2D1B0E] mt-2 p-2 bg-white rounded border border-red-200 whitespace-pre-wrap">
+              {text}
+            </p>
+          </div>
+
+          {err && <Note tone="warn">{err}</Note>}
+          {sent?.published === 'unknown' && (
+            <Note tone="warn">{sent.published_note}</Note>
+          )}
+
+          <div className="flex flex-wrap items-center gap-2 mt-2.5">
+            <button
+              onClick={() => setStage('preview')}
+              className="px-3 py-1.5 rounded-lg text-[11px] font-semibold border border-[#E0D0BE] bg-white text-[#6B5744]"
+            >
+              Back
+            </button>
+            <button
+              onClick={send}
+              disabled={sending}
+              className="flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-[11.5px] font-bold bg-red-700 text-white hover:bg-red-800 disabled:opacity-50"
+            >
+              {sending ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
+              {sending ? 'Posting…' : `Post publicly to Google as ${check?.business_label || 'this business'}`}
+            </button>
+          </div>
+        </>
+      )}
+
+      {err && stage !== 'confirm' && <Note tone="warn">{err}</Note>}
+    </div>
+  );
+}
+
+/** Findings, each naming itself. "Invalid" at the moment of publishing tells an
+ *  admin nothing about what to change, which is why every code carries its own
+ *  label and sentence. */
+function FindingList({ findings }: { findings: ReplyFinding[] }) {
+  if (!findings.length) return null;
+  return (
+    <div className="mt-2 space-y-1.5">
+      {findings.map(f => (
+        <div
+          key={f.code}
+          className={`text-[11.5px] rounded-lg px-2.5 py-1.5 border ${f.severity === 'blocking'
+            ? 'border-red-300 bg-red-50 text-red-900' : 'border-amber-300 bg-amber-50 text-amber-900'}`}
+        >
+          <span className="font-bold">
+            {f.severity === 'blocking' ? 'Cannot send' : 'Check'} · {f.label}.
+          </span>{' '}
+          {f.detail}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function ReviewRowCard({ r, link, canReply, locationKey, onReplied }: {
+  r: ReviewCard; link: Report['reply_link'];
+  /** Admin only. False for a manager, who sees the review and nothing actionable. */
+  canReply?: boolean;
+  locationKey?: string;
+  onReplied?: () => void;
+}) {
   const [copied, setCopied] = useState(false);
 
   const copy = async () => {
@@ -2464,6 +2972,18 @@ function ReviewRowCard({ r, link }: { r: ReviewCard; link: Report['reply_link'] 
           </p>
           <p className="text-[12px] text-[#6B5744] mt-0.5 whitespace-pre-wrap">{r.reply_text || '—'}</p>
         </div>
+      )}
+
+      {/* ADMIN ONLY. A manager gets the card above and nothing below it: reading
+          the reviews is management work, publishing under the business's name is
+          the owner's. The route enforces the same rule — this only decides what
+          is drawn. */}
+      {canReply && (
+        <ReplyComposer
+          r={r}
+          locationKey={locationKey || ''}
+          onSent={() => onReplied?.()}
+        />
       )}
     </div>
   );
@@ -3028,10 +3548,18 @@ function CountButton({ n, active, onClick, title, tone = 'plain' }: {
  * having landed on different data — an import between the two requests. That is
  * worth a sentence on screen, not a hidden discrepancy.
  */
-function ThemeDrill({ label, spanLabel, low, expected, drill, loading, error, link, onClose }: {
+function ThemeDrill({
+  label, spanLabel, low, expected, drill, loading, error, link,
+  canReply, locationKey, onReplied, onClose,
+}: {
   label: string; spanLabel: string; low: boolean; expected: number;
   drill: ThemePage | null; loading: boolean; error: string | null;
-  link: Report['reply_link']; onClose: () => void;
+  link: Report['reply_link'];
+  /* Passed through so a review opened from a theme count is answerable in the
+     same place it was found. A theme drill-down is exactly where an owner
+     notices five people complaining about the same thing. */
+  canReply?: boolean; locationKey?: string; onReplied?: () => void;
+  onClose: () => void;
 }) {
   const heading = low
     ? `The ${expected} review${expected === 1 ? '' : 's'} rated 1–2★ that mention ${label}`
@@ -3092,7 +3620,12 @@ function ThemeDrill({ label, spanLabel, low, expected, drill, loading, error, li
               the page — the two halves are looking at different snapshots.</Empty>
           ) : (
             <div className="space-y-2.5">
-              {drill.reviews.map(r => <ReviewRowCard key={r.id} r={r} link={link} />)}
+              {drill.reviews.map(r => (
+                <ReviewRowCard
+                  key={r.id} r={r} link={link}
+                  canReply={canReply} locationKey={locationKey} onReplied={onReplied}
+                />
+              ))}
             </div>
           )}
 

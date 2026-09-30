@@ -137,6 +137,22 @@ const KEY_POLICY = new Map<string, KeyPolicy>([
     write: 'admin',
     writeError: 'Admin role required to change the Google redirect URI',
   }],
+  // THE AI REPLY-DRAFT SWITCH. New key, arriving with the owner-reply send path,
+  // and listed here on the way in rather than after someone notices.
+  //
+  // It arms two things a manager should not arm. It starts spending on the LLM
+  // rail per button press; and it puts model-written prose in front of the one
+  // route in this application that publishes to the public internet — an owner
+  // reply on the live Google listing, which Google cannot undo. The drafting and
+  // sending routes are both requireRole('admin') already, so flipping this would
+  // gain a manager nothing directly; it would just mean the person who decides
+  // the app may write drafts for a public listing is not the person the module
+  // gates everything else on. READ stays open: it is a boolean feature flag, not
+  // a credential, and a screen may show a manager that drafting is available.
+  ['reviews_ai_reply_draft', {
+    write: 'admin',
+    writeError: 'Admin role required to turn AI reply drafting on or off',
+  }],
   // THE VARIANCE BAR — the sharpest self-lift in this table, and it was open.
   // These TWO decide how much stock movement happens with NO admin in the
   // loop: a count whose difference is under the bar applies itself to

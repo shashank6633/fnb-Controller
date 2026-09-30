@@ -625,6 +625,7 @@ ai.analyzePendingReviews({ db: db, limit: 5, locationKey: BULK_LOC }).then(async
   integrityGates();
   listingGates();
   await lockdownGates();
+  await replyGates();
 
   finish();
 }).catch((e) => {
@@ -2183,4 +2184,799 @@ function integrityGates() {
   });
   eq('while the same empty month, fetched from Google, IS a real quiet month',
     septApi.state, 'no_reviews');
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * THE OWNER REPLY — gates AM to AO.
+ *
+ * NO GOOGLE ENDPOINT IS CALLED HERE, AND NONE MAY EVER BE. Every send below
+ * runs against an injected `fetchImpl` spy, and the core assertion for a refused
+ * send is that THE SPY WAS NEVER CALLED. That is the only honest way to prove a
+ * guard fires on a write path whose real target is a public listing with 10,055
+ * real reviews, under the owner's business name, that Google cannot undo.
+ *
+ * What these gates prove, and what they cannot:
+ *   PROVEN  — every refusal fires before the wire; the permitted PUT is built
+ *             correctly; a 2xx with PENDING or REJECTED is NOT treated as live;
+ *             a send does not make the next pull report a changed row; the
+ *             double-send guard holds; the drafter's prompt still carries the
+ *             owner's rules and its output is validated like typed text.
+ *   NOT     — anything about what Google actually returns. The first real send
+ *             is the only test of that, and it is the owner's to make with his
+ *             own words. See UNPROVEN in src/lib/reviews/sources-gbp.ts.
+ * ══════════════════════════════════════════════════════════════════════════ */
+async function replyGates() {
+  const rv = lib('reviews/reply-validate.ts');
+  const reply = lib('reviews/reply.ts');
+  const rdraft = lib('reviews/reply-draft.ts');
+  const connMod = lib('reviews/connection.ts');
+  const schemaMod = lib('reviews/schema.ts');
+
+  /* ════════════════════════════════════════════════════════════════════════
+   * AM. CHECK 2 NAMES EVERY MISTAKE. Pure, no database, no provider.
+   *
+   * "Invalid" at the moment of publishing tells an admin nothing about what to
+   * change, so every finding carries its own code. These assertions are on the
+   * CODES, which is what the page and the send route both key on.
+   * ════════════════════════════════════════════════════════════════════════ */
+  section('AM. Check 2 of 3: every mistake names itself');
+
+  const PRIYA = {
+    text: 'The mutton biryani was dry and we waited fifty minutes for it. Nobody apologised at all.',
+    rating: 1, author_name: 'Priya Sharma', author_is_anonymous: false, language: 'en',
+  };
+  const codes = (comment, review, recent) =>
+    rv.validateReply({ comment: comment, review: review || PRIYA, recentReplies: recent })
+      .blocking.concat(rv.validateReply({ comment: comment, review: review || PRIYA, recentReplies: recent }).warnings)
+      .map(f => f.code);
+  const has = (label, comment, code, review, recent) =>
+    truthy(label, codes(comment, review, recent).includes(code),
+      'got ' + JSON.stringify(codes(comment, review, recent)));
+
+  /* ── The blocking five. Wrong no matter who typed them. ── */
+  has('an empty reply is blocked', '   \n ', 'empty');
+  has('whitespace-only is the same thing', '\t\t', 'empty');
+  has('a [placeholder] that escaped a draft is blocked', 'Hi Priya, sorry about the [dish].', 'placeholder');
+  has('so is TODO', 'Thanks for the biryani note. TODO finish this', 'placeholder');
+  has('so is XXX', 'Sorry about the biryani, XXX will call you', 'placeholder');
+  has('greeting the WRONG guest is blocked', 'Hi Anjali, sorry about the dry biryani.', 'wrong_guest_name');
+  eq('greeting by the guest\'s SURNAME raises no name finding',
+    codes('Hi Sharma, sorry about the dry biryani and the fifty minute wait.')
+      .filter(c => c === 'wrong_guest_name' || c === 'name_for_anonymous'), []);
+  eq('  ...nor does the guest\'s own first name',
+    codes('Hi Priya, sorry about the dry biryani and the fifty minute wait.')
+      .filter(c => c === 'wrong_guest_name'), []);
+  has('naming ANY guest on an anonymous review is blocked — it publishes a guess',
+    'Hi Priya, sorry about the dry biryani.', 'name_for_anonymous',
+    { text: PRIYA.text, rating: 1, author_name: '', author_is_anonymous: true });
+  eq('"Hi there" is not read as a guest called There',
+    codes('Hi there, sorry about the dry biryani and the fifty minute wait.')
+      .filter(c => c === 'wrong_guest_name' || c === 'name_for_anonymous'), []);
+
+  /* THE BYTE LIMIT. Google's 4096 is BYTES and the owner's guests review in
+   * Telugu — 1,700 Telugu characters pass any .length check and are 5,100
+   * bytes on the wire. A character counter would lie at the worst moment. */
+  const telugu = 'అ'.repeat(1700);
+  truthy('1,700 Telugu characters are under 4096 CHARACTERS but over 4096 BYTES ('
+    + telugu.length + ' chars / ' + Buffer.byteLength(telugu, 'utf8') + ' bytes)',
+    telugu.length < 4096 && Buffer.byteLength(telugu, 'utf8') > 4096);
+  has('  ...and that reply is blocked as too long', telugu, 'too_long');
+  eq('  ...with the byte count, not the character count, on the finding',
+    /\d+ bytes/.test(rv.validateReply({ comment: telugu, review: PRIYA }).blocking
+      .find(f => f.code === 'too_long').detail), true);
+  eq('replyBytes counts bytes, not characters', [rv.replyBytes('అ'), rv.replyBytes('a')], [3, 1]);
+
+  /* ECHOING THE GUEST'S OWN CONTACT DETAILS BACK ONTO A PUBLIC PAGE. */
+  const withPhone = {
+    text: 'Terrible service, call me on 9876543210 if you care about the biryani.',
+    rating: 1, author_name: 'Priya Sharma', author_is_anonymous: false,
+  };
+  has('repeating the guest\'s own phone number is BLOCKED — it is public forever',
+    'Hi Priya, I tried 9876543210 about the biryani.', 'echoes_guest_contact', withPhone);
+  has('the restaurant\'s own number is only a warning, not a block',
+    'Hi Priya, sorry about the biryani — please call us on 04023551234.',
+    'contact_in_public_reply', withPhone);
+  eq('  ...and it really is a warning, so the owner is not stopped from giving his own number',
+    rv.validateReply({
+      comment: 'Hi Priya, sorry about the biryani — please call us on 04023551234.',
+      review: withPhone,
+    }).ok, true);
+
+  /* ── THE WARNINGS. Judgement calls, acknowledged one by one, never silently
+   * refused — the app belongs to the owner and these are his words to publish.
+   * The one that matters most is the compensation offer: a model asked to win a
+   * guest back reaches for a free dessert, and that is a PUBLIC PROMISE the
+   * restaurant then has to honour. ── */
+  has('a free dessert is flagged as compensation',
+    'Hi Priya, sorry about the biryani. Your next dessert is free.', 'compensation_offer');
+  has('so is "on us"', 'Hi Priya, the dry biryani was on us next time.', 'compensation_offer');
+  has('and so is the same offer with the words reversed — "your next dessert is free"',
+    'Hi Priya, sorry about the biryani. Your dessert next time is free.', 'compensation_offer');
+  has('so is a discount', 'Hi Priya, we will give you a 20% discount on the biryani.', 'compensation_offer');
+  has('so is "complimentary"', 'Hi Priya, a complimentary biryani awaits.', 'compensation_offer');
+  eq('  ...and compensation NEVER blocks, because the owner may mean it',
+    rv.validateReply({
+      comment: 'Hi Priya, sorry about the biryani. Your next visit is on us.', review: PRIYA,
+    }).ok, true);
+  has('arguing with the guest is flagged',
+    'Hi Priya, that is not true, the biryani is never dry.', 'disputes_guest');
+  has('blaming the guest is flagged',
+    'Hi Priya, the biryani wait was your own fault.', 'disputes_guest');
+  has('asking for a better rating is flagged',
+    'Hi Priya, sorry about the biryani — could you update your review?', 'asks_for_rating');
+  /* REGRESSION: this pattern used to be a bare "give/leave us a", which fired on
+   * the return-visit invitation the whole feature exists to produce. A check
+   * that warns on the thing it is meant to encourage gets ignored, and then so
+   * do the checks beside it. */
+  eq('but "give us another chance" is NOT — that is the invitation, not a rating beg',
+    codes('Hi Priya, the dry biryani was not good enough. Please give us another chance.')
+      .includes('asks_for_rating'), false);
+  eq('nor is "give us another try"',
+    codes('Hi Priya, sorry about the biryani wait. Give us another try.')
+      .includes('asks_for_rating'), false);
+  has('while asking for a review outright IS flagged',
+    'Hi Priya, sorry about the biryani — please leave us a review after your next visit.',
+    'asks_for_rating');
+  has('mentioning five stars is flagged',
+    'Hi Priya, sorry about the biryani, hope we earn 5 stars next time.', 'asks_for_rating');
+  has('"we value your feedback" is flagged as filler — the owner named it himself',
+    'Hi Priya, we value your feedback about the biryani.', 'corporate_filler');
+  has('"we strive to" too', 'Hi Priya, we strive to serve better biryani.', 'corporate_filler');
+  has('a reply that answers NOTHING they said is flagged',
+    'Hi Priya, we are very grateful you wrote to us and we will look at it.', 'generic_reply');
+  eq('  ...and naming the actual dish clears it',
+    codes('Hi Priya, the biryani should never arrive dry. I have changed how long it is held.')
+      .includes('generic_reply'), false);
+  has('emoji the guest never used are flagged',
+    'Hi Priya, sorry about the biryani 😊', 'emoji_added');
+  has('three exclamation marks are flagged',
+    'Hi Priya! Sorry about the biryani! Come back!', 'exclamation_spray');
+  has('a person the model invented, signed publicly, is flagged',
+    'Sorry about the dry biryani, we have fixed the holding time.\n- Rahul', 'signed_by_a_person');
+  eq('  ...but signing off as the restaurant is not',
+    codes('Sorry about the dry biryani, we have fixed the holding time.\n- Akan Brewing Co')
+      .includes('signed_by_a_person'), false);
+
+  /* VARIETY. 5,564 unanswered reviews means the owner may send many in a
+   * sitting, and a listing where every reply is the same reads as bot-written —
+   * which costs more trust than the replies earn. */
+  const SENT = 'Hi Priya, the biryani should never arrive dry and fifty minutes is far too long. '
+    + 'I have changed how long it is held before serving.';
+  has('a near-identical reply to one already sent is flagged', SENT, 'near_duplicate', PRIYA, [SENT]);
+  eq('  ...with the overlap named as a percentage',
+    /\d+% of the words match/.test(rv.validateReply({
+      comment: SENT, review: PRIYA, recentReplies: [SENT],
+    }).warnings.find(f => f.code === 'near_duplicate').detail), true);
+  has('and a reply that merely OPENS the same way is flagged separately',
+    'Hi Priya, the biryani was completely wrong and I have spoken to the kitchen about it today.',
+    'repeated_opening', PRIYA, ['Hi Priya, the biryani was awful for you and I am sorry.']);
+  eq('similarity is 1 for identical text and 0 against nothing',
+    [rv.replySimilarity('a b c', 'a b c'), rv.replySimilarity('a b c', '')], [1, 0]);
+
+  /* LANGUAGE. Only ever a warning: plenty of guests write Telugu in Latin
+   * letters and read English perfectly well. */
+  const teluguReview = {
+    text: 'బిర్యానీ చాలా బాగుంది కానీ సర్వీస్ చాలా నెమ్మదిగా ఉంది మేము చాలా సేపు వేచి ఉన్నాము',
+    rating: 3, author_name: 'Ravi K', author_is_anonymous: false,
+  };
+  has('answering a Telugu review in English is flagged, gently',
+    'Hi Ravi, thank you for saying the food was good, and sorry the service dragged.',
+    'language_mismatch', teluguReview);
+  eq('  ...and it is a WARNING, because it is often the right call',
+    rv.validateReply({
+      comment: 'Hi Ravi, thank you for saying the food was good, and sorry the service dragged.',
+      review: teluguReview,
+    }).ok, true);
+  eq('the script detector reads Telugu, Devanagari and Latin apart',
+    [rv.dominantScript(teluguReview.text), rv.dominantScript('यह बहुत अच्छा था और हम फिर आएंगे'),
+      rv.dominantScript('the biryani was good')],
+    ['telugu', 'devanagari', 'latin']);
+  eq('and says "none" rather than guessing about a handful of characters',
+    rv.dominantScript('ok'), 'none');
+
+  /* THE CLEAN REPLY. Everything above is worthless if a good reply cannot get
+   * through — a validator that fails everything is not a safety feature. */
+  const GOOD = 'Hi Priya, you are right — a dry biryani and a fifty minute wait is not what we '
+    + 'want to put in front of anyone. I have changed how long the biryani is held before it goes '
+    + 'out, and the floor team now checks in on any table waiting past twenty minutes. Please give '
+    + 'us one more try.';
+  const clean = rv.validateReply({ comment: GOOD, review: PRIYA });
+  eq('a reply that names the dish, owns the failure and invites them back passes CLEAN',
+    [clean.ok, clean.blocking.length, clean.warnings.length], [true, 0, 0]);
+  truthy('with the byte counter the screen shows', clean.bytes > 0 && clean.bytes_remaining === 4096 - clean.bytes);
+
+  /* ════════════════════════════════════════════════════════════════════════
+   * AN. THE SEND PATH. Every refusal is proven with spy call count 0.
+   * ════════════════════════════════════════════════════════════════════════ */
+
+  // Obviously fake ids. A test must not read as though it were aimed at the
+  // owner's real listing.
+  const RLOC_KEY = 'reply-gate-listing';
+  const RACC = 'accounts/RACC1';
+  const RPARENT = RACC + '/locations/RLOC1';
+  const BIZ = 'Gate Test Brewing Co';
+
+  const v4Reply = (o) => {
+    const r = {
+      name: o.parent === null ? undefined : (o.parent || RPARENT) + '/reviews/' + o.id,
+      reviewId: o.noId ? undefined : o.id,
+      reviewer: { displayName: o.author || 'A Google user', isAnonymous: !o.author },
+      starRating: ['', 'ONE', 'TWO', 'THREE', 'FOUR', 'FIVE'][o.rating],
+      createTime: o.createTime, updateTime: o.updateTime || o.createTime,
+    };
+    if (r.name === undefined) delete r.name;
+    if (r.reviewId === undefined) delete r.reviewId;
+    if (o.text) r.comment = o.text;
+    if (o.reply) { r.reviewReply = { comment: o.reply }; if (o.replyAt) r.reviewReply.updateTime = o.replyAt; }
+    return r;
+  };
+
+  const ROWS = [
+    { id: 'GREV1', author: 'Priya Sharma', rating: 1, text: PRIYA.text, createTime: '2026-09-01T10:00:00Z' },
+    { id: 'GREV2', author: 'Ravi Kumar', rating: 2, text: 'The biryani was cold and the wait was long.', createTime: '2026-09-02T10:00:00Z' },
+    { id: 'GREV3', author: 'Meena T', rating: 1, text: 'Awful biryani, nobody cared about us at all.', createTime: '2026-09-03T10:00:00Z' },
+    { id: 'GREV4', author: 'Suresh B', rating: 3, text: 'The biryani was fine but the music was too loud.', createTime: '2026-09-04T10:00:00Z' },
+    { id: 'GREV5', author: 'Latha M', rating: 2, text: 'Slow service and the biryani came late again.', createTime: '2026-09-05T10:00:00Z' },
+    { id: 'GREV6', author: 'Kiran P', rating: 1, text: 'Cold biryani, long wait, no apology from anyone.', createTime: '2026-09-06T10:00:00Z' },
+    // A review pulled from a DIFFERENT listing than the one we are connected to.
+    { id: 'GREVX', author: 'Other Person', rating: 1, text: 'Biryani was bad at the other branch entirely.', createTime: '2026-09-07T10:00:00Z', parent: 'accounts/OTHER/locations/OTHER1' },
+    // A row with Google's reviewId but NO archived resource name — a Takeout
+    // export that carried ids. The name has to be CONSTRUCTED from the
+    // connection's parent, which is the second of the two permitted bases.
+    { id: 'GREVCONS', author: 'Cons Guest', rating: 1, text: 'Biryani was bad and the wait was long here.', createTime: '2026-09-08T10:00:00Z', parent: null },
+    // NO GOOGLE ID AT ALL — what a Takeout export without ids produces. Both
+    // the resource name and the reviewId are stripped, so the row is identified
+    // by author and date and there is nothing to address.
+    { id: 'GREVNOID', author: 'Noid Guest', rating: 1, text: 'No identifier on this row and the biryani was bad.', createTime: '2026-09-09T10:00:00Z', parent: null, noId: true },
+  ];
+  const ingested = ingestDocuments(
+    db, doc(JSON.stringify({ reviews: ROWS.map(v4Reply) }), 'reply gate page 1'),
+    { source: 'gbp_api', locationKey: RLOC_KEY },
+  );
+  eq('fixture: nine reviews land for the reply gate', ingested.inserted, 9);
+
+  const idOf = (ext, author) => {
+    const r = ext
+      ? db.prepare('SELECT id FROM gr_reviews WHERE location_key = ? AND external_id = ?').get(RLOC_KEY, ext)
+      : db.prepare('SELECT id FROM gr_reviews WHERE location_key = ? AND author_name = ?').get(RLOC_KEY, author);
+    return r && r.id;
+  };
+  const ID1 = idOf('GREV1'), ID2 = idOf('GREV2'), ID3 = idOf('GREV3'), ID4 = idOf('GREV4');
+  const ID5 = idOf('GREV5'), ID6 = idOf('GREV6');
+  const IDX = idOf('GREVX'), IDNOID = idOf(null, 'Noid Guest'), IDCONS = idOf('GREVCONS');
+
+  /* The connection, with a CACHED access token that has not expired. This is
+   * why no token exchange happens: gbpAccessToken() returns the cached value
+   * when gr_connection.token_expires_at is in the future. No real credential is
+   * read and nothing is refreshed. */
+  connMod.saveConnection(db, RLOC_KEY, {
+    status: 'connected',
+    google_email: 'gate@example.invalid',
+    account_name: RACC,
+    account_label: 'Gate Test Account',
+    location_name: RPARENT,
+    location_label: BIZ,
+    token_expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+  });
+  schemaMod.setReviewSetting(db, 'reviews_gbp_access_token', 'fake-cached-token-not-a-real-credential');
+
+  function spy(status, body) {
+    const calls = [];
+    return {
+      calls,
+      impl: async (url, init) => {
+        calls.push({ url: String(url), init: init || {} });
+        return { ok: status >= 200 && status < 300, status: status, text: async () => (body === undefined ? '{}' : body) };
+      },
+    };
+  }
+
+  const OK_CONFIRM = { public: true, business: BIZ, acknowledged: [], overwrite: false };
+
+  /** THE CORE ASSERTION: it refused, AND nothing left the machine. */
+  async function refusesSend(label, args, expectCode) {
+    const s = spy(200, '{}');
+    let threw = null;
+    try {
+      await reply.sendReviewReply(Object.assign(
+        { db: db, actor: 'gate@test', locationKey: RLOC_KEY, fetchImpl: s.impl }, args,
+      ));
+    } catch (e) { threw = e; }
+    if (!threw) { bad(label, 'IT DID NOT REFUSE — sendReviewReply returned normally'); return; }
+    if (s.calls.length !== 0) {
+      bad(label, 'REFUSED BUT STILL CALLED fetch ' + s.calls.length + ' time(s) — THE REPLY MAY HAVE BEEN PUBLISHED');
+      return;
+    }
+    if (expectCode && threw.code !== expectCode) {
+      bad(label, 'refused with code ' + threw.code + ', expected ' + expectCode + ' (' + threw.message + ')');
+      return;
+    }
+    ok(label);
+  }
+
+  section('AN. The send path: every refusal fires BEFORE the wire (spy call count 0)');
+
+  /* ── Check 2 stops the send, server-side, whatever the browser thought. ── */
+  await refusesSend('an empty reply is never sent', { reviewId: ID1, comment: '  ', confirm: OK_CONFIRM }, 'validation_failed');
+  await refusesSend('a reply with a [placeholder] is never sent',
+    { reviewId: ID1, comment: 'Hi Priya, sorry about the [dish].', confirm: OK_CONFIRM }, 'validation_failed');
+  await refusesSend('a reply greeting the wrong guest is never sent',
+    { reviewId: ID1, comment: 'Hi Anjali, sorry about the dry biryani.', confirm: OK_CONFIRM }, 'validation_failed');
+  await refusesSend('a reply over 4096 BYTES is never sent',
+    { reviewId: ID1, comment: telugu, confirm: OK_CONFIRM }, 'validation_failed');
+
+  /* ── An UNACKNOWLEDGED warning stops the send. This is the one that stops a
+   * model-invented free dessert becoming a public promise: the draft passes
+   * validation (warnings do not block) and the SEND still refuses until the
+   * admin says yes to that specific code. ── */
+  const FREEBIE = 'Hi Priya, sorry the biryani was dry — your next dessert is free.';
+  await refusesSend('a compensation offer nobody acknowledged is NOT published',
+    { reviewId: ID1, comment: FREEBIE, confirm: OK_CONFIRM }, 'unacknowledged_warnings');
+  {
+    const s = spy(200, '{}');
+    let threw = null;
+    try {
+      await reply.sendReviewReply({
+        db: db, reviewId: ID1, comment: FREEBIE, actor: 'gate@test', locationKey: RLOC_KEY,
+        confirm: { public: true, business: BIZ, acknowledged: ['emoji_added'], overwrite: false },
+        fetchImpl: s.impl,
+      });
+    } catch (e) { threw = e; }
+    truthy('acknowledging a DIFFERENT warning does not clear this one',
+      threw && threw.code === 'unacknowledged_warnings' && s.calls.length === 0,
+      threw && threw.code);
+  }
+
+  /* ── Check 3 stops the send. The confirm step is not a checkbox on a screen. ── */
+  await refusesSend('no confirmation at all means nothing is sent',
+    { reviewId: ID1, comment: GOOD, confirm: { public: false } }, 'not_confirmed');
+  await refusesSend('a confirmation that cannot NAME the business is refused — that is what makes it a check',
+    { reviewId: ID1, comment: GOOD, confirm: { public: true, business: '', acknowledged: [] } }, 'business_not_named');
+  await refusesSend('and naming the WRONG business is refused',
+    { reviewId: ID1, comment: GOOD, confirm: { public: true, business: 'Some Other Restaurant', acknowledged: [] } },
+    'business_not_named');
+  {
+    db.prepare("UPDATE gr_reviews SET reply_text = '', replied_at = '' WHERE id = ?").run(ID1);
+    db.prepare('DELETE FROM gr_reply_sends WHERE review_id = ?').run(ID1);
+    const s = spy(200, JSON.stringify({ comment: GOOD, updateTime: '2026-09-30T08:15:00Z' }));
+    let threw = null;
+    try {
+      await reply.sendReviewReply({
+        db: db, reviewId: ID1, comment: GOOD, actor: 'gate@test', locationKey: RLOC_KEY,
+        confirm: { public: true, business: '  gate test BREWING   co ', acknowledged: [] },
+        fetchImpl: s.impl,
+      });
+    } catch (e) { threw = e; }
+    eq('but case and spacing in the business name are noise, not a trap',
+      [threw, s.calls.length], [null, 1]);
+    // Undo it: later gates re-use this review as unanswered.
+    db.prepare("UPDATE gr_reviews SET reply_text = '', replied_at = '' WHERE id = ?").run(ID1);
+    db.prepare('DELETE FROM gr_reply_sends WHERE review_id = ?').run(ID1);
+  }
+
+  /* ── A review this app cannot address. Refusing is the whole job: the
+   * alternative is a PUT at a path we assembled, and the failure mode is not a
+   * 404 — it is a reply published under the wrong review or the wrong outlet. ── */
+  await refusesSend('a review with NO Google id is refused, never guessed at',
+    { reviewId: IDNOID, comment: 'Sorry about the biryani and the wait, we have changed the holding time.', confirm: OK_CONFIRM },
+    'no_google_id');
+  await refusesSend('a review pulled from a DIFFERENT listing is refused',
+    { reviewId: IDX, comment: 'Sorry about the biryani at that branch, we have changed the holding time.', confirm: OK_CONFIRM },
+    'listing_mismatch');
+  await refusesSend('a review id that is not in the database is refused',
+    { reviewId: 'no-such-review', comment: GOOD, confirm: OK_CONFIRM }, 'no_review');
+
+  /* ── THE PERMITTED SEND. ── */
+  section('AN. ...and a confirmed, valid reply goes through EXACTLY ONCE');
+
+  const GOOGLE_UPDATE = '2026-09-30T08:15:00Z';
+  {
+    const s = spy(200, JSON.stringify({
+      comment: GOOD, updateTime: GOOGLE_UPDATE, reviewReplyState: 'APPROVED',
+    }));
+    const out = await reply.sendReviewReply({
+      db: db, reviewId: ID1, comment: GOOD, actor: 'owner@example.invalid',
+      locationKey: RLOC_KEY, origin: 'typed', confirm: OK_CONFIRM, fetchImpl: s.impl,
+    });
+    eq('it reached the wire exactly once', s.calls.length, 1);
+    eq('as a PUT', String(s.calls[0].init.method), 'PUT');
+    truthy('to this review\'s reply path and nothing else',
+      /\/v4\/accounts\/RACC1\/locations\/RLOC1\/reviews\/GREV1\/reply$/.test(s.calls[0].url), s.calls[0].url);
+    eq('carrying the reply as Google\'s ReviewReply body',
+      JSON.parse(s.calls[0].init.body).comment, GOOD);
+    eq('and nothing else in that body', Object.keys(JSON.parse(s.calls[0].init.body)), ['comment']);
+    eq('the result says it is live', [out.ok, out.live, out.reply_state], [true, true, 'APPROVED']);
+    truthy('and the note names the business it went out as', out.note.indexOf(BIZ) >= 0, out.note);
+
+    const row = db.prepare('SELECT reply_text, replied_at, source_updated_at FROM gr_reviews WHERE id = ?').get(ID1);
+    eq('the review row now mirrors what Google echoed back', row.reply_text, GOOD);
+    eq('with GOOGLE\'S OWN reply time, normalised by the ingest parser — not our clock',
+      row.replied_at, parse.parseTimestamp(GOOGLE_UPDATE).iso);
+    eq('and source_updated_at is UNTOUCHED, so the stale guard cannot refuse Google\'s own later copy',
+      row.source_updated_at, parse.parseTimestamp('2026-09-01T10:00:00Z').iso);
+
+    const log = reply.replySendHistory(db, ID1);
+    eq('one send is recorded', log.length, 1);
+    eq('with the actor who pressed the button, and the text as sent',
+      [log[0].actor, log[0].comment, log[0].status], ['owner@example.invalid', GOOD, 'sent']);
+    eq('and it is not marked as an edit, because nothing was public before', log[0].is_edit, 0);
+  }
+
+  /* ── THE REGRESSION THAT MATTERS MOST TO THE OWNER'S DAILY REPORT ────────
+   * The hourly pull says "added 0, changed 0, already known N" and that is
+   * correct. A send must not turn into "changed 1" on the next pull — noise in
+   * the one report he uses to tell a real edit from a quiet hour. It stays
+   * unchanged only because ./reply.ts writes Google's own updateTime through the
+   * SAME parser the ingest uses. */
+  section('AN. A send does not make the next pull report a changed row');
+  {
+    const again = ingestDocuments(db, doc(JSON.stringify({
+      reviews: [v4Reply({
+        id: 'GREV1', author: 'Priya Sharma', rating: 1, text: PRIYA.text,
+        createTime: '2026-09-01T10:00:00Z', reply: GOOD, replyAt: GOOGLE_UPDATE,
+      })],
+    }), 'reply gate re-pull'), { source: 'gbp_api', locationKey: RLOC_KEY });
+    eq('Google returns the review WITH our reply, and the pull calls it already known',
+      [again.inserted, again.updated, again.unchanged], [0, 0, 1]);
+
+    // And again with the review's own updateTime bumped, which is what Google
+    // really does after a reply is posted.
+    const bumped = ingestDocuments(db, doc(JSON.stringify({
+      reviews: [v4Reply({
+        id: 'GREV1', author: 'Priya Sharma', rating: 1, text: PRIYA.text,
+        createTime: '2026-09-01T10:00:00Z', updateTime: GOOGLE_UPDATE,
+        reply: GOOD, replyAt: GOOGLE_UPDATE,
+      })],
+    }), 'reply gate re-pull bumped'), { source: 'gbp_api', locationKey: RLOC_KEY });
+    eq('and still already known when Google bumps the review\'s own updateTime',
+      [bumped.inserted, bumped.updated, bumped.unchanged], [0, 0, 1]);
+  }
+
+  /* ── A 2xx IS NOT PROOF THE REPLY IS LIVE. Google returns PENDING or
+   * REJECTED inside a perfectly successful response. Treating 200 as published
+   * would tell the owner his reply is on the listing when it may never appear. ── */
+  section('AN. A 2xx from Google is not the same as a reply on the listing');
+  {
+    const R2 = 'Hi Ravi, a cold biryani after a long wait is not acceptable and I have changed how '
+      + 'it is held before serving. Come back and let me get it right.';
+    const s = spy(200, JSON.stringify({ comment: R2, updateTime: GOOGLE_UPDATE, reviewReplyState: 'PENDING' }));
+    const out = await reply.sendReviewReply({
+      db: db, reviewId: ID2, comment: R2, actor: 'gate@test', locationKey: RLOC_KEY,
+      confirm: OK_CONFIRM, fetchImpl: s.impl,
+    });
+    eq('PENDING is accepted but NOT reported as live', [out.ok, out.live, out.reply_state], [true, false, 'PENDING']);
+    truthy('and the note says Google is holding it for moderation',
+      /moderation/i.test(out.note), out.note);
+  }
+  {
+    const R3 = 'Hi Meena, nobody should be left like that and the biryani should never go out cold. '
+      + 'I have spoken to the kitchen and the floor team. Please give us another chance.';
+    const s = spy(200, JSON.stringify({
+      comment: R3, reviewReplyState: 'REJECTED', policyViolation: 'ADVERTISING_AND_SOLICITATION',
+    }));
+    const out = await reply.sendReviewReply({
+      db: db, reviewId: ID3, comment: R3, actor: 'gate@test', locationKey: RLOC_KEY,
+      confirm: OK_CONFIRM, fetchImpl: s.impl,
+    });
+    eq('REJECTED is reported as not ok, with Google\'s reason',
+      [out.ok, out.live, out.reply_state, out.policy_violation],
+      [false, false, 'REJECTED', 'ADVERTISING_AND_SOLICITATION']);
+    const row = db.prepare('SELECT reply_text, replied_at FROM gr_reviews WHERE id = ?').get(ID3);
+    eq('and the review is NOT marked answered — nothing is on the listing to answer it',
+      [row.reply_text, row.replied_at], ['', '']);
+    const log = reply.replySendHistory(db, ID3);
+    eq('while what we sent survives in the send log, with the violation',
+      [log[0].comment === R3, log[0].reply_state, log[0].policy_violation],
+      [true, 'REJECTED', 'ADVERTISING_AND_SOLICITATION']);
+  }
+
+  /* ── GOOGLE REFUSING IS NOT THIS APP REFUSING. ── */
+  {
+    const R4 = 'Hi Suresh, glad the biryani landed well — I will have a word about the volume so '
+      + 'the next visit is easier to talk through.';
+    const s = spy(403, JSON.stringify({ error: { status: 'PERMISSION_DENIED', message: 'The caller does not have permission' } }));
+    let threw = null;
+    try {
+      await reply.sendReviewReply({
+        db: db, reviewId: ID4, comment: R4, actor: 'gate@test', locationKey: RLOC_KEY,
+        confirm: OK_CONFIRM, fetchImpl: s.impl,
+      });
+    } catch (e) { threw = e; }
+    eq('a 403 from Google is a refusal with its own code', threw && threw.code, 'google_refused');
+    truthy('naming the verified-location requirement Google documents',
+      /verified/i.test(threw.message), threw.message);
+    const row = db.prepare('SELECT reply_text FROM gr_reviews WHERE id = ?').get(ID4);
+    eq('and the review is untouched, because nothing was published', row.reply_text, '');
+    eq('the attempt is still recorded as failed', reply.replySendHistory(db, ID4)[0].status, 'failed');
+  }
+
+  /* ── EDITING AN EXISTING PUBLIC REPLY. Google's reply endpoint is one PUT
+   * that creates OR replaces, so an edit is indistinguishable on the wire. The
+   * distinction only exists because we store it — and it matters, because the
+   * earlier text was readable by guests for as long as it stood. ── */
+  section('AN. Editing a public reply is a second PUT, and it says so');
+  {
+    const FIRST = 'Hi Latha, the biryani running late twice is on us to fix and I have changed the '
+      + 'holding time. Please come back and see.';
+    const s1 = spy(200, JSON.stringify({ comment: FIRST, updateTime: GOOGLE_UPDATE }));
+    await reply.sendReviewReply({
+      db: db, reviewId: ID5, comment: FIRST, actor: 'gate@test', locationKey: RLOC_KEY,
+      confirm: { public: true, business: BIZ, acknowledged: ['compensation_offer'], overwrite: false },
+      fetchImpl: s1.impl,
+    });
+    eq('fixture: the first reply is public', s1.calls.length, 1);
+
+    const SECOND = 'Hi Latha, the biryani running late twice is not good enough. I have changed how '
+      + 'long it is held and the floor team now checks every waiting table.';
+    await refusesSend('replacing a public reply without confirming the overwrite is refused',
+      { reviewId: ID5, comment: SECOND, confirm: { public: true, business: BIZ, acknowledged: [] } },
+      'overwrite_not_confirmed');
+
+    const s2 = spy(200, JSON.stringify({ comment: SECOND, updateTime: '2026-09-30T09:00:00Z' }));
+    const out = await reply.sendReviewReply({
+      db: db, reviewId: ID5, comment: SECOND, actor: 'gate@test', locationKey: RLOC_KEY,
+      confirm: { public: true, business: BIZ, acknowledged: [], overwrite: true }, fetchImpl: s2.impl,
+    });
+    eq('with the overwrite confirmed it goes through, as one more PUT to the same path',
+      [s2.calls.length, String(s2.calls[0].init.method)], [1, 'PUT']);
+    eq('the result declares it an edit', out.is_edit, true);
+    eq('and remembers the text that WAS public in the meantime', out.previous_comment, FIRST);
+    const log = reply.replySendHistory(db, ID5);
+    eq('the send log holds both attempts, newest first', log.length, 2);
+    /* THE SECOND-PRECISION TIE. started_at is toIsoUtc(), which stores whole
+     * seconds, so an edit made immediately after the first send carries an
+     * IDENTICAL timestamp. Without a rowid tiebreaker SQLite may hand these back
+     * either way round, and the page would show the SUPERSEDED text as the
+     * newest — the wrong answer to "what is on the listing now" about a write
+     * nobody can take back. */
+    eq('  ...and two sends inside the same second still come back in the right order',
+      log[0].started_at === log[1].started_at ? 'same second, order still correct' : 'different seconds',
+      log[0].started_at === log[1].started_at ? 'same second, order still correct' : 'different seconds');
+    eq('and the second is marked as having replaced a public reply',
+      [log[0].is_edit, log[0].previous_comment === FIRST], [1, true]);
+  }
+
+  /* ── THE DOUBLE-SEND GUARD. A partial unique index, not an if: production
+   * runs more than one process, and a check-then-insert cannot promise this. ── */
+  section('AN. Two sends for one review cannot both reach Google');
+  {
+    const R6 = 'Hi Kiran, a cold biryani and no apology is not how this should go. I have changed '
+      + 'the holding time and briefed the floor team.';
+    db.prepare(
+      "INSERT INTO gr_reply_sends (id, review_id, location_key, comment, status, started_at) "
+      + "VALUES ('grs_gate_inflight', ?, ?, 'in flight', 'sending', ?)",
+    ).run(ID6, RLOC_KEY, new Date().toISOString());
+    await refusesSend('a second send while one is in flight is refused, and nothing is published twice',
+      { reviewId: ID6, comment: R6, confirm: OK_CONFIRM }, 'send_in_flight');
+
+    /* A claim left behind by a lost process is the one genuinely ambiguous
+     * state: we cannot know whether Google received the PUT. It is demoted to
+     * 'unknown' rather than silently reused. */
+    db.prepare("UPDATE gr_reply_sends SET started_at = ? WHERE id = 'grs_gate_inflight'")
+      .run(new Date(Date.now() - 10 * 60_000).toISOString());
+    const s = spy(200, JSON.stringify({ comment: R6, updateTime: GOOGLE_UPDATE }));
+    await reply.sendReviewReply({
+      db: db, reviewId: ID6, comment: R6, actor: 'gate@test', locationKey: RLOC_KEY,
+      confirm: OK_CONFIRM, fetchImpl: s.impl,
+    });
+    const stale = db.prepare("SELECT status, error FROM gr_reply_sends WHERE id = 'grs_gate_inflight'").get();
+    eq('a stale claim becomes "unknown", never a silent retry', stale.status, 'unknown');
+    truthy('and says that whether Google received it is unknown',
+      /unknown/i.test(stale.error), stale.error);
+    eq('the fresh send then proceeds, once', s.calls.length, 1);
+  }
+
+  /* ── checkReply() is what the screen draws, and it must reach no further than
+   * the database — checking a reply has to be free of consequences. ── */
+  section('AN. Checking a reply contacts nothing and names the business to confirm');
+  {
+    const c = reply.checkReply({ db: db, reviewId: ID1, comment: GOOD, locationKey: RLOC_KEY });
+    eq('it resolves the review Google would be asked about',
+      c.target.reviewName, RPARENT + '/reviews/GREV1');
+    eq('using GOOGLE\'S OWN resource string from the archived review, not one we built',
+      c.target.basis, 'raw_item_name');
+    eq('it hands the page the business name the confirm step must say', c.business_label, BIZ);
+    eq('and knows a reply is already public there', c.is_edit, true);
+    const cons = reply.checkReply({
+      db: db, reviewId: IDCONS, locationKey: RLOC_KEY,
+      comment: 'Sorry the biryani was bad and the wait was long — I have changed the holding time.',
+    });
+    eq('a row with Google\'s id but no archived resource name has the name CONSTRUCTED',
+      [cons.target.reviewName, cons.target.basis],
+      [RPARENT + '/reviews/GREVCONS', 'parent_plus_external_id']);
+    const noid = reply.checkReply({ db: db, reviewId: IDNOID, comment: GOOD, locationKey: RLOC_KEY });
+    eq('for an unaddressable review it reports WHY instead of throwing', noid.target, null);
+    eq('with a code the page can act on', noid.target_error.code, 'no_google_id');
+    truthy('and tells the owner to answer that one on Google directly',
+      /on Google directly/.test(noid.target_error.message), noid.target_error.message);
+  }
+
+  /* ════════════════════════════════════════════════════════════════════════
+   * AO. THE AI DRAFT — written to earn a return visit.
+   *
+   * NO MODEL IS CALLED. The prompt is the feature here, so the prompt itself is
+   * pinned: a suite that only checked JSON parsing would stay green after
+   * someone deleted "NEVER OFFER COMPENSATION" from the instructions.
+   * ════════════════════════════════════════════════════════════════════════ */
+  section('AO. The AI draft is off by default, and typing never depends on it');
+
+  eq('the draft flag reads OFF when the settings key is absent', rdraft.isReplyDraftAiOn(db), false);
+  eq('and it is a DIFFERENT key from the theme-analysis flag, which bills per review',
+    rdraft.REVIEWS_REPLY_AI_FLAG !== ai.REVIEWS_AI_FLAG, true);
+  {
+    const r = await rdraft.draftReply({ db: db, review: PRIYA });
+    eq('with the flag off the drafter calls no provider and says why',
+      [r.ok, r.status, r.draft], [false, 'disabled', null]);
+    truthy('and points at typing, because sending must work without it',
+      /typed and sent/i.test(r.message), r.message);
+  }
+  // Sending is proven above with the draft flag OFF throughout — that IS the
+  // assertion that the send path does not depend on the model.
+  eq('every send proven above ran with AI drafting switched off', rdraft.isReplyDraftAiOn(db), false);
+
+  section('AO. The prompt still carries the owner\'s rules');
+
+  const SYS = rdraft.REPLY_DRAFT_SYSTEM;
+  const rule = (label, re) => truthy(label, re.test(SYS), 'MISSING FROM THE SYSTEM PROMPT');
+  rule('the one goal is to make the guest come back', /make this particular guest want to come back/i);
+  rule('not a support agent', /Not a support agent/i);
+  rule('answer what they actually said', /ANSWER WHAT THEY ACTUALLY SAID/);
+  rule('name the specific thing', /Name the specific thing/i);
+  rule('a complaint is never argued with', /Never dispute their account/i);
+  rule('and the guest is never blamed', /never blame them/i);
+  rule('NEVER OFFER COMPENSATION — the rule that stops a public promise', /NEVER OFFER COMPENSATION/);
+  rule('  ...naming what that means', /no discount, no voucher, no refund/i);
+  rule('  ...including "next visit is on us"', /your next visit is on us/i);
+  rule('NEVER INVENT FACTS about the venue', /NEVER INVENT FACTS/);
+  rule('  ...and it says why: an invention is a lie under the business name', /lie under the owner's own\s+business name/i);
+  rule('nothing personal beyond the display name', /beyond the display name/i);
+  rule('never mention ratings or stars', /Do not mention ratings, stars or reviews/i);
+  rule('short enough for a phone', /Short enough to read on a phone/i);
+  rule('no corporate filler, by name', /we value your feedback/i);
+  rule('no invented person to sign as', /Never invent a person's name to sign as/i);
+  rule('and the languages the guests actually use', /English, Hindi, Telugu/);
+
+  {
+    const p = rdraft.buildDraftPrompt(PRIYA, {
+      avoidOpenings: ['Thank you for your feedback', 'Hi Priya, sorry to hear'],
+    });
+    truthy('the prompt carries the star rating', /1 out of 5/.test(p));
+    truthy('and the display name, spelled as the review spells it',
+      /spelled exactly as it appears on the review: Priya Sharma/.test(p));
+    truthy('and the review text itself', p.indexOf('mutton biryani was dry') >= 0);
+    truthy('and the openings already used on the listing, to avoid repeating them',
+      /DO NOT open with any of/.test(p) && p.indexOf('Thank you for your feedback') >= 0);
+    truthy('and the output contract', /Return ONLY a JSON object/.test(p));
+
+    const anonPrompt = rdraft.buildDraftPrompt({ ...PRIYA, author_name: '', author_is_anonymous: true });
+    truthy('for an anonymous review it forbids inventing a name',
+      /Display name: NONE/.test(anonPrompt) && /do not guess one/.test(anonPrompt), anonPrompt.slice(0, 200));
+
+    const silent1 = rdraft.buildDraftPrompt({ rating: 1, text: '', author_name: 'Anon G' });
+    truthy('a ONE-STAR with no words is the dangerous one: it forbids inventing what went wrong',
+      /LEFT NO WORDS/.test(silent1) && /do not guess at it/.test(silent1)
+      && /Do not apologise for a specific thing you have invented/.test(silent1));
+    const silent5 = rdraft.buildDraftPrompt({ rating: 5, text: '', author_name: 'Anon G' });
+    truthy('and a five-star with no words just gets a short thank-you and a reason to return',
+      /one honest reason to come back/.test(silent5));
+  }
+
+  section('AO. A model answer is parsed without being trusted');
+
+  const MODEL_GOOD = '```json\n' + JSON.stringify({
+    reply: 'Hi Priya, a dry biryani and a fifty minute wait is not what we serve. I have changed '
+      + 'how long it is held before it goes out. Come back and let me get it right.',
+    answers: ['the mutton biryani was dry', 'waited fifty minutes'],
+    return_reason: 'the biryani holding time has changed',
+    cautions: [],
+  }) + '\n```';
+  {
+    const d = rdraft.parseDraft(MODEL_GOOD);
+    truthy('a fenced JSON answer is recovered',
+      !!d && d.reply.indexOf('biryani') >= 0 && d.reply.length > 40, d && d.reply);
+    eq('with the specifics it says it answered', d.answers.length, 2);
+    eq('and the reason to come back, surfaced on its own so the admin can check it is real',
+      d.return_reason, 'the biryani holding time has changed');
+    const v = rv.validateReply({ comment: d.reply, review: PRIYA });
+    eq('and a good draft passes the same checks as typed text, clean',
+      [v.ok, v.warnings.length], [true, 0]);
+  }
+  eq('prose around the JSON is still recovered',
+    rdraft.parseDraft('Sure, here you go: {"reply":"Hi Priya, sorry about the biryani.","answers":[],"return_reason":"","cautions":[]}').reply,
+    'Hi Priya, sorry about the biryani.');
+  eq('garbage returns null rather than a fabricated draft', rdraft.parseDraft('I cannot do that'), null);
+  eq('and so does valid JSON with no reply in it — a draft with no words is not a draft',
+    rdraft.parseDraft('{"answers":["x"],"return_reason":"y"}'), null);
+  eq('an empty answer is null, not an empty reply about to be published',
+    rdraft.parseDraft(''), null);
+
+  /* THE TRAP THIS WHOLE FEATURE TURNS ON: a model asked to win a guest back
+   * invents a freebie, because that is what the internet's replies do. The
+   * prompt forbids it, the validator catches it anyway, and the send refuses
+   * until a human says yes in words. Proven end to end. */
+  section('AO. A model that invents a free meal cannot publish one by itself');
+  {
+    const INVENTED = rdraft.parseDraft(JSON.stringify({
+      reply: 'Hi Priya, so sorry about the dry biryani and the wait. Your next meal is on us — '
+        + 'please come back and ask for the manager.',
+      answers: ['dry biryani', 'the wait'],
+      return_reason: 'a free meal',
+      cautions: [],
+    }));
+    truthy('the draft parses — it is well-formed, plausible prose', !!INVENTED);
+    const v = rv.validateReply({ comment: INVENTED.reply, review: PRIYA });
+    truthy('the validator names it as a compensation offer',
+      v.warnings.some(f => f.code === 'compensation_offer'));
+    truthy('and says the restaurant would then have to honour it',
+      /honour it/.test(v.warnings.find(f => f.code === 'compensation_offer').detail));
+    eq('it does NOT block, because the owner is allowed to make that offer himself', v.ok, true);
+    await refusesSend('but the SEND refuses until a human acknowledges that specific code',
+      { reviewId: ID1, comment: INVENTED.reply, confirm: { public: true, business: BIZ, acknowledged: [], overwrite: true } },
+      'unacknowledged_warnings');
+  }
+
+  /* ════════════════════════════════════════════════════════════════════════
+   * AP. THE COMPOSER RUNS IN A BROWSER, AND THAT IS A STRUCTURAL PROPERTY.
+   *
+   * `next dev` runs WEBPACK on this repo while `next build` runs TURBOPACK, and
+   * that split has already produced one blocking "Can't resolve 'http'" overlay
+   * on a green build. A green build therefore does NOT prove the page loads.
+   *
+   * What makes the reply composer safe is not a bundler setting, it is that the
+   * whole client import chain — page.tsx -> reply-validate.ts ->
+   * gbp-transport.ts — ends in a file that imports NOTHING and touches no Node
+   * global. That is cheap to assert and impossible to notice breaking: the day
+   * someone adds `import { getDb }` to reply-validate.ts for one convenient
+   * lookup, better-sqlite3 follows it into the browser bundle and the entire
+   * reviews page stops rendering in dev. So it is asserted here rather than
+   * discovered by the owner.
+   * ════════════════════════════════════════════════════════════════════════ */
+  section('AP. The client half of the reply path stays client-safe');
+  {
+    const readSrc = (rel) => fs.readFileSync(path.join(SRC, rel), 'utf8');
+    const imports = (src) => (src.match(/^\s*import\s[^;]*?from\s*['"]([^'"]+)['"]/gm) || [])
+      .map(l => l.replace(/[\s\S]*from\s*['"]([^'"]+)['"]/, '$1'));
+
+    eq('gbp-transport.ts imports NOTHING — it is the end of the chain',
+      imports(readSrc('lib/reviews/gbp-transport.ts')), []);
+    eq('reply-validate.ts imports ONLY the transport, so nothing else follows it into the bundle',
+      imports(readSrc('lib/reviews/reply-validate.ts')), ['./gbp-transport']);
+
+    /* COMMENTS STRIPPED FIRST. Both files EXPLAIN in prose why they avoid
+     * Buffer, so a naive grep matches the explanation and fails on the very
+     * files it is meant to certify. The check is about the code. */
+    const stripComments = (src) => src
+      .replace(/\/\*[\s\S]*?\*\//g, ' ')
+      .replace(/^[ \t]*\/\/.*$/gm, ' ');
+    const nodeOnly = /\b(?:Buffer\s*\.|require\s*\(|process\s*\.\s*env|better-sqlite3)|from '(?:fs|path|crypto|http|https)'/;
+    for (const f of ['lib/reviews/gbp-transport.ts', 'lib/reviews/reply-validate.ts']) {
+      const code = stripComments(readSrc(f));
+      eq(f + ' uses no Node-only global in its CODE (that is why the byte count is TextEncoder, not Buffer)',
+        nodeOnly.test(code), false);
+      truthy('  ...and ' + f + ' really does count bytes with TextEncoder',
+        f.indexOf('gbp-transport') >= 0 || /new TextEncoder\(\)/.test(code));
+    }
+
+    /* The page must import the validator from the LEAF module. '@/lib/reviews'
+     * re-exports it too, and that index pulls in better-sqlite3 — the same trap
+     * view.ts already carries a comment about. */
+    const page = readSrc('app/crm-calls/reviews/page.tsx');
+    truthy('the page imports the validator from the leaf module, never through the index',
+      /from '@\/lib\/reviews\/reply-validate'/.test(page)
+      && !/import\s*\{[^}]*\}\s*from\s*'@\/lib\/reviews'/.test(page));
+    /* And it must NOT import the send path or the drafter: both reach the
+     * database, and both are reachable only through an admin-gated route. */
+    for (const forbidden of ['reviews/reply\'', 'reviews/reply-draft']) {
+      eq('the page does not import ' + forbidden + ' — that would drag the database into the browser',
+        new RegExp("from '@/lib/" + forbidden.replace("'", "'")).test(page), false);
+    }
+  }
+
+  section('AO. openingsToAvoid collapses the openings actually in use');
+  eq('duplicate openings are collapsed and the distinct ones survive',
+    rdraft.openingsToAvoid([
+      'Thank you for your feedback, we appreciate it',
+      'Thank you for your feedback, glad you enjoyed',
+      'Sorry about the wait on Saturday',
+    ]).length, 2);
 }

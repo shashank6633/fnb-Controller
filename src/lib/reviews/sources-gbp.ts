@@ -126,7 +126,9 @@ export const PREREQUISITES: string[] = [
  * exercised" on the same panel that had just exercised one. What remains below
  * is what is still genuinely unproven. */
 export const UNPROVEN: string[] = [
-  'The owner-reply write has NEVER been sent to Google. The app refuses every Google call except four permitted shapes, and the reply PUT is the only write among them — but that PUT has not been exercised, because the only way to exercise it is to publish a real reply on the real listing. What Google returns, and whether it comes back PENDING or REJECTED rather than live, will be seen on the first real send.',
+  'The owner-reply write has NEVER been sent to Google. The admin-only send path is built and every branch of it is proven against an injected fetch spy, but no byte has reached Google\'s reply endpoint — the only way to exercise it is to publish a real reply on the real listing, and a test string under a guest\'s review cannot be taken back. What Google returns on the first real send is unknown: in particular a 2xx does NOT mean the reply is live, because reviewReplyState can come back PENDING (held for moderation) or REJECTED (with a policyViolation) inside a perfectly successful response, and neither has been seen from this account.',
+  'Google documents the reply write as valid ONLY for a VERIFIED location. Whether this listing satisfies that check has not been confirmed, and it will show up as a refusal on the first send rather than as anything visible beforehand.',
+  'The AI reply drafter has never been run against a live model from this codebase. Its prompt, its parse-without-trusting layer and its validation are proven, and it is OFF by default — but the quality of what the configured provider actually returns for these reviews is unproven, which is exactly why a draft is a starting point an admin edits and passes through the same three checks as typed text.',
   'Google publishes NO read-only scope for Business Profile — business.manage, the full management scope, is the only one there is. So the token this app holds could in principle edit the listing, and what prevents that is the allowlist in gbp-transport.ts, not a narrower permission granted at consent time.',
   'The v4 Reviews endpoint has no separately published quota; the 300 QPM figure Google publishes is for the newer Business Profile APIs. Do not plan against a specific number for v4 reviews.',
   'Whether the business.manage scope is classed sensitive or restricted (which decides how heavy consent-screen verification is) has not been confirmed.',
@@ -695,11 +697,26 @@ export function gbpSource(db?: Database.Database, locationKey = ''): ReviewSourc
  *
  *    So the reply write exists, in exactly one place and nowhere else:
  *    gbpPutReviewReply() in ./gbp-transport.ts, the only non-GET shape that
- *    file permits. This connector does not call it — the admin-only send path,
- *    with the preview/validate/confirm checks the owner asked for, is its own
- *    surface. Two things did NOT change with that decision: the scope is still
- *    the full business.manage (Google publishes no read-only alternative), and
- *    every other write remains impossible in code rather than merely unused.
+ *    file permits. THIS CONNECTOR STILL DOES NOT CALL IT. The send path is its
+ *    own surface and now exists:
+ *
+ *      ./reply-validate.ts  the automatic check, pure, shared with the browser
+ *      ./reply.ts           resolve the review, confirm, send, record, mirror
+ *      ./reply-draft.ts     the optional AI draft (off by default, never sent)
+ *      /api/crm-calls/reviews/reply{,/check,/draft}   admin only, all three
+ *
+ *    Two things did NOT change with that decision: the scope is still the full
+ *    business.manage (Google publishes no read-only alternative), and every
+ *    other write remains impossible in code rather than merely unused.
+ *
+ *    What this connector DOES owe the reply path is the mirror. The hourly pull
+ *    is the authority on what a reply says: it overwrites gr_reviews.reply_text
+ *    from whatever Google currently serves, so a reply rejected at moderation
+ *    correctly goes back to unanswered here. ./reply.ts therefore writes its
+ *    copy in the exact shape this parser produces — Google's own
+ *    reviewReply.updateTime through parseTimestamp() — so a send does not show
+ *    up in the next pull as a changed row. What we SENT survives separately in
+ *    gr_reply_sends, which no ingest ever touches.
  *
  *  • No delete, flag or moderate. Google exposes no flagging or moderation at
  *    all, and pretending otherwise on a page would be worse than the absence.
