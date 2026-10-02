@@ -14,6 +14,39 @@
  * To add a page: append it to its section (or create a new section).
  */
 
+// The Guest Feedback floor gate. `src/lib/feedback/access.ts` imports NOTHING,
+// which is what makes it safe here: page-catalog is bundled into client
+// components (Sidebar, /customers, /settings/page-access), so an import that
+// reached for `@/lib/db` would drag better-sqlite3 into the browser. Keep it
+// that way. The dependency is one-way — access.ts must never import this file.
+import { canOpenFeedbackFloor, isFeedbackPath } from './feedback/access';
+
+/**
+ * The user shape every gate in this file reads. Structural, not `SessionUser`,
+ * for the bundle reason above — three different producers build it:
+ *   · `getCurrentUser()`    (src/lib/auth.ts) — the full session user
+ *   · `proxy.ts` step 2b    — its own narrower SELECT, resolved through roles
+ *   · `/api/auth/me` → JSON — what the Sidebar filters with
+ *
+ * `role_name` is the newest field and the only one that can be legitimately
+ * absent: it resolves from `users.role_id`, which is NULL for every user on the
+ * measured database. Every gate that reads it treats absent as DENY.
+ */
+export interface CatalogUser {
+  role?: string;
+  page_access?: string | null;
+  is_head_chef?: boolean;
+  /** `roles.name` of the assigned role, or null/absent when none is assigned.
+   *  Read only by the `greOnly` gate. Absent ⇒ denied, never granted. */
+  role_name?: string | null;
+  /** `roles.is_active` for the assigned role, or null when none is assigned.
+   *  Read only by the `greOnly` gate: a positively-false value refuses the GRE
+   *  match, absent/null means "not looked up" and changes nothing. It does NOT
+   *  affect tier or page-map resolution, which must keep honouring a
+   *  deactivated role (auth.ts:104-107) or deactivation would escalate. */
+  role_is_active?: boolean | number | null;
+}
+
 export interface PageEntry {
   /** Path that proxy.ts + sidebar will match against */
   path: string;
@@ -67,6 +100,27 @@ export interface PageEntry {
    * see the '/boh' entry below.
    */
   impliedBy?: string;
+
+  /**
+   * When true, only the NAMED GRE role (`roles.name`, matched by
+   * `canOpenFeedbackFloor` in `src/lib/feedback/access.ts`) or management —
+   * Admin, any Manager tier including Floor Manager, or an HOD — may see/open
+   * this page. Used by the three Guest Feedback floor pages.
+   *
+   * ⚠️ IT IS THE FIRST FLAG HERE THAT READS A NAMED ROLE, NOT A TIER. The other
+   * three resolve from `role` / `is_head_chef`, which every caller already had.
+   * This one needs `role_name`, which `getCurrentUser()` resolves but which
+   * `proxy.ts` step 2b did NOT select until this flag was added — a flag whose
+   * data the proxy cannot see would have denied the very users it exists for.
+   * If you add a `greOnly` page, confirm the proxy still selects `r.name`.
+   *
+   * ⚠️ IT FAILS CLOSED. `role_name` is NULL for every user whose `users.role_id`
+   * is NULL — all 9 on the measured database — so this denies until the owner
+   * ASSIGNS the role he created. That is the intent: `canAccessPage` grants
+   * every unflagged page to a null-map user (8 of those 9), and the feedback
+   * floor pages must not be among them.
+   */
+  greOnly?: boolean;
 }
 
 export interface PageSection {
@@ -195,6 +249,76 @@ export const PAGE_CATALOG: PageSection[] = [
       { path: '/direct-items',        label: 'Direct Items' },
       { path: '/sales',               label: 'Sales Upload' },
       { path: '/dine-in/reconciliation', label: 'Reconciliation' },
+    ],
+  },
+  // Guest Feedback & Service Recovery. Its own section rather than four more
+  // rows under Dine-In: the people who live on these pages (GRE / Floor
+  // Manager) are not the people who live on Order Floor and Cashier, and the
+  // whole point of the module is that the GRE has READ-ONLY access to
+  // everything in that section above.
+  //
+  // ⚠️ THREE THINGS A READER MUST KNOW BEFORE EDITING THIS BLOCK.
+  //
+  // 1. THIS IS NOT THE SECURITY BOUNDARY. proxy.ts guards PAGES, NOT APIs, and
+  //    canAccessPage fails open FOUR ways (null page_access map — true for 8 of
+  //    9 users today; garbled JSON; an empty array; a prefix grant opening every
+  //    descendant) plus a fifth in proxy.ts's own `catch { /* fail open */ }`.
+  //    Every /api/feedback/* route gates itself with canUseFeedback() /
+  //    canUseFeedbackAnalytics() from src/lib/feedback.ts. These flags decide
+  //    what is VISIBLE, nothing more.
+  //
+  // 2. THE OWNER'S READ-ONLY CONSTRAINT CANNOT BE MET BY HIDING BUTTONS, and
+  //    removing a page from a GRE's map does not close a single POS endpoint.
+  //    The enforcement is isReadOnlyFeedbackUser() called inside the POS
+  //    handlers themselves (P2). Do not "simplify" this by assuming the catalog
+  //    protects anything.
+  //
+  // 3. §7 Q1 IS ANSWERED — the owner created a "GRE" role (base role Staff) in
+  //    PRODUCTION on 2026-09-22, so pages 1-3 now carry `greOnly` and the gate
+  //    is live. The role NAME is one line: GRE_ROLE_NAME in
+  //    src/lib/feedback/access.ts.
+  //
+  //    Before this, pages 1-3 carried no flag at all and canAccessPage's
+  //    null-map backward-compat grant therefore opened them to any signed-in
+  //    user — measured: 8 of the 9 users on this database have page_access
+  //    NULL, so a Captain and a Cashier could both open the GRE's floor board.
+  //    greOnly closes that, and closes it FAIL-CLOSED: `role_name` resolves
+  //    only through `users.role_id`, which is NULL for all 9 users today, so a
+  //    would-be GRE is denied until the role is actually ASSIGNED to the login.
+  //    Creating the role is half the job; assigning it is the other half.
+  {
+    label: 'Guest Feedback',
+    pages: [
+      // Page 1 — the mobile floor board. Path is /feedback and NOT
+      // /captain/feedback even though it borrows the Captain app's look:
+      // AppShell.tsx:16 grants the chrome-free `bare` layout to anything under
+      // /captain, and putting a GRE surface inside that prefix would hand it a
+      // Captain page-access grant by prefix (canAccessPage rule 4 opens every
+      // descendant of a granted path). The layout is worth less than the gate.
+      { path: '/feedback',            label: 'Floor Feedback', greOnly: true },
+      // Page 2 — one order at a time, reached as /feedback/take/<orderId>.
+      // bestEntry() is longest-prefix, so the child route resolves to this
+      // entry and inherits exactly its flags.
+      { path: '/feedback/take',       label: 'Take Feedback', greOnly: true },
+      // Page 3 — the shift-level tracker. Floor-facing on purpose: a GRE must
+      // see their own pending list, and the fairness ruling means coverage is
+      // not a stick to hide from them.
+      { path: '/feedback/tracker',    label: 'Feedback Tracker', greOnly: true },
+      // Page 4 — Admin Analytics & Reports, including all EIGHT downloads
+      // (§3 puts the reports here, not on a fifth page).
+      //
+      // mgmtOnly, for the same reason /reports/sales is: it ranks NAMED STAFF
+      // (GRE/Manager Performance) and exports guest comments and contact-level
+      // recovery history in bulk. The fairness ruling makes this stricter, not
+      // looser — "the system should not judge GRE performance based on positive
+      // feedback", and a league table left open to the floor is precisely the
+      // pressure that makes a GRE stop recording complaints.
+      //
+      // mgmtOnly = admin OR role 'manager' OR is_head_chef, and it is checked
+      // BEFORE the null-map backward-compat grant in canAccessPage, so legacy
+      // full-access staff are locked out too. Widening it later is a one-word
+      // change; starting narrow is the reversible direction.
+      { path: '/feedback/analytics',  label: 'Feedback Analytics', mgmtOnly: true },
     ],
   },
   {
@@ -838,6 +962,66 @@ export function isMgmtOnlyPath(pathname: string): boolean {
 export function isAdminOnlyPath(pathname: string): boolean {
   return !!bestEntry(pathname)?.adminOnly;
 }
+/**
+ * Is `pathname` under a GRE-gated catalog entry (the Guest Feedback floor
+ * pages)? Longest-prefix like the three above, which is what keeps
+ * /feedback/analytics on its own mgmtOnly entry instead of inheriting this one.
+ */
+export function isGreOnlyPath(pathname: string): boolean {
+  return !!bestEntry(pathname)?.greOnly;
+}
+
+/**
+ * Does this role's `page_access` list say ANYTHING about the Guest Feedback
+ * module?
+ *
+ * ── WHY THIS QUESTION EXISTS, AND WHAT IT DECIDES ───────────────────────────
+ * Measured on this branch (probe `floor-managers-and-null-role`, 2026-09-23): a
+ * **Floor Manager gets 403 on all four feedback pages while `GET
+ * /api/feedback/floor` answers 200 `scope=management`**. The module's own gate
+ * admits them; `canAccessPage`'s last line then refuses, because the Floor
+ * Manager role carries an explicit list — `["/","/dine-in/floor",…,
+ * "/dine-in/reservations"]` — with no `/feedback` entry. Six of the ten roles on
+ * this snapshot carry such a list, including every management role the module
+ * intends to admit, and the owner's spec names "GRE **or Floor Manager**" on
+ * every page.
+ *
+ * The reason the entry is missing is not that the owner decided against it:
+ * **this module has never shipped, so no role's list could possibly mention it.**
+ * Every one of those lists was written before `/feedback` existed. Treating
+ * "absent" as "denied" therefore reads an opinion into silence — and the result
+ * is a module whose API says yes and whose page says no, to the four people
+ * production has actually assigned.
+ *
+ * ── THE RULE, STATED ONCE ───────────────────────────────────────────────────
+ *   For `/feedback*`, the MODULE'S OWN GATE decides who may enter. A role's
+ *   `page_access` list can only NARROW that, never widen it.
+ *
+ * So:
+ *   · list never mentions the module  → the module's gate is the whole answer
+ *     (this function returns false, and `canAccessPage` grants).
+ *   · list mentions the module at all → the owner has an opinion; his list is
+ *     honoured exactly, page by page, and a feedback page he left out is
+ *     refused with the existing "tick it in Settings → Roles" card in
+ *     `proxy.ts`. **Ticking one feedback page switches that role from
+ *     module-governed to list-governed** — that is the lever, and it is the
+ *     only way to take a page away from someone the gate admits.
+ *   · the gate itself is untouched: a Captain, a Cashier or a legacy Staff
+ *     login is refused by `greOnly` LONG before this, and adding `/feedback` to
+ *     their list cannot let them in.
+ *
+ * Anchored, never a substring: `isFeedbackPath()` matches `/feedback` and
+ * `/feedback/...` only, so `/feedback-notes` in some future list is not a
+ * mention of this module. Parsing failures answer **false** (= module-governed),
+ * matching `canAccessPage`'s own "garbled value → don't lock out" direction.
+ */
+export function feedbackListedInMap(page_access: string | null | undefined): boolean {
+  if (!page_access) return false;
+  let allowed: unknown;
+  try { allowed = JSON.parse(page_access); } catch { return false; }
+  if (!Array.isArray(allowed)) return false;
+  return allowed.some((p) => typeof p === 'string' && isFeedbackPath(p.trim()));
+}
 
 /**
  * The companion path whose grant also opens `pathname`, or null.
@@ -882,7 +1066,7 @@ export const ALWAYS_ALLOWED: string[] = ['/login', '/launch'];
  * re-blocks them. Purely a routing convenience — every page still enforces its
  * own access; this never grants anything.
  */
-export function homePathFor(user: { role?: string; page_access?: string | null; is_head_chef?: boolean } | null): string {
+export function homePathFor(user: CatalogUser | null): string {
   if (!user) return '/login';
   const isMgmt = user.role === 'admin' || user.role === 'manager' || user.is_head_chef;
   // Legacy full-access (null map) NON-management users: canAccessPage grants
@@ -972,7 +1156,7 @@ export function homePathFor(user: { role?: string; page_access?: string | null; 
   return '/login';
 }
 
-export function firstAllowedPath(user: { role?: string; page_access?: string | null; is_head_chef?: boolean } | null): string {
+export function firstAllowedPath(user: CatalogUser | null): string {
   if (!user) return '/login';
   if (user.role === 'admin') return '/';
   if (!user.page_access) return '/';                     // null map = full access → /
@@ -986,10 +1170,16 @@ export function firstAllowedPath(user: { role?: string; page_access?: string | n
   // a non-HOD isn't redirected to a page that immediately re-blocks them.
   for (const section of PAGE_CATALOG) {
     for (const p of section.pages) {
+      // The tier tests here are hand-rolled rather than canAccessPage, so every
+      // flag MUST be repeated — a missing one lands the user on a page the
+      // proxy then blocks, and since this function IS the proxy's fallback
+      // target that is a redirect loop, not a cosmetic bug. greOnly was the
+      // fourth flag; there are four tests below for that reason.
       if (allowed.includes(p.path)
         && !(p.hodOnly && !user.is_head_chef)
         && !(p.mgmtOnly && !(user.role === 'manager' || user.is_head_chef))
-        && !(p.adminOnly && user.role !== 'admin')) return p.path;
+        && !(p.adminOnly && user.role !== 'admin')
+        && !(p.greOnly && !canOpenFeedbackFloor(user))) return p.path;
     }
   }
   return '/login';
@@ -1007,7 +1197,7 @@ export function firstAllowedPath(user: { role?: string; page_access?: string | n
  */
 export function canAccessPage(
   pathname: string,
-  user: { role?: string; page_access?: string | null; is_head_chef?: boolean } | null,
+  user: CatalogUser | null,
 ): boolean {
   if (!user) return false;
   if (user.role === 'admin') return true;
@@ -1028,6 +1218,24 @@ export function canAccessPage(
   // legacy full-access staff can't reach it either. (Admins already returned
   // true above, so this only ever affects non-admins.)
   if (isAdminOnlyPath(pathname)) return false;
+
+  // GRE-gated pages (the Guest Feedback floor pages): a non-admin must either
+  // be management or carry the ASSIGNED named GRE role. Runs here, before the
+  // null-map grant, for the same reason as the three gates above — and it
+  // matters more here than for any of them, because `role_name` is null for
+  // every user until a role is assigned, so a mis-ordered check would have
+  // opened these pages to all 8 null-map users instead of closing them.
+  if (isGreOnlyPath(pathname) && !canOpenFeedbackFloor(user)) return false;
+
+  // Guest Feedback governs its own door — see `feedbackListedInMap()` for the
+  // measurement and the rule. Reaching this line means the flag gates above
+  // already said YES (greOnly for pages 1-3, mgmtOnly for analytics), so the
+  // only thing left to ask is whether the owner has expressed an opinion about
+  // this module in the role's list. He cannot have, on any role written before
+  // the module existed, and "absent" must not read as "denied" — a Floor
+  // Manager was getting 403 on the page while the API served them the board.
+  // A list that DOES mention the module falls through and is honoured exactly.
+  if (isFeedbackPath(pathname) && !feedbackListedInMap(user.page_access)) return true;
 
   // No explicit map → grant everything (backward compat)
   if (!user.page_access) return true;
@@ -1148,7 +1356,7 @@ function nearestCatalogAncestor(pathname: string): string | null {
  */
 export function canAccessPageStrict(
   pathname: string,
-  user: { role?: string; page_access?: string | null; is_head_chef?: boolean } | null,
+  user: CatalogUser | null,
 ): boolean {
   // ── Gates below are copied verbatim from canAccessPage. Keep them in sync.
   if (!user) return false;
@@ -1157,6 +1365,11 @@ export function canAccessPageStrict(
   if (isHodOnlyPath(pathname) && !user.is_head_chef) return false;
   if (isMgmtOnlyPath(pathname) && !(user.role === 'manager' || user.is_head_chef)) return false;
   if (isAdminOnlyPath(pathname)) return false;
+  if (isGreOnlyPath(pathname) && !canOpenFeedbackFloor(user)) return false;
+  // Kept in sync with canAccessPage deliberately: this function is MEASURED,
+  // not wired up, and the day it is wired up the feedback module must not
+  // silently go back to 403ing every management role whose list predates it.
+  if (isFeedbackPath(pathname) && !feedbackListedInMap(user.page_access)) return true;
   if (!user.page_access) return true;
 
   let allowed: string[];

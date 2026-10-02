@@ -8621,6 +8621,176 @@ function initializeSchema(db: Database.Database) {
       CREATE INDEX IF NOT EXISTS idx_hr_notif_rcpt ON hr_notifications(recipient_email, is_read);
     `);
   } catch (e) { console.error('hrms schema failed:', e); }
+
+  // ══ GUEST FEEDBACK & SERVICE RECOVERY (gf_) ════════════════════════════════
+  // Deliberately the LAST block in initializeSchema and isolated in its own
+  // try/catch, so a hiccup here can never break a table above it — and so a
+  // carve that must prove "zero feedback paths" has one contiguous region to
+  // lift out. Vocabulary lives in src/lib/feedback.ts; the comments below name
+  // the wire values so a reader of the DDL never has to open that file to know
+  // what a column may hold.
+  //
+  // THE MODULE IS ALMOST ENTIRELY A READ over existing POS data. These three
+  // tables hold ONLY what the guest said and what was done about it. Nothing
+  // here duplicates an order, an item or a bill — `order_id` / `order_item_id`
+  // are the join back, and the few snapshot columns (table_number, floor,
+  // covers, captain_name, item_name, station) exist because a renamed table or
+  // a re-stationed dish must not retro-rewrite last month's complaints.
+  //
+  // ⚠️ NO FOREIGN KEYS, matching house style everywhere else in this file
+  // (better-sqlite3 here does not enable foreign_keys, so a declared FK would
+  // be decorative, and an ON DELETE CASCADE that silently worked one day would
+  // erase the service-recovery record the owner asked for). Orphan rows are
+  // handled by the reading query, never by the database deleting evidence.
+  try {
+    db.exec(`
+      -- ── gf_visits ─ ONE row per ORDER the GRE has taken feedback on. ───────
+      -- A REVISIT DOES NOT CREATE A SECOND ROW. The owner's cycle is
+      -- "GRE Visits → … → GRE Revisits → Guest Satisfaction Checked → Issue
+      -- Closed"; the revisit writes gf_follow_ups, so coverage (Feedback Taken
+      -- ÷ Eligible Tables) stays a straight COUNT and cannot be inflated by
+      -- visiting the same table twice.
+      CREATE TABLE IF NOT EXISTS gf_visits (
+        id              TEXT PRIMARY KEY,
+        outlet_id       TEXT NOT NULL DEFAULT '',
+        order_id        TEXT NOT NULL,
+        table_id        TEXT NOT NULL DEFAULT '',
+        -- Snapshots taken at visit time. floor is restaurant_tables.ZONE:
+        -- there is no 'floor' column on that table and SELECT floor errors;
+        -- sales-reports.ts, sales-dashboard.ts and stale-tables.ts all already
+        -- alias 'zone AS floor'. An empty zone renders as the literal 'Floor'
+        -- in the Captain UI (CaptainShell.tsx:31), so a Floor filter must
+        -- bucket '' and 'Floor' together the way captain-area.ts:30 does.
+        table_number    TEXT NOT NULL DEFAULT '',
+        floor           TEXT NOT NULL DEFAULT '',
+        covers          INTEGER NOT NULL DEFAULT 0,   -- Pax  (orders.covers)
+        captain_name    TEXT NOT NULL DEFAULT '',     -- orders.server_name
+        items_ordered   INTEGER NOT NULL DEFAULT 0,   -- COUNT(order_items) at visit
+        -- Who took it. Recorded from the SESSION, never from the request body.
+        gre_user_id     TEXT NOT NULL DEFAULT '',
+        gre_email       TEXT NOT NULL DEFAULT '',
+        gre_name        TEXT NOT NULL DEFAULT '',
+        gre_role        TEXT NOT NULL DEFAULT '',     -- role_name at visit time
+        -- The 10-20 second happy path: "Everything Good" → Submit. 1 means the
+        -- GRE affirmed it, NOT that fields were left blank — an abandoned form
+        -- never becomes a row at all.
+        everything_good INTEGER NOT NULL DEFAULT 0,
+        overall_rating  TEXT NOT NULL DEFAULT '',     -- excellent|good|average|poor|''
+        -- The four categories. '' is legitimate: §3 says "Not every field
+        -- mandatory".
+        cat_food        TEXT NOT NULL DEFAULT '',     -- excellent|good|average|poor|''
+        cat_drinks      TEXT NOT NULL DEFAULT '',
+        cat_service     TEXT NOT NULL DEFAULT '',
+        cat_ambience    TEXT NOT NULL DEFAULT '',
+        comment         TEXT NOT NULL DEFAULT '',
+        status          TEXT NOT NULL DEFAULT 'taken',-- taken|issue|follow_up
+        -- Denormalised counters, maintained in the same transaction as the rows
+        -- they count. They are a CACHE, never the truth: every one of them is
+        -- recomputable from gf_item_feedback / gf_follow_ups, and P6's
+        -- verification must prove they agree. They exist because Page 1 polls a
+        -- table board every few seconds and must not aggregate two tables per
+        -- card to colour a pill.
+        has_negative    INTEGER NOT NULL DEFAULT 0,
+        follow_ups_total INTEGER NOT NULL DEFAULT 0,
+        open_follow_ups INTEGER NOT NULL DEFAULT 0,
+        created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      -- One feedback record per order, enforced by the database rather than by
+      -- every writer remembering to check. Deliberately a UNIQUE INDEX and not
+      -- a table-level UNIQUE: there is no migration framework here, and an
+      -- index can be dropped in a later boot block with one DROP INDEX, while a
+      -- table constraint would need a full rebuild of a table holding live
+      -- guest complaints.
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_gf_visits_order ON gf_visits(order_id);
+      CREATE INDEX IF NOT EXISTS idx_gf_visits_table   ON gf_visits(table_id);
+      CREATE INDEX IF NOT EXISTS idx_gf_visits_created ON gf_visits(created_at);
+      CREATE INDEX IF NOT EXISTS idx_gf_visits_gre     ON gf_visits(gre_user_id, created_at);
+      CREATE INDEX IF NOT EXISTS idx_gf_visits_open    ON gf_visits(open_follow_ups);
+
+      -- ── gf_item_feedback ─ per ORDERED ITEM. ──────────────────────────────
+      CREATE TABLE IF NOT EXISTS gf_item_feedback (
+        id              TEXT PRIMARY KEY,
+        visit_id        TEXT NOT NULL,
+        order_id        TEXT NOT NULL DEFAULT '',
+        order_item_id   TEXT NOT NULL DEFAULT '',
+        menu_item_id    TEXT NOT NULL DEFAULT '',
+        item_name       TEXT NOT NULL DEFAULT '',     -- snapshot of order_items.name
+        -- station is stored RAW, exactly as the line was ordered, and
+        -- item_group is the answer stationKdsSection() gave at WRITE time.
+        -- Both, not one: the classifier is TOTAL (a blank, NULL, typo'd or
+        -- renamed station silently returns 'kitchen' = Food), so keeping the
+        -- raw value is the only way Page 4 can count how often a drink was
+        -- mis-filed instead of letting it vanish into Food. Resolving the group
+        -- at write time also means a station renamed next year cannot
+        -- reclassify last month's complaints.
+        station         TEXT NOT NULL DEFAULT '',
+        item_group      TEXT NOT NULL DEFAULT 'food', -- food|drinks
+        quantity        REAL NOT NULL DEFAULT 0,
+        rating          TEXT NOT NULL DEFAULT '',     -- good|average|poor|''
+        issue           TEXT NOT NULL DEFAULT '',
+          -- taste|too_spicy|too_salty|cold|dry|overcooked|undercooked|
+          -- presentation|quantity|delay|other|''
+        comment         TEXT NOT NULL DEFAULT '',
+        action_taken    TEXT NOT NULL DEFAULT 'none',
+          -- none|returned|remade|replaced_same|replaced_other|cancelled
+        -- §7 Q3, answered the honest way: record WHICH item was given instead.
+        -- Two columns, and they are what stop Menu Item Analysis reporting a
+        -- replacement as a sale of the dish that was sent back.
+        replacement_menu_item_id TEXT NOT NULL DEFAULT '',
+        replacement_item_name    TEXT NOT NULL DEFAULT '',
+        is_negative     INTEGER NOT NULL DEFAULT 0,   -- rating IN (poor, average)
+        created_by      TEXT NOT NULL DEFAULT '',
+        created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      -- One feedback row per ordered line, for the same reason as above: a
+      -- second row for the same line would double-count the complaint in every
+      -- Page 4 rate. Same rationale for an INDEX over a table constraint.
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_gf_item_line
+        ON gf_item_feedback(visit_id, order_item_id);
+      CREATE INDEX IF NOT EXISTS idx_gf_item_visit  ON gf_item_feedback(visit_id);
+      CREATE INDEX IF NOT EXISTS idx_gf_item_menu   ON gf_item_feedback(menu_item_id);
+      CREATE INDEX IF NOT EXISTS idx_gf_item_neg    ON gf_item_feedback(is_negative, created_at);
+      CREATE INDEX IF NOT EXISTS idx_gf_item_action ON gf_item_feedback(action_taken);
+
+      -- ── gf_follow_ups ─ THE OPEN COMPLAINT. ───────────────────────────────
+      -- The owner, verbatim: "Remade/Replaced ⇒ automatically create Follow-Up
+      -- Required, and the complaint stays OPEN until the GRE revisits."
+      -- So: a row is born status='open' the moment an item feedback records
+      -- remade / replaced_same / replaced_other, and NOTHING closes it except a
+      -- recorded revisit whose happiness is 'happy'. There is no auto-close, no
+      -- expiry sweep and no cascade — settling the bill does not close it, and
+      -- neither does the end of the day. "Partially Happy" and "No - Still
+      -- Unhappy" both leave status='open' and stamp escalated_at, which is the
+      -- owner's "stays open for Manager attention".
+      CREATE TABLE IF NOT EXISTS gf_follow_ups (
+        id               TEXT PRIMARY KEY,
+        visit_id         TEXT NOT NULL,
+        item_feedback_id TEXT NOT NULL,
+        order_id         TEXT NOT NULL DEFAULT '',
+        table_id         TEXT NOT NULL DEFAULT '',
+        item_name        TEXT NOT NULL DEFAULT '',
+        action_taken     TEXT NOT NULL DEFAULT '',    -- the action that created it
+        status           TEXT NOT NULL DEFAULT 'open',-- open|closed
+        revisit_rating   TEXT NOT NULL DEFAULT '',    -- excellent|good|average|still_poor|''
+        happiness        TEXT NOT NULL DEFAULT '',    -- happy|partial|unhappy|''
+        revisit_comment  TEXT NOT NULL DEFAULT '',
+        revisited_at     TEXT NOT NULL DEFAULT '',
+        revisited_by     TEXT NOT NULL DEFAULT '',
+        closed_at        TEXT NOT NULL DEFAULT '',
+        closed_by        TEXT NOT NULL DEFAULT '',
+        escalated_at     TEXT NOT NULL DEFAULT '',    -- revisited but NOT closed
+        created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at       TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_gf_followup_item
+        ON gf_follow_ups(item_feedback_id);
+      CREATE INDEX IF NOT EXISTS idx_gf_fu_visit  ON gf_follow_ups(visit_id);
+      CREATE INDEX IF NOT EXISTS idx_gf_fu_open   ON gf_follow_ups(status, created_at);
+      CREATE INDEX IF NOT EXISTS idx_gf_fu_table  ON gf_follow_ups(table_id, status);
+    `);
+  } catch (e) { console.error('guest-feedback schema failed:', e); }
 }
 
 // ---- UTILITY FUNCTIONS ----

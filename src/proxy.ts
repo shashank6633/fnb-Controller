@@ -2,6 +2,10 @@ import { NextRequest, NextResponse } from 'next/server';
 import { canAccessPage, firstAllowedPath } from '@/lib/page-catalog';
 import { loadHodOnlyOverrides } from '@/lib/hod-overrides';
 import { getDb } from '@/lib/db';
+import {
+  feedbackAccess, isFeedbackAnalyticsPath, isFeedbackPath,
+} from '@/lib/feedback/access';
+import { refusePosWrite, posWriteRefusalBody } from '@/lib/feedback/pos-readonly';
 
 /**
  * Next.js 16 proxy (formerly `middleware`) — runs at the network boundary on the
@@ -127,6 +131,31 @@ const CSRF_REQUIRED_PREFIXES = [
   // extension, so neither isPublic() carve-out can make any of it public — and
   // the /api/ hard floor below (9224f6d) is untouched by this edit.
   '/api/bill-submissions',
+  // Guest Feedback & Service Recovery — one prefix covers every present and
+  // future feedback mutation (visits, item feedback, follow-ups, revisits).
+  // Added at P1 with the schema, BEFORE any route exists, deliberately: Bill
+  // Handover shipped without its line and a POST carrying no CSRF header
+  // reached app code — measured, not theorised.
+  //
+  // ⚠️ A BAD PATH NAME USED TO NULLIFY THIS ENTRY, AND NO LONGER CAN. When this
+  // comment was written isPublic() returned true for any pathname CONTAINING
+  // '/print' and for anything matching the static-asset regex, so a route named
+  // /api/feedback/reports/print or /api/feedback/board.json would have been
+  // public AND CSRF-exempt whatever this list said. main has since fixed that
+  // (9224f6d): isPublic() now has a HARD `/api/` floor returning false before
+  // any pattern can match, and the print carve-out is four anchored regexes
+  // rather than a substring. The naming discipline below is still worth keeping
+  // — it costs nothing — but it is no longer the only thing standing between a
+  // feedback route and the public internet.
+  // No feedback path should contain 'print' or end .png/.jpg/.json. Report
+  // downloads take the report key as a QUERY PARAMETER (?report=daily).
+  //
+  // CSRF is not authorisation. The cookie is httpOnly:false and src/lib/api.ts
+  // reads it straight back out, so a signed-in caller holds both halves of the
+  // double-submit pair by design. This line stops a third-party site forging a
+  // write; it does nothing about WHO is signed in. That is the route's own job
+  // (canUseFeedback / isReadOnlyFeedbackUser in src/lib/feedback.ts).
+  '/api/feedback',
 ];
 
 // Print PAGES that must render without bouncing through /login — the four paths
@@ -282,7 +311,8 @@ export function proxy(req: NextRequest) {
       // mirroring getCurrentUser(): a role-based user's page_access lives on the
       // role, not the user row — read it here or page gating fails open.
       const row = db.prepare(`
-        SELECT u.role, u.page_access, u.role_id, u.is_head_chef,
+        SELECT u.role, u.page_access, u.role_id, u.is_head_chef, u.section,
+               r.name AS role_name, r.is_active AS role_active,
                r.base_role AS role_base, r.page_access AS role_page_access,
                r.is_head_chef AS role_head_chef
         FROM sessions s JOIN users u ON u.id = s.user_id
@@ -296,8 +326,100 @@ export function proxy(req: NextRequest) {
         // getCurrentUser EXACTLY (auth.ts): the role contributes only when it is a
         // real assigned role (role_id AND base_role present), so the two never drift.
         is_head_chef: !!row.is_head_chef || (!!row.role_id && !!row.role_base && !!row.role_head_chef),
+        // The ASSIGNED role's display name, read by the `greOnly` catalog gate
+        // (Guest Feedback floor pages). NULL whenever u.role_id is NULL — which
+        // is every user on the measured database — and the gate treats NULL as
+        // DENY, so adding this field cannot widen access for anybody. It exists
+        // so that the day a GRE role IS assigned, the proxy can see it: without
+        // it the gate would deny the one population it was built for.
+        // Mirrors getCurrentUser (auth.ts:120) including the `|| null`.
+        role_name: row.role_name || null,
+        // `users.section` grants NOTHING — no gate reads it. It is carried only
+        // so the Guest Feedback refusal below can add one extra sentence when a
+        // login's section already says GRE: that is the owner's half-finished
+        // setup, and telling him the section field is not the switch is the
+        // difference between a useful refusal and a dead end.
+        section: row.section || '',
+        // Tri-state, read ONLY by the GRE match: null when no role is assigned
+        // (nothing to judge), true/false from `roles.is_active` otherwise. Note
+        // the LEFT JOIN above has NO is_active filter, deliberately — the tier
+        // and page map must keep resolving from a deactivated role or switching
+        // a role off would fall back to a null map = every page. This field is
+        // how the feedback gate refuses a deactivated role WITHOUT disturbing
+        // that rule for anything else.
+        role_is_active: row.role_id ? !!row.role_active : null,
       } : undefined;
+      // ── Guest Feedback ONLY: an unresolved session is a REFUSAL, not a pass.
+      // Measured 2026-09-22 on this branch, port 3924: with a made-up cookie
+      // value (`fnb_session=zzgc-NO-SUCH-TOKEN`) all four feedback pages
+      // answered **200** and rendered — including /feedback/analytics, which is
+      // management-only. The SELECT above returns no row for a forged token, an
+      // EXPIRED session or a DEACTIVATED user, `user` is then `undefined`, and
+      // the `user && …` guard on the next line skips the whole page gate. The
+      // API rail was never fooled (401 every time), so nothing leaked today —
+      // but the page shell, the full nav and every future server-rendered
+      // number on Page 4 did render for someone holding no valid session at
+      // all, and the module's own refusal never ran.
+      //
+      // ⚠️ THE SAME HOLE IS APP-WIDE AND IS **NOT** FIXED HERE. The same forged
+      // cookie also returns 200 on /settings/errors (adminOnly), /customers
+      // (PII), /reports/sales, /settings/roles, /variance-approvals and
+      // /cashier. That is shipped behaviour on every page in the app and
+      // closing it belongs to the owner, not to this module's fleet — a
+      // one-word change to the guard below would alter what happens to every
+      // page request in the product. So this branch is anchored to
+      // isFeedbackPath() and can change nothing outside /feedback*.
+      if (!user && isFeedbackPath(pathname)) {
+        const d = feedbackAccess(null, { analytics: isFeedbackAnalyticsPath(pathname) });
+        return new NextResponse(feedbackDeniedPage(d.headline, d.remedy), {
+          status: 403,
+          headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' },
+        });
+      }
       if (user && !canAccessPage(pathname, user)) {
+        // ── Guest Feedback: explain, don't bounce. ────────────────────────────
+        // Everywhere else a blocked page redirects to the user's first allowed
+        // page with ?forbidden=<path>, and NOTHING in this app renders that
+        // parameter — the user simply finds themselves somewhere else. For this
+        // module that silence is the whole bug: the live failure mode is a role
+        // the owner has CREATED but not yet ASSIGNED, and a silent bounce is
+        // indistinguishable from "the feature doesn't work". So a denied
+        // feedback page answers with the reason in words. Scoped to this module
+        // by an anchored path test (never a substring — proxy.ts's own
+        // `includes('/print')` in isPublic() is the cautionary tale), so no other
+        // page's behaviour changes.
+        if (isFeedbackPath(pathname)) {
+          const d = feedbackAccess(user, { analytics: isFeedbackAnalyticsPath(pathname) });
+          // ⚠️ THE GATE CAN SAY YES WHILE THE PAGE MAP SAYS NO, and when it did
+          // this card rendered EMPTY. `feedbackAccess()` returns
+          // `headline: '', remedy: ''` for an ALLOWED decision, so an assigned
+          // GRE — or a real Floor Manager — whose role carries an explicit
+          // `page_access` array without "/feedback" got a blank white card
+          // reading only "Back to the app". Measured on this branch: the
+          // production `Floor Manager` row's page_access is
+          // ["/","/dine-in/floor",…,"/dine-in/reservations"] with no feedback
+          // entry, and that login answered `<h1></h1><p></p>` on all four
+          // pages while GET /api/feedback/floor answered 200. The two gates
+          // genuinely disagree — canAccessPage is honouring the owner's
+          // per-role grant — and the ONE screen built to explain a refusal was
+          // the one screen that said nothing. It now names the real remedy,
+          // which is an owner action in Settings → Roles, not a code change.
+          const [headline, remedy] = d.allowed
+            ? [
+              'This login may use Guest Feedback, but the page is not in its role\'s page list.',
+              `The Guest Feedback gate accepted this login${d.scope === 'gre' ? ' as a GRE' : ' as management'}`
+              + ` — GET /api/feedback/* answers normally — but the assigned role's PAGE LIST does not`
+              + ` include "${pathname}", so the page itself is closed. An administrator should open`
+              + ` Settings → Roles, edit this role, and tick Floor Feedback, Take Feedback and`
+              + ` Feedback Tracker (Feedback Analytics is management-only). A role whose page list is`
+              + ` left empty inherits every page and needs no change.`,
+            ]
+            : [d.headline, d.remedy];
+          return new NextResponse(feedbackDeniedPage(headline, remedy), {
+            status: 403,
+            headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' },
+          });
+        }
         // Dashboard `/` is no longer ALWAYS_ALLOWED — so a user without
         // dashboard access who hits `/` would be told to go to... `/` again,
         // looping forever. Smart fallback: send them to the first allowed
@@ -327,12 +449,71 @@ export function proxy(req: NextRequest) {
   if (isApi && isStateChanging(req.method)) {
     try {
       const db = getDb();
-      const valid = db.prepare(`
-        SELECT 1 FROM sessions s JOIN users u ON u.id = s.user_id
+      // The SELECT that was already here, WIDENED — same one row, same one
+      // query, same WHERE clause, so this step still costs exactly what it cost
+      // before. The extra columns exist only to answer the Guest Feedback
+      // read-only question below; nothing else reads them, and the row's mere
+      // existence is still what proves the session valid.
+      const row = db.prepare(`
+        SELECT u.role, u.role_id, u.is_head_chef, u.section,
+               r.name AS role_name, r.is_active AS role_active,
+               r.base_role AS role_base, r.is_head_chef AS role_head_chef
+        FROM sessions s JOIN users u ON u.id = s.user_id
+        LEFT JOIN roles r ON r.id = u.role_id
         WHERE s.token = ? AND u.is_active = 1 AND s.expires_at > datetime('now')
-      `).get(session);
-      if (!valid) return NextResponse.json({ error: 'Sign in required' }, { status: 401 });
-    } catch { /* infra/DB error → fall through (don't hard-fail the whole app) */ }
+      `).get(session) as any;
+      if (!row) return NextResponse.json({ error: 'Sign in required' }, { status: 401 });
+
+      // ── 🔒 GUEST FEEDBACK: the owner's READ-ONLY rule, enforced server-side.
+      //
+      // "The GRE/Manager may view ordered items but has READ-ONLY ACCESS. They
+      //  cannot: place orders · cancel items · change quantity · modify KOT ·
+      //  modify bill · apply discounts. This must be enforced server-side, not
+      //  merely hidden in the UI."
+      //
+      // ONE boundary, not fourteen handler edits: `refusePosWrite()` owns the
+      // prefix list (src/lib/feedback/pos-readonly.ts) so the next POS write
+      // route inherits the denial instead of needing a fourteenth edit in a
+      // fourteenth handler. NO POS ROUTE FILE WAS TOUCHED.
+      //
+      // ⚠️ IT REFUSES NOBODY TODAY, BY CONSTRUCTION. The predicate matches only
+      // a login with the "GRE" role ASSIGNED that is not management, and
+      // `users.role_id` is NULL for every user on the measured database — the
+      // same trap that has kept auth.ts:184's `role_name === 'Cashier'` from
+      // ever firing. Captains, cashiers, Floor Managers, Managers, HODs and
+      // Admins all answer false. It starts refusing exactly one login the
+      // moment an administrator ASSIGNS the GRE role to it, which is the moment
+      // that login is supposed to become read-only. (Switching the role OFF
+      // does not lift the deny — see isPosReadOnlyActor()'s measured reason.)
+      //
+      // The actor is built to MIRROR getCurrentUser() (auth.ts:113-126) field
+      // for field — the same `hasRole` test, the same tier fallback, the same
+      // `|| null` on role_name, the same union for is_head_chef — so the proxy
+      // and the handlers can never disagree about who someone is. `role_active`
+      // is the one field getCurrentUser does not report (it resolves tier and
+      // pages from a deactivated role on purpose, auth.ts:104-107), and it is
+      // carried as the same TRI-STATE step 2b uses: null when no role is
+      // assigned, because "not looked up" must not read as "known bad".
+      const posHasRole = !!row.role_id && !!row.role_base;
+      const posActor = {
+        role: ((posHasRole ? row.role_base : row.role) as string) || 'staff',
+        role_name: row.role_name || null,
+        section: row.section || '',
+        is_head_chef: !!row.is_head_chef || (posHasRole && !!row.role_head_chef),
+        role_is_active: row.role_id ? !!row.role_active : null,
+      };
+      if (refusePosWrite(posActor, pathname, req.method)) {
+        return NextResponse.json(posWriteRefusalBody(pathname), { status: 403 });
+      }
+    } catch {
+      /* infra/DB error → fall through (don't hard-fail the whole app).
+         The deny fails OPEN here, and that is safe rather than sloppy: every
+         POS write handler downstream opens with getCurrentUser(), which calls
+         the same getDb(). A database this block could not read is a database
+         the handler cannot read either, so a POS write cannot succeed through
+         this gap — it 401s or 500s one layer later. Failing CLOSED instead
+         would refuse live captains on a transient read error. */
+    }
   }
 
   // 3. CSRF check on sensitive state-changing API calls
@@ -379,6 +560,41 @@ function addNoCacheHeader(res: NextResponse, isApi: boolean): void {
   if (isApi) return;   // APIs set their own Cache-Control
   res.headers.set('Cache-Control', 'no-store, no-cache, must-revalidate, max-age=0');
   res.headers.set('Pragma', 'no-cache');
+}
+
+/**
+ * The Guest Feedback refusal screen. Rendered by the proxy, so it cannot use a
+ * React component — this runs before any page is resolved.
+ *
+ * Deliberately plain: no script, no external asset, no session data beyond the
+ * two sentences `feedbackAccess()` produced. Both are escaped even though they
+ * are built from a compile-time constant plus `roles.name`, because `roles.name`
+ * is owner-entered text and a role called `<img onerror=...>` must render as
+ * characters, not as markup.
+ */
+function feedbackDeniedPage(headline: string, remedy: string): string {
+  const esc = (s: string) => s
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Guest Feedback — access</title>
+<style>
+  :root { color-scheme: light }
+  body { margin:0; background:#FAF7F2; color:#3D3229;
+         font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+         display:flex; align-items:center; justify-content:center; min-height:100vh; padding:24px }
+  .card { background:#fff; border:1px solid #E8D5C4; border-radius:14px; padding:24px;
+          max-width:560px; width:100%; box-shadow:0 1px 3px rgba(0,0,0,.05) }
+  h1 { font-size:17px; margin:0 0 10px; color:#8B5A2B }
+  p { margin:0 0 16px }
+  a { display:inline-block; padding:9px 16px; border-radius:9px; background:#8B5A2B;
+      color:#fff; text-decoration:none; font-weight:600; font-size:14px }
+</style></head><body><div class="card">
+<h1>${esc(headline)}</h1>
+<p>${esc(remedy)}</p>
+<a href="/">Back to the app</a>
+</div></body></html>`;
 }
 
 function randomToken(): string {

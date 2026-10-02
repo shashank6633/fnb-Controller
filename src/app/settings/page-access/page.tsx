@@ -514,14 +514,23 @@ export default function PageAccessSettingsPage() {
                         </div>
                         {isExpanded && (
                           <div className="px-4 py-2 grid grid-cols-2 md:grid-cols-3 gap-1.5 text-xs">
+                            {/* The tier badges below are not cosmetic — a tier gate runs BEFORE
+                                the page_access map, so a ticked box on a gated page grants
+                                nothing. Every flag in PageEntry therefore needs a badge here or
+                                the grid quietly lies to the admin. `greOnly` is the newest, and
+                                the one most likely to be misread: the role has to be ASSIGNED to
+                                the user, which is a separate step from creating it in Settings →
+                                Roles, and until it is assigned the page stays shut no matter what
+                                is ticked. */}
                             {matchPages.map(p => (
-                              <label key={p.path} title={p.hodOnly ? 'Only HODs (Is HOD) and admins can open this page — this grant is ignored for non-HODs' : p.mgmtOnly ? 'Only Admins, Managers and HODs can open this page — this grant is ignored for other roles' : undefined}
+                              <label key={p.path} title={p.hodOnly ? 'Only HODs (Is HOD) and admins can open this page — this grant is ignored for non-HODs' : p.mgmtOnly ? 'Only Admins, Managers and HODs can open this page — this grant is ignored for other roles' : p.greOnly ? 'Only the GRE role (create it in Settings → Roles, then ASSIGN it to the user below) plus Managers, HODs and Admins can open this page. Until the role is assigned to this user, ticking this box grants nothing.' : undefined}
                                      className="flex items-center gap-1.5 cursor-pointer hover:bg-[#FFF8F0] px-1 py-0.5 rounded min-w-0">
                                 <input type="checkbox" checked={cur.has(p.path)}
                                        onChange={() => togglePath(u.id, p.path)} />
                                 <span className="text-[#2D1B0E]">{p.label}</span>
                                 {p.hodOnly && <span className="text-[9px] bg-amber-100 text-amber-700 px-1.5 py-0.5 rounded-full font-medium">HOD only</span>}
                                 {p.mgmtOnly && <span className="text-[9px] bg-amber-100 text-amber-700 px-1.5 py-0.5 rounded-full font-medium">Mgmt</span>}
+                                {p.greOnly && <span className="text-[9px] bg-violet-100 text-violet-700 px-1.5 py-0.5 rounded-full font-medium">GRE</span>}
                                 <span className="text-[9px] font-mono text-[#8B7355] ml-auto truncate max-w-full">{p.path}</span>
                               </label>
                             ))}
