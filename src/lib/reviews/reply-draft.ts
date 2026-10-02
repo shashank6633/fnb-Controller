@@ -24,9 +24,19 @@
  *   • A COMPLAINT gets acknowledgement without argument, what is being done,
  *     and a concrete reason to believe the next visit differs. Never dispute
  *     their account, never blame them, never imply they misremembered.
- *   • A GOOD REVIEW gets thanks for something specific and a reason to return —
- *     a dish they have not tried, something seasonal, the live music. Never a
- *     word about ratings or stars.
+ *   • A GOOD REVIEW gets thanks for something specific and a reason to return,
+ *     BUILT ONLY FROM THEIR OWN REVIEW or from the true-facts list the caller
+ *     supplies as venueNotes. Never a word about ratings or stars.
+ *
+ *     This bullet used to offer "something seasonal, the live music" as the
+ *     examples, four lines above a rule forbidding any event or policy not in
+ *     the review — so the prompt instructed the model to do the thing it banned,
+ *     and the ban is the one that matters, because a reason to return is exactly
+ *     where a model reaches for a plausible invention. The examples now come
+ *     from what the guest actually wrote; anything else has to arrive through
+ *     venueNotes, which already tells the model that nothing outside it exists.
+ *     Where the review supports no specific hook, a plain invitation is the
+ *     correct answer — an invented reason is worse than no reason.
  *   • NEVER INVENT A REMEDY. No free meals, no discounts, no comped drinks, no
  *     "next visit is on us" unless the owner types it himself. Those are PUBLIC
  *     PROMISES the restaurant then has to honour.
@@ -178,9 +188,13 @@ IF THEY COMPLAINED:
 
 IF THEY WERE HAPPY:
 - Thank them for the specific thing, not for "the feedback".
-- Give them a reason to return: something they have not tried yet that follows from what they
-  liked, something that changes with the season, the live music. Only things you can infer
-  from their own review.
+- Give them a reason to return, and build it ONLY from what is in front of you: what they
+  praised, what they said they would try next, what they mentioned missing or running out of,
+  the occasion they came for. "You came for the biryani and left talking about the kebabs —
+  come back hungry for both" follows from their review. Naming an event, a season, a menu
+  change or anything else they did not mention does NOT, however inviting it sounds, unless it
+  appears in the true-facts list below. If nothing in their review supports a specific hook,
+  a plain warm invitation is correct and complete — an invented reason is worse than none.
 - Do not mention ratings, stars or reviews, and never ask them to change or leave one.
 
 NEVER OFFER COMPENSATION. No free food or drink, no discount, no voucher, no refund, no

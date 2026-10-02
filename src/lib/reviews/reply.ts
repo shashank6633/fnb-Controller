@@ -383,10 +383,37 @@ export function requireConfirmation(check: ReplyCheck, confirm: Confirmation): v
       + 'public posting — that step is the only undo there is.');
   }
 
-  // The business name must be echoed back when we know it. This is what makes
-  // the confirm step a CHECK rather than a checkbox: a request that did not come
-  // from the confirm dialog does not know what name to echo.
-  if (check.business_label && !sameBusiness(confirm.business || '', check.business_label)) {
+  // The business name must be echoed back. This is what makes the confirm step a
+  // CHECK rather than a checkbox: a request that did not come from the confirm
+  // dialog does not know what name to echo.
+  //
+  // IT FAILS CLOSED, AND THAT IS THE WHOLE POINT OF THE REWRITE. This read
+  //
+  //     if (check.business_label && !sameBusiness(...)) throw
+  //
+  // and so skipped itself entirely whenever business_label was empty — which it
+  // can be, because :336 derives it as
+  // `target?.businessLabel || conn.location_label || conn.account_label || ''`
+  // and every one of those three can be blank. A bare `{ public: true }` that had
+  // never been near the confirm dialog then published, with the LAST guard in
+  // front of a permanent public write silently absent. A guard that disappears
+  // exactly when it has nothing to compare against is the inert-guard shape this
+  // codebase has been bitten by before; the condition it needs is not "do we know
+  // the name" but "did this come from the dialog".
+  //
+  // So an unknown label now REFUSES rather than waves through. That is the honest
+  // outcome either way: if the app cannot say which business a reply will appear
+  // under, it has no business publishing one, and nobody could have confirmed it
+  // meaningfully. The remedy is a reconnect, which repopulates the label — not a
+  // send that proceeds on a blank.
+  if (!check.business_label) {
+    throw new ReplyRefusedError('business_unknown',
+      'This cannot be published because the connection does not say which business it would appear '
+      + 'under. A reply is public and permanent the moment it is sent, so it is never sent on a blank '
+      + 'name. Reconnect the Google Business Profile account and pick the listing again, then retry.');
+  }
+
+  if (!sameBusiness(confirm.business || '', check.business_label)) {
     throw new ReplyRefusedError('business_not_named',
       `The confirmation must name the business this will be published as — ${check.business_label}. `
       + 'The reply appears publicly under that name, so the confirm step says it out loud.');

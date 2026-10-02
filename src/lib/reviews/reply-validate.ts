@@ -180,14 +180,72 @@ const PLACEHOLDERS: Array<{ re: RegExp; what: string }> = [
  * visit is on us" unless he typed it himself. He can type it; the model may not
  * slip it in. Warned, never silently blocked, and acknowledged in words.
  */
-const COMPENSATION: Array<{ re: RegExp; what: string }> = [
-  { re: /\b(?:on the house|on us)\b/i, what: '"on us" / "on the house"' },
+/* "ON US" IS TWO DIFFERENT SENTENCES AND ONLY ONE OF THEM IS AN OFFER.
+ *
+ *   "the next round is on us"            -> offers something. A public promise.
+ *   "how we staff that is on us"         -> accepts blame. The opposite.
+ *   "the AC being off is on us"          -> accepts blame.
+ *
+ * A bare /\bon us\b/ flagged both, so the two best drafts this app produced were
+ * warned for taking responsibility well — which is the single behaviour the
+ * owner's brief asks for most ("acknowledge it plainly without arguing"). That
+ * matters more than a tidy regex: a warning that fires on honest prose teaches
+ * the owner to click past warnings, and the next one past is the real one.
+ *
+ * So an offer now needs something CONSUMABLE OR BILLABLE named near it. Blame
+ * attaches to a clause or a demonstrative ("that", "this", "what happened"),
+ * never to a dessert. Where the subject is genuinely ambiguous this stays
+ * SILENT: the rest of this list still catches "free", "complimentary", "comped",
+ * "discount", "refund", "no charge", "we'll pay" and "next visit is on us", so
+ * a real offer has to evade every one of them, not just this one. */
+/** The sentence containing "on us" / "on the house", or '' if there is none. */
+function onUsSentence(s: string): string {
+  for (const part of String(s || '').split(/(?<=[.?!\n])/)) {
+    if (/\bon (?:us|the house)\b/i.test(part)) return part;
+  }
+  return '';
+}
+
+/** A FORWARD-LOOKING marker. An offer points at a future visit; blame points at
+ *  what already happened. "the dry biryani was on us next time" is an offer and
+ *  names a dish this list could never enumerate — an Indian menu is not
+ *  "dessert, starter, course" — so the tense carries what a noun list cannot. */
+const ON_US_FUTURE = /\b(?:next time|next visit|next round|next meal|next one|your next|come back|comes back|coming back|return visit|on your return|when you(?:'re| are)? (?:back|next)|tonight|future visit)\b/i;
+
+/** Named consumables, as a second route in for an offer with no tense marker
+ *  ("dinner on the house"). Deliberately short — ON_US_FUTURE does the work. */
+const ON_US_CONSUMABLE = /\b(?:meal|meals|dinner|lunch|brunch|breakfast|drink|drinks|round|rounds|bill|tab|dessert|sweet|starter|course|coffee|chai|tea|beer|wine|cocktail|bottle|food|dish|dishes|plate|platter)\b/i;
+
+/** Blame, not an offer: the thing that is "on us" is a fault, not a dish. */
+const ON_US_BLAME = /\b(?:that|this|it|these|those|which|everything|all of (?:that|this|it)|the (?:delay|wait|mistake|mix[- ]?up|error|failing|lapse))\b[^.?!\n]{0,40}?\bis on us\b|\bon us\b[^.?!\n]{0,20}?\b(?:to (?:fix|put right|sort|own)|not on you)\b/i;
+
+function offersOnUs(comment: string): boolean {
+  const sentence = onUsSentence(comment);
+  if (!sentence) return false;
+  // Blame wins when nothing forward-looking is present. "how we staff that is
+  // on us" and "the AC being off is on us" accept responsibility; flagging them
+  // as a compensation offer warned the owner for doing the one thing his brief
+  // asks for most, and a warning that fires on honest prose is how the real one
+  // gets clicked past.
+  if (ON_US_BLAME.test(sentence) && !ON_US_FUTURE.test(sentence)) return false;
+  return ON_US_FUTURE.test(sentence) || ON_US_CONSUMABLE.test(sentence);
+}
+
+/* An entry is either a pattern or a predicate. "on us" needed a predicate:
+ * whether it is an offer or an admission of fault depends on the rest of the
+ * sentence, which a single regex cannot read without flagging honest prose. */
+const COMPENSATION: Array<{ re?: RegExp; fn?: (s: string) => boolean; what: string }> = [
+  { fn: offersOnUs, what: '"on us" / "on the house"' },
   { re: /\bfree\s+(?:meal|dish|drink|dessert|starter|round|appetiser|appetizer|coffee|beer|food|plate)/i, what: 'a free item' },
   /* "your next dessert is free" — the SAME offer with the words the other way
    * round. Missed by the pattern above until a test caught it, and it is the
    * likeliest phrasing a model reaches for, so it is matched in both directions
    * now. An offer is an offer whichever end of the sentence it sits at. */
-  { re: /\b(?:is|are|will be|it'?s)\s+(?:completely\s+|totally\s+|absolutely\s+)?(?:free|complimentary|on us|on the house)\b/i, what: 'something offered free' },
+  /* "on us" / "on the house" are NOT listed here any more — they moved to
+   * offersOnUs() above, which reads the whole sentence. Left in this pattern
+   * they re-flagged "the AC being off is on us" through a second door, so fixing
+   * only the first one would have changed nothing the owner could see. */
+  { re: /\b(?:is|are|will be|it'?s)\s+(?:completely\s+|totally\s+|absolutely\s+)?(?:free|complimentary)\b/i, what: 'something offered free' },
   { re: /\bfree of (?:charge|cost)\b/i, what: '"free of charge"' },
   { re: /\bcomplimentary\b/i, what: '"complimentary"' },
   { re: /\bcomped?\b/i, what: '"comp" / "comped"' },
@@ -254,6 +312,15 @@ const NOT_A_NAME = new Set([
   'there', 'all', 'everyone', 'team', 'guest', 'guests', 'friend', 'friends',
   'sir', 'madam', "ma'am", 'maam', 'folks', 'again', 'and', 'thank', 'thanks',
   'you', 'so', 'much', 'to', 'for', 'we', 'i', 'it', 'that', 'this', 'from',
+  // Sentence openers that share the bare-vocative shape "<Word>, ...". Without
+  // these VOCATIVE_RE would read the first word of "Honestly, the AC being off
+  // is on us" as a guest's name and block an honest reply. Keep this list ahead
+  // of the regex: a false block trains the owner to distrust every check.
+  'yes', 'no', 'sorry', 'apologies', 'honestly', 'frankly', 'truthfully',
+  'first', 'firstly', 'second', 'secondly', 'finally', 'look', 'right', 'ok',
+  'okay', 'well', 'but', 'however', 'still', 'actually', 'unfortunately',
+  'sadly', 'genuinely', 'truly', 'absolutely', 'completely', 'understood',
+  'noted', 'agreed', 'fair', 'true', 'dear', 'hi', 'hello', 'hey', 'namaste',
 ]);
 
 /** Words too common to count as "answering what they actually said". */
@@ -277,6 +344,25 @@ const PHONEISH_RE = /\+?\d[\d\s().-]{7,}\d/g;
 /** A sign-off line: "— Rahul" or "- Rahul, Manager". */
 const SIGNOFF_RE = /(?:^|\n)[ \t]*[-–—]{1,2}[ \t]*([\p{Lu}][\p{L}]+)(?:[ \t]*[,|][ \t]*(?:manager|owner|gm|general manager|team lead|host))?[ \t]*$/u;
 const GREETING_RE = /^\s*(?:hi|hello|hey|hii+|dear|dearest|namaste|namaskaram)\b[\s,]*([\p{L}][\p{L}.'-]*)/iu;
+
+/* A BARE VOCATIVE IS A GREETING TOO — "Varun, I'm not going to dress this up."
+ *
+ * GREETING_RE above only fires after an explicit greeting word, so for a while
+ * both blocking name checks were asleep on the single most likely opening this
+ * app produces. The draft prompt tells the model to vary its openings and never
+ * to sound like a template, which steers it straight at the bare vocative; the
+ * owner's own 2,177 published replies all open "Dear <Name>," which is exactly
+ * what it is told to avoid. So the guard covered the shape we do not write and
+ * missed the shape we do: a reply addressing the WRONG guest by name, or naming
+ * an anonymous reviewer, sailed through.
+ *
+ * Deliberately narrow, because a false block is worse than no block here — it
+ * would refuse honest prose and train the owner to distrust the checks. It fires
+ * only on a leading capitalised word immediately followed by a comma or dash,
+ * which is a vocative and almost nothing else. NOT_A_NAME carries the sentence
+ * openers that share that shape ("Honestly, ...", "Yes, ...", "Sorry, ..."). A
+ * reply opening with a lowercase word, or with no comma, is not matched at all. */
+const VOCATIVE_RE = /^\s*(\p{Lu}[\p{L}.'-]*)\s*[,—–-]/u;
 
 /* ── Small helpers ────────────────────────────────────────────────────────── */
 
@@ -341,7 +427,11 @@ export function replyOpening(s: string, n = 5): string {
 
 /** The name a greeting claims, or '' when the reply does not greet anybody. */
 export function greetedName(comment: string): string {
-  const m = String(comment || '').match(GREETING_RE);
+  const s = String(comment || '');
+  // An explicit greeting first, then the bare vocative. Order matters only for
+  // readability — "Dear Varun," matches the first and would match neither test
+  // of the second, since "Dear" is in NOT_A_NAME.
+  const m = s.match(GREETING_RE) || s.match(VOCATIVE_RE);
   if (!m) return '';
   const cand = m[1];
   if (NOT_A_NAME.has(cand.toLowerCase().replace(/[.'-]+$/, ''))) return '';
@@ -428,7 +518,7 @@ export function validateReply(input: ReplyValidationInput): ReplyValidation {
   /* ── WARNINGS — judgement calls the admin acknowledges one by one ──────── */
 
   for (const c of COMPENSATION) {
-    if (c.re.test(comment)) {
+    if (c.fn ? c.fn(comment) : !!c.re && c.re.test(comment)) {
       warn('compensation_offer', 'Offers compensation',
         `This promises something — ${c.what} — in public, under the business name, and the restaurant `
         + 'then has to honour it for this guest. Send it only if that offer is real and you meant to make it. '
