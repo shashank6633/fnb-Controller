@@ -232,6 +232,24 @@ export default function RolesAdmin() {
               <p className="-mt-1 text-[11px] text-[#8B7355]">
                 “Can approve requisitions” grants ONLY the approval inbox (dine-in + party) — no HOD-only pages, no party financials. “Is HOD” includes it.
               </p>
+              {/* THE SIDE EFFECT THE OWNER ASKED TO HAVE SAID OUT LOUD (2026-09-25).
+                  Ticking HOD — or moving a role to the Manager tier — lifts the Guest
+                  Feedback module's POS read-only restriction: a GRE-titled login then
+                  passes isManagement() and can add items, bump KOTs and settle
+                  (measured: all three returned 200). He ruled that tier SHOULD win,
+                  because management already holds those powers. The hazard was never
+                  the behaviour; it was that nothing on this screen said so, which is
+                  how it would be discovered mid-service instead of here. */}
+              {draft.is_head_chef && (
+                <p className="-mt-1 text-[11px] text-amber-700 flex items-start gap-1">
+                  <span aria-hidden>⚠</span>
+                  <span>
+                    HOD also <b>lifts the Guest Feedback read-only rule</b> for this role. A GRE-titled
+                    login with HOD ticked can add items, bump KOTs and settle bills. Intended — management
+                    holds those powers — but worth knowing before you tick it for a front-office role.
+                  </span>
+                </p>
+              )}
               {!draft.is_head_chef && !draft.can_approve_requisitions && (
                 <p className="-mt-1 text-[11px] text-amber-700 flex items-start gap-1">
                   <span aria-hidden>⚠</span>
