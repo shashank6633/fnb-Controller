@@ -215,7 +215,7 @@ supported, clear status indicators, sticky Submit. Minimal typing.
 | P0 | Recon — read-only: POS/order/table/role wiring, Captain-app patterns, export helpers, the read-only enforcement surface | PENDING | |
 | P1 | Foundation — `gf_` schema, nav in BOTH files, RBAC, 4 page shells | PENDING | |
 | P2 | Page 1 Floor Feedback + the READ-ONLY guarantee, proved server-side | **DONE (A + B)** | §6 2026-09-22: GET-only routes (405 with CSRF, 403 without), 40 reads → census identical, 6-persona gate, all 5 statuses live, `tunable()` zero-default bug fixed, tsc 0. **Part (B) IS NOW APPLIED** — one prefix deny at ONE boundary (`src/lib/feedback/pos-readonly.ts` + `src/proxy.ts`), zero POS route handlers edited, 23/23 forbidden writes refused for an assigned GRE, 115/115 non-GRE writes untouched. **Lane B (read/board/catalog) closed its three HIGHs + 7 MEDIUMs** — elapsed proved against a known instant, a business-day exit for the never-settled order, tier flags proved per persona; 120 reads → census identical. **Probe `the-gre-is-denied` (2026-09-22, port 3954, no code changed): 87/87 state-changing POS requests refused against REAL rows with zero writes, the same requests measured WRITING for six other personas — but the claim is falsified once, by `POST /api/crm-calls/bookings/[id]/seat`, which opens/edits an order for any signed-in user (§6, §7 items 6-7).** **Probe `floor-managers-and-null-role` (2026-09-23, port 3955, no code changed): the deny is INERT in the null-role state and switches on and off with the assignment (0/27 → 26/27 → 0/27 on ONE login); 162 HTTP lines and a 33,407-line dump of all 217 tables are BYTE-IDENTICAL between the deny build and the deny reverted, for the Floor Manager and all three null-role tiers; the Page-1 truth table and the elapsed clock both pass. 🛑 But a **Floor Manager gets 403 on all four pages** while the API hands them the board — §6, and it is a config blocker, not a code one.** |
-| P3 | Page 2 Take Feedback + item-level complaints + action + follow-up lifecycle | PENDING | |
+| P3 | Page 2 Take Feedback + item-level complaints + action + follow-up lifecycle | **LANE A DONE (capture exists)** · Lane B (rewire the page, delete the placeholder) PENDING | §6 2026-10-03: `src/lib/feedback/write.ts` + `POST /api/feedback` built — **the module could not CAPTURE anything before this**: `grep -rn "INSERT INTO gf_" src/` returned ZERO, so 3,147 lines of reporting and 526 assertions ran over rows no code could produce. `write.ts` is now the ONLY file in `src/` that writes `gf_*` (grep proves it). One transaction per submit; silence is not a rating; `requiresFollowUp`/`closesIssue` reused, not re-spelled; idempotent per (order, GRE) with the UNIQUE index as the second layer; an item not on the order is a refusal. New suite `scripts/feedback-capture-tests.js` (**143/0**) drives the REAL handler end to end — order → POST → `gf_` rows → `analytics()`/`readTracker()` — and the suite **cannot even load at `6194ccf`** (`Cannot find module .../write.ts`, 0 assertions). 8 one-line sabotages measured: 6 RED, and 2 INERT **by design** (removing the duplicate pre-check alone, or the UNIQUE-recovery branch alone, leaves 143/0 — they defend the same rule twice; removing BOTH turns G1/H1 red). Also fixed: the `gf_` DDL is lifted into `GF_SCHEMA_SQL`/`createGuestFeedbackSchema()` so the fixtures create the tables from the SHIPPED string — **`feedback-scope-tests.js` had been crashing before assertion 1** (`no such table: gf_follow_ups`) on any snapshot never booted since the schema shipped; it is now genuinely **526/0**. `reviews-tests.js` **619/0**. `tsc --noEmit` exit 0, `next build` exit 0 (`/api/feedback` in the manifest). NO SERVER BOOTED. |
 | P4 | Page 3 Feedback Tracker + coverage | **LANE A DONE** | §6 2026-09-23: `GET /api/feedback/tracker` built (GET-only, 403 without CSRF / 405 with a valid pair, 40 reads → census identical), Page 3 reads it and the placeholder import is gone, and **the door is open** — a Floor Manager / Bar Manager / Head Chef / Store Manager now gets 200 on pages 1-3 where the same build without the one-line change gives 403 on all four (control run, every other row byte-identical). Analytics stays 403 for a GRE. tsc 0. |
 | P5 | Page 4 Analytics + the 8 reports | **LANE C + LANE B DONE · LANE D VERIFIED vs `715f604` · D11 `2c`+`2d` CLOSED · GUARD WIDENED TO THE WHOLE DOC (`2e`)** | §6 2026-09-30 (D11 `2e`): the guard stopped being a LIST. Gate **J** walks each `ReportDoc` by the doc's OWN KEYS and fails on a key it has not been taught, and over that enumeration asserts filter invariance (classified by the FILE'S OWN cover sentences) and internal agreement for **every printed number in every block** - tiles, table cells, footnotes, sheet notes, column headings, cover lines. Two of the four briefed sabotages turned out **INERT on the old fixture**: `users.preferred_zones` has ZERO populated rows and the fixture set none, so every floor-coverage cell printed `'-'` and the swap was **byte-identical in all 8 reports x 5 states x 2 worlds**; one business day made `d.eligible` the venue's count for the same reason. The fixture now has **two floors and two business days** (venue totals unchanged by construction). **Eleven one-line sabotages go RED** - the 4 named (432/0 before, 4-10 failures after) and 7 nobody had named - with `tsc` exit 0 for every one. tsc 0, `next build` 0, suite **526/0**. **TEST-ONLY: no `src/` file changed.** NO SERVER BOOTED. §6 2026-09-30 (D11 `2d`): the FOURTH site of the mixed-population shape closed — the menu-item Summary tile was `value` off the RECORD lane over `sub` off the VENUE lane and printed **`6 of 6` / `5 of 6` / `3 of 6` / `0 of 6`** four rows under the cover's promise that the Summary tiles do not move; it is now venue over venue, `records.items_sold` is deleted in favour of one branded `{count, of}` pair, and 3 negative controls (TS2345 ×2, TS2322) were RUN. **The gate that let it through is fixed too:** gate D asserted only the denominator of the ratio it is named after and reported green on 6/5/3/0; it now reads both halves of every rate and every `value`/`sub` pair from the PRINTED strings, and gate E5 sweeps every tile of all 8 reports for filter-invariance. The repaired suite goes **RED on `399e4cc` (400 passed, 32 failed)** where the suite committed there was **green (299/0)**. 90-object payload+report diff vs the pinned baseline: only the `records` rename and the filtered tile moved; unfiltered downloads byte-identical. tsc 0, `next build` 0, suite **432/0**. NO SERVER BOOTED. §6 2026-09-24 (Lane D): every briefed defect reproduced on the BASELINE and confirmed closed at `5bf8fda` — the filter moves 4 payload paths (was 15); the exported Rating split is byte-identical filtered vs unfiltered in BOTH worlds; Page 3 == Page 4 (`11/8/72.7%`, was `12/9/75.0%` vs `11/8/72.7%`); the workbook reconciles (`9=9`, and Share sums to 100% where the baseline summed to **110%**); 628/628 menu names print distinct (baseline: 58 names in 28 rows); 18 of 42 truncated KPI subs → 0; 37 reads → DB byte-identical; tsc 0. NO SERVER BOOTED. §6 2026-09-24: the CRITICAL is closed — a person filter now moves **4 payload paths (`filters.gre` · `person` · `meta.counts_scope` · `meta.person_filter_active`) instead of 13**, and the flip (records honestly vs records "everything good") leaves the person-filtered page BYTE-IDENTICAL to the unfiltered one in both worlds. Page 3 and Page 4 agree (`11/8/72.7%` both, was `12/9/75.0%` vs `11/8/72.7%`) including the new floor denominator and the per-person Tables/Taken columns. The workbook no longer contradicts itself (`Feedbacks recorded 9 = Rating split 9`, was `8` vs `9`). PDF menu names: **628 of 628 printed strings distinct**, was 58 names collapsing into 28 rows. 37 reads incl. all 16 downloads → DB byte-identical. tsc 0. **NO SERVER WAS BOOTED.** **LANE B (export/PDF half, independent second measurement, 2026-09-24):** the three HIGHs re-proved with controls — Page 3 vs Page 4 `7/5/71.4%` both, and reverting only the numerator restores the brief's exact pair `8 eligible/75.0%` vs `7/71.4%`; 184 workbook assertions across 8 reports x 4 filter states, 0 contradictions; 628 of 628 menu names print distinct (widening ALONE still left 22 colliding, so the label pass is load-bearing). **Then four defects nobody had measured, all only visible at the owner's real 292-table scale:** `Their floor` printed `188/188 1…` for a GRE who covered EVERY table on her floor (a truncated percentage inverts its meaning — proved in two real rendered PDFs), `Recovery` the same past 100 complaints, 4 KPI subs cut mid-word (one losing the word PRINTED, one losing the sentence that reconciles the Summary against the Rating split), and the venue's open-follow-up count printed on a named person's card. Exhaustive audit: **36,365 rendered strings, 0 truncated, 0 ambiguous** (control at `f83b30b`: 88). tsc 0. **NO SERVER WAS BOOTED.** |
 | P6 | Full adversarial verification + carve-readiness | PENDING | |
@@ -2036,3 +2036,115 @@ supported, clear status indicators, sticky Submit. Minimal typing.
        this table". Typing the name still works (`&gre=Silent Gre` → person block PRESENT,
        `kind: assigned`, `0/2 = 0 %` of her floor), and the person filter still moves no coverage
        (`13/7/53.8 %` with and without a name), so this is reachability, not arithmetic.
+
+- **2026-10-03 (P3 Lane A — CAPTURE)** — The owner's bug report: *"In Floor Feedback Page for the
+  Table no FA3 it showing 2 items. Idli and Masala Dosa. But when i Click on Take Feedback It is not
+  showing the Ordered Items. Its showing the Other Items."* He is right, and it was worse than a
+  display bug. **THE MODULE HAD A COMPLETE READ SIDE AND NO WRITE SIDE AT ALL**, measured on
+  `6194ccf`:
+
+  ```
+  $ grep -rn "INSERT INTO gf_" src/ | wc -l
+  0
+  $ ls src/lib/feedback/write.ts src/app/api/feedback/route.ts
+  ls: ...: No such file or directory
+  ```
+
+  So Page 2's Submit flashed *"Shell only — P3 wires POST /api/feedback"* and the 526-assertion
+  suite was measuring reporting over rows **no code in the repository could have produced**. That is
+  how the defect reached production.
+
+  **BUILT (this lane):**
+  - `src/lib/feedback/write.ts` — the ONLY writer of `gf_*`. Re-measured after the change:
+    `grep -rln "INSERT INTO gf_\|UPDATE gf_\|DELETE FROM gf_" src/` → `src/lib/feedback/write.ts`
+    and nothing else. One `db.transaction()` per submit (better-sqlite3 is synchronous, no awaits
+    inside). Silence is NOT a rating: an item the GRE never tapped gets no row, and an entry whose
+    only content is `action: 'none'` is ignored and REPORTED as `items_ignored_empty`.
+    `requiresFollowUp()` / `closesIssue()` / `isNegative()` are reused from `src/lib/feedback.ts`,
+    never re-spelled, so Pages 1/3/4 and the writer cannot disagree. Idempotent per (order, GRE);
+    a different person gets 409 naming who holds the record.
+  - `POST /api/feedback` — `requireFeedbackRecorder()`, which delegates to the SAME `gate(false)`
+    `requireFeedbackReader()` uses, so there is one gate and not two. `/api/feedback` was already in
+    `CSRF_REQUIRED_PREFIXES` (`proxy.ts:158`). POST is the only export: no PATCH, no DELETE, so a
+    recorded complaint cannot be edited away through this route.
+  - `GF_SCHEMA_SQL` + `createGuestFeedbackSchema()` in `src/lib/db.ts` — the `gf_` DDL is unchanged
+    byte for byte, just named, and `initializeSchema()` now calls the function. This was NOT
+    optional polish: `scripts/feedback-scope-tests.js` **crashed before assertion 1** on this
+    machine —
+
+    ```
+    $ node scripts/feedback-scope-tests.js ; echo EXIT=$?
+    SqliteError: no such table: gf_follow_ups
+        at Object.build (scripts/feedback-scope-fixture.js:127:8)
+    EXIT=1
+    $ sqlite3 "file:fnb-controller.db?mode=ro" "SELECT name FROM sqlite_master WHERE name LIKE 'gf_%';"
+    (nothing)
+    ```
+
+    — because the tables are created only at app boot and the fixture only `DELETE`s and `INSERT`s.
+    The fixture now calls the shipped function, so "526 stays green" is finally a fact here and not
+    a claim about somebody else's booted database.
+
+  **THE NEW SUITE: `scripts/feedback-capture-tests.js` — 143 passed, 0 failed.** It drives the REAL
+  `POST` and the REAL `GET /api/feedback/order/[orderId]` handlers with real `Request` objects, real
+  `sessions` rows and the real gate; the only stub in the process is `next/headers`, because Next's
+  per-request store does not exist outside a server. Order → POST → `gf_` rows → the real
+  `analytics()`, `itemComments()` and `readTracker()`. The fixture is named after the owner's own
+  report: table **FA3**, dishes **Idli** and **Masala Dosa**.
+
+  Gates: **A** the gate fails closed (signed out 401 `signed_out`; a real `Captain` role 403
+  `role_not_gre`; a null-role login 403 `no_role_assigned` carrying the "ASSIGN that role" remedy;
+  a `Floor Manager` allowed, attributed by role not tier) · **B** FA3's read returns exactly Idli +
+  Masala Dosa, split Food/Drinks from `order_items.station`, with **zero money fields in the whole
+  payload** and a blank station owned up to in `unclassified_count` · **C** the 10-second path writes
+  ONE visit and ZERO item rows · **D/E** Masala Dosa rated Poor/Cold/Remade writes one item row
+  (`menu_item_id` from `order_items`, not the body), one OPEN follow-up, and the untapped Idli gets
+  **no row** · **F** another table's `order_item_id` → 400 `item_not_on_order`, nothing written ·
+  **G/H** a double-tap → 200 `duplicate: true` with the same `visit_id`; a second person → 409 ·
+  **I** "Yes - Happy" closes, "Partially Happy" stays OPEN and stamps `escalated_at`, "Item
+  Cancelled" raises no follow-up · **J** every off-enum value is a refusal and an abandoned form is
+  `nothing_to_record`; a takeaway order and an order with no table are both 400 `not_a_table_visit`
+  (a visit no report could ever read is worse than a refusal) · **N** a Poor night with no dish
+  tapped stores the rating and `has_negative = 0`, and the consequence is asserted out loud ·
+  **K** the cached counters equal a recount, and the shipped tracker reports `cache_mismatch: 0` ·
+  **L** 🔒 `orders` + `order_items` + `restaurant_tables` are **byte-identical** before and after
+  every submit, and the only tables in the whole database whose row count moved are the three `gf_`
+  ones · **M** the analytics DELTA is exactly what was captured, Masala Dosa carries its negative in
+  Menu Item Analysis with a computable Return/Remake Rate, the guest's words come back out of
+  `itemComments()`, and the fairness ruling still holds over rows created through the real route.
+
+  **MEASURED BREADTH, not claimed breadth.**
+  - The suite **cannot load at `6194ccf`**: run against a pristine `git archive` of the tip it fails
+    with `Cannot find module .../src/lib/feedback/write.ts` and **0 assertions pass**. There is no
+    way to make it green without the writer.
+  - Eight one-line sabotages, `tsc` exit 0 for each. **Six go RED:** `toRecord = normal` (silence
+    becomes a rating) → D1/D2/**E1**; the item-on-order check disabled → F1-F5; both idempotency
+    layers disabled → G1/H1; `has_negative` widened to the overall rating → **N3/K1/K2**
+    (`cache_mismatch` stops being 0); `alreadyTaken` folding a second person into the existing row →
+    H1; the recorder read from the BODY instead of the session → C4; and the route ignoring its own
+    gate → A1/A2/A3. An "Item Cancelled" that also wrote `order_items.status` → **L1/L2**, which is
+    the read-only rule failing loudly instead of silently.
+  - **TWO SABOTAGES ARE INERT, BY DESIGN, AND THAT IS REPORTED RATHER THAN HIDDEN.** Removing the
+    duplicate PRE-CHECK alone leaves **143/0** (the UNIQUE index plus the recovery branch carry it);
+    removing the UNIQUE-recovery branch alone also leaves **143/0** (the pre-check carries it). Only
+    removing BOTH turns G1/H1 red. The rule is defended twice and the measurement says so.
+
+  **GATES:** `npx tsc --noEmit` exit **0** · `npx next build` exit **0**, with `/api/feedback` in the
+  route manifest as `ƒ` · `feedback-capture-tests` **143/0** · `feedback-scope-tests` **526/0** ·
+  `reviews-tests` **619/0**. Worktree build only, `node_modules` hardlinked with `cp -al`.
+  **NO DEV SERVER WAS BOOTED.** DB read only via `sqlite3 "file:…?mode=ro"` + `VACUUM INTO` (snapshot
+  verified `purchases=2165`, `raw_materials=952`); the live file was never written.
+
+  **STILL PENDING — Lane B, deliberately not in this commit:** `src/app/feedback/take/[orderId]/
+  page.tsx` still imports `TAKE_ORDER` from `../../placeholder` and still prints the "P1 SHELL"
+  banner, so **the owner's screen is not fixed yet**. The capture path it needs now exists and is
+  proved; the rewire (read `GET /api/feedback/order/[orderId]`, post through `src/lib/api.ts`, drop
+  the banner) and deleting `src/app/feedback/placeholder.ts` are the next lane.
+
+  **ONE QUESTION FOR THE OWNER.** A guest who grumbles about the SERVICE — overall **Poor**, no dish
+  tapped — produces a visit with `has_negative = 0`, so Page 1 shows that table as **Feedback Taken**
+  and not **Issue Raised**. The rating is not lost (the split counts it). `has_negative` is a
+  documented CACHE of the ITEM rows and `query.ts:603-607` recounts it exactly that way, so widening
+  it here alone would make `meta.cache_mismatch` non-zero on every such visit. If he wants that table
+  to read "Issue Raised", `tableStatus()` and the tracker's recount must move TOGETHER. Gate N pins
+  the present behaviour so the decision is visible instead of inherited.

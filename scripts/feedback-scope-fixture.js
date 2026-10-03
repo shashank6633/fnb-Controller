@@ -116,12 +116,64 @@ const floorOf = (n) => (n <= TABLES / 2 ? FLOORS[0] : FLOORS[1]);
 const AREA_ZONES = { 'fs-u-probe': ['Ground'], 'fs-u-steady': ['Terrace'] };
 
 /**
+ * CREATE THE THREE `gf_` TABLES IF THE SNAPSHOT HAS NOT GOT THEM — and it very
+ * often has not.
+ *
+ * MEASURED, 2026-10-03, on the production checkout's own `fnb-controller.db`:
+ *
+ *     sqlite3 "file:fnb-controller.db?mode=ro" \
+ *       "SELECT name FROM sqlite_master WHERE name LIKE 'gf_%';"   →  (nothing)
+ *
+ * Not "0 rows" — ABSENT. The DDL runs only inside `initializeSchema()` at app
+ * boot (`src/lib/db.ts`), and this database had not been booted since the
+ * feedback schema shipped. So this fixture, which only DELETEs and INSERTs, died
+ * on `SqliteError: no such table: gf_follow_ups` at its first statement and took
+ * the whole 526-assertion suite down with it before assertion 1 — on a machine
+ * where the standing rule forbids booting a dev server to fix it.
+ *
+ * The DDL is NOT copied here. `createGuestFeedbackSchema()` in `src/lib/db.ts`
+ * is the same function `initializeSchema()` calls, over the same
+ * `GF_SCHEMA_SQL` string, so a column added to the shipped schema reaches this
+ * fixture automatically and the two can never drift. Every statement in it is
+ * `CREATE … IF NOT EXISTS`, so calling it on a database that already has the
+ * tables does nothing.
+ *
+ * The `require` is LAZY and inside the function, so a caller that only wants
+ * this module's constants (`DAY`, `DISHES`, `PEOPLE`) does not pay for loading
+ * `db.ts`, and so the TypeScript `require.extensions` hook the suites install is
+ * guaranteed to be in place by the time it runs.
+ */
+function ensureGfSchema(db) {
+  const path = require('path');
+  let mod;
+  try {
+    mod = require(path.join(__dirname, '..', 'src', 'lib', 'db.ts'));
+  } catch (e) {
+    throw new Error(
+      'feedback-scope-fixture: could not load src/lib/db.ts to create the gf_ tables. '
+      + 'The caller must install the TypeScript require hook (see the loader section of '
+      + `scripts/feedback-scope-tests.js) before calling build(). Cause: ${e && e.message}`,
+    );
+  }
+  if (typeof mod.createGuestFeedbackSchema !== 'function') {
+    throw new Error(
+      'feedback-scope-fixture: src/lib/db.ts no longer exports createGuestFeedbackSchema(). '
+      + 'The gf_ DDL must stay reachable without booting a server, or this fixture is back to '
+      + 'assuming tables that may not exist.',
+    );
+  }
+  mod.createGuestFeedbackSchema(db);
+}
+
+/**
  * Seed one world into an open better-sqlite3 handle.
  * @param {import('better-sqlite3').Database} db  a snapshot, opened read-write
  * @param {'A'|'B'} which
  */
 function build(db, which) {
   if (which !== 'A' && which !== 'B') throw new Error(`build(): world must be 'A' or 'B', got ${which}`);
+
+  ensureGfSchema(db);
 
   for (const t of ['gf_follow_ups', 'gf_item_feedback', 'gf_visits']) {
     db.prepare(`DELETE FROM ${t}`).run();
@@ -284,6 +336,9 @@ function build(db, which) {
 
 module.exports = {
   build,
+  /** Exported so a suite that seeds its own rows (rather than calling `build()`)
+   *  can still get the three tables created from the shipped DDL. */
+  ensureGfSchema,
   DAY,
   DAY_ONE,
   DAY_TWO,

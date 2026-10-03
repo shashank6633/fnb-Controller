@@ -113,6 +113,25 @@ export async function requireFeedbackReader(): Promise<FeedbackGrant | FeedbackR
   return gate(false);
 }
 
+/**
+ * Page 2's SUBMIT — `POST /api/feedback`. THE SAME DECISION as
+ * `requireFeedbackReader()`, delegated to the same `gate(false)` rather than
+ * re-derived: recording the visit IS the GRE's one write in this module, so the
+ * population that may open Page 2 is exactly the population that may submit it,
+ * and a second predicate here is how two gates start disagreeing.
+ *
+ * It exists for one reason — so a write route does not have to call something
+ * named `…Reader()` and leave the next reader wondering whether the write lane
+ * was ever authorised at all. `readOnly` on the grant still means "a GRE, not
+ * management", and it remains true for a GRE submitting feedback: the owner's
+ * read-only rule is about the POS (orders, quantities, KOTs, bills, discounts),
+ * and `gf_*` is not the POS. `POS_WRITE_PREFIXES` in `./pos-readonly.ts` is what
+ * enforces that boundary, and `/api/feedback` is deliberately not on it.
+ */
+export async function requireFeedbackRecorder(): Promise<FeedbackGrant | FeedbackRefusal> {
+  return gate(false);
+}
+
 /** Page 4 — Admin Analytics & Reports. Management only, matching the catalog's
  *  `mgmtOnly` flag. Here so P5 inherits the same fail-closed shape. */
 export async function requireFeedbackAnalyst(): Promise<FeedbackGrant | FeedbackRefusal> {

@@ -8643,7 +8643,30 @@ function initializeSchema(db: Database.Database) {
   // erase the service-recovery record the owner asked for). Orphan rows are
   // handled by the reading query, never by the database deleting evidence.
   try {
-    db.exec(`
+    // The DDL itself now lives in GF_SCHEMA_SQL, immediately below, so the
+    // fixtures that seed these tables create them from the SAME STRING this
+    // boot runs. Before P3 they could not: the DDL was inline here and reachable
+    // only by booting the app, so `scripts/feedback-scope-fixture.js` DELETEd and
+    // INSERTed into tables it assumed existed — and on a database snapshot that
+    // had never been booted since this block shipped, the 526-assertion suite
+    // died on `no such table: gf_follow_ups` before its first assertion. One
+    // string, two callers, no drift.
+    createGuestFeedbackSchema(db);
+  } catch (e) { console.error('guest-feedback schema failed:', e); }
+}
+
+/**
+ * THE `gf_` DDL, as one string — deliberately still in THIS file and directly
+ * below the block that runs it, so the carve note above (“one contiguous region
+ * to lift out”) still holds and `db.ts` never has to import a `feedback/` path
+ * to build its own schema.
+ *
+ * Exported for ONE reason: a test fixture must be able to create these three
+ * tables without booting a server. `initializeSchema()` is the only runtime
+ * caller; everything about the SQL — the comments, the column order, the
+ * UNIQUE indexes — is unchanged from the block that shipped at 6194ccf.
+ */
+export const GF_SCHEMA_SQL = `
       -- ── gf_visits ─ ONE row per ORDER the GRE has taken feedback on. ───────
       -- A REVISIT DOES NOT CREATE A SECOND ROW. The owner's cycle is
       -- "GRE Visits → … → GRE Revisits → Guest Satisfaction Checked → Issue
@@ -8789,8 +8812,15 @@ function initializeSchema(db: Database.Database) {
       CREATE INDEX IF NOT EXISTS idx_gf_fu_visit  ON gf_follow_ups(visit_id);
       CREATE INDEX IF NOT EXISTS idx_gf_fu_open   ON gf_follow_ups(status, created_at);
       CREATE INDEX IF NOT EXISTS idx_gf_fu_table  ON gf_follow_ups(table_id, status);
-    `);
-  } catch (e) { console.error('guest-feedback schema failed:', e); }
+`;
+
+/**
+ * Create the three Guest Feedback tables and their indexes if they are absent.
+ * `CREATE TABLE IF NOT EXISTS` throughout, so it is safe to call on a database
+ * that already has them.
+ */
+export function createGuestFeedbackSchema(db: Database.Database): void {
+  db.exec(GF_SCHEMA_SQL);
 }
 
 // ---- UTILITY FUNCTIONS ----
