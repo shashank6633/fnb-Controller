@@ -15,6 +15,9 @@ interface Role {
   /** Granular: approve requisitions (dine-in + party) without the full HOD flag. */
   can_approve_requisitions: number;
   can_void_bill_handover: number;
+  /** Lifts the management-only gate on exactly five screens: /purchases and the
+   *  four vendor-money Reports. Not a tier — see page-catalog.ts financeCap. */
+  can_view_finance_reports: number;
   is_system: number;
   sort_order: number;
   description: string;
@@ -41,6 +44,7 @@ const blankDraft = () => ({
   id: '' as string, name: '', base_role: 'staff' as Role['base_role'], description: '',
   is_head_chef: false, is_store_manager: false, can_approve_requisitions: false,
   can_void_bill_handover: false,
+  can_view_finance_reports: false,
   pages: new Set<string>(), is_system: 0,
   can_request_discount: false, max_discount_pct: 0,
 });
@@ -73,6 +77,11 @@ export default function RolesAdmin() {
       is_head_chef: !!role.is_head_chef, is_store_manager: !!role.is_store_manager,
       can_approve_requisitions: !!role.can_approve_requisitions,
       can_void_bill_handover: !!role.can_void_bill_handover,
+      // MUST be seeded from the role. save() writes the whole draft, so a key
+      // missing here renders the box unticked for a role that HOLDS the
+      // capability and silently revokes it the next time anyone opens the role
+      // and presses Save — a revoke nobody asked for and nobody would see.
+      can_view_finance_reports: !!role.can_view_finance_reports,
       pages: new Set(parsePages(role.page_access)), is_system: role.is_system,
       can_request_discount: !!role.can_request_discount, max_discount_pct: Number(role.max_discount_pct) || 0,
     });
@@ -109,10 +118,23 @@ export default function RolesAdmin() {
     if (!draft.name.trim()) { alert('Give the role a name'); return; }
     setSaving(true);
     try {
+      // THIS LITERAL IS AN ALLOWLIST, AND IT IS THE ONLY WRITER OF EVERY ROLE
+      // CAPABILITY. A checkbox bound to `draft` is NOT wired up until its key
+      // appears here: the route reads named keys, PUT guards each with
+      // `!== undefined`, so a key left out is silently ignored and the column
+      // keeps its old value — forever, since no other code path writes it.
+      //
+      // That is exactly what happened to can_void_bill_handover in a86cb50: the
+      // column, the route and the checkbox all shipped, the key did not, and the
+      // capability could be ticked but never saved. With DEFAULT 0 that left it
+      // OFF for every role and ungrantable by any means in the product.
+      // ADD THE KEY HERE WHENEVER YOU ADD A CAPABILITY CHECKBOX.
       const body: any = {
         name: draft.name.trim(), base_role: draft.base_role, description: draft.description,
         is_head_chef: draft.is_head_chef, is_store_manager: draft.is_store_manager,
         can_approve_requisitions: draft.can_approve_requisitions,
+        can_void_bill_handover: draft.can_void_bill_handover,
+        can_view_finance_reports: draft.can_view_finance_reports,
         page_access: draft.base_role === 'admin' ? null : Array.from(draft.pages),
         can_request_discount: draft.can_request_discount,
         max_discount_pct: draft.can_request_discount ? Number(draft.max_discount_pct) || 0 : 0,
@@ -238,9 +260,25 @@ export default function RolesAdmin() {
                 <label className="flex items-center gap-2 text-sm text-[#2D1B0E]">
                   <input type="checkbox" checked={draft.can_void_bill_handover} onChange={(e) => setDraft({ ...draft, can_void_bill_handover: e.target.checked })} /> Can void a bill handover
                 </label>
+                {/* Finance & purchase reports. The FIRST capability that reaches
+                    past a tier gate: ticking it lets a STAFF role open five
+                    management screens it otherwise could not see at all. It is
+                    still not a grant on its own — the role also needs those pages
+                    ticked in its page list below. Defaults off on every role. */}
+                <label className="flex items-center gap-2 text-sm text-[#2D1B0E]">
+                  <input type="checkbox" checked={draft.can_view_finance_reports} onChange={(e) => setDraft({ ...draft, can_view_finance_reports: e.target.checked })} /> View finance &amp; purchase reports
+                </label>
               </div>
               <p className="-mt-1 text-[11px] text-[#8B7355]">
                 “Can approve requisitions” grants ONLY the approval inbox (dine-in + party) — no HOD-only pages, no party financials. “Is HOD” includes it.
+              </p>
+              <p className="-mt-1 text-[11px] text-[#8B7355]">
+                “View finance &amp; purchase reports” opens exactly five screens to a non-management role:
+                <strong> Purchases</strong>, <strong>Sales Reports</strong>, <strong>Purchase Report</strong>,
+                <strong> Purchase Bill Summary</strong> and <strong>Return Report</strong>. It opens nothing else —
+                other management pages stay shut. It is READ access: it does not allow CSV uploads or opening-stock
+                imports on the Purchases page. The role must ALSO have these pages ticked in its page list below;
+                this checkbox only lifts the management-only restriction on them.
               </p>
               <p className="-mt-1 text-[11px] text-[#8B7355]">
                 “Can void a bill handover” retires a vendor-bill record, with a reason, at any stage —

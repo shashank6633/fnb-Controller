@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { canAccessPage, firstAllowedPath } from '@/lib/page-catalog';
+import { canAccessPage, firstAllowedPath, isFinanceCapPath } from '@/lib/page-catalog';
 import { loadHodOnlyOverrides } from '@/lib/hod-overrides';
 import { getDb } from '@/lib/db';
 import {
@@ -348,7 +348,44 @@ export function proxy(req: NextRequest) {
         // how the feedback gate refuses a deactivated role WITHOUT disturbing
         // that rule for anything else.
         role_is_active: row.role_id ? !!row.role_active : null,
+        // Resolved below by its own query, deliberately NOT in the SELECT above.
+        can_view_finance_reports: false,
       } : undefined;
+      // ── FINANCE CAPABILITY, resolved in a SEPARATE, FAIL-CLOSED query.
+      //
+      // WHY NOT IN THE SELECT ABOVE. That query runs inside the try whose catch
+      // at the end of this block reads `fall through — fail open`. Naming a
+      // column there that does not exist yet would turn a swallowed roles
+      // migration into an app-wide BYPASS of page gating: the SELECT throws,
+      // the catch fails open, and every page opens for everyone. Before this
+      // change that query named no capability column at all, so there was no
+      // such coupling; keeping it byte-identical to what shipped means this
+      // feature adds no new fail-open surface.
+      //
+      // Here, a missing column means `false` — the capability is simply not
+      // held, the mgmtOnly gate stands, and the five pages stay SHUT. Fail
+      // closed, which is the correct direction for a grant.
+      //
+      // Cost: one indexed primary-key lookup, and only on the five flagged
+      // paths — isFinanceCapPath is false for every other request.
+      // row.role_id, NOT user.role_id — the `user` literal above deliberately
+      // does not carry role_id, so testing it there would be permanently false
+      // and this whole block would never run. Role-only, mirroring getCurrentUser.
+      if (user && row.role_id && isFinanceCapPath(pathname)) {
+        try {
+          // `AND is_active = 1` MATCHES getCurrentUser (auth.ts joins roles with
+          // the same filter), and it is the opposite of the rule for tier and
+          // page_access directly above, which deliberately keep resolving from a
+          // DEACTIVATED role so switching one off cannot fall back to a null map
+          // = every page. For a CAPABILITY the safe direction is the reverse:
+          // deactivating the role must revoke it. Without this filter the proxy
+          // would open the five pages while all six API feeds — which resolve
+          // through auth.ts — answer 403, i.e. a nav link that fails on click.
+          const cap = db.prepare('SELECT can_view_finance_reports AS c FROM roles WHERE id = ? AND is_active = 1')
+            .get(row.role_id) as any;
+          user.can_view_finance_reports = !!cap?.c;
+        } catch { user.can_view_finance_reports = false; }
+      }
       // ── Guest Feedback ONLY: an unresolved session is a REFUSAL, not a pass.
       // Measured 2026-09-22 on this branch, port 3924: with a made-up cookie
       // value (`fnb_session=zzgc-NO-SUCH-TOKEN`) all four feedback pages

@@ -260,6 +260,13 @@ export default function PurchasesPage() {
   // fed went with the bill form, and /grn derives its own from the same setting.
   const [backdateLimit, setBackdateLimit] = useState(3);
   const [isAdmin, setIsAdmin] = useState(false);
+  /** Can this user WRITE purchases (the two bulk-upload buttons), as opposed to
+   *  merely reading the register? Mirrors requirePurchasesAccess on the server —
+   *  management or the store person. A finance-report role reads this page but
+   *  is refused by /api/purchases/bulk and /opening-stock, so showing it those
+   *  buttons would only produce a 403 after it had picked a file. Default false:
+   *  the buttons appear once /api/auth/me confirms the bar, never before. */
+  const [canWritePurchases, setCanWritePurchases] = useState(false);
   const [limitInput, setLimitInput] = useState('3');
   const [limitSaving, setLimitSaving] = useState(false);
   const [limitSaved, setLimitSaved] = useState(false);
@@ -415,6 +422,13 @@ export default function PurchasesPage() {
       setLimitInput(String(limit));
       const mJson = await mRes.json().catch(() => null);
       setIsAdmin(mJson?.user?.role === 'admin');
+      // Same bar as requirePurchasesAccess (src/lib/purchases-access.ts):
+      // isManagement(me) || canProcessAsStore(me). Deliberately NOT widened by
+      // can_view_finance_reports — that capability is read-only on this page.
+      const u = mJson?.user;
+      setCanWritePurchases(
+        !!u && (u.role === 'admin' || u.role === 'manager' || !!u.is_head_chef || !!u.is_store_manager),
+      );
     } catch {
       // Leave defaults (3 days, non-admin). Server still enforces the real guard.
     }
@@ -1018,6 +1032,10 @@ export default function PurchasesPage() {
               <FileSpreadsheet className="w-4 h-4" />
               Bulk Template
             </button>
+            {/* Gated on the WRITE bar, not on page access. POST /api/purchases/bulk
+                keeps requirePurchasesAccess, so a finance-report role — which may
+                READ this register — would hit a 403 here after choosing a file. */}
+            {canWritePurchases && (
             <button
               onClick={openBulkModal}
               className="flex items-center gap-2 px-4 py-2.5 border border-green-600 text-green-700 hover:bg-green-50 rounded-lg text-sm font-medium transition-colors"
@@ -1025,6 +1043,7 @@ export default function PurchasesPage() {
               <Upload className="w-4 h-4" />
               Generic CSV Upload
             </button>
+            )}
             <button
               onClick={downloadOpeningTemplate}
               className="flex items-center gap-2 px-4 py-2.5 border border-blue-600 text-blue-700 hover:bg-blue-50 rounded-lg text-sm font-medium transition-colors"
@@ -1033,6 +1052,9 @@ export default function PurchasesPage() {
               <FileSpreadsheet className="w-4 h-4" />
               Opening Stock Template
             </button>
+            {/* Same WRITE bar: POST /api/purchases/opening-stock seeds stock and
+                average cost, so it stays management/store-only. */}
+            {canWritePurchases && (<>
             <button
               onClick={() => openingFileRef.current?.click()}
               disabled={openingBusy}
@@ -1044,6 +1066,7 @@ export default function PurchasesPage() {
             </button>
             <input ref={openingFileRef} type="file" accept=".xlsx,.xls,.csv" className="hidden"
                    onChange={(e) => { const f = e.target.files?.[0]; if (f) handleOpeningFile(f); }} />
+            </>)}
             {/* ══ WHERE "ENTER FULL BILL" WENT ═══════════════════════════════
                 This page no longer creates purchase rows. A hand-typed vendor
                 bill is now recorded on /grn as a goods receipt, so it inherits —

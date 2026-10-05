@@ -632,6 +632,11 @@ export default function Sidebar() {
     page_access?: string | null;
     is_head_chef?: boolean;
     role_name?: string | null;
+    // Read by canAccessPage's financeCap exception. The field is already on the
+    // wire (/api/auth/me returns the whole SessionUser) — this narrow local type
+    // is the only thing deciding whether the client-side filter can SEE it, so
+    // omitting it hides the five finance rows from the very roles granted them.
+    can_view_finance_reports?: boolean;
   } | null>(null);
   useEffect(() => {
     fetch('/api/auth/me').then(r => r.json()).then(d => {

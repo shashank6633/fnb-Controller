@@ -1,5 +1,6 @@
 import { getDb } from '@/lib/db';
-import { getCurrentUser, isManagement } from '@/lib/auth';
+import { getCurrentUser } from '@/lib/auth';
+import { requireFinanceReport } from '@/lib/finance-reports-access';
 import {
   buildPurchaseReconciliation, buildBillIdentityCoverage,
 } from '@/lib/purchase-reconciliation';
@@ -165,7 +166,8 @@ export async function GET(req: Request) {
   try {
     const me = await getCurrentUser();
     if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-    if (!isManagement(me)) return Response.json({ error: 'Management only' }, { status: 403 });
+    const deniedFin = requireFinanceReport(me, '/reports/purchases');
+    if (deniedFin) return deniedFin;
 
     const url = new URL(req.url);
 

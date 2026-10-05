@@ -46,7 +46,7 @@ export async function GET(req: Request) {
 export async function POST(req: Request) {
   const auth = await requireRole('admin');
   if (!auth.ok) return Response.json({ error: auth.message }, { status: auth.status });
-  const { name, base_role, page_access, is_head_chef, is_store_manager, can_approve_requisitions, can_void_bill_handover, description, sort_order,
+  const { name, base_role, page_access, is_head_chef, is_store_manager, can_approve_requisitions, can_void_bill_handover, can_view_finance_reports, description, sort_order,
           can_request_discount, max_discount_pct } = await req.json();
   const nm = String(name || '').trim();
   if (!nm) return Response.json({ error: 'Role name is required' }, { status: 400 });
@@ -56,12 +56,20 @@ export async function POST(req: Request) {
     return Response.json({ error: 'A role with that name already exists' }, { status: 409 });
   }
   const info = db.prepare(`
-    INSERT INTO roles (id, name, base_role, page_access, is_head_chef, is_store_manager, can_approve_requisitions, can_void_bill_handover, is_system, sort_order, description,
+    INSERT INTO roles (id, name, base_role, page_access, is_head_chef, is_store_manager, can_approve_requisitions, can_void_bill_handover, can_view_finance_reports, is_system, sort_order, description,
                        can_request_discount, max_discount_pct)
-    VALUES (lower(hex(randomblob(16))), ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+    -- 14 columns, 14 values. The literal 0 is is_system: a role created through
+    -- this route is never a system role, so it is hardcoded rather than bound.
+    -- COUNT THE PLACEHOLDERS AGAINST THE COLUMN LIST WHEN ADDING A CAPABILITY.
+    -- a86cb50 added can_void_bill_handover to the column list above and a value
+    -- to .run() below but no '?' here, leaving 12 values for 13 columns, which
+    -- better-sqlite3 rejects at PREPARE time — so creating any new role 500'd
+    -- while editing existing ones (PUT, which uses named sets.push) kept working.
+    VALUES (lower(hex(randomblob(16))), ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
   `).run(nm, base_role, cleanPages(page_access), is_head_chef ? 1 : 0, is_store_manager ? 1 : 0,
          can_approve_requisitions ? 1 : 0,
          can_void_bill_handover ? 1 : 0,
+         can_view_finance_reports ? 1 : 0,
          Number(sort_order) || 50, String(description || ''),
          can_request_discount ? 1 : 0, clampPct(max_discount_pct));
   return Response.json({ success: true, id: info.lastInsertRowid }, { status: 201 });
@@ -70,7 +78,7 @@ export async function POST(req: Request) {
 export async function PUT(req: Request) {
   const auth = await requireRole('admin');
   if (!auth.ok) return Response.json({ error: auth.message }, { status: auth.status });
-  const { id, name, base_role, page_access, is_head_chef, is_store_manager, can_approve_requisitions, can_void_bill_handover, description, sort_order,
+  const { id, name, base_role, page_access, is_head_chef, is_store_manager, can_approve_requisitions, can_void_bill_handover, can_view_finance_reports, description, sort_order,
           can_request_discount, max_discount_pct } = await req.json();
   if (!id) return Response.json({ error: 'id required' }, { status: 400 });
   if (base_role != null && !VALID_BASE.includes(base_role)) {
@@ -91,6 +99,7 @@ export async function PUT(req: Request) {
   if (is_store_manager !== undefined)         { sets.push('is_store_manager = ?'); params.push(is_store_manager ? 1 : 0); }
   if (can_approve_requisitions !== undefined) { sets.push('can_approve_requisitions = ?'); params.push(can_approve_requisitions ? 1 : 0); }
   if (can_void_bill_handover !== undefined) { sets.push('can_void_bill_handover = ?'); params.push(can_void_bill_handover ? 1 : 0); }
+  if (can_view_finance_reports !== undefined) { sets.push('can_view_finance_reports = ?'); params.push(can_view_finance_reports ? 1 : 0); }
   if (description !== undefined)              { sets.push('description = ?'); params.push(String(description || '')); }
   if (sort_order !== undefined)              { sets.push('sort_order = ?'); params.push(Number(sort_order) || 0); }
   if (can_request_discount !== undefined)    { sets.push('can_request_discount = ?'); params.push(can_request_discount ? 1 : 0); }

@@ -39,6 +39,12 @@ export interface SessionUser {
    *  column): voiding retires a record of money changing hands, so it is a
    *  designation's capability, not a person's. An admin always holds it. */
   can_void_bill_handover: boolean;
+  /** Who may open the five finance/purchase screens — /purchases and the four
+   *  vendor-money Reports. Granted per ROLE only, like the capability above.
+   *  NECESSARY BUT NOT SUFFICIENT: this lifts the TIER gate (mgmtOnly, and the
+   *  management bar on the purchase register) and nothing else — the holder
+   *  still needs the page in their page_access map, exactly as before. */
+  can_view_finance_reports: boolean;
   /** JSON-stringified array of allowed page paths. null = full access (backward compat). */
   page_access: string | null;
   /** JSON-stringified array of department_ids whose data is visible. null = only own dept. */
@@ -100,6 +106,7 @@ export async function getCurrentUser(): Promise<SessionUser | null> {
            r.is_head_chef AS role_head_chef, r.is_store_manager AS role_store,
            r.can_approve_requisitions AS role_can_approve_req,
            r.can_void_bill_handover AS role_can_void_bh,
+           r.can_view_finance_reports AS role_can_view_fin,
            r.can_request_discount AS role_can_discount, r.max_discount_pct AS role_max_discount,
            s.expires_at
     FROM sessions s JOIN users u ON u.id = s.user_id
@@ -134,6 +141,11 @@ export async function getCurrentUser(): Promise<SessionUser | null> {
     // capability outlives the reason it was given; this one is held by a
     // designation or not at all.
     can_void_bill_handover: hasRole && !!row.role_can_void_bh,
+    // ROLE-ONLY, same shape as the line above: there is no users.* column to
+    // union with, so a person holds this only through the designation they are
+    // assigned. hasRole is false when role_id is unset, which keeps a legacy
+    // user on the old users.role tier from picking the capability up by accident.
+    can_view_finance_reports: hasRole && !!row.role_can_view_fin,
     // Pages: a per-user page_access overrides; else inherit the role's set; else
     // null = full access (backward compat for users without a role or override).
     page_access: row.page_access != null ? row.page_access : (hasRole ? (row.role_page_access ?? null) : null),
@@ -221,6 +233,7 @@ export async function verifyApprover(email: string, password: string): Promise<S
            r.is_head_chef AS role_head_chef, r.is_store_manager AS role_store,
            r.can_approve_requisitions AS role_can_approve_req,
            r.can_void_bill_handover AS role_can_void_bh,
+           r.can_view_finance_reports AS role_can_view_fin,
            r.can_request_discount AS role_can_discount, r.max_discount_pct AS role_max_discount
     FROM users u LEFT JOIN roles r ON r.id = u.role_id AND r.is_active = 1
     WHERE lower(u.email) = lower(?) AND u.is_active = 1
@@ -237,6 +250,11 @@ export async function verifyApprover(email: string, password: string): Promise<S
     is_store_manager: !!row.is_store_manager || (hasRole && !!row.role_store),
     can_approve_requisitions: !!row.can_approve_requisitions || (hasRole && !!row.role_can_approve_req),
     can_void_bill_handover: hasRole && !!row.role_can_void_bh,
+    // ROLE-ONLY, same shape as the line above: there is no users.* column to
+    // union with, so a person holds this only through the designation they are
+    // assigned. hasRole is false when role_id is unset, which keeps a legacy
+    // user on the old users.role tier from picking the capability up by accident.
+    can_view_finance_reports: hasRole && !!row.role_can_view_fin,
     page_access: row.page_access != null ? row.page_access : (hasRole ? (row.role_page_access ?? null) : null),
     visible_department_ids: row.visible_department_ids || null,
     preferred_zones: row.preferred_zones || null,

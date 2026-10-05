@@ -1,4 +1,5 @@
-import { getCurrentUser, isManagement } from '@/lib/auth';
+import { getCurrentUser } from '@/lib/auth';
+import { requireFinanceReport } from '@/lib/finance-reports-access';
 import { todayIST } from '@/lib/format-date';
 import {
   getPurchaseLog,
@@ -276,7 +277,11 @@ export async function GET(req: Request) {
     // commercially sensitive data at line-level detail.
     const me = await getCurrentUser();
     if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-    if (!isManagement(me)) return Response.json({ error: 'Management only' }, { status: 403 });
+    // '/reports/purchases' — this route has no catalog page of its own;
+    // it is the Purchase Report page's data feed, so it inherits that
+    // page's flag rather than inventing a grant nobody can see.
+    const deniedFin = requireFinanceReport(me, '/reports/purchases');
+    if (deniedFin) return deniedFin;
 
     const sp = new URL(req.url).searchParams;
     const rawFrom = sp.get('from');

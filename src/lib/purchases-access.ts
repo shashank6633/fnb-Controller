@@ -1,4 +1,5 @@
 import { isManagement, canProcessAsStore, type SessionUser } from '@/lib/auth';
+import { canViewFinanceReport } from '@/lib/finance-reports-access';
 
 /**
  * ROLE GATE for the purchase register and every route that WRITES purchases
@@ -30,4 +31,29 @@ export function requirePurchasesAccess(me: SessionUser): Response | null {
     return Response.json({ error: 'Store manager or management only' }, { status: 403 });
   }
   return null;
+}
+
+/**
+ * READ-SIDE VARIANT (owner, 2026-10-05) — the register FEED only.
+ *
+ * THE SPLIT IS THE POINT. requirePurchasesAccess above gates four call sites:
+ * one read (GET /api/purchases) and three that INSERT purchases rows and move
+ * current_stock and average_price (POST /api/purchases, /purchases/bulk,
+ * /purchases/opening-stock). The Accounts designation needs to READ the
+ * purchase register; it has no business bulk-inserting stock. Widening the
+ * existing function would have handed those three writes to every future holder
+ * of the capability, retroactively and silently — so the strict bar above is
+ * left EXACTLY as it was and this weaker one is used at the single read site.
+ *
+ * canViewFinanceReport() is asked about '/purchases' specifically, so the grant
+ * still comes from that page's own catalog flag. Nothing here can open a screen
+ * the owner did not flag.
+ */
+export function requirePurchasesReadAccess(me: SessionUser): Response | null {
+  if (isManagement(me) || canProcessAsStore(me)) return null;
+  if (canViewFinanceReport(me, '/purchases')) return null;
+  return Response.json(
+    { error: 'Store manager, management, or a role with "View finance & purchase reports"' },
+    { status: 403 },
+  );
 }

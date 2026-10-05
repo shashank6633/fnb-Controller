@@ -45,6 +45,12 @@ export interface CatalogUser {
    *  affect tier or page-map resolution, which must keep honouring a
    *  deactivated role (auth.ts:104-107) or deactivation would escalate. */
   role_is_active?: boolean | number | null;
+  /** `roles.can_view_finance_reports` for the assigned role. Read by ONE gate:
+   *  the mgmtOnly test, and only on a page whose entry carries `financeCap`.
+   *  Absent/false ⇒ nothing changes anywhere. It is never tested on its own —
+   *  every read is `user.can_view_finance_reports && entry.financeCap` — which
+   *  is what makes it structurally incapable of opening an unflagged page. */
+  can_view_finance_reports?: boolean;
 }
 
 export interface PageEntry {
@@ -63,6 +69,27 @@ export interface PageEntry {
    * for sensitive customer PII (the Customers page).
    */
   mgmtOnly?: boolean;
+  /**
+   * THE ONE EXCEPTION TO mgmtOnly, and the only one. When true, a user holding
+   * `can_view_finance_reports` (a roles column, admin-granted in Settings →
+   * Roles) satisfies this page's mgmtOnly test without being management.
+   *
+   * It is a per-PAGE opt-in, not a tier: the capability is never tested alone,
+   * so flagging nothing would grant nothing, and a mgmtOnly page WITHOUT this
+   * flag stays shut to a cap holder no matter what. That is deliberate — it is
+   * what stops an Accounts designation reaching /boh/accountability,
+   * /department-variance, staff rankings or the guest-phone screens.
+   *
+   * Carried by exactly five rows: /purchases and the four vendor-money Reports.
+   * On /purchases the flag is INERT for canAccessPage (that row has no mgmtOnly
+   * to lift) and exists so the five paths are ONE reviewable list — the actual
+   * unlock there is in src/lib/purchases-access.ts, which reads the same list.
+   *
+   * PREFIX LAW APPLIES: bestEntry() is longest-prefix, so a future page under
+   * one of the five with no row of its own inherits this flag. A new child a
+   * cap holder must NOT see needs its own catalog row.
+   */
+  financeCap?: boolean;
   /**
    * When true, ONLY an Admin (role === 'admin') may see/open this page —
    * stricter than mgmtOnly/hodOnly. Used for admin-only consoles like the App
@@ -341,7 +368,12 @@ export const PAGE_CATALOG: PageSection[] = [
   {
     label: 'Purchasing',
     pages: [
-      { path: '/purchases',           label: 'Purchases' },
+      // financeCap is INERT here for canAccessPage — this row has no mgmtOnly to
+      // lift, so a plain staffer with the grant already opens the page. It is
+      // carried so FINANCE_CAP_PATHS below is the ONE list of the owner's five,
+      // which src/lib/purchases-access.ts reads to unlock GET /api/purchases —
+      // the 403 that actually makes this page show "Failed to fetch purchases".
+      { path: '/purchases',           label: 'Purchases', financeCap: true },
       { path: '/purchase-orders',     label: 'Purchase Orders' },
       { path: '/grn',                 label: 'Goods Receipt (GRN)' },
       // Pending Quality Checks — the queue a kitchen/bar staffer clears at the
@@ -569,10 +601,10 @@ export const PAGE_CATALOG: PageSection[] = [
     pages: [
       { path: '/sales-dashboard',     label: 'Sales Dashboard' },
       { path: '/reports',             label: 'Reports' },
-      { path: '/reports/sales',       label: 'Sales Reports', mgmtOnly: true },
-      { path: '/reports/purchases',   label: 'Purchase Report', mgmtOnly: true },
-      { path: '/reports/purchase-bill-summary', label: 'Purchase Bill Summary', mgmtOnly: true }, // mgmtOnly for the SAME reason as Purchase Report directly above: vendor-level spend, GST and cess, one row per vendor bill. Two traps a future reader will hit: (1) a "bill" here is DERIVED, not stored — purchases holds one row per ITEM, so the report groups on invoice_id > grn_id > vendor|bill_no|date|outlet > vendor|date|outlet, and since ~2,151 of 2,165 rows carry no vendor bill number most rows are a vendor-day consolidation flagged DAY_RUN, not a paper bill. (2) it reads the purchases table ALONE — goods_receipt_note_items / po_vendor_bills restate the SAME money (see the header of src/lib/purchase-log.ts), so joining them back in to "enrich" a PO-receive bill with its GRN tax would double-count; PO-receive purchases rows are deliberately tax-free cost mirrors and are labelled as booked cost, not bill face value. This line is NOT the security boundary: /api/reports/purchase-bill-summary refuses non-management with its own 403.
-      { path: '/reports/returns',     label: 'Return Report', mgmtOnly: true },           // mgmtOnly for the SAME vendor-spend reason recorded on the Purchase Report line above: a vendor-return row carries the GRN line's unit price and the credit note the vendor owes us, so this is vendor money, not a counting aid. Two things not to "simplify": (1) it reports BOTH kinds of return in one list and deliberately has NO grand-total field — a vendor return takes stock OUT of the building (central DOWN) while an internal department return puts it back (central UP), and the two are even measured in different unit bases (purchase vs recipe), so a combined figure would be arithmetically meaningless; totals are per source, each printing its basis. (2) PO No. / GRN No. print BLANK on internal rows rather than a nearest match — the department ledger carries no purchase link, so any value there would be fabricated. As with every report line here, this flag is NOT the security boundary: the route behind it refuses non-management with its own 403.
+      { path: '/reports/sales',       label: 'Sales Reports', mgmtOnly: true, financeCap: true },
+      { path: '/reports/purchases',   label: 'Purchase Report', mgmtOnly: true, financeCap: true },
+      { path: '/reports/purchase-bill-summary', label: 'Purchase Bill Summary', mgmtOnly: true, financeCap: true }, // mgmtOnly for the SAME reason as Purchase Report directly above: vendor-level spend, GST and cess, one row per vendor bill. Two traps a future reader will hit: (1) a "bill" here is DERIVED, not stored — purchases holds one row per ITEM, so the report groups on invoice_id > grn_id > vendor|bill_no|date|outlet > vendor|date|outlet, and since ~2,151 of 2,165 rows carry no vendor bill number most rows are a vendor-day consolidation flagged DAY_RUN, not a paper bill. (2) it reads the purchases table ALONE — goods_receipt_note_items / po_vendor_bills restate the SAME money (see the header of src/lib/purchase-log.ts), so joining them back in to "enrich" a PO-receive bill with its GRN tax would double-count; PO-receive purchases rows are deliberately tax-free cost mirrors and are labelled as booked cost, not bill face value. This line is NOT the security boundary: /api/reports/purchase-bill-summary refuses non-management with its own 403.
+      { path: '/reports/returns',     label: 'Return Report', mgmtOnly: true, financeCap: true },         // mgmtOnly for the SAME vendor-spend reason recorded on the Purchase Report line above: a vendor-return row carries the GRN line's unit price and the credit note the vendor owes us, so this is vendor money, not a counting aid. Two things not to "simplify": (1) it reports BOTH kinds of return in one list and deliberately has NO grand-total field — a vendor return takes stock OUT of the building (central DOWN) while an internal department return puts it back (central UP), and the two are even measured in different unit bases (purchase vs recipe), so a combined figure would be arithmetically meaningless; totals are per source, each printing its basis. (2) PO No. / GRN No. print BLANK on internal rows rather than a nearest match — the department ledger carries no purchase link, so any value there would be fabricated. As with every report line here, this flag is NOT the security boundary: the route behind it refuses non-management with its own 403.
       { path: '/reports/issue-log',   label: 'Purchase to Issue Log', mgmtOnly: true },   // mgmtOnly for the SAME reason as Purchase Report directly above: it joins vendor spend and purchase rates onto material rows. Do NOT "simplify" this to an open page — the store's own issue view (/store-requisitions, /api/store-issued-log) is untouched and still carries no money.
       { path: '/reports/menu-recipe-gap', label: 'Menu Items Without Recipe', mgmtOnly: true }, // mgmtOnly: ranks the un-costed menu by actual SALES VALUE (revenue on the page), and its review-gated bulk attach rewrites the food cost of every FUTURE sale of a dish. Not a staff surface.
       { path: '/menu-engineering',    label: 'Menu Engineering', hodOnly: true },
@@ -973,6 +1005,24 @@ export function isHodOnlyPath(pathname: string): boolean {
 export function isMgmtOnlyPath(pathname: string): boolean {
   return !!bestEntry(pathname)?.mgmtOnly;
 }
+/** Is `pathname` under a catalog entry that `can_view_finance_reports` may open?
+ *  Uses the SAME bestEntry() longest-prefix walk as isMgmtOnlyPath, so the two
+ *  always agree about WHICH entry they are judging — if they resolved the path
+ *  differently the capability could lift a gate belonging to another row. */
+export function isFinanceCapPath(pathname: string): boolean {
+  return !!bestEntry(pathname)?.financeCap;
+}
+/** Can this user open `pathname` because they hold the finance capability?
+ *  THE ONLY PLACE the capability is read. Both halves are required: the user's
+ *  column AND the page's own flag. Exported so the API gates (which must not
+ *  trust a catalog flag for security) use one predicate instead of six copies. */
+export function financeCapOpens(user: CatalogUser | null, pathname: string): boolean {
+  return !!user?.can_view_finance_reports && isFinanceCapPath(pathname);
+}
+/** The owner's five finance paths, DERIVED from the catalog rather than retyped,
+ *  so a sixth flagged row cannot disagree with the API allowlist. */
+export const FINANCE_CAP_PATHS: string[] =
+  PAGE_CATALOG.flatMap(s => s.pages).filter(p => p.financeCap).map(p => p.path);
 /** Is `pathname` under an admin-only catalog entry (role === 'admin' only)? */
 export function isAdminOnlyPath(pathname: string): boolean {
   return !!bestEntry(pathname)?.adminOnly;
@@ -1190,9 +1240,16 @@ export function firstAllowedPath(user: CatalogUser | null): string {
       // proxy then blocks, and since this function IS the proxy's fallback
       // target that is a redirect loop, not a cosmetic bug. greOnly was the
       // fourth flag; there are four tests below for that reason.
+      //
+      // financeCap is NOT a fifth flag — it WIDENS the mgmtOnly test rather than
+      // adding a test of its own, so the failure mode here is the opposite one:
+      // omit it and a finance-capable role whose map is exactly the five paths
+      // matches NO row, falls through to '/login', and is bounced straight back
+      // by the proxy. That is the redirect loop this comment warns about.
       if (allowed.includes(p.path)
         && !(p.hodOnly && !user.is_head_chef)
-        && !(p.mgmtOnly && !(user.role === 'manager' || user.is_head_chef))
+        && !(p.mgmtOnly && !(user.role === 'manager' || user.is_head_chef)
+             && !(p.financeCap && user.can_view_finance_reports))
         && !(p.adminOnly && user.role !== 'admin')
         && !(p.greOnly && !canOpenFeedbackFloor(user))) return p.path;
     }
@@ -1226,7 +1283,11 @@ export function canAccessPage(
   // Management-only pages (customer PII): a non-admin must be a Manager or an
   // HOD. Also runs before the null-map grant so legacy full-access staff can't
   // reach the Customers page.
-  if (isMgmtOnlyPath(pathname) && !(user.role === 'manager' || user.is_head_chef)) return false;
+  // financeCapOpens() is the ONE exception to mgmtOnly, and it needs BOTH the
+  // user's roles column AND this page's own financeCap flag — so it can only
+  // ever open the five flagged rows, never mgmtOnly as a class.
+  if (isMgmtOnlyPath(pathname) && !(user.role === 'manager' || user.is_head_chef)
+      && !financeCapOpens(user, pathname)) return false;
 
   // Admin-only pages (App Errors console): a non-admin is blocked outright,
   // whatever their page_access map says — runs before the null-map grant so
@@ -1378,7 +1439,11 @@ export function canAccessPageStrict(
   if (user.role === 'admin') return true;
   if (ALWAYS_ALLOWED.some(p => pathname === p)) return true;
   if (isHodOnlyPath(pathname) && !user.is_head_chef) return false;
-  if (isMgmtOnlyPath(pathname) && !(user.role === 'manager' || user.is_head_chef)) return false;
+  // financeCapOpens() is the ONE exception to mgmtOnly, and it needs BOTH the
+  // user's roles column AND this page's own financeCap flag — so it can only
+  // ever open the five flagged rows, never mgmtOnly as a class.
+  if (isMgmtOnlyPath(pathname) && !(user.role === 'manager' || user.is_head_chef)
+      && !financeCapOpens(user, pathname)) return false;
   if (isAdminOnlyPath(pathname)) return false;
   if (isGreOnlyPath(pathname) && !canOpenFeedbackFloor(user)) return false;
   // Kept in sync with canAccessPage deliberately: this function is MEASURED,
