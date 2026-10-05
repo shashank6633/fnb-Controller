@@ -10,13 +10,44 @@
  * detail — per-item rating, issue, comment, action taken — is entirely optional
  * and lives behind a tap on an item, out of the way of the common case.
  *
- * 🔒 READ-ONLY. Every control here writes to this module's own draft state. The
- * screen shows the ordered items and cannot change one: no quantity stepper, no
- * remove, no add, no fire, no reprint. "Item Cancelled" and "Fresh Item
- * Replaced" are *records of what the kitchen did*, not commands — P3 writes them
- * to `gf_*` only, never to `order_items`. The actual enforcement is P2's
- * server-side deny (P0 Lane A: `PATCH /api/dine-in/orders/[id]` currently gates
- * on nothing but a session).
+ * ── WHAT CHANGED IN P3 LANE C ───────────────────────────────────────────────
+ * THE BUG THE OWNER HIT: "In Floor Feedback Page for the Table no FA3 it showing
+ * 2 items. Idli and Masala Dosa. But when i Click on Take Feedback It is not
+ * showing the Ordered Items. Its showing the Other Items."
+ *
+ * He was right, and the cause was not a display glitch. This file rendered
+ * `../../placeholder.ts` — ONE INVENTED ORDER with invented dishes — behind a
+ * "P1 SHELL" note, and Submit flashed "Shell only". So the screen showed the
+ * same fake order for every table on the floor, and the per-item capture that is
+ * the entire point of the feature ("to that particular item if there is negative
+ * review their itself they can take the review for that item") wrote nothing
+ * anywhere. The floor board was reading real orders while this screen was
+ * reading fiction, which is why the two disagreed about FA3.
+ *
+ * It now reads `GET /api/feedback/order/[orderId]` — the module's OWN narrow
+ * SELECT over `order_items`, never a proxy to `/api/dine-in/orders/[id]`, whose
+ * PATCH exports add_item · set_qty · remove_item · fire — and submits through
+ * `POST /api/feedback`. Food vs Drinks is NOT guessed here from a dish name: the
+ * server resolves it from `order_items.station` via `classifyStation()` and
+ * hands back two arrays already split, so this screen and the writer that stores
+ * `item_group` cannot disagree about where a plate belongs.
+ *
+ * Like the sibling landing at `../page.tsx`, a denial and an empty order must
+ * never look alike: a 401/403 prints the gate's own `what_to_do` verbatim,
+ * because the live trap is "role created but never ASSIGNED", which otherwise
+ * reads as a broken page.
+ *
+ * 🔒 READ-ONLY. Every control here writes to this module's own draft state, and
+ * the only request it ever POSTs is `/api/feedback`, which touches `gf_*` and
+ * nothing else. The screen shows the ordered items and cannot change one: no
+ * quantity stepper, no remove, no add, no fire, no reprint. "Item Cancelled" and
+ * "Fresh Item Replaced" are *records of what the kitchen did*, not commands.
+ * No money is read, shown or sent — the GRE records how the food was, not the
+ * cheque.
+ *
+ * 🔒 CSRF. Submit goes through `src/lib/api.ts`, which injects `x-csrf-token` on
+ * state-changing methods. `/api/feedback` is in `CSRF_REQUIRED_PREFIXES`
+ * (`src/proxy.ts`), so a bare `fetch()` here would 403 at the proxy.
  *
  * The route is `/feedback/take/[orderId]` — no `print` segment, no `.json`
  * ending, both of which `proxy.ts` would turn into a public, CSRF-exempt path
@@ -31,48 +62,79 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import {
   ArrowLeft, Users, Clock, Check, X, MessageSquare, Mic, Star, RotateCcw, ChevronRight,
+  Lock, RefreshCw, AlertTriangle, Loader2,
 } from 'lucide-react';
+import { api } from '@/lib/api';
 import {
-  ACTIONS_TAKEN, CATEGORIES, HAPPINESS, ITEM_ISSUES, ITEM_RATINGS, OVERALL_RATINGS,
-  REVISIT_RATINGS, closesIssue, isNegative, requiresFollowUp,
-  type ActionTaken, type Category, type Happiness, type ItemIssue, type ItemRating,
-  type OverallRating,
+  ACTIONS_TAKEN, CATEGORIES, GRE_ROLE_NAME, HAPPINESS, ITEM_ISSUES, ITEM_RATINGS,
+  OVERALL_RATINGS, REVISIT_RATINGS, closesIssue, isNegative, requiresFollowUp,
+  type Category, type ItemRating, type OverallRating,
 } from '@/lib/feedback';
-import { TAKE_ORDER, type TakeItem } from '../../placeholder';
-import { Card, Chip, PlaceholderNote, PrimaryButton, Scroller, SectionTitle, StickyBar, elapsed } from '../../ui';
+// Type-only, so nothing from the server modules reaches the client bundle — the
+// same thing `../page.tsx` does for FloorRow.
+import type { FeedbackOrderItem, FeedbackOrderView } from '@/lib/feedback/read';
+import type { SubmitFeedbackOk } from '@/lib/feedback/write';
+// The pure half of this screen: the silence rule and the request body, as plain
+// functions over plain data so a test can drive them into the real route. See
+// the header of ./draft.ts for why they are not inlined here.
+import {
+  buildSubmitBody, canSubmit as draftCanSubmit, isRecordable,
+  type ItemFeedback, type Revisit, type TakeDraft,
+} from './draft';
+import { Card, Chip, PrimaryButton, Scroller, SectionTitle, StickyBar, elapsed } from '../../ui';
 
-/** What the GRE has recorded against one ordered line. All fields optional —
- *  that is the point of the screen. */
-interface ItemFeedback {
-  rating?: ItemRating;
-  issue?: ItemIssue;
-  comment?: string;
-  action?: ActionTaken;
+/** The refusal body the feedback gate returns. `what_to_do` is printed verbatim
+ *  — the live trap is "role created but never ASSIGNED", which looks exactly
+ *  like a broken page unless the screen names the missing step. */
+interface Denial {
+  error: string;
+  reason: string;
+  your_role?: string | null;
+  what_to_do?: string;
 }
 
-/** The revisit, asked only for items whose action forces a follow-up. */
-interface Revisit {
-  after?: string;
-  happy?: Happiness;
+/** A refused submit, as the route reports it. */
+interface SubmitRefusal {
+  error: string;
+  reason?: string;
+  taken_by?: string;
+  taken_at?: string;
 }
 
 const CATEGORY_CHOICES = ITEM_RATINGS; // Good · Average · Poor, the same three
+
+/** Stable empty array, so the `useMemo` over the two item lists does not get a
+ *  fresh `[]` on every render while the order is still loading. */
+const NO_ITEMS: FeedbackOrderItem[] = [];
 
 export default function TakeFeedbackPage() {
   const router = useRouter();
   const params = useParams<{ orderId: string }>();
   const orderId = typeof params?.orderId === 'string' ? params.orderId : '';
 
-  // P3: `api('/api/feedback/order/' + orderId)` — a read-only projection of the
-  // order with its items already split Food/Drinks by `stationKdsSection()`.
-  const order = TAKE_ORDER;
+  /* ── the real order ───────────────────────────────────────────────────── */
+  const [view, setView] = useState<FeedbackOrderView | null>(null);
+  const [denial, setDenial] = useState<Denial | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
 
+  /* ── the draft ────────────────────────────────────────────────────────── */
   const [overall, setOverall] = useState<OverallRating | null>(null);
   const [categories, setCategories] = useState<Partial<Record<Category, ItemRating>>>({});
   const [itemFb, setItemFb] = useState<Record<string, ItemFeedback>>({});
   const [revisits, setRevisits] = useState<Record<string, Revisit>>({});
-  const [sheetFor, setSheetFor] = useState<TakeItem | null>(null);
+  /** Was the one-tap path used? Sent as `everything_good`, which the writer
+   *  stores — and which it refuses to store as 1 next to a negative item. Any
+   *  later edit clears it, so this screen never produces that contradiction. */
+  const [oneTap, setOneTap] = useState(false);
+  const [sheetFor, setSheetFor] = useState<FeedbackOrderItem | null>(null);
   const [toast, setToast] = useState<string | null>(null);
+
+  /* ── the submit ───────────────────────────────────────────────────────── */
+  const [submitting, setSubmitting] = useState(false);
+  const [refusal, setRefusal] = useState<SubmitRefusal | null>(null);
+  const [done, setDone] = useState<SubmitFeedbackOk | null>(null);
 
   const [now, setNow] = useState<number | null>(null);
   useEffect(() => {
@@ -86,8 +148,68 @@ export default function TakeFeedbackPage() {
     setTimeout(() => setToast(null), 2500);
   }, []);
 
-  const food = useMemo(() => order.items.filter((i) => i.group === 'food'), [order.items]);
-  const drinks = useMemo(() => order.items.filter((i) => i.group === 'drinks'), [order.items]);
+  /**
+   * One load, plus a manual refresh. NOT a poll like the floor board: the GRE is
+   * standing at the table typing into this form, and swapping the item list out
+   * from under a half-written complaint would lose it.
+   */
+  const load = useCallback(async (quiet = false) => {
+    if (!orderId) {
+      setLoadError('No order id in the address — open this screen from the floor board.');
+      setLoading(false);
+      return;
+    }
+    if (!quiet) setBusy(true);
+    try {
+      const res = await api(`/api/feedback/order/${encodeURIComponent(orderId)}`);
+      if (res.status === 401 || res.status === 403) {
+        let body: Denial = { error: `HTTP ${res.status}`, reason: 'unknown' };
+        try { body = await res.json(); } catch { /* keep the fallback */ }
+        setDenial(body);
+        setView(null);
+        setLoadError(null);
+        return;
+      }
+      if (!res.ok) {
+        let msg = `HTTP ${res.status}`;
+        try { msg = (await res.json()).error || msg; } catch { /* keep the fallback */ }
+        setLoadError(
+          res.status === 404
+            ? 'This order is not open for feedback — it may have been voided, or it belongs to '
+              + 'another outlet. Go back to the floor board and pick a table from there.'
+            : msg,
+        );
+        setView(null);
+        return;
+      }
+      const body = (await res.json()) as { order: FeedbackOrderView };
+      setDenial(null);
+      setLoadError(null);
+      setView(body.order);
+    } catch (e: any) {
+      setLoadError(e?.message || 'Could not reach the server');
+    } finally {
+      setLoading(false);
+      setBusy(false);
+    }
+  }, [orderId]);
+
+  useEffect(() => { load(); }, [load]);
+
+  /** Already split by the SERVER, from `order_items.station`. Nothing on this
+   *  screen re-derives Food vs Drinks from a dish name. */
+  const food = view?.food ?? NO_ITEMS;
+  const drinks = view?.drinks ?? NO_ITEMS;
+  const allItems = useMemo(() => [...food, ...drinks], [food, drinks]);
+
+  const resetAll = useCallback(() => {
+    setOverall(null);
+    setCategories({});
+    setItemFb({});
+    setRevisits({});
+    setOneTap(false);
+    setRefusal(null);
+  }, []);
 
   /** THE 10-SECOND PATH. One tap sets everything the happy case needs and
    *  clears any half-entered detail, so a mis-tap cannot leave a stray "Poor"
@@ -97,36 +219,220 @@ export default function TakeFeedbackPage() {
     setCategories({ food: 'good', drinks: 'good', service: 'good', ambience: 'good' });
     setItemFb({});
     setRevisits({});
+    setOneTap(true);
+    setRefusal(null);
     flash('Everything Good — ready to submit');
   }, [flash]);
 
-  const resetAll = useCallback(() => {
-    setOverall(null);
-    setCategories({});
-    setItemFb({});
-    setRevisits({});
-  }, []);
-
   /** Items whose recorded action forces a Follow-Up Required and holds the
-   *  complaint open — the rule lives in enums.ts so Pages 1, 3 and 4 cannot
+   *  complaint open — the rule lives in feedback.ts so Pages 1, 3 and 4 cannot
    *  each decide it differently. */
   const followUpItems = useMemo(
-    () => order.items.filter((i) => requiresFollowUp(itemFb[i.id]?.action || '')),
-    [order.items, itemFb],
+    () => allItems.filter((i) => requiresFollowUp(itemFb[i.id]?.action || '')),
+    [allItems, itemFb],
   );
 
   const negativeCount = useMemo(
-    () => order.items.filter((i) => isNegative(itemFb[i.id]?.rating || '')).length,
-    [order.items, itemFb],
+    () => allItems.filter((i) => isNegative(itemFb[i.id]?.rating || '')).length,
+    [allItems, itemFb],
   );
 
-  const canSubmit = overall !== null || Object.keys(itemFb).length > 0;
+  /** Only the entries the server would actually store — see `isRecordable`. */
+  const notedCount = useMemo(
+    () => Object.values(itemFb).filter(isRecordable).length,
+    [itemFb],
+  );
 
-  const submit = () => {
-    // P3 wires `api('/api/feedback', { method: 'POST', body: {...} })`. Writing
-    // it now would mean writing it twice, and the endpoint does not exist.
-    flash('Shell only — P3 wires POST /api/feedback');
-  };
+  /** The draft, as one serialisable object — the exact input the tested
+   *  `buildSubmitBody()` / `canSubmit()` in ./draft.ts take. `order_id` comes
+   *  from the SERVER's view, never from the URL, so a body can only ever name
+   *  the order the GET route actually returned. */
+  const draft: TakeDraft = useMemo(
+    () => ({
+      order_id: view?.order_id ?? '',
+      overall,
+      categories,
+      itemFb,
+      revisits,
+      oneTap,
+    }),
+    [view?.order_id, overall, categories, itemFb, revisits, oneTap],
+  );
+
+  const canSubmit = draftCanSubmit(draft);
+
+  const submit = useCallback(async () => {
+    if (!view || submitting) return;
+    setSubmitting(true);
+    setRefusal(null);
+    try {
+      // Through `api()`, never a bare fetch: `/api/feedback` is CSRF-required.
+      const res = await api('/api/feedback', { method: 'POST', body: buildSubmitBody(draft) });
+      let payload: any = null;
+      try { payload = await res.json(); } catch { /* handled below */ }
+
+      if (res.status === 401 || res.status === 403) {
+        setDenial(payload && payload.error
+          ? payload
+          : { error: `HTTP ${res.status}`, reason: 'unknown' });
+        return;
+      }
+      if (!res.ok || !payload?.ok) {
+        setRefusal({
+          error: payload?.error || `HTTP ${res.status} — nothing was recorded.`,
+          reason: payload?.reason,
+          taken_by: payload?.taken_by,
+          taken_at: payload?.taken_at,
+        });
+        return;
+      }
+      setDone(payload as SubmitFeedbackOk);
+    } catch (e: any) {
+      setRefusal({
+        error: e?.message
+          || 'Could not reach the server, so nothing was recorded. Your entries are still here — tap Submit again.',
+      });
+    } finally {
+      setSubmitting(false);
+    }
+  }, [view, submitting, draft]);
+
+  /** Recorded — hand the floor back. The GRE's next table is on the board, and
+   *  this screen has nothing left to say. */
+  useEffect(() => {
+    if (!done) return;
+    const t = setTimeout(() => router.push('/feedback'), 1800);
+    return () => clearTimeout(t);
+  }, [done, router]);
+
+  /* ── GATE REFUSED ─────────────────────────────────────────────────────── */
+  if (denial) {
+    return (
+      <div className="pb-6">
+        <SimpleHead onBack={() => router.push('/feedback')} title="Take Feedback" sub="Access not confirmed" />
+        <div className="mt-4 bg-white border border-[#E8D5C4] rounded-2xl p-4">
+          <div className="flex items-start gap-3">
+            <div className="w-10 h-10 shrink-0 rounded-xl bg-[#FFF1E3] border border-[#E8D5C4] flex items-center justify-center">
+              <Lock className="w-5 h-5 text-[#af4408]" />
+            </div>
+            <div className="min-w-0">
+              <h2 className="text-base font-extrabold text-[#2D1B0E] leading-snug">{denial.error}</h2>
+              {denial.what_to_do ? (
+                <p className="mt-2 text-[13px] leading-relaxed text-[#6B5744]">{denial.what_to_do}</p>
+              ) : null}
+              <dl className="mt-3 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-[12px]">
+                <dt className="text-[#8B7355] font-semibold">Role needed</dt>
+                <dd className="text-[#2D1B0E] font-bold">{GRE_ROLE_NAME}</dd>
+                <dt className="text-[#8B7355] font-semibold">Your role</dt>
+                <dd className="text-[#2D1B0E] font-bold">{denial.your_role || 'none assigned'}</dd>
+              </dl>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  /* ── RECORDED ─────────────────────────────────────────────────────────── */
+  if (done) {
+    return (
+      <div className="pb-6">
+        <SimpleHead onBack={() => router.push('/feedback')} title="Feedback recorded" sub="Returning to the floor…" />
+        <Card className="mt-4 p-4 border-emerald-300 bg-emerald-50/50">
+          <div className="flex items-start gap-3">
+            <span className="w-10 h-10 rounded-full bg-emerald-600 text-white flex items-center justify-center shrink-0">
+              <Check className="w-5 h-5" />
+            </span>
+            <div className="min-w-0">
+              <div className="text-base font-extrabold text-[#2D1B0E]">
+                {done.duplicate ? 'Already recorded by you' : 'Recorded'}
+              </div>
+              <div className="mt-1 text-[12px] text-[#6B5744] leading-relaxed">
+                {done.duplicate
+                  ? 'This table was already taken on your login, so nothing was written twice. '
+                    + 'The counts below are the visit that is already on the Tracker.'
+                  : 'The visit is on the Tracker and in the reports.'}
+              </div>
+              <dl className="mt-3 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-[12px]">
+                <dt className="text-[#8B7355] font-semibold">Items noted</dt>
+                <dd className="text-[#2D1B0E] font-bold">{done.items_recorded}</dd>
+                {done.follow_ups_open > 0 ? (
+                  <>
+                    <dt className="text-[#8B7355] font-semibold">Open follow-ups</dt>
+                    <dd className="text-violet-800 font-bold">{done.follow_ups_open}</dd>
+                  </>
+                ) : null}
+                {done.follow_ups_closed > 0 ? (
+                  <>
+                    <dt className="text-[#8B7355] font-semibold">Closed on submit</dt>
+                    <dd className="text-emerald-800 font-bold">{done.follow_ups_closed}</dd>
+                  </>
+                ) : null}
+              </dl>
+            </div>
+          </div>
+          <div className="mt-4">
+            <PrimaryButton onClick={() => router.push('/feedback')}>Back to floor</PrimaryButton>
+          </div>
+        </Card>
+      </div>
+    );
+  }
+
+  /* ── STILL LOADING ────────────────────────────────────────────────────── */
+  if (loading && !view) {
+    return (
+      <div className="pb-6">
+        <SimpleHead onBack={() => router.push('/feedback')} title="Take Feedback" sub="Loading the order…" />
+        <div className="mt-4 flex items-center justify-center gap-2 bg-white border border-[#E8D5C4] rounded-2xl px-4 py-10 text-[13px] text-[#8B7355]">
+          <Loader2 className="w-4 h-4 animate-spin" />
+          Reading the ordered items…
+        </div>
+      </div>
+    );
+  }
+
+  /* ── COULD NOT LOAD ───────────────────────────────────────────────────── */
+  // Never an empty form: a GRE who cannot see what the table ordered must not be
+  // handed a blank item list that looks like "nothing was ordered".
+  if (!view) {
+    return (
+      <div className="pb-6">
+        <SimpleHead onBack={() => router.push('/feedback')} title="Take Feedback" sub="Order not loaded" />
+        <Card className="mt-4 p-4 border-red-200 bg-red-50/60">
+          <div className="flex items-start gap-3">
+            <AlertTriangle className="w-5 h-5 text-red-600 shrink-0 mt-0.5" />
+            <div className="min-w-0 text-[13px] leading-relaxed text-red-800">
+              {loadError || 'The order could not be loaded.'}
+              <div className="mt-1 text-[12px] text-red-700">
+                Nothing has been recorded. This is NOT an empty order.
+              </div>
+            </div>
+          </div>
+          <div className="mt-4 flex gap-2">
+            <button
+              type="button"
+              onClick={() => load()}
+              disabled={busy}
+              className="px-4 py-3 rounded-xl bg-white border border-[#E8D5C4] text-[#6B5744] text-sm font-semibold active:scale-95 disabled:opacity-50 inline-flex items-center gap-1.5"
+            >
+              <RefreshCw className={`w-4 h-4 ${busy ? 'animate-spin' : ''}`} />
+              Try again
+            </button>
+            <button
+              type="button"
+              onClick={() => router.push('/feedback')}
+              className="px-4 py-3 rounded-xl bg-[#af4408] text-white text-sm font-semibold active:scale-95"
+            >
+              Floor board
+            </button>
+          </div>
+        </Card>
+      </div>
+    );
+  }
+
+  const order = view;
 
   return (
     <div className="pb-28 lg:pb-6">
@@ -147,7 +453,7 @@ export default function TakeFeedbackPage() {
         </button>
         <div className="min-w-0 flex-1">
           <div className="text-lg font-extrabold leading-tight truncate text-[#2D1B0E]">
-            Table {order.table_number} · #{order.order_number}
+            Table {order.table_number || '—'} · #{order.order_number}
           </div>
           <div className="text-[11px] text-[#8B7355] leading-tight flex flex-wrap items-center gap-x-2">
             <span className="truncate">{order.floor}</span>
@@ -157,7 +463,9 @@ export default function TakeFeedbackPage() {
             </span>
             <span className="inline-flex items-center gap-0.5">
               <Clock className="w-3 h-3" />
-              {now === null ? '···' : elapsed(order.opened_at, now)}
+              {/* `elapsed()` takes a non-nullable string and answers '—' for
+                  anything it cannot parse, so a null open time needs no branch. */}
+              {now === null ? '···' : elapsed(order.opened_at ?? '', now)}
             </span>
             <span className="truncate">Capt. {order.server_name || '—'}</span>
           </div>
@@ -201,7 +509,7 @@ export default function TakeFeedbackPage() {
             <button
               key={r.v}
               type="button"
-              onClick={() => setOverall(r.v)}
+              onClick={() => { setOverall(r.v); setOneTap(false); setRefusal(null); }}
               aria-pressed={active}
               className={`h-14 rounded-xl border text-base font-bold active:scale-95 transition ${
                 active
@@ -230,12 +538,14 @@ export default function TakeFeedbackPage() {
                   <button
                     key={o.v}
                     type="button"
-                    onClick={() =>
+                    onClick={() => {
                       setCategories((prev) => ({
                         ...prev,
                         [c.v]: prev[c.v] === o.v ? undefined : (o.v as ItemRating),
-                      }))
-                    }
+                      }));
+                      setOneTap(false);
+                      setRefusal(null);
+                    }}
                     aria-pressed={active}
                     className={`h-11 rounded-lg border text-[12px] font-bold active:scale-95 transition ${
                       active
@@ -255,6 +565,10 @@ export default function TakeFeedbackPage() {
       </div>
 
       {/* ── THE ORDERED ITEMS ──────────────────────────────────────────── */}
+      {/* These are the lines on THIS order, split Food/Drinks by the server from
+          `order_items.station`. If the station is blank or off the menu master
+          the item is filed under Food and the note below says so, rather than
+          leaving a drink in the wrong list with no explanation. */}
       <SectionTitle hint="tap an item only if there is a problem">
         Food · {food.length}
       </SectionTitle>
@@ -262,6 +576,22 @@ export default function TakeFeedbackPage() {
 
       <SectionTitle>Drinks · {drinks.length}</SectionTitle>
       <ItemList items={drinks} feedback={itemFb} onOpen={setSheetFor} />
+
+      {order.unclassified_count > 0 ? (
+        <div className="mt-2 rounded-xl border border-dashed border-[#D4B896] bg-[#FFF1E3] px-3 py-2 text-[11px] leading-snug text-[#6B5744]">
+          <span className="font-bold text-[#af4408]">
+            {order.unclassified_count} item{order.unclassified_count === 1 ? '' : 's'} filed under Food ·{' '}
+          </span>
+          {order.unclassified_reason}
+        </div>
+      ) : null}
+
+      {order.item_count === 0 ? (
+        <div className="mt-2 rounded-xl border border-dashed border-[#E8D5C4] bg-white px-3 py-3 text-[12px] text-[#8B7355]">
+          This order has no items yet. You can still record the overall experience, service and
+          ambience.
+        </div>
+      ) : null}
 
       {/* ── FOLLOW-UP / REVISIT ────────────────────────────────────────── */}
       {followUpItems.length > 0 && (
@@ -337,12 +667,31 @@ export default function TakeFeedbackPage() {
         </>
       )}
 
-      <PlaceholderNote>
-        Routed for order <code>{orderId || '(none)'}</code>, but the order and items below come from{' '}
-        <code>../../placeholder.ts</code>. Nothing submits yet: P3 adds <code>POST /api/feedback</code>{' '}
-        and the <code>gf_</code> tables, and derives Food vs Drinks server-side from{' '}
-        <code>order_items.station</code> via <code>stationKdsSection()</code>.
-      </PlaceholderNote>
+      {/* ── A REFUSED SUBMIT ───────────────────────────────────────────── */}
+      {/* The draft is deliberately kept: a GRE who just typed a complaint must
+          not lose it because the server said no. */}
+      {refusal ? (
+        <Card className="mt-3 p-3 border-red-200 bg-red-50/60">
+          <div className="flex items-start gap-2">
+            <AlertTriangle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
+            <div className="min-w-0 text-[12px] leading-relaxed text-red-800">
+              <span className="font-bold">Not recorded. </span>
+              {refusal.error}
+              {refusal.reason === 'already_taken' ? (
+                <div className="mt-2">
+                  <button
+                    type="button"
+                    onClick={() => router.push('/feedback/tracker')}
+                    className="rounded-lg bg-white border border-red-200 px-3 py-2 text-[12px] font-bold text-red-800 active:scale-95"
+                  >
+                    Open the Tracker
+                  </button>
+                </div>
+              ) : null}
+            </div>
+          </div>
+        </Card>
+      ) : null}
 
       {/* ── STICKY SUBMIT ──────────────────────────────────────────────── */}
       <StickyBar>
@@ -355,14 +704,28 @@ export default function TakeFeedbackPage() {
             ) : (
               <span className="font-extrabold text-[#8B7355] text-[13px] block">No rating yet</span>
             )}
+            {/* An item can be NOTED without being negative — "Same Item Remade"
+                with no rating, say. Saying "No item issues" over a noted plate
+                would be a small lie on the one screen that exists to stop
+                things being missed. */}
             <span className="truncate block">
-              {negativeCount > 0 ? `${negativeCount} item issue${negativeCount === 1 ? '' : 's'}` : 'No item issues'}
+              {negativeCount > 0
+                ? `${negativeCount} item issue${negativeCount === 1 ? '' : 's'}`
+                : notedCount > 0
+                  ? `${notedCount} item${notedCount === 1 ? '' : 's'} noted`
+                  : 'No item issues'}
               {followUpItems.length > 0 ? ` · ${followUpItems.length} follow-up` : ''}
             </span>
           </div>
           <div className="w-40 shrink-0">
-            <PrimaryButton onClick={submit} disabled={!canSubmit}>
-              Submit
+            <PrimaryButton onClick={submit} disabled={!canSubmit || submitting}>
+              {submitting ? (
+                <span className="inline-flex items-center gap-1.5 justify-center">
+                  <Loader2 className="w-4 h-4 animate-spin" /> Saving…
+                </span>
+              ) : (
+                'Submit'
+              )}
             </PrimaryButton>
           </div>
         </div>
@@ -389,6 +752,9 @@ export default function TakeFeedbackPage() {
           }}
           onSave={(v) => {
             setItemFb((p) => ({ ...p, [sheetFor.id]: v }));
+            // A per-item opinion and "Everything Good" cannot both be true.
+            setOneTap(false);
+            setRefusal(null);
             // Dropping an action that no longer needs a follow-up must also
             // drop its half-answered revisit, or Page 3 would count a
             // follow-up that no item is asking for.
@@ -413,6 +779,27 @@ export default function TakeFeedbackPage() {
   );
 }
 
+/* ── a header for the states that have no order to describe ──────────────── */
+
+function SimpleHead({ onBack, title, sub }: { onBack: () => void; title: string; sub: string }) {
+  return (
+    <header className="sticky top-12 lg:top-0 z-20 -mx-3 sm:-mx-5 lg:-mx-8 px-3 sm:px-5 lg:px-8 py-2.5 bg-[#FFF8F0]/95 backdrop-blur border-b border-[#E8D5C4] flex items-center gap-2">
+      <button
+        type="button"
+        onClick={onBack}
+        aria-label="Back to floor"
+        className="w-11 h-11 -ml-2 rounded-xl flex items-center justify-center text-[#6B5744] active:scale-95 transition"
+      >
+        <ArrowLeft className="w-5 h-5" />
+      </button>
+      <div className="min-w-0">
+        <div className="text-lg font-extrabold leading-tight truncate text-[#2D1B0E]">{title}</div>
+        <div className="text-[11px] text-[#8B7355] leading-tight truncate">{sub}</div>
+      </div>
+    </header>
+  );
+}
+
 /* ── the item list ───────────────────────────────────────────────────────── */
 
 function ItemList({
@@ -420,9 +807,9 @@ function ItemList({
   feedback,
   onOpen,
 }: {
-  items: TakeItem[];
+  items: FeedbackOrderItem[];
   feedback: Record<string, ItemFeedback>;
-  onOpen: (i: TakeItem) => void;
+  onOpen: (i: FeedbackOrderItem) => void;
 }) {
   if (items.length === 0) {
     return (
@@ -435,6 +822,7 @@ function ItemList({
     <div className="space-y-2">
       {items.map((i) => {
         const fb = feedback[i.id];
+        const noted = isRecordable(fb);
         const bad = isNegative(fb?.rating || '');
         return (
           <button
@@ -442,7 +830,7 @@ function ItemList({
             type="button"
             onClick={() => onOpen(i)}
             className={`w-full text-left bg-white border rounded-2xl px-3 py-3 flex items-center gap-3 active:scale-[0.98] transition ${
-              fb ? (bad ? 'border-red-300' : 'border-emerald-300') : 'border-[#E8D5C4]'
+              noted ? (bad ? 'border-red-300' : 'border-emerald-300') : 'border-[#E8D5C4]'
             }`}
           >
             <span className="w-9 h-9 rounded-lg bg-[#FFF1E3] text-[#af4408] text-sm font-extrabold flex items-center justify-center shrink-0">
@@ -451,16 +839,18 @@ function ItemList({
             <span className="min-w-0 flex-1">
               <span className="block text-sm font-bold text-[#2D1B0E] truncate">{i.name}</span>
               <span className="block text-[11px] text-[#8B7355] truncate">
-                {fb ? (
+                {noted ? (
                   <>
-                    {ITEM_RATINGS.find((r) => r.v === fb.rating)?.label || 'Noted'}
-                    {fb.issue ? ` · ${ITEM_ISSUES.find((x) => x.v === fb.issue)?.label}` : ''}
-                    {fb.action && fb.action !== 'none'
+                    {ITEM_RATINGS.find((r) => r.v === fb?.rating)?.label || 'Noted'}
+                    {fb?.issue ? ` · ${ITEM_ISSUES.find((x) => x.v === fb.issue)?.label}` : ''}
+                    {fb?.action && fb.action !== 'none'
                       ? ` · ${ACTIONS_TAKEN.find((a) => a.v === fb.action)?.label}`
                       : ''}
                   </>
                 ) : (
-                  i.station
+                  // The station, so the GRE can see WHY a line sits in this
+                  // group — blank when the menu item has none set.
+                  i.station || 'no station set'
                 )}
               </span>
             </span>
@@ -487,7 +877,7 @@ function ItemSheet({
   onClear,
   onClose,
 }: {
-  item: TakeItem;
+  item: FeedbackOrderItem;
   value: ItemFeedback;
   onSave: (v: ItemFeedback) => void;
   onClear: () => void;
@@ -550,7 +940,8 @@ function ItemSheet({
           <div className="min-w-0 flex-1">
             <div className="text-base font-extrabold text-[#2D1B0E] truncate">{item.name}</div>
             <div className="text-[11px] text-[#8B7355]">
-              ×{item.quantity} · {item.group === 'food' ? 'Food' : 'Drinks'} · {item.station}
+              ×{item.quantity} · {item.group === 'drinks' ? 'Drinks' : 'Food'}
+              {item.station ? ` · ${item.station}` : ''}
             </div>
           </div>
           <button
@@ -671,8 +1062,10 @@ function ItemSheet({
               </div>
             )}
             {/* The replacement item itself is §7 Q3, still open with the owner:
-                record WHICH item replaced which, or is the label enough? Not
-                guessed here — P3 adds the picker if he says record it. */}
+                record WHICH item replaced which, or is the label enough? The
+                writer already accepts `replacement_menu_item_id` /
+                `replacement_item_name` and stores them, so adding the picker is
+                a UI change only — not guessed here. */}
           </div>
         </div>
 
@@ -687,7 +1080,7 @@ function ItemSheet({
           <div className="flex-1">
             <PrimaryButton
               onClick={() => onSave(draft)}
-              disabled={!draft.rating && !draft.issue && !draft.comment && !draft.action}
+              disabled={!isRecordable(draft)}
             >
               <span className="inline-flex items-center gap-1.5 justify-center">
                 <Star className="w-4 h-4" /> Save item

@@ -362,16 +362,12 @@ export function TableScroll({ children }: { children: ReactNode }) {
   );
 }
 
-/** The "this is a shell" marker. Every screen carries one so nobody mistakes
- *  placeholder rows for live data — and so P2..P5 can grep for it. */
-export function PlaceholderNote({ children }: { children: ReactNode }) {
-  return (
-    <div className="mt-3 rounded-xl border border-dashed border-[#D4B896] bg-[#FFF1E3] px-3 py-2 text-[11px] leading-snug text-[#6B5744]">
-      <span className="font-bold text-[#af4408]">P1 SHELL · </span>
-      {children}
-    </div>
-  );
-}
+/* `PlaceholderNote` — the "this is a shell" marker — lived here through P1..P2.
+   It is GONE, with `src/app/feedback/placeholder.ts`, because every screen in
+   this module now reads live data and the last shell banner was the one on
+   `take/[orderId]` that told a GRE the ordered items were invented. A component
+   whose job is to label fiction has no job left here; re-adding one would mean
+   re-adding fiction. */
 
 export function EmptyState({ children }: { children: ReactNode }) {
   return (
