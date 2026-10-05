@@ -1,17 +1,24 @@
 import { isManagement, type SessionUser } from '@/lib/auth';
-import { financeCapOpens, FINANCE_CAP_PATHS } from '@/lib/page-catalog';
+import { financeCapOpens, isFinanceCapPath, FINANCE_CAP_PATHS } from '@/lib/page-catalog';
 
 /**
- * THE API GATE for the owner's five finance screens (2026-10-05).
+ * THE API GATE for the owner's finance screens (2026-10-05).
  *
  * WHY THIS FILE EXISTS. Four Reports routes and the purchase register each
  * refused with their own copy of `if (!isManagement(me)) 403`. The Accounts
- * designation was given all five pages in the Edit User grid and could open
+ * designation was given five of those pages in the Edit User grid and could open
  * none of them: ticks in that grid cannot reach past a tier gate. Widening
  * isManagement() would have opened every management screen in the building, so
  * instead the bar gains ONE narrow, admin-granted exception, and it lives here
  * rather than being retyped five times — six, once /api/reports/purchase-log is
  * counted, which is the feed the Purchase Report page actually calls.
+ *
+ * WHICH PAGES THE EXCEPTION COVERS IS NOT DECIDED HERE. It is decided by the
+ * financeCap flag in page-catalog.ts, which the owner trimmed to FOUR the same
+ * day by removing /reports/sales — sales data ranking NAMED STAFF, unlike the
+ * three vendor-money Reports. Every route here still calls this helper, so that
+ * page is refused by the ordinary management bar and the catalog remains the one
+ * place the set is defined.
  *
  * THE SAFETY PROPERTY, stated plainly: the capability is never tested alone.
  * Every call is `isManagement(me) || financeCapOpens(me, pagePath)`, and
@@ -37,13 +44,23 @@ export function canViewFinanceReport(me: SessionUser | null, pagePath: string): 
   return isManagement(me) || financeCapOpens(me, pagePath);
 }
 
-/** Standard 403 for the five finance screens, or null when allowed. The message
- *  names the capability so an admin reading a support screenshot knows which
- *  box to tick in Settings → Roles rather than guessing at tiers. */
+/** Standard 403 for these screens, or null when allowed.
+ *
+ *  THE MESSAGE IS CONDITIONAL ON THE PAGE'S OWN FLAG, not on this module being
+ *  the one refusing. A route whose page carries no financeCap — /reports/sales
+ *  since the owner removed it — is management-only exactly as it was before this
+ *  module existed, so naming a capability there would send an admin to tick a box
+ *  that cannot open it. Routes still call this helper rather than isManagement
+ *  directly so the catalog stays the single source of truth: re-flagging a page
+ *  changes both the gate and the message together, with no route to re-edit. */
 export function requireFinanceReport(me: SessionUser | null, pagePath: string): Response | null {
   if (canViewFinanceReport(me, pagePath)) return null;
   return Response.json(
-    { error: 'Management only, or a role with "View finance & purchase reports"' },
+    {
+      error: isFinanceCapPath(pagePath)
+        ? 'Management only, or a role with "View finance & purchase reports"'
+        : 'Management only',
+    },
     { status: 403 },
   );
 }

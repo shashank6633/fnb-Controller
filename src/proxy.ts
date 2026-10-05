@@ -363,10 +363,10 @@ export function proxy(req: NextRequest) {
       // feature adds no new fail-open surface.
       //
       // Here, a missing column means `false` — the capability is simply not
-      // held, the mgmtOnly gate stands, and the five pages stay SHUT. Fail
+      // held, the mgmtOnly gate stands, and the flagged pages stay SHUT. Fail
       // closed, which is the correct direction for a grant.
       //
-      // Cost: one indexed primary-key lookup, and only on the five flagged
+      // Cost: one indexed primary-key lookup, and only on the flagged
       // paths — isFinanceCapPath is false for every other request.
       // row.role_id, NOT user.role_id — the `user` literal above deliberately
       // does not carry role_id, so testing it there would be permanently false
@@ -379,7 +379,7 @@ export function proxy(req: NextRequest) {
           // DEACTIVATED role so switching one off cannot fall back to a null map
           // = every page. For a CAPABILITY the safe direction is the reverse:
           // deactivating the role must revoke it. Without this filter the proxy
-          // would open the five pages while all six API feeds — which resolve
+          // would open those pages while the API feeds — which resolve
           // through auth.ts — answer 403, i.e. a nav link that fails on click.
           const cap = db.prepare('SELECT can_view_finance_reports AS c FROM roles WHERE id = ? AND is_active = 1')
             .get(row.role_id) as any;

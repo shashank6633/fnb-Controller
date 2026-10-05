@@ -2952,14 +2952,14 @@ function initializeSchema(db: Database.Database) {
     // designation he wants, in Settings → Roles. An Administrator can always
     // void regardless, so the capability never disappears from the building.
     if (!rCols.some((c: any) => c.name === 'can_void_bill_handover')) db.exec(`ALTER TABLE roles ADD COLUMN can_void_bill_handover INTEGER NOT NULL DEFAULT 0`);
-    // Who may open the five finance/purchase screens (owner's call, 2026-10-05).
+    // Who may open the finance/purchase screens (owner's call, 2026-10-05).
     // The Accounts designation was given /purchases and four Reports pages in the
     // Edit User grid and could open NONE of them: the four reports are mgmtOnly,
     // and /purchases is gated by requirePurchasesAccess (management or the store
     // person). Ticks in the grid cannot reach past a tier gate, so the grant was
     // real in the database and inert in every code path that reads it.
     //
-    // A BOOLEAN, NOT A LIST OF PATHS — deliberately. The five paths live in ONE
+    // A BOOLEAN, NOT A LIST OF PATHS — deliberately. The paths live in ONE
     // code constant (financeCap in page-catalog.ts + FINANCE_REPORT_PATHS in
     // finance-reports-access.ts) that the gates consult, so the set is reviewable
     // in a diff and cannot be widened from the UI. Were this column to hold path

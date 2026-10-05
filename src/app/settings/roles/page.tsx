@@ -15,8 +15,8 @@ interface Role {
   /** Granular: approve requisitions (dine-in + party) without the full HOD flag. */
   can_approve_requisitions: number;
   can_void_bill_handover: number;
-  /** Lifts the management-only gate on exactly five screens: /purchases and the
-   *  four vendor-money Reports. Not a tier — see page-catalog.ts financeCap. */
+  /** Lifts the management-only gate on exactly four screens: /purchases and the
+   *  three vendor-money Reports. Not a tier — see page-catalog.ts financeCap. */
   can_view_finance_reports: number;
   is_system: number;
   sort_order: number;
@@ -261,7 +261,7 @@ export default function RolesAdmin() {
                   <input type="checkbox" checked={draft.can_void_bill_handover} onChange={(e) => setDraft({ ...draft, can_void_bill_handover: e.target.checked })} /> Can void a bill handover
                 </label>
                 {/* Finance & purchase reports. The FIRST capability that reaches
-                    past a tier gate: ticking it lets a STAFF role open five
+                    past a tier gate: ticking it lets a STAFF role open four
                     management screens it otherwise could not see at all. It is
                     still not a grant on its own — the role also needs those pages
                     ticked in its page list below. Defaults off on every role. */}
@@ -273,12 +273,13 @@ export default function RolesAdmin() {
                 “Can approve requisitions” grants ONLY the approval inbox (dine-in + party) — no HOD-only pages, no party financials. “Is HOD” includes it.
               </p>
               <p className="-mt-1 text-[11px] text-[#8B7355]">
-                “View finance &amp; purchase reports” opens exactly five screens to a non-management role:
-                <strong> Purchases</strong>, <strong>Sales Reports</strong>, <strong>Purchase Report</strong>,
+                “View finance &amp; purchase reports” opens exactly four screens to a non-management role:
+                <strong> Purchases</strong>, <strong>Purchase Report</strong>,
                 <strong> Purchase Bill Summary</strong> and <strong>Return Report</strong>. It opens nothing else —
-                other management pages stay shut. It is READ access: it does not allow CSV uploads or opening-stock
-                imports on the Purchases page. The role must ALSO have these pages ticked in its page list below;
-                this checkbox only lifts the management-only restriction on them.
+                every other management page stays shut, <strong>Sales Reports included</strong>. It is READ access:
+                it does not allow CSV uploads or opening-stock imports on the Purchases page. The role must ALSO
+                have these pages ticked in its page list below; this checkbox only lifts the management-only
+                restriction on them.
               </p>
               <p className="-mt-1 text-[11px] text-[#8B7355]">
                 “Can void a bill handover” retires a vendor-bill record, with a reason, at any stage —
