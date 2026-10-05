@@ -223,6 +223,13 @@ const navTree: NavEntry[] = [
       // kitchen and bar staff who have to act on it. Seeing it is not permission
       // to move stock — the sign-off route re-checks department membership.
       { kind: "link", label: "Pending Quality Checks", href: "/grn/qc",         icon: ClipboardCheck },
+      // The override report, directly under the queue it is the consequence of:
+      // what got released WITHOUT a kitchen check, who allowed it, and why.
+      // mgmtOnly in page-catalog.ts — this row and that one must stay in step,
+      // href for href, or it repeats the drift that once hid
+      // /variance-approvals. The route it reads has existed since August with
+      // nothing on earth calling it.
+      { kind: "link", label: "Inwarded without QC", href: "/grn/qc/overrides",  icon: ShieldAlert },
       { kind: "link", label: "Receiving Variance", href: "/receiving-variance", icon: AlertTriangle },
       // Returns — sits right after Receiving Variance on purpose: that page is
       // where a short/damaged delivery is spotted, and this is where the goods

@@ -365,6 +365,21 @@ export const PAGE_CATALOG: PageSection[] = [
       // documents. It also inherits a /grn grant by prefix, which is correct —
       // whoever can see the receipts should see which of them are held.
       { path: '/grn/qc',              label: 'Pending Quality Checks' },
+      // The override report — every receipt released into stock WITHOUT a
+      // kitchen check, with who allowed it and the reason they typed. mgmtOnly
+      // and not merely by prefix: unlike the queue above, this names staff who
+      // bypassed a food-safety gate and prints the value that moved, so it
+      // carries the same bar as the receiving money it reports rather than
+      // inheriting a /grn grant.
+      //
+      // ⚠️ It must exist in src/components/Sidebar.tsx too, href matching
+      // character for character, in the same commit. GET /api/grn/qc/overrides
+      // has served this report since August and had NO page, NO caller and NO
+      // row in either file — so the data accumulated where nobody could read it
+      // while /grn/qc promised the person overriding, twice, that it "appears
+      // on the override report". Catalog-only is gated but invisible;
+      // sidebar-only is visible but ungated. Both, always.
+      { path: '/grn/qc/overrides',    label: 'Inwarded without QC', mgmtOnly: true },
       { path: '/receiving-variance',  label: 'Receiving Variance' },
       // Returns — the return TICKET queue. One workflow, two kinds of return,
       // forked by an immutable `kind` column on the ticket. Two facts a reader
