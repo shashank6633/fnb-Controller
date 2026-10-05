@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState, useRef } from 'react';
 import Link from 'next/link';
 import { fmtISTDate } from '@/lib/format-date';
+import { canAccessPage } from '@/lib/page-catalog';
 import {
   ShoppingCart,
   Search,
@@ -267,6 +268,12 @@ export default function PurchasesPage() {
    *  buttons would only produce a 403 after it had picked a file. Default false:
    *  the buttons appear once /api/auth/me confirms the bar, never before. */
   const [canWritePurchases, setCanWritePurchases] = useState(false);
+  /** Can this user actually OPEN /grn? The "Enter Vendor Bill" button is a link
+   *  there, and /grn is an ordinary page_access grant that a finance-report role
+   *  need not hold — for Anusha the proxy bounced it. Decided with the same
+   *  canAccessPage() the Sidebar uses to draw a nav row, so the button and the
+   *  nav agree. Default false: it appears once /api/auth/me confirms access. */
+  const [canOpenGrn, setCanOpenGrn] = useState(false);
   const [limitInput, setLimitInput] = useState('3');
   const [limitSaving, setLimitSaving] = useState(false);
   const [limitSaved, setLimitSaved] = useState(false);
@@ -429,6 +436,7 @@ export default function PurchasesPage() {
       setCanWritePurchases(
         !!u && (u.role === 'admin' || u.role === 'manager' || !!u.is_head_chef || !!u.is_store_manager),
       );
+      setCanOpenGrn(canAccessPage('/grn', u ?? null));
     } catch {
       // Leave defaults (3 days, non-admin). Server still enforces the real guard.
     }
@@ -1016,6 +1024,10 @@ export default function PurchasesPage() {
             <p className="text-[#8B7355] text-sm mt-1">Track and manage all raw material purchases</p>
           </div>
           <div className="flex gap-2 flex-wrap">
+            {/* ADMIN ONLY, because the API is: both /api/inward-import/preview and
+                /commit call requireRole('admin'). Shown to a non-admin it opened a
+                modal, took a file, and answered 403. */}
+            {isAdmin && (
             <button
               onClick={() => setRecahoOpen(true)}
               className="flex items-center gap-2 px-4 py-2.5 bg-purple-600 hover:bg-purple-700 text-white rounded-lg text-sm font-medium transition-colors"
@@ -1024,6 +1036,10 @@ export default function PurchasesPage() {
               <Upload className="w-4 h-4" />
               Recaho Inward Upload
             </button>
+            )}
+            {/* A template for an upload the WRITE bar governs — hiding the upload
+                while still offering its blank form only produces a dead end. */}
+            {canWritePurchases && (
             <button
               onClick={downloadBulkPurchaseTemplate}
               className="flex items-center gap-2 px-4 py-2.5 border border-green-600 text-green-700 hover:bg-green-50 rounded-lg text-sm font-medium transition-colors"
@@ -1032,6 +1048,7 @@ export default function PurchasesPage() {
               <FileSpreadsheet className="w-4 h-4" />
               Bulk Template
             </button>
+            )}
             {/* Gated on the WRITE bar, not on page access. POST /api/purchases/bulk
                 keeps requirePurchasesAccess, so a finance-report role — which may
                 READ this register — would hit a 403 here after choosing a file. */}
@@ -1044,6 +1061,11 @@ export default function PurchasesPage() {
               Generic CSV Upload
             </button>
             )}
+            {/* Same WRITE bar for BOTH, which is why the template moved inside
+                this fragment: POST /api/purchases/opening-stock seeds stock and
+                average cost, and a blank form for an upload you cannot perform
+                is just a dead end. */}
+            {canWritePurchases && (<>
             <button
               onClick={downloadOpeningTemplate}
               className="flex items-center gap-2 px-4 py-2.5 border border-blue-600 text-blue-700 hover:bg-blue-50 rounded-lg text-sm font-medium transition-colors"
@@ -1052,9 +1074,6 @@ export default function PurchasesPage() {
               <FileSpreadsheet className="w-4 h-4" />
               Opening Stock Template
             </button>
-            {/* Same WRITE bar: POST /api/purchases/opening-stock seeds stock and
-                average cost, so it stays management/store-only. */}
-            {canWritePurchases && (<>
             <button
               onClick={() => openingFileRef.current?.click()}
               disabled={openingBusy}
@@ -1088,6 +1107,10 @@ export default function PurchasesPage() {
                 to the job they do every morning, on the one screen whose whole
                 purpose is that they use it instead of the ungated CSV beside it.
                 /grn reads the flag once on mount and strips it from the URL. */}
+            {/* Only for someone who can actually open /grn. This is a LINK, not a
+                form: a user without the grant was sent there and bounced by the
+                proxy, which is how the read-only finance role first saw it. */}
+            {canOpenGrn && (
             <Link
               href="/grn?new=1"
               title="Vendor bills are recorded on Goods Receipt Notes now — same form, plus the kitchen quality check, the inward register, void and line-edit."
@@ -1097,6 +1120,7 @@ export default function PurchasesPage() {
               Enter Vendor Bill
               <ArrowRight className="w-4 h-4" />
             </Link>
+            )}
           </div>
         </div>
 
