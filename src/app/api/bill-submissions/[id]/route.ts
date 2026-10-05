@@ -4,7 +4,7 @@ import {
   canConfirmBillHandover,
   canRecordBillHandover,
   canViewBillHandovers,
-  canVoidConfirmedBillHandover,
+  canVoidBillHandover,
   getBillHandover,
   getBillHandoverTrail,
   selfConfirmRefusal,
@@ -60,7 +60,10 @@ export async function GET(_request: Request, { params }: { params: Promise<{ id:
         // The button the Accounts screen should actually render for THIS row.
         confirm_this: canConfirmBillHandover(me) && !refusal && handover.status === BH_SUBMITTED,
         confirm_blocked_reason: refusal,
-        void_confirmed: canVoidConfirmedBillHandover(me),
+        // One permission now, every status — the screen asks this ONE
+        // question instead of guessing from canRecord and being refused.
+        can_void: canVoidBillHandover(me),
+        void_confirmed: canVoidBillHandover(me),  // legacy key, same answer
       },
     });
   } catch (e) {

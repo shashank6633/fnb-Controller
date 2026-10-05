@@ -3,7 +3,7 @@ import { logAuditEvent } from '@/lib/db';
 import {
   billHandoverDb,
   canRecordBillHandover,
-  canVoidConfirmedBillHandover,
+  canVoidBillHandover,
   voidBillHandover,
 } from '@/lib/bill-handover';
 
@@ -43,11 +43,18 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
   const me = await getCurrentUser();
   if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
 
-  // The coarse gate. voidBillHandover() applies the stricter admin-only rule for
-  // an already-confirmed record, because that depends on the row, not the user.
-  if (!canRecordBillHandover(me) && !canVoidConfirmedBillHandover(me)) {
+  // ONE PERMISSION, EVERY STATUS. This used to read
+  //   if (!canRecordBillHandover(me) && !canVoidConfirmedBillHandover(me))
+  // which let through anyone who could CREATE a handover — every manager and
+  // every store manager — and left voidBillHandover() to apply a stricter rule
+  // only for already-confirmed rows. So the right to void a Pending or
+  // Submitted record was never granted to anybody; it was inherited from the
+  // right to record one. The owner reported exactly that in production: a Store
+  // Manager offered "Void with a reason". Now the capability is held by a role
+  // or by an Administrator, and by nobody else.
+  if (!canVoidBillHandover(me)) {
     return Response.json(
-      { error: 'Only Management or the Store Manager can void a vendor bill record.' },
+      { error: 'Voiding a vendor bill record needs the void permission on your role. An administrator can grant it in Settings → Roles.' },
       { status: 403 },
     );
   }

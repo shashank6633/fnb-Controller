@@ -2937,6 +2937,21 @@ function initializeSchema(db: Database.Database) {
     // Granular approval flag on the role (mirrors users.can_approve_requisitions):
     // holders may approve dine-in + party requisitions without being an HOD.
     if (!rCols.some((c: any) => c.name === 'can_approve_requisitions')) db.exec(`ALTER TABLE roles ADD COLUMN can_approve_requisitions INTEGER NOT NULL DEFAULT 0`);
+    // Who may VOID a bill handover (owner, 2026-10-05). Until this existed,
+    // voiding was implied by canRecordBillHandover() — isManagement(u) ||
+    // is_store_manager — so every manager and every store manager could void a
+    // Pending or Submitted handover, and the Store Manager holding it was the
+    // defect the owner reported. A void is not a delete, but it does retire a
+    // record of money changing hands, and that is not something a role should
+    // acquire as a side effect of being able to CREATE one.
+    //
+    // DEFAULT 0 IS THE WHOLE POINT, and it is why this needs no data migration:
+    // adding the column removes the capability from EVERY role at once, so the
+    // reported access is gone the moment this ships, without a single role row
+    // being rewritten. Roles are the owner's to set — he grants this to the
+    // designation he wants, in Settings → Roles. An Administrator can always
+    // void regardless, so the capability never disappears from the building.
+    if (!rCols.some((c: any) => c.name === 'can_void_bill_handover')) db.exec(`ALTER TABLE roles ADD COLUMN can_void_bill_handover INTEGER NOT NULL DEFAULT 0`);
 
     const seedRole = db.prepare(`
       INSERT OR IGNORE INTO roles (id, name, base_role, page_access, is_head_chef, is_store_manager, is_system, sort_order, description)

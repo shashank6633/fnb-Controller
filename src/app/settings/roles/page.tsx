@@ -14,6 +14,7 @@ interface Role {
   is_store_manager: number;
   /** Granular: approve requisitions (dine-in + party) without the full HOD flag. */
   can_approve_requisitions: number;
+  can_void_bill_handover: number;
   is_system: number;
   sort_order: number;
   description: string;
@@ -39,6 +40,7 @@ function parsePages(pa: string | null): string[] {
 const blankDraft = () => ({
   id: '' as string, name: '', base_role: 'staff' as Role['base_role'], description: '',
   is_head_chef: false, is_store_manager: false, can_approve_requisitions: false,
+  can_void_bill_handover: false,
   pages: new Set<string>(), is_system: 0,
   can_request_discount: false, max_discount_pct: 0,
 });
@@ -70,6 +72,7 @@ export default function RolesAdmin() {
       id: role.id, name: role.name, base_role: role.base_role, description: role.description || '',
       is_head_chef: !!role.is_head_chef, is_store_manager: !!role.is_store_manager,
       can_approve_requisitions: !!role.can_approve_requisitions,
+      can_void_bill_handover: !!role.can_void_bill_handover,
       pages: new Set(parsePages(role.page_access)), is_system: role.is_system,
       can_request_discount: !!role.can_request_discount, max_discount_pct: Number(role.max_discount_pct) || 0,
     });
@@ -228,9 +231,22 @@ export default function RolesAdmin() {
                 <label className="flex items-center gap-2 text-sm text-[#2D1B0E]">
                   <input type="checkbox" checked={draft.can_approve_requisitions} onChange={(e) => setDraft({ ...draft, can_approve_requisitions: e.target.checked })} /> Can approve requisitions (dine-in + party)
                 </label>
+                {/* Voiding a bill handover. Its own permission since 2026-10-05:
+                    it used to be implied by being able to RECORD a handover, so
+                    every manager and store manager had it without anyone
+                    granting it. Defaults off on every role. */}
+                <label className="flex items-center gap-2 text-sm text-[#2D1B0E]">
+                  <input type="checkbox" checked={draft.can_void_bill_handover} onChange={(e) => setDraft({ ...draft, can_void_bill_handover: e.target.checked })} /> Can void a bill handover
+                </label>
               </div>
               <p className="-mt-1 text-[11px] text-[#8B7355]">
                 “Can approve requisitions” grants ONLY the approval inbox (dine-in + party) — no HOD-only pages, no party financials. “Is HOD” includes it.
+              </p>
+              <p className="-mt-1 text-[11px] text-[#8B7355]">
+                “Can void a bill handover” retires a vendor-bill record, with a reason, at any stage —
+                including one Accounts has already confirmed. A void is never a delete: the row survives
+                carrying who voided it and why. An Administrator can always void, so this is for granting
+                it to a designation that is not an administrator.
               </p>
               {/* THE SIDE EFFECT THE OWNER ASKED TO HAVE SAID OUT LOUD (2026-09-25).
                   Ticking HOD — or moving a role to the Manager tier — lifts the Guest

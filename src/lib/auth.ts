@@ -35,6 +35,10 @@ export interface SessionUser {
    *  flag — no HOD-only pages, no party financials. Union of the user's own
    *  flag and the assigned role's flag (see canApproveAsChef). */
   can_approve_requisitions: boolean;
+  /** Who may VOID a bill handover. Granted per ROLE only (there is no per-user
+   *  column): voiding retires a record of money changing hands, so it is a
+   *  designation's capability, not a person's. An admin always holds it. */
+  can_void_bill_handover: boolean;
   /** JSON-stringified array of allowed page paths. null = full access (backward compat). */
   page_access: string | null;
   /** JSON-stringified array of department_ids whose data is visible. null = only own dept. */
@@ -95,6 +99,7 @@ export async function getCurrentUser(): Promise<SessionUser | null> {
            r.name AS role_name, r.base_role AS role_base, r.page_access AS role_page_access,
            r.is_head_chef AS role_head_chef, r.is_store_manager AS role_store,
            r.can_approve_requisitions AS role_can_approve_req,
+           r.can_void_bill_handover AS role_can_void_bh,
            r.can_request_discount AS role_can_discount, r.max_discount_pct AS role_max_discount,
            s.expires_at
     FROM sessions s JOIN users u ON u.id = s.user_id
@@ -124,6 +129,11 @@ export async function getCurrentUser(): Promise<SessionUser | null> {
     is_head_chef: !!row.is_head_chef || (hasRole && !!row.role_head_chef),
     is_store_manager: !!row.is_store_manager || (hasRole && !!row.role_store),
     can_approve_requisitions: !!row.can_approve_requisitions || (hasRole && !!row.role_can_approve_req),
+    // Role-only, unlike the three above: there is no users.can_void_bill_handover
+    // column to union with, deliberately. A one-off grant to a PERSON is how a
+    // capability outlives the reason it was given; this one is held by a
+    // designation or not at all.
+    can_void_bill_handover: hasRole && !!row.role_can_void_bh,
     // Pages: a per-user page_access overrides; else inherit the role's set; else
     // null = full access (backward compat for users without a role or override).
     page_access: row.page_access != null ? row.page_access : (hasRole ? (row.role_page_access ?? null) : null),
@@ -210,6 +220,7 @@ export async function verifyApprover(email: string, password: string): Promise<S
            r.name AS role_name, r.base_role AS role_base, r.page_access AS role_page_access,
            r.is_head_chef AS role_head_chef, r.is_store_manager AS role_store,
            r.can_approve_requisitions AS role_can_approve_req,
+           r.can_void_bill_handover AS role_can_void_bh,
            r.can_request_discount AS role_can_discount, r.max_discount_pct AS role_max_discount
     FROM users u LEFT JOIN roles r ON r.id = u.role_id AND r.is_active = 1
     WHERE lower(u.email) = lower(?) AND u.is_active = 1
@@ -225,6 +236,7 @@ export async function verifyApprover(email: string, password: string): Promise<S
     is_head_chef: !!row.is_head_chef || (hasRole && !!row.role_head_chef),
     is_store_manager: !!row.is_store_manager || (hasRole && !!row.role_store),
     can_approve_requisitions: !!row.can_approve_requisitions || (hasRole && !!row.role_can_approve_req),
+    can_void_bill_handover: hasRole && !!row.role_can_void_bh,
     page_access: row.page_access != null ? row.page_access : (hasRole ? (row.role_page_access ?? null) : null),
     visible_department_ids: row.visible_department_ids || null,
     preferred_zones: row.preferred_zones || null,

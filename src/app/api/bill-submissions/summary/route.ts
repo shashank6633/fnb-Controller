@@ -3,6 +3,7 @@ import {
   billHandoverDb,
   billHandoverSummary,
   canConfirmBillHandover,
+  canVoidBillHandover,
   canRecordBillHandover,
   canViewBillHandovers,
   accountsRoleState,
@@ -56,7 +57,11 @@ export async function GET() {
       // the two screens cannot paraphrase them differently.
       labels: { long: BH_STATUS_LABEL, short: BH_STATUS_SHORT },
       accounts_role: accountsRoleState(db),
-      can: { record: canRecordBillHandover(me), confirm: canConfirmBillHandover(me) },
+      // `void` is its OWN capability, not implied by `record`. The screen used
+      // to gate the Void button on `record` and so offered it to every manager
+      // and store manager — the access the owner reported. Asking the server
+      // the actual question is what stops a button appearing and then refusing.
+      can: { record: canRecordBillHandover(me), confirm: canConfirmBillHandover(me), void: canVoidBillHandover(me) },
     });
   } catch (e) {
     console.error('GET /api/bill-submissions/summary failed:', e);

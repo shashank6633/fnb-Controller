@@ -176,10 +176,53 @@ export function canViewBillHandovers(u: SessionUser | null | undefined): boolean
   return canRecordBillHandover(u) || canConfirmBillHandover(u);
 }
 
-/** Who may VOID a row that Accounts has already confirmed. Admin only: undoing a
- *  recorded confirmation is undoing the evidence itself. */
+/**
+ * WHO MAY VOID A BILL HANDOVER — one permission, every status.
+ *
+ * ── WHAT THIS REPLACED, AND WHY ─────────────────────────────────────────────
+ * Voiding used to be two different rules, and only one of them was written
+ * down. A CONFIRMED row was admin-only, enforced here. Everything else — a
+ * Pending or Submitted handover — was voidable by anyone who passed
+ * canRecordBillHandover(), i.e. `isManagement(u) || u.is_store_manager`. Nobody
+ * decided that; it was inherited from the gate for CREATING a handover, and a
+ * capability acquired as a side effect of another one is a capability nobody
+ * reviewed.
+ *
+ * The owner found it in production on 2026-10-05: a Store Manager (manager
+ * tier) was offered "Void with a reason" on the Bill Handover screen. His
+ * instruction was to remove it from that designation AND to make it grantable,
+ * "so that we can provide to concerned designation in future" — a setting
+ * rather than a hard-coded tier.
+ *
+ * ── THE RULE NOW ────────────────────────────────────────────────────────────
+ * An Administrator always may. Anyone else may only if their ROLE carries
+ * `can_void_bill_handover`, which defaults to 0 on every role — so shipping the
+ * column revoked the reported access from everybody at once, without rewriting
+ * a single role row. Roles are the owner's to set.
+ *
+ * One rule for every status, on purpose. Two rules meant the screen could not
+ * answer "may I void this" without also knowing what state the row was in,
+ * which is exactly how it ended up showing a button that the server then
+ * refused: src/app/bill-submissions/page.tsx gated the button on canRecord and
+ * never consulted the admin check at all, so a manager was offered a void of a
+ * CONFIRMED bill and told no only after pressing it.
+ *
+ * A void is still never a delete. The row survives, carrying its reason, its
+ * actor and its time — see voidBillHandover() below. This decides WHO, not
+ * WHETHER THE EVIDENCE SURVIVES.
+ */
+export function canVoidBillHandover(u: SessionUser | null | undefined): boolean {
+  if (!u) return false;
+  return u.role === 'admin' || !!u.can_void_bill_handover;
+}
+
+/**
+ * @deprecated Kept so no caller silently loses its guard during the rename.
+ * Voiding is one permission now, whatever the row's status — see
+ * canVoidBillHandover() above. Delete once nothing references it.
+ */
 export function canVoidConfirmedBillHandover(u: SessionUser | null | undefined): boolean {
-  return !!u && u.role === 'admin';
+  return canVoidBillHandover(u);
 }
 
 /**
@@ -1135,7 +1178,7 @@ export function voidBillHandover(
   if (row.status === BH_VOID) {
     return { ok: false, status: 409, error: 'That bill record is already voided.' };
   }
-  if (row.status === BH_RECEIVED && !canVoidConfirmedBillHandover(actor)) {
+  if (!canVoidBillHandover(actor)) {
     return {
       ok: false,
       status: 403,

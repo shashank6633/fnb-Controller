@@ -151,7 +151,7 @@ interface Summary {
      diagnosis behind the missing-role banner. It was already on the wire and
      this screen was the one place not reading it. */
   accounts_role?: AccountsRoleState;
-  can?: { record?: boolean; confirm?: boolean };
+  can?: { record?: boolean; confirm?: boolean; void?: boolean };
 }
 
 interface Unrecorded {
@@ -198,6 +198,11 @@ export default function BillSubmissionsPage() {
   };
 
   const canRecord = summary?.can?.record === true;
+  // Voiding is NOT implied by being able to record. Both Void buttons below
+  // used to read `canRecord`, which is isManagement || is_store_manager, so a
+  // Store Manager was offered a void of a CONFIRMED bill and refused only
+  // after pressing it. This asks the one question the API already answers.
+  const canVoid = summary?.can?.void === true;
 
   /* ── loads ─────────────────────────────────────────────────────────────── */
 
@@ -1056,6 +1061,7 @@ export default function BillSubmissionsPage() {
                     trail={trail[r.id]}
                     busy={busy === r.id}
                     canRecord={canRecord}
+                    canVoid={canVoid}
                     onToggle={() => {
                       const next = open ? null : r.id;
                       setOpenRow(next);
@@ -1100,6 +1106,7 @@ export default function BillSubmissionsPage() {
                       trail={trail[r.id]}
                       busy={busy === r.id}
                       canRecord={canRecord}
+                      canVoid={canVoid}
                       onToggle={() => {
                         const next = open ? null : r.id;
                         setOpenRow(next);
@@ -1267,6 +1274,7 @@ function MobileBillCard({
   trail,
   busy,
   canRecord,
+  canVoid,
   onToggle,
   onSubmit,
   onVoid,
@@ -1277,6 +1285,8 @@ function MobileBillCard({
   trail?: TrailRow[];
   busy: boolean;
   canRecord: boolean;
+  /** Voiding is its own permission — never inferred from canRecord. */
+  canVoid: boolean;
   onToggle: () => void;
   onSubmit: () => void;
   onVoid: () => void;
@@ -1451,7 +1461,7 @@ function MobileBillCard({
                 />
               </label>
             )}
-            {canRecord && r.status !== BH_VOID && (
+            {canVoid && r.status !== BH_VOID && (
               <button
                 onClick={onVoid}
                 disabled={busy}
@@ -1483,6 +1493,7 @@ function RowBlock({
   trail,
   busy,
   canRecord,
+  canVoid,
   onToggle,
   onSubmit,
   onVoid,
@@ -1493,6 +1504,8 @@ function RowBlock({
   trail?: TrailRow[];
   busy: boolean;
   canRecord: boolean;
+  /** Voiding is its own permission — never inferred from canRecord. */
+  canVoid: boolean;
   onToggle: () => void;
   onSubmit: () => void;
   onVoid: () => void;
@@ -1639,7 +1652,7 @@ function RowBlock({
                       />
                     </label>
                   )}
-                  {canRecord && r.status !== BH_VOID && (
+                  {canVoid && r.status !== BH_VOID && (
                     <button
                       onClick={onVoid}
                       disabled={busy}
