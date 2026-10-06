@@ -10,6 +10,10 @@ import {
   requireFssaiUser, fssaiCsrfGuard, fssaiAudit, fssaiAppAudit, str,
   FSSAI_NO_MATCH, FSSAI_CA_SELECT, shapeFssaiCa,
 } from '@/lib/fssai-server';
+import {
+  createFssaiCaTask, readFssaiCaTaskLink, readFssaiCaTaskLinks, readFssaiCaAlertTrail,
+  sweepFssaiCaAlerts, readFssaiEscalationRules,
+} from '@/lib/fssai-alerts';
 
 /**
  * CORRECTIVE ACTIONS (/api/fssai/corrective-actions) — the owner's §7 Q14.
@@ -46,7 +50,22 @@ import {
  *   GET  ?id=<ca>                one action, everything on it
  *   GET  ?run_id=<run>           every action hanging off one record
  *   GET  [?status=&severity=&department_id=&owner=&q=&from=&to=&overdue=1]
- *   POST { action: 'assign'|'start'|'complete'|'verify'|'reopen'|'cancel', id, … }
+ *   POST { action: 'assign'|'start'|'complete'|'verify'|'reopen'|'cancel'
+ *                 |'create_task', id, … }
+ *
+ * ── THE TWO THINGS ADDED FOR §21 AND §23, AND WHAT THEY DO NOT DO ───────────
+ * `create_task` makes the fix a job in the Task Manager staff already use and
+ * writes the task's id into `created_task_id` — the column that, until now,
+ * nothing wrote (the raise path left it '' rather than fabricate an id). The
+ * task is how a person is ASKED to do the work; this action stays the
+ * compliance record. Completing the task does not complete the action, and
+ * src/lib/fssai-alerts.ts holds no write against fssai_runs or fssai_responses
+ * either, so neither half can un-fail a check.
+ *
+ * The list GET also rides a THROTTLED chase (src/lib/fssai-alerts.ts), so
+ * opening this queue is what tells the owner of a late action that it is late.
+ * It is best-effort and ten-minute throttled: a chase that broke the queue
+ * would be worse than a chase that missed a morning.
  *
  * NO DELETE and no way to create one by hand. Every action in the file was
  * raised by a real failed answer on a real record (owner §19: nothing is
@@ -121,11 +140,44 @@ export async function GET(request: Request) {
         }),
         can_manage: canManageFssaiCa(me),
         cannot_change: 'A corrective action cannot change the check that failed. The failure stays on the record exactly as it was written.',
+        /* §21 — the job in the Task Manager, carried BESIDE the shaped action
+         * rather than inside it: FssaiCaView lives in src/lib/fssai.ts, which
+         * this lane may not edit, and a second private shape of the same row is
+         * exactly how two screens end up disagreeing. */
+        task: readFssaiCaTaskLink(db, found.row),
+        /* §23 — what was actually SENT about this action, read out of the audit
+         * trail rather than recomputed, so tightening a rule tomorrow cannot
+         * rewrite what somebody was told yesterday. */
+        alerts: readFssaiCaAlertTrail(db, id),
       });
     }
 
     /* ══ EVERY ACTION ON ONE RECORD ═════════════════════════════════════════ */
     const runId = str(url.searchParams.get('run_id'));
+
+    /**
+     * ══ THE RIDE-ALONG CHASE (owner §23) ═════════════════════════════════
+     *
+     * Opening the queue chases whatever is late. This is the same argument the
+     * scheduler makes about recording retention and idle tables in its own
+     * comments — a policy that only fires when somebody presses a button is not
+     * a policy — with one honest difference: this lane may not edit
+     * src/lib/scheduler.ts, so a page load is the earliest trigger available.
+     * THE SWEEP IS ITS OWN GATE: ten-minute throttled by a settings watermark,
+     * `INSERT OR IGNORE` deduped per action per day, and it swallows its own
+     * errors. ?no_sweep=1 turns it off for a caller that just wants the rows.
+     *
+     * It is not run for a single-record read (?run_id=) because that is opened
+     * from a record page, where chasing is not the reader's job.
+     */
+    if (!runId && url.searchParams.get('no_sweep') !== '1') {
+      try {
+        if (readFssaiEscalationRules(db).enabled) sweepFssaiCaAlerts(db);
+      } catch (sweepErr) {
+        // Never let the chase break the queue it is chasing.
+        console.error('[fssai] ride-along chase failed (the list is unaffected):', sweepErr);
+      }
+    }
 
     /* ══ THE LIST ═══════════════════════════════════════════════════════════ */
     const where: string[] = [];
@@ -232,6 +284,13 @@ export async function GET(request: Request) {
       can_manage: canManageFssaiCa(me),
       me: me.email || '',
       truncated: rows.length >= LIST_LIMIT,
+      /* §21 — which of these are already a job in the Task Manager, keyed by
+       * action id. One query for the whole page, and absent means "no job",
+       * never a fabricated id. */
+      task_links: readFssaiCaTaskLinks(db, shaped.map((a) => a.id)),
+      /* Management sees whether the chase is armed at all; a screen that offers
+       * "Chase now" while chasing is switched off would be lying. */
+      chasing_enabled: readFssaiEscalationRules(db).enabled,
     });
   } catch (e: any) {
     console.error('GET /api/fssai/corrective-actions failed:', e);
@@ -604,9 +663,86 @@ export async function POST(request: Request) {
       });
     }
 
+    /* ══════════════════════════════════════════════════════════════════════
+     * CREATE_TASK — make the fix a job in the list staff already use (§21).
+     *
+     * MANAGEMENT ONLY, and for one reason: this puts a job in somebody else's
+     * list and pushes it to their phone. Recording a fix is work anybody who can
+     * see the action may do; asking another person to do work is not.
+     *
+     * It changes NOTHING about the action except `created_task_id`. No status
+     * moves, no due date is touched, and the compliance record still has to be
+     * completed and checked here — the task cannot do either, and the sentence
+     * returned below says so because somebody who has just created a job will
+     * otherwise assume it is now handled.
+     * ════════════════════════════════════════════════════════════════════ */
+    if (action === 'create_task') {
+      if (!canManageFssaiCa(me)) {
+        return Response.json(
+          { error: 'Only a manager, head of department or administrator can put this in somebody\'s task list.' },
+          { status: 403 },
+        );
+      }
+      const assignee = str(body?.assignee_email).toLowerCase();
+      if (assignee) {
+        const who = db.prepare(
+          `SELECT email, name FROM users WHERE lower(email) = lower(?) AND is_active = 1`,
+        ).get(assignee) as any;
+        if (!who) {
+          return Response.json(
+            { error: `Nobody signs in as "${assignee}". Choose somebody from the list.` },
+            { status: 400 },
+          );
+        }
+      }
+      const dueDate = str(body?.due_date);
+      if (dueDate && !isISODate(dueDate)) {
+        return Response.json({ error: 'That is not a real date.' }, { status: 400 });
+      }
+      const priority = str(body?.priority);
+      if (priority && !isFssaiCaSeverity(priority)) {
+        return Response.json({ error: `"${priority}" is not one of the priorities.` }, { status: 400 });
+      }
+      const res = createFssaiCaTask(db, {
+        ca,
+        actor: { email: me.email, name: me.name },
+        assigneeEmail: assignee,
+        assigneeName: assignee
+          ? String((db.prepare(`SELECT name FROM users WHERE lower(email) = lower(?)`).get(assignee) as any)?.name || '')
+          : '',
+        priority,
+        dueDate,
+        note: str(body?.note).slice(0, 2000),
+        outletId,
+        origin: 'manual',
+      });
+      if (res.created) {
+        fssaiAppAudit(db, {
+          event_type: 'fssai.ca.task_created', entity_type: 'fssai_corrective_actions', entity_id: id,
+          actor_email: me.email, after: { task_id: res.task_id }, note: res.message,
+        });
+      }
+      return Response.json(
+        {
+          ok: res.created,
+          created: res.created,
+          task: readFssaiCaTaskLink(db, readOne(db, id)?.row || ca),
+          action: readOne(db, id)?.shaped,
+          note_to_staff: res.message,
+          /* THE SAME SENTENCE UNDER `error` TOO, because apiJson() throws on a
+           * non-2xx and reads `.error` — without this the screen would show the
+           * caller "HTTP 409" instead of the reason nothing was created. */
+          ...(res.created ? {} : { error: res.message }),
+        },
+        // 409 when there is already a job: nothing was created, and a 200 here
+        // would have the screen report success for a no-op.
+        { status: res.created ? 200 : 409 },
+      );
+    }
+
     return Response.json(
       {
-        error: `"${action || 'nothing'}" is not something that can be done to a corrective action. Use assign, start, complete, verify, reopen or cancel.`,
+        error: `"${action || 'nothing'}" is not something that can be done to a corrective action. Use assign, start, complete, verify, reopen, cancel or create_task.`,
       },
       { status: 400 },
     );

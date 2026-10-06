@@ -25,10 +25,28 @@
  * server's own words rather than hiding the button, because a person who cannot
  * see why they are blocked assumes the screen is broken.
  *
- * It replaces the PhaseShell that stood here. Every promise that shell made is
- * kept except one, and the screen says which: the fix does not yet become a row
- * in the Task Manager (the `created_task_id` column is deliberately left empty
- * rather than filled with a task id nothing created).
+ * ── THE TWO PROMISES THIS SCREEN NOW KEEPS (owner §21 and §23) ──────────────
+ * It used to end with a footnote admitting two gaps, and both are closed here:
+ *
+ *   §21 THE JOB. "Add to the Task Manager" turns the fix into a row in the task
+ *   list staff already use, and writes its id into `created_task_id` — the
+ *   column nothing wrote before. The job and the action are DELIBERATELY two
+ *   things: the job is how a person is asked to do the work, the action is the
+ *   compliance record. Completing the job does not close the action, and the
+ *   screen says so where somebody is about to assume otherwise.
+ *
+ *   §23 THE CHASE. "Late" was a red badge for whoever happened to look. Now a
+ *   reminder reaches the owner, an escalation reaches management on a
+ *   configurable ladder, and the action shows WHAT WAS ACTUALLY SENT — read out
+ *   of the audit trail, so tightening a rule tomorrow cannot rewrite what
+ *   somebody was told yesterday. The rules live behind "Chasing" (management
+ *   reads them, an administrator changes them).
+ *
+ * ONE THING IT STILL CANNOT PROMISE, said on the panel rather than hidden: there
+ * is no fixed-time job on the server for the chase. An action is chased the
+ * first time somebody opens this queue each day, and whenever a manager presses
+ * "Chase now". Arming it unattended needs one line in the app's scheduler, which
+ * is not this module's file to edit.
  *
  * Styling is the house skeleton (RECON §1.3-1.6) as /fssai/verification uses
  * it: the #FFF8F0 page, the #af4408 heading with an icon tile, white cards
@@ -40,8 +58,8 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import {
-  AlertTriangle, ArrowLeft, CalendarDays, Check, ClipboardList, Info, Loader2,
-  Lock, RefreshCw, Search, ShieldCheck, Undo2, UserCog, Wrench, X,
+  AlertTriangle, ArrowLeft, BellRing, CalendarDays, Check, ClipboardList, Info, Loader2,
+  Lock, RefreshCw, Search, Send, ShieldCheck, Undo2, UserCog, Wrench, X,
 } from 'lucide-react';
 import { apiJson } from '@/lib/api';
 import { fmtIST, fmtISTDate } from '@/lib/format-date';
@@ -50,6 +68,10 @@ import {
   FSSAI_CA_SEVERITIES, fssaiCaSeverityMeta, fssaiCaStatusMeta,
   type FssaiCaView,
 } from '@/lib/fssai';
+import { statusMeta as taskStatusMeta } from '@/lib/tasks';
+import type {
+  FssaiEscalationRules, FssaiEscalationTarget, FssaiCaTaskLink, FssaiCaAlertEvent,
+} from '@/lib/fssai-alerts';
 
 interface Counts {
   open: number; in_progress: number; done: number;
@@ -62,6 +84,8 @@ interface ListResponse {
   can_manage: boolean;
   me: string;
   truncated: boolean;
+  task_links?: Record<string, FssaiCaTaskLink>;
+  chasing_enabled?: boolean;
 }
 
 interface OneResponse {
@@ -70,6 +94,26 @@ interface OneResponse {
   verify_refusal: string;
   can_manage: boolean;
   cannot_change: string;
+  /** null when this action is not a job in the Task Manager (owner §21). */
+  task: FssaiCaTaskLink | null;
+  /** Every reminder and escalation actually sent about it (owner §23). */
+  alerts: FssaiCaAlertEvent[];
+}
+
+interface EscalationPicture {
+  outstanding: number; unassigned: number; due_today: number; overdue: number;
+  overdue_urgent: number; worst_days_late: number; with_task: number;
+  told_today: number; last_sweep_at: string;
+}
+
+interface RulesResponse {
+  rules: FssaiEscalationRules;
+  defaults: FssaiEscalationRules;
+  picture: EscalationPicture;
+  targets: { key: FssaiEscalationTarget; label: string; note: string }[];
+  can_edit: boolean;
+  today: string;
+  arming: string;
 }
 
 const TABS = [
@@ -138,13 +182,39 @@ function Pills({ a }: { a: FssaiCaView }) {
   );
 }
 
-function ActionCard({ a, onOpen }: { a: FssaiCaView; onOpen: () => void }) {
+/**
+ * "It is also a job." A chip, not a sentence, because the list is scanned —
+ * and only when a task really exists. An action whose created_task_id points at
+ * a deleted task shows the chip in RED rather than silently as "no job": a job
+ * somebody removed is not a mended fault, and the modal explains it.
+ */
+function TaskChip({ link }: { link?: FssaiCaTaskLink }) {
+  if (!link) return null;
+  if (!link.exists) {
+    return (
+      <span className="text-[11px] px-1.5 py-0.5 rounded border bg-red-100 text-red-700 border-red-200 inline-flex flex-nowrap items-center gap-1">
+        <ClipboardList size={11} className="shrink-0" /> Job deleted
+      </span>
+    );
+  }
+  const st = taskStatusMeta(link.status);
+  return (
+    <span className={`text-[11px] px-1.5 py-0.5 rounded border inline-flex flex-nowrap items-center gap-1 ${st.color}`}>
+      <ClipboardList size={11} className="shrink-0" /> Job · {st.label}
+    </span>
+  );
+}
+
+function ActionCard({ a, taskLink, onOpen }: { a: FssaiCaView; taskLink?: FssaiCaTaskLink; onOpen: () => void }) {
   return (
     <button
       onClick={onOpen}
       className="w-full text-left bg-white border border-[#E8D5C4] rounded-xl p-3 hover:border-[#af4408] focus:outline-none focus:border-[#af4408]"
     >
-      <Pills a={a} />
+      <div className="flex flex-wrap items-center gap-1.5">
+        <Pills a={a} />
+        <TaskChip link={taskLink} />
+      </div>
       <p className="text-sm font-semibold text-[#2D1B0E] mt-1.5">{a.title}</p>
       <p className="text-xs text-[#6B5744] mt-0.5 truncate">{whereFrom(a)}</p>
       <p className="text-xs mt-1">
@@ -174,6 +244,9 @@ export default function FssaiCorrectiveActionsPage() {
   const [lateOnly, setLateOnly] = useState(false);
   const [mineOnly, setMineOnly] = useState(false);
   const [openId, setOpenId] = useState<string | null>(null);
+  const [taskLinks, setTaskLinks] = useState<Record<string, FssaiCaTaskLink>>({});
+  const [chasingEnabled, setChasingEnabled] = useState<boolean | null>(null);
+  const [showChasing, setShowChasing] = useState(false);
 
   useEffect(() => {
     if (!toast) return;
@@ -194,6 +267,8 @@ export default function FssaiCorrectiveActionsPage() {
       setRows(j.actions || []);
       setCounts(j.counts || ZERO);
       setCanManage(!!j.can_manage);
+      setTaskLinks(j.task_links || {});
+      setChasingEnabled(typeof j.chasing_enabled === 'boolean' ? j.chasing_enabled : null);
       setSignedOut(false);
     } catch (e) {
       const m = e instanceof Error ? e.message : 'Could not load the corrective actions';
@@ -283,11 +358,28 @@ export default function FssaiCorrectiveActionsPage() {
             </button>
           );
         })}
+        {/* CHASING — management only. It names who gets told when the restaurant
+          * fails to fix something, which is supervisory information, and the
+          * route refuses a non-manager anyway (403), so offering the button to
+          * everybody would only produce a dead end. */}
+        {canManage && (
+          <button
+            onClick={() => setShowChasing(true)}
+            className={`ml-auto min-h-[44px] text-sm px-3 rounded-lg border font-medium inline-flex flex-nowrap items-center gap-1.5 ${
+              chasingEnabled === false
+                ? 'bg-amber-50 border-amber-300 text-amber-900'
+                : 'bg-white border-[#E8D5C4] text-[#6B5744] hover:border-[#af4408]'
+            }`}
+          >
+            <BellRing size={15} className="shrink-0" />
+            {chasingEnabled === false ? 'Chasing is off' : 'Chasing'}
+          </button>
+        )}
         <button
           onClick={() => void load()}
           title="Reload"
           aria-label="Reload"
-          className="ml-auto w-11 h-11 rounded-lg border border-[#E8D5C4] bg-white hover:border-[#af4408] flex items-center justify-center"
+          className={`${canManage ? '' : 'ml-auto '}w-11 h-11 rounded-lg border border-[#E8D5C4] bg-white hover:border-[#af4408] flex items-center justify-center`}
         >
           <RefreshCw size={15} className={loading ? 'animate-spin' : ''} />
         </button>
@@ -358,7 +450,9 @@ export default function FssaiCorrectiveActionsPage() {
         <>
           {/* cards under md */}
           <div className="md:hidden space-y-2">
-            {rows!.map((a) => <ActionCard key={a.id} a={a} onOpen={() => setOpenId(a.id)} />)}
+            {rows!.map((a) => (
+              <ActionCard key={a.id} a={a} taskLink={taskLinks[a.id]} onOpen={() => setOpenId(a.id)} />
+            ))}
           </div>
 
           {/* table from md up */}
@@ -380,7 +474,12 @@ export default function FssaiCorrectiveActionsPage() {
                     onClick={() => setOpenId(a.id)}
                     className="cursor-pointer hover:bg-[#FFF8F0]"
                   >
-                    <td className="px-4 py-2 align-top"><Pills a={a} /></td>
+                    <td className="px-4 py-2 align-top">
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <Pills a={a} />
+                        <TaskChip link={taskLinks[a.id]} />
+                      </div>
+                    </td>
                     <td className="px-4 py-2 align-top max-w-[22rem]">
                       <span className="text-[#2D1B0E]">{a.title}</span>
                       {a.answer?.text && (
@@ -413,6 +512,13 @@ export default function FssaiCorrectiveActionsPage() {
         />
       )}
 
+      {showChasing && (
+        <ChasingModal
+          onClose={() => setShowChasing(false)}
+          onChanged={(msg) => { setToast(msg); void load(); }}
+        />
+      )}
+
       {toast && (
         <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-[60] bg-[#2D1B0E] text-white text-sm px-4 py-2.5 rounded-xl shadow-lg max-w-[90vw]">
           {toast}
@@ -441,7 +547,9 @@ function ActionModal({
   const [actErr, setActErr] = useState<string | null>(null);
 
   // One panel is open at a time; null is the read-only view.
-  const [panel, setPanel] = useState<null | 'assign' | 'complete' | 'verify' | 'reopen' | 'cancel'>(null);
+  const [panel, setPanel] = useState<null | 'assign' | 'complete' | 'verify' | 'reopen' | 'cancel' | 'task'>(null);
+  const [taskAssignee, setTaskAssignee] = useState('');
+  const [taskNote, setTaskNote] = useState('');
   const [actionTaken, setActionTaken] = useState('');
   const [verifyNote, setVerifyNote] = useState('');
   const [reason, setReason] = useState('');
@@ -460,6 +568,9 @@ function ActionModal({
       setDue(j.action.due_date || '');
       setSev(j.action.severity || 'medium');
       setRootCause(j.action.root_cause || '');
+      // The job starts offered to whoever already owns the action — the common
+      // case, and nobody has to pick the same person twice.
+      setTaskAssignee(j.action.owner_email || '');
     } catch (e) {
       setErr(e instanceof Error ? e.message : 'Could not open that action');
     } finally {
@@ -480,6 +591,7 @@ function ActionModal({
       setActionTaken('');
       setVerifyNote('');
       setReason('');
+      setTaskNote('');
       await load();
       // The SERVER's own sentence wins when it sent one — it knows things the
       // screen does not, like "somebody still has to check this".
@@ -609,6 +721,92 @@ function ActionModal({
                       </div>
                     )}
                   </div>
+                </div>
+              )}
+
+              {/* ── §21 · THE JOB IN THE TASK MANAGER ─────────────────────── */}
+              <div className="bg-white border border-[#E8D5C4] rounded-xl p-3">
+                <div className="flex flex-nowrap items-start gap-2.5">
+                  <ClipboardList size={15} className="text-[#af4408] shrink-0 mt-0.5" />
+                  <div className="min-w-0 flex-1">
+                    {v.task && v.task.exists ? (
+                      <>
+                        <p className="text-sm text-[#2D1B0E]">
+                          <strong>This is a job in the Task Manager.</strong>{' '}
+                          <span className={`text-[11px] px-1.5 py-0.5 rounded border ${taskStatusMeta(v.task.status).color}`}>
+                            {taskStatusMeta(v.task.status).label}
+                          </span>
+                        </p>
+                        <p className="text-xs text-[#6B5744] mt-1 break-words">{v.task.title}</p>
+                        <p className="text-xs text-[#6B5744] mt-0.5">
+                          {v.task.assignee_email || 'Nobody on the job yet'}
+                          {v.task.department ? ` · ${v.task.department}` : ''}
+                          {v.task.category ? ` · ${v.task.category}` : ''}
+                          {v.task.due_date ? ` · due ${fmtISTDate(v.task.due_date)}` : ''}
+                        </p>
+                        {/* THE THING SOMEBODY WILL OTHERWISE ASSUME. */}
+                        <p className="text-[11px] text-[#8B7355] mt-1.5">
+                          Finishing that job does not close this action. The fix still has to be
+                          written down here and checked by somebody else.
+                        </p>
+                      </>
+                    ) : v.task && !v.task.exists ? (
+                      <>
+                        <p className="text-sm text-red-800">
+                          <strong>The job raised for this action is no longer in the Task Manager.</strong>
+                        </p>
+                        <p className="text-xs text-[#6B5744] mt-1">
+                          Nothing has been created a second time, on purpose — two task ids for one
+                          fault with no record of the first is worse than none. A deleted job is not
+                          a mended fault, so tell an administrator.
+                        </p>
+                      </>
+                    ) : (
+                      <>
+                        <p className="text-sm text-[#2D1B0E]">Not a job in the Task Manager yet.</p>
+                        <p className="text-xs text-[#6B5744] mt-0.5">
+                          This action is the compliance record. A job is how somebody is actually
+                          asked to do the work — it lands in their task list and on their phone.
+                        </p>
+                        {canManage && a.status !== 'verified' && a.status !== 'cancelled' && a.status !== 'void' && (
+                          <button
+                            onClick={() => setPanel('task')}
+                            className="mt-2 min-h-[44px] px-3 rounded-lg border border-[#E8D5C4] bg-white hover:border-[#af4408] text-sm font-medium inline-flex flex-nowrap items-center gap-2"
+                          >
+                            <ClipboardList size={15} className="shrink-0" /> Add to the Task Manager
+                          </button>
+                        )}
+                      </>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              {/* ── §23 · WHAT WAS ACTUALLY SENT ──────────────────────────── */}
+              {v.alerts.length > 0 && (
+                <div className="border border-[#E8D5C4] rounded-xl overflow-hidden">
+                  <p className="px-3 py-2 bg-[#FFF8F0] border-b border-[#E8D5C4] text-xs font-semibold text-[#6B5744] flex flex-nowrap items-center gap-1.5">
+                    <BellRing size={13} className="shrink-0" /> Who has been told
+                  </p>
+                  <div className="divide-y divide-[#E8D5C4] bg-white">
+                    {v.alerts.map((ev, i) => (
+                      <div key={`${ev.kind}-${ev.at}-${i}`} className="p-3">
+                        <p className="text-sm text-[#2D1B0E]">
+                          <strong>{ev.kind_label}</strong>
+                          {ev.days_late > 0 ? ` · ${ev.days_late} day${ev.days_late === 1 ? '' : 's'} late` : ''}
+                          {ev.at ? ` · ${fmtIST(ev.at)}` : ''}
+                        </p>
+                        <p className="text-xs text-[#6B5744] mt-0.5 break-words">
+                          {ev.recipients.length ? ev.recipients.join(', ') : '—'}
+                        </p>
+                      </div>
+                    ))}
+                  </div>
+                  {/* Read from the trail, not recomputed — said so nobody reads
+                    * this list as "what today's rules would send". */}
+                  <p className="px-3 py-2 bg-[#FFF8F0] border-t border-[#E8D5C4] text-[11px] text-[#8B7355]">
+                    This is what was sent at the time. Changing the chasing rules does not change it.
+                  </p>
                 </div>
               )}
 
@@ -898,13 +1096,449 @@ function ActionModal({
                 </div>
               )}
 
-              {/* ── the one promise this screen does NOT yet keep ─────────── */}
-              <p className="text-[11px] text-[#8B7355] flex flex-nowrap items-start gap-1.5">
-                <ClipboardList size={12} className="shrink-0 mt-0.5" />
-                <span>
-                  The fix is recorded here, not yet as a job in the Task Manager. That link is not
-                  built, so nothing on this action will appear in your task list.
-                </span>
+              {/* ── put it in somebody's task list ────────────────────────── */}
+              {panel === 'task' && (
+                <div className="bg-white border border-[#E8D5C4] rounded-xl p-3 space-y-2">
+                  <p className="text-sm font-semibold text-[#2D1B0E]">Who is being asked to do the work?</p>
+                  <p className="text-xs text-[#6B5744]">
+                    This creates one job in the Task Manager, with everything about the failure on it,
+                    and sends it to their task list and their phone. The job is{' '}
+                    <strong>{fssaiCaSeverityMeta(a.severity).label}</strong> priority and due{' '}
+                    {a.due_date ? fmtISTDate(a.due_date) : 'with no date'} — the action&apos;s own severity
+                    and deadline, so the two cannot disagree. Leave the person blank to create it as a
+                    draft for the task board.
+                  </p>
+                  <UserPicker
+                    value={taskAssignee}
+                    onPick={(u) => setTaskAssignee(u.email)}
+                    allowClear
+                    onClear={() => setTaskAssignee('')}
+                    placeholder="Nobody — create it as a draft"
+                  />
+                  <div>
+                    <label className="text-xs font-semibold text-[#6B5744]">Anything to add for them (optional)</label>
+                    <textarea
+                      value={taskNote}
+                      onChange={(e) => setTaskNote(e.target.value)}
+                      rows={2}
+                      placeholder="e.g. The spare seal is in the store, shelf 4."
+                      className={INPUT}
+                    />
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      onClick={() => void post(
+                        { action: 'create_task', assignee_email: taskAssignee, note: taskNote },
+                        'Added to the Task Manager.',
+                      )}
+                      disabled={busy}
+                      className="flex-1 min-w-[9rem] min-h-[52px] inline-flex flex-nowrap items-center justify-center gap-2 rounded-xl bg-[#af4408] hover:bg-[#8a3606] disabled:opacity-60 text-white font-semibold text-sm px-4"
+                    >
+                      {busy ? <Loader2 size={17} className="animate-spin shrink-0" /> : <ClipboardList size={17} className="shrink-0" />}
+                      Create the job
+                    </button>
+                    <button onClick={() => setPanel(null)} className="min-h-[52px] px-4 rounded-xl border border-[#E8D5C4] bg-white text-sm font-medium">
+                      Back
+                    </button>
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ *
+ * CHASING AND ESCALATION — the owner's §23, on one screen
+ *
+ * TWO AUDIENCES, ONE PANEL. Management READS it: how many actions are
+ * outstanding, how late the worst one is, how many people were told today, and
+ * — the number that matters most — whether anything is sitting with nobody's
+ * name on it. An ADMINISTRATOR can change the ladder (the route refuses
+ * anybody else, 403, and the save button is not offered without `can_edit`).
+ *
+ * THE ONE SENTENCE THIS PANEL MUST NOT LEAVE OUT is the arming note the server
+ * sends: there is no fixed-time job for the chase, so an action is chased the
+ * first time somebody opens this queue each day. A screen promising scheduled
+ * escalation it does not have is exactly the guard that reads correctly and
+ * never fires.
+ * ------------------------------------------------------------------ */
+
+function ChasingModal({
+  onClose, onChanged,
+}: {
+  onClose: () => void;
+  onChanged: (message: string) => void;
+}) {
+  const [v, setV] = useState<RulesResponse | null>(null);
+  const [draft, setDraft] = useState<FssaiEscalationRules | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState<string | null>(null);
+  const [actErr, setActErr] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [sweeping, setSweeping] = useState(false);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setErr(null);
+    try {
+      const j = await apiJson<RulesResponse>('/api/fssai/escalations');
+      setV(j);
+      setDraft(j.rules);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : 'Could not load the chasing rules');
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { void load(); }, [load]);
+
+  const save = useCallback(async () => {
+    if (!draft) return;
+    setBusy(true);
+    setActErr(null);
+    try {
+      const j = await apiJson<{ rules: FssaiEscalationRules; note: string }>(
+        '/api/fssai/escalations', { method: 'POST', body: { action: 'save_rules', rules: draft } },
+      );
+      setV((prev) => (prev ? { ...prev, rules: j.rules } : prev));
+      setDraft(j.rules);
+      onChanged(j.note || 'Saved.');
+    } catch (e) {
+      setActErr(e instanceof Error ? e.message : 'Those rules could not be saved');
+    } finally {
+      setBusy(false);
+    }
+  }, [draft, onChanged]);
+
+  const chaseNow = useCallback(async () => {
+    setSweeping(true);
+    setActErr(null);
+    try {
+      const j = await apiJson<{ message: string; picture: EscalationPicture }>(
+        '/api/fssai/escalations', { method: 'POST', body: { action: 'sweep', force: true } },
+      );
+      setV((prev) => (prev ? { ...prev, picture: j.picture } : prev));
+      onChanged(j.message || 'Done.');
+    } catch (e) {
+      setActErr(e instanceof Error ? e.message : 'The chase could not be run');
+    } finally {
+      setSweeping(false);
+    }
+  }, [onChanged]);
+
+  const set = <K extends keyof FssaiEscalationRules>(k: K, value: FssaiEscalationRules[K]) =>
+    setDraft((d) => (d ? { ...d, [k]: value } : d));
+
+  const toggleTarget = (
+    which: 'level1_targets' | 'level2_targets', key: FssaiEscalationTarget,
+  ) => setDraft((d) => {
+    if (!d) return d;
+    const list = d[which];
+    return { ...d, [which]: list.includes(key) ? list.filter((t) => t !== key) : [...list, key] };
+  });
+
+  const canEdit = !!v?.can_edit;
+  const dirty = !!(v && draft) && JSON.stringify(v.rules) !== JSON.stringify(draft);
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/40 flex items-end sm:items-center justify-center" onClick={onClose}>
+      <div
+        className="bg-[#FFF8F0] w-full sm:max-w-2xl sm:rounded-2xl rounded-t-2xl max-h-[92vh] overflow-y-auto"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="sticky top-0 bg-[#FFF8F0] border-b border-[#E8D5C4] px-3 sm:px-4 py-3 flex flex-nowrap items-center gap-2">
+          <button
+            onClick={onClose}
+            aria-label="Close"
+            className="w-10 h-10 rounded-lg border border-[#E8D5C4] bg-white flex items-center justify-center shrink-0"
+          >
+            <ArrowLeft size={16} />
+          </button>
+          <p className="font-semibold text-[#2D1B0E] truncate">Chasing and escalation</p>
+          <button
+            onClick={onClose}
+            aria-label="Close"
+            className="ml-auto w-10 h-10 rounded-lg border border-[#E8D5C4] bg-white flex items-center justify-center shrink-0"
+          >
+            <X size={16} />
+          </button>
+        </div>
+
+        <div className="p-3 sm:p-4 space-y-3">
+          {loading ? (
+            <div className="p-8 text-center"><Loader2 className="w-6 h-6 mx-auto animate-spin text-[#af4408]" /></div>
+          ) : err ? (
+            <div className="bg-red-50 border border-red-200 rounded-xl p-3 text-sm text-red-800">{err}</div>
+          ) : !v || !draft ? null : (
+            <>
+              {/* ── where things stand ─────────────────────────────────────── */}
+              <div className="bg-white border border-[#E8D5C4] rounded-xl p-3">
+                <p className="text-xs font-semibold text-[#6B5744] mb-2">Where things stand today</p>
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-center">
+                  {[
+                    { n: v.picture.outstanding, l: 'Still to do', bad: false },
+                    { n: v.picture.overdue, l: 'Late', bad: v.picture.overdue > 0 },
+                    { n: v.picture.unassigned, l: 'No owner', bad: v.picture.unassigned > 0 },
+                    { n: v.picture.told_today, l: 'Told today', bad: false },
+                  ].map((c) => (
+                    <div key={c.l} className={`rounded-lg border p-2 ${c.bad ? 'bg-red-50 border-red-200' : 'bg-[#FFF8F0] border-[#E8D5C4]'}`}>
+                      <p className={`text-lg font-bold ${c.bad ? 'text-red-700' : 'text-[#2D1B0E]'}`}>{c.n}</p>
+                      <p className="text-[11px] text-[#6B5744]">{c.l}</p>
+                    </div>
+                  ))}
+                </div>
+                {v.picture.worst_days_late > 0 && (
+                  <p className="text-xs text-red-800 mt-2">
+                    The oldest unfixed action is <strong>{v.picture.worst_days_late} day
+                    {v.picture.worst_days_late === 1 ? '' : 's'}</strong> past its date
+                    {v.picture.overdue_urgent > 0 && (
+                      <> and {v.picture.overdue_urgent} late action{v.picture.overdue_urgent === 1 ? ' is' : 's are'} marked urgent</>
+                    )}.
+                  </p>
+                )}
+                <p className="text-[11px] text-[#8B7355] mt-2">
+                  {v.picture.with_task} of these {v.picture.outstanding === 1 ? 'is' : 'are'} also a job in
+                  the Task Manager.
+                  {v.picture.last_sweep_at && <> Last chased {fmtIST(v.picture.last_sweep_at)}.</>}
+                </p>
+              </div>
+
+              {/* ── the honest sentence about arming ───────────────────────── */}
+              <div className="bg-[#FFF1E3] border border-[#E8D5C4] rounded-xl p-3">
+                <div className="flex flex-nowrap items-start gap-2.5">
+                  <Info size={15} className="text-[#af4408] shrink-0 mt-0.5" />
+                  <p className="text-xs text-[#3D2614]">{v.arming}</p>
+                </div>
+              </div>
+
+              <button
+                onClick={() => void chaseNow()}
+                disabled={sweeping || !draft.enabled}
+                className="w-full min-h-[52px] inline-flex flex-nowrap items-center justify-center gap-2 rounded-xl bg-[#af4408] hover:bg-[#8a3606] disabled:opacity-50 text-white font-semibold text-sm px-4"
+              >
+                {sweeping ? <Loader2 size={17} className="animate-spin shrink-0" /> : <Send size={17} className="shrink-0" />}
+                {draft.enabled ? 'Chase now' : 'Chasing is switched off'}
+              </button>
+
+              {actErr && (
+                <div className="bg-red-50 border border-red-200 rounded-xl p-3 text-sm text-red-800">{actErr}</div>
+              )}
+
+              {!canEdit && (
+                <div className="bg-amber-50 border border-amber-200 rounded-xl p-3">
+                  <div className="flex flex-nowrap items-start gap-2.5">
+                    <Info size={15} className="text-amber-800 shrink-0 mt-0.5" />
+                    <p className="text-sm text-amber-900">
+                      You can read the rules and run the chase. Only an administrator can change who
+                      gets told and when.
+                    </p>
+                  </div>
+                </div>
+              )}
+
+              {/* ── the rules ─────────────────────────────────────────────── */}
+              <fieldset disabled={!canEdit} className="space-y-3 disabled:opacity-70">
+                <div className="bg-white border border-[#E8D5C4] rounded-xl p-3 space-y-2.5">
+                  <label className="flex flex-nowrap items-start gap-2.5 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={draft.enabled}
+                      onChange={(e) => set('enabled', e.target.checked)}
+                      className="mt-1 w-4 h-4 shrink-0 accent-[#af4408]"
+                    />
+                    <span className="min-w-0">
+                      <span className="text-sm font-semibold text-[#2D1B0E]">Chase late corrective actions</span>
+                      <span className="block text-xs text-[#6B5744]">
+                        Switch this off and nobody is told about anything. Records and actions are
+                        unaffected — only the messages stop.
+                      </span>
+                    </span>
+                  </label>
+                </div>
+
+                <div className="bg-white border border-[#E8D5C4] rounded-xl p-3 space-y-2.5">
+                  <p className="text-xs font-semibold text-[#6B5744]">Reminding the person it belongs to</p>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                    <div>
+                      <label className="text-xs text-[#6B5744]">Days before it is due</label>
+                      <input
+                        type="number" min={0} max={30} inputMode="numeric"
+                        value={draft.remind_before_days}
+                        onChange={(e) => set('remind_before_days', Math.max(0, Math.min(30, parseInt(e.target.value || '0', 10) || 0)))}
+                        className={INPUT}
+                      />
+                      <p className="text-[11px] text-[#8B7355] mt-0.5">0 = no early reminder.</p>
+                    </div>
+                    <div className="space-y-2 sm:pt-5">
+                      <label className="flex flex-nowrap items-center gap-2 text-sm text-[#3D2614] cursor-pointer">
+                        <input
+                          type="checkbox" checked={draft.remind_on_due}
+                          onChange={(e) => set('remind_on_due', e.target.checked)}
+                          className="w-4 h-4 shrink-0 accent-[#af4408]"
+                        />
+                        On the day it is due
+                      </label>
+                      <label className="flex flex-nowrap items-center gap-2 text-sm text-[#3D2614] cursor-pointer">
+                        <input
+                          type="checkbox" checked={draft.remind_overdue_daily}
+                          onChange={(e) => set('remind_overdue_daily', e.target.checked)}
+                          className="w-4 h-4 shrink-0 accent-[#af4408]"
+                        />
+                        Every day it stays late
+                      </label>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="bg-white border border-[#E8D5C4] rounded-xl p-3 space-y-3">
+                  <p className="text-xs font-semibold text-[#6B5744]">Escalating past them</p>
+                  {([
+                    { which: 'level1_targets' as const, days: 'level1_after_days' as const, label: 'First escalation' },
+                    { which: 'level2_targets' as const, days: 'level2_after_days' as const, label: 'Second escalation' },
+                  ]).map((lvl) => (
+                    <div key={lvl.which} className="border border-[#E8D5C4] rounded-lg p-2.5">
+                      <div className="flex flex-wrap items-end gap-2">
+                        <div className="flex-1 min-w-[10rem]">
+                          <label className="text-xs text-[#6B5744]">{lvl.label} — days late</label>
+                          <input
+                            type="number" min={0} max={365} inputMode="numeric"
+                            value={draft[lvl.days]}
+                            onChange={(e) => set(lvl.days, Math.max(0, Math.min(365, parseInt(e.target.value || '0', 10) || 0)))}
+                            className={INPUT}
+                          />
+                        </div>
+                      </div>
+                      <div className="flex flex-wrap gap-1.5 mt-2">
+                        {v.targets.map((t) => {
+                          const on = draft[lvl.which].includes(t.key);
+                          return (
+                            <button
+                              key={t.key}
+                              type="button"
+                              onClick={() => toggleTarget(lvl.which, t.key)}
+                              title={t.note}
+                              className={`min-h-[40px] text-xs px-2.5 rounded-lg border font-medium ${
+                                on
+                                  ? 'bg-[#af4408] border-[#af4408] text-white'
+                                  : 'bg-white border-[#E8D5C4] text-[#6B5744] hover:border-[#af4408]'
+                              }`}
+                            >
+                              {t.label}
+                            </button>
+                          );
+                        })}
+                      </div>
+                      {draft[lvl.which].length === 0 && (
+                        <p className="text-[11px] text-amber-800 mt-1.5">
+                          Nobody selected — this level will never be sent. That is a real setting, not
+                          a mistake, but it is worth knowing.
+                        </p>
+                      )}
+                    </div>
+                  ))}
+                  {draft.level2_after_days < draft.level1_after_days && (
+                    <p className="text-xs text-red-800">
+                      The second escalation cannot happen before the first. The server will refuse
+                      this.
+                    </p>
+                  )}
+                </div>
+
+                <div className="bg-white border border-[#E8D5C4] rounded-xl p-3 space-y-2.5">
+                  <p className="text-xs font-semibold text-[#6B5744]">The two cases that cannot wait</p>
+                  <label className="flex flex-nowrap items-start gap-2.5 cursor-pointer">
+                    <input
+                      type="checkbox" checked={draft.urgent_escalates_same_day}
+                      onChange={(e) => set('urgent_escalates_same_day', e.target.checked)}
+                      className="mt-1 w-4 h-4 shrink-0 accent-[#af4408]"
+                    />
+                    <span className="min-w-0">
+                      <span className="text-sm text-[#3D2614]">An urgent action escalates the day it is raised</span>
+                      <span className="block text-xs text-[#6B5744]">
+                        An urgent action is due the same day, so waiting for it to be late means
+                        waiting until tomorrow.
+                      </span>
+                    </span>
+                  </label>
+                  <div>
+                    <label className="text-xs text-[#6B5744]">
+                      Hours an action may sit with nobody&apos;s name on it
+                    </label>
+                    <input
+                      type="number" min={0} max={720} inputMode="numeric"
+                      value={draft.unassigned_escalates_after_hours}
+                      onChange={(e) => set('unassigned_escalates_after_hours', Math.max(0, Math.min(720, parseInt(e.target.value || '0', 10) || 0)))}
+                      className={INPUT}
+                    />
+                    <p className="text-[11px] text-[#8B7355] mt-0.5">
+                      An action is raised with no owner on purpose — nothing in this app says who mends
+                      a fridge. Without this, an unowned failure has nobody to remind. 0 = never.
+                    </p>
+                  </div>
+                </div>
+
+                <div className="bg-white border border-[#E8D5C4] rounded-xl p-3 space-y-2.5">
+                  <p className="text-xs font-semibold text-[#6B5744]">Also</p>
+                  <label className="flex flex-nowrap items-start gap-2.5 cursor-pointer">
+                    <input
+                      type="checkbox" checked={draft.auto_create_task}
+                      onChange={(e) => set('auto_create_task', e.target.checked)}
+                      className="mt-1 w-4 h-4 shrink-0 accent-[#af4408]"
+                    />
+                    <span className="min-w-0">
+                      <span className="text-sm text-[#3D2614]">Raise a Task-Manager job automatically</span>
+                      <span className="block text-xs text-[#6B5744]">
+                        Off by default. With this on, every corrective action becomes a job without
+                        anybody pressing a button — which on a restaurant whose questions all raise
+                        actions is one job per failed answer. Try it with the button on an action first.
+                      </span>
+                    </span>
+                  </label>
+                  <label className="flex flex-nowrap items-start gap-2.5 cursor-pointer">
+                    <input
+                      type="checkbox" checked={draft.slack}
+                      onChange={(e) => set('slack', e.target.checked)}
+                      className="mt-1 w-4 h-4 shrink-0 accent-[#af4408]"
+                    />
+                    <span className="min-w-0">
+                      <span className="text-sm text-[#3D2614]">Post escalations to Slack too</span>
+                      <span className="block text-xs text-[#6B5744]">
+                        Only sends if a Slack webhook is already configured in Settings. With none
+                        configured the rows are written and simply never sent.
+                      </span>
+                    </span>
+                  </label>
+                </div>
+              </fieldset>
+
+              {canEdit && (
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    onClick={() => void save()}
+                    disabled={busy || !dirty || draft.level2_after_days < draft.level1_after_days}
+                    className="flex-1 min-w-[9rem] min-h-[52px] inline-flex flex-nowrap items-center justify-center gap-2 rounded-xl bg-[#af4408] hover:bg-[#8a3606] disabled:opacity-50 text-white font-semibold text-sm px-4"
+                  >
+                    {busy ? <Loader2 size={17} className="animate-spin shrink-0" /> : <Check size={17} className="shrink-0" />}
+                    {dirty ? 'Save the rules' : 'Nothing to save'}
+                  </button>
+                  <button
+                    onClick={() => setDraft(v.defaults)}
+                    className="min-h-[52px] px-4 rounded-xl border border-[#E8D5C4] bg-white text-sm font-medium"
+                  >
+                    Back to the defaults
+                  </button>
+                </div>
+              )}
+
+              {/* The §19 point, because a rule is a decision like any other. */}
+              <p className="text-[11px] text-[#8B7355]">
+                Every change to these rules is recorded in the food-safety audit trail with the old
+                and new values and who made it. Changing them never alters what has already been sent.
               </p>
             </>
           )}
