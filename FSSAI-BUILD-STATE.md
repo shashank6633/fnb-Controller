@@ -661,6 +661,83 @@ top costs far more than fixing it now. He is reviewing the foundation, not the f
      `next/headers` was stubbed with a double that THROWS if called, so the probe cannot have
      silently tested a signed-out request path.
 
+- **2026-10-06** — **P9: THE DASHBOARD, INSPECTION MODE AND THE REPORTS.** Commits `359f79c` (five
+  routes) · `914aa73` (a defect the probe found) · `daefcb3` (four screens). **No shared file edited**
+  — `db.ts`, `page-catalog.ts`, `Sidebar.tsx`, `fssai.ts` untouched; the only shared file is four
+  `built: true` lines on this lane's own `modules.ts` rows. `npx tsc --noEmit` exit 0, zero output,
+  three consecutive runs.
+  1. **ONE DEFECT, FOUND BY RUNNING AND NOT BY READING.** A duplicate inspection number returned
+     **500 with raw SQL in the message**. SQLite names the COLUMNS and not the index —
+     `UNIQUE constraint failed: fssai_inspections.outlet_id, fssai_inspections.inspection_no`, with
+     no mention of `uq_fssai_insp_no` anywhere — which is the exact trap `constraintMessage`'s own
+     header documents for the template/section/question codes. The handler matched the index name,
+     fell through, and handed the SQL to the user. Now matched on the column (index name kept as a
+     fallback) and it answers 409 in words.
+  2. **A MISSING REGISTER IS NOT A CLEAN KITCHEN** — the rule the dashboard is built around, and the
+     one thing it was worth building a harness to prove. Eleven of thirty `fssai_` tables exist in
+     this worktree, so the case is today's reality, not a hypothetical. Every figure arrives as
+     `{value, state, why}` and `state` has four values of which **only one is a number**:
+     `unavailable` (the register is not in this database), `restricted` (premises-wide, management
+     only — §7 Q10), `failed` (the query broke, named rather than swallowed into 0), and `ok`.
+     **Proved by dropping four tables and re-reading the dashboard:** still 200, three named in
+     `registers_missing`, the countable figures still counted, the inspections route 503 in its own
+     words instead of "no such table", a report 503 not 500, the catalogue still listing 20 and
+     marking 5 unavailable.
+  3. **"DUE TODAY" IS THE PICKER'S OWN PREDICATE, COPIED ON PURPOSE.**
+     `checklists/run/page.tsx:333-343` decides what a member of staff is shown as due
+     (`next_due_date = '' OR <= today`, overdue when `< today`). The dashboard states the same rule
+     in SQL and names the source in a comment, because a dashboard promising a number of rounds the
+     screen staff actually open does not list is precisely the rival-helper disagreement this project
+     has already paid for once.
+  4. **INSPECTION MODE SPLITS ITS PAYLOAD, AND THAT IS HOW §7 Q11's RULE WAS KEPT.** "Nothing on
+     Inspection Mode may describe what the restaurant lacks." So `sections` is the handover (real
+     records, and an empty one says "No records for these dates" — about the DATES) and `prepare` is
+     management's readiness list, which is where every sentence about a gap lives. A section whose
+     register is absent is left OUT of the handover rather than shown empty, because an empty section
+     says the checks were not done. The probe asserts that no available handover section carries such
+     a sentence.
+  5. **THE HANDOVER NOTE DID NOT GET A NEW `entity_table`.** §16 wants the handover recorded.
+     `fssai_audit_log.entity_table` is enumerated by `FSSAI_RECORD_TABLES`, which is also the
+     allowlist a void route validates against, so inventing `fssai_inspection_mode` there would put a
+     row in the compliance trail naming a table that does not exist. It goes to the app-wide trail
+     (`audit_events`, `entity_type='fssai_inspection_mode'`) always, and to `fssai_audit_log` with
+     `entity_table='fssai_inspections'`, `action='handover'` only when it is linked to a real visit.
+     The probe asserts **zero** rows in `fssai_audit_log` outside the three real tables.
+  6. **A FINDING CANNOT RAISE A CORRECTIVE ACTION, and that was not bodged around.** The CA route's
+     own header says it is the only writer of that table and that none may be created by hand. So a
+     finding may be ATTACHED to one that exists (validated first; a dangling id is refused 400) and
+     the raise-from-finding path belongs to P7. §7 Q32, and in this lane's open problems.
+  7. **TWENTY REPORTS, on the `/api/hr/reports` contract** (COLUMNS + `run()`), one registry so
+     twenty files of twelve lines cannot drift. **No date default** (RECON §7.2 — the owner has
+     already read a silently-windowed report as his books being lost) and **voided rows included and
+     marked**, with `status=active` as the deliberate exclusion. CSV carries the BOM — and the probe
+     asserts the BYTES `ef bb bf`, because `Response.text()` performs a UTF-8 decode that STRIPS a
+     BOM, so checking it through `.text()` always looks broken and is how somebody "fixes" a BOM that
+     was never missing. The PDF reprints in full every cell its one-line fit cut (RECON §7.4's own
+     recommended workaround) and its path carries no `print` segment, which `proxy.ts:125` would make
+     public.
+  8. **MY OWN LINTER FOUND A REAL DEFECT IN MY OWN SCREEN, and it was fixed rather than suppressed.**
+     The reports page ran its report from an effect on `picked`, which has to list `run` among its
+     dependencies — and `run` changes with every filter, so it would have re-queried the server on
+     every keystroke in the search box. Picking now runs it in the handler with the key passed
+     through. That signature change then made `onClick={run}` pass the MouseEvent as the report key;
+     both call sites fixed.
+  9. **WHAT IS NOT PROVED, in the same words P2b and P3 use.** No browser rendered these four
+     screens. `next build` was deliberately not run (eight concurrent lanes; the brief reserves one
+     build for the verify wave) and a ninth `next dev` was deliberately not started (the
+     fleet-server-leak trap: 39 orphaned servers once took the load to 124 on 10 CPUs and every new
+     lane died with a misleading stall). To close as much of that gap as a harness can, the probe
+     asserts **every key the four screens read against a real response** — 71 dashboard paths plus 14
+     row and entry shapes, 0 missing — which is the one defect class `tsc` cannot catch, since a page
+     compiles happily against its own interface and reads `undefined` for ever.
+ 10. **AN OPERATIONAL ARTEFACT WORTH KNOWING.** One `tsc` run mid-way returned a single error in
+     `src/app/fssai/temperature/page.tsx` — a SIBLING lane's file, caught mid-write. Three runs
+     afterwards were exit 0 with zero output. **A lone tsc error in a file outside your footprint,
+     in this worktree, is more likely a concurrent lane's half-saved file than a break** — the same
+     shape as the `next build` lock noted on 2026-09-21. Re-run before acting on it, and never
+     "fix" another lane's file.
+
+
 ---
 
 ## 7. OPEN DECISIONS FOR THE OWNER
