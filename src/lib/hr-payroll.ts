@@ -45,9 +45,11 @@
  *    — including the weekly off. Until a weekly-off calendar exists, months
  *    must either carry attendance/leave rows for offs or the owner accepts
  *    the proration basis "paid days / calendar days".
- *  · STATUTORY CONFIGS: only state = '' (all-India) rows are selected in v1
- *    — employees carry no state data yet, so state-scoped rates cannot be
- *    resolved and are never applied (a later phase adds employee state).
+ *  · STATUTORY CONFIGS are scoped by the hr_org_state setting, which the
+ *    payroll route passes in as opts.state. All-India (state = '') rows always
+ *    qualify; a state-scoped row qualifies only when it equals that setting,
+ *    and then OUTRANKS the all-India row for its kind. Setting unset = '' =
+ *    all-India rates only, which is what this did before the setting existed.
  *  · Overtime minutes are summed and REPORTED, not paid — no overtime rate
  *    is defined anywhere yet.
  *  · The salary structure's own deductions_json (fixed structural
@@ -110,12 +112,18 @@ export type PayrollComputeResult = PayrollComputeSkip | PayrollComputeItem;
 /** Options for computePayrollItem. */
 export interface ComputePayrollOpts {
   /**
-   * RESERVED for a later phase — has NO effect in v1. The compute selects
-   * ONLY all-India rows (state = '') from hr_statutory_configs, because
-   * employees carry no state data yet: a state-scoped rate cannot be
-   * resolved honestly, so it is never applied. When employee state lands,
-   * this option scopes matching (rows with state = '' always qualify; rows
-   * with a specific state qualify only when it equals this value).
+   * The state statutory rates resolve against. The payroll route supplies it
+   * from the hr_org_state setting, reading it ONCE per run so a concurrent
+   * settings change cannot split one run across two rate sets.
+   *
+   * Rows with state = '' always qualify; a row with a specific state qualifies
+   * only when it equals this value, and then wins over the all-India row for
+   * its kind. Omitted or '' = all-India rates only — the behaviour before this
+   * option did anything, so an unconfigured install computes identical payroll.
+   *
+   * ORG-level, not per employee: hr_employees has no state column. If payroll
+   * ever spans states, change where the CALLER reads this from; the compute
+   * already takes state as a parameter and would not need to change.
    */
   state?: string;
 }
@@ -215,6 +223,28 @@ interface StatutoryConfigRow {
  * state match > state '' (rows with a non-matching category or state were
  * excluded before ranking), then effective_from DESC, created_at DESC.
  */
+/**
+ * Is this config row in scope for this employee and state? THE ONE eligibility
+ * test — resolveStatutoryConfigs selects with it and the payslip trace reports
+ * with it, so what was applied and what the trace claims was considered cannot
+ * drift apart. Until this was factored out, the SQL carried a second, stricter
+ * copy of the state half and the two disagreed silently.
+ *
+ * A row scoped to a state is eligible ONLY when it equals `state` exactly; an
+ * empty `state` scope therefore admits all-India rows alone. Matching is exact
+ * and case-sensitive on both sides, which is why the HR settings route offers
+ * the spellings already stored on config rows rather than a free-text box.
+ */
+function configInScope(
+  row: StatutoryConfigRow,
+  employeeCategory: string,
+  state: string,
+): boolean {
+  if (row.employee_category !== '' && row.employee_category !== employeeCategory) return false;
+  if (row.state !== '' && row.state !== state) return false;
+  return true;
+}
+
 function resolveStatutoryConfigs(
   candidates: StatutoryConfigRow[],
   employeeCategory: string,
@@ -222,8 +252,7 @@ function resolveStatutoryConfigs(
 ): Map<string, StatutoryConfigRow> {
   const byKind = new Map<string, StatutoryConfigRow[]>();
   for (const row of candidates) {
-    if (row.employee_category !== '' && row.employee_category !== employeeCategory) continue;
-    if (row.state !== '' && row.state !== state) continue;
+    if (!configInScope(row, employeeCategory, state)) continue;
     const list = byKind.get(row.kind) ?? [];
     list.push(row);
     byKind.set(row.kind, list);
@@ -278,8 +307,9 @@ function resolveStatutoryConfigs(
  *  4. Statutory deductions GENERICALLY from hr_statutory_configs
  *     (pf {percent_of_basic, wage_cap} · esi {percent_of_gross, gross_cap}
  *     · professional_tax {slabs:[{upto, amount}]}); absent config = 0.
- *     v1 selects ONLY state = '' (all-India) rows — employees carry no
- *     state data, so state-scoped rates are never applied (later phase).
+ *     Scoped by opts.state (the hr_org_state setting): all-India rows always
+ *     qualify, a state-scoped row only when it matches, and it then outranks
+ *     the all-India row for its kind. Unset = all-India rates only.
  *  5. Advance recovery consumes this period's due hr_advance_installments
  *     of DISBURSED advances only (recovery presupposes the money was paid
  *     out), greedily, never below net 0 — deferred ones stay due.
@@ -558,9 +588,23 @@ export function computePayrollItem(
 
   /* 4 ── statutory deductions, GENERICALLY from config rows. No config for a
    *      kind = zero deduction for that kind, never a built-in rate.
-   *      v1 selects ONLY state = '' (all-India) rows: employees carry no
-   *      state data yet, so a state-scoped rate cannot be resolved honestly
-   *      and is never applied (opts.state is reserved for that later phase). */
+   *
+   *      STATE SCOPING. This used to carry `AND state = ''`, so an Active,
+   *      in-effect, state-scoped row — and Professional Tax is a STATE levy, so
+   *      that is the realistic case — was dropped by the SQL while the Statutory
+   *      tab went on showing it as Active. It deducted nothing, said nothing,
+   *      and did not even appear in this payslip's frozen trace, because the
+   *      trace reports `candidates` and the filter had already removed it.
+   *
+   *      The clause is gone. SCOPE IS NOW DECIDED IN ONE PLACE — the eligibility
+   *      test in resolveStatutoryConfigs, which drops a row whose state is set
+   *      and does not equal `stateScope`, and ranks a state match above an
+   *      all-India row. Two filters that had to agree are now one.
+   *
+   *      stateScope comes from the hr_org_state setting via the payroll route.
+   *      WHEN IT IS '' THIS CHANGES NOTHING: the eligibility test excludes every
+   *      state-scoped row on an empty scope, which is exactly what the deleted
+   *      SQL clause did. An unconfigured install computes identical payroll. */
   const stateScope = String(opts?.state ?? '').trim();
   const candidates = db
     .prepare(
@@ -568,7 +612,6 @@ export function computePayrollItem(
               config_json, created_at
        FROM hr_statutory_configs
        WHERE is_active = 1
-         AND state = ''
          AND effective_from <= ?
          AND (effective_to = '' OR effective_to >= ?)`,
     )
@@ -798,12 +841,30 @@ export function computePayrollItem(
       earnings,
     },
     statutory: {
+      // The RAW scope beside the prose. finalize compares this against the live
+      // hr_org_state to detect "the setting changed after this was computed", and
+      // parsing it back out of an English sentence would be absurd and fragile.
+      state_scope_value: stateScope,
       state_scope:
         (stateScope || '(none)') +
-        ' — v1 selects only all-India (state = \'\') config rows; employees carry no state data, so state-scoped rates need employee state data, a later phase.',
+        (stateScope
+          ? ' — from the hr_org_state setting. State-scoped config rows for this state apply and outrank all-India rows; rows for any other state do not.'
+          : ' — hr_org_state is not set, so only all-India (state = \'\') rates apply. Any state-scoped config row is listed below with in_scope: false.'),
+      // EVERY candidate, in scope or not, each carrying WHY. This used to report
+      // an already state-filtered list, so a skipped Telangana row left no trace
+      // at all and a payslip could not be told apart from one where no such
+      // config existed. in_scope is computed with configInScope — the same test
+      // that selected the applied rows — so this cannot drift from reality.
       configs_considered: candidates.map((c) => ({
         id: c.id, kind: c.kind, state: c.state, employee_category: c.employee_category,
         effective_from: c.effective_from, effective_to: c.effective_to,
+        in_scope: configInScope(c, employee.employee_category, stateScope),
+        excluded_because:
+          configInScope(c, employee.employee_category, stateScope)
+            ? ''
+            : c.state !== '' && c.state !== stateScope
+              ? `state '${c.state}' does not match the payroll state '${stateScope || '(not set)'}'`
+              : `employee category '${c.employee_category}' does not match '${employee.employee_category}'`,
       })),
       applied: statutoryTrace,
       total: statutoryTotal,
@@ -834,6 +895,108 @@ export function computePayrollItem(
     detail_json: JSON.stringify(detail),
     advance_installments: appliedInstallments,
   };
+}
+
+/* ------------------------------------------------------------------ *
+ * statutoryDriftSinceCompute
+ * ------------------------------------------------------------------ */
+
+/** What changed between compute and finalize. Empty array = nothing changed. */
+export interface StatutoryDrift {
+  kind: 'state_scope' | 'configs';
+  message: string;
+}
+
+/**
+ * Did the statutory INPUTS move after these payslips were computed? (Owner's
+ * call 2B, 2026-10-06: warn and require an explicit acknowledgement — do not
+ * refuse outright, and do not silently recompute figures he has already
+ * reviewed.)
+ *
+ * THE SEQUENCE THIS EXISTS FOR, which is the LIKELY one, not a corner case:
+ * compute September while hr_org_state is blank, so Professional Tax lands at
+ * zero; notice it; set the state to Telangana; come back and press Finalize on
+ * the draft that is already computed. Today that freezes PT at ZERO forever,
+ * with no refusal, no warning and no staleness marker anywhere — the exact
+ * silent zero the state setting was added to end.
+ *
+ * finalizeRunGuard cannot catch it: it checks only that the run is a draft and
+ * has items. The existing 409 on finalize guards ADVANCE INSTALLMENTS, nothing
+ * statutory.
+ *
+ * NO SCHEMA CHANGE. Each frozen item already carries, in detail_json, the scope
+ * it was computed under (statutory.state_scope_value) and every config row it
+ * considered (statutory.configs_considered[].id). Comparing those against the
+ * live settings and the live candidate set answers the question exactly, from
+ * data the compute already wrote down. A fingerprint column would have to be
+ * added, migrated and kept in step; this cannot drift because it IS the trace.
+ *
+ * Read-only and synchronous — safe inside the route's db.transaction().
+ */
+export function statutoryDriftSinceCompute(
+  db: Database.Database,
+  runId: string,
+  period: string,
+  currentStateScope: string,
+): StatutoryDrift[] {
+  const drift: StatutoryDrift[] = [];
+  const bounds = payrollPeriodBounds(period);
+  if (!bounds) return drift;
+
+  const rows = db
+    .prepare(`SELECT detail_json FROM hr_payroll_items WHERE run_id = ?`)
+    .all(runId) as Array<{ detail_json: string }>;
+  if (rows.length === 0) return drift;
+
+  // The scope every item was computed under. All items in one run share it (the
+  // route reads hr_org_state ONCE above the loop), so the first parseable trace
+  // is the run's scope; a mixed set would itself be drift worth reporting.
+  const scopes = new Set<string>();
+  const consideredIds = new Set<string>();
+  for (const r of rows) {
+    const t = parseJson(r.detail_json) as any;
+    const st = t?.statutory;
+    if (!st) continue;
+    if (typeof st.state_scope_value === 'string') scopes.add(st.state_scope_value);
+    for (const c of (Array.isArray(st.configs_considered) ? st.configs_considered : [])) {
+      if (c && typeof c.id === 'string') consideredIds.add(c.id);
+    }
+  }
+
+  if (scopes.size > 0 && !scopes.has(currentStateScope)) {
+    const was = [...scopes].map((s) => s || '(none)').join(', ');
+    drift.push({
+      kind: 'state_scope',
+      message:
+        `Payroll state is now "${currentStateScope || '(none)'}" but these payslips were computed ` +
+        `under "${was}". Statutory rates scoped to a state resolve differently — recompute to pick ` +
+        `them up, or finalize as-is to freeze the figures you already reviewed.`,
+    });
+  }
+
+  // The candidate set the compute WOULD see today, by the same rule it used.
+  const nowIds = new Set(
+    (db
+      .prepare(
+        `SELECT id FROM hr_statutory_configs
+          WHERE is_active = 1 AND effective_from <= ? AND (effective_to = '' OR effective_to >= ?)`,
+      )
+      .all(bounds.end, bounds.start) as Array<{ id: string }>).map((r) => r.id),
+  );
+  const added = [...nowIds].filter((id) => !consideredIds.has(id));
+  const removed = [...consideredIds].filter((id) => !nowIds.has(id));
+  if (added.length || removed.length) {
+    const bits: string[] = [];
+    if (added.length) bits.push(`${added.length} new or re-activated`);
+    if (removed.length) bits.push(`${removed.length} ended or deactivated`);
+    drift.push({
+      kind: 'configs',
+      message:
+        `Statutory rate configuration changed since these payslips were computed ` +
+        `(${bits.join(', ')}). Recompute to apply the current rates, or finalize as-is.`,
+    });
+  }
+  return drift;
 }
 
 /* ------------------------------------------------------------------ *

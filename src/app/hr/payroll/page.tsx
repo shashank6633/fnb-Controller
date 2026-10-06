@@ -755,6 +755,90 @@ export default function HrPayrollPage() {
   const [endTarget, setEndTarget] = useState<HrStatutoryConfig | null>(null);
   const [endDate, setEndDate] = useState('');
 
+  /** The state payroll resolves statutory rates in (hr_org_state). A row scoped
+   *  to any OTHER state is stored, listed and Active — and deducts nothing. The
+   *  tab showed no sign of that, which is how a Telangana PT row could sit here
+   *  looking correct while every payslip ignored it. Loaded once with the tab. */
+  const [orgState, setOrgState] = useState<string | null>(null);
+  useEffect(() => {
+    let alive = true;
+    fetch('/api/hr/settings')
+      .then(async (r) => {
+        // CHECK res.ok. Every error body from this route is still valid JSON —
+        // 401 'Sign in required', 403, 500 'Failed to load HR settings', and the
+        // proxy's own 401 — so `r.json()` succeeds and `d?.settings?.hr_org_state
+        // ?? ''` quietly yields '' instead of null. The UI would then assert
+        // "payroll runs in no state, this rate is NOT applied" on the strength of
+        // an error response. null means UNKNOWN and the badges stay silent.
+        if (!r.ok) return null;
+        const d = await r.json().catch(() => null);
+        return d && d.settings ? String(d.settings.hr_org_state ?? '') : null;
+      })
+      .then((v) => { if (alive) setOrgState(v); })
+      .catch(() => { if (alive) setOrgState(null); });   // null = unknown, never guess
+    return () => { alive = false; };
+  }, []);
+
+  /**
+   * Is this row's STATE a mismatch for the payroll state? That is the ONLY thing
+   * a single row can tell you, and the badge must claim nothing more.
+   *
+   * WHY NOT "will it be applied". Eligibility is category AND state
+   * (configInScope), but WINNING is a ranking against every other row of the same
+   * kind — and resolveStatutoryConfigs sorts employee_category specificity ABOVE
+   * state specificity. So an all-India row scoped to a category BEATS a
+   * state-scoped row that matches perfectly. Measured: with hr_org_state
+   * 'Telangana', a PT row (state='', category='manager', flat 99) beat a PT row
+   * (state='Telangana', slabs -> 150) and payroll deducted 99.
+   *
+   * An earlier version of this function was named configApplies() and returned
+   * true for a matching state, so the absence of a badge implied "this applies" —
+   * the exact look-active-deduct-nothing claim this whole change exists to end,
+   * rebuilt inside the fix for it. A false reassurance is worse than silence.
+   *
+   * Returns null while the setting is unknown (not loaded, or the fetch above
+   * failed), so the UI says nothing rather than guessing.
+   */
+  const configStateMismatch = (rowState: string): boolean | null => {
+    if (orgState === null) return null;   // unknown — assert nothing
+    if (!rowState) return false;          // all-India: never a state mismatch
+    return rowState !== orgState;
+  };
+
+  /**
+   * Is this state-scoped row OVERRIDING a NEWER all-India rate of the same kind?
+   * (Owner's call 1A, 2026-10-06: leave the ranking alone, make the conflict
+   * visible.)
+   *
+   * resolveStatutoryConfigs sorts state specificity ABOVE effective_from, so a
+   * Telangana PF row dated 2023 beats an all-India PF row dated 2026 — the newest
+   * rate loses to a stale state override. On a 15,000 wage cap that is 10% vs
+   * 13%: 450 rupees a month short per employee, and a PF shortfall attracts
+   * interest and penalty. The owner chose NOT to reorder the ranking (that would
+   * also make a newer all-India PT beat a Telangana PT, which is wrong the other
+   * way) and instead to SEE the stale row and end-date it himself.
+   *
+   * BEST EFFORT, AND IT SAYS SO. This compares only the rows currently loaded in
+   * the tab, which is one page of a paginated list — so it can MISS a conflict,
+   * and must never be read as "no conflicts exist". It never produces a false
+   * positive, which is the direction that matters: a flag here is always a real
+   * pair worth looking at.
+   */
+  const newerAllIndiaRate = (row: HrStatutoryConfig): HrStatutoryConfig | null => {
+    if (!row.state) return null;                       // only state rows override
+    if (configStateMismatch(row.state) !== false) return null;  // only ones in play
+    let newest: HrStatutoryConfig | null = null;
+    for (const other of statRows) {
+      if (other.id === row.id) continue;
+      if (other.kind !== row.kind) continue;
+      if (other.state !== '') continue;                // the all-India sibling
+      if (!other.is_active) continue;
+      if (String(other.effective_from) <= String(row.effective_from)) continue;
+      if (!newest || String(other.effective_from) > String(newest.effective_from)) newest = other;
+    }
+    return newest;
+  };
+
   useEffect(() => { setStatPage(1); }, [statKind, statInactive]);
 
   const fetchStatutory = useCallback(async () => {
@@ -1394,7 +1478,38 @@ export default function HrPayrollPage() {
                                   <span className="font-medium">{meta.label}</span>
                                   {!meta.applied && <div className="text-[10px] text-[#8B7355]">recorded only (v1)</div>}
                                 </td>
-                                <td className="py-2 px-3 text-xs">{c.state || <span className="text-[#8B7355]">All India</span>}</td>
+                                <td className="py-2 px-3 text-xs">
+                                  {c.state || <span className="text-[#8B7355]">All India</span>}
+                                  {/* A state-scoped row whose state does not match the
+                                      payroll state can NEVER be applied — that much a single
+                                      row does prove, and the green Active badge beside it
+                                      cannot say it. The inverse is NOT claimed: a matching
+                                      state still has to win its kind's ranking, where
+                                      employee_category specificity outranks state. */}
+                                  {configStateMismatch(c.state) === true && (
+                                    <span
+                                      className="ml-1.5 text-[9px] bg-amber-100 text-amber-800 px-1.5 py-0.5 rounded-full font-medium align-middle"
+                                      title={`Payroll runs in ${orgState ? `“${orgState}”` : '(no payroll state set)'}, so this ${c.state} rate is NOT applied to any payslip. Set the payroll state in HR Settings — and match the spelling exactly, the comparison is case-sensitive.`}
+                                    >
+                                      other state — not applied
+                                    </span>
+                                  )}
+                                  {/* 1A: this state row WINS over a newer all-India rate,
+                                      because state specificity outranks effective_from. The
+                                      owner chose to see it rather than reorder the ranking. */}
+                                  {(() => {
+                                    const newer = newerAllIndiaRate(c);
+                                    if (!newer) return null;
+                                    return (
+                                      <span
+                                        className="ml-1.5 text-[9px] bg-rose-100 text-rose-800 px-1.5 py-0.5 rounded-full font-medium align-middle"
+                                        title={`This ${c.state} rate (from ${fmtISTDate(c.effective_from)}) OVERRIDES a newer all-India ${c.kind} rate that starts ${fmtISTDate(newer.effective_from)} — state-specific rows outrank later start dates. If the newer all-India rate is the one that should apply, end-date this ${c.state} row.`}
+                                      >
+                                        overrides a newer all-India rate
+                                      </span>
+                                    );
+                                  })()}
+                                </td>
                                 <td className="py-2 px-3 text-xs">{c.employee_category || <span className="text-[#8B7355]">All</span>}</td>
                                 <td className="py-2 px-3 text-xs whitespace-nowrap">{fmtISTDate(c.effective_from)}</td>
                                 <td className="py-2 px-3 text-xs whitespace-nowrap">{c.effective_to ? fmtISTDate(c.effective_to) : <span className="text-[#8B7355]">open</span>}</td>
@@ -1612,6 +1727,26 @@ export default function HrPayrollPage() {
                 <label className="text-xs text-[#6B5744]">State</label>
                 <input value={statForm.state} onChange={(e) => setStatForm({ ...statForm, state: e.target.value })}
                        placeholder="Blank = all India" className={inputCls} />
+                {/* The comparison against the payroll state is EXACT and
+                    case-sensitive on BOTH sides — 'telangana' here against a
+                    'Telangana' there silently deducts nothing, which is the
+                    failure this whole change exists to end. Say so at the
+                    moment of typing, not in a trace nobody opens. */}
+                {statForm.state.trim() !== '' && orgState !== null && (
+                  statForm.state.trim() === orgState ? (
+                    <p className="mt-1 text-[11px] text-emerald-700">
+                      Matches the payroll state — this rate will be applied, and it overrides any
+                      all-India rate of the same kind.
+                    </p>
+                  ) : (
+                    <p className="mt-1 text-[11px] text-amber-700">
+                      Payroll runs in {orgState ? <b>{orgState}</b> : <b>no state yet</b>}, so a rate
+                      scoped to “{statForm.state.trim()}” will be saved and shown Active but
+                      {' '}<b>never applied</b>. Matching is exact and case-sensitive — correct the
+                      spelling here, or set the payroll state in HR Settings.
+                    </p>
+                  )
+                )}
               </div>
               <div>
                 <label className="text-xs text-[#6B5744]">Employee category</label>
@@ -1666,6 +1801,18 @@ export default function HrPayrollPage() {
               {endTarget.state ? <> in <b>{endTarget.state}</b></> : ' (all India)'}.
               Set the last day this config applies, or clear the date to reopen it.
             </p>
+            {/* This sentence used to assert, flatly, that a state-scoped row was
+                in force in its state — the one place the UI mentioned a row's
+                state in prose, and it said the opposite of what payroll did.
+                Dating a row that was never applied changes nothing, and the
+                admin should know that before doing it. */}
+            {configStateMismatch(endTarget.state) === true && (
+              <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+                Payroll currently runs in {orgState ? <b>{orgState}</b> : <b>no state</b>}, so this
+                {' '}<b>{endTarget.state}</b> rate is <b>not being applied</b> to any payslip. Ending
+                it will not change a single payroll figure.
+              </p>
+            )}
             <div>
               <label className="text-xs text-[#6B5744]">Effective to (blank = open)</label>
               <input type="date" value={endDate} onChange={(e) => setEndDate(e.target.value)} className={inputCls} />

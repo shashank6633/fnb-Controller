@@ -237,6 +237,27 @@ export function getHrPunchDebounceMin(db: Database.Database): number {
   return Number.isFinite(n) && n > 0 ? n : DEFAULT_DEBOUNCE_MIN;
 }
 
+/** hr_org_state — the state this organisation pays payroll in, e.g. 'Telangana'.
+ *  DEFAULT '' AND THAT IS THE SAFE VALUE: payroll passes this as opts.state, and
+ *  resolveStatutoryConfigs drops every state-scoped config row when the scope is
+ *  empty. So until an admin fills this in, only all-India (state = '') rates
+ *  apply — exactly the behaviour that shipped before this setting existed.
+ *
+ *  WHY AN ORG SETTING AND NOT AN EMPLOYEE COLUMN. Professional Tax is a state
+ *  levy, so a state has to come from somewhere, and hr_employees has no state
+ *  column — the "a later phase adds employee state" note in hr-payroll.ts was
+ *  never built. AKAN operates in one state, so one org-level value resolves it
+ *  for everyone. If the business ever runs payroll across states, this is the
+ *  value to replace with a per-employee field; the payroll side already takes
+ *  state as a parameter, so only the source would change.
+ *
+ *  Free text, trimmed, matched EXACTLY (case-sensitively) against
+ *  hr_statutory_configs.state, which is itself a free-text admin input. The
+ *  settings route offers the configured spellings so the two cannot drift. */
+export function getHrOrgState(db: Database.Database): string {
+  return String(readSetting(db, 'hr_org_state') ?? '').trim();
+}
+
 /** The business date RIGHT NOW (reads hr_day_cutoff, default '04:00').
  *  This is the default `date` of GET /api/hr/attendance and the boundary
  *  recomputeDay uses to decide whether a day is closed. */

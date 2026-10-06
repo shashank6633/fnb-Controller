@@ -555,6 +555,14 @@ export default function HrSettingsPage() {
 function AttendanceEngineCard() {
   const [cutoff, setCutoff] = useState('');
   const [debounce, setDebounce] = useState('');
+  /** hr_org_state — the state payroll resolves statutory rates in. '' is a real
+   *  value, not "unset": it means all-India rates only, which is what payroll
+   *  did before this field existed. */
+  const [orgState, setOrgState] = useState('');
+  /** The state spellings already stored on statutory config rows, offered as a
+   *  datalist. Both sides of the match are free text compared exactly, so
+   *  retyping is how a silent zero-deduction gets introduced. */
+  const [configuredStates, setConfiguredStates] = useState<string[]>([]);
   const [loaded, setLoaded] = useState(false);
   const [loadFailed, setLoadFailed] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -573,6 +581,8 @@ function AttendanceEngineCard() {
         }
         setCutoff(String(j.settings.hr_day_cutoff || '04:00'));
         setDebounce(String(j.settings.hr_punch_debounce_min ?? 3));
+        setOrgState(String(j.settings.hr_org_state ?? ''));
+        setConfiguredStates(Array.isArray(j.configured_states) ? j.configured_states : []);
         setLoaded(true);
       } catch {
         setLoadFailed(true);
@@ -587,7 +597,10 @@ function AttendanceEngineCard() {
     try {
       const r = await api('/api/hr/settings', {
         method: 'PUT',
-        body: { hr_day_cutoff: cutoff, hr_punch_debounce_min: debounce },
+        // THIS BODY IS AN ALLOWLIST. A field not named here is never sent, the
+        // route's `!== undefined` guard skips it, and the setting silently keeps
+        // its old value — the box looks saved and changes nothing.
+        body: { hr_day_cutoff: cutoff, hr_punch_debounce_min: debounce, hr_org_state: orgState },
       });
       const j = await r.json().catch(() => null);
       if (!r.ok) {
@@ -601,6 +614,7 @@ function AttendanceEngineCard() {
       if (j?.settings) {
         setCutoff(String(j.settings.hr_day_cutoff));
         setDebounce(String(j.settings.hr_punch_debounce_min));
+        setOrgState(String(j.settings.hr_org_state ?? ''));
       }
       setSaved(true);
     } catch {
@@ -652,6 +666,42 @@ function AttendanceEngineCard() {
                 className="w-full px-2 py-1.5 border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] text-sm"
               />
               <p className="text-[10px] text-[#8B7355] mt-1">Repeat punches inside this window are duplicates.</p>
+            </div>
+            {/* PAYROLL STATE. Professional Tax is a state levy, so a statutory
+                rate can be scoped to a state — and until this field existed
+                payroll had no state to compare against, so every such rate was
+                stored, shown Active, and deducted nothing. Blank keeps exactly
+                that behaviour (all-India rates only); it is a valid choice, not
+                a half-finished one. */}
+            <div className="md:col-span-2">
+              <label className="text-xs text-[#6B5744]">Payroll state (for statutory rates)</label>
+              <input
+                list="hr-org-state-options"
+                value={orgState}
+                onChange={(e) => setOrgState(e.target.value)}
+                placeholder="Blank = all-India rates only"
+                className="w-full px-2 py-1.5 border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] text-sm"
+              />
+              <datalist id="hr-org-state-options">
+                {configuredStates.map((s) => <option key={s} value={s} />)}
+              </datalist>
+              <p className="text-[10px] text-[#8B7355] mt-1">
+                The state payroll resolves statutory rates in — e.g. <b>Telangana</b>. A rate scoped
+                to this state is applied and overrides the all-India rate of the same kind; rates for
+                any other state are ignored. Matching is <b>exact and case-sensitive</b>, so pick from
+                the list where you can.
+                {configuredStates.length > 0 && (
+                  <> States already used on statutory rates: <b>{configuredStates.join(', ')}</b>.</>
+                )}
+              </p>
+              {orgState.trim() !== '' && configuredStates.length > 0
+                && !configuredStates.includes(orgState.trim()) && (
+                <p className="text-[10px] text-amber-700 mt-1">
+                  No statutory rate is scoped to “{orgState.trim()}”. That is fine if you have not
+                  added one yet — but if you meant an existing rate, check the spelling against the
+                  list above.
+                </p>
+              )}
             </div>
           </div>
           {err && (

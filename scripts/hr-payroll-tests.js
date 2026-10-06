@@ -1,0 +1,381 @@
+#!/usr/bin/env node
+/**
+ * HR PAYROLL — STATUTORY STATE SCOPING
+ * ====================================
+ *
+ * The first automated tests this module has ever had. Payroll computes real
+ * salaries and real statutory deductions, and until now nothing in scripts/
+ * referenced hr_ tables, computePayrollItem, or the word payroll.
+ *
+ * WHAT THEY GUARD. Professional Tax is a STATE levy. hr_statutory_configs.state
+ * exists and the Statutory tab lets an admin fill it in, but the payroll compute
+ * carried `AND state = ''` in its SQL *and* the only caller passed no opts, so a
+ * Telangana PT row was Active in the UI, in effect by date, and deducted ZERO —
+ * silently, with no trace that it had been skipped. Two independent filters had
+ * to be removed for it to work, and exactly one of them being removed must not
+ * quietly change anybody's pay.
+ *
+ * THE TEST THAT MATTERS MOST IS [1]: with hr_org_state unset, a state-scoped row
+ * must STILL be ignored. That is the proof this change is a no-op on every
+ * install that has not opted in, which is every install today.
+ *
+ * Harness is lifted from run-tests.js: a VACUUM INTO snapshot of the live DB in
+ * a temp dir, the TypeScript loader, and a SAVEPOINT per test so fixtures never
+ * accumulate. It NEVER writes to the real database — see assertSandboxed().
+ *
+ * NOTE ON SQL CONSTRUCTION: no statement here is built by interpolation. The
+ * snapshot path is a BOUND parameter to `VACUUM INTO ?`, and the savepoint name
+ * is a module constant, so there is no dynamic SQL anywhere in this file.
+ *
+ * Run: node scripts/hr-payroll-tests.js [--keep]
+ */
+
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const Database = require('better-sqlite3');
+
+const REPO = path.resolve(__dirname, '..');
+const LIVE_DB = path.join(REPO, 'fnb-controller.db');
+const SRC = path.join(REPO, 'src');
+const KEEP = process.argv.includes('--keep');
+
+if (!fs.existsSync(LIVE_DB)) {
+  console.error(`hr-payroll-tests: ${LIVE_DB} not found — nothing to snapshot.`);
+  process.exit(2);
+}
+
+const TMP = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'fnb-hrpay-')));
+const SNAP = path.join(TMP, 'fnb-controller.db');
+{
+  // readonly is the belt; VACUUM INTO is the braces — unlike a byte copy it
+  // folds the WAL in, so the image is consistent even mid-write. The path is
+  // BOUND, never interpolated.
+  const src = new Database(LIVE_DB, { readonly: true });
+  src.prepare('VACUUM INTO ?').run(SNAP);
+  src.close();
+}
+process.chdir(TMP);
+
+/* ── TypeScript loader ─────────────────────────────────────────────────────── */
+const ts = require(path.join(REPO, 'node_modules', 'typescript'));
+const Module = require('module');
+const origResolve = Module._resolveFilename;
+Module._resolveFilename = function (request, ...rest) {
+  if (typeof request === 'string' && request.startsWith('@/')) {
+    request = path.join(SRC, request.slice(2));
+  }
+  return origResolve.call(this, request, ...rest);
+};
+require.extensions['.ts'] = function (module, filename) {
+  const out = ts.transpileModule(fs.readFileSync(filename, 'utf8'), {
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2020,
+      esModuleInterop: true,
+    },
+    fileName: filename,
+  });
+  module._compile(out.outputText, filename);
+};
+const lib = (rel) => require(path.join(SRC, 'lib', rel));
+
+const dbMod = lib('db.ts');
+const { computePayrollItem } = lib('hr-payroll.ts');
+const { getHrOrgState } = lib('hr-attendance.ts');
+const db = dbMod.getDb();
+
+function assertSandboxed() {
+  const open = path.resolve(db.name || '');
+  if (path.resolve(LIVE_DB) === open || !open.startsWith(path.resolve(TMP))) {
+    console.error(`\nFATAL: tests opened ${open}, not the snapshot in ${TMP}. Aborting.`);
+    process.exit(3);
+  }
+}
+assertSandboxed();
+
+/* ── harness ───────────────────────────────────────────────────────────────── */
+let pass = 0, fail = 0;
+const failures = [];
+function ok(l) { pass++; console.log(`  ✓ ${l}`); }
+function bad(l, d) { fail++; failures.push(l); console.log(`  ✗ ${l}`); if (d) console.log(`      ${d}`); }
+function expect(a, e, l) {
+  if (Number(a) === Number(e)) ok(`${l} — ${a}`);
+  else bad(l, `expected ${e}, got ${a}`);
+}
+function expectTrue(c, l, h) { c ? ok(l) : bad(l, h); }
+function section(n, t) { console.log(`\n[${n}] ${t}`); }
+
+// Constant savepoint name — tests never nest, so nothing needs to be generated.
+const SP_BEGIN = 'SAVEPOINT hrpay_t';
+const SP_UNDO = 'ROLLBACK TO SAVEPOINT hrpay_t';
+const SP_DONE = 'RELEASE SAVEPOINT hrpay_t';
+/**
+ * HERMETIC ISOLATION. The snapshot is a copy of the LIVE database, so it carries
+ * whatever statutory configs the owner has already created — and
+ * resolveStatutoryConfigs ranks effective_from DESC above created_at, so a real
+ * row dated after the fixtures' hardcoded '2020-01-01' WINS and the assertion
+ * fails. Measured: 10 of 26 assertions go red on exactly the install where the
+ * bug was found, the flagship no-op test among them. A suite that only passes on
+ * an empty database proves nothing about the one that matters.
+ *
+ * Deactivating inside the savepoint neutralises pre-existing rows for the test
+ * and is rolled back with everything else, so the snapshot is never altered.
+ */
+function test(name, fn) {
+  db.prepare(SP_BEGIN).run();
+  db.prepare('UPDATE hr_statutory_configs SET is_active = 0').run();
+  try { fn(); }
+  catch (e) { bad(`${name} — threw`, String((e && e.stack) || e)); }
+  finally {
+    try { db.prepare(SP_UNDO).run(); db.prepare(SP_DONE).run(); }
+    catch (e) { bad(`${name} — savepoint unwind failed`, String(e)); }
+  }
+}
+const uid = () => 'hrtest-' + Math.random().toString(36).slice(2, 12);
+
+/* ── fixtures ──────────────────────────────────────────────────────────────── */
+
+const PERIOD = '2026-09';          // 30 days
+const DAYS = 30;
+const GROSS = 20000;               // basic 20000, no HRA/allowances
+
+/** An employee who worked EVERY day of PERIOD, so earned gross == full gross
+ *  and a PT slab match is deterministic. Without attendance rows presentDays is
+ *  0, earned gross is 0, and every slab test would pass for the wrong reason. */
+function mkEmployee(category = 'staff') {
+  const id = uid();
+  db.prepare(
+    `INSERT INTO hr_employees (id, employee_code, full_name, employee_category, status)
+     VALUES (?, ?, ?, ?, 'active')`,
+  ).run(id, 'EMP-' + id.slice(-5), 'Test Employee', category);
+  db.prepare(
+    `INSERT INTO hr_salary_structures
+       (id, employee_id, effective_from, effective_to, basic, hra, allowances_json,
+        gross, deductions_json, net, created_at)
+     VALUES (?, ?, '2020-01-01', '', ?, 0, '{}', ?, '{}', ?, datetime('now'))`,
+  ).run(uid(), id, GROSS, GROSS, GROSS);
+  const att = db.prepare(
+    `INSERT INTO hr_attendance (id, employee_id, outlet_id, date, status)
+     VALUES (?, ?, '', ?, 'PRESENT')`,
+  );
+  for (let d = 1; d <= DAYS; d++) {
+    att.run(uid(), id, `${PERIOD}-${String(d).padStart(2, '0')}`);
+  }
+  return id;
+}
+
+/** A statutory config row exactly as the Statutory tab would store one. */
+function mkConfig(kind, state, configJson, category = '') {
+  const id = uid();
+  db.prepare(
+    `INSERT INTO hr_statutory_configs
+       (id, kind, state, employee_category, effective_from, effective_to, config_json, is_active)
+     VALUES (?, ?, ?, ?, '2020-01-01', '', ?, 1)`,
+  ).run(id, kind, state, category, JSON.stringify(configJson));
+  return id;
+}
+
+/** Telangana-shaped PT: nil to 15k, 150 to 20k, 200 above. GROSS=20000 → 150. */
+const TG_SLABS = { slabs: [{ upto: 15000, amount: 0 }, { upto: 20000, amount: 150 }, { upto: 0, amount: 200 }] };
+/** A deliberately distinct all-India amount so precedence is unambiguous. */
+const ALL_INDIA_SLABS = { slabs: [{ upto: 0, amount: 99 }] };
+
+function run(empId, state) {
+  const r = computePayrollItem(db, empId, PERIOD, state === undefined ? undefined : { state });
+  if (r.skip) throw new Error('compute skipped: ' + r.reason);
+  return r;
+}
+const ptOf = (r) => {
+  const line = JSON.parse(r.deductions_json).find((d) => d.label === 'Professional Tax');
+  return line ? line.amount : 0;
+};
+const traceOf = (r) => JSON.parse(r.detail_json);
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * TESTS
+ * ══════════════════════════════════════════════════════════════════════════*/
+
+console.log('\nHR PAYROLL — statutory state scoping');
+console.log(`snapshot: ${SNAP}`);
+
+section(1, 'NO-OP PROOF — an unset payroll state must behave exactly as before');
+test('state-scoped row ignored when hr_org_state is unset', () => {
+  const emp = mkEmployee();
+  mkConfig('professional_tax', 'Telangana', TG_SLABS);
+  const r = run(emp, '');
+  expect(ptOf(r), 0, 'PT is NOT deducted with an empty state scope');
+  expect(r.gross, GROSS, 'gross is the full month (attendance seeded)');
+  expect(r.net, GROSS, 'net equals gross — no deduction of any kind');
+});
+test('omitting opts entirely behaves identically to state: ""', () => {
+  const emp = mkEmployee();
+  mkConfig('professional_tax', 'Telangana', TG_SLABS);
+  expect(ptOf(run(emp, undefined)), 0, 'PT not deducted when the caller passes no opts');
+});
+test('getHrOrgState defaults to empty on a fresh install', () => {
+  db.prepare(`DELETE FROM settings WHERE key = 'hr_org_state'`).run();
+  expectTrue(getHrOrgState(db) === '', 'unset hr_org_state reads as ""');
+});
+test('getHrOrgState actually READS the stored value', () => {
+  // The default-empty test above passes just as happily against a getter
+  // sabotaged to `return ''`, which is why that sabotage killed zero tests.
+  // Assert the READ, not only the default.
+  db.prepare(`INSERT OR REPLACE INTO settings (key, value) VALUES ('hr_org_state', 'Telangana')`).run();
+  expectTrue(getHrOrgState(db) === 'Telangana', 'a stored state reads back');
+  db.prepare(`INSERT OR REPLACE INTO settings (key, value) VALUES ('hr_org_state', '  Kerala  ')`).run();
+  expectTrue(getHrOrgState(db) === 'Kerala', 'and is trimmed');
+});
+test('the settings route PERSISTS hr_org_state', () => {
+  // The opt-in is dead end-to-end if PUT never writes the key — and that
+  // sabotage also killed zero tests. The route is an auth-gated Next handler,
+  // so assert on its SOURCE; a static check is weaker than execution and is
+  // labelled as such, but it is far better than nothing.
+  const src = fs.readFileSync(path.join(SRC, 'app', 'api', 'hr', 'settings', 'route.ts'), 'utf8')
+    .replace(/\n\s*/g, ' ');
+  expectTrue(/upsert\.run\(\s*'hr_org_state'/.test(src),
+    'PUT /api/hr/settings writes hr_org_state',
+    'Without this the owner can tick the setting and it never persists.');
+  expectTrue(/hr_org_state:\s*getHrOrgState\s*\(\s*db\s*\)/.test(src),
+    'GET /api/hr/settings returns hr_org_state');
+  expectTrue(/hr_org_state/.test(src.split('const after')[1] || ''),
+    'the PUT response echoes hr_org_state back');
+});
+
+section(2, 'THE FIX — a matching state-scoped row is applied');
+test('Telangana PT applies when hr_org_state is Telangana', () => {
+  const emp = mkEmployee();
+  mkConfig('professional_tax', 'Telangana', TG_SLABS);
+  const r = run(emp, 'Telangana');
+  expect(ptOf(r), 150, 'PT deducted at the 20,000 slab');
+  expect(r.net, GROSS - 150, 'net is reduced by exactly the PT');
+});
+test('the slab is matched on gross, not guessed', () => {
+  const emp = mkEmployee();
+  mkConfig('professional_tax', 'Telangana',
+    { slabs: [{ upto: 15000, amount: 0 }, { upto: 19999, amount: 150 }, { upto: 0, amount: 200 }] });
+  expect(ptOf(run(emp, 'Telangana')), 200, 'gross 20,000 falls to the unbounded top slab');
+});
+test('PT is NOT prorated — it is a per-month levy', () => {
+  const emp = mkEmployee();
+  // Halve the month's attendance: earned gross halves, the slab amount does not.
+  db.prepare(`DELETE FROM hr_attendance WHERE employee_id = ? AND date > ?`).run(emp, `${PERIOD}-15`);
+  mkConfig('professional_tax', 'Telangana', { slabs: [{ upto: 0, amount: 200 }] });
+  const r = run(emp, 'Telangana');
+  expect(ptOf(r), 200, 'flat 200 even on a part-worked month');
+  expectTrue(r.gross < GROSS, 'gross really did prorate', `gross was ${r.gross}`);
+});
+
+section(3, 'PRECEDENCE — a state row outranks an all-India row for the same kind');
+test('Telangana beats all-India when the scope matches', () => {
+  const emp = mkEmployee();
+  mkConfig('professional_tax', '', ALL_INDIA_SLABS);
+  mkConfig('professional_tax', 'Telangana', TG_SLABS);
+  expect(ptOf(run(emp, 'Telangana')), 150, 'the Telangana rate wins');
+});
+test('all-India still applies when the scope does not match', () => {
+  const emp = mkEmployee();
+  mkConfig('professional_tax', '', ALL_INDIA_SLABS);
+  mkConfig('professional_tax', 'Telangana', TG_SLABS);
+  expect(ptOf(run(emp, 'Karnataka')), 99, 'falls back to the all-India rate');
+});
+test('a foreign state row alone deducts nothing', () => {
+  const emp = mkEmployee();
+  mkConfig('professional_tax', 'Telangana', TG_SLABS);
+  expect(ptOf(run(emp, 'Karnataka')), 0, 'Telangana row ignored under a Karnataka scope');
+});
+
+section(4, 'THE CASE-SENSITIVITY TRAP — both sides are free text, matched exactly');
+test('"telangana" does not match "Telangana"', () => {
+  const emp = mkEmployee();
+  mkConfig('professional_tax', 'Telangana', TG_SLABS);
+  expect(ptOf(run(emp, 'telangana')), 0,
+    'lower-case scope does NOT match — this is why the settings route offers stored spellings');
+});
+
+section(5, 'TRACE HONESTY — a skipped row must be visible on the payslip');
+test('an out-of-scope row appears in the trace with a reason', () => {
+  const emp = mkEmployee();
+  mkConfig('professional_tax', 'Telangana', TG_SLABS);
+  const t = traceOf(run(emp, 'Karnataka'));
+  const considered = t.statutory.configs_considered;
+  const tg = considered.find((c) => c.state === 'Telangana');
+  expectTrue(!!tg, 'the Telangana row IS listed (it used to be filtered out of the trace entirely)');
+  expectTrue(tg && tg.in_scope === false, 'it is marked out of scope');
+  expectTrue(tg && /state 'Telangana' does not match/.test(tg.excluded_because),
+    'and the reason names the mismatch', tg && tg.excluded_because);
+});
+test('an applied row is marked in scope', () => {
+  const emp = mkEmployee();
+  mkConfig('professional_tax', 'Telangana', TG_SLABS);
+  const t = traceOf(run(emp, 'Telangana'));
+  const tg = t.statutory.configs_considered.find((c) => c.state === 'Telangana');
+  expectTrue(tg && tg.in_scope === true, 'in_scope true');
+  expectTrue(/Telangana/.test(t.statutory.state_scope), 'state_scope names the state');
+});
+
+section(6, 'NO COLLATERAL CHANGE — the other statutory kinds are untouched');
+test('all-India PF and ESI apply exactly as before, with a state set', () => {
+  const emp = mkEmployee();
+  mkConfig('pf', '', { percent_of_basic: 12, wage_cap: 15000 });
+  mkConfig('esi', '', { percent_of_gross: 0.75, gross_cap: 21000 });
+  const withState = JSON.parse(run(emp, 'Telangana').deductions_json);
+  const without = JSON.parse(run(emp, '').deductions_json);
+  const pf = (lines) => (lines.find((d) => d.label === 'PF') || {}).amount || 0;
+  const esi = (lines) => (lines.find((d) => d.label === 'ESI') || {}).amount || 0;
+  expect(pf(withState), 1800, 'PF = 12% of the 15,000 cap');
+  expect(pf(withState), pf(without), 'PF identical with and without a state scope');
+  expect(esi(withState), esi(without), 'ESI identical with and without a state scope');
+});
+test('employee-category scoping still excludes a non-matching row', () => {
+  const emp = mkEmployee('staff');
+  mkConfig('professional_tax', 'Telangana', TG_SLABS, 'manager');
+  expect(ptOf(run(emp, 'Telangana')), 0, 'a manager-scoped row does not touch a staff payslip');
+});
+
+section(7, 'ROUTE WIRING — the second blocker, which the tests above cannot see');
+/* Everything above drives computePayrollItem directly, so it would all still
+ * pass if the ROUTE went back to calling it without opts — and that alone was
+ * enough to make every state-scoped rate inert, because resolveStatutoryConfigs
+ * drops them on an empty scope. There is no cheap way to execute the route here
+ * (it is an auth-gated Next handler), so this asserts on its SOURCE instead.
+ * A static check is weaker than an execution, and is labelled as such. */
+test('the payroll route reads hr_org_state and passes it to the compute', () => {
+  const routeSrc = fs.readFileSync(
+    path.join(SRC, 'app', 'api', 'hr', 'payroll', 'route.ts'), 'utf8',
+  );
+  const flat = routeSrc.replace(/\n\s*/g, ' ');
+  // Capture WHAT is passed as state, then assert that thing is the setting.
+  // The old guard was /computePayrollItem\([^)]*\{\s*state:/ which a hardcoded
+  // `{ state: '' }` satisfies perfectly — measured: sabotaging the route to
+  // `{ state: '' }` while leaving a getHrOrgState call elsewhere in the file
+  // left the suite at 26 passed / 0 failed while every state-scoped rate was
+  // inert again. A guard that cannot fail is not a guard.
+  const m = flat.match(/computePayrollItem\(\s*db\s*,[^)]*?\{\s*state:\s*([A-Za-z0-9_.]+|'[^']*'|"[^"]*")/);
+  expectTrue(!!m, 'route passes a { state } option into computePayrollItem',
+    'Without it every state-scoped rate is inert no matter what the SQL says.');
+  const passed = m ? m[1] : '';
+  expectTrue(!/^['"]/.test(passed),
+    `the state passed is a variable, not a literal (saw: ${passed || 'nothing'})`,
+    'A hardcoded literal means the setting is never consulted — the wire is dead.');
+  const assign = new RegExp(
+    'const\\s+' + (passed || '__none__').replace(/[.*+?^${}()|[\]\\]/g, '\\$&') +
+    '\\s*=\\s*getHrOrgState\\s*\\(\\s*db\\s*\\)');
+  expectTrue(passed !== '' && assign.test(flat),
+    `${passed || 'that variable'} is assigned from getHrOrgState(db)`,
+    'The variable must come from the setting, not from somewhere else.');
+  const compute = routeSrc.indexOf('computePayrollItem(db');
+  const read = routeSrc.indexOf('getHrOrgState(db)');
+  expectTrue(read > -1 && compute > -1 && read < compute,
+    'the setting is read BEFORE the loop, so one run uses one rate set');
+});
+
+/* ── summary ───────────────────────────────────────────────────────────────── */
+console.log(`\n${pass} passed · ${fail} failed`);
+if (fail) {
+  console.log('failing:');
+  failures.forEach((f) => console.log(`  · ${f}`));
+}
+if (KEEP) console.log(`\nsnapshot kept at ${TMP}`);
+else fs.rmSync(TMP, { recursive: true, force: true });
+process.exit(fail ? 1 : 0);

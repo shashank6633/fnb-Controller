@@ -2,7 +2,7 @@
 import { getDb, logAuditEvent } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
 import { canAdminHr, canManageHr } from '@/lib/hr';
-import { getHrDayCutoff, getHrPunchDebounceMin } from '@/lib/hr-attendance';
+import { getHrDayCutoff, getHrPunchDebounceMin, getHrOrgState } from '@/lib/hr-attendance';
 import { reportServerError } from '@/lib/error-alerts';
 
 /**
@@ -67,11 +67,24 @@ export async function GET(request: Request) {
   }
   try {
     const db = getDb();
+    // The state spellings ALREADY used by statutory config rows. Both sides of
+    // the match are free text and compared exactly, so a 'telangana' here
+    // against a 'Telangana' there silently deducts nothing — the exact failure
+    // this setting exists to end. Offering the stored spellings lets the UI
+    // present them as choices instead of asking an admin to retype one.
+    const configured_states = db
+      .prepare(
+        `SELECT DISTINCT state FROM hr_statutory_configs
+          WHERE state <> '' ORDER BY state`,
+      )
+      .all() as Array<{ state: string }>;
     return Response.json({
       settings: {
         hr_day_cutoff: getHrDayCutoff(db),
         hr_punch_debounce_min: getHrPunchDebounceMin(db),
+        hr_org_state: getHrOrgState(db),
       },
+      configured_states: configured_states.map((r) => r.state),
     });
   } catch (e) {
     console.error('GET /api/hr/settings failed:', e);
@@ -110,7 +123,25 @@ export async function PUT(request: Request) {
       );
     }
   }
-  if (cutoff === null && debounce === null) {
+  // hr_org_state — the state payroll resolves statutory rates in. '' is a
+  // LEGITIMATE value, not an absence: it means "all-India rates only", which is
+  // what payroll did before this setting existed. So it is tracked with its own
+  // flag rather than by null-ness, or clearing it back to '' would be
+  // indistinguishable from not sending it and could never be undone.
+  let orgState: string | null = null;
+  if (body?.hr_org_state !== undefined) {
+    if (typeof body.hr_org_state !== 'string') {
+      return Response.json({ error: 'Payroll state must be text' }, { status: 400 });
+    }
+    // String(...) rather than body.hr_org_state.trim(): `body` is `any`, so
+    // assigning from it leaves orgState as `string | null` and every later use
+    // needs a null check. This narrows it properly at the source.
+    orgState = String(body.hr_org_state).trim();
+    if (orgState.length > 64) {
+      return Response.json({ error: 'Payroll state is too long' }, { status: 400 });
+    }
+  }
+  if (cutoff === null && debounce === null && orgState === null) {
     return Response.json({ error: 'Nothing to update' }, { status: 400 });
   }
 
@@ -126,16 +157,21 @@ export async function PUT(request: Request) {
     const before = {
       hr_day_cutoff: getHrDayCutoff(db),
       hr_punch_debounce_min: getHrPunchDebounceMin(db),
+      hr_org_state: getHrOrgState(db),
     };
 
     const upsert = db.prepare(`INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)`);
     const write = db.transaction(() => {
       if (cutoff !== null) upsert.run('hr_day_cutoff', cutoff);
       if (debounce !== null) upsert.run('hr_punch_debounce_min', String(debounce));
+      if (orgState !== null) upsert.run('hr_org_state', orgState);
 
       const after = {
         hr_day_cutoff: cutoff ?? before.hr_day_cutoff,
         hr_punch_debounce_min: debounce ?? before.hr_punch_debounce_min,
+        // `orgState ?? before` and NOT `orgState || before`: '' is a real value
+        // here (all-India rates only), and || would quietly discard a clear.
+        hr_org_state: orgState ?? before.hr_org_state,
       };
       logAuditEvent(db, {
         event_type: 'hr.settings.update',
