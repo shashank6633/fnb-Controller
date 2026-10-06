@@ -340,6 +340,11 @@ export const FSSAI_MODULES: FssaiModule[] = [
     label: 'Record Changes & Voids',
     blurb: 'Who changed a record, from what to what, and the reason they gave for cancelling one.',
     phase: 10,
+    // Built. The trail was always being written — this is the screen to read it
+    // on, with the original beside the changed value, the reason, a CSV for an
+    // inspector, and the photo-retention sweep that proves what it dropped.
+    // Nothing on it can edit or delete a line: the route has no POST at all.
+    built: true,
     icon: History,
     access: 'management',
     group: 'records',
