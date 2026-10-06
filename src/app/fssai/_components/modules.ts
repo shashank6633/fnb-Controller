@@ -204,6 +204,9 @@ export const FSSAI_MODULES: FssaiModule[] = [
     label: 'Food Quality Checks',
     blurb: 'Taste, smell, look and texture checked before food goes out.',
     phase: 8,
+    // The screen is live: it lists the checklists that cover food quality, the
+    // last round recorded against each, and leads to the runner or the builder.
+    built: true,
     icon: Utensils,
     access: 'everyone',
     group: 'checks',
@@ -213,6 +216,11 @@ export const FSSAI_MODULES: FssaiModule[] = [
     label: 'Pest Control Logs',
     blurb: 'Contractor visits, bait stations, and sightings your own staff report in between.',
     phase: 6,
+    // Built. Three registers on one screen: the contractor's visits (management),
+    // the sightings any member of staff can file from their own phone, and the
+    // pest map (admin). 'Missed' is a first-class state, because a contract visit
+    // that did not happen is the commonest pest-control finding there is.
+    built: true,
     icon: Bug,
     access: 'everyone',
     group: 'checks',
@@ -222,6 +230,7 @@ export const FSSAI_MODULES: FssaiModule[] = [
     label: 'Cleaning & Sanitation',
     blurb: 'Daily, weekly and deep-clean schedules, signed by whoever did the work.',
     phase: 8,
+    built: true,
     icon: SprayCan,
     access: 'everyone',
     group: 'checks',
@@ -231,6 +240,7 @@ export const FSSAI_MODULES: FssaiModule[] = [
     label: 'Personal Hygiene',
     blurb: 'The start-of-shift check on uniform, hands and health, filed by each person.',
     phase: 8,
+    built: true,
     icon: Sparkles,
     access: 'everyone',
     group: 'checks',
@@ -240,6 +250,7 @@ export const FSSAI_MODULES: FssaiModule[] = [
     label: 'Food Storage Checks',
     blurb: 'Raw apart from cooked, covered, labelled and dated, nothing on the floor.',
     phase: 8,
+    built: true,
     icon: Boxes,
     access: 'everyone',
     group: 'checks',
@@ -249,6 +260,7 @@ export const FSSAI_MODULES: FssaiModule[] = [
     label: 'Kitchen Safety Checks',
     blurb: 'Gas, electricals, hood, extinguishers, first aid and the cutting equipment.',
     phase: 8,
+    built: true,
     icon: HardHat,
     access: 'everyone',
     group: 'checks',
@@ -306,6 +318,10 @@ export const FSSAI_MODULES: FssaiModule[] = [
     label: 'Documents & Certificates',
     blurb: 'Licence, water tests, pest contract and medical certificates, with expiry warnings.',
     phase: 6,
+    // Built. The expiry state is DERIVED on every read, never stored, and
+    // renewing files a new version rather than overwriting the old one. What it
+    // does NOT do, and says so on the screen: send a reminder anywhere.
+    built: true,
     icon: FileText,
     access: 'management',
     group: 'records',

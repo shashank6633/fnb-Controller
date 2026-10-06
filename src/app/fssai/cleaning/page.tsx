@@ -1,35 +1,31 @@
 'use client';
 
 /**
- * Cleaning & Sanitation — Phase 8 (a seeded checklist, not a bespoke screen).
- * See the note in ../food-quality/page.tsx: these twelve are configuration the
- * owner edits himself, running on the Phase 2 builder and the Phase 3 phone runner.
+ * Cleaning & Sanitation (owner §8).
+ *
+ * The record for this area IS a checklist — FSSAI-BUILD-STATE.md §2, from the
+ * owner's §24. Three ready-made ones cover it (src/lib/fssai-checklist-pack.ts):
+ * the daily kitchen clean, the twice-daily washroom and guest-area round, and
+ * the weekly deep clean. Each is signed by whoever did the work, which is the
+ * part a cleaning schedule on a wall cannot do.
+ *
+ * This screen lists them, says when each was last recorded, and leads to the
+ * runner or the builder. It owns no table and writes nothing.
  */
 
-import PhaseShell from '../_components/PhaseShell';
+import SeededModuleScreen from '../_components/SeededModuleScreen';
 
 export default function FssaiCleaningPage() {
   return (
-    <PhaseShell
+    <SeededModuleScreen
       href="/fssai/cleaning"
-      will={[
-        'Carry the daily, weekly and deep-clean schedules as checklists, one per area — kitchen line, prep, wash-up, stores, cold rooms, bar, toilets, bins and the back yard.',
-        'Record who cleaned what, and at what time, with a signature at the end of the round.',
-        'Ask for the dilution and the contact time where the chemical actually matters, instead of a single "cleaned" tick.',
-        'Ask for a photograph on the deep cleans, which are the ones that get skipped.',
-        'Show up as overdue when a weekly clean has not been done, in the same red the Task Manager already uses.',
-      ]}
-      today={{
-        text:
-          'Partly. The Task Manager has a Daily Checklists screen and a Hygiene Audits screen. Neither carries a signature, a shift or a frozen copy of the questions, so neither is enough as a cleaning record. Nothing is taken away from them — the FSSAI checklists sit alongside.',
-        links: [
-          { href: '/tasks/checklists', label: 'Daily Checklists' },
-          { href: '/tasks/hygiene', label: 'Hygiene Audits' },
-        ],
-      }}
-      notes={[
-        'One of twelve ready-made checklists, written once the checklist builder is in place. The questions, the frequency and the department responsible are all yours to change in Settings.',
-        'The areas have to be your areas. Rather than guess them, the ready-made checklists will start from the departments and floors already set up in the app and let you adjust the list.',
+      moduleKey="cleaning"
+      covers={[
+        'The daily kitchen clean: surfaces, boards, range, hood filters, fridges and the equipment that comes apart.',
+        'Floors, drains, grease traps and the waste area — the three things an inspector looks at first.',
+        'Sanitiser strength measured on a test strip (50–100 ppm) and the dishwasher final rinse at 82 °C or above.',
+        'The twice-daily washroom round: soap, hand drying, running water, and a readable hand-washing notice.',
+        'The weekly deep clean behind and underneath, with the name of whoever did it and anything carried over.',
       ]}
     />
   );

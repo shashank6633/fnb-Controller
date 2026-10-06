@@ -1,32 +1,35 @@
 'use client';
 
 /**
- * Food Storage Checks — Phase 8 (a seeded checklist, not a bespoke screen).
- * One of the twelve: configuration the owner edits, run by the Phase 2 builder and
- * the Phase 3 phone runner.
+ * Food Storage Checks (owner §10).
+ *
+ * The record for this area IS a checklist — FSSAI-BUILD-STATE.md §2, from the
+ * owner's §24. Three ready-made ones cover it
+ * (src/lib/fssai-checklist-pack.ts): the daily dry-store walk, the daily cold-
+ * storage segregation and labelling round, and the weekly storage audit.
+ *
+ * ⚠️ WHERE THIS STOPS, so two screens do not record the same thing twice. These
+ * checklists are about what is INSIDE the store — raw apart from cooked,
+ * covered, labelled, dated, nothing on the floor. The TEMPERATURE of each cold
+ * unit is a reading against a configured range and belongs to Temperature Logs
+ * and Cold Room Climate Control, which have their own tables. The two
+ * temperature questions here are the round's own observation ("the warmest
+ * chiller I saw"), not the unit-by-unit log.
  */
 
-import PhaseShell from '../_components/PhaseShell';
+import SeededModuleScreen from '../_components/SeededModuleScreen';
 
 export default function FssaiStoragePage() {
   return (
-    <PhaseShell
+    <SeededModuleScreen
       href="/fssai/storage"
-      will={[
-        'Check that raw and cooked are kept apart, everything is covered, and every container is labelled and dated.',
-        'Check that nothing is standing on the floor, that allergens are kept separate, and that chemicals are nowhere near food.',
-        'Run as three short lists — dry store, cold store and freezer — instead of one long one nobody finishes.',
-        'Ask for a photograph when something is wrong, so the storekeeper and the chef see the same thing.',
-        'Turn a repeated failure in the same store into a corrective action with a deadline.',
-      ]}
-      today={{
-        text:
-          'Nowhere as a storage check. Stock levels and closing counts are recorded, but nothing records the state of the shelves.',
-        links: [{ href: '/closing-stock', label: 'Closing Stock' }],
-      }}
-      notes={[
-        'One of twelve ready-made checklists, written once the checklist builder is in place; every question is yours to edit in Settings.',
-        'The stores in the list will be the store locations already set up in the app, so there is no second list of places to keep in step.',
+      moduleKey="storage"
+      covers={[
+        'Raw meat, poultry and fish below and apart from ready-to-eat food — the single most common finding against a kitchen.',
+        'Everything covered, labelled with what it is, and dated with the day it went in.',
+        'Nothing on the floor, oldest at the front, and nothing past its date on a shelf.',
+        'Chemicals and non-food stored separately, never above food.',
+        'The weekly audit: opened-pack shelf lives being applied, thawing in a chiller, nothing refrozen, and the fabric of the store sound.',
       ]}
     />
   );

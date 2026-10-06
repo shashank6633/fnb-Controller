@@ -168,7 +168,7 @@ its evidence line is filled in with real command output.
 | P5 | FIFO/FEFO & Expiry · Oil Quality · Water & Ice | §3, §12, §13 | **SCHEMA READY** | **W1.** Tables: `fssai_item_shelf_life` · `fssai_expiry_items` · `fssai_oil_checks` · `fssai_oil_disposals` · `fssai_water_tests`. Evidence on the W1 row below |
 | P6 | Pest Control · Documents & Certificates | §7, §17 | **SCHEMA READY** | **W1.** Tables: `fssai_pest_services` · `fssai_pest_sightings` · `fssai_pest_devices` · `fssai_documents` (+ the shared `fssai_attachments`). Evidence on the W1 row below |
 | P7 | Corrective Actions + Task/Maintenance + alerts | §14, §21, §23 | **PARTIAL** | **THE CORRECTIVE-ACTION SPINE IS BUILT AND LIVE IN CODE — `a7e5714` (engine + route) · `d1ea748` (screens) · `2f7628c` (self-review fixes). Brought forward out of P7 because the owner RULED §7 Q14 on 2026-09-25: "Corrective action against the failed record. The failure STANDS. The fix and its verification hang off it via `fssai_corrective_actions`. NO change to the slot rule, no 'rejected' status, no voiding a true observation." NO SCHEMA CHANGE — the P1 spine took it as declared. What closed: `raise_ca_on_fail` had **0** readers in the engine and `fssai_corrective_actions` was written by **no route at all** (measured: 0 rows, 0 questions with the flag ever switched on — the inert-guard shape exactly). Now a failed answer on a flagged question raises `CA-yyyy-####` inside the submit transaction, from the SAME judged list the verdict is built from, reading `is_fail` off the frozen response; idempotent on (run_id, response_id); best-effort so a follow-up row that will not insert can never cost a chef his submitted round. `/api/fssai/corrective-actions` does assign/start/complete/verify/reopen/cancel, every UPDATE status-guarded and in one transaction with its audit row, no DELETE, no create-by-hand. `complete` REFUSES without the fix in words; `verify` refuses the fixer, refuses whoever recorded the failed check, and refuses anyone outside management. It CANNOT un-fail anything: no write against `fssai_runs` or `fssai_responses` exists in either file. `/fssai/corrective-actions` replaces its PhaseShell; the failed record shows its actions on `/fssai/verification` and on `GET /api/fssai/runs?id=`. **STILL NOT BUILT, and the screen says so:** the fix does not become a row in the Task Manager (`created_task_id` deliberately left `''`, never a fabricated task id), and there are no escalations or due/overdue reminders — §21/§23 are untouched. Gates: `npx tsc --noEmit` 0, `npx next build` 0; proof harness 33/33 + 9/9 against a COPY of the db (production db still 0 actions). NOT deployed, NOT pushed — the FSSAI gate holds.** |
-| P8 | Seeded checklist templates (the twelve) | §6, §8, §9, §10, §11 | **SCHEMA READY** | **W1.** No new template tables — the twelve are ROWS in the existing engine (§2). What W1 added is the one thing a seed cannot do without: `fssai_seed_log` + `uq_fssai_seed_item`, so a pack runs ONCE and a cold start can never resurrect a checklist an admin retired. Evidence on the W1 row below |
+| P8 | Seeded checklist templates (the twelve) | §6, §8, §9, §10, §11 | **BUILT — not browser-verified** | **2026-10-06, Wave 2. NO SCHEMA CHANGE, NO SHARED-FILE CHANGE** (`db.ts`, `page-catalog.ts`, `Sidebar.tsx`, `fssai.ts` all untouched; the only shared edit is `built: true` on P8's OWN five rows in `modules.ts`). **The twelve exist as DATA**: `src/lib/fssai-checklist-pack.ts` — **12 checklists · 37 sections · 151 questions · 66 critical**, across all five areas (food-quality 2, cleaning 3, hygiene 2, storage 3, kitchen-safety 2). Applier `src/lib/fssai-seed-server.ts`, route `src/app/api/fssai/seed/route.ts` (GET state + POST apply; **no PUT, no DELETE** — asserted), admin screen `/fssai/settings/ready-made`, and the five module screens are real at last via `src/app/fssai/_components/SeededModuleScreen.tsx`. **IT IS NOT A BOOT SEED** — an administrator presses a button, the marker row goes in FIRST inside the transaction and `uq_fssai_seed_item` is the gate, so a restart can never bring back a checklist he retired. **PROBE (the real code, real `initializeSchema`, a `VACUUM INTO` copy of the worktree DB): `/tmp/claude-501/p8probe/probe.cjs` → exit 0, 67 passed / 0 failed.** Measured: boot creates 30 fssai tables incl. `fssai_seed_log` + `uq_fssai_seed_item`; the pack passes `normalizeFssaiQuestion` with **0 problems**; **a good answer passes all 151 questions** and a reading 20 °C below a minimum fails and raises a CA (the R1 renderer test); apply → `templates +12 · sections +37 · questions +151 · seed_log +13 · audit_log +12 · fssai_runs UNCHANGED · purchases 2165`; 0 orphan questions, 0 invented roles, 0 invented departments; **a second apply is refused `already_applied` and writes nothing, and still refuses after an admin RETIRES one of the twelve — the retired row is NOT resurrected**; a new pack version skips the 11 codes already in use and overwrites none; an unknown department id is refused by name with no marker row written; a real department id is stamped BY ID; `publish:true` publishes and records `published_by`; CSRF refused with no pair and with a mismatched pair, passes with a matching pair. **Gates: `npx tsc --noEmit` exit 2, 4 src errors — ZERO in any P8 file; all four are sibling lanes' in-flight files (`_p9/reports.ts`, `inspections/route.ts`, `corrective-actions/page.tsx`).** `next build` deliberately NOT run (the verify wave builds once for everybody). **NOT browser-verified** — no agent in this environment can render a screen, the same wall P2b and P3 hit. **Assumptions recorded in §7: seeded as DRAFT; no rota; no department; `target_kind` only 'none'/'person'; 10 of 12 carry the Q16 warning and the screen shows it.** NOT deployed, NOT pushed, NOT merged — §0 holds |
 | P9 | Dashboard · Inspection Mode · Reports | §1, §16, §18 | **SCHEMA READY** | **W1.** Mostly reads, as planned; the two shapes a read cannot invent are `fssai_inspections` + `fssai_inspection_findings` (somebody ELSE's findings against clauses we did not write — not a checklist run). Evidence on the W1 row below |
 | P10 | Audit trail hardening — void, never delete | §19 | **SCHEMA READY** | **W1.** `fssai_audit_log` already existed and is already being written; W1 added the void trio to all 19 new tables, the shared `fssaiVoidRefusal()` guard, the `FSSAI_RECORD_TABLES` allowlist, `fssai_retention_runs` (an unattended job that deletes image data must prove what it did), and the missing SCREEN: `/fssai/audit-log` (mgmtOnly, BOTH files + a shell). Evidence on the W1 row below |
 | P11 | Full adversarial verification + carve | all | PENDING | after the feature lanes. The carve still proves the FOUR signature checks of §0, never the bare word `fssai` |
@@ -642,6 +642,44 @@ is wrong, and nothing in the authoring API used to say so.
 4. **Auto-scope to the department.**
 
 **Recommendation: 1.** Revisit only if a seeded checklist in P8 trips over it.
+
+> ⚠️ **IT DID, AND BY DESIGN — measured 2026-10-06 (P8).** **10 of the twelve ready-made checklists
+> carry this warning**, because ten of them genuinely are one round for the whole restaurant: the
+> daily kitchen clean, the washroom round, the storage walks, the opening safety check. The two that
+> are one-per-person (`CHK-HYG-SHIFT`, `CHK-HYG-HEALTH-MONTHLY`) use `target_kind='person'` and do not
+> warn. So the recommendation stands and nothing was changed — but the warning is no longer only in a
+> JSON field: `/fssai/settings/ready-made` prints it next to the checklist it belongs to BEFORE the
+> admin presses the button, so he reads the sentence on the screen and not on a Friday night. **No
+> seeded checklist targets equipment, an area, a GRN or a batch**, deliberately: the runner refuses a
+> non-'none' target with no `target_id` (`runs/route.ts:381`) and `fssai_equipment` holds 0 rows, so a
+> per-cold-room seeded checklist would be impossible to start. He changes one in the builder the day
+> the equipment register has rows.
+
+### Q20 — P8's own five assumptions, none of them hidden (2026-10-06)
+
+None of these is a ruling. Each is the safest reversible default, each is reversible in the builder
+in one click, and each is written on the screen that applies the pack.
+
+1. **The twelve arrive as DRAFTS, not published.** A draft is invisible to staff
+   (`templates/route.ts` shows a non-admin only published, active checklists), so the owner reads
+   each one, changes the questions and the ranges to match this kitchen, and publishes it himself.
+   Publishing twelve is twelve clicks; un-publishing twelve that staff have already filed in is not.
+   **Configurable**: the apply screen offers "Published straight away", and the route takes
+   `{publish: true}`.
+2. **The pack sets NO rota.** `fssai_assignments` needs a person or a role, roles are the owner's
+   (HARD RULE 4), and a seeded rota would start marking staff late for checks nobody rostered them
+   for. **Nothing becomes "due" until he adds it to the schedule.**
+3. **No department, unless he picks one.** Live names carry double spaces ("Akan  Indian") and
+   matching on a name is forbidden (RECON §5 row 5), so the pack leaves `department_id` blank and the
+   screen offers an optional per-checklist picker that sends an **id**. An id that does not exist is
+   refused by name and nothing is written.
+4. **`responsible_role_id` is always ''.** FSSAI never creates a role, and guessing which of his
+   roles owns a checklist is a production-mapping change (HARD RULE 4).
+5. **It cannot be un-seeded.** There is no DELETE on `/api/fssai/seed`. Once the twelve exist they
+   are ordinary checklists, retired in the builder like any other — because a seed able to remove
+   what it created would be able to remove his edits with them.
+
+**He may want to overrule 1 (publish straight away) and 2 (seed a rota too).** Both are one change.
 
 ### Q11 — the module tells the truth about the restaurant, inside the restaurant's app
 
