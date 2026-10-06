@@ -390,10 +390,28 @@ export async function POST(request: Request) {
           fssaiAudit(db, { entity_table: 'fssai_inspections', entity_id: id, action: 'create', after: row, actor, outlet_id: outletId });
         })();
       } catch (e: any) {
-        const msg = constraintMessage(e, '');
-        if (msg || String(e?.message || '').includes('uq_fssai_insp_no')) {
-          return Response.json({ error: `An inspection numbered ${row.inspection_no} already exists.` }, { status: 409 });
+        /* ⚠️ SQLITE NAMES THE COLUMNS, NOT THE INDEX — measured here, and it is
+         * the exact trap constraintMessage's own header documents. A duplicate
+         * inspection number reports:
+         *   "UNIQUE constraint failed: fssai_inspections.outlet_id,
+         *    fssai_inspections.inspection_no"
+         * with no mention of uq_fssai_insp_no anywhere. The first version of this
+         * handler matched on the index name, fell through, and returned a 500
+         * carrying raw SQL at the user — proved by the probe, not reasoned about.
+         * So match the column, and keep the index name as well in case a future
+         * SQLite reports that instead. */
+        const isDupNo =
+          String(e?.code || '').startsWith('SQLITE_CONSTRAINT') &&
+          (String(e?.message || '').includes('fssai_inspections.inspection_no') ||
+            String(e?.message || '').includes('uq_fssai_insp_no'));
+        if (isDupNo) {
+          return Response.json(
+            { error: `An inspection numbered ${row.inspection_no} already exists. Leave the number blank to have one allocated.` },
+            { status: 409 },
+          );
         }
+        const msg = constraintMessage(e, '');
+        if (msg) return Response.json({ error: msg }, { status: 409 });
         throw e;
       }
 
