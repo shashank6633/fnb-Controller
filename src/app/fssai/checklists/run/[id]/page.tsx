@@ -411,14 +411,42 @@ export default function FssaiRunnerPage() {
     }
   }, [runId, persistQueue]);
 
-  /** Retry everything the phone is holding. Serial on purpose — order matters. */
-  const flushQueue = useCallback(async () => {
-    const ids = Object.keys(queueRef.current);
-    for (const qid of ids) {
-      const d = queueRef.current[qid];
-      if (!d) continue;
-      const ok = await pushAnswer(qid, d, { silent: true });
-      if (!ok && queueRef.current[qid]) break;   // still offline; stop hammering
+  /**
+   * Retry everything the phone is holding. Serial on purpose — order matters.
+   *
+   * ONE FLUSH AT A TIME. Two things call this: a 12-second timer and the browser's
+   * `online` event — and signal coming back fires both at once, which is precisely
+   * the moment the queue is full. Without the latch, two loops walked the same
+   * queue concurrently and each `await` let the other past the `queueRef` check,
+   * so the same answer was POSTed twice. The engine upserts an answer, so the
+   * record survived it; what did not survive was the chef's screen, which flickered
+   * between "saving" and "saved" and could show a stale verdict from whichever
+   * response landed second. Cheaper to serialise than to make two writers agree.
+   *
+   * The latch JOINS the flush in flight rather than skipping it, and that detail is
+   * the whole fix. Submit does `await flushQueue()` and then judges the queue on the
+   * very next line: a latch that returned early would have let a submit arriving
+   * during a timer flush read a queue that was still draining and refuse the chef's
+   * completed round — "answers have not reached the server yet" — mid-service, over
+   * answers that were already in the air. So a second caller awaits the first.
+   */
+  const flushingRef = useRef<Promise<void> | null>(null);
+  const flushQueue = useCallback(async (): Promise<void> => {
+    if (flushingRef.current) return flushingRef.current;
+    const run = (async () => {
+      const ids = Object.keys(queueRef.current);
+      for (const qid of ids) {
+        const d = queueRef.current[qid];
+        if (!d) continue;
+        const ok = await pushAnswer(qid, d, { silent: true });
+        if (!ok && queueRef.current[qid]) break;   // still offline; stop hammering
+      }
+    })();
+    flushingRef.current = run;
+    try {
+      await run;
+    } finally {
+      flushingRef.current = null;
     }
   }, [pushAnswer]);
 

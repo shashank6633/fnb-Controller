@@ -103,6 +103,7 @@ import Combobox, { type ComboOption } from '@/components/Combobox';
 import { api } from '@/lib/api';
 import { FSSAI_MODULES } from '@/app/fssai/_components/modules';
 import {
+  FSSAI_EVIDENCE_MAX_PER_ANSWER,
   FSSAI_EVIDENCE_RULES, FSSAI_FREQUENCIES, FSSAI_MODULE_KEYS, FSSAI_QTYPES,
   FSSAI_SHIFTS, FSSAI_TARGET_KINDS,
   evaluateFssaiAnswer, fssaiConfigWarnings, fssaiDisplayReading, fssaiTemplateStatusMeta,
@@ -1574,12 +1575,10 @@ export default function FssaiChecklistBuilderPage() {
                     {photoOwed.length} question{photoOwed.length === 1 ? '' : 's'} ask
                     {photoOwed.length === 1 ? 's' : ''} for a photograph
                     {photoAlways.length ? ` (${photoAlways.length} of them every single time)` : ''}.{' '}
-                    <strong>
-                      A photograph can only be attached on the phone runner, which is not built yet
-                    </strong>{' '}
-                    — so until it is, an answer that owes one is unfinished and the check cannot be
-                    submitted. That is the engine protecting the record, not a bug, but it means a
-                    checklist published today with a compulsory photograph cannot be completed today.
+                    <strong>A photograph is taken on the phone, in the checklist runner</strong> — not
+                    on this screen. An answer that still owes one is unfinished until it is attached,
+                    so the check cannot be submitted while a photograph is outstanding. That is the
+                    engine protecting the record, not a bug.
                   </p>
                 )}
               </div>
@@ -2139,6 +2138,22 @@ function QuestionCard({
             )}
           </div>
 
+          {/*
+            THE CRITICAL CONSEQUENCE, VISIBLE WITHOUT A HOVER (defect L-3).
+            The red "Critical" chip above carries the consequence in its `title`, and a
+            title only appears on a mouse. Checklists are reviewed and approved on the
+            same tablets the rounds are run on, where hover does not exist — so on the
+            device that matters the chip said "Critical" and nothing more, while the
+            pass mark it silently overrides sat two lines above it. Said once, in
+            words, for an active question; a retired one says it in the line below
+            instead, which is already more specific.
+          */}
+          {!retired && !!Number(q.is_critical) && (
+            <p className="text-[11px] text-red-800 mt-2">
+              A failure here fails the whole check on its own — the {passMark}% pass mark is ignored.
+            </p>
+          )}
+
           {retired && (
             <p className="text-[11px] text-[#6B5744] mt-2">
               Off every future check. Every answer already given to it stays in its record exactly as
@@ -2628,8 +2643,8 @@ function QuestionEditor({
       {draft.qtype === 'photo' && (
         <div className="bg-amber-50 border border-amber-200 rounded-lg p-3 text-sm text-amber-900">
           The photograph <strong>is</strong> the answer to this question, so it is always required.
-          Photographs can only be taken on the phone runner, which is not built yet — until it is, a
-          check containing this question cannot be submitted.
+          It is taken on the phone, in the checklist runner — there is no way to attach one from this
+          screen, and the check cannot be submitted until it is there.
         </div>
       )}
 
@@ -2730,8 +2745,9 @@ function QuestionEditor({
         </p>
         {(draft.photo_rule !== 'never' || photoForced) && (
           <p className="text-[11px] text-amber-900 bg-amber-50 border border-amber-200 rounded-lg p-2">
-            Photographs are taken on the phone runner, which is not built yet. Until it is, this
-            question cannot be completed and the check cannot be submitted.
+            Photographs are taken on the phone, in the checklist runner — not on this screen. The
+            camera shrinks each one to fit, and up to {FSSAI_EVIDENCE_MAX_PER_ANSWER} may be attached
+            to a single answer.
           </p>
         )}
       </div>
@@ -3118,9 +3134,41 @@ function PreviewQuestion({
   const na = !!answer?.is_na;
   const step = Number(q.decimals) > 0 ? 0.5 : 1;
 
+  /**
+   * WHERE THE STEPPER STARTS WHEN NOTHING HAS BEEN TYPED — THE RUNNER'S RULE, NOT
+   * A SECOND ONE (defect L-2).
+   *
+   * This preview's whole promise is "what it says here is what the chef will see".
+   * It was starting from 0 while the phone runner starts from the target, then the
+   * midpoint of the acceptable range, then 0 (`run/[id]/page.tsx`, the `nudge` in
+   * its numeric field). On a freezer question authored -22 to -18 with a target of
+   * -20, one press of the minus button gave the admin -1 here — a reading his own
+   * checklist FAILS — against -21 on the phone, which passes. The preview was
+   * contradicting the runner on the one screen built to predict it, which is the
+   * same fault already fixed once for the pass/fail button colours above.
+   *
+   * Kept deliberately as a COPY of the rule rather than a shared helper: the two
+   * screens are owned by different phases and `src/lib/fssai.ts` is not this
+   * lane's to edit. If the rule ever moves into the vocabulary module, both call
+   * sites should follow it there — flagged in the lane report.
+   */
+  function stepperBase(): number {
+    if (typeof answer?.value_num === 'number' && Number.isFinite(answer.value_num)) {
+      return answer.value_num;
+    }
+    const target = Number(q.target_value);
+    if (q.target_value !== null && q.target_value !== undefined && Number.isFinite(target)) {
+      return target;
+    }
+    if (q.min_value !== null && q.max_value !== null) {
+      const mid = (Number(q.min_value) + Number(q.max_value)) / 2;
+      if (Number.isFinite(mid)) return mid;
+    }
+    return 0;
+  }
+
   function nudge(delta: number) {
-    const base = typeof answer?.value_num === 'number' ? answer.value_num : 0;
-    onAnswer({ value_num: Number((base + delta).toFixed(3)), is_na: false });
+    onAnswer({ value_num: Number((stepperBase() + delta).toFixed(3)), is_na: false });
   }
 
   const boolWords: [string, string] = q.qtype === 'pass_fail' ? ['Pass', 'Fail'] : ['Yes', 'No'];
@@ -3282,8 +3330,8 @@ function PreviewQuestion({
             <div className="rounded-lg border border-dashed border-[#D4B896] bg-[#FFF1E3] p-3 text-center">
               <Camera size={18} className="mx-auto text-[#8B7355]" />
               <p className="text-[11px] text-[#6B5744] mt-1">
-                The camera opens here on the phone runner, which is not built yet. Nothing can be
-                attached today, so this question cannot be completed.
+                On the phone, the camera opens here. This is a preview, so nothing can be attached
+                from it — which is why the question below stays unfinished on this screen.
               </p>
             </div>
           )}
