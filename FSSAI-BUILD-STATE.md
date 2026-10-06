@@ -736,6 +736,18 @@ top costs far more than fixing it now. He is reviewing the foundation, not the f
      in this worktree, is more likely a concurrent lane's half-saved file than a break** — the same
      shape as the `next build` lock noted on 2026-09-21. Re-run before acting on it, and never
      "fix" another lane's file.
+ 11. **MY OWN MISTAKE, RECORDED BECAUSE THE ATTRIBUTION IS NOW WRONG AND SOMEBODY WILL BE PUZZLED BY
+     IT.** Commit `914aa73` is titled "A duplicate inspection number returned 500" and that is the
+     only change in it that is mine (`src/app/api/fssai/inspections/route.ts`). It also carries **20
+     files belonging to the P4, P5 and P6 lanes**, because I staged with
+     `git add -A src/app/api/fssai` instead of naming my own paths. **Nothing was lost** — a commit
+     protects work, and those lanes' files were uncommitted at that moment, which §6's 2026-09-17
+     entry calls the only place git cannot protect; the whole tree type-checks at exit 0 either way,
+     and each lane has since committed its own work on top. **It was NOT rewritten.** A rebase or a
+     reset in a worktree with eight live lanes is the exact class of command that destroyed 665 lines
+     on 2026-09-17, and a confusing commit message is a far smaller cost than that. **The rule for the
+     next lane: stage by naming your own files, never `git add -A` on a directory eight agents
+     share.**
 
 
 ---
