@@ -8,7 +8,7 @@ import {
   fssaiPestServiceStatusMeta, fssaiPestSeverityMeta,
   fssaiTempLogKindLabel, fssaiWaterTestKind,
 } from '@/lib/fssai';
-import { dateClause, intOr, intOrBlank, numOrBlank, whereAll, type DateWindow } from './lib';
+import { dateClause, deptLabel, intOr, intOrBlank, numOrBlank, whereAll, type DateWindow } from './lib';
 
 /**
  * THE FSSAI REPORT REGISTRY (owner §18).
@@ -131,9 +131,8 @@ function textFilter(ctx: FssaiReportCtx, cols: string[]) {
 }
 
 function deptName(ctx: FssaiReportCtx, id: unknown): string {
-  const key = String(id || '');
-  if (!key) return '';
-  return DEPT_CACHE.get(ctx.db)?.get(key) || key;
+  // One definition of "name a department, or say its id" — see deptLabel.
+  return deptLabel(DEPT_CACHE.get(ctx.db) || new Map(), id);
 }
 
 /**

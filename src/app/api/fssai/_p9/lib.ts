@@ -313,6 +313,27 @@ export function dateClause(col: string, w: DateWindow): { sql: string; args: any
  * 7. SMALL READS EVERY P9 SCREEN NEEDS
  * ══════════════════════════════════════════════════════════════════════════ */
 
+/**
+ * NAME A DEPARTMENT, OR SAY ITS ID — but never render a blank.
+ *
+ * ⚠️ MEASURED, and it is an honesty defect rather than cosmetics. A record whose
+ * `department_id` is `''` genuinely has no department: that is a checklist filed
+ * once for the whole premises, and the reports print "Whole restaurant" for it. A
+ * record pointing at an id the departments table no longer holds — the owner
+ * renamed or removed one, or the row came from another outlet — is a COMPLETELY
+ * DIFFERENT statement, and `map.get(id) || ''` collapses the two into the same
+ * blank cell. An inspector reading "whole restaurant" against a kitchen record
+ * would be reading something nobody recorded.
+ *
+ * So an unresolved id falls through to the id itself: ugly, obviously a key, and
+ * impossible to mistake for "no department".
+ */
+export function deptLabel(map: Map<string, string>, id: unknown): string {
+  const key = String(id || '');
+  if (!key) return '';
+  return map.get(key) || key;
+}
+
 /** id → department name. Match on ID, never on name: live names hold double spaces. */
 export function departmentNames(db: Database.Database): Map<string, string> {
   const m = new Map<string, string>();

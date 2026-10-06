@@ -6,7 +6,7 @@ import {
   fssaiFindingSeverityRank, fssaiToday, fssaiVoidRefusal, isISODate,
 } from '@/lib/fssai';
 import { requireFssaiUser, fssaiCsrfGuard, fssaiAudit, fssaiAppAudit, str, constraintMessage } from '@/lib/fssai-server';
-import { fssaiTableExists, intOr, whereAll, departmentNames } from '../_p9/lib';
+import { deptLabel, fssaiTableExists, intOr, whereAll, departmentNames } from '../_p9/lib';
 
 /**
  * INSPECTIONS AND THEIR FINDINGS (/api/fssai/inspections) — owner §16, §18.
@@ -135,7 +135,7 @@ function shapeInspection(row: any, deptMap: Map<string, string>, today: string) 
   const open = intOr(row.open_count);
   return {
     ...row,
-    department_name: deptMap.get(String(row.department_id || '')) || '',
+    department_name: deptLabel(deptMap, row.department_id),
     // Their number, as given. NULL stays null — a blank score is not a zero mark.
     score: row.score === null || row.score === undefined ? null : Number(row.score),
     score_max: row.score_max === null || row.score_max === undefined ? null : Number(row.score_max),
@@ -149,7 +149,7 @@ function shapeInspection(row: any, deptMap: Map<string, string>, today: string) 
 function shapeFinding(row: any, deptMap: Map<string, string>, today: string) {
   return {
     ...row,
-    department_name: deptMap.get(String(row.department_id || '')) || '',
+    department_name: deptLabel(deptMap, row.department_id),
     severity_rank: fssaiFindingSeverityRank(row.severity),
     overdue: String(row.status) !== 'closed' && !!String(row.due_date || '') && String(row.due_date) < today,
     sort_order: intOr(row.sort_order),

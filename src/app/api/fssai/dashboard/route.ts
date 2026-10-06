@@ -3,7 +3,7 @@ import { getDb } from '@/lib/db';
 import { isManagement } from '@/lib/auth';
 import { fssaiDocState, fssaiToday, daysBetweenISO, isISODate, addDaysISO } from '@/lib/fssai';
 import { requireFssaiUser, FSSAI_NO_MATCH } from '@/lib/fssai-server';
-import { bucket, deptFence, fssaiTablesPresent, numOrBlank, intOr, whereAll, departmentNames } from '../_p9/lib';
+import { bucket, deptFence, deptLabel, fssaiTablesPresent, numOrBlank, intOr, whereAll, departmentNames } from '../_p9/lib';
 
 /**
  * THE COMPLIANCE DASHBOARD'S FIGURES (/api/fssai/dashboard) — owner §1.
@@ -140,7 +140,7 @@ export async function GET(request: Request) {
           target_label: String(r.target_label || ''),
           shift: String(r.shift || ''),
           department_id: String(r.department_id || ''),
-          department_name: deptMap.get(String(r.department_id || '')) || '',
+          department_name: deptLabel(deptMap, r.department_id),
           next_due_date: String(r.next_due_date || ''),
           filed: filed,
           filed_run_id: String(r.filed_run_id || ''),
@@ -221,7 +221,7 @@ export async function GET(request: Request) {
           prompt: String(r.prompt_snapshot || ''),
           // NULL value_num stays blank. A failure for "no reading" is not 0 °C.
           answer: String(r.value_text || '') || (r.value_num === null || r.value_num === undefined ? '' : `${numOrBlank(r.value_num, 1)} ${String(r.uom || '')}`.trim()),
-          department_name: deptMap.get(String(r.department_id || '')) || '',
+          department_name: deptLabel(deptMap, r.department_id),
           by: String(r.recorded_name || r.recorded_by || ''),
         })),
       };
@@ -270,7 +270,7 @@ export async function GET(request: Request) {
           status: String(r.status || ''),
           due_date: String(r.due_date || ''),
           owner_email: String(r.owner_email || ''),
-          department_name: deptMap.get(String(r.department_id || '')) || '',
+          department_name: deptLabel(deptMap, r.department_id),
           overdue: !!String(r.due_date || '') && String(r.due_date) < today,
         })),
       };
