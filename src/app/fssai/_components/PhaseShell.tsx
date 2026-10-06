@@ -33,6 +33,7 @@
 
 import { ArrowLeft, ArrowRight, Hourglass, Lock } from 'lucide-react';
 import {
+  FSSAI_BUILD_HELD_AT_REVIEW_GATE,
   FSSAI_REVIEW_GATE_PHASE,
   fssaiAccessLabel,
   fssaiModule,
@@ -75,7 +76,18 @@ export default function PhaseShell({ href, title, will, today, notes, notice }: 
   const phase = fssaiPhase(mod.phase);
   const Icon = mod.icon;
   const accessLabel = fssaiAccessLabel(mod.access);
-  const heldBehindReview = mod.phase >= FSSAI_REVIEW_GATE_PHASE;
+  /* TWO CONDITIONS, NOT ONE, and both are load-bearing.
+   *
+   * `FSSAI_BUILD_HELD_AT_REVIEW_GATE` is the owner's instruction: he asked for
+   * the build to stop after the phone checklist, then asked for it to carry on.
+   * While it is false, no screen claims its work is on hold — a sentence that
+   * was true in September and is not true now.
+   *
+   * `!notice` is the older rule and the reason is on the `notice` prop itself: a
+   * screen that passes its own headline is one meant to be read by somebody
+   * OUTSIDE the business (Inspection Mode is the case it was written for), and
+   * a paragraph about our internal build order has no business on it. */
+  const heldBehindReview = FSSAI_BUILD_HELD_AT_REVIEW_GATE && mod.phase >= FSSAI_REVIEW_GATE_PHASE && !notice;
 
   return (
     <div className="min-h-screen bg-[#FFF8F0] text-[#2D1B0E]">

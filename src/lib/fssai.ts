@@ -1873,3 +1873,856 @@ export function daysBetweenISO(a: string, b: string): number {
   const [by, bm, bd] = b.split('-').map(Number);
   return Math.round((Date.UTC(by, bm - 1, bd) - Date.UTC(ay, am - 1, ad)) / 86400000);
 }
+
+/* ================================================================== *
+ * 14. THE RECORD MODULES (P4-P10) — THE SHARED VOCABULARY
+ * ==================================================================
+ *
+ * Everything below is used by MORE THAN ONE phase, which is the only reason it
+ * is here rather than in a route. Eight feature lanes build the record screens
+ * in parallel and none of them may edit this file, so a vocabulary that two of
+ * them touch has to exist before any of them starts. The alternative was
+ * measured on this project and has a name: two lanes each wrote their own
+ * sales-slice.ts with the same export signature, the pair disagreed silently,
+ * and tsc pointed at the wrong one.
+ *
+ * THE RULE THAT MAKES THIS SAFE, same as §1 above: there is NO CHECK constraint
+ * on any of these columns in db.ts, so the database will store a value this file
+ * does not declare. The arrays below are therefore the WHOLE enforcement. A row
+ * carrying an unknown value must render as itself and never as a blank — every
+ * `*Meta` lookup here falls back to the raw key, exactly as fssaiCaStatusMeta
+ * does, so an unrecognised status reads "pest_fumigation" on screen instead of
+ * disappearing from a food-safety record.
+ */
+
+/* ------------------------------------------------------------------ *
+ * 14.1 THE RECORD LIFECYCLE — shared by every P4-P6 record table
+ * ------------------------------------------------------------------ */
+
+/**
+ * The status every NON-CHECKLIST record moves through.
+ *
+ * FOUR VALUES, NOT THE RUN'S FIVE, and the missing one is the point:
+ * fssai_runs has 'rejected' because a checklist round can be sent back for a
+ * redo (the slot reopens). A receiving inspection, a temperature reading or a
+ * pest sighting is an OBSERVATION OF A MOMENT THAT HAS PASSED — there is
+ * nothing to redo, and "send it back" would invite re-recording a reading
+ * somebody did not like. A record that was entered in error is VOIDED with a
+ * reason (§19), and a record whose subject needs fixing raises a corrective
+ * action (owner's Q14 ruling). Do not add 'rejected' here without a ruling.
+ *
+ * 'draft' is deliberately the first value and NOT 'in_progress': these records
+ * are typically filled in one sitting at the door or in front of the fridge,
+ * and a half-typed row is a draft, not a round in progress.
+ */
+export type FssaiRecordStatus = 'draft' | 'submitted' | 'verified' | 'void';
+
+export const FSSAI_RECORD_STATUSES: readonly FssaiStatusMeta[] = [
+  { key: 'draft',     label: 'Draft',     color: 'bg-amber-100 text-amber-800 border-amber-200' },
+  { key: 'submitted', label: 'Submitted', color: 'bg-teal-100 text-teal-700 border-teal-200' },
+  { key: 'verified',  label: 'Verified',  color: 'bg-green-100 text-green-700 border-green-200' },
+  { key: 'void',      label: 'Voided',    color: 'bg-gray-100 text-gray-600 border-gray-200' },
+] as const;
+
+export function fssaiRecordStatusMeta(key: string | null | undefined): FssaiStatusMeta {
+  return metaFrom(FSSAI_RECORD_STATUSES, key);
+}
+
+export function isFssaiRecordStatus(v: string | null | undefined): v is FssaiRecordStatus {
+  return FSSAI_RECORD_STATUSES.some((s) => s.key === String(v || ''));
+}
+
+/**
+ * May this record still be edited in place?
+ *
+ * Only a draft. A submitted record is amended by voiding it with a reason and
+ * filing a new one, which is what §19 means by "void, never delete" — the file
+ * then shows both, and an inspector can see what changed and why. A verified
+ * record is doubly closed: somebody else has already attested to it.
+ */
+export function fssaiRecordIsEditable(status: string | null | undefined): boolean {
+  return String(status || 'draft') === 'draft';
+}
+
+/**
+ * WHY THIS PERSON CANNOT VOID THIS RECORD, in words, or '' if they can.
+ *
+ * One helper for all of P4-P6 because §19 is a single rule and eight lanes
+ * writing it eight times is eight chances to drop the reason check. Measured
+ * precedent for why the reason matters: goods_receipt_notes is the only
+ * complete void implementation in this codebase and its void_reason is
+ * mandatory in the route, not in the schema — a schema cannot require it,
+ * because ALTER cannot add a CHECK (db.ts header).
+ *
+ * MANAGEMENT ONLY, and deliberately NOT "whoever recorded it": the person who
+ * wrote a failing reading is exactly the person with a motive to make it go
+ * away. This mirrors canVerifyFssai's §7 Q3 reasoning on the other side of the
+ * same record.
+ */
+export function fssaiVoidRefusal(
+  me: FssaiActor | null | undefined,
+  row: { status?: string | null; voided_at?: string | null } | null | undefined,
+  reason: string | null | undefined,
+): string {
+  if (!me) return 'You are not signed in.';
+  if (!canManageFssaiCa(me)) return 'Only a manager, head of department or admin may void a compliance record.';
+  if (!row) return 'That record no longer exists.';
+  if (String(row.status || '') === 'void' || String(row.voided_at || '')) return 'That record has already been voided.';
+  if (String(reason || '').trim().length < 4) return 'Say in words why this record is being voided — a void with no reason is not an audit trail.';
+  return '';
+}
+
+/**
+ * The record tables P10 must be able to void and audit, with the words a screen
+ * uses for one of their rows.
+ *
+ * ONE LIST, because §19 is "void, never delete" for ALL of them and the audit
+ * surface has to enumerate them somewhere. It is also the allowlist a generic
+ * void route validates `entity_table` against — without it, a caller-supplied
+ * table name reaches SQL, and this module's own audit row would name a table
+ * that does not exist.
+ */
+export const FSSAI_RECORD_TABLES: readonly { table: string; one: string; many: string; path: string }[] = [
+  { table: 'fssai_runs',               one: 'checklist record',       many: 'Checklist records',       path: '/fssai/checklists' },
+  { table: 'fssai_receiving_checks',   one: 'delivery inspection',    many: 'Delivery inspections',    path: '/fssai/receiving' },
+  { table: 'fssai_temperature_logs',   one: 'temperature reading',    many: 'Temperature readings',    path: '/fssai/temperature' },
+  { table: 'fssai_equipment_events',   one: 'equipment event',        many: 'Equipment events',        path: '/fssai/cold-rooms' },
+  { table: 'fssai_expiry_items',       one: 'expiry entry',           many: 'Expiry and disposal',     path: '/fssai/fifo' },
+  { table: 'fssai_oil_checks',         one: 'oil check',              many: 'Oil checks',              path: '/fssai/oil-quality' },
+  { table: 'fssai_oil_disposals',      one: 'used-oil collection',    many: 'Used-oil collections',    path: '/fssai/oil-quality' },
+  { table: 'fssai_water_tests',        one: 'water or ice test',      many: 'Water and ice tests',     path: '/fssai/water-ice' },
+  { table: 'fssai_pest_services',      one: 'pest control visit',     many: 'Pest control visits',     path: '/fssai/pest-control' },
+  { table: 'fssai_pest_sightings',     one: 'pest sighting',          many: 'Pest sightings',          path: '/fssai/pest-control' },
+  { table: 'fssai_documents',          one: 'document',               many: 'Documents and certificates', path: '/fssai/documents' },
+  { table: 'fssai_inspections',        one: 'inspection',             many: 'Inspections',             path: '/fssai/inspections' },
+  { table: 'fssai_corrective_actions', one: 'corrective action',      many: 'Corrective actions',      path: '/fssai/corrective-actions' },
+] as const;
+
+export function fssaiRecordTable(table: string | null | undefined) {
+  return FSSAI_RECORD_TABLES.find((t) => t.table === String(table || '')) || null;
+}
+
+/* ------------------------------------------------------------------ *
+ * 14.2 THE THREE-WAY TICK-BOX — and the trap it exists to avoid
+ * ------------------------------------------------------------------ */
+
+/**
+ * A named checkpoint on a record: not assessed, in order, not in order, or not
+ * applicable.
+ *
+ * WHY THIS IS TEXT AND NOT AN INTEGER, which is the single most important
+ * decision in this section. goods_receipt_notes carries six INTEGER tick-boxes
+ * (qc_quality, qc_temperature, qc_expiry, qc_damage, qc_weight,
+ * qc_invoice_match) and MEASURED on the live snapshot: 29 GRNs exist and all
+ * six columns sum to 0 across every one of them. That 0 is unreadable. It means
+ * either "the checker looked and it was wrong" or "nobody ticked anything", and
+ * those are opposite statements about a delivery. An integer column with a
+ * DEFAULT cannot tell them apart, so a report over it either over-counts
+ * failures or silently treats an un-done check as a pass.
+ *
+ * '' is therefore "not assessed" and it is the default; 'ok' and 'not_ok' are
+ * both deliberate acts; 'na' is a deliberate act too ("no cold items on this
+ * delivery"). Only 'not_ok' is a failure — see fssaiCheckResultIsFail.
+ */
+export type FssaiCheckResult = '' | 'ok' | 'not_ok' | 'na';
+
+export const FSSAI_CHECK_RESULTS: readonly { key: FssaiCheckResult; label: string; color: string }[] = [
+  { key: '',       label: 'Not checked',  color: 'bg-gray-100 text-gray-500 border-gray-200' },
+  { key: 'ok',     label: 'In order',     color: 'bg-green-100 text-green-700 border-green-200' },
+  { key: 'not_ok', label: 'Not in order', color: 'bg-red-100 text-red-700 border-red-200' },
+  { key: 'na',     label: 'Not applicable', color: 'bg-slate-100 text-slate-600 border-slate-200' },
+] as const;
+
+export function isFssaiCheckResult(v: string | null | undefined): v is FssaiCheckResult {
+  return FSSAI_CHECK_RESULTS.some((r) => r.key === String(v ?? ''));
+}
+
+/** Only an explicit 'not_ok' is a failure. '' is unanswered, never a fail. */
+export function fssaiCheckResultIsFail(v: string | null | undefined): boolean {
+  return String(v ?? '') === 'not_ok';
+}
+
+/** Was this checkpoint actually assessed either way? '' and nothing else is no. */
+export function fssaiCheckResultAnswered(v: string | null | undefined): boolean {
+  const s = String(v ?? '');
+  return s === 'ok' || s === 'not_ok' || s === 'na';
+}
+
+export function fssaiCheckResultLabel(v: string | null | undefined): string {
+  return (FSSAI_CHECK_RESULTS.find((r) => r.key === String(v ?? ''))?.label) || String(v ?? '');
+}
+
+/* ------------------------------------------------------------------ *
+ * 14.3 A READING AGAINST A RANGE — temperature, oil, water
+ * ------------------------------------------------------------------ */
+
+/** fssai_temperature_logs.uom and fssai_equipment.temp_uom. */
+export const FSSAI_TEMP_UOMS: readonly { key: string; label: string }[] = [
+  { key: 'C', label: '°C' },
+  { key: 'F', label: '°F' },
+] as const;
+
+/**
+ * A reading in Celsius, whatever unit it was taken in.
+ *
+ * Needed because the range on a piece of equipment and the reading on a
+ * borrowed probe may not share a unit, and comparing 40 (F) against a 0-5 (C)
+ * range passes a fridge that is actually at 4.4 C only by accident. Returns
+ * null for anything that is not a finite number — never 0, which would read as
+ * a freezing reading.
+ */
+export function fssaiTempInC(value: number | null | undefined, uom: string | null | undefined): number | null {
+  if (value === null || value === undefined || !Number.isFinite(Number(value))) return null;
+  const v = Number(value);
+  return String(uom || 'C').toUpperCase() === 'F' ? (v - 32) * (5 / 9) : v;
+}
+
+/**
+ * IS THIS READING OUTSIDE ITS RANGE, and in which direction, in words.
+ *
+ * Shared by the temperature log, the oil check and the water test because all
+ * three ask the identical question and all three must phrase the answer the
+ * same way on the record and in the corrective action it raises.
+ *
+ * TWO THINGS IT DELIBERATELY DOES NOT DO:
+ *   · It does not round. evaluateFssaiAnswer already carries this rule for
+ *     checklist answers and the reason is written there: rounding 5.4 to 5 lets
+ *     a failing fridge pass a 0-5 rule. `decimals` is for DISPLAY.
+ *   · It does not treat a missing range as a pass or a fail. No range means the
+ *     reading is recorded and nothing is judged — which is the honest answer
+ *     before the owner has set his standards, and is why `judged` is separate
+ *     from `out_of_range`.
+ */
+export function fssaiRangeCheck(
+  value: number | null | undefined,
+  min: number | null | undefined,
+  max: number | null | undefined,
+  uom = '',
+): { judged: boolean; out_of_range: boolean; why: string } {
+  const v = value === null || value === undefined || !Number.isFinite(Number(value)) ? null : Number(value);
+  const lo = min === null || min === undefined || !Number.isFinite(Number(min)) ? null : Number(min);
+  const hi = max === null || max === undefined || !Number.isFinite(Number(max)) ? null : Number(max);
+  const u = uom ? ` ${uom}` : '';
+  if (v === null) return { judged: false, out_of_range: false, why: 'No reading was entered.' };
+  if (lo === null && hi === null) return { judged: false, out_of_range: false, why: 'No safe range has been set for this, so the reading is recorded but not judged.' };
+  if (lo !== null && v < lo) return { judged: true, out_of_range: true, why: `${v}${u} is below the safe minimum of ${lo}${u}.` };
+  if (hi !== null && v > hi) return { judged: true, out_of_range: true, why: `${v}${u} is above the safe maximum of ${hi}${u}.` };
+  return { judged: true, out_of_range: false, why: `${v}${u} is within range.` };
+}
+
+/* ------------------------------------------------------------------ *
+ * 14.4 P4 — RECEIVING QC
+ * ------------------------------------------------------------------ */
+
+/**
+ * The named checkpoints on a received line.
+ *
+ * The first six are the SAME six the GRN already carries (goods_receipt_notes
+ * qc_quality / qc_temperature / qc_expiry / qc_damage / qc_weight /
+ * qc_invoice_match), so a delivery inspected here can be read beside the GRN
+ * without a translation table. `label` is the seventh and is new: FSSAI
+ * labelling (name, batch/lot, use-by, veg/non-veg mark) is a checkpoint the
+ * purchasing module never had a reason to carry.
+ *
+ * `cold_only` marks the checkpoints that mean nothing on a sack of flour, so a
+ * screen can offer 'na' as the obvious answer instead of an empty box.
+ */
+export const FSSAI_RECEIVING_CHECKPOINTS: readonly {
+  key: string; column: string; label: string; hint: string; cold_only?: true;
+}[] = [
+  { key: 'quality',       column: 'chk_quality',       label: 'Quality',            hint: 'Look, smell and condition on arrival.' },
+  { key: 'temperature',   column: 'chk_temperature',   label: 'Temperature',        hint: 'Probed or surface reading against the range for this item.', cold_only: true },
+  { key: 'expiry',        column: 'chk_expiry',        label: 'Date code',          hint: 'Use-by or best-before, and enough shelf life left to use it.' },
+  { key: 'damage',        column: 'chk_damage',        label: 'Packaging',          hint: 'Torn, crushed, leaking, swollen or opened packs.' },
+  { key: 'weight',        column: 'chk_weight',        label: 'Weight or count',    hint: 'What arrived against what the bill says.' },
+  { key: 'invoice_match', column: 'chk_invoice_match', label: 'Bill matches',       hint: 'Item, rate and quantity as ordered.' },
+  { key: 'label',         column: 'chk_label',         label: 'Labelling',          hint: 'Name, lot or batch, date, and the veg / non-veg mark.' },
+] as const;
+
+/** What was decided about a received line. */
+export type FssaiReceivingDecision = '' | 'accepted' | 'partially_accepted' | 'rejected';
+
+export const FSSAI_RECEIVING_DECISIONS: readonly FssaiStatusMeta[] = [
+  { key: '',                   label: 'Not decided',        color: 'bg-gray-100 text-gray-500 border-gray-200' },
+  { key: 'accepted',           label: 'Accepted',           color: 'bg-green-100 text-green-700 border-green-200' },
+  { key: 'partially_accepted', label: 'Partly accepted',    color: 'bg-amber-100 text-amber-800 border-amber-200' },
+  { key: 'rejected',           label: 'Rejected',           color: 'bg-red-100 text-red-700 border-red-200' },
+] as const;
+
+export function fssaiReceivingDecisionMeta(key: string | null | undefined): FssaiStatusMeta {
+  return metaFrom(FSSAI_RECEIVING_DECISIONS, key);
+}
+
+/**
+ * The decision the QUANTITIES imply, so a screen can propose it and a report
+ * can never show "Accepted" beside a rejected quantity.
+ *
+ * It is a PROPOSAL, not an override: the stored column is what the checker
+ * decided, and a line may be rejected outright on quality with nothing sent
+ * back yet. Returns '' when nothing has been entered, so an untouched line
+ * never reads as accepted.
+ */
+export function fssaiReceivingDecisionFor(
+  received: number | null | undefined,
+  accepted: number | null | undefined,
+): FssaiReceivingDecision {
+  const r = Number(received);
+  const a = Number(accepted);
+  if (!Number.isFinite(r) || r <= 0 || !Number.isFinite(a)) return '';
+  if (a <= 0) return 'rejected';
+  if (a >= r) return 'accepted';
+  return 'partially_accepted';
+}
+
+/**
+ * Why a line was sent back. A CODED list, not free text, because §18's reports
+ * ask "what do we reject this vendor for" and free text cannot be grouped.
+ * 'other' keeps the free-text column honest instead of forcing a wrong code.
+ */
+export const FSSAI_REJECT_REASONS: readonly { key: string; label: string }[] = [
+  { key: 'temperature',      label: 'Arrived too warm or too cold' },
+  { key: 'expired',          label: 'Past its date' },
+  { key: 'near_expiry',      label: 'Too little shelf life left' },
+  { key: 'damaged',          label: 'Damaged or leaking packaging' },
+  { key: 'short_weight',     label: 'Short weight or short count' },
+  { key: 'poor_quality',     label: 'Poor quality — look, smell or condition' },
+  { key: 'pest_evidence',    label: 'Signs of pests' },
+  { key: 'no_label',         label: 'Missing or unreadable label' },
+  { key: 'wrong_item',       label: 'Not what was ordered' },
+  { key: 'no_supplier_licence', label: 'Supplier licence missing or expired' },
+  { key: 'unhygienic_vehicle',  label: 'Vehicle or handler not hygienic' },
+  { key: 'other',            label: 'Other — say why' },
+] as const;
+
+/* ------------------------------------------------------------------ *
+ * 14.5 P4 — TEMPERATURE LOGS AND EQUIPMENT
+ * ------------------------------------------------------------------ */
+
+/**
+ * WHAT a temperature reading is of. fssai_temperature_logs.log_kind.
+ *
+ * One table and a kind column, not nine tables: every one of these is the same
+ * record — a number, a time, a range and a person — and §24's rule ("dynamic
+ * and configurable rather than a separate table for every checklist") applies
+ * with even more force to readings than to checklists.
+ *
+ * `direction` is what the screen needs to phrase a failure the right way round:
+ * a chiller fails by being TOO WARM and hot holding fails by being TOO COOL, so
+ * "above the maximum" is the alarming half for one and "below the minimum" for
+ * the other. `window_minutes` marks the two kinds where the FSSAI rule is a
+ * RATE, not a level — cooling and reheating are judged on reaching a
+ * temperature within a time, which is why fssai_temp_standards carries
+ * max_minutes.
+ */
+export type FssaiTempLogKind =
+  | 'equipment'
+  | 'food'
+  | 'delivery'
+  | 'hot_holding'
+  | 'cooking'
+  | 'cooling'
+  | 'reheating'
+  | 'thawing'
+  | 'probe_calibration';
+
+export const FSSAI_TEMP_LOG_KINDS: readonly {
+  key: FssaiTempLogKind; label: string; hint: string; direction: 'cold' | 'hot' | 'either'; window_minutes?: true;
+}[] = [
+  { key: 'equipment',         label: 'Equipment',          hint: 'A cold room, chiller, freezer or hot cabinet read on its round.', direction: 'cold' },
+  { key: 'food',              label: 'Food probe',         hint: 'A probe into the food itself, in storage or on the line.',        direction: 'either' },
+  { key: 'delivery',          label: 'Delivery',           hint: 'Taken at the door as goods arrive.',                              direction: 'cold' },
+  { key: 'hot_holding',       label: 'Hot holding',        hint: 'Food held hot for service.',                                      direction: 'hot' },
+  { key: 'cooking',           label: 'Cooking',            hint: 'Core temperature at the end of cooking.',                         direction: 'hot' },
+  { key: 'cooling',           label: 'Cooling',            hint: 'Cooked food on its way down, judged against the clock.',          direction: 'cold', window_minutes: true },
+  { key: 'reheating',         label: 'Reheating',          hint: 'Food brought back up, judged against the clock.',                 direction: 'hot',  window_minutes: true },
+  { key: 'thawing',           label: 'Thawing',            hint: 'Frozen food being brought up under control.',                     direction: 'cold' },
+  { key: 'probe_calibration', label: 'Probe calibration',  hint: 'The thermometer checked against ice or boiling water.',            direction: 'either' },
+] as const;
+
+export function isFssaiTempLogKind(v: string | null | undefined): v is FssaiTempLogKind {
+  return FSSAI_TEMP_LOG_KINDS.some((k) => k.key === String(v || ''));
+}
+
+export function fssaiTempLogKindLabel(v: string | null | undefined): string {
+  return FSSAI_TEMP_LOG_KINDS.find((k) => k.key === String(v || ''))?.label || String(v || '');
+}
+
+/**
+ * HOW a reading got into the log. fssai_temperature_logs.source_kind.
+ *
+ * It matters for the audit trail: a reading that came from a checklist answer
+ * is covered by that round's signature and its sheet digest, while a reading
+ * typed straight onto the temperature screen is not. A report that mixes them
+ * without saying so overstates how much of the file is signed for.
+ */
+export const FSSAI_TEMP_SOURCES: readonly { key: string; label: string }[] = [
+  { key: 'manual',    label: 'Entered directly' },
+  { key: 'checklist', label: 'From a checklist answer' },
+  { key: 'receiving', label: 'From a delivery inspection' },
+  { key: 'device',    label: 'From a logging device' },
+] as const;
+
+/**
+ * What happens TO a piece of equipment, as opposed to a reading off it.
+ * fssai_equipment_events.event_kind.
+ *
+ * These are the entries an inspector asks for when a reading is out of range:
+ * was the unit defrosted, was it repaired, was the thermometer ever checked.
+ * 'calibration' is here rather than in its own table because the shape is
+ * identical — a before value, a reference, an after value and a verdict.
+ */
+export const FSSAI_EQUIPMENT_EVENT_KINDS: readonly { key: string; label: string; hint: string }[] = [
+  { key: 'defrost',       label: 'Defrost',             hint: 'Planned or forced defrost of a cold unit.' },
+  { key: 'cleaning',      label: 'Deep clean',          hint: 'Beyond the daily wipe-down — a recorded clean of the unit.' },
+  { key: 'breakdown',     label: 'Breakdown',           hint: 'The unit stopped holding temperature.' },
+  { key: 'repair',        label: 'Repair or service',   hint: 'What was done, by whom, and when it is next due.' },
+  { key: 'calibration',   label: 'Calibration',         hint: 'Thermometer or probe checked against a known reference.' },
+  { key: 'out_of_service', label: 'Taken out of use',   hint: 'The unit is not to be loaded until it is back.' },
+  { key: 'back_in_service', label: 'Back in use',       hint: 'Checked and loaded again.' },
+  { key: 'filter_change', label: 'Filter change',       hint: 'Water or air filter replaced.' },
+] as const;
+
+/* ------------------------------------------------------------------ *
+ * 14.6 P5 — FIFO / FEFO, EXPIRY AND DISPOSAL
+ * ------------------------------------------------------------------ */
+
+/**
+ * How many days ahead counts as "near expiry" before the owner sets his own.
+ *
+ * A DEFAULT, NOT A RULE: it belongs on fssai_item_shelf_life.near_expiry_days
+ * per item and in Settings globally, because a 7-day warning on milk is useless
+ * and on canned tomatoes is noise. Nothing in the module may compare against a
+ * literal — that is the §5 "never hard-coded" rule applied to dates.
+ */
+export const FSSAI_NEAR_EXPIRY_DAYS = 3;
+
+export type FssaiExpiryState = 'none' | 'ok' | 'near_expiry' | 'expired';
+
+export const FSSAI_EXPIRY_STATES: readonly FssaiStatusMeta[] = [
+  { key: 'none',        label: 'No date',     color: 'bg-gray-100 text-gray-500 border-gray-200' },
+  { key: 'ok',          label: 'In date',     color: 'bg-green-100 text-green-700 border-green-200' },
+  { key: 'near_expiry', label: 'Use first',   color: 'bg-amber-100 text-amber-800 border-amber-200' },
+  { key: 'expired',     label: 'Past date',   color: 'bg-red-100 text-red-700 border-red-200' },
+] as const;
+
+export function fssaiExpiryStateMeta(key: string | null | undefined): FssaiStatusMeta {
+  return metaFrom(FSSAI_EXPIRY_STATES, key);
+}
+
+/**
+ * The state of one dated item, from its expiry date alone.
+ *
+ * 'none' for a blank or malformed date and NEVER 'ok' — which is the whole
+ * reason this is a shared helper. MEASURED on the live snapshot: all 952 items
+ * carry a blank shelf life, so a FIFO screen that treats "no date" as "in date"
+ * would paint the entire store green and say nothing at all. 'none' is what
+ * makes the gap visible.
+ */
+export function fssaiExpiryState(
+  expiryISO: string | null | undefined,
+  todayISO: string,
+  nearDays: number = FSSAI_NEAR_EXPIRY_DAYS,
+): FssaiExpiryState {
+  const e = String(expiryISO || '');
+  if (!isISODate(e) || !isISODate(todayISO)) return 'none';
+  const days = daysBetweenISO(todayISO, e);
+  if (!Number.isFinite(days)) return 'none';
+  if (days < 0) return 'expired';
+  const window = Number.isFinite(Number(nearDays)) && Number(nearDays) >= 0 ? Number(nearDays) : FSSAI_NEAR_EXPIRY_DAYS;
+  return days <= window ? 'near_expiry' : 'ok';
+}
+
+/** Why an item is on the expiry register. fssai_expiry_items.state. */
+export const FSSAI_EXPIRY_REASONS: readonly { key: string; label: string }[] = [
+  { key: 'near_expiry', label: 'Near its date' },
+  { key: 'expired',     label: 'Past its date' },
+  { key: 'damaged',     label: 'Damaged' },
+  { key: 'spoiled',     label: 'Spoiled' },
+  { key: 'unlabelled',  label: 'No label or date' },
+  { key: 'recalled',    label: 'Recalled by the supplier' },
+] as const;
+
+/**
+ * What was DONE about it. fssai_expiry_items.action_taken.
+ *
+ * ⚠️ NONE OF THESE MOVES STOCK. HARD RULE 5 freezes the material-movement flow
+ * and FSSAI only observes it: 'discarded' here records that a discard happened
+ * and who witnessed it, and the stock adjustment is still made in the inventory
+ * module by whoever owns that number. A disposal register that silently wrote
+ * stock would put two different authorities on one quantity.
+ */
+export const FSSAI_EXPIRY_ACTIONS: readonly { key: string; label: string }[] = [
+  { key: '',           label: 'Not decided yet' },
+  { key: 'use_first',  label: 'Moved to the front to use first' },
+  { key: 'relabelled', label: 'Relabelled with its real date' },
+  { key: 'segregated', label: 'Segregated and held' },
+  { key: 'returned',   label: 'Returned to the supplier' },
+  { key: 'discarded',  label: 'Discarded' },
+] as const;
+
+/** How an item is kept. fssai_item_shelf_life.storage_condition. */
+export const FSSAI_STORAGE_CONDITIONS: readonly { key: string; label: string; hint: string }[] = [
+  { key: 'ambient',  label: 'Ambient',  hint: 'Dry store, room temperature.' },
+  { key: 'chilled',  label: 'Chilled',  hint: 'Cold room or chiller.' },
+  { key: 'frozen',   label: 'Frozen',   hint: 'Freezer.' },
+  { key: 'hot',      label: 'Hot held', hint: 'Held above the hot-holding minimum.' },
+] as const;
+
+/* ------------------------------------------------------------------ *
+ * 14.7 P5 — OIL QUALITY
+ * ------------------------------------------------------------------ */
+
+/**
+ * The FSSAI limit on total polar materials in frying oil: 25%. Oil above it
+ * must not be used.
+ *
+ * A DEFAULT IN ONE PLACE, not a rule in the code: it seeds
+ * fssai_temp_standards (code 'OIL-TPM') and every reader goes through the
+ * standard, so the owner can tighten it without a deploy. Never compare a
+ * reading against this constant directly — that is exactly the hard-coding §5
+ * forbids.
+ */
+export const FSSAI_OIL_TPM_LIMIT_PCT = 25;
+
+/** How the oil was judged. fssai_oil_checks.method. */
+export const FSSAI_OIL_METHODS: readonly { key: string; label: string; hint: string }[] = [
+  { key: 'tpm_meter',  label: 'TPM meter',   hint: 'A number from the meter — the one an inspector trusts.' },
+  { key: 'test_strip', label: 'Test strip',  hint: 'Colour band read off the strip.' },
+  { key: 'sensory',    label: 'Look and smell', hint: 'Colour, smoke, foam and smell. Honest, but not a measurement.' },
+] as const;
+
+/** What was done to the oil. fssai_oil_checks.action_taken. */
+export const FSSAI_OIL_ACTIONS: readonly { key: string; label: string }[] = [
+  { key: '',          label: 'Nothing — in use' },
+  { key: 'topped_up', label: 'Topped up' },
+  { key: 'filtered',  label: 'Filtered' },
+  { key: 'changed',   label: 'Changed completely' },
+  { key: 'withdrawn', label: 'Taken out of use' },
+] as const;
+
+/* ------------------------------------------------------------------ *
+ * 14.8 P5 — WATER AND ICE
+ * ------------------------------------------------------------------ */
+
+/**
+ * What kind of water or ice record this is. fssai_water_tests.test_kind.
+ *
+ * A lab report and a daily chlorine reading sit in ONE table because the
+ * question an inspector asks is one question — "show me your water records" —
+ * and splitting them means every report unions two tables. The lab report's
+ * variable parameter list lives in parameters_json for the same reason
+ * fssai_questions.options_json is JSON: ordered, variable-length, never
+ * filtered in SQL.
+ */
+export const FSSAI_WATER_TEST_KINDS: readonly { key: string; label: string; hint: string; is_lab?: true }[] = [
+  { key: 'lab_report',    label: 'Lab report',        hint: 'A potability certificate from a laboratory.', is_lab: true },
+  { key: 'chlorine',      label: 'Residual chlorine', hint: 'Free chlorine at the tap, in ppm.' },
+  { key: 'tds',           label: 'TDS',               hint: 'Total dissolved solids, in ppm.' },
+  { key: 'ph',            label: 'pH',                hint: 'Acidity of the supply.' },
+  { key: 'hardness',      label: 'Hardness',          hint: 'As CaCO3, in ppm.' },
+  { key: 'ice_check',     label: 'Ice check',         hint: 'Ice machine, scoop and store — clean, covered, no bare hands.' },
+  { key: 'tank_cleaning', label: 'Tank cleaning',     hint: 'Storage tank cleaned and the date it is next due.' },
+  { key: 'filter_change', label: 'Filter change',     hint: 'RO or sediment filter replaced.' },
+] as const;
+
+export function fssaiWaterTestKind(v: string | null | undefined) {
+  return FSSAI_WATER_TEST_KINDS.find((k) => k.key === String(v || '')) || null;
+}
+
+/* ------------------------------------------------------------------ *
+ * 14.9 P6 — PEST CONTROL
+ * ------------------------------------------------------------------ */
+
+/** What was seen. fssai_pest_sightings.pest_type. */
+export const FSSAI_PEST_TYPES: readonly { key: string; label: string }[] = [
+  { key: 'rodent',    label: 'Rodent' },
+  { key: 'cockroach', label: 'Cockroach' },
+  { key: 'fly',       label: 'Fly' },
+  { key: 'mosquito',  label: 'Mosquito' },
+  { key: 'ant',       label: 'Ant' },
+  { key: 'bird',      label: 'Bird' },
+  { key: 'lizard',    label: 'Lizard' },
+  { key: 'stored_product', label: 'Weevil or stored-product insect' },
+  { key: 'other',     label: 'Other' },
+] as const;
+
+/**
+ * What was actually seen, as opposed to the pest itself — droppings and gnaw
+ * marks are evidence an inspector counts, and a log that only records live
+ * sightings misses most of what staff actually find.
+ */
+export const FSSAI_PEST_EVIDENCE_KINDS: readonly { key: string; label: string }[] = [
+  { key: 'live',       label: 'Live pest' },
+  { key: 'dead',       label: 'Dead pest' },
+  { key: 'droppings',  label: 'Droppings' },
+  { key: 'gnaw_marks', label: 'Gnaw or chew marks' },
+  { key: 'nesting',    label: 'Nesting material' },
+  { key: 'smear',      label: 'Smear marks' },
+  { key: 'device_catch', label: 'Caught in a device' },
+] as const;
+
+export const FSSAI_PEST_SEVERITIES: readonly FssaiStatusMeta[] = [
+  { key: 'low',    label: 'One-off',   color: 'bg-yellow-100 text-yellow-800 border-yellow-200' },
+  { key: 'medium', label: 'Recurring', color: 'bg-amber-100 text-amber-800 border-amber-200' },
+  { key: 'high',   label: 'Infestation', color: 'bg-red-100 text-red-700 border-red-200' },
+] as const;
+
+export function fssaiPestSeverityMeta(key: string | null | undefined): FssaiStatusMeta {
+  return metaFrom(FSSAI_PEST_SEVERITIES, key);
+}
+
+/** Why the contractor came. fssai_pest_services.service_kind. */
+export const FSSAI_PEST_SERVICE_KINDS: readonly { key: string; label: string }[] = [
+  { key: 'scheduled', label: 'Scheduled visit' },
+  { key: 'follow_up', label: 'Follow-up' },
+  { key: 'emergency', label: 'Called out' },
+  { key: 'fogging',   label: 'Fogging' },
+  { key: 'baiting',   label: 'Baiting' },
+  { key: 'inspection', label: 'Inspection only' },
+] as const;
+
+/**
+ * Where the visit stands. fssai_pest_services.status.
+ *
+ * 'missed' is the value that earns this its own vocabulary: a contract visit
+ * that did not happen is the single most common pest-control finding, and a
+ * schema with only planned/completed cannot record it — the row would either
+ * sit as "planned" forever or be deleted, and §19 forbids the second.
+ */
+export const FSSAI_PEST_SERVICE_STATUSES: readonly FssaiStatusMeta[] = [
+  { key: 'planned',   label: 'Planned',   color: 'bg-gray-100 text-gray-600 border-gray-200' },
+  { key: 'completed', label: 'Completed', color: 'bg-green-100 text-green-700 border-green-200' },
+  { key: 'missed',    label: 'Missed',    color: 'bg-red-100 text-red-700 border-red-200' },
+  { key: 'cancelled', label: 'Cancelled', color: 'bg-slate-100 text-slate-600 border-slate-200' },
+] as const;
+
+export function fssaiPestServiceStatusMeta(key: string | null | undefined): FssaiStatusMeta {
+  return metaFrom(FSSAI_PEST_SERVICE_STATUSES, key);
+}
+
+/** Monitoring points on the pest map. fssai_pest_devices.device_kind. */
+export const FSSAI_PEST_DEVICE_KINDS: readonly { key: string; label: string }[] = [
+  { key: 'bait_station', label: 'Bait station' },
+  { key: 'glue_board',   label: 'Glue board' },
+  { key: 'fly_unit',     label: 'Insect light trap' },
+  { key: 'rodent_trap',  label: 'Rodent trap' },
+  { key: 'pheromone',    label: 'Pheromone trap' },
+  { key: 'air_curtain',  label: 'Air curtain' },
+  { key: 'other',        label: 'Other' },
+] as const;
+
+/* ------------------------------------------------------------------ *
+ * 14.10 P6 — DOCUMENTS AND CERTIFICATES
+ * ------------------------------------------------------------------ */
+
+/**
+ * What kind of paper this is. fssai_documents.doc_type.
+ *
+ * `scope` is what tells the screen which other id the document hangs off:
+ * 'vendor' needs a supplier, 'person' needs a staff email, 'equipment' needs a
+ * unit, 'outlet' needs nothing. Without it, every document form would show
+ * every field.
+ */
+export const FSSAI_DOC_TYPES: readonly {
+  key: string; label: string; scope: 'outlet' | 'vendor' | 'person' | 'equipment'; renews?: true;
+}[] = [
+  { key: 'fssai_licence',      label: 'FSSAI licence or registration', scope: 'outlet',    renews: true },
+  { key: 'trade_licence',      label: 'Trade licence',                 scope: 'outlet',    renews: true },
+  { key: 'fire_noc',           label: 'Fire NOC',                      scope: 'outlet',    renews: true },
+  { key: 'gst',                label: 'GST registration',              scope: 'outlet' },
+  { key: 'insurance',          label: 'Insurance',                     scope: 'outlet',    renews: true },
+  { key: 'water_test',         label: 'Water test report',             scope: 'outlet',    renews: true },
+  { key: 'pest_contract',      label: 'Pest control contract',         scope: 'vendor',    renews: true },
+  { key: 'supplier_licence',   label: 'Supplier FSSAI licence',        scope: 'vendor',    renews: true },
+  { key: 'medical_fitness',    label: 'Medical fitness certificate',   scope: 'person',    renews: true },
+  { key: 'food_handler_training', label: 'Food handler training',      scope: 'person',    renews: true },
+  { key: 'calibration_certificate', label: 'Calibration certificate',  scope: 'equipment', renews: true },
+  { key: 'amc',                label: 'Service contract (AMC)',        scope: 'equipment', renews: true },
+  { key: 'lease',              label: 'Lease or premises document',    scope: 'outlet' },
+  { key: 'other',              label: 'Other',                         scope: 'outlet' },
+] as const;
+
+export function fssaiDocType(key: string | null | undefined) {
+  return FSSAI_DOC_TYPES.find((d) => d.key === String(key || '')) || null;
+}
+
+/** How many days before expiry the reminder starts, before the owner sets it. */
+export const FSSAI_DOC_REMINDER_DAYS = 30;
+
+export type FssaiDocState = 'no_expiry' | 'valid' | 'expiring' | 'expired';
+
+export const FSSAI_DOC_STATES: readonly FssaiStatusMeta[] = [
+  { key: 'no_expiry', label: 'No expiry',      color: 'bg-gray-100 text-gray-500 border-gray-200' },
+  { key: 'valid',     label: 'Valid',          color: 'bg-green-100 text-green-700 border-green-200' },
+  { key: 'expiring',  label: 'Expiring soon',  color: 'bg-amber-100 text-amber-800 border-amber-200' },
+  { key: 'expired',   label: 'EXPIRED',        color: 'bg-red-100 text-red-700 border-red-200' },
+] as const;
+
+export function fssaiDocStateMeta(key: string | null | undefined): FssaiStatusMeta {
+  return metaFrom(FSSAI_DOC_STATES, key);
+}
+
+/**
+ * The expiry state of one document, DERIVED and never stored.
+ *
+ * Deliberately not a column: a stored 'expiring' goes stale at midnight with
+ * nothing to wake it, and a licence that reads "Valid" the day after it lapsed
+ * is the worst single row this module could render. Same shape as
+ * fssaiExpiryState above, with the document's own reminder window.
+ */
+export function fssaiDocState(
+  expiryISO: string | null | undefined,
+  todayISO: string,
+  reminderDays: number | null | undefined = FSSAI_DOC_REMINDER_DAYS,
+): FssaiDocState {
+  const e = String(expiryISO || '');
+  if (!isISODate(e) || !isISODate(todayISO)) return 'no_expiry';
+  const days = daysBetweenISO(todayISO, e);
+  if (!Number.isFinite(days)) return 'no_expiry';
+  if (days < 0) return 'expired';
+  const w = Number.isFinite(Number(reminderDays)) && Number(reminderDays) >= 0 ? Number(reminderDays) : FSSAI_DOC_REMINDER_DAYS;
+  return days <= w ? 'expiring' : 'valid';
+}
+
+/* ------------------------------------------------------------------ *
+ * 14.11 P9 — INSPECTIONS AND FINDINGS
+ * ------------------------------------------------------------------ */
+
+/** Who inspected. fssai_inspections.inspection_kind. */
+export const FSSAI_INSPECTION_KINDS: readonly { key: string; label: string; external?: true }[] = [
+  { key: 'fssai_officer',  label: 'FSSAI officer',        external: true },
+  { key: 'municipal',      label: 'Municipal or local body', external: true },
+  { key: 'third_party',    label: 'Third-party audit',    external: true },
+  { key: 'customer_audit', label: 'Customer or aggregator audit', external: true },
+  { key: 'internal',       label: 'Internal audit' },
+] as const;
+
+export const FSSAI_INSPECTION_STATUSES: readonly FssaiStatusMeta[] = [
+  { key: 'planned',     label: 'Planned',      color: 'bg-gray-100 text-gray-600 border-gray-200' },
+  { key: 'in_progress', label: 'In progress',  color: 'bg-amber-100 text-amber-800 border-amber-200' },
+  { key: 'open',        label: 'Points open',  color: 'bg-red-100 text-red-700 border-red-200' },
+  { key: 'closed',      label: 'Closed',       color: 'bg-green-100 text-green-700 border-green-200' },
+  { key: 'void',        label: 'Voided',       color: 'bg-gray-100 text-gray-600 border-gray-200' },
+] as const;
+
+export function fssaiInspectionStatusMeta(key: string | null | undefined): FssaiStatusMeta {
+  return metaFrom(FSSAI_INSPECTION_STATUSES, key);
+}
+
+/**
+ * How bad one finding is. The four words an audit report actually uses, in the
+ * order an inspector ranks them — so a report can sort on severity_rank and a
+ * screen can lead with what must be fixed first.
+ */
+export const FSSAI_FINDING_SEVERITIES: readonly (FssaiStatusMeta & { rank: number })[] = [
+  { key: 'critical',    label: 'Critical',    rank: 1, color: 'bg-red-100 text-red-700 border-red-200' },
+  { key: 'major',       label: 'Major',       rank: 2, color: 'bg-orange-100 text-orange-700 border-orange-200' },
+  { key: 'minor',       label: 'Minor',       rank: 3, color: 'bg-amber-100 text-amber-800 border-amber-200' },
+  { key: 'observation', label: 'Observation', rank: 4, color: 'bg-slate-100 text-slate-600 border-slate-200' },
+] as const;
+
+export function fssaiFindingSeverityMeta(key: string | null | undefined): FssaiStatusMeta {
+  return metaFrom(FSSAI_FINDING_SEVERITIES, key);
+}
+
+export function fssaiFindingSeverityRank(key: string | null | undefined): number {
+  return FSSAI_FINDING_SEVERITIES.find((s) => s.key === String(key || ''))?.rank ?? 9;
+}
+
+export const FSSAI_FINDING_STATUSES: readonly FssaiStatusMeta[] = [
+  { key: 'open',        label: 'Open',        color: 'bg-red-100 text-red-700 border-red-200' },
+  { key: 'in_progress', label: 'Being fixed', color: 'bg-amber-100 text-amber-800 border-amber-200' },
+  { key: 'closed',      label: 'Closed',      color: 'bg-green-100 text-green-700 border-green-200' },
+  { key: 'not_accepted', label: 'Not accepted', color: 'bg-slate-100 text-slate-600 border-slate-200' },
+] as const;
+
+export function fssaiFindingStatusMeta(key: string | null | undefined): FssaiStatusMeta {
+  return metaFrom(FSSAI_FINDING_STATUSES, key);
+}
+
+/* ------------------------------------------------------------------ *
+ * 14.12 ATTACHMENTS ON A RECORD THAT IS NOT A CHECKLIST RUN
+ * ------------------------------------------------------------------ */
+
+/**
+ * WHY fssai_attachments EXISTS AND fssai_evidence COULD NOT BE REUSED — read
+ * this before adding a photo to any P4-P6 screen.
+ *
+ * fssai_evidence.run_id is `TEXT NOT NULL` with a FOREIGN KEY to fssai_runs, so
+ * a photograph of a rejected delivery or a rat sighting CANNOT be stored there:
+ * there is no run to point at, and '' would throw with foreign_keys = ON. That
+ * is not an oversight to fix — it is load-bearing. computeFssaiSheetDigest
+ * hashes a run's evidence into the signature that covers the sheet, so every
+ * row in that table is part of somebody's attestation. Widening it to accept
+ * run-less rows would put unsigned photographs inside a signed set.
+ *
+ * So the record tables get their own store with the SAME budget
+ * (FSSAI_PHOTO_* above), the SAME 12-month retention columns and the same
+ * "the row outlives the image" rule. Two consequences the lanes must honour:
+ *   1. The retention sweep must walk BOTH tables. One that only clears
+ *      fssai_evidence silently keeps every delivery photograph forever.
+ *   2. entity_table is validated against this list. A caller-supplied table
+ *      name must never reach SQL, and an attachment pointing at a table that
+ *      does not exist is an orphan nothing will ever show.
+ */
+export const FSSAI_ATTACHMENT_ENTITIES: readonly string[] = [
+  'fssai_receiving_checks',
+  'fssai_receiving_lines',
+  'fssai_temperature_logs',
+  'fssai_equipment',
+  'fssai_equipment_events',
+  'fssai_expiry_items',
+  'fssai_oil_checks',
+  'fssai_oil_disposals',
+  'fssai_water_tests',
+  'fssai_pest_services',
+  'fssai_pest_sightings',
+  'fssai_documents',
+  'fssai_inspections',
+  'fssai_inspection_findings',
+  'fssai_corrective_actions',
+] as const;
+
+export function isFssaiAttachmentEntity(v: string | null | undefined): boolean {
+  return FSSAI_ATTACHMENT_ENTITIES.includes(String(v || ''));
+}
+
+/** What an attachment is. Mirrors FssaiEvidenceKind, plus the paper documents. */
+export const FSSAI_ATTACHMENT_KINDS: readonly { key: string; label: string }[] = [
+  { key: 'photo',       label: 'Photograph' },
+  { key: 'document',    label: 'Scanned document' },
+  { key: 'certificate', label: 'Certificate' },
+  { key: 'report',      label: 'Report' },
+] as const;
+
+/* ------------------------------------------------------------------ *
+ * 14.13 P8 — THE SEED LOG
+ * ------------------------------------------------------------------ */
+
+/**
+ * WHY A SEED NEEDS A LOG AT ALL, which is the one thing P8 must not get wrong.
+ *
+ * The HRMS block in db.ts records the rule in its own words: a seed that runs on
+ * every boot RESURRECTS ROWS AN ADMIN DELETED. The twelve checklists are rows
+ * (§24), the owner is meant to edit and retire them, and INSERT OR IGNORE keyed
+ * on `code` cannot tell "never seeded" from "seeded and then deliberately
+ * removed" — both look like an absent row.
+ *
+ * fssai_seed_log is the memory that closes that gap: a pack writes one row per
+ * pack-version and one per item, and a pack whose marker row exists NEVER RUNS
+ * AGAIN. It is also the only honest answer to "what did the seed actually do",
+ * because the DDL's errors are swallowed per statement.
+ */
+export const FSSAI_SEED_ITEM_KINDS: readonly string[] = [
+  'pack', 'template', 'section', 'question', 'equipment', 'standard', 'document_type',
+] as const;
+
+export const FSSAI_SEED_ACTIONS: readonly { key: string; label: string }[] = [
+  { key: 'inserted', label: 'Created' },
+  { key: 'skipped',  label: 'Already there — left alone' },
+  { key: 'updated',  label: 'Updated' },
+  { key: 'failed',   label: 'Failed' },
+] as const;
+
+/** The marker row's item_kind. A pack with this row present must not re-run. */
+export const FSSAI_SEED_PACK_MARKER = 'pack';

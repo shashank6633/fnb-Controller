@@ -8784,6 +8784,861 @@ const FSSAI_TABLE_DDL: string[] = [
     outlet_id    TEXT NOT NULL DEFAULT '',
     created_at   TEXT NOT NULL DEFAULT (datetime('now'))
   );`,
+
+  /* ══════════════════════════════════════════════════════════════════════════
+   * THE RECORD TABLES (P4-P10) — the shapes the checklist engine cannot hold
+   * ══════════════════════════════════════════════════════════════════════════
+   *
+   * READ §2 OF FSSAI-BUILD-STATE.md BEFORE ADDING ANYTHING HERE. Twelve of the
+   * twenty sub-modules are SEEDED CHECKLIST ROWS, not tables — Food Quality,
+   * Cleaning, Personal Hygiene, Food Storage, Kitchen Safety and the daily FIFO
+   * round are all the same object (a template with typed questions) and ship as
+   * data so the owner edits them in Settings when the rules change. That
+   * decision is settled and is what keeps this module at ~30 tables instead of
+   * ~45. A table below earns its place ONLY because its record has a genuinely
+   * different shape: a per-line accept/reject against a delivery, a number
+   * against a configured range, a batch with a date, a contractor's visit, a
+   * certificate with an expiry.
+   *
+   * EVERY ONE OF THEM FOLLOWS THE ELEVEN ABOVE, column for column, because the
+   * conventions in this namespace are already proven and a second convention is
+   * a defect:
+   *   · id TEXT PRIMARY KEY; outlet_id TEXT NOT NULL DEFAULT '' (§7 Q1 — present
+   *     now, filtering deferred); created_at / updated_at
+   *     TEXT NOT NULL DEFAULT (datetime('now')).
+   *   · An FK column is `TEXT NOT NULL` or nullable `TEXT`, NEVER
+   *     `TEXT NOT NULL DEFAULT ''` — with foreign_keys = ON an insert that
+   *     leaves it '' throws. A reference to a master in ANOTHER module
+   *     (raw_materials, vendors, departments, users, goods_receipt_notes,
+   *     production_batches, tasks) is indexed TEXT + a denormalised label and
+   *     carries NO FK, because three shipped flows hard-delete those masters.
+   *   · No CHECK constraints: ALTER cannot add one, so the shape guard could
+   *     never repair it. Vocabularies live in src/lib/fssai.ts §14.
+   *   · VOID, NEVER DELETE (owner §19): every record table carries
+   *     status + voided_at/voided_by/void_reason, and the reason is mandatory in
+   *     the route (fssaiVoidRefusal). No DELETE path is ever written.
+   *   · A frozen verdict (is_fail) and the thresholds actually applied
+   *     (min_used / max_used) sit ON the record, never recomputed on read — the
+   *     standard may legitimately change and recomputing would rewrite history.
+   *   · Quantities follow the owner's PURCHASE UNIT LEADS rule: the number is
+   *     stored in the unit the screen showed, with uom + pack_size + recipe_uom
+   *     beside it so DualQty can render both without a join.
+   *
+   * ⚠️ A THREE-WAY TICK-BOX IS TEXT, NOT AN INTEGER, and this is the one thing
+   * not to "simplify". goods_receipt_notes carries six INTEGER qc_ tick-boxes
+   * and MEASURED on the live snapshot: 29 GRNs, all six columns summing to 0 on
+   * every one of them. A 0 cannot distinguish "checked and wrong" from "nobody
+   * ticked it", which are opposite statements about a delivery. So the
+   * checkpoint columns below are TEXT with ''|ok|not_ok|na — see
+   * FssaiCheckResult in src/lib/fssai.ts.                                    */
+
+  /* 12. A DELIVERY INSPECTION — the header (owner §2).
+   *     ATTACHED TO THE GRN, NEVER TO purchases: a GRN is the receipt event and
+   *     one GRN has many purchase rows (RECON §5). grn_id is plain TEXT with no
+   *     FK so a door-step inspection can be recorded BEFORE the GRN is raised —
+   *     which is the common case at 6am with a truck waiting — and the GRN is
+   *     attached afterwards. grn_number is denormalised because the sheet must
+   *     still name the delivery if the GRN is later voided.
+   *     run_id is '' unless the inspection was performed through a checklist, in
+   *     which case that round's signature covers it; see source_kind on
+   *     fssai_temperature_logs for why the distinction is recorded and not
+   *     inferred. */
+  `CREATE TABLE IF NOT EXISTS fssai_receiving_checks (
+    id                TEXT PRIMARY KEY,
+    check_no          TEXT NOT NULL DEFAULT '',   -- 'RQC-2026-0001', human-facing; P4 owns the generator
+    business_date     TEXT NOT NULL,              -- YYYY-MM-DD IST — the day the delivery belongs to
+    received_at       TEXT NOT NULL DEFAULT '',   -- HH:MM the vehicle arrived
+    shift             TEXT NOT NULL DEFAULT '',
+    grn_id            TEXT NOT NULL DEFAULT '',   -- goods_receipt_notes.id, no FK: the inspection may precede the GRN
+    grn_number        TEXT NOT NULL DEFAULT '',   -- denormalised: survives a voided GRN
+    po_id             TEXT NOT NULL DEFAULT '',
+    vendor_id         TEXT NOT NULL DEFAULT '',   -- vendors.id
+    vendor_name       TEXT NOT NULL DEFAULT '',
+    supplier_licence_no     TEXT NOT NULL DEFAULT '',  -- the supplier's own FSSAI number, as printed on the bill
+    supplier_licence_expiry TEXT NOT NULL DEFAULT '',
+    invoice_number    TEXT NOT NULL DEFAULT '',
+    department_id     TEXT NOT NULL DEFAULT '',
+    store_id          TEXT NOT NULL DEFAULT '',   -- store_locations.id — where it was received
+    run_id            TEXT NOT NULL DEFAULT '',   -- fssai_runs.id if done through a checklist, else ''
+    -- the vehicle and the person who brought it: the FSSAI checkpoints the
+    -- purchasing module has no reason to carry
+    vehicle_no        TEXT NOT NULL DEFAULT '',
+    vehicle_type      TEXT NOT NULL DEFAULT '',   -- ambient|insulated|refrigerated
+    chk_vehicle_clean TEXT NOT NULL DEFAULT '',   -- ''|ok|not_ok|na
+    chk_handler_hygiene TEXT NOT NULL DEFAULT '',
+    chk_documents     TEXT NOT NULL DEFAULT '',   -- bill, licence, lot details present
+    vehicle_temp_c    REAL,                       -- NULL = not measured, NEVER 0
+    -- the verdict, frozen
+    status            TEXT NOT NULL DEFAULT 'draft',  -- draft|submitted|verified|void
+    outcome           TEXT NOT NULL DEFAULT '',   -- ''|pass|fail
+    line_count        INTEGER NOT NULL DEFAULT 0,
+    fail_count        INTEGER NOT NULL DEFAULT 0,
+    rejected_count    INTEGER NOT NULL DEFAULT 0,
+    remarks           TEXT NOT NULL DEFAULT '',
+    checked_by        TEXT NOT NULL DEFAULT '',   -- users.email
+    checked_name      TEXT NOT NULL DEFAULT '',
+    submitted_at      TEXT NOT NULL DEFAULT '',
+    verified_by       TEXT NOT NULL DEFAULT '',   -- never equal to checked_by — enforced in the route (§7 Q3)
+    verified_at       TEXT NOT NULL DEFAULT '',
+    verify_note       TEXT NOT NULL DEFAULT '',
+    voided_at         TEXT NOT NULL DEFAULT '',
+    voided_by         TEXT NOT NULL DEFAULT '',
+    void_reason       TEXT NOT NULL DEFAULT '',
+    created_by        TEXT NOT NULL DEFAULT '',
+    outlet_id         TEXT NOT NULL DEFAULT '',
+    created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
+  );`,
+
+  /* 13. ONE RECEIVED LINE, ACCEPTED OR REJECTED. The shape the checklist engine
+   *     genuinely cannot hold: a checklist has a fixed question set, a delivery
+   *     has however many lines the vendor brought.
+   *     check_id is `TEXT NOT NULL` with a CASCADE FK — a line has no meaning
+   *     without its inspection, and the inspection is voided rather than
+   *     deleted, so CASCADE only ever fires on a draft being discarded.
+   *     The seven chk_ columns are the six on goods_receipt_notes plus `label`,
+   *     in the same order, so the two can be read side by side.
+   *     QUANTITIES ARE IN THE PURCHASE UNIT the screen showed (owner's rule,
+   *     293 sites). pack_size + recipe_uom travel with them so nothing has to
+   *     join raw_materials to render the second figure. */
+  `CREATE TABLE IF NOT EXISTS fssai_receiving_lines (
+    id               TEXT PRIMARY KEY,
+    check_id         TEXT NOT NULL,
+    grn_item_id      TEXT NOT NULL DEFAULT '',   -- goods_receipt_note_items.id, no FK
+    material_id      TEXT NOT NULL DEFAULT '',   -- raw_materials.id, no FK (import-materials hard-deletes)
+    material_name    TEXT NOT NULL DEFAULT '',   -- denormalised: the sheet must name what was checked
+    brand            TEXT NOT NULL DEFAULT '',
+    lot_no           TEXT NOT NULL DEFAULT '',   -- the supplier's batch/lot — lot traceability starts here
+    qty_received     REAL,                       -- purchase units. NULL = not recorded
+    qty_accepted     REAL,
+    qty_rejected     REAL,
+    uom              TEXT NOT NULL DEFAULT '',   -- the PURCHASE unit the screen led with
+    pack_size        REAL,                       -- recipe units per purchase unit, frozen at check time
+    recipe_uom       TEXT NOT NULL DEFAULT '',
+    mfg_date         TEXT NOT NULL DEFAULT '',
+    expiry_date      TEXT NOT NULL DEFAULT '',
+    shelf_life_days  INTEGER,                    -- days left on arrival. NULL = no date on the pack
+    temp_c           REAL,                       -- probed reading. NULL = not measured, NEVER 0
+    temp_min_used    REAL,                       -- the range ACTUALLY applied, frozen
+    temp_max_used    REAL,
+    chk_quality      TEXT NOT NULL DEFAULT '',   -- ''|ok|not_ok|na  (FssaiCheckResult)
+    chk_temperature  TEXT NOT NULL DEFAULT '',
+    chk_expiry       TEXT NOT NULL DEFAULT '',
+    chk_damage       TEXT NOT NULL DEFAULT '',
+    chk_weight       TEXT NOT NULL DEFAULT '',
+    chk_invoice_match TEXT NOT NULL DEFAULT '',
+    chk_label        TEXT NOT NULL DEFAULT '',
+    decision         TEXT NOT NULL DEFAULT '',   -- ''|accepted|partially_accepted|rejected
+    reject_reason    TEXT NOT NULL DEFAULT '',   -- coded, FSSAI_REJECT_REASONS
+    reject_note      TEXT NOT NULL DEFAULT '',
+    is_fail          INTEGER NOT NULL DEFAULT 0, -- frozen verdict, never recomputed on read
+    ca_id            TEXT NOT NULL DEFAULT '',   -- fssai_corrective_actions.id, no FK
+    note             TEXT NOT NULL DEFAULT '',
+    sort_order       INTEGER NOT NULL DEFAULT 0,
+    outlet_id        TEXT NOT NULL DEFAULT '',
+    created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (check_id) REFERENCES fssai_receiving_checks(id) ON DELETE CASCADE
+  );`,
+
+  /* 14. ONE TEMPERATURE READING — the table P9's reports and the cold-room
+   *     screen both live on, and the single most queried table in the module.
+   *
+   *     ONE TABLE AND A log_kind COLUMN, NOT NINE. A fridge reading, a probe
+   *     into a curry, a hot-holding check and a cooling curve are the same
+   *     record: a number, a time, a range, a person, a verdict. §24's rule
+   *     applies with more force to readings than to checklists. The kinds are
+   *     FSSAI_TEMP_LOG_KINDS in src/lib/fssai.ts.
+   *
+   *     source_kind IS RECORDED AND NEVER INFERRED, and it is the column an
+   *     inspector's question turns on. A reading that arrived as a checklist
+   *     answer is inside that round's SHA-256 sheet digest and is covered by
+   *     whoever signed it; a reading typed straight onto the temperature screen
+   *     is not. A report that mixes the two silently overstates how much of the
+   *     file is attested. response_id lets such a reading be traced back to the
+   *     exact frozen answer.
+   *
+   *     NO VALUE IS EVER HARD-CODED (owner §5). min_used / max_used are copied
+   *     from fssai_equipment or fssai_temp_standards at the moment of the
+   *     reading and frozen here, so tightening a standard next month cannot
+   *     retrospectively fail a fridge that passed. standard_id records WHICH
+   *     rule was applied. */
+  `CREATE TABLE IF NOT EXISTS fssai_temperature_logs (
+    id               TEXT PRIMARY KEY,
+    business_date    TEXT NOT NULL,              -- YYYY-MM-DD IST
+    reading_at       TEXT NOT NULL DEFAULT '',   -- HH:MM the reading was taken (not when it was typed)
+    shift            TEXT NOT NULL DEFAULT '',
+    log_kind         TEXT NOT NULL DEFAULT 'equipment',  -- FSSAI_TEMP_LOG_KINDS
+    source_kind      TEXT NOT NULL DEFAULT 'manual',     -- manual|checklist|receiving|device
+    run_id           TEXT NOT NULL DEFAULT '',   -- fssai_runs.id, no FK: keeps the '' convention uniform
+    response_id      TEXT NOT NULL DEFAULT '',   -- fssai_responses.id — the frozen answer this came from
+    receiving_line_id TEXT NOT NULL DEFAULT '',  -- fssai_receiving_lines.id
+    equipment_id     TEXT NOT NULL DEFAULT '',   -- fssai_equipment.id
+    equipment_label  TEXT NOT NULL DEFAULT '',   -- denormalised: the log must name the unit even if it is retired
+    equipment_kind   TEXT NOT NULL DEFAULT '',
+    area_label       TEXT NOT NULL DEFAULT '',   -- a place that is not a registered unit
+    department_id    TEXT NOT NULL DEFAULT '',
+    material_id      TEXT NOT NULL DEFAULT '',   -- raw_materials.id for a food probe
+    item_label       TEXT NOT NULL DEFAULT '',   -- the dish or item probed, in words
+    batch_id         TEXT NOT NULL DEFAULT '',   -- production_batches.id
+    standard_id      TEXT NOT NULL DEFAULT '',   -- fssai_temp_standards.id — WHICH rule was applied
+    value_num        REAL,                       -- the reading. NULL = not recorded, NEVER 0
+    uom              TEXT NOT NULL DEFAULT 'C',  -- C|F; the degree sign is added at render time
+    decimals         INTEGER NOT NULL DEFAULT 1, -- DISPLAY ONLY — rounding before the range test would pass 5.4 on a 0-5 rule
+    min_used         REAL,                       -- the threshold ACTUALLY applied, frozen
+    max_used         REAL,
+    target_used      REAL,
+    elapsed_minutes  INTEGER,                    -- cooling / reheating: minutes since the start of the curve
+    max_minutes_used INTEGER,                    -- the time limit applied, frozen
+    is_fail          INTEGER NOT NULL DEFAULT 0, -- frozen verdict
+    is_judged        INTEGER NOT NULL DEFAULT 0, -- 0 = recorded against NO range; an unjudged reading is not a pass
+    fail_reason      TEXT NOT NULL DEFAULT '',   -- in words, as fssaiRangeCheck phrased it
+    action_taken     TEXT NOT NULL DEFAULT '',
+    ca_id            TEXT NOT NULL DEFAULT '',   -- fssai_corrective_actions.id
+    note             TEXT NOT NULL DEFAULT '',
+    status           TEXT NOT NULL DEFAULT 'submitted',  -- draft|submitted|verified|void
+    recorded_by      TEXT NOT NULL DEFAULT '',   -- users.email
+    recorded_name    TEXT NOT NULL DEFAULT '',
+    verified_by      TEXT NOT NULL DEFAULT '',
+    verified_at      TEXT NOT NULL DEFAULT '',
+    voided_at        TEXT NOT NULL DEFAULT '',
+    voided_by        TEXT NOT NULL DEFAULT '',
+    void_reason      TEXT NOT NULL DEFAULT '',
+    outlet_id        TEXT NOT NULL DEFAULT '',
+    created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at       TEXT NOT NULL DEFAULT (datetime('now'))
+  );`,
+
+  /* 15. THE STANDARDS THEMSELVES — "configurable from Settings, never
+   *     hard-coded" (owner §5) made real.
+   *
+   *     WHY A TABLE AND NOT A SETTINGS KEY. RECON §7.6 sketches
+   *     `fssai_temp_standards` as a JSON value in the `settings` table, and that
+   *     is a reasonable shape for two or three numbers. It was not taken, for
+   *     three measured reasons: (1) the generic settings route has a known audit
+   *     gap (RECON §7.3) and a change to a fridge's safe range is exactly the
+   *     change §19 wants a before/after row for — rows here write
+   *     fssai_audit_log like every other record; (2) a JSON blob cannot carry
+   *     is_active, so retiring a standard means editing text and the readings
+   *     that cited it lose their reference; (3) the P8 seed needs an idempotency
+   *     key, and `code` with a partial UNIQUE is the same mechanism the twelve
+   *     checklists already use. A settings key can still override globally
+   *     later; nothing here forecloses it.
+   *
+   *     applies_to is a log_kind, so a reading finds its rule by kind and
+   *     (optionally) equipment_kind. A rule for ONE unit lives on
+   *     fssai_equipment.min_temp/max_temp, which wins — most specific first. */
+  `CREATE TABLE IF NOT EXISTS fssai_temp_standards (
+    id            TEXT PRIMARY KEY,
+    code          TEXT NOT NULL DEFAULT '',   -- stable seed key, e.g. 'TEMP-CHILLER', 'OIL-TPM'
+    label         TEXT NOT NULL,
+    applies_to    TEXT NOT NULL DEFAULT 'equipment',  -- a FSSAI_TEMP_LOG_KINDS key, or 'oil'|'water'
+    equipment_kind TEXT NOT NULL DEFAULT '',  -- '' = any unit of that kind
+    material_id   TEXT NOT NULL DEFAULT '',   -- '' = any item; an item-specific rule names it
+    min_value     REAL,                       -- NULL = no lower bound
+    max_value     REAL,
+    target_value  REAL,
+    uom           TEXT NOT NULL DEFAULT 'C',  -- C|F|pct|ppm|pH
+    decimals      INTEGER NOT NULL DEFAULT 1,
+    max_minutes   INTEGER,                    -- cooling/reheating: the clock half of the rule
+    authority     TEXT NOT NULL DEFAULT '',   -- where the number comes from, in words
+    notes         TEXT NOT NULL DEFAULT '',
+    is_active     INTEGER NOT NULL DEFAULT 1,
+    is_seeded     INTEGER NOT NULL DEFAULT 0,
+    sort_order    INTEGER NOT NULL DEFAULT 0,
+    created_by    TEXT NOT NULL DEFAULT '',
+    outlet_id     TEXT NOT NULL DEFAULT '',
+    created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
+  );`,
+
+  /* 16. WHAT HAPPENED TO A UNIT, as opposed to a reading off it — defrost, deep
+   *     clean, breakdown, repair, calibration, out of use, back in use.
+   *     These are the entries an inspector asks for the moment a reading is out
+   *     of range: was it defrosted, was it mended, was the probe ever checked.
+   *     CALIBRATION LIVES HERE rather than in a twelfth table because the shape
+   *     is identical — a before value, a known reference, an after value and a
+   *     verdict — and a separate table would need its own CRUD for four
+   *     columns. equipment_id has no FK so an event can be recorded against a
+   *     unit an admin later retires; equipment_label is denormalised for the
+   *     same reason. */
+  `CREATE TABLE IF NOT EXISTS fssai_equipment_events (
+    id              TEXT PRIMARY KEY,
+    equipment_id    TEXT NOT NULL DEFAULT '',   -- fssai_equipment.id, no FK
+    equipment_label TEXT NOT NULL DEFAULT '',
+    event_kind      TEXT NOT NULL DEFAULT 'defrost',  -- FSSAI_EQUIPMENT_EVENT_KINDS
+    business_date   TEXT NOT NULL,
+    event_at        TEXT NOT NULL DEFAULT '',   -- HH:MM
+    department_id   TEXT NOT NULL DEFAULT '',
+    detail          TEXT NOT NULL DEFAULT '',   -- what was done, in words
+    performed_by    TEXT NOT NULL DEFAULT '',   -- a staff email, or a contractor's name
+    vendor_id       TEXT NOT NULL DEFAULT '',   -- vendors.id when a contractor did it
+    reference_no    TEXT NOT NULL DEFAULT '',   -- job sheet / certificate number
+    downtime_minutes INTEGER,
+    value_before    REAL,                       -- calibration: what the probe read
+    reference_value REAL,                       -- calibration: what it should have read (ice = 0)
+    value_after     REAL,                       -- calibration: after adjustment
+    deviation       REAL,                       -- frozen, not recomputed
+    uom             TEXT NOT NULL DEFAULT 'C',
+    is_fail         INTEGER NOT NULL DEFAULT 0,
+    next_due_date   TEXT NOT NULL DEFAULT '',   -- when this event is due again
+    document_id     TEXT NOT NULL DEFAULT '',   -- fssai_documents.id for the certificate
+    ca_id           TEXT NOT NULL DEFAULT '',
+    status          TEXT NOT NULL DEFAULT 'submitted',
+    voided_at       TEXT NOT NULL DEFAULT '',
+    voided_by       TEXT NOT NULL DEFAULT '',
+    void_reason     TEXT NOT NULL DEFAULT '',
+    created_by      TEXT NOT NULL DEFAULT '',
+    outlet_id       TEXT NOT NULL DEFAULT '',
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+  );`,
+
+  /* 17. SHELF LIFE PER ITEM — and why this is NOT a second item master.
+   *     MEASURED (RECON §5, re-checked): all 952 rows of raw_materials carry a
+   *     BLANK shelf life, and there is no storage-condition column anywhere. So
+   *     FEFO has nothing to sort on today. The alternative was to write the
+   *     missing days back into raw_materials, which is the owner's Item Master
+   *     and not this module's to fill in (HARD RULE 4's spirit, and
+   *     api/import-materials would wipe it on the next import anyway).
+   *     This table therefore holds ONE ROW PER ITEM THE OWNER HAS CONFIGURED —
+   *     a join, never a copy: material_name is denormalised for display only and
+   *     no price, stock, unit or category is restated here.
+   *     §7 Q5 (PROVISIONAL): produced batches already carry their own expiry on
+   *     production_batches; this covers purchased goods, which carry none. */
+  `CREATE TABLE IF NOT EXISTS fssai_item_shelf_life (
+    id                 TEXT PRIMARY KEY,
+    material_id        TEXT NOT NULL DEFAULT '',  -- raw_materials.id, no FK, UNIQUE per outlet below
+    material_name      TEXT NOT NULL DEFAULT '',  -- display only; raw_materials stays the master
+    storage_condition  TEXT NOT NULL DEFAULT 'ambient',  -- ambient|chilled|frozen|hot
+    shelf_life_days    INTEGER,                   -- unopened. NULL = the owner has not said
+    opened_shelf_life_days INTEGER,               -- secondary shelf life once opened
+    near_expiry_days   INTEGER,                   -- NULL = fall back to the global default
+    storage_temp_min   REAL,
+    storage_temp_max   REAL,
+    temp_uom           TEXT NOT NULL DEFAULT 'C',
+    label_rule         TEXT NOT NULL DEFAULT '',  -- what must be written on the label, in words
+    is_high_risk       INTEGER NOT NULL DEFAULT 0, -- ready-to-eat / high-risk: tighter rules
+    notes              TEXT NOT NULL DEFAULT '',
+    is_active          INTEGER NOT NULL DEFAULT 1,
+    created_by         TEXT NOT NULL DEFAULT '',
+    outlet_id          TEXT NOT NULL DEFAULT '',
+    created_at         TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at         TEXT NOT NULL DEFAULT (datetime('now'))
+  );`,
+
+  /* 18. THE EXPIRY AND DISPOSAL REGISTER — one row per thing found near or past
+   *     its date, and what was done about it.
+   *     ⚠️ NOTHING HERE MOVES STOCK. HARD RULE 5 freezes the material-movement
+   *     flow: Central Store -> requisition -> Department Stock -> recipe
+   *     consumption. A discard recorded here is an OBSERVATION with a witness;
+   *     the stock adjustment is still made in the inventory module by whoever
+   *     owns that number. Two authorities on one quantity is how a stock figure
+   *     becomes unexplainable.
+   *     It serves the daily FIFO round, Food Storage discards and a supplier
+   *     recall, because all three are the same row: an item, a date, a state and
+   *     an action. */
+  `CREATE TABLE IF NOT EXISTS fssai_expiry_items (
+    id              TEXT PRIMARY KEY,
+    business_date   TEXT NOT NULL,
+    found_at        TEXT NOT NULL DEFAULT '',   -- HH:MM
+    source_kind     TEXT NOT NULL DEFAULT 'manual',  -- manual|fifo_round|receiving|batch|recall
+    run_id          TEXT NOT NULL DEFAULT '',   -- fssai_runs.id if found on a checklist round
+    response_id     TEXT NOT NULL DEFAULT '',
+    batch_id        TEXT NOT NULL DEFAULT '',   -- production_batches.id — produced stock already has a date
+    batch_label     TEXT NOT NULL DEFAULT '',   -- the PROD###### barcode or batch number, denormalised
+    material_id     TEXT NOT NULL DEFAULT '',   -- raw_materials.id
+    material_name   TEXT NOT NULL DEFAULT '',
+    lot_no          TEXT NOT NULL DEFAULT '',
+    department_id   TEXT NOT NULL DEFAULT '',
+    store_id        TEXT NOT NULL DEFAULT '',
+    location_label  TEXT NOT NULL DEFAULT '',   -- the shelf or unit it was found on
+    expiry_date     TEXT NOT NULL DEFAULT '',
+    days_to_expiry  INTEGER,                    -- frozen at the time of the finding, not recomputed
+    state           TEXT NOT NULL DEFAULT '',   -- FSSAI_EXPIRY_REASONS: near_expiry|expired|damaged|spoiled|unlabelled|recalled
+    qty             REAL,                       -- in the PURCHASE unit the screen led with
+    uom             TEXT NOT NULL DEFAULT '',
+    pack_size       REAL,
+    recipe_uom      TEXT NOT NULL DEFAULT '',
+    action_taken    TEXT NOT NULL DEFAULT '',   -- FSSAI_EXPIRY_ACTIONS
+    discard_qty     REAL,
+    discard_method  TEXT NOT NULL DEFAULT '',   -- how it left the building
+    witnessed_by    TEXT NOT NULL DEFAULT '',   -- users.email — a discard with no witness is a weak record
+    ca_id           TEXT NOT NULL DEFAULT '',
+    note            TEXT NOT NULL DEFAULT '',
+    status          TEXT NOT NULL DEFAULT 'submitted',
+    recorded_by     TEXT NOT NULL DEFAULT '',
+    recorded_name   TEXT NOT NULL DEFAULT '',
+    voided_at       TEXT NOT NULL DEFAULT '',
+    voided_by       TEXT NOT NULL DEFAULT '',
+    void_reason     TEXT NOT NULL DEFAULT '',
+    outlet_id       TEXT NOT NULL DEFAULT '',
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+  );`,
+
+  /* 19. FRYER OIL — a reading against a limit, plus what was done to the oil.
+   *     tpm_pct is the number an inspector trusts; ffa_pct and the sensory
+   *     columns are kept beside it because most kitchens judge oil by look and
+   *     smell and a register that only accepts a meter reading will simply be
+   *     left blank. method says which was used, so a report can say how much of
+   *     the file is measured rather than eyeballed.
+   *     max_tpm_used is frozen from fssai_temp_standards (code 'OIL-TPM'), never
+   *     from a literal — FSSAI_OIL_TPM_LIMIT_PCT in src/lib/fssai.ts seeds that
+   *     row and is not a comparison target. */
+  `CREATE TABLE IF NOT EXISTS fssai_oil_checks (
+    id              TEXT PRIMARY KEY,
+    business_date   TEXT NOT NULL,
+    checked_at      TEXT NOT NULL DEFAULT '',
+    shift           TEXT NOT NULL DEFAULT '',
+    equipment_id    TEXT NOT NULL DEFAULT '',   -- fssai_equipment.id (kind 'fryer')
+    equipment_label TEXT NOT NULL DEFAULT '',
+    department_id   TEXT NOT NULL DEFAULT '',
+    oil_type        TEXT NOT NULL DEFAULT '',
+    material_id     TEXT NOT NULL DEFAULT '',   -- raw_materials.id of the oil in use
+    run_id          TEXT NOT NULL DEFAULT '',
+    response_id     TEXT NOT NULL DEFAULT '',
+    method          TEXT NOT NULL DEFAULT '',   -- tpm_meter|test_strip|sensory
+    tpm_pct         REAL,                       -- NULL = not measured, NEVER 0
+    ffa_pct         REAL,
+    temp_c          REAL,
+    colour_grade    TEXT NOT NULL DEFAULT '',   -- the strip's or chart's band, as read
+    chk_smell       TEXT NOT NULL DEFAULT '',   -- ''|ok|not_ok|na
+    chk_foaming     TEXT NOT NULL DEFAULT '',
+    chk_smoking     TEXT NOT NULL DEFAULT '',
+    max_tpm_used    REAL,                       -- the limit ACTUALLY applied, frozen
+    standard_id     TEXT NOT NULL DEFAULT '',   -- fssai_temp_standards.id
+    is_fail         INTEGER NOT NULL DEFAULT 0,
+    is_judged       INTEGER NOT NULL DEFAULT 0,
+    fail_reason     TEXT NOT NULL DEFAULT '',
+    action_taken    TEXT NOT NULL DEFAULT '',   -- FSSAI_OIL_ACTIONS
+    oil_changed     INTEGER NOT NULL DEFAULT 0,
+    qty_discarded   REAL,
+    qty_added       REAL,
+    qty_uom         TEXT NOT NULL DEFAULT '',
+    hours_in_use    REAL,
+    disposal_id     TEXT NOT NULL DEFAULT '',   -- fssai_oil_disposals.id once it is collected
+    ca_id           TEXT NOT NULL DEFAULT '',
+    note            TEXT NOT NULL DEFAULT '',
+    status          TEXT NOT NULL DEFAULT 'submitted',
+    recorded_by     TEXT NOT NULL DEFAULT '',
+    recorded_name   TEXT NOT NULL DEFAULT '',
+    voided_at       TEXT NOT NULL DEFAULT '',
+    voided_by       TEXT NOT NULL DEFAULT '',
+    void_reason     TEXT NOT NULL DEFAULT '',
+    outlet_id       TEXT NOT NULL DEFAULT '',
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+  );`,
+
+  /* 20. USED COOKING OIL LEAVING THE BUILDING (the RUCO register).
+   *     Its own table and not a column on fssai_oil_checks because ONE
+   *     collection covers SEVERAL fryers on several days — a many-to-one that a
+   *     column cannot express. Required of a food business that fries: who
+   *     collected it, under what registration, how much, and the receipt.
+   *     DELIBERATELY NO MONEY COLUMN. A collector's receipt often carries a
+   *     value, and the moment this table holds one it becomes a second place the
+   *     business records income, outside the purchasing and sales ledgers that
+   *     own that. FSSAI records the quantity and the paper, nothing more. */
+  `CREATE TABLE IF NOT EXISTS fssai_oil_disposals (
+    id              TEXT PRIMARY KEY,
+    business_date   TEXT NOT NULL,
+    collected_at    TEXT NOT NULL DEFAULT '',
+    vendor_id       TEXT NOT NULL DEFAULT '',   -- vendors.id of the aggregator, if he is one
+    collector_name  TEXT NOT NULL DEFAULT '',
+    agency_reg_no   TEXT NOT NULL DEFAULT '',   -- the collector's registration — the point of the record
+    vehicle_no      TEXT NOT NULL DEFAULT '',
+    quantity        REAL,
+    uom             TEXT NOT NULL DEFAULT 'L',
+    receipt_no      TEXT NOT NULL DEFAULT '',
+    document_id     TEXT NOT NULL DEFAULT '',   -- fssai_documents.id for the scanned receipt
+    handed_over_by  TEXT NOT NULL DEFAULT '',   -- users.email
+    note            TEXT NOT NULL DEFAULT '',
+    status          TEXT NOT NULL DEFAULT 'submitted',
+    voided_at       TEXT NOT NULL DEFAULT '',
+    voided_by       TEXT NOT NULL DEFAULT '',
+    void_reason     TEXT NOT NULL DEFAULT '',
+    created_by      TEXT NOT NULL DEFAULT '',
+    outlet_id       TEXT NOT NULL DEFAULT '',
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+  );`,
+
+  /* 21. WATER AND ICE — a lab certificate and a daily chlorine reading in ONE
+   *     table, because the question an inspector asks is one question: "show me
+   *     your water records". Splitting them means every report unions two
+   *     tables and the Water screen shows two unrelated lists.
+   *     parameters_json is TEXT JSON for the lab report's variable parameter
+   *     list, for exactly the reason fssai_questions.options_json is
+   *     (ordered, variable-length, never filtered in SQL). The ONE value a
+   *     report ranges over — the daily reading — is value_num, a REAL column,
+   *     so it can be indexed and compared. That split is deliberate, not
+   *     inconsistent. */
+  `CREATE TABLE IF NOT EXISTS fssai_water_tests (
+    id              TEXT PRIMARY KEY,
+    business_date   TEXT NOT NULL,
+    tested_at       TEXT NOT NULL DEFAULT '',
+    test_kind       TEXT NOT NULL DEFAULT 'chlorine',  -- FSSAI_WATER_TEST_KINDS
+    source_point    TEXT NOT NULL DEFAULT '',   -- the tap, tank, RO outlet or ice machine, in words
+    equipment_id    TEXT NOT NULL DEFAULT '',   -- fssai_equipment.id (water_filter / ice machine)
+    department_id   TEXT NOT NULL DEFAULT '',
+    run_id          TEXT NOT NULL DEFAULT '',
+    response_id     TEXT NOT NULL DEFAULT '',
+    value_num       REAL,                       -- the daily reading. NULL = not measured
+    uom             TEXT NOT NULL DEFAULT '',   -- ppm|pH|NTU
+    decimals        INTEGER NOT NULL DEFAULT 2,
+    min_used        REAL,
+    max_used        REAL,
+    standard_id     TEXT NOT NULL DEFAULT '',
+    -- the lab half
+    lab_name        TEXT NOT NULL DEFAULT '',
+    lab_licence_no  TEXT NOT NULL DEFAULT '',   -- NABL / FSSAI-notified lab reference
+    report_no       TEXT NOT NULL DEFAULT '',
+    sample_date     TEXT NOT NULL DEFAULT '',
+    report_date     TEXT NOT NULL DEFAULT '',
+    parameters_json TEXT NOT NULL DEFAULT '[]', -- [{name, value, uom, limit, result}], ordered
+    result          TEXT NOT NULL DEFAULT '',   -- ''|pass|fail — the lab's own verdict, as printed
+    document_id     TEXT NOT NULL DEFAULT '',   -- fssai_documents.id for the certificate
+    is_fail         INTEGER NOT NULL DEFAULT 0,
+    is_judged       INTEGER NOT NULL DEFAULT 0,
+    fail_reason     TEXT NOT NULL DEFAULT '',
+    action_taken    TEXT NOT NULL DEFAULT '',
+    next_due_date   TEXT NOT NULL DEFAULT '',   -- when this test is due again
+    ca_id           TEXT NOT NULL DEFAULT '',
+    note            TEXT NOT NULL DEFAULT '',
+    status          TEXT NOT NULL DEFAULT 'submitted',
+    recorded_by     TEXT NOT NULL DEFAULT '',
+    recorded_name   TEXT NOT NULL DEFAULT '',
+    voided_at       TEXT NOT NULL DEFAULT '',
+    voided_by       TEXT NOT NULL DEFAULT '',
+    void_reason     TEXT NOT NULL DEFAULT '',
+    outlet_id       TEXT NOT NULL DEFAULT '',
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+  );`,
+
+  /* 22. A PEST CONTROL VISIT (owner §7: services and sightings tracked
+   *     SEPARATELY, and this is the services half).
+   *     'missed' is the status that earns this its own vocabulary: a contract
+   *     visit that did not happen is the commonest pest finding there is, and a
+   *     schema with only planned/completed cannot record it — the row sits as
+   *     "planned" forever or gets deleted, and §19 forbids the second.
+   *     chemicals_json is JSON for the same reason options_json is: the
+   *     technician used however many products he used, each with a batch and a
+   *     dilution, and nothing ranges over them in SQL. */
+  `CREATE TABLE IF NOT EXISTS fssai_pest_services (
+    id               TEXT PRIMARY KEY,
+    service_no       TEXT NOT NULL DEFAULT '',
+    vendor_id        TEXT NOT NULL DEFAULT '',   -- vendors.id of the pest control agency
+    vendor_name      TEXT NOT NULL DEFAULT '',
+    agency_licence_no TEXT NOT NULL DEFAULT '',  -- the agency's own licence — an inspector asks for it
+    technician_name  TEXT NOT NULL DEFAULT '',
+    service_kind     TEXT NOT NULL DEFAULT 'scheduled',  -- FSSAI_PEST_SERVICE_KINDS
+    business_date    TEXT NOT NULL,              -- the date the visit belongs to (planned or actual)
+    started_at       TEXT NOT NULL DEFAULT '',
+    finished_at      TEXT NOT NULL DEFAULT '',
+    areas_covered    TEXT NOT NULL DEFAULT '',   -- in words; a free-text list is what the job sheet is
+    chemicals_json   TEXT NOT NULL DEFAULT '[]', -- [{name, batch, dilution, qty, uom, licence_no}]
+    findings         TEXT NOT NULL DEFAULT '',
+    recommendations  TEXT NOT NULL DEFAULT '',
+    report_no        TEXT NOT NULL DEFAULT '',
+    document_id      TEXT NOT NULL DEFAULT '',   -- fssai_documents.id for the job sheet
+    contract_doc_id  TEXT NOT NULL DEFAULT '',   -- fssai_documents.id for the contract itself
+    next_due_date    TEXT NOT NULL DEFAULT '',
+    staff_witness    TEXT NOT NULL DEFAULT '',   -- users.email of whoever accompanied the technician
+    status           TEXT NOT NULL DEFAULT 'planned',  -- planned|completed|missed|cancelled
+    missed_reason    TEXT NOT NULL DEFAULT '',
+    ca_id            TEXT NOT NULL DEFAULT '',
+    note             TEXT NOT NULL DEFAULT '',
+    voided_at        TEXT NOT NULL DEFAULT '',
+    voided_by        TEXT NOT NULL DEFAULT '',
+    void_reason      TEXT NOT NULL DEFAULT '',
+    created_by       TEXT NOT NULL DEFAULT '',
+    outlet_id        TEXT NOT NULL DEFAULT '',
+    created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at       TEXT NOT NULL DEFAULT (datetime('now'))
+  );`,
+
+  /* 23. WHAT OUR OWN STAFF SAW BETWEEN VISITS — the sightings half of §7, and
+   *     the half that makes the register credible. A file containing only
+   *     contractor reports says nobody in the kitchen was watching.
+   *     evidence_kind matters as much as pest_type: droppings and gnaw marks are
+   *     what staff actually find, and a log that only accepts live sightings
+   *     records almost nothing. service_id links a sighting the contractor then
+   *     dealt with, so "reported and acted on" is readable in one row. */
+  `CREATE TABLE IF NOT EXISTS fssai_pest_sightings (
+    id              TEXT PRIMARY KEY,
+    business_date   TEXT NOT NULL,
+    sighted_at      TEXT NOT NULL DEFAULT '',
+    pest_type       TEXT NOT NULL DEFAULT '',   -- FSSAI_PEST_TYPES
+    evidence_kind   TEXT NOT NULL DEFAULT '',   -- FSSAI_PEST_EVIDENCE_KINDS
+    count_seen      INTEGER,
+    severity        TEXT NOT NULL DEFAULT 'low', -- low|medium|high
+    location_label  TEXT NOT NULL DEFAULT '',
+    department_id   TEXT NOT NULL DEFAULT '',
+    device_id       TEXT NOT NULL DEFAULT '',   -- fssai_pest_devices.id if found in a device
+    run_id          TEXT NOT NULL DEFAULT '',
+    response_id     TEXT NOT NULL DEFAULT '',
+    service_id      TEXT NOT NULL DEFAULT '',   -- fssai_pest_services.id that dealt with it
+    description     TEXT NOT NULL DEFAULT '',
+    immediate_action TEXT NOT NULL DEFAULT '',
+    ca_id           TEXT NOT NULL DEFAULT '',
+    status          TEXT NOT NULL DEFAULT 'submitted',
+    reported_by     TEXT NOT NULL DEFAULT '',   -- users.email
+    reported_name   TEXT NOT NULL DEFAULT '',
+    closed_at       TEXT NOT NULL DEFAULT '',
+    closed_by       TEXT NOT NULL DEFAULT '',
+    voided_at       TEXT NOT NULL DEFAULT '',
+    voided_by       TEXT NOT NULL DEFAULT '',
+    void_reason     TEXT NOT NULL DEFAULT '',
+    outlet_id       TEXT NOT NULL DEFAULT '',
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+  );`,
+
+  /* 24. THE PEST MAP — bait stations, glue boards and fly units, as a register.
+   *     A REGISTER ONLY, with no log table behind it, and that is deliberate:
+   *     "device 7 checked, no activity" is a CHECKLIST ANSWER (§24 — the
+   *     monitoring round is a seeded template), and a sighting carries
+   *     device_id. A third pest table for routine checks would be exactly the
+   *     per-record table §2 exists to prevent. */
+  `CREATE TABLE IF NOT EXISTS fssai_pest_devices (
+    id             TEXT PRIMARY KEY,
+    code           TEXT NOT NULL DEFAULT '',   -- the number painted on the station
+    device_kind    TEXT NOT NULL DEFAULT 'bait_station',
+    location_label TEXT NOT NULL,
+    department_id  TEXT NOT NULL DEFAULT '',
+    store_id       TEXT NOT NULL DEFAULT '',
+    installed_on   TEXT NOT NULL DEFAULT '',
+    vendor_id      TEXT NOT NULL DEFAULT '',
+    check_frequency TEXT NOT NULL DEFAULT 'weekly',
+    last_checked_at TEXT NOT NULL DEFAULT '',
+    notes          TEXT NOT NULL DEFAULT '',
+    is_active      INTEGER NOT NULL DEFAULT 1,
+    sort_order     INTEGER NOT NULL DEFAULT 0,
+    created_by     TEXT NOT NULL DEFAULT '',
+    outlet_id      TEXT NOT NULL DEFAULT '',
+    created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at     TEXT NOT NULL DEFAULT (datetime('now'))
+  );`,
+
+  /* 25. THE CERTIFICATE CUPBOARD (owner §17) — licences, water reports, the pest
+   *     contract, medical fitness and training certificates, with expiry
+   *     reminders.
+   *     THE EXPIRY STATE IS NOT A COLUMN, and that is the important decision
+   *     here. A stored 'expiring' goes stale at midnight with nothing to wake
+   *     it, and a licence rendering "Valid" the day after it lapsed is the worst
+   *     single row this module could produce. expiry_date is stored; the state
+   *     is derived by fssaiDocState() on every read.
+   *     last_reminder_at exists so the reminder sweep does not alert daily for
+   *     thirty days; it is about the NOTIFICATION, never about the document.
+   *     supersedes_id is the renewal chain: a renewed licence points at the one
+   *     it replaces and the old row stays (§19), so the history of a licence
+   *     number is readable.
+   *     THE FILE ITSELF LIVES IN fssai_attachments, not in a column here — one
+   *     photo/file store with one retention sweep, not two. */
+  `CREATE TABLE IF NOT EXISTS fssai_documents (
+    id              TEXT PRIMARY KEY,
+    doc_code        TEXT NOT NULL DEFAULT '',   -- stable key for a seeded or well-known document
+    doc_type        TEXT NOT NULL DEFAULT 'other',  -- FSSAI_DOC_TYPES
+    title           TEXT NOT NULL,
+    reference_no    TEXT NOT NULL DEFAULT '',   -- the licence / certificate number as printed
+    issuer          TEXT NOT NULL DEFAULT '',   -- the authority or lab that issued it
+    issued_on       TEXT NOT NULL DEFAULT '',
+    valid_from      TEXT NOT NULL DEFAULT '',
+    expiry_date     TEXT NOT NULL DEFAULT '',   -- '' = no expiry; the STATE is derived, never stored
+    reminder_days   INTEGER NOT NULL DEFAULT 30,
+    last_reminder_at TEXT NOT NULL DEFAULT '',  -- about the reminder, never about the document
+    owner_email     TEXT NOT NULL DEFAULT '',   -- users.email — who must renew it
+    department_id   TEXT NOT NULL DEFAULT '',
+    vendor_id       TEXT NOT NULL DEFAULT '',   -- a supplier licence or a pest contract
+    person_email    TEXT NOT NULL DEFAULT '',   -- a medical or training certificate (§7 Q18: email, hr_employees is empty)
+    equipment_id    TEXT NOT NULL DEFAULT '',   -- a calibration certificate or an AMC
+    supersedes_id   TEXT NOT NULL DEFAULT '',   -- fssai_documents.id this renewal replaces
+    version         INTEGER NOT NULL DEFAULT 1,
+    notes           TEXT NOT NULL DEFAULT '',
+    status          TEXT NOT NULL DEFAULT 'submitted',  -- draft|submitted|verified|void
+    is_active       INTEGER NOT NULL DEFAULT 1, -- 0 once superseded; the row is never deleted
+    voided_at       TEXT NOT NULL DEFAULT '',
+    voided_by       TEXT NOT NULL DEFAULT '',
+    void_reason     TEXT NOT NULL DEFAULT '',
+    created_by      TEXT NOT NULL DEFAULT '',
+    outlet_id       TEXT NOT NULL DEFAULT '',
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+  );`,
+
+  /* 26. PHOTOGRAPHS AND FILES ON A RECORD THAT IS NOT A CHECKLIST RUN.
+   *
+   *     ⚠️ WHY fssai_evidence COULD NOT BE REUSED — the reason is load-bearing,
+   *     not a shortcoming. fssai_evidence.run_id is `TEXT NOT NULL` with an FK
+   *     to fssai_runs, so a photograph of a rejected delivery or a rat sighting
+   *     cannot go there: there is no run, and '' throws with foreign_keys = ON
+   *     (measured). Widening that column is the wrong fix, because
+   *     computeFssaiSheetDigest hashes a run's evidence into the SHA-256 that
+   *     the signature covers — every row in that table is inside somebody's
+   *     attestation, and run-less rows would sit inside a signed set.
+   *
+   *     So the record tables get their own store with the SAME budget
+   *     (FSSAI_PHOTO_* in src/lib/fssai.ts), the SAME 12-month retention
+   *     columns, and the same rule: THE IMAGE AGES OUT, THE ROW NEVER DOES, so
+   *     the record still says a photograph was taken, by whom, when, how big it
+   *     was and what it hashed to.
+   *
+   *     TWO THINGS A LANE MUST HONOUR:
+   *       1. The retention sweep walks BOTH tables. One that clears only
+   *          fssai_evidence keeps every delivery photograph forever.
+   *       2. entity_table is validated against FSSAI_ATTACHMENT_ENTITIES before
+   *          any insert. A caller-supplied table name must never reach SQL, and
+   *          an attachment pointing at a table that does not exist is an orphan
+   *          nothing will ever render.
+   *     No FK on entity_id, deliberately: one column cannot reference fifteen
+   *     tables, and an attachment must survive its parent being voided. */
+  `CREATE TABLE IF NOT EXISTS fssai_attachments (
+    id           TEXT PRIMARY KEY,
+    entity_table TEXT NOT NULL,                -- validated against FSSAI_ATTACHMENT_ENTITIES
+    entity_id    TEXT NOT NULL,
+    kind         TEXT NOT NULL DEFAULT 'photo', -- photo|document|certificate|report
+    data_uri     TEXT NOT NULL DEFAULT '',     -- '' once the image has aged out, or for a row-only record
+    filename     TEXT NOT NULL DEFAULT '',
+    mime         TEXT NOT NULL DEFAULT '',
+    size_bytes   INTEGER NOT NULL DEFAULT 0,   -- the ORIGINAL size; never reset to 0 by the sweep
+    caption      TEXT NOT NULL DEFAULT '',
+    digest_sha256 TEXT NOT NULL DEFAULT '',    -- of the decoded bytes, at upload; outlives the image
+    image_dropped_at TEXT NOT NULL DEFAULT '', -- '' = still stored; else when retention dropped it
+    created_by   TEXT NOT NULL DEFAULT '',
+    outlet_id    TEXT NOT NULL DEFAULT '',
+    created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+  );`,
+
+  /* 27. AN INSPECTION OR AUDIT THAT ACTUALLY HAPPENED (owner §16, §18) — an
+   *     FSSAI officer's visit, a third-party audit, an aggregator's audit or our
+   *     own internal round.
+   *     This is NOT the same object as a checklist run and must not be folded
+   *     into one: a run is OUR OWN record of OUR OWN questions, and an
+   *     inspection is somebody ELSE's findings against clauses we did not write.
+   *     The score and grade are theirs, as printed. */
+  `CREATE TABLE IF NOT EXISTS fssai_inspections (
+    id               TEXT PRIMARY KEY,
+    inspection_no    TEXT NOT NULL DEFAULT '',
+    inspection_kind  TEXT NOT NULL DEFAULT 'internal',  -- FSSAI_INSPECTION_KINDS
+    authority        TEXT NOT NULL DEFAULT '',
+    inspector_name   TEXT NOT NULL DEFAULT '',
+    inspector_id_no  TEXT NOT NULL DEFAULT '',
+    business_date    TEXT NOT NULL,              -- the date of the visit
+    started_at       TEXT NOT NULL DEFAULT '',
+    finished_at      TEXT NOT NULL DEFAULT '',
+    scope            TEXT NOT NULL DEFAULT '',
+    department_id    TEXT NOT NULL DEFAULT '',
+    score            REAL,                       -- their number, as given. NULL = none given
+    score_max        REAL,
+    grade            TEXT NOT NULL DEFAULT '',   -- their grade, as printed
+    outcome          TEXT NOT NULL DEFAULT '',   -- ''|pass|conditional|fail
+    report_no        TEXT NOT NULL DEFAULT '',
+    document_id      TEXT NOT NULL DEFAULT '',   -- fssai_documents.id for their report
+    observations     TEXT NOT NULL DEFAULT '',
+    our_response     TEXT NOT NULL DEFAULT '',
+    finding_count    INTEGER NOT NULL DEFAULT 0,
+    open_count       INTEGER NOT NULL DEFAULT 0,
+    reply_due_date   TEXT NOT NULL DEFAULT '',
+    status           TEXT NOT NULL DEFAULT 'planned',  -- planned|in_progress|open|closed|void
+    closed_at        TEXT NOT NULL DEFAULT '',
+    closed_by        TEXT NOT NULL DEFAULT '',
+    accompanied_by   TEXT NOT NULL DEFAULT '',   -- users.email of whoever walked round with them
+    voided_at        TEXT NOT NULL DEFAULT '',
+    voided_by        TEXT NOT NULL DEFAULT '',
+    void_reason      TEXT NOT NULL DEFAULT '',
+    created_by       TEXT NOT NULL DEFAULT '',
+    outlet_id        TEXT NOT NULL DEFAULT '',
+    created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at       TEXT NOT NULL DEFAULT (datetime('now'))
+  );`,
+
+  /* 28. ONE POINT RAISED BY AN INSPECTION, and how it was closed.
+   *     Its own rows because an inspection raises however many points it raises
+   *     and each one closes on its own date with its own evidence — the thing
+   *     that gets asked for at the NEXT visit.
+   *     ca_id is the join to the corrective-action spine: the fix itself is
+   *     recorded once, in fssai_corrective_actions, exactly as the owner's Q14
+   *     ruling has a failed check do. This table does not re-implement a fix. */
+  `CREATE TABLE IF NOT EXISTS fssai_inspection_findings (
+    id             TEXT PRIMARY KEY,
+    inspection_id  TEXT NOT NULL,
+    finding_no     TEXT NOT NULL DEFAULT '',
+    clause_ref     TEXT NOT NULL DEFAULT '',   -- their clause or schedule reference, as cited
+    category       TEXT NOT NULL DEFAULT '',
+    severity       TEXT NOT NULL DEFAULT 'minor',  -- critical|major|minor|observation
+    observation    TEXT NOT NULL,
+    department_id  TEXT NOT NULL DEFAULT '',
+    location_label TEXT NOT NULL DEFAULT '',
+    due_date       TEXT NOT NULL DEFAULT '',
+    ca_id          TEXT NOT NULL DEFAULT '',   -- fssai_corrective_actions.id — the fix lives there, once
+    response       TEXT NOT NULL DEFAULT '',
+    status         TEXT NOT NULL DEFAULT 'open',  -- open|in_progress|closed|not_accepted
+    closed_at      TEXT NOT NULL DEFAULT '',
+    closed_by      TEXT NOT NULL DEFAULT '',
+    sort_order     INTEGER NOT NULL DEFAULT 0,
+    outlet_id      TEXT NOT NULL DEFAULT '',
+    created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at     TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (inspection_id) REFERENCES fssai_inspections(id) ON DELETE CASCADE
+  );`,
+
+  /* 29. WHAT A SEED PACK DID, AND THAT IT ALREADY RAN (P8's memory).
+   *     THE TRAP THIS CLOSES, in the HRMS block's own words a few hundred lines
+   *     above: A BOOT SEED RESURRECTS ROWS AN ADMIN DELETED. The twelve
+   *     checklists ship as rows (§2), the owner is meant to retire the ones he
+   *     does not want, and INSERT OR IGNORE keyed on `code` cannot tell "never
+   *     seeded" from "seeded and then deliberately removed" — both look like an
+   *     absent row, so the next cold start brings back everything he threw out.
+   *     A pack whose marker row (item_kind='pack') exists MUST NOT RUN AGAIN.
+   *     It is also the only honest answer to "what did the seed actually do",
+   *     since every DDL and seed error in this file is swallowed per statement.
+   *     Append-only: no UPDATE and no DELETE path is written against it. */
+  `CREATE TABLE IF NOT EXISTS fssai_seed_log (
+    id           TEXT PRIMARY KEY,
+    pack_key     TEXT NOT NULL,                -- e.g. 'checklists.v1'
+    pack_version INTEGER NOT NULL DEFAULT 1,
+    item_kind    TEXT NOT NULL DEFAULT 'pack', -- pack|template|section|question|equipment|standard|document_type
+    item_code    TEXT NOT NULL DEFAULT '',     -- '' on the pack marker row
+    item_id      TEXT NOT NULL DEFAULT '',     -- the row it created, if it created one
+    action       TEXT NOT NULL DEFAULT '',     -- inserted|skipped|updated|failed
+    detail       TEXT NOT NULL DEFAULT '',     -- the error, when action = 'failed'
+    applied_by   TEXT NOT NULL DEFAULT '',     -- users.email, or 'boot'
+    outlet_id    TEXT NOT NULL DEFAULT '',
+    created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+  );`,
+
+  /* 30. THE RETENTION SWEEP'S OWN LOG (P10 / owner §13 ruling).
+   *     An unattended job that DELETES IMAGE DATA from a compliance file must be
+   *     able to prove what it did and when, or "the photograph is missing" and
+   *     "the photograph aged out by the policy you set" are indistinguishable —
+   *     and only one of those is acceptable to an inspector. Per-row,
+   *     image_dropped_at already says a given image went; this says the SWEEP
+   *     ran, over what cutoff, and how much it touched.
+   *     ⚠️ WHAT THE SWEEP MAY NEVER TOUCH, restated because it is one UPDATE
+   *     away from a disaster: computeFssaiSheetDigest hashes evidence as
+   *     (id, response_id, mime, size_bytes). Clear data_uri and every sheet
+   *     digest stays bit-identical and every signature still covers its sheet.
+   *     Change any of those four and you silently invalidate the signature on
+   *     every aged record in the file. size_bytes keeps the ORIGINAL size. */
+  `CREATE TABLE IF NOT EXISTS fssai_retention_runs (
+    id             TEXT PRIMARY KEY,
+    started_at     TEXT NOT NULL DEFAULT (datetime('now')),
+    finished_at    TEXT NOT NULL DEFAULT '',
+    cutoff_date    TEXT NOT NULL DEFAULT '',   -- images created before this were eligible
+    months_kept    INTEGER NOT NULL DEFAULT 12,
+    scanned_count  INTEGER NOT NULL DEFAULT 0,
+    dropped_count  INTEGER NOT NULL DEFAULT 0,
+    bytes_freed    INTEGER NOT NULL DEFAULT 0,
+    evidence_dropped    INTEGER NOT NULL DEFAULT 0,  -- from fssai_evidence
+    attachments_dropped INTEGER NOT NULL DEFAULT 0,  -- from fssai_attachments — BOTH tables, always
+    status         TEXT NOT NULL DEFAULT 'running',  -- running|done|failed
+    detail         TEXT NOT NULL DEFAULT '',
+    triggered_by   TEXT NOT NULL DEFAULT '',   -- users.email, or 'scheduler'
+    outlet_id      TEXT NOT NULL DEFAULT '',
+    created_at     TEXT NOT NULL DEFAULT (datetime('now'))
+  );`,
 ];
 
 /* Indexes get their OWN array and their OWN catch, so one swallowed error
@@ -8853,6 +9708,117 @@ const FSSAI_INDEX_DDL: string[] = [
   `CREATE INDEX IF NOT EXISTS idx_fssai_audit_entity  ON fssai_audit_log(entity_table, entity_id)`,
   `CREATE INDEX IF NOT EXISTS idx_fssai_audit_created ON fssai_audit_log(created_at DESC)`,
   `CREATE INDEX IF NOT EXISTS idx_fssai_audit_actor   ON fssai_audit_log(actor_email)`,
+
+  /* ══ THE RECORD TABLES (P4-P10) ═════════════════════════════════════════════
+   * ONE INDEX PER SCREEN OR SWEEP THAT ACTUALLY EXISTS, not one per column.
+   * Every record table is read three ways and no more: by business_date (the
+   * register), by the thing it is about (unit, item, vendor, document), and by
+   * whether it failed (the dashboard and the corrective-action queue). The
+   * partial `WHERE col <> ''` indexes exist because the module's convention is
+   * '' rather than NULL for an absent reference, so a plain index would hold a
+   * row for every record ever written while the query only ever wants the few
+   * that carry a value — the same reasoning as idx_fssai_evidence_retain above.
+   *
+   * ⚠️ NO UNIQUENESS RULE ON A READING, DELIBERATELY, and a lane must not add
+   * one casually. A partial UNIQUE over (equipment, date, time, person) looks
+   * like the obvious double-submit guard, but reading_at defaults to '' for a
+   * reading typed without a time, and a NOT NULL '' compares EQUAL in a UNIQUE
+   * index — so the second undated reading of the day would be refused with a
+   * constraint error in front of a chef. Double submits are the ROUTE's problem
+   * (an idempotency key on the request), exactly as uq_fssai_runs_open's own
+   * note says the slot rule is. */
+
+  // a delivery inspection: the register, the GRN it belongs to, the vendor's record
+  `CREATE UNIQUE INDEX IF NOT EXISTS uq_fssai_rqc_no ON fssai_receiving_checks(outlet_id, check_no) WHERE check_no <> ''`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_rqc_date   ON fssai_receiving_checks(business_date)`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_rqc_grn    ON fssai_receiving_checks(grn_id) WHERE grn_id <> ''`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_rqc_vendor ON fssai_receiving_checks(vendor_id, business_date)`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_rqc_status ON fssai_receiving_checks(status, business_date)`,
+  // received lines: always read inspection-scoped and in order; plus "what do we reject this item for"
+  `CREATE INDEX IF NOT EXISTS idx_fssai_rql_check    ON fssai_receiving_lines(check_id, sort_order)`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_rql_material ON fssai_receiving_lines(material_id, created_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_rql_fail     ON fssai_receiving_lines(is_fail, created_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_rql_expiry   ON fssai_receiving_lines(expiry_date) WHERE expiry_date <> ''`,
+  // temperature: the most queried table in the module — the register, the unit's
+  // history, the per-kind report, the failure list, department scoping, and the
+  // trace back to the checklist answer a reading came from
+  `CREATE INDEX IF NOT EXISTS idx_fssai_temp_date   ON fssai_temperature_logs(business_date)`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_temp_equip  ON fssai_temperature_logs(equipment_id, business_date)`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_temp_kind   ON fssai_temperature_logs(log_kind, business_date)`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_temp_fail   ON fssai_temperature_logs(is_fail, business_date)`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_temp_dept   ON fssai_temperature_logs(department_id, business_date)`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_temp_status ON fssai_temperature_logs(status, business_date)`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_temp_run    ON fssai_temperature_logs(run_id) WHERE run_id <> ''`,
+  // standards — `code` is the P8 seed's idempotency key, same mechanism as templates
+  `CREATE UNIQUE INDEX IF NOT EXISTS uq_fssai_std_code ON fssai_temp_standards(outlet_id, code) WHERE code <> ''`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_std_applies ON fssai_temp_standards(applies_to, is_active)`,
+  // equipment events — the unit's own history, and the "what is due" sweep
+  `CREATE INDEX IF NOT EXISTS idx_fssai_eqev_equip ON fssai_equipment_events(equipment_id, business_date)`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_eqev_kind  ON fssai_equipment_events(event_kind, business_date)`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_eqev_due   ON fssai_equipment_events(next_due_date) WHERE next_due_date <> ''`,
+  // shelf life — ONE row per item per outlet. This UNIQUE is what stops a second
+  // shelf-life master growing beside the first one.
+  `CREATE UNIQUE INDEX IF NOT EXISTS uq_fssai_shelf_material ON fssai_item_shelf_life(outlet_id, material_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_shelf_active ON fssai_item_shelf_life(is_active, storage_condition)`,
+  // the expiry and disposal register
+  `CREATE INDEX IF NOT EXISTS idx_fssai_expiry_date     ON fssai_expiry_items(business_date)`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_expiry_material ON fssai_expiry_items(material_id, business_date)`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_expiry_state    ON fssai_expiry_items(state, business_date)`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_expiry_batch    ON fssai_expiry_items(batch_id) WHERE batch_id <> ''`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_expiry_exp      ON fssai_expiry_items(expiry_date) WHERE expiry_date <> ''`,
+  // oil
+  `CREATE INDEX IF NOT EXISTS idx_fssai_oil_date  ON fssai_oil_checks(business_date)`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_oil_equip ON fssai_oil_checks(equipment_id, business_date)`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_oil_fail  ON fssai_oil_checks(is_fail, business_date)`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_oildisp_date   ON fssai_oil_disposals(business_date)`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_oildisp_vendor ON fssai_oil_disposals(vendor_id, business_date)`,
+  // water and ice — including the "when is the next test due" sweep
+  `CREATE INDEX IF NOT EXISTS idx_fssai_water_date ON fssai_water_tests(business_date)`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_water_kind ON fssai_water_tests(test_kind, business_date)`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_water_fail ON fssai_water_tests(is_fail, business_date)`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_water_due  ON fssai_water_tests(next_due_date) WHERE next_due_date <> ''`,
+  // pest — the visit register, the "is a contract visit overdue" sweep, the sightings log
+  `CREATE UNIQUE INDEX IF NOT EXISTS uq_fssai_pest_service_no ON fssai_pest_services(outlet_id, service_no) WHERE service_no <> ''`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_pest_svc_date   ON fssai_pest_services(business_date)`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_pest_svc_status ON fssai_pest_services(status, business_date)`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_pest_svc_vendor ON fssai_pest_services(vendor_id, business_date)`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_pest_svc_due    ON fssai_pest_services(next_due_date) WHERE next_due_date <> ''`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_pest_sight_date   ON fssai_pest_sightings(business_date)`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_pest_sight_type   ON fssai_pest_sightings(pest_type, business_date)`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_pest_sight_dept   ON fssai_pest_sightings(department_id, business_date)`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_pest_sight_device ON fssai_pest_sightings(device_id) WHERE device_id <> ''`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS uq_fssai_pest_device_code ON fssai_pest_devices(outlet_id, code) WHERE code <> ''`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_pest_device_active ON fssai_pest_devices(is_active, device_kind)`,
+  // documents — idx_fssai_doc_expiry IS the renewal reminder. It is partial
+  // because a document with no expiry never needs one, and §17's sweep then
+  // costs the number of expiring papers rather than the number ever filed.
+  `CREATE UNIQUE INDEX IF NOT EXISTS uq_fssai_doc_code ON fssai_documents(outlet_id, doc_code) WHERE doc_code <> ''`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_doc_expiry ON fssai_documents(expiry_date) WHERE expiry_date <> ''`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_doc_type   ON fssai_documents(doc_type, is_active)`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_doc_vendor ON fssai_documents(vendor_id) WHERE vendor_id <> ''`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_doc_person ON fssai_documents(person_email) WHERE person_email <> ''`,
+  // attachments — the parent lookup, and the retention sweep's one question.
+  // idx_fssai_attach_retain is the TWIN of idx_fssai_evidence_retain above: the
+  // sweep must walk BOTH tables or every record-module photograph is kept for ever.
+  `CREATE INDEX IF NOT EXISTS idx_fssai_attach_entity ON fssai_attachments(entity_table, entity_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_attach_retain ON fssai_attachments(created_at) WHERE data_uri <> ''`,
+  // inspections and their findings
+  `CREATE UNIQUE INDEX IF NOT EXISTS uq_fssai_insp_no ON fssai_inspections(outlet_id, inspection_no) WHERE inspection_no <> ''`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_insp_date   ON fssai_inspections(business_date)`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_insp_status ON fssai_inspections(status, business_date)`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_finding_insp   ON fssai_inspection_findings(inspection_id, sort_order)`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_finding_status ON fssai_inspection_findings(status, due_date)`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_finding_ca     ON fssai_inspection_findings(ca_id) WHERE ca_id <> ''`,
+  /* THE SEED'S IDEMPOTENCY GUARANTEE, and the one index in this block that is
+   * doing real work rather than making a screen fast. Every column is NOT NULL,
+   * so this is a FULL unique: the pack marker row (item_kind='pack',
+   * item_code='') can exist exactly once per pack_key + pack_version. A seed
+   * that inserts its marker first and refuses on constraint failure can never
+   * run twice — which is what stops a cold start resurrecting the checklists an
+   * admin deliberately retired. */
+  `CREATE UNIQUE INDEX IF NOT EXISTS uq_fssai_seed_item ON fssai_seed_log(pack_key, pack_version, item_kind, item_code)`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_seed_pack ON fssai_seed_log(pack_key, created_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_retention_started ON fssai_retention_runs(started_at DESC)`,
 ];
 
 /* ── WHAT THE LAST APPLY PASS FOUND ────────────────────────────────────────

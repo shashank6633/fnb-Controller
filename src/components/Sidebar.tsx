@@ -451,8 +451,14 @@ const navTree: NavEntry[] = [
       { kind: "link", label: "Inspection Reports",                  href: "/fssai/inspections",        icon: ClipboardList },
       { kind: "link", label: "Documents & Certificates",            href: "/fssai/documents",          icon: FileText },
       { kind: "link", label: "Reports & Downloads",                 href: "/fssai/reports",            icon: BarChart3 },
+      { kind: "link", label: "Record Changes & Voids",              href: "/fssai/audit-log",          icon: History },
       // adminOnly in the catalog.
       { kind: "link", label: "Settings",                            href: "/fssai/settings",           icon: Settings2 },
+      // A sub-page of Settings, listed here on purpose: the equipment register is
+      // where every safe range in the module is set, and a screen reached only by
+      // a link inside another screen is a screen nobody finds. Its own catalog row
+      // carries adminOnly, so it hides itself for everyone else.
+      { kind: "link", label: "Equipment & Cold Units",              href: "/fssai/settings/equipment", icon: Snowflake },
       { kind: "link", label: "Inspection Mode",                     href: "/fssai/inspection-mode",    icon: Eye },
     ],
   },

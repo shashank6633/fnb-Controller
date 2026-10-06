@@ -1,6 +1,14 @@
 /**
- * The twenty FSSAI Compliance screens, in the owner's own order, with the phase
- * that brings each one to life.
+ * The FSSAI Compliance screens, in the owner's own order, with the phase that
+ * brings each one to life.
+ *
+ * It was twenty. It is TWENTY-TWO: the record modules needed two surfaces the
+ * original list had nowhere to put — the change-and-void trail that owner §19
+ * requires, and the equipment register every temperature verdict is judged
+ * against (fssai_equipment holds 0 rows, so without it a cold room cannot even
+ * be the target of a check). Both carry the same tier flags in page-catalog.ts.
+ * Count them from this array, never from a sentence: the number in a comment
+ * goes stale silently and this one already had.
  *
  * ONE LIST, THREE READERS. The Compliance Dashboard builds its tiles from here,
  * every sub-page reads its own row for its heading, icon and phase, and the
@@ -32,6 +40,7 @@ import {
   Eye,
   FileText,
   HardHat,
+  History,
   LayoutDashboard,
   ListChecks,
   PackageCheck,
@@ -102,15 +111,16 @@ export interface FssaiModule {
  * `name: 'Phase N'` back and render it instead of `when`.
  */
 export const FSSAI_PHASES: Record<number, { when: string; brings: string }> = {
-  1: { when: 'In place',          brings: 'the foundation — the records store, the menu, the permissions and these screens' },
-  2: { when: 'Next',              brings: 'the checklist builder — sections, questions, and which answer counts as a pass' },
-  3: { when: 'Next',              brings: 'the phone checklist — answer it, photograph, sign and submit' },
-  4: { when: 'After your review', brings: 'the receiving, temperature and cold-room records' },
-  5: { when: 'After your review', brings: 'the batch and expiry, oil and water records' },
-  6: { when: 'After your review', brings: 'pest control and the certificate cupboard' },
-  7: { when: 'After your review', brings: 'corrective actions, the follow-up tasks and the escalations' },
-  8: { when: 'After your review', brings: 'the twelve ready-made checklists' },
-  9: { when: 'After your review', brings: 'the dashboard figures, Inspection Mode and the reports' },
+  1: { when: 'In place',       brings: 'the foundation — the records store, the menu, the permissions and these screens' },
+  2: { when: 'Next',           brings: 'the checklist builder — sections, questions, and which answer counts as a pass' },
+  3: { when: 'Next',           brings: 'the phone checklist — answer it, photograph, sign and submit' },
+  4: { when: 'Being built',    brings: 'the receiving, temperature and cold-room records' },
+  5: { when: 'Being built',    brings: 'the batch and expiry, oil and water records' },
+  6: { when: 'Being built',    brings: 'pest control and the certificate cupboard' },
+  7: { when: 'Being built',    brings: 'corrective actions, the follow-up tasks and the escalations' },
+  8: { when: 'Being built',    brings: 'the twelve ready-made checklists' },
+  9: { when: 'Being built',    brings: 'the dashboard figures, Inspection Mode and the reports' },
+  10: { when: 'Being built',   brings: 'the change-and-void trail behind every record' },
 };
 
 /**
@@ -121,6 +131,27 @@ export const FSSAI_PHASES: Record<number, { when: string; brings: string }> = {
  * in the queue.
  */
 export const FSSAI_REVIEW_GATE_PHASE = 4;
+
+/**
+ * IS THE BUILD STILL STOPPED AT THAT GATE? Now **false**, and the reason is the
+ * only thing that may ever change it.
+ *
+ * WHY IT EXISTS AS A FLAG RATHER THAN A DELETED PARAGRAPH. Until today every
+ * screen from phase 4 up printed "That work is deliberately on hold… the build
+ * stops once a checklist runs on a phone", which was true and was exactly what
+ * the owner asked for on 2026-09-16. He has since instructed the build to carry
+ * on and complete the module, so that sentence became a false statement about
+ * his own project, printed on eighteen screens at once. The sentence is not
+ * deleted — the gate is part of this build's history and the words are still
+ * here, one line away — it is simply no longer asserted.
+ *
+ * ⚠️ WHAT THIS IS NOT. It has NOTHING to do with the DEPLOY gate, which stands
+ * unchanged and is not a flag in any file: nothing in this module is deployed,
+ * merged or pushed until the owner says "Deploy FSSAI". See
+ * FSSAI-BUILD-STATE.md §0. Flipping this constant back to `true` restores the
+ * hold paragraph and changes nothing else.
+ */
+export const FSSAI_BUILD_HELD_AT_REVIEW_GATE = false;
 
 export const FSSAI_MODULES: FssaiModule[] = [
   {
@@ -289,11 +320,29 @@ export const FSSAI_MODULES: FssaiModule[] = [
     group: 'setup',
   },
   {
+    href: '/fssai/audit-log',
+    label: 'Record Changes & Voids',
+    blurb: 'Who changed a record, from what to what, and the reason they gave for cancelling one.',
+    phase: 10,
+    icon: History,
+    access: 'management',
+    group: 'records',
+  },
+  {
     href: '/fssai/settings',
     label: 'Settings',
     blurb: 'Your standards: the checklists, the frequencies, the equipment and the safe ranges.',
     phase: 2,
     icon: Settings2,
+    access: 'admin',
+    group: 'setup',
+  },
+  {
+    href: '/fssai/settings/equipment',
+    label: 'Equipment & Cold Units',
+    blurb: 'Every cold room, chiller, freezer and fryer, each with the safe range you set for it.',
+    phase: 4,
+    icon: Snowflake,
     access: 'admin',
     group: 'setup',
   },

@@ -523,11 +523,38 @@ export const PAGE_CATALOG: PageSection[] = [
       { path: '/fssai/inspections',        label: 'Inspection Reports',       mgmtOnly: true },
       { path: '/fssai/documents',          label: 'Documents & Certificates', mgmtOnly: true },
       { path: '/fssai/reports',            label: 'Reports & Downloads',      mgmtOnly: true },
+      // RECORD CHANGES & VOIDS — the owner's §19 surface: who changed a
+      // compliance record, from what to what, and the reason they gave for
+      // voiding it. Reads fssai_audit_log plus the voided_* columns on every
+      // record table.
+      //
+      // mgmtOnly, the SAME set as Verify Records, and for the same reason: this
+      // screen is a list of the moments somebody's record was overridden. It is
+      // not a staff surface, and it is not adminOnly either — a manager must be
+      // able to show an inspector what changed without the owner present, which
+      // is the whole point of keeping the trail.
+      { path: '/fssai/audit-log',          label: 'Record Changes & Voids',   mgmtOnly: true },
       // Temperature standards, frequencies and template authoring live here. A
       // wrong value here does not announce itself — it surfaces weeks later as a
       // record an inspector rejects. Same reasoning as /hr/settings and
       // /settings/qc-categories above.
       { path: '/fssai/settings',           label: 'Settings',                 adminOnly: true },
+      // EQUIPMENT & COLD UNITS — the register of cold rooms, chillers, freezers,
+      // fryers and water filters, each with the safe range the owner sets for it.
+      // MEASURED: fssai_equipment holds 0 rows, so today an equipment-targeted
+      // checklist can only run if an admin types the unit onto the schedule by
+      // hand, and the only cold units that exist anywhere in this app are four
+      // free-text strings on production_batches.storage_location.
+      //
+      // It carries adminOnly EXPLICITLY even though bestEntry()'s longest-prefix
+      // rule would hand it down from /fssai/settings anyway. Two reasons, both
+      // practical: the Page Access matrix is built from this array, so an entry
+      // that is not here can never be granted or revoked on its own; and a reader
+      // of this file should not have to re-derive a tier gate from prefix
+      // arithmetic. A safe range is the number every temperature verdict in the
+      // module is judged against — owner §5, "never hard-coded" — so a wrong
+      // value here silently re-grades the whole file.
+      { path: '/fssai/settings/equipment', label: 'Equipment & Cold Units',   adminOnly: true },
       { path: '/fssai/inspection-mode',    label: 'Inspection Mode',          mgmtOnly: true },
     ],
   },
@@ -930,21 +957,26 @@ export function canAccessPage(
  * The problem is that many catalog parents are ALSO the URL prefix of their
  * SIBLING catalog pages. /tasks is the Task Dashboard *and* the prefix of the
  * 14 other Task Management pages, so ticking the dashboard silently hands over
- * the whole module. Across the catalog 11 parents carry 88 such grants:
- *   /fssai +19, /hr +18, /crm-calls +16, /tasks +14, /inventory +8,
+ * the whole module. Across the catalog 12 parents carry 92 such grants:
+ *   /fssai +22, /hr +18, /crm-calls +16, /tasks +14, /inventory +8,
  *   /reports +6, /kitchen-production +3, /dine-in/kitchen +1, /grn +1,
- *   /settings/integrations +1, /vendors +1
+ *   /settings/integrations +1, /vendors +1, /fssai/settings +1
  * proxy.ts imports canAccessPage rather than duplicating it, so this is real
  * server-side reach, not just a sidebar that shows too much.
  *
- * THESE NUMBERS ARE MEASURED, AND THEY GO STALE SILENTLY. The figure above read
- * "8 parents carry 43 such grants" and was already wrong before the FSSAI
- * section was added: re-measured against this array it was 10 parents / 69
- * grants, because /hr (+18) and /grn (+1) were never added to the list and
- * /crm-calls (16, not 10) and /inventory (8, not 7) had grown. Adding the 20
- * FSSAI rows contributes /fssai +19 and takes it to 11 / 88, so FSSAI is now the
- * single largest carrier in the catalog. Nothing recomputes this comment, so any
- * section added here must re-measure it. The live figure is whatever
+ * THESE NUMBERS ARE MEASURED, AND THEY GO STALE SILENTLY — this figure has now
+ * been wrong three times. It read "8 parents carry 43 such grants" and was
+ * already wrong before the FSSAI section existed: re-measured it was 10 / 69,
+ * because /hr (+18) and /grn (+1) were never added to the list and /crm-calls
+ * (16, not 10) and /inventory (8, not 7) had grown. It was then written as
+ * 11 / 88 for a "20-row" FSSAI section that was in fact 21 rows. Re-measured
+ * against this array on 2026-10-06, after the record modules added
+ * 'Record Changes & Voids' and 'Equipment & Cold Units', it is
+ * **12 parents / 92 grants** — and /fssai/settings is a NEW KIND of entry in
+ * this list: a catalog parent that is itself the child of another one, so
+ * /fssai/settings/equipment inherits from it and not from /fssai. FSSAI remains
+ * the single largest carrier. Nothing recomputes this comment, so any section
+ * added here must re-measure it. The live figure is whatever
  * GET /api/admin/page-access-impact reports, not whatever this comment says.
  *
  * WHY IT IS NOT ENFORCED YET
