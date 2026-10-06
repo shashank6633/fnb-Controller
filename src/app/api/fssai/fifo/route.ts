@@ -4,7 +4,7 @@ import { getCurrentOutletId, isManagement } from '@/lib/auth';
 import {
   canRunFssaiCheck, fssaiToday, isISODate, daysBetweenISO,
   fssaiExpiryState, fssaiExpiryStateMeta, FSSAI_NEAR_EXPIRY_DAYS,
-  FSSAI_EXPIRY_REASONS, FSSAI_EXPIRY_ACTIONS, FSSAI_SHIFTS,
+  FSSAI_EXPIRY_REASONS, FSSAI_EXPIRY_ACTIONS,
   fssaiRecordStatusMeta, isFssaiRecordStatus, fssaiVoidRefusal,
 } from '@/lib/fssai';
 import {
@@ -398,7 +398,9 @@ export async function GET(request: Request) {
       vocab: {
         reasons: FSSAI_EXPIRY_REASONS,
         actions: FSSAI_EXPIRY_ACTIONS,
-        shifts: FSSAI_SHIFTS,
+        /* NO SHIFTS HERE. fssai_expiry_items has no shift column — a shelf walk is
+         * dated and timed, not shift-scoped — and offering a shift the record
+         * cannot hold is how a form grows a field that goes nowhere. */
       },
       decide_writable_columns: DECIDE_WRITABLE_COLUMNS,
       moves_stock: false,

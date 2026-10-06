@@ -378,7 +378,7 @@ export async function POST(request: Request) {
     /* WHICH FRYER. Registered equipment is preferred; a typed name is accepted
      * because fssai_equipment is empty until P4 seeds it, and a check against
      * "the fryer" with no name is a record nobody can act on. */
-    let equipmentId = str(body?.equipment_id);
+    const equipmentId = str(body?.equipment_id);
     let equipmentLabel = str(body?.equipment_label).slice(0, 200);
     let departmentId = str(body?.department_id) || me.department_id || '';
     if (equipmentId) {

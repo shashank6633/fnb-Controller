@@ -62,6 +62,15 @@ const MAX_LAB_PARAMETERS = 80;
 const LAB_RESULTS = ['', 'pass', 'fail'] as const;
 
 /**
+ * The kinds of record that are meaningless without a number.
+ *
+ * An ice check, a tank cleaning and a filter change are satisfied by words or a
+ * date — holding them to a reading would mean a cleaned tank could not be
+ * recorded at all. These four are a measurement or they are nothing.
+ */
+const NUMBER_REQUIRED_KINDS: readonly string[] = ['chlorine', 'tds', 'ph', 'hardness'];
+
+/**
  * The code a water test asks fssai_temp_standards for before falling back to a
  * generic 'water' standard. A CONVENTION THIS PHASE PROPOSES — the table and its
  * seed belong to other phases, so nothing here assumes such a row exists.
@@ -296,13 +305,29 @@ export async function GET(request: Request) {
 
     const docs = readP5AttachmentIndex(db, 'fssai_water_tests', shaped.map((r) => r.id));
 
+    /* THE COUNTS ARE SCOPED THE SAME WAY THE LIST IS — the visibility rule AND
+     * the readings/certificates split. The screen shows the two shapes as two
+     * tabs, so a tab reading "6" above a list of 3 would make every number on
+     * this page untrustworthy. Date and text filters deliberately do NOT narrow
+     * them: those are the user narrowing a view, and the chip is the total they
+     * are narrowing out of. */
+    const countWhere: string[] = [];
+    const countArgs: any[] = [];
     const visCount = p5VisibilityClause(me, 'w');
+    if (visCount.sql) { countWhere.push(visCount.sql); countArgs.push(...visCount.args); }
+    if (labKinds.length && url.searchParams.get('lab') === '1') {
+      countWhere.push(`w.test_kind IN (${labKinds.map(() => '?').join(',')})`);
+      countArgs.push(...labKinds);
+    } else if (labKinds.length && url.searchParams.get('lab') === '0') {
+      countWhere.push(`w.test_kind NOT IN (${labKinds.map(() => '?').join(',')})`);
+      countArgs.push(...labKinds);
+    }
     const countRows = db.prepare(
       `SELECT status, is_fail, is_judged, test_kind, next_due_date, COUNT(*) AS n
          FROM fssai_water_tests w
-        ${visCount.sql ? `WHERE ${visCount.sql}` : ''}
+        ${countWhere.length ? `WHERE ${countWhere.join(' AND ')}` : ''}
         GROUP BY status, is_fail, is_judged, test_kind, next_due_date`,
-    ).all(...visCount.args) as any[];
+    ).all(...countArgs) as any[];
     const live = countRows.filter((c) => String(c.status) !== 'void');
     const sum = (f: (c: any) => boolean) => live.filter(f).reduce((t, c) => t + (Number(c.n) || 0), 0);
 
@@ -349,6 +374,11 @@ export async function GET(request: Request) {
         test_kinds: FSSAI_WATER_TEST_KINDS,
         lab_results: LAB_RESULTS,
         max_lab_parameters: MAX_LAB_PARAMETERS,
+        /* THE KINDS WHOSE WHOLE POINT IS A NUMBER, served rather than repeated on
+         * the screen. The form needs to know which boxes are compulsory, and a
+         * second copy of this list in the page would drift the moment a kind is
+         * added — the rival-helper trap in miniature. */
+        number_kinds: NUMBER_REQUIRED_KINDS,
       },
       truncated: rows.length >= P5_LIST_LIMIT,
     });
@@ -452,7 +482,7 @@ export async function POST(request: Request) {
     }
     const isLab = !!kindMeta.is_lab;
 
-    let equipmentId = str(body?.equipment_id);
+    const equipmentId = str(body?.equipment_id);
     let departmentId = str(body?.department_id) || me.department_id || '';
     let sourcePoint = str(body?.source_point).slice(0, 200);
     if (equipmentId) {
@@ -589,10 +619,10 @@ export async function POST(request: Request) {
       standardId = standard?.id || '';
       if (standard && !uom) uom = standard.uom;
 
-      /* A RECORD HAS TO SAY SOMETHING. The kinds with no number — an ice check, a
-       * tank cleaning, a filter change — are satisfied by words or a date, so
-       * they are not held to a reading. */
-      const needsNumber = ['chlorine', 'tds', 'ph', 'hardness'].includes(testKind);
+      /* A RECORD HAS TO SAY SOMETHING, and NUMBER_REQUIRED_KINDS is the one list
+       * that decides which kinds owe a reading — the same list the GET serves to
+       * the form, so the compulsory box and the refusal cannot disagree. */
+      const needsNumber = NUMBER_REQUIRED_KINDS.includes(testKind);
       if (needsNumber && valueNum === null) {
         return Response.json(
           { error: `A ${kindMeta.label.toLowerCase()} record needs the reading. Enter it, or choose a different kind of record.`, code: 'reading_required' },
