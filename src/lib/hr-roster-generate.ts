@@ -97,6 +97,22 @@ const WEEKDAY_NAMES = [
  */
 export const ROSTER_SOURCE_GENERATED = 'generated';
 
+/**
+ * hr_attendance.status for an off day this generator recorded under
+ * hr_weekly_off_policy='paid'.
+ *
+ * ONE constant for BOTH the insert and the superseded-row delete in
+ * commitRosterPlan, for the same reason hr_rosters.source has one: two inlined
+ * copies agree today and the first time one of them is "improved" the delete
+ * silently stops matching — a guard that reads correctly and never fires, which
+ * is how the accumulating-offs bug got in. hr_attendance has no provenance
+ * column, so this status IS the provenance: db.ts records that WEEKLY_OFF is
+ * written ONLY here, and the attendance engine (hr-attendance.ts recomputeDay)
+ * only ever writes punch-derived statuses, so a real punch on an off day lands
+ * as PRESENT/LATE/CHECKED_OUT and can never be mistaken for a generated row.
+ */
+const WEEKLY_OFF_ATTENDANCE_STATUS = 'WEEKLY_OFF';
+
 /** Scope label for a coverage row that names no designation. */
 const WHOLE_DEPARTMENT = 'Whole department';
 
@@ -248,6 +264,11 @@ export interface RosterCommitResult {
   weekly_off_rows_written: number;
   /** An off day that already had attendance — a real punch is never overwritten. */
   weekly_off_rows_skipped: Array<{ employee_id: string; date: string; existing_status: string }>;
+  /** Generated WEEKLY_OFF attendance rows removed because that day is no longer
+   *  an off in this plan. The paid-off mirror of stale_rows_removed: without it a
+   *  regenerate ADDED offs instead of replacing them and payroll paid for days
+   *  nobody was off. Only ever rows this generator wrote. */
+  weekly_off_rows_removed: number;
 }
 
 /* ------------------------------------------------------------------ *
@@ -1345,6 +1366,14 @@ export interface RosterCommitOptions {
  * hr_weekly_off_policy='paid' each off becomes an hr_attendance row with status
  * WEEKLY_OFF instead.
  *
+ * A COMMIT REPLACES THE WEEK, IT DOES NOT ADD TO IT. Both generated rails are
+ * rewritten for the committed range: superseded hr_rosters rows go (stale) and so
+ * do superseded WEEKLY_OFF attendance rows (staleOffs). The off rail used to only
+ * insert, so every regenerate under 'paid' kept the previous off days as well as
+ * the new ones — offs compounding until the days-in-month cap, dates reading as
+ * both a rostered shift and a paid off, and payroll paying for days nobody was
+ * off. Only rows this generator wrote are ever removed; see delStaleOff.
+ *
  * A MANUAL EDIT WINS. Rows whose hr_rosters.source is not 'generated' — which
  * includes every row written before that column existed — are left exactly as
  * they are and reported in kept_manual. The upsert also carries that test in
@@ -1366,6 +1395,7 @@ export function commitRosterPlan(
     kept_manual: [],
     weekly_off_rows_written: 0,
     weekly_off_rows_skipped: [],
+    weekly_off_rows_removed: 0,
   };
 
   if (!plan.ok || plan.refusals.length) {
@@ -1443,7 +1473,13 @@ export function commitRosterPlan(
   const offWrites = plan.weekly_off_policy === 'paid' ? plan.off_writes : [];
   const weekly_off_rows_skipped: RosterCommitResult['weekly_off_rows_skipped'] = [];
   const offInserts: RosterOffWrite[] = [];
-  if (offWrites.length) {
+  const staleOffs: RosterOffWrite[] = [];
+  // Gated on the POLICY, not on offWrites.length: under 'paid' with zero offs
+  // this week (everyone on leave, or no allowed off weekday falls in the week)
+  // last run's paid offs must still be cleared. Under 'unpaid' — the default,
+  // and what production has — nothing is read and nothing is deleted, so that
+  // path stays byte-for-byte what it was.
+  if (plan.weekly_off_policy === 'paid') {
     const existingAtt = db
       .prepare(
         `SELECT employee_id, date, status
@@ -1468,12 +1504,34 @@ export function commitRosterPlan(
       }
       offInserts.push(o);
     }
+
+    // A day that WAS a paid off and is now a shift, a leave day, or simply a
+    // different off must LOSE its WEEKLY_OFF row — the exact mirror of `stale`
+    // above. Without this the off path only ever inserted: every regenerate
+    // (a settings change, an approved leave, a joiner, a coverage edit) left the
+    // previous offs behind, so one month's offs compounded to 70 rows where 45
+    // were earned, 25 dates read as BOTH a rostered shift and a paid off, and
+    // payroll paid for days nobody was off.
+    //
+    // Scoped three ways, and every one of them matters: the committed date range,
+    // the employees in this plan, and status = WEEKLY_OFF so that only rows this
+    // generator itself wrote can go. A PRESENT / ABSENT / ON_LEAVE /
+    // NOT_CHECKED_IN row — anything punch-derived or manually recorded — is
+    // outside the filter and survives untouched. Deleting a real attendance
+    // record would be far worse than the bug this fixes.
+    const offKeys = new Set(offWrites.map((o) => `${o.employee_id}\u0000${o.date}`));
+    for (const r of existingAtt) {
+      if (s(r.status) !== WEEKLY_OFF_ATTENDANCE_STATUS) continue;
+      if (offKeys.has(`${r.employee_id}\u0000${r.date}`)) continue;
+      staleOffs.push({ employee_id: r.employee_id, date: r.date });
+    }
   }
 
   const outletId = s(actor.outlet_id ?? '');
   let shiftRowsWritten = 0;
   let staleRemoved = 0;
   let offRowsWritten = 0;
+  let offRowsRemoved = 0;
 
   const upsert = db.prepare(
     `INSERT INTO hr_rosters (id, employee_id, date, shift_id, note, created_by, source)
@@ -1491,8 +1549,23 @@ export function commitRosterPlan(
   );
   const insOff = db.prepare(
     `INSERT INTO hr_attendance (id, employee_id, outlet_id, date, status)
-     VALUES (?, ?, ?, ?, 'WEEKLY_OFF')
+     VALUES (?, ?, ?, ?, '${WEEKLY_OFF_ATTENDANCE_STATUS}')
      ON CONFLICT(employee_id, date) DO NOTHING`,
+  );
+  // The delete that pairs with insOff. Status is the provenance (hr_attendance
+  // has no source column), and the four zero-punch tests are belt and braces:
+  // insOff writes ONLY the five columns above, so every row it created has
+  // first_in='', last_out='', sessions=0, worked_minutes=0 and corrected=0.
+  // Anything carrying punch data or an approved correction is therefore not ours
+  // and is left exactly where it is, whatever its status says. Every one of those
+  // tests is carried IN THE SQL, like the upsert's source test, so a punch that
+  // lands between the pre-read and this transaction is still safe: the row no
+  // longer matches and the delete simply changes nothing.
+  const delStaleOff = db.prepare(
+    `DELETE FROM hr_attendance
+      WHERE employee_id = ? AND date = ? AND status = '${WEEKLY_OFF_ATTENDANCE_STATUS}'
+        AND corrected = 0 AND first_in = '' AND last_out = ''
+        AND sessions = 0 AND worked_minutes = 0`,
   );
 
   const run = db.transaction(() => {
@@ -1508,6 +1581,12 @@ export function commitRosterPlan(
     }
     for (const r of stale) {
       staleRemoved += delStale.run(r.employee_id, r.date).changes;
+    }
+    // Remove BEFORE inserting: a date that is leaving the off set and a date that
+    // is joining it are different keys, but doing it in this order also means a
+    // single transaction can never hold both states of the same day.
+    for (const o of staleOffs) {
+      offRowsRemoved += delStaleOff.run(o.employee_id, o.date).changes;
     }
     for (const o of offInserts) {
       offRowsWritten += insOff.run(generateId(), o.employee_id, outletId, o.date).changes;
@@ -1533,6 +1612,7 @@ export function commitRosterPlan(
         stale_rows_removed: staleRemoved,
         kept_manual: kept_manual.length,
         weekly_off_rows: offRowsWritten,
+        weekly_off_rows_removed: offRowsRemoved,
         breaches: plan.breaches.length,
         breaches_acknowledged: !!options.allow_breaches,
       },
@@ -1547,5 +1627,6 @@ export function commitRosterPlan(
     kept_manual,
     weekly_off_rows_written: offRowsWritten,
     weekly_off_rows_skipped,
+    weekly_off_rows_removed: offRowsRemoved,
   };
 }
