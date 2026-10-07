@@ -258,6 +258,116 @@ export function getHrOrgState(db: Database.Database): string {
   return String(readSetting(db, 'hr_org_state') ?? '').trim();
 }
 
+/* ------------------------------------------------------------------ *
+ * Roster-generator policy settings
+ *
+ * Four knobs, EVERY ONE OF THEM DEFAULTING TO TODAY'S BEHAVIOUR: on a database
+ * where none of these keys exists (which is every database right now) the
+ * getters below describe exactly what the app already does, so adding them
+ * changes nothing until an admin changes something.
+ *
+ * They live here, beside the two attendance knobs, because this is the file that
+ * owns the shared-settings reads for HR and because readSetting()'s
+ * never-throws contract is what makes a default safe. /api/hr/settings serves
+ * and writes them (the hr_ prefix is registered to that route in
+ * src/app/api/settings/route.ts, so the generic manager-writable PUT cannot).
+ * ------------------------------------------------------------------ */
+
+/** Owner: "Usually should rotate people between the shifts" — so rotation ON is
+ *  the default, and the alternative stays selectable. */
+const DEFAULT_ROSTER_ROTATE_SHIFTS = true;
+
+/** Mon-Thu. OWNER HARD RULE: weekly offs land Mon-Thu ONLY, "it is a Pub,
+ *  weekend is more busy". Measured in his own Captains grid: Mon 5, Tue 7,
+ *  Wed 4, Thu 4, and Fri/Sat/Sun ZERO. */
+const DEFAULT_OFFS_WEEKDAYS: readonly number[] = [1, 2, 3, 4];
+
+/** 'unpaid' is TODAY: nothing is recorded for an off day at all. */
+export type HrWeeklyOffPolicy = 'unpaid' | 'paid';
+const DEFAULT_WEEKLY_OFF_POLICY: HrWeeklyOffPolicy = 'unpaid';
+
+/** 'calendar_days' is TODAY's payroll proration basis — see the getter. */
+export type HrPayrollProrationBasis = 'calendar_days' | 'working_days';
+const DEFAULT_PRORATION_BASIS: HrPayrollProrationBasis = 'calendar_days';
+
+/**
+ * hr_roster_rotate_shifts (0/1), default 1 = ROTATE.
+ *
+ * true  — rotate people between shifts week to week (the owner's usual).
+ * false — keep each person on their usual shift and move ONLY the off day.
+ *
+ * Tested as the exact strings '0' and '1', NOT through parseInt: a stored '0' is
+ * a real answer ("do not rotate") and must not be mistaken for "unset" by a
+ * falsy check that then hands back the default. Anything else stored (garbage,
+ * 'false', '') is unset and falls back.
+ */
+export function getHrRosterRotateShifts(db: Database.Database): boolean {
+  const v = String(readSetting(db, 'hr_roster_rotate_shifts') ?? '').trim();
+  if (v === '0') return false;
+  if (v === '1') return true;
+  return DEFAULT_ROSTER_ROTATE_SHIFTS;
+}
+
+/**
+ * hr_roster_offs_weekdays — which weekdays a generated weekly off may land on,
+ * stored as CSV of 0=Sun..6=Sat. Default '1,2,3,4' (Mon-Thu) per the hard rule.
+ *
+ * Returns a sorted, de-duplicated list of valid weekdays.
+ *
+ * AN EMPTY RESULT IS NEVER "ANY DAY". A blank key, a blank value and a value
+ * holding nothing parseable all mean the same thing — nobody has chosen — so
+ * they all come back as Mon-Thu. The dangerous reading is the other one: an
+ * empty allow-list treated as "unrestricted" would put offs on Saturday night,
+ * which is the single thing the owner ruled out.
+ */
+export function getHrRosterOffsWeekdays(db: Database.Database): number[] {
+  const raw = String(readSetting(db, 'hr_roster_offs_weekdays') ?? '');
+  const seen = new Set<number>();
+  for (const part of raw.split(',')) {
+    const t = part.trim();
+    // /^\d$/ and not parseInt: '3abc' and '3.5' are typos, not weekday 3.
+    if (!/^\d$/.test(t)) continue;
+    const n = Number(t);
+    if (n >= 0 && n <= 6) seen.add(n);
+  }
+  if (seen.size === 0) return [...DEFAULT_OFFS_WEEKDAYS];
+  return [...seen].sort((a, b) => a - b);
+}
+
+/**
+ * hr_weekly_off_policy — 'unpaid' (default, = today) or 'paid'.
+ *
+ * 'unpaid' is today's behaviour because today NOTHING is recorded for an off
+ * day: no roster row (hr_rosters cannot hold one) and no attendance row, so the
+ * day simply is not a paid day.
+ *
+ * 'paid' makes the generator write an hr_attendance row with status WEEKLY_OFF
+ * for each off day. That counts as PAID with NO change to payroll arithmetic:
+ * hr-payroll.ts treats only ABSENT / NOT_CHECKED_IN / ON_LEAVE as unpaid, so a
+ * WEEKLY_OFF row lands in presentDates like any other paying status.
+ */
+export function getHrWeeklyOffPolicy(db: Database.Database): HrWeeklyOffPolicy {
+  const v = String(readSetting(db, 'hr_weekly_off_policy') ?? '').trim().toLowerCase();
+  return v === 'paid' ? 'paid' : DEFAULT_WEEKLY_OFF_POLICY;
+}
+
+/**
+ * hr_payroll_proration_basis — 'calendar_days' (default, = today) or
+ * 'working_days'.
+ *
+ * ONLY MEANINGFUL ONCE OFFS ARE RECORDED, i.e. together with
+ * hr_weekly_off_policy='paid'. Under the default off policy no off day exists in
+ * any table, so "working days" cannot be counted and this setting would
+ * silently describe nothing. The UI says so on the control itself.
+ *
+ * Reading it changes no arithmetic on its own — payroll's current proration is
+ * calendar-day based and stays that way until a caller asks for this basis.
+ */
+export function getHrPayrollProrationBasis(db: Database.Database): HrPayrollProrationBasis {
+  const v = String(readSetting(db, 'hr_payroll_proration_basis') ?? '').trim().toLowerCase();
+  return v === 'working_days' ? 'working_days' : DEFAULT_PRORATION_BASIS;
+}
+
 /** The business date RIGHT NOW (reads hr_day_cutoff, default '04:00').
  *  This is the default `date` of GET /api/hr/attendance and the boundary
  *  recomputeDay uses to decide whether a day is closed. */

@@ -8112,7 +8112,10 @@ function initializeSchema(db: Database.Database) {
         date             TEXT NOT NULL,             -- IST business date (YYYY-MM-DD), the register key
         status           TEXT NOT NULL DEFAULT 'NOT_CHECKED_IN',
           -- NOT_CHECKED_IN|PRESENT|LATE|ON_BREAK|OUTSIDE_GEOFENCE|EARLY_CHECKOUT|
-          -- CHECKED_OUT|ABSENT|ON_LEAVE|HALF_DAY|OVERTIME|MISSING_CHECKOUT (vocab in src/lib/hr.ts)
+          -- CHECKED_OUT|ABSENT|ON_LEAVE|HALF_DAY|WEEKLY_OFF|OVERTIME|MISSING_CHECKOUT
+          -- (vocab in src/lib/hr.ts). WEEKLY_OFF is written ONLY by the roster
+          -- generator and ONLY under hr_weekly_off_policy='paid'; it is a PAID
+          -- day (absent from hr-payroll.ts's UNPAID_ATTENDANCE_STATUSES).
         first_in         TEXT NOT NULL DEFAULT '',  -- UTC datetimes; '' = none
         last_out         TEXT NOT NULL DEFAULT '',
         sessions         INTEGER NOT NULL DEFAULT 0, -- IN/OUT pairs; 2 on a split-shift day
@@ -8657,6 +8660,155 @@ function initializeSchema(db: Database.Database) {
       CREATE INDEX IF NOT EXISTS idx_hr_notif_rcpt ON hr_notifications(recipient_email, is_read);
     `);
   } catch (e) { console.error('hrms schema failed:', e); }
+
+  // ══ ROSTER GENERATOR CONFIG (hr_roster_coverage, hr_roster_shift_map) ══════
+  //
+  // Config only — the generator itself introduces no new roster row type: it
+  // writes SHIFT rows into hr_rosters exactly as the manual week grid does.
+  //
+  // OWNER RULING — WEEKLY OFFS ARE NOT PERSISTED. There is deliberately no "off"
+  // row type here, and hr_rosters is deliberately left alone. Two measured
+  // reasons:
+  //   1. hr_rosters cannot express an off at all: shift_id is NOT NULL and there
+  //      is no off concept in the column vocabulary.
+  //   2. An off stored as a roster row becomes a FALSE ABSENT.
+  //      src/lib/reports/hr-attendance-register.ts counts a roster row with no
+  //      matching attendance row as absent and does NOT join hr_shifts, so it
+  //      cannot tell a rostered shift from a rostered rest day.
+  // Offs are therefore computed and rendered (grid + printout) and never stored.
+  // Under the OPTIONAL hr_weekly_off_policy='paid' setting the off is recorded as
+  // an hr_attendance row with status WEEKLY_OFF — the attendance register, not
+  // the roster, and a status payroll already treats as PAID (it is absent from
+  // hr-payroll.ts's UNPAID_ATTENDANCE_STATUSES, so no payroll arithmetic moves).
+  //
+  // DEPARTMENT AND DESIGNATION IDS ARE READ, NEVER CREATED. departments /
+  // hr_designations are the owner's masters. No name is hardcoded here or in any
+  // caller: the local database still carries a legacy "Akan Service" department
+  // that production does NOT have (production has 15, none containing
+  // "Service"), so a generator keyed on a department NAME would configure a
+  // venue that does not exist. Both id columns default to '' and are MATCHED,
+  // not validated, by the reader — a department removed later leaves a harmless
+  // orphan config row instead of a failed boot.
+  try {
+    // One try/catch PER STATEMENT, then a sqlite_master proof below: a
+    // multi-statement batch stops at its first failure and silently skips the
+    // rest, and initializeSchema's own catch would swallow the whole block.
+    // Same shape as ensureBohSchema() in src/lib/boh-schema.ts.
+    const rosterConfigDdl: Array<{ name: string; sql: string }> = [
+      {
+        name: 'hr_roster_coverage',
+        sql: `
+          CREATE TABLE IF NOT EXISTS hr_roster_coverage (
+            id             TEXT PRIMARY KEY,
+            department_id  TEXT NOT NULL DEFAULT '',   -- departments.id; '' = every department
+            designation_id TEXT NOT NULL DEFAULT '',   -- hr_designations.id; '' = the WHOLE department
+            weekday        INTEGER NOT NULL,           -- 0=Sun, 1=Mon .. 6=Sat (JS getDay / SQLite %w)
+            shift_role     TEXT NOT NULL DEFAULT '',   -- '' = the day TOTAL across every shift
+            -- MINIMUM PRESENT, NOT A MAX-OFFS CAP. Owner rule 3, verbatim:
+            -- coverage is "minimum present per group per day". The two are not
+            -- interchangeable — headcount moves with joiners, leavers and
+            -- approved leave, so a cap of "2 offs" silently becomes a different
+            -- floor every week, while a floor of "6 present" stays the promise
+            -- the owner actually made. Nothing in this module may store or
+            -- compute a max-offs number.
+            min_present    INTEGER NOT NULL DEFAULT 0,
+            note           TEXT NOT NULL DEFAULT '',
+            updated_by     TEXT NOT NULL DEFAULT '',   -- me.email (house actor convention)
+            updated_at     TEXT NOT NULL DEFAULT (datetime('now'))
+          )`,
+      },
+      {
+        name: 'hr_roster_shift_map',
+        sql: `
+          CREATE TABLE IF NOT EXISTS hr_roster_shift_map (
+            id             TEXT PRIMARY KEY,
+            department_id  TEXT NOT NULL DEFAULT '',   -- departments.id; '' = every department
+            -- The owner's own shift vocabulary, from his AKAN SERVICE sheet
+            -- footer. Free TEXT because the roles are HIS words, not ours:
+            --   MS         Morning Shift
+            --   M 2 C      Morning to Closing
+            --   MOR BREAK  (written "11AM/B") a SPLIT shift: 11:00-15:30 AND
+            --              18:30-closing
+            --   SECOND     (written "2:30 PM") 14:30-closing
+            --   NIGHT      18:30-03:30
+            shift_role     TEXT NOT NULL,
+            -- WHY WEEKDAY IS PART OF THE KEY. hr_shifts has NO weekday
+            -- dimension, and SUNDAY TIMINGS DIFFER: MOR BREAK is 11:00-16:00 +
+            -- 19:30-closing and SECOND is 14:00-closing. Sunday therefore needs
+            -- its OWN hr_shifts rows, and this map is what points at them.
+            weekday        INTEGER NOT NULL,           -- 0=Sun, 1=Mon .. 6=Sat
+            -- hr_shifts.id. NO FALLTHROUGH TO THE WEEKDAY TEMPLATE: an unmapped
+            -- (department, role, weekday) is a REFUSAL the generator must name,
+            -- never a silent substitution — substitution is exactly how Sunday's
+            -- 19:30 would quietly become the weekday 18:30, invisible until
+            -- staff turned up ninety minutes early.
+            shift_id       TEXT NOT NULL,
+            updated_by     TEXT NOT NULL DEFAULT '',
+            updated_at     TEXT NOT NULL DEFAULT (datetime('now'))
+          )`,
+      },
+    ];
+    const rosterConfigIndexDdl: Array<{ name: string; sql: string }> = [
+      {
+        name: 'idx_hr_roster_cov_key',
+        sql: `CREATE UNIQUE INDEX IF NOT EXISTS idx_hr_roster_cov_key
+                ON hr_roster_coverage(department_id, designation_id, weekday, shift_role)`,
+      },
+      {
+        // (role, weekday) resolves to ONE shift per department — this uniqueness
+        // is what makes the refusal above meaningful.
+        name: 'idx_hr_roster_map_key',
+        sql: `CREATE UNIQUE INDEX IF NOT EXISTS idx_hr_roster_map_key
+                ON hr_roster_shift_map(department_id, shift_role, weekday)`,
+      },
+      {
+        // "Which mappings point at this shift?" — asked before a shift is
+        // deactivated, so a warning can name the days that would go unmapped.
+        name: 'idx_hr_roster_map_shift',
+        sql: `CREATE INDEX IF NOT EXISTS idx_hr_roster_map_shift ON hr_roster_shift_map(shift_id)`,
+      },
+    ];
+    for (const t of [...rosterConfigDdl, ...rosterConfigIndexDdl]) {
+      // One statement each, so prepare().run() is enough (house runDdl shape).
+      try { db.prepare(t.sql).run(); }
+      catch (e) { console.error(`roster config DDL failed (${t.name}):`, e); }
+    }
+    // PROVE the tables are there instead of assuming it — the enclosing catch
+    // would otherwise let a missing table through in total silence, and the
+    // first symptom would be a "no such table" 500 inside the generator.
+    for (const t of rosterConfigDdl) {
+      const row = db
+        .prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`)
+        .get(t.name) as { name?: string } | undefined;
+      if (!row?.name) console.error(`roster config verification failed: table ${t.name} is absent`);
+    }
+
+    // hr_rosters.source — PROVENANCE, so a MANUAL EDIT WINS.
+    //
+    // '' (the default, and therefore every row ever written before this column
+    // existed) means MANUAL; 'generated' means the roster generator wrote it.
+    // Without this the generator cannot tell its own last output from a hand
+    // edit, and "regenerate the week" would silently overwrite the fix a manager
+    // made at 7pm — which is the manager's call, not ours. Unknown provenance
+    // deliberately fails towards "leave it alone".
+    //
+    // Additive and defaulted, so every existing reader is untouched: the grid's
+    // ROSTER_ROW_SELECT (`r.*`) simply gains a column, and nothing keys on it.
+    // hr_rosters still holds SHIFT rows only — this is not an off row type.
+    try {
+      const rosterCols = db.prepare(`PRAGMA table_info(hr_rosters)`).all() as Array<{ name: string }>;
+      if (rosterCols.length && !rosterCols.some((c) => c.name === 'source')) {
+        db.prepare(`ALTER TABLE hr_rosters ADD COLUMN source TEXT NOT NULL DEFAULT ''`).run();
+      }
+      // ASSERT, don't assume — see the table proof above. A missing column here
+      // surfaces as a named refusal from commitRosterPlan rather than as a
+      // "no such column" 500 halfway through a week's write.
+      const after = db.prepare(`PRAGMA table_info(hr_rosters)`).all() as Array<{ name: string }>;
+      if (after.length && !after.some((c) => c.name === 'source')) {
+        console.error('roster config verification failed: hr_rosters.source is absent');
+      }
+    } catch (e) { console.error('hr_rosters source migration failed:', e); }
+  } catch (e) { console.error('roster config schema failed:', e); }
 
   // ══ GUEST FEEDBACK & SERVICE RECOVERY (gf_) ════════════════════════════════
   // Deliberately the LAST block in initializeSchema and isolated in its own

@@ -19,6 +19,12 @@
  * PREVIOUS attendance day) and punch debounce minutes
  * (hr_punch_debounce_min). GET is management-tier, PUT is admin-only.
  *
+ * Roster policy card → the same route's other four keys
+ * (hr_roster_rotate_shifts, hr_roster_offs_weekdays, hr_weekly_off_policy,
+ * hr_payroll_proration_basis). ⚠️ BOTH cards' save() bodies are ALLOWLISTS, and
+ * so is the route's PUT: a key missing from either side is dropped in silence and
+ * the control can never change anything. Add a new key to BOTH.
+ *
  * Shift templates and Leave types are managed on their own live pages
  * (/hr/shifts, /hr/leave) — this page just links there.
  */
@@ -435,6 +441,9 @@ export default function HrSettingsPage() {
         {/* Attendance engine knobs — GET/PUT /api/hr/settings (§8.2). */}
         <AttendanceEngineCard />
 
+        {/* Roster-generator policy — the other four keys on /api/hr/settings. */}
+        <RosterPolicyCard />
+
         {/* Shifts and leave types are LIVE on their own pages — link there. */}
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           <a
@@ -718,6 +727,297 @@ function AttendanceEngineCard() {
               {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />} Save
             </button>
             {saved && <span className="text-xs text-green-700">Saved — future punches use the new values.</span>}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+/** Sunday-first, matching the stored weekday numbering (0=Sun … 6=Sat) used by
+ *  hr_roster_coverage.weekday and hr_roster_shift_map.weekday. */
+const WEEKDAY_LABELS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'] as const;
+
+/** Fri/Sat/Sun — the owner's hard rule says a weekly off never lands here. The
+ *  boxes are not disabled (an admin may have a real reason one week), but
+ *  ticking one shows a warning and asks for confirmation before it is saved. */
+const WEEKEND_WEEKDAYS = new Set([0, 5, 6]);
+
+/** CSV ('1,2,3,4') → sorted weekday numbers; blanks and junk dropped. Module
+ *  scope so the effect below has nothing component-shaped in its dep list. */
+const parseOffDays = (csv: unknown): number[] => {
+  const out = new Set<number>();
+  for (const part of String(csv ?? '').split(',')) {
+    const t = part.trim();
+    if (!/^\d$/.test(t)) continue;
+    const n = Number(t);
+    if (n >= 0 && n <= 6) out.add(n);
+  }
+  return [...out].sort((a, b) => a - b);
+};
+
+/**
+ * Roster-generator policy — the four §Stage-1 knobs on /api/hr/settings:
+ * hr_roster_rotate_shifts, hr_roster_offs_weekdays, hr_weekly_off_policy and
+ * hr_payroll_proration_basis. GET is management-tier, PUT is admin-only, so a
+ * manager's Save gets the same friendly 403 copy as everything else here.
+ *
+ * ⚠️ save() BELOW IS AN ALLOWLIST, exactly like the route's PUT. All four keys
+ * must appear in this body — a key left out of either side is dropped in silence
+ * and the control becomes decorative. That bug shipped in this repo this week.
+ *
+ * Every default equals TODAY'S BEHAVIOUR, which is why this card can ship before
+ * the generator exists: until an admin changes something, nothing behaves
+ * differently.
+ */
+function RosterPolicyCard() {
+  const [rotate, setRotate] = useState(true);
+  const [offDays, setOffDays] = useState<number[]>([1, 2, 3, 4]);
+  const [offPolicy, setOffPolicy] = useState<'unpaid' | 'paid'>('unpaid');
+  const [prorationBasis, setProrationBasis] = useState<'calendar_days' | 'working_days'>(
+    'calendar_days',
+  );
+  const [loaded, setLoaded] = useState(false);
+  const [loadFailed, setLoadFailed] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  /** Apply one GET/PUT `settings` payload to the four controls. */
+  const applySettings = useCallback((s: Record<string, unknown>) => {
+    setRotate(String(s.hr_roster_rotate_shifts ?? '1') !== '0');
+    const days = parseOffDays(s.hr_roster_offs_weekdays);
+    // The server never sends an empty list (its getter falls back to Mon-Thu),
+    // but if it somehow did, showing nothing ticked would invite a save that
+    // means "any day" — so fall back here as well.
+    setOffDays(days.length ? days : [1, 2, 3, 4]);
+    setOffPolicy(s.hr_weekly_off_policy === 'paid' ? 'paid' : 'unpaid');
+    setProrationBasis(
+      s.hr_payroll_proration_basis === 'working_days' ? 'working_days' : 'calendar_days',
+    );
+  }, []);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        // Bare fetch is fine for GETs (CSRF header is only for mutations).
+        const r = await fetch('/api/hr/settings');
+        const j = await r.json().catch(() => null);
+        if (!r.ok || !j?.settings) {
+          setLoadFailed(true);
+          return;
+        }
+        applySettings(j.settings);
+        setLoaded(true);
+      } catch {
+        setLoadFailed(true);
+      }
+    })();
+  }, [applySettings]);
+
+  const toggleDay = (n: number) => {
+    setSaved(false);
+    setOffDays((prev) => (prev.includes(n) ? prev.filter((d) => d !== n) : [...prev, n].sort((a, b) => a - b)));
+  };
+
+  const weekendPicked = offDays.filter((d) => WEEKEND_WEEKDAYS.has(d));
+
+  const save = async () => {
+    // Refuse an empty list in the UI too, with the reason — the server 400s on
+    // it as well, but the admin should not have to submit to find out.
+    if (offDays.length === 0) {
+      setErr('Pick at least one weekday for weekly offs — an empty list would mean "any day".');
+      return;
+    }
+    if (weekendPicked.length > 0) {
+      const names = weekendPicked.map((d) => WEEKDAY_LABELS[d]).join(', ');
+      const ok = confirm(
+        `${names} ${weekendPicked.length === 1 ? 'is' : 'are'} outside the house rule.\n\n` +
+          'Weekly offs are meant to land Monday to Thursday only — the weekend is the busiest ' +
+          'service. Save anyway?',
+      );
+      if (!ok) return;
+    }
+    setSaving(true);
+    setSaved(false);
+    setErr(null);
+    try {
+      const r = await api('/api/hr/settings', {
+        method: 'PUT',
+        // ALL FOUR KEYS, ALWAYS. See the warning in this component's docblock.
+        body: {
+          hr_roster_rotate_shifts: rotate ? 1 : 0,
+          hr_roster_offs_weekdays: offDays.join(','),
+          hr_weekly_off_policy: offPolicy,
+          hr_payroll_proration_basis: prorationBasis,
+        },
+      });
+      const j = await r.json().catch(() => null);
+      if (!r.ok) {
+        setErr(
+          r.status === 403
+            ? 'Only admins can change the roster policy — ask an admin to make this change.'
+            : j?.error || 'Could not save the roster policy. Try again.',
+        );
+        return;
+      }
+      // Re-apply from the response: these are the EFFECTIVE values the generator
+      // will read, so the card shows what the server actually stored.
+      if (j?.settings) applySettings(j.settings);
+      setSaved(true);
+    } catch {
+      setErr('Could not save the roster policy. Check your connection and try again.');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="bg-white border border-[#E8D5C4] rounded-xl shadow p-5">
+      <h3 className="font-semibold text-[#2D1B0E] flex items-center gap-2 mb-1">
+        <CalendarRange className="w-5 h-5 text-[#af4408]" /> Roster policy
+        <span className="text-xs font-normal text-[#8B7355]">changes are admin-only</span>
+      </h3>
+      <p className="text-xs text-[#8B7355] mb-4">
+        How a generated week is built: whether people rotate between shifts, which days a weekly off may land on, and
+        whether an off day is recorded as paid. Every setting here starts on today&apos;s behaviour — nothing changes
+        until you change it.
+      </p>
+      {loadFailed ? (
+        <p className="text-sm text-[#8B7355]">The roster policy could not be loaded — reload the page to retry.</p>
+      ) : !loaded ? (
+        <p className="text-sm text-[#8B7355]">
+          <Loader2 className="w-4 h-4 animate-spin inline mr-2" /> Loading...
+        </p>
+      ) : (
+        <>
+          <div className="space-y-5 max-w-2xl">
+            {/* Shift rotation */}
+            <div>
+              <div className="flex items-start gap-3">
+                <Toggle
+                  size="sm"
+                  checked={rotate}
+                  onChange={(next) => {
+                    setSaved(false);
+                    setRotate(next);
+                  }}
+                  label="Rotate people between shifts"
+                />
+                <div>
+                  <p className="text-sm text-[#2D1B0E]">Rotate people between shifts</p>
+                  <p className="text-[10px] text-[#8B7355] mt-0.5">
+                    {rotate
+                      ? 'On (usual): each week moves people across the shifts as well as moving the off day.'
+                      : 'Off: everyone keeps their usual shift and only the off day moves.'}
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            {/* Allowed off weekdays */}
+            <div>
+              <label className="text-xs text-[#6B5744]">Weekly offs may land on</label>
+              <div className="flex flex-wrap gap-2 mt-1.5">
+                {WEEKDAY_LABELS.map((label, n) => {
+                  const on = offDays.includes(n);
+                  const weekend = WEEKEND_WEEKDAYS.has(n);
+                  return (
+                    <button
+                      key={label}
+                      type="button"
+                      onClick={() => toggleDay(n)}
+                      aria-pressed={on}
+                      className={`px-3 py-1.5 rounded-lg text-xs font-medium border ${
+                        on
+                          ? weekend
+                            ? 'bg-red-50 border-red-300 text-red-800'
+                            : 'bg-[#af4408] border-[#af4408] text-white'
+                          : 'bg-[#FFF8F0] border-[#E8D5C4] text-[#6B5744] hover:border-[#af4408]'
+                      }`}
+                      title={weekend ? 'Outside the house rule — the weekend is the busiest service' : undefined}
+                    >
+                      {label}
+                    </button>
+                  );
+                })}
+              </div>
+              <p className="text-[10px] text-[#8B7355] mt-1">
+                House rule: Monday to Thursday only — the weekend is the busiest service. At least one day must stay
+                selected; an empty list is refused rather than read as &ldquo;any day&rdquo;.
+              </p>
+              {weekendPicked.length > 0 && (
+                <p className="text-[10px] text-red-700 mt-1 flex items-center gap-1">
+                  <AlertTriangle className="w-3 h-3 shrink-0" />
+                  {weekendPicked.map((d) => WEEKDAY_LABELS[d]).join(', ')} {weekendPicked.length === 1 ? 'is' : 'are'}{' '}
+                  outside the house rule — you will be asked to confirm on save.
+                </p>
+              )}
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              {/* Weekly-off pay policy */}
+              <div>
+                <label className="text-xs text-[#6B5744]">Weekly off is</label>
+                <select
+                  value={offPolicy}
+                  onChange={(e) => {
+                    setSaved(false);
+                    setOffPolicy(e.target.value === 'paid' ? 'paid' : 'unpaid');
+                  }}
+                  className="w-full px-2 py-1.5 border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] text-sm"
+                >
+                  <option value="unpaid">Not recorded (current)</option>
+                  <option value="paid">Recorded as a paid day</option>
+                </select>
+                <p className="text-[10px] text-[#8B7355] mt-1">
+                  {offPolicy === 'paid'
+                    ? 'Each off day is written to the attendance register as “Weekly Off”, which counts as a paid day. Payroll arithmetic is unchanged.'
+                    : 'Today’s behaviour: an off day is shown on the roster and in the printout, and recorded nowhere.'}
+                </p>
+              </div>
+
+              {/* Payroll proration basis */}
+              <div>
+                <label className="text-xs text-[#6B5744]">Payroll proration basis</label>
+                <select
+                  value={prorationBasis}
+                  onChange={(e) => {
+                    setSaved(false);
+                    setProrationBasis(e.target.value === 'working_days' ? 'working_days' : 'calendar_days');
+                  }}
+                  className="w-full px-2 py-1.5 border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] text-sm"
+                >
+                  <option value="calendar_days">Calendar days (current)</option>
+                  <option value="working_days">Working days</option>
+                </select>
+                <p className="text-[10px] text-[#8B7355] mt-1">
+                  Only meaningful once offs are recorded — with the weekly off set to &ldquo;Not recorded&rdquo; there
+                  are no off days to exclude, so working days and calendar days are the same thing.
+                </p>
+                {prorationBasis === 'working_days' && offPolicy === 'unpaid' && (
+                  <p className="text-[10px] text-amber-800 mt-1 flex items-center gap-1">
+                    <Info className="w-3 h-3 shrink-0" />
+                    This has no effect while weekly offs are not recorded.
+                  </p>
+                )}
+              </div>
+            </div>
+          </div>
+          {err && (
+            <div className="mt-3 bg-red-50 border border-red-200 rounded-lg p-3 text-sm text-red-800 flex items-center gap-2">
+              <AlertTriangle className="w-4 h-4 shrink-0" /> {err}
+            </div>
+          )}
+          <div className="mt-4 flex items-center gap-3">
+            <button
+              onClick={save}
+              disabled={saving}
+              className="px-3 py-2 text-sm bg-[#af4408] hover:bg-[#8a3506] text-white rounded-lg inline-flex items-center gap-1 disabled:opacity-50"
+            >
+              {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />} Save
+            </button>
+            {saved && <span className="text-xs text-green-700">Saved — the next generated week uses these rules.</span>}
           </div>
         </>
       )}
