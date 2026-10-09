@@ -654,6 +654,137 @@ const QUERY_PAGE_SIZES = [50, 100, 250, 500];
 
 const QUERY_STATUSES = STATUS_OPTIONS.filter(([v]) => v);
 
+/* ── the repeat-customer dimension ─────────────────────────────────────────── */
+
+/**
+ * REPEAT MEANS THE GUEST ARRIVED MORE THAN ONCE — NOT THAT THEY BOOKED TWICE.
+ *
+ * That distinction is the whole feature. Most of this archive's bookings are
+ * cancelled, so "booked twice" and "came twice" are wildly different numbers,
+ * and the screen states which one it is answering rather than leaving the owner
+ * to remember. The server decides who qualifies (a visit is a booking whose
+ * status is in `repeat_definition.visit_statuses`, judged over the guest's
+ * WHOLE history); this page only renders the answer and never re-derives it.
+ *
+ * The three VALUES are a contract this file has to know — they type the state,
+ * name the default and go on the wire — but the WORDS beside them come off
+ * GET /api/crm/reservations/query, so a label renamed on the server cannot
+ * drift from the value the chip sends.
+ */
+type RepeatMode = 'all' | 'repeat' | 'first';
+interface RepeatModeOption { value: RepeatMode; label: string; help: string }
+interface RepeatDefinition {
+  visit_statuses: string[];
+  threshold: number;
+  /** What the archive knows a guest BY — 'phone number'. Quoted into the
+   *  approximation notice, so the notice cannot describe a rule the engine
+   *  stopped using. */
+  identity_basis: string;
+  /** What re-uploads are grouped BY — 'the day the booking was made'. The other
+   *  half of that notice, and the F2/F3 limit in the owner's words. */
+  duplicate_grouping: string;
+}
+
+/**
+ * Used only until that GET lands, and if it never does.
+ *
+ * Hiding the control in that case would be worse than a cosmetic label drift:
+ * the owner would get a Reservation Database with no repeat filter on it and no
+ * reason why — the inert-guard failure this repo has nine recorded instances
+ * of. And the fallback cannot mislabel live numbers, because the GET and the
+ * POST sit behind the same admin gate on the same route: if the options call is
+ * refused the query call is refused too, and the tab shows its error instead of
+ * any cards at all.
+ */
+const REPEAT_MODE_FALLBACK: RepeatModeOption[] = [
+  { value: 'all', label: 'Everyone', help: 'No repeat filter — every customer, including the ones with no phone number on file.' },
+  { value: 'repeat', label: 'Repeat only', help: 'Customers with a phone number on file who have arrived more than once, ever.' },
+  { value: 'first', label: 'First-timers only', help: 'Customers with a phone number on file who have arrived at most once, ever.' },
+];
+const REPEAT_DEFINITION_FALLBACK: RepeatDefinition = {
+  visit_statuses: ['completed', 'seated'],
+  threshold: 2,
+  identity_basis: 'phone number',
+  duplicate_grouping: 'the day the booking was made',
+};
+
+/** The aggregate keys this page renders as DESIGNED cards rather than letting
+ *  the generic grid label them — a rate whose denominator is a guess is worse
+ *  than no rate, so these are laid out to carry it, and two of them
+ *  (identified/unidentified) are the arithmetic BEHIND the others and belong on
+ *  the cards they qualify rather than as two more bare numbers in the grid.
+ *  Every other key, including one added server-side tomorrow, still appears
+ *  generically. */
+const REPEAT_AGG_KEYS = [
+  'customers', 'identified_customers', 'unidentified_customers',
+  'repeat_customers', 'repeat_rate',
+] as const;
+
+/** The row fields the results grid renders as a visit ordinal and an identity
+ *  verdict instead of three bare integers. */
+const VISIT_ROW_KEYS = {
+  number: 'visit_number',
+  count: 'visit_count',
+  identified: 'guest_identified',
+} as const;
+
+/** The server's own verdict on whether this row's guest can be named, read
+ *  defensively: ONLY an explicit 1 counts as identified. A payload that somehow
+ *  arrives without the flag, or with a value this reader does not understand,
+ *  therefore makes the screen say LESS about the guest rather than more — the
+ *  safe direction for a column whose whole job is to withhold a claim. */
+const rowIdentified = (row: Record<string, unknown> | null | undefined): boolean =>
+  Number(row?.[VISIT_ROW_KEYS.identified]) === 1;
+
+/**
+ * Only the modes this page can actually SEND survive. A fourth mode added
+ * server-side is dropped rather than drawn as a chip that would be refused with
+ * a 400, and a list that somehow arrives without 'all' is rejected whole — a
+ * repeat row with no way back to the unfiltered screen would trap the reader in
+ * a filtered answer.
+ */
+function readRepeatModes(raw: unknown): RepeatModeOption[] {
+  const list = Array.isArray((raw as any)?.repeat_modes) ? (raw as any).repeat_modes : [];
+  const out: RepeatModeOption[] = [];
+  for (const m of list) {
+    const value = String((m as any)?.value ?? '').trim();
+    if (value !== 'all' && value !== 'repeat' && value !== 'first') continue;
+    if (out.some(o => o.value === value)) continue;
+    out.push({
+      value,
+      label: String((m as any)?.label ?? '').trim() || humanize(value),
+      help: String((m as any)?.help ?? '').trim(),
+    });
+  }
+  return out.some(m => m.value === 'all') ? out : [];
+}
+
+function readRepeatDefinition(raw: unknown): RepeatDefinition | null {
+  const d = (raw as any)?.repeat_definition;
+  if (!d || typeof d !== 'object') return null;
+  const statuses = asStringList(d.visit_statuses);
+  const threshold = Number(d.threshold);
+  if (!statuses.length || !Number.isFinite(threshold) || threshold < 1) return null;
+  // The two wording fields fall back INDIVIDUALLY rather than rejecting the
+  // whole definition: an older server that sends statuses and a threshold but
+  // not these should still get its statuses quoted, and the notice reads the
+  // same either way because the fallback is the same sentence.
+  return {
+    visit_statuses: statuses,
+    threshold: Math.trunc(threshold),
+    identity_basis: String(d.identity_basis ?? '').trim() || REPEAT_DEFINITION_FALLBACK.identity_basis,
+    duplicate_grouping: String(d.duplicate_grouping ?? '').trim() || REPEAT_DEFINITION_FALLBACK.duplicate_grouping,
+  };
+}
+
+/** "completed or seated" — the visit statuses in a sentence, in the server's
+ *  own words, so the caption cannot describe a rule the engine is not using. */
+function statusPhrase(list: string[]): string {
+  const words = list.map(humanize).map(s => s.toLowerCase());
+  if (words.length <= 1) return words[0] ?? '';
+  return `${words.slice(0, -1).join(', ')} or ${words[words.length - 1]}`;
+}
+
 /* ── generic renderers for server-shaped rows ──────────────────────────────── */
 
 /** snake_case / camelCase → "Sentence case", for column heads and metric cards. */
@@ -672,6 +803,30 @@ const isRateKey = (k: string) => /(rate|pct|percent|share)/i.test(k);
  *  percentage; treating >1 as a fraction would print "8300%". */
 function fmtRate(v: number): string {
   return v <= 1 ? fmtPct(v) : `${Math.round(v * 10) / 10}%`;
+}
+
+/**
+ * A percentage that is ALREADY a percentage, printed as one.
+ *
+ * NOT fmtRate() above, deliberately. That one guesses the scale from the value
+ * — `v <= 1` is read as a 0..1 fraction and multiplied by 100 — and
+ * repeat_rate is documented as 0..100 with one decimal. A venue whose repeat
+ * rate inside some filter is genuinely 0.6% would come out of fmtRate as
+ * "60%", and 1.0% as "100%": a hundredfold overstatement of the one number
+ * this feature exists to report, in exactly the narrow filters the owner will
+ * use it on. The scale is known here, so it is not guessed.
+ */
+const fmtPercentPoints = (v: number): string => `${Math.round(v * 10) / 10}%`;
+
+/** 4 → "4th", 1 → "1st", 22 → "22nd". The teens are the case a bare last-digit
+ *  rule gets wrong ("11st"), so 11–13 are excluded before it is applied. */
+function ordinal(n: number): string {
+  const v = Math.trunc(n);
+  const tens = Math.abs(v) % 100;
+  const unit = Math.abs(v) % 10;
+  const suffix = tens >= 11 && tens <= 13 ? 'th'
+    : unit === 1 ? 'st' : unit === 2 ? 'nd' : unit === 3 ? 'rd' : 'th';
+  return `${fmtInt(v)}${suffix}`;
 }
 
 /**
@@ -942,6 +1097,10 @@ export default function ReservationDatabasePage() {
   const [qSource, setQSource] = useState<string[]>([]);
   const [qBand, setQBand] = useState('');
   const [qOutlet, setQOutlet] = useState('');
+  /** 'all' is the builder's "this row is not filtering" state, exactly like an
+   *  empty day list or a blank outlet — so it is the default, it is what Clear
+   *  returns to, and it is not counted as a filter. */
+  const [qRepeat, setQRepeat] = useState<RepeatMode>('all');
   const [qLimit, setQLimit] = useState(QUERY_PAGE_SIZES[0]);
   const [qPage, setQPage] = useState(1);
 
@@ -965,6 +1124,11 @@ export default function ReservationDatabasePage() {
   const [outletOptions, setOutletOptions] = useState<string[]>([]);
   const [bandOptions, setBandOptions] = useState<BandOption[]>([]);
   const [sourceDraft, setSourceDraft] = useState('');
+
+  /** The repeat control's vocabulary, off the options GET. Seeded with the
+   *  fallback so the row renders on the first paint and never flickers in. */
+  const [repeatModes, setRepeatModes] = useState<RepeatModeOption[]>(REPEAT_MODE_FALLBACK);
+  const [repeatDef, setRepeatDef] = useState<RepeatDefinition>(REPEAT_DEFINITION_FALLBACK);
 
   /* ── advanced SQL ───────────────────────────────────────────────────────── */
   const [sqlText, setSqlText] = useState('');
@@ -1262,9 +1426,16 @@ export default function ReservationDatabasePage() {
     source: qSource,
     liveBandId: qBand,
     outlet: qOutlet,
+    // 'all' GOES AS ABSENCE, NOT AS THE STRING. The route documents a missing
+    // `repeat` key and repeat:'all' as the same thing, so omitting it makes the
+    // default body byte-for-byte the body this page sent before the repeat
+    // filter existed — the nine original cards and the row order cannot move at
+    // the default even by accident. Every other mode is sent explicitly, and a
+    // value outside the three is refused by the route rather than coerced.
+    ...(qRepeat === 'all' ? {} : { repeat: qRepeat }),
     limit: qLimit,
     offset: (qPage - 1) * qLimit,
-  }), [qDow, qMeal, qFrom, qTo, qTimeFrom, qTimeTo, qStatus, qSource, qBand, qOutlet, qLimit, qPage]);
+  }), [qDow, qMeal, qFrom, qTo, qTimeFrom, qTimeTo, qStatus, qSource, qBand, qOutlet, qRepeat, qLimit, qPage]);
 
   /** Keeps the pickers stocked from whatever the last response actually
    *  contained, without ever narrowing them — a filtered run returns fewer
@@ -1325,7 +1496,12 @@ export default function ReservationDatabasePage() {
    * that guard, changing a filter while on page 4 costs two POSTs, the first
    * against an offset that no longer exists in the new result set.
    */
-  const filterSig = JSON.stringify([qDow, qMeal, qFrom, qTo, qTimeFrom, qTimeTo, qStatus, qSource, qBand, qOutlet, qLimit]);
+  // qRepeat IS IN HERE, and that is not decoration: this signature is the only
+  // thing that makes a changed filter re-run. A control left out of it reads
+  // correctly, writes its state, and never reaches the server — the inert guard
+  // this repo keeps producing. Proven by watching the result set change, not by
+  // reading this line.
+  const filterSig = JSON.stringify([qDow, qMeal, qFrom, qTo, qTimeFrom, qTimeTo, qStatus, qSource, qBand, qOutlet, qRepeat, qLimit]);
   const filterSigRef = useRef<string | null>(null);
 
   useEffect(() => {
@@ -1386,6 +1562,36 @@ export default function ReservationDatabasePage() {
     return () => c.abort();
   }, [tab]);
 
+  /**
+   * The repeat control's WORDS, from GET on the same route the queries go to.
+   *
+   * The labels and the visit definition are the server's to state, not this
+   * page's to invent — the owner settled what a visit is, the engine encodes
+   * it, and the caption under the chips quotes it back. Fetched once per visit
+   * like the band list, and a failure is not an error state: the fallback
+   * labels keep the filter usable, and anything that breaks this GET has
+   * already broken the POST beside it, so there are no numbers on screen for a
+   * stale caption to misdescribe.
+   */
+  const repeatOptsFetched = useRef(false);
+  useEffect(() => {
+    if (tab !== 'query' || repeatOptsFetched.current) return;
+    repeatOptsFetched.current = true;
+    const c = new AbortController();
+    (async () => {
+      try {
+        const res = await fetch('/api/crm/reservations/query', { signal: c.signal, cache: 'no-store' });
+        if (!res.ok) return;
+        const json = await res.json();
+        const modes = readRepeatModes(json);
+        if (modes.length) setRepeatModes(modes);
+        const def = readRepeatDefinition(json);
+        if (def) setRepeatDef(def);
+      } catch { /* the fallback vocabulary stands */ }
+    })();
+    return () => c.abort();
+  }, [tab]);
+
   const toggleIn = <T,>(list: T[], value: T): T[] =>
     list.includes(value) ? list.filter(v => v !== value) : [...list, value];
 
@@ -1399,11 +1605,159 @@ export default function ReservationDatabasePage() {
   const clearQueryFilters = () => {
     setQDow([]); setQMeal(''); setQFrom(''); setQTo(''); setQTimeFrom(''); setQTimeTo('');
     setQStatus([]); setQSource([]); setQBand(''); setQOutlet(''); setSourceDraft('');
+    setQRepeat('all');
   };
 
   const queryFilterCount =
     qDow.length + qStatus.length + qSource.length +
-    [qMeal, qFrom, qTo, qTimeFrom, qTimeTo, qBand, qOutlet].filter(Boolean).length;
+    [qMeal, qFrom, qTo, qTimeFrom, qTimeTo, qBand, qOutlet].filter(Boolean).length +
+    // Counted the same way the Service row counts "Whole day": the row's
+    // not-filtering state is worth nothing, anything else is worth one.
+    (qRepeat === 'all' ? 0 : 1);
+
+  /**
+   * WHAT "REPEAT" MEANS, in the owner's terms, on the screen — not in a tooltip
+   * nobody opens. Both halves matter and both are easy to get wrong from
+   * memory: a visit is an ARRIVAL (so booked-and-cancelled does not count), and
+   * the judgement is LIFETIME (so a June guest who returns in July is a repeat
+   * customer inside a July-only filter). The statuses and the threshold are the
+   * server's, quoted back.
+   */
+  const repeatCaption = useMemo(() => {
+    const visits = statusPhrase(repeatDef.visit_statuses);
+    return `A visit means the guest turned up — a booking marked ${visits}. `
+      + `A repeat customer has arrived ${fmtInt(repeatDef.threshold)} or more times across their WHOLE history, `
+      + 'so a guest who came in June and again in July is a repeat customer inside a July-only filter. '
+      + 'A booking that was cancelled is not a visit, however many times it was made. '
+      // The third thing both non-default chips do, said where they are clicked:
+      // they answer only about guests the archive can name. Left out, "Repeat
+      // only" and "First-timers only" read as a clean split of every customer,
+      // which the archive cannot deliver.
+      + `Both of the filtered choices cover only customers with a ${repeatDef.identity_basis} on file.`;
+  }, [repeatDef]);
+
+  /**
+   * The two visit columns, rendered as the owner asked the question — "this was
+   * their 4th visit" — instead of two bare integers headed "Visit number" and
+   * "Visit count".
+   *
+   * A NON-VISIT GETS A DASH, never a 0: the server sends null for every
+   * cancelled, no-show, pending, confirmed and duplicate row, which is most of
+   * this archive, and a 0 in that column would read as a fact about the guest.
+   * The cell says WHY it is a dash in its tooltip, from the row's own status,
+   * because "—" with no reason is the kind of blank that gets read as a bug.
+   *
+   * AND A ROW WHOSE GUEST HAS NO PHONE NUMBER SAYS SO, in its own column and in
+   * both visit cells. That guest id is not reliably one person and its
+   * re-uploaded bookings were never collapsed, so "47th visit" and a repeat
+   * badge were two claims the archive could not support — measured, a planted
+   * phone-less "Walk in" bucket printed exactly that. The number survives (the
+   * owner cannot act on a bucket he cannot see); the claim does not.
+   */
+  const queryRenderers = useMemo<Record<string, ColumnRender>>(() => {
+    const visits = statusPhrase(repeatDef.visit_statuses);
+    const basis = repeatDef.identity_basis;
+    const lifetime = (row: Record<string, unknown>) => Math.max(0, Math.trunc(Number(row?.[VISIT_ROW_KEYS.count]) || 0));
+    /** Said the same way in all three places, so the three cells cannot drift
+     *  into three different explanations of one fact. */
+    const bucketWhy = `This guest has no ${basis} on file, so the archive cannot tell them from another guest `
+      + 'booked under the same name, and it never collapsed their re-uploaded bookings either '
+      + '(that collapse is keyed on the number). The count is bookings in one bucket, not one person\'s visits.';
+    return {
+      [VISIT_ROW_KEYS.identified]: {
+        head: 'Identified',
+        align: 'left',
+        title: row => (rowIdentified(row)
+          ? `This guest has a ${basis} on file, so their visits are counted as one person's and they are judged `
+            + 'by the repeat filter and the repeat cards.'
+          : `${bucketWhy} Rows like this are counted in Customers, left out of Repeat customers, and shown only under `
+            + 'the Everyone filter.'),
+        cell: row => (rowIdentified(row)
+          ? <span className="text-[#6B5744]">Phone</span>
+          : (
+            <span className="text-[10px] font-semibold uppercase tracking-wide text-[#8a5a2b] bg-[#FFF1E3] border border-[#F0D9C0] rounded px-1.5 py-0.5">
+              Not identified
+            </span>
+          )),
+      },
+      [VISIT_ROW_KEYS.number]: {
+        head: 'Visit',
+        align: 'right',
+        title: row => {
+          const raw = row?.[VISIT_ROW_KEYS.number];
+          const n = raw === null || raw === undefined || raw === '' ? null : Number(raw);
+          if (n !== null && Number.isFinite(n) && n >= 1) {
+            return `Their ${ordinal(n)} visit, of ${fmtInt(lifetime(row))} across the whole archive.`;
+          }
+          // The identity reason is checked FIRST and is not combined with the
+          // status reason. For an unidentified row the status is beside the
+          // point: even a completed booking has no ordinal, because there is no
+          // "their" to count it for.
+          if (!rowIdentified(row)) return `No visit number — ${bucketWhy}`;
+          const status = String(row?.status ?? '').trim();
+          const dup = Number(row?.is_duplicate ?? 0) === 1;
+          const why = dup
+            ? 'this row is the same booking uploaded twice, and a re-upload is not a second visit'
+            : status
+              ? `this booking is ${humanize(status).toLowerCase()}`
+              : 'this booking has no status';
+          return `Not a visit — ${why}. Only a booking marked ${visits} counts as the guest turning up.`;
+        },
+        cell: row => {
+          const raw = row?.[VISIT_ROW_KEYS.number];
+          if (raw === null || raw === undefined || raw === '') return dash;
+          const n = Number(raw);
+          if (!Number.isFinite(n) || n < 1) return dash;
+          return <>{ordinal(n)}<span className="ml-1 text-[11px] font-normal text-[#8B7355]">visit</span></>;
+        },
+      },
+      [VISIT_ROW_KEYS.count]: {
+        // The head is the weaker of the two readings on purpose: it has to be
+        // true of every row in the column, and for an unidentified row these
+        // are arrival-status BOOKINGS in a bucket rather than one person's
+        // visits. Each cell then says which it is.
+        head: 'Lifetime arrivals',
+        align: 'right',
+        title: row => {
+          const n = lifetime(row);
+          const who = String(row?.guest_name ?? '').trim() || 'This guest';
+          if (!rowIdentified(row)) {
+            return `${fmtInt(n)} booking${n === 1 ? '' : 's'} marked ${visits} sit under the id "${who}". `
+              + `${bucketWhy} So this is not a repeat customer and not a first-timer — it is not a person.`;
+          }
+          return n === 0
+            ? `${who} has never arrived — booked, but never marked ${visits}.`
+            : `${who} has arrived ${fmtInt(n)} time${n === 1 ? '' : 's'} in the whole archive, ignoring the filters above. `
+              + `${n >= repeatDef.threshold ? 'A repeat customer.' : 'Not a repeat customer yet.'}`;
+        },
+        cell: row => {
+          const n = lifetime(row);
+          // THE BADGE IS THE CLAIM, so it is gated on identity and not on the
+          // number. Showing "repeat" next to a 47 that is really 47 different
+          // walk-ins is the exact sentence this lane exists to delete; the
+          // number stays and is labelled as what it is.
+          if (!rowIdentified(row)) {
+            return (
+              <>
+                {fmtInt(n)}
+                <span className="ml-1.5 align-middle text-[10px] font-semibold uppercase tracking-wide text-[#8B7355]">
+                  in bucket
+                </span>
+              </>
+            );
+          }
+          return (
+            <>
+              {fmtInt(n)}
+              {n >= repeatDef.threshold && (
+                <span className="ml-1.5 align-middle text-[10px] font-semibold uppercase tracking-wide text-[#a8632b]">repeat</span>
+              )}
+            </>
+          );
+        },
+      },
+    };
+  }, [repeatDef]);
 
   const exportQueryCsv = () => {
     if (qRows.length === 0) return;
@@ -2495,6 +2849,26 @@ export default function ReservationDatabasePage() {
                     {bandOptions.map(b => <option key={b.id} value={b.id}>{b.label}</option>)}
                   </select>
                 </FilterRow>
+
+                {/* The one row here that filters by the PERSON rather than the
+                    booking, so it sits last and is labelled for the person.
+                    Single-choice like Service: "Everyone" is this row's
+                    not-filtering state, and clicking the live chip again
+                    returns to it. */}
+                <FilterRow label="Customer">
+                  {repeatModes.map(m => (
+                    <Chip
+                      key={m.value}
+                      on={qRepeat === m.value}
+                      title={m.help}
+                      onClick={() => setQRepeat(qRepeat === m.value ? 'all' : m.value)}>
+                      {m.label}
+                    </Chip>
+                  ))}
+                  <span className="basis-full text-[11px] leading-snug text-[#8B7355] pt-0.5">
+                    {repeatCaption}
+                  </span>
+                </FilterRow>
               </div>
 
               {qError && <ErrorBox message={qError} />}
@@ -2504,7 +2878,29 @@ export default function ReservationDatabasePage() {
                   nights were left out of them. */}
               {qBandInfo && <BandNotice info={qBandInfo} />}
 
-              {qAgg && <AggregateCards agg={qAgg} />}
+              {/* The nine original cards, still rendered from whatever keys the
+                  route sends — then the three repeat cards appended INTO the
+                  same grid, so they sit beside the nine instead of in a strip
+                  of their own. Only those three are lifted out of the generic
+                  path, and only because a rate needs its denominator printed
+                  next to it; a tenth metric added server-side tomorrow still
+                  appears here on its own. */}
+              {qAgg && (
+                <>
+                  <AggregateCards
+                    agg={qAgg}
+                    omit={REPEAT_AGG_KEYS}
+                    notes={QUERY_AGG_NOTES}
+                    extra={<RepeatCards agg={qAgg} def={repeatDef} />}
+                  />
+                  {/* The one sentence, immediately under the cards it qualifies
+                      — close enough that nobody reads a repeat figure without
+                      it, short enough that it is not skipped. It sits ABOVE the
+                      mode note because it is true of every mode. */}
+                  <ApproximationNote def={repeatDef} />
+                  <RepeatNote agg={qAgg} def={repeatDef} mode={qRepeat} />
+                </>
+              )}
 
               {/* ── results ────────────────────────────────────────────────── */}
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
@@ -2536,7 +2932,7 @@ export default function ReservationDatabasePage() {
                   hint={queryFilterCount ? 'Loosen one of them — the day chips and the service period are the two that narrow hardest.' : 'Pick a day, a service period or a date range to start.'}
                 />
               ) : qRows.length > 0 ? (
-                <ResultTable columns={qCols} rows={qRows} />
+                <ResultTable columns={qCols} rows={qRows} renderers={queryRenderers} />
               ) : null}
 
               <div className="flex justify-end">
@@ -3610,19 +4006,258 @@ function SchemaPanel({ tables, loading, onInsert }: {
 }
 
 /** The aggregate cards. Rendered from whatever keys the route sends rather than
- *  a fixed set, so a metric added server-side appears without a UI change. */
-function AggregateCards({ agg }: { agg: Record<string, unknown> }) {
-  const entries = Object.entries(agg).filter(([, v]) => v !== null && v !== undefined && typeof v !== 'object');
-  if (entries.length === 0) return null;
+ *  a fixed set, so a metric added server-side appears without a UI change.
+ *
+ *  `omit` and `extra` are how a metric that needs more than a label and a
+ *  number — a rate that has to print its denominator — gets a designed card in
+ *  THIS grid rather than a second strip underneath. Both are optional and both
+ *  default to doing nothing, so the call that passes neither renders exactly
+ *  what it rendered before they existed. */
+function AggregateCards({ agg, omit, extra, notes }: {
+  agg: Record<string, unknown>; omit?: readonly string[]; extra?: React.ReactNode;
+  /**
+   * A one-line qualifier under a named metric's number — WHICH RULE PRODUCED
+   * IT, for a card that sits next to another card answering nearly the same
+   * question. Keyed by aggregate key, so a metric with nothing to qualify is
+   * rendered exactly as it was before this existed, and the VALUE is never
+   * touched by it.
+   */
+  notes?: Readonly<Record<string, string>>;
+}) {
+  const skip = new Set<string>(omit ?? []);
+  const entries = Object.entries(agg)
+    .filter(([k, v]) => !skip.has(k) && v !== null && v !== undefined && typeof v !== 'object');
+  if (entries.length === 0 && !extra) return null;
   return (
     <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2">
       {entries.map(([k, v]) => (
         <div key={k} className="bg-white border border-[#E8D5C4] rounded-xl px-3 py-2.5 shadow-sm">
           <p className="text-[10px] text-[#8B7355] uppercase tracking-wide truncate" title={humanize(k)}>{humanize(k)}</p>
           <p className="text-lg font-bold text-[#2D1B0E]">{fmtAggregate(k, v)}</p>
+          {notes?.[k] && <p className="mt-0.5 text-[10px] leading-snug text-[#8B7355]">{notes[k]}</p>}
         </div>
       ))}
+      {extra}
     </div>
+  );
+}
+
+/**
+ * F4, THE OTHER HALF — said on the Arrived card, because that is the card
+ * someone is looking at when the numbers stop agreeing.
+ *
+ * `arrived` is the COLUMN (ARRIVED_SQL / isArrived in src/lib/reservego.ts),
+ * which counts one case the repeat cards do not: a pending or confirmed booking
+ * that merely carries a Seated Time Reservego left behind. Measured sensitivity
+ * on a production-shaped archive — flipping 1/5/10% of arrived rows to
+ * confirmed-with-a-seated-time moved this card NOT AT ALL (52,506 every run)
+ * while repeat_customers fell 3,954 → 3,556. So the two figures can disagree by
+ * thousands, and before this line there was nothing on screen to say why.
+ *
+ * It qualifies the RULE, never the number: the nine cards that existed before
+ * the repeat feature still print the same values from the same SQL.
+ */
+const QUERY_AGG_NOTES: Readonly<Record<string, string>> = {
+  arrived: 'the arrived flag — also counts a booking left with a seated time',
+};
+
+/** One card in that grid, with room for the figure its number is a share OF.
+ *  Same shell as the generic card above; the denominator rides the value line
+ *  so the card keeps the same height as the nine beside it.
+ *
+ *  `note` is a SECOND VISIBLE LINE, not a tooltip. It is where a card says what
+ *  rule produced its number or what it is leaving out — the two things a reader
+ *  comparing two cards side by side needs and will never hover for. Cards that
+ *  pass none keep the height they had. */
+function RepeatCard({ label, value, hint, note, title }: {
+  label: string; value: React.ReactNode; hint?: string; note?: string; title: string;
+}) {
+  return (
+    <div className="bg-white border border-[#E8D5C4] rounded-xl px-3 py-2.5 shadow-sm" title={title}>
+      <p className="text-[10px] text-[#8B7355] uppercase tracking-wide truncate" title={label}>{label}</p>
+      {/* NOT truncated: the denominator is the point of the card, and on a
+          phone's two-up grid a truncating value line is exactly where it would
+          be cut off. It wraps instead. */}
+      <p className="text-lg font-bold text-[#2D1B0E] leading-tight">
+        {value}
+        {hint && <span className="ml-1 text-[11px] font-semibold text-[#8B7355]">{hint}</span>}
+      </p>
+      {note && <p className="mt-0.5 text-[10px] leading-snug text-[#8B7355]">{note}</p>}
+    </div>
+  );
+}
+
+/**
+ * THE REPEAT CARDS — the denominator printed, and the two things they are NOT.
+ *
+ * A rate card that says "7.1%" and nothing else is a number the reader has to
+ * guess the bottom of: 7.1% of bookings? of arrivals? of the archive? It is
+ * none of those. It is a share of PEOPLE — repeat customers over the customers
+ * this filter matched AND the archive can name — and the server ships every
+ * half for exactly this reason, so each card carries "195 of 2,733" on its
+ * face.
+ *
+ * TWO THINGS ARE SAID ON THE CARDS RATHER THAN NEARBY, because both are only
+ * ever noticed by someone comparing two numbers inches apart:
+ *
+ *  · WHICH ARRIVAL RULE. The Arrived card counts the `arrived` column, which is
+ *    also set for a booking merely left carrying a Seated Time; these cards
+ *    count the STATUS. Measured, the two can part company by thousands, so the
+ *    pair of cards says which rule each one used. Not a tooltip: a reader who
+ *    has spotted that two numbers disagree is not going to hover to find out
+ *    whether that is a bug.
+ *  · WHO IS NOT JUDGED. Customers with no phone number on file are counted in
+ *    `Customers` and left out of the repeat figures, so the Customers card
+ *    prints how many that is. It is what makes
+ *    customers = identified + unidentified check out by eye, and it answers
+ *    "which rows is this about and roughly how many" from the screen alone.
+ *
+ * `—` when the filter matched nobody identifiable, never 0%: a 0% repeat rate
+ * is a claim that the customers who matched do not come back, and "there were
+ * none to judge" is a different statement.
+ */
+function RepeatCards({ agg, def }: { agg: Record<string, unknown>; def: RepeatDefinition }) {
+  const int = (v: unknown) => Math.max(0, Math.trunc(Number(v) || 0));
+  const customers = int(agg.customers);
+  const repeat = int(agg.repeat_customers);
+  // The server ships the denominator it divided by; it is not re-derived here.
+  // Clamped only so a payload missing the field cannot print a denominator
+  // LARGER than the population it came out of.
+  const identified = Math.min(customers, int(agg.identified_customers));
+  const unidentified = Math.min(customers, int(agg.unidentified_customers));
+  const rawRate = agg.repeat_rate;
+  const rate = rawRate === null || rawRate === undefined || !Number.isFinite(Number(rawRate))
+    ? null
+    : Number(rawRate);
+  const people = `${fmtInt(customers)} distinct customer${customers === 1 ? '' : 's'}`;
+  const arrivals = `arrived ${fmtInt(def.threshold)}+ times, ever`;
+  const basis = def.identity_basis;
+  const noNumber = `no ${basis} on file`;
+  return (
+    <>
+      <RepeatCard
+        label="Customers"
+        value={fmtInt(customers)}
+        hint="distinct"
+        note={unidentified > 0
+          ? `${fmtInt(unidentified)} with ${noNumber} — not judged below`
+          : `all have a ${basis} on file`}
+        title={`${people} have at least one booking matching this filter, including customers whose every booking `
+          + `was cancelled. ${unidentified > 0
+            ? `${fmtInt(unidentified)} of them have ${noNumber}, so the archive cannot tell one of them from another `
+              + `and the repeat figures leave them out: ${fmtInt(identified)} customers are judged, not ${fmtInt(customers)}.`
+            : `Every one of them has a ${basis} on file, so all ${fmtInt(identified)} are judged below.`}`}
+      />
+      <RepeatCard
+        label="Repeat customers"
+        value={fmtInt(repeat)}
+        hint={identified > 0 ? `of ${fmtInt(identified)}` : undefined}
+        note={`a visit is ${statusPhrase(def.visit_statuses)} status — not the Arrived flag`}
+        title={`${fmtInt(repeat)} of the ${fmtInt(identified)} customers in this filter with a ${basis} on file have `
+          + `${arrivals} — judged over their whole history, not over the filtered window. A visit here is a booking `
+          + `whose STATUS is ${statusPhrase(def.visit_statuses)}; the Arrived card counts the arrived column instead, `
+          + 'which is also set for a booking merely left carrying a seated time, so the two can differ.'}
+      />
+      <RepeatCard
+        label="Repeat rate"
+        value={rate === null ? dash : fmtPercentPoints(rate)}
+        hint={rate === null
+          ? 'nobody to judge'
+          : `${fmtInt(repeat)} of ${fmtInt(identified)} customers with a ${basis}`}
+        note={unidentified > 0
+          ? `${fmtInt(unidentified)} customer${unidentified === 1 ? '' : 's'} with ${noNumber} are out of both halves`
+          : undefined}
+        title={rate === null
+          ? `No customer this filter matched has a ${basis} on file, so there is no rate to report — shown as a dash `
+            + 'rather than 0%, which would claim nobody comes back.'
+          : `${fmtInt(repeat)} of ${fmtInt(identified)} customers came back. The denominator is the customers with a `
+            + `${basis} on file, not all ${fmtInt(customers)} — both halves have to be answering the same question. `
+            + 'A share of PEOPLE, not of bookings: a regular with eleven bookings in this window counts once, exactly '
+            + 'like a guest with one.'}
+      />
+    </>
+  );
+}
+
+/**
+ * THE ONE SENTENCE. Where the cards are, not in a help page.
+ *
+ * The repeat count is an estimate and the screen has to say so once, plainly,
+ * in the two facts that cap it — both of them properties of the Reservego
+ * import, neither of them fixable from this tab:
+ *
+ *  · identity is the phone number, so a guest without one is never matched to
+ *    themselves (and, when the desk typed "Guest", one id holds many people);
+ *  · re-uploads are grouped by the day the booking was MADE, not the night it
+ *    was for, so two nights booked in one phone call can collapse into one
+ *    visit and one night booked twice on separate days can count as two.
+ *
+ * BOTH DIRECTIONS ARE NAMED, which is the part that cannot be dropped for
+ * brevity. The downward error is the one the owner cannot sanity-check — a real
+ * regular reading as a first-timer leaves nothing on screen to notice — so a
+ * notice that admitted only the inflation would itself be a half-truth.
+ *
+ * ONE SENTENCE, and it stays one. The pull is always to add a clause; the words
+ * it would take are in the cards' own tooltips instead, where they do not cost
+ * the sentence its chance of being read.
+ */
+function ApproximationNote({ def }: { def: RepeatDefinition }) {
+  return (
+    <p className="text-[11px] leading-relaxed text-[#6B5744]">
+      <span className="font-semibold">Approximate:</span>{' '}
+      the archive knows a guest by their {def.identity_basis} and groups re-uploaded bookings by{' '}
+      {def.duplicate_grouping}, so a guest with no {def.identity_basis} on file is never matched to themselves,
+      two nights booked in one call can count as one visit, and one night booked twice on separate days can
+      count as two.
+    </p>
+  );
+}
+
+/**
+ * The line that stops the two non-default modes being read as a discovery.
+ *
+ * "Repeat only" filters the rows down to repeat customers, so the rate it then
+ * reports is 100% BY CONSTRUCTION, and "First-timers only" reports 0% the same
+ * way. Both are correct and both look alarming unexplained, so the screen says
+ * which number is a finding and which is a tautology.
+ */
+function RepeatNote({ agg, def, mode }: {
+  agg: Record<string, unknown>; def: RepeatDefinition; mode: RepeatMode;
+}) {
+  const int = (v: unknown) => Math.max(0, Math.trunc(Number(v) || 0));
+  const customers = int(agg.customers);
+  const repeat = int(agg.repeat_customers);
+  const identified = Math.min(customers, int(agg.identified_customers));
+  const unidentified = Math.min(customers, int(agg.unidentified_customers));
+  const visits = statusPhrase(def.visit_statuses);
+  const basis = def.identity_basis;
+  // WHAT THE TWO FILTERED MODES LEFT OUT, and it is not "nothing". Both modes
+  // answer only about guests the archive can name, so they also drop every
+  // phone-less row — and a reader who filtered to "Repeat only" and got fewer
+  // rows than the Repeat customers card led them to expect is owed the reason
+  // here, in the mode's own sentence, rather than being left to work it out.
+  const excluded = `Customers with no ${basis} on file are not shown in this mode: `
+    + 'the archive cannot tell one of them from another, so it can call them neither.';
+  const body = mode === 'repeat'
+    ? `Showing REPEAT CUSTOMERS ONLY, so the repeat rate is 100% by definition — the filter already removed everyone else. `
+      + `The number that means something here is ${fmtInt(customers)}: that is how many repeat customers have a booking in this window. `
+      + excluded
+    : mode === 'first'
+      ? `Showing FIRST-TIMERS ONLY, so the repeat rate is 0% by definition — the filter already removed every returning customer. `
+        + `The number that means something here is ${fmtInt(customers)}: that is how many first-timers have a booking in this window. `
+        + excluded
+      : `${fmtInt(repeat)} of the ${fmtInt(identified)} customers in this filter with a ${basis} on file have arrived `
+        + `${fmtInt(def.threshold)} or more times across the whole archive. A visit is a booking marked ${visits} — a booking `
+        + 'that was cancelled is not a visit, so a guest who booked five times and came once is a first-timer here.'
+        + (unidentified > 0
+          ? ` The other ${fmtInt(unidentified)} customer${unidentified === 1 ? '' : 's'} here `
+            + `${unidentified === 1 ? 'has' : 'have'} no ${basis} on file and ${unidentified === 1 ? 'is' : 'are'} `
+            + 'counted but not judged — their rows are marked Not identified in the list below.'
+          : '');
+  return (
+    <p className="text-[11px] leading-relaxed text-[#6B5744] bg-[#FFF8F0] border border-[#F0E4D6] rounded-xl px-3 py-2">
+      {body}
+    </p>
   );
 }
 
@@ -3645,9 +4280,36 @@ function numericColumns(columns: string[], rows: unknown[], cell: (row: any, col
   return out;
 }
 
-function ResultTable({ columns, rows }: { columns: string[]; rows: Record<string, unknown>[] }) {
+/**
+ * How ONE column opts out of the generic rendering above — a better head, a
+ * fixed alignment, a cell built from more than its own value, a tooltip that
+ * explains the cell rather than repeating it.
+ *
+ * Every field is optional and every omission falls through to exactly what this
+ * table did before: a column with no entry here is untouched. It exists because
+ * "4th visit" needs two of the row's fields and a dash needs the row's status
+ * to explain itself, and neither is expressible as fmtCell(key, value).
+ */
+interface ColumnRender {
+  head?: string;
+  align?: 'left' | 'right';
+  cell?: (row: Record<string, unknown>) => React.ReactNode;
+  title?: (row: Record<string, unknown>) => string;
+}
+
+function ResultTable({ columns, rows, renderers }: {
+  columns: string[]; rows: Record<string, unknown>[]; renderers?: Record<string, ColumnRender>;
+}) {
   const cell = (row: any, col: string) => row?.[col];
   const numeric = useMemo(() => numericColumns(columns, rows, cell), [columns, rows]);
+  // A declared alignment wins over the one guessed from the data: the visit
+  // ordinal is null on most rows, and a column that right-aligns or not
+  // depending on which page you are looking at is the small wrongness the
+  // comment above numericColumns is about.
+  const alignRight = (c: string) => {
+    const a = renderers?.[c]?.align;
+    return a ? a === 'right' : numeric.has(c);
+  };
   if (columns.length === 0) return null;
   return (
     <div className="bg-white border border-[#E8D5C4] rounded-2xl shadow-sm overflow-hidden">
@@ -3657,8 +4319,8 @@ function ResultTable({ columns, rows }: { columns: string[]; rows: Record<string
             <tr className="text-[11px] uppercase tracking-wide text-[#8B7355] border-b border-[#E8D5C4]">
               {columns.map(c => (
                 <th key={c} title={c}
-                    className={`py-2.5 px-3 font-semibold whitespace-nowrap bg-[#FFF8F0] ${numeric.has(c) ? 'text-right' : 'text-left'}`}>
-                  {humanize(c)}
+                    className={`py-2.5 px-3 font-semibold whitespace-nowrap bg-[#FFF8F0] ${alignRight(c) ? 'text-right' : 'text-left'}`}>
+                  {renderers?.[c]?.head ?? humanize(c)}
                 </th>
               ))}
             </tr>
@@ -3666,13 +4328,17 @@ function ResultTable({ columns, rows }: { columns: string[]; rows: Record<string
           <tbody>
             {rows.map((r, i) => (
               <tr key={i} className="border-b border-[#F0E4D6] last:border-0 hover:bg-[#FFF8F0]">
-                {columns.map(c => (
-                  <td key={c} className={`py-2 px-3 align-top ${numeric.has(c) ? 'text-right tabular-nums' : ''}`}>
-                    <span className="block max-w-[18rem] truncate" title={r?.[c] == null ? '' : String(r[c])}>
-                      {fmtCell(c, r?.[c])}
-                    </span>
-                  </td>
-                ))}
+                {columns.map(c => {
+                  const rc = renderers?.[c];
+                  return (
+                    <td key={c} className={`py-2 px-3 align-top ${alignRight(c) ? 'text-right tabular-nums' : ''}`}>
+                      <span className="block max-w-[18rem] truncate"
+                            title={rc?.title ? rc.title(r ?? {}) : (r?.[c] == null ? '' : String(r[c]))}>
+                        {rc?.cell ? rc.cell(r ?? {}) : fmtCell(c, r?.[c])}
+                      </span>
+                    </td>
+                  );
+                })}
               </tr>
             ))}
           </tbody>

@@ -13,14 +13,33 @@ import {
  *
  *   GET  /api/crm/reservations/query
  *        → { schema, statuses, meal_periods, dow, sources, outlets, bands,
- *            band_lead_in_minutes, sortable, limits }
+ *            band_lead_in_minutes, sortable, limits, repeat_modes,
+ *            repeat_definition }
  *        Everything the tab needs to BUILD a question: the table and column
  *        names it is filtering, and the values actually present in the data.
  *
  *   POST /api/crm/reservations/query   { dow, mealPeriod, from, to, timeFrom,
- *        timeTo, status[], source[], liveBandId, outlet, duplicates, sort, dir,
- *        limit, offset }
+ *        timeTo, status[], source[], liveBandId, outlet, duplicates, repeat,
+ *        sort, dir, limit, offset }
  *        → { rows, total, duplicate_total, aggregates, band, filter, took_ms }
+ *
+ * `repeat` is 'all' | 'repeat' | 'first' and defaults to 'all'; at that default
+ * every number this route returns is the one it returned before the repeat
+ * feature existed. Each row additionally carries guest_identified (1 when the
+ * archive has a phone number for this guest), visit_count (the guest's lifetime
+ * visits — a bucket's row count when guest_identified is 0) and visit_number
+ * (which visit this booking was, null when the booking is not a visit AND null
+ * for every unidentified guest), and `aggregates` additionally carries
+ * customers, identified_customers, unidentified_customers, repeat_customers and
+ * repeat_rate.
+ *
+ * THE REPEAT FIGURES ARE ABOUT IDENTIFIED GUESTS ONLY, and the payload says so
+ * in numbers rather than leaving the reader to infer it: repeat_customers and
+ * repeat_rate are counted over identified_customers, and
+ * unidentified_customers is the rest of `customers`. Nothing here is a claim
+ * about a guest the archive cannot name — see identifiedGuestSql() in
+ * src/lib/reservation-query.ts for why that is ct_guests.phone10 and for the
+ * measured 47-booking bucket that made it necessary.
  *
  * ── WHY POST FOR A READ ───────────────────────────────────────────────────
  * The body is a FILTER OBJECT — arrays of weekdays, statuses and sources — and

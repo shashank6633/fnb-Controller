@@ -90,6 +90,245 @@ export type MealPeriodId = (typeof MEAL_PERIODS)[number]['id'];
 
 export type DuplicateMode = 'exclude' | 'include' | 'only';
 
+/* ── repeat customers ─────────────────────────────────────────────────────── */
+
+/**
+ * WHAT COUNTS AS A VISIT, AND IT IS NOT THE `arrived` COLUMN.
+ *
+ * A visit is a booking whose status says THE GUEST TURNED UP: 'completed' or
+ * 'seated'. The owner was shown that 43,944 of his 99,386 bookings are
+ * CANCELLED and chose this definition over the flattering one, so a guest who
+ * booked five times and cancelled four is NOT a repeat customer.
+ *
+ * DELIBERATELY NOT `COALESCE(arrived, 0) = 1`, which is what the existing
+ * "arrived" stat card counts. They are not the same rule. `arrived` is
+ * ARRIVED_SQL / isArrived() (src/lib/reservego.ts), which counts a THIRD case
+ * this one does not: a row whose status is 'pending' or 'confirmed' but which
+ * carries a non-empty seated_at. So the two sets differ on exactly
+ *   status IN ('pending','confirmed') AND TRIM(COALESCE(seated_at,'')) <> ''
+ * and nowhere else. MEASURED on the live database: 0 such rows, and 0 rows
+ * disagreeing in either direction. (The production-shaped fixture this feature
+ * was proven on also shows 0, but that one agrees BY CONSTRUCTION — the seeder
+ * writes status and arrived together — so only the live-database figure is
+ * evidence about real data.)
+ *
+ * Anchoring on the STATUS is the choice because the number on screen can then
+ * be re-derived by a human from the status column in the row list beside it,
+ * and it cannot drift when a stale Reservego "Seated Time" lands on a pending
+ * row. If the two ever part company the "arrived" card and the repeat cards
+ * will differ, and that is honest: they answer two different questions.
+ */
+export const VISIT_STATUSES = ['completed', 'seated'] as const satisfies readonly Status[];
+
+/** Two arrivals make a repeat customer. One does not. */
+export const REPEAT_VISIT_THRESHOLD = 2;
+
+/**
+ * THE REPEAT DIMENSION — Everyone / repeat only / first-timers only.
+ *
+ * 'all' is the default and must stay the default: at 'all' this filter adds no
+ * clause and no statement changes, so every number that was on the screen
+ * before this feature existed is the same number afterwards.
+ *
+ * 'repeat' and 'first' SPLIT THE GUESTS THE ARCHIVE CAN IDENTIFY, and they do
+ * not cover everyone. Over the ids that have a phone number they are an exact
+ * partition — every such booking belongs to a guest who either has more than
+ * one lifetime visit or does not, which is why the predicate is written as
+ * IN / NOT IN against the same id list rather than as two independently built
+ * tests. Over the ids that do NOT, they claim nothing: a phone-less id is a
+ * merged bucket whose re-uploads never collapse (see identifiedGuestSql), so
+ * calling it a repeat customer is a false claim about a person and calling it a
+ * first-timer is the same false claim pointing the other way. Those rows appear
+ * under 'all' only, they are counted by `unidentified_customers`, and each one
+ * is marked on screen — a third bucket that is reported rather than a row that
+ * falls through. A booking whose guest_id matches no ct_guests row at all (an
+ * orphan) has no phone10 to read and lands there too.
+ */
+export const REPEAT_MODES = ['all', 'repeat', 'first'] as const;
+export type RepeatMode = (typeof REPEAT_MODES)[number];
+
+/**
+ * WHEN THE ARCHIVE CAN ACTUALLY NAME THE PERSON — ct_guests.phone10, and
+ * nothing else will do.
+ *
+ * This is the gate on every per-person claim the screen makes, and it exists
+ * because of ONE measured fact about the import, not out of caution:
+ *
+ *   markDuplicateGroups() (src/lib/reservego.ts:983, and the same line in
+ *   collapseSameDayDuplicates at :861) pushes a row with no phone10 straight
+ *   onto primaryIds BEFORE it builds a group key. A guest id with no phone10
+ *   therefore has NO row that is ever flagged is_duplicate, so for that id a
+ *   re-uploaded booking IS counted as a second visit — the one place in the
+ *   archive where the re-upload collapse never happens.
+ *
+ * And the same ids are the ones the importer keys on EMAIL or NAME
+ * (reservego-import.ts:1020 — `email:<addr>` / `name:<name>` when there is no
+ * number), so one id absorbs every unrelated human the desk typed "Guest" or
+ * "Walk in" for. MEASURED on a production-shaped fixture: a phone-less
+ * "Walk in" id holding 47 unrelated bookings rendered visit_count 47,
+ * visit_number 47, and sat at the top of Repeat only — the screen called it the
+ * venue's biggest regular. The importer's own comment measures 47 such guests
+ * in production.
+ *
+ * THE TWO DEFECTS COMPOUND, which is why one test gates both claims: the merged
+ * bucket is also the bucket whose re-uploads never collapse, so its visit
+ * figures are wrong in both the "who" and the "how many".
+ *
+ * phone10, NOT phone_e164, and that is deliberate. src/lib/ct/guest-autosave.ts
+ * inserts a ct_guests row with a real phone_e164 and NO phone10 at all, and
+ * markDuplicateGroups reads phone10 (via reservego-import.ts:1420, `g.phone10`
+ * joined on b.guest_id). Such a guest is a real person with a real number whom
+ * the archive still cannot match, so their re-uploads still never collapse.
+ * Testing phone_e164 would call them identified and re-admit the inflated count.
+ * The test here is EXACTLY the condition markDuplicateGroups needs and no
+ * weaker.
+ *
+ * WHAT THE SCREEN DOES WITH IT — keep the data, drop the claim:
+ *   · the row still appears, and still carries its booking count;
+ *   · it gets NO visit ordinal (visit_number is NULL) — see ReservationQueryRow;
+ *   · it carries `guest_identified` so the page can mark it, and the owner can
+ *     see WHICH rows are affected from the screen alone;
+ *   · it is counted in `customers` but NOT in `repeat_customers`, and
+ *     `unidentified_customers` reports how many there are so the arithmetic on
+ *     the cards stays explainable — customers = identified + unidentified;
+ *   · the Repeat only / First-timers only modes do not claim it either way.
+ * Excluding it silently would have hidden real guests behind an unexplainable
+ * total; counting it as-is printed a false claim about a person.
+ *
+ * NOT A FIX FOR THE ARCHIVE, and not trying to be. Re-keying guest identity, or
+ * changing how 99,386 bookings are deduplicated, is a decision about the guest
+ * master that the owner has not asked for. This only stops the screen stating
+ * what the archive cannot support.
+ */
+function identifiedGuestSql(alias: string): string {
+  return `COALESCE(${alias}.phone10, '') <> ''`;
+}
+
+/**
+ * The same test for a bookings row that has no ct_guests join to hand.
+ *
+ * An EXISTS against the primary key, NOT `guest_id IN (SELECT id FROM
+ * ct_guests WHERE …)`: the IN form materialises a list of ~84,000 ids on every
+ * query, the EXISTS form is one primary-key seek per row. It is also correct for
+ * an ORPHAN guest_id — a booking whose guest matches no ct_guests row at all —
+ * which has no phone10 to read and so is NOT identified, which is the honest
+ * answer about a guest the master has never heard of.
+ */
+function identifiedByGuestIdSql(guestIdExpr: string): string {
+  return `EXISTS (SELECT 1 FROM ct_guests ig`
+    + ` WHERE ig.id = ${guestIdExpr} AND ${identifiedGuestSql('ig')})`;
+}
+
+/**
+ * WHO COUNTS AS ONE CUSTOMER — ct_bookings.guest_id, and the limits of that.
+ *
+ * Every count here keys on b.guest_id. That is the app's OWN notion of which
+ * customer a booking belongs to, it is what the rest of this screen already
+ * joins on, and it needs no join to ct_guests to evaluate — which is what keeps
+ * the lifetime pass affordable (see lifetimeVisitsSql).
+ *
+ * THE IMPORTER ALREADY UNIFIES ON THE LAST 10 DIGITS. reservego-import.ts
+ * resolves a guest by `SELECT … WHERE phone10 = ?` FIRST and only then by
+ * phone_e164, so for the Reservego rows that are ~all of the archive, one human
+ * with one mobile number holds one guest_id. This is the same last-10-digit
+ * rule the rest of the CRM uses.
+ *
+ * WHERE IT CAN STILL BE WRONG, both directions, because the owner should know
+ * what caps the number rather than trusting a figure with no stated error:
+ *
+ *  1. UNDERCOUNT — one human, two guest ids. ct_guests.phone_e164 is UNIQUE but
+ *     phone10 is NOT (there is an index on it, not a constraint), and not every
+ *     writer fills phone10 in: ct/guest-autosave.ts inserts id/phone_e164/name
+ *     only. A CRM-created guest therefore has phone10 NULL, the importer's
+ *     phone10 lookup misses it, and a second profile can be created for the
+ *     same person under a differently-formatted number. Their visits then split
+ *     across two ids and a genuine regular reads as two first-timers. This
+ *     direction UNDERSTATES repeat customers, which is the same way the owner
+ *     already chose to be wrong when he picked arrivals over bookings for D1.
+ *     Measured on the live database: 0 phone10 values are shared by two guest
+ *     ids — but all 27 of its guests have phone10 NULL, so that 0 means "no
+ *     evidence here", not "does not happen".
+ *     The phone10-NULL half of this is no longer counted as a person at all:
+ *     identifiedGuestSql() excludes it from every per-person claim, so a
+ *     CRM-created guest is reported as unidentified rather than as a
+ *     first-timer the screen is sure about.
+ *
+ *  2. OVERCOUNT — two humans, one guest id. This is the one that is NOT
+ *     conservative, so it is worth stating loudly. reservego-import.ts falls
+ *     back to matching on EMAIL and then on NAME, for phone-less guests only
+ *     (phone_e164 empty or an 'email:' / 'name:' placeholder). The reservation
+ *     desk types "Guest" and "Walk in" all day, so one such id can absorb many
+ *     unrelated people and show up as the venue's biggest regular. The
+ *     importer's own comment measures the exposure: 128 weak-keyed rows in
+ *     217,805, resolving to 47 phone-less guests.
+ *     THIS USED TO BE LEFT TO ANNOUNCE ITSELF, on the theory that a bucket
+ *     reading "Guest — 47th visit" is visibly not a person. It was measured and
+ *     it is not: a planted phone-less "Walk in" id holding 47 unrelated
+ *     bookings rendered an ordinal of 47, a repeat badge, and the top row of
+ *     Repeat only. It read as the venue's biggest regular, not as a bucket.
+ *     So the claim is gone instead: identifiedGuestSql() gates it, the row is
+ *     MARKED on screen, and unidentified_customers says how many there are. The
+ *     rows to inspect are
+ *       SELECT * FROM ct_guests WHERE COALESCE(phone10, '') = '';
+ *     which is deliberately WIDER than the importer's own phone-less test — it
+ *     also catches the guest-autosave rows that have a real phone_e164 and no
+ *     phone10, because those are matched no better. See identifiedGuestSql().
+ *
+ * STILL NOT RE-KEYED, and that is a separate decision. Re-keying identity onto
+ * phone10 would change what every other number on this screen means, and it
+ * cannot be done naively: 27 of 27 live guests have phone10 NULL, so grouping
+ * on phone10 alone would collapse every one of them into a single bucket and
+ * invent a 40-visit regular. That is a decision about the guest master, not
+ * about this query tab. What this module does is narrower and safer: it refuses
+ * to make a per-person claim about an id that cannot support one.
+ *
+ * There is deliberately no GUEST_IDENTITY constant to swap: every statement
+ * below says `guest_id` literally, because a single symbol would advertise that
+ * identity is one edit away when in truth it is spread across the row shape,
+ * the aggregates and the other screens that must agree with them.
+ */
+
+/**
+ * THE LIFETIME VISIT COUNT — one row per guest, visits over their WHOLE
+ * HISTORY, deliberately ignoring every filter the caller set.
+ *
+ * THIS IS D2, AND IT IS THE SUBTLE PART OF THE FEATURE. "Repeat customers in
+ * July" means bookings in July belonging to guests who have EVER arrived more
+ * than once — so a guest who came in June and again in July IS a repeat
+ * customer inside a July-only filter. The split is therefore:
+ *   · WHO IS A REPEAT CUSTOMER — judged here, unfiltered, whole archive.
+ *   · WHICH ROWS AND TOTALS YOU SEE — judged by buildWhere, filtered as asked.
+ * Nothing from ReservationFilter may ever leak into this statement; the moment
+ * a date bound reaches it, "repeat" silently degrades into "booked twice inside
+ * the window", which is a different and much smaller number.
+ *
+ * DUPLICATES ARE EXCLUDED UNCONDITIONALLY — TRAP 1, and the reason this
+ * function takes no duplicates argument at all. The screen's own subtitle
+ * promises "Same booking uploaded twice stays one booking", and
+ * markDuplicateGroups() (src/lib/reservego.ts) has already decided, per
+ * (outlet, phone10, booking_date), which stored row IS the visit. Counting the
+ * re-uploaded copy would manufacture a second visit out of one evening and
+ * promote a first-timer to a regular — on 3,578 rows of a
+ * production-shaped archive, which would inflate every repeat number on the
+ * page. So the answer to "how does the repeat count behave under each of the
+ * three duplicate modes" is: IDENTICALLY. `duplicates` picks which rows are
+ * LISTED; it never changes who is a repeat customer, exactly as it never
+ * changes any other aggregate (see buildWhere's forAggregate).
+ *
+ * The status list is BOUND, not interpolated, like every other value in this
+ * module — callers pass LIFETIME_VISITS_PARAMS positionally ahead of their own.
+ */
+function lifetimeVisitsSql(): string {
+  return `SELECT v.guest_id AS guest_id, COUNT(*) AS visits
+            FROM ct_bookings v
+           WHERE v.status IN (${VISIT_STATUSES.map(() => '?').join(',')})
+             AND COALESCE(v.is_duplicate, 0) = 0
+           GROUP BY v.guest_id`;
+}
+
+/** The bound parameters lifetimeVisitsSql() expects, in order. */
+const LIFETIME_VISITS_PARAMS: readonly string[] = VISIT_STATUSES;
+
 /* ── the band lead-in ─────────────────────────────────────────────────────── */
 
 /**
@@ -184,6 +423,11 @@ export interface ReservationFilter {
   liveBandId: string | null;
   outlet: string | null;
   duplicates: DuplicateMode;
+  /**
+   * Everyone / repeat only / first-timers only. Judged over the guest's WHOLE
+   * history, never over the filtered window — see repeatGuestIdsSql().
+   */
+  repeat: RepeatMode;
   sort: SortKey;
   dir: 'asc' | 'desc';
   limit: number;
@@ -215,9 +459,21 @@ const SORTABLE = {
   party_size: (d: string) => `b.party_size ${d}`,
   bill_amount: (d: string) => `b.bill_amount ${d}`,
   status: (d: string) => `b.status ${d}`,
+  /**
+   * The guest's LIFETIME visit count — "show me my regulars first".
+   *
+   * `lvs` is the lifetime-visits derived table, which only the id pass joins
+   * and only when THIS key is the one chosen (see runReservationQuery). Every
+   * other key's statement is textually unchanged, so picking a sort can never
+   * make the rest of the page slower. booking_date/slot_time break the tie so
+   * that the hundreds of rows sharing a visit count hold a stable order.
+   */
+  visit_count: (d: string) => `COALESCE(lvs.visits, 0) ${d}, b.booking_date ${d}, b.slot_time ${d}`,
 } as const;
 export type SortKey = keyof typeof SORTABLE;
 const isSortable = (k: string): k is SortKey => Object.prototype.hasOwnProperty.call(SORTABLE, k);
+/** Sort keys whose ORDER BY fragment references the `lvs` join. */
+const SORT_NEEDS_LIFETIME: ReadonlySet<string> = new Set<SortKey>(['visit_count']);
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
@@ -335,6 +591,14 @@ export function parseReservationFilter(input: unknown): ReservationFilter {
     throw new ReservationQueryError('duplicates must be exclude, include or only');
   }
 
+  // REFUSED, not coerced, exactly like status and duplicates above: a typo in
+  // `repeat` silently read as "Everyone" would label the whole archive as an
+  // answer about repeat customers, and the reader has no way to tell.
+  const repeatRaw = asString(raw.repeat, 'repeat') || 'all';
+  if (!(REPEAT_MODES as readonly string[]).includes(repeatRaw)) {
+    throw new ReservationQueryError(`repeat must be one of ${REPEAT_MODES.join(', ')}`);
+  }
+
   let sortRaw = asString(raw.sort, 'sort');
   let dirRaw = asString(raw.dir, 'dir').toLowerCase();
   if (sortRaw.startsWith('-')) { sortRaw = sortRaw.slice(1); if (!dirRaw) dirRaw = 'desc'; }
@@ -359,6 +623,7 @@ export function parseReservationFilter(input: unknown): ReservationFilter {
     liveBandId,
     outlet,
     duplicates: dupRaw as DuplicateMode,
+    repeat: repeatRaw as RepeatMode,
     sort,
     dir,
     limit: Math.min(MAX_LIMIT, Math.max(1, Math.round(limitRaw) || DEFAULT_LIMIT)),
@@ -980,6 +1245,49 @@ function buildWhere(f: ReservationFilter, opts: { forAggregate: boolean; band: B
     }
   }
 
+  // ── THE REPEAT DIMENSION, LAST ON PURPOSE ───────────────────────────────────
+  // At the default 'all' this block pushes NOTHING — no clause, no parameter —
+  // so the statement is character-for-character the one that ran before this
+  // feature existed and every number on the screen is unchanged. That is the
+  // regression that matters, and it is guaranteed structurally here rather than
+  // by testing it afterwards. It is also appended AFTER the band clause so that
+  // no existing clause's parameter position moves even when it does fire.
+  //
+  // WHO is a repeat customer comes from lifetimeVisitsSql() — the whole
+  // archive, every filter above deliberately absent (D2). WHICH rows you see is
+  // every clause above. The two are composed here and nowhere else.
+  //
+  // IN / NOT IN AGAINST THE SAME ID LIST, which is what makes the two modes an
+  // exact partition of the IDENTIFIED guests: every such booking's guest either
+  // appears in that list or does not. Written as two independent tests (say, a
+  // `visits >= 2` join versus a `visits < 2` join) a guest with no lifetime row
+  // would fall through BOTH, since a LEFT JOIN miss satisfies neither
+  // comparison — and that booking would then be in neither answer and silently
+  // missing from the screen.
+  //
+  // `AND guest_id IS NOT NULL` is belt-and-braces: ct_bookings.guest_id is
+  // declared NOT NULL so the list cannot contain one, but a single NULL inside a
+  // NOT IN list makes the whole predicate UNKNOWN and would return an EMPTY
+  // first-timers page — a silent-empty failure, the worst kind on a counting
+  // screen. One cheap, always-true condition buys immunity from it.
+  //
+  // THE IDENTITY CLAUSE IS ON BOTH MODES, NOT ONE. Putting it on 'repeat' alone
+  // would have been the tidy-looking half-fix: the 47-booking "Walk in" bucket
+  // stops being called a regular and silently becomes a FIRST-TIMER instead,
+  // which is the same false claim about a person with the sign flipped. Both
+  // modes therefore answer only about guests the archive can name, and the rows
+  // it cannot name are reported as their own bucket — see REPEAT_MODES and
+  // identifiedGuestSql(). Appended AFTER the lifetime clause so that clause's
+  // parameter positions do not move.
+  if (f.repeat !== 'all') {
+    where.push(
+      `b.guest_id ${f.repeat === 'repeat' ? 'IN' : 'NOT IN'} (`
+      + `SELECT guest_id FROM (${lifetimeVisitsSql()}) WHERE visits >= ? AND guest_id IS NOT NULL)`,
+    );
+    params.push(...LIFETIME_VISITS_PARAMS, REPEAT_VISIT_THRESHOLD);
+    where.push(identifiedByGuestIdSql('b.guest_id'));
+  }
+
   return { sql: where.length ? `WHERE ${where.join(' AND ')}` : '', params };
 }
 
@@ -996,6 +1304,75 @@ export interface ReservationAggregates {
   average_spend: number | null;
   /** arrived / bookings as a 0–100 percentage, or null when there are no bookings. */
   arrival_rate: number | null;
+
+  /**
+   * DISTINCT CUSTOMERS IN THE FILTERED SET — and THE DENOMINATOR OF
+   * repeat_rate. It ships for exactly that reason: a rate whose denominator is
+   * unclear is worse than no rate, so the screen never has to guess and can
+   * label the card in full — "412 of 3,106 customers came back".
+   *
+   * Counted as COUNT(DISTINCT b.guest_id) over the same rows `bookings`
+   * counts, so it is "customers with a booking matching this filter",
+   * INCLUDING customers whose every booking was cancelled. Those people are
+   * real customers of the filtered window and dropping them would quietly
+   * inflate the rate.
+   */
+  customers: number;
+  /**
+   * Of those, the ones the archive can actually NAME — a phone number on file
+   * (identifiedGuestSql). THE DENOMINATOR OF repeat_rate, and the reason it
+   * ships as its own figure rather than being left for the page to subtract:
+   * the card has to print the number it divided by, and a denominator the page
+   * computed is a denominator that can disagree with the numerator.
+   */
+  identified_customers: number;
+  /**
+   * customers − identified_customers: matching guests with NO phone number on
+   * file, so the archive cannot tell one person's visits from another's and
+   * their re-uploaded bookings were never collapsed.
+   *
+   * ON SCREEN, NOT SWALLOWED. These people are real customers of the filtered
+   * window — they are counted in `customers` — but no per-person claim is made
+   * about them, so the screen owes the reader the size of the gap. It is what
+   * makes customers = identified + unidentified check out by eye, and it is how
+   * the owner learns "roughly how many" rows are affected without running a
+   * query. Usually small (the importer measures 47 such guests in production);
+   * if it is ever large, that is the most important number on the screen.
+   */
+  unidentified_customers: number;
+  /**
+   * IDENTIFIED distinct customers in the filtered set who have EVER arrived
+   * more than once — lifetime, whole archive, regardless of the date filter
+   * (D2).
+   *
+   * So in a July-only filter this counts guests with a July booking who are
+   * repeat customers overall, NOT guests who came twice during July.
+   *
+   * IDENTIFIED ONLY, and that bound is the F1 fix rather than a nicety. A
+   * phone-less guest id is a merged bucket whose re-uploads never collapse, so
+   * including one would be counting "a person who came back" where there is
+   * neither one person nor a reliable count — measured, one such id contributed
+   * 47 visits. They are in `unidentified_customers` instead.
+   */
+  repeat_customers: number;
+  /**
+   * repeat_customers / identified_customers as a 0–100 percentage, null when
+   * the filter matched no identifiable customer at all.
+   *
+   * THE DENOMINATOR IS THE IDENTIFIED COUNT, NOT `customers`, because both
+   * halves of a rate have to be answering the same question. Dividing a
+   * repeat count that excludes unidentified guests by a total that includes
+   * them would quietly understate the rate by however many of them there are,
+   * and the card would be printing a denominator it did not use. The card
+   * states this one on its face.
+   *
+   * SHARE OF PEOPLE, NOT OF BOOKINGS. Both halves are distinct-guest counts, so
+   * a regular with eleven bookings in the window moves this number exactly as
+   * much as a regular with one. The bookings-weighted version is a different
+   * and much larger figure; this is the one that answers "how much of my custom
+   * is repeat custom".
+   */
+  repeat_rate: number | null;
 }
 
 export interface ReservationQueryRow {
@@ -1021,6 +1398,70 @@ export interface ReservationQueryRow {
   outlet_name: string | null;
   sections: string | null;
   tables_csv: string | null;
+
+  /**
+   * 1 when the archive can NAME this guest — a phone number on file — and 0
+   * when it cannot. identifiedGuestSql() is the rule; see it for why that is
+   * phone10 and not phone_e164.
+   *
+   * SHIPPED SO THE PAGE DOES NOT RE-DERIVE IT. `guest_phone10` is already on
+   * the row, so a client could test it and get the same answer today — and
+   * would silently stop agreeing with the cards the first time the server's
+   * rule moved. One flag, decided once, in the same statement that decides
+   * visit_number.
+   *
+   * It is a COLUMN of the results grid, not just a hint for the visit cells,
+   * because the owner has to be able to see WHICH rows are affected from the
+   * screen alone, and it rides the CSV export for the same reason.
+   */
+  guest_identified: number;
+  /**
+   * The guest's LIFETIME visit count across the whole archive, ignoring the
+   * filter (D2). 0 for a guest who has booked but never turned up, and for an
+   * orphan guest_id.
+   *
+   * WHAT IT COUNTS DEPENDS ON guest_identified, and the page labels it
+   * accordingly rather than printing one word over two different things:
+   *   · identified → how many times THIS PERSON has arrived.
+   *   · not identified → how many arrival-status bookings sit in a bucket that
+   *     may hold many unrelated people, and whose re-uploads were never
+   *     collapsed. A count of rows, not of visits by anyone.
+   * The NUMBER is kept either way. Blanking it would have hidden the 47-booking
+   * bucket that makes this worth saying, and the owner cannot act on a figure he
+   * cannot see; what is withdrawn is the claim about a person, not the data.
+   *
+   * `guest_identified = 1 AND visit_count >= REPEAT_VISIT_THRESHOLD` is exactly
+   * the test the repeat filter and the repeat cards apply, so the row list can
+   * always be checked against the cards by eye — the screen never has to
+   * re-derive the rule.
+   */
+  visit_count: number;
+  /**
+   * WHICH VISIT THIS BOOKING WAS for that guest — 4 means "their 4th visit",
+   * counted chronologically over their whole history.
+   *
+   * NULL WHEN THIS BOOKING IS NOT A VISIT, and that is the deliberate choice
+   * the brief asks to be documented. A cancelled, no-show, pending or confirmed
+   * booking never happened as a visit, so it has no ordinal, and a duplicate
+   * row is the same evening uploaded twice and must not claim an ordinal of its
+   * own. Printing 0, or carrying the previous visit's number forward, would put
+   * a number in that column that reads as a fact and is not one; the page shows
+   * a dash. The honest ordinal is therefore null for ~44% of the archive
+   * (the cancelled rows), which is a true statement about this venue's data.
+   *
+   * ALSO NULL WHEN guest_identified IS 0, which is the F1 fix in one column. An
+   * ordinal is the most personal claim on the whole screen — "this was their
+   * 47th visit" names a human and counts their evenings — and on a phone-less
+   * bucket both halves are wrong: it is not one human, and the count includes
+   * re-uploads that were never collapsed. MEASURED before this bound existed: a
+   * planted "Walk in" id printed "47th visit" with a repeat badge. There is no
+   * honest ordinal to print for such a row, so none is sent.
+   *
+   * The counting rule is "visits at or before this one", so for a row that IS a
+   * visit by an identified guest this is always between 1 and visit_count
+   * inclusive.
+   */
+  visit_number: number | null;
 }
 
 export interface ReservationQueryResult {
@@ -1133,10 +1574,78 @@ export function runReservationQuery(db: DB, f: ReservationFilter): ReservationQu
         FROM ct_bookings b ${aggWhere.sql}
     `).get(...aggWhere.params) as Record<string, number | null>;
 
+    // ── THE TWO REPEAT CARDS, IN THEIR OWN PASS ──────────────────────────────
+    // A SEPARATE STATEMENT ON PURPOSE, for two reasons.
+    //
+    // 1. THE NINE EXISTING NUMBERS KEEP THEIR OWN SQL, character for character.
+    //    Folding these two cards into the statement above would have made every
+    //    pre-existing number on the screen the output of a statement this
+    //    feature edited. Left alone, "the default must not change" stops being
+    //    a thing to test and becomes a thing you can read.
+    //
+    // 2. IT IS THE FASTER SHAPE, because the two grains are different: the
+    //    sums above are per BOOKING, these two are per CUSTOMER. Reducing to
+    //    DISTINCT guests FIRST and then testing each one is strictly less work
+    //    than carrying a join through all the booking rows and distinct-ing
+    //    twice at the end. MEASURED on the production-shaped archive
+    //    (99,405 live bookings / 84,173 guests, warm cache, median of 7):
+    //      one combined statement, LEFT JOIN + 2x COUNT(DISTINCT) … 114ms
+    //      DISTINCT-first, joining the lifetime derived table    …  82ms
+    //      DISTINCT-first + EXISTS, this one                     …  63ms
+    //    and on a July-only filter 55ms / 58ms / 23ms. All three forms were
+    //    verified to return IDENTICAL customers and repeat_customers on the
+    //    whole archive, on Fri+Sat and on July before this one was chosen.
+    //
+    // WHY `EXISTS … LIMIT 1 OFFSET ?` AND NOT `COUNT(*) >= 2`. The question is
+    // not "how many times did they come" but "did they come more than once",
+    // so the probe can stop at the second row instead of counting all 43 of a
+    // regular's bookings. It reads as the threshold it implements: skip
+    // THRESHOLD-1 rows and ask whether anything is left. The planner uses
+    // idx_ct_bookings_guest for it (SEARCH v USING INDEX idx_ct_bookings_guest)
+    // — NO new index is needed for this feature, measured, and none was added.
+    //
+    // This also means the cost scales with the FILTERED customer count, not the
+    // size of the archive, which is the right way round: the owner's narrow
+    // questions stay cheap as the archive grows.
+    //
+    // `COUNT(*)` over the already-DISTINCT subquery is `customers`, so the
+    // denominator and the numerator come from one pass and cannot disagree.
+    //
+    // ALL THREE COUNTS COME OUT OF THIS ONE STATEMENT, including the identity
+    // split, and that is the point: customers, identified and repeat are then
+    // three sums over ONE list of distinct guests, so customers = identified +
+    // unidentified is true by construction rather than by two queries agreeing.
+    // The identity probe is another primary-key seek per distinct guest and
+    // carries no bound parameter, so the parameter order below is unchanged.
+    const rep = db.prepare(`
+      SELECT COUNT(*) AS customers,
+             SUM(CASE WHEN ${identifiedByGuestIdSql('dg.guest_id')} THEN 1 ELSE 0 END)
+               AS identified_customers,
+             SUM(CASE WHEN ${identifiedByGuestIdSql('dg.guest_id')} AND EXISTS (
+                   SELECT 1 FROM ct_bookings v
+                    WHERE v.guest_id = dg.guest_id
+                      AND v.status IN (${VISIT_STATUSES.map(() => '?').join(',')})
+                      AND COALESCE(v.is_duplicate, 0) = 0
+                    LIMIT 1 OFFSET ?
+                 ) THEN 1 ELSE 0 END) AS repeat_customers
+        FROM (SELECT DISTINCT b.guest_id FROM ct_bookings b ${aggWhere.sql}) dg
+    `).get(
+      // Positional: the correlated subquery appears before the FROM in the text.
+      ...LIFETIME_VISITS_PARAMS, REPEAT_VISIT_THRESHOLD - 1, ...aggWhere.params,
+    ) as Record<string, number | null>;
+
     const bookings = Number(agg?.bookings ?? 0);
     const billed = Number(agg?.billed_bookings ?? 0);
     const spend = Number(agg?.total_spend ?? 0);
     const arrived = Number(agg?.arrived ?? 0);
+    const customers = Number(rep?.customers ?? 0);
+    // Clamped into [0, customers] before it is subtracted: `identified` is a
+    // SUM over the same list `customers` counted so it cannot legitimately
+    // exceed it, but an unidentified count that came out NEGATIVE would be
+    // printed on the card as a fact, and a card is the wrong place to discover
+    // an arithmetic slip.
+    const identified = Math.min(customers, Math.max(0, Number(rep?.identified_customers ?? 0)));
+    const repeatCustomers = Number(rep?.repeat_customers ?? 0);
     const aggregates: ReservationAggregates = {
       bookings,
       arrived,
@@ -1147,6 +1656,15 @@ export function runReservationQuery(db: DB, f: ReservationFilter): ReservationQu
       billed_bookings: billed,
       average_spend: billed > 0 ? Math.round((spend / billed) * 100) / 100 : null,
       arrival_rate: bookings > 0 ? Math.round((arrived / bookings) * 1000) / 10 : null,
+      customers,
+      identified_customers: identified,
+      unidentified_customers: customers - identified,
+      repeat_customers: repeatCustomers,
+      // Over the IDENTIFIED count, which is what repeat_customers was counted
+      // out of — see the field's own comment. Rounded to one decimal, the same
+      // way arrival_rate is, so the two percentages on the screen agree on
+      // precision.
+      repeat_rate: identified > 0 ? Math.round((repeatCustomers / identified) * 1000) / 10 : null,
     };
 
     // How many of the matching rows are duplicates — reported so the screen can
@@ -1170,24 +1688,83 @@ export function runReservationQuery(db: DB, f: ReservationFilter): ReservationQu
     // so page 2 cannot repeat a row from page 1 when a busy Saturday shares a
     // date and slot across dozens of bookings.
     const d = f.dir === 'asc' ? 'ASC' : 'DESC';
+    // The lifetime join is added ONLY when the chosen sort key's ORDER BY
+    // fragment actually references `lvs`. Every other sort — which is every
+    // sort the page opens on — prepares the identical statement it did before
+    // this feature, so choosing "newest first" can never pay for a join it does
+    // not use. SORT_NEEDS_LIFETIME is the single list that decides, so a future
+    // sort key that reaches for `lvs` without being added to it fails loudly on
+    // "no such column" rather than quietly sorting by something else.
+    const needsLifetime = SORT_NEEDS_LIFETIME.has(f.sort);
+    const lifetimeJoin = needsLifetime
+      ? `LEFT JOIN (${lifetimeVisitsSql()}) lvs ON lvs.guest_id = b.guest_id`
+      : '';
     const ids = (db.prepare(`
-      SELECT b.id FROM ct_bookings b ${rowsWhere.sql}
+      SELECT b.id FROM ct_bookings b ${lifetimeJoin} ${rowsWhere.sql}
       ORDER BY ${SORTABLE[f.sort](d)}, b.id ${d}
       LIMIT ? OFFSET ?
-    `).all(...rowsWhere.params, f.limit, f.offset) as Array<{ id: string }>).map((r) => String(r.id));
+    `).all(
+      ...(needsLifetime ? LIFETIME_VISITS_PARAMS : []),
+      ...rowsWhere.params, f.limit, f.offset,
+    ) as Array<{ id: string }>).map((r) => String(r.id));
     if (!ids.length) return { rows: [] as ReservationQueryRow[], total, duplicateTotal, aggregates };
 
+    // ── THE PER-ROW VISIT NUMBERS, AND WHY THEY ARE NOT AN N+1 ───────────────
+    // Both are correlated subqueries, which is normally the thing to avoid on a
+    // 99,386-row table — but they are evaluated HERE, in the hydrate pass,
+    // against the ids of ONE PAGE only. The work is therefore bounded by
+    // MAX_LIMIT (200) regardless of how big the filter's result set is, and each
+    // probe is an index seek on idx_ct_bookings_guest over one guest's handful
+    // of bookings. Putting them in the id pass instead would have computed them
+    // for every matching row and thrown all but a page away.
+    //
+    // THE CHRONOLOGICAL KEY IS A STRING COMPARE, deliberately. The ordinal is
+    // "visits at or before this one", so it needs a total order over a guest's
+    // visits: night, then slot, then id as the final tiebreak so two bookings
+    // identical on both still get distinct ordinals and the same ones on every
+    // run. Lexicographic ordering is chronological here because the night is
+    // 'YYYY-MM-DD' and slot_time is zero-padded 'HH:MM' (stampTime, measured: 0
+    // rows malformed in the archive). A row with a blank slot_time sorts to the
+    // front of its own night — '#' < '0' — which is deterministic, and the id
+    // tiebreak keeps the order total even if a date were malformed.
+    //
+    // visit_number is NULL for a row that is not a visit; see the field's own
+    // comment on ReservationQueryRow for why that is a dash and not a 0.
+    const visitPredicate = (t: string) =>
+      `${t}.status IN (${VISIT_STATUSES.map(() => '?').join(',')}) AND COALESCE(${t}.is_duplicate, 0) = 0`;
+    const visitOrderKey = (t: string) =>
+      `(COALESCE(NULLIF(${t}.reserved_date, ''), ${t}.booking_date) || 'T'`
+      + ` || COALESCE(${t}.slot_time, '') || '#' || ${t}.id)`;
     const hydrated = db.prepare(`
       SELECT b.id, b.guest_id, b.booking_date, b.slot_time, b.reserved_time, b.booking_time,
              b.party_size, b.status, b.reservego_status, b.arrived, b.is_duplicate,
              b.bill_amount, b.bill_number, b.source, b.booking_type, b.outlet_name,
              b.sections, b.tables_csv,
              COALESCE(b.dow, CAST(strftime('%w', COALESCE(NULLIF(b.reserved_date, ''), b.booking_date)) AS INTEGER)) AS dow,
-             g.name AS guest_name, g.phone_e164 AS guest_phone, g.phone10 AS guest_phone10
+             g.name AS guest_name, g.phone_e164 AS guest_phone, g.phone10 AS guest_phone10,
+             -- Off the join that is already here, so the flag costs nothing and
+             -- cannot disagree with the guest_phone10 printed beside it.
+             CASE WHEN ${identifiedGuestSql('g')} THEN 1 ELSE 0 END AS guest_identified,
+             (SELECT COUNT(*) FROM ct_bookings v
+               WHERE v.guest_id = b.guest_id AND ${visitPredicate('v')}) AS visit_count,
+             -- The identity test is ANDed into the ordinal's own CASE rather
+             -- than applied by the page: an ordinal that exists in the payload
+             -- and is suppressed in the markup is one render away from being
+             -- printed again, and it would still go out in the CSV.
+             CASE WHEN ${visitPredicate('b')} AND ${identifiedGuestSql('g')}
+               THEN (SELECT COUNT(*) FROM ct_bookings v2
+                      WHERE v2.guest_id = b.guest_id AND ${visitPredicate('v2')}
+                        AND ${visitOrderKey('v2')} <= ${visitOrderKey('b')})
+               ELSE NULL END AS visit_number
         FROM ct_bookings b
         LEFT JOIN ct_guests g ON g.id = b.guest_id
        WHERE b.id IN (${ids.map(() => '?').join(',')})
-    `).all(...ids) as ReservationQueryRow[];
+    `).all(
+      // Positional, in the order the placeholders appear in the text above:
+      // visit_count's statuses, the CASE's own test, then the inner ordinal.
+      ...LIFETIME_VISITS_PARAMS, ...LIFETIME_VISITS_PARAMS, ...LIFETIME_VISITS_PARAMS,
+      ...ids,
+    ) as ReservationQueryRow[];
 
     // IN (…) returns SQLite's order, not the id list's — put the page back into
     // the order that was asked for.
@@ -1292,9 +1869,29 @@ export const RESERVATION_QUERY_SCHEMA: { tables: Array<{ table: string; label: s
     { table: 'ct_bookings', column: 'sections', type: 'text', label: 'Section(s)' },
     { table: 'ct_bookings', column: 'tables_csv', type: 'text', label: 'Table(s)' },
     { table: 'ct_bookings', column: 'is_duplicate', type: 'boolean', label: 'Duplicate', filter: 'duplicates', note: 'Never counted in any aggregate.' },
+    // DERIVED, NOT STORED — and the panel says so, because "where does that
+    // number come from" is the question this panel exists to answer and
+    // ct_bookings has no visit-count column to point at. reservego_visit_count
+    // IS a stored column, but it is Reservego's own figure for its own
+    // definition; these two are computed here from status.
+    {
+      table: 'ct_bookings', column: 'status → visit count (derived)', type: 'number',
+      label: 'Repeat customer / visit count', filter: 'repeat',
+      note: `A visit is a booking whose status is ${VISIT_STATUSES.join(' or ')} — the guest arrived. `
+        + `A repeat customer has ${REPEAT_VISIT_THRESHOLD} or more visits over their WHOLE history, `
+        + 'counted per guest and never counting the same booking twice. '
+        + 'The date filter chooses which bookings you see; it never changes who counts as a repeat customer, '
+        + 'so a guest who came in June and again in July is a repeat customer inside a July-only filter.',
+    },
+    {
+      table: 'ct_bookings', column: 'guest_id', type: 'text', label: 'Customer identity',
+      note: 'How bookings are grouped into one customer. The importer resolves a guest by the last 10 digits '
+        + 'of the mobile number first, so one number is one customer; a customer created without a stored '
+        + '10-digit number can still split across two records, which understates repeat customers.',
+    },
     { table: 'ct_guests', column: 'name', type: 'text', label: 'Guest name' },
     { table: 'ct_guests', column: 'phone_e164', type: 'text', label: 'Guest phone' },
-    { table: 'ct_guests', column: 'phone10', type: 'text', label: 'Guest phone (10-digit)' },
+    { table: 'ct_guests', column: 'phone10', type: 'text', label: 'Guest phone (10-digit)', note: 'The identity key, and the limit on every per-person figure here. Blank means the archive cannot tell this guest apart from another, and that the importer never collapsed their re-uploaded bookings — those rows are marked Not identified and are left out of the repeat count.' },
     { table: 'ct_bands', column: 'id', type: 'text', label: 'Band', filter: 'liveBandId', note: 'What the picker sends. Resolved to the band name, then to every night that name is on the calendar.' },
     { table: 'ct_bands', column: 'name', type: 'text', label: 'Band name', filter: 'liveBandId', note: 'Matched to ct_entertainment.name case-insensitively (COLLATE NOCASE) and trimmed.' },
     { table: 'ct_entertainment', column: 'name', type: 'text', label: 'Act name', filter: 'liveBandId', note: 'The only link back to the band master — the calendar has no band id.' },
@@ -1314,6 +1911,35 @@ export interface QueryOptions {
   band_lead_in_minutes: number;
   sortable: SortKey[];
   limits: { default: number; max: number };
+  /**
+   * The three values of the repeat control, with the labels the owner asked
+   * for. Shipped as data rather than hard-coded in the page so the wire value
+   * and the words beside it can never drift apart — the page renders
+   * `label`, sends `value`, and parseReservationFilter refuses anything else.
+   */
+  repeat_modes: Array<{ value: RepeatMode; label: string; help: string }>;
+  /** What makes a visit and what makes a repeat customer, for the control's caption. */
+  repeat_definition: {
+    visit_statuses: readonly string[];
+    threshold: number;
+    /**
+     * WHAT THE ARCHIVE IDENTIFIES A GUEST BY, in the owner's words, so the
+     * sentence on screen cannot describe a rule the engine is not using. The
+     * page prints it inside the one-line approximation notice beside the cards;
+     * if this ever becomes something other than a phone number, that notice
+     * changes with it instead of going stale.
+     */
+    identity_basis: string;
+    /**
+     * WHAT RE-UPLOADS ARE GROUPED BY — the day the booking was MADE, which is
+     * the F2/F3 limit in four words. markDuplicateGroups() keys on
+     * (outlet, phone10, booking_date) and booking_date is the creation day, not
+     * the night; the repo measures the two columns disagreeing on 23,407 of
+     * 83,658 rows. Shipped for the same reason as identity_basis: the
+     * disclosure is a quote, not a guess.
+     */
+    duplicate_grouping: string;
+  };
 }
 
 /**
@@ -1355,5 +1981,31 @@ export function queryOptions(db: DB): QueryOptions {
     band_lead_in_minutes: bandLeadInMinutes(db),
     sortable: Object.keys(SORTABLE) as SortKey[],
     limits: { default: DEFAULT_LIMIT, max: MAX_LIMIT },
+    // No query behind these — they are the vocabulary, not data — but they ride
+    // the options call so the control is built from the same constants the
+    // filter validates against.
+    // Both non-default modes say "with a phone number on file" out loud. The
+    // chips used to promise a clean two-way split of every customer, which is a
+    // promise the archive cannot keep — see REPEAT_MODES.
+    repeat_modes: [
+      {
+        value: 'all', label: 'Everyone',
+        help: 'No repeat filter — every customer, including the ones with no phone number on file.',
+      },
+      {
+        value: 'repeat', label: 'Repeat only',
+        help: `Customers with a phone number on file who have arrived ${REPEAT_VISIT_THRESHOLD} or more times, ever.`,
+      },
+      {
+        value: 'first', label: 'First-timers only',
+        help: 'Customers with a phone number on file who have arrived at most once, ever — including those who have never arrived.',
+      },
+    ],
+    repeat_definition: {
+      visit_statuses: VISIT_STATUSES,
+      threshold: REPEAT_VISIT_THRESHOLD,
+      identity_basis: 'phone number',
+      duplicate_grouping: 'the day the booking was made',
+    },
   };
 }
