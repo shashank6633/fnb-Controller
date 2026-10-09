@@ -117,9 +117,11 @@ export interface ComputePayrollOpts {
    * settings change cannot split one run across two rate sets.
    *
    * Rows with state = '' always qualify; a row with a specific state qualifies
-   * only when it equals this value, and then wins over the all-India row for
-   * its kind. Omitted or '' = all-India rates only — the behaviour before this
-   * option did anything, so an unconfigured install computes identical payroll.
+   * only when it equals this value, and then wins over EVERY all-India row for
+   * its kind — including a category-scoped one (see configSpecificity: a state
+   * match outranks a category match). Omitted or '' = all-India rates only —
+   * the behaviour before this option did anything, so an unconfigured install
+   * computes identical payroll.
    *
    * ORG-level, not per employee: hr_employees has no state column. If payroll
    * ever spans states, change where the CALLER reads this from; the compute
@@ -217,13 +219,6 @@ interface StatutoryConfigRow {
 }
 
 /**
- * Pick the single best config row per kind for this employee + period.
- * Candidates were already filtered to "effective in the period, active".
- * Ranking (most specific wins, then latest): category match > category '',
- * state match > state '' (rows with a non-matching category or state were
- * excluded before ranking), then effective_from DESC, created_at DESC.
- */
-/**
  * Is this config row in scope for this employee and state? THE ONE eligibility
  * test — resolveStatutoryConfigs selects with it and the payslip trace reports
  * with it, so what was applied and what the trace claims was considered cannot
@@ -245,6 +240,53 @@ function configInScope(
   return true;
 }
 
+/**
+ * How strongly an IN-SCOPE config row claims this employee. Higher wins.
+ *
+ * Only in-scope rows are ranked — configInScope has already dropped every
+ * mismatch — so a non-empty state IS the payroll state and a non-empty category
+ * IS the employee's category. A set field here is always a MATCH, never merely
+ * "present", which is what makes a plain score sound.
+ *
+ * THE COMPLETE ORDER over the four shapes a row can have:
+ *
+ *   3  state match + category match   most specific — wins outright
+ *   2  state match + category ''      a state match on its own
+ *   1  all-India   + category match   a category match on its own
+ *   0  all-India   + category ''      the fallback every employee matches
+ *
+ * STATE OUTRANKS CATEGORY — owner's decision, 2026-10-07. This sort used to key
+ * on CATEGORY first, so a category-scoped all-India Professional Tax row of ₹99
+ * beat a Telangana row of ₹150 for a Telangana employee, and the wrong statutory
+ * rate was deducted. PT is a STATE levy: a state match is the stronger signal.
+ * Weighting state 2 against category 1 is what guarantees a state match can
+ * never be outvoted by a category match, no matter how the two combine.
+ *
+ * WITH AN EMPTY PAYROLL STATE THIS CHANGES NOTHING. configInScope admits no
+ * state-scoped row when the scope is '', so only 1 and 0 can occur, and 1 above
+ * 0 is exactly the category-first order that already shipped. Every install that
+ * has not set hr_org_state — which is every install today — computes identical
+ * payroll.
+ */
+function configSpecificity(row: StatutoryConfigRow): number {
+  return (row.state === '' ? 0 : 2) + (row.employee_category === '' ? 0 : 1);
+}
+
+/** The row's scope shape in words, for the payslip trace. */
+function configScopeShape(row: StatutoryConfigRow): string {
+  return (
+    (row.state === '' ? 'all-India' : `state '${row.state}'`) +
+    ' + ' +
+    (row.employee_category === '' ? 'any category' : `category '${row.employee_category}'`)
+  );
+}
+
+/**
+ * Pick the single best config row per kind for this employee + period.
+ * Candidates were already filtered to "effective in the period, active".
+ * Ranking: configSpecificity DESC (the four-shape order documented there —
+ * state match beats category match), then effective_from DESC, created_at DESC.
+ */
 function resolveStatutoryConfigs(
   candidates: StatutoryConfigRow[],
   employeeCategory: string,
@@ -260,12 +302,9 @@ function resolveStatutoryConfigs(
   const resolved = new Map<string, StatutoryConfigRow>();
   for (const [kind, list] of byKind) {
     list.sort((a, b) => {
-      const catA = a.employee_category === '' ? 0 : 1;
-      const catB = b.employee_category === '' ? 0 : 1;
-      if (catA !== catB) return catB - catA;
-      const stA = a.state === '' ? 0 : 1;
-      const stB = b.state === '' ? 0 : 1;
-      if (stA !== stB) return stB - stA;
+      const specA = configSpecificity(a);
+      const specB = configSpecificity(b);
+      if (specA !== specB) return specB - specA;
       if (a.effective_from !== b.effective_from) {
         return a.effective_from < b.effective_from ? 1 : -1;
       }
@@ -309,7 +348,9 @@ function resolveStatutoryConfigs(
  *     · professional_tax {slabs:[{upto, amount}]}); absent config = 0.
  *     Scoped by opts.state (the hr_org_state setting): all-India rows always
  *     qualify, a state-scoped row only when it matches, and it then outranks
- *     the all-India row for its kind. Unset = all-India rates only.
+ *     EVERY all-India row for its kind — a category-scoped one included, since
+ *     a state match ranks above a category match (configSpecificity). Unset =
+ *     all-India rates only.
  *  5. Advance recovery consumes this period's due hr_advance_installments
  *     of DISBURSED advances only (recovery presupposes the money was paid
  *     out), greedily, never below net 0 — deferred ones stay due.
@@ -598,8 +639,9 @@ export function computePayrollItem(
    *
    *      The clause is gone. SCOPE IS NOW DECIDED IN ONE PLACE — the eligibility
    *      test in resolveStatutoryConfigs, which drops a row whose state is set
-   *      and does not equal `stateScope`, and ranks a state match above an
-   *      all-India row. Two filters that had to agree are now one.
+   *      and does not equal `stateScope`, and ranks a state match above ANY
+   *      all-India row, a category-scoped one included (configSpecificity).
+   *      Two filters that had to agree are now one.
    *
    *      stateScope comes from the hr_org_state setting via the payroll route.
    *      WHEN IT IS '' THIS CHANGES NOTHING: the eligibility test excludes every
@@ -848,24 +890,75 @@ export function computePayrollItem(
       state_scope:
         (stateScope || '(none)') +
         (stateScope
-          ? ' — from the hr_org_state setting. State-scoped config rows for this state apply and outrank all-India rows; rows for any other state do not.'
+          ? ' — from the hr_org_state setting. State-scoped config rows for this state apply and outrank EVERY all-India row for their kind, a category-scoped one included; rows for any other state do not apply.'
           : ' — hr_org_state is not set, so only all-India (state = \'\') rates apply. Any state-scoped config row is listed below with in_scope: false.'),
+      // The ranking the rows below were resolved by, spelled out on the payslip
+      // so a reader can check the winner rather than trust it.
+      ranking:
+        'Per kind, the in-scope row with the highest specificity wins — ' +
+        '3 = state match + category match, 2 = state match, 1 = category match, ' +
+        '0 = all-India + any category — then the latest effective_from, then the ' +
+        'latest created_at. A STATE match outranks a CATEGORY match (owner, 2026-10-07).',
       // EVERY candidate, in scope or not, each carrying WHY. This used to report
       // an already state-filtered list, so a skipped Telangana row left no trace
       // at all and a payslip could not be told apart from one where no such
-      // config existed. in_scope is computed with configInScope — the same test
-      // that selected the applied rows — so this cannot drift from reality.
-      configs_considered: candidates.map((c) => ({
-        id: c.id, kind: c.kind, state: c.state, employee_category: c.employee_category,
-        effective_from: c.effective_from, effective_to: c.effective_to,
-        in_scope: configInScope(c, employee.employee_category, stateScope),
-        excluded_because:
-          configInScope(c, employee.employee_category, stateScope)
-            ? ''
-            : c.state !== '' && c.state !== stateScope
+      // config existed. in_scope is computed with configInScope and `selected`
+      // against the resolved map — the same test and the same winners that
+      // produced the amounts — so this cannot drift from reality.
+      //
+      // A row can now be in scope and still not applied, which used to leave
+      // excluded_because empty and the loss invisible: a ₹99 all-India row
+      // beating a ₹150 Telangana one said nothing on the payslip. An in-scope
+      // loser now names its winner, and the winner lists what it outranked.
+      configs_considered: candidates.map((c) => {
+        const inScope = configInScope(c, employee.employee_category, stateScope);
+        const winner = configs.get(c.kind);
+        const selected = inScope && !!winner && winner.id === c.id;
+        const spec = configSpecificity(c);
+        let excluded_because = '';
+        if (!inScope) {
+          excluded_because =
+            c.state !== '' && c.state !== stateScope
               ? `state '${c.state}' does not match the payroll state '${stateScope || '(not set)'}'`
-              : `employee category '${c.employee_category}' does not match '${employee.employee_category}'`,
-      })),
+              : `employee category '${c.employee_category}' does not match '${employee.employee_category}'`;
+        } else if (!selected && winner) {
+          const wSpec = configSpecificity(winner);
+          excluded_because =
+            `outranked for kind '${c.kind}' by config ${winner.id} ` +
+            `(${configScopeShape(winner)}, specificity ${wSpec}, effective_from ${winner.effective_from})` +
+            (wSpec !== spec
+              ? ` — this row is ${configScopeShape(c)}, specificity ${spec}`
+              : winner.effective_from !== c.effective_from
+                ? `, same specificity ${spec} but effective later (this row: effective_from ${c.effective_from})`
+                : `, same specificity ${spec} and the same effective_from — it was created later`);
+        }
+        return {
+          id: c.id, kind: c.kind, state: c.state, employee_category: c.employee_category,
+          effective_from: c.effective_from, effective_to: c.effective_to,
+          scope_shape: configScopeShape(c),
+          // Null when out of scope: an ineligible row was never ranked at all,
+          // and printing a number there would read as a near miss.
+          specificity: inScope ? spec : null,
+          in_scope: inScope,
+          selected,
+          outranked: selected
+            ? candidates
+                .filter(
+                  (o) =>
+                    o.kind === c.kind &&
+                    o.id !== c.id &&
+                    configInScope(o, employee.employee_category, stateScope),
+                )
+                .map((o) => ({
+                  id: o.id,
+                  scope_shape: configScopeShape(o),
+                  specificity: configSpecificity(o),
+                  effective_from: o.effective_from,
+                }))
+            : [],
+          excluded_because,
+        };
+      }),
       applied: statutoryTrace,
       total: statutoryTotal,
     },

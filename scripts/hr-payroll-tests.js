@@ -165,14 +165,16 @@ function mkEmployee(category = 'staff') {
   return id;
 }
 
-/** A statutory config row exactly as the Statutory tab would store one. */
-function mkConfig(kind, state, configJson, category = '') {
+/** A statutory config row exactly as the Statutory tab would store one.
+ *  effectiveFrom is overridable so the specificity TIE-BREAK (same shape, later
+ *  effective_from wins) can be exercised without a second insert helper. */
+function mkConfig(kind, state, configJson, category = '', effectiveFrom = '2020-01-01') {
   const id = uid();
   db.prepare(
     `INSERT INTO hr_statutory_configs
        (id, kind, state, employee_category, effective_from, effective_to, config_json, is_active)
-     VALUES (?, ?, ?, ?, '2020-01-01', '', ?, 1)`,
-  ).run(id, kind, state, category, JSON.stringify(configJson));
+     VALUES (?, ?, ?, ?, ?, '', ?, 1)`,
+  ).run(id, kind, state, category, effectiveFrom, JSON.stringify(configJson));
   return id;
 }
 
@@ -186,10 +188,11 @@ function run(empId, state) {
   if (r.skip) throw new Error('compute skipped: ' + r.reason);
   return r;
 }
-const ptOf = (r) => {
-  const line = JSON.parse(r.deductions_json).find((d) => d.label === 'Professional Tax');
+const amountOf = (r, label) => {
+  const line = JSON.parse(r.deductions_json).find((d) => d.label === label);
   return line ? line.amount : 0;
 };
+const ptOf = (r) => amountOf(r, 'Professional Tax');
 const traceOf = (r) => JSON.parse(r.detail_json);
 
 /* ════════════════════════════════════════════════════════════════════════════
@@ -368,6 +371,223 @@ test('the payroll route reads hr_org_state and passes it to the compute', () => 
   const read = routeSrc.indexOf('getHrOrgState(db)');
   expectTrue(read > -1 && compute > -1 && read < compute,
     'the setting is read BEFORE the loop, so one run uses one rate set');
+});
+
+section(8, 'SCOPE RANKING — a STATE match outranks a CATEGORY match');
+/* THE GAP THESE CLOSE. Sections 3 and 6 covered state-vs-all-India and a
+ * non-matching category, but NOTHING covered the two scopes COMPETING: a
+ * category-scoped all-India row against a state-scoped row for the same kind.
+ * Measured on 9d6d700, the shipped ranking keyed on category FIRST, so an
+ * all-India staff row of ₹99 beat a Telangana row of ₹150 for a Telangana staff
+ * employee — the wrong statutory rate, with nothing on the payslip to say the
+ * Telangana row had been outranked. Owner's decision, 2026-10-07: the state
+ * match is the stronger signal and must win.
+ *
+ * THE FOUR SHAPES a row can have, with the amount each fixture carries:
+ *   A  all-India + any category       ₹50   specificity 0
+ *   B  all-India + category 'staff'   ₹99   specificity 1
+ *   C  Telangana + any category       ₹150  specificity 2
+ *   D  Telangana + category 'staff'   ₹175  specificity 3
+ * Every amount is distinct, so the winner is readable off the deduction alone. */
+const FLAT = (amount) => ({ slabs: [{ upto: 0, amount }] });
+const mkA = () => mkConfig('professional_tax', '', FLAT(50), '');
+const mkB = () => mkConfig('professional_tax', '', FLAT(99), 'staff');
+const mkC = () => mkConfig('professional_tax', 'Telangana', FLAT(150), '');
+const mkD = () => mkConfig('professional_tax', 'Telangana', FLAT(175), 'staff');
+
+test('THE REPORTED CASE — category-scoped all-India ₹99 vs Telangana ₹150', () => {
+  const emp = mkEmployee('staff');
+  mkB();
+  mkC();
+  expect(ptOf(run(emp, 'Telangana')), 150,
+    'the Telangana row wins — a state match outranks a category match');
+});
+test('each shape alone is applied, so the fixtures are distinguishable', () => {
+  let emp = mkEmployee('staff'); mkA(); expect(ptOf(run(emp, 'Telangana')), 50, 'A alone');
+});
+test('shape B alone', () => {
+  const emp = mkEmployee('staff'); mkB(); expect(ptOf(run(emp, 'Telangana')), 99, 'B alone');
+});
+test('shape C alone', () => {
+  const emp = mkEmployee('staff'); mkC(); expect(ptOf(run(emp, 'Telangana')), 150, 'C alone');
+});
+test('shape D alone', () => {
+  const emp = mkEmployee('staff'); mkD(); expect(ptOf(run(emp, 'Telangana')), 175, 'D alone');
+});
+test('state + category is the most specific and wins outright over all three', () => {
+  const emp = mkEmployee('staff');
+  mkA(); mkB(); mkC(); mkD();
+  expect(ptOf(run(emp, 'Telangana')), 175, 'D beats C, B and A together');
+});
+test('the full order is D > C > B > A', () => {
+  const emp = mkEmployee('staff');
+  mkA(); mkB(); mkC();
+  expect(ptOf(run(emp, 'Telangana')), 150, 'C wins when D is absent (C > B > A)');
+});
+test('C > B with no all-India fallback present', () => {
+  const emp = mkEmployee('staff');
+  mkB(); mkC(); mkD();
+  expect(ptOf(run(emp, 'Telangana')), 175, 'D still wins');
+});
+test('B > A among all-India rows — the category rule itself is NOT weakened', () => {
+  const emp = mkEmployee('staff');
+  mkA(); mkB();
+  expect(ptOf(run(emp, 'Telangana')), 99, 'a category match still beats the bare fallback');
+});
+test('C > A — a state match beats the bare all-India fallback', () => {
+  const emp = mkEmployee('staff');
+  mkA(); mkC();
+  expect(ptOf(run(emp, 'Telangana')), 150, 'C wins');
+});
+
+section(9, 'THE NO-OP EDGE OF THE RANKING CHANGE');
+/* With an empty payroll state — which is PRODUCTION, it has no hr_ settings rows
+ * at all — no state-scoped row is in scope, so only shapes A and B can compete
+ * and B-over-A is the order that already shipped. This is the structural reason
+ * the change cannot move anybody's pay until the state is set. */
+test('with an empty state scope the all-India order is category-first, as before', () => {
+  const emp = mkEmployee('staff');
+  mkA(); mkB(); mkC(); mkD();
+  expect(ptOf(run(emp, '')), 99, 'B wins; the two Telangana rows are not in scope at all');
+});
+test('with a NON-matching state scope the all-India order is category-first too', () => {
+  const emp = mkEmployee('staff');
+  mkA(); mkB(); mkC(); mkD();
+  expect(ptOf(run(emp, 'Karnataka')), 99, 'B wins under Karnataka');
+});
+test('a state match the employee CATEGORY excludes does not rescue the row', () => {
+  // Telangana + 'manager' is specificity 3 but out of scope for a staff
+  // employee, so it must not be ranked at all — the fallback applies.
+  const emp = mkEmployee('staff');
+  mkA();
+  mkConfig('professional_tax', 'Telangana', FLAT(175), 'manager');
+  expect(ptOf(run(emp, 'Telangana')), 50, 'the all-India fallback applies, not the manager row');
+});
+test('an uncategorised employee matches only the category-blind rows', () => {
+  // employee_category '' is "no department"-shaped: the EMPTY STRING is a real
+  // value, and a row scoped to 'staff' must not match it.
+  const emp = mkEmployee('');
+  mkA(); mkB(); mkC(); mkD();
+  expect(ptOf(run(emp, 'Telangana')), 150, 'C wins — B and D are staff-scoped');
+});
+
+section(10, 'RANKING TIE-BREAKS SURVIVE THE CHANGE');
+test('same specificity → the later effective_from wins', () => {
+  const emp = mkEmployee('staff');
+  mkConfig('professional_tax', 'Telangana', FLAT(150), '', '2020-01-01');
+  mkConfig('professional_tax', 'Telangana', FLAT(210), '', '2026-01-01');
+  expect(ptOf(run(emp, 'Telangana')), 210, 'the 2026 Telangana row supersedes the 2020 one');
+});
+test('specificity beats a later effective_from — it is the PRIMARY key', () => {
+  const emp = mkEmployee('staff');
+  mkConfig('professional_tax', '', FLAT(99), 'staff', '2026-01-01');   // newer, less specific
+  mkConfig('professional_tax', 'Telangana', FLAT(150), '', '2020-01-01');
+  expect(ptOf(run(emp, 'Telangana')), 150,
+    'the older Telangana row still wins — scope outranks recency');
+});
+
+section(11, 'THE RANKING IS KIND-AGNOSTIC — every statutory kind resolves the same way');
+test('PF ranks by the same rule (a state row beats a category-scoped all-India row)', () => {
+  const emp = mkEmployee('staff');
+  mkConfig('pf', '', { percent_of_basic: 10, wage_cap: 0 }, 'staff');
+  mkConfig('pf', 'Telangana', { percent_of_basic: 12, wage_cap: 0 }, '');
+  expect(amountOf(run(emp, 'Telangana'), 'PF'), 2400, 'PF = 12% of 20,000 — the Telangana row');
+  expect(amountOf(run(emp, ''), 'PF'), 2000, 'and 10% with no state set — the all-India row, as before');
+});
+test('ESI ranks by the same rule', () => {
+  const emp = mkEmployee('staff');
+  mkConfig('esi', '', { percent_of_gross: 0.5, gross_cap: 0 }, 'staff');
+  mkConfig('esi', 'Telangana', { percent_of_gross: 0.75, gross_cap: 0 }, '');
+  expect(amountOf(run(emp, 'Telangana'), 'ESI'), 150, 'ESI = 0.75% of 20,000 — the Telangana row');
+  expect(amountOf(run(emp, ''), 'ESI'), 100, 'and 0.5% with no state set — unchanged');
+});
+test('PF and ESI do NOT move when only Professional Tax scopes compete', () => {
+  // The blast radius guard: resolveStatutoryConfigs serves every kind, so the
+  // reported PT case must not disturb PF or ESI for the same employee.
+  const emp = mkEmployee('staff');
+  mkConfig('pf', '', { percent_of_basic: 12, wage_cap: 15000 });
+  mkConfig('esi', '', { percent_of_gross: 0.75, gross_cap: 21000 });
+  mkB(); mkC();
+  const tg = run(emp, 'Telangana');
+  const none = run(emp, '');
+  expect(amountOf(tg, 'PF'), 1800, 'PF = 12% of the 15,000 cap');
+  expect(amountOf(tg, 'PF'), amountOf(none, 'PF'), 'PF identical whichever PT row wins');
+  expect(amountOf(tg, 'ESI'), amountOf(none, 'ESI'), 'ESI identical whichever PT row wins');
+  expect(ptOf(tg), 150, 'only PT moved — to the Telangana rate');
+  expect(ptOf(none), 99, 'and it is still the all-India rate with no state set');
+});
+
+section(12, 'TRACE — the payslip must name the winner and what it outranked');
+test('the winner is marked selected with its specificity', () => {
+  const emp = mkEmployee('staff');
+  const bId = mkB();
+  const cId = mkC();
+  const t = traceOf(run(emp, 'Telangana'));
+  const considered = t.statutory.configs_considered;
+  const c = considered.find((x) => x.id === cId);
+  const b = considered.find((x) => x.id === bId);
+  expectTrue(c && c.selected === true, 'the Telangana row is selected: true');
+  expect(c && c.specificity, 2, "its specificity is 2 (state match, category '')");
+  expectTrue(b && b.selected === false, 'the all-India staff row is selected: false');
+  expect(b && b.specificity, 1, 'its specificity is 1 (category match only)');
+});
+test('the winner LISTS what it outranked', () => {
+  const emp = mkEmployee('staff');
+  const bId = mkB();
+  const cId = mkC();
+  const t = traceOf(run(emp, 'Telangana'));
+  const c = t.statutory.configs_considered.find((x) => x.id === cId);
+  expectTrue(c && Array.isArray(c.outranked) && c.outranked.length === 1,
+    'outranked has exactly one entry', c && JSON.stringify(c.outranked));
+  expectTrue(c && c.outranked[0] && c.outranked[0].id === bId,
+    'and it is the ₹99 all-India staff row');
+  expectTrue(c && /category 'staff'/.test(c.outranked[0].scope_shape),
+    'named by its scope shape', c && c.outranked[0] && c.outranked[0].scope_shape);
+});
+test('the LOSER says who outranked it — it used to say nothing at all', () => {
+  const emp = mkEmployee('staff');
+  const bId = mkB();
+  const cId = mkC();
+  const t = traceOf(run(emp, 'Telangana'));
+  const b = t.statutory.configs_considered.find((x) => x.id === bId);
+  expectTrue(b && b.in_scope === true, 'the losing row is still IN SCOPE (it was eligible)');
+  expectTrue(b && b.excluded_because.includes(cId),
+    'excluded_because names the winning config id', b && b.excluded_because);
+  expectTrue(b && /outranked for kind 'professional_tax'/.test(b.excluded_because),
+    'and says it was outranked, for which kind', b && b.excluded_because);
+  expectTrue(b && /specificity 2/.test(b.excluded_because),
+    "and quotes the winner's specificity", b && b.excluded_because);
+});
+test('a tie-break loss is explained as a tie-break, not as a scope loss', () => {
+  const emp = mkEmployee('staff');
+  const older = mkConfig('professional_tax', 'Telangana', FLAT(150), '', '2020-01-01');
+  mkConfig('professional_tax', 'Telangana', FLAT(210), '', '2026-01-01');
+  const t = traceOf(run(emp, 'Telangana'));
+  const o = t.statutory.configs_considered.find((x) => x.id === older);
+  expectTrue(o && /same specificity 2/.test(o.excluded_because),
+    'the reason says the specificity was equal', o && o.excluded_because);
+});
+test('the ranking rule itself is written on the payslip', () => {
+  const emp = mkEmployee('staff');
+  mkC();
+  const t = traceOf(run(emp, 'Telangana'));
+  expectTrue(/state match outranks a CATEGORY match/i.test(String(t.statutory.ranking)),
+    'statutory.ranking states that state outranks category', String(t.statutory.ranking));
+  expectTrue(/outrank EVERY all-India row/.test(String(t.statutory.state_scope)),
+    'and state_scope no longer promises only "the" all-India row',
+    String(t.statutory.state_scope));
+});
+test('configs_considered still carries id — statutoryDriftSinceCompute reads it', () => {
+  // The drift check compares statutory.configs_considered[].id against the live
+  // candidate set. Dropping or renaming that field would silently disable the
+  // finalize-time warning, which no other test would notice.
+  const emp = mkEmployee('staff');
+  const cId = mkC();
+  const t = traceOf(run(emp, 'Telangana'));
+  expectTrue(t.statutory.configs_considered.some((x) => x.id === cId),
+    'every considered row still reports its id');
+  expectTrue(typeof t.statutory.state_scope_value === 'string',
+    'and state_scope_value is still a raw string');
 });
 
 /* ── summary ───────────────────────────────────────────────────────────────── */
