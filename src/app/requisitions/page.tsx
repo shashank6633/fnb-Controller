@@ -37,6 +37,38 @@ interface Material {
   category?: string;
 }
 interface Department { id: string; name: string; code?: string; }
+/**
+ * One row of a refusal's `blocked[]` array — the envelope both issue routes use
+ * (the same one the department-reversal block already used, which is why the
+ * existing `code` / `blocked` handling applies unchanged).
+ *
+ * ⚠ TWO BASES ON ONE OBJECT, and they must never be swapped:
+ *   · `requested` / `available` are in the PURCHASE unit (`purchase_unit`) —
+ *     what the message prints and what any banner must show (owner rule: store
+ *     surfaces lead with the purchase unit).
+ *   · `max_issue_qty` is in the LINE's own unit (`line_unit`), because it is
+ *     the value the ISSUE BOX takes.
+ * They coincide on every live pack line; that is luck, not a licence.
+ *
+ * `message` is a finished sentence written for a storekeeper — print it
+ * verbatim, do not re-word it, and do not rebuild it from the numbers.
+ */
+interface ServerBlock {
+  code?: string;
+  material?: string;
+  material_id?: string;
+  req_item_id?: string;
+  /** PURCHASE unit. */
+  requested?: number;
+  /** PURCHASE unit. 0 on 508 of the 564 refusable live lines — a reader must
+   *  make sense at zero and never print "issue up to 0". */
+  available?: number;
+  purchase_unit?: string;
+  /** LINE unit — the Issue box's own basis. */
+  max_issue_qty?: number;
+  line_unit?: string;
+  message?: string;
+}
 interface ReqItem {
   id: string; req_id: string; material_id: string;
   material_name: string; material_sku?: string; material_unit: string;
@@ -121,6 +153,26 @@ function reqPackFactor(it: ReqItem): number {
   const pu = String(it.material_purchase_unit || '').toLowerCase().trim();
   const ru = String(it.material_unit || '').toLowerCase().trim();
   return (lu && pu && lu === pu && lu !== ru && pack > 1) ? pack : 1;
+}
+
+/**
+ * Is the central book balance actually ON this payload?
+ *
+ * THE DIFFERENCE BETWEEN "ZERO" AND "NOT TOLD" IS THE WHOLE POINT. The store
+ * grid caps the Issue box against current_stock now, because the server refuses
+ * a debit that would take it below zero. `Number(undefined) || 0` is 0, so a
+ * payload that simply does not carry the field would cap every line on the
+ * sheet to nothing and announce that the store holds none of anything.
+ *
+ * The detail SELECT does project it bare (`rm.current_stock`, no COALESCE —
+ * api/requisitions/route.ts) and the column holds 0 NULLs across all 952 live
+ * materials, so on today's data this returns true for every line. It is the
+ * compatibility floor for an older/partial payload, and the one thing that can
+ * leave the client-side cap UNARMED — which the modal then says in an amber
+ * panel rather than pretending the grid is capped.
+ */
+function stockIsKnown(it: { current_stock?: number | null }): boolean {
+  return it.current_stock != null && Number.isFinite(Number(it.current_stock));
 }
 
 /**
@@ -2131,6 +2183,12 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
   //      what the dept originally asked for.
   const visibleItems = (req.items || []).filter(it => !it.is_rejected);
   const rejectedCount = (req.items || []).length - visibleItems.length;
+  /** A party requisition's goods move on the party rail, so the central-stock
+   *  floor the server added does not apply to ANY of its lines (applyIssueDelta
+   *  carves purpose === 'party' out before the debit). Resolved once, from the
+   *  same field the party banner below keys on, and read by the seed and by
+   *  every cap/warning — so the screen cannot cap one and exempt the other. */
+  const isPartyReq = String(req.purpose || '') === 'party';
   const [lines, setLines] = useState(() =>
     visibleItems.map(it => {
       // effective demand is in the REQUESTED unit (ri.unit — may be the purchase
@@ -2140,36 +2198,67 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
         : it.quantity_requested;
       // requested-unit → recipe-unit factor (1 BTL = pack_size recipe units).
       const reqFactor = reqPackFactor(it);
-      // THE BOOK BALANCE IS A CAP ONLY WHILE IT IS STILL A BALANCE.
+      // THE BOOK BALANCE IS THE CAP AGAIN — BECAUSE THE SERVER MAKES IT ONE.
       //
-      // current_stock is the STORE's book figure. Once it reaches 0 or goes
-      // below, it has stopped describing the shelf and is only describing the
-      // arithmetic: issues have outrun recorded purchases. That is the normal
-      // state after the deduct-at-issue cutover — every requisition now debits
-      // central, so a material carrying months of un-reconciled history reads
-      // deeply negative while the sacks are physically stacked in the store.
+      // current_stock is the STORE's book figure, in RECIPE units. This seed
+      // used to relax to the FULL APPROVED DEMAND the moment that figure hit 0
+      // or below, on the reasoning that the books had stopped describing the
+      // shelf. That reasoning is now moot: src/lib/issue-stock.ts
+      // (assertCentralIssue) REFUSES a debit that would take current_stock
+      // below zero, and both issue routes refuse the whole gesture before their
+      // transaction even opens. So the old relaxation pre-filled a number the
+      // server answers with a 400 — measured over the 16,353 live lines this
+      // grid can render, the old seed is refusable on 862 of them.
       //
-      // The old code clamped to Math.max(0, stock), which made the cap 0 and
-      // therefore the DEFAULT ISSUE 0 — the storekeeper handing over 5 kg saw a
-      // blank, disabled box, and the whole 5 kg fell through to `shortfall` and
-      // out to the PO block below as real vendor spend for goods already on the
-      // premises. Measured on this db: 308 of 737 issued materials sit at
-      // current_stock <= 0 today, and that count only grows.
+      // The old comment's real warning still stands and is NOT being undone: a
+      // cap of 0 must not turn into vendor spend for goods already on the
+      // premises. Two things keep that from happening now and neither existed
+      // when it was written — the Buy box is re-derived live (autoBuyQty) rather
+      // than frozen from this seed, and it only becomes a VALUE once a vendor is
+      // picked (buyStr); until then the shortfall is a grey placeholder that
+      // orders nothing. What is left is a blank Issue box next to a banner that
+      // says what the store's books hold and that the way out is a received
+      // delivery or a recorded closing count — not a PO.
       //
-      // So: cap against the books only when the books are still positive; when
-      // they are not, seed the full approved demand and let the storekeeper type
-      // what he physically hands over. The true figure (negative and all) is
-      // printed in red on the row — we show the deficit, we do not act on it.
-      // DO NOT "tidy" this back into a Math.max(0, …): that is the same clamp
-      // wearing a different hat, and it manufactures a PO for stock we own.
+      // WHAT THE SERVER WILL NOT REFUSE, so this seed must not either:
+      //   · A PARTY requisition. applyIssueDelta carves it out (the goods move
+      //     on the party rail), so checkCentralIssue reports debits:false and
+      //     the central balance never gates it. `req.purpose` is on the payload,
+      //     so this one the screen KNOWS — keep the full demand, exactly as
+      //     today. 1 live line is in this state.
+      //   · A LIQUOR / store-mapped line, carved out the same way. The screen
+      //     CANNOT know which those are — the category→store map lives in
+      //     store_category_map and this page has no endpoint for it, and
+      //     guessing would be a second copy of a server rule (see the note
+      //     above the paragraph further down). 156 live lines sit at a central
+      //     balance of 0 and would be issued happily by the server. They are
+      //     why nothing below LOCKS or BLOCKS: the box stays typeable, the
+      //     submit button stays live, and the banner names the exception. A cap
+      //     the screen cannot be sure of is a suggestion, never a gate.
+      //   · A line that ALREADY carries an issue. The server's own ceiling is
+      //     max(before, before + available) — a credit is not its business — so
+      //     a seed below `alreadyIssued` would silently hand stock BACK on a
+      //     desk that writes quantity_issued absolutely. 0 live lines in the two
+      //     statuses this modal opens on are in that state (and 0 ever have
+      //     been), so this is the compatibility floor, not a live case.
+      //
       // Stock is in RECIPE units — convert to requested units before comparing
       // (floor when packs: you can't hand over 0.4 of a bottle against a BTL ask).
+      // That floor is kept verbatim: it only ever seeds LESS than the server
+      // allows, and the server's own 6-dp ceiling is what the validation below
+      // compares against, so the screen never claims a refusal the server
+      // would not make.
+      const stockKnown = stockIsKnown(it);
       const bookStock = Number(it.current_stock) || 0;
       const stockInReqUnits = reqFactor > 1 ? Math.floor(bookStock / reqFactor) : bookStock;
-      // bookStock > 0, NOT stockInReqUnits > 0 — a positive book balance smaller
-      // than one pack (300 ml against a 750 ml BTL ask) must keep floor()'s 0 and
-      // behave exactly as it did before this change. Only <= 0 relaxes.
-      const issuable  = bookStock > 0 ? Math.min(effective, stockInReqUnits) : effective;
+      const alreadyIssued = Math.max(0, Number(it.quantity_issued) || 0);
+      // Unknown balance (an older payload that does not project current_stock)
+      // is NOT zero: treating it as zero would seed a blank box on every line in
+      // the grid and tell the storekeeper the store holds nothing. It leaves the
+      // check UNARMED, which the amber panel below says out loud.
+      const issuable = (isPartyReq || !stockKnown)
+        ? effective
+        : Math.max(alreadyIssued, Math.min(effective, alreadyIssued + Math.max(0, stockInReqUnits)));
       // (There used to be a `const shortfall = effective - issuable` here, frozen
       //  into the Buy box below. See the note above buyInPurchaseUnit.)
       // Purchase-unit metadata so the PO math can switch between recipe-unit
@@ -2250,6 +2339,15 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
          *  the SAME arithmetic, not an equivalent one. */
         req_factor: reqFactor,
         current_stock: it.current_stock,     // keep raw value for the warning render
+        /** Was current_stock on the payload at all? Separates "the books say 0"
+         *  (cap to 0) from "we were not told" (do not cap, say so). */
+        stock_known: stockKnown,
+        /** quantity_issued as it stood when the modal opened — the server's
+         *  `beforeLineQty`. The central ceiling is max(before, before +
+         *  available), never below it, so this keeps a cap from reversing an
+         *  issue that already happened. 0 on every live line this modal can
+         *  open on. */
+        already_issued: alreadyIssued,
         requested: effective,                // chef-approved demand, not raw request
         /** STORED-basis seed. Posted VERBATIM while the box still reads its own
          *  seeded purchase figure — fromPU(toPU(q)) is not the identity, so a
@@ -2280,9 +2378,16 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
       };
     })
   );
-  // Lines whose central BOOK balance is negative — surfaced in a red banner so
-  // the store user knows the figure beside them is un-reconciled and needs a
-  // physical recount. Reporting only: it no longer gates what can be issued.
+  // Lines whose central BOOK balance is BELOW zero — a data-quality fact, kept
+  // separate from "the store cannot cover this line" because the remedy is
+  // different: a negative book means issues have outrun recorded purchases and
+  // a physical count has to re-base central.
+  //
+  // IT IS NO LONGER "REPORTING ONLY". That sentence used to end this comment
+  // and it is now false: the server refuses a debit that would take
+  // current_stock below zero, so the book balance gates every ordinary line.
+  // What the banner below must therefore do is say what the store CAN give and
+  // why the rest cannot be issued — not merely flag the deficit.
   const negativeStockLines = lines.filter(ln => Number(ln.current_stock) < 0);
   const [note, setNote] = useState('');
   const [busy, setBusy] = useState(false);
@@ -2297,6 +2402,11 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
      `code` plus the req_item_id(s) it is about. */
   const [errorText, setErrorText] = useState('');
   const [errorRows, setErrorRows] = useState<Set<string>>(new Set());
+  /* The server's per-line refusal rows from a `blocked[]` answer, keyed by
+     req_item_id. Rendered against the named line instead of an alert(), and
+     read by the cap below — a refusal carries max_issue_qty, which is a FRESHER
+     reading of the balance than the snapshot this modal opened with. */
+  const [blockedRows, setBlockedRows] = useState<Record<string, ServerBlock>>({});
   const [poDate, setPoDate] = useState(new Date().toISOString().slice(0, 10));
   // Deliberately BLANK, unlike poDate. Defaulting this to today would put an
   // invented delivery promise on the vendor PO that nobody agreed to, and the
@@ -2376,6 +2486,15 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
     // Any edit invalidates the last refusal: the sentence named a row and a
     // value that no longer describe the form, and a stale red banner over a
     // corrected grid is how a storekeeper stops reading red banners.
+    //
+    // `blockedRows` DELIBERATELY SURVIVES. The banner is about a QUANTITY that
+    // has just been corrected; those rows carry a BALANCE, which has not
+    // changed and is a fresher reading than the snapshot this modal opened
+    // with (it is why a refusal from the write-lock race leaves the grid more
+    // accurate, not less). The server's own sentence is only rendered while the
+    // box still exceeds that balance, so it clears itself the moment the number
+    // is right — and the ceiling stays correct meanwhile. Dropping it would
+    // walk the cap back to the stale figure and invite the same refusal twice.
     if (errorText) { setErrorText(''); setErrorRows(new Set()); }
     setLines(p => p.map((ln, j) => j === i ? { ...ln, ...patch } : ln));
   };
@@ -2399,6 +2518,94 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
   /** What is still short on this line, in the line's STORED unit — the exact
    *  subtraction the Shortfall column prints (`requested − Issue Now`). */
   const shortOf = (ln: Line) => Math.max(0, ln.requested - issuedOf(ln));
+
+  /* ──────────────────────────────────────────────────────────────────────────
+   * THE CENTRAL CAP — THE SCREEN'S COPY OF THE SERVER'S FLOOR.
+   *
+   * The server refuses an issue that would take raw_materials.current_stock
+   * below zero (src/lib/issue-stock.ts checkCentralIssue / assertCentralIssue;
+   * both desks also refuse the whole gesture before their transaction opens).
+   * This is the SAME ARITHMETIC asked on the client so the storekeeper is told
+   * before the round trip instead of after — a courtesy, NOT a guard. The
+   * server is the authority; everything here is advisory and nothing here
+   * blocks a submit.
+   *
+   * IT IS DELIBERATELY NOT A GATE, and the reason is measured: 156 live lines
+   * are liquor / store-mapped materials sitting at a central balance of 0 that
+   * the server issues happily (applyIssueDelta carves them out — their stock
+   * moves on the Liquor Store ledger), and this page cannot tell which lines
+   * those are. Blocking on the client would stop 156 real hand-overs to protect
+   * a rule the server already enforces for itself. So: warn, never lock.
+   *
+   * THE SAME CEILING EXPRESSION THE SERVER USES, so the two cannot disagree:
+   *   max(before, before + available)      where available = max(0, stock)
+   * `max(0, …)` on the balance is what makes an ALREADY-negative book read as
+   * "nothing issuable" instead of as a negative allowance that digs deeper, and
+   * the `before` floor is why a cap can never reverse an issue that happened.
+   *
+   * UNITS, which is where a clamp like this kills people: current_stock is a
+   * MATERIAL-level RECIPE figure. `req_factor` converts the LINE's unit to
+   * recipe units (the same factor the server's lineFactor returns for this
+   * row), so the ceiling comes back in the LINE's own unit — what the Issue box
+   * holds. Printing it needs the PURCHASE unit (owner rule), which is
+   * U.stockPU() for a material figure and U.toPU() for a line figure; the two
+   * agree on this number by construction, and the pack-floored SEED above is
+   * the only place a whole-pack floor is applied.
+   * ────────────────────────────────────────────────────────────────────────── */
+  const EPSQ = 1e-9;
+  const centralCapOf = (ln: Line) => {
+    const srv = blockedRows[ln.id];
+    // ARMED only when the screen genuinely knows the balance. A party
+    // requisition is EXEMPT by the server's own rule, so there is nothing to
+    // cap; an unknown balance leaves the cap off rather than guessing 0.
+    const exempt = isPartyReq;
+    const armed = !exempt && (ln.stock_known || !!srv);
+    const availRecipe = Math.max(0, Number(ln.current_stock) || 0);
+    const factor = ln.req_factor || 1;
+    // 6 dp, floored — a ceiling must never round itself UP past the balance it
+    // is capping. Same floor the server applies to max_issue_qty.
+    const floor6 = (n: number) => Math.floor((Number(n) || 0) * 1e6) / 1e6;
+    const capFromBooks = Math.max(
+      ln.already_issued,
+      floor6(ln.already_issued + availRecipe / factor),
+    );
+    // THE SERVER'S OWN NUMBER WINS once it has spoken about this line. It is
+    // the only fresh reading available — `current_stock` here is a snapshot
+    // taken when the modal opened, and max_issue_qty arrives in the LINE's unit
+    // (`line_unit`), which is exactly the basis the Issue box holds. Do NOT
+    // reach for `available`/`requested` on that row for this: those are in the
+    // PURCHASE unit and mixing the two is the 1000x error.
+    const maxLine = srv && Number.isFinite(Number(srv.max_issue_qty))
+      ? Math.max(0, Number(srv.max_issue_qty))
+      : capFromBooks;
+    return {
+      armed, exempt,
+      /** Recipe units the books say are issuable (never negative). */
+      availRecipe,
+      /** Ceiling in the LINE's own unit — what the Issue box may hold. */
+      maxLine,
+      /** Books hold less than this line asks for. */
+      capped: armed && maxLine < ln.requested - EPSQ,
+      /** Books hold nothing at all. */
+      empty: armed && maxLine <= EPSQ,
+      /** The server has already refused this line, in its own words. */
+      serverMessage: srv ? String(srv.message || '') : '',
+      /** Printable PURCHASE-unit figures (owner rule). The server's own
+       *  `available` is preferred when present — it is the fresher reading and
+       *  it is ALREADY in the purchase unit, so it is not converted again. */
+      availPU: srv && Number.isFinite(Number(srv.available))
+        ? Number(srv.available)
+        : ln.U.stockPU(availRecipe),
+      purchaseUnit: (srv && String(srv.purchase_unit || '').trim()) || ln.U.pu,
+    };
+  };
+  /** Is the quantity currently in the box one the server will refuse? Live, on
+   *  the stored basis, against the same ceiling. Silent whenever the cap is not
+   *  armed — an unsure screen says nothing rather than crying wolf. */
+  const overCapOf = (ln: Line) => {
+    const c = centralCapOf(ln);
+    return c.armed && issuedOf(ln) > c.maxLine + EPSQ;
+  };
   /**
    * The Buy qty a line offers while nobody has overridden it: the LIVE shortfall,
    * expressed in whatever unit the Buy box is currently entering in.
@@ -2514,6 +2721,18 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
     }
     return null;
   };
+
+  /* Lines the central store's books cannot cover in full — the set the red
+     banner is about. Derived through centralCapOf, so the banner, the row and
+     the box can never quote three different ceilings. */
+  const cappedLines = lines.filter(ln => centralCapOf(ln).capped);
+  /** Lines currently holding a quantity the server will refuse. */
+  const overCapLines = lines.filter(ln => overCapOf(ln));
+  /** The cap could not arm itself on these lines: the payload did not carry a
+   *  balance for them. NOT a quiet fallback — the amber panel says so, because
+   *  a cap that disarms in silence is how the previous attempt at this ended up
+   *  claiming a protection it did not have. 0 live lines are in this state. */
+  const unarmedLines = isPartyReq ? [] : lines.filter(ln => !ln.stock_known && !blockedRows[ln.id]);
 
   // A cross-line SUM of shortfalls mixes units (kg + BTL + pcs) and is
   // meaningless as a number — count the lines that are short instead.
@@ -2637,7 +2856,32 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
       const ids: string[] = Array.isArray(j?.req_item_ids)
         ? j.req_item_ids.map(String)
         : (j?.req_item_id ? [String(j.req_item_id)] : []);
-      setErrorRows(new Set(ids));
+      // ── THE CENTRAL STORE REFUSED (the over-issue clamp) ──────────────────
+      // Two spellings, ONE case: 'central_stock_short' comes from the
+      // pre-flight (nothing was written) and 'CENTRAL_STOCK_SHORT' from the
+      // catch (the balance moved between the pre-flight and the write lock, and
+      // the whole transaction was rolled back). Same payload, same meaning —
+      // and in both cases the requisition is unchanged, so the form below is
+      // still exactly what was typed and one corrected number replays it.
+      //
+      // Each row is kept against its req_item_id so the server's own sentence
+      // prints next to the line it is about, and so the cap above can use
+      // max_issue_qty — a FRESHER reading of the balance than the snapshot this
+      // modal opened with. Only rows the server tagged as a stock shortage are
+      // taken: a future refusal with a different `blocked` shape must not end
+      // up feeding a stock ceiling.
+      const blocked: ServerBlock[] = Array.isArray(j?.blocked) ? j.blocked : [];
+      const byItem: Record<string, ServerBlock> = {};
+      for (const b of blocked) {
+        const rid = String(b?.req_item_id || '');
+        if (!rid) continue;
+        if (String(b?.code || '').toLowerCase() !== 'central_stock_short') continue;
+        byItem[rid] = b;
+      }
+      setBlockedRows(byItem);
+      // The rows the server named, from either field — `blocked[]` carries them
+      // even if req_item_ids is ever absent.
+      setErrorRows(new Set(ids.length > 0 ? ids : Object.keys(byItem)));
       setErrorText(String(j?.error || 'Failed'));
       setBusy(false);
       return;
@@ -2854,10 +3098,17 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                   banner below says so only when this really is one.
               The third case (an unresolvable line unit) is REPORTED by the server
               and printed on the result panel, so it is not claimed here. */}
+          {/* AND THE DEBIT NOW HAS A FLOOR. The server refuses an issue that
+              would take raw_materials.current_stock below zero — on both issue
+              desks and on a direct API call — so "In Stock" below is a LIMIT,
+              not just a reading. Said here because it is the one fact that
+              changed about the button this storekeeper is about to press. */}
           <p className="text-[10px] text-[#8B7355] italic">
             Issuing <b>debits the central store</b> and credits the department — stock moves once, here, when you submit.
+            The store <b>cannot be taken below zero</b>: an issue above the balance in <b>In Stock</b> is refused and
+            nothing is saved, so get the stock received or a closing count recorded first.
             Liquor-store items (bar / wine / spirits) are the exception: the hand-over is recorded, but the stock itself
-            moves on the Liquor Store ledger, not on this one.
+            moves on the Liquor Store ledger, not on this one — so the central figure does not limit them.
             A negative figure below means issues have outrun recorded purchases on that material, not that the shelf is empty.
           </p>
           {/* Only on a real party requisition, so the normal case is not made
@@ -2906,28 +3157,83 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
             </div>
           )}
 
-          {/* Negative book balance. The store's BOOK figure is below 0: issues
-              have outrun recorded purchases on these materials. That is an
-              accounting deficit, not a statement about the shelf, and it is the
-              expected state after the deduct-at-issue cutover until a physical
-              recount re-bases central.
+          {/* ── WHAT THE CENTRAL STORE CAN ACTUALLY GIVE ─────────────────────
+              THE SERVER NOW REFUSES AN OVER-ISSUE, so this banner has a job it
+              did not have before. It used to describe a negative book balance
+              and then say, in its own words, that it was "reporting only: it no
+              longer gates what can be issued" — and the rows backed that up by
+              seeding the FULL approved demand against a red 0. That sentence is
+              now false in both halves: raw_materials.current_stock is the
+              ceiling, and the hand-over is refused above it with a 400.
 
-              This banner used to say "Issuing 0 here" and the rows enforced it.
-              It no longer does either: the storekeeper issues what he is
-              physically handing over, and the deficit is reported, not acted on.
-              Do not restore the block — it converted a bookkeeping gap into a
-              vendor PO for goods already sitting in the store. */}
-          {negativeStockLines.length > 0 && (
+              So the banner says the two things a storekeeper needs before he
+              types: HOW MUCH is issuable per line, in the PURCHASE unit (owner
+              rule), and WHY the rest cannot go — with the way out, which is a
+              received delivery or a recorded closing count, NOT a vendor PO for
+              goods that may well be on the premises.
+
+              THE ONE CLAIM IT MUST NOT MAKE is that this screen is the guard.
+              It is not, and it cannot be: a liquor / store-mapped line is
+              exempt on the server (its stock moves on the Liquor Store ledger)
+              and this page has no way to identify one — 156 live lines sit at a
+              central balance of 0 and issue perfectly well. Hence "the central
+              store's books", the named exception, and a box that stays
+              typeable. */}
+          {cappedLines.length > 0 && (
+            <div className="text-[11px] px-3 py-2 bg-red-50 border-2 border-red-300 rounded text-red-900 space-y-1">
+              <div className="font-semibold">
+                🚨 The central store&apos;s books cannot cover {cappedLines.length} line{cappedLines.length === 1 ? '' : 's'} — an issue above the balance is <b>refused</b>.
+              </div>
+              <ul className="ml-5 list-disc">
+                {cappedLines.map(ln => {
+                  const c = centralCapOf(ln);
+                  return (
+                    <li key={ln.id}>
+                      <b>{ln.material_name}</b> —{' '}
+                      {/* NEVER "issue up to 0": on 508 of the 564 refusable
+                          live lines the balance is zero and there is no smaller
+                          number to offer, so the empty case gets its own
+                          sentence. Same split the server's own message makes. */}
+                      {c.empty
+                        ? <>the books hold <b>none of it</b>, so nothing can be issued on this line.</>
+                        : <>the books hold <b>{fmtNum(c.availPU)} {c.purchaseUnit}</b> of the {fmtNum(ln.U.toPU(ln.requested))} {ln.U.pu} asked — issue up to that, not more.</>}
+                      {/* The exact stored figure stays visible, negative and
+                          all: current_stock is a MATERIAL-level RECIPE figure,
+                          so stockPU / the raw value, never the line-basis toPU. */}
+                      {ln.U.pf > 1 && (
+                        <span className="text-[10px] text-red-800"> (books: {fmtNum(ln.current_stock)} {ln.U.recipeUnit})</span>
+                      )}
+                    </li>
+                  );
+                })}
+              </ul>
+              <div className="text-[10px]">
+                To issue the rest, get the stock <b>received</b> or a <b>closing count recorded</b> first — that is what
+                re-bases the balance the store is measured against. A{' '}
+                <a href="/purchase-orders" className="underline">vendor PO</a> is only the answer if the material is
+                genuinely finished.
+                {negativeStockLines.length > 0 && (
+                  <> {negativeStockLines.length} of these read <b>below zero</b>: issues have outrun recorded purchases
+                    there, so a physical count is the fix, not a purchase.</>
+                )}
+                {' '}Liquor-store items (bar / wine / spirits) are the exception — their stock moves on the Liquor Store
+                ledger, so this central figure does not gate them and the boxes below stay open.
+              </div>
+            </div>
+          )}
+
+          {/* Books below zero on a line the banner above did not already list
+              (it asks for less than 0 — i.e. nothing, so it is not "capped").
+              Kept because the deficit still needs a recount; it is a data
+              problem, not a refusal. */}
+          {cappedLines.length === 0 && negativeStockLines.length > 0 && (
             <div className="text-[11px] px-3 py-2 bg-red-50 border-2 border-red-300 rounded text-red-900 space-y-1">
               <div className="font-semibold">
                 🚨 {negativeStockLines.length} line{negativeStockLines.length === 1 ? '' : 's'} show a <b>negative store book balance</b> — recount pending.
               </div>
               <div className="text-[10px]">
-                Issue what you are actually handing over. The figures below are the
-                store&apos;s books, not a count of the shelf — get a physical count
-                recorded so central can be re-based, and raise a PO on{' '}
-                <a href="/purchase-orders" className="underline">Purchase Orders</a> only
-                if the material is genuinely finished.
+                Issues have outrun recorded purchases on these materials. Get a physical count recorded so central can be
+                re-based — the store&apos;s balance is what an issue is now measured against.
               </div>
               <ul className="ml-5 list-disc">
                 {negativeStockLines.map(ln => (
@@ -2941,6 +3247,25 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                   </li>
                 ))}
               </ul>
+            </div>
+          )}
+
+          {/* THE CHECK COULD NOT ARM ITSELF. The previous attempt at this
+              shipped a client cap that fell silently open when its lookup
+              failed, and a verifier's whole point was that a guard which
+              disarms in silence is worse than none. This screen's cap needs
+              current_stock on the payload; if it is not there, the ceiling is
+              unknown and the grid says so instead of pretending. The SERVER
+              still refuses the over-issue either way — that is the protection,
+              and this panel must not suggest otherwise. 0 live lines are in
+              this state (current_stock is NOT NULL on all 952 materials). */}
+          {unarmedLines.length > 0 && (
+            <div className="text-[11px] px-3 py-2 bg-amber-50 border border-amber-300 rounded text-amber-900">
+              ⚠ <b>This screen cannot check {unarmedLines.length === lines.length ? 'these lines' : `${unarmedLines.length} line${unarmedLines.length === 1 ? '' : 's'}`} against the store balance</b> — the
+              central figure did not come through on this requisition ({unarmedLines.slice(0, 4).map(ln => ln.material_name).join(', ')}
+              {unarmedLines.length > 4 ? `, +${unarmedLines.length - 4} more` : ''}). Nothing is capped or warned about here, so
+              reload the page before issuing. The central store still refuses an issue it cannot cover and will name the
+              line if it does.
             </div>
           )}
 
@@ -2985,7 +3310,9 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                       deduct-at-issue it is the opposite: the issue IS the central
                       debit. Left stale, this label would have told the storekeeper
                       the exact inverse of what the button he is about to press does. */}
-                  <th className="text-right py-1.5 px-2 font-medium" title="Central store book balance. Issuing debits it (liquor-store items excepted — those move on the Liquor Store ledger) — a negative figure means issues have outrun recorded purchases, not that the shelf is empty.">In Stock*</th>
+                  {/* AND IT IS NOW THE CEILING, not just a reading: the server
+                      refuses an issue that would take this figure below zero. */}
+                  <th className="text-right py-1.5 px-2 font-medium" title="Central store book balance, and the LIMIT an issue is measured against — the store refuses a hand-over that would take it below zero (liquor-store items excepted; those move on the Liquor Store ledger). A negative figure means issues have outrun recorded purchases, not that the shelf is empty.">In Stock*</th>
                   <th className="text-right py-1.5 px-2 font-medium">Issue Now</th>
                   {/* Say what this subtracts. It is NOT "what the store is out
                       of" — it is Requested minus what you are handing over on
@@ -3042,13 +3369,27 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                      (min(approved, stock)), so a store that physically handed
                      over more had no way to know it could type the real figure —
                      it just submitted the seeded number. The value is allowed
-                     and recorded as-is; this only makes it visible. */
+                     and recorded as-is; this only makes it visible.
+
+                     NOTE this is over the APPROVED DEMAND, which the server has
+                     never refused and still does not. It is a different question
+                     from `overCap` below — over the central STOCK — which the
+                     server now refuses with a 400. A line can be either, both,
+                     or neither, so the two warnings are separate sentences. */
                   const overIssued = issued - ln.requested > 1e-9;
                   // Negative BOOK balance — a red flag on the row, NOT a lock on
                   // the box. It used to disable the input and force 0; that made
                   // the honest figure untypeable and pushed the line into the PO
                   // block. It now only drives colour + the "recount pending" label.
                   const negStock = Number(ln.current_stock) < 0;
+                  /* THE CENTRAL CEILING FOR THIS ROW. `cap.maxLine` is in the
+                     LINE's stored unit (the Issue box's own basis); every
+                     printed figure goes through the purchase unit. Advisory:
+                     the box is NOT clamped and the submit is NOT disabled — see
+                     centralCapOf for why (the liquor carve-out this page cannot
+                     see), and the server refuses regardless. */
+                  const cap      = centralCapOf(ln);
+                  const overCap  = overCapOf(ln);
                   /** Recipe-unit hint under a purchase-lead figure. Takes a qty in
                    *  the LINE's stored unit — same signature as the approve grid's
                    *  hint(), so the two screens print identical equivalents. */
@@ -3073,6 +3414,15 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                         {negStock && (
                           <div className="text-[9px] text-red-700 font-semibold">⚠ Store book balance — recount pending</div>
                         )}
+                        {/* A row the books cannot cover, marked on the line
+                            itself: a balance of exactly 0 used to carry no flag
+                            at all (only a NEGATIVE one did), so on a long sheet
+                            the one row that will be refused looked ordinary. */}
+                        {cap.capped && !negStock && (
+                          <div className="text-[9px] text-red-700 font-semibold">
+                            {cap.empty ? '⚠ Store books hold none of this' : `⚠ Store books hold ${fmtNum(cap.availPU)} ${cap.purchaseUnit}`}
+                          </div>
+                        )}
                       </td>
                       {/* Approved demand — printed in the unit the HOD approved
                           in, not the unit it happens to be stored in. */}
@@ -3080,7 +3430,21 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                         {fmtNum(U.toPU(ln.requested))} {U.pu}
                         {hint(ln.requested)}
                       </td>
-                      <td className={`py-1.5 px-2 text-right font-mono ${negStock ? 'text-red-700 font-bold' : 'text-[#6B5744]'}`}
+                      {/* THE FIGURE THE HEADER NOW CALLS THE LIMIT, so it has
+                          to read like one. It was coloured on `negStock` alone
+                          — current_stock < 0 — and NOT ONE of the 952 live
+                          materials is negative (min(current_stock) = 0), so
+                          this cell has never once been red on real data. The
+                          balance that actually occurs is EXACTLY ZERO: 486 of
+                          the 952, behind 1,198 requisition lines the server now
+                          refuses. Those printed a plain grey 0 next to a box
+                          pre-filled with the full demand, which is the defect
+                          this lane was opened for, seen from the cell.
+                          `cap.capped` covers both (a negative balance caps too),
+                          so the red now appears on every row the store cannot
+                          cover and the storekeeper's eye lands on the number
+                          rather than only on the banner above. */}
+                      <td className={`py-1.5 px-2 text-right font-mono ${negStock || cap.capped ? 'text-red-700 font-bold' : 'text-[#6B5744]'}`}
                           title={`= ${fmtNum(ln.current_stock)} ${U.recipeUnit} (exact)`}>
                         {/* On hand is a MATERIAL-level recipe figure — stockPU,
                             never toPU (which reads the LINE's basis). */}
@@ -3101,16 +3465,41 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                             that the shelf is empty — locking the box made the
                             storekeeper unable to record a handover he had just
                             physically made. */}
+                        {/* STILL NOT CLAMPED, and not disabled either. `max=` is
+                            deliberately absent: a hard max would make a liquor /
+                            store-mapped line untypeable (the server issues those
+                            whatever central says, and this page cannot identify
+                            them), which is the one way a convenience turns into
+                            lost work. The cap is said, not enforced. */}
                         <input type="number" step="any" min={0}
                                value={ln.issued_pu}
                                onChange={e => update(i, { issued_pu: e.target.value.replace(/^-/, '') })}
-                               title={negStock
-                                 ? `Quantity actually handed over, in ${U.pu || 'units'}. The store book balance is negative (recount pending) — issue what physically left the shelf, not what the books say.`
+                               title={cap.armed
+                                 ? (cap.empty
+                                     ? `Quantity actually handed over, in ${U.pu || 'units'}. The central store's books hold NONE of this material, so the store will refuse an issue here — get stock received or a closing count recorded first. (Liquor-store items are the exception: their stock moves on the Liquor Store ledger.)`
+                                     : `Quantity actually handed over, in ${U.pu || 'units'}. The central store's books hold ${fmtNum(cap.availPU)} ${cap.purchaseUnit} — more than that is refused.`)
                                  : `Quantity actually handed over, in ${U.pu || 'units'}. Seeded with the approved qty — type the real figure if more or less left the store.`}
                                className={`w-20 px-1.5 py-1 border rounded text-right text-xs ${
-                                 overIssued ? 'border-amber-400 bg-amber-50'
+                                 overCap ? 'border-red-400 bg-red-50 text-red-900 font-semibold'
+                                 : overIssued ? 'border-amber-400 bg-amber-50'
                                  : negStock ? 'border-red-300'
                                  : 'border-[#E8D5C4]'}`} />
+                        {/* ── THE CENTRAL REFUSAL, AGAINST THE NAMED LINE ─────
+                            The server's OWN sentence when it has spoken about
+                            this row (it is written for a storekeeper and names
+                            the figures in the purchase unit — printed verbatim,
+                            not re-worded), otherwise this screen's own advance
+                            warning. Inline, under the box it is about, instead
+                            of the alert() this used to be. */}
+                        {overCap && (
+                          <div className="text-[9px] text-red-800 mt-0.5 text-right font-semibold">
+                            {cap.serverMessage
+                              ? cap.serverMessage
+                              : (cap.empty
+                                  ? <>The store&apos;s books hold <b>none</b> of this — the central store will refuse this issue.</>
+                                  : <>Over the store&apos;s balance of <b>{fmtNum(cap.availPU)} {cap.purchaseUnit}</b> — the central store will refuse this issue.</>)}
+                          </div>
+                        )}
                         {/* Same warning as before, said in purchase units: the
                             over-issue is measured on the exact stored basis, only
                             the two printed figures are converted. */}
@@ -3388,12 +3777,67 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
             )}
           </div>
 
+          {/* ── THE SUBMIT WILL BE REFUSED ────────────────────────────────────
+              Shown in ALL THREE modes below (PO ticked, short, fully issued),
+              because it outranks each of them: the server answers 400 and
+              NOTHING is written, so none of the three sentences underneath will
+              have happened.
+
+              IT DOES NOT DISABLE THE BUTTON, and that is a decision, not an
+              omission. The submit gate at the bottom of this modal is reserved
+              for things this screen can be SURE the server refuses (a Buy line
+              with no price or no vendor). An over-issue is not one of them: a
+              liquor / store-mapped line is exempt on the server and
+              unidentifiable here, so a lock would stop 156 real live lines dead.
+              Being wrong in this direction costs one round trip and a sentence
+              the server writes itself; being wrong the other way costs a
+              hand-over the storekeeper cannot record. No confirm() either — the
+              refusal writes nothing and is replayable, so a dialog would be
+              friction on every bar hand-over for a message already on screen. */}
+          {overCapLines.length > 0 && (
+            <div className="text-[11px] px-3 py-2 bg-red-50 border-2 border-red-300 rounded text-red-900">
+              <div className="font-semibold">
+                ⛔ {overCapLines.length} line{overCapLines.length === 1 ? '' : 's'} ask{overCapLines.length === 1 ? 's' : ''} for more than the central store&apos;s books hold
+                — the store will <b>refuse the whole issue</b> and save nothing.
+              </div>
+              <div className="text-[10px] mt-0.5">
+                {overCapLines.map(ln => {
+                  const c = centralCapOf(ln);
+                  return `${ln.material_name} (books: ${c.empty ? 'none' : `${fmtNum(c.availPU)} ${c.purchaseUnit}`})`;
+                }).join(', ')}
+                . Lower {overCapLines.length === 1 ? 'that line' : 'those lines'} to what the store can give — the rest needs
+                stock received or a closing count recorded. Nothing else on this grid is affected; the whole gesture replays
+                once the number is corrected.
+                {' '}If {overCapLines.length === 1 ? 'it is' : 'they are'} liquor-store items, the stock moves on the Liquor
+                Store ledger and the store will accept the hand-over as entered.
+              </div>
+            </div>
+          )}
+
           {/* WHAT WILL ACTUALLY HAPPEN, counted off the same accessors the POST
               body uses. The old text asserted a PO unconditionally ("+ new vendor PO
               created in pending status") the moment the box was ticked, even
               with every Buy box empty — and claimed "no stock change", which is
-              the opposite of what the issue does (see the note at the top). */}
-          {raisePo ? (() => {
+              the opposite of what the issue does (see the note at the top).
+
+              ALL THREE OF THESE ARE PROMISES ABOUT SUBMIT, so they are silenced
+              while a line is over the central ceiling — the panel above has
+              just said the store will refuse the gesture and write NOTHING, and
+              none of these three sentences would then have happened. Left
+              rendering, the fully-issued case put "requisition will move to
+              Fulfilled on submit" directly beneath "the store will refuse the
+              whole issue and save nothing", which is the screen contradicting
+              the server on the one screenful where it matters most. The ⛔
+              panel says what to do instead, and these come back the moment the
+              number is corrected.
+
+              `overCapLines` — NOT `cappedLines` — is deliberately the test: a
+              line the books cannot cover in FULL is fine as long as the
+              storekeeper has typed a figure the store can actually give, and
+              that partial issue really will be recorded and really will leave
+              the requisition short. Only a quantity the server would refuse
+              makes these three false. */}
+          {overCapLines.length > 0 ? null : raisePo ? (() => {
             const buyLines  = lines.filter(ln => buyOf(ln) > 0);
             // Same predicate as submit()'s confirm — vendor named AND rejected
             // by the mapping rule. A line with no vendor yet is a different

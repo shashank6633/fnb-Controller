@@ -2,7 +2,7 @@ import { getDb, generateId } from '@/lib/db';
 import { getCurrentUser, canIssueAsStore, getCurrentOutletId } from '@/lib/auth';
 import { applyPartyFulfillment } from '@/lib/party-fulfillment';
 import { mergeDuplicateLines } from '@/lib/po-helpers';
-import { applyIssueDelta } from '@/lib/issue-stock';
+import { applyIssueDelta, checkCentralIssue, isCentralStockShort } from '@/lib/issue-stock';
 import { vendorMappingError, vendorResolver } from '@/lib/vendor-mapping';
 import { centralFlowBlock } from '@/lib/store-engine';
 
@@ -107,6 +107,20 @@ import { centralFlowBlock } from '@/lib/store-engine';
  *   bad_number | negative_qty            → { code, material, req_item_id, field? }
  *   duplicate_line | unknown_line        → { code, req_item_ids: string[] }
  *   missing_line_id                      → { code, count }
+ *   central_stock_short                  → { code, blocked: [{ material, material_id,
+ *                                            req_item_id, requested, available,
+ *                                            purchase_unit, max_issue_qty, line_unit,
+ *                                            message }], req_item_ids, applied: 0 }
+ *                                          EVERY short line at once. requested /
+ *                                          available / max_issue_qty read in the
+ *                                          PURCHASE unit except max_issue_qty, which
+ *                                          is in the LINE's unit — it is the value the
+ *                                          Issue box may hold. A partial issue of what
+ *                                          the store does hold is still accepted; only
+ *                                          the part that does not exist is refused.
+ *                                          Also returned from the catch, at 400, when
+ *                                          the balance moves between the pre-flight and
+ *                                          the write lock.
  *   po_price_required | po_vendor_required | po_unit_unrecognised
  *   po_qty_too_small                     → { code, material, req_item_id }
  */
@@ -260,9 +274,13 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     const unparseable = (v: unknown) =>
       v !== undefined && v !== null && String(v).trim() !== '' && !Number.isFinite(Number(v));
 
-    // Validate before mutating. Stock-sufficiency is informational only —
-    // current_stock = total purchased − total recipe-consumed; issuing internally
-    // doesn't touch it. We still reject negative qtys.
+    // Validate before mutating. Stock sufficiency IS NOW ENFORCED — see THE
+    // CENTRAL FLOOR below; this loop still rejects negative and unparseable
+    // qtys. (The sentence here used to read "Stock-sufficiency is informational
+    // only — current_stock = total purchased − total recipe-consumed; issuing
+    // internally doesn't touch it", which stopped being true when the deduct
+    // became unconditional: an issue through this route really does debit
+    // central, so an over-issue really did drive it negative.)
     for (const it of items) {
       const ln = lineMap.get(it.id);
       if (!ln) continue;
@@ -305,6 +323,102 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           req_item_id: it.id,
         }, { status: 400 });
       }
+    }
+
+    // ── THE CENTRAL FLOOR, ASKED BEFORE ANYTHING IS WRITTEN ─────────────────
+    // No issue may take raw_materials.current_stock below zero. The bound that
+    // makes that structural lives on the single writer (assertCentralIssue in
+    // src/lib/issue-stock.ts, which throws inside the transaction); this is the
+    // same rule — literally the same function — asked here so the storekeeper
+    // gets a sentence about every short line at once instead of a rollback.
+    //
+    // ── HOW A MULTI-LINE REQUISITION BEHAVES WHEN ONE LINE IS SHORT ─────────
+    // THE WHOLE GESTURE IS REFUSED, BEFORE THE TRANSACTION OPENS, AND NOTHING
+    // IS WRITTEN. That is a deliberate decision and this is the place it is
+    // recorded.
+    //
+    // The rejected alternative was to refuse from INSIDE the transaction, which
+    // an earlier attempt at this did: it threw on the first short line after the
+    // ordinary lines of the same requisition had already been written, and the
+    // rollback took them with it. A reviewer's verdict on that shape was "the
+    // ordinary case broken while fixing the unusual one", and it is right — the
+    // storekeeper loses work he had correctly entered, and he is told about one
+    // short line at a time.
+    //
+    // Refusing HERE is not that. Nothing has been written, so every other line
+    // is not "rolled back", it is untouched and byte-identical; the response
+    // names EVERY short line with what the store actually holds; and the whole
+    // gesture is replayable the moment the numbers are corrected. It is also the
+    // shape this route already advertises for every operator-answerable refusal
+    // — see the Errors block in the file header: "every one is raised BEFORE the
+    // transaction opens, so nothing is half-written". bad_number, negative_qty,
+    // unknown_line and duplicate_line all behave exactly this way, and a short
+    // line is the same kind of problem: one number a human can fix and resubmit.
+    //
+    // WHY NOT SILENTLY ISSUE WHAT IS THERE AND SHORT THE REST: because this
+    // route is ABSOLUTE (SET quantity_issued = ?). Writing 0.4 where the
+    // storekeeper typed 5 would commit a requisition line claiming a hand-over
+    // that did not happen, on the row the kitchen is owed against. A PARTIAL
+    // ISSUE IS STILL FULLY AVAILABLE — he types 0.4, which the message gives
+    // him, and it goes through. What is refused is only the part that does not
+    // exist.
+    //
+    // ORDER MATCHES THE WRITE LOOP (`for (const it of items)`), and the running
+    // claim is accumulated per material, so a gesture drawing on one material
+    // twice is scored the way the floor will see it.
+    const centralShort: {
+      code: 'central_stock_short';
+      material: string; material_id: string; req_item_id: string;
+      /** PURCHASE basis — the unit every store surface leads with. */
+      requested: number; available: number; purchase_unit: string;
+      /** LINE basis — what the Issue box may hold on a retry. */
+      max_issue_qty: number; line_unit: string;
+      message: string;
+    }[] = [];
+    {
+      // Read fresh rather than from `items` (SELECTed before `await
+      // req.json()`), for the same reason the write loop re-reads it: a stale
+      // pre-image makes the delta wrong. Not in a transaction — a pre-flight
+      // cannot hold one — so this can still be raced, which is precisely why
+      // the floor exists inside the writer.
+      const selIssuedNow = db.prepare(`SELECT quantity_issued FROM requisition_items WHERE id = ?`);
+      const claimed = new Map<string, number>();
+      for (const it of items) {
+        const ln = lineMap.get(it.id) || {};
+        const beforeIssued = Number((selIssuedNow.get(it.id) as any)?.quantity_issued) || 0;
+        const afterIssued = Number(ln.quantity_issued) || 0;
+        const already = claimed.get(String(it.material_id)) || 0;
+        const c = checkCentralIssue(db, {
+          reqItemId: it.id,
+          beforeLineQty: beforeIssued,
+          afterLineQty: afterIssued,
+          alreadyClaimedRecipe: already,
+        });
+        // netRecipe, not requestedRecipe: an omitted line credits stock back and
+        // that headroom is real for a later line of the same material.
+        claimed.set(String(it.material_id), already + c.netRecipe);
+        if (c.ok) continue;
+        centralShort.push({
+          code: 'central_stock_short',
+          material: c.materialName, material_id: c.materialId, req_item_id: c.reqItemId,
+          requested: c.requestedPurchase, available: c.availablePurchase,
+          purchase_unit: c.purchaseUnit,
+          max_issue_qty: c.maxIssueLineQty, line_unit: c.lineUnit,
+          message: c.message,
+        });
+      }
+    }
+    if (centralShort.length > 0) {
+      return Response.json({
+        error: `${centralShort.length} line${centralShort.length === 1 ? '' : 's'} `
+          + `${centralShort.length === 1 ? 'asks' : 'ask'} for more than the central store holds, `
+          + `so nothing was issued and ${r.req_number} is unchanged. `
+          + centralShort.map(s => s.message).join(' '),
+        code: 'central_stock_short',
+        blocked: centralShort,
+        req_item_ids: centralShort.map(s => s.req_item_id),
+        applied: 0,
+      }, { status: 400 });
     }
 
     // ── THE ONE LIST OF "YOU ASKED TO BUY THIS AND IT WAS NOT ORDERED" ──────
@@ -1182,6 +1296,30 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     return Response.json({ success: true, ...result });
   } catch (e: any) {
     console.error('[req store-process]', e);
+    // THE FLOOR FIRED INSIDE THE TRANSACTION. The pre-flight above refuses this
+    // before anything is written, so reaching here means the balance moved
+    // between that read and the write lock — a concurrent issue, a receipt
+    // reversal, a closing count. The whole transaction is rolled back, so the
+    // requisition is unchanged and the answer is the same shape and the same
+    // 400 the pre-flight gives: one short line, named, with what the store
+    // holds. Without this the storekeeper would get a bare 500 for a race he
+    // can fix by reloading.
+    if (isCentralStockShort(e)) {
+      return Response.json({
+        error: e.message,
+        code: e.code,
+        blocked: [{
+          code: 'central_stock_short',
+          material: e.materialName, material_id: e.materialId, req_item_id: e.reqItemId,
+          requested: e.requestedPurchase, available: e.availablePurchase,
+          purchase_unit: e.purchaseUnit,
+          max_issue_qty: e.maxIssueLineQty, line_unit: e.lineUnit,
+          message: e.message,
+        }],
+        req_item_ids: [e.reqItemId],
+        applied: 0,
+      }, { status: 400 });
+    }
     // A lost double-process race is a conflict, not a server fault — the atomic
     // claim at the top of the txn tags it with 409 so the UI can say "already
     // processed". Everything else keeps the existing 500.

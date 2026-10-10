@@ -1,5 +1,6 @@
 import type Database from 'better-sqlite3';
-import { generateId } from '@/lib/db';
+import { generateId, logAuditEvent } from '@/lib/db';
+import { assertCentralIssue } from '@/lib/issue-stock';
 // THE MOVEMENT RECORD (owner's eight fields, 2026-09-10). This module writes
 // BOTH rails with its own raw INSERTs — it maintains the department_materials
 // cache itself, so it deliberately does NOT route through postDeptLedger (that
@@ -29,13 +30,45 @@ import {
  *       balance_after = new on_hand). This is what departments later draw down
  *       to record leftover balance / consumption post-party.
  *
+ * ── THE CENTRAL FLOOR APPLIES HERE, AND IT IS THE INTERNAL RAIL'S OWN ───────
+ * THE DEBIT BELOW USED TO BE UNBOUNDED. `UPDATE raw_materials SET current_stock
+ * = current_stock - ?` ran with no balance read of any kind, so a party
+ * requisition could take out stock that was not there and drive central
+ * negative in silence. Measured over 76 real material shapes at both issue
+ * desks — 152 attempts, 0 refused, 152 negative outcomes, global
+ * MIN(current_stock) −36,000, 75 materials below zero.
+ *
+ * It is bounded now by assertCentralIssue() from src/lib/issue-stock.ts —
+ * THE SAME floor the internal rail uses, asked with rail:'party' so its party
+ * carve-out (which exists for the OTHER rail, where a party line debits
+ * nothing) does not excuse the very debit it is bounding. Deliberately NOT a
+ * second floor and NOT a second conversion: both are recorded traps in this
+ * repo (the rival-helper trap, and the 750x trap of a local packFactor copy).
+ *
+ * IT THROWS CentralStockShort, and that is right HERE because somebody is
+ * standing at the counter. Both callers run inside their own db.transaction and
+ * both already catch it and answer 400 with the storekeeper-phrased message
+ * (store-issue/route.ts:971, store-process/route.ts:1307), so the whole gesture
+ * unwinds and the requisition is left exactly as it was. It must be
+ * all-or-nothing rather than a partial transfer, because the idempotency guard
+ * below is per-REQUISITION: one line's party row makes the whole requisition
+ * read as already-transferred, so a quietly short line could never be completed
+ * later. The UNATTENDED third route (the PO-receipt / GRN-QC cascade in
+ * po-requisition-fulfil.ts) deliberately does the opposite — see the judgement
+ * recorded there.
+ *
  * UNITS: requisition_items.quantity_issued is in ri.unit — the unit the line
  * was REQUESTED in, which may be the material's PURCHASE unit (1 BTL = 750 ml)
  * — while current_stock and department_materials.on_hand are RECIPE units
- * (average_price is ₹/recipe-unit). Convert ONCE here with the house
- * pack-factor CASE (byte-equivalent to department-consumption route.ts SQL and
- * dept-stock reqPackFactor): × pack_size only when the line was requested in
- * the purchase unit. Legacy rows with a blank ri.unit stay ×1.
+ * (average_price is ₹/recipe-unit). THE CONVERSION IS NOW THE FLOOR'S OWN. The
+ * hand-rolled pack-factor CASE that stood here has been replaced by the factor
+ * assertCentralIssue already applied (lineFactor → packFactor from
+ * src/lib/pack-units.ts), so the quantity compared against the balance and the
+ * quantity subtracted from it are THE SAME NUMBER by construction and cannot
+ * drift. Proved a no-op on quantity: across all 16,353 live requisition lines
+ * the old CASE and lineFactor return the identical factor on 16,350 and both
+ * return 1 on the other 3 — which are exactly the blank-unit packed lines the
+ * two now REFUSE rather than guess (see the carve-outs below).
  *
  * The party transfer inventory_transactions row is the single source of truth
  * for de-duplication: if one already exists for this requisition, the transfer
@@ -157,20 +190,73 @@ export function applyPartyFulfillment(
       return false;
     }
     const items = selItems.all(reqId) as any[];
+    // Lines this transfer DECLINED to move, for the audit row below. A declined
+    // line leaves no other trace: unlike applyIssueDelta, this rail writes no
+    // requisition_issue_ledger row, so without that row the skip would be
+    // invisible — and the per-requisition guard above means it can never be
+    // picked up on a later call either.
+    const declined: Array<{
+      req_item_id: string; material_id: string; material_name: string;
+      reason: string; requested_line_qty: number; line_unit: string;
+    }> = [];
     for (const it of items) {
       const issuedReq = Number(it.quantity_issued) || 0; // in ri.unit
       if (issuedReq <= 0) continue;
-      // ri.unit → RECIPE units: the house pack-factor CASE (see header). Kept
-      // byte-equivalent to department-consumption route.ts SQL and dept-stock
-      // reqPackFactor: emptiness guarded with trim, purchase-/recipe-unit
-      // equality on the RAW ri.unit.
-      const packFactor =
-        (String(it.req_unit ?? '').trim() !== '' &&
-         it.req_unit === it.purchase_unit &&
-         it.req_unit !== it.unit &&
-         (Number(it.pack_size) || 1) > 1)
-          ? Number(it.pack_size) : 1;
-      const issued = issuedReq * packFactor; // RECIPE units
+
+      // THE FLOOR AND THE CONVERSION, FROM ONE CALL, INSIDE THIS TRANSACTION.
+      //
+      // beforeLineQty 0 / afterLineQty issuedReq is the honest statement of what
+      // this rail does: the internal rail debits an INCREMENT as each line is
+      // issued, while the party rail moves the line's whole quantity_issued once,
+      // here, at fulfilment. So the delta this floor must bound is the full
+      // figure, not a difference.
+      //
+      // IT READS current_stock ITSELF, per line, one statement before the UPDATE
+      // — which is also why two lines of the same material need no running
+      // claim: by the time the second is checked the first has already been
+      // subtracted. better-sqlite3 is synchronous and nothing awaits inside this
+      // transaction, so nothing can interleave between the read and the write.
+      const c = assertCentralIssue(db, {
+        reqItemId: String(it.id),
+        beforeLineQty: 0,
+        afterLineQty: issuedReq,
+        rail: 'party',
+      });
+
+      // THE OTHER TWO CARVE-OUTS, HONOURED — AND THEY GATE BOTH SIDES.
+      //
+      // store_mapped: the material lives on the TGBCL store ledger
+      // (store_stock_ledger / store_locations) and central's current_stock is
+      // not its balance. This rail used to debit central anyway — of the 952
+      // materials 127 are store-mapped and 95 of those hold a central balance of
+      // 0, so a party draw on one of them went straight below zero.
+      // unit_review: ri.unit is blank or unrecognised on a PACKED material, so
+      // nobody can say whether the line means grams or kilos. The old CASE
+      // silently assumed recipe units (×1) where dept-stock and
+      // department-consumption read the same blank as the purchase basis
+      // (×pack) — a 750x disagreement decided by which screen you opened. 3 live
+      // lines are this shape: 100 PIPERS (750ML), OLIVE OIL POMACE 1 ltr and
+      // SALTED BUTTER 500 GM.
+      //
+      // NEITHER SIDE MOVES. Skipping only the central debit while still crediting
+      // the department would MANUFACTURE stock — the department would gain a
+      // gram central never gave up. applyIssueDelta learned this the same way
+      // and gates both sides for the identical reason; a gap that is recorded is
+      // the lesser evil, and it is recorded in audit_events below.
+      if (!c.debits) {
+        declined.push({
+          req_item_id: String(it.id),
+          material_id: String(it.material_id),
+          material_name: String(c.materialName || ''),
+          reason: c.skipReason || 'zero_delta',
+          requested_line_qty: issuedReq,
+          line_unit: String(it.req_unit ?? ''),
+        });
+        continue;
+      }
+
+      // RECIPE units, and the floor's own figure — never a second multiplication.
+      const issued = c.requestedRecipe;
       const deptId: string | null = it.department_id || req.department_id || null;
 
       // STORE: decrement current_stock + ledger row.
@@ -225,6 +311,31 @@ export function applyPartyFulfillment(
       }
 
       transferred.push({ material_id: it.material_id, issued, department_id: deptId });
+    }
+
+    // WHAT THIS TRANSFER WOULD NOT MOVE, WHERE THE OWNER CAN SEE IT. Written
+    // ONLY when something was declined, so an ordinary fulfilment is byte-identical
+    // to before this change.
+    //
+    // THE EVENT TYPE IS DELIBERATELY NOT ONE OF THE CASCADE'S TWO.
+    // po-requisition-fulfil.ts's cascadeDeductionWitness tells a void which rail
+    // deducted by looking for exactly 'requisition.party_consumption' or
+    // 'requisition.party_consumption.skipped', and its correctness rests on the
+    // stated fact that "applyPartyFulfillment writes no audit event at all".
+    // Writing either name here would make THIS rail's row look like the
+    // cascade's own witness, and a void would then credit back — or refuse to
+    // credit back — on the strength of a row the cascade never wrote. Keep this
+    // name distinct from both, and keep it out of that IN list.
+    if (declined.length > 0) {
+      logAuditEvent(db, {
+        event_type: 'requisition.party_transfer.declined',
+        entity_type: 'requisition',
+        entity_id: reqId,
+        actor_email: actorEmail,
+        after: { declined, transferred: transferred.length },
+        note: `Party transfer: ${declined.length} line(s) moved no stock — `
+          + declined.map(d => `${d.material_name || d.material_id} (${d.reason})`).join(', '),
+      });
     }
     return true;
   });

@@ -1,22 +1,41 @@
 import { getDb, generateId, logAuditEvent } from '@/lib/db';
 import { getCurrentUser, canIssueAsStore } from '@/lib/auth';
 import { applyPartyFulfillment } from '@/lib/party-fulfillment';
-import { applyIssueDelta } from '@/lib/issue-stock';
+import {
+  applyIssueDelta, checkCentralIssue, isCentralStockShort,
+  isIssueGestureRecorded, isIssueTokenReplayError,
+} from '@/lib/issue-stock';
 import { isDeptReversalBlocked } from '@/lib/dept-ledger';
 
 /**
- * A replayed POST carrying a client_token it already spent collides on
- * requisition_issue_ledger's partial unique index (db.ts:1271). better-sqlite3
- * rolls the WHOLE transaction back, so nothing was applied twice — the honest
- * answer is 200 "you already did this", not a 500.
+ * A replayed POST carrying a client_token it already spent is answered 200
+ * "you already did this", never a 400 and never a 500: nothing was applied a
+ * second time, so a failure is a lie about what happened.
  *
- * SQLite words the failure with the COLUMNS, not the index name
- * ("UNIQUE constraint failed: requisition_issue_ledger.client_token,
- * requisition_issue_ledger.req_item_id"), so match on that and keep the index
- * name as a fallback. Deliberately narrow: any other constraint failure is a
- * real bug and must keep surfacing as a 500.
+ * TWO SPELLINGS OF THE SAME FACT, AND BOTH ARE NEEDED.
+ *
+ *  1. IssueTokenReplay, thrown by applyIssueDelta BEFORE either of its guards
+ *     can refuse. This is the one that actually fires in ordinary use, and it
+ *     exists because of a measured trap: with the central floor in front of the
+ *     ledger insert, a replayed tight-stock issue (asks 5, central held 2,
+ *     issued 2 and deferred the rest) was answered 400 "nothing was issued and
+ *     the requisition is unchanged" WHEN THE HAND-OVER HAD COMPLETED. The floor
+ *     was right about the balance — the first POST had taken it to zero — and
+ *     backwards about the gesture. See the ordering note in issue-stock.ts.
+ *
+ *  2. The unique index uq_req_issue_token_item on requisition_issue_ledger
+ *     (client_token, req_item_id), which is still in place and is still the
+ *     LAST word: it is the only layer that is atomic against a first POST that
+ *     has not committed yet. better-sqlite3 rolls the WHOLE transaction back,
+ *     so again nothing was applied twice.
+ *     SQLite words the failure with the COLUMNS, not the index name
+ *     ("UNIQUE constraint failed: requisition_issue_ledger.client_token,
+ *     requisition_issue_ledger.req_item_id"), so match on that and keep the
+ *     index name as a fallback. Deliberately narrow: any other constraint
+ *     failure is a real bug and must keep surfacing as a 500.
  */
 function isIssueTokenReplay(e: any): boolean {
+  if (isIssueTokenReplayError(e)) return true;
   const code = String(e?.code || '');
   const msg = String(e?.message || '');
   if (!code.startsWith('SQLITE_CONSTRAINT')) return false;
@@ -251,6 +270,30 @@ function isIssueTokenReplay(e: any): boolean {
  * to "keep the rest of the batch going" — quantity_issued is already written by
  * then, so the surviving lines would be committed against stock that never came
  * back. The batch is atomic; the catch below only improves the MESSAGE.
+ *
+ * ── AND CENTRAL CANNOT GO NEGATIVE EITHER (THE OVER-ISSUE CLAMP) ───────────
+ * An 'issue' for more than the central store holds is REFUSED. It used to
+ * succeed silently and drive raw_materials.current_stock negative; nothing on
+ * the path said no, in this route or in the helper.
+ *
+ * The refusal is asked TWICE, and the two are not redundant:
+ *   - BEFORE the transaction (the pre-flight block below), so the whole batch is
+ *     refused with every short line named and nothing written. That is what
+ *     keeps a multi-line batch intact: the other lines are untouched, not rolled
+ *     back, and the batch replays as soon as the number is corrected.
+ *   - INSIDE applyIssueDelta (assertCentralIssue), which throws and unwinds this
+ *     route's transaction. That is the bound that actually holds — it covers the
+ *     race the pre-flight cannot see, and it covers any future caller.
+ * A PARTIAL issue of what the store genuinely holds still works; the refusal
+ * carries that number, in the line's own unit, as max_issue_qty.
+ *
+ * AND NEITHER LAYER MAY ANSWER FOR A REPLAY. Both of them sit in front of the
+ * ledger insert that used to be the only thing aware of client_token, so a
+ * re-POST of an already-recorded gesture was answered "nothing was issued and
+ * the requisition is unchanged" on the very tight-stock case the token exists
+ * for. The replay is now recognised ahead of both — in the pre-flight loop's
+ * filters and, structurally, inside applyIssueDelta — and answered 200 as it
+ * always was. See isIssueTokenReplay above.
  */
 export async function POST(req: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
@@ -455,6 +498,152 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       SET store_rejected = 0, store_reject_reason = ''
       WHERE id = ?
     `);
+
+    // ── THE CENTRAL FLOOR, ASKED BEFORE THE TRANSACTION OPENS ───────────────
+    // No issue may take raw_materials.current_stock below zero. The bound that
+    // makes that structural lives on the single writer (assertCentralIssue in
+    // src/lib/issue-stock.ts, which throws inside this route's transaction);
+    // this is the same rule — literally the same function — asked early, so a
+    // storekeeper is told about every short line at once rather than meeting a
+    // rolled-back batch.
+    //
+    // THE BATCH IS REFUSED WHOLE, AND NOTHING IS WRITTEN. This route's batch is
+    // already atomic by decision ("The batch is atomic; the catch below only
+    // improves the MESSAGE" — see the STOCK section of the header), so refusing
+    // a short line mid-transaction would roll back the ordinary lines beside it.
+    // Refusing here is the opposite of that: the requisition is untouched, not
+    // rolled back, every short line is named, and the batch is replayable as
+    // soon as the quantity is corrected.
+    //
+    // A PARTIAL ISSUE REMAINS FULLY AVAILABLE, which is the point of a per-line
+    // cap rather than a per-line veto: the message carries max_issue_qty in the
+    // LINE's own unit, and issuing that amount passes. Only the part the store
+    // does not hold is refused.
+    //
+    // THE FILTERS BELOW MIRROR THE WRITE LOOP ENTRY FOR ENTRY — unknown line,
+    // vanished line, chef-rejected, store-rejected-and-not-unrejecting, and the
+    // finite/positive quantity test. A pre-flight that scored a line the loop
+    // skips would refuse a batch that moves no stock at all.
+    //
+    // ONE FILTER IS NOT IN THE WRITE LOOP, AND IS STILL THE SAME RULE: a line
+    // whose gesture this token has ALREADY recorded. The loop does call the
+    // helper for it — and the helper throws IssueTokenReplay before debiting,
+    // which unwinds the batch and is answered 200 in the catch below. So it is
+    // a line that moves no stock, which is exactly what this filter list is for.
+    // It is spelled out at its own entry below because it is the regression this
+    // round exists to fix.
+    const centralShort: {
+      code: 'central_stock_short';
+      line_id: string;
+      material: string; material_id: string; req_item_id: string;
+      /** PURCHASE basis — the unit every store surface leads with. */
+      requested: number; available: number; purchase_unit: string;
+      /** LINE basis — what this line's Issue box may hold on a retry. */
+      max_issue_qty: number; line_unit: string;
+      message: string;
+    }[] = [];
+    {
+      // Accumulated per MATERIAL, in the batch's own order, so two entries for
+      // one line — which this route documents and has measured — and two lines
+      // of one material are both scored the way the floor will see them.
+      const claimed = new Map<string, number>();
+      for (const ln of lines) {
+        if (!itemMap.get(ln.id)) continue;
+        const cur = selLine.get(ln.id, id) as any;
+        if (!cur) continue;
+        if (cur.is_rejected) continue;
+        const action = String(ln.action || '').toLowerCase();
+        if (cur.store_rejected && action !== 'unreject') continue;
+        // 'defer' and 'unreject' write no quantity at all; the loop calls the
+        // helper for neither, so there is no delta to bound.
+        if (action !== 'issue' && action !== 'undo' && action !== 'reject') continue;
+        // ── A REPLAY IS NOT A STOCK PROBLEM, SO IT IS NOT SCORED ────────────
+        // THE DEFECT THIS CLOSES, MEASURED. Requisition asks 5, central holds
+        // exactly 2, the storekeeper issues 2 and defers the rest, and the same
+        // gesture arrives twice (a dropped response on the venue LAN — the one
+        // case the token exists for). The first POST took central to 0, so this
+        // pre-flight then scored the REPLAY against an empty store and refused
+        // it 400 "nothing was issued and the requisition is unchanged" — the
+        // opposite of the truth, about a hand-over that had completed. On
+        // 3be09af the same second POST answered 200, applied=0.
+        //
+        // A gesture already in requisition_issue_ledger under this token moves
+        // no stock on this POST: applyIssueDelta throws IssueTokenReplay before
+        // it debits anything, the transaction unwinds, and the catch below
+        // answers 200 like the unique index always made it. There is therefore
+        // no delta for a floor to bound — scoring it would refuse a no-op.
+        //
+        // SKIPPING IS WHAT 3be09af DID, exactly: it had no pre-flight at all,
+        // so no replayed line was ever weighed against a balance. Note what is
+        // deliberately NOT done here — the batch is not short-circuited and no
+        // 200 is minted at this point. Whether a row actually gets written (and
+        // so whether this IS a replay) is applyIssueDelta's decision, made from
+        // the final delta inside the transaction; deciding it here would start
+        // refusing the zero-delta cases the base tree let through (a replayed
+        // token arriving on a defer-only POST, or on a reject that keeps what
+        // was handed over — both measured identical to base).
+        //
+        // ONE DELIBERATE DIFFERENCE FROM 3be09af, AND IT IS A BETTER ANSWER,
+        // not an oversight. A batch that mixes a replayed line with a FRESH line
+        // that is genuinely short is refused here naming the fresh line, where
+        // base answered "you already did this". Both write nothing and leave
+        // byte-identical state (measured), but base's sentence was false about
+        // the line that actually could not be satisfied. No shipped client can
+        // produce the case — the only tokened POST is the single-line
+        // issue-and-defer gesture at store-requisitions/page.tsx:676.
+        if (isIssueGestureRecorded(db, clientToken, String(cur.id))) continue;
+        const beforeQty = Number(cur.quantity_issued) || 0;
+        let afterQty = beforeQty;
+        if (action === 'issue') {
+          const addQty = Number(ln.quantity);
+          if (!Number.isFinite(addQty) || addQty <= 0) continue;
+          afterQty = beforeQty + addQty;
+        } else if (action === 'undo') {
+          afterQty = 0;
+        } else {
+          // reject: keeps what was handed over unless the party rail owns the
+          // line — the same keepIssued expression the loop uses below.
+          afterQty = (!isParty && beforeQty > 0) ? beforeQty : 0;
+        }
+        const matId = String(itemMap.get(ln.id)?.material_id || '');
+        const already = claimed.get(matId) || 0;
+        const c = checkCentralIssue(db, {
+          reqItemId: String(cur.id),
+          beforeLineQty: beforeQty,
+          afterLineQty: afterQty,
+          alreadyClaimedRecipe: already,
+        });
+        // netRecipe, not requestedRecipe: an undo in the same batch credits
+        // stock back, and that headroom is real for a later issue of the same
+        // material.
+        claimed.set(matId, already + c.netRecipe);
+        if (c.ok) continue;
+        centralShort.push({
+          code: 'central_stock_short',
+          line_id: String(ln.id ?? ''),
+          material: c.materialName, material_id: c.materialId, req_item_id: c.reqItemId,
+          requested: c.requestedPurchase, available: c.availablePurchase,
+          purchase_unit: c.purchaseUnit,
+          max_issue_qty: c.maxIssueLineQty, line_unit: c.lineUnit,
+          message: c.message,
+        });
+      }
+    }
+    if (centralShort.length > 0) {
+      // Same envelope the department-reversal refusal uses — `code` + `blocked`
+      // — because the client already keys off those and renders the message
+      // inline against the named line instead of an alert
+      // (store-requisitions/page.tsx:232).
+      return Response.json({
+        error: `${centralShort.length} line${centralShort.length === 1 ? '' : 's'} `
+          + `${centralShort.length === 1 ? 'asks' : 'ask'} for more than the central store holds, `
+          + `so nothing was issued and the requisition is unchanged. `
+          + centralShort.map(s => s.message).join(' '),
+        code: 'central_stock_short',
+        blocked: centralShort,
+        applied: 0,
+      }, { status: 400 });
+    }
 
     const auditPerLine: any[] = [];
     const nowIso = new Date().toISOString();
@@ -764,6 +953,33 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
             requested: e.requested,
             available: e.available,
             consumed_since: e.consumedSince,
+            message: e.message,
+          }],
+          applied: 0,
+        }, { status: 400 });
+      }
+      // THE CENTRAL STORE WILL NOT GIVE THE GOODS. The mirror of the block
+      // above, on the other direction: assertCentralIssue() throws rather than
+      // debiting past zero, and that throw rolled this whole batch back. The
+      // pre-flight already refused this before the transaction opened, so
+      // reaching here means the balance moved between that read and the write
+      // lock — a concurrent issue, a receipt reversal, a closing count. Same
+      // envelope, same 400, so the client renders it against the named line
+      // exactly as it renders the reversal block; `failing.lineId` supplies the
+      // batch entry, since the error knows the requisition line but not which
+      // submitted row named it.
+      if (isCentralStockShort(e)) {
+        console.warn('[req store-issue] central stock short:', e.message);
+        return Response.json({
+          error: e.message,
+          code: e.code,
+          blocked: [{
+            code: 'central_stock_short',
+            line_id: failing.lineId || (lines.length === 1 ? String(lines[0]?.id || '') : ''),
+            material: e.materialName, material_id: e.materialId, req_item_id: e.reqItemId,
+            requested: e.requestedPurchase, available: e.availablePurchase,
+            purchase_unit: e.purchaseUnit,
+            max_issue_qty: e.maxIssueLineQty, line_unit: e.lineUnit,
             message: e.message,
           }],
           applied: 0,

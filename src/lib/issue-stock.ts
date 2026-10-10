@@ -122,12 +122,72 @@
  * A THIRD mechanism now sits on top of the stock clamp, and it is not a clamp:
  * the department must actually still HOLD the goods. See assertReversible.
  *
+ * ── AND A FOURTH, ON THE OTHER DIRECTION: THE CENTRAL FLOOR ────────────────
+ * Until this change the DEBIT direction had no bound at all. Issuing a line for
+ * more than the central store holds succeeded silently and drove
+ * raw_materials.current_stock NEGATIVE — measured on a copy of the live db,
+ * central 0 kg -> -1 kg on a 1 kg issue, with nothing anywhere on the path
+ * refusing it. The owner has decided the server must refuse, so that no caller
+ * — not the two issue desks, not a direct API call, not a future writer — can
+ * take out more than is there. See assertCentralIssue / checkCentralIssue.
+ *
+ * TWO LAYERS, AND THE SPLIT IS THE WHOLE DESIGN:
+ *   1. assertCentralIssue() here is the FLOOR. It reads current_stock inside the
+ *      caller's transaction, immediately before the debit, and THROWS. It is the
+ *      only thing that can make the no-negative property structural, because it
+ *      sits on the single writer.
+ *   2. checkCentralIssue() is the same rule asked EARLY. Both routes run it over
+ *      every line BEFORE opening their transaction and refuse the whole gesture
+ *      with every short line named. That is what keeps the floor from ever being
+ *      the thing the storekeeper meets: by the time the transaction opens, the
+ *      numbers have already been agreed.
+ *
+ * WHY THE FLOOR THROWS RATHER THAN CLAMPS, which is the same reason the reversal
+ * guard throws: every caller has ALREADY written quantity_issued by the time we
+ * are called. Silently debiting less than the line claims commits a row reading
+ * "5 kg issued" against 0.4 kg that actually moved — the two rails diverge with
+ * nothing on screen to show it. A throw unwinds the caller's transaction and the
+ * line stays exactly as it was.
+ *
+ * THE FLOOR IS ON THE DEBIT ONLY. A credit (undo / reject / a reduced absolute
+ * re-process) can never drive central negative — it moves stock INTO the store —
+ * and it already has two bounds of its own above. Putting the floor on both
+ * directions would refuse every legitimate undo the moment a material's balance
+ * happened to be 0.
+ *
+ * THE THREE CARVE-OUTS ARE CARVED OUT HERE TOO, necessarily: party,
+ * store-mapped and ambiguous-unit lines debit nothing, so there is nothing for a
+ * floor to bound. Refusing them for a central balance they never touch would
+ * stop four daily operations over a rail they are not on.
+ *
+ * ── THE PARTY RAIL BORROWS THIS FLOOR; IT DOES NOT GROW ITS OWN ────────────
+ * A party line debits nothing HERE, but it is not free: the goods leave central
+ * later, in one lump, when the requisition reaches 'fulfilled'. Three writers do
+ * that — applyPartyFulfillment (both issue desks) and fulfilRequisitionFromPo
+ * (the PO-receipt / GRN-QC cascade) — and until now every one of them ran
+ * `current_stock = current_stock - ?` with no balance read of any kind. Measured
+ * over 76 material shapes at both desks: 152 attempts, 0 refused, global
+ * MIN(current_stock) −36,000.
+ *
+ * All three now ask THIS function, with rail:'party'. They do not get a floor of
+ * their own, for the two reasons this file keeps repeating: a second floor with
+ * slightly different rules is the rival-helper trap, and a second unit
+ * conversion is the 750x trap (the party rail had one of those too — see
+ * lineFactor's note on the three hand-rolled packFactor copies).
+ *
+ * WHAT "REFUSE" MEANS SPLITS BY WHETHER ANYONE IS THERE TO READ IT, and that is
+ * a deliberate decision documented at both sites: the two issue desks THROW
+ * (a storekeeper is at the counter and both routes already answer 400 with the
+ * message), while the PO/QC cascade CLAMPS and records the shortfall, because a
+ * throw there would roll back a delivery that physically arrived, in front of
+ * nobody. See the comment above the clamp in po-requisition-fulfil.ts.
+ *
  * pack_factor is stored per row so the log can reverse each row's conversion
  * with the factor ACTUALLY USED — a later Unit Audit rebase changes a
  * material's factor, and the pre-ledger remainder arithmetic in the end-to-end
  * log depends on that reversal being exact.
  */
-import { packFactor } from '@/lib/pack-units';
+import { packFactor, toPurchaseQty, fmtQtyNum } from '@/lib/pack-units';
 import { generateId } from '@/lib/db';
 import { centralFlowBlock } from '@/lib/store-engine';
 import { postDeptLedger, assertReversible } from '@/lib/dept-ledger';
@@ -254,6 +314,392 @@ export function lineFactor(
   return { factor: 1, needsReview: true };                   // unrecognised unit — refuse
 }
 
+/* ────────────────────────────────────────────────────────────────────────────
+ * THE CENTRAL FLOOR — no requisition issue may drive current_stock negative.
+ * ──────────────────────────────────────────────────────────────────────────*/
+
+/**
+ * Thrown by assertCentralIssue(). Routes answer 400 with `.message` and the
+ * structured fields, exactly as they already do for DeptReversalBlocked.
+ *
+ * EVERY QUANTITY ON THIS ERROR CARRIES ITS BASIS IN ITS NAME. The *Purchase
+ * fields are what a message may print (OWNER RULE: store and inventory surfaces
+ * lead with the purchase unit); the *Recipe fields are the stored truth. Mixing
+ * them is the 750x error this file exists to prevent.
+ */
+export class CentralStockShort extends Error {
+  readonly code = 'CENTRAL_STOCK_SHORT';
+  readonly reqItemId: string;
+  readonly materialId: string;
+  readonly materialName: string;
+  /** RECIPE units the debit wanted. */
+  readonly requestedRecipe: number;
+  /** RECIPE units issuable right now (never negative). */
+  readonly availableRecipe: number;
+  /** PURCHASE units the debit wanted — printable. */
+  readonly requestedPurchase: number;
+  /** PURCHASE units issuable right now — printable. */
+  readonly availablePurchase: number;
+  readonly purchaseUnit: string;
+  /** Largest value the line's Issue box may hold, in THE LINE'S OWN unit. */
+  readonly maxIssueLineQty: number;
+  readonly lineUnit: string;
+
+  constructor(c: CentralIssueCheck) {
+    super(c.message);
+    this.name = 'CentralStockShort';
+    this.reqItemId = c.reqItemId;
+    this.materialId = c.materialId;
+    this.materialName = c.materialName;
+    this.requestedRecipe = c.requestedRecipe;
+    this.availableRecipe = c.availableRecipe;
+    this.requestedPurchase = c.requestedPurchase;
+    this.availablePurchase = c.availablePurchase;
+    this.purchaseUnit = c.purchaseUnit;
+    this.maxIssueLineQty = c.maxIssueLineQty;
+    this.lineUnit = c.lineUnit;
+  }
+}
+
+export function isCentralStockShort(e: unknown): e is CentralStockShort {
+  return e instanceof CentralStockShort
+    || (typeof e === 'object' && e !== null && (e as { code?: string }).code === 'CENTRAL_STOCK_SHORT');
+}
+
+export interface CentralIssueCheck {
+  /** false => this debit would take central below zero. */
+  ok: boolean;
+  /**
+   * Does this write debit central at all? false for the three carve-outs
+   * (party / store-mapped / ambiguous unit), for a credit, for a zero delta and
+   * for a line that no longer exists. `ok` is always true when this is false —
+   * there is nothing to bound.
+   */
+  debits: boolean;
+  /**
+   * WHY `debits` is false. '' when it is true.
+   *
+   * The same vocabulary applyIssueDelta stamps on its ledger row, deliberately,
+   * so one word means one thing on both. The internal rail never needed to read
+   * it — a carve-out there simply means "no floor applies" and the row records
+   * the reason itself. THE PARTY RAIL DOES NEED IT: party-fulfillment writes no
+   * requisition_issue_ledger row, so a line it declines to move leaves no trace
+   * unless the caller is told which reason to record, and it must gate the
+   * matching DEPARTMENT credit by the same answer — crediting a department for a
+   * gram central never gave up manufactures stock, which is the one outcome
+   * worse than a gap (see the store_mapped note in applyIssueDelta).
+   */
+  skipReason: '' | 'party' | 'store_mapped' | 'unit_review' | 'zero_delta' | 'missing_line';
+  reqItemId: string;
+  materialId: string;
+  materialName: string;
+  /** RECIPE units this write wants to remove. 0 when !debits. */
+  requestedRecipe: number;
+  /**
+   * The SIGNED recipe delta this write applies to central — positive = out of
+   * the store, negative = back into it, 0 for the three carve-outs and for a
+   * line that no longer exists. This is the field a caller accumulates across a
+   * multi-line gesture; requestedRecipe alone would count the debits and ignore
+   * the credits that pay for them.
+   */
+  netRecipe: number;
+  /** RECIPE units issuable — max(0, stock − already claimed). */
+  availableRecipe: number;
+  /** The raw stored balance, negative included, so nothing is hidden. */
+  centralStockRecipe: number;
+  /** Largest afterLineQty this line can reach, in the LINE'S OWN unit. */
+  maxIssueLineQty: number;
+  /** requisition_items.unit as stored ('' means the recipe basis — Option B). */
+  lineUnit: string;
+  requestedPurchase: number;
+  availablePurchase: number;
+  /** raw_materials.purchase_unit as stored. Never blank on any of the 952 live
+   *  materials (checked), so a message may lean on it. */
+  purchaseUnit: string;
+  packFactor: number;
+  /** '' when ok. Already phrased for a storekeeper, in PURCHASE units. */
+  message: string;
+}
+
+/** Round DOWN to the house 6dp. A cap must never round itself up past the
+ *  balance it is capping. */
+const floor6 = (n: number) => Math.floor((Number(n) || 0) * 1e6) / 1e6;
+
+/**
+ * THE RULE, ASKED ONCE. Both issue routes call this before opening their
+ * transaction (to refuse with a good message) and applyIssueDelta calls it
+ * through assertCentralIssue inside the transaction (to make the bound real).
+ * One function, so the pre-flight and the floor can never disagree about what
+ * is issuable — a pre-flight that said yes where the floor says no would be a
+ * 500 at the counter, which is the failure this shape exists to avoid.
+ *
+ * UNITS. requisition_items quantities are in the LINE'S own unit; current_stock
+ * is RECIPE units. The conversion is lineFactor() — the same call applyIssueDelta
+ * makes for the debit itself, which is what guarantees the number compared here
+ * is the number subtracted there. A cap derived from a second conversion would
+ * refuse correct work and admit wrong work; packFactor is never re-derived (see
+ * lineFactor's own comment on the three hand-rolled copies in this repo).
+ *
+ * `alreadyClaimedRecipe` is for the pre-flight only, and it is SIGNED (sum the
+ * `netRecipe` of the lines already scored). One gesture can draw on the same
+ * material twice — two entries for one line, which store-issue documents and
+ * measures, or two lines for one material, which 0 of the 1,630 live
+ * requisitions currently hold — and each draw fits while the pair does not. The
+ * floor needs no equivalent: it re-reads current_stock per line, so by the time
+ * the second debit runs the first is already in the balance.
+ *
+ * WHERE THE PRE-FLIGHT CAN BE MORE GENEROUS THAN THE FLOOR, stated rather than
+ * hidden: a credit in the same gesture is assumed to land in full, while the
+ * credit clamp and assertReversible may reduce or refuse it. The floor is the
+ * authority and catches that; erring this way costs a late refusal with the same
+ * sentence, where erring the other way would refuse work the floor allows.
+ *
+ * ── `rail`: WHICH WRITER IS ASKING, AND WHY THE PARTY RAIL MUST SAY SO ───────
+ * The party carve-out below exists because on the INTERNAL rail a party line
+ * debits nothing — applyIssueDelta leaves it alone and the party rail moves the
+ * goods later, in one lump, at fulfilment. For that caller the carve-out is
+ * simply the truth.
+ *
+ * THE PARTY RAIL ITSELF IS THE OTHER CALLER, and for it that same carve-out
+ * would be a guard that reads correctly and can never fire — this codebase's
+ * recorded inert-guard pattern, 9 instances, in its purest form: a floor on the
+ * party debit that begins by excusing every party debit. So the party rail
+ * passes rail:'party' and the carve-out does not apply to it.
+ *
+ * NOTHING ELSE FORKS. The store-mapped and ambiguous-unit carve-outs, the
+ * lineFactor conversion, the comparison, the max(0, …) and the message are the
+ * same lines of code for both rails. That is the whole reason this takes a flag
+ * instead of getting a sibling function: a second floor with slightly different
+ * rules is the rival-helper trap, and a second conversion is the 750x one.
+ * rail defaults to 'internal', so every pre-existing caller is unchanged.
+ */
+export function checkCentralIssue(
+  db: any,
+  a: {
+    reqItemId: string;
+    beforeLineQty: number;
+    afterLineQty: number;
+    /** RECIPE units earlier lines of the SAME gesture have already claimed. */
+    alreadyClaimedRecipe?: number;
+    /**
+     * Who is debiting. 'internal' (default) = applyIssueDelta and the two issue
+     * desks' pre-flights, for which a party line debits nothing. 'party' = the
+     * party rail's own fulfilment debit (party-fulfillment.ts /
+     * po-requisition-fulfil.ts), for which the party carve-out would be inert.
+     */
+    rail?: 'internal' | 'party';
+  },
+): CentralIssueCheck {
+  const nil = (over: Partial<CentralIssueCheck>): CentralIssueCheck => ({
+    ok: true, debits: false, skipReason: 'zero_delta',
+    reqItemId: String(a.reqItemId || ''),
+    materialId: '', materialName: '', requestedRecipe: 0, netRecipe: 0,
+    availableRecipe: 0,
+    centralStockRecipe: 0, maxIssueLineQty: Number(a.afterLineQty) || 0,
+    lineUnit: '', requestedPurchase: 0, availablePurchase: 0,
+    purchaseUnit: '', packFactor: 1, message: '', ...over,
+  });
+
+  const line = db.prepare(`
+    SELECT ri.id, ri.material_id, ri.unit AS line_unit, r.purpose,
+           rm.name AS material_name, rm.unit, rm.purchase_unit, rm.pack_size,
+           COALESCE(rm.current_stock, 0) AS current_stock
+      FROM requisition_items ri
+      JOIN requisitions  r  ON r.id  = ri.req_id
+      JOIN raw_materials rm ON rm.id = ri.material_id
+     WHERE ri.id = ?
+  `).get(String(a.reqItemId)) as any;
+  // A line that is not there debits nothing; applyIssueDelta answers the same
+  // way ({ skipped: 'missing_line' }) a few lines into its own body.
+  if (!line) return nil({ skipReason: 'missing_line' });
+
+  // THE SAME THREE CARVE-OUTS, RESOLVED THE SAME WAY as applyIssueDelta does
+  // below — purpose === 'party', centralFlowBlock(), and lineFactor's
+  // needsReview. None of the three moves a gram of central stock, so none of
+  // them has a central balance to be short of.
+  //
+  // THE FIRST ONE IS THE CALLER'S OWN RAIL TALKING. See `rail` in the header:
+  // for the internal rail a party line debits nothing here and the carve-out is
+  // the truth; for the party rail, which IS the writer of that later debit, the
+  // same line would excuse the very thing it is being asked to bound.
+  if (a.rail !== 'party' && String(line.purpose || '') === 'party') {
+    return nil({ materialId: String(line.material_id), skipReason: 'party' });
+  }
+  let storeMapped = false;
+  try { storeMapped = centralFlowBlock(db, String(line.material_id)) !== null; } catch { /* not fatal */ }
+  if (storeMapped) return nil({ materialId: String(line.material_id), skipReason: 'store_mapped' });
+
+  const { factor, needsReview } = lineFactor(line.line_unit, line);
+  if (needsReview) {
+    return nil({ materialId: String(line.material_id), packFactor: factor, skipReason: 'unit_review' });
+  }
+
+  const deltaLine = (Number(a.afterLineQty) || 0) - (Number(a.beforeLineQty) || 0);
+  const requestedRecipe = Math.round(deltaLine * factor * 1e6) / 1e6;
+  // CREDITS AND NO-OPS ARE NOT THIS GUARD'S BUSINESS. A give-back raises the
+  // central balance and is bounded by the credit clamp plus assertReversible; a
+  // zero delta writes nothing at all. The signed figure still goes back, so a
+  // caller accumulating across lines sees the headroom the credit creates.
+  if (requestedRecipe <= EPS) {
+    return nil({
+      materialId: String(line.material_id), packFactor: factor,
+      netRecipe: requestedRecipe < -EPS ? requestedRecipe : 0,
+    });
+  }
+
+  const meta = { unit: line.unit, purchase_unit: line.purchase_unit, pack_size: line.pack_size };
+  const stock = Number(line.current_stock) || 0;
+  // SIGNED, deliberately. A negative running claim means an earlier line of the
+  // same gesture is putting goods BACK, which genuinely raises the balance this
+  // line draws on — and that is what the floor will see when it re-reads
+  // current_stock after that credit has been written.
+  const claimed = Number(a.alreadyClaimedRecipe) || 0;
+  // max(0, …): a balance that is ALREADY negative (0 of 952 materials today,
+  // but /api/inventory/fix-negative-stock exists because it has happened) must
+  // read as "nothing issuable", never as a negative allowance that would let the
+  // next issue dig the hole deeper.
+  const availableRecipe = Math.max(0, Math.round((stock - claimed) * 1e6) / 1e6);
+  const purchaseUnit = String(line.purchase_unit || line.unit || '').trim();
+  const availablePurchase = toPurchaseQty(availableRecipe, meta);
+  const requestedPurchase = toPurchaseQty(requestedRecipe, meta);
+  const base: CentralIssueCheck = {
+    ok: true, debits: true, skipReason: '',
+    reqItemId: String(line.id),
+    materialId: String(line.material_id),
+    materialName: String(line.material_name || ''),
+    requestedRecipe, netRecipe: requestedRecipe,
+    availableRecipe, centralStockRecipe: stock,
+    // In the LINE's unit, floored, so the value can be typed straight back into
+    // the Issue box and pass this very check on the retry.
+    maxIssueLineQty: Math.max(
+      Number(a.beforeLineQty) || 0,
+      floor6((Number(a.beforeLineQty) || 0) + availableRecipe / (factor || 1)),
+    ),
+    lineUnit: String(line.line_unit ?? ''),
+    requestedPurchase, availablePurchase, purchaseUnit,
+    packFactor: factor,
+    message: '',
+  };
+  // `+ EPS`: an exact-to-the-gram issue that lands the balance on 0 is correct
+  // work and must pass. Only going BELOW zero is refused.
+  if (requestedRecipe <= availableRecipe + EPS) return base;
+
+  // THE MESSAGE IS WRITTEN FOR THE 508, NOT FOR THE 56. Measured over all 16,346
+  // non-party lines: 564 carry an outstanding seed this floor would refuse, and
+  // on 508 of them the central balance is ZERO — there is no "issue less"
+  // available. A single sentence offering a smaller number would therefore be
+  // nonsense on 90% of the real refusals, which is this project's inert-guard
+  // pattern (9 recorded instances) in message form. So the empty case gets its
+  // own sentence and names the way out, and only the 56 are offered a partial.
+  const q = (n: number) => `${fmtQtyNum(n)}${purchaseUnit ? ` ${purchaseUnit}` : ''}`;
+  const message = availablePurchase > 0
+    ? `${base.materialName}: the central store holds only ${q(availablePurchase)}, `
+      + `so ${q(requestedPurchase)} cannot be issued. Issue ${q(availablePurchase)} or less on this line.`
+    : `${base.materialName}: the central store holds none of it, `
+      + `so ${q(requestedPurchase)} cannot be issued. Receive the stock, or record a closing count, first.`;
+  return { ...base, ok: false, message };
+}
+
+/**
+ * THE FLOOR. Throws CentralStockShort; it does NOT clamp — see "WHY THE FLOOR
+ * THROWS RATHER THAN CLAMPS" in this file's header.
+ *
+ * MUST be called inside the caller's transaction, immediately before the debit,
+ * for the same reason the pre-image must be: a balance read earlier races.
+ */
+export function assertCentralIssue(
+  db: any,
+  a: {
+    reqItemId: string; beforeLineQty: number; afterLineQty: number;
+    /** See `rail` on checkCentralIssue. Passed straight through. */
+    rail?: 'internal' | 'party';
+  },
+): CentralIssueCheck {
+  const c = checkCentralIssue(db, a);
+  if (!c.ok) throw new CentralStockShort(c);
+  return c;
+}
+
+/* ────────────────────────────────────────────────────────────────────────────
+ * THE REPLAY, AND WHY IT HAS TO BE RECOGNISED HERE RATHER THAN AT THE INSERT.
+ * ──────────────────────────────────────────────────────────────────────────*/
+
+/**
+ * Layer-2 idempotency used to be recognised by ACCIDENT: a replayed gesture
+ * reached insertLedger, collided on uq_req_issue_token_item, and the route read
+ * the SQLite constraint message. That worked only while nothing else on the path
+ * could refuse first — and the central floor, added in this same change, CAN.
+ *
+ * MEASURED, and this is the whole reason this class exists. Requisition asks 5,
+ * central holds exactly 2, the storekeeper issues 2 and defers the rest, and the
+ * same gesture is POSTed twice (a dropped response on a venue LAN — the exact
+ * case the token exists for):
+ *     3be09af : POST1 200 applied=2 ; POST2 200 success=true applied=0
+ *     with the floor and the route pre-flight in front of the insert, and
+ *     NOTHING consulting the token:
+ *               POST1 200 applied=2 ; POST2 400 code=central_stock_short
+ *     "nothing was issued and the requisition is unchanged"
+ * The hand-over had completed and central was down to 0, so the floor was
+ * telling the truth about the BALANCE and the opposite of the truth about the
+ * GESTURE. Final DB state was identical on both trees — the defect was purely
+ * what the storekeeper was told, and it trapped him: the client clears its
+ * armed panel only on a 2xx, so he retried the same token forever.
+ *
+ * THE FIX IS ORDERING, NOT A SECOND MESSAGE. The question "has this gesture
+ * already been recorded" is answered from requisition_issue_ledger, which is
+ * the same table and the same (client_token, req_item_id) pair the unique index
+ * is built on — so it can be asked at ANY point, and it is now asked BEFORE
+ * either guard can refuse. The index stays exactly where it was and remains the
+ * last word (it is the only thing that is atomic against a concurrent first
+ * POST), so this is an additional, earlier reading of the same fact — never a
+ * replacement for it.
+ */
+export class IssueTokenReplay extends Error {
+  readonly code = 'ISSUE_TOKEN_REPLAY';
+  readonly reqItemId: string;
+  readonly clientToken: string;
+  constructor(reqItemId: string, clientToken: string) {
+    super(
+      `This issue has already been recorded (gesture ${clientToken} on line ${reqItemId}). ` +
+      `Nothing was changed a second time.`,
+    );
+    this.name = 'IssueTokenReplay';
+    this.reqItemId = reqItemId;
+    this.clientToken = clientToken;
+  }
+}
+
+export function isIssueTokenReplayError(e: unknown): e is IssueTokenReplay {
+  return e instanceof IssueTokenReplay
+    || (typeof e === 'object' && e !== null && (e as { code?: string }).code === 'ISSUE_TOKEN_REPLAY');
+}
+
+/**
+ * Has (clientToken, reqItemId) already been written to the issue ledger? This
+ * is the unique index's own predicate, asked as a question instead of met as a
+ * collision.
+ *
+ * SCOPED TO THE LINE, not to the token, because the index is. One token covers a
+ * whole batch, and a SECOND POST under the same token naming a DIFFERENT line
+ * genuinely is new work — on 3be09af that line's insert did not collide and the
+ * work went through. Answering on the token alone would start refusing it.
+ *
+ * A blank/absent token is never a replay: the index is partial
+ * (WHERE client_token IS NOT NULL) and the 14,149 imported issued lines carry no
+ * token at all, so a tokenless gesture must stay freely repeatable.
+ */
+export function isIssueGestureRecorded(
+  db: any, clientToken: string | null | undefined, reqItemId: string,
+): boolean {
+  const token = String(clientToken ?? '').trim();
+  if (!token) return false;
+  const row = db.prepare(
+    `SELECT 1 FROM requisition_issue_ledger
+      WHERE client_token = ? AND req_item_id = ? LIMIT 1`,
+  ).get(token, String(reqItemId)) as any;
+  return !!row;
+}
+
 export function applyIssueDelta(db: any, input: IssueDeltaInput): IssueDeltaResult {
   // quantity_requested and chef_approved_qty are read HERE rather than passed
   // in, which is what keeps store-issue — the hottest, most carefully reasoned
@@ -357,13 +803,60 @@ export function applyIssueDelta(db: any, input: IssueDeltaInput): IssueDeltaResu
     //   SUM(delta_recipe_qty) for a req_item_id is never negative, and equals
     //   the net recipe quantity this rail has removed from the store.
     //
-    // Debits are never clamped — only the giving-back direction.
+    // DEBITS ARE STILL NEVER CLAMPED — THEY ARE NOW REFUSED. This sentence used
+    // to read "Debits are never clamped — only the giving-back direction", and
+    // it was the whole bug: the debit direction had no bound of any kind, so
+    // issuing more than the store held drove current_stock negative in silence
+    // (measured: central 0 kg -> -1 kg on a 1 kg issue). The floor below does
+    // not clamp either — a clamp here would commit a line claiming more than
+    // moved — it THROWS, and the caller's transaction unwinds. The clamp
+    // immediately after this still governs the credit direction and is
+    // untouched.
     const takenRow = db.prepare(
       `SELECT COALESCE(SUM(delta_recipe_qty), 0) AS taken FROM requisition_issue_ledger WHERE req_item_id = ?`,
     ).get(input.reqItemId) as any;
     const taken = Number(takenRow?.taken) || 0;
     if (stockQty < 0 && taken + stockQty < -EPS) stockQty = -taken;
     if (Math.abs(stockQty) < EPS) stockQty = 0;
+  }
+
+  // Would this call reach insertLedger at all? ONE expression, read twice — here
+  // and by the early return further down that uses it as its own condition.
+  // They MUST agree: the replay check below is placed early precisely so it
+  // fires in exactly the cases the unique index used to fire in, and if these
+  // two tests ever drift that equivalence quietly stops holding.
+  const writesLedgerRow = !(recordQty === 0 && stockQty === 0 && !needsReview);
+
+  // ── THE REPLAY IS RECOGNISED HERE, AHEAD OF BOTH GUARDS ───────────────────
+  // THIS IS AN ORDERING FIX, AND THE ORDER IS THE WHOLE POINT. Until now the
+  // only thing that knew about a spent token was the unique index at
+  // insertLedger, which is the LAST write this function makes. Everything that
+  // can refuse — the department-reversal guard, and now the central floor —
+  // sits in front of it, so whichever of them spoke first got to answer for a
+  // replay. The floor did: it reported "the central store holds none of it" for
+  // a hand-over that had already completed and taken the balance to zero.
+  //
+  // IT IS EQUIVALENT TO THE INDEX, NOT MERELY EARLIER THAN IT. The index fires
+  // iff a row is inserted, and a row is inserted iff the zero-delta gate above
+  // let us through AND `writesLedgerRow`. Both are already decided at this
+  // line, so this test fires on exactly the same calls — which is what lets the
+  // route keep answering a replay the way it did on 3be09af. In particular a
+  // replayed gesture that writes NO row (a reject that keeps what was handed
+  // over, an undo of one of the 14,149 pre-ledger lines, a defer) is not a
+  // replay for this purpose and still proceeds, exactly as it did before.
+  //
+  // IT THROWS, like the index did and like both guards do. Every caller has
+  // ALREADY written quantity_issued by the time we are reached (store-issue
+  // walks its lines, store-process rewrites them absolutely), so returning a
+  // quiet skip here would COMMIT that second write — an 'issue' of 2 kg
+  // replayed would read 4 kg issued against 2 kg that moved. The throw unwinds
+  // the caller's transaction, which is what makes the replay a true no-op.
+  //
+  // THE INDEX STAYS, AND STAYS THE LAST WORD. This read cannot be atomic
+  // against a first POST that has not committed yet; the index can. Both routes
+  // still recognise the constraint message.
+  if (writesLedgerRow && isIssueGestureRecorded(db, input.clientToken, input.reqItemId)) {
+    throw new IssueTokenReplay(String(input.reqItemId), String(input.clientToken || ''));
   }
 
   let invTxnId: string | null = null;
@@ -415,6 +908,34 @@ export function applyIssueDelta(db: any, input: IssueDeltaInput): IssueDeltaResu
         materialId: String(line.material_id),
         qty: -stockQty,
       });
+    } else {
+      // THE CENTRAL FLOOR — THE MIRROR OF THE REVERSAL GUARD, ON THE OTHER
+      // DIRECTION. assertReversible above answers "does the department still
+      // hold what we are putting back"; this answers "does central hold what we
+      // are taking out". Before this existed the debit had no bound at all and
+      // an over-issue simply drove current_stock negative.
+      //
+      // IT READS THE BALANCE HERE, inside the caller's transaction and one
+      // statement before the UPDATE, so it cannot be raced by a concurrent
+      // issue: better-sqlite3 is synchronous and no caller awaits inside its
+      // transaction, so from this read to that write nothing interleaves.
+      //
+      // IT THROWS, exactly like assertReversible and for the identical reason —
+      // quantity_issued is already written by every caller at this point, so a
+      // silent partial debit would commit a line that claims more than moved.
+      // The throw unwinds the caller's transaction and the line is untouched.
+      //
+      // BOTH ROUTES ALREADY REFUSED THIS BEFORE OPENING THEIR TRANSACTION, with
+      // every short line named at once (checkCentralIssue, the same rule). So in
+      // ordinary use this never fires, and that is the point: it is the bound
+      // that makes the no-negative property structural rather than a promise the
+      // two routes keep. It is what answers a direct API call, a third issue
+      // desk written next year, and the pre-flight/transaction race.
+      assertCentralIssue(db, {
+        reqItemId: input.reqItemId,
+        beforeLineQty: Number(input.beforeLineQty) || 0,
+        afterLineQty: Number(input.afterLineQty) || 0,
+      });
     }
 
     // Positive delta = goods left the store.
@@ -454,7 +975,7 @@ export function applyIssueDelta(db: any, input: IssueDeltaInput): IssueDeltaResu
   // above, so this cannot reintroduce the junk-row-per-process problem — the
   // old code, which had no zero-delta gate ahead of it, wrote one of these on
   // every single process.
-  if (recordQty === 0 && stockQty === 0 && !needsReview) {
+  if (!writesLedgerRow) {
     return { applied: false, skipped: 'zero_delta', packFactor: factor };
   }
 

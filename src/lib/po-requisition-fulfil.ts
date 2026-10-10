@@ -4,6 +4,7 @@ import { GrnRefused, logAuditOrThrow, r6 } from './grn-reversal';
 import {
   postCentralTxn, deptParty, PARTY_TRANSFER_TYPE, PARTY_TRANSFER_TYPES_SQL,
 } from '@/lib/movement-record';
+import { checkCentralIssue } from '@/lib/issue-stock';
 
 /* ══════════════════════════════════════════════════════════════════════════
  * THE PO → REQUISITION FULFIL CASCADE, IN ONE PLACE.
@@ -27,12 +28,20 @@ import {
  * One helper, two callers, one behaviour. Copying it would have been two
  * behaviours the day one of them was edited.
  *
- * ── THE BODY IS UNCHANGED ──────────────────────────────────────────────────
- * Lifted verbatim from receive/route.ts. Only three names were rewritten —
+ * ── THE BODY WAS LIFTED VERBATIM, AND HAS SINCE GAINED THE CENTRAL FLOOR ───
+ * It came from receive/route.ts with only three names rewritten —
  * po.requisition_id → requisitionId, po.outlet_id → poOutletId,
- * receivedByEmail → actorEmail. Every comment, every guard, the effective-qty
- * rule, the pack factor and the average_price basis are exactly as they were;
- * they are load-bearing and are documented in place below.
+ * receivedByEmail → actorEmail. The effective-qty rule and the average_price
+ * basis are still exactly as they were; they are load-bearing and are
+ * documented in place below.
+ *
+ * ONE THING IS NO LONGER VERBATIM: the party debit is now bounded, and its
+ * hand-rolled pack factor is gone in favour of the shared one. The debit ran as
+ * a bare `current_stock = current_stock - ?` with no balance read, so this
+ * cascade could drive central negative with NO STOREKEEPER ANYWHERE IN THE
+ * STORY (measured: a party line of 9 against a balance of 0 → −9, status
+ * fulfilled). See THE UNATTENDED-PATH JUDGEMENT at the clamp below, which is
+ * why this route CLAMPS where the two issue desks THROW.
  *
  * ── IT IS ITS OWN REPLAY GUARD ─────────────────────────────────────────────
  * Two guards, both pre-existing:
@@ -122,6 +131,13 @@ export function fulfilRequisitionFromPo(
       const partyOutletId = reqRow.outlet_id || poOutletId || null;
       const partyNote = `Party: ${reqRow.event_name || '(unnamed)'} @ ${reqRow.event_date || ''}`.trim();
       const auditItems: any[] = [];
+      // Every line this cascade could NOT satisfy in full, for the audit row
+      // below. See THE UNATTENDED-PATH JUDGEMENT at the clamp.
+      const shortfalls: Array<{
+        req_item_id: string; material_id: string; material_name: string;
+        reason: string; wanted_recipe: number; issued_recipe: number;
+        short_recipe: number; central_stock_recipe: number;
+      }> = [];
       let totalCost = 0;
       for (const it of reqItems) {
         /* EFFECTIVE QTY — the house rule (store-issue/route.ts, dept-stock,
@@ -136,20 +152,110 @@ export function fulfilRequisitionFromPo(
           : Number(it.quantity_requested)) || 0;
         const issuedReq = Math.min(Number(it.quantity_issued) || effApproved, effApproved);
         if (issuedReq <= 0) continue;
+
+        /* ── THE UNATTENDED-PATH JUDGEMENT ──────────────────────────────────
+           THIS ROUTE CLAMPS. The two issue desks THROW, and the difference is
+           deliberate: it is about whether there is a human being to read a
+           refusal.
+
+           applyPartyFulfillment runs with a storekeeper at the counter, mid
+           hand-over, inside a request he just made. Throwing there unwinds HIS
+           gesture, puts the sentence on HIS screen and he fixes the stock. That
+           is the right answer and it is what that rail does.
+
+           NOBODY IS HERE. This cascade fires from a purchase-order receipt or a
+           GRN QC sign-off (receive/route.ts:1930, grn-qc.ts:2043) — a delivery
+           that has physically arrived and been counted, or a chef signing off
+           perishables. The party requisition is a BYSTANDER to that
+           transaction. A throw would roll the whole receipt back, so:
+             · goods that are on the premises would be recorded as not received,
+             · the QC signature would vanish,
+             · the refusal would be addressed to a person who is not there,
+             · and the thing actually at fault — a short party line on some
+               other material — would be nowhere on screen.
+           Destroying a correct delivery to prevent a bad party debit is a worse
+           outcome than the debit, and it fails closed on the wrong transaction.
+
+           SO BOTH OF THE OWNER'S REQUIREMENTS ARE MET WITHOUT A THROW:
+             1. central must not silently go negative → the debit is clamped to
+                what central actually holds, so the floor still holds absolutely.
+                Never more, never below zero.
+             2. he must be able to SEE what could not be satisfied → every
+                clamped or skipped line is recorded in audit_events as
+                'requisition.party_consumption.short', naming the material, what
+                was wanted, what moved and what is missing. The word "silently"
+                is the part this removes; the arithmetic is the part the clamp
+                removes.
+
+           A CLAMPED LINE IS PERMANENT, WHICH IS WHY THE RECORD IS NOT OPTIONAL.
+           Both party rails treat ONE party transfer row on the requisition as
+           proof the whole transfer happened, so a short line will not be topped
+           up on a later call by either of them. The audit row is the only thing
+           that will ever say so.
+
+           THE VOID STAYS CORRECT FOR FREE. reverseRequisitionFulfilFromPo
+           credits back ABS(the stored inventory_transactions.quantity) and never
+           recomputes (see its header), so it reverses exactly the clamped figure
+           that was written. A line clamped to zero writes no row at all — the
+           same shape as the pre-existing `issuedReq <= 0` skip — and the void's
+           own 'party_row_shape' guard, which refuses a zero or positive row,
+           therefore still never sees one. */
+        const c = checkCentralIssue(db, {
+          reqItemId: String(it.id),
+          beforeLineQty: 0,
+          afterLineQty: issuedReq,
+          rail: 'party',
+        });
+
+        // The two carve-outs the internal floor respects, honoured here too, and
+        // gating BOTH the debit and the cost line. store_mapped = the material's
+        // balance lives on the TGBCL store ledger, not in central (95 of the 127
+        // store-mapped materials hold a central balance of 0, so a party draw on
+        // one went straight below zero). unit_review = ri.unit is blank or
+        // unrecognised on a PACKED material, so the old CASE above silently
+        // guessed recipe units where dept-stock reads the same blank as the
+        // purchase basis — a 750x fork decided by which screen you opened.
+        if (!c.debits) {
+          shortfalls.push({
+            req_item_id: String(it.id), material_id: String(it.material_id),
+            material_name: String(it.material_name || ''),
+            reason: c.skipReason || 'zero_delta',
+            wanted_recipe: 0, issued_recipe: 0, short_recipe: 0,
+            central_stock_recipe: c.centralStockRecipe,
+          });
+          continue;
+        }
+
         // ri.unit → RECIPE units. Requisition quantities are stored in the
         // LINE's OWN unit (option B), so a "2 BTL" line is TWO BOTTLES —
-        // deducting it verbatim took 2 ml off stock instead of 1,500 ml
-        // and wrote a −2 party transfer row. Same pack-factor CASE as
-        // src/lib/party-fulfillment.ts and the department-consumption SQL;
-        // keep the three byte-equivalent.
-        const rPack = Number(it.rm_pack_size) || 1;
-        const reqPackFactor =
-          (String(it.unit ?? '').trim() !== '' &&
-           it.unit === it.rm_purchase_unit &&
-           it.unit !== it.rm_unit &&
-           rPack > 1)
-            ? rPack : 1;
-        const issued = issuedReq * reqPackFactor;   // RECIPE units
+        // deducting it verbatim took 2 ml off stock instead of 1,500 ml and
+        // wrote a −2 party transfer row. THE FACTOR IS THE FLOOR'S OWN: the
+        // hand-rolled CASE that stood here is gone, so the quantity weighed
+        // against the balance and the quantity taken off it are one number and
+        // cannot drift. Proved a no-op on quantity across all 16,353 live
+        // requisition lines (identical factor on 16,350; the other 3 are the
+        // blank-unit packed lines both now refuse instead of guessing).
+        const wanted = c.requestedRecipe;          // RECIPE units
+        // THE CLAMP. min() of the rule's allowance AND the raw stored balance —
+        // both come from this one check, so it is still one rule. availableRecipe
+        // is the 6dp-rounded allowance the floor publishes; centralStockRecipe is
+        // the exact balance, and taking the lower of the two means a rounding
+        // step can never hand out a fraction more than is physically there.
+        const issued = Math.max(0, Math.min(wanted, c.availableRecipe, Math.max(0, c.centralStockRecipe)));
+        if (issued <= 0 || issued < wanted - 1e-9) {
+          shortfalls.push({
+            req_item_id: String(it.id), material_id: String(it.material_id),
+            material_name: String(it.material_name || ''),
+            reason: 'central_stock_short',
+            wanted_recipe: wanted, issued_recipe: issued,
+            short_recipe: Math.round((wanted - issued) * 1e6) / 1e6,
+            central_stock_recipe: c.centralStockRecipe,
+          });
+        }
+        // Nothing issuable at all writes NO movement row, exactly as the
+        // `issuedReq <= 0` skip above does — a zero-quantity party row would be
+        // a movement that did not happen, and the void refuses rows of that shape.
+        if (issued <= 0) continue;
         decStock.run(issued, it.material_id);
         // MOVEMENT RECORD: the party's draw on central. The destination was
         // implicit in the type; it is now the requisition's own department when
@@ -175,12 +281,13 @@ export function fulfilRequisitionFromPo(
         });
         /* BOTH SIDES OF THIS MULTIPLICATION ARE ON THE RECIPE BASIS.
            LEFT  — `issued` is RECIPE units (ml/g): issuedReq is in the LINE's
-                   own unit and reqPackFactor above lifted a purchase-unit
-                   line into recipe units.
+                   own unit and the shared pack factor applied by
+                   checkCentralIssue above lifted a purchase-unit line into
+                   recipe units (it is `c.requestedRecipe`, possibly clamped).
            RIGHT — raw_materials.average_price is ₹ per RECIPE unit by canon,
-                   so it needs NO pack conversion. Dividing it by rPack, or
-                   multiplying it up, would break the trio.
-           It used to read last_purchase_price / rPack here. That column is
+                   so it needs NO pack conversion. Dividing it by the pack size,
+                   or multiplying it up, would break the trio.
+           It used to read last_purchase_price / pack_size here. That column is
            stored in MIXED bases: of the 190 packed materials that hold both a
            stored LPP and a purchase history, 71 are ALREADY ₹/recipe-unit, so
            the divide fired a second time — MALA STRAWBERRY CRUSH 5 LTR
@@ -198,6 +305,12 @@ export function fulfilRequisitionFromPo(
           quantity: issued,
           unit_cost: unitCost,
           line_cost: lineCost,
+          // Stated on the line itself as well as in the shortfall event below,
+          // so the consumption record cannot read as a full hand-over when the
+          // clamp reduced it. Only present when it actually bit.
+          ...(issued < wanted - 1e-9
+            ? { requested_quantity: wanted, short_quantity: Math.round((wanted - issued) * 1e6) / 1e6 }
+            : {}),
         });
       }
       logAuditEvent(db, {
@@ -208,6 +321,30 @@ export function fulfilRequisitionFromPo(
         after: { items: auditItems, total_cost: Math.round(totalCost * 100) / 100 },
         note: partyNote,
       });
+      // WHAT COULD NOT BE SATISFIED, ON ITS OWN ROW. Written only when the clamp
+      // or a carve-out bit, so an ordinary cascade is byte-identical to before.
+      //
+      // IT IS A THIRD, SEPARATE EVENT TYPE ON PURPOSE. cascadeDeductionWitness
+      // below decides what a void may undo from exactly two names —
+      // 'requisition.party_consumption' and '…​.skipped' — and the event above is
+      // still written whenever this branch ran, so the witness answers 'deducted'
+      // exactly as it did before and this row cannot change its mind. It is a
+      // report to the owner, not a discriminator; do NOT add it to that IN list.
+      if (shortfalls.length > 0) {
+        logAuditEvent(db, {
+          event_type: 'requisition.party_consumption.short',
+          entity_type: 'requisition',
+          entity_id: requisitionId,
+          actor_email: actorEmail,
+          after: {
+            reason: 'central_floor',
+            lines: shortfalls,
+            moved_lines: auditItems.length,
+          },
+          note: `${partyNote} — ${shortfalls.length} line(s) could not be issued in full from central: `
+            + shortfalls.map(s => `${s.material_name || s.material_id} (${s.reason})`).join(', '),
+        });
+      }
     }
   }
 }
