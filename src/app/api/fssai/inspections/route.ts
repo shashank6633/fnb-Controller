@@ -3,9 +3,12 @@ import { getDb, generateId } from '@/lib/db';
 import { getCurrentOutletId, isManagement } from '@/lib/auth';
 import {
   FSSAI_FINDING_SEVERITIES, FSSAI_FINDING_STATUSES, FSSAI_INSPECTION_KINDS, FSSAI_INSPECTION_STATUSES,
-  fssaiFindingSeverityRank, fssaiToday, fssaiVoidRefusal, isISODate,
+  fssaiFindingSeverityRank, fssaiFindingSeverityMeta, fssaiToday, fssaiVoidRefusal, isISODate,
+  fssaiCaDueDate, isFssaiCaSeverity, type FssaiCaSeverity,
 } from '@/lib/fssai';
-import { requireFssaiUser, fssaiCsrfGuard, fssaiAudit, fssaiAppAudit, str, constraintMessage } from '@/lib/fssai-server';
+import {
+  requireFssaiUser, fssaiCsrfGuard, fssaiAudit, fssaiAppAudit, str, constraintMessage, nextFssaiCaNumber,
+} from '@/lib/fssai-server';
 import { deptLabel, fssaiTableExists, intOr, whereAll, departmentNames } from '../_p9/lib';
 
 /**
@@ -24,14 +27,37 @@ import { deptLabel, fssaiTableExists, intOr, whereAll, departmentNames } from '.
  * therefore does NOT re-implement a fix: `response` is what we told the
  * authority, and the work itself hangs off the corrective action.
  *
- * ⚠️ AND IT CANNOT RAISE ONE. /api/fssai/corrective-actions states in its own
- * header that it is "the ONLY route that writes fssai_corrective_actions after
- * the raise" and that there is "no way to create one by hand" — the only raiser
- * is a failed checklist answer. So a finding can be ATTACHED to a corrective
- * action that already exists (the id is validated against the table before it is
- * stored), and raising one straight from a finding is a genuine gap that belongs
- * to P7, not a shortcut to take here by inserting a row from this file. It is
- * written up in this lane's report rather than worked around.
+ * ── A FINDING CAN RAISE ITS OWN ACTION (owner §7 Q32, the gap that closed) ──
+ * `raise_ca` on a point — or `raise_ca: true` on `add_finding` — raises ONE
+ * corrective action from the inspector's own words. It is the SAME raise every
+ * other record already does (a failed checklist answer in fssai-server.ts, a
+ * warm fridge in _p4, oil/water/expiry in _p5, a pest sighting in p6-shared),
+ * into the SAME spine and through the SAME shared pieces:
+ *   · the one number allocator, `nextFssaiCaNumber` — so CA numbers cannot drift
+ *     into two sequences (uq_fssai_ca_number is the backstop);
+ *   · the one due-date rule, `fssaiCaDueDate`, and the Task Manager's four
+ *     severity words;
+ *   · the same column list, status 'open', `run_id` NULL (never '' — FK);
+ *   · `source_kind = 'inspection'`, a value db.ts declared for exactly this in P1.
+ * The raise is the ONLY write this file makes to that table. Every later move —
+ * assign, start, complete, verify, cancel, make it a task — is
+ * /api/fssai/corrective-actions' alone, unchanged; this file never updates an
+ * action, so the status guards there cannot be bypassed from here.
+ *
+ * THE LINK, BOTH WAYS, IN ONE TRANSACTION. The finding's `ca_id` is set with a
+ * guarded UPDATE (`WHERE ca_id = ''`), so a point can never hold two actions
+ * and a double press raises one. The action carries the finding in words —
+ * which visit, which point, the clause, the severity as THEY graded it, where,
+ * and who inspected — because whoever picks it up may never open this screen.
+ * `response_id` is deliberately left '': it joins fssai_responses in the shared
+ * CA SELECT, and a finding id there would print "Recorded as “—” — which
+ * failed" on the action, about an answer that does not exist.
+ *
+ * MANUAL, NEVER AUTOMATIC. Nothing here raises an action unasked: a visit with
+ * no point raises nothing, and a point raises nothing until somebody presses
+ * the button (or ticks the box on the add form). An inspector's "observation"
+ * often needs no work, and an action nobody chose is the inert row this module
+ * has been bitten by before.
  *
  * ── THE TWO COUNTERS, AND WHY RECOMPUTING THEM IS NOT A HISTORY REWRITE ─────
  * finding_count and open_count on the inspection are recomputed from the
@@ -44,7 +70,10 @@ import { deptLabel, fssaiTableExists, intOr, whereAll, departmentNames } from '.
  *   GET  ?id=<inspection>       one visit, with every finding on it
  *   GET  [?status=&kind=&from=&to=&department_id=&q=]   the history
  *   POST { action: 'create'|'update'|'close'|'reopen'|'void'
- *                 |'add_finding'|'update_finding'|'close_finding'|'reopen_finding', … }
+ *                 |'add_finding'|'update_finding'|'close_finding'|'reopen_finding'
+ *                 |'raise_ca', … }
+ *        raise_ca: { id: <finding>, ca_severity?, ca_due_date?, ca_owner_email? }
+ *        add_finding also takes raise_ca: true plus the same three ca_* fields.
  *
  * MANAGEMENT ONLY, both verbs. This holds a regulator's findings about the
  * business; §7 Q10's default is that cross-department and inspection material is
@@ -154,6 +183,195 @@ function shapeFinding(row: any, deptMap: Map<string, string>, today: string) {
     overdue: String(row.status) !== 'closed' && !!String(row.due_date || '') && String(row.due_date) < today,
     sort_order: intOr(row.sort_order),
   };
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * RAISING A CORRECTIVE ACTION FROM A FINDING — see the header for the contract.
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * The inspector's grading in the corrective-action vocabulary (the Task
+ * Manager's four words, FSSAI_CA_SEVERITIES). Rank for rank: their worst is our
+ * most urgent. A default only — the person raising it can choose another, and a
+ * manager can change it later in the corrective-action queue.
+ */
+const FINDING_TO_CA_SEVERITY: Readonly<Record<string, FssaiCaSeverity>> = {
+  critical: 'urgent',
+  major: 'high',
+  minor: 'medium',
+  observation: 'low',
+};
+
+/** A finding can only raise an action while it is still a live point. */
+const FINDING_STATES_THAT_MAY_RAISE = ['open', 'in_progress'];
+
+/** Thrown inside the transaction when the guarded link finds a ca_id already set. */
+const FINDING_ALREADY_HAS_CA = 'FSSAI_FINDING_ALREADY_HAS_CA';
+
+interface RaiseOptions { severity: string; dueDate: string; ownerEmail: string }
+
+/** Read and check the three optional ca_* fields. A Response is a refusal. */
+function readRaiseOptions(db: any, body: any): RaiseOptions | Response {
+  const severity = str(body?.ca_severity);
+  if (severity && !isFssaiCaSeverity(severity)) {
+    return Response.json(
+      { error: `"${severity}" is not a corrective-action severity. Use low, medium, high or urgent — or leave it to follow the point's own severity.` },
+      { status: 400 },
+    );
+  }
+  const dueDate = str(body?.ca_due_date);
+  if (dueDate && !isISODate(dueDate)) {
+    return Response.json({ error: 'The date the fix is due must be a real date.' }, { status: 400 });
+  }
+  const ownerEmail = str(body?.ca_owner_email).trim().toLowerCase();
+  if (ownerEmail) {
+    /* The corrective-action route's own rule for an owner (its 'assign'): an
+     * action given to an address nobody signs in with LOOKS assigned and is
+     * never done, which is worse than looking unassigned. */
+    const who = db.prepare(`SELECT email FROM users WHERE lower(email) = lower(?) AND is_active = 1`).get(ownerEmail) as any;
+    if (!who) {
+      return Response.json({ error: `Nobody signs in as "${ownerEmail}". Choose somebody who does, or leave it unassigned.` }, { status: 400 });
+    }
+  }
+  return { severity, dueDate, ownerEmail };
+}
+
+/**
+ * The point must still be open, on a visit that is neither closed nor voided,
+ * and must not already have an action. null when it may raise, else the refusal.
+ */
+function raiseRefusal(db: any, finding: any, insp: any): { error: string; status: number } | null {
+  if (!insp) return { error: 'The inspection this point belongs to no longer exists.', status: 404 };
+  if (String(insp.status) === 'void') {
+    return { error: 'That inspection has been voided. A voided record raises nothing.', status: 409 };
+  }
+  if (String(insp.status) === 'closed') {
+    return { error: 'That inspection is closed. Reopen it first, so the file shows why work was raised after it was closed.', status: 409 };
+  }
+  if (!FINDING_STATES_THAT_MAY_RAISE.includes(String(finding.status))) {
+    return {
+      error: 'That point is already settled. Reopen it first if it still needs fixing — an action against a closed point is a job nobody will connect to anything.',
+      status: 409,
+    };
+  }
+  const existing = str(finding.ca_id);
+  if (existing) {
+    const ca = db.prepare(`SELECT ca_number, status FROM fssai_corrective_actions WHERE id = ?`).get(existing) as any;
+    return {
+      error: ca
+        ? `This point already has corrective action ${ca.ca_number} (${ca.status}). One point, one fix — follow that one in Corrective actions.`
+        : 'This point is already linked to a corrective action. Clear that link before raising another.',
+      status: 409,
+    };
+  }
+  return null;
+}
+
+/**
+ * RAISE ONE ACTION FOR ONE FINDING, and link the finding to it.
+ *
+ * MUST be called inside the caller's db.transaction — the allocator, the insert,
+ * the guarded link and the audit rows commit together or not at all.
+ * better-sqlite3 is synchronous: nothing in here is awaited.
+ *
+ * Throws FINDING_ALREADY_HAS_CA if the point gained an action between the
+ * caller's check and this write; the transaction then rolls the insert back.
+ */
+function raiseCaFromFinding(
+  db: any,
+  p: {
+    finding: any;
+    inspection: any;
+    options: RaiseOptions;
+    deptMap: Map<string, string>;
+    actor: { email: string; name: string };
+    outletId: string;
+    today: string;
+  },
+): { id: string; ca_number: string; severity: string; due_date: string; owner_email: string; title: string; department_id: string } {
+  const { finding, inspection: insp, options, actor } = p;
+
+  const severity: string = options.severity || FINDING_TO_CA_SEVERITY[String(finding.severity)] || 'medium';
+  /* Counted from the day the work is raised — or from the visit, if the visit
+   * is dated ahead (a planned visit). An inspection recorded a week late must
+   * not hand the kitchen an action that was overdue before anyone saw it. */
+  const visitDate = isISODate(String(insp.business_date || '')) ? String(insp.business_date) : p.today;
+  const fromDate = visitDate > p.today ? visitDate : p.today;
+  /* THEIR DEADLINE WINS. A date the inspector set for this point is the date
+   * the authority will ask about; the house default is only for a point
+   * without one. An explicit choice from the person raising it beats both. */
+  const findingDue = isISODate(String(finding.due_date || '')) ? String(finding.due_date) : '';
+  const dueDate = options.dueDate || findingDue || fssaiCaDueDate(severity, fromDate);
+
+  const id = generateId();
+  const caNumber = nextFssaiCaNumber(db, fromDate);
+  const observation = String(finding.observation || '').trim();
+  /* THE OBSERVATION IS THE TITLE, as the question is on a failed check.
+   * Inventing a summary would put words on a compliance record nobody wrote. */
+  const title = observation.slice(0, 300);
+  const departmentId = String(finding.department_id || insp.department_id || '');
+  const pointNo = String(finding.finding_no || finding.sort_order || '').trim();
+  const kind = FSSAI_INSPECTION_KINDS.find((k) => k.key === String(insp.inspection_kind))?.label || String(insp.inspection_kind || '');
+  const inspector = String(insp.inspector_name || '').trim();
+  const who = [
+    String(insp.authority || '').trim(),
+    inspector ? `inspector ${inspector}${String(insp.inspector_id_no || '').trim() ? ` (ID ${String(insp.inspector_id_no).trim()})` : ''}` : '',
+  ].filter(Boolean).join(', ');
+  const where = [String(finding.location_label || '').trim(), deptLabel(p.deptMap, departmentId)].filter(Boolean).join(' · ');
+
+  /* THE FINDING TRAVELS WITH THE ACTION, written once and frozen — the same
+   * reason the checklist raiser quotes the failed answer: whoever picks this up
+   * may not be able to open the inspection, and should not need to. */
+  const description = [
+    `Raised from point ${pointNo || '—'} of inspection ${insp.inspection_no || '(unnumbered)'} — ${kind}${who ? `, ${who}` : ''} — on the visit of ${insp.business_date}.`,
+    `Their finding (${fssaiFindingSeverityMeta(finding.severity).label}${String(finding.clause_ref || '').trim() ? `, clause ${String(finding.clause_ref).trim()}` : ''}): “${observation}”`,
+    where ? `Where: ${where}.` : '',
+    String(finding.category || '').trim() ? `Category: ${String(finding.category).trim()}.` : '',
+    findingDue ? `The inspector's deadline for this point: ${findingDue}.` : '',
+  ].filter(Boolean).join(' ');
+
+  db.prepare(
+    `INSERT INTO fssai_corrective_actions
+       (id, ca_number, source_kind, run_id, response_id, equipment_id, department_id,
+        title, description, severity, status, owner_email, due_date, created_by, outlet_id)
+     VALUES (?, ?, 'inspection', NULL, '', '', ?, ?, ?, ?, 'open', ?, ?, ?, ?)`,
+  ).run(
+    id, caNumber, departmentId, title, description, severity,
+    options.ownerEmail, dueDate, actor.email, p.outletId,
+  );
+
+  /* The link, guarded: only a point with no action yet takes this one. */
+  const linked = db.prepare(
+    `UPDATE fssai_inspection_findings SET ca_id = ?, updated_at = datetime('now') WHERE id = ? AND ca_id = ''`,
+  ).run(id, String(finding.id));
+  if (linked.changes !== 1) throw new Error(FINDING_ALREADY_HAS_CA);
+
+  const reason = `Corrective action ${caNumber} raised from point ${pointNo || '—'} of ${insp.inspection_no || 'this inspection'}.`;
+  fssaiAudit(db, {
+    entity_table: 'fssai_corrective_actions', entity_id: id, action: 'create',
+    after: {
+      ca_number: caNumber, source_kind: 'inspection', source_table: 'fssai_inspection_findings',
+      source_id: String(finding.id), inspection_id: String(insp.id), inspection_no: String(insp.inspection_no || ''),
+      finding_severity: String(finding.severity || ''), severity, status: 'open', title,
+      owner_email: options.ownerEmail, due_date: dueDate,
+    },
+    reason, actor, outlet_id: p.outletId,
+  });
+  fssaiAudit(db, {
+    entity_table: 'fssai_inspection_findings', entity_id: String(finding.id), action: 'raise_ca', field: 'ca_id',
+    before: { ca_id: '' }, after: { ca_id: id, ca_number: caNumber, severity, due_date: dueDate },
+    reason, actor, outlet_id: p.outletId,
+  });
+  /* And on the visit itself, because the visit's own trail (GET ?id=) reads
+   * only fssai_inspections rows — without this the file would show the point
+   * and never say work was raised from it. */
+  fssaiAudit(db, {
+    entity_table: 'fssai_inspections', entity_id: String(insp.id), action: 'raise_ca', field: 'finding',
+    after: { finding_id: String(finding.id), finding_no: pointNo, ca_id: id, ca_number: caNumber },
+    reason, actor, outlet_id: p.outletId,
+  });
+
+  return { id, ca_number: caNumber, severity, due_date: dueDate, owner_email: options.ownerEmail, title, department_id: departmentId };
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -640,6 +858,25 @@ export async function POST(request: Request) {
         if (!ca) return Response.json({ error: 'That corrective action does not exist.' }, { status: 400 });
       }
 
+      /* RAISE ONE NOW, if asked — in the same transaction as the point, so a
+       * point that asked for an action can never be saved without it. */
+      const wantsCa = body?.raise_ca === true || body?.raise_ca === 1 || body?.raise_ca === '1';
+      let raiseOpts: RaiseOptions | null = null;
+      if (wantsCa) {
+        if (caId) {
+          return Response.json(
+            { error: 'Either link this point to an existing corrective action or raise a new one — not both.' },
+            { status: 400 },
+          );
+        }
+        if (!fssaiTableExists(db, 'fssai_corrective_actions')) {
+          return Response.json({ error: 'Corrective actions are not available in this copy of the database yet.' }, { status: 503 });
+        }
+        const opts = readRaiseOptions(db, body);
+        if (opts instanceof Response) return opts;
+        raiseOpts = opts;
+      }
+
       const fid = generateId();
       const nextOrder = intOr(
         (db.prepare(`SELECT MAX(sort_order) AS n FROM fssai_inspection_findings WHERE inspection_id = ?`).get(inspectionId) as any)?.n,
@@ -653,6 +890,7 @@ export async function POST(request: Request) {
         response: str(body?.response), status: 'open', sort_order: nextOrder,
       };
 
+      let raised: ReturnType<typeof raiseCaFromFinding> | null = null;
       db.transaction(() => {
         db.prepare(
           `INSERT INTO fssai_inspection_findings
@@ -669,11 +907,83 @@ export async function POST(request: Request) {
         if (['planned', 'in_progress'].includes(String(insp.status))) {
           db.prepare(`UPDATE fssai_inspections SET status = 'open', updated_at = datetime('now') WHERE id = ?`).run(inspectionId);
         }
+        if (raiseOpts) {
+          const fresh = db.prepare(`SELECT * FROM fssai_inspection_findings WHERE id = ?`).get(fid) as any;
+          raised = raiseCaFromFinding(db, {
+            finding: fresh, inspection: insp, options: raiseOpts, deptMap, actor, outletId, today,
+          });
+        }
       })();
+
+      if (raised) {
+        const r = raised as ReturnType<typeof raiseCaFromFinding>;
+        fssaiAppAudit(db, {
+          event_type: 'fssai_inspection_ca_raised', entity_type: 'fssai_corrective_actions', entity_id: r.id,
+          actor_email: String(me.email || ''), after: { ...r, finding_id: fid, inspection_id: inspectionId },
+          note: `${r.ca_number} from ${insp.inspection_no} point ${row.finding_no}`,
+        });
+      }
 
       const saved = db.prepare(`SELECT * FROM fssai_inspection_findings WHERE id = ?`).get(fid) as any;
       const insp2 = db.prepare(`SELECT * FROM fssai_inspections WHERE id = ?`).get(inspectionId) as any;
-      return Response.json({ finding: shapeFinding(saved, deptMap, today), inspection: shapeInspection(insp2, deptMap, today) });
+      return Response.json({
+        finding: shapeFinding(saved, deptMap, today),
+        inspection: shapeInspection(insp2, deptMap, today),
+        // null when none was asked for — never a fabricated one.
+        corrective_action: raised,
+      });
+    }
+
+    /* ══ RAISE A CORRECTIVE ACTION FROM AN EXISTING POINT ══════════════════ */
+    if (action === 'raise_ca') {
+      if (!id) return Response.json({ error: 'Which point should the corrective action be raised from?' }, { status: 400 });
+      if (!fssaiTableExists(db, 'fssai_corrective_actions')) {
+        return Response.json({ error: 'Corrective actions are not available in this copy of the database yet.' }, { status: 503 });
+      }
+      const finding = db.prepare(`SELECT * FROM fssai_inspection_findings WHERE id = ?`).get(id) as any;
+      if (!finding) {
+        /* An INSPECTION id lands here too, deliberately: a corrective action is
+         * raised from a point the inspector made, never from a visit as a whole.
+         * A visit with no point has nothing to raise. */
+        return Response.json(
+          { error: 'That point does not exist. A corrective action is raised from one point on a visit — add the point first.' },
+          { status: 404 },
+        );
+      }
+      const insp = db.prepare(`SELECT * FROM fssai_inspections WHERE id = ?`).get(String(finding.inspection_id)) as any;
+      const refusal = raiseRefusal(db, finding, insp);
+      if (refusal) return Response.json({ error: refusal.error }, { status: refusal.status });
+      const opts = readRaiseOptions(db, body);
+      if (opts instanceof Response) return opts;
+
+      let raised: ReturnType<typeof raiseCaFromFinding>;
+      try {
+        raised = db.transaction(() => raiseCaFromFinding(db, {
+          finding, inspection: insp, options: opts, deptMap, actor, outletId, today,
+        }))();
+      } catch (e: any) {
+        if (String(e?.message) === FINDING_ALREADY_HAS_CA) {
+          return Response.json(
+            { error: 'Somebody raised a corrective action for this point a moment ago. Refresh to see it.' },
+            { status: 409 },
+          );
+        }
+        throw e;
+      }
+
+      fssaiAppAudit(db, {
+        event_type: 'fssai_inspection_ca_raised', entity_type: 'fssai_corrective_actions', entity_id: raised.id,
+        actor_email: String(me.email || ''), after: { ...raised, finding_id: id, inspection_id: String(insp.id) },
+        note: `${raised.ca_number} from ${insp.inspection_no} point ${finding.finding_no}`,
+      });
+
+      const saved = db.prepare(`SELECT * FROM fssai_inspection_findings WHERE id = ?`).get(id) as any;
+      const insp2 = db.prepare(`SELECT * FROM fssai_inspections WHERE id = ?`).get(String(insp.id)) as any;
+      return Response.json({
+        finding: shapeFinding(saved, deptMap, today),
+        inspection: shapeInspection(insp2, deptMap, today),
+        corrective_action: raised,
+      });
     }
 
     if (action === 'update_finding' || action === 'close_finding' || action === 'reopen_finding') {
@@ -770,7 +1080,7 @@ export async function POST(request: Request) {
     }
 
     return Response.json(
-      { error: 'That is not something this screen can do. Expected create, update, close, reopen, void, or one of the point actions.' },
+      { error: 'That is not something this screen can do. Expected create, update, close, reopen, void, raise_ca, or one of the point actions.' },
       { status: 400 },
     );
   } catch (e: any) {

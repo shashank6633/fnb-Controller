@@ -752,11 +752,16 @@ export async function POST(request: Request) {
       const signStatement = fssaiSignatureStatement(str(body?.signature_statement));
       /* WHETHER AN UNSIGNED CHECK IS REFUSED OR ATTESTED ON THE SPOT — the
        * reasoning, and how to tighten it, is written out in full at
-       * FSSAI_REQUIRE_EXPLICIT_SIGNATURE. In short: refusing would mean the owner's
-       * first tap on "Sign and submit" at the review gate met an error about the
-       * button he had just pressed, because the runner does not send sign:true yet.
-       * So the act is performed and its MODE is recorded, and every screen says
-       * which kind of attestation it was. */
+       * FSSAI_REQUIRE_EXPLICIT_SIGNATURE. In short: the strict refusal stays OFF by
+       * the owner's Q17 ruling (2026-09-25) — "strict refusal AFTER one real run on
+       * the phone" — because the runner's sign path has not yet been exercised in a
+       * real browser, and a refusal on an unexercised path would block every submit
+       * mid-service if that path had a bug. It is NOT off because the runner fails
+       * to send sign:true: the runner has sent `sign: needsSignature ? true :
+       * undefined` on every submit since 9c453bb (run/[id]/page.tsx, `submit`).
+       * So while the flag is off, a submit WITHOUT sign:true is still attested,
+       * and its MODE is recorded as 'not_asked' (below) so every screen says that
+       * nobody was asked. */
       const signNow = askedToSign || !FSSAI_REQUIRE_EXPLICIT_SIGNATURE;
       /* WHICH KIND OF ATTESTATION THIS IS — owner Q17, and the record must say
        * so honestly.
@@ -771,9 +776,12 @@ export async function POST(request: Request) {
        *                    'on_submit' made /fssai/verification print "signed by
        *                    pressing “Sign and submit”" about a button that was
        *                    never on screen.
-       * The two-step path (POST /api/fssai/sign first) never reaches this line at
-       * all — its signature is carried in via signatureForRecord below and keeps
-       * the 'explicit' mode the sign route wrote. */
+       * The two-step path (POST /api/fssai/sign first) never reaches the sign call
+       * below while its signature still covers the sheet — that signature is
+       * carried in via signatureForRecord and keeps the 'explicit' mode the sign
+       * route wrote. Only a STALE two-step signature (an answer changed after
+       * signing, flag off) is re-taken there, and then in whichever of the two
+       * modes above describes THIS submit. */
       const signMode: FssaiSignatureMode = askedToSign ? 'on_submit' : 'not_asked';
       if (Number(tpl.requires_signature)) {
         const sig = fssaiSignatureState(db, runId);

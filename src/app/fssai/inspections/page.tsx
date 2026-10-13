@@ -15,6 +15,13 @@
  * shows the refusal in the words the server used. That is deliberate: a button
  * disabled on the client is a courtesy, and a refusal from the route is the rule.
  *
+ * ── A POINT CAN RAISE ITS FIX ───────────────────────────────────────────────
+ * "Raise a corrective action" on a live point (or the box on the add form)
+ * asks the route to raise ONE action in the shared corrective-action spine,
+ * carrying the point with it. The route refuses a second one, a settled point
+ * and a closed or voided visit; this screen only hides the button where the
+ * route would refuse. The action is then worked in /fssai/corrective-actions.
+ *
  * ── NO DATE DEFAULT ────────────────────────────────────────────────────────
  * The history opens on EVERY visit. RECON §7.2 records what a silent window once
  * did to this owner's trust in a report; on an inspection history it would read as
@@ -27,13 +34,24 @@
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
-  AlertTriangle, ArrowLeft, CheckCircle2, ClipboardList, Loader2, Plus, RefreshCw, Trash2, X,
+  AlertTriangle, ArrowLeft, CheckCircle2, ClipboardList, Loader2, Plus, RefreshCw, Trash2, Wrench, X,
 } from 'lucide-react';
 import { apiJson } from '@/lib/api';
 import {
-  FSSAI_FINDING_SEVERITIES, FSSAI_INSPECTION_KINDS, FSSAI_INSPECTION_STATUSES,
+  FSSAI_CA_SEVERITIES, FSSAI_FINDING_SEVERITIES, FSSAI_INSPECTION_KINDS, FSSAI_INSPECTION_STATUSES,
+  fssaiCaSeverityMeta, fssaiCaStatusMeta,
   fssaiFindingSeverityMeta, fssaiFindingStatusMeta, fssaiInspectionStatusMeta,
 } from '@/lib/fssai';
+
+/**
+ * The inspector's grading → the corrective-action severity it starts at. The
+ * SAME table as FINDING_TO_CA_SEVERITY in /api/fssai/inspections; the screen only
+ * uses it to pre-select the drop-down and to say what will happen — the server
+ * decides, and repeats the mapping itself when no severity is sent.
+ */
+const FINDING_TO_CA_SEVERITY: Record<string, string> = {
+  critical: 'urgent', major: 'high', minor: 'medium', observation: 'low',
+};
 
 interface Inspection {
   id: string; inspection_no: string; inspection_kind: string; authority: string; inspector_name: string;
@@ -53,6 +71,10 @@ interface Finding {
 interface CaRow {
   id: string; ca_number: string; title: string; status: string; severity: string;
   owner_email: string; due_date: string; action_taken: string; verified_by: string; verified_at: string;
+}
+/** What add_finding / raise_ca answer with — corrective_action is null when none was asked for. */
+interface RaiseResponse {
+  corrective_action: { id: string; ca_number: string; severity: string; due_date: string } | null;
 }
 
 const FIELD = 'mt-1 w-full bg-white border border-[#D4B896] rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#af4408]';
@@ -308,6 +330,7 @@ function Detail({
   const [busy, setBusy] = useState('');
   const [addOpen, setAddOpen] = useState(false);
   const [closing, setClosing] = useState<Finding | null>(null);
+  const [raising, setRaising] = useState<Finding | null>(null);
   const [voidOpen, setVoidOpen] = useState(false);
 
   const load = useCallback(async () => {
@@ -515,19 +538,37 @@ function Detail({
                           </p>
                           <p className="text-sm font-semibold mt-0.5">{ca.title}</p>
                           <p className="text-xs text-[#6B5744] mt-0.5">
-                            {[ca.status, ca.owner_email, ca.due_date && `due ${ca.due_date}`].filter(Boolean).join(' · ')}
+                            {[
+                              fssaiCaStatusMeta(ca.status).label,
+                              fssaiCaSeverityMeta(ca.severity).label,
+                              ca.owner_email || 'nobody assigned yet',
+                              ca.due_date && `due ${ca.due_date}`,
+                            ].filter(Boolean).join(' · ')}
                           </p>
                         </a>
                       )}
                       {insp.status !== 'void' && (
                         <div className="flex flex-wrap gap-2">
                           {f.status !== 'closed' && f.status !== 'not_accepted' ? (
-                            <button
-                              onClick={() => setClosing(f)}
-                              className="text-xs font-semibold border border-[#E8D5C4] bg-white rounded-lg px-2.5 py-1.5 hover:bg-[#FFF1E3]"
-                            >
-                              Close this point
-                            </button>
+                            <>
+                              <button
+                                onClick={() => setClosing(f)}
+                                className="text-xs font-semibold border border-[#E8D5C4] bg-white rounded-lg px-2.5 py-1.5 hover:bg-[#FFF1E3]"
+                              >
+                                Close this point
+                              </button>
+                              {/* Only a live point with no fix yet. The server
+                                * holds the same rule and says so if it is
+                                * broken; hiding the button is the courtesy. */}
+                              {!f.ca_id && insp.status !== 'closed' && (
+                                <button
+                                  onClick={() => setRaising(f)}
+                                  className="inline-flex items-center gap-1 text-xs font-semibold border border-[#af4408] text-[#af4408] bg-white rounded-lg px-2.5 py-1.5 hover:bg-[#FFF1E3]"
+                                >
+                                  <Wrench size={13} /> Raise a corrective action
+                                </button>
+                              )}
+                            </>
                           ) : (
                             <button
                               onClick={() => {
@@ -573,7 +614,14 @@ function Detail({
               departments={departments}
               defaultDepartmentId={insp.department_id}
               onClose={() => setAddOpen(false)}
-              onSaved={() => { setAddOpen(false); say('Point added.'); load(); }}
+              onSaved={(msg) => { setAddOpen(false); say(msg); load(); }}
+            />
+          )}
+          {raising && (
+            <RaiseCaModal
+              finding={raising}
+              onClose={() => setRaising(null)}
+              onSaved={(caNumber) => { setRaising(null); say(`Corrective action ${caNumber} raised.`); load(); }}
             />
           )}
           {closing && (
@@ -672,12 +720,17 @@ function AddFindingModal({
   inspectionId, departments, defaultDepartmentId, onClose, onSaved,
 }: {
   inspectionId: string; departments: Array<{ id: string; name: string }>;
-  defaultDepartmentId: string; onClose: () => void; onSaved: () => void;
+  defaultDepartmentId: string; onClose: () => void; onSaved: (msg: string) => void;
 }) {
   const [f, setF] = useState<any>({
     finding_no: '', clause_ref: '', category: '', severity: 'major', observation: '',
     department_id: defaultDepartmentId || '', location_label: '', due_date: '',
   });
+  /* null = follow the severity (ticked for critical and major, the two an
+   * authority comes back to check); true/false = the person chose. Either way
+   * the box is on screen and nothing is raised without it ticked. */
+  const [raiseChoice, setRaiseChoice] = useState<boolean | null>(null);
+  const raiseCa = raiseChoice ?? (f.severity === 'critical' || f.severity === 'major');
   const [err, setErr] = useState('');
   const [saving, setSaving] = useState(false);
   const set = (k: string) => (e: any) => setF((p: any) => ({ ...p, [k]: e.target.value }));
@@ -685,8 +738,13 @@ function AddFindingModal({
   async function save() {
     setSaving(true); setErr('');
     try {
-      await apiJson('/api/fssai/inspections', { method: 'POST', body: { action: 'add_finding', inspection_id: inspectionId, ...f } });
-      onSaved();
+      const j = await apiJson<RaiseResponse>('/api/fssai/inspections', {
+        method: 'POST',
+        body: { action: 'add_finding', inspection_id: inspectionId, ...f, raise_ca: raiseCa },
+      });
+      onSaved(j?.corrective_action?.ca_number
+        ? `Point added — corrective action ${j.corrective_action.ca_number} raised.`
+        : 'Point added.');
     } catch (e: any) { setErr(e?.message || 'Could not save'); }
     finally { setSaving(false); }
   }
@@ -716,9 +774,77 @@ function AddFindingModal({
           </select>
         </Field>
       </div>
+      <label className="flex items-start gap-2 text-sm bg-[#FFF1E3] border border-[#E8D5C4] rounded-lg p-3">
+        <input type="checkbox" checked={raiseCa} onChange={(e) => setRaiseChoice(e.target.checked)} className="mt-0.5" />
+        <span>
+          <span className="font-semibold">Raise a corrective action for this point now.</span>
+          <span className="text-[#6B5744]">
+            {' '}It goes into Corrective actions as{' '}
+            <b>{fssaiCaSeverityMeta(FINDING_TO_CA_SEVERITY[f.severity] || 'medium').label}</b>, due{' '}
+            {f.due_date ? `on ${f.due_date} (the date above)` : 'by the house default for that severity'}, carrying
+            this observation, where it was found and who inspected.
+          </span>
+        </span>
+      </label>
       <p className="text-xs text-[#8B7355]">
         The fix itself is recorded once, as a corrective action. This screen holds what was observed and what we
         answered — it does not keep a second copy of the work.
+      </p>
+    </Modal>
+  );
+}
+
+function RaiseCaModal({
+  finding, onClose, onSaved,
+}: { finding: Finding; onClose: () => void; onSaved: (caNumber: string) => void }) {
+  const [severity, setSeverity] = useState(FINDING_TO_CA_SEVERITY[finding.severity] || 'medium');
+  const [dueDate, setDueDate] = useState('');
+  const [err, setErr] = useState('');
+  const [saving, setSaving] = useState(false);
+
+  async function save() {
+    setSaving(true); setErr('');
+    try {
+      const j = await apiJson<RaiseResponse>('/api/fssai/inspections', {
+        method: 'POST',
+        body: { action: 'raise_ca', id: finding.id, ca_severity: severity, ca_due_date: dueDate },
+      });
+      onSaved(String(j?.corrective_action?.ca_number || ''));
+    } catch (e: unknown) { setErr(e instanceof Error && e.message ? e.message : 'Could not raise it'); }
+    finally { setSaving(false); }
+  }
+
+  return (
+    <Modal title="Raise a corrective action" onClose={onClose} onSave={save} saving={saving} err={err} saveLabel="Raise it">
+      <div className="bg-[#FFF1E3] border border-[#E8D5C4] rounded-lg p-3">
+        <p className="text-[11px] font-bold uppercase tracking-wider text-[#8B7355]">
+          Point #{finding.finding_no || finding.sort_order} · {fssaiFindingSeverityMeta(finding.severity).label}
+          {finding.clause_ref ? ` · clause ${finding.clause_ref}` : ''}
+        </p>
+        <p className="text-sm mt-0.5 whitespace-pre-wrap">{finding.observation}</p>
+        {(finding.location_label || finding.department_name) && (
+          <p className="text-xs text-[#8B7355] mt-1">{[finding.location_label, finding.department_name].filter(Boolean).join(' · ')}</p>
+        )}
+      </div>
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+        <Field label="How urgent" hint="Starts from how they graded the point. A manager can change it later.">
+          <select value={severity} onChange={(e) => setSeverity(e.target.value)} className={FIELD}>
+            {FSSAI_CA_SEVERITIES.map((s) => <option key={s.key} value={s.key}>{s.label}</option>)}
+          </select>
+        </Field>
+        <Field
+          label="Fix by"
+          hint={finding.due_date
+            ? `Leave blank to use their deadline, ${finding.due_date}.`
+            : 'Leave blank to use the house default for that severity.'}
+        >
+          <input type="date" value={dueDate} onChange={(e) => setDueDate(e.target.value)} className={FIELD} />
+        </Field>
+      </div>
+      <p className="text-xs text-[#8B7355]">
+        The action carries this observation, the clause, where it was found and who inspected, so whoever fixes it does
+        not need this screen. It is assigned, worked and checked in Corrective actions, like every other fix. One point
+        raises one action.
       </p>
     </Modal>
   );

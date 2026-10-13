@@ -1443,21 +1443,27 @@ export interface FssaiSignature {
  * one line away — flip this to true and submit answers `code:'signature_required'`
  * with the endpoint to call.
  *
- * Instead of refusing, submit SIGNS and records `mode:'on_submit'`, and every
- * screen that shows a signature shows which kind it was. Nothing is invented
- * silently: the digest, the statement and the audit row are written either way,
- * which is what P2a never did. What is gone for good is the server signing when
- * nobody asked at all.
+ * Instead of refusing, submit SIGNS and records WHICH KIND of attestation it
+ * was, and every screen that shows a signature says so:
+ *   · `{sign:true}` (the person tapped "Sign and submit") → mode 'on_submit';
+ *   · no `sign` flag (nobody was asked)                   → mode 'not_asked'.
+ * Nothing is invented silently: the digest, the statement and the audit row are
+ * written either way, which is what P2a never did. What the flag being off still
+ * allows is the server attesting when nobody asked — and that case is now
+ * labelled as exactly that ('not_asked'), never as a button press. Turning the
+ * flag on is what removes it.
  *
  * ⚠️ THE ORIGINAL REASON FOR LEAVING IT OFF HAS EXPIRED — read this before the
  * next change. It was off because P3 Lane A's runner posted `{action:'submit'}`
  * with no `sign` flag, so the strict gate would have met the owner with an error
- * about the button he had just pressed. **Lane A has since conformed**
- * (`src/app/fssai/checklists/run/[id]/page.tsx`): it sends
- * `sign: needsSignature ? true : undefined`, it has a two-step path that POSTs
- * /api/fssai/sign, and it handles both `signature_required` and `signature_stale`
- * by putting the server's own sentence and statement on screen with a button that
- * signs and submits again. So the only caller is ready for the gate.
+ * about the button he had just pressed. That has been FALSE since 9c453bb:
+ * **Lane A has conformed** (`src/app/fssai/checklists/run/[id]/page.tsx`,
+ * `submit`): it sends `sign: needsSignature ? true : undefined` on every submit,
+ * it has a two-step path that POSTs /api/fssai/sign, and it handles both
+ * `signature_required` and `signature_stale` by putting the server's own sentence
+ * and statement on screen with a button that signs and submits again. So the
+ * only caller is ready for the gate; the ONLY reason the flag is still off is
+ * the owner's ruling below.
  *
  * ══ THE OWNER RULED ON THIS — Q17, 2026-09-25. DO NOT RE-LITIGATE. ══════════
  *
@@ -1477,12 +1483,15 @@ export interface FssaiSignature {
  *
  * ⚠️ FLIPPING IT IS A FIVE-SECOND CHANGE AND NOTHING ELSE HAS TO MOVE. Change
  * `false` to `true` on the line below. Then:
- *   · an unsigned submit answers `code:'signature_required'` (runs/route.ts:752);
- *   · an answer changed after signing answers `code:'signature_stale'` (:766);
+ *   · an unsigned submit answers `code:'signature_required'` (runs/route.ts,
+ *     THE SIGNATURE GATE in the submit branch);
+ *   · an answer changed after signing answers `code:'signature_stale'` (same
+ *     block, the next refusal);
  *   · `{sign:true}` submits 200 as it does today;
  *   · the 'not_asked' mode becomes UNREACHABLE — `signNow === askedToSign` — so
  *     no new record can be written in the weakest kind at all.
- * The runner already handles both refusal codes (`run/[id]/page.tsx:593-599`),
+ * The runner already handles both refusal codes (`run/[id]/page.tsx`, `submit`,
+ * the `signature_required || signature_stale` branch),
  * and both positions were measured on an isolated instance before it was torn
  * down. Flip it once somebody has watched a real phone sign and submit once.
  */
