@@ -2,6 +2,8 @@
 import { getDb, generateId, logAuditEvent } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
 import { canAdminHr, canManageHr, type HrShift } from '@/lib/hr';
+import { getHrDayCutoff } from '@/lib/hr-attendance';
+import { splitShiftInvariantProblem } from '@/lib/hr-roster-generate';
 import { reportServerError } from '@/lib/error-alerts';
 
 /**
@@ -28,6 +30,11 @@ import { reportServerError } from '@/lib/error-alerts';
  *          → { ok: true }. Admin only. SOFT delete (is_active = 0) — roster
  *          rows referencing the shift keep rendering via LEFT JOIN; only the
  *          pickers hide it.
+ *
+ * Both writers additionally enforce THE SPLIT-SHIFT INVARIANT (400): when
+ * split_json carries a window, the EARLIER window must be the main one in
+ * start_hhmm/end_hhmm. See splitProblemMessage() below for why that is refused
+ * here rather than silently swapped.
  *
  * Error bodies are GENERIC on 500 (never e.message — HR data must not leak
  * schema/details through errors).
@@ -69,6 +76,43 @@ function normalizeSplitJson(v: unknown): string | null {
     windows.push([start, end]);
   }
   return JSON.stringify(windows);
+}
+
+/** 'HH:MM' → minutes past midnight; null for anything unparseable. */
+function hhmmToMinutes(v: string): number | null {
+  const m = String(v ?? '').trim().match(/^(\d{1,2}):(\d{2})$/);
+  if (!m) return null;
+  const h = parseInt(m[1], 10);
+  const min = parseInt(m[2], 10);
+  if (h < 0 || h > 23 || min < 0 || min > 59) return null;
+  return h * 60 + min;
+}
+
+/**
+ * THE SPLIT-SHIFT INVARIANT, enforced where the shift is ENTERED.
+ *
+ * For a split shift the EARLIER window must be the main one: MOR BREAK is
+ * start_hhmm='11:00', end_hhmm='15:30' with the 18:30→closing window in
+ * split_json. Stored the other way round, hr-attendance.ts — which computes LATE
+ * from start_hhmm ALONE — compares an 11:00 arrival against 18:30, so every
+ * person on that shift reads on-time forever. A guard that reads perfectly and
+ * never fires.
+ *
+ * WHY IT IS REFUSED HERE AND NOT QUIETLY SWAPPED: the shift master is the
+ * owner's data. The roster generator already refuses such a shift
+ * (`split_shift_reversed`), but only the week someone tries to generate — this
+ * returns the same sentence while the manager is still looking at the form. The
+ * check is IMPORTED, never re-implemented, so the two answers cannot drift.
+ *
+ * Returns the 400 message, or null when the shift is fine.
+ */
+function splitProblemMessage(
+  db: ReturnType<typeof getDb>,
+  candidate: { start_hhmm: string; end_hhmm: string; split_json: string },
+): string | null {
+  const cutoffMin = hhmmToMinutes(getHrDayCutoff(db)) ?? 4 * 60;
+  const problem = splitShiftInvariantProblem(candidate, cutoffMin);
+  return problem ? `Split shift stored the wrong way round — ${problem}` : null;
 }
 
 export async function GET(request: Request) {
@@ -146,6 +190,9 @@ export async function POST(request: Request) {
       .get(name) as any;
     if (dupe) return Response.json({ error: 'An active shift with that name already exists' }, { status: 409 });
 
+    const splitProblem = splitProblemMessage(db, { start_hhmm, end_hhmm, split_json });
+    if (splitProblem) return Response.json({ error: splitProblem }, { status: 400 });
+
     const id = generateId();
     db.prepare(
       `INSERT INTO hr_shifts (
@@ -199,6 +246,13 @@ export async function PUT(request: Request) {
     const sets: string[] = [];
     const args: any[] = [];
 
+    // The split-shift invariant is a property of the WHOLE shift, so it is
+    // checked against the MERGED result below — patching split_json alone must
+    // still be judged against the start/end already stored, and vice versa.
+    let nextStart = s(existing.start_hhmm);
+    let nextEnd = s(existing.end_hhmm);
+    let nextSplit = String(existing.split_json ?? '[]');
+
     if (body.name !== undefined) {
       const name = s(body.name);
       if (!name) return Response.json({ error: 'Shift name cannot be empty' }, { status: 400 });
@@ -213,6 +267,7 @@ export async function PUT(request: Request) {
       if (!HHMM_RE.test(start)) {
         return Response.json({ error: 'Invalid start time (expected HH:MM, 24h)' }, { status: 400 });
       }
+      nextStart = start;
       sets.push('start_hhmm = ?'); args.push(start);
     }
     if (body.end_hhmm !== undefined) {
@@ -221,6 +276,7 @@ export async function PUT(request: Request) {
         return Response.json({ error: 'Invalid end time (expected HH:MM, 24h)' }, { status: 400 });
       }
       // end < start stays LEGAL — the overnight (+1 day) form, §8.2.6.
+      nextEnd = end;
       sets.push('end_hhmm = ?'); args.push(end);
     }
     if (body.split_json !== undefined) {
@@ -231,6 +287,7 @@ export async function PUT(request: Request) {
           { status: 400 },
         );
       }
+      nextSplit = split;
       sets.push('split_json = ?'); args.push(split);
     }
     for (const col of [
@@ -256,6 +313,15 @@ export async function PUT(request: Request) {
       sets.push('is_active = ?'); args.push(body.is_active ? 1 : 0);
     }
     if (!sets.length) return Response.json({ error: 'Nothing to update' }, { status: 400 });
+
+    // Judged on the merged shift, so a patch cannot reverse the invariant by
+    // touching only one of the three columns it spans.
+    const splitProblem = splitProblemMessage(db, {
+      start_hhmm: nextStart,
+      end_hhmm: nextEnd,
+      split_json: nextSplit,
+    });
+    if (splitProblem) return Response.json({ error: splitProblem }, { status: 400 });
 
     sets.push(`updated_at = datetime('now')`);
     db.prepare(`UPDATE hr_shifts SET ${sets.join(', ')} WHERE id = ?`).run(...args, id);

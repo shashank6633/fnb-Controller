@@ -814,9 +814,31 @@ function PageAccessSection({ editing, setEditing, departments, roles, rolesReady
                 {isExpanded && (
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-1 px-3 py-1.5 text-xs bg-white">
                     {section.pages.map(p => (
-                      <label key={p.path} className="flex items-center gap-1.5 cursor-pointer hover:bg-[#FFF8F0] px-1 rounded">
+                      /* TIER BADGES. Settings → Page Access has carried these for a
+                         while; THIS grid never did, and that gap is what produced
+                         the Accounts report: four mgmtOnly Reports pages were ticked
+                         here for a staff user, saved without complaint, and silently
+                         ignored at runtime — a tick cannot reach past a tier gate.
+                         The badge says which gate will veto it and, for the five
+                         finance pages, which role capability lifts that veto. */
+                      <label
+                        key={p.path}
+                        className="flex items-center gap-1.5 cursor-pointer hover:bg-[#FFF8F0] px-1 rounded"
+                        title={
+                          p.adminOnly ? 'Admins only — this tick is ignored for everyone else.'
+                          : p.hodOnly ? 'HODs (Is HOD) and admins only — this tick is ignored for other users.'
+                          : p.financeCap ? 'Management only by default. A role with “View finance & purchase reports” (Settings → Roles) can also open it — WITH this tick. Without that capability, this tick is ignored for non-management.'
+                          : p.mgmtOnly ? 'Admins, Managers and HODs only — this tick is ignored for other users.'
+                          : undefined
+                        }
+                      >
                         <input type="checkbox" checked={draft.has(p.path)} onChange={() => togglePage(p.path)} />
                         <span className="text-[#2D1B0E]">{p.label}</span>
+                        {p.adminOnly && <span className="text-[9px] bg-rose-100 text-rose-700 px-1.5 py-0.5 rounded-full font-medium">Admin</span>}
+                        {p.hodOnly && <span className="text-[9px] bg-violet-100 text-violet-700 px-1.5 py-0.5 rounded-full font-medium">HOD</span>}
+                        {p.financeCap
+                          ? <span className="text-[9px] bg-emerald-100 text-emerald-700 px-1.5 py-0.5 rounded-full font-medium">Finance</span>
+                          : p.mgmtOnly && <span className="text-[9px] bg-amber-100 text-amber-700 px-1.5 py-0.5 rounded-full font-medium">Mgmt</span>}
                         <span className="text-[9px] font-mono text-[#8B7355] ml-auto">{p.path}</span>
                       </label>
                     ))}

@@ -5,7 +5,8 @@ import { startSchedulerOnce } from '@/lib/scheduler';
 import {
   getCampaign, startBroadcast, pauseBroadcast, resumeBroadcast, cancelBroadcast,
   campaignProgress, broadcastSettings, previewAudience, parseAudience,
-  BROADCAST_FLAG,
+  mappingAckCheck, setCampaignAck, campaignAck, paramOrderOf,
+  campaignSendability,
 } from '@/lib/wa-broadcast';
 import { isWaConfigured } from '@/lib/whatsapp';
 
@@ -33,6 +34,16 @@ export const revalidate = 0;
 // Same driver-arming as the list route: any management touch on a campaign
 // must be enough to get the queue draining after a server restart.
 startSchedulerOnce();
+
+/**
+ * The transition errors that mean "this template would be refused for EVERY
+ * recipient, identically" — an unapproved or wrong-category template, a
+ * parameter count that cannot match, or a header this rail cannot fill. Each
+ * carries its own specific `detail`, and that detail is what an operator must
+ * read; flattening any of them into "cannot start" is what left a Start button
+ * that appeared to do nothing.
+ */
+const WHOLE_QUEUE_REFUSALS = ['template_not_approved', 'param_mismatch', 'header_unfillable'];
 
 export async function POST(req: Request, { params }: { params: Promise<{ id: string }> }) {
   const me = await getCurrentUser();
@@ -65,21 +76,77 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       }, { status: 409 });
     }
 
+    /* THE ACKNOWLEDGEMENT, ASKED AGAIN AT THE LAST DOOR.
+     *
+     * A draft may be created correctly and then have its param_order rewritten
+     * (PATCH /api/crm-calls/broadcasts/[id] stores a mapping without asking the
+     * mapping gate), which changes the sentence every guest would read while
+     * the confirmation recorded at create still sits there. So the sentence is
+     * re-derived from the campaign AS IT IS NOW: a fresh confirmation sent with
+     * this request replaces the stored one, and startBroadcast() refuses on the
+     * stored one when neither matches.
+     *
+     * The refusal already travels as `param_mismatch` with its own detail (see
+     * WHOLE_QUEUE_REFUSALS); this only adds the sentence itself to the reply so
+     * a caller can show the words rather than a description of them. */
+    const order = paramOrderOf(c);
+    const fresh = mappingAckCheck(db, c.template_name, order, body?.confirm_message);
+    if (fresh.required && fresh.ok) setCampaignAck(db, id, fresh.sentence);
+    const standing = fresh.required && !fresh.ok
+      ? mappingAckCheck(db, c.template_name, order, campaignAck(db, id))
+      : null;
+
     const res = startBroadcast(db, id);
     if (!res.ok) {
+      /* Only where the acknowledgement IS the cause. campaignParamCheck() sets
+       * `reason` to exactly this text when nothing else refused the mapping; a
+       * blank the wording contradicts outright carries its own, more specific
+       * refusal, and flattening that into "nothing here can check it for you"
+       * would tell an operator the opposite of what went wrong. */
+      if (standing && !standing.ok && res.detail === standing.reason) {
+        return Response.json({
+          error: standing.reason,
+          code: res.error,
+          proof_sentence: standing.sentence,
+          unproven_blanks: standing.positions,
+          wording_notes: standing.cues,
+          confirm_field: 'confirm_message',
+          campaign: res.campaign,
+        }, { status: 409 });
+      }
       const msg: Record<string, string> = {
         bad_state: `Only a draft can be started — this campaign is '${c.state}'.`,
         no_template: 'This campaign has no approved WhatsApp template name, so there is nothing Meta would deliver.',
         nothing_queued: 'This campaign has no queued recipients.',
         not_found: 'Campaign not found.',
       };
-      return Response.json({ error: msg[res.error || ''] || 'Cannot start.', campaign: res.campaign }, { status: 409 });
+      // The approval gate carries its own specific reason (which template, what
+      // status, what Meta said) — never flatten it into the generic message.
+      // All THREE whole-queue gates carry their own specific reason (which
+      // template, what status / how many variables / what kind of heading) —
+      // never flatten one into a generic line.
+      const error = WHOLE_QUEUE_REFUSALS.includes(res.error || '')
+        ? (res.detail || 'This campaign\'s template is not approved for sending.')
+        : (msg[res.error || ''] || 'Cannot start.');
+      return Response.json({ error, code: res.error, campaign: res.campaign }, { status: 409 });
     }
 
     // Started ≠ sending yet — say exactly what still gates delivery.
     const s = broadcastSettings(db);
     const warnings: string[] = [];
-    if (!s.enabled) warnings.push(`Broadcast sending is switched OFF (ct_settings.${BROADCAST_FLAG}). The queue will not move until an admin enables it in Broadcast Settings.`);
+    /* WHAT WHATSAPP'S LIST SAID, repeated at the start door. It did not stop
+     * the campaign being created and it does not stop it starting (owner's
+     * ruling, 2026-09-15) — but Start is the last moment before messages are
+     * attempted, and the list may have been checked since the campaign was
+     * built, so it is asked again here rather than remembered from create. */
+    const listSays = campaignSendability(db, res.campaign!).advisory;
+    if (listSays) warnings.push(listSays);
+    /* NO DATABASE KEY ON SCREEN. This line is read at the moment Start is
+     * pressed, and it used to print `ct_settings.broadcast_enabled` — a table
+     * and column name, in the one place the owner is looking for what to do
+     * next. The key is still what the toggle writes; it just is not his
+     * business. Where to go is, so the sentence keeps that and drops the rest. */
+    if (!s.enabled) warnings.push('Broadcast sending is switched off, so nothing will go out yet. An admin can turn it on in Broadcast Settings.');
     if (!isWaConfigured()) warnings.push('WhatsApp is not configured — no provider credentials. The queue will not move until Settings → Integrations → WhatsApp is completed.');
 
     return Response.json({
@@ -96,9 +163,15 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     const res = fn(db, id);
     if (!res.ok) {
       return Response.json({
-        error: res.error === 'bad_state'
-          ? `Cannot ${action} a campaign in state '${c.state}'.`
-          : 'Campaign not found.',
+        // A resume refused by the approval gate must say WHY — a campaign the
+        // drain halted because Meta paused its template cannot be resumed by
+        // clicking again, and "cannot resume" alone would not explain that.
+        error: WHOLE_QUEUE_REFUSALS.includes(res.error || '')
+          ? (res.detail || 'This campaign\'s template is not approved for sending.')
+          : res.error === 'bad_state'
+            ? `Cannot ${action} a campaign in state '${c.state}'.`
+            : 'Campaign not found.',
+        code: res.error,
         campaign: res.campaign,
       }, { status: res.error === 'not_found' ? 404 : 409 });
     }

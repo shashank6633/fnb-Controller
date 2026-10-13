@@ -1,4 +1,5 @@
-import { getCurrentUser, isManagement } from '@/lib/auth';
+import { getCurrentUser } from '@/lib/auth';
+import { requireFinanceReport } from '@/lib/finance-reports-access';
 import { todayIST } from '@/lib/format-date';
 import {
   getPurchaseBillSummary,
@@ -285,7 +286,8 @@ export async function GET(req: Request) {
     // flag only hides a nav link — THIS is the security boundary.
     const me = await getCurrentUser();
     if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-    if (!isManagement(me)) return Response.json({ error: 'Management only' }, { status: 403 });
+    const deniedFin = requireFinanceReport(me, '/reports/purchase-bill-summary');
+    if (deniedFin) return deniedFin;
 
     const sp = new URL(req.url).searchParams;
     const rawFrom = sp.get('from');

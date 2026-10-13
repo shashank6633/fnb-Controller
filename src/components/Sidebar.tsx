@@ -32,9 +32,11 @@ import {
   ShieldAlert,
   AlertTriangle,
   History,
+  Inbox,
   Boxes,
   Layers,
   ArrowLeftRight,
+  ArrowRightLeft,
   Warehouse,
   Database,
   Scissors,
@@ -117,6 +119,19 @@ const navTree: NavEntry[] = [
       // everyone else. Sits beside Cashier because it is the same job: closing
       // bills that were never closed.
       { kind: "link", label: "Idle Tables",        href: "/dine-in/stale-tables",      icon: Timer },
+      // The REGISTER itself — every bill on hold, and the one screen a cashier
+      // uses. Listed above its two management dashboards because it is the page
+      // people actually work in; the dashboards read it, not the other way
+      // round. Same rule as the note below: page-catalog.ts gates, this list is
+      // what makes it visible, and both carry a row.
+      { kind: "link", label: "Bills on Hold",      href: "/boh",                       icon: Banknote },
+      // BILLS ON HOLD (management). This list is its OWN nav source — registering
+      // a page in page-catalog.ts alone gates it but leaves it INVISIBLE, which
+      // is the sidebar-vs-catalog drift that once hid eight pages including
+      // /variance-approvals. Both files carry these two entries; edit both.
+      // canAccessPage hides them for anyone who is not a Manager, Admin or HOD.
+      { kind: "link", label: "BOH Dashboard",      href: "/boh/dashboard",             icon: Banknote },
+      { kind: "link", label: "BOH — Who is chasing", href: "/boh/accountability",      icon: ClipboardCheck },
       { kind: "link", label: "Customer Orders & Requests", href: "/dine-in/requests",  icon: Bell },
       { kind: "link", label: "Discount Approvals", href: "/dine-in/discount-approvals", icon: BadgePercent },
       { kind: "link", label: "Kitchen Display",    href: "/dine-in/kitchen",           icon: ChefHat },
@@ -133,6 +148,50 @@ const navTree: NavEntry[] = [
       { kind: "link", label: "Direct Items",       href: "/direct-items",              icon: Link2 },
       { kind: "link", label: "Sales Upload",       href: "/sales",                     icon: Upload },
       { kind: "link", label: "Reconciliation",     href: "/dine-in/reconciliation",    icon: AlertTriangle },
+    ],
+  },
+
+  // Guest Feedback & Service Recovery.
+  //
+  // ⚠️ THIS LIST AND src/lib/page-catalog.ts ARE SEPARATE AND BOTH ARE
+  // REQUIRED. The catalog GATES a page; this tree is what actually RENDERS the
+  // nav. A page added only to the catalog is gated but invisible — that exact
+  // drift once hid eight pages including /variance-approvals and was misread
+  // for weeks as a stock bug. Every href below has a twin entry in the
+  // 'Guest Feedback' section of page-catalog.ts. Change one, change both.
+  //
+  // Visibility is filtered by canAccessPage() further down this file, so
+  // Feedback Analytics (mgmtOnly in the catalog) disappears for everyone else
+  // without needing a flag here. Do NOT hand-roll a role test in this file:
+  // the catalog is the single place tier flags live.
+  //
+  // The first three rows carry the catalog's `greOnly` flag — GRE role OR
+  // management — so a Captain, a Cashier or a legacy Staff login sees no rows
+  // here at all and the whole section disappears (the filter drops a section
+  // once every item is denied). That filter reads `me.role_name`; see the note
+  // on the `me` state below before changing its type.
+  //
+  // ⚠️ P4: THESE ROWS NOW APPEAR FOR A MANAGEMENT ROLE WHOSE `page_access` LIST
+  // PREDATES THE MODULE. `canAccessPage` gained one line —
+  // `isFeedbackPath(pathname) && !feedbackListedInMap(user.page_access)` — so
+  // for `/feedback*` the module's own gate decides and a role's list can only
+  // NARROW it, never widen it. Before that, a Floor Manager (whose list is
+  // explicit and has no `/feedback` entry) got a 403 PAGE while
+  // `GET /api/feedback/floor` answered 200, and the sidebar correctly hid a row
+  // that would have bounced them. Nothing here had to change for that to work —
+  // this list and the catalog were already twins — but if you ever hand-roll a
+  // role test in this file you will re-create exactly that split.
+  {
+    kind: "section",
+    label: "Guest Feedback",
+    icon: HeartHandshake,
+    items: [
+      { kind: "link", label: "Floor Feedback",     href: "/feedback",           icon: MessageCircle },
+      { kind: "link", label: "Take Feedback",      href: "/feedback/take",      icon: Star },
+      { kind: "link", label: "Feedback Tracker",   href: "/feedback/tracker",   icon: ClipboardList },
+      // Management-only (page-catalog mgmtOnly) — canAccessPage hides this row
+      // for everyone else, the same way it hides Idle Tables above.
+      { kind: "link", label: "Feedback Analytics", href: "/feedback/analytics", icon: BarChart3 },
     ],
   },
 
@@ -179,6 +238,13 @@ const navTree: NavEntry[] = [
       // kitchen and bar staff who have to act on it. Seeing it is not permission
       // to move stock — the sign-off route re-checks department membership.
       { kind: "link", label: "Pending Quality Checks", href: "/grn/qc",         icon: ClipboardCheck },
+      // The override report, directly under the queue it is the consequence of:
+      // what got released WITHOUT a kitchen check, who allowed it, and why.
+      // mgmtOnly in page-catalog.ts — this row and that one must stay in step,
+      // href for href, or it repeats the drift that once hid
+      // /variance-approvals. The route it reads has existed since August with
+      // nothing on earth calling it.
+      { kind: "link", label: "Inwarded without QC", href: "/grn/qc/overrides",  icon: ShieldAlert },
       { kind: "link", label: "Receiving Variance", href: "/receiving-variance", icon: AlertTriangle },
       // Returns — sits right after Receiving Variance on purpose: that page is
       // where a short/damaged delivery is spotted, and this is where the goods
@@ -198,6 +264,47 @@ const navTree: NavEntry[] = [
       { kind: "link", label: "Vendor → Items",     href: "/vendors/materials",  icon: Building2 },
       { kind: "link", label: "Contracts",          href: "/contracts",          icon: FileText },
       { kind: "link", label: "Petty Cash",         href: "/petty-cash",         icon: Banknote },
+      // ── Bill Submission Quality Check — the STORE half ──────────────────
+      // The store's own register: what is pending, what has been handed to
+      // Accounts, and what Accounts have confirmed. Rule 7's other half — this
+      // href must match its row in src/lib/page-catalog.ts character for
+      // character, in the same commit. A page in only one of the two files is
+      // the failure that hid /variance-approvals: gated but invisible, so it
+      // reads as a bug in the feature rather than a missing nav line.
+      //
+      // Sits directly under Petty Cash and above the Accounts rows because it is
+      // the same flow read from the two ends, and because the STORE end is where
+      // a record starts: a bill is normally created by answering the question in
+      // the store quality check while receiving (Purchase Orders → Receive and
+      // Goods Receipt (GRN)), not on this page.
+      //
+      // NO tier flag in the catalog, on purpose: the storekeeper who physically
+      // takes the bill over the counter is the person who must mark it handed
+      // over, and mgmtOnly/hodOnly run BEFORE the null-map grant, so they would
+      // be a real lock on exactly the wrong people. Seeing this page is not
+      // permission to record anything — every /api/bill-submissions route
+      // re-derives that from the session (Management or the Store Manager for
+      // the store side; an Administrator or a holder of the role named
+      // "Accounts" to confirm).
+      { kind: "link", label: "Bill Handover — Store", href: "/bill-submissions", icon: Store },
+      // ── Bill Submission Quality Check — the ACCOUNTS half ───────────────
+      // The other half of rule 7: these two hrefs must match their rows in
+      // src/lib/page-catalog.ts character for character, in the same commit.
+      // A page listed in only one of the two files is the failure that hid
+      // /variance-approvals — gated but invisible, so it reads as a bug in the
+      // feature rather than a missing nav line.
+      //
+      // The STORE screen (/bill-submissions) is the store lane's and its row
+      // goes directly above these two, in BOTH files.
+      //
+      // Deliberately listed for everyone the catalog allows, including the
+      // Accounts team, who are staff tier: seeing the queue is not permission
+      // to confirm anything. POST /api/bill-submissions/:id/confirm re-derives
+      // that from the session — Administrator, or a holder of the role named
+      // "Accounts" — and refuses anyone else with its own sentence, which the
+      // page renders verbatim rather than re-wording.
+      { kind: "link", label: "Bill Handover — Accounts", href: "/bill-submissions/accounts", icon: Inbox },
+      { kind: "link", label: "Bill Handover — History",  href: "/bill-submissions/history",  icon: History },
     ],
   },
   {
@@ -217,6 +324,13 @@ const navTree: NavEntry[] = [
       // today's count instead of reading history.
       { kind: "link", label: "Closing History & Compare", href: "/inventory/closing-history", icon: History },
       { kind: "link", label: "Store Transfers",    href: "/inventory/transfers", icon: ArrowLeftRight },
+      // Sits under Store Transfers because it is the same subject one level up:
+      // a transfer is ONE kind of movement, this is the register of ALL of them
+      // across the store, department and central rails. MUST stay in step with
+      // the /inventory/movements entry in src/lib/page-catalog.ts — the catalog
+      // gates a page, this list is what makes it reachable, and a page in only
+      // one of the two is either invisible or ungated.
+      { kind: "link", label: "Stock Movements",    href: "/inventory/movements", icon: ArrowRightLeft },
       { kind: "link", label: "Department Stock",   href: "/inventory/department-stock", icon: Warehouse },
       { kind: "link", label: "Sales vs Consumption", href: "/inventory/reconciliation", icon: Scale },
       { kind: "link", label: "Low Stock — Buy List", href: "/store-dashboard",  icon: AlertTriangle },
@@ -567,7 +681,26 @@ export default function Sidebar() {
   const installApp = async () => { if (!installEvt) return; installEvt.prompt(); try { await installEvt.userChoice; } catch {} setInstallEvt(null); };
 
   // Current user — used to filter nav links by the per-user page_access map.
-  const [me, setMe] = useState<{ role?: string; page_access?: string | null; is_head_chef?: boolean } | null>(null);
+  //
+  // ⚠️ `role_name` IS LOAD-BEARING, not decoration. The Guest Feedback floor
+  // pages carry the catalog's `greOnly` flag, which is the first flag that
+  // resolves from a NAMED ROLE rather than a tier, and canAccessPage reads it
+  // off this object. Drop the field and every GRE's three nav rows vanish while
+  // the pages themselves stay reachable by URL — the sidebar-vs-catalog drift
+  // trap wearing a different hat. /api/auth/me returns the full SessionUser, so
+  // the value is already on the wire (src/lib/auth.ts:120); this type is all
+  // that decides whether the filter can see it.
+  const [me, setMe] = useState<{
+    role?: string;
+    page_access?: string | null;
+    is_head_chef?: boolean;
+    role_name?: string | null;
+    // Read by canAccessPage's financeCap exception. The field is already on the
+    // wire (/api/auth/me returns the whole SessionUser) — this narrow local type
+    // is the only thing deciding whether the client-side filter can SEE it, so
+    // omitting it hides the five finance rows from the very roles granted them.
+    can_view_finance_reports?: boolean;
+  } | null>(null);
   useEffect(() => {
     fetch('/api/auth/me').then(r => r.json()).then(d => {
       // Push the admin HOD-gate overrides into page-catalog's client state

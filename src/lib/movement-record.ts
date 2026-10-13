@@ -439,7 +439,13 @@ export const CENTRAL_TXN_TYPES: Record<string, { doc: string; counterparty: Move
   sale:                { doc: 'Recipe consumption against a sale',           counterparty: 'consumption' },
   nc:                  { doc: 'Non-chargeable / complimentary consumption',   counterparty: 'consumption' },
   party_issue:         { doc: 'Issued to a party / event',                    counterparty: 'consumption' },
-  party_consumption:   { doc: 'Consumed at a party / event',                  counterparty: 'consumption' },
+  // LEGACY, AND IT STAYS. Nothing writes 'party_consumption' since 2026-09-17
+  // (the party requisition transfer now writes 'party_issue' above), but this
+  // key is what LABELS a surviving legacy row and what puts it in the Type
+  // filter on /inventory/movements — that filter is built from
+  // Object.keys(CENTRAL_TXN_TYPES). Delete the key and any row the migration
+  // did not reach becomes unlabelled and unfilterable. See PARTY_TRANSFER_TYPES.
+  party_consumption:   { doc: 'Consumed at a party / event (legacy name)',    counterparty: 'consumption' },
   party_return:        { doc: 'Party leftovers returned to the central store', counterparty: 'consumption' },
   consumption:         { doc: 'Consumed',                                     counterparty: 'consumption' },
   wastage:             { doc: 'Spoilage written off',                         counterparty: 'wastage' },
@@ -455,6 +461,48 @@ export const CENTRAL_TXN_TYPES: Record<string, { doc: string; counterparty: Move
   adjustment:          { doc: 'Correction against a physical count',          counterparty: 'adjustment' },
   opening:             { doc: 'Opening balance at cutover',                   counterparty: 'opening' },
 };
+
+/* ── THE PARTY REQUISITION TRANSFER — BOTH NAMES IT HAS EVER HAD ────────────
+ *
+ * A party requisition's store→department hand-over is written by exactly two
+ * writers (src/lib/party-fulfillment.ts and src/lib/po-requisition-fulfil.ts).
+ * It was typed 'party_consumption' until 2026-09-17, when it was renamed
+ * 'party_issue' — because the movement is a TRANSFER into our own kitchen, not
+ * a consumption, and every report that whitelists outflows was counting it
+ * beside a sale as stock gone.
+ *
+ * THIS LIST IS PERMANENT, NOT A MIGRATION WINDOW. Four predicates across the
+ * two writers decide whether the transfer has ALREADY happened (the idempotency
+ * guards) and which rows a PO void must credit back and delete. If any one of
+ * them stops recognising the legacy name, a row that escaped the migration — or
+ * a database restored from a pre-2026-09-17 backup — reads as never-transferred
+ * and the SAME GOODS ARE DEDUCTED FROM CENTRAL A SECOND TIME. Production held
+ * 1,592 such rows at the rename. Do not "tidy" this to one name, ever.
+ *
+ * It is declared HERE, once, so those four predicates cannot drift apart: they
+ * are the only thing standing between a double call and a double deduction, and
+ * two of them live in a different file from the other two.
+ *
+ * NOTE what this is NOT:
+ *   · NOT the TABLE `party_consumption` (db.ts, the Liquor Consumption register
+ *     behind party P&L). Same word, unrelated object. Never put a table name
+ *     through this constant.
+ *   · NOT the audit event_type strings 'requisition.party_consumption[.skipped]'
+ *     (po-requisition-fulfil.ts). Those stayed as they were on purpose — they
+ *     are matched against HISTORY and renaming them blinds every void.
+ *   · NOT the Party Items rail, which has always written 'party_issue' against a
+ *     party_items id (api/parties/items). After the rename 'party_issue' carries
+ *     two provenances; the four predicates stay safe because every one of them
+ *     is also keyed on `reference_id = <requisition id>`, and a party_items id
+ *     is never a requisition id.
+ */
+export const PARTY_TRANSFER_TYPES = ['party_consumption', 'party_issue'] as const;
+/** The same list as a SQL IN(...) fragment. Literals, no binds — the values are
+ *  compile-time constants, so this can be interpolated into any statement. */
+export const PARTY_TRANSFER_TYPES_SQL = PARTY_TRANSFER_TYPES.map(t => `'${t}'`).join(', ');
+/** What a NEW party requisition transfer is typed. Read the block above before
+ *  changing it: the write may only move forward once every reader accepts both. */
+export const PARTY_TRANSFER_TYPE = 'party_issue';
 
 export interface CentralTxnEntry {
   materialId: string;

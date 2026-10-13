@@ -32,12 +32,13 @@
  * that with a tidy badge that hides the rule.
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
 import {
   Star, StarHalf, MessageSquare, RefreshCw, Lock, Info, ChevronLeft, AlertTriangle,
   CheckCircle2, Loader2, TrendingUp, TrendingDown, Minus, ExternalLink, Copy, Check,
   Upload, Database, Clock, Tag, CloudDownload, X, Link2, Power, PlugZap, MapPin, ShieldAlert,
+  Send, Sparkles, Eye, Globe, Pencil,
 } from 'lucide-react';
 import {
   ComposedChart, Bar, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend,
@@ -50,6 +51,14 @@ import {
   agoText, connectionBanner, fmtIst, intervalText, nextFetchText, periodProgress, periodTileView,
 } from '@/lib/reviews/view';
 import type { ConnectionHealth } from '@/lib/reviews/connection';
+/* CHECK 2 OF 3, running in the browser for the live counter and instant
+ * findings. Imported from the leaf module for the same reason view.ts is: it
+ * imports only gbp-transport.ts, which imports NOTHING and touches no Node
+ * global, so nothing follows it into the client bundle. It is the SAME function
+ * the send route runs — one implementation, so what an admin reads here cannot
+ * drift from what the server enforces. The server is still the authority: the
+ * route re-runs it and refuses on its own verdict. */
+import { replyBytes, validateReply, type ReplyFinding } from '@/lib/reviews/reply-validate';
 /* Every state-changing request MUST go through api(): middleware rejects a
  * POST/PUT/PATCH/DELETE without the X-CSRF-Token header read from the fnb_csrf
  * cookie. A raw fetch() here fails with "CSRF token missing or mismatched"
@@ -135,6 +144,10 @@ interface Report {
   generated_at: string; timezone: string; location_key: string;
   locations: Array<{ k: string; n: number }>;
   can_import: boolean;
+  /** May this session publish a reply on the public Google listing. Admin only,
+   *  and the send route re-checks it — this decides what is DRAWN, nothing more.
+   *  A manager sees every review and no reply box. */
+  can_reply: boolean;
   headline: {
     today: HeadBlock; week: HeadBlock; month: HeadBlock;
     all_time: {
@@ -212,6 +225,74 @@ interface ConnectionDetail {
   } | null;
 }
 
+/* ── One filtered page of the scored reviews (GET …/reviews/list) ────────────
+ *
+ * WHY THE LIST IS A SECOND FETCH AND NOT A FILTER OVER `major.reviews`.
+ * The report above caps its review list at 500 rows chosen MAJOR-FIRST BY SCORE
+ * out of a history ten thousand deep. Those are the right 500 for "worst first"
+ * and the wrong 500 for every other question:
+ *
+ *   • "Oldest first" over them returns the oldest of the 500 highest-scoring
+ *     reviews — not the oldest review, and never was.
+ *   • A date window over them returns whichever of the top 500 happen to fall
+ *     inside it: a short, confident, WRONG list with nothing on screen to hint
+ *     that thousands of matching reviews were never in the browser.
+ *
+ * So the date window, the sort and the theme drill-down all ask the server,
+ * which filters where all the rows are and sends the exact totals back. When
+ * that fetch fails this page shows the failure. It does NOT fall back to
+ * filtering the 500 it happens to hold — a wrong list is worse than no list.
+ */
+
+interface ListWindow {
+  kind: RangeKey;
+  from_ms: number | null; to_ms: number | null;
+  from: string | null; to: string | null;
+  /** Printed verbatim: the control and the rows must not disagree about what
+   *  was ranged over. */
+  label: string;
+  unbounded: boolean;
+}
+
+interface ListBase {
+  ok: true;
+  generated_at: string;
+  anchor_at: string;
+  /** The server rejected our anchor as too far from its own clock. */
+  anchor_clamped: boolean;
+  location_key: string;
+  limit: number;
+  total_stored: number; rows_loaded: number;
+  history_truncated: boolean; history_from: string | null;
+  /** WHOLE-DATASET figures. They do not move when the window narrows. */
+  total_scored: number; major_count: number;
+  reviews: ReviewCard[]; listed: number; truncated: boolean;
+  matched_total: number;
+}
+
+interface ListPage extends ListBase {
+  mode: 'list';
+  window: ListWindow;
+  filters: { rating: RatingFilter; reply: AnsweredFilter; scope: 'major' | 'all'; sort: SortOrder; range: RangeKey };
+  /** What the DATE WINDOW alone excluded. `older_outside` is the number a
+   *  narrowed default is required to print: a list that hides 5,000 rows
+   *  without saying so reads as "this is everything". */
+  older_outside: number; newer_outside: number; undated_outside: number;
+  /** Rows passing SCOPE alone — what the window and the chips are a part of. */
+  scope_total: number;
+}
+
+interface ThemePage extends ListBase {
+  mode: 'theme';
+  theme: string;
+  span: ThemeSpanKey;
+  theme_low: boolean;
+  /** The MENTIONS total behind the rows. Compared on screen with the cell that
+   *  was clicked, because a drill-down that disagrees with its own row makes the
+   *  table's number look wrong. */
+  theme_total: number;
+}
+
 /** accounts/{a}/locations/{l} — the string a pull actually needs. */
 interface GbpLocationRow { name: string; label: string; address: string; storeCode: string }
 interface GbpAccountRow { name: string; label: string; type: string; locations: GbpLocationRow[] }
@@ -226,6 +307,22 @@ interface RefreshOutcome {
   needsReconnect?: boolean;
   /** 409 + prerequisites: Google's approval process, not a fault here. */
   prerequisites?: string[];
+  /**
+   * ERROR OUTCOMES ONLY. The value of `connection.last_success_at` as the SERVER
+   * reported it at the instant this failure was raised, in milliseconds — the
+   * marker a later success has to pass before this banner may be retired.
+   *
+   * It is the server's own success clock and nothing else. Using the browser's
+   * clock, or `generated_at` from a report that may have been loaded hours
+   * earlier, would let a success that happened BEFORE the error retire it, which
+   * hides a live failure — the opposite mistake and the worse one.
+   *
+   * null/undefined means the reply carried no health (the 401 from the proxy or
+   * from this route's own admin check, or a body that did not parse). Then there
+   * is no marker, and the banner stays until it is dismissed by hand: a stale
+   * error is bad, but inventing a success that was never reported is worse.
+   */
+  successBaselineMs?: number | null;
   ingest?: {
     rows_seen: number; inserted: number; updated: number; unchanged: number;
     skipped_stale: number; errors: number; weak_identity: number;
@@ -300,6 +397,36 @@ type PeriodKey = 'daily' | 'weekly' | 'monthly';
 type RatingFilter = 'all' | 'low' | '1' | '2' | '3' | '4' | '5';
 type AnsweredFilter = 'all' | 'no' | 'yes';
 type ThemeSpanKey = 'd90' | 'd365' | 'all';
+/** The date window for "Reviews that need attention". Resolved SERVER-SIDE so
+ *  "today" means an IST calendar day and not the browser's idea of one. */
+type RangeKey = 'today' | 'd7' | 'd30' | 'd90' | 'all' | 'custom';
+type SortOrder = 'newest' | 'oldest';
+
+/**
+ * THE DEFAULT WINDOW IS THE LAST 30 DAYS, AND THAT IS A DELIBERATE NARROWING.
+ *
+ * The owner's instruction: "from now dont show all the unanswered to answer
+ * right now but for the past 1 month it can show and leave the before ones."
+ * There are thousands of unanswered reviews going back years. A list of 5,564 is
+ * not a work queue, it is a wall, and a wall gets abandoned.
+ *
+ * NOTHING IS DELETED OR EXCLUDED FROM THE DATA. The older reviews are one chip
+ * away, every whole-dataset figure on this page still counts them, and the list
+ * is REQUIRED to print how many it is not showing — see the band rendered from
+ * `older_outside`. A silently narrowed list reads as "this is everything", which
+ * is the same lie as an unimported week reading as a quiet one, and this page
+ * exists to refuse that.
+ */
+const DEFAULT_RANGE: RangeKey = 'd30';
+
+/** Rows asked for at first, and the step each "show more" adds. The page renders
+ *  exactly what the server returns — there is no second cap up here — so the
+ *  count on screen is always the number of cards on screen. */
+const LIST_PAGE = 200;
+const LIST_STEP = 500;
+/** Matches MAX_LIMIT in /api/crm-calls/reviews/list. A transport ceiling, not an
+ *  answer: past it the page says how many it is not showing. */
+const LIST_MAX = 2000;
 
 export default function ReviewsPage() {
   const [period, setPeriod] = useState<PeriodKey>('monthly');
@@ -316,6 +443,25 @@ export default function ReviewsPage() {
   const [showRule, setShowRule] = useState(false);
   const [themeSpan, setThemeSpan] = useState<ThemeSpanKey>('d365');
   const [showImport, setShowImport] = useState(false);
+
+  /* The attention list's own controls. These do NOT filter anything in the
+   * browser — they are query parameters for …/reviews/list, which filters where
+   * all ten thousand rows are. See the ListPage comment above. */
+  const [dateRange, setDateRange] = useState<RangeKey>(DEFAULT_RANGE);
+  const [customFrom, setCustomFrom] = useState('');
+  const [customTo, setCustomTo] = useState('');
+  const [sortOrder, setSortOrder] = useState<SortOrder>('newest');
+  const [listLimit, setListLimit] = useState(LIST_PAGE);
+  const [list, setList] = useState<ListPage | null>(null);
+  const [listLoading, setListLoading] = useState(false);
+  const [listError, setListError] = useState<string | null>(null);
+
+  /** Which theme cell in "What guests mention" is expanded, and whether the
+   *  1-2★ column was the one clicked. */
+  const [openTheme, setOpenTheme] = useState<{ key: string; low: boolean } | null>(null);
+  const [drill, setDrill] = useState<ThemePage | null>(null);
+  const [drillLoading, setDrillLoading] = useState(false);
+  const [drillError, setDrillError] = useState<string | null>(null);
 
   const [refreshing, setRefreshing] = useState(false);
   const [refreshResult, setRefreshResult] = useState<RefreshOutcome | null>(null);
@@ -380,25 +526,86 @@ export default function ReviewsPage() {
       }
 
       const err = String((json as { error?: string }).error || `HTTP ${res.status}`);
+      const needsReconnect = !!(json as { needs_reconnect?: boolean }).needs_reconnect;
+      // Every failing branch of the refresh route returns fresh `health` beside
+      // its error; the page used to throw it away. Its last_success_at is the
+      // marker that lets a LATER success retire this banner — see
+      // successBaselineMs, and visibleRefreshResult below.
+      const health = (json as { health?: { last_success_at?: string } }).health;
       setRefreshResult({
         tone: 'error',
         message: err,
-        needsReconnect: !!(json as { needs_reconnect?: boolean }).needs_reconnect,
+        needsReconnect,
         prerequisites: (json as { prerequisites?: string[] }).prerequisites || [],
+        // A 409 is TWO states, and one blanket "not retryable" line was wrong
+        // about one of them. A refused refresh token really is terminal. A
+        // prerequisites 409 is a setup or approval state on Google's side whose
+        // own message now says which one and where it is fixed — asserting
+        // non-retryability over the top of it contradicted the message above it.
         detail: res.status === 409
-          ? 'This is not a retryable error — pressing Refresh again will not change it.'
+          ? (needsReconnect
+            ? 'This is not a retryable error — the connection has to be re-authorised before any fetch can work.'
+            : 'This is a setup or approval state on Google’s side, not a fault in this app. The message above says which one, and where it is fixed.')
           : res.status === 401
             ? 'Only an admin can run a manual fetch.'
             : 'Google could not be reached, or answered with an error. This one is worth retrying.',
+        successBaselineMs: health
+          // '' / missing => never succeeded => 0, which is the true baseline:
+          // the first success of all time then passes it.
+          ? (Date.parse(String(health.last_success_at || '')) || 0)
+          : null,
       });
       // The health on the page is now out of date whatever happened.
       await load();
     } catch {
-      setRefreshResult({ tone: 'error', message: 'Couldn’t reach the server to start a fetch.', detail: '' });
+      // Our own server was unreachable, so nothing reported a success marker.
+      // No marker => this one is cleared by hand only.
+      setRefreshResult({
+        tone: 'error',
+        message: 'Couldn’t reach the server to start a fetch.',
+        detail: '',
+        successBaselineMs: null,
+      });
     } finally {
       setRefreshing(false);
     }
   }, [load]);
+
+  /**
+   * A SUCCESSFUL FETCH RETIRES A PREVIOUS FAILURE.
+   *
+   * The failure banner used to be cleared by exactly two things: pressing
+   * Refresh again, and pressing its own ×. Nothing else — not a period change,
+   * not a reconnect, and above all not the hourly automatic pull — so one
+   * transient 504 sat on screen for hours next to "LAST FETCH 1 minute ago" and
+   * the two halves of the same panel contradicted each other. The server had
+   * already retired the failure (recordSuccess clears last_error and zeroes the
+   * failure streak, which is why the "N consecutive failed fetches" line
+   * correctly vanished while this banner did not).
+   *
+   * The rule, stated plainly: a failure is hidden once the server reports a
+   * success STRICTLY NEWER than the one that stood when the failure was raised.
+   *
+   *   · A success that lands after the error retires it — manual or automatic,
+   *     visible at the next load() the page performs.
+   *   · A real, ongoing failure stays. The load() that runs immediately after a
+   *     failed refresh re-reads the same unchanged last_success_at, so the
+   *     baseline and the current value are equal and the banner holds. Nothing
+   *     here is time-based and nothing auto-dismisses.
+   *   · No marker (no health on the reply) => the banner is never hidden by this
+   *     rule at all; it waits for the ×, exactly as before.
+   *
+   * Derived rather than cleared with an effect: the state stays the record of
+   * WHAT failed, and what is computed is only whether it is still true.
+   */
+  const visibleRefreshResult = useMemo(() => {
+    if (!refreshResult || refreshResult.tone !== 'error') return refreshResult;
+    const baseline = refreshResult.successBaselineMs;
+    if (baseline === null || baseline === undefined) return refreshResult;
+    const latestSuccess = Date.parse(data?.connection.last_success_at || '');
+    if (Number.isFinite(latestSuccess) && latestSuccess > baseline) return null;
+    return refreshResult;
+  }, [refreshResult, data]);
 
   const banner = useMemo(
     () => (data ? connectionBanner(data.connection) : null),
@@ -436,17 +643,119 @@ export default function ReviewsPage() {
     [chartData],
   );
 
-  const filtered = useMemo(() => {
-    if (!data) return [];
-    return data.major.reviews.filter(r => {
-      if (majorOnly && !r.is_major) return false;
-      if (ratingFilter === 'low' && r.rating > 2) return false;
-      if (ratingFilter !== 'all' && ratingFilter !== 'low' && r.rating !== Number(ratingFilter)) return false;
-      if (answeredFilter === 'no' && r.replied) return false;
-      if (answeredFilter === 'yes' && !r.replied) return false;
-      return true;
-    });
-  }, [data, majorOnly, ratingFilter, answeredFilter]);
+  /**
+   * THE ATTENTION LIST, FETCHED RATHER THAN FILTERED.
+   *
+   * This used to be a useMemo filtering `data.major.reviews` in the browser. It
+   * cannot be one any more, and the reason is the 500-row cap on that array:
+   * those 500 are the top of a SCORE ranking over ten thousand rows, so a date
+   * window or an oldest-first sort applied to them answers a different question
+   * than the one asked and looks completely certain doing it. The filter goes
+   * where the rows are.
+   *
+   * `at` carries the report's own generated_at, so the window the server
+   * resolves is measured from the same instant as every other number the
+   * manager is looking at.
+   */
+  const listSeq = useRef(0);
+
+  const loadList = useCallback(async () => {
+    if (!data) return;
+    const seq = ++listSeq.current;
+    setListLoading(true);
+    setListError(null);
+    try {
+      const sp = new URLSearchParams({
+        at: data.generated_at,
+        location: data.location_key,
+        rating: ratingFilter,
+        reply: answeredFilter,
+        scope: majorOnly ? 'major' : 'all',
+        sort: sortOrder,
+        range: dateRange,
+        limit: String(listLimit),
+      });
+      if (dateRange === 'custom') {
+        if (customFrom) sp.set('from', customFrom);
+        if (customTo) sp.set('to', customTo);
+      }
+      const res = await fetch(`/api/crm-calls/reviews/list?${sp.toString()}`);
+      if (seq !== listSeq.current) return;
+      const json = await res.json().catch(() => ({}));
+      if (seq !== listSeq.current) return;
+      if (!res.ok) {
+        // NO FALLBACK to filtering the 500 rows we hold. That would produce a
+        // plausible, confident, wrong list. An error is the honest output.
+        setListError(json?.error || `Couldn’t load the list (HTTP ${res.status})`);
+        setList(null);
+        return;
+      }
+      setList(json as ListPage);
+    } catch {
+      if (seq === listSeq.current) { setListError('Couldn’t load the list'); setList(null); }
+    } finally {
+      if (seq === listSeq.current) setListLoading(false);
+    }
+  }, [data, ratingFilter, answeredFilter, majorOnly, sortOrder, dateRange, customFrom, customTo, listLimit]);
+
+  useEffect(() => { loadList(); }, [loadList]);
+
+  /** Narrowing or re-ordering starts a new question, so the "show more" growth
+   *  resets with it. Without this, changing one chip re-requests whatever large
+   *  limit the last question had grown to. */
+  const refine = useCallback((apply: () => void) => {
+    apply();
+    setListLimit(LIST_PAGE);
+  }, []);
+
+  /**
+   * THE THEME DRILL-DOWN.
+   *
+   * Keyed on the span as well as the clicked cell, so the rows revealed are
+   * always the rows the visible table counted. The theme table's numbers are
+   * computed over `now - days * 86400000` from the report's own clock; the
+   * server reproduces that arithmetic from the `at` we send, which is why
+   * `theme_total` comes back and can be compared with the cell that was
+   * clicked instead of the agreement merely being hoped for.
+   */
+  useEffect(() => {
+    if (!openTheme || !data) { setDrill(null); setDrillError(null); return; }
+    let alive = true;
+    // Dropped, not kept, while the new one loads. Changing the span changes the
+    // table's counts AND this list; holding the previous span's rows against the
+    // new span's number would flash the "these disagree" warning at a
+    // disagreement that does not exist.
+    setDrill(null);
+    setDrillLoading(true);
+    setDrillError(null);
+    (async () => {
+      try {
+        const sp = new URLSearchParams({
+          at: data.generated_at,
+          location: data.location_key,
+          theme: openTheme.key,
+          span: themeSpan,
+          sort: 'newest',
+          limit: String(LIST_MAX),
+        });
+        if (openTheme.low) sp.set('theme_low', '1');
+        const res = await fetch(`/api/crm-calls/reviews/list?${sp.toString()}`);
+        const json = await res.json().catch(() => ({}));
+        if (!alive) return;
+        if (!res.ok) {
+          setDrillError(json?.error || `Couldn’t load those reviews (HTTP ${res.status})`);
+          setDrill(null);
+          return;
+        }
+        setDrill(json as ThemePage);
+      } catch {
+        if (alive) { setDrillError('Couldn’t load those reviews'); setDrill(null); }
+      } finally {
+        if (alive) setDrillLoading(false);
+      }
+    })();
+    return () => { alive = false; };
+  }, [openTheme, themeSpan, data]);
 
   if (forbidden) {
     return (
@@ -610,7 +919,7 @@ export default function ReviewsPage() {
             refreshing={refreshing}
             onRefreshNow={refreshNow}
             onChanged={load}
-            lastResult={refreshResult}
+            lastResult={visibleRefreshResult}
             onDismissResult={() => setRefreshResult(null)}
           />
         )}
@@ -755,7 +1064,7 @@ export default function ReviewsPage() {
           <Section
             icon={<MessageSquare className="w-4 h-4 text-[#af4408]" />}
             title="Reviews that need attention"
-            subtitle="Scored, not filtered by star rating alone: a 3-star with no reply outranks a replied 2-star, because a reply is the thing still owed. Worst first."
+            subtitle="Scored, not filtered by star rating alone: a 3-star with no reply outranks a replied 2-star, because a reply is the thing still owed. Opens on the last 30 days — the older ones are still held and one chip away."
             right={
               <button onClick={() => setShowRule(v => !v)} className="text-xs font-semibold text-[#af4408] hover:underline whitespace-nowrap">
                 {showRule ? 'Hide the rule' : 'How this list is chosen'}
@@ -774,29 +1083,144 @@ export default function ReviewsPage() {
               </div>
             )}
 
-            {/* Filters */}
+            {/* Filters. Every chip here is a QUERY PARAMETER, not a client-side
+                filter — see loadList(). */}
             <div className="flex flex-wrap items-center gap-x-4 gap-y-2 mb-3 pb-3 border-b border-[#F0E4D6]">
+              <FilterGroup label="Dates">
+                {([
+                  ['today', 'Today'], ['d7', '7 days'], ['d30', '30 days'], ['d90', '90 days'], ['all', 'All'],
+                ] as Array<[RangeKey, string]>).map(([v, l]) => (
+                  <Chip key={v} active={dateRange === v} onClick={() => refine(() => setDateRange(v))}>{l}</Chip>
+                ))}
+                <Chip active={dateRange === 'custom'} onClick={() => refine(() => setDateRange('custom'))}>Range</Chip>
+              </FilterGroup>
+              <FilterGroup label="Order">
+                <Chip active={sortOrder === 'newest'} onClick={() => refine(() => setSortOrder('newest'))}>Newest first</Chip>
+                <Chip active={sortOrder === 'oldest'} onClick={() => refine(() => setSortOrder('oldest'))}>Oldest first</Chip>
+              </FilterGroup>
               <FilterGroup label="Rating">
                 {([
                   ['all', 'All'], ['low', '1–2★'], ['1', '1★'], ['2', '2★'], ['3', '3★'], ['4', '4★'], ['5', '5★'],
                 ] as Array<[RatingFilter, string]>).map(([v, l]) => (
-                  <Chip key={v} active={ratingFilter === v} onClick={() => setRatingFilter(v)}>{l}</Chip>
+                  <Chip key={v} active={ratingFilter === v} onClick={() => refine(() => setRatingFilter(v))}>{l}</Chip>
                 ))}
               </FilterGroup>
               <FilterGroup label="Reply">
                 {([['all', 'All'], ['no', 'Unanswered'], ['yes', 'Answered']] as Array<[AnsweredFilter, string]>).map(([v, l]) => (
-                  <Chip key={v} active={answeredFilter === v} onClick={() => setAnsweredFilter(v)}>{l}</Chip>
+                  <Chip key={v} active={answeredFilter === v} onClick={() => refine(() => setAnsweredFilter(v))}>{l}</Chip>
                 ))}
               </FilterGroup>
               <FilterGroup label="Scope">
-                <Chip active={majorOnly} onClick={() => setMajorOnly(true)}>Needs attention</Chip>
-                <Chip active={!majorOnly} onClick={() => setMajorOnly(false)}>Every review</Chip>
+                <Chip active={majorOnly} onClick={() => refine(() => setMajorOnly(true))}>Needs attention</Chip>
+                <Chip active={!majorOnly} onClick={() => refine(() => setMajorOnly(false))}>Every review</Chip>
               </FilterGroup>
-              <p className="text-[11px] text-[#8B7355] ml-auto">
-                {filtered.length} shown of {majorOnly ? data.major.major_count : data.major.total_scored}
-                {data.major.truncated && ` · the newest ${data.major.listed} scored reviews were loaded`}
-              </p>
             </div>
+
+            {dateRange === 'custom' && (
+              <div className="flex flex-wrap items-end gap-3 mb-3 bg-[#FFFBF5] border border-[#F0E4D6] rounded-lg px-3 py-2.5">
+                <label className="text-[11px] font-semibold text-[#6B5744] uppercase tracking-wider">
+                  From
+                  <input
+                    type="date"
+                    value={customFrom}
+                    onChange={e => refine(() => setCustomFrom(e.target.value))}
+                    className="block mt-1 px-2.5 py-1.5 rounded-lg border border-[#E0D0BE] bg-white text-[12px] font-normal normal-case tracking-normal text-[#2D1B0E]"
+                  />
+                </label>
+                <label className="text-[11px] font-semibold text-[#6B5744] uppercase tracking-wider">
+                  To
+                  <input
+                    type="date"
+                    value={customTo}
+                    onChange={e => refine(() => setCustomTo(e.target.value))}
+                    className="block mt-1 px-2.5 py-1.5 rounded-lg border border-[#E0D0BE] bg-white text-[12px] font-normal normal-case tracking-normal text-[#2D1B0E]"
+                  />
+                </label>
+                <p className="text-[11px] text-[#8B7355] max-w-md">
+                  Whole IST calendar days, both ends included. Leave one side empty for an open-ended
+                  range. Empty both and this is every review held.
+                </p>
+              </div>
+            )}
+
+            {/* ── WHAT THIS LIST IS, AND WHAT IT IS NOT ────────────────────────
+                The required admission. A list narrowed to 30 days by default,
+                with thousands of older rows silently absent, reads as "this is
+                everything" — and that is the same class of falsehood as an
+                unimported week reading as a quiet one. So the window is named,
+                the hidden count is printed, and the control that widens it is
+                right here. Amber when something is hidden; plain when the list
+                really is the whole of the matching set. ─────────────────────── */}
+            {listError ? (
+              <div className="bg-red-50 border border-red-200 text-red-800 rounded-lg px-3 py-2.5 text-[12px] flex items-start gap-2 mb-3">
+                <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
+                <span>
+                  {listError} — so this list is not being shown at all. It is deliberately not falling
+                  back to the {data.major.listed} reviews already on this page: those are the
+                  highest-SCORING ones, and filtering or re-ordering them by date would produce a
+                  confident, wrong answer. Press Reload page to try again.
+                </span>
+              </div>
+            ) : list && (
+              <div
+                className={`rounded-lg px-3 py-2.5 text-[12px] border mb-3 flex flex-wrap items-center gap-x-2 gap-y-1 ${
+                  list.older_outside + list.newer_outside > 0
+                    ? 'bg-amber-50 border-amber-200 text-amber-900'
+                    : 'bg-[#FFFBF5] border-[#F0E4D6] text-[#6B5744]'
+                }`}
+              >
+                <span>
+                  Showing <span className="font-semibold">{list.window.label}</span>
+                  {' — '}
+                  {list.matched_total === 0 ? 'no review matches' : (
+                    <>
+                      <span className="font-semibold tabular-nums">{list.matched_total}</span>
+                      {' '}review{list.matched_total === 1 ? '' : 's'} match
+                      {list.listed < list.matched_total && <>, {list.listed} on screen</>}
+                    </>
+                  )}
+                  {', '}
+                  {list.filters.sort === 'newest' ? 'newest first' : 'oldest first'}.
+                </span>
+                {list.older_outside > 0 && (
+                  <span className="font-semibold tabular-nums">
+                    {list.older_outside} older {list.older_outside === 1 ? 'one' : 'ones'} not shown.
+                  </span>
+                )}
+                {list.newer_outside > 0 && (
+                  <span className="font-semibold tabular-nums">{list.newer_outside} newer not shown.</span>
+                )}
+                {list.older_outside + list.newer_outside > 0 && (
+                  <button
+                    onClick={() => refine(() => { setDateRange('all'); setCustomFrom(''); setCustomTo(''); })}
+                    className="font-semibold underline hover:no-underline"
+                  >
+                    Show every review held
+                  </button>
+                )}
+                {/* Said while a new selection is in flight, because the sentence
+                    above it describes the PREVIOUS one until the reply lands.
+                    Unlabelled, that is a window label contradicting the chip the
+                    manager just pressed. */}
+                {listLoading && (
+                  <span className="inline-flex items-center gap-1 font-semibold">
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />updating…
+                  </span>
+                )}
+                {list.anchor_clamped && (
+                  <span className="font-semibold">
+                    This page has been open a long time; the dates were measured from the server’s clock
+                    instead. Reload for a current view.
+                  </span>
+                )}
+                <span className="ml-auto text-[11px] opacity-80">
+                  {list.filters.scope === 'major'
+                    ? `${list.scope_total} of ${list.total_scored} reviews held reach the attention threshold.`
+                    : `${list.total_scored} scored reviews held.`}
+                  {' '}Every other count on this page is over that whole set, not this window.
+                </span>
+              </div>
+            )}
 
             {data.reply_link.kind === 'none' && (
               <Note tone="warn">
@@ -807,22 +1231,70 @@ export default function ReviewsPage() {
               </Note>
             )}
 
-            {filtered.length === 0 ? (
+            {/* Not `listLoading` alone: the first selection is requested in an
+                effect AFTER the first paint, so for one frame nothing is loading
+                and nothing has loaded. An empty section there reads as "no
+                reviews". */}
+            {!list && !listError && (
+              <div className="flex items-center gap-2 text-[13px] text-[#6B5744] px-3 py-3">
+                <Loader2 className="w-4 h-4 animate-spin" />
+                Selecting from the {data.data_state.stored_total} reviews held…
+              </div>
+            )}
+
+            {list && list.reviews.length === 0 ? (
               <Empty>
-                {data.major.total_scored === 0
+                {list.total_scored === 0
                   ? 'No reviews have been imported for this listing yet, so there is nothing to score.'
-                  : majorOnly && ratingFilter === 'all' && answeredFilter === 'all'
-                    ? 'No review in the imported history reaches the attention threshold. That is a real result over ' +
-                      `${data.major.total_scored} reviews, not an empty page.`
-                    : 'No review matches these filters. The others are still there — widen the filter.'}
+                  : list.older_outside + list.newer_outside > 0
+                    // The distinction the date default makes necessary: nothing
+                    // matched HERE is not the same as nothing matching.
+                    ? `No review matches inside ${list.window.label}, but ${list.older_outside + list.newer_outside} ` +
+                      'outside it do. Widen the dates above to see them — nothing has been removed.'
+                    : list.filters.scope === 'major' && list.filters.rating === 'all' && list.filters.reply === 'all'
+                      ? 'No review in the imported history reaches the attention threshold. That is a real result over ' +
+                        `${list.total_scored} reviews, not an empty page.`
+                      : 'No review matches these filters. The others are still there — widen the filter.'}
               </Empty>
-            ) : (
-              <div className="space-y-2.5">
-                {filtered.slice(0, 200).map(r => (
-                  <ReviewRowCard key={r.id} r={r} link={data.reply_link} />
+            ) : list && (
+              <div className={`space-y-2.5 transition-opacity ${listLoading ? 'opacity-50' : ''}`}>
+                {/* Every row the server returned is rendered. There is no second
+                    cap here, so "N on screen" is always literally true. */}
+                {list.reviews.map(r => (
+                  <ReviewRowCard
+                    key={r.id}
+                    r={r}
+                    link={data.reply_link}
+                    canReply={data.can_reply}
+                    locationKey={data.location_key}
+                    /* A successful send changes the answered/unanswered counts
+                       and the reply rate in the header. Reload both rather than
+                       patching one card, so nothing on screen disagrees with
+                       anything else on screen. */
+                    onReplied={() => { load(); loadList(); }}
+                  />
                 ))}
-                {filtered.length > 200 && (
-                  <Note>Showing the first 200 of {filtered.length} matching reviews. Narrow the filters to see the rest.</Note>
+                {list.truncated && (
+                  <div className="flex flex-wrap items-center gap-3 bg-[#FFFBF5] border border-[#F0E4D6] rounded-lg px-3 py-2.5 text-[12px] text-[#6B5744] mt-3">
+                    <span>
+                      {list.listed} of <span className="font-semibold tabular-nums">{list.matched_total}</span>{' '}
+                      matching reviews are on screen.
+                    </span>
+                    {list.limit < LIST_MAX ? (
+                      <button
+                        onClick={() => setListLimit(n => Math.min(LIST_MAX, n + LIST_STEP))}
+                        disabled={listLoading}
+                        className="font-semibold text-[#af4408] hover:underline disabled:opacity-60"
+                      >
+                        {listLoading ? 'Loading…' : `Show ${Math.min(LIST_STEP, list.matched_total - list.listed)} more`}
+                      </button>
+                    ) : (
+                      <span>
+                        That is as many as this page will load at once — narrow the dates or the rating to
+                        work through the rest.
+                      </span>
+                    )}
+                  </div>
                 )}
               </div>
             )}
@@ -868,25 +1340,77 @@ export default function ReviewsPage() {
                     </tr>
                   </thead>
                   <tbody>
-                    {themes.themes.map(t => (
-                      <tr key={t.key} className="border-b border-[#F7EEE4] last:border-0 align-top">
-                        <td className="py-2.5 pr-3 font-semibold">{t.label}</td>
-                        <Td>{t.count}</Td>
-                        <Td>{t.share_of_text_reviews == null ? '—' : `${Math.round(t.share_of_text_reviews * 1000) / 10}%`}</Td>
-                        <Td>
-                          {t.average_rating == null ? '—' : (
-                            <span className="inline-flex items-center gap-1.5 justify-end">
-                              <span>{t.average_rating.toFixed(2)}</span>
-                              <Stars value={t.average_rating} size={11} />
-                            </span>
+                    {themes.themes.map(t => {
+                      const openHere = openTheme?.key === t.key;
+                      return (
+                        <Fragment key={t.key}>
+                          <tr className={`border-b border-[#F7EEE4] align-top ${openHere ? 'bg-[#FFFBF5]' : ''}`}>
+                            <td className="py-2.5 pr-3 font-semibold">{t.label}</td>
+                            <Td>
+                              <CountButton
+                                n={t.count}
+                                active={openHere && !openTheme!.low}
+                                title={`Show the ${t.count} review${t.count === 1 ? '' : 's'} that mention ${t.label} in ${themes.label.toLowerCase()}`}
+                                onClick={() => setOpenTheme(cur =>
+                                  cur && cur.key === t.key && !cur.low ? null : { key: t.key, low: false })}
+                              />
+                            </Td>
+                            <Td>{t.share_of_text_reviews == null ? '—' : `${Math.round(t.share_of_text_reviews * 1000) / 10}%`}</Td>
+                            <Td>
+                              {t.average_rating == null ? '—' : (
+                                <span className="inline-flex items-center gap-1.5 justify-end">
+                                  <span>{t.average_rating.toFixed(2)}</span>
+                                  <Stars value={t.average_rating} size={11} />
+                                </span>
+                              )}
+                            </Td>
+                            <Td>
+                              {/* Zero opens nothing: a button that reveals an
+                                  empty list is a promise the number already
+                                  broke. */}
+                              {t.low_count === 0 ? '0' : (
+                                <CountButton
+                                  n={t.low_count}
+                                  tone="low"
+                                  active={openHere && openTheme!.low}
+                                  title={`Show the ${t.low_count} review${t.low_count === 1 ? '' : 's'} rated 1–2★ that mention ${t.label}`}
+                                  onClick={() => setOpenTheme(cur =>
+                                    cur && cur.key === t.key && cur.low ? null : { key: t.key, low: true })}
+                                />
+                              )}
+                            </Td>
+                            <td className="py-2.5 pl-3 text-[11px] text-[#8B7355]">
+                              {t.top_terms.map(x => `${x.term} (${x.count})`).join(', ') || '—'}
+                            </td>
+                          </tr>
+                          {openHere && (
+                            <tr className="border-b-2 border-[#E8D5C4] bg-[#FFFBF5]">
+                              <td colSpan={6} className="px-1 sm:px-3 pb-4 pt-1">
+                                <ThemeDrill
+                                  label={t.label}
+                                  spanLabel={themes.label.toLowerCase()}
+                                  low={openTheme!.low}
+                                  /* The number the manager actually clicked.
+                                     ThemeDrill compares it with the total the
+                                     server counted and says so if they differ —
+                                     a drill-down that quietly disagrees with its
+                                     own row makes the table look wrong. */
+                                  expected={openTheme!.low ? t.low_count : t.count}
+                                  drill={drill}
+                                  loading={drillLoading}
+                                  error={drillError}
+                                  link={data.reply_link}
+                                  canReply={data.can_reply}
+                                  locationKey={data.location_key}
+                                  onReplied={() => { load(); loadList(); }}
+                                  onClose={() => setOpenTheme(null)}
+                                />
+                              </td>
+                            </tr>
                           )}
-                        </Td>
-                        <Td>{t.low_count}</Td>
-                        <td className="py-2.5 pl-3 text-[11px] text-[#8B7355]">
-                          {t.top_terms.map(x => `${x.term} (${x.count})`).join(', ') || '—'}
-                        </td>
-                      </tr>
-                    ))}
+                        </Fragment>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
@@ -947,6 +1471,20 @@ export default function ReviewsPage() {
                 Speed is measured over the <span className="font-semibold">{data.summary.reply.timed}</span> replies that carry a
                 timestamp, not over all {data.summary.reply.replied} answered ones. A Takeout export can hold the reply text
                 without a reply time; those count as answered and cannot be timed, so the two denominators differ on purpose.
+              </Note>
+              {/* ── A NUMBER MUST NOT CHANGE MEANING WITHOUT SAYING SO ────────
+                  "Reviews that need attention" above now opens on the last 30
+                  days. These figures deliberately did NOT follow it: this panel
+                  answers "how are we doing on replies", which is a question about
+                  the venue's whole record, and quietly re-basing "Unanswered"
+                  onto a month would make the backlog look solved. So the scope
+                  is stated instead of being left to be inferred — the same
+                  discipline as the NOT IMPORTED tiles. ──────────────────────── */}
+              <Note tone="warn">
+                Every figure in this panel covers <span className="font-semibold">all {data.summary.total} reviews held</span>,
+                not the date window chosen in “Reviews that need attention”. That list opens on the last
+                30 days because a queue thousands long cannot be worked; this scoreboard stays whole,
+                so the backlog it reports is the real one.
               </Note>
             </Section>
           </div>
@@ -1388,6 +1926,21 @@ function ConnectionPanel({
             <div className="flex-1 min-w-0">
               <p className="font-semibold">{lastResult.message}</p>
               {lastResult.detail && <p className="mt-0.5 opacity-90">{lastResult.detail}</p>}
+              {/* The other half of "there's an error but it fetched 1 minute
+                  ago". A banner that is NOT stale can still sit beside a fresh
+                  last-fetch time: one manual attempt timed out while the hourly
+                  feed kept working. Both statements are true, and leaving the
+                  reader to reconcile them is how a working connector gets read
+                  as a broken one. Said only while the feed is inside its own
+                  staleness threshold — past that it would be reassurance about
+                  nothing. */}
+              {lastResult.tone === 'error' && !!health.last_success_at
+                && (health.hours_since_success ?? Infinity) < health.stale_after_hours && (
+                <p className="mt-0.5 opacity-90">
+                  This attempt failed; the feed itself has not. Reviews last arrived{' '}
+                  {agoText(health.hours_since_success)} and nothing already fetched was lost.
+                </p>
+              )}
               {!!lastResult.prerequisites?.length && (
                 <ol className="list-decimal pl-4 mt-1.5 space-y-0.5">
                   {lastResult.prerequisites.map((p, i) => <li key={i}>{p}</li>)}
@@ -1845,7 +2398,488 @@ function AllTimeTile({ all, summary }: { all: Report['headline']['all_time']; su
 
 /* ── Review card ───────────────────────────────────────────────────────────── */
 
-function ReviewRowCard({ r, link }: { r: ReviewCard; link: Report['reply_link'] }) {
+/* ── Reply composer (admin) ────────────────────────────────────────────────────
+ *
+ * THE THREE CHECKS, AS A SCREEN. The owner asked for "2-3 checks before
+ * Submiting to google so can check any mistakes before submitting to google",
+ * and they are the ONLY undo that exists: a reply is public the instant Google's
+ * PUT returns, under the business's own name, and Google offers no way to take
+ * it back.
+ *
+ *   1. PREVIEW  — stage 'preview' shows the exact words that will appear
+ *                 publicly, directly beside the review being answered, so a
+ *                 mismatch is visible rather than imagined.
+ *   2. VALIDATE — validateReply() runs here as the admin types (live byte
+ *                 counter, instant findings) AND on the server when the preview
+ *                 opens, which adds the two things a browser cannot know:
+ *                 whether the review is addressable on Google at all, and
+ *                 whether this reply nearly repeats a recently published one.
+ *   3. CONFIRM  — stage 'confirm' names the business out loud and posts nothing
+ *                 until it is pressed. The business name is echoed back to the
+ *                 route, which refuses a send that cannot name it — that is what
+ *                 makes this a check instead of a checkbox.
+ *
+ * WHY THREE STAGES AND NOT ONE FORM WITH A BUTTON: the failure this prevents is
+ * an admin with 5,564 unanswered reviews building muscle memory. A single Send
+ * button next to a textarea becomes one click; three stages that each show
+ * something different cannot be completed without reading.
+ *
+ * THE AI DRAFT IS A STARTING POINT AND NOTHING MORE. It lands in the same
+ * textarea as typed text, it is validated by the same function, and it goes
+ * through the same three stages. If AI is off or the model fails, everything
+ * here still works by typing — a drafting feature that breaks sending when it is
+ * unavailable would be worse than no drafting feature.
+ */
+
+interface ReplyCheckResponse {
+  ok?: boolean;
+  error?: string;
+  can_send?: boolean;
+  validation?: { ok: boolean; blocking: ReplyFinding[]; warnings: ReplyFinding[]; bytes: number; chars: number };
+  target?: { review_name: string; basis: string } | null;
+  target_error?: { code: string; message: string } | null;
+  is_edit?: boolean;
+  existing_reply?: string;
+  business_label?: string;
+  max_bytes?: number;
+  history?: Array<{
+    id: string; comment: string; actor: string; origin: string; status: string;
+    reply_state: string; is_edit: number; error: string; started_at: string;
+  }>;
+}
+
+interface DraftResponse {
+  ok?: boolean;
+  status?: string;
+  message?: string;
+  model?: string;
+  draft?: { reply: string; answers: string[]; return_reason: string; cautions: string[] };
+  disclaimer?: string;
+}
+
+interface SendResponse {
+  ok?: boolean;
+  error?: string;
+  code?: string;
+  findings?: ReplyFinding[];
+  published?: 'no' | 'unknown';
+  published_note?: string;
+  note?: string;
+  reply_state?: string;
+  live?: boolean;
+}
+
+function ReplyComposer({ r, locationKey, onSent }: {
+  r: ReviewCard; locationKey: string; onSent: () => void;
+}) {
+  const [stage, setStage] = useState<'closed' | 'compose' | 'preview' | 'confirm' | 'done'>('closed');
+  const [text, setText] = useState('');
+  /** Whether a model wrote the text currently in the box, and whether the admin
+   *  has edited it since. Recorded with the send: worth knowing, in six months,
+   *  which replies on the listing a model wrote. Gates nothing. */
+  const [draftedText, setDraftedText] = useState<string | null>(null);
+  const [draft, setDraft] = useState<DraftResponse | null>(null);
+  const [drafting, setDrafting] = useState(false);
+  const [check, setCheck] = useState<ReplyCheckResponse | null>(null);
+  const [checking, setChecking] = useState(false);
+  const [acked, setAcked] = useState<Record<string, boolean>>({});
+  const [sending, setSending] = useState(false);
+  const [sent, setSent] = useState<SendResponse | null>(null);
+  const [err, setErr] = useState('');
+
+  /* Check 2, live, from the same function the server runs. The counter has to be
+   * in BYTES: Google's 4096 is a byte limit, and a Telugu character is three
+   * bytes, so a character counter would lie at exactly the wrong moment. */
+  const local = useMemo(() => validateReply({
+    comment: text,
+    review: {
+      text: r.text, rating: r.rating,
+      author_name: r.author_name, author_is_anonymous: r.author_is_anonymous,
+      language: r.language,
+    },
+  }), [text, r.text, r.rating, r.author_name, r.author_is_anonymous, r.language]);
+
+  const maxBytes = check?.max_bytes ?? 4096;
+  const bytes = replyBytes(text);
+
+  const reset = () => {
+    setStage('closed'); setText(''); setDraft(null); setDraftedText(null);
+    setCheck(null); setAcked({}); setSent(null); setErr('');
+  };
+
+  const runCheck = async (): Promise<ReplyCheckResponse | null> => {
+    setChecking(true); setErr('');
+    try {
+      const res = await api('/api/crm-calls/reviews/reply/check', {
+        method: 'POST',
+        body: { review_id: r.id, comment: text, location_key: locationKey },
+      });
+      const j: ReplyCheckResponse = await res.json();
+      if (!res.ok) { setErr(j.error || `Check failed (HTTP ${res.status})`); setCheck(null); return null; }
+      setCheck(j);
+      return j;
+    } catch (e: unknown) {
+      setErr(e instanceof Error ? e.message : 'Could not reach the server to check the reply');
+      return null;
+    } finally { setChecking(false); }
+  };
+
+  const getDraft = async () => {
+    setDrafting(true); setErr(''); setDraft(null);
+    try {
+      const res = await api('/api/crm-calls/reviews/reply/draft', {
+        method: 'POST',
+        body: { review_id: r.id, location_key: locationKey },
+      });
+      const j: DraftResponse = await res.json();
+      setDraft(j);
+      if (j.ok && j.draft?.reply) {
+        setText(j.draft.reply);
+        setDraftedText(j.draft.reply);
+        // A new draft invalidates any acknowledgement made about the old text.
+        setAcked({});
+      }
+    } catch (e: unknown) {
+      setErr(e instanceof Error ? e.message : 'Could not reach the server for a draft');
+    } finally { setDrafting(false); }
+  };
+
+  const send = async () => {
+    if (!check) return;
+    setSending(true); setErr('');
+    try {
+      const res = await api('/api/crm-calls/reviews/reply', {
+        method: 'POST',
+        body: {
+          review_id: r.id,
+          comment: text,
+          location_key: locationKey,
+          origin: draftedText == null ? 'typed'
+            : draftedText === text ? 'ai_draft_unchanged' : 'ai_draft_edited',
+          confirm: {
+            public: true,
+            business: check.business_label || '',
+            acknowledged: (check.validation?.warnings || []).map(w => w.code).filter(c => acked[c]),
+            overwrite: !!check.is_edit,
+          },
+        },
+      });
+      const j: SendResponse = await res.json();
+      setSent(j);
+      if (res.ok) { setStage('done'); onSent(); }
+      else setErr(j.error || `Send failed (HTTP ${res.status})`);
+    } catch (e: unknown) {
+      // A network error here is the ambiguous case: the request may have reached
+      // Google. Say so rather than implying nothing happened.
+      setErr((e instanceof Error ? e.message : 'The request failed')
+        + ' — the connection dropped, so it is not certain whether the reply reached Google. '
+        + 'Check the review on Google before sending again.');
+    } finally { setSending(false); }
+  };
+
+  /* ── Closed: one button, and it says which of the two things it does. ───── */
+  if (stage === 'closed') {
+    return (
+      <div className="mt-2.5">
+        <button
+          onClick={() => { setStage('compose'); setText(r.replied ? r.reply_text : ''); }}
+          className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[11px] font-semibold border border-[#E0D0BE] bg-white hover:bg-[#FFF1E3] text-[#6B5744]"
+        >
+          {r.replied ? <><Pencil className="w-3.5 h-3.5" /> Edit the public reply</>
+            : <><MessageSquare className="w-3.5 h-3.5" /> Reply from here</>}
+        </button>
+      </div>
+    );
+  }
+
+  /* ── Sent. ──────────────────────────────────────────────────────────────── */
+  if (stage === 'done' && sent) {
+    const rejected = sent.reply_state === 'REJECTED';
+    return (
+      <div className={`mt-2.5 rounded-lg border p-3 ${rejected
+        ? 'border-red-300 bg-red-50' : sent.live ? 'border-emerald-300 bg-emerald-50' : 'border-amber-300 bg-amber-50'}`}>
+        <p className="text-[12px] font-semibold flex items-center gap-1.5">
+          {rejected ? <><ShieldAlert className="w-4 h-4 text-red-600" /> Google rejected it</>
+            : sent.live ? <><Globe className="w-4 h-4 text-emerald-700" /> Published on Google</>
+            : <><Clock className="w-4 h-4 text-amber-700" /> Sent — Google is holding it</>}
+        </p>
+        <p className="text-[12px] text-[#3D2A1A] mt-1">{sent.note}</p>
+        <button onClick={reset} className="mt-2 text-[11px] font-semibold text-[#af4408] underline">Close</button>
+      </div>
+    );
+  }
+
+  const warnings = check?.validation?.warnings || [];
+  const unacked = warnings.filter(w => !acked[w.code]);
+  const serverBlocking = check?.validation?.blocking || [];
+  const canContinue = !!check && !!check.target && serverBlocking.length === 0 && unacked.length === 0;
+
+  return (
+    <div className="mt-2.5 rounded-lg border border-[#E0D0BE] bg-[#FFFDFB] p-3">
+      <div className="flex items-center justify-between gap-2 mb-2">
+        <p className="text-[11px] font-bold text-[#2D1B0E] uppercase tracking-wide">
+          {stage === 'compose' ? 'Step 1 of 3 · Write' : stage === 'preview' ? 'Step 2 of 3 · Check' : 'Step 3 of 3 · Confirm'}
+        </p>
+        <button onClick={reset} title="Cancel" className="text-[#8B7355] hover:text-[#2D1B0E]">
+          <X className="w-4 h-4" />
+        </button>
+      </div>
+
+      {/* ── STAGE 1: WRITE ── */}
+      {stage === 'compose' && (
+        <>
+          {r.replied && (
+            <Note tone="warn">
+              A reply is already public on this review. Sending replaces it — the text below is what
+              guests are reading now, and Google keeps no history of what it replaced.
+            </Note>
+          )}
+          <textarea
+            value={text}
+            onChange={e => setText(e.target.value)}
+            rows={6}
+            placeholder="Write the reply this guest will read. Answer what they actually said, and give them a reason to come back."
+            className="w-full mt-2 px-3 py-2 text-[13px] rounded-lg border border-[#E0D0BE] bg-white focus:outline-none focus:border-[#af4408] resize-y"
+          />
+          <div className="flex flex-wrap items-center justify-between gap-2 mt-1.5">
+            <span className={`text-[11px] tabular-nums ${bytes > maxBytes ? 'text-red-600 font-bold' : 'text-[#8B7355]'}`}>
+              {bytes} / {maxBytes} bytes
+              <span className="text-[#A89480]"> · {[...text].length} characters</span>
+            </span>
+            <button
+              onClick={getDraft}
+              disabled={drafting}
+              title="Ask the model for a first draft written to bring this guest back. You edit it; nothing is sent."
+              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[11px] font-semibold border border-[#E0D0BE] bg-white hover:bg-[#FFF1E3] text-[#6B5744] disabled:opacity-50"
+            >
+              {drafting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Sparkles className="w-3.5 h-3.5" />}
+              {drafting ? 'Drafting…' : 'AI draft'}
+            </button>
+          </div>
+
+          {/* The draft's own account of itself. `answers` is the accountability
+              field: if it is empty for a review with real content, the model did
+              not engage with what the guest wrote. */}
+          {draft && !draft.ok && (
+            <Note tone="warn">
+              {draft.message || 'The draft is not available.'}
+              {' '}Type the reply instead — sending does not need the draft.
+            </Note>
+          )}
+          {draft?.ok && draft.draft && (
+            <div className="mt-2 rounded-lg border border-[#D9C3AC] bg-[#FFF8F0] p-2.5">
+              <p className="text-[10.5px] font-bold uppercase tracking-wide text-[#8B6B45] flex items-center gap-1">
+                <Sparkles className="w-3 h-3" /> AI draft{draft.model ? ` · ${draft.model}` : ''}
+              </p>
+              <p className="text-[11px] text-[#6B5744] mt-1">{draft.disclaimer}</p>
+              {draft.draft.answers.length > 0 ? (
+                <p className="text-[11px] text-[#3D2A1A] mt-1.5">
+                  <span className="font-semibold">It answers:</span> {draft.draft.answers.join(' · ')}
+                </p>
+              ) : r.text.trim().length > 40 && (
+                <p className="text-[11px] text-red-700 mt-1.5 font-semibold">
+                  It did not name one specific thing from this review. A reply that could sit under any
+                  review convinces nobody — rewrite it or draft again.
+                </p>
+              )}
+              {draft.draft.return_reason && (
+                <p className="text-[11px] text-[#3D2A1A] mt-1">
+                  <span className="font-semibold">Reason to come back:</span> {draft.draft.return_reason}
+                  <span className="text-[#8B7355]"> — check this is something the restaurant really offers.</span>
+                </p>
+              )}
+              {draft.draft.cautions.length > 0 && (
+                <p className="text-[11px] text-amber-800 mt-1">
+                  <span className="font-semibold">For you to decide:</span> {draft.draft.cautions.join(' · ')}
+                </p>
+              )}
+            </div>
+          )}
+
+          <FindingList findings={[...local.blocking, ...local.warnings]} />
+
+          <div className="flex items-center gap-2 mt-2.5">
+            <button
+              onClick={async () => { const j = await runCheck(); if (j) setStage('preview'); }}
+              disabled={!local.ok || checking}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[11px] font-bold bg-[#af4408] text-white hover:bg-[#963a06] disabled:opacity-40"
+            >
+              {checking ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Eye className="w-3.5 h-3.5" />}
+              Preview what guests will see
+            </button>
+            {!local.ok && (
+              <span className="text-[11px] text-red-700 font-semibold">Fix the items above first.</span>
+            )}
+          </div>
+        </>
+      )}
+
+      {/* ── STAGE 2: CHECK — the exact words, beside the review ── */}
+      {stage === 'preview' && (
+        <>
+          <div className="grid gap-2.5 md:grid-cols-2">
+            <div className="rounded-lg border border-[#E8D5C4] bg-white p-2.5">
+              <p className="text-[10.5px] font-bold uppercase tracking-wide text-[#8B7355]">
+                {r.author_is_anonymous || !r.author_name ? 'A Google user' : r.author_name} · {r.rating}★
+              </p>
+              <p className="text-[12px] text-[#3D2A1A] mt-1 whitespace-pre-wrap">
+                {r.text || 'Rating only — the guest left no words.'}
+              </p>
+            </div>
+            <div className="rounded-lg border-2 border-[#af4408] bg-white p-2.5">
+              <p className="text-[10.5px] font-bold uppercase tracking-wide text-[#af4408]">
+                Your reply, exactly as it will appear
+              </p>
+              <p className="text-[12px] text-[#2D1B0E] mt-1 whitespace-pre-wrap">{text}</p>
+            </div>
+          </div>
+
+          {check?.target_error && (
+            <Note tone="warn">{check.target_error.message}</Note>
+          )}
+
+          <FindingList findings={serverBlocking} />
+
+          {/* Warnings are acknowledged ONE BY ONE. A single "I understand" box
+              would be ticked without reading; a box per finding makes the admin
+              look at each one. The route re-checks every code. */}
+          {warnings.length > 0 && (
+            <div className="mt-2 rounded-lg border border-amber-300 bg-amber-50 p-2.5">
+              <p className="text-[11px] font-bold text-amber-900 uppercase tracking-wide">
+                Accept each of these before it can be published
+              </p>
+              {warnings.map(w => (
+                <label key={w.code} className="flex items-start gap-2 mt-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={!!acked[w.code]}
+                    onChange={e => setAcked(a => ({ ...a, [w.code]: e.target.checked }))}
+                    className="mt-0.5 shrink-0"
+                  />
+                  <span className="text-[11.5px] text-[#3D2A1A]">
+                    <span className="font-bold">{w.label}.</span> {w.detail}
+                  </span>
+                </label>
+              ))}
+            </div>
+          )}
+
+          {check?.history && check.history.length > 0 && (
+            <div className="mt-2 rounded-lg border border-[#E8D5C4] bg-white p-2.5">
+              <p className="text-[10.5px] font-bold uppercase tracking-wide text-[#8B7355]">
+                Already sent from this app
+              </p>
+              {check.history.slice(0, 3).map(h => (
+                <p key={h.id} className="text-[11px] text-[#6B5744] mt-1">
+                  {fmtDateTime(h.started_at)} · {h.actor || 'unknown'} · {h.status}
+                  {h.reply_state ? ` (${h.reply_state})` : ''}
+                  {h.is_edit ? ' · replaced an earlier public reply' : ''}
+                </p>
+              ))}
+            </div>
+          )}
+
+          <div className="flex flex-wrap items-center gap-2 mt-2.5">
+            <button
+              onClick={() => setStage('compose')}
+              className="px-3 py-1.5 rounded-lg text-[11px] font-semibold border border-[#E0D0BE] bg-white text-[#6B5744]"
+            >
+              Back to editing
+            </button>
+            <button
+              onClick={() => setStage('confirm')}
+              disabled={!canContinue}
+              className="px-3 py-1.5 rounded-lg text-[11px] font-bold bg-[#af4408] text-white hover:bg-[#963a06] disabled:opacity-40"
+            >
+              This is right — continue
+            </button>
+            {!check?.target && !check?.target_error && (
+              <span className="text-[11px] text-[#8B7355]">Checking whether this review can be answered…</span>
+            )}
+          </div>
+        </>
+      )}
+
+      {/* ── STAGE 3: CONFIRM — name the business out loud ── */}
+      {stage === 'confirm' && (
+        <>
+          <div className="rounded-lg border-2 border-red-400 bg-red-50 p-3">
+            <p className="text-[12px] font-bold text-red-900 flex items-center gap-1.5">
+              <Globe className="w-4 h-4" /> This becomes public immediately
+            </p>
+            <p className="text-[12px] text-[#3D2A1A] mt-1.5">
+              The reply below will be posted on Google as{' '}
+              <span className="font-bold">{check?.business_label || 'the connected business'}</span>,
+              where every future guest reading this review will see it.{' '}
+              <span className="font-bold">Google has no undo</span> — it cannot be withdrawn from here
+              or anywhere else. {check?.is_edit
+                ? 'It replaces the reply that is on the listing now, which guests have already been reading.'
+                : ''}
+            </p>
+            <p className="text-[12px] text-[#2D1B0E] mt-2 p-2 bg-white rounded border border-red-200 whitespace-pre-wrap">
+              {text}
+            </p>
+          </div>
+
+          {err && <Note tone="warn">{err}</Note>}
+          {sent?.published === 'unknown' && (
+            <Note tone="warn">{sent.published_note}</Note>
+          )}
+
+          <div className="flex flex-wrap items-center gap-2 mt-2.5">
+            <button
+              onClick={() => setStage('preview')}
+              className="px-3 py-1.5 rounded-lg text-[11px] font-semibold border border-[#E0D0BE] bg-white text-[#6B5744]"
+            >
+              Back
+            </button>
+            <button
+              onClick={send}
+              disabled={sending}
+              className="flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-[11.5px] font-bold bg-red-700 text-white hover:bg-red-800 disabled:opacity-50"
+            >
+              {sending ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
+              {sending ? 'Posting…' : `Post publicly to Google as ${check?.business_label || 'this business'}`}
+            </button>
+          </div>
+        </>
+      )}
+
+      {err && stage !== 'confirm' && <Note tone="warn">{err}</Note>}
+    </div>
+  );
+}
+
+/** Findings, each naming itself. "Invalid" at the moment of publishing tells an
+ *  admin nothing about what to change, which is why every code carries its own
+ *  label and sentence. */
+function FindingList({ findings }: { findings: ReplyFinding[] }) {
+  if (!findings.length) return null;
+  return (
+    <div className="mt-2 space-y-1.5">
+      {findings.map(f => (
+        <div
+          key={f.code}
+          className={`text-[11.5px] rounded-lg px-2.5 py-1.5 border ${f.severity === 'blocking'
+            ? 'border-red-300 bg-red-50 text-red-900' : 'border-amber-300 bg-amber-50 text-amber-900'}`}
+        >
+          <span className="font-bold">
+            {f.severity === 'blocking' ? 'Cannot send' : 'Check'} · {f.label}.
+          </span>{' '}
+          {f.detail}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function ReviewRowCard({ r, link, canReply, locationKey, onReplied }: {
+  r: ReviewCard; link: Report['reply_link'];
+  /** Admin only. False for a manager, who sees the review and nothing actionable. */
+  canReply?: boolean;
+  locationKey?: string;
+  onReplied?: () => void;
+}) {
   const [copied, setCopied] = useState(false);
 
   const copy = async () => {
@@ -1938,6 +2972,18 @@ function ReviewRowCard({ r, link }: { r: ReviewCard; link: Report['reply_link'] 
           </p>
           <p className="text-[12px] text-[#6B5744] mt-0.5 whitespace-pre-wrap">{r.reply_text || '—'}</p>
         </div>
+      )}
+
+      {/* ADMIN ONLY. A manager gets the card above and nothing below it: reading
+          the reviews is management work, publishing under the business's name is
+          the owner's. The route enforces the same rule — this only decides what
+          is drawn. */}
+      {canReply && (
+        <ReplyComposer
+          r={r}
+          locationKey={locationKey || ''}
+          onSent={() => onReplied?.()}
+        />
       )}
     </div>
   );
@@ -2455,6 +3501,144 @@ function Badge({ tone, children, title }: { tone: 'red' | 'amber' | 'green' | 'p
     : tone === 'green' ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
     : 'bg-[#FFF1E3] border-[#E8D5C4] text-[#6B5744]';
   return <span title={title} className={`inline-block px-2 py-0.5 rounded-md border text-[10px] font-semibold ${cls}`}>{children}</span>;
+}
+
+/**
+ * A count in the theme table that opens the reviews behind it.
+ *
+ * Looks like a number, because it is one — underlined on hover rather than
+ * dressed as a button, so the column still reads as a column of figures.
+ */
+function CountButton({ n, active, onClick, title, tone = 'plain' }: {
+  n: number; active: boolean; onClick: () => void; title: string; tone?: 'plain' | 'low';
+}) {
+  return (
+    <button
+      onClick={onClick}
+      title={title}
+      aria-expanded={active}
+      className={`tabular-nums font-semibold rounded-md px-1.5 py-0.5 -mr-1.5 transition-colors ${
+        active
+          ? 'bg-[#af4408] text-white'
+          : `${tone === 'low' && n > 0 ? 'text-red-700' : 'text-[#2D1B0E]'} hover:bg-[#FFF1E3] hover:underline decoration-[#af4408] underline-offset-2`
+      }`}
+    >
+      {n}
+    </button>
+  );
+}
+
+/**
+ * THE REVIEWS BEHIND ONE THEME COUNT.
+ *
+ * ── THE RULE THIS COMPONENT EXISTS TO KEEP ──────────────────────────────────
+ * The rows shown must be exactly the rows counted. If clicking 27 revealed 24,
+ * the table's own 27 is what would look wrong, and every other number on the
+ * page would come under suspicion with it. So:
+ *
+ *   • The server re-runs the theme table's OWN predicate over the same span
+ *     anchored at the same instant, and returns `theme_total` — the MENTIONS
+ *     figure it counted.
+ *   • `expected` is the number the manager pressed.
+ *   • When those disagree, this says so, loudly, instead of quietly rendering
+ *     the shorter list. A visible contradiction is a bug report; a silent one is
+ *     a page that lies.
+ *
+ * The usual cause of a disagreement would be the report and the drill-down
+ * having landed on different data — an import between the two requests. That is
+ * worth a sentence on screen, not a hidden discrepancy.
+ */
+function ThemeDrill({
+  label, spanLabel, low, expected, drill, loading, error, link,
+  canReply, locationKey, onReplied, onClose,
+}: {
+  label: string; spanLabel: string; low: boolean; expected: number;
+  drill: ThemePage | null; loading: boolean; error: string | null;
+  link: Report['reply_link'];
+  /* Passed through so a review opened from a theme count is answerable in the
+     same place it was found. A theme drill-down is exactly where an owner
+     notices five people complaining about the same thing. */
+  canReply?: boolean; locationKey?: string; onReplied?: () => void;
+  onClose: () => void;
+}) {
+  const heading = low
+    ? `The ${expected} review${expected === 1 ? '' : 's'} rated 1–2★ that mention ${label}`
+    : `The ${expected} review${expected === 1 ? '' : 's'} that mention ${label}`;
+
+  const shownTotal = drill?.matched_total ?? null;
+  const disagrees = shownTotal != null && shownTotal !== expected;
+
+  return (
+    <div className="bg-white border border-[#E8D5C4] rounded-xl p-3 sm:p-3.5">
+      <div className="flex flex-wrap items-start justify-between gap-2 mb-2.5">
+        <div className="min-w-0">
+          <p className="text-[13px] font-bold">{heading}</p>
+          <p className="text-[11px] text-[#8B7355] mt-0.5">
+            Over {spanLabel}, matched on the words in the review text — the same counting that produced
+            the number you clicked.
+          </p>
+        </div>
+        <button
+          onClick={onClose}
+          className="shrink-0 flex items-center gap-1 px-2 py-1 rounded-lg text-[11px] font-semibold border border-[#E0D0BE] bg-white hover:bg-[#FFF1E3] text-[#6B5744]"
+        >
+          <X className="w-3.5 h-3.5" />Close
+        </button>
+      </div>
+
+      {loading && (
+        <div className="flex items-center gap-2 text-[12px] text-[#6B5744] py-2">
+          <Loader2 className="w-4 h-4 animate-spin" />Finding those reviews…
+        </div>
+      )}
+
+      {error && (
+        <div className="bg-red-50 border border-red-200 text-red-800 rounded-lg px-3 py-2 text-[12px] flex items-start gap-2">
+          <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
+          <span>{error}. The count of {expected} in the row above still stands — it was computed from
+            every review held. Only this list failed to load.</span>
+        </div>
+      )}
+
+      {drill && (
+        <>
+          {disagrees && (
+            <div className="bg-amber-50 border border-amber-200 text-amber-900 rounded-lg px-3 py-2 text-[12px] flex items-start gap-2 mb-2.5">
+              <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
+              <span>
+                The table says <span className="font-semibold">{expected}</span> and this selection
+                found <span className="font-semibold">{shownTotal}</span>. They are counted the same way
+                over the same window, so a difference means the data moved between the two requests —
+                most likely a fetch from Google landed just now. Reload the page to bring both onto the
+                same snapshot.
+              </span>
+            </div>
+          )}
+
+          {drill.reviews.length === 0 ? (
+            <Empty>No review came back for this theme, although the table counted {expected}. Reload
+              the page — the two halves are looking at different snapshots.</Empty>
+          ) : (
+            <div className="space-y-2.5">
+              {drill.reviews.map(r => (
+                <ReviewRowCard
+                  key={r.id} r={r} link={link}
+                  canReply={canReply} locationKey={locationKey} onReplied={onReplied}
+                />
+              ))}
+            </div>
+          )}
+
+          <p className="text-[11px] text-[#8B7355] mt-2.5">
+            {drill.truncated
+              ? `${drill.listed} of ${drill.matched_total} shown — that is as many as this page loads at once. Narrow the span above to work through the rest.`
+              : `All ${drill.listed} shown.`}
+            {low && ` These are the 1–2★ subset of the ${drill.theme_total} reviews that mention ${label}.`}
+          </p>
+        </>
+      )}
+    </div>
+  );
 }
 
 function Th({ children, align = 'right' }: { children: React.ReactNode; align?: 'left' | 'right' }) {

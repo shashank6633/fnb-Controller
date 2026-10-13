@@ -43,7 +43,16 @@ export function buildBillPdf(
   // A SETTLED bill is a reprint: show the FROZEN figures settle stored, so the
   // copy always equals what was actually charged even if bill_design later
   // changes. An OPEN bill is provisional → compute live from the current design.
-  const bill = order.status === 'settled'
+  //
+  // 'on_hold' IS FROZEN TOO, and leaving it out of this condition was a real
+  // defect: hold writes subtotal / service_charge / discount / tax_total / total
+  // exactly as settle does (hold/route.ts) and then refuses further items, and a
+  // bill on hold is a debt somebody is chasing for a specific amount. Recomputed
+  // live it drifted with the CURRENT settings — measured on a booted server,
+  // ₹940.28 rendered as ₹907.38 after the owner changed the service-charge and
+  // GST percentages, while the register still chased ₹940. The customer was
+  // handed a document that disagreed with the bill by ₹33.
+  const bill = (order.status === 'settled' || order.status === 'on_hold')
     ? (() => {
         const tax = round2(order.tax_total || 0);
         const cgst = round2(tax / 2);

@@ -948,7 +948,7 @@ export default function SalesUploadPage() {
         )}
 
         {/* ===== v2 HOURLY × WEEKDAY HEATMAP ===== */}
-        {v2Analytics && <HourlyHeatmap heatmap={v2Analytics.heatmap} />}
+        {v2Analytics && <HourlyHeatmap heatmap={v2Analytics.heatmap} unattributed={v2Analytics.heatmapUnattributed} />}
 
         {/* ===== v2 TOP ITEMS ===== */}
         {v2Analytics && (
@@ -1554,7 +1554,7 @@ function PeakCallouts({ analytics }: { analytics: any }) {
         {peakHour ? (
           <>
             <p className="text-lg font-bold text-[#2D1B0E] mt-1">
-              {DOW_NAMES[peakHour.dow]} · {String(peakHour.hour).padStart(2,'0')}:00
+              {DOW_NAMES[peakHour.dow]} · {hour12(Number(peakHour.hour))}
             </p>
             <p className="text-xs text-[#8B7355]">{formatCompactINR(peakHour.revenue)} · {peakHour.count} lines</p>
           </>
@@ -1575,15 +1575,18 @@ function PeakCallouts({ analytics }: { analytics: any }) {
   );
 }
 
-function HourlyHeatmap({ heatmap }: { heatmap: any[] }) {
+function HourlyHeatmap({ heatmap, unattributed }: { heatmap: any[]; unattributed?: { count: number; revenue: number } | null }) {
   const DOW = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
-  // Build matrix dow x hour → revenue
+  // Build matrix dow x hour → revenue. Several source rows can land on the same
+  // cell now that the hour comes from sale_time OR the linked order, so ADD
+  // rather than overwrite — assigning would have kept only the last group.
   const grid: Record<string, number> = {};
   let max = 0;
   for (const row of heatmap) {
+    if (row.hour == null) continue;
     const key = `${row.dow}-${row.hour}`;
-    grid[key] = row.revenue;
-    if (row.revenue > max) max = row.revenue;
+    grid[key] = (grid[key] || 0) + (Number(row.revenue) || 0);
+    if (grid[key] > max) max = grid[key];
   }
   const intensity = (v: number) => {
     if (!max || !v) return 0;
@@ -1595,6 +1598,9 @@ function HourlyHeatmap({ heatmap }: { heatmap: any[] }) {
         <Clock className="w-4 h-4 text-[#af4408]" />
         Hourly Heatmap · Weekday × Hour (revenue intensity)
       </h3>
+      <p className="text-[10px] text-[#8B7355] -mt-2 mb-2">
+        Hour of SALE (IST), from the bill&apos;s sale time or its settled order. Weekday is the trading night, 4:00 AM–4:00 AM.
+      </p>
       {max === 0 ? (
         <p className="text-xs text-[#8B7355] text-center py-6">
           No hourly data yet. Re-upload your POS export — the new parser captures sale time (HH:MM) from <code>Order Date and Time</code>.
@@ -1606,7 +1612,7 @@ function HourlyHeatmap({ heatmap }: { heatmap: any[] }) {
               <tr>
                 <th className="w-10"></th>
                 {[...Array(24)].map((_, h) => (
-                  <th key={h} className="w-7 text-[#8B7355] font-medium">{h}</th>
+                  <th key={h} className="w-7 text-[#8B7355] font-medium" title={hour12(h)}>{hour12Short(h)}</th>
                 ))}
               </tr>
             </thead>
@@ -1620,7 +1626,7 @@ function HourlyHeatmap({ heatmap }: { heatmap: any[] }) {
                     return (
                       <td key={h} className="w-7 h-6 rounded"
                           style={{ backgroundColor: v ? `rgba(175, 68, 8, ${a})` : '#FFF8F0' }}
-                          title={`${name} ${h}:00 · ₹${v.toFixed(0)}`} />
+                          title={`${name} ${hour12(h)} · ₹${v.toFixed(0)}`} />
                     );
                   })}
                 </tr>
@@ -1629,8 +1635,26 @@ function HourlyHeatmap({ heatmap }: { heatmap: any[] }) {
           </table>
         </div>
       )}
+      {/* Never quietly show a smaller total than the KPIs above: rows whose sale
+          hour is genuinely unknown are named, not parked on an invented hour. */}
+      {unattributed && Number(unattributed.count) > 0 && (
+        <p className="text-[10px] text-[#8B7355] mt-2">
+          {Number(unattributed.count).toLocaleString('en-IN')} line{Number(unattributed.count) === 1 ? '' : 's'} ·{' '}
+          {formatCompactINR(Number(unattributed.revenue) || 0)} carry no sale time and no settled order, so they are not on this grid.
+        </p>
+      )}
     </div>
   );
+}
+
+/** '4:00 PM' — the owner's 12-hour standard (ruling 2026-09-23). */
+function hour12(h: number): string {
+  const ap = h < 12 ? 'AM' : 'PM';
+  return `${h % 12 === 0 ? 12 : h % 12}:00 ${ap}`;
+}
+/** '12a' / '4p' — the same clock, narrow enough for a 24-column header. */
+function hour12Short(h: number): string {
+  return `${h % 12 === 0 ? 12 : h % 12}${h < 12 ? 'a' : 'p'}`;
 }
 
 function TopItemsCard({ title, icon, items, metric }: { title: string; icon: React.ReactNode; items: any[]; metric: 'revenue' | 'qty' }) {

@@ -3,15 +3,39 @@
  * GOOGLE BUSINESS PROFILE — the automatic connector. THE PRIMARY PATH.
  *
  * ══════════════════════════════════════════════════════════════════════════
- * UNPROVEN. NO GOOGLE ENDPOINT WAS CALLED AND NO CREDENTIAL EXERCISED WHILE
- * THIS WAS WRITTEN.
+ * PROVEN AGAINST A LIVE ACCOUNT — 2026-09-30.
  * ══════════════════════════════════════════════════════════════════════════
- * Everything below is built from Google's published reference and wired end to
- * end, but not one line has round-tripped against a live account, because the
- * account does not exist yet — the owner has to create it. Treat the request
- * shapes as documented-correct and the RESPONSES as untested. The first real
- * pull is the test. Specific unknowns are in UNPROVEN below and are returned by
- * status() so a screen can print them rather than implying this is proven.
+ * This header used to say, correctly, that no Google endpoint had ever been
+ * called. That stopped being true on 2026-09-30: the Business Profile API
+ * allowlist came through for project 1077580169090 (300 QPM), the owner enabled
+ * Google My Business API (the legacy v4 host, listed as a Private API — the
+ * allowlist being visibly applied), and the first live pull returned
+ * 102 PAGES / 10,055 REVIEWS from
+ * accounts/113778984854595644612/locations/5410705488583350830, de-duplicating
+ * correctly against the earlier Takeout import (added 0, changed 0, already
+ * known 5070).
+ *
+ * So the read path — token refresh, account discovery, location discovery and
+ * the paged v4 reviews pull — has round-tripped. What is STILL unproven is
+ * narrower and lives in UNPROVEN below, which status() returns so the setup
+ * panel prints it. Keep that list honest in both directions: a stale "untested"
+ * on a panel that has just done the thing is its own kind of lie.
+ *
+ * THIS FILE IS READ-ONLY, AND NOW IT IS ENFORCED RATHER THAN OBSERVED. Every
+ * call here is a GET and goes through one door, gbpFetch() in
+ * ./gbp-transport.ts, which refuses any host, method or path outside four
+ * permitted shapes before a request leaves the process. That matters because
+ * the old version of this paragraph was an observation about the code as
+ * written — all the call sites happened to be GETs — and an observation is not
+ * a guarantee. Nothing in this file can edit the listing, upload a photo,
+ * publish a post or delete anything, and now it cannot be EDITED into doing so
+ * either: the attempt throws.
+ *
+ * The transport carries exactly ONE permitted write, the owner-reply PUT, which
+ * the owner asked for in as many words. It is not called from this file. See
+ * the "WHAT THIS FILE DELIBERATELY DOES NOT DO" note at the end, and read
+ * ./gbp-transport.ts before assuming the OAuth scope protects anything — it
+ * does not, because Google publishes no read-only scope for Business Profile.
  *
  * ── WHAT THE OWNER ASKED FOR, AND WHAT THAT MEANS HERE ──────────────────────
  * "It should automatically retrieve the reviews data... how can we import every
@@ -22,8 +46,9 @@
  * so they de-duplicate against each other and can be used together.
  *
  * ── WHERE REVIEWS LIVE, AND WHY IT LOOKS ODD ────────────────────────────────
- * Reviews are on the LEGACY My Business API v4:
- *     GET https://mybusiness.googleapis.com/v4/{parent}/reviews
+ * Reviews are on the LEGACY My Business API v4 (GBP_REVIEWS_HOST in
+ * ./gbp-transport.ts, the one file that names Google's hosts):
+ *     GET {v4 host}/{parent}/reviews
  * The monolithic v4 API was largely sunset in April 2022, but reviews were never
  * migrated to the newer split APIs and are not on the deprecation schedule. So
  * the endpoint is old, alive and un-replatformed. That is a real long-term risk
@@ -56,14 +81,16 @@ import {
   GBP_KEYS, gbpCredentials, getConnection, hasOauthApp, recordFailure, saveConnection,
 } from './connection';
 import { GBP_SCOPE, ReconnectRequiredError, refreshAccessToken } from './oauth';
+import {
+  GBP_ACCOUNTS_HOST as ACCOUNTS_HOST,
+  GBP_INFO_HOST as INFO_HOST,
+  GBP_REVIEWS_HOST as REVIEWS_HOST,
+  gbpFetch,
+} from './gbp-transport';
 import type { CollectOptions, RawDocument, ReviewSource, SourceStatus } from './types';
 import { SourceNotConfiguredError } from './types';
 
 export { GBP_KEYS, GBP_SCOPE };
-
-const REVIEWS_HOST = 'https://mybusiness.googleapis.com/v4';
-const ACCOUNTS_HOST = 'https://mybusinessaccountmanagement.googleapis.com/v1';
-const INFO_HOST = 'https://mybusinessbusinessinformation.googleapis.com/v1';
 
 /** Google's documented maximum for the reviews endpoint. Asking for more is
  *  rejected, not clamped. */
@@ -90,12 +117,23 @@ export const PREREQUISITES: string[] = [
   'Paste the client ID and client secret into settings, then press Connect Google Business Profile and authorise as the account that manages the listing.',
 ];
 
+/* This list is rendered on the setup panel, so it must describe what is unknown
+ * TODAY. The first two entries used to say no Google endpoint had ever been
+ * called and that approval had no published turnaround — both were true when
+ * written and both were falsified on 2026-09-30, when the allowlist came
+ * through for project 1077580169090 and the first live pull returned 102 pages
+ * and 10,055 reviews. Leaving them would have printed "no credential
+ * exercised" on the same panel that had just exercised one. What remains below
+ * is what is still genuinely unproven. */
 export const UNPROVEN: string[] = [
-  'No Google endpoint has been called and no credential exercised — every response shape here is from documentation, not from a round trip.',
+  'The owner-reply write has NEVER been sent to Google. The admin-only send path is built and every branch of it is proven against an injected fetch spy, but no byte has reached Google\'s reply endpoint — the only way to exercise it is to publish a real reply on the real listing, and a test string under a guest\'s review cannot be taken back. What Google returns on the first real send is unknown: in particular a 2xx does NOT mean the reply is live, because reviewReplyState can come back PENDING (held for moderation) or REJECTED (with a policyViolation) inside a perfectly successful response, and neither has been seen from this account.',
+  'Google documents the reply write as valid ONLY for a VERIFIED location. Whether this listing satisfies that check has not been confirmed, and it will show up as a refusal on the first send rather than as anything visible beforehand.',
+  'The AI reply drafter has never been run against a live model from this codebase. Its prompt, its parse-without-trusting layer and its validation are proven, and it is OFF by default — but the quality of what the configured provider actually returns for these reviews is unproven, which is exactly why a draft is a starting point an admin edits and passes through the same three checks as typed text.',
+  'Google publishes NO read-only scope for Business Profile — business.manage, the full management scope, is the only one there is. So the token this app holds could in principle edit the listing, and what prevents that is the allowlist in gbp-transport.ts, not a narrower permission granted at consent time.',
   'The v4 Reviews endpoint has no separately published quota; the 300 QPM figure Google publishes is for the newer Business Profile APIs. Do not plan against a specific number for v4 reviews.',
-  'Google publishes no turnaround time for Basic API Access approval. Third-party estimates of 2-4 weeks are not a commitment and are not a date.',
   'Whether the business.manage scope is classed sensitive or restricted (which decides how heavy consent-screen verification is) has not been confirmed.',
   'Reviews sit on the legacy v4 surface that was otherwise sunset in 2022. It is alive and not on the deprecation schedule, but it is un-replatformed and could move.',
+  'Google refusals are classified from 16 documented and observed error-body shapes, not from a live refusal. The first real 403 after this is the test; an unrecognised shape falls through to a branch that names both candidate fixes rather than guessing.',
 ];
 
 /* ── Configuration ────────────────────────────────────────────────────────── */
@@ -331,21 +369,159 @@ export function parseLocationsResponse(body: string, accountName: string):
   };
 }
 
+/* ── Why Google said no ───────────────────────────────────────────────────── */
+
+/**
+ * WHAT WENT WRONG HERE BEFORE: every 401 and every 403 was answered with one
+ * sentence — "the Business Profile API application has not been approved yet —
+ * that is paperwork, not a bug". While the application really was outstanding
+ * that was true often enough to be useful. Once it is GRANTED the same sentence
+ * becomes the most expensive kind of wrong: it sends the owner back to a queue
+ * he has already left, and the fix he actually needs — one checkbox in Cloud
+ * Console, or a different Google account — is never named.
+ *
+ * A 403 from Google is not one state. It is at least four, and the status code
+ * does not tell them apart:
+ *
+ *   SERVICE_DISABLED        the APIs are not switched ON for the Cloud project.
+ *                           A toggle in Console. Being granted access does NOT
+ *                           do this for you, so an APPROVED owner can sit here.
+ *   accessNotConfigured     the project was never granted Basic API Access. The
+ *                           application — and the grant is PER PROJECT.
+ *   quota refused           either a burst against a working grant (quota above
+ *                           0) or the zero quota of a project that was never
+ *                           granted access. Google's message is identical.
+ *   PERMISSION_DENIED       credentials fine, API on, but the authorised Google
+ *                           account does not MANAGE this profile.
+ *
+ * Nothing below guesses. The cause is read from the reason codes and the message
+ * Google itself returned, and when those do not identify it the answer is
+ * 'unknown' and BOTH candidate fixes are named rather than one asserted.
+ *
+ * READ THE REASON CODES BEFORE THE PROSE, and never treat `error.status` as a
+ * cause. Two things force this:
+ *
+ *   · Google's message for SERVICE_DISABLED ("...has not been used in project
+ *     1077580169090 before or it is disabled") and for the legacy
+ *     accessNotConfigured ("...has not been used in this project before") differ
+ *     by one word. Matching prose ahead of the machine-readable reason is a
+ *     coin-flip between two fixes in two different places.
+ *   · `status: PERMISSION_DENIED` is what Google sends for SERVICE_DISABLED and
+ *     for accessNotConfigured too, so it identifies nothing on its own.
+ *
+ * And the prose pass matches only phrases specific enough to name a fix. The
+ * bare word "forbidden" is deliberately not one of them: an HTML "403 Forbidden"
+ * page from a proxy in the middle is not evidence about any of Google's states,
+ * and reading it as one (an earlier draft of this function did) points the owner
+ * at the wrong Google account for a fault that was never Google's.
+ */
+export type GoogleRefusal =
+  | 'bad_credentials'
+  | 'api_not_enabled'
+  | 'not_allowlisted'
+  | 'quota_refused'
+  | 'not_this_listing'
+  | 'unknown';
+
+export function classifyGoogleRefusal(
+  status: number,
+  body: string,
+): { cause: GoogleRefusal; detail: string } {
+  let err: any = {};
+  try { err = JSON.parse(body)?.error ?? {}; } catch { /* body is not JSON — fall back to its text */ }
+  const detail = String(err?.message || '').trim() || body.slice(0, 400);
+
+  // Machine-readable reasons only. `error.status` is deliberately NOT collected
+  // here — see the note above on why PERMISSION_DENIED identifies nothing.
+  const reasons = new Set<string>();
+  const push = (v: unknown) => { const s = String(v ?? '').trim().toLowerCase(); if (s) reasons.add(s); };
+  if (Array.isArray(err?.details)) for (const d of err.details) push(d?.reason);
+  if (Array.isArray(err?.errors)) for (const e of err.errors) push(e?.reason);
+  const has = (...keys: string[]) => keys.some(k => reasons.has(k));
+  const statusCode = String(err?.status ?? '').trim().toLowerCase();
+  const said = detail.toLowerCase();
+
+  /* ── Pass 1: what Google said in machine-readable form. Authoritative. ── */
+  if (status === 401 || statusCode === 'unauthenticated' || has('autherror', 'authenticationerror')) {
+    return { cause: 'bad_credentials', detail };
+  }
+  if (has('service_disabled')) return { cause: 'api_not_enabled', detail };
+  if (has('accessnotconfigured')) return { cause: 'not_allowlisted', detail };
+  if (statusCode === 'resource_exhausted'
+    || has('ratelimitexceeded', 'rate_limit_exceeded', 'userratelimitexceeded', 'quotaexceeded', 'quota_exceeded')) {
+    return { cause: 'quota_refused', detail };
+  }
+  if (has('insufficientpermissions', 'forbidden')) return { cause: 'not_this_listing', detail };
+
+  /* ── Pass 2: Google's prose, same order, specific phrases only. ── */
+  if (/invalid authentication|invalid credentials/.test(said)) return { cause: 'bad_credentials', detail };
+  if (/or it is disabled|enable it by visiting|api is not enabled/.test(said)) {
+    return { cause: 'api_not_enabled', detail };
+  }
+  if (/not been granted access|basic api access|access not configured/.test(said)) {
+    return { cause: 'not_allowlisted', detail };
+  }
+  if (/quota exceeded|rate limit exceeded/.test(said)) return { cause: 'quota_refused', detail };
+  if (/does not have permission|caller does not have|insufficient authentication scopes|insufficient permission/
+    .test(said)) {
+    return { cause: 'not_this_listing', detail };
+  }
+
+  return { cause: 'unknown', detail };
+}
+
+/** One sentence per cause, and each one names WHERE the fix lives. */
+export const REFUSAL_REMEDY: Record<GoogleRefusal, string> = {
+  bad_credentials:
+    'Google rejected the credentials themselves. That is an authorisation problem and not an approval one — '
+    + 'reconnect the Google account; nothing about the API application changes it.',
+  api_not_enabled:
+    'The Business Profile APIs are NOT switched on for this Google Cloud project. Being granted API access does '
+    + 'not enable them for you — in Cloud Console, on the project this OAuth client belongs to, enable Account '
+    + 'Management, Business Information and My Business v4. This is a toggle, not an application.',
+  not_allowlisted:
+    'This Cloud project has not been granted Basic API Access. The grant is PER PROJECT, so an approval already '
+    + 'held on one project does not cover a different one — check that the project these credentials belong to '
+    + 'shows a Business Profile quota above 0. (Google: a quota of 0 means access was never granted, and the fix '
+    + 'is the application, not a quota-increase request.)',
+  quota_refused:
+    'Google refused on quota, and its message reads the same for two different causes. Read the quota page for '
+    + 'THIS project before doing anything: above 0 means a burst against a working grant and the next pull will '
+    + 'get through; exactly 0 means the project was never granted access, and retrying cannot help.',
+  not_this_listing:
+    'The credentials are valid and the API is on, but the Google account that authorised this app does not MANAGE '
+    + 'this Business Profile. Being able to see the listing on Maps is not the same thing — reconnect as an owner '
+    + 'or a manager of the profile.',
+  unknown:
+    'Google refused without naming a reason this app recognises, so its own message above is the thing to read. '
+    + 'The two causes that look identical from here are the APIs not being switched on for the Cloud project (a '
+    + 'Console toggle) and the project never having been granted Basic API Access (the application, where the '
+    + 'quota reads 0 instead of 300 QPM). They are fixed in different places.',
+};
+
+/**
+ * Every GET in this file. Routed through gbpFetch (./gbp-transport.ts), which
+ * refuses any host, method or path outside the four permitted shapes BEFORE a
+ * request leaves the process — so this function cannot be turned into a write
+ * by editing its arguments.
+ *
+ * The !ok handling below is unchanged and stays HERE rather than in the
+ * transport: gbpFetch reports what Google said and this decides what it means.
+ */
 async function googleGet(url: string, token: string, signal?: AbortSignal): Promise<string> {
-  const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` }, signal });
-  const body = await res.text();
-  if (!res.ok) {
+  const { ok, status, body } = await gbpFetch({ method: 'GET', url, token, signal });
+  if (!ok) {
     let detail = body.slice(0, 400);
     try { detail = JSON.parse(body)?.error?.message || detail; } catch { /* keep the text */ }
-    if (res.status === 401 || res.status === 403) {
+    if (status === 401 || status === 403) {
+      const refusal = classifyGoogleRefusal(status, body);
       throw new SourceNotConfiguredError(
-        `Google refused the request (HTTP ${res.status}): ${detail}. A 403 with zero quota ` +
-        'means the Business Profile API application has not been approved yet — that is ' +
-        'paperwork, not a bug, and a Takeout import works in the meantime.',
+        `Google refused the request (HTTP ${status}): ${refusal.detail}. `
+        + REFUSAL_REMEDY[refusal.cause],
         PREREQUISITES,
       );
     }
-    throw new Error(scrubCredentials(`Google request failed (HTTP ${res.status}): ${detail}`, [token]));
+    throw new Error(scrubCredentials(`Google request failed (HTTP ${status}): ${detail}`, [token]));
   }
   return body;
 }
@@ -439,18 +615,19 @@ export async function gbpCollect(
     url.searchParams.set('pageSize', String(GBP_PAGE_SIZE));
     if (pageToken) url.searchParams.set('pageToken', pageToken);
 
-    const res = await fetch(url.toString(), {
-      headers: { Authorization: `Bearer ${token}` },
-      signal: opts.signal,
+    // Through the same one door as every other Google call — see
+    // ./gbp-transport.ts. It hands back the raw status rather than throwing,
+    // which is what lets the 401 retry below stay exactly as it was.
+    const { ok, status, body } = await gbpFetch({
+      method: 'GET', url: url.toString(), token, signal: opts.signal,
     });
-    const body = await res.text();
 
-    if (!res.ok) {
+    if (!ok) {
       // A 401 mid-pull is an access token that expired between pages despite
       // the skew — a long pull, a slow network, a clock that drifted. Force one
       // refresh and retry the SAME page once. Without this a nine-page pull can
       // fail on page seven for a reason that fixes itself.
-      if (res.status === 401 && !retriedAuth) {
+      if (status === 401 && !retriedAuth) {
         retriedAuth = true;
         token = await gbpAccessToken(cfg, {
           db, locationKey: opts.locationKey, signal: opts.signal, force: true,
@@ -460,17 +637,19 @@ export async function gbpCollect(
       }
       let detail = body.slice(0, 400);
       try { detail = JSON.parse(body)?.error?.message || detail; } catch { /* keep the text */ }
-      if (res.status === 401 || res.status === 403) {
+      if (status === 401 || status === 403) {
+        // Same four-way distinction as googleGet — see classifyGoogleRefusal.
+        // A single "not approved yet" here is what told an owner who HAD been
+        // approved to go and re-apply.
+        const refusal = classifyGoogleRefusal(status, body);
         throw new SourceNotConfiguredError(
-          `Google refused the reviews request (HTTP ${res.status}): ${detail}. ` +
-          'A 403 with zero quota means the Business Profile API application has not been ' +
-          'approved yet — that is paperwork, not a bug, and a Takeout import works in the ' +
-          'meantime.',
+          `Google refused the reviews request (HTTP ${status}): ${refusal.detail}. `
+          + REFUSAL_REMEDY[refusal.cause],
           PREREQUISITES,
         );
       }
       throw new Error(scrubCredentials(
-        `Google reviews request failed (HTTP ${res.status}): ${detail}`,
+        `Google reviews request failed (HTTP ${status}): ${detail}`,
         [token, cfg.clientSecret, cfg.refreshToken],
       ));
     }
@@ -508,12 +687,42 @@ export function gbpSource(db?: Database.Database, locationKey = ''): ReviewSourc
  * ───────────────────────────────────────────────────────────────────────────
  * WHAT THIS FILE DELIBERATELY DOES NOT DO
  * ───────────────────────────────────────────────────────────────────────────
- *  • No replies. Posting an owner reply is a WRITE against a public listing
- *    under the business's name. Read-only analysis does not get to decide that;
- *    it is a separate scope and a separate decision.
+ *  • No replies FROM THIS FILE — but the decision this note used to defer has
+ *    now been MADE. It said posting an owner reply is a write against a public
+ *    listing under the business's name, that read-only analysis does not get to
+ *    decide that, and that it was a separate scope and a separate decision.
+ *    All of that still holds, and the owner has since decided it: "only the API
+ *    can do Reply from us if it allows but other than Reviews it should not do
+ *    any other action for the Google Account which has the Access."
  *
- *  • No delete, flag or moderate. Google exposes none of it, and pretending
- *    otherwise on a page would be worse than the absence.
+ *    So the reply write exists, in exactly one place and nowhere else:
+ *    gbpPutReviewReply() in ./gbp-transport.ts, the only non-GET shape that
+ *    file permits. THIS CONNECTOR STILL DOES NOT CALL IT. The send path is its
+ *    own surface and now exists:
+ *
+ *      ./reply-validate.ts  the automatic check, pure, shared with the browser
+ *      ./reply.ts           resolve the review, confirm, send, record, mirror
+ *      ./reply-draft.ts     the optional AI draft (off by default, never sent)
+ *      /api/crm-calls/reviews/reply{,/check,/draft}   admin only, all three
+ *
+ *    Two things did NOT change with that decision: the scope is still the full
+ *    business.manage (Google publishes no read-only alternative), and every
+ *    other write remains impossible in code rather than merely unused.
+ *
+ *    What this connector DOES owe the reply path is the mirror. The hourly pull
+ *    is the authority on what a reply says: it overwrites gr_reviews.reply_text
+ *    from whatever Google currently serves, so a reply rejected at moderation
+ *    correctly goes back to unanswered here. ./reply.ts therefore writes its
+ *    copy in the exact shape this parser produces — Google's own
+ *    reviewReply.updateTime through parseTimestamp() — so a send does not show
+ *    up in the next pull as a changed row. What we SENT survives separately in
+ *    gr_reply_sends, which no ingest ever touches.
+ *
+ *  • No delete, flag or moderate. Google exposes no flagging or moderation at
+ *    all, and pretending otherwise on a page would be worse than the absence.
+ *    Google DOES expose DELETE on a reply, and it is deliberately not on the
+ *    allowlist: deleting a reply is not an undo, because the text was public
+ *    from the moment it was posted.
  *
  *  • No scraping fallback, and no paid aggregator. The Maps Platform terms
  *    carry a No Scraping clause that names user reviews specifically; a vendor

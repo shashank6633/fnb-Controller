@@ -281,6 +281,14 @@ export async function GET(request: Request) {
              -- purpose='party' outright, so a party requisition never produces a
              -- 'requisition_issue' row and these three types cannot double-count
              -- with issues_to_date. 'party_return' is positive and nets itself off.
+             -- BOTH PARTY NAMES ARE HERE AND BOTH MUST STAY. The requisition
+             -- transfer was renamed 'party_consumption' → 'party_issue' on
+             -- 2026-09-17; because this list already carried both, this formula
+             -- returned the IDENTICAL party_to_date before and after the rename,
+             -- which is exactly the property a closed type list is supposed to
+             -- have. Do not "tidy" it to one name — see the warning below about
+             -- a new type being invisible, and movement-record.ts
+             -- PARTY_TRANSFER_TYPES for why the legacy name never expires.
              COALESCE((SELECT -SUM(it.quantity) FROM inventory_transactions it
                         WHERE it.material_id = cs.material_id
                           AND it.type IN ('party_issue', 'party_consumption', 'party_return')

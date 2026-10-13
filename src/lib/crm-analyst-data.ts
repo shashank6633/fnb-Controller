@@ -47,8 +47,9 @@ const ISSUE_DATE = `COALESCE(NULLIF(SUBSTR(ri.issued_at,1,10),''), r.date)`;
  *
  * The type vocabulary actually written by the app is purchase, sale, nc,
  * adjustment, wastage, transfer, requisition_issue, party_issue,
- * party_consumption, party_return, staff_meal_issue, staff_meal_return,
- * butchering_input, butchering_output. Of those:
+ * party_return, staff_meal_issue, staff_meal_return, butchering_input,
+ * butchering_output. ('party_consumption' was retired on 2026-09-17 — see the
+ * party note below.) Of those:
  *
  *   requisition_issue  EXCLUDED — an INTERNAL store→department transfer. Goods
  *                      moved shelf-to-shelf; the outlet still owns every gram.
@@ -59,9 +60,40 @@ const ISSUE_DATE = `COALESCE(NULLIF(SUBSTR(ri.issued_at,1,10),''), r.date)`;
  *                      and (b) smuggle in lines the primary leg deliberately
  *                      drops via REQ_ISSUED — draft / cancelled / chef_rejected
  *                      requisitions. Do not "simplify" it back in.
- *   transfer,          EXCLUDED for the same reason — internal movements. The
- *   party_issue,       party rail's real usage is party_consumption; its issue
- *   party_return       and return legs are transfers around it.
+ *   transfer           EXCLUDED for the same reason — an internal movement.
+ *   party_issue,       EXCLUDED — INTERNAL, and this is the 2026-09-17 change.
+ *   party_return       A party requisition's fulfilment moves goods store →
+ *                      DEPARTMENT: central −q AND department_materials +q with
+ *                      a 'received' dept ledger row (party-fulfillment.ts). The
+ *                      outlet still owns every gram, so outletOnHandMap() — the
+ *                      numerator every caller divides by this rate — does not
+ *                      move. Counting it here is the requisition_issue trap
+ *                      verbatim: the denominator rises while the numerator
+ *                      stands still, days-of-cover falls, and /crm/reorder
+ *                      drafts a purchase order for goods sitting on the
+ *                      kitchen shelf. That row used to be typed
+ *                      'party_consumption' and WAS in this list, which is how a
+ *                      transfer into the owner's own kitchen came to be counted
+ *                      beside a sale as stock consumed and gone. The entry is
+ *                      now removed deliberately, so that a database restored
+ *                      from a pre-rename backup cannot smuggle it back.
+ *                      DO NOT ADD 'party_issue' HERE IN ITS PLACE. It would not
+ *                      merely restore today's numbers: 'party_issue' is also
+ *                      written by the Party Items rail (api/parties/items),
+ *                      which has always been excluded, so adding it would newly
+ *                      inflate the burn rate for every bar material issued on
+ *                      that screen. The return leg is a transfer around it.
+ *                      KNOWN AND ACCEPTED NARROWING: the PO-receive cascade
+ *                      (po-requisition-fulfil.ts) writes the same type WITHOUT
+ *                      a department credit, so for those rows the outlet total
+ *                      genuinely does fall and this rate no longer sees them.
+ *                      It only ever saw them at all in the FALLBACK leg below,
+ *                      which fires solely for materials with no issued
+ *                      requisition line in the window — a material the party
+ *                      rail issued normally is already counted in the primary
+ *                      leg, which does not filter out purpose='party'. The fix
+ *                      for that asymmetry is a department credit on the cascade
+ *                      rail, not a wrong entry in an outflow whitelist.
  *   butchering_*       EXCLUDED — a yield conversion, not consumption. Counting
  *                      the input as usage double-books it against the output.
  *   adjustment         EXCLUDED — a count correction (also staff-meal deletes
@@ -73,7 +105,7 @@ const ISSUE_DATE = `COALESCE(NULLIF(SUBSTR(ri.issued_at,1,10),''), r.date)`;
  * already keeps them out of the sum; the rate is therefore gross-of-returns,
  * exactly as it was before this change.
  */
-const OUTFLOW_TX_TYPES = ['sale', 'nc', 'wastage', 'staff_meal_issue', 'party_consumption'] as const;
+const OUTFLOW_TX_TYPES = ['sale', 'nc', 'wastage', 'staff_meal_issue'] as const;
 const OUTFLOW_TX_IN = OUTFLOW_TX_TYPES.map(t => `'${t}'`).join(',');
 
 /**

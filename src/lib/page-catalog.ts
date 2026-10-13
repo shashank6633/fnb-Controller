@@ -14,6 +14,45 @@
  * To add a page: append it to its section (or create a new section).
  */
 
+// The Guest Feedback floor gate. `src/lib/feedback/access.ts` imports NOTHING,
+// which is what makes it safe here: page-catalog is bundled into client
+// components (Sidebar, /customers, /settings/page-access), so an import that
+// reached for `@/lib/db` would drag better-sqlite3 into the browser. Keep it
+// that way. The dependency is one-way — access.ts must never import this file.
+import { canOpenFeedbackFloor, isFeedbackPath } from './feedback/access';
+
+/**
+ * The user shape every gate in this file reads. Structural, not `SessionUser`,
+ * for the bundle reason above — three different producers build it:
+ *   · `getCurrentUser()`    (src/lib/auth.ts) — the full session user
+ *   · `proxy.ts` step 2b    — its own narrower SELECT, resolved through roles
+ *   · `/api/auth/me` → JSON — what the Sidebar filters with
+ *
+ * `role_name` is the newest field and the only one that can be legitimately
+ * absent: it resolves from `users.role_id`, which is NULL for every user on the
+ * measured database. Every gate that reads it treats absent as DENY.
+ */
+export interface CatalogUser {
+  role?: string;
+  page_access?: string | null;
+  is_head_chef?: boolean;
+  /** `roles.name` of the assigned role, or null/absent when none is assigned.
+   *  Read only by the `greOnly` gate. Absent ⇒ denied, never granted. */
+  role_name?: string | null;
+  /** `roles.is_active` for the assigned role, or null when none is assigned.
+   *  Read only by the `greOnly` gate: a positively-false value refuses the GRE
+   *  match, absent/null means "not looked up" and changes nothing. It does NOT
+   *  affect tier or page-map resolution, which must keep honouring a
+   *  deactivated role (auth.ts:104-107) or deactivation would escalate. */
+  role_is_active?: boolean | number | null;
+  /** `roles.can_view_finance_reports` for the assigned role. Read by ONE gate:
+   *  the mgmtOnly test, and only on a page whose entry carries `financeCap`.
+   *  Absent/false ⇒ nothing changes anywhere. It is never tested on its own —
+   *  every read is `user.can_view_finance_reports && entry.financeCap` — which
+   *  is what makes it structurally incapable of opening an unflagged page. */
+  can_view_finance_reports?: boolean;
+}
+
 export interface PageEntry {
   /** Path that proxy.ts + sidebar will match against */
   path: string;
@@ -31,11 +70,90 @@ export interface PageEntry {
    */
   mgmtOnly?: boolean;
   /**
+   * THE ONE EXCEPTION TO mgmtOnly, and the only one. When true, a user holding
+   * `can_view_finance_reports` (a roles column, admin-granted in Settings →
+   * Roles) satisfies this page's mgmtOnly test without being management.
+   *
+   * It is a per-PAGE opt-in, not a tier: the capability is never tested alone,
+   * so flagging nothing would grant nothing, and a mgmtOnly page WITHOUT this
+   * flag stays shut to a cap holder no matter what. That is deliberate — it is
+   * what stops an Accounts designation reaching /boh/accountability,
+   * /department-variance, staff rankings or the guest-phone screens.
+   *
+   * Carried by exactly FOUR rows: /purchases and the three vendor-money Reports
+   * (Purchase Report, Purchase Bill Summary, Return Report). /reports/sales was
+   * flagged for a few hours on 2026-10-05 and the owner removed it: it is sales
+   * data and it ranks NAMED STAFF, which is a different thing from vendor spend.
+   * That removal was a one-line edit to its catalog row and nothing else, which
+   * is the property this design is for — the set of pages lives in ONE place.
+   *
+   * On /purchases the flag is INERT for canAccessPage (that row has no mgmtOnly
+   * to lift) and exists so the paths are ONE reviewable list — the actual unlock
+   * there is in src/lib/purchases-access.ts, which reads the same list.
+   *
+   * PREFIX LAW APPLIES: bestEntry() is longest-prefix, so a future page under a
+   * flagged row with no row of its own inherits this flag. A new child a cap
+   * holder must NOT see needs its own catalog row.
+   */
+  financeCap?: boolean;
+  /**
    * When true, ONLY an Admin (role === 'admin') may see/open this page —
    * stricter than mgmtOnly/hodOnly. Used for admin-only consoles like the App
    * Errors page. Non-admins are blocked even with an explicit page_access grant.
    */
   adminOnly?: boolean;
+  /**
+   * A COMPANION GRANT: an explicit page map that opens `impliedBy` also opens
+   * THIS page, even when the map never names it.
+   *
+   * ── WHY THIS EXISTS AT ALL, AND WHY IT IS NOT A BACK DOOR ──────────────────
+   * It is for the case where some OTHER module has already made the real
+   * capability decision from a DIFFERENT fact, and this file's map test would
+   * otherwise answer a stricter, contradictory "no" — leaving a page that the
+   * API hands the user data for but the proxy bounces them off. That is not a
+   * safety margin, it is the drift settle-authority.ts's header warns about,
+   * read from the other end: two surfaces, two copies of one authority rule.
+   *
+   * THREE PROPERTIES, all load-bearing:
+   *   1. IT ONLY EVER FILLS IN. It runs AFTER the ordinary map test has already
+   *      failed, so an explicit grant still works exactly as before and nothing
+   *      any admin has ticked changes meaning.
+   *   2. IT CANNOT REACH PAST A TIER GATE. hodOnly / mgmtOnly / adminOnly all
+   *      return false ABOVE the map test, so an implied grant can never open a
+   *      management screen. /boh/dashboard and /boh/accountability stay shut.
+   *   3. IT IS ONE HOP, NOT A GRAPH. The implied path is tested against the
+   *      user's own map and never against another implication, so no chain of
+   *      rows can quietly compound into access nobody wrote down.
+   *
+   * THE COST, STATED PLAINLY: while the companion grant holds, this page cannot
+   * be revoked on its own — unticking it in Settings → Roles has no effect for
+   * a user who still holds `impliedBy`. Only use it where the page is strictly
+   * LESS than what the companion already gives, so there is nothing left to
+   * revoke separately. That is exactly true of the one row that uses it today:
+   * see the '/boh' entry below.
+   */
+  impliedBy?: string;
+
+  /**
+   * When true, only the NAMED GRE role (`roles.name`, matched by
+   * `canOpenFeedbackFloor` in `src/lib/feedback/access.ts`) or management —
+   * Admin, any Manager tier including Floor Manager, or an HOD — may see/open
+   * this page. Used by the three Guest Feedback floor pages.
+   *
+   * ⚠️ IT IS THE FIRST FLAG HERE THAT READS A NAMED ROLE, NOT A TIER. The other
+   * three resolve from `role` / `is_head_chef`, which every caller already had.
+   * This one needs `role_name`, which `getCurrentUser()` resolves but which
+   * `proxy.ts` step 2b did NOT select until this flag was added — a flag whose
+   * data the proxy cannot see would have denied the very users it exists for.
+   * If you add a `greOnly` page, confirm the proxy still selects `r.name`.
+   *
+   * ⚠️ IT FAILS CLOSED. `role_name` is NULL for every user whose `users.role_id`
+   * is NULL — all 9 on the measured database — so this denies until the owner
+   * ASSIGNS the role he created. That is the intent: `canAccessPage` grants
+   * every unflagged page to a null-map user (8 of those 9), and the feedback
+   * floor pages must not be among them.
+   */
+  greOnly?: boolean;
 }
 
 export interface PageSection {
@@ -66,6 +184,87 @@ export const PAGE_CATALOG: PageSection[] = [
       // refuses a non-management caller with its own 403, and settle/void keep
       // their own gates on top.
       { path: '/dine-in/stale-tables', label: 'Idle Tables', mgmtOnly: true },
+      // THE BILLS-ON-HOLD REGISTER — the catalog row the two management rows
+      // below say is claimed "in a separate lane". This is that row.
+      //
+      // Deliberately NOT mgmtOnly, unlike its two dashboards: a cashier has to
+      // be able to work their OWN outstanding bills, which is the whole point
+      // of the accountability model. The separation is safe because bestEntry()
+      // takes the LONGEST matching prefix — '/boh/dashboard' still resolves to
+      // its own mgmtOnly row, and '/boh/<id>' resolves to this one — and
+      // because isMgmtOnlyPath() runs BEFORE the page_access map is consulted,
+      // so granting '/boh' can never open a management screen.
+      //
+      // The real gate is the route's, as always: GET /api/boh pins a
+      // non-management caller to their own responsible_user_id and refuses
+      // anyone without an explicit '/cashier' grant (canUseBoh → tillCapable),
+      // which is STRICTER than this catalog rather than looser.
+      //
+      // ── THE CASHIER DECISION — impliedBy: '/cashier' ────────────────────
+      // THE ANSWER IS YES: a Cashier gets this page. A cashier is the person
+      // standing at the till when a guest asks to leave a bill on hold; the
+      // hold route defaults responsible_user_id to exactly that person, so the
+      // register is the ONE screen the accountability model requires them to be
+      // able to work. Denying it leaves a named debt with no way for the named
+      // person to record a payment or a follow-up against it.
+      //
+      // WHY A COMPANION GRANT AND NOT A ROLE EDIT. Measured on the owner's
+      // database (2026-09-22), the Cashier role's page map is
+      //   ["/dine-in/floor","/dine-in/tables","/dine-in/order","/captain",
+      //    "/dine-in/reservations","/cashier"]
+      // — an EXPLICIT map with no '/boh', so canAccessPage said no while
+      // GET /api/boh said yes. Both halves were measured on that snapshot:
+      //   Cashier  GET /boh      -> 307 /dine-in/floor?forbidden=%2Fboh
+      //   Cashier  GET /api/boh  -> 200 {"rows":[],"scope":"own"}
+      // and a Captain's own API refusal reads "Ask an admin to assign you the
+      // Cashier role" — advice that, before this line, did not open the page.
+      //
+      // The obvious repair is a one-shot migration adding '/boh' to that row,
+      // in the shape of db.ts's cashier_role_page_grant_v1. It is rejected for
+      // two reasons. First, roles are PRODUCTION CONFIGURATION and the owner's
+      // standing rule is that they are his to set in the app — a migration
+      // writes his mapping for him. Second and worse, it fixes one row and
+      // nothing else: the day he creates a second till role (a "Senior
+      // Cashier", an outlet-specific till) and grants it '/cashier', that role
+      // is locked out of /boh again and the same bug is back with no migration
+      // left to run. Deriving the page from the SAME fact the API derives its
+      // answer from cannot drift and cannot be out of date.
+      //
+      // WHY IT GIVES AWAY NOTHING. '/cashier' is already the app's definition
+      // of a till operator — tillCapable() in settle-authority.ts gates
+      // SETTLING A BILL on precisely this grant, and canUseBoh() reuses it. So
+      // everyone this line admits could already read their own BOH rows over
+      // the API, could already settle the underlying bill, and is already
+      // pinned by GET /api/boh to responsible_user_id = themselves. The page is
+      // strictly less than the API they already hold, which is the condition
+      // PageEntry.impliedBy requires. Management screens are unaffected:
+      // '/boh/dashboard' and '/boh/accountability' are mgmtOnly, and mgmtOnly
+      // is tested BEFORE any map or implication is consulted.
+      { path: '/boh',                 label: 'Bills on Hold', impliedBy: '/cashier' },
+      // BILLS ON HOLD — the two management surfaces of the BOH module. They sit
+      // beside Cashier because a BOH starts at the till: hold already writes the
+      // sales rows and deducts the stock, so what is left is a debt somebody has
+      // to chase.
+      //
+      // mgmtOnly on BOTH, for the reason src/lib/boh-access.ts's third tier
+      // gives: a cashier may see their OWN bills (on the register, /boh), but
+      // cross-user lists, the user-wise view and every money TOTAL are
+      // management — and each of these two screens is nothing but cross-user
+      // money totals with a customer's phone number on every row. mgmtOnly runs
+      // BEFORE canAccessPage's null-map backward-compat grant, so it is a real
+      // lock rather than a default.
+      //
+      // As everywhere in this file, the flag is NOT the security boundary:
+      // GET /api/boh/dashboard and GET /api/boh/accountability each refuse a
+      // non-management caller with their own 403, which is what actually holds
+      // when role_id is NULL on every user and page_access is NULL on 8 of 9.
+      //
+      // The register itself (/boh, /boh/[id]) is NOT registered here — it is
+      // built in a separate lane and claims its own catalog row. bestEntry()
+      // takes the LONGEST matching prefix, so these two keep their mgmtOnly
+      // whatever flag that row eventually carries.
+      { path: '/boh/dashboard',       label: 'Bills on Hold — Dashboard', mgmtOnly: true },
+      { path: '/boh/accountability',  label: 'Bills on Hold — Who is chasing', mgmtOnly: true },
       { path: '/dine-in/requests',    label: 'Customer Orders & Requests' },
       { path: '/dine-in/discount-approvals', label: 'Discount Approvals' },
       { path: '/dine-in/kitchen',     label: 'Kitchen Display' },
@@ -83,6 +282,76 @@ export const PAGE_CATALOG: PageSection[] = [
       { path: '/direct-items',        label: 'Direct Items' },
       { path: '/sales',               label: 'Sales Upload' },
       { path: '/dine-in/reconciliation', label: 'Reconciliation' },
+    ],
+  },
+  // Guest Feedback & Service Recovery. Its own section rather than four more
+  // rows under Dine-In: the people who live on these pages (GRE / Floor
+  // Manager) are not the people who live on Order Floor and Cashier, and the
+  // whole point of the module is that the GRE has READ-ONLY access to
+  // everything in that section above.
+  //
+  // ⚠️ THREE THINGS A READER MUST KNOW BEFORE EDITING THIS BLOCK.
+  //
+  // 1. THIS IS NOT THE SECURITY BOUNDARY. proxy.ts guards PAGES, NOT APIs, and
+  //    canAccessPage fails open FOUR ways (null page_access map — true for 8 of
+  //    9 users today; garbled JSON; an empty array; a prefix grant opening every
+  //    descendant) plus a fifth in proxy.ts's own `catch { /* fail open */ }`.
+  //    Every /api/feedback/* route gates itself with canUseFeedback() /
+  //    canUseFeedbackAnalytics() from src/lib/feedback.ts. These flags decide
+  //    what is VISIBLE, nothing more.
+  //
+  // 2. THE OWNER'S READ-ONLY CONSTRAINT CANNOT BE MET BY HIDING BUTTONS, and
+  //    removing a page from a GRE's map does not close a single POS endpoint.
+  //    The enforcement is isReadOnlyFeedbackUser() called inside the POS
+  //    handlers themselves (P2). Do not "simplify" this by assuming the catalog
+  //    protects anything.
+  //
+  // 3. §7 Q1 IS ANSWERED — the owner created a "GRE" role (base role Staff) in
+  //    PRODUCTION on 2026-09-22, so pages 1-3 now carry `greOnly` and the gate
+  //    is live. The role NAME is one line: GRE_ROLE_NAME in
+  //    src/lib/feedback/access.ts.
+  //
+  //    Before this, pages 1-3 carried no flag at all and canAccessPage's
+  //    null-map backward-compat grant therefore opened them to any signed-in
+  //    user — measured: 8 of the 9 users on this database have page_access
+  //    NULL, so a Captain and a Cashier could both open the GRE's floor board.
+  //    greOnly closes that, and closes it FAIL-CLOSED: `role_name` resolves
+  //    only through `users.role_id`, which is NULL for all 9 users today, so a
+  //    would-be GRE is denied until the role is actually ASSIGNED to the login.
+  //    Creating the role is half the job; assigning it is the other half.
+  {
+    label: 'Guest Feedback',
+    pages: [
+      // Page 1 — the mobile floor board. Path is /feedback and NOT
+      // /captain/feedback even though it borrows the Captain app's look:
+      // AppShell.tsx:16 grants the chrome-free `bare` layout to anything under
+      // /captain, and putting a GRE surface inside that prefix would hand it a
+      // Captain page-access grant by prefix (canAccessPage rule 4 opens every
+      // descendant of a granted path). The layout is worth less than the gate.
+      { path: '/feedback',            label: 'Floor Feedback', greOnly: true },
+      // Page 2 — one order at a time, reached as /feedback/take/<orderId>.
+      // bestEntry() is longest-prefix, so the child route resolves to this
+      // entry and inherits exactly its flags.
+      { path: '/feedback/take',       label: 'Take Feedback', greOnly: true },
+      // Page 3 — the shift-level tracker. Floor-facing on purpose: a GRE must
+      // see their own pending list, and the fairness ruling means coverage is
+      // not a stick to hide from them.
+      { path: '/feedback/tracker',    label: 'Feedback Tracker', greOnly: true },
+      // Page 4 — Admin Analytics & Reports, including all EIGHT downloads
+      // (§3 puts the reports here, not on a fifth page).
+      //
+      // mgmtOnly, for the same reason /reports/sales is: it ranks NAMED STAFF
+      // (GRE/Manager Performance) and exports guest comments and contact-level
+      // recovery history in bulk. The fairness ruling makes this stricter, not
+      // looser — "the system should not judge GRE performance based on positive
+      // feedback", and a league table left open to the floor is precisely the
+      // pressure that makes a GRE stop recording complaints.
+      //
+      // mgmtOnly = admin OR role 'manager' OR is_head_chef, and it is checked
+      // BEFORE the null-map backward-compat grant in canAccessPage, so legacy
+      // full-access staff are locked out too. Widening it later is a one-word
+      // change; starting narrow is the reversible direction.
+      { path: '/feedback/analytics',  label: 'Feedback Analytics', mgmtOnly: true },
     ],
   },
   {
@@ -105,7 +374,12 @@ export const PAGE_CATALOG: PageSection[] = [
   {
     label: 'Purchasing',
     pages: [
-      { path: '/purchases',           label: 'Purchases' },
+      // financeCap is INERT here for canAccessPage — this row has no mgmtOnly to
+      // lift, so a plain staffer with the grant already opens the page. It is
+      // carried so FINANCE_CAP_PATHS below is the ONE list of the owner's set,
+      // which src/lib/purchases-access.ts reads to unlock GET /api/purchases —
+      // the 403 that actually makes this page show "Failed to fetch purchases".
+      { path: '/purchases',           label: 'Purchases', financeCap: true },
       { path: '/purchase-orders',     label: 'Purchase Orders' },
       { path: '/grn',                 label: 'Goods Receipt (GRN)' },
       // Pending Quality Checks — the queue a kitchen/bar staffer clears at the
@@ -129,6 +403,21 @@ export const PAGE_CATALOG: PageSection[] = [
       // documents. It also inherits a /grn grant by prefix, which is correct —
       // whoever can see the receipts should see which of them are held.
       { path: '/grn/qc',              label: 'Pending Quality Checks' },
+      // The override report — every receipt released into stock WITHOUT a
+      // kitchen check, with who allowed it and the reason they typed. mgmtOnly
+      // and not merely by prefix: unlike the queue above, this names staff who
+      // bypassed a food-safety gate and prints the value that moved, so it
+      // carries the same bar as the receiving money it reports rather than
+      // inheriting a /grn grant.
+      //
+      // ⚠️ It must exist in src/components/Sidebar.tsx too, href matching
+      // character for character, in the same commit. GET /api/grn/qc/overrides
+      // has served this report since August and had NO page, NO caller and NO
+      // row in either file — so the data accumulated where nobody could read it
+      // while /grn/qc promised the person overriding, twice, that it "appears
+      // on the override report". Catalog-only is gated but invisible;
+      // sidebar-only is visible but ungated. Both, always.
+      { path: '/grn/qc/overrides',    label: 'Inwarded without QC', mgmtOnly: true },
       { path: '/receiving-variance',  label: 'Receiving Variance' },
       // Returns — the return TICKET queue. One workflow, two kinds of return,
       // forked by an immutable `kind` column on the ticket. Two facts a reader
@@ -171,6 +460,63 @@ export const PAGE_CATALOG: PageSection[] = [
       // category that can conjure or vanish cash ('adjustment') is
       // management-only server-side.
       { path: '/petty-cash',          label: 'Petty Cash (store cash box)' },
+      // ── Bill Submission Quality Check — the STORE half ──────────────────
+      // The store's own register of vendor bills and whether they have reached
+      // Accounts: Pending Submission / Submitted - Awaiting Accounts
+      // Confirmation / Received by Accounts, plus the deliveries that carry no
+      // bill record at all. This row and its twin in src/components/Sidebar.tsx
+      // must ship together, hrefs matching character for character — the two
+      // files keep separate lists, so a page in only one of them is either
+      // invisible (catalog-only) or ungated (sidebar-only).
+      //
+      // DELIBERATELY NO TIER FLAG. The storekeeper who hands the bill across the
+      // counter is the person who must record that it happened, and
+      // mgmtOnly/hodOnly run BEFORE the null-map grant — they are a real lock,
+      // not a hint, and here they would lock out the one role the page is for.
+      // Access stays opt-in per user/role, and the routes are the actual
+      // boundary: canRecordBillHandover is Management or the Store Manager and
+      // explicitly refuses an Accounts-role holder, so a grant here widens who
+      // can SEE the register, never who can assert a handover.
+      //
+      // AND THE PREFIX TRAP, stated once for all three rows: canAccessPage
+      // matches a grant by prefix, so ticking this row also grants
+      // /bill-submissions/accounts and /bill-submissions/history below. That is
+      // the documented behaviour of every parent in this catalog and it is
+      // harmless here, because confirming a receipt is gated by the route on the
+      // role NAME ("Accounts") and not by which checkbox is ticked.
+      { path: '/bill-submissions',    label: 'Bill Handover — Store' },
+      // ── Bill Submission Quality Check — the ACCOUNTS half ───────────────
+      // Two screens for the vendor-bill handover: the queue Accounts works and
+      // the history both departments read. The STORE screen (/bill-submissions)
+      // belongs to the store lane and its row goes directly above these two —
+      // this file and src/components/Sidebar.tsx must gain it in the same
+      // commit, hrefs matching character for character, or it repeats the
+      // drift that once hid /variance-approvals (catalog-only = gated and
+      // invisible; sidebar-only = visible and ungated).
+      //
+      // NO TIER FLAG, and that is deliberate rather than an omission. The
+      // Accounts role the owner creates will be STAFF tier (a manager-tier role
+      // would silently pass isManagement() everywhere and reach /reports/sales
+      // and /hr/employees), so an mgmtOnly/hodOnly flag here would lock the
+      // Accounts team out of the one page built for them — those flags run
+      // BEFORE the null-map grant and are a real lock, not a hint.
+      //
+      // THIS LINE IS NOT THE SECURITY BOUNDARY, and nothing about this feature
+      // should be reasoned about as if it were. Measured on the live database:
+      // role_id is set on 0 of 9 users and page_access is NULL on 8 of 9, so
+      // page gating is effectively INERT today; src/proxy.ts guards pages and
+      // not APIs; and canAccessPage fails open four ways. Every route under
+      // /api/bill-submissions re-derives its own answer from the session —
+      // reading is canViewBillHandovers, and only an Administrator or a holder
+      // of the role NAMED "Accounts" can confirm a receipt.
+      //
+      // ONE PREFIX TRAP WORTH KNOWING: canAccessPage matches a grant by prefix,
+      // so ticking the store's /bill-submissions also grants both rows below.
+      // That is the documented behaviour for every parent in this catalog, and
+      // it is harmless here precisely because confirming is gated by the route
+      // on the role name and not by which checkbox is ticked.
+      { path: '/bill-submissions/accounts', label: 'Bill Handover — Accounts' },
+      { path: '/bill-submissions/history',  label: 'Bill Handover — History' },
     ],
   },
   {
@@ -190,6 +536,18 @@ export const PAGE_CATALOG: PageSection[] = [
       // (system stock / variance) stays admin-only server-side.
       { path: '/inventory/closing-sheet', label: 'Department Closing Sheet' },
       { path: '/inventory/transfers', label: 'Store Transfers' },
+      // THE MOVEMENT REGISTER (owner's eight fields, 2026-09-10). Every stock
+      // movement on every rail, filterable by store / department / type / date,
+      // with CSV. Deliberately NOT mgmtOnly: it is an operational record a store
+      // manager and an HOD have to be able to read — who moved what, where, in
+      // what unit — and it carries no rupee figure for them (the API returns
+      // unit_cost as null to anyone outside isManagement, and scopes stores by
+      // userStoreAccess and departments by allowedDeptIds). As everywhere on
+      // this list, the flag is NOT the security boundary: the route behind it
+      // refuses anyone who is not admin / manager / store-manager / HOD with its
+      // own 403. Keep in step with src/components/Sidebar.tsx, which carries its
+      // own nav list ([[project_fnb_sidebar_catalog_drift]]).
+      { path: '/inventory/movements', label: 'Stock Movements' },
       { path: '/inventory/department-stock', label: 'Department Stock' },
       { path: '/inventory/reconciliation', label: 'Sales vs Consumption' },
       { path: '/store-dashboard',     label: 'Store Dashboard — Low Stock' },
@@ -249,10 +607,14 @@ export const PAGE_CATALOG: PageSection[] = [
     pages: [
       { path: '/sales-dashboard',     label: 'Sales Dashboard' },
       { path: '/reports',             label: 'Reports' },
+      // NO financeCap, by the owner's call (2026-10-05). It was flagged briefly
+      // in 53b0863 because the Accounts role had been ticked for it, then removed
+      // the same day: unlike the other three Reports this one is not vendor money,
+      // it is SALES — and it ranks NAMED STAFF. Management only, as before.
       { path: '/reports/sales',       label: 'Sales Reports', mgmtOnly: true },
-      { path: '/reports/purchases',   label: 'Purchase Report', mgmtOnly: true },
-      { path: '/reports/purchase-bill-summary', label: 'Purchase Bill Summary', mgmtOnly: true }, // mgmtOnly for the SAME reason as Purchase Report directly above: vendor-level spend, GST and cess, one row per vendor bill. Two traps a future reader will hit: (1) a "bill" here is DERIVED, not stored — purchases holds one row per ITEM, so the report groups on invoice_id > grn_id > vendor|bill_no|date|outlet > vendor|date|outlet, and since ~2,151 of 2,165 rows carry no vendor bill number most rows are a vendor-day consolidation flagged DAY_RUN, not a paper bill. (2) it reads the purchases table ALONE — goods_receipt_note_items / po_vendor_bills restate the SAME money (see the header of src/lib/purchase-log.ts), so joining them back in to "enrich" a PO-receive bill with its GRN tax would double-count; PO-receive purchases rows are deliberately tax-free cost mirrors and are labelled as booked cost, not bill face value. This line is NOT the security boundary: /api/reports/purchase-bill-summary refuses non-management with its own 403.
-      { path: '/reports/returns',     label: 'Return Report', mgmtOnly: true },           // mgmtOnly for the SAME vendor-spend reason recorded on the Purchase Report line above: a vendor-return row carries the GRN line's unit price and the credit note the vendor owes us, so this is vendor money, not a counting aid. Two things not to "simplify": (1) it reports BOTH kinds of return in one list and deliberately has NO grand-total field — a vendor return takes stock OUT of the building (central DOWN) while an internal department return puts it back (central UP), and the two are even measured in different unit bases (purchase vs recipe), so a combined figure would be arithmetically meaningless; totals are per source, each printing its basis. (2) PO No. / GRN No. print BLANK on internal rows rather than a nearest match — the department ledger carries no purchase link, so any value there would be fabricated. As with every report line here, this flag is NOT the security boundary: the route behind it refuses non-management with its own 403.
+      { path: '/reports/purchases',   label: 'Purchase Report', mgmtOnly: true, financeCap: true },
+      { path: '/reports/purchase-bill-summary', label: 'Purchase Bill Summary', mgmtOnly: true, financeCap: true }, // mgmtOnly for the SAME reason as Purchase Report directly above: vendor-level spend, GST and cess, one row per vendor bill. Two traps a future reader will hit: (1) a "bill" here is DERIVED, not stored — purchases holds one row per ITEM, so the report groups on invoice_id > grn_id > vendor|bill_no|date|outlet > vendor|date|outlet, and since ~2,151 of 2,165 rows carry no vendor bill number most rows are a vendor-day consolidation flagged DAY_RUN, not a paper bill. (2) it reads the purchases table ALONE — goods_receipt_note_items / po_vendor_bills restate the SAME money (see the header of src/lib/purchase-log.ts), so joining them back in to "enrich" a PO-receive bill with its GRN tax would double-count; PO-receive purchases rows are deliberately tax-free cost mirrors and are labelled as booked cost, not bill face value. This line is NOT the security boundary: /api/reports/purchase-bill-summary refuses non-management with its own 403.
+      { path: '/reports/returns',     label: 'Return Report', mgmtOnly: true, financeCap: true },         // mgmtOnly for the SAME vendor-spend reason recorded on the Purchase Report line above: a vendor-return row carries the GRN line's unit price and the credit note the vendor owes us, so this is vendor money, not a counting aid. Two things not to "simplify": (1) it reports BOTH kinds of return in one list and deliberately has NO grand-total field — a vendor return takes stock OUT of the building (central DOWN) while an internal department return puts it back (central UP), and the two are even measured in different unit bases (purchase vs recipe), so a combined figure would be arithmetically meaningless; totals are per source, each printing its basis. (2) PO No. / GRN No. print BLANK on internal rows rather than a nearest match — the department ledger carries no purchase link, so any value there would be fabricated. As with every report line here, this flag is NOT the security boundary: the route behind it refuses non-management with its own 403.
       { path: '/reports/issue-log',   label: 'Purchase to Issue Log', mgmtOnly: true },   // mgmtOnly for the SAME reason as Purchase Report directly above: it joins vendor spend and purchase rates onto material rows. Do NOT "simplify" this to an open page — the store's own issue view (/store-requisitions, /api/store-issued-log) is untouched and still carries no money.
       { path: '/reports/menu-recipe-gap', label: 'Menu Items Without Recipe', mgmtOnly: true }, // mgmtOnly: ranks the un-costed menu by actual SALES VALUE (revenue on the page), and its review-gated bulk attach rewrites the food cost of every FUTURE sale of a dish. Not a staff surface.
       { path: '/menu-engineering',    label: 'Menu Engineering', hodOnly: true },
@@ -750,9 +1112,102 @@ export function isHodOnlyPath(pathname: string): boolean {
 export function isMgmtOnlyPath(pathname: string): boolean {
   return !!bestEntry(pathname)?.mgmtOnly;
 }
+/** Is `pathname` under a catalog entry that `can_view_finance_reports` may open?
+ *  Uses the SAME bestEntry() longest-prefix walk as isMgmtOnlyPath, so the two
+ *  always agree about WHICH entry they are judging — if they resolved the path
+ *  differently the capability could lift a gate belonging to another row. */
+export function isFinanceCapPath(pathname: string): boolean {
+  return !!bestEntry(pathname)?.financeCap;
+}
+/** Can this user open `pathname` because they hold the finance capability?
+ *  THE ONLY PLACE the capability is read. Both halves are required: the user's
+ *  column AND the page's own flag. Exported so the API gates (which must not
+ *  trust a catalog flag for security) use one predicate instead of six copies. */
+export function financeCapOpens(user: CatalogUser | null, pathname: string): boolean {
+  return !!user?.can_view_finance_reports && isFinanceCapPath(pathname);
+}
+/** The owner's finance paths, DERIVED from the catalog rather than retyped,
+ *  so a sixth flagged row cannot disagree with the API allowlist. */
+export const FINANCE_CAP_PATHS: string[] =
+  PAGE_CATALOG.flatMap(s => s.pages).filter(p => p.financeCap).map(p => p.path);
 /** Is `pathname` under an admin-only catalog entry (role === 'admin' only)? */
 export function isAdminOnlyPath(pathname: string): boolean {
   return !!bestEntry(pathname)?.adminOnly;
+}
+/**
+ * Is `pathname` under a GRE-gated catalog entry (the Guest Feedback floor
+ * pages)? Longest-prefix like the three above, which is what keeps
+ * /feedback/analytics on its own mgmtOnly entry instead of inheriting this one.
+ */
+export function isGreOnlyPath(pathname: string): boolean {
+  return !!bestEntry(pathname)?.greOnly;
+}
+
+/**
+ * Does this role's `page_access` list say ANYTHING about the Guest Feedback
+ * module?
+ *
+ * ── WHY THIS QUESTION EXISTS, AND WHAT IT DECIDES ───────────────────────────
+ * Measured on this branch (probe `floor-managers-and-null-role`, 2026-09-23): a
+ * **Floor Manager gets 403 on all four feedback pages while `GET
+ * /api/feedback/floor` answers 200 `scope=management`**. The module's own gate
+ * admits them; `canAccessPage`'s last line then refuses, because the Floor
+ * Manager role carries an explicit list — `["/","/dine-in/floor",…,
+ * "/dine-in/reservations"]` — with no `/feedback` entry. Six of the ten roles on
+ * this snapshot carry such a list, including every management role the module
+ * intends to admit, and the owner's spec names "GRE **or Floor Manager**" on
+ * every page.
+ *
+ * The reason the entry is missing is not that the owner decided against it:
+ * **this module has never shipped, so no role's list could possibly mention it.**
+ * Every one of those lists was written before `/feedback` existed. Treating
+ * "absent" as "denied" therefore reads an opinion into silence — and the result
+ * is a module whose API says yes and whose page says no, to the four people
+ * production has actually assigned.
+ *
+ * ── THE RULE, STATED ONCE ───────────────────────────────────────────────────
+ *   For `/feedback*`, the MODULE'S OWN GATE decides who may enter. A role's
+ *   `page_access` list can only NARROW that, never widen it.
+ *
+ * So:
+ *   · list never mentions the module  → the module's gate is the whole answer
+ *     (this function returns false, and `canAccessPage` grants).
+ *   · list mentions the module at all → the owner has an opinion; his list is
+ *     honoured exactly, page by page, and a feedback page he left out is
+ *     refused with the existing "tick it in Settings → Roles" card in
+ *     `proxy.ts`. **Ticking one feedback page switches that role from
+ *     module-governed to list-governed** — that is the lever, and it is the
+ *     only way to take a page away from someone the gate admits.
+ *   · the gate itself is untouched: a Captain, a Cashier or a legacy Staff
+ *     login is refused by `greOnly` LONG before this, and adding `/feedback` to
+ *     their list cannot let them in.
+ *
+ * Anchored, never a substring: `isFeedbackPath()` matches `/feedback` and
+ * `/feedback/...` only, so `/feedback-notes` in some future list is not a
+ * mention of this module. Parsing failures answer **false** (= module-governed),
+ * matching `canAccessPage`'s own "garbled value → don't lock out" direction.
+ */
+export function feedbackListedInMap(page_access: string | null | undefined): boolean {
+  if (!page_access) return false;
+  let allowed: unknown;
+  try { allowed = JSON.parse(page_access); } catch { return false; }
+  if (!Array.isArray(allowed)) return false;
+  return allowed.some((p) => typeof p === 'string' && isFeedbackPath(p.trim()));
+}
+
+/**
+ * The companion path whose grant also opens `pathname`, or null.
+ *
+ * Same LONGEST-prefix resolution as every other flag here, so '/boh/<id>'
+ * inherits the '/boh' row's implication while '/boh/dashboard' resolves to its
+ * OWN row — which carries no `impliedBy` and is mgmtOnly besides.
+ *
+ * Deliberately NOT transitive: the caller tests the returned path against the
+ * user's literal map and stops. See PageEntry.impliedBy, property 3.
+ */
+export function impliedGrantFor(pathname: string): string | null {
+  const via = bestEntry(pathname)?.impliedBy;
+  return via ? via : null;
 }
 
 /**
@@ -783,7 +1238,7 @@ export const ALWAYS_ALLOWED: string[] = ['/login', '/launch'];
  * re-blocks them. Purely a routing convenience — every page still enforces its
  * own access; this never grants anything.
  */
-export function homePathFor(user: { role?: string; page_access?: string | null; is_head_chef?: boolean } | null): string {
+export function homePathFor(user: CatalogUser | null): string {
   if (!user) return '/login';
   const isMgmt = user.role === 'admin' || user.role === 'manager' || user.is_head_chef;
   // Legacy full-access (null map) NON-management users: canAccessPage grants
@@ -873,7 +1328,7 @@ export function homePathFor(user: { role?: string; page_access?: string | null; 
   return '/login';
 }
 
-export function firstAllowedPath(user: { role?: string; page_access?: string | null; is_head_chef?: boolean } | null): string {
+export function firstAllowedPath(user: CatalogUser | null): string {
   if (!user) return '/login';
   if (user.role === 'admin') return '/';
   if (!user.page_access) return '/';                     // null map = full access → /
@@ -887,10 +1342,23 @@ export function firstAllowedPath(user: { role?: string; page_access?: string | n
   // a non-HOD isn't redirected to a page that immediately re-blocks them.
   for (const section of PAGE_CATALOG) {
     for (const p of section.pages) {
+      // The tier tests here are hand-rolled rather than canAccessPage, so every
+      // flag MUST be repeated — a missing one lands the user on a page the
+      // proxy then blocks, and since this function IS the proxy's fallback
+      // target that is a redirect loop, not a cosmetic bug. greOnly was the
+      // fourth flag; there are four tests below for that reason.
+      //
+      // financeCap is NOT a fifth flag — it WIDENS the mgmtOnly test rather than
+      // adding a test of its own, so the failure mode here is the opposite one:
+      // omit it and a finance-capable role whose map is exactly the flagged paths
+      // matches NO row, falls through to '/login', and is bounced straight back
+      // by the proxy. That is the redirect loop this comment warns about.
       if (allowed.includes(p.path)
         && !(p.hodOnly && !user.is_head_chef)
-        && !(p.mgmtOnly && !(user.role === 'manager' || user.is_head_chef))
-        && !(p.adminOnly && user.role !== 'admin')) return p.path;
+        && !(p.mgmtOnly && !(user.role === 'manager' || user.is_head_chef)
+             && !(p.financeCap && user.can_view_finance_reports))
+        && !(p.adminOnly && user.role !== 'admin')
+        && !(p.greOnly && !canOpenFeedbackFloor(user))) return p.path;
     }
   }
   return '/login';
@@ -908,7 +1376,7 @@ export function firstAllowedPath(user: { role?: string; page_access?: string | n
  */
 export function canAccessPage(
   pathname: string,
-  user: { role?: string; page_access?: string | null; is_head_chef?: boolean } | null,
+  user: CatalogUser | null,
 ): boolean {
   if (!user) return false;
   if (user.role === 'admin') return true;
@@ -922,13 +1390,35 @@ export function canAccessPage(
   // Management-only pages (customer PII): a non-admin must be a Manager or an
   // HOD. Also runs before the null-map grant so legacy full-access staff can't
   // reach the Customers page.
-  if (isMgmtOnlyPath(pathname) && !(user.role === 'manager' || user.is_head_chef)) return false;
+  // financeCapOpens() is the ONE exception to mgmtOnly, and it needs BOTH the
+  // user's roles column AND this page's own financeCap flag — so it can only
+  // ever open the flagged rows, never mgmtOnly as a class.
+  if (isMgmtOnlyPath(pathname) && !(user.role === 'manager' || user.is_head_chef)
+      && !financeCapOpens(user, pathname)) return false;
 
   // Admin-only pages (App Errors console): a non-admin is blocked outright,
   // whatever their page_access map says — runs before the null-map grant so
   // legacy full-access staff can't reach it either. (Admins already returned
   // true above, so this only ever affects non-admins.)
   if (isAdminOnlyPath(pathname)) return false;
+
+  // GRE-gated pages (the Guest Feedback floor pages): a non-admin must either
+  // be management or carry the ASSIGNED named GRE role. Runs here, before the
+  // null-map grant, for the same reason as the three gates above — and it
+  // matters more here than for any of them, because `role_name` is null for
+  // every user until a role is assigned, so a mis-ordered check would have
+  // opened these pages to all 8 null-map users instead of closing them.
+  if (isGreOnlyPath(pathname) && !canOpenFeedbackFloor(user)) return false;
+
+  // Guest Feedback governs its own door — see `feedbackListedInMap()` for the
+  // measurement and the rule. Reaching this line means the flag gates above
+  // already said YES (greOnly for pages 1-3, mgmtOnly for analytics), so the
+  // only thing left to ask is whether the owner has expressed an opinion about
+  // this module in the role's list. He cannot have, on any role written before
+  // the module existed, and "absent" must not read as "denied" — a Floor
+  // Manager was getting 403 on the page while the API served them the board.
+  // A list that DOES mention the module falls through and is honoured exactly.
+  if (isFeedbackPath(pathname) && !feedbackListedInMap(user.page_access)) return true;
 
   // No explicit map → grant everything (backward compat)
   if (!user.page_access) return true;
@@ -941,7 +1431,17 @@ export function canAccessPage(
   // Exact match OR prefix match on a controlled page (so /vendors/123 works
   // when /vendors is allowed). To avoid /audit allowing /audit-log we require
   // the next char to be '/' or end-of-string.
-  return allowed.some(p => pathname === p || pathname.startsWith(p + '/'));
+  if (allowed.some(p => pathname === p || pathname.startsWith(p + '/'))) return true;
+
+  // COMPANION GRANT, LAST. The ordinary map test has already failed, and both
+  // tier gates above have already returned, so this can only ever fill in a
+  // page whose real capability decision another module makes from a different
+  // fact — today exactly one row, '/boh', keyed on '/cashier'. Matched with the
+  // same rule as the line above so a map that opens the companion PAGE opens
+  // this one, never one without the other. See PageEntry.impliedBy.
+  const via = impliedGrantFor(pathname);
+  if (via) return allowed.some(p => via === p || via.startsWith(p + '/'));
+  return false;
 }
 
 /* ───────────────────────────────────────────────────────────────────────────
@@ -1054,15 +1554,24 @@ function nearestCatalogAncestor(pathname: string): string | null {
  */
 export function canAccessPageStrict(
   pathname: string,
-  user: { role?: string; page_access?: string | null; is_head_chef?: boolean } | null,
+  user: CatalogUser | null,
 ): boolean {
   // ── Gates below are copied verbatim from canAccessPage. Keep them in sync.
   if (!user) return false;
   if (user.role === 'admin') return true;
   if (ALWAYS_ALLOWED.some(p => pathname === p)) return true;
   if (isHodOnlyPath(pathname) && !user.is_head_chef) return false;
-  if (isMgmtOnlyPath(pathname) && !(user.role === 'manager' || user.is_head_chef)) return false;
+  // financeCapOpens() is the ONE exception to mgmtOnly, and it needs BOTH the
+  // user's roles column AND this page's own financeCap flag — so it can only
+  // ever open the flagged rows, never mgmtOnly as a class.
+  if (isMgmtOnlyPath(pathname) && !(user.role === 'manager' || user.is_head_chef)
+      && !financeCapOpens(user, pathname)) return false;
   if (isAdminOnlyPath(pathname)) return false;
+  if (isGreOnlyPath(pathname) && !canOpenFeedbackFloor(user)) return false;
+  // Kept in sync with canAccessPage deliberately: this function is MEASURED,
+  // not wired up, and the day it is wired up the feedback module must not
+  // silently go back to 403ing every management role whose list predates it.
+  if (isFeedbackPath(pathname) && !feedbackListedInMap(user.page_access)) return true;
   if (!user.page_access) return true;
 
   let allowed: string[];
@@ -1073,6 +1582,15 @@ export function canAccessPageStrict(
 
   // 1. Explicitly granted.
   if (allowed.includes(pathname)) return true;
+
+  // 1b. COMPANION GRANT — kept in step with canAccessPage on purpose. This
+  //     function's whole job is to measure what the STRICT prefix rule would
+  //     cost, and `impliedBy` is orthogonal to prefix matching: leaving it out
+  //     would make /boh read as a loss caused by strictness when it is nothing
+  //     of the kind, and the report exists to be trusted. Explicit grant still
+  //     wins above; this only fills in, exactly as it does over there.
+  const impliedStrict = impliedGrantFor(pathname);
+  if (impliedStrict && allowed.includes(impliedStrict)) return true;
 
   // 2. A page that stands on its own in the catalog needs its own grant —
   //    it does NOT inherit from a parent that merely shares its URL prefix.

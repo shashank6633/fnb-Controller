@@ -325,6 +325,19 @@ export type HrAttendanceStatus =
   | 'ABSENT'
   | 'ON_LEAVE'
   | 'HALF_DAY'
+  /**
+   * The rostered weekly off (owner rule 4: one weekly off each).
+   *
+   * WRITTEN ONLY BY THE ROSTER GENERATOR, AND ONLY UNDER
+   * hr_weekly_off_policy='paid'. The default policy ('unpaid') stores nothing
+   * at all for an off day — offs live in the generated grid and the printout,
+   * never in hr_rosters (which cannot express one: shift_id is NOT NULL).
+   *
+   * IT IS A PAID DAY and payroll needed no change for that: hr-payroll.ts
+   * counts a day as unpaid only for ABSENT / NOT_CHECKED_IN / ON_LEAVE, so a
+   * WEEKLY_OFF row lands in presentDates like any other paying status.
+   */
+  | 'WEEKLY_OFF'
   | 'OVERTIME'
   | 'MISSING_CHECKOUT';
 
@@ -347,6 +360,9 @@ export const HR_ATTENDANCE_STATUSES: readonly HrAttendanceStatusMeta[] = [
   { key: 'ABSENT', label: 'Absent', color: 'bg-rose-100 text-rose-700 border-rose-200' },
   { key: 'ON_LEAVE', label: 'On Leave', color: 'bg-purple-100 text-purple-700 border-purple-200' },
   { key: 'HALF_DAY', label: 'Half Day', color: 'bg-teal-100 text-teal-700 border-teal-200' },
+  // Sits beside the leave statuses because that is what it is to a reader of the
+  // register — a sanctioned non-working day — but it PAYS (see the union above).
+  { key: 'WEEKLY_OFF', label: 'Weekly Off', color: 'bg-slate-100 text-slate-700 border-slate-200' },
   { key: 'OVERTIME', label: 'Overtime', color: 'bg-cyan-100 text-cyan-700 border-cyan-200' },
   { key: 'MISSING_CHECKOUT', label: 'Missing Checkout', color: 'bg-red-100 text-red-700 border-red-200' },
 ] as const;
@@ -1037,6 +1053,17 @@ export interface HrRoster {
   /** hr_shifts.id. */
   shift_id: string;
   note: string;
+  /**
+   * PROVENANCE. '' = written by hand (and therefore PROTECTED: a regenerate
+   * leaves it alone and reports it in kept_manual), 'generated' = written by the
+   * roster generator. Every row that predates the column reads '' and is
+   * therefore treated as manual — unknown provenance fails towards "leave it
+   * alone", because a manual edit is the manager's call, not ours.
+   *
+   * Optional on the type only because older callers select columns explicitly;
+   * ROSTER_ROW_SELECT uses `r.*`, so the grid already receives it.
+   */
+  source?: string;
   /** me.email (house actor convention). */
   created_by: string;
   created_at: string;
@@ -1059,6 +1086,56 @@ export interface HrShiftRequest {
   reviewed_at: string;
   review_reason: string;
   created_at: string;
+}
+
+/**
+ * One row of hr_roster_coverage — the owner's coverage floor for one
+ * (department, designation, weekday, shift role) slot.
+ *
+ * MINIMUM PRESENT, NEVER A MAX-OFFS CAP (owner rule 3). A floor survives
+ * joiners, leavers and approved leave; a cap silently means something different
+ * every week.
+ */
+export interface HrRosterCoverage {
+  id: string;
+  /** departments.id; '' = every department. Read from the master, never created. */
+  department_id: string;
+  /** hr_designations.id; '' = the WHOLE department (all designations). */
+  designation_id: string;
+  /** 0=Sun, 1=Mon .. 6=Sat (JS getDay). */
+  weekday: number;
+  /** The owner's shift vocabulary (MS / M 2 C / MOR BREAK / SECOND / NIGHT);
+   *  '' = the day TOTAL across every shift. */
+  shift_role: string;
+  /** How many people must be PRESENT in this group on this weekday. */
+  min_present: number;
+  note: string;
+  /** me.email (house actor convention). */
+  updated_by: string;
+  updated_at: string;
+}
+
+/**
+ * One row of hr_roster_shift_map — which hr_shifts row a (department, shift
+ * role, weekday) resolves to.
+ *
+ * WEEKDAY IS PART OF THE KEY because hr_shifts has no weekday dimension and the
+ * owner's SUNDAY timings differ (MOR BREAK 11:00-16:00 + 19:30-closing, SECOND
+ * 14:00-closing). An unmapped (role, weekday) is a REFUSAL, never a fallthrough
+ * to the weekday template.
+ */
+export interface HrRosterShiftMap {
+  id: string;
+  /** departments.id; '' = every department. */
+  department_id: string;
+  /** MS | M 2 C | MOR BREAK | SECOND | NIGHT — the owner's own words. */
+  shift_role: string;
+  /** 0=Sun, 1=Mon .. 6=Sat. */
+  weekday: number;
+  /** hr_shifts.id. */
+  shift_id: string;
+  updated_by: string;
+  updated_at: string;
 }
 
 /** One row of hr_leave_types (soft delete via is_active). */

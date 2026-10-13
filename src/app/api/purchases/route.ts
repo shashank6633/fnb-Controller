@@ -7,7 +7,7 @@ import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
 // /api/purchases/opening-stock) that write the same purchases rows. It used to
 // be a private function here, which is exactly how the importers shipped
 // without it. See the module header for the bar and the measured callers.
-import { requirePurchasesAccess } from '@/lib/purchases-access';
+import { requirePurchasesAccess, requirePurchasesReadAccess } from '@/lib/purchases-access';
 import { canSeeAllDeptStock } from '@/lib/dept-stock';
 import { checkPurchaseDate } from '@/lib/purchase-guard';
 // The QC gate is ONE helper, shared with both receiving routes and the bulk
@@ -99,7 +99,11 @@ export async function GET(request: Request) {
      */
     const me = await getCurrentUser();
     if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-    const deniedGet = requirePurchasesAccess(me);
+    // READ variant — the register feed. POST below keeps requirePurchasesAccess,
+    // and so do /purchases/bulk and /purchases/opening-stock: a finance-report
+    // role may READ the purchase register but must never INSERT purchases rows,
+    // which move current_stock and average_price.
+    const deniedGet = requirePurchasesReadAccess(me);
     if (deniedGet) return deniedGet;
     const db = getDb();
     const url = new URL(request.url);

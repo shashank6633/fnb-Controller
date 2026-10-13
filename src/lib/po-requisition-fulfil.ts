@@ -1,7 +1,9 @@
 import type Database from 'better-sqlite3';
 import { generateId, logAuditEvent } from './db';
 import { GrnRefused, logAuditOrThrow, r6 } from './grn-reversal';
-import { postCentralTxn, deptParty } from '@/lib/movement-record';
+import {
+  postCentralTxn, deptParty, PARTY_TRANSFER_TYPE, PARTY_TRANSFER_TYPES_SQL,
+} from '@/lib/movement-record';
 
 /* ══════════════════════════════════════════════════════════════════════════
  * THE PO → REQUISITION FULFIL CASCADE, IN ONE PLACE.
@@ -39,7 +41,8 @@ import { postCentralTxn, deptParty } from '@/lib/movement-record';
  *     caller sees 'fulfilled', not 'store_processed', and skips the party
  *     branch entirely;
  *   · the party branch additionally probes inventory_transactions for an
- *     existing 'party_consumption' row on this requisition and logs a skip.
+ *     existing party transfer row on this requisition (type 'party_issue',
+ *     or the legacy 'party_consumption') and logs a skip.
  * Do not add a third; these two already make the double-call safe, which is
  * exactly what two callers require.
  * ══════════════════════════════════════════════════════════════════════════ */
@@ -68,9 +71,15 @@ export function fulfilRequisitionFromPo(
   // Party requisition fulfilled via PO-receive cascade — deduct now.
   // (Internal requisitions remain audit-only and never enter this branch.)
   if (willFulfill && reqRow.purpose === 'party') {
+    // MATCHES BOTH NAMES, PERMANENTLY. This guard's whole job is to see rows
+    // the OTHER rail (applyPartyFulfillment) wrote — same reference_id, same
+    // shape. The type was renamed 'party_consumption' → 'party_issue' on
+    // 2026-09-17; a row that escaped the migration, or an older backup, still
+    // means the goods have already left central. Narrow it to one name and this
+    // cascade deducts the same stock a second time. See PARTY_TRANSFER_TYPES.
     const already = db.prepare(`
       SELECT 1 FROM inventory_transactions
-      WHERE reference_id = ? AND type = 'party_consumption'
+      WHERE reference_id = ? AND type IN (${PARTY_TRANSFER_TYPES_SQL})
       LIMIT 1
     `).get(requisitionId);
     if (already) {
@@ -130,7 +139,7 @@ export function fulfilRequisitionFromPo(
         // ri.unit → RECIPE units. Requisition quantities are stored in the
         // LINE's OWN unit (option B), so a "2 BTL" line is TWO BOTTLES —
         // deducting it verbatim took 2 ml off stock instead of 1,500 ml
-        // and wrote a −2 party_consumption row. Same pack-factor CASE as
+        // and wrote a −2 party transfer row. Same pack-factor CASE as
         // src/lib/party-fulfillment.ts and the department-consumption SQL;
         // keep the three byte-equivalent.
         const rPack = Number(it.rm_pack_size) || 1;
@@ -143,11 +152,17 @@ export function fulfilRequisitionFromPo(
         const issued = issuedReq * reqPackFactor;   // RECIPE units
         decStock.run(issued, it.material_id);
         // MOVEMENT RECORD: the party's draw on central. The destination was
-        // implicit in the type ('party_consumption'); it is now the requisition's
-        // own department when one is named, and the party sink otherwise.
+        // implicit in the type; it is now the requisition's own department when
+        // one is named, and the party sink otherwise.
+        //
+        // TYPED 'party_issue' SINCE 2026-09-17, and it MUST move in lockstep
+        // with party-fulfillment.ts's write. The two rails produce an
+        // identically shaped row on the same reference_id and each rail's guard
+        // exists to see the OTHER rail's rows: rename one write and leave the
+        // other, and the two rails write two different types for one event.
         postCentralTxn(db, {
           materialId: it.material_id,
-          type: 'party_consumption',
+          type: PARTY_TRANSFER_TYPE,
           quantity: -issued,
           referenceId: requisitionId,
           notes: partyNote,
@@ -210,11 +225,13 @@ export function fulfilRequisitionFromPo(
  *   1. requisitions: store_processed → fulfilled, stamping fulfilled_at and
  *      fulfilled_by = 'po-received-cascade'.
  *   2. purpose='party' ONLY: per non-rejected line, current_stock -= issued and
- *      an inventory_transactions row (type 'party_consumption', quantity
+ *      an inventory_transactions row (type 'party_issue' — 'party_consumption'
+ *      on rows written before 2026-09-17, which is why every predicate in this
+ *      file matches both — quantity
  *      = −issued, reference_id = the requisition).
  *
  * ── THE PROVENANCE TRAP, WHICH IS THE REAL HAZARD HERE ────────────────────
- * TWO writers produce an IDENTICALLY SHAPED party_consumption row keyed on the
+ * TWO writers produce an IDENTICALLY SHAPED party transfer row keyed on the
  * same reference_id: this cascade, and applyPartyFulfillment()
  * (src/lib/party-fulfillment.ts, called from store-issue and store-process).
  * Same type, same reference_id, same negative quantity, same
@@ -282,7 +299,7 @@ export interface RequisitionUndoPlan {
    *  cascade fulfilled the requisition but deducted nothing, so only the
    *  fulfilment is undone. */
   reverseParty: boolean;
-  /** The party_consumption rows about to be deleted — verbatim, the only copy.
+  /** The party transfer rows about to be deleted — verbatim, the only copy.
    *  EMPTY when reverseParty is false, even where rows exist on the ledger. */
   partyRows: any[];
   /** Party movements deliberately LEFT STANDING because another rail booked
@@ -364,10 +381,22 @@ export function planRequisitionUndoFromPo(
       { requisition_id: requisitionId }, 'requisition_missing');
   }
 
+  // BOTH NAMES, and this one is load-bearing in a way the guards are not: this
+  // SELECT is the ONLY thing that finds the movements a void must credit back
+  // and delete. If it misses the renamed rows it returns [], so
+  //   · the 'party_unattributable' refusal (below) never fires,
+  //   · the 'party_two_rails' refusal never fires,
+  //   · `credit` is empty and reverseRequisitionFulfilFromPo's
+  //     `plan.partyRows.length > 0` arm is skipped,
+  // and the void then DEMOTES THE REQUISITION WHILE LEAVING THE DEDUCTION
+  // STANDING AND UNCREDITED — recording in the audit that it reversed it. Three
+  // safety gates failing OPEN and silently. Keep both names. Keep it in step
+  // with the DELETE in reverseRequisitionFulfilFromPo, which must delete
+  // exactly the set this selected.
   const partyRows = db.prepare(`
     SELECT id, material_id, quantity, reference_id, notes, outlet_id, created_at
     FROM inventory_transactions
-    WHERE reference_id = ? AND type = 'party_consumption'
+    WHERE reference_id = ? AND type IN (${PARTY_TRANSFER_TYPES_SQL})
   `).all(requisitionId) as any[];
 
   // DISCRIMINATOR 1 — the cascade's signature.
@@ -557,8 +586,14 @@ export function reverseRequisitionFulfilFromPo(
         quantity: r6(qty),
       });
     }
+    // THE SAME SET THE PLAN SELECTED, BY THE SAME PREDICATE. The credit above
+    // is computed from plan.partyRows; this DELETE must remove exactly those
+    // rows. Leave this narrow while the plan's SELECT matches both names and a
+    // renamed row gets its stock credited back with the deduction row still on
+    // the ledger — stock invented out of a mismatch between two lines of SQL.
+    // Both predicates come from PARTY_TRANSFER_TYPES_SQL so they cannot drift.
     out.party_rows_deleted = db.prepare(
-      `DELETE FROM inventory_transactions WHERE reference_id = ? AND type = 'party_consumption'`
+      `DELETE FROM inventory_transactions WHERE reference_id = ? AND type IN (${PARTY_TRANSFER_TYPES_SQL})`
     ).run(plan.requisition_id).changes;
   }
 

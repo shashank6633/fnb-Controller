@@ -5,6 +5,7 @@ import {
   ALL_PAGE_PATHS,
   canAccessPage,
   canAccessPageStrict,
+  type CatalogUser,
 } from '@/lib/page-catalog';
 
 /**
@@ -73,8 +74,11 @@ const PARENTS = ALL_PAGE_PATHS
   .map(p => ({ ...p, carries: p.children.length }))
   .sort((a, b) => b.carries - a.carries || a.path.localeCompare(b.path));
 
-/** The subject of a diff, shaped exactly as canAccessPage expects a user. */
-type Subject = { role?: string; page_access?: string | null; is_head_chef?: boolean };
+/** The subject of a diff, shaped exactly as canAccessPage expects a user.
+ *  Aliased to the catalog's own type so a field added to the gates (role_name
+ *  and role_is_active were, for the Guest Feedback `greOnly` pages) cannot be
+ *  forgotten here and quietly change what the report measures. */
+type Subject = CatalogUser;
 
 /** Row shapes for the two reads below. SQLite hands back 0/1 for booleans. */
 interface UserRow {
@@ -231,6 +235,12 @@ export async function GET() {
       role: (hasRole ? row.role_base : row.role) || 'staff',
       is_head_chef: !!row.is_head_chef || (hasRole && !!row.role_head_chef),
       page_access: row.page_access != null ? row.page_access : (hasRole ? (row.role_page_access ?? null) : null),
+      // Carried so the simulation sees the Guest Feedback `greOnly` pages the
+      // way the proxy does. Both sides of the now-vs-strict diff use the same
+      // subject, so omitting it would not have produced a FALSE diff — it would
+      // have silently understated a GRE's reach in the "now" column.
+      role_name: row.role_name || null,
+      role_is_active: row.role_id ? !!row.role_is_active : null,
     };
     const source: Diff['effective_map_source'] =
       row.page_access != null ? 'user'

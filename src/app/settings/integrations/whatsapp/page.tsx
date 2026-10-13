@@ -3,11 +3,17 @@
 /**
  * Settings → Integrations → WhatsApp
  *
- * Central home for ALL current & future WhatsApp features. Four tabs:
+ * Central home for ALL current & future WhatsApp features. Five tabs:
  *   1. Configuration — provider + credentials + webhook + test ping
- *   2. Templates     — reusable message bodies with {{placeholder}} vars
+ *   2. Templates     — the TEMPLATE STUDIO: author a Meta template (header /
+ *                      body / footer / buttons, positional variables with
+ *                      example values, a live guest-eye preview), submit it for
+ *                      approval, and track its status — plus the plain local
+ *                      free-form bodies that were always here.
+ *                      (src/components/whatsapp/TemplateStudio.tsx)
  *   3. Notifications — master + per-event toggles (live once provider is set)
- *   4. Coming soon   — automation workflows + AI features roadmap
+ *   4. Broadcasts    — the campaign engine's delivery + safety knobs
+ *   5. Coming soon   — automation workflows + AI features roadmap
  *
  * No live Business-API traffic happens until credentials are configured —
  * the Test button returns a clean "not configured" until then. The existing
@@ -16,14 +22,15 @@
  * Admin-only (client gate here + requireRole('admin') on every API).
  */
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useState } from 'react';
 import {
   MessageCircle, Save, Loader2, CheckCircle2, AlertTriangle, Send, Copy,
-  Plus, Pencil, Trash2, Eye, Bell, Sparkles, Settings2, LayoutTemplate,
+  Bell, Sparkles, Settings2, LayoutTemplate,
   ArrowLeft, Bot, Workflow, Megaphone,
 } from 'lucide-react';
 import { api } from '@/lib/api';
 import PhoneField from '@/components/PhoneField';
+import TemplateStudio from '@/components/whatsapp/TemplateStudio';
 
 type Tab = 'config' | 'templates' | 'notifications' | 'broadcasts' | 'soon';
 
@@ -43,39 +50,22 @@ interface WaConfigDto {
   recipients: Record<string, string[]>;
 }
 
-interface WaTemplate {
-  id: string; name: string; category: string; language: string;
-  body: string; is_active: number; created_at: string; updated_at: string;
-  // Provider approved-template routing (added for template-send path)
-  send_as_template?: number;
-  provider_template_name?: string;
-  provider_language?: string;
-  param_order?: string; // JSON array of var names, in {{1}},{{2}}… order
-}
-
 /**
- * Positional {{1}},{{2}}… var order per built-in notify event — mirrors
- * WA_EVENT_PARAM_ORDER in lib/whatsapp.ts. Used only to hint the default
- * "Parameter order" when a template's provider name matches a known event.
+ * THE SERVER BROKE AND DID NOT SAY WHY.
+ *
+ * Every call on this page reads `j.error` first — the API's own plain sentence.
+ * This is only the fallback for a response with no readable error at all, where
+ * the screen used to show the literal words "HTTP 500". The status code belongs in
+ * the console, not in front of a restaurant owner.
+ *
+ * It does not claim "nothing was saved": the same fallback covers saving
+ * credentials, rotating the app secret AND firing a test message to a real phone,
+ * and this page is not in a position to know which of those landed.
  */
-const WA_EVENT_PARAM_ORDER: Record<string, string[]> = {
-  requisition_approved: ['req_number', 'department', 'approved_by'],
-  discount_decided:     ['order', 'pct', 'decision', 'decided_by'],
-  low_stock_daily:      ['date', 'count', 'summary'],
-  digest_daily:         ['date', 'content'],
-  calls_daily:          ['date', 'calls', 'answered', 'answered_pct', 'missed', 'bookings', 'pending', 'peak', 'agents'],
-};
-
-/** Client-side mirror of lib/whatsapp renderTemplate() for the live preview. */
-function renderPreview(body: string, vars: Record<string, string>): string {
-  return String(body ?? '').replace(/\{\{\s*([\w.]+)\s*\}\}/g, (whole, key: string) =>
-    Object.prototype.hasOwnProperty.call(vars, key) ? String(vars[key]) : whole);
+function serverTrouble(status: number, what: string): string {
+  console.error(`[WhatsApp settings] ${what} failed with HTTP ${status}`);
+  return 'Something went wrong at our end. Reload this page to see where things stand, then try again.';
 }
-
-const SAMPLE_VARS: Record<string, string> = {
-  name: 'Shashank', guest_name: 'Shashank', amount: '1,250', date: new Date().toLocaleDateString('en-IN'),
-  outlet: 'AKAN', item: 'Paneer Tikka', status: 'Approved', table: 'T-12', points: '48',
-};
 
 const NOTIFY_EVENTS: { key: string; label: string; hint: string }[] = [
   { key: 'requisition_approved', label: 'Requisition approved', hint: 'Ping the raising department when HOD/Mgmt approves their requisition.' },
@@ -150,7 +140,7 @@ export default function WhatsAppIntegrationPage() {
       </div>
 
       {tab === 'config' && <ConfigTab cfg={cfg} reload={loadCfg} onError={setError} onOk={setOkMsg} />}
-      {tab === 'templates' && <TemplatesTab onError={setError} onOk={setOkMsg} />}
+      {tab === 'templates' && <TemplateStudio onError={setError} onOk={setOkMsg} />}
       {tab === 'notifications' && <NotificationsTab cfg={cfg} reload={loadCfg} onError={setError} onOk={setOkMsg} />}
       {tab === 'broadcasts' && <BroadcastsTab onError={setError} onOk={setOkMsg} />}
       {tab === 'soon' && <ComingSoonTab />}
@@ -210,6 +200,66 @@ function ConfigTab({ cfg, reload, onError, onOk }: {
   const [webhookUrl, setWebhookUrl] = useState('/api/whatsapp/webhook');
   useEffect(() => { setWebhookUrl(`${window.location.origin}/api/whatsapp/webhook`); }, []);
 
+  /**
+   * IS THE WEBHOOK ADDRESS PROTECTED?
+   *
+   * The webhook URL has to be reachable without a login, so the only thing that
+   * separates Meta from a stranger is the signature Meta puts on every request.
+   * Without the app secret that signature cannot be checked, and invented guest
+   * messages and delivery reports would be stored as real. That is not something
+   * to leave silent on the one screen where this integration is set up.
+   */
+  const [webhookSec, setWebhookSec] = useState<
+    {
+      signature_enforced: boolean; source: string; headline: string; detail: string;
+      can_set_here?: boolean; warn?: boolean; last_verified_at?: string;
+    } | null
+  >(null);
+  useEffect(() => {
+    fetch('/api/whatsapp/templates/sync')
+      .then(r => r.json())
+      .then(d => { if (d?.webhook_security) setWebhookSec(d.webhook_security); })
+      .catch(() => {});
+  }, []);
+
+  /**
+   * THE APP SECRET IS TYPED HERE, and that is the whole point of this field.
+   *
+   * The signature check itself shipped correct and DORMANT: the secret could only
+   * come from a server environment variable, none was set, and nothing in the app
+   * could write one — so the forgery hole the check exists to close stayed wide
+   * open after the deploy that "closed" it. A control nobody can switch on is not
+   * a control. Saved write-only through its own admin route; it is never read back
+   * to this screen, and the server environment still wins over it.
+   */
+  const [appSecret, setAppSecret] = useState('');
+  const [secretBusy, setSecretBusy] = useState(false);
+
+  const saveAppSecret = async () => {
+    setSecretBusy(true); onError(null); onOk(null);
+    try {
+      const r = await api('/api/whatsapp/templates/sync/webhook-secret', {
+        method: 'POST', body: { secret: appSecret.trim() },
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) { onError(j.error || serverTrouble(r.status, 'saving the app secret')); return; }
+      setAppSecret('');
+      if (j?.webhook_security) setWebhookSec(j.webhook_security);
+      onOk(`✓ ${j.note || 'App secret saved.'}`);
+    } finally { setSecretBusy(false); }
+  };
+
+  const removeAppSecret = async () => {
+    setSecretBusy(true); onError(null); onOk(null);
+    try {
+      const r = await api('/api/whatsapp/templates/sync/webhook-secret?confirm=1', { method: 'DELETE' });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) { onError(j.error || serverTrouble(r.status, 'removing the app secret')); return; }
+      if (j?.webhook_security) setWebhookSec(j.webhook_security);
+      onOk(`✓ ${j.note || 'App secret removed.'}`);
+    } finally { setSecretBusy(false); }
+  };
+
   const save = async () => {
     setBusy(true); onError(null); onOk(null);
     try {
@@ -229,7 +279,7 @@ function ConfigTab({ cfg, reload, onError, onOk }: {
         },
       });
       const j = await r.json().catch(() => ({}));
-      if (!r.ok) { onError(j.error || `HTTP ${r.status}`); return; }
+      if (!r.ok) { onError(j.error || serverTrouble(r.status, 'saving the WhatsApp configuration')); return; }
       setToken(''); setVerifyToken(''); setInteraktKey('');
       onOk('✓ WhatsApp configuration saved.');
       reload();
@@ -241,7 +291,7 @@ function ConfigTab({ cfg, reload, onError, onOk }: {
     try {
       const r = await api('/api/whatsapp/config', { method: 'POST', body: { action: 'test', to: testTo } });
       const j = await r.json().catch(() => ({}));
-      if (!r.ok) { onError(j.error || `HTTP ${r.status}`); return; }
+      if (!r.ok) { onError(j.error || serverTrouble(r.status, 'the test message')); return; }
       setTestResult(j.result);
       if (j.result?.ok) onOk('✓ Test message sent — check the phone.');
     } finally { setBusy(false); }
@@ -262,7 +312,7 @@ function ConfigTab({ cfg, reload, onError, onOk }: {
         },
       });
       const j = await r.json().catch(() => ({}));
-      if (!r.ok) { onError(j.error || `HTTP ${r.status}`); return; }
+      if (!r.ok) { onError(j.error || serverTrouble(r.status, 'the test template')); return; }
       setTplResult(j.result);
       if (j.result?.ok) onOk('✓ Test template accepted — check the phone.');
     } finally { setTplBusy(false); }
@@ -382,7 +432,55 @@ function ConfigTab({ cfg, reload, onError, onOk }: {
                 </button>
               </div>
             </div>
+
           </>
+        )}
+
+        {/* ── WEBHOOK AUTHENTICITY ──────────────────────────────────────────
+            OUTSIDE the Meta-only block on purpose. The webhook address is public
+            and this app ingests whatever reaches it regardless of which provider
+            is selected, so hiding this while the provider is set to Interakt hid
+            the warning without closing the hole. */}
+        {webhookSec && (
+          <div className={`text-[11px] rounded p-2 border space-y-2 ${
+            !webhookSec.signature_enforced
+              ? 'bg-red-50 border-red-200 text-red-800'
+              : webhookSec.warn
+                ? 'bg-amber-50 border-amber-200 text-amber-900'
+                : 'bg-emerald-50 border-emerald-200 text-emerald-900'}`}>
+            <div>
+              {webhookSec.signature_enforced && !webhookSec.warn
+                ? <CheckCircle2 size={11} className="inline mr-1" />
+                : <AlertTriangle size={11} className="inline mr-1" />}
+              <b>{webhookSec.headline}.</b> {webhookSec.detail}
+            </div>
+
+            {webhookSec.can_set_here === false ? (
+              <div className="text-[10px] opacity-80">
+                The secret comes from the server environment, so it cannot be changed from this screen.
+              </div>
+            ) : (
+              <div className="flex items-end gap-2 flex-wrap">
+                <label className="block text-[11px] flex-1 min-w-[220px]">
+                  {webhookSec.signature_enforced ? 'Replace the app secret' : 'App secret'}
+                  <input type="password" value={appSecret} onChange={e => setAppSecret(e.target.value)}
+                         placeholder="Meta App Dashboard → Settings → Basic → App secret"
+                         className="mt-1 w-full px-3 py-2 border border-[#D4B896] rounded bg-[#FFF1E3] text-sm font-mono" />
+                </label>
+                <button onClick={saveAppSecret} disabled={secretBusy || !appSecret.trim()}
+                        className="inline-flex items-center gap-1.5 px-3 py-2 bg-[#af4408] hover:bg-[#933807] text-white text-xs rounded disabled:opacity-50">
+                  {secretBusy ? <Loader2 size={12} className="animate-spin" /> : <Save size={12} />} Save app secret
+                </button>
+                {webhookSec.signature_enforced && (
+                  <button onClick={removeAppSecret} disabled={secretBusy}
+                          className="px-3 py-2 border border-[#D4B896] rounded text-xs text-[#6B5744] hover:bg-[#FFF1E3] disabled:opacity-50"
+                          title="Switches signature checking off — forged WhatsApp events would be accepted again">
+                    Remove
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
         )}
 
         <button onClick={save} disabled={busy}
@@ -438,7 +536,7 @@ function ConfigTab({ cfg, reload, onError, onOk }: {
         <p className="text-xs text-[#8B7355]">
           Fires a provider-approved template — works anytime (no 24 h window). The name & language
           must match a template already approved on {isMeta ? 'Meta' : isInterakt ? 'Interakt' : 'the configured provider'}.
-          Parameters map to <code className="bg-[#FFF1E3] px-1 rounded">{'{{1}},{{2}}…'}</code> in body order.
+          The values you type below fill <code className="bg-[#FFF1E3] px-1 rounded">{'{{1}},{{2}}…'}</code> in the order they appear in the message.
         </p>
         <div className="grid sm:grid-cols-2 gap-2">
           <PhoneField value={tplTo} onChange={setTplTo} placeholder="mobile number"
@@ -450,8 +548,8 @@ function ConfigTab({ cfg, reload, onError, onOk }: {
           <input value={tplLang} onChange={e => setTplLang(e.target.value)} placeholder="Language e.g. en_US (Meta) / en (Interakt)"
                  aria-label="Template language code"
                  className="px-3 py-2 border border-[#D4B896] rounded bg-[#FFF1E3] text-sm" />
-          <input value={tplParams} onChange={e => setTplParams(e.target.value)} placeholder="Params, comma-separated (v1, v2, …)"
-                 aria-label="Template parameters, comma-separated"
+          <input value={tplParams} onChange={e => setTplParams(e.target.value)} placeholder="Values to fill in, separated by commas"
+                 aria-label="Values to fill into the message, separated by commas"
                  className="px-3 py-2 border border-[#D4B896] rounded bg-[#FFF1E3] text-sm" />
         </div>
         <button onClick={testTemplate} disabled={tplBusy || !tplTo.trim() || !tplName.trim()}
@@ -511,256 +609,6 @@ function ConfigTab({ cfg, reload, onError, onOk }: {
   );
 }
 
-/* ───────────────────────── Templates ───────────────────────── */
-
-const CATEGORY_BADGE: Record<string, string> = {
-  notification: 'bg-sky-100 text-sky-800 border-sky-300',
-  marketing:    'bg-fuchsia-100 text-fuchsia-800 border-fuchsia-300',
-  approval:     'bg-emerald-100 text-emerald-800 border-emerald-300',
-  general:      'bg-stone-100 text-stone-700 border-stone-300',
-};
-
-function TemplatesTab({ onError, onOk }: { onError: (m: string | null) => void; onOk: (m: string | null) => void }) {
-  const [templates, setTemplates] = useState<WaTemplate[]>([]);
-  const [busy, setBusy] = useState(false);
-  const [editing, setEditing] = useState<Partial<WaTemplate> | null>(null); // null = closed, {} = new
-  const [previewId, setPreviewId] = useState<string | null>(null);
-
-  const reload = () =>
-    fetch('/api/whatsapp/templates').then(r => r.json()).then(d => setTemplates(d.templates || [])).catch(() => {});
-  useEffect(() => { reload(); }, []);
-
-  const save = async () => {
-    if (!editing) return;
-    setBusy(true); onError(null); onOk(null);
-    try {
-      const isNew = !editing.id;
-      const r = await api('/api/whatsapp/templates', {
-        method: isNew ? 'POST' : 'PUT',
-        body: {
-          id: editing.id, name: editing.name, category: editing.category || 'general',
-          language: editing.language || 'en', body: editing.body,
-          is_active: editing.is_active !== 0,
-          send_as_template: editing.send_as_template ? 1 : 0,
-          provider_template_name: (editing.provider_template_name || '').trim(),
-          provider_language: (editing.provider_language || '').trim(),
-          param_order: (editing.param_order || '').trim(),
-        },
-      });
-      const j = await r.json().catch(() => ({}));
-      if (!r.ok) { onError(j.error || `HTTP ${r.status}`); return; }
-      onOk(isNew ? '✓ Template created.' : '✓ Template updated.');
-      setEditing(null);
-      reload();
-    } finally { setBusy(false); }
-  };
-
-  const toggleActive = async (t: WaTemplate) => {
-    setBusy(true); onError(null);
-    try {
-      const r = await api('/api/whatsapp/templates', { method: 'PUT', body: { id: t.id, is_active: !t.is_active } });
-      if (!r.ok) { const j = await r.json().catch(() => ({})); onError(j.error || `HTTP ${r.status}`); return; }
-      reload();
-    } finally { setBusy(false); }
-  };
-
-  const del = async (t: WaTemplate) => {
-    if (!window.confirm(`Delete template "${t.name}"?`)) return;
-    setBusy(true); onError(null);
-    try {
-      const r = await api(`/api/whatsapp/templates?id=${encodeURIComponent(t.id)}`, { method: 'DELETE' });
-      if (!r.ok) { const j = await r.json().catch(() => ({})); onError(j.error || `HTTP ${r.status}`); return; }
-      onOk('✓ Template deleted.');
-      reload();
-    } finally { setBusy(false); }
-  };
-
-  const previewText = useMemo(() => {
-    if (!editing?.body) return '';
-    return renderPreview(editing.body, SAMPLE_VARS);
-  }, [editing?.body]);
-
-  // If the template's provider name (or its own name) matches a built-in notify
-  // event, surface that event's positional var order as a hint.
-  const paramHintEvent = useMemo(() => {
-    const cand = (editing?.provider_template_name || editing?.name || '').trim();
-    return cand && WA_EVENT_PARAM_ORDER[cand] ? cand : '';
-  }, [editing?.provider_template_name, editing?.name]);
-  const paramHint = paramHintEvent ? WA_EVENT_PARAM_ORDER[paramHintEvent].join(', ') : '';
-
-  return (
-    <div className="space-y-4">
-      <div className="bg-white border border-[#E8D5C4] rounded-xl p-4 space-y-3">
-        <div className="flex items-center gap-2">
-          <h2 className="text-sm font-semibold text-[#2D1B0E]">Message templates</h2>
-          <button onClick={() => setEditing({ category: 'general', language: 'en', is_active: 1 })}
-                  className="ml-auto inline-flex items-center gap-1 px-2.5 py-1 bg-[#af4408] hover:bg-[#933807] text-white text-xs rounded">
-            <Plus size={12} /> New template
-          </button>
-        </div>
-        <p className="text-xs text-[#8B7355]">
-          Reusable bodies with <code className="bg-[#FFF1E3] px-1 rounded">{'{{placeholders}}'}</code> —
-          e.g. <code className="bg-[#FFF1E3] px-1 rounded">{'Hi {{name}}, your bill of ₹{{amount}} is settled.'}</code>{' '}
-          Placeholders are filled at send time.
-        </p>
-
-        {templates.length === 0 && !editing && (
-          <div className="text-xs text-[#8B7355] bg-[#FFF8F0] border border-dashed border-[#D4B896] rounded p-4 text-center">
-            No templates yet. Create the first one — they'll be ready the moment the provider goes live.
-          </div>
-        )}
-
-        <div className="space-y-2">
-          {templates.map(t => (
-            <div key={t.id} className="border border-[#E8D5C4] rounded-lg p-2.5 space-y-1.5">
-              <div className="flex items-center gap-2 flex-wrap">
-                <span className="text-sm font-medium text-[#2D1B0E]">{t.name}</span>
-                <span className={`text-[10px] px-1.5 py-0.5 rounded-full border ${CATEGORY_BADGE[t.category] || CATEGORY_BADGE.general}`}>{t.category}</span>
-                <span className="text-[10px] text-[#8B7355] uppercase">{t.language}</span>
-                {!!t.send_as_template && !!(t.provider_template_name || '').trim() && (
-                  <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-emerald-100 text-emerald-800 border border-emerald-300 inline-flex items-center gap-1" title={`Provider template: ${t.provider_template_name}`}>
-                    <Send size={9} /> template
-                  </span>
-                )}
-                <div className="ml-auto flex items-center gap-1.5">
-                  <label className="inline-flex items-center gap-1 text-[10px] text-[#6B5744] cursor-pointer">
-                    <input type="checkbox" checked={!!t.is_active} onChange={() => toggleActive(t)} disabled={busy} />
-                    active
-                  </label>
-                  <button onClick={() => setPreviewId(previewId === t.id ? null : t.id)} title="Preview"
-                          className="p-1 text-[#6B5744] hover:text-[#2D1B0E]"><Eye size={13} /></button>
-                  <button onClick={() => setEditing({ ...t })} title="Edit"
-                          className="p-1 text-[#6B5744] hover:text-[#2D1B0E]"><Pencil size={13} /></button>
-                  <button onClick={() => del(t)} title="Delete"
-                          className="p-1 text-red-500 hover:text-red-700"><Trash2 size={13} /></button>
-                </div>
-              </div>
-              <div className="text-[11px] text-[#6B5744] whitespace-pre-wrap break-words">{t.body}</div>
-              {previewId === t.id && (
-                <div className="text-[11px] bg-emerald-50 border border-emerald-200 rounded p-2 whitespace-pre-wrap break-words">
-                  <div className="text-[9px] uppercase tracking-wide text-emerald-700 mb-1">Preview with sample values</div>
-                  {renderPreview(t.body, SAMPLE_VARS)}
-                </div>
-              )}
-            </div>
-          ))}
-        </div>
-      </div>
-
-      {editing && (
-        <div className="bg-white border border-[#af4408]/40 rounded-xl p-4 space-y-3">
-          <h3 className="text-sm font-semibold text-[#2D1B0E]">{editing.id ? 'Edit template' : 'New template'}</h3>
-          <div className="grid sm:grid-cols-3 gap-3">
-            <label className="block text-xs text-[#6B5744] sm:col-span-1">
-              Name
-              <input value={editing.name || ''} onChange={e => setEditing({ ...editing, name: e.target.value })}
-                     placeholder="e.g. bill_settled_thanks"
-                     className="mt-1 w-full px-3 py-2 border border-[#D4B896] rounded bg-[#FFF1E3] text-sm" />
-            </label>
-            <label className="block text-xs text-[#6B5744]">
-              Category
-              <select value={editing.category || 'general'} onChange={e => setEditing({ ...editing, category: e.target.value })}
-                      className="mt-1 w-full px-3 py-2 border border-[#D4B896] rounded bg-[#FFF1E3] text-sm">
-                <option value="notification">notification</option>
-                <option value="marketing">marketing</option>
-                <option value="approval">approval</option>
-                <option value="general">general</option>
-              </select>
-            </label>
-            <label className="block text-xs text-[#6B5744]">
-              Language
-              <input value={editing.language || 'en'} onChange={e => setEditing({ ...editing, language: e.target.value })}
-                     placeholder="en / te / hi"
-                     className="mt-1 w-full px-3 py-2 border border-[#D4B896] rounded bg-[#FFF1E3] text-sm" />
-            </label>
-          </div>
-          <label className="block text-xs text-[#6B5744]">
-            Body — use <code className="bg-[#FFF1E3] px-1 rounded">{'{{name}}'}</code>-style placeholders
-            <textarea value={editing.body || ''} onChange={e => setEditing({ ...editing, body: e.target.value })} rows={4}
-                      placeholder={'Hi {{name}}, thanks for dining at {{outlet}}! Your bill of ₹{{amount}} is settled.'}
-                      className="mt-1 w-full px-3 py-2 border border-[#D4B896] rounded bg-[#FFF1E3] text-sm font-mono" />
-          </label>
-          {previewText && (
-            <div className="text-[11px] bg-emerald-50 border border-emerald-200 rounded p-2 whitespace-pre-wrap break-words">
-              <div className="text-[9px] uppercase tracking-wide text-emerald-700 mb-1">Live preview (sample values)</div>
-              {previewText}
-            </div>
-          )}
-
-          {/* Provider approved-template routing — needed to deliver outside the 24h window / for Interakt. */}
-          <div className="border-t border-[#E8D5C4] pt-3 space-y-3">
-            <label className="flex items-start gap-2 cursor-pointer text-xs text-[#6B5744]">
-              <input type="checkbox" checked={!!editing.send_as_template}
-                     onChange={e => setEditing({ ...editing, send_as_template: e.target.checked ? 1 : 0 })} className="mt-0.5" />
-              <span>
-                <span className="font-medium text-[#2D1B0E]">Send as approved template</span>
-                <span className="block text-[10px] text-[#8B7355] mt-0.5">
-                  Routes through the provider's approved-template API (delivers anytime; required for Interakt).
-                  When off, the plain body above is sent as free-form text (Meta 24 h window only).
-                </span>
-              </span>
-            </label>
-
-            {!!editing.send_as_template && (
-              <div className="space-y-3 pl-6">
-                <div className="grid sm:grid-cols-2 gap-3">
-                  <label className="block text-xs text-[#6B5744]">
-                    Provider template name
-                    <input value={editing.provider_template_name || ''}
-                           onChange={e => setEditing({ ...editing, provider_template_name: e.target.value })}
-                           placeholder="exact name approved on Meta / Interakt"
-                           className={`mt-1 w-full px-3 py-2 border rounded bg-[#FFF1E3] text-sm font-mono ${(editing.provider_template_name || '').trim() ? 'border-[#D4B896]' : 'border-red-400'}`} />
-                    {!(editing.provider_template_name || '').trim() && (
-                      <span className="block text-[10px] text-red-600 mt-1">
-                        Required when “Send as approved template” is on — without it the row falls back to free-form text and never delivers as a template.
-                      </span>
-                    )}
-                  </label>
-                  <label className="block text-xs text-[#6B5744]">
-                    Provider language
-                    <input value={editing.provider_language || ''}
-                           onChange={e => setEditing({ ...editing, provider_language: e.target.value })}
-                           placeholder="en_US (Meta) / en (Interakt)"
-                           className="mt-1 w-full px-3 py-2 border border-[#D4B896] rounded bg-[#FFF1E3] text-sm font-mono" />
-                  </label>
-                </div>
-                <label className="block text-xs text-[#6B5744]">
-                  Parameter order — variable names in <code className="bg-[#FFF1E3] px-1 rounded">{'{{1}},{{2}}…'}</code> order (comma-separated or JSON array)
-                  <input value={editing.param_order || ''}
-                         onChange={e => setEditing({ ...editing, param_order: e.target.value })}
-                         placeholder="e.g. req_number, department, approved_by"
-                         className="mt-1 w-full px-3 py-2 border border-[#D4B896] rounded bg-[#FFF1E3] text-sm font-mono" />
-                  {paramHint && (
-                    <span className="block text-[10px] text-[#8B7355] mt-1">
-                      Default order for “{paramHintEvent}”: <code className="bg-[#FFF1E3] px-1 rounded">{paramHint}</code>
-                      {' '}— leave blank to use it.
-                    </span>
-                  )}
-                </label>
-              </div>
-            )}
-          </div>
-
-          <div className="flex items-center gap-2">
-            <label className="inline-flex items-center gap-1.5 text-xs text-[#6B5744] cursor-pointer">
-              <input type="checkbox" checked={editing.is_active !== 0}
-                     onChange={e => setEditing({ ...editing, is_active: e.target.checked ? 1 : 0 })} />
-              Active
-            </label>
-            <div className="ml-auto flex items-center gap-2">
-              <button onClick={() => setEditing(null)} className="text-xs text-[#6B5744]">Cancel</button>
-              <button onClick={save} disabled={busy || !(editing.name || '').trim() || !(editing.body || '').trim() || (!!editing.send_as_template && !(editing.provider_template_name || '').trim())}
-                      className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-[#af4408] hover:bg-[#933807] text-white text-sm rounded disabled:opacity-50">
-                {busy ? <Loader2 size={12} className="animate-spin" /> : <Save size={12} />} Save template
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
 /* ───────────────────────── Notifications ───────────────────────── */
 
 function NotificationsTab({ cfg, reload, onError, onOk }: {
@@ -800,7 +648,7 @@ function NotificationsTab({ cfg, reload, onError, onOk }: {
         },
       });
       const j = await r.json().catch(() => ({}));
-      if (!r.ok) { onError(j.error || `HTTP ${r.status}`); return; }
+      if (!r.ok) { onError(j.error || serverTrouble(r.status, 'saving the notification preferences')); return; }
       onOk('✓ Notification preferences saved.');
       reload();
     } finally { setBusy(false); }
@@ -935,7 +783,7 @@ function BroadcastsTab({ onError, onOk }: {
       try {
         const r = await fetch('/api/crm-calls/broadcasts/settings');
         const j = await r.json().catch(() => ({}));
-        if (!r.ok) { onError(j.error || `HTTP ${r.status}`); return; }
+        if (!r.ok) { onError(j.error || serverTrouble(r.status, 'loading the broadcast settings')); return; }
         const s: BroadcastSettingsDto = j.settings;
         setEnabled(!!s.enabled);
         setMsgsPerMin(s.msgs_per_min);
@@ -969,7 +817,7 @@ function BroadcastsTab({ onError, onOk }: {
         },
       });
       const j = await r.json().catch(() => ({}));
-      if (!r.ok) { onError(j.error || `HTTP ${r.status}`); return; }
+      if (!r.ok) { onError(j.error || serverTrouble(r.status, 'saving the broadcast settings')); return; }
       onOk('✓ Broadcast settings saved.');
       if (j.settings) {
         setMsgsPerMin(j.settings.msgs_per_min);

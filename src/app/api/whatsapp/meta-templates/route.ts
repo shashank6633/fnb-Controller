@@ -1,5 +1,6 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import { requireRole } from '@/lib/auth';
-import { getWaConfigRaw } from '@/lib/whatsapp';
+import { getWaConfigRaw, META_GRAPH_VERSION } from '@/lib/whatsapp';
 
 /**
  * Meta approved-template listing (admin only) — powers the template-name
@@ -17,7 +18,10 @@ import { getWaConfigRaw } from '@/lib/whatsapp';
  */
 export const dynamic = 'force-dynamic';
 
-const META_GRAPH_VERSION = 'v23.0';
+// META_GRAPH_VERSION is IMPORTED, not redeclared. This file used to carry its
+// own private copy of the version string, so bumping the shared one in
+// lib/whatsapp.ts left this listing pinned to a stale version — exactly the
+// failure mode that broke every call when v19 expired on 2026-05-21.
 
 export async function GET() {
   try {

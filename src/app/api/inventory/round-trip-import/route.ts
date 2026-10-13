@@ -47,6 +47,12 @@ const FIELD_TYPES: Record<string, 'string' | 'number' | 'bool'> = {
   closing_cadence: 'string', storage_location: 'string',
   shelf_life_days: 'number',
   is_recipe_item: 'bool', is_direct_sell: 'bool', is_semifinished: 'bool',
+  // Butchering role flags — tagged by hand on the master / bulk editor.
+  // A CSV exported BEFORE these columns existed has no such header, so `f in r`
+  // is false and the field is skipped: an old sheet re-uploaded later leaves both
+  // flags exactly as they were. The export blanks them when 0 (BLANK_WHEN_ZERO)
+  // so a stale sheet cannot mass-untag either; typing a literal 0 still untags.
+  is_butchering_source: 'bool', is_butchering_output: 'bool',
 };
 const WRITABLE_FIELDS = Object.keys(FIELD_TYPES);
 
@@ -227,11 +233,14 @@ export async function POST(request: Request) {
               reorder_level, priority, costing_method, average_price, super_category, brand,
               yield_percent, tax_percent, cess_percent, standard_purchase_rate,
               closing_cadence, is_recipe_item, is_direct_sell, is_semifinished,
+              is_butchering_source, is_butchering_output,
               storage_location, shelf_life_days, is_active, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, 1, datetime('now'), datetime('now'))
+                    ?, ?, ?, ?,
+                    ?, ?,
+                    ?, ?, 1, datetime('now'), datetime('now'))
           `).run(
             newId, sku, name,
             coerce('category', r.category) ?? 'other',
@@ -253,6 +262,11 @@ export async function POST(request: Request) {
             coerce('is_recipe_item', r.is_recipe_item) ?? 0,
             coerce('is_direct_sell', r.is_direct_sell) ?? 0,
             coerce('is_semifinished', r.is_semifinished) ?? 0,
+            // Positional INSERT — these two must stay in step with the column list
+            // above. A COUNT mismatch throws loudly; a WRONG ORDER at the right
+            // count corrupts silently, so keep them adjacent to their names.
+            coerce('is_butchering_source', r.is_butchering_source) ?? 0,
+            coerce('is_butchering_output', r.is_butchering_output) ?? 0,
             coerce('storage_location', r.storage_location) ?? '',
             coerce('shelf_life_days', r.shelf_life_days) ?? 0,
           );

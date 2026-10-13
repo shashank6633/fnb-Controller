@@ -48,7 +48,15 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
       businessName: get('business_name') || 'Restaurant',
       gstin: get('gstin') || '',
       printedBy: me.name || me.email || '',
-      duplicate: order.status === 'settled',
+      // A HELD BILL IS A REPRINT TOO. 'on_hold' means the bill was finalised and
+      // presented — hold froze the totals and the POS refuses to add another
+      // item to it — so anything pulled from this endpoint afterwards is a copy,
+      // including the "Download / reprint" on a Bills-on-Hold record. Left as
+      // `=== 'settled'` it came off the printer as an unmarked ORIGINAL, which
+      // is the exact defect this project has already shipped once (see
+      // project_fnb_print_topology). Over-marking a first copy is cosmetic;
+      // under-marking a second original is not.
+      duplicate: order.status === 'settled' || order.status === 'on_hold',
       payments,
     });
 

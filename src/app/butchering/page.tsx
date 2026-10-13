@@ -43,7 +43,19 @@ const wtFactor = (from?: string | null, to?: string | null): number | null => {
 };
 const today = () => new Date().toISOString().slice(0, 10);
 
-interface Material { id: string; name: string; sku?: string; unit?: string; average_price?: number; category?: string }
+interface Material {
+  id: string; name: string; sku?: string; unit?: string; average_price?: number; category?: string;
+  /** Owner's manual tags (raw_materials.is_butchering_source / _output, set on
+   *  Inventory → Raw Materials). They arrive free on /api/inventory because that
+   *  route is `SELECT rm.*`. 0/1 from SQLite; read through Number() so a "1"
+   *  string from a CSV round-trip counts too. Optional so an older payload (or a
+   *  server that has not migrated yet) simply reads as untagged instead of
+   *  crashing the picker. */
+  is_butchering_source?: number | string | null;
+  is_butchering_output?: number | string | null;
+}
+/** TRUE only for an explicit tag. Anything absent/null/0 is "not tagged", never "maybe". */
+const isTagged = (v: unknown) => Number(v) === 1;
 interface Batch {
   id: string; batch_id: string; source_material_id: string; source_material_name: string;
   source_material_unit?: string;
@@ -212,6 +224,7 @@ export default function ButcheringPage() {
           onSeeded={reloadMaterials}
           onClose={() => setShowNew(false)}
           onCreated={(id) => { setShowNew(false); setOpenBatchId(id); reload(); }}
+          onSaved={() => reload()}
         />
       )}
       {openBatchId && (
@@ -227,11 +240,13 @@ export default function ButcheringPage() {
 
 /* ──────────────── New Batch Modal ──────────────── */
 
-function NewBatchModal({ materials, onSeeded, onClose, onCreated }: {
+function NewBatchModal({ materials, onSeeded, onClose, onCreated, onSaved }: {
   materials: Material[];
   onSeeded: () => void;
   onClose: () => void;
   onCreated: (id: string) => void;
+  /** Save-and-continue: refresh the list behind the modal without closing it. */
+  onSaved: (id: string) => void;
 }) {
   const [batchId, setBatchId] = useState('');
   const [sourceId, setSourceId] = useState('');
@@ -244,22 +259,67 @@ function NewBatchModal({ materials, onSeeded, onClose, onCreated }: {
   const [seeding, setSeeding] = useState(false);
   const [seedResult, setSeedResult] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [showAllSources, setShowAllSources] = useState(false);   // escape hatch for a mis-categorised carcass
+  const [showAllSources, setShowAllSources] = useState(false);   // last-resort escape hatch
+  /** Set after a save-and-continue, so the form can say which batch it just wrote. */
+  const [justSaved, setJustSaved] = useState<string | null>(null);
 
-  // A butchering source is a whole protein/carcass — not the whole 1000-item
-  // catalog. Match meat/protein categories OR a protein keyword in name/SKU.
-  // The "Show all materials" checkbox is the fallback if a carcass isn't tagged.
+  /* ── WHICH ITEMS MAY BE A SOURCE CARCASS — two tiers, on purpose ─────────
+     TIER 1 · the owner's own tag (raw_materials.is_butchering_source, ticked on
+     Inventory → Raw Materials). This is the only trustworthy answer, because a
+     tag can say pork, duck, turkey, quail or a house name — none of which any
+     keyword list will ever guess.
+
+     TIER 2 · the OLD guess, kept DELIBERATELY as a second tier. It is wrong in
+     both directions: it offered CHICKEN SEASONING POWDER 500 GM and FISH SAUCE
+     700 ML as carcasses to break down, and it could never offer pork. But on the
+     day this ships NOTHING is tagged (both columns default 0), and silently
+     emptying a dropdown that works today would be a worse bug than the one being
+     fixed. So tier 2 stays, is LABELLED as a guess so it is obvious which rows
+     still need confirming, and shrinks on its own as he tags items.
+
+     The two tiers are rendered as separate <optgroup>s — that is what makes the
+     tier visible on screen without inventing a new widget. */
+  const isTaggedSource = (m: Material) => isTagged(m.is_butchering_source);
   const MEAT_CATS = ['meat', 'mutton', 'chicken', 'poultry', 'seafood', 'fish', 'prawn', 'lamb', 'goat', 'non-veg', 'nonveg', 'non veg'];
-  const isCarcassSource = (m: Material) => {
-    const cat = String((m as any).category || '').toLowerCase().trim();
+  const looksLikeMeat = (m: Material) => {
+    const cat = String(m.category || '').toLowerCase().trim();
     if (MEAT_CATS.includes(cat)) return true;
     const hay = `${m.name || ''} ${m.sku || ''}`.toLowerCase();
     return /carcass|mutton|chicken|lamb|goat|poultry|seafood|prawn|\bmeat\b|\bfish\b/.test(hay);
   };
-  const sourceMaterials = showAllSources ? materials : materials.filter(isCarcassSource);
+  const taggedSources  = useMemo(() => materials.filter(isTaggedSource), [materials]);
+  const guessedSources = useMemo(() => materials.filter(m => !isTaggedSource(m) && looksLikeMeat(m)), [materials]);
+  const otherSources   = useMemo(() => materials.filter(m => !isTaggedSource(m) && !looksLikeMeat(m)), [materials]);
+  /**
+   * THE PROMISE THE BANNER MAKES, KEPT.
+   *
+   * While nothing is marked, the name-guesses are all he has, so they are
+   * offered and the banner explains why. The moment he marks even ONE carcass,
+   * they stop being offered — which is exactly what that banner told him would
+   * happen ("After that only those items appear here").
+   *
+   * Leaving them in was measured as the thing that makes a WORKING tag read as
+   * a broken one: he marks three carcasses, reopens, and is still offered
+   * CHICKEN SEASONING IMPPORTED and CRAB STICKS — while the sentence that
+   * explained the guesses has disappeared, because it only shows at zero.
+   *
+   * They are never hidden, only un-offered: "Show every item in the store" puts
+   * them back, one click away, which is also the escape hatch for the day he
+   * buys a carcass he has not marked yet.
+   */
+  const visibleGuesses = (taggedSources.length === 0 || showAllSources) ? guessedSources : [];
+  // Honest count: what is ACTUALLY listed right now, not "41 meat/carcass".
+  const shownSourceCount = taggedSources.length + visibleGuesses.length + (showAllSources ? otherSources.length : 0);
   // Weight fields debit the SOURCE material's stock verbatim → label with ITS
   // recipe unit ('kg' only until a source is picked).
-  const srcUnit = materials.find(m => m.id === sourceId)?.unit || 'kg';
+  const pickedSource = materials.find(m => m.id === sourceId) || null;
+  const srcUnit = pickedSource?.unit || 'kg';
+  // A source picked while "show all" was ON must not silently vanish when it is
+  // switched off: a <select> whose value matches no <option> renders BLANK while
+  // sourceId still posts. Keep it visible in its own group instead.
+  const pickedSourceListed = !!pickedSource
+    && (isTaggedSource(pickedSource) || looksLikeMeat(pickedSource) || showAllSources);
+  const optLabel = (m: Material) => `${m.sku ? `[${m.sku}] ` : ''}${m.name}${m.unit ? ` (${m.unit})` : ''}`;
 
   // Detect if the standard mutton cuts are missing — if so, surface a 1-click seed button
   const hasMuttonCarcass = materials.some(m =>
@@ -285,7 +345,24 @@ function NewBatchModal({ materials, onSeeded, onClose, onCreated }: {
     setBatchId(`${prefix}-${date}-01`);
   };
 
-  const submit = async () => {
+  /**
+   * ONE BATCH IS ONE SOURCE — the owner's ruling, 2026-09-18, after trying to
+   * add a second item and finding it replaced the first.
+   *
+   * It is not a limitation of this form: `butchering_batches` carries ONE
+   * source_material_id and ONE gross_weight, and every figure the module exists
+   * to produce is computed against them. Yield is cut ÷ gross and cost is
+   * prorated the same way, so pooling a mutton carcass with a bag of chicken
+   * legs would make 4 kg of breast read as "27% of everything" instead of "80%
+   * of the bird" — and the AKAN yield standards (leg 24-28%, shoulder 16-19%)
+   * stop being comparable to anything.
+   *
+   * So the answer to "I broke down two things this morning" is TWO BATCHES, and
+   * the job of this screen is to make that quick rather than to hide the rule:
+   * `keepGoing` saves and immediately reopens with the date, butcher, head chef
+   * and vendor carried forward, so the second batch costs one field.
+   */
+  const submit = async (keepGoing = false) => {
     if (!batchId.trim()) { setError('Batch ID required'); return; }
     if (!sourceId) { setError('Pick the source carcass material'); return; }
     if (!(Number(grossWeight) > 0)) { setError('Gross weight must be a number greater than 0'); return; }
@@ -306,7 +383,14 @@ function NewBatchModal({ materials, onSeeded, onClose, onCreated }: {
       });
       const j = await r.json().catch(() => ({}));
       if (!r.ok) { setError(j.error || `HTTP ${r.status}`); return; }
-      onCreated(j.batch.id);
+      if (!keepGoing) { onCreated(j.batch.id); return; }
+      // SAVE AND START ANOTHER. The people-and-paperwork fields stay; the ones
+      // that describe THIS carcass are cleared, because carrying a weight or a
+      // batch id forward is how two batches end up claiming the same number.
+      onSaved(j.batch.id);
+      setSourceId(''); setGrossWeight(''); setInvoiceWeight(''); setBatchId('');
+      setJustSaved(String(j.batch.batch_id || '').trim());
+      setError(null);
     } finally { setSaving(false); }
   };
 
@@ -330,20 +414,74 @@ function NewBatchModal({ materials, onSeeded, onClose, onCreated }: {
         </div>
       )}
       <div className="grid grid-cols-2 gap-3 text-sm">
-        <Field label="Source carcass *" className="col-span-2">
+        <Field label="Source carcass * — one per batch" className="col-span-2">
+          {/* SAYING IT ON THE LABEL, because the owner tried to add a second item
+              and watched it replace the first with nothing on screen admitting
+              why. One batch is one source: yield is cut ÷ gross and cost is
+              prorated the same way, so two different animals in one batch make
+              every percentage an average of unlike things. The answer is the
+              "Save & start another" button below, not a second slot here. */}
           <select value={sourceId} onChange={e => { setSourceId(e.target.value); if (!batchId) setTimeout(suggestId, 0); }}
                   className="w-full px-3 py-2 border border-[#D4B896] rounded bg-[#FFF1E3]">
             <option value="">— pick a carcass / meat item —</option>
-            {sourceMaterials.map(m => (
-              <option key={m.id} value={m.id}>
-                {m.sku ? `[${m.sku}] ` : ''}{m.name} {m.unit ? `(${m.unit})` : ''}
-              </option>
-            ))}
+            {pickedSource && !pickedSourceListed && (
+              <optgroup label="Currently selected">
+                <option value={pickedSource.id}>{optLabel(pickedSource)}</option>
+              </optgroup>
+            )}
+            {taggedSources.length > 0 && (
+              <optgroup label={`Carcasses you have marked (${taggedSources.length})`}>
+                {taggedSources.map(m => <option key={m.id} value={m.id}>{optLabel(m)}</option>)}
+              </optgroup>
+            )}
+            {visibleGuesses.length > 0 && (
+              <optgroup label={`Not marked yet — guessed from the name (${visibleGuesses.length})`}>
+                {visibleGuesses.map(m => <option key={m.id} value={m.id}>{optLabel(m)}</option>)}
+              </optgroup>
+            )}
+            {showAllSources && otherSources.length > 0 && (
+              <optgroup label={`Everything else in the store (${otherSources.length})`}>
+                {otherSources.map(m => <option key={m.id} value={m.id}>{optLabel(m)}</option>)}
+              </optgroup>
+            )}
           </select>
+          <p className="mt-1 text-[10px] text-[#8B7355]">
+            Breaking down more than one thing today? Record them as separate batches —
+            use <strong>Save &amp; start another</strong> below and the date, butcher and head chef stay put.
+            Each batch keeps its own honest yield.
+          </p>
           <label className="flex items-center gap-1.5 mt-1 text-[11px] text-[#8B7355]">
             <input type="checkbox" checked={showAllSources} onChange={e => setShowAllSources(e.target.checked)} />
-            Show all materials {showAllSources ? '' : `(showing ${sourceMaterials.length} meat/carcass of ${materials.length})`}
+            Show every item in the store
+            <span className="text-[#A08B72]">
+              (listing {shownSourceCount} of {materials.length} — {taggedSources.length} marked
+              {visibleGuesses.length > 0 ? `, ${visibleGuesses.length} guessed` : ''}
+              {showAllSources ? `, ${otherSources.length} other` : ''})
+            </span>
           </label>
+          {/* Once he HAS marked some, say so plainly — otherwise the list simply
+              gets shorter with nothing on screen admitting why, and a guess he
+              used yesterday has silently vanished. */}
+          {materials.length > 0 && taggedSources.length > 0 && guessedSources.length > 0 && !showAllSources && (
+            <div className="mt-1 text-[10px] text-[#8B7355]">
+              Showing only the {taggedSources.length} carcass{taggedSources.length === 1 ? '' : 'es'} you marked.
+              {' '}{guessedSources.length} more were guessed from their names and are not shown — tick the box above to see them.
+            </div>
+          )}
+          {/* Only when the catalog actually LOADED. reloadMaterials() swallows a
+              fetch failure (`catch { keep previous list }`), so on a failed load
+              materials is [] — and "nothing is marked, go and mark it" would then
+              be a lie about a network problem. */}
+          {materials.length > 0 && taggedSources.length === 0 && (
+            <div className="mt-1.5 text-[11px] bg-[#FFF8F0] border border-[#E8D5C4] rounded p-2 text-[#6B5744] leading-relaxed">
+              <strong className="text-[#2D1B0E]">No carcasses have been marked yet</strong>, so this list is
+              only a guess from the item name. That means it can miss pork, duck or anything with a house name,
+              and it can offer things that are not carcasses at all.
+              <br />
+              To fix it for good: open <strong>Inventory → Raw Materials</strong> and mark each whole carcass
+              you actually buy — mutton carcass, whole chicken, and so on. After that only those items appear here.
+            </div>
+          )}
         </Field>
         <Field label="Batch ID *" hint="auto-suggested when source is picked">
           <div className="flex gap-2">
@@ -380,8 +518,26 @@ function NewBatchModal({ materials, onSeeded, onClose, onCreated }: {
 
       {error && <div className="bg-red-50 border border-red-200 text-red-700 rounded p-2 text-xs mt-3">{error}</div>}
 
+      {justSaved && (
+        <div className="bg-emerald-50 border border-emerald-200 text-emerald-800 rounded p-2 text-xs mt-3">
+          Saved <strong>{justSaved}</strong>. Pick the next item and its weight — the date, butcher,
+          head chef and any notes are still here.
+        </div>
+      )}
+
       <ModalFooter onClose={onClose}>
-        <button onClick={submit} disabled={saving}
+        {/* ONE BATCH IS ONE SOURCE. Two buttons instead of one, because the
+            common case after a delivery is several things to break down and the
+            alternative — reopening this modal and retyping the butcher's name
+            four times — is what makes a person want to pool them into one
+            batch and lose every yield figure. */}
+        <button onClick={() => submit(true)} disabled={saving}
+                title="Save this one and stay here for the next item"
+                className="inline-flex items-center gap-1.5 px-3 py-2 border border-[#af4408] text-[#af4408] hover:bg-[#af4408]/10 rounded text-sm disabled:opacity-50">
+          {saving ? <Loader2 className="animate-spin" size={14} /> : <Plus size={14} />}
+          Save & start another
+        </button>
+        <button onClick={() => submit(false)} disabled={saving}
                 className="inline-flex items-center gap-1.5 px-4 py-2 bg-[#af4408] hover:bg-[#933807] text-white rounded text-sm disabled:opacity-50">
           {saving ? <Loader2 className="animate-spin" size={14} /> : <Plus size={14} />}
           {saving ? 'Creating…' : 'Create Batch & Add Cuts'}
@@ -410,6 +566,31 @@ function BatchDetailModal({ batchId, materials, onClose }: {
   const [butcher, setButcher] = useState('');
   const [headChef, setHeadChef] = useState('');
   const [notes, setNotes] = useState('');
+  const [showAllCuts, setShowAllCuts] = useState(false);
+
+  /* ── WHICH ITEMS MAY BE A CUT ─────────────────────────────────────────────
+     This picker used to be handed the WHOLE catalog with no filter at all, so it
+     offered 00 FLOUR, 100 PIPERS (750ML), 300 Coupons and 350ML DISPOSABLE GLASS
+     as cuts of a carcass. Now it is the owner's tag (is_butchering_output) and
+     nothing else — there is no keyword tier here, because a cut has no reliable
+     keyword (LEG, CHOPS, MINCE, SUPREME, KEEMA are all just words) and guessing
+     is exactly what produced the mess.
+
+     WHEN NOTHING IS TAGGED (today: 0 of 952 rows) the picker falls back to the
+     whole catalog rather than showing an empty box, so a batch can still be
+     recorded on day one — with a banner saying plainly why, and where to fix it.
+     The moment one item is tagged, the list snaps to the tagged set.
+
+     NOTE the tag says "this CAN come out of a carcass" — it never stops the item
+     being bought from a vendor, and it is not what the yield report counts (that
+     reads butchering_outputs rows). The banner says so, so he is not afraid to
+     tick it on an item he also purchases. */
+  const taggedCuts = useMemo(() => materials.filter(m => isTagged(m.is_butchering_output)), [materials]);
+  // `materials.length > 0` guard: reloadMaterials() swallows a fetch failure, so a
+  // failed load also yields 0 tagged. Without the guard the banner would blame the
+  // owner for not tagging when the real problem is that nothing loaded.
+  const noCutsTagged = materials.length > 0 && taggedCuts.length === 0;
+  const cutPool = (showAllCuts || noCutsTagged) ? materials : taggedCuts;
 
   const load = async () => {
     setLoadError(null);
@@ -606,12 +787,45 @@ function BatchDetailModal({ batchId, materials, onClose }: {
 
       {/* CUTS section */}
       <div className="mt-4">
-        <div className="flex items-center justify-between mb-2">
-          <h3 className="text-sm font-semibold text-[#2D1B0E]">Cuts</h3>
+        <div className="flex items-center justify-between mb-2 gap-2 flex-wrap">
+          <h3 className="text-sm font-semibold text-[#2D1B0E]">
+            Cuts
+            {!readOnly && (
+              <span className="ml-2 text-[11px] font-normal text-[#8B7355]">
+                {materials.length === 0
+                  ? '— item list still loading'
+                  : noCutsTagged
+                    ? `— nothing marked yet, listing all ${materials.length} items`
+                    : `— ${taggedCuts.length} item${taggedCuts.length === 1 ? '' : 's'} can be a cut${showAllCuts ? `, listing all ${materials.length}` : ''}`}
+              </span>
+            )}
+          </h3>
           {!readOnly && (
-            <button onClick={() => addLine('cut')} className="text-xs text-[#af4408] hover:underline"><Plus size={11} className="inline" /> Add cut</button>
+            <div className="flex items-center gap-3">
+              {!noCutsTagged && (
+                <label className="flex items-center gap-1.5 text-[11px] text-[#8B7355]">
+                  <input type="checkbox" checked={showAllCuts} onChange={e => setShowAllCuts(e.target.checked)} />
+                  Show every item
+                </label>
+              )}
+              <button onClick={() => addLine('cut')} className="text-xs text-[#af4408] hover:underline"><Plus size={11} className="inline" /> Add cut</button>
+            </div>
           )}
         </div>
+        {!readOnly && noCutsTagged && (
+          <div className="mb-2 text-[11px] bg-[#FFF8F0] border border-[#E8D5C4] rounded p-2 text-[#6B5744] leading-relaxed">
+            <strong className="text-[#2D1B0E]">No cuts have been marked yet</strong>, so every item in the store
+            is listed below — which is why things like disposable glasses and coupons turn up in the list.
+            <br />
+            Open <strong>Inventory → Raw Materials</strong> and mark the items you actually get out of a carcass
+            — leg, shoulder, chops, ribs, mince, bones, breast, and so on. After that only those appear here.
+            <br />
+            <span className="text-[#8B7355]">
+              Marking an item changes nothing about buying it: you can still purchase the same cut from a vendor,
+              and the yield report still counts only what came out of a carcass batch.
+            </span>
+          </div>
+        )}
         <div className="grid grid-cols-12 gap-2 text-[10px] uppercase tracking-wide text-[#8B7355] px-1">
           <div className="col-span-6">Material</div>
           <div className="col-span-2 text-right">Weight</div>
@@ -620,7 +834,12 @@ function BatchDetailModal({ batchId, materials, onClose }: {
         </div>
         <div className="space-y-1 mt-1">
           {outputs.map((o, i) => o.output_type !== 'cut' ? null : (
+            /* materials = the FULL list, for resolving a line's name + unit — a
+               closed batch renders read-only from it, so filtering THIS prop
+               would blank historical cuts to "—" the moment a tag is removed.
+               pickMaterials = the filtered list, used for the picker ONLY. */
             <CutLine key={i} idx={i} line={o} grossWeight={gross} sourceUnit={srcUnit} totalCost={liveTotalCost} materials={materials}
+                     pickMaterials={cutPool}
                      totalCutWeight={totalCut} readOnly={readOnly} excludeIds={outputs.filter(x => x.output_type === 'cut' && x.material_id).map(x => x.material_id)}
                      onUpdate={(patch) => update(i, patch)} onRemove={() => removeLine(i)} />
           ))}
@@ -674,14 +893,27 @@ function BatchDetailModal({ batchId, materials, onClose }: {
   );
 }
 
-function CutLine({ idx, line, grossWeight, sourceUnit, totalCost, materials, totalCutWeight, readOnly, excludeIds, onUpdate, onRemove }: {
-  idx: number; line: OutputLine; grossWeight: number; sourceUnit: string; totalCost: number; materials: Material[]; totalCutWeight: number;
+function CutLine({ idx, line, grossWeight, sourceUnit, totalCost, materials, pickMaterials, totalCutWeight, readOnly, excludeIds, onUpdate, onRemove }: {
+  idx: number; line: OutputLine; grossWeight: number; sourceUnit: string; totalCost: number; materials: Material[];
+  /** The list the PICKER may offer (tagged cuts). Never used to resolve an
+   *  existing line's name/unit — `materials` stays the full catalog for that. */
+  pickMaterials: Material[];
+  totalCutWeight: number;
   readOnly: boolean; excludeIds: string[];
   onUpdate: (patch: Partial<OutputLine>) => void; onRemove: () => void;
 }) {
   const weight = Number(line.weight) || 0;
   const mat = materials.find(m => m.id === line.material_id);
   const unit = mat?.unit || sourceUnit;   // unpicked line: assume source unit until chosen
+  // The picker's array MUST contain whatever is already picked. MaterialTypeahead
+  // finds its chip via materials.find(m => m.id === value) (component line 149) —
+  // miss that and an already-chosen cut renders as an empty search box while
+  // line.material_id is still set: reads as "my cut disappeared". So a line
+  // drafted before the tag existed (or tagged and then untagged) keeps its chip.
+  const pickList = useMemo(() => {
+    if (!line.material_id || pickMaterials.some(m => m.id === line.material_id)) return pickMaterials;
+    return mat ? [mat, ...pickMaterials] : pickMaterials;
+  }, [pickMaterials, line.material_id, mat]);
   // Yield = cut ÷ gross — only meaningful once the cut weight is expressed in
   // the source's unit; non-convertible pairs (pcs vs kg) get a dash, not a lie.
   const k = wtFactor(unit, sourceUnit);
@@ -705,7 +937,10 @@ function CutLine({ idx, line, grossWeight, sourceUnit, totalCost, materials, tot
              grams: a 1000x trap on all 413 materials with a real pack conversion.
              Off, the dropdown prints m.unit and the box prints mat.unit — the SAME
              field, so they cannot disagree for any material, ever. */
-          <MaterialTypeahead materials={materials as any} value={line.material_id}
+          /* pickList, NOT materials: 18 other screens mount MaterialTypeahead
+             (incl. liquor + party pages behind deploy gates), so the component
+             itself is untouched — the FILTER is applied to what we hand it. */
+          <MaterialTypeahead materials={pickList as any} value={line.material_id}
                              onPick={(id: string) => onUpdate({ material_id: id })}
                              excludeIds={excludeIds.filter(x => x !== line.material_id) as string[]} />
         )}

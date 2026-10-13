@@ -1,5 +1,6 @@
 import { getDb } from '@/lib/db';
-import { getCurrentUser, getCurrentOutletId, isManagement } from '@/lib/auth';
+import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
+import { requireFinanceReport } from '@/lib/finance-reports-access';
 import { runSalesReport, type SalesReportType } from '@/lib/sales-reports';
 
 /**
@@ -26,7 +27,8 @@ export async function GET(req: Request) {
   try {
     const me = await getCurrentUser();
     if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-    if (!isManagement(me)) return Response.json({ error: 'Management only' }, { status: 403 });
+    const deniedFin = requireFinanceReport(me, '/reports/sales');
+    if (deniedFin) return deniedFin;
 
     const url = new URL(req.url);
     const type = String(url.searchParams.get('type') || '');

@@ -5,6 +5,25 @@
  *
  * Contract: docs/HRMS_DECISIONS.md. Two tabs (TabScroller):
  *  · Week Grid — employees down, 7 IST days across (prev/next week nav).
+ *
+ *    Above the grid sit the roster GENERATOR's three Stage-3 surfaces, all of
+ *    which leave the grid itself alone:
+ *      · READINESS PANEL — per department: staff on rolls, how many still have no
+ *        department, active shifts, shift-role mappings, coverage rows, and the
+ *        verdict. The verdict is the GENERATOR'S OWN (it runs generateRosterPlan
+ *        server-side), never a second set of checks that could disagree with it.
+ *      · GENERATE — Preview (writes nothing) then Apply. Apply writes SHIFT rows
+ *        only: WEEKLY OFFS ARE NOT PERSISTED (the owner's call — hr_rosters cannot
+ *        express an off, and a row stored there is counted as an ABSENCE by
+ *        src/lib/reports/hr-attendance-register.ts). Offs therefore render from
+ *        the plan held in component state, and vanish on reload until the next
+ *        preview; the UI says so rather than letting them look saved.
+ *      · CONFIGURE — coverage floors (minimum present per group per weekday,
+ *        never a cap on offs) and the (shift_role, weekday) → shift map, which is
+ *        the only bridge across hr_shifts' missing weekday dimension.
+ *    Plus a PRINT sheet laid out like the owner's real roster: groups as
+ *    sections, people as rows, seven day columns, OFF and LEAVE visible.
+ *
  *    Each cell shows the assigned shift chip (name + IST times, "+1d" for
  *    overnight spans) or '—'. Clicking a cell opens the house modal with a
  *    PORTALED shift Combobox → POST /api/hr/roster upsert (one shift per
@@ -39,6 +58,8 @@ import {
   Copy,
   Trash2,
   Plus,
+  Printer,
+  Settings2,
   CheckCircle2,
   XCircle,
   ClipboardList,
@@ -55,6 +76,14 @@ import {
   type HrShiftRequest,
 } from '@/lib/hr';
 import type { SessionUser } from '@/lib/auth';
+import RosterReadinessPanel from './_components/RosterReadinessPanel';
+import RosterGenerateCard from './_components/RosterGenerateCard';
+import RosterConfigModal from './_components/RosterConfigModal';
+import RosterPrintSheet, {
+  type PrintCell,
+  type PrintSection,
+} from './_components/RosterPrintSheet';
+import { planIndex, planMatches, type RosterPlan } from './_components/roster-plan';
 
 const EMP_PAGE_SIZE = 100;
 /** Hard stop for the employee loader: 5 pages = 500 people, far beyond the venue. */
@@ -70,12 +99,16 @@ const MAX_BULK = 1000;
 
 interface DeptRow { id: string; name: string; parent_id: string | null; is_active: number }
 
-/** GET /api/hr/employees list row — only the fields this grid needs. */
+/** GET /api/hr/employees list row — only the fields this grid needs.
+ *  designation_* come from the API's own LEFT JOIN and may be '' / null; they
+ *  group the PRINT sheet into the owner's sections (Captains, Stewards, …). */
 interface EmpRow {
   id: string;
   full_name: string;
   employee_code: string;
   status: string;
+  designation_id?: string | null;
+  designation_name?: string | null;
 }
 
 /** GET /api/hr/roster row (hr_rosters + LEFT JOIN employee + shift). */
@@ -311,6 +344,97 @@ export default function HrRosterPage() {
     [employees],
   );
   const activeEmpIds = useMemo(() => new Set(activeEmployees.map(e => e.id)), [activeEmployees]);
+
+  /* ── Generator: plan overlay, config editor, print, readiness ──────────────
+       THE PLAN IS THE ONLY SOURCE OF OFFS. Weekly offs are deliberately not
+       persisted (hr_rosters cannot express one, and a row stored there is counted
+       as an ABSENCE by the attendance register), so they live in this state and
+       nowhere else — reload the page and they are gone until the next preview.
+       planMatches() refuses to paint a plan on a week or department it was not
+       computed for: a stale overlay would look exactly like a real off and, since
+       nothing stores offs, could never be contradicted by a reload. ────────── */
+  const [plan, setPlan] = useState<RosterPlan | null>(null);
+  const planActive = planMatches(plan, deptId, weekStart);
+  const planByKey = useMemo(() => planIndex(planActive ? plan : null), [plan, planActive]);
+
+  const [configFor, setConfigFor] = useState<{ deptId: string; tab: 'coverage' | 'map' } | null>(null);
+  const [printOpen, setPrintOpen] = useState(false);
+  /** Bumped after a commit or a config save so the readiness panel re-measures. */
+  const [readinessKey, setReadinessKey] = useState(0);
+  const bumpReadiness = useCallback(() => setReadinessKey(k => k + 1), []);
+
+  /** A cell's planned intent, or null when no plan applies to this grid. */
+  const planCell = useCallback(
+    (empId: string, date: string) => planByKey.get(`${empId}|${date}`) ?? null,
+    [planByKey],
+  );
+
+  /* ── Print sheet: groups as sections, exactly as the owner's sheet reads. ── */
+  const printSections = useMemo<PrintSection[]>(() => {
+    // With a plan, use ITS group order and membership — the same designations the
+    // coverage floors are held against, so the printed sections match the plan.
+    if (planActive && plan) {
+      const sections: PrintSection[] = [];
+      for (const g of plan.groups) {
+        const seen = new Set<string>();
+        const people: PrintSection['people'] = [];
+        for (const r of plan.rows) {
+          if (r.designation_id !== g.designation_id || seen.has(r.employee_id)) continue;
+          seen.add(r.employee_id);
+          people.push({ id: r.employee_id, name: r.employee_name, code: r.employee_code });
+        }
+        if (people.length) sections.push({ id: g.designation_id, name: g.designation_name, people });
+      }
+      return sections;
+    }
+    // No plan: group by whatever designation the employee list carries, so a
+    // hand-built week still prints as sections rather than one flat list.
+    const groups = new Map<string, PrintSection>();
+    for (const e of gridEmployees) {
+      const id = String(e.designation_id ?? '');
+      const name = String(e.designation_name ?? '').trim() || 'No designation';
+      const g = groups.get(id) ?? { id, name, people: [] };
+      g.people.push({ id: e.id, name: e.full_name, code: e.employee_code });
+      groups.set(id, g);
+    }
+    return [...groups.values()].sort((a, b) => a.name.localeCompare(b.name));
+  }, [gridEmployees, plan, planActive]);
+
+  /**
+   * One printed cell.
+   *
+   * A SAVED ROW WINS THE CHIP, because it is the record: commitRosterPlan leaves a
+   * hand-edited day exactly as it is (kept_manual), so a shift row standing on a
+   * planned-off day means a human decided that person works. The planned off is
+   * then reported in the reason rather than silently dropped.
+   */
+  const printCell = useCallback(
+    (empId: string, date: string): PrintCell => {
+      const saved = rosterByKey.get(`${empId}|${date}`);
+      const p = planCell(empId, date);
+      if (saved) {
+        const clash = p && p.kind !== 'shift' ? ` · plan says ${p.kind.toUpperCase()}, kept by hand` : '';
+        return {
+          kind: 'shift',
+          label: saved.shift_name || 'Unknown shift',
+          time: timeLabel(saved.shift_start_hhmm, saved.shift_end_hhmm),
+          reason: `${saved.note ? `${saved.note} · ` : ''}${p?.reason ?? ''}${clash}`.trim(),
+        };
+      }
+      if (p?.kind === 'leave') return { kind: 'leave', label: 'LEAVE', time: '', reason: p.reason };
+      if (p?.kind === 'off') return { kind: 'off', label: 'OFF', time: '', reason: p.reason };
+      if (p?.kind === 'shift') {
+        return {
+          kind: 'shift',
+          label: p.shift_name || p.shift_role || '—',
+          time: '',
+          reason: `Planned, not applied yet — ${p.reason}`,
+        };
+      }
+      return { kind: 'empty', label: '', time: '', reason: '' };
+    },
+    [rosterByKey, planCell],
+  );
 
   /* ── Cell shift-picker modal ───────────────────────────────────────── */
   const [picker, setPicker] = useState<{
@@ -609,8 +733,10 @@ export default function HrRosterPage() {
     }`;
 
   return (
-    <div className="min-h-screen bg-[#FFF8F0] text-[#2D1B0E]">
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-5">
+    <div className="min-h-screen bg-[#FFF8F0] text-[#2D1B0E] print:bg-white">
+      {/* While the print sheet is open it is the ONLY thing that goes to paper —
+          the screen UI is hidden rather than printed as a second, broken page. */}
+      <div className={`max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-5 ${printOpen ? 'print:hidden' : ''}`}>
 
         {/* Header */}
         <div>
@@ -662,12 +788,46 @@ export default function HrRosterPage() {
                           onChange={(v) => setDeptId(v)} placeholder="All departments" />
               </div>
               <div className="flex-1" />
+              <button onClick={() => setPrintOpen(true)}
+                      className="inline-flex items-center gap-2 px-3 py-2 border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm">
+                <Printer className="w-4 h-4" /> Print
+              </button>
+              <button onClick={() => setConfigFor({ deptId, tab: 'coverage' })}
+                      disabled={!deptId}
+                      title={deptId ? 'Coverage floors and the shift map' : 'Pick a department first'}
+                      className="inline-flex items-center gap-2 px-3 py-2 border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm disabled:opacity-50">
+                <Settings2 className="w-4 h-4" /> Configure
+              </button>
               <button onClick={copyLastWeek} disabled={copying || gridFetching}
                       className="inline-flex items-center gap-2 px-3 py-2 border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm disabled:opacity-50">
                 {copying ? <Loader2 className="w-4 h-4 animate-spin" /> : <Copy className="w-4 h-4" />}
                 Copy last week
               </button>
             </div>
+
+            {/* ── Readiness, then Generate. Above the grid, which is untouched
+                   below: production has 128 unclassified employees and ZERO
+                   shifts, so BLOCKED is the ordinary answer and the panel has to
+                   say exactly what to fix and where. ────────────────────────── */}
+            <RosterReadinessPanel
+              weekStart={weekStart}
+              selectedDeptId={deptId}
+              refreshKey={readinessKey}
+              onPickDepartment={(id) => setDeptId(id)}
+              onOpenConfig={(id, tab) => setConfigFor({ deptId: id, tab })}
+            />
+
+            <RosterGenerateCard
+              departmentId={deptId}
+              departmentLabel={deptFilterLabel || 'All departments'}
+              weekStart={weekStart}
+              weekEnd={weekEnd}
+              plan={planActive ? plan : null}
+              onPlan={(p) => setPlan(p)}
+              onCommitted={() => { fetchGrid(); bumpReadiness(); }}
+              onOpenConfig={(id, tab) => setConfigFor({ deptId: id, tab })}
+              onPrint={() => setPrintOpen(true)}
+            />
 
             {copyMsg && (
               <div className="rounded-lg border border-green-200 bg-green-50 text-green-700 px-3 py-2 text-sm">
@@ -724,11 +884,27 @@ export default function HrRosterPage() {
                           </td>
                           {weekDates.map(d => {
                             const cell = rosterByKey.get(`${emp.id}|${d}`);
+                            const p = planCell(emp.id, d);
+                            // A SAVED ROW IS THE RECORD and wins the chip: a
+                            // commit leaves a hand-edited day exactly as it is
+                            // (kept_manual), so a shift standing on a planned-off
+                            // day means a human decided that person works. The
+                            // planned off is then said out loud, not dropped.
+                            const clash = cell && p && p.kind !== 'shift';
+                            const title = cell
+                              ? [
+                                  cell.note ? `Note: ${cell.note}` : '',
+                                  clash ? `Plan says ${p.kind.toUpperCase()} — kept because a human set this day` : '',
+                                  p?.reason ?? '',
+                                ].filter(Boolean).join(' · ') || 'Assign shift'
+                              : p
+                                ? p.reason
+                                : 'Assign shift';
                             return (
                               <td key={d} className={`p-1 align-top ${d === today ? 'bg-[#FFF8F0]' : ''}`}>
                                 <button
                                   onClick={() => openCell(emp, d)}
-                                  title={cell?.note ? `Note: ${cell.note}` : 'Assign shift'}
+                                  title={title}
                                   className="w-full min-h-[3rem] rounded-lg px-1.5 py-1.5 text-center hover:bg-[#FFF1E3] focus:outline-none focus:ring-1 focus:ring-[#af4408]/40">
                                   {cell ? (
                                     <span className={`inline-flex flex-col items-center gap-0.5 ${cell.shift_is_active === 0 ? 'opacity-60' : ''}`}>
@@ -740,6 +916,39 @@ export default function HrRosterPage() {
                                         {hasSplit(cell.shift_split_json) ? ' · split' : ''}
                                         {cell.note ? ' ✎' : ''}
                                       </span>
+                                      {/* Provenance, so kept_manual stops being
+                                          mysterious: '' (and every row older than
+                                          the column) means a human owns the day. */}
+                                      {planActive && (
+                                        <span className={`text-[9px] uppercase tracking-wide ${
+                                          cell.source === 'generated' ? 'text-[#8B7355]' : 'text-amber-700 font-medium'
+                                        }`}>
+                                          {cell.source === 'generated' ? 'auto' : 'by hand'}
+                                        </span>
+                                      )}
+                                      {clash && (
+                                        <span className="text-[9px] text-amber-700">plan: {p.kind}</span>
+                                      )}
+                                    </span>
+                                  ) : p?.kind === 'off' ? (
+                                    <span className="inline-flex flex-col items-center gap-0.5">
+                                      <span className="inline-block px-2 py-0.5 rounded-full border border-slate-300 bg-slate-100 text-slate-700 text-xs font-semibold">
+                                        OFF
+                                      </span>
+                                      <span className="text-[9px] text-[#8B7355]">not stored</span>
+                                    </span>
+                                  ) : p?.kind === 'leave' ? (
+                                    <span className="inline-block px-2 py-0.5 rounded-full border border-purple-200 bg-purple-50 text-purple-700 text-xs font-semibold">
+                                      LEAVE
+                                    </span>
+                                  ) : p?.kind === 'shift' ? (
+                                    // Previewed but not applied — dashed, so it can
+                                    // never be mistaken for a saved assignment.
+                                    <span className="inline-flex flex-col items-center gap-0.5">
+                                      <span className="inline-block max-w-[9rem] truncate px-2 py-0.5 rounded-full border border-dashed border-[#af4408]/50 text-[#af4408] text-xs">
+                                        {p.shift_name || p.shift_role || '—'}
+                                      </span>
+                                      <span className="text-[9px] text-[#8B7355]">planned</span>
                                     </span>
                                   ) : (
                                     <span className="text-[#C9B8A5]">—</span>
@@ -759,6 +968,13 @@ export default function HrRosterPage() {
             <p className="text-[11px] text-[#8B7355]">
               Times are IST clock times; “+1d” marks an overnight shift ending the next calendar
               morning — the whole shift still belongs to the start day’s attendance.
+              {planActive && (
+                <>
+                  {' '}OFF and LEAVE cells come from the plan above and are <strong>never
+                  stored</strong>; hover any cell for the reason behind it. “auto” marks a cell this
+                  generator wrote, “by hand” a day a human owns — a regenerate leaves those alone.
+                </>
+              )}
             </p>
           </>
         )}
@@ -1110,7 +1326,34 @@ export default function HrRosterPage() {
           </div>
         )}
 
+        {/* ── Coverage + shift-map editor ─────────────────────────────────── */}
+        {configFor && (
+          <RosterConfigModal
+            departmentId={configFor.deptId}
+            departmentLabel={deptById.get(configFor.deptId)?.name || configFor.deptId}
+            initialTab={configFor.tab}
+            canWrite={isAdmin}
+            onClose={() => setConfigFor(null)}
+            onSaved={bumpReadiness}
+          />
+        )}
+
       </div>
+
+      {/* ── Print sheet. Outside the container above so that container can be
+             print:hidden while this prints. ────────────────────────────────── */}
+      {printOpen && (
+        <RosterPrintSheet
+          departmentLabel={deptFilterLabel || 'All departments'}
+          weekStart={weekStart}
+          weekEnd={weekEnd}
+          dates={weekDates}
+          sections={printSections}
+          cell={printCell}
+          hasPlan={planActive}
+          onClose={() => setPrintOpen(false)}
+        />
+      )}
     </div>
   );
 }

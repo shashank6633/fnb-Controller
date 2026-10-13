@@ -76,8 +76,26 @@ import {
   type HrEmployeeListRow,
 } from '@/lib/hr';
 import type { SessionUser } from '@/lib/auth';
+import BulkDepartmentBar from './_components/BulkDepartmentBar';
+import { useEmployeeSelection } from './_components/useEmployeeSelection';
 
 const PAGE_SIZE = 25;
+
+/**
+ * The department filter's "has no department at all" token — the one value
+ * employeeListWhere() (src/lib/hr-server.ts) turns into `department_id = ''`.
+ *
+ * BOUND BY TYPE, NOT IMPORTED. hr-server.ts declares itself SERVER ONLY in
+ * capitals: it carries the SQL and the better-sqlite3 helpers, and this is a
+ * 'use client' module, so a real import would ship the schema into the browser
+ * bundle — what the Next docs call environment poisoning. The annotation below
+ * is a TYPE-position import, which TypeScript erases completely: nothing is
+ * bundled, and because the server's constant has the literal type
+ * '__unassigned__', changing it there makes THIS LINE a tsc error instead of
+ * leaving a filter that reads fine and silently matches nobody.
+ */
+const UNASSIGNED_DEPARTMENT: typeof import('@/lib/hr-server').UNASSIGNED_DEPARTMENT =
+  '__unassigned__';
 
 interface DeptRow { id: string; name: string; parent_id: string | null; is_active: number }
 /** `department_id` is the HR-Settings link: '' = generic (any department). */
@@ -407,18 +425,27 @@ export default function HrEmployeesPage() {
     return () => clearTimeout(t);
   }, [searchInput]);
 
-  // Reset to page 1 whenever any filter changes
-  useEffect(() => { setPage(1); }, [q, deptId, status]);
-
-  const buildQuery = useCallback((p: number) => {
+  /** `size` is a parameter because the bulk-selection collect strides at the
+   *  API's own 100 cap, not at this list's 25 — same filters, bigger pages. */
+  const buildQuery = useCallback((p: number, size: number = PAGE_SIZE) => {
     const sp = new URLSearchParams();
     if (q) sp.set('q', q);
     if (deptId) sp.set('department_id', deptId);
     if (status) sp.set('status', status);
     sp.set('page', String(p));
-    sp.set('pageSize', String(PAGE_SIZE));
+    sp.set('pageSize', String(size));
     return sp.toString();
   }, [q, deptId, status]);
+
+  // ── Bulk department assignment (duty-roster Phase 0) ────────────────────
+  // Selection spans pages, so it is held by id, not by row.
+  const selection = useEmployeeSelection(buildQuery);
+
+  // Reset to page 1 whenever any filter changes — and DROP the selection with
+  // it. A set collected under "No department" that survived into a search for
+  // "Kitchen" would be a set the manager can no longer see but could still
+  // assign, which is exactly the mistake this whole bar exists to avoid.
+  useEffect(() => { setPage(1); selection.clear(); }, [q, deptId, status, selection.clear]);
 
   const fetchEmployees = useCallback(async () => {
     const seq = ++fetchSeq.current;
@@ -485,7 +512,13 @@ export default function HrEmployeesPage() {
 
   /** Filter picker: all departments; subs carry their parent name as the hint (profile-page pattern). */
   const deptFilterOptions = useMemo<ComboOption[]>(() => {
-    const opts: ComboOption[] = [{ value: '', label: 'All departments' }];
+    const opts: ComboOption[] = [
+      { value: '', label: 'All departments' },
+      // Phase 0's whole reason for existing: until now no filter could ASK for
+      // the 128 employees with no department. Second in the list, not buried
+      // under the tree, because it is the one every roster task starts from.
+      { value: UNASSIGNED_DEPARTMENT, label: 'No department', hint: 'never classified' },
+    ];
     for (const m of mains) {
       opts.push({ value: m.id, label: m.name });
       for (const s of subsOf(m.id)) opts.push({ value: s.id, label: s.name, hint: m.name });
@@ -494,7 +527,12 @@ export default function HrEmployeesPage() {
   }, [mains, subsOf]);
 
   const deptById = useMemo(() => new Map(departments.map(d => [d.id, d])), [departments]);
-  const deptFilterLabel = deptId ? (deptById.get(deptId)?.name || '') : '';
+  /** The sentinel is not a departments row, so the map lookup would come back
+   *  empty and the box would read "All departments" while filtering to the
+   *  unassigned — it needs its own label, not a fallback. */
+  const deptFilterLabel = deptId === UNASSIGNED_DEPARTMENT
+    ? 'No department'
+    : (deptId ? (deptById.get(deptId)?.name || '') : '');
 
   // Modal pickers
   const mainOptions = useMemo<ComboOption[]>(
@@ -967,6 +1005,11 @@ export default function HrEmployeesPage() {
   const fromN = total === 0 ? 0 : (page - 1) * PAGE_SIZE + 1;
   const toN = Math.min(page * PAGE_SIZE, total);
 
+  // ── Selection derived (this page's slice of a cross-page selection) ──────
+  const pageIds = useMemo(() => rows.map(r => r.id), [rows]);
+  const selectedOnPage = pageIds.filter(id => selection.selected.has(id)).length;
+  const pageAllSelected = pageIds.length > 0 && selectedOnPage === pageIds.length;
+
   const inputCls = 'w-full px-2 py-1.5 border border-[#E8D5C4] rounded-lg bg-[#FFF8F0] text-sm';
 
   return (
@@ -1035,6 +1078,21 @@ export default function HrEmployeesPage() {
           </TabScroller>
         </div>
 
+        {/* Bulk department assignment — the duty roster cannot start until the
+            128 unclassified employees have a department. Hidden on first paint
+            so it never advertises a count of 0 before the list has loaded. */}
+        {!loading && (
+          <BulkDepartmentBar
+            total={total}
+            pageIds={pageIds}
+            selection={selection}
+            mains={mains}
+            subsOf={subsOf}
+            unassignedFilter={deptId === UNASSIGNED_DEPARTMENT}
+            onApplied={fetchEmployees}
+          />
+        )}
+
         {/* Error banner */}
         {error && (
           <div className="rounded-xl border border-red-200 bg-red-50 text-red-700 px-4 py-3 text-sm flex items-center justify-between gap-3">
@@ -1062,6 +1120,19 @@ export default function HrEmployeesPage() {
                 <table className="w-full text-sm">
                   <thead className="bg-[#FFF1E3] text-xs text-[#6B5744]">
                     <tr>
+                      <th className="text-left py-2 px-3 font-medium w-10">
+                        <input
+                          type="checkbox"
+                          aria-label="Select every employee on this page"
+                          checked={pageAllSelected}
+                          // `indeterminate` is a DOM property with no React prop,
+                          // so without this a part-ticked page reads as "nothing
+                          // selected here" while the bar says otherwise.
+                          ref={el => { if (el) el.indeterminate = selectedOnPage > 0 && !pageAllSelected; }}
+                          onChange={e => selection.setMany(pageIds, e.target.checked)}
+                          className="accent-[#af4408]"
+                        />
+                      </th>
                       <th className="text-left py-2 px-3 font-medium w-10"></th>
                       <th className="text-left py-2 px-3 font-medium">Code</th>
                       <th className="text-left py-2 px-3 font-medium">Name</th>
@@ -1075,8 +1146,19 @@ export default function HrEmployeesPage() {
                   <tbody>
                     {rows.map(r => {
                       const meta = employeeStatusMeta(r.status);
+                      const picked = selection.selected.has(r.id);
                       return (
-                        <tr key={r.id} className="border-t border-[#E8D5C4]/50 hover:bg-[#FFF1E3]">
+                        <tr key={r.id}
+                            className={`border-t border-[#E8D5C4]/50 hover:bg-[#FFF1E3] ${picked ? 'bg-[#FFF1E3]' : ''}`}>
+                          <td className="py-2 px-3">
+                            <input
+                              type="checkbox"
+                              aria-label={`Select ${r.full_name}`}
+                              checked={picked}
+                              onChange={e => selection.toggle(r.id, e.target.checked)}
+                              className="accent-[#af4408]"
+                            />
+                          </td>
                           <td className="py-2 pl-3 pr-0">
                             {/* Per-row photos deliberately not fetched in lists (Phase 1) — the list API sends has_photo only. */}
                             <div className="w-8 h-8 rounded-full bg-[#FFF1E3] border border-[#E8D5C4] text-[#af4408] text-xs font-bold flex items-center justify-center">

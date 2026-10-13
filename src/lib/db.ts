@@ -23,63 +23,99 @@ import { convertForCosting, ingredientLineCost } from './recipe-cost';
 
 const DB_PATH = path.join(process.cwd(), 'fnb-controller.db');
 
-/* THE MODULE CACHE, AND WHY THE BOOT IS NOW GUARDED.
+/* ── A HALF-BUILT HANDLE THAT NEVER HEALED ────────────────────────────────────
  *
- * `db` is set BEFORE the schema is built, and that one ordering detail used to
- * turn any boot-time throw into a permanent, silent, half-built database: the
- * throw escaped getDb(), the cache was already populated, and every later call
- * short-circuited on `if (!db)` and returned the same unbuilt handle forever.
- * Nothing in the app detects that — there is no schema_version table and no
- * health endpoint — so the process served traffic indefinitely with tables
- * missing and printed nothing about it.
+ * getDb() used to assign `db` and THEN call initializeSchema(db). If the schema
+ * threw, `db` was already assigned, so the throw escaped this call and every
+ * later call found `!db` false and returned the handle whose DDL never ran —
+ * silently, for the life of the process. Two ordinary ways in:
  *
- * MEASURED, driving the real getDb() three times in one process:
- *   · a READ-ONLY database file (a bad chown, a full disk's read-only remount):
- *     "THREW attempt to write a readonly database" on call 1 — from
- *     pragma('journal_mode = WAL'), ONE LINE after the cache was set, so
- *     initializeSchema was never entered at all — then calls 2 and 3 returned a
- *     handle with zero fssai_ tables and no warning of any kind.
- *   · an older database missing sales.bill_type (an index over it sits in the
- *     one un-try-caught exec at the top of initializeSchema): identical
- *     silence, with no unusual permissions needed.
+ *   · a read-only database file: `new Database()` succeeds, the first pragma or
+ *     exec throws, and initializeSchema may never be entered at all.
+ *   · an older database missing a column an index at the top of
+ *     initializeSchema sits over: identical silence, no unusual permissions.
  *
- * So the boot now lives in bootDb(): every step inside one try, a LOUD error if
- * it fails, the FSSAI assertion in a `finally` so it reports on the failure
- * path too, and a flag that makes the NEXT getDb() retry instead of inheriting
- * a broken handle. The retry is throttled — a broken database must not re-run
- * ~10,000 lines of DDL on every request.
+ * This matters more here than it looks, because initializeSchema SWALLOWS
+ * errors per block — so a half-built schema raises no alarm anywhere else.
  *
- * THE RETRY RE-OPENS THE FILE, and that detail is the whole difference between
- * a retry that works and one that only looks like it does. SQLite latches a
- * database's read-only status when the connection is OPENED, so re-running the
- * DDL on the handle we already have can never recover from the read-only case —
- * measured: after chmod-ing the file back to 644, the SAME handle still threw
- * "attempt to write a readonly database" while a NEW handle opened fine. The
- * first version of this retry reused the handle and therefore healed nothing.
- * Replacing it is safe here because nothing in the app holds a handle across
- * calls: all 901 getDb() call sites resolve it per call, and the only 8 that
- * appear at module level are DEFAULT PARAMETER VALUES (`db = getDb()`), which
- * are evaluated per invocation. The old handle is closed before the new one is
- * adopted, so nothing leaks; and if the re-open itself throws, the previous
- * handle is KEPT (a stale handle still serves reads; a closed one throws on
- * every query) and the throttle is re-armed. Fix the cause — permissions, a
- * full disk, a restored file — and the app repairs itself within the throttle
- * window instead of needing a restart nobody knows to perform.
+ * The boot now lives in bootDb(): every step inside one try, a LOUD error if it
+ * fails, and a flag that makes the NEXT getDb() retry instead of inheriting a
+ * broken handle. The retry is throttled — a broken database must not re-run
+ * thousands of lines of DDL on every request.
  *
- * getDb() deliberately still RETURNS the handle rather than re-throwing: every
- * caller in the app assumes it returns, and turning a schema failure into a
- * throw on hundreds of call sites is a change with its own blast radius. What
- * P1 owes is that the failure is never SILENT. It is not silent now. */
+ * THE RETRY RE-OPENS THE FILE, and that is the whole difference between a retry
+ * that works and one that only looks like it does: SQLite latches a database's
+ * read-only status when the connection is OPENED, so re-running DDL on the
+ * handle we already hold can never recover from the read-only case. Replacing
+ * the handle is safe because nothing in this app holds one across calls — every
+ * getDb() call site resolves it per call, and the module-level ones are DEFAULT
+ * PARAMETER VALUES (`db = getDb()`), evaluated per invocation. The old handle is
+ * closed before the new one is adopted, so nothing leaks; if the re-open itself
+ * throws, the previous handle is KEPT (a stale handle still serves reads; a
+ * closed one throws on every query) and the throttle is re-armed.
+ *
+ * getDb() deliberately still RETURNS rather than re-throwing: every caller
+ * assumes it returns, and turning a schema failure into a throw across hundreds
+ * of call sites is a change with its own blast radius. What this owes is that
+ * the failure is never SILENT. It is not silent now. */
+/* ── WHY THE OLD HANDLE IS NOT CLOSED, AND WHY THE RETRY BACKS OFF ───────────
+ *
+ * The first version of this retry called `db.close()` before adopting the fresh
+ * connection. That was wrong, and it was wrong in a way that only bites on the
+ * exact path this code exists for — a database whose schema boot FAILED.
+ *
+ * 102 call sites in src have this shape:
+ *
+ *     const db = getDb();                  // handle captured
+ *     const x  = await somethingAsync();   // ...which itself calls getDb()
+ *     db.prepare(...)                      // captured handle used again
+ *
+ * `auth.ts:250` getCurrentOutletId() is one, and it runs on nearly every
+ * authenticated request. 28 of those sites end in a `db.transaction(...)` —
+ * settle, hold, KDS bump, order PATCH, GRN. If the nested call is the one that
+ * crosses the retry threshold, closing the old handle makes the captured
+ * reference throw `The database connection is not open` — so a database missing
+ * one index went from "serves fine, one broken feature" to a burst of 500s on
+ * settle and KOT-bump every 30 seconds, for the life of the process.
+ *
+ * So: the old handle is LEFT OPEN and simply dropped. Anything still holding it
+ * keeps reading from a stale but working connection; everything that calls
+ * getDb() afterwards gets the fresh one. That is the same reasoning already
+ * applied to the re-open-failure path below — a stale handle still serves
+ * reads, a closed one throws on every query — it just was not applied here.
+ *
+ * Not closing means a failed boot leaks one connection per retry, so the retry
+ * now BACKS OFF: 30s, 1m, 5m, then 30m forever. A permanently broken database
+ * leaks a handful of file descriptors a day instead of 2,880, while one that is
+ * actually repaired — permissions fixed, disk freed, file restored — still
+ * heals itself within half an hour without anyone knowing to restart it. */
+/* ── AND WHY THE FSSAI ASSERTION SITS IN A `finally` ─────────────────────────
+ *
+ * bootDb() runs assertFssaiSchema() in a `finally`, not after initializeSchema()
+ * — deliberately, and for the same reason this whole guard exists. MEASURED on a
+ * read-only database file: pragma('journal_mode = WAL') throws ONE LINE after the
+ * module cache is set, so initializeSchema is never entered and there are zero
+ * fssai_ tables. An assertion that only runs on the happy path would have said
+ * nothing at all on exactly that boot. The `finally` makes it report on the
+ * failure path too; resetFssaiState() at the top of bootDb() is what keeps it
+ * judging THIS attempt rather than an earlier one. */
 let db: Database.Database | null = null;
 let dbBootFailed = false;
 let dbBootLastAttempt = 0;
-const DB_BOOT_RETRY_MS = 30_000;
+let dbBootAttempts = 0;
+/** Backoff ladder, in ms. The last entry repeats for every attempt after it. */
+const DB_BOOT_RETRY_LADDER = [30_000, 60_000, 300_000, 1_800_000] as const;
+
+function dbBootRetryDelay(): number {
+  const i = Math.min(Math.max(dbBootAttempts - 1, 0), DB_BOOT_RETRY_LADDER.length - 1);
+  return DB_BOOT_RETRY_LADDER[i];
+}
 
 export function getDb(): Database.Database {
   if (!db) {
     db = new Database(DB_PATH);
     bootDb(db);
-  } else if (dbBootFailed && Date.now() - dbBootLastAttempt >= DB_BOOT_RETRY_MS) {
+  } else if (dbBootFailed && Date.now() - dbBootLastAttempt >= dbBootRetryDelay()) {
     // The last attempt did not finish. Try again on a FRESH connection — see
     // the read-only latch explained above; a same-handle retry cannot heal.
     let fresh: Database.Database | null = null;
@@ -87,10 +123,12 @@ export function getDb(): Database.Database {
       fresh = new Database(DB_PATH);
     } catch (e) {
       dbBootLastAttempt = Date.now();   // re-arm the throttle; keep the old handle
+      dbBootAttempts++;
       console.error('[db] schema retry could not re-open the database (keeping the previous connection). Cause:', e);
     }
     if (fresh) {
-      try { db.close(); } catch { /* already closed, or never opened cleanly */ }
+      // The old handle is deliberately NOT closed — see the note above. It is
+      // dropped and collected once nothing references it any more.
       db = fresh;
       bootDb(db);
     }
@@ -99,7 +137,7 @@ export function getDb(): Database.Database {
 }
 
 /** One boot attempt: pragmas, schema, units registry, then the FSSAI assertion
- *  — which runs whether or not the rest of it worked. */
+ *  — which runs whether or not the rest of it worked. Never throws. */
 function bootDb(database: Database.Database) {
   dbBootLastAttempt = Date.now();
   resetFssaiState();       // so the assertion below judges THIS attempt, not an earlier one
@@ -148,11 +186,14 @@ function bootDb(database: Database.Database) {
     } catch (e) { console.error('units registry hydration failed:', e); }
     if (dbBootFailed) console.warn('[db] schema initialisation SUCCEEDED on a retry — the failure reported earlier is cleared.');
     dbBootFailed = false;
+    dbBootAttempts = 0;        // healed: start the ladder over if it ever fails again
   } catch (e) {
     dbBootFailed = true;
+    dbBootAttempts++;
     console.error(
       '[db] SCHEMA INITIALISATION FAILED — this process is about to serve traffic against a database whose schema was NOT fully applied. ' +
-      `Tables and columns may be missing. The next getDb() at least ${DB_BOOT_RETRY_MS / 1000}s from now will try again. Cause:`, e
+      `Tables and columns may be missing. This was attempt ${dbBootAttempts}; the next getDb() at least ` +
+      `${Math.round(dbBootRetryDelay() / 1000)}s from now will try again. Cause:`, e
     );
   } finally {
     // The assertion is the only runtime proof this app has that a migration
@@ -2913,6 +2954,42 @@ function initializeSchema(db: Database.Database) {
     // Granular approval flag on the role (mirrors users.can_approve_requisitions):
     // holders may approve dine-in + party requisitions without being an HOD.
     if (!rCols.some((c: any) => c.name === 'can_approve_requisitions')) db.exec(`ALTER TABLE roles ADD COLUMN can_approve_requisitions INTEGER NOT NULL DEFAULT 0`);
+    // Who may VOID a bill handover (owner, 2026-10-05). Until this existed,
+    // voiding was implied by canRecordBillHandover() — isManagement(u) ||
+    // is_store_manager — so every manager and every store manager could void a
+    // Pending or Submitted handover, and the Store Manager holding it was the
+    // defect the owner reported. A void is not a delete, but it does retire a
+    // record of money changing hands, and that is not something a role should
+    // acquire as a side effect of being able to CREATE one.
+    //
+    // DEFAULT 0 IS THE WHOLE POINT, and it is why this needs no data migration:
+    // adding the column removes the capability from EVERY role at once, so the
+    // reported access is gone the moment this ships, without a single role row
+    // being rewritten. Roles are the owner's to set — he grants this to the
+    // designation he wants, in Settings → Roles. An Administrator can always
+    // void regardless, so the capability never disappears from the building.
+    if (!rCols.some((c: any) => c.name === 'can_void_bill_handover')) db.exec(`ALTER TABLE roles ADD COLUMN can_void_bill_handover INTEGER NOT NULL DEFAULT 0`);
+    // Who may open the finance/purchase screens (owner's call, 2026-10-05).
+    // The Accounts designation was given /purchases and four Reports pages in the
+    // Edit User grid and could open NONE of them: the four reports are mgmtOnly,
+    // and /purchases is gated by requirePurchasesAccess (management or the store
+    // person). Ticks in the grid cannot reach past a tier gate, so the grant was
+    // real in the database and inert in every code path that reads it.
+    //
+    // A BOOLEAN, NOT A LIST OF PATHS — deliberately. The paths live in ONE
+    // code constant (financeCap in page-catalog.ts + FINANCE_REPORT_PATHS in
+    // finance-reports-access.ts) that the gates consult, so the set is reviewable
+    // in a diff and cannot be widened from the UI. Were this column to hold path
+    // text, Settings → Roles would become a way to hand a staff role
+    // /boh/accountability, /department-variance or the guest-phone screens — the
+    // blanket-mgmtOnly failure this capability exists to avoid.
+    //
+    // DEFAULT 0 AND NO BACKFILL. Adding the column grants it to nobody; the owner
+    // grants it to the designation he wants, in Settings → Roles. A boot-time
+    // UPDATE that pre-granted it would be admin-owned state recomputed on every
+    // deploy — the exact thing scripts/check-boot-migrations.js locks — and it
+    // would silently undo a revoke.
+    if (!rCols.some((c: any) => c.name === 'can_view_finance_reports')) db.exec(`ALTER TABLE roles ADD COLUMN can_view_finance_reports INTEGER NOT NULL DEFAULT 0`);
 
     const seedRole = db.prepare(`
       INSERT OR IGNORE INTO roles (id, name, base_role, page_access, is_head_chef, is_store_manager, is_system, sort_order, description)
@@ -4187,6 +4264,34 @@ function initializeSchema(db: Database.Database) {
     if (!has('is_recipe_item'))         db.exec(`ALTER TABLE raw_materials ADD COLUMN is_recipe_item INTEGER NOT NULL DEFAULT 0`);
     if (!has('is_direct_sell'))         db.exec(`ALTER TABLE raw_materials ADD COLUMN is_direct_sell INTEGER NOT NULL DEFAULT 0`);
     if (!has('is_semifinished'))        db.exec(`ALTER TABLE raw_materials ADD COLUMN is_semifinished INTEGER NOT NULL DEFAULT 0`);
+    // ------------------------------------------------------------
+    // Butchering role flags — the MANUAL answer to "what belongs in the
+    // butchering dropdowns". /butchering used to GUESS from a hardcoded category
+    // list plus a name/SKU regex, so CHICKEN SEASONING POWDER was offered as a
+    // carcass to break down while pork / duck / a house-named item could never
+    // appear; the Cuts picker was worse still — unfiltered, so 350ML DISPOSABLE
+    // GLASS was offerable as a cut. These two flags replace the guess with the
+    // owner's own tagging. One GLOBAL flag per item, not a per-carcass mapping.
+    //   is_butchering_source   this item is a whole carcass / protein that can be BROKEN DOWN
+    //   is_butchering_output   this item CAN BE PRODUCED by breaking down a carcass
+    // INDEPENDENT, not exclusive: a bought CHICKEN LEG BONELESS is an output of a
+    // whole bird AND could later be the source of a further cut, so both may be 1
+    // on the same row.
+    //
+    // THE OWNER'S RULE, and it is the correctness rule of this feature: an item
+    // may be BOTH BOUGHT FROM A VENDOR AND PRODUCED FROM A CARCASS. So
+    // is_butchering_output means only "this CAN be a butchering output" — it
+    // NEVER means the stock on hand came from a carcass, and it must never change
+    // how a PURCHASE of the item behaves. Only a butchering_outputs row is
+    // evidence that something actually came out of a carcass batch, and that is
+    // what the yield figures count. Do NOT make any yield / consumption / costing
+    // query filter on this flag instead of joining butchering_outputs.
+    //
+    // Both default 0 — nothing is tagged until he tags it, so no heuristic's
+    // false positives get baked into real data (see is_recipe_item's backfill,
+    // which recipe-suggest.ts:179-181 now refuses to trust).
+    if (!has('is_butchering_source'))   db.exec(`ALTER TABLE raw_materials ADD COLUMN is_butchering_source INTEGER NOT NULL DEFAULT 0`);
+    if (!has('is_butchering_output'))   db.exec(`ALTER TABLE raw_materials ADD COLUMN is_butchering_output INTEGER NOT NULL DEFAULT 0`);
     // Operational fields — where it lives + how long it lasts
     if (!has('storage_location'))       db.exec(`ALTER TABLE raw_materials ADD COLUMN storage_location TEXT DEFAULT ''`);
     if (!has('shelf_life_days'))        db.exec(`ALTER TABLE raw_materials ADD COLUMN shelf_life_days INTEGER NOT NULL DEFAULT 0`);
@@ -4660,6 +4765,68 @@ function initializeSchema(db: Database.Database) {
     if (!has('param_order'))            db.exec(`ALTER TABLE whatsapp_templates ADD COLUMN param_order TEXT DEFAULT ''`);            // JSON array of var names in {{1}},{{2}}… order; empty → WA_EVENT_PARAM_ORDER
     if (!has('send_as_template'))       db.exec(`ALTER TABLE whatsapp_templates ADD COLUMN send_as_template INTEGER NOT NULL DEFAULT 0`); // 1 → send via provider template API, not free-form text
   } catch (e) { console.error('whatsapp_templates template-send migration failed:', e); }
+
+  // ── Migration: Meta template LIFECYCLE (authoring → submission → approval) ─
+  // Until now a template's approval state was not modelled at all: an admin
+  // typed a provider_template_name by hand and hoped Meta had approved it. A
+  // wrong guess fails at SEND time, per message, with an opaque Graph error.
+  //
+  // These columns give a local row its Meta lifecycle so the state is known
+  // BEFORE a campaign goes out. Every one is additive with an empty/0 default,
+  // so the 11 existing rows keep behaving EXACTLY as today:
+  //   meta_status = '' means "not managed by the Meta lifecycle" — a local
+  //   free-form template. Nothing gates on '' (see wa-template-authoring.ts:
+  //   templateSendability), so notifyEvent / the inbox picker / the broadcast
+  //   picker read the same 9 columns they always did.
+  //
+  // meta_category is DELIBERATELY separate from `category`: the local column is
+  // the venue's own vocabulary (notification|marketing|approval|general) and
+  // three consumers order/filter by it — the broadcast picker sorts marketing
+  // first. Meta's vocabulary (MARKETING|UTILITY|AUTHENTICATION) is a different
+  // axis with a ~7× price gap; overloading one column would break both.
+  try {
+    const cols = db.prepare("PRAGMA table_info(whatsapp_templates)").all() as any[];
+    const has = (n: string) => cols.some((c: any) => c.name === n);
+    // Meta's own id for the template — REQUIRED for the edit/delete-by-id path.
+    if (!has('meta_template_id'))       db.exec(`ALTER TABLE whatsapp_templates ADD COLUMN meta_template_id TEXT DEFAULT ''`);
+    // '' = local-only (unmanaged) | draft | pending | approved | rejected
+    // | paused | disabled | unknown_at_meta (submitted here, absent at Meta).
+    if (!has('meta_status'))            db.exec(`ALTER TABLE whatsapp_templates ADD COLUMN meta_status TEXT NOT NULL DEFAULT ''`);
+    // MARKETING | UTILITY | AUTHENTICATION — Meta's category, not the local one.
+    if (!has('meta_category'))          db.exec(`ALTER TABLE whatsapp_templates ADD COLUMN meta_category TEXT DEFAULT ''`);
+    // JSON components[] exactly as submitted (HEADER/BODY/FOOTER/BUTTONS).
+    if (!has('meta_components'))        db.exec(`ALTER TABLE whatsapp_templates ADD COLUMN meta_components TEXT DEFAULT ''`);
+    // Meta's VERBATIM rejection reason — never paraphrased on its way to the UI.
+    if (!has('meta_rejected_reason'))   db.exec(`ALTER TABLE whatsapp_templates ADD COLUMN meta_rejected_reason TEXT DEFAULT ''`);
+    // Verbatim Graph error from the last submit attempt (empty on success).
+    if (!has('meta_last_error'))        db.exec(`ALTER TABLE whatsapp_templates ADD COLUMN meta_last_error TEXT DEFAULT ''`);
+    if (!has('meta_submitted_at'))      db.exec(`ALTER TABLE whatsapp_templates ADD COLUMN meta_submitted_at TEXT DEFAULT ''`);
+    if (!has('meta_status_checked_at')) db.exec(`ALTER TABLE whatsapp_templates ADD COLUMN meta_status_checked_at TEXT DEFAULT ''`);
+    // JSON [{ index, name, example }] — the variable spec the broadcast wizard
+    // maps against. `name` is the var the wizard binds ({{1}} ← name/venue/…),
+    // `example` is what Meta requires at submission for every placeholder.
+    if (!has('var_spec'))               db.exec(`ALTER TABLE whatsapp_templates ADD COLUMN var_spec TEXT DEFAULT ''`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_wa_templates_meta ON whatsapp_templates(meta_status, name)`);
+  } catch (e) { console.error('whatsapp_templates lifecycle migration failed:', e); }
+
+  // Ground-truth marker for the broadcast approval gate. EMPTY means Meta has
+  // never been listed, so the gate cannot prove a template is unapproved and
+  // stays permissive (today's behaviour, preserved). Once a sync succeeds this
+  // holds its UTC timestamp and absence-from-Meta becomes a refusable fact.
+  try {
+    db.exec(`INSERT OR IGNORE INTO settings (key, value) VALUES ('wa_templates_last_sync_at', '')`);
+  } catch (e) { console.error('wa_templates_last_sync_at seed failed:', e); }
+
+  // Why a campaign stopped, when it was not a human who stopped it. Reuses the
+  // existing 'paused' state ON PURPOSE — every consumer (UI badge, resume
+  // button, action route) already handles 'paused', and a NEW state value would
+  // fall through CAMP_STYLE[state] and strand the campaign with no resume.
+  try {
+    const cols = db.prepare("PRAGMA table_info(wa_campaigns)").all() as any[];
+    if (!cols.some((c: any) => c.name === 'halt_reason')) {
+      db.exec(`ALTER TABLE wa_campaigns ADD COLUMN halt_reason TEXT NOT NULL DEFAULT ''`);
+    }
+  } catch (e) { console.error('wa_campaigns halt_reason migration failed:', e); }
 
   // Interakt provider API key (Basic-auth secret, used AS-IS). Additive seed.
   try {
@@ -5377,6 +5544,164 @@ function initializeSchema(db: Database.Database) {
       CREATE INDEX IF NOT EXISTS idx_it_src_dst    ON inventory_transactions(src_id, dst_id)     WHERE src_id <> '' OR dst_id <> '';
     `);
   } catch (e) { console.error('movement-record schema failed:', e); }
+
+  /* ── party_consumption → party_issue : A TRANSFER THAT WAS CALLED A LOSS ──
+   *
+   * A party requisition's store→department hand-over wrote
+   * inventory_transactions.type = 'party_consumption'. It is not a consumption:
+   * the goods move to the department, whose on_hand is credited in the same
+   * transaction (src/lib/party-fulfillment.ts), and the kitchen draws them down
+   * afterwards. But the TYPE is what every report buckets on, and this one sat
+   * in the outflow whitelist beside 'sale' and 'wastage' — so an internal
+   * transfer read as stock consumed and gone. That is the whole defect: the
+   * movement was always right, its NAME was wrong.
+   *
+   * 'party_issue' ("Issued to a party / event") already existed in
+   * CENTRAL_TXN_TYPES and is what actually happened. This reclassifies the
+   * history so old rows and new rows say the same thing.
+   *
+   * ⚠ THIS TOUCHES A TYPE VALUE. IT MUST NEVER TOUCH THE TABLE OF THE SAME
+   *   NAME. `party_consumption` is ALSO a table (created ~line 2493 above —
+   *   the Liquor Consumption register that feeds party P&L). It is a different
+   *   object with a different purpose and it is not involved here. Note the
+   *   shape of the statement below: `inventory_transactions` is its only object
+   *   and the string 'party_consumption' appears exactly once, as a quoted
+   *   literal compared against a COLUMN. Never in a FROM / UPDATE / INTO
+   *   position. A find-and-replace that forgets this corrupts the register.
+   *
+   * IDEMPOTENT BY CONSTRUCTION, and deliberately WITHOUT a settings flag. The
+   * WHERE is self-limiting: after one run no row matches, so a second run
+   * changes 0. The house flag idiom exists to stop boot-time recomputes from
+   * reverting ADMIN decisions; nobody sets inventory_transactions.type by hand,
+   * so that rationale does not apply — and a flag would make this
+   * non-convergent, stranding any row restored from an old backup under the
+   * legacy name for ever. Unconditional + self-limiting is the safer shape.
+   *
+   * SAFE IN EITHER DIRECTION because it is NOT what makes the code correct:
+   * every predicate on both party writers matches BOTH names, permanently
+   * (movement-record.ts PARTY_TRANSFER_TYPES). New code on un-migrated rows is
+   * safe; a restored pre-migration backup is safe and re-converges on boot.
+   * THE ONE UNSAFE DIRECTION IS A CODE ROLLBACK AFTER THIS HAS RUN: old code
+   * re-arms a narrow 'party_consumption'-only guard against renamed rows, every
+   * already-fulfilled party looks un-transferred, and central is deducted a
+   * SECOND time. Roll the database back with the code, or reverse the rename
+   * first (bounded by `reference_id IN (SELECT id FROM requisitions)` — a bare
+   * reverse would capture the Party Items rail, which writes 'party_issue'
+   * natively and was never 'party_consumption').
+   */
+  try {
+    // Partial index on the LEGACY value only. In the steady state it holds ZERO
+    // entries (no row carries the old name), so it costs ~44 KB and nothing
+    // else — and it turns the convergent UPDATE below from a full scan of the
+    // largest table on every cold start into an index probe.
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_it_legacy_party_consumption
+        ON inventory_transactions(type) WHERE type = 'party_consumption';
+    `);
+    const moved = db.prepare(`
+      UPDATE inventory_transactions
+         SET type = 'party_issue'
+       WHERE type = 'party_consumption'
+    `).run().changes;
+    if (moved > 0) console.log(`[db] party_issue rename: reclassified ${moved} ledger row(s)`);
+  } catch (e) { console.error('party_issue rename migration failed:', e); }
+
+  /* ── THE ROLLBACK BACKSTOP: A GUARD THAT LIVES IN THE DATABASE ─────────────
+   *
+   * The rename above has ONE unsafe direction, and it is not reachable from the
+   * code that ships with it: roll the CODE back to a build whose idempotency
+   * guard matches only 'party_consumption', leave the DATABASE migrated, and
+   * every already-fulfilled party requisition reads as never-transferred. The
+   * old guard finds nothing, the old cascade deducts the same goods a SECOND
+   * time, and the old PO void credits back ZERO rows while still un-fulfilling
+   * the requisition. Measured at 1,592 rows and −6,095,974 units of real stock.
+   *
+   * No amount of care in THIS release can fix that, because in that world this
+   * release's code is gone. The only defence that survives a code rollback is
+   * one that lives in the database file itself — so here it is.
+   *
+   * WHAT IT BLOCKS, AND ONLY THIS: inserting a party-transfer row for a
+   * reference_id that ALREADY carries a party-transfer row under the OTHER type
+   * name. That is the exact and complete signature of the double deduction:
+   * old code writing 'party_consumption' on top of migrated 'party_issue' rows,
+   * or new code writing 'party_issue' on top of un-migrated legacy rows. The
+   * insert aborts, and because both writers deduct raw_materials.current_stock
+   * inside the same transaction as the ledger row, the deduction rolls back
+   * with it. LOUD AND INTACT beats silent and wrong.
+   *
+   * IT CANNOT FIRE IN FORWARD OPERATION, and that is structural, not hopeful:
+   *   · One fulfilment writes ONE type name for every line, so a multi-line
+   *     party requisition never trips it (same type ⇒ `type <> NEW.type` false).
+   *   · The two writers guard each other on reference_id before they insert, so
+   *     the second rail skips rather than reaching this trigger at all.
+   *   · A PO void DELETEs the party rows before any re-receive re-inserts them,
+   *     so the round trip is clean.
+   *   · The Party Items rail (api/parties/items) has only ever written
+   *     'party_issue', against a party_items id that is never a requisition id,
+   *     and its returns are typed 'party_return' — outside the WHEN clause.
+   *   · A NULL reference_id matches nothing (`= NULL` is never true), so
+   *     un-referenced rows are unaffected.
+   * Verified against the live schema: zero (reference_id, material_id) or
+   * (reference_id, type) duplicates exist among party rows, and zero
+   * (req_id, material_id) duplicates exist across all 16,353 requisition_items.
+   *
+   * THE WHEN CLAUSE IS THE COST CONTROL. inventory_transactions takes an insert
+   * on every purchase, sale and transfer; SQLite evaluates the trigger body
+   * only when NEW.type is one of the two party names, so every other insert
+   * pays a single string comparison and nothing else.
+   *
+   * IF IT EVER DOES FIRE, the fix is not to drop it. Either roll the database
+   * back alongside the code, or run the bounded reverse —
+   * `node scripts/party-issue-rollback.js <db> --apply` — which is bounded by
+   * `reference_id IN (SELECT id FROM requisitions)` precisely so it cannot drag
+   * the natively-'party_issue' Party Items rail back to a name it never had.
+   */
+  try {
+    /* THE PARTY REFERENCE INDEX — what makes all of this free.
+     *
+     * FIVE predicates now probe inventory_transactions by reference_id + the
+     * two party type names: the two idempotency guards (party-fulfillment.ts,
+     * po-requisition-fulfil.ts), the PO void's plan SELECT and its DELETE, and
+     * the trigger body below. inventory_transactions has NO index on
+     * reference_id, so every one of them was a full SCAN of the largest table —
+     * on the hot store-issue path, synchronously, once per line.
+     *
+     * PARTIAL, on purpose. Measured on a synthetic table at production's ~1:250
+     * party-row ratio, guard probe and party insert (trigger live):
+     *    12,000 rows   no index  0.4188 / 0.4804 ms   SCAN
+     *                  partial   0.0015 / 0.0044 ms   SEARCH ... USING INDEX      12 KB
+     *   500,000 rows   no index  1.3870 / 26.7795 ms  SCAN
+     *                  partial   0.0020 / 0.0045 ms   SEARCH ... USING INDEX      53 KB
+     *                  FULL      0.0041 / 0.0045 ms   same speed, 8,974,336 bytes
+     * The full index is 169× the size for no gain, because only party rows are
+     * ever looked up this way. And a non-party insert (a purchase, a sale) pays
+     * NOTHING for the partial index — 0.0030 ms with it, 0.0030 ms without —
+     * since those rows are not in it at all.
+     *
+     * Verified with EXPLAIN QUERY PLAN that SQLite really does match the index's
+     * `type IN (...)` against the guards' own `type IN (...)`:
+     *   SEARCH inventory_transactions USING INDEX idx_it_party_ref (reference_id=?)
+     */
+    db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_it_party_ref
+        ON inventory_transactions(reference_id)
+        WHERE type IN ('party_consumption', 'party_issue');
+    `);
+    db.exec(`
+      CREATE TRIGGER IF NOT EXISTS trg_party_transfer_no_double_deduct
+      BEFORE INSERT ON inventory_transactions
+      WHEN NEW.type IN ('party_consumption', 'party_issue')
+      BEGIN
+        SELECT RAISE(ABORT,
+          'party transfer already recorded for this reference under the other type name - refusing a second central deduction (see PARTY_TRANSFER_TYPES / scripts/party-issue-rollback.js)')
+        FROM inventory_transactions
+        WHERE reference_id = NEW.reference_id
+          AND type IN ('party_consumption', 'party_issue')
+          AND type <> NEW.type
+        LIMIT 1;
+      END;
+    `);
+  } catch (e) { console.error('party transfer double-deduct trigger failed:', e); }
 
   // ── Party Menu (manager-enabled LIMITED menu for selected tables, additive) ─
   // A curated subset of à-la-carte items shown ONLY on specific tables' QR menu
@@ -6474,6 +6799,46 @@ function initializeSchema(db: Database.Database) {
       } catch (e) { console.error('[db] ct_guests_autosave_backfill_v1 failed (rolled back):', e); }
     }
   } catch (e) { console.error('ct (call-to-table CRM) schema failed:', e); }
+
+  // ── BILL ON HOLD (boh_*) ─────────────────────────────────────────────────
+  // The BOH lifecycle + accountability register: a held POS bill from the
+  // moment it is parked until the whole amount is collected and the record is
+  // closed. Owner's objective, verbatim: "to create a complete BOH lifecycle
+  // and accountability system — from the moment a POS bill is placed on hold
+  // until the entire payment is collected and the BOH is officially closed."
+  //
+  // THE WHOLE MODULE LIVES IN src/lib/boh-schema.ts, NOT HERE. Only this call
+  // site is in db.ts, for the two reasons the bill-handover call site ~1,100
+  // lines below already states:
+  //   1. THIS FILE HAS FIVE CONCURRENT EDITORS. Four lanes carry uncommitted
+  //      hunks inside initializeSchema right now — butchering (~4102),
+  //      party_issue (~5384), the store bill-handover call site (~7749), and
+  //      the gated liquor foundation (~8473, which owns every line to the end
+  //      of this function). A 400-line DDL block here would be a fifth merge
+  //      surface in one function; a require() is one line that cannot collide.
+  //      THIS SPOT IS DELIBERATE: it is the midpoint of the largest gap between
+  //      those hunks — ~1,100 lines after the party_issue hunk ends and ~1,100
+  //      before the bill-handover hunk begins, on the block boundary between
+  //      the ct (call-to-table CRM) schema above and RESERVEGO below.
+  //   2. initializeSchema SWALLOWS ERRORS. ensureBohSchema() runs one try/catch
+  //      PER STATEMENT and then VERIFIES its tables against sqlite_master, and
+  //      every route under /api/boh calls it again on first use — so a boot
+  //      failure swallowed here is repaired on the next request instead of
+  //      becoming a permanent "no such table" 500.
+  //
+  // require(), not a top-level import, for the same reason getDb() uses one for
+  // ./units: boh-schema is a LEAF (better-sqlite3 types only), and keeping it
+  // out of this file's import block keeps the diff to this single hunk. An
+  // import back into db.ts from there would close a cycle at module-init time.
+  //
+  // IT WRITES NO ADMIN-OWNED STATE — no users, roles, departments or
+  // page_access — so scripts/check-boot-migrations.js has nothing to flag, and
+  // every statement is CREATE ... IF NOT EXISTS, so a re-run touches no row.
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { ensureBohSchema } = require('./boh-schema') as typeof import('./boh-schema');
+    ensureBohSchema(db, true);
+  } catch (e) { console.error('boh schema failed:', e); }
 
   // ══ RESERVEGO RESERVATION IMPORT — SCHEMA ONLY (2026-08) ══════════════════
   //
@@ -7585,6 +7950,40 @@ function initializeSchema(db: Database.Database) {
     }
   } catch (e) { console.error('discount_limits_v1 migration failed:', e); }
 
+  // ── BILL SUBMISSION QUALITY CHECK (bill_handover*) ────────────────────────
+  // Tables + the forward-only cutoff for the Store -> Accounts vendor-bill
+  // handover register. Owner's purpose, verbatim: "create a proper audit trail
+  // and prevent situations where there is confusion about whether a vendor bill
+  // was actually handed over to the Accounts department."
+  //
+  // THE WHOLE MODULE LIVES IN src/lib/bill-handover-schema.ts, NOT HERE. Only
+  // this call site is in db.ts, for two reasons:
+  //   1. THIS FILE HAS FOUR CONCURRENT EDITORS. Three other lanes carry
+  //      uncommitted hunks in initializeSchema right now (butchering flags
+  //      ~4102, the party_issue migration ~5384, and the gated liquor
+  //      foundation ~8439, which also owns the last ~500 lines of this
+  //      function). A 300-line DDL block here would be a fourth merge surface
+  //      in the same function; a require() is one line that cannot collide.
+  //      This spot is deliberate: it sits between the discount-limits migration
+  //      above and the HRMS namespace below, ~2,200 lines after the party_issue
+  //      hunk and with the whole HRMS block (~690 lines) between it and the
+  //      liquor hunk.
+  //   2. initializeSchema SWALLOWS ERRORS. ensureBillHandoverSchema() runs one
+  //      try/catch PER STATEMENT and then VERIFIES the tables against
+  //      sqlite_master, and every route under /api/bill-submissions calls it
+  //      again on first use — so a boot failure swallowed here is repaired on
+  //      the next request instead of becoming a permanent "no such table" 500.
+  //
+  // require(), not a top-level import, for the same reason getDb() uses one for
+  // ./units: bill-handover-schema is a leaf (better-sqlite3 types +
+  // ./format-date, which imports nothing), and keeping it out of this file's
+  // import block keeps the diff to this single hunk.
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { ensureBillHandoverSchema } = require('./bill-handover-schema') as typeof import('./bill-handover-schema');
+    ensureBillHandoverSchema(db, true);
+  } catch (e) { console.error('bill_handover schema failed:', e); }
+
   // ── HRMS module (hr_ namespace) ──────────────────────────────────────────
   // Contract: docs/HRMS_DECISIONS.md (read it before touching anything here).
   // Phase 1 tables only; later phases append INSIDE this one block.
@@ -7730,7 +8129,10 @@ function initializeSchema(db: Database.Database) {
         date             TEXT NOT NULL,             -- IST business date (YYYY-MM-DD), the register key
         status           TEXT NOT NULL DEFAULT 'NOT_CHECKED_IN',
           -- NOT_CHECKED_IN|PRESENT|LATE|ON_BREAK|OUTSIDE_GEOFENCE|EARLY_CHECKOUT|
-          -- CHECKED_OUT|ABSENT|ON_LEAVE|HALF_DAY|OVERTIME|MISSING_CHECKOUT (vocab in src/lib/hr.ts)
+          -- CHECKED_OUT|ABSENT|ON_LEAVE|HALF_DAY|WEEKLY_OFF|OVERTIME|MISSING_CHECKOUT
+          -- (vocab in src/lib/hr.ts). WEEKLY_OFF is written ONLY by the roster
+          -- generator and ONLY under hr_weekly_off_policy='paid'; it is a PAID
+          -- day (absent from hr-payroll.ts's UNPAID_ATTENDANCE_STATUSES).
         first_in         TEXT NOT NULL DEFAULT '',  -- UTC datetimes; '' = none
         last_out         TEXT NOT NULL DEFAULT '',
         sessions         INTEGER NOT NULL DEFAULT 0, -- IN/OUT pairs; 2 on a split-shift day
@@ -8290,6 +8692,187 @@ function initializeSchema(db: Database.Database) {
    * An assertion that only runs on the happy path is not an assertion. See
    * bootDb() above and assertFssaiSchema() below. */
   applyFssaiSchema(db);
+
+  // ══ ROSTER GENERATOR CONFIG (hr_roster_coverage, hr_roster_shift_map) ══════
+  //
+  // Config only — the generator itself introduces no new roster row type: it
+  // writes SHIFT rows into hr_rosters exactly as the manual week grid does.
+  //
+  // OWNER RULING — WEEKLY OFFS ARE NOT PERSISTED. There is deliberately no "off"
+  // row type here, and hr_rosters is deliberately left alone. Two measured
+  // reasons:
+  //   1. hr_rosters cannot express an off at all: shift_id is NOT NULL and there
+  //      is no off concept in the column vocabulary.
+  //   2. An off stored as a roster row becomes a FALSE ABSENT.
+  //      src/lib/reports/hr-attendance-register.ts counts a roster row with no
+  //      matching attendance row as absent and does NOT join hr_shifts, so it
+  //      cannot tell a rostered shift from a rostered rest day.
+  // Offs are therefore computed and rendered (grid + printout) and never stored.
+  // Under the OPTIONAL hr_weekly_off_policy='paid' setting the off is recorded as
+  // an hr_attendance row with status WEEKLY_OFF — the attendance register, not
+  // the roster, and a status payroll already treats as PAID (it is absent from
+  // hr-payroll.ts's UNPAID_ATTENDANCE_STATUSES, so no payroll arithmetic moves).
+  //
+  // DEPARTMENT AND DESIGNATION IDS ARE READ, NEVER CREATED. departments /
+  // hr_designations are the owner's masters. No name is hardcoded here or in any
+  // caller: the local database still carries a legacy "Akan Service" department
+  // that production does NOT have (production has 15, none containing
+  // "Service"), so a generator keyed on a department NAME would configure a
+  // venue that does not exist. Both id columns default to '' and are MATCHED,
+  // not validated, by the reader — a department removed later leaves a harmless
+  // orphan config row instead of a failed boot.
+  try {
+    // One try/catch PER STATEMENT, then a sqlite_master proof below: a
+    // multi-statement batch stops at its first failure and silently skips the
+    // rest, and initializeSchema's own catch would swallow the whole block.
+    // Same shape as ensureBohSchema() in src/lib/boh-schema.ts.
+    const rosterConfigDdl: Array<{ name: string; sql: string }> = [
+      {
+        name: 'hr_roster_coverage',
+        sql: `
+          CREATE TABLE IF NOT EXISTS hr_roster_coverage (
+            id             TEXT PRIMARY KEY,
+            department_id  TEXT NOT NULL DEFAULT '',   -- departments.id; '' = every department
+            designation_id TEXT NOT NULL DEFAULT '',   -- hr_designations.id; '' = the WHOLE department
+            weekday        INTEGER NOT NULL,           -- 0=Sun, 1=Mon .. 6=Sat (JS getDay / SQLite %w)
+            shift_role     TEXT NOT NULL DEFAULT '',   -- '' = the day TOTAL across every shift
+            -- MINIMUM PRESENT, NOT A MAX-OFFS CAP. Owner rule 3, verbatim:
+            -- coverage is "minimum present per group per day". The two are not
+            -- interchangeable — headcount moves with joiners, leavers and
+            -- approved leave, so a cap of "2 offs" silently becomes a different
+            -- floor every week, while a floor of "6 present" stays the promise
+            -- the owner actually made. Nothing in this module may store or
+            -- compute a max-offs number.
+            min_present    INTEGER NOT NULL DEFAULT 0,
+            note           TEXT NOT NULL DEFAULT '',
+            updated_by     TEXT NOT NULL DEFAULT '',   -- me.email (house actor convention)
+            updated_at     TEXT NOT NULL DEFAULT (datetime('now'))
+          )`,
+      },
+      {
+        name: 'hr_roster_shift_map',
+        sql: `
+          CREATE TABLE IF NOT EXISTS hr_roster_shift_map (
+            id             TEXT PRIMARY KEY,
+            department_id  TEXT NOT NULL DEFAULT '',   -- departments.id; '' = every department
+            -- The owner's own shift vocabulary, from his AKAN SERVICE sheet
+            -- footer. Free TEXT because the roles are HIS words, not ours:
+            --   MS         Morning Shift
+            --   M 2 C      Morning to Closing
+            --   MOR BREAK  (written "11AM/B") a SPLIT shift: 11:00-15:30 AND
+            --              18:30-closing
+            --   SECOND     (written "2:30 PM") 14:30-closing
+            --   NIGHT      18:30-03:30
+            shift_role     TEXT NOT NULL,
+            -- WHY WEEKDAY IS PART OF THE KEY. hr_shifts has NO weekday
+            -- dimension, and SUNDAY TIMINGS DIFFER: MOR BREAK is 11:00-16:00 +
+            -- 19:30-closing and SECOND is 14:00-closing. Sunday therefore needs
+            -- its OWN hr_shifts rows, and this map is what points at them.
+            weekday        INTEGER NOT NULL,           -- 0=Sun, 1=Mon .. 6=Sat
+            -- hr_shifts.id. NO FALLTHROUGH TO THE WEEKDAY TEMPLATE: an unmapped
+            -- (department, role, weekday) is a REFUSAL the generator must name,
+            -- never a silent substitution — substitution is exactly how Sunday's
+            -- 19:30 would quietly become the weekday 18:30, invisible until
+            -- staff turned up ninety minutes early.
+            shift_id       TEXT NOT NULL,
+            updated_by     TEXT NOT NULL DEFAULT '',
+            updated_at     TEXT NOT NULL DEFAULT (datetime('now'))
+          )`,
+      },
+    ];
+    const rosterConfigIndexDdl: Array<{ name: string; sql: string }> = [
+      {
+        name: 'idx_hr_roster_cov_key',
+        sql: `CREATE UNIQUE INDEX IF NOT EXISTS idx_hr_roster_cov_key
+                ON hr_roster_coverage(department_id, designation_id, weekday, shift_role)`,
+      },
+      {
+        // (role, weekday) resolves to ONE shift per department — this uniqueness
+        // is what makes the refusal above meaningful.
+        name: 'idx_hr_roster_map_key',
+        sql: `CREATE UNIQUE INDEX IF NOT EXISTS idx_hr_roster_map_key
+                ON hr_roster_shift_map(department_id, shift_role, weekday)`,
+      },
+      {
+        // "Which mappings point at this shift?" — asked before a shift is
+        // deactivated, so a warning can name the days that would go unmapped.
+        name: 'idx_hr_roster_map_shift',
+        sql: `CREATE INDEX IF NOT EXISTS idx_hr_roster_map_shift ON hr_roster_shift_map(shift_id)`,
+      },
+    ];
+    for (const t of [...rosterConfigDdl, ...rosterConfigIndexDdl]) {
+      // One statement each, so prepare().run() is enough (house runDdl shape).
+      try { db.prepare(t.sql).run(); }
+      catch (e) { console.error(`roster config DDL failed (${t.name}):`, e); }
+    }
+    // PROVE the tables are there instead of assuming it — the enclosing catch
+    // would otherwise let a missing table through in total silence, and the
+    // first symptom would be a "no such table" 500 inside the generator.
+    for (const t of rosterConfigDdl) {
+      const row = db
+        .prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`)
+        .get(t.name) as { name?: string } | undefined;
+      if (!row?.name) console.error(`roster config verification failed: table ${t.name} is absent`);
+    }
+
+    // hr_rosters.source — PROVENANCE, so a MANUAL EDIT WINS.
+    //
+    // '' (the default, and therefore every row ever written before this column
+    // existed) means MANUAL; 'generated' means the roster generator wrote it.
+    // Without this the generator cannot tell its own last output from a hand
+    // edit, and "regenerate the week" would silently overwrite the fix a manager
+    // made at 7pm — which is the manager's call, not ours. Unknown provenance
+    // deliberately fails towards "leave it alone".
+    //
+    // Additive and defaulted, so every existing reader is untouched: the grid's
+    // ROSTER_ROW_SELECT (`r.*`) simply gains a column, and nothing keys on it.
+    // hr_rosters still holds SHIFT rows only — this is not an off row type.
+    try {
+      const rosterCols = db.prepare(`PRAGMA table_info(hr_rosters)`).all() as Array<{ name: string }>;
+      if (rosterCols.length && !rosterCols.some((c) => c.name === 'source')) {
+        db.prepare(`ALTER TABLE hr_rosters ADD COLUMN source TEXT NOT NULL DEFAULT ''`).run();
+      }
+      // ASSERT, don't assume — see the table proof above. A missing column here
+      // surfaces as a named refusal from commitRosterPlan rather than as a
+      // "no such column" 500 halfway through a week's write.
+      const after = db.prepare(`PRAGMA table_info(hr_rosters)`).all() as Array<{ name: string }>;
+      if (after.length && !after.some((c) => c.name === 'source')) {
+        console.error('roster config verification failed: hr_rosters.source is absent');
+      }
+    } catch (e) { console.error('hr_rosters source migration failed:', e); }
+  } catch (e) { console.error('roster config schema failed:', e); }
+
+  // ══ GUEST FEEDBACK & SERVICE RECOVERY (gf_) ════════════════════════════════
+  // Deliberately the LAST block in initializeSchema and isolated in its own
+  // try/catch, so a hiccup here can never break a table above it — and so a
+  // carve that must prove "zero feedback paths" has one contiguous region to
+  // lift out. Vocabulary lives in src/lib/feedback.ts; the comments below name
+  // the wire values so a reader of the DDL never has to open that file to know
+  // what a column may hold.
+  //
+  // THE MODULE IS ALMOST ENTIRELY A READ over existing POS data. These three
+  // tables hold ONLY what the guest said and what was done about it. Nothing
+  // here duplicates an order, an item or a bill — `order_id` / `order_item_id`
+  // are the join back, and the few snapshot columns (table_number, floor,
+  // covers, captain_name, item_name, station) exist because a renamed table or
+  // a re-stationed dish must not retro-rewrite last month's complaints.
+  //
+  // ⚠️ NO FOREIGN KEYS, matching house style everywhere else in this file
+  // (better-sqlite3 here does not enable foreign_keys, so a declared FK would
+  // be decorative, and an ON DELETE CASCADE that silently worked one day would
+  // erase the service-recovery record the owner asked for). Orphan rows are
+  // handled by the reading query, never by the database deleting evidence.
+  try {
+    // The DDL itself now lives in GF_SCHEMA_SQL, immediately below, so the
+    // fixtures that seed these tables create them from the SAME STRING this
+    // boot runs. Before P3 they could not: the DDL was inline here and reachable
+    // only by booting the app, so `scripts/feedback-scope-fixture.js` DELETEd and
+    // INSERTed into tables it assumed existed — and on a database snapshot that
+    // had never been booted since this block shipped, the 526-assertion suite
+    // died on `no such table: gf_follow_ups` before its first assertion. One
+    // string, two callers, no drift.
+    createGuestFeedbackSchema(db);
+  } catch (e) { console.error('guest-feedback schema failed:', e); }
 }
 
 /* ── FSSAI COMPLIANCE (fssai_) ─────────────────────────────────────────────
@@ -10261,6 +10844,174 @@ function assertFssaiSchema(db: Database.Database) {
   } catch (e) {
     console.error('[db] FSSAI SCHEMA NOT OK — the boot assertion itself failed:', e);
   }
+}
+
+/**
+ * THE `gf_` DDL, as one string — deliberately still in THIS file and directly
+ * below the block that runs it, so the carve note above (“one contiguous region
+ * to lift out”) still holds and `db.ts` never has to import a `feedback/` path
+ * to build its own schema.
+ *
+ * Exported for ONE reason: a test fixture must be able to create these three
+ * tables without booting a server. `initializeSchema()` is the only runtime
+ * caller; everything about the SQL — the comments, the column order, the
+ * UNIQUE indexes — is unchanged from the block that shipped at 6194ccf.
+ */
+export const GF_SCHEMA_SQL = `
+      -- ── gf_visits ─ ONE row per ORDER the GRE has taken feedback on. ───────
+      -- A REVISIT DOES NOT CREATE A SECOND ROW. The owner's cycle is
+      -- "GRE Visits → … → GRE Revisits → Guest Satisfaction Checked → Issue
+      -- Closed"; the revisit writes gf_follow_ups, so coverage (Feedback Taken
+      -- ÷ Eligible Tables) stays a straight COUNT and cannot be inflated by
+      -- visiting the same table twice.
+      CREATE TABLE IF NOT EXISTS gf_visits (
+        id              TEXT PRIMARY KEY,
+        outlet_id       TEXT NOT NULL DEFAULT '',
+        order_id        TEXT NOT NULL,
+        table_id        TEXT NOT NULL DEFAULT '',
+        -- Snapshots taken at visit time. floor is restaurant_tables.ZONE:
+        -- there is no 'floor' column on that table and SELECT floor errors;
+        -- sales-reports.ts, sales-dashboard.ts and stale-tables.ts all already
+        -- alias 'zone AS floor'. An empty zone renders as the literal 'Floor'
+        -- in the Captain UI (CaptainShell.tsx:31), so a Floor filter must
+        -- bucket '' and 'Floor' together the way captain-area.ts:30 does.
+        table_number    TEXT NOT NULL DEFAULT '',
+        floor           TEXT NOT NULL DEFAULT '',
+        covers          INTEGER NOT NULL DEFAULT 0,   -- Pax  (orders.covers)
+        captain_name    TEXT NOT NULL DEFAULT '',     -- orders.server_name
+        items_ordered   INTEGER NOT NULL DEFAULT 0,   -- COUNT(order_items) at visit
+        -- Who took it. Recorded from the SESSION, never from the request body.
+        gre_user_id     TEXT NOT NULL DEFAULT '',
+        gre_email       TEXT NOT NULL DEFAULT '',
+        gre_name        TEXT NOT NULL DEFAULT '',
+        gre_role        TEXT NOT NULL DEFAULT '',     -- role_name at visit time
+        -- The 10-20 second happy path: "Everything Good" → Submit. 1 means the
+        -- GRE affirmed it, NOT that fields were left blank — an abandoned form
+        -- never becomes a row at all.
+        everything_good INTEGER NOT NULL DEFAULT 0,
+        overall_rating  TEXT NOT NULL DEFAULT '',     -- excellent|good|average|poor|''
+        -- The four categories. '' is legitimate: §3 says "Not every field
+        -- mandatory".
+        cat_food        TEXT NOT NULL DEFAULT '',     -- excellent|good|average|poor|''
+        cat_drinks      TEXT NOT NULL DEFAULT '',
+        cat_service     TEXT NOT NULL DEFAULT '',
+        cat_ambience    TEXT NOT NULL DEFAULT '',
+        comment         TEXT NOT NULL DEFAULT '',
+        status          TEXT NOT NULL DEFAULT 'taken',-- taken|issue|follow_up
+        -- Denormalised counters, maintained in the same transaction as the rows
+        -- they count. They are a CACHE, never the truth: every one of them is
+        -- recomputable from gf_item_feedback / gf_follow_ups, and P6's
+        -- verification must prove they agree. They exist because Page 1 polls a
+        -- table board every few seconds and must not aggregate two tables per
+        -- card to colour a pill.
+        has_negative    INTEGER NOT NULL DEFAULT 0,
+        follow_ups_total INTEGER NOT NULL DEFAULT 0,
+        open_follow_ups INTEGER NOT NULL DEFAULT 0,
+        created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      -- One feedback record per order, enforced by the database rather than by
+      -- every writer remembering to check. Deliberately a UNIQUE INDEX and not
+      -- a table-level UNIQUE: there is no migration framework here, and an
+      -- index can be dropped in a later boot block with one DROP INDEX, while a
+      -- table constraint would need a full rebuild of a table holding live
+      -- guest complaints.
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_gf_visits_order ON gf_visits(order_id);
+      CREATE INDEX IF NOT EXISTS idx_gf_visits_table   ON gf_visits(table_id);
+      CREATE INDEX IF NOT EXISTS idx_gf_visits_created ON gf_visits(created_at);
+      CREATE INDEX IF NOT EXISTS idx_gf_visits_gre     ON gf_visits(gre_user_id, created_at);
+      CREATE INDEX IF NOT EXISTS idx_gf_visits_open    ON gf_visits(open_follow_ups);
+
+      -- ── gf_item_feedback ─ per ORDERED ITEM. ──────────────────────────────
+      CREATE TABLE IF NOT EXISTS gf_item_feedback (
+        id              TEXT PRIMARY KEY,
+        visit_id        TEXT NOT NULL,
+        order_id        TEXT NOT NULL DEFAULT '',
+        order_item_id   TEXT NOT NULL DEFAULT '',
+        menu_item_id    TEXT NOT NULL DEFAULT '',
+        item_name       TEXT NOT NULL DEFAULT '',     -- snapshot of order_items.name
+        -- station is stored RAW, exactly as the line was ordered, and
+        -- item_group is the answer stationKdsSection() gave at WRITE time.
+        -- Both, not one: the classifier is TOTAL (a blank, NULL, typo'd or
+        -- renamed station silently returns 'kitchen' = Food), so keeping the
+        -- raw value is the only way Page 4 can count how often a drink was
+        -- mis-filed instead of letting it vanish into Food. Resolving the group
+        -- at write time also means a station renamed next year cannot
+        -- reclassify last month's complaints.
+        station         TEXT NOT NULL DEFAULT '',
+        item_group      TEXT NOT NULL DEFAULT 'food', -- food|drinks
+        quantity        REAL NOT NULL DEFAULT 0,
+        rating          TEXT NOT NULL DEFAULT '',     -- good|average|poor|''
+        issue           TEXT NOT NULL DEFAULT '',
+          -- taste|too_spicy|too_salty|cold|dry|overcooked|undercooked|
+          -- presentation|quantity|delay|other|''
+        comment         TEXT NOT NULL DEFAULT '',
+        action_taken    TEXT NOT NULL DEFAULT 'none',
+          -- none|returned|remade|replaced_same|replaced_other|cancelled
+        -- §7 Q3, answered the honest way: record WHICH item was given instead.
+        -- Two columns, and they are what stop Menu Item Analysis reporting a
+        -- replacement as a sale of the dish that was sent back.
+        replacement_menu_item_id TEXT NOT NULL DEFAULT '',
+        replacement_item_name    TEXT NOT NULL DEFAULT '',
+        is_negative     INTEGER NOT NULL DEFAULT 0,   -- rating IN (poor, average)
+        created_by      TEXT NOT NULL DEFAULT '',
+        created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      -- One feedback row per ordered line, for the same reason as above: a
+      -- second row for the same line would double-count the complaint in every
+      -- Page 4 rate. Same rationale for an INDEX over a table constraint.
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_gf_item_line
+        ON gf_item_feedback(visit_id, order_item_id);
+      CREATE INDEX IF NOT EXISTS idx_gf_item_visit  ON gf_item_feedback(visit_id);
+      CREATE INDEX IF NOT EXISTS idx_gf_item_menu   ON gf_item_feedback(menu_item_id);
+      CREATE INDEX IF NOT EXISTS idx_gf_item_neg    ON gf_item_feedback(is_negative, created_at);
+      CREATE INDEX IF NOT EXISTS idx_gf_item_action ON gf_item_feedback(action_taken);
+
+      -- ── gf_follow_ups ─ THE OPEN COMPLAINT. ───────────────────────────────
+      -- The owner, verbatim: "Remade/Replaced ⇒ automatically create Follow-Up
+      -- Required, and the complaint stays OPEN until the GRE revisits."
+      -- So: a row is born status='open' the moment an item feedback records
+      -- remade / replaced_same / replaced_other, and NOTHING closes it except a
+      -- recorded revisit whose happiness is 'happy'. There is no auto-close, no
+      -- expiry sweep and no cascade — settling the bill does not close it, and
+      -- neither does the end of the day. "Partially Happy" and "No - Still
+      -- Unhappy" both leave status='open' and stamp escalated_at, which is the
+      -- owner's "stays open for Manager attention".
+      CREATE TABLE IF NOT EXISTS gf_follow_ups (
+        id               TEXT PRIMARY KEY,
+        visit_id         TEXT NOT NULL,
+        item_feedback_id TEXT NOT NULL,
+        order_id         TEXT NOT NULL DEFAULT '',
+        table_id         TEXT NOT NULL DEFAULT '',
+        item_name        TEXT NOT NULL DEFAULT '',
+        action_taken     TEXT NOT NULL DEFAULT '',    -- the action that created it
+        status           TEXT NOT NULL DEFAULT 'open',-- open|closed
+        revisit_rating   TEXT NOT NULL DEFAULT '',    -- excellent|good|average|still_poor|''
+        happiness        TEXT NOT NULL DEFAULT '',    -- happy|partial|unhappy|''
+        revisit_comment  TEXT NOT NULL DEFAULT '',
+        revisited_at     TEXT NOT NULL DEFAULT '',
+        revisited_by     TEXT NOT NULL DEFAULT '',
+        closed_at        TEXT NOT NULL DEFAULT '',
+        closed_by        TEXT NOT NULL DEFAULT '',
+        escalated_at     TEXT NOT NULL DEFAULT '',    -- revisited but NOT closed
+        created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at       TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_gf_followup_item
+        ON gf_follow_ups(item_feedback_id);
+      CREATE INDEX IF NOT EXISTS idx_gf_fu_visit  ON gf_follow_ups(visit_id);
+      CREATE INDEX IF NOT EXISTS idx_gf_fu_open   ON gf_follow_ups(status, created_at);
+      CREATE INDEX IF NOT EXISTS idx_gf_fu_table  ON gf_follow_ups(table_id, status);
+`;
+
+/**
+ * Create the three Guest Feedback tables and their indexes if they are absent.
+ * `CREATE TABLE IF NOT EXISTS` throughout, so it is safe to call on a database
+ * that already has them.
+ */
+export function createGuestFeedbackSchema(db: Database.Database): void {
+  db.exec(GF_SCHEMA_SQL);
 }
 
 // ---- UTILITY FUNCTIONS ----

@@ -1,4 +1,5 @@
 import { getCurrentUser, isManagement } from '@/lib/auth';
+import { requireFinanceReport } from '@/lib/finance-reports-access';
 import { RETURN_STATUSES } from '@/lib/returns';
 import {
   getReturnLog,
@@ -260,7 +261,8 @@ export async function GET(req: Request) {
     // Same gate, same wording, as /api/reports/issue-log.
     const me = await getCurrentUser();
     if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-    if (!isManagement(me)) return Response.json({ error: 'Management only' }, { status: 403 });
+    const deniedFin = requireFinanceReport(me, '/reports/returns');
+    if (deniedFin) return deniedFin;
 
     const sp = new URL(req.url).searchParams;
     const rawFrom = sp.get('from');

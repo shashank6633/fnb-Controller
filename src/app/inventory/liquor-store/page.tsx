@@ -298,6 +298,15 @@ export default function LiquorStorePage() {
   const [latestCountByStore, setLatestCountByStore] = useState<Record<string, string | null>>({});
 
   const [tab, setTab] = useState<'stock' | 'ledger' | 'closing' | 'reports'>('stock');
+  /* The Closing Stock sheet's business date, held HERE rather than inside
+     ClosingSection because that component is keyed on the store (see its
+     render site) and is therefore destroyed and rebuilt on every floor
+     switch. The date is a property of the counting session, not of the
+     floor — counting four bars for one night's close must not silently snap
+     the date back to today on each switch. Everything that IS per-floor
+     (the typed counts, the notes, the ✓saved markers, the as-of system
+     figures, the history list) dies with the instance, which is the fix. */
+  const [closingDate, setClosingDate] = useState(today());
   const [flash, setFlash] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [meRole, setMeRole] = useState<string>('');   // admin-only closing 'adjust' toggle
@@ -888,11 +897,61 @@ export default function LiquorStorePage() {
           )}
         </>
       ) : tab === 'closing' && store ? (
-        <ClosingSection
-          storeId={store.id} storeName={store.name}
-          stock={catalog} isAdmin={meRole === 'admin'}
-          onSaved={afterWrite}
-        />
+        /* ══════════════════════════════════════════════════════════════════
+         * ONE COUNT SHEET PER FLOOR — `key={store.id}` IS THE FIX, NOT DECOR
+         * ══════════════════════════════════════════════════════════════════
+         * BAR FLOOR 1/2/3 and the LIQUOR STORE are SEPARATE store_locations
+         * with separate ledgers, and this screen raises VARIANCE APPROVALS
+         * that move real stock once an admin signs them. Without a key React
+         * reconciled the SAME ClosingSection instance across a floor switch,
+         * so every per-material box (cases/whole/loose/notes, keyed on
+         * material_id alone), the "counted" chip and the client-computed
+         * variance survived verbatim onto the next floor — and pressing Save
+         * there wrote a REAL store_closing_counts row and a REAL pending
+         * variance_approvals row against a floor nobody had counted.
+         *
+         * KEYING, NOT CLEARING, is deliberate. A clear-on-change effect has
+         * to enumerate every piece of state, which is exactly how the bug was
+         * born: the only reset this component had (seedFromCounts, reached
+         * through `seed`) was gated on the DATE alone and had no notion of
+         * which store was selected. A key needs no enumeration and cannot
+         * rot as state is added — the instance is destroyed outright.
+         *
+         * `closingDate` is LIFTED so the remount does not silently snap the
+         * Closing Date back to today. Counting a venue means counting four
+         * stores for ONE business date; a date that resets itself mid-round
+         * is its own wrong-day-count hazard. The date belongs to the counting
+         * session, not to the floor, so it is the one thing that survives.
+         *
+         * THE LOAD GATE. `catalog` still holds the PREVIOUS floor's rows
+         * until loadStock() resolves. Mounting against those would paint the
+         * old floor's material list under the new floor's name, so the
+         * section is not rendered at all until `stockLoadedFor` says the
+         * catalog in hand belongs to the selected store. */
+        stockLoadedFor === store.id ? (
+          <ClosingSection
+            key={store.id}
+            storeId={store.id} storeName={store.name}
+            stock={catalog} isAdmin={meRole === 'admin'}
+            date={closingDate} onDateChange={setClosingDate}
+            onSaved={afterWrite}
+          />
+        ) : stockLoading ? (
+          <div className="p-8 text-center text-sm text-[#8B7355]">
+            <Loader2 className="w-5 h-5 animate-spin inline mr-2" /> Loading {store.name}…
+          </div>
+        ) : (
+          /* loadStock() failed (its message is in the `error` banner above).
+             Refusing to render the sheet is the point: a count typed against
+             another floor's catalog is the bug this screen just fixed. */
+          <div className="p-8 text-center text-sm text-[#8B7355] bg-white border border-[#E8D5C4] rounded-xl space-y-3">
+            <p>Could not load {store.name}&apos;s materials, so there is nothing safe to count against yet.</p>
+            <button onClick={() => loadStock()}
+                    className="px-3 py-2 bg-white border border-[#af4408] text-[#af4408] hover:bg-[#af4408]/10 rounded-lg text-sm font-medium">
+              Retry
+            </button>
+          </div>
+        )
       ) : tab === 'reports' && store ? (
         <ReportsSection storeId={store.id} storeCode={store.code || 'store'} />
       ) : (
@@ -2568,15 +2627,23 @@ const CSV_COLS_BULKADJ = ['material_id', 'SKU', 'Name', 'Category', 'Purchase un
    entry convention. Rows come from the page-loaded `stock` (every mapped
    material, zero-stock included); GET …/closing?date= prefills existing
    counts + notes for the chosen date. */
-function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
+function ClosingSection({ storeId, storeName, stock, isAdmin, date, onDateChange, onSaved }: {
   storeId: string; storeName: string; stock: StockRow[];
-  isAdmin: boolean; onSaved: (msg: string) => void;
+  isAdmin: boolean;
+  /** Owned by the page so it survives the per-store remount (see render site). */
+  date: string; onDateChange: (d: string) => void;
+  onSaved: (msg: string) => void;
 }) {
   const [showHistory, setShowHistory] = useState(false);
-  const [date, setDate] = useState(today());
   const [counts, setCounts] = useState<ClosingCount[]>([]);
   const [systemAsof, setSystemAsof] = useState<Record<string, number>>({});
-  const [dayLoading, setDayLoading] = useState(false);
+  /* TRUE on mount, not false. A fresh instance must never paint the count
+     grid before its GET lands: `systemAsof` is empty until then, so every
+     System Stock cell would read 0 btl and every typed figure would show as
+     a full-quantity EXCESS — the exact number the owner saw leak across his
+     floors. The grid is already gated on `dayLoading` (below); starting it
+     armed closes the one frame between mount and the first effect. */
+  const [dayLoading, setDayLoading] = useState(true);
   const [cases, setCases] = useState<Record<string, string>>({});   // full cases (case_size × BTL)
   const [whole, setWhole] = useState<Record<string, string>>({});   // purchase units (BTL)
   const [loose, setLoose] = useState<Record<string, string>>({});   // recipe units (ml)
@@ -2601,6 +2668,50 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
   const [histLoading, setHistLoading] = useState(false);
   const [histDate, setHistDate] = useState('');
   const [histCat, setHistCat] = useState('');
+
+  /* ════════════════════════════════════════════════════════════════════════
+   * WHICH FLOOR ARE THE BOXES FILLED FOR? — the honest answer, kept in a ref
+   * ════════════════════════════════════════════════════════════════════════
+   * Not "which floor is selected" (that is `storeId`), but "which floor was
+   * selected when the figures now sitting in cases/whole/loose/notes were
+   * typed". The two are the same only because this component is keyed on the
+   * store and because the guard below re-arms it — and it is precisely the
+   * gap between those two questions that let a count typed on BAR FLOOR 1 be
+   * saved onto BAR FLOOR 2. It rides along in every POST body as `store_id`,
+   * where the route compares it with the store in its own URL and refuses the
+   * write if they disagree (src/app/api/stores/[id]/closing/route.ts).
+   *
+   * Because it is seeded once per MOUNT, it cannot be fooled by the same
+   * refactor that would reintroduce the bug: strip the key and drop the reset
+   * below, and this ref stays pinned to the floor the boxes were filled for,
+   * so the server — not the screen — stops the write. */
+  const gatheredForStore = useRef(storeId);
+  /** Last `${store}|${date}` the input boxes were seeded for. Carries the
+   *  STORE as well as the date; tracking the date alone is the defect. */
+  const seededFor = useRef<string | null>(null);
+
+  /* ════════════════════════════════════════════════════════════════════════
+   * SECOND LINE OF DEFENCE — reset DURING RENDER if the store ever changes
+   * ════════════════════════════════════════════════════════════════════════
+   * The page keys this component on the store, so in the shipped tree this
+   * branch never runs: a floor switch destroys the instance instead. It is
+   * here for the day someone removes that key. React's documented "adjust
+   * state when a prop changes" pattern — a set during render, applied before
+   * anything is painted — so the previous floor's figures are gone BEFORE a
+   * frame can show them or a click can save them, which an effect could not
+   * promise. Everything derived from a floor is listed; `date` is not,
+   * because the date is the session's, not the floor's. */
+  const [renderedForStore, setRenderedForStore] = useState(storeId);
+  if (renderedForStore !== storeId) {
+    setRenderedForStore(storeId);
+    gatheredForStore.current = storeId;
+    seededFor.current = null;
+    setCases({}); setWhole({}); setLoose({}); setNotes({});
+    setCounts([]); setSystemAsof({}); setDayLoading(true);
+    setCsvResult(null); setZeroGuard(null); setErr(null); setBusy(false);
+    setCatFilter(''); setQ('');
+    setShowHistory(false); setDays([]); setHistDate(''); setHistCat('');
+  }
 
   const seedFromCounts = useCallback((rows: ClosingCount[]) => {
     // Prefill the Cases/Bottles/loose inputs + notes from that date's saved
@@ -2658,15 +2769,22 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
   // Returning from History (showHistory true→false) must NOT re-seed: it would
   // wipe in-progress physical counts / notes. We still reload (seed=false) so
   // the ✓saved markers and System Stock refresh to `date` after browsing other
-  // dates in history — but only actually re-seed when the date itself changed.
-  const seededDate = useRef<string | null>(null);
+  // dates in history — but only actually re-seed when the SHEET changed.
+  //
+  // "THE SHEET" IS STORE **AND** DATE — this was the defect. The key was the
+  // bare date, so the effect re-ran on a floor switch (loadDay's identity
+  // changes with storeId, which is why counts and systemAsof correctly
+  // reloaded) but computed seed === false, seedFromCounts was never called,
+  // and the typed boxes carried the previous floor's count over verbatim.
+  // A count sheet is identified by the floor it is for as much as by the day.
   useEffect(() => {
     if (showHistory) return;
     setCsvResult(null);
-    const seed = seededDate.current !== date;
-    seededDate.current = date;
+    const sheet = `${storeId}|${date}`;
+    const seed = seededFor.current !== sheet;
+    seededFor.current = sheet;
     loadDay(date, seed);
-  }, [date, showHistory, loadDay]);
+  }, [storeId, date, showHistory, loadDay]);
   useEffect(() => { if (showHistory) { loadHistory(); setHistDate(''); setHistCat(''); } }, [showHistory, loadHistory]);
 
   const countedBy = useMemo(() => {
@@ -2748,6 +2866,11 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
       const r = await api(`/api/stores/${storeId}/closing`, {
         method: 'POST',
         body: {
+          // THE FLOOR THESE FIGURES WERE TYPED FOR, declared to the server so
+          // it can refuse a sheet aimed at a different store than the one in
+          // its URL. Deliberately gatheredForStore.current, NOT `storeId`:
+          // sending the URL's store back to the server would assert nothing.
+          store_id: gatheredForStore.current,
           date,
           items: pending.map(({ r, phys }) => ({
             material_id: r.material_id,
@@ -2880,7 +3003,11 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
         // `adjust_to_physical` is retired — the route ignores it and sends every
         // non-zero variance to the approval queue. Kept pinned to false so the
         // bulk path can never opt into an inline reconcile if the flag returns.
-        body: { date, items, adjust_to_physical: false, confirm_zeros: confirmZeros },
+        // `store_id` is the floor the file was parsed against (see save()).
+        body: {
+          store_id: gatheredForStore.current,
+          date, items, adjust_to_physical: false, confirm_zeros: confirmZeros,
+        },
       });
       const j = await r.json();
       // THE ZERO-PATTERN REFUSAL — the spreadsheet door, and the one the
@@ -2990,7 +3117,7 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, onSaved }: {
             <div>
               <label htmlFor="lc-date" className="block text-xs font-medium text-[#6B5744] mb-1">Closing Date *</label>
               <input id="lc-date" type="date" value={date} max={today()}
-                     onChange={e => setDate(e.target.value)}
+                     onChange={e => onDateChange(e.target.value)}
                      className={`${inCls} [color-scheme:light]`} />
             </div>
             <div>

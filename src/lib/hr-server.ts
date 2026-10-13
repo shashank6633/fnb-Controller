@@ -114,8 +114,24 @@ export const HR_EMPLOYEE_JOINS = `
  * Use the SAME return values for both the page query and its COUNT(*) — the
  * crm-calls pagination convention requires the WHERE to be identical.
  */
+/**
+ * Sentinel for `department_id` meaning "has no department at all".
+ *
+ * A token inside the EXISTING filter param rather than a second boolean, which
+ * is the house shape: /api/crm-calls/recoveries does the same with
+ * `assigned_to=unassigned`, and /eod + /closing-stock use `__unassigned__` for
+ * locations. Keeping it in one param means the page query and its COUNT(*) can
+ * never diverge, which is employeeListWhere's whole stated contract.
+ *
+ * Double-underscored so it cannot collide with a real departments.id (they are
+ * UUIDs), and exported so the client asks for it by name instead of retyping a
+ * magic string that would silently stop matching if this ever changed.
+ */
+export const UNASSIGNED_DEPARTMENT = '__unassigned__';
+
 export function employeeListWhere(filters: {
   q?: string | null;
+  /** A departments.id, '' for "any", or UNASSIGNED_DEPARTMENT for "none". */
   department_id?: string | null;
   status?: string | null;
 }): { where: string; params: (string | number)[] } {
@@ -132,7 +148,23 @@ export function employeeListWhere(filters: {
   }
 
   const dept = String(filters.department_id ?? '').trim();
-  if (dept) {
+  if (dept === UNASSIGNED_DEPARTMENT) {
+    // THE 128. Production carries 129 employees on rolls and 128 of them have no
+    // department, so nothing can be rostered by field until they are classified —
+    // and until now no caller could even ASK for them: an empty department_id
+    // falls through the `else if (dept)` below and means "all departments".
+    //
+    // `= ''` AND NOT `IS NULL`. hr_employees.department_id is TEXT NOT NULL
+    // DEFAULT '', so unassigned is the EMPTY STRING and `IS NULL` would read
+    // perfectly and match zero rows forever. (users.department_id uses the
+    // opposite convention, which is exactly how that mistake gets made.)
+    //
+    // Deliberately tests the MAIN department only, not `AND sub_department_id =
+    // ''`. A row holding a sub-department with no main is itself broken, and the
+    // roster needs a main department — so it must stay visible here, not hide
+    // behind a stricter predicate.
+    clauses.push("e.department_id = ''");
+  } else if (dept) {
     clauses.push('(e.department_id = ? OR e.sub_department_id = ?)');
     params.push(dept, dept);
   }

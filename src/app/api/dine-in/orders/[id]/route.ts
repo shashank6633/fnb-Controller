@@ -68,7 +68,29 @@ function loadOrder(db: Database.Database, id: string) {
          ORDER BY j.created_at DESC LIMIT 1) AS print_error
     FROM kots k WHERE k.order_id = ? ORDER BY k.kot_number ASC
   `).all(id);
-  return { ...order, items, kots };
+  // WHAT IS STILL OWED, when this bill is on hold and carries a BOH record with
+  // collections already taken. /cashier's Collect button used to offer the whole
+  // frozen total; the settle route now refuses to take more than the balance, so
+  // the screen has to be able to show the same number. Isolated: a database
+  // without the BOH tables returns the order exactly as it did before.
+  let boh: { boh_id: string; paid: number; balance: number } | null = null;
+  try {
+    if (order.status === 'on_hold') {
+      // `status <> 'void'`, the SAME predicate as bohTillNetting() and as the
+      // orders LIST above. A write-off closes the record but leaves the bill on
+      // hold, so `= 'open'` hid the collections already taken on exactly the
+      // bills where the Collect button would then have offered the whole total.
+      const r = db.prepare(`
+        SELECT b.id, COALESCE((SELECT SUM(p.amount) FROM boh_payments p WHERE p.boh_id = b.id), 0) AS paid
+          FROM boh_bills b WHERE b.order_id = ? AND b.status <> 'void' LIMIT 1
+      `).get(id) as any;
+      if (r) {
+        const paid = Math.round((Number(r.paid) || 0) * 100) / 100;
+        boh = { boh_id: String(r.id), paid, balance: Math.round((Math.round(Number(order.total) || 0) - paid) * 100) / 100 };
+      }
+    }
+  } catch { boh = null; }
+  return { ...order, items, kots, boh };
 }
 
 /** GET — order with its line items. */

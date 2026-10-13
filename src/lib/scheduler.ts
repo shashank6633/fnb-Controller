@@ -1,12 +1,28 @@
 /**
- * In-process background scheduler. Boots when this module is first imported
- * (which happens on the first API request thanks to Next's lazy route bundling).
+ * In-process background scheduler. ARMED AT SERVER BOOT, from register() in
+ * src/instrumentation.ts. It used to arm only when this module was first imported
+ * — which happened on the first AUTHENTICATED request to /api/upcoming-parties or
+ * /api/crm-calls/broadcasts — so a quiet restart silently stopped every job below
+ * until somebody happened to open one of those pages. The route-level calls are
+ * still there and still harmless; globalThis makes arming idempotent.
  *
  * Guards against double-start via globalThis so HMR / multi-route imports
- * don't spawn parallel intervals.
+ * don't spawn parallel intervals. That guard is PER PROCESS: N pm2 workers get N
+ * ticks, which was already true before boot-arming, so every job below carries
+ * its own cross-process claim (an expiring SQLite transaction, a per-row
+ * compare-and-swap, or a once-per-IST-day sentinel).
  *
- * Every tick, in this order (each after the first is best-effort and wrapped so
- * it cannot break the loop):
+ * Every tick, in this order. EVERY ONE of them is wrapped in its own try —
+ * including the parties refresh, which until recently was the single unguarded
+ * statement here and skipped the nine jobs behind it whenever Sheets failed:
+ *   - runReviewAutoRefresh()       — the Google Reviews pull; THIS is its driver
+ *   - runWaDailyNotifications()    — low-stock summary + owner digest, once a day
+ *   - runTaskAutomation()          — recurring + maintenance task generation,
+ *                                    overdue sweep + escalation, once per IST day
+ *   - runBohReminders()            — Bill-on-Hold payment follow-ups, one per
+ *                                    (BOH, expected date). Placed ABOVE
+ *                                    refreshUpcomingParties so a Sheets failure
+ *                                    can never starve the money chase.
  *   - refreshUpcomingParties() + refreshPartyBookings()
  *   - checkDeferDueSoon()          — deferred requisition items coming due
  *   - sweepRecordingRetention()    — call recordings past the admin's window
@@ -14,6 +30,11 @@
  *   - checkKitchenExpiry()         — production batches at/near expiry
  *   - runWaReportJobs()            — scheduled WhatsApp reports, each at its own
  *                                    IST time, once per day per outlet
+ *
+ * runWaDailyNotifications and runTaskAutomation are here because they had NO
+ * DRIVER AT ALL: their only call site was POST /api/cron/refresh-parties, which
+ * an external caller cannot reach (absent from proxy.ts's isPublic(), so the
+ * proxy 401s a token-only POST before the route's x-cron-token check runs).
  *
  * Production-only by default. Set ENABLE_SCHEDULER=1 to force in dev for
  * local testing.
@@ -75,10 +96,154 @@ export function startSchedulerOnce(): void {
 
   const tick = async () => {
     try {
-      const res = await refreshUpcomingParties('cron');
-      globalThis.__fnbScheduler__!.lastRun = Date.now();
-      globalThis.__fnbScheduler__!.lastResult = res;
-      console.log(`[scheduler] refresh @ IST ${istHour()}h: ${res.fetched_parties} parties · ${res.status_changes} status changes · ${res.notifications_created} notifications · ${res.slack_sent} slack sent`);
+      // GOOGLE REVIEWS — the automatic pull. THIS IS THE DRIVER; without it
+      // there is none, and src/lib/reviews/refresh.ts says so in its own header
+      // ("NOTHING DRIVES THIS YET"). The external-cron alternative needs the
+      // refresh endpoint carved out of the proxy's protected prefixes, which is
+      // a change to a shared security file — so the in-process hook is the one
+      // that costs nothing to be wrong about.
+      //
+      // SAFE ON EVERY TICK. runReviewAutoRefresh decides for itself whether a
+      // pull is owed and returns 'not_due' in microseconds when it is not, so
+      // the 5-minute cadence costs a settings read. It also stamps a heartbeat
+      // FIRST and unconditionally, which is what lets the Reviews page show an
+      // automatic badge on evidence that a driver is alive rather than on the
+      // mere fact that a schedule was configured.
+      //
+      // IT NEVER THROWS by its own contract, and it takes an advisory lock so
+      // this tick and a future external cron cannot pull the same page twice
+      // against a quota Google does not publish a number for. The try/catch and
+      // the dynamic import are still here because every neighbour has them: a
+      // fault in the reviews module must not take the rest of the tick with it.
+      try {
+        const { runReviewAutoRefresh } = await import('./reviews/refresh');
+        const { getDb } = await import('./db');
+        const rev = await runReviewAutoRefresh({ db: getDb() });
+        // 'not_due' is the overwhelmingly common answer and says nothing worth
+        // a log line every five minutes. Everything else is worth seeing.
+        if (rev.outcome !== 'not_due') {
+          const counts = [
+            rev.inserted ? `${rev.inserted} new` : '',
+            rev.updated ? `${rev.updated} updated` : '',
+          ].filter(Boolean).join(', ');
+          console.log(`[scheduler] reviews: ${rev.outcome}${counts ? ` (${counts})` : ''} — ${rev.detail}`);
+        }
+      } catch (e) {
+        console.error('[scheduler] reviews refresh failed:', e instanceof Error ? e.message : e);
+      }
+
+      // WHATSAPP DAILY JOBS (low-stock summary + owner digest) and TASK
+      // MANAGEMENT AUTOMATION (recurring + maintenance generation, overdue sweep
+      // + escalation).
+      //
+      // THESE TWO HAD NO DRIVER AT ALL, which is why they are here. Each had
+      // exactly ONE call site in the whole of src — POST
+      // /api/cron/refresh-parties — and that route cannot be reached by an
+      // external caller: it is absent from proxy.ts's isPublic(), so proxy.ts
+      // answers a token-only POST with 401 "Sign in required" before the route's
+      // own x-cron-token check can run. Nothing else called them, so they simply
+      // never ran. MEASURED on the live database: `settings` has NO
+      // tm_automation_last_run row (the job has never completed a run), and all
+      // 21 active maintenance_schedules still read last_generated_date =
+      // 2026-07-15 — 67 days of daily, weekly and monthly checks never
+      // generated.
+      //
+      // ABOVE refreshUpcomingParties, like every other job here, and for the
+      // reason the route below states in its own words: a Sheets failure must
+      // never starve the daily pings.
+      //
+      // SAFE ON EVERY TICK AND SAFE TWICE OVER. Both are idempotent per IST day
+      // — runWaDailyNotifications dedupes against whatsapp_events_log and
+      // runTaskAutomation short-circuits on last_run_date == today — so the
+      // route keeping its own copies, and N pm2 workers each running a tick,
+      // cannot produce a second send or a second generated task.
+      // NOTE ON THE FILTER: runWaDailyNotifications returns
+      // Record<string, string> — the VALUES ARE STATUS STRINGS, not objects. Its
+      // neighbours on this tick return {status} objects, so reading r.status here
+      // would be undefined for every key and log "3 jobs acted" on every single
+      // tick forever.
+      try {
+        const { runWaDailyNotifications } = await import('./whatsapp');
+        const rep = await runWaDailyNotifications();
+        const acted = Object.entries(rep)
+          .filter(([, status]) => !['skipped', 'disabled', 'already_sent_today'].includes(status));
+        if (acted.length) {
+          console.log(`[scheduler] wa-daily @ IST ${istHour()}h: `
+            + acted.map(([job, status]) => `${job}=${status}`).join(' · '));
+        }
+      } catch (e) {
+        console.error('[scheduler] wa daily notifications failed:', e instanceof Error ? e.message : e);
+      }
+
+      try {
+        const { runTaskAutomation } = await import('./task-automation');
+        const { getDb } = await import('./db');
+        const ta: any = runTaskAutomation(getDb());
+        if (ta && ta.ran) console.log(`[scheduler] task-automation @ IST ${istHour()}h: ran for ${ta.date}`);
+      } catch (e) {
+        console.error('[scheduler] task automation failed:', e instanceof Error ? e.message : e);
+      }
+
+      // BILL ON HOLD — the payment-follow-up reminder. Same shape as the
+      // reviews block above (dynamic import, its own try/catch, cheap when
+      // nothing is due) and deliberately in the same place: ABOVE the
+      // `refreshUpcomingParties` call below.
+      //
+      // WHY ABOVE IT. refreshUpcomingParties is a Google Sheets call; when it
+      // fails (expired ADC, org policy, Sheets quota, network) the tick has
+      // nothing useful left to do for the parties rail, and a reminder that
+      // fires only on days Sheets is reachable is not a reminder — the owner's
+      // money has to be chased on the other days too. (The try/catch that now
+      // wraps that call below came from commit 93962d2; this block sitting
+      // above it is belt and braces, not a substitute for it.)
+      //
+      // SAFE ON EVERY TICK. runBohReminders' first statement is one indexed
+      // COUNT over idx_boh_bills_due; it returns 'not_due' in microseconds on
+      // the ~1,435 ticks a day when nothing is owed. It NEVER THROWS by its own
+      // contract, and it claims each (BOH, due date) slot atomically against a
+      // UNIQUE partial index — so a reminder fires ONCE for a due date, not
+      // every five minutes, even with two ticks racing.
+      //
+      // It also stamps its own heartbeat (a boh_reminders row per slot) rather
+      // than trusting globalThis.__fnbScheduler__.lastRun, which is never
+      // stamped on exactly the ticks that half-fail below.
+      try {
+        const { runBohReminders } = await import('./boh-reminders');
+        const { getDb } = await import('./db');
+        const boh = await runBohReminders(getDb());
+        // 'not_due' is the overwhelmingly common answer and says nothing worth
+        // a log line every five minutes. Everything else is worth seeing.
+        if (boh.outcome !== 'not_due') {
+          console.log(`[scheduler] boh-reminders: ${boh.outcome} — ${boh.detail}`);
+        }
+      } catch (e) {
+        console.error('[scheduler] boh reminders failed:', e instanceof Error ? e.message : e);
+      }
+
+      // GUARDED — AND THAT IS THE ENTIRE POINT OF THIS try.
+      //
+      // Until it existed, the call below was the tick's ONLY unguarded
+      // statement, so when the Google Sheets credential fails the throw jumped
+      // straight to the outer catch and SKIPPED THE NINE JOBS BEHIND IT: party
+      // bookings, defer-due warnings, GRN kitchen-QC escalation, the WhatsApp
+      // broadcast drain, scheduled reports and price-hike alerts among them.
+      // MEASURED: a deferred requisition item due in 2h produced ZERO
+      // notifications on a box whose scheduler was armed and ticking normally.
+      // Every other job in this tick already carried its own try; this is the
+      // one that never did.
+      //
+      // lastRun is stamped on BOTH paths, so a failing Sheets call can no longer
+      // make the tick look like it never happened.
+      try {
+        const res = await refreshUpcomingParties('cron');
+        globalThis.__fnbScheduler__!.lastRun = Date.now();
+        globalThis.__fnbScheduler__!.lastResult = res;
+        console.log(`[scheduler] refresh @ IST ${istHour()}h: ${res.fetched_parties} parties · ${res.status_changes} status changes · ${res.notifications_created} notifications · ${res.slack_sent} slack sent`);
+      } catch (e: any) {
+        console.error('[scheduler] parties refresh failed:', e?.message);
+        globalThis.__fnbScheduler__!.lastRun = Date.now();
+        globalThis.__fnbScheduler__!.lastResult = { error: e?.message };
+      }
 
       // Party Bookings tab → feeds the GRE "What's On" board. Best-effort on the
       // same cadence; a failure here must NEVER break the F&P refresh loop.

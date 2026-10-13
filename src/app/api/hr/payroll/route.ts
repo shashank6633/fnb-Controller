@@ -2,7 +2,8 @@
 import { getDb, generateId, logAuditEvent } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
 import { canAdminHr } from '@/lib/hr';
-import { computePayrollItem, finalizeRunGuard, payrollPeriodBounds } from '@/lib/hr-payroll';
+import { computePayrollItem, finalizeRunGuard, payrollPeriodBounds, statutoryDriftSinceCompute } from '@/lib/hr-payroll';
+import { getHrOrgState } from '@/lib/hr-attendance';
 import { reportServerError } from '@/lib/error-alerts';
 
 /**
@@ -397,6 +398,10 @@ function computeRun(me: any, body: any, request: Request): Response {
        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
 
+    // The state every statutory rate in THIS run resolves against. Read once,
+    // outside the transaction and above the loop, so one run is one rate set.
+    const orgState = getHrOrgState(db);
+
     // Everything inside is synchronous: computePayrollItem is read-only and
     // await-free by contract (hr-payroll.ts header), so delete + compute +
     // insert is ONE atomic replace.
@@ -423,7 +428,16 @@ function computeRun(me: any, body: any, request: Request): Response {
           continue;
         }
 
-        const result = computePayrollItem(db, emp.id, run.period);
+        // STATE SCOPE for statutory rates. Read ONCE above the loop (orgState)
+        // so every employee in a run is computed against one value — re-reading
+        // per employee would let a concurrent settings change split a single
+        // payroll run across two rate sets.
+        //
+        // '' means "all-India rates only", which is what payroll did before this
+        // setting existed: resolveStatutoryConfigs drops every state-scoped row
+        // when the scope is empty. So an unset setting is not a half-configured
+        // state, it is the previous behaviour, unchanged.
+        const result = computePayrollItem(db, emp.id, run.period, { state: orgState });
         if (result.skip) {
           skipped.push({
             employee_id: emp.id,
@@ -504,11 +518,18 @@ function computeRun(me: any, body: any, request: Request): Response {
 function finalizeRun(me: any, body: any, request: Request): Response {
   const run_id = s(body?.run_id);
   if (!run_id) return Response.json({ error: 'Run id is required' }, { status: 400 });
+  // The owner has SEEN the staleness warning and chosen to freeze the figures he
+  // already reviewed. Must be sent explicitly; there is no default-yes.
+  const acknowledgeStale = body?.acknowledge_stale === true;
 
   try {
     const db = getDb();
     const run = db.prepare('SELECT * FROM hr_payroll_runs WHERE id = ?').get(run_id) as any;
     if (!run) return Response.json({ error: 'Payroll run not found' }, { status: 404 });
+    const runRow = run;
+    // Read ONCE, outside the transaction, exactly as compute does — so the
+    // comparison is against one value and not a moving target.
+    const orgStateNow = getHrOrgState(db);
 
     let recoveredCount = 0;
     let recoveredP = 0;
@@ -530,6 +551,19 @@ function finalizeRun(me: any, body: any, request: Request): Response {
         .get(run_id) as any;
       const guardMsg = finalizeRunGuard(db, fresh);
       if (guardMsg) throw new Error(`GUARD:${guardMsg}`);
+
+      // STATUTORY STALENESS (owner's call 2B). finalizeRunGuard only asks "is
+      // this a draft with items" — it cannot see that the payroll state or the
+      // rate configs moved AFTER these payslips were computed. The likely
+      // sequence is: compute with no state set so PT is zero, notice, set the
+      // state, then finalize the draft that is already computed — freezing zero
+      // forever. Warn and make him say yes; never refuse outright (a month-end
+      // deadline is a bad place to be blocked) and never silently recompute
+      // figures he has already reviewed.
+      if (!acknowledgeStale) {
+        const drift = statutoryDriftSinceCompute(db, run_id, String(fresh?.period ?? runRow?.period ?? ''), orgStateNow);
+        if (drift.length > 0) throw new Error(`STALE:${JSON.stringify(drift)}`);
+      }
 
       const items = db
         .prepare(
@@ -639,6 +673,24 @@ function finalizeRun(me: any, body: any, request: Request): Response {
     try {
       tx();
     } catch (e) {
+      // STALE is a QUESTION, not a refusal (owner's call 2B). The transaction
+      // has rolled back and nothing was frozen; the client shows what changed
+      // and offers Recompute or Finalize anyway, and a yes comes back as
+      // acknowledge_stale: true. `stale: true` is what the UI branches on —
+      // never the message text.
+      if (e instanceof Error && e.message.startsWith('STALE:')) {
+        let drift: unknown = [];
+        try { drift = JSON.parse(e.message.slice('STALE:'.length)); } catch { /* shape below */ }
+        return Response.json(
+          {
+            error: 'Statutory settings changed since this run was computed',
+            stale: true,
+            drift,
+            hint: 'Recompute to apply the current rates, or send acknowledge_stale to finalize the figures as they stand.',
+          },
+          { status: 409 },
+        );
+      }
       if (e instanceof Error && e.message.startsWith('GUARD:')) {
         const msg = e.message.slice('GUARD:'.length);
         return Response.json(

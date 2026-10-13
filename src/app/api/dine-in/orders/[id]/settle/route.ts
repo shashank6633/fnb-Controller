@@ -7,6 +7,11 @@ import { computeBill, sumItemTax, round2 } from '@/lib/bill-calc';
 // posts to — a floor bar store (owner ruling 2026-09-10, see the deduct block).
 import { completeBookingForOrder } from '@/lib/ct/seating';
 import { closeServiceRequestsForOrder } from '@/lib/service-requests';
+// BILLS ON HOLD. A held bill can carry collections already taken on its BOH
+// record; this route used to collect the whole frozen total regardless, which
+// charged the guest twice. bohTillNetting() is a pure read; absorbTillSettleIntoBoh()
+// records the till's own collection in that ledger and closes the record.
+import { bohTillNetting, absorbTillSettleIntoBoh } from '@/lib/boh';
 
 // Payment methods the cashier can settle with. Split payments record one
 // order_payments row per method; the sales dashboard's payment-category breakup
@@ -120,9 +125,36 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     // A held bill's total was frozen at hold time — collect exactly that.
     const grand = Math.round(fromHold ? Number(order.total) : bill.total);
 
+    // ── BILLS ON HOLD: NET OFF WHAT WAS ALREADY COLLECTED ────────────────────
+    // A bill on hold can carry part-payments recorded on its BOH record (a
+    // company that paid half on account, a guest who left a deposit). This
+    // branch used to take `grand` — the WHOLE frozen bill — with no knowledge of
+    // boh_payments, so the guest paid twice: measured live, Rs 200 on the BOH
+    // plus Rs 681 at the till against a Rs 681 bill. The books were never
+    // doubled (hold wrote the single sales row and deducted the stock; this
+    // branch writes no sales row at all) — only the guest was.
+    //
+    // `collect` is what this till may still take. It is derived SERVER-SIDE from
+    // the BOH ledger; no request field can move it. A bill with no BOH record —
+    // every bill held before the module shipped — nets nothing and behaves
+    // exactly as before.
+    const bohNet = fromHold ? bohTillNetting(db, id, grand) : null;
+    const collect = bohNet ? bohNet.dueNow : grand;
+    if (bohNet && collect <= 0.005) {
+      return Response.json({
+        error:
+          `₹${bohNet.alreadyPaid.toFixed(2)} has already been collected against this bill on its Bills-on-Hold record, ` +
+          `which covers the whole ₹${grand} bill. There is nothing left to take here — ` +
+          (bohNet.status === 'open'
+            ? 'open the bill on hold and close it there.'
+            : 'that record is already closed, so a manager should reconcile the bill in the POS rather than collecting again.'),
+        boh_id: bohNet.bohId,
+      }, { status: 409 });
+    }
+
     // Resolve payment(s): either a split { payments: [{method, amount}] } that must
-    // total the grand amount, or a single { payment_method }. Validated here so a
-    // mistyped split can never settle for the wrong money.
+    // total the collectable amount, or a single { payment_method }. Validated here
+    // so a mistyped split can never settle for the wrong money.
     let payments: { method: string; amount: number }[];
     const raw = Array.isArray(b.payments) ? b.payments : null;
     if (raw && raw.length) {
@@ -136,15 +168,59 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         }
       }
       const sum = round2(payments.reduce((s, p) => s + p.amount, 0));
-      if (Math.abs(sum - grand) > 1) {
-        return Response.json({ error: `Split payments total ₹${sum} but the bill is ₹${grand}` }, { status: 400 });
+      if (Math.abs(sum - collect) > 1) {
+        return Response.json({
+          error: bohNet
+            ? `Split payments total ₹${sum}, but only ₹${collect} is still due on this bill — ` +
+              `₹${bohNet.alreadyPaid.toFixed(2)} was already collected on its bill-on-hold record.`
+            : `Split payments total ₹${sum} but the bill is ₹${grand}`,
+        }, { status: 400 });
+      }
+      // ── A HELD BILL MAY NEVER BE SETTLED FOR MORE THAN IT OWES ───────────
+      // MEASURED on a booted server (lane-A money probe, round 3): a ₹252 held
+      // bill carrying ₹40 already collected on its BOH record settled for ₹213
+      // against a ₹212 balance — HTTP 200. The guest paid ₹1 too much, the BOH
+      // ledger summed to ₹253 against a ₹252 principal (a NEGATIVE balance on
+      // the record, and a dashboard 'collected' figure larger than the bill),
+      // and the order's own tenders came to ₹253 against an orders.total of
+      // ₹252. Reproduced identically with ₹100 already collected, and on a held
+      // bill with no partial at all.
+      //
+      // The ±₹1 slack above is there to forgive a split that ROUNDS. It also,
+      // silently, forgave taking MORE than the guest owes — which is the one
+      // thing this module exists to prevent ("Deduct BOH payments and charge
+      // the balance" — the owner). recordBohPayment() already refuses exactly
+      // this on the /api/boh side ("That is more than the outstanding balance");
+      // the till door had no equivalent.
+      //
+      // ROUNDING IS STILL FORGIVEN. `collect` can carry paisa (a whole-rupee
+      // frozen bill minus a part payment, e.g. ₹151.70), so a till that rounds
+      // it to the nearest rupee moves it by at most ₹0.50 and is still accepted.
+      // Beyond that it is a typo: /cashier's own split editor shows "Remaining"
+      // and only reads Balanced at exactly zero. Under-collection keeps the full
+      // ₹1 tolerance it had — this guard is one-sided on purpose.
+      //
+      // SCOPED TO THE HELD-BILL PATH. `bohNet` is non-null only for an order
+      // that has a live Bills-on-Hold record, so an ordinary open-order settle —
+      // and every bill held before this module ships — keeps the tolerance it
+      // shipped with, byte for byte.
+      if (bohNet && sum - collect > 0.5) {
+        return Response.json({
+          error:
+            `Split payments total ₹${sum}, but only ₹${collect} is due on this bill` +
+            (bohNet.alreadyPaid > 0.005
+              ? ` — ₹${bohNet.alreadyPaid.toFixed(2)} was already collected on its bill-on-hold record. `
+              : '. ') +
+            `A bill on hold cannot be settled for more than it owes.`,
+          boh_id: bohNet.bohId,
+        }, { status: 400 });
       }
     } else {
       const method = String(b.payment_method || '').toLowerCase();
       if (!VALID_METHODS.includes(method)) {
         return Response.json({ error: `payment_method must be one of ${VALID_METHODS.join(', ')}` }, { status: 400 });
       }
-      payments = [{ method, amount: grand }];
+      payments = [{ method, amount: collect }];
     }
     const primaryMethod = payments.length === 1 ? payments[0].method : 'split';
 
@@ -155,6 +231,10 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     // store level: the backstop deduct goes to the DEPARTMENT that cooked the
     // line, or nowhere with a recorded skip. The floor's own figure is measured
     // by counting (/inventory/reconciliation), never inferred from the bill.
+    // Held in an object rather than a plain `let`: the write happens inside the
+    // transaction closure below, and TypeScript's control-flow analysis would
+    // otherwise keep narrowing the variable to the `null` it was initialised to.
+    const bohOut: { res: ReturnType<typeof absorbTillSettleIntoBoh> } = { res: null };
     const settle = db.transaction(() => {
       // A held bill already wrote its sales/inventory rows — don't double-write.
       const freshDeduct = db.prepare('SELECT recipe_deducted_at FROM order_items WHERE id = ?');
@@ -265,8 +345,24 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         'INSERT INTO order_payments (id, order_id, outlet_id, method, amount, created_by) VALUES (?, ?, ?, ?, ?, ?)'
       );
       for (const p of payments) insP.run(generateId(), id, outletId, p.method, p.amount, me.email);
+
+      // ── CLOSE THE BILL-ON-HOLD RECORD, IN THE SAME BREATH ────────────────
+      // Only on the fromHold branch, and only when a live record exists.
+      // It appends the till's tenders to the BOH ledger, replays any EARLIER
+      // BOH collections into this order's tender rows (so order_payments still
+      // sums to the whole bill, not just to what this till took), and closes the
+      // record as paid in full, attributed to the person standing here.
+      //
+      // Before this, every held bill settled the way staff actually settle them
+      // left its BOH open for ever: the dashboard's pending figure and every
+      // per-user overdue column overstated the debt, and the accountability view
+      // accused people of not chasing bills that were already paid.
+      if (fromHold) {
+        bohOut.res = absorbTillSettleIntoBoh(db, id, { tenders: payments, outletId, actor: me });
+      }
     });
     settle();
+    const bohSettle = bohOut.res;
 
     // THE OVERRIDE LEDGER. If management just settled past a live floor
     // cashier ('manager_override'), record who settled, when, and who was
@@ -292,6 +388,22 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
 
     return Response.json({
       success: true, order_id: id, total: bill.total, payment_method: primaryMethod, payments, lines: items.length,
+      // What the till actually took, and why it may differ from the bill total.
+      // Present only when this bill had a live bill-on-hold record.
+      boh: bohSettle
+        ? {
+            boh_id: bohSettle.bohId,
+            collected_now: bohSettle.till_amount,
+            already_collected: bohSettle.already_paid,
+            bill_total: grand,
+            closed: bohSettle.closed,
+            // The engine composes this sentence, because only it knows whether
+            // the record was still open (this settle closed it) or was ALREADY
+            // closed — a write-off whose bill stayed on hold, where the money
+            // is appended to the ledger and the close decision stands.
+            note: bohSettle.note,
+          }
+        : null,
       // SURFACE THE OVERRIDE. When management settled past a live floor cashier
       // the client should say so ("Settled by <manager> — <cashier> holds this
       // floor"), so the success payload carries the same facts the ledger just
