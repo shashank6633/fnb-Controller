@@ -24,6 +24,18 @@ import { canonNameInput } from '@/lib/name-canon';
 import { MAX_PAISE, mayRecordPettyCash, outflowWarning, fmtRs } from '@/lib/petty-cash';
 import { canAccessPage } from '@/lib/page-catalog';
 import { todayIST } from '@/lib/format-date';
+import { postCentralTxn, vendorParty } from '@/lib/movement-record';
+// TAX ACTUALLY CHARGED — the inward register's two appended columns (see
+// REGISTER_HEADER). ONE module owns the arithmetic, the base and the
+// blank-never-zero rule, shared with /reports/purchases, the purchase log and
+// /reports/purchase-bill-summary, so the same bill cannot read 18.00% on one
+// report and 16.20% on another. Cess is NOT in the figure: it is charged on the
+// GROSS line value and GST on the post-discount value, so no single percentage
+// can cover both — see src/lib/tax-applied.ts.
+import {
+  TAX_VALUE_CSV_HEADER, TAX_PERCENT_CSV_HEADER,
+  gstValue, taxAppliedPercent, taxCsvNumber,
+} from '@/lib/tax-applied';
 
 /**
  * GRN read API. Listing + detail.
@@ -128,6 +140,20 @@ import { todayIST } from '@/lib/format-date';
  *       value can't justify.
  *   Like the other recorded-only charges it never touches unit_price /
  *   total_price / the weighted average — it joins Total Inward on read.
+ *
+ *   tax_applicable is the RECEIVER'S DECISION and is NOT a rate. It is the wire
+ *   half of the "Tax applicable (GST + cess)" tick on the receiving screens.
+ *     false   → the line is DECLARED EXEMPT: this route forces BOTH rates to 0
+ *               (it does not merely trust the client's zeros) and stores
+ *               tax_decision = 'exempt'.
+ *     true    → DECLARED TAXABLE; rates as sent, tax_decision = 'taxable'.
+ *     absent  → nobody decided. Everything below behaves exactly as it did
+ *               before this field existed and tax_decision stores ''.
+ *   WHY IT IS NOT JUST `gst_rate: 0`: a 0 in that field is already spoken for —
+ *   it is what an ABSENT rate writes too, so "we decided this line is exempt"
+ *   and "nobody thought about it" are the same stored row without this field.
+ *   Both rate columns are NOT NULL DEFAULT 0, so the distinction needed a column
+ *   of its own; db.ts carries the measurement and the reasoning.
  *
  * ═══════════════════════════════════════════════════════════════════════════
  * cash_purchase — THE BILL WAS PAID OUT OF THE PETTY CASH BOX
@@ -237,10 +263,59 @@ const csvCell = (v: any): string => {
  *  on STATUS or SUPPLIER: status is what happened to the receipt, bill type is
  *  what kind of document it is, and one cell cannot carry both without losing
  *  one of them to the reader. */
+/*  TAX DECISION IS THE 28TH COLUMN AND IS APPENDED, for the same reason BILL
+ *  TYPE was: the 27 ahead of it are already in filed sheets and formulas point
+ *  at them. It is the ONE thing a ₹0 tax row could not previously tell its
+ *  reader — whether the zero is a decision somebody made at the delivery door
+ *  or a field nobody ever looked at. In rupees the two are identical (₹0 CGST,
+ *  ₹0 SGST, ₹0 cess either way), so no existing column can carry it, and an
+ *  auditor reading this file is exactly the person who needs to know which one
+ *  it is. THREE VALUES, spelled out rather than left blank: a blank cell in a
+ *  spreadsheet reads as "no data in this export", which is a fourth meaning
+ *  nobody intended. */
+/*  TAX VALUE (GST) IS THE 29TH AND TAX % APPLIED (GST) THE 30TH, both APPENDED,
+ *  for the third time the same reason: the 28 ahead of them sit in filed sheets
+ *  and formulas point at them.
+ *
+ *  BOTH ARE DERIVED FROM COLUMNS ALREADY ON THE ROW — Tax Value is CGST + SGST,
+ *  and Tax % Applied is that pair over (SUBTOTAL − DISCOUNT), which is the base
+ *  GST is charged on. That is WHY they are appended rather than slotted beside
+ *  CGST: TOTAL INWARD AMOUNT is footable from the columns to its left, and a
+ *  duplicate rupee column inside that run would let a reader adding across the
+ *  row count GST twice. After the total they read as a restatement.
+ *
+ *  A BLANK, NEVER A 0 OR AN 0%, when the line recorded no GST — and TAX DECISION
+ *  beside them is what separates DECLARED EXEMPT (somebody decided, at the
+ *  delivery door) from NOT RECORDED (nobody looked). In rupees those two are
+ *  identical, which is exactly why the percentage must not assert a rate.
+ *  The arithmetic and the formatting come from src/lib/tax-applied.ts, the same
+ *  module /reports/purchases, /reports/purchase-bill-summary and the purchase
+ *  log use, so a figure on this file and the same figure on those reports cannot
+ *  round differently. */
 const REGISTER_HEADER = ['GRN No.', 'INVOICE ID', 'INWARD DATE', 'SUPPLIER NAME', 'CATEGORY NAME', 'ITEM NAME',
   'PO QTY', 'INWARD QTY', 'PURCHASE UNIT', 'RATE', 'SUBTOTAL', 'DISCOUNT', 'CGST', 'SGST',
   'COMPENSATION CESS', 'SPECIAL EXCISE CESS', 'TCS', 'DELIVERY CHARGES', 'MRP ROUND OFF', 'TOTAL INWARD AMOUNT',
+<<<<<<< WIP-MIXED production side — these lines came from: ceace04 GRN list: every row says DIRECT or AGAINST PO (1)
   'ACCEPTED QTY', 'REJECTED QTY', 'REJECT REASON', 'STATUS', 'RECEIVED BY', 'INVOICE DATE', 'BILL TYPE'];
+======= WIP side
+  'ACCEPTED QTY', 'REJECTED QTY', 'REJECT REASON', 'STATUS', 'RECEIVED BY', 'INVOICE DATE', 'BILL TYPE',
+  'TAX DECISION', TAX_VALUE_CSV_HEADER, TAX_PERCENT_CSV_HEADER];
+
+/** goods_receipt_note_items.tax_decision in the words the register prints. The
+ *  stored values are '', 'taxable' and 'exempt' (db.ts declares them); anything
+ *  else — including a value written by some future writer — reads as NOT
+ *  RECORDED, which is the honest answer to "what did the receiver decide?" when
+ *  the column does not say. NOT exported — a Next.js route module may only
+ *  export its handlers — so the /grn page carries a byte-identical copy beside
+ *  its own copy of REGISTER_HEADER, and the two are kept in step exactly as the
+ *  27 headings above already are. */
+const taxDecisionLabel = (v: any): string => {
+  const s = String(v ?? '').trim();
+  return s === 'taxable' ? 'DECLARED TAXABLE'
+       : s === 'exempt'  ? 'DECLARED EXEMPT'
+       : 'NOT RECORDED';
+};
+>>>>>>> WIP-MIXED
 
 /** Same field order as REGISTER_HEADER, against a row of the register query. */
 const registerRow = (r: any) => [
@@ -249,6 +324,15 @@ const registerRow = (r: any) => [
   r.compensation_cess, r.special_excise_cess, r.tcs, r.delivery_charges, r.mrp_round_off, r.total_inward_amount,
   r.quantity_accepted, r.quantity_rejected, r.rejection_reason, r.status, r.received_by, r.invoice_date,
   r.bill_type,
+  taxDecisionLabel(r.tax_decision),
+  // The 29th and 30th. Derived from this row's own cgst/sgst and its
+  // subtotal − discount by the shared helper; '' (never 0) when no GST was
+  // recorded on the line. `subtotal` is quantity_received × unit_price, which is
+  // the gross the GRN's own discount was struck against — so the percentage
+  // comes out at the rate the vendor actually charged (measured 18.00 / 12.00
+  // exactly on all 29 tax-bearing lines in this database).
+  taxCsvNumber(gstValue(r)),
+  taxCsvNumber(taxAppliedPercent(r)),
 ];
 
 /* ── DIRECT vs AGAINST PO ────────────────────────────────────────────────────
@@ -483,7 +567,18 @@ export async function GET(request: Request) {
                -- The 27th register column. Computed here rather than in the
                -- browser so the bulk download, the per-entry Download and the
                -- screen all read one rule off one column (see BILL_TYPE_SQL).
+<<<<<<< WIP-MIXED production side — these lines came from: ceace04 GRN list: every row says DIRECT or AGAINST PO (1)
                ${BILL_TYPE_SQL} AS bill_type
+======= WIP side
+               ${BILL_TYPE_SQL} AS bill_type,
+               -- The 28th. The stored decision travels RAW ('', 'taxable',
+               -- 'exempt') and is turned into words by taxDecisionLabel() at
+               -- the two places that render a file, so the JSON shape stays the
+               -- column itself and a future reader is not parsing English back
+               -- into a state. NOT NULL DEFAULT '' since the boot migration, so
+               -- every historical line answers "NOT RECORDED" rather than null.
+               gi.tax_decision
+>>>>>>> WIP-MIXED
         FROM goods_receipt_note_items gi
         JOIN goods_receipt_notes g  ON g.id  = gi.grn_id
         JOIN raw_materials       rm ON rm.id = gi.material_id
@@ -495,7 +590,23 @@ export async function GET(request: Request) {
       // JS, no Blob and no second copy of the column order to keep in step.
       // The JSON shape is unchanged for every caller that does not ask for csv.
       if (String(url.searchParams.get('format') || '').toLowerCase() === 'csv') {
+<<<<<<< WIP-MIXED production side — these lines came from: 15ae868 Inward History: View, Edit, Print, Delete and Download per bil (1)
         const lines = [REGISTER_HEADER.join(',')];
+======= WIP side
+        // THE HEADING ROW IS ESCAPED WITH THE SAME csvCell THE DATA ROWS USE.
+        // Two of the thirty headings are sentences that contain commas (they
+        // name the formula and the exclusions — see TAX_VALUE_CSV_HEADER and
+        // TAX_PERCENT_CSV_HEADER in src/lib/tax-applied.ts). Joined RAW they
+        // split into extra fields: measured 32 header fields over 30 data
+        // fields, which in a spreadsheet slides every heading from TAX VALUE
+        // rightward off its own column — the Tax % figure landed under a
+        // fragment of the Tax Value heading ("…they are separate levies with
+        // their own columns)") while the real "Tax % Applied (GST)" heading
+        // labelled an empty column. The figures were always right; only the
+        // labels were. One .map(csvCell) is the whole fix, and it is the same
+        // thing issue-log.ts and petty-cash.ts already do to their headings.
+        const lines = [REGISTER_HEADER.map(csvCell).join(',')];
+>>>>>>> WIP-MIXED
         for (const r of rows) lines.push(registerRow(r).map(csvCell).join(','));
         // Named off the GRN when it is one entry (that is the document's own
         // identity, and the number is what an auditor searches for), off the
@@ -861,19 +972,98 @@ export async function POST(request: Request) {
     // in the stored row would ever show that it went missing. Wording is
     // /api/purchases' wording verbatim; two purchase surfaces answering the same
     // mistake differently is how a clerk learns to distrust the message.
+<<<<<<< WIP-MIXED production side — these lines came from: 17e008d GST/Cess from the material master, Total Inward always shown,  (2)
     const gstProvided = (it: any) =>
       it?.gst_rate !== undefined && it?.gst_rate !== null && String(it.gst_rate).trim() !== '';
+======= WIP side
+    /* ── A RATE IS A NUMBER, OR THE NUMERIC STRING A FORM ROUND-TRIP MAKES OF
+     *    ONE. IT IS NOT A BOOLEAN AND IT IS NOT AN ARRAY. ───────────────────
+     * `String(v).trim() !== ''` on its own says "something was sent", and then
+     * Number() coerces whatever that something was:
+     *     gst_rate: true   → String 'true' → present → Number(true)  = 1   → a
+     *                        1% GST silently booked on the bill, 201 OK.
+     *     gst_rate: [18]   → String '18'   → present → Number([18])   = 18  → a
+     *                        rate the caller never typed, also 201 OK.
+     * Both were accepted and stored (measured: cgst ₹0.05 on a ₹10 line, and a
+     * full 18% from an array). Neither is a mistake anyone makes on purpose —
+     * but `tax_applicable` is now a BOOLEAN sitting on the same line object, so
+     * a client that writes `gst_rate: true` meaning "yes, taxable" is one
+     * keystroke away, and it books a tax figure the bill never carried AND
+     * records no decision.
+     * TYPE FIRST, THEN RANGE. A non-scalar is REFUSED with the same 400 as an
+     * out-of-range percent rather than being read as absent: silently dropping
+     * the tax on a bill forfeits the input credit, and nothing in the stored row
+     * would ever show that it went missing (this route's own rule, above).
+     * `[]` still reads as absent — String([]) is '' — exactly as it did before.
+     */
+    const rateSent   = (v: any) => v !== undefined && v !== null && String(v).trim() !== '';
+    const rateScalar = (v: any) => typeof v === 'number' || typeof v === 'string';
+    const gstProvided = (it: any) => rateSent(it?.gst_rate) && rateScalar(it?.gst_rate);
+>>>>>>> WIP-MIXED
     // GST COMPENSATION CESS, also a per-line PERCENT, seeded from the material
     // master's cess_percent the way gst_rate is seeded from tax_percent. Same
     // absent/present contract, same pre-transaction validation, and rejected
     // rather than quietly zeroed for the same reason: a cess silently dropped is
     // real money the venue paid and can no longer show it paid. NOT a slice of
     // the GST split and NOT special_excise_cess — see the header doc.
+<<<<<<< WIP-MIXED production side — these lines came from: ff0f440 Req 71: PO Receive and GRN auto-pick Cess % from the Raw Mater (2)
     const cessProvided = (it: any) =>
       it?.cess_rate !== undefined && it?.cess_rate !== null && String(it.cess_rate).trim() !== '';
+======= WIP side
+    const cessProvided = (it: any) => rateSent(it?.cess_rate) && rateScalar(it?.cess_rate);
+    /* ── "TAX APPLICABLE" — THE RECEIVER'S DECISION, NOT A RATE ──────────────
+     * The owner's ask, verbatim: "tax % configured to an item should
+     * automatically pick up, but it's better to provide an option to deselect
+     * that option for some instances". The auto-pickup already existed (the form
+     * seeds gst_rate from raw_materials.tax_percent and cess_rate from
+     * cess_percent); what was missing was a way to say NO that survives.
+     *
+     * THREE STATES, and the third one is why this field exists at all:
+     *   tax_applicable === false  → DECLARED EXEMPT. Both rates are forced to 0
+     *                               below and the row records tax_decision
+     *                               'exempt'.
+     *   tax_applicable === true   → DECLARED TAXABLE. Rates are whatever the
+     *                               line sent; the row records 'taxable'.
+     *   absent                    → NOBODY DECIDED. Byte-identical to every
+     *                               payload this route has ever accepted, right
+     *                               down to a stored tax_decision of ''. The CSV
+     *                               importer and the hand-typed-₹ manual path
+     *                               both land here and neither changes.
+     *
+     * IT COVERS BOTH LEVIES, and the screen says so ("Tax applicable (GST +
+     * cess)"). A store person reading "Tax applicable: no" and still being
+     * charged a 12% compensation cess would be the exact failure the seeded-rate
+     * badges were added to prevent. Only 19 of 952 materials carry a cess rate,
+     * so this is rare — but when it fires it is real money, and the silent path
+     * is the dangerous one.
+     *
+     * DELIBERATELY NOT INFERRED FROM `gst_rate === 0`. The explicit 0 that the
+     * GST% dropdown has always been able to send stays exactly what it was, so
+     * no existing client's rows change meaning. The decision is a separate fact
+     * and travels in its own field.
+     */
+    const taxApplicableOf = (it: any): boolean | undefined => {
+      const v = it?.tax_applicable;
+      if (v === undefined || v === null || v === '') return undefined;
+      // Tolerant of the string forms a form/JSON round-trip can produce, and of
+      // nothing else: an unrecognised value is "no decision", never a silent
+      // "yes", so a typo can never manufacture an exemption that was not made.
+      if (v === true || v === 'true' || v === 1 || v === '1') return true;
+      if (v === false || v === 'false' || v === 0 || v === '0') return false;
+      return undefined;
+    };
+>>>>>>> WIP-MIXED
     for (const it of receivable) {
+<<<<<<< WIP-MIXED production side — these lines came from: 17e008d GST/Cess from the material master, Total Inward always shown,  (2)
       if (!gstProvided(it)) continue;
       const n = Number(it.gst_rate);
+======= WIP side
+      // `rateSent`, not `gstProvided`: a boolean or an array HAS been sent and
+      // must be answered with the 400 below, not skipped as if the field were
+      // absent. NaN for a non-scalar falls straight into the same refusal.
+      if (!rateSent(it?.gst_rate)) continue;
+      const n = rateScalar(it.gst_rate) ? Number(it.gst_rate) : NaN;
+>>>>>>> WIP-MIXED
       if (!Number.isFinite(n) || n < 0 || n > 100) {
         return Response.json({
           error: 'gst_rate must be a percentage between 0 and 100 (0 = exempt) — send no gst_rate at all to record a line with no tax',
@@ -881,8 +1071,14 @@ export async function POST(request: Request) {
       }
     }
     for (const it of receivable) {
+<<<<<<< WIP-MIXED production side — these lines came from: ff0f440 Req 71: PO Receive and GRN auto-pick Cess % from the Raw Mater (2)
       if (!cessProvided(it)) continue;
       const n = Number(it.cess_rate);
+======= WIP side
+      // Same rule as the GST loop directly above — see the type note there.
+      if (!rateSent(it?.cess_rate)) continue;
+      const n = rateScalar(it.cess_rate) ? Number(it.cess_rate) : NaN;
+>>>>>>> WIP-MIXED
       if (!Number.isFinite(n) || n < 0 || n > 100) {
         return Response.json({
           error: 'cess_rate must be a percentage between 0 and 100 (0 = none) — send no cess_rate at all to record a line with no compensation cess',
@@ -1462,8 +1658,14 @@ export async function POST(request: Request) {
           (id, grn_id, po_item_id, material_id, quantity_ordered, quantity_received,
            quantity_accepted, quantity_rejected, rejection_reason, unit_price, notes,
            discount, cgst, sgst, compensation_cess, special_excise_cess, tcs,
+<<<<<<< WIP-MIXED production side — these lines came from: 9b927e2 Every vendor bill is a GRN now — one entry point, one number,  (2)
            delivery_charges, mrp_round_off, gst_rate, cess_rate, cost_vendor, cost_note, brand)
         VALUES (?, ?, NULL, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+======= WIP side
+           delivery_charges, mrp_round_off, gst_rate, cess_rate, tax_decision,
+           cost_vendor, cost_note, brand)
+        VALUES (?, ?, NULL, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+>>>>>>> WIP-MIXED
       `);
       // Per-line inward charges (₹). mrp_round_off is signed; the rest ≥ 0.
       const chg = (v: any) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? Math.round(n * 100) / 100 : 0; };
@@ -1603,17 +1805,28 @@ export async function POST(request: Request) {
                 -- Inward then read the undiscounted bill. See the bind.
                 -- src/lib/grn-qc.ts makes the identical distinction, so a bill
                 -- books the same whether the gate held it or not.
+<<<<<<< WIP-MIXED production side — these lines came from: 9b927e2 Every vendor bill is a GRN now — one entry point, one number,  (1)
                 ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+======= WIP side
+                -- The LAST bind before created_at is tax_decision — the same
+                -- '' / 'taxable' / 'exempt' that went onto the GRN line, mirrored
+                -- so the COST rail can answer it too. /api/reports/purchases and
+                -- src/lib/purchase-bill-summary.ts read the purchases table and
+                -- nothing else, so a decision recorded only on the bill document
+                -- is invisible to both of them.
+                -- (No back-ticks in this comment on purpose: it lives inside a
+                -- TS template literal, where one would close the string.)
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+>>>>>>> WIP-MIXED
       `);
       const bumpStock = db.prepare(`
         UPDATE raw_materials
         SET current_stock = current_stock + ?, last_purchase_price = ?, last_purchase_date = ?, updated_at = datetime('now')
         WHERE id = ?
       `);
-      const insTx = db.prepare(`
-        INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, created_at, outlet_id)
-        VALUES (?, ?, 'purchase', ?, ?, ?, datetime('now'), ?)
-      `);
+      // Replaced by postCentralTxn at the call site — the receipt now names the
+      // VENDOR it came from, the unit it is measured in, the BILL's date and
+      // the session user who received it.
       const getPackInfo = db.prepare(`SELECT pack_size, unit, purchase_unit FROM raw_materials WHERE id = ?`);
 
       let hasReject = false;
@@ -1678,6 +1891,16 @@ export async function POST(request: Request) {
         // paisa. A third rounding convention across the purchase paths is how a
         // GST return stops reconciling.
         const hasGst = gstProvided(it);
+        /* THE RECEIVER'S DECISION, resolved once for both levies.
+         * `taxDecided === false` is the tick turned OFF at the delivery door: it
+         * FORCES both rates to 0 below rather than trusting the client to have
+         * sent zeros. The form does send explicit zeros — an exemption must be a
+         * recorded 0, never an omitted field — but a rate that survived a stale
+         * form state, a replayed payload or a hand-rolled client must not be
+         * able to tax a line somebody declared exempt. The stored decision and
+         * the stored rupees have to agree, or the column is worse than useless. */
+        const taxDecided = taxApplicableOf(it);
+        const taxOff = taxDecided === false;
         // LIQUOR IS ZERO-RATED — its duty rides on the TGBCL bill (excise / cess
         // / TCS), never on GST, so a credit here would be claimed twice.
         // centralFlowBlock already dropped these lines from `receivable`, so in
@@ -1722,6 +1945,12 @@ export async function POST(request: Request) {
         // than GST's: that bill already carries its own special excise cess, so
         // a master cess% seeded onto a liquor line would charge the venue the
         // cess twice — once as excise on the store ledger and once again here.
+        // …and the tick zero-rates the cess on exactly the same terms as the GST
+        // above. THIS IS THE HALF THAT WOULD HAVE BEEN SILENT: the charges panel
+        // is collapsed by default, so a master cess% left running on a line the
+        // receiver marked "not taxable" would move the row total with nothing on
+        // screen explaining it — which is the defect the cess badge exists to
+        // prevent, reintroduced by the control meant to give the receiver a say.
         const hasCess = cessProvided(it);
         const cessRate = (!hasCess || isStoreMappedMaterial(db, String(it.material_id || '')))
           ? 0 : Number(it.cess_rate);
@@ -1741,6 +1970,52 @@ export async function POST(request: Request) {
               `(${grnNumber}, material ${it.material_id}, taxable ₹${taxable.toFixed(2)} @ ${gstRate}%) — stored the derived figure`
             );
           }
+        }
+
+        /* ── THE TWO GST FIGURES THIS LINE STORES, DECIDED ONCE ──────────────
+         * THE HOLE THIS CLOSES, measured on a live server before the fix:
+         *   POST /api/grn { tax_applicable: false, cgst: 90, sgst: 90 }  — no
+         *   gst_rate at all — stored gst_rate 0, tax_decision 'exempt' AND
+         *   cgst ₹90 / sgst ₹90, on the GRN line and on its purchases mirror.
+         *   The inward register then printed "DECLARED EXEMPT" in column 28
+         *   beside ₹180 of GST in columns 13-14.
+         * `taxOff` already forced both RATES to 0, but the rate forcing never
+         * reached the MANUAL-₹ fallback below: `hasGst` asks "did a rate arrive?"
+         * and a hand-typed rupee figure arrives without one, so the fallback fired
+         * on a line somebody had declared exempt. A declared-exempt line bears no
+         * GST whatever shape the payload sends it in — otherwise tax_decision is
+         * worse than useless, because the column and the money it describes
+         * disagree and the reader cannot tell which one to believe.
+         *
+         * FORCED TO 0 RATHER THAN REFUSED WITH A 400, to match what this route
+         * already does with a rate on the same payload (see `taxOff` above): one
+         * rule, one direction — the DECISION wins over the figures, because it is
+         * the half a person made deliberately. NOT SILENT, though: the mismatch
+         * is logged with the same wording and the same channel as the client /
+         * server divergence directly above, so a payload whose ₹ went unstored
+         * leaves a trace instead of vanishing.
+         * The real screens cannot reach this: unticking on /grn clears cgst/sgst
+         * to '' along with both rates (src/app/grn/page.tsx, the tick handler).
+         * It is a stale form state, a replayed payload or a hand-rolled client —
+         * exactly the cases the server-side lock exists for.
+         *
+         * THE OTHER TWO INWARD ROUTES NEED NO SUCH GUARD, and were checked rather
+         * than assumed: PO-receive binds cgstAmt off the server-derived lineTax
+         * and has no ₹ fallback at all, and /api/purchases discards the body's
+         * cgst/sgst by construction — both were run with this exact payload and
+         * stored ₹0 with 'exempt'. Only this route ever had the ₹ fallback.
+         *
+         * cess needs no equivalent: it has never had a hand-typed ₹ box (see the
+         * bind below), so `cessPaise` is server-derived on every path and `taxOff`
+         * has already zeroed its rate. */
+        const cgstStored = taxOff ? 0 : (hasGst ? cgstPaise / 100 : chg(it.cgst));
+        const sgstStored = taxOff ? 0 : (hasGst ? sgstPaise / 100 : chg(it.sgst));
+        if (taxOff && (chg(it.cgst) > 0 || chg(it.sgst) > 0)) {
+          console.warn(
+            `[grn POST] line declared NOT TAXABLE but the payload carried ₹${(chg(it.cgst) + chg(it.sgst)).toFixed(2)} ` +
+            `of hand-typed GST (${grnNumber}, material ${it.material_id}) — stored ₹0 and recorded the exemption; ` +
+            `the decision wins over the figures`
+          );
         }
 
         // THE COST ROW'S OWN WORDING, MINTED HERE EVEN WHEN NOTHING IS BOOKED.
@@ -1785,8 +2060,16 @@ export async function POST(request: Request) {
                        // src/lib/grn-qc.ts re-reads at sign-off to net the rate on
                        // a held receipt, so all three must be one number.
                        discountLine,
+<<<<<<< WIP-MIXED production side — these lines came from: 17e008d GST/Cess from the material master, Total Inward always shown,  (2)
                        hasGst ? cgstPaise / 100 : chg(it.cgst),
                        hasGst ? sgstPaise / 100 : chg(it.sgst),
+======= WIP side
+                       // cgstStored / sgstStored, not the ternary they replaced:
+                       // a line DECLARED not taxable stores ₹0 even when the
+                       // payload hand-typed a figure. See the block above.
+                       cgstStored,
+                       sgstStored,
+>>>>>>> WIP-MIXED
                        // No chg(it.compensation_cess) fallback, deliberately: cgst/sgst
                        // keep one because a hand-typed ₹ predates the rate field on this
                        // modal, but cess has never had a hand-typed box on any surface —
@@ -1800,6 +2083,15 @@ export async function POST(request: Request) {
                        // arithmetic instead of reverse-engineering a rate out of rupees.
                        // 0 when the client sent none — which writes ₹0 either way.
                        hasGst ? gstRate : 0, hasCess ? cessRate : 0,
+                       /* THE DECISION BEHIND THOSE TWO ZEROES — the one fact the
+                        * rupees and the rates cannot carry. '' when the payload
+                        * said nothing, which is every historical row and every
+                        * line the receiver never touched. See db.ts, where the
+                        * column is declared and the three values are spelled out.
+                        * Derived from the SAME `taxDecided` the rate forcing above
+                        * used, so a row can never say 'exempt' while carrying a
+                        * rate, or say 'taxable' while the tick was off. */
+                       taxDecided === undefined ? '' : (taxDecided ? 'taxable' : 'exempt'),
                        vendor || '', noteTag,
                        // The brand, stored on the LINE so a held bill keeps it.
                        // The mirror below still writes it directly on the unheld
@@ -1832,8 +2124,17 @@ export async function POST(request: Request) {
           const rp = (v: number) => Math.round((Number(v) || 0) * 100);
           cashPaise += Math.round(received * price * 100)
                      - rp(discountLine)
+<<<<<<< WIP-MIXED production side — these lines came from: dd257c0 Cash purchase on Enter Vendor Bill, and petty cash may go nega (2)
                      + rp(hasGst ? cgstPaise / 100 : chg(it.cgst))
                      + rp(hasGst ? sgstPaise / 100 : chg(it.sgst))
+======= WIP side
+                     // The STORED figures, so the cash the box is asked to have
+                     // paid is the cash this bill actually books. A line declared
+                     // not taxable stores ₹0 of GST and must not be counted as
+                     // having paid it.
+                     + rp(cgstStored)
+                     + rp(sgstStored)
+>>>>>>> WIP-MIXED
                      + rp(cessPaise / 100)
                      + rp(chg(it.special_excise_cess))
                      + rp(chg(it.tcs))
@@ -1932,9 +2233,17 @@ export async function POST(request: Request) {
                           (canNet && netCandidate > 0) ? 0 : discountLine,
                           // The eight recorded-only charges, in the register's own
                           // order. cgst/sgst are the SERVER-DERIVED halves (or the
+<<<<<<< WIP-MIXED production side — these lines came from: 9b927e2 Every vendor bill is a GRN now — one entry point, one number,  (3)
                           // hand-typed ₹ on a manual line), identical to what went
                           // onto the GRN line above — the two documents state the
                           // same tax or they state nothing worth reading.
+======= WIP side
+                          // hand-typed ₹ on a manual line, or ₹0 on a line declared
+                          // not taxable) — and they are the SAME two expressions
+                          // the GRN line above was written from, by name now rather
+                          // than by a repeated ternary, so the bill document and its
+                          // cost mirror cannot state different tax.
+>>>>>>> WIP-MIXED
                           // They stay OUT of unit_price / total_price forever:
                           // average_price is derived from those two columns and
                           // feeds every recipe, so folding tax in inflates every
@@ -1945,7 +2254,19 @@ export async function POST(request: Request) {
                           chg(it.special_excise_cess),
                           chg(it.tcs),
                           chg(it.delivery_charges),
+<<<<<<< WIP-MIXED production side — these lines came from: 9b927e2 Every vendor bill is a GRN now — one entry point, one number,  (1)
                           chgSigned(it.mrp_round_off));
+======= WIP side
+                          chgSigned(it.mrp_round_off),
+                          // THE DECISION, ON THE COST ROW TOO. Derived from the
+                          // SAME `taxDecided` as the GRN line above — one
+                          // expression, two rows, so the bill document and its
+                          // cost mirror can never disagree about what was
+                          // decided. '' on every payload that sends no
+                          // tax_applicable, which is every client that predates
+                          // the tick.
+                          taxDecided === undefined ? '' : (taxDecided ? 'taxable' : 'exempt'));
+>>>>>>> WIP-MIXED
           // ── Unit-basis boundary (CORE CONVENTION) ──────────────────────
           // GRN lines are entered in PURCHASE units at ₹/purchase-unit (same
           // basis as /api/purchases — also the only reading consistent with
@@ -1992,9 +2313,23 @@ export async function POST(request: Request) {
             });
           } else {
             bumpStock.run(stockQty, price, date, it.material_id);
+<<<<<<< WIP-MIXED production side — these lines came from: 82e23ba Direct Issue: vendor deliveries routed straight to a departmen (3)
             insTx.run(generateId(), it.material_id, stockQty, purchaseId,
                       accepted < 0 ? `BACK-CORRECTION ${grnNumber}` : `Ad-hoc GRN ${grnNumber}`,
                       outletId);
+======= WIP side
+            postCentralTxn(db, {
+              materialId: it.material_id,
+              type: 'purchase',
+              quantity: stockQty,
+              referenceId: purchaseId,
+              notes: accepted < 0 ? `BACK-CORRECTION ${grnNumber}` : `Ad-hoc GRN ${grnNumber}`,
+              outletId,
+              counterparty: vendorParty(vendor, b.vendor_id),
+              txnDate: date,
+              actor: me.email,
+            });
+>>>>>>> WIP-MIXED
           }
           touched.add(it.material_id);
         }

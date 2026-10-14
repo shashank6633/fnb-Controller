@@ -162,28 +162,33 @@ export async function GET(request: Request) {
       WHERE date >= ? AND date <= ?
     `).get(dateFrom, dateTo) as any;
 
-    // Category-wise purchase breakdown
+    // Category-wise purchase breakdown.
+    // LEFT JOIN, 2026-09-10 — same ruling as /api/reports/purchases and
+    // /api/purchases: purchase spend is never dropped for a broken material
+    // link, it is labelled. An INNER JOIN here would quietly shrink the very
+    // total this panel exists to state.
     const purchaseByCategory = db.prepare(`
       SELECT
-        rm.category,
+        COALESCE(NULLIF(TRIM(rm.category), ''), '(uncategorised)') AS category,
         SUM(p.total_price) as spend,
         SUM(p.quantity) as quantity
       FROM purchases p
-      JOIN raw_materials rm ON p.material_id = rm.id
+      LEFT JOIN raw_materials rm ON p.material_id = rm.id
       WHERE p.date >= ? AND p.date <= ?
-      GROUP BY rm.category
+      GROUP BY LOWER(TRIM(COALESCE(rm.category, '')))
       ORDER BY spend DESC
     `).all(dateFrom, dateTo);
 
-    // Top purchased materials
+    // Top purchased materials — LEFT JOIN for the same reason.
     const topPurchased = db.prepare(`
       SELECT
-        rm.name,
+        COALESCE(NULLIF(TRIM(rm.name), ''),
+                 '(material not linked · id ' || COALESCE(p.material_id, '?') || ')') AS name,
         SUM(p.total_price) as total_spend,
         SUM(p.quantity) as total_qty,
         rm.unit
       FROM purchases p
-      JOIN raw_materials rm ON p.material_id = rm.id
+      LEFT JOIN raw_materials rm ON p.material_id = rm.id
       WHERE p.date >= ? AND p.date <= ?
       GROUP BY p.material_id
       ORDER BY total_spend DESC

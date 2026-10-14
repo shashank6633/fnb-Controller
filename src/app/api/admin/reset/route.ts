@@ -57,6 +57,13 @@ export async function POST(req: Request) {
   const auth = await requireRole('admin');
   if (!auth.ok) return Response.json({ error: auth.message }, { status: auth.status });
 
+  // FIELD 8 — the responsible user for every ledger row this reset writes.
+  // postDeptLedger REFUSES a blank actor and is deliberately un-caught below, so
+  // omitting this rolls the WHOLE reset back the moment any department still
+  // holds stock. requireRole already resolved the session; the admin who pressed
+  // Reset is the responsible party for the flatten rows it posts.
+  const resetActor = String(auth.user.email || '').trim() || 'system:admin-reset';
+
   const body = await req.json().catch(() => ({}));
   if (body?.confirm !== 'RESET') {
     return Response.json({ error: 'Send { confirm: "RESET", scopes: [...] } — confirm must equal "RESET" exactly' }, { status: 400 });
@@ -188,6 +195,7 @@ export async function POST(req: Request) {
           source,
           referenceId: 'admin-reset',
           notes: note,
+          user: resetActor,
         });
         posted += 1;
       }

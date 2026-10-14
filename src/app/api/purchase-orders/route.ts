@@ -417,8 +417,24 @@ export async function GET(request: Request) {
 
     if (status) { where.push('po.status = ?'); params.push(status); }
     if (vendor) { where.push('po.vendor LIKE ?'); params.push(`%${vendor}%`); }
-    if (from)   { where.push('po.date >= ?'); params.push(from); }
-    if (to)     { where.push('po.date <= ?'); params.push(to); }
+    // `from`/`to` filter ONE column — po.date, the day the PO was RAISED. They do
+    // not and must not silently stand in for a lifecycle date: "what came in last
+    // week" is received_at, "what has been waiting" is submitted_at, and answering
+    // either from po.date gives a confidently wrong list. A caller that needs one
+    // of those needs its own parameter naming the column, not a re-pointing of
+    // these two — whatever filters here has to be sayable on screen.
+    //
+    // Compared through substr(...,1,10) so an inclusive range is inclusive. po.date
+    // is a 10-char IST business date today (all 24 rows: length(date)=10, and
+    // date = substr(date,1,10) on every row), so this is a no-op on current data —
+    // verified identical to the raw comparison across five ranges. It matters the
+    // moment any column carrying 'YYYY-MM-DD HH:MM:SS' is compared this way:
+    // '2026-08-07 07:38:25' <= '2026-08-07' is FALSE, so a raw inclusive single-day
+    // range drops every row stamped after midnight (proven on approved_at: raw 0
+    // rows, sliced 2). Keeping the normalisation here means the next column wired
+    // in cannot reintroduce that.
+    if (from)   { where.push('substr(po.date, 1, 10) >= ?'); params.push(from); }
+    if (to)     { where.push('substr(po.date, 1, 10) <= ?'); params.push(to); }
 
     const rows = db.prepare(`
       SELECT po.*, (SELECT COUNT(*) FROM purchase_order_items WHERE po_id = po.id) AS item_count,

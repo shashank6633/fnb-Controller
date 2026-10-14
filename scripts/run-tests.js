@@ -40,6 +40,9 @@
  *   8  PACK FACTOR               PICKLED GINGER 1.5KG must NOT convert
  *   9  CACHE == TRUTH            on_hand equals the ledger sum after 100 moves
  *  10  NO BACKFILL               boot adds zero department movements
+ *  11  NO STORE STOCK ON A SALE  the retired floor auto-deduct, armed on
+ *                                purpose, writes ZERO store ledger rows
+ *                                (owner ruling, 2026-09-10)
  *
  * PART B keeps the five arithmetic checks this file has always carried
  * (weighted-average price, recipe math, GRN accept/reject, closing variance,
@@ -143,6 +146,10 @@ const {
   postDeptLedger, resolveStationDepartment, deptOnHand, isDeptReversalBlocked,
 } = lib('dept-ledger.ts');
 const { packFactor } = lib('pack-units.ts');
+// Test 11 arms the RETIRED floor auto-deduct on purpose: floorAutoDeductEnabled
+// proves the switch is really on for the negative test, postLedger builds the
+// lawful floor holding the removed branch used to look for.
+const { floorAutoDeductEnabled, postLedger } = lib('store-engine.ts');
 
 // getDb() runs initializeSchema — i.e. the boot migrations — against the copy.
 const db = dbMod.getDb();
@@ -713,6 +720,9 @@ test('cache-equals-truth', () => {
     postDeptLedger(db, {
       departmentId: d, materialId: m, type: p.type, quantity: q,
       referenceId: 'fuzz-' + i, source: 'run-tests-fuzz', notes: 'fuzz',
+      // postDeptLedger REFUSES a blank responsible user (movement record,
+      // 2026-09-10). A fuzz movement is machine-made and says so.
+      user: 'system:run-tests',
     });
     posted++;
   }
@@ -768,6 +778,312 @@ section(10, 'NO BACKFILL — booting the app adds ZERO department movements');
   expectTrue(!stamp || !String(stamp.value || '').trim() || preBoot.deptTxns > 0,
     'boot did not stamp dept_ledger_cutover_at on an un-cut-over database',
     `settings.dept_ledger_cutover_at = ${JSON.stringify(stamp && stamp.value)}`);
+}
+
+/* ── 11 ────────────────────────────────────────────────────────────────────*/
+section(11, 'A SALE NEVER MOVES STORE STOCK — the retired floor auto-deduct stays dead');
+{
+  /**
+   * OWNER RULING, 2026-09-10. A sale, a KOT completion or a recipe explosion
+   * must never change stock at STORE level. deductInventoryForSale used to
+   * carry a fourth rail ahead of the three tested above: with settings
+   * tm_floor_autodeduct = '1' and a caller-supplied floor store, it posted an
+   * OUTWARD store_stock_ledger row ("Floor auto-deduct (sale …)") instead of
+   * touching central. That branch is gone.
+   *
+   * These tests ARM THE RETIRED SWITCH DELIBERATELY — settings back to '1', a
+   * live floor store, a material the floor holds, and the legacy `storeId`
+   * field passed on the opts object exactly as the old dine-in callers passed
+   * it. Everything the removed branch needed is present. If a future engineer
+   * "restores" it, or re-reads the setting, these fail here rather than in
+   * service, where the symptom is a floor book that falls by a quantity nobody
+   * moved and a count that then reconciles against it.
+   */
+  const storeLedgerTotal = () =>
+    Number(db.prepare('SELECT COUNT(*) c FROM store_stock_ledger').get().c) || 0;
+  const storeRowsFor = (matId) => db.prepare(`
+    SELECT store_id, txn_type, quantity, ref, notes FROM store_stock_ledger WHERE material_id = ?
+  `).all(matId);
+  const autoDeductRows = () => Number(db.prepare(`
+    SELECT COUNT(*) c FROM store_stock_ledger WHERE notes LIKE 'Floor auto-deduct%'
+  `).get().c) || 0;
+
+  /** A floor bar store wired to a table zone, exactly as Settings → Stores does. */
+  function mkFloorStore(zone) {
+    const id = uid();
+    db.prepare(`
+      INSERT INTO store_locations (id, name, code, is_active, floor_label) VALUES (?, ?, ?, 1, ?)
+    `).run(id, 'TEST FLOOR BAR ' + id, 'TFB', zone);
+    return id;
+  }
+
+  /**
+   * The dine-in call shape as it was BEFORE the removal: opts carries storeId.
+   * The field no longer exists on the type — passing it anyway is the point,
+   * because a stale caller (or a reverted one) would pass it, and the deduct
+   * must ignore it rather than act on it.
+   */
+  function sellOnFloor(recipeId, qty, station, storeId) {
+    const saleId = uid();
+    db.prepare(`
+      INSERT INTO sales (id, item_name, recipe_id, quantity_sold, bill_type, selling_price, total_revenue, total_cost, date)
+      VALUES (?, 'Test Floor Pour', ?, ?, 'normal', 0, 0, 0, date('now'))
+    `).run(saleId, recipeId, qty);
+    deductInventoryForSale(db, recipeId, qty, saleId, 'normal', {
+      storeId, station, orderItemId: 'oi-' + saleId,
+    });
+    return saleId;
+  }
+
+  /* 11a — a floor-HELD material on a mapped station: department deducts, store
+   * ledger does not move at all. */
+  test('sale-on-floor-moves-no-store-stock', () => {
+    db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('tm_floor_autodeduct', '1')").run();
+    expectTrue(floorAutoDeductEnabled(db) === true,
+      'the retired switch really is ARMED for this test (worst case, not best case)');
+
+    const zone = 'testzone-' + uid();
+    const storeId = mkFloorStore(zone);
+    const dept = mkDept('TEST Bar 11');
+    const station = 'teststation-' + uid();
+    mapStation(station, dept);
+
+    // A synthetic category, so this material is NOT store-mapped: it must reach
+    // the DEPARTMENT branch, which is the branch the floor rail used to steal.
+    const mat = mkMaterial({
+      name: 'TEST FLOOR SODA', category: 'test-floorheld-' + uid(),
+      unit: 'ml', purchase_unit: 'btl', pack_size: 1000, current_stock: 100000,
+    });
+
+    // The floor HOLDS it — a lawful opening row, which is precisely what the
+    // removed branch used as its "held here" test (ledgerHasRow).
+    postLedger(db, {
+      store_id: storeId, material_id: mat, txn_type: 'opening', quantity: 5000,
+      unit_cost: 1, notes: 'run-tests fixture opening',
+      // FIELD 8 of the movement record (2026-09-10): postLedger REFUSES a blank
+      // responsible user, so a fixture must name one too. 'system:run-tests' is
+      // the honest label for a movement no person made — the same shape the
+      // KOT-completion sweep and the other machine writers use.
+      created_by: 'system:run-tests',
+    });
+
+    const req = mkReq(dept);
+    const line = mkLine(req, mat, { requested: 10, unit: 'btl', departmentId: dept });
+    issue(line, 5);                                   // 5 × pack 1000 = 5000 ml
+
+    const recipe = mkRecipe(mat, { quantity: 2000, unit: 'ml' });
+    const ledgerBefore = storeLedgerTotal();
+    const centralBefore = central(mat);
+    const deptBefore = deptSum(dept, mat);
+
+    const saleId = sellOnFloor(recipe, 1, station, storeId);
+
+    expect(storeLedgerTotal(), ledgerBefore,
+      'store_stock_ledger row count UNCHANGED by the sale',
+      'The floor auto-deduct is back. A sale is writing a store movement nobody made.');
+    expect(autoDeductRows(), 0, "no 'Floor auto-deduct' row exists anywhere in the ledger");
+    expect(storeRowsFor(mat).length, 1,
+      'the only store row for this material is still the fixture opening',
+      JSON.stringify(storeRowsFor(mat)));
+    expect(central(mat), centralBefore, 'central untouched (it lost the gram at the issue)');
+    expect(deptSum(dept, mat) - deptBefore, -2000,
+      'the DEPARTMENT lost exactly the recipe quantity — the rail the pour belongs to');
+    expect(invTxns(mat, 'sale'), 1, 'the inventory_transactions audit row is still written');
+    expect(skipRows(mat).length, 0, 'a resolved station on a floor-held material records no skip');
+
+    // BYTE-IDENTICAL DEPARTMENT ROW. Every field the pre-removal code wrote,
+    // asserted field by field: the removal changed where a pour does NOT go,
+    // and nothing about where it does.
+    const row = db.prepare(`
+      SELECT type, quantity, reference_id, order_item_id, station, source, notes, balance_after
+        FROM department_material_transactions
+       WHERE department_id = ? AND material_id = ? ORDER BY rowid DESC LIMIT 1
+    `).get(dept, mat);
+    expectTrue(!!row && row.type === 'consumption', "type is 'consumption'", JSON.stringify(row));
+    expect(row ? row.quantity : NaN, -2000, 'quantity is signed negative recipe units');
+    expectTrue(!!row && row.reference_id === saleId, 'reference_id is the sale id', JSON.stringify(row));
+    expectTrue(!!row && row.order_item_id === 'oi-' + saleId, 'order_item_id is the sold line');
+    expectTrue(!!row && String(row.station) === station, 'station is the SOLD LINE station');
+    expectTrue(!!row && row.source === 'recipe_consumption', "source is 'recipe_consumption'");
+    expectTrue(!!row && row.notes === `Recipe consumption (sale ${saleId})`,
+      'notes read exactly as before the removal', JSON.stringify(row && row.notes));
+    expect(row ? row.balance_after : NaN, 3000, 'balance_after = 5000 issued − 2000 cooked');
+  });
+
+  /* 11b — a store-mapped (liquor) material: still neither rail, even with the
+   * switch armed and the floor holding it. */
+  test('liquor-sale-on-floor-moves-no-store-stock', () => {
+    db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('tm_floor_autodeduct', '1')").run();
+
+    const zone = 'testzone-' + uid();
+    const storeId = mkFloorStore(zone);
+    const dept = mkDept('TEST Bar 11b');
+    const station = 'teststation-' + uid();
+    mapStation(station, dept);
+
+    // The live wiring where it exists (same choice as test 7), else a synthetic
+    // category-owning store so the MECHANISM stays under test.
+    let category = (db.prepare(`
+      SELECT m.category FROM store_category_map m
+        JOIN store_locations s ON s.id = m.store_id
+       WHERE s.is_active = 1 ORDER BY m.created_at ASC, m.id ASC LIMIT 1
+    `).get() || {}).category;
+    if (!category) {
+      category = 'test-liquor-' + uid();
+      db.prepare(`INSERT INTO store_category_map (id, store_id, category) VALUES (?,?,?)`)
+        .run(uid(), storeId, category);
+    }
+
+    const mat = mkMaterial({
+      name: 'TEST FLOOR WHISKY 750ML', category, unit: 'ml', purchase_unit: 'btl',
+      pack_size: 750, current_stock: 7500,
+    });
+    postLedger(db, {
+      store_id: storeId, material_id: mat, txn_type: 'opening', quantity: 3000,
+      unit_cost: 2, notes: 'run-tests fixture opening',
+      // FIELD 8 of the movement record (2026-09-10): postLedger REFUSES a blank
+      // responsible user, so a fixture must name one too. 'system:run-tests' is
+      // the honest label for a movement no person made — the same shape the
+      // KOT-completion sweep and the other machine writers use.
+      created_by: 'system:run-tests',
+    });
+
+    const recipe = mkRecipe(mat, { quantity: 60, unit: 'ml' });
+    const ledgerBefore = storeLedgerTotal();
+    const centralBefore = central(mat);
+
+    sellOnFloor(recipe, 2, station, storeId);         // 120 ml of a floor-held spirit
+
+    expect(storeLedgerTotal(), ledgerBefore,
+      'store_stock_ledger row count UNCHANGED — the TGBCL rail moves on counts and transfers, not on pours');
+    expect(autoDeductRows(), 0, "still no 'Floor auto-deduct' row");
+    expect(central(mat), centralBefore, 'central untouched');
+    expect(deptSum(dept, mat), 0, 'no department movement either (liquor keeps its own rail)');
+    const skips = skipRows(mat);
+    expect(skips.length, 1, 'exactly one consumption_skips row');
+    expectTrue(skips[0] && skips[0].reason === 'store_mapped',
+      "skip reason is still 'store_mapped'", JSON.stringify(skips[0]));
+    expect(skips[0] ? skips[0].quantity : -1, 120, 'the skip records what would have been poured');
+    expect(invTxns(mat, 'sale'), 1, 'the audit row is still written');
+  });
+
+  /* 11c — no department nameable: nothing moves anywhere, one skip. The floor
+   * store must NOT become the fallback the unmapped station never had. */
+  test('unmapped-station-on-floor-still-skips', () => {
+    db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('tm_floor_autodeduct', '1')").run();
+
+    const zone = 'testzone-' + uid();
+    const storeId = mkFloorStore(zone);
+    const station = 'unmapped-' + uid();
+    const mat = mkMaterial({
+      name: 'TEST FLOOR MIXER', category: 'test-floorheld-' + uid(),
+      unit: 'ml', purchase_unit: 'btl', pack_size: 1000, current_stock: 50000,
+    });
+    postLedger(db, {
+      store_id: storeId, material_id: mat, txn_type: 'opening', quantity: 2000,
+      unit_cost: 1, notes: 'run-tests fixture opening',
+      // FIELD 8 of the movement record (2026-09-10): postLedger REFUSES a blank
+      // responsible user, so a fixture must name one too. 'system:run-tests' is
+      // the honest label for a movement no person made — the same shape the
+      // KOT-completion sweep and the other machine writers use.
+      created_by: 'system:run-tests',
+    });
+    const recipe = mkRecipe(mat, { quantity: 150, unit: 'ml' });
+
+    const ledgerBefore = storeLedgerTotal();
+    const centralBefore = central(mat);
+    const deptRowsBefore = Number(db.prepare(
+      'SELECT COUNT(*) c FROM department_material_transactions WHERE material_id = ?').get(mat).c) || 0;
+
+    sellOnFloor(recipe, 2, station, storeId);
+
+    expect(storeLedgerTotal(), ledgerBefore,
+      'store_stock_ledger UNCHANGED — an unnameable department never falls back to the floor store');
+    expect(central(mat), centralBefore, 'central untouched');
+    expect(Number(db.prepare('SELECT COUNT(*) c FROM department_material_transactions WHERE material_id = ?')
+      .get(mat).c) || 0, deptRowsBefore, 'no department row');
+    const skips = skipRows(mat);
+    expect(skips.length, 1, 'exactly one consumption_skips row');
+    expect(skips[0] ? skips[0].quantity : -1, 300, 'the skip records what would have been deducted');
+  });
+
+  /* 11d — recordSale's legacy `store_id` field is inert too. */
+  test('recordSale-store_id-is-inert', () => {
+    db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('tm_floor_autodeduct', '1')").run();
+
+    const zone = 'testzone-' + uid();
+    const storeId = mkFloorStore(zone);
+    const dept = mkDept('TEST Bar 11d');
+    const station = 'teststation-' + uid();
+    mapStation(station, dept);
+    const mat = mkMaterial({
+      name: 'TEST FLOOR JUICE', category: 'test-floorheld-' + uid(),
+      unit: 'ml', purchase_unit: 'btl', pack_size: 1000, current_stock: 60000,
+    });
+    postLedger(db, {
+      store_id: storeId, material_id: mat, txn_type: 'opening', quantity: 4000,
+      unit_cost: 1, notes: 'run-tests fixture opening',
+      // FIELD 8 of the movement record (2026-09-10): postLedger REFUSES a blank
+      // responsible user, so a fixture must name one too. 'system:run-tests' is
+      // the honest label for a movement no person made — the same shape the
+      // KOT-completion sweep and the other machine writers use.
+      created_by: 'system:run-tests',
+    });
+    const req = mkReq(dept);
+    const line = mkLine(req, mat, { requested: 6, unit: 'btl', departmentId: dept });
+    issue(line, 3);
+    const recipe = mkRecipe(mat, { quantity: 500, unit: 'ml' });
+
+    const ledgerBefore = storeLedgerTotal();
+    const deptBefore = deptSum(dept, mat);
+
+    // The settle/hold call shape as it was: store_id on the SaleInput. The
+    // field is gone from the type; a stale caller still passes it.
+    dbMod.recordSale(db, {
+      item_name: 'Test Floor Juice', recipe_id: recipe, quantity_sold: 1,
+      bill_type: 'normal', selling_price: 100, date: new Date().toISOString().slice(0, 10),
+      station, store_id: storeId,
+    });
+
+    expect(storeLedgerTotal(), ledgerBefore, 'recordSale wrote NO store ledger row');
+    expect(autoDeductRows(), 0, "no 'Floor auto-deduct' row from the settle path either");
+    expect(deptSum(dept, mat) - deptBefore, -500, 'the department took the pour, as it should');
+  });
+
+  /* 11e — the switch itself: retired at boot, prior value preserved, and the
+   * report is pinned to the measured (physical) model. */
+  test('tm_floor_autodeduct-is-retired', () => {
+    const val = (k) => {
+      const r = db.prepare('SELECT value FROM settings WHERE key = ?').get(k);
+      return r ? String(r.value) : null;
+    };
+    // getDb() above ran the boot migrations against the snapshot.
+    expect(val('tm_floor_autodeduct'), '0',
+      'boot normalised the retired switch to 0 (floorReconciliation therefore runs physical mode)');
+    expectTrue(val('tm_floor_autodeduct_retired_v1') === '2026-09-10',
+      'the one-shot retirement flag is stamped with the ruling date',
+      String(val('tm_floor_autodeduct_retired_v1')));
+    expectTrue(val('tm_floor_autodeduct_was') !== null,
+      'the prior value is PRESERVED as a historical marker, not destroyed',
+      'tm_floor_autodeduct_was is missing — the retirement threw away what the site had set');
+    expectTrue(floorAutoDeductEnabled(db) === false,
+      'store-engine reads the switch as OFF, so the reconciliation measures by counting');
+  });
+
+  /* 11f — the code-level lock: db.ts may not post to a store ledger at all. */
+  test('db.ts-posts-no-store-ledger-row', () => {
+    const code = fs.readFileSync(path.join(SRC, 'lib', 'db.ts'), 'utf8')
+      .split('\n')
+      .filter(l => !/^\s*(\/\/|\*|\/\*)/.test(l))      // drop comment lines (the tombstone quotes the old call)
+      .join('\n');
+    expectTrue(!/\bpostLedger\s*\(/.test(code),
+      'src/lib/db.ts contains NO postLedger( call — the sale path cannot reach a store ledger',
+      'A store-ledger write has reappeared in db.ts. Consumption belongs to the department rail.');
+    expectTrue(!/INSERT\s+INTO\s+store_stock_ledger/i.test(code),
+      'src/lib/db.ts writes no store_stock_ledger row directly either');
+    expectTrue(!/floorAutoDeductEnabled/.test(code),
+      'src/lib/db.ts no longer reads the retired tm_floor_autodeduct switch');
+  });
 }
 
 /* ────────────────────────────────────────────────────────────────────────────

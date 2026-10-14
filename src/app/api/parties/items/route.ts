@@ -1,4 +1,6 @@
 import { getDb, generateId } from '@/lib/db';
+import { getCurrentUser } from '@/lib/auth';
+import { postCentralTxn } from '@/lib/movement-record';
 
 /**
  * PARTY ITEMS — Issue → Return → Consumption, with the stock movement it drives.
@@ -71,6 +73,12 @@ export async function GET(request: Request) {
 // POST: Issue items for a party (opening) — deducts from main inventory
 export async function POST(request: Request) {
   try {
+    // FIELD 8 of the movement record — the responsible user, FROM THE SESSION.
+    // This handler moved stock without ever naming who did it. The route is
+    // gated by src/proxy.ts, so a session exists; the `system:` fallback is the
+    // honest label if one ever does not, and it reads as a machine actor on the
+    // movements register rather than as a blank.
+    const partyActor = String((await getCurrentUser())?.email || '').trim() || 'system:party-items';
     const db = getDb();
     const body = await request.json();
     const { items, deduct_inventory } = body;
@@ -152,13 +160,15 @@ export async function POST(request: Request) {
             WHERE id = ?
           `).run(issuedQuantity, materialId);
 
-          db.prepare(`
-            INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, created_at)
-            VALUES (?, ?, 'party_issue', ?, ?, ?, datetime('now'))
-          `).run(
-            generateId(), materialId, -issuedQuantity, id,
-            `Issued to party ${item.party_id}`
-          );
+          postCentralTxn(db, {
+            materialId,
+            type: 'party_issue',
+            quantity: -issuedQuantity,
+            referenceId: id,
+            notes: `Issued to party ${item.party_id}`,
+            counterparty: { kind: 'consumption', name: `Party ${item.party_id}` },
+            actor: partyActor,
+          });
         }
 
         results.success++;
@@ -176,6 +186,12 @@ export async function POST(request: Request) {
 // PATCH: Record returns for party items (closing) — returns unused qty to inventory
 export async function PATCH(request: Request) {
   try {
+    // FIELD 8 of the movement record — the responsible user, FROM THE SESSION.
+    // This handler moved stock without ever naming who did it. The route is
+    // gated by src/proxy.ts, so a session exists; the `system:` fallback is the
+    // honest label if one ever does not, and it reads as a machine actor on the
+    // movements register rather than as a blank.
+    const partyActor = String((await getCurrentUser())?.email || '').trim() || 'system:party-items';
     const db = getDb();
     const body = await request.json();
     const { returns, restore_inventory } = body;
@@ -240,13 +256,15 @@ export async function PATCH(request: Request) {
             WHERE id = ?
           `).run(returnedQty, item.material_id);
 
-          db.prepare(`
-            INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, created_at)
-            VALUES (?, ?, 'party_return', ?, ?, ?, datetime('now'))
-          `).run(
-            generateId(), item.material_id, returnedQty, ret.id,
-            `Returned from party ${item.party_id} (unused)`
-          );
+          postCentralTxn(db, {
+            materialId: item.material_id,
+            type: 'party_return',
+            quantity: returnedQty,
+            referenceId: ret.id,
+            notes: `Returned from party ${item.party_id} (unused)`,
+            counterparty: { kind: 'consumption', name: `Party ${item.party_id}` },
+            actor: partyActor,
+          });
         }
 
         results.success++;
@@ -263,6 +281,12 @@ export async function PATCH(request: Request) {
 
 export async function DELETE(request: Request) {
   try {
+    // FIELD 8 of the movement record — the responsible user, FROM THE SESSION.
+    // This handler moved stock without ever naming who did it. The route is
+    // gated by src/proxy.ts, so a session exists; the `system:` fallback is the
+    // honest label if one ever does not, and it reads as a machine actor on the
+    // movements register rather than as a blank.
+    const partyActor = String((await getCurrentUser())?.email || '').trim() || 'system:party-items';
     const db = getDb();
     const url = new URL(request.url);
     const id = url.searchParams.get('id');
@@ -278,10 +302,15 @@ export async function DELETE(request: Request) {
       if (netRemoved > 0) {
         db.prepare('UPDATE raw_materials SET current_stock = current_stock + ? WHERE id = ?')
           .run(netRemoved, item.material_id);
-        db.prepare(`
-          INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, created_at)
-          VALUES (?, ?, 'adjustment', ?, ?, ?, datetime('now'))
-        `).run(generateId(), item.material_id, netRemoved, id, `Party item deleted — restored to stock`);
+        postCentralTxn(db, {
+          materialId: item.material_id,
+          type: 'adjustment',
+          quantity: netRemoved,
+          referenceId: id,
+          notes: `Party item deleted — restored to stock`,
+          counterparty: { kind: 'consumption', name: 'Party (item deleted)' },
+          actor: partyActor,
+        });
       }
     }
 

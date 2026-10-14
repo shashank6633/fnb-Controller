@@ -90,7 +90,16 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         markKotServed(db, id);
         // Window 0 = the undo is switched off, so there is nothing to wait for:
         // consume in this same transaction, exactly as this route always did.
+<<<<<<< WIP-MIXED production side — these lines came from: d9cb84b KOT undo, role-scoped alerts, call-duration trust, and the Cen (1)
         if (windowSec <= 0) applyKotConsumption(db, id);
+======= WIP side
+        // FIELD 8 of the movement record: this branch DOES have a session — the
+        // chef who bumped the ticket — so the consumption rows name that person
+        // rather than the timer. The deferred path (commitDueKotConsumption,
+        // above and on the sweep) genuinely has no session and stays
+        // 'system:kot-sweep'.
+        if (windowSec <= 0) applyKotConsumption(db, id, String(me?.email || '').trim() || undefined);
+>>>>>>> WIP-MIXED
       } else {
         db.prepare("UPDATE kots SET status = ?, updated_at = datetime('now') WHERE id = ?").run(next, id);
       }

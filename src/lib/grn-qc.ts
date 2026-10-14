@@ -1937,6 +1937,13 @@ export function decideGrnQc(
         Number(r.item.special_excise_cess) || 0,
         Number(r.item.tcs) || 0,
         Number(r.item.mrp_round_off) || 0,
+        // THE RECEIVER'S TAX DECISION, carried onto the cost row exactly as the
+        // unheld path (api/grn, PO-receive) does. Read off the STORED LINE, not
+        // re-decided here: the person who ticked or unticked it stood at the
+        // delivery door hours ago, and a QC sign-off judges QUALITY, never
+        // whether a line bears tax. '' on every line received before the tick
+        // existed, which is what those rows would have written anyway.
+        String(r.item.tax_decision || ''),
       );
       // ── Unit-basis boundary (CORE CONVENTION) ────────────────────────────
       // GRN quantities are PURCHASE units; current_stock and

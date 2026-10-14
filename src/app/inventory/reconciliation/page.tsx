@@ -5,8 +5,16 @@
  * (multi-floor bar, Phase 2). For each floor store + material it lines up:
  *
  *   EXPECTED = sold-through from `sales` (recipe exploded to materials → pegs),
- *   ACTUAL   = the floor's physical stock decrease (opening + inflow − closing),
- *              or, when auto-deduct is ON, the ledger outward sale rows,
+ *   ACTUAL   = the floor's MEASURED stock decrease (opening + inflow − closing,
+ *              from physical counts). This is now the only mode that can run:
+ *              the sale-driven floor auto-deduct that fed the old 'ledger' mode
+ *              was removed by owner ruling on 2026-09-10 — a sale, a KOT
+ *              completion and a recipe explosion move NOTHING at store level.
+ *              A floor's figure is therefore exactly as fresh as its last
+ *              count, and this report is where the pour is compared with it.
+ *              The ledger-mode branches below are kept, not dead-stripped, so a
+ *              period that PREDATES the ruling still renders from the rows the
+ *              floor really has. Do not re-arm that mode for new periods.
  *   VARIANCE = actual − expected. A positive variance means more stock left the
  *              floor than sales explain — the unbilled gap / leak, flagged red.
  *
@@ -245,7 +253,9 @@ function FloorHealthPanel() {
           </span>
         ) : null}
         <span className="ml-auto text-[11px] opacity-70">
-          {data && `auto-deduct ${data.autodeduct.enabled ? 'ON' : 'OFF'} · ${data.autodeduct.mode} mode`}
+          {data && (data.autodeduct.mode === 'physical'
+            ? 'floor usage measured by counting · physical mode'
+            : 'legacy auto-deduct rows · ledger mode')}
         </span>
       </button>
 
@@ -525,8 +535,8 @@ export default function ReconciliationPage() {
               : 'bg-[#FFF1E3] border-[#E8D5C4] text-[#6B5744]'}`}>
             <Info className="w-3.5 h-3.5 shrink-0" />
             {mode === 'ledger'
-              ? 'Auto-deduct ON — Actual = floor ledger outward'
-              : 'Auto-deduct OFF — Actual = opening + inflow − closing (physical count)'}
+              ? 'Legacy ledger mode — Actual = floor ledger outward (pre-2026-09-10 rows only)'
+              : 'Floor usage is measured by counting — Actual = opening + transfers in − closing. A sale never moves floor stock, so a floor’s figure is only as fresh as its last count.'}
           </div>
         )}
       </div>

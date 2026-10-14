@@ -13,7 +13,7 @@
  */
 
 import { useEffect, useState } from 'react';
-import { Wine, Loader2, RefreshCw, AlertTriangle, Plus, X, Trash2 } from 'lucide-react';
+import { Wine, Loader2, RefreshCw, AlertTriangle, Plus, X, Trash2, Lock } from 'lucide-react';
 import MaterialTypeahead from '@/components/MaterialTypeahead';
 import { api } from '@/lib/api';
 import { fmtQtyNum, packFactor, purchasePrice, type PackMeta } from '@/lib/pack-units';
@@ -122,6 +122,15 @@ function prettyQty(qty: number, unit?: string): string {
   return qty.toLocaleString('en-IN', { maximumFractionDigits: 2 }) + ' ' + (unit || '');
 }
 
+/** The two sources behind liquor_items, or null when the API predates the split
+ *  (then the caller falls back to the merged count rather than printing "0 · 0"). */
+function liquorSplit(r: PnLRow): { req: number; rec: number } | null {
+  const req = r.liquor_requisition_items;
+  const rec = r.liquor_consumption_items;
+  if (typeof req !== 'number' || typeof rec !== 'number') return null;
+  return { req, rec };
+}
+
 interface PnLRow {
   party_unique_id?: string;
   fp_id?: string;
@@ -134,6 +143,11 @@ interface PnLRow {
   food_items: number;
   liquor_cost: number;
   liquor_items: number;
+  // liquor_items is the SUM of these two sources. Optional so an older cached
+  // response (or a payload from before the split shipped) degrades to the merged
+  // count instead of rendering "0 · 0" over a non-zero cost.
+  liquor_consumption_items?: number;   // recorded on this screen
+  liquor_requisition_items?: number;   // already costed from the Bar requisition
   total_cost: number;
   profit: number;
   margin_pct: number;
@@ -248,10 +262,33 @@ export default function PartyPnLPage() {
                     </td>
                     <td className="py-1.5 px-3 text-right font-mono">{r.pax || '—'}</td>
                     <td className="py-1.5 px-3">
+                      {/* SPLIT BY SOURCE, not a merged count. A party whose liquor
+                          came entirely from a bar requisition used to read
+                          "✓ 1 item recorded" and open a modal saying nothing was
+                          recorded — a green tick pointing at the wrong place, which
+                          invites re-typing a bottle that is already costed. Each
+                          source now names itself, and the tick appears only for what
+                          was actually recorded on this screen. */}
                       {r.has_liquor_recorded
-                        ? <button onClick={() => setRecordFor(r)} title="View / edit recorded items"
-                                  className="inline-flex items-center gap-1 text-emerald-700 hover:underline">
-                            ✓ {r.liquor_items} item{r.liquor_items === 1 ? '' : 's'} recorded
+                        ? <button onClick={() => setRecordFor(r)}
+                                  title="Open the liquor breakdown for this event. Requisition lines are already costed on the P&L and are read-only."
+                                  className="inline-flex flex-wrap items-center gap-x-1 text-left hover:underline">
+                            {liquorSplit(r)
+                              ? <>
+                                  <span className={liquorSplit(r)!.req > 0 ? 'text-[#af4408]' : 'text-[#8B7355]'}>
+                                    {/* "requisitions" names the SOURCE and never
+                                        agrees with the count: the owner specified
+                                        "1 from requisitions · 0 recorded here"
+                                        verbatim, and "recorded here" opposite it
+                                        does not inflect either. */}
+                                    {liquorSplit(r)!.req} from requisitions
+                                  </span>
+                                  <span className="text-[#C4B5A5]">·</span>
+                                  <span className={liquorSplit(r)!.rec > 0 ? 'text-emerald-700' : 'text-[#8B7355]'}>
+                                    {liquorSplit(r)!.rec === 0 ? '0' : `✓ ${liquorSplit(r)!.rec}`} recorded here
+                                  </span>
+                                </>
+                              : <span className="text-emerald-700">✓ {r.liquor_items} item{r.liquor_items === 1 ? '' : 's'} recorded</span>}
                           </button>
                         : <span className="text-amber-700 text-[10px]">not recorded yet</span>}
                     </td>
@@ -296,6 +333,34 @@ interface ConsumptionEntry {
   recorded_by?: string;
 }
 
+/** A liquor line from the party's BAR REQUISITION — already costed into the P&L
+ *  by /api/party-events/pnl. Shown read-only; there is nothing here to edit and
+ *  re-entering one of these on the form counts the same bottle twice. */
+interface ReqLiquorItem {
+  id: string;
+  material_id: string;
+  material_name: string;
+  material_unit: string;
+  issued_unit: string;
+  qty_issued: number;
+  qty_issued_recipe: number;
+  cost: number;
+  req_number: string;
+  req_status: string;
+  issued_at?: string | null;
+  issued_by?: string | null;
+}
+
+/** A material the POST refused because the bar requisition already covers it. */
+interface DuplicateWarning {
+  material_id: string;
+  material_name: string;
+  req_number: string;
+  qty_issued: number;
+  issued_unit: string;
+  cost: number;
+}
+
 function RecordConsumptionModal({ target, onClose, onChanged }: {
   target: PnLRow;
   onClose: () => void;
@@ -303,6 +368,8 @@ function RecordConsumptionModal({ target, onClose, onChanged }: {
 }) {
   const [materials, setMaterials] = useState<any[]>([]);
   const [existing, setExisting] = useState<ConsumptionEntry[]>([]);
+  const [reqItems, setReqItems] = useState<ReqLiquorItem[]>([]);
+  const [dupes, setDupes] = useState<DuplicateWarning[] | null>(null);
   const [loadingExisting, setLoadingExisting] = useState(true);
   const [lines, setLines] = useState<{ material_id: string; qty: string; notes: string; unit: string }[]>([
     { material_id: '', qty: '', notes: '', unit: '' },
@@ -322,7 +389,12 @@ function RecordConsumptionModal({ target, onClose, onChanged }: {
     setLoadingExisting(true);
     fetch(`/api/party-consumption?${existingQs}`)
       .then(r => r.json())
-      .then(d => setExisting(d.entries || []))
+      .then(d => {
+        setExisting(d.entries || []);
+        // The other half of this event's liquor cost. Read-only by construction:
+        // nothing in this modal can edit or delete a requisition line.
+        setReqItems(d.requisition_items || []);
+      })
       .catch(() => {})
       .finally(() => setLoadingExisting(false));
   };
@@ -354,9 +426,14 @@ function RecordConsumptionModal({ target, onClose, onChanged }: {
   }, 0);
 
   const existingTotal = existing.reduce((a, e) => a + (e.cost_at_time || 0), 0);
+  const reqTotal      = reqItems.reduce((a, e) => a + (e.cost || 0), 0);
   const recordedMaterialIds = new Set(existing.map(e => e.material_id));
+  // Materials already costed from the bar requisition. Typing one of these on the
+  // form is how the same bottle gets counted twice — the line flags it, and the
+  // API refuses it once (409) before anything is written.
+  const reqMaterialIds = new Map(reqItems.map(e => [e.material_id, e]));
 
-  const submit = async () => {
+  const submit = async (confirmDuplicates = false) => {
     const cleaned = lines.filter(l => l.material_id && Number(l.qty) > 0);
     if (cleaned.length === 0) { setError('Add at least one item with qty > 0'); return; }
     setSaving(true); setError(null); setOk(null);
@@ -368,6 +445,9 @@ function RecordConsumptionModal({ target, onClose, onChanged }: {
           fp_id: target.fp_id,
           event_name: target.event_name,
           event_date: target.event_date,
+          // Only ever true after the user has been shown the requisition line the
+          // material is already costed on and has chosen to record it anyway.
+          confirm_duplicates: confirmDuplicates,
           items: cleaned.map(l => {
             const m = materials.find(x => x.id === l.material_id);
             // Posts RECIPE units — the API stores qty_consumed in the material's
@@ -377,9 +457,18 @@ function RecordConsumptionModal({ target, onClose, onChanged }: {
         },
       });
       const j = await r.json().catch(() => ({}));
+      if (r.status === 409 && j.needs_confirmation) {
+        // NOT an error the user should have to decode: show which bottle is
+        // already costed, on which requisition, and make recording it anyway an
+        // explicit second click.
+        setDupes(j.duplicates || []);
+        setError(null);
+        return;
+      }
       if (!r.ok) { setError(j.error || `HTTP ${r.status}`); return; }
+      setDupes(null);
       setLines([{ material_id: '', qty: '', notes: '', unit: '' }]);
-      setOk(`Recorded ${cleaned.length} item${cleaned.length === 1 ? '' : 's'} — see "Already recorded" above.`);
+      setOk(`Recorded ${cleaned.length} item${cleaned.length === 1 ? '' : 's'} — see "Recorded on this screen" above.`);
       loadExisting();
       onChanged();
     } finally { setSaving(false); }
@@ -413,10 +502,62 @@ function RecordConsumptionModal({ target, onClose, onChanged }: {
         </div>
 
         <div className="px-6 py-4 space-y-3 overflow-y-auto flex-1">
-          {/* Already recorded — so you can see what's punched and avoid duplicates */}
+          {/* ── ALREADY COSTED FROM THE BAR REQUISITION — READ-ONLY ──────────────
+              These lines are the OTHER half of this event's liquor cost. They used
+              to be invisible here, so a party whose liquor came entirely from a
+              requisition opened an empty modal under a badge saying an item was
+              recorded — and the natural response to an empty modal is to type the
+              bottle in, which charges the party twice. Nothing in this block is
+              editable or deletable: the store issued it, the P&L already counted
+              it, and there is nothing to re-enter. */}
+          {!loadingExisting && reqItems.length > 0 && (
+            <div>
+              <div className="flex items-center justify-between mb-1">
+                <h3 className="text-xs font-semibold text-[#2D1B0E] uppercase tracking-wide flex items-center gap-1">
+                  <Lock size={11} className="text-[#af4408]" /> Already costed from the Bar requisition
+                </h3>
+                <span className="text-[11px] text-[#8B7355]">{reqItems.length} item{reqItems.length === 1 ? '' : 's'} · {fmt(reqTotal)}</span>
+              </div>
+              <div className="border border-[#D4B896] rounded-lg overflow-hidden bg-[#F5EDE3]">
+                <div className="px-2 py-1.5 text-[10px] text-[#6B5744] border-b border-[#D4B896]">
+                  Issued by the store on this party&apos;s bar requisition and <b>already included in the liquor cost</b> on the P&amp;L.
+                  Read-only — re-entering any of these below would count the same bottle twice.
+                </div>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-xs">
+                    <thead className="bg-[#EDDFD0] text-[#6B5744]">
+                      <tr>
+                        <th className="text-left  py-1.5 px-2 font-medium">Item</th>
+                        <th className="text-right py-1.5 px-2 font-medium">Issued</th>
+                        <th className="text-right py-1.5 px-2 font-medium">Cost</th>
+                        <th className="text-left  py-1.5 px-2 font-medium">Requisition</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {reqItems.map(e => (
+                        <tr key={e.id} className="border-t border-[#D4B896]/60">
+                          <td className="py-1.5 px-2 text-[#2D1B0E]">{e.material_name}</td>
+                          <td className="py-1.5 px-2 text-right font-mono whitespace-nowrap"
+                              title={`= ${prettyQty(e.qty_issued_recipe, e.material_unit)} costed at ₹/${e.material_unit}`}>
+                            {fmtQtyNum(e.qty_issued)} {e.issued_unit}
+                          </td>
+                          <td className="py-1.5 px-2 text-right font-mono">{fmt(e.cost)}</td>
+                          <td className="py-1.5 px-2 text-[10px] text-[#8B7355] whitespace-nowrap">
+                            {e.req_number || '—'}{e.issued_by ? ` · ${String(e.issued_by).split('@')[0]}` : ''}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Recorded here — what was punched on THIS screen, so duplicates are visible */}
           <div>
             <div className="flex items-center justify-between mb-1">
-              <h3 className="text-xs font-semibold text-[#2D1B0E] uppercase tracking-wide">Already recorded</h3>
+              <h3 className="text-xs font-semibold text-[#2D1B0E] uppercase tracking-wide">Recorded on this screen</h3>
               {!loadingExisting && existing.length > 0 && (
                 <span className="text-[11px] text-[#8B7355]">{existing.length} item{existing.length === 1 ? '' : 's'} · {fmt(existingTotal)}</span>
               )}
@@ -424,7 +565,12 @@ function RecordConsumptionModal({ target, onClose, onChanged }: {
             {loadingExisting ? (
               <div className="text-xs text-[#8B7355] py-2"><Loader2 size={12} className="inline animate-spin mr-1" /> Loading…</div>
             ) : existing.length === 0 ? (
-              <div className="text-xs text-[#8B7355] bg-[#FFF8F0] border border-[#E8D5C4] rounded p-2">Nothing recorded for this event yet.</div>
+              <div className="text-xs text-[#8B7355] bg-[#FFF8F0] border border-[#E8D5C4] rounded p-2">
+                {reqItems.length > 0
+                  ? <>Nothing recorded on this screen — this event&apos;s liquor is already costed from the Bar requisition above.
+                      Add an item here only if it was drawn from the bar <b>on top of</b> what the store issued.</>
+                  : 'Nothing recorded for this event yet.'}
+              </div>
             ) : (
               <div className="border border-[#E8D5C4] rounded-lg overflow-hidden">
                 <div className="overflow-x-auto">
@@ -463,6 +609,23 @@ function RecordConsumptionModal({ target, onClose, onChanged }: {
               </div>
             )}
           </div>
+
+          {/* RECONCILIATION. The two blocks above are the whole liquor cost this
+              event carries on the P&L, so their sum must equal the figure printed
+              on the list. Showing the arithmetic is what proves the modal is no
+              longer hiding a source — and what tells someone the number they are
+              looking for is already here, before they reach for the form below. */}
+          {!loadingExisting && (reqItems.length > 0 || existing.length > 0) && (
+            <div className="text-[11px] bg-[#FFF8F0] border border-[#E8D5C4] rounded p-2 flex items-center justify-between gap-2 flex-wrap">
+              <span className="text-[#6B5744]">
+                Liquor cost on the P&amp;L for this event
+                <span className="text-[#8B7355]">
+                  {' '}= {fmt(reqTotal)} requisition + {fmt(existingTotal)} recorded here
+                </span>
+              </span>
+              <span className="font-mono font-semibold text-[#2D1B0E]">{fmt(reqTotal + existingTotal)}</span>
+            </div>
+          )}
 
           <div className="border-t border-[#E8D5C4] pt-3">
             <h3 className="text-xs font-semibold text-[#2D1B0E] uppercase tracking-wide">Add items</h3>
@@ -549,6 +712,17 @@ function RecordConsumptionModal({ target, onClose, onChanged }: {
                   )}
                   {l.material_id && recordedMaterialIds.has(l.material_id) && (
                     <div className="text-[10px] text-amber-700 mt-0.5">⚠ Already recorded above — saving will add to it.</div>
+                  )}
+                  {/* The one that actually double-counts money: this material is
+                      already costed from the bar requisition, so saving it here
+                      charges the party for the same bottle twice. The API refuses
+                      it once and asks for confirmation; this is the warning before
+                      that happens. */}
+                  {l.material_id && reqMaterialIds.has(l.material_id) && (
+                    <div className="text-[10px] text-red-700 mt-0.5">
+                      ⚠ Already costed from Bar requisition {reqMaterialIds.get(l.material_id)!.req_number || '(this party)'} —
+                      saving this counts the same item twice. Only add it if it was drawn on top of what was issued.
+                    </div>
                   )}
                 </div>
                 <input type="number" step="any" value={l.qty}
@@ -663,11 +837,49 @@ function RecordConsumptionModal({ target, onClose, onChanged }: {
 
           {ok && <div className="bg-emerald-50 border border-emerald-200 text-emerald-800 rounded p-2 text-xs">{ok}</div>}
           {error && <div className="bg-red-50 border border-red-200 text-red-700 rounded p-2 text-xs">{error}</div>}
+
+          {/* THE DOUBLE-COUNT STOP. Nothing was written: the API refused with 409
+              and named the requisition line the material is already costed on.
+              Recording it anyway stays possible — a party can genuinely drink more
+              than was issued — but it now takes a deliberate second click. */}
+          {dupes && dupes.length > 0 && (
+            <div className="bg-red-50 border border-red-300 rounded p-3 text-xs space-y-2">
+              <div className="font-semibold text-red-800 flex items-center gap-1">
+                <AlertTriangle size={13} /> Nothing was saved — this would count the same item twice
+              </div>
+              <ul className="space-y-1">
+                {dupes.map(d => (
+                  <li key={d.material_id} className="text-red-700">
+                    <b>{d.material_name}</b> is already costed at {fmt(d.cost)} from Bar requisition{' '}
+                    <span className="font-mono">{d.req_number || '(this party)'}</span>
+                    {d.qty_issued ? ` (${fmtQtyNum(d.qty_issued)} ${d.issued_unit} issued)` : ''}.
+                  </li>
+                ))}
+              </ul>
+              <div className="text-[11px] text-red-700">
+                It is already in the liquor cost on the P&amp;L. Record it here only if this is <b>extra</b> stock
+                drawn from the bar on top of what the store issued.
+              </div>
+              <div className="flex flex-wrap gap-2 pt-0.5">
+                <button type="button" onClick={() => { setDupes(null); }}
+                        className="px-3 py-1.5 rounded text-xs bg-white border border-red-300 text-red-800 hover:bg-red-100">
+                  Cancel — it is already counted
+                </button>
+                <button type="button" onClick={() => submit(true)} disabled={saving}
+                        className="px-3 py-1.5 rounded text-xs bg-red-700 hover:bg-red-800 text-white disabled:opacity-50">
+                  {saving ? 'Saving…' : 'Record anyway — this is extra stock'}
+                </button>
+              </div>
+            </div>
+          )}
         </div>
 
         <div className="flex justify-end gap-2 px-6 py-3 border-t border-[#E8D5C4] shrink-0">
           <button onClick={onClose} className="px-4 py-2 text-sm text-[#6B5744] hover:bg-[#FFF1E3] rounded">Close</button>
-          <button onClick={submit} disabled={saving}
+          {/* () => submit() — NOT onClick={submit}. Passing the click handler
+              directly would hand React's MouseEvent in as confirmDuplicates and
+              post a truthy confirm on the very first click, skipping the gate. */}
+          <button onClick={() => submit()} disabled={saving}
                   className="inline-flex items-center gap-1.5 px-4 py-2 bg-[#af4408] hover:bg-[#933807] text-white rounded text-sm disabled:opacity-50">
             {saving ? <Loader2 className="animate-spin" size={14} /> : <Plus size={14} />}
             {saving ? 'Saving…' : 'Save Consumption'}

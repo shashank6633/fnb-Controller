@@ -1103,14 +1103,14 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // final 'fulfilled' transition, TRANSFER the issued materials out of the
       // store (raw_materials.current_stock − / inventory_transactions) and INTO
       // the owning department's on-hand balance. The helper owns the dedup guard
-      // (via the existing party_consumption ledger row), the store deduction, and
+      // (via the existing party transfer ledger row), the store deduction, and
       // the department credit — so it is safe to call from both fulfilment paths
       // without any double-transfer. Only fire when no PO is being raised.
       //
       // The trigger stays "no PO raised" and deliberately does NOT follow
       // finalStatus any more. A short issue is now 'store_processed', and gating
       // the transfer on fulfilment would stop party stock leaving the store on
-      // the day it physically leaves — and because the party_consumption ledger
+      // the day it physically leaves — and because the party transfer ledger
       // row makes the transfer one-shot, a later top-up could never move the
       // balance either. Status honesty and transfer timing are separate calls.
       // `!linkedPoId` used to mean "nothing is on order, so what was issued is
@@ -1119,7 +1119,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // Dropping unmapped vendor lines broke that reading: a shortfall that
       // WOULD have become a PO can now be skipped instead, leaving linkedPoId
       // null while goods are still genuinely outstanding. The transfer would
-      // then fire on the partial quantity, and because the party_consumption
+      // then fire on the partial quantity, and because the party transfer
       // ledger row makes it one-shot, the remainder could never move afterwards
       // — the party would be permanently short on the books.
       //

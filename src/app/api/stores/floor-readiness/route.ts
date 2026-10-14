@@ -123,15 +123,17 @@ export async function GET() {
     if (orphan_labels.length > 0) {
       issues.push({ severity: 'warn', message: `Floor label(s) matching no table zone: ${orphan_labels.map(o => `${o.store} → "${o.label}"`).join(', ')}. Check the label spelling matches the table zone exactly.` });
     }
+    // MODE IS 'physical' FOR EVERY NEW PERIOD. The sale-driven floor auto-deduct
+    // was removed by owner ruling on 2026-09-10 and tm_floor_autodeduct retired
+    // to '0', so nothing writes floor sale rows any more. 'ledger' can only
+    // surface on a database whose retirement migration has not run yet, and its
+    // message says so rather than telling anyone to feed a dead rail.
     if (mode === 'ledger') {
-      const noStock = floorStores.filter(s => !s.has_stock);
-      if (noStock.length > 0) {
-        issues.push({ severity: 'error', message: `Auto-deduct is ON but ${noStock.map(s => s.name).join(', ')} hold no stock — a sale only deducts a material the floor actually holds. Transfer stock in or set opening stock first.` });
-      }
+      issues.push({ severity: 'error', message: 'This database still has the retired auto-deduct switch ON, so the report is summing floor sale rows that nothing writes any more (a sale has not moved floor stock since 2026-09-10). Restart the app to run the retirement migration — the report then measures each floor by counting instead.' });
     } else {
       const noCounts = floorStores.filter(s => s.closing_counts === 0);
       if (noCounts.length > 0) {
-        issues.push({ severity: 'warn', message: `Auto-deduct is OFF (physical mode) and ${noCounts.map(s => s.name).join(', ')} have no closing counts yet — physical-mode reconciliation needs an opening and a closing count per floor.` });
+        issues.push({ severity: 'warn', message: `Floor usage is measured by counting, and ${noCounts.map(s => s.name).join(', ')} have no closing counts yet — each floor needs an opening and a closing count for the period, or its usage cannot be measured at all.` });
       }
     }
     if (recipe_coverage.missing_recipe > 0) {
@@ -143,11 +145,16 @@ export async function GET() {
 
     return Response.json({
       ready,
+      // `autodeduct` is reported for continuity of this response shape, and
+      // because a stale '1' is itself a finding (see the issue above). The
+      // switch is RETIRED (owner ruling 2026-09-10): it no longer moves stock
+      // and /api/settings refuses to write it.
       autodeduct: {
         enabled: autodeduct,
+        retired: true,
         mode,
         needs: mode === 'ledger'
-          ? ['Zone → floor label mapping', 'Floor holds the stock (transfer/opening)', 'Drinks have recipes', 'Drinks rung up on POS per floor']
+          ? ['Restart to retire the auto-deduct switch', 'Zone → floor label mapping', 'Opening + closing physical counts per floor', 'Drinks have recipes']
           : ['Zone → floor label mapping', 'Opening + closing physical counts per floor', 'Drinks have recipes', 'Drinks rung up on POS per floor'],
       },
       floor_stores: floorStores,

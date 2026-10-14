@@ -27,6 +27,15 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     // so this only bites a second process on the same SQLite file (or a future
     // await inserted here) — approve/route.ts:28-39 has the same shape and needs it
     // because two awaits do sit in its gap.
+    //
+    // NO rejected_at HERE, deliberately. purchase_orders.rejected_at/rejected_by
+    // exist in long-lived databases but src/lib/db.ts creates NEITHER (its CREATE
+    // TABLE declares 15 columns; its ALTERs add approval_note, vendor_id,
+    // outlet_id, requisition_id, delivery_date, grn_id — 21 in total, and this
+    // DB's 26 include five nobody creates). Writing one would 500 on any database
+    // built from the current schema. The rejection timestamp lives in the
+    // audit_events row below; rejected_reason, which IS in the CREATE TABLE, is
+    // the part the drafter reads on the PO.
     const claim = db.prepare(`
       UPDATE purchase_orders SET status = 'rejected', rejected_reason = ?, updated_at = datetime('now')
       WHERE id = ? AND status IN ('pending', 'pending_reapproval')

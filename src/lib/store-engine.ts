@@ -2,6 +2,19 @@ import type { Database } from 'better-sqlite3';
 import type { SessionUser } from './auth';
 import { generateId, convertToMaterialUnit } from './db';
 import { packFactor } from './pack-units';
+// THE MOVEMENT RECORD (owner's requirement, 2026-09-10). postLedger() is the
+// only INSERT into store_stock_ledger in the whole tree, so it is the only
+// place the STORE rail can be made to carry the eight fields. movement-record
+// imports nothing but better-sqlite3's type — no cycle.
+import {
+  movementCols, orient, storeParty, vendorParty,
+  type MovementParty, type MovementPartyKind,
+} from './movement-record';
+// Phase L2 of the Liquor Purchase Reconciliation module. upsertBillCharges()
+// below is the ONE place a TGBCL Net Indent is ever written, and the plan
+// requires the wallet debit to be created in the SAME TRANSACTION as the
+// indent — see the note inside that function.
+import { autoDebitForIndent, type AutoDebitResult } from './liquor-wallet';
 
 /**
  * Multi-Store Inventory Engine — Phase A foundation (LIQUOR STORE first).
@@ -71,6 +84,31 @@ export const LEDGER_TXN_TYPES = [
 ] as const;
 export type LedgerTxnType = (typeof LEDGER_TXN_TYPES)[number];
 
+/**
+ * The DEFAULT other end of a store movement, per txn_type — fields 4 & 5 for
+ * the ~10 writers that have never been told to name one.
+ *
+ * Chosen so a site nobody revisits still records something TRUE rather than
+ * blank. Blank is what every store_stock_ledger row carried before, and it is
+ * why the movements register has to flag them `unrecorded`. A writer that
+ * knows the real counterparty passes `counterparty` on the entry and this is
+ * not consulted.
+ *
+ * 'purchase' and 'inward' resolve to the VENDOR when the entry carries a
+ * supplier or vendor_id (procure / procure-bulk / procure-bill all do), and
+ * fall back to 'external' when it does not — a receipt from somewhere
+ * unnamed, which is honest, rather than a vendor called "Vendor".
+ */
+const LEDGER_COUNTERPARTY: Record<LedgerTxnType, MovementPartyKind> = {
+  opening:    'opening',      // the balance this store started from
+  purchase:   'vendor',
+  inward:     'vendor',
+  outward:    'external',     // a pour / withdrawal / hand-over the caller did not name
+  adjustment: 'adjustment',   // a stock correction, not a place
+  closing:    'adjustment',   // a count re-basing the ledger, likewise
+  transfer:   'external',     // the other store is not on the entry; a caller that knows passes it
+};
+
 export interface LedgerEntry {
   store_id: string;
   material_id: string;
@@ -94,6 +132,25 @@ export interface LedgerEntry {
   cgst?: number;
   sgst?: number;
   delivery_charges?: number;
+  /**
+   * THE OTHER END of this movement — fields 4 & 5 of the owner's record. The
+   * store itself is always one end (this is the store's own ledger); which end
+   * is decided by the SIGN of `quantity`, exactly as on the other two rails.
+   *
+   * OPTIONAL, and it defaults per txn_type (see LEDGER_COUNTERPARTY) so that
+   * every existing caller starts recording a true source and destination with
+   * no change at all. A writer that knows better — which vendor, which
+   * department, which other store — passes its own and overrides the default.
+   */
+  counterparty?: MovementParty;
+  /**
+   * FIELD 7, the BUSINESS date (YYYY-MM-DD, IST). Defaults to today.
+   * Note this is deliberately separate from created_at: four store writers
+   * backdate a purchase by UPDATE-ing created_at after the insert, which is
+   * what made "when did this happen" and "when was this recorded" the same
+   * unusable number. A backdating caller should pass its date here too.
+   */
+  txn_date?: unknown;
 }
 
 export interface StoreStockRow {
@@ -357,19 +414,61 @@ export function postLedger(db: Database, entry: LedgerEntry): string {
   // charges are ≥ 0; blank/invalid → 0. They do NOT enter unit_cost/valuation.
   const chg = (v: any) => { const x = Number(v); return Number.isFinite(x) && x > 0 ? Math.round(x * 100) / 100 : 0; };
   const id = generateId();
-  db.prepare(`
-    INSERT INTO store_stock_ledger
-      (id, store_id, material_id, txn_type, quantity, unit_cost,
-       batch_no, supplier, vendor_id, expiry_date, ref, notes, created_by,
-       discount, cgst, sgst, delivery_charges, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-  `).run(
+
+  /* ── THE EIGHT FIELDS, ON THE STORE RAIL ────────────────────────────────────
+   * This rail carried four of them (item, quantity, movement type, and a
+   * created_by that most writers left blank) and NONE of the other four: no
+   * unit of measure, no source, no destination, no business date. Every row
+   * written from here landed in the movements register flagged `unrecorded`.
+   *
+   * ADDITIVE, and deliberately so. The columns were added by ALTER TABLE with
+   * a '' / 0 default, the INSERT's original column list is untouched, and
+   * movementCols() appends only the columns this database actually HAS — so a
+   * handle opened against an unmigrated file writes exactly the row it wrote
+   * before instead of failing on "no such column". No quantity, sign, cost,
+   * balance or ordering key moves.
+   *
+   * WHAT IS NOT DONE HERE, on purpose: postLedger does NOT refuse a blank
+   * created_by the way postCentralTxn and postDeptLedger refuse a blank actor.
+   * Roughly ten routes write this rail, most of them held by another lane
+   * right now, and turning a silent blank into a thrown 500 across all of them
+   * is a change to make deliberately with the owner — not as a side effect of
+   * wiring the record. The blank is now VISIBLE in the register instead of
+   * being indistinguishable from an unmigrated row, which is the first half of
+   * fixing it.
+   * ─────────────────────────────────────────────────────────────────────────*/
+  const home = storeParty(db, storeId);
+  const defaultKind = LEDGER_COUNTERPARTY[txnType] || 'external';
+  const counterparty: MovementParty = entry.counterparty
+    || (defaultKind === 'vendor' && (entry.supplier || entry.vendor_id)
+      ? vendorParty(entry.supplier, entry.vendor_id)
+      : { kind: defaultKind === 'vendor' ? 'external' : defaultKind });
+  // Sign decides which end the store is — the deployed convention on all three
+  // rails: + came IN to the store, − went OUT of it.
+  const { src, dst } = orient(home, counterparty, qty);
+  const mv = movementCols(db, 'store_stock_ledger', {
+    materialId, quantity: qty, src, dst, txnDate: entry.txn_date,
+  });
+
+  const names = [
+    'id', 'store_id', 'material_id', 'txn_type', 'quantity', 'unit_cost',
+    'batch_no', 'supplier', 'vendor_id', 'expiry_date', 'ref', 'notes', 'created_by',
+    'discount', 'cgst', 'sgst', 'delivery_charges',
+  ];
+  const vals: Array<string | number> = [
     id, storeId, materialId, txnType, qty, unitCost,
     String(entry.batch_no || ''), String(entry.supplier || ''), String(entry.vendor_id || ''),
     String(entry.expiry_date || ''), String(entry.ref || ''), String(entry.notes || ''),
     String(entry.created_by || ''),
     chg(entry.discount), chg(entry.cgst), chg(entry.sgst), chg(entry.delivery_charges),
-  );
+  ];
+  names.push(...mv.names);
+  vals.push(...mv.values);
+
+  db.prepare(`
+    INSERT INTO store_stock_ledger (${names.join(', ')}, created_at)
+    VALUES (${names.map(() => '?').join(', ')}, datetime('now'))
+  `).run(...vals);
   return id;
 }
 
@@ -1847,19 +1946,39 @@ export function invoiceRefHasPurchases(db: Database, storeId: string, invoiceRef
  *  amounts (bottle cost); net_indent_value is derived = invoiceValue + 4 charges.
  *  Keyed UNIQUE(store_id, invoice_ref) so re-save updates in place. Returns the
  *  stored figures (incl. net_indent_value). A no-op-safe write: only call when
- *  the caller actually has charges to record. */
+ *  the caller actually has charges to record.
+ *
+ *  ── AND IT DEBITS THE TGBCL WALLET (phase L2) ────────────────────────────────
+ *  The plan: "Indent debits AUTO-CREATED from the inward register's Net Indent
+ *  (same transaction), so the wallet can never disagree with recorded indents."
+ *  This function is where that promise is kept, for two reasons:
+ *    · it is the ONE place net_indent_value is ever computed or written, so
+ *      there is no second door a future caller could record an indent through;
+ *      and
+ *    · both callers (/procure-bill and /procure-bulk) already invoke it INSIDE
+ *      their own db.transaction(), so the debit commits with the indent's
+ *      ledger lines or not at all. A failed bill therefore leaves no orphan
+ *      debit, and a debit that cannot be written takes the bill down with it —
+ *      which is what "can never disagree" has to mean.
+ *  The debit is keyed on this row's id (lq_wallet_txns.source_ref), so re-saving
+ *  a bill re-derives the one debit instead of adding a second. See
+ *  src/lib/liquor-wallet.ts autoDebitForIndent() for the idempotency rules.
+ *  Every store_bill_charges row IS a TGBCL indent — the four charges are the
+ *  government levies (see the block comment above BillCharges) and the only UI
+ *  that records them is the Liquor Store bill entry. */
 export function upsertBillCharges(
   db: Database,
   args: {
     store_id: string; invoice_ref: string; supplier?: string; date?: string;
     invoice_value: number; charges: BillCharges; created_by?: string;
   },
-): { invoice_value: number; net_indent_value: number } & BillCharges {
+): { id: string; invoice_value: number; net_indent_value: number; wallet_debit: AutoDebitResult | null } & BillCharges {
   const invoiceValue = Math.round((Number(args.invoice_value) || 0) * 100) / 100;
   const c = normalizeBillCharges(args.charges);
   const netIndent = Math.round(
     (invoiceValue + c.mrp_rounding + c.excise_turnover_tax + c.special_excise_cess + c.tcs) * 100,
   ) / 100;
+  const invoiceRef = String(args.invoice_ref || '').trim();
   db.prepare(`
     INSERT INTO store_bill_charges
       (id, store_id, invoice_ref, supplier, date, invoice_value,
@@ -1876,12 +1995,37 @@ export function upsertBillCharges(
       net_indent_value    = excluded.net_indent_value,
       updated_at          = datetime('now')
   `).run(
-    generateId(), args.store_id, String(args.invoice_ref || '').trim(),
+    generateId(), args.store_id, invoiceRef,
     String(args.supplier || '').trim(), String(args.date || '').trim(), invoiceValue,
     c.mrp_rounding, c.excise_turnover_tax, c.special_excise_cess, c.tcs, netIndent,
     String(args.created_by || '').trim(),
   );
-  return { invoice_value: invoiceValue, net_indent_value: netIndent, ...c };
+  // The row's id is read back rather than kept from the INSERT: on the UPDATE
+  // half of the upsert the generateId() above is discarded and the ORIGINAL id
+  // stands. That id is the wallet debit's identity (uq_lq_wallet_debit_source),
+  // so using the freshly generated one would create a SECOND debit on every
+  // re-save of the same bill — the exact doubling this module exists to prevent.
+  const stored = db.prepare(
+    'SELECT id FROM store_bill_charges WHERE store_id = ? AND invoice_ref = ?',
+  ).get(args.store_id, invoiceRef) as { id: string } | undefined;
+
+  // Same transaction as the indent, by construction (see the note above the
+  // function). Deliberately NOT wrapped in try/catch: a debit that quietly
+  // failed to write is the silent disagreement this exists to prevent, so if it
+  // cannot be written the whole bill save rolls back and says why.
+  let wallet: AutoDebitResult | null = null;
+  if (stored?.id && invoiceRef) {
+    wallet = autoDebitForIndent(db, {
+      source_ref: stored.id,
+      reference: invoiceRef,
+      date: String(args.date || '').trim(),
+      net_indent_value: netIndent,
+      store_id: args.store_id,
+      supplier: String(args.supplier || '').trim(),
+      created_by: String(args.created_by || '').trim(),
+    });
+  }
+  return { id: stored?.id || '', invoice_value: invoiceValue, net_indent_value: netIndent, wallet_debit: wallet, ...c };
 }
 
 /** All bill-charge rows for a store, keyed by invoice_ref (for ledger render). */

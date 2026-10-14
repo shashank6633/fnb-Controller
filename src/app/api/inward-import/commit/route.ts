@@ -7,6 +7,7 @@ import {
 import { requireRole, getCurrentOutletId } from '@/lib/auth';
 import { findUnitLock } from '@/lib/unit-audit-lock';
 import { centralFlowBlock, isStoreMappedMaterial } from '@/lib/store-engine';
+import { postCentralTxn, vendorParty } from '@/lib/movement-record';
 
 /**
  * Step 2 — actually persist the inward report into the DB.
@@ -33,6 +34,9 @@ import { centralFlowBlock, isStoreMappedMaterial } from '@/lib/store-engine';
 export async function POST(req: Request) {
   const auth = await requireRole('admin');
   if (!auth.ok) return Response.json({ error: auth.message }, { status: auth.status });
+  // FIELD 8 of the movement record — the admin who ran the import, taken from
+  // the SESSION requireRole has already resolved.
+  const importActor = String(auth.user.email || '').trim() || 'system:inward-import';
   try {
     const fd = await req.formData();
     const file = fd.get('file');
@@ -75,17 +79,50 @@ export async function POST(req: Request) {
       INSERT INTO vendors (id, name, is_active, created_at, updated_at)
       VALUES (?, ?, 1, datetime('now'), datetime('now'))
     `);
+    /**
+     * bill_no CARRIES THE VENDOR'S INVOICE NUMBER. Added 2026-09-10.
+     *
+     * THE BUG THIS FIXES: the sheet's INVOICE ID was parsed (recaho-inward.ts
+     * sets `invoiceId` on every row) and then thrown away — this INSERT had no
+     * bill_no column, and the number survived only as prose inside `notes`
+     * ("Invoice: 19162 · Inward: 4633"). Every bill view keys a bill by
+     * invoice_id → grn_id → bill_no and falls back to VENDOR+DAY when all three
+     * are blank, so 2,118 imported rows fell to that fallback and genuinely
+     * different invoices from one vendor on one day printed as a single line:
+     * 60 lines hiding 69 real bills worth ₹12,93,120.30. The owner reported it
+     * as "the purchase report is missing bills". It was.
+     *
+     * SAFE AGAINST THE DUPLICATE GUARD, which is the one thing to check before
+     * touching this column: /api/purchases scopes its (vendor, bill_no, date,
+     * outlet) dupe check with `COALESCE(invoice_id,'') LIKE 'PINV-%'`, and rows
+     * from this importer never mint an invoice_id — so they are not judged by
+     * that guard, with or without a bill_no. (That route's comment already
+     * claimed the inward-import commit stamps a bill_no; as of this change it
+     * finally does.)
+     *
+     * `notes` deliberately keeps saying "Invoice: …" too. It is what the
+     * repair path reads to recover the number on rows imported BEFORE this fix,
+     * and dropping it would strand them.
+     */
     const insertPurchase = db.prepare(`
       INSERT INTO purchases (
         id, material_id, vendor, brand, quantity, unit_price, total_price, date, notes, outlet_id,
         discount, cgst, sgst, special_excise_cess, tcs, delivery_charges, mrp_round_off, created_at
       )
+<<<<<<< WIP-MIXED production side — these lines came from: 17e008d GST/Cess from the material master, Total Inward always shown,  (1)
       VALUES (?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
     `);
     const insertTx = db.prepare(`
       INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, outlet_id, created_at)
       VALUES (?, ?, 'purchase', ?, ?, ?, ?, datetime('now'))
+======= WIP side
+      VALUES (?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+>>>>>>> WIP-MIXED
     `);
+    // The raw INSERT that stood here is now postCentralTxn at the call site, so
+    // an imported inward line records the supplier it came from and the sheet's
+    // own INVOICE DATE — an import of last month's bills is last month's
+    // movements, not today's.
     const bumpStock = db.prepare(`
       UPDATE raw_materials
       SET current_stock = current_stock + ?,
@@ -294,9 +331,22 @@ export async function POST(req: Request) {
             purchaseId, mat.id, r.supplier, purchaseQty, purchaseRate, goods, date,
             noteBits.join(' · '), outletId,
             discountAmt, cgst, sgst, specialCess, 0, deliveryAmt, mrpRoundOff,
+            // The vendor's own invoice number, into its own column at last.
+            // Trimmed; '' when the sheet had no INVOICE ID, which keeps the
+            // vendor+day fallback for rows that genuinely have no bill number.
+            String(r.invoiceId || '').trim(),
           );
-          insertTx.run(randomUUID(), mat.id, stockQty, purchaseId,
-                       `Inward import — ${r.supplier || 'unknown vendor'}`, outletId);
+          postCentralTxn(db, {
+            materialId: mat.id,
+            type: 'purchase',
+            quantity: stockQty,
+            referenceId: purchaseId,
+            notes: `Inward import — ${r.supplier || 'unknown vendor'}`,
+            outletId,
+            counterparty: vendorParty(r.supplier),
+            txnDate: date,
+            actor: importActor,
+          });
           bumpStock.run(stockQty, recipeUnitRate, date, mat.id);
 
           touchedMaterials.add(mat.id);

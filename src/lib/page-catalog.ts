@@ -103,9 +103,17 @@ export interface PageEntry {
    */
   adminOnly?: boolean;
   /**
+<<<<<<< WIP-MIXED production side — these lines came from: 3450f62 Bills on Hold, and a mandatory field that could not be switche (2)
    * A COMPANION GRANT: an explicit page map that opens `impliedBy` also opens
    * THIS page, even when the map never names it.
+======= WIP side
+   * The path is REGISTERED but its page.tsx does not exist yet — a page whose
+   * build is split across phases and whose catalog row is claimed up front so
+   * the phase builds do not collide on this file. Normally a page is added here
+   * only once it is BUILT; this is the exception, and it is not free.
+>>>>>>> WIP-MIXED
    *
+<<<<<<< WIP-MIXED production side — these lines came from: 3450f62 Bills on Hold, and a mandatory field that could not be switche (7)
    * ── WHY THIS EXISTS AT ALL, AND WHY IT IS NOT A BACK DOOR ──────────────────
    * It is for the case where some OTHER module has already made the real
    * capability decision from a DIFFERENT fact, and this file's map test would
@@ -113,6 +121,14 @@ export interface PageEntry {
    * API hands the user data for but the proxy bounces them off. That is not a
    * safety margin, it is the drift settle-authority.ts's header warns about,
    * read from the other end: two surfaces, two copies of one authority rule.
+======= WIP side
+   * What it does: keeps the entry out of the app's AUTOMATIC landing-page
+   * resolution (homePathFor / firstAllowedPath). Those two answer "the first
+   * catalog page in display order this user can open", and they drive the
+   * post-login redirect, the Captain APK start URL, Android-Back home and the
+   * proxy's forbidden bounce — so without this a user whose map happened to
+   * contain only an unbuilt path was REDIRECTED onto a 404 with no click.
+>>>>>>> WIP-MIXED
    *
    * THREE PROPERTIES, all load-bearing:
    *   1. IT ONLY EVER FILLS IN. It runs AFTER the ordinary map test has already
@@ -525,6 +541,64 @@ export const PAGE_CATALOG: PageSection[] = [
       { path: '/inventory',           label: 'Raw Materials' },
       { path: '/settings/categories', label: 'Categories' },
       { path: '/inventory/liquor-store', label: 'Liquor Store' },
+      // ── Liquor Purchase Reconciliation (docs/liquor-reconciliation-plan.md) ──
+      // The four pages phases L1/L2/L4/L5 add, registered HERE and in
+      // Sidebar.tsx's Inventory section — deliberately inside the existing
+      // Liquor Store group rather than a new sidebar section (plan decision 4).
+      // A catalog entry on its own gates a page correctly and leaves it
+      // INVISIBLE; the two lists are separate and must be edited together.
+      //
+      // ⚠️ THESE PATHS ARE REGISTERED BEFORE THEIR page.tsx EXISTS, and each
+      // carries `unbuilt: true` until its phase ships. The HR section below
+      // states the opposite rule — "this list must only ever name pages that
+      // are BUILT" — and that rule stands everywhere else; this block is the
+      // one deliberate, time-boxed exception, taken because five phase builds
+      // would otherwise collide on this file. `unbuilt` is what pays for it:
+      // it keeps the four out of the app's AUTOMATIC landing-page resolution
+      // (homePathFor / firstAllowedPath), so nobody can be REDIRECTED onto a
+      // page that does not exist. Measured before it existed: a manager whose
+      // map was ["/inventory/liquor-wallet"] got homePathFor =
+      // /inventory/liquor-wallet — a 404 after login, after an Android Back, on
+      // the Captain APK's start URL, and on every proxy bounce.
+      // A granted user who CLICKS one still reaches a 404; that is the residue,
+      // and the phase that builds each page removes its own `unbuilt: true`
+      // together with this caveat.
+      //
+      // Every entry is tier-flagged, and that is the real lock: canAccessPage
+      // FAILS OPEN for a legacy user whose page_access is null, and only the
+      // tier flags run before that grant.
+      // The tier flag is not the whole story either: canAccessPage's last line
+      // matches a grant BY PREFIX, so a bare '/inventory' grant carries both
+      // mgmtOnly pages here with no explicit grant anywhere (measured on the
+      // live roles: the seeded Store Manager holds '/inventory'). Each page's
+      // own routes MUST re-check server-side — isManagement() for the wallet
+      // and the reconciliation summary, admin for the brand map and the
+      // withdrawals register. This list is never the security boundary.
+      //
+      // L1 · adminOnly per the plan's "Admin UI: mapping editor + CSV import".
+      // One row here re-prices a brand for every later indent (rate-vs-master
+      // variance, landed cost, the §G rate-movement watch), so it is the same
+      // class of surface as the Station → Department map. If L1 wants the §G
+      // "accept new rate into master" one-tap to be manager-usable, that
+      // decision is made ONCE server-side and this flag revisited with it —
+      // do not let a manager write the master from a card while this page 403s.
+      { path: '/inventory/liquor-brand-map',      label: 'Liquor Brand Map (TGBCL)',   adminOnly: true, unbuilt: true },
+      // L2 · mgmtOnly: the TGBCL wallet is working capital parked with the
+      // government — deposits, challans, bank-match state and the top-up
+      // planner. Management money, not a counting surface.
+      { path: '/inventory/liquor-wallet',         label: 'Liquor Wallet (TGBCL)',      mgmtOnly: true, unbuilt: true },
+      // L4 · adminOnly per the plan ("Admin-only page"): this is the
+      // director/management personal-use ledger with amounts recoverable from
+      // named people, and it MOVES STOCK. It stays out of reach of everyone
+      // else, including a manager with an explicit grant.
+      { path: '/inventory/liquor-withdrawals',    label: 'Liquor Withdrawals',         adminOnly: true, unbuilt: true },
+      // L5 · mgmtOnly per the plan ("(mgmt/admin)"): the reconciliation summary
+      // — wallet check, per-indent value vs portal, retail excess, non-sale
+      // issues as a % of purchases.
+      { path: '/inventory/liquor-reconciliation', label: 'Liquor Reconciliation',      mgmtOnly: true, unbuilt: true },
+      // L3 (emergency wine-shop buys) deliberately has NO entry: it is a side
+      // record on the EXISTING purchase flow plus a card on the L5 summary, so
+      // it adds no page of its own. Do not invent one to "complete the set".
       { path: '/inventory/stock-overview', label: 'Stock Overview' },
       // Read-only board: counted stock by storage area x department. Counts are
       // still recorded on /closing-stock — this only makes them comparable.
@@ -783,6 +857,14 @@ export const PAGE_CATALOG: PageSection[] = [
     // granted users a 404 (the proxy happily lets them through), so this list
     // must only ever name pages that are BUILT. Phase 1: dashboard, employees,
     // settings.
+    // (Scope of that rule, added 2026-08-28 so the file does not read as two
+    // contradictory laws: it is the DEFAULT for every section, and it still is.
+    // The one exception is the liquor-reconciliation block in Inventory above,
+    // where five phase builds would otherwise collide on this file; those four
+    // entries carry `unbuilt: true`, which buys the exception by keeping them
+    // out of the automatic landing-page resolution. Do NOT read `unbuilt` as
+    // permission to pre-register pages here — HR adds an entry when the page
+    // ships, which is still the better shape when nothing forces the split.)
     //
     // Every entry here is tier-flagged on purpose: canAccessPage fails OPEN for
     // legacy NULL page_access users (8 of 9 on the reference DB), so an
@@ -1225,8 +1307,10 @@ export function homePathFor(user: CatalogUser | null): string {
   // decided by canAccessPage — the SAME authority the proxy enforces, so
   // homePathFor can never return a page the proxy then bounces (no loop). A
   // user with no openable page → '/login' (LaunchPage shows a friendly notice).
+  // `unbuilt` entries are skipped: a registered-but-not-yet-built path would
+  // land the user on a 404 they did not click (see PageEntry.unbuilt).
   for (const section of PAGE_CATALOG) {
-    for (const pg of section.pages) if (canAccessPage(pg.path, user)) return pg.path;
+    for (const pg of section.pages) if (!pg.unbuilt && canAccessPage(pg.path, user)) return pg.path;
   }
   return '/login';
 }
@@ -1257,6 +1341,9 @@ export function firstAllowedPath(user: CatalogUser | null): string {
       // matches NO row, falls through to '/login', and is bounced straight back
       // by the proxy. That is the redirect loop this comment warns about.
       if (allowed.includes(p.path)
+        // Registered but not yet built — redirecting here is a 404 the user
+        // never asked for (see PageEntry.unbuilt).
+        && !p.unbuilt
         && !(p.hodOnly && !user.is_head_chef)
         && !(p.mgmtOnly && !(user.role === 'manager' || user.is_head_chef)
              && !(p.financeCap && user.can_view_finance_reports))
@@ -1360,10 +1447,25 @@ export function canAccessPage(
  * The problem is that many catalog parents are ALSO the URL prefix of their
  * SIBLING catalog pages. /tasks is the Task Dashboard *and* the prefix of the
  * 14 other Task Management pages, so ticking the dashboard silently hands over
+<<<<<<< WIP-MIXED production side — these lines came from: 425f092 Page Access: impact preview before the prefix leak is closed ( (3)
  * the whole module. Across the catalog 8 parents carry 43 such grants:
  *   /tasks +14, /crm-calls +10, /inventory +7, /reports +6,
  *   /kitchen-production +3, /dine-in/kitchen +1, /vendors +1,
+======= WIP side
+ * the whole module. Re-measured 2026-08-28 over the current catalog (160 paths,
+ * counted by running this rule over PAGE_CATALOG): 10 parents carry 69 such
+ * grants:
+ *   /hr +18, /tasks +14, /inventory +12, /crm-calls +12, /reports +6,
+ *   /kitchen-production +3, /dine-in/kitchen +1, /grn +1, /vendors +1,
+>>>>>>> WIP-MIXED
  *   /settings/integrations +1
+ * (The previous figures — 8 parents / 43 grants / /inventory +7 — predated the
+ * HR module and the liquor-reconciliation pages. This count is RAW reach, i.e.
+ * what the prefix rule alone hands over. THREE of /inventory's twelve children
+ * are adminOnly — liquor-brand-map, liquor-withdrawals and central-cutover —
+ * and the tier gate stops those first, so what a MANAGER actually gains from a
+ * bare '/inventory' grant is +9, not +12. Every other parent in the list is
+ * counted raw the same way.)
  * proxy.ts imports canAccessPage rather than duplicating it, so this is real
  * server-side reach, not just a sidebar that shows too much.
  *

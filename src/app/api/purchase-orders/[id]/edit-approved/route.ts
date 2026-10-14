@@ -211,11 +211,33 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // re-running updateMaterialPrice. better-sqlite3 txns are synchronous, so
       // re-asserting the precondition in the WHERE clause means the loser
       // matches 0 rows and throws, rolling its whole txn back untouched.
+      // submitted_at IS RE-STAMPED, and that is deliberate.
+      //
+      // This edit is what puts the PO back into the approval queue, so
+      // submitted_at must say when it ARRIVED there — not when the submission
+      // that was already approved happened. Leaving the old value stranded a PO
+      // advertising a queue-entry date nine days before it re-entered the queue
+      // (PO-2026-0008: submitted_at 2026-08-07, edited back to
+      // pending_reapproval 2026-08-16), which the detail drawer and the printout
+      // both render as "Submitted:". It also mis-answers the one question the
+      // approval queue exists for — "what has been waiting, and since when".
+      //
+      // Same reasoning, same codebase: reject/route.ts's Revise sets
+      // submitted_at = NULL for the rejected → draft hop precisely so the
+      // re-submit stamps a fresh one ("otherwise the PO carries the timestamp of
+      // the submission that was already rejected"). This transition has no
+      // re-submit to do that stamping — edit-approved moves straight to
+      // pending_reapproval — so it stamps here.
+      //
+      // The ORIGINAL value is not lost: it is written to the po.edit audit
+      // event's `before` block below, which is the only place it survives (a
+      // plain submit logs no audit row of its own).
       const claim = db.prepare(`
         UPDATE purchase_orders
         SET status = 'pending_reapproval',
             approved_at = NULL,
             approved_by = '',
+            submitted_at = datetime('now'),
             updated_at = datetime('now')
         WHERE id = ? AND status = 'approved'
       `).run(id);
@@ -306,6 +328,10 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       before: {
         status: po.status, total_cost: po.total_cost,
         approved_by: po.approved_by, approved_at: po.approved_at,
+        // The claim re-stamps submitted_at to "now" (see the note on it), so this
+        // is the ONLY surviving record of when the PO was originally submitted —
+        // a plain submit writes no audit row of its own.
+        submitted_at: po.submitted_at,
         items: beforeItems,
       },
       after: { status: 'pending_reapproval', total_cost: newTotal, items: afterItems },

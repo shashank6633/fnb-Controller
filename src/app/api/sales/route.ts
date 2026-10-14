@@ -1,4 +1,6 @@
 import { getDb, generateId, deductInventoryForSale } from '@/lib/db';
+import { getCurrentUser } from '@/lib/auth';
+import { movementCols, deptParty } from '@/lib/movement-record';
 
 export async function GET(request: Request) {
   try {
@@ -65,6 +67,15 @@ export async function DELETE(request: Request) {
     const id = url.searchParams.get('id');
     if (!id) return Response.json({ error: 'id is required' }, { status: 400 });
 
+    // FIELD 8 — the responsible user, FROM THE SESSION. /api/sales is gated by
+    // proxy.ts, so a session exists by the time this runs; getCurrentUser() is
+    // read here rather than trusted from the body precisely because the body is
+    // the caller's to write. The `system:` fallback is not a loophole — it is
+    // the honest label if this is ever reached without a session, and it is
+    // visibly a machine actor on the movements register rather than a blank.
+    const me = await getCurrentUser();
+    const actor = String(me?.email || '').trim() || 'system:sale-delete';
+
     const txn = db.transaction(() => {
       // Reverse the sale's stock deduction BEFORE erasing its audit trail,
       // otherwise current_stock stays deducted while the transactions that
@@ -108,6 +119,53 @@ export async function DELETE(request: Request) {
         deptByMaterial.set(r.material_id, (deptByMaterial.get(r.material_id) || 0) + Number(r.qty || 0));
       }
 
+      // FOURTH RAIL — THE SKIPS, WHICH ARE NOT A RAIL AT ALL.
+      // ─────────────────────────────────────────────────────────────────────
+      // applyDeduct (src/lib/db.ts) has four outcomes and only two of them move
+      // stock. A store-mapped liquor material, an unmapped station and a blank
+      // station all take a `recordSkip()` branch that moves NOTHING, anywhere —
+      // while the inventory_transactions audit row is still written
+      // unconditionally, because Variance / Daily Roll-up / Sales-vs-Purchase
+      // read it and would report the whole purchase history as shrinkage if it
+      // were gated.
+      //
+      // That audit row is this handler's `totalDeducted` basis. So a skipped
+      // portion had to be excluded here exactly like the floor and department
+      // portions are, and it was not: `totalDeducted - floorDeducted -
+      // deptDeducted` handed the FULL audit quantity back to central for stock
+      // central never lost. Recording a store-mapped whisky sale and deleting it
+      // INVENTED 60 ml on raw_materials.current_stock, every time.
+      // /api/admin/reset (route.ts, the `consumption_skips` block) has always
+      // subtracted this leg; this route never looked at the table.
+      //
+      // COUPLING, STATED OUT LOUD — the same one admin/reset declares:
+      // consumption_skips has no sale_id column (it is keyed to order_item_id,
+      // which /api/sales does not supply), so the ONLY link back to a sale is
+      // the notes string db.ts writes as `recipe:<id> sale:<id>`. If that format
+      // changes, this subtraction silently stops matching and this route starts
+      // inventing stock again. source = 'recipe_consumption' keeps wastage and
+      // staff-meal skips — which have their own reversal paths — out of the sum.
+      const skipByMaterial = new Map<string, number>();
+      try {
+        const skipRows = db.prepare(`
+          SELECT material_id, COALESCE(SUM(quantity), 0) AS qty
+          FROM consumption_skips
+          WHERE source = 'recipe_consumption'
+            AND material_id IS NOT NULL
+            AND notes LIKE '%sale:' || ?
+          GROUP BY material_id
+        `).all(id) as any[];
+        // quantity is stored POSITIVE here ("what WOULD have been deducted"),
+        // unlike the two ledger rails whose rows are negative. The map keeps the
+        // table's own sign and the arithmetic below negates once, in the open,
+        // rather than hiding a second negation in this loop.
+        for (const r of skipRows) skipByMaterial.set(r.material_id, Number(r.qty || 0));
+      } catch {
+        // Fail-soft on a database that predates the table, exactly as
+        // admin/reset's hasTable() guard does. A missing skip log means there
+        // are no skips to exclude, not that the delete should fail.
+      }
+
       const txRows = db.prepare(`
         SELECT material_id, COALESCE(SUM(quantity), 0) AS qty
         FROM inventory_transactions WHERE reference_id = ? GROUP BY material_id
@@ -119,13 +177,28 @@ export async function DELETE(request: Request) {
         const totalDeducted = -r.qty;                                   // deduction rows are negative
         const floorDeducted = -(floorByMaterial.get(r.material_id) || 0); // ledger deductions are negative too
         const deptDeducted  = -(deptByMaterial.get(r.material_id) || 0); // department rows are negative too
+<<<<<<< WIP-MIXED production side — these lines came from: 44431ea Department-based inventory: central issues to a department, re (3)
         // What central actually lost = the audit total minus the two rails that
         // were never central's. The inventory_transactions row is written on
         // EVERY path (db.ts applyDeduct keeps it unconditional so Variance and
+======= WIP side
+        const skipDeducted  = skipByMaterial.get(r.material_id) || 0;   // already positive (see above)
+        // What central actually lost = the audit total minus every leg that was
+        // never central's — the two other rails AND the skips, which moved
+        // nothing at all. The inventory_transactions row is written on EVERY
+        // path (db.ts applyDeduct keeps it unconditional so Variance and
+>>>>>>> WIP-MIXED
         // Sales-vs-Purchase stay bit-identical), which is exactly why it is the
+<<<<<<< WIP-MIXED production side — these lines came from: 44431ea Department-based inventory: central issues to a department, re (3)
         // total and not the central figure.
         const centralDeducted = totalDeducted - floorDeducted - deptDeducted;
         // Epsilon, not `!== 0`: with three floating-point legs a fully
+======= WIP side
+        // total and not the central figure — and why every non-central outcome
+        // has to be named here or it silently becomes a central credit.
+        const centralDeducted = totalDeducted - floorDeducted - deptDeducted - skipDeducted;
+        // Epsilon, not `!== 0`: with four floating-point legs a fully
+>>>>>>> WIP-MIXED
         // department-attributed sale lands on ~1e-16 rather than a clean zero,
         // and `!== 0` would post a meaningless sub-nanogram credit to central.
         if (Math.abs(centralDeducted) > 1e-9) restoreStmt.run(centralDeducted, r.material_id);
@@ -168,6 +241,24 @@ export async function DELETE(request: Request) {
             `).run(generateId(), d.outlet_id || null, d.department_id, d.material_id, balanceAfter);
           }
 
+          // THE ACTOR USED TO BE A HARD-CODED '' HERE — the department could be
+          // credited back stock with nothing on the row saying who did it. It is
+          // now the SESSION user (resolved at the top of this handler, never
+          // from the request), and the row carries the movement record's other
+          // fields too: the unit the grams are in, both ends (this credit comes
+          // back FROM the guest, since it is the undo of a consumption), and the
+          // business date. Cache maths, sign and reference are untouched — this
+          // keeps its own raw INSERT rather than routing through postDeptLedger
+          // precisely because it maintains department_materials itself just
+          // above, and postDeptLedger would update that cache a second time.
+          const mv = movementCols(db, 'department_material_transactions', {
+            materialId: d.material_id,
+            quantity: back,                       // positive → dept is the destination
+            src: { kind: 'consumption', name: 'Consumption reversed (sale deleted)' },
+            dst: deptParty(db, d.department_id),
+          });
+          const mvCols = mv.names.length ? `, ${mv.names.join(', ')}` : '';
+          const mvQs = mv.names.map(() => ', ?').join('');
           db.prepare(`
             INSERT INTO department_material_transactions
               (id, outlet_id, department_id, material_id, type, quantity, balance_after,
@@ -177,6 +268,8 @@ export async function DELETE(request: Request) {
             generateId(), d.outlet_id || null, d.department_id, d.material_id,
             back, balanceAfter, id,
             `Sale deleted (/api/sales DELETE) — recipe consumption returned to department`,
+            actor,
+            ...mv.values,
           );
         }
       }
@@ -201,6 +294,13 @@ export async function POST(request: Request) {
     if (!sales || !Array.isArray(sales) || sales.length === 0) {
       return Response.json({ error: 'sales array is required' }, { status: 400 });
     }
+
+    // FIELD 8 — from the SESSION, deliberately NOT from `body`. The request
+    // body is a list of sales the caller composed; a "user" field inside it
+    // would be a name the caller chose to write, which is exactly what the
+    // owner's requirement excludes.
+    const poster = await getCurrentUser();
+    const postActor = String(poster?.email || '').trim() || 'system:sales-upload';
 
     const createdSales: any[] = [];
 
@@ -266,7 +366,13 @@ export async function POST(request: Request) {
         // "tidying" it to undefined degrades the reason and sends the owner
         // hunting a mapping that was never the problem.
         if (recipe_id) {
+<<<<<<< WIP-MIXED production side — these lines came from: 44431ea Department-based inventory: central issues to a department, re (1)
           deductInventoryForSale(db, recipe_id, quantity_sold, id, bill_type || 'normal', { station: null });
+======= WIP side
+          // FIELD 8 — the session user who uploaded this sale, so its
+          // consumption rows name a person rather than nobody.
+          deductInventoryForSale(db, recipe_id, quantity_sold, id, bill_type || 'normal', { station: null, actor: postActor });
+>>>>>>> WIP-MIXED
         }
 
         createdSales.push(db.prepare('SELECT * FROM sales WHERE id = ?').get(id));

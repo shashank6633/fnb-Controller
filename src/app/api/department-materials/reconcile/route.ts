@@ -6,6 +6,7 @@ import {
   assertReversible,
   isDeptReversalBlocked,
 } from '@/lib/dept-ledger';
+import { postCentralTxn, deptParty } from '@/lib/movement-record';
 
 /**
  * Post-party reconciliation of a department's on-hand materials.
@@ -156,10 +157,9 @@ export async function POST(request: Request) {
       UPDATE raw_materials SET current_stock = current_stock + ?, updated_at = datetime('now')
       WHERE id = ?
     `);
-    const insStoreTx = db.prepare(`
-      INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, created_at)
-      VALUES (?, ?, 'adjustment', ?, ?, ?, datetime('now'))
-    `);
+    // The raw central-credit INSERT that stood here is now postCentralTxn at the
+    // call site, so a party leftover return names the department it came back
+    // from instead of appearing as an unexplained credit with a NULL reference.
 
     const note = `Party: ${eventName || '(unnamed)'} @ ${eventDate || ''}`.trim();
     const deptName = (db.prepare('SELECT name FROM departments WHERE id = ?').get(departmentId) as
@@ -231,7 +231,21 @@ export async function POST(request: Request) {
             eventName, eventDate, notes: 'party leftover return', user: me.email,
           });
           incStock.run(returned, materialId);
-          insStoreTx.run(generateId(), materialId, returned, null, 'party leftover return');
+          // MOVEMENT RECORD: this row used to be written with a NULL
+          // reference_id — an unexplained central credit. The reference stays as
+          // it was (changing it would move the row out of the reconcile
+          // reader's reach), but the movement now names the DEPARTMENT the
+          // leftovers came back from, in the right unit, by the session user.
+          postCentralTxn(db, {
+            materialId,
+            type: 'adjustment',
+            quantity: returned,
+            referenceId: null,
+            notes: 'party leftover return',
+            counterparty: deptParty(db, departmentId),
+            txnDate: eventDate || undefined,
+            actor: me.email,
+          });
         }
 
         results.push({

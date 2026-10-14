@@ -34,6 +34,7 @@ import {
   History,
   Inbox,
   Boxes,
+  PackageMinus,
   Layers,
   ArrowLeftRight,
   ArrowRightLeft,
@@ -300,6 +301,25 @@ const navTree: NavEntry[] = [
       { kind: "link", label: "Raw Materials",      href: "/inventory",          icon: Package },
       { kind: "link", label: "Categories",         href: "/settings/categories", icon: Boxes },
       { kind: "link", label: "Liquor Store",       href: "/inventory/liquor-store", icon: Wine },
+      // ── Liquor Purchase Reconciliation (docs/liquor-reconciliation-plan.md) ──
+      // Grouped directly under Liquor Store rather than given their own sidebar
+      // section (plan decision 4). Each row MUST also exist in
+      // src/lib/page-catalog.ts and vice versa: this file keeps its own nav
+      // tree, so a page registered only in the catalog is correctly gated and
+      // completely invisible — that is what once hid 8 pages including
+      // /variance-approvals. canAccessPage filters these rows per user, so the
+      // adminOnly / mgmtOnly flags set in the catalog hide them automatically.
+      //
+      // ⚠️ These pages are registered before they are BUILT (phases L1/L2/L4/L5)
+      // — until the owning phase ships, clicking one lands on a 404. Being
+      // *redirected* to one is already prevented: each carries `unbuilt: true`
+      // in the catalog, which keeps it out of homePathFor / firstAllowedPath.
+      // The phase that ships each page deletes its `unbuilt` flag and this row's
+      // share of this caveat.
+      { kind: "link", label: "Liquor Brand Map",   href: "/inventory/liquor-brand-map", icon: Link2 },
+      { kind: "link", label: "Liquor Wallet",      href: "/inventory/liquor-wallet", icon: Wallet },
+      { kind: "link", label: "Liquor Withdrawals", href: "/inventory/liquor-withdrawals", icon: PackageMinus },
+      { kind: "link", label: "Liquor Reconciliation", href: "/inventory/liquor-reconciliation", icon: Scale },
       { kind: "link", label: "Stock Overview",     href: "/inventory/stock-overview", icon: Layers },
       { kind: "link", label: "Closing Overview",   href: "/inventory/closing-overview", icon: ClipboardCheck },
       { kind: "link", label: "Dept Closing Sheet", href: "/inventory/closing-sheet", icon: ClipboardList },

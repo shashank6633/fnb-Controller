@@ -3202,6 +3202,38 @@ function initializeSchema(db: Database.Database) {
     // wording: it is history, and purchase-log.ts still reads it.
     if (!has('grn_id')) db.exec(`ALTER TABLE purchases ADD COLUMN grn_id TEXT`);
     db.exec(`CREATE INDEX IF NOT EXISTS idx_purchases_grn ON purchases(grn_id)`);
+    /* ── THE RECEIVER'S TAX DECISION, ON THE COST RAIL TOO ───────────────────
+     * goods_receipt_note_items.tax_decision (declared further down this file)
+     * records whether a ₹0 tax line was DECLARED exempt or was simply never
+     * looked at. That column covers the bill document. This one covers the row
+     * every purchase report actually reads.
+     *
+     * WHY IT IS NEEDED HERE AS WELL, measured rather than assumed:
+     *   • `purchases` is the ONLY table /api/reports/purchases and
+     *     src/lib/purchase-bill-summary.ts read (the latter says so in its own
+     *     header: "This file reads the `purchases` table and NOTHING ELSE"), so
+     *     a decision that lives only on the GRN line is invisible to both.
+     *   • POST /api/purchases HONOURS tax_applicable (it forces both rates to 0)
+     *     and, until this column existed, recorded nothing about it: two rows,
+     *     one declared exempt and one nobody looked at, came out byte-identical.
+     *     A route that accepts a fact, acts on it, and then drops it silently is
+     *     worse than one that refuses it.
+     *
+     * SAME THREE VALUES AS THE GRN COLUMN, and the same reasoning for each:
+     *   ''        no decision recorded — every historical row (all 2,165 of
+     *             them), every bulk/CSV/opening-stock/seed row, and any client
+     *             that sends no tax_applicable. Nothing changes meaning.
+     *   'taxable' somebody declared this line bears tax.
+     *   'exempt'  somebody declared it bears no GST and no compensation cess.
+     *
+     * WRITTEN BY EVERY PATH THAT KNOWS ONE, so the rail never carries a stale
+     * blank beside a decided bill: POST /api/grn and PO-receive bind it at
+     * receipt, src/lib/grn-qc.ts binds it when a held bill is signed off, and
+     * src/lib/grn-reversal.ts binds it when an amendment re-books a line that
+     * was fully rejected. It is NOT a rate and never enters any arithmetic.
+     * TEXT NOT NULL DEFAULT '' — additive, no rebuild, no row changes meaning.
+     */
+    if (!has('tax_decision')) db.exec(`ALTER TABLE purchases ADD COLUMN tax_decision TEXT NOT NULL DEFAULT ''`);
   } catch (e) { console.error('purchases.is_emergency migration failed:', e); }
 
   // Phase 1 §5: Goods Receipt Note (GRN) — formal record at the receiving bay.
@@ -3487,6 +3519,50 @@ function initializeSchema(db: Database.Database) {
     // Absent on every historical row ⇒ 0 ⇒ nothing is ever re-derived for them.
     qcAdd('goods_receipt_note_items', 'gst_rate', `gst_rate REAL NOT NULL DEFAULT 0`, hasQI);
     qcAdd('goods_receipt_note_items', 'cess_rate', `cess_rate REAL NOT NULL DEFAULT 0`, hasQI);
+    // ── WAS THE TAX ON THIS LINE A DECISION, OR DID NOBODY LOOK? ────────────
+    // The two rate columns above say so themselves: "0 means 'no rate was sent
+    // for this line', which is NOT the same as '0% exempt' — both write ₹0 and
+    // both are honest, so nothing downstream needs to tell them apart."
+    //
+    // THAT LAST CLAUSE STOPPED BEING TRUE when the receiver got a "Tax
+    // applicable" tick at the delivery door. Unticking it is somebody deciding
+    // this delivery bears no GST and no compensation cess, and that decision is
+    // the whole audit value of the control: "we looked at this line and it is
+    // exempt" must never be indistinguishable from "nobody thought about it".
+    // In rupees they are identical — ₹0 either way — so the difference cannot
+    // live in cgst/sgst/compensation_cess, and it cannot live in gst_rate/
+    // cess_rate either, because both are NOT NULL DEFAULT 0 and a 0 there is
+    // already spoken for by the absent case. It needs a column of its own.
+    //
+    // MEASURED BEFORE ADDING IT, on his data (goods_receipt_note_items, 31 rows):
+    //     gst_rate > 0                                  0
+    //     gst_rate = 0 AND cgst = 0 AND sgst = 0        2   ← today indistinguishable
+    //     gst_rate = 0 BUT a hand-typed ₹ on the row   29   ← the manual path, taxed
+    // so the ambiguity is real but tiny, and '' describes all 31 correctly.
+    //
+    // THREE VALUES, and the default is the honest one:
+    //   ''        no decision recorded. Every historical row, and every client
+    //             that sends no tax_applicable — which is the CSV importer, the
+    //             manual hand-typed-₹ path, and any line the receiver never
+    //             touched. Reads exactly as those rows already read.
+    //   'taxable' the receiver declared this line bears tax. The rates beside it
+    //             are what it bears.
+    //   'exempt'  the receiver declared this line bears NO GST and NO
+    //             compensation cess. gst_rate and cess_rate are 0 because
+    //             somebody said so, not because nobody asked.
+    //
+    // TEXT DEFAULT '' — additive, no rebuild, and no historical row changes
+    // meaning. Deliberately NOT a boolean: a 0/1 column has no room for "not
+    // recorded", so it would have to default to one of the two real answers and
+    // would then assert a decision on 31 rows where none was made.
+    //
+    // ⚠ THIS COVERS GRN-BORNE RECEIPTS ONLY, and the build must not claim more.
+    // `purchases` carries no rate column at all (only cgst/sgst RUPEES), and
+    // 2,134 of its 2,165 rows have no grn_id — so 98.6% of the back catalogue
+    // can never carry this evidence. /grn and PO-Receive are now the only human
+    // bill paths, so this is the right and sufficient place for it going
+    // forward; it is not a retrofit of history.
+    qcAdd('goods_receipt_note_items', 'tax_decision', `tax_decision TEXT NOT NULL DEFAULT ''`, hasQI);
   } catch (e) { console.error('GRN QC schema failed (line columns):', e); }
 
   // ── CATEGORY → CHECKER MAP ────────────────────────────────────────────────
@@ -4275,6 +4351,7 @@ function initializeSchema(db: Database.Database) {
     // which recipe-suggest.ts:179-181 now refuses to trust).
     if (!has('is_butchering_source'))   db.exec(`ALTER TABLE raw_materials ADD COLUMN is_butchering_source INTEGER NOT NULL DEFAULT 0`);
     if (!has('is_butchering_output'))   db.exec(`ALTER TABLE raw_materials ADD COLUMN is_butchering_output INTEGER NOT NULL DEFAULT 0`);
+    // ------------------------------------------------------------
     // Operational fields — where it lives + how long it lasts
     if (!has('storage_location'))       db.exec(`ALTER TABLE raw_materials ADD COLUMN storage_location TEXT DEFAULT ''`);
     if (!has('shelf_life_days'))        db.exec(`ALTER TABLE raw_materials ADD COLUMN shelf_life_days INTEGER NOT NULL DEFAULT 0`);
@@ -8661,6 +8738,7 @@ function initializeSchema(db: Database.Database) {
     `);
   } catch (e) { console.error('hrms schema failed:', e); }
 
+<<<<<<< production
   // ══ ROSTER GENERATOR CONFIG (hr_roster_coverage, hr_roster_shift_map) ══════
   //
   // Config only — the generator itself introduces no new roster row type: it
@@ -9009,6 +9087,513 @@ export const GF_SCHEMA_SQL = `
  */
 export function createGuestFeedbackSchema(db: Database.Database): void {
   db.exec(GF_SCHEMA_SQL);
+=======
+  // ════════════════════════════════════════════════════════════════════════
+  // LIQUOR PURCHASE RECONCILIATION — SHARED FOUNDATION (phase L0)
+  // Contract: docs/liquor-reconciliation-plan.md. Types + vocabularies:
+  // src/lib/liquor-recon.ts. Phases L1-L5 build the routes and pages; this
+  // block is ONLY the tables they share, written once so five phases cannot
+  // collide on this file.
+  //
+  // WHAT THIS MODULE DOES **NOT** DUPLICATE — read before adding anything:
+  //   · The INDENT REGISTER already exists. Per-line liquor purchases live in
+  //     store_stock_ledger and the four bill-level TGBCL levies in
+  //     store_bill_charges (deployed 3a67ac9 / f732956). There is deliberately
+  //     no lq_indent* table: L1-L5 EXTEND those, never shadow them.
+  //   · Landed cost / rate-per-bottle / uplift factors / effective TCS / avg
+  //     landed-per-bottle are COMPUTED from recorded lines. The workbook's own
+  //     stance is "computed, not assumed", so no derived factor is stored here.
+  //   · Valuation is UNCHANGED. Per plan decision 1(a) these levies stay
+  //     RECORDED-ONLY; landed cost is an analytics figure inside this module and
+  //     must never be written back to raw_materials.average_price or to
+  //     store_stock_ledger.unit_cost. (See [[project_fnb_unit_convention]] and
+  //     src/lib/closing-valuation.ts — last_purchase_price is a mixed-basis trap.)
+  //
+  // MONEY CONVENTION — the two neighbours were read and one was followed:
+  //   petty_cash_ledger stores `amount` ALWAYS POSITIVE with a separate
+  //   `direction` ('in'|'out') carrying the sign; store_stock_ledger stores
+  //   `quantity` SIGNED (+in/-out) with the value-at-txn-time in `unit_cost`.
+  //   lq_wallet_txns follows STORE_STOCK_LEDGER (signed), because the plan
+  //   specifies "amount SIGNED" and because a running balance that is SUM(amount)
+  //   has exactly one source of direction. The petty-cash shape needs every
+  //   reader to re-derive CASE direction WHEN 'in' THEN +amount ELSE -amount END,
+  //   and a row written with direction='out' AND a negative amount is a silent
+  //   double negative that no constraint can catch. Every other money column
+  //   across these tables is REAL ₹ with DEFAULT 0, exactly like both neighbours
+  //   (nothing in this app stores integer paise).
+  //
+  // outlet_id — carried ONLY where the closest sibling carries it:
+  //   lq_wallet_txns   YES  (sibling petty_cash_ledger: nullable outlet_id + index;
+  //                          a TGBCL wallet belongs to a licence, i.e. an outlet)
+  //   lq_portal_checks YES  (it is the observed twin of a wallet/indent figure)
+  //   lq_brand_map     NO   (a master, like raw_materials/vendors/units/store_locations;
+  //                          a TGBCL brand code is state-wide, not outlet-scoped)
+  //   lq_withdrawals   NO   (it is store-scoped: it posts a store_stock_ledger row,
+  //                          and that table has store_id and NO outlet_id. Carrying
+  //                          both would create two scopes that can disagree.)
+  //   lq_retail_flags  NO   (a side record on a purchases row — outlet is read from
+  //                          the parent purchase, the same way store_bill_charges
+  //                          derives scope from its invoice instead of copying it.)
+  //   NOTE none of these are in TABLES_NEEDING_OUTLET (the boot backfill list near
+  //   the top of this function) and they must not be added to it: that loop
+  //   UPDATEs every NULL outlet_id to the default outlet on EVERY boot, which is
+  //   right for legacy tables and wrong for a table born after multi-outlet.
+  //
+  // SCOPE — ONE ANSWER, because five phases inherit it. The module has TWO
+  // scopes and they are not interchangeable:
+  //   STORE scope (store_locations.id) is the OPERATIONAL one. Liquor stock,
+  //     the indent lines (store_stock_ledger), the bill levies
+  //     (store_bill_charges) and lq_withdrawals all live here.
+  //     store_locations has NO outlet_id — verified — so a store cannot be
+  //     resolved to an outlet by a join today.
+  //   OUTLET scope (outlet_id) is the LICENCE one, and only two tables carry
+  //     it: lq_wallet_txns and lq_portal_checks. A TGBCL wallet belongs to a
+  //     licence, and the portal figure it is checked against belongs to the
+  //     same licence.
+  // The bridge between them is lq_wallet_txns.source_ref → store_bill_charges.id
+  // → store_id. It is the ONLY supported way to get from a wallet row to a
+  // store, and vice versa. Two consequences a phase must respect:
+  //   · L2's auto-debit has no outlet to resolve from a store, so outlet_id is
+  //     NULL until multi-licence exists. Both unique rules below key on
+  //     COALESCE(outlet_id,'') for exactly that reason, and the debit's real
+  //     identity is source_ref (see uq_lq_wallet_debit_source).
+  //   · §H ("non-sale issues as a % of purchases") must compare like with like:
+  //     store-scoped lq_withdrawals against the STORE-scoped indent lines in
+  //     store_stock_ledger, NEVER against outlet-scoped `purchases`.
+  //
+  // SILENT-FAILURE NOTE: initializeSchema swallows errors per block, so this one
+  // is deliberately split — ONE try/catch PER CREATE TABLE, then one for the
+  // shape guard, then one for the indexes. db.exec stops at its first failing
+  // statement and silently skips the rest of that string, so a single combined
+  // exec would let one bad CREATE take four tables and two UNIQUE constraints
+  // with it behind a single misleading log line (measured: a name collision on
+  // lq_withdrawals left uq_lq_portal_check absent, logged only as "indexes
+  // failed"). Per statement, the failure is named and nothing after it is lost.
+  const LQ_TABLE_DDL: string[] = [
+    `
+      -- ── L1. TGBCL Brand Master ↔ our material ─────────────────────────────
+      -- One row per (brand code, pack size). The SAME material maps to SEVERAL
+      -- rows when it is bought in more than one pack (the workbook's 9740-PP vs
+      -- 9740-NN), so the key is the TGBCL code pair, NOT material_id.
+      -- rate_per_bottle and landed-cost/bottle are DERIVED (rate_per_case_master ÷
+      -- bottles_per_case, plus allocated levies) and are deliberately not columns.
+      -- product_type is stored in the workbook's exact spelling; an importer
+      -- normalises to these three tokens rather than the CHECK being loosened,
+      -- because 'Beer' and 'BEER' arriving as two values would split every
+      -- category split in the Summary (§C/§D).
+      CREATE TABLE IF NOT EXISTS lq_brand_map (
+        id                   TEXT PRIMARY KEY,
+        material_id          TEXT NOT NULL,
+        tgbcl_brand_code     TEXT NOT NULL,
+        size_code            TEXT NOT NULL DEFAULT '',     -- TGBCL pack letter(s): PP, NN, QQ …
+        size_ml              REAL NOT NULL DEFAULT 0,      -- ml per bottle (0 = UNKNOWN, see below)
+        -- NO DEFAULT, and > 0: every landed cost in this module is
+        -- rate_per_case_master ÷ bottles_per_case, and SQLite does not raise on
+        -- division by zero — it returns NULL, which is byte-for-byte the value
+        -- landedCostPerBottle() reserves for "this material is NOT MAPPED".
+        -- A default of 0 let a CSV import that mis-headed one column produce a
+        -- fully-mapped master that silently reads as unmapped on every row.
+        -- Dropping the default makes an INSERT that omits it fail loudly.
+        -- size_ml is deliberately NOT constrained: 0 genuinely means "we don't
+        -- know the bottle size", which is harmless because nothing divides by it
+        -- for money. Any per-ml maths must guard on size_ml > 0 itself.
+        bottles_per_case     INTEGER NOT NULL CHECK (bottles_per_case > 0),
+        rate_per_case_master REAL NOT NULL DEFAULT 0,      -- ₹/case, TGBCL issue price
+        product_type         TEXT NOT NULL DEFAULT 'IML'
+                             CHECK (product_type IN ('BEER','IML','Duty Paid')),
+        is_active            INTEGER NOT NULL DEFAULT 1,
+        note                 TEXT NOT NULL DEFAULT '',
+        created_by           TEXT NOT NULL DEFAULT '',
+        created_at           TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at           TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE (tgbcl_brand_code, size_code),
+        -- CASCADE (not the bare FK the ledger tables use): this row is pure
+        -- configuration, so deleting the material should take its mapping with
+        -- it rather than blocking the delete. Historical money rows below use
+        -- the bare FK on purpose — those must block.
+        FOREIGN KEY (material_id) REFERENCES raw_materials(id) ON DELETE CASCADE
+      );
+    `,
+    `
+      -- ── L2. TGBCL Portal Wallet ledger ────────────────────────────────────
+      -- THE RUNNING BALANCE IS SUM(amount) AND IS NEVER STORED. There is no
+      -- balance column here and none may be added: a stored balance drifts the
+      -- moment one back-dated row is inserted, which is the exact failure the
+      -- workbook's Portal Wallet sheet re-derives every time it is opened.
+      --   opening       + (ONE per outlet — uq_lq_wallet_opening; the balance
+      --                    the ledger starts from)
+      --   deposit       + (challan paid into the wallet)
+      --   indent_debit  - (AUTO-created from a recorded indent's Net Indent —
+      --                    uq_lq_wallet_indent_debit + uq_lq_wallet_debit_source)
+      --   adjustment    ± (portal correction; needs a remark, enforced in the API)
+      -- The + / − above are CHECK constraints at the foot of this table, not a
+      -- convention: SUM(amount) is the balance, so a sign error is a wrong
+      -- balance with nothing to detect it.
+      -- bank_debit_date / bank_amount / bank_match describe the BANK side of a
+      -- DEPOSIT only. Summary check C ("bank-unconfirmed deposits") is therefore
+      -- type='deposit' AND bank_match='pending' — never bank_match alone, which
+      -- is meaningless on the other three types and stays at its default there.
+      CREATE TABLE IF NOT EXISTS lq_wallet_txns (
+        id              TEXT PRIMARY KEY,
+        outlet_id       TEXT,
+        date            TEXT NOT NULL,                     -- YYYY-MM-DD (ledger date)
+        type            TEXT NOT NULL
+                        CHECK (type IN ('opening','deposit','indent_debit','adjustment')),
+        reference       TEXT NOT NULL DEFAULT '',          -- challan no | indent/invoice ref
+        amount          REAL NOT NULL DEFAULT 0,           -- SIGNED ₹: + into the wallet, − spent
+        payment_mode    TEXT NOT NULL DEFAULT '',          -- neft|rtgs|cheque|cash|portal … (free text)
+        bank_debit_date TEXT NOT NULL DEFAULT '',          -- YYYY-MM-DD off the bank statement
+        bank_amount     REAL NOT NULL DEFAULT 0,           -- what the bank actually debited
+        bank_match      TEXT NOT NULL DEFAULT 'pending'
+                        CHECK (bank_match IN ('pending','verified')),
+        portal_status   TEXT NOT NULL DEFAULT '',          -- what TGBCL shows against this row
+        source_ref      TEXT NOT NULL DEFAULT '',          -- store_bill_charges.id for an auto debit
+        remarks         TEXT NOT NULL DEFAULT '',
+        created_by      TEXT NOT NULL DEFAULT '',
+        created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
+        -- SIGN BY TYPE. The balance IS SUM(amount), so one wrong sign is a wrong
+        -- balance with nothing to detect it: a positive indent_debit and a
+        -- negative deposit were both accepted, turning a ₹431,550 balance into
+        -- ₹68,450. The whole reason this table is signed rather than
+        -- petty_cash_ledger's amount-positive-plus-direction is that there is
+        -- ONE source of direction — this is what makes that true.
+        -- The one-time Portal Wallet history import is the likeliest offender:
+        -- spreadsheets write debits unsigned.
+        -- 'adjustment' is deliberately unconstrained — it IS the ± correction
+        -- row, and pinning it would leave no way to correct in one direction.
+        CHECK ((type IN ('opening','deposit') AND amount >= 0)
+            OR (type = 'indent_debit'         AND amount <= 0)
+            OR  type = 'adjustment'),
+        -- An indent debit MUST name its indent. Without this, two debits with a
+        -- blank reference both slipped past uq_lq_wallet_indent_debit (which is
+        -- partial) and the spend silently doubled. A deposit's reference (the
+        -- challan no) is still optional — a challan can be recorded before its
+        -- number is known — which is why this is scoped to the machine-written
+        -- type rather than applied to the whole table.
+        CHECK (type <> 'indent_debit' OR reference <> '')
+      );
+    `,
+    `
+      -- ── L3. Emergency wine-shop purchase — SIDE RECORD, not a purchase ────
+      -- The bottles are a REAL purchase and move stock through the existing
+      -- purchase flow (vendor = the wine shop). This row only carries what that
+      -- flow has nowhere to put. One row per PURCHASE LINE, because the
+      -- purchases table holds one row per ITEM and the excess is per bottle;
+      -- bill_ref groups the
+      -- lines of one trip for the petty-cash claim.
+      -- The four excess figures are FROZEN AT ENTRY, like landed_value below:
+      -- depot landed cost moves with every later indent, and a report that
+      -- silently re-prices last quarter's emergency buy is worse than no report.
+      CREATE TABLE IF NOT EXISTS lq_retail_flags (
+        id                      TEXT PRIMARY KEY,
+        purchase_id             TEXT NOT NULL,
+        bill_ref                TEXT NOT NULL DEFAULT '',  -- wine-shop bill no (groups a trip)
+        -- NO DEFAULT, like its parent purchases.date and like the two other
+        -- lq_ date columns. A default of '' let a route that forgot the field
+        -- write a flag that every WHERE-date-BETWEEN silently drops — and §E
+        -- ("the price of running out") is nothing but date-range totals.
+        date                    TEXT NOT NULL,             -- YYYY-MM-DD
+        shop_name               TEXT NOT NULL DEFAULT '',
+        shop_licence_no         TEXT NOT NULL DEFAULT '',
+        bottles                 REAL NOT NULL DEFAULT 0,   -- bottles bought (frozen)
+        rate_paid_per_bottle    REAL NOT NULL DEFAULT 0,   -- ₹ actually paid at the shop
+        depot_landed_per_bottle REAL NOT NULL DEFAULT 0,   -- L1 landed cost AT ENTRY (frozen)
+        excess_per_bottle       REAL NOT NULL DEFAULT 0,   -- paid − depot landed (frozen)
+        excess_total            REAL NOT NULL DEFAULT 0,   -- excess_per_bottle × bottles (frozen)
+        excess_pct              REAL NOT NULL DEFAULT 0,   -- excess ÷ depot landed × 100 (frozen)
+        paid_by                 TEXT NOT NULL DEFAULT '',  -- who fronted the money
+        payment_mode            TEXT NOT NULL DEFAULT '',  -- cash|upi|card|petty_cash (free text)
+        reimbursement_status    TEXT NOT NULL DEFAULT 'not_required'
+                                CHECK (reimbursement_status IN
+                                  ('not_required','claimed_pending','reimbursed','rejected')),
+        petty_cash_id           TEXT,                      -- payout that closed the claim
+        reason                  TEXT NOT NULL DEFAULT '',  -- why we bought retail (depot dry …)
+        approved_by             TEXT NOT NULL DEFAULT '',
+        recorded_by             TEXT NOT NULL DEFAULT '',
+        created_at              TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at              TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE (purchase_id),
+        -- CASCADE: deleting the purchase deletes the note about it. Without this
+        -- the FK would BLOCK an ordinary purchase delete — a new failure mode
+        -- bolted onto an existing flow, which this module must not create.
+        FOREIGN KEY (purchase_id)   REFERENCES purchases(id) ON DELETE CASCADE,
+        -- SET NULL, not CASCADE and not blocking: deleting the petty-cash payout
+        -- must reopen the claim, never delete the purchase's excess record.
+        FOREIGN KEY (petty_cash_id) REFERENCES petty_cash_ledger(id) ON DELETE SET NULL
+      );
+    `,
+    `
+      -- ── L4. Stock withdrawals — non-sale issues ───────────────────────────
+      -- MOVES STOCK (L4 wires that): one store_stock_ledger row per withdrawal,
+      -- inside the same transaction, id kept in ledger_id. cases/bottles are the
+      -- human figures as issued; qty_recipe_units is what the ledger actually
+      -- moved, held POSITIVE here because the sign belongs to the ledger row
+      -- (which is signed) — this table is the register, not the movement.
+      -- landed_unit_cost / landed_value are FROZEN AT ISSUE: the point of the
+      -- director-use ledger is what it cost the night it left, not what a
+      -- re-priced bottle would cost today.
+      -- outstanding is a GENERATED column, so recoverable − recovered can never
+      -- drift and cannot be written by mistake — same rule as the wallet balance
+      -- above, one level down. An INSERT that lists it fails loudly
+      -- ("cannot INSERT into generated column"), so L4 must simply not name it.
+      -- GOTCHA, measured: PRAGMA table_info DOES NOT LIST A GENERATED COLUMN
+      -- (25 columns back, no outstanding); PRAGMA table_xinfo does (26). Every
+      -- has-this-column guard in this file is written on table_info, so one
+      -- copied onto this column would conclude it is missing and try to ALTER
+      -- it in on every boot. Use table_xinfo if you ever need to check — the
+      -- shape guard below does.
+      -- Same gotcha, one consumer away: src/lib/db-explorer.ts builds the admin
+      -- DB console's schema panel and its sortable-column list from
+      -- pragma_table_info, so that page will report 25 columns and refuse to
+      -- sort by "outstanding", while its row browser (SELECT *) shows 26. Not
+      -- fixed here — db-explorer is outside this module — but expect it.
+      CREATE TABLE IF NOT EXISTS lq_withdrawals (
+        id               TEXT PRIMARY KEY,
+        ref              TEXT NOT NULL,                    -- WD-YYYY-### (human handle)
+        date             TEXT NOT NULL,                    -- YYYY-MM-DD
+        store_id         TEXT NOT NULL,                    -- which store/floor bar it left
+        material_id      TEXT NOT NULL,
+        category         TEXT NOT NULL
+                         CHECK (category IN ('management_personal','staff_welfare',
+                                             'marketing_sampling','breakage_spoilage','transfer')),
+        cases            REAL NOT NULL DEFAULT 0,          -- as issued (display/audit)
+        bottles          REAL NOT NULL DEFAULT 0,          -- loose bottles on top of the cases
+        -- POSITIVE, and now enforced. A negative here that postWithdrawalStock
+        -- then negates again would ADD stock and still credit the register — a
+        -- withdrawal that increases the bar's on-hand. The sign belongs to the
+        -- (signed) store_stock_ledger row; this table is the register.
+        qty_recipe_units REAL NOT NULL DEFAULT 0 CHECK (qty_recipe_units >= 0),
+        landed_unit_cost REAL NOT NULL DEFAULT 0,          -- ₹/recipe-unit FROZEN AT ISSUE
+        landed_value     REAL NOT NULL DEFAULT 0,          -- qty × landed_unit_cost, FROZEN
+        mrp_unit_value   REAL NOT NULL DEFAULT 0,          -- ₹/recipe-unit at MRP
+        mrp_value        REAL NOT NULL DEFAULT 0,
+        taken_by         TEXT NOT NULL DEFAULT '',
+        authorised_by    TEXT NOT NULL DEFAULT '',
+        recovery_basis   TEXT NOT NULL DEFAULT 'none'
+                         CHECK (recovery_basis IN ('none','landed','mrp','custom')),
+        recoverable      REAL NOT NULL DEFAULT 0,
+        recovered        REAL NOT NULL DEFAULT 0,
+        outstanding      REAL GENERATED ALWAYS AS (recoverable - recovered) VIRTUAL,
+        excise_register  INTEGER NOT NULL DEFAULT 0,       -- 1 = goes in the excise register
+        ledger_id        TEXT NOT NULL DEFAULT '',         -- store_stock_ledger row this posted
+        wastage_id       TEXT NOT NULL DEFAULT '',         -- set when breakage co-wrote wastages
+        remarks          TEXT NOT NULL DEFAULT '',
+        recorded_by      TEXT NOT NULL DEFAULT '',
+        created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at       TEXT NOT NULL DEFAULT (datetime('now')),
+        UNIQUE (ref),
+        -- outstanding is GENERATED and unwritable; this is the other half of
+        -- that care. recovered > recoverable was accepted and produced a
+        -- NEGATIVE outstanding (measured: −400), which §H then nets against
+        -- real debt and under-reports what is owed. Over-recovery is corrected
+        -- by raising recoverable, not by letting recovered run past it.
+        CHECK (recoverable >= 0 AND recovered >= 0 AND recovered <= recoverable),
+        -- Bare FKs (no CASCADE): these are money rows against real stock. A
+        -- material or store that a withdrawal names must not be deletable out
+        -- from under the register — the same choice store_stock_ledger and
+        -- store_closing_counts make.
+        FOREIGN KEY (store_id)    REFERENCES store_locations(id),
+        FOREIGN KEY (material_id) REFERENCES raw_materials(id)
+      );
+    `,
+    `
+      -- ── L5. Portal figures the owner OBSERVES ─────────────────────────────
+      -- The only table L5 needs, and it earns its place: Summary checks A and B
+      -- compare our COMPUTED figure against what the TGBCL portal/indent PDF
+      -- SHOWS, and that shown figure is an observation a human typed in — it
+      -- cannot be derived from anything we hold. Everything else in the Summary
+      -- (uplift factors, effective TCS, cess/case, MRP rounding per bottle, avg
+      -- landed per bottle, every §A-§H total) is computed from recorded lines and
+      -- gets no storage, per the plan.
+      -- It is NOT folded into lq_wallet_txns on purpose: a row there is a
+      -- MOVEMENT and enters SUM(amount); a portal reading is not a movement, and
+      -- putting it there would corrupt the very balance it is meant to check.
+      CREATE TABLE IF NOT EXISTS lq_portal_checks (
+        id            TEXT PRIMARY KEY,
+        outlet_id     TEXT,
+        kind          TEXT NOT NULL
+                      CHECK (kind IN ('wallet_balance','indent_value')),
+        as_of_date    TEXT NOT NULL,                       -- date the figure was read
+        reference     TEXT NOT NULL DEFAULT '',            -- indent/invoice ref; '' for a balance
+        portal_amount REAL NOT NULL DEFAULT 0,             -- ₹ AS SHOWN (observed, never computed)
+        source        TEXT NOT NULL DEFAULT '',            -- 'portal screen' | 'indent PDF' | …
+        observed_by   TEXT NOT NULL DEFAULT '',
+        note          TEXT NOT NULL DEFAULT '',
+        created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+    `,
+  ];
+  for (const stmt of LQ_TABLE_DDL) {
+    const named = /CREATE TABLE IF NOT EXISTS (lq_[a-z_]+)/.exec(stmt);
+    try { db.exec(stmt); }
+    catch (e) { console.error('liquor reconciliation (lq_*) schema failed for ' + (named ? named[1] : '?') + ':', e); }
+  }
+
+  // ── SHAPE GUARD — the thing CREATE TABLE IF NOT EXISTS cannot do ──────────
+  // IF NOT EXISTS answers "is there an object with this name", never "does it
+  // have the right columns". A table that already exists in a WRONG shape
+  // survives the block above in complete silence — no log line, indexes still
+  // created, CHECK vocabularies simply absent — and then throws at runtime,
+  // three deploys away from the cause. Measured on a fixture: a 6-of-16-column
+  // lq_wallet_txns booted clean, then "table lq_wallet_txns has no column named
+  // bank_match" on the first save, with type='NONSENSE' accepted.
+  //
+  // This matters most for the phases: the day L2 adds a column to the CREATE
+  // TABLE above, dev is a fresh DB and works, while testing and production
+  // already have the table and never get it. Every other evolving table in this
+  // file carries the house PRAGMA table_info + ALTER TABLE ADD COLUMN guard
+  // (store_transfers.from_central, the four store_stock_ledger charge columns);
+  // this is the same guard, written once for all five tables so no phase has to
+  // remember it.
+  //
+  // HOW IT WORKS, and why there is no second column list to keep in sync: the
+  // CREATE TABLE text above IS the specification. We re-run it into the TEMP
+  // schema under a zz_ prefix, read the intended columns back off the temp
+  // copy, and add whatever the real table is missing. A phase that edits a
+  // CREATE TABLE gets the migration for free; a list of column names copied out
+  // here would silently rot instead.
+  //
+  //   · PRAGMA table_xinfo, NOT table_info — table_info OMITS GENERATED COLUMNS,
+  //     so a guard written on it would try to ALTER lq_withdrawals.outstanding
+  //     in on every single boot. (Measured: table_info 25, table_xinfo 26.)
+  //   · A generated column, or a NOT NULL column with no default, is NOT added
+  //     automatically — the first cannot be reconstructed from xinfo, the second
+  //     would leave every future INSERT failing. Both are reported by name.
+  //   · dflt_value comes back WITHOUT its parentheses, so it is re-wrapped:
+  //     DEFAULT (datetime('now')) is rejected unparenthesised.
+  //   · Adds columns only, only to lq_ tables, only when missing. It never
+  //     drops, re-types or rebuilds anything, and a correct database is a no-op.
+  //   · CHECK constraints and FKs CANNOT be added by ALTER. If this guard ever
+  //     fires, the table is only partly repaired — that is why it shouts.
+  try {
+    const lqNames = LQ_TABLE_DDL
+      .map(s => /CREATE TABLE IF NOT EXISTS (lq_[a-z_]+)/.exec(s))
+      .filter((m): m is RegExpExecArray => !!m)
+      .map(m => m[1]);
+    for (const sql of LQ_TABLE_DDL) {
+      db.exec(sql.replace(/CREATE TABLE IF NOT EXISTS lq_/g, 'CREATE TABLE IF NOT EXISTS temp.zz_lq_'));
+    }
+    for (const table of lqNames) {
+      const want = db.prepare('SELECT name, type, "notnull", dflt_value, hidden FROM pragma_table_xinfo(?)').all('zz_' + table) as Array<{
+        name: string; type: string; notnull: number; dflt_value: string | null; hidden: number;
+      }>;
+      const have = new Set((db.prepare('SELECT name FROM pragma_table_xinfo(?)').all(table) as Array<{ name: string }>).map(c => c.name));
+      if (have.size === 0) { console.error('[db] lq_ shape guard: ' + table + ' DOES NOT EXIST after its CREATE — see the error above it'); continue; }
+      const added: string[] = [];
+      const manual: string[] = [];
+      for (const col of want) {
+        if (have.has(col.name)) continue;
+        if (col.hidden === 2 || col.hidden === 3) { manual.push(col.name + ' (GENERATED — rebuild the table by hand)'); continue; }
+        if (col.notnull && col.dflt_value === null) { manual.push(col.name + ' (NOT NULL with no default — would break every INSERT)'); continue; }
+        const decl = col.name + ' ' + col.type + (col.notnull ? ' NOT NULL' : '')
+          + (col.dflt_value === null ? '' : ' DEFAULT (' + col.dflt_value + ')');
+        const alter = 'ALTER TABLE ' + table + ' ADD COLUMN ' + decl;
+        try { db.exec(alter); added.push(col.name); }
+        catch (e) { manual.push(col.name + ' (' + String((e as Error).message) + ')'); }
+      }
+      if (added.length || manual.length) {
+        console.error('[db] lq_ SHAPE DRIFT on ' + table + ' — this database did not match the CREATE TABLE in db.ts.'
+          + (added.length ? ' Added: ' + added.join(', ') + '.' : '')
+          + (manual.length ? ' NEEDS A HAND: ' + manual.join('; ') + '.' : '')
+          + ' CHECK constraints and FKs cannot be added by ALTER, so this table is only partly repaired.');
+      }
+    }
+    for (const table of lqNames) db.exec('DROP TABLE IF EXISTS temp.zz_' + table);
+  } catch (e) { console.error('liquor reconciliation (lq_*) shape guard failed:', e); }
+
+  // Indexes + the FOUR uniqueness rules, in their OWN try/catch (see the note at
+  // the top of this block: one swallowed error must not hide the other half).
+  //
+  // The unique rules that involve an outlet key on COALESCE(outlet_id,'') rather
+  // than outlet_id. In a UNIQUE index SQLite treats every NULL as DISTINCT, so a
+  // plain (outlet_id, …) key would enforce nothing at all on the rows that
+  // matter — these tables are outside TABLES_NEEDING_OUTLET, so nothing
+  // backfills a NULL outlet_id and NULL is the normal value until a route sets
+  // one.
+  // Upserts must name the same expression as their conflict target, and a
+  // PARTIAL index needs its WHERE repeated there too:
+  //   INSERT … ON CONFLICT (COALESCE(outlet_id,''), kind, reference, as_of_date) DO UPDATE …
+  //   INSERT … ON CONFLICT (source_ref) WHERE type='indent_debit' AND source_ref <> '' DO UPDATE …
+  // Without the WHERE, SQLite answers "ON CONFLICT clause does not match any
+  // PRIMARY KEY or UNIQUE constraint" — loudly, at least.
+  //
+  // NO INDEX on lq_brand_map(tgbcl_brand_code) alone: UNIQUE (tgbcl_brand_code,
+  // size_code) already creates an autoindex leading with that column, which
+  // answers every brand-code lookup. A second B-tree there is maintained on
+  // every write and enables no read (verified with EXPLAIN QUERY PLAN).
+  //
+  // Run ONE STATEMENT AT A TIME, for the reason given at the top of the block:
+  // as a single exec, the first failure silently skipped every statement after
+  // it. Measured — a name collision on lq_withdrawals left uq_lq_portal_check,
+  // a UNIQUE constraint, absent, with one log line that named only "indexes".
+  const LQ_INDEX_DDL = `
+      CREATE INDEX IF NOT EXISTS idx_lq_brand_map_material ON lq_brand_map(material_id);
+
+      CREATE INDEX IF NOT EXISTS idx_lq_wallet_date ON lq_wallet_txns(date);
+      CREATE INDEX IF NOT EXISTS idx_lq_wallet_type ON lq_wallet_txns(type, reference);
+      -- (outlet_id, date), not outlet_id alone: §A's balance-as-of is
+      -- "SUM(amount) WHERE outlet_id=? AND date<=?" and is the wallet page's hot
+      -- path. The single-column form made that a partial scan.
+      CREATE INDEX IF NOT EXISTS idx_lq_wallet_outlet_date ON lq_wallet_txns(outlet_id, date);
+      -- ONE debit per indent per outlet. This is what makes the plan's promise
+      -- ("the wallet can never disagree with recorded indents") a constraint
+      -- rather than an intention: re-saving an indent must UPDATE its debit, and
+      -- a second INSERT fails loudly instead of quietly doubling the spend.
+      -- Partial to type, so deposits and adjustments (which share a blank
+      -- reference) are untouched. It no longer needs "AND reference <> ''": the
+      -- CHECK on the table now guarantees an indent debit has a reference, and
+      -- carrying that clause here is what let two blank-ref debits through.
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_lq_wallet_indent_debit
+        ON lq_wallet_txns(COALESCE(outlet_id,''), reference)
+        WHERE type = 'indent_debit';
+      -- …and ONE debit per RECORDED INDENT ROW, whatever outlet it is filed
+      -- under. The index above is keyed on COALESCE(outlet_id,''), and outlet_id
+      -- is nullable with nothing to resolve it from (store_locations has no
+      -- outlet_id), so the same indent debited once with a NULL outlet and once
+      -- with a real one passed it and doubled the spend. source_ref is
+      -- store_bill_charges.id — the identity of the thing being debited — so
+      -- this is the rule that actually holds for the auto-debit path the plan
+      -- describes. Partial on source_ref because a hand-entered debit has none.
+      -- RESIDUAL, for L2 to close: a HAND-entered debit with no source_ref can
+      -- still be duplicated across the NULL/set outlet split. L2 either always
+      -- sets source_ref, or resolves outlet_id once at write time.
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_lq_wallet_debit_source
+        ON lq_wallet_txns(source_ref)
+        WHERE type = 'indent_debit' AND source_ref <> '';
+      -- ONE opening balance per outlet. The workbook's Portal Wallet sheet has
+      -- exactly one, and a second silently DOUBLES the balance every check A is
+      -- measured against (measured: 250000 → 500000). It is the row entered by
+      -- hand exactly once, which is why it is the easiest to enter twice.
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_lq_wallet_opening
+        ON lq_wallet_txns(COALESCE(outlet_id,''))
+        WHERE type = 'opening';
+
+      CREATE INDEX IF NOT EXISTS idx_lq_retail_date  ON lq_retail_flags(date);
+      CREATE INDEX IF NOT EXISTS idx_lq_retail_bill  ON lq_retail_flags(bill_ref);
+      CREATE INDEX IF NOT EXISTS idx_lq_retail_reimb ON lq_retail_flags(reimbursement_status);
+      CREATE INDEX IF NOT EXISTS idx_lq_retail_petty ON lq_retail_flags(petty_cash_id);
+
+      CREATE INDEX IF NOT EXISTS idx_lq_withdrawals_date     ON lq_withdrawals(date);
+      CREATE INDEX IF NOT EXISTS idx_lq_withdrawals_store    ON lq_withdrawals(store_id, date);
+      CREATE INDEX IF NOT EXISTS idx_lq_withdrawals_material ON lq_withdrawals(material_id);
+      CREATE INDEX IF NOT EXISTS idx_lq_withdrawals_category ON lq_withdrawals(category);
+
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_lq_portal_check
+        ON lq_portal_checks(COALESCE(outlet_id,''), kind, reference, as_of_date);
+      CREATE INDEX IF NOT EXISTS idx_lq_portal_checks_kind ON lq_portal_checks(kind, as_of_date);
+    `;
+  // Comment lines are dropped BEFORE the split so a ';' inside one can never
+  // cut a statement in half; no string literal in this block contains one.
+  for (const stmt of LQ_INDEX_DDL
+    .split('\n').filter(l => !/^\s*--/.test(l)).join('\n')
+    .split(';').map(s => s.trim()).filter(Boolean)) {
+    const named = /INDEX IF NOT EXISTS (\w+)/.exec(stmt);
+    try { db.exec(stmt); }
+    catch (e) { console.error('liquor reconciliation (lq_*) index failed: ' + (named ? named[1] : stmt.slice(0, 60)), e); }
+  }
+>>>>>>> WIP
 }
 
 // ---- UTILITY FUNCTIONS ----

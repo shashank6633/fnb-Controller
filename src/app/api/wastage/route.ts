@@ -2,6 +2,7 @@ import { getDb, generateId } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
 import { isStoreMappedMaterial } from '@/lib/store-engine';
 import { postDeptLedger, deptOnHand } from '@/lib/dept-ledger';
+import { postCentralTxn } from '@/lib/movement-record';
 
 /**
  * Wastages — Phase 1 §6 consumption channel.
@@ -229,10 +230,20 @@ export async function POST(request: Request) {
       // BOTH RAILS. The central Variance Report reads wastage out of
       // inventory_transactions; gating this on the rail would make wastage
       // disappear from variance the day a chef first tags a department.
-      db.prepare(`
-        INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, created_at, outlet_id)
-        VALUES (?, ?, 'wastage', ?, ?, ?, datetime('now'), ?)
-      `).run(generateId(), material_id, -qty, id, `Wastage: ${r}${notes ? ' — ' + notes : ''}`, outletId);
+      // MOVEMENT RECORD: spoilage leaves the central store and goes NOWHERE —
+      // 'wastage' is a sink, not a place, and is recorded as one rather than
+      // being dressed up as a transfer to an imaginary location.
+      postCentralTxn(db, {
+        materialId: material_id,
+        type: 'wastage',
+        quantity: -qty,
+        referenceId: id,
+        notes: `Wastage: ${r}${notes ? ' — ' + notes : ''}`,
+        outletId,
+        counterparty: { kind: 'wastage', name: `Wastage — ${r}` },
+        txnDate: date,
+        actor: me.email,
+      });
     });
     try {
       txn();

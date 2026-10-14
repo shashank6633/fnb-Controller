@@ -20,6 +20,7 @@ import { checkPurchaseDate } from '@/lib/purchase-guard';
 // skipped-rows CSV has been told nothing. line-dedupe imports nothing, so this
 // costs the bundle nothing. Edit it there or not at all.
 import { SPLIT_RATE_REMEDY } from '@/lib/line-dedupe';
+import { postCentralTxn, vendorParty } from '@/lib/movement-record';
 
 interface BulkPurchaseItem {
   item_name: string;
@@ -216,10 +217,9 @@ export async function POST(request: Request) {
     const updateStock = db.prepare(`
       UPDATE raw_materials SET current_stock = current_stock + ?, updated_at = datetime('now') WHERE id = ?
     `);
-    const insertTransaction = db.prepare(`
-      INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, created_at)
-      VALUES (?, ?, 'purchase', ?, ?, ?, datetime('now'))
-    `);
+    // The raw INSERT that stood here is now postCentralTxn at the call site, so
+    // each bulk line records its own vendor, its own BILL date and the session
+    // user who ran the import.
     // Duplicate guard: same material + vendor + date + qty + unit_price already
     // in the DB, with the VENDOR's bill_no as an ADDITIONAL discriminator (never
     // our auto invoice_id, which is unique per entry and would defeat the check).
@@ -609,7 +609,22 @@ export async function POST(request: Request) {
           });
         } else {
           updateStock.run(stockQty, materialId);
+<<<<<<< WIP-MIXED production side — these lines came from: 82e23ba Direct Issue: vendor deliveries routed straight to a departmen (1)
           insertTransaction.run(generateId(), materialId, stockQty, id, `Bulk import: ${item.vendor || 'unknown'}`);
+======= WIP side
+          postCentralTxn(db, {
+            materialId,
+            type: 'purchase',
+            quantity: stockQty,
+            referenceId: id,
+            notes: `Bulk import: ${item.vendor || 'unknown'}`,
+            counterparty: vendorParty(item.vendor),
+            // The BILL's date from the uploaded row, not the upload's date — a
+            // month-old invoice imported today is a month-old movement.
+            txnDate: item.date,
+            actor: me?.email || 'system:purchase-import',
+          });
+>>>>>>> WIP-MIXED
         }
         touchedMaterials.add(materialId);
         results.success++;

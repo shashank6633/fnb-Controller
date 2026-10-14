@@ -3,6 +3,7 @@ import { getCurrentUser } from '@/lib/auth';
 import { isStoreMappedMaterial } from '@/lib/store-engine';
 import { materialsAwaitingQc } from '@/lib/grn-qc';
 import { dualQty, fmtQtyNum } from '@/lib/pack-units';
+import { postCentralTxn } from '@/lib/movement-record';
 
 /**
  * One-click repair: lift any NEGATIVE raw-material current_stock up to 0, and
@@ -352,12 +353,24 @@ export async function POST(request: Request) {
         // whole batch back — a booked adjustment with no matching stock change
         // is worse than the negative it was meant to clear.
         if (res.changes !== 1) throw new Error(`Could not lift "${r.name}" — stock changed mid-fix. Nothing was applied; try again.`);
+<<<<<<< WIP-MIXED production side — these lines came from: 44431ea Department-based inventory: central issues to a department, re (6)
         insertTx.run(
           generateId(),
           r.id,
           lift,
           `fix-negative-stock:${batchId}`,
           `Negative stock lifted to 0 by ${stamp}. `
+======= WIP side
+        postCentralTxn(db, {
+          materialId: r.id,
+          type: 'adjustment',
+          quantity: lift,
+          referenceId: `fix-negative-stock:${batchId}`,
+          counterparty: { kind: 'adjustment', name: 'Negative-stock lift' },
+          actor: me!.email,
+          notes:
+            `Negative stock lifted to 0 by ${stamp}. `
+>>>>>>> WIP-MIXED
             + `${fmtQtyNum(d.lift_purchase_qty)} ${d.purchase_unit || d.unit} `
             + `(${fmtQtyNum(lift)} ${d.unit}) created, ${inr(d.value_created)} @ ${inr(r.average_price)}/${d.unit}. `
             + `Was ${fmtQtyNum(r.current_stock)} ${d.unit}.`

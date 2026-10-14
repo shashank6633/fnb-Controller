@@ -668,7 +668,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           WHERE id = ?
         `).run(me.email, me.email, note, note, id);
         // Party path also TRANSFERS store → department (store deduction + dept
-        // credit). The helper is idempotent via the party_consumption ledger row,
+        // credit). The helper is idempotent via the party transfer ledger row,
         // so re-fulfilment or the store-process path can never double-transfer.
         if (r.purpose === 'party') {
           applyPartyFulfillment(db, id, me.email);
