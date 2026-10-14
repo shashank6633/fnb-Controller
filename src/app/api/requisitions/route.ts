@@ -1,7 +1,7 @@
 import { getDb, generateId } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId, canApproveAsChef, canApproveAsMgmt, canProcessAsStore, canIssueAsStore } from '@/lib/auth';
 import { requisitionVisibility, isMainDeptHead, isAnyMainDeptHead, effectiveCategoriesForUser } from '@/lib/dept-hierarchy';
-import { requisitionHasMovedStock } from '@/lib/issue-stock';
+import { requisitionHasMovedStock, lineIssueComplete, type LineCompletenessRow } from '@/lib/issue-stock';
 import { duplicateLineError } from '@/lib/po-helpers';
 
 // Statuses at which a requisition can be edited, by whom:
@@ -54,6 +54,56 @@ const ESTIMATED_VALUE_SQL = `(SELECT COALESCE(SUM(
                   * rm.average_price), 0)
                 FROM requisition_items ri JOIN raw_materials rm ON rm.id = ri.material_id
                 WHERE ri.req_id = r.id)`;
+
+/**
+ * lines_owing BY THE ISSUE DESKS' OWN RULE (round 7).
+ *
+ * The list's lines_owing is a bare SQL `quantity_issued < approved`. Both issue
+ * routes now close a line by issue-stock.ts lineIssueComplete, which adds one
+ * arm SQL cannot express: the issued and approved figures SHOW as the same
+ * number (central-debit-clamp.ts issuedCoversAsk). THREE MANGO approved 14.843
+ * kg, the whole 14,842.5 g shelf taken and recorded as 14.8425 kg, is COMPLETE
+ * on both desks — but this count kept it owing, so the list row's hover read
+ * "1 line(s) handed over, 2 still owed" with only SALT owed, and the Part chip
+ * (isPartIssued) would stay lit on a requisition whose every other line was
+ * done. Measured by the round-7 verifier (md_r1_detail).
+ *
+ * So the rows the SQL calls owing are re-read here, ONLY the lines that rule
+ * can close (something issued, less than approved, not rejected — the SQL's own
+ * exclusions), and each one lineIssueComplete calls complete is taken off the
+ * count. The SQL arm is untouched, so every line it calls complete stays
+ * complete, and a requisition with no such line keeps its figure exactly.
+ * Mutates `rows` in place. Census at round 7: 0 live lines change.
+ */
+function uncountShownFigureCloses(
+  db: ReturnType<typeof getDb>,
+  rows: Array<{ id: unknown; lines_owing?: unknown }>,
+): void {
+  const owing = rows.filter(r => (Number(r?.lines_owing) || 0) > 0);
+  if (owing.length === 0) return;
+  const byId = new Map(owing.map(r => [String(r.id), r] as const));
+  const ids = [...byId.keys()];
+  const CHUNK = 500;
+  for (let i = 0; i < ids.length; i += CHUNK) {
+    const part = ids.slice(i, i + CHUNK);
+    const lines = db.prepare(`
+      SELECT ri.req_id, ri.quantity_issued, ri.chef_approved_qty, ri.quantity_requested,
+             ri.unit AS line_unit, rm.unit, rm.purchase_unit, rm.pack_size
+        FROM requisition_items ri JOIN raw_materials rm ON rm.id = ri.material_id
+       WHERE ri.req_id IN (${part.map(() => '?').join(',')})
+         AND COALESCE(ri.is_rejected, 0) = 0
+         AND COALESCE(ri.store_rejected, 0) = 0
+         AND COALESCE(ri.quantity_issued, 0) > 0
+         AND COALESCE(ri.quantity_issued, 0)
+             < COALESCE(ri.chef_approved_qty, ri.quantity_requested, 0)
+    `).all(...part) as Array<LineCompletenessRow & { req_id: string }>;
+    for (const l of lines) {
+      if (!lineIssueComplete(l)) continue;
+      const r = byId.get(String(l.req_id));
+      if (r) r.lines_owing = Math.max(0, (Number(r.lines_owing) || 0) - 1);
+    }
+  }
+}
 
 function nextReqNumber(db: ReturnType<typeof getDb>, isoDate: string): string {
   const year = isoDate.slice(0, 4);
@@ -281,6 +331,8 @@ export async function GET(request: Request) {
       WHERE ${where.join(' AND ')}
       ORDER BY r.date DESC, r.created_at DESC
     `).all(...params);
+    // lines_owing by the issue desks' own rule — see uncountShownFigureCloses.
+    uncountShownFigureCloses(db, rows as Array<{ id: unknown; lines_owing?: unknown }>);
 
     const me = await getCurrentUser();
     // Per-requisition approve permission: only the head of THAT requisition's

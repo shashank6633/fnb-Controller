@@ -260,8 +260,20 @@ export interface CentralDebitPlan {
 }
 
 /** A display converter: a RECIPE quantity ↦ the figure the operator is shown
- *  for it. Supplied by the caller (this file converts nothing). */
-export type ShownAs = (recipeQty: number) => number;
+ *  for it. Supplied by the caller (this file converts nothing).
+ *
+ *  `step`, optional: ONE STEP OF THE SHOWN FIGURE — the smallest non-zero
+ *  figure it can print (0.001 of the purchase unit for the desks'
+ *  toPurchaseQty) — stated in the SAME units the converter takes. The caller
+ *  that builds the converter knows its precision; this file still converts
+ *  nothing. Only issuedCoversAsk reads it (its third arm); planCentralDebit
+ *  ignores it, so attaching one changes no debit. Attach with shownWithStep. */
+export type ShownAs = ((recipeQty: number) => number) & { readonly step?: number };
+
+/** A converter carrying its printed step (see ShownAs). */
+export function shownWithStep(fn: (q: number) => number, step: number): ShownAs {
+  return Object.assign(fn, { step: Number(step) || 0 });
+}
 
 /**
  * DOES THIS DEBIT FIT, AND WHAT EXACTLY DO WE SUBTRACT?
@@ -337,6 +349,8 @@ export function planCentralDebit(stock: number, ask: number, shownAs?: ShownAs |
  *
  *     complete  ⇔  issued ≥ wanted
  *               ∨  ( shownAs(issued) === shownAs(wanted)  ∧  shownAs(wanted) > 0 )
+ *               ∨  ( wanted − issued < ONE STEP of the shown figure
+ *                    ∧  issued > 0  ∧  shownAs(wanted) > 0 )           (round 7b)
  *
  * The first arm is the predicate every desk used, byte for byte, so nothing
  * that was complete stops being complete. The second is the shown-figure rule
@@ -345,25 +359,56 @@ export function planCentralDebit(stock: number, ask: number, shownAs?: ShownAs |
  * figure IS the approved one" makes it an issue of the approved line. The
  * storekeeper reads "14.843 of 14.843" — the line is done.
  *
- * WHY NOT "AFTER TAKING EVERYTHING ON THE SHELF" AS A SEPARATE TEST. Every gap
- * the rule above can open is at most half a display step (the shown figure is
- * the 3-dp half-up rounding of the balance), and that is exactly the gap this
- * test closes; it needs no memory of HOW the line got there, so it gives the
- * same answer on every later re-read — the auto-advance re-scores every line of
- * the requisition on every gesture, long after the shelf has been restocked. A
- * test keyed on "the store is empty now" would re-open the line the day a
- * delivery arrived.
+ * THE THIRD ARM: AN OUTSTANDING BELOW WHAT THE DESK CAN DISPLAY (round 7b).
+ * The second arm closed the half-step cases and left their neighbour stuck,
+ * MEASURED on the real store-issue route and the real store page (verifier
+ * run new-short): approved 14.843 kg, the shelf holds 14,842.4 g (shown
+ * 14.842). Issue Now is held "holds only 14.842 kg"; the offered 14.842 takes
+ * the whole shelf by the shown-figure rule and records 14.8424 kg; the line
+ * then owes 0.0006 kg, which the desk prints as "0.001 kg", and that retry is
+ * refused "the central store holds none of it" — correctly, the shelf is
+ * empty. The requisition sat 'store_processed' on 0.6 g nobody can type. The
+ * owner's rule (R1): a line whose outstanding is below what the desk can
+ * display, after taking everything on the shelf, counts as FULFILLED, recorded
+ * truthfully — the line keeps what left the shelf (14.8424) and the typed
+ * figure stays in its history as `asked`.
  *
- * WHAT IT CANNOT DO: close a line the desk shows as short. A line at 14.842 of
- * 14.843 (the store held 14,842.4 g and all of it went) shows two different
- * figures and stays outstanding — the store really is 0.6 g short, at a
- * precision the desk prints. `> 0` keeps a line approved at a sub-display
- * figure and issued nothing from "matching" at 0.
+ * "Below what the desk can display" is strictly less than ONE printed step —
+ * 0.001 of the purchase unit (1 g of a kg line, 0.75 ml of a 750 ml bottle) —
+ * supplied by the converter as `shownAs.step`, in the converter's own units,
+ * and compared on the house grid (qtyGrid) so float noise cannot move it: a
+ * line short by exactly one step or more (14.842 of 14.843 — a whole gram the
+ * desk prints and a restocked store can issue) stays OUTSTANDING, at every
+ * pack size (measured 1000 g, 750 ml, 700 ml, kg/kg, pcs).
+ *
+ * WHY NOT "AFTER TAKING EVERYTHING ON THE SHELF" AS A SEPARATE TEST. It needs
+ * no memory of HOW the line got there, so it gives the same answer on every
+ * later re-read — the auto-advance re-scores every line of the requisition on
+ * every gesture, long after the shelf has been restocked; a test keyed on "the
+ * store is empty now" would re-open the line the day a delivery arrived. And
+ * it does not need one: a figure a desk types is on the printed 3-dp grid, and
+ * a figure it offers is either that or the line's exact remainder (which
+ * completes the line by the first arm), so a sub-step remainder arises only
+ * when a take recorded what left the shelf instead of the typed figure — the
+ * take that emptied it. (A sub-display figure typed by hand, 14.8424 kg over a
+ * stocked shelf, would also close; that is a figure no screen offers.)
+ *
+ * WHAT IT CANNOT DO: close a line on nothing, or a line the desk can still
+ * serve. `issued > 0` — a line nothing has left the shelf for never closes by
+ * the third arm, however small its approval. `shownAs(wanted) > 0` — a line
+ * approved at a sub-display figure (0.0004 kg, shown 0) closes only by the
+ * first arm, exactly as before. An outstanding of a whole printed step or more
+ * is never touched.
  *
  * `shownAs` is the caller's display converter, as for planCentralDebit (for a
- * requisition line: the line quantity ↦ its purchase-unit "In store" figure).
- * Without one the first arm stands alone, exactly as before. Pure; reads
- * nothing.
+ * requisition line: the line quantity ↦ its purchase-unit "In store" figure,
+ * issue-stock.ts lineShownAs, which carries the step). Without one the first
+ * arm stands alone; without a step the first two, exactly as before. Pure;
+ * reads nothing.
+ *
+ * MIRRORED, BY TRANSCRIPTION, in the two desks that cannot import this file
+ * (it imports the database): store-requisitions/page.tsx and
+ * requisitions/page.tsx lineIssueComplete. Change all three together.
  */
 export function issuedCoversAsk(issued: number, wanted: number, shownAs?: ShownAs | null): boolean {
   const i = Number(issued) || 0;
@@ -371,7 +416,10 @@ export function issuedCoversAsk(issued: number, wanted: number, shownAs?: ShownA
   if (i >= w) return true;
   if (typeof shownAs !== 'function') return false;
   const sw = Number(shownAs(w)) || 0;
-  return sw > 0 && (Number(shownAs(i)) || 0) === sw;
+  if (!(sw > 0)) return false;
+  if ((Number(shownAs(i)) || 0) === sw) return true;
+  const step = Number(shownAs.step) || 0;
+  return step > 0 && qtyGrid(i) > 0 && qtyGrid(w - i) < qtyGrid(step);
 }
 
 /**

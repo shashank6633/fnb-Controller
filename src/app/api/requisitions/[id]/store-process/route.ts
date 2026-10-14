@@ -1,10 +1,11 @@
-import { getDb, generateId } from '@/lib/db';
+import { getDb, generateId, logAuditEvent } from '@/lib/db';
 import { getCurrentUser, canIssueAsStore, getCurrentOutletId } from '@/lib/auth';
 import { applyPartyFulfillment } from '@/lib/party-fulfillment';
 import { mergeDuplicateLines } from '@/lib/po-helpers';
 import {
   applyIssueDelta, checkCentralIssue, isCentralStockShort,
   issueLineQtyToRecord, rescoreHeldIssue, scoreHeldAtTurn, lineIssueComplete,
+  zeroEntriesSentence,
 } from '@/lib/issue-stock';
 import { vendorMappingError, vendorResolver } from '@/lib/vendor-mapping';
 import { centralFlowBlock } from '@/lib/store-engine';
@@ -1171,6 +1172,37 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           clientToken,
         });
         if (res.needsUnitReview) unitReview.push(it.material_name);
+        // ── THE TYPED FIGURE IS KEPT, NOT ONLY WHAT LEFT THE SHELF (round 7) ──
+        // When the shown-figure rule took the balance instead of the typed
+        // figure (14.843 kg typed over 14,842.5 g → 14.8425 kg recorded), the
+        // line, the ledger and the movement all carry what left the shelf, and
+        // until now NOTHING carried what the storekeeper typed: this route
+        // writes no issue_history and had no audit row, where store-issue keeps
+        // `asked` on both and the party rails on 'requisition.party_transfer
+        // .shelf'. One row per such line, in store-issue's own after-image shape
+        // ({quantity_issued, added, asked}). Written ONLY when the figure moved,
+        // so every ordinary process writes exactly what it wrote before. A held
+        // line is written back as found and never reaches this.
+        if (!heldItemIds.has(String(it.id)) && issuedToWrite !== issued) {
+          logAuditEvent(db, {
+            event_type: 'req_item.store_process.shelf',
+            entity_type: 'requisition_item',
+            entity_id: String(it.id),
+            actor_email: me.email,
+            before: { quantity_issued: beforeIssued },
+            after: {
+              quantity_issued: issuedToWrite,
+              added: Math.round((issuedToWrite - beforeIssued) * 1e9) / 1e9,
+              asked: issued,
+              line_unit: String(it.unit ?? ''),
+            },
+            // 1e-9 line units in the SENTENCE only (2,999.7 ml ÷ 750 is stored
+            // as 3.9995999999999996 BTL); the after-image keeps the stored value.
+            note: `${it.material_name}: issued what the central store held — ${Math.round(issued * 1e9) / 1e9}`
+              + `${it.unit ? ` ${it.unit}` : ''} typed (the store's shown figure for its balance), `
+              + `${Math.round(issuedToWrite * 1e9) / 1e9}${it.unit ? ` ${it.unit}` : ''} recorded as handed over`,
+          });
+        }
       }
       // Only surfaced when the helper actually refused a line for an ambiguous
       // unit — impossible while the deduct flag is off, so the response body is
@@ -1436,6 +1468,15 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // than left out because the failure it would cause is permanent: the
       // party_consumption ledger row makes the transfer one-shot, so a transfer
       // fired on a partial could never move the remainder afterwards.
+      //
+      // ROUND 7: THE TRANSFER IS NO LONGER ONE-SHOT. The "one-shot" above was
+      // the defect behind a measured gap: a party line processed here at 10 of
+      // 14.843 kg moved 10 kg, the store-issue top-up that completed it was
+      // skipped, and the line, ledger and Issue Log claimed 4.843 kg that never
+      // left central. applyPartyFulfillment now tops up what an earlier call
+      // moved (see "A LATER CALL TOPS UP" in party-fulfillment.ts), so the
+      // completing gesture moves the remainder. The three gates here are left
+      // exactly as they are — they still decide WHEN goods first move.
       if (!linkedPoId && poDropped.length === 0 && heldItemIds.size === 0 && r.purpose === 'party') {
         applyPartyFulfillment(db, id, me.email);
       }
@@ -1478,10 +1519,20 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     if (centralShort.length > 0) {
       const n = centralShort.length;
       result.held_lines = centralShort;
+      // Lines the storekeeper ENTERED AS 0 that still owe something: written
+      // unchanged, nothing went out on them — so "everything else was issued"
+      // must not count them (round 7 verifier). Only lines the POST named:
+      // an omitted line was not "entered".
+      const zeroNames = items
+        .filter(it => !heldItemIds.has(String(it.id)) && !it.is_rejected && lineMap.has(it.id)
+          && (Number(lineMap.get(it.id)?.quantity_issued) || 0) <= 0
+          && ((it.chef_approved_qty != null ? Number(it.chef_approved_qty) : Number(it.quantity_requested)) || 0) > 0)
+        .map(it => String(it.material_name || 'a line'));
       result.stock_held_note =
         `${n} line${n === 1 ? '' : 's'} ${n === 1 ? 'was' : 'were'} NOT issued and `
         + `${n === 1 ? 'stays' : 'stay'} outstanding on ${r.req_number} — the central store does not `
-        + `hold the quantity asked. ${centralShort.map(s => s.message).join(' ')} `
+        + `hold the quantity asked. ${centralShort.map(s => s.message).join(' ')}`
+        + `${zeroEntriesSentence(zeroNames)} `
         + `Everything else on this requisition was issued.`;
     }
     // `|| result.stock_held_note` so a plain issue (no PO asked for) that held a

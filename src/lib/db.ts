@@ -5617,6 +5617,13 @@ function initializeSchema(db: Database.Database) {
    *     party requisition never trips it (same type ⇒ `type <> NEW.type` false).
    *   · The two writers guard each other on reference_id before they insert, so
    *     the second rail skips rather than reaching this trigger at all.
+   *   · The desks' rail TOPS UP since round 7 (party-fulfillment.ts, "A LATER
+   *     CALL TOPS UP"): a completing gesture adds rows to a reference that
+   *     already has some — always as 'party_issue', the name the migration
+   *     above leaves every existing row under at boot, so `type <> NEW.type`
+   *     is false. Only a legacy row that appeared AFTER boot (a file restored
+   *     under a running process) makes a top-up reach this, and then the
+   *     gesture is refused loudly, which is this trigger's whole purpose.
    *   · A PO void DELETEs the party rows before any re-receive re-inserts them,
    *     so the round trip is clean.
    *   · The Party Items rail (api/parties/items) has only ever written

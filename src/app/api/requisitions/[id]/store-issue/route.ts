@@ -5,6 +5,7 @@ import {
   applyIssueDelta, checkCentralIssue, isCentralStockShort,
   isIssueGestureRecorded, isIssueTokenReplayError,
   issueLineQtyToRecord, rescoreHeldIssue, scoreHeldAtTurn, lineIssueComplete,
+  zeroEntriesSentence,
 } from '@/lib/issue-stock';
 import { isDeptReversalBlocked } from '@/lib/dept-ledger';
 
@@ -779,6 +780,11 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     // batch that is the only thing the storekeeper needs, so the line being
     // worked on is stamped here and read after the rollback.
     const failing: { lineId?: string; material?: string } = {};
+    // 'issue' entries sent at 0 (a box typed to 0 on Issue All / Issue
+    // Selected). The loop skips them — nothing is issued on them — so the held
+    // sentence below must not say "everything else was issued" over them
+    // (round 7 verifier: MIRCHI held + SALT at 0 + EGGS).
+    const zeroEntryNames: string[] = [];
 
     const txn = db.transaction(() => {
       // TOCTOU. The status read at the top of this handler happened BEFORE
@@ -834,7 +840,10 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         if (cur.store_rejected && action !== 'unreject') continue;
         if (action === 'issue') {
           const addQty = Number(ln.quantity);
-          if (!Number.isFinite(addQty) || addQty <= 0) continue;
+          if (!Number.isFinite(addQty) || addQty <= 0) {
+            zeroEntryNames.push(String(it.material_name || 'a line'));
+            continue;
+          }
           const beforeQty = Number(cur.quantity_issued) || 0;   // in-txn pre-image
           // WHAT LEFT THE SHELF, NOT WHAT WAS TYPED (round 6). Identical to
           // beforeQty + addQty on every ordinary issue (`shelf.changed` false, the
@@ -1259,6 +1268,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         `${n} line${n === 1 ? '' : 's'} ${n === 1 ? 'was' : 'were'} NOT issued and `
         + `${n === 1 ? 'stays' : 'stay'} outstanding — the central store does not hold the quantity asked. `
         + centralShort.map(s => s.message).join(' ')
+        + zeroEntriesSentence(zeroEntryNames)
         + ` Everything else in this gesture was issued.`;
     }
     return Response.json(out);

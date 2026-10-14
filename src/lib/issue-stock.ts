@@ -196,7 +196,7 @@ import { postCentralTxn, deptParty } from '@/lib/movement-record';
 // every other central floor. See its header for the grid and why 1e-6, and for
 // the shown-figure rule the desks' purchase-unit figure obeys (round 6).
 import {
-  planCentralDebit, holdsAny, qtyDown, qtyGrid, fmtGridQty, issuedCoversAsk, type ShownAs,
+  planCentralDebit, holdsAny, qtyDown, qtyGrid, fmtGridQty, issuedCoversAsk, shownWithStep, type ShownAs,
 } from '@/lib/central-debit-clamp';
 
 export interface IssueDeltaInput {
@@ -331,6 +331,13 @@ export function lineFactor(
  *
  * null for a line whose unit cannot be resolved (lineFactor's needsReview):
  * nobody can say what such a line "shows", so only exact comparisons apply.
+ *
+ * It CARRIES ITS PRINTED STEP (round 7b): toPurchaseQty prints 3 dp of the
+ * purchase unit, so one step is 0.001 purchase unit = 0.001 × packFactor
+ * recipe units = that ÷ factor in the LINE's units (0.001 on a line kept in
+ * the purchase unit, 1 g on a gram line of a 1000-pack). issuedCoversAsk reads
+ * it to close a line whose outstanding is below what the desk can print;
+ * planCentralDebit ignores it.
  */
 export function lineShownAs(
   lineUnit: string | null | undefined,
@@ -339,7 +346,10 @@ export function lineShownAs(
   const { factor, needsReview } = lineFactor(lineUnit, rm);
   if (needsReview) return null;
   const meta = { unit: rm.unit, purchase_unit: rm.purchase_unit, pack_size: rm.pack_size };
-  return (lineQty: number) => toPurchaseQty(Math.round((Number(lineQty) || 0) * factor * 1e6) / 1e6, meta);
+  return shownWithStep(
+    (lineQty: number) => toPurchaseQty(Math.round((Number(lineQty) || 0) * factor * 1e6) / 1e6, meta),
+    (0.001 * packFactor(meta)) / factor,
+  );
 }
 
 /** The columns lineIssueComplete reads. `line_unit` is requisition_items.unit;
@@ -365,13 +375,36 @@ export interface LineCompletenessRow {
  * and the approved figures show as the same number on the desk. That second
  * arm is what lets a line the store emptied itself into by the shown figure
  * (14.843 kg typed, 14,842.5 g on the shelf, 14.8425 kg recorded) close as
- * fulfilled instead of sitting forever 0.0005 kg short. Every line the old
- * predicate called complete is still complete.
+ * fulfilled instead of sitting forever 0.0005 kg short. The third arm (round
+ * 7b, via the step lineShownAs carries) closes its neighbour: 14,842.4 g taken
+ * whole against 14.843 kg approved, 0.0006 kg outstanding — below one printed
+ * step, so nothing on a desk could ever issue it. A line short by a printed
+ * step or more stays open. Every line the old predicate called complete is
+ * still complete.
  */
 export function lineIssueComplete(l: LineCompletenessRow): boolean {
   const eff = (l.chef_approved_qty != null ? Number(l.chef_approved_qty) : Number(l.quantity_requested)) || 0;
   const got = Number(l.quantity_issued) || 0;
   return issuedCoversAsk(got, eff, lineShownAs(l.line_unit, l));
+}
+
+/**
+ * THE LINES A GESTURE LEFT AT 0, IN THE HELD SENTENCE (round 7). Both issue
+ * routes close their held-line sentence with "Everything else … was issued";
+ * a line the storekeeper entered as 0 in the same gesture was not issued
+ * either (store-issue skips it, store-process writes it unchanged), so it is
+ * named first and "everything else" stops counting it. Measured: MIRCHI held,
+ * SALT entered as 0, EGGS issued — the alert said everything else was issued
+ * and SALT stayed at 0. '' when there is none, so every other held sentence is
+ * byte-identical. The desks' pre-submit banners say the same in the present
+ * tense (zeroEntrySentence in both pages).
+ */
+export function zeroEntriesSentence(names: string[]): string {
+  if (!names.length) return '';
+  const list = names.length === 1 ? names[0]
+    : `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
+  const one = names.length === 1;
+  return ` ${list} ${one ? 'was' : 'were'} entered as 0, so ${one ? 'it was' : 'they were'} not issued either.`;
 }
 
 /* ────────────────────────────────────────────────────────────────────────────

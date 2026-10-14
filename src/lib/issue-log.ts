@@ -1,7 +1,8 @@
 import type DatabaseT from 'better-sqlite3';
 import { getDb } from './db';
 import { packFactor, toPurchaseQty, type PackMeta } from './pack-units';
-import { lineFactor } from './issue-stock';
+import { lineFactor, lineShownAs } from './issue-stock';
+import { issuedCoversAsk, type ShownAs } from './central-debit-clamp';
 import { resolvePurchaseLogRange } from './purchase-log';
 
 /**
@@ -732,12 +733,26 @@ function probeSchema(db: DatabaseT.Database): IssueLogSchema {
  * effective quantity is the SNAPSHOT taken at issue time — see the header.
  * A negative issued figure is a reversal (undo / store reject) and gets no
  * fulfilment verdict at all rather than a misleading "PART".
+ *
+ * FULL IS THE DESKS' OWN "ISSUED IN FULL" (round 7). Both desks close a line by
+ * lineIssueComplete — issuedCoversAsk in src/lib/central-debit-clamp.ts: the
+ * old `issued >= effective`, OR the issued and the approved figures show as
+ * the same non-zero number in the purchase unit. A line the store emptied
+ * itself into by the shown figure (THREE MANGO 14,842.5 g on the shelf, 14.843
+ * kg typed and approved, 14.8425 kg recorded) is 'fulfilled' on both desks; this
+ * report printed it "PART | still open 0.001 kg | 14.843 of 14.843 kg" (and a
+ * 4-BTL line over 2,999.7 ml "still open 0 BTL"). `shownAs` is the converter the
+ * caller resolves for the row's basis; without one (an ambiguous unit) the
+ * first arm stands alone, exactly as before. The EPS arm stays first, so a row
+ * this called FULL is still FULL.
  */
-function fulfilmentOf(issued: number, effective: number | null): 'FULL' | 'PART' | 'OPEN' | null {
+function fulfilmentOf(
+  issued: number, effective: number | null, shownAs?: ShownAs | null,
+): 'FULL' | 'PART' | 'OPEN' | null {
   if (effective === null || effective <= 0) return null;
   if (issued < -EPS) return null;
   if (issued <= EPS) return 'OPEN';
-  return issued + EPS >= effective ? 'FULL' : 'PART';
+  return issued + EPS >= effective || issuedCoversAsk(issued, effective, shownAs) ? 'FULL' : 'PART';
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1683,8 +1698,23 @@ export function getIssueLog(
     const issued = r.issued_qty === null || r.issued_qty === undefined
       ? null : r6(Number(r.issued_qty) * sf);
 
+    // THE DESKS' "ISSUED IN FULL", in this row's basis (see fulfilmentOf). An
+    // ISSUE row's figures are RECIPE units (restated through sf above), so its
+    // converter is the recipe-basis one; REQUISITION and pre-ledger rows are in
+    // the LINE's unit and use the line's — lineShownAs, the very converter
+    // lineIssueComplete hands issuedCoversAsk, so a line both desks closed reads
+    // FULL here. A row flagged for unit review has no trustworthy figure to show
+    // and keeps the exact comparison only.
+    const shownAs: ShownAs | null = effective === null || issued === null
+      ? null
+      : st === 'ISSUE'
+        ? (Number(r.needs_unit_review) === 1 ? null : lineShownAs(meta.unit, meta))
+        : lineShownAs(lineUnit, meta);
+    const fulfilment = fulfilmentOf(issued ?? 0, effective, shownAs);
+    // A FULL line owes nothing, whichever arm closed it. Without this the row
+    // printed "FULL" beside "still open 0.0005 kg" — the R1 stuck-line text.
     const stillOpen = effective === null || issued === null
-      ? null : Math.max(0, r6(effective - issued));
+      ? null : fulfilment === 'FULL' ? 0 : Math.max(0, r6(effective - issued));
 
     return {
       stage: st,
@@ -1719,7 +1749,7 @@ export function getIssueLog(
       effective_qty: effective,
       issued_qty: issued,
       still_open: stillOpen,
-      fulfilment: fulfilmentOf(issued ?? 0, effective),
+      fulfilment,
       stock_moved: r.stock_moved === null || r.stock_moved === undefined
         ? null : Number(r.stock_moved) === 1,
       skip_reason: s(r.skip_reason),

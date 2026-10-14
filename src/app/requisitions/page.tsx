@@ -43,6 +43,25 @@ const fmtCapPU = (v: number, pf = 1) => {
   const dp = Math.min(20, 6 + Math.max(0, Math.ceil(Math.log10(pf > 1 ? pf : 1))));
   return n.toLocaleString('en-IN', { maximumFractionDigits: dp });
 };
+/** Who a held row's balance goes to when the server gave it to sibling rows of
+ *  the same item first — the store desk's CentralHoldBanner words. */
+const sharedTarget = (n: number) => (n === 1 ? 'the other line' : `the ${n} other lines`);
+/**
+ * The sentence for lines a gesture leaves at 0 while another line is held —
+ * "SALT is entered as 0, so it is not issued either." Said before "every other
+ * line is issued" so that sentence never counts a line nothing goes out on.
+ * The store desk's ⛔ banner uses the same words (store-requisitions/page.tsx
+ * zeroEntrySentence); `past` is the result panel's tense, the words of the
+ * server's stock_held_note (issue-stock.ts zeroEntriesSentence).
+ */
+function zeroEntrySentence(names: string[], past = false): string {
+  const list = names.length <= 1 ? (names[0] || '')
+    : `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
+  const one = names.length <= 1;
+  return past
+    ? `${list} ${one ? 'was' : 'were'} entered as 0, so ${one ? 'it was' : 'they were'} not issued either.`
+    : `${list} ${one ? 'is' : 'are'} entered as 0, so ${one ? 'it is' : 'they are'} not issued either.`;
+}
 
 interface Material {
   id: string; name: string; sku?: string; unit: string;
@@ -88,7 +107,9 @@ interface ServerBlock {
    *  half-up — the "In Stock" column's own number), which the server accepts
    *  when typed back and debits as the whole balance; below 0.001 it is a
    *  sub-display crumb carried at the precision that takes it (print it with
-   *  fmtCapPU, never fmtNum). 0 only when the store holds none of it. */
+   *  fmtCapPU, never fmtNum). 0 when the store holds none of it — OR (round 7)
+   *  when another held row of the same item was given the whole pool first
+   *  (scoreHeldAtTurn); centralCapOf's `sharedWith` tells the two apart. */
   available?: number;
   purchase_unit?: string;
   /** LINE unit — the Issue box's own basis. */
@@ -259,6 +280,66 @@ function effectiveQty(it: ReqItem): number {
   return (it.chef_approved_qty != null
     ? Number(it.chef_approved_qty)
     : Number(it.quantity_requested)) || 0;
+}
+
+/**
+ * IS THIS LINE ISSUED IN FULL? — the server's own predicate, so this desk, the
+ * store desk and the routes can never disagree about which lines are done.
+ * issue-stock.ts lineIssueComplete → central-debit-clamp.ts issuedCoversAsk
+ * (round 7), transcribed exactly as store-requisitions/page.tsx carries it
+ * (those files import the database and cannot be bundled here):
+ *
+ *     complete ⇔ issued ≥ approved
+ *              ∨ ( shown(issued) = shown(approved) ∧ shown(approved) > 0 )
+ *              ∨ ( approved − issued < one printed step ∧ issued > 0
+ *                  ∧ shown(approved) > 0 )                        (round 7b)
+ *
+ * The third arm: the shelf held 14,842.4 g (shown 14.842) against 14.843
+ * approved, the offered 14.842 took all of it, and the line owed 0.0006 kg —
+ * printed "0.001 still to come" here while no desk could ever issue it (the
+ * store's retry is refused "holds none of it"). One printed step is 0.001
+ * purchase unit in the LINE's units (0.001 × pf ÷ factor, the step the
+ * server's lineShownAs carries), compared on the 6-dp grid as the server
+ * compares it. A whole step or more short (14.842 of 14.843 exactly) stays open.
+ *
+ * shown() is issue-stock.ts lineShownAs: line unit → recipe through lineFactor
+ * (a blank or unrecognised unit on a packed material has no shown figure, and
+ * then only the exact comparison applies), snapped to the 6-dp grid, then
+ * toPurchaseQty — the "In Stock" column's arithmetic.
+ *
+ * WHY THIS DESK NEEDS IT (round 7 verifier). THREE MANGO approved 14.843 kg,
+ * 14,842.5 g on the shelf, typed 14.843: the store takes the whole shelf and
+ * records 14.8425 kg — and the server calls the line COMPLETE (both figures
+ * show as 14.843). The department view here subtracted and printed "0.001
+ * still to come" (store_processed) / "0.001 short" (fulfilled) on a line no
+ * desk will ever issue again, while the store desk printed Outstanding 0 kg.
+ * A line genuinely short at a printed figure (14.842 of 14.843) stays open.
+ * Any change to issuedCoversAsk must be mirrored here and on the store desk.
+ */
+function lineIssueComplete(it: ReqItem): boolean {
+  const eff = effectiveQty(it);
+  const got = Number(it.quantity_issued) || 0;
+  if (got >= eff) return true;
+  const ru = String(it.material_unit || '').trim();
+  if (!ru) return false;
+  const meta = { unit: ru, purchase_unit: it.material_purchase_unit, pack_size: it.material_pack_size };
+  const pf = packFactor(meta);
+  let factor = 1;
+  if (pf > 1) {
+    const lu = String(it.unit ?? '').toLowerCase().trim();
+    const pu = String(it.material_purchase_unit ?? '').toLowerCase().trim();
+    if (lu === '') return false;
+    if (lu === pu) factor = pf;
+    else if (lu === ru.toLowerCase()) factor = 1;
+    else return false;
+  }
+  const shown = (q: number) => toPurchaseQty(Math.round((Number(q) || 0) * factor * 1e6) / 1e6, meta);
+  const sw = Number(shown(eff)) || 0;
+  if (!(sw > 0)) return false;
+  if ((Number(shown(got)) || 0) === sw) return true;
+  const grid6 = (n: number) => Math.round((Number(n) || 0) * 1e6);
+  const step = (0.001 * pf) / factor;
+  return grid6(got) > 0 && grid6(eff - got) < grid6(step);
 }
 
 /**
@@ -1261,7 +1342,9 @@ function RequisitionDetail({ r, materials, viewer, requireMgmt, reload, onEdit }
                     const lead = deptLeadQty(it, storeHasIssued);
                     const approved = effectiveQty(it);
                     const issued = Number(it.quantity_issued) || 0;
-                    const open = Math.max(0, approved - issued);
+                    // Nothing is still to come on a line the server calls
+                    // complete (lineIssueComplete — the shown-figure close).
+                    const open = lineIssueComplete(it) ? 0 : Math.max(0, approved - issued);
                     const over = issued - approved;
                     // "requested" vs "approved" — say which number the line fell
                     // short OF, or the department reads its own ask back at it
@@ -2644,6 +2727,21 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
     const availPU = srv && Number.isFinite(Number(srv.available))
       ? Math.max(0, Number(srv.available))
       : booksPU;
+    /* A HELD ROW LEFT NOTHING BY ITS SIBLING (round 7). Held rows of one
+       material share the pool in row order on the server (issue-stock.ts
+       scoreHeldAtTurn / rescoreHeldIssue), so the second of two MANGO rows over
+       a 1 kg shelf arrives with available 0 and the sentence "holds only 1 kg,
+       and all of it goes to the line above for the same item". Read as "the
+       books are empty" that printed "Store books hold none of this", "(books:
+       none)" and "the books hold none of it … (books: 1,000 g)" over a stocked
+       shelf (round-7 verifier, md_twice_typed_ask). It is the sibling's share
+       exactly when another line of the same item has a server row that WAS
+       given something, and the books hold some. Then the figure to print is
+       the books' (the pool both rows share), never 0. */
+    const sharedWith = srv && !(availPU > 0) && holds
+      ? lines.filter(o => o.id !== ln.id && o.material_id === ln.material_id
+          && (Number(blockedRows[o.id]?.available) || 0) > 0).length
+      : 0;
     const purchaseUnit = (srv && String(srv.purchase_unit || '').trim()) || ln.U.pu;
     // The shown-figure test compares availPU with U.stockPU of the ask, so the
     // two must be on ONE basis. They are read off the same raw_materials row;
@@ -2699,8 +2797,16 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
       /** Books cannot cover what this line asks for — the full ask would be held. */
       capped: wouldHold(ln.requested),
       /** Books hold nothing at all (holdsAny is false). Never true while the
-       *  store holds even one grid step — that is a crumb with a figure. */
-      empty: armed && !(availPU > 0),
+       *  store holds even one grid step — that is a crumb with a figure — and
+       *  never for a row whose 0 is a sibling's share (`sharedWith`). */
+      empty: armed && !(availPU > 0) && sharedWith === 0,
+      /** How many other lines of the same item the server gave the balance to
+       *  first, when THIS row was left nothing (0 otherwise). Print the books'
+       *  figure (`booksPU`) with "all of it goes to …", never "none". */
+      sharedWith,
+      /** The books' own figure, purchase unit (the In Stock column's number,
+       *  or a crumb's grid point) — the pool sibling rows share. */
+      booksPU,
       wouldHold,
       /** The server has already refused this line, in its own words. */
       serverMessage: srv ? String(srv.message || '') : '',
@@ -2853,6 +2959,13 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
    *  `held_lines`). Advisory like every cap on this screen. */
   const handOverLines = lines.filter(ln => !overCapOf(ln) && issuedOf(ln) > ln.already_issued + EPSQ);
   const refusedWhole = overCapLines.length > 0 && handOverLines.length === 0;
+  /** Lines entered as 0 that are still owed: not held, and nothing goes out on
+   *  them — they stay outstanding exactly like a held line. The ⛔ banner's
+   *  "Every other line is issued" must not count them (round 7 verifier:
+   *  MIRCHI held + SALT at 0 + EGGS read "Every other line is issued" and SALT
+   *  was not). The store desk's forecastCentralHolds `idle` is the same set. */
+  const zeroEntryLines = lines.filter(ln => !overCapOf(ln) && issuedOf(ln) <= EPSQ
+    && ln.requested - ln.already_issued > EPSQ);
   /** The cap could not arm itself on these lines: the payload did not carry a
    *  balance for them. NOT a quiet fallback — the amber panel says so, because
    *  a cap that disarms in silence is how the previous attempt at this ended up
@@ -3150,6 +3263,10 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                   })}
                 </ul>
                 <div className="text-[10px]">
+                  {/* A line entered as 0 went out with nothing either, so it is
+                      named before "everything else" (the lines state is the
+                      gesture that was posted). None ⇒ the sentence as before. */}
+                  {zeroEntryLines.length > 0 && <>{zeroEntrySentence(zeroEntryLines.map(ln => ln.material_name), true)}{' '}</>}
                   Everything else on this requisition was issued. This requisition can no longer be issued from this
                   screen — issue the held quantity on{' '}
                   <a href="/store-requisitions" className="underline font-semibold">Issue Requisitions</a>.
@@ -3417,7 +3534,9 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                           live lines the balance is zero and there is no smaller
                           number to offer, so the empty case gets its own
                           sentence. Same split the server's own message makes. */}
-                      {c.empty
+                      {c.sharedWith > 0
+                        ? <>the books hold <b>{fmtCapPU(c.booksPU, c.pf)} {c.purchaseUnit}</b>, and all of it goes to {sharedTarget(c.sharedWith)} for the same item, so nothing can be issued on this line.</>
+                        : c.empty
                         ? <>the books hold <b>none of it</b>, so nothing can be issued on this line.</>
                         : <>the books hold <b>{fmtCapPU(c.availPU, c.pf)} {c.purchaseUnit}</b> of the {fmtNum(ln.U.toPU(ln.requested))} {ln.U.pu} asked — issue up to that, not more.</>}
                       {/* The exact stored figure stays visible, negative and
@@ -3643,7 +3762,9 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                             the one row that will be refused looked ordinary. */}
                         {cap.capped && !negStock && (
                           <div className="text-[9px] text-red-700 font-semibold">
-                            {cap.empty ? '⚠ Store books hold none of this' : `⚠ Store books hold ${fmtCapPU(cap.availPU, cap.pf)} ${cap.purchaseUnit}`}
+                            {cap.sharedWith > 0
+                              ? `⚠ Store books hold ${fmtCapPU(cap.booksPU, cap.pf)} ${cap.purchaseUnit} — all of it goes to ${sharedTarget(cap.sharedWith)} for the same item`
+                              : cap.empty ? '⚠ Store books hold none of this' : `⚠ Store books hold ${fmtCapPU(cap.availPU, cap.pf)} ${cap.purchaseUnit}`}
                           </div>
                         )}
                       </td>
@@ -3698,7 +3819,9 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                                value={ln.issued_pu}
                                onChange={e => update(i, { issued_pu: e.target.value.replace(/^-/, '') })}
                                title={cap.armed
-                                 ? (cap.empty
+                                 ? (cap.sharedWith > 0
+                                   ? `Quantity actually handed over, in ${U.pu || 'units'}. The central store's books hold ${fmtCapPU(cap.booksPU, cap.pf)} ${cap.purchaseUnit} of this material, and all of it goes to ${sharedTarget(cap.sharedWith)} for the same item — so the store will NOT issue this line.`
+                                   : cap.empty
                                      ? `Quantity actually handed over, in ${U.pu || 'units'}. The central store's books hold NONE of this material, so the store will NOT issue this line — get stock received or a closing count recorded first. (Liquor-store items are the exception: their stock moves on the Liquor Store ledger.)`
                                      : `Quantity actually handed over, in ${U.pu || 'units'}. The central store's books hold ${fmtCapPU(cap.availPU, cap.pf)} ${cap.purchaseUnit} — more than that is NOT issued.`)
                                  : `Quantity actually handed over, in ${U.pu || 'units'}. Seeded with the approved qty — type the real figure if more or less left the store.`}
@@ -4098,14 +4221,24 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                   ⛔ {n} line{one ? '' : 's'} ask{one ? 's' : ''} for more than the central store&apos;s books hold
                   {refusedWhole ? (
                     <> — and no other line hands anything over, so the store will <b>refuse the whole issue</b> and save nothing.</>
-                  ) : (
+                  ) : zeroEntryLines.length === 0 ? (
                     <> — on submit {one ? 'it is' : 'they are'} <b>NOT issued and {one ? 'stays' : 'stay'} outstanding</b>.
                       Every other line is issued.</>
+                  ) : (
+                    /* A line entered as 0 goes out with nothing either — named
+                       before "every other line", so that sentence excludes it.
+                       Separate branch: no such line ⇒ the markup above, as before. */
+                    <> — on submit {one ? 'it is' : 'they are'} <b>NOT issued and {one ? 'stays' : 'stay'} outstanding</b>.
+                      {' '}{zeroEntrySentence(zeroEntryLines.map(ln => ln.material_name))}{' '}Every other line is issued.</>
                   )}
                 </div>
                 <div className="text-[10px] mt-0.5">
                   {overCapLines.map(ln => {
                     const c = centralCapOf(ln);
+                    // The store desk's words for a row its sibling empties.
+                    if (c.sharedWith > 0) {
+                      return `${ln.material_name} (books: ${fmtCapPU(c.booksPU, c.pf)} ${c.purchaseUnit}, and all of it goes to ${sharedTarget(c.sharedWith)} for the same item)`;
+                    }
                     return `${ln.material_name} (books: ${c.empty ? 'none' : `${fmtCapPU(c.availPU, c.pf)} ${c.purchaseUnit}`})`;
                   }).join(', ')}
                   .{' '}
