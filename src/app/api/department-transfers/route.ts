@@ -2,15 +2,15 @@ import { getDb } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
 import { canSeeAllDeptStock } from '@/lib/dept-stock';
 import {
-  createDeptTransfer, getDeptTransfer, type DeptTransferLineInput,
+  sendDeptTransfer, getDeptTransfer, countOpenDeptTransferDisputes, type DeptTransferLineInput,
 } from '@/lib/dept-ledger';
 import {
-  loadDepartments, canSendFrom, canReceiveInto, canSeeDept,
-  presentTransfer, transferErrorResponse, resolveEntryUnit,
+  loadDepartments, canSendFrom, canSeeDept, isAdminOrManager,
+  presentTransfer, transferErrorResponse, resolveEntryUnit, bodyNumber,
 } from './access';
 
 /**
- * DEPARTMENT → DEPARTMENT TRANSFERS — the HTTP layer.
+ * DEPARTMENT → DEPARTMENT TRANSFERS — the HTTP layer. ONE STEP (owner's ruling).
  *
  * Kitchen receives MEAT / POULTRY / SEAFOOD straight onto its own department
  * ledger (Direct Issue), but every requisition for them comes from its
@@ -19,36 +19,41 @@ import {
  *
  *   GET  /api/department-transfers                      list documents
  *          ?department_id=<id>      only transfers this department sends or receives
- *          &direction=in|out        relative to department_id
- *          &status=pending|received|cancelled
+ *          &direction=in|out        relative to department_id ("Transfers in" = in)
+ *          &dispute=open|resolved|any   filter on the document's dispute state
  *          &limit=<1..500>          default 100, newest first
- *   POST /api/department-transfers                      SEND — a PENDING document
- *          { from_department_id, to_department_id, notes? (or note),
+ *        → { transfers, departments, open_disputes_to_act }
+ *   POST /api/department-transfers                      SEND — moves the stock NOW
+ *          { from_department_id, to_department_id, client_key, notes? (or note),
  *            lines: [{ material_id, quantity, unit?, notes? }] }
  *          A line may give `quantity_purchase` instead of `quantity` — the same
  *          number, explicitly in the purchase unit (both at once → 400).
- *          (one-line shorthand: material_id / quantity / unit at the top level)
- *          → 201 { transfer }. Every document on the wire carries `lines[]`
- *          with qty_sent / qty_received (RECIPE), their *_purchase twins,
- *          `quantity` (what moved, or is pending) + `quantity_purchase`, and a
- *          `permissions` block { is_sender, can_receive, needs_override_reason,
- *          can_cancel } — show exactly the buttons the server will accept.
- *          GET also returns `departments[]` with can_send / can_receive per
- *          department, and `pending_to_receive` (the caller's inbox count).
+ *        → 201 { transfer, duplicate: false }  — the sender's ledger is already
+ *          down and the receiver's up, in one transaction.
+ *        → 200 { transfer, duplicate: true }   — this client_key already made
+ *          that transfer (a retry after a lost response); NOTHING new written.
+ *        → 409 reason 'idempotency_conflict'   — the key was used for different goods.
  *   GET  /api/department-transfers/<id>                 one document
- *   POST /api/department-transfers/<id>/receive         CONFIRM — moves the stock
- *   POST /api/department-transfers/<id>/cancel          drop a pending document
+ *   POST /api/department-transfers/<id>/dispute         receiver flags short / wrong item / not received
+ *   POST /api/department-transfers/<id>/reverse         the one-tap correction (receiver → sender)
+ *   POST /api/department-transfers/<id>/resolve         close a dispute with a note, moving nothing
  *   GET  /api/department-transfers/holdings?department_id=<id>
- *                                                       what that ONE department can send
+ *                                                       what that ONE department can send, + receivers
  *
- * ── WHY TWO STEPS (send, then receive) ─────────────────────────────────────
- * Both maps of the house pattern say so: the Kitchen QC ruling ("stock moves
- * only when the receiver signs", "the receiver may not be the checker") and
- * the store→store transfer's request/issue/receive split. Unlike store→store,
- * NOTHING moves at send: the kilo stays on the SENDER's ledger until the
- * receiver confirms, and the confirm debits the sender and credits the
- * receiver in ONE transaction (postDeptTransfer in src/lib/dept-ledger.ts), so
- * the kilo is in exactly one ledger at every instant — never both, never none.
+ * ── ONE STEP ───────────────────────────────────────────────────────────────
+ * The moment a transfer is SENT the sender's ledger goes down and the
+ * receiver's goes up, in ONE transaction (dept-ledger sendDeptTransfer →
+ * postDeptTransfer per line). There is no pending state, no /receive, no
+ * /cancel, no waiting list. The receiver sees it under "Transfers in"
+ * (direction=in) and may flag a dispute — which records and alerts, and moves
+ * nothing; the correction is a reverse transfer, one tap from the disputed row.
+ *
+ * ── CLIENT KEY (idempotency) ───────────────────────────────────────────────
+ * REQUIRED on every send. The screen mints it ONCE per tray (crypto.randomUUID)
+ * and re-sends the SAME key when it retries after a network error; it mints a
+ * new one only after a send is confirmed. The server finds the transfer that
+ * key already made and returns it (200, duplicate: true) — a retried send can
+ * never become a second transfer. 8–120 chars of [A-Za-z0-9._:-].
  *
  * ── UNITS ──────────────────────────────────────────────────────────────────
  * `quantity` is in the material's PURCHASE unit unless `unit` says otherwise
@@ -61,26 +66,26 @@ import {
  *
  * ── NEVER COUNTED IS NOT ZERO ──────────────────────────────────────────────
  * Kitchen is in practice never counted, so its balance is NULL. Refusing on
- * NULL would block every hand-over. The rule is dept-ledger's deptReleasable():
- * the counted balance, or — never counted — the all-time signed ledger sum,
- * minus what is already promised on pending transfers. The refusal message
- * names the basis ("by its ledger (never counted)") and what IS available, in
- * the purchase unit. /holdings returns the same figure, so the screen cannot
- * offer what the server will refuse.
+ * NULL would block every hand-over. The send check is dept-ledger's
+ * deptSendable(): the counted balance (capped by the count plus every movement
+ * since it), or — never counted — the all-time signed ledger sum, an UPPER
+ * BOUND the holdings screen labels "up to". The refusal message names the basis
+ * and what IS available, in the purchase unit.
  *
  * ── AUTH ───────────────────────────────────────────────────────────────────
- * Signed-in only (401). WHO may send / receive / cancel / see is ./access.ts.
- * The proxy never checks page access on an API, so each handler authorises
- * itself. CSRF: '/api/department-transfers' is its own CSRF_REQUIRED_PREFIXES
- * line in src/proxy.ts — neither '/api/departments' nor
- * '/api/department-materials' is a prefix of this path.
+ * Signed-in only (401). WHO may send / flag / reverse / dismiss / see is
+ * ./access.ts — the owner's ruling: senders are the SENDING department's head
+ * (head_user_id, or an HOD posted there) plus managers and admin. The proxy
+ * never checks page access on an API, so each handler authorises itself.
+ * CSRF: '/api/department-transfers' is its own CSRF_REQUIRED_PREFIXES line in
+ * src/proxy.ts and covers every POST below it.
  */
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
 
-const STATUSES = new Set(['pending', 'received', 'cancelled']);
 const MAX_LINES = 50;
+const DISPUTE_FILTERS = new Set(['open', 'resolved', 'any']);
 
 export async function GET(request: Request) {
   try {
@@ -90,7 +95,7 @@ export async function GET(request: Request) {
     const url = new URL(request.url);
     const departmentId = (url.searchParams.get('department_id') || '').trim();
     const direction = (url.searchParams.get('direction') || '').trim().toLowerCase();
-    const status = (url.searchParams.get('status') || '').trim().toLowerCase();
+    const dispute = (url.searchParams.get('dispute') || '').trim().toLowerCase();
     const limitRaw = Number(url.searchParams.get('limit') || 100);
     const limit = Math.max(1, Math.min(500, Number.isFinite(limitRaw) ? Math.floor(limitRaw) : 100));
 
@@ -100,8 +105,8 @@ export async function GET(request: Request) {
     if (direction && !departmentId) {
       return Response.json({ error: 'direction needs department_id' }, { status: 400 });
     }
-    if (status && !STATUSES.has(status)) {
-      return Response.json({ error: 'status must be pending, received or cancelled' }, { status: 400 });
+    if (dispute && !DISPUTE_FILTERS.has(dispute)) {
+      return Response.json({ error: 'dispute must be open, resolved or any' }, { status: 400 });
     }
 
     const db = getDb();
@@ -112,6 +117,11 @@ export async function GET(request: Request) {
         return Response.json({ error: 'Not allowed for this department' }, { status: 403 });
       }
     }
+
+    // Departments whose open disputes this caller can act on (reverse) — the
+    // sender side's to-do count. Managers / admin: every department.
+    const actOn = isAdminOrManager(me) ? null : [...depts.values()].filter((d) => canSendFrom(me, d)).map((d) => d.id);
+    const openToAct = countOpenDeptTransferDisputes(db, actOn);
 
     const where: string[] = [];
     const params: string[] = [];
@@ -124,14 +134,16 @@ export async function GET(request: Request) {
       // department this user may see. Fail CLOSED — an empty set lists nothing.
       const visible = [...depts.keys()].filter((id) => canSeeDept(me, id, depts));
       if (visible.length === 0) {
-        return Response.json({ transfers: [], pending_to_receive: 0, departments: deptOptions(me, depts) });
+        return Response.json({ transfers: [], departments: deptOptions(me, depts), open_disputes_to_act: openToAct });
       }
       const json = JSON.stringify(visible);
       where.push(`(t.from_department_id IN (SELECT value FROM json_each(?))
                 OR t.to_department_id IN (SELECT value FROM json_each(?)))`);
       params.push(json, json);
     }
-    if (status) { where.push('t.status = ?'); params.push(status); }
+    if (dispute === 'open') where.push(`t.dispute_status = 'open'`);
+    else if (dispute === 'resolved') where.push(`t.dispute_status = 'resolved'`);
+    else if (dispute === 'any') where.push(`t.dispute_status <> ''`);
 
     const ids = db.prepare(`
       SELECT t.id FROM department_transfers t
@@ -141,16 +153,12 @@ export async function GET(request: Request) {
     `).all(...params) as Array<{ id: string }>;
 
     const transfers = [];
-    let pendingToReceive = 0;
     for (const { id } of ids) {
       const doc = getDeptTransfer(db, id);
-      if (!doc) continue;
-      const p = presentTransfer(me, doc, depts);
-      if (p.permissions.can_receive) pendingToReceive++;
-      transfers.push(p);
+      if (doc) transfers.push(presentTransfer(me, doc, depts));
     }
 
-    return Response.json({ transfers, pending_to_receive: pendingToReceive, departments: deptOptions(me, depts) });
+    return Response.json({ transfers, departments: deptOptions(me, depts), open_disputes_to_act: openToAct });
   } catch (e: any) {
     console.error('[department-transfers GET]', e);
     return Response.json({ error: e?.message || 'Failed to list transfers' }, { status: 500 });
@@ -158,7 +166,8 @@ export async function GET(request: Request) {
 }
 
 /** Every department with what the caller may do there — the screen's pickers
- *  read this instead of guessing the rules. */
+ *  read this instead of guessing the rules. Receivers for a chosen sender, in
+ *  the owner's order, come from /holdings. */
 function deptOptions(me: NonNullable<Awaited<ReturnType<typeof getCurrentUser>>>, depts: ReturnType<typeof loadDepartments>) {
   return [...depts.values()]
     .map((d) => ({
@@ -167,8 +176,9 @@ function deptOptions(me: NonNullable<Awaited<ReturnType<typeof getCurrentUser>>>
       parent_id: d.parent_id,
       parent_name: d.parent_id ? depts.get(d.parent_id)?.name || '' : '',
       is_active: !!Number(d.is_active),
-      can_send: canSendFrom(me, d, depts),
-      can_receive: canReceiveInto(me, d, depts),
+      can_send: canSendFrom(me, d),
+      can_view: canSeeDept(me, d.id, depts),
+      is_mine: !!me.department_id && me.department_id === d.id,
     }))
     .sort((a, b) => (a.parent_name || a.name).localeCompare(b.parent_name || b.name)
       || (a.parent_id ? 1 : 0) - (b.parent_id ? 1 : 0)
@@ -200,11 +210,18 @@ export async function POST(request: Request) {
     if (!from) return Response.json({ error: 'Unknown sending department' }, { status: 404 });
     if (!to) return Response.json({ error: 'Unknown receiving department' }, { status: 404 });
 
-    if (!canSendFrom(me, from, depts)) {
+    if (!canSendFrom(me, from)) {
       return Response.json({
-        error: `Only an admin, a head of department, ${from.name}'s named head, or a manager posted to ` +
-          `${from.name} can send its stock.`,
+        error: `Only ${from.name}'s head (its named head, or an HOD posted to ${from.name}), a manager or an ` +
+          `admin can send its stock. You can still see transfers into and out of your department and flag a dispute.`,
       }, { status: 403 });
+    }
+
+    const clientKey = typeof body.client_key === 'string' ? body.client_key.trim() : '';
+    if (!clientKey) {
+      return Response.json({
+        error: 'client_key is required: mint one per send (crypto.randomUUID()) and re-send the same key on a retry, so a retry can never post twice.',
+      }, { status: 400 });
     }
 
     const rawLines: any[] = Array.isArray(body.lines)
@@ -230,9 +247,8 @@ export async function POST(request: Request) {
       if (hasQP && ln?.quantity !== undefined) {
         return Response.json({ error: `Send quantity OR quantity_purchase, not both (material ${materialId})` }, { status: 400 });
       }
-      const rawQty = hasQP ? ln.quantity_purchase : ln?.quantity;
-      const qty = Number(rawQty);
-      if (rawQty === null || rawQty === '' || rawQty === undefined || !Number.isFinite(qty) || qty <= 0) {
+      const qty = bodyNumber(hasQP ? ln.quantity_purchase : ln?.quantity);
+      if (!Number.isFinite(qty) || qty <= 0) {
         return Response.json({ error: `quantity must be a number above 0 (material ${materialId})` }, { status: 400 });
       }
       const m = lookup.get(materialId) as { id: string; name: string; unit: string; purchase_unit: string } | undefined;
@@ -252,19 +268,24 @@ export async function POST(request: Request) {
       lines.push({ materialId, quantity: qty, unit, notes: String(ln?.notes || '').trim() });
     }
 
-    // createDeptTransfer opens its own IMMEDIATE transaction and refuses on
-    // every stock invariant (same department, inactive receiver, liquor,
-    // more than the sender can release minus what is already pending).
-    const doc = createDeptTransfer(db, {
+    // sendDeptTransfer opens its own IMMEDIATE transaction: the idempotency
+    // gate first, then the document and every line's transfer_out/transfer_in
+    // pair. It refuses on every stock invariant (same department, inactive
+    // receiver, liquor, more than the sender can send).
+    const res = sendDeptTransfer(db, {
       fromDepartmentId: fromId,
       toDepartmentId: toId,
       lines,
       user: me.email,
+      clientKey,
       // `note` accepted as a synonym — one free-text field, whichever the screen names it.
       notes: String(body.notes ?? body.note ?? '').trim(),
       outletId,
     });
-    return Response.json({ transfer: presentTransfer(me, doc, depts) }, { status: 201 });
+    return Response.json(
+      { transfer: presentTransfer(me, res.transfer, depts), duplicate: res.duplicate },
+      { status: res.duplicate ? 200 : 201 },
+    );
   } catch (e: any) {
     const handled = transferErrorResponse(db, e);
     if (handled) return handled;

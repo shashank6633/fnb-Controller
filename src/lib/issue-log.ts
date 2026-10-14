@@ -32,6 +32,9 @@ import { resolvePurchaseLogRange } from './purchase-log';
  *   REVERSAL     recipe units                goods going back, department->store
  *   CONSUMPTION  recipe units                goods being cooked, days later
  *   CONS. SKIP   recipe units                a cook that moved NOTHING, and why
+ *   TRANSFER     recipe units                goods handed department -> department
+ *                                            (only once a transfer exists; see
+ *                                            IssueLogStage)
  *
  * Add any two of those and the number is wrong in its unit AND in its meaning.
  * A 5 kg receipt plus a 5,000 g issue is not 10 of anything. So each stage
@@ -110,6 +113,7 @@ import { resolvePurchaseLogRange } from './purchase-log';
  *   REQUISITION / ISSUE / PRELEDGER "<req_number>#<req_item_id>"
  *   REVERSAL                       "<req_number>#<req_item_id>"  (same as its ISSUE)
  *   CONSUMPTION / CONS. SKIP       "<material_id>"
+ *   TRANSFER                       "<transfer_no>#<transfer line id>"
  *
  * The RECEIPT key is the SAME SHAPE purchase-log.ts mints, so the two reports
  * reconcile line for line on a delivery. Its source is now the hard column
@@ -222,6 +226,9 @@ import { resolvePurchaseLogRange } from './purchase-log';
  *   req_number     -> RECEIPT, CONSUMPTION and CONSUMPTION (skipped) drop out
  *                     (a cook answers to an order, never to a requisition)
  *   vendor         -> only RECEIPT survives (only a purchase has a vendor)
+ *   TRANSFER answers a department filter (EITHER end matches, and the quantity
+ *   is then signed from that department's side) and an item filter; a vendor
+ *   or a requisition number removes it, like CONSUMPTION.
  *
  * CONSUMPTION NOW ANSWERS A DEPARTMENT FILTER, and that is the point of this
  * change. Before the cutover it dropped out beside RECEIPT, so "show me
@@ -258,7 +265,35 @@ export type IssueLogStage =
   | 'ISSUE_PRELEDGER'
   | 'CONSUMPTION'
   | 'REVERSAL'
-  | 'CONSUMPTION_SKIP';
+  | 'CONSUMPTION_SKIP'
+  /**
+   * DEPARTMENT → DEPARTMENT (2026-10-14). One row per hand-over — the PAIR of
+   * department ledger legs postDeptTransfer() writes (transfer_out on the
+   * sender, transfer_in on the receiver, one reference_id). Kitchen receives
+   * routed meat by Direct Issue and hands some to Akan Tandoori: without this
+   * stage the chain went RECEIPT → … → CONSUMPTION with the hand-over between
+   * two kitchens invisible.
+   *
+   * ONE ROW, NOT TWO. Listing each leg would print every hand-over twice and a
+   * stage total would read double the kilos that moved.
+   *
+   * THE SIGN. With no department filter the quantity is the amount moved
+   * (positive): the row has no "side". With a department filter it is signed
+   * from THAT department's side — + received, − handed on — because one stage
+   * carries both directions, and the sign is then the only honest carrier of
+   * the direction. For one item and one department the stage total is that
+   * department's net transfer, which is what makes it checkable against the
+   * department balance like the ISSUE / REVERSAL / CONSUMPTION legs.
+   *
+   * NO MONEY: the goods were valued when they came into the building; moving
+   * them between two kitchens spends nothing.
+   *
+   * PRESENT ONLY ONCE A TRANSFER EXISTS. A database whose ledger has never
+   * held a transfer leg does not grow an empty TRANSFER stage — no card, no
+   * totals line, no stages_present entry — so the report reads exactly as it
+   * did before transfers existed. See probeSchema().transfers.
+   */
+  | 'TRANSFER';
 
 /**
  * ?stage= filter values accepted on the wire.
@@ -280,7 +315,7 @@ export type IssueLogStage =
  */
 export type IssueLogStageFilter =
   | 'all' | 'receipt' | 'requisition' | 'issue' | 'pre_ledger' | 'preledger'
-  | 'consumption' | 'reversal' | 'skip' | 'consumption_skip';
+  | 'consumption' | 'reversal' | 'skip' | 'consumption_skip' | 'transfer';
 
 /** Which basis `qty`/`unit` are stated in. NEVER add across two of these. */
 export type IssueLogQtyBasis = 'purchase' | 'line' | 'recipe';
@@ -461,6 +496,13 @@ export interface IssueLogTotals {
   consumption: IssueLogStageTotal;
   reversal: IssueLogStageTotal;
   consumption_skip: IssueLogStageTotal;
+  /**
+   * Department → department hand-overs. PRESENT ONLY while the TRANSFER stage
+   * is in play (the ledger holds a transfer, or ?stage=transfer was asked) —
+   * absent on a database that has never transferred, so its payload is the one
+   * it always was. Also in `by_stage` under the same rule.
+   */
+  transfer?: IssueLogStageTotal;
   /** The same objects, in STAGE_ORDER, for callers that would rather map. */
   by_stage: IssueLogStageTotal[];
   /** Rows matching the filters BEFORE any truncation, for the cap check only. */
@@ -508,6 +550,14 @@ const TOTALS_BASIS =
   + 'or liquor on its own rail), never a loss. The ISSUE rupee figure is a VALUED MEMO at average '
   + 'price, not a spend — the spend was booked at RECEIPT. There is deliberately no grand total.';
 
+/** Appended to TOTALS_BASIS only while the TRANSFER stage is in play, so a
+ *  database that has never transferred keeps its sentence byte-for-byte. */
+const TOTALS_BASIS_TRANSFER =
+  ' TRANSFER is goods handed from one department to another — one row per hand-over, in RECIPE '
+  + 'units, no money (the goods were valued when they came in). It moves stock between two '
+  + 'kitchens\' books and never in or out of the building, so it must not be added to any receipt, '
+  + 'issue or consumption figure.';
+
 /** The per-stage sentence printed under each card, and in the CSV totals block. */
 const STAGE_BASIS: Record<IssueLogStage, string> = {
   RECEIPT:
@@ -546,6 +596,13 @@ const STAGE_BASIS: Record<IssueLogStage, string> = {
     + 'terracegrill), switched off, or the material is store-mapped liquor on the TGBCL rail. These '
     + 'are a DATA GAP, not a loss: nothing was taken from any department, so nothing here may be read '
     + 'as shrinkage. Map the station in Settings and the same cook starts deducting.',
+  TRANSFER:
+    'Goods handed from one department to another (Department Transfers), in RECIPE units, from the '
+    + 'department ledger — one row per hand-over: the sender\'s books went down and the receiver\'s '
+    + 'went up in the same moment, and central stock did not move. With no department filter the '
+    + 'quantity is the amount moved; with a department filter it is signed from that department\'s '
+    + 'side (+ received, − handed on). No money: the goods were valued when they came into the '
+    + 'building, so never add this to a receipt, issue or consumption figure.',
 };
 
 /**
@@ -576,7 +633,11 @@ const EPS = 1e-6;
  */
 const STAGE_ORDER: IssueLogStage[] =
   ['RECEIPT', 'REQUISITION', 'ISSUE', 'ISSUE_PRELEDGER', 'CONSUMPTION',
-   'REVERSAL', 'CONSUMPTION_SKIP'];
+   'REVERSAL', 'CONSUMPTION_SKIP',
+   // APPENDED for the same seatbelt reason as the two above: an un-updated
+   // page that falls back to 'CONSUMPTION' finds the real CONSUMPTION total
+   // first. Present in by_stage only while the stage is in play.
+   'TRANSFER'];
 
 const STAGE_QTY_BASIS: Record<IssueLogStage, IssueLogQtyBasis> = {
   RECEIPT: 'purchase',
@@ -588,6 +649,8 @@ const STAGE_QTY_BASIS: Record<IssueLogStage, IssueLogQtyBasis> = {
   // (dept-ledger.ts: "Every quantity in this file is RECIPE units").
   REVERSAL: 'recipe',
   CONSUMPTION_SKIP: 'recipe',
+  // The department rail again.
+  TRANSFER: 'recipe',
 };
 
 const STAGE_VALUE_BASIS: Record<IssueLogStage, IssueLogValueBasis> = {
@@ -604,6 +667,10 @@ const STAGE_VALUE_BASIS: Record<IssueLogStage, IssueLogValueBasis> = {
   REVERSAL: '',
   // A skip moved nothing, so there is nothing to value.
   CONSUMPTION_SKIP: '',
+  // A hand-over between two kitchens spends nothing: the goods were valued
+  // when they came in, and pricing them again would put the same money on the
+  // report a second time.
+  TRANSFER: '',
 };
 
 /** Human label for the CSV and any plain-text surface. */
@@ -615,6 +682,7 @@ const STAGE_LABEL: Record<IssueLogStage, string> = {
   CONSUMPTION: 'CONSUMPTION',
   REVERSAL: 'REVERSAL (department -> store)',
   CONSUMPTION_SKIP: 'CONSUMPTION (skipped — no stock moved)',
+  TRANSFER: 'TRANSFER (department -> department)',
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -703,6 +771,22 @@ interface IssueLogSchema {
   deptTrace: boolean;
   /** consumption_skips exists (created by the cutover migration block). */
   skips: boolean;
+  /**
+   * The department ledger has EVER held a transfer leg. Not a table probe — a
+   * data probe, and that is the point: the TRANSFER stage exists only once a
+   * transfer does, so a building that has never transferred sees this report
+   * exactly as before (no empty card, no extra totals line, no new
+   * stages_present entry). Cheap: the partial idx_dmt_transfer_ref index holds
+   * transfer rows only, and the WHERE below matches its predicate verbatim.
+   */
+  transfers: boolean;
+  /** …and department_transfers / department_transfer_lines are readable with
+   *  the columns the document number needs, so a row can print DTR-yyyy-####
+   *  instead of the bare line id. Optional: the ledger pair alone is the truth. */
+  transferDocs: boolean;
+  /** department_material_transactions carries txn_date (the movement-record
+   *  columns), the business date both legs of a transfer are stamped with. */
+  txnDate: boolean;
 }
 
 function probeSchema(db: DatabaseT.Database): IssueLogSchema {
@@ -713,18 +797,38 @@ function probeSchema(db: DatabaseT.Database): IssueLogSchema {
       ).get(name);
     } catch { return false; }
   };
+  const colsOf = (table: string): Set<string> => {
+    try {
+      return new Set((db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>)
+        .map(c => String(c.name)));
+    } catch { return new Set(); }
+  };
   const deptLedger = has('department_material_transactions');
   let deptTrace = false;
+  let txnDate = false;
+  if (deptLedger) {
+    const names = colsOf('department_material_transactions');
+    deptTrace = names.has('req_item_id') && names.has('station') && names.has('source');
+    txnDate = names.has('txn_date');
+  }
+  let transfers = false;
   if (deptLedger) {
     try {
-      const cols = db.prepare(
-        'PRAGMA table_info(department_material_transactions)',
-      ).all() as Array<{ name: string }>;
-      const names = new Set(cols.map(c => String(c.name)));
-      deptTrace = names.has('req_item_id') && names.has('station') && names.has('source');
-    } catch { deptTrace = false; }
+      transfers = !!db.prepare(`
+        SELECT 1 FROM department_material_transactions
+         WHERE type IN ('transfer_out', 'transfer_in') AND type = 'transfer_out'
+         LIMIT 1
+      `).get();
+    } catch { transfers = false; }
   }
-  return { deptLedger, deptTrace, skips: has('consumption_skips') };
+  let transferDocs = false;
+  if (transfers && has('department_transfers') && has('department_transfer_lines')) {
+    const docCols = colsOf('department_transfers');
+    const lineCols = colsOf('department_transfer_lines');
+    transferDocs = docCols.has('id') && docCols.has('transfer_no')
+      && lineCols.has('id') && lineCols.has('transfer_id');
+  }
+  return { deptLedger, deptTrace, skips: has('consumption_skips'), transfers, transferDocs, txnDate };
 }
 
 /**
@@ -1482,6 +1586,114 @@ function buildUnion(f: {
     if (f.materialId) params.push(f.materialId);
   }
 
+  // ── TRANSFER (department -> department) ──────────────────────────────────
+  // ONE ROW PER HAND-OVER, read off the SENDER's transfer_out leg; the
+  // receiver is its transfer_in twin (same reference_id — the
+  // department_transfer_lines.id), found by SCALAR SUBQUERY and never by a
+  // join, for the same no-fan-out reason as the CONSUMPTION attribution above.
+  // Like CONSUMPTION it answers a department filter (either end matches) and an
+  // item filter, never a vendor or a requisition: a hand-over between two
+  // kitchens answers to neither.
+  //
+  // Runs only once the ledger has held a transfer (schema.transfers) — see the
+  // IssueLogStage note: no transfer, no stage, report unchanged.
+  if (want('transfer', cooked && f.schema.transfers)) {
+    stages.push('TRANSFER');
+    // The twin leg's department. The doubled type test matches the partial
+    // idx_dmt_transfer_ref predicate verbatim so SQLite can use that index.
+    const RECEIVER = `(
+          SELECT ti.department_id
+            FROM department_material_transactions ti
+           WHERE ti.reference_id = dmt.reference_id
+             AND ti.type IN ('transfer_out', 'transfer_in') AND ti.type = 'transfer_in'
+             AND ti.material_id = dmt.material_id
+           ORDER BY ti.created_at ASC, ti.id ASC
+           LIMIT 1)`;
+    const RECEIVER_NAME = `COALESCE((SELECT dr.name FROM departments dr WHERE dr.id = ${RECEIVER}), '(unknown department)')`;
+    const SENDER_NAME = `COALESCE(ds.name, '(unknown department)')`;
+    // The business date both legs carry (IST, postDeptTransfer always stamps
+    // it); the row's own UTC date only on a database without that column.
+    const XDATE = f.schema.txnDate
+      ? `COALESCE(NULLIF(substr(dmt.txn_date, 1, 10), ''), substr(dmt.created_at, 1, 10))`
+      : `substr(dmt.created_at, 1, 10)`;
+    const DOC_NO = f.schema.transferDocs
+      ? `COALESCE(NULLIF(TRIM((SELECT dt.transfer_no
+                                 FROM department_transfer_lines dtl
+                                 JOIN department_transfers dt ON dt.id = dtl.transfer_id
+                                WHERE dtl.id = dmt.reference_id
+                                LIMIT 1)), ''), COALESCE(dmt.reference_id, ''))`
+      : `COALESCE(dmt.reference_id, '')`;
+    // Perspective: with a department filter the row is read from THAT side.
+    // dmt is the OUT leg, so its stored quantity is already −q.
+    const persp = !!f.departmentId;
+    const QTY = persp ? `CASE WHEN dmt.department_id = ? THEN dmt.quantity ELSE -dmt.quantity END` : `-dmt.quantity`;
+    const STATUS = persp ? `CASE WHEN dmt.department_id = ? THEN 'transfer_out' ELSE 'transfer_in' END` : `'transfer'`;
+    const DEPT_ID = persp ? `?` : RECEIVER;
+    parts.push(`
+      SELECT
+        'TRANSFER'                                        AS stage,
+        8                                                 AS stage_rank,
+        dmt.id                                            AS row_id,
+        ${XDATE}                                          AS date,
+        COALESCE(dmt.created_at, '')                      AS at,
+        ${DOC_NO}                                         AS doc_no,
+        -- The hand-over LINE, the same shape as a requisition line's key:
+        -- '<transfer_no>#<line id>'.
+        ${DOC_NO} || '#' || COALESCE(dmt.reference_id, '') AS link_raw,
+        ''                                                AS ref_no,
+        COALESCE(dmt.material_id, '')                     AS material_id,
+        COALESCE(rm.name, '(unknown item)')               AS material,
+        COALESCE(rm.sku, '')                              AS sku,
+        COALESCE(rm.category, '')                         AS category,
+        -- The filtered department when there is a filter (the side the
+        -- quantity is signed from), else the RECEIVER — where the goods are now.
+        ${DEPT_ID}                                        AS department_id,
+        -- BOTH ends, always: a hand-over is between two departments and
+        -- printing one of them would hide where the goods came from or went.
+        ${SENDER_NAME} || ' → ' || ${RECEIVER_NAME}       AS department,
+        ''                                                AS vendor,
+        ''                                                AS station,
+        ${QTY}                                            AS qty,
+        COALESCE(rm.unit, '')                             AS unit,
+        NULL                                              AS value,
+        -- A pair is written only when the stock moved — both legs in one
+        -- transaction, or neither.
+        1                                                 AS stock_moved,
+        ''                                                AS skip_reason,
+        0                                                 AS needs_unit_review,
+        NULL                                              AS requested_qty,
+        NULL                                              AS effective_qty,
+        NULL                                              AS issued_qty,
+        1                                                 AS snapshot_factor,
+        ${STATUS}                                         AS status,
+        ''                                                AS raised_at,
+        ''                                                AS chef_approved_at,
+        ''                                                AS mgmt_approved_at,
+        COALESCE(dmt.user, '')                            AS actor,
+        TRIM(COALESCE(dmt.notes, '')
+             || ' | department to department: the sender''s books went down and the receiver''s '
+             || 'went up in the same moment; central stock did not move') AS notes,
+        ''                                                AS req_number,
+        ''                                                AS req_item_id,
+        COALESCE(rm.unit, '')                             AS rm_unit,
+        COALESCE(rm.purchase_unit, '')                    AS rm_purchase_unit,
+        COALESCE(rm.pack_size, 1)                         AS rm_pack_size,
+        ''                                                AS line_unit
+      FROM department_material_transactions dmt
+      LEFT JOIN raw_materials rm ON rm.id = dmt.material_id
+      LEFT JOIN departments ds ON ds.id = dmt.department_id
+      WHERE dmt.type IN ('transfer_out', 'transfer_in') AND dmt.type = 'transfer_out'
+        AND ${XDATE} >= ? AND ${XDATE} <= ?
+        ${f.departmentId ? `AND (dmt.department_id = ? OR ${RECEIVER} = ?)` : ''}${matFilter('dmt.material_id')}
+    `);
+    // POSITIONAL, in textual order: the three SELECT-list placeholders (only
+    // under a department filter: department_id, qty, status), then the WHERE.
+    if (persp) params.push(f.departmentId, f.departmentId, f.departmentId);
+    params.push(f.from, f.to);
+    if (f.departmentId) params.push(f.departmentId, f.departmentId);
+    if (f.materialId) params.push(f.materialId);
+  }
+
   return { sql: parts.join('\nUNION ALL\n'), params, stages };
 }
 
@@ -1524,6 +1736,7 @@ export function getIssueLog(
     reversal: 'reversal',
     skip: 'skip',
     consumptionskip: 'skip',
+    transfer: 'transfer',
   };
   const rawStage = s(filters.stage).toLowerCase().replace(/_/g, '');
   const stage: IssueLogStageFilter = STAGE_TOKENS[rawStage] ?? 'all';
@@ -1571,7 +1784,14 @@ export function getIssueLog(
     CONSUMPTION: blankTotal('CONSUMPTION'),
     REVERSAL: blankTotal('REVERSAL'),
     CONSUMPTION_SKIP: blankTotal('CONSUMPTION_SKIP'),
+    TRANSFER: blankTotal('TRANSFER'),
   };
+  // The TRANSFER stage is IN PLAY once the ledger has held a transfer, or when
+  // the caller asked for transfers by name (an explicit "Transfers only" must
+  // answer with a zero, not with silence). Out of play it is absent from the
+  // named totals, from by_stage and from the basis sentence — see the
+  // IssueLogStage note.
+  const transferInPlay = schema.transfers || stage === 'transfer';
   const totals: IssueLogTotals = {
     receipt: byName.RECEIPT,
     requisition: byName.REQUISITION,
@@ -1580,10 +1800,11 @@ export function getIssueLog(
     consumption: byName.CONSUMPTION,
     reversal: byName.REVERSAL,
     consumption_skip: byName.CONSUMPTION_SKIP,
+    ...(transferInPlay ? { transfer: byName.TRANSFER } : {}),
     // THE SAME OBJECTS, not copies — the two views cannot drift apart.
-    by_stage: STAGE_ORDER.map(st => byName[st]),
+    by_stage: STAGE_ORDER.filter(st => st !== 'TRANSFER' || transferInPlay).map(st => byName[st]),
     lines: 0,
-    basis: TOTALS_BASIS,
+    basis: transferInPlay ? TOTALS_BASIS + TOTALS_BASIS_TRANSFER : TOTALS_BASIS,
     stages_present: stages,
   };
 

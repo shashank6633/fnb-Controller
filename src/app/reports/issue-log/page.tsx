@@ -84,7 +84,7 @@ import { todayIST } from '@/lib/format-date';
 import MaterialTypeahead, { type MaterialLite } from '@/components/MaterialTypeahead';
 import {
   ScrollText, Download, AlertTriangle, Info, Loader2, Truck, ClipboardList,
-  ArrowRightLeft, Flame, Link2, CircleSlash, Layers, CalendarDays,
+  ArrowRightLeft, Flame, Link2, CircleSlash, Layers, CalendarDays, Shuffle,
 } from 'lucide-react';
 
 /* ═══════════════════════════════ WIRE CONTRACT ═══════════════════════════════
@@ -93,7 +93,10 @@ import {
  * field names are the contract and must not drift.
  */
 
-type IssueLogStage = 'RECEIPT' | 'REQUISITION' | 'ISSUE' | 'ISSUE_PRELEDGER' | 'CONSUMPTION';
+/** 'TRANSFER' = a department → department hand-over (2026-10-14). The server
+ *  sends that stage only once a transfer exists, so with none this page renders
+ *  exactly as before: no card, no rows, no extra reading note. */
+type IssueLogStage = 'RECEIPT' | 'REQUISITION' | 'ISSUE' | 'ISSUE_PRELEDGER' | 'CONSUMPTION' | 'TRANSFER';
 
 /** '' means "stock moved, nothing was skipped". */
 type SkipReason = '' | 'flag_off' | 'party' | 'unit_review' | string;
@@ -159,6 +162,9 @@ interface IssueLogRow {
   req_item_id: string;
   actor: string;
   notes: string;
+  /** The document's own status. On a TRANSFER row: 'transfer' (no department
+   *  filter), or 'transfer_in' / 'transfer_out' — the filtered department's side. */
+  status?: string;
 }
 
 interface StageTotal {
@@ -215,9 +221,18 @@ const STAGE_META: Record<IssueLogStage, {
     icon: <Flame className="w-4 h-4" />,
     blurb: 'Used up — recipe units',
   },
+  // Between the hand-over from the store and the cooking: goods that came into
+  // one kitchen and were passed to another before anyone used them.
+  TRANSFER: {
+    label: 'Transfer (dept → dept)', short: 'TRANSFER', rank: 3.5,
+    badge: 'bg-[#EAF2F8] text-[#2F5D7C] border-[#CADDEA]',
+    icon: <Shuffle className="w-4 h-4" />,
+    blurb: 'Handed between departments — recipe units',
+  },
 };
 
-const STAGE_ORDER: IssueLogStage[] = ['RECEIPT', 'REQUISITION', 'ISSUE', 'ISSUE_PRELEDGER', 'CONSUMPTION'];
+/** TRANSFER is last: its card appears only when the server sends that stage. */
+const STAGE_ORDER: IssueLogStage[] = ['RECEIPT', 'REQUISITION', 'ISSUE', 'ISSUE_PRELEDGER', 'CONSUMPTION', 'TRANSFER'];
 
 /**
  * The server's pre-ledger stage token. Accepting the human label as well is
@@ -230,6 +245,9 @@ function normStage(raw: string): IssueLogStage {
   const s = String(raw || '').toUpperCase().trim();
   if (s === 'ISSUE_PRELEDGER' || s === 'ISSUE (PRE-LEDGER)' || s === 'PRE_LEDGER' || s === 'PRELEDGER') return 'ISSUE_PRELEDGER';
   if (s === 'RECEIPT' || s === 'REQUISITION' || s === 'ISSUE' || s === 'CONSUMPTION') return s as IssueLogStage;
+  // Named explicitly so a hand-over can never fall through to the
+  // 'CONSUMPTION' fallback below and be read as stock used up.
+  if (s === 'TRANSFER') return 'TRANSFER';
   return 'CONSUMPTION';
 }
 
@@ -250,6 +268,7 @@ const STAGE_FILTERS = [
   { k: 'issue', label: 'Issues only (recorded)' },
   { k: 'preledger', label: 'Pre-ledger issues (reconstructed)' },
   { k: 'consumption', label: 'Consumption only' },
+  { k: 'transfer', label: 'Department transfers only' },
 ] as const;
 type StageFilter = (typeof STAGE_FILTERS)[number]['k'];
 
@@ -440,6 +459,10 @@ export default function IssueLogPage() {
 
   const totals = data?.totals.by_stage || [];
   const anyFilter = !!(departmentId || materialId || vendorQ || reqNumberQ || stage !== 'all');
+  // The server sends a TRANSFER total only once a transfer exists (or when
+  // transfers were asked for), so this is false — and the page unchanged — for
+  // a building that has never transferred.
+  const transferStage = totals.some(t => normStage(t.stage) === 'TRANSFER');
 
   return (
     <div className="min-h-screen bg-[#FFF8F0] text-[#2D1B0E] overflow-x-hidden">
@@ -497,7 +520,12 @@ export default function IssueLogPage() {
             <label className="block min-w-[190px]"><span className="text-[11px] font-semibold text-[#8B7355] uppercase">Stage</span>
               <select value={stage} onChange={e => setStage(e.target.value as StageFilter)}
                 className="mt-1 block w-full px-3 py-2 rounded-lg border border-[#E0D0BE] bg-white text-sm outline-none focus:border-[#af4408]">
-                {STAGE_FILTERS.map(o => <option key={o.k} value={o.k}>{o.label}</option>)}
+                {/* "Department transfers only" is offered once the server has a
+                    TRANSFER stage to answer with (or it is already the choice),
+                    so a building that has never transferred sees the list it
+                    always saw. */}
+                {STAGE_FILTERS.filter(o => o.k !== 'transfer' || transferStage || stage === 'transfer')
+                  .map(o => <option key={o.k} value={o.k}>{o.label}</option>)}
               </select></label>
 
             <button onClick={download} disabled={downloading}
@@ -634,6 +662,12 @@ export default function IssueLogPage() {
             time because those facts were never recorded. They never overlap a recorded issue: together they add back to the line’s issued quantity exactly.</p>
           <p><strong>Consumption is not attributed to a specific issue.</strong> Recipe deduction happens against a material, not against a hand-over, so a consumption row
             links by item only. Anyone tying a specific consumption to a specific issue is guessing.</p>
+          {transferStage && (
+            <p><strong>Transfer</strong> rows are goods handed from one department to another — one row per hand-over, in recipe units.
+              The sender&rsquo;s books went down and the receiver&rsquo;s went up in the same moment; central stock did not move and no
+              money is attached. With a department picked, the quantity is signed from that department&rsquo;s side:
+              <strong> +</strong> received, <strong>−</strong> handed on. Never add a transfer to a receipt, issue or consumption figure.</p>
+          )}
           <p>No GST or cess is included in any figure on this page — receipt value is the goods figure.</p>
         </div>
       </div>
@@ -764,6 +798,15 @@ function LogRow({ r }: { r: IssueLogRow }) {
             <span className="block text-[10px] text-[#B8A48E]">{r.qty_basis === 'line' ? 'line unit' : r.qty_basis === 'recipe' ? 'recipe units' : r.qty_basis || ''}</span>
             {r.purchase_qty != null && r.purchase_unit && (
               <span className="block text-[10px] text-[#8B7355]">= {fmtQty(r.purchase_qty)} {r.purchase_unit}</span>
+            )}
+            {/* A transfer's sign is read from the filtered department's side;
+                say which side in words so a minus is never read as a loss. */}
+            {r.stage === 'TRANSFER' && (
+              <span className="block text-[10px] text-[#2F5D7C]">
+                {r.status === 'transfer_in' ? 'received from the other department'
+                  : r.status === 'transfer_out' ? 'handed to the other department'
+                  : 'moved between departments'}
+              </span>
             )}
           </>
         )}

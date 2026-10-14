@@ -1,30 +1,34 @@
 import { getDb } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
 import { deptTransferableStock } from '@/lib/dept-stock';
-import { fmtQtyNum, toPurchaseQty } from '@/lib/pack-units';
-import { loadDepartments, canSeeDept, canSendFrom } from '../access';
+import { fmtQtyNum } from '@/lib/pack-units';
+import { loadDepartments, canSeeDept, canSendFrom, receiversFor } from '../access';
 
 /**
  * GET /api/department-transfers/holdings?department_id=<id>
  *
- * What ONE department can hand on — the sender's material picker. NOT
- * /api/department-stock: that rolls a main department up over its children,
- * so "Kitchen" there is Kitchen + Akan Tandoori + …, and Kitchen's OWN holding
- * is visible nowhere. This reads exactly one department (dept-stock.ts
- * deptTransferableStock → dept-ledger deptReleasable), the SAME figure the send
- * check enforces, minus what is already promised on pending transfers, so the
- * screen cannot offer a quantity the server will refuse.
+ * What ONE department can hand on — the sender's material picker — and WHERE
+ * it can send it. NOT /api/department-stock: that rolls a main department up
+ * over its children, so "Kitchen" there is Kitchen + Akan Tandoori + …, and
+ * Kitchen's OWN holding is visible nowhere. This reads exactly one department
+ * (dept-stock.ts deptTransferableStock → dept-ledger deptSendable), the SAME
+ * figure the send check enforces, so the screen cannot offer a quantity the
+ * server will refuse.
  *
- * Each row: `transferable_purchase` + `purchase_unit` lead (owner rule);
- * `transferable` / `unit` are the RECIPE figures; `basis` is 'counted' or
- * 'uncounted_ledger_sum' — a never-counted department (Kitchen, in practice)
- * is NOT zero, it is its ledger sum, and the screen must say so (`never_counted`
- * + `basis_label` carry it in words).
+ * Each row: `transferable_purchase` + `purchase_unit` lead (owner rule) —
+ * ROUNDED DOWN to 3 decimals, so the offered figure always converts back to no
+ * more than the server accepts. `transferable` / `unit` are the RECIPE
+ * figures; `basis` is 'counted' or 'uncounted_ledger_sum'.
  *
- * ⚠ `available` is what the department HOLDS (deptReleasable); `transferable`
- * is that minus what is already promised on PENDING transfers out — the most a
- * NEW send may ask for. A picker must cap at `transferable`, or the send is
- * refused with "… is already on pending transfers".
+ * HONEST ABOUT WHAT THE APP CANNOT SEE: a never-counted row is `upper_bound`
+ * — "up to", not "holds" — and when `department.usage_booked_here` is false no
+ * till station books this department's cooking to it, so anything cooked from
+ * this stock never reached its ledger. `basis_label` says it in words a cook
+ * can read; the screen must show it and point at a count.
+ *
+ * `receivers`: every other ACTIVE department, in the owner's order — the
+ * sender's own family first, departments where requisitions land first within
+ * each group (Kitchen → the AKAN-* sub-kitchens). Any may be chosen.
  *
  * department_id defaults to the caller's own department. Visible to anyone who
  * may see that department (../access.ts canSeeDept); `can_send` says whether
@@ -52,27 +56,34 @@ export async function GET(request: Request) {
 
     const result = deptTransferableStock(db, departmentId);
     if (!result) return Response.json({ error: 'Unknown department' }, { status: 404 });
-    // Added, never overriding a library field: `never_counted` and the basis in
-    // words, so no screen prints the raw token 'uncounted_ledger_sum' to a cook.
-    // The figures themselves are deptTransferableStock's, untouched.
+    const usageHere = result.department.usage_booked_here;
+    // Added, never overriding a library field: the basis in words, so no
+    // screen prints the raw token 'uncounted_ledger_sum' to a cook. The figures
+    // themselves are deptTransferableStock's, untouched.
     const rows = result.rows.map((r) => {
-      const never = r.basis !== 'counted';
       const pu = r.purchase_unit || r.unit;
-      const pend = r.pending_out > 1e-9
-        ? ` ${fmtQtyNum(toPurchaseQty(r.pending_out, r))} ${pu} is already on pending transfers out.`
-        : '';
-      return {
-        ...r,
-        never_counted: never,
-        basis_label: (never
-          ? `${dept.name} has never counted this, so this is its ledger figure — everything received minus everything used or sent — not a count.`
-          : `${dept.name}'s last count plus every movement since.`) + pend,
-      };
+      const upTo = `${fmtQtyNum(r.transferable_purchase)} ${pu}`;
+      let label: string;
+      if (r.upper_bound) {
+        label = `Up to ${upTo}. ${dept.name} has never counted this, so this is its ledger — everything received ` +
+          `minus everything used or sent — not a count. ` +
+          (usageHere
+            ? 'Cooking here is deducted at the till, but waste nobody recorded is not.'
+            : `No till station books ${dept.name}'s cooking to it, so whatever was cooked from this stock is NOT taken off here — the shelf may hold less.`) +
+          ` Count it to send an exact figure.`;
+      } else if (r.since_anchor != null && r.since_anchor < (r.on_hand ?? 0)) {
+        label = `${dept.name}'s last count plus every movement since, held to the lower reading because the count is older than the department cutover.`;
+      } else {
+        label = `${dept.name}'s last count plus every movement since.`;
+      }
+      if (r.available < -1e-9) label += ' The ledger is below zero — record a count before sending.';
+      return { ...r, never_counted: r.upper_bound, basis_label: label };
     });
     return Response.json({
       department: { ...result.department, is_active: !!Number(dept.is_active) },
-      can_send: canSendFrom(me, dept, depts),
+      can_send: canSendFrom(me, dept),
       rows,
+      receivers: receiversFor(db, departmentId, depts),
     });
   } catch (e: any) {
     console.error('[department-transfers/holdings GET]', e);

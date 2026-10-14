@@ -1,13 +1,16 @@
 import { getDb } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
 import { getDeptTransfer } from '@/lib/dept-ledger';
-import { loadDepartments, canSeeDept, presentTransfer } from '../access';
+import { loadDepartments, canSeeTransfer, presentTransfer } from '../access';
 
 /**
- * GET /api/department-transfers/<id> — one transfer document with its lines,
- * each quantity in RECIPE units (as stored) and the PURCHASE unit, plus what
- * the caller may do with it. Visible to anyone who may see either end
- * (../access.ts canSeeDept). GET-only — no CSRF surface.
+ * GET /api/department-transfers/<id> — one transfer document with its lines
+ * (each quantity in RECIPE units as stored, and the PURCHASE unit), its
+ * disputes, its reverse links, and what the caller may do with it
+ * (`permissions`: can_flag_dispute, can_reverse + reverse_prefill — the exact
+ * quantities a one-tap reverse would move — and dismissable_dispute_ids).
+ * Visible to anyone who may see either end (../access.ts). GET-only — no CSRF
+ * surface.
  */
 
 export const dynamic = 'force-dynamic';
@@ -22,7 +25,7 @@ export async function GET(_request: Request, { params }: { params: Promise<{ id:
     const doc = getDeptTransfer(db, String(id || ''));
     if (!doc) return Response.json({ error: 'Transfer not found' }, { status: 404 });
     const depts = loadDepartments(db);
-    if (!canSeeDept(me, doc.from_department_id, depts) && !canSeeDept(me, doc.to_department_id, depts)) {
+    if (!canSeeTransfer(me, doc, depts)) {
       return Response.json({ error: 'Not allowed for this transfer' }, { status: 403 });
     }
     return Response.json({ transfer: presentTransfer(me, doc, depts) });

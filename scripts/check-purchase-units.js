@@ -176,6 +176,10 @@ const SCOPE_DIRS = [
   'src/app/closing-stock',
   'src/app/department-materials',
   'src/app/department-consumption',
+  // Department → department transfers (2026-10-14): the screen leads with the
+  // PURCHASE unit through packFactor(); a raw recipe-unit render there would be
+  // the same leak as anywhere else on the stock rail.
+  'src/app/department-transfers',
   'src/app/food-consumption',
   'src/app/party-events',
   'src/app/wastage',

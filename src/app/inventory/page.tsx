@@ -84,6 +84,23 @@ interface DirectDeptStock {
   never_counted: boolean;
   /** RECIPE units. Uncounted ledger movement; tooltip context only. */
   movements_since: number;
+  /** Where the routed kilos went after a department → department transfer.
+   *  ABSENT when this material was never transferred — the cell then renders
+   *  exactly as it did before transfers existed. RECIPE units, display-only,
+   *  never summed with central, the destination or each other. */
+  transfers?: {
+    /** Net handed on by the destination inside its balance window. */
+    passed_on: number;
+    holders: Array<{
+      department_id: string;
+      department_name: string;
+      on_hand: number | null;
+      never_counted: boolean;
+      movements_since: number;
+      /** Net received by transfer inside that department's balance window. */
+      by_transfer: number;
+    }>;
+  };
 }
 
 interface FormData {
@@ -1198,6 +1215,34 @@ export default function InventoryPage() {
                                   {ps > 1 && (
                                     <div className="text-[9px] text-[#B8A590]">
                                       = {fmtQtyNum(m.current_stock)} {m.unit}{dd.on_hand != null ? ` · ${fmtQtyNum(dd.on_hand)} ${m.unit} dept` : ''}
+                                    </div>
+                                  )}
+                                  {/* WHERE THE ROUTED KILOS WENT — only when this
+                                      material has moved between departments
+                                      (Department Transfers). Each figure is its
+                                      own pool, labelled, never added to central,
+                                      to the destination above or to each other. */}
+                                  {dd.transfers && (dd.transfers.passed_on !== 0 || dd.transfers.holders.length > 0) && (
+                                    <div className="text-[10px] text-[#8B7355] font-sans"
+                                         title={`Moved on from ${dd.department_name} by Department Transfers. Each department's figure is held BY that department; none is part of central or of ${dd.department_name}'s figure.`}>
+                                      {dd.transfers.passed_on !== 0 && (
+                                        <span>{dd.department_name} handed on {fmtPU(dd.transfers.passed_on, m)} {pu}</span>
+                                      )}
+                                      {dd.transfers.holders.map((h) => (
+                                        <span key={h.department_id} className="block">
+                                          → {h.department_name}{' '}
+                                          {h.on_hand != null ? (
+                                            <span className="font-mono text-[#3D2614]">{fmtPU(h.on_hand, m)} {pu}</span>
+                                          ) : (
+                                            // NULL is not zero: that department never
+                                            // counted it. Show what reached it by
+                                            // transfer, labelled as such.
+                                            <span className="italic text-[#B8A590]">
+                                              {fmtPU(h.by_transfer, m)} {pu} by transfer · not counted
+                                            </span>
+                                          )}
+                                        </span>
+                                      ))}
                                     </div>
                                   )}
                                 </>

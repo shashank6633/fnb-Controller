@@ -205,12 +205,20 @@ interface Buckets {
   reversals_out: number;
   adjustments_net: number;
   party_net: number;
+  /** DEPARTMENT → DEPARTMENT (2026-10-14). Their OWN buckets, never other_net:
+   *  a transfer is neither usage nor a correction — the goods still exist, on
+   *  another department's ledger — and filing it under the catch-all made a
+   *  Kitchen → Akan Tandoori hand-over read as "unrecognised movement". Both are
+   *  POSITIVE magnitudes like every out-leg here; `net` keeps the sign. */
+  transfer_in: number;
+  transfer_out: number;
   other_net: number;
   net: number;
 }
 const emptyBuckets = (): Buckets => ({
   issued_in: 0, consumption: 0, wastage: 0, staff_meal: 0,
-  reversals_out: 0, adjustments_net: 0, party_net: 0, other_net: 0, net: 0,
+  reversals_out: 0, adjustments_net: 0, party_net: 0,
+  transfer_in: 0, transfer_out: 0, other_net: 0, net: 0,
 });
 
 /** Not exported: a route module's export surface is validated by Next, and a
@@ -526,10 +534,22 @@ export async function GET(request: Request) {
 
       // Buckets over the cutover window. 'opening' rows are the BASE, never a
       // movement — excluded from every bucket and from `net`.
+      //
+      // A TRANSFER LEG IS NOT CUT BY THE FLOOR. The department ledger reads
+      // transfer_out / transfer_in under their own rule (dept-ledger.ts
+      // deptOnHand, "A TRANSFER PAIR IS NEVER SPLIT"): bounded by the pair's
+      // ANCHOR only, never by the cutover — otherwise a cutover stamped after a
+      // hand-over drops one leg and keeps the other. The buckets follow the same
+      // rule so they keep explaining the balance they sit beside: a leg counts
+      // when it is after the floor OR after this pair's anchor (every leg, when
+      // the pair was never counted). Every other type is untouched.
+      const balPre = balances.get(k);
+      const legFrom = balPre && balPre.anchorAt ? String(balPre.anchorAt) : '';
       const b = emptyBuckets();
       for (const row of ledger) {
         if (row.type === 'opening') continue;
-        if (!(row.at > floor)) continue;
+        const isLeg = row.type === 'transfer_in' || row.type === 'transfer_out';
+        if (!(row.at > floor) && !(isLeg && row.at > legFrom)) continue;
         b.net += row.q;
         switch (row.type) {
           case 'issued':         b.issued_in       += row.q;  break;
@@ -542,6 +562,10 @@ export async function GET(request: Request) {
           case 'received':
           case 'consumed':
           case 'returned':       b.party_net       += row.q;  break;   // party rail, own lifecycle
+          // One leg each of a department → department pair (postDeptTransfer).
+          // Magnitudes, like the out-legs above; the sign lives in `net`.
+          case 'transfer_in':    b.transfer_in     += row.q;  break;
+          case 'transfer_out':   b.transfer_out    += -row.q; break;
           default:               b.other_net       += row.q;  break;   // unknown type — visible, never dropped
         }
       }
@@ -645,12 +669,20 @@ export async function GET(request: Request) {
         } else {
           const windowFrom = prior.at > floor ? prior.at : floor;
           const tieRowid = prior.source === 'opening' && windowFrom === prior.at ? prior.rowid : null;
+          // Transfer legs: the baseline alone, never the floor — the ledger's
+          // leg rule (see the bucket note above). Identical to windowFrom
+          // whenever the baseline is a count, since only counts at or after the
+          // cutover qualify as one.
+          const legTie = prior.source === 'opening' ? prior.rowid : null;
           let moved = 0;
           for (const row of ledger) {
             if (row.type === 'opening') continue;            // a base, never a movement
             if (row.at > lastCount.at) continue;             // after the count — not its business
+            const isLeg = row.type === 'transfer_in' || row.type === 'transfer_out';
             const inWindow = row.at > windowFrom
-              || (tieRowid !== null && row.at === windowFrom && row.rid > tieRowid);
+              || (tieRowid !== null && row.at === windowFrom && row.rid > tieRowid)
+              || (isLeg && (row.at > prior.at
+                || (legTie !== null && row.at === prior.at && row.rid > legTie)));
             if (!inWindow) continue;
             moved += row.q;
           }
@@ -694,6 +726,12 @@ export async function GET(request: Request) {
         reversals_out: r4(b.reversals_out),
         adjustments_net: r4(b.adjustments_net),
         party_net: r4(b.party_net),
+        // Only on rows that HAVE a transfer, so a building that has never
+        // transferred gets the payload it always got, key for key. Absent
+        // means zero; the page reads `|| 0`.
+        ...(b.transfer_in !== 0 || b.transfer_out !== 0
+          ? { transfer_in: r4(b.transfer_in), transfer_out: r4(b.transfer_out) }
+          : {}),
         other_net: r4(b.other_net),
         net_movement_since_cutover: r4(b.net),
 

@@ -1,5 +1,6 @@
 import { getDb } from '@/lib/db';
 import { getCurrentOutletId } from '@/lib/auth';
+import { DEPT_TRANSFER_TYPES_SQL } from '@/lib/dept-ledger';
 
 /**
  * Department-wise material consumption analytics.
@@ -26,6 +27,25 @@ import { getCurrentOutletId } from '@/lib/auth';
  * kitchen received — from the main store or vendor-direct). It's
  * analytics-only — does NOT relate to recipe-driven inventory deductions,
  * which run on a separate rail.
+ *
+ * DEPARTMENT → DEPARTMENT TRANSFERS (2026-10-14) ARE A THIRD, SEPARATE COLUMN —
+ * NEVER PART OF total_qty / total_value / qty / value.
+ *   Kitchen receives 10 kg of routed chicken by Direct Issue (rail 2 above: it
+ *   is already in Kitchen's total) and hands 4 kg to Akan Tandoori. Adding that
+ *   4 kg to Tandoori's total as well would count the same kilos twice — the
+ *   building took in 10, not 14. So a transfer rides in its own fields:
+ *     transfer_in_qty / transfer_in_value    what this department RECEIVED from
+ *                                            another department
+ *     transfer_out_qty / transfer_out_value  what it HANDED to another one
+ *   (RECIPE units, positive magnitudes, valued at average_price like rail 2).
+ *   by_department carries the two VALUES only: its materials are in different
+ *   units, so a quantity summed across them would add g to ml.
+ *   top_materials and trend_by_day are building-wide inflow and carry no
+ *   transfer at all: inside the building a transfer nets to zero.
+ *   Every transfer field is present ONLY when the window holds a transfer, so a
+ *   building that has never transferred gets this payload exactly as before.
+ *   A department or (department, material) pair that only moved by transfer
+ *   appears with zero totals and its transfer fields — the honest reading.
  *
  * Query params:
  *   from, to        date range, default last 30 days
@@ -87,6 +107,54 @@ function directInflowRows(
       JOIN raw_materials rm ON rm.id = dmt.material_id
       LEFT JOIN departments d ON d.id = dmt.department_id
       LEFT JOIN purchases  p ON p.id = dmt.reference_id
+      WHERE ${where.join(' AND ')}
+      GROUP BY day, dmt.department_id, dmt.material_id
+    `).all(...params) as any[];
+  } catch {
+    return [];
+  }
+}
+
+/** Per (day, department, material) department → department transfer legs
+ *  inside the window, RECIPE units, as POSITIVE magnitudes: `qty_in` from
+ *  'transfer_in' rows, `qty_out` from 'transfer_out' rows. Day = the business
+ *  date both legs carry (txn_date, IST — postDeptTransfer always stamps it),
+ *  else the ledger row's own UTC date. Never merged into the inflow rails: see
+ *  the header. try/catch to [] for the same reason directInflowRows has one. */
+function transferRows(
+  db: any,
+  f: { from: string; to: string; outletId: string | null; departmentId: string; categoryF: string; materialId: string },
+): any[] {
+  const DAY = `COALESCE(NULLIF(SUBSTR(dmt.txn_date, 1, 10), ''), SUBSTR(REPLACE(dmt.created_at, 'T', ' '), 1, 10))`;
+  const where: string[] = [
+    `dmt.type IN (${DEPT_TRANSFER_TYPES_SQL})`,
+    `${DAY} BETWEEN ? AND ?`,
+  ];
+  const params: any[] = [f.from, f.to];
+  if (f.outletId)     { where.push('(dmt.outlet_id = ? OR dmt.outlet_id IS NULL)'); params.push(f.outletId); }
+  if (f.departmentId) { where.push('dmt.department_id = ?'); params.push(f.departmentId); }
+  if (f.categoryF)    { where.push('rm.category = ?');       params.push(f.categoryF); }
+  if (f.materialId)   { where.push('dmt.material_id = ?');   params.push(f.materialId); }
+  try {
+    return db.prepare(`
+      SELECT ${DAY}                                        AS day,
+             dmt.department_id                             AS department_id,
+             COALESCE(d.name, '—')                         AS department_name,
+             COALESCE(d.code, '')                          AS department_code,
+             dmt.material_id                               AS material_id,
+             rm.name                                       AS material_name,
+             rm.sku                                        AS material_sku,
+             rm.unit                                       AS unit,
+             COALESCE(rm.category, '')                     AS category,
+             COALESCE(rm.average_price, 0)                 AS average_price,
+             COALESCE(NULLIF(TRIM(rm.purchase_unit), ''), rm.unit) AS purchase_unit,
+             COALESCE(rm.pack_size, 1)                     AS pack_size,
+             SUM(CASE WHEN dmt.type = 'transfer_in'  THEN  dmt.quantity ELSE 0 END) AS qty_in,
+             SUM(CASE WHEN dmt.type = 'transfer_out' THEN -dmt.quantity ELSE 0 END) AS qty_out,
+             COUNT(*)                                      AS line_count
+      FROM department_material_transactions dmt
+      JOIN raw_materials rm ON rm.id = dmt.material_id
+      LEFT JOIN departments d ON d.id = dmt.department_id
       WHERE ${where.join(' AND ')}
       GROUP BY day, dmt.department_id, dmt.material_id
     `).all(...params) as any[];
@@ -242,6 +310,38 @@ export async function GET(request: Request) {
         totQty += dQty; totVal += dVal;
       }
 
+      // ── TRANSFERS: their own fields on the row, NEVER g.qty / g.value / the
+      // totals above (see the header — the kilos are already in the department
+      // that first took them in). A (date, department, material) that moved
+      // only by transfer gets a row of its own with qty 0 and req_count 0. The
+      // day/department/material census above deliberately does not count it:
+      // those three figures describe inflow to the building.
+      let xferRows = 0, xferInVal = 0, xferOutVal = 0;
+      for (const row of transferRows(db, { from, to, outletId, departmentId, categoryF, materialId })) {
+        const tIn = Number(row.qty_in) || 0;
+        const tOut = Number(row.qty_out) || 0;
+        if (Math.abs(tIn) < 1e-9 && Math.abs(tOut) < 1e-9) continue;
+        const day = String(row.day || '').slice(0, 10);
+        const key = day + '|' + (row.department_id || '') + '|' + row.material_id;
+        let g = map.get(key);
+        if (!g) {
+          g = { date: day, department_id: row.department_id || '', department_name: row.department_name || '—',
+                material_id: row.material_id, material_name: row.material_name, unit: row.unit, category: row.category || '',
+                purchase_unit: row.purchase_unit || row.unit, pack_div: packDivOf(row),
+                qty: 0, value: 0, reqs: new Set<string>() };
+          map.set(key, g);
+        }
+        const price = Number(row.average_price) || 0; // rate-basis: recipe (ledger qty is RECIPE units; average_price is ₹/recipe-unit)
+        g.transfer_in_qty = (g.transfer_in_qty || 0) + tIn;
+        g.transfer_out_qty = (g.transfer_out_qty || 0) + tOut;
+        g.transfer_in_value = (g.transfer_in_value || 0) + tIn * price;
+        g.transfer_out_value = (g.transfer_out_value || 0) + tOut * price;
+        g.has_transfer = true;
+        xferInVal += tIn * price; xferOutVal += tOut * price;
+      }
+
+      const r3x = (n: number) => Math.round((Number(n) || 0) * 1000) / 1000;
+      const r2x = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
       const regRows = [...map.values()]
         .map(g => ({ date: g.date, department_id: g.department_id, department_name: g.department_name,
           material_id: g.material_id, material_name: g.material_name, unit: g.unit, category: g.category,
@@ -250,12 +350,24 @@ export async function GET(request: Request) {
           direct_qty: Math.round((g.direct_qty || 0) * 1000) / 1000,
           // PURCHASE basis for display (rounded derivative — never summed)
           qty_purchase: Math.round((g.qty / g.pack_div) * 1000) / 1000,
-          purchase_unit: g.purchase_unit, pack_factor: g.pack_div }))
+          purchase_unit: g.purchase_unit, pack_factor: g.pack_div,
+          // Department → department, ONLY on a row that has one (see header).
+          ...(g.has_transfer ? {
+            transfer_in_qty: r3x(g.transfer_in_qty), transfer_out_qty: r3x(g.transfer_out_qty),
+            transfer_in_value: r2x(g.transfer_in_value), transfer_out_value: r2x(g.transfer_out_value),
+            transfer_in_qty_purchase: r3x((g.transfer_in_qty || 0) / g.pack_div),
+            transfer_out_qty_purchase: r3x((g.transfer_out_qty || 0) / g.pack_div),
+          } : {}) }))
         .sort((a, b) => b.date.localeCompare(a.date) || a.department_name.localeCompare(b.department_name) || b.value - a.value);
+      for (const r of regRows) if ('transfer_in_qty' in r) xferRows++;
       return Response.json({
         view: 'register', range: { from, to }, rows: regRows,
         totals: { rows: regRows.length, total_qty: Math.round(totQty * 1000) / 1000, total_value: Math.round(totVal * 100) / 100,
-          days: days.size, departments: depts.size, materials: mats.size },
+          days: days.size, departments: depts.size, materials: mats.size,
+          // Transfer census — ONLY when the window holds one. Values, not a
+          // cross-material quantity (that would add g to ml). NOT inside
+          // total_value: the goods were counted when they first came in.
+          ...(xferRows > 0 ? { transfer_rows: xferRows, transfer_in_value: r2x(xferInVal), transfer_out_value: r2x(xferOutVal) } : {}) },
       });
     }
 
@@ -506,6 +618,87 @@ export async function GET(request: Request) {
       byDeptMatAny.sort((a, b) => (Number(b.value) || 0) - (Number(a.value) || 0));
       topMatAny.sort((a, b) => (Number(b.total_value) || 0) - (Number(a.total_value) || 0));
       trendAny.sort((a, b) => String(a.date).localeCompare(String(b.date)));
+    }
+
+    // ── TRANSFERS: their OWN fields, never inside total_qty / total_value /
+    // qty / value (see the header — the kilos were counted where they first came
+    // in). Only by_department and by_department_material carry them; the
+    // building-wide aggregates (summary totals, top_materials, trend_by_day)
+    // are untouched because inside the building a transfer nets to zero.
+    // Everything here is skipped when the window holds no transfer, so the
+    // payload is then exactly what it was before transfers existed.
+    const xferRows = transferRows(db, { from, to, outletId, departmentId, categoryF, materialId })
+      .filter((row) => Math.abs(Number(row.qty_in) || 0) >= 1e-9 || Math.abs(Number(row.qty_out) || 0) >= 1e-9);
+    if (xferRows.length > 0) {
+      const r3 = (n: number) => Math.round((Number(n) || 0) * 1000) / 1000;
+      const r2 = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
+      const deptRow = new Map<string, any>(byDeptAny.map((r) => [String(r.department_id), r]));
+      const deptMatRow = new Map<string, any>(byDeptMatAny.map((r) => [`${r.department_id}|${r.material_id}`, r]));
+      const touched = new Set<any>();
+      const touchedDept = new Set<any>();
+      let inVal = 0, outVal = 0;
+      const xferDepts = new Set<string>();
+
+      for (const row of xferRows) {
+        const tIn = Number(row.qty_in) || 0;
+        const tOut = Number(row.qty_out) || 0;
+        const price = Number(row.average_price) || 0; // rate-basis: recipe (ledger qty is RECIPE units; average_price is ₹/recipe-unit)
+        const deptId = String(row.department_id || '');
+        const matId = String(row.material_id);
+        inVal += tIn * price; outVal += tOut * price;
+        xferDepts.add(deptId);
+
+        // by_department — a department that only moved by transfer gets a row
+        // with zero inflow totals and its transfer fields.
+        let dr = deptRow.get(deptId);
+        if (!dr) {
+          dr = { department_id: deptId, department_name: row.department_name, code: row.department_code,
+                 requisition_count: 0, material_count: 0, line_count: 0, total_qty: 0, total_value: 0 };
+          deptRow.set(deptId, dr); byDeptAny.push(dr);
+        }
+        // VALUES ONLY on a department row: its materials are in different
+        // units, and a cross-material quantity would add g to ml.
+        dr.transfer_in_value = (dr.transfer_in_value || 0) + tIn * price;
+        dr.transfer_out_value = (dr.transfer_out_value || 0) + tOut * price;
+        touchedDept.add(dr);
+
+        // by_department_material
+        const dmKey = `${deptId}|${matId}`;
+        let dm = deptMatRow.get(dmKey);
+        if (!dm) {
+          dm = { department_id: deptId, department_name: row.department_name,
+                 material_id: matId, material_name: row.material_name, material_sku: row.material_sku,
+                 material_unit: row.unit, category: row.category,
+                 material_purchase_unit: row.purchase_unit, material_pack_size: row.pack_size,
+                 qty: 0, value: 0, line_count: 0 };
+          deptMatRow.set(dmKey, dm); byDeptMatAny.push(dm);
+        }
+        dm.transfer_in_qty = (dm.transfer_in_qty || 0) + tIn;
+        dm.transfer_out_qty = (dm.transfer_out_qty || 0) + tOut;
+        dm.transfer_in_value = (dm.transfer_in_value || 0) + tIn * price;
+        dm.transfer_out_value = (dm.transfer_out_value || 0) + tOut * price;
+        touched.add(dm);
+      }
+      for (const r of touched) {
+        r.transfer_in_qty = r3(r.transfer_in_qty); r.transfer_out_qty = r3(r.transfer_out_qty);
+        r.transfer_in_value = r2(r.transfer_in_value); r.transfer_out_value = r2(r.transfer_out_value);
+      }
+      for (const r of touchedDept) {
+        r.transfer_in_value = r2(r.transfer_in_value); r.transfer_out_value = r2(r.transfer_out_value);
+      }
+      // Rows that exist ONLY because of a transfer carry total_value 0, so the
+      // value sort already puts them last; the sort is re-run because they were
+      // appended after it.
+      byDeptAny.sort((a, b) => (Number(b.total_value) || 0) - (Number(a.total_value) || 0));
+      byDeptMatAny.sort((a, b) => (Number(b.value) || 0) - (Number(a.value) || 0));
+      // A census beside the totals, never inside them. Values only — a
+      // cross-material quantity would add g to ml. summary.departments /
+      // materials stay the INFLOW census they always were.
+      summaryAny.transfers = {
+        departments: xferDepts.size,
+        in_value: r2(inVal),
+        out_value: r2(outVal),
+      };
     }
 
     return Response.json({

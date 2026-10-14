@@ -545,14 +545,21 @@ export async function POST(request: Request) {
        * balance for good. windowFrom comes from deptOnHand — the SAME resolver
        * the balance uses — so this guard and the balance can never disagree
        * about where the window starts. */
+      /* TRANSFER LEGS count from the COUNT itself, not the window: a
+       * transfer_out / transfer_in is never cut by the cutover floor
+       * (dept-ledger deptOnHand, "A TRANSFER PAIR IS NEVER SPLIT"), so a leg
+       * between an old count and the floor IS in this pair's balance — and an
+       * opening written now would drop it while its twin stays on the other
+       * department. Same rule, fourth place it is implemented. */
       if (adopt) {
         const bal = deptOnHand(db, departmentId, m.id);
         if (bal.anchorSource === 'count' && bal.windowFrom) {
           const moved = db.prepare(`
             SELECT COUNT(*) AS n FROM department_material_transactions
              WHERE department_id = ? AND material_id = ? AND type <> 'opening'
-               AND ${LEDGER_TS_SQL} > ?
-          `).get(departmentId, m.id, bal.windowFrom) as { n: number } | undefined;
+               AND (${LEDGER_TS_SQL} > ?
+                    OR (type IN ('transfer_out', 'transfer_in') AND ${LEDGER_TS_SQL} > ?))
+          `).get(departmentId, m.id, bal.windowFrom, bal.anchorAt || bal.windowFrom) as { n: number } | undefined;
           const n = Number(moved?.n) || 0;
           if (n > 0) {
             movedSinceCount.push({ material_id: m.id, name: m.name, moved_rows: n, count_at: bal.windowFrom });

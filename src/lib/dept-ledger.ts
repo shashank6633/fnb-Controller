@@ -58,9 +58,10 @@ import { packFactor, toPurchaseQty, type PackMeta } from './pack-units';
  * the cache update and your own writes roll back together. A throw from here is
  * DESIGNED to roll your transaction back — see assertReversible().
  * THE ONE EXCEPTION is the department-transfer section at the foot of the file
- * (postDeptTransfer / createDeptTransfer / receiveDeptTransfer /
- * cancelDeptTransfer): a transfer is TWO ledger rows that must never exist one
- * without the other, so each of those wraps itself in db.transaction() —
+ * (postDeptTransfer / sendDeptTransfer / reverseDeptTransfer /
+ * flagDeptTransferDispute / resolveDeptTransferDisputes): a transfer is TWO
+ * ledger rows that must never exist one without the other, so each of those
+ * wraps itself in db.transaction() —
  * IMMEDIATE standalone, a SAVEPOINT when you call it inside your own. Still
  * synchronous: never await inside any of them, or around them inside yours.
  *
@@ -629,13 +630,50 @@ interface AnchorPick {
  * THE CUTOVER FLOOR IS NOT DECORATION. It is what makes decision D (no
  * backfill) real: a count backdated past the cutover moves the anchor back but
  * still cannot pull pre-cutover movement into the balance.
+ *
+ * ── A TRANSFER PAIR IS NEVER SPLIT — THE ONE EXCEPTION TO THE FLOOR ─────────
+ * The two legs of a department → department transfer (transfer_out on the
+ * sender, transfer_in on the receiver, written together by postDeptTransfer)
+ * live in two DIFFERENT (department, material) pairs, each read under its own
+ * rule: a counted pair by the window above, a never-counted pair by its
+ * all-time ledger sum (deptReleasable). If the cutover floor could cut one leg
+ * and not the other, the same kilos would sit in two departments (the
+ * sender's −q dropped, the receiver's +q kept) or in none (the reverse) — and
+ * the send check would then let more leave a shelf than is on it. Measured
+ * before this rule (round-1 floor.cjs, reproduced in xfer-r2-ledger): X1 26.8
+ * kg on the books from 23.8 physical; X2 4 kg in no ledger at all.
+ *
+ *   THE RULE, decided once, here: a transfer leg is bounded ONLY by its own
+ *   department's ANCHOR — the physical count or opening row for that pair —
+ *   and NEVER by the cutover floor. A never-counted pair counts every leg it
+ *   has (no bound), which is exactly what its all-time sum already does.
+ *   Every other movement type keeps the window above, unchanged.
+ *
+ * Why that conserves whatever order things happen in:
+ *   transfer, then floor stamped   → both legs stay visible (the floor is
+ *                                    ignored for legs) — X1 and X2.
+ *   floor, then transfer           → both legs are after the floor anyway.
+ *   count/opening, then transfer   → the leg is after its anchor: visible.
+ *   transfer, then count/opening   → that side's leg is ABSORBED by the count,
+ *                                    which measured the shelf with the goods
+ *                                    already on (or already off) it; the other
+ *                                    side's leg stands. A count is the truth
+ *                                    for its own department, never a split.
+ * Only a physical count can ever absorb a leg, and only on its own side.
+ *
+ * Nothing in production carries a transfer leg yet, so every balance that does
+ * not involve a transfer is byte-identical to before this rule. Implemented in
+ * the four places that window the ledger, and nowhere else: sumMovements
+ * (this function), deptOnHandBulk, dept-stock.ts computeDeptStock, and the
+ * cutover route's adopt-trap count. Change one, change all four.
  */
 export function deptOnHand(db: Database.Database, departmentId: string, materialId: string): DeptOnHandResult {
   const deptId = String(departmentId || '');
   const matId = String(materialId || '');
-  const { anchor, windowFrom, tieRowid } = anchorWindow(db, deptId, matId);
+  const w = anchorWindow(db, deptId, matId);
+  const { anchor, windowFrom } = w;
 
-  const movementsSince = sumMovements(db, deptId, matId, windowFrom, tieRowid);
+  const movementsSince = sumMovements(db, deptId, matId, w);
   const cacheRow = db.prepare(
     'SELECT on_hand FROM department_materials WHERE department_id = ? AND material_id = ?',
   ).get(deptId, matId) as { on_hand: number } | undefined;
@@ -665,6 +703,20 @@ interface AnchorWindow {
   windowFrom: string;
   /** Same-second tie-break, or null when it must not apply. */
   tieRowid: number | null;
+  /** THE TRANSFER-LEG WINDOW (see "A TRANSFER PAIR IS NEVER SPLIT" on
+   *  deptOnHand): the anchor alone, never the cutover floor. '' (no bound)
+   *  when the pair was never counted. */
+  legFrom: string;
+  /** Same-second tie-break for the leg window — an OPENING anchor only (it is
+   *  a ledger row with a rowid); a count is not, and strict `>` applies. */
+  legTieRowid: number | null;
+}
+
+/** The transfer leg types, inline for SQL. Kept literal (not built from
+ *  DEPT_TRANSFER_TYPES, declared further down) so this block reads alone. */
+const TRANSFER_LEG_SQL = `'transfer_out', 'transfer_in'`;
+function isTransferLegType(t: unknown): boolean {
+  return t === 'transfer_out' || t === 'transfer_in';
 }
 
 /**
@@ -683,7 +735,11 @@ function anchorWindow(db: Database.Database, deptId: string, matId: string): Anc
   // row is already outside the window and a rowid arm at the floor's timestamp
   // would re-admit rows the floor is there to exclude.
   const tieRowid = anchor && anchor.source === 'opening' && windowFrom === anchor.at ? anchor.rowid : null;
-  return { anchor, windowFrom, tieRowid };
+  // Transfer legs: the anchor only — never the floor (deptOnHand, "A TRANSFER
+  // PAIR IS NEVER SPLIT"). Never counted → '' = every leg.
+  const legFrom = anchor ? anchor.at : '';
+  const legTieRowid = anchor && anchor.source === 'opening' ? anchor.rowid : null;
+  return { anchor, windowFrom, tieRowid, legFrom, legTieRowid };
 }
 
 function latestCount(db: Database.Database, deptId: string, matId: string): AnchorPick | null {
@@ -737,21 +793,25 @@ function pickAnchor(count: AnchorPick | null, opening: AnchorPick | null): Ancho
  * as the cutover opening — a kitchen's first minute of trading — would be
  * dropped from the balance while still sitting in the cache, and the drift
  * check would fire on day one with nothing actually wrong.
+ *
+ * THE SECOND ARM is the transfer-leg rule (deptOnHand, "A TRANSFER PAIR IS
+ * NEVER SPLIT"): a transfer_out / transfer_in row also counts when it is after
+ * the ANCHOR, even if it is before the cutover floor. It adds nothing for any
+ * other type, so a ledger without transfer legs sums exactly as it always did.
  */
-function sumMovements(
-  db: Database.Database, deptId: string, matId: string, windowFrom: string, tieRowid: number | null,
-): number {
+function sumMovements(db: Database.Database, deptId: string, matId: string, w: AnchorWindow): number {
   try {
-    const row = tieRowid == null
-      ? db.prepare(`
-          SELECT COALESCE(SUM(quantity), 0) AS s FROM department_material_transactions
-           WHERE department_id = ? AND material_id = ? AND ${LEDGER_TS_SQL} > ?
-        `).get(deptId, matId, windowFrom)
-      : db.prepare(`
-          SELECT COALESCE(SUM(quantity), 0) AS s FROM department_material_transactions
-           WHERE department_id = ? AND material_id = ?
-             AND (${LEDGER_TS_SQL} > ? OR (${LEDGER_TS_SQL} = ? AND rowid > ?))
-        `).get(deptId, matId, windowFrom, windowFrom, tieRowid);
+    const row = db.prepare(`
+      SELECT COALESCE(SUM(quantity), 0) AS s FROM department_material_transactions
+       WHERE department_id = @d AND material_id = @m
+         AND (
+              ${LEDGER_TS_SQL} > @wf
+           OR (@tie IS NOT NULL AND ${LEDGER_TS_SQL} = @wf AND rowid > @tie)
+           OR (type IN (${TRANSFER_LEG_SQL}) AND (
+                   ${LEDGER_TS_SQL} > @lf
+                OR (@ltie IS NOT NULL AND ${LEDGER_TS_SQL} = @lf AND rowid > @ltie)))
+         )
+    `).get({ d: deptId, m: matId, wf: w.windowFrom, tie: w.tieRowid, lf: w.legFrom, ltie: w.legTieRowid });
     return r6(Number((row as { s: number } | undefined)?.s) || 0);
   } catch { return 0; }
 }
@@ -822,21 +882,28 @@ export function deptOnHandBulk(
   //    window. One pass; the department ledger starts empty at the cutover, so
   //    this stays small for a long time. If it ever does not, push the window
   //    into a CTE — but keep ONE implementation of the arithmetic.
+  //    Transfer legs use the leg window (anchor only, never the floor) — the
+  //    rule documented on deptOnHand, "A TRANSFER PAIR IS NEVER SPLIT".
   const sums = new Map<string, number>();
   const cache = new Map<string, number>();
   try {
     const rows = db.prepare(`
-      SELECT rowid AS rid, department_id, material_id, quantity, ${LEDGER_TS_SQL} AS at
+      SELECT rowid AS rid, department_id, material_id, type, quantity, ${LEDGER_TS_SQL} AS at
         FROM department_material_transactions
        WHERE department_id IN (SELECT value FROM json_each(?)) ${matFilter}
-    `).all(deptJson, ...matParams) as Array<{ rid: number; department_id: string; material_id: string; quantity: number; at: string }>;
+    `).all(deptJson, ...matParams) as Array<{ rid: number; department_id: string; material_id: string; type: string; quantity: number; at: string }>;
     for (const r of rows) {
       const k = deptKey(r.department_id, r.material_id);
       const a = anchors.get(k) || null;
       const windowFrom = a ? (a.at > floor ? a.at : floor) : floor;
       const tieRowid = a && a.source === 'opening' && windowFrom === a.at ? a.rowid : null;
       const at = String(r.at);
-      const inWindow = at > windowFrom || (tieRowid != null && at === windowFrom && Number(r.rid) > tieRowid);
+      let inWindow = at > windowFrom || (tieRowid != null && at === windowFrom && Number(r.rid) > tieRowid);
+      if (!inWindow && isTransferLegType(r.type)) {
+        const legFrom = a ? a.at : '';
+        const legTie = a && a.source === 'opening' ? a.rowid : null;
+        inWindow = at > legFrom || (legTie != null && at === legFrom && Number(r.rid) > legTie);
+      }
       if (!inWindow) continue;
       sums.set(k, (sums.get(k) || 0) + (Number(r.quantity) || 0));
     }
@@ -1173,58 +1240,59 @@ function fmt(n: number): string {
 }
 
 /* ════════════════════════════════════════════════════════════════════════════
- * DEPARTMENT → DEPARTMENT TRANSFER
+ * DEPARTMENT → DEPARTMENT TRANSFER — ONE STEP (owner's ruling, final)
  *
  * WHY THIS EXISTS. Direct Issue rules route MEAT / POULTRY / SEAFOOD deliveries
  * straight onto KITCHEN's department ledger (type direct_receipt). Every
  * requisition for those categories comes from Kitchen's CHILDREN (Akan Main
  * Kitchen, Akan Tandoori, …), and a child never sees its parent's stock —
- * resolveDeptSet() rolls DOWNWARD only. Until this section the ledger had no
- * department-to-department movement at all, so routed stock sat in Kitchen and
- * the sub-kitchens could not get it. The owner's decision: Kitchen receives the
- * delivery, then HANDS stock to the sub-kitchens.
+ * resolveDeptSet() rolls DOWNWARD only. The owner's decision: Kitchen receives
+ * the delivery, then HANDS stock to the sub-kitchens.
+ *
+ * ONE STEP. The moment a transfer is SENT the sender's ledger goes down and the
+ * receiver's goes up, in ONE synchronous transaction (sendDeptTransfer →
+ * postDeptTransfer per line). There is NO pending state, no "confirm receipt",
+ * no waiting list. The receiver sees it under "Transfers in" and may FLAG A
+ * DISPUTE — short, wrong item, not received — with a reason. A flag RECORDS
+ * the dispute (and the route alerts the sender's head and managers); it moves
+ * NO stock. The correction is a REVERSE transfer (receiver → sender, one tap
+ * from the disputed row, prefilled with the disputed quantity), which is an
+ * ordinary one-step transfer through the same writer and the same checks.
  *
  * THE LAW THIS SECTION EXISTS TO KEEP — NO DOUBLE COUNT. One physical kilo
  * lives in exactly one ledger. A transfer is a DEBIT on the sender's department
  * ledger (transfer_out, −q) and a CREDIT on the receiver's (transfer_in, +q),
- * in ONE synchronous transaction, sharing one reference_id. Central
- * (raw_materials.current_stock / inventory_transactions) is never read for a
- * decision and never written. There is no in-transit state: between "sent" and
- * "received" the kilo stays on the SENDER's ledger (a pending transfer document
- * moves nothing), and at "received" it moves in one step. That is deliberately
- * NOT the store→store model (store-engine.ts debits at issue and credits at
- * receive, so in between the bottle is in neither ledger).
+ * in ONE synchronous transaction, sharing one reference_id (the transfer line
+ * id). Central (raw_materials.current_stock / inventory_transactions) is never
+ * read for a decision and never written. No floor, count or cutover can split
+ * the pair afterwards — see "A TRANSFER PAIR IS NEVER SPLIT" on deptOnHand.
  *
  * UNITS. Every ledger quantity is RECIPE units. A person types PURCHASE units
  * (owner rule: screens lead with the purchase unit); the entry is converted
  * ONCE, at the door, by transferQtyToRecipe() → packFactor() from
  * pack-units.ts. Nothing below converts a second time, and nothing imports
- * issue-stock.ts's lineFactor (another branch is rewriting that file).
+ * issue-stock.ts (another branch owns that file).
  *
- * NEVER COUNTED IS NOT ZERO. A department balance before its first count is
- * NULL. Kitchen is, in practice, never counted — its closing sheet lists only
- * items it requisitioned, and it requisitions none of the routed categories —
- * so a refuse-on-NULL guard (wastage's rule) would block EVERY transfer. The
- * rule used instead is deptReleasable(): the counted balance when there is
- * one, else the all-time signed ledger sum. It is the SAME rule the reversal
- * guard (assertReversible) has always used for its capDept, now one function
- * shared by both, so "may stock leave this department" has one answer.
+ * NEVER COUNTED IS NOT ZERO — AND NOT A FIGURE THE APP CAN VOUCH FOR. A
+ * department balance before its first count is NULL. Kitchen is, in practice,
+ * never counted, so a refuse-on-NULL guard would block every transfer. The
+ * send check reads deptSendable(): the most conservative figure the ledger
+ * supports — the counted balance (capped by the anchor plus every movement
+ * since it, whichever is lower), or, never counted, the all-time signed ledger
+ * sum. For a never-counted department whose cooking is booked to ANOTHER
+ * department (the owner's station map books KOT consumption to the top-level
+ * Tandoor / Indian / …), that sum cannot see what was cooked: it is an UPPER
+ * BOUND, flagged `upperBound`, and the holdings screen must say so.
  *
- * THE ANCHOR HAZARD. The two legs sit in two different (department, material)
- * pairs, each with its OWN anchor and window. A leg whose created_at is not
- * strictly after its pair's window start is invisible to the balance — the kilo
- * would leave the sender and land in ZERO ledgers. postDeptTransfer refuses up
- * front when either window starts at or after the posting second, and then
- * PROVES the outcome: it re-reads both balances inside the transaction and
- * throws (rolling everything back) unless the sender moved by exactly −q and the
- * receiver by exactly +q. created_at is never backdated; txn_date carries the
- * business date.
+ * IDEMPOTENCY. Every send (and every reverse) carries a CLIENT KEY the screen
+ * mints once per tray. A retry after a lost response finds the document that
+ * key already made and gets it back (duplicate: true) — it never writes a
+ * second transfer. The same key with a DIFFERENT request is refused (409): a
+ * key names one transfer, forever. A UNIQUE index backs the lookup.
  *
- * WHAT THIS SECTION DOES NOT DECIDE: who may send, receive or cancel. That is
- * the route's job (session user, department membership, HOD/admin). This
- * section enforces DATA invariants only — and one of them is the QC-style
- * "the receiver may not be the sender" rule, which needs a written override
- * reason the route must only accept from a user it has authorised to give one.
+ * WHAT THIS SECTION DOES NOT DECIDE: who may send, flag, dismiss or reverse.
+ * That is the route's job (session user, department head, HOD posted there,
+ * managers, admin). This section enforces DATA invariants only.
  * ════════════════════════════════════════════════════════════════════════════ */
 
 /** How deptReleasable() arrived at its figure. Show it on screen. */
@@ -1241,9 +1309,9 @@ export interface DeptReleasable {
 }
 
 /**
- * THE ONE ANSWER to "how much may leave this department", for a reversal back
- * to central (assertReversible's capDept) and a transfer to another department
- * alike.
+ * "How much may go back to CENTRAL from this department" — assertReversible's
+ * capDept. Unchanged from production on purpose: the reversal guard sits on
+ * the requisition undo/return paths, which this branch must not move.
  *
  *   counted        → deptOnHand().onHand — the count is the truth.
  *   never counted  → the ALL-TIME signed ledger sum: everything this rail has
@@ -1256,8 +1324,10 @@ export interface DeptReleasable {
  * never-counted pair has NO opening row — the cutover count did not cover it —
  * so its pre-floor direct receipts were never absorbed into any count, and
  * movementsSince would silently drop real kilos Kitchen is still holding. The
- * all-time sum keeps them. If you change this rule, change it HERE: both the
- * reversal guard and the transfer guard read it.
+ * all-time sum keeps them.
+ *
+ * A TRANSFER reads deptSendable() below, which is this figure made more
+ * conservative where the ledger allows (never less conservative).
  */
 export function deptReleasable(bal: DeptOnHandResult, rawSum: number): DeptReleasable {
   const ledgerSum = r6(rawSum);
@@ -1279,8 +1349,82 @@ export function deptReleasableFor(db: Database.Database, departmentId: string, m
  *  department — no roll-up: a parent's figure must never include what its
  *  children hold, or Kitchen could hand on Akan Tandoori's stock. */
 export function deptReleasableBulk(db: Database.Database, departmentId: string): Map<string, DeptReleasable> {
-  const deptId = String(departmentId || '');
   const out = new Map<string, DeptReleasable>();
+  for (const [matId, s] of deptSendableBulk(db, departmentId)) {
+    out.set(matId, { available: s.releasable, basis: s.basis, onHand: s.onHand, ledgerSum: s.ledgerSum });
+  }
+  return out;
+}
+
+/* ── THE SEND FIGURE ────────────────────────────────────────────────────── */
+
+export interface DeptSendable extends DeptReleasable {
+  /** deptReleasable().available, before the conservative cap. */
+  releasable: number;
+  /**
+   * Counted pairs whose count is OLDER than the cutover floor: the anchor plus
+   * EVERY movement after it, the floor ignored. NULL when it cannot differ
+   * from the balance (never counted, or the anchor is after the floor).
+   */
+  sinceAnchor: number | null;
+  /**
+   * TRUE when the figure is one the app cannot vouch for: the pair was never
+   * counted, so stock cooked here but booked to another department (or to
+   * none) is invisible and the real shelf may hold less. Screens must say
+   * "up to", never "holds".
+   */
+  upperBound: boolean;
+}
+
+/**
+ * THE most conservative figure the ledger supports for "may this leave by
+ * transfer". Two readings of a counted pair can disagree when its count is
+ * older than the cutover floor: the balance (count + movements after the
+ * floor, + transfer legs after the count) and the count plus EVERYTHING after
+ * it. The floor can hide a post-count outflow (a wastage or staff meal booked
+ * between the count and the cutover); the lower of the two never lets more
+ * leave than either reading supports. A never-counted pair has one figure the
+ * ledger supports — its all-time sum — so NULL is never a block, and the
+ * figure is flagged upperBound for the screen.
+ */
+export function deptSendable(bal: DeptOnHandResult, rawSum: number, sinceAnchor: number | null): DeptSendable {
+  const rel = deptReleasable(bal, rawSum);
+  if (rel.basis !== 'counted') {
+    return { ...rel, releasable: rel.available, sinceAnchor: null, upperBound: true };
+  }
+  const sa = sinceAnchor == null ? null : r6(sinceAnchor);
+  const available = sa == null ? rel.available : r6(Math.min(rel.available, sa));
+  return { ...rel, available, releasable: rel.available, sinceAnchor: sa, upperBound: false };
+}
+
+/** anchor + every movement after it, the floor ignored — only when the anchor
+ *  is older than the window start (otherwise it equals the balance). */
+function sinceAnchorFigure(db: Database.Database, deptId: string, matId: string, bal: DeptOnHandResult): number | null {
+  if (bal.neverCounted || bal.anchorAt == null || bal.anchorQty == null) return null;
+  if (!(bal.anchorAt < bal.windowFrom)) return null;
+  try {
+    const row = db.prepare(`
+      SELECT COALESCE(SUM(quantity), 0) AS s FROM department_material_transactions
+       WHERE department_id = ? AND material_id = ? AND type <> 'opening' AND ${LEDGER_TS_SQL} > ?
+    `).get(deptId, matId, bal.anchorAt) as { s: number } | undefined;
+    return r6(bal.anchorQty + (Number(row?.s) || 0));
+  } catch { return null; }
+}
+
+/** deptSendable() for one (department, material), read live. */
+export function deptSendableFor(db: Database.Database, departmentId: string, materialId: string): DeptSendable {
+  const deptId = String(departmentId || '');
+  const matId = String(materialId || '');
+  const bal = deptOnHand(db, deptId, matId);
+  return deptSendable(bal, rawLedgerSum(db, deptId, matId), sinceAnchorFigure(db, deptId, matId, bal));
+}
+
+/** deptSendable() for every material ONE department holds — the holdings
+ *  screen. Same function per pair as the send check, so the screen cannot
+ *  offer what the server refuses. No roll-up (see deptReleasableBulk). */
+export function deptSendableBulk(db: Database.Database, departmentId: string): Map<string, DeptSendable> {
+  const deptId = String(departmentId || '');
+  const out = new Map<string, DeptSendable>();
   if (!deptId) return out;
   const raw = new Map<string, number>();
   try {
@@ -1293,14 +1437,18 @@ export function deptReleasableBulk(db: Database.Database, departmentId: string):
   const bal = deptOnHandBulk(db, [deptId]);
   for (const [k, b] of bal) {
     const matId = k.slice(deptId.length + 1);
-    out.set(matId, deptReleasable(b, raw.get(matId) ?? 0));
+    out.set(matId, deptSendable(b, raw.get(matId) ?? 0, sinceAnchorFigure(db, deptId, matId, b)));
   }
   // A pair can hold ledger rows that are all before the cutover floor, with no
   // anchor and no cache row — deptOnHandBulk then returns no key for it. It is
   // never-counted stock all the same; the all-time sum is its figure.
   for (const [matId, s] of raw) {
     if (out.has(matId)) continue;
-    out.set(matId, { available: r6(s), basis: 'uncounted_ledger_sum', onHand: null, ledgerSum: r6(s) });
+    const v = r6(s);
+    out.set(matId, {
+      available: v, basis: 'uncounted_ledger_sum', onHand: null, ledgerSum: v,
+      releasable: v, sinceAnchor: null, upperBound: true,
+    });
   }
   return out;
 }
@@ -1308,16 +1456,16 @@ export function deptReleasableBulk(db: Database.Database, departmentId: string):
 /* ── errors ─────────────────────────────────────────────────────────────── */
 
 export type DeptTransferBlockReason =
-  | 'invalid'             // malformed input — 400
+  | 'invalid'               // malformed input — 400
   | 'same_department'
   | 'unknown_department'
   | 'inactive_department'
   | 'unknown_material'
-  | 'store_mapped'        // liquor: lives on the TGBCL store rail
-  | 'insufficient'        // the sender does not hold enough
-  | 'window'              // a leg would fall outside its pair's balance window
-  | 'state'               // not pending / not found / already received
-  | 'self_receive';       // the sender is confirming their own transfer
+  | 'store_mapped'          // liquor: lives on the TGBCL store rail
+  | 'insufficient'          // the sender does not hold enough
+  | 'window'                // a leg would fall outside its pair's balance window
+  | 'state'                 // not found / not posted / already disputed / nothing left
+  | 'idempotency_conflict'; // a client key reused for a DIFFERENT request
 
 /** Thrown by every transfer function below. Routes answer `httpStatus` with
  *  `.message`; the transaction it was thrown in has already rolled back. */
@@ -1389,12 +1537,22 @@ export function transferQtyToRecipe(meta: PackMeta, qty: number, unit: TransferE
 }
 
 /** "3 kg" / "2.5 l (2500 ml)" — the PURCHASE unit leads (owner rule), the
- *  recipe figure follows only when there is a real pack conversion. */
+ *  recipe figure follows only when there is a real pack conversion. Shows up
+ *  to 6 decimals so a refusal never prints two figures that look equal. */
 function fmtDual(recipeQty: number, m: PackMeta): string {
   const pu = String(m.purchase_unit || m.unit || '').trim();
   const ru = String(m.unit || '').trim();
-  const lead = `${fmt(toPurchaseQty(recipeQty, m))} ${pu}`.trim();
-  return packFactor(m) > 1 ? `${lead} (${fmt(recipeQty)} ${ru})` : lead;
+  const pf = packFactor(m);
+  const lead = `${fmtFine(r6(recipeQty / pf))} ${pu}`.trim();
+  return pf > 1 ? `${lead} (${fmtFine(recipeQty)} ${ru})` : lead;
+}
+
+/** Like fmt(), but keeps up to 6 decimals when 3 would hide the difference. */
+function fmtFine(n: number): string {
+  const v = r6(n);
+  if (Number.isInteger(v)) return String(v);
+  const three = Math.round(v * 1000) / 1000;
+  return Math.abs(three - v) < 1e-9 ? String(three) : String(v);
 }
 
 /* ── departments & the liquor carve-out ─────────────────────────────────── */
@@ -1462,8 +1620,8 @@ export interface DeptTransferPostResult {
   /** RECIPE units moved. */
   quantity: number;
   createdAt: string;
-  from: { before: DeptReleasable; after: DeptReleasable };
-  to: { before: DeptReleasable; after: DeptReleasable };
+  from: { before: DeptSendable; after: DeptSendable };
+  to: { before: DeptSendable; after: DeptSendable };
 }
 
 /**
@@ -1484,7 +1642,7 @@ export interface DeptTransferPostResult {
  *                       switched-off department is allowed — it drains it)
  *   unknown_material    no such raw material
  *   store_mapped        liquor — see storeRailBlock()
- *   insufficient        q > deptReleasable(sender).available
+ *   insufficient        q > deptSendable(sender).available
  *   window              a leg would not land inside its pair's balance window
  */
 export function postDeptTransfer(db: Database.Database, t: DeptTransferPost): DeptTransferPostResult {
@@ -1525,7 +1683,7 @@ function postDeptTransferInTxn(db: Database.Database, t: DeptTransferPost): Dept
   if (storeMsg) throw blocked('store_mapped', storeMsg, { materialId: matId });
 
   // ── the sender must hold it (refuse, never clamp) ────────────────────────
-  const fromBefore = deptReleasableFor(db, fromId, matId);
+  const fromBefore = deptSendableFor(db, fromId, matId);
   if (q > fromBefore.available + EPS) {
     const basisNote = fromBefore.basis === 'counted'
       ? 'by its last count and the movements since'
@@ -1538,23 +1696,24 @@ function postDeptTransferInTxn(db: Database.Database, t: DeptTransferPost): Dept
       { materialId: matId, requested: q, available: Math.max(0, fromBefore.available) },
     );
   }
-  const toBefore = deptReleasableFor(db, toId, matId);
+  const toBefore = deptSendableFor(db, toId, matId);
 
   // ── the anchor hazard, refused up front ──────────────────────────────────
-  // A leg is counted only when its 19-char created_at is STRICTLY after its
-  // pair's window start. If either window starts at or after this second (a
-  // count saved this very second, a count stamped in the future, a cutover
-  // stamped just now) the leg would be swallowed. computeDeptStock has no
-  // same-second rowid tie-break, so "at" is refused too, not only "after".
+  // A LEG is counted when its 19-char created_at is strictly after its pair's
+  // ANCHOR (the leg window — the cutover floor never applies to a leg; see
+  // deptOnHand, "A TRANSFER PAIR IS NEVER SPLIT"). If an anchor sits at or
+  // after this second (a count saved this very second, or stamped in the
+  // future) the leg would be swallowed, so it is refused. computeDeptStock has
+  // no same-second rowid tie-break, so "at" is refused too, not only "after".
   const postingSec = nowMs().slice(0, 19);
   for (const [dept, label] of [[fromId, from.name], [toId, to.name]] as const) {
     const w = anchorWindow(db, dept, matId);
-    if (w.windowFrom && w.windowFrom >= postingSec) {
+    if (w.legFrom && w.legFrom >= postingSec) {
       throw blocked(
         'window',
-        `${label}'s balance for ${m.name} starts at ${w.windowFrom} (a count or the cutover), which is not ` +
-        `before now (${postingSec}). A transfer posted now would not appear in that balance, so it was ` +
-        `refused. Retry in a moment; if it persists, the count's date or time is in the future.`,
+        `${label}'s balance for ${m.name} starts at ${w.legFrom} (its count), which is not before now ` +
+        `(${postingSec}). A transfer posted now would not appear in that balance, so it was refused. ` +
+        `Retry in a moment; if it persists, the count's date or time is in the future.`,
         { materialId: matId, requested: q },
       );
     }
@@ -1608,22 +1767,24 @@ function postDeptTransferInTxn(db: Database.Database, t: DeptTransferPost): Dept
     inId: inRow.id,
     quantity: q,
     createdAt: inRow.createdAt,
-    from: { before: fromBefore, after: deptReleasableFor(db, fromId, matId) },
-    to: { before: toBefore, after: deptReleasableFor(db, toId, matId) },
+    from: { before: fromBefore, after: deptSendableFor(db, fromId, matId) },
+    to: { before: toBefore, after: deptSendableFor(db, toId, matId) },
   };
 }
 
-/* ── the transfer DOCUMENT: send → receive (or cancel) ──────────────────────
- * Tables: department_transfers + department_transfer_lines (db.ts, the
- * "DEPARTMENT → DEPARTMENT TRANSFERS" block). A PENDING document moves NO
- * stock: the goods stay on the sender's ledger until the receiver confirms,
- * and the confirm posts every accepted line through postDeptTransfer() in one
- * transaction. A line accepted short leaves the shortfall on the SENDER —
- * only what arrived is debited, so the kilo is still in exactly one ledger;
- * the sender's next count settles where it went.
+/* ── the transfer DOCUMENT — one step ───────────────────────────────────────
+ * Tables: department_transfers + department_transfer_lines +
+ * department_transfer_disputes (db.ts, the "DEPARTMENT → DEPARTMENT
+ * TRANSFERS" block). Every document is 'posted': its legs were written in the
+ * same transaction that wrote it. The tables hold NO balance — never SUM a
+ * line into a stock figure; the ledger is the truth.
  * ──────────────────────────────────────────────────────────────────────────*/
 
-export type DeptTransferStatus = 'pending' | 'received' | 'cancelled';
+/** Always 'posted' — the stock moved when the document was written. */
+export type DeptTransferStatus = 'posted';
+export type DeptTransferDisputeStatus = '' | 'open' | 'resolved';
+export type DeptTransferDisputeKind = 'short' | 'wrong_item' | 'not_received';
+export const DEPT_TRANSFER_DISPUTE_KINDS: readonly DeptTransferDisputeKind[] = ['short', 'wrong_item', 'not_received'];
 
 export interface DeptTransferLineInput {
   materialId: string;
@@ -1634,12 +1795,14 @@ export interface DeptTransferLineInput {
   notes?: string;
 }
 
-export interface CreateDeptTransferInput {
+export interface SendDeptTransferInput {
   fromDepartmentId: string;
   toDepartmentId: string;
   lines: DeptTransferLineInput[];
   /** The SESSION user's email. */
   user: string;
+  /** REQUIRED. Minted ONCE per tray by the screen; a retry re-sends the same key. */
+  clientKey: string;
   notes?: string;
   outletId?: string | null;
 }
@@ -1652,16 +1815,49 @@ export interface DeptTransferLineRow {
   unit: string;
   purchase_unit: string;
   pack_factor: number;
-  /** RECIPE units. */
+  /** RECIPE units moved by this line — both legs. */
   qty_sent: number;
   entry_qty: number | null;
   entry_unit: string;
-  /** RECIPE units. NULL until received; 0 = accepted nothing on this line. */
-  qty_received: number | null;
-  out_txn_id: string | null;
-  in_txn_id: string | null;
+  /** The sender's transfer_out and the receiver's transfer_in ledger rows. */
+  out_txn_id: string;
+  in_txn_id: string;
+  /** Set on a REVERSE transfer's line: the original line it corrects. */
+  reverses_line_id: string;
   notes: string;
   created_at: string;
+  /** Computed: RECIPE units already moved back by reverse transfers. */
+  qty_reversed: number;
+  /** Computed: qty_sent − qty_reversed — what this line still has in the receiver's books. */
+  qty_net: number;
+  /** Computed: RECIPE units under an OPEN dispute and not yet reversed. */
+  qty_open_disputed: number;
+}
+
+export interface DeptTransferDisputeRow {
+  id: string;
+  transfer_id: string;
+  line_id: string;
+  kind: DeptTransferDisputeKind;
+  /** RECIPE units the receiver says did not arrive (or arrived wrong). */
+  qty_disputed: number;
+  /** What the receiver typed: what DID arrive, for 'short'. */
+  entry_qty: number | null;
+  entry_unit: string;
+  reason: string;
+  raised_by: string;
+  raised_at: string;
+  status: 'open' | 'resolved';
+  /** 'reversed' (a reverse transfer moved it back) | 'dismissed' (closed with a note, nothing moved). */
+  resolution: string;
+  resolution_note: string;
+  resolved_by: string;
+  resolved_at: string;
+  /** RECIPE units moved back so far by reverse transfers against this dispute. */
+  qty_reversed: number;
+  reverse_transfer_id: string;
+  /** Comma-joined emails the route alerted when the dispute was raised. */
+  alert_recipients: string;
 }
 
 export interface DeptTransferRow {
@@ -1673,20 +1869,31 @@ export interface DeptTransferRow {
   to_department_id: string;
   to_department_name: string;
   status: DeptTransferStatus;
+  /** Business date stamped on both legs. */
+  txn_date: string;
   notes: string;
   created_by: string;
   created_at: string;
-  received_by: string;
-  received_at: string;
-  receive_txn_date: string;
-  receive_override_reason: string;
-  cancelled_by: string;
-  cancelled_at: string;
-  cancel_reason: string;
+  client_key: string;
+  /** '' unless this transfer CORRECTS another (a reverse transfer). */
+  reverses_transfer_id: string;
+  dispute_status: DeptTransferDisputeStatus;
+  updated_at: string;
 }
 
 export interface DeptTransferWithLines extends DeptTransferRow {
   lines: DeptTransferLineRow[];
+  disputes: DeptTransferDisputeRow[];
+  /** transfer_no of the transfer this one reverses ('' when not a reverse). */
+  reverses_transfer_no: string;
+  /** Reverse transfers made against this one. */
+  reversed_by: Array<{ id: string; transfer_no: string; created_at: string; created_by: string }>;
+}
+
+export interface SendDeptTransferResult {
+  transfer: DeptTransferWithLines;
+  /** TRUE when the client key had already made this transfer: nothing new was written. */
+  duplicate: boolean;
 }
 
 /** Next DTR-<year>-#### — the same MAX+1 shape as PINV-<year>-####. Called
@@ -1700,66 +1907,155 @@ function nextTransferNo(db: Database.Database): string {
   return `DTR-${yr}-${String((Number(row?.n) || 0) + 1).padStart(4, '0')}`;
 }
 
+const CLIENT_KEY_RE = /^[A-Za-z0-9._:-]{8,120}$/;
+
 /**
- * RECIPE units of a material already promised out of a department on PENDING
- * transfers. A pending transfer moves no stock, so this is NOT part of any
- * balance — it is subtracted only by the SEND check, so two pending transfers
- * cannot promise the same kilo twice. (The receive check does not need it: it
- * reads the live ledger, which already reflects every received transfer.)
+ * THE IDEMPOTENCY GATE. Runs FIRST inside the IMMEDIATE transaction, before any
+ * validation that could read differently on a retry (a retry of a send that
+ * succeeded must come back as that send — not as "insufficient", which is what
+ * re-checking the now-lower balance would say). Returns the existing document
+ * when this user already used this key for the SAME request; refuses the key
+ * for a different one.
  */
-export function deptPendingOutgoing(
-  db: Database.Database, departmentId: string, materialId?: string, excludeTransferId?: string,
-): Map<string, number> {
-  const out = new Map<string, number>();
-  try {
-    const rows = db.prepare(`
-      SELECT l.material_id, COALESCE(SUM(l.qty_sent), 0) AS q
-        FROM department_transfer_lines l
-        JOIN department_transfers t ON t.id = l.transfer_id
-       WHERE t.from_department_id = ? AND t.status = 'pending'
-         AND (? = '' OR l.material_id = ?)
-         AND (? = '' OR t.id <> ?)
-       GROUP BY l.material_id
-    `).all(
-      String(departmentId || ''),
-      String(materialId || ''), String(materialId || ''),
-      String(excludeTransferId || ''), String(excludeTransferId || ''),
-    ) as Array<{ material_id: string; q: number }>;
-    for (const r of rows) out.set(String(r.material_id), r6(Number(r.q) || 0));
-  } catch { /* tables absent (schema block not run) — nothing can be pending */ }
-  return out;
+function idempotentHit(
+  db: Database.Database, actor: string, clientKey: string, fingerprint: string,
+): DeptTransferWithLines | null {
+  const row = db.prepare(`
+    SELECT id, request_fingerprint FROM department_transfers WHERE created_by = ? AND client_key = ?
+  `).get(actor, clientKey) as { id: string; request_fingerprint: string } | undefined;
+  if (!row) return null;
+  if (String(row.request_fingerprint || '') !== fingerprint) {
+    throw blocked(
+      'idempotency_conflict',
+      `This send key was already used for a different transfer. Nothing was written; start a new transfer.`,
+    );
+  }
+  return getDeptTransfer(db, row.id);
+}
+
+interface PreparedLine {
+  m: TransferMaterial;
+  /** RECIPE units. */
+  qty: number;
+  entryQty: number | null;
+  entryUnit: string;
+  factor: number;
+  notes: string;
+  reversesLineId: string;
 }
 
 /**
- * SEND: write a PENDING transfer document. Moves NO stock.
- *
- * Refuses (DeptTransferBlocked) on every invariant postDeptTransfer checks
- * except the window (nothing is posted yet), plus: no lines, a material listed
- * twice, and a quantity above what the sender can release LESS what is already
- * promised on other pending transfers. The same checks run again, against the
- * live ledger, at receive — a send-time pass is not a reservation.
+ * The one writer of a transfer DOCUMENT and its legs. Caller is inside an
+ * IMMEDIATE transaction and has passed the idempotency gate. Writes the
+ * header, then each line, then each line's pair through postDeptTransfer(), and
+ * stamps the leg ids on the line. Any refusal rolls everything back.
  */
-export function createDeptTransfer(db: Database.Database, input: CreateDeptTransferInput): DeptTransferWithLines {
-  const run = db.transaction((): DeptTransferWithLines => {
+function writeTransferDoc(db: Database.Database, d: {
+  from: TransferDept; to: TransferDept; actor: string; clientKey: string; fingerprint: string;
+  notes: string; outletId: string | null; reversesTransferId: string; lines: PreparedLine[];
+}): DeptTransferWithLines {
+  const id = newId();
+  const txnDate = todayISTDate();
+  const transferNo = nextTransferNo(db);
+  const at = nowMs();
+  db.prepare(`
+    INSERT INTO department_transfers
+      (id, transfer_no, outlet_id, from_department_id, from_department_name,
+       to_department_id, to_department_name, status, txn_date, notes, created_by, created_at,
+       client_key, request_fingerprint, reverses_transfer_id, dispute_status, updated_at)
+    VALUES (?,?,?,?,?,?,?, 'posted', ?,?,?,?,?,?,?, '', ?)
+  `).run(
+    id, transferNo, d.outletId, d.from.id, d.from.name, d.to.id, d.to.name,
+    txnDate, d.notes, d.actor, at, d.clientKey, d.fingerprint, d.reversesTransferId, at,
+  );
+  const insLine = db.prepare(`
+    INSERT INTO department_transfer_lines
+      (id, transfer_id, material_id, material_name, unit, purchase_unit, pack_factor,
+       qty_sent, entry_qty, entry_unit, out_txn_id, in_txn_id, reverses_line_id, notes, created_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?, '', '', ?,?,?)
+  `);
+  const stamp = db.prepare(`UPDATE department_transfer_lines SET out_txn_id = ?, in_txn_id = ? WHERE id = ?`);
+  for (const p of d.lines) {
+    const lineId = newId();
+    insLine.run(
+      lineId, id, p.m.id, p.m.name, String(p.m.unit || ''), String(p.m.purchase_unit || p.m.unit || ''),
+      p.factor, p.qty, p.entryQty, p.entryUnit, p.reversesLineId, p.notes, nowMs(),
+    );
+    const posted = postDeptTransfer(db, {
+      fromDepartmentId: d.from.id,
+      toDepartmentId: d.to.id,
+      materialId: p.m.id,
+      quantity: p.qty,
+      referenceId: lineId,
+      user: d.actor,
+      txnDate,
+      outletId: d.outletId,
+      notes: `${transferNo}${d.notes ? ` — ${d.notes}` : ''}`,
+      source: d.reversesTransferId ? 'department-transfer:reverse' : 'department-transfer',
+    });
+    stamp.run(posted.outId, posted.inId, lineId);
+  }
+  return getDeptTransfer(db, id) as DeptTransferWithLines;
+}
+
+function validateClientKey(clientKey: string): void {
+  if (!clientKey) {
+    throw blocked('invalid', 'A transfer needs a client_key (minted once per send, re-sent unchanged on a retry) so a retry can never post twice.');
+  }
+  if (!CLIENT_KEY_RE.test(clientKey)) {
+    throw blocked('invalid', 'client_key must be 8–120 characters of letters, digits, dot, underscore, colon or dash.');
+  }
+}
+
+function resolveEnds(db: Database.Database, fromId: string, toId: string): { from: TransferDept; to: TransferDept } {
+  if (!fromId || !toId) throw blocked('invalid', 'A transfer needs a sending and a receiving department.');
+  if (fromId === toId) throw blocked('same_department', 'A department cannot transfer stock to itself.');
+  const from = transferDept(db, fromId);
+  const to = transferDept(db, toId);
+  if (!from) throw blocked('unknown_department', `Sending department ${fromId} does not exist.`, { httpStatus: 404 });
+  if (!to) throw blocked('unknown_department', `Receiving department ${toId} does not exist.`, { httpStatus: 404 });
+  if (!Number(to.is_active)) {
+    throw blocked('inactive_department', `${to.name} is switched off; stock sent there would be hidden from every live screen.`);
+  }
+  return { from, to };
+}
+
+/**
+ * SEND — ONE STEP. In ONE IMMEDIATE transaction: the idempotency gate, then
+ * the document, its lines and every line's transfer_out/transfer_in pair. When
+ * this returns, the sender's ledger is down and the receiver's is up.
+ *
+ * Refuses (DeptTransferBlocked) on every invariant postDeptTransfer checks,
+ * plus: no client key, no lines, a material listed twice, more than 50 lines.
+ */
+export function sendDeptTransfer(db: Database.Database, input: SendDeptTransferInput): SendDeptTransferResult {
+  const run = db.transaction((): SendDeptTransferResult => {
     const fromId = String(input.fromDepartmentId || '').trim();
     const toId = String(input.toDepartmentId || '').trim();
     const actor = String(input.user || '').trim();
-    if (!fromId || !toId) throw blocked('invalid', 'A transfer needs a sending and a receiving department.');
+    const clientKey = String(input.clientKey || '').trim();
     if (!actor) throw blocked('invalid', 'A transfer needs the responsible user (the session user).');
-    if (fromId === toId) throw blocked('same_department', 'A department cannot transfer stock to itself.');
-    const from = transferDept(db, fromId);
-    const to = transferDept(db, toId);
-    if (!from) throw blocked('unknown_department', `Sending department ${fromId} does not exist.`, { httpStatus: 404 });
-    if (!to) throw blocked('unknown_department', `Receiving department ${toId} does not exist.`, { httpStatus: 404 });
-    if (!Number(to.is_active)) {
-      throw blocked('inactive_department', `${to.name} is switched off; stock sent there would be hidden from every live screen.`);
-    }
-    const lines = Array.isArray(input.lines) ? input.lines : [];
-    if (lines.length === 0) throw blocked('invalid', 'A transfer needs at least one line.');
+    validateClientKey(clientKey);
+    const rawLines = Array.isArray(input.lines) ? input.lines : [];
+
+    // The request's identity: ends + goods as TYPED. Notes are not identity —
+    // a retry of the same tray with the note retyped is still the same send.
+    const fingerprint = JSON.stringify({
+      kind: 'send', from: fromId, to: toId,
+      lines: rawLines
+        .map((l) => [String(l?.materialId || '').trim(), l?.unit === 'recipe' ? 'recipe' : 'purchase', Number(l?.quantity)])
+        .sort((a, b) => String(a[0]).localeCompare(String(b[0]))),
+    });
+    const hit = idempotentHit(db, actor, clientKey, fingerprint);
+    if (hit) return { transfer: hit, duplicate: true };
+
+    const { from, to } = resolveEnds(db, fromId, toId);
+    if (rawLines.length === 0) throw blocked('invalid', 'A transfer needs at least one line.');
+    if (rawLines.length > 50) throw blocked('invalid', 'At most 50 lines per transfer.');
 
     const seen = new Set<string>();
-    const prepared: Array<{ m: TransferMaterial; qty: number; entryQty: number; entryUnit: string; factor: number; notes: string }> = [];
-    for (const ln of lines) {
+    const prepared: PreparedLine[] = [];
+    for (const ln of rawLines) {
       const matId = String(ln?.materialId || '').trim();
       if (!matId) throw blocked('invalid', 'Every transfer line needs a material.');
       if (seen.has(matId)) {
@@ -1776,237 +2072,459 @@ export function createDeptTransfer(db: Database.Database, input: CreateDeptTrans
       if (!Number.isFinite(qty) || qty <= EPS) {
         throw blocked('invalid', `Quantity for ${m.name} must be a positive number.`, { materialId: matId });
       }
-      const rel = deptReleasableFor(db, fromId, matId);
-      const pending = deptPendingOutgoing(db, fromId, matId).get(matId) || 0;
-      const free = r6(rel.available - pending);
-      if (qty > free + EPS) {
-        const why = pending > EPS
-          ? `${from.name} holds ${fmtDual(Math.max(0, rel.available), m)} and ${fmtDual(pending, m)} is already on pending transfers`
-          : `${from.name} holds only ${fmtDual(Math.max(0, rel.available), m)}` +
-            (rel.basis === 'uncounted_ledger_sum' ? ' by its ledger (never counted)' : '');
-        throw blocked(
-          'insufficient',
-          `Cannot send ${fmtDual(qty, m)} of ${m.name}: ${why}. Send ${fmtDual(Math.max(0, free), m)} or less.`,
-          { materialId: matId, requested: qty, available: Math.max(0, free) },
-        );
-      }
       prepared.push({
-        m, qty, entryQty, entryUnit: unit === 'recipe' ? String(m.unit || '') : String(m.purchase_unit || m.unit || ''),
-        factor: packFactor(m), notes: String(ln.notes || '').trim(),
+        m, qty, entryQty: Number.isFinite(entryQty) ? entryQty : null,
+        entryUnit: unit === 'recipe' ? String(m.unit || '') : String(m.purchase_unit || m.unit || ''),
+        factor: packFactor(m), notes: String(ln.notes || '').trim(), reversesLineId: '',
       });
     }
 
-    const id = newId();
-    const transferNo = nextTransferNo(db);
-    db.prepare(`
-      INSERT INTO department_transfers
-        (id, transfer_no, outlet_id, from_department_id, from_department_name,
-         to_department_id, to_department_name, status, notes, created_by, created_at, updated_at)
-      VALUES (?,?,?,?,?,?,?, 'pending', ?, ?, ?, ?)
-    `).run(
-      id, transferNo, input.outletId ?? null, fromId, from.name, toId, to.name,
-      String(input.notes || '').trim(), actor, nowMs(), nowMs(),
-    );
-    const insLine = db.prepare(`
-      INSERT INTO department_transfer_lines
-        (id, transfer_id, material_id, material_name, unit, purchase_unit, pack_factor,
-         qty_sent, entry_qty, entry_unit, notes, created_at)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-    `);
-    for (const p of prepared) {
-      insLine.run(
-        newId(), id, p.m.id, p.m.name, String(p.m.unit || ''), String(p.m.purchase_unit || p.m.unit || ''),
-        p.factor, p.qty, Number.isFinite(p.entryQty) ? p.entryQty : null, p.entryUnit, p.notes, nowMs(),
-      );
-    }
-    return getDeptTransfer(db, id) as DeptTransferWithLines;
+    const transfer = writeTransferDoc(db, {
+      from, to, actor, clientKey, fingerprint,
+      notes: String(input.notes || '').trim(), outletId: input.outletId ?? null,
+      reversesTransferId: '', lines: prepared,
+    });
+    return { transfer, duplicate: false };
   });
   return run.immediate();
 }
 
-export interface ReceiveDeptTransferInput {
+/* ── DISPUTE — records, alerts (route), moves NOTHING ───────────────────── */
+
+export interface FlagDeptTransferDisputeInput {
   transferId: string;
   /** The SESSION user's email. */
   user: string;
+  kind: DeptTransferDisputeKind;
+  /** Required, in words. */
+  reason: string;
   /**
-   * Per-line acceptance. OMIT to accept every line in full. A line not listed
-   * is accepted in full; a listed line may be accepted short (down to 0, which
-   * posts nothing for it). Never more than was sent.
+   * Which lines. OMIT = every line still standing. For 'short' each listed line
+   * needs `quantityReceived` — what DID arrive (0 ≤ it < what the line still
+   * says arrived); the dispute is the difference. 'wrong_item' and
+   * 'not_received' dispute the whole remaining line.
    */
-  lines?: Array<{ lineId: string; quantity: number; unit?: TransferEntryUnit }>;
-  /**
-   * Required when the receiver is the person who SENT it (the QC rule: the
-   * receiver may not be the checker). Stored permanently on the document. The
-   * ROUTE must accept it only from a user it authorises to override (admin/HOD);
-   * this function only refuses a blank one.
-   */
-  overrideReason?: string;
-  /** Business date the goods changed hands (YYYY-MM-DD IST). Default today; never in the future. */
-  txnDate?: string;
+  lines?: Array<{ lineId: string; quantityReceived?: number; unit?: TransferEntryUnit }>;
+  /** Emails the ROUTE will alert, recorded on the dispute so the record says who was told. */
+  alertRecipients?: string[];
 }
 
 /**
- * RECEIVE: the receiver confirms. In ONE IMMEDIATE transaction it claims the
- * document (pending → received, so a double-click cannot post twice), then
- * posts every accepted line through postDeptTransfer() — each line is its own
- * transfer_out/transfer_in pair with reference_id = the line id — and stamps
- * the ledger row ids onto the line. Any refusal (the sender no longer holds
- * enough, a window problem) rolls back the claim and every pair before it.
+ * FLAG A DISPUTE. One IMMEDIATE transaction that writes dispute rows and the
+ * document's dispute_status — and NOTHING on any ledger. The stock already
+ * moved at send; whether it should move back is the sender's side's call, by
+ * a reverse transfer. Refuses a line that already has an OPEN dispute (one
+ * claim per line at a time) or that has been fully reversed.
  */
-export function receiveDeptTransfer(db: Database.Database, input: ReceiveDeptTransferInput): DeptTransferWithLines {
-  const run = db.transaction((): DeptTransferWithLines => {
+export function flagDeptTransferDispute(
+  db: Database.Database, input: FlagDeptTransferDisputeInput,
+): { transfer: DeptTransferWithLines; disputes: DeptTransferDisputeRow[] } {
+  const run = db.transaction(() => {
     const id = String(input.transferId || '').trim();
     const actor = String(input.user || '').trim();
+    const reason = String(input.reason || '').trim();
+    const kind = String(input.kind || '').trim() as DeptTransferDisputeKind;
     if (!id) throw blocked('invalid', 'Which transfer?');
-    if (!actor) throw blocked('invalid', 'Receiving needs the responsible user (the session user).');
+    if (!actor) throw blocked('invalid', 'Flagging needs the responsible user (the session user).');
+    if (!DEPT_TRANSFER_DISPUTE_KINDS.includes(kind)) {
+      throw blocked('invalid', `Say what is wrong: one of ${DEPT_TRANSFER_DISPUTE_KINDS.join(', ')}.`);
+    }
+    if (!reason) throw blocked('invalid', 'Say what happened — a dispute needs a reason the sender can act on.');
+    if (reason.length > 1000) throw blocked('invalid', 'Keep the reason under 1,000 characters.');
     const doc = getDeptTransfer(db, id);
     if (!doc) throw blocked('state', `Transfer ${id} does not exist.`, { httpStatus: 404 });
-    if (doc.status !== 'pending') {
-      throw blocked('state', `Transfer ${doc.transfer_no} is already ${doc.status}; nothing was posted.`);
-    }
-    const override = String(input.overrideReason || '').trim();
-    if (doc.created_by.trim().toLowerCase() === actor.toLowerCase() && !override) {
-      throw blocked(
-        'self_receive',
-        `${doc.transfer_no} was sent by you; someone in ${doc.to_department_name} must confirm receipt ` +
-        `(or an authorised override with a written reason).`,
-      );
-    }
-    const today = todayISTDate();
-    const txnDate = String(input.txnDate || '').trim() || today;
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(txnDate)) throw blocked('invalid', `Receive date must be YYYY-MM-DD; got '${txnDate}'.`);
-    if (txnDate > today) throw blocked('invalid', `Receive date ${txnDate} is in the future.`);
+    if (doc.status !== 'posted') throw blocked('state', `${doc.transfer_no} is ${doc.status}; only a posted transfer can be disputed.`);
 
-    const byLine = new Map<string, { quantity: number; unit: TransferEntryUnit }>();
-    for (const a of input.lines || []) {
-      const lid = String(a?.lineId || '').trim();
-      if (!doc.lines.some((l) => l.id === lid)) {
-        throw blocked('invalid', `Line ${lid || '(blank)'} is not on ${doc.transfer_no}.`);
+    const byId = new Map(doc.lines.map((l) => [l.id, l]));
+    const wanted = input.lines && input.lines.length > 0
+      ? input.lines.map((a) => ({ a, line: byId.get(String(a?.lineId || '').trim()) }))
+      : doc.lines.filter((l) => l.qty_net > EPS).map((line) => ({ a: undefined, line }));
+    if (wanted.length === 0) throw blocked('state', `Nothing on ${doc.transfer_no} is left to dispute — every line has been reversed.`);
+    if (kind === 'short' && !(input.lines && input.lines.length > 0)) {
+      throw blocked('invalid', 'For a short delivery, say for each line how much DID arrive.');
+    }
+
+    const seenLines = new Set<string>();
+    const rows: Array<{ line: DeptTransferLineRow; qty: number; entryQty: number | null; entryUnit: string }> = [];
+    for (const { a, line } of wanted) {
+      if (!line) throw blocked('invalid', `Line ${String(a?.lineId || '(blank)')} is not on ${doc.transfer_no}.`);
+      if (seenLines.has(line.id)) throw blocked('invalid', `${line.material_name} is listed twice.`);
+      seenLines.add(line.id);
+      if (line.qty_net <= EPS) throw blocked('state', `${line.material_name} on ${doc.transfer_no} has already been reversed in full.`);
+      if (doc.disputes.some((d) => d.line_id === line.id && d.status === 'open')) {
+        throw blocked('state', `${line.material_name} on ${doc.transfer_no} already has an open dispute. It is with the sender.`);
       }
-      byLine.set(lid, { quantity: Number(a.quantity), unit: a.unit === 'recipe' ? 'recipe' : 'purchase' });
-    }
-
-    // Accepted quantities, RECIPE units, validated before anything is written.
-    const accepted = doc.lines.map((l) => {
-      const a = byLine.get(l.id);
-      let q = l.qty_sent;
-      if (a) {
-        const meta: PackMeta = { unit: l.unit, purchase_unit: l.purchase_unit, pack_size: l.pack_factor };
-        q = transferQtyToRecipe(meta, a.quantity, a.unit);
-        if (!Number.isFinite(q) || q < -EPS) {
-          throw blocked('invalid', `Received quantity for ${l.material_name} must be 0 or more.`, { materialId: l.material_id });
+      const meta: PackMeta = { unit: line.unit, purchase_unit: line.purchase_unit, pack_size: line.pack_factor };
+      if (kind === 'short') {
+        const unit: TransferEntryUnit = a?.unit === 'recipe' ? 'recipe' : 'purchase';
+        const got = transferQtyToRecipe(meta, Number(a?.quantityReceived), unit);
+        if (a?.quantityReceived === undefined || a?.quantityReceived === null || !Number.isFinite(got) || got < -EPS) {
+          throw blocked('invalid', `Say how much ${line.material_name} DID arrive (0 or more).`, { materialId: line.material_id });
         }
-        if (q > l.qty_sent + EPS) {
+        if (got >= line.qty_net - EPS) {
           throw blocked(
             'invalid',
-            `Cannot receive ${fmtDual(q, meta)} of ${l.material_name}: only ${fmtDual(l.qty_sent, meta)} was sent. ` +
-            `Raise a new transfer for the rest.`,
-            { materialId: l.material_id, requested: q, available: l.qty_sent },
+            `${line.material_name}: ${fmtDual(got, meta)} arrived and ${fmtDual(line.qty_net, meta)} was sent — nothing is short.`,
+            { materialId: line.material_id },
           );
         }
-        q = Math.max(0, r6(q));
+        rows.push({
+          line, qty: r6(line.qty_net - Math.max(0, got)),
+          entryQty: Number(a?.quantityReceived),
+          entryUnit: unit === 'recipe' ? line.unit : (line.purchase_unit || line.unit),
+        });
+      } else {
+        rows.push({ line, qty: r6(line.qty_net), entryQty: null, entryUnit: '' });
       }
-      return { line: l, q };
-    });
-    if (!accepted.some((a) => a.q > EPS)) {
-      throw blocked('invalid', `Nothing was accepted on ${doc.transfer_no}. Cancel it instead.`);
     }
 
-    // CLAIM first: a second confirm racing this one finds status <> 'pending'.
-    const claim = db.prepare(`
-      UPDATE department_transfers
-         SET status = 'received', received_by = ?, received_at = ?, receive_txn_date = ?,
-             receive_override_reason = ?, updated_at = ?
-       WHERE id = ? AND status = 'pending'
-    `).run(actor, nowMs(), txnDate, override, nowMs(), id);
-    if (claim.changes !== 1) throw blocked('state', `${doc.transfer_no} is no longer pending; nothing was posted.`);
-
-    const stamp = db.prepare(`
-      UPDATE department_transfer_lines SET qty_received = ?, out_txn_id = ?, in_txn_id = ? WHERE id = ?
+    const recipients = (input.alertRecipients || []).map((s) => String(s || '').trim()).filter(Boolean).join(',').slice(0, 2000);
+    const at = nowMs();
+    const ins = db.prepare(`
+      INSERT INTO department_transfer_disputes
+        (id, transfer_id, line_id, kind, qty_disputed, entry_qty, entry_unit, reason, raised_by, raised_at,
+         status, resolution, resolution_note, resolved_by, resolved_at, qty_reversed, reverse_transfer_id,
+         alert_recipients)
+      VALUES (?,?,?,?,?,?,?,?,?,?, 'open', '', '', '', '', 0, '', ?)
     `);
-    for (const { line, q } of accepted) {
-      if (q <= EPS) { stamp.run(0, null, null, line.id); continue; }
-      const posted = postDeptTransfer(db, {
-        fromDepartmentId: doc.from_department_id,
-        toDepartmentId: doc.to_department_id,
-        materialId: line.material_id,
-        quantity: q,
-        referenceId: line.id,
-        user: actor,
-        txnDate,
-        outletId: doc.outlet_id,
-        notes: `${doc.transfer_no}${override ? ` (override: ${override})` : ''}`,
-      });
-      stamp.run(posted.quantity, posted.outId, posted.inId, line.id);
+    const newIds: string[] = [];
+    for (const r of rows) {
+      const did = newId();
+      newIds.push(did);
+      ins.run(did, doc.id, r.line.id, kind, r.qty, r.entryQty, r.entryUnit, reason, actor, at, recipients);
     }
-    return getDeptTransfer(db, id) as DeptTransferWithLines;
+    db.prepare(`UPDATE department_transfers SET dispute_status = 'open', updated_at = ? WHERE id = ?`).run(at, doc.id);
+    const transfer = getDeptTransfer(db, doc.id) as DeptTransferWithLines;
+    return { transfer, disputes: transfer.disputes.filter((d) => newIds.includes(d.id)) };
   });
   return run.immediate();
 }
 
-/** CANCEL a PENDING transfer. Moves no stock (none was moved). Reason required. */
-export function cancelDeptTransfer(
-  db: Database.Database, input: { transferId: string; user: string; reason: string },
+/**
+ * CLOSE open disputes WITHOUT moving stock — the claim was withdrawn or found
+ * wrong ("it was in the walk-in"). A note is required and kept. The ROUTE
+ * decides who may (the person who raised it, managers, admin).
+ */
+export function resolveDeptTransferDisputes(
+  db: Database.Database, input: { transferId: string; user: string; note: string; disputeIds?: string[] },
 ): DeptTransferWithLines {
   const run = db.transaction((): DeptTransferWithLines => {
     const id = String(input.transferId || '').trim();
     const actor = String(input.user || '').trim();
-    const reason = String(input.reason || '').trim();
+    const note = String(input.note || '').trim();
     if (!id) throw blocked('invalid', 'Which transfer?');
-    if (!actor) throw blocked('invalid', 'Cancelling needs the responsible user (the session user).');
-    if (!reason) throw blocked('invalid', 'Say why the transfer is being cancelled.');
+    if (!actor) throw blocked('invalid', 'Closing a dispute needs the responsible user (the session user).');
+    if (!note) throw blocked('invalid', 'Say why the dispute is being closed without moving anything back.');
     const doc = getDeptTransfer(db, id);
     if (!doc) throw blocked('state', `Transfer ${id} does not exist.`, { httpStatus: 404 });
-    const r = db.prepare(`
-      UPDATE department_transfers
-         SET status = 'cancelled', cancelled_by = ?, cancelled_at = ?, cancel_reason = ?, updated_at = ?
-       WHERE id = ? AND status = 'pending'
-    `).run(actor, nowMs(), reason, nowMs(), id);
-    if (r.changes !== 1) throw blocked('state', `${doc.transfer_no} is ${doc.status}; only a pending transfer can be cancelled.`);
-    return getDeptTransfer(db, id) as DeptTransferWithLines;
+    const open = doc.disputes.filter((d) => d.status === 'open');
+    const want = input.disputeIds && input.disputeIds.length > 0 ? new Set(input.disputeIds.map(String)) : null;
+    const target = want ? open.filter((d) => want.has(d.id)) : open;
+    if (want && target.length !== want.size) {
+      throw blocked('state', `One or more of those disputes is not open on ${doc.transfer_no}.`);
+    }
+    if (target.length === 0) throw blocked('state', `${doc.transfer_no} has no open dispute to close.`);
+    const at = nowMs();
+    const upd = db.prepare(`
+      UPDATE department_transfer_disputes
+         SET status = 'resolved', resolution = 'dismissed', resolution_note = ?, resolved_by = ?, resolved_at = ?
+       WHERE id = ? AND status = 'open'
+    `);
+    for (const d of target) upd.run(note, actor, at, d.id);
+    refreshDisputeStatus(db, doc.id, at);
+    return getDeptTransfer(db, doc.id) as DeptTransferWithLines;
   });
   return run.immediate();
 }
 
-/** One transfer document with its lines, or null. */
+function refreshDisputeStatus(db: Database.Database, transferId: string, at: string): void {
+  const r = db.prepare(`
+    SELECT SUM(CASE WHEN status = 'open' THEN 1 ELSE 0 END) AS open_n, COUNT(*) AS n
+      FROM department_transfer_disputes WHERE transfer_id = ?
+  `).get(transferId) as { open_n: number | null; n: number };
+  const status: DeptTransferDisputeStatus = Number(r?.open_n) > 0 ? 'open' : Number(r?.n) > 0 ? 'resolved' : '';
+  db.prepare(`UPDATE department_transfers SET dispute_status = ?, updated_at = ? WHERE id = ?`).run(status, at, transferId);
+}
+
+/* ── REVERSE — the one correction ───────────────────────────────────────── */
+
+export interface ReverseDeptTransferInput {
+  /** The transfer being corrected. */
+  transferId: string;
+  /** The SESSION user's email. */
+  user: string;
+  /** REQUIRED, as on a send — a retried tap returns the reverse it already made. */
+  clientKey: string;
+  /**
+   * Per line, in the unit given (default 'purchase'). OMIT = the prefill: each
+   * line's OPEN disputed quantity — or, with 'receiver' authority and no open
+   * dispute, everything the line still has standing.
+   */
+  lines?: Array<{ lineId: string; quantity: number; unit?: TransferEntryUnit }>;
+  /**
+   * Decided by the ROUTE from who is asking:
+   *   'receiver'      may send from the ORIGINAL RECEIVER (it is a send from
+   *                   there): up to what each line still has standing.
+   *   'disputed_only' acting for the ORIGINAL SENDER on the receiver's own
+   *                   claim: only lines with an open dispute, up to its amount.
+   */
+  authority: 'receiver' | 'disputed_only';
+  notes?: string;
+  outletId?: string | null;
+}
+
+/**
+ * REVERSE: receiver → sender, the same goods, one step, through the same
+ * writer and the same checks (the original RECEIVER must hold what goes back).
+ * Each reverse line carries reverses_line_id; a line can never be reversed by
+ * more than it moved. Open disputes on the reversed lines are settled oldest
+ * first; a dispute is resolved once what was reversed covers what was claimed.
+ */
+export function reverseDeptTransfer(
+  db: Database.Database, input: ReverseDeptTransferInput,
+): SendDeptTransferResult & { original: DeptTransferWithLines } {
+  const run = db.transaction(() => {
+    const origId = String(input.transferId || '').trim();
+    const actor = String(input.user || '').trim();
+    const clientKey = String(input.clientKey || '').trim();
+    if (!origId) throw blocked('invalid', 'Which transfer?');
+    if (!actor) throw blocked('invalid', 'A reverse needs the responsible user (the session user).');
+    validateClientKey(clientKey);
+    const authority = input.authority === 'receiver' ? 'receiver' : 'disputed_only';
+
+    const fingerprint = JSON.stringify({
+      kind: 'reverse', of: origId,
+      lines: input.lines && input.lines.length > 0
+        ? input.lines
+          .map((l) => [String(l?.lineId || '').trim(), l?.unit === 'recipe' ? 'recipe' : 'purchase', Number(l?.quantity)])
+          .sort((a, b) => String(a[0]).localeCompare(String(b[0])))
+        : 'prefill',
+    });
+    const hit = idempotentHit(db, actor, clientKey, fingerprint);
+    if (hit) {
+      return { transfer: hit, duplicate: true, original: getDeptTransfer(db, origId) as DeptTransferWithLines };
+    }
+
+    const orig = getDeptTransfer(db, origId);
+    if (!orig) throw blocked('state', `Transfer ${origId} does not exist.`, { httpStatus: 404 });
+    if (orig.status !== 'posted') throw blocked('state', `${orig.transfer_no} is ${orig.status}; nothing to reverse.`);
+
+    const byId = new Map(orig.lines.map((l) => [l.id, l]));
+    const plan: Array<{ line: DeptTransferLineRow; qty: number; entryQty: number | null; entryUnit: string }> = [];
+    if (input.lines && input.lines.length > 0) {
+      const seen = new Set<string>();
+      for (const a of input.lines) {
+        const line = byId.get(String(a?.lineId || '').trim());
+        if (!line) throw blocked('invalid', `Line ${String(a?.lineId || '(blank)')} is not on ${orig.transfer_no}.`);
+        if (seen.has(line.id)) throw blocked('invalid', `${line.material_name} is listed twice.`);
+        seen.add(line.id);
+        const meta: PackMeta = { unit: line.unit, purchase_unit: line.purchase_unit, pack_size: line.pack_factor };
+        const unit: TransferEntryUnit = a?.unit === 'recipe' ? 'recipe' : 'purchase';
+        const q = transferQtyToRecipe(meta, Number(a?.quantity), unit);
+        if (!Number.isFinite(q) || q <= EPS) {
+          throw blocked('invalid', `Quantity to send back for ${line.material_name} must be a positive number.`, { materialId: line.material_id });
+        }
+        plan.push({ line, qty: q, entryQty: Number(a.quantity), entryUnit: unit === 'recipe' ? line.unit : (line.purchase_unit || line.unit) });
+      }
+    } else {
+      // THE PREFILL. With an open dispute on the document: exactly the
+      // disputed quantities, and nothing on an undisputed line. With none (a
+      // receiver sending back of its own accord): everything still standing.
+      const anyOpen = orig.lines.some((l) => l.qty_open_disputed > EPS);
+      for (const line of orig.lines) {
+        const q = anyOpen ? line.qty_open_disputed : (authority === 'receiver' ? line.qty_net : 0);
+        if (q > EPS) plan.push({ line, qty: r6(q), entryQty: null, entryUnit: '' });
+      }
+    }
+    if (plan.length === 0) {
+      throw blocked('state', authority === 'receiver'
+        ? `Nothing on ${orig.transfer_no} is left to send back.`
+        : `${orig.transfer_no} has no open dispute to reverse.`);
+    }
+
+    // ── caps — a reverse can never move more than the line moved ──────────
+    for (const p of plan) {
+      const meta: PackMeta = { unit: p.line.unit, purchase_unit: p.line.purchase_unit, pack_size: p.line.pack_factor };
+      const cap = authority === 'receiver' ? p.line.qty_net : p.line.qty_open_disputed;
+      if (p.qty > cap + EPS) {
+        throw blocked(
+          authority === 'receiver' ? 'invalid' : 'state',
+          authority === 'receiver'
+            ? `Cannot send back ${fmtDual(p.qty, meta)} of ${p.line.material_name}: ${orig.transfer_no} moved ` +
+              `${fmtDual(p.line.qty_sent, meta)} and ${fmtDual(p.line.qty_reversed, meta)} has already gone back. ` +
+              `Send back ${fmtDual(Math.max(0, cap), meta)} or less.`
+            : `Only the disputed ${fmtDual(Math.max(0, cap), meta)} of ${p.line.material_name} can be reversed from ` +
+              `${orig.from_department_name}'s side; anything more is a new transfer from ${orig.to_department_name}.`,
+          { materialId: p.line.material_id, requested: p.qty, available: Math.max(0, cap) },
+        );
+      }
+    }
+
+    const { from, to } = resolveEnds(db, orig.to_department_id, orig.from_department_id);
+    const prepared: PreparedLine[] = plan.map((p) => {
+      const m = transferMaterial(db, p.line.material_id);
+      if (!m) throw blocked('unknown_material', `Material ${p.line.material_id} no longer exists.`, { httpStatus: 404 });
+      const pm: PackMeta = { unit: p.line.unit, purchase_unit: p.line.purchase_unit, pack_size: p.line.pack_factor };
+      return {
+        m, qty: r6(p.qty),
+        entryQty: p.entryQty != null && Number.isFinite(p.entryQty) ? p.entryQty : toPurchaseQty(p.qty, pm),
+        entryUnit: p.entryUnit || (p.line.purchase_unit || p.line.unit),
+        factor: packFactor(m), notes: '', reversesLineId: p.line.id,
+      };
+    });
+
+    let transfer: DeptTransferWithLines;
+    try {
+      transfer = writeTransferDoc(db, {
+        from, to, actor, clientKey, fingerprint,
+        notes: (`Reverses ${orig.transfer_no}` + (String(input.notes || '').trim() ? ` — ${String(input.notes).trim()}` : '')),
+        outletId: input.outletId ?? orig.outlet_id ?? null,
+        reversesTransferId: orig.id, lines: prepared,
+      });
+    } catch (e) {
+      if (isDeptTransferBlocked(e) && e.reason === 'insufficient') {
+        throw blocked('insufficient',
+          `${e.message} If ${orig.to_department_name} has been COUNTED since ${orig.transfer_no} and the count ` +
+          `left these goods out, they never reached its shelf and are still at ${orig.from_department_name}: ` +
+          `record a count for ${orig.from_department_name} instead of reversing.`,
+          { materialId: e.materialId, requested: e.requested, available: e.available });
+      }
+      throw e;
+    }
+
+    // ── settle the disputes the reverse answers, oldest first ─────────────
+    const at = nowMs();
+    const settle = db.prepare(`
+      UPDATE department_transfer_disputes
+         SET qty_reversed = ?, reverse_transfer_id = ?,
+             status = CASE WHEN ? THEN 'resolved' ELSE status END,
+             resolution = CASE WHEN ? THEN 'reversed' ELSE resolution END,
+             resolved_by = CASE WHEN ? THEN ? ELSE resolved_by END,
+             resolved_at = CASE WHEN ? THEN ? ELSE resolved_at END
+       WHERE id = ?
+    `);
+    for (const p of plan) {
+      let left = p.qty;
+      const open = orig.disputes.filter((d) => d.line_id === p.line.id && d.status === 'open');
+      for (const d of open) {
+        if (left <= EPS) break;
+        const need = r6(d.qty_disputed - d.qty_reversed);
+        const take = r6(Math.min(left, need));
+        left = r6(left - take);
+        const done = take >= need - EPS ? 1 : 0;
+        settle.run(r6(d.qty_reversed + take), transfer.id, done, done, done, actor, done, at, d.id);
+      }
+    }
+    refreshDisputeStatus(db, orig.id, at);
+    return { transfer, duplicate: false, original: getDeptTransfer(db, orig.id) as DeptTransferWithLines };
+  });
+  return run.immediate();
+}
+
+/* ── reading ────────────────────────────────────────────────────────────── */
+
+/** One transfer document with its lines (reversed / net / disputed figures
+ *  computed), its disputes and its reverse links, or null. */
 export function getDeptTransfer(db: Database.Database, transferId: string): DeptTransferWithLines | null {
   try {
-    const doc = db.prepare('SELECT * FROM department_transfers WHERE id = ?')
-      .get(String(transferId || '')) as DeptTransferRow | undefined;
+    const doc = db.prepare(`
+      SELECT id, transfer_no, outlet_id, from_department_id, from_department_name,
+             to_department_id, to_department_name, status, txn_date, notes, created_by, created_at,
+             client_key, reverses_transfer_id, dispute_status, updated_at
+        FROM department_transfers WHERE id = ?
+    `).get(String(transferId || '')) as DeptTransferRow | undefined;
     if (!doc) return null;
-    const lines = db.prepare(
-      'SELECT * FROM department_transfer_lines WHERE transfer_id = ? ORDER BY created_at ASC, rowid ASC',
-    ).all(doc.id) as DeptTransferLineRow[];
-    return { ...doc, lines };
+    const rawLines = db.prepare(`
+      SELECT id, transfer_id, material_id, material_name, unit, purchase_unit, pack_factor, qty_sent,
+             entry_qty, entry_unit, out_txn_id, in_txn_id, reverses_line_id, notes, created_at
+        FROM department_transfer_lines WHERE transfer_id = ? ORDER BY created_at ASC, rowid ASC
+    `).all(doc.id) as Array<Omit<DeptTransferLineRow, 'qty_reversed' | 'qty_net' | 'qty_open_disputed'>>;
+    const disputes = db.prepare(`
+      SELECT id, transfer_id, line_id, kind, qty_disputed, entry_qty, entry_unit, reason, raised_by, raised_at,
+             status, resolution, resolution_note, resolved_by, resolved_at, qty_reversed, reverse_transfer_id,
+             alert_recipients
+        FROM department_transfer_disputes WHERE transfer_id = ? ORDER BY raised_at ASC, rowid ASC
+    `).all(doc.id) as DeptTransferDisputeRow[];
+    const reversedByLine = new Map<string, number>();
+    if (rawLines.length > 0) {
+      const rows = db.prepare(`
+        SELECT l.reverses_line_id AS lid, COALESCE(SUM(l.qty_sent), 0) AS q
+          FROM department_transfer_lines l JOIN department_transfers t ON t.id = l.transfer_id
+         WHERE t.status = 'posted' AND l.reverses_line_id IN (SELECT value FROM json_each(?))
+         GROUP BY l.reverses_line_id
+      `).all(JSON.stringify(rawLines.map((l) => l.id))) as Array<{ lid: string; q: number }>;
+      for (const r of rows) reversedByLine.set(String(r.lid), r6(Number(r.q) || 0));
+    }
+    const lines: DeptTransferLineRow[] = rawLines.map((l) => {
+      const rev = reversedByLine.get(l.id) || 0;
+      const openDisputed = disputes
+        .filter((d) => d.line_id === l.id && d.status === 'open')
+        .reduce((s, d) => s + Math.max(0, (Number(d.qty_disputed) || 0) - (Number(d.qty_reversed) || 0)), 0);
+      const net = r6(l.qty_sent - rev);
+      return { ...l, qty_reversed: rev, qty_net: net, qty_open_disputed: r6(Math.min(openDisputed, Math.max(0, net))) };
+    });
+    const reversedBy = db.prepare(`
+      SELECT id, transfer_no, created_at, created_by FROM department_transfers
+       WHERE reverses_transfer_id = ? AND status = 'posted' ORDER BY created_at ASC, rowid ASC
+    `).all(doc.id) as Array<{ id: string; transfer_no: string; created_at: string; created_by: string }>;
+    let reversesNo = '';
+    if (doc.reverses_transfer_id) {
+      const r = db.prepare('SELECT transfer_no FROM department_transfers WHERE id = ?').get(doc.reverses_transfer_id) as { transfer_no: string } | undefined;
+      reversesNo = String(r?.transfer_no || '');
+    }
+    return { ...doc, lines, disputes, reverses_transfer_no: reversesNo, reversed_by: reversedBy };
   } catch { return null; }
+}
+
+/**
+ * Transfers with an OPEN dispute out of these departments (null = every
+ * department) — the number the bell / list shows the sender's side.
+ */
+export function countOpenDeptTransferDisputes(db: Database.Database, fromDepartmentIds: string[] | null): number {
+  try {
+    if (fromDepartmentIds && fromDepartmentIds.length === 0) return 0;
+    const row = fromDepartmentIds
+      ? db.prepare(`
+          SELECT COUNT(*) AS n FROM department_transfers
+           WHERE dispute_status = 'open' AND from_department_id IN (SELECT value FROM json_each(?))
+        `).get(JSON.stringify(fromDepartmentIds))
+      : db.prepare(`SELECT COUNT(*) AS n FROM department_transfers WHERE dispute_status = 'open'`).get();
+    return Number((row as { n: number } | undefined)?.n) || 0;
+  } catch { return 0; }
 }
 
 /* ── the integrity check ────────────────────────────────────────────────── */
 
 export interface DeptTransferIntegrityIssue {
   issue:
-    | 'unpaired'            // a reference with ≠ 1 out leg or ≠ 1 in leg
-    | 'qty_mismatch'        // out + in ≠ 0
+    | 'unpaired'                // a reference with ≠ 1 out leg or ≠ 1 in leg
+    | 'qty_mismatch'            // out + in ≠ 0
     | 'material_mismatch'
     | 'same_department'
     | 'no_reference'
-    | 'line_missing_legs'   // a received line with qty > 0 but no ledger pair
-    | 'legs_on_unreceived'  // ledger legs whose line's document is not 'received'
-    | 'line_qty_mismatch';  // line.qty_received ≠ the posted pair's quantity
+    | 'orphan_legs'             // legs whose reference is no transfer line
+    | 'line_missing_legs'       // a line of a posted document with no ledger pair
+    | 'line_leg_ids'            // the line's out/in ids do not name its legs
+    | 'line_qty_mismatch'       // line.qty_sent ≠ the posted pair's quantity
+    | 'leg_department_mismatch' // a leg on a department the document does not name
+    | 'legs_on_unposted'        // legs whose document is not 'posted'
+    | 'reverse_direction'       // a reverse line not going receiver → sender
+    | 'over_reversed';          // reverses of one line exceed what it moved
   reference_id: string;
   detail: string;
 }
 
 /**
- * Pair integrity for the transfer rail — the check the brief's map called (g).
- * Every transfer_out must have exactly one transfer_in under the same
- * reference_id, same material, opposite and equal quantity, different
- * department; and every received document line must point at its pair. An
- * empty `issues` is the proof that no kilo was left in two ledgers or none.
- * Read-only. Meant for /api/department-ledger/check.
+ * Pair integrity for the transfer rail. Every transfer_out must have exactly
+ * one transfer_in under the same reference_id, same material, opposite and
+ * equal quantity, different department; every line of a posted document must
+ * point at its pair, on the document's own two departments; a reverse may
+ * never exceed the line it corrects. An empty `issues` is the proof that no
+ * kilo was left in two ledgers or none. Read-only. Called by
+ * /api/department-ledger/check.
  */
 export function checkDeptTransferPairs(db: Database.Database): {
-  pairs: number; legs: number; issues: DeptTransferIntegrityIssue[];
+  pairs: number; legs: number; lines: number; issues: DeptTransferIntegrityIssue[];
 } {
   const issues: DeptTransferIntegrityIssue[] = [];
   let legs: Array<{ id: string; reference_id: string | null; type: string; department_id: string; material_id: string; quantity: number }> = [];
@@ -2015,7 +2533,7 @@ export function checkDeptTransferPairs(db: Database.Database): {
       SELECT id, reference_id, type, department_id, material_id, quantity
         FROM department_material_transactions WHERE type IN (${DEPT_TRANSFER_TYPES_SQL})
     `).all() as typeof legs;
-  } catch { return { pairs: 0, legs: 0, issues }; }
+  } catch { return { pairs: 0, legs: 0, lines: 0, issues }; }
 
   const byRef = new Map<string, typeof legs>();
   for (const l of legs) {
@@ -2029,7 +2547,7 @@ export function checkDeptTransferPairs(db: Database.Database): {
     byRef.set(ref, arr);
   }
   let pairs = 0;
-  const pairQty = new Map<string, number>();
+  const pair = new Map<string, { out: (typeof legs)[number]; in: (typeof legs)[number] }>();
   for (const [ref, arr] of byRef) {
     const outs = arr.filter((l) => l.type === 'transfer_out');
     const ins = arr.filter((l) => l.type === 'transfer_in');
@@ -2048,28 +2566,64 @@ export function checkDeptTransferPairs(db: Database.Database): {
       issues.push({ issue: 'same_department', reference_id: ref, detail: `Both legs are on department ${o.department_id}.` });
     }
     pairs++;
-    pairQty.set(ref, Number(i.quantity) || 0);
+    pair.set(ref, { out: o, in: i });
   }
 
+  let lineCount = 0;
   try {
     const lines = db.prepare(`
-      SELECT l.id, l.qty_received, l.out_txn_id, l.in_txn_id, t.status, t.transfer_no
+      SELECT l.id, l.material_id, l.qty_sent, l.out_txn_id, l.in_txn_id, l.reverses_line_id,
+             t.status, t.transfer_no, t.from_department_id, t.to_department_id
         FROM department_transfer_lines l JOIN department_transfers t ON t.id = l.transfer_id
-    `).all() as Array<{ id: string; qty_received: number | null; out_txn_id: string | null; in_txn_id: string | null; status: string; transfer_no: string }>;
+    `).all() as Array<{
+      id: string; material_id: string; qty_sent: number; out_txn_id: string | null; in_txn_id: string | null;
+      reverses_line_id: string | null; status: string; transfer_no: string; from_department_id: string; to_department_id: string;
+    }>;
+    lineCount = lines.length;
+    const lineById = new Map(lines.map((l) => [l.id, l]));
+    const reversedSum = new Map<string, number>();
     for (const l of lines) {
-      const posted = byRef.has(l.id);
-      if (l.status !== 'received' && posted) {
-        issues.push({ issue: 'legs_on_unreceived', reference_id: l.id, detail: `${l.transfer_no} is ${l.status} but its line has ledger legs.` });
+      const p = pair.get(l.id);
+      const hasLegs = byRef.has(l.id);
+      if (l.status !== 'posted') {
+        if (hasLegs) issues.push({ issue: 'legs_on_unposted', reference_id: l.id, detail: `${l.transfer_no} is ${l.status} but its line has ledger legs.` });
+        continue;
       }
-      if (l.status === 'received' && (Number(l.qty_received) || 0) > EPS) {
-        if (!posted || !l.out_txn_id || !l.in_txn_id) {
-          issues.push({ issue: 'line_missing_legs', reference_id: l.id, detail: `${l.transfer_no} line received ${l.qty_received} but has no ledger pair.` });
-        } else if (pairQty.has(l.id) && Math.abs((pairQty.get(l.id) || 0) - (Number(l.qty_received) || 0)) > 1e-6) {
-          issues.push({ issue: 'line_qty_mismatch', reference_id: l.id, detail: `${l.transfer_no} line says ${l.qty_received}, ledger pair moved ${pairQty.get(l.id)}.` });
+      if (!hasLegs) {
+        issues.push({ issue: 'line_missing_legs', reference_id: l.id, detail: `${l.transfer_no} line moved ${l.qty_sent} but has no ledger pair.` });
+        continue;
+      }
+      if (!p) continue; // already reported as unpaired
+      if (String(l.out_txn_id || '') !== p.out.id || String(l.in_txn_id || '') !== p.in.id) {
+        issues.push({ issue: 'line_leg_ids', reference_id: l.id, detail: `${l.transfer_no} line names legs ${l.out_txn_id || '∅'} / ${l.in_txn_id || '∅'}, ledger has ${p.out.id} / ${p.in.id}.` });
+      }
+      if (Math.abs((Number(p.in.quantity) || 0) - (Number(l.qty_sent) || 0)) > 1e-6) {
+        issues.push({ issue: 'line_qty_mismatch', reference_id: l.id, detail: `${l.transfer_no} line says ${l.qty_sent}, ledger pair moved ${p.in.quantity}.` });
+      }
+      if (p.out.department_id !== l.from_department_id || p.in.department_id !== l.to_department_id || p.in.material_id !== l.material_id) {
+        issues.push({ issue: 'leg_department_mismatch', reference_id: l.id, detail: `${l.transfer_no}: legs are ${p.out.department_id} → ${p.in.department_id} for ${p.in.material_id}; the document says ${l.from_department_id} → ${l.to_department_id} for ${l.material_id}.` });
+      }
+      const rl = String(l.reverses_line_id || '');
+      if (rl) {
+        const orig = lineById.get(rl);
+        if (!orig || orig.from_department_id !== l.to_department_id || orig.to_department_id !== l.from_department_id || orig.material_id !== l.material_id) {
+          issues.push({ issue: 'reverse_direction', reference_id: l.id, detail: `${l.transfer_no} reverses line ${rl}, which is not the same goods going the other way.` });
         }
+        reversedSum.set(rl, (reversedSum.get(rl) || 0) + (Number(l.qty_sent) || 0));
+      }
+    }
+    for (const [rl, sum] of reversedSum) {
+      const orig = lineById.get(rl);
+      if (orig && sum > (Number(orig.qty_sent) || 0) + 1e-6) {
+        issues.push({ issue: 'over_reversed', reference_id: rl, detail: `${orig.transfer_no} line moved ${orig.qty_sent} but ${r6(sum)} has been reversed.` });
+      }
+    }
+    for (const ref of byRef.keys()) {
+      if (!lineById.has(ref)) {
+        issues.push({ issue: 'orphan_legs', reference_id: ref, detail: `Ledger legs reference ${ref}, which is no transfer line.` });
       }
     }
   } catch { /* document tables absent — the ledger-side checks above still stand */ }
 
-  return { pairs, legs: legs.length, issues };
+  return { pairs, legs: legs.length, lines: lineCount, issues };
 }

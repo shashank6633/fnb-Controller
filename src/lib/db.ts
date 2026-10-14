@@ -7360,18 +7360,30 @@ function initializeSchema(db: Database.Database) {
   // children (Akan Main Kitchen, Akan Tandoori, …), and roll-up runs downward
   // only. A transfer is how Kitchen hands that stock on.
   //
-  // THESE TWO TABLES HOLD NO BALANCE. The stock movement is the pair of ledger
-  // rows department_material_transactions 'transfer_out' (sender, −) and
-  // 'transfer_in' (receiver, +), written together by postDeptTransfer() in
-  // src/lib/dept-ledger.ts, both with reference_id = department_transfer_lines.id.
-  // A PENDING document moves nothing — the goods stay on the sender's ledger
-  // until the receiver confirms, so a kilo is never in two ledgers or none.
-  // Never SUM qty_sent / qty_received into a balance; the ledger is the truth.
+  // ONE STEP (owner's ruling). A document is written in the SAME transaction
+  // as its stock movement: the pair of ledger rows department_material_
+  // transactions 'transfer_out' (sender, −) and 'transfer_in' (receiver, +),
+  // written together by postDeptTransfer() in src/lib/dept-ledger.ts, both with
+  // reference_id = department_transfer_lines.id. So every document is
+  // 'posted' — there is no pending state and nothing waits for a confirm.
+  // THESE TABLES HOLD NO BALANCE: never SUM qty_sent into stock; the ledger is
+  // the truth.
   //
-  // UNITS: qty_sent / qty_received are RECIPE units (the ledger's basis).
-  // entry_qty / entry_unit are what the person TYPED (purchase units on every
-  // screen); pack_factor is packFactor() at send time, snapshotted with the
-  // unit names so a later edit to the material cannot re-mean the line.
+  // DISPUTES (department_transfer_disputes) record a receiver's claim — short,
+  // wrong item, not received — and move NOTHING. The correction is a REVERSE
+  // transfer: an ordinary posted document whose reverses_transfer_id /
+  // reverses_line_id name what it corrects.
+  //
+  // IDEMPOTENCY: client_key is minted by the screen once per send; the UNIQUE
+  // (created_by, client_key) index means a retried send after a lost response
+  // can never write a second document. request_fingerprint is the request the
+  // key was first used for, so a reused key with different goods is refused.
+  //
+  // UNITS: qty_sent / qty_disputed / qty_reversed are RECIPE units (the
+  // ledger's basis). entry_qty / entry_unit are what the person TYPED (purchase
+  // units on every screen); pack_factor is packFactor() at send time,
+  // snapshotted with the unit names so a later edit to the material cannot
+  // re-mean the line.
   //
   // Department NAMES are snapshotted for the same reason the movement record
   // snapshots them: a rename must not rewrite where last month's goods went.
@@ -7381,66 +7393,104 @@ function initializeSchema(db: Database.Database) {
   // above it down; the writers fail loudly on a missing table instead. One
   // statement per prepare().run(), so a failing statement is the one named in
   // the log line rather than "somewhere in a multi-statement string".
+  //
+  // ROUND-1 SHAPE: an unshipped build created these tables with a pending /
+  // received / cancelled CHECK. Nothing was ever deployed with it; a dev
+  // database still carrying it is NAMED in the log and left alone (no boot
+  // migration drops a table) — the writers then refuse loudly on it.
   try {
-    const DEPT_TRANSFER_DDL: string[] = [
-      `CREATE TABLE IF NOT EXISTS department_transfers (
-        id                      TEXT PRIMARY KEY,
-        transfer_no             TEXT NOT NULL DEFAULT '',          -- DTR-<year>-####
-        outlet_id               TEXT,
-        from_department_id      TEXT NOT NULL,
-        from_department_name    TEXT NOT NULL DEFAULT '',
-        to_department_id        TEXT NOT NULL,
-        to_department_name      TEXT NOT NULL DEFAULT '',
-        status                  TEXT NOT NULL DEFAULT 'pending'
-                                CHECK (status IN ('pending', 'received', 'cancelled')),
-        notes                   TEXT NOT NULL DEFAULT '',
-        created_by              TEXT NOT NULL DEFAULT '',          -- session email of the SENDER
-        created_at              TEXT NOT NULL DEFAULT (datetime('now')),
-        received_by             TEXT NOT NULL DEFAULT '',
-        received_at             TEXT NOT NULL DEFAULT '',
-        receive_txn_date        TEXT NOT NULL DEFAULT '',          -- business date stamped on both ledger legs
-        receive_override_reason TEXT NOT NULL DEFAULT '',          -- non-blank ONLY when the sender confirmed their own transfer
-        cancelled_by            TEXT NOT NULL DEFAULT '',
-        cancelled_at            TEXT NOT NULL DEFAULT '',
-        cancel_reason           TEXT NOT NULL DEFAULT '',
-        updated_at              TEXT NOT NULL DEFAULT (datetime('now'))
-      )`,
-      `CREATE UNIQUE INDEX IF NOT EXISTS idx_dept_transfers_no
-        ON department_transfers(transfer_no) WHERE transfer_no <> ''`,
-      `CREATE INDEX IF NOT EXISTS idx_dept_transfers_from ON department_transfers(from_department_id, status)`,
-      `CREATE INDEX IF NOT EXISTS idx_dept_transfers_to ON department_transfers(to_department_id, status)`,
-      `CREATE TABLE IF NOT EXISTS department_transfer_lines (
-        id            TEXT PRIMARY KEY,                 -- = reference_id on BOTH ledger legs
-        transfer_id   TEXT NOT NULL,
-        material_id   TEXT NOT NULL,
-        material_name TEXT NOT NULL DEFAULT '',
-        unit          TEXT NOT NULL DEFAULT '',         -- recipe unit, snapshot
-        purchase_unit TEXT NOT NULL DEFAULT '',         -- purchase unit, snapshot
-        pack_factor   REAL NOT NULL DEFAULT 1,          -- packFactor() at send time
-        qty_sent      REAL NOT NULL,                    -- RECIPE units, > 0
-        entry_qty     REAL,                             -- as typed
-        entry_unit    TEXT NOT NULL DEFAULT '',         -- the unit it was typed in
-        qty_received  REAL,                             -- RECIPE units; NULL until received; 0 = none accepted
-        out_txn_id    TEXT,                             -- the sender's transfer_out ledger row
-        in_txn_id     TEXT,                             -- the receiver's transfer_in ledger row
-        notes         TEXT NOT NULL DEFAULT '',
-        created_at    TEXT NOT NULL DEFAULT (datetime('now'))
-      )`,
-      `CREATE INDEX IF NOT EXISTS idx_dept_transfer_lines_transfer ON department_transfer_lines(transfer_id)`,
-      `CREATE INDEX IF NOT EXISTS idx_dept_transfer_lines_material ON department_transfer_lines(material_id)`,
-      // The pair lookup / integrity check reads transfer legs by reference_id.
-      // PARTIAL, so it indexes only transfer rows and costs nothing at boot on
-      // the rest of the ledger.
-      `CREATE INDEX IF NOT EXISTS idx_dmt_transfer_ref
-        ON department_material_transactions(reference_id) WHERE type IN ('transfer_out', 'transfer_in')`,
-    ];
-    for (const sql of DEPT_TRANSFER_DDL) {
-      try { db.prepare(sql).run(); }
-      catch (e) { console.error(`department transfer schema statement failed: ${sql.split('\n')[0]}`, e); }
+    const r1 = db.prepare(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'department_transfers'`)
+      .get() as { sql?: string } | undefined;
+    if (r1?.sql && /'pending'/.test(r1.sql)) {
+      console.error('department transfer schema: department_transfers has the UNSHIPPED round-1 (pending/received) shape on this database. ' +
+        'It was never deployed; drop department_transfers and department_transfer_lines by hand on this dev database and restart.');
+    } else {
+      const DEPT_TRANSFER_DDL: string[] = [
+        `CREATE TABLE IF NOT EXISTS department_transfers (
+          id                    TEXT PRIMARY KEY,
+          transfer_no           TEXT NOT NULL DEFAULT '',          -- DTR-<year>-####
+          outlet_id             TEXT,
+          from_department_id    TEXT NOT NULL,
+          from_department_name  TEXT NOT NULL DEFAULT '',
+          to_department_id      TEXT NOT NULL,
+          to_department_name    TEXT NOT NULL DEFAULT '',
+          status                TEXT NOT NULL DEFAULT 'posted',    -- always 'posted': the stock moved when this row was written
+          txn_date              TEXT NOT NULL DEFAULT '',          -- business date (IST) on both ledger legs
+          notes                 TEXT NOT NULL DEFAULT '',
+          created_by            TEXT NOT NULL DEFAULT '',          -- session email of the SENDER
+          created_at            TEXT NOT NULL DEFAULT (datetime('now')),
+          client_key            TEXT NOT NULL DEFAULT '',          -- idempotency key minted by the screen
+          request_fingerprint   TEXT NOT NULL DEFAULT '',          -- the request the key was first used for
+          reverses_transfer_id  TEXT NOT NULL DEFAULT '',          -- set on a REVERSE: the transfer it corrects
+          dispute_status        TEXT NOT NULL DEFAULT '',          -- '' | 'open' | 'resolved'
+          updated_at            TEXT NOT NULL DEFAULT (datetime('now'))
+        )`,
+        `CREATE UNIQUE INDEX IF NOT EXISTS idx_dept_transfers_no
+          ON department_transfers(transfer_no) WHERE transfer_no <> ''`,
+        `CREATE UNIQUE INDEX IF NOT EXISTS idx_dept_transfers_client_key
+          ON department_transfers(created_by, client_key) WHERE client_key <> ''`,
+        `CREATE INDEX IF NOT EXISTS idx_dept_transfers_from ON department_transfers(from_department_id, created_at)`,
+        `CREATE INDEX IF NOT EXISTS idx_dept_transfers_to ON department_transfers(to_department_id, created_at)`,
+        `CREATE INDEX IF NOT EXISTS idx_dept_transfers_reverses
+          ON department_transfers(reverses_transfer_id) WHERE reverses_transfer_id <> ''`,
+        `CREATE INDEX IF NOT EXISTS idx_dept_transfers_dispute
+          ON department_transfers(dispute_status) WHERE dispute_status = 'open'`,
+        `CREATE TABLE IF NOT EXISTS department_transfer_lines (
+          id                TEXT PRIMARY KEY,               -- = reference_id on BOTH ledger legs
+          transfer_id       TEXT NOT NULL,
+          material_id       TEXT NOT NULL,
+          material_name     TEXT NOT NULL DEFAULT '',
+          unit              TEXT NOT NULL DEFAULT '',       -- recipe unit, snapshot
+          purchase_unit     TEXT NOT NULL DEFAULT '',       -- purchase unit, snapshot
+          pack_factor       REAL NOT NULL DEFAULT 1,        -- packFactor() at send time
+          qty_sent          REAL NOT NULL,                  -- RECIPE units moved, > 0 (both legs)
+          entry_qty         REAL,                           -- as typed
+          entry_unit        TEXT NOT NULL DEFAULT '',       -- the unit it was typed in
+          out_txn_id        TEXT NOT NULL DEFAULT '',       -- the sender's transfer_out ledger row
+          in_txn_id         TEXT NOT NULL DEFAULT '',       -- the receiver's transfer_in ledger row
+          reverses_line_id  TEXT NOT NULL DEFAULT '',       -- set on a REVERSE line: the line it corrects
+          notes             TEXT NOT NULL DEFAULT '',
+          created_at        TEXT NOT NULL DEFAULT (datetime('now'))
+        )`,
+        `CREATE INDEX IF NOT EXISTS idx_dept_transfer_lines_transfer ON department_transfer_lines(transfer_id)`,
+        `CREATE INDEX IF NOT EXISTS idx_dept_transfer_lines_material ON department_transfer_lines(material_id)`,
+        `CREATE INDEX IF NOT EXISTS idx_dept_transfer_lines_reverses
+          ON department_transfer_lines(reverses_line_id) WHERE reverses_line_id <> ''`,
+        `CREATE TABLE IF NOT EXISTS department_transfer_disputes (
+          id                   TEXT PRIMARY KEY,
+          transfer_id          TEXT NOT NULL,
+          line_id              TEXT NOT NULL,
+          kind                 TEXT NOT NULL,               -- 'short' | 'wrong_item' | 'not_received'
+          qty_disputed         REAL NOT NULL,               -- RECIPE units claimed missing / wrong
+          entry_qty            REAL,                        -- 'short': what DID arrive, as typed
+          entry_unit           TEXT NOT NULL DEFAULT '',
+          reason               TEXT NOT NULL,
+          raised_by            TEXT NOT NULL,               -- session email
+          raised_at            TEXT NOT NULL,
+          status               TEXT NOT NULL DEFAULT 'open', -- 'open' | 'resolved'
+          resolution           TEXT NOT NULL DEFAULT '',    -- 'reversed' | 'dismissed'
+          resolution_note      TEXT NOT NULL DEFAULT '',
+          resolved_by          TEXT NOT NULL DEFAULT '',
+          resolved_at          TEXT NOT NULL DEFAULT '',
+          qty_reversed         REAL NOT NULL DEFAULT 0,     -- RECIPE units moved back against this claim
+          reverse_transfer_id  TEXT NOT NULL DEFAULT '',
+          alert_recipients     TEXT NOT NULL DEFAULT ''     -- who was told, comma-joined emails
+        )`,
+        `CREATE INDEX IF NOT EXISTS idx_dept_transfer_disputes_transfer ON department_transfer_disputes(transfer_id, status)`,
+        // The pair lookup / integrity check reads transfer legs by reference_id.
+        // PARTIAL, so it indexes only transfer rows and costs nothing at boot on
+        // the rest of the ledger.
+        `CREATE INDEX IF NOT EXISTS idx_dmt_transfer_ref
+          ON department_material_transactions(reference_id) WHERE type IN ('transfer_out', 'transfer_in')`,
+      ];
+      for (const sql of DEPT_TRANSFER_DDL) {
+        try { db.prepare(sql).run(); }
+        catch (e) { console.error(`department transfer schema statement failed: ${sql.split('\n')[0]}`, e); }
+      }
     }
     // ASSERT, don't assume — an error above is only logged, and a missing table
     // must be a named log line, not a 500 at the first transfer.
-    for (const t of ['department_transfers', 'department_transfer_lines']) {
+    for (const t of ['department_transfers', 'department_transfer_lines', 'department_transfer_disputes']) {
       const row = db.prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`).get(t) as { name?: string } | undefined;
       if (!row?.name) console.error(`department transfer schema verification failed: table ${t} is absent`);
     }

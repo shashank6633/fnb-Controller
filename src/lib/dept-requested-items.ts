@@ -91,6 +91,25 @@ import { resolveDeptSet } from './dept-stock';
  * arm contributes nothing; it is what makes the escape hatch stick from the
  * first dept-tagged count onwards.)
  *
+ * THE LEDGER-ARRIVAL UNION (2026-10-14 — direct receipts and transfers)
+ * ---------------------------------------------------------------------
+ * Two rails put stock on a department's shelf WITHOUT a requisition line:
+ *   · 'direct_receipt' — a vendor delivery routed straight to the department by
+ *     Settings → Direct Issue (meat / poultry / seafood land on Kitchen);
+ *   · 'transfer_in'    — another department handed it over (Kitchen → Akan
+ *     Tandoori).
+ * Before this arm a material that only ever arrived that way could never be
+ * COUNTED by the department holding it: Kitchen raises no requisitions, so its
+ * routed meat was on no sheet at all, and a child department that received
+ * chicken by transfer had no row to count it on. The arm adds every material a
+ * department has ever RECEIVED on either rail — "ever", the same no-window rule
+ * as the requisition arm above. Both types are positive by postDeptLedger's
+ * sign contract, and the undo of each is a type of its own that is NOT in the
+ * list, so no quantity test is needed (one could never fire). It can only
+ * WIDEN a set, never narrow one, so the superset property
+ * over dept-stock.DEPT_ITEM_SET_SQL still holds. A department with neither kind
+ * of row gets exactly the set it had before.
+ *
  * LINE OWNERSHIP
  * --------------
  * COALESCE(NULLIF(TRIM(ri.department_id),''), r.department_id) — the per-line
@@ -102,9 +121,18 @@ import { resolveDeptSet } from './dept-stock';
  */
 
 /**
+ * The ledger types that ARRIVE stock on a department without a requisition
+ * line — see "THE LEDGER-ARRIVAL UNION" above. Exported so the department
+ * closing sheet (src/app/api/closing-stock/dept-sheet) builds its pair set from
+ * the SAME list and the two surfaces cannot disagree about what is countable.
+ */
+export const DEPT_LEDGER_ARRIVAL_TYPES_SQL = `'direct_receipt', 'transfer_in'`;
+
+/**
  * SQL fragment restricting a `raw_materials rm` alias to one department set's
- * ever-requested items. Binds TWO params, both the SAME JSON array of
- * department ids — pass deptRequestedParams(deptSet).
+ * ever-requested items. Binds THREE params, all the SAME JSON array of
+ * department ids — pass deptRequestedParams(deptSet), always spread, so the
+ * count can never drift from this fragment.
  */
 export const DEPT_REQUESTED_ITEM_SQL = `rm.id IN (
   SELECT ri.material_id
@@ -119,12 +147,17 @@ export const DEPT_REQUESTED_ITEM_SQL = `rm.id IN (
   FROM closing_stock cs
   WHERE COALESCE(cs.department_id, '') <> ''
     AND cs.department_id IN (SELECT value FROM json_each(?))
+  UNION
+  SELECT dmt.material_id
+  FROM department_material_transactions dmt
+  WHERE dmt.department_id IN (SELECT value FROM json_each(?))
+    AND dmt.type IN (${DEPT_LEDGER_ARRIVAL_TYPES_SQL})
 )`;
 
-/** The two bind params DEPT_REQUESTED_ITEM_SQL expects. */
-export function deptRequestedParams(deptSet: string[]): [string, string] {
+/** The three bind params DEPT_REQUESTED_ITEM_SQL expects. */
+export function deptRequestedParams(deptSet: string[]): [string, string, string] {
   const json = JSON.stringify(deptSet);
-  return [json, json];
+  return [json, json, json];
 }
 
 /**

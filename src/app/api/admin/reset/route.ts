@@ -794,6 +794,16 @@ export async function POST(req: Request) {
       // the same thing as zero.
       safeDel('department_material_transactions');
       safeDel('department_materials');
+      // The department-to-department transfer DOCUMENTS go with the ledger
+      // they describe. Every line's reference_id names a transfer_out /
+      // transfer_in pair that was just deleted above; left behind, every line
+      // would fail the pair check (/api/department-ledger/check →
+      // line_missing_legs) and "Transfers in" would list goods that are on no
+      // ledger. They hold no balance, so deleting them moves nothing. Full wipe
+      // only — this is the one place the ledger itself is deleted.
+      safeDel('department_transfer_disputes');
+      safeDel('department_transfer_lines');
+      safeDel('department_transfers');
       // The unmapped-station skip log. Every row points at an order_item this
       // cleanup deletes; left behind it keeps a warning banner up about stations
       // and orders nobody can open any more.

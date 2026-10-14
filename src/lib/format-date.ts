@@ -28,6 +28,23 @@ const TZ = 'Asia/Kolkata';
  * SQLite's `datetime('now')` lacks a timezone marker — we MUST treat it as
  * UTC explicitly, otherwise the browser parses it as the user's local zone
  * and IST-rendering then double-shifts the result.
+ *
+ * FRACTIONAL SECONDS ARE THE SAME UTC STAMP, NOT A DIFFERENT SHAPE.
+ * The department ledger (src/lib/dept-ledger.ts nowMs()) writes created_at as
+ * `new Date().toISOString()` minus its 'Z' — "2026-10-14 08:15:30.123", UTC
+ * to the millisecond. Before 2026-10-14 the pattern below stopped at the
+ * seconds, so that string fell through to a bare `new Date(s)`: Chrome and
+ * Node read a zone-less date-time as LOCAL time (5 h 30 m early on an IST
+ * device — a 13:45 IST transfer printed as 08:15), and Safari rejects the
+ * space-separated form outright, so every such stamp printed the fallback.
+ * The fraction is now accepted and normalised to exactly three digits (the
+ * only width ECMA-262's date-time format defines, which is what Safari holds
+ * strings to), then parsed as UTC like every other zone-less stamp.
+ *
+ * NOTHING ELSE CHANGES. A string the old pattern matched is matched and
+ * rebuilt byte-for-byte as before (the fraction group is empty for it). A
+ * string carrying its own zone ('Z', '+05:30') never matched and still goes to
+ * `new Date(s)` untouched, as do Date instances, epoch numbers and bare dates.
  */
 function parseDb(value: unknown): Date | null {
   if (value == null || value === '') return null;
@@ -36,12 +53,17 @@ function parseDb(value: unknown): Date | null {
   const s = String(value).trim();
   if (!s) return null;
   // SQLite UTC without 'Z' — normalize to ISO so parsing is unambiguous.
-  // Pattern: "2026-05-29 14:00:00" → "2026-05-29T14:00:00Z"
+  // Pattern: "2026-05-29 14:00:00"     → "2026-05-29T14:00:00Z"
+  //          "2026-10-14 08:15:30.123" → "2026-10-14T08:15:30.123Z"
+  // (a 'T' separator is accepted too: "2026-05-29T14:00" → "2026-05-29T14:00Z")
   let iso = s;
-  const m = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}(:\d{2})?)$/.exec(s);
-  if (m) iso = `${m[1]}T${m[2]}Z`;
-  // Already-ISO strings without TZ also need a Z. e.g. "2026-05-29T14:00:00"
-  else if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?$/.test(s)) iso = s + 'Z';
+  const m = s.match(/^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}(:\d{2})?)(\.\d+)?$/);
+  // Seconds are required before a fraction ("14:00.5" is not a time) — such a
+  // string is left to `new Date` exactly as it always was.
+  if (m && !(m[4] && !m[3])) {
+    const frac = m[4] ? `.${(m[4].slice(1) + '00').slice(0, 3)}` : '';
+    iso = `${m[1]}T${m[2]}${frac}Z`;
+  }
   const d = new Date(iso);
   return isNaN(d.getTime()) ? null : d;
 }

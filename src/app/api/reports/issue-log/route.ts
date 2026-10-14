@@ -142,6 +142,8 @@ const STAGES: Record<string, IssueLogStageFilter> = {
   pre_ledger: 'pre_ledger',
   preledger: 'pre_ledger',
   consumption: 'consumption',
+  // Department → department hand-overs (the lib's TRANSFER stage).
+  transfer: 'transfer',
 };
 
 /** Calendar arithmetic on an IST date string. Never touches the server's zone. */
@@ -321,6 +323,19 @@ export async function GET(req: Request) {
         + `the issues above, usually days later — DO NOT ADD it to any issue figure.${qtyClause(t.consumption)}`,
         { qty: t.consumption.qty, basis: t.consumption.unit_basis, value: t.consumption.value },
       ));
+      // Only while the lib has the TRANSFER stage in play (the ledger has held a
+      // transfer, or transfers were asked for by name) — a database that has
+      // never transferred gets the file it always got, line for line.
+      if (t.transfer) {
+        lines.push(captionRow(
+          `TOTAL — TRANSFER (${lineCount(t.transfer.lines)}): goods handed from one department to another, one line per `
+          + `hand-over, in RECIPE units. With a department filter each quantity is signed from that department's side `
+          + `(+ received, − handed on). Goods moving between two kitchens' books — never in or out of the building — so `
+          + `DO NOT ADD this to any receipt, issue or consumption figure. No money: the goods were valued when they came in.`
+          + qtyClause(t.transfer),
+          { qty: t.transfer.qty, basis: t.transfer.unit_basis, value: t.transfer.value },
+        ));
+      }
 
       lines.push(captionRow(''));
       // A stage missing from stages_present returned nothing because the FILTERS

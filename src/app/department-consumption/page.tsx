@@ -36,6 +36,14 @@ const QtyPU = ({ qty, unit, pu, pack }: { qty: number; unit?: string; pu?: strin
     </>
   );
 };
+/** DEPARTMENT → DEPARTMENT TRANSFERS. The API sends transfer_in_* /
+ *  transfer_out_* ONLY on rows that moved stock between departments, and they
+ *  are NEVER inside qty / value / total_* — the kilos were counted where they
+ *  first came in (the store issue or the vendor delivery), so adding a hand-over
+ *  again would double-count. Every transfer column below therefore appears only
+ *  when the data holds one, beside the totals and never summed into them; with
+ *  no transfer the page renders exactly as it always did. */
+const hasXfer = (r: any) => !!r && (r.transfer_in_value !== undefined || r.transfer_out_value !== undefined);
 const todayIso = () => new Date().toISOString().slice(0, 10);
 const isoMinusDays = (n: number) => { const d = new Date(); d.setDate(d.getDate() - n); return d.toISOString().slice(0, 10); };
 
@@ -93,26 +101,38 @@ export default function DepartmentConsumptionPage() {
     document.body.appendChild(a); a.click(); document.body.removeChild(a);
     URL.revokeObjectURL(url);
   };
+  // Transfer columns exist only when the loaded data holds a transfer (see hasXfer).
+  const regXfer = (register?.rows || []).some(hasXfer);
+  const deptXfer = (data?.by_department || []).some(hasXfer);
+  const matXfer = (data?.by_department_material || []).some(hasXfer);
+
   const exportCsv = () => {
     if (view === 'register') {
       if (!register?.rows?.length) return;
-      const lines = [['date','department','material','category','qty_purchase','purchase_unit','qty_recipe','recipe_unit','value','requisitions'].join(',')];
+      const lines = [['date','department','material','category','qty_purchase','purchase_unit','qty_recipe','recipe_unit','value','requisitions',
+                      // Appended, never folded into qty/value — see hasXfer.
+                      ...(regXfer ? ['transfer_in_qty_purchase','transfer_out_qty_purchase','transfer_in_qty_recipe','transfer_out_qty_recipe'] : [])].join(',')];
       for (const r of register.rows) {
         lines.push([r.date, r.department_name, r.material_name, r.category || '',
                     (r as any).qty_purchase ?? r.qty, (r as any).purchase_unit || r.unit,
-                    r.qty, r.unit, r.value, r.req_count].map(csvCell).join(','));
+                    r.qty, r.unit, r.value, r.req_count,
+                    ...(regXfer ? [r.transfer_in_qty_purchase ?? 0, r.transfer_out_qty_purchase ?? 0,
+                                   r.transfer_in_qty ?? 0, r.transfer_out_qty ?? 0] : [])].map(csvCell).join(','));
       }
       downloadCsv(`materials-register-${from}_to_${to}.csv`, lines);
       return;
     }
     if (!data?.by_department_material?.length) return;
-    const lines = [['department','material','sku','category','qty_purchase','purchase_unit','qty_recipe','recipe_unit','avg_price_per_recipe_unit','value'].join(',')];
+    const lines = [['department','material','sku','category','qty_purchase','purchase_unit','qty_recipe','recipe_unit','avg_price_per_recipe_unit','value',
+                    ...(matXfer ? ['transfer_in_qty_purchase','transfer_out_qty_purchase','transfer_in_value','transfer_out_value'] : [])].join(',')];
     for (const r of data.by_department_material) {
       const avg = r.qty > 0 ? r.value / r.qty : 0;
       const m = metaOf(r.material_unit, r.material_purchase_unit, r.material_pack_size);
       lines.push([r.department_name, r.material_name, r.material_sku || '', r.category || '',
                   toPurchaseQty(r.qty, m), m.purchase_unit, r.qty, r.material_unit,
-                  avg.toFixed(2), r.value].map(csvCell).join(','));
+                  avg.toFixed(2), r.value,
+                  ...(matXfer ? [toPurchaseQty(r.transfer_in_qty || 0, m), toPurchaseQty(r.transfer_out_qty || 0, m),
+                                 r.transfer_in_value || 0, r.transfer_out_value || 0] : [])].map(csvCell).join(','));
     }
     downloadCsv(`dept-consumption-${from}_to_${to}.csv`, lines);
   };
@@ -210,6 +230,21 @@ export default function DepartmentConsumptionPage() {
           <Stat label="Date Range" value={`${data.range.from} → ${data.range.to}`} />
         </div>
       )}
+      {/* Present only when the range holds a transfer. A line BESIDE the totals,
+          never added to them: the goods were already counted when they first
+          came in. */}
+      {view === 'summary' && data?.summary?.transfers && (
+        <div className="bg-white border border-[#E8D5C4] rounded-lg px-3 py-2 text-xs text-[#6B5744]">
+          Moved between departments in this range:{' '}
+          <strong>{fmt(data.summary.transfers.in_value)}</strong> received by transfer ·{' '}
+          <strong>{fmt(data.summary.transfers.out_value)}</strong> handed on
+          {' '}({data.summary.transfers.departments} department{data.summary.transfers.departments === 1 ? '' : 's'}).
+          <span className="block text-[10px] text-[#8B7355]">
+            Not part of the Total Value Issued above — those goods were counted when the store issued them or the
+            vendor delivered them. A transfer only moves them from one department&rsquo;s books to another&rsquo;s.
+          </span>
+        </div>
+      )}
 
       {/* Department leaderboard */}
       {view === 'summary' && data?.by_department?.length > 0 && (
@@ -229,6 +264,12 @@ export default function DepartmentConsumptionPage() {
                 <th className="text-right py-1.5 px-3 font-medium">Requisitions</th>
                 <th className="text-right py-1.5 px-3 font-medium">Total Qty</th>
                 <th className="text-right py-1.5 px-3 font-medium">Total Value ₹</th>
+                {deptXfer && (
+                  <th className="text-right py-1.5 px-3 font-medium whitespace-nowrap"
+                      title="Received from / handed to another department. Not part of Total Value — the goods were counted when they first came in.">
+                    Transfers in / out ₹
+                  </th>
+                )}
                 <th className="w-16"></th>
               </tr>
             </thead>
@@ -254,6 +295,13 @@ export default function DepartmentConsumptionPage() {
                           comparable per-department number. */}
                       <td className="py-2 px-3 text-right font-mono text-[#B09A82]" title="Quantities of different units can't be summed — compare departments by Value ₹">—</td>
                       <td className="py-2 px-3 text-right font-mono font-semibold text-[#af4408]">{fmt(d.total_value)}</td>
+                      {deptXfer && (
+                        <td className="py-2 px-3 text-right font-mono text-[#6B5744] whitespace-nowrap">
+                          {hasXfer(d)
+                            ? <>{fmt(d.transfer_in_value)} <span className="text-[#B09A82]">/</span> {fmt(d.transfer_out_value)}</>
+                            : <span className="text-[#B09A82]">—</span>}
+                        </td>
+                      )}
                       <td className="py-2 px-3">
                         <div className="h-2 bg-[#FFF1E3] rounded">
                           <div className="h-2 bg-[#af4408] rounded" style={{ width: `${pct}%` }} />
@@ -261,7 +309,7 @@ export default function DepartmentConsumptionPage() {
                       </td>
                     </tr>
                     {isExp && (
-                      <tr><td colSpan={8} className="bg-[#FFF8F0] px-4 py-2">
+                      <tr><td colSpan={deptXfer ? 9 : 8} className="bg-[#FFF8F0] px-4 py-2">
                         <DepartmentDrillDown rows={matrixForDept(d.department_id)} />
                       </td></tr>
                     )}
@@ -346,6 +394,12 @@ export default function DepartmentConsumptionPage() {
                     <th className="text-right py-1.5 px-3 font-medium">Qty</th>
                     <th className="text-right py-1.5 px-3 font-medium">Value ₹</th>
                     <th className="text-right py-1.5 px-3 font-medium">Reqs</th>
+                    {regXfer && (
+                      <th className="text-right py-1.5 px-3 font-medium whitespace-nowrap"
+                          title="Received from / handed to another department. Not part of Qty or Value — the goods were counted when they first came in.">
+                        Transfer in / out
+                      </th>
+                    )}
                   </tr>
                 </thead>
                 <tbody>
@@ -363,6 +417,21 @@ export default function DepartmentConsumptionPage() {
                         </td>
                         <td className="py-1.5 px-3 text-right font-mono font-semibold text-[#af4408]">{fmt(r.value)}</td>
                         <td className="py-1.5 px-3 text-right font-mono text-[#6B5744]">{r.req_count}</td>
+                        {regXfer && (
+                          <td className="py-1.5 px-3 text-right font-mono text-[#6B5744] whitespace-nowrap">
+                            {hasXfer(r) ? (
+                              <>
+                                in {fmt3(r.transfer_in_qty_purchase || 0)} · out {fmt3(r.transfer_out_qty_purchase || 0)}{' '}
+                                <span className="text-[#8B7355]">{r.purchase_unit || r.unit}</span>
+                                {(r.pack_factor || 1) > 1 && (
+                                  <span className="block text-[9px] text-[#B09A82]">
+                                    = {fmt2(r.transfer_in_qty || 0)} · {fmt2(r.transfer_out_qty || 0)} {r.unit}
+                                  </span>
+                                )}
+                              </>
+                            ) : <span className="text-[#B09A82]">—</span>}
+                          </td>
+                        )}
                       </tr>
                     );
                   })}
@@ -394,6 +463,9 @@ function Stat({ label, value, hint }: { label: string; value: string; hint?: str
 function DepartmentDrillDown({ rows }: { rows: any[] }) {
   if (rows.length === 0) return <div className="text-xs text-[#8B7355] italic py-2">No materials.</div>;
   const total = rows.reduce((s, r) => s + r.value, 0);
+  // Transfer column only when this department moved something between
+  // departments; % of Dept stays a share of INFLOW value (transfers excluded).
+  const xfer = rows.some(hasXfer);
   return (
     <table className="w-full text-xs">
       <thead className="text-[#8B7355]">
@@ -404,6 +476,7 @@ function DepartmentDrillDown({ rows }: { rows: any[] }) {
           <th className="text-right py-1 px-2 font-medium">Qty</th>
           <th className="text-right py-1 px-2 font-medium">Value ₹</th>
           <th className="text-right py-1 px-2 font-medium">% of Dept</th>
+          {xfer && <th className="text-right py-1 px-2 font-medium whitespace-nowrap">Transfer in / out</th>}
         </tr>
       </thead>
       <tbody>
@@ -417,10 +490,20 @@ function DepartmentDrillDown({ rows }: { rows: any[] }) {
             <td className="py-1 px-2 text-right font-mono text-[#6B5744]">
               {total > 0 ? ((r.value / total) * 100).toFixed(1) : '0.0'}%
             </td>
+            {xfer && (
+              <td className="py-1 px-2 text-right font-mono text-[#6B5744] whitespace-nowrap">
+                {hasXfer(r) ? (
+                  <>
+                    in <QtyPU qty={r.transfer_in_qty || 0} unit={r.material_unit} pu={r.material_purchase_unit} pack={r.material_pack_size} />
+                    {' '}out <QtyPU qty={r.transfer_out_qty || 0} unit={r.material_unit} pu={r.material_purchase_unit} pack={r.material_pack_size} />
+                  </>
+                ) : <span className="text-[#B09A82]">—</span>}
+              </td>
+            )}
           </tr>
         ))}
         {rows.length > 50 && (
-          <tr><td colSpan={6} className="text-[10px] text-[#8B7355] italic py-1 px-2">…and {rows.length - 50} more</td></tr>
+          <tr><td colSpan={xfer ? 7 : 6} className="text-[10px] text-[#8B7355] italic py-1 px-2">…and {rows.length - 50} more</td></tr>
         )}
       </tbody>
     </table>

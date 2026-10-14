@@ -9,6 +9,7 @@ import { rateMap, valueCount, type RateSource } from '@/lib/closing-valuation';
 import { packFactor, toPurchaseQty, type PackMeta } from '@/lib/pack-units';
 import { todayIST } from '@/lib/format-date';
 import { checkClosingDate } from '@/lib/closing-date';
+import { DEPT_LEDGER_ARRIVAL_TYPES_SQL } from '@/lib/dept-requested-items';
 
 /**
  * DEPARTMENT CLOSING SHEET — one sheet spanning every ACTIVE department, for
@@ -33,7 +34,10 @@ import { checkClosingDate } from '@/lib/closing-date';
  * ── ITEM SET PER DEPARTMENT ────────────────────────────────────────────────
  * The house definition, shared with /api/department-stock: materials ever
  * ISSUED to that department, UNION materials ever COUNTED by it
- * (dept-stock.DEPT_ITEM_SET_SQL). Deliberately NOT rolled up to the parent —
+ * (dept-stock.DEPT_ITEM_SET_SQL), UNION materials that ever ARRIVED on its
+ * ledger with no requisition line — a Direct Issue delivery or a transfer from
+ * another department (see the LEDGER ARRIVALS arm in the query). Deliberately
+ * NOT rolled up to the parent —
  * see above. Store-mapped (liquor) materials are excluded: they are counted in
  * their own store's closing, and the POST here rejects them too. A line the
  * STORE rejected is excluded only when it delivered nothing — see the long
@@ -235,6 +239,20 @@ export async function GET(request: Request) {
         SELECT cs.department_id AS dept_id, cs.material_id AS material_id
           FROM closing_stock cs
          WHERE cs.department_id IN (SELECT value FROM json_each(?))
+        -- LEDGER ARRIVALS (2026-10-14). Stock that reached THIS department with
+        -- no requisition line: a Direct Issue vendor delivery, or a transfer
+        -- from another department. Without this arm Kitchen could never count
+        -- the routed meat it holds (it raises no requisitions) and a child
+        -- department could never count chicken it received by transfer. Same
+        -- type list as DEPT_REQUESTED_ITEM_SQL (imported, never re-spelled),
+        -- no time window (the house "ever" rule). Both types are positive by
+        -- the ledger's sign contract and their undo types are not in the list.
+        -- It only ever ADDS pairs.
+        UNION
+        SELECT dmt.department_id AS dept_id, dmt.material_id AS material_id
+          FROM department_material_transactions dmt
+         WHERE dmt.department_id IN (SELECT value FROM json_each(?))
+           AND dmt.type IN (${DEPT_LEDGER_ARRIVAL_TYPES_SQL})
       )
       SELECT pairs.dept_id                                            AS dept_id,
              rm.id                                                    AS material_id,
@@ -257,7 +275,7 @@ export async function GET(request: Request) {
                             AND cs2.date = ?
                             AND COALESCE(cs2.department_id,'') = pairs.dept_id))
        ORDER BY COALESCE(NULLIF(TRIM(rm.category),''), 'zz') , rm.name
-    `).all(deptIdsJson, deptIdsJson, date) as MatRow[];
+    `).all(deptIdsJson, deptIdsJson, deptIdsJson, date) as MatRow[];
 
     // Counts already recorded for this date, keyed by department+material.
     const countRows = db.prepare(`
