@@ -157,6 +157,42 @@ function blankRow() {
 /** The two fields that identify which material an issue row is about. */
 type IssueRowRef = { material_id?: string | null; item_name?: string | null };
 
+/**
+ * WHICH SUBMITTED ROWS DID THE SERVER REFUSE?
+ *
+ * /api/staff-meals/items POST reports per line and commits the rest — a short
+ * line must not block its neighbours (owner's ruling), and the central floor
+ * added to that route makes a PARTIAL answer the ordinary case rather than a
+ * curiosity: 486 of the 952 active materials sit at a balance of 0, so one row
+ * of a batch being refused is now routine.
+ *
+ * Every error that route pushes is prefixed `Row <n>: ` with n 1-based over the
+ * `items` array it was sent — which is this page's `payload`, in order. So the
+ * refusals can be mapped back onto the exact rows the operator typed, and those
+ * rows KEPT in the grid instead of being wiped along with the ones that went
+ * through. Without this, "hold the short one" meant holding a sentence about a
+ * row whose figures had just been cleared off the screen, leaving the operator
+ * to retype them out of the error text.
+ *
+ * DELIBERATELY FORGIVING, AND IT FAILS TOWARDS THE OLD BEHAVIOUR. An error the
+ * route phrases some other way (a batch-level `No valid rows`, a future message
+ * without the prefix) yields no index and keeps nothing — exactly what this page
+ * did before. It never guesses a row, because keeping a row that actually
+ * COMMITTED would re-issue it on the next press, and a double debit is far worse
+ * than a retype.
+ */
+function refusedRowIndices(errors: unknown): Set<number> {
+  const out = new Set<number>();
+  if (!Array.isArray(errors)) return out;
+  for (const e of errors) {
+    const m = String(e ?? '').match(/^Row\s+(\d+)\s*:/);
+    if (!m) continue;
+    const n = Number(m[1]);
+    if (Number.isInteger(n) && n >= 1) out.add(n - 1); // → 0-based, as sent
+  }
+  return out;
+}
+
 function todayString(): string {
   return new Date().toISOString().split('T')[0];
 }
@@ -398,7 +434,15 @@ export default function StaffMealsPage() {
     setIssuing(true);
     setIssueResult(null);
     try {
-      const usable = newRows.filter(r => r.item_name.trim() && parseFloat(r.quantity) > 0);
+      // The SOURCE INDEX travels with each submitted row. The server answers in
+      // terms of its own `items` positions, and those are `usable` positions,
+      // not `newRows` positions — the two differ the moment a half-typed row
+      // sits in the grid. Carrying srcIdx is what lets a refusal be put back
+      // against the row the operator is looking at rather than its neighbour.
+      const submitted = newRows
+        .map((r, srcIdx) => ({ r, srcIdx }))
+        .filter(x => x.r.item_name.trim() && parseFloat(x.r.quantity) > 0);
+      const usable = submitted.map(x => x.r);
 
       // CLOSED-LIST GUARD. The API multiplies issued_quantity × purchase_price
       // verbatim and (department branch) converts the quantity with lineFactor(),
@@ -454,7 +498,19 @@ export default function StaffMealsPage() {
       const json = await res.json();
       setIssueResult(json);
       if (json.success > 0) {
-        setNewRows([blankRow()]);
+        // A PARTIAL SUCCESS KEEPS THE REFUSED ROWS. See refusedRowIndices: the
+        // rows that committed are cleared (keeping one would re-issue it), the
+        // rows the server named are left standing with their figures intact, and
+        // so are rows that were never submitted at all — a half-typed row is
+        // work in progress, not a rejected line, and wiping it was collateral
+        // damage from clearing the whole grid.
+        const refused = refusedRowIndices(json.errors);
+        const refusedSrc = new Set(
+          submitted.filter((_, i) => refused.has(i)).map(x => x.srcIdx),
+        );
+        const submittedSrc = new Set(submitted.map(x => x.srcIdx));
+        const keep = newRows.filter((_, i) => refusedSrc.has(i) || !submittedSrc.has(i));
+        setNewRows(keep.length > 0 ? keep : [blankRow()]);
         await viewMeal(selectedMeal);
         await fetchMeals();
         await fetchMaterials();

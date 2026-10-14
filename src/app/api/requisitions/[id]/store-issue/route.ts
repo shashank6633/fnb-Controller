@@ -277,15 +277,18 @@ function isIssueTokenReplay(e: any): boolean {
  * the path said no, in this route or in the helper.
  *
  * The refusal is asked TWICE, and the two are not redundant:
- *   - BEFORE the transaction (the pre-flight block below), so the whole batch is
- *     refused with every short line named and nothing written. That is what
- *     keeps a multi-line batch intact: the other lines are untouched, not rolled
- *     back, and the batch replays as soon as the number is corrected.
+ *   - BEFORE the transaction (the pre-flight block below), so the short line is
+ *     HELD — dropped from the write loop and named on the response — while
+ *     every other line of the batch is handed over. "Issue the 5, hold the 1",
+ *     the owner's call. Only when NOT ONE 'issue' entry survives the floor is
+ *     the whole gesture refused with nothing written, which is what keeps the
+ *     single-line issue-and-defer modal replayable with its typed numbers.
  *   - INSIDE applyIssueDelta (assertCentralIssue), which throws and unwinds this
  *     route's transaction. That is the bound that actually holds — it covers the
  *     race the pre-flight cannot see, and it covers any future caller.
- * A PARTIAL issue of what the store genuinely holds still works; the refusal
- * carries that number, in the line's own unit, as max_issue_qty.
+ * A PARTIAL issue of what the store genuinely holds still works; both the
+ * refusal and the held row carry that number, in the line's own unit, as
+ * max_issue_qty.
  *
  * AND NEITHER LAYER MAY ANSWER FOR A REPLAY. Both of them sit in front of the
  * ledger insert that used to be the only thing aware of client_token, so a
@@ -503,17 +506,42 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     // No issue may take raw_materials.current_stock below zero. The bound that
     // makes that structural lives on the single writer (assertCentralIssue in
     // src/lib/issue-stock.ts, which throws inside this route's transaction);
-    // this is the same rule — literally the same function — asked early, so a
-    // storekeeper is told about every short line at once rather than meeting a
-    // rolled-back batch.
+    // this is the same rule — literally the same function — asked early, so the
+    // lines that CAN be handed over are not held hostage by the one that cannot.
     //
-    // THE BATCH IS REFUSED WHOLE, AND NOTHING IS WRITTEN. This route's batch is
-    // already atomic by decision ("The batch is atomic; the catch below only
-    // improves the MESSAGE" — see the STOCK section of the header), so refusing
-    // a short line mid-transaction would roll back the ordinary lines beside it.
-    // Refusing here is the opposite of that: the requisition is untouched, not
-    // rolled back, every short line is named, and the batch is replayable as
-    // soon as the quantity is corrected.
+    // ── ISSUE THE 5, HOLD THE 1 (the owner's call) ──────────────────────────
+    // A batch where ONE material is short used to answer 400 with applied:0:
+    // every line kept quantity_issued 0, no requisition_issue_ledger rows, no
+    // inventory_transactions, and the materials the storekeeper was holding in
+    // his hands stayed on the shelf. Measured on a copy of the live db — SALT
+    // 2 kg, MIRCHI 3 kg (1,000 g on hand), EGGS 100 pcs, CHICKEN 5 kg — one
+    // short line cost the other three their hand-over. The storekeeper's only
+    // answer was to retype the batch without the short line, which is work this
+    // route can do for him.
+    //
+    // SO A SHORT LINE IS HELD, NOT FATAL. Its entry is dropped from the write
+    // loop (`heldEntries` below) and every other entry runs exactly as it would
+    // have on its own. The held line keeps the quantity_issued it already had,
+    // so it stays outstanding on the requisition and in the store queue — the
+    // department is still owed it — and the response names it with the obeyable
+    // quantity, so issuing what the store really holds is one more gesture.
+    //
+    // WHY HELD RATHER THAN CLAMPED TO WHAT IS THERE. Writing 1 kg where the
+    // storekeeper typed 3 would commit a hand-over that did not happen, on the
+    // row the department is owed against. The verdict stays per line and binary
+    // — `c.ok` from checkCentralIssue, the one place that decides what is
+    // issuable — and nothing here invents a second notion of "short".
+    // store-process/route.ts:779 makes the same point about the per-line vendor
+    // verdict that drives its own drop-the-line rule.
+    //
+    // NOTHING LEFT TO ISSUE IS STILL REFUSED WHOLE, in the envelope and the
+    // words it has always had. If not one 'issue' entry survives the floor there
+    // is no hand-over to protect: the requisition is left untouched rather than
+    // written to, every short line is named, and the modal keeps the typed
+    // numbers so one corrected figure replays the gesture. The single-line
+    // issue-and-defer gesture (store-requisitions/page.tsx:676) is exactly this
+    // case, and it is unchanged — a 'defer' entry is never scored here, so a
+    // short issue beside it leaves nothing issuable.
     //
     // A PARTIAL ISSUE REMAINS FULLY AVAILABLE, which is the point of a per-line
     // cap rather than a per-line veto: the message carries max_issue_qty in the
@@ -542,12 +570,23 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       max_issue_qty: number; line_unit: string;
       message: string;
     }[] = [];
+    /**
+     * INDICES INTO `lines` the write loop must not run, keyed by ENTRY and not
+     * by line id on purpose: one POST can carry two entries for the same line
+     * (the issue-and-defer gesture is exactly that), and only the entry the
+     * floor refused is dropped. The write loop walks the same array by the same
+     * index, so the two can never drift apart.
+     */
+    const heldEntries = new Set<number>();
+    /** 'issue' entries the floor cleared. 0 with a held line ⇒ refuse whole. */
+    let issuableEntries = 0;
     {
       // Accumulated per MATERIAL, in the batch's own order, so two entries for
       // one line — which this route documents and has measured — and two lines
       // of one material are both scored the way the floor will see them.
       const claimed = new Map<string, number>();
-      for (const ln of lines) {
+      for (let li = 0; li < lines.length; li++) {
+        const ln = lines[li];
         if (!itemMap.get(ln.id)) continue;
         const cur = selLine.get(ln.id, id) as any;
         if (!cur) continue;
@@ -613,11 +652,28 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           afterLineQty: afterQty,
           alreadyClaimedRecipe: already,
         });
+        // ── WHAT A HELD LINE CLAIMS: NOTHING ────────────────────────────────
         // netRecipe, not requestedRecipe: an undo in the same batch credits
         // stock back, and that headroom is real for a later issue of the same
         // material.
-        claimed.set(matId, already + c.netRecipe);
-        if (c.ok) continue;
+        //
+        // AND ONLY WHEN THE LINE IS ACTUALLY GOING TO RUN. A held line is
+        // dropped from the write loop, so it removes nothing from central and
+        // must not eat the headroom a later line of the same material draws on
+        // — accumulating its full request (what the whole-batch refusal did,
+        // harmlessly, because nothing ran afterwards) would cascade one short
+        // line into holding every later line of that material. 0 of the 1,630
+        // live requisitions name one material twice, so this changes no
+        // measured case; it stops the day one does from being wrong.
+        if (c.ok) {
+          claimed.set(matId, already + c.netRecipe);
+          // 'issue' is the only action that hands goods OVER (an 'undo' or
+          // 'reject' is a credit or a no-op — see afterQty above), so it is the
+          // only one whose survival makes a partial hand-over worth protecting.
+          if (action === 'issue') issuableEntries++;
+          continue;
+        }
+        heldEntries.add(li);
         centralShort.push({
           code: 'central_stock_short',
           line_id: String(ln.id ?? ''),
@@ -629,7 +685,12 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         });
       }
     }
-    if (centralShort.length > 0) {
+    // NOTHING LEFT TO HAND OVER ⇒ THE WHOLE GESTURE IS REFUSED, unchanged in
+    // wording, envelope and status from the day the floor was added. Every
+    // 'issue' entry in the batch is short, so there is no partial hand-over to
+    // protect and writing the defers/unrejects that rode along with it would
+    // record half a gesture the storekeeper never completed.
+    if (centralShort.length > 0 && issuableEntries === 0) {
       // Same envelope the department-reversal refusal uses — `code` + `blocked`
       // — because the client already keys off those and renders the message
       // inline against the named line instead of an alert
@@ -671,7 +732,19 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         throw new Error('req_status_changed');
       }
 
-      for (const ln of lines) {
+      for (let li = 0; li < lines.length; li++) {
+        const ln = lines[li];
+        // ── A HELD ENTRY IS NOT RUN ─────────────────────────────────────────
+        // The floor refused this one entry before the transaction opened
+        // (centralShort above) and at least one other 'issue' entry survived,
+        // so the gesture proceeds without it: no quantity_issued, no
+        // issue_history, no applyIssueDelta call, no ledger row, no audit row
+        // and no contribution to `applied`. The line keeps whatever it already
+        // held, which is what leaves it outstanding in the store queue.
+        //
+        // FIRST, BEFORE `failing` IS STAMPED. A line this loop never touches
+        // must not be named as the one that threw.
+        if (heldEntries.has(li)) continue;
         const it = itemMap.get(ln.id);
         if (!it) continue;                          // unknown line — skip silently
         // Stamped BEFORE any work on this line, so whatever throws below is
@@ -1021,7 +1094,29 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
 
     // Re-read final status for response
     const after = db.prepare('SELECT status FROM requisitions WHERE id = ?').get(id) as any;
-    return Response.json({ success: true, status: after?.status, applied: auditPerLine.length });
+    // ── WHAT WAS HELD BACK, ON THE SAME RESPONSE THAT CONFIRMS THE REST ─────
+    // `held`, not `blocked`: this is a 200 and the hand-over DID happen, so a
+    // reader must not mistake it for the refusal. The ROW shape is identical to
+    // `blocked` (code, line_id, material, requested/available in purchase
+    // units, max_issue_qty in the line's own unit, the sentence), so the
+    // client's existing reader can be pointed at it without a second format —
+    // store-requisitions/page.tsx:251 readBlockedReversals is keyed on exactly
+    // these fields. Until a client does, the held line staying outstanding in
+    // the store queue is the visible signal, and `held_message` is the sentence
+    // to print beside it.
+    const out: Record<string, unknown> = {
+      success: true, status: after?.status, applied: auditPerLine.length,
+    };
+    if (centralShort.length > 0) {
+      const n = centralShort.length;
+      out.held = centralShort;
+      out.held_message =
+        `${n} line${n === 1 ? '' : 's'} ${n === 1 ? 'was' : 'were'} NOT issued and `
+        + `${n === 1 ? 'stays' : 'stay'} outstanding — the central store does not hold the quantity asked. `
+        + centralShort.map(s => s.message).join(' ')
+        + ` Everything else in this gesture was issued.`;
+    }
+    return Response.json(out);
   } catch (e: any) {
     console.error('[req store-issue]', e);
     return Response.json({ error: e.message }, { status: 500 });

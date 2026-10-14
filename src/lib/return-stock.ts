@@ -4,6 +4,7 @@ import { assertReversible, postDeptLedger } from './dept-ledger';
 import { directRowsForGrn } from './direct-issue';
 import { centralFlowBlock } from './store-engine';
 import { postCentralTxn, deptParty, vendorParty } from '@/lib/movement-record';
+import { planCentralDebit } from './central-debit-clamp';
 
 /**
  * THE two stock movers for the Returns module (owner requirements 72-79).
@@ -619,8 +620,15 @@ export function acceptVendorReturnLine(db: Database.Database, p: VendorReturnLin
     .get(materialId) as { name?: string; current_stock?: number } | undefined;
   if (!row) throw new Error(`${FN}: material ${materialId} not found`);
 
-  const onHand = r6(Number(row.current_stock) || 0);
-  if (qty > onHand + EPS) {
+  // THE ONE RULE — planCentralDebit (src/lib/central-debit-clamp.ts), the
+  // 6-dp-grid answer every central floor gets. `qty > r6(stock) + 1e-9` rounded
+  // the balance UP: a stored 99.9999996 read as 100, a return of 100 passed and
+  // the debit below wrote −4e-7. The plan accepts the same "return everything"
+  // and says to subtract the balance itself, so the landing is exactly 0.
+  const plan = planCentralDebit(Number(row.current_stock) || 0, qty);
+  // DISPLAY ONLY — on the balance's own grid point, so typing it back fits.
+  const onHand = r6(plan.available);
+  if (!plan.fits) {
     const name = String(row.name || '') || materialId;
     throw new ReturnStockRefused({
       materialId,
@@ -637,8 +645,12 @@ export function acceptVendorReturnLine(db: Database.Database, p: VendorReturnLin
   const note = (p.notes || '').trim()
     || `${p.retNumber ? `Return ${p.retNumber}` : 'Vendor return'}: goods returned to vendor`;
 
+  // plan.debit: `qty`, or on a return of everything on the shelf the balance
+  // itself — under one 6-dp step apart — so the landing is exactly 0. The
+  // movement row and the returned centralDelta carry the same figure.
+  const centralOut = plan.debit;
   db.prepare(`UPDATE raw_materials SET current_stock = current_stock - ?, updated_at = datetime('now') WHERE id = ?`)
-    .run(qty, materialId);
+    .run(centralOut, materialId);
 
   // NEGATIVE — goods out. A NEW type, and it is a known and disclosed gap: the
   // central variance formula's terms are closed `type IN (...)` lists, so
@@ -663,7 +675,7 @@ export function acceptVendorReturnLine(db: Database.Database, p: VendorReturnLin
     id: invTxnId,
     materialId,
     type: 'vendor_return',
-    quantity: -qty,
+    quantity: -centralOut,
     referenceId: returnItemId,
     notes: note,
     outletId,
@@ -675,5 +687,5 @@ export function acceptVendorReturnLine(db: Database.Database, p: VendorReturnLin
     actor: String(p.actor || '').trim() || 'system:vendor-return',
   });
 
-  return { deptTxnId: null, invTxnId, recipeQty: qty, centralDelta: -qty, disposition: 'reusable' };
+  return { deptTxnId: null, invTxnId, recipeQty: qty, centralDelta: -centralOut, disposition: 'reusable' };
 }

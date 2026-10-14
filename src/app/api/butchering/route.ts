@@ -1,6 +1,7 @@
 import { getDb, generateId } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
 import { deptOnHandBulk, deptKey } from '@/lib/dept-ledger';
+import { planCentralDebit } from '@/lib/central-debit-clamp';
 
 /**
  * Butchering — carcass breakdown into named cuts.
@@ -20,7 +21,8 @@ import { deptOnHandBulk, deptKey } from '@/lib/dept-ledger';
  * DELETE /api/butchering?id=<uuid>              → delete open batch only
  *
  * On close: validates reconciliation gap ≤ 1.5%, refuses if a DEPARTMENT holds
- * the carcass (see the guard in PUT), then atomically:
+ * the carcass, refuses if the CENTRAL STORE does not hold it (both guards in
+ * PUT — a breakdown posts both halves or neither), then atomically:
  *   1. Debits source_material.current_stock by gross_weight
  *   2. Credits each cut's material.current_stock by its weight (pro-rata cost)
  *   3. Writes inventory_transactions rows for the audit log
@@ -32,6 +34,33 @@ import { deptOnHandBulk, deptKey } from '@/lib/dept-ledger';
 export const dynamic = 'force-dynamic';
 
 const RECONCILE_TOLERANCE = 0.015; // 1.5%
+
+// THE CARCASS FLOOR'S TOLERANCE is not a constant in this file any more, and it
+// is NOT the department guard's HOLD_EPS. It is planCentralDebit's 6-dp grid
+// (src/lib/central-debit-clamp.ts) — the one rule every central floor asks, the
+// GRN void guard included. The two local copies that stood here (STOCK_EPS 1e-9
+// + r6) let a carcass 4e-7 over the balance through and wrote −4e-7.
+// MEASURED, and still true under the grid: at the department guard's additive
+// 1e-6 a carcass 1 mg short of the balance closed anyway and left current_stock
+// at -0.000001. The grid refuses that carcass (it is a whole step over), and a
+// carcass that IS everything on the shelf lands on exactly 0, never below.
+// "Does a department hold any of this" tolerates more slop than "may this debit
+// be written", so they still do not share a figure.
+
+/**
+ * Thrown by the carcass floor INSIDE the close transaction, so the refusal and
+ * the debit it guards are the same transaction. PUT catches it immediately
+ * around txn() and answers 409 with `.message` — the same status the
+ * department-held refusal next to it uses, because it is the same physical
+ * question asked of the other pool. Nothing is posted and the batch stays open.
+ */
+class CarcassShort extends Error {
+  readonly code = 'CARCASS_SHORT';
+  constructor(message: string) {
+    super(message);
+    this.name = 'CarcassShort';
+  }
+}
 
 // Metric normalization — MIRRORS page.tsx (uNorm/METRIC/wtFactor). Weights are
 // stored in each material's OWN recipe unit; any math that sums or divides
@@ -308,7 +337,7 @@ export async function PUT(request: Request) {
     // Close action: post inventory transactions and lock the batch
     if (action === 'close') {
       const fresh = db.prepare(`
-        SELECT bb.*, rm.unit AS source_unit
+        SELECT bb.*, rm.unit AS source_unit, rm.name AS source_name
         FROM butchering_batches bb JOIN raw_materials rm ON rm.id = bb.source_material_id
         WHERE bb.id = ?
       `).get(id) as any;
@@ -399,14 +428,136 @@ export async function PUT(request: Request) {
       const srcRateLabel = `₹${fresh.cost_per_unit}${srcRateUnit ? '/' + srcRateUnit : ''}`;
 
       const txn = db.transaction(() => {
+        // ── THE STORE MUST HOLD THE CARCASS. BOTH HALVES, OR NEITHER. ────────
+        //
+        // A close posts TWO stock legs that are one physical fact: a carcass is
+        // broken down INTO its cuts. The debit and the credits are the same
+        // grams, named twice. Until this floor existed neither leg had a central
+        // balance check, and MEASURED on a copy of the live db — probe source at
+        // 0 kg, gross 10, cuts 6 + 3, waste 1 — the close answered HTTP 200 and
+        // wrote: source 0 -> -10, and cuts 50 -> 56 and 7 -> 10. The negative is
+        // the lesser half of that. The worse half is that 9 kg of SALEABLE cuts
+        // entered the store's pool from a carcass no purchase ever paid for: the
+        // book was credited stock that does not exist, at a cost basis
+        // (₹222.22/kg) pro-rated off a ₹2,000 total that was never spent.
+        //
+        // WHY THIS REFUSES RATHER THAN CLAMPS. The owner's rule is that an
+        // UNATTENDED path (a PO receipt, a QC sign-off, a cascade with nobody
+        // there) must clamp and record the shortfall, because destroying a
+        // correct delivery to prevent a bad debit is the worse outcome. This
+        // path is the opposite case on every count: PUT action='close' is a
+        // person pressing Close on the /butchering batch modal, nothing
+        // physically arrived, there is no host transaction to roll back, and
+        // refusing destroys NOTHING — the batch stays 'open' with every output
+        // weight he just entered still stored (the outputs block above commits
+        // separately), so he can receive the carcass and close again. The page
+        // shows this sentence and keeps the modal open (page.tsx saveAndAction:
+        // `if (!r.ok) { setError(j.error); return; }` — no onClose()).
+        //
+        // SO THIS IS NOT A MISSING CALL TO clampCentralDelta(). That helper
+        // (src/lib/central-debit-clamp.ts) is the ONE implementation of the
+        // unattended side and names butchering as a lane that must call it
+        // rather than grow a rival — but its own header scopes itself out of
+        // attended paths ("THIS FILE IS NOT FOR THOSE PATHS"), which is the side
+        // this close is on, with assertCentralIssue and POST /api/grn. Nothing
+        // below is a second clamp; it is a refusal, and its comparison is that
+        // file's planCentralDebit — the one rule every central floor asks — not
+        // a fourth figure.
+        //
+        // AND WHY NOT CLAMP EITHER HALF, which is the trap here:
+        //   · Clamp the DEBIT alone and the credits still post in full. That is
+        //     strictly worse than the negative it removes: the book then looks
+        //     consistent while being wrong by the whole output weight, with no
+        //     negative balance left for /inventory or fix-negative-stock to show.
+        //   · Clamp BOTH pro-rata (debit what is there, scale the cuts to match)
+        //     and the store records a breakdown nobody performed. The ≤1.5%
+        //     reconciliation gap checked earlier in this handler was agreed
+        //     against the FULL gross weight; a scaled close would store cut
+        //     weights, yield_pct and cost_allocated
+        //     off a basis that never existed, silently replacing the operator's
+        //     own scale readings. A carcass is not divisible that way either —
+        //     you cannot break down 60% of each cut from 4 kg of a 10 kg goat.
+        // The "issue the lines that can be issued, hold the short one" rule does
+        // not reach here: the cuts are not neighbouring lines that happen to
+        // share a gesture, they ARE the source line's grams. There is no
+        // neighbour to spare.
+        //
+        // READ INSIDE THIS TRANSACTION, immediately before the debit, for the
+        // same reason the issue floor is (src/lib/issue-stock.ts
+        // assertCentralIssue): a balance read earlier is a snapshot, and a
+        // snapshot races. Do not hoist this read out to sit beside the
+        // department guard, and do not move the credit loop above it.
+        //
+        // UNITS: gross_weight and current_stock are BOTH in the source
+        // material's own recipe unit (see the file header, and the DENOMINATOR
+        // note just above), so this compares two numbers on one basis. There is
+        // deliberately NO packFactor here — adding one would be the second
+        // conversion this project keeps getting burned by.
+        //
+        // THE PREDICATE IS THE ONE EVERY CENTRAL FLOOR USES — planCentralDebit
+        // (src/lib/central-debit-clamp.ts), which assertNoNegativeStock in
+        // grn-reversal.ts now asks too. Gross weight and balance are compared on
+        // the house 6-dp grid. So a breakdown of everything the store holds is
+        // correct work, passes and lands on exactly 0; float noise and a 6-dp
+        // display rounding are not treated as a shortfall; and a real shortfall
+        // — down to a milligram, one grid step — is refused.
+        const onHand = Number(
+          (db.prepare(`SELECT COALESCE(current_stock, 0) AS s FROM raw_materials WHERE id = ?`)
+            .get(fresh.source_material_id) as any)?.s,
+        ) || 0;
+        // THE ONE RULE NOW, NOT A COPY OF IT. `r6(onHand − gross) < −1e-9` let a
+        // carcass 4e-7 over the balance through (r6 rounds −4e-7 to −0) and then
+        // subtracted the full gross: current_stock −4e-7. planCentralDebit
+        // (src/lib/central-debit-clamp.ts) judges on the same 6-dp grid, still
+        // refuses the measured 1-mg-short carcass (it lands on the NEXT grid
+        // point), and says what to subtract — the balance itself on a
+        // breakdown of everything, so the landing is exactly 0.
+        const carcassPlan = planCentralDebit(onHand, Number(fresh.gross_weight) || 0);
+        if (!carcassPlan.fits) {
+          // RECIPE UNITS IN THE MESSAGE, matching the department-held refusal
+          // above and matching the screen: /butchering/page.tsx
+          // renders every weight through fmtWt(v, source_material_unit) and does
+          // not import packFactor at all, so `unit` is the unit the operator
+          // typed the gross weight in. Two refusals in one gesture quoting
+          // different bases for the same material would be worse than either.
+          const unit = fresh.source_unit ? ' ' + fresh.source_unit : '';
+          // PRINTED AT THE PRECISION THE FLOOR JUDGES AT (6dp, r6 above), with
+          // trailing zeros dropped, so 10 prints "10 kg" and not "10.000000 kg".
+          // The page's fmtWt is 3dp and that is right for a weight column, but a
+          // REFUSAL that rounds its two figures to the same number tells the
+          // storekeeper nothing: at 3dp a balance of 9.999999 against a 10 kg
+          // gross read "holds only 10 kg, so a 10 kg carcass cannot be broken
+          // down". Measured, then fixed — the message has to show the gap it is
+          // refusing over.
+          const qty = (n: number) => `${Number(n.toFixed(6))}${unit}`;
+          // max(0, …): a balance already sitting below zero reads as "holds
+          // none", never as a negative allowance — and never gets printed back
+          // at the operator as "holds only -10 kg". The branch is taken at the
+          // precision the message PRINTS, so it can never say "holds only 0 kg"
+          // about a balance too small to render.
+          const available = Math.max(0, onHand);
+          const name = fresh.source_name || 'this carcass';
+          throw new CarcassShort(
+            (Number(available.toFixed(6)) > 0
+              ? `The central store holds only ${qty(available)} of ${name}, so a ${qty(fresh.gross_weight)} carcass cannot be broken down.`
+              : `The central store holds none of ${name}, so a ${qty(fresh.gross_weight)} carcass cannot be broken down.`)
+            + ` Nothing was posted and the batch is still open — receive the carcass, correct the gross weight, or record a closing count, then close again.`,
+          );
+        }
+
         // 1. Debit source carcass stock — CENTRAL only, and only reachable
-        //    because the guard above proved no department holds this carcass.
+        //    because the guards proved that no department holds this carcass and
+        //    that the central store does.
+        //    carcassPlan.debit, not gross_weight: identical except on a breakdown
+        //    of everything the store holds, where it is the balance itself and the
+        //    write lands on exactly 0 (under one 6-dp step from gross_weight). The
+        //    movement row carries the same figure so it reconciles to the column.
         db.prepare(`UPDATE raw_materials SET current_stock = COALESCE(current_stock, 0) - ? WHERE id = ?`)
-          .run(fresh.gross_weight, fresh.source_material_id);
+          .run(carcassPlan.debit, fresh.source_material_id);
         db.prepare(`
           INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, outlet_id)
           VALUES (?, ?, 'butchering_input', ?, ?, ?, ?)
-        `).run(generateId(), fresh.source_material_id, -fresh.gross_weight, fresh.id,
+        `).run(generateId(), fresh.source_material_id, -carcassPlan.debit, fresh.id,
                 `Carcass breakdown ${fresh.batch_id} @ ${srcRateLabel}`, fresh.outlet_id || null);
 
         // 2. Credit each cut
@@ -445,7 +596,19 @@ export async function PUT(request: Request) {
         // 4. Close the batch
         db.prepare(`UPDATE butchering_batches SET status = 'closed', closed_at = datetime('now') WHERE id = ?`).run(id);
       });
-      txn();
+      // The carcass floor throws from inside txn(), which unwinds every leg
+      // above — no debit, no credits, no waste rows, batch still 'open'. It gets
+      // the department guard's 409 rather than the catch-all 500 at the bottom
+      // of this handler, because it is a refusal the storekeeper can act on and
+      // not a fault. Anything else still propagates.
+      try {
+        txn();
+      } catch (e: any) {
+        if (e instanceof CarcassShort) {
+          return Response.json({ error: e.message, code: 'carcass_short' }, { status: 409 });
+        }
+        throw e;
+      }
     }
 
     if (action === 'cancel') {

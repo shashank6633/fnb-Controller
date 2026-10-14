@@ -187,11 +187,14 @@
  * material's factor, and the pre-ledger remainder arithmetic in the end-to-end
  * log depends on that reversal being exact.
  */
-import { packFactor, toPurchaseQty, fmtQtyNum } from '@/lib/pack-units';
+import { packFactor, fmtQtyNum, type PackMeta } from '@/lib/pack-units';
 import { generateId } from '@/lib/db';
 import { centralFlowBlock } from '@/lib/store-engine';
 import { postDeptLedger, assertReversible } from '@/lib/dept-ledger';
 import { postCentralTxn, deptParty } from '@/lib/movement-record';
+// THE ONE RULE for "does this debit fit, and what do we subtract" — shared with
+// every other central floor. See its header for the grid and why 1e-6.
+import { planCentralDebit } from '@/lib/central-debit-clamp';
 
 export interface IssueDeltaInput {
   reqItemId: string;
@@ -403,7 +406,19 @@ export interface CentralIssueCheck {
    * the credits that pay for them.
    */
   netRecipe: number;
-  /** RECIPE units issuable — max(0, stock − already claimed). */
+  /**
+   * RECIPE units to actually SUBTRACT from current_stock for this line — the
+   * figure every writer on this rule must use, never requestedRecipe. Equal to
+   * requestedRecipe on an ordinary partial issue; equal to the balance ITSELF
+   * when the ask is "everything on the shelf" (on the balance's 6-dp grid point),
+   * so the landing is exactly 0 and never -4e-7 (planCentralDebit,
+   * src/lib/central-debit-clamp.ts). When !ok it is what an unattended rail may
+   * clamp to: max(0, balance). 0 when !debits.
+   */
+  debitRecipe: number;
+  /** RECIPE units issuable — max(0, stock − already claimed), 6-dp. A DISPLAY
+   *  figure: it sits on the balance's own grid point, so typing it back fits.
+   *  The comparison itself is planCentralDebit's, on the unrounded balance. */
   availableRecipe: number;
   /** The raw stored balance, negative included, so nothing is hidden. */
   centralStockRecipe: number;
@@ -424,6 +439,69 @@ export interface CentralIssueCheck {
 /** Round DOWN to the house 6dp. A cap must never round itself up past the
  *  balance it is capping. */
 const floor6 = (n: number) => Math.floor((Number(n) || 0) * 1e6) / 1e6;
+
+/* ────────────────────────────────────────────────────────────────────────────
+ * THE SAME RULE, ONE CONVERSION LATER: THE PURCHASE-BASIS DISPLAY PRECISION.
+ *
+ * toPurchaseQty() (pack-units.ts:212) is the one converter every purchase-unit
+ * display in this app goes through, and it ROUNDS to 3 dp. That is right for a
+ * figure that is only being READ and wrong for a figure that is being OBEYED,
+ * and the refusal below is the second kind: the storekeeper types it back.
+ *
+ * MEASURED on live data. THREE MANGO RED CHILLI POWDER 500 GM (g/kg, pack 1000)
+ * holds 14,842.5 g. toPurchaseQty rounded that UP to 14.843 kg, the refusal read
+ * "the central store holds only 14.843 kg, so 20 kg cannot be issued. Issue
+ * 14.843 kg or less on this line." — and typing 14.843 back came back refused
+ * with the identical sentence, because 14,843 g > 14,842.5 g. GREEN APPLE
+ * (8,368.5 g) behaved the same. 2 of the 466 materials holding stock were in
+ * that state, and every fractional-gram issue adds another. floor6 above states
+ * the rule this file already applies to max_issue_qty; these two apply it to the
+ * printed figures, which is where it was missing.
+ *
+ * SO THE TWO NUMBERS IN THE SENTENCE GET THE ONLY ROUNDING EACH CAN SURVIVE:
+ *   · the CAP rounds DOWN — it may never name more than the store holds, or the
+ *     storekeeper is refused for typing what he was told to type.
+ *   · the ASK rounds UP — it may never name less than was actually asked for.
+ * That also makes the sentence structurally honest rather than honest by luck:
+ * capShown ≤ cap < ask ≤ askShown, so the printed cap is ALWAYS strictly below
+ * the printed ask and "holds only 14.842 kg, so 14.842 kg cannot be issued" —
+ * reachable today whenever both figures round into the same 3rd decimal — cannot
+ * be printed at all.
+ *
+ * WHY ROUND-THEN-STEP AND NOT Math.floor(x * 1000) / 1000. 8,369 g on a pack of
+ * 1000 is EXACTLY 8.369 kg, and in binary x * 1000 can land at
+ * 8368.999999999999; a bare floor would quietly shave 0.001 off clean balances
+ * all over the app. The tick only moves when the rounding went the wrong way by
+ * more than EPS — a real rounding, never float dust. Measured over the 466
+ * materials holding stock, exactly 2 printed figures change (the 2 broken ones,
+ * by 0.001 each) and the other 464 are byte-identical.
+ *
+ * THE ZERO BRANCH DOES NOT WIDEN, measured rather than assumed: the only two
+ * materials whose purchase-basis cap reads 0 are float dust (7.1e-15 kg,
+ * 1.8e-15 kg), which rounded to 0 before this and floors to 0 after it. No live
+ * balance sits in the band [0.0005, 0.001) purchase units where a floor would
+ * newly print "holds none of it".
+ * ──────────────────────────────────────────────────────────────────────────*/
+
+/** One tick of the purchase-basis display precision (toPurchaseQty's 3 dp). */
+const PU_TICK = 0.001;
+const r3 = (n: number) => Math.round((Number(n) || 0) * 1000) / 1000;
+
+/** recipe → purchase units, never ABOVE the true figure. For a CAP. */
+function purchaseQtyDown(recipeQty: number, m: PackMeta): number {
+  const exact = (Number(recipeQty) || 0) / packFactor(m);
+  const r = r3(exact);
+  const v = r <= exact + EPS ? r : r3(r - PU_TICK);
+  return v === 0 ? 0 : v; // normalises -0, as toPurchaseQty does
+}
+
+/** recipe → purchase units, never BELOW the true figure. For an ASK. */
+function purchaseQtyUp(recipeQty: number, m: PackMeta): number {
+  const exact = (Number(recipeQty) || 0) / packFactor(m);
+  const r = r3(exact);
+  const v = r >= exact - EPS ? r : r3(r + PU_TICK);
+  return v === 0 ? 0 : v;
+}
 
 /**
  * THE RULE, ASKED ONCE. Both issue routes call this before opening their
@@ -494,7 +572,7 @@ export function checkCentralIssue(
     ok: true, debits: false, skipReason: 'zero_delta',
     reqItemId: String(a.reqItemId || ''),
     materialId: '', materialName: '', requestedRecipe: 0, netRecipe: 0,
-    availableRecipe: 0,
+    debitRecipe: 0, availableRecipe: 0,
     centralStockRecipe: 0, maxIssueLineQty: Number(a.afterLineQty) || 0,
     lineUnit: '', requestedPurchase: 0, availablePurchase: 0,
     purchaseUnit: '', packFactor: 1, message: '', ...over,
@@ -559,15 +637,32 @@ export function checkCentralIssue(
   // read as "nothing issuable", never as a negative allowance that would let the
   // next issue dig the hole deeper.
   const availableRecipe = Math.max(0, Math.round((stock - claimed) * 1e6) / 1e6);
+  // THE DECISION — planCentralDebit, the one rule every central floor shares.
+  // It used to be `requestedRecipe <= availableRecipe + EPS` here: a 6-dp
+  // ROUNDED allowance against a 1e-9 slack. Rounding UP let 100 through against
+  // a stored 99.9999996 and the debit wrote -4e-7 (measured, both desks). The
+  // plan compares both figures on the same 6-dp grid and also says what to
+  // subtract, so the floor and the write cannot disagree. Against
+  // `stock − claimed`, so the pre-flight's running claim and the floor's
+  // per-line re-read see the same balance.
+  const plan = planCentralDebit(stock - claimed, requestedRecipe);
   const purchaseUnit = String(line.purchase_unit || line.unit || '').trim();
-  const availablePurchase = toPurchaseQty(availableRecipe, meta);
-  const requestedPurchase = toPurchaseQty(requestedRecipe, meta);
+  // DOWN for the cap, UP for the ask — see purchaseQtyDown/Up above. These two
+  // are what the message prints and what both desks print, so this is the only
+  // place the direction is decided.
+  const availablePurchase = purchaseQtyDown(availableRecipe, meta);
+  const requestedPurchase = purchaseQtyUp(requestedRecipe, meta);
   const base: CentralIssueCheck = {
     ok: true, debits: true, skipReason: '',
     reqItemId: String(line.id),
     materialId: String(line.material_id),
     materialName: String(line.material_name || ''),
-    requestedRecipe, netRecipe: requestedRecipe,
+    // netRecipe carries the figure the floor will actually WRITE when the line
+    // fits — the pre-flight's running claim then subtracts exactly what the
+    // floor's per-line re-read will see gone. On a refusal it stays the ask
+    // (the line does not run, so callers do not accumulate it).
+    requestedRecipe, netRecipe: plan.fits ? plan.debit : requestedRecipe,
+    debitRecipe: plan.debit,
     availableRecipe, centralStockRecipe: stock,
     // In the LINE's unit, floored, so the value can be typed straight back into
     // the Issue box and pass this very check on the retry.
@@ -580,9 +675,10 @@ export function checkCentralIssue(
     packFactor: factor,
     message: '',
   };
-  // `+ EPS`: an exact-to-the-gram issue that lands the balance on 0 is correct
-  // work and must pass. Only going BELOW zero is refused.
-  if (requestedRecipe <= availableRecipe + EPS) return base;
+  // An issue of everything on the shelf — binary noise included, or the 6-dp
+  // figure the desks print — fits and lands on exactly 0 (debitRecipe is then
+  // the balance itself). Only an ask on a grid point PAST the balance is refused.
+  if (plan.fits) return base;
 
   // THE MESSAGE IS WRITTEN FOR THE 508, NOT FOR THE 56. Measured over all 16,346
   // non-party lines: 564 carry an outstanding seed this floor would refuse, and
@@ -591,6 +687,15 @@ export function checkCentralIssue(
   // nonsense on 90% of the real refusals, which is this project's inert-guard
   // pattern (9 recorded instances) in message form. So the empty case gets its
   // own sentence and names the way out, and only the 56 are offered a partial.
+  //
+  // AND THE PARTIAL IT OFFERS IS NOW TYPEABLE. `availablePurchase` is floored
+  // (purchaseQtyDown), so the figure in "Issue X or less" is a figure this very
+  // function accepts on the retry — proved by typing it back on the real
+  // 14,842.5 g balance, not by reading this code. The PURCHASE unit is the right
+  // basis for it because that is the unit BOTH desks' Issue boxes are entered in
+  // (requisitions/page.tsx `issued_pu` → U.fromPU, store-requisitions/page.tsx
+  // `editQty` → U.fromPU); the line unit the API itself takes is reached only
+  // through those converters, never typed by a human.
   const q = (n: number) => `${fmtQtyNum(n)}${purchaseUnit ? ` ${purchaseUnit}` : ''}`;
   const message = availablePurchase > 0
     ? `${base.materialName}: the central store holds only ${q(availablePurchase)}, `
@@ -931,11 +1036,21 @@ export function applyIssueDelta(db: any, input: IssueDeltaInput): IssueDeltaResu
       // that makes the no-negative property structural rather than a promise the
       // two routes keep. It is what answers a direct API call, a third issue
       // desk written next year, and the pre-flight/transaction race.
-      assertCentralIssue(db, {
+      const c = assertCentralIssue(db, {
         reqItemId: input.reqItemId,
         beforeLineQty: Number(input.beforeLineQty) || 0,
         afterLineQty: Number(input.afterLineQty) || 0,
       });
+      // WRITE THE FLOOR'S FIGURE, NOT THE ASK. Same balance read, same rule: an
+      // issue of "everything" subtracts the balance itself and lands on exactly
+      // 0 instead of -4e-7 (or a 1e-9 crumb). It differs from deltaRecipe by
+      // strictly less than one 6-dp step, and only on that "everything" issue.
+      // The ledger row, the central movement and the department credit below
+      // all carry this one figure, so SUM(delta_recipe_qty) is still exactly
+      // what central gave up and the credit clamp above stays honest. It cannot
+      // be 0 here: deltaRecipe is 6-dp rounded and > 0, so it is at least one
+      // grid step, which a zero balance does not fit.
+      stockQty = c.debitRecipe;
     }
 
     // Positive delta = goods left the store.

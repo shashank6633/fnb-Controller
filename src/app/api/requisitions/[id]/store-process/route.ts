@@ -99,6 +99,16 @@ import { centralFlowBlock } from '@/lib/store-engine';
  *                                          // `ordered` false = the combined line was then
  *                                          // dropped and is in po_skipped_lines instead.
  *   issue_unit_review?: string[]           // lines whose unit was too ambiguous to move stock
+ *   held_lines?: [{                        // lines the central floor would not let through,
+ *     code: 'central_stock_short',         // so quantity_issued was LEFT AS IT WAS and the
+ *     material, material_id,               // line stays outstanding. Same row shape as the
+ *     req_item_id, requested, available,   // 400's `blocked`, so one reader serves both.
+ *     purchase_unit, max_issue_qty,        // Never empty-but-silent: absent = nothing held.
+ *     line_unit, message
+ *   }],
+ *   stock_held_note?,                      // the same list as one printable sentence; also
+ *                                          // folded into po_note, the field every shipped
+ *                                          // caller prints verbatim.
  * }
  *
  * Errors (400) that name the offending row, so a caller can point at it rather
@@ -111,6 +121,11 @@ import { centralFlowBlock } from '@/lib/store-engine';
  *                                            req_item_id, requested, available,
  *                                            purchase_unit, max_issue_qty, line_unit,
  *                                            message }], req_item_ids, applied: 0 }
+ *                                          ONLY when not one line of the gesture can
+ *                                          be handed over. A gesture that CAN issue
+ *                                          something succeeds instead and reports the
+ *                                          short lines as held_lines (same row shape)
+ *                                          on the 200 — "issue the 5, hold the 1".
  *                                          EVERY short line at once. requested /
  *                                          available / max_issue_qty read in the
  *                                          PURCHASE unit except max_issue_qty, which
@@ -333,35 +348,56 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     // gets a sentence about every short line at once instead of a rollback.
     //
     // ── HOW A MULTI-LINE REQUISITION BEHAVES WHEN ONE LINE IS SHORT ─────────
-    // THE WHOLE GESTURE IS REFUSED, BEFORE THE TRANSACTION OPENS, AND NOTHING
-    // IS WRITTEN. That is a deliberate decision and this is the place it is
-    // recorded.
+    // ISSUE THE 5, HOLD THE 1 — the owner's call, and this is the place it is
+    // recorded. THE SHORT LINE IS HELD AND THE REST OF THE GESTURE IS WRITTEN.
     //
-    // The rejected alternative was to refuse from INSIDE the transaction, which
-    // an earlier attempt at this did: it threw on the first short line after the
-    // ordinary lines of the same requisition had already been written, and the
-    // rollback took them with it. A reviewer's verdict on that shape was "the
-    // ordinary case broken while fixing the unusual one", and it is right — the
-    // storekeeper loses work he had correctly entered, and he is told about one
-    // short line at a time.
+    // THE PARAGRAPH THIS REPLACES SAID THE OPPOSITE ("THE WHOLE GESTURE IS
+    // REFUSED… AND NOTHING IS WRITTEN"), and it is kept here because its
+    // reasoning was sound and a future reader will otherwise re-derive it:
     //
-    // Refusing HERE is not that. Nothing has been written, so every other line
-    // is not "rolled back", it is untouched and byte-identical; the response
-    // names EVERY short line with what the store actually holds; and the whole
-    // gesture is replayable the moment the numbers are corrected. It is also the
-    // shape this route already advertises for every operator-answerable refusal
-    // — see the Errors block in the file header: "every one is raised BEFORE the
-    // transaction opens, so nothing is half-written". bad_number, negative_qty,
-    // unknown_line and duplicate_line all behave exactly this way, and a short
-    // line is the same kind of problem: one number a human can fix and resubmit.
+    //   "The rejected alternative was to refuse from INSIDE the transaction,
+    //   which an earlier attempt at this did: it threw on the first short line
+    //   after the ordinary lines of the same requisition had already been
+    //   written, and the rollback took them with it. A reviewer's verdict on
+    //   that shape was 'the ordinary case broken while fixing the unusual one'…
+    //   Refusing HERE is not that. Nothing has been written, so every other
+    //   line is not 'rolled back', it is untouched and byte-identical."
     //
-    // WHY NOT SILENTLY ISSUE WHAT IS THERE AND SHORT THE REST: because this
-    // route is ABSOLUTE (SET quantity_issued = ?). Writing 0.4 where the
-    // storekeeper typed 5 would commit a requisition line claiming a hand-over
-    // that did not happen, on the row the kitchen is owed against. A PARTIAL
-    // ISSUE IS STILL FULLY AVAILABLE — he types 0.4, which the message gives
-    // him, and it goes through. What is refused is only the part that does not
-    // exist.
+    // What that reasoning got right is WHERE the decision belongs: before the
+    // transaction, never mid-write. What it got wrong is the decision itself.
+    // "Untouched and byte-identical" was offered as the consolation, but on a
+    // 3-line gesture where EGGS held 10 and asked 100 it meant the storekeeper
+    // had SALT and CHICKEN in his hands, the kitchen waiting, and a 400 telling
+    // him to type the whole thing again (measured: applied:0, three lines at
+    // quantity_issued 0, zero ledger rows, zero inventory_transactions). The
+    // "ordinary case broken while fixing the unusual one" verdict applies to
+    // that outcome just as squarely.
+    //
+    // So: the lines the floor clears are written, and a short line is HELD —
+    // quantity_issued is LEFT EXACTLY AS IT WAS FOUND, which on this absolute
+    // route is how a line is left alone. It therefore stays below its effective
+    // quantity, `allDone` below reads it as outstanding, the requisition stays
+    // 'store_processed' rather than closing as 'fulfilled', and it keeps its
+    // place in the store queue. The response names it with the obeyable figure.
+    //
+    // WHY NOT SILENTLY ISSUE WHAT IS THERE AND SHORT THE REST — unchanged, and
+    // it is the reason a short line is held rather than clamped: this route is
+    // ABSOLUTE (SET quantity_issued = ?). Writing 0.4 where the storekeeper
+    // typed 5 would commit a requisition line claiming a hand-over that did not
+    // happen, on the row the kitchen is owed against. A PARTIAL ISSUE IS STILL
+    // FULLY AVAILABLE — he types 0.4, which the message gives him, and it goes
+    // through. The verdict stays per line and binary, `c.ok` from
+    // checkCentralIssue, the one place that decides what is issuable; there is
+    // no second notion of "short" here (:779 below makes the same point about
+    // the per-line vendor verdict that drives its drop-the-line rule).
+    //
+    // NOT ONE LINE CAN BE HANDED OVER ⇒ STILL REFUSED WHOLE, before the
+    // transaction opens, with the wording, envelope and 400 it has always had.
+    // That is the shape this route advertises for every operator-answerable
+    // refusal — see the Errors block in the file header: "every one is raised
+    // BEFORE the transaction opens, so nothing is half-written" — and with
+    // nothing issuable there is no hand-over to protect, so the requisition is
+    // better left untouched and replayable than part-written.
     //
     // ORDER MATCHES THE WRITE LOOP (`for (const it of items)`), and the running
     // claim is accumulated per material, so a gesture drawing on one material
@@ -375,6 +411,27 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       max_issue_qty: number; line_unit: string;
       message: string;
     }[] = [];
+    /**
+     * requisition_items.id of every line the floor refused. The write loop
+     * reads this to leave quantity_issued exactly as it found it — the only way
+     * to "not write" a line on a route whose UPDATE is absolute.
+     */
+    const heldItemIds = new Set<string>();
+    /**
+     * Lines the floor CLEARED that actually hand goods over on this POST
+     * (posted quantity_issued above the stored one). 0 of these alongside a
+     * held line ⇒ nothing issuable ⇒ refuse the gesture whole.
+     *
+     * The test is "does this line hand goods over", not a second reading of
+     * "is it short" — shortness is `c.ok` and nothing else. It is needed
+     * because this route's loop is UNFILTERED: it walks every line of the
+     * requisition, including the ones the caller omitted (which credit stock
+     * back) and the ones already at their posted figure (zero delta). Counting
+     * those as issuable would make "not one line can be handed over"
+     * unreachable on any requisition with more than one line — the recorded
+     * inert-guard shape, where the refusal reads correctly and never fires.
+     */
+    let issuableLines = 0;
     {
       // Read fresh rather than from `items` (SELECTed before `await
       // req.json()`), for the same reason the write loop re-reads it: a stale
@@ -394,10 +451,26 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           afterLineQty: afterIssued,
           alreadyClaimedRecipe: already,
         });
+        // ── WHAT A HELD LINE CLAIMS: NOTHING ────────────────────────────────
         // netRecipe, not requestedRecipe: an omitted line credits stock back and
         // that headroom is real for a later line of the same material.
-        claimed.set(String(it.material_id), already + c.netRecipe);
-        if (c.ok) continue;
+        //
+        // AND ONLY WHEN THE LINE IS ACTUALLY GOING TO BE WRITTEN. A held line
+        // removes nothing from central, so it must not eat the headroom a later
+        // line of the same material draws on — accumulating its full request
+        // (what the whole-gesture refusal did, harmlessly, because nothing ran
+        // afterwards) would cascade one short line into holding every later
+        // line of that material. 0 of the 1,630 live requisitions name one
+        // material twice, so this changes no measured case; it stops the day
+        // one does from being wrong.
+        if (c.ok) {
+          claimed.set(String(it.material_id), already + c.netRecipe);
+          // Posted ABOVE the stored figure = goods handed over on this POST.
+          // See issuableLines' own note for why the unfiltered loop needs this.
+          if (afterIssued > beforeIssued) issuableLines++;
+          continue;
+        }
+        heldItemIds.add(String(it.id));
         centralShort.push({
           code: 'central_stock_short',
           material: c.materialName, material_id: c.materialId, req_item_id: c.reqItemId,
@@ -408,7 +481,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         });
       }
     }
-    if (centralShort.length > 0) {
+    if (centralShort.length > 0 && issuableLines === 0) {
       return Response.json({
         error: `${centralShort.length} line${centralShort.length === 1 ? '' : 's'} `
           + `${centralShort.length === 1 ? 'asks' : 'ask'} for more than the central store holds, `
@@ -420,6 +493,9 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         applied: 0,
       }, { status: 400 });
     }
+    // PAST THIS POINT THE GESTURE IS GOING AHEAD WITHOUT THE HELD LINES. Their
+    // rows go back on the 200 (held_lines / stock_held_note, assembled after the
+    // transaction), and the write loop leaves their quantity_issued untouched.
 
     // ── THE ONE LIST OF "YOU ASKED TO BUY THIS AND IT WAS NOT ORDERED" ──────
     // Every branch below that declines to turn a buy intent into a PO line
@@ -1003,6 +1079,22 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         const issued   = Number(ln.quantity_issued)      || 0;
         const purchase = Number(ln.quantity_to_purchase) || 0;
         const beforeIssued = Number((selBefore.get(it.id) as any)?.quantity_issued) || 0;
+        // ── A HELD LINE IS WRITTEN BACK AS IT WAS FOUND ──────────────────────
+        // The floor refused this line's issue before the transaction opened
+        // (centralShort above) and at least one other line survived, so the
+        // gesture proceeds without it. On an ABSOLUTE route "do not write this
+        // line" IS writing its own pre-image back: beforeIssued was read inside
+        // this transaction a line ago, so the column ends up byte-identical,
+        // and applyIssueDelta below gets before === after, which its zero-delta
+        // gate answers ahead of every clamp, stock write,
+        // inventory_transactions row, ledger row and client_token burn
+        // (issue-stock.ts). The line therefore stays exactly as outstanding as
+        // it was, which is what `allDone` reads at the end of this transaction.
+        //
+        // THE PURCHASE HALF IS NOT HELD. A Buy qty is a statement about what to
+        // order, and the central store being empty is the very reason to order
+        // it — holding the PO line as well would punish the short line twice.
+        const issuedToWrite = heldItemIds.has(String(it.id)) ? beforeIssued : issued;
         // `!it.is_rejected` on the purchase half only. The ISSUE half stays
         // unfiltered and absolute on purpose (see the note below — a rejected
         // line that held 5 must still credit 5 back), but writing
@@ -1010,8 +1102,8 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         // this very request has just refused and reported as 'chef_rejected'.
         // The row would then read "buy 9" for an item no PO can ever carry.
         // updIssuedOnly leaves the column exactly as it found it.
-        if (autoCreatePo && !it.is_rejected) updReqItem.run(issued, toLineBasis(it, ln, purchase), it.id);
-        else                                 updIssuedOnly.run(issued, it.id);
+        if (autoCreatePo && !it.is_rejected) updReqItem.run(issuedToWrite, toLineBasis(it, ln, purchase), it.id);
+        else                                 updIssuedOnly.run(issuedToWrite, it.id);
         // EVERY row in this loop, not only the ones with issued > 0. This loop is
         // both absolute and unfiltered: it rewrites lines the client omitted
         // (issued = 0) and chef-rejected lines too — the is_rejected guard exists
@@ -1024,7 +1116,10 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         const res = applyIssueDelta(db, {
           reqItemId: it.id,
           beforeLineQty: beforeIssued,
-          afterLineQty: issued,
+          // issuedToWrite, NOT `issued`: this call must mirror the UPDATE above
+          // exactly or the two rails disagree. On a held line that makes it
+          // before === after, so the zero-delta gate returns before any write.
+          afterLineQty: issuedToWrite,
           reason: 'store_process',
           actor: me.email,
           clientToken,
@@ -1241,7 +1336,18 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // dropped. A dropped line is exactly as "still to come" as a PO line.
       // Same poDropped/poSkipped distinction as finalStatus above: only a line
       // that WOULD have been ordered and was not still counts as outstanding.
-      if (!linkedPoId && poDropped.length === 0 && r.purpose === 'party') {
+      //
+      // A HELD LINE IS OUTSTANDING FOR THE SAME REASON, and is listed here for
+      // the same reason — but BE CLEAR THAT IT CANNOT FIRE TODAY, so nobody
+      // reads it as protection it is not providing. checkCentralIssue carves
+      // every line of a 'party' requisition out on the internal rail
+      // (skipReason 'party'), so a party line is never short and heldItemIds is
+      // always empty here; the party rail moves those goods later, in one lump,
+      // through this very helper. It is written into the outstanding test rather
+      // than left out because the failure it would cause is permanent: the
+      // party_consumption ledger row makes the transfer one-shot, so a transfer
+      // fired on a partial could never move the remainder afterwards.
+      if (!linkedPoId && poDropped.length === 0 && heldItemIds.size === 0 && r.purpose === 'party') {
         applyPartyFulfillment(db, id, me.email);
       }
       db.prepare(`
@@ -1272,7 +1378,32 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     // payload that stated a purchase intent without asking for a PO reports it
     // through the same field, and a caller that prints po_note is right on every
     // path rather than on the PO one only.
-    if (autoCreatePo || result.po_skipped_note) {
+    // ── WHAT THE CENTRAL FLOOR HELD BACK, ON THE SUCCESS RESPONSE ───────────
+    // Machine-readable rows in the SAME shape as the 400's `blocked` (so one
+    // client reader serves both — requisitions/page.tsx:2873 keys on
+    // req_item_id + code + max_issue_qty), plus one sentence. Built before
+    // po_note so that sentence can be folded into it below: po_note is the
+    // field this route documents as true on every path and the modal prints it
+    // verbatim ("Server summary:", requisitions/page.tsx:3036), so a storekeeper
+    // learns about a held line without waiting for a client change.
+    if (centralShort.length > 0) {
+      const n = centralShort.length;
+      result.held_lines = centralShort;
+      result.stock_held_note =
+        `${n} line${n === 1 ? '' : 's'} ${n === 1 ? 'was' : 'were'} NOT issued and `
+        + `${n === 1 ? 'stays' : 'stay'} outstanding on ${r.req_number} — the central store does not `
+        + `hold the quantity asked. ${centralShort.map(s => s.message).join(' ')} `
+        + `Everything else on this requisition was issued.`;
+    }
+    // `|| result.stock_held_note` so a plain issue (no PO asked for) that held a
+    // line still reaches po_note. The `autoCreatePo &&` added to the
+    // no-PO-raised branch below is a provable no-op on every pre-existing path:
+    // that branch needs poSkipped.length === 0, and without autoCreatePo the
+    // only other way into this block was po_skipped_note, which is set solely
+    // when poSkipped.length > 0 — so the branch was already unreachable with
+    // autoCreatePo false. Without it, a plain issue with a held line would be
+    // told "No vendor PO was raised" about a PO it never asked for.
+    if (autoCreatePo || result.po_skipped_note || result.stock_held_note) {
       const parts: string[] = [];
       if (result.linked_po_number) {
         const n = result.po_line_count;
@@ -1283,13 +1414,17 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           `Purchase order ${result.linked_po_number} raised for ${n} item${n === 1 ? '' : 's'} ` +
           `(₹${Number(result.po_total_cost).toFixed(2)}) — it is PENDING ADMIN APPROVAL on Purchase Orders.`,
         );
-      } else if (poSkipped.length === 0) {
+      } else if (autoCreatePo && poSkipped.length === 0) {
         // Ticking the box and buying nothing is legitimate (issue-only), but it
         // must not read as "the PO went through".
         parts.push('No vendor PO was raised — no line had a Buy quantity.');
       }
       if (result.po_skipped_note) parts.push(result.po_skipped_note);
       if (result.po_merged_note)  parts.push(result.po_merged_note);
+      // LAST, and first in the storekeeper's eye-line only because it is the one
+      // fact about goods rather than paperwork: a line he thinks he just handed
+      // over did not move.
+      if (result.stock_held_note) parts.push(result.stock_held_note);
       result.po_note = parts.join(' ');
     }
 

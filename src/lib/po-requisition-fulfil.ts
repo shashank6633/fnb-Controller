@@ -236,13 +236,17 @@ export function fulfilRequisitionFromPo(
         // requisition lines (identical factor on 16,350; the other 3 are the
         // blank-unit packed lines both now refuse instead of guessing).
         const wanted = c.requestedRecipe;          // RECIPE units
-        // THE CLAMP. min() of the rule's allowance AND the raw stored balance —
-        // both come from this one check, so it is still one rule. availableRecipe
-        // is the 6dp-rounded allowance the floor publishes; centralStockRecipe is
-        // the exact balance, and taking the lower of the two means a rounding
-        // step can never hand out a fraction more than is physically there.
-        const issued = Math.max(0, Math.min(wanted, c.availableRecipe, Math.max(0, c.centralStockRecipe)));
-        if (issued <= 0 || issued < wanted - 1e-9) {
+        // THE CLAMP IS THE RULE'S OWN FIGURE. debitRecipe comes from
+        // planCentralDebit (src/lib/central-debit-clamp.ts), the one rule every
+        // central floor shares: when the line fits it is the ask (or, on an ask
+        // of "everything", the balance itself, so the write lands on exactly 0);
+        // when it does not fit it is max(0, balance) — the clamp. Never more than
+        // the raw stored balance, so a rounding step can never hand out a
+        // fraction more than is physically there. This used to be a local
+        // min(wanted, 6-dp allowance, balance) with its own 1e-9 test, which
+        // logged a "short" of 0.0000004 against an ask the floor had accepted.
+        const issued = Math.max(0, c.debitRecipe);
+        if (!c.ok || issued <= 0) {
           shortfalls.push({
             req_item_id: String(it.id), material_id: String(it.material_id),
             material_name: String(it.material_name || ''),

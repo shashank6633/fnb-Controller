@@ -278,6 +278,122 @@ function readBlockedReversals(
   return out;
 }
 
+/* ── THE CENTRAL FLOOR'S REFUSAL, WHICH IS A DIFFERENT ANIMAL ────────────────
+   The store cannot hand over goods the central books do not hold, and
+   /store-issue answers that with code 'central_stock_short' and the same
+   `blocked[]` envelope the reversal gate uses.
+
+   IT GETS ITS OWN TYPE AND ITS OWN READER, and that is the whole point rather
+   than duplication for its own sake: BlockedReversal's `requested`/`available`
+   arrive in RECIPE units (the department ledger is material-level) and render
+   through U.stockPU, while these arrive ALREADY IN THE PURCHASE UNIT, floored by
+   the server (issue-stock.ts purchaseQtyDown) so that they are typeable. Feeding
+   a central row into readBlockedReversals would print kilograms through a
+   gram→kilogram converter — the 1000x error this app has had before.
+
+   WHAT WAS WRONG BEFORE THIS. The sentence existed and was correct; it reached
+   the storekeeper as `alert(j.error)` and vanished on OK, leaving him in front
+   of an empty box with no number. `max_issue_qty` / `available` were on the wire
+   and nothing on this page read either. So the refusal now lands as a panel on
+   the line, and the figure lands in the quantity box via the chip in it. */
+const CENTRAL_SHORT_CODE = 'central_stock_short';
+
+interface CentralShort {
+  material: string;
+  /** PURCHASE units, floored by the server — the figure THIS page's quantity
+   *  box takes, because that box holds a DELTA added to quantity_issued and
+   *  `available` is exactly the headroom on top of what is already issued. */
+  available: number;
+  /** PURCHASE units, rounded UP by the server — never less than was asked. */
+  requested: number;
+  /** The unit both figures above are in. Blank only if the server sent none. */
+  purchaseUnit: string;
+  /** The server's finished sentence. Printed verbatim — never re-worded. */
+  message: string;
+  /** TRUE when this row came off a 200's `held[]` and NOT a 400's `blocked[]`.
+   *  The figures and the sentence are identical; what differs is the fact about
+   *  the GESTURE. A refusal wrote nothing ("Nothing was issued"), a hold means
+   *  every other line of the same gesture WAS handed over and only this one
+   *  stays outstanding. The panel's footer must say whichever is true. */
+  held?: boolean;
+}
+
+/**
+ * Read a central-stock refusal into a per-line map. Same forgiving shape as
+ * readBlockedReversals (a swallowed refusal reads as "the app ignored me"), with
+ * one extra condition: the row must actually BE a central refusal, so a reversal
+ * block can never be rendered through this panel's purchase-unit basis.
+ */
+function readCentralShort(
+  payload: { code?: unknown; error?: unknown; blocked?: unknown } | null | undefined,
+  submitted: { id: string; material_name: string }[],
+): Record<string, CentralShort> {
+  const out: Record<string, CentralShort> = {};
+  const typed = String(payload?.code || '') === CENTRAL_SHORT_CODE;
+  const rows: Record<string, unknown>[] = Array.isArray(payload?.blocked)
+    ? (payload.blocked as Record<string, unknown>[]) : [];
+  for (const b of rows) {
+    if (String(b?.code || '') !== CENTRAL_SHORT_CODE && !typed) continue;
+    // `line_id` is what /store-issue sends; `req_item_id` is the same id by
+    // another name (this page submits requisition_item ids), accepted so a
+    // reshaped envelope cannot silently swallow the refusal.
+    const id = String(b?.line_id || b?.req_item_id || b?.id
+                      || (submitted.length === 1 ? submitted[0].id : ''));
+    if (!id) continue;
+    out[id] = {
+      material: String(b?.material || submitted.find(s => s.id === id)?.material_name || 'this item'),
+      available: Number(b?.available) || 0,
+      requested: Number(b?.requested) || 0,
+      purchaseUnit: String(b?.purchase_unit || '').trim(),
+      message: String(b?.message || b?.error || payload?.error || '').trim(),
+    };
+  }
+  // Typed refusal with no per-line detail and a single-line batch → it is that
+  // line. No figures, so the panel prints the sentence alone and offers no chip.
+  if (Object.keys(out).length === 0 && typed && submitted.length === 1) {
+    out[submitted[0].id] = {
+      material: submitted[0].material_name,
+      available: 0, requested: 0, purchaseUnit: '',
+      message: String(payload?.error || '').trim(),
+    };
+  }
+  return out;
+}
+
+/* ── THE SAME REFUSAL, ON A SUCCESS: "ISSUE THE 5, HOLD THE 1" ───────────────
+   /store-issue no longer refuses a batch because one line is short. It hands
+   over every line the central books cover, leaves the short one's
+   quantity_issued as it was (so it stays outstanding), and answers 200 with
+   `held[]` + `held_message` (store-issue/route.ts, "WHAT WAS HELD BACK"). A
+   400 with `blocked[]` now only happens when not one line could go.
+
+   THE ROWS ARE THE `blocked[]` ROWS, field for field (code, line_id, material,
+   requested / available in the PURCHASE unit, purchase_unit, message), so
+   they go through readCentralShort above and nowhere else. A second parser for
+   the same shape would be the rival-helper trap. The only additions are the
+   `held` flag, which changes the panel's footer, and the guard below.
+
+   THE EMPTY-ARRAY GUARD IS LOAD-BEARING. readCentralShort turns a TYPED payload
+   with no per-line rows on a single-line batch into a row for that line. That
+   is right for a 400 and wrong here: a fully-issued 200 that ever carried
+   `held: []` would paint a "does not hold this much" panel on the line that had
+   just gone out. Nothing held means nothing is read. */
+function readCentralHeld(
+  payload: { held?: unknown } | null | undefined,
+  submitted: { id: string; material_name: string }[],
+): Record<string, CentralShort> {
+  const rows = Array.isArray(payload?.held) ? (payload.held as unknown[]) : [];
+  if (rows.length === 0) return {};
+  // `code` set on the envelope because `held` IS the central-short list by
+  // definition, so a row the server sent without its own code is still read.
+  // `error` left blank on purpose: readCentralShort falls back to it for a row
+  // with no sentence, and the gesture-level held_message printed on ONE line
+  // would claim the whole gesture's figures for that line.
+  const out = readCentralShort({ code: CENTRAL_SHORT_CODE, blocked: rows, error: '' }, submitted);
+  for (const id of Object.keys(out)) out[id] = { ...out[id], held: true };
+  return out;
+}
+
 export default function StoreRequisitionsPage() {
   const [list, setList] = useState<Requisition[]>([]);
   const [departments, setDepartments] = useState<Department[]>([]);
@@ -341,12 +457,106 @@ export default function StoreRequisitionsPage() {
   // per undo to record "that endpoint isn't there" would be noise. Resets on
   // page load, so deploying the route later needs no code change here.
   const precheckAvailable = useRef(true);
-  const clearBlocked = (...lineIds: string[]) =>
+  // Central-stock refusals, keyed by requisition_item id — see CentralShort
+  // above. Same lifetime rule as blockedReversals: it must survive a reload, and
+  // it is cleared only when the storekeeper acts on that same line again.
+  const [centralShort, setCentralShort] = useState<Record<string, CentralShort>>({});
+  const clearBlocked = (...lineIds: string[]) => {
     setBlockedReversals(s => {
       const hit = lineIds.filter(id => id in s);
       if (hit.length === 0) return s;                 // no-op keeps the ref stable
       const n = { ...s }; for (const id of hit) delete n[id]; return n;
     });
+    // Cleared on the SAME gesture, for the same reason: a stale "only 14.842 kg"
+    // sitting beside a line that has just gone out reads as a fresh failure, and
+    // the figure itself is a lie the moment any stock moves.
+    setCentralShort(s => {
+      const hit = lineIds.filter(id => id in s);
+      if (hit.length === 0) return s;
+      const n = { ...s }; for (const id of hit) delete n[id]; return n;
+    });
+  };
+  /* Shared tail for the four ISSUE actions, mirroring showReversalError: a typed
+     central-stock refusal goes inline against the named line(s); anything else
+     (wrong status, signed out, CSRF, a dropped LAN packet) is requisition-level
+     and stays an alert, because burying that under one row is how it gets
+     missed. Returns true when it was handled as a per-line refusal.
+
+     THE REQUISITION IS EXPANDED when a refusal lands, and that is not a flourish
+     — "Issue All" and "Issue Selected" are pressed from the CARD HEADER and the
+     refused line can be anywhere below it, or behind a collapsed card, in which
+     case a panel nobody can see is no better than the alert it replaced.
+     A MULTI-LINE GESTURE ALSO KEEPS THE ALERT, because the route refuses the
+     batch WHOLE ("nothing was issued and the requisition is unchanged") and that
+     is a fact about the gesture, not about any one row; the panels then hold the
+     per-line numbers for as long as the storekeeper needs them. */
+  const showIssueError = (
+    j: { code?: unknown; error?: unknown; blocked?: unknown } | null | undefined,
+    batch: { id: string; material_name: string }[], fallback: string,
+    reqId?: string,
+  ): boolean => {
+    const short = readCentralShort(j, batch);
+    if (Object.keys(short).length > 0) {
+      setCentralShort(s => ({ ...s, ...short }));
+      if (reqId) setExpanded(p => (p.has(reqId) ? p : new Set(p).add(reqId)));
+      if (batch.length > 1 && j?.error) alert(String(j.error));
+      return true;
+    }
+    alert(j?.error || fallback);
+    return false;
+  };
+  /* The SUCCESS-side twin of showIssueError, called on the 200 of all four
+     ISSUE actions. Before this, every success path did setRefreshKey and
+     nothing else. A gesture that handed over five lines and HELD the sixth
+     looked exactly like one that handed over all six, and the storekeeper
+     learnt about the sixth only if he noticed it was still in the queue.
+
+     It does the same three things the multi-line refusal does, for the same
+     reasons:
+       - the per-line panels, so the figure ("holds only 14.842 kg") and the
+         one-click partial issue sit on the line that was held, and stay there
+         until he acts on that line again (clearBlocked)
+       - the card is EXPANDED, because Issue All / Issue Selected are pressed
+         from the card header and the held line can be anywhere below it
+       - ONE alert with the server's own `held_message`, printed VERBATIM.
+         That is the sentence the management desk prints for the same event
+         (store-process's `stock_held_note`, folded into the po_note it shows as
+         "Server summary:"), word for word except "in this gesture" for "on this
+         requisition", so both desks say it the same way. The alert is the
+         interruption: a held line is a fact about goods, not paperwork. A
+         panel on a reloaded card he is not looking at is exactly how it got
+         missed.
+
+     Returns the ids of the lines that were held (empty when nothing was), so a
+     single-line caller keeps the typed figure on a line that did not go out
+     instead of clearing it as if it had. A fully-issued response carries no
+     `held` and no `held_message`, so this does nothing at all and every path
+     behaves exactly as before. */
+  const announceHeld = (
+    j: { held?: unknown; held_message?: unknown } | null | undefined,
+    batch: { id: string; material_name: string }[],
+    reqId?: string,
+  ): Set<string> => {
+    const held = readCentralHeld(j, batch);
+    const ids = Object.keys(held);
+    let msg = String(j?.held_message || '').trim();
+    const rows = Array.isArray(j?.held) ? (j!.held as Record<string, unknown>[]) : [];
+    // Only when the server sent rows but not the sentence, which is not a shape
+    // it produces today. Built from the route's own words (store-issue/route.ts
+    // held_message) so the fallback cannot read differently from the real thing.
+    if (!msg && rows.length > 0) {
+      const n = rows.length;
+      msg = `${n} line${n === 1 ? '' : 's'} ${n === 1 ? 'was' : 'were'} NOT issued and `
+        + `${n === 1 ? 'stays' : 'stay'} outstanding — the central store does not hold the quantity asked. `
+        + rows.map(b => String(b?.message || '').trim()).filter(Boolean).join(' ')
+        + ` Everything else in this gesture was issued.`;
+    }
+    if (ids.length === 0 && !msg) return new Set();
+    if (ids.length > 0) setCentralShort(s => ({ ...s, ...held }));
+    if (reqId) setExpanded(p => (p.has(reqId) ? p : new Set(p).add(reqId)));
+    if (msg) alert(msg);
+    return new Set(ids);
+  };
   // "Issue All Items" confirmation — holds the requisition whose bulk-issue is
   // awaiting confirmation (null = no modal). We compute the lines to issue at
   // confirm time from the same req object.
@@ -404,7 +614,13 @@ export default function StoreRequisitionsPage() {
         body: { lines: resolvedLines.map(x => ({ id: x.l.id, action: 'issue', quantity: x.r.qty, note: x.r.note })) },
       });
       const j = await r.json();
-      if (!r.ok) { alert(j.error || 'Issue selected failed'); return; }
+      if (!r.ok) {
+        showIssueError(j, lines.map(l => ({ id: l.id, material_name: l.material_name })),
+                       'Issue selected failed', req.id);
+        return;
+      }
+      // A 200 is not "all of it" any more — see announceHeld.
+      announceHeld(j, lines.map(l => ({ id: l.id, material_name: l.material_name })), req.id);
       setSelectedLines(prev => { const n = { ...prev }; delete n[req.id]; return n; });
       setRefreshKey(k => k + 1);
     } finally { setIssuingSelected(null); }
@@ -584,9 +800,20 @@ export default function StoreRequisitionsPage() {
         }] },
       });
       const j = await r.json();
-      if (!r.ok) { alert(j.error || 'Issue failed'); return; }
-      setEditQty(s => ({ ...s, [line.id]: '' }));
-      setIssueNotes(s => { const n = { ...s }; delete n[line.id]; return n; });
+      if (!r.ok) {
+        showIssueError(j, [{ id: line.id, material_name: line.material_name }],
+                       'Issue failed', req.id);
+        return;
+      }
+      // One 'issue' entry that the floor holds leaves nothing issuable, and the
+      // route answers that 400, so today this line cannot come back held on a
+      // 200. Read anyway: the day it does, the typed figure must survive on a
+      // line that did not go out, and the storekeeper must be told.
+      const heldIds = announceHeld(j, [{ id: line.id, material_name: line.material_name }], req.id);
+      if (!heldIds.has(line.id)) {
+        setEditQty(s => ({ ...s, [line.id]: '' }));
+        setIssueNotes(s => { const n = { ...s }; delete n[line.id]; return n; });
+      }
       setRefreshKey(k => k + 1);
     } finally { setBusyLine(null); }
   };
@@ -683,11 +910,22 @@ export default function StoreRequisitionsPage() {
         ] },
       });
       const j = await r.json();
-      if (!r.ok) { alert(j.error || 'Issue + defer failed'); return; }
-      setEditQty(sm => ({ ...sm, [line.id]: '' }));
-      setIssueNotes(sm => { const n = { ...sm }; delete n[line.id]; return n; });
-      setEditDefer(sm => { const n = { ...sm }; delete n[line.id]; return n; });
-      setSplitIssueQty(sm => { const n = { ...sm }; delete n[line.id]; return n; });
+      if (!r.ok) {
+        showIssueError(j, [{ id: line.id, material_name: line.material_name }],
+                       'Issue + defer failed', req.id);
+        return;
+      }
+      // Same as issueLine: a held issue entry beside a defer leaves nothing
+      // issuable, which the route refuses 400, so this is defensive today. If
+      // it ever is held on a 200, the captured gesture (quantity, promised
+      // time, token) is kept so the storekeeper can correct one figure and replay.
+      const heldIds = announceHeld(j, [{ id: line.id, material_name: line.material_name }], req.id);
+      if (!heldIds.has(line.id)) {
+        setEditQty(sm => ({ ...sm, [line.id]: '' }));
+        setIssueNotes(sm => { const n = { ...sm }; delete n[line.id]; return n; });
+        setEditDefer(sm => { const n = { ...sm }; delete n[line.id]; return n; });
+        setSplitIssueQty(sm => { const n = { ...sm }; delete n[line.id]; return n; });
+      }
       setRefreshKey(k => k + 1);
     } finally { setBusyLine(null); }
   };
@@ -876,8 +1114,18 @@ export default function StoreRequisitionsPage() {
         body: { lines: resolvedLines.map(x => ({ id: x.l.id, action: 'issue', quantity: x.r.qty, note: x.r.note })) },
       });
       const j = await r.json();
-      if (!r.ok) { alert(j.error || 'Issue all failed'); return; }
+      if (!r.ok) {
+        showIssueError(j, lines.map(l => ({ id: l.id, material_name: l.material_name })),
+                       'Issue all failed', req.id);
+        // Close the confirmation so the panels underneath are reachable — the
+        // modal sits over the very lines the refusal is about.
+        setConfirmIssueAll(null);
+        return;
+      }
       setConfirmIssueAll(null);
+      // "Issue All" is the gesture most likely to carry a short line: it posts
+      // every open line at once. See announceHeld.
+      announceHeld(j, lines.map(l => ({ id: l.id, material_name: l.material_name })), req.id);
       setRefreshKey(k => k + 1);
     } finally { setIssuingAll(false); }
   };
@@ -1010,6 +1258,7 @@ export default function StoreRequisitionsPage() {
                      onIssue={(line, qty) => issueLine(req, line, qty)}
                      onDefer={(line) => deferLine(req, line)}
                      blockedReversals={blockedReversals}
+                     centralShort={centralShort}
                      onUndo={(line) => undoLine(req, line)}
                      onReject={(line) => rejectLine(req, line)}
                      onUnreject={(line) => unrejectLine(req, line)}
@@ -1569,6 +1818,8 @@ function ReqCard(props: {
   onDefer: (line: ReqLine) => void;
   /** Refused reversals by line id — rendered on the line, not as a toast. */
   blockedReversals: Record<string, BlockedReversal>;
+  /** Central-stock refusals by line id — PURCHASE units, see CentralShort. */
+  centralShort: Record<string, CentralShort>;
   onUndo: (line: ReqLine) => void;
   onReject: (line: ReqLine) => void;
   onUnreject: (line: ReqLine) => void;
@@ -1835,6 +2086,7 @@ function ReqCard(props: {
                          onIssueDeferRest={props.onIssueDeferRest}
                          onIssue={props.onIssue} onDefer={props.onDefer}
                          blocked={props.blockedReversals[line.id]}
+                         short={props.centralShort[line.id]}
                          onUndo={props.onUndo} onReject={props.onReject} onUnreject={props.onUnreject}
                          onShowHistory={props.onShowHistory} />
                     ))}
@@ -1874,6 +2126,8 @@ function LineRow(props: {
   onDefer: (line: ReqLine) => void;
   /** Set when the server refused a reversal on THIS line. */
   blocked?: BlockedReversal;
+  /** Set when the central floor refused an ISSUE on THIS line. */
+  short?: CentralShort;
   onUndo: (line: ReqLine) => void;
   onReject: (line: ReqLine) => void;
   onUnreject: (line: ReqLine) => void;
@@ -2192,6 +2446,76 @@ function LineRow(props: {
               {b.message ? <div className="mt-0.5 opacity-90">{b.message}</div> : null}
               <div className="mt-0.5 opacity-90">
                 Nothing was changed on this line. Every other line is untouched.
+              </div>
+            </div>
+          );
+        })()}
+        {/* ── THE CENTRAL STORE WILL NOT GIVE THE GOODS ───────────────────────
+            Its own panel beside the reversal one, never through it: these
+            figures are PURCHASE units already (the reversal panel's are recipe
+            units and go through stockPU), and crossing the two is the 1000x
+            error. See CentralShort.
+
+            A panel and not the alert() it was, for exactly the reason the
+            reversal panel is one: the only useful thing in it is the NUMBER, and
+            a number that fades three seconds later leaves the storekeeper in
+            front of the same box with nothing to type. */}
+        {props.short && (() => {
+          const s = props.short!;
+          // The server's unit must be the unit THIS box is entered in before a
+          // one-click issue is offered. They are read from the same
+          // raw_materials row and always agree — but if the queue payload ever
+          // arrives without material_purchase_unit, lineUnits() falls back to
+          // the RECIPE unit with pf = 1 and fromPU() becomes a no-op, which
+          // would turn one click into a 1000x under-issue. On a mismatch the
+          // sentence and the figure still show; only the button is withheld.
+          const sameBasis = !!s.purchaseUnit
+            && s.purchaseUnit.toLowerCase() === String(u || '').toLowerCase();
+          const canOffer = s.available > 0 && sameBasis;
+          // In the LINE's stored unit — the basis /store-issue adds verbatim.
+          // Passed as onIssue's qtyOverride, which skips resolveIssueQty: its
+          // "typed exactly what the row shows means all of it" shortcut would
+          // substitute the full outstanding whenever the cap and the outstanding
+          // round into the same 3rd decimal, and that substitution is refused.
+          const exactLineQty = U.fromPU(s.available);
+          return (
+            <div className="mb-1 rounded border border-rose-300 bg-rose-50 px-1.5 py-1 text-[10px] leading-snug text-rose-900 max-w-[15rem] md:max-w-[22rem]">
+              <div className="font-semibold flex items-start gap-1">
+                <AlertCircle className="w-3 h-3 mt-[1px] shrink-0" />
+                <span>The central store does not hold this much</span>
+              </div>
+              {/* Verbatim. It is written for a storekeeper, it names both
+                  figures in the purchase unit, and its cap is floored server-side
+                  so it is a quantity that passes on the retry. */}
+              {s.message ? <div className="mt-0.5 opacity-90">{s.message}</div> : null}
+              {s.available > 0 && (
+                <div className="mt-1 flex items-center justify-between gap-1">
+                  <span>
+                    Most it can give now:{' '}
+                    <b className="font-mono">{fmtNum(s.available)}{s.purchaseUnit ? ` ${s.purchaseUnit}` : ''}</b>
+                    {U.pf > 1 && sameBasis
+                      ? <span className="text-[9px] opacity-70"> (= {fmtNum(U.toRecipe(exactLineQty))} {U.recipeUnit})</span>
+                      : null}
+                  </span>
+                  {canOffer && (
+                    <button onClick={() => props.onIssue(line, exactLineQty)} disabled={busy}
+                            title={`Hand over ${fmtNum(s.available)} ${s.purchaseUnit} — the most the central books cover on this line. The rest stays outstanding and can be deferred or ordered.`}
+                            className="shrink-0 px-1.5 py-0.5 rounded border border-rose-400 bg-white hover:bg-rose-100 font-semibold disabled:opacity-50">
+                      Issue {fmtNum(s.available)} {s.purchaseUnit}
+                    </button>
+                  )}
+                </div>
+              )}
+              {/* THE ONE SENTENCE THAT DIFFERS between a refusal and a hold, and
+                  it is the opposite fact. A 400 wrote nothing anywhere. A held
+                  line is the only line of a 200 that did NOT go out, so
+                  "Every other line is untouched" here would tell him the lines
+                  he just handed over are still on the shelf. Worded after the
+                  route's own held_message. */}
+              <div className="mt-0.5 opacity-90">
+                {s.held
+                  ? <><b>This line was NOT issued and stays outstanding.</b> Everything else in that gesture was issued.</>
+                  : <>Nothing was issued. Every other line is untouched.</>}
               </div>
             </div>
           );

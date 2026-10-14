@@ -2,6 +2,7 @@ import { getDb, generateId } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
 import { isStoreMappedMaterial } from '@/lib/store-engine';
 import { postDeptLedger, deptOnHand } from '@/lib/dept-ledger';
+import { planCentralDebit, qtyDown } from '@/lib/central-debit-clamp';
 
 /**
  * Wastages — Phase 1 §6 consumption channel.
@@ -29,9 +30,47 @@ import { postDeptLedger, deptOnHand } from '@/lib/dept-ledger';
  *                         would be blamed for goods he correctly binned.
  *
  *   department_id NULL  → the store found it rotten on its OWN shelf. Central
- *                         still holds it, so this is byte-for-byte today's
- *                         behaviour: current_stock − qty. The NULL branch is
- *                         deliberately preserved, not a legacy leftover.
+ *                         still holds it, so this branch debits current_stock −
+ *                         qty. The NULL branch is deliberately preserved, not a
+ *                         legacy leftover. It now carries the SAME FLOOR the
+ *                         department branch has always had — see THE CENTRAL
+ *                         FLOOR below.
+ *
+ * ── THE CENTRAL FLOOR (why the NULL branch is no longer bare) ──────────────
+ * The refusal below used to sit INSIDE `if (deptId) {`, so the department rail
+ * was bounded and the central rail was not: the else branch debited
+ * raw_materials.current_stock with no balance read of any kind. MEASURED by
+ * running that statement verbatim against a snapshot — GHEE at current_stock 0,
+ * a 400-unit central wastage, balance left at −400, nothing anywhere on the path
+ * refusing it. A guard that is correct and unreachable is this codebase's
+ * recorded inert-guard pattern; this one was merely in the wrong scope.
+ *
+ * The central branch now asks the same question of the same kind of balance, and
+ * REFUSES on the same terms — it does not clamp, for the reason the department
+ * branch already states: a clamp writes a wastage line for goods nobody held,
+ * which is stock invented out of nothing on the one report whose job is to find
+ * stock that went missing.
+ *
+ * TWO DELIBERATE DIFFERENCES FROM THE DEPARTMENT BRANCH, both forced by what the
+ * two balances ARE:
+ *   · NO "never counted" case. raw_materials.current_stock is NOT NULL DEFAULT
+ *     0, so central always has a balance; it is never the department rail's
+ *     "unknown". A zero balance is therefore a real zero and is refused on the
+ *     ordinary short path, not on a separate unknown-balance path.
+ *   · THE BALANCE IS FLOORED AT ZERO before the comparison — max(0, …) — the
+ *     same way src/lib/issue-stock.ts's central floor does it: an
+ *     already-negative balance must read as "nothing available", never as a
+ *     negative allowance that lets the next wastage dig the hole deeper.
+ *     /api/inventory/fix-negative-stock exists because such balances happen.
+ *
+ * AND NO STORE-MAPPED CARVE-OUT ON THIS BRANCH. The department branch refuses a
+ * store-mapped material outright because it structurally has no department
+ * balance. Central is different: this branch has always debited central for them,
+ * and 95 of the 127 store-mapped materials hold a central balance of 0 — so
+ * carving them out of the floor while leaving the debit in place would excuse
+ * precisely the materials that go negative first. They are refused by the
+ * ordinary floor instead, and the message points at the Liquor Store, which is
+ * where their balance actually lives.
  *
  * The inventory_transactions(type='wastage', −qty) row is written on BOTH
  * rails, unconditionally. That row is what the central Variance Report reads;
@@ -40,8 +79,8 @@ import { postDeptLedger, deptOnHand } from '@/lib/dept-ledger';
  *
  * Reasons this file is stricter than it looks — each of these is a rule a
  * future "simplification" would quietly delete:
- *   · THE NEGATIVE GUARD refuses; it never clamps. A clamp writes a wastage
- *     line for goods the department never held, which is stock invented out of
+ *   · THE NEGATIVE GUARD refuses; it never clamps, on BOTH rails. A clamp writes
+ *     a wastage line for goods nobody ever held, which is stock invented out of
  *     nothing on a report whose entire job is to find missing stock.
  *   · THE LIQUOR CARVE-OUT. Store-mapped materials live on the TGBCL rail
  *     (store_stock_ledger / store_locations) and are skipped by both the
@@ -84,6 +123,14 @@ class WastageBlocked extends Error {
  * onHand === null means NEVER COUNTED — no count and no opening row. That is
  * not zero, it is "unknown", and an unknown balance cannot prove a deduction
  * stays positive, so the guard refuses rather than assuming a base.
+ *
+ * THE CENTRAL BRANCH'S BALANCE IS raw_materials.current_stock ITSELF, read
+ * inside the transaction immediately before the debit it bounds. There is no
+ * second derivation to choose between here — that column IS the central balance,
+ * it is the thing the debit writes, and reading it anywhere else (a cached
+ * figure, a stock report, the row fetched before the transaction opened) would
+ * let the balance move between the read and the write. Both branches therefore
+ * follow the same discipline: ONE derivation, read late, inside the transaction.
  */
 
 export async function GET(request: Request) {
@@ -182,6 +229,13 @@ export async function POST(request: Request) {
     const id = generateId();
     const outletId = await getCurrentOutletId();
     const txn = db.transaction(() => {
+      // What this wastage takes out of CENTRAL on the no-department branch: `qty`,
+      // or — on a "bin everything on the shelf" ask — the balance itself, so the
+      // write lands on exactly 0 (set by the central floor below). The wastage
+      // row and its movement row carry the same figure, so DELETE (which restores
+      // the stored quantity) puts back exactly what left, and the movement rail
+      // reconciles to the column. Untouched on the department branch.
+      let centralQty = qty;
       if (deptId) {
         // GUARD FIRST, so a refusal costs nothing. It is inside the
         // transaction anyway: a throw unwinds every write below it.
@@ -199,12 +253,93 @@ export async function POST(request: Request) {
             `${deptName} holds only ${fmtQty(onHand)} ${matUnit} of this item; cannot record ${fmtQty(qty)} ${matUnit} of wastage against it.`
           );
         }
+      } else {
+        // ── THE CENTRAL FLOOR ────────────────────────────────────────────────
+        // The same guard, in the scope it was missing from. GUARD FIRST for the
+        // same reason as above, and the balance is read HERE — inside the
+        // transaction, before the debit — not at the top of the handler.
+        const rm = db.prepare(
+          `SELECT name, COALESCE(unit, '') AS unit, COALESCE(current_stock, 0) AS current_stock
+             FROM raw_materials WHERE id = ?`
+        ).get(material_id) as { name: string; unit: string; current_stock: number } | undefined;
+        // A material that does not exist is NOT refused here. The pre-flight
+        // above documents why: the central path must not newly 400 a material
+        // that today fails on the wastages → raw_materials foreign key instead.
+        // No row means no balance to drive negative, so the floor has nothing
+        // to say and the INSERT below fails exactly as it does today.
+        if (rm) {
+          // SAME BASIS ON BOTH SIDES, NO PACK FACTOR. wastages.quantity is in
+          // RECIPE units (schema comment, and POST's own contract) and
+          // current_stock is recipe units by canon, so `qty` is directly
+          // comparable to the balance — it is the very number the debit
+          // subtracts four statements below. Converting either side here would
+          // weigh a purchase-unit figure against a recipe-unit balance.
+          // THE ONE RULE — planCentralDebit (src/lib/central-debit-clamp.ts),
+          // the same answer every central floor gets. `qty - onHand > EPS` here
+          // refused "bin all of it" whenever the balance a screen printed was
+          // its 6-dp rounding (stored 99.9999996, printed and typed as 100):
+          // refused with "holds only 100 g; cannot record 100 g". The plan
+          // accepts an ask on the balance's own 6-dp grid point and then takes
+          // the balance itself, so the write lands on exactly 0 — never below.
+          const plan = planCentralDebit(Number(rm.current_stock) || 0, qty);
+          centralQty = plan.debit;
+          // DISPLAY ONLY, at the precision fmtQty prints (4 dp), never naming
+          // more than the plan accepts — a "holds only X" the operator can type.
+          const onHand = qtyDown(plan.available, 4);
+          if (!plan.fits) {
+            // REFUSE, never clamp — see the department branch above and the
+            // header. The sentence is the department branch's, word for word,
+            // with Central Store as the holder: the same `${fmtQty(x)} <unit>`
+            // shape and the same "holds only … cannot record …" clause order.
+            //
+            // unit-lock: BOTH BRANCHES PRINT THE RECIPE UNIT, and on this one it
+            // is the only honest choice. wastages.quantity is STORED and POSTed
+            // in recipe units (schema comment; POST's documented contract), the
+            // refused number `qty` is the caller's own figure in that basis, and
+            // the balance it is weighed against — raw_materials.current_stock —
+            // is recipe units by canon. The purchase-unit conversion for this
+            // module happens ONCE, client-side in the entry screen, BEFORE the
+            // POST (see the GET projection's note), so leading in purchase units
+            // here would print a number the operator never typed and cannot
+            // retype. rm.unit is read in the same statement as the balance, so
+            // the figure and its unit always describe one material. Printed as
+            // `rm.unit` inline rather than through a short local, so the basis
+            // is readable on the line that prints it and no file-wide alias is
+            // introduced for the unit checker to resolve.
+            //
+            // WHERE TO GO INSTEAD. A store-mapped (liquor) material holds its
+            // real balance on the TGBCL store ledger, so "receive the stock"
+            // would send the operator to the wrong screen — central genuinely
+            // holds none of it and never will (95 of the 127 are at 0). Offered
+            // only on the empty case: when central does hold some, recording
+            // less against central is the simpler and more likely answer.
+            // unit-lock: recipe basis — the stored, posted and caller-supplied
+            // basis for wastage; reasoned out in full a few lines above.
+            const wayOut = onHand > 0
+              ? `Record ${fmtQty(onHand)} ${rm.unit} or less against Central Store.`
+              : isStoreMappedMaterial(db, String(material_id))
+                ? `"${rm.name}" is a store-mapped (liquor) material — record the loss on the Liquor Store instead.`
+                : `Receive the stock, or record a closing count, first.`;
+            // unit-lock: recipe basis, as above — the department branch's own
+            // refusal prints the same unit for the same reason.
+            throw new WastageBlocked(
+              (onHand > 0
+                ? `Central Store holds only ${fmtQty(onHand)} ${rm.unit} of this item; cannot record ${fmtQty(qty)} ${rm.unit} of wastage against it. `
+                : `Central Store holds none of this item; cannot record ${fmtQty(qty)} ${rm.unit} of wastage against it. `)
+              + wayOut
+            );
+          }
+        }
       }
 
+      // `rowQty` is qty on the department branch and on the central branch the
+      // figure central actually gives up (centralQty — identical to qty except
+      // on an ask of "everything", where it differs by under one 6-dp step).
+      const rowQty = deptId ? qty : centralQty;
       db.prepare(`
         INSERT INTO wastages (id, date, material_id, quantity, reason, recipe_id, recorded_by, notes, outlet_id, department_id)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(id, date, material_id, qty, r, recipe_id || null, me.email, notes || '', outletId, deptId);
+      `).run(id, date, material_id, rowQty, r, recipe_id || null, me.email, notes || '', outletId, deptId);
 
       if (deptId) {
         // The department already took this gram off central at issue. Debit
@@ -223,7 +358,7 @@ export async function POST(request: Request) {
         });
       } else {
         // Central still holds it — the store found it rotten on its own shelf.
-        db.prepare(`UPDATE raw_materials SET current_stock = current_stock - ?, updated_at = datetime('now') WHERE id = ?`).run(qty, material_id);
+        db.prepare(`UPDATE raw_materials SET current_stock = current_stock - ?, updated_at = datetime('now') WHERE id = ?`).run(centralQty, material_id);
       }
 
       // BOTH RAILS. The central Variance Report reads wastage out of
@@ -232,7 +367,7 @@ export async function POST(request: Request) {
       db.prepare(`
         INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, created_at, outlet_id)
         VALUES (?, ?, 'wastage', ?, ?, ?, datetime('now'), ?)
-      `).run(generateId(), material_id, -qty, id, `Wastage: ${r}${notes ? ' — ' + notes : ''}`, outletId);
+      `).run(generateId(), material_id, -rowQty, id, `Wastage: ${r}${notes ? ' — ' + notes : ''}`, outletId);
     });
     try {
       txn();

@@ -1,4 +1,6 @@
 import { getDb, generateId } from '@/lib/db';
+import { packFactor, toPurchaseQty, fmtQtyNum } from '@/lib/pack-units';
+import { planCentralDebit, qtyDown } from '@/lib/central-debit-clamp';
 
 /**
  * PARTY ITEMS — Issue → Return → Consumption, with the stock movement it drives.
@@ -26,7 +28,63 @@ import { getDb, generateId } from '@/lib/db';
  * caller today (this route is reached through src/proxy.ts by the external AKAN
  * event client); a caller that sends ₹ per bottle beside a bottle count would be
  * mis-stating BOTH halves, and the stock debit would be wrong first.
+ *
+ * ── THE CENTRAL FLOOR ON THE ISSUE (POST) ──────────────────────────────────
+ * The debit below used to be a bare `current_stock = current_stock - ?` with no
+ * balance read of any kind. MEASURED on a snapshot: GHEE forced to
+ * current_stock 0, then POST { deduct_inventory: true, items: [{ material_id:
+ * GHEE, issued_quantity: 500 }] } answered 201 {"success":1,"errors":[]} and
+ * left current_stock at −500. The only guards in the loop were a missing
+ * party_id/item_name and a non-positive quantity; nothing bounded the debit.
+ *
+ * This is the same hole the requisition rails closed (src/lib/issue-stock.ts,
+ * "THE CENTRAL FLOOR"), reached by a different writer, and it is closed with the
+ * same rule: READ THE BALANCE, FLOOR IT AT ZERO, REFUSE THE DEBIT THAT WOULD GO
+ * BELOW. max(0, …) rather than the raw balance, for issue-stock.ts's own reason:
+ * a balance that is already negative must read as "nothing issuable", never as a
+ * negative allowance that lets the next issue dig the hole deeper.
+ *
+ * WHY THIS ROUTE REPORTS INSTEAD OF THROWING. There is no in-app caller; this is
+ * reached through src/proxy.ts by the external AKAN event client, whose contract
+ * with us is the {success, errors[]} body it already gets. A throw would hand it
+ * a 500 with no per-line detail and no partial success, so a short line is
+ * pushed onto errors[] — named, with the shortfall — and its NEIGHBOURS ON THE
+ * SAME POST still go through, exactly as a missing item_name already behaves.
+ *
+ * WHY IT REFUSES THE LINE RATHER THAN CLAMPING THE DEBIT. The party_items row
+ * and the stock movement are the same quantity by this file's basis contract
+ * (above). Clamping the debit while inserting the full issued_quantity would
+ * commit a row reading "500 issued" against the 64 that actually moved — and
+ * PATCH credits returns back out of issued_quantity, so the next close would
+ * hand 500 back to a store that only ever gave up 64. That is stock manufactured
+ * out of nothing: the measured ALMOND bug in a new costume (issue-stock.ts
+ * header). So a short line writes NOTHING — no party_items row, no debit, no
+ * inventory_transactions row — and success is not incremented for it.
+ *
+ * THE BALANCE IS READ FRESH, PER LINE, INSIDE THE TRANSACTION. The
+ * `allMaterials` snapshot taken before the loop is a stale read by the time the
+ * second line runs: one POST may carry two lines on the same material, and each
+ * fits while the pair does not. Re-reading per line means the second line sees
+ * the first line's debit already in the balance, which is the same thing the
+ * requisition floor relies on instead of an accumulator. Nothing between the
+ * read and the debit touches raw_materials, and better-sqlite3 is synchronous
+ * inside the one transaction, so the read cannot race the write it bounds.
+ *
+ * NO STORE-MAPPED (LIQUOR) CARVE-OUT HERE, deliberately. The requisition rail
+ * carves those materials out because its debit skips them — their balance lives
+ * on the TGBCL store ledger. THIS route's debit does not skip them: it has always
+ * taken them off central, and 95 of the 127 store-mapped materials hold a central
+ * balance of 0, so a party draw on one went straight below zero. A carve-out
+ * would therefore excuse exactly the materials most at risk — a guard that reads
+ * correctly and can never fire, which is this codebase's recorded inert-guard
+ * pattern. The floor bounds whatever this route debits.
  */
+
+/* NO LOCAL EPSILON. This floor used to carry its own `EPS = 1e-9` beside a
+ * 6-dp-rounded allowance, and the two disagreed (see the floor below). "Does
+ * this debit fit, and what do we subtract" is planCentralDebit's question, asked
+ * once for every central floor in src/lib/central-debit-clamp.ts. */
+
 export async function GET(request: Request) {
   try {
     const db = getDb();
@@ -89,6 +147,15 @@ export async function POST(request: Request) {
 
     const results = { success: 0, errors: [] as string[] };
 
+    // THE FLOOR'S OWN READ. Prepared once, RUN per line inside the transaction —
+    // see "THE BALANCE IS READ FRESH" in the file header. It carries the unit
+    // metadata too, so the balance and the units the refusal is phrased in come
+    // out of one row and cannot describe two different materials.
+    const readBalance = db.prepare(`
+      SELECT name, unit, purchase_unit, pack_size, COALESCE(current_stock, 0) AS current_stock
+        FROM raw_materials WHERE id = ?
+    `);
+
     const insertItems = db.transaction(() => {
       for (let i = 0; i < items.length; i++) {
         const item = items[i];
@@ -122,6 +189,81 @@ export async function POST(request: Request) {
           continue;
         }
 
+        // ── THE CENTRAL FLOOR ────────────────────────────────────────────────
+        // Gated on the SAME condition as the debit it bounds (`deduct_inventory
+        // && materialId`), because a line that moves no stock has no central
+        // balance to be short of — bounding it would refuse a pure bookkeeping
+        // row that never touched the store. Placed BEFORE the INSERT so a
+        // refused line leaves nothing behind at all.
+        // The figure the central UPDATE subtracts. issuedQuantity unless the
+        // floor below says this ask is "everything on the shelf", in which case
+        // it is the balance itself — see planCentralDebit.
+        let centralDebit = issuedQuantity;
+        if (deduct_inventory && materialId) {
+          const bal = readBalance.get(materialId) as {
+            name: string; unit: string | null; purchase_unit: string | null;
+            pack_size: number | null; current_stock: number;
+          } | undefined;
+          // A material_id the caller invented has no row, so the UPDATE below
+          // matches nothing and no balance moves. There is nothing for a floor
+          // to bound, and refusing here would newly reject a line that today
+          // fails (or no-ops) further down — so leave that path exactly as it is.
+          if (bal) {
+            const stock = Number(bal.current_stock) || 0;
+            // THE ONE RULE (src/lib/central-debit-clamp.ts planCentralDebit).
+            // This floor used to round the allowance to 6 dp and then compare the
+            // RAW ask with a 1e-9 slack — two decisions that disagreed both ways.
+            // MEASURED: stored 14842.500000001 asked in full was REFUSED (production
+            // answered 201 and landed on 0), and stored 99.9999996 rounded UP to
+            // 100, so an ask of 100 passed and wrote -4e-7. The plan compares on
+            // one 6-dp grid and says what to subtract, so both are gone.
+            // max(0, …) lives inside it: an already-negative balance reads as
+            // "nothing issuable", never as a negative allowance. See the header.
+            const plan = planCentralDebit(stock, issuedQuantity);
+            centralDebit = plan.debit;
+            // A DISPLAY figure only — never compared. Rounded at the precision the
+            // sentence prints (fmtQtyNum, 3 dp) without ever naming more than the
+            // floor accepts, so "re-send it for X or less" is a figure that fits.
+            const available = qtyDown(plan.available, 3);
+            if (!plan.fits) {
+              // BOTH BASES IN ONE SENTENCE. The caller's issued_quantity is
+              // RECIPE units (this file's basis contract), so the recipe figure
+              // leads — it is the number the client must change. The
+              // purchase-unit figure follows for the owner's store-display rule
+              // whenever the material is packed, and it comes from the imported
+              // toPurchaseQty, never a re-derived pack factor (the 750x trap).
+              const meta = { unit: bal.unit, purchase_unit: bal.purchase_unit, pack_size: bal.pack_size };
+              const ru = String(bal.unit || '').trim();
+              const pu = String(bal.purchase_unit || '').trim();
+              const packed = packFactor(meta) > 1;
+              const q = (n: number) => {
+                const recipe = `${fmtQtyNum(n)}${ru ? ` ${ru}` : ''}`;
+                return packed ? `${recipe} (${fmtQtyNum(toPurchaseQty(n, meta))}${pu ? ` ${pu}` : ''})` : recipe;
+              };
+              // THE CAP'S PURCHASE FIGURE ROUNDS DOWN TOO. toPurchaseQty rounds to
+              // 3 dp and printed 14,842.5 g as "14.843 kg" — more than is there.
+              // `available` is already floored on the recipe side; this keeps the
+              // parenthetical from undoing that. The ASK keeps q() above.
+              const qCap = (n: number) => {
+                const recipe = `${fmtQtyNum(n)}${ru ? ` ${ru}` : ''}`;
+                return packed
+                  ? `${recipe} (${fmtQtyNum(qtyDown(n / packFactor(meta), 3))}${pu ? ` ${pu}` : ''})`
+                  : recipe;
+              };
+              results.errors.push(
+                available > 0
+                  ? `Row ${i + 1}: ${bal.name} — the central store holds only ${qCap(available)}, `
+                    + `so ${q(issuedQuantity)} cannot be issued. Nothing was recorded for this line; `
+                    + `re-send it for ${qCap(available)} or less.`
+                  : `Row ${i + 1}: ${bal.name} — the central store holds none of it, `
+                    + `so ${q(issuedQuantity)} cannot be issued. Nothing was recorded for this line; `
+                    + `receive the stock, or record a closing count, first.`,
+              );
+              continue;
+            }
+          }
+        }
+
         // At issue time, consumed = issued (no return recorded yet)
         // purchasePrice is ₹/RECIPE unit — it falls back to matched.average_price
         // (canon: ₹ per recipe unit) above and never touches last_purchase_price.
@@ -147,16 +289,22 @@ export async function POST(request: Request) {
 
         // Deduct from main inventory if requested and material matched
         if (deduct_inventory && materialId) {
+          // centralDebit, not issuedQuantity: on an ask of "everything on the
+          // shelf" it is the balance itself, so this lands on exactly 0 instead
+          // of -4e-7. Everywhere else it IS issuedQuantity. The party_items row
+          // above keeps the caller's figure (the external client's contract); the
+          // two differ by under one 6-dp step and only on that "everything" ask.
+          // The movement row carries the debit, so it reconciles to the column.
           db.prepare(`
             UPDATE raw_materials SET current_stock = current_stock - ?, updated_at = datetime('now')
             WHERE id = ?
-          `).run(issuedQuantity, materialId);
+          `).run(centralDebit, materialId);
 
           db.prepare(`
             INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, created_at)
             VALUES (?, ?, 'party_issue', ?, ?, ?, datetime('now'))
           `).run(
-            generateId(), materialId, -issuedQuantity, id,
+            generateId(), materialId, -centralDebit, id,
             `Issued to party ${item.party_id}`
           );
         }

@@ -256,7 +256,13 @@ export function applyPartyFulfillment(
       }
 
       // RECIPE units, and the floor's own figure — never a second multiplication.
-      const issued = c.requestedRecipe;
+      // debitRecipe, not requestedRecipe: the floor accepts "everything on the
+      // shelf" on the balance's 6-dp grid point, and on that ask the figure to
+      // subtract is the balance itself, so the write lands on exactly 0 rather
+      // than -4e-7 (planCentralDebit, src/lib/central-debit-clamp.ts). Identical
+      // to requestedRecipe on every other ask. The department credit and the
+      // movement row below carry the same figure, so the two rails still agree.
+      const issued = c.debitRecipe;
       const deptId: string | null = it.department_id || req.department_id || null;
 
       // STORE: decrement current_stock + ledger row.

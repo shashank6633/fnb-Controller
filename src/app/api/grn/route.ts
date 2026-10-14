@@ -1,6 +1,11 @@
 import { getDb, generateId, updateMaterialPrice } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId, canProcessAsStore, isManagement } from '@/lib/auth';
 import { centralFlowBlock, isStoreMappedMaterial } from '@/lib/store-engine';
+// THE house purchase→recipe converter, and the ONLY one. The back-correction
+// floor below weighs a PURCHASE-unit line against a RECIPE-unit balance, and it
+// must use the very factor the bump site uses or the two disagree.
+import { packFactor } from '@/lib/pack-units';
+import { planCentralDebit } from '@/lib/central-debit-clamp';
 import { checkPurchaseDate } from '@/lib/purchase-guard';
 import { duplicateLineError } from '@/lib/po-helpers';
 import { resolveQcRequirement, undecidedQcCategories, storePreRejectBlock, QC_AWAITING } from '@/lib/grn-qc';
@@ -1334,6 +1339,159 @@ export async function POST(request: Request) {
     // the sign-off (decideGrnQc) resolves afresh when the goods actually move.
     const directTargets = resolveDirectIssueBulk(db, receivable.map((it: any) => String(it.material_id || '')));
 
+    /* ═══════════════════════════════════════════════════════════════════════
+     * THE CENTRAL FLOOR ON A BACK-CORRECTION — THE ONE DEBIT THIS ROUTE MAKES
+     * ═══════════════════════════════════════════════════════════════════════
+     * EVERY OTHER GUARD IN THIS FILE BOUNDS A RECEIPT; this one bounds the
+     * REDUCTION a receipt can also be. `bumpStock` is
+     * `current_stock = current_stock + ?` bound to a SIGNED accepted quantity,
+     * and the sign is deliberate — the rate block at the top of this handler
+     * says in as many words that "QUANTITY is NOT forced positive: a negative
+     * line is a back-correction and is a first-class shape here", and the
+     * insert loop lets it through. Sign-mixing, cash and the QC mix are all
+     * refused; the BALANCE was never asked about at all.
+     *
+     * MEASURED on a copy of the live book before this guard existed: Chicken
+     * Breast forced to current_stock 0, one line
+     * {quantity_received: -40, quantity_accepted: -40, unit_price: 100} →
+     * HTTP 201, GRN-2026-0030 written, current_stock 0 → −40. Nothing on the
+     * path refused it. Reachable from the shipped /grn page: the
+     * "This is a back-correction" checkbox is the only thing that permits a
+     * negative quantity to be typed, and it is on screen for an admin.
+     * The GRN VOID path has carried assertNoNegativeStock
+     * (src/lib/grn-reversal.ts) all along — this POST path never did, so the
+     * same material could be driven negative forwards that could not be driven
+     * negative backwards.
+     *
+     * ── IT REFUSES; IT DOES NOT CLAMP, AND THAT IS THE OWNER'S OWN SPLIT ────
+     * A storekeeper or admin is AT THE SCREEN, inside a request he just made,
+     * with the line in front of him. A refusal unwinds HIS gesture, puts the
+     * figure on HIS screen and he corrects the number — the same judgement
+     * /api/wastage and src/lib/issue-stock.ts make for the same reason. Only
+     * the unattended paths clamp (src/lib/central-debit-clamp.ts states that
+     * ruling in full, and grn-qc.ts's sign-off is one of them). Clamping here
+     * would silently book a correction SMALLER than the one he typed and close
+     * the document as though the whole over-booking had been undone.
+     *
+     * ── NETTED PER MATERIAL, NOT PER LINE ──────────────────────────────────
+     * The insert loop applies each line in turn inside ONE transaction, so the
+     * only balance that can be observed is the one at commit. A bill carrying
+     * +100 and −40 of the same material nets +60, and judging line-by-line
+     * would refuse it on an intermediate figure no reader ever sees — the same
+     * net-of-debit-and-credit rule assertNoNegativeStock applies on the
+     * reversal rails.
+     *
+     * TODAY THAT IS DEFENCE IN DEPTH, AND IT IS KEPT ANYWAY. duplicateLineError
+     * above already refuses two lines of one material on one bill ("put the full
+     * quantity on one line" — measured: that guard fires first on exactly the
+     * +100/−40 payload), so a bill cannot currently carry both signs for the
+     * same material. Writing the floor per line instead would be correct only
+     * for as long as that unrelated guard keeps its present shape, and would
+     * then fail in the refusing direction — which is the brittleness this round
+     * exists to stop, not a saving.
+     *
+     * ── WHAT IS IN SCOPE, AND WHY EACH EXCLUSION IS SOUND ──────────────────
+     *   · qc.required  → NOTHING books at save time on a held bill (the
+     *     `!qc.required && accepted !== 0` gate at the bump site), so there is
+     *     no central debit to bound. A back-correction cannot ride a held bill
+     *     anyway: refused ~90 lines above. The deferred writes are bounded at
+     *     their own writer, in grn-qc.ts decideGrnQc.
+     *   · direct-issue materials → the bump site posts these to the DEPARTMENT
+     *     rail via postDirectReceipt and explicitly does NOT touch
+     *     current_stock ("central never moved"). Bounding them here would
+     *     refuse a correction central is not party to.
+     *   · received === 0 && accepted === 0 → skipped by the insert loop.
+     *
+     * ── ONE CONVERSION, AND IT IS THE HOUSE ONE ────────────────────────────
+     * GRN lines are PURCHASE units; current_stock is RECIPE units. The bump
+     * site converts with an inline `packSize > 1 && ru !== pu ? ×packSize : 1`,
+     * which is packFactor() from src/lib/pack-units.ts character for character.
+     * This pre-flight calls packFactor() rather than re-typing that expression,
+     * so the quantity weighed against the balance and the quantity taken off it
+     * are one number and cannot drift — the rule src/lib/po-requisition-fulfil.ts
+     * learned when a hand-rolled CASE forked 750×.
+     *
+     * Validated BEFORE the transaction, like every other refusal in this
+     * handler, because a Response cannot be returned from inside
+     * db.transaction(): a short correction has to be a clean 400 with no GRN
+     * number burned and no row written.
+     */
+    if (!qc.required) {
+      const netDebit = new Map<string, number>();   // material_id → RECIPE units OUT (positive)
+      for (const it of receivable) {
+        const mid = String(it.material_id || '');
+        if (!mid || directTargets.get(mid)) continue;
+        const rec = Number(it.quantity_received) || 0;
+        const acc = it.quantity_accepted != null ? Number(it.quantity_accepted) : rec;
+        if (rec === 0 && acc === 0) continue;
+        const meta = db.prepare(
+          `SELECT unit, purchase_unit, pack_size FROM raw_materials WHERE id = ?`,
+        ).get(mid) as any;
+        if (!meta) continue;                        // 404'd by the pre-flight above
+        const stockQty = acc * packFactor(meta);    // the bump site's own figure
+        netDebit.set(mid, (netDebit.get(mid) || 0) - stockQty);
+      }
+      const short: Array<{ name: string; on_hand: number; taking_out: number; short_by: number; unit: string }> = [];
+      for (const [mid, out] of netDebit) {
+        if (!(out > 1e-9)) continue;                // a net credit cannot go below zero
+        const rm = db.prepare(
+          `SELECT COALESCE(name, '') AS name, COALESCE(unit, '') AS unit,
+                  COALESCE(current_stock, 0) AS current_stock
+             FROM raw_materials WHERE id = ?`,
+        ).get(mid) as any;
+        if (!rm) continue;
+        // max(0, …): an already-negative balance reads as "nothing available",
+        // never as a negative allowance that lets this correction dig deeper.
+        // /api/inventory/fix-negative-stock exists because such balances happen,
+        // and a stock adjustment — not a receipt — is the rail that may move one.
+        const onHand = Math.max(0, Number(rm.current_stock) || 0);
+        // THE ONE RULE — planCentralDebit (src/lib/central-debit-clamp.ts), the
+        // same 6-dp-grid answer every central floor gets. `out − onHand > 1e-9`
+        // refused a correction of everything on the shelf whenever the balance
+        // carried a sub-grid crumb the screens print away (stored 99.9999996,
+        // shown and typed as 100). The bump site below takes the balance itself
+        // on such a correction, so accepting it cannot write below zero.
+        if (!planCentralDebit(Number(rm.current_stock) || 0, out).fits) {
+          short.push({
+            name: String(rm.name), unit: String(rm.unit),
+            /* EACH FIGURE GETS THE ONLY ROUNDING IT CAN SURVIVE — the rule
+             * src/lib/issue-stock.ts arrived at by measurement, applied here to
+             * the figures this sentence prints.
+             *   · on_hand is THE CAP, and it is the number he types back on the
+             *     retry, so it rounds DOWN. Rounded to nearest it can name a
+             *     hair MORE than the store holds, and the retry is then refused
+             *     with the identical sentence — the trap measured on a
+             *     14,842.5 g balance, where the refusal told the storekeeper to
+             *     issue 14.843 kg and then refused 14.843 kg.
+             *   · taking_out is THE ASK, so it rounds UP: it may never name
+             *     less than was actually requested.
+             * Together they also make the sentence structurally honest rather
+             * than honest by luck — the printed cap is always strictly below
+             * the printed ask, so "holds 40 kg and removes 40 kg" cannot print.
+             */
+            on_hand: Math.floor(onHand * 1e6) / 1e6,
+            taking_out: Math.ceil(out * 1e6) / 1e6,
+            short_by: Math.floor((out - onHand) * 1e6) / 1e6,
+          });
+        }
+      }
+      if (short.length > 0) {
+        const u = (n: number, unit: string) => `${n}${unit ? ` ${unit}` : ''}`;
+        return Response.json({
+          error:
+            `This back-correction takes out more than the central store holds, so it would leave stock below zero. `
+            + short.slice(0, 3).map(s =>
+                `"${s.name}": the store holds ${u(s.on_hand, s.unit)} and this bill removes ${u(s.taking_out, s.unit)} `
+                + `(${u(s.short_by, s.unit)} more than is there)`).join('; ')
+            + `${short.length > 3 ? `; and ${short.length - 3} more line(s)` : ''}. `
+            + `Nothing was saved. Reduce the correction to what the store actually holds, or — if the balance itself is wrong — `
+            + `fix it on a stock adjustment, which is the rail that may move a number a receipt cannot honestly move.`,
+          central_stock_short: true,
+          materials: short,
+        }, { status: 400 });
+      }
+    }
+
     // Generate GRN number
     const yr = String(date).slice(0, 4);
     const lastGrn = db.prepare(`SELECT grn_number FROM goods_receipt_notes WHERE grn_number LIKE 'GRN-' || ? || '-%' ORDER BY grn_number DESC LIMIT 1`).get(yr) as any;
@@ -1991,8 +2149,26 @@ export async function POST(request: Request) {
                 : `Direct issue: Ad-hoc GRN ${grnNumber}`,
             });
           } else {
-            bumpStock.run(stockQty, price, date, it.material_id);
-            insTx.run(generateId(), it.material_id, stockQty, purchaseId,
+            // A BACK-CORRECTION TAKES THE FLOOR'S FIGURE. The pre-flight above
+            // accepted it on planCentralDebit's grid; re-asked here against the
+            // balance read inside this transaction, the plan says what to
+            // subtract — the correction itself, or on a correction of everything
+            // on the shelf the balance itself, so the landing is exactly 0 and
+            // never -4e-7. The two differ by under one 6-dp step. If the plan
+            // does not fit HERE (only reachable by a race past the pre-flight),
+            // the figure is left exactly as it always was: the pre-flight is the
+            // refusal this route owns, and this line only removes the crumb.
+            // A receipt (stockQty > 0) is a credit and is never touched.
+            let centralDelta = stockQty;
+            if (stockQty < 0) {
+              const bal = Number((db.prepare(
+                `SELECT COALESCE(current_stock, 0) AS s FROM raw_materials WHERE id = ?`,
+              ).get(it.material_id) as any)?.s) || 0;
+              const plan = planCentralDebit(bal, -stockQty);
+              if (plan.fits) centralDelta = -plan.debit;
+            }
+            bumpStock.run(centralDelta, price, date, it.material_id);
+            insTx.run(generateId(), it.material_id, centralDelta, purchaseId,
                       accepted < 0 ? `BACK-CORRECTION ${grnNumber}` : `Ad-hoc GRN ${grnNumber}`,
                       outletId);
           }

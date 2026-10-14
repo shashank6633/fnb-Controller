@@ -2578,24 +2578,60 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
     const maxLine = srv && Number.isFinite(Number(srv.max_issue_qty))
       ? Math.max(0, Number(srv.max_issue_qty))
       : capFromBooks;
+    /* ── THE BOX'S OWN NUMBER, AND WHY IT NEEDS ITS OWN ROUNDING ────────────
+       `maxLine` is in the LINE's stored unit; this Issue box is entered in
+       PURCHASE units (`issued_pu`, converted once by U.fromPU at use). So the
+       ceiling has to cross that boundary before it can be printed as "type
+       this" — and U.toPU() / U.stockPU() cannot carry it, because both ROUND to
+       3 dp and a ceiling that rounds UP is refused by the server the moment it
+       is obeyed. MEASURED: THREE MANGO RED CHILLI POWDER holds 14,842.5 g on a
+       pack of 1000; U.stockPU prints 14.843 kg and 14.843 kg is 14,843 g, which
+       the floor refuses. Floored at the same 3 dp the display uses, it reads
+       14.842 kg — and 14.842 kg is 14,842 g, which passes.
+       round-then-step, not Math.floor(x*1000): 8.369 kg held as 8369 g is exact
+       at 3 dp and bare flooring on binary noise would shave a gram off it. */
+    const down3 = (n: number) => {
+      const x = Number(n) || 0;
+      const r = Math.round(x * 1000) / 1000;
+      return r <= x + EPSQ ? r : Math.round((r - 0.001) * 1000) / 1000;
+    };
+    /** maxLine → the purchase basis the box is entered in, UNROUNDED. */
+    const maxBoxRaw = ln.U.isPU ? maxLine : maxLine / (ln.U.pf || 1);
     return {
       armed, exempt,
       /** Recipe units the books say are issuable (never negative). */
       availRecipe,
-      /** Ceiling in the LINE's own unit — what the Issue box may hold. */
+      /** Ceiling in the LINE's own unit — what the POST body may hold. */
       maxLine,
+      /** THE SAME CEILING IN THE BOX'S OWN UNIT, floored — the one number on
+       *  this row a storekeeper can type and have accepted. This is the
+       *  `max_issue_qty` the server has always sent and nothing ever printed. */
+      maxBoxPU: down3(maxBoxRaw),
       /** Books hold less than this line asks for. */
       capped: armed && maxLine < ln.requested - EPSQ,
       /** Books hold nothing at all. */
       empty: armed && maxLine <= EPSQ,
       /** The server has already refused this line, in its own words. */
       serverMessage: srv ? String(srv.message || '') : '',
+      /** Has the SERVER refused this very line, or is this only the screen's
+       *  own reading of a snapshot? The difference decides whether a one-click
+       *  "use the cap" may be offered: a liquor / store-mapped line is carved
+       *  out of the central floor server-side and never produces a refusal row,
+       *  but this page cannot identify one (which is why the box is not clamped
+       *  and no `max=` is set — see the input below). So before the server has
+       *  spoken the ceiling is advisory and is only STATED; once it has, the
+       *  refusal is authoritative and the figure can be acted on. */
+      fromServer: !!srv,
       /** Printable PURCHASE-unit figures (owner rule). The server's own
        *  `available` is preferred when present — it is the fresher reading and
-       *  it is ALREADY in the purchase unit, so it is not converted again. */
+       *  it is ALREADY in the purchase unit (and already floored there by
+       *  purchaseQtyDown), so it is not converted or re-rounded here. The
+       *  fallback goes through down3 for the same reason maxBoxPU does:
+       *  stockPU() would round a 14,842.5 g balance up to 14.843 kg and this
+       *  screen would be advertising a quantity the server refuses. */
       availPU: srv && Number.isFinite(Number(srv.available))
         ? Number(srv.available)
-        : ln.U.stockPU(availRecipe),
+        : down3(availRecipe / (ln.U.pf || 1)),
       purchaseUnit: (srv && String(srv.purchase_unit || '').trim()) || ln.U.pu,
     };
   };
@@ -3498,6 +3534,58 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                               : (cap.empty
                                   ? <>The store&apos;s books hold <b>none</b> of this — the central store will refuse this issue.</>
                                   : <>Over the store&apos;s balance of <b>{fmtNum(cap.availPU)} {cap.purchaseUnit}</b> — the central store will refuse this issue.</>)}
+                          </div>
+                        )}
+                        {/* ── THE NUMBER TO TYPE, AND A WAY TO TYPE IT ─────────
+                            `max_issue_qty` has been on the wire since the floor
+                            shipped and NOTHING rendered it: the sentence above
+                            states a limit, and the storekeeper was then left to
+                            work out what to put in the box. `cap.maxBoxPU` is
+                            that same ceiling converted to the unit this box is
+                            entered in and FLOORED, so it is a value the server
+                            accepts — the chip writes it straight in, which is
+                            the only version of "the number reached the screen"
+                            that cannot be mis-transcribed.
+                            Hidden when the books hold nothing: a chip offering
+                            0 is not a way out, and the sentence above already
+                            names the real one (receive stock or count it). */}
+                        {overCap && !cap.empty && cap.maxBoxPU > 0 && (
+                          <div className="text-[9px] text-red-900 mt-0.5 text-right flex items-center justify-end gap-1">
+                            <span>Issuable now: <b className="font-mono">{fmtNum(cap.maxBoxPU)} {cap.purchaseUnit}</b></span>
+                            {/* THE BUTTON WAITS FOR THE SERVER — see `fromServer`
+                                on the cap. Until the server has refused THIS
+                                line the ceiling is this screen's reading of a
+                                snapshot, and on a liquor / store-mapped line it
+                                is simply wrong (central does not govern those
+                                and the server issues them regardless). Stating the
+                                number is as wrong as the sentence above it
+                                already is; turning it into one click that cuts a
+                                legitimate full issue down to the central balance
+                                is not. */}
+                            {cap.fromServer && (
+                              <button type="button"
+                                      /* Sets the SEED as well, and that is not
+                                         belt-and-braces. issuedOf() posts
+                                         `issued_seed` verbatim whenever the box
+                                         still reads toPU(seed) — there to stop a
+                                         quantity nobody touched round-tripping
+                                         through a 3-dp display. If the cap and
+                                         the seed ever round into the same 3rd
+                                         decimal, that shortcut would post the
+                                         SEED where this button promised the cap,
+                                         and the line would be refused again by
+                                         the figure it was told to use. Writing
+                                         both makes the two branches of issuedOf
+                                         return the same number. */
+                                      onClick={() => update(i, {
+                                        issued_pu: String(cap.maxBoxPU),
+                                        issued_seed: U.fromPU(cap.maxBoxPU),
+                                      })}
+                                      title={`Put ${fmtNum(cap.maxBoxPU)} ${cap.purchaseUnit} in the Issue box — the most this line can hand over against the store's books`}
+                                      className="px-1 py-[1px] rounded border border-red-400 bg-white hover:bg-red-50 font-semibold">
+                                use it
+                              </button>
+                            )}
                           </div>
                         )}
                         {/* Same warning as before, said in purchase units: the
