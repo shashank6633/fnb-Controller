@@ -11,7 +11,7 @@
  *   [1] the schema boots: 30 fssai_ tables, 99 indexes, and the app's own boot
  *       assertion says OK — on a fresh install, on a database one deploy behind,
  *       and on a snapshot of the real database when one is present;
- *   [2] the twelve ready-made checklists seed ONCE: a second apply is refused and
+ *   [2] the fifteen ready-made checklists seed ONCE: a second apply is refused and
  *       writes nothing, a retired checklist is never resurrected, the UNIQUE
  *       marker (not the friendly pre-check) is the gate that holds, and boot
  *       never seeds;
@@ -399,7 +399,13 @@ function mkRow(table, over = {}, depth = 0) {
   }
 
   /* ─────────────────────────────────────────────────────────────────────── */
-  section(2, 'THE TWELVE READY-MADE CHECKLISTS — applied once, never twice, never resurrected');
+  section(2, 'THE FIFTEEN READY-MADE CHECKLISTS — applied once, never twice, never resurrected');
+
+  /* THE PACK SIZE, ASSERTED EXACTLY AND ON PURPOSE. It was 12 until pack v2
+   * (2026-10-14) added the Hyderabad Food Safety Authority's three audit pages
+   * (CHK-HYD-AUDIT-1/2/3). A checklist added or lost by accident must fail this
+   * suite; one added deliberately changes this number in the same commit. */
+  const PACK_CHECKLISTS = 15;
 
   const validation = PACK.validateFssaiChecklistPack();
   const C = validation.counts || {};
@@ -411,7 +417,7 @@ function mkRow(table, over = {}, depth = 0) {
 
   await test('the pack itself is renderable by this build', () => {
     expectTrue(validation.ok, 'validateFssaiChecklistPack() is ok', JSON.stringify(validation.problems || []).slice(0, 300));
-    expect(C.templates, 12, 'checklists in the pack');
+    expect(C.templates, PACK_CHECKLISTS, 'checklists in the pack');
     console.log(`      (pack: ${C.templates} checklists · ${C.sections} sections · ${C.questions} questions)`);
   });
   await test('boot never seeds — a freshly booted database holds no seeded checklist', () => {
@@ -424,16 +430,16 @@ function mkRow(table, over = {}, depth = 0) {
     const b = seedCounts();
     const r = SEED.applyFssaiChecklistPack(db, seedOpts());
     expectTrue(r.ok === true, 'apply returned ok', JSON.stringify(r).slice(0, 300));
-    expect(r.inserted, 12, 'inserted');
+    expect(r.inserted, PACK_CHECKLISTS, 'inserted');
     expect(r.skipped, 0, 'skipped');
     const a = seedCounts();
-    expect(a.templates - b.templates, 12, 'templates +');
+    expect(a.templates - b.templates, PACK_CHECKLISTS, 'templates +');
     expect(a.sections - b.sections, C.sections, 'sections + (the pack’s own count)');
     expect(a.questions - b.questions, C.questions, 'questions + (the pack’s own count)');
-    expect(a.seed_log - b.seed_log, 13, 'seed_log + (1 pack marker + 12 checklists)');
+    expect(a.seed_log - b.seed_log, 1 + PACK_CHECKLISTS, `seed_log + (1 pack marker + ${PACK_CHECKLISTS} checklists)`);
     expect(a.runs, b.runs, 'fssai_runs unchanged');
     const drafts = db.prepare(`SELECT COUNT(*) AS c FROM fssai_templates WHERE is_seeded = 1 AND status = 'draft' AND outlet_id = ?`).get(OUTLET).c;
-    expect(drafts, 12, 'all twelve seeded as DRAFT (invisible to staff until published)');
+    expect(drafts, PACK_CHECKLISTS, `all ${PACK_CHECKLISTS} seeded as DRAFT (invisible to staff until published)`);
     const orphans = db.prepare(
       `SELECT COUNT(*) AS c FROM fssai_questions q LEFT JOIN fssai_templates t ON t.id = q.template_id WHERE t.id IS NULL`,
     ).get().c;
@@ -486,7 +492,7 @@ function mkRow(table, over = {}, depth = 0) {
     const r = SEED.applyFssaiChecklistPack(db, { ...seedOpts(), pack: { ...pack, version: pack.version + 1 } });
     expectTrue(r.ok === true, 'v+1 applies (its marker is new)', JSON.stringify(r).slice(0, 200));
     expect(r.inserted, 0, 'inserted by v+1');
-    expect(r.skipped, 12, 'skipped by v+1 (codes already in use)');
+    expect(r.skipped, PACK_CHECKLISTS, 'skipped by v+1 (codes already in use)');
     const a = seedCounts();
     expect(a.templates, b.templates, 'templates unchanged');
     expect(a.questions, b.questions, 'questions unchanged');
@@ -501,7 +507,7 @@ function mkRow(table, over = {}, depth = 0) {
     expect(a.seed_log, b.seed_log, 'no marker row written');
     expect(a.templates, b.templates, 'no checklist written');
     const again = SEED.applyFssaiChecklistPack(db, seedOpts());
-    expectTrue(again.ok === true && again.inserted === 12, 'and a correct apply afterwards still works');
+    expectTrue(again.ok === true && again.inserted === PACK_CHECKLISTS, 'and a correct apply afterwards still works');
   });
 
   /* ─────────────────────────────────────────────────────────────────────── */
