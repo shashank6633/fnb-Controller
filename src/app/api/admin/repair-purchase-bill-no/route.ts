@@ -48,16 +48,18 @@ import { invoiceFromNotes } from '@/lib/purchase-reconciliation';
  *    mint an invoice_id, so that guard never judges them, whether or not they
  *    carry a bill_no. Filling it in cannot make it wrongly refuse a
  *    hand-entered bill.
- *  · /api/purchases/bulk DOES judge them, and reads a stored BLANK bill_no as
- *    "matches any bill". After APPLY, a bulk CSV line with the same item +
- *    vendor + date + qty + rate as a repaired row is still refused on that
- *    row's bill number or a blank one, but a line carrying a DIFFERENT bill
- *    number is inserted and its stock counted; before APPLY it was refused.
- *    That is the bulk route's own rule for two named bills, which the blank
- *    used to mask. And the reverse: a bulk line naming the SAME bill for the
- *    same material at another qty or rate, inserted before APPLY, is refused
- *    after it (one material = one line on a named bill). The repair write
- *    itself moves no stock (below).
+ *  · /api/purchases/bulk DOES judge them, and APPLY CHANGES NONE OF ITS
+ *    ANSWERS (owner's ruling 33, 2026-10-14). That route reads a row with
+ *    neither an invoice_id nor a grn_id — the inward importer's shape — as
+ *    blank-billed whatever its bill_no says (IMPORTED_ROW in
+ *    purchases/bulk/route.ts). So after APPLY a bulk CSV line with the same
+ *    item + vendor + date + qty + rate as a repaired row is still refused
+ *    whatever bill number it carries, and a line naming the repaired row's
+ *    bill for the same material at another qty or rate still inserts, exactly
+ *    as before APPLY. That holds by construction: the candidate query below
+ *    selects only rows whose invoice_id AND grn_id are blank, which is the
+ *    same test. If either query changes, change the other with it. The repair
+ *    write itself moves no stock (below).
  *
  * NO STOCK, NO MONEY, NO LEDGER. This writes one text column. Quantities,
  * rates, totals, charges and every inventory row are untouched — which is why
@@ -91,7 +93,9 @@ export async function POST(req: Request) {
 
     // Candidates: no bill identity of any kind, but a recoverable invoice
     // number sitting in notes. `invoice_id`/`grn_id` blank is part of the test —
-    // a row that already groups correctly must not be disturbed.
+    // a row that already groups correctly must not be disturbed. It is also what
+    // keeps a repaired row inside /api/purchases/bulk's IMPORTED_ROW set, so the
+    // bulk duplicate guard judges it exactly as it did while it was blank.
     const rows = db.prepare(`
       SELECT id, COALESCE(vendor, '') AS vendor, date, notes,
              COALESCE(total_price, 0) AS goods

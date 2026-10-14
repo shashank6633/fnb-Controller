@@ -258,9 +258,11 @@ const csvCell = (v: any): string => {
  *  and formulas point at them. The owner's "Ship B" ruling (98e1be7): tax
  *  columns on TRANSACTION reports, and this register is one.
  *
- *  BOTH ARE DERIVED FROM COLUMNS ALREADY ON THE ROW — Tax Value is CGST + SGST,
- *  and Tax % Applied is that pair over (SUBTOTAL − DISCOUNT), the base GST is
- *  charged on. That is WHY they are appended rather than slotted beside CGST:
+ *  BOTH ARE DERIVED FROM THE ROW'S OWN FIGURES — Tax Value is CGST + SGST, and
+ *  Tax % Applied is that pair over the value GST was CHARGED on, less DISCOUNT
+ *  (see GST_GOODS_VALUE_SQL below: the ACCEPTED goods value, which is SUBTOTAL
+ *  itself on every line that rejected nothing). That is WHY they are appended
+ *  rather than slotted beside CGST:
  *  TOTAL INWARD AMOUNT is footable from the columns to its left, and a
  *  duplicate rupee column inside that run would let a reader adding across the
  *  row count GST twice. After the total they read as a restatement.
@@ -277,6 +279,42 @@ const REGISTER_HEADER = ['GRN No.', 'INVOICE ID', 'INWARD DATE', 'SUPPLIER NAME'
   'ACCEPTED QTY', 'REJECTED QTY', 'REJECT REASON', 'STATUS', 'RECEIVED BY', 'INVOICE DATE', 'BILL TYPE',
   TAX_VALUE_CSV_HEADER, TAX_PERCENT_CSV_HEADER];
 
+/* ── TAX % APPLIED IS STRUCK ON THE ACCEPTED VALUE (owner's ruling, 2026-10-14) ──
+ *  Every GST writer charges the tax on ACCEPTED qty × rate − discount: POST
+ *  /api/grn (`grossTax` over `accepted`), PO receive (`effAcc`), the QC sign-off
+ *  (src/lib/grn-qc.ts re-derives on the kitchen's accepted figure) and the bill
+ *  amendment (src/lib/grn-reversal.ts deriveLineTax). The register's SUBTOTAL
+ *  is RECEIVED × rate — what arrived, and what TOTAL INWARD is footed from — so
+ *  dividing the tax by it read a received 10 / accepted 8 @ ₹100, discount ₹50,
+ *  18% line (₹135 GST) as 14.21% while /reports/purchase-log printed 18.00% for
+ *  the same bill. Only the RATE's base moves: SUBTOTAL, TOTAL INWARD and every
+ *  other column keep printing what they printed.
+ *
+ *  ONE EXCEPTION, and it is the held receipt. While a GRN awaits QC its lines
+ *  carry accepted = 0 AND rejected = 0 — "no decision yet", not "nothing
+ *  accepted" (grn-qc.ts) — and the tax on them was recorded against what
+ *  ARRIVED (the store may not pre-reject a gated line, so the declared accepted
+ *  IS the received). A line that has decided nothing therefore keeps the
+ *  received base. Every decided line has accepted + rejected = received, so the
+ *  test cannot mistake one for the other; a fully-rejected line (accepted 0,
+ *  rejected > 0) takes the accepted base, which is nothing, and reads an em
+ *  dash — a rate over nothing is not a rate.
+ *
+ *  WRITTEN ONCE, read by the register rows AND the drawer's line items, so the
+ *  screen, its footer, the server CSV and the page's own export divide by the
+ *  same rupees. Same ROUND(…, 2) as SUBTOTAL, so a line that rejected nothing
+ *  has a base byte-identical to the one it had before. */
+const GST_GOODS_VALUE_SQL = `ROUND(CASE WHEN COALESCE(gi.quantity_accepted, 0) = 0 AND COALESCE(gi.quantity_rejected, 0) = 0
+                    THEN gi.quantity_received ELSE gi.quantity_accepted END * gi.unit_price, 2)`;
+
+/** The row the shared tax helper reads: the GST pair, the discount, and the
+ *  goods value GST was charged on in the `subtotal` slot. Falls back to the
+ *  printed SUBTOTAL only when the query did not supply the charged value. */
+const gstRateBasis = (r: any) => ({
+  cgst: r.cgst, sgst: r.sgst, discount: r.discount,
+  subtotal: r.gst_goods_value ?? r.subtotal,
+});
+
 /** Same field order as REGISTER_HEADER, against a row of the register query. */
 const registerRow = (r: any) => [
   r.grn_number, r.invoice_number, r.inward_date, r.supplier, r.category_name, r.item_name,
@@ -284,11 +322,11 @@ const registerRow = (r: any) => [
   r.compensation_cess, r.special_excise_cess, r.tcs, r.delivery_charges, r.mrp_round_off, r.total_inward_amount,
   r.quantity_accepted, r.quantity_rejected, r.rejection_reason, r.status, r.received_by, r.invoice_date,
   r.bill_type,
-  // The 28th and 29th. Derived from this row's own cgst/sgst and its
-  // subtotal − discount by the shared helper; the percentage is '' (never 0)
-  // when no GST was recorded on the line.
+  // The 28th and 29th. Derived from this row's own cgst/sgst and the value GST
+  // was charged on (accepted goods − discount) by the shared helper; the
+  // percentage is '' (never 0) when no GST was recorded on the line.
   taxCsvNumber(gstValue(r)),
-  taxCsvNumber(taxAppliedPercent(r)),
+  taxCsvNumber(taxAppliedPercent(gstRateBasis(r))),
 ];
 
 /* ── DIRECT vs AGAINST PO ────────────────────────────────────────────────────
@@ -387,7 +425,10 @@ export async function GET(request: Request) {
                ROUND(gi.quantity_received * gi.unit_price
                      - gi.discount + gi.cgst + gi.sgst + gi.compensation_cess
                      + gi.special_excise_cess
-                     + gi.tcs + gi.delivery_charges + gi.mrp_round_off, 2) AS total_inward_amount
+                     + gi.tcs + gi.delivery_charges + gi.mrp_round_off, 2) AS total_inward_amount,
+               -- The base the drawer's Tax % Applied divides by — the register's
+               -- own fragment, so the screen and the CSV cannot disagree.
+               ${GST_GOODS_VALUE_SQL} AS gst_goods_value
         FROM goods_receipt_note_items gi
         JOIN raw_materials rm ON rm.id = gi.material_id
         WHERE gi.grn_id = ?
@@ -523,7 +564,11 @@ export async function GET(request: Request) {
                -- The 27th register column. Computed here rather than in the
                -- browser so the bulk download, the per-entry Download and the
                -- screen all read one rule off one column (see BILL_TYPE_SQL).
-               ${BILL_TYPE_SQL} AS bill_type
+               ${BILL_TYPE_SQL} AS bill_type,
+               -- Not a column of the file: the base Tax % Applied (the 29th)
+               -- divides by. Shipped on the JSON row so the page's own export
+               -- prints the same rate this file does (see GST_GOODS_VALUE_SQL).
+               ${GST_GOODS_VALUE_SQL} AS gst_goods_value
         FROM goods_receipt_note_items gi
         JOIN goods_receipt_notes g  ON g.id  = gi.grn_id
         JOIN raw_materials       rm ON rm.id = gi.material_id

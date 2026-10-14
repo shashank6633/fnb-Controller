@@ -1,8 +1,7 @@
 import { getDb, generateId, logAuditEvent } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
 import {
-  resolvePartyEventNames, partyLiquorReqItems, loadPnlParties, pnlCandidateNames,
-  orphanSlot, claimOrphanConsumption, orphanShareOf, noIdPartiesCountingName,
+  partyScope, partyLiquorReqItems, loadPnlParties, pnlCandidateNames,
 } from '@/lib/party-liquor';
 
 /**
@@ -29,20 +28,24 @@ import {
  * is in `unassigned_entries` instead — shown, never summed — until the owner
  * assigns it with PATCH. So the modal, the badge and the P&L cannot disagree.
  *
+ * OWNER RULING 34 (2026-10-14). The requisition lines shown, and the ones the
+ * POST 409 gate checks, are exactly the requisitions the P&L costs on this party
+ * (claimPartyRequisitions: its own id, else the exactly-one name match), never
+ * every requisition raised under a name it shares. A party with no AKAN id shows
+ * no id-bearing rows at all — only the orphan rows the claim gave it.
+ *
  * GET    /api/party-consumption?party_unique_id=...
  * GET    /api/party-consumption?event_name=...&event_date=YYYY-MM-DD[&fp_id=...]
- *        -> { entries, requisition_items, unassigned_entries }
+ *        -> { entries, requisition_items, unassigned_entries, unassigned_requisitions }
  *        fp_id names WHICH party without an id is meant when two parties share
  *        the display name that evening (findPnlPartyIndex); the page sends it.
  * POST   /api/party-consumption
  *        body: { party_unique_id?, fp_id?, event_name, event_date,
  *                items: [{ material_id, qty, notes? }], confirm_duplicates? }
  *        -> 409 { error, duplicates } when an item is already costed from the
- *           requisition and confirm_duplicates is not true
+ *           party's requisition and confirm_duplicates is not true
  * PATCH  /api/party-consumption   body: { id, party_unique_id }   (admin only)
- *        assigns an orphan row to one of the parties its name + date match;
- *        -> 409 while a party without an id is listed under that name that
- *           evening (it would count the row too — see the PATCH below)
+ *        assigns an orphan row to one of the parties its name + date match
  * DELETE /api/party-consumption?id=<uuid>
  */
 export const dynamic = 'force-dynamic';
@@ -62,11 +65,9 @@ export async function GET(request: Request) {
       return Response.json({ error: 'party_unique_id or (event_name+event_date) required' }, { status: 400 });
     }
 
-    // Resolve the party to the SAME name list + date /api/party-events/pnl uses,
-    // so the rows below are exactly the rows counted in liquor_items there. A
-    // requisition is raised under the contact person / company / FP id, not
-    // necessarily the event name, so matching on one guessed name would show
-    // fewer rows than the badge counts — the mismatch this fix exists to close.
+    // Resolve the key ONCE, through the very call /api/party-events/pnl's
+    // single-party GET makes (partyScope): the requisitions, the orphan share and
+    // the party id below are then exactly the ones counted in liquor_items there.
     // fp_id picks the right party WITHOUT an id when its display name is shared
     // (findPnlPartyIndex); without it the first party of that name was taken.
     const key = {
@@ -75,28 +76,41 @@ export async function GET(request: Request) {
       event_name: eventName || undefined,
       event_date: eventDate || undefined,
     };
-    const { names, eventDate: resolvedDate } = resolvePartyEventNames(db, key);
+    const scope = partyScope(db, key);
+    const { parties } = scope;
 
-    // THE ID-BEARING ROWS — the same predicate as pnlFor's two arms.
+    // THE ID-BEARING ROWS — pnlFor's id arm, on the id of the party the key
+    // resolved to (a party that gained an id since the page loaded is read by
+    // it, as the board reads it). A party WITHOUT an id has none (ruling 34b): an
+    // id-bearing row recorded under its display name is the id's party's bottle,
+    // and the P&L no longer counts it here.
     const SELECT_ROWS = `
         SELECT pc.*, rm.name AS material_name, rm.unit AS material_unit,
                rm.average_price AS current_avg_price
         FROM party_consumption pc
         JOIN raw_materials rm ON rm.id = pc.material_id`;
-    const own = (partyUniqueId
-      ? db.prepare(`${SELECT_ROWS} WHERE pc.party_unique_id = ?`).all(partyUniqueId)
-      : db.prepare(`${SELECT_ROWS}
-          WHERE pc.event_name = ? AND pc.event_date = ? AND pc.party_unique_id IS NOT NULL`).all(eventName, eventDate)
-    ) as any[];
+    const own = (scope.party_unique_id
+      ? db.prepare(`${SELECT_ROWS} WHERE pc.party_unique_id = ?`).all(scope.party_unique_id)
+      : []) as any[];
 
     // THE ORPHAN ROWS (no party id) — through the P&L's own claim, over the P&L's
-    // own claimant list (orphanSlot), never through a name predicate of this
+    // own claimant list (partySlot), never through a name predicate of this
     // route's. A per-party SQL arm cannot see the OTHER parties, which is exactly
     // how the parked build showed party A a bottle only party B was charged for.
-    const parties = loadPnlParties(db);
-    const slot = orphanSlot(parties, key);
-    const { matched, awaiting } = orphanShareOf(claimOrphanConsumption(db, slot.claimants), slot.index);
+    const { matched, awaiting } = scope.orphanShare;
     const byId = db.prepare(`${SELECT_ROWS} WHERE pc.id = ?`);
+    // A claimant index, described. fp_id is what tells two parties of the same
+    // display name apart ("Ravi Kumar" / "Ravi Kumar"). An index past the cached
+    // list is the key itself (appended by partySlot).
+    const candidateOf = (i: number) => {
+      const p = i < parties.length ? parties[i] : undefined;
+      return {
+        party_unique_id: p ? (p.party_unique_id || null) : (partyUniqueId || null),
+        fp_id: p ? (p.fp_id || null) : (fpId || null),
+        event_name: p ? (p.event_name || '') : (eventName || ''),
+        event_date: p ? (p.event_date || '') : (eventDate || ''),
+      };
+    };
     const matchedRows = matched
       .map(m => byId.get(m.id) as any)
       .filter(Boolean)
@@ -116,22 +130,29 @@ export async function GET(request: Request) {
         if (!r) return null;
         return {
           ...r,
-          candidates: a.candidates.map(i => {
-            const p = i < parties.length ? parties[i] : undefined;
-            return {
-              party_unique_id: p?.party_unique_id || null,
-              event_name: p ? (p.event_name || '') : (eventName || ''),
-              event_date: p ? (p.event_date || '') : (eventDate || ''),
-            };
-          }),
+          candidates: a.candidates.map(i => candidateOf(i)),
         };
       })
       .filter(Boolean);
 
-    // READ-ONLY. Already costed into liquor_cost from the Bar requisition; shown
+    // READ-ONLY. Already costed into liquor_cost from the party's own Bar
+    // requisition(s) — the ones the P&L costs on THIS party (ruling 34a); shown
     // so the modal accounts for the whole liquor figure instead of half of it.
-    const requisitionItems = partyLiquorReqItems(db, names, resolvedDate);
-    return Response.json({ entries: rows, requisition_items: requisitionItems, unassigned_entries: unassigned });
+    const requisitionItems = partyLiquorReqItems(db, scope.reqIds);
+    // Requisitions with no id raised under a name this party shares with another
+    // that evening: costed on NEITHER (ruling 34a). Listed, never summed, so the
+    // modal matches the badge's count and nobody reads the gap as missing liquor.
+    const unassignedReqs = scope.reqAwaiting.map(a => ({
+      req_id: a.req.id,
+      req_number: a.req.req_number,
+      event_name: a.req.event_name,
+      event_date: a.req.event_date,
+      candidates: a.candidates.map(i => candidateOf(i)),
+    }));
+    return Response.json({
+      entries: rows, requisition_items: requisitionItems,
+      unassigned_entries: unassigned, unassigned_requisitions: unassignedReqs,
+    });
   } catch (e: any) {
     console.error('[/api/party-consumption GET]', e);
     return Response.json({ error: e.message }, { status: 500 });
@@ -171,14 +192,18 @@ export async function POST(request: Request) {
     // fp_id (sent by the page for every party) identifies a party WITHOUT an id
     // whose display name another party shares that evening — without it the gate
     // checked the FIRST party of that name, i.e. somebody else's requisitions.
-    const { names, eventDate: resolvedDate } = resolvePartyEventNames(db, {
+    // The set checked is the modal's requisition_items and the P&L's liquor
+    // requisition lines for this party — the same partyScope() requisitions
+    // (ruling 34a): another party's requisition raised under a shared name is
+    // not "already costed on this party" and no longer trips the gate.
+    const scope = partyScope(db, {
       party_unique_id: party_unique_id || undefined,
       fp_id: typeof fp_id === 'string' && fp_id.trim() ? fp_id.trim() : undefined,
       event_name: String(event_name).trim(),
       event_date,
     });
     const alreadyCosted = new Map(
-      partyLiquorReqItems(db, names, resolvedDate).map(r => [r.material_id, r]));
+      partyLiquorReqItems(db, scope.reqIds).map(r => [r.material_id, r]));
     if (b.confirm_duplicates !== true && alreadyCosted.size > 0) {
       const duplicates = items
         .filter((it: any) => it?.material_id && Number(it.qty) > 0 && alreadyCosted.has(it.material_id))
@@ -223,7 +248,8 @@ export async function POST(request: Request) {
         //    (₹/ml, ₹/g). It is read straight off the material row above, not
         //    through last_purchase_price, so there is no mixed-basis exposure.
         //  · QTY: `it.qty` is posted ALREADY CONVERTED to recipe units. The only
-        //    writer is the recorder in src/app/party-pnl/page.tsx:354, which
+        //    writer is the recorder in src/app/party-pnl/page.tsx (submit() in
+        //    RecordConsumptionModal), which
         //    sends toBaseQty(qty, entryUnit, m.unit, m) — 3 BTL × pack_size 750
         //    leaves the browser as 2250 ml. The same number is stored in
         //    party_consumption.qty_consumed, which the rate-basis canon fixes as
@@ -268,16 +294,13 @@ export async function POST(request: Request) {
  * changes: the name it was recorded under, its qty and its snapshotted
  * cost_at_time stay as recorded (re-recording would re-snapshot the price).
  *
- * REFUSED (409) WHILE A PARTY WITHOUT AN ID IS LISTED UNDER THE ROW'S NAME THAT
- * EVENING. Such a party's P&L counts every id-bearing row recorded under its
- * display name and date (the no-id arm of /api/party-events/pnl, production
- * behaviour, left as it is). The moment this UPDATE gives the row an id, that arm
- * picks it up, so the bottle would be charged to the party chosen here AND to
- * that one — and an orphan recorded from such a party's own modal is stored
- * under exactly that name, so this is the usual case, not a corner. The check is
- * noIdPartiesCountingName(), the same list the board shows in place of the
- * Assign buttons. Once the sheet gives that party an id (refresh the party list),
- * it counts by id only and the assignment goes through.
+ * NO LONGER REFUSED because a party without an id shares the row's name. That
+ * 409 existed only because such a party's P&L counted every id-bearing row under
+ * its display name, so an assigned row landed on two P&Ls. Owner ruling 34(b)
+ * removed that counting: a party without an id counts only rows WITHOUT an id
+ * (and only those the exactly-one claim gives it), so the row assigned here
+ * counts on the chosen party alone. The board names the F&P the row was recorded
+ * from (recorded_fp_id), so the owner can see whose bottle it is before choosing.
  */
 export async function PATCH(request: Request) {
   try {
@@ -307,20 +330,6 @@ export async function PATCH(request: Request) {
         error: `That party does not match this entry: it was recorded under "${name}" on ${date}.`,
       }, { status: 400 });
     }
-    // THE DOUBLE-COUNT GUARD — see the block comment. Compared on the row's RAW
-    // event_name / event_date, exactly as the P&L's no-id arm compares them in SQL.
-    const sharers = noIdPartiesCountingName(parties, row.event_name, row.event_date).map(i => parties[i]);
-    if (sharers.length > 0) {
-      const who = sharers.map(p => p.fp_id ? `${p.fp_id} (${p.event_name})` : String(p.event_name)).join(', ');
-      return Response.json({
-        error: `Not assigned. ${who} has no AKAN id yet and is listed under "${name}" on ${date}; ` +
-               `its P&L counts every entry that carries a party id under that name, so assigning this ` +
-               `to ${party.event_name || target} would charge the same bottle to both. ` +
-               `Assign it once ${sharers.length === 1 ? 'that party has' : 'those parties have'} an AKAN id (refresh the party list).`,
-        blocked_by: sharers.map(p => ({ fp_id: p.fp_id || null, event_name: p.event_name || '', event_date: p.event_date || '' })),
-      }, { status: 409 });
-    }
-
     const changed = db.prepare(
       'UPDATE party_consumption SET party_unique_id = ? WHERE id = ? AND party_unique_id IS NULL',
     ).run(target, id).changes;

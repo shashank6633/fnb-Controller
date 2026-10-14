@@ -1,17 +1,16 @@
 import { getDb } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
 // The liquor category vocabulary, the party-requisition cost/count query, the
-// party name resolution and the orphan-liquor claim now live in ONE place,
-// because /api/party-consumption has to show the very rows this route costs —
-// see src/lib/party-liquor.ts for why. partyReqSplit() costs the same lines the
-// runSplit() that used to sit in this file costed (same FROM, same WHERE, same
-// parameters); its line→recipe conversion is now the party rail's own
-// lineFactor(), measured identical to the old CASE on every live line.
+// party resolution, the requisition claim and the orphan-liquor claim live in
+// ONE place, because /api/party-consumption has to show the very rows this
+// route costs — see src/lib/party-liquor.ts for why. partyReqSplit() costs each
+// line as the runSplit() that used to sit in this file did (same status pair,
+// same category split, issued qty × average_price through the rail's own
+// lineFactor()); WHICH requisitions a party carries is ruling 34's claim.
 import {
-  partyReqSplit, loadPnlParties, pnlCandidateNames, findPnlPartyIndex,
-  orphanClaimants, orphanSlot, claimOrphanConsumption, orphanShareOf,
-  noIdPartiesCountingName,
-  type OrphanClaims, type OrphanRow, type CachedPnlParty,
+  partyReqSplit, loadPnlParties, partyClaimants, partyScope,
+  claimOrphanConsumption, orphanShareOf, claimPartyRequisitions, partyReqShareOf,
+  type OrphanClaims, type OrphanRow, type CachedPnlParty, type ReqClaims,
 } from '@/lib/party-liquor';
 
 /**
@@ -19,11 +18,14 @@ import {
  *
  *   Revenue    = Party Bookings sheet "Final Total Amount" (matched by party_unique_id)
  *   Food Cost  = Σ (party requisition issued qty × material avg price), non-liquor
- *                categories, matched by event_name+event_date
+ *                categories, over the requisitions THIS party is costed on
+ *                (owner ruling 34, 2026-10-14): those carrying its id, plus those
+ *                carrying no id that only it matches by name + date
  *   Liquor Cost= Σ the same for liquor/beverage categories (the Bar requisition)
  *              + Σ party_consumption cost_at_time (snapshotted) for the party's id,
  *              + the orphan rows (no id) that ONLY this party matches by name
- *                (owner ruling 2026-10-14 — see src/lib/party-liquor.ts)
+ *                (owner ruling 2026-10-14 — see src/lib/party-liquor.ts).
+ *                A party with no AKAN id counts ONLY those orphan rows (34b).
  *   Profit     = Revenue − (Food + Liquor)
  *   Margin     = Profit / Revenue
  *
@@ -79,11 +81,6 @@ function revenueGate(status: string | undefined, eventDate: string | undefined, 
   return { allow: true, reason: null };
 }
 
-/** All names a party's requisition might have been raised under. Body moved to
- *  src/lib/party-liquor.ts (pnlCandidateNames) so /api/party-consumption resolves
- *  the identical name set — see loadUpcomingPartiesCache above. */
-const candidateNames = pnlCandidateNames;
-
 /**
  * A party's share of the ORPHAN consumption rows (no party_unique_id), as decided
  * by claimOrphanConsumption() in src/lib/party-liquor.ts — the ONE rule the
@@ -97,8 +94,7 @@ const candidateNames = pnlCandidateNames;
 interface OrphanShare { matchedCost: number; matchedN: number; awaitingN: number }
 const NO_ORPHAN: OrphanShare = { matchedCost: 0, matchedN: 0, awaitingN: 0 };
 
-function shareFor(claims: OrphanClaims, index: number): OrphanShare {
-  const { matched, awaiting } = orphanShareOf(claims, index);
+function toOrphanShare({ matched, awaiting }: { matched: OrphanRow[]; awaiting: unknown[] }): OrphanShare {
   return {
     matchedCost: matched.reduce((a, r) => a + (Number(r.cost) || 0), 0),
     matchedN: matched.length,
@@ -106,50 +102,54 @@ function shareFor(claims: OrphanClaims, index: number): OrphanShare {
   };
 }
 
+function shareFor(claims: OrphanClaims, index: number): OrphanShare {
+  return toOrphanShare(orphanShareOf(claims, index));
+}
+
 function pnlFor(db: ReturnType<typeof getDb>, bookings: Map<string, number>,
-                key: { party_unique_id?: string; event_name?: string; event_date?: string; eventNames?: string[] },
+                key: { party_unique_id?: string; reqIds: string[] },
                 gate: { allow: boolean; reason: string | null },
-                orphan: OrphanShare = NO_ORPHAN) {
+                orphan: OrphanShare = NO_ORPHAN,
+                reqAwaitingN = 0) {
   // Revenue = Party Bookings Final Total (matched by party_unique_id) — but ONLY
   // counted once the party is confirmed/done AND its date has passed (gate). The
   // raw booking total is still returned so the UI can show "₹X — <reason>".
   const bookingTotal = key.party_unique_id ? (bookings.get(key.party_unique_id) || 0) : 0;
   const revenue = gate.allow ? bookingTotal : 0;
 
-  // Food cost from party requisitions. A requisition links to a party ONLY by
-  // event_name+date (no party_unique_id), and the name it was raised with may be
-  // the contact person, the company, or the FP id — so match on the date + ANY of
-  // the party's candidate names, not a single guessed one (else food cost = ₹0).
+  // Food cost from party requisitions — over key.reqIds, the requisitions the
+  // claim gave THIS party (owner ruling 34a, claimPartyRequisitions in
+  // src/lib/party-liquor.ts): the ones carrying its id, plus id-less ones that it
+  // ALONE matches by name + date (the name may be the contact person, the
+  // company or the FP id — pnlCandidateNames). Production matched by name alone,
+  // so a requisition raised under a name two parties share that evening was
+  // costed on both.
   let foodCost = 0;
   let foodItems = 0;
   let liquorFromReqs = 0;      // Bar / liquor / beverage requisition items → liquor cost, not food
   let liquorFromReqItems = 0;
-  const names = [...new Set(
-    (key.eventNames && key.eventNames.length ? key.eventNames : (key.event_name ? [key.event_name] : []))
-      .map(n => String(n || '').trim()).filter(Boolean)
-  )];
-  if (names.length && key.event_date) {
+  if (key.reqIds.length) {
     // ACTUALS, not estimates: cost the ISSUED quantity (what the store actually
     // handed over) × avg price, only for FULFILLED requisitions. AND split by
     // category: liquor / beer / wine / spirits / beverages / mixers are costed as
     // LIQUOR, everything else as FOOD.
     //
-    // The query itself is partyReqSplit() in src/lib/party-liquor.ts — the same
-    // FROM / WHERE / parameters and the 'fulfilled'/'store_processed' status pair
-    // as the runSplit() that used to be inlined here. Its line→recipe conversion
-    // is the party rail's own lineFactor() (× pack_size only when the line is in
-    // the material's purchase unit, e.g. 1 BTL = 750 ml), which replaced the
+    // The query itself is partyReqSplit() in src/lib/party-liquor.ts — the
+    // 'fulfilled'/'store_processed' status pair and the category split of the
+    // runSplit() that used to be inlined here. Its line→recipe conversion is the
+    // party rail's own lineFactor() (× pack_size only when the line is in the
+    // material's purchase unit, e.g. 1 BTL = 750 ml), which replaced the
     // hand-rolled CASE when the over-issue clamp landed; measured identical on all
     // 16,353 live requisition lines. It costs the HAND-OVER (quantity_issued),
     // not the central debit: since the clamp a Liquor Store (TGBCL) bottle on a
     // party requisition moves no central stock, and it is still the party's cost.
     // It is shared so that /api/party-consumption can list the very liquor rows
-    // counted here from the SAME clause — rows that do not add up to this cost
-    // would be worse than no rows at all.
-    const food = partyReqSplit(db, names, key.event_date, 'NOT IN');
+    // counted here from the SAME requisitions — rows that do not add up to this
+    // cost would be worse than no rows at all.
+    const food = partyReqSplit(db, key.reqIds, 'NOT IN');
     foodCost = food.cost;
     foodItems = food.item_count;
-    const liq = partyReqSplit(db, names, key.event_date, 'IN');
+    const liq = partyReqSplit(db, key.reqIds, 'IN');
     liquorFromReqs = liq.cost;
     liquorFromReqItems = liq.item_count;
   }
@@ -176,27 +176,16 @@ function pnlFor(db: ReturnType<typeof getDb>, bookings: Map<string, number>,
     `).get(key.party_unique_id) as { cost: number; n: number };
     liquorFromConsumption = (r.cost || 0) + orphan.matchedCost;
     liquorConsumptionItems = (r.n || 0) + orphan.matchedN;
-  } else if (key.event_name && key.event_date) {
-    // A party the sheet has issued no id for. Its ID-BEARING rows match by its
-    // own event_name + date, exactly as production always matched them; its
-    // orphan rows arrive only through the exactly-one claim above.
-    //
-    // NOT SOLVED HERE (pre-existing, unchanged from production 6cd5615): an
-    // id-bearing row recorded under the SAME event_name and date as this party is
-    // counted here AND on the party that owns that id. The owner's ruling covers
-    // orphan rows only; this arm is left exactly as production had it.
-    //
-    // MIRRORED by noIdPartiesCountingName() in src/lib/party-liquor.ts, which
-    // stops PATCH /api/party-consumption from MAKING such a row (assigning an
-    // orphan recorded under this party's name to another party). Change this arm
-    // and that predicate together, or the guard stops matching what is counted.
-    const r = db.prepare(`
-      SELECT COALESCE(SUM(cost_at_time), 0) AS cost, COUNT(*) AS n
-      FROM party_consumption
-      WHERE event_name = ? AND event_date = ? AND party_unique_id IS NOT NULL
-    `).get(key.event_name, key.event_date) as { cost: number; n: number };
-    liquorFromConsumption = (r.cost || 0) + orphan.matchedCost;
-    liquorConsumptionItems = (r.n || 0) + orphan.matchedN;
+  } else {
+    // A party the sheet has issued no id for counts ONLY rows with no id, and
+    // only those the exactly-one claim gave it (owner ruling 34b). Production
+    // also counted here every ID-BEARING row recorded under this party's display
+    // name and date — i.e. another party's bottles, already counted on that
+    // party by its id — so such a row sat on two P&Ls. That arm is gone, and
+    // with it the PATCH refusal that existed only to stop it double counting an
+    // assigned orphan.
+    liquorFromConsumption = orphan.matchedCost;
+    liquorConsumptionItems = orphan.matchedN;
   }
 
   const liquorCost = liquorFromConsumption + liquorFromReqs;
@@ -232,6 +221,11 @@ function pnlFor(db: ReturnType<typeof getDb>, bookings: Map<string, number>,
     liquor_matched_by_name_items: orphan.matchedN,
     liquor_matched_by_name_cost: orphan.matchedCost,
     liquor_unassigned_items: orphan.awaitingN,
+    // Requisitions with NO id raised under a name this party shares with another
+    // party that evening: costed on NEITHER (ruling 34a). Not included in
+    // food_* / liquor_* above; a count so the row can say so — the money is in
+    // the top-level unassigned_requisitions list.
+    requisitions_unassigned: reqAwaitingN,
     total_cost: totalCost,
     profit,
     margin,                       // 0..1 (negative possible)
@@ -248,11 +242,9 @@ function pnlFor(db: ReturnType<typeof getDb>, bookings: Map<string, number>,
  *   reason 'no_party'        — no cached party that evening carries the name.
  * Ordered as the claim read them (recorded_at, id).
  *
- * assign_blocked_by — the parties WITHOUT an id listed under the row's exact name
- * that evening (noIdPartiesCountingName, read on the row's RAW name/date as the
- * no-id arm reads them). While it is non-empty PATCH /api/party-consumption
- * refuses every assignment of the row (it would count on that party too), so the
- * page shows this list instead of Assign buttons the server would refuse.
+ * (The release batch also returned assign_blocked_by here — the no-id parties
+ * whose P&L would have counted the row once it carried an id. Ruling 34b removed
+ * that counting, so nothing blocks an assignment and the list is gone.)
  */
 function describeUnassigned(db: ReturnType<typeof getDb>, claims: OrphanClaims, parties: CachedPnlParty[]) {
   const items: { row: OrphanRow; reason: 'several_parties' | 'no_party'; candidates: number[] }[] = [
@@ -271,7 +263,6 @@ function describeUnassigned(db: ReturnType<typeof getDb>, claims: OrphanClaims, 
   `);
   return items.map(({ row, reason, candidates }) => {
     const d = (detail.get(row.id) || {}) as Record<string, any>;
-    const blocked = noIdPartiesCountingName(parties, d.raw_event_name, d.raw_event_date);
     return {
       id: row.id,
       event_name: row.event_name,
@@ -285,13 +276,54 @@ function describeUnassigned(db: ReturnType<typeof getDb>, claims: OrphanClaims, 
       notes: d.notes ?? '',
       recorded_by: d.recorded_by ?? null,
       recorded_at: d.recorded_at ?? null,
+      // The F&P the row was recorded from (the modal posts its fp_id). With two
+      // parties of one name that evening it is the owner's best clue whose bottle
+      // it is — shown beside the Assign buttons, decides nothing by itself.
+      recorded_fp_id: d.fp_id || null,
       candidates: candidates.map(i => ({
         party_unique_id: parties[i]?.party_unique_id || null,
         fp_id: parties[i]?.fp_id || null,
         event_name: parties[i]?.event_name || '',
         event_date: parties[i]?.event_date || '',
       })),
-      assign_blocked_by: blocked.map(i => ({
+    };
+  });
+}
+
+/**
+ * The COSTED party requisitions the claim put on NO row of this board (owner
+ * ruling 34a), described for the owner — read-only: a requisition's party is
+ * set when it is raised (Raise Req), and nothing here re-assigns it.
+ *   reason 'several_parties' — no id, and two or more parties that evening carry
+ *     the name it was raised under (candidates). Production costed it on EACH.
+ *   reason 'id_not_listed'   — it carries an AKAN id no party on the list has,
+ *     while a listed party matches its name that evening (candidates), where
+ *     production costed it. The single-party P&L for that id still costs it.
+ * Its food / liquor split is computed by the same partyReqSplit() the rows use,
+ * and is returned only to the audience that sees party financials.
+ */
+function describeUnassignedReqs(db: ReturnType<typeof getDb>, claims: ReqClaims,
+                                parties: CachedPnlParty[], financialsAllowed: boolean) {
+  const items = [
+    ...claims.ambiguous.map(a => ({ req: a.req, reason: 'several_parties' as const, candidates: a.candidates })),
+    ...claims.idNotListed.map(a => ({ req: a.req, reason: 'id_not_listed' as const, candidates: a.nameMatches })),
+  ];
+  return items.map(({ req, reason, candidates }) => {
+    const food = partyReqSplit(db, [req.id], 'NOT IN');
+    const liq = partyReqSplit(db, [req.id], 'IN');
+    return {
+      req_id: req.id,
+      req_number: req.req_number,
+      event_name: req.event_name,
+      event_date: req.event_date,
+      party_unique_id: req.party_unique_id || null,
+      fp_id: req.fp_id || null,
+      reason,
+      food_items: food.item_count,
+      liquor_items: liq.item_count,
+      ...(financialsAllowed ? { food_cost: food.cost, liquor_cost: liq.cost } : {}),
+      candidates: candidates.map(i => ({
+        party_unique_id: parties[i]?.party_unique_id || null,
         fp_id: parties[i]?.fp_id || null,
         event_name: parties[i]?.event_name || '',
         event_date: parties[i]?.event_date || '',
@@ -331,6 +363,9 @@ function stripFinancials(row: any) {
     liquor_matched_by_name_items: row.liquor_matched_by_name_items,
     liquor_matched_by_name_cost: row.liquor_matched_by_name_cost,
     liquor_unassigned_items: row.liquor_unassigned_items,
+    // A count, not money: tells the recorder a requisition under this party's
+    // name is costed on no party (ruling 34a), so the badge does not look short.
+    requisitions_unassigned: row.requisitions_unassigned,
     has_liquor_recorded: row.has_liquor_recorded,
     financials_hidden: true,
   };
@@ -360,52 +395,60 @@ export async function GET(request: Request) {
     const parties = loadUpcomingPartiesCache();
 
     if (party_unique_id || (event_name && event_date)) {
-      // Resolve the party's status + date from the cache to gate its revenue.
-      const idx = findPnlPartyIndex(parties, { party_unique_id, fp_id, event_name, event_date });
-      const p = idx >= 0 ? parties[idx] : undefined;
+      // ONE resolution (partyScope in src/lib/party-liquor.ts — the very call the
+      // consumption modal and its POST 409 gate make): the key is a SLOT in the
+      // board's own claimant list. A cached party is its own index, so its
+      // requisitions, its orphan share and its id are exactly the board row's —
+      // including the id of a party that gained one after the page loaded. A key
+      // no cached party matches is appended as one more claimant (see partySlot):
+      // it can win only what no cached party also matches, plus the requisitions
+      // carrying its own id.
+      const scope = partyScope(db, { party_unique_id, fp_id, event_name, event_date });
+      const p = scope.party;
+      // The party's status + date from the cache gate its revenue.
       const gate = revenueGate(p?.status, p?.event_date ?? event_date, today);
-      const eventNames = p ? candidateNames(p).concat(event_name ? [event_name] : []) : (event_name ? [event_name] : []);
-      // ORPHAN SHARE, from the SAME claimant list the board uses. A cached party
-      // is its own index, so it gets exactly the share the board gave it. A key no
-      // cached party matches is appended as one more party that evening (see
-      // orphanSlot) — under the exactly-one rule it can then win only a row no
-      // cached party also matches, so it can never take a bottle the board
-      // already charged.
-      const slot = orphanSlot(parties, { party_unique_id, fp_id, event_name, event_date });
-      const orphan = shareFor(claimOrphanConsumption(db, slot.claimants), slot.index);
-      const pnl = pnlFor(db, bookings, { party_unique_id, event_name, event_date: p?.event_date ?? event_date, eventNames }, gate, orphan);
+      const pnl = pnlFor(db, bookings, { party_unique_id: scope.party_unique_id, reqIds: scope.reqIds },
+                         gate, toOrphanShare(scope.orphanShare), scope.reqAwaiting.length);
       return Response.json({ pnl: financialsAllowed ? pnl : stripFinancials(pnl) });
     }
 
-    // Orphan consumption rows are claimed ONCE, over the whole cached list, before
-    // any per-party figure is computed — so every row on this board, the
-    // single-party branch above and the consumption modal reach the same answer.
-    const claims = claimOrphanConsumption(db, orphanClaimants(parties));
+    // Orphan consumption rows AND party requisitions are claimed ONCE, over the
+    // whole cached list, before any per-party figure is computed — so every row on
+    // this board, the single-party branch above and the consumption modal reach
+    // the same answer (owner rulings of 2026-10-14, incl. 34).
+    const claimants = partyClaimants(parties);
+    const claims = claimOrphanConsumption(db, claimants);
+    const reqClaims = claimPartyRequisitions(db, claimants);
 
     // Bulk: every cached party. Booking revenue is counted ONLY for Confirmed/Done
     // parties whose date has passed (revenueGate); otherwise revenue shows 0 with a reason.
-    const out = parties.map((p, i) => ({
-      party_unique_id: p.party_unique_id,
-      fp_id: p.fp_id,
-      event_name: p.event_name || '',
-      event_date: p.event_date || '',
-      guest_name: p.guest_name,
-      status: p.status,
-      // Kitchen-canonical headcount: min_guarantee (contracted) first; pax_expected as fallback
-      pax: p.min_guarantee || p.pax_expected,
-      ...pnlFor(db, bookings, {
+    const out = parties.map((p, i) => {
+      const reqShare = partyReqShareOf(reqClaims, i);
+      return {
         party_unique_id: p.party_unique_id,
-        event_name: p.event_name,
-        event_date: p.event_date,
-        eventNames: candidateNames(p),
-      }, revenueGate(p.status, p.event_date, today), shareFor(claims, i)),
-    }));
+        fp_id: p.fp_id,
+        event_name: p.event_name || '',
+        event_date: p.event_date || '',
+        guest_name: p.guest_name,
+        status: p.status,
+        // Kitchen-canonical headcount: min_guarantee (contracted) first; pax_expected as fallback
+        pax: p.min_guarantee || p.pax_expected,
+        ...pnlFor(db, bookings, {
+          party_unique_id: p.party_unique_id,
+          reqIds: reqShare.reqIds,
+        }, revenueGate(p.status, p.event_date, today), shareFor(claims, i), reqShare.awaiting.length),
+      };
+    });
     return Response.json({
       pnl: financialsAllowed ? out : out.map(stripFinancials),
       // The orphan rows charged to NO party — for the owner to assign. Liquor
       // cost is visible to every signed-in user already (see stripFinancials),
       // so the list is not withheld; ASSIGNING is admin-only (can_assign).
       unassigned_liquor: describeUnassigned(db, claims, parties),
+      // The costed requisitions on NO row here (ruling 34a) — read-only, so the
+      // food / liquor they carry does not silently leave the board. Costs only
+      // for the financial audience.
+      unassigned_requisitions: describeUnassignedReqs(db, reqClaims, parties, !!financialsAllowed),
       can_assign: me.role === 'admin',
     });
   } catch (e: any) {

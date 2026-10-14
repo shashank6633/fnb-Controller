@@ -25,10 +25,13 @@
  * point of showing them. Hence partyReqSource() and issuedRecipeQty() below are
  * shared by every figure here; do not inline a copy of either.
  *
- * NOT A MONEY CHANGE: partyReqSplit() costs exactly the lines the runSplit()
- * query that used to live in /api/party-events/pnl costed — same FROM, same
- * WHERE, same parameter order, same ISSUED qty × average_price. The ONE thing
- * that is no longer verbatim is the line→recipe conversion; see below.
+ * partyReqSplit() costs each line the way the runSplit() query that used to
+ * live in /api/party-events/pnl costed it — same status pair, same category
+ * split, same ISSUED qty × average_price; the line→recipe conversion is the
+ * rail's own (see below). WHICH REQUISITIONS a party is costed on changed with
+ * the owner's ruling 34 (2026-10-14) — see "WHOSE REQUISITION IS IT" below
+ * claimPartyRequisitions(). That IS a money change, and a deliberate one: it
+ * removes a double count production 6cd5615 has.
  *
  * ── THE OVER-ISSUE CLAMP, AND WHAT THIS FILE DOES (AND DOES NOT) ASSUME ──────
  * The clamp (src/lib/issue-stock.ts "THE CENTRAL FLOOR", party-fulfillment.ts,
@@ -136,37 +139,48 @@ function lineCost(recipeQty: number, row: PartyReqLineInputs): number {
 }
 
 /**
- * The FROM + WHERE every party-requisition query here shares.
+ * The statuses whose requisitions are COSTED. ACTUALS, not estimates: only
+ * FULFILLED (and store_processed) requisitions, and the ISSUED quantity — what
+ * the store actually handed over. A part-issued party req now correctly stays
+ * 'store_processed' rather than being mis-stamped 'fulfilled'; its goods still
+ * left the store, so excluding it would silently drop real cost from the P&L.
+ * The claim below reads the same set, so it never decides ownership of a
+ * requisition that is not costed.
+ */
+const COSTED_REQ_STATUSES = `('fulfilled', 'store_processed')`;
+
+/**
+ * The FROM + WHERE every party-requisition cost query here shares.
  *
- * ACTUALS, not estimates: only FULFILLED (and store_processed) requisitions, and
- * the ISSUED quantity — what the store actually handed over. A part-issued party
- * req now correctly stays 'store_processed' rather than being mis-stamped
- * 'fulfilled'; its goods still left the store, so excluding it would silently
- * drop real cost from the party P&L.
+ * WHICH requisitions: exactly the ids the claim gave this party
+ * (claimPartyRequisitions → partyReqShareOf), bound as ONE JSON array so the
+ * statement never runs into SQLite's host-parameter limit. It used to be
+ * `r.event_name IN (<the party's candidate names>) AND r.event_date = ?`, which
+ * costed a requisition on EVERY party sharing the name that evening (ruling 34).
+ * The purpose / status / category filters are unchanged.
  *
- * Parameter order is (…names, eventDate, …LIQUOR_CATEGORIES) — bind with
+ * Parameter order is (reqIdsJson, …LIQUOR_CATEGORIES) — bind with
  * partyReqParams() so a caller cannot get it wrong.
  */
-function partyReqSource(names: string[], inOrNotIn: 'IN' | 'NOT IN'): string {
-  const ph  = names.map(() => '?').join(',');
+function partyReqSource(inOrNotIn: 'IN' | 'NOT IN'): string {
   const lph = LIQUOR_CATEGORIES.map(() => '?').join(',');
   return `
       FROM requisitions r
       JOIN requisition_items ri ON ri.req_id = r.id
       JOIN raw_materials rm ON rm.id = ri.material_id
-      WHERE r.purpose = 'party'
-        AND r.event_name IN (${ph})
-        AND r.event_date = ?
-        AND r.status IN ('fulfilled', 'store_processed')
+      WHERE r.id IN (SELECT value FROM json_each(?))
+        AND r.purpose = 'party'
+        AND r.status IN ${COSTED_REQ_STATUSES}
         AND LOWER(TRIM(COALESCE(rm.category, ''))) ${inOrNotIn} (${lph})`;
 }
 
-function partyReqParams(names: string[], eventDate: string): (string | number)[] {
-  return [...names, eventDate, ...LIQUOR_CATEGORIES];
+function partyReqParams(reqIds: string[]): (string | number)[] {
+  return [JSON.stringify(reqIds), ...LIQUOR_CATEGORIES];
 }
 
 /**
- * Party requisition cost + item count, split by category.
+ * Party requisition cost + item count, split by category, over the
+ * requisitions the claim gave ONE party (partyReqShareOf(...).reqIds).
  *   'NOT IN' → FOOD   (everything that is not a liquor/beverage category)
  *   'IN'     → LIQUOR (bar / beer / wine / spirits / beverages / mixers)
  * item_count counts only lines that were actually issued (quantity_issued > 0),
@@ -174,13 +188,13 @@ function partyReqParams(names: string[], eventDate: string): (string | number)[]
  * the rows in the modal can never disagree. cost sums EVERY matched line, as the
  * old SUM() did (an unissued line contributes 0).
  */
-export function partyReqSplit(db: DB, names: string[], eventDate: string | undefined,
+export function partyReqSplit(db: DB, reqIds: string[],
                               inOrNotIn: 'IN' | 'NOT IN'): { cost: number; item_count: number } {
-  if (!names.length || !eventDate) return { cost: 0, item_count: 0 };
+  if (!reqIds.length) return { cost: 0, item_count: 0 };
   const rows = db.prepare(`
       SELECT ${LINE_INPUTS}
-      ${partyReqSource(names, inOrNotIn)}
-    `).all(...partyReqParams(names, eventDate)) as PartyReqLineInputs[];
+      ${partyReqSource(inOrNotIn)}
+    `).all(...partyReqParams(reqIds)) as PartyReqLineInputs[];
   let cost = 0;
   let itemCount = 0;
   for (const row of rows) {
@@ -219,12 +233,13 @@ export interface PartyLiquorReqItem {
 /**
  * The individual LIQUOR requisition lines behind a party's liquor cost — the
  * read-only rows the consumption modal shows so nobody re-types an already-costed
- * bottle. Same source clause and same conversion as partyReqSplit(db, …, 'IN'),
- * plus `quantity_issued > 0` so the row count equals that call's item_count and
- * the rows' cost adds up to its cost.
+ * bottle, and the set the POST double-count gate (409) checks. Same requisition
+ * ids, source clause and conversion as partyReqSplit(db, reqIds, 'IN'), plus
+ * `quantity_issued > 0` so the row count equals that call's item_count and the
+ * rows' cost adds up to its cost.
  */
-export function partyLiquorReqItems(db: DB, names: string[], eventDate: string | undefined): PartyLiquorReqItem[] {
-  if (!names.length || !eventDate) return [];
+export function partyLiquorReqItems(db: DB, reqIds: string[]): PartyLiquorReqItem[] {
+  if (!reqIds.length) return [];
   const rows = db.prepare(`
       SELECT ri.id,
              ri.material_id,
@@ -244,10 +259,10 @@ export function partyLiquorReqItems(db: DB, names: string[], eventDate: string |
              ri.issued_at,
              ri.issued_by,
              ${LINE_INPUTS}
-      ${partyReqSource(names, 'IN')}
+      ${partyReqSource('IN')}
         AND ri.quantity_issued > 0
       ORDER BY rm.name
-    `).all(...partyReqParams(names, eventDate)) as (PartyReqLineInputs & {
+    `).all(...partyReqParams(reqIds)) as (PartyReqLineInputs & {
       id: string; material_id: string; material_name: string; material_unit: string;
       material_purchase_unit: string; material_pack_size: number; issued_unit: string;
       qty_issued: number; req_id: string; req_number: string; req_status: string;
@@ -367,54 +382,30 @@ export function findPnlPartyIndex(parties: CachedPnlParty[], key: PartyEventKey)
   return noId >= 0 ? noId : parties.findIndex(byName);
 }
 
-/**
- * The cached parties WITHOUT an id whose P&L counts an ID-BEARING
- * party_consumption row recorded under (eventName, eventDate).
+/* ────────────────────────────────────────────────────────────────────────────
+ * OWNER RULING 34 (2026-10-14) — NO NAME MATCH ACROSS A PARTY ID.
+ * ────────────────────────────────────────────────────────────────────────────
  *
- * This mirrors the no-id arm of pnlFor() in /api/party-events/pnl exactly: a party
- * with no party_unique_id, a display name and a date counts
- *   WHERE event_name = <its display name> AND event_date = <its date>
- *     AND party_unique_id IS NOT NULL
- * — a plain SQL `=` (BINARY collation, untrimmed), hence the untrimmed string
- * comparison here. That arm is production behaviour and is left as it is. It is
- * why PATCH /api/party-consumption must not give an orphan a party id while such
- * a party exists: the row would then count on the party it was assigned to AND
- * on this one. The PATCH refuses on this list, and the P&L board shows the same
- * list in place of the Assign buttons, so the screen never offers an assignment
- * the server will refuse.
+ *   (a) A requisition is costed ONLY on the party whose id it carries
+ *       (requisitions.party_unique_id, filled by Raise Req). Name + date
+ *       matching is a FALLBACK for a requisition with no id, and then only when
+ *       EXACTLY ONE party that evening matches — the orphan-liquor rule below.
+ *   (b) A party with no AKAN id matches by name ONLY rows with no party id. Its
+ *       P&L used to count every ID-BEARING party_consumption row recorded under
+ *       its display name — i.e. another party's bottles — and the release batch
+ *       had to refuse orphan assignments to stop that arm counting them twice
+ *       (noIdPartiesCountingName, now gone with the arm it mirrored).
+ *
+ * Production 6cd5615 costed a requisition raised under "Ravi Kumar" on EVERY
+ * party that evening carrying that name, and a no-id "Ravi Kumar" party's P&L
+ * carried the other Ravi Kumar's recorded bottles. Both are removed here.
+ *
+ * ONE RESOLUTION for every consumer — the P&L board, its single-party GET, the
+ * consumption modal, its badge and the POST 409 gate: an event key resolves to a
+ * SLOT in the claimant list (partySlot), and the requisitions, orphan rows and
+ * party id are all read from that slot. A slot is one party; nothing is matched
+ * by a name list of the caller's own any more.
  */
-export function noIdPartiesCountingName(parties: CachedPnlParty[], eventName: unknown, eventDate: unknown): number[] {
-  const n = eventName == null ? '' : String(eventName);
-  const d = eventDate == null ? '' : String(eventDate);
-  const out: number[] = [];
-  parties.forEach((x, i) => {
-    if (x.party_unique_id || !x.event_name || !x.event_date) return;
-    if (String(x.event_name) === n && String(x.event_date) === d) out.push(i);
-  });
-  return out;
-}
-
-/**
- * Resolve an event key (what the modal has) to the name list + date the
- * requisition queries need — the SAME resolution /api/party-events/pnl's GET
- * performs for its single-party branch. Without this the modal would look up
- * requisitions under one name while the badge counted them under five, and the
- * rows would not reconcile with the cost.
- */
-export function resolvePartyEventNames(db: DB, key: PartyEventKey):
-  { names: string[]; eventDate: string | undefined; party: CachedPnlParty | undefined } {
-  const parties = loadPnlParties(db);
-  const idx = findPnlPartyIndex(parties, key);
-  const p = idx >= 0 ? parties[idx] : undefined;
-  const names = p
-    ? pnlCandidateNames(p).concat(key.event_name ? [key.event_name] : [])
-    : (key.event_name ? [key.event_name] : []);
-  return {
-    names: [...new Set(names.map(n => String(n || '').trim()).filter(Boolean))],
-    eventDate: p?.event_date ?? key.event_date,
-    party: p,
-  };
-}
 
 /* ────────────────────────────────────────────────────────────────────────────
  * ORPHAN LIQUOR — party_consumption rows that carry NO party_unique_id.
@@ -432,11 +423,9 @@ export function resolvePartyEventNames(db: DB, key: PartyEventKey):
  *     mark it "matched by name";
  *   · when TWO OR MORE parties match, count it NOWHERE and list it for the owner
  *     to assign (PATCH /api/party-consumption sets its party_unique_id, after
- *     which it is an ordinary id-bearing row). The PATCH is REFUSED while a
- *     party without an id is listed under the row's name that evening
- *     (noIdPartiesCountingName above): that party's P&L counts every
- *     id-bearing row under its name, so the assignment would charge the bottle
- *     twice. It can be assigned once that party has an id;
+ *     which it is an ordinary id-bearing row and counts on that party alone —
+ *     since ruling 34(b) no party without an id counts an id-bearing row, so an
+ *     assignment can no longer land a bottle on a second P&L);
  *   · when NO party matches, it is counted nowhere, as before, and is listed too
  *     so a recorded bottle can never vanish without a trace.
  *
@@ -446,18 +435,21 @@ export function resolvePartyEventNames(db: DB, key: PartyEventKey):
  * two "Ravi Kumar" parties on 2026-10-10 one modal listed a bottle its P&L did
  * not charge, and offered to delete it. Now the board, the single-party P&L, the
  * modal and the badge all call claimOrphanConsumption() over the SAME claimant
- * list (orphanSlot), so they cannot disagree about who owns a row.
+ * list (partySlot), so they cannot disagree about who owns a row.
  *
  * The claim is a pure function of the cached party list and the rows, decided
  * across EVERY party at once — a per-party query cannot see the other parties,
- * which is how one bottle used to land on two P&Ls.
+ * which is how one bottle used to land on two P&Ls. claimPartyRequisitions()
+ * below applies the same exactly-one rule to requisitions without an id.
  */
 
-/** One party's claim on orphan rows: every name its liquor might have been
- *  recorded under, and its event date. */
+/** One party's claim: every name its liquor / requisitions might have been
+ *  recorded under, its event date, and its AKAN id (ruling 34: a requisition
+ *  that carries an id belongs to the claimant with that id and to no other). */
 export interface OrphanClaimant {
   names: string[];
   date?: string;
+  party_unique_id?: string;
 }
 
 /** An orphan party_consumption row, as the claim reads it. */
@@ -478,29 +470,67 @@ export interface OrphanClaims {
 }
 
 /** Claimants for the cached party list, index-aligned with it. */
-export function orphanClaimants(parties: CachedPnlParty[]): OrphanClaimant[] {
-  return parties.map(p => ({ names: pnlCandidateNames(p), date: p.event_date }));
+export function partyClaimants(parties: CachedPnlParty[]): OrphanClaimant[] {
+  return parties.map(p => ({
+    names: pnlCandidateNames(p),
+    date: p.event_date,
+    party_unique_id: String(p.party_unique_id || '').trim() || undefined,
+  }));
 }
 
 /**
  * Where an event key sits in the claim. A CACHED party (found by
  * findPnlPartyIndex — id, else fp_id, else name) is its own index in the
- * cached list — so its share is exactly the share the bulk board gives it. A key
- * no cached party matches but which names a date (an ad-hoc single-party GET) is
- * appended LAST as one more party that evening; under the exactly-one rule it can
- * then only win a row that no cached party also matches, so it can never take a
- * bottle the board has already charged. No date → no orphans at all (index -1).
+ * cached list — so its share is exactly the share the bulk board gives it, and
+ * `party_unique_id` is THAT party's id (a party that gained an id after the page
+ * loaded is still addressed by it). A key no cached party matches (an ad-hoc
+ * single-party GET) is appended LAST as one more claimant:
+ *   · orphans / id-less requisitions — under the exactly-one rule it can then
+ *     only win a row no cached party also matches, so it can never take
+ *     something the board has already charged; with no date it wins nothing;
+ *   · id-bearing requisitions — it owns those carrying the key's id (a party
+ *     that has dropped off the cached list is still costed by its own id).
+ * A key with neither a date nor an id is no party at all (index -1).
  */
-export function orphanSlot(parties: CachedPnlParty[], key: PartyEventKey):
-  { claimants: OrphanClaimant[]; index: number } {
-  const claimants = orphanClaimants(parties);
+export function partySlot(parties: CachedPnlParty[], key: PartyEventKey):
+  { claimants: OrphanClaimant[]; index: number; party: CachedPnlParty | undefined; party_unique_id: string | undefined } {
+  const claimants = partyClaimants(parties);
   const idx = findPnlPartyIndex(parties, key);
-  if (idx >= 0) return { claimants, index: idx };
+  // The id as the cache holds it — the board passes p.party_unique_id to the
+  // party_consumption id arm exactly so, and the two must bind the same string.
+  if (idx >= 0) return { claimants, index: idx, party: parties[idx], party_unique_id: parties[idx].party_unique_id || undefined };
   const date = String(key.event_date || '').trim();
-  if (!date) return { claimants, index: -1 };
+  const id = String(key.party_unique_id || '').trim() || undefined;
+  if (!date && !id) return { claimants, index: -1, party: undefined, party_unique_id: undefined };
   const name = String(key.event_name || '').trim();
-  claimants.push({ names: name ? [name] : [], date });
-  return { claimants, index: claimants.length - 1 };
+  claimants.push({ names: name ? [name] : [], date: date || undefined, party_unique_id: id });
+  // The key's id as sent, as the id arm has always bound it.
+  return { claimants, index: claimants.length - 1, party: undefined, party_unique_id: key.party_unique_id || undefined };
+}
+
+/**
+ * date -> name -> DISTINCT claimant indexes, for the exactly-one rule (orphan
+ * liquor AND id-less requisitions read the SAME index). Nested rather than a
+ * concatenated key so no separator can ever collide two different pairs; a Set
+ * so a party whose guest_name and company are the same string is still ONE
+ * party. A claimant without a date claims nothing by name.
+ */
+function claimantNameIndex(claimants: OrphanClaimant[]): Map<string, Map<string, Set<number>>> {
+  const byDate = new Map<string, Map<string, Set<number>>>();
+  claimants.forEach((c, i) => {
+    const d = String(c.date || '').trim();
+    if (!d) return;
+    let byName = byDate.get(d);
+    if (!byName) { byName = new Map(); byDate.set(d, byName); }
+    for (const raw of c.names) {
+      const n = String(raw || '').trim();
+      if (!n) continue;
+      let set = byName.get(n);
+      if (!set) { set = new Set(); byName.set(n, set); }
+      set.add(i);
+    }
+  });
+  return byDate;
 }
 
 /** THE RULE. See the block comment above. */
@@ -517,23 +547,7 @@ export function claimOrphanConsumption(db: DB, claimants: OrphanClaimant[]): Orp
   `).all() as OrphanRow[];
   if (!rows.length) return out;
 
-  // date -> name -> DISTINCT claimant indexes. Nested rather than a concatenated
-  // key so no separator can ever collide two different pairs; a Set so a party
-  // whose guest_name and company are the same string is still ONE party.
-  const byDate = new Map<string, Map<string, Set<number>>>();
-  claimants.forEach((c, i) => {
-    const d = String(c.date || '').trim();
-    if (!d) return;
-    let byName = byDate.get(d);
-    if (!byName) { byName = new Map(); byDate.set(d, byName); }
-    for (const raw of c.names) {
-      const n = String(raw || '').trim();
-      if (!n) continue;
-      let set = byName.get(n);
-      if (!set) { set = new Set(); byName.set(n, set); }
-      set.add(i);
-    }
-  });
+  const byDate = claimantNameIndex(claimants);
 
   for (const row of rows) {
     const cands = (row.event_date && row.event_name)
@@ -561,4 +575,125 @@ export function orphanShareOf(claims: OrphanClaims, index: number):
     matched: claims.owned.get(index) || [],
     awaiting: claims.ambiguous.filter(a => a.candidates.includes(index)),
   };
+}
+
+/* ────────────────────────────────────────────────────────────────────────────
+ * WHOSE REQUISITION IS IT — owner ruling 34(a), 2026-10-14.
+ * ────────────────────────────────────────────────────────────────────────────
+ *
+ * A COSTED party requisition (purpose 'party', status fulfilled/store_processed):
+ *   · CARRIES AN ID (TRIM(party_unique_id) <> '', filled by Raise Req) — it is
+ *     costed on the claimant with that id and on NO other party, whatever name
+ *     it was raised under. Production costed it on every party whose candidate
+ *     names included that name that evening, so two "Ravi Kumar" parties both
+ *     carried it. When no cached party carries the id, no board row costs it
+ *     (the single-party GET for that id still does); if a party on the list
+ *     matched it by name, it is listed as 'id_not_listed' so the money is not
+ *     silently gone from the board.
+ *   · CARRIES NO ID — the orphan-liquor rule: EXACTLY ONE claimant that evening
+ *     whose candidate names include the requisition's event_name owns it; two or
+ *     more → costed on NONE of them and listed ('several_parties'); none →
+ *     costed nowhere, exactly as production (not listed: production never costed
+ *     it anywhere either).
+ * The name and date are compared as the old SQL compared them: the
+ * requisition's event_name / event_date as stored, against the party's trimmed
+ * candidate names and its date — so no requisition starts matching a party it
+ * did not match before; some simply stop matching the parties that are not
+ * theirs.
+ *
+ * Decided across EVERY claimant at once, like the orphan claim, because "only
+ * this party" cannot be seen from a per-party query.
+ */
+
+/** A costed party requisition, as the claim reads it. */
+export interface PartyReqRef {
+  id: string;
+  req_number: string;
+  event_name: string;       // as stored
+  event_date: string;       // as stored
+  party_unique_id: string;  // trimmed; '' = no id
+  fp_id: string;            // trimmed; display only (the ruling keys on the AKAN id)
+}
+
+export interface ReqClaims {
+  /** claimant index → ids of the requisitions it is COSTED on. */
+  owned: Map<number, string[]>;
+  /** No id, and two or more claimants match its name that evening: costed on none. */
+  ambiguous: { req: PartyReqRef; candidates: number[] }[];
+  /** Carries an id no claimant has, while at least one claimant matches its name
+   *  that evening (production costed it there): costed on no listed party. */
+  idNotListed: { req: PartyReqRef; nameMatches: number[] }[];
+}
+
+/** THE RULE for requisitions. See the block comment above. */
+export function claimPartyRequisitions(db: DB, claimants: OrphanClaimant[]): ReqClaims {
+  const out: ReqClaims = { owned: new Map(), ambiguous: [], idNotListed: [] };
+  const rows = db.prepare(`
+    SELECT r.id,
+           COALESCE(r.req_number, '')                 AS req_number,
+           COALESCE(r.event_name, '')                 AS event_name,
+           COALESCE(r.event_date, '')                 AS event_date,
+           TRIM(COALESCE(r.party_unique_id, ''))      AS party_unique_id,
+           TRIM(COALESCE(r.fp_id, ''))                AS fp_id
+    FROM requisitions r
+    WHERE r.purpose = 'party'
+      AND r.status IN ${COSTED_REQ_STATUSES}
+    ORDER BY r.event_date, r.req_number, r.id
+  `).all() as PartyReqRef[];
+  if (!rows.length) return out;
+
+  const byId = new Map<string, number[]>();
+  claimants.forEach((c, i) => {
+    const id = String(c.party_unique_id || '').trim();
+    if (!id) return;
+    const list = byId.get(id);
+    if (list) list.push(i); else byId.set(id, [i]);
+  });
+  const byDate = claimantNameIndex(claimants);
+  const give = (i: number, reqId: string) => {
+    const list = out.owned.get(i);
+    if (list) list.push(reqId); else out.owned.set(i, [reqId]);
+  };
+
+  for (const req of rows) {
+    const nameMatches = (req.event_date && req.event_name)
+      ? [...(byDate.get(req.event_date)?.get(req.event_name) ?? [])].sort((a, b) => a - b)
+      : [];
+    if (req.party_unique_id) {
+      const owners = byId.get(req.party_unique_id) || [];
+      if (owners.length) owners.forEach(i => give(i, req.id));
+      else if (nameMatches.length) out.idNotListed.push({ req, nameMatches });
+      continue;
+    }
+    if (nameMatches.length === 1) give(nameMatches[0], req.id);
+    else if (nameMatches.length >= 2) out.ambiguous.push({ req, candidates: nameMatches });
+  }
+  return out;
+}
+
+/** One party's view of the requisition claim: the requisitions it is costed on,
+ *  and the id-less ones that name it AND another party that evening — costed on
+ *  nobody, counted only so the badge and the modal can say so. */
+export function partyReqShareOf(claims: ReqClaims, index: number):
+  { reqIds: string[]; awaiting: { req: PartyReqRef; candidates: number[] }[] } {
+  if (index < 0) return { reqIds: [], awaiting: [] };
+  return {
+    reqIds: claims.owned.get(index) || [],
+    awaiting: claims.ambiguous.filter(a => a.candidates.includes(index)),
+  };
+}
+
+/**
+ * Everything one event key is charged with, resolved ONCE — what the single-party
+ * P&L GET, the consumption modal and the POST 409 gate all read, so they cannot
+ * resolve the same key to different requisitions, rows or id. The bulk board
+ * computes the same claims over partyClaimants(parties) and reads each party's
+ * own index, which is the index partySlot() returns for that party's key.
+ */
+export function partyScope(db: DB, key: PartyEventKey) {
+  const parties = loadPnlParties(db);
+  const slot = partySlot(parties, key);
+  const reqShare = partyReqShareOf(claimPartyRequisitions(db, slot.claimants), slot.index);
+  const orphanShare = orphanShareOf(claimOrphanConsumption(db, slot.claimants), slot.index);
+  return { parties, ...slot, reqIds: reqShare.reqIds, reqAwaiting: reqShare.awaiting, orphanShare };
 }

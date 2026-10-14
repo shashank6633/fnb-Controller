@@ -62,6 +62,13 @@ import { clampCentralDelta, recordCentralDebitClamp, type CentralDeltaClamp } fr
 export async function POST(req: Request) {
   const auth = await requireRole('admin');
   if (!auth.ok) return Response.json({ error: auth.message }, { status: auth.status });
+  // THE RESPONSIBLE USER for every department movement this reset posts
+  // (zeroDepartmentRail below). postDeptLedger REFUSES a blank user, and that
+  // throw rolled back every `stock_only` reset whose departments held stock
+  // (500 "a responsible user is required"). The SESSION admin's email — never a
+  // client-supplied name — with a `system:` actor only as the fallback, exactly
+  // as the staff-meal routes resolve their itemActor.
+  const resetActor = String(auth.user?.email || '').trim() || 'system:admin-reset';
 
   const body = await req.json().catch(() => ({}));
   if (body?.confirm !== 'RESET') {
@@ -199,6 +206,8 @@ export async function POST(req: Request) {
           source,
           referenceId: 'admin-reset',
           notes: note,
+          // Required by postDeptLedger; see resetActor at the top of POST.
+          user: resetActor,
         });
         posted += 1;
       }

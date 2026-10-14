@@ -67,6 +67,22 @@ import {
   gstValue, taxAppliedPercent, fmtTaxPercent, taxCsvNumber,
 } from '@/lib/tax-applied';
 
+/* TAX % APPLIED DIVIDES BY THE VALUE GST WAS CHARGED ON (owner's ruling,
+   2026-10-14): ACCEPTED qty × rate − discount, which is what every GST writer
+   taxes. The register's SUBTOTAL is RECEIVED × rate, so on a line with a
+   rejected quantity the old base read an 18% bill as 14.21% here while
+   /reports/purchase-log printed 18.00% for it. `gst_goods_value` comes off the
+   server (src/app/api/grn/route.ts GST_GOODS_VALUE_SQL — on the register rows
+   AND the drawer's line items, one fragment), and equals `subtotal` on every
+   line that rejected nothing and on a held line that has not been decided yet.
+   Only the RATE's base moves — SUBTOTAL and TOTAL INWARD print what they did.
+   Field-for-field the server CSV's own basis, so the screen, its footer, the
+   page's export and the server's file divide by the same rupees. */
+const gstRateBasis = (r: any) => ({
+  cgst: r.cgst, sgst: r.sgst, discount: r.discount,
+  subtotal: r.gst_goods_value ?? r.subtotal,
+});
+
 const fmt = (v: number) => '₹' + Math.round(v || 0).toLocaleString('en-IN');
 /** ₹ with 2 decimals — for the inward register (taxes/charges carry paise). */
 const m2 = (v: any) => '₹' + (Number(v) || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -802,9 +818,9 @@ export default function GrnPage() {
         'COMPENSATION CESS', 'SPECIAL EXCISE CESS', 'TCS', 'DELIVERY CHARGES', 'MRP ROUND OFF', 'TOTAL INWARD AMOUNT',
         'ACCEPTED QTY', 'REJECTED QTY', 'REJECT REASON', 'STATUS', 'RECEIVED BY', 'INVOICE DATE', 'BILL TYPE',
         // TAX VALUE (GST) is the 28th and TAX % APPLIED (GST) the 29th, APPENDED
-        // for the same reason BILL TYPE was. Both are DERIVED from columns
-        // already on the row (CGST + SGST, over SUBTOTAL − DISCOUNT, the base
-        // GST is charged on), which is why they go AFTER TOTAL INWARD AMOUNT and
+        // for the same reason BILL TYPE was. Both are DERIVED from the row's own
+        // figures (CGST + SGST, over the ACCEPTED goods value − DISCOUNT, the
+        // base GST is charged on — see gstRateBasis), which is why they go AFTER TOTAL INWARD AMOUNT and
         // not beside CGST: the total is footable from the columns to its left,
         // and a duplicate rupee column inside that run would let a reader adding
         // across the row count GST twice. Kept byte-identical to the server's
@@ -827,7 +843,7 @@ export default function GrnPage() {
         // arithmetic comes from the shared helper, so this file and the reports
         // that print the same figure cannot round differently.
         taxCsvNumber(gstValue(r)),
-        taxCsvNumber(taxAppliedPercent(r)),
+        taxCsvNumber(taxAppliedPercent(gstRateBasis(r))),
       ].map(clean).join(','));
       const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8;' });
       const url = URL.createObjectURL(blob); const a = document.createElement('a');
@@ -1866,9 +1882,10 @@ function GrnRow({ g, expanded, onToggle, isAdmin, canAmend, dataVersion, onEdit,
                     <th className="text-right py-1 px-2 font-medium text-[#af4408]">Total Inward</th>
                     {/* THE OWNER'S TWO TAX COLUMNS ("Ship B", 98e1be7), AFTER
                         Total Inward and not beside CGST. Both are DERIVED from
-                        cells already on this row — Tax Value is CGST + SGST, Tax %
-                        Applied is that pair over (Subtotal − Discount), the base
-                        GST is charged on — and the run of columns to the left of
+                        this row's own figures — Tax Value is CGST + SGST, Tax %
+                        Applied is that pair over (accepted goods − Discount), the
+                        base GST is charged on (gstRateBasis; equal to Subtotal on
+                        a line that rejected nothing) — and the run of columns to the left of
                         Total Inward has to keep adding up to it. Same position,
                         same wording and the same shared helper as the 28th and
                         29th columns of the register CSV. */}
@@ -1920,8 +1937,8 @@ function GrnRow({ g, expanded, onToggle, isAdmin, canAmend, dataVersion, onEdit,
                       <td className={`py-1 px-2 text-right font-mono border-l border-[#E8D5C4] ${gstValue(it) ? 'text-[#2D1B0E]' : muted}`}>
                         {gstValue(it) == null ? '—' : q2(gstValue(it))}
                       </td>
-                      <td className={`py-1 px-2 text-right font-mono ${taxAppliedPercent(it) == null ? muted : 'text-[#2D1B0E] font-semibold'}`}>
-                        {fmtTaxPercent(taxAppliedPercent(it))}
+                      <td className={`py-1 px-2 text-right font-mono ${taxAppliedPercent(gstRateBasis(it)) == null ? muted : 'text-[#2D1B0E] font-semibold'}`}>
+                        {fmtTaxPercent(taxAppliedPercent(gstRateBasis(it)))}
                       </td>
                       {/* Same rule as the list row's accepted-value cell: while
                           the receipt is held these are stored 0 because no
@@ -1975,7 +1992,11 @@ function GrnRow({ g, expanded, onToggle, isAdmin, canAmend, dataVersion, onEdit,
                         a.cgst += Number(it.cgst) || 0;
                         a.sgst += Number(it.sgst) || 0;
                         if (g > 0) {
-                          a.taxed_bill_value += (Number(it.subtotal) || 0) - (Number(it.discount) || 0);
+                          // The value GST was CHARGED on (accepted goods −
+                          // discount), the same base as the line cell above —
+                          // not the printed Subtotal, which is what ARRIVED.
+                          const b = gstRateBasis(it);
+                          a.taxed_bill_value += (Number(b.subtotal) || 0) - (Number(b.discount) || 0);
                           a.taxed_lines += 1;
                         }
                         return a;
