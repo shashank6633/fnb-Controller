@@ -280,8 +280,12 @@ function SummaryCards({ summary }: { summary: Summary }) {
         <div className="flex flex-wrap items-baseline justify-between gap-2 mb-2">
           <h3 className="text-sm font-semibold text-[#2D1B0E]">By category</h3>
           <span className="text-xs text-[#6B5744]">
+            {/* Two bases in one ratio, said out loud: the numerator is the LANDED
+                value frozen at issue, the denominator the store's RECORDED inflow
+                (rate paid, before levies). Reconciliation §H puts value and % on
+                one basis and states this page's figure beside its own. */}
             {summary.pct_of_purchases != null
-              ? `${summary.pct_of_purchases}% of purchases (${inr(summary.purchases_value)}) in range`
+              ? `${summary.pct_of_purchases}% of purchases in range — the landed value issued ÷ the recorded purchase value ${inr(summary.purchases_value)} (store ledger at recorded cost, no levies)`
               : 'No purchases recorded in range'}
           </span>
         </div>

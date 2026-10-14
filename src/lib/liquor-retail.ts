@@ -77,10 +77,59 @@ const COUNTED_UNITS = new Set([
  * stock in central current_stock; it stays readable (material and outlet are
  * read off it, backfilled by db.ts from its purchase), and nothing new is ever
  * written that way.
+ *
+ * ── A BUY THE COUNT ALREADY HOLDS IS COST ONLY (owner ruling 39, 2026-10-14) ─
+ * A store count's variance is FROZEN when the count is saved: approveVariance()
+ * posts the stored figure, it never re-works it. A wine-shop buy typed AFTER a
+ * count that already found its bottles on the shelf (the usual order for an
+ * emergency run made during service and keyed in next morning) would land on
+ * top of that count's excess and book the same bottles twice. Measured on a
+ * copy: count +2 BTL pending, buy typed → book 4500, approve → 6000 against a
+ * shelf of 4500; with the auto-apply bar on the count applied itself, the late
+ * buy added +2 BTL and the next count wrote off a phantom −2 BTL.
+ *
+ * So a buy dated ON OR BEFORE a saved count of the same item at the same store
+ * whose variance is PENDING or APPLIED (by a person, or by the bar at count
+ * time) is refused FOR STOCK and kept as a COST-ONLY record — the same
+ * variance_approvals test withdrawals use (liquor-withdrawals.ts countConflict,
+ * codes count_pending / count_applied). The money side is untouched: the flag,
+ * the rate paid, the frozen excess and the claim are written exactly as for any
+ * buy, because the money really was spent. Only the store_stock_ledger row is
+ * not written; the bottles reach the book through the count (applied: already
+ * there; pending: when approved; rejected afterwards: through the next count
+ * that finds them on the shelf).
+ *   · A count that MATCHED the book has no approval row and is NOT a conflict.
+ *     The shelf held these bottles and the book did not, yet they agreed — so
+ *     an equal quantity left unrecorded. Booking the buy is what surfaces that
+ *     real loss on the next count; it is not a second copy of the bottles.
+ *   · A REJECTED count moved nothing, so it is not a conflict either.
+ * The flag still needs an anchor (the lq_retail_flags CHECK: purchase_id, or
+ * material_id AND ledger_id). A cost-only buy made no ledger row, so its
+ * ledger_id is the COUNT it deferred to — `count:<count date>:<flag id>`
+ * (COST_ONLY_ANCHOR_PREFIX). ledger_id has no FK and no reader joins it; every
+ * reader in this file reports such a row as cost_only with ledger_id null, so
+ * nothing downstream can mistake the anchor for a ledger row.
  */
 
 const r2 = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
 const r4 = (n: number) => Math.round((Number(n) || 0) * 1e4) / 1e4;
+
+/** lq_retail_flags.ledger_id on a COST-ONLY buy starts with this — the anchor
+ *  is the count the buy deferred to, not a ledger row (see the header). */
+export const COST_ONLY_ANCHOR_PREFIX = 'count:';
+
+/** true when a flag's ledger_id is a cost-only anchor (no stock was booked). */
+export function isCostOnlyAnchor(ledgerId: unknown): boolean {
+  return typeof ledgerId === 'string' && ledgerId.startsWith(COST_ONLY_ANCHOR_PREFIX);
+}
+
+/** The count date a cost-only anchor names (`count:<YYYY-MM-DD>:<flag id>`),
+ *  or null when the anchor is not a cost-only one / carries no real date. */
+export function costOnlyCountDate(ledgerId: unknown): string | null {
+  if (!isCostOnlyAnchor(ledgerId)) return null;
+  const d = String(ledgerId).slice(COST_ONLY_ANCHOR_PREFIX.length, COST_ONLY_ANCHOR_PREFIX.length + 10);
+  return isRealDate(d) ? d : null;
+}
 
 /**
  * A refusal the CALLER caused, carrying the HTTP status it deserves.
@@ -234,19 +283,61 @@ export interface RecordWineShopInput {
   notes?: string;
   outletId: string | null;
   storeId: string;
+  /**
+   * May the DUPLICATE refusal quote the earlier buy's bottles and rate paid?
+   * Pass true for management only (the route passes isManagement). A colleague's
+   * retail rate is §E money, read on the management-only register, and the
+   * duplicate key (material, shop, bill no., date) is on the store ledger every
+   * can_procure user reads — so quoting it handed that money to bar staff.
+   * Fail closed: anything but true withholds, except that a caller is always
+   * told the figures of a buy THEY recorded (their own input).
+   */
+  revealOtherBuyFigures?: boolean;
+  /**
+   * May the COST-ONLY sentence state the count's status and variance? Admin
+   * only (pass role === 'admin'): BLIND COUNTS — a count's system figure and
+   * variance are admin-only on every surface (stores/[id]/closing returns them
+   * as null to everyone else), and a variance in bottles re-derives the system
+   * figure. Fail closed.
+   */
+  revealCountFigures?: boolean;
+}
+
+/** Why a buy was kept as COST ONLY (ruling 39) — the count that already holds it. */
+export interface WineShopStockRefusal {
+  /** The withdrawal rule's own codes: the count is applied, or awaiting approval. */
+  code: 'count_applied' | 'count_pending';
+  /** The code this VIEWER may be told: the status for an admin, 'counted' otherwise. */
+  viewerCode: 'count_applied' | 'count_pending' | 'counted';
+  /** The count's business date (YYYY-MM-DD). */
+  countDate: string;
+  /** When that count was last saved, IST 'YYYY-MM-DD HH:MM' ('' if unknown). */
+  countSavedAt: string;
+  /** variance_approvals.id of that count. */
+  approvalId: string;
+  autoApplied: boolean;
+  /** Signed variance in purchase units ('+2 BTL'). ADMIN-ONLY — blind counts. */
+  varianceText: string;
+  /** The sentence for THIS viewer (count status/variance only when revealCountFigures). */
+  message: string;
 }
 
 export interface WineShopRecordResult {
   /** Always null on a new buy — no central purchases row is written (see header). */
   purchaseId: null;
   flagId: string;
-  /** The store_stock_ledger 'inward' row that moved the stock. */
-  ledgerId: string;
+  /** The store_stock_ledger 'inward' row that moved the stock; null on a
+   *  COST-ONLY buy (stockBooked false — no ledger row was written). */
+  ledgerId: string | null;
   /** The store the bottles were booked into (the material's own store). */
   storeId: string;
   storeName: string;
-  /** Recipe units added to that store's ledger. */
+  /** Recipe units added to that store's ledger (0 on a COST-ONLY buy). */
   stockQty: number;
+  /** false → COST ONLY: a saved count already holds these bottles (ruling 39). */
+  stockBooked: boolean;
+  /** Present exactly when stockBooked is false. */
+  stockRefusal?: WineShopStockRefusal;
   depotLandedPerBottle: number;
   depotSource: DepotLandedResolved['source'];
   depotDetail: string;
@@ -402,7 +493,7 @@ export function recordWineShopPurchase(
   // its parent purchases row — COALESCE reads either, so a retry of a buy first
   // recorded under the old design is still caught.
   const dupe = db.prepare(`
-    SELECT f.id, f.bottles, f.rate_paid_per_bottle, f.date, f.bill_ref
+    SELECT f.id, f.bottles, f.rate_paid_per_bottle, f.date, f.bill_ref, f.recorded_by
       FROM lq_retail_flags f
       LEFT JOIN purchases p ON p.id = f.purchase_id
      WHERE COALESCE(f.material_id, p.material_id) = ?
@@ -420,10 +511,25 @@ export function recordWineShopPurchase(
       : [input.materialId, input.date, input.outletId, shopName.trim().toLowerCase(), bottles, rate]),
   ) as any;
   if (dupe) {
+    // THE EARLIER BUY'S FIGURES ARE QUOTED ONLY TO WHOEVER MAY READ THEM. The
+    // bill-number match is keyed on facts every can_procure user reads off the
+    // store ledger (material, shop = supplier, bill = ref, date), so quoting the
+    // matched row's bottles and rate paid handed a COLLEAGUE's retail price to
+    // bar staff outside management — the same leak the PATCH path closed by
+    // returning the excess to management only (retail/[id]/route.ts). The rate
+    // paid is §E money, shown on the management-only register. The caller's OWN
+    // earlier buy is still quoted: those figures are their own input.
+    // (The blank-bill branch below quotes only the caller's own figures — its
+    // match requires the same bottles and rate the caller just sent.)
+    const ownBuy = String(dupe.recorded_by || '').trim().toLowerCase() === String(actorEmail || '').trim().toLowerCase()
+      && String(actorEmail || '').trim() !== '';
+    const quoteDupe = input.revealOtherBuyFigures === true || ownBuy;
     throw new RetailError(
       billRef
-        ? `"${mat.name}" is already recorded on wine-shop bill ${billRef} from ${shopName || 'this shop'} dated ${input.date} `
-          + `— ${dupe.bottles} ${purchaseUnitLabel} at ${fmtRs(toPaise(Number(dupe.rate_paid_per_bottle)))} each. `
+        ? `"${mat.name}" is already recorded on wine-shop bill ${billRef} from ${shopName || 'this shop'} dated ${input.date}`
+          + (quoteDupe
+            ? ` — ${dupe.bottles} ${purchaseUnitLabel} at ${fmtRs(toPaise(Number(dupe.rate_paid_per_bottle)))} each. `
+            : ' (its bottles and rate paid are on the Wine-shop buys register, which management can open). ')
           + `Nothing was saved; if you are re-trying after a failed save, that buy is already in.`
         : `An identical wine-shop buy (${bottles} ${purchaseUnitLabel} × "${mat.name}" at ${fmtRs(toPaise(rate))} each from ${shopName || 'this shop'} on ${input.date}) `
           + `was recorded moments ago. Nothing was saved. If the bottles really were bought twice, enter the shop's bill number to record the second run.`,
@@ -435,58 +541,130 @@ export function recordWineShopPurchase(
   let ledgerId = '';
   const today = todayIST();
 
-  const run = db.transaction(() => {
-    // 1. THE STOCK MOVEMENT — ONE row on the store's own ledger, where Liquor
-    //    Store on-hand, withdrawals and closing counts read it. 'inward' (not
-    //    'purchase', which every DEPOT reader keys on) and unit_cost 0 (so every
-    //    store valuation keeps its existing basis) — see the header. Nothing
-    //    central moves: no purchases row, no inventory_transactions, no
-    //    current_stock, no price column. postLedger is the only door stock uses.
-    //
-    //    MOVEMENT RECORD: still a VENDOR receipt (the shop is the source, the
-    //    store the destination) on the buy's own business date. SPREAD IN, NOT
-    //    WRITTEN AS LITERAL KEYS, on purpose: counterparty and txn_date belong to
-    //    the store-rail movement-record work in store-engine.ts, which is NOT part
-    //    of Liquor Reconciliation and ships on its own. With that work in,
-    //    postLedger writes both into the movement columns. Without it
-    //    (production store-engine) LedgerEntry has neither field and the rail has
-    //    no column for them, so postLedger ignores them and nothing else about
-    //    the row changes; the stock DATE never depends on txn_date, because the
-    //    backdate below sets created_at itself. As literal keys they failed
-    //    type-checking against production store-engine (TS2353 'counterparty'),
-    //    which tied a liquor ship to those non-liquor hunks.
-    const movementRecord = {
-      counterparty: vendorParty(shopName || 'wine shop'),
-      txn_date: input.date,
+  /* ── ALREADY COUNTED? (ruling 39 — see the header) ──────────────────────────
+   * The statement is prepared here and RUN INSIDE the IMMEDIATE transaction
+   * below, exactly as liquor-withdrawals.ts runs its countConflictStmt: a count
+   * saved by another process cannot slip in between the check and the write.
+   * Same predicate as the withdrawal rule: this store, this item, a count dated
+   * ON OR AFTER the buy's date, status pending or approved (approved includes a
+   * count the bar applied at save time — auto_applied 1). An applied count is
+   * named first: it is the one that already put the bottles on the book. */
+  const countConflictStmt = db.prepare(`
+    SELECT va.id, va.date, va.status, va.variance, va.auto_applied,
+           COALESCE(
+             (SELECT strftime('%Y-%m-%d %H:%M', c.created_at, '+330 minutes')
+                FROM store_closing_counts c
+               WHERE c.store_id = va.store_id AND c.material_id = va.material_id AND c.date = va.date
+               LIMIT 1),
+             strftime('%Y-%m-%d %H:%M', va.created_at, '+330 minutes'),
+             ''
+           ) AS saved_at
+      FROM variance_approvals va
+     WHERE va.source = 'liquor' AND va.store_id = ? AND va.material_id = ? AND va.date >= ?
+       AND va.status IN ('pending', 'approved')
+     ORDER BY CASE va.status WHEN 'approved' THEN 0 ELSE 1 END, va.date DESC, va.created_at DESC
+     LIMIT 1
+  `);
+  const revealCount = input.revealCountFigures === true;
+  const stockRefusalFor = (
+    c: { id: string; date: string; status: string; variance: number; auto_applied: number; saved_at: string },
+  ): WineShopStockRefusal => {
+    const pf = packFactor(mat) || 1;
+    const v = Number(c.variance) || 0;
+    const varianceText = `${v > 0 ? '+' : v < 0 ? '−' : ''}${Math.round((Math.abs(v) / pf) * 1000) / 1000} ${purchaseUnitLabel}`;
+    const code: WineShopStockRefusal['code'] = c.status === 'approved' ? 'count_applied' : 'count_pending';
+    const auto = Number(c.auto_applied) === 1;
+    const savedAt = String(c.saved_at || '');
+    // What the count did — ADMIN ONLY (blind counts: status and variance reveal
+    // the system figure). Everyone else is told which count, and when.
+    const how = !revealCount
+      ? ' The bottles reach the book through that count, never through this buy.'
+      : code === 'count_applied'
+        ? ` That count has already been applied (${varianceText}${auto ? ', applied at count time under the variance bar' : ''}), `
+          + 'so the book was set to what was on the shelf — these bottles included.'
+        : ` That count is waiting in Variance Approvals (${varianceText}); approving it puts these bottles on the book. `
+          + 'If it is rejected instead, the next count that finds them on the shelf carries them.';
+    const message =
+      `Recorded as COST ONLY — no stock was added. ${store.name}'s closing count of ${mat.name} for ${c.date}`
+      + `${savedAt ? ` (saved ${savedAt} IST)` : ''} already includes these bottles, so adding them to the book as well `
+      + `would count them twice.${how} `
+      + `The money side — ${fmtRs(toPaise(totalPaid))} paid, who paid it and any claim — is recorded as usual. `
+      + `If the bottles were in fact bought after that count was taken, the next count finds them and puts them on the book; `
+      + `do not record this buy again.`;
+    return {
+      code, viewerCode: revealCount ? code : 'counted',
+      countDate: String(c.date), countSavedAt: savedAt, approvalId: String(c.id),
+      autoApplied: auto, varianceText, message,
     };
-    ledgerId = postLedger(db, {
-      store_id: input.storeId,
-      material_id: input.materialId,
-      txn_type: 'inward',
-      quantity: stockQty,
-      unit_cost: 0,
-      supplier: shopName,
-      ref: billRef,
-      notes: `Emergency wine-shop buy${shopName ? ` from ${shopName}` : ''} — retail price is on the wine-shop register (lq_retail_flags ${flagId}), never a cost basis`.slice(0, 500),
-      created_by: actorEmail,
-      ...movementRecord,
-    });
-    // BACKDATE, IST-exact. Every IST-day reader of this ledger (floor
-    // reconciliation, the §H denominator, depot spend) buckets on
-    // date(created_at, '+330 minutes'). A buy keyed in today for yesterday must
-    // land on yesterday: the instant is the buy's date at the current IST
-    // time-of-day, converted back to UTC, so its IST day is exactly input.date.
-    if (input.date !== today) {
-      db.prepare(`
-        UPDATE store_stock_ledger
-           SET created_at = datetime(? || ' ' || strftime('%H:%M:%S', 'now', '+330 minutes'), '-330 minutes')
-         WHERE id = ?
-      `).run(input.date, ledgerId);
+  };
+  let stockRefusal: WineShopStockRefusal | undefined;
+
+  const run = db.transaction(() => {
+    // 0. ALREADY COUNTED → COST ONLY. Decided inside the write lock. Nothing
+    //    else about the record changes: the flag, its frozen excess, the claim
+    //    and the audit row are written below exactly as for a booked buy.
+    const conflict = countConflictStmt.get(input.storeId, input.materialId, input.date) as
+      { id: string; date: string; status: string; variance: number; auto_applied: number; saved_at: string } | undefined;
+    stockRefusal = conflict ? stockRefusalFor(conflict) : undefined;
+
+    if (stockRefusal) {
+      // No ledger row. The anchor names the count the buy deferred to (the
+      // lq_retail_flags CHECK needs one); see COST_ONLY_ANCHOR_PREFIX.
+      ledgerId = `${COST_ONLY_ANCHOR_PREFIX}${stockRefusal.countDate}:${flagId}`;
+    } else {
+      // 1. THE STOCK MOVEMENT — ONE row on the store's own ledger, where Liquor
+      //    Store on-hand, withdrawals and closing counts read it. 'inward' (not
+      //    'purchase', which every DEPOT reader keys on) and unit_cost 0 (so every
+      //    store valuation keeps its existing basis) — see the header. Nothing
+      //    central moves: no purchases row, no inventory_transactions, no
+      //    current_stock, no price column. postLedger is the only door stock uses.
+      //
+      //    MOVEMENT RECORD: still a VENDOR receipt (the shop is the source, the
+      //    store the destination) on the buy's own business date. SPREAD IN, NOT
+      //    WRITTEN AS LITERAL KEYS, on purpose: counterparty and txn_date belong to
+      //    the store-rail movement-record work in store-engine.ts, which is NOT part
+      //    of Liquor Reconciliation and ships on its own. With that work in,
+      //    postLedger writes both into the movement columns. Without it
+      //    (production store-engine) LedgerEntry has neither field and the rail has
+      //    no column for them, so postLedger ignores them and nothing else about
+      //    the row changes; the stock DATE never depends on txn_date, because the
+      //    backdate below sets created_at itself. As literal keys they failed
+      //    type-checking against production store-engine (TS2353 'counterparty'),
+      //    which tied a liquor ship to those non-liquor hunks.
+      const movementRecord = {
+        counterparty: vendorParty(shopName || 'wine shop'),
+        txn_date: input.date,
+      };
+      ledgerId = postLedger(db, {
+        store_id: input.storeId,
+        material_id: input.materialId,
+        txn_type: 'inward',
+        quantity: stockQty,
+        unit_cost: 0,
+        supplier: shopName,
+        ref: billRef,
+        notes: `Emergency wine-shop buy${shopName ? ` from ${shopName}` : ''} — retail price is on the wine-shop register (lq_retail_flags ${flagId}), never a cost basis`.slice(0, 500),
+        created_by: actorEmail,
+        ...movementRecord,
+      });
+      // BACKDATE, IST-exact. Every IST-day reader of this ledger (floor
+      // reconciliation, the §H denominator, depot spend) buckets on
+      // date(created_at, '+330 minutes'). A buy keyed in today for yesterday must
+      // land on yesterday: the instant is the buy's date at the current IST
+      // time-of-day, converted back to UTC, so its IST day is exactly input.date.
+      if (input.date !== today) {
+        db.prepare(`
+          UPDATE store_stock_ledger
+             SET created_at = datetime(? || ' ' || strftime('%H:%M:%S', 'now', '+330 minutes'), '-330 minutes')
+           WHERE id = ?
+        `).run(input.date, ledgerId);
+      }
     }
 
     // 2. THE SIDE RECORD — the flag. The ONLY place the retail ₹ is written. It
-    //    names the stock movement (ledger_id) rather than repeating it. The four
-    //    excess figures are frozen above.
+    //    names the stock movement (ledger_id) rather than repeating it — or, on
+    //    a COST-ONLY buy, the count that holds the bottles. The four excess
+    //    figures are frozen above, for both kinds: the money was spent either way.
     db.prepare(`
       INSERT INTO lq_retail_flags
         (id, purchase_id, material_id, ledger_id, outlet_id, bill_ref, date, shop_name, shop_licence_no, bottles,
@@ -510,8 +688,19 @@ export function recordWineShopPurchase(
       actor_email: actorEmail,
       outlet_id: input.outletId,
       after: {
-        ledger_id: ledgerId, store_id: input.storeId, store: store.name,
-        material_id: input.materialId, material: mat.name, stock_qty: stockQty, recipe_unit: mat.unit,
+        ledger_id: stockRefusal ? null : ledgerId, store_id: input.storeId, store: store.name,
+        material_id: input.materialId, material: mat.name, stock_qty: stockRefusal ? 0 : stockQty, recipe_unit: mat.unit,
+        // Ruling 39: the full facts of the count the buy deferred to. /audit is
+        // admin-only, so the count's status and variance may be stated here.
+        stock_booked: !stockRefusal,
+        ...(stockRefusal ? {
+          cost_only: {
+            anchor: ledgerId, code: stockRefusal.code, count_date: stockRefusal.countDate,
+            count_saved_at_ist: stockRefusal.countSavedAt, approval_id: stockRefusal.approvalId,
+            auto_applied: stockRefusal.autoApplied, variance: stockRefusal.varianceText,
+            bottles_not_booked: bottles, qty_not_booked: stockQty,
+          },
+        } : {}),
         brand: String(input.brand || '').slice(0, 200) || undefined, notes: String(input.notes || '').slice(0, 500) || undefined,
         bottles, rate_paid_per_bottle: rate, total_paid: totalPaid,
         depot_landed_per_bottle: depotPerBottle, depot_source: depot.source,
@@ -525,7 +714,12 @@ export function recordWineShopPurchase(
       // brand is bought by the case, and scripts/check-rate-basis.js refuses it.
       // rate-basis: purchase   (₹ per purchase unit, beside a purchase-unit qty)
       note: `Emergency wine-shop buy: ${bottles} ${purchaseUnitLabel} × ${mat.name} @ ${fmtRs(toPaise(rate))} per ${purchaseUnitLabel} from ${input.shopName || 'wine shop'}`
-        + (depotPerBottle > 0 ? ` — excess ${fmtRs(toPaise(excess.excessTotal))} (${excess.excessPct}%)` : ' — depot rate unknown'),
+        + (depotPerBottle > 0 ? ` — excess ${fmtRs(toPaise(excess.excessTotal))} (${excess.excessPct}%)` : ' — depot rate unknown')
+        + (stockRefusal
+          ? ` — COST ONLY, no stock added: ${store.name}'s ${stockRefusal.countDate} count`
+            + `${stockRefusal.countSavedAt ? ` (saved ${stockRefusal.countSavedAt} IST)` : ''} already holds these bottles`
+            + ` (${stockRefusal.code === 'count_applied' ? 'applied' : 'pending'}, ${stockRefusal.varianceText})`
+          : ''),
     });
   });
   // IMMEDIATE, not the default deferred BEGIN — the same rule the two sibling
@@ -548,7 +742,13 @@ export function recordWineShopPurchase(
     : undefined;
 
   return {
-    purchaseId: null, flagId, ledgerId, storeId: input.storeId, storeName: store.name, stockQty,
+    purchaseId: null, flagId,
+    // A cost-only anchor is never handed out as a ledger id.
+    ledgerId: stockRefusal ? null : ledgerId,
+    storeId: input.storeId, storeName: store.name,
+    stockQty: stockRefusal ? 0 : stockQty,
+    stockBooked: !stockRefusal,
+    ...(stockRefusal ? { stockRefusal } : {}),
     depotLandedPerBottle: depotPerBottle, depotSource: depot.source, depotDetail: depot.detail,
     excess, totalPaid,
     ...(notice ? { notice } : {}),
@@ -933,8 +1133,14 @@ export interface RetailFlagRow {
   id: string;
   /** LEGACY anchor only (a flag written by the first version); null on new rows. */
   purchase_id: string | null;
-  /** The store_stock_ledger 'inward' row that moved the stock (new rows). */
+  /** The store_stock_ledger 'inward' row that moved the stock (new rows).
+   *  null on a COST-ONLY buy — it moved no stock (cost_only). */
   ledger_id: string | null;
+  /** true → no stock was booked: a saved count already held these bottles
+   *  (ruling 39). The money figures below are recorded as for any buy. */
+  cost_only: boolean;
+  /** The count date a cost-only buy deferred to; null otherwise. */
+  cost_only_count_date: string | null;
   bill_ref: string;
   date: string;
   shop_name: string;
@@ -1076,8 +1282,13 @@ export function retailExcessSummary(
     const reopened = status === 'reimbursed' && !f.petty_cash_id;
     if (reopened) reopenedClaimCount += 1;
     if (status === 'claimed_pending' || reopened) unreimbursedStaffSpend += paid;
+    // A cost-only anchor is reported as what it is, never as a ledger id. A
+    // LEGACY row (purchase_id set) is never cost-only — its stock went central.
+    const costOnly = !f.purchase_id && isCostOnlyAnchor(f.ledger_id);
     return {
-      id: f.id, purchase_id: f.purchase_id ?? null, ledger_id: f.ledger_id ?? null, bill_ref: f.bill_ref, date: f.date,
+      id: f.id, purchase_id: f.purchase_id ?? null, ledger_id: costOnly ? null : (f.ledger_id ?? null),
+      cost_only: costOnly, cost_only_count_date: costOnly ? costOnlyCountDate(f.ledger_id) : null,
+      bill_ref: f.bill_ref, date: f.date,
       shop_name: f.shop_name, shop_licence_no: f.shop_licence_no, bottles,
       rate_paid_per_bottle: Number(f.rate_paid_per_bottle) || 0, depot_landed_per_bottle: depot,
       excess_per_bottle: Number(f.excess_per_bottle) || 0, excess_total: Number(f.excess_total) || 0,

@@ -5,8 +5,10 @@
  * Plan: docs/liquor-reconciliation-plan.md § "Phase L2". API: /api/liquor/wallet.
  *
  * The workbook's Portal Wallet sheet, live: the ledger with a running balance,
- * Summary check A (computed vs what the portal shows) and Summary §A2 (the
- * top-up planner).
+ * Summary check A (computed vs what the portal shows), the reading Summary
+ * check B needs (one indent's value on the portal vs its recorded Net Indent —
+ * POST /api/liquor/wallet/portal-check with kind 'indent_value') and Summary
+ * §A2 (the top-up planner).
  *
  * FOUR THINGS THIS PAGE REFUSES TO DO
  *   1. Show a stored balance. There is no balance column in lq_wallet_txns and
@@ -87,6 +89,21 @@ interface PortalCheck {
   difference: number; difference_direction: string; matched: boolean; source: string;
   note: string; observed_by: string; replaced_amount?: number | null;
 }
+/** Summary check B's input — ONE indent's value as the portal shows it
+ *  (GET/POST /api/liquor/wallet/portal-check, kind 'indent_value'). Mirrors
+ *  IndentPortalCheckResult in src/lib/liquor-wallet.ts. */
+interface IndentCheck {
+  id: string; as_of_date: string; reference: string; portal_amount: number;
+  /** The recorded indent compared against; null when no recorded bill carries the number yet. */
+  matched_invoice_ref: string | null; store: string | null;
+  net_indent_value: number | null;
+  /** portal − recorded Net Indent; null when there is nothing on record to compare. */
+  difference: number | null; difference_direction: string;
+  /** null = no recorded indent to compare against (not a pass, not a fail). */
+  matched: boolean | null;
+  warning: string | null; register_ref: string | null;
+  source: string; note: string; observed_by: string; replaced_amount?: number | null;
+}
 interface Integrity {
   missing: Array<{ source_ref: string; invoice_ref: string; date: string; net_indent_value: number; store: string; failure?: string | null }>;
   mismatched: Array<{ id: string; reference: string; debit: number; net_indent_value: number; diff: number; hand_entered?: boolean }>;
@@ -135,6 +152,12 @@ export default function LiquorWalletPage() {
   const [from, setFrom] = useState('');
   const [to, setTo] = useState('');
   const [planned, setPlanned] = useState('');
+  /* Check B's readings. The wallet GET carries only the balance readings
+     (check A), so the per-indent ones are read from the portal-check route,
+     which re-compares each against the indent's CURRENT Net Indent. A failure
+     here is said on the panel; it never takes the wallet down. */
+  const [indentChecks, setIndentChecks] = useState<IndentCheck[]>([]);
+  const [indentChecksErr, setIndentChecksErr] = useState('');
 
   const load = useCallback(async (f?: string, t?: string, p?: string) => {
     setLoading(true); setErr('');
@@ -143,12 +166,22 @@ export default function LiquorWalletPage() {
       if (f) q.set('from', f);
       if (t) q.set('to', t);
       if (p) q.set('planned', p);
-      const r = await fetch('/api/liquor/wallet' + (q.toString() ? '?' + q.toString() : ''), { credentials: 'same-origin' });
+      const [r, rc] = await Promise.all([
+        fetch('/api/liquor/wallet' + (q.toString() ? '?' + q.toString() : ''), { credentials: 'same-origin' }),
+        fetch('/api/liquor/wallet/portal-check', { credentials: 'same-origin' }).catch(() => null),
+      ]);
       const j = await r.json();
       if (!r.ok) { setErr(j.error || `HTTP ${r.status}`); setData(null); return; }
       setData(j);
       if (!f) setFrom(j.range.from);
       if (!t) setTo(j.range.to);
+      const jc = rc ? await rc.json().catch(() => null) : null;
+      if (rc && rc.ok && jc && Array.isArray(jc.indent_checks)) {
+        setIndentChecks(jc.indent_checks); setIndentChecksErr('');
+      } else {
+        setIndentChecks([]);
+        setIndentChecksErr(jc?.error || (rc ? `HTTP ${rc.status}` : 'network error'));
+      }
     } catch (e: any) {
       setErr(e?.message || 'Could not load the wallet.');
     } finally { setLoading(false); }
@@ -217,6 +250,9 @@ export default function LiquorWalletPage() {
               <TopUpPanel data={data} planned={planned} setPlanned={setPlanned}
                           onReload={(p) => load(from, to, p)} onStepSaved={(m) => { setNotice(m); reload(); }} onError={setErr} />
             </div>
+
+            <IndentCheckPanel data={data} checks={indentChecks} checksError={indentChecksErr}
+                              onSaved={(m) => { setNotice(m); reload(); }} onError={setErr} />
 
             <RecordPanel data={data} onSaved={(m) => { setNotice(m); reload(); }} onError={setErr} />
 
@@ -296,7 +332,9 @@ function PortalCheckPanel(
     try {
       const r = await api('/api/liquor/wallet/portal-check', {
         method: 'POST',
-        body: { as_of_date: asOf, portal_amount: Number(amount), source, note },
+        // Named, not left to the route's default: this form is the BALANCE
+        // reading. Check B's per-indent figure has its own form below.
+        body: { kind: 'wallet_balance', as_of_date: asOf, portal_amount: Number(amount), source, note },
       });
       const j = await r.json();
       if (!r.ok) { onError(j.error || `HTTP ${r.status}`); return; }
@@ -403,6 +441,192 @@ function PortalCheckPanel(
                   <td className="text-right">{rs(c.computed_balance)}</td>
                   <td className={`text-right font-semibold ${c.matched ? 'text-emerald-700' : 'text-amber-700'}`}>
                     {c.matched ? '—' : rs(c.difference)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ── Summary check B: one indent's value, portal vs recorded Net Indent ──────
+   The per-indent reading check B waits on. Nothing else in the app writes a
+   kind 'indent_value' row: the check A form above posts the wallet BALANCE,
+   and a per-indent figure filed there would be read as that day's balance
+   (that is why the route now refuses to guess a kind). Like check A it is an
+   OBSERVATION in lq_portal_checks: it moves no money and never edits the
+   indent's recorded Net Indent. One reading per indent per day — saving the
+   same indent and date again replaces the figure. */
+function IndentCheckPanel(
+  { data, checks, checksError, onSaved, onError }: {
+    data: WalletData; checks: IndentCheck[]; checksError: string;
+    onSaved: (m: string) => void; onError: (m: string) => void;
+  },
+) {
+  const [reference, setReference] = useState('');
+  const [asOf, setAsOf] = useState(data.today);
+  const [amount, setAmount] = useState('');
+  const [source, setSource] = useState('indent PDF');
+  const [note, setNote] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [last, setLast] = useState<IndentCheck | null>(null);
+
+  /* Indent numbers to pick from: the debits in this window and the recorded
+     indents that have none. A suggestion only — the field takes any number,
+     because a reading may be taken off the portal before the bill is keyed. */
+  const suggestions = useMemo(() => {
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const v of [
+      ...data.rows.filter(r => r.type === 'indent_debit').map(r => r.reference),
+      ...data.integrity.missing.map(m => m.invoice_ref),
+    ]) {
+      const s = String(v || '').trim();
+      if (s && !seen.has(s.toLowerCase())) { seen.add(s.toLowerCase()); out.push(s); }
+    }
+    return out.slice(0, 200);
+  }, [data.rows, data.integrity.missing]);
+
+  const save = async () => {
+    setBusy(true); onError('');
+    try {
+      const r = await api('/api/liquor/wallet/portal-check', {
+        method: 'POST',
+        body: {
+          kind: 'indent_value', reference: reference.trim(), as_of_date: asOf,
+          portal_amount: Number(amount), source, note,
+        },
+      });
+      const j = await r.json();
+      if (!r.ok) { onError(j.error || `HTTP ${r.status}`); return; }
+      const c = j.check as IndentCheck;
+      setLast(c);
+      setAmount('');
+      onSaved(
+        (c.matched === null
+          ? `Indent reading saved for ${c.reference} — no recorded indent to compare it with yet.`
+          : c.matched
+            ? `Indent reading saved — ${c.reference}: the portal and the recorded Net Indent agree at ${rs(c.portal_amount)}.`
+            : `Indent reading saved — ${c.reference}: the portal shows ${rs(c.portal_amount)}, the recorded Net Indent is ${rs(c.net_indent_value)}.`)
+        + (c.replaced_amount === null || c.replaced_amount === undefined
+          ? ''
+          : ` It REPLACED the earlier reading of ${rs(c.replaced_amount)} for ${c.reference} on ${c.as_of_date} — one reading is kept per indent per day.`),
+      );
+    } catch (e: any) { onError(e?.message || 'Could not save the indent reading.'); }
+    finally { setBusy(false); }
+  };
+
+  // As on check A: the receipt is the moment of saving; the list is re-compared
+  // on every load (a corrected levy changes the Net Indent), so prefer it.
+  const lastLive = last ? (checks.find(c => c.id === last.id) || last) : null;
+  const recent = checks.slice(0, 8);
+
+  return (
+    <div className="rounded-xl border border-[#E8D5C4] bg-white p-4 space-y-3" data-panel="check-b">
+      <div className="flex items-center gap-2">
+        <ScrollText className="w-5 h-5 text-[#af4408]" />
+        <h2 className="font-semibold text-[#2D1B0E]">Check B — one indent: the portal vs its recorded Net Indent</h2>
+      </div>
+      <p className="text-xs text-[#8B7355]">
+        Type the value the TGBCL portal (or the indent PDF) shows for <span className="font-medium">one indent</span>.
+        It is compared with that indent&apos;s recorded Net Indent (invoice value + the four TGBCL levies) and kept as an
+        observation — it <span className="font-medium">moves no money</span> and does not change the recorded bill.
+        The difference is <span className="font-medium">the portal MINUS the recorded Net Indent</span>. The wallet
+        balance goes in check A, not here. One reading is kept per indent per day.
+      </p>
+
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
+        <label className="text-xs text-[#6B5744] flex flex-col gap-1 lg:col-span-2">
+          Indent number
+          <input value={reference} onChange={e => setReference(e.target.value)} list="lq-indent-refs"
+            placeholder="e.g. IND/2026/10/0457"
+            className="px-3 py-2 border border-[#D4B896] rounded-lg bg-white text-sm" />
+          <datalist id="lq-indent-refs">
+            {suggestions.map(s => <option key={s} value={s} />)}
+          </datalist>
+        </label>
+        <label className="text-xs text-[#6B5744] flex flex-col gap-1">
+          As at
+          <input type="date" value={asOf} max={data.today} onChange={e => setAsOf(e.target.value)}
+            className="px-3 py-2 border border-[#D4B896] rounded-lg bg-white text-sm" />
+        </label>
+        <label className="text-xs text-[#6B5744] flex flex-col gap-1">
+          Indent value on the portal (₹)
+          <input type="number" step="0.01" min="0" value={amount} onChange={e => setAmount(e.target.value)}
+            placeholder="e.g. 105450.60"
+            className="px-3 py-2 border border-[#D4B896] rounded-lg bg-white text-sm" />
+        </label>
+        <label className="text-xs text-[#6B5744] flex flex-col gap-1">
+          Read from
+          <input value={source} onChange={e => setSource(e.target.value)} placeholder="indent PDF / portal screen"
+            className="px-3 py-2 border border-[#D4B896] rounded-lg bg-white text-sm" />
+        </label>
+      </div>
+      <label className="text-xs text-[#6B5744] flex flex-col gap-1">
+        Note
+        <input value={note} onChange={e => setNote(e.target.value)} placeholder="optional"
+          className="px-3 py-2 border border-[#D4B896] rounded-lg bg-white text-sm" />
+      </label>
+
+      <div className="flex items-center gap-3">
+        <button onClick={save} disabled={busy || amount === '' || reference.trim() === ''}
+          className="px-4 py-2 rounded-lg text-sm font-medium bg-[#af4408] text-white disabled:opacity-50">
+          {busy ? 'Saving…' : 'Record the indent figure'}
+        </button>
+        <span className="text-xs text-[#8B7355]">The recorded Net Indent is looked up when you save.</span>
+      </div>
+
+      {lastLive && (
+        <div data-receipt="check-b"
+             className={`rounded-lg p-3 text-sm border ${lastLive.matched === null
+               ? 'bg-[#FFF8F0] border-[#D4B896] text-[#6B5744]'
+               : lastLive.matched ? 'bg-emerald-50 border-emerald-300 text-emerald-900' : 'bg-amber-50 border-amber-400 text-amber-900'}`}>
+          <div className="font-semibold">
+            {lastLive.matched === null
+              ? 'NOT COMPARED — no recorded Net Indent for this number'
+              : lastLive.matched ? 'MATCH' : `DIFFERENCE ${rs(lastLive.difference)} (portal − recorded Net Indent)`}
+          </div>
+          <div className="text-xs mt-0.5">
+            {lastLive.reference} · portal {rs(lastLive.portal_amount)}
+            {lastLive.net_indent_value !== null && <> · recorded Net Indent {rs(lastLive.net_indent_value)}</>}
+            {lastLive.store && <> · {lastLive.store}</>} · as at {lastLive.as_of_date}
+          </div>
+          {lastLive.matched !== true && lastLive.difference_direction && (
+            <div className="text-xs mt-1">{lastLive.difference_direction}</div>
+          )}
+          {lastLive.warning && <div className="text-xs mt-1">{lastLive.warning}</div>}
+        </div>
+      )}
+
+      {checksError && (
+        <div className="text-xs text-amber-800">The recorded indent readings could not be loaded ({checksError}).</div>
+      )}
+      {recent.length > 0 && (
+        <div className="overflow-x-auto">
+          <table className="w-full text-xs">
+            <thead className="text-[#8B7355]">
+              <tr>
+                <th className="text-left py-1">As at</th><th className="text-left">Indent</th>
+                <th className="text-right">Portal</th><th className="text-right">Recorded Net Indent</th>
+                <th className="text-right">Difference (portal − recorded)</th>
+              </tr>
+            </thead>
+            <tbody>
+              {recent.map(c => (
+                <tr key={c.id} className="border-t border-[#E8D5C4]/60" data-indent-check={c.reference}>
+                  <td className="py-1 text-[#6B5744]">{c.as_of_date}</td>
+                  <td className="text-[#6B5744]">
+                    {c.reference}
+                    {c.register_ref && c.register_ref !== c.reference && <span className="text-[10px] text-[#8B7355]"> · in register {c.register_ref}</span>}
+                  </td>
+                  <td className="text-right">{rs(c.portal_amount)}</td>
+                  <td className="text-right">{c.net_indent_value === null ? <span className="text-[#8B7355]">not on record</span> : rs(c.net_indent_value)}</td>
+                  <td className={`text-right font-semibold ${c.matched === null ? 'text-[#8B7355]' : c.matched ? 'text-emerald-700' : 'text-amber-700'}`}
+                      title={c.matched === true ? '' : c.difference_direction}>
+                    {c.matched === null ? 'not compared' : c.matched ? '—' : rs(c.difference)}
                   </td>
                 </tr>
               ))}
@@ -679,7 +903,20 @@ function IntegrityPanel(
   // saved: re-runs it from the RECORDED indent (POST action retry_auto_debit).
   // Re-saving the bill cannot do it — a recorded invoice is refused as a duplicate.
   const [busyRef, setBusyRef] = useState('');
-  const writeDebit = async (sourceRef: string, label: string) => {
+  const writeDebit = async (sourceRef: string, label: string, failure: string | null | undefined, date: string) => {
+    /* NO FAILURE ON RECORD → most often an indent saved BEFORE this ledger
+       existed. The debit is dated on the indent's own date, and nothing on the
+       server compares that with the opening balance — so for an indent the
+       opening already reflects, writing it takes the same spend out twice and
+       check A then fails by the whole indent. Only the person pressing knows
+       which case this is, so they are asked, plainly, before anything is written. */
+    if (!failure && typeof window !== 'undefined' && !window.confirm(
+      `${label} (${date || 'no date'}) has no failed debit on record — it was most likely recorded before this wallet ledger existed, `
+      + 'or its debit was removed by hand.\n\n'
+      + 'If the wallet\'s OPENING balance was read off the portal AFTER this indent was charged, the opening already includes it: '
+      + 'writing the debit now would take the same money out twice. Press Cancel in that case.\n\n'
+      + 'Write the debit for this indent?',
+    )) return;
     setBusyRef(sourceRef); onError('');
     try {
       const r = await api('/api/liquor/wallet', { method: 'POST', body: { action: 'retry_auto_debit', source_ref: sourceRef } });
@@ -706,18 +943,25 @@ function IntegrityPanel(
             {integrity.missing.slice(0, 8).map(m => (
               <li key={m.source_ref} className="flex flex-wrap items-start gap-x-2 gap-y-0.5">
                 <span>{m.invoice_ref} · {m.date || 'no date'} · {rs(m.net_indent_value)} · {m.store}</span>
-                <button onClick={() => writeDebit(m.source_ref, m.invoice_ref)} disabled={!!busyRef}
+                <button onClick={() => writeDebit(m.source_ref, m.invoice_ref, m.failure, m.date)} disabled={!!busyRef}
                   className="px-2 py-0.5 rounded border border-amber-500 text-amber-900 hover:bg-amber-100 disabled:opacity-50">
                   {busyRef === m.source_ref ? 'Writing…' : 'Write the debit'}
                 </button>
-                {m.failure && <span className="basis-full text-[11px] text-amber-800">Why it was not written: {m.failure}</span>}
+                {m.failure
+                  ? <span className="basis-full text-[11px] text-amber-800">Why it was not written: {m.failure}</span>
+                  : <span className="basis-full text-[11px] text-amber-800">
+                      No failure on record — most likely recorded before this ledger existed. If the opening balance
+                      already includes it, do not write it.
+                    </span>}
               </li>
             ))}
           </ul>
           <div className="text-[11px] mt-1">
             Recorded before this ledger existed, the debit was removed by hand, or it could not be written when the bill
             was saved (the reason is shown). Fix the cause, then press <b>Write the debit</b> — it writes the debit from
-            the recorded indent&apos;s Net Indent. Re-saving the bill does not: a recorded invoice is refused as a duplicate.
+            the recorded indent&apos;s Net Indent, dated on the indent&apos;s own date. Re-saving the bill does not: a
+            recorded invoice is refused as a duplicate. An indent charged <b>before</b> the portal balance you typed as
+            the opening is already inside that opening — writing its debit would count it twice, so leave it.
           </div>
         </div>
       )}

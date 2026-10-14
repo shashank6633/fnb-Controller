@@ -1,5 +1,5 @@
 import { getDb } from '@/lib/db';
-import { getCurrentOutletId } from '@/lib/auth';
+import { getCurrentOutletId, isManagement } from '@/lib/auth';
 import { checkPurchaseDate } from '@/lib/purchase-guard';
 import { LQ_REIMBURSEMENT_STATUS, type LqReimbursementStatus } from '@/lib/liquor-recon';
 import {
@@ -21,6 +21,12 @@ import {
  *                             NO central purchases row, NO current_stock move,
  *                             NO price column (owner decision 1 — see
  *                             src/lib/liquor-retail.ts for why).
+ *                             COST ONLY (ruling 39): a buy dated on or before a
+ *                             saved count of the item whose variance is pending
+ *                             or applied books NO stock — the count already holds
+ *                             the bottles. Still 201: the money record is kept.
+ *                             The reply says so (stock_booked false, cost_only,
+ *                             stock_refused, and the sentence in `warning`).
  *   GET  /api/liquor/retail?from=&to=[&outlet=all]
  *                             the §E numbers + the flag rows, for a register and
  *                             for anything that wants the same figures L5 shows.
@@ -159,6 +165,12 @@ export async function POST(request: Request) {
       notes: String(b.notes || '').trim(),
       outletId,
       storeId,
+      // A colleague's bottles and rate paid are quoted on a duplicate refusal to
+      // management only — the PATCH path's rule (retail/[id]/route.ts).
+      revealOtherBuyFigures: isManagement(gate.user),
+      // BLIND COUNTS: a count's status and variance are admin-only everywhere
+      // (stores/[id]/closing nulls them for everyone else).
+      revealCountFigures: gate.user.role === 'admin',
     }, gate.user.email);
 
     // WHAT THE RECORDER IS TOLD ABOUT THE DEPOT RATE. A rate resolved from the
@@ -181,10 +193,25 @@ export async function POST(request: Request) {
       purchase_id: result.purchaseId,
       flag_id: result.flagId,
       // WHERE the bottles went: the store-ledger row, and the store it is in.
+      // ledger_id is null and stock_qty 0 on a COST-ONLY buy (ruling 39).
       ledger_id: result.ledgerId,
       store_id: result.storeId,
       store_name: result.storeName,
       stock_qty: result.stockQty,
+      stock_booked: result.stockBooked,
+      cost_only: !result.stockBooked,
+      // Which count holds the bottles, and when it was saved — never its
+      // variance or (for a non-admin) its status: blind counts.
+      ...(result.stockRefusal
+        ? {
+            stock_refused: {
+              code: result.stockRefusal.viewerCode,
+              count_date: result.stockRefusal.countDate,
+              count_saved_at: result.stockRefusal.countSavedAt,
+              message: result.stockRefusal.message,
+            },
+          }
+        : {}),
       depot_landed_per_bottle: depotWithheld ? null : result.depotLandedPerBottle,
       depot_source: result.depotSource,
       depot_detail: result.depotDetail,
@@ -197,13 +224,21 @@ export async function POST(request: Request) {
       // it can prompt for a depot rate rather than trusting a silent 0 — and it
       // is told WHERE to supply it, because the old wording promised a backfill
       // ("until a rate is known") that no route could then perform.
-      ...(result.depotSource === 'unknown'
-        ? {
-            warning: 'Depot landed cost is unknown for this brand (not mapped in the TGBCL Brand Map, and no depot rate was supplied) — '
+      //
+      // The COST-ONLY sentence leads `warning`, which every client renders
+      // verbatim: a recorder whose bottles were NOT added to stock must be told
+      // so on the receipt itself, not only in a field a screen may not read yet.
+      ...((() => {
+        const parts = [
+          result.stockRefusal ? result.stockRefusal.message : '',
+          result.depotSource === 'unknown'
+            ? 'Depot landed cost is unknown for this brand (not mapped in the TGBCL Brand Map, and no depot rate was supplied) — '
               + 'the excess was recorded as 0 and is excluded from the "price of running out" total. '
-              + `Supply it later with PATCH /api/liquor/retail/${result.flagId} { "depot_landed_per_bottle": … } and the excess is computed then.`,
-          }
-        : {}),
+              + `Supply it later with PATCH /api/liquor/retail/${result.flagId} { "depot_landed_per_bottle": … } and the excess is computed then.`
+            : '',
+        ].filter(Boolean);
+        return parts.length ? { warning: parts.join(' ') } : {};
+      })()),
       // e.g. cash was taken straight from the box: the box is NOT debited here.
       ...(result.notice ? { notice: result.notice } : {}),
     }, { status: 201 });

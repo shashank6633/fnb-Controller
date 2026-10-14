@@ -263,6 +263,10 @@ export default function LiquorReconciliationPage() {
   const vb: ValueBasis = data.value_basis?.active === 'landed' ? 'landed' : 'recorded';
   const isLanded = vb === 'landed';
   const isAdmin = me?.role === 'admin';
+  /* §G: the server withheld the master-derived figures from this viewer (the
+     TGBCL master is admin-only — liquor-summary.ts LqSectionG). Read off the
+     payload, never off `me`: the server decides, the page only labels it. */
+  const gWithheld = S.G.master_rates_visible === false;
 
   return (
     <div className="p-4 sm:p-6 max-w-7xl mx-auto space-y-5">
@@ -544,7 +548,10 @@ export default function LiquorReconciliationPage() {
           <Stat label="Lines moved" value={n2(S.G.moved_lines, 0)} tone={S.G.moved_lines > 0 ? 'warn' : 'good'} />
           <Stat label="Lines scanned" value={n2(S.G.scanned_lines, 0)} />
           <Stat label="Unmapped" value={n2(S.G.unmapped_lines, 0)} />
-          <Stat label="Total variance value" value={inr(S.G.total_variance_value)} />
+          {/* Withheld ≠ zero ≠ unknown: a manager is told the figure exists and
+              who may see it, not shown a bare "—" that reads as "no data". */}
+          <Stat label="Total variance value"
+                value={gWithheld ? 'admin-only' : inr(S.G.total_variance_value)} />
         </div>
         {/* The server withholds the master-derived figures from a non-admin
             (the TGBCL master is admin-only) and says so in its own sentence. */}
@@ -574,13 +581,17 @@ export default function LiquorReconciliationPage() {
                     <td className="px-2 py-1.5 text-[#2D1B0E]">{r.materialName}</td>
                     <td className="px-2 py-1.5 text-right tabular-nums">{n2(r.bottles)}</td>
                     <td className="px-2 py-1.5 text-right tabular-nums">{inr(r.indentRate, 2)}</td>
-                    <td className="px-2 py-1.5 text-right tabular-nums">{inr(r.masterRate, 2)}</td>
+                    <td className="px-2 py-1.5 text-right tabular-nums">{gWithheld && r.masterRate == null
+                      ? <span className="text-[#8B7355]" title="TGBCL master rates are admin-only">admin-only</span>
+                      : inr(r.masterRate, 2)}</td>
                     <td className={`px-2 py-1.5 text-right tabular-nums ${(r.variance != null ? r.variance > 0 : r.direction === 'above_master') ? 'text-red-700' : 'text-emerald-700'}`}>
                       {r.variance != null ? inr(r.variance, 2)
                         : r.direction === 'above_master' ? '↑ above master'
                           : r.direction === 'below_master' ? '↓ below master' : '—'}
                     </td>
-                    <td className="px-2 py-1.5 text-right tabular-nums">{inr(r.varianceValue)}</td>
+                    <td className="px-2 py-1.5 text-right tabular-nums">{gWithheld && r.varianceValue == null
+                      ? <span className="text-[#8B7355]" title="Derived from the admin-only TGBCL master rate">admin-only</span>
+                      : inr(r.varianceValue)}</td>
                   </tr>
                 ))}
               </tbody>

@@ -33,6 +33,7 @@ import MaterialTypeahead, { MaterialLite } from '@/components/MaterialTypeahead'
 import ZeroCountGuard, { readZeroGuard, type ZeroGuardInfo } from '@/components/ZeroCountGuard';
 import CountState from '@/components/CountState';
 import WineShopRegister from './WineShopRegister';
+import { BillWalletNotices, billWalletNotices, mergeBillWalletNotices, type BillWalletNotice } from './BillWalletNotice';
 import {
   packFactor, caseFactor, entryMode, tripleToRecipe, breakdownQty, fmtBreakdown,
   toPurchaseQty, csvQty, PackMeta,
@@ -309,6 +310,11 @@ export default function LiquorStorePage() {
      figures, the history list) dies with the instance, which is the fix. */
   const [closingDate, setClosingDate] = useState(today());
   const [flash, setFlash] = useState<string | null>(null);
+  /* What a TGBCL bill save did to the wallet, when it was not the ordinary
+     "debited" — above all a debit that FAILED while the bill saved (see
+     BillWalletNotice.tsx). Kept until dismissed: the flash above is gone in
+     five seconds, and this is the only place the saver is told. */
+  const [walletNotices, setWalletNotices] = useState<BillWalletNotice[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [meRole, setMeRole] = useState<string>('');   // admin-only closing 'adjust' toggle
   /* MANAGEMENT (admin / manager / HOD) — the gate GET /api/liquor/retail
@@ -730,6 +736,8 @@ export default function LiquorStorePage() {
           <CheckCircle2 className="w-4 h-4 shrink-0" /> {flash}
         </div>
       )}
+      <BillWalletNotices notices={walletNotices}
+                         onDismiss={key => setWalletNotices(ns => ns.filter(n => n.key !== key))} />
       {error && (
         <div className="bg-red-50 border border-red-200 text-red-700 rounded-lg p-3 text-sm flex items-center gap-2">
           <AlertCircle className="w-4 h-4 shrink-0" /> {error}
@@ -1258,6 +1266,7 @@ export default function LiquorStorePage() {
           materials={materials} suppliers={suppliers} vendors={vendors} storeVendors={storeVendors}
           onClose={() => setShowBill(false)}
           onSaved={msg => { setShowBill(false); afterWrite(msg); }}
+          onWalletNotices={ns => setWalletNotices(prev => mergeBillWalletNotices(prev, ns))}
         />
       )}
       {showUpload && store && (
@@ -1267,6 +1276,7 @@ export default function LiquorStorePage() {
           onClose={() => setShowUpload(false)}
           onSaved={msg => { setShowUpload(false); afterWrite(msg); }}
           onRefresh={() => { loadStock(); loadLedger(); }}
+          onWalletNotices={ns => setWalletNotices(prev => mergeBillWalletNotices(prev, ns))}
         />
       )}
       {showRetail && store && (
@@ -1519,10 +1529,12 @@ function VendorSelect({ used, all, value, onChange }: {
   );
 }
 
-function BillModal({ storeId, storeName, materials, suppliers, vendors, storeVendors, onClose, onSaved }: {
+function BillModal({ storeId, storeName, materials, suppliers, vendors, storeVendors, onClose, onSaved, onWalletNotices }: {
   storeId: string; storeName: string;
   materials: MatRow[]; suppliers: string[]; vendors: VendorLite[]; storeVendors: VendorLite[];
   onClose: () => void; onSaved: (msg: string) => void;
+  /** What the save did to the TGBCL wallet beyond the ordinary debit (BillWalletNotice.tsx). */
+  onWalletNotices: (notices: BillWalletNotice[]) => void;
 }) {
   const [supplier, setSupplier] = useState('');
   const [invoiceRef, setInvoiceRef] = useState('');
@@ -1587,6 +1599,9 @@ function BillModal({ storeId, storeName, materials, suppliers, vendors, storeVen
       const j = await r.json();
       if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
       const net = j.bill_charges?.net_indent_value;
+      // The bill IS saved (2xx). A wallet debit that failed alongside it rides
+      // the same reply; it goes to the page's lasting notices, not the flash.
+      onWalletNotices(billWalletNotices(j.bill_charges, invoiceRef.trim()));
       onSaved(`Bill ${invoiceRef.trim()} saved — ${j.posted} line${j.posted === 1 ? '' : 's'}, ${inr(j.total_value)}`
         + (net && net !== j.total_value ? ` · Net Indent ${inr(net)}` : ''));
     } catch (e: any) { setErr(e.message); }
@@ -1871,10 +1886,12 @@ function parseBillCsv(text: string): UploadRow[] {
   return out;
 }
 
-function UploadBillModal({ storeId, storeName, suppliers, vendors, storeVendors, onClose, onSaved, onRefresh }: {
+function UploadBillModal({ storeId, storeName, suppliers, vendors, storeVendors, onClose, onSaved, onRefresh, onWalletNotices }: {
   storeId: string; storeName: string;
   suppliers: string[]; vendors: VendorLite[]; storeVendors: VendorLite[];
   onClose: () => void; onSaved: (msg: string) => void; onRefresh: () => void;
+  /** What the save did to the TGBCL wallet beyond the ordinary debit (BillWalletNotice.tsx). */
+  onWalletNotices: (notices: BillWalletNotice[]) => void;
 }) {
   const [supplier, setSupplier] = useState('');
   const [invoiceRef, setInvoiceRef] = useState('');
@@ -1886,7 +1903,7 @@ function UploadBillModal({ storeId, storeName, suppliers, vendors, storeVendors,
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [result, setResult] = useState<{ posted: number; skipped: number; duplicates: number; total_value: number;
-    net_indent_value?: number; skipped_rows: UploadSkipped[] } | null>(null);
+    net_indent_value?: number; skipped_rows: UploadSkipped[]; wallet_notices: BillWalletNotice[] } | null>(null);
 
   // Invoice Value preview from parsed rows (best-effort — the exact figure is
   // computed on the server with each material's pack/case factors). When a row
@@ -2053,9 +2070,16 @@ function UploadBillModal({ storeId, storeName, suppliers, vendors, storeVendors,
       const j = await r.json();
       if (r.status === 409 && j.duplicate) { setErr(j.error); setBusy(false); return; }
       if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+      // The bill IS saved (2xx). A wallet debit that failed alongside it, and a
+      // register's inward-number links, ride the same reply: shown in the result
+      // panel below while this stays open, and handed to the page so they
+      // outlive the modal and the five-second flash.
+      const walletNotices = billWalletNotices(j.bill_charges, invoiceRef.trim());
+      onWalletNotices(walletNotices);
       setResult({
         posted: j.posted, skipped: j.skipped, duplicates: j.duplicates || 0, total_value: j.total_value,
         net_indent_value: j.bill_charges?.net_indent_value, skipped_rows: j.skipped_rows || [],
+        wallet_notices: walletNotices,
       });
       // If everything posted, close out with a flash (onSaved refreshes the
       // parent). If some rows were skipped, keep the modal open for review — but
@@ -2240,6 +2264,7 @@ function UploadBillModal({ storeId, storeName, suppliers, vendors, storeVendors,
               </span>
             )}
           </div>
+          <BillWalletNotices notices={result.wallet_notices} />
           {result.skipped > 0 && (
             <>
               <div className="flex items-center justify-between gap-2">
@@ -2717,6 +2742,15 @@ function MigrateModal({ storeId, storeName, candidates, blockedCount, onClose, o
    bottles — the retail ₹ is written only to the wine-shop register. So the
    Ledger tab DOES move (one Inward row) and nothing is re-priced. */
 
+/** Did this wine-shop reply book stock? Only a store-ledger row id says yes.
+ *  The route never moves Central stock (purchase_id is always null), and a
+ *  reply with no ledger row is a COST-ONLY record — the receipt and the flash
+ *  must then not say "added". */
+function wineShopStockAdded(res: Pick<RetailResult, 'ledger_id' | 'stock_qty' | 'stock_booked' | 'cost_only'>): boolean {
+  if (res.stock_booked === false || res.cost_only === true) return false;
+  return !!res.ledger_id && Number(res.stock_qty) > 0;
+}
+
 /**
  * L1's own basis for a Brand-Map landed cost, in English.
  *
@@ -2788,12 +2822,22 @@ const REIMB_OPTIONS: Array<{ v: 'not_required' | 'claimed_pending' | 'rejected';
 ];
 
 interface RetailResult {
-  /** null on every new buy (no central purchases row). A string only from a
-   *  server still on the first, central-purchase design. */
+  /** Always null: a wine-shop buy writes no `purchases` row and moves no
+   *  Central stock (the route keeps the key only as an explicit "none"). */
   purchase_id: string | null;
   flag_id: string; stock_qty: number;
-  /** WHERE the bottles went: the store-ledger row and the store it is in. */
+  /** WHERE the bottles went: the store-ledger row and the store it is in.
+   *  ledger_id null → NO stock row was written: the buy is on the wine-shop
+   *  register as cost only (owner ruling 2026-10-14 — a count already taken
+   *  that day includes those bottles), and the receipt must not say "added". */
   ledger_id?: string | null; store_id?: string | null; store_name?: string | null;
+  /** The server's own answer to "was stock booked?" (false = COST ONLY). */
+  stock_booked?: boolean;
+  cost_only?: boolean;
+  /** Which count already holds the bottles. Its sentence also leads `warning`,
+   *  which is printed verbatim — `message` is not repeated. The count's status
+   *  and variance are never here for a non-admin (blind counts). */
+  stock_refused?: { code: string; count_date: string; count_saved_at: string; message: string };
   /** null when the buy IS priced but the figure is withheld from this viewer
    *  (depot_figures_withheld) — a Brand-Map depot rate re-derives the admin-only
    *  TGBCL master, so only an admin is told it. */
@@ -2959,13 +3003,14 @@ function WineShopModal({ materials, onClose, onSaved, onRefresh }: {
       if (!r.ok) { setErrCode(String(j.code || '')); setErr(j.error || `HTTP ${r.status}`); return; }
       const res = j as RetailResult;
       setResult(res);
-      // Where the stock went is read off the reply, never assumed: a store
-      // ledger row (the design) or — only from a server still on the first
-      // design — a central purchases row.
+      // Where the stock went is read off the reply, never assumed. Central
+      // stock is never touched by this route. A ledger row id means one
+      // Inward row on the material's own store ledger; no id means no stock
+      // row at all — the buy is recorded as cost only (wineShopStockAdded).
       const msg = `Wine-shop buy recorded — ${fq(nBottles)} ${pu} × ${mat?.name || 'item'} at ${inr(nRate)} each, ${inr(res.total_paid)} paid.`
-        + (res.purchase_id
-          ? ' Bottles went into CENTRAL stock.'
-          : ` Bottles added to ${res.store_name || 'the liquor store'}'s ledger as one Inward row, at the store's existing cost — nothing was re-priced.`);
+        + (wineShopStockAdded(res)
+          ? ` Bottles added to ${res.store_name || 'the liquor store'}'s ledger as one Inward row, at the store's existing cost — nothing was re-priced.`
+          : ' No stock was added — recorded on the wine-shop register as cost only.');
       setSavedMsg(msg);
       // ALWAYS stay open on the receipt, and refresh the page behind instead of
       // closing. This used to auto-close whenever the server had no warning to
@@ -3072,13 +3117,25 @@ function WineShopModal({ materials, onClose, onSaved, onRefresh }: {
             <CheckCircle2 className="w-4 h-4 shrink-0" /> Recorded — {inr(result.total_paid)} paid
           </div>
           <div className="text-[12px] text-emerald-900 space-y-1">
-            <div>
-              Stock added: <b>{mat ? qtyText(result.stock_qty, mat) : fq(result.stock_qty)}</b>
-              {result.purchase_id
-                ? <>{' '}to <b>Central</b>{' '}stock.</>
-                : <>{' '}to <b>{result.store_name || 'the liquor store'}</b>{' '}— one Inward row on its
-                    ledger, at the store&apos;s existing cost.</>}
-            </div>
+            {wineShopStockAdded(result) ? (
+              <div>
+                Stock added: <b>{mat ? qtyText(result.stock_qty, mat) : fq(result.stock_qty)}</b>
+                {' '}to <b>{result.store_name || 'the liquor store'}</b>{' '}— one Inward row on its
+                ledger, at the store&apos;s existing cost.
+              </div>
+            ) : (
+              /* COST ONLY. No ledger row came back, so no bottle was booked:
+                 the server refused the stock (a count already taken that day
+                 includes these bottles) and kept the ₹ on the register. Its
+                 own sentence, if it sent one, is printed verbatim below. */
+              <div data-retail-stock="cost-only">
+                <b>No stock added</b>{' '}— this buy is on the wine-shop register as <b>cost only</b>;
+                {' '}{result.store_name || 'the liquor store'}&apos;s on-hand is unchanged
+                {result.stock_refused?.count_date
+                  ? <>{' '}(the {result.stock_refused.count_date} closing count already includes these bottles — why, below)</>
+                  : null}.
+              </div>
+            )}
             {/* THE TEST IS THE FIGURE, NOT THE SOURCE. It used to be
                 `depot_source === 'unknown'`, which let a depot rate that
                 resolved to 0 through the PRICED branch and printed "Depot landed

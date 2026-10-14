@@ -466,9 +466,15 @@ export interface LqRateMoveRow {
  *
  * NOT THE ONLY DOOR. The master also sat inside §E: a wine-shop buy's depot
  * rate can be the master per bottle itself, or the master plus levies §B
- * prints, so §E's depot figures go under the same switch (LqSectionE). §H's landed values are frozen L1 landed
- * costs too, but only as per-CATEGORY totals with no bottle count beside them;
- * they stay on the page the plan gives management (see LqSectionH).
+ * prints, so §E's depot figures go under the same switch (LqSectionE). And
+ * inside §H: a withdrawal's frozen landed value is L1's landed cost at issue,
+ * which for a brand never indented IS the master per bottle (measured: Gin,
+ * one bottle, ₹760.28 = the ₹9,123.36 master ÷ 12, served to a manager as §H
+ * landed value AND — on the default basis — as the recoverable of a
+ * withdrawal recovered "at landed cost"; the bottle count is on the store
+ * ledger). So §H's landed values, and every recoverable / recovered /
+ * outstanding figure that contains a landed-cost recovery, go under the same
+ * switch too (LqSectionH).
  */
 export interface LqSectionG {
   rows: LqRateMoveRow[];
@@ -495,12 +501,22 @@ export interface LqWithdrawalBucket {
   /** Withdrawals in this bucket the store had no recorded cost for on their
    *  date — counted here, never valued at a silent 0. */
   recorded_unpriced: number;
-  /** Σ the landed value frozen on each withdrawal. null on the RECORDED basis. */
+  /** Σ the landed value frozen on each withdrawal. null on the RECORDED basis,
+   *  and null for a non-admin on EITHER basis (see LqSectionH). */
   landed_value: number | null;
   mrp_value: number;
-  recoverable: number;
-  recovered: number;
-  outstanding: number;
+  /** Σ recoverable / recovered / outstanding. null for a non-admin when this
+   *  bucket holds a withdrawal recovered AT LANDED COST: that row's recoverable
+   *  IS its frozen landed value (the master per bottle for a brand never
+   *  indented), and recovered/outstanding re-derive it. A partial sum under the
+   *  same heading would read as the whole debt, so the cell is withheld, not
+   *  shrunk; `landed_recovery_withheld` counts the rows behind it. */
+  recoverable: number | null;
+  recovered: number | null;
+  outstanding: number | null;
+  /** Withdrawals in this bucket recovered at landed cost whose ₹ are withheld
+   *  from this viewer. Always 0 for an admin. */
+  landed_recovery_withheld: number;
 }
 /**
  * §H. ONE BASIS PER CARD (owner decision 1). The card's `total_value` and
@@ -515,13 +531,28 @@ export interface LqWithdrawalBucket {
  * so. The Withdrawals page still prints that L4 ratio; `pct_basis` says how
  * the two differ.
  *
- * LANDED VALUES ARE SHOWN HERE (on the landed basis), unlike §E's depot rate.
- * They are frozen L1 landed costs — the rate paid + levies since owner decision
- * 2, the master + levies on a row frozen before it — but summed per CATEGORY
- * with no bottle count beside them, and the plan puts these cards on the
- * management Summary. A viewer who already knows a range holds exactly one
- * withdrawal of a known size can still divide one out — that residual is the
- * owner's call, not closed here.
+ * THE LANDED FIGURES ARE ADMIN-ONLY, under §G's switch
+ * (LqSummaryOpts.revealMasterRates), exactly as §E's depot rate is. A
+ * withdrawal's landed value is L1's landed cost FROZEN at issue: the master per
+ * bottle itself for a brand with no recorded indent (L1 basis 'master_only'),
+ * the master + levies on a row frozen before owner decision 2, the rate paid +
+ * levies after it — and the row stores no basis, so all are treated alike, as
+ * §E treats its rows. Category totals were no protection: the bottle count is
+ * on the store ledger (the withdrawal's WD ref, −750 ml), so one withdrawal in
+ * a bucket IS its own per-bottle figure (measured: Gin ₹760.28 = the admin-only
+ * master to the paisa, via both the landed column and the default basis's
+ * recoverable). Withheld from a non-admin, with everything that re-derives it:
+ *   · landed_value per bucket, total_landed_value, the landed basis's card
+ *     total and %, and the L4 "% of purchases" quoted in pct_basis (landed ÷ a
+ *     recorded denominator this card prints);
+ *   · recoverable / recovered / outstanding of any bucket holding a withdrawal
+ *     recovered AT LANDED COST (its recoverable IS its landed value), and
+ *     total_outstanding when any is held back.
+ * What a non-admin keeps: every bucket and its count, the recorded value (the
+ * store's own average cost, never the master), MRP values, and what is still
+ * owed on withdrawals recovered at MRP or a typed amount
+ * (total_outstanding_shown), with the number of landed-cost recoveries
+ * withheld so a blank is never read as ₹0. An admin sees everything.
  */
 export interface LqSectionH {
   value_basis: LqValueBasis;
@@ -530,11 +561,25 @@ export interface LqSectionH {
   total_recorded_value: number;
   /** Withdrawals with no recorded cost on their date (excluded from the value). */
   recorded_unpriced_count: number;
-  /** Σ frozen landed value. null on the RECORDED basis. */
+  /** Σ frozen landed value. null on the RECORDED basis, and for a non-admin. */
   total_landed_value: number | null;
-  /** THE CARD'S VALUE, on the active basis. */
-  total_value: number;
-  total_outstanding: number;
+  /** THE CARD'S VALUE, on the active basis. null only for a non-admin viewing
+   *  the LANDED basis (the landed values are admin-only). */
+  total_value: number | null;
+  /** Σ outstanding over EVERY withdrawal in range. null for a non-admin when
+   *  any withdrawal in range is recovered at landed cost. */
+  total_outstanding: number | null;
+  /** Σ outstanding over the withdrawals recovered at MRP or a typed amount —
+   *  the part of the debt that carries no landed cost. Equals total_outstanding
+   *  for an admin, and whenever nothing is withheld. */
+  total_outstanding_shown: number;
+  /** Withdrawals in range recovered at landed cost whose ₹ are withheld from
+   *  this viewer. 0 for an admin. */
+  landed_recovery_withheld_count: number;
+  /** true for an admin; false → every landed-derived figure above is null. */
+  landed_figures_visible: boolean;
+  /** When withheld, one sentence saying so and where an admin sees them. */
+  landed_figures_note: string | null;
   /** The RECORDED denominator: recorded purchase value in range (L4's — Σ
    *  store-ledger purchase/inward lines, IST day). */
   purchases_value: number;
@@ -603,9 +648,10 @@ export interface LqSummaryOpts {
    *  balance only. */
   plannedIndent?: number | null;
   /** §G: include the TGBCL brand master's rates and the figures derived from
-   *  them — and §E's depot rate / excess figures, which re-derive the same
-   *  master. ADMIN ONLY — the route passes `role === 'admin'`. Omitted → false:
-   *  a caller that forgets this withholds the rates rather than leaking them. */
+   *  them — and §E's depot rate / excess figures and §H's frozen landed values
+   *  (with every recoverable that is one), which re-derive the same master.
+   *  ADMIN ONLY — the route passes `role === 'admin'`. Omitted → false: a
+   *  caller that forgets this withholds the rates rather than leaking them. */
   revealMasterRates?: boolean;
   /** Owner decision 1: the basis to value §C/§D/§F/§H at for THIS view.
    *  Omitted → 'recorded' (the existing basis; landed is opt-in). */

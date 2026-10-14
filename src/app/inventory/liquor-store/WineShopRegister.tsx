@@ -63,8 +63,16 @@ export interface RetailFlag {
   id: string;
   /** LEGACY anchor only (a flag from the first, central-purchase design). */
   purchase_id: string | null;
-  /** The store-ledger 'inward' row that moved the bottles (new flags). */
+  /** The store-ledger 'inward' row that moved the bottles (new flags). null on
+   *  a COST-ONLY buy, which moved no stock. */
   ledger_id?: string | null;
+  /** true → COST ONLY (owner ruling 2026-10-14): a closing count saved for the
+   *  item on or after the buy's date already held these bottles, so the buy
+   *  booked no stock and is on this register for its money alone. Absent from
+   *  a server without the ruling (read as false). */
+  cost_only?: boolean;
+  /** The date of the count that holds the bottles, when the server names it. */
+  cost_only_count_date?: string | null;
   bill_ref: string;
   date: string;
   shop_name: string;
@@ -330,7 +338,10 @@ export function RegisterView({ summary, rows, materials, onAction, canCorrect = 
                           {r.shop_name || '—'}
                           {r.bill_ref && <div className="text-[10px] font-mono text-[#8B7355]">{r.bill_ref}</div>}
                         </td>
-                        <td className="px-3 py-2 text-right whitespace-nowrap font-medium text-[#2D1B0E]">{fq(r.bottles)} {pu}</td>
+                        <td className="px-3 py-2 text-right whitespace-nowrap font-medium text-[#2D1B0E]">
+                          {fq(r.bottles)} {pu}
+                          {r.cost_only && <CostOnlyNote r={r} />}
+                        </td>
                         <td className="px-3 py-2 text-right whitespace-nowrap">{inr(r.rate_paid_per_bottle)}/{pu}</td>
                         <td className="px-3 py-2 text-right whitespace-nowrap">
                           {st.unpriced ? <span className="text-amber-700">unknown</span>
@@ -368,6 +379,7 @@ export function RegisterView({ summary, rows, materials, onAction, canCorrect = 
                   <div className="text-sm font-medium text-[#2D1B0E] break-words">{r.material_name || '—'}</div>
                   <div className="text-[#6B5744]">
                     <b className="text-[#2D1B0E]">{fq(r.bottles)} {pu}</b> at {inr(r.rate_paid_per_bottle)}/{pu} = {inr(r.total_paid)}
+                    {r.cost_only && <CostOnlyNote r={r} />}
                   </div>
                   <div className="text-[#6B5744]">
                     Depot {st.unpriced ? <span className="text-amber-700">unknown — excess not computed</span>
@@ -388,6 +400,17 @@ export function RegisterView({ summary, rows, materials, onAction, canCorrect = 
         </>
       )}
     </>
+  );
+}
+
+/** A cost-only buy's bottles are a money fact, not stock: said beside the
+ *  quantity so nobody reads the column as bottles that reached the shelf book. */
+function CostOnlyNote({ r }: { r: Pick<RetailFlag, 'cost_only_count_date'> }) {
+  return (
+    <div data-cost-only="1" className="text-[10px] font-normal text-[#8B7355] whitespace-normal"
+         title="A closing count already included these bottles, so this buy added no stock — its cost is recorded here only.">
+      cost only — no stock added{r.cost_only_count_date ? ` (already in the ${r.cost_only_count_date} count)` : ''}
+    </div>
   );
 }
 
