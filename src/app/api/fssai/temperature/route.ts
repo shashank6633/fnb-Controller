@@ -16,9 +16,10 @@ import {
   resolveFssaiRange, judgeFssaiReading, raiseFssaiRecordCa, writeFssaiAttachment,
   fssaiAttachmentCounts, fssaiRecordVisibility, fssaiClock, fssaiNum, fssaiInt,
   FSSAI_BACKDATE_DAYS,
-  resolveFssaiCurve, fssaiCurveMembers, fssaiCurveReached, fssaiCurveExpected,
-  fssaiCurveExpectedShown, fssaiTempDirection, fssaiClockMinute,
-  type FssaiCurveResolution,
+  resolveFssaiCurve, fssaiCurveExpectedShown, fssaiTempDirection,
+  fssaiCurveLineStart, fssaiCurveExpected, fssaiReadingScheduleValue, fssaiTempVerdictWord,
+  fssaiTempMinutesWords, fssaiCurveSummary, fssaiOpenCurves, fssaiNowMinuteIST,
+  type FssaiCurveResolution, type FssaiCurveStart,
 } from '../_p4/lib';
 
 /**
@@ -86,6 +87,7 @@ const LOG_SELECT = `
          t.is_fail, t.is_judged, t.fail_reason, t.action_taken, t.ca_id, t.note,
          t.status, t.recorded_by, t.recorded_name, t.verified_by, t.verified_at,
          t.voided_at, t.voided_by, t.void_reason, t.outlet_id, t.created_at, t.updated_at,
+         t.curve_start_used, t.curve_start_minute, t.curve_start_source,
          IFNULL(d.name,'')  AS department_name,
          IFNULL(e.name,'')  AS equipment_name_now,
          IFNULL(m.name,'')  AS material_name,
@@ -166,6 +168,21 @@ function shapeLog(row: any, photoCount = 0) {
     /* Cooling and reheating only: the batch whose curve this reading is on
      * (GET ?curve=<this> returns the whole curve). '' for every other kind. */
     curve_id: isRateKind(row.log_kind) ? (String(row.batch_id || '') || String(row.id)) : '',
+    /* Where this reading's schedule line started, FROZEN with its verdict
+     * (cooling / reheating only): the batch's 0-minute reading, or the rule's
+     * starting temperature when the batch had none. null / '' otherwise. */
+    curve_start_used: fssaiNum(row.curve_start_used),
+    curve_start_minute: fssaiInt(row.curve_start_minute),
+    curve_start_source: String(row.curve_start_source || ''),
+    /* "Needed by then", from the frozen line — never a live rule. */
+    schedule_value: (() => {
+      const e = fssaiReadingScheduleValue(row);
+      return e === null ? null : Number(fssaiCurveExpectedShown(e, fssaiTempDirection(String(row.log_kind || ''))));
+    })(),
+    /* The one word every screen and printout uses for this verdict: 'On
+     * schedule' for a cooling reading still on its way down, never "In range". */
+    verdict_word: fssaiTempVerdictWord(row),
+    minutes_words: fssaiTempMinutesWords(row),
     photo_count: photoCount,
     /* The range in words, computed from the FROZEN columns and not from any live
      * rule, so a list and a record can never disagree. */
@@ -176,71 +193,6 @@ function shapeLog(row: any, photoCount = 0) {
 /** Cooling and reheating — the kinds whose FSSAI rule is a RATE against a clock. */
 function isRateKind(logKind: unknown): boolean {
   return !!FSSAI_TEMP_LOG_KINDS.find((k) => k.key === String(logKind || ''))?.window_minutes;
-}
-
-/** The current IST time on the same clock as a reading. */
-function nowMinuteIST(): number | null {
-  const hhmm = new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata' });
-  return fssaiClockMinute(fssaiToday(), hhmm);
-}
-
-/**
- * ONE BATCH'S CURVE, as the sheet reads it: the first reading, the target and
- * the time limit it was judged against, where it stands now, and each reading
- * with the figure the schedule asked for at that point.
- *
- * Every verdict here is the FROZEN one. `schedule_value` is the one shared line
- * (`fssaiCurveExpected`) drawn from the first LIVE reading; it is shown beside a
- * reading and never used to change its verdict.
- */
-function curveSummary(db: any, logKind: string, key: string, nowMinute: number | null) {
-  const all = fssaiCurveMembers(db, logKind, key, true);
-  const live = all.filter((m) => m.status !== 'void');
-  const dir = fssaiTempDirection(logKind);
-  const start = live[0] || null;
-  const limit = start ? start.max_minutes : null;
-  const goal = start ? start.goal : null;
-  const reached = fssaiCurveReached(live, logKind);
-  const last = live[live.length - 1] || null;
-  const elapsedNow = start && start.minute !== null && nowMinute !== null
-    ? (start.elapsed ?? 0) + (nowMinute - start.minute) : null;
-  const breach = live.some((m) => m.is_fail === 1);
-  /* A breach anywhere on the batch outranks how it ended: a pot that fell behind
-   * and then caught up still had a breach, and the sheet must say so first. */
-  const outcome = breach ? 'breach'
-    : reached
-      ? (limit !== null && reached.elapsed !== null && reached.elapsed > limit ? 'reached_late' : 'reached_in_time')
-      : (limit !== null && elapsedNow !== null && elapsedNow > limit ? 'overdue' : 'in_progress');
-  const OUTCOME_WORDS: Record<string, string> = {
-    reached_in_time: 'Reached the target within the time allowed',
-    reached_late: 'Reached the target, but after the time allowed',
-    breach: 'A reading on this batch was a breach',
-    overdue: 'Past the time allowed with no reading at the target',
-    in_progress: 'Still in progress',
-  };
-  const summary = {
-    id: key,
-    log_kind: logKind,
-    log_kind_label: fssaiTempLogKindLabel(logKind),
-    direction: dir,
-    goal,
-    max_minutes: limit,
-    start: start ? { id: start.id, business_date: start.business_date, reading_at: start.reading_at, value_num: start.value, elapsed_minutes: start.elapsed } : null,
-    last: last ? { id: last.id, business_date: last.business_date, reading_at: last.reading_at, value_num: last.value, elapsed_minutes: last.elapsed } : null,
-    reached: reached ? { id: reached.id, reading_at: reached.reading_at, value_num: reached.value, elapsed_minutes: reached.elapsed } : null,
-    elapsed_now: reached ? null : elapsedNow,
-    has_breach: breach,
-    outcome,
-    outcome_label: OUTCOME_WORDS[outcome],
-  };
-  const schedule = (m: { elapsed: number | null }): number | null => {
-    const e = fssaiCurveExpected({
-      startValue: start ? start.value : null, startElapsed: start ? start.elapsed : null,
-      goal, maxMinutes: limit, elapsed: m.elapsed,
-    });
-    return e === null ? null : Number(fssaiCurveExpectedShown(e, dir));
-  };
-  return { summary, members: all, schedule };
 }
 
 /** "0 to 5 °C" / "at or below −18 °C" / "no range was set". */
@@ -289,12 +241,73 @@ export async function GET(request: Request) {
       const dir = kindMeta?.direction || 'either';
       const goal = range.target !== null ? range.target : (dir === 'hot' ? range.min : range.max);
       const u = range.uom === 'C' || range.uom === 'F' ? ` °${range.uom}` : ` ${range.uom}`;
+      const going = dir === 'hot' ? 'heating' : 'cooling';
+      const startWords = range.start_value !== null
+        ? `A batch with no 0-minute reading is measured from the rule's starting temperature, ${range.start_value}${u} at 0 minutes.`
+        : `This rule sets no starting temperature, so a batch whose first reading is taken part-way (minutes entered) has nothing to be measured from — a reading short of ${goal}${u} on such a batch is filed as a failure. Take the first reading as the food comes off the heat.`;
+
+      /* WHERE THIS READING WOULD GO, before it is filed — the same resolver and
+       * the same line rule the write path uses, read-only. Only when the screen
+       * asks with a time (`reading_at`), so the plain range preview is unchanged. */
+      let curvePreview: any = null;
+      const pvAt = fssaiClock(url.searchParams.get('reading_at'));
+      if (kindMeta?.window_minutes && pvAt && range.source !== 'none') {
+        const pvDate = isISODate(str(url.searchParams.get('business_date'))) ? str(url.searchParams.get('business_date')) : fssaiToday();
+        const typed = fssaiInt(url.searchParams.get('elapsed_minutes'));
+        const c = resolveFssaiCurve(db, {
+          logKind,
+          curveId: str(url.searchParams.get('curve_id')),
+          batchId: str(url.searchParams.get('batch_id')),
+          newCurve: url.searchParams.get('new_curve') === '1',
+          typedElapsed: typed !== null && typed >= 0 ? typed : null,
+          businessDate: pvDate,
+          readingAt: pvAt,
+          uom: range.uom === 'F' ? 'F' : 'C',
+          maxMinutes: range.max_minutes,
+          subject: {
+            equipmentId, materialId: str(url.searchParams.get('material_id')),
+            itemLabel: str(url.searchParams.get('item_label')).slice(0, 200),
+            areaLabel: str(url.searchParams.get('area_label')).slice(0, 200),
+            outletId: (await getCurrentOutletId()) || '',
+          },
+        });
+        if (!c.ok) {
+          curvePreview = { ok: false, error: c.error, code: c.code };
+        } else {
+          /* A new batch at 0 minutes starts its own line from the number about to
+           * be typed — nothing is "needed" of it yet. */
+          const startsLine = !c.start && c.elapsed === 0;
+          const line = startsLine
+            ? null
+            : fssaiCurveLineStart({ first: c.start, self: { value: null, elapsed: c.elapsed }, anchor: range.start_value });
+          const needed = line
+            ? fssaiCurveExpected({ startValue: line.value, startElapsed: line.minute, goal, maxMinutes: range.max_minutes, elapsed: c.elapsed })
+            : null;
+          curvePreview = {
+            ok: true,
+            mode: c.mode,
+            curve_id: c.key || '',
+            elapsed_minutes: c.elapsed,
+            starts_line: startsLine,
+            line_start: line,
+            /* null with starts_line false = no line at all: a reading short of
+             * the target will be filed as a failure (see the note). */
+            needed: needed === null ? null : Number(fssaiCurveExpectedShown(needed, dir)),
+            goal,
+            max_minutes: range.max_minutes,
+            past_window: range.max_minutes !== null && c.elapsed > range.max_minutes,
+            how: c.how,
+          };
+        }
+      }
+
       return Response.json({
         range,
         equipment_label: equipmentLabel,
         range_label: rangeWords(range.min, range.max, range.uom),
         direction: dir,
         wants_clock: !!kindMeta?.window_minutes,
+        curve_preview: curvePreview,
         /* The honest sentence, written here so every screen says the same thing. */
         note: range.source === 'none'
           ? 'No safe range has been set for this, so the reading will be recorded and marked as not judged. It will not be counted as a pass.'
@@ -303,7 +316,7 @@ export async function GET(request: Request) {
             : (kindMeta?.window_minutes && range.max_minutes && goal !== null
               /* Said BEFORE the number is typed, so a cook does not read the red
                * "out of range" on 30 °C as a breach half-way down. */
-              ? `Judged against "${range.standard_label}". While it is still ${dir === 'hot' ? 'heating' : 'cooling'}, a reading is judged against where it should be by then — on a straight line from this batch's first reading to ${goal}${u} at ${range.max_minutes} minutes — not against ${goal}${u} itself. At ${range.max_minutes} minutes it has to be at ${goal}${u}. Minutes are counted from the batch's first reading; enter 0 minutes to start a new batch.`
+              ? `Judged against "${range.standard_label}". While it is still ${going}, a reading is judged against where it should be by then — on a straight line from where the batch started at 0 minutes to ${goal}${u} at ${range.max_minutes} minutes — not against ${goal}${u} itself. At ${range.max_minutes} minutes it has to be at ${goal}${u}. Minutes are counted from the batch's first reading. ${startWords}`
               : `Judged against "${range.standard_label}".`),
       });
     }
@@ -321,7 +334,7 @@ export async function GET(request: Request) {
       if (!isRateKind(logKind)) {
         return Response.json({ error: 'Only cooling and reheating readings are kept as a curve.' }, { status: 400 });
       }
-      const s = curveSummary(db, logKind, key, nowMinuteIST());
+      const s = fssaiCurveSummary(db, logKind, key, fssaiNowMinuteIST());
       if (!s.members.length) return Response.json({ error: 'That batch is not in the file.' }, { status: 404 });
       const ids = s.members.map((m) => m.id);
       const rows = db.prepare(`${LOG_SELECT} WHERE t.id IN (${ids.map(() => '?').join(',')})`).all(...ids) as any[];
@@ -335,14 +348,14 @@ export async function GET(request: Request) {
       const readings = s.members
         .map((m) => ({ m, row: byId.get(m.id) }))
         .filter((x) => x.row && visible(x.row))
-        .map((x) => ({ ...shapeLog(x.row), schedule_value: x.m.status === 'void' ? null : s.schedule(x.m) }));
+        .map((x) => ({ ...shapeLog(x.row), schedule_value: s.schedule(x.m) }));
       if (!readings.length) {
         return Response.json({ error: 'That batch belongs to another department.' }, { status: 403 });
       }
       return Response.json({
         curve: s.summary,
         readings,
-        note: 'Each verdict is the one frozen on the reading when it was taken. "Schedule" is where the batch needed to be at that point, on a straight line from its first reading to the target at the time limit.',
+        note: 'Each verdict is the one frozen on the reading when it was taken. "Schedule" is where the batch needed to be at that point, on a straight line from where it started at 0 minutes — its own 0-minute reading, or the rule\'s starting temperature when it had none — to the target at the time limit.',
       });
     }
 
@@ -356,39 +369,19 @@ export async function GET(request: Request) {
       if (kindParam && !isRateKind(kindParam)) {
         return Response.json({ error: 'Only cooling and reheating readings are kept as a curve.' }, { status: 400 });
       }
-      const kinds = kindParam ? [kindParam] : FSSAI_TEMP_LOG_KINDS.filter((k) => k.window_minutes).map((k) => k.key);
-      const today = fssaiToday();
-      const where = [
-        `t.log_kind IN (${kinds.map(() => '?').join(',')})`,
-        `t.status <> 'void'`,
-        `t.business_date >= ?`,
-        `t.business_date <= ?`,
-      ];
-      const args: any[] = [...kinds, addDaysISO(today, -1), today];
+      /* ONE DEFINITION of "open" and "overdue" — fssaiOpenCurves in _p4/lib,
+       * shared with the scheduled jobs. This route only adds who may see what. */
       const vis = fssaiRecordVisibility(me, { department: 't.department_id', recordedBy: 't.recorded_by' }, mgmt, FSSAI_NO_MATCH);
-      if (vis.sql) { where.push(vis.sql); args.push(...vis.args); }
-      const rows = db.prepare(
-        `SELECT t.id, t.batch_id, t.log_kind, t.equipment_label, t.area_label, t.item_label
-           FROM fssai_temperature_logs t WHERE ${where.join(' AND ')}`,
-      ).all(...args) as any[];
-      const seen = new Map<string, any>();
-      for (const r of rows) {
-        const k = `${String(r.log_kind)}|${String(r.batch_id || '') || String(r.id)}`;
-        if (!seen.has(k)) seen.set(k, r);
-      }
-      const now = nowMinuteIST();
-      const open: any[] = [];
-      for (const [k, r] of seen) {
-        const key = k.slice(k.indexOf('|') + 1);
-        const s = curveSummary(db, String(r.log_kind), key, now);
-        if (!s.summary.start || s.summary.reached) continue;
-        open.push({
-          ...s.summary,
-          label: [String(r.item_label || ''), String(r.equipment_label || r.area_label || '')].filter(Boolean).join(' · ') || 'Unnamed',
-        });
-      }
-      open.sort((a, b) => `${a.start.business_date} ${a.start.reading_at}`.localeCompare(`${b.start.business_date} ${b.start.reading_at}`));
-      return Response.json({ curves: open });
+      const open = fssaiOpenCurves(db, {
+        today: fssaiToday(),
+        nowMinute: fssaiNowMinuteIST(),
+        logKind: kindParam || undefined,
+        where: vis.sql ? vis : null,
+      });
+      return Response.json({
+        curves: open,
+        overdue: open.filter((c) => c.outcome === 'overdue').length,
+      });
     }
 
     /* ══ ONE READING ════════════════════════════════════════════════════════ */
@@ -408,7 +401,7 @@ export async function GET(request: Request) {
       }
       const photos = db.prepare(
         `SELECT id, kind, mime, size_bytes, caption, filename, created_by, created_at,
-                (data_uri <> '') AS has_image
+                (data_uri <> '') AS has_image, status, voided_at, voided_by, void_reason
            FROM fssai_attachments
           WHERE entity_table = 'fssai_temperature_logs' AND entity_id = ?
           ORDER BY created_at ASC`,
@@ -423,6 +416,11 @@ export async function GET(request: Request) {
           size_bytes: Number(p.size_bytes) || 0, caption: String(p.caption || ''),
           filename: String(p.filename || ''), created_by: String(p.created_by || ''),
           created_at: String(p.created_at || ''), has_image: Number(p.has_image) ? 1 : 0,
+          /* A mistaken photograph is VOIDED, never removed: it stays listed, with
+           * who voided it and why. */
+          status: String(p.status || 'active'),
+          voided_at: String(p.voided_at || ''), voided_by: String(p.voided_by || ''),
+          void_reason: String(p.void_reason || ''),
         })),
         void_refusal: fssaiVoidRefusal(me, { status: row.status, voided_at: row.voided_at }, 'placeholder reason'),
         can_verify: canVerifyFssai(me, row.recorded_by) && String(row.status) === 'submitted',
@@ -800,6 +798,17 @@ export async function POST(request: Request) {
        * starts one. Any other kind keeps whatever batch it was given. */
       const batchIdToStore = placed ? (placed.key || id) : str(body?.batch_id);
 
+      /* WHERE THIS BATCH'S SCHEDULE LINE STARTS — at minute 0 and only there:
+       * the batch's own 0-minute reading (this one, if it starts the batch at 0),
+       * else the rule's starting temperature, else nowhere (and a reading short
+       * of the target is then failed). The choice is FROZEN on the row below, so
+       * voiding a reading or editing the rule later cannot move this verdict's
+       * line. fssaiCurveLineStart is the one rule; see it for why a part-way
+       * first reading can never be its own start. */
+      const lineStart: FssaiCurveStart | null = placed
+        ? fssaiCurveLineStart({ first: placed.start, self: { value, elapsed: placed.elapsed }, anchor: range.start_value })
+        : null;
+
       const verdict = judgeFssaiReading({
         value,
         min: range.min,
@@ -809,11 +818,7 @@ export async function POST(request: Request) {
         maxMinutes: maxMinutesUsed,
         target: range.target,
         direction: kindMeta.direction,
-        curveStart: placed
-          ? (placed.start
-            ? { value: placed.start.value, elapsedMinutes: placed.start.elapsed }
-            : { value, elapsedMinutes: placed.elapsed })
-          : null,
+        curveStart: lineStart ? { value: lineStart.value, elapsedMinutes: lineStart.minute, source: lineStart.source } : null,
       });
 
       const actionTaken = str(body?.action_taken).slice(0, 2000);
@@ -845,12 +850,14 @@ export async function POST(request: Request) {
               value_num, uom, decimals, min_used, max_used, target_used,
               elapsed_minutes, max_minutes_used,
               is_fail, is_judged, fail_reason, action_taken, ca_id, note,
-              status, recorded_by, recorded_name, outlet_id)
+              status, recorded_by, recorded_name, outlet_id,
+              curve_start_used, curve_start_minute, curve_start_source)
            VALUES (?, ?, ?, ?, ?, 'manual', '', '', '',
                    ?, ?, ?, ?, ?, ?, ?, ?, ?,
                    ?, ?, ?, ?, ?, ?, ?, ?,
                    ?, ?, ?, ?, '', ?,
-                   'submitted', ?, ?, ?)`,
+                   'submitted', ?, ?, ?,
+                   ?, ?, ?)`,
         ).run(
           id, businessDate, readingAt, shift, logKind,
           equipmentId, equipmentLabel, equipmentKind, areaLabel, departmentId,
@@ -859,6 +866,7 @@ export async function POST(request: Request) {
           elapsed, maxMinutesUsed,
           verdict.is_fail, verdict.is_judged, verdict.fail_reason, actionTaken, note,
           me.email || '', me.name || '', outletId,
+          lineStart ? lineStart.value : null, lineStart ? lineStart.minute : null, lineStart ? lineStart.source : '',
         );
 
         /* ── OWNER §4: OUT OF RANGE RAISES A CORRECTIVE ACTION ──────────────
@@ -869,11 +877,17 @@ export async function POST(request: Request) {
          * FAILURE is on the record in red either way. */
         if (verdict.is_fail) {
           const where = [equipmentLabel || areaLabel || itemLabel, shift].filter(Boolean).join(' · ');
+          /* A cooling or reheating failure is about the FOOD — "Cooling behind
+           * schedule — Chicken curry", not "— Kitchen": the place is where the pot
+           * stood. Every other kind names the unit or place first, as before. */
+          const subjectWords = clockApplies
+            ? [itemLabel, equipmentLabel || areaLabel].filter(Boolean).join(' · ')
+            : (equipmentLabel || areaLabel || itemLabel);
           raised = raiseFssaiRecordCa(db, {
             sourceKind: 'temperature',
             entityTable: 'fssai_temperature_logs',
             entityId: id,
-            title: `${fssaiTempLogKindLabel(logKind)} ${verdict.fail_reason.startsWith('Behind schedule') ? 'behind schedule' : 'out of range'} — ${equipmentLabel || areaLabel || itemLabel || 'unnamed'}`,
+            title: `${fssaiTempLogKindLabel(logKind)} ${verdict.fail_reason.startsWith('Behind schedule') ? 'behind schedule' : 'out of range'} — ${subjectWords || 'unnamed'}`,
             description: [
               `${verdict.fail_reason}`,
               `Read as ${fssaiDisplayReading(value, range.decimals)} °${uom} at ${readingAt} on ${businessDate}${where ? ` (${where})` : ''}.`,
@@ -914,6 +928,9 @@ export async function POST(request: Request) {
               batch_id: batchIdToStore, curve_mode: placed.mode, elapsed_minutes: elapsed,
               elapsed_typed: typedElapsed, max_minutes_used: maxMinutesUsed,
               curve_start_id: placed.start ? placed.start.id : id,
+              curve_start_used: lineStart ? lineStart.value : null,
+              curve_start_minute: lineStart ? lineStart.minute : null,
+              curve_start_source: lineStart ? lineStart.source : '',
             } : {}),
           },
           reason: daysBack > 0
@@ -954,6 +971,8 @@ export async function POST(request: Request) {
           start: placed.start
             ? { id: placed.start.id, business_date: placed.start.business_date, reading_at: placed.start.reading_at, value_num: placed.start.value }
             : { id, business_date: businessDate, reading_at: readingAt, value_num: value },
+          /* Where this verdict's schedule line started, as frozen on the row. */
+          line_start: lineStart,
           how: placed.how,
         } : null,
         /* THE ONE SENTENCE THAT MUST NOT BE LEFT TO THE SCREEN. An unjudged
@@ -1148,8 +1167,10 @@ export async function POST(request: Request) {
       }
       /* FOUR PER READING, the same budget as a checklist answer
        * (FSSAI_PHOTO_* in src/lib/fssai.ts). Not a new rule — the same one. */
+      /* A VOIDED photograph stays on the record but no longer takes a slot. */
       const have = Number((db.prepare(
-        `SELECT COUNT(*) AS n FROM fssai_attachments WHERE entity_table='fssai_temperature_logs' AND entity_id=?`,
+        `SELECT COUNT(*) AS n FROM fssai_attachments
+          WHERE entity_table='fssai_temperature_logs' AND entity_id=? AND status <> 'void'`,
       ).get(id) as any)?.n) || 0;
       if (have >= 4) {
         return Response.json(

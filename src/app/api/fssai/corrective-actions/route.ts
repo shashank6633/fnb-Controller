@@ -14,6 +14,10 @@ import {
   createFssaiCaTask, readFssaiCaTaskLink, readFssaiCaTaskLinks, readFssaiCaAlertTrail,
   sweepFssaiCaAlerts, readFssaiEscalationRules,
 } from '@/lib/fssai-alerts';
+import {
+  insertClosureFile, voidClosureFile, listClosureFiles, liveClosureCounts, closureSnapshot,
+  readClosureFileRow, closureFileResponse, CLOSURE_LIVE_FILES_PER_RECORD,
+} from '../_closure/lib';
 
 /**
  * CORRECTIVE ACTIONS (/api/fssai/corrective-actions) — the owner's §7 Q14.
@@ -49,9 +53,26 @@ import {
  *
  *   GET  ?id=<ca>                one action, everything on it
  *   GET  ?run_id=<run>           every action hanging off one record
+ *   GET  ?file=<attachment>      one closure photograph's image (same fence as ?id=)
  *   GET  [?status=&severity=&department_id=&owner=&q=&from=&to=&overdue=1]
  *   POST { action: 'assign'|'start'|'complete'|'verify'|'reopen'|'cancel'
- *                 |'create_task', id, … }
+ *                 |'create_task'|'attach_closure'|'void_file', id, … }
+ *
+ * ── CLOSURE PHOTOGRAPHS (Hyderabad audit line #120, 2026-10-14) ─────────────
+ * `attach_closure` { id, data_uri, filename?, caption? } puts ONE photograph of
+ * the fix on the action (fssai_attachments, purpose 'closure'). While the action
+ * is open or being fixed, whoever may record the fix may add one; once the fix
+ * is written down ('done'), only management may — the checker's own photograph
+ * — because the fixer's statement is frozen until it is sent back. A verified or
+ * cancelled action is closed evidence: nothing is added, nothing is voided.
+ * `void_file` { id, attachment_id, reason } VOIDS a photograph taken by mistake:
+ * management, a written reason, the row and its image KEPT and shown as void.
+ * There is no way to remove one. `complete` and `verify` freeze the live
+ * photographs (id + SHA-256) into their audit rows, so what the checker saw is
+ * on file however the set changes later. A photograph is never REQUIRED to
+ * close — "retrained the line cooks" has nothing to photograph — but `complete`
+ * says so in its reply and the screen shows "in words only", and
+ * readFssaiVisitClosureEvidence (../_closure/lib.ts) counts such points apart.
  *
  * ── THE TWO THINGS ADDED FOR §21 AND §23, AND WHAT THEY DO NOT DO ───────────
  * `create_task` makes the fix a job in the Task Manager staff already use and
@@ -109,6 +130,44 @@ function canSeeCa(me: any, row: any): boolean {
   return !!String(row.department_id || '') && row.department_id === me.department_id;
 }
 
+/**
+ * MAY THIS PERSON ADD A CLOSURE PHOTOGRAPH TO THIS ACTION NOW? '' when they may.
+ * `state` says whether the refusal is about the action (409) or the person (403).
+ *
+ *  · verified / cancelled — closed evidence. A checker signed the action off
+ *    against the photographs that were there; adding one afterwards would change
+ *    what was checked. A fault that comes back raises a fresh action.
+ *  · done — the fixer's statement is frozen until a manager sends it back (the
+ *    same rule fssaiCaCompleteRefusal holds for the words). Management may add
+ *    one: the checker photographing what they re-measured is the best closure
+ *    evidence there is.
+ *  · open / in_progress — whoever may record the fix (fssaiCaCompleteRefusal).
+ */
+function closureAttachRefusal(me: any, ca: any): { error: string; state: boolean } | null {
+  const st = String(ca.status || '');
+  if (st === 'verified') {
+    return { error: 'This action has been fixed and checked, so its photographs are closed evidence. If the fault comes back, the next failed check raises a fresh action.', state: true };
+  }
+  if (st === 'cancelled' || st === 'void') {
+    return { error: 'This action was cancelled, so nothing more is added to it.', state: true };
+  }
+  if (st === 'done') {
+    return canManageFssaiCa(me)
+      ? null
+      : { error: 'The fix has been written down and is waiting to be checked. The person checking it can add a photograph; if more is needed, a manager will send it back to you.', state: false };
+  }
+  const refusal = fssaiCaCompleteRefusal(me, { status: st, owner_email: ca.owner_email });
+  return refusal ? { error: refusal, state: false } : null;
+}
+
+/** May a photograph on this action still be voided? The ACTION's half of the rule. */
+function closureVoidStateRefusal(ca: any): string {
+  const st = String(ca.status || '');
+  if (st === 'verified') return 'This action has been fixed and checked with these photographs in front of the checker, so they stay exactly as they are.';
+  if (st === 'cancelled' || st === 'void') return 'This action was cancelled, so its photographs are closed evidence and stay as they are.';
+  return '';
+}
+
 export async function GET(request: Request) {
   const g = await requireFssaiUser();
   if ('resp' in g) return g.resp;
@@ -118,6 +177,21 @@ export async function GET(request: Request) {
     const db = getDb();
     const url = new URL(request.url);
 
+    /* ══ ONE CLOSURE PHOTOGRAPH'S IMAGE ═════════════════════════════════════
+     * The SAME fence as reading the action: a file is served only when it is
+     * on a corrective action this person may see. A file on any other table
+     * answers exactly like a missing one. Void files are served too — a void
+     * keeps its image; the screen marks it void. */
+    const fileId = str(url.searchParams.get('file'));
+    if (fileId) {
+      const row = readClosureFileRow(db, fileId);
+      const owner = row && String(row.entity_table) === 'fssai_corrective_actions' ? readOne(db, String(row.entity_id)) : null;
+      if (!row || !owner || !canSeeCa(me, owner.row)) {
+        return Response.json({ error: 'That photograph is not on a corrective action you can open.' }, { status: 404 });
+      }
+      return closureFileResponse(row);
+    }
+
     /* ══ ONE ACTION ═════════════════════════════════════════════════════════ */
     const id = str(url.searchParams.get('id'));
     if (id) {
@@ -126,7 +200,21 @@ export async function GET(request: Request) {
       if (!canSeeCa(me, found.row)) {
         return Response.json({ error: 'That corrective action belongs to another department.' }, { status: 403 });
       }
+      const attachRefusal = closureAttachRefusal(me, found.row);
+      const voidState = closureVoidStateRefusal(found.row);
       return Response.json({
+        /* Hyderabad audit line #120 — closure evidence. Live and void, oldest
+         * first; the image itself is fetched from each file's `url`. */
+        closure_files: listClosureFiles(db, 'fssai_corrective_actions', [id]).get(id) || [],
+        closure_rules: {
+          // '' = this person may add a photograph now; else the sentence why not.
+          attach_refusal: attachRefusal?.error || '',
+          // '' = a manager may void a photograph here with a reason; else why not.
+          void_refusal: !canManageFssaiCa(me)
+            ? 'Only a manager, head of department or administrator can void a photograph.'
+            : voidState,
+          live_limit: CLOSURE_LIVE_FILES_PER_RECORD,
+        },
         action: found.shaped,
         // '' means this person may do it. Anything else is the sentence to show,
         // computed by the SAME predicates the POST re-checks, so the button and
@@ -288,6 +376,9 @@ export async function GET(request: Request) {
        * action id. One query for the whole page, and absent means "no job",
        * never a fabricated id. */
       task_links: readFssaiCaTaskLinks(db, shaped.map((a) => a.id)),
+      /* Line #120 — live closure photographs per action, keyed by id. Absent
+       * means none; one grouped query for the whole page. */
+      closure_counts: liveClosureCounts(db, 'fssai_corrective_actions', shaped.map((a) => a.id)),
       /* Management sees whether the chase is armed at all; a screen that offers
        * "Chase now" while chasing is switched off would be lying. */
       chasing_enabled: readFssaiEscalationRules(db).enabled,
@@ -493,6 +584,9 @@ export async function POST(request: Request) {
           { status: 400 },
         );
       }
+      // What the fixer is putting their name to: the words AND the photographs
+      // live on the action right now, frozen by digest (line #120).
+      const photosAtCompletion = closureSnapshot(db, 'fssai_corrective_actions', id);
       try {
         apply(
           `status='done', action_taken=?, completed_at=datetime('now'), completed_by=?,
@@ -502,7 +596,7 @@ export async function POST(request: Request) {
           {
             field: 'status',
             before: { status: ca.status },
-            after: { status: 'done', completed_by: me.email || '' },
+            after: { status: 'done', completed_by: me.email || '', closure_photos: photosAtCompletion },
             // The note IS the reason — §19's "reason for change" and the fix
             // itself are one thing here.
             reason: actionTaken,
@@ -519,8 +613,12 @@ export async function POST(request: Request) {
       return Response.json({
         ok: true,
         action: readOne(db, id)?.shaped,
-        // Said out loud so nobody thinks recording the fix finished it.
-        note_to_staff: 'Recorded. Somebody else still has to check the fix before this action is closed.',
+        closure_photos: photosAtCompletion.length,
+        // Said out loud so nobody thinks recording the fix finished it — and,
+        // when it rests on words alone, so nobody thinks a photograph is on it.
+        note_to_staff: photosAtCompletion.length
+          ? `Recorded, with ${photosAtCompletion.length} photograph${photosAtCompletion.length === 1 ? '' : 's'}. Somebody else still has to check the fix before this action is closed.`
+          : 'Recorded, in words only — no photograph is on it. Somebody else still has to check the fix before this action is closed.',
       });
     }
 
@@ -541,6 +639,8 @@ export async function POST(request: Request) {
         );
       }
       const note = str(body?.verify_note).slice(0, 2000);
+      // What the checker had in front of them, frozen by digest (line #120).
+      const photosAtVerify = closureSnapshot(db, 'fssai_corrective_actions', id);
       try {
         apply(
           `status='verified', verified_by=?, verified_at=datetime('now'), verify_note=?`,
@@ -549,7 +649,7 @@ export async function POST(request: Request) {
           {
             field: 'status',
             before: { status: 'done', completed_by: ca.completed_by },
-            after: { status: 'verified', verified_by: me.email || '' },
+            after: { status: 'verified', verified_by: me.email || '', closure_photos: photosAtVerify },
             reason: note || 'Checked and accepted',
           },
         );
@@ -568,6 +668,7 @@ export async function POST(request: Request) {
          * closed a corrective action is exactly the person most likely to assume
          * the failed check is now a pass. */
         record_unchanged: 'The check that failed still reads as it did. This action records that the fault was mended and checked — it does not change the record.',
+        closure_photos: photosAtVerify.length,
       });
     }
 
@@ -740,9 +841,67 @@ export async function POST(request: Request) {
       );
     }
 
+    /* ══════════════════════════════════════════════════════════════════════
+     * ATTACH_CLOSURE — one photograph of the fix (Hyderabad audit line #120).
+     *
+     * ONE FILE PER CALL: production's nginx accepts about 1 MB, and a 400 KB
+     * photograph is ~533 KB once base64'd. The screen uploads each picture as
+     * it is taken, then the fix is written down with `complete`.
+     * ════════════════════════════════════════════════════════════════════ */
+    if (action === 'attach_closure') {
+      const refusal = closureAttachRefusal(me, ca);
+      if (refusal) {
+        return Response.json({ error: refusal.error, code: refusal.state ? 'closed' : 'not_allowed' }, { status: refusal.state ? 409 : 403 });
+      }
+      const res = insertClosureFile(db, {
+        entity_table: 'fssai_corrective_actions',
+        entity_id: id,
+        data_uri: str(body?.data_uri),
+        filename: str(body?.filename),
+        caption: str(body?.caption),
+        actor: { email: me.email, name: me.name },
+        outlet_id: outletId || ca.outlet_id || '',
+        reason: `Closure photograph for ${ca.ca_number || 'this corrective action'}`,
+      });
+      if ('error' in res) return Response.json({ error: res.error, code: res.code }, { status: res.status });
+      return Response.json({
+        ok: true,
+        file: res.file,
+        closure_files: listClosureFiles(db, 'fssai_corrective_actions', [id]).get(id) || [],
+        note_to_staff: 'Photograph added to this action. It cannot be removed — one taken by mistake is voided by a manager, with a reason, and stays on file marked void.',
+      });
+    }
+
+    /* ══════════════════════════════════════════════════════════════════════
+     * VOID_FILE — a photograph taken by mistake. VOIDED, never removed.
+     * Management + a written reason (fssaiVoidRefusal, inside voidClosureFile);
+     * the action itself must still be live (closureVoidStateRefusal).
+     * ════════════════════════════════════════════════════════════════════ */
+    if (action === 'void_file') {
+      const stateRefusal = closureVoidStateRefusal(ca);
+      if (stateRefusal && canManageFssaiCa(me)) {
+        return Response.json({ error: stateRefusal, code: 'closed' }, { status: 409 });
+      }
+      const res = voidClosureFile(db, {
+        attachment_id: str(body?.attachment_id),
+        entity_table: 'fssai_corrective_actions',
+        entity_id: id,
+        reason: str(body?.reason),
+        me: me as any,
+        outlet_id: outletId || ca.outlet_id || '',
+      });
+      if ('error' in res) return Response.json({ error: res.error, code: res.code }, { status: res.status });
+      return Response.json({
+        ok: true,
+        file: res.file,
+        closure_files: listClosureFiles(db, 'fssai_corrective_actions', [id]).get(id) || [],
+        note_to_staff: 'Voided. The photograph stays on the action, marked void with your reason — nothing was removed.',
+      });
+    }
+
     return Response.json(
       {
-        error: `"${action || 'nothing'}" is not something that can be done to a corrective action. Use assign, start, complete, verify, reopen, cancel or create_task.`,
+        error: `"${action || 'nothing'}" is not something that can be done to a corrective action. Use assign, start, complete, verify, reopen, cancel, create_task, attach_closure or void_file.`,
       },
       { status: 400 },
     );

@@ -60,7 +60,7 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import {
-  AlertTriangle, ArrowLeft, BellRing, CalendarDays, Check, ClipboardList, Info, Loader2,
+  AlertTriangle, ArrowLeft, BellRing, CalendarDays, Camera, Check, ClipboardList, Info, Loader2,
   Lock, RefreshCw, Search, Send, ShieldCheck, Undo2, UserCog, Wrench, X,
 } from 'lucide-react';
 import { apiJson } from '@/lib/api';
@@ -74,6 +74,7 @@ import { statusMeta as taskStatusMeta } from '@/lib/tasks';
 import type {
   FssaiEscalationRules, FssaiEscalationTarget, FssaiCaTaskLink, FssaiCaAlertEvent,
 } from '@/lib/fssai-alerts';
+import ClosurePhotos, { type ClosureFile } from './ClosurePhotos';
 
 interface Counts {
   open: number; in_progress: number; done: number;
@@ -88,6 +89,8 @@ interface ListResponse {
   truncated: boolean;
   task_links?: Record<string, FssaiCaTaskLink>;
   chasing_enabled?: boolean;
+  /** Live closure photographs per action (Hyderabad audit line #120). */
+  closure_counts?: Record<string, number>;
 }
 
 interface OneResponse {
@@ -100,6 +103,10 @@ interface OneResponse {
   task: FssaiCaTaskLink | null;
   /** Every reminder and escalation actually sent about it (owner §23). */
   alerts: FssaiCaAlertEvent[];
+  /** Photographs of the fix, live and void (Hyderabad audit line #120). */
+  closure_files: ClosureFile[];
+  /** '' = may do it now; otherwise the server's sentence. */
+  closure_rules: { attach_refusal: string; void_refusal: string; live_limit: number };
 }
 
 interface EscalationPicture {
@@ -256,7 +263,21 @@ function TaskChip({ link }: { link?: FssaiCaTaskLink }) {
   );
 }
 
-function ActionCard({ a, taskLink, onOpen }: { a: FssaiCaView; taskLink?: FssaiCaTaskLink; onOpen: () => void }) {
+/**
+ * "The fix has a photograph." A chip, only when there is one — Hyderabad audit
+ * line #120 asks for closure EVIDENCE, and the list is where a manager sees at a
+ * glance which closed fixes rest on words alone.
+ */
+function PhotoChip({ n }: { n?: number }) {
+  if (!n) return null;
+  return (
+    <span className="text-[11px] px-1.5 py-0.5 rounded border bg-white text-[#6B5744] border-[#E8D5C4] inline-flex flex-nowrap items-center gap-1">
+      <Camera size={11} className="shrink-0" /> {n}
+    </span>
+  );
+}
+
+function ActionCard({ a, taskLink, photos, onOpen }: { a: FssaiCaView; taskLink?: FssaiCaTaskLink; photos?: number; onOpen: () => void }) {
   return (
     <button
       onClick={onOpen}
@@ -265,6 +286,7 @@ function ActionCard({ a, taskLink, onOpen }: { a: FssaiCaView; taskLink?: FssaiC
       <div className="flex flex-wrap items-center gap-1.5">
         <Pills a={a} />
         <TaskChip link={taskLink} />
+        <PhotoChip n={photos} />
       </div>
       <p className="text-sm font-semibold text-[#2D1B0E] mt-1.5">{a.title}</p>
       <p className="text-xs text-[#6B5744] mt-0.5 truncate">{whereFrom(a)}</p>
@@ -296,6 +318,7 @@ export default function FssaiCorrectiveActionsPage() {
   const [mineOnly, setMineOnly] = useState(false);
   const [openId, setOpenId] = useState<string | null>(null);
   const [taskLinks, setTaskLinks] = useState<Record<string, FssaiCaTaskLink>>({});
+  const [closureCounts, setClosureCounts] = useState<Record<string, number>>({});
   const [chasingEnabled, setChasingEnabled] = useState<boolean | null>(null);
   const [showChasing, setShowChasing] = useState(false);
 
@@ -319,6 +342,7 @@ export default function FssaiCorrectiveActionsPage() {
       setCounts(j.counts || ZERO);
       setCanManage(!!j.can_manage);
       setTaskLinks(j.task_links || {});
+      setClosureCounts(j.closure_counts || {});
       setChasingEnabled(typeof j.chasing_enabled === 'boolean' ? j.chasing_enabled : null);
       setSignedOut(false);
     } catch (e) {
@@ -502,7 +526,7 @@ export default function FssaiCorrectiveActionsPage() {
           {/* cards under md */}
           <div className="md:hidden space-y-2">
             {rows!.map((a) => (
-              <ActionCard key={a.id} a={a} taskLink={taskLinks[a.id]} onOpen={() => setOpenId(a.id)} />
+              <ActionCard key={a.id} a={a} taskLink={taskLinks[a.id]} photos={closureCounts[a.id]} onOpen={() => setOpenId(a.id)} />
             ))}
           </div>
 
@@ -529,6 +553,7 @@ export default function FssaiCorrectiveActionsPage() {
                       <div className="flex flex-wrap items-center gap-1.5">
                         <Pills a={a} />
                         <TaskChip link={taskLinks[a.id]} />
+                        <PhotoChip n={closureCounts[a.id]} />
                       </div>
                     </td>
                     <td className="px-4 py-2 align-top max-w-[22rem]">
@@ -650,7 +675,28 @@ function ActionModal({
     }
   }, [id, load, onChanged]);
 
+  /* CLOSURE PHOTOGRAPHS (Hyderabad audit line #120). Each upload is its own
+   * request; the reply carries the action's files, so the modal updates in
+   * place rather than reloading under somebody halfway through typing the fix.
+   * apiJson throws the server's sentence, which ClosurePhotos shows. */
+  const attachClosure = useCallback(async (dataUri: string) => {
+    const j = await apiJson<{ closure_files: ClosureFile[] }>('/api/fssai/corrective-actions', {
+      method: 'POST', body: { id, action: 'attach_closure', data_uri: dataUri },
+    });
+    setV((prev) => (prev ? { ...prev, closure_files: j.closure_files || prev.closure_files } : prev));
+    onChanged('Photograph added to the fix.');
+  }, [id, onChanged]);
+
+  const voidClosure = useCallback(async (attachmentId: string, why: string) => {
+    const j = await apiJson<{ closure_files: ClosureFile[]; note_to_staff?: string }>('/api/fssai/corrective-actions', {
+      method: 'POST', body: { id, action: 'void_file', attachment_id: attachmentId, reason: why },
+    });
+    setV((prev) => (prev ? { ...prev, closure_files: j.closure_files || prev.closure_files } : prev));
+    onChanged(j.note_to_staff || 'Voided — it stays on file, marked void.');
+  }, [id, onChanged]);
+
   const a = v?.action;
+  const livePhotos = (v?.closure_files || []).filter((f) => f.status !== 'void').length;
 
   return (
     <div className="fixed inset-0 z-50 bg-black/40 flex items-end sm:items-center justify-center" onClick={onClose}>
@@ -763,6 +809,25 @@ function ActionModal({
                   </div>
                 </div>
               )}
+
+              {/* ── CLOSURE EVIDENCE · Hyderabad audit line #120 ─────────── */}
+              <div className="bg-white border border-[#E8D5C4] rounded-xl p-3">
+                <ClosurePhotos
+                  files={v.closure_files || []}
+                  title="Photographs of the fix"
+                  hint="The closure evidence an inspector asks for. Optional — a fix with nothing to photograph is closed in words — but a photograph cannot be removed once added: one taken by mistake is voided by a manager, with a reason, and stays on file marked void."
+                  attachRefusal={v.closure_rules ? v.closure_rules.attach_refusal : null}
+                  voidRefusal={v.closure_rules ? v.closure_rules.void_refusal : null}
+                  liveLimit={v.closure_rules?.live_limit}
+                  onAttach={attachClosure}
+                  onVoid={voidClosure}
+                  closedAt={a.completed_at}
+                  afterLabel="added after the fix was written down"
+                  emptyText={a.status === 'done' || a.status === 'verified'
+                    ? 'No photograph — this fix rests on the words above.'
+                    : 'No photograph yet.'}
+                />
+              </div>
 
               {/* ── §21 · THE JOB IN THE TASK MANAGER ─────────────────────── */}
               <div className="bg-white border border-[#E8D5C4] rounded-xl p-3">
@@ -963,6 +1028,13 @@ function ActionModal({
                     person needs to know. An action closed with no note proves nothing to an
                     inspector, and the person checking it has nothing to check.
                   </p>
+                  {/* Line #120 — the photographs go on BEFORE the words are saved:
+                    * once the fix is written down only the checker can add one. */}
+                  <p className={`text-xs ${livePhotos ? 'text-[#6B5744]' : 'text-amber-800'}`}>
+                    {livePhotos
+                      ? `${livePhotos} photograph${livePhotos === 1 ? '' : 's'} of the fix ${livePhotos === 1 ? 'is' : 'are'} on this action and will be saved with what you write.`
+                      : 'No photograph of the fix yet. If there is something to see — the new seal, the clean drain — add it under "Photographs of the fix" above before you save: once this is written down, only the person checking it can add one.'}
+                  </p>
                   <textarea
                     value={actionTaken}
                     onChange={(e) => setActionTaken(e.target.value)}
@@ -994,6 +1066,13 @@ function ActionModal({
                   <p className="text-xs text-[#6B5744]">
                     This closes the action. It does not change the check that failed — that record
                     stays exactly as it was recorded.
+                  </p>
+                  {/* Line #120 — what the checker is signing off ON. The server
+                    * freezes these photographs (by fingerprint) into the record. */}
+                  <p className={`text-xs ${livePhotos ? 'text-[#6B5744]' : 'text-amber-800'}`}>
+                    {livePhotos
+                      ? `You are checking the words and ${livePhotos} photograph${livePhotos === 1 ? '' : 's'} above. They are recorded with your sign-off, and stay on the action as they are.`
+                      : 'No photograph is on this fix — you are closing it on the words alone. Look at the fix yourself first; you can add your own photograph above.'}
                   </p>
                   <textarea
                     value={verifyNote}

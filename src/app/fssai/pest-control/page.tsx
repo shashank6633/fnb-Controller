@@ -1,7 +1,9 @@
 'use client';
 
 /**
- * PEST CONTROL LOGS (owner §7) — three registers on one screen.
+ * PEST CONTROL LOGS (owner §7) — four registers on one screen: sightings, the
+ * station-by-station monitoring sheet (#113), contractor visits with what they
+ * applied (#78), and the pest map.
  *
  * ── THE TWO DIFFERENT RIGHTS ON ONE SCREEN, WHICH IS THE WHOLE DESIGN ───────
  * The shell this replaces promised it in words and the API enforces it:
@@ -13,6 +15,10 @@
  *   · RECORDING THE CONTRACTOR'S VISIT IS A MANAGER'S JOB — the agency licence
  *     number and the chemical list on that row are what an inspector reads first.
  *   · THE PEST MAP IS CONFIGURATION, so it is the administrator's (owner §20).
+ *   · WALKING THE STATIONS IS OPEN TO EVERYONE, like a sighting — the steward who
+ *     walks them at closing files the sheet (_components/MonitoringTab.tsx).
+ *   · A WRONG FILE IS VOIDED, NEVER REMOVED: it stays on the record, marked VOID
+ *     with its reason (decision in src/app/api/fssai/pest/_pest/files.ts).
  * Each tab therefore shows what the SERVER said this person may do
  * (`can_record` / `can_close` / `can_configure`), and a button a person cannot
  * press is replaced by the reason rather than hidden — a hidden button reads as
@@ -33,10 +39,10 @@
  * the page scroll behind it.
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
-  AlertTriangle, Bug, CalendarClock, Camera, Check, Info, Loader2,
-  MapPin, Plus, RefreshCw, Search, ShieldAlert, Trash2, Truck, Wrench, X,
+  AlertTriangle, Bug, CalendarClock, Camera, Check, ClipboardCheck, Info, Loader2,
+  MapPin, Plus, Printer, RefreshCw, Search, ShieldAlert, Truck, Wrench, X,
 } from 'lucide-react';
 import { apiJson } from '@/lib/api';
 import { fmtIST, fmtISTDate } from '@/lib/format-date';
@@ -44,16 +50,19 @@ import ImageUpload, { ImageThumb } from '@/app/tasks/_components/ImageUpload';
 import {
   FSSAI_PEST_TYPES, FSSAI_PEST_EVIDENCE_KINDS, FSSAI_PEST_SEVERITIES,
   FSSAI_PEST_SERVICE_KINDS, FSSAI_PEST_SERVICE_STATUSES, FSSAI_PEST_DEVICE_KINDS,
-  FSSAI_CA_SEVERITIES, fssaiToday,
+  fssaiToday,
 } from '@/lib/fssai';
+import type { PestChemicalsVisit } from '@/app/api/fssai/pest/_pest/monitoring';
+import {
+  errMsg, INPUT, BTN_PRIMARY, BTN_PLAIN, BTN_DANGER, CARD, LABEL, REQ,
+  Badge, Modal, Files, Tile, Field, Para, RaiseCaForm, PrintOverlay, askReason, type FileRow,
+} from './_components/pest-ui';
+import { ChemicalsEditor, ChemicalsTable, chemBody, emptyChemValue, type ChemRow, type ChemValue } from './_components/Chemicals';
+import { ChemicalsRegisterPrint, VisitRecordPrint } from './_components/PestPrints';
+import MonitoringTab from './_components/MonitoringTab';
 
 /* ── shapes the API returns ────────────────────────────────────────────────── */
 
-interface FileRow {
-  id: string; kind: string; kind_label: string; data_uri: string; has_image: boolean;
-  filename: string; caption: string; size_bytes: number; image_dropped_at: string;
-  created_by: string; created_at: string;
-}
 interface CaLink {
   id: string; ca_number: string; status: string; due_date: string;
   owner_email: string; severity: string;
@@ -64,7 +73,8 @@ interface Service {
   agency_licence_no: string; technician_name: string;
   service_kind: string; service_kind_label: string; business_date: string;
   started_at: string; finished_at: string; areas_covered: string;
-  chemicals: Record<string, unknown>[]; findings: string; recommendations: string;
+  chemicals: ChemRow[]; chemicals_state: string; chemicals_none_note: string; can_record_chemicals: boolean;
+  findings: string; recommendations: string;
   report_no: string; document_id: string; document_title: string;
   contract_doc_id: string; contract_doc_title: string;
   next_due_date: string; staff_witness: string;
@@ -72,7 +82,7 @@ interface Service {
   ca_id: string; ca: CaLink | null; note: string;
   voided_at: string; voided_by: string; void_reason: string;
   created_by: string; created_at: string; updated_at: string;
-  is_editable: boolean; files: FileRow[]; file_limit: number;
+  is_editable: boolean; files: FileRow[]; active_file_count: number; file_limit: number;
 }
 interface Sighting {
   id: string; business_date: string; sighted_at: string;
@@ -88,7 +98,7 @@ interface Sighting {
   status: string; status_label: string; status_color: string;
   reported_by: string; reported_name: string; closed_at: string; closed_by: string;
   voided_at: string; void_reason: string; created_at: string;
-  is_open: boolean; files: FileRow[]; file_limit: number;
+  is_open: boolean; files: FileRow[]; active_file_count: number; file_limit: number;
 }
 interface Device {
   id: string; code: string; device_kind: string; device_kind_label: string;
@@ -97,6 +107,8 @@ interface Device {
   vendor_id: string; vendor_name: string; check_frequency: string;
   last_checked_at: string; notes: string; is_active: boolean; sort_order: number;
   sighting_count: number; last_sighting_date: string;
+  /** Where the station stands on the monitoring sheet; null for a retired one. */
+  sheet: { state: string; state_label: string; state_color: string; last_check_date: string; last_check_time: string; due_on: string } | null;
 }
 
 /* ── what each call returns ────────────────────────────────────────────────── */
@@ -112,149 +124,26 @@ interface LinkedSighting {
 interface SightingListResponse {
   sightings: Sighting[]; counts: SightingCounts; can_close: boolean; me: string; truncated: boolean;
 }
-interface SightingOneResponse { sighting: Sighting; can_amend: boolean; can_void: boolean }
+interface SightingOneResponse { sighting: Sighting; can_amend: boolean; can_void: boolean; can_void_files?: boolean }
 interface SightingSaveResponse { sighting?: Sighting; advice?: string }
 interface ServiceListResponse {
   services: Service[]; counts: ServiceCounts; can_record: boolean; can_void: boolean;
 }
-interface ServiceOneResponse { service: Service; sightings: LinkedSighting[] }
-interface ServiceSaveResponse { service?: Service; advice?: string }
+interface ServiceOneResponse { service: Service; sightings: LinkedSighting[]; can_void_files?: boolean; me?: string }
+interface ServiceSaveResponse { service?: Service; advice?: string; warnings?: string[] }
 interface DeviceListResponse { devices: Device[]; counts: { active: number; retired: number; all: number }; can_configure: boolean }
+interface ChemRegister {
+  from: string; to: string; visits: PestChemicalsVisit[];
+  totals: { visits: number; listed: number; none_applied: number; not_recorded: number; products: number };
+  problems: string[];
+}
 interface VendorsResponse { vendors?: { id: string; name: string }[]; rows?: { id: string; name: string }[] }
-interface UsersResponse { users?: { email?: string; name?: string }[] }
-
-/**
- * The server's own sentence for a failed call, or a fallback.
- *
- * apiJson throws an Error carrying `.error` from the response body, which is
- * written for a restaurant manager rather than a developer (RECON §2.3) — so the
- * message is shown as it arrives and only replaced when there is none.
- */
-function errMsg(e: unknown, fallback: string): string {
-  return e instanceof Error && e.message ? e.message : fallback;
-}
-
-/* ── shared class strings ──────────────────────────────────────────────────── */
-
-const INPUT =
-  'mt-1 w-full bg-white border border-[#D4B896] rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#af4408]';
-const BTN_PRIMARY =
-  'inline-flex flex-nowrap items-center gap-1.5 text-sm font-semibold bg-[#af4408] hover:bg-[#8a3606] text-white rounded-lg px-3 py-2 disabled:opacity-50';
-const BTN_PLAIN =
-  'inline-flex flex-nowrap items-center gap-1.5 text-sm border border-[#E8D5C4] bg-white rounded-lg px-3 py-2 hover:bg-[#FFF1E3] disabled:opacity-50';
-const CARD = 'bg-white rounded-xl border border-[#E8D5C4]';
-const LABEL = 'text-xs text-[#6B5744]';
-const REQ = <span className="text-[#af4408]">*</span>;
-
-function Badge({ label, color }: { label: string; color: string }) {
-  return (
-    <span className={`inline-flex flex-nowrap items-center gap-1 text-xs font-semibold px-2 py-0.5 rounded-full border ${color}`}>
-      {label}
-    </span>
-  );
-}
-
-/**
- * The house "safe modal" (RECON §1.4, vendors/page.tsx:331-373) plus the three
- * things RECON §1.6 says FSSAI should add to its OWN modals and nowhere else:
- * role="dialog", aria-modal and an Escape handler. Cheap, invisible, and not an
- * app-wide accessibility programme.
- *
- * On a phone it is a BOTTOM SHEET — the thumb is already there, and a dialog
- * centred on a 390px screen puts its buttons where the keyboard appears.
- */
-function Modal({
-  title, onClose, children, footer, wide,
-}: {
-  title: string; onClose: () => void; children: React.ReactNode;
-  footer?: React.ReactNode; wide?: boolean;
-}) {
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [onClose]);
-  return (
-    <div
-      className="fixed inset-0 z-[110] bg-black/40 flex items-end sm:items-center justify-center sm:p-4"
-      onClick={onClose}
-    >
-      <div
-        role="dialog"
-        aria-modal="true"
-        aria-label={title}
-        onClick={(e) => e.stopPropagation()}
-        className={`bg-white border border-[#E8D5C4] w-full ${wide ? 'sm:max-w-3xl' : 'sm:max-w-2xl'} shadow-xl flex flex-col overflow-hidden rounded-t-3xl sm:rounded-xl max-h-[88vh] sm:max-h-[90vh]`}
-      >
-        <div className="px-4 py-3 border-b border-[#E8D5C4] flex flex-nowrap items-center justify-between gap-2 shrink-0">
-          <h2 className="font-bold text-[#2D1B0E] min-w-0 truncate">{title}</h2>
-          <button onClick={onClose} aria-label="Close" className="w-9 h-9 rounded-lg hover:bg-[#FFF1E3] shrink-0">
-            <X size={16} className="mx-auto" />
-          </button>
-        </div>
-        <div className="p-4 space-y-4 overflow-y-auto">{children}</div>
-        {footer && (
-          <div className="px-4 py-3 border-t border-[#E8D5C4] flex flex-wrap justify-end gap-2 shrink-0">{footer}</div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-/** A tile of files on one record, with the one honest thing a thumbnail must say. */
-function Files({
-  files, limit, onAdd, onRemove, canAdd, canRemove, busy,
-}: {
-  files: FileRow[]; limit: number;
-  onAdd: (dataUri: string) => void; onRemove: (id: string) => void;
-  canAdd: boolean; canRemove: boolean; busy: boolean;
-}) {
-  return (
-    <div className="space-y-2">
-      <div className="flex flex-wrap items-center gap-2">
-        {files.map((f) => (
-          <div key={f.id} className="relative">
-            {f.has_image ? (
-              <ImageThumb src={f.data_uri} alt={f.filename || f.kind_label} size={64} />
-            ) : (
-              /* The row outlives the image by design (12-month retention). A blank
-               * square would read as a bug, so it says what happened and keeps
-               * the proof that the file was once there. */
-              <div
-                className="w-16 h-16 rounded-lg border border-[#E8D5C4] bg-[#FFF1E3] flex items-center justify-center text-[10px] text-center text-[#8B7355] px-1"
-                title={`Image removed ${fmtIST(f.image_dropped_at)}. The record of it remains.`}
-              >
-                image kept 12 months
-              </div>
-            )}
-            {canRemove && f.has_image && (
-              <button
-                onClick={() => onRemove(f.id)}
-                aria-label="Remove this file"
-                className="absolute -top-1.5 -right-1.5 w-6 h-6 rounded-full bg-white border border-[#E8D5C4] shadow text-red-600"
-              >
-                <Trash2 size={11} className="mx-auto" />
-              </button>
-            )}
-          </div>
-        ))}
-        {canAdd && files.length < limit && (
-          <ImageUpload value={[]} onAdd={onAdd} label="Add photo" disabled={busy} thumbSize={64} />
-        )}
-      </div>
-      <p className="text-[11px] text-[#8B7355]">
-        {files.length} of {limit} files. Photographs are shrunk on this device before they are sent, and the
-        picture itself is kept for twelve months — the record of it never goes.
-      </p>
-    </div>
-  );
-}
 
 /* ══════════════════════════════════════════════════════════════════════════ *
  * THE PAGE
  * ══════════════════════════════════════════════════════════════════════════ */
 
-type Tab = 'sightings' | 'visits' | 'map';
+type Tab = 'sightings' | 'checks' | 'visits' | 'map';
 
 export default function FssaiPestControlPage() {
   const [tab, setTab] = useState<Tab>('sightings');
@@ -279,7 +168,8 @@ export default function FssaiPestControlPage() {
           <div className="min-w-0 flex-1">
             <h1 className="text-2xl sm:text-3xl font-bold text-[#af4408]">Pest Control Logs</h1>
             <p className="text-xs text-[#8B7355]">
-              What the contractor did, what your own staff saw in between, and where the monitoring points are.
+              What your own staff saw, the station-by-station monitoring sheet, what the contractor did and applied, and
+              where the monitoring points are.
             </p>
           </div>
         </div>
@@ -289,6 +179,7 @@ export default function FssaiPestControlPage() {
         <div className="flex flex-wrap gap-2">
           {([
             { key: 'sightings', label: 'Sightings', icon: ShieldAlert },
+            { key: 'checks', label: 'Station checks', icon: ClipboardCheck },
             { key: 'visits', label: 'Contractor visits', icon: Truck },
             { key: 'map', label: 'Monitoring points', icon: MapPin },
           ] as { key: Tab; label: string; icon: typeof Bug }[]).map((t) => {
@@ -310,6 +201,7 @@ export default function FssaiPestControlPage() {
         </div>
 
         {tab === 'sightings' && <SightingsTab say={say} />}
+        {tab === 'checks' && <MonitoringTab say={say} />}
         {tab === 'visits' && <VisitsTab say={say} />}
         {tab === 'map' && <MapTab say={say} />}
 
@@ -480,7 +372,7 @@ function SightingsTab({ say }: { say: (m: string) => void }) {
                   <div className="flex flex-wrap gap-1.5 mt-2">
                     <Badge label={r.status_label} color={r.status_color} />
                     {r.ca && <Badge label={`Action ${r.ca.ca_number}`} color="bg-blue-100 text-blue-700 border-blue-200" />}
-                    {r.files.length > 0 && <Badge label={`${r.files.length} photo`} color="bg-slate-100 text-slate-600 border-slate-200" />}
+                    {r.active_file_count > 0 && <Badge label={`${r.active_file_count} photo`} color="bg-slate-100 text-slate-600 border-slate-200" />}
                   </div>
                 </button>
               ))}
@@ -540,17 +432,6 @@ function SightingsTab({ say }: { say: (m: string) => void }) {
           say={say}
         />
       )}
-    </div>
-  );
-}
-
-function Tile({ n, label, tone = 'plain' }: { n: number; label: string; tone?: 'plain' | 'good' | 'warn' | 'bad' }) {
-  const colour =
-    tone === 'bad' ? 'text-red-700' : tone === 'warn' ? 'text-amber-700' : tone === 'good' ? 'text-green-700' : 'text-[#2D1B0E]';
-  return (
-    <div className={`${CARD} p-3`}>
-      <p className={`text-2xl font-bold ${colour}`}>{n}</p>
-      <p className="text-[11px] text-[#8B7355]">{label}</p>
     </div>
   );
 }
@@ -764,6 +645,7 @@ function SightingDetail({
   const [row, setRow] = useState<Sighting | null>(null);
   const [canAmend, setCanAmend] = useState(false);
   const [canVoid, setCanVoid] = useState(false);
+  const [canVoidFiles, setCanVoidFiles] = useState(false);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
@@ -773,7 +655,7 @@ function SightingDetail({
     setLoading(true); setErr('');
     try {
       const j = await apiJson<SightingOneResponse>(`/api/fssai/pest/sightings?id=${encodeURIComponent(id)}`);
-      setRow(j.sighting); setCanAmend(!!j.can_amend); setCanVoid(!!j.can_void);
+      setRow(j.sighting); setCanAmend(!!j.can_amend); setCanVoid(!!j.can_void); setCanVoidFiles(!!j.can_void_files);
     } catch (e: unknown) { setErr(errMsg(e, 'Could not load the sighting')); }
     finally { setLoading(false); }
   }, [id]);
@@ -843,12 +725,11 @@ function SightingDetail({
           <div>
             <p className={`${LABEL} mb-1`}>Photographs</p>
             <Files
-              files={row.files} limit={row.file_limit} canAdd={canAmend} canRemove={canVoid} busy={busy}
+              files={row.files} limit={row.file_limit} canAdd={canAmend} canVoid={canVoidFiles && !row.voided_at} busy={busy}
               onAdd={(uri) => post({ action: 'attach', data_uri: uri, kind: 'photo' }, 'Photograph attached.')}
-              onRemove={(fid) => {
-                const reason = window.prompt('Why is this photograph being removed? The record of it stays either way.');
-                if (!reason || reason.trim().length < 4) { say('A reason of at least four characters is needed.'); return; }
-                post({ action: 'remove_file', attachment_id: fid, reason }, 'Photograph removed; the record of it stays.');
+              onVoid={(fid) => {
+                const reason = askReason('Voiding a photograph does NOT remove it: it stays on this sighting, marked VOID, with your reason.\n\nWhy is this photograph being voided?', say);
+                if (reason) post({ action: 'void_file', attachment_id: fid, reason }, 'Photograph voided — it stays on the record, marked, with your reason.');
               }}
             />
           </div>
@@ -921,98 +802,6 @@ function SightingDetail({
   );
 }
 
-function Field({ k, v }: { k: string; v: string }) {
-  return (
-    <div>
-      <dt className="text-[11px] text-[#8B7355]">{k}</dt>
-      <dd className="text-sm">{v}</dd>
-    </div>
-  );
-}
-function Para({ k, v }: { k: string; v: string }) {
-  return (
-    <div>
-      <p className="text-[11px] text-[#8B7355]">{k}</p>
-      <p className="text-sm whitespace-pre-wrap">{v}</p>
-    </div>
-  );
-}
-
-/**
- * Raising a corrective action asks for an OWNER and never guesses one.
- *
- * An action with nobody's name on it is the inert row this project has been
- * bitten by four times — it reads correctly and nothing ever happens. So the
- * server refuses a blank owner and this form will not submit one.
- */
-function RaiseCaForm({
-  busy, defaultTitle, defaultSeverity, onCancel, onSubmit,
-}: {
-  busy: boolean; defaultTitle: string; defaultSeverity: string;
-  onCancel: () => void;
-  onSubmit: (p: { title: string; owner_email: string; severity: string; description: string }) => void;
-}) {
-  const [title, setTitle] = useState(defaultTitle);
-  const [severity, setSeverity] = useState(defaultSeverity);
-  const [owner, setOwner] = useState('');
-  const [description, setDescription] = useState('');
-  const [users, setUsers] = useState<{ email: string; name: string }[]>([]);
-
-  useEffect(() => {
-    // /api/tasks/users is the house people list (RECON §1.2, UserPicker uses it)
-    // and it already exists. FSSAI never builds a second employee master.
-    (async () => {
-      try {
-        const j = await apiJson<UsersResponse>('/api/tasks/users');
-        setUsers((j.users || []).map((u) => ({ email: String(u.email || ''), name: String(u.name || u.email || '') })));
-      } catch { /* the picker degrades to a typed address, which the server validates */ }
-    })();
-  }, []);
-
-  return (
-    <div className="bg-[#FFF1E3] border border-[#E8D5C4] rounded-lg p-3 space-y-3">
-      <p className="text-sm font-semibold">Raise a corrective action</p>
-      <label className="block">
-        <span className={LABEL}>What has to be done {REQ}</span>
-        <input value={title} onChange={(e) => setTitle(e.target.value)} className={INPUT} />
-      </label>
-      <div className="grid sm:grid-cols-2 gap-3">
-        <label className="block">
-          <span className={LABEL}>Who will deal with it {REQ}</span>
-          <select value={owner} onChange={(e) => setOwner(e.target.value)} className={INPUT}>
-            <option value="">Choose somebody</option>
-            {users.map((u) => <option key={u.email} value={u.email}>{u.name}</option>)}
-          </select>
-        </label>
-        <label className="block">
-          <span className={LABEL}>How serious</span>
-          <select value={severity} onChange={(e) => setSeverity(e.target.value)} className={INPUT}>
-            {FSSAI_CA_SEVERITIES.map((s) => <option key={s.key} value={s.key}>{s.label}</option>)}
-          </select>
-        </label>
-      </div>
-      <label className="block">
-        <span className={LABEL}>Anything to add</span>
-        <textarea rows={2} value={description} onChange={(e) => setDescription(e.target.value)} className={INPUT} />
-      </label>
-      <p className="text-[11px] text-[#6B5744]">
-        The due date is set from the severity. The sighting itself does not change — the fix hangs off it, and closing
-        the fix never makes the sighting read as if nothing happened.
-      </p>
-      <div className="flex flex-wrap justify-end gap-2">
-        <button onClick={onCancel} className={BTN_PLAIN}>Cancel</button>
-        <button
-          disabled={busy || !owner || title.trim().length < 4}
-          onClick={() => onSubmit({ title, owner_email: owner, severity, description })}
-          className={BTN_PRIMARY}
-        >
-          {busy ? <Loader2 size={15} className="animate-spin" /> : <Wrench size={15} />} Raise it
-        </button>
-      </div>
-    </div>
-  );
-}
-
 /* ══════════════════════════════════════════════════════════════════════════ *
  * TAB 2 — CONTRACTOR VISITS. Management. 'Missed' is the row that matters.
  * ══════════════════════════════════════════════════════════════════════════ */
@@ -1028,6 +817,21 @@ function VisitsTab({ say }: { say: (m: string) => void }) {
   const [q, setQ] = useState('');
   const [newOpen, setNewOpen] = useState(false);
   const [detailId, setDetailId] = useState('');
+  const [regFrom, setRegFrom] = useState(() => {
+    const [y, m, d] = fssaiToday().split('-').map(Number);
+    return new Date(Date.UTC(y, m - 1, d - 92)).toISOString().slice(0, 10);
+  });
+  const [register, setRegister] = useState<ChemRegister | null>(null);
+  const [regBusy, setRegBusy] = useState(false);
+
+  async function openRegister() {
+    setRegBusy(true);
+    try {
+      const j = await apiJson<ChemRegister>(`/api/fssai/pest/checks?chemicals=1&from=${regFrom}&to=${fssaiToday()}`);
+      setRegister(j);
+    } catch (e: unknown) { say(errMsg(e, 'Could not load the chemicals register')); }
+    finally { setRegBusy(false); }
+  }
 
   const load = useCallback(async () => {
     setLoading(true); setErr('');
@@ -1088,6 +892,21 @@ function VisitsTab({ say }: { say: (m: string) => void }) {
             Recording a contractor&apos;s visit is a manager&apos;s job. You can still report a sighting.
           </p>
         )}
+      </div>
+
+      {/* #78 — what was applied, visit by visit, on paper. */}
+      <div className={`${CARD} p-3 flex flex-wrap items-end gap-3`}>
+        <p className="text-xs text-[#6B5744] min-w-0 flex-1">
+          <strong>Chemicals register</strong> — every completed visit with the products applied, their CIB&amp;RC
+          registration, batch, dilution and where they went down. A visit that does not say is printed as NOT RECORDED.
+        </p>
+        <label>
+          <span className={LABEL}>From</span>
+          <input type="date" value={regFrom} max={fssaiToday()} onChange={(e) => setRegFrom(e.target.value)} className={INPUT} />
+        </label>
+        <button onClick={openRegister} disabled={regBusy} className={BTN_PLAIN}>
+          {regBusy ? <Loader2 size={15} className="animate-spin" /> : <Printer size={15} />} Print the chemicals register
+        </button>
       </div>
 
       {err && <div className="bg-red-50 border border-red-200 rounded-lg p-3 text-sm text-red-800">{err}</div>}
@@ -1169,6 +988,11 @@ function VisitsTab({ say }: { say: (m: string) => void }) {
           onClose={() => setDetailId('')} onChanged={load} say={say}
         />
       )}
+      {register && (
+        <PrintOverlay title="Pest-control chemicals register" onClose={() => setRegister(null)} landscape>
+          <ChemicalsRegisterPrint data={register} />
+        </PrintOverlay>
+      )}
     </div>
   );
 }
@@ -1188,6 +1012,7 @@ function NewVisitModal({ onClose, onSaved }: { onClose: () => void; onSaved: (m:
   const [reportNo, setReportNo] = useState('');
   const [nextDue, setNextDue] = useState('');
   const [missedReason, setMissedReason] = useState('');
+  const [chem, setChem] = useState<ChemValue>(emptyChemValue());
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
 
@@ -1214,9 +1039,13 @@ function NewVisitModal({ onClose, onSaved }: { onClose: () => void; onSaved: (m:
           business_date: businessDate, status, areas_covered: areas,
           findings, recommendations, report_no: reportNo,
           next_due_date: nextDue, missed_reason: missedReason,
+          // What was applied belongs to a visit that HAPPENED; the server refuses
+          // it on any other status, so it is only sent for a completed one.
+          ...(status === 'completed' ? chemBody(chem) : {}),
         },
       });
-      onSaved(`Visit ${String(j.service?.service_no || '')} recorded.`);
+      const warn = (j.warnings || []).length ? ` Note: ${(j.warnings || []).join(' ')}` : '';
+      onSaved(`Visit ${String(j.service?.service_no || '')} recorded.${j.advice ? ` ${j.advice}` : ''}${warn}`);
     } catch (e: unknown) { setErr(errMsg(e, 'Could not record the visit')); }
     finally { setBusy(false); }
   }
@@ -1334,6 +1163,13 @@ function NewVisitModal({ onClose, onSaved }: { onClose: () => void; onSaved: (m:
         </span>
       </label>
 
+      {status === 'completed' && (
+        <div className="border-t border-[#E8D5C4] pt-3">
+          <p className="text-sm font-semibold mb-2">What was applied</p>
+          <ChemicalsEditor value={chem} onChange={setChem} />
+        </div>
+      )}
+
       <p className="text-[11px] text-[#6B5744]">
         The job sheet itself is attached after saving — one file at a time, so a large scan can never lose the record.
       </p>
@@ -1353,27 +1189,31 @@ function VisitDetail({
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
   const [raise, setRaise] = useState(false);
+  const [canVoidFiles, setCanVoidFiles] = useState(false);
+  /** 'complete' = the visit happened (with what was applied); 'chem' = fill a list nobody recorded. */
+  const [form, setForm] = useState<'' | 'complete' | 'chem'>('');
+  const [printOpen, setPrintOpen] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true); setErr('');
     try {
       const j = await apiJson<ServiceOneResponse>(`/api/fssai/pest/services?id=${encodeURIComponent(id)}`);
-      setRow(j.service); setSightings(j.sightings || []);
+      setRow(j.service); setSightings(j.sightings || []); setCanVoidFiles(!!j.can_void_files);
     } catch (e: unknown) { setErr(errMsg(e, 'Could not load the visit')); }
     finally { setLoading(false); }
   }, [id]);
   useEffect(() => { load(); }, [load]);
 
-  async function post(body: Record<string, unknown>, ok: string) {
+  async function post(body: Record<string, unknown>, ok: string): Promise<boolean> {
     setBusy(true); setErr('');
     try {
       const j = await apiJson<ServiceSaveResponse>('/api/fssai/pest/services', { method: 'POST', body: { ...body, id } });
-      say(j.advice || ok); await load(); onChanged();
-    } catch (e: unknown) { setErr(errMsg(e, 'That did not work')); }
+      const warn = (j.warnings || []).length ? ` Note: ${(j.warnings || []).join(' ')}` : '';
+      say(`${j.advice || ok}${warn}`); await load(); onChanged();
+      return true;
+    } catch (e: unknown) { setErr(errMsg(e, 'That did not work')); return false; }
     finally { setBusy(false); }
   }
-
-  const chemicals = useMemo(() => (row?.chemicals || []) as Record<string, unknown>[], [row]);
 
   return (
     <Modal title={row ? `${row.service_no} — ${row.vendor_name || 'agency not named'}` : 'Visit'} onClose={onClose} wide>
@@ -1427,34 +1267,31 @@ function VisitDetail({
           {row.findings && <Para k="What they found" v={row.findings} />}
           {row.recommendations && <Para k="What they recommended" v={row.recommendations} />}
 
-          {chemicals.length > 0 && (
+          {/* #78 — what was applied. Shown on EVERY completed visit, including
+              the ones that do not say: "not recorded" in red is the gap an
+              inspector would find, so it is never hidden. */}
+          {row.status === 'completed' && (
             <div>
               <p className={`${LABEL} mb-1`}>What was applied</p>
-              <div className="overflow-x-auto">
-                <table className="w-full text-xs">
-                  <thead className="bg-[#FFF1E3] text-[#6B5744]">
-                    <tr>
-                      <th className="text-left font-semibold px-2 py-1.5">Chemical</th>
-                      <th className="text-left font-semibold px-2 py-1.5">Batch</th>
-                      <th className="text-left font-semibold px-2 py-1.5">Dilution</th>
-                      <th className="text-left font-semibold px-2 py-1.5">Quantity</th>
-                      <th className="text-left font-semibold px-2 py-1.5">Licence</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-[#E8D5C4]">
-                    {chemicals.map((c, i) => (
-                      <tr key={i}>
-                        <td className="px-2 py-1.5">{String(c.name ?? '')}</td>
-                        <td className="px-2 py-1.5">{String(c.batch ?? '')}</td>
-                        <td className="px-2 py-1.5">{String(c.dilution ?? '')}</td>
-                        <td className="px-2 py-1.5">{String(c.qty ?? '')} {String(c.uom ?? '')}</td>
-                        <td className="px-2 py-1.5">{String(c.licence_no ?? '')}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
+              <ChemicalsTable state={row.chemicals_state} rows={row.chemicals} noneNote={row.chemicals_none_note} />
+              {row.can_record_chemicals && canRecord && form !== 'chem' && (
+                <button disabled={busy} onClick={() => setForm('chem')} className={`${BTN_PRIMARY} mt-2`}>
+                  <Plus size={15} /> Fill in what was applied, from the job sheet
+                </button>
+              )}
+              {row.can_record_chemicals && !canRecord && (
+                <p className="text-[11px] text-[#8B7355] mt-1">A manager fills this in from the technician&apos;s job sheet.</p>
+              )}
             </div>
+          )}
+          {form === 'chem' && (
+            <ChemicalsForm
+              busy={busy}
+              title="What was applied on this visit"
+              note="Once saved, this list is part of the record. To correct it later, the visit is voided with a reason and filed again."
+              onCancel={() => setForm('')}
+              onSubmit={async (v) => { if (await post({ action: 'record_chemicals', ...chemBody(v) }, 'Chemicals recorded.')) setForm(''); }}
+            />
           )}
 
           {(row.document_title || row.contract_doc_title) && (
@@ -1489,12 +1326,11 @@ function VisitDetail({
           <div>
             <p className={`${LABEL} mb-1`}>The contractor&apos;s report</p>
             <Files
-              files={row.files} limit={row.file_limit} canAdd={canRecord && !row.voided_at} canRemove={canVoid} busy={busy}
+              files={row.files} limit={row.file_limit} canAdd={canRecord && !row.voided_at} canVoid={canVoidFiles && !row.voided_at} busy={busy}
               onAdd={(uri) => post({ action: 'attach', data_uri: uri, kind: 'report' }, 'File attached.')}
-              onRemove={(fid) => {
-                const reason = window.prompt('Why is this file being removed? The record of it stays either way.');
-                if (!reason || reason.trim().length < 4) { say('A reason of at least four characters is needed.'); return; }
-                post({ action: 'remove_file', attachment_id: fid, reason }, 'File removed; the record of it stays.');
+              onVoid={(fid) => {
+                const reason = askReason('Voiding a file does NOT remove it: it stays on this visit, marked VOID, with your reason. Attach the right one beside it.\n\nWhy is this file being voided?', say);
+                if (reason) post({ action: 'void_file', attachment_id: fid, reason }, 'File voided — it stays on the record, marked, with your reason.');
               }}
             />
           </div>
@@ -1503,14 +1339,7 @@ function VisitDetail({
             <div className="flex flex-wrap gap-2 pt-2 border-t border-[#E8D5C4]">
               {row.status === 'planned' && (
                 <>
-                  <button
-                    disabled={busy}
-                    onClick={() => {
-                      const findings = window.prompt('The visit happened. What did they find? (you can leave this blank and add it later)') ?? '';
-                      post({ action: 'complete', findings }, 'Recorded as completed.');
-                    }}
-                    className={BTN_PRIMARY}
-                  >
+                  <button disabled={busy} onClick={() => setForm('complete')} className={BTN_PRIMARY}>
                     <Check size={15} /> It happened
                   </button>
                   <button
@@ -1520,7 +1349,7 @@ function VisitDetail({
                       if (reason.trim().length < 4) { say('A reason of at least four characters is needed.'); return; }
                       post({ action: 'miss', missed_reason: reason }, 'Recorded as missed.');
                     }}
-                    className="inline-flex flex-nowrap items-center gap-1.5 text-sm border border-red-200 text-red-700 bg-white rounded-lg px-3 py-2 hover:bg-red-50 disabled:opacity-50"
+                    className={BTN_DANGER}
                   >
                     <AlertTriangle size={15} /> It did not happen
                   </button>
@@ -1560,6 +1389,15 @@ function VisitDetail({
             </div>
           )}
 
+          {form === 'complete' && (
+            <CompleteVisitForm
+              busy={busy}
+              row={row}
+              onCancel={() => setForm('')}
+              onSubmit={async (body) => { if (await post({ action: 'complete', ...body }, 'Recorded as completed.')) setForm(''); }}
+            />
+          )}
+
           {raise && (
             <RaiseCaForm
               busy={busy}
@@ -1569,9 +1407,125 @@ function VisitDetail({
               onSubmit={async (p) => { setRaise(false); await post({ action: 'raise_ca', ...p }, 'Corrective action raised.'); }}
             />
           )}
+
+          <div className="pt-2 border-t border-[#E8D5C4]">
+            <button onClick={() => setPrintOpen(true)} className={BTN_PLAIN}><Printer size={15} /> Print this visit</button>
+          </div>
+          {printOpen && (
+            <PrintOverlay title={`Pest-control visit ${row.service_no}`} onClose={() => setPrintOpen(false)}>
+              <VisitRecordPrint v={row} />
+            </PrintOverlay>
+          )}
         </>
       )}
     </Modal>
+  );
+}
+
+/** "It happened" — the visit's outcome AND what was applied, in one form. */
+function CompleteVisitForm({
+  busy, row, onCancel, onSubmit,
+}: {
+  busy: boolean; row: Service; onCancel: () => void;
+  onSubmit: (body: Record<string, unknown>) => void;
+}) {
+  const [businessDate, setBusinessDate] = useState(row.business_date > fssaiToday() ? fssaiToday() : row.business_date);
+  const [technician, setTechnician] = useState(row.technician_name);
+  const [licence, setLicence] = useState(row.agency_licence_no);
+  const [reportNo, setReportNo] = useState(row.report_no);
+  const [areas, setAreas] = useState(row.areas_covered);
+  const [findings, setFindings] = useState(row.findings);
+  const [recommendations, setRecommendations] = useState(row.recommendations);
+  const [nextDue, setNextDue] = useState(row.next_due_date);
+  const [witness, setWitness] = useState(row.staff_witness);
+  const [chem, setChem] = useState<ChemValue>(emptyChemValue());
+  return (
+    <div className="bg-[#FFF1E3] border border-[#E8D5C4] rounded-lg p-3 space-y-3">
+      <p className="text-sm font-semibold">The visit happened</p>
+      <div className="grid sm:grid-cols-3 gap-3">
+        <label className="block">
+          <span className={LABEL}>Date it happened {REQ}</span>
+          <input type="date" value={businessDate} max={fssaiToday()} onChange={(e) => setBusinessDate(e.target.value)} className={INPUT} />
+        </label>
+        <label className="block">
+          <span className={LABEL}>Technician</span>
+          <input value={technician} onChange={(e) => setTechnician(e.target.value)} className={INPUT} />
+        </label>
+        <label className="block">
+          <span className={LABEL}>Agency licence number</span>
+          <input value={licence} onChange={(e) => setLicence(e.target.value)} className={INPUT} />
+        </label>
+      </div>
+      <div className="grid sm:grid-cols-3 gap-3">
+        <label className="block">
+          <span className={LABEL}>Report number</span>
+          <input value={reportNo} onChange={(e) => setReportNo(e.target.value)} className={INPUT} />
+        </label>
+        <label className="block">
+          <span className={LABEL}>Accompanied by (our staff)</span>
+          <input value={witness} onChange={(e) => setWitness(e.target.value)} className={INPUT} />
+        </label>
+        <label className="block">
+          <span className={LABEL}>Next visit due</span>
+          <input type="date" value={nextDue} min={businessDate} onChange={(e) => setNextDue(e.target.value)} className={INPUT} />
+        </label>
+      </div>
+      <label className="block">
+        <span className={LABEL}>Areas covered</span>
+        <textarea rows={2} value={areas} onChange={(e) => setAreas(e.target.value)} className={INPUT} />
+      </label>
+      <label className="block">
+        <span className={LABEL}>What they found</span>
+        <textarea rows={2} value={findings} onChange={(e) => setFindings(e.target.value)} className={INPUT} />
+      </label>
+      <label className="block">
+        <span className={LABEL}>What they recommended</span>
+        <textarea rows={2} value={recommendations} onChange={(e) => setRecommendations(e.target.value)} className={INPUT} />
+      </label>
+      <div className="border-t border-[#E8D5C4] pt-3">
+        <p className="text-sm font-semibold mb-2">What was applied</p>
+        <ChemicalsEditor value={chem} onChange={setChem} />
+      </div>
+      <p className="text-[11px] text-[#6B5744]">
+        Once it is marked completed the visit is a record. Leave the chemicals blank only if the job sheet has not
+        arrived — the visit then shows NOT RECORDED in red until a manager fills it in.
+      </p>
+      <div className="flex flex-wrap justify-end gap-2">
+        <button onClick={onCancel} className={BTN_PLAIN}>Cancel</button>
+        <button
+          disabled={busy || !businessDate}
+          onClick={() => onSubmit({
+            business_date: businessDate, technician_name: technician, agency_licence_no: licence, report_no: reportNo,
+            areas_covered: areas, findings, recommendations, next_due_date: nextDue, staff_witness: witness,
+            ...chemBody(chem),
+          })}
+          className={BTN_PRIMARY}
+        >
+          {busy ? <Loader2 size={15} className="animate-spin" /> : <Check size={15} />} Mark it completed
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/** Fill a chemicals list nobody recorded — once. */
+function ChemicalsForm({
+  busy, title, note, onCancel, onSubmit,
+}: { busy: boolean; title: string; note: string; onCancel: () => void; onSubmit: (v: ChemValue) => void }) {
+  const [chem, setChem] = useState<ChemValue>(emptyChemValue());
+  const ready = chem.none ? chem.noneNote.trim().length >= 4 : chem.rows.some((r) => r.name.trim().length >= 2);
+  return (
+    <div className="bg-[#FFF1E3] border border-[#E8D5C4] rounded-lg p-3 space-y-3">
+      <p className="text-sm font-semibold">{title}</p>
+      <ChemicalsEditor value={chem} onChange={setChem} />
+      <p className="text-[11px] text-[#6B5744]">{note}</p>
+      <div className="flex flex-wrap justify-end gap-2">
+        <button onClick={onCancel} className={BTN_PLAIN}>Cancel</button>
+        <button disabled={busy || !ready} onClick={() => onSubmit(chem)} className={BTN_PRIMARY}>
+          {busy ? <Loader2 size={15} className="animate-spin" /> : <Check size={15} />} Save what was applied
+        </button>
+      </div>
+    </div>
   );
 }
 
@@ -1612,9 +1566,9 @@ function MapTab({ say }: { say: (m: string) => void }) {
       <div className={`${CARD} p-4 text-xs text-[#6B5744] flex flex-nowrap items-start gap-2`}>
         <Info size={14} className="mt-0.5 shrink-0 text-[#af4408]" />
         <span>
-          This is a <strong>register of places</strong>, not a check log. &ldquo;Station 7 checked, no activity&rdquo; is
-          an answer on the monitoring checklist, not a row here — which is why there is no second table behind this and
-          no form asking you to tick each station. A station is stamped as checked when something is found in it.
+          This is the <strong>register of places</strong> — where each bait station, glue board and fly unit is, and how
+          often it must be checked. The checks themselves are filed on the <strong>Station checks</strong> tab, one line
+          per station, and the column below says where each station stands on that sheet.
         </span>
       </div>
 
@@ -1664,6 +1618,7 @@ function MapTab({ say }: { say: (m: string) => void }) {
                   <th className="text-left font-semibold px-3 py-2">Station</th>
                   <th className="text-left font-semibold px-3 py-2">Kind</th>
                   <th className="text-left font-semibold px-3 py-2">Where</th>
+                  <th className="text-left font-semibold px-3 py-2">Monitoring sheet</th>
                   <th className="text-left font-semibold px-3 py-2">Sightings</th>
                   <th className="text-left font-semibold px-3 py-2">Last found something</th>
                   <th className="text-right font-semibold px-3 py-2">{canConfigure ? '' : 'State'}</th>
@@ -1675,6 +1630,16 @@ function MapTab({ say }: { say: (m: string) => void }) {
                     <td className="px-3 py-2 font-medium whitespace-nowrap">{d.code || '—'}</td>
                     <td className="px-3 py-2 text-[#6B5744]">{d.device_kind_label}</td>
                     <td className="px-3 py-2">{d.location_label}{d.department_name ? <span className="text-[#8B7355]"> · {d.department_name}</span> : null}</td>
+                    <td className="px-3 py-2 whitespace-nowrap">
+                      {d.sheet ? (
+                        <span className="inline-flex flex-nowrap items-center gap-1.5">
+                          <Badge label={d.sheet.state_label} color={d.sheet.state_color} />
+                          <span className="text-[11px] text-[#8B7355]">
+                            {d.sheet.last_check_date ? `last ${fmtISTDate(d.sheet.last_check_date)}` : ''}{d.sheet.due_on ? ` · due ${fmtISTDate(d.sheet.due_on)}` : ''}
+                          </span>
+                        </span>
+                      ) : <span className="text-[#8B7355]">—</span>}
+                    </td>
                     <td className="px-3 py-2">{d.sighting_count || '—'}</td>
                     <td className="px-3 py-2 text-[#6B5744] whitespace-nowrap">{d.last_sighting_date ? fmtISTDate(d.last_sighting_date) : '—'}</td>
                     <td className="px-3 py-2 text-right">
@@ -1795,7 +1760,7 @@ function DeviceModal({
             <option value="fortnightly">Fortnightly</option>
             <option value="monthly">Monthly</option>
           </select>
-          <span className="text-[11px] text-[#8B7355]">A note for the monitoring checklist — nothing here enforces it.</span>
+          <span className="text-[11px] text-[#8B7355]">The monitoring sheet calls the station overdue when a check is missed by this much.</span>
         </label>
         <label className="block">
           <span className={LABEL}>Installed on</span>

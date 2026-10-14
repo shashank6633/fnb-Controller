@@ -22,9 +22,24 @@ import { fssaiNum, fssaiInt } from '../_p4/lib';
  * answer 500 instead of 409. That is the "guard that reads correctly and never
  * fires" shape this project has been bitten by four times, so the test is made
  * explicit here instead of being inferred from a truthy string.
+ *
+ * ⚠️ UNIQUE ONLY — NOT EVERY CONSTRAINT (measured 2026-10-14). This used to
+ * match any `SQLITE_CONSTRAINT*`, so a NOT NULL failure (create_suggested bound
+ * a missing `notes` as NULL into `notes TEXT NOT NULL`) came back as "One of
+ * those rules already exists under the same code" on an EMPTY table — 409,
+ * nothing written, and cooling could never be switched on. A NOT NULL or CHECK
+ * failure is a bug in this route and must surface as one (500 with the
+ * message), never be dressed up as a duplicate.
  */
 function isUniqueRefusal(e: any): boolean {
-  return String(e?.code || '').startsWith('SQLITE_CONSTRAINT');
+  const code = String(e?.code || '');
+  return code === 'SQLITE_CONSTRAINT_UNIQUE' || code === 'SQLITE_CONSTRAINT_PRIMARYKEY';
+}
+
+/** Cooling and reheating — the kinds judged on a clock, whose rule can carry a
+ *  starting temperature for the schedule line. */
+function isRateAppliesTo(v: string): boolean {
+  return !!FSSAI_TEMP_LOG_KINDS.find((k) => k.key === v)?.window_minutes;
 }
 
 /**
@@ -109,7 +124,7 @@ const STD_SELECT = `
   SELECT s.id, s.code, s.label, s.applies_to, s.equipment_kind, s.material_id,
          s.min_value, s.max_value, s.target_value, s.uom, s.decimals, s.max_minutes,
          s.authority, s.notes, s.is_active, s.is_seeded, s.sort_order,
-         s.created_by, s.created_at, s.updated_at,
+         s.created_by, s.created_at, s.updated_at, s.start_value,
          IFNULL(m.name,'') AS material_name
     FROM fssai_temp_standards s
     LEFT JOIN raw_materials m ON m.id = s.material_id`;
@@ -137,6 +152,10 @@ function shapeStandard(row: any) {
     uom: String(row.uom || 'C'),
     decimals: fssaiInt(row.decimals) ?? 1,
     max_minutes: fssaiInt(row.max_minutes),
+    /* Cooling / reheating: the temperature the schedule line starts from at 0
+     * minutes when a batch has no 0-minute reading. null = none, and such a
+     * batch's readings short of the target are then failed, never passed. */
+    start_value: fssaiNum(row.start_value),
     authority: String(row.authority || ''),
     notes: String(row.notes || ''),
     is_active: Number(row.is_active) ? 1 : 0,
@@ -161,18 +180,26 @@ function shapeStandard(row: any) {
  *
  * `authority` is filled in with where the number came from, in words, because an
  * inspector's first question about a range is "whose number is that".
+ *
+ * `start_value` (cooling and reheating only) is the schedule line's 0-minute
+ * anchor for a batch with no 0-minute reading of its own, picked on the STRICT
+ * side of where such food starts: cooling from 60 °C (cooked food is at or above
+ * it, and a lower start draws a lower — stricter — line), reheating from 5 °C
+ * (chilled food is at or below it, and a higher start draws a higher — stricter —
+ * line). `notes` is bound as '' because the column is NOT NULL: leaving it out
+ * bound NULL and made this button answer 409 on an empty table.
  */
 function suggestedStandards() {
   return [
-    { code: 'TEMP-CHILLER', label: 'Chiller and cold room', applies_to: 'equipment', equipment_kind: 'chiller', min_value: 0, max_value: 5, target_value: 4, uom: 'C', decimals: 1, max_minutes: null, authority: 'Common chilled-storage practice — confirm against your own equipment.' },
-    { code: 'TEMP-COLDROOM', label: 'Cold room', applies_to: 'equipment', equipment_kind: 'cold_room', min_value: 0, max_value: 5, target_value: 4, uom: 'C', decimals: 1, max_minutes: null, authority: 'Common chilled-storage practice — confirm against your own equipment.' },
-    { code: 'TEMP-FREEZER', label: 'Freezer', applies_to: 'equipment', equipment_kind: 'freezer', min_value: null, max_value: -18, target_value: -20, uom: 'C', decimals: 1, max_minutes: null, authority: 'Frozen storage at or below −18 °C.' },
-    { code: 'TEMP-HOTHOLD', label: 'Hot holding', applies_to: 'hot_holding', equipment_kind: '', min_value: 60, max_value: null, target_value: 65, uom: 'C', decimals: 1, max_minutes: null, authority: 'Hot food held at or above 60 °C.' },
-    { code: 'TEMP-COOKING', label: 'Cooking core temperature', applies_to: 'cooking', equipment_kind: '', min_value: 75, max_value: null, target_value: 75, uom: 'C', decimals: 1, max_minutes: null, authority: 'Core temperature at the end of cooking.' },
-    { code: 'TEMP-COOLING', label: 'Cooling after cooking', applies_to: 'cooling', equipment_kind: '', min_value: null, max_value: 5, target_value: 5, uom: 'C', decimals: 1, max_minutes: 240, authority: 'Cooked food brought down within a set time — a RATE, not a level.' },
-    { code: 'TEMP-REHEAT', label: 'Reheating', applies_to: 'reheating', equipment_kind: '', min_value: 75, max_value: null, target_value: 75, uom: 'C', decimals: 1, max_minutes: 120, authority: 'Reheated through within a set time.' },
-    { code: 'TEMP-DELIVERY-CHILL', label: 'Chilled delivery at the door', applies_to: 'delivery', equipment_kind: '', min_value: null, max_value: 5, target_value: null, uom: 'C', decimals: 1, max_minutes: null, authority: 'Chilled goods on arrival.' },
-    { code: 'OIL-TPM', label: 'Frying oil — total polar materials', applies_to: 'oil', equipment_kind: 'fryer', min_value: null, max_value: FSSAI_OIL_TPM_LIMIT_PCT, target_value: null, uom: 'pct', decimals: 1, max_minutes: null, authority: `FSSAI limit on total polar materials in frying oil: ${FSSAI_OIL_TPM_LIMIT_PCT}%. Oil above it must not be used.` },
+    { code: 'TEMP-CHILLER', label: 'Chiller and cold room', applies_to: 'equipment', equipment_kind: 'chiller', min_value: 0, max_value: 5, target_value: 4, uom: 'C', decimals: 1, max_minutes: null, start_value: null, notes: '', authority: 'Common chilled-storage practice — confirm against your own equipment.' },
+    { code: 'TEMP-COLDROOM', label: 'Cold room', applies_to: 'equipment', equipment_kind: 'cold_room', min_value: 0, max_value: 5, target_value: 4, uom: 'C', decimals: 1, max_minutes: null, start_value: null, notes: '', authority: 'Common chilled-storage practice — confirm against your own equipment.' },
+    { code: 'TEMP-FREEZER', label: 'Freezer', applies_to: 'equipment', equipment_kind: 'freezer', min_value: null, max_value: -18, target_value: -20, uom: 'C', decimals: 1, max_minutes: null, start_value: null, notes: '', authority: 'Frozen storage at or below −18 °C.' },
+    { code: 'TEMP-HOTHOLD', label: 'Hot holding', applies_to: 'hot_holding', equipment_kind: '', min_value: 60, max_value: null, target_value: 65, uom: 'C', decimals: 1, max_minutes: null, start_value: null, notes: '', authority: 'Hot food held at or above 60 °C.' },
+    { code: 'TEMP-COOKING', label: 'Cooking core temperature', applies_to: 'cooking', equipment_kind: '', min_value: 75, max_value: null, target_value: 75, uom: 'C', decimals: 1, max_minutes: null, start_value: null, notes: '', authority: 'Core temperature at the end of cooking.' },
+    { code: 'TEMP-COOLING', label: 'Cooling after cooking', applies_to: 'cooling', equipment_kind: '', min_value: null, max_value: 5, target_value: 5, uom: 'C', decimals: 1, max_minutes: 240, start_value: 60, notes: '', authority: 'Cooked food brought down within a set time — a RATE, not a level.' },
+    { code: 'TEMP-REHEAT', label: 'Reheating', applies_to: 'reheating', equipment_kind: '', min_value: 75, max_value: null, target_value: 75, uom: 'C', decimals: 1, max_minutes: 120, start_value: 5, notes: '', authority: 'Reheated through within a set time.' },
+    { code: 'TEMP-DELIVERY-CHILL', label: 'Chilled delivery at the door', applies_to: 'delivery', equipment_kind: '', min_value: null, max_value: 5, target_value: null, uom: 'C', decimals: 1, max_minutes: null, start_value: null, notes: '', authority: 'Chilled goods on arrival.' },
+    { code: 'OIL-TPM', label: 'Frying oil — total polar materials', applies_to: 'oil', equipment_kind: 'fryer', min_value: null, max_value: FSSAI_OIL_TPM_LIMIT_PCT, target_value: null, uom: 'pct', decimals: 1, max_minutes: null, start_value: null, notes: '', authority: `FSSAI limit on total polar materials in frying oil: ${FSSAI_OIL_TPM_LIMIT_PCT}%. Oil above it must not be used.` },
   ];
 }
 
@@ -283,6 +310,38 @@ function validateStandard(body: any, existing: any | null): { error: string } | 
     };
   }
 
+  /* ── COOLING AND REHEATING: THE TEMPERATURE TO REACH, AND WHERE THE LINE STARTS ──
+   * A rate rule with no temperature to reach (no target and no bound on the safe
+   * side) can never say a pot got there, so every reading short of it would be
+   * "not judged" — the inert-guard shape again. Refused. */
+  const rate = isRateAppliesTo(appliesTo);
+  const dir = FSSAI_TEMP_LOG_KINDS.find((k) => k.key === appliesTo)?.direction || 'either';
+  const goal = target !== null ? target : (dir === 'hot' ? min : max);
+  if (rate && goal === null) {
+    return {
+      error: dir === 'hot'
+        ? 'A reheating rule needs the temperature the food has to reach — a target or a minimum. Without one nothing can say whether it got there.'
+        : 'A cooling rule needs the temperature the food has to come down to — a target or a maximum. Without one nothing can say whether it got there.',
+    };
+  }
+  const startRaw = body?.start_value !== undefined ? body.start_value : existing?.start_value;
+  const startValue = fssaiNum(startRaw);
+  if (body?.start_value !== undefined && str(body.start_value) !== '' && body.start_value !== null && startValue === null) {
+    return { error: 'The starting temperature is not a number.' };
+  }
+  if (startValue !== null && !rate) {
+    return {
+      error: 'A starting temperature belongs only to a cooling or reheating rule — it is where the schedule line starts. Leave it empty for this one.',
+    };
+  }
+  if (startValue !== null && goal !== null && (dir === 'hot' ? startValue >= goal : startValue <= goal)) {
+    return {
+      error: dir === 'hot'
+        ? `Reheating starts below the temperature it has to reach. A starting temperature of ${startValue} with a target of ${goal} would draw no schedule at all.`
+        : `Cooling starts above the temperature it has to come down to. A starting temperature of ${startValue} with a target of ${goal} would draw no schedule at all.`,
+    };
+  }
+
   const decimals = body?.decimals !== undefined ? fssaiInt(body.decimals) : fssaiInt(existing?.decimals);
   const d = decimals === null || decimals < 0 || decimals > 3 ? 1 : decimals;
 
@@ -300,6 +359,7 @@ function validateStandard(body: any, existing: any | null): { error: string } | 
       uom,
       decimals: d,
       max_minutes: maxMinutes,
+      start_value: startValue,
       authority: str(body?.authority ?? existing?.authority).slice(0, 500),
       notes: str(body?.notes ?? existing?.notes).slice(0, 2000),
       sort_order: Number(body?.sort_order ?? existing?.sort_order) || 0,
@@ -328,12 +388,18 @@ export async function POST(request: Request) {
         `INSERT INTO fssai_temp_standards
            (id, code, label, applies_to, equipment_kind, material_id,
             min_value, max_value, target_value, uom, decimals, max_minutes,
-            authority, notes, is_active, is_seeded, sort_order, created_by, outlet_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)`,
+            authority, notes, is_active, is_seeded, sort_order, created_by, outlet_id,
+            start_value)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)`,
       ).run(
-        id, v.code, v.label, v.applies_to, v.equipment_kind, v.material_id,
-        v.min_value, v.max_value, v.target_value, v.uom, v.decimals, v.max_minutes,
-        v.authority, v.notes, isSeeded, v.sort_order, me.email || '', outletId,
+        /* Every TEXT NOT NULL column goes through str(): a value left out of the
+         * object binds NULL and fails the NOT NULL, which is how the
+         * suggested-rules button refused on an empty table. */
+        id, str(v.code), str(v.label), str(v.applies_to), str(v.equipment_kind), str(v.material_id),
+        fssaiNum(v.min_value), fssaiNum(v.max_value), fssaiNum(v.target_value), str(v.uom) || 'C',
+        fssaiInt(v.decimals) ?? 1, fssaiInt(v.max_minutes),
+        str(v.authority), str(v.notes), isSeeded, Number(v.sort_order) || 0, me.email || '', outletId,
+        fssaiNum(v.start_value),
       );
       fssaiAudit(db, {
         entity_table: 'fssai_temp_standards', entity_id: id, action: 'create',
@@ -353,6 +419,15 @@ export async function POST(request: Request) {
       const pool = suggestedStandards().filter((s) => wanted.includes(s.code));
       if (!pool.length) {
         return Response.json({ error: 'None of those is a rule this screen can offer.' }, { status: 400 });
+      }
+      /* THE OFFERED RULES PASS THE SAME GATE A TYPED ONE DOES — so this button can
+       * never store a rule validateStandard would refuse (an inert one, or an
+       * anchor on the wrong side of its target). */
+      for (const s of pool) {
+        const chk = validateStandard(s, null);
+        if ('error' in chk) {
+          return Response.json({ error: `The offered rule ${s.code} is not valid: ${chk.error}`, code: 'bad_suggestion' }, { status: 500 });
+        }
       }
       const created: string[] = [];
       const skipped: string[] = [];
@@ -433,12 +508,12 @@ export async function POST(request: Request) {
             `UPDATE fssai_temp_standards
                 SET code=?, label=?, applies_to=?, equipment_kind=?, material_id=?,
                     min_value=?, max_value=?, target_value=?, uom=?, decimals=?, max_minutes=?,
-                    authority=?, notes=?, sort_order=?, updated_at=datetime('now')
+                    authority=?, notes=?, sort_order=?, start_value=?, updated_at=datetime('now')
               WHERE id=?`,
           ).run(
-            v.code, v.label, v.applies_to, v.equipment_kind, v.material_id,
-            v.min_value, v.max_value, v.target_value, v.uom, v.decimals, v.max_minutes,
-            v.authority, v.notes, v.sort_order, id,
+            str(v.code), str(v.label), str(v.applies_to), str(v.equipment_kind), str(v.material_id),
+            v.min_value, v.max_value, v.target_value, str(v.uom) || 'C', v.decimals, v.max_minutes,
+            str(v.authority), str(v.notes), v.sort_order, v.start_value, id,
           );
           fssaiAudit(db, {
             entity_table: 'fssai_temp_standards', entity_id: id, action: 'update',
@@ -448,6 +523,7 @@ export async function POST(request: Request) {
               min_value: fssaiNum(existing.min_value), max_value: fssaiNum(existing.max_value),
               target_value: fssaiNum(existing.target_value), uom: existing.uom,
               max_minutes: fssaiInt(existing.max_minutes),
+              start_value: fssaiNum(existing.start_value),
             },
             after: v,
             reason: str(body?.reason) || 'Safe range changed',

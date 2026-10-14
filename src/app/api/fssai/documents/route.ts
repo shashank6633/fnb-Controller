@@ -8,9 +8,12 @@ import {
 } from '@/lib/fssai';
 import { requireFssaiUser, fssaiCsrfGuard, fssaiAudit, fssaiAppAudit, str } from '@/lib/fssai-server';
 import {
-  insertP6Attachment, dropP6AttachmentImage, p6AttachmentsFor, voidP6Record,
-  p6ConstraintMessage, isoDateOrBlank, intOrNull, P6_ATTACHMENTS_PER_RECORD,
+  voidP6Record, p6ConstraintMessage, isoDateOrBlank, intOrNull,
 } from '../p6-shared';
+import {
+  documentFilesFor, insertDocumentFile, voidDocumentFile, DOC_FILES_LIVE_LIMIT, type DocFile,
+} from './files';
+import { resolveFssaiCertificateHolder, fssaiDocumentHolders } from '@/lib/fssai-food-handlers';
 
 /**
  * DOCUMENTS AND CERTIFICATES (owner §17). /api/fssai/documents
@@ -48,8 +51,20 @@ import {
  * never the person who filed it, always with a reason.
  *
  *   GET  ?id=<id>                              one document, its files, its chain
- *   GET  [?state=&doc_type=&vendor_id=&person_email=&equipment_id=&q=&include_superseded=1]
- *   POST { action: 'create' | 'update' | 'renew' | 'void' | 'attach' | 'remove_file', … }
+ *   GET  [?state=&doc_type=&vendor_id=&person_email=&handler_id=&equipment_id=&q=&include_superseded=1]
+ *   POST { action: 'create' | 'update' | 'renew' | 'void' | 'attach' | 'void_file' | 'remove_file', … }
+ *
+ * ── A PERSON'S CERTIFICATE (2026-10-14, Hyderabad #55 #56 #106 #107) ────────
+ * Medical fitness, food-handler training and FoSTaC certificates are filed
+ * against a FOOD HANDLER on the register (handler_id → fssai_food_handlers), who
+ * does NOT need a login. Sending person_email alone still works for a login (the
+ * Q18 fallback) and is linked to that person's register row when there is one.
+ * The register and its coverage list live at /api/fssai/documents/food-handlers.
+ *
+ * ── FILES ARE VOIDED, NEVER STRIPPED (2026-10-14) ───────────────────────────
+ * 'void_file' (and the old name 'remove_file', kept so the existing screen keeps
+ * working) marks a mistaken scan VOID with a reason; the image stays in the row
+ * and is listed under voided_files. Rules and the measured defect: ./files.ts.
  *
  * NO DELETE (§19).
  */
@@ -61,22 +76,38 @@ const LIST_LIMIT = 400;
  *  the missing-licence warning would fire on every load — loud, never silent. */
 const FSSAI_LICENCE_TYPE = 'fssai_licence';
 
-const SELECT = `
+/**
+ * The register join is only written when the table exists — initializeSchema
+ * swallows DDL errors per statement, so "the table is missing" is a state this
+ * route must survive rather than 500 on (the house rule for a new table).
+ */
+function docSelect(db: any): string {
+  const haveRegister = !!db.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name='fssai_food_handlers'`).get();
+  const haveVoid = !!db.prepare(`SELECT 1 FROM pragma_table_xinfo('fssai_attachments') WHERE name = 'status'`).get();
+  const live = haveVoid ? `AND a.status <> 'void'` : '';
+  return `
   SELECT d.*,
          dep.name AS department_name,
          v.name   AS vendor_name,
          prev.title AS supersedes_title, prev.expiry_date AS supersedes_expiry,
          prev.reference_no AS supersedes_reference_no,
+         ${haveRegister ? `fh.full_name AS handler_name, fh.handler_no AS handler_no, fh.status AS handler_status,` : `'' AS handler_name, '' AS handler_no, '' AS handler_status,`}
          (SELECT COUNT(*) FROM fssai_attachments a
-            WHERE a.entity_table = 'fssai_documents' AND a.entity_id = d.id) AS file_count,
+            WHERE a.entity_table = 'fssai_documents' AND a.entity_id = d.id ${live}) AS file_count,
+         (SELECT COUNT(*) FROM fssai_attachments a
+            WHERE a.entity_table = 'fssai_documents' AND a.entity_id = d.id ${haveVoid ? `AND a.status = 'void'` : 'AND 0'}) AS void_file_count,
          (SELECT nx.id FROM fssai_documents nx WHERE nx.supersedes_id = d.id
             ORDER BY nx.created_at DESC LIMIT 1) AS superseded_by_id
     FROM fssai_documents d
     LEFT JOIN departments     dep  ON dep.id  = d.department_id
     LEFT JOIN vendors         v    ON v.id    = d.vendor_id
-    LEFT JOIN fssai_documents prev ON prev.id = d.supersedes_id`;
+    LEFT JOIN fssai_documents prev ON prev.id = d.supersedes_id
+    ${haveRegister ? `LEFT JOIN fssai_food_handlers fh ON fh.id = d.handler_id AND d.handler_id <> ''` : ''}`;
+}
 
-function shape(row: any, todayISO: string, files: any[] = []) {
+function shape(row: any, todayISO: string, allFiles: DocFile[] = [], holderLabel = '') {
+  const files = allFiles.filter((f) => !f.is_void);
+  const voidedFiles = allFiles.filter((f) => f.is_void);
   const voided = !!str(row.voided_at);
   const expiry = str(row.expiry_date);
   const reminderDays = Number.isFinite(Number(row.reminder_days)) ? Number(row.reminder_days) : FSSAI_DOC_REMINDER_DAYS;
@@ -112,6 +143,15 @@ function shape(row: any, todayISO: string, files: any[] = []) {
     vendor_id: str(row.vendor_id),
     vendor_name: str(row.vendor_name),
     person_email: str(row.person_email),
+    /** fssai_food_handlers.id — the person a certificate belongs to, login or not. */
+    handler_id: str(row.handler_id),
+    handler_name: str(row.handler_name),
+    handler_no: str(row.handler_no),
+    handler_status: str(row.handler_status),
+    /** Whose paper this is, in words, for any person-scope document ('' otherwise). */
+    holder_label: holderLabel
+      || (str(row.handler_name) ? `${str(row.handler_name)}${str(row.handler_no) ? ` (${str(row.handler_no)})` : ''}` : '')
+      || str(row.person_email),
     equipment_id: str(row.equipment_id),
     supersedes_id: str(row.supersedes_id),
     supersedes: str(row.supersedes_id) && str(row.supersedes_title)
@@ -133,9 +173,13 @@ function shape(row: any, todayISO: string, files: any[] = []) {
     created_by: str(row.created_by),
     created_at: str(row.created_at),
     updated_at: str(row.updated_at),
+    /** LIVE files only. A voided scan is not a copy of the certificate. */
     file_count: Number(row.file_count) || 0,
+    /** Voided scans: kept, image and all, listed under voided_files. */
+    void_file_count: Number(row.void_file_count) || 0,
     files,
-    file_limit: P6_ATTACHMENTS_PER_RECORD,
+    voided_files: voidedFiles,
+    file_limit: DOC_FILES_LIVE_LIMIT,
     is_editable: !voided && Number(row.is_active) === 1,
   };
 }
@@ -152,11 +196,11 @@ function resolveScope(
   db: any,
   docType: string,
   body: any,
-  fallback: { vendor_id: string; person_email: string; equipment_id: string; department_id: string },
-): { error: string } | { vendor_id: string; person_email: string; equipment_id: string; department_id: string } {
+  fallback: { vendor_id: string; person_email: string; handler_id: string; equipment_id: string; department_id: string },
+): { error: string } | { vendor_id: string; person_email: string; handler_id: string; equipment_id: string; department_id: string } {
   const type = fssaiDocType(docType);
   const scope = type?.scope || 'outlet';
-  const out = { vendor_id: '', person_email: '', equipment_id: '', department_id: '' };
+  const out = { vendor_id: '', person_email: '', handler_id: '', equipment_id: '', department_id: '' };
 
   out.department_id = body.department_id === undefined ? fallback.department_id : str(body.department_id);
   if (out.department_id) {
@@ -170,16 +214,29 @@ function resolveScope(
     const v = db.prepare(`SELECT id FROM vendors WHERE id = ?`).get(out.vendor_id);
     if (!v) return { error: 'That supplier is not in the vendor list.' };
   } else if (scope === 'person') {
-    out.person_email = (body.person_email === undefined ? fallback.person_email : str(body.person_email)).trim().toLowerCase();
-    if (!out.person_email) return { error: `A ${type?.label || 'document'} belongs to a person. Pick whose it is.` };
-    // §7 Q18, UNRULED: a person is keyed on EMAIL because hr_employees holds 0
-    // rows and users.email is the only stable staff key this app has today. The
-    // email is validated against the live user list so a typo cannot create a
-    // certificate belonging to nobody. If the owner later populates HR and
-    // switches to an employee id, existing rows keep theirs and the two keys do
-    // not collide.
-    const u = db.prepare(`SELECT email FROM users WHERE lower(email) = ?`).get(out.person_email);
-    if (!u) return { error: 'That is not somebody on the staff list. Pick a name rather than typing an address.' };
+    // OWNER RULING Q18 (2026-10-14): the person is a FOOD HANDLER on the
+    // register (handler_id), keyed on HRMS where HR is populated, else a login,
+    // else the name alone — so a cook with no login can be covered. The email
+    // stays as the fallback for a login: validated against the user list (a typo
+    // cannot create a certificate belonging to nobody) and linked to that
+    // person's register row when they have one. See resolveFssaiCertificateHolder.
+    //
+    // Which handler: the one the request names; else, when the request changes
+    // the login, the one that login belongs to; else the one already on file.
+    const emailIn = body.person_email === undefined ? undefined : str(body.person_email).trim().toLowerCase();
+    const emailChanged = emailIn !== undefined && emailIn !== fallback.person_email.trim().toLowerCase();
+    const handlerIn = body.handler_id !== undefined
+      ? str(body.handler_id)
+      : (emailChanged ? '' : fallback.handler_id);
+    const who = resolveFssaiCertificateHolder(db, {
+      handler_id: handlerIn,
+      // A request that names the handler takes the login FROM the handler; the
+      // old document's email must not be carried onto a different person.
+      person_email: emailIn !== undefined ? emailIn : (body.handler_id !== undefined ? '' : fallback.person_email),
+    });
+    if ('error' in who) return { error: who.error };
+    out.handler_id = who.handler_id;
+    out.person_email = who.person_email;
   } else if (scope === 'equipment') {
     out.equipment_id = body.equipment_id === undefined ? fallback.equipment_id : str(body.equipment_id);
     if (!out.equipment_id) return { error: `A ${type?.label || 'document'} belongs to a piece of equipment. Pick which one.` };
@@ -212,11 +269,14 @@ export async function GET(request: Request) {
     const url = new URL(request.url);
     const today = fssaiToday();
 
+    const SELECT = docSelect(db);
     const id = str(url.searchParams.get('id'));
     if (id) {
       const row = db.prepare(`${SELECT} WHERE d.id = ?`).get(id) as any;
       if (!row) return Response.json({ error: 'That document is no longer in the cupboard.' }, { status: 404 });
-      const files = p6AttachmentsFor(db, 'fssai_documents', [id], { withImage: true }).get(id) || [];
+      // Live AND voided files, with their images: a voided scan is kept and shown as void.
+      const files = documentFilesFor(db, [id], { withImage: true }).get(id) || [];
+      const holder = fssaiDocumentHolders(db, [{ id, handler_id: row.handler_id, person_email: row.person_email }]).get(id);
       // The whole renewal chain, oldest first, so "were we covered in March" has
       // one answer on one screen. Bounded at 20 links: a licence renewed twenty
       // times is a long enough history for any inspection, and an unbounded walk
@@ -237,7 +297,7 @@ export async function GET(request: Request) {
         cursor = str(up?.supersedes_id);
       }
       return Response.json({
-        document: shape(row, today, files),
+        document: shape(row, today, files, holder?.label || ''),
         chain,
         can_void: canManageFssaiCa(me),
         me: me.email,
@@ -270,16 +330,19 @@ export async function GET(request: Request) {
     if (vendorId) { where.push('d.vendor_id = ?'); args.push(vendorId); }
     const personEmail = str(url.searchParams.get('person_email')).toLowerCase();
     if (personEmail) { where.push('lower(d.person_email) = ?'); args.push(personEmail); }
+    const handlerId = str(url.searchParams.get('handler_id'));
+    if (handlerId) { where.push('d.handler_id = ?'); args.push(handlerId); }
     const equipmentId = str(url.searchParams.get('equipment_id'));
     if (equipmentId) { where.push('d.equipment_id = ?'); args.push(equipmentId); }
 
     const q = str(url.searchParams.get('q'));
     if (q) {
       const like = `%${q.toLowerCase()}%`;
+      // The holder's name is searchable too — "Ravi's medical" is how it is asked for.
       where.push(`(lower(d.title) LIKE ? OR lower(d.reference_no) LIKE ? OR lower(d.issuer) LIKE ?
                    OR lower(d.doc_code) LIKE ? OR lower(d.notes) LIKE ? OR lower(IFNULL(v.name,'')) LIKE ?
-                   OR lower(d.person_email) LIKE ?)`);
-      args.push(like, like, like, like, like, like, like);
+                   OR lower(d.person_email) LIKE ? OR lower(IFNULL(handler_name,'')) LIKE ?)`);
+      args.push(like, like, like, like, like, like, like, like);
     }
 
     const rows = db.prepare(
@@ -294,8 +357,11 @@ export async function GET(request: Request) {
     ).all(...args) as any[];
     const truncated = rows.length > LIST_LIMIT;
     const page = truncated ? rows.slice(0, LIST_LIMIT) : rows;
-    const files = p6AttachmentsFor(db, 'fssai_documents', page.map((r) => String(r.id)));
-    let shaped = page.map((r) => shape(r, today, files.get(String(r.id)) || []));
+    const files = documentFilesFor(db, page.map((r) => String(r.id)));
+    const holders = fssaiDocumentHolders(db, page
+      .filter((r) => fssaiDocType(str(r.doc_type))?.scope === 'person')
+      .map((r) => ({ id: String(r.id), handler_id: r.handler_id, person_email: r.person_email })));
+    let shaped = page.map((r) => shape(r, today, files.get(String(r.id)) || [], holders.get(String(r.id))?.label || ''));
 
     // The STATE filter has to be applied here, in JS, and not in SQL — because
     // the state is not a column. That is the cost of the decision in the header
@@ -398,6 +464,7 @@ export async function POST(request: Request) {
     const db = getDb();
     const outletId = (await getCurrentOutletId()) || '';
     const today = fssaiToday();
+    const SELECT = docSelect(db);
 
     /* ── CREATE ──────────────────────────────────────────────────────────── */
     if (action === 'create' || action === 'renew') {
@@ -431,6 +498,8 @@ export async function POST(request: Request) {
       const scope = resolveScope(db, docType, body, {
         vendor_id: prev ? str(prev.vendor_id) : '',
         person_email: prev ? str(prev.person_email) : '',
+        // A renewal is the same person's next certificate.
+        handler_id: prev ? str(prev.handler_id) : '',
         equipment_id: prev ? str(prev.equipment_id) : '',
         department_id: prev ? str(prev.department_id) : '',
       });
@@ -480,8 +549,8 @@ export async function POST(request: Request) {
                (id, doc_code, doc_type, title, reference_no, issuer, issued_on, valid_from,
                 expiry_date, reminder_days, owner_email, department_id, vendor_id, person_email,
                 equipment_id, supersedes_id, version, notes, status, is_active,
-                created_by, outlet_id, created_at, updated_at)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'submitted',1,?,?,?,?)`,
+                created_by, outlet_id, created_at, updated_at, handler_id)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'submitted',1,?,?,?,?,?)`,
           ).run(
             id, docCode, docType, title.slice(0, 300),
             str(body.reference_no ?? (prev ? prev.reference_no : '')).slice(0, 200),
@@ -492,7 +561,7 @@ export async function POST(request: Request) {
             isRenew ? String(prev.id) : '',
             isRenew ? (Number(prev.version) || 1) + 1 : 1,
             str(body.notes).slice(0, 4000),
-            me.email, outletId, now, now,
+            me.email, outletId, now, now, scope.handler_id,
           );
           if (isRenew) {
             // The old row is retired, NOT deleted and NOT voided: it was a real,
@@ -511,7 +580,8 @@ export async function POST(request: Request) {
             after: {
               doc_type: docType, title, reference_no: str(body.reference_no), expiry_date: expiry,
               supersedes_id: isRenew ? String(prev.id) : '', version: isRenew ? (Number(prev.version) || 1) + 1 : 1,
-              vendor_id: scope.vendor_id, person_email: scope.person_email, equipment_id: scope.equipment_id,
+              vendor_id: scope.vendor_id, person_email: scope.person_email, handler_id: scope.handler_id,
+              equipment_id: scope.equipment_id,
             },
             actor: { email: me.email, name: me.name }, outlet_id: outletId,
           });
@@ -554,9 +624,9 @@ export async function POST(request: Request) {
     /* ── FILES — the scan or photograph of the paper itself ──────────────── */
     if (action === 'attach') {
       if (voided) return Response.json({ error: 'That document has been voided, so nothing more can be added to it.' }, { status: 409 });
-      const out = db.transaction(() => insertP6Attachment(db, {
-        entity_table: 'fssai_documents', entity_id: id,
-        kind: str(body.kind) || 'certificate', data_uri: str(body.data_uri),
+      const out = db.transaction(() => insertDocumentFile(db, {
+        document_id: id,
+        kind: str(body.kind) || 'certificate', purpose: str(body.purpose), data_uri: str(body.data_uri),
         filename: str(body.filename), caption: str(body.caption),
         actor: { email: me.email, name: me.name }, outlet_id: outletId,
       }))();
@@ -564,16 +634,27 @@ export async function POST(request: Request) {
       return Response.json({ attachment: out.attachment });
     }
 
-    if (action === 'remove_file') {
-      // The scan must be on THIS document — dropP6AttachmentImage refuses one
-      // from any other record or register, and only allows a 24-hour correction
-      // (decision and rules documented there).
-      const out = db.transaction(() => dropP6AttachmentImage(db, {
-        id: str(body.attachment_id), entity_table: 'fssai_documents', entity_id: id,
+    /* ── VOID A FILE — never strip it ─────────────────────────────────────────
+     * DECISION (2026-10-14), documented in full in ./files.ts: a mistaken scan is
+     * VOIDED — status 'void' + who + when + why, an fssai_audit_log row, and the
+     * image KEPT in the row and still listed (voided_files). The file must be on
+     * THIS document: a file id from any other record or register is refused 404,
+     * exactly like a missing one. 'remove_file' is the old name for the same act,
+     * kept so the existing screen's button lands here and nowhere else; it no
+     * longer removes anything. */
+    if (action === 'void_file' || action === 'remove_file') {
+      const out = voidDocumentFile(db, {
+        document_id: id, attachment_id: str(body.attachment_id),
         reason: str(body.reason), me: me as any, outlet_id: outletId,
-      }))();
+      });
       if ('error' in out) return Response.json({ error: out.error }, { status: out.status });
-      return Response.json({ removed: out.dropped });
+      return Response.json({
+        voided: out.voided,
+        // The old key, for the screen that still reads it. Same object: the file
+        // was voided and KEPT, not removed.
+        removed: out.voided,
+        message: 'Scan voided. It stays on the document, marked void, with your reason.',
+      });
     }
 
     /* ── UPDATE — correct the details on the CURRENT version ─────────────── */
@@ -594,10 +675,16 @@ export async function POST(request: Request) {
       if (title.length < 3) return Response.json({ error: 'Give the document a name.' }, { status: 400 });
 
       const scope = resolveScope(db, docType, body, {
-        vendor_id: str(row.vendor_id), person_email: str(row.person_email),
+        vendor_id: str(row.vendor_id), person_email: str(row.person_email), handler_id: str(row.handler_id),
         equipment_id: str(row.equipment_id), department_id: str(row.department_id),
       });
       if ('error' in scope) return Response.json({ error: scope.error }, { status: 400 });
+      // RE-POINTING A CERTIFICATE AT A DIFFERENT PERSON needs a reason, like moving
+      // an expiry date: it changes who the register says is covered. Linking a
+      // certificate that belonged to nobody on the register ('' → a person) is a
+      // correction and needs none.
+      const holderMoved = (!!str(row.handler_id) && scope.handler_id !== str(row.handler_id))
+        || (!str(row.handler_id) && !!str(row.person_email) && scope.person_email !== str(row.person_email).toLowerCase());
 
       const issuedOn = body.issued_on === undefined ? str(row.issued_on) : isoDateOrBlank(body.issued_on);
       const validFrom = body.valid_from === undefined ? str(row.valid_from) : isoDateOrBlank(body.valid_from);
@@ -625,13 +712,18 @@ export async function POST(request: Request) {
           error: `This moves the expiry date from ${str(row.expiry_date)} to ${expiry || '(none)'}. Say in words why — that date decides whether the file says you were covered.`,
         }, { status: 400 });
       }
+      if (holderMoved && reason.length < 4) {
+        return Response.json({
+          error: 'This moves the certificate to a different person. Say in words why — it changes who the register says is covered.',
+        }, { status: 400 });
+      }
 
       const before = {
         doc_type: str(row.doc_type), title: str(row.title), reference_no: str(row.reference_no),
         issuer: str(row.issuer), issued_on: str(row.issued_on), valid_from: str(row.valid_from),
         expiry_date: str(row.expiry_date), reminder_days: Number(row.reminder_days),
         owner_email: str(row.owner_email), vendor_id: str(row.vendor_id),
-        person_email: str(row.person_email), equipment_id: str(row.equipment_id),
+        person_email: str(row.person_email), handler_id: str(row.handler_id), equipment_id: str(row.equipment_id),
         department_id: str(row.department_id), notes: str(row.notes),
       };
       const now = new Date().toISOString();
@@ -642,7 +734,7 @@ export async function POST(request: Request) {
                 SET doc_code = ?, doc_type = ?, title = ?, reference_no = ?, issuer = ?,
                     issued_on = ?, valid_from = ?, expiry_date = ?, reminder_days = ?,
                     owner_email = ?, department_id = ?, vendor_id = ?, person_email = ?,
-                    equipment_id = ?, notes = ?, updated_at = ?
+                    equipment_id = ?, notes = ?, updated_at = ?, handler_id = ?
               WHERE id = ?`,
           ).run(
             body.doc_code === undefined ? str(row.doc_code) : str(body.doc_code),
@@ -652,15 +744,16 @@ export async function POST(request: Request) {
             issuedOn, validFrom, expiry,
             reminderDays === null ? Number(row.reminder_days) || FSSAI_DOC_REMINDER_DAYS : reminderDays,
             ownerEmail, scope.department_id, scope.vendor_id, scope.person_email, scope.equipment_id,
-            str(body.notes ?? row.notes).slice(0, 4000), now, id,
+            str(body.notes ?? row.notes).slice(0, 4000), now, scope.handler_id, id,
           );
           fssaiAudit(db, {
             entity_table: 'fssai_documents', entity_id: id, action: 'update',
-            field: expiryMoved ? 'expiry_date' : '',
+            field: expiryMoved ? 'expiry_date' : holderMoved ? 'handler_id' : '',
             before, after: {
               doc_type: docType, title, reference_no: str(body.reference_no ?? row.reference_no),
               expiry_date: expiry, owner_email: ownerEmail,
-              vendor_id: scope.vendor_id, person_email: scope.person_email, equipment_id: scope.equipment_id,
+              vendor_id: scope.vendor_id, person_email: scope.person_email, handler_id: scope.handler_id,
+              equipment_id: scope.equipment_id,
             },
             reason, actor: { email: me.email, name: me.name }, outlet_id: outletId,
           });

@@ -10,6 +10,11 @@ import {
   requireFssaiUser, fssaiCsrfGuard, fssaiAudit, fssaiAppAudit, str, constraintMessage, nextFssaiCaNumber,
 } from '@/lib/fssai-server';
 import { deptLabel, fssaiTableExists, intOr, whereAll, departmentNames } from '../_p9/lib';
+import {
+  insertClosureFile, voidClosureFile, closureSnapshot, readClosureFileRow, closureFileResponse,
+  readFssaiOneVisitClosureEvidence, reportDocumentCandidates, reportDocumentRefusal, readReportDocument,
+  CLOSURE_LIVE_FILES_PER_RECORD, type ClosureEntityTable,
+} from '../_closure/lib';
 
 /**
  * INSPECTIONS AND THEIR FINDINGS (/api/fssai/inspections) — owner §16, §18.
@@ -68,12 +73,42 @@ import { deptLabel, fssaiTableExists, intOr, whereAll, departmentNames } from '.
  * at a moment in time, and nothing in this file touches one.
  *
  *   GET  ?id=<inspection>       one visit, with every finding on it
+ *   GET  ?file=<attachment>     one image: a report copy, a closure photograph,
+ *                               a CA's closure photograph or a linked document's scan
  *   GET  [?status=&kind=&from=&to=&department_id=&q=]   the history
  *   POST { action: 'create'|'update'|'close'|'reopen'|'void'
  *                 |'add_finding'|'update_finding'|'close_finding'|'reopen_finding'
- *                 |'raise_ca', … }
+ *                 |'raise_ca'|'link_report'|'attach_report'|'attach_closure'|'void_file', … }
  *        raise_ca: { id: <finding>, ca_severity?, ca_due_date?, ca_owner_email? }
  *        add_finding also takes raise_ca: true plus the same three ca_* fields.
+ *        link_report:    { id: <inspection>, document_id ('' to unlink), reason? }
+ *        attach_report:  { id: <inspection>, data_uri, filename?, caption? }
+ *        attach_closure: { id: <finding>,    data_uri, filename?, caption? }
+ *        void_file:      { id: <inspection or finding>, attachment_id, reason }
+ *
+ * ── THE REPORT AND THE CLOSURE EVIDENCE (Hyderabad audit line #120) ─────────
+ * "Previous audit report and closure evidence" was words only, and the visit's
+ * `document_id` could not be set from this page — while the route stored ANY
+ * string it was sent, so a dangling id read as "the report is linked".
+ *   · The report is LINKED (`link_report`, or document_id on create/update) to a
+ *     document filed in Documents & Certificates. The id must exist, must not be
+ *     voided, and must be filed as an audit report ('other' is accepted for a
+ *     report filed before that type existed). Replacing or clearing a link needs
+ *     a reason; the old id stays in the audit row.
+ *   · Or the report is PHOTOGRAPHED onto the visit (`attach_report`, purpose
+ *     'report'). Allowed after the visit is closed — the report often arrives by
+ *     post — never on a voided visit.
+ *   · Each point takes CLOSURE PHOTOGRAPHS (`attach_closure`, purpose
+ *     'closure') while its visit is not closed or voided — before, during or
+ *     after the point itself is closed; the screen marks one added after the
+ *     point was closed. Closing the visit seals them.
+ *   · `void_file` VOIDS a file taken by mistake — management, a reason, the row
+ *     and its image kept and shown as void. Nothing here removes a file.
+ *   · `close_finding` freezes the point's live photographs (id + SHA-256) into
+ *     its audit row. A photograph is not required to close a point; the reply
+ *     says when a point was closed on words alone.
+ * The writes live in ../_closure/lib.ts; readFssaiVisitClosureEvidence there is
+ * the read the audit file's record 20 should call.
  *
  * MANAGEMENT ONLY, both verbs. This holds a regulator's findings about the
  * business; §7 Q10's default is that cross-department and inspection material is
@@ -375,6 +410,51 @@ function raiseCaFromFinding(
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
+ * THE REPORT AND THE CLOSURE EVIDENCE — see the header (line #120)
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/** The tables whose files this route will serve through ?file= (management only). */
+const SERVABLE_FILE_TABLES = [
+  'fssai_inspections', 'fssai_inspection_findings', 'fssai_corrective_actions', 'fssai_documents',
+];
+
+/**
+ * MAY FILES ON THIS VISIT'S POINTS STILL CHANGE? null when they may.
+ * A voided visit is closed evidence; a CLOSED visit has been sealed with its
+ * points as they stand, so a closure photograph is added or voided only after
+ * the visit is reopened — which leaves its own reason in the file.
+ */
+function pointFilesRefusal(insp: any): { error: string; status: number } | null {
+  if (!insp) return { error: 'The inspection this point belongs to no longer exists.', status: 404 };
+  if (String(insp.status) === 'void') {
+    return { error: 'That inspection has been voided. A voided record and its files stay exactly as they are.', status: 409 };
+  }
+  if (String(insp.status) === 'closed') {
+    return { error: 'That inspection is closed, so its points and their photographs are sealed. Reopen it first — the reason goes in the file.', status: 409 };
+  }
+  return null;
+}
+
+/** May the visit's report copy or link still change? Only a void visit refuses. */
+function reportFilesRefusal(insp: any): { error: string; status: number } | null {
+  if (!insp) return { error: 'That inspection no longer exists.', status: 404 };
+  if (String(insp.status) === 'void') {
+    return { error: 'That inspection has been voided. A voided record and its files stay exactly as they are.', status: 409 };
+  }
+  return null;
+}
+
+/**
+ * A document_id sent on create / update / link_report, checked. '' clears.
+ * Returns the refusal Response, or null when it may be stored.
+ */
+function documentIdRefusal(db: any, documentId: string): Response | null {
+  if (!documentId) return null;
+  const r = reportDocumentRefusal(db, documentId);
+  return r ? Response.json({ error: r.error, code: 'bad_document' }, { status: r.status }) : null;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
  * GET
  * ══════════════════════════════════════════════════════════════════════════ */
 
@@ -392,6 +472,19 @@ export async function GET(request: Request) {
     const url = new URL(request.url);
     const today = fssaiToday();
     const deptMap = departmentNames(db);
+
+    /* ── ONE IMAGE ──────────────────────────────────────────────────────────
+     * Management only (the gate above), and only from the four registers this
+     * screen shows files from. Anything else answers like a missing file. A
+     * void file is served too — a void keeps its image; the screen marks it. */
+    const fileId = str(url.searchParams.get('file'));
+    if (fileId) {
+      const row = readClosureFileRow(db, fileId);
+      if (!row || !SERVABLE_FILE_TABLES.includes(String(row.entity_table))) {
+        return Response.json({ error: 'That file is not one this screen shows.' }, { status: 404 });
+      }
+      return closureFileResponse(row);
+    }
 
     /* ── ONE VISIT ──────────────────────────────────────────────────────── */
     const id = str(url.searchParams.get('id'));
@@ -413,19 +506,38 @@ export async function GET(request: Request) {
         ).all(...caIds) as any[];
       }
 
-      /* The change-and-void trail for this one visit (§19). */
+      /* The change-and-void trail for this one visit AND its points (§19) — a
+       * photograph attached to point 3, or voided off it, is a change to this
+       * visit's file, so it shows here too. */
+      const findingIds = findings.map((f) => String(f.id));
       const trail = db.prepare(
-        `SELECT action, field, reason, actor_email, actor_name, created_at
+        `SELECT entity_table, entity_id, action, field, reason, actor_email, actor_name, created_at
            FROM fssai_audit_log
-          WHERE entity_table = 'fssai_inspections' AND entity_id = ?
-          ORDER BY created_at DESC, rowid DESC LIMIT 50`,
-      ).all(id) as any[];
+          WHERE (entity_table = 'fssai_inspections' AND entity_id = ?)
+             ${findingIds.length ? `OR (entity_table = 'fssai_inspection_findings' AND entity_id IN (${findingIds.map(() => '?').join(',')}))` : ''}
+          ORDER BY created_at DESC, rowid DESC LIMIT 80`,
+      ).all(id, ...findingIds) as any[];
+
+      /* Line #120 — the report (linked document + photographed copies) and every
+       * point's closure photographs, from the point and from its action. */
+      const evidence = readFssaiOneVisitClosureEvidence(db, id);
+      const sealed = pointFilesRefusal(row);
+      const reportLocked = reportFilesRefusal(row);
 
       return Response.json({
         inspection: shapeInspection(row, deptMap, today),
         findings: findings.map((f) => shapeFinding(f, deptMap, today)),
         corrective_actions: actions,
         trail,
+        evidence,
+        report_documents: reportDocumentCandidates(db),
+        closure_rules: {
+          // '' = closure photographs on the points may be added / voided now.
+          point_files_refusal: sealed?.error || '',
+          // '' = the report link and report copies may change now.
+          report_refusal: reportLocked?.error || '',
+          live_limit: CLOSURE_LIVE_FILES_PER_RECORD,
+        },
         today,
         vocab: {
           kinds: FSSAI_INSPECTION_KINDS, statuses: FSSAI_INSPECTION_STATUSES,
@@ -560,6 +672,11 @@ export async function POST(request: Request) {
         return Response.json({ error: 'The score cannot be higher than the score it is out of.' }, { status: 400 });
       }
 
+      /* The report link must point at a real, live audit report — a dangling id
+       * would read as "the report is on file" (line #120). '' is no link. */
+      const docRefusal = documentIdRefusal(db, str(body?.document_id));
+      if (docRefusal) return docRefusal;
+
       const id = generateId();
       const requestedNo = str(body?.inspection_no);
       const statusIn = str(body?.status) || (businessDate > today ? 'planned' : 'in_progress');
@@ -687,6 +804,23 @@ export async function POST(request: Request) {
       if (next.score_max !== undefined && next.score_max !== null && !Number.isFinite(next.score_max)) {
         return Response.json({ error: 'The score out of must be a number, or left blank.' }, { status: 400 });
       }
+      /* The report link, held to the same rule as link_report: a real, live
+       * audit report, and a reason when an existing link is replaced or cleared
+       * (the old id is kept in the audit row either way). */
+      if (next.document_id !== undefined && next.document_id === str(before.document_id)) {
+        // Unchanged — a form re-sending what is already stored is not a change.
+        delete next.document_id;
+      } else if (next.document_id !== undefined) {
+        const docRefusal = documentIdRefusal(db, next.document_id);
+        if (docRefusal) return docRefusal;
+        if (str(before.document_id) && str(body?.reason).length < 4) {
+          return Response.json(
+            { error: 'This visit already has a report linked. Say in words why it is being replaced or removed — the old link stays in the file.', code: 'reason_required' },
+            { status: 400 },
+          );
+        }
+      }
+
       const keys = Object.keys(next);
       if (!keys.length) return Response.json({ error: 'Nothing was changed.' }, { status: 400 });
 
@@ -1008,6 +1142,25 @@ export async function POST(request: Request) {
         if (body.status !== undefined) {
           const st = str(body.status);
           if (!FINDING_STATUSES.includes(st)) return Response.json({ error: 'That is not a state a point can be in.' }, { status: 400 });
+          /* ⚠️ SETTLING AND UNSETTLING ARE NOT EDITS. Measured on HEAD: an
+           * update_finding with status 'closed' and no response closed the
+           * point with no answer, no closed_at and no closed_by — and the visit
+           * then closed — straight past close_finding's "say what was done"
+           * rule and its photograph snapshot. A point is closed or marked not
+           * accepted ONLY by close_finding, and reopened ONLY by reopen_finding
+           * (which demands a reason). This edit moves open ↔ being fixed. */
+          const settled = ['closed', 'not_accepted'];
+          if (st !== String(before.status) && (settled.includes(st) || settled.includes(String(before.status)))) {
+            return Response.json(
+              {
+                error: settled.includes(st)
+                  ? 'A point is closed with "Close this point", which records what was done. It cannot be closed by editing it.'
+                  : 'A closed point is reopened with "Reopen", which records why. It cannot be reopened by editing it.',
+                code: 'use_close_or_reopen',
+              },
+              { status: 409 },
+            );
+          }
           next.status = st;
         }
         if (body.ca_id !== undefined) {
@@ -1058,7 +1211,20 @@ export async function POST(request: Request) {
       const keys = Object.keys(next);
       if (!keys.length) return Response.json({ error: 'Nothing was changed.' }, { status: 400 });
 
+      /* Line #120 — what the point is being closed ON: the words in `response`
+       * and the photographs live on the point and on its corrective action at
+       * this moment, frozen by digest into the close row. A later void cannot
+       * change what the closer had in front of them. */
+      let photosAtClose: Array<ReturnType<typeof closureSnapshot>[number] & { on: string }> = [];
       db.transaction(() => {
+        if (action === 'close_finding') {
+          photosAtClose = [
+            ...closureSnapshot(db, 'fssai_inspection_findings', id).map((p) => ({ ...p, on: 'fssai_inspection_findings' })),
+            ...(str(before.ca_id)
+              ? closureSnapshot(db, 'fssai_corrective_actions', str(before.ca_id)).map((p) => ({ ...p, on: 'fssai_corrective_actions' }))
+              : []),
+          ];
+        }
         db.prepare(
           `UPDATE fssai_inspection_findings SET ${keys.map((k) => `${k} = ?`).join(', ')}, updated_at = datetime('now') WHERE id = ?`,
         ).run(...keys.map((k) => next[k]), id);
@@ -1066,7 +1232,9 @@ export async function POST(request: Request) {
         fssaiAudit(db, {
           entity_table: 'fssai_inspection_findings', entity_id: id,
           action: action === 'close_finding' ? 'close' : action === 'reopen_finding' ? 'reopen' : 'update',
-          before: changedBefore, after: next, reason: str(body?.reason) || str(body?.response), actor, outlet_id: outletId,
+          before: changedBefore,
+          after: action === 'close_finding' ? { ...next, closure_photos: photosAtClose } : next,
+          reason: str(body?.reason) || str(body?.response), actor, outlet_id: outletId,
         });
         recountFindings(db, String(before.inspection_id));
       })();
@@ -1076,11 +1244,153 @@ export async function POST(request: Request) {
       return Response.json({
         finding: shapeFinding(saved, deptMap, today),
         inspection: insp2 ? shapeInspection(insp2, deptMap, today) : null,
+        ...(action === 'close_finding'
+          ? {
+              closure_photos: photosAtClose.length,
+              note_to_staff: photosAtClose.length
+                ? `Point closed, with ${photosAtClose.length} photograph${photosAtClose.length === 1 ? '' : 's'} as closure evidence.`
+                : 'Point closed in words only — no photograph is on it or on its corrective action. You can still add one until the visit is closed.',
+            }
+          : {}),
+      });
+    }
+
+    /* ══ LINK THE VISIT'S REPORT DOCUMENT (line #120) ═══════════════════════
+     * The copy filed in Documents & Certificates. Allowed on a closed visit —
+     * the report often arrives after the points are settled — never on a
+     * voided one. Replacing or clearing a link needs a reason. */
+    if (action === 'link_report') {
+      if (!id) return Response.json({ error: 'Which inspection?' }, { status: 400 });
+      const before = db.prepare(`SELECT * FROM fssai_inspections WHERE id = ?`).get(id) as any;
+      const locked = reportFilesRefusal(before);
+      if (locked) return Response.json({ error: locked.error }, { status: locked.status });
+      const documentId = str(body?.document_id);
+      const was = str(before.document_id);
+      if (documentId === was) {
+        return Response.json({ error: documentId ? 'That report is already linked to this visit.' : 'No report is linked to this visit.' }, { status: 409 });
+      }
+      const docRefusal = documentIdRefusal(db, documentId);
+      if (docRefusal) return docRefusal;
+      const reason = str(body?.reason);
+      if (was && reason.length < 4) {
+        return Response.json(
+          { error: 'This visit already has a report linked. Say in words why it is being replaced or removed — the old link stays in the file.', code: 'reason_required' },
+          { status: 400 },
+        );
+      }
+      const doc = documentId ? readReportDocument(db, documentId) : null;
+      const moved = db.transaction(() => {
+        const res = db.prepare(
+          `UPDATE fssai_inspections SET document_id = ?, updated_at = datetime('now') WHERE id = ? AND document_id = ? AND status <> 'void'`,
+        ).run(documentId, id, was);
+        if (res.changes !== 1) return false;
+        fssaiAudit(db, {
+          entity_table: 'fssai_inspections', entity_id: id, action: 'link_report', field: 'document_id',
+          before: { document_id: was },
+          after: { document_id: documentId, title: doc?.title || '', reference_no: doc?.reference_no || '', doc_type: doc?.doc_type || '', live_scans: doc?.live_scans ?? 0 },
+          reason: reason || (documentId ? `Report linked: ${doc?.title || documentId}` : ''),
+          actor, outlet_id: outletId,
+        });
+        return true;
+      })();
+      if (!moved) return Response.json({ error: 'Somebody changed this visit a moment ago. Refresh and try again.' }, { status: 409 });
+      fssaiAppAudit(db, {
+        event_type: 'fssai_inspection_report_linked', entity_type: 'fssai_inspections', entity_id: id,
+        actor_email: String(me.email || ''), before: { document_id: was }, after: { document_id: documentId }, note: reason,
+      });
+      const saved = db.prepare(`SELECT * FROM fssai_inspections WHERE id = ?`).get(id) as any;
+      return Response.json({
+        inspection: shapeInspection(saved, deptMap, today),
+        document: doc,
+        note_to_staff: !documentId
+          ? 'The report link was removed. The old link stays in the file with your reason.'
+          : doc && doc.live_scans
+            ? `Linked "${doc.title}" as this visit's report.`
+            : `Linked "${doc?.title || 'that document'}" — but it has no scan attached yet, so there is still no copy of the report to show. Attach one in Documents & Certificates, or photograph the report onto this visit.`,
+      });
+    }
+
+    /* ══ PHOTOGRAPH THE REPORT ONTO THE VISIT (line #120) ════════════════════ */
+    if (action === 'attach_report') {
+      if (!id) return Response.json({ error: 'Which inspection?' }, { status: 400 });
+      const insp = db.prepare(`SELECT * FROM fssai_inspections WHERE id = ?`).get(id) as any;
+      const locked = reportFilesRefusal(insp);
+      if (locked) return Response.json({ error: locked.error }, { status: locked.status });
+      const res = insertClosureFile(db, {
+        entity_table: 'fssai_inspections', entity_id: id,
+        data_uri: str(body?.data_uri), filename: str(body?.filename), caption: str(body?.caption),
+        actor, outlet_id: outletId || String(insp.outlet_id || ''),
+        reason: `Report copy for ${insp.inspection_no || 'this inspection'}`,
+      });
+      if ('error' in res) return Response.json({ error: res.error, code: res.code }, { status: res.status });
+      return Response.json({
+        file: res.file,
+        evidence: readFssaiOneVisitClosureEvidence(db, id),
+        note_to_staff: 'Report page added to the visit. It cannot be removed — a wrong page is voided with a reason and stays on file marked void.',
+      });
+    }
+
+    /* ══ A CLOSURE PHOTOGRAPH ON ONE POINT (line #120) ═══════════════════════ */
+    if (action === 'attach_closure') {
+      if (!id) return Response.json({ error: 'Which point is this photograph for?' }, { status: 400 });
+      const finding = db.prepare(`SELECT * FROM fssai_inspection_findings WHERE id = ?`).get(id) as any;
+      if (!finding) {
+        return Response.json({ error: 'That point does not exist. A closure photograph goes on one point of a visit.' }, { status: 404 });
+      }
+      const insp = db.prepare(`SELECT * FROM fssai_inspections WHERE id = ?`).get(String(finding.inspection_id)) as any;
+      const sealed = pointFilesRefusal(insp);
+      if (sealed) return Response.json({ error: sealed.error }, { status: sealed.status });
+      const res = insertClosureFile(db, {
+        entity_table: 'fssai_inspection_findings', entity_id: id,
+        data_uri: str(body?.data_uri), filename: str(body?.filename), caption: str(body?.caption),
+        actor, outlet_id: outletId || String(finding.outlet_id || ''),
+        reason: `Closure photograph for point ${finding.finding_no || finding.sort_order} of ${insp.inspection_no || 'this inspection'}`
+          + (['closed', 'not_accepted'].includes(String(finding.status)) ? ` — added after the point was closed on ${String(finding.closed_at || '').slice(0, 10) || 'an earlier date'}` : ''),
+      });
+      if ('error' in res) return Response.json({ error: res.error, code: res.code }, { status: res.status });
+      return Response.json({
+        file: res.file,
+        evidence: readFssaiOneVisitClosureEvidence(db, String(insp.id)),
+        note_to_staff: 'Photograph added to the point. It cannot be removed — one taken by mistake is voided with a reason and stays on file marked void.',
+      });
+    }
+
+    /* ══ VOID A FILE TAKEN BY MISTAKE — never removed (line #120, §19) ══════
+     * `id` is the record the file is on (the visit for a report page, the point
+     * for a closure photograph); the attachment must be on THAT record. */
+    if (action === 'void_file') {
+      if (!id) return Response.json({ error: 'Which record is the file on?' }, { status: 400 });
+      const attachmentId = str(body?.attachment_id);
+      const fileRow = readClosureFileRow(db, attachmentId);
+      const table = String(fileRow?.entity_table || '');
+      if (!fileRow || String(fileRow.entity_id) !== id || !['fssai_inspections', 'fssai_inspection_findings'].includes(table)) {
+        return Response.json({ error: 'That file is not on this record.', code: 'not_found' }, { status: 404 });
+      }
+      let insp: any;
+      if (table === 'fssai_inspections') {
+        insp = db.prepare(`SELECT * FROM fssai_inspections WHERE id = ?`).get(id) as any;
+        const locked = reportFilesRefusal(insp);
+        if (locked) return Response.json({ error: locked.error }, { status: locked.status });
+      } else {
+        const finding = db.prepare(`SELECT inspection_id FROM fssai_inspection_findings WHERE id = ?`).get(id) as any;
+        insp = finding ? db.prepare(`SELECT * FROM fssai_inspections WHERE id = ?`).get(String(finding.inspection_id)) as any : null;
+        const sealed = pointFilesRefusal(insp);
+        if (sealed) return Response.json({ error: sealed.error }, { status: sealed.status });
+      }
+      const res = voidClosureFile(db, {
+        attachment_id: attachmentId, entity_table: table as ClosureEntityTable, entity_id: id,
+        reason: str(body?.reason), me, outlet_id: outletId || String(insp?.outlet_id || ''),
+      });
+      if ('error' in res) return Response.json({ error: res.error, code: res.code }, { status: res.status });
+      return Response.json({
+        file: res.file,
+        evidence: insp ? readFssaiOneVisitClosureEvidence(db, String(insp.id)) : null,
+        note_to_staff: 'Voided. The file stays on the record, marked void with your reason — nothing was removed.',
       });
     }
 
     return Response.json(
-      { error: 'That is not something this screen can do. Expected create, update, close, reopen, void, raise_ca, or one of the point actions.' },
+      { error: 'That is not something this screen can do. Expected create, update, close, reopen, void, raise_ca, link_report, attach_report, attach_closure, void_file, or one of the point actions.' },
       { status: 400 },
     );
   } catch (e: any) {

@@ -1,489 +1,2557 @@
 {
-  "source": "Hyderabad Food Safety Authority — FOOD SAFETY AUDIT CHECKLIST.xlsx (owner-supplied 2026-10-13)",
-  "format": "YES / NO / REMARK per line",
-  "sections": [
+ "source": "Hyderabad Food Safety Authority — FOOD SAFETY AUDIT CHECKLIST.xlsx (owner-supplied 2026-10-13)",
+ "read_from": "The .xlsx itself, every sheet, row by row — the text of column A and the cell STYLE of each row, which is the only thing that tells a heading from a line (every row, headings included, has YES / NO / REMARK cells). Regenerated 2026-10-14 by the pack-and-excel lane; FSSAI_HYD_WORKBOOK in src/lib/fssai-checklist-pack.ts holds the same rows and is proved against the file.",
+ "format": "YES / NO / REMARK per line",
+ "how_rows_are_told_apart": {
+  "title": "bold 12 pt",
+  "heading": "bold, shaded",
+  "lead_in": "plain, not indented",
+  "subheading": "bold, not shaded, not indented",
+  "line": "plain, indented — the rows that are answered"
+ },
+ "total_items": 120,
+ "counts": {
+  "master_rows": 137,
+  "title": 1,
+  "headings": 13,
+  "lead_ins": 3,
+  "subheadings": 1,
+  "lines": 119,
+  "walk_through_lines": 99,
+  "audit_file_lines": 20
+ },
+ "numbering_note": "sections[].items[] keeps the 120 entries, in the order and with the numbers (#1–#120) every earlier coverage report uses. 119 of them are lines; #57 \"Kitchen\" is the sub-heading over the kitchen cleaning lines and has no answer of its own. Of the 119 lines, 99 are the walk-through, asked word for word by CHK-HYD-AUDIT-1/2/3 (see asked_by), and 20 are \"Records You Should Keep Ready in One Audit File\", held by the Audit File page (audit_file_record = AUDIT_FILE_RECORDS n).",
+ "corrections_2026_10_14": [
+  "authority_pages: CHECKLIST 1 holds all seven Food Temperature Control lines (Receiving … Cooling) and no Cleaning & Sanitation line. The previous file said 5 temperature lines and 2 cleaning lines.",
+  "authority_pages: CHECKLIST 3 is headed \"FOH\" (4 lines) and \"Washrooms\" (5 lines), not \"Cleaning & Sanitation\" (9).",
+  "authority_pages: CHECKLIST 2 has 30 lines, not 31 — \"Kitchen\" is a sub-heading on the sheet, not a line."
+ ],
+ "sections": [
+  {
+   "section": "Licences & Display",
+   "items": [
     {
-      "section": "Licences & Display",
-      "items": [
-        {
-          "item": "FSSAI licence displayed prominently"
-        },
-        {
-          "item": "Food Safety Display Board (FSDB) displayed and readable"
-        },
-        {
-          "item": "GHMC trade/municipal licence available"
-        },
-        {
-          "item": "Fire/safety documents as applicable"
-        },
-        {
-          "item": "Pest-control agency agreement and latest service report"
-        },
-        {
-          "item": "Food-handler medical examination records"
-        },
-        {
-          "item": "Water testing report / municipal water bill records"
-        },
-        {
-          "item": "Approved vendor list maintained"
-        }
-      ]
+     "n": 1,
+     "item": "FSSAI licence displayed prominently",
+     "kind": "line",
+     "master_row": 3,
+     "page": "CHECKLIST 1",
+     "page_row": 3,
+     "asked_by": "CHK-HYD-AUDIT-1 Q01"
     },
     {
-      "section": "Kitchen & Premises Hygiene",
-      "items": [
-        {
-          "item": "Kitchen floors clean, dry and non-slippery"
-        },
-        {
-          "item": "Walls and ceiling clean; no peeling paint/plaster"
-        },
-        {
-          "item": "No water stagnation"
-        },
-        {
-          "item": "Proper drainage"
-        },
-        {
-          "item": "Exhaust/hood clean"
-        },
-        {
-          "item": "Adequate lighting"
-        },
-        {
-          "item": "Light fittings protected against breakage"
-        },
-        {
-          "item": "Doors/windows clean and pest-proof"
-        },
-        {
-          "item": "No unnecessary items stored in food areas"
-        }
-      ]
+     "n": 2,
+     "item": "Food Safety Display Board (FSDB) displayed and readable",
+     "kind": "line",
+     "master_row": 4,
+     "page": "CHECKLIST 1",
+     "page_row": 4,
+     "asked_by": "CHK-HYD-AUDIT-1 Q02"
     },
     {
-      "section": "Storage – Very Important",
-      "items": [
-        {
-          "item": "FIFO followed"
-        },
-        {
-          "item": "FEFO followed"
-        },
-        {
-          "item": "All containers properly covered"
-        },
-        {
-          "item": "Food-grade containers used"
-        },
-        {
-          "item": "No food stored directly on floor"
-        },
-        {
-          "item": "Raw and cooked food separated"
-        },
-        {
-          "item": "Veg and non-veg properly segregated"
-        },
-        {
-          "item": "Chemicals stored separately from food"
-        },
-        {
-          "item": "Personal items kept outside food-storage areas"
-        },
-        {
-          "item": "Dry store clean and pest-free"
-        },
-        {
-          "item": "Refrigerator/freezer temperature recorded daily"
-        },
-        {
-          "item": "Expired/damaged products immediately removed"
-        }
-      ]
+     "n": 3,
+     "item": "GHMC trade/municipal licence available",
+     "kind": "line",
+     "master_row": 5,
+     "page": "CHECKLIST 1",
+     "page_row": 5,
+     "asked_by": "CHK-HYD-AUDIT-1 Q03"
     },
     {
-      "section": "Food Temperature Control",
-      "items": [
-        {
-          "item": "Receiving",
-          "group": "Maintain a temperature monitoring sheet for"
-        },
-        {
-          "item": "Refrigerators",
-          "group": "Maintain a temperature monitoring sheet for"
-        },
-        {
-          "item": "Freezers",
-          "group": "Maintain a temperature monitoring sheet for"
-        },
-        {
-          "item": "Hot holding",
-          "group": "Maintain a temperature monitoring sheet for"
-        },
-        {
-          "item": "Cooking",
-          "group": "Maintain a temperature monitoring sheet for"
-        },
-        {
-          "item": "Reheating",
-          "group": "Maintain a temperature monitoring sheet for"
-        },
-        {
-          "item": "Cooling",
-          "group": "Maintain a temperature monitoring sheet for"
-        }
-      ]
+     "n": 4,
+     "item": "Fire/safety documents as applicable",
+     "kind": "line",
+     "master_row": 6,
+     "page": "CHECKLIST 1",
+     "page_row": 6,
+     "asked_by": "CHK-HYD-AUDIT-1 Q04"
     },
     {
-      "section": "Food Preparation",
-      "items": [
-        {
-          "item": "Raw materials washed/cleaned properly"
-        },
-        {
-          "item": "Separate cutting boards/knives where required"
-        },
-        {
-          "item": "Raw and cooked food not cross-contaminated"
-        },
-        {
-          "item": "Food handlers wash hands before food preparation"
-        },
-        {
-          "item": "Food covered during preparation/storage"
-        },
-        {
-          "item": "No direct hand contact with ready-to-eat food where avoidable"
-        },
-        {
-          "item": "Cooking temperature/process monitored"
-        },
-        {
-          "item": "Reheating controlled and recorded"
-        },
-        {
-          "item": "No expired ingredients used"
-        }
-      ]
+     "n": 5,
+     "item": "Pest-control agency agreement and latest service report",
+     "kind": "line",
+     "master_row": 7,
+     "page": "CHECKLIST 1",
+     "page_row": 7,
+     "asked_by": "CHK-HYD-AUDIT-1 Q05"
     },
     {
-      "section": "Personal Hygiene – Critical",
-      "items": [
-        {
-          "item": "Clean uniform",
-          "group": "Every food handler should have"
-        },
-        {
-          "item": "Hairnet/cap",
-          "group": "Every food handler should have"
-        },
-        {
-          "item": "Appropriate apron",
-          "group": "Every food handler should have"
-        },
-        {
-          "item": "Clean, trimmed nails",
-          "group": "Every food handler should have"
-        },
-        {
-          "item": "No loose jewellery",
-          "group": "Every food handler should have"
-        },
-        {
-          "item": "Proper handwashing practice",
-          "group": "Every food handler should have"
-        },
-        {
-          "item": "Waterproof dressing for minor wounds",
-          "group": "Every food handler should have"
-        },
-        {
-          "item": "No smoking/spitting in food areas",
-          "group": "Every food handler should have"
-        },
-        {
-          "item": "No handling food while suffering from an illness/open wound",
-          "group": "Every food handler should have"
-        },
-        {
-          "item": "Medical examination records available",
-          "group": "Every food handler should have"
-        },
-        {
-          "item": "Food-safety training records available",
-          "group": "Every food handler should have"
-        }
-      ]
+     "n": 6,
+     "item": "Food-handler medical examination records",
+     "kind": "line",
+     "master_row": 8,
+     "page": "CHECKLIST 1",
+     "page_row": 8,
+     "asked_by": "CHK-HYD-AUDIT-1 Q06"
     },
     {
-      "section": "Cleaning & Sanitation",
-      "items": [
-        {
-          "item": "Kitchen",
-          "group": "Maintain daily cleaning checklists for"
-        },
-        {
-          "item": "Floors",
-          "group": "Maintain daily cleaning checklists for"
-        },
-        {
-          "item": "Walls",
-          "group": "Maintain daily cleaning checklists for"
-        },
-        {
-          "item": "Work tables",
-          "group": "Maintain daily cleaning checklists for"
-        },
-        {
-          "item": "Cutting boards",
-          "group": "Maintain daily cleaning checklists for"
-        },
-        {
-          "item": "Cooking equipment",
-          "group": "Maintain daily cleaning checklists for"
-        },
-        {
-          "item": "Refrigerators",
-          "group": "Maintain daily cleaning checklists for"
-        },
-        {
-          "item": "Freezers",
-          "group": "Maintain daily cleaning checklists for"
-        },
-        {
-          "item": "Exhaust/hood",
-          "group": "Maintain daily cleaning checklists for"
-        },
-        {
-          "item": "Sinks",
-          "group": "Maintain daily cleaning checklists for"
-        },
-        {
-          "item": "Racks",
-          "group": "Maintain daily cleaning checklists for"
-        },
-        {
-          "item": "Tables/chairs",
-          "group": "FOH"
-        },
-        {
-          "item": "Service stations",
-          "group": "FOH"
-        },
-        {
-          "item": "Crockery/cutlery",
-          "group": "FOH"
-        },
-        {
-          "item": "Water station",
-          "group": "FOH"
-        },
-        {
-          "item": "Toilet",
-          "group": "Washrooms"
-        },
-        {
-          "item": "Wash basin",
-          "group": "Washrooms"
-        },
-        {
-          "item": "Soap",
-          "group": "Washrooms"
-        },
-        {
-          "item": "Hand-drying facility",
-          "group": "Washrooms"
-        },
-        {
-          "item": "Cleaning record",
-          "group": "Washrooms"
-        }
-      ]
+     "n": 7,
+     "item": "Water testing report / municipal water bill records",
+     "kind": "line",
+     "master_row": 9,
+     "page": "CHECKLIST 1",
+     "page_row": 9,
+     "asked_by": "CHK-HYD-AUDIT-1 Q07"
     },
     {
-      "section": "Pest Control",
-      "items": [
-        {
-          "item": "Monthly pest-control report"
-        },
-        {
-          "item": "Pest-control chemicals/records maintained"
-        },
-        {
-          "item": "No cockroaches"
-        },
-        {
-          "item": "No flies"
-        },
-        {
-          "item": "No rodents"
-        },
-        {
-          "item": "No pest droppings/eggs/larvae"
-        },
-        {
-          "item": "Insect-proof screens where required"
-        },
-        {
-          "item": "Door gaps sealed"
-        },
-        {
-          "item": "Drain/grease traps maintained"
-        }
-      ]
-    },
-    {
-      "section": "Waste Management",
-      "items": [
-        {
-          "item": "Separate wet/dry waste as applicable"
-        },
-        {
-          "item": "Bins have lids"
-        },
-        {
-          "item": "Bins are cleaned regularly"
-        },
-        {
-          "item": "Waste removed from kitchen periodically"
-        },
-        {
-          "item": "No overflowing bins"
-        },
-        {
-          "item": "Waste area kept clean"
-        },
-        {
-          "item": "Used oil disposal records maintained"
-        },
-        {
-          "item": "No food waste accumulated near preparation areas"
-        }
-      ]
-    },
-    {
-      "section": "Food-Grade Equipment & Packaging",
-      "items": [
-        {
-          "item": "Food-contact equipment is food-safe"
-        },
-        {
-          "item": "Containers are non-toxic and easy to clean"
-        },
-        {
-          "item": "No rusted/damaged food-contact equipment"
-        },
-        {
-          "item": "Food-grade storage containers"
-        },
-        {
-          "item": "Food-grade packaging for delivery"
-        },
-        {
-          "item": "No newspaper used for food wrapping"
-        },
-        {
-          "item": "Packaging properly stored"
-        }
-      ]
-    },
-    {
-      "section": "Records You Should Keep Ready in One Audit File",
-      "items": [
-        {
-          "item": "FSSAI licence copy"
-        },
-        {
-          "item": "FSDB photograph"
-        },
-        {
-          "item": "GHMC licence"
-        },
-        {
-          "item": "Water test report / water bill"
-        },
-        {
-          "item": "Pest-control agreement + reports"
-        },
-        {
-          "item": "Food-handler medical certificates"
-        },
-        {
-          "item": "Food-safety training records"
-        },
-        {
-          "item": "Approved vendor list"
-        },
-        {
-          "item": "Receiving checklist"
-        },
-        {
-          "item": "Refrigerator/freezer temperature log"
-        },
-        {
-          "item": "Cooking/reheating temperature log"
-        },
-        {
-          "item": "Cleaning & sanitation checklist"
-        },
-        {
-          "item": "Pest-control monitoring sheet"
-        },
-        {
-          "item": "Waste disposal record"
-        },
-        {
-          "item": "Used cooking-oil/TPC records"
-        },
-        {
-          "item": "Equipment maintenance records"
-        },
-        {
-          "item": "Calibration certificates"
-        },
-        {
-          "item": "FIFO/FEFO checklist"
-        },
-        {
-          "item": "Food sampling/lab reports, where applicable"
-        },
-        {
-          "item": "Previous audit report and closure evidence"
-        }
-      ]
+     "n": 8,
+     "item": "Approved vendor list maintained",
+     "kind": "line",
+     "master_row": 10,
+     "page": "CHECKLIST 1",
+     "page_row": 10,
+     "asked_by": "CHK-HYD-AUDIT-1 Q08"
     }
-  ],
-  "total_items": 120,
-  "authority_pages": {
-    "CHECKLIST 1": {
-      "items": 36,
-      "sections": {
-        "Licences & Display": 8,
-        "Kitchen & Premises Hygiene": 9,
-        "Storage – Very Important": 12,
-        "Food Temperature Control": 5,
-        "Cleaning & Sanitation": 2
-      }
+   ]
+  },
+  {
+   "section": "Kitchen & Premises Hygiene",
+   "items": [
+    {
+     "n": 9,
+     "item": "Kitchen floors clean, dry and non-slippery",
+     "kind": "line",
+     "master_row": 12,
+     "page": "CHECKLIST 1",
+     "page_row": 12,
+     "asked_by": "CHK-HYD-AUDIT-1 Q09"
     },
-    "CHECKLIST 2": {
-      "items": 31,
-      "sections": {
-        "Food Preparation": 9,
-        "Personal Hygiene – Critical": 11,
-        "Cleaning & Sanitation": 11
-      }
+    {
+     "n": 10,
+     "item": "Walls and ceiling clean; no peeling paint/plaster",
+     "kind": "line",
+     "master_row": 13,
+     "page": "CHECKLIST 1",
+     "page_row": 13,
+     "asked_by": "CHK-HYD-AUDIT-1 Q10"
     },
-    "CHECKLIST 3": {
-      "items": 33,
-      "sections": {
-        "Cleaning & Sanitation": 9,
-        "Pest Control": 9,
-        "Waste Management": 8,
-        "Food-Grade Equipment & Packaging": 7
-      }
+    {
+     "n": 11,
+     "item": "No water stagnation",
+     "kind": "line",
+     "master_row": 14,
+     "page": "CHECKLIST 1",
+     "page_row": 14,
+     "asked_by": "CHK-HYD-AUDIT-1 Q11"
+    },
+    {
+     "n": 12,
+     "item": "Proper drainage",
+     "kind": "line",
+     "master_row": 15,
+     "page": "CHECKLIST 1",
+     "page_row": 15,
+     "asked_by": "CHK-HYD-AUDIT-1 Q12"
+    },
+    {
+     "n": 13,
+     "item": "Exhaust/hood clean",
+     "kind": "line",
+     "master_row": 16,
+     "page": "CHECKLIST 1",
+     "page_row": 16,
+     "asked_by": "CHK-HYD-AUDIT-1 Q13"
+    },
+    {
+     "n": 14,
+     "item": "Adequate lighting",
+     "kind": "line",
+     "master_row": 17,
+     "page": "CHECKLIST 1",
+     "page_row": 17,
+     "asked_by": "CHK-HYD-AUDIT-1 Q14"
+    },
+    {
+     "n": 15,
+     "item": "Light fittings protected against breakage",
+     "kind": "line",
+     "master_row": 18,
+     "page": "CHECKLIST 1",
+     "page_row": 18,
+     "asked_by": "CHK-HYD-AUDIT-1 Q15"
+    },
+    {
+     "n": 16,
+     "item": "Doors/windows clean and pest-proof",
+     "kind": "line",
+     "master_row": 19,
+     "page": "CHECKLIST 1",
+     "page_row": 19,
+     "asked_by": "CHK-HYD-AUDIT-1 Q16"
+    },
+    {
+     "n": 17,
+     "item": "No unnecessary items stored in food areas",
+     "kind": "line",
+     "master_row": 20,
+     "page": "CHECKLIST 1",
+     "page_row": 20,
+     "asked_by": "CHK-HYD-AUDIT-1 Q17"
     }
+   ]
+  },
+  {
+   "section": "Storage – Very Important",
+   "items": [
+    {
+     "n": 18,
+     "item": "FIFO followed",
+     "kind": "line",
+     "master_row": 22,
+     "page": "CHECKLIST 1",
+     "page_row": 22,
+     "asked_by": "CHK-HYD-AUDIT-1 Q18"
+    },
+    {
+     "n": 19,
+     "item": "FEFO followed",
+     "kind": "line",
+     "master_row": 23,
+     "page": "CHECKLIST 1",
+     "page_row": 23,
+     "asked_by": "CHK-HYD-AUDIT-1 Q19"
+    },
+    {
+     "n": 20,
+     "item": "All containers properly covered",
+     "kind": "line",
+     "master_row": 24,
+     "page": "CHECKLIST 1",
+     "page_row": 24,
+     "asked_by": "CHK-HYD-AUDIT-1 Q20"
+    },
+    {
+     "n": 21,
+     "item": "Food-grade containers used",
+     "kind": "line",
+     "master_row": 25,
+     "page": "CHECKLIST 1",
+     "page_row": 25,
+     "asked_by": "CHK-HYD-AUDIT-1 Q21"
+    },
+    {
+     "n": 22,
+     "item": "No food stored directly on floor",
+     "kind": "line",
+     "master_row": 26,
+     "page": "CHECKLIST 1",
+     "page_row": 26,
+     "asked_by": "CHK-HYD-AUDIT-1 Q22"
+    },
+    {
+     "n": 23,
+     "item": "Raw and cooked food separated",
+     "kind": "line",
+     "master_row": 27,
+     "page": "CHECKLIST 1",
+     "page_row": 27,
+     "asked_by": "CHK-HYD-AUDIT-1 Q23"
+    },
+    {
+     "n": 24,
+     "item": "Veg and non-veg properly segregated",
+     "kind": "line",
+     "master_row": 28,
+     "page": "CHECKLIST 1",
+     "page_row": 28,
+     "asked_by": "CHK-HYD-AUDIT-1 Q24"
+    },
+    {
+     "n": 25,
+     "item": "Chemicals stored separately from food",
+     "kind": "line",
+     "master_row": 29,
+     "page": "CHECKLIST 1",
+     "page_row": 29,
+     "asked_by": "CHK-HYD-AUDIT-1 Q25"
+    },
+    {
+     "n": 26,
+     "item": "Personal items kept outside food-storage areas",
+     "kind": "line",
+     "master_row": 30,
+     "page": "CHECKLIST 1",
+     "page_row": 30,
+     "asked_by": "CHK-HYD-AUDIT-1 Q26"
+    },
+    {
+     "n": 27,
+     "item": "Dry store clean and pest-free",
+     "kind": "line",
+     "master_row": 31,
+     "page": "CHECKLIST 1",
+     "page_row": 31,
+     "asked_by": "CHK-HYD-AUDIT-1 Q27"
+    },
+    {
+     "n": 28,
+     "item": "Refrigerator/freezer temperature recorded daily",
+     "kind": "line",
+     "master_row": 32,
+     "page": "CHECKLIST 1",
+     "page_row": 32,
+     "asked_by": "CHK-HYD-AUDIT-1 Q28"
+    },
+    {
+     "n": 29,
+     "item": "Expired/damaged products immediately removed",
+     "kind": "line",
+     "master_row": 33,
+     "page": "CHECKLIST 1",
+     "page_row": 33,
+     "asked_by": "CHK-HYD-AUDIT-1 Q29"
+    }
+   ]
+  },
+  {
+   "section": "Food Temperature Control",
+   "items": [
+    {
+     "n": 30,
+     "item": "Receiving",
+     "group": "Maintain a temperature monitoring sheet for",
+     "kind": "line",
+     "master_row": 36,
+     "page": "CHECKLIST 1",
+     "page_row": 36,
+     "asked_by": "CHK-HYD-AUDIT-1 Q30"
+    },
+    {
+     "n": 31,
+     "item": "Refrigerators",
+     "group": "Maintain a temperature monitoring sheet for",
+     "kind": "line",
+     "master_row": 37,
+     "page": "CHECKLIST 1",
+     "page_row": 37,
+     "asked_by": "CHK-HYD-AUDIT-1 Q31"
+    },
+    {
+     "n": 32,
+     "item": "Freezers",
+     "group": "Maintain a temperature monitoring sheet for",
+     "kind": "line",
+     "master_row": 38,
+     "page": "CHECKLIST 1",
+     "page_row": 38,
+     "asked_by": "CHK-HYD-AUDIT-1 Q32"
+    },
+    {
+     "n": 33,
+     "item": "Hot holding",
+     "group": "Maintain a temperature monitoring sheet for",
+     "kind": "line",
+     "master_row": 39,
+     "page": "CHECKLIST 1",
+     "page_row": 39,
+     "asked_by": "CHK-HYD-AUDIT-1 Q33"
+    },
+    {
+     "n": 34,
+     "item": "Cooking",
+     "group": "Maintain a temperature monitoring sheet for",
+     "kind": "line",
+     "master_row": 40,
+     "page": "CHECKLIST 1",
+     "page_row": 40,
+     "asked_by": "CHK-HYD-AUDIT-1 Q34"
+    },
+    {
+     "n": 35,
+     "item": "Reheating",
+     "group": "Maintain a temperature monitoring sheet for",
+     "kind": "line",
+     "master_row": 41,
+     "page": "CHECKLIST 1",
+     "page_row": 41,
+     "asked_by": "CHK-HYD-AUDIT-1 Q35"
+    },
+    {
+     "n": 36,
+     "item": "Cooling",
+     "group": "Maintain a temperature monitoring sheet for",
+     "kind": "line",
+     "master_row": 42,
+     "page": "CHECKLIST 1",
+     "page_row": 42,
+     "asked_by": "CHK-HYD-AUDIT-1 Q36"
+    }
+   ]
+  },
+  {
+   "section": "Food Preparation",
+   "items": [
+    {
+     "n": 37,
+     "item": "Raw materials washed/cleaned properly",
+     "kind": "line",
+     "master_row": 44,
+     "page": "CHECKLIST 2",
+     "page_row": 2,
+     "asked_by": "CHK-HYD-AUDIT-2 Q01"
+    },
+    {
+     "n": 38,
+     "item": "Separate cutting boards/knives where required",
+     "kind": "line",
+     "master_row": 45,
+     "page": "CHECKLIST 2",
+     "page_row": 3,
+     "asked_by": "CHK-HYD-AUDIT-2 Q02"
+    },
+    {
+     "n": 39,
+     "item": "Raw and cooked food not cross-contaminated",
+     "kind": "line",
+     "master_row": 46,
+     "page": "CHECKLIST 2",
+     "page_row": 4,
+     "asked_by": "CHK-HYD-AUDIT-2 Q03"
+    },
+    {
+     "n": 40,
+     "item": "Food handlers wash hands before food preparation",
+     "kind": "line",
+     "master_row": 47,
+     "page": "CHECKLIST 2",
+     "page_row": 5,
+     "asked_by": "CHK-HYD-AUDIT-2 Q04"
+    },
+    {
+     "n": 41,
+     "item": "Food covered during preparation/storage",
+     "kind": "line",
+     "master_row": 48,
+     "page": "CHECKLIST 2",
+     "page_row": 6,
+     "asked_by": "CHK-HYD-AUDIT-2 Q05"
+    },
+    {
+     "n": 42,
+     "item": "No direct hand contact with ready-to-eat food where avoidable",
+     "kind": "line",
+     "master_row": 49,
+     "page": "CHECKLIST 2",
+     "page_row": 7,
+     "asked_by": "CHK-HYD-AUDIT-2 Q06"
+    },
+    {
+     "n": 43,
+     "item": "Cooking temperature/process monitored",
+     "kind": "line",
+     "master_row": 50,
+     "page": "CHECKLIST 2",
+     "page_row": 8,
+     "asked_by": "CHK-HYD-AUDIT-2 Q07"
+    },
+    {
+     "n": 44,
+     "item": "Reheating controlled and recorded",
+     "kind": "line",
+     "master_row": 51,
+     "page": "CHECKLIST 2",
+     "page_row": 9,
+     "asked_by": "CHK-HYD-AUDIT-2 Q08"
+    },
+    {
+     "n": 45,
+     "item": "No expired ingredients used",
+     "kind": "line",
+     "master_row": 52,
+     "page": "CHECKLIST 2",
+     "page_row": 10,
+     "asked_by": "CHK-HYD-AUDIT-2 Q09"
+    }
+   ]
+  },
+  {
+   "section": "Personal Hygiene – Critical",
+   "items": [
+    {
+     "n": 46,
+     "item": "Clean uniform",
+     "group": "Every food handler should have",
+     "kind": "line",
+     "master_row": 55,
+     "page": "CHECKLIST 2",
+     "page_row": 13,
+     "asked_by": "CHK-HYD-AUDIT-2 Q10"
+    },
+    {
+     "n": 47,
+     "item": "Hairnet/cap",
+     "group": "Every food handler should have",
+     "kind": "line",
+     "master_row": 56,
+     "page": "CHECKLIST 2",
+     "page_row": 14,
+     "asked_by": "CHK-HYD-AUDIT-2 Q11"
+    },
+    {
+     "n": 48,
+     "item": "Appropriate apron",
+     "group": "Every food handler should have",
+     "kind": "line",
+     "master_row": 57,
+     "page": "CHECKLIST 2",
+     "page_row": 15,
+     "asked_by": "CHK-HYD-AUDIT-2 Q12"
+    },
+    {
+     "n": 49,
+     "item": "Clean, trimmed nails",
+     "group": "Every food handler should have",
+     "kind": "line",
+     "master_row": 58,
+     "page": "CHECKLIST 2",
+     "page_row": 16,
+     "asked_by": "CHK-HYD-AUDIT-2 Q13"
+    },
+    {
+     "n": 50,
+     "item": "No loose jewellery",
+     "group": "Every food handler should have",
+     "kind": "line",
+     "master_row": 59,
+     "page": "CHECKLIST 2",
+     "page_row": 17,
+     "asked_by": "CHK-HYD-AUDIT-2 Q14"
+    },
+    {
+     "n": 51,
+     "item": "Proper handwashing practice",
+     "group": "Every food handler should have",
+     "kind": "line",
+     "master_row": 60,
+     "page": "CHECKLIST 2",
+     "page_row": 18,
+     "asked_by": "CHK-HYD-AUDIT-2 Q15"
+    },
+    {
+     "n": 52,
+     "item": "Waterproof dressing for minor wounds",
+     "group": "Every food handler should have",
+     "kind": "line",
+     "master_row": 61,
+     "page": "CHECKLIST 2",
+     "page_row": 19,
+     "asked_by": "CHK-HYD-AUDIT-2 Q16"
+    },
+    {
+     "n": 53,
+     "item": "No smoking/spitting in food areas",
+     "group": "Every food handler should have",
+     "kind": "line",
+     "master_row": 62,
+     "page": "CHECKLIST 2",
+     "page_row": 20,
+     "asked_by": "CHK-HYD-AUDIT-2 Q17"
+    },
+    {
+     "n": 54,
+     "item": "No handling food while suffering from an illness/open wound",
+     "group": "Every food handler should have",
+     "kind": "line",
+     "master_row": 63,
+     "page": "CHECKLIST 2",
+     "page_row": 21,
+     "asked_by": "CHK-HYD-AUDIT-2 Q18"
+    },
+    {
+     "n": 55,
+     "item": "Medical examination records available",
+     "group": "Every food handler should have",
+     "kind": "line",
+     "master_row": 64,
+     "page": "CHECKLIST 2",
+     "page_row": 22,
+     "asked_by": "CHK-HYD-AUDIT-2 Q19"
+    },
+    {
+     "n": 56,
+     "item": "Food-safety training records available",
+     "group": "Every food handler should have",
+     "kind": "line",
+     "master_row": 65,
+     "page": "CHECKLIST 2",
+     "page_row": 23,
+     "asked_by": "CHK-HYD-AUDIT-2 Q20"
+    }
+   ]
+  },
+  {
+   "section": "Cleaning & Sanitation",
+   "items": [
+    {
+     "n": 57,
+     "item": "Kitchen",
+     "group": "Maintain daily cleaning checklists for",
+     "kind": "subheading",
+     "master_row": 68,
+     "note": "NOT A LINE. Bold and unshaded on the sheet, not indented: the group label over Floors … Racks, as FOH and Washrooms are over theirs. It has no answer of its own; its lines are asked as \"Maintain daily cleaning checklists for: Kitchen — <line>\". Kept here at #57 only so the #1–#120 numbering earlier reports use does not shift."
+    },
+    {
+     "n": 58,
+     "item": "Floors",
+     "group": "Maintain daily cleaning checklists for",
+     "kind": "line",
+     "master_row": 69,
+     "subheading": "Kitchen",
+     "page": "CHECKLIST 2",
+     "page_row": 27,
+     "asked_by": "CHK-HYD-AUDIT-2 Q21"
+    },
+    {
+     "n": 59,
+     "item": "Walls",
+     "group": "Maintain daily cleaning checklists for",
+     "kind": "line",
+     "master_row": 70,
+     "subheading": "Kitchen",
+     "page": "CHECKLIST 2",
+     "page_row": 28,
+     "asked_by": "CHK-HYD-AUDIT-2 Q22"
+    },
+    {
+     "n": 60,
+     "item": "Work tables",
+     "group": "Maintain daily cleaning checklists for",
+     "kind": "line",
+     "master_row": 71,
+     "subheading": "Kitchen",
+     "page": "CHECKLIST 2",
+     "page_row": 29,
+     "asked_by": "CHK-HYD-AUDIT-2 Q23"
+    },
+    {
+     "n": 61,
+     "item": "Cutting boards",
+     "group": "Maintain daily cleaning checklists for",
+     "kind": "line",
+     "master_row": 72,
+     "subheading": "Kitchen",
+     "page": "CHECKLIST 2",
+     "page_row": 30,
+     "asked_by": "CHK-HYD-AUDIT-2 Q24"
+    },
+    {
+     "n": 62,
+     "item": "Cooking equipment",
+     "group": "Maintain daily cleaning checklists for",
+     "kind": "line",
+     "master_row": 73,
+     "subheading": "Kitchen",
+     "page": "CHECKLIST 2",
+     "page_row": 31,
+     "asked_by": "CHK-HYD-AUDIT-2 Q25"
+    },
+    {
+     "n": 63,
+     "item": "Refrigerators",
+     "group": "Maintain daily cleaning checklists for",
+     "kind": "line",
+     "master_row": 74,
+     "subheading": "Kitchen",
+     "page": "CHECKLIST 2",
+     "page_row": 32,
+     "asked_by": "CHK-HYD-AUDIT-2 Q26"
+    },
+    {
+     "n": 64,
+     "item": "Freezers",
+     "group": "Maintain daily cleaning checklists for",
+     "kind": "line",
+     "master_row": 75,
+     "subheading": "Kitchen",
+     "page": "CHECKLIST 2",
+     "page_row": 33,
+     "asked_by": "CHK-HYD-AUDIT-2 Q27"
+    },
+    {
+     "n": 65,
+     "item": "Exhaust/hood",
+     "group": "Maintain daily cleaning checklists for",
+     "kind": "line",
+     "master_row": 76,
+     "subheading": "Kitchen",
+     "page": "CHECKLIST 2",
+     "page_row": 34,
+     "asked_by": "CHK-HYD-AUDIT-2 Q28"
+    },
+    {
+     "n": 66,
+     "item": "Sinks",
+     "group": "Maintain daily cleaning checklists for",
+     "kind": "line",
+     "master_row": 77,
+     "subheading": "Kitchen",
+     "page": "CHECKLIST 2",
+     "page_row": 35,
+     "asked_by": "CHK-HYD-AUDIT-2 Q29"
+    },
+    {
+     "n": 67,
+     "item": "Racks",
+     "group": "Maintain daily cleaning checklists for",
+     "kind": "line",
+     "master_row": 78,
+     "subheading": "Kitchen",
+     "page": "CHECKLIST 2",
+     "page_row": 36,
+     "asked_by": "CHK-HYD-AUDIT-2 Q30"
+    },
+    {
+     "n": 68,
+     "item": "Tables/chairs",
+     "group": "FOH",
+     "kind": "line",
+     "master_row": 80,
+     "page": "CHECKLIST 3",
+     "page_row": 2,
+     "asked_by": "CHK-HYD-AUDIT-3 Q01"
+    },
+    {
+     "n": 69,
+     "item": "Service stations",
+     "group": "FOH",
+     "kind": "line",
+     "master_row": 81,
+     "page": "CHECKLIST 3",
+     "page_row": 3,
+     "asked_by": "CHK-HYD-AUDIT-3 Q02"
+    },
+    {
+     "n": 70,
+     "item": "Crockery/cutlery",
+     "group": "FOH",
+     "kind": "line",
+     "master_row": 82,
+     "page": "CHECKLIST 3",
+     "page_row": 4,
+     "asked_by": "CHK-HYD-AUDIT-3 Q03"
+    },
+    {
+     "n": 71,
+     "item": "Water station",
+     "group": "FOH",
+     "kind": "line",
+     "master_row": 83,
+     "page": "CHECKLIST 3",
+     "page_row": 5,
+     "asked_by": "CHK-HYD-AUDIT-3 Q04"
+    },
+    {
+     "n": 72,
+     "item": "Toilet",
+     "group": "Washrooms",
+     "kind": "line",
+     "master_row": 85,
+     "page": "CHECKLIST 3",
+     "page_row": 7,
+     "asked_by": "CHK-HYD-AUDIT-3 Q05"
+    },
+    {
+     "n": 73,
+     "item": "Wash basin",
+     "group": "Washrooms",
+     "kind": "line",
+     "master_row": 86,
+     "page": "CHECKLIST 3",
+     "page_row": 8,
+     "asked_by": "CHK-HYD-AUDIT-3 Q06"
+    },
+    {
+     "n": 74,
+     "item": "Soap",
+     "group": "Washrooms",
+     "kind": "line",
+     "master_row": 87,
+     "page": "CHECKLIST 3",
+     "page_row": 9,
+     "asked_by": "CHK-HYD-AUDIT-3 Q07"
+    },
+    {
+     "n": 75,
+     "item": "Hand-drying facility",
+     "group": "Washrooms",
+     "kind": "line",
+     "master_row": 88,
+     "page": "CHECKLIST 3",
+     "page_row": 10,
+     "asked_by": "CHK-HYD-AUDIT-3 Q08"
+    },
+    {
+     "n": 76,
+     "item": "Cleaning record",
+     "group": "Washrooms",
+     "kind": "line",
+     "master_row": 89,
+     "page": "CHECKLIST 3",
+     "page_row": 11,
+     "asked_by": "CHK-HYD-AUDIT-3 Q09"
+    }
+   ]
+  },
+  {
+   "section": "Pest Control",
+   "items": [
+    {
+     "n": 77,
+     "item": "Monthly pest-control report",
+     "kind": "line",
+     "master_row": 91,
+     "page": "CHECKLIST 3",
+     "page_row": 13,
+     "asked_by": "CHK-HYD-AUDIT-3 Q10"
+    },
+    {
+     "n": 78,
+     "item": "Pest-control chemicals/records maintained",
+     "kind": "line",
+     "master_row": 92,
+     "page": "CHECKLIST 3",
+     "page_row": 14,
+     "asked_by": "CHK-HYD-AUDIT-3 Q11"
+    },
+    {
+     "n": 79,
+     "item": "No cockroaches",
+     "kind": "line",
+     "master_row": 93,
+     "page": "CHECKLIST 3",
+     "page_row": 15,
+     "asked_by": "CHK-HYD-AUDIT-3 Q12"
+    },
+    {
+     "n": 80,
+     "item": "No flies",
+     "kind": "line",
+     "master_row": 94,
+     "page": "CHECKLIST 3",
+     "page_row": 16,
+     "asked_by": "CHK-HYD-AUDIT-3 Q13"
+    },
+    {
+     "n": 81,
+     "item": "No rodents",
+     "kind": "line",
+     "master_row": 95,
+     "page": "CHECKLIST 3",
+     "page_row": 17,
+     "asked_by": "CHK-HYD-AUDIT-3 Q14"
+    },
+    {
+     "n": 82,
+     "item": "No pest droppings/eggs/larvae",
+     "kind": "line",
+     "master_row": 96,
+     "page": "CHECKLIST 3",
+     "page_row": 18,
+     "asked_by": "CHK-HYD-AUDIT-3 Q15"
+    },
+    {
+     "n": 83,
+     "item": "Insect-proof screens where required",
+     "kind": "line",
+     "master_row": 97,
+     "page": "CHECKLIST 3",
+     "page_row": 19,
+     "asked_by": "CHK-HYD-AUDIT-3 Q16"
+    },
+    {
+     "n": 84,
+     "item": "Door gaps sealed",
+     "kind": "line",
+     "master_row": 98,
+     "page": "CHECKLIST 3",
+     "page_row": 20,
+     "asked_by": "CHK-HYD-AUDIT-3 Q17"
+    },
+    {
+     "n": 85,
+     "item": "Drain/grease traps maintained",
+     "kind": "line",
+     "master_row": 99,
+     "page": "CHECKLIST 3",
+     "page_row": 21,
+     "asked_by": "CHK-HYD-AUDIT-3 Q18"
+    }
+   ]
+  },
+  {
+   "section": "Waste Management",
+   "items": [
+    {
+     "n": 86,
+     "item": "Separate wet/dry waste as applicable",
+     "kind": "line",
+     "master_row": 101,
+     "page": "CHECKLIST 3",
+     "page_row": 23,
+     "asked_by": "CHK-HYD-AUDIT-3 Q19"
+    },
+    {
+     "n": 87,
+     "item": "Bins have lids",
+     "kind": "line",
+     "master_row": 102,
+     "page": "CHECKLIST 3",
+     "page_row": 24,
+     "asked_by": "CHK-HYD-AUDIT-3 Q20"
+    },
+    {
+     "n": 88,
+     "item": "Bins are cleaned regularly",
+     "kind": "line",
+     "master_row": 103,
+     "page": "CHECKLIST 3",
+     "page_row": 25,
+     "asked_by": "CHK-HYD-AUDIT-3 Q21"
+    },
+    {
+     "n": 89,
+     "item": "Waste removed from kitchen periodically",
+     "kind": "line",
+     "master_row": 104,
+     "page": "CHECKLIST 3",
+     "page_row": 26,
+     "asked_by": "CHK-HYD-AUDIT-3 Q22"
+    },
+    {
+     "n": 90,
+     "item": "No overflowing bins",
+     "kind": "line",
+     "master_row": 105,
+     "page": "CHECKLIST 3",
+     "page_row": 27,
+     "asked_by": "CHK-HYD-AUDIT-3 Q23"
+    },
+    {
+     "n": 91,
+     "item": "Waste area kept clean",
+     "kind": "line",
+     "master_row": 106,
+     "page": "CHECKLIST 3",
+     "page_row": 28,
+     "asked_by": "CHK-HYD-AUDIT-3 Q24"
+    },
+    {
+     "n": 92,
+     "item": "Used oil disposal records maintained",
+     "kind": "line",
+     "master_row": 107,
+     "page": "CHECKLIST 3",
+     "page_row": 29,
+     "asked_by": "CHK-HYD-AUDIT-3 Q25"
+    },
+    {
+     "n": 93,
+     "item": "No food waste accumulated near preparation areas",
+     "kind": "line",
+     "master_row": 108,
+     "page": "CHECKLIST 3",
+     "page_row": 30,
+     "asked_by": "CHK-HYD-AUDIT-3 Q26"
+    }
+   ]
+  },
+  {
+   "section": "Food-Grade Equipment & Packaging",
+   "items": [
+    {
+     "n": 94,
+     "item": "Food-contact equipment is food-safe",
+     "kind": "line",
+     "master_row": 110,
+     "page": "CHECKLIST 3",
+     "page_row": 32,
+     "asked_by": "CHK-HYD-AUDIT-3 Q27"
+    },
+    {
+     "n": 95,
+     "item": "Containers are non-toxic and easy to clean",
+     "kind": "line",
+     "master_row": 111,
+     "page": "CHECKLIST 3",
+     "page_row": 33,
+     "asked_by": "CHK-HYD-AUDIT-3 Q28"
+    },
+    {
+     "n": 96,
+     "item": "No rusted/damaged food-contact equipment",
+     "kind": "line",
+     "master_row": 112,
+     "page": "CHECKLIST 3",
+     "page_row": 34,
+     "asked_by": "CHK-HYD-AUDIT-3 Q29"
+    },
+    {
+     "n": 97,
+     "item": "Food-grade storage containers",
+     "kind": "line",
+     "master_row": 113,
+     "page": "CHECKLIST 3",
+     "page_row": 35,
+     "asked_by": "CHK-HYD-AUDIT-3 Q30"
+    },
+    {
+     "n": 98,
+     "item": "Food-grade packaging for delivery",
+     "kind": "line",
+     "master_row": 114,
+     "page": "CHECKLIST 3",
+     "page_row": 36,
+     "asked_by": "CHK-HYD-AUDIT-3 Q31"
+    },
+    {
+     "n": 99,
+     "item": "No newspaper used for food wrapping",
+     "kind": "line",
+     "master_row": 115,
+     "page": "CHECKLIST 3",
+     "page_row": 37,
+     "asked_by": "CHK-HYD-AUDIT-3 Q32"
+    },
+    {
+     "n": 100,
+     "item": "Packaging properly stored",
+     "kind": "line",
+     "master_row": 116,
+     "page": "CHECKLIST 3",
+     "page_row": 38,
+     "asked_by": "CHK-HYD-AUDIT-3 Q33"
+    }
+   ]
+  },
+  {
+   "section": "Records You Should Keep Ready in One Audit File",
+   "items": [
+    {
+     "n": 101,
+     "item": "FSSAI licence copy",
+     "kind": "line",
+     "master_row": 118,
+     "audit_file_record": 1
+    },
+    {
+     "n": 102,
+     "item": "FSDB photograph",
+     "kind": "line",
+     "master_row": 119,
+     "audit_file_record": 2
+    },
+    {
+     "n": 103,
+     "item": "GHMC licence",
+     "kind": "line",
+     "master_row": 120,
+     "audit_file_record": 3
+    },
+    {
+     "n": 104,
+     "item": "Water test report / water bill",
+     "kind": "line",
+     "master_row": 121,
+     "audit_file_record": 4
+    },
+    {
+     "n": 105,
+     "item": "Pest-control agreement + reports",
+     "kind": "line",
+     "master_row": 122,
+     "audit_file_record": 5
+    },
+    {
+     "n": 106,
+     "item": "Food-handler medical certificates",
+     "kind": "line",
+     "master_row": 123,
+     "audit_file_record": 6
+    },
+    {
+     "n": 107,
+     "item": "Food-safety training records",
+     "kind": "line",
+     "master_row": 124,
+     "audit_file_record": 7
+    },
+    {
+     "n": 108,
+     "item": "Approved vendor list",
+     "kind": "line",
+     "master_row": 125,
+     "audit_file_record": 8
+    },
+    {
+     "n": 109,
+     "item": "Receiving checklist",
+     "kind": "line",
+     "master_row": 126,
+     "audit_file_record": 9
+    },
+    {
+     "n": 110,
+     "item": "Refrigerator/freezer temperature log",
+     "kind": "line",
+     "master_row": 127,
+     "audit_file_record": 10
+    },
+    {
+     "n": 111,
+     "item": "Cooking/reheating temperature log",
+     "kind": "line",
+     "master_row": 128,
+     "audit_file_record": 11
+    },
+    {
+     "n": 112,
+     "item": "Cleaning & sanitation checklist",
+     "kind": "line",
+     "master_row": 129,
+     "audit_file_record": 12
+    },
+    {
+     "n": 113,
+     "item": "Pest-control monitoring sheet",
+     "kind": "line",
+     "master_row": 130,
+     "audit_file_record": 13
+    },
+    {
+     "n": 114,
+     "item": "Waste disposal record",
+     "kind": "line",
+     "master_row": 131,
+     "audit_file_record": 14
+    },
+    {
+     "n": 115,
+     "item": "Used cooking-oil/TPC records",
+     "kind": "line",
+     "master_row": 132,
+     "audit_file_record": 15
+    },
+    {
+     "n": 116,
+     "item": "Equipment maintenance records",
+     "kind": "line",
+     "master_row": 133,
+     "audit_file_record": 16
+    },
+    {
+     "n": 117,
+     "item": "Calibration certificates",
+     "kind": "line",
+     "master_row": 134,
+     "audit_file_record": 17
+    },
+    {
+     "n": 118,
+     "item": "FIFO/FEFO checklist",
+     "kind": "line",
+     "master_row": 135,
+     "audit_file_record": 18
+    },
+    {
+     "n": 119,
+     "item": "Food sampling/lab reports, where applicable",
+     "kind": "line",
+     "master_row": 136,
+     "audit_file_record": 19
+    },
+    {
+     "n": 120,
+     "item": "Previous audit report and closure evidence",
+     "kind": "line",
+     "master_row": 137,
+     "audit_file_record": 20
+    }
+   ]
   }
+ ],
+ "authority_pages": {
+  "CHECKLIST 1": {
+   "sheet": " CHECKLIST 1",
+   "rows": 42,
+   "lines": 36,
+   "template": "CHK-HYD-AUDIT-1",
+   "sections": [
+    {
+     "heading": "Licences & Display",
+     "lines": 8
+    },
+    {
+     "heading": "Kitchen & Premises Hygiene",
+     "lines": 9
+    },
+    {
+     "heading": "Storage – Very Important",
+     "lines": 12
+    },
+    {
+     "heading": "Food Temperature Control",
+     "lines": 7,
+     "lead_in": "Maintain a temperature monitoring sheet for:"
+    }
+   ]
+  },
+  "CHECKLIST 2": {
+   "sheet": "CHECKLIST 2",
+   "rows": 36,
+   "lines": 30,
+   "template": "CHK-HYD-AUDIT-2",
+   "sections": [
+    {
+     "heading": "Food Preparation",
+     "lines": 9
+    },
+    {
+     "heading": "Personal Hygiene – Critical",
+     "lines": 11,
+     "lead_in": "Every food handler should have:"
+    },
+    {
+     "heading": "Cleaning & Sanitation",
+     "lines": 10,
+     "lead_in": "Maintain daily cleaning checklists for:",
+     "subheading": "Kitchen"
+    }
+   ]
+  },
+  "CHECKLIST 3": {
+   "sheet": "CHECKLIST 3",
+   "rows": 38,
+   "lines": 33,
+   "template": "CHK-HYD-AUDIT-3",
+   "sections": [
+    {
+     "heading": "FOH",
+     "lines": 4
+    },
+    {
+     "heading": "Washrooms",
+     "lines": 5
+    },
+    {
+     "heading": "Pest Control",
+     "lines": 9
+    },
+    {
+     "heading": "Waste Management",
+     "lines": 8
+    },
+    {
+     "heading": "Food-Grade Equipment & Packaging",
+     "lines": 7
+    }
+   ]
+  }
+ },
+ "workbook": [
+  {
+   "sheet": "FOOD SAFETY AUDIT CHECKLIS",
+   "columns": [
+    "YES",
+    "NO",
+    "REMARK"
+   ],
+   "rows": [
+    [
+     1,
+     "title",
+     " FOOD SAFETY AUDIT CHECKLIST"
+    ],
+    [
+     2,
+     "heading",
+     "Licences & Display"
+    ],
+    [
+     3,
+     "line",
+     "FSSAI licence displayed prominently"
+    ],
+    [
+     4,
+     "line",
+     "Food Safety Display Board (FSDB) displayed and readable"
+    ],
+    [
+     5,
+     "line",
+     "GHMC trade/municipal licence available"
+    ],
+    [
+     6,
+     "line",
+     "Fire/safety documents as applicable"
+    ],
+    [
+     7,
+     "line",
+     "Pest-control agency agreement and latest service report"
+    ],
+    [
+     8,
+     "line",
+     "Food-handler medical examination records"
+    ],
+    [
+     9,
+     "line",
+     "Water testing report / municipal water bill records"
+    ],
+    [
+     10,
+     "line",
+     "Approved vendor list maintained"
+    ],
+    [
+     11,
+     "heading",
+     "Kitchen & Premises Hygiene"
+    ],
+    [
+     12,
+     "line",
+     "Kitchen floors clean, dry and non-slippery"
+    ],
+    [
+     13,
+     "line",
+     "Walls and ceiling clean; no peeling paint/plaster"
+    ],
+    [
+     14,
+     "line",
+     "No water stagnation"
+    ],
+    [
+     15,
+     "line",
+     "Proper drainage"
+    ],
+    [
+     16,
+     "line",
+     "Exhaust/hood clean"
+    ],
+    [
+     17,
+     "line",
+     "Adequate lighting"
+    ],
+    [
+     18,
+     "line",
+     "Light fittings protected against breakage"
+    ],
+    [
+     19,
+     "line",
+     "Doors/windows clean and pest-proof"
+    ],
+    [
+     20,
+     "line",
+     "No unnecessary items stored in food areas"
+    ],
+    [
+     21,
+     "heading",
+     "Storage – Very Important"
+    ],
+    [
+     22,
+     "line",
+     "FIFO followed"
+    ],
+    [
+     23,
+     "line",
+     "FEFO followed"
+    ],
+    [
+     24,
+     "line",
+     "All containers properly covered"
+    ],
+    [
+     25,
+     "line",
+     "Food-grade containers used"
+    ],
+    [
+     26,
+     "line",
+     "No food stored directly on floor"
+    ],
+    [
+     27,
+     "line",
+     "Raw and cooked food separated"
+    ],
+    [
+     28,
+     "line",
+     "Veg and non-veg properly segregated"
+    ],
+    [
+     29,
+     "line",
+     "Chemicals stored separately from food"
+    ],
+    [
+     30,
+     "line",
+     "Personal items kept outside food-storage areas"
+    ],
+    [
+     31,
+     "line",
+     "Dry store clean and pest-free"
+    ],
+    [
+     32,
+     "line",
+     "Refrigerator/freezer temperature recorded daily"
+    ],
+    [
+     33,
+     "line",
+     "Expired/damaged products immediately removed"
+    ],
+    [
+     34,
+     "heading",
+     "Food Temperature Control"
+    ],
+    [
+     35,
+     "lead_in",
+     "Maintain a temperature monitoring sheet for:"
+    ],
+    [
+     36,
+     "line",
+     "Receiving"
+    ],
+    [
+     37,
+     "line",
+     "Refrigerators"
+    ],
+    [
+     38,
+     "line",
+     "Freezers"
+    ],
+    [
+     39,
+     "line",
+     "Hot holding"
+    ],
+    [
+     40,
+     "line",
+     "Cooking"
+    ],
+    [
+     41,
+     "line",
+     "Reheating"
+    ],
+    [
+     42,
+     "line",
+     "Cooling"
+    ],
+    [
+     43,
+     "heading",
+     "Food Preparation"
+    ],
+    [
+     44,
+     "line",
+     "Raw materials washed/cleaned properly"
+    ],
+    [
+     45,
+     "line",
+     "Separate cutting boards/knives where required"
+    ],
+    [
+     46,
+     "line",
+     "Raw and cooked food not cross-contaminated"
+    ],
+    [
+     47,
+     "line",
+     "Food handlers wash hands before food preparation"
+    ],
+    [
+     48,
+     "line",
+     "Food covered during preparation/storage"
+    ],
+    [
+     49,
+     "line",
+     "No direct hand contact with ready-to-eat food where avoidable"
+    ],
+    [
+     50,
+     "line",
+     "Cooking temperature/process monitored"
+    ],
+    [
+     51,
+     "line",
+     "Reheating controlled and recorded"
+    ],
+    [
+     52,
+     "line",
+     "No expired ingredients used"
+    ],
+    [
+     53,
+     "heading",
+     "Personal Hygiene – Critical"
+    ],
+    [
+     54,
+     "lead_in",
+     "Every food handler should have:"
+    ],
+    [
+     55,
+     "line",
+     "Clean uniform"
+    ],
+    [
+     56,
+     "line",
+     "Hairnet/cap"
+    ],
+    [
+     57,
+     "line",
+     "Appropriate apron"
+    ],
+    [
+     58,
+     "line",
+     "Clean, trimmed nails"
+    ],
+    [
+     59,
+     "line",
+     "No loose jewellery"
+    ],
+    [
+     60,
+     "line",
+     "Proper handwashing practice"
+    ],
+    [
+     61,
+     "line",
+     "Waterproof dressing for minor wounds"
+    ],
+    [
+     62,
+     "line",
+     "No smoking/spitting in food areas"
+    ],
+    [
+     63,
+     "line",
+     "No handling food while suffering from an illness/open wound"
+    ],
+    [
+     64,
+     "line",
+     "Medical examination records available"
+    ],
+    [
+     65,
+     "line",
+     "Food-safety training records available"
+    ],
+    [
+     66,
+     "heading",
+     "Cleaning & Sanitation"
+    ],
+    [
+     67,
+     "lead_in",
+     "Maintain daily cleaning checklists for:"
+    ],
+    [
+     68,
+     "subheading",
+     "Kitchen"
+    ],
+    [
+     69,
+     "line",
+     "Floors"
+    ],
+    [
+     70,
+     "line",
+     "Walls"
+    ],
+    [
+     71,
+     "line",
+     "Work tables"
+    ],
+    [
+     72,
+     "line",
+     "Cutting boards"
+    ],
+    [
+     73,
+     "line",
+     "Cooking equipment"
+    ],
+    [
+     74,
+     "line",
+     "Refrigerators"
+    ],
+    [
+     75,
+     "line",
+     "Freezers"
+    ],
+    [
+     76,
+     "line",
+     "Exhaust/hood"
+    ],
+    [
+     77,
+     "line",
+     "Sinks"
+    ],
+    [
+     78,
+     "line",
+     "Racks"
+    ],
+    [
+     79,
+     "heading",
+     "FOH"
+    ],
+    [
+     80,
+     "line",
+     "Tables/chairs"
+    ],
+    [
+     81,
+     "line",
+     "Service stations"
+    ],
+    [
+     82,
+     "line",
+     "Crockery/cutlery"
+    ],
+    [
+     83,
+     "line",
+     "Water station"
+    ],
+    [
+     84,
+     "heading",
+     "Washrooms"
+    ],
+    [
+     85,
+     "line",
+     "Toilet"
+    ],
+    [
+     86,
+     "line",
+     "Wash basin"
+    ],
+    [
+     87,
+     "line",
+     "Soap"
+    ],
+    [
+     88,
+     "line",
+     "Hand-drying facility"
+    ],
+    [
+     89,
+     "line",
+     "Cleaning record"
+    ],
+    [
+     90,
+     "heading",
+     "Pest Control"
+    ],
+    [
+     91,
+     "line",
+     "Monthly pest-control report"
+    ],
+    [
+     92,
+     "line",
+     "Pest-control chemicals/records maintained"
+    ],
+    [
+     93,
+     "line",
+     "No cockroaches"
+    ],
+    [
+     94,
+     "line",
+     "No flies"
+    ],
+    [
+     95,
+     "line",
+     "No rodents"
+    ],
+    [
+     96,
+     "line",
+     "No pest droppings/eggs/larvae"
+    ],
+    [
+     97,
+     "line",
+     "Insect-proof screens where required"
+    ],
+    [
+     98,
+     "line",
+     "Door gaps sealed"
+    ],
+    [
+     99,
+     "line",
+     "Drain/grease traps maintained"
+    ],
+    [
+     100,
+     "heading",
+     "Waste Management"
+    ],
+    [
+     101,
+     "line",
+     "Separate wet/dry waste as applicable"
+    ],
+    [
+     102,
+     "line",
+     "Bins have lids"
+    ],
+    [
+     103,
+     "line",
+     "Bins are cleaned regularly"
+    ],
+    [
+     104,
+     "line",
+     "Waste removed from kitchen periodically"
+    ],
+    [
+     105,
+     "line",
+     "No overflowing bins"
+    ],
+    [
+     106,
+     "line",
+     "Waste area kept clean"
+    ],
+    [
+     107,
+     "line",
+     "Used oil disposal records maintained"
+    ],
+    [
+     108,
+     "line",
+     "No food waste accumulated near preparation areas"
+    ],
+    [
+     109,
+     "heading",
+     "Food-Grade Equipment & Packaging"
+    ],
+    [
+     110,
+     "line",
+     "Food-contact equipment is food-safe"
+    ],
+    [
+     111,
+     "line",
+     "Containers are non-toxic and easy to clean"
+    ],
+    [
+     112,
+     "line",
+     "No rusted/damaged food-contact equipment"
+    ],
+    [
+     113,
+     "line",
+     "Food-grade storage containers"
+    ],
+    [
+     114,
+     "line",
+     "Food-grade packaging for delivery"
+    ],
+    [
+     115,
+     "line",
+     "No newspaper used for food wrapping"
+    ],
+    [
+     116,
+     "line",
+     "Packaging properly stored"
+    ],
+    [
+     117,
+     "heading",
+     "Records You Should Keep Ready in One Audit File"
+    ],
+    [
+     118,
+     "line",
+     "FSSAI licence copy"
+    ],
+    [
+     119,
+     "line",
+     "FSDB photograph"
+    ],
+    [
+     120,
+     "line",
+     "GHMC licence"
+    ],
+    [
+     121,
+     "line",
+     "Water test report / water bill"
+    ],
+    [
+     122,
+     "line",
+     "Pest-control agreement + reports"
+    ],
+    [
+     123,
+     "line",
+     "Food-handler medical certificates"
+    ],
+    [
+     124,
+     "line",
+     "Food-safety training records"
+    ],
+    [
+     125,
+     "line",
+     "Approved vendor list"
+    ],
+    [
+     126,
+     "line",
+     "Receiving checklist"
+    ],
+    [
+     127,
+     "line",
+     "Refrigerator/freezer temperature log"
+    ],
+    [
+     128,
+     "line",
+     "Cooking/reheating temperature log"
+    ],
+    [
+     129,
+     "line",
+     "Cleaning & sanitation checklist"
+    ],
+    [
+     130,
+     "line",
+     "Pest-control monitoring sheet"
+    ],
+    [
+     131,
+     "line",
+     "Waste disposal record"
+    ],
+    [
+     132,
+     "line",
+     "Used cooking-oil/TPC records"
+    ],
+    [
+     133,
+     "line",
+     "Equipment maintenance records"
+    ],
+    [
+     134,
+     "line",
+     "Calibration certificates"
+    ],
+    [
+     135,
+     "line",
+     "FIFO/FEFO checklist"
+    ],
+    [
+     136,
+     "line",
+     "Food sampling/lab reports, where applicable"
+    ],
+    [
+     137,
+     "line",
+     "Previous audit report and closure evidence"
+    ]
+   ]
+  },
+  {
+   "sheet": " CHECKLIST 1",
+   "columns": [
+    "YES",
+    "NO",
+    "REMARK"
+   ],
+   "rows": [
+    [
+     1,
+     "title",
+     " FOOD SAFETY AUDIT CHECKLIST"
+    ],
+    [
+     2,
+     "heading",
+     "Licences & Display"
+    ],
+    [
+     3,
+     "line",
+     "FSSAI licence displayed prominently"
+    ],
+    [
+     4,
+     "line",
+     "Food Safety Display Board (FSDB) displayed and readable"
+    ],
+    [
+     5,
+     "line",
+     "GHMC trade/municipal licence available"
+    ],
+    [
+     6,
+     "line",
+     "Fire/safety documents as applicable"
+    ],
+    [
+     7,
+     "line",
+     "Pest-control agency agreement and latest service report"
+    ],
+    [
+     8,
+     "line",
+     "Food-handler medical examination records"
+    ],
+    [
+     9,
+     "line",
+     "Water testing report / municipal water bill records"
+    ],
+    [
+     10,
+     "line",
+     "Approved vendor list maintained"
+    ],
+    [
+     11,
+     "heading",
+     "Kitchen & Premises Hygiene"
+    ],
+    [
+     12,
+     "line",
+     "Kitchen floors clean, dry and non-slippery"
+    ],
+    [
+     13,
+     "line",
+     "Walls and ceiling clean; no peeling paint/plaster"
+    ],
+    [
+     14,
+     "line",
+     "No water stagnation"
+    ],
+    [
+     15,
+     "line",
+     "Proper drainage"
+    ],
+    [
+     16,
+     "line",
+     "Exhaust/hood clean"
+    ],
+    [
+     17,
+     "line",
+     "Adequate lighting"
+    ],
+    [
+     18,
+     "line",
+     "Light fittings protected against breakage"
+    ],
+    [
+     19,
+     "line",
+     "Doors/windows clean and pest-proof"
+    ],
+    [
+     20,
+     "line",
+     "No unnecessary items stored in food areas"
+    ],
+    [
+     21,
+     "heading",
+     "Storage – Very Important"
+    ],
+    [
+     22,
+     "line",
+     "FIFO followed"
+    ],
+    [
+     23,
+     "line",
+     "FEFO followed"
+    ],
+    [
+     24,
+     "line",
+     "All containers properly covered"
+    ],
+    [
+     25,
+     "line",
+     "Food-grade containers used"
+    ],
+    [
+     26,
+     "line",
+     "No food stored directly on floor"
+    ],
+    [
+     27,
+     "line",
+     "Raw and cooked food separated"
+    ],
+    [
+     28,
+     "line",
+     "Veg and non-veg properly segregated"
+    ],
+    [
+     29,
+     "line",
+     "Chemicals stored separately from food"
+    ],
+    [
+     30,
+     "line",
+     "Personal items kept outside food-storage areas"
+    ],
+    [
+     31,
+     "line",
+     "Dry store clean and pest-free"
+    ],
+    [
+     32,
+     "line",
+     "Refrigerator/freezer temperature recorded daily"
+    ],
+    [
+     33,
+     "line",
+     "Expired/damaged products immediately removed"
+    ],
+    [
+     34,
+     "heading",
+     "Food Temperature Control"
+    ],
+    [
+     35,
+     "lead_in",
+     "Maintain a temperature monitoring sheet for:"
+    ],
+    [
+     36,
+     "line",
+     "Receiving"
+    ],
+    [
+     37,
+     "line",
+     "Refrigerators"
+    ],
+    [
+     38,
+     "line",
+     "Freezers"
+    ],
+    [
+     39,
+     "line",
+     "Hot holding"
+    ],
+    [
+     40,
+     "line",
+     "Cooking"
+    ],
+    [
+     41,
+     "line",
+     "Reheating"
+    ],
+    [
+     42,
+     "line",
+     "Cooling"
+    ]
+   ]
+  },
+  {
+   "sheet": "CHECKLIST 2",
+   "columns": [
+    "YES",
+    "NO",
+    "REMARK"
+   ],
+   "rows": [
+    [
+     1,
+     "heading",
+     "Food Preparation"
+    ],
+    [
+     2,
+     "line",
+     "Raw materials washed/cleaned properly"
+    ],
+    [
+     3,
+     "line",
+     "Separate cutting boards/knives where required"
+    ],
+    [
+     4,
+     "line",
+     "Raw and cooked food not cross-contaminated"
+    ],
+    [
+     5,
+     "line",
+     "Food handlers wash hands before food preparation"
+    ],
+    [
+     6,
+     "line",
+     "Food covered during preparation/storage"
+    ],
+    [
+     7,
+     "line",
+     "No direct hand contact with ready-to-eat food where avoidable"
+    ],
+    [
+     8,
+     "line",
+     "Cooking temperature/process monitored"
+    ],
+    [
+     9,
+     "line",
+     "Reheating controlled and recorded"
+    ],
+    [
+     10,
+     "line",
+     "No expired ingredients used"
+    ],
+    [
+     11,
+     "heading",
+     "Personal Hygiene – Critical"
+    ],
+    [
+     12,
+     "lead_in",
+     "Every food handler should have:"
+    ],
+    [
+     13,
+     "line",
+     "Clean uniform"
+    ],
+    [
+     14,
+     "line",
+     "Hairnet/cap"
+    ],
+    [
+     15,
+     "line",
+     "Appropriate apron"
+    ],
+    [
+     16,
+     "line",
+     "Clean, trimmed nails"
+    ],
+    [
+     17,
+     "line",
+     "No loose jewellery"
+    ],
+    [
+     18,
+     "line",
+     "Proper handwashing practice"
+    ],
+    [
+     19,
+     "line",
+     "Waterproof dressing for minor wounds"
+    ],
+    [
+     20,
+     "line",
+     "No smoking/spitting in food areas"
+    ],
+    [
+     21,
+     "line",
+     "No handling food while suffering from an illness/open wound"
+    ],
+    [
+     22,
+     "line",
+     "Medical examination records available"
+    ],
+    [
+     23,
+     "line",
+     "Food-safety training records available"
+    ],
+    [
+     24,
+     "heading",
+     "Cleaning & Sanitation"
+    ],
+    [
+     25,
+     "lead_in",
+     "Maintain daily cleaning checklists for:"
+    ],
+    [
+     26,
+     "subheading",
+     "Kitchen"
+    ],
+    [
+     27,
+     "line",
+     "Floors"
+    ],
+    [
+     28,
+     "line",
+     "Walls"
+    ],
+    [
+     29,
+     "line",
+     "Work tables"
+    ],
+    [
+     30,
+     "line",
+     "Cutting boards"
+    ],
+    [
+     31,
+     "line",
+     "Cooking equipment"
+    ],
+    [
+     32,
+     "line",
+     "Refrigerators"
+    ],
+    [
+     33,
+     "line",
+     "Freezers"
+    ],
+    [
+     34,
+     "line",
+     "Exhaust/hood"
+    ],
+    [
+     35,
+     "line",
+     "Sinks"
+    ],
+    [
+     36,
+     "line",
+     "Racks"
+    ]
+   ]
+  },
+  {
+   "sheet": "CHECKLIST 3",
+   "columns": [
+    "YES",
+    "NO",
+    "REMARK"
+   ],
+   "rows": [
+    [
+     1,
+     "heading",
+     "FOH"
+    ],
+    [
+     2,
+     "line",
+     "Tables/chairs"
+    ],
+    [
+     3,
+     "line",
+     "Service stations"
+    ],
+    [
+     4,
+     "line",
+     "Crockery/cutlery"
+    ],
+    [
+     5,
+     "line",
+     "Water station"
+    ],
+    [
+     6,
+     "heading",
+     "Washrooms"
+    ],
+    [
+     7,
+     "line",
+     "Toilet"
+    ],
+    [
+     8,
+     "line",
+     "Wash basin"
+    ],
+    [
+     9,
+     "line",
+     "Soap"
+    ],
+    [
+     10,
+     "line",
+     "Hand-drying facility"
+    ],
+    [
+     11,
+     "line",
+     "Cleaning record"
+    ],
+    [
+     12,
+     "heading",
+     "Pest Control"
+    ],
+    [
+     13,
+     "line",
+     "Monthly pest-control report"
+    ],
+    [
+     14,
+     "line",
+     "Pest-control chemicals/records maintained"
+    ],
+    [
+     15,
+     "line",
+     "No cockroaches"
+    ],
+    [
+     16,
+     "line",
+     "No flies"
+    ],
+    [
+     17,
+     "line",
+     "No rodents"
+    ],
+    [
+     18,
+     "line",
+     "No pest droppings/eggs/larvae"
+    ],
+    [
+     19,
+     "line",
+     "Insect-proof screens where required"
+    ],
+    [
+     20,
+     "line",
+     "Door gaps sealed"
+    ],
+    [
+     21,
+     "line",
+     "Drain/grease traps maintained"
+    ],
+    [
+     22,
+     "heading",
+     "Waste Management"
+    ],
+    [
+     23,
+     "line",
+     "Separate wet/dry waste as applicable"
+    ],
+    [
+     24,
+     "line",
+     "Bins have lids"
+    ],
+    [
+     25,
+     "line",
+     "Bins are cleaned regularly"
+    ],
+    [
+     26,
+     "line",
+     "Waste removed from kitchen periodically"
+    ],
+    [
+     27,
+     "line",
+     "No overflowing bins"
+    ],
+    [
+     28,
+     "line",
+     "Waste area kept clean"
+    ],
+    [
+     29,
+     "line",
+     "Used oil disposal records maintained"
+    ],
+    [
+     30,
+     "line",
+     "No food waste accumulated near preparation areas"
+    ],
+    [
+     31,
+     "heading",
+     "Food-Grade Equipment & Packaging"
+    ],
+    [
+     32,
+     "line",
+     "Food-contact equipment is food-safe"
+    ],
+    [
+     33,
+     "line",
+     "Containers are non-toxic and easy to clean"
+    ],
+    [
+     34,
+     "line",
+     "No rusted/damaged food-contact equipment"
+    ],
+    [
+     35,
+     "line",
+     "Food-grade storage containers"
+    ],
+    [
+     36,
+     "line",
+     "Food-grade packaging for delivery"
+    ],
+    [
+     37,
+     "line",
+     "No newspaper used for food wrapping"
+    ],
+    [
+     38,
+     "line",
+     "Packaging properly stored"
+    ]
+   ]
+  }
+ ]
 }

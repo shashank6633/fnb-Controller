@@ -7,11 +7,13 @@ import {
 } from '@/lib/fssai';
 import { requireFssaiUser, fssaiCsrfGuard, fssaiAudit, fssaiAppAudit, str } from '@/lib/fssai-server';
 import {
-  insertP6Attachment, dropP6AttachmentImage, p6AttachmentsFor, nextP6Number,
-  voidP6Record, raiseP6CorrectiveAction, nextP6CaNumber, p6ConstraintMessage,
-  isoDateOrBlank, isoStampOrBlank, jsonArrayText, parseJsonObjects,
-  P6_ATTACHMENTS_PER_RECORD,
+  nextP6Number, voidP6Record, raiseP6CorrectiveAction, nextP6CaNumber, p6ConstraintMessage,
+  isoDateOrBlank, isoStampOrBlank,
 } from '../../p6-shared';
+import {
+  attachPestFile, voidPestFile, pestFilesFor, canVoidPestFiles, PEST_ACTIVE_FILES_PER_RECORD,
+} from '../_pest/files';
+import { normalisePestChemicals, readPestChemicals, requestMentionsChemicals } from '../_pest/chemicals';
 
 /**
  * PEST CONTROL — THE CONTRACTOR'S VISITS (owner §7).
@@ -37,16 +39,29 @@ import {
  * owner rules on Q2 the join can be added in one read; inventing a rival
  * schedule now could not be undone.
  *
- * It does not keep a per-device check log either. "Device 7 checked, no
- * activity" is a CHECKLIST ANSWER (§24 — the monitoring round is a seeded
- * template); the device register lives at /api/fssai/pest/devices and a
- * sighting carries device_id. A third pest table for routine checks would be
- * exactly the per-record table §2 exists to prevent.
+ * (It once said here that it keeps no per-device check log because "device 7
+ * checked, no activity" would be a checklist answer. SUPERSEDED 2026-10-14: the
+ * authority's monitoring sheet is station by station, so it has its own table
+ * and route — /api/fssai/pest/checks, table 33.)
+ *
+ * ── WHAT WAS APPLIED (#78) ──────────────────────────────────────────────────
+ * chemicals_json is written through normalisePestChemicals (../_pest/
+ * chemicals.ts), which also explains its three states: listed, none applied
+ * (said in words), not recorded. A completed visit's list is a record: it is
+ * never edited, but a list NOBODY recorded may be filled once from the job
+ * sheet ('record_chemicals'), with an audit row.
+ *
+ * ── FILES ARE VOIDED, NEVER STRIPPED ────────────────────────────────────────
+ * 'void_file' (and the old name 'remove_file', kept so a page left open across
+ * a deploy cannot reach the old behaviour) goes to voidPestFile: the file must
+ * belong to THIS visit, and it stays on the record marked void with its reason.
+ * The decision is written in full in ../_pest/files.ts.
  *
  *   GET  ?id=<id>                          one visit, with its files and sightings
  *   GET  [?from=&to=&status=&vendor_id=&kind=&q=&due=1]   the register
  *   POST { action: 'create' | 'update' | 'complete' | 'miss' | 'cancel'
- *                 | 'void' | 'attach' | 'remove_file' | 'raise_ca', … }
+ *                 | 'void' | 'attach' | 'void_file' | 'remove_file'
+ *                 | 'record_chemicals' | 'raise_ca', … }
  *
  * NO DELETE. A visit entered in error is VOIDED with a reason by somebody other
  * than the person who entered it (§19).
@@ -90,6 +105,8 @@ const SELECT = `
 function shape(row: any, opts: { mgmt: boolean; files?: any[] }) {
   const voided = !!str(row.voided_at);
   const statusMeta = voided ? fssaiRecordStatusMeta('void') : fssaiPestServiceStatusMeta(row.status);
+  const chem = readPestChemicals(row.chemicals_json);
+  const files = opts.files || [];
   return {
     id: String(row.id),
     service_no: str(row.service_no),
@@ -109,7 +126,12 @@ function shape(row: any, opts: { mgmt: boolean; files?: any[] }) {
     started_at: str(row.started_at),
     finished_at: str(row.finished_at),
     areas_covered: str(row.areas_covered),
-    chemicals: parseJsonObjects(row.chemicals_json),
+    chemicals: chem.rows,
+    /** 'listed' | 'none_applied' | 'not_recorded' — '[]' is NEVER "none". */
+    chemicals_state: chem.state,
+    chemicals_none_note: chem.none_note,
+    /** A completed visit whose list nobody recorded may be filled once. */
+    can_record_chemicals: !voided && str(row.status) === 'completed' && chem.state === 'not_recorded',
     findings: str(row.findings),
     recommendations: str(row.recommendations),
     report_no: str(row.report_no),
@@ -139,8 +161,10 @@ function shape(row: any, opts: { mgmt: boolean; files?: any[] }) {
     updated_at: str(row.updated_at),
     /** Only a planned visit is still a plan. Once it happened, it is a record. */
     is_editable: !voided && str(row.status) === 'planned',
-    files: opts.files || [],
-    file_limit: P6_ATTACHMENTS_PER_RECORD,
+    files,
+    /** Active files only — a voided file stays on the record but frees its place. */
+    active_file_count: files.filter((f: any) => !f.is_void).length,
+    file_limit: PEST_ACTIVE_FILES_PER_RECORD,
   };
 }
 
@@ -160,7 +184,7 @@ export async function GET(request: Request) {
     if (id) {
       const row = db.prepare(`${SELECT} WHERE s.id = ?`).get(id) as any;
       if (!row) return Response.json({ error: 'That pest control visit no longer exists.' }, { status: 404 });
-      const files = p6AttachmentsFor(db, 'fssai_pest_services', [id], { withImage: true }).get(id) || [];
+      const files = pestFilesFor(db, 'fssai_pest_services', [id], { withImage: true }).get(id) || [];
       // The sightings this visit dealt with, so "reported and acted on" reads in
       // one place. Oldest first: the order they were seen in is the story.
       const sightings = db.prepare(
@@ -174,6 +198,7 @@ export async function GET(request: Request) {
         sightings,
         can_record: canRecordVisit(me),
         can_void: canManageFssaiCa(me),
+        can_void_files: canVoidPestFiles(me),
         me: me.email,
         today,
       });
@@ -235,7 +260,7 @@ export async function GET(request: Request) {
     const truncated = rows.length > LIST_LIMIT;
     const page = truncated ? rows.slice(0, LIST_LIMIT) : rows;
 
-    const fileCounts = p6AttachmentsFor(db, 'fssai_pest_services', page.map((r) => String(r.id)));
+    const fileCounts = pestFilesFor(db, 'fssai_pest_services', page.map((r) => String(r.id)));
 
     // The counts are over the WHOLE register, not the page — a tab that says
     // "Missed 0" because the first 300 rows happen to contain none is worse than
@@ -265,6 +290,7 @@ export async function GET(request: Request) {
       },
       can_record: canRecordVisit(me),
       can_void: canManageFssaiCa(me),
+      can_void_files: canVoidPestFiles(me),
       me: me.email,
       today,
       truncated,
@@ -331,6 +357,16 @@ export async function POST(request: Request) {
       if (wantStatus === 'missed' && str(body.missed_reason).trim().length < 4) {
         return Response.json({ error: 'A missed visit needs a reason in words — that sentence is the single most useful line in a pest file.' }, { status: 400 });
       }
+      // What was applied is a fact about a visit that HAPPENED. On a planned,
+      // missed or cancelled visit it would be a list of things nobody sprayed,
+      // so it is refused rather than silently dropped.
+      const chem = normalisePestChemicals({
+        chemicals: body.chemicals, none: body.chemicals_none, noneNote: body.chemicals_none_note, visitDate: businessDate,
+      });
+      if (!chem.ok) return Response.json({ error: chem.error }, { status: 400 });
+      if (wantStatus !== 'completed' && chem.read.state !== 'not_recorded') {
+        return Response.json({ error: 'Chemicals are recorded on a visit that happened. Save it as completed, or leave the chemicals for when it does.' }, { status: 400 });
+      }
 
       const id = generateId();
       const now = new Date().toISOString();
@@ -349,7 +385,7 @@ export async function POST(request: Request) {
         ).run(
           id, serviceNo, vendorId, vendorName, str(body.agency_licence_no), str(body.technician_name),
           kind, businessDate, isoStampOrBlank(body.started_at), isoStampOrBlank(body.finished_at),
-          str(body.areas_covered).slice(0, 2000), jsonArrayText(body.chemicals),
+          str(body.areas_covered).slice(0, 2000), chem.json,
           str(body.findings).slice(0, 8000), str(body.recommendations).slice(0, 8000),
           str(body.report_no), str(body.document_id), str(body.contract_doc_id),
           isoDateOrBlank(body.next_due_date), str(body.staff_witness),
@@ -358,7 +394,10 @@ export async function POST(request: Request) {
         );
         fssaiAudit(db, {
           entity_table: 'fssai_pest_services', entity_id: id, action: 'create',
-          after: { service_no: serviceNo, vendor_id: vendorId, vendor_name: vendorName, business_date: businessDate, status: wantStatus, service_kind: kind },
+          after: {
+            service_no: serviceNo, vendor_id: vendorId, vendor_name: vendorName, business_date: businessDate, status: wantStatus, service_kind: kind,
+            chemicals_state: chem.read.state, chemicals: chem.read.rows.map((c) => c.name),
+          },
           actor: { email: me.email, name: me.name }, outlet_id: outletId,
         });
         return serviceNo;
@@ -377,7 +416,14 @@ export async function POST(request: Request) {
         actor_email: me.email, after: { service_no: serviceNo, status: wantStatus }, note: vendorName,
       });
       const row = db.prepare(`${SELECT} WHERE s.id = ?`).get(id) as any;
-      return Response.json({ service: shape(row, { mgmt: isManagement(me) }), created: true });
+      return Response.json({
+        service: shape(row, { mgmt: isManagement(me) }),
+        created: true,
+        warnings: chem.warnings,
+        advice: wantStatus === 'completed' && chem.read.state === 'not_recorded'
+          ? 'Recorded — but it does not say what was applied yet. Fill in the chemicals from the job sheet; an inspector reads that list first.'
+          : undefined,
+      });
     }
 
     /* ── everything else needs the row ───────────────────────────────────── */
@@ -404,7 +450,7 @@ export async function POST(request: Request) {
       // same as recording one. A voided row takes no new evidence.
       if (!canRecordVisit(me)) return Response.json({ error: 'Only a manager or an administrator can attach the contractor’s report.' }, { status: 403 });
       if (voided) return Response.json({ error: 'That visit has been voided, so nothing more can be added to it.' }, { status: 409 });
-      const out = db.transaction(() => insertP6Attachment(db, {
+      const out = db.transaction(() => attachPestFile(db, {
         entity_table: 'fssai_pest_services', entity_id: id,
         kind: str(body.kind) || 'report', data_uri: str(body.data_uri),
         filename: str(body.filename), caption: str(body.caption),
@@ -414,16 +460,19 @@ export async function POST(request: Request) {
       return Response.json({ attachment: out.attachment });
     }
 
-    if (action === 'remove_file') {
-      // The file must be on THIS visit — dropP6AttachmentImage refuses one from
-      // any other record or register, and only allows a 24-hour correction
-      // (decision and rules documented there).
-      const out = db.transaction(() => dropP6AttachmentImage(db, {
+    if (action === 'void_file' || action === 'remove_file') {
+      // DECISION (../_pest/files.ts): a file on a filed visit is VOIDED, never
+      // stripped. voidPestFile reads the file's own entity_table/entity_id and
+      // refuses (404) unless they are THIS visit — a file on a sighting, a
+      // licence or any other record cannot be reached through this id. The
+      // image stays; the void, its reason and an fssai_audit_log row are added.
+      // 'remove_file' is the old name, kept so a stale page cannot strip.
+      const out = voidPestFile(db, {
         id: str(body.attachment_id), entity_table: 'fssai_pest_services', entity_id: id,
         reason: str(body.reason), me: me as any, outlet_id: outletId,
-      }))();
+      });
       if ('error' in out) return Response.json({ error: out.error }, { status: out.status });
-      return Response.json({ removed: out.dropped });
+      return Response.json({ voided_file: out.voided });
     }
 
     /* ── RAISE A CORRECTIVE ACTION ───────────────────────────────────────── */
@@ -530,6 +579,19 @@ export async function POST(request: Request) {
       if (nextDue && nextDue < businessDate) {
         return Response.json({ error: 'The next visit cannot be due before this one happened.' }, { status: 400 });
       }
+      // A body that says nothing about chemicals keeps what the row carries; one
+      // that says something goes through the same normaliser as create.
+      let chemJson = str(row.chemicals_json) || '[]';
+      let chemWarnings: string[] = [];
+      if (requestMentionsChemicals(body)) {
+        const chem = normalisePestChemicals({
+          chemicals: body.chemicals, none: body.chemicals_none, noneNote: body.chemicals_none_note, visitDate: businessDate,
+        });
+        if (!chem.ok) return Response.json({ error: chem.error }, { status: 400 });
+        chemJson = chem.json;
+        chemWarnings = chem.warnings;
+      }
+      const chemAfter = readPestChemicals(chemJson);
       const now = new Date().toISOString();
       db.transaction(() => {
         db.prepare(
@@ -545,7 +607,7 @@ export async function POST(request: Request) {
           body.finished_at === undefined ? str(row.finished_at) : isoStampOrBlank(body.finished_at),
           str(body.technician_name ?? row.technician_name), str(body.agency_licence_no ?? row.agency_licence_no),
           str(body.areas_covered ?? row.areas_covered).slice(0, 2000),
-          body.chemicals === undefined ? str(row.chemicals_json) : jsonArrayText(body.chemicals),
+          chemJson,
           findings, str(body.recommendations ?? row.recommendations).slice(0, 8000),
           str(body.report_no ?? row.report_no), str(body.document_id ?? row.document_id),
           nextDue, str(body.staff_witness ?? row.staff_witness),
@@ -553,8 +615,11 @@ export async function POST(request: Request) {
         );
         fssaiAudit(db, {
           entity_table: 'fssai_pest_services', entity_id: id, action: 'complete',
-          before: { status: str(row.status), findings: str(row.findings), next_due_date: str(row.next_due_date) },
-          after: { status: 'completed', business_date: businessDate, findings, next_due_date: nextDue },
+          before: { status: str(row.status), findings: str(row.findings), next_due_date: str(row.next_due_date), chemicals_state: readPestChemicals(row.chemicals_json).state },
+          after: {
+            status: 'completed', business_date: businessDate, findings, next_due_date: nextDue,
+            chemicals_state: chemAfter.state, chemicals: chemAfter.rows.map((c) => c.name),
+          },
           actor: { email: me.email, name: me.name }, outlet_id: outletId,
         });
       })();
@@ -564,7 +629,60 @@ export async function POST(request: Request) {
         note: str(row.service_no),
       });
       const after = db.prepare(`${SELECT} WHERE s.id = ?`).get(id) as any;
-      return Response.json({ service: shape(after, { mgmt: isManagement(me) }), completed: true });
+      return Response.json({
+        service: shape(after, { mgmt: isManagement(me) }),
+        completed: true,
+        warnings: chemWarnings,
+        advice: chemAfter.state === 'not_recorded'
+          ? 'Recorded as completed — but it does not say what was applied yet. Fill in the chemicals from the job sheet.'
+          : undefined,
+      });
+    }
+
+    /* ── FILL A CHEMICALS LIST NOBODY RECORDED — once ────────────────────── */
+    if (action === 'record_chemicals') {
+      // A completed visit is a record; its chemicals, once stated, are not
+      // edited (void and refile). The one thing allowed is to fill a list that
+      // was never recorded — the job sheet arrives days after the visit as a
+      // matter of routine. The UPDATE's WHERE re-checks the column, so two
+      // managers filling it at once cannot overwrite each other.
+      if (str(row.status) !== 'completed') {
+        return Response.json({ error: 'Chemicals are recorded on a visit that happened. Mark the visit completed first.' }, { status: 409 });
+      }
+      const current = readPestChemicals(row.chemicals_json);
+      if (current.state !== 'not_recorded') {
+        return Response.json({
+          error: 'This visit already says what was applied. A completed visit is a record — to correct it, void it with a reason and file it again.',
+        }, { status: 409 });
+      }
+      const chem = normalisePestChemicals({
+        chemicals: body.chemicals, none: body.chemicals_none, noneNote: body.chemicals_none_note, visitDate: str(row.business_date),
+      });
+      if (!chem.ok) return Response.json({ error: chem.error }, { status: 400 });
+      if (chem.read.state === 'not_recorded') {
+        return Response.json({ error: 'List at least one product, or say that nothing was applied and why.' }, { status: 400 });
+      }
+      const now = new Date().toISOString();
+      const changed = db.transaction(() => {
+        const res = db.prepare(
+          `UPDATE fssai_pest_services SET chemicals_json = ?, updated_at = ? WHERE id = ? AND chemicals_json = ?`,
+        ).run(chem.json, now, id, str(row.chemicals_json));
+        if (res.changes !== 1) return false;
+        fssaiAudit(db, {
+          entity_table: 'fssai_pest_services', entity_id: id, action: 'record_chemicals', field: 'chemicals_json',
+          before: { chemicals_state: 'not_recorded', chemicals_json: str(row.chemicals_json) },
+          after: { chemicals_state: chem.read.state, chemicals: chem.read.rows, none_note: chem.read.none_note },
+          actor: { email: me.email, name: me.name }, outlet_id: outletId,
+        });
+        return true;
+      })();
+      if (!changed) return Response.json({ error: 'Somebody else filled the chemicals a moment ago. Reload the visit.' }, { status: 409 });
+      fssaiAppAudit(db, {
+        event_type: 'fssai_pest_service_chemicals', entity_type: 'fssai_pest_services', entity_id: id,
+        actor_email: me.email, after: { chemicals_state: chem.read.state, products: chem.read.rows.length }, note: str(row.service_no),
+      });
+      const after = db.prepare(`${SELECT} WHERE s.id = ?`).get(id) as any;
+      return Response.json({ service: shape(after, { mgmt: isManagement(me) }), recorded: true, warnings: chem.warnings });
     }
 
     /* ── MISS — the row this register exists for ─────────────────────────── */

@@ -157,6 +157,14 @@ const EXTRA: Record<string, Partial<Extra>> = {
     labelCols: ['receipt_no', 'collector_name', 'agency_reg_no'],
     deptCol: '',
   },
+  /* The waste handover log (2026-10-14, #114), one line per handover at the back
+   * door. recorded_by is the session login; handed_over_name is the person at the
+   * door, typed, often with no login — so NOT an author column. Voiding a handover
+   * leaves its photographs exactly as they are (Q22: never blanked). */
+  fssai_waste_handovers: {
+    authorCols: ['recorded_by'],
+    labelCols: ['handover_no', 'collector_name', 'receipt_no'],
+  },
   fssai_water_tests: {
     authorCols: ['recorded_by'],
     labelCols: ['source_point', 'test_kind', 'report_no', 'lab_name'],
@@ -170,6 +178,14 @@ const EXTRA: Record<string, Partial<Extra>> = {
     authorCols: ['reported_by'],
     labelCols: ['pest_type', 'location_label'],
   },
+  /* The pest monitoring sheet (2026-10-14), one line per station per walk.
+   * checked_by is the session login; initials are typed text, so not an author
+   * column. Voiding a line does NOT void the sighting it raised — that is its
+   * own record (the checks route says so in its reply). */
+  fssai_pest_device_checks: {
+    authorCols: ['checked_by'],
+    labelCols: ['device_code', 'location_label', 'checked_at'],
+  },
   fssai_documents: {
     authorCols: ['created_by'],
     labelCols: ['doc_code', 'title', 'reference_no'],
@@ -178,6 +194,15 @@ const EXTRA: Record<string, Partial<Extra>> = {
      * this table and on no other voidable one, which is why it is written out
      * here instead of in the shared UPDATE. */
     extraSet: ['is_active = 0'],
+  },
+  /* The food-handler register (2026-10-14). VOID is for a person entered by
+   * mistake (a duplicate, a typo'd name). Someone who LEAVES is status 'left'
+   * with left_on, set on the register's own route — never a void, because their
+   * certificates were valid evidence while they worked here. No business_date. */
+  fssai_food_handlers: {
+    authorCols: ['created_by'],
+    labelCols: ['handler_no', 'full_name', 'employee_code'],
+    dateCol: '',
   },
   fssai_inspections: {
     authorCols: ['created_by'],

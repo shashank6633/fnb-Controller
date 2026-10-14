@@ -24,16 +24,34 @@ import { FSSAI_PHOTO_RETENTION_MONTHS, fssaiBytesLabel } from '@/lib/fssai';
  *  1. IT WALKS fssai_evidence ONLY — the photographs on a checklist round, which
  *     is the store Q13 was asked about and answered. fssai_attachments (a
  *     delivery's photo, a pest sighting, a contractor's job sheet, a LICENCE or
- *     CERTIFICATE SCAN) is NOT swept. Extending the window to that store is Q22,
- *     and Q22 has NO RULING. The difference is not academic: an FSSAI licence is
- *     valid for one to five years, a FoSTaC certificate for two, and a sweep that
- *     treated their scans like a fridge photo would delete the copy of a licence
- *     while the licence is still in force — the very document an inspector asks
- *     for first. Measured on a copy of the database before this change: a licence
- *     valid to 2029 whose scan was two years old lost its scan to one sweep.
- *     Until the owner rules Q22 those files are KEPT, and the status payload
- *     says so per store (`swept: false`, `past_window_kept`) rather than counting
- *     them as "past the window" for a button that will never drop them.
+ *     CERTIFICATE SCAN, an audit report, closure evidence) is NEVER swept.
+ *
+ *     ══ OWNER RULING Q22, 2026-10-14 (final) ══════════════════════════════
+ *     "Document scans in fssai_attachments (licence, FoSTaC, pest job sheets,
+ *      delivery photos) are NEVER auto-deleted. Only checklist photos
+ *      (fssai_evidence) follow the 12-month sweep."
+ *     ════════════════════════════════════════════════════════════════════════
+ *
+ *     Why it matters: an FSSAI licence is valid for one to five years, a FoSTaC
+ *     certificate for two, and a sweep that treated their scans like a fridge
+ *     photo would delete the copy of a licence while the licence is still in
+ *     force — the very document an inspector asks for first. Measured on a copy
+ *     of the database before the store was taken off the sweep: a licence valid
+ *     to 2029 whose scan was two years old lost its scan to one sweep.
+ *
+ *     Enforced three times, so no single edit can undo the ruling:
+ *       (a) FSSAI_RETENTION_SWEPT_STORES names fssai_evidence alone;
+ *       (b) FSSAI_RETENTION_NEVER_SWEPT_STORES names fssai_attachments, and the
+ *           sweep skips any store on it EVEN IF somebody adds it to (a) — no
+ *           drop statement is ever prepared for it;
+ *       (c) the scheduler's guard (runFssaiRetentionJob, fssai-jobs.ts) refuses
+ *           the whole daily pass if a dry run names any store but fssai_evidence.
+ *     A mistaken file in fssai_attachments is VOIDED (status 'void' + reason +
+ *     actor), never blanked: recordFssaiManualImageRemoval below refuses that
+ *     store, so the old "take the image back within 24 hours" path can no longer
+ *     blank one. The status payload reports the store per store (`swept: false`,
+ *     `past_window_kept`), never as "past the window" for a button that will
+ *     never drop it.
  *
  *  2. ONLY A WELL-FORMED created_at CAN EVER QUALIFY. The old SQL compared
  *     `replace(created_at,' ','T') <= cutoff` AS STRINGS, so '' — and anything
@@ -48,11 +66,12 @@ import { FSSAI_PHOTO_RETENTION_MONTHS, fssaiBytesLabel } from '@/lib/fssai';
  *     every photograph for ever; now the bad row is skipped and named, and the
  *     guard stays as the backstop it was meant to be.
  *
- * THE OTHER WAY AN IMAGE CAN LEAVE THE FILE — a manager correcting a file
- * attached by mistake — is governed here too (`fssaiManualRemovalRefusal`,
- * `recordFssaiManualImageRemoval`), so the two rules about how long a picture
- * lives sit side by side and every image that ever leaves is in ONE ledger,
- * fssai_retention_runs.
+ * THE OTHER WAY AN IMAGE CAN LEAVE THE FILE — a manager correcting a checklist
+ * photograph attached by mistake — is governed here too
+ * (`fssaiManualRemovalRefusal`, `recordFssaiManualImageRemoval`), so the rules
+ * about how long a picture lives sit side by side and every image that ever
+ * leaves is in ONE ledger, fssai_retention_runs. Since Q22 that path is for
+ * fssai_evidence only; an attachment is voided, never removed.
  *
  * ═══ WHAT THE SWEEP MUST NEVER CHANGE, AND WHY ══════════════════════════════
  *
@@ -82,18 +101,15 @@ import { FSSAI_PHOTO_RETENTION_MONTHS, fssaiBytesLabel } from '@/lib/fssai';
  * P10 walked BOTH tables, on the reasoning that a sweep over fssai_evidence
  * alone "keeps every record-module photograph for ever while reporting success".
  * That reasoning assumed Q13 covered both stores. It does not: Q13 was asked and
- * answered about checklist photographs, and the question of the second store is
- * Q22, which is unruled (see the header). So the sweep now walks
+ * answered about checklist photographs, and the second store is Q22 — which the
+ * owner has now RULED: never auto-deleted (see the header). So the sweep walks
  * FSSAI_RETENTION_SWEPT_STORES (fssai_evidence) and the "green report over a
- * growing database" risk is answered the other way — by SAYING it: the report
- * names the store it deliberately did not walk (`stores_not_swept`), every run
- * row's detail says so, and the status payload reports fssai_attachments with
- * `swept: false` and how many of its files are past twelve months and kept.
- * `attachments_dropped` stays in the report and the run row, and stays 0 from
- * the sweep; a manual correction (below) is the only thing that raises it.
- *
- * The four-column rule is applied identically to both stores by the one UPDATE
- * that can write either, so the day Q22 is ruled the rule is already there.
+ * growing database" risk is answered by SAYING it: the report names the store it
+ * deliberately does not walk (`stores_not_swept`), every run row's detail says
+ * so, and the status payload reports fssai_attachments with `swept: false` and
+ * how many of its files are past twelve months and kept BY RULING.
+ * `attachments_dropped` stays in the report and the run row for the history it
+ * already holds; after Q22 nothing raises it.
  *
  * ═══ AND IT NOW PROVES WHAT IT DID ══════════════════════════════════════════
  *
@@ -157,8 +173,8 @@ export interface FssaiRetentionReport {
    */
   stores_skipped: string;
   /**
-   * Stores the sweep DELIBERATELY does not walk, and why — today
-   * 'fssai_attachments' (Q22 unruled). Distinct from `stores_skipped`, which is a
+   * Stores the sweep DELIBERATELY does not walk — 'fssai_attachments', by owner
+   * ruling Q22 (never auto-deleted). Distinct from `stores_skipped`, which is a
    * store the sweep wanted to walk and could not.
    */
   stores_not_swept: string;
@@ -261,21 +277,45 @@ export function fssaiRetentionInstantMs(v: unknown): number {
 /**
  * THE STORES THE 12-MONTH SWEEP WALKS — what Q13 ruled, and nothing else.
  *
- * ⚠️ DO NOT ADD 'fssai_attachments' HERE WITHOUT THE OWNER'S RULING ON Q22.
- * That store holds licence, certificate and contract scans that must outlive
- * twelve months by years; a rule for it has to know whether the document it
- * belongs to is still in force, and no such rule has been asked for or given.
+ * ⚠️ 'fssai_attachments' MUST NEVER BE ADDED HERE. Owner ruling Q22
+ * (2026-10-14): document scans in that store are NEVER auto-deleted. Adding it
+ * would not work anyway — FSSAI_RETENTION_NEVER_SWEPT_STORES below overrides
+ * this list, and the scheduler's guard refuses a pass that names it — but the
+ * list is the first thing a reader sees, so it says so here too.
  */
 export const FSSAI_RETENTION_SWEPT_STORES: readonly FssaiPhotoStore[] = ['fssai_evidence'] as const;
+
+/**
+ * THE STORES THE SWEEP MAY NEVER TOUCH, WHATEVER THE LIST ABOVE SAYS — the
+ * owner's Q22 ruling as data. The sweep subtracts this from the swept list
+ * before it reads a row or prepares a statement, so a store named here has no
+ * drop statement in the process at all.
+ */
+export const FSSAI_RETENTION_NEVER_SWEPT_STORES: readonly FssaiPhotoStore[] = ['fssai_attachments'] as const;
+
+/** The owner's Q22 ruling, word for word — quoted on every report, run row and status. */
+export const FSSAI_Q22_RULING =
+  'Owner ruling Q22 (2026-10-14): document scans in fssai_attachments (licence, FoSTaC, pest job sheets, delivery photos) are NEVER auto-deleted. Only checklist photos (fssai_evidence) follow the 12-month sweep.';
 
 /** Why each store that is NOT swept is left alone — said on every report and status. */
 export const FSSAI_RETENTION_NOT_SWEPT: Readonly<Partial<Record<FssaiPhotoStore, string>>> = {
   fssai_attachments:
-    'Register files (deliveries, pest control, documents and certificates) are not swept: the owner ruled the 12-month window for checklist photographs (§7 Q13), and extending it to these files (Q22) has no ruling. A licence or certificate scan must not vanish while the document is in force.',
+    'Register files (deliveries, pest control, documents and certificates, audit reports, closure evidence) are never swept. '
+    + FSSAI_Q22_RULING
+    + ' A file attached by mistake is voided with a reason, never deleted.',
 };
 
+function isNeverSweptStore(store: FssaiPhotoStore | string): boolean {
+  return (FSSAI_RETENTION_NEVER_SWEPT_STORES as readonly string[]).includes(String(store));
+}
+
 function isSweptStore(store: FssaiPhotoStore): boolean {
-  return (FSSAI_RETENTION_SWEPT_STORES as readonly string[]).includes(store);
+  return (FSSAI_RETENTION_SWEPT_STORES as readonly string[]).includes(store) && !isNeverSweptStore(store);
+}
+
+/** The stores this process will actually walk: the swept list minus the never-swept one. */
+function sweptStoresNow(): FssaiPhotoStore[] {
+  return [...FSSAI_RETENTION_SWEPT_STORES].filter((s) => !isNeverSweptStore(s));
 }
 
 /* ------------------------------------------------------------------ *
@@ -352,7 +392,8 @@ export function sweepFssaiPhotoRetention(
   const unprovable: { store: FssaiPhotoStore; id: string; created_at: string }[] = [];
   let stillHeld = 0;
 
-  for (const store of FSSAI_RETENTION_SWEPT_STORES) {
+  const walk = sweptStoresNow();   // Q22: never includes fssai_attachments, whatever the list says
+  for (const store of walk) {
     if (!photoTableExists(db, store)) { skipped.push(store); continue; }
     /* AGE IS DECIDED IN ONE PLACE, AND NOT BY STRING COMPARISON.
      * This used to be `replace(created_at, ' ', 'T') <= ?` in the WHERE clause,
@@ -425,7 +466,7 @@ export function sweepFssaiPhotoRetention(
     unprovable.length
       ? `${unprovable.length} image(s) kept because their created_at is not a real date and time, so their age cannot be proved (first: ${unprovable.slice(0, 3).map((u) => `${u.store}:${u.id}`).join(', ')}).`
       : '',
-    notSwept.length ? `Not swept, pending the owner's ruling on Q22: ${notSwept.join(', ')}.` : '',
+    notSwept.length ? `Not swept, by owner ruling Q22 (2026-10-14) — never auto-deleted: ${notSwept.join(', ')}.` : '',
   ].filter(Boolean).join(' ');
 
   /* ── THE PROOF ROW ──────────────────────────────────────────────────────────
@@ -461,8 +502,8 @@ export function sweepFssaiPhotoRetention(
    * Prepared ONLY for the swept stores, so even a candidate that somehow named
    * another store would find no statement to run (`if (!drop) continue`). */
   const droppers = new Map<FssaiPhotoStore, Database.Statement<[string, string]>>();
-  for (const store of FSSAI_RETENTION_SWEPT_STORES) {
-    if (skipped.includes(store)) continue;
+  for (const store of walk) {
+    if (skipped.includes(store) || isNeverSweptStore(store)) continue;
     droppers.set(store, db.prepare(
       `UPDATE ${store} SET data_uri = '', image_dropped_at = ? WHERE id = ? AND data_uri <> ''`,
     ));
@@ -573,7 +614,7 @@ export interface FssaiPhotoStoreStatus {
    */
   overdue: number;
   overdue_bytes: number;
-  /** Not-swept stores only: files older than the window that are KEPT on purpose. */
+  /** Not-swept stores only: files older than the window that are KEPT on purpose (Q22). */
   past_window_kept: number;
   /** Images whose created_at is not a real date and time — kept, and counted here. */
   unprovable_age: number;
@@ -589,7 +630,7 @@ export interface FssaiRetentionStatus {
   overdue: number;
   overdue_bytes: number;
   overdue_bytes_label: string;
-  /** Files past the window in stores the sweep does not walk, kept pending Q22. */
+  /** Files past the window in stores the sweep does not walk — kept for good, by ruling Q22. */
   past_window_kept: number;
   /** Images, in any store, whose age cannot be proved. Never swept. */
   unprovable_age: number;
@@ -618,7 +659,8 @@ export interface FssaiRetentionStatus {
  * `held` answers "how big is this file going to get", so it is every image in
  * the module. `overdue` answers "what will the next sweep drop", so since the
  * sweep was restricted to Q13's scope it counts fssai_evidence only, and the
- * register files past twelve months are reported as `past_window_kept` instead.
+ * register files past twelve months are reported as `past_window_kept` instead
+ * — kept for good, by owner ruling Q22.
  * Age is fssaiRetentionInstantMs — the sweep's own rule — never a string
  * comparison, so this payload and the sweep cannot disagree about a row.
  */
@@ -779,6 +821,12 @@ export function listFssaiRetentionRuns(
  * ASSUMPTION, REVERSIBLE: 24 hours. It is long enough to catch a mistake made at
  * the end of a shift by the manager on the next one, and short enough that no
  * inspection could have relied on the file in between. Changing it is one line.
+ *
+ * ⚠️ SINCE OWNER RULING Q22 (2026-10-14) THIS WINDOW IS FOR CHECKLIST
+ * PHOTOGRAPHS (fssai_evidence) ONLY. A file in fssai_attachments is never
+ * blanked, inside 24 hours or out: it is voided with a reason and stays on file
+ * (FSSAI_ATTACHMENT_VOID_ONLY), and recordFssaiManualImageRemoval refuses that
+ * store so a removal transaction for it cannot commit.
  */
 export const FSSAI_FILE_CORRECTION_HOURS = 24;
 
@@ -825,6 +873,17 @@ export function fssaiManualRemovalRefusal(
  */
 export const FSSAI_MANUAL_REMOVAL_PREFIX = 'Manual correction, not the retention sweep:';
 
+/**
+ * THE ANSWER TO "TAKE THIS FILE OFF THE RECORD" FOR AN ATTACHMENT, after Q22.
+ * A route that removes files should say this (409) rather than try; the throw
+ * below is the backstop for one that still tries.
+ */
+export const FSSAI_ATTACHMENT_VOID_ONLY =
+  'A file on a food-safety record is never removed or blanked (owner ruling Q22, 2026-10-14). If it was attached by mistake, void it with a reason — it stays on file, struck out, with who voided it and why — and attach the right one beside it.';
+
+/** The error code the backstop throws with, so a caller can tell it from a failed write. */
+export const FSSAI_Q22_VOID_ONLY_CODE = 'FSSAI_Q22_VOID_ONLY';
+
 export function recordFssaiManualImageRemoval(
   db: Database.Database,
   p: {
@@ -844,6 +903,17 @@ export function recordFssaiManualImageRemoval(
     outlet_id?: string;
   },
 ): string {
+  /* Q22 BACKSTOP. This ledger row is MANDATORY for a removal (the caller runs it
+   * inside the same transaction as the UPDATE that blanks the image, and a throw
+   * here rolls that UPDATE back). Since the owner ruled that attachments are
+   * never blanked — a mistaken one is voided — refusing to write the row for
+   * that store is what makes any removal path that still exists for it roll
+   * back, with the image left exactly where it was. */
+  if (p.store === 'fssai_attachments' || isNeverSweptStore(p.store)) {
+    const e: any = new Error(FSSAI_ATTACHMENT_VOID_ONLY);
+    e.code = FSSAI_Q22_VOID_ONLY_CODE;
+    throw e;
+  }
   const id = generateId();
   const detail = [
     FSSAI_MANUAL_REMOVAL_PREFIX,
@@ -859,7 +929,8 @@ export function recordFssaiManualImageRemoval(
      VALUES (?, datetime('now'), ?, 0, 1, 1, ?, ?, ?, 'done', ?, ?, ?)`,
   ).run(
     id, String(p.created_at || ''), Number(p.size_bytes) || 0,
-    p.store === 'fssai_evidence' ? 1 : 0, p.store === 'fssai_attachments' ? 1 : 0,
+    // attachments_dropped is always 0 here: an attachment never reaches this line (Q22 backstop above).
+    p.store === 'fssai_evidence' ? 1 : 0, 0,
     detail, String(p.actor.email || p.actor.name || 'unknown'), String(p.outlet_id || ''),
   );
   return id;

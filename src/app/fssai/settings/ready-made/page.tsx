@@ -1,25 +1,29 @@
 'use client';
 
 /**
- * READY-MADE CHECKLISTS — the screen that sets the twelve up (P8). Admin only.
+ * READY-MADE CHECKLISTS — the screen that sets the fifteen up (P8). Admin only:
+ * the twelve FSSAI routines and the Hyderabad Food Safety Authority's own
+ * three-page audit (CHK-HYD-AUDIT-1/2/3), word for word.
  *
  * ── WHY THERE IS A SCREEN AT ALL, AND NOT JUST A BOOT SEED ──────────────────
  * Because a boot seed resurrects rows an administrator deleted. The rule is in
  * `scripts/check-boot-migrations.js`: anything a HUMAN has decided must not be
- * re-applied by a restart, and the twelve checklists are the clearest case of
+ * re-applied by a restart, and the ready-made checklists are the clearest case of
  * that in this module — the owner is meant to edit them and retire the ones he
  * does not want (owner §24). So nothing happens on boot. Somebody presses this
  * button, once, and `fssai_seed_log` remembers that it happened for ever.
  *
  * ── WHAT THE SCREEN HAS TO BE HONEST ABOUT ──────────────────────────────────
- *   1. It writes TWELVE checklists and about a hundred and sixty questions into
+ *   1. It writes FIFTEEN checklists and about three hundred questions into
  *      a compliance module. It therefore shows exactly what it will create
  *      BEFORE anything is pressed, grouped by the screen each one belongs to.
  *   2. They arrive as DRAFTS by default. A draft is invisible to staff
  *      (/api/fssai/templates shows a non-admin only published, active
  *      checklists), which is the reversible choice: read each one, change what
- *      you want, publish it. Publishing twelve is twelve clicks; un-publishing
- *      twelve that staff have already filed in is not.
+ *      you want, publish it — one at a time on its own page, or every untouched
+ *      ready-made draft at once with "Publish the ready-made checklists" (never
+ *      an archived one, never one whose status a person already changed).
+ *      Un-publishing fifteen that staff have already filed in is not one click.
  *   3. Several of them carry a configuration WARNING, and it is shown next to
  *      the checklist it belongs to rather than buried. "Not run against anything
  *      in particular, every shift" means ONE person files for the whole
@@ -27,11 +31,13 @@
  *      see on this screen and not discover on a Friday night.
  *   4. A code that already exists is SKIPPED, never overwritten, and the card
  *      says so with the name of what is already there.
+ *   5. A checklist an EARLIER version created and the owner since removed is
+ *      RETIRED and stays retired; the card says so instead of offering it.
  *
  * ── WHAT IT DOES NOT DO ─────────────────────────────────────────────────────
  * It cannot un-seed. There is no DELETE on /api/fssai/seed, because a seed able
  * to remove what it created would be able to remove the owner's edits with it.
- * Once the twelve exist they are ordinary checklists, retired in the builder
+ * Once the fifteen exist they are ordinary checklists, retired in the builder
  * like any other. It also creates no rota: `fssai_assignments` needs a person or
  * a role, and roles and departments are the owner's (HARD RULE 4).
  *
@@ -44,7 +50,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   AlertTriangle, ArrowLeft, Check, CheckCircle2, ClipboardList, Info, Loader2,
-  Lock, PackagePlus, RefreshCw, ShieldAlert, Sparkles,
+  Lock, PackagePlus, RefreshCw, Send, ShieldAlert, Sparkles,
 } from 'lucide-react';
 import { apiJson } from '@/lib/api';
 import { fmtIST } from '@/lib/format-date';
@@ -70,9 +76,12 @@ interface TemplateState {
   module_key: string;
   frequency: string;
   target_kind: string;
+  category: string;
   section_count: number;
   question_count: number;
   critical_count: number;
+  /** An earlier version created it here and it has since been removed: it stays retired. */
+  retired: null | { pack_version: number; created_at: string; template_id: string };
   existing: ExistingRow | null;
   warnings: string[];
 }
@@ -98,6 +107,18 @@ interface SeedState {
   problems: { template_code: string; item: string; problem: string }[];
   templates: TemplateState[];
   log: LogRow[];
+  drafts: ReadyMadeDrafts;
+}
+
+interface DraftRow { template_id: string; code: string; name: string; question_count: number }
+interface HeldRow { template_id: string; code: string; name: string; status: string; why: string }
+interface ReadyMadeDrafts { publishable: DraftRow[]; held: HeldRow[]; published: number }
+
+interface PublishResponse {
+  published: { template_id: string; code: string; name: string; questions: number; warnings: string[] }[];
+  held: HeldRow[];
+  lost_race: string[];
+  state: SeedState;
 }
 
 interface DeptRow { id: string; name: string }
@@ -112,6 +133,7 @@ interface ApplyItem {
   code: string;
   name: string;
   action: 'inserted' | 'skipped';
+  reason?: 'code_in_use' | 'retired';
   template_id: string;
   sections: number;
   questions: number;
@@ -135,10 +157,17 @@ function freqLabel(key: string): string {
 function targetLabel(key: string): string {
   return FSSAI_TARGET_KINDS.find((t) => t.key === key)?.label || key || '—';
 }
-/** The food-safety screen a checklist belongs to, named as the menu names it. */
-function moduleLabel(moduleKey: string): string {
-  if (!moduleKey) return 'No particular screen';
-  return fssaiModule(`/fssai/${moduleKey}`).label;
+/**
+ * The food-safety screen a checklist belongs to, named as the menu names it. The
+ * three Hyderabad audit pages belong to no one screen — they walk across all of
+ * them — so they are grouped under their own category instead.
+ */
+function groupFor(t: { module_key: string; category: string }): { key: string; label: string } {
+  if (t.module_key) return { key: t.module_key, label: fssaiModule(`/fssai/${t.module_key}`).label };
+  if (t.category === 'Hyderabad Food Safety Audit') {
+    return { key: 'cat:' + t.category, label: 'Hyderabad Food Safety Authority — its own audit, three pages' };
+  }
+  return { key: 'cat:' + (t.category || ''), label: t.category || 'No particular screen' };
 }
 
 export default function FssaiReadyMadeChecklistsPage() {
@@ -152,6 +181,8 @@ export default function FssaiReadyMadeChecklistsPage() {
   const [confirming, setConfirming] = useState(false);
   const [applying, setApplying] = useState(false);
   const [result, setResult] = useState<ApplyResponse | null>(null);
+  const [publishing, setPublishing] = useState(false);
+  const [published, setPublished] = useState<PublishResponse | null>(null);
   const [toast, setToast] = useState('');
 
   const load = useCallback(async () => {
@@ -184,17 +215,20 @@ export default function FssaiReadyMadeChecklistsPage() {
 
   /** Grouped by the screen each checklist belongs to, in pack order. */
   const groups = useMemo(() => {
-    const out: { module_key: string; label: string; rows: TemplateState[] }[] = [];
+    const out: { key: string; label: string; rows: TemplateState[] }[] = [];
     for (const t of state?.templates || []) {
-      let g = out.find((x) => x.module_key === t.module_key);
-      if (!g) { g = { module_key: t.module_key, label: moduleLabel(t.module_key), rows: [] }; out.push(g); }
+      const gk = groupFor(t);
+      let g = out.find((x) => x.key === gk.key);
+      if (!g) { g = { key: gk.key, label: gk.label, rows: [] }; out.push(g); }
       g.rows.push(t);
     }
     return out;
   }, [state]);
 
-  const willCreate = (state?.templates || []).filter((t) => !t.existing);
+  // A retired checklist is never offered again, so it is neither "to create" nor "already there".
+  const willCreate = (state?.templates || []).filter((t) => !t.existing && !t.retired);
   const willSkip = (state?.templates || []).filter((t) => t.existing);
+  const retired = (state?.templates || []).filter((t) => !t.existing && t.retired);
   const questionsToCreate = willCreate.reduce((n, t) => n + t.question_count, 0);
 
   const apply = useCallback(async () => {
@@ -220,6 +254,26 @@ export default function FssaiReadyMadeChecklistsPage() {
       setApplying(false);
     }
   }, [publish, deptByCode, load]);
+
+  /** ONE CLICK: every untouched ready-made draft goes live. The route says what it left alone and why. */
+  const publishAll = useCallback(async () => {
+    setPublishing(true);
+    setErr('');
+    try {
+      const j = await apiJson<PublishResponse>('/api/fssai/seed/publish', { method: 'POST', body: {} });
+      setPublished(j);
+      setData((d) => (d ? { ...d, state: j.state } : d));
+      setToast(
+        `${j.published.length} checklist${j.published.length === 1 ? '' : 's'} published — staff can run ` +
+        `${j.published.length === 1 ? 'it' : 'them'} now` + (j.held.length ? `, ${j.held.length} left alone` : ''),
+      );
+    } catch (e: any) {
+      setErr(String(e?.message || 'Could not publish the ready-made checklists.'));
+      void load();
+    } finally {
+      setPublishing(false);
+    }
+  }, [load]);
 
   /* ── permission panel ── */
   if (forbidden) {
@@ -254,8 +308,9 @@ export default function FssaiReadyMadeChecklistsPage() {
             <p className="text-[11px] font-semibold text-[#8B7355] uppercase tracking-wider">FSSAI Compliance · Settings</p>
             <h1 className="text-2xl sm:text-3xl font-bold text-[#af4408]">Ready-made Checklists</h1>
             <p className="text-sm text-[#6B5744] mt-1">
-              Twelve checklists written to FSSAI Schedule 4 — food quality, cleaning, personal hygiene, storage and
-              kitchen safety. Add them once, then change anything you like in the builder.
+              Fifteen checklists: the twelve written to FSSAI Schedule 4 — food quality, cleaning, personal hygiene,
+              storage and kitchen safety — and the Hyderabad Food Safety Authority’s own audit, its three pages word for
+              word. Add them once, publish them, then change anything you like in the builder.
             </p>
           </div>
           <div className="flex items-center gap-2 flex-nowrap">
@@ -336,7 +391,7 @@ export default function FssaiReadyMadeChecklistsPage() {
               <p className="font-bold text-[#af4408]">What was created</p>
               <p className="text-xs text-[#6B5744] mt-0.5">
                 {result.inserted} created as {result.status === 'published' ? 'published' : 'drafts'}
-                {result.skipped ? `, ${result.skipped} left exactly as they were` : ''}.
+                {result.skipped ? `, ${result.skipped} left exactly as they were or kept retired` : ''}.
                 {result.status !== 'published' && ' A draft is not visible to staff until you publish it.'}
               </p>
             </div>
@@ -369,6 +424,89 @@ export default function FssaiReadyMadeChecklistsPage() {
           </div>
         )}
 
+        {/* ONE CLICK — publish every untouched ready-made draft. The pack adds them
+            as drafts and a draft cannot be run; this is the button that makes
+            them runnable without opening fifteen pages. */}
+        {state && (state.drafts.publishable.length > 0 || published || state.drafts.held.length > 0) && (
+          <div className="bg-white border border-[#E8D5C4] rounded-xl p-4 sm:p-5 space-y-3">
+            <div className="flex items-start gap-3 flex-nowrap">
+              <Send className="w-5 h-5 text-[#af4408] shrink-0 mt-0.5" />
+              <div className="min-w-0">
+                <p className="font-bold text-[#af4408]">Publish the ready-made checklists</p>
+                <p className="text-sm text-[#6B5744] mt-1">
+                  They were added as drafts, and staff cannot see or run a draft. One click publishes every ready-made
+                  draft nobody has touched, so staff can run them straight away. Nothing else about them changes — not
+                  a question, not a range. A checklist you archived, or whose status you already changed yourself, is
+                  left alone.
+                  {state.drafts.published ? ` ${state.drafts.published} already published.` : ''}
+                </p>
+              </div>
+            </div>
+
+            {state.drafts.publishable.length > 0 && (
+              <>
+                <ul className="text-xs text-[#6B5744] space-y-0.5 pl-8">
+                  {state.drafts.publishable.map((d) => (
+                    <li key={d.template_id}>{d.name} · {d.question_count} questions</li>
+                  ))}
+                </ul>
+                <div className="pl-8">
+                  <button
+                    onClick={() => void publishAll()}
+                    disabled={publishing}
+                    className="inline-flex items-center gap-2 px-4 py-2.5 rounded-lg bg-[#af4408] text-white font-semibold hover:bg-[#8f3607] active:scale-95 disabled:opacity-50 flex-nowrap"
+                  >
+                    {publishing ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
+                    Publish {state.drafts.publishable.length} ready-made checklist{state.drafts.publishable.length === 1 ? '' : 's'}
+                  </button>
+                </div>
+              </>
+            )}
+
+            {published && published.published.length > 0 && (
+              <div className="pl-8">
+                <p className="text-sm font-semibold text-green-800">
+                  Published {published.published.length} — staff can run {published.published.length === 1 ? 'it' : 'them'} now.
+                </p>
+                <ul className="mt-1 space-y-1">
+                  {published.published.map((p) => (
+                    <li key={p.template_id} className="text-xs">
+                      <div className="flex items-start gap-2 flex-nowrap">
+                        <Check className="w-3.5 h-3.5 text-green-600 shrink-0 mt-0.5" />
+                        <div className="min-w-0">
+                          <span className="font-semibold">{p.name}</span>
+                          {p.warnings.map((w, i) => <p key={i} className="text-amber-800">{w}</p>)}
+                        </div>
+                        <a href={`/fssai/settings/checklists/${p.template_id}`} className="ml-auto shrink-0 font-semibold text-[#af4408] hover:underline">
+                          Open
+                        </a>
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+                {published.lost_race.length > 0 && (
+                  <p className="text-xs text-amber-800 mt-1">
+                    {published.lost_race.length} changed while this was running and were left as they are: {published.lost_race.join(', ')}.
+                  </p>
+                )}
+              </div>
+            )}
+
+            {state.drafts.held.length > 0 && (
+              <div className="pl-8">
+                <p className="text-xs font-semibold text-[#8B7355] uppercase tracking-wider">Left alone</p>
+                <ul className="mt-1 space-y-1">
+                  {state.drafts.held.map((h) => (
+                    <li key={h.template_id} className="text-xs text-[#6B5744]">
+                      <span className="font-semibold text-[#2D1B0E]">{h.name}</span> — {h.why}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </div>
+        )}
+
         {/* What the pack contains */}
         {state && (
           <div className="bg-white border border-[#E8D5C4] rounded-xl overflow-hidden">
@@ -384,12 +522,13 @@ export default function FssaiReadyMadeChecklistsPage() {
                 <p className="text-xs text-[#6B5744]">
                   {willCreate.length} to create ({questionsToCreate} questions)
                   {willSkip.length ? ` · ${willSkip.length} already there` : ''}
+                  {retired.length ? ` · ${retired.length} retired, not brought back` : ''}
                 </p>
               )}
             </div>
 
             {groups.map((g) => (
-              <div key={g.module_key}>
+              <div key={g.key}>
                 <div className="px-4 py-2 bg-[#FFF8F0] border-y border-[#F0E4D7]">
                   <p className="text-[11px] font-semibold text-[#8B7355] uppercase tracking-wider">{g.label}</p>
                 </div>
@@ -413,6 +552,13 @@ export default function FssaiReadyMadeChecklistsPage() {
                               It will be left exactly as it is.
                             </p>
                           )}
+                          {!t.existing && t.retired && (
+                            <p className="text-xs text-[#6B5744] mt-1.5">
+                              Retired — the ready-made checklists added this
+                              {t.retired.created_at ? ` on ${fmtIST(t.retired.created_at)}` : ''} and it has since been
+                              removed. It is not brought back.
+                            </p>
+                          )}
                           {t.warnings.map((w, i) => (
                             <p key={i} className="text-xs text-amber-800 mt-1.5">{w}</p>
                           ))}
@@ -420,7 +566,7 @@ export default function FssaiReadyMadeChecklistsPage() {
 
                         {/* Optional department. Sent as an ID — live names carry
                             double spaces, so a name is never matched on. */}
-                        {!state.applied && !t.existing && (
+                        {!state.applied && !t.existing && !t.retired && (
                           <label className="shrink-0 text-xs text-[#6B5744]">
                             <span className="block mb-1">Department</span>
                             <select
@@ -465,7 +611,7 @@ export default function FssaiReadyMadeChecklistsPage() {
                   <span className="min-w-0">
                     <span className="font-semibold">Published straight away</span>
                     <span className="block text-xs text-[#6B5744]">
-                      Staff can run all twelve immediately, with the standard FSSAI ranges exactly as written here.
+                      Staff can run all fifteen immediately, with the standard FSSAI ranges exactly as written here.
                     </span>
                   </span>
                 </label>
@@ -477,7 +623,7 @@ export default function FssaiReadyMadeChecklistsPage() {
                 <Info className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
                 <p className="text-xs text-amber-900 min-w-0">
                   This can only be done once. Nothing sets a rota — no checklist becomes &ldquo;due&rdquo; until you add
-                  it to the schedule yourself, so nobody is marked late for a check nobody asked them to do. The twelve
+                  it to the schedule yourself, so nobody is marked late for a check nobody asked them to do. The fifteen
                   are added to your own library and are yours to change after that.
                 </p>
               </div>
@@ -491,7 +637,7 @@ export default function FssaiReadyMadeChecklistsPage() {
               >
                 <PackagePlus className="w-4 h-4" />
                 {willCreate.length === 0
-                  ? 'Every one of these codes is already in use'
+                  ? (retired.length ? 'Nothing new to add — each one is already here or retired' : 'Every one of these codes is already in use')
                   : `Add ${willCreate.length} checklist${willCreate.length === 1 ? '' : 's'}`}
               </button>
             ) : (

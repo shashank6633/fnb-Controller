@@ -10,7 +10,8 @@ import {
 } from '@/lib/fssai';
 import { dateClause, deptLabel, intOr, intOrBlank, numOrBlank, whereAll, type DateWindow } from './lib';
 import {
-  fssaiCurveMembers, fssaiCurveReached, fssaiCurveExpected, fssaiCurveExpectedShown, fssaiTempDirection,
+  fssaiCurveMembers, fssaiCurveReached, fssaiCurveExpectedShown, fssaiTempDirection,
+  fssaiReadingScheduleValue, fssaiTempVerdictWord, fssaiTempMinutesWords, fssaiNowMinuteIST,
   type FssaiCurveMember,
 } from '../_p4/lib';
 
@@ -156,30 +157,19 @@ function verdictWord(isFail: unknown, isJudged: unknown): string {
 }
 
 /**
- * The verdict word for a temperature reading. Identical to verdictWord except
- * for a cooling or reheating reading that PASSED while still short of its target:
- * that is "On schedule", not "In range" — 30 °C an hour into cooling is not in a
- * 5 °C range, it is where the schedule allowed it to be. Read from the frozen
- * columns only (is_fail, is_judged, value_num, target/min/max_used); nothing is
- * re-judged.
+ * The verdict word for a temperature reading — 'On schedule' for a cooling or
+ * reheating reading that passed while still short of its target. ONE definition,
+ * `fssaiTempVerdictWord` in _p4/lib, shared with the temperature page and (for
+ * the audit-file PDF) whoever prints the same row, so the three cannot say
+ * different words for it. Read from the frozen columns only.
  */
 function tempVerdictWord(r: any): string {
-  const base = verdictWord(r.is_fail, r.is_judged);
-  if (base !== 'In range' || !isRateKind(r.log_kind)) return base;
-  const v = numOrNull(r.value_num);
-  const dir = fssaiTempDirection(String(r.log_kind || ''));
-  const goal = numOrNull(r.target_used) ?? (dir === 'hot' ? numOrNull(r.min_used) : numOrNull(r.max_used));
-  if (v === null || goal === null) return base;
-  const short = dir === 'hot' ? v < goal : v > goal;
-  return short ? 'On schedule' : base;
+  return fssaiTempVerdictWord(r);
 }
 
-/** "60 of 240" — minutes counted on the batch's clock, and the time allowed. */
+/** "60 of 240" — and "0 of 240" for a reading at minute 0 (fssaiTempMinutesWords). */
 function minutesWords(r: any): string {
-  const e = intOrBlank(r.elapsed_minutes);
-  if (!e) return '';
-  const m = intOrBlank(r.max_minutes_used);
-  return m ? `${e} of ${m}` : e;
+  return fssaiTempMinutesWords(r);
 }
 
 function numOrNull(v: unknown): number | null {
@@ -815,6 +805,7 @@ export const FSSAI_REPORTS: FssaiReportDef[] = [
         rows: any[]; outcome: string; firstMinute: string;
       }
       const batches = new Map<string, Batch>();
+      const nowMinute = fssaiNowMinuteIST();
       for (const r of page) {
         const kind = String(r.log_kind || '');
         const key = String(r.batch_id || '') || String(r.id);
@@ -828,6 +819,11 @@ export const FSSAI_REPORTS: FssaiReportDef[] = [
           const breach = live.some((m) => m.is_fail === 1);
           const limit = start ? start.max_minutes : null;
           const lastLive = live[live.length - 1] || null;
+          /* Past its time with nothing at the target, on the batch's own clock —
+           * the same sum fssaiCurveSummary does for the screen. */
+          const elapsedNow = start && start.minute !== null && nowMinute !== null
+            ? (start.elapsed ?? 0) + (nowMinute - start.minute) : null;
+          const overdue = limit !== null && elapsedNow !== null && elapsedNow > limit;
           const outcome = breach
             ? 'Breach recorded on this batch'
             : reached
@@ -835,7 +831,7 @@ export const FSSAI_REPORTS: FssaiReportDef[] = [
                 ? `Reached ${numOrBlank(reached.value, 1)} at ${reached.elapsed} min — AFTER the ${limit} allowed`
                 : `Reached ${numOrBlank(reached.value, 1)} at ${reached.elapsed ?? '?'} min — in time`)
               : (lastLive
-                ? `Not finished — last ${numOrBlank(lastLive.value, 1)} at ${lastLive.elapsed ?? '?'} min, no reading at the target`
+                ? `Not finished — last ${numOrBlank(lastLive.value, 1)} at ${lastLive.elapsed ?? '?'} min, no reading at the target${overdue ? `, and the ${limit} minutes allowed have run out` : ''}`
                 : 'Every reading voided');
           b = {
             key, kind, members, start, rows: [], outcome,
@@ -860,23 +856,26 @@ export const FSSAI_REPORTS: FssaiReportDef[] = [
           const uom = String(r.uom || 'C');
           const u = uom === 'C' || uom === 'F' ? ` °${uom}` : ` ${uom}`;
           const m = b.members.find((x) => x.id === String(r.id)) || null;
-          const goal = b.start ? b.start.goal : null;
-          const limit = b.start ? b.start.max_minutes : null;
+          /* "Needed by then" from THIS reading's frozen line (curve_start_*), so
+           * the sheet draws the line the verdict actually used. Rows filed before
+           * the line was frozen fall back to the batch's first live reading, which
+           * is what their verdicts were measured from. */
           const expected = m && String(r.status) !== 'void'
-            ? fssaiCurveExpected({
-              startValue: b.start ? b.start.value : null, startElapsed: b.start ? b.start.elapsed : null,
-              goal, maxMinutes: limit, elapsed: m.elapsed,
-            })
+            ? fssaiReadingScheduleValue(r, b.start ? { value: b.start.value, elapsed: b.start.elapsed } : null)
             : null;
           const side = dir === 'hot' ? '≥' : '≤';
           const ruleGoal = numOrNull(r.target_used) ?? (dir === 'hot' ? numOrNull(r.min_used) : numOrNull(r.max_used));
           const ruleLimit = intOrBlank(r.max_minutes_used);
+          /* A batch with no 0-minute reading was measured from the rule's
+           * starting temperature, and the sheet says so on every row of it. */
+          const anchored = String(r.curve_start_source || '') === 'standard_anchor' && numOrNull(r.curve_start_used) !== null;
           cells.push([
             [String(r.item_label || ''), String(r.equipment_label || r.area_label || '')].filter(Boolean).join(' · ') || 'Unnamed',
             fssaiTempLogKindLabel(r.log_kind),
-            b.start
-              ? `${b.start.business_date !== String(r.business_date || '') ? `${b.start.business_date} ` : ''}${b.start.reading_at} at ${numOrBlank(b.start.value, 1)}${u}`
-              : '',
+            (b.start
+              ? `${b.start.business_date !== String(r.business_date || '') ? `${b.start.business_date} ` : ''}${b.start.reading_at} at ${numOrBlank(b.start.value, 1)}${u}${(b.start.elapsed ?? 0) > 0 ? ` (${b.start.elapsed} min in)` : ''}`
+              : '')
+              + (anchored ? ` — no 0-minute reading; measured from the rule's ${numOrBlank(r.curve_start_used, 1)}${u} at 0 min` : ''),
             String(r.business_date || ''),
             String(r.reading_at || ''),
             intOrBlank(r.elapsed_minutes),
@@ -902,7 +901,8 @@ export const FSSAI_REPORTS: FssaiReportDef[] = [
         ],
         note:
           'One block per batch, readings in the order they were taken. "Minutes" is counted by the system from the batch\'s first reading, not typed. ' +
-          '"Needed by then" is where the batch had to be at that point — a straight line from its first reading to the target at the time allowed; ' +
+          '"Needed by then" is where the batch had to be at that point — a straight line from where it started at 0 minutes (its own 0-minute reading, ' +
+          'or the rule\'s starting temperature when it had none) to the target at the time allowed; a batch with neither had no line, and a reading short of the target on it was failed; ' +
           '"On schedule" means short of the target but where it needed to be. Each verdict is the one frozen on the reading when it was taken. ' +
           '"Not finished" means no reading at the target was ever recorded.',
       };
@@ -1351,7 +1351,7 @@ export const FSSAI_REPORTS: FssaiReportDef[] = [
     label: 'Documents and certificates',
     group: 'The file',
     blurb: 'Every licence and certificate with the state worked out against today — valid, expiring, or expired.',
-    requires: ['fssai_documents'],
+    requires: ['fssai_documents', 'fssai_food_handlers'],
     dateLabel: 'the expiry date',
     hasDepartment: true,
     columns: [
@@ -1375,23 +1375,36 @@ export const FSSAI_REPORTS: FssaiReportDef[] = [
         dateClause('d.expiry_date', ctx.window),
         deptFilter(ctx, 'd'),
         statusFilter(ctx, 'd'),
-        textFilter(ctx, ['d.title', 'd.reference_no', 'd.issuer', 'd.owner_email', 'd.person_email', 'v.name']),
+        textFilter(ctx, ['d.title', 'd.reference_no', 'd.issuer', 'd.owner_email', 'd.person_email', 'v.name', 'fh.full_name']),
       ]);
       /* The supplier's NAME, joined — the column used to print the raw vendor_id
-       * UUID, which tells an inspector nothing about whose licence it is. */
+       * UUID, which tells an inspector nothing about whose licence it is. The food
+       * handler's name likewise (handler_id, 2026-10-14): a certificate for a cook
+       * with no app login has no person_email, and would otherwise belong to
+       * nobody on this sheet. */
       const rows = ctx.db.prepare(
-        `SELECT d.*, IFNULL(v.name, '') AS vendor_name
+        `SELECT d.*, IFNULL(v.name, '') AS vendor_name, IFNULL(fh.full_name, '') AS handler_name
            FROM fssai_documents d
-           LEFT JOIN vendors v ON v.id = d.vendor_id ${w.sql}
+           LEFT JOIN vendors v ON v.id = d.vendor_id
+           LEFT JOIN fssai_food_handlers fh ON fh.id = d.handler_id AND d.handler_id <> '' ${w.sql}
           ORDER BY (CASE WHEN d.expiry_date = '' THEN 1 ELSE 0 END) ASC, d.expiry_date ASC LIMIT ?`,
       ).all(...w.args, lim(ctx) + 1) as any[];
       const truncated = rows.length > lim(ctx);
       const page = truncated ? rows.slice(0, lim(ctx)) : rows;
-      let expired = 0; let expiring = 0;
+      let expired = 0; let expiring = 0; let superseded = 0; let voided = 0;
       const cells = page.map((r) => {
+        /* A RENEWED OR VOIDED DOCUMENT IS NOT "EXPIRED" (measured 2026-10-14: the
+         * licence a renewal replaced printed EXPIRED and counted in the Expired
+         * figure, beside its own valid renewal). It stays on the sheet — §19, a
+         * record is never hidden — but says what it is, and only a live document's
+         * expiry is counted. */
+        const isVoid = String(r.status || '') === 'void' || !!String(r.voided_at || '');
+        const isSuperseded = !isVoid && Number(r.is_active) === 0;
         const state = fssaiDocState(r.expiry_date, ctx.today, intOr(r.reminder_days, 30));
-        if (state === 'expired') expired++;
-        if (state === 'expiring') expiring++;
+        if (isVoid) voided++;
+        else if (isSuperseded) superseded++;
+        else if (state === 'expired') expired++;
+        else if (state === 'expiring') expiring++;
         const exp = String(r.expiry_date || '');
         const days = exp
           ? String(Math.round((Date.parse(`${exp}T00:00:00Z`) - Date.parse(`${ctx.today}T00:00:00Z`)) / 86400000))
@@ -1401,7 +1414,17 @@ export const FSSAI_REPORTS: FssaiReportDef[] = [
         const vendor = String(r.vendor_id || '')
           ? (String(r.vendor_name || '').trim() || 'A supplier no longer on the vendor list')
           : '';
-        const belongs = String(r.person_email || '') || vendor || deptName(ctx, r.department_id) || '';
+        /* The handler's name leads (handler_id is the person key that covers a
+         * cook with no login), then the login email, then supplier, then dept. */
+        const handler = String(r.handler_id || '')
+          ? (String(r.handler_name || '').trim() || 'A food handler no longer on the register')
+          : '';
+        const belongs = handler || String(r.person_email || '') || vendor || deptName(ctx, r.department_id) || '';
+        const stateWords = isVoid
+          ? `Voided${String(r.void_reason || '') ? ` — ${String(r.void_reason)}` : ''}`
+          : isSuperseded
+            ? 'Superseded — renewed'
+            : fssaiDocStateMeta(state).label;
         return [
           fssaiDocType(r.doc_type)?.label || String(r.doc_type || ''),
           String(r.title || ''),
@@ -1410,8 +1433,9 @@ export const FSSAI_REPORTS: FssaiReportDef[] = [
           belongs,
           String(r.issued_on || ''),
           exp,
-          days,
-          fssaiDocStateMeta(state).label,
+          /* Days left means nothing on a document that no longer counts. */
+          isVoid || isSuperseded ? '' : days,
+          stateWords,
           String(r.owner_email || ''),
         ];
       });
@@ -1420,12 +1444,15 @@ export const FSSAI_REPORTS: FssaiReportDef[] = [
         truncated,
         kpis: [
           { label: 'Documents', value: String(page.length) },
-          { label: 'Expired', value: String(expired) },
+          { label: 'Expired', value: String(expired), sub: 'live documents only' },
           { label: 'Expiring soon', value: String(expiring) },
+          { label: 'Superseded or voided', value: String(superseded + voided), sub: 'kept on file, not counted' },
         ],
         note:
           `The state is worked out against ${ctx.today} every time this is read, never stored — a document cannot read ` +
-          '"Valid" the day after it lapsed. A blank expiry means the document does not expire.',
+          '"Valid" the day after it lapsed. A blank expiry means the document does not expire. ' +
+          'A document replaced by its renewal reads "Superseded — renewed" and a voided one "Voided": both stay on the sheet ' +
+          'and neither is counted as expired.',
       };
     },
   },

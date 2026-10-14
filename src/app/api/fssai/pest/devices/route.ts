@@ -4,23 +4,29 @@ import { getCurrentOutletId } from '@/lib/auth';
 import { canAuthorFssai, FSSAI_PEST_DEVICE_KINDS } from '@/lib/fssai';
 import { requireFssaiUser, fssaiCsrfGuard, fssaiAudit, str } from '@/lib/fssai-server';
 import { p6ConstraintMessage, isoDateOrBlank, p6Bool01, intOrNull } from '../../p6-shared';
+import { fssaiToday } from '@/lib/fssai';
+import { fssaiTableExists } from '@/lib/fssai-void';
+import { pestStationCoverage, PEST_CHECK_FREQUENCY_DAYS } from '../_pest/monitoring';
 
 /**
  * THE PEST MAP — bait stations, glue boards and insect light traps, AS A
  * REGISTER (owner §7). /api/fssai/pest/devices
  *
- * ── A REGISTER, AND NOTHING ELSE. THIS IS THE DESIGN DECISION ───────────────
- * There is no device-CHECK table behind this and there must not be one.
- * "Station 7 checked, no activity" is a CHECKLIST ANSWER — the weekly monitoring
- * round is a seeded template (§24, and the §2 architecture decision this module
- * was built on: twelve of the twenty sub-modules are ROWS, not code). A third
- * pest table for routine checks would be precisely the per-record table that
- * decision exists to prevent, and it would be the table nobody fills in.
+ * ── A REGISTER OF PLACES ─────────────────────────────────────────────────────
+ * This holds WHERE the stations are. It said here once that there must never be
+ * a device-check table, because "station 7 checked, no activity" would be a
+ * checklist answer. SUPERSEDED 2026-10-14: the Hyderabad authority's monitoring
+ * sheet is station by station (date, device, activity yes/no, action,
+ * initials), a checklist has a fixed question set while this map has however
+ * many stations are on the wall, and the measured result of the old bet was
+ * that last_checked_at was written only by a sighting. The walk now has its own
+ * table and route (fssai_pest_device_checks, /api/fssai/pest/checks).
  *
- * So this holds WHERE the stations are, and two things read it: a sighting names
- * the station it was found in (fssai_pest_sightings.device_id), and that sighting
- * stamps last_checked_at — the only writer of that column, because a station that
- * caught something was by definition checked.
+ * Three things read this register: the walk (one line per station in use), a
+ * sighting (device_id), and the coverage below. last_checked_at is stamped by
+ * both a walk and a sighting — "somebody looked"; whether a station is DUE is
+ * judged from the walk's lines alone (pestStationCoverage), because a sighting
+ * is not a check.
  *
  * ── WHO MAY WRITE IT ────────────────────────────────────────────────────────
  * ADMIN, via canAuthorFssai. The pest map is configuration, not a record: the
@@ -127,8 +133,27 @@ export async function GET(request: Request) {
          FROM fssai_pest_devices`,
     ).get() as any;
 
+    // Where each station IN USE stands on the monitoring sheet. A retired
+    // station has no coverage — it is no longer walked.
+    const coverage = fssaiTableExists(db, 'fssai_pest_device_checks')
+      ? new Map(pestStationCoverage(db, fssaiToday()).map((c) => [c.device_id, c]))
+      : new Map();
+
     return Response.json({
-      devices: rows.map(shape),
+      devices: rows.map((r) => {
+        const c: any = coverage.get(String(r.id));
+        return {
+          ...shape(r),
+          sheet: c
+            ? {
+              state: c.state, state_label: c.state_label, state_color: c.state_color,
+              last_check_date: c.last_check_date, last_check_time: c.last_check_time,
+              last_activity: c.last_activity, due_on: c.due_on, frequency_days: c.frequency_days,
+            }
+            : null,
+        };
+      }),
+      frequencies: Object.keys(PEST_CHECK_FREQUENCY_DAYS),
       counts: {
         active: Number(counts?.active) || 0,
         retired: Number(counts?.retired) || 0,
@@ -199,6 +224,15 @@ export async function POST(request: Request) {
         if (!v) return Response.json({ error: 'That pest control agency is not in the supplier list.' }, { status: 400 });
       }
 
+      // The frequency decides when the monitoring sheet calls a station overdue,
+      // so only the four words pestStationCoverage knows are accepted. A row
+      // already holding something else keeps it (and reads as weekly, flagged).
+      const frequency = (body.check_frequency === undefined && row ? str(row.check_frequency) : str(body.check_frequency)) || 'weekly';
+      const freqChanged = isCreate || frequency !== str(row?.check_frequency);
+      if (freqChanged && !Object.prototype.hasOwnProperty.call(PEST_CHECK_FREQUENCY_DAYS, frequency)) {
+        return Response.json({ error: `"${frequency}" is not a check frequency. Use daily, weekly, fortnightly or monthly.` }, { status: 400 });
+      }
+
       const now = new Date().toISOString();
       const id = isCreate ? generateId() : String(row.id);
       const sortOrder = intOrNull(body.sort_order) ?? (row ? Number(row.sort_order) || 0 : 0);
@@ -215,7 +249,7 @@ export async function POST(request: Request) {
             ).run(
               id, code, kind, location.slice(0, 300), deptId, storeId,
               isoDateOrBlank(body.installed_on), vendorId,
-              str(body.check_frequency) || 'weekly', str(body.notes).slice(0, 2000),
+              frequency, str(body.notes).slice(0, 2000),
               p6Bool01(body.is_active, 1), sortOrder, me.email, outletId, now, now,
             );
             fssaiAudit(db, {
@@ -233,7 +267,7 @@ export async function POST(request: Request) {
             ).run(
               code, kind, location.slice(0, 300), deptId, storeId,
               body.installed_on === undefined ? str(row.installed_on) : isoDateOrBlank(body.installed_on),
-              vendorId, str(body.check_frequency ?? row.check_frequency) || 'weekly',
+              vendorId, frequency,
               str(body.notes ?? row.notes).slice(0, 2000), sortOrder, now, id,
             );
             fssaiAudit(db, {

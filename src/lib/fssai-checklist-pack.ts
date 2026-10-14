@@ -3,7 +3,8 @@
  *
  * Fifteen since pack v2: the twelve FSSAI routines (§3) plus the Hyderabad
  * Food Safety Authority's own audit, its three pages as three templates,
- * word for word (§3b). The twelve also carry the questions that audit showed
+ * word for word (§3b), with the authority's whole workbook kept row for row as
+ * FSSAI_HYD_WORKBOOK. The twelve also carry the questions that audit showed
  * they were missing (docs/fssai/hyderabad-coverage-map.json), each marked
  * where it is asked.
  *
@@ -758,22 +759,49 @@ const T_SAFE_MONTHLY: PackTemplate = {
  * ------------------------------------------------------------------ */
 
 /**
- * The owner's file "FOOD SAFETY AUDIT CHECKLIST.xlsx" (2026-10-13) has FOUR
- * sheets: a master sheet of all 120 lines, then the authority's own split of
- * the walk-through into three pages — " CHECKLIST 1" (36 lines), "CHECKLIST 2"
- * (31) and "CHECKLIST 3" (33). Every line is answered YES / NO / REMARK.
+ * The owner's file "FOOD SAFETY AUDIT CHECKLIST.xlsx" (2026-10-13), read row by
+ * row from the workbook itself — the cell text AND the cell style, because the
+ * style is the only thing that says which row is a heading and which is a line
+ * to answer. It has FOUR sheets:
  *
- * These three templates ARE those three pages: the same headings, the same
- * lines, in the same order, in the authority's own words — so staff can run
- * the regulator's audit as a self-audit before an inspector arrives. The 20
- * lines of "Records You Should Keep Ready in One Audit File" appear only on the
- * master sheet; they are documents to hold, not a walk-through check, and they
- * belong to the audit file, not to a checklist.
+ *   "FOOD SAFETY AUDIT CHECKLIS" (the tab name is cut there)  137 rows — the master
+ *   " CHECKLIST 1" (the tab name starts with a space)            42 rows — 36 lines
+ *   "CHECKLIST 2"                                                 36 rows — 30 lines
+ *   "CHECKLIST 3"                                                 38 rows — 33 lines
  *
- * Read off the sheets themselves, not the summary in
- * docs/fssai/hyderabad-audit-checklist.json: " CHECKLIST 1" carries ALL SEVEN
- * temperature lines (Receiving … Cooling) and no Cleaning & Sanitation line,
- * and "CHECKLIST 3" heads its first nine lines "FOH" and "Washrooms".
+ * The master is the three pages one after the other, plus "Records You Should
+ * Keep Ready in One Audit File" (20 lines) at the end. Its 137 rows are 1 title,
+ * 13 headings, 3 lead-ins, 1 sub-heading and 119 lines: 99 to walk and check,
+ * 20 records to hold. Every row has YES / NO / REMARK cells, headings included,
+ * so the cells say nothing; the STYLE does:
+ *   · bold 12 pt                 → the title, " FOOD SAFETY AUDIT CHECKLIST"
+ *   · bold, shaded               → a heading ("Storage – Very Important", "FOH")
+ *   · plain, not indented        → a lead-in ("Every food handler should have:")
+ *   · bold, NOT shaded           → a sub-heading — exactly one: "Kitchen", under
+ *                                  "Maintain daily cleaning checklists for:", the
+ *                                  same place "FOH" and "Washrooms" hold
+ *   · plain, indented            → a line, answered YES / NO / REMARK
+ *
+ * ⚠️ "Kitchen" IS NOT A LINE. Pack v2 asked it as its own question ("Maintain
+ * daily cleaning checklists for: Kitchen"), which made CHECKLIST 2 thirty-one
+ * questions where the authority has thirty lines, and docs/fssai/
+ * hyderabad-audit-checklist.json counted it among its "120 items". On the sheet
+ * it is the bold group label over Floors … Racks, just as FOH and Washrooms are
+ * over theirs on CHECKLIST 3. It is now carried in the words of each line under
+ * it: "Maintain daily cleaning checklists for: Kitchen — Floors".
+ *
+ * These three templates ARE the three pages: the same headings, the same lines,
+ * in the same order, in the authority's own words — so staff can run the
+ * regulator's audit as a self-audit before an inspector arrives. The 20 records
+ * lines are documents to hold, not a walk-through check; they belong to the audit
+ * file (src/app/api/fssai/audit-file/lib.ts AUDIT_FILE_RECORDS), not to a
+ * checklist, and are exported below as FSSAI_HYD_AUDIT_FILE_LINES so that file can
+ * be proved against the same source.
+ *
+ * ONE SOURCE. The templates and the row-for-row copy of the workbook
+ * (FSSAI_HYD_WORKBOOK) are both generated from the page definitions below, so a
+ * template cannot drift from the sheet without the sheet copy drifting with it —
+ * and the sheet copy is what the proof compares against the .xlsx itself.
  *
  * HOW YES / NO / REMARK MAPS ONTO THE ENGINE — nothing new invented:
  *   · YES / NO → the existing 'yes_no' type; YES is the passing answer.
@@ -786,118 +814,148 @@ const T_SAFE_MONTHLY: PackTemplate = {
  *   · A NO raises a corrective action exactly as a failed answer does in the
  *     twelve: raise_ca_on_fail → raiseFssaiCorrectiveActions on submit, with
  *     the authority's line as the action's title and the remark in its text.
- *   · Critical (a NO fails the round outright, whatever the pass mark): the
- *     two sections the authority itself marks "Very Important" and "Critical",
- *     a live pest sighting (urgent, as everywhere in the twelve), and two
- *     Food Preparation lines the twelve already treat as critical.
- *   · A photograph is demanded on a NO only where a picture can show the
- *     failure. Never for a missing document, and never in Personal Hygiene,
- *     where it would be a photograph of a person.
+ *   · THE PASS MARK IS 100 (the engine's default), so ANY NO fails the round —
+ *     an inspector does not average. "Critical" does something else: it sets
+ *     the action's severity (high, or urgent for a live pest sign) and keeps the
+ *     round failing on that line even if the owner later lowers the pass mark.
+ *     Critical lines: the two sections the authority itself marks "Very
+ *     Important" and "Critical", the four pest sightings, and two Food
+ *     Preparation lines the twelve already treat as critical.
+ *   · A PHOTOGRAPH IS DEMANDED ON A NO WHEREVER A PICTURE CAN SHOW THE FAILURE —
+ *     on every line that names a thing you can point a camera at (a floor, a
+ *     bin, a container, a light fitting, a toilet, a cockroach). It is NOT
+ *     demanded where a NO is a missing document or record (`noPhoto`), and never
+ *     in Personal Hygiene or for a handler's own hands, where it would be a
+ *     photograph of a person. 66 of the 99 lines take one.
  *
  * A line the authority lists under a lead-in ("Maintain a temperature
  * monitoring sheet for:" → "Receiving") is asked as lead-in + line, because
  * "Receiving" alone means nothing on a phone or as the title of a corrective
  * action. The words are still the authority's, in the authority's order.
  */
-interface AuthorityLine {
+
+/** What a row of the authority's workbook is, read from its cell style. */
+export type HydRowKind = 'title' | 'heading' | 'lead_in' | 'subheading' | 'line';
+
+export interface HydWorkbookRow {
+  /** The row number on the sheet, as Excel numbers it (1 = the first row). */
+  row: number;
+  kind: HydRowKind;
+  /** Column A exactly as typed — the leading space and the en dash included. */
+  text: string;
+  /** A 'line' on a CHECKLIST page: the checklist and question that ask it. */
+  template_code?: string;
+  question_code?: string;
+  /** A records line on the master sheet: its number 1–20 in the audit file. */
+  audit_file_n?: number;
+}
+
+export interface HydWorkbookSheet {
+  /** The tab name, exactly as the workbook spells it. */
+  name: string;
+  /** B1:D1 — the answer columns. */
+  columns: readonly string[];
+  /** The checklist this page IS, or '' for the master sheet. */
+  template_code: string;
+  rows: HydWorkbookRow[];
+}
+
+interface HydLine {
   /** The authority's words, exactly as on its sheet. */
   words: string;
   /** The authority's own text says "as applicable" or "where required". */
   na?: true;
-  /** A NO fails the whole round, at this severity. */
+  /** Critical, at this severity. */
   crit?: 'high' | 'urgent';
-  /** A NO here is a missing record or a person — a photograph proves nothing. */
+  /** A NO here is a missing document or record, or a person — a photograph proves nothing. */
   noPhoto?: true;
 }
 
-interface AuthoritySection {
+interface HydSection {
   code: string;
-  /** The heading, exactly as on the authority's page. */
-  title: string;
-  /** The authority's lead-in under the heading, e.g. "Every food handler should have:". */
+  /** The heading row, exactly as on the authority's page. */
+  heading: string;
+  /** The lead-in row under the heading, exactly ("Every food handler should have:"). */
   leadIn?: string;
+  /** The bold sub-heading row under the lead-in, exactly ("Kitchen"). */
+  subheading?: string;
+  /**
+   * Not a row: put the heading before each line ("FOH: Tables/chairs") so a line
+   * reads on its own — on a phone and as the title of a corrective action.
+   */
+  headingInPrompt?: true;
+  /** OURS, not the authority's: how to answer this section in this app. */
   description: string;
-  lines: AuthorityLine[];
+  lines: HydLine[];
 }
 
-/** Every line in a section shares a severity; this stamps it on each. */
-function lines(texts: string[], extra: Omit<AuthorityLine, 'words'> = {}): AuthorityLine[] {
+interface HydPage {
+  /** The tab name, exactly. */
+  sheet: string;
+  /** Row 1 of the sheet is the workbook's title (only CHECKLIST 1 has it). */
+  titleRow?: string;
+  head: Omit<PackTemplate, 'sections' | 'questions' | 'module_key' | 'frequency' | 'target_kind' | 'category'>;
+  sections: HydSection[];
+}
+
+const HYD_TITLE = ' FOOD SAFETY AUDIT CHECKLIST';
+const HYD_COLUMNS: readonly string[] = ['YES', 'NO', 'REMARK'];
+const HYD_CATEGORY = 'Hyderabad Food Safety Audit';
+
+/** Every line in a section shares these; this stamps them on each. */
+function lines(texts: string[], extra: Omit<HydLine, 'words'> = {}): HydLine[] {
   return texts.map((words) => ({ words, ...extra }));
 }
 
-/**
- * One authority page → one template. Codes run Q01, Q02 … down the page, so
- * question N of CHK-HYD-AUDIT-k is line N of the authority's "CHECKLIST k".
- */
-function authorityPage(
-  head: Omit<PackTemplate, 'sections' | 'questions' | 'module_key' | 'frequency' | 'target_kind' | 'category'>,
-  page: AuthoritySection[],
-): PackTemplate {
-  const questions: PackQuestion[] = [];
-  for (const s of page) {
-    for (const l of s.lines) {
-      const code = `Q${String(questions.length + 1).padStart(2, '0')}`;
-      questions.push({
-        section: s.code,
-        code,
-        qtype: 'yes_no',
-        prompt: s.leadIn ? `${s.leadIn.replace(/:\s*$/, '')}: ${l.words}` : l.words,
-        expected_value: 'yes',
-        allow_na: l.na ? 1 : 0,
-        note_rule: 'on_fail',
-        raise_ca_on_fail: 1,
-        ca_severity: l.crit || 'medium',
-        is_critical: l.crit ? 1 : 0,
-        photo_rule: l.crit && !l.noPhoto ? 'on_fail' : 'never',
-      });
-    }
-  }
-  return {
-    ...head,
-    // Not one record screen's checklist: the audit walks across all of them.
-    module_key: '',
-    // A self-audit, run monthly and again before an expected inspection. The
-    // one-run-per-slot rule is per DAY, so a re-audit after fixes is never
-    // blocked by the frequency.
-    frequency: 'monthly',
-    target_kind: 'none',
-    category: 'Hyderabad Food Safety Audit',
-    sections: page.map((s) => ({ code: s.code, title: s.title, description: s.description })),
-    questions,
-  };
+/** The question's words: the authority's line, with its lead-in / sub-heading when it has one. */
+function hydPrompt(s: HydSection, l: HydLine): string {
+  const lead = s.leadIn ? s.leadIn.replace(/:\s*$/, '') : s.headingInPrompt ? s.heading : '';
+  if (lead && s.subheading) return `${lead}: ${s.subheading} — ${l.words}`;
+  if (lead) return `${lead}: ${l.words}`;
+  return l.words;
+}
+
+/** Question N of a page is its Nth line, top to bottom. */
+function hydQuestionCode(n: number): string {
+  return `Q${String(n).padStart(2, '0')}`;
 }
 
 const HYD_HOW =
-  'Answer every line YES or NO, exactly as the inspector will. A NO needs a remark saying what you saw, and raises a corrective action when you submit.';
+  'Answer every line YES or NO, exactly as the inspector will. A NO needs a remark saying what you saw — and a ' +
+  'photograph wherever a picture can show it — and raises a corrective action when you submit.';
 
-const T_HYD_AUDIT_1: PackTemplate = authorityPage(
-  {
+const HYD_PAGE_1: HydPage = {
+  sheet: ' CHECKLIST 1',
+  titleRow: HYD_TITLE,
+  head: {
     code: 'CHK-HYD-AUDIT-1',
     name: 'Hyderabad Food Safety Audit — Checklist 1: Licences, Premises, Storage, Temperature',
     description:
-      'The Hyderabad Food Safety Authority’s own audit checklist, page 1 of 3 ("CHECKLIST 1"), word for word: ' +
+      'The Hyderabad Food Safety Authority’s own audit checklist, "FOOD SAFETY AUDIT CHECKLIST" — page 1 of 3 ("CHECKLIST 1"), word for word: ' +
       'Licences & Display, Kitchen & Premises Hygiene, Storage – Very Important, Food Temperature Control. ' +
       'Run it as a self-audit before an inspector does. ' + HYD_HOW,
     sort_order: 130,
   },
-  [
+  sections: [
     {
-      code: 'LICENCES', title: 'Licences & Display',
-      description: 'YES only when it is on the premises, current and can be shown now. Copies are filed under Documents & Certificates.',
+      code: 'LICENCES', heading: 'Licences & Display',
+      description:
+        'YES only when it is on the premises, current and can be shown now. Copies are filed under Documents & ' +
+        'Certificates. On a NO for the licence or the display board, photograph where it should be.',
       lines: [
         { words: 'FSSAI licence displayed prominently' },
         { words: 'Food Safety Display Board (FSDB) displayed and readable' },
-        { words: 'GHMC trade/municipal licence available' },
-        { words: 'Fire/safety documents as applicable', na: true },
-        { words: 'Pest-control agency agreement and latest service report' },
-        { words: 'Food-handler medical examination records' },
-        { words: 'Water testing report / municipal water bill records' },
-        { words: 'Approved vendor list maintained' },
+        { words: 'GHMC trade/municipal licence available', noPhoto: true },
+        { words: 'Fire/safety documents as applicable', na: true, noPhoto: true },
+        { words: 'Pest-control agency agreement and latest service report', noPhoto: true },
+        { words: 'Food-handler medical examination records', noPhoto: true },
+        { words: 'Water testing report / municipal water bill records', noPhoto: true },
+        { words: 'Approved vendor list maintained', noPhoto: true },
       ],
     },
     {
-      code: 'PREMISES', title: 'Kitchen & Premises Hygiene',
-      description: 'Walk the kitchen, prep, wash-up and stores as the inspector will.',
+      code: 'PREMISES', heading: 'Kitchen & Premises Hygiene',
+      description: 'Walk the kitchen, prep, wash-up and stores as the inspector will. On a NO, photograph what you saw.',
       lines: lines([
         'Kitchen floors clean, dry and non-slippery',
         'Walls and ceiling clean; no peeling paint/plaster',
@@ -911,8 +969,9 @@ const T_HYD_AUDIT_1: PackTemplate = authorityPage(
       ]),
     },
     {
-      code: 'STORAGE', title: 'Storage – Very Important',
-      description: 'The authority marks this section Very Important: any NO fails the audit.',
+      code: 'STORAGE', heading: 'Storage – Very Important',
+      description:
+        'The authority marks this section Very Important: a NO here is critical. On a NO, photograph what you saw.',
       lines: [
         ...lines([
           'FIFO followed',
@@ -931,47 +990,50 @@ const T_HYD_AUDIT_1: PackTemplate = authorityPage(
       ],
     },
     {
-      code: 'TEMPERATURE', title: 'Food Temperature Control',
+      code: 'TEMPERATURE', heading: 'Food Temperature Control',
       leadIn: 'Maintain a temperature monitoring sheet for:',
       description:
         'YES when the sheet is kept and up to date. In this app every one of them is under Temperature Logs — ' +
         'Delivery (receiving), Equipment (refrigerators and freezers), Hot holding, Cooking, Reheating and Cooling.',
-      lines: lines(['Receiving', 'Refrigerators', 'Freezers', 'Hot holding', 'Cooking', 'Reheating', 'Cooling']),
+      lines: lines(['Receiving', 'Refrigerators', 'Freezers', 'Hot holding', 'Cooking', 'Reheating', 'Cooling'], { noPhoto: true }),
     },
   ],
-);
+};
 
-const T_HYD_AUDIT_2: PackTemplate = authorityPage(
-  {
+const HYD_PAGE_2: HydPage = {
+  sheet: 'CHECKLIST 2',
+  head: {
     code: 'CHK-HYD-AUDIT-2',
     name: 'Hyderabad Food Safety Audit — Checklist 2: Food Preparation, Personal Hygiene, Kitchen Cleaning',
     description:
-      'The Hyderabad Food Safety Authority’s own audit checklist, page 2 of 3 ("CHECKLIST 2"), word for word: ' +
+      'The Hyderabad Food Safety Authority’s own audit checklist, "FOOD SAFETY AUDIT CHECKLIST" — page 2 of 3 ("CHECKLIST 2"), word for word: ' +
       'Food Preparation, Personal Hygiene – Critical, Cleaning & Sanitation. ' +
       'Run it as a self-audit before an inspector does. ' + HYD_HOW,
     sort_order: 140,
   },
-  [
+  sections: [
     {
-      code: 'PREP', title: 'Food Preparation',
-      description: 'Watch preparation while it is happening, not after.',
+      code: 'PREP', heading: 'Food Preparation',
+      description:
+        'Watch preparation while it is happening, not after. On a NO, photograph what you saw — except for a ' +
+        'person’s own hands and for a missing record.',
       lines: [
         { words: 'Raw materials washed/cleaned properly' },
         { words: 'Separate cutting boards/knives where required', na: true },
         { words: 'Raw and cooked food not cross-contaminated', crit: 'high' },
-        { words: 'Food handlers wash hands before food preparation' },
+        { words: 'Food handlers wash hands before food preparation', noPhoto: true },
         { words: 'Food covered during preparation/storage' },
-        { words: 'No direct hand contact with ready-to-eat food where avoidable' },
-        { words: 'Cooking temperature/process monitored' },
-        { words: 'Reheating controlled and recorded' },
+        { words: 'No direct hand contact with ready-to-eat food where avoidable', noPhoto: true },
+        { words: 'Cooking temperature/process monitored', noPhoto: true },
+        { words: 'Reheating controlled and recorded', noPhoto: true },
         { words: 'No expired ingredients used', crit: 'high' },
       ],
     },
     {
-      code: 'HYGIENE', title: 'Personal Hygiene – Critical',
+      code: 'HYGIENE', heading: 'Personal Hygiene – Critical',
       leadIn: 'Every food handler should have:',
       description:
-        'The authority marks this section Critical: any NO fails the audit. YES only when it is true of EVERY food ' +
+        'The authority marks this section Critical: a NO here is critical. YES only when it is true of EVERY food ' +
         'handler on shift — name the person in the remark on a NO. Certificates are filed under Documents & Certificates.',
       lines: lines([
         'Clean uniform',
@@ -988,50 +1050,59 @@ const T_HYD_AUDIT_2: PackTemplate = authorityPage(
       ], { crit: 'high', noPhoto: true }),
     },
     {
-      code: 'CLEANING', title: 'Cleaning & Sanitation',
+      code: 'CLEANING', heading: 'Cleaning & Sanitation',
       leadIn: 'Maintain daily cleaning checklists for:',
+      // Bold on the sheet, not shaded, not indented: the group label, not a line.
+      subheading: 'Kitchen',
       description:
         'YES when it is clean now AND its daily cleaning is on record — in this app, Kitchen Cleaning — Daily under ' +
-        'Cleaning & Sanitation.',
+        'Cleaning & Sanitation. On a NO, photograph what is not clean.',
       lines: lines([
-        'Kitchen', 'Floors', 'Walls', 'Work tables', 'Cutting boards', 'Cooking equipment',
+        'Floors', 'Walls', 'Work tables', 'Cutting boards', 'Cooking equipment',
         'Refrigerators', 'Freezers', 'Exhaust/hood', 'Sinks', 'Racks',
       ]),
     },
   ],
-);
+};
 
-const T_HYD_AUDIT_3: PackTemplate = authorityPage(
-  {
+const HYD_PAGE_3: HydPage = {
+  sheet: 'CHECKLIST 3',
+  head: {
     code: 'CHK-HYD-AUDIT-3',
     name: 'Hyderabad Food Safety Audit — Checklist 3: FOH, Washrooms, Pests, Waste, Equipment & Packaging',
     description:
-      'The Hyderabad Food Safety Authority’s own audit checklist, page 3 of 3 ("CHECKLIST 3"), word for word: ' +
+      'The Hyderabad Food Safety Authority’s own audit checklist, "FOOD SAFETY AUDIT CHECKLIST" — page 3 of 3 ("CHECKLIST 3"), word for word: ' +
       'FOH, Washrooms, Pest Control, Waste Management, Food-Grade Equipment & Packaging. ' +
       'Run it as a self-audit before an inspector does. ' + HYD_HOW,
     sort_order: 150,
   },
-  [
+  sections: [
     {
-      code: 'FOH', title: 'FOH', leadIn: 'FOH',
+      code: 'FOH', heading: 'FOH', headingInPrompt: true,
       description:
         'On the authority’s full sheet these sit under Cleaning & Sanitation. YES when it is clean now and its cleaning ' +
-        'is on record — in this app, Washrooms & Guest Areas — Cleaning Round.',
+        'is on record — in this app, Washrooms & Guest Areas — Cleaning Round. On a NO, photograph what you saw.',
       lines: lines(['Tables/chairs', 'Service stations', 'Crockery/cutlery', 'Water station']),
     },
     {
-      code: 'WASHROOMS', title: 'Washrooms', leadIn: 'Washrooms',
+      code: 'WASHROOMS', heading: 'Washrooms', headingInPrompt: true,
       description:
         'On the authority’s full sheet these sit under Cleaning & Sanitation. YES when it is clean and stocked now and ' +
-        'its cleaning is on record — in this app, Washrooms & Guest Areas — Cleaning Round.',
-      lines: lines(['Toilet', 'Wash basin', 'Soap', 'Hand-drying facility', 'Cleaning record']),
+        'its cleaning is on record — in this app, Washrooms & Guest Areas — Cleaning Round. On a NO, photograph what ' +
+        'you saw (not needed for a missing cleaning record).',
+      lines: [
+        ...lines(['Toilet', 'Wash basin', 'Soap', 'Hand-drying facility']),
+        { words: 'Cleaning record', noPhoto: true },
+      ],
     },
     {
-      code: 'PEST', title: 'Pest Control',
-      description: 'Reports and visits are under Pest Control Logs. Any sign of a pest is urgent and fails the audit.',
+      code: 'PEST', heading: 'Pest Control',
+      description:
+        'Reports and visits are under Pest Control Logs. Any sign of a pest is urgent. On a NO, photograph what you ' +
+        'saw (not needed for a missing report or record).',
       lines: [
-        { words: 'Monthly pest-control report' },
-        { words: 'Pest-control chemicals/records maintained' },
+        { words: 'Monthly pest-control report', noPhoto: true },
+        { words: 'Pest-control chemicals/records maintained', noPhoto: true },
         ...lines(['No cockroaches', 'No flies', 'No rodents', 'No pest droppings/eggs/larvae'], { crit: 'urgent' }),
         { words: 'Insect-proof screens where required', na: true },
         { words: 'Door gaps sealed' },
@@ -1039,8 +1110,10 @@ const T_HYD_AUDIT_3: PackTemplate = authorityPage(
       ],
     },
     {
-      code: 'WASTE', title: 'Waste Management',
-      description: 'Look at the kitchen bins and the waste area outside.',
+      code: 'WASTE', heading: 'Waste Management',
+      description:
+        'Look at the kitchen bins and the waste area outside. On a NO, photograph what you saw (not needed for missing ' +
+        'oil-disposal records).',
       lines: [
         { words: 'Separate wet/dry waste as applicable', na: true },
         ...lines([
@@ -1049,14 +1122,16 @@ const T_HYD_AUDIT_3: PackTemplate = authorityPage(
           'Waste removed from kitchen periodically',
           'No overflowing bins',
           'Waste area kept clean',
-          'Used oil disposal records maintained',
-          'No food waste accumulated near preparation areas',
         ]),
+        { words: 'Used oil disposal records maintained', noPhoto: true },
+        { words: 'No food waste accumulated near preparation areas' },
       ],
     },
     {
-      code: 'EQUIPMENT', title: 'Food-Grade Equipment & Packaging',
-      description: 'Anything that touches food — utensils, boards, containers, and the packaging it leaves in.',
+      code: 'EQUIPMENT', heading: 'Food-Grade Equipment & Packaging',
+      description:
+        'Anything that touches food — utensils, boards, containers, and the packaging it leaves in. On a NO, ' +
+        'photograph the item.',
       lines: lines([
         'Food-contact equipment is food-safe',
         'Containers are non-toxic and easy to clean',
@@ -1068,7 +1143,164 @@ const T_HYD_AUDIT_3: PackTemplate = authorityPage(
       ]),
     },
   ],
-);
+};
+
+const HYD_PAGES: readonly HydPage[] = [HYD_PAGE_1, HYD_PAGE_2, HYD_PAGE_3];
+
+/** The master sheet's last heading and its 20 lines — the audit file, not a checklist. */
+const HYD_AUDIT_FILE_HEADING = 'Records You Should Keep Ready in One Audit File';
+export const FSSAI_HYD_AUDIT_FILE_LINES: readonly string[] = [
+  'FSSAI licence copy',
+  'FSDB photograph',
+  'GHMC licence',
+  'Water test report / water bill',
+  'Pest-control agreement + reports',
+  'Food-handler medical certificates',
+  'Food-safety training records',
+  'Approved vendor list',
+  'Receiving checklist',
+  'Refrigerator/freezer temperature log',
+  'Cooking/reheating temperature log',
+  'Cleaning & sanitation checklist',
+  'Pest-control monitoring sheet',
+  'Waste disposal record',
+  'Used cooking-oil/TPC records',
+  'Equipment maintenance records',
+  'Calibration certificates',
+  'FIFO/FEFO checklist',
+  'Food sampling/lab reports, where applicable',
+  'Previous audit report and closure evidence',
+];
+
+/** One authority page → one template. Question N is the page's Nth line. */
+function hydTemplate(p: HydPage): PackTemplate {
+  const questions: PackQuestion[] = [];
+  for (const s of p.sections) {
+    for (const l of s.lines) {
+      questions.push({
+        section: s.code,
+        code: hydQuestionCode(questions.length + 1),
+        qtype: 'yes_no',
+        prompt: hydPrompt(s, l),
+        expected_value: 'yes',
+        allow_na: l.na ? 1 : 0,
+        note_rule: 'on_fail',
+        raise_ca_on_fail: 1,
+        ca_severity: l.crit || 'medium',
+        is_critical: l.crit ? 1 : 0,
+        photo_rule: l.noPhoto ? 'never' : 'on_fail',
+      });
+    }
+  }
+  return {
+    ...p.head,
+    // Not one record screen's checklist: the audit walks across all of them.
+    module_key: '',
+    // A self-audit, run monthly and again before an expected inspection. The
+    // one-run-per-slot rule is per DAY, so a re-audit after fixes is never
+    // blocked by the frequency.
+    frequency: 'monthly',
+    target_kind: 'none',
+    category: HYD_CATEGORY,
+    sections: p.sections.map((s) => ({ code: s.code, title: s.heading, description: s.description })),
+    questions,
+  };
+}
+
+/** One authority page → its rows, numbered as the sheet numbers them. */
+function hydPageRows(p: HydPage): HydWorkbookRow[] {
+  const out: HydWorkbookRow[] = [];
+  const push = (kind: HydRowKind, text: string, extra: Partial<HydWorkbookRow> = {}) =>
+    out.push({ row: out.length + 1, kind, text, ...extra });
+  if (p.titleRow) push('title', p.titleRow);
+  let n = 0;
+  for (const s of p.sections) {
+    push('heading', s.heading);
+    if (s.leadIn) push('lead_in', s.leadIn);
+    if (s.subheading) push('subheading', s.subheading);
+    for (const l of s.lines) {
+      n++;
+      push('line', l.words, { template_code: p.head.code, question_code: hydQuestionCode(n) });
+    }
+  }
+  return out;
+}
+
+function buildHydWorkbook(): HydWorkbookSheet[] {
+  const pages = HYD_PAGES.map((p) => ({
+    name: p.sheet, columns: HYD_COLUMNS, template_code: p.head.code, rows: hydPageRows(p),
+  }));
+  const master: HydWorkbookRow[] = [];
+  for (const pg of pages) for (const r of pg.rows) master.push({ ...r, row: master.length + 1 });
+  master.push({ row: master.length + 1, kind: 'heading', text: HYD_AUDIT_FILE_HEADING });
+  FSSAI_HYD_AUDIT_FILE_LINES.forEach((text, i) => master.push({ row: master.length + 1, kind: 'line', text, audit_file_n: i + 1 }));
+  // The workbook's own tab order: the master first.
+  return [{ name: 'FOOD SAFETY AUDIT CHECKLIS', columns: HYD_COLUMNS, template_code: '', rows: master }, ...pages];
+}
+
+/**
+ * THE AUTHORITY'S WORKBOOK, every sheet, every row, in its own words and order —
+ * each row tagged heading / lead-in / sub-heading / line, and each CHECKLIST
+ * line tagged with the question that asks it. Proved row for row against the
+ * .xlsx (the pack-and-excel proof, 2026-10-14). The audit file and Inspection
+ * Mode can print the authority's pages from this rather than from a template the
+ * owner may have edited.
+ */
+export const FSSAI_HYD_WORKBOOK: readonly HydWorkbookSheet[] = buildHydWorkbook();
+
+/** The workbook above, for a caller that prefers a function. */
+export function fssaiHydWorkbook(): readonly HydWorkbookSheet[] {
+  return FSSAI_HYD_WORKBOOK;
+}
+
+export interface HydLineRef {
+  /** The CHECKLIST page and its row. */
+  sheet: string;
+  row: number;
+  /** The same line's row on the master sheet. */
+  master_row: number;
+  heading: string;
+  lead_in: string;
+  subheading: string;
+  /** The authority's line, exactly. */
+  words: string;
+  template_code: string;
+  question_code: string;
+}
+
+/**
+ * Which line of the authority's workbook a pack question asks — by the codes the
+ * pack seeds (CHK-HYD-AUDIT-k, Qnn). Null for anything that is not one of the
+ * 99 lines. A template the owner has since edited still carries these codes, so
+ * this is how an answer is put back on the authority's page.
+ */
+export function fssaiHydLineForQuestion(templateCode: string, questionCode: string): HydLineRef | null {
+  const master = FSSAI_HYD_WORKBOOK[0];
+  for (const sheet of FSSAI_HYD_WORKBOOK.slice(1)) {
+    if (sheet.template_code !== templateCode) continue;
+    let heading = '';
+    let leadIn = '';
+    let sub = '';
+    for (const r of sheet.rows) {
+      if (r.kind === 'heading') { heading = r.text; leadIn = ''; sub = ''; }
+      else if (r.kind === 'lead_in') { leadIn = r.text; sub = ''; }
+      else if (r.kind === 'subheading') sub = r.text;
+      else if (r.kind === 'line' && r.question_code === questionCode) {
+        const m = master.rows.find((x) => x.template_code === templateCode && x.question_code === questionCode);
+        return {
+          sheet: sheet.name, row: r.row, master_row: m ? m.row : 0,
+          heading, lead_in: leadIn, subheading: sub, words: r.text,
+          template_code: templateCode, question_code: questionCode,
+        };
+      }
+    }
+  }
+  return null;
+}
+
+const T_HYD_AUDIT_1: PackTemplate = hydTemplate(HYD_PAGE_1);
+const T_HYD_AUDIT_2: PackTemplate = hydTemplate(HYD_PAGE_2);
+const T_HYD_AUDIT_3: PackTemplate = hydTemplate(HYD_PAGE_3);
 
 /* ------------------------------------------------------------------ *
  * 4. THE PACK
@@ -1076,22 +1308,34 @@ const T_HYD_AUDIT_3: PackTemplate = authorityPage(
 
 /**
  * pack_key / pack_version are what `uq_fssai_seed_item` makes unique, and the
- * marker row keyed on them is what stops a second apply (and stops a cold start
- * resurrecting a checklist the owner retired). Bumping `version` ships a new
- * pack that may run once more; it NEVER rewrites what the first one created,
- * because the owner may have edited it since.
+ * marker row keyed on them is what stops a second apply of the SAME version.
+ * Bumping `version` ships a new pack that may run once more; it NEVER rewrites
+ * what an earlier version created, because the owner may have edited it since.
  *
- * VERSION 2 (2026-10-14) adds the Hyderabad Food Safety Authority's three
+ * ⚠️ AND A NEW VERSION NEVER BRINGS BACK WHAT THE OWNER RETIRED. The marker is
+ * per version, so on its own it cannot answer that — measured 2026-10-14: v2
+ * re-created CHK-SAFE-MONTHLY on a database where the owner had applied v1 and
+ * then deleted it. The applier (fssai-seed-server.ts) therefore asks a second,
+ * version-free question of every checklist before it creates one: "did ANY
+ * version of this pack ever insert this code here?" (idx_fssai_seed_code). If
+ * yes and it is no longer there, it was retired, and it stays retired.
+ *
+ * VERSION 2 (2026-10-14) added the Hyderabad Food Safety Authority's three
  * audit pages and the questions that close the gaps that audit found in the
- * twelve. On a database that never applied v1 it creates all fifteen. On one
- * that did, it creates the three audits and SKIPS the twelve by code — so the
- * new questions inside the twelve reach only a fresh set-up; an outlet that
- * already has the twelve adds them in the builder. That is the cost of the
- * never-overwrite rule above, and it is paid knowingly.
+ * twelve.
+ * VERSION 3 (2026-10-14, the same day, before anything was deployed) re-reads
+ * the authority's workbook with its cell styles: "Kitchen" is a sub-heading,
+ * not a line (CHECKLIST 2 is 30 lines, not 31), and every line a photograph
+ * can show now demands one on a NO, not only the critical ones.
+ *
+ * On a database that never applied a version it creates all fifteen. On one
+ * that did, it creates only the checklists no version ever created there — an
+ * outlet that already has the twelve gets their new questions by adding them in
+ * the builder. That is the cost of the never-overwrite rule, paid knowingly.
  */
 export const FSSAI_CHECKLIST_PACK: ChecklistPack = {
   key: 'fssai.checklists',
-  version: 2,
+  version: 3,
   title: 'Fifteen ready-made checklists — the twelve FSSAI routines and the Hyderabad Food Safety Authority’s own three-page audit',
   templates: [
     T_FQ_PRESERVICE,
@@ -1154,7 +1398,9 @@ export interface PackValidation {
  *     would throw on halfway through the seed;
  *   · a question pointing at a section that is not in its template;
  *   · a `photo_rule: 'always'` on a REQUIRED non-photo question, which would
- *     make the round unsubmittable without a camera.
+ *     make the round unsubmittable without a camera;
+ *   · a Hyderabad audit page that no longer matches the authority's workbook
+ *     (FSSAI_HYD_WORKBOOK) — headings, line order, words or photo rule.
  */
 export function validateFssaiChecklistPack(pack: ChecklistPack = FSSAI_CHECKLIST_PACK): PackValidation {
   const problems: PackProblem[] = [];
@@ -1230,6 +1476,49 @@ export function validateFssaiChecklistPack(pack: ChecklistPack = FSSAI_CHECKLIST
       validated.push({ code: q.code, section: q.section || '', value: v.value });
     }
     templates.push({ template: t, questions: validated });
+
+    /* THE AUTHORITY'S PAGES MAY NOT DRIFT. A checklist carrying a CHK-HYD-AUDIT
+     * code must still be its page of the workbook: the headings as sections in
+     * order, one question per line in order, each question ending in the line's
+     * own words, and a photograph on a NO exactly where the page definition says
+     * a picture can show the failure. */
+    const sheet = FSSAI_HYD_WORKBOOK.find((s) => s.template_code && s.template_code === t.code);
+    if (sheet) {
+      const headings = sheet.rows.filter((r) => r.kind === 'heading').map((r) => r.text);
+      const titles = t.sections.map((s) => s.title);
+      if (JSON.stringify(headings) !== JSON.stringify(titles)) {
+        problems.push({
+          template_code: where, item: 'sections',
+          problem: `The sections must be the authority's headings in order (${headings.join(' · ')}), not ${titles.join(' · ')}.`,
+        });
+      }
+      const lineRows = sheet.rows.filter((r) => r.kind === 'line');
+      if (lineRows.length !== t.questions.length) {
+        problems.push({
+          template_code: where, item: 'questions',
+          problem: `"${sheet.name.trim()}" has ${lineRows.length} lines; this checklist has ${t.questions.length} questions.`,
+        });
+      }
+      const page = HYD_PAGES.find((p) => p.head.code === t.code);
+      const specLines = page ? page.sections.flatMap((s) => s.lines) : [];
+      lineRows.forEach((r, i) => {
+        const q = t.questions[i];
+        if (!q) return;
+        if (q.code !== r.question_code || !String(q.prompt).endsWith(r.text)) {
+          problems.push({
+            template_code: where, item: `question ${q.code}`,
+            problem: `Line ${r.row} of "${sheet.name.trim()}" is "${r.text}"; this question is ${q.code} "${q.prompt}".`,
+          });
+        }
+        const wantPhoto = specLines[i] && !specLines[i].noPhoto ? 'on_fail' : 'never';
+        if ((q.photo_rule || 'never') !== wantPhoto) {
+          problems.push({
+            template_code: where, item: `question ${q.code}`,
+            problem: `A photograph on a NO should be "${wantPhoto}" for "${r.text}", not "${q.photo_rule || 'never'}".`,
+          });
+        }
+      });
+    }
   }
 
   return {
@@ -1245,7 +1534,7 @@ export function fssaiPackTemplate(code: string, pack: ChecklistPack = FSSAI_CHEC
   return pack.templates.find((t) => t.code === code) || null;
 }
 
-/** How many of the twelve belong to each food-safety area. */
+/** The fifteen grouped by food-safety area ('' = the Hyderabad audit, which walks across all of them). */
 export function fssaiPackByModule(pack: ChecklistPack = FSSAI_CHECKLIST_PACK): Map<string, PackTemplate[]> {
   const out = new Map<string, PackTemplate[]>();
   for (const t of pack.templates) {

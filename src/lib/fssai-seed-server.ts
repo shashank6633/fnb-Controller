@@ -22,7 +22,16 @@
  *     a UNIQUE failure on that insert IS the "already ran" answer;
  *   · a checklist code that already exists is SKIPPED and logged, never
  *     overwritten: by the time anyone presses this twice, the row may carry the
- *     owner's own edits and a seed has no business replacing them.
+ *     owner's own edits and a seed has no business replacing them;
+ *   · a checklist code that ANY earlier version of the pack created here and
+ *     that is no longer here is SKIPPED as RETIRED (the version-free question,
+ *     idx_fssai_seed_code) — the marker is per version, so without this a new
+ *     version brought back what the owner deleted (measured 2026-10-14).
+ *
+ * The pack seeds DRAFTS, and a draft cannot be run, so
+ * publishFssaiReadyMadeDrafts publishes every untouched ready-made draft in one
+ * click — never an archived one, and never one whose status a person already
+ * changed.
  *
  * ALL OR NOTHING. One `db.transaction`, so a half-seeded library cannot exist —
  * which matters because RECON §10 R1 warns that *"a half-migrated template looks
@@ -35,7 +44,7 @@
 
 import type Database from 'better-sqlite3';
 import { generateId } from './db';
-import { fssaiConfigWarnings } from './fssai';
+import { fssaiConfigWarnings, qtypeMeta } from './fssai';
 import { fssaiAudit, fssaiAppAudit } from './fssai-server';
 import {
   FSSAI_CHECKLIST_PACK,
@@ -55,9 +64,17 @@ export interface SeedTemplateState {
   module_key: string;
   frequency: string;
   target_kind: string;
+  /** fssai_templates.category as the pack creates it ('Hyderabad Food Safety Audit' for the three pages). */
+  category: string;
   section_count: number;
   question_count: number;
   critical_count: number;
+  /**
+   * Set when an EARLIER apply (any version of this pack) created this checklist
+   * here and it is no longer here — the owner deleted it or changed its code.
+   * It is RETIRED: no later version brings it back.
+   */
+  retired: null | { pack_version: number; created_at: string; template_id: string };
   /** Set when a checklist with this code already exists in this outlet. */
   existing: null | {
     id: string;
@@ -96,6 +113,131 @@ export interface SeedState {
   problems: PackProblem[];
   templates: SeedTemplateState[];
   log: SeedLogRow[];
+  /** What "Publish the ready-made checklists" would do right now. */
+  drafts: ReadyMadeDrafts;
+}
+
+/* ------------------------------------------------------------------ *
+ * "Was this code ever created here by ANY version of this pack?"
+ * ------------------------------------------------------------------ */
+
+/**
+ * THE VERSION-FREE QUESTION (idx_fssai_seed_code). The pack marker is per
+ * version, so it can only say "v3 has run". Asked per checklist, this says "a
+ * version of this pack created this code in this outlet before" — and if the
+ * code is no longer in fssai_templates, the owner retired it. Measured
+ * 2026-10-14: without it, v2 re-created CHK-SAFE-MONTHLY on a database where
+ * the owner had applied v1 and then deleted it.
+ */
+function everInsertedHere(db: Database.Database, packKey: string, code: string, outletId: string): any {
+  return db.prepare(
+    `SELECT pack_version, item_id, created_at FROM fssai_seed_log
+      WHERE pack_key = ? AND item_kind = 'template' AND item_code = ? AND action = 'inserted' AND outlet_id = ?
+      ORDER BY created_at ASC, rowid ASC LIMIT 1`,
+  ).get(packKey, code, outletId);
+}
+
+/* ------------------------------------------------------------------ *
+ * The ready-made drafts, and which of them one click may publish
+ * ------------------------------------------------------------------ */
+
+export interface ReadyMadeDraft {
+  template_id: string;
+  code: string;
+  name: string;
+  question_count: number;
+}
+
+export interface ReadyMadeHeld {
+  template_id: string;
+  code: string;
+  name: string;
+  status: string;
+  /** Why one click leaves it alone, in the owner's words. */
+  why: string;
+}
+
+export interface ReadyMadeDrafts {
+  /** Drafts the pack created that nobody has published, archived or taken back. */
+  publishable: ReadyMadeDraft[];
+  /** Pack-created checklists one click will NOT touch, each with the reason. */
+  held: ReadyMadeHeld[];
+  /** Pack-created checklists already published. */
+  published: number;
+}
+
+/**
+ * Every checklist the ready-made pack created in this outlet (by the seed log,
+ * any version — never by name and never by is_seeded alone), sorted into what
+ * a "publish them all" click may publish and what it must leave alone.
+ *
+ * WHAT IT MUST LEAVE ALONE, and why each is a refusal rather than a convenience:
+ *   · ARCHIVED (or inactive): the owner retired it. Publishing it would bring a
+ *     retired checklist back to staff — the very thing the pack promises never
+ *     to do. Restoring is a deliberate act on the checklist's own page.
+ *   · A DRAFT WHOSE STATUS A PERSON ALREADY CHANGED (published then taken back,
+ *     or restored from the archive): fssai_audit_log holds a field='status' row
+ *     for it. Somebody decided about that one; a bulk click does not overrule him.
+ *   · No active question, or a question type this build does not know — the
+ *     single-checklist publish refuses those too (templates/[id] route).
+ */
+export function readFssaiReadyMadeDrafts(
+  db: Database.Database,
+  outletId: string,
+  pack: ChecklistPack = FSSAI_CHECKLIST_PACK,
+): ReadyMadeDrafts {
+  const rows = db.prepare(
+    `SELECT t.id, t.code, t.name, t.status, t.is_active, t.sort_order
+       FROM fssai_templates t
+      WHERE t.outlet_id = ?
+        AND t.id IN (SELECT item_id FROM fssai_seed_log
+                      WHERE pack_key = ? AND item_kind = 'template' AND action = 'inserted' AND outlet_id = ?)
+      ORDER BY t.sort_order ASC, t.code ASC`,
+  ).all(outletId, pack.key, outletId) as any[];
+  const statusChange = db.prepare(
+    `SELECT before_json, after_json, actor_email, created_at FROM fssai_audit_log
+      WHERE entity_table = 'fssai_templates' AND entity_id = ? AND field = 'status'
+      ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+  );
+  const activeQs = db.prepare(`SELECT qtype FROM fssai_questions WHERE template_id = ? AND is_active = 1`);
+
+  const out: ReadyMadeDrafts = { publishable: [], held: [], published: 0 };
+  for (const r of rows) {
+    const base = { template_id: String(r.id), code: String(r.code), name: String(r.name), status: String(r.status) };
+    if (r.status === 'published' && Number(r.is_active) === 1) { out.published++; continue; }
+    if (r.status === 'archived' || Number(r.is_active) !== 1) {
+      out.held.push({ ...base, why: 'Archived — you retired it, so it stays retired. Restore it from its own page if you want it back.' });
+      continue;
+    }
+    if (r.status !== 'draft') {
+      out.held.push({ ...base, why: `Its status is "${r.status}", not a draft.` });
+      continue;
+    }
+    const ch = statusChange.get(r.id) as any;
+    if (ch) {
+      let from = '';
+      try { from = String(JSON.parse(ch.before_json || '{}').status || ''); } catch { /* the words below still stand */ }
+      out.held.push({
+        ...base,
+        why:
+          `Somebody already decided about this one${from ? ` — it was ${from} until ${String(ch.created_at || '').slice(0, 10)}` : ''}` +
+          `${ch.actor_email ? ` (${ch.actor_email})` : ''}. Publish it from its own page if you want it live.`,
+      });
+      continue;
+    }
+    const qs = activeQs.all(r.id) as any[];
+    if (!qs.length) {
+      out.held.push({ ...base, why: 'It has no questions, so there is nothing to run.' });
+      continue;
+    }
+    const unknown = qs.filter((q) => !qtypeMeta(q.qtype));
+    if (unknown.length) {
+      out.held.push({ ...base, why: `It has ${unknown.length} question(s) of a type this system does not know. Fix them before publishing.` });
+      continue;
+    }
+    out.publishable.push({ template_id: base.template_id, code: base.code, name: base.name, question_count: qs.length });
+  }
+  return out;
 }
 
 function packMarker(db: Database.Database, pack: ChecklistPack): any {
@@ -132,15 +274,20 @@ export function readFssaiChecklistSeedState(
 
   const templates: SeedTemplateState[] = pack.templates.map((t) => {
     const row = findTemplate.get(t.code, outletId) as any;
+    const prior = row ? null : everInsertedHere(db, pack.key, t.code, outletId);
     return {
       code: t.code,
       name: t.name,
       module_key: t.module_key,
       frequency: t.frequency,
       target_kind: t.target_kind,
+      category: t.category || 'Compliance',
       section_count: t.sections.length,
       question_count: t.questions.length,
       critical_count: t.questions.filter((q) => Number(q.is_critical) === 1).length,
+      retired: prior
+        ? { pack_version: Number(prior.pack_version), created_at: String(prior.created_at || ''), template_id: String(prior.item_id || '') }
+        : null,
       existing: row
         ? {
             id: String(row.id),
@@ -182,6 +329,7 @@ export function readFssaiChecklistSeedState(
     problems: validation.problems,
     templates,
     log,
+    drafts: readFssaiReadyMadeDrafts(db, outletId, pack),
   };
 }
 
@@ -201,7 +349,7 @@ export interface ApplyOptions {
    */
   departmentByCode?: Record<string, string>;
   /**
-   * Seed the twelve as PUBLISHED rather than as drafts.
+   * Seed the fifteen as PUBLISHED rather than as drafts.
    *
    * The default is `false` and that is the deliberate, reversible choice: a
    * draft is invisible to staff (templates/route.ts shows a non-admin only
@@ -217,6 +365,8 @@ export interface ApplyItemResult {
   code: string;
   name: string;
   action: 'inserted' | 'skipped';
+  /** Why a skip: the code is taken, or an earlier version created it and the owner retired it. */
+  reason?: 'code_in_use' | 'retired';
   template_id: string;
   sections: number;
   questions: number;
@@ -237,7 +387,8 @@ function isPackAlreadyRan(e: any): boolean {
 }
 
 /**
- * Create the twelve checklists, once.
+ * Create the ready-made checklists, once per pack version — never one an
+ * earlier version created that the owner has since retired.
  *
  * Returns a tagged result rather than throwing, so the route can answer the
  * three refusals in the owner's own words (already applied · the engine cannot
@@ -352,9 +503,31 @@ export function applyFssaiChecklistPack(db: Database.Database, opts: ApplyOption
           actorEmail || 'unknown', outletId,
         );
         items.push({
-          code: t.code, name: t.name, action: 'skipped', template_id: String(already.id),
+          code: t.code, name: t.name, action: 'skipped', reason: 'code_in_use', template_id: String(already.id),
           sections: 0, questions: 0,
           detail: `Already there as "${already.name}" (${already.status}). Nothing was changed.`,
+          warnings: [],
+        });
+        continue;
+      }
+
+      /* NEVER RESURRECT. The marker above is per VERSION, so it cannot see that
+       * an earlier version created this checklist and the owner has since
+       * deleted it (or renamed its code). Ask the version-free question; a yes
+       * means it was retired, and a new pack version does not overrule him. */
+      const prior = everInsertedHere(db, pack.key, t.code, outletId);
+      if (prior) {
+        const when = String(prior.created_at || '').slice(0, 10);
+        insLog.run(
+          generateId(), pack.key, pack.version, 'template', t.code, String(prior.item_id || ''), 'skipped',
+          `Retired: version ${prior.pack_version} of the ready-made checklists created this on ${when} and it is no ` +
+          `longer here — deleted, or its code changed. Not brought back.`,
+          actorEmail || 'unknown', outletId,
+        );
+        items.push({
+          code: t.code, name: t.name, action: 'skipped', reason: 'retired', template_id: '',
+          sections: 0, questions: 0,
+          detail: `Retired — added on ${when} and since removed from your checklists. It is not brought back.`,
           warnings: [],
         });
         continue;
@@ -462,4 +635,114 @@ export function applyFssaiChecklistPack(db: Database.Database, opts: ApplyOption
   });
 
   return { ok: true, inserted, skipped, items, status: nowStatus };
+}
+
+/* ------------------------------------------------------------------ *
+ * Publishing the ready-made drafts — one click, for an administrator
+ * ------------------------------------------------------------------ */
+
+export interface PublishDraftItem {
+  template_id: string;
+  code: string;
+  name: string;
+  questions: number;
+  warnings: string[];
+}
+
+export type PublishDraftsResult =
+  | { ok: false; code: 'nothing_to_publish'; message: string; drafts: ReadyMadeDrafts }
+  | { ok: false; code: 'unknown_code'; message: string }
+  | { ok: true; published: PublishDraftItem[]; held: ReadyMadeHeld[]; lost_race: string[] };
+
+/**
+ * "Publish the ready-made checklists": every draft the pack created that nobody
+ * has published, archived or taken back (readFssaiReadyMadeDrafts) goes live in
+ * ONE transaction. The pack seeds all fifteen as drafts and a draft cannot be
+ * run, so without this an administrator publishes them one page at a time.
+ *
+ * Exactly what the single-checklist publish does (templates/[id] route), per
+ * checklist: a STATUS-GUARDED update — `status = 'draft' AND is_active = 1` —
+ * whose `changes !== 1` means somebody else moved it first (it is reported, not
+ * overwritten), and an fssai_audit_log row (field 'status', draft → published)
+ * for each one, inside the same transaction. Nothing else about the checklist is
+ * touched: not a question, not a range, not a department.
+ *
+ * `codes` narrows it to some of them; a code that is not in the pack is refused
+ * before anything is written.
+ */
+export function publishFssaiReadyMadeDrafts(
+  db: Database.Database,
+  opts: { actor: { email?: string | null; name?: string | null }; outletId: string; codes?: string[]; pack?: ChecklistPack },
+): PublishDraftsResult {
+  const pack = opts.pack || FSSAI_CHECKLIST_PACK;
+  const outletId = opts.outletId || '';
+  const actorEmail = String(opts.actor?.email || '');
+  const wanted = Array.isArray(opts.codes) && opts.codes.length ? new Set(opts.codes.map(String)) : null;
+  if (wanted) {
+    const unknown = Array.from(wanted).filter((c) => !pack.templates.some((t) => t.code === c));
+    if (unknown.length) {
+      return { ok: false, code: 'unknown_code', message: `"${unknown[0]}" is not one of the ready-made checklists.` };
+    }
+  }
+
+  const published: PublishDraftItem[] = [];
+  const lostRace: string[] = [];
+  let held: ReadyMadeHeld[] = [];
+  let drafts: ReadyMadeDrafts = { publishable: [], held: [], published: 0 };
+
+  const claim = db.prepare(
+    `UPDATE fssai_templates
+        SET status='published', is_active=1, published_by=?, published_at=datetime('now'), updated_at=datetime('now')
+      WHERE id=? AND status='draft' AND is_active=1`,
+  );
+  const tplRow = db.prepare(`SELECT * FROM fssai_templates WHERE id = ?`);
+
+  db.transaction(() => {
+    // Sorted INSIDE the transaction, so what is published is what was checked.
+    drafts = readFssaiReadyMadeDrafts(db, outletId, pack);
+    held = wanted ? drafts.held.filter((h) => wanted.has(h.code)) : drafts.held;
+    for (const d of drafts.publishable) {
+      if (wanted && !wanted.has(d.code)) continue;
+      const before = tplRow.get(d.template_id) as any;
+      const res = claim.run(actorEmail, d.template_id);
+      if (res.changes !== 1) { lostRace.push(d.code); continue; }
+      fssaiAudit(db, {
+        entity_table: 'fssai_templates', entity_id: d.template_id, action: 'update', field: 'status',
+        before: { status: before?.status || 'draft' },
+        after: { status: 'published', version: Number(before?.version || 1), questions: d.question_count },
+        reason: 'Published with "Publish the ready-made checklists"',
+        actor: { email: opts.actor?.email || '', name: opts.actor?.name || '' },
+        outlet_id: outletId,
+      });
+      published.push({
+        template_id: d.template_id, code: d.code, name: d.name, questions: d.question_count,
+        warnings: fssaiConfigWarnings((tplRow.get(d.template_id) as any) || {}),
+      });
+    }
+  })();
+
+  if (!published.length && !lostRace.length) {
+    return {
+      ok: false,
+      code: 'nothing_to_publish',
+      message:
+        drafts.published && !drafts.publishable.length
+          ? `There is no ready-made draft left to publish — ${drafts.published} already published` +
+            `${drafts.held.length ? `, ${drafts.held.length} left alone on purpose` : ''}.`
+          : 'There is no ready-made draft to publish.',
+      drafts,
+    };
+  }
+
+  // The app-wide trail too, outside the transaction: logAuditEvent never throws.
+  fssaiAppAudit(db, {
+    event_type: 'fssai.checklist_pack.publish',
+    entity_type: 'fssai_seed_log',
+    entity_id: pack.key,
+    actor_email: actorEmail,
+    after: { published: published.map((p) => p.code), held: held.map((h) => h.code), lost_race: lostRace },
+    note: `${published.length} ready-made checklist${published.length === 1 ? '' : 's'} published in one click`,
+  });
+
+  return { ok: true, published, held, lost_race: lostRace };
 }

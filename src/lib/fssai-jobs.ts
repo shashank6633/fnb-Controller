@@ -1,6 +1,35 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 /**
- * FSSAI — THE THREE UNATTENDED JOBS, AND THE ONLY THING THAT DRIVES THEM.
+ * FSSAI — THE UNATTENDED JOBS, AND THE ONLY THING THAT DRIVES THEM.
+ *
+ * ═══ 2026-10-14 — THE OWNER'S RULINGS, AND WHAT THIS FILE NOW ADDS ═══════════
+ *
+ *   4. MISSED CHECKS ALSO GO TO WHATSAPP — runFssaiMissedCheckWhatsApp. "Keep
+ *      the next-morning bell AND add WhatsApp to the SAME recipients." Same
+ *      people missedCheckRecipients() resolves, each mapped to a number the app
+ *      ALREADY holds (users.wa_mobile, else hr_employees.phone10 — the
+ *      wa-report-recipients resolver, not a second one). Approved TEMPLATE only,
+ *      through sendWhatsAppTemplate — free text is never sent. DORMANT (bell
+ *      only) until the template is approved AND the Meta app secret exists; a
+ *      dormant day is still written down, one fssai_job_notices row per person,
+ *      so "nobody was told" and "we hold no number for them" are different rows.
+ *      Nothing here configures WhatsApp or writes a credential.
+ *
+ *   5. AN ABANDONED OR OVERDUE COOLING BATCH IS ESCALATED — runFssaiCoolingOverdueJob.
+ *      A batch whose time limit has passed with no reading at the target used to
+ *      sit as "overdue" on a screen nobody opened. Now, once the window plus a
+ *      short grace has passed, it raises ONE corrective action and rings the
+ *      bell of the people who recorded it and their department's head — claimed
+ *      once per batch on fssai_job_notices' UNIQUE index.
+ *
+ *   6. OWNER RULING Q19 — applyFssaiOwnerRulings. The leftover test checklist
+ *      ZZ-P2B-COLDROOM is deleted from any database this app runs on, only while
+ *      it is still the empty draft it was (no questions, sections, assignments
+ *      or rounds), with an fssai_audit_log row. Nothing in this codebase seeds it.
+ *
+ *   Q22 (attachments are never auto-deleted) is enforced in fssai-retention.ts
+ *   and BACKSTOPPED in the retention guard below: a dry run that names any
+ *   store other than fssai_evidence refuses the whole pass.
  *
  * Called once per scheduler tick from src/lib/scheduler.ts, which is armed at
  * server boot from register() in src/instrumentation.ts. That is the app's one
@@ -23,9 +52,9 @@
  *      (src/lib/fssai-retention.ts), owner §7 Q13. It DELETES IMAGE DATA, and
  *      unattended, so it is wrapped in a guard (runFssaiRetentionJob below) that
  *      refuses rather than proceeds whenever it cannot PROVE every image it is
- *      about to drop is at least twelve months old, and that makes sure every
- *      scheduled pass — swept, refused or failed — leaves an
- *      fssai_retention_runs row.
+ *      about to drop is at least twelve months old AND a checklist photograph
+ *      (Q22: attachments never), and that makes sure every scheduled pass —
+ *      swept, refused or failed — leaves an fssai_retention_runs row.
  *
  *   3. MISSED-CHECK REMINDERS — there was NO existing function for this
  *      (FSSAI-BUILD-STATE.md, P3 row: "any due/overdue reminder" not built), so
@@ -35,29 +64,35 @@
  *      record. See runFssaiMissedCheckReminders.
  *
  * WHAT THIS FILE NEVER DOES: write fssai_runs, fssai_responses, an assignment,
- * a template, a department, a role or a mapping. Its only writes are
+ * a department, a role or a mapping, or change a filed reading. Its writes are
  * `notifications` (the claim), `task_notifications` (the bell),
  * `fssai_audit_log` (the trail), `fssai_retention_runs` (the proof — and only
- * for a refusal or a lost proof row; a real sweep writes its own) and three
- * `settings` keys under `fssai_job_*` (once-a-day watermarks + a heartbeat).
+ * for a refusal or a lost proof row; a real sweep writes its own),
+ * `fssai_job_notices` (who was told what, on which channel — and who could
+ * not be), `fssai_corrective_actions` (ONLY the one action an overdue cooling
+ * batch raises), the ONE template delete Q19 ordered, and `settings` keys under
+ * `fssai_job_*` (once-a-day watermarks + a heartbeat).
  *
  * better-sqlite3 IS SYNCHRONOUS: every db.transaction() below is a plain
- * synchronous function. The only `await` in this file is the Slack flush, which
- * is outside every transaction (fssai-alerts.ts already split it out for exactly
- * that reason).
+ * synchronous function. The `await`s in this file — the Slack flush and the
+ * WhatsApp template sends — are outside every transaction.
  */
 import type Database from 'better-sqlite3';
 import { generateId } from '@/lib/db';
 import {
   FSSAI_PHOTO_RETENTION_MONTHS, fssaiToday, addDaysISO, isISODate, fssaiNextDueDate,
-  isFssaiFrequency, type FssaiFrequency,
+  isFssaiFrequency, fssaiCaDueDate, type FssaiFrequency,
 } from '@/lib/fssai';
-import { sweepFssaiPhotoRetention } from '@/lib/fssai-retention';
+import { sweepFssaiPhotoRetention, FSSAI_RETENTION_SWEPT_STORES } from '@/lib/fssai-retention';
 import {
   sweepFssaiCaAlerts, flushFssaiAlertSlack, readFssaiEscalationRules, type FssaiSweepResult,
 } from '@/lib/fssai-alerts';
-import { fssaiAuditBestEffort } from '@/lib/fssai-server';
+import { fssaiAudit, fssaiAuditBestEffort, nextFssaiCaNumber } from '@/lib/fssai-server';
 import { sendPushToUser } from '@/lib/push';
+import { isWaConfigured, sendWhatsAppTemplate } from '@/lib/whatsapp';
+import { templateSendability, webhookAppSecretLookup } from '@/lib/wa-template-authoring';
+import { numberForUser } from '@/lib/wa-report-recipients';
+import { fssaiCurveMembers, fssaiCurveReached, fssaiClockMinute } from '@/app/api/fssai/_p4/lib';
 
 type Db = Database.Database;
 
@@ -68,6 +103,36 @@ type Db = Database.Database;
 /** IST hour (0-23) of an instant, independent of the host timezone (fssaiToday's own +5.5h rule). */
 function istHourOf(now: Date): number {
   return new Date(now.getTime() + 5.5 * 3600_000).getUTCHours();
+}
+
+/** IST 'HH:MM' of an instant — the clock a temperature reading's reading_at is on. */
+function istHHMMOf(now: Date): string {
+  const d = new Date(now.getTime() + 5.5 * 3600_000);
+  return `${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`;
+}
+
+/** Lower-cased, trimmed, de-duplicated, empties dropped — the one email key. */
+function normEmails(rows: any[]): string[] {
+  return [...new Set(rows.map((r) => String(r?.email || '').trim().toLowerCase()).filter(Boolean))];
+}
+
+/** Active heads of a department (is_head_chef on the user OR on their role). Read-only. */
+function departmentHeads(db: Db, dept: string): string[] {
+  if (!dept) return [];
+  return normEmails(db.prepare(
+    `SELECT DISTINCT u.email FROM users u LEFT JOIN roles r ON r.id = u.role_id
+      WHERE u.is_active = 1 AND u.department_id = ?
+        AND (u.is_head_chef = 1 OR IFNULL(r.is_head_chef, 0) = 1)`,
+  ).all(dept) as any[]);
+}
+
+/** Active management tier (manager / admin, by the user's role or its base role). Read-only. */
+function managementTier(db: Db): string[] {
+  return normEmails(db.prepare(
+    `SELECT DISTINCT u.email FROM users u LEFT JOIN roles r ON r.id = u.role_id
+      WHERE u.is_active = 1
+        AND (lower(IFNULL(u.role,'')) IN ('manager','admin') OR lower(IFNULL(r.base_role,'')) IN ('manager','admin'))`,
+  ).all() as any[]);
 }
 
 function getSetting(db: Db, key: string): string | null {
@@ -298,11 +363,26 @@ export function runFssaiRetentionJob(
     }
     const young: string[] = [];
     const unprovable: string[] = [];
+    const wrongStore: string[] = [];
     for (const r of dry.rows) {
+      // OWNER RULING Q22 (2026-10-14): document scans in fssai_attachments are
+      // NEVER auto-deleted; only checklist photographs (fssai_evidence) age out.
+      // fssai-retention.ts already walks fssai_evidence alone — this is the
+      // backstop for the day somebody widens that list: a dry run that names ANY
+      // other store refuses the whole pass, before a single image is touched.
+      if (String(r.store) !== 'fssai_evidence') {
+        wrongStore.push(`${r.store}:${r.id}`);
+        continue;
+      }
       const ms = parseStoredInstant(r.created_at);
       if (!Number.isFinite(ms)) unprovable.push(`${r.store}:${r.id} (created_at "${String(r.created_at)}")`);
       else if (ms > floorMs) young.push(`${r.store}:${r.id} (created ${String(r.created_at)})`);
     }
+    const sweptStores = [...FSSAI_RETENTION_SWEPT_STORES].map(String);
+    if (sweptStores.some((s) => s !== 'fssai_evidence')) {
+      problems.push(`the sweep is configured to walk ${sweptStores.join(', ')}, but the owner ruled (Q22, 2026-10-14) that only checklist photographs (fssai_evidence) may age out — register files are never deleted automatically`);
+    }
+    if (wrongStore.length) problems.push(`${wrongStore.length} candidate(s) are not checklist photographs, and Q22 says those are never auto-deleted: ${wrongStore.slice(0, 5).join(', ')}`);
     if (young.length) problems.push(`${young.length} candidate image(s) are younger than 12 months: ${young.slice(0, 5).join(', ')}`);
     if (unprovable.length) problems.push(`${unprovable.length} candidate image(s) have no provable age: ${unprovable.slice(0, 5).join(', ')}`);
     if (problems.length) {
@@ -437,6 +517,13 @@ export interface FssaiMissedCheckResult {
   missed: number;
   people_told: number;
   items: FssaiMissedCheck[];
+  /**
+   * ONE ENTRY PER PERSON, with the checks their message lists — the exact
+   * grouping the bell used. runFssaiMissedCheckWhatsApp sends from this and
+   * nothing else, so the WhatsApp leg cannot reach a different set of people
+   * than the bell did. Filled whenever something was missed.
+   */
+  people: { email: string; assignment_ids: string[] }[];
   detail: string;
 }
 
@@ -479,12 +566,11 @@ function istDateOfStored(v: unknown): string {
  * Read-only against users/roles; never writes them. Inactive users never hear.
  */
 function missedCheckRecipients(db: Db, a: any): string[] {
-  const norm = (rows: any[]) => [...new Set(rows.map((r) => String(r.email || '').trim().toLowerCase()).filter(Boolean))];
   try {
     const assignee = String(a.assignee_email || '').trim();
     if (assignee) {
       const ok = db.prepare(`SELECT email FROM users WHERE lower(email) = lower(?) AND is_active = 1`).all(assignee) as any[];
-      if (ok.length) return norm(ok);
+      if (ok.length) return normEmails(ok);
     }
     const dept = String(a.department_id || '').trim();
     const roleId = String(a.responsible_role_id || '').trim();
@@ -493,30 +579,30 @@ function missedCheckRecipients(db: Db, a: any): string[] {
         ? db.prepare(`SELECT email FROM users WHERE is_active = 1 AND role_id = ? AND department_id = ?`).all(roleId, dept) as any[]
         : [];
       const rows = inDept.length ? inDept : db.prepare(`SELECT email FROM users WHERE is_active = 1 AND role_id = ?`).all(roleId) as any[];
-      if (rows.length) return norm(rows);
+      if (rows.length) return normEmails(rows);
     }
-    if (dept) {
-      const heads = db.prepare(
-        `SELECT DISTINCT u.email FROM users u LEFT JOIN roles r ON r.id = u.role_id
-          WHERE u.is_active = 1 AND u.department_id = ?
-            AND (u.is_head_chef = 1 OR IFNULL(r.is_head_chef, 0) = 1)`,
-      ).all(dept) as any[];
-      if (heads.length) return norm(heads);
-    }
-    const mgmt = db.prepare(
-      `SELECT DISTINCT u.email FROM users u LEFT JOIN roles r ON r.id = u.role_id
-        WHERE u.is_active = 1
-          AND (lower(IFNULL(u.role,'')) IN ('manager','admin') OR lower(IFNULL(r.base_role,'')) IN ('manager','admin'))`,
-    ).all() as any[];
-    return norm(mgmt);
+    const heads = departmentHeads(db, dept);
+    if (heads.length) return heads;
+    return managementTier(db);
   } catch (e: any) {
     console.error('[fssai-jobs] could not resolve missed-check recipients:', e?.message);
     return [];
   }
 }
 
+/** One missed check in words — the bell and the WhatsApp list say it identically. */
+function fssaiMissedCheckLabel(it: FssaiMissedCheck): string {
+  return [it.template_name, it.target_label, it.shift].filter(Boolean).join(' · ')
+    + (it.period_from !== it.period_to ? ` (due ${it.period_from}–${it.period_to})` : '');
+}
+
 /**
  * TELL PEOPLE ABOUT YESTERDAY'S CHECKS THAT WERE NEVER RECORDED. Once per day.
+ *
+ * THIS IS THE BELL. The WhatsApp leg the owner added on 2026-10-14 is
+ * runFssaiMissedCheckWhatsApp, which the tick calls straight after this with
+ * this result — to the same people, with the same lists (`people`). It is a
+ * separate function only because a send is async and this is not.
  *
  * MISSED means: an active assignment on a PUBLISHED, active template (the runner
  * refuses anything else, so nobody is nagged about a sheet they cannot open),
@@ -544,7 +630,7 @@ export function runFssaiMissedCheckReminders(db: Db, opts: { now?: Date } = {}):
   const today = fssaiToday(now);
   const y = addDaysISO(today, -1);
   const res: FssaiMissedCheckResult = {
-    outcome: 'not_due', business_date: y, scanned: 0, missed: 0, people_told: 0, items: [], detail: '',
+    outcome: 'not_due', business_date: y, scanned: 0, missed: 0, people_told: 0, items: [], people: [], detail: '',
   };
   if (istHourOf(now) < MISSED_EARLIEST_IST_HOUR) {
     res.detail = `Runs from ${MISSED_EARLIEST_IST_HOUR}:00 IST for the previous day.`;
@@ -629,9 +715,10 @@ export function runFssaiMissedCheckReminders(db: Db, opts: { now?: Date } = {}):
       }
     }
     const everyone = [...perPerson.keys()];
-    const label = (it: FssaiMissedCheck) =>
-      [it.template_name, it.target_label, it.shift].filter(Boolean).join(' · ')
-      + (it.period_from !== it.period_to ? ` (due ${it.period_from}–${it.period_to})` : '');
+    res.people = everyone.map((email) => ({
+      email, assignment_ids: (perPerson.get(email) || []).map((it) => it.assignment_id),
+    }));
+    const label = fssaiMissedCheckLabel;
     const title = (n: number) => `${n} food-safety check${n === 1 ? ' was' : 's were'} not recorded on ${y}`;
     const body = (list: FssaiMissedCheck[]) => {
       const shown = list.slice(0, 8).map(label);
@@ -698,6 +785,793 @@ export function runFssaiMissedCheckReminders(db: Db, opts: { now?: Date } = {}):
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
+ * 3b. MISSED CHECKS ON WHATSAPP — owner ruling 2026-10-14
+ * ════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * THE TEMPLATE THE OWNER SUBMITS. The app never creates or submits it — it is
+ * authored in Settings → Integrations → WhatsApp → Templates and approved by
+ * Meta. Until a row of this name is APPROVED, this leg is dormant.
+ *
+ * Suggested body (category UTILITY — our own staff, about our own operation):
+ *
+ *   Food-safety checks not recorded on {{1}}: {{2}} check(s) — {{3}}. Please
+ *   record them late with a reason in F&B Controller, or tell your manager why
+ *   they did not happen.
+ *
+ * It starts and ends with text and no two variables touch — the two rules that
+ * cause most rejections (docs/interakt-templates.md).
+ */
+export const FSSAI_MISSED_WA_TEMPLATE = 'fssai_checks_missed';
+export const FSSAI_MISSED_WA_LANG = 'en';
+/** {{1}}, {{2}}, {{3}} — the positional contract, in WA_EVENT_PARAM_ORDER style. */
+export const FSSAI_MISSED_WA_PARAM_ORDER = ['business_date', 'count', 'checks'] as const;
+
+export type FssaiJobSkipReason = '' | 'no_phone' | 'no_template' | 'no_app_secret' | 'disabled' | 'provider_error';
+
+export interface FssaiMissedWaReadiness {
+  /** May a message be sent right now? */
+  ready: boolean;
+  /** The FIRST blocker, in the ruling's order: template, app secret, then the connection. '' when ready. */
+  skip_reason: FssaiJobSkipReason;
+  template_name: string;
+  template_lang: string;
+  /** whatsapp_templates.meta_status, lower-cased; '' when no row. */
+  template_status: string;
+  template_ok: boolean;
+  app_secret_present: boolean;
+  /** Could the secret's PRESENCE be read? A failed read is never "no secret is set, so carry on". */
+  app_secret_unreadable: boolean;
+  connected: boolean;
+  /** Every blocker, in words, for a screen. */
+  blockers: string[];
+}
+
+/**
+ * IS THE WHATSAPP LEG ALLOWED TO SEND? Three facts, all required, read fresh:
+ *
+ *  1. THE TEMPLATE IS APPROVED — a whatsapp_templates row of this name whose
+ *     meta_status is 'approved', AND templateSendability agrees (so a paused,
+ *     rejected or wrong-language row still fails). Approval is read off the ROW
+ *     because templateSendability alone says ok for a name nobody has heard of
+ *     (its "unmanaged local template" branch) — the trap boh-notify.ts measured.
+ *  2. THE META APP SECRET EXISTS — env or settings, via the webhook's own lookup
+ *     (webhookAppSecretLookup). Only its PRESENCE is read; the value never
+ *     leaves that function's caller here, never reaches a log, a row or a reply.
+ *     A secret whose presence could not be read counts as absent.
+ *  3. WHATSAPP IS CONNECTED — isWaConfigured(), the send path's own test.
+ *
+ * Pure reads. Writes nothing, sends nothing, configures nothing.
+ */
+export function fssaiMissedCheckWaReadiness(db: Db): FssaiMissedWaReadiness {
+  const out: FssaiMissedWaReadiness = {
+    ready: false, skip_reason: '', template_name: FSSAI_MISSED_WA_TEMPLATE, template_lang: FSSAI_MISSED_WA_LANG,
+    template_status: '', template_ok: false, app_secret_present: false, app_secret_unreadable: false,
+    connected: false, blockers: [],
+  };
+  // 1. the template
+  try {
+    let row: any;
+    try { row = db.prepare(`SELECT name, meta_status FROM whatsapp_templates WHERE name = ?`).get(FSSAI_MISSED_WA_TEMPLATE); }
+    catch { row = undefined; }
+    out.template_status = String(row?.meta_status || '').trim().toLowerCase();
+    const approved = !!row && out.template_status === 'approved';
+    const s = approved ? templateSendability(db, FSSAI_MISSED_WA_TEMPLATE, FSSAI_MISSED_WA_LANG) : null;
+    out.template_ok = approved && !!s?.ok;
+    if (!out.template_ok) {
+      out.blockers.push(
+        !row
+          ? `No WhatsApp template named "${FSSAI_MISSED_WA_TEMPLATE}" exists yet. Author and submit it from Settings → Integrations → WhatsApp → Templates; until Meta approves it, missed checks go to the bell only.`
+          : !approved
+            ? `The WhatsApp template "${FSSAI_MISSED_WA_TEMPLATE}" is ${out.template_status ? `"${out.template_status}" at Meta` : 'not yet submitted to Meta'}, not approved. Missed checks go to the bell only until it is.`
+            : `The WhatsApp template "${FSSAI_MISSED_WA_TEMPLATE}" is approved but cannot be sent: ${String((s as any)?.advisory || s?.reason || 'the template lifecycle refused it')}`,
+      );
+    }
+  } catch {
+    out.template_ok = false;
+    out.blockers.push('The WhatsApp template list could not be read, so no template can be proved approved. Missed checks go to the bell only.');
+  }
+  // 2. the app secret — presence only
+  try {
+    const sec = webhookAppSecretLookup(db);
+    out.app_secret_unreadable = !!sec.unreadable;
+    out.app_secret_present = !sec.unreadable && !!String(sec.secret || '').trim();
+  } catch {
+    out.app_secret_unreadable = true;
+    out.app_secret_present = false;
+  }
+  if (!out.app_secret_present) {
+    out.blockers.push(out.app_secret_unreadable
+      ? 'Whether the Meta app secret is set could not be read, so WhatsApp stays off for missed checks (bell only).'
+      : 'The Meta app secret is not set on this install, so WhatsApp stays off for missed checks (bell only). The owner adds it; the app never does.');
+  }
+  // 3. the connection
+  try { out.connected = isWaConfigured(); } catch { out.connected = false; }
+  if (!out.connected) {
+    out.blockers.push('WhatsApp is not connected (Settings → Integrations → WhatsApp has no working phone number id and token), so nothing can be sent.');
+  }
+  out.ready = out.template_ok && out.app_secret_present && out.connected;
+  out.skip_reason = out.ready ? ''
+    : !out.template_ok ? 'no_template'
+      : !out.app_secret_present ? 'no_app_secret'
+        : 'disabled';
+  return out;
+}
+
+/** Where a number for this login would come from, in the contract's words. */
+type FssaiPhoneSource = '' | 'users.wa_mobile' | 'hr_employees.phone10';
+
+/**
+ * THE NUMBER THE APP ALREADY HOLDS FOR ONE LOGIN — never a number from a
+ * request, never a guess. users.wa_mobile first, then the HR record linked to
+ * the login (numberForUser in wa-report-recipients.ts — the reports rail's own
+ * resolver, so the two rails cannot disagree about a person's number).
+ * A value that is not a plausible international mobile (11–15 digits once
+ * normalised) is reported as NO number, with what was on file in `bad`.
+ */
+function fssaiPhoneForEmail(db: Db, email: string): { number: string; source: FssaiPhoneSource; bad: string } {
+  let u: any;
+  try {
+    u = db.prepare(
+      `SELECT id, name, email, role, is_head_chef, department_id, COALESCE(wa_mobile, '') AS wa_mobile
+         FROM users WHERE lower(email) = lower(?) AND is_active = 1 LIMIT 1`,
+    ).get(email);
+  } catch {
+    try {
+      u = db.prepare(
+        `SELECT id, name, email, role, is_head_chef, department_id, '' AS wa_mobile
+           FROM users WHERE lower(email) = lower(?) AND is_active = 1 LIMIT 1`,
+      ).get(email);
+    } catch { u = undefined; }
+  }
+  if (!u) return { number: '', source: '', bad: '' };
+  const r = numberForUser(db, u);
+  const source: FssaiPhoneSource = r.source === 'wa_mobile' ? 'users.wa_mobile' : r.source === 'hr_phone' ? 'hr_employees.phone10' : '';
+  if (!r.number) return { number: '', source: '', bad: '' };
+  if (!/^\d{11,15}$/.test(r.number)) return { number: '', source, bad: r.number };
+  return { number: r.number, source, bad: '' };
+}
+
+/** '…1234' — a number in a log line or a reply is masked; the notices table holds the real one. */
+function maskPhone(n: string): string {
+  return n ? `…${n.slice(-4)}` : '';
+}
+
+/** Meta refuses a body parameter with a newline, a tab or a run of more than four spaces. */
+function waParam(v: unknown, max = 700): string {
+  const s = String(v ?? '').replace(/\s+/g, ' ').trim();
+  return s.length > max ? `${s.slice(0, max - 1).trimEnd()}…` : s;
+}
+
+function humanDate(iso: string): string {
+  if (!isISODate(iso)) return iso;
+  const [y, m, d] = iso.split('-').map(Number);
+  const mon = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][m - 1];
+  return `${d} ${mon} ${y}`;
+}
+
+/** The three body parameters for one person, in FSSAI_MISSED_WA_PARAM_ORDER. */
+export function fssaiMissedCheckWaParams(businessDate: string, checks: FssaiMissedCheck[]): string[] {
+  const shown = checks.slice(0, 8).map(fssaiMissedCheckLabel);
+  const more = checks.length > shown.length ? ` … and ${checks.length - shown.length} more` : '';
+  return [
+    waParam(humanDate(businessDate), 40),
+    String(checks.length),
+    waParam(`${shown.join('; ')}${more}`) || '-',
+  ];
+}
+
+export interface FssaiMissedWaRow {
+  email: string;
+  status: 'sent' | 'skipped' | 'dormant' | 'failed' | 'already_claimed';
+  skip_reason: FssaiJobSkipReason;
+  phone_source: FssaiPhoneSource;
+  /** Masked. The full number is in fssai_job_notices.recipient_phone. */
+  phone: string;
+  notice_id: string;
+  detail: string;
+}
+
+export interface FssaiMissedWaResult {
+  outcome: 'not_run' | 'dormant' | 'sent' | 'partial' | 'none_sent' | 'failed';
+  business_date: string;
+  readiness: Pick<FssaiMissedWaReadiness, 'ready' | 'skip_reason' | 'template_name' | 'template_status' | 'app_secret_present' | 'connected' | 'blockers'>;
+  recipients: number;
+  sent: number;
+  failed: number;
+  dormant: number;
+  no_phone: number;
+  already_claimed: number;
+  rows: FssaiMissedWaRow[];
+  detail: string;
+}
+
+/**
+ * THE WHATSAPP LEG OF THE MISSED-CHECK REMINDER. Call it with the result of
+ * runFssaiMissedCheckReminders; it acts ONLY when that pass actually rang the
+ * bell (`reminded`) — so it reaches exactly the bell's people, once.
+ *
+ * ONE fssai_job_notices ROW PER PERSON, for every person, whatever happens:
+ *   dormant  the template is not approved / the app secret is missing / not
+ *            connected (skip_reason says which) — bell only, by ruling;
+ *   skipped  ready, but the app holds no usable number for them ('no_phone');
+ *   sent     the approved template was accepted by the provider;
+ *   failed   the provider refused or the network failed ('provider_error').
+ * The row IS the claim (UNIQUE job, subject, channel, recipient — INSERT OR
+ * IGNORE, changes === 1 means it is ours), so a second worker or a second run
+ * of the same day finds it and sends nothing. A send is claimed BEFORE it is
+ * made, as 'failed' with "no answer recorded", and corrected after: a crash
+ * between the two leaves an honest row, never a silent double send.
+ *
+ * TEMPLATE ONLY. sendWhatsAppTemplate is the only send this calls. There is no
+ * free-form fallback — it would not deliver at 06:00 anyway, and the owner
+ * ruled it out.
+ */
+export async function runFssaiMissedCheckWhatsApp(
+  db: Db,
+  res: FssaiMissedCheckResult,
+): Promise<FssaiMissedWaResult> {
+  const out: FssaiMissedWaResult = {
+    outcome: 'not_run', business_date: res.business_date,
+    readiness: {
+      ready: false, skip_reason: '', template_name: FSSAI_MISSED_WA_TEMPLATE, template_status: '',
+      app_secret_present: false, connected: false, blockers: [],
+    },
+    recipients: 0, sent: 0, failed: 0, dormant: 0, no_phone: 0, already_claimed: 0, rows: [], detail: '',
+  };
+  if (res.outcome !== 'reminded' || !res.people.length) {
+    out.detail = `Nothing to send: the bell pass was "${res.outcome}".`;
+    return out;
+  }
+  if (!tableExists(db, 'fssai_job_notices')) {
+    out.outcome = 'failed';
+    out.detail = 'fssai_job_notices is not in this database, so a WhatsApp send could not be claimed or recorded. Nothing was sent.';
+    console.error(`[fssai-jobs] missed-checks whatsapp: ${out.detail}`);
+    return out;
+  }
+
+  const ready = fssaiMissedCheckWaReadiness(db);
+  out.readiness = {
+    ready: ready.ready, skip_reason: ready.skip_reason, template_name: ready.template_name,
+    template_status: ready.template_status, app_secret_present: ready.app_secret_present,
+    connected: ready.connected, blockers: ready.blockers,
+  };
+  const byId = new Map(res.items.map((it) => [it.assignment_id, it]));
+  /** The outlet of the first check on a person's list — the notice row's outlet. */
+  const outletOf = (ids: string[]): string => {
+    if (!ids.length) return '';
+    try {
+      const r = db.prepare(`SELECT outlet_id FROM fssai_assignments WHERE id = ?`).get(ids[0]) as any;
+      return String(r?.outlet_id || '');
+    } catch { return ''; }
+  };
+
+  const claim = db.prepare(
+    `INSERT OR IGNORE INTO fssai_job_notices
+       (id, job_key, subject_key, channel, recipient_email, recipient_phone, phone_source,
+        template_name, template_lang, status, skip_reason, detail, outlet_id)
+     VALUES (?, 'missed_checks', ?, 'whatsapp', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  );
+
+  for (const p of res.people) {
+    out.recipients += 1;
+    const email = String(p.email || '').trim().toLowerCase();
+    const checks = p.assignment_ids.map((id) => byId.get(id)).filter(Boolean) as FssaiMissedCheck[];
+    const phone = fssaiPhoneForEmail(db, email);
+    const id = generateId();
+    const outlet = outletOf(p.assignment_ids);
+
+    let status: FssaiMissedWaRow['status'];
+    let skip: FssaiJobSkipReason;
+    let detail: string;
+    let usePhone = '';
+    if (!ready.ready) {
+      status = 'dormant';
+      skip = ready.skip_reason;
+      detail = `Bell only — ${ready.blockers[0] || 'WhatsApp is not ready'}`
+        + (phone.number ? ` (a number is on file from ${phone.source})` : ' (and no WhatsApp number is on file for this person)');
+    } else if (!phone.number) {
+      status = 'skipped';
+      skip = 'no_phone';
+      detail = phone.bad
+        ? `The number on file (${phone.source}) is not a usable WhatsApp number (${maskPhone(phone.bad)}). Correct it on the user record.`
+        : 'No WhatsApp number is on file for this person: add it on their user record (WhatsApp mobile), or link them to an HR record with a phone number.';
+    } else {
+      // Claimed BEFORE the send, as an honest failure; corrected after.
+      status = 'failed';
+      skip = 'provider_error';
+      detail = 'Send started; no answer from the provider was recorded.';
+      usePhone = phone.number;
+    }
+
+    let won = false;
+    try {
+      // template_name is "the approved template USED" — set only when a send is attempted.
+      const attempting = status === 'failed';
+      won = claim.run(
+        id, res.business_date, email, usePhone, phone.source,
+        attempting ? FSSAI_MISSED_WA_TEMPLATE : '', attempting ? FSSAI_MISSED_WA_LANG : '',
+        status, skip, detail.slice(0, 1000), outlet,
+      ).changes === 1;
+    } catch (e: any) {
+      out.failed += 1;
+      out.rows.push({ email, status: 'failed', skip_reason: 'provider_error', phone_source: phone.source, phone: '', notice_id: '', detail: `Could not be claimed: ${e?.message || e}` });
+      console.error('[fssai-jobs] missed-checks whatsapp claim failed:', e?.message);
+      continue;
+    }
+    if (!won) {
+      out.already_claimed += 1;
+      out.rows.push({ email, status: 'already_claimed', skip_reason: '', phone_source: phone.source, phone: '', notice_id: '', detail: 'Already handled for this day by an earlier pass or another worker.' });
+      continue;
+    }
+
+    if (status === 'dormant') {
+      out.dormant += 1;
+      out.rows.push({ email, status, skip_reason: skip, phone_source: phone.source, phone: '', notice_id: id, detail });
+      continue;
+    }
+    if (status === 'skipped') {
+      out.no_phone += 1;
+      out.rows.push({ email, status, skip_reason: skip, phone_source: phone.source, phone: '', notice_id: id, detail });
+      continue;
+    }
+
+    // THE SEND — an approved template, positional params, nothing else.
+    let sendOk = false;
+    let msgId = '';
+    let why = '';
+    try {
+      const r = await sendWhatsAppTemplate(
+        usePhone, FSSAI_MISSED_WA_TEMPLATE, FSSAI_MISSED_WA_LANG,
+        fssaiMissedCheckWaParams(res.business_date, checks),
+      );
+      sendOk = !!r.ok;
+      msgId = r.ok ? String(r.message_id || '') : '';
+      why = r.ok ? '' : `${r.reason}${r.detail ? `: ${r.detail}` : ''}`;
+    } catch (e: any) {
+      why = `send_failed: ${e?.message || e}`;
+    }
+    try {
+      db.prepare(
+        `UPDATE fssai_job_notices
+            SET status = ?, skip_reason = ?, provider_message_id = ?, detail = ?, updated_at = datetime('now')
+          WHERE id = ?`,
+      ).run(
+        sendOk ? 'sent' : 'failed', sendOk ? '' : 'provider_error', msgId,
+        sendOk ? `Sent the approved template "${FSSAI_MISSED_WA_TEMPLATE}" listing ${checks.length} check(s).` : `The provider refused it — ${why}`.slice(0, 1000),
+        id,
+      );
+    } catch (e: any) {
+      console.error('[fssai-jobs] missed-checks whatsapp: the send outcome could not be recorded:', e?.message);
+    }
+    if (sendOk) out.sent += 1; else out.failed += 1;
+    out.rows.push({
+      email, status: sendOk ? 'sent' : 'failed', skip_reason: sendOk ? '' : 'provider_error',
+      phone_source: phone.source, phone: maskPhone(usePhone), notice_id: id, detail: sendOk ? '' : why,
+    });
+  }
+
+  out.outcome = !ready.ready ? 'dormant'
+    : out.sent && !out.failed && !out.no_phone ? 'sent'
+      : out.sent ? 'partial'
+        : out.failed ? 'failed'
+          : 'none_sent';
+  out.detail = !ready.ready
+    ? `Dormant (bell only) for ${out.dormant} person(s): ${ready.blockers[0] || 'WhatsApp is not ready'}`
+    : `${out.sent} sent, ${out.failed} failed, ${out.no_phone} with no number on file`
+      + (out.already_claimed ? `, ${out.already_claimed} already handled` : '') + '.';
+  return out;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * 4. AN ABANDONED OR OVERDUE COOLING BATCH — raise it, once
+ * ════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * HOW LONG AFTER THE TIME LIMIT BEFORE A BATCH IS CALLED ABANDONED: 30 minutes.
+ *
+ * A reading at the target taken at minute 240 is often typed in at 245. Raising
+ * the action at minute 241 would accuse a batch that finished on time of being
+ * abandoned. Thirty minutes is long enough for a late entry and short enough
+ * that the food is still in front of somebody. ASSUMPTION, REVERSIBLE: one line.
+ * A reading at the target typed AFTER the action was raised does not withdraw
+ * it — a manager closes it with that reading as the note.
+ */
+export const FSSAI_COOLING_OVERDUE_GRACE_MINUTES = 30;
+
+/** Batches whose readings fall on today or the two days before are looked at. */
+export const FSSAI_COOLING_OVERDUE_LOOKBACK_DAYS = 2;
+
+/** Severity of the action an abandoned batch raises — 'urgent' = due the same day. */
+export const FSSAI_COOLING_OVERDUE_SEVERITY = 'urgent';
+
+export interface FssaiCoolingOverdueItem {
+  curve_key: string;
+  label: string;
+  department_id: string;
+  outlet_id: string;
+  start: { id: string; business_date: string; reading_at: string; value: number | null; elapsed: number | null };
+  last: { id: string; business_date: string; reading_at: string; value: number | null; elapsed: number | null };
+  goal: number;
+  max_minutes: number;
+  uom: string;
+  elapsed_now: number;
+  /** IST 'YYYY-MM-DD HH:MM' at which the time limit ran out. */
+  window_ended_at: string;
+  /** Actions already raised against single readings on this batch (behind schedule). */
+  earlier_actions: string[];
+  ca_id: string;
+  ca_number: string;
+  recipients: string[];
+  people_told: number;
+  /** true = raised on THIS pass; false = an earlier pass (or another worker) already had. */
+  raised: boolean;
+}
+
+export interface FssaiCoolingOverdueResult {
+  outcome: 'none_overdue' | 'raised' | 'already_raised' | 'not_ready' | 'failed';
+  /** IST instant this pass judged "now" by. */
+  now_ist: string;
+  scanned_curves: number;
+  in_progress: number;
+  reached: number;
+  /** No time limit or no target frozen on the first reading — nothing can be overdue. */
+  unjudged: number;
+  /** A reading taken AFTER the limit was filed and failed — that reading already raised its own action. */
+  covered_by_reading: number;
+  overdue: number;
+  raised: number;
+  already_raised: number;
+  people_told: number;
+  bell: 'on' | 'off';
+  items: FssaiCoolingOverdueItem[];
+  errors: string[];
+  detail: string;
+}
+
+/** IST 'YYYY-MM-DD HH:MM' for a minute on fssaiClockMinute's clock. */
+function clockMinuteWords(minute: number): string {
+  return new Date(minute * 60_000).toISOString().slice(0, 16).replace('T', ' ');
+}
+
+/**
+ * RAISE EVERY COOLING BATCH WHOSE TIME RAN OUT WITHOUT A READING AT THE TARGET.
+ *
+ * Reads the batches exactly as the temperature screen does — fssaiCurveMembers
+ * (the one membership rule), fssaiCurveReached (the one "got there" rule), the
+ * FROZEN goal and time limit on the batch's first reading, minutes counted on
+ * fssaiClockMinute's clock — so this job and the cooling sheet cannot disagree
+ * about which batch is overdue.
+ *
+ * A BATCH IS RAISED WHEN ALL OF:
+ *   · its first live reading carries a time limit and a target (otherwise it
+ *     was never judged on the clock — counted as `unjudged`, not raised);
+ *   · no live reading on it is at or below the target;
+ *   · the time limit plus FSSAI_COOLING_OVERDUE_GRACE_MINUTES has passed;
+ *   · no reading taken AFTER the limit failed — the temperature route already
+ *     judged that one a breach and raised its own action, and a second one for
+ *     the same fact would double-nag (`covered_by_reading`).
+ *
+ * WHAT IT WRITES, IN ONE TRANSACTION PER BATCH:
+ *   1. THE CLAIM — fssai_job_notices (cooling_overdue, curve key, 'ca', '').
+ *      INSERT OR IGNORE; changes === 1 means this pass owns the batch. Never
+ *      raised twice, whatever ticks, workers or restarts follow.
+ *   2. ONE corrective action (source_kind 'temperature', response_id = the
+ *      curve key, run_id NULL, severity FSSAI_COOLING_OVERDUE_SEVERITY), its
+ *      number from the module's allocator, and an fssai_audit_log 'create' row
+ *      (THROWING — no action without its trail).
+ *   3. THE BELL — task_notifications to the people who recorded the batch and
+ *      their department's head (management when the department has none), each
+ *      claimed on its own fssai_job_notices 'bell' row. With chasing switched
+ *      off on the Chasing panel the action is still raised (it is a record, not
+ *      a message) and each person's bell row says 'skipped' / 'disabled'.
+ * If any of it throws, all of it rolls back and the next tick tries again.
+ * No filed reading is changed.
+ */
+export function runFssaiCoolingOverdueJob(db: Db, opts: { now?: Date } = {}): FssaiCoolingOverdueResult {
+  const now = opts.now ?? new Date();
+  const today = fssaiToday(now);
+  const hhmm = istHHMMOf(now);
+  const res: FssaiCoolingOverdueResult = {
+    outcome: 'none_overdue', now_ist: `${today} ${hhmm}`, scanned_curves: 0, in_progress: 0, reached: 0,
+    unjudged: 0, covered_by_reading: 0, overdue: 0, raised: 0, already_raised: 0, people_told: 0,
+    bell: 'on', items: [], errors: [], detail: '',
+  };
+  const missing = ['fssai_temperature_logs', 'fssai_corrective_actions', 'fssai_job_notices', 'fssai_audit_log']
+    .filter((t) => !tableExists(db, t));
+  if (missing.length) {
+    res.outcome = 'not_ready';
+    res.detail = `Not in this database yet: ${missing.join(', ')}.`;
+    return res;
+  }
+  const nowMinute = fssaiClockMinute(today, hhmm);
+  if (nowMinute === null) {
+    res.outcome = 'failed';
+    res.detail = 'The clock did not give a usable time.';
+    return res;
+  }
+  let bellOn = true;
+  try { bellOn = readFssaiEscalationRules(db).enabled; } catch { bellOn = true; }
+  res.bell = bellOn ? 'on' : 'off';
+
+  try {
+    const keys = db.prepare(
+      `SELECT DISTINCT CASE WHEN batch_id <> '' THEN batch_id ELSE id END AS k
+         FROM fssai_temperature_logs
+        WHERE log_kind = 'cooling' AND status <> 'void'
+          AND business_date >= ? AND business_date <= ?`,
+    ).all(addDaysISO(today, -FSSAI_COOLING_OVERDUE_LOOKBACK_DAYS), today) as any[];
+
+    const pushes: { email: string; title: string; body: string }[] = [];
+    for (const { k } of keys) {
+      const key = String(k || '');
+      if (!key) continue;
+      const members = fssaiCurveMembers(db, 'cooling', key);
+      if (!members.length) continue;
+      res.scanned_curves += 1;
+      const start = members[0];
+      const limit = start.max_minutes;
+      const goal = start.goal;
+      if (start.minute === null || limit === null || !(limit > 0) || goal === null) { res.unjudged += 1; continue; }
+      if (fssaiCurveReached(members, 'cooling')) { res.reached += 1; continue; }
+      const elapsedNow = (start.elapsed ?? 0) + (nowMinute - start.minute);
+      if (!(elapsedNow > limit + FSSAI_COOLING_OVERDUE_GRACE_MINUTES)) { res.in_progress += 1; continue; }
+      if (members.some((m) => m.is_fail === 1 && m.elapsed !== null && m.elapsed > (m.max_minutes ?? limit))) {
+        res.covered_by_reading += 1;
+        continue;
+      }
+      res.overdue += 1;
+
+      const last = members[members.length - 1];
+      const ids = members.map((m) => m.id);
+      const ph = ids.map(() => '?').join(',');
+      const first = db.prepare(
+        `SELECT item_label, equipment_label, area_label, department_id, equipment_id, outlet_id
+           FROM fssai_temperature_logs WHERE id = ?`,
+      ).get(start.id) as any || {};
+      const dept = String(first.department_id || '');
+      const label = String(first.item_label || '') || String(first.equipment_label || '') || String(first.area_label || '') || 'an unnamed batch';
+      const where = [first.equipment_label, first.area_label].map((v: any) => String(v || '')).filter(Boolean).filter((v) => v !== label).join(' · ');
+      const earlier = (db.prepare(
+        `SELECT DISTINCT ca.ca_number FROM fssai_corrective_actions ca
+          WHERE ca.id IN (SELECT ca_id FROM fssai_temperature_logs WHERE id IN (${ph}) AND ca_id <> '')`,
+      ).all(...ids) as any[]).map((r) => String(r.ca_number || '')).filter(Boolean);
+      const recorders = normEmails(db.prepare(
+        `SELECT DISTINCT u.email FROM fssai_temperature_logs t
+           JOIN users u ON lower(u.email) = lower(trim(t.recorded_by)) AND u.is_active = 1
+          WHERE t.id IN (${ph})`,
+      ).all(...ids) as any[]);
+      const heads = departmentHeads(db, dept);
+      const recipients = [...new Set([...recorders, ...heads, ...(heads.length ? [] : managementTier(db))])];
+
+      const u = start.uom === 'C' || start.uom === 'F' ? ` °${start.uom}` : ` ${start.uom}`;
+      const endMinute = start.minute + (limit - (start.elapsed ?? 0));
+      const item: FssaiCoolingOverdueItem = {
+        curve_key: key, label, department_id: dept, outlet_id: String(first.outlet_id || ''),
+        start: { id: start.id, business_date: start.business_date, reading_at: start.reading_at, value: start.value, elapsed: start.elapsed },
+        last: { id: last.id, business_date: last.business_date, reading_at: last.reading_at, value: last.value, elapsed: last.elapsed },
+        goal, max_minutes: limit, uom: start.uom, elapsed_now: elapsedNow,
+        window_ended_at: clockMinuteWords(endMinute), earlier_actions: earlier,
+        ca_id: '', ca_number: '', recipients, people_told: 0, raised: false,
+      };
+      const title = `Cooling not finished in time — ${label}`.slice(0, 300);
+      const description = [
+        `This cooling batch passed its time limit without a reading at the target.`,
+        `It started at ${start.value ?? '?'}${u} at ${start.reading_at} on ${start.business_date}${where ? ` (${where})` : ''}; the rule allows ${limit} minutes to reach ${goal}${u}, so its time ran out at ${item.window_ended_at.slice(11)} on ${item.window_ended_at.slice(0, 10)}.`,
+        members.length > 1
+          ? `The last reading on it was ${last.value ?? '?'}${u} at ${last.reading_at} (${last.elapsed ?? '?'} minutes in), ${members.length} reading(s) in all.`
+          : 'Only the first reading was ever taken.',
+        `No reading at or below ${goal}${u} has been recorded, ${elapsedNow} minutes after it began.`,
+        earlier.length ? `Already raised against single readings on this batch: ${earlier.join(', ')}.` : '',
+        `Decide today what happened to this food and record it: if it was discarded, say so; if it is still held, it is not safe to use until a reading at the target is on file.`,
+      ].filter(Boolean).join(' ');
+      const bellTitle = `Cooling not finished in time — ${label}`;
+
+      const raise = db.transaction(() => {
+        const claimId = generateId();
+        const claimed = db.prepare(
+          `INSERT OR IGNORE INTO fssai_job_notices
+             (id, job_key, subject_key, channel, recipient_email, status, ref_table, detail, outlet_id)
+           VALUES (?, 'cooling_overdue', ?, 'ca', '', 'raised', 'fssai_corrective_actions', ?, ?)`,
+        ).run(claimId, key, `Raised ${elapsedNow} minutes into a ${limit}-minute window with no reading at ${goal}${u}.`, item.outlet_id);
+        if (claimed.changes !== 1) return null;
+
+        const caId = generateId();
+        const caNumber = nextFssaiCaNumber(db, today);
+        const due = fssaiCaDueDate(FSSAI_COOLING_OVERDUE_SEVERITY, today);
+        db.prepare(
+          `INSERT INTO fssai_corrective_actions
+             (id, ca_number, source_kind, run_id, response_id, equipment_id, department_id,
+              title, description, severity, status, owner_email, due_date, created_by, outlet_id)
+           VALUES (?, ?, 'temperature', NULL, ?, ?, ?, ?, ?, ?, 'open', '', ?, 'system', ?)`,
+        ).run(caId, caNumber, key, String(first.equipment_id || ''), dept, title, description,
+          FSSAI_COOLING_OVERDUE_SEVERITY, due, item.outlet_id);
+        db.prepare(`UPDATE fssai_job_notices SET ref_id = ?, updated_at = datetime('now') WHERE id = ?`).run(caId, claimId);
+        fssaiAudit(db, {
+          entity_table: 'fssai_corrective_actions', entity_id: caId, action: 'create',
+          after: {
+            ca_number: caNumber, source_kind: 'temperature', source_table: 'fssai_temperature_logs',
+            curve_key: key, start_reading_id: start.id, last_reading_id: last.id,
+            severity: FSSAI_COOLING_OVERDUE_SEVERITY, status: 'open', title,
+            goal, max_minutes: limit, elapsed_now: elapsedNow, window_ended_at: item.window_ended_at,
+          },
+          reason: `Raised automatically: this cooling batch passed its ${limit}-minute limit (plus ${FSSAI_COOLING_OVERDUE_GRACE_MINUTES} minutes' grace) without a reading at ${goal}${u}.`,
+          actor: { email: 'system', name: 'Cooling overdue check' },
+          outlet_id: item.outlet_id,
+        });
+
+        let told = 0;
+        const bellClaim = db.prepare(
+          `INSERT OR IGNORE INTO fssai_job_notices
+             (id, job_key, subject_key, channel, recipient_email, status, skip_reason, ref_table, ref_id, detail, outlet_id)
+           VALUES (?, 'cooling_overdue', ?, 'bell', ?, ?, ?, 'fssai_corrective_actions', ?, ?, ?)`,
+        );
+        const bell = db.prepare(
+          `INSERT INTO task_notifications (id, recipient_email, kind, title, body, task_id, href)
+           VALUES (?, ?, 'fssai_cooling_overdue', ?, ?, '', '/fssai/corrective-actions')`,
+        );
+        const body = `${caNumber}: ${description}`;
+        for (const email of recipients) {
+          const c = bellClaim.run(
+            generateId(), key, email, bellOn ? 'sent' : 'skipped', bellOn ? '' : 'disabled', caId,
+            bellOn ? '' : 'Chasing is switched off on the Chasing panel; the action was raised, nobody was rung.',
+            item.outlet_id,
+          );
+          if (c.changes !== 1 || !bellOn) continue;
+          bell.run(generateId(), email, bellTitle, body);
+          told += 1;
+          pushes.push({ email, title: bellTitle, body });
+        }
+        return { caId, caNumber, told };
+      });
+
+      try {
+        const r = raise();
+        if (!r) {
+          res.already_raised += 1;
+          const prior = db.prepare(
+            `SELECT n.ref_id, IFNULL(ca.ca_number, '') AS ca_number FROM fssai_job_notices n
+               LEFT JOIN fssai_corrective_actions ca ON ca.id = n.ref_id
+              WHERE n.job_key = 'cooling_overdue' AND n.subject_key = ? AND n.channel = 'ca' AND n.recipient_email = ''`,
+          ).get(key) as any;
+          item.ca_id = String(prior?.ref_id || '');
+          item.ca_number = String(prior?.ca_number || '');
+        } else {
+          res.raised += 1;
+          res.people_told += r.told;
+          item.ca_id = r.caId;
+          item.ca_number = r.caNumber;
+          item.people_told = r.told;
+          item.raised = true;
+        }
+      } catch (e: any) {
+        res.errors.push(`${key}: ${e?.message || e}`);
+        console.error(`[fssai-jobs] cooling overdue: batch ${key} could not be raised (rolled back, retried next tick):`, e?.message);
+      }
+      res.items.push(item);
+    }
+
+    // Push AFTER every commit, fire-and-forget: a push failure can never reach the tick.
+    for (const p of pushes) {
+      Promise.resolve()
+        .then(() => sendPushToUser(db, p.email, { title: p.title, body: p.body, url: '/fssai/corrective-actions' }))
+        .catch(() => { /* never */ });
+    }
+  } catch (e: any) {
+    res.outcome = 'failed';
+    res.errors.push(String(e?.message || e));
+    res.detail = `The cooling overdue check failed: ${e?.message || e}`;
+    console.error(`[fssai-jobs] ${res.detail}`);
+    return res;
+  }
+
+  res.outcome = res.raised ? 'raised'
+    : res.errors.length ? 'failed'
+      : res.already_raised ? 'already_raised'
+        : 'none_overdue';
+  res.detail = res.raised
+    ? `${res.raised} cooling batch(es) raised as corrective actions; ${res.people_told} person(s) told.`
+    : res.errors.length ? `${res.errors.length} batch(es) could not be raised: ${res.errors.slice(0, 3).join('; ')}`
+      : `${res.scanned_curves} batch(es) looked at; none newly overdue.`;
+  return res;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * 5. THE OWNER'S RULINGS THAT ARE ABOUT DATA — applied wherever the app runs
+ * ════════════════════════════════════════════════════════════════════════ */
+
+/** Owner ruling Q19 (2026-10-14): "delete the leftover test template". */
+export const FSSAI_Q19_TEMPLATE_CODE = 'ZZ-P2B-COLDROOM';
+
+export interface FssaiRulingsResult {
+  q19: {
+    outcome: 'absent' | 'removed' | 'refused' | 'failed';
+    template_id: string;
+    detail: string;
+  };
+}
+
+const KEY_Q19_NOTE = 'fssai_job_ruling_q19_note';
+
+/**
+ * APPLY THE OWNER'S DATA RULINGS. Safe on every tick: when there is nothing to
+ * do it is one indexed SELECT.
+ *
+ * Q19 — THE LEFTOVER TEST CHECKLIST. ZZ-P2B-COLDROOM ("Cold room temperature —
+ * closing round") was left behind by a build lane: a draft with no questions.
+ * Nothing in this codebase seeds it (no pack, no boot step, no script names
+ * it); it exists only in a database a lane once wrote it into. The owner ruled
+ * it deleted, so on any database this app runs on it is deleted —
+ *   ONLY while it is still exactly that: status 'draft', and NO row anywhere
+ *   that points at it (every table whose foreign key references fssai_templates
+ *   is counted, the CASCADE ones too, so nothing is ever removed silently along
+ *   with it). A checklist somebody went on to use is not a leftover: it is
+ *   REFUSED and said once in the server log, never deleted.
+ *   In one transaction: the fssai_audit_log row (THROWING — no delete without
+ *   its trail, carrying the whole row as it was) and then the DELETE, which
+ *   must remove exactly one row or the whole thing rolls back.
+ * A template is configuration, not evidence; the trail is the audit row.
+ */
+export function applyFssaiOwnerRulings(db: Db): FssaiRulingsResult {
+  const out: FssaiRulingsResult = { q19: { outcome: 'absent', template_id: '', detail: '' } };
+  try {
+    if (!tableExists(db, 'fssai_templates')) return out;
+    const row = db.prepare(`SELECT * FROM fssai_templates WHERE code = ?`).get(FSSAI_Q19_TEMPLATE_CODE) as any;
+    if (!row) return out;
+    out.q19.template_id = String(row.id);
+
+    const refs: Record<string, number> = {};
+    const tables = db.prepare(`SELECT name FROM sqlite_master WHERE type = 'table'`).all() as any[];
+    for (const t of tables) {
+      const name = String(t.name);
+      if (!/^[A-Za-z0-9_]+$/.test(name)) continue;
+      let fks: any[] = [];
+      try { fks = db.prepare(`PRAGMA foreign_key_list(${name})`).all() as any[]; } catch { continue; }
+      for (const fk of fks) {
+        if (String(fk.table) !== 'fssai_templates') continue;
+        const col = String(fk.from);
+        if (!/^[A-Za-z0-9_]+$/.test(col)) continue;
+        const n = Number((db.prepare(`SELECT COUNT(*) AS n FROM ${name} WHERE ${col} = ?`).get(row.id) as any)?.n) || 0;
+        if (n) refs[`${name}.${col}`] = n;
+      }
+    }
+    const used = Object.entries(refs).map(([k, n]) => `${n} in ${k}`);
+    if (String(row.status) !== 'draft' || used.length) {
+      out.q19.outcome = 'refused';
+      out.q19.detail = `"${FSSAI_Q19_TEMPLATE_CODE}" was NOT deleted: it is ${String(row.status) !== 'draft' ? `"${row.status}", not the draft it was` : 'still a draft'}${used.length ? `, and it is in use (${used.join(', ')})` : ''}. A checklist somebody used is archived, never deleted — this needs the owner.`;
+      if (getSetting(db, KEY_Q19_NOTE) !== out.q19.detail) {
+        setSetting(db, KEY_Q19_NOTE, out.q19.detail);
+        console.error(`[fssai-jobs] ruling Q19: ${out.q19.detail}`);
+      }
+      return out;
+    }
+
+    const del = db.transaction(() => {
+      fssaiAudit(db, {
+        entity_table: 'fssai_templates', entity_id: String(row.id), action: 'delete',
+        before: row,
+        reason: `Owner ruling Q19 (2026-10-14): delete the leftover test checklist ${FSSAI_Q19_TEMPLATE_CODE}. It was a draft with no questions, sections, assignments or rounds — configuration, not evidence.`,
+        actor: { email: 'system', name: 'Owner ruling Q19' },
+        outlet_id: String(row.outlet_id || ''),
+      });
+      const r = db.prepare(`DELETE FROM fssai_templates WHERE id = ? AND code = ? AND status = 'draft'`)
+        .run(row.id, FSSAI_Q19_TEMPLATE_CODE);
+      if (r.changes !== 1) throw new Error(`expected to delete 1 row, deleted ${r.changes}`);
+    });
+    del();
+    out.q19.outcome = 'removed';
+    out.q19.detail = `Deleted the leftover test checklist ${FSSAI_Q19_TEMPLATE_CODE} ("${String(row.name || '')}") per owner ruling Q19; the fssai_audit_log row keeps it as it was.`;
+    console.log(`[fssai-jobs] ruling Q19: ${out.q19.detail}`);
+    return out;
+  } catch (e: any) {
+    out.q19.outcome = 'failed';
+    out.q19.detail = `Ruling Q19 could not be applied: ${e?.message || e}`;
+    console.error(`[fssai-jobs] ${out.q19.detail}`);
+    return out;
+  }
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
  * THE TICK
  * ════════════════════════════════════════════════════════════════════════ */
 
@@ -706,11 +1580,15 @@ export interface FssaiJobsReport {
   escalation: FssaiEscalationJobResult | { error: string };
   retention: FssaiRetentionJobResult | { error: string };
   missed_checks: FssaiMissedCheckResult | { error: string };
+  /** The WhatsApp leg of missed_checks (owner ruling 2026-10-14). */
+  missed_checks_whatsapp: FssaiMissedWaResult | { error: string };
+  cooling_overdue: FssaiCoolingOverdueResult | { error: string };
+  rulings: FssaiRulingsResult | { error: string };
 }
 
 /**
  * Everything FSSAI does unattended, once per scheduler tick. Each job is in its
- * own try, so one failing cannot starve the other two. Ends by stamping a
+ * own try, so one failing cannot starve the others. Ends by stamping a
  * heartbeat (settings.fssai_job_heartbeat) that a screen can read to say the
  * driver is ALIVE on evidence — readFssaiJobsHeartbeat below.
  */
@@ -721,15 +1599,29 @@ export async function runFssaiScheduledJobs(db: Db, opts: { now?: Date } = {}): 
     escalation: { error: 'not run' },
     retention: { error: 'not run' },
     missed_checks: { error: 'not run' },
+    missed_checks_whatsapp: { error: 'not run' },
+    cooling_overdue: { error: 'not run' },
+    rulings: { error: 'not run' },
   };
   try { report.escalation = await runFssaiEscalationJob(db); } catch (e: any) { report.escalation = { error: String(e?.message || e) }; }
   try { report.retention = runFssaiRetentionJob(db, { now }); } catch (e: any) { report.retention = { error: String(e?.message || e) }; }
   try { report.missed_checks = runFssaiMissedCheckReminders(db, { now }); } catch (e: any) { report.missed_checks = { error: String(e?.message || e) }; }
+  try {
+    const mc: any = report.missed_checks;
+    report.missed_checks_whatsapp = mc.error
+      ? { error: `the bell pass failed, so WhatsApp was not tried: ${mc.error}` }
+      : await runFssaiMissedCheckWhatsApp(db, mc as FssaiMissedCheckResult);
+  } catch (e: any) { report.missed_checks_whatsapp = { error: String(e?.message || e) }; }
+  try { report.cooling_overdue = runFssaiCoolingOverdueJob(db, { now }); } catch (e: any) { report.cooling_overdue = { error: String(e?.message || e) }; }
+  try { report.rulings = applyFssaiOwnerRulings(db); } catch (e: any) { report.rulings = { error: String(e?.message || e) }; }
 
   try {
     const esc: any = report.escalation;
     const ret: any = report.retention;
     const mis: any = report.missed_checks;
+    const wa: any = report.missed_checks_whatsapp;
+    const cool: any = report.cooling_overdue;
+    const rul: any = report.rulings;
     setSetting(db, KEY_HEARTBEAT, JSON.stringify({
       at: report.at,
       escalation: esc.error ? { error: esc.error } : {
@@ -741,7 +1633,16 @@ export async function runFssaiScheduledJobs(db: Db, opts: { now?: Date } = {}): 
       },
       missed_checks: mis.error ? { error: mis.error } : {
         outcome: mis.outcome, business_date: mis.business_date, missed: mis.missed, people_told: mis.people_told,
+        whatsapp: wa.error ? { error: wa.error } : {
+          outcome: wa.outcome, skip_reason: wa.readiness?.skip_reason || '', sent: wa.sent, failed: wa.failed,
+          dormant: wa.dormant, no_phone: wa.no_phone,
+        },
       },
+      cooling_overdue: cool.error ? { error: cool.error } : {
+        outcome: cool.outcome, scanned: cool.scanned_curves, overdue: cool.overdue, raised: cool.raised,
+        people_told: cool.people_told, errors: (cool.errors || []).length,
+      },
+      rulings: rul.error ? { error: rul.error } : { q19: rul.q19?.outcome || '' },
     }));
   } catch (e: any) {
     console.error('[fssai-jobs] heartbeat could not be written:', e?.message);
@@ -782,5 +1683,14 @@ export function fssaiJobsLogLine(r: FssaiJobsReport): string | null {
   const mis: any = r.missed_checks;
   if (mis.error) parts.push(`missed-checks ERROR ${mis.error}`);
   else if (['reminded', 'failed'].includes(mis.outcome)) parts.push(`missed-checks ${mis.outcome}: ${mis.detail}`);
+  const wa: any = r.missed_checks_whatsapp;
+  if (wa?.error) parts.push(`missed-checks whatsapp ERROR ${wa.error}`);
+  else if (wa && wa.outcome !== 'not_run') parts.push(`missed-checks whatsapp ${wa.outcome}: ${wa.detail}`);
+  const cool: any = r.cooling_overdue;
+  if (cool?.error) parts.push(`cooling-overdue ERROR ${cool.error}`);
+  else if (cool && ['raised', 'failed'].includes(cool.outcome)) parts.push(`cooling-overdue ${cool.outcome}: ${cool.detail}`);
+  const rul: any = r.rulings;
+  if (rul?.error) parts.push(`rulings ERROR ${rul.error}`);
+  else if (rul?.q19 && ['removed', 'failed'].includes(rul.q19.outcome)) parts.push(`ruling Q19 ${rul.q19.outcome}: ${rul.q19.detail}`);
   return parts.length ? parts.join(' · ') : null;
 }

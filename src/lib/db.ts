@@ -9586,7 +9586,18 @@ const FSSAI_TABLE_DDL: string[] = [
    *     from fssai_equipment or fssai_temp_standards at the moment of the
    *     reading and frozen here, so tightening a standard next month cannot
    *     retrospectively fail a fridge that passed. standard_id records WHICH
-   *     rule was applied. */
+   *     rule was applied.
+   *
+   *     curve_start_used / curve_start_minute / curve_start_source (added
+   *     2026-10-14, cooling and reheating only) freeze WHERE THE SCHEDULE LINE
+   *     STARTED for this reading's verdict — the batch's own first reading, or
+   *     the standard's start_value anchor (see fssai_temp_standards) when the
+   *     batch has no minute-0 reading. Same rule as min_used/max_used: the
+   *     anchor lives on a standard an admin can edit, and the first reading of a
+   *     batch can be voided, so a verdict recomputed on read from either would
+   *     rewrite history. With these three, the line is a pure function of the
+   *     row: start (value, minute) → target_used at max_minutes_used. NULL / ''
+   *     on every non-curve reading and on every row written before them. */
   `CREATE TABLE IF NOT EXISTS fssai_temperature_logs (
     id               TEXT PRIMARY KEY,
     business_date    TEXT NOT NULL,              -- YYYY-MM-DD IST
@@ -9630,7 +9641,11 @@ const FSSAI_TABLE_DDL: string[] = [
     void_reason      TEXT NOT NULL DEFAULT '',
     outlet_id        TEXT NOT NULL DEFAULT '',
     created_at       TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at       TEXT NOT NULL DEFAULT (datetime('now'))
+    updated_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    -- cooling / reheating only (2026-10-14): the schedule line's start, FROZEN with the verdict
+    curve_start_used   REAL,                     -- the temperature the line was drawn from. NULL = no line
+    curve_start_minute INTEGER,                  -- the minute on the batch clock that start sits at (anchor = 0)
+    curve_start_source TEXT NOT NULL DEFAULT ''  -- ''|first_reading|standard_anchor
   );`,
 
   /* 15. THE STANDARDS THEMSELVES — "configurable from Settings, never
@@ -9651,7 +9666,20 @@ const FSSAI_TABLE_DDL: string[] = [
    *
    *     applies_to is a log_kind, so a reading finds its rule by kind and
    *     (optionally) equipment_kind. A rule for ONE unit lives on
-   *     fssai_equipment.min_temp/max_temp, which wins — most specific first. */
+   *     fssai_equipment.min_temp/max_temp, which wins — most specific first.
+   *
+   *     start_value (added 2026-10-14) — THE COOLING FAIL-OPEN, CLOSED IN DATA.
+   *     Measured: a cooling reading that STARTED a batch with its minutes typed
+   *     (65 °C "at 239 of 240 minutes") became the start of its own schedule
+   *     line, so it could never be behind that line, and it was filed as a
+   *     judged PASS with no action and no corrective action. start_value is the
+   *     temperature the line is drawn FROM, at minute 0, when the batch has no
+   *     minute-0 reading of its own — cooling from the hot side (60 °C is the
+   *     usual anchor), reheating from the chilled side. NULL = this rule has no
+   *     anchor, and such a reading must then be refused or failed by the route,
+   *     never passed (is_judged = 0 is not a pass either). Whatever start a
+   *     verdict used is frozen on the reading (fssai_temperature_logs
+   *     curve_start_*), so editing this number later rewrites nothing. */
   `CREATE TABLE IF NOT EXISTS fssai_temp_standards (
     id            TEXT PRIMARY KEY,
     code          TEXT NOT NULL DEFAULT '',   -- stable seed key, e.g. 'TEMP-CHILLER', 'OIL-TPM'
@@ -9673,7 +9701,8 @@ const FSSAI_TABLE_DDL: string[] = [
     created_by    TEXT NOT NULL DEFAULT '',
     outlet_id     TEXT NOT NULL DEFAULT '',
     created_at    TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
+    updated_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    start_value   REAL                        -- cooling/reheating: the line's minute-0 anchor (2026-10-14). NULL = none
   );`,
 
   /* 16. WHAT HAPPENED TO A UNIT, as opposed to a reading off it — defrost, deep
@@ -10025,7 +10054,10 @@ const FSSAI_TABLE_DDL: string[] = [
    *     "device 7 checked, no activity" is a CHECKLIST ANSWER (§24 — the
    *     monitoring round is a seeded template), and a sighting carries
    *     device_id. A third pest table for routine checks would be exactly the
-   *     per-record table §2 exists to prevent. */
+   *     per-record table §2 exists to prevent.
+   *     SUPERSEDED 2026-10-14: the authority's monitoring sheet is station by
+   *     station, so the routine check now has its own table —
+   *     fssai_pest_device_checks (33). The reason is written there. */
   `CREATE TABLE IF NOT EXISTS fssai_pest_devices (
     id             TEXT PRIMARY KEY,
     code           TEXT NOT NULL DEFAULT '',   -- the number painted on the station
@@ -10060,7 +10092,13 @@ const FSSAI_TABLE_DDL: string[] = [
    *     it replaces and the old row stays (§19), so the history of a licence
    *     number is readable.
    *     THE FILE ITSELF LIVES IN fssai_attachments, not in a column here — one
-   *     photo/file store with one retention sweep, not two. */
+   *     photo/file store, not two.
+   *     handler_id (added 2026-10-14) is the key a FOOD HANDLER's certificate
+   *     is filed under — medical fitness, food-handler training, FoSTaC — and
+   *     points at fssai_food_handlers (31), which does NOT need an app login.
+   *     person_email stays as the Q18 fallback for rows filed before the
+   *     register existed; a reader that judges coverage must read handler_id
+   *     first. No FK: same '' convention as every other cross-record id here. */
   `CREATE TABLE IF NOT EXISTS fssai_documents (
     id              TEXT PRIMARY KEY,
     doc_code        TEXT NOT NULL DEFAULT '',   -- stable key for a seeded or well-known document
@@ -10089,7 +10127,8 @@ const FSSAI_TABLE_DDL: string[] = [
     created_by      TEXT NOT NULL DEFAULT '',
     outlet_id       TEXT NOT NULL DEFAULT '',
     created_at      TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+    updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    handler_id      TEXT NOT NULL DEFAULT ''    -- fssai_food_handlers.id (2026-10-14): a handler certificate, login or not
   );`,
 
   /* 26. PHOTOGRAPHS AND FILES ON A RECORD THAT IS NOT A CHECKLIST RUN.
@@ -10104,18 +10143,33 @@ const FSSAI_TABLE_DDL: string[] = [
    *     attestation, and run-less rows would sit inside a signed set.
    *
    *     So the record tables get their own store with the SAME budget
-   *     (FSSAI_PHOTO_* in src/lib/fssai.ts), the SAME 12-month retention
-   *     columns, and the same rule: THE IMAGE AGES OUT, THE ROW NEVER DOES, so
-   *     the record still says a photograph was taken, by whom, when, how big it
-   *     was and what it hashed to.
+   *     (FSSAI_PHOTO_* in src/lib/fssai.ts) and the same digest taken at
+   *     upload. digest_sha256 / image_dropped_at keep the shape of
+   *     fssai_evidence, but nothing ages out of THIS table — see Q22 below.
    *
-   *     TWO THINGS A LANE MUST HONOUR:
-   *       1. The retention sweep walks BOTH tables. One that clears only
-   *          fssai_evidence keeps every delivery photograph forever.
-   *       2. entity_table is validated against FSSAI_ATTACHMENT_ENTITIES before
-   *          any insert. A caller-supplied table name must never reach SQL, and
-   *          an attachment pointing at a table that does not exist is an orphan
-   *          nothing will ever render.
+   *     ── OWNER RULING Q22 (2026-10-14): NEVER AUTO-DELETED ───────────────────
+   *     Document scans in fssai_attachments — licence, FoSTaC, pest job sheets,
+   *     delivery photos — are NEVER auto-deleted. Only checklist photos
+   *     (fssai_evidence) follow the 12-month sweep. A sweep that walks this
+   *     table breaks the ruling. (This reverses the note that stood here before
+   *     Q22 was ruled, "the retention sweep walks BOTH tables".)
+   *
+   *     ── VOID, NEVER STRIP (2026-10-14) ──────────────────────────────────────
+   *     A file attached by mistake is VOIDED: status = 'void' + voided_at /
+   *     voided_by / void_reason, and the row AND its image stay, shown as void.
+   *     The earlier "remove the file" path blanked data_uri — a deletion of
+   *     evidence under another name. image_dropped_at only describes rows an
+   *     earlier build already blanked; nothing new may set it on this table.
+   *     purpose says why the file is on the record: '' = evidence taken with the
+   *     record (every row before this column existed), 'closure' = the proof a
+   *     corrective action or an inspection finding was fixed, 'report' = the
+   *     inspector's or auditor's report itself. Vocabulary in src/lib/fssai.ts.
+   *
+   *     ONE THING A LANE MUST STILL HONOUR: entity_table is validated against
+   *     FSSAI_ATTACHMENT_ENTITIES before any insert. A caller-supplied table name
+   *     must never reach SQL, and an attachment pointing at a table that does not
+   *     exist is an orphan nothing will ever render. A new register that takes a
+   *     photo (waste handovers, pest station checks) must be added to that list.
    *     No FK on entity_id, deliberately: one column cannot reference fifteen
    *     tables, and an attachment must survive its parent being voided. */
   `CREATE TABLE IF NOT EXISTS fssai_attachments (
@@ -10123,16 +10177,22 @@ const FSSAI_TABLE_DDL: string[] = [
     entity_table TEXT NOT NULL,                -- validated against FSSAI_ATTACHMENT_ENTITIES
     entity_id    TEXT NOT NULL,
     kind         TEXT NOT NULL DEFAULT 'photo', -- photo|document|certificate|report
-    data_uri     TEXT NOT NULL DEFAULT '',     -- '' once the image has aged out, or for a row-only record
+    data_uri     TEXT NOT NULL DEFAULT '',     -- the image. Never blanked by a sweep (Q22); a void keeps it
     filename     TEXT NOT NULL DEFAULT '',
     mime         TEXT NOT NULL DEFAULT '',
-    size_bytes   INTEGER NOT NULL DEFAULT 0,   -- the ORIGINAL size; never reset to 0 by the sweep
+    size_bytes   INTEGER NOT NULL DEFAULT 0,   -- the ORIGINAL size
     caption      TEXT NOT NULL DEFAULT '',
-    digest_sha256 TEXT NOT NULL DEFAULT '',    -- of the decoded bytes, at upload; outlives the image
-    image_dropped_at TEXT NOT NULL DEFAULT '', -- '' = still stored; else when retention dropped it
+    digest_sha256 TEXT NOT NULL DEFAULT '',    -- of the decoded bytes, at upload
+    image_dropped_at TEXT NOT NULL DEFAULT '', -- legacy: set only by a build before 2026-10-14
     created_by   TEXT NOT NULL DEFAULT '',
     outlet_id    TEXT NOT NULL DEFAULT '',
-    created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+    created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    -- 2026-10-14: void, never strip; and why the file is here
+    purpose      TEXT NOT NULL DEFAULT '',        -- ''|closure|report
+    status       TEXT NOT NULL DEFAULT 'active',  -- active|void
+    voided_at    TEXT NOT NULL DEFAULT '',
+    voided_by    TEXT NOT NULL DEFAULT '',        -- users.email
+    void_reason  TEXT NOT NULL DEFAULT ''         -- mandatory, in words (fssaiVoidRefusal)
   );`,
 
   /* 27. AN INSPECTION OR AUDIT THAT ACTUALLY HAPPENED (owner §16, §18) — an
@@ -10256,12 +10316,259 @@ const FSSAI_TABLE_DDL: string[] = [
     dropped_count  INTEGER NOT NULL DEFAULT 0,
     bytes_freed    INTEGER NOT NULL DEFAULT 0,
     evidence_dropped    INTEGER NOT NULL DEFAULT 0,  -- from fssai_evidence
-    attachments_dropped INTEGER NOT NULL DEFAULT 0,  -- from fssai_attachments — BOTH tables, always
+    attachments_dropped INTEGER NOT NULL DEFAULT 0,  -- from fssai_attachments: 0 by the sweep since ruling Q22 (2026-10-14)
     status         TEXT NOT NULL DEFAULT 'running',  -- running|done|failed
     detail         TEXT NOT NULL DEFAULT '',
     triggered_by   TEXT NOT NULL DEFAULT '',   -- users.email, or 'scheduler'
     outlet_id      TEXT NOT NULL DEFAULT '',
     created_at     TEXT NOT NULL DEFAULT (datetime('now'))
+  );`,
+
+  /* ══════════════════════════════════════════════════════════════════════════
+   * THE HYDERABAD AUDIT ROUND (2026-10-14) — tables 31-35
+   * ══════════════════════════════════════════════════════════════════════════
+   * The Hyderabad Food Safety Authority's checklist
+   * (docs/fssai/hyderabad-audit-checklist.json) left eight lines PARTIAL after
+   * the last round, each because a record had no shape to live in: a food
+   * handler without an app login (#55 #56 #106 #107), a pest station checked
+   * one by one (#113, #78), a waste handover (#114). Plus one ledger the
+   * owner's 2026-10-14 MISSED-CHECKS ruling needs. Every one follows the
+   * conventions written at the top of the record tables above, column for
+   * column — id/outlet_id/created_at/updated_at, '' not NULL for an absent
+   * reference, no FK into another module, no CHECK, the void trio on anything
+   * that is evidence. Five tables: each earns its place because its record has a
+   * shape none of the thirty above can hold. */
+
+  /* 31. THE FOOD-HANDLER REGISTER (#55 #56 #106 #107; owner ruling Q18 of
+   *     2026-10-14: "email key until HR is populated").
+   *
+   *     WHY A REGISTER. A certificate could only be filed against an app LOGIN
+   *     (the documents route requires person_email = users.email), so a cook
+   *     with no login could never be covered, and nothing could name the
+   *     handler who has NO certificate: a list built from the certificates on
+   *     file only ever names people who have one. This table is the list of
+   *     PEOPLE; coverage (medical, training, FoSTaC: valid / expiring / missing)
+   *     is derived by joining their certificates to it, so "missing" is a row
+   *     an inspector can see.
+   *
+   *     THE PERSON KEY, in order (Q18): employee_id when HRMS is populated
+   *     (production has hr_employees), else person_email when the person has a
+   *     login, else NEITHER — a name-only row is legal, because the cook
+   *     without a login is the case this table exists for. No FK to
+   *     hr_employees or users (other modules; both can be hard-deleted — the FK
+   *     note at the top of this block). full_name is denormalised so the
+   *     register still reads if either master loses the row.
+   *
+   *     NOTHING HERE IS A ROLE, A DEPARTMENT OR A DESIGNATION. department_id and
+   *     designation are READ from the owner's masters and stored; this table
+   *     never creates or edits one.
+   *
+   *     CERTIFICATES LIVE IN fssai_documents, keyed by its handler_id —
+   *     medical_fitness, food_handler_training and the FoSTaC certificate are
+   *     documents with an expiry whose STATE stays derived on read
+   *     (fssaiDocState), never stored here. HRMS training completions count
+   *     through fssai_training_links (32), joined live.
+   *     is_fostac_supervisor marks the FoSTaC-trained supervisor the premises
+   *     must have; their certificate is a document like any other.
+   *
+   *     A person who leaves is status 'left' + left_on — never voided: their
+   *     certificates were valid evidence while they worked here. 'void' is for a
+   *     row entered by mistake, with a reason (§19). The partial UNIQUE keys
+   *     below skip void rows only, so someone who left and came back is the
+   *     SAME row reactivated, never a second one. */
+  `CREATE TABLE IF NOT EXISTS fssai_food_handlers (
+    id                   TEXT PRIMARY KEY,
+    handler_no           TEXT NOT NULL DEFAULT '',   -- 'FH-0001', human-facing; the route owns the allocator
+    employee_id          TEXT NOT NULL DEFAULT '',   -- hr_employees.id when HR is populated; '' otherwise. No FK
+    employee_code        TEXT NOT NULL DEFAULT '',   -- hr_employees.employee_code, denormalised
+    person_email         TEXT NOT NULL DEFAULT '',   -- users.email when they have a login (Q18 fallback); '' for none
+    full_name            TEXT NOT NULL,              -- as printed on the register; the one key every row has
+    phone10              TEXT NOT NULL DEFAULT '',   -- contact only, PhoneField contract (bare 10 digits)
+    designation          TEXT NOT NULL DEFAULT '',   -- in words, READ from hr_designations or typed; never written back
+    department_id        TEXT NOT NULL DEFAULT '',   -- departments.id, READ ONLY
+    is_food_handler      INTEGER NOT NULL DEFAULT 1, -- 1 = handles food: medical + training are required
+    is_fostac_supervisor INTEGER NOT NULL DEFAULT 0, -- the premises' FoSTaC-trained supervisor
+    joined_on            TEXT NOT NULL DEFAULT '',   -- YYYY-MM-DD
+    left_on              TEXT NOT NULL DEFAULT '',   -- YYYY-MM-DD; '' = still working here
+    source               TEXT NOT NULL DEFAULT 'manual', -- manual|hrms|users: where the row was first taken from
+    note                 TEXT NOT NULL DEFAULT '',
+    status               TEXT NOT NULL DEFAULT 'active', -- active|left|void
+    voided_at            TEXT NOT NULL DEFAULT '',
+    voided_by            TEXT NOT NULL DEFAULT '',
+    void_reason          TEXT NOT NULL DEFAULT '',
+    created_by           TEXT NOT NULL DEFAULT '',
+    outlet_id            TEXT NOT NULL DEFAULT '',
+    created_at           TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at           TEXT NOT NULL DEFAULT (datetime('now'))
+  );`,
+
+  /* 32. WHICH HRMS TRAININGS COUNT AS FOOD-SAFETY TRAINING (#56 #107).
+   *     HRMS already records who completed what (hr_training_assignments,
+   *     status 'completed' + completed_date, keyed by hr_employees.id). It has
+   *     no idea which of its trainings an FSSAI inspector would accept. This
+   *     table is that one fact per HRMS training and nothing else: a MAPPING,
+   *     never a copy — completions are joined live through the handler's
+   *     employee_id, so HRMS stays the only place a completion is recorded.
+   *     counts_as is an FSSAI_DOC_TYPES key with scope 'person', so a
+   *     completion reads exactly like a filed certificate of that type.
+   *     valid_months turns completed_date into an expiry; NULL = the completion
+   *     carries none (state 'no_expiry'). Configuration, not evidence: retired
+   *     with is_active = 0, and every change still writes fssai_audit_log.
+   *     hr_trainings and hr_training_assignments are READ ONLY from here. */
+  `CREATE TABLE IF NOT EXISTS fssai_training_links (
+    id             TEXT PRIMARY KEY,
+    hr_training_id TEXT NOT NULL,                -- hr_trainings.id, no FK (HRMS master)
+    training_name  TEXT NOT NULL DEFAULT '',     -- denormalised for display; hr_trainings.name stays the master
+    counts_as      TEXT NOT NULL DEFAULT 'food_handler_training', -- an FSSAI_DOC_TYPES key, scope 'person'
+    valid_months   INTEGER,                      -- completed_date + this = expiry. NULL = no expiry
+    is_active      INTEGER NOT NULL DEFAULT 1,
+    note           TEXT NOT NULL DEFAULT '',
+    created_by     TEXT NOT NULL DEFAULT '',
+    outlet_id      TEXT NOT NULL DEFAULT '',
+    created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at     TEXT NOT NULL DEFAULT (datetime('now'))
+  );`,
+
+  /* 33. THE PEST MONITORING SHEET — one station, one check (#113; #78's
+   *     "records maintained").
+   *     THIS REVERSES 24's "a register only, with no log table behind it". That
+   *     note bet the round would be a checklist answer. The authority's sheet is
+   *     station by station — date, device, activity yes/no, action, initials —
+   *     and a checklist has a fixed question set while the pest map has however
+   *     many stations are painted on the wall. Measured result of the bet:
+   *     fssai_pest_devices.last_checked_at was written only by a sighting, and
+   *     Audit File record 13 counted unrelated rounds instead.
+   *     round_id groups the stations checked on one walk; the route mints one id
+   *     per submission. No header table: the walk has no facts of its own beyond
+   *     date, time and person, which every row already carries.
+   *     activity is TEXT ''|yes|no for the reason given at the top of the record
+   *     tables: '' (not recorded) must never read as "no activity".
+   *     initials are what the paper sheet carries; checked_by is the session —
+   *     both, because the person at the station may not be the one typing.
+   *     Activity raises a SIGHTING (sighting_id): fssai_pest_sightings stays the
+   *     one register of pests seen, and this row only points at it. */
+  `CREATE TABLE IF NOT EXISTS fssai_pest_device_checks (
+    id               TEXT PRIMARY KEY,
+    round_id         TEXT NOT NULL DEFAULT '',   -- one walk of the stations; minted by the route
+    business_date    TEXT NOT NULL,              -- YYYY-MM-DD IST
+    checked_at       TEXT NOT NULL DEFAULT '',   -- HH:MM
+    device_id        TEXT NOT NULL DEFAULT '',   -- fssai_pest_devices.id, no FK (the '' convention, as on sightings)
+    device_code      TEXT NOT NULL DEFAULT '',   -- denormalised: the number painted on the station
+    device_kind      TEXT NOT NULL DEFAULT '',
+    location_label   TEXT NOT NULL DEFAULT '',
+    department_id    TEXT NOT NULL DEFAULT '',
+    activity         TEXT NOT NULL DEFAULT '',   -- ''|yes|no. '' is NOT "no"
+    activity_kind    TEXT NOT NULL DEFAULT '',   -- FSSAI_PEST_EVIDENCE_KINDS / FSSAI_PEST_TYPES key when activity = yes
+    device_condition TEXT NOT NULL DEFAULT '',   -- ''|ok|not_ok|na (FssaiCheckResult): bait there, board intact, unit working
+    action_taken     TEXT NOT NULL DEFAULT '',   -- bait replaced, board changed, contractor called, in words
+    initials         TEXT NOT NULL DEFAULT '',   -- as written on the paper sheet
+    checked_by       TEXT NOT NULL DEFAULT '',   -- users.email, from the session
+    checked_name     TEXT NOT NULL DEFAULT '',
+    checker_kind     TEXT NOT NULL DEFAULT 'staff', -- staff|contractor
+    service_id       TEXT NOT NULL DEFAULT '',   -- fssai_pest_services.id when checked during a contractor visit
+    sighting_id      TEXT NOT NULL DEFAULT '',   -- fssai_pest_sightings.id raised from activity = yes
+    is_fail          INTEGER NOT NULL DEFAULT 0, -- frozen: activity = yes, or device_condition = not_ok
+    ca_id            TEXT NOT NULL DEFAULT '',
+    note             TEXT NOT NULL DEFAULT '',
+    status           TEXT NOT NULL DEFAULT 'submitted', -- submitted|void
+    voided_at        TEXT NOT NULL DEFAULT '',
+    voided_by        TEXT NOT NULL DEFAULT '',
+    void_reason      TEXT NOT NULL DEFAULT '',
+    outlet_id        TEXT NOT NULL DEFAULT '',
+    created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at       TEXT NOT NULL DEFAULT (datetime('now'))
+  );`,
+
+  /* 34. WASTE LEAVING BY THE BACK DOOR — one row per handover (#114).
+   *     Until now the only slot was a 'waste_disposal_record' DOCUMENT, where one
+   *     collector's receipt counted for 92 days. The authority asks for each
+   *     handover: date, wet / dry / other, how much, who collected it (GHMC or
+   *     an agency), the receipt or vehicle number, who handed it over. The
+   *     agency's agreement stays a document (document_id).
+   *     THREE QUANTITY COLUMNS IN ONE ROW, not a row per stream: the collector
+   *     takes the wet and the dry bins on one visit and signs one receipt, and
+   *     the printed register reads date | wet | dry | other | collector. NULL
+   *     means that stream was not handed over on this visit — never 0 for
+   *     "not recorded".
+   *     DELIBERATELY NO MONEY COLUMN — the reason given on fssai_oil_disposals.
+   *     recorded_by is the session; handed_over_name is the person at the door,
+   *     who may have no login. */
+  `CREATE TABLE IF NOT EXISTS fssai_waste_handovers (
+    id               TEXT PRIMARY KEY,
+    handover_no      TEXT NOT NULL DEFAULT '',   -- 'WST-2026-0001', human-facing; the route owns the allocator
+    business_date    TEXT NOT NULL,              -- YYYY-MM-DD IST
+    handed_at        TEXT NOT NULL DEFAULT '',   -- HH:MM
+    wet_qty          REAL,                       -- NULL = no wet waste on this handover
+    dry_qty          REAL,                       -- NULL = no dry waste on this handover
+    other_qty        REAL,                       -- NULL = nothing else
+    other_kind       TEXT NOT NULL DEFAULT '',   -- what "other" was, in words (glass, e-waste, sanitary)
+    qty_uom          TEXT NOT NULL DEFAULT 'kg', -- kg|bags|bins: one unit for the row, as the receipt states it
+    collector_kind   TEXT NOT NULL DEFAULT '',   -- ghmc|agency|other
+    collector_name   TEXT NOT NULL DEFAULT '',   -- the agency or the person, in words
+    vendor_id        TEXT NOT NULL DEFAULT '',   -- vendors.id when the agency is in the vendors master; usually ''
+    agency_reg_no    TEXT NOT NULL DEFAULT '',
+    receipt_no       TEXT NOT NULL DEFAULT '',
+    vehicle_no       TEXT NOT NULL DEFAULT '',
+    received_by_name TEXT NOT NULL DEFAULT '',   -- the collector's person who took it
+    handed_over_name TEXT NOT NULL DEFAULT '',   -- our person at the door (may have no login)
+    department_id    TEXT NOT NULL DEFAULT '',
+    document_id      TEXT NOT NULL DEFAULT '',   -- fssai_documents.id: the agency agreement, if filed
+    note             TEXT NOT NULL DEFAULT '',
+    status           TEXT NOT NULL DEFAULT 'submitted', -- submitted|void
+    recorded_by      TEXT NOT NULL DEFAULT '',   -- users.email, from the session
+    recorded_name    TEXT NOT NULL DEFAULT '',
+    voided_at        TEXT NOT NULL DEFAULT '',
+    voided_by        TEXT NOT NULL DEFAULT '',
+    void_reason      TEXT NOT NULL DEFAULT '',
+    outlet_id        TEXT NOT NULL DEFAULT '',
+    created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at       TEXT NOT NULL DEFAULT (datetime('now'))
+  );`,
+
+  /* 35. WHAT AN UNATTENDED JOB TOLD WHOM — and the once-only claim that stops
+   *     it telling them twice. Owner ruling 2026-10-14, MISSED CHECKS: keep the
+   *     next-morning bell, add WhatsApp to the SAME recipients through the app's
+   *     existing send path, approved template only, DORMANT (bell only) until a
+   *     template is configured and the Meta app secret exists.
+   *     ONE ROW PER (job, subject, channel, recipient), enforced by the UNIQUE
+   *     index — the claim IS the INSERT, so two workers on one tick cannot both
+   *     send and a re-run of the tick cannot send again. Used by:
+   *       missed_checks    subject = the business_date reported; channel
+   *                        'whatsapp'; one row per recipient that
+   *                        missedCheckRecipients() resolved, INCLUDING the ones
+   *                        who could not be messaged — status 'skipped' with
+   *                        skip_reason 'no_phone', or 'dormant' while WhatsApp is
+   *                        not configured. "Nobody was told" and "we hold no
+   *                        number for them" must be different rows. The bell
+   *                        keeps its existing claim in notifications.
+   *       cooling_overdue  subject = the curve key (fssai_temperature_logs
+   *                        batch_id, else the first reading's id); channel 'ca',
+   *                        recipient '' — the ONE corrective action an overdue or
+   *                        abandoned batch raises, ref_id = that action's id;
+   *                        plus 'bell' rows per person told.
+   *     recipient_phone is the number actually used, or '' — never a guess.
+   *     NOT EVIDENCE, so a failed send may be retried on its own row
+   *     (attempt_count, status, detail); the row itself is never removed. */
+  `CREATE TABLE IF NOT EXISTS fssai_job_notices (
+    id                  TEXT PRIMARY KEY,
+    job_key             TEXT NOT NULL,              -- missed_checks | cooling_overdue
+    subject_key         TEXT NOT NULL DEFAULT '',   -- what the notice is about (see above)
+    channel             TEXT NOT NULL DEFAULT '',   -- whatsapp | bell | ca
+    recipient_email     TEXT NOT NULL DEFAULT '',   -- users.email, LOWER-CASED; '' for a notice addressed to nobody
+    recipient_phone     TEXT NOT NULL DEFAULT '',   -- the number the message went to; '' when the app holds none
+    phone_source        TEXT NOT NULL DEFAULT '',   -- users.wa_mobile | hr_employees.phone10 | ''
+    template_name       TEXT NOT NULL DEFAULT '',   -- the APPROVED template used; free text is never sent
+    template_lang       TEXT NOT NULL DEFAULT '',
+    status              TEXT NOT NULL DEFAULT '',   -- sent|skipped|dormant|failed|raised
+    skip_reason         TEXT NOT NULL DEFAULT '',   -- no_phone|no_template|no_app_secret|disabled|provider_error
+    provider_message_id TEXT NOT NULL DEFAULT '',
+    ref_table           TEXT NOT NULL DEFAULT '',   -- e.g. fssai_corrective_actions
+    ref_id              TEXT NOT NULL DEFAULT '',
+    detail              TEXT NOT NULL DEFAULT '',
+    attempt_count       INTEGER NOT NULL DEFAULT 1,
+    outlet_id           TEXT NOT NULL DEFAULT '',
+    created_at          TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at          TEXT NOT NULL DEFAULT (datetime('now'))
   );`,
 ];
 
@@ -10421,9 +10728,10 @@ const FSSAI_INDEX_DDL: string[] = [
   `CREATE INDEX IF NOT EXISTS idx_fssai_doc_type   ON fssai_documents(doc_type, is_active)`,
   `CREATE INDEX IF NOT EXISTS idx_fssai_doc_vendor ON fssai_documents(vendor_id) WHERE vendor_id <> ''`,
   `CREATE INDEX IF NOT EXISTS idx_fssai_doc_person ON fssai_documents(person_email) WHERE person_email <> ''`,
-  // attachments — the parent lookup, and the retention sweep's one question.
-  // idx_fssai_attach_retain is the TWIN of idx_fssai_evidence_retain above: the
-  // sweep must walk BOTH tables or every record-module photograph is kept for ever.
+  // attachments — the parent lookup. idx_fssai_attach_retain is KEPT, unchanged,
+  // so no existing database reports it as undeclared — but it no longer serves a
+  // sweep: owner ruling Q22 (2026-10-14), fssai_attachments is NEVER auto-deleted
+  // and only fssai_evidence ages out. Do not read it as licence to sweep here.
   `CREATE INDEX IF NOT EXISTS idx_fssai_attach_entity ON fssai_attachments(entity_table, entity_id)`,
   `CREATE INDEX IF NOT EXISTS idx_fssai_attach_retain ON fssai_attachments(created_at) WHERE data_uri <> ''`,
   // inspections and their findings
@@ -10442,7 +10750,45 @@ const FSSAI_INDEX_DDL: string[] = [
    * admin deliberately retired. */
   `CREATE UNIQUE INDEX IF NOT EXISTS uq_fssai_seed_item ON fssai_seed_log(pack_key, pack_version, item_kind, item_code)`,
   `CREATE INDEX IF NOT EXISTS idx_fssai_seed_pack ON fssai_seed_log(pack_key, created_at)`,
+  /* "WAS THIS CODE EVER SEEDED, BY ANY VERSION OF THIS PACK?" (2026-10-14).
+   * uq_fssai_seed_item above leads with pack_version, so it answers "did v2 run"
+   * — and measured: pack v2 then brought back CHK-SAFE-MONTHLY, which the owner
+   * had deleted after v1, because v2's marker was new. A retired checklist must
+   * never come back, so the pack asks this version-free question per item. */
+  `CREATE INDEX IF NOT EXISTS idx_fssai_seed_code ON fssai_seed_log(pack_key, item_kind, item_code)`,
   `CREATE INDEX IF NOT EXISTS idx_fssai_retention_started ON fssai_retention_runs(started_at DESC)`,
+
+  /* ══ THE HYDERABAD AUDIT ROUND (2026-10-14) — tables 31-35 ═══════════════════ */
+  /* food handlers — ONE live row per person. Two partial UNIQUE keys, one per
+   * person key (Q18), each skipping void rows only: a row entered by mistake and
+   * voided must not block entering the person properly, while someone who LEFT
+   * keeps their row and is reactivated rather than duplicated. A name-only row
+   * (no login, no HR record) is under neither key, deliberately. */
+  `CREATE UNIQUE INDEX IF NOT EXISTS uq_fssai_fh_employee ON fssai_food_handlers(outlet_id, employee_id) WHERE employee_id <> '' AND status <> 'void'`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS uq_fssai_fh_email ON fssai_food_handlers(outlet_id, person_email COLLATE NOCASE) WHERE person_email <> '' AND status <> 'void'`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS uq_fssai_fh_no ON fssai_food_handlers(outlet_id, handler_no) WHERE handler_no <> ''`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_fh_status ON fssai_food_handlers(status, is_food_handler)`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_fh_dept   ON fssai_food_handlers(department_id, status)`,
+  // the certificates filed against a handler — the coverage join
+  `CREATE INDEX IF NOT EXISTS idx_fssai_doc_handler ON fssai_documents(handler_id) WHERE handler_id <> ''`,
+  // one mapping per HRMS training per outlet; retire with is_active, never a second row
+  `CREATE UNIQUE INDEX IF NOT EXISTS uq_fssai_trlink_training ON fssai_training_links(outlet_id, hr_training_id)`,
+  // pest station checks: the printed sheet by date, a station's history, one walk, the failures
+  `CREATE INDEX IF NOT EXISTS idx_fssai_pest_check_date   ON fssai_pest_device_checks(business_date)`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_pest_check_device ON fssai_pest_device_checks(device_id, business_date)`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_pest_check_round  ON fssai_pest_device_checks(round_id) WHERE round_id <> ''`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_pest_check_fail   ON fssai_pest_device_checks(is_fail, business_date)`,
+  // waste handovers: the human number, the register, the agency's record
+  `CREATE UNIQUE INDEX IF NOT EXISTS uq_fssai_waste_no ON fssai_waste_handovers(outlet_id, handover_no) WHERE handover_no <> ''`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_waste_date   ON fssai_waste_handovers(business_date)`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_waste_vendor ON fssai_waste_handovers(vendor_id, business_date) WHERE vendor_id <> ''`,
+  /* job notices — THE ONCE-ONLY CLAIM. A FULL unique (every column NOT NULL), so
+   * '' compares equal and a notice addressed to nobody (the cooling CA) can still
+   * be claimed exactly once per subject. recipient_email must be written
+   * lower-cased: the index is not NOCASE, and a mixed-case second write would
+   * otherwise be a second message to the same person. */
+  `CREATE UNIQUE INDEX IF NOT EXISTS uq_fssai_job_notice ON fssai_job_notices(job_key, subject_key, channel, recipient_email)`,
+  `CREATE INDEX IF NOT EXISTS idx_fssai_job_notice_job ON fssai_job_notices(job_key, created_at)`,
 ];
 
 /* ── WHAT THE LAST APPLY PASS FOUND ────────────────────────────────────────

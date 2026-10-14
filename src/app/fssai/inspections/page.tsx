@@ -22,6 +22,15 @@
  * and a closed or voided visit; this screen only hides the button where the
  * route would refuse. The action is then worked in /fssai/corrective-actions.
  *
+ * ── THE REPORT AND THE CLOSURE EVIDENCE (Hyderabad audit line #120) ───────
+ * "Previous audit report and closure evidence". Each visit has a REPORT card:
+ * link the copy filed in Documents & Certificates (the route refuses a dangling
+ * id, a voided document and anything not filed as an audit report), or
+ * photograph the report's pages onto the visit. Each point takes CLOSURE
+ * PHOTOGRAPHS while its visit is open — and shows, read-only, the photographs
+ * on the corrective action it raised. Nothing is removed: a file taken by
+ * mistake is VOIDED with a reason and stays on screen, greyed, marked void.
+ *
  * ── NO DATE DEFAULT ────────────────────────────────────────────────────────
  * The history opens on EVERY visit. RECON §7.2 records what a silent window once
  * did to this owner's trust in a report; on an inspection history it would read as
@@ -34,8 +43,11 @@
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
-  AlertTriangle, ArrowLeft, CheckCircle2, ClipboardList, Loader2, Plus, RefreshCw, Trash2, Wrench, X,
+  AlertTriangle, ArrowLeft, CheckCircle2, ClipboardList, FileText, Link2, Loader2, Plus, RefreshCw, Trash2, Wrench, X,
 } from 'lucide-react';
+import ClosurePhotos, { type ClosureFile } from '../corrective-actions/ClosurePhotos';
+import { ImageThumb } from '@/app/tasks/_components/ImageUpload';
+import type { FssaiVisitClosureEvidence, ReportDocument } from '@/app/api/fssai/_closure/lib';
 import { apiJson } from '@/lib/api';
 import {
   FSSAI_CA_SEVERITIES, FSSAI_FINDING_SEVERITIES, FSSAI_INSPECTION_KINDS, FSSAI_INSPECTION_STATUSES,
@@ -57,7 +69,7 @@ interface Inspection {
   id: string; inspection_no: string; inspection_kind: string; authority: string; inspector_name: string;
   inspector_id_no: string; business_date: string; started_at: string; finished_at: string; scope: string;
   department_id: string; department_name: string; score: number | null; score_max: number | null;
-  grade: string; outcome: string; report_no: string; observations: string; our_response: string;
+  grade: string; outcome: string; report_no: string; document_id: string; observations: string; our_response: string;
   finding_count: number; open_count: number; reply_due_date: string; reply_overdue: boolean;
   status: string; closed_at: string; closed_by: string; accompanied_by: string;
   voided_at: string; voided_by: string; void_reason: string; created_by: string; is_editable: boolean;
@@ -76,6 +88,10 @@ interface CaRow {
 interface RaiseResponse {
   corrective_action: { id: string; ca_number: string; severity: string; due_date: string } | null;
 }
+/** What GET ?id= says about changing files (line #120). '' = allowed now. */
+interface ClosureRules { point_files_refusal: string; report_refusal: string; live_limit: number }
+/** What a file write (attach / void / link) answers with. */
+interface FileReply { evidence?: FssaiVisitClosureEvidence | null; note_to_staff?: string }
 
 const FIELD = 'mt-1 w-full bg-white border border-[#D4B896] rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#af4408]';
 
@@ -332,6 +348,9 @@ function Detail({
   const [closing, setClosing] = useState<Finding | null>(null);
   const [raising, setRaising] = useState<Finding | null>(null);
   const [voidOpen, setVoidOpen] = useState(false);
+  const [evidence, setEvidence] = useState<FssaiVisitClosureEvidence | null>(null);
+  const [reportDocs, setReportDocs] = useState<ReportDocument[]>([]);
+  const [rules, setRules] = useState<ClosureRules | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true); setErr('');
@@ -339,10 +358,26 @@ function Detail({
       const j = await apiJson<any>(`/api/fssai/inspections?id=${encodeURIComponent(id)}`);
       setInsp(j.inspection); setFindings(j.findings || []);
       setActions(j.corrective_actions || []); setTrail(j.trail || []);
+      setEvidence(j.evidence || null); setReportDocs(j.report_documents || []); setRules(j.closure_rules || null);
     } catch (e: any) { setErr(e?.message || 'Could not load that visit'); }
     finally { setLoading(false); }
   }, [id]);
   useEffect(() => { load(); }, [load]);
+
+  /* LINE #120 — files. Each call is one request; the reply carries the visit's
+   * evidence, so the screen updates in place. apiJson throws the server's own
+   * sentence, which ClosurePhotos shows beside the control. */
+  const fileCall = useCallback(async (body: Record<string, unknown>, okMsg: string) => {
+    const j = await apiJson<FileReply>('/api/fssai/inspections', { method: 'POST', body });
+    if (j?.evidence) setEvidence(j.evidence);
+    say(j?.note_to_staff || okMsg);
+  }, [say]);
+  const attachReport = useCallback((uri: string) => fileCall({ action: 'attach_report', id, data_uri: uri }, 'Report page added.'), [fileCall, id]);
+  const attachPoint = useCallback((findingId: string, uri: string) => fileCall({ action: 'attach_closure', id: findingId, data_uri: uri }, 'Photograph added.'), [fileCall]);
+  const voidFile = useCallback((recordId: string, attachmentId: string, reason: string) =>
+    fileCall({ action: 'void_file', id: recordId, attachment_id: attachmentId, reason }, 'Voided — it stays on file, marked void.'), [fileCall]);
+
+  const evFor = useCallback((findingId: string) => evidence?.findings.find((e) => e.finding_id === findingId) || null, [evidence]);
 
   const act = useCallback(async (body: any, okMsg: string) => {
     setBusy(body.action); setErr('');
@@ -482,6 +517,24 @@ function Detail({
             )}
           </div>
 
+          {/* The report — line #120 */}
+          {evidence && (
+            <ReportCard
+              insp={insp}
+              evidence={evidence}
+              candidates={reportDocs}
+              refusal={rules ? rules.report_refusal : 'Loading…'}
+              liveLimit={rules?.live_limit}
+              onAttach={attachReport}
+              onVoid={(attachmentId, reason) => voidFile(insp.id, attachmentId, reason)}
+              onLink={async (documentId, reason) => {
+                const j = await apiJson<FileReply>('/api/fssai/inspections', { method: 'POST', body: { action: 'link_report', id: insp.id, document_id: documentId, reason } });
+                say(j?.note_to_staff || 'Saved.');
+                await load();
+              }}
+            />
+          )}
+
           {/* The points */}
           <div className="bg-white rounded-xl border border-[#E8D5C4] overflow-hidden">
             <div className="px-4 py-3 border-b border-[#E8D5C4]">
@@ -547,6 +600,41 @@ function Detail({
                           </p>
                         </a>
                       )}
+                      {/* Line #120 — the closure evidence for THIS point: its own
+                        * photographs, and (read-only) the ones on its action. */}
+                      {(() => {
+                        const ev = evFor(f.id);
+                        const all = ev ? [...ev.closure_files, ...ev.voided_files] : [];
+                        const own = all.filter((x) => x.entity_table === 'fssai_inspection_findings');
+                        const fromCa = all.filter((x) => x.entity_table === 'fssai_corrective_actions');
+                        const settled = f.status === 'closed' || f.status === 'not_accepted';
+                        return (
+                          <div className="bg-[#FFF8F0] border border-[#E8D5C4] rounded-lg p-3 space-y-3">
+                            <ClosurePhotos
+                              files={own}
+                              title="Closure photographs"
+                              attachRefusal={rules ? rules.point_files_refusal : null}
+                              voidRefusal={rules ? rules.point_files_refusal : null}
+                              liveLimit={rules?.live_limit}
+                              onAttach={(uri) => attachPoint(f.id, uri)}
+                              onVoid={(attId, reason) => voidFile(f.id, attId, reason)}
+                              closedAt={settled ? f.closed_at : ''}
+                              emptyText={settled && !ev?.has_closure_photo
+                                ? 'Closed in words only — no photograph is on this point or its corrective action.'
+                                : 'No photograph on this point yet.'}
+                            />
+                            {fromCa.length > 0 && (
+                              <ClosurePhotos
+                                files={fromCa}
+                                title={`On corrective action ${ca?.ca_number || ''}`.trim()}
+                                hint="Added and voided in Corrective actions. Shown here because it is evidence this point was fixed."
+                                attachRefusal={null}
+                                voidRefusal={null}
+                              />
+                            )}
+                          </div>
+                        );
+                      })()}
                       {insp.status !== 'void' && (
                         <div className="flex flex-wrap gap-2">
                           {f.status !== 'closed' && f.status !== 'not_accepted' ? (
@@ -598,6 +686,11 @@ function Detail({
               <ul className="divide-y divide-[#E8D5C4]">
                 {trail.map((t, i) => (
                   <li key={i} className="px-4 py-2 text-xs">
+                    {t.entity_table === 'fssai_inspection_findings' && (
+                      <span className="text-[#8B7355]">
+                        point #{findings.find((x) => x.id === t.entity_id)?.finding_no || '?'} ·{' '}
+                      </span>
+                    )}
                     <span className="font-semibold">{t.action}</span>
                     {t.field ? <span className="text-[#8B7355]"> · {t.field}</span> : null}
                     <span className="text-[#8B7355]"> · {t.actor_name || t.actor_email} · {t.created_at}</span>
@@ -627,8 +720,16 @@ function Detail({
           {closing && (
             <CloseFindingModal
               finding={closing}
+              photos={(() => {
+                const ev = evFor(closing.id);
+                return ev ? [...ev.closure_files, ...ev.voided_files].filter((x) => x.entity_table === 'fssai_inspection_findings') : [];
+              })()}
+              caPhotos={evFor(closing.id)?.closure_files.filter((x) => x.entity_table === 'fssai_corrective_actions').length || 0}
+              rules={rules}
+              onAttach={(uri) => attachPoint(closing.id, uri)}
+              onVoid={(attId, reason) => voidFile(closing.id, attId, reason)}
               onClose={() => setClosing(null)}
-              onSaved={() => { setClosing(null); say('Point closed.'); load(); }}
+              onSaved={(msg) => { setClosing(null); say(msg || 'Point closed.'); load(); }}
             />
           )}
           {voidOpen && (
@@ -647,6 +748,164 @@ function Detail({
 /* ══════════════════════════════════════════════════════════════════════════
  * MODALS
  * ══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * THE INSPECTOR'S REPORT — line #120's first half, "Previous audit report".
+ *
+ * Two ways to keep a copy, and either counts: LINK the document filed in
+ * Documents & Certificates (fssai_inspections.document_id — the route refuses a
+ * dangling id, a voided document and anything not filed as an audit report),
+ * or PHOTOGRAPH the report's pages onto the visit. Replacing or removing a link
+ * takes a reason; the old link stays in the file. A voided page stays on
+ * screen, greyed, and is not counted as a copy.
+ */
+function ReportCard({
+  insp, evidence, candidates, refusal, liveLimit, onAttach, onVoid, onLink,
+}: {
+  insp: Inspection;
+  evidence: FssaiVisitClosureEvidence;
+  candidates: ReportDocument[];
+  /** '' = the link and the pages may change now; otherwise the server's sentence. */
+  refusal: string;
+  liveLimit?: number;
+  onAttach: (uri: string) => Promise<void>;
+  onVoid: (attachmentId: string, reason: string) => Promise<void>;
+  onLink: (documentId: string, reason: string) => Promise<void>;
+}) {
+  const rep = evidence.report;
+  const doc = rep.document;
+  const [pick, setPick] = useState('');
+  const [reason, setReason] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const others = candidates.filter((d) => d.id !== rep.document_id);
+  const needsReason = !!rep.document_id;
+
+  async function link(documentId: string) {
+    setBusy(true); setErr('');
+    try { await onLink(documentId, reason); setPick(''); setReason(''); }
+    catch (e: unknown) { setErr(e instanceof Error && e.message ? e.message : 'That could not be saved'); }
+    finally { setBusy(false); }
+  }
+
+  return (
+    <div className="bg-white rounded-xl border border-[#E8D5C4] p-4 space-y-4">
+      <div className="flex flex-nowrap items-start gap-2.5">
+        <FileText size={18} className="text-[#af4408] shrink-0 mt-0.5" />
+        <div className="min-w-0 flex-1">
+          <h2 className="font-semibold text-sm">Their report</h2>
+          <p className="text-xs text-[#8B7355] mt-0.5">
+            The audit file keeps a copy of every inspector&apos;s report with the evidence each point was closed.
+            Link the copy filed in Documents &amp; Certificates, or photograph its pages here — either counts.
+          </p>
+        </div>
+        <span className={`text-xs font-semibold px-2 py-0.5 rounded-full border shrink-0 ${rep.copies ? 'bg-green-100 text-green-700 border-green-200' : 'bg-amber-100 text-amber-800 border-amber-200'}`}>
+          {rep.copies ? `${rep.copies} cop${rep.copies === 1 ? 'y' : 'ies'} on file` : 'No copy on file'}
+        </span>
+      </div>
+
+      {/* the linked document */}
+      <div className="border border-[#E8D5C4] rounded-lg p-3 space-y-2">
+        <p className="text-xs font-semibold text-[#6B5744] flex flex-nowrap items-center gap-1.5">
+          <Link2 size={13} className="shrink-0" /> Filed in Documents &amp; Certificates
+        </p>
+        {doc ? (
+          <div className="space-y-1.5">
+            <p className="text-sm">
+              <span className="font-semibold">{doc.title}</span>
+              <span className="text-[#6B5744]">
+                {[doc.reference_no && ` · no. ${doc.reference_no}`, doc.issued_on && ` · ${doc.issued_on}`, ` · ${doc.doc_type_label}`].filter(Boolean).join('')}
+              </span>
+            </p>
+            {doc.scans.filter((x) => x.status !== 'void' && x.has_image).length > 0 && (
+              <div className="flex flex-wrap gap-2">
+                {doc.scans.filter((x) => x.status !== 'void' && x.has_image).map((x) => (
+                  <ImageThumb key={x.attachment_id} src={x.url} alt={x.filename || doc.title} size={64} />
+                ))}
+              </div>
+            )}
+            <a href="/fssai/documents" className="text-xs text-[#af4408] font-semibold hover:underline">
+              Open Documents &amp; Certificates
+            </a>
+          </div>
+        ) : rep.document_id ? null : (
+          <p className="text-xs text-[#8B7355] italic">No document is linked to this visit.</p>
+        )}
+        {rep.document_problem && (
+          <p className="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded p-2">{rep.document_problem}</p>
+        )}
+
+        {refusal === '' ? (
+          <div className="space-y-2 pt-1">
+            {others.length > 0 ? (
+              <div className="flex flex-wrap gap-2 items-end">
+                <label className="block flex-1 min-w-[14rem]">
+                  <span className="text-xs text-[#6B5744]">{doc ? 'Link a different report' : 'Link the report'}</span>
+                  <select value={pick} onChange={(e) => setPick(e.target.value)} className={FIELD}>
+                    <option value="">Choose a filed report…</option>
+                    {others.map((d) => (
+                      <option key={d.id} value={d.id}>
+                        {[d.title, d.reference_no && `no. ${d.reference_no}`, d.issued_on, d.live_scans ? `${d.live_scans} scan${d.live_scans === 1 ? '' : 's'}` : 'no scan'].filter(Boolean).join(' · ')}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <button
+                  type="button"
+                  disabled={busy || !pick || (needsReason && reason.trim().length < 4)}
+                  onClick={() => void link(pick)}
+                  className="text-sm font-semibold bg-[#af4408] hover:bg-[#8a3606] text-white rounded-lg px-3 py-2 disabled:opacity-50"
+                >
+                  {busy ? <Loader2 size={15} className="animate-spin inline" /> : doc ? 'Replace the link' : 'Link it'}
+                </button>
+              </div>
+            ) : (
+              <p className="text-xs text-[#8B7355]">
+                {doc ? 'No other audit report is filed.' : 'Nothing is filed as an audit report yet.'} File it in{' '}
+                <a href="/fssai/documents" className="text-[#af4408] font-semibold hover:underline">Documents &amp; Certificates</a>{' '}
+                as &ldquo;Previous audit report and closure evidence&rdquo;, then link it here — or photograph the pages below.
+              </p>
+            )}
+            {needsReason && (
+              <>
+                <Field label="Why the link is changing" hint="Needed to replace or remove a link. The old link stays in the file.">
+                  <input value={reason} onChange={(e) => setReason(e.target.value)} className={FIELD} placeholder="e.g. The signed copy arrived by post" />
+                </Field>
+                <button
+                  type="button"
+                  disabled={busy || reason.trim().length < 4}
+                  onClick={() => void link('')}
+                  className="text-xs font-semibold border border-red-200 text-red-700 bg-white rounded-lg px-2.5 py-1.5 hover:bg-red-50 disabled:opacity-50"
+                >
+                  Remove the link
+                </button>
+              </>
+            )}
+            {err && <p className="text-xs text-red-700">{err}</p>}
+          </div>
+        ) : (
+          <p className="text-[11px] text-[#8B7355]">{refusal}</p>
+        )}
+      </div>
+
+      {/* pages photographed onto the visit */}
+      <div className="border border-[#E8D5C4] rounded-lg p-3">
+        <ClosurePhotos
+          files={[...rep.files, ...rep.voided_files]}
+          title="Pages of the report, photographed"
+          hint={insp.status === 'closed' ? 'The visit is closed, but a report that arrives later can still be added.' : undefined}
+          attachRefusal={refusal}
+          voidRefusal={refusal}
+          liveLimit={liveLimit}
+          onAttach={onAttach}
+          onVoid={onVoid}
+          addLabel="Add page"
+          emptyText="No page photographed."
+        />
+      </div>
+    </div>
+  );
+}
 
 function NewVisitModal({
   departments, onClose, onSaved,
@@ -850,20 +1109,34 @@ function RaiseCaModal({
   );
 }
 
-function CloseFindingModal({ finding, onClose, onSaved }: { finding: Finding; onClose: () => void; onSaved: () => void }) {
+function CloseFindingModal({
+  finding, photos, caPhotos, rules, onAttach, onVoid, onClose, onSaved,
+}: {
+  finding: Finding;
+  /** this point's own files, live and void (line #120) */
+  photos: ClosureFile[];
+  /** live photographs on its corrective action — they count as closure evidence too */
+  caPhotos: number;
+  rules: ClosureRules | null;
+  onAttach: (uri: string) => Promise<void>;
+  onVoid: (attachmentId: string, reason: string) => Promise<void>;
+  onClose: () => void;
+  onSaved: (msg: string) => void;
+}) {
   const [response, setResponse] = useState('');
   const [notAccepted, setNotAccepted] = useState(false);
   const [err, setErr] = useState('');
   const [saving, setSaving] = useState(false);
+  const live = photos.filter((p) => p.status !== 'void').length + caPhotos;
 
   async function save() {
     setSaving(true); setErr('');
     try {
-      await apiJson('/api/fssai/inspections', {
+      const j = await apiJson<FileReply>('/api/fssai/inspections', {
         method: 'POST',
         body: { action: 'close_finding', id: finding.id, response, not_accepted: notAccepted ? '1' : '' },
       });
-      onSaved();
+      onSaved(String(j?.note_to_staff || ''));
     } catch (e: any) { setErr(e?.message || 'Could not save'); }
     finally { setSaving(false); }
   }
@@ -877,6 +1150,27 @@ function CloseFindingModal({ finding, onClose, onSaved }: { finding: Finding; on
       <Field label="What was done about it" required hint="A point closed with no answer is the first thing asked about at the next visit.">
         <textarea value={response} onChange={(e) => setResponse(e.target.value)} rows={4} className={FIELD} />
       </Field>
+      {/* Line #120 — "closure evidence". Photographs go on as they are taken;
+        * the close records which ones (by fingerprint) it was closed on. */}
+      <div className="bg-[#FFF8F0] border border-[#E8D5C4] rounded-lg p-3">
+        <ClosurePhotos
+          files={photos}
+          title="Closure photographs"
+          hint={caPhotos
+            ? `Its corrective action already carries ${caPhotos} photograph${caPhotos === 1 ? '' : 's'}; they count too. Add any of the point itself here.`
+            : 'A photograph of the point, fixed, is the evidence the next inspector asks for. Optional — but it cannot be removed once added; one taken by mistake is voided with a reason.'}
+          attachRefusal={rules ? rules.point_files_refusal : null}
+          voidRefusal={rules ? rules.point_files_refusal : null}
+          liveLimit={rules?.live_limit}
+          onAttach={onAttach}
+          onVoid={onVoid}
+        />
+        {!live && !notAccepted && (
+          <p className="text-[11px] text-amber-800 mt-2">
+            No photograph yet — this point would be closed on words alone.
+          </p>
+        )}
+      </div>
       <label className="flex items-start gap-2 text-sm">
         <input type="checkbox" checked={notAccepted} onChange={(e) => setNotAccepted(e.target.checked)} className="mt-0.5" />
         <span>

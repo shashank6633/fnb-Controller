@@ -118,7 +118,7 @@ export const FSSAI_PHASES: Record<number, { when: string; brings: string }> = {
   5: { when: 'Being built',    brings: 'the batch and expiry, oil and water records' },
   6: { when: 'Being built',    brings: 'pest control and the certificate cupboard' },
   7: { when: 'Being built',    brings: 'corrective actions, the follow-up tasks and the escalations' },
-  8: { when: 'Being built',    brings: 'the twelve ready-made checklists' },
+  8: { when: 'Being built',    brings: 'the fifteen ready-made checklists' },
   9: { when: 'Being built',    brings: 'the dashboard figures, Inspection Mode and the reports' },
   10: { when: 'Being built',   brings: 'the change-and-void trail behind every record' },
 };

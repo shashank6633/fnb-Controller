@@ -1999,10 +1999,19 @@ export const FSSAI_RECORD_TABLES: readonly { table: string; one: string; many: s
   { table: 'fssai_expiry_items',       one: 'expiry entry',           many: 'Expiry and disposal',     path: '/fssai/fifo' },
   { table: 'fssai_oil_checks',         one: 'oil check',              many: 'Oil checks',              path: '/fssai/oil-quality' },
   { table: 'fssai_oil_disposals',      one: 'used-oil collection',    many: 'Used-oil collections',    path: '/fssai/oil-quality' },
-  { table: 'fssai_water_tests',        one: 'water or ice test',      many: 'Water and ice tests',     path: '/fssai/water-ice' },
+  // 2026-10-14: the waste handover log (#114). One line per handover at the back
+  // door; a line entered by mistake is voided with a reason, never deleted.
+  { table: 'fssai_waste_handovers',    one: 'waste handover',         many: 'Waste handovers',         path: '/fssai/waste' },
+  { table: 'fssai_water_tests',       one: 'water or ice test',      many: 'Water and ice tests',     path: '/fssai/water-ice' },
   { table: 'fssai_pest_services',      one: 'pest control visit',     many: 'Pest control visits',     path: '/fssai/pest-control' },
   { table: 'fssai_pest_sightings',     one: 'pest sighting',          many: 'Pest sightings',          path: '/fssai/pest-control' },
-  { table: 'fssai_documents',          one: 'document',               many: 'Documents and certificates', path: '/fssai/documents' },
+  // 2026-10-14: the station-by-station monitoring sheet (#113). One line per
+  // station per walk; a line entered by mistake is voided with a reason.
+  { table: 'fssai_pest_device_checks', one: 'pest station check',     many: 'Pest station checks',     path: '/fssai/pest-control' },
+  { table: 'fssai_documents',          one: 'document',              many: 'Documents and certificates', path: '/fssai/documents' },
+  // 2026-10-14: the food-handler register (#55 #56 #106 #107). A person entered
+  // by mistake is voided with a reason; one who leaves is status 'left', never void.
+  { table: 'fssai_food_handlers',      one: 'food handler',           many: 'Food handlers',           path: '/fssai/documents/food-handlers' },
   { table: 'fssai_inspections',        one: 'inspection',             many: 'Inspections',             path: '/fssai/inspections' },
   { table: 'fssai_corrective_actions', one: 'corrective action',      many: 'Corrective actions',      path: '/fssai/corrective-actions' },
 ] as const;
@@ -2566,6 +2575,12 @@ export const FSSAI_DOC_TYPES: readonly {
   { key: 'supplier_licence',   label: 'Supplier FSSAI licence',        scope: 'vendor',    renews: true },
   { key: 'medical_fitness',    label: 'Medical fitness certificate',   scope: 'person',    renews: true },
   { key: 'food_handler_training', label: 'Food handler training',      scope: 'person',    renews: true },
+  // #107 "Food-safety training records" + the FoSTaC-trained Food Safety
+  // Supervisor the premises must have (2026-10-14). 'person' scope: filed against
+  // a food handler on the register (fssai_food_handlers, no login needed). It
+  // also counts as that person's food-safety training. FoSTaC certificates carry
+  // an expiry (usually two years), so it renews.
+  { key: 'fostac_certificate', label: 'FoSTaC certificate',            scope: 'person',    renews: true },
   { key: 'calibration_certificate', label: 'Calibration certificate',  scope: 'equipment', renews: true },
   { key: 'amc',                label: 'Service contract (AMC)',        scope: 'equipment', renews: true },
   // Food-Grade Equipment & Packaging: "Food-contact equipment is food-safe".
@@ -2714,6 +2729,7 @@ export const FSSAI_ATTACHMENT_ENTITIES: readonly string[] = [
   'fssai_expiry_items',
   'fssai_oil_checks',
   'fssai_oil_disposals',
+  'fssai_waste_handovers',   // 2026-10-14: the collector's receipt / the bins at the door (#114)
   'fssai_water_tests',
   'fssai_pest_services',
   'fssai_pest_sightings',
@@ -2734,6 +2750,33 @@ export const FSSAI_ATTACHMENT_KINDS: readonly { key: string; label: string }[] =
   { key: 'certificate', label: 'Certificate' },
   { key: 'report',      label: 'Report' },
 ] as const;
+
+/**
+ * WHY A FILE IS ON A RECORD — fssai_attachments.purpose (2026-10-14).
+ *
+ *   ''        evidence taken WITH the record (a delivery photograph, a sighting,
+ *             a licence scan) — and every row written before the column existed.
+ *   'closure' the proof a corrective action or an inspection finding was FIXED.
+ *             The Hyderabad checklist's line #120 asks for "closure evidence";
+ *             a sentence alone is a claim, a photograph of the mended seal is
+ *             evidence.
+ *   'report'  the inspector's or auditor's report itself, attached to the visit.
+ *
+ * A purpose is fixed at upload and never edited. A mistaken file is VOIDED
+ * (status 'void' + who + when + why) and stays visible as void — it is never
+ * blanked and never deleted (owner Q22; see the fssai_attachments DDL).
+ */
+export const FSSAI_ATTACHMENT_PURPOSES: readonly { key: '' | 'closure' | 'report'; label: string }[] = [
+  { key: '',        label: 'Evidence taken with the record' },
+  { key: 'closure', label: 'Closure evidence' },
+  { key: 'report',  label: 'Inspector’s or auditor’s report' },
+] as const;
+
+export type FssaiAttachmentPurpose = (typeof FSSAI_ATTACHMENT_PURPOSES)[number]['key'];
+
+export function isFssaiAttachmentPurpose(v: unknown): v is FssaiAttachmentPurpose {
+  return FSSAI_ATTACHMENT_PURPOSES.some((p) => p.key === String(v ?? ''));
+}
 
 /* ------------------------------------------------------------------ *
  * 14.13 P8 — THE SEED LOG

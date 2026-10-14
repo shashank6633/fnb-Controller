@@ -7,10 +7,12 @@ import {
 } from '@/lib/fssai';
 import { requireFssaiUser, fssaiCsrfGuard, fssaiAudit, fssaiAppAudit, str } from '@/lib/fssai-server';
 import {
-  insertP6Attachment, dropP6AttachmentImage, p6AttachmentsFor,
   voidP6Record, raiseP6CorrectiveAction, nextP6CaNumber, p6ConstraintMessage,
-  isoDateOrBlank, isoStampOrBlank, intOrNull, P6_ATTACHMENTS_PER_RECORD,
+  isoDateOrBlank, isoStampOrBlank, intOrNull,
 } from '../../p6-shared';
+import {
+  attachPestFile, voidPestFile, pestFilesFor, canVoidPestFiles, PEST_ACTIVE_FILES_PER_RECORD,
+} from '../_pest/files';
 
 /**
  * PEST CONTROL — WHAT OUR OWN STAFF SAW BETWEEN VISITS (owner §7).
@@ -42,10 +44,16 @@ import {
  * with nobody's name on it is exactly that shape. The response tells the screen
  * to push for one (`advice`); it does not invent it.
  *
+ * A photograph attached by mistake is VOIDED, never stripped ('void_file', or
+ * its old name 'remove_file'): it must be on THIS sighting, and it stays on the
+ * record marked void with its reason — decision in ../_pest/files.ts. Activity
+ * found on the monitoring sheet (/api/fssai/pest/checks) arrives here as a
+ * sighting too, so a pest seen anywhere is in one register.
+ *
  *   GET  ?id=<id>                                       one sighting + its photographs
  *   GET  [?from=&to=&pest_type=&severity=&status=&department_id=&device_id=&open=1&q=]
  *   POST { action: 'create' | 'update' | 'close' | 'link_service' | 'void'
- *                 | 'attach' | 'remove_file' | 'raise_ca', … }
+ *                 | 'attach' | 'void_file' | 'remove_file' | 'raise_ca', … }
  *
  * NO DELETE (§19).
  */
@@ -121,7 +129,9 @@ function shape(row: any, files: any[] = []) {
     updated_at: str(row.updated_at),
     is_open: !voided && str(row.status) !== 'verified' && !str(row.closed_at),
     files,
-    file_limit: P6_ATTACHMENTS_PER_RECORD,
+    /** Active files only — a voided photograph stays on the record but frees its place. */
+    active_file_count: files.filter((f: any) => !f.is_void).length,
+    file_limit: PEST_ACTIVE_FILES_PER_RECORD,
   };
 }
 
@@ -155,12 +165,13 @@ export async function GET(request: Request) {
     if (id) {
       const row = db.prepare(`${SELECT} WHERE g.id = ?`).get(id) as any;
       if (!row) return Response.json({ error: 'That sighting is no longer in the register.' }, { status: 404 });
-      const files = p6AttachmentsFor(db, 'fssai_pest_sightings', [id], { withImage: true }).get(id) || [];
+      const files = pestFilesFor(db, 'fssai_pest_sightings', [id], { withImage: true }).get(id) || [];
       return Response.json({
         sighting: shape(row, files),
         can_amend: canAmend(me, row),
         can_close: canManageFssaiCa(me),
         can_void: canManageFssaiCa(me),
+        can_void_files: canVoidPestFiles(me),
         me: me.email,
         today,
       });
@@ -220,7 +231,7 @@ export async function GET(request: Request) {
     ).all(...args) as any[];
     const truncated = rows.length > LIST_LIMIT;
     const page = truncated ? rows.slice(0, LIST_LIMIT) : rows;
-    const files = p6AttachmentsFor(db, 'fssai_pest_sightings', page.map((r) => String(r.id)));
+    const files = pestFilesFor(db, 'fssai_pest_sightings', page.map((r) => String(r.id)));
 
     const counts = db.prepare(
       `SELECT
@@ -333,13 +344,14 @@ export async function POST(request: Request) {
           me.email, me.name || '', outletId, now, now,
         );
         if (deviceId) {
-          // A device that caught something was, by definition, checked. This is
-          // the ONLY thing that writes last_checked_at, and it is a fact about
-          // this sighting — not a routine check log. "Device 7 checked, no
-          // activity" is a CHECKLIST ANSWER (§24), which is why there is no
-          // device-check table.
-          db.prepare(`UPDATE fssai_pest_devices SET last_checked_at = ?, updated_at = ? WHERE id = ?`)
-            .run(now, now, deviceId);
+          // A device that caught something was, by definition, looked at, so
+          // last_checked_at moves forward (never back). It is NOT the monitoring
+          // sheet: since 2026-10-14 the routine station-by-station check has its
+          // own table (fssai_pest_device_checks, /api/fssai/pest/checks), which
+          // also stamps this column, and whether a station is due is judged from
+          // that table alone (pestStationCoverage) — a sighting is not a check.
+          db.prepare(`UPDATE fssai_pest_devices SET last_checked_at = ?, updated_at = ? WHERE id = ? AND (last_checked_at = '' OR last_checked_at < ?)`)
+            .run(now, now, deviceId, now);
         }
         fssaiAudit(db, {
           entity_table: 'fssai_pest_sightings', entity_id: id, action: 'create',
@@ -387,7 +399,7 @@ export async function POST(request: Request) {
             : 'That sighting has been closed by a manager. Ask them to reopen it, or file a new sighting.',
         }, { status: 403 });
       }
-      const out = db.transaction(() => insertP6Attachment(db, {
+      const out = db.transaction(() => attachPestFile(db, {
         entity_table: 'fssai_pest_sightings', entity_id: id,
         kind: str(body.kind) || 'photo', data_uri: str(body.data_uri),
         filename: str(body.filename), caption: str(body.caption),
@@ -397,16 +409,18 @@ export async function POST(request: Request) {
       return Response.json({ attachment: out.attachment });
     }
 
-    if (action === 'remove_file') {
-      // The file must be on THIS sighting — dropP6AttachmentImage refuses one
-      // from any other record or register, and only allows a 24-hour correction
-      // (decision and rules documented there).
-      const out = db.transaction(() => dropP6AttachmentImage(db, {
+    if (action === 'void_file' || action === 'remove_file') {
+      // DECISION (../_pest/files.ts): a photograph on a filed sighting is
+      // VOIDED, never stripped. voidPestFile refuses (404) unless the file's own
+      // entity_table/entity_id are THIS sighting, so no other record or register
+      // can be reached through this id. The image stays; the void, its reason
+      // and an fssai_audit_log row are added. 'remove_file' is the old name.
+      const out = voidPestFile(db, {
         id: str(body.attachment_id), entity_table: 'fssai_pest_sightings', entity_id: id,
         reason: str(body.reason), me: me as any, outlet_id: outletId,
-      }))();
+      });
       if ('error' in out) return Response.json({ error: out.error }, { status: out.status });
-      return Response.json({ removed: out.dropped });
+      return Response.json({ voided_file: out.voided });
     }
 
     /* ── RAISE A CORRECTIVE ACTION ───────────────────────────────────────── */
