@@ -9093,7 +9093,7 @@ function initializeSchema(db: Database.Database) {
       -- The bottles move stock WHERE LIQUOR LIVES: ONE store_stock_ledger
       -- 'inward' row into the material's own store (ledger_id), at unit_cost 0
       -- so the store keeps valuing it at its EXISTING recorded basis. There is
-      -- NO central `purchases` row: every reader of that table (updateMaterialPrice,
+      -- NO central purchases row: every reader of that table (updateMaterialPrice,
       -- closing-valuation's last-purchase rung, the LPP boot backfill, cost
       -- spikes) would take the retail MRP as the item's rate — owner decision 1.
       -- The retail price lives ONLY here, as analytics. One row per ITEM LINE
@@ -9258,6 +9258,32 @@ function initializeSchema(db: Database.Database) {
         note          TEXT NOT NULL DEFAULT '',
         created_at    TEXT NOT NULL DEFAULT (datetime('now')),
         updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+    `,
+    `
+      -- ── L2. Inward numbers a REGISTER upload's charges cover ─────────────────
+      -- /procure-bulk takes a multi-inward register CSV: each line posts under
+      -- its OWN inward_no, while the four TGBCL levies are typed ONCE for the
+      -- upload and keyed on the HEADER ref, whose invoice_value spans every
+      -- inward the upload touched. The Net Indent and the wallet debit therefore
+      -- sit on the header, and nothing else recorded which inward numbers they
+      -- cover, so every reader keyed on a line's own ref (wallet integrity, §B,
+      -- check B) saw those inwards as indents with NO levies and NO debit.
+      -- One row per (store, inward number) per header that covers it. Written by
+      -- /procure-bulk's liquor block through linkIndentMembers (liquor-wallet),
+      -- in its own savepoint, so it never blocks a bill. ref keeps the file's
+      -- spelling (owner decision 4); ref_key is the LOWER(TRIM()) every reader
+      -- matches on. No FK to store_bill_charges, like lq_wallet_txns.source_ref:
+      -- readers JOIN it, so a link whose header row is gone simply stops counting.
+      CREATE TABLE IF NOT EXISTS lq_indent_members (
+        store_id    TEXT NOT NULL,
+        ref_key     TEXT NOT NULL,                     -- LOWER(TRIM(inward no))
+        ref         TEXT NOT NULL DEFAULT '',          -- the inward no as filed
+        charges_id  TEXT NOT NULL,                     -- store_bill_charges.id of the header
+        header_ref  TEXT NOT NULL DEFAULT '',          -- that row's invoice_ref, for display
+        created_by  TEXT NOT NULL DEFAULT '',
+        created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (store_id, ref_key, charges_id)
       );
     `,
   ];
@@ -9448,6 +9474,10 @@ function initializeSchema(db: Database.Database) {
       CREATE UNIQUE INDEX IF NOT EXISTS uq_lq_wallet_opening
         ON lq_wallet_txns(COALESCE(outlet_id,''))
         WHERE type = 'opening';
+
+      -- The header's own members (§B folds them under it). The PRIMARY KEY
+      -- already leads with (store_id, ref_key) for the per-inward lookups.
+      CREATE INDEX IF NOT EXISTS idx_lq_indent_members_charges ON lq_indent_members(charges_id);
 
       CREATE INDEX IF NOT EXISTS idx_lq_retail_date  ON lq_retail_flags(date);
       CREATE INDEX IF NOT EXISTS idx_lq_retail_bill  ON lq_retail_flags(bill_ref);

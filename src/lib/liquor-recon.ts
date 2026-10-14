@@ -685,11 +685,14 @@ function pickFromBrandMaps(
  *   → { ratePerBottle, allocatedLevies, landedPerBottle } | null
  *   Owner: L1. Read by L3 (depot rate to compare a wine-shop price against),
  *   L4 (the value frozen onto a withdrawal) and L5 (§D avg landed/bottle).
- *   CONTRACT: computed from RECORDED lines only — the master rate for the pack
- *   plus that line's share of the recorded levies (MRP rounding allocated BY
- *   BOTTLES, tax/cess/TCS BY LINE VALUE, matching the workbook and the deployed
- *   inward register). No rate may be hardcoded, and nothing may be written back
- *   to raw_materials or store_stock_ledger — see rule 1 in the header.
+ *   CONTRACT: computed from RECORDED lines only — the RATE PAID on the indent
+ *   line (owner decision 2, 2026-08-31; the L0 text said "the master rate for
+ *   the pack", and the owner settled that the other way) plus that line's share
+ *   of the recorded levies (MRP rounding allocated BY BOTTLES, tax/cess/TCS BY
+ *   LINE VALUE, matching the workbook and the deployed inward register). The
+ *   master is the YARDSTICK only (ratePerBottleVariance, §G). No rate may be
+ *   hardcoded, and nothing may be written back to raw_materials or
+ *   store_stock_ledger — see rule 1 in the header.
  *   Returns null when the material has no brand map row: the caller shows "not
  *   mapped", never a zero, which would read as "free". bottles_per_case is
  *   CHECKed > 0 in the schema precisely so a mapped row can never divide to
@@ -697,29 +700,41 @@ function pickFromBrandMaps(
  *
  * ── THREE THINGS A READER MUST KNOW BEFORE TRUSTING THIS NUMBER ─────────────
  *
- * 1. IT IS BUILT ON THE MASTER RATE, NOT THE RATE PAID. `ratePerBottle` is
- *    rate_per_case_master ÷ bottles_per_case, exactly as the contract above
- *    says. The workbook's Indent Lines!T/U instead build the landed value from
- *    K, the amount ACTUALLY PAID, and L5 §D follows the workbook
- *    (liquor-summary.ts: `bkt.landedValue += ln.subtotal + ln.levies`). So while
- *    a master is stale, this figure is stale with it and the module answers
- *    "landed cost" two ways — L1 per-bottle from the master, L5 §D in aggregate
- *    from what was paid. That divergence is DELIBERATE per the L0 contract and
- *    is the owner's to settle, not a phase's; until it is settled, every caller
- *    gets `indentRatePerBottle` and `ratePerBottleVariance` in the same object
- *    so it can see how far the master has drifted from the line it was priced
- *    against. Read them before freezing landedPerBottle onto a money record.
+ * 1. IT IS BUILT ON THE RATE PAID (owner decision 2, 2026-08-31). When an indent
+ *    rate differs from the Brand Master, the figures are built on what was
+ *    ACTUALLY PAID, and the master is kept as the yardstick only. So
+ *    `ratePerBottle` is the indent line's own rate (unit_cost × packFactor) —
+ *    the same basis the workbook's Indent Lines!T/U and L5 §C/§D use
+ *    (liquor-summary.ts: `bkt.landedValue += ln.subtotal + ln.levies`), so the
+ *    module now answers "landed cost" ONE way. It used to be the master
+ *    (rate_per_case_master ÷ bottles_per_case), which understated every landed
+ *    figure by exactly the §G drift while a master was stale — and L3 and L4
+ *    FREEZE this figure onto money records (the wine-shop excess baseline; a
+ *    "landed" recovery billed to a named person). Measured on the decisions
+ *    probe: master ₹4,200, paid ₹4,500, levies ₹280.1342 → ₹4,480.13 where the
+ *    paid basis is ₹4,780.13, i.e. a wine-shop excess overstated by ₹300 a
+ *    bottle and a recovery under-billed by ₹300.
+ *    The master is used for the rate in ONE case only: there is no recorded
+ *    line (basis 'master_only'), or the line recorded no rate (a ₹0 line).
+ *    `rateSource` says which, `masterRatePerBottle` and `ratePerBottleVariance`
+ *    carry the yardstick, and accepting a moved rate into the master (the §G
+ *    card) never re-prices anything already FROZEN on lq_retail_flags or
+ *    lq_withdrawals — that freezing is deliberate and stays.
  *
- * 2. THE TWO HALVES ARE CHOSEN ON DIFFERENT KEYS. The master rate comes from
- *    the PACK (lq_brand_map row); the levies come from the newest recorded
- *    store_stock_ledger line for the MATERIAL. That row carries no pack
- *    identity — store_stock_ledger has material_id and nothing else to filter
- *    on — so a material mapped to two packs of DIFFERENT ml is served whichever
- *    line was recorded last, whatever pack it was. Two packs that are the same
- *    bottle in different case counts are unaffected (levy per bottle is the
- *    same). Fixing this needs a pack column on the ledger, which is a schema
- *    change and not L1's to make; it is recorded here rather than left for the
- *    next reader to rediscover.
+ * 2. THE RATE AND THE LEVIES NOW COME FROM ONE LINE; THE PACK IS CHOSEN
+ *    SEPARATELY. The brand-map row (the PACK) decides whether the material is
+ *    priceable at all and supplies the master yardstick; the rate and the levies
+ *    both come from the newest recorded store_stock_ledger line for the
+ *    MATERIAL. That row carries no pack identity — store_stock_ledger has
+ *    material_id and nothing else to filter on — so a material mapped to two
+ *    packs of DIFFERENT ml is served whichever line was recorded last, whatever
+ *    pack it was. Per bottle here means per bottle of the MATERIAL's own pack
+ *    (packFactor), which is also how L3 and L4 read the figure back (L4 divides
+ *    it by packFactor to freeze ₹/ml), so rate and levies are at least on one
+ *    basis with each other and with their callers. Fixing the pack identity
+ *    needs a pack column on the ledger, which is a schema change and not L1's to
+ *    make; it is recorded here rather than left for the next reader to
+ *    rediscover.
  *
  * 3. THE LEVIES BELONG TO THE BILL REF, AND A store_bill_charges ROW CAN COVER
  *    MORE REFS THAN ITS OWN. /procure-bulk records a register CSV's lines under
@@ -740,9 +755,23 @@ export type LqLandedBasis =
    *  landed cost is the master rate. Honest: no recorded levy, no uplift. */
   | 'master_only';
 
+/** Which rate `ratePerBottle` is (owner decision 2): the rate PAID on the
+ *  indent line, or the master — the latter only when there is no recorded line
+ *  or the line recorded no rate. */
+export type LqLandedRateSource = 'paid' | 'master';
+
 export interface LqLandedCost {
-  /** ₹ per bottle from the MASTER: rate_per_case_master ÷ bottles_per_case. */
+  /** ₹ per bottle the landed figure is BUILT ON. Owner decision 2: the RATE
+   *  PAID on the indent line (= indentRatePerBottle) whenever one was recorded;
+   *  the master (rate_per_case_master ÷ bottles_per_case) only when nothing was
+   *  paid — see rateSource. */
   ratePerBottle: number;
+  /** 'paid' | 'master' — which rate ratePerBottle is. */
+  rateSource: LqLandedRateSource;
+  /** The master yardstick, ₹ per bottle — null when the pack has no master rate
+   *  yet (rate_per_case_master 0). Never the basis of landedPerBottle while a
+   *  paid rate exists. */
+  masterRatePerBottle: number | null;
   /** ₹ per bottle of allocated BILL-LEVEL levies. SIGNED — MRP rounding is a
    *  signed correction, so this can be negative. */
   allocatedLevies: number;
@@ -764,7 +793,8 @@ export interface LqLandedCost {
   /** ₹ per bottle actually paid on that line — null when there is no line.
    *  Kept beside the master rate so a caller never has to guess which is which. */
   indentRatePerBottle: number | null;
-  /** indentRatePerBottle − ratePerBottle, null when there is no line. */
+  /** indentRatePerBottle − masterRatePerBottle (the §G drift), null when there
+   *  is no line or no master rate. */
   ratePerBottleVariance: number | null;
   /** Per-LINE charges per bottle (cgst+sgst+delivery−discount). Excluded from
    *  `allocatedLevies` by contract; see LqIndentLine.lineCharges. */
@@ -822,28 +852,14 @@ export function landedCostPerBottleExplained(
     // the belt for a row that arrived some other way.
     return { value: null, reason: 'not_mapped', candidates: pick.candidates };
   }
-  // A MAPPED PACK WITH NO RATE IS NOT A LANDED COST. rate_per_case_master is
-  // `NOT NULL DEFAULT 0` with no CHECK — unlike bottles_per_case, which has no
-  // default and CHECK > 0 — and the importer deliberately stores 0 with a
-  // warning ("the row maps, the rate is filled in later"). So a rateless row is
-  // a normal, expected state, and building a landed cost on it produces a
-  // figure made ENTIRELY of allocated levies: small, plausible, non-zero, and
-  // therefore invisible to every `> 0` guard downstream (L3's
-  // resolveDepotLanded, L4's freeze, retailExcessSummary). Measured on the
-  // fixture: ₹94.13 where the truth was ≈ ₹1,094 — 91% low, reported as
-  // source 'landed'. null is this module's honest answer for "cannot be priced".
-  //
-  // NOT applied to the §G rate-movement watch (varianceRowsFrom below): there a
-  // master of 0 against a real indent rate is the SIGNAL, and its Accept button
-  // is how the rate gets filled in. Refusing to compute it there would hide the
-  // one row an admin needs to act on.
-  if (!(bm.rate_per_case_master > 0)) {
-    return { value: null, reason: 'no_master_rate', candidates: pick.candidates };
-  }
+  // The master YARDSTICK for this pack — null when the pack has no rate yet.
+  // rate_per_case_master is `NOT NULL DEFAULT 0` with no CHECK (unlike
+  // bottles_per_case), and the importer deliberately stores 0 with a warning
+  // ("the row maps, the rate is filled in later"), so a rateless row is a
+  // normal, expected state.
+  const masterRate: number | null = bm.rate_per_case_master > 0 ? bm.rate_per_bottle_master : null;
 
-  const ratePerBottle = bm.rate_per_bottle_master;
-
-  // Find the recorded line whose levies apply.
+  // Find the recorded line whose RATE (owner decision 2) and levies apply.
   const where: string[] = ["l.txn_type = 'purchase'", 'l.material_id = ?'];
   const args: any[] = [bm.material_id];
   if (opts.storeId) { where.push('l.store_id = ?'); args.push(opts.storeId); }
@@ -857,14 +873,48 @@ export function landedCostPerBottleExplained(
     LIMIT 1
   `).get(...args) as any;
 
+  // The line, allocated over its WHOLE bill. `undefined` when nothing was ever
+  // recorded, or (should be unreachable — the line was found by the same
+  // predicate the allocation reads) when it is missing from its own bill; both
+  // degrade to master-only rather than to a wrong number.
+  const ln: LqIndentLine | undefined = line
+    ? allocateIndentBill(db, String(line.store_id), String(line.invoice_ref))
+        .lines.find(x => x.ledgerId === String(line.id))
+    : undefined;
+
+  // OWNER DECISION 2 — VALUE AT THE RATE PAID. The rate is the line's own
+  // indent rate whenever one was recorded; the master only when nothing was
+  // paid (no line, or a ₹0 line). See note 1 in the block above.
+  const paid = ln && ln.indentRatePerBottle > 0 ? ln.indentRatePerBottle : null;
+
+  // A PACK WITH NOTHING TO PRICE IT ON IS NOT A LANDED COST. With no rate paid
+  // AND no master rate, the only figure left is made ENTIRELY of allocated
+  // levies: small, plausible, non-zero, and therefore invisible to every `> 0`
+  // guard downstream (L3's resolveDepotLanded, L4's freeze,
+  // retailExcessSummary). Measured on the fixture: ₹94.13 where the truth was
+  // ≈ ₹1,094 — 91% low, reported as source 'landed'. null is this module's
+  // honest answer for "cannot be priced". (A rateless master WITH a paid line
+  // is priced on the rate paid — the master is only the yardstick now.)
+  //
+  // NOT applied to the §G rate-movement watch (varianceRowsFrom below): there a
+  // master of 0 against a real indent rate is the SIGNAL, and its Accept button
+  // is how the rate gets filled in. Refusing to compute it there would hide the
+  // one row an admin needs to act on.
+  if (paid == null && masterRate == null) {
+    return { value: null, reason: 'no_master_rate', candidates: pick.candidates };
+  }
+  const ratePerBottle = (paid ?? masterRate) as number;
+  const rateSource: LqLandedRateSource = paid != null ? 'paid' : 'master';
+
   const shell = {
     basis: 'master_only' as LqLandedBasis,
     brandMapId: bm.id, materialId: bm.material_id,
     tgbclBrandCode: bm.tgbcl_brand_code, sizeCode: bm.size_code,
     bottlesPerCase: bm.bottles_per_case, ratePerCaseMaster: bm.rate_per_case_master,
+    rateSource, masterRatePerBottle: masterRate,
   };
 
-  if (!line) {
+  if (!ln) {
     return {
       value: {
         ...shell,
@@ -875,23 +925,6 @@ export function landedCostPerBottleExplained(
         indentRatePerBottle: null, ratePerBottleVariance: null,
         lineChargesPerBottle: 0,
         landedWithLineChargesPerBottle: ratePerBottle,
-      },
-      reason: 'ok', candidates: pick.candidates,
-    };
-  }
-
-  const alloc = allocateIndentBill(db, String(line.store_id), String(line.invoice_ref));
-  const ln = alloc.lines.find(x => x.ledgerId === String(line.id));
-  if (!ln) {
-    // Should be unreachable (the line was found by the same predicate the
-    // allocation reads). Degrade to master-only rather than to a wrong number.
-    return {
-      value: {
-        ...shell,
-        ratePerBottle, allocatedLevies: 0, landedPerBottle: ratePerBottle,
-        ledgerId: '', invoiceRef: '', inwardDate: '',
-        indentRatePerBottle: null, ratePerBottleVariance: null,
-        lineChargesPerBottle: 0, landedWithLineChargesPerBottle: ratePerBottle,
       },
       reason: 'ok', candidates: pick.candidates,
     };
@@ -910,7 +943,7 @@ export function landedCostPerBottleExplained(
       invoiceRef: ln.invoiceRef,
       inwardDate: ln.inwardDate,
       indentRatePerBottle: ln.indentRatePerBottle,
-      ratePerBottleVariance: r4(ln.indentRatePerBottle - ratePerBottle),
+      ratePerBottleVariance: masterRate == null ? null : r4(ln.indentRatePerBottle - masterRate),
       lineChargesPerBottle: ln.lineChargesPerBottle,
       landedWithLineChargesPerBottle: r4(landedPerBottle + ln.lineChargesPerBottle),
     },
@@ -971,9 +1004,13 @@ export interface LqRateVarianceRow {
   leviesLine: number;
   leviesPerBottle: number;
   lineChargesPerBottle: number;
-  /** masterRate + leviesPerBottle — the landed cost of a bottle on this line.
-   *  null when unmapped, never 0: a zero would read as "free". ANALYTICS ONLY
-   *  (plan decision 1(a)); nothing writes it back to a valuation column. */
+  /** indentRate + leviesPerBottle — the landed cost of a bottle on this line,
+   *  built on the RATE PAID (owner decision 2; it used to be masterRate +
+   *  levies, which understated it by exactly `variance`). The master is used
+   *  only for a ₹0 line, the same rule as landedCostPerBottle. null when
+   *  unmapped (or nothing to price it on), never 0: a zero would read as
+   *  "free". ANALYTICS ONLY (plan decision 1(a)); nothing writes it back to a
+   *  valuation column. */
   landedPerBottle: number | null;
   /** landedPerBottle × bottles. null when unmapped. */
   landedValue: number | null;
@@ -1020,7 +1057,14 @@ function varianceRowsFrom(
     const bm = pick.row;
     const masterRate = bm ? bm.rate_per_bottle_master : null;
     const variance = masterRate == null ? null : r4(ln.indentRatePerBottle - masterRate);
-    const landedPerBottle = masterRate == null ? null : r4(masterRate + ln.leviesPerBottle);
+    // Owner decision 2: landed on the RATE PAID; the master is the yardstick
+    // (`variance`), and stands in for the rate only on a ₹0 line — exactly the
+    // rule landedCostPerBottleExplained applies, so the Rate Movement card, the
+    // register's recon block and the figure L3/L4 freeze cannot disagree.
+    const landedRate = !bm ? null
+      : (ln.indentRatePerBottle > 0 ? ln.indentRatePerBottle
+        : (masterRate != null && masterRate > 0 ? masterRate : null));
+    const landedPerBottle = landedRate == null ? null : r4(landedRate + ln.leviesPerBottle);
     out.push({
       allocated: ln.allocated,
       leviesLine: ln.leviesLine,

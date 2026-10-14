@@ -3,7 +3,7 @@ import { getCurrentOutletId } from '@/lib/auth';
 import { getStoreById, listStores, materialStoreId } from '@/lib/store-engine';
 import { requireWithdrawalsAdmin } from './_lib/guard';
 import {
-  createWithdrawal, listWithdrawals, withdrawalSummary, storeMaterialOnHand,
+  createWithdrawal, listWithdrawals, withdrawalSummary, storeMaterialOnHand, WithdrawalRefusal,
   type WithdrawalMaterial, type CreateWithdrawalInput,
 } from '@/lib/liquor-withdrawals';
 import {
@@ -137,6 +137,12 @@ export async function POST(request: Request) {
     const row = createWithdrawal(db, input, mat);
     return Response.json({ ok: true, withdrawal: row }, { status: 201 });
   } catch (e: any) {
+    // A refusal someone must act on elsewhere first (run Migrate; decide the
+    // count that already covers this date) — 409 with its code, nothing written.
+    // Not logged as an error: it is the guard working.
+    if (e instanceof WithdrawalRefusal) {
+      return Response.json({ error: e.message, code: e.code }, { status: e.status });
+    }
     console.error('[/api/liquor/withdrawals POST]', e);
     // createWithdrawal throws user-presentable messages for validation; surface
     // those as 400, unexpected failures as 500.

@@ -50,6 +50,21 @@ import {
 // its implementation, this file picks it up with no edit.
 import * as recon from '@/lib/liquor-recon';
 
+/* ── A refusal with its own status and code ───────────────────────────────────
+ * Everything else createWithdrawal throws is a plain Error that the route maps
+ * to 400 by message. These are the refusals a person must act on elsewhere
+ * first (run Migrate, decide a pending count), so they carry a 409 and a
+ * machine-readable `code`, the same shape the wine-shop route returns for
+ * `not_migrated`. Nothing is written when one is thrown. */
+export type WithdrawalRefusalCode = 'not_migrated' | 'count_pending' | 'count_applied';
+export class WithdrawalRefusal extends Error {
+  readonly status = 409;
+  constructor(message: string, readonly code: WithdrawalRefusalCode) {
+    super(message);
+    this.name = 'WithdrawalRefusal';
+  }
+}
+
 /* ── Material meta the maths needs ───────────────────────────────────────── */
 export interface WithdrawalMaterial extends PackMeta {
   id: string;
@@ -217,12 +232,40 @@ export function storeMaterialOnHand(db: Database.Database, storeId: string, mate
  * `quantity > 0 OR txn_type='transfer'` (a negative adjustment is excluded
  * exactly as a negative outward was), and the physical-mode opening/closing
  * fallbacks sum every type. Only the ledger-mode "was this a pour?" test
- * changes — which is the defect. */
+ * changes — which is the defect.
+ *
+ * PHYSICAL MODE (the default, autodeduct off) is the other half: there ACTUAL
+ * is opening + inflow − closing, the bottle is simply missing from the count,
+ * and only bar_empties was netted, so every withdrawal still read as leak
+ * (measured: one 1-BTL breakage, actual 750 ml, ₹4,299.97). The bar
+ * reconciliation now adds lq_withdrawals to its known non-sale figure on the
+ * withdrawal's business date — the [LIQUOR-RECON] blocks in store-engine.ts
+ * floorReconciliation and overallReconciliation.
+ *
+ * THE ROW IS DATED ON THE WITHDRAWAL'S BUSINESS DAY, NOT ON THE DAY IT WAS TYPED.
+ * The store ledger has no date column; every reader buckets on created_at. The
+ * closing count's system figure is `date(created_at) <= count date` (UTC day,
+ * stores/[id]/closing/route.ts asOfStats) and the floor reconciliation, §H and
+ * depot spend use `date(created_at, '+330 minutes')` (IST day). A row stamped
+ * `now` for yesterday's broken bottle sat outside yesterday on BOTH: measured,
+ * a WD dated 2026-10-13 was stamped 2026-10-14 10:21, the re-typed 10-13 count
+ * then read system 4500 against a true shelf of 3750 (variance −750, pending),
+ * and approving that took the same bottle off a second time (book 18000 against
+ * a shelf of 18750, the next count +750). The wine-shop buy already dates its
+ * row this way (liquor-retail.ts); this does the same, with one refinement:
+ * the instant is chosen so that its UTC day AND its IST day are both the
+ * business date — the current IST time of day, but never earlier than 05:30
+ * IST (00:00 UTC). Between 00:00 and 05:30 IST the plain time of day would put
+ * the row on the previous UTC day, i.e. on the wrong side of the closing route.
+ * A row for TODAY keeps `now`, exactly as every other writer does, so nothing
+ * is ever stamped in the future. */
 export function postWithdrawalStock(
   db: Database.Database,
   w: {
     store_id: string; material_id: string; qty_recipe_units: number;
     ref: string; category: LqWithdrawalCategory; recorded_by: string; note?: string;
+    /** Business date (YYYY-MM-DD, IST). Omitted or today → stamped now. */
+    date?: string;
   },
 ): { ledgerId: string } {
   const qty = Number(w.qty_recipe_units);
@@ -230,6 +273,13 @@ export function postWithdrawalStock(
     // POSITIVE in, NEGATIVE out: the register holds the magnitude, the ledger the
     // sign. A non-positive magnitude here would flip the movement into an inflow.
     throw new Error('qty_recipe_units must be a positive number');
+  }
+  const businessDate = /^\d{4}-\d{2}-\d{2}$/.test(String(w.date || '')) ? String(w.date) : '';
+  const today = todayIST();
+  if (businessDate && businessDate > today) {
+    // createWithdrawal refuses this first; the helper must not be the place a
+    // future-dated movement gets through if another caller ever appears.
+    throw new Error(`date ${businessDate} is in the future — a withdrawal records stock that has already left`);
   }
   const ledgerId = postLedger(db, {
     store_id: w.store_id,
@@ -240,7 +290,16 @@ export function postWithdrawalStock(
     ref: w.ref,
     notes: w.note || `Withdrawal ${w.ref} (${w.category})`,
     created_by: w.recorded_by,
+    // MOVEMENT RECORD field 7: the business date the bottle left.
+    ...(businessDate ? { txn_date: businessDate } : {}),
   });
+  if (businessDate && businessDate < today) {
+    db.prepare(`
+      UPDATE store_stock_ledger
+         SET created_at = datetime(? || ' ' || MAX('05:30:00', strftime('%H:%M:%S', 'now', '+330 minutes')), '-330 minutes')
+       WHERE id = ?
+    `).run(businessDate, ledgerId);
+  }
   return { ledgerId };
 }
 
@@ -342,10 +401,10 @@ export function createWithdrawal(
   }
   const date = String(input.date || '').trim();
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new Error('date must be YYYY-MM-DD');
-  // A withdrawal is a record of stock that HAS LEFT. The stock movement it posts
-  // is stamped now, so a future business date books the register in a period the
-  // ledger will never reach. Backdating stays open (recording yesterday's bottle
-  // is the normal case) and is documented as a period-basis caveat on §H.
+  // A withdrawal is a record of stock that HAS LEFT, so a future business date is
+  // refused. Backdating stays open (recording yesterday's bottle is the normal
+  // case), and the stock movement is dated on that business day, not today (see
+  // postWithdrawalStock), so a count of that day sees it.
   if (date > todayIST()) {
     throw new Error(`date ${date} is in the future — a withdrawal records stock that has already left`);
   }
@@ -360,6 +419,36 @@ export function createWithdrawal(
   // the quantity is the deployed convention; only the landed COST touches L1.
   const qtyRecipe = tripleToRecipe(cases, bottles, 0, mat);
   if (!(qtyRecipe > 0)) throw new Error('Enter a quantity to withdraw — cases and/or bottles');
+
+  // NOT YET MIGRATED — refused BEFORE the on-hand guard, and allow_negative does
+  // not override it. An item whose stock still sits in CENTRAL
+  // (raw_materials.current_stock > 0) and has never had a row on this store's
+  // ledger predates the store. Measured with the override on ABSOLUT (central
+  // 27000 ml, no store history): the forced issue wrote the item's first store
+  // row (store −750), Migrate then refused it for good ("already has LIQUOR
+  // STORE ledger history — not migrated"), the next count read system −750
+  // against a shelf of 26250 (variance +27000, ₹78,259.50), and approving that
+  // left central 27000 AND the store 26250 — 53,250 ml on the books for a
+  // 26,250 ml shelf. The wine-shop buy refuses the same item the same way
+  // (liquor-retail.ts, code 'not_migrated'); this is the one rule for both.
+  const centralRow = db.prepare('SELECT current_stock FROM raw_materials WHERE id = ?')
+    .get(input.material_id) as { current_stock: number | null } | undefined;
+  const centralQty = Number(centralRow?.current_stock) || 0;
+  if (centralQty > 0) {
+    const hist = db.prepare(
+      'SELECT 1 FROM store_stock_ledger WHERE store_id = ? AND material_id = ? LIMIT 1',
+    ).get(input.store_id, input.material_id);
+    if (!hist) {
+      const pf = packFactor(mat) || 1;
+      const held = `${Math.round((centralQty / pf) * 1000) / 1000} ${mat.purchase_unit || mat.unit}`;
+      throw new WithdrawalRefusal(
+        `${mat.name} still holds ${held} in Central stock and has never been moved into ${store.name}. `
+        + `A withdrawal now would be its first ${store.name} entry, after which Migrate skips the item and that Central stock is counted twice. `
+        + `Ask an admin to run Migrate on ${store.name} for this item first, then record the withdrawal. Nothing was saved.`,
+        'not_migrated',
+      );
+    }
+  }
 
   // Stock guard: you cannot issue what the book does not show, unless explicitly
   // overridden. Keeps a fat-fingered "10 cases" from silently driving a bar
@@ -393,6 +482,56 @@ export function createWithdrawal(
        AND created_at >= datetime('now','-120 seconds')
      ORDER BY created_at DESC LIMIT 1
   `);
+
+  // COUNTED ON OR AFTER THIS DATE ALREADY (the statement; it runs inside the
+  // transaction, so a count saved by another process cannot slip in between the
+  // check and the write). A store count's variance is FROZEN at save time:
+  // approveVariance() posts the stored figure, it does not re-work it. A count
+  // dated on or after this withdrawal's date was worked out against a book that
+  // did not yet have this withdrawal, so:
+  //   • PENDING — approving it after this withdrawal takes the same stock off
+  //     twice (measured: D-1 count −750 approved, then the D-1 bottle's
+  //     withdrawal → book 18000 against a shelf of 18750, next count +750).
+  //     Fixable in order: reject it, record this, re-save that count (a re-saved
+  //     count that now matches clears its pending row — variance-approval.ts).
+  //   • APPROVED (by a person or automatically under the bar) — the book was
+  //     already set to that day's shelf, which no longer held this stock.
+  //     Recording it now moves the book below the shelf, and nothing re-works
+  //     an applied count, so it is refused outright.
+  // A count that MATCHED has no approval row and is not a conflict: the next
+  // count compares against the live book. A REJECTED one moved nothing.
+  const countConflictStmt = db.prepare(`
+    SELECT date, status, variance, auto_applied
+      FROM variance_approvals
+     WHERE source = 'liquor' AND store_id = ? AND material_id = ? AND date >= ?
+       AND status IN ('pending', 'approved')
+     ORDER BY CASE status WHEN 'approved' THEN 0 ELSE 1 END, date DESC, created_at DESC
+     LIMIT 1
+  `);
+  const countConflict = (): WithdrawalRefusal | null => {
+    const c = countConflictStmt.get(input.store_id, input.material_id, date) as
+      { date: string; status: string; variance: number; auto_applied: number } | undefined;
+    if (!c) return null;
+    const pf = packFactor(mat) || 1;
+    const v = Number(c.variance) || 0;
+    const vTxt = `${v > 0 ? '+' : v < 0 ? '−' : ''}${Math.round((Math.abs(v) / pf) * 1000) / 1000} ${mat.purchase_unit || mat.unit}`;
+    if (c.status === 'approved') {
+      return new WithdrawalRefusal(
+        `${store.name}'s count of ${mat.name} for ${c.date} has already been applied (${vTxt}`
+        + `${Number(c.auto_applied) ? ', applied at count time' : ''}), so the book was set to what was on the shelf that day. `
+        + `Stock that had left by then is already off the book, and a withdrawal dated ${date} would take it off a second time. `
+        + `Nothing was saved. If the stock left after that count was taken, record it on a later business day.`,
+        'count_applied',
+      );
+    }
+    return new WithdrawalRefusal(
+      `${store.name}'s count of ${mat.name} for ${c.date} is waiting in Variance Approvals (${vTxt}). `
+      + `It was worked out before this withdrawal was recorded, so approving it afterwards would take the same stock off twice. `
+      + `Reject that count in Variance Approvals, record this withdrawal, then re-save the ${c.date} count so it is worked out against the corrected book. `
+      + `Nothing was saved.`,
+      'count_pending',
+    );
+  };
 
   // Frozen landed cost (₹/recipe-unit) + value.
   const landed = resolveLandedUnitCost(db, {
@@ -497,10 +636,13 @@ export function createWithdrawal(
         );
       }
     }
+    const conflict = countConflict();
+    if (conflict) throw conflict;
     const ref = mintWithdrawalRef(db, date);
     const { ledgerId } = postWithdrawalStock(db, {
       store_id: input.store_id, material_id: input.material_id,
       qty_recipe_units: qtyRecipe, ref, category, recorded_by: input.recorded_by,
+      date,
       note: `Withdrawal ${ref} — ${category}${input.taken_by ? ` (${input.taken_by})` : ''}`,
     });
 
@@ -527,14 +669,23 @@ export function createWithdrawal(
       // department rail instead of the central one. DELETE /api/wastage refuses
       // this row outright, keyed on the wastage_id stamped below in this same
       // transaction (see the block above co_write_wastage).
+      //
+      // THE NOTE CARRIES NO ₹ AND NO REMARKS. /wastage is read by every role
+      // (GET /api/wastage has no money gate), while this register is admin-only.
+      // The note used to carry "(₹<landed_value> landed)" — for one bottle that
+      // IS the frozen L1 landed rate, the admin-only register's own figure (and
+      // the TGBCL master itself for a brand with no recorded indent) — and
+      // the withdrawal's free-text remarks; measured on the copy, all 19 roles
+      // read "(₹4014.69 landed) … dropped at the bar", including bar staff the
+      // withdrawals API refuses. The WD ref is the join key an admin follows
+      // back to the full record; the figures and remarks stay on it.
       wastageId = generateId();
       insertWastage.run(
         wastageId, date, input.material_id, qtyRecipe,
         CO_WRITE_WASTAGE_REASON,
         input.recorded_by,
-        `${ref} · liquor withdrawal, RECORD ONLY — stock already off the ${store.name} ledger`
-          + ` (₹${landedValue} landed); cannot be deleted from /wastage — it never left central`
-          + `${remarks ? ` — ${remarks}` : ''}`,
+        `${ref} · liquor withdrawal, RECORD ONLY — stock already off the ${store.name} ledger;`
+          + ' cannot be deleted from /wastage — it never left central',
         input.outlet_id || null,
       );
     }
@@ -662,13 +813,12 @@ export function listWithdrawals(db: Database.Database, f: WithdrawalFilter = {})
  * cost — the withdrawal numerator is landed value, the ratio is a rough "how much
  * of what we bought walked out unsold" gauge, exactly as the workbook's §H reads.
  *
- * PERIOD BASIS, stated because the two sides differ and cannot be made to agree
- * here: the numerator buckets on lq_withdrawals.date (the BUSINESS date the
- * admin typed), the denominator on store_stock_ledger.created_at (+330 minutes),
- * because the ledger has no business-date column — postLedger stamps `now` and
- * that is a store-rail fact, not an L4 one. Future dates are refused at create,
- * so the drift is bounded to backdating: a bottle recorded today for last month
- * counts in last month's §H while its stock left the ledger today. */
+ * PERIOD BASIS: the numerator buckets on lq_withdrawals.date (the BUSINESS date
+ * the admin typed), the denominator on store_stock_ledger.created_at (+330
+ * minutes), because the ledger has no business-date column. A withdrawal's own
+ * ledger row is dated on its business day (postWithdrawalStock), so the two
+ * agree for withdrawals; an inflow row lands on the day its own writer stamped
+ * (the wine-shop buy and TGBCL procure date theirs to the bill). */
 export interface WithdrawalCategoryStat {
   category: LqWithdrawalCategory;
   count: number;
@@ -774,43 +924,45 @@ export interface RecoveryUpdate {
   actor_email: string;
 }
 export function recordRecovery(db: Database.Database, id: string, u: RecoveryUpdate): LqWithdrawal {
-  // Read + write inside ONE transaction. The read-modify-write is unreachable
-  // as a lost update today (synchronous better-sqlite3, one process, no await
-  // between the two), but this is a money field and the transaction costs
-  // nothing. `recoverable` is written back only when it actually changed, so a
-  // caller sending only `recovered` cannot clobber a concurrent change to it.
-  const cur = getWithdrawalById(db, id);
-  if (!cur) throw new Error('Withdrawal not found');
+  // Read + validate + write inside ONE IMMEDIATE transaction, so the row the
+  // checks run against is the row the UPDATE lands on: IMMEDIATE takes the
+  // write lock at BEGIN, so a second process's save serialises behind this one
+  // instead of slipping in between the read and the write. Any refusal below
+  // throws before a write and rolls back to nothing. `recoverable` is written
+  // back only when it actually changed, so a caller sending only `recovered`
+  // never rewrites it.
+  const before = db.transaction((): LqWithdrawal => {
+    const cur = getWithdrawalById(db, id);
+    if (!cur) throw new Error('Withdrawal not found');
 
-  let recoverable = Number(cur.recoverable) || 0;
-  if (u.recoverable_custom !== undefined && u.recoverable_custom !== null) {
-    // REFUSE rather than ignore. Silently returning 200 with the unchanged row
-    // told a caller correcting a money figure that it had worked: measured, a
-    // 'landed' row at ₹1,800 patched with recoverable_custom 5 came back 200,
-    // still ₹1,800.
-    if (cur.recovery_basis !== 'custom') {
-      throw new Error(
-        `${cur.ref} recovers at "${cur.recovery_basis}", so its recoverable is derived and cannot be typed`
-        + ` — only a "Custom amount" row takes a recoverable figure`,
-      );
+    let recoverable = Number(cur.recoverable) || 0;
+    if (u.recoverable_custom !== undefined && u.recoverable_custom !== null) {
+      // REFUSE rather than ignore. Silently returning 200 with the unchanged row
+      // told a caller correcting a money figure that it had worked: measured, a
+      // 'landed' row at ₹1,800 patched with recoverable_custom 5 came back 200,
+      // still ₹1,800.
+      if (cur.recovery_basis !== 'custom') {
+        throw new Error(
+          `${cur.ref} recovers at "${cur.recovery_basis}", so its recoverable is derived and cannot be typed`
+          + ` — only a "Custom amount" row takes a recoverable figure`,
+        );
+      }
+      const rc = Number(u.recoverable_custom);
+      if (!Number.isFinite(rc) || rc < 0) throw new Error('recoverable must be a number ≥ 0');
+      recoverable = round2(rc);
     }
-    const rc = Number(u.recoverable_custom);
-    if (!Number.isFinite(rc) || rc < 0) throw new Error('recoverable must be a number ≥ 0');
-    recoverable = round2(rc);
-  }
-  let recovered = Number(cur.recovered) || 0;
-  if (u.recovered !== undefined && u.recovered !== null) {
-    const rv = Number(u.recovered);
-    if (!Number.isFinite(rv) || rv < 0) throw new Error('recovered must be a number ≥ 0');
-    recovered = round2(rv);
-  }
-  if (recovered > recoverable + 1e-9) {
-    throw new Error(`Recovered (₹${recovered}) cannot exceed recoverable (₹${recoverable})`);
-  }
-  const remarks = u.remarks !== undefined && u.remarks !== null ? String(u.remarks) : cur.remarks;
-  const recoverableChanged = Math.abs(recoverable - (Number(cur.recoverable) || 0)) > 1e-9;
+    let recovered = Number(cur.recovered) || 0;
+    if (u.recovered !== undefined && u.recovered !== null) {
+      const rv = Number(u.recovered);
+      if (!Number.isFinite(rv) || rv < 0) throw new Error('recovered must be a number ≥ 0');
+      recovered = round2(rv);
+    }
+    if (recovered > recoverable + 1e-9) {
+      throw new Error(`Recovered (₹${recovered}) cannot exceed recoverable (₹${recoverable})`);
+    }
+    const remarks = u.remarks !== undefined && u.remarks !== null ? String(u.remarks) : cur.remarks;
+    const recoverableChanged = Math.abs(recoverable - (Number(cur.recoverable) || 0)) > 1e-9;
 
-  db.transaction(() => {
     if (recoverableChanged) {
       db.prepare(`
         UPDATE lq_withdrawals
@@ -824,7 +976,8 @@ export function recordRecovery(db: Database.Database, id: string, u: RecoveryUpd
          WHERE id = ?
       `).run(recovered, remarks, id);
     }
-  })();
+    return cur;
+  }).immediate();
 
   const row = getWithdrawalById(db, id)!;
   logAuditEvent(db, {
@@ -832,7 +985,7 @@ export function recordRecovery(db: Database.Database, id: string, u: RecoveryUpd
     entity_type: 'lq_withdrawals',
     entity_id: id,
     actor_email: u.actor_email,
-    before: { recoverable: cur.recoverable, recovered: cur.recovered, outstanding: cur.outstanding },
+    before: { recoverable: before.recoverable, recovered: before.recovered, outstanding: before.outstanding },
     after: { recoverable: row.recoverable, recovered: row.recovered, outstanding: row.outstanding },
     note: `Withdrawal ${row.ref}: recovered ₹${row.recovered} of ₹${row.recoverable} (₹${row.outstanding} outstanding)`,
   });

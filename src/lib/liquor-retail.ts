@@ -10,6 +10,15 @@ import { CASH_CATEGORY } from '@/lib/cash-purchase';
 import { toPaise, toRupees, fmtRs, outflowWarning, MAX_PAISE } from '@/lib/petty-cash';
 import { todayIST } from '@/lib/format-date';
 import { vendorParty } from '@/lib/movement-record';
+import { packFactor, entryMode } from '@/lib/pack-units';
+
+/** Units that are themselves a COUNT — a fraction of one is not a purchase.
+ *  The same list the Liquor Store modal's countedWhole() uses (page.tsx). */
+const COUNTED_UNITS = new Set([
+  'pcs', 'pc', 'nos', 'no', 'each', 'unit', 'units', 'btl', 'bottle', 'bottles',
+  'can', 'cans', 'case', 'cases', 'box', 'boxes', 'pkt', 'packet', 'packets',
+  'pack', 'packs', 'tin', 'tins', 'jar', 'jars',
+]);
 
 /**
  * LIQUOR PURCHASE RECONCILIATION — phase L3, EMERGENCY WINE-SHOP PURCHASES.
@@ -199,7 +208,7 @@ export function resolveDepotLanded(
   return { perBottle: null, source: 'unknown', detail: explained.reason };
 }
 
-/* ── Record a wine-shop purchase (stock + purchases row + flag, ONE txn) ─────*/
+/* ── Record a wine-shop purchase (store-ledger stock + flag, ONE txn) ────────*/
 
 export interface RecordWineShopInput {
   materialId: string;
@@ -260,7 +269,7 @@ export function recordWineShopPurchase(
   actorEmail: string,
 ): WineShopRecordResult {
   const mat = db.prepare(
-    'SELECT id, name, category, unit, purchase_unit, pack_size, current_stock FROM raw_materials WHERE id = ?',
+    'SELECT id, name, category, unit, purchase_unit, pack_size, case_size, current_stock FROM raw_materials WHERE id = ?',
   ).get(input.materialId) as any;
   if (!mat) throw new RetailError('Material not found.', 404, 'material_not_found');
 
@@ -301,6 +310,15 @@ export function recordWineShopPurchase(
   const rate = Number(input.ratePaidPerBottle);
   if (!Number.isFinite(rate) || rate <= 0) throw new RetailError('rate paid per bottle must be a number greater than 0.');
   if (!isRealDate(input.date)) throw new RetailError('date must be a real calendar date in YYYY-MM-DD.');
+  // NOT IN THE FUTURE — for anyone, admins included. The route's purchase-date
+  // window exempts admins entirely (purchase-guard.ts), and that exemption is
+  // for BACKDATING. A wine-shop run is an event that has already happened, and
+  // the bottles now land on a store ledger whose row is dated from this field:
+  // a future date would put stock on a day that has not arrived, ahead of every
+  // IST-day reconciliation. The payout path refuses a future date the same way.
+  if (input.date > todayIST()) {
+    throw new RetailError(`The buy date ${input.date} is in the future — record a wine-shop buy on the day the bottles were bought. Nothing was saved.`, 400, 'future_date');
+  }
 
   // 'reimbursed' IS NOT A STATE THAT CAN BE TYPED. It is the terminal state of a
   // claim and it means "a petty-cash payout closed this" — a flag born
@@ -320,14 +338,30 @@ export function recordWineShopPurchase(
     throw new RetailError(`reimbursement_status must be one of: ${LQ_REIMBURSEMENT_STATUS.join(', ')}.`);
   }
 
-  // Purchase units → recipe units, the house pack convention (mirrors
-  // /api/stores/[id]/procure): the store ledger quantity is RECIPE units.
-  const packSize = Number(mat.pack_size) || 1;
+  // Purchase units → recipe units, the house pack convention (packFactor — the
+  // same helper /api/stores/[id]/procure and every DualQty screen use): the
+  // store ledger quantity is RECIPE units (ml for a spirit), the bill count is
+  // PURCHASE units (BTL).
   const ru = String(mat.unit || '').toLowerCase().trim();
   const pu = String(mat.purchase_unit || mat.unit || '').toLowerCase().trim();
-  const stockQty = (packSize > 1 && ru !== pu) ? bottles * packSize : bottles;
+  const stockQty = bottles * packFactor(mat);
   /** The material's OWN purchase-unit label, for any sentence that names a rate. */
   const purchaseUnitLabel = String(mat.purchase_unit || mat.unit || 'unit').trim() || 'unit';
+
+  // A COUNTED VESSEL IS BOUGHT WHOLE. The stock now lands on the store ledger
+  // that closing counts are taken against, so half a bottle posted here is half
+  // a bottle the count can never find — a manufactured variance. The Liquor
+  // Store modal already refuses a fraction for these items (page.tsx
+  // countedWhole); this is the server half it asked for, with the SAME test:
+  // a pack or a case behind the unit, a container purchase unit, or a unit that
+  // is itself a count. kg / g / L / ml lines stay fractional — 2.5 is real there.
+  const countedVessel = entryMode(mat) !== 'plain' || ru !== pu || COUNTED_UNITS.has(pu);
+  if (countedVessel && !Number.isInteger(bottles)) {
+    throw new RetailError(
+      `"${mat.name}" is bought by the ${purchaseUnitLabel} — enter a whole number of ${purchaseUnitLabel} (got ${bottles}). Nothing was saved.`,
+      400, 'whole_units_only',
+    );
+  }
 
   // Depot landed cost is READ (read-only) before the write and FROZEN.
   const depot = resolveDepotLanded(db, {
@@ -408,6 +442,23 @@ export function recordWineShopPurchase(
     //    store valuation keeps its existing basis) — see the header. Nothing
     //    central moves: no purchases row, no inventory_transactions, no
     //    current_stock, no price column. postLedger is the only door stock uses.
+    //
+    //    MOVEMENT RECORD: still a VENDOR receipt (the shop is the source, the
+    //    store the destination) on the buy's own business date. SPREAD IN, NOT
+    //    WRITTEN AS LITERAL KEYS, on purpose: counterparty and txn_date belong to
+    //    the store-rail movement-record work in store-engine.ts, which is NOT part
+    //    of Liquor Reconciliation and ships on its own. With that work in,
+    //    postLedger writes both into the movement columns. Without it
+    //    (production store-engine) LedgerEntry has neither field and the rail has
+    //    no column for them, so postLedger ignores them and nothing else about
+    //    the row changes; the stock DATE never depends on txn_date, because the
+    //    backdate below sets created_at itself. As literal keys they failed
+    //    type-checking against production store-engine (TS2353 'counterparty'),
+    //    which tied a liquor ship to those non-liquor hunks.
+    const movementRecord = {
+      counterparty: vendorParty(shopName || 'wine shop'),
+      txn_date: input.date,
+    };
     ledgerId = postLedger(db, {
       store_id: input.storeId,
       material_id: input.materialId,
@@ -418,10 +469,7 @@ export function recordWineShopPurchase(
       ref: billRef,
       notes: `Emergency wine-shop buy${shopName ? ` from ${shopName}` : ''} — retail price is on the wine-shop register (lq_retail_flags ${flagId}), never a cost basis`.slice(0, 500),
       created_by: actorEmail,
-      // MOVEMENT RECORD: still a VENDOR receipt — the shop is the source, the
-      // store the destination — on the buy's own business date.
-      counterparty: vendorParty(shopName || 'wine shop'),
-      txn_date: input.date,
+      ...movementRecord,
     });
     // BACKDATE, IST-exact. Every IST-day reader of this ledger (floor
     // reconciliation, the §H denominator, depot spend) buckets on
@@ -500,7 +548,7 @@ export function recordWineShopPurchase(
     : undefined;
 
   return {
-    purchaseId, flagId, inventoryTxnId, stockQty,
+    purchaseId: null, flagId, ledgerId, storeId: input.storeId, storeName: store.name, stockQty,
     depotLandedPerBottle: depotPerBottle, depotSource: depot.source, depotDetail: depot.detail,
     excess, totalPaid,
     ...(notice ? { notice } : {}),
@@ -541,10 +589,10 @@ export interface ReimburseResult {
  * outside the cash book.
  *
  * ── THE BOX THAT IS DEBITED IS THE CLAIM'S, NOT THE SESSION'S ────────────────
- * The outlet comes from the flag's parent purchase. Passing the session outlet
- * let a Main claim be paid out of Branch 2's box while §E, which scopes on
- * purchases.outlet_id, reported it reimbursed against Main — two books that can
- * never be reconciled against each other.
+ * The outlet is the flag's own outlet_id (a legacy flag's was backfilled from
+ * its parent purchase). Passing the session outlet let a Main claim be paid out
+ * of Branch 2's box while §E, which scopes on the claim's outlet, reported it
+ * reimbursed against Main — two books that can never be reconciled.
  *
  * ── A DELETED PAYOUT REOPENS THE CLAIM ──────────────────────────────────────
  * The FK petty_cash_id → petty_cash_ledger is ON DELETE SET NULL, and the L0 DDL
@@ -557,10 +605,10 @@ export interface ReimburseResult {
  *
  * The payout is a real petty_cash_ledger 'out' row (category 'cash_purchase' —
  * cash paid out against a voucher, here the wine-shop bill), written the same
- * way src/lib/cash-purchase.ts writes the GRN money leg, and — unlike a normal
- * central purchase — a wine-shop buy is ONE purchases LINE, so the payout can
- * honestly carry purchase_id = the flag's purchase (the one case the petty-cash
- * route's own comment says purchase_id is safe to set).
+ * way src/lib/cash-purchase.ts writes the GRN money leg. Its link to the claim
+ * is lq_retail_flags.petty_cash_id. purchase_id is set only for a LEGACY flag
+ * (one anchored on a central purchases row); a new flag has no purchases row,
+ * so the payout's purchase_id is NULL.
  */
 export function closeReimbursementWithPettyCash(
   db: Database,
@@ -635,9 +683,10 @@ export function closeReimbursementWithPettyCash(
     date = String(args.date);
   }
 
-  // The CLAIM's outlet, falling back to the caller's session only when the
-  // purchase carries none (single-outlet installs).
-  const outletId: string | null = flag.purchase_outlet_id ?? args.outletId ?? null;
+  // The CLAIM's outlet (its own column; a legacy flag's parent purchase as a
+  // second source), falling back to the caller's session only when neither
+  // carries one (single-outlet installs).
+  const outletId: string | null = flag.outlet_id ?? flag.purchase_outlet_id ?? args.outletId ?? null;
 
   const vendor = String(flag.shop_name || '').slice(0, 200);
   const reference = String(flag.bill_ref || '').slice(0, 120);
@@ -651,14 +700,34 @@ export function closeReimbursementWithPettyCash(
      * its own writes. A manager who paid Ravi back on the form and then closed the
      * flag here debited the box twice for one claim, with nothing on either
      * surface to say so. Two checks, both inside the write lock:
-     *   (a) any 'out' row already pointing at THIS claim's purchase — exact, and
-     *       it also catches a payout whose flag link was cleared by a delete;
+     *   (a) a payout that is ALREADY THIS CLAIM'S, by its document identity:
+     *       · LEGACY flag — any 'out' row pointing at its purchase (exact);
+     *       · NEW flag (no purchases row, so `purchase_id = NULL` would match
+     *         nothing and the guard would sit there never firing) — an 'out'
+     *         row for this bill: same shop as vendor, same bill number as
+     *         reference, same amount, ANY date, and not already the payout of
+     *         another claim (two lines of one trip share a bill number). Only
+     *         when the bill number is known; a paperless run has no identity
+     *         to match and is left to (b).
      *   (b) the petty-cash form's own key (date+direction+amount+category+vendor+
      *       reference) inside 90 seconds — the retry/double-click window. */
-    const linked = db.prepare(`
-      SELECT id, date, amount FROM petty_cash_ledger
-       WHERE direction = 'out' AND purchase_id = ? LIMIT 1
-    `).get(flag.purchase_id) as any;
+    const billKey = String(flag.bill_ref || '').trim();
+    const linked = (flag.purchase_id
+      ? db.prepare(`
+          SELECT id, date, amount FROM petty_cash_ledger
+           WHERE direction = 'out' AND purchase_id = ? LIMIT 1
+        `).get(flag.purchase_id)
+      : billKey
+        ? db.prepare(`
+            SELECT pc.id, pc.date, pc.amount FROM petty_cash_ledger pc
+             WHERE pc.direction = 'out'
+               AND LOWER(TRIM(COALESCE(pc.vendor, ''))) = LOWER(TRIM(?))
+               AND LOWER(TRIM(COALESCE(pc.reference, ''))) = LOWER(?)
+               AND CAST(ROUND(pc.amount * 100) AS INTEGER) = ?
+               AND NOT EXISTS (SELECT 1 FROM lq_retail_flags o WHERE o.petty_cash_id = pc.id AND o.id <> ?)
+             LIMIT 1
+          `).get(vendor, billKey, amountPaise, args.flagId)
+        : undefined) as any;
     if (linked) {
       throw new RetailError(
         `A petty-cash payout of ${fmtRs(toPaise(Number(linked.amount)))} on ${linked.date} is already recorded against this wine-shop bill. `
@@ -752,9 +821,16 @@ export function backfillDepotLanded(
   const flag = db.prepare('SELECT * FROM lq_retail_flags WHERE id = ?').get(args.flagId) as any;
   if (!flag) throw new RetailError('That wine-shop record no longer exists.', 404, 'flag_not_found');
   if (Number(flag.depot_landed_per_bottle) > 0) {
+    // THE FIGURE IS NOT QUOTED. This refusal reaches anyone with can_procure on
+    // the store, for ANY buy (flag ids are on the store ledger's notes), and a
+    // frozen rate resolved from the Brand Map can BE the TGBCL master per bottle
+    // — admin-only (see RETAIL_DEPOT_WITHHELD_NOTE).
+    // It used to say "already carries a depot rate of ₹760.28": a read-only
+    // oracle onto the master, measured for every buy on the copy. Whoever may see
+    // the rate sees it on the Wine-shop buys register.
     throw new RetailError(
-      `This buy already carries a depot rate of ${fmtRs(toPaise(Number(flag.depot_landed_per_bottle)))}, frozen when it was recorded. `
-      + `A frozen rate is never re-priced — that is what keeps §E readable across quarters.`,
+      'This buy already carries a depot rate, frozen when it was recorded. '
+      + 'A frozen rate is never re-priced — that is what keeps §E readable across quarters.',
       409, 'already_priced',
     );
   }
@@ -855,7 +931,10 @@ export function setReimbursementStatus(
 
 export interface RetailFlagRow {
   id: string;
-  purchase_id: string;
+  /** LEGACY anchor only (a flag written by the first version); null on new rows. */
+  purchase_id: string | null;
+  /** The store_stock_ledger 'inward' row that moved the stock (new rows). */
+  ledger_id: string | null;
   bill_ref: string;
   date: string;
   shop_name: string;
@@ -904,7 +983,7 @@ export interface RetailExcessSummary {
    *  Counted in unreimbursedStaffSpend; surfaced so a screen can explain why. */
   reopenedClaimCount: number;
   /** Flags in range dropped by the outlet filter — so a view can say "N not shown"
-   *  instead of silently hiding a buy whose purchase carries no outlet. */
+   *  instead of silently hiding a buy recorded with no outlet. */
   hiddenByOutletCount: number;
   /** Count of flags per reimbursement status. */
   byStatus: Record<LqReimbursementStatus, number>;
@@ -924,14 +1003,18 @@ export interface RetailExcessSummary {
  * counts them separately, so a buy we could not price never masquerades as a
  * zero-excess buy and understates the cost of running out.
  *
- * OPEN HANDOFF TO L5 (its file, not this one): src/lib/liquor-summary.ts:607-644
- * re-queries lq_retail_flags and re-derives these figures instead of calling
- * here. The two agree on the simple cases but not on the two rules added since:
- * that query folds unknown-depot rows in as ZERO excess, and it never selects
- * petty_cash_id, so it cannot tell a payout-backed close from a claim whose
- * payout was deleted — it will report ₹0 still owed where this function reports
- * the debt. Any change to these definitions has to land in both places until L5
- * calls this one.
+ * L5 (src/lib/liquor-summary.ts §E/§F) calls this function rather than
+ * re-querying lq_retail_flags, so a change to these definitions lands in one
+ * place.
+ *
+ * MANAGEMENT-ONLY DATA. The rows name who fronted money and what they are owed,
+ * and the totals are depot spend and the price of running out — the same §E the
+ * management-only Reconciliation Summary shows. Every route that returns this
+ * must gate on management AND a page that shows it (GET /api/liquor/retail's
+ * requireRetailView), and must pass it through retailSummaryForViewer: the
+ * depot rate and every excess figure are ADMIN-ONLY (they re-derive the TGBCL
+ * master rate). This function returns the full figures because the Summary
+ * computes §E from them; it is never handed to a browser as it stands.
  */
 export function retailExcessSummary(
   db: Database,
@@ -941,21 +1024,26 @@ export function retailExcessSummary(
   const to = isRealDate(args.to) ? args.to : '9999-12-31';
   const scoped = args.outletId != null && String(args.outletId).trim() !== '';
 
+  // material and outlet are the FLAG's own columns. A new flag has no purchases
+  // row, so reading them off one (the first version) returned NULL for every
+  // buy: no material name, no outlet, and an outlet-scoped view that hid them
+  // all. The purchases join survives only as a second source for a legacy flag.
   const rows = db.prepare(`
-    SELECT f.id, f.purchase_id, f.bill_ref, f.date, f.shop_name, f.shop_licence_no,
+    SELECT f.id, f.purchase_id, f.ledger_id, f.bill_ref, f.date, f.shop_name, f.shop_licence_no,
            f.bottles, f.rate_paid_per_bottle, f.depot_landed_per_bottle,
            f.excess_per_bottle, f.excess_total, f.excess_pct, f.paid_by, f.payment_mode,
            f.reimbursement_status, f.petty_cash_id, f.reason, f.approved_by,
-           p.material_id AS material_id, rm.name AS material_name, p.outlet_id AS outlet_id
+           COALESCE(f.material_id, p.material_id) AS material_id, rm.name AS material_name,
+           COALESCE(f.outlet_id, p.outlet_id)     AS outlet_id
       FROM lq_retail_flags f
       LEFT JOIN purchases p     ON p.id = f.purchase_id
-      LEFT JOIN raw_materials rm ON rm.id = p.material_id
+      LEFT JOIN raw_materials rm ON rm.id = COALESCE(f.material_id, p.material_id)
      WHERE f.date >= ? AND f.date <= ?
-       ${scoped ? "AND COALESCE(p.outlet_id, '') = ?" : ''}
+       ${scoped ? "AND COALESCE(f.outlet_id, p.outlet_id, '') = ?" : ''}
      ORDER BY f.date DESC, f.created_at DESC
   `).all(...(scoped ? [from, to, String(args.outletId)] : [from, to])) as any[];
 
-  // What the outlet filter dropped. A flag whose purchase carries no outlet
+  // What the outlet filter dropped. A flag recorded with no outlet
   // vanishes from an outlet-scoped view; the caller is told how many, so a screen
   // can offer "show all outlets" instead of quietly under-reporting.
   const inRange = scoped
@@ -989,7 +1077,7 @@ export function retailExcessSummary(
     if (reopened) reopenedClaimCount += 1;
     if (status === 'claimed_pending' || reopened) unreimbursedStaffSpend += paid;
     return {
-      id: f.id, purchase_id: f.purchase_id, bill_ref: f.bill_ref, date: f.date,
+      id: f.id, purchase_id: f.purchase_id ?? null, ledger_id: f.ledger_id ?? null, bill_ref: f.bill_ref, date: f.date,
       shop_name: f.shop_name, shop_licence_no: f.shop_licence_no, bottles,
       rate_paid_per_bottle: Number(f.rate_paid_per_bottle) || 0, depot_landed_per_bottle: depot,
       excess_per_bottle: Number(f.excess_per_bottle) || 0, excess_total: Number(f.excess_total) || 0,
@@ -1063,5 +1151,87 @@ export function retailExcessSummary(
     unreimbursedStaffSpend: r2(unreimbursedStaffSpend),
     reopenedClaimCount, hiddenByOutletCount,
     byStatus, flagCount: outRows.length, totalBottles: r4(totalBottles), rows: outRows,
+  };
+}
+
+/* ── WHO MAY SEE THE DEPOT RATE: the redacted view of §E ────────────────────*/
+
+/**
+ * Why a non-admin sees no depot rate and no excess — one sentence, used by the
+ * register API, the record/backfill replies and the Summary's §E, so every
+ * screen that withholds the figures says the same thing.
+ */
+export const RETAIL_DEPOT_WITHHELD_NOTE =
+  'The depot landed rate and the excess are admin-only: for a brand with no recorded TGBCL indent the depot rate '
+  + 'IS the Brand Map master rate per bottle, and a buy does not record which basis its rate was frozen on, so the '
+  + 'rate (and the excess, which is the rate paid minus it) would hand over the admin-only master. Bottles, the rate '
+  + 'paid, who paid and what is still owed are shown; an admin sees the depot figures on the Wine-shop buys register '
+  + 'and in §E of the Reconciliation Summary.';
+
+/** One row of the register as a viewer receives it: the depot-derived figures
+ *  are null when withheld, and `priced` says whether a rate is frozen at all (so
+ *  a screen can still tell "priced, withheld" from "unknown — price it"). */
+export interface RetailFlagRowView extends Omit<RetailFlagRow,
+  'depot_landed_per_bottle' | 'excess_per_bottle' | 'excess_total' | 'excess_pct'> {
+  depot_landed_per_bottle: number | null;
+  excess_per_bottle: number | null;
+  excess_total: number | null;
+  excess_pct: number | null;
+  /** depot_landed_per_bottle > 0 — the SAME test backfillDepotLanded and the
+   *  summary use. Never a money figure. */
+  priced: boolean;
+}
+
+export interface RetailExcessSummaryView extends Omit<RetailExcessSummary, 'excessTotal' | 'rows'> {
+  /** null when the depot figures are withheld (it is Σ (rate paid − depot) × bottles). */
+  excessTotal: number | null;
+  rows: RetailFlagRowView[];
+  /** true for an admin; false → every depot-derived figure above is null. */
+  depotFiguresVisible: boolean;
+  /** When withheld, RETAIL_DEPOT_WITHHELD_NOTE; otherwise null. */
+  depotFiguresNote: string | null;
+}
+
+/**
+ * The register as a given viewer may see it.
+ *
+ * THE DEPOT RATE IS ADMIN-ONLY, for the same reason §G's master rate is
+ * (liquor-summary.ts LqSectionG; brand-map/_lib/guard.ts; inward-register rule
+ * b): resolveDepotLanded freezes L1's landedPerBottle. For a brand with no
+ * recorded indent line that IS the master ÷ bottles_per_case (basis
+ * 'master_only' — measured: Gin 760.28 = the ₹9,123.36 master ÷ 12, returned to
+ * the bartender who recorded it). Before owner decision 2 moved L1 onto the rate
+ * PAID it was the master plus the latest indent's levies for every brand, and
+ * §B hands those levies to the same manager (measured: 4,014.69 − 264.69 =
+ * 3,750 = the ₹45,000 master ÷ 12). A flag stores no basis column, so a row
+ * cannot say which kind it is — every row is treated alike.
+ * Every figure the depot rate can be re-derived from goes with it:
+ *   depot_landed_per_bottle — the rate;
+ *   excess_per_bottle       — rate paid − depot, and the rate paid is on the row;
+ *   excess_total            — excess_per_bottle × bottles;
+ *   excess_pct              — (paid − depot) ÷ depot;
+ *   excessTotal             — with one buy in range it IS that buy's excess_total.
+ * Fail closed: anything but an explicit `revealDepotFigures: true` withholds.
+ * retailExcessSummary itself keeps returning the full figures — it is the ONE
+ * definition the Summary computes from; only what leaves a route is redacted.
+ */
+export function retailSummaryForViewer(
+  summary: RetailExcessSummary,
+  opts: { revealDepotFigures?: boolean },
+): RetailExcessSummaryView {
+  const reveal = opts.revealDepotFigures === true;
+  return {
+    ...summary,
+    excessTotal: reveal ? summary.excessTotal : null,
+    rows: summary.rows.map((r) => ({
+      ...r,
+      depot_landed_per_bottle: reveal ? r.depot_landed_per_bottle : null,
+      excess_per_bottle: reveal ? r.excess_per_bottle : null,
+      excess_total: reveal ? r.excess_total : null,
+      excess_pct: reveal ? r.excess_pct : null,
+      priced: Number(r.depot_landed_per_bottle) > 0,
+    })),
+    depotFiguresVisible: reveal,
+    depotFiguresNote: reveal ? null : RETAIL_DEPOT_WITHHELD_NOTE,
   };
 }

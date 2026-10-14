@@ -3,22 +3,31 @@ import { getCurrentOutletId } from '@/lib/auth';
 import { checkPurchaseDate } from '@/lib/purchase-guard';
 import { LQ_REIMBURSEMENT_STATUS, type LqReimbursementStatus } from '@/lib/liquor-recon';
 import {
-  recordWineShopPurchase, retailExcessSummary, isRealDate, retailErrorResponse,
+  recordWineShopPurchase, retailExcessSummary, retailSummaryForViewer, isRealDate, retailErrorResponse,
+  RETAIL_DEPOT_WITHHELD_NOTE,
 } from '@/lib/liquor-retail';
 import {
-  requireRetailRecord, requireRetailView, gateResponse, liquorStore,
+  requireRetailRecord, requireRetailView, gateResponse, liquorStore, revealDepotFigures,
 } from './_lib/guard';
 
 /**
  * EMERGENCY WINE-SHOP PURCHASES — phase L3 (docs/liquor-reconciliation-plan.md).
  *
- *   POST /api/liquor/retail   record ONE wine-shop buy: stock moves, ONE
- *                             purchases row is written, and ONE lq_retail_flags
- *                             side record is added (see src/lib/liquor-retail.ts
- *                             for why it is shaped this way).
+ *   POST /api/liquor/retail   record ONE wine-shop buy: the bottles land on the
+ *                             material's OWN store ledger (ONE 'inward' row,
+ *                             unit_cost 0 — where Liquor Store on-hand,
+ *                             withdrawals and closing counts read them), and ONE
+ *                             lq_retail_flags side record carries the retail ₹.
+ *                             NO central purchases row, NO current_stock move,
+ *                             NO price column (owner decision 1 — see
+ *                             src/lib/liquor-retail.ts for why).
  *   GET  /api/liquor/retail?from=&to=[&outlet=all]
  *                             the §E numbers + the flag rows, for a register and
  *                             for anything that wants the same figures L5 shows.
+ *                             MANAGEMENT + a page that shows it, like the L5
+ *                             Summary itself; the depot rate and every excess
+ *                             figure are ADMIN ONLY (they re-derive the TGBCL
+ *                             master rate — retailSummaryForViewer).
  *   PATCH /api/liquor/retail/[id]           correct one record: backfill the
  *                             depot rate on a buy recorded before its brand was
  *                             mapped, and/or correct the claim's status.
@@ -44,7 +53,7 @@ export async function GET(request: Request) {
     const outletParam = (sp.get('outlet') || '').trim().toLowerCase();
     const outletId = outletParam === 'all' ? null : await getCurrentOutletId();
 
-    const summary = retailExcessSummary(db, {
+    const full = retailExcessSummary(db, {
       from: isRealDate(from) ? from : '0000-01-01',
       to: isRealDate(to) ? to : '9999-12-31',
       outletId: outletParam === 'all' ? null : outletId,
@@ -53,6 +62,9 @@ export async function GET(request: Request) {
       // own materials. Either way it never joins every store's category map.
       storeId: liquorStore(db)?.id ?? null,
     });
+    // Admin-only depot rate + excess: withheld (null, with the reason) for
+    // everyone else this gate admits. Fail closed — see liquor-retail.ts.
+    const summary = retailSummaryForViewer(full, { revealDepotFigures: revealDepotFigures(gate.user) });
     return Response.json({ summary });
   } catch (e: any) {
     return retailErrorResponse(e, 'Could not load wine-shop purchases.');
@@ -93,9 +105,9 @@ export async function POST(request: Request) {
     // The SAME backdate/future window the central purchase flow enforces
     // (purchase-guard.ts; /api/purchases/route.ts:318), admins exempt. Two
     // reasons it matters here and not only there: a wine-shop run is a physical
-    // event that has already happened, and a FUTURE-dated emergency row becomes
-    // MAX(date) for the material — which hands a whole month's average_price
-    // basis to a retail MRP the moment anyone presses Recompute prices.
+    // event that has already happened, and a future-dated store-ledger row
+    // would sit in on-hand and every IST-day reconciliation ahead of the day it
+    // could physically have arrived.
     const dateCheck = checkPurchaseDate(db, date, gate.user.role === 'admin');
     if (!dateCheck.ok) return Response.json({ error: dateCheck.error }, { status: 400 });
 
@@ -149,15 +161,37 @@ export async function POST(request: Request) {
       storeId,
     }, gate.user.email);
 
+    // WHAT THE RECORDER IS TOLD ABOUT THE DEPOT RATE. A rate resolved from the
+    // Brand Map ('landed') IS the admin-only TGBCL master per bottle whenever the
+    // brand has no recorded indent (basis 'master_only'), and the excess is the
+    // rate paid minus it (RETAIL_DEPOT_WITHHELD_NOTE).
+    // This reply goes to anyone with can_procure (bar staff, any 'Bar Manager'
+    // position), so it used to hand the master to the paisa to whoever recorded
+    // a buy (measured: 760.28 × 12 = the 9,123.36 master). Only an admin is
+    // told those figures. An OVERRIDE is the caller's own typed rate and the
+    // rate paid is their own input too, so echoing both tells them nothing new.
+    // 'unknown' has no figure to withhold. depot_source / depot_detail are words.
+    const showDepot = revealDepotFigures(gate.user) || result.depotSource === 'override';
+    const depotWithheld = !showDepot && result.depotSource !== 'unknown';
+
     return Response.json({
       ok: true,
+      // Always null now — no central purchases row is written. Kept so a
+      // caller that reads the key gets an explicit "none", not undefined.
       purchase_id: result.purchaseId,
       flag_id: result.flagId,
+      // WHERE the bottles went: the store-ledger row, and the store it is in.
+      ledger_id: result.ledgerId,
+      store_id: result.storeId,
+      store_name: result.storeName,
       stock_qty: result.stockQty,
-      depot_landed_per_bottle: result.depotLandedPerBottle,
+      depot_landed_per_bottle: depotWithheld ? null : result.depotLandedPerBottle,
       depot_source: result.depotSource,
       depot_detail: result.depotDetail,
-      excess: result.excess,
+      excess: depotWithheld ? null : result.excess,
+      // true → the buy IS priced and its figures are withheld from this viewer.
+      depot_figures_withheld: depotWithheld,
+      ...(depotWithheld ? { depot_figures_note: RETAIL_DEPOT_WITHHELD_NOTE } : {}),
       total_paid: result.totalPaid,
       // A buy we could not price is recorded, but the client is told plainly so
       // it can prompt for a depot rate rather than trusting a silent 0 — and it

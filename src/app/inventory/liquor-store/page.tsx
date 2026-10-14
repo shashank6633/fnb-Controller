@@ -23,7 +23,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Wine, Plus, Search, X, Loader2, AlertCircle, AlertTriangle, CheckCircle2,
   SlidersHorizontal, ScrollText, Boxes, Warehouse, ClipboardCheck, BarChart3,
-  Download, Upload, History, Save, ReceiptText, ArrowRightLeft, Trash2, Siren,
+  Download, Upload, History, Save, ReceiptText, ArrowRightLeft, Trash2, Siren, ShieldCheck,
 } from 'lucide-react';
 import Papa from 'papaparse';
 import { api } from '@/lib/api';
@@ -311,6 +311,13 @@ export default function LiquorStorePage() {
   const [flash, setFlash] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [meRole, setMeRole] = useState<string>('');   // admin-only closing 'adjust' toggle
+  /* MANAGEMENT (admin / manager / HOD) — the gate GET /api/liquor/retail
+     applies to the Wine-shop buys register, because that list IS the §E money
+     (excess paid, depot spend, amounts owed to named staff). The same test as
+     auth.ts isManagement(), which this client file cannot import (it pulls in
+     the session store). null until /api/auth/me answers: the tab is withheld,
+     never guessed. */
+  const [meMgmt, setMeMgmt] = useState<boolean | null>(null);
 
   // Stock filters
   const [q, setQ] = useState('');
@@ -344,23 +351,39 @@ export default function LiquorStorePage() {
   useEffect(() => {
     if (tab === 'closing' && !access.can_close_stock) setTab('stock');
   }, [tab, access.can_close_stock]);
-  // Wine-shop buys follows the Wine-shop Purchase button's gate (can_procure).
+  /* The Wine-shop buys tab follows the REGISTER's read gate (management), not
+     the Wine-shop Purchase button's (can_procure): recording a buy is a stock
+     authority, reading the money behind every buy is not. A bar manager with
+     can_procure but no management tier still records buys from the button;
+     the list would only 403 for them, so it is not offered.
+     The route ALSO needs a page that shows the register: for this page that is
+     can_view on the LIQUOR STORE itself (requireRetailView resolves the store
+     by that name), so a manager who sees only another store here is not
+     offered a tab that would answer 403. */
+  const liquorStoreRow = stores.find(s => String(s.name || '').trim().toUpperCase() === 'LIQUOR STORE');
+  const canRetailTab = meMgmt === true && !!liquorStoreRow && !!accessByStore[liquorStoreRow.id]?.can_view;
+  /* Pricing an unpriced buy and correcting a claim are PATCH
+     /api/liquor/retail/[id], gated on can_procure on the material's own store.
+     The register spans stores, so the screen offers those two actions to
+     anyone holding can_procure on ANY active store and leaves the per-material
+     decision to the route, whose refusal is shown verbatim. */
+  const canCorrectRetail = Object.values(accessByStore).some(a => a?.can_procure);
   useEffect(() => {
-    if (tab === 'retail' && !access.can_procure) setTab('stock');
-  }, [tab, access.can_procure]);
+    if (tab === 'retail' && !canRetailTab) setTab('stock');
+  }, [tab, canRetailTab]);
   /* ?tab=retail — the Reconciliation summary's §E links here so a pending
-     claim it lists can be paid back. Applied only once boot has resolved this
-     user's access: applied at mount, `access` is still the all-false default
-     and the bounce above would throw the link away before it could land. */
+     claim it lists can be paid back. Applied only once boot AND the viewer's
+     tier have resolved: applied at mount, both are still unknown and the
+     bounce above would throw the link away before it could land. */
   const wantTab = useRef<string | null>(null);
   useEffect(() => {
     try { wantTab.current = new URLSearchParams(window.location.search).get('tab'); } catch { /* no URL */ }
   }, []);
   useEffect(() => {
-    if (bootLoading || wantTab.current !== 'retail') return;
+    if (bootLoading || meMgmt === null || wantTab.current !== 'retail') return;
     wantTab.current = null;
-    if (access.can_procure) setTab('retail');
-  }, [bootLoading, access.can_procure]);
+    if (meMgmt) setTab('retail');
+  }, [bootLoading, meMgmt]);
 
   /* Boot: active stores + my access per store */
   useEffect(() => {
@@ -369,8 +392,11 @@ export default function LiquorStorePage() {
       try {
         // Role (for the admin-only "adjust to physical" toggle on Closing)
         fetch('/api/auth/me').then(r => r.json()).then(j => {
-          if (!cancelled) setMeRole(j?.user?.role || '');
-        }).catch(() => {});
+          if (cancelled) return;
+          const u = j?.user;
+          setMeRole(u?.role || '');
+          setMeMgmt(!!u && (u.role === 'admin' || u.role === 'manager' || !!u.is_head_chef));
+        }).catch(() => { if (!cancelled) setMeMgmt(false); });
         const r = await fetch('/api/stores');
         const j = await r.json();
         if (j.error) throw new Error(j.error);
@@ -734,7 +760,7 @@ export default function LiquorStorePage() {
                   tab === 'reports' ? 'bg-[#af4408] border-[#af4408] text-white' : 'bg-white border-[#E8D5C4] text-[#6B5744]'}`}>
           <BarChart3 className="w-3.5 h-3.5" /> Reports
         </button>
-        {access.can_procure && (
+        {canRetailTab && (
           <button onClick={() => setTab('retail')}
                   className={`px-3 py-1.5 rounded-full text-xs font-medium border flex items-center gap-1.5 ${
                     tab === 'retail' ? 'bg-[#af4408] border-[#af4408] text-white' : 'bg-white border-[#E8D5C4] text-[#6B5744]'}`}>
@@ -1009,13 +1035,14 @@ export default function LiquorStorePage() {
         )
       ) : tab === 'reports' && store ? (
         <ReportsSection storeId={store.id} storeCode={store.code || 'store'} />
-      ) : tab === 'retail' && access.can_procure ? (
+      ) : tab === 'retail' && canRetailTab ? (
         /* The L3 register: pay a pending claim back, price an unpriced buy,
            correct a claim. See WineShopRegister.tsx. Not keyed on the store —
            a wine-shop buy is booked against its MATERIAL's own store, so the
            list is the same whichever store is selected. */
         <WineShopRegister
           materials={materials}
+          canCorrect={canCorrectRetail}
           refreshKey={retailKey}
           onFlash={msg => { setFlash(msg); setTimeout(() => setFlash(null), 5000); }}
         />
@@ -2661,19 +2688,21 @@ function MigrateModal({ storeId, storeName, candidates, blockedCount, onClose, o
 
 /* ── Emergency wine-shop purchase (phase L3) ─────────────────────────────────
    The depot ran dry mid-service, somebody drove to a local wine shop and paid
-   MRP. POST /api/liquor/retail writes ONE documentary `purchases` row, moves
-   CENTRAL stock, and adds ONE lq_retail_flags side record carrying the excess
-   over depot landed cost, who fronted the money and whether they are owed it
-   back (Summary §E). See src/lib/liquor-retail.ts for why it is shaped that way.
+   MRP. POST /api/liquor/retail posts ONE 'inward' row on the material's own
+   store ledger (unit_cost 0 — where Liquor Store on-hand, withdrawals and
+   closing counts read it) and adds ONE lq_retail_flags side record carrying the
+   excess over depot landed cost, who fronted the money and whether they are
+   owed it back (Summary §E). No central `purchases` row, no current_stock move,
+   no price column. See src/lib/liquor-retail.ts for why it is shaped that way.
 
    FOUR THINGS THIS FORM MUST NOT GET WRONG — all decided in that library, not
    here, and all enforced again server-side:
      · 'Reimbursed' is NOT offered. That state means "a real petty-cash payout
        closed this claim"; the library and the route both refuse it at entry, so
        offering it would be a dropdown that promises a payment nobody made.
-     · The date must be a real calendar day AND inside the purchase-date window
-       (admins exempt) — a future-dated row becomes MAX(date) for the material.
-       We do not pre-judge the window; the server's own sentence is shown.
+     · The date must be a real calendar day, never in the future (for anyone),
+       AND inside the purchase-date window (admins exempt). We do not pre-judge
+       the window; the server's own sentence is shown.
      · The duplicate guard (material+date+shop+bill+outlet with a bill number;
        an identical shape within 90 seconds without one) answers 409. Its message
        is rendered as-is and the Save button is never left looking un-pressed.
@@ -2681,10 +2710,12 @@ function MigrateModal({ storeId, storeName, candidates, blockedCount, onClose, o
        excess 0 and depot_source 'unknown'. That 0 means "not computed", so the
        form says so before saving and the result panel refuses to print an excess.
 
-   Stock lands in CENTRAL current_stock, never in this page's store ledger — a
-   retail buy written to the depot ledger would poison the very landed cost the
-   excess is measured against. The Ledger tab is therefore expected NOT to move;
-   the Stock tab's Central column is. */
+   The ledger row is txn_type 'inward', NOT 'purchase': every DEPOT reader
+   (landed cost, the GRN Inward register, Rate Movement, the levy checks) keys
+   on 'purchase', so a retail buy never poisons the landed cost the excess is
+   measured against. unit_cost 0 keeps the store's EXISTING cost basis on the
+   bottles — the retail ₹ is written only to the wine-shop register. So the
+   Ledger tab DOES move (one Inward row) and nothing is re-priced. */
 
 /**
  * L1's own basis for a Brand-Map landed cost, in English.
@@ -2732,10 +2763,10 @@ function landedBasisText(detail?: string): string {
  * BTL/BTL and bottle/bottle lines (170) and not one weighed line; inside this
  * store the only three left fractional are its kg/kg rows.
  *
- * THIS IS THE BROWSER'S HALF ONLY. `recordWineShopPurchase` checks `bottles > 0`
- * and nothing more, so 0.5 posted straight at the route still records (measured:
- * 0.5 BTL of a 750 ml spirit → stockQty 375). Closing that needs a guard in
- * src/lib/liquor-retail.ts, which this lane does not own.
+ * THIS IS THE BROWSER'S HALF. The server half now exists with the same test:
+ * `recordWineShopPurchase` refuses a fraction of a counted vessel with 400
+ * 'whole_units_only' (src/lib/liquor-retail.ts, its own COUNTED_UNITS copy), so
+ * 0.5 posted straight at the route no longer records. Keep the two lists equal.
  */
 const COUNTED_UNITS = new Set([
   'pcs', 'pc', 'nos', 'no', 'each', 'unit', 'units', 'btl', 'bottle', 'bottles',
@@ -2757,11 +2788,22 @@ const REIMB_OPTIONS: Array<{ v: 'not_required' | 'claimed_pending' | 'rejected';
 ];
 
 interface RetailResult {
-  purchase_id: string; flag_id: string; stock_qty: number;
-  depot_landed_per_bottle: number;
+  /** null on every new buy (no central purchases row). A string only from a
+   *  server still on the first, central-purchase design. */
+  purchase_id: string | null;
+  flag_id: string; stock_qty: number;
+  /** WHERE the bottles went: the store-ledger row and the store it is in. */
+  ledger_id?: string | null; store_id?: string | null; store_name?: string | null;
+  /** null when the buy IS priced but the figure is withheld from this viewer
+   *  (depot_figures_withheld) — a Brand-Map depot rate re-derives the admin-only
+   *  TGBCL master, so only an admin is told it. */
+  depot_landed_per_bottle: number | null;
   depot_source: 'landed' | 'override' | 'unknown';
   depot_detail?: string;
-  excess?: { excessPerBottle: number; excessTotal: number; excessPct: number };
+  excess?: { excessPerBottle: number; excessTotal: number; excessPct: number } | null;
+  /** true → priced, figures withheld; depot_figures_note says why (verbatim). */
+  depot_figures_withheld?: boolean;
+  depot_figures_note?: string;
   total_paid: number;
   /** Server's own words when the brand could not be priced. Rendered verbatim. */
   warning?: string;
@@ -2769,10 +2811,10 @@ interface RetailResult {
   notice?: string;
 }
 
-/* No storeName prop: nothing this modal says is true of ONE store (see the
-   intro paragraph's comment). The stock lands in Central and the route books
-   against the material's own store, so naming the page's selected store could
-   only ever be right by coincidence. */
+/* No storeName prop: the route books into the MATERIAL's own store, which need
+   not be the store this page has selected, so naming the selected store could
+   only ever be right by coincidence. The receipt names the store the SERVER
+   says it booked into (store_name in its reply). */
 function WineShopModal({ materials, onClose, onSaved, onRefresh }: {
   materials: MatRow[];
   onClose: () => void; onSaved: (msg: string) => void; onRefresh: () => void;
@@ -2917,8 +2959,13 @@ function WineShopModal({ materials, onClose, onSaved, onRefresh }: {
       if (!r.ok) { setErrCode(String(j.code || '')); setErr(j.error || `HTTP ${r.status}`); return; }
       const res = j as RetailResult;
       setResult(res);
+      // Where the stock went is read off the reply, never assumed: a store
+      // ledger row (the design) or — only from a server still on the first
+      // design — a central purchases row.
       const msg = `Wine-shop buy recorded — ${fq(nBottles)} ${pu} × ${mat?.name || 'item'} at ${inr(nRate)} each, ${inr(res.total_paid)} paid.`
-        + ` Bottles went into CENTRAL stock; the liquor store's depot ledger is untouched by design.`;
+        + (res.purchase_id
+          ? ' Bottles went into CENTRAL stock.'
+          : ` Bottles added to ${res.store_name || 'the liquor store'}'s ledger as one Inward row, at the store's existing cost — nothing was re-priced.`);
       setSavedMsg(msg);
       // ALWAYS stay open on the receipt, and refresh the page behind instead of
       // closing. This used to auto-close whenever the server had no warning to
@@ -2983,46 +3030,27 @@ function WineShopModal({ materials, onClose, onSaved, onRefresh }: {
           which for another store's item is simply false. The data was always
           right; only the sentence was. */}
       <p className="text-[11px] text-[#8B7355] -mt-1">
-        Bottles bought at a wine shop at MRP because the depot was dry. The stock moves into
-        {' '}<b>Central</b> stock (the Stock tab&apos;s Central column) — <b>not</b>{' '}into the
-        liquor store&apos;s own ledger, which is the TGBCL depot record the excess is measured
-        against.
+        Bottles bought at a wine shop at MRP because the depot was dry. The stock is added to the
+        liquor store&apos;s own ledger as one <b>Inward</b>{' '}row, so on-hand, withdrawals and
+        closing counts see it. It is <b>not</b>{' '}a TGBCL indent: the depot record the excess is
+        measured against is left alone.
       </p>
-      {/* WHAT THIS FORM MAY AND MAY NOT PROMISE ABOUT VALUATION.
-          Saving here never re-prices the item: src/lib/liquor-retail.ts
-          deliberately does NOT call updateMaterialPrice(), so average_price and
-          last_purchase_price are byte-identical afterwards. But that file's own
-          header retracts the stronger claim this box used to make, and the two
-          readers below confirm it — db.ts updateMaterialPrice() averages EVERY
-          purchases row in the month of MAX(date), and closing-valuation.ts
-          materialRate() takes rung #1 = the most recent purchases row; NEITHER
-          excludes is_emergency. Until they do, telling a storekeeper "valuation
-          is not touched" would be the app promising something no code keeps.
-
-          A THIRD READER, and the only one that needs no user at all: db.ts's
-          raw_materials boot migration backfills last_purchase_price from the
-          most recent purchases row WHERE last_purchase_price IS NULL OR = 0. It
-          carries no settings flag, so it runs on every getDb() boot, and no
-          is_emergency predicate, so on a brand never bought through the app the
-          FIRST purchases row it ever sees is this wine-shop MRP. Measured on a
-          fixture: LPP 0 → restart the server → LPP ₹30,000, no user action.
-          73 of the liquor store's 127 materials currently sit at LPP 0, so a
-          deploy or a crash-restart is enough. That is why the sentence below
-          names a restart. THE FIX BELONGS IN db.ts (a third
-          `AND COALESCE(is_emergency,0) = 0`) — not in this file, which owns the
-          modal only; until it lands the operator is told the truth. */}
-      <div className="text-[11px] text-amber-900 bg-amber-50 border border-amber-200 rounded-lg p-2.5 leading-relaxed flex items-start gap-2">
-        <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+      {/* WHAT THIS FORM PROMISES ABOUT VALUATION — owner decision 1: the retail
+          price is ANALYTICS ONLY. It is now true by construction, so it is
+          said plainly: src/lib/liquor-retail.ts writes no `purchases` row (the
+          table updateMaterialPrice, closing-valuation's rate ladder and the
+          last-purchase-price boot backfill all read), and its one store-ledger
+          row carries unit_cost 0, which every store valuation skips when it
+          averages cost. The retail ₹ lives only on the wine-shop register.
+          (This box used to warn the opposite, correctly, while the first
+          design wrote a central purchase row; it changed with the library.) */}
+      <div className="text-[11px] text-[#6B5744] bg-[#FFF8F0] border border-[#E8D5C4] rounded-lg p-2.5 leading-relaxed flex items-start gap-2">
+        <ShieldCheck className="w-3.5 h-3.5 shrink-0 mt-0.5 text-emerald-700" />
         <span>
-          <b>Retail MRP is far above depot cost, so keep it out of your costing.</b> Saving this
-          does <b>not</b> re-price the item — average price and last purchase price are unchanged
-          at the moment you save. It is not permanent cover, though: this buy writes one purchase
-          row, and <b>Recompute / Restore prices</b>{' '}on the Recipes page and closing-stock
-          valuation both read every purchase row, this one included. Running a re-price after an
-          emergency buy can therefore pull this brand&apos;s cost up towards the shop&apos;s MRP.
-          {' '}<b>And if this brand has no purchase history at all</b> (last purchase price still
-          blank — most of the liquor catalogue), the next server restart backfills its last
-          purchase price from this row, with nobody pressing anything.
+          <b>The shop&apos;s MRP stays out of your costing.</b>{' '}No purchase row is written and the
+          bottles enter the store at no cost, so average price, last purchase price, closing-stock
+          value per {pu} and recipe costs keep their existing basis. The ₹ paid is kept only on the
+          wine-shop register, where the excess over depot cost is reported.
         </span>
       </div>
 
@@ -3045,9 +3073,11 @@ function WineShopModal({ materials, onClose, onSaved, onRefresh }: {
           </div>
           <div className="text-[12px] text-emerald-900 space-y-1">
             <div>
-              Stock added: <b>{mat ? qtyText(result.stock_qty, mat) : fq(result.stock_qty)}</b> to
-              {' '}<b>Central</b>{' '}stock. The liquor store&apos;s own ledger is deliberately
-              untouched.
+              Stock added: <b>{mat ? qtyText(result.stock_qty, mat) : fq(result.stock_qty)}</b>
+              {result.purchase_id
+                ? <>{' '}to <b>Central</b>{' '}stock.</>
+                : <>{' '}to <b>{result.store_name || 'the liquor store'}</b>{' '}— one Inward row on its
+                    ledger, at the store&apos;s existing cost.</>}
             </div>
             {/* THE TEST IS THE FIGURE, NOT THE SOURCE. It used to be
                 `depot_source === 'unknown'`, which let a depot rate that
@@ -3056,7 +3086,16 @@ function WineShopModal({ materials, onClose, onSaved, onRefresh }: {
                 cost us nothing extra" — while retailExcessSummary, whose test is
                 `depot > 0`, bucketed the very same row as unknown-depot. Same
                 test, both places: any figure that is not > 0 is "not computed". */}
-            {!(result.depot_landed_per_bottle > 0) ? (
+            {result.depot_figures_withheld ? (
+              /* PRICED, BUT NOT FOR THIS VIEWER. Tested FIRST: the figure is
+                 null here, and the "unknown" branch below (whose test is the
+                 figure) would otherwise tell the recorder a priced buy was never
+                 priced and send a manager to price it again (a 409). */
+              <div>
+                Depot rate <b>recorded</b> ({landedBasisText(result.depot_detail)}) and the excess computed. The figures are
+                admin-only — an admin sees them on the <b>Wine-shop buys</b>{' '}tab.
+              </div>
+            ) : !(Number(result.depot_landed_per_bottle) > 0) ? (
               /* depot_detail is NOT printed on this branch. resolveDepotLanded
                  sets it to L1's raw LqMapReason on the unknown path, so it
                  rendered the bare token "not_mapped" at a storekeeper — and the
@@ -3065,15 +3104,15 @@ function WineShopModal({ materials, onClose, onSaved, onRefresh }: {
                  and no depot rate was supplied"). One sentence, in words. */
               <div>
                 Depot landed cost <b>unknown</b> — the excess was <b>not computed</b> for this buy
-                (stored as 0 and left out of the “price of running out” total). Price it later from
-                the <b>Wine-shop buys</b>{' '}tab → <b>Set depot rate</b>.
+                (stored as 0 and left out of the “price of running out” total). A manager can price it
+                later from the <b>Wine-shop buys</b>{' '}tab → <b>Set depot rate</b>.
               </div>
             ) : (
               <div>
                 {/* Both figures are ₹ per PURCHASE unit, beside a purchase-unit
                     quantity, and the unit label is the material's own.
                     rate-basis: purchase */}
-                Depot landed <b>{inr(result.depot_landed_per_bottle)}</b> per {pu}
+                Depot landed <b>{inr(Number(result.depot_landed_per_bottle))}</b> per {pu}
                 {' '}({result.depot_source === 'override'
                        ? 'the rate you entered'
                        : landedBasisText(result.depot_detail)})
@@ -3110,8 +3149,8 @@ function WineShopModal({ materials, onClose, onSaved, onRefresh }: {
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
             <div>
               <L>Date bought (required)</L>
-              <input type="date" value={date} onChange={e => setDate(e.target.value)} className={inputCls} />
-              <div className="text-[10px] text-[#8B7355] mt-0.5">Backdating limits apply (admins exempt)</div>
+              <input type="date" value={date} max={today()} onChange={e => setDate(e.target.value)} className={inputCls} />
+              <div className="text-[10px] text-[#8B7355] mt-0.5">Not in the future; backdating limits apply (admins exempt)</div>
             </div>
             <div>
               <L>Qty in {pu} (required)</L>
@@ -3207,8 +3246,9 @@ function WineShopModal({ materials, onClose, onSaved, onRefresh }: {
                   also corrects a claim recorded pending by mistake. */}
               {status === 'claimed_pending' && (
                 <div className="text-[10px] text-[#8B7355] mt-0.5">
-                  Pay it back later from the <b>Wine-shop buys</b>{' '}tab → <b>Pay back</b>{' '}— that petty-cash
-                  payout is what sets “Reimbursed”. Until then it counts in “unreimbursed staff spend”.
+                  A manager pays it back later from the <b>Wine-shop buys</b>{' '}tab → <b>Pay back</b>{' '}— that
+                  petty-cash payout is what sets “Reimbursed”. Until then it counts in “unreimbursed staff
+                  spend”.
                 </div>
               )}
             </div>

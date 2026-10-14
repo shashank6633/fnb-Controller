@@ -4,6 +4,7 @@ import { requireBrandMapAdmin, gateResponse, requireAuditedWrite } from '../_lib
 import {
   parseCsv, normProductType, numCell, boolCell, normCode,
   KNOWN_COLUMNS, BRAND_MAP_CSV_HEADER,
+  spellingFold, spellingFoldMessage, type SpellingFold,
 } from '../_lib/rows';
 
 /**
@@ -33,6 +34,14 @@ import {
  * produces zero new rows and zero edits the second time. Codes are upper-cased
  * at the edge (normCode) because that UNIQUE index is case-SENSITIVE: without
  * it, "9740/pp" and "9740/PP" would be two master rows for one pack.
+ *
+ * NO FOLD IS SILENT (owner decision 4, 2026-08-31). The two folds that must
+ * stay — the code/pack upper-casing above, and product_type onto BEER / IML /
+ * Duty Paid — are each reported as a WARNING naming the line, what the file
+ * typed and what is stored ("product type 'Beer' stored as 'BEER'"), on every
+ * row whatever its action, and every fold rides the batch audit with the
+ * file's own spelling (`spelling_folds`). The material NAME is never folded:
+ * it is matched case-insensitively and raw_materials is never written.
  *
  * AN UPDATE CHANGES WHAT THE FILE SAYS, AND ONLY THAT. Three columns are
  * optional (size_ml, is_active, note — only the starred three are required per
@@ -98,6 +107,9 @@ export const dynamic = 'force-dynamic';
 
 const MAX_BODY_BYTES = 1_000_000; // 1MB — same cap as the HR import
 const MAX_ROWS = 2_000;           // keeps the synchronous commit loop bounded
+/** Owner decision 4: fold warnings listed one per line up to this many; the
+ *  rest are counted in one closing line (never dropped — see the row loop). */
+const FOLD_WARNINGS_MAX = 200;
 
 interface RowIssue { line: number; message: string }
 interface Warning { line?: number; message: string }
@@ -126,6 +138,10 @@ interface ValidRow {
    *  about, and carried into the audit — see the header. */
   material_from: string | null;
   material_from_name: string | null;
+  /** Every place the stored value differs from what the file typed (owner
+   *  decision 4) — warned in the preview and kept, with the file's spelling,
+   *  in the batch audit. */
+  spelling_folds: SpellingFold[];
 }
 
 async function readCsvBody(req: Request): Promise<string> {
@@ -207,6 +223,7 @@ export async function POST(request: Request) {
     const has = (k: string): boolean => headers.includes(k);
 
     const seenKeys = new Map<string, number>();   // "CODE|SIZE" → first file line
+    let foldWarned = 0, foldOverflow = 0;         // owner decision 4 — see the row loop
     const valid: ValidRow[] = [];
 
     for (const row of rows) {
@@ -320,6 +337,23 @@ export async function POST(request: Request) {
         continue;
       }
 
+      // ── owner decision 4: name every fold, never fold quietly ──
+      // Only on a row that will import (an excluded row stores nothing), and on
+      // EVERY such row whatever its action: an 'unchanged' re-import was folded
+      // just the same, and that was where a fold used to pass with no word.
+      const folds = [
+        spellingFold('code', cell('tgbcl_brand_code'), tgbcl_brand_code),
+        spellingFold('pack code', cell('size_code'), size_code),
+        spellingFold('product type', ptRaw, product_type as string),
+      ].filter((f): f is SpellingFold => f !== null);
+      // One line per fold up to FOLD_WARNINGS_MAX, then a single count line at
+      // the end — a whole TGBCL sheet typed in lower case is still ANNOUNCED,
+      // without a 6,000-line preview.
+      for (const f of folds) {
+        if (foldWarned < FOLD_WARNINGS_MAX) { warnings.push({ line: row.line, message: spellingFoldMessage(f) }); foldWarned++; }
+        else foldOverflow++;
+      }
+
       const rate2 = Math.round((rate as number) * 100) / 100;
       const existing = byKey.get(tgbcl_brand_code, size_code) as any;
 
@@ -396,6 +430,15 @@ export async function POST(request: Request) {
         product_type: product_type as string, is_active, note,
         existing_id: existing ? String(existing.id) : '',
         action, rate_from, material_from, material_from_name,
+        spelling_folds: folds,
+      });
+    }
+
+    if (foldOverflow > 0) {
+      warnings.push({
+        message: `…and ${foldOverflow} more value${foldOverflow > 1 ? 's' : ''} stored with a different spelling from the file `
+          + '(codes upper-cased, product types onto BEER / IML / Duty Paid) — counted in spelling_folds_total and in the '
+          + 'import audit, which also lists the first 200 with the file\'s own spelling.',
       });
     }
 
@@ -410,6 +453,12 @@ export async function POST(request: Request) {
       from_material_id: v.material_from, from_material: v.material_from_name,
       to_material_id: v.material_id, to_material: v.material_name,
     }));
+    // Owner decision 4: the file's own spelling beside what is stored, per fold.
+    const spellingFoldRows = valid.flatMap(v => v.spelling_folds.map(f => ({
+      line: v.line, material: v.material_name,
+      code: v.tgbcl_brand_code, size_code: v.size_code,
+      field: f.field, typed: f.typed, stored: f.stored,
+    })));
 
     if (!commit) {
       return Response.json({
@@ -426,6 +475,8 @@ export async function POST(request: Request) {
         rate_changes_total: rateChanges.length,
         material_changes: materialChangeRows.slice(0, 50),
         material_changes_total: materialChanges.length,
+        spelling_folds: spellingFoldRows.slice(0, 50),
+        spelling_folds_total: spellingFoldRows.length,
         sample: valid.slice(0, 10),
       });
     }
@@ -489,8 +540,17 @@ export async function POST(request: Request) {
           // the half a bare "updated" count cannot reconstruct.
           material_changes_total: materialChanges.length,
           material_changes: materialChangeRows.slice(0, 200),
+          // Owner decision 4: what the FILE typed, beside what was stored — so
+          // the audit keeps the file's spelling even where the master cannot.
+          spelling_folds_total: spellingFoldRows.length,
+          spelling_folds: spellingFoldRows.slice(0, 200),
         },
         note: `Brand Master CSV import — ${created} added, ${updated} updated, ${unchangedCount} unchanged`
+          + (spellingFoldRows.length > 0
+            ? `; ${spellingFoldRows.length} spelling${spellingFoldRows.length > 1 ? 's' : ''} stored differently from the file (`
+              + spellingFoldRows.slice(0, 5).map(f => `line ${f.line} ${f.field} '${f.typed}' → '${f.stored}'`).join('; ')
+              + (spellingFoldRows.length > 5 ? '; …' : '') + ')'
+            : '')
           + (materialChanges.length > 0
             ? `; ${materialChanges.length} mapping${materialChanges.length > 1 ? 's' : ''} MOVED to a different material (`
               + materialChangeRows.slice(0, 5).map(m => `${m.code}${m.size_code ? '-' + m.size_code : ''}: ${m.from_material} → ${m.to_material}`).join('; ')
@@ -507,6 +567,7 @@ export async function POST(request: Request) {
       rate_changes_total: rateChanges.length,
       material_changes_total: materialChanges.length,
       material_changes: materialChangeRows.slice(0, 50),
+      spelling_folds_total: spellingFoldRows.length,
     });
   } catch (e: any) {
     console.error('[POST /api/liquor/brand-map/import]', e);

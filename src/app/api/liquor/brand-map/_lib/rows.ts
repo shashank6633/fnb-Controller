@@ -169,3 +169,44 @@ export function boolCell(raw: string, dflt: number): number {
  *  "9740" / "9740 " / "pp" / "PP" can never become two master rows behind the
  *  UNIQUE(tgbcl_brand_code, size_code) index. */
 export const normCode = (v: unknown): string => String(v ?? '').trim().toUpperCase();
+
+/** One spelling the file typed that is NOT what gets stored. */
+export interface SpellingFold {
+  /** The column, in the words the preview uses ('code', 'pack code', 'product type'). */
+  field: string;
+  /** Exactly what the file typed, trimmed. */
+  typed: string;
+  /** What is stored instead. */
+  stored: string;
+}
+
+/**
+ * OWNER DECISION 4 (2026-08-31): an import must NOT silently fold case — keep
+ * the file's spelling, and WARN whenever what is stored differs from what the
+ * file typed.
+ *
+ * normCode() and normProductType() above still fold, deliberately: the
+ * UNIQUE(tgbcl_brand_code, size_code) index is case-SENSITIVE, so an unfolded
+ * '9740/pp' beside '9740/PP' would make one pack two master rows; and
+ * product_type is CHECKed against the workbook's three exact tokens, so
+ * 'Beer' and 'BEER' stored apart would split every §C/§D total. What the
+ * decision forbids is the SILENCE, so every fold is named — on the preview,
+ * on every row whatever its action (an 'unchanged' row was folded too), and in
+ * the batch audit — and nothing is folded quietly.
+ *
+ * Returns null when the stored value IS what the file typed. Surrounding spaces
+ * are not a spelling (every cell is trimmed on read), so trimming alone never
+ * warns; a blank cell has no spelling to keep and never warns either.
+ */
+export function spellingFold(field: string, raw: unknown, stored: string): SpellingFold | null {
+  const typed = String(raw ?? '').trim();
+  if (!typed || typed === stored) return null;
+  return { field, typed, stored };
+}
+
+/** The preview's sentence for a fold: product type 'Beer' stored as 'BEER'. */
+export const spellingFoldMessage = (f: SpellingFold): string =>
+  `${f.field} '${f.typed}' stored as '${f.stored}' — the file's spelling is not kept `
+  + (f.field === 'product type'
+    ? '(product type is one of BEER / IML / Duty Paid exactly, so the totals do not split).'
+    : '(TGBCL codes are stored upper-case, so one pack can never become two master rows).');

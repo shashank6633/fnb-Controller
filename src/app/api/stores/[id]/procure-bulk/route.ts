@@ -252,6 +252,9 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
             supplier, vendor_id: vendorId, expiry_date: p.expiry_date,
             ref: p.ref, notes: '', created_by: user.email,
             discount: p.discount, cgst: p.cgst, sgst: p.sgst, delivery_charges: p.delivery_charges,
+            // Business date = this row's own date (or the bill's), as the
+            // created_at backdate below uses — see /procure-bill. Blank → today.
+            txn_date: p.date || undefined,
           });
           if (p.date) backdateStmt.run(p.date, id);
           ledgerIds.push(id);
@@ -274,6 +277,32 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
             invoice_value: Math.round((Number(inv?.v) || 0) * 100) / 100,
             charges: effectiveCharges, created_by: user.email,
           });
+          // [LIQUOR-RECON:BEGIN] ── inward numbers this header's charges cover (L2) ──
+          // GATED: ships only when the owner says "Deploy Liqour Reconcilation".
+          // A pure insertion: a ship WITHOUT liquor deletes BEGIN..END and this
+          // route is production's again, byte for byte.
+          //
+          // A register CSV posts each line under its OWN inward_no, but the
+          // levies, Net Indent and wallet debit are keyed on the header ref above
+          // (its invoice_value spans refList). Nothing else records which inward
+          // numbers that covers, so the wallet integrity check, the Summary's §B
+          // and check B — all keyed on a line's own ref — read them as indents
+          // with no levies and no debit. linkIndentMembers records the cover in
+          // lq_indent_members, in its own savepoint: it never blocks the bill.
+          // billCharges.id is the charges row id upsertBillCharges' liquor block
+          // adds at runtime; without it (no liquor) there is nothing to link.
+          if (billCharges?.id) {
+            // eslint-disable-next-line @typescript-eslint/no-require-imports
+            const { linkIndentMembers } = require('../../../../../lib/liquor-wallet') as typeof import('../../../../../lib/liquor-wallet');
+            const covers = linkIndentMembers(db, {
+              store_id: storeId, charges_id: String(billCharges.id), header_ref: invoiceRef,
+              refs: prepared.map(p => p.ref), created_by: user.email,
+            });
+            if (covers.linked.length || covers.also_covered_by.length || covers.error) {
+              billCharges = { ...billCharges, covers };
+            }
+          }
+          // [LIQUOR-RECON:END] ───────────────────────────────────────────────────
         }
       });
       txn();

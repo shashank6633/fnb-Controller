@@ -630,13 +630,23 @@ function NewWithdrawalForm({ stores, categories, basisList, onClose, onSaved }: 
         {category === 'breakage_spoilage' && coWriteWastage && (
           <span className="text-[11px] text-amber-800 bg-amber-50 border border-amber-200 rounded px-2 py-1">
             The /wastage copy is a RECORD ONLY — the stock has already left the liquor store ledger.
-            Never delete it from /wastage: that page&apos;s Trash button credits central stock back, and this
-            bottle never sat on central&apos;s shelf.
+            It cannot be deleted from /wastage (this bottle never sat on central&apos;s shelf), and it stays
+            for as long as this withdrawal does.
           </span>
         )}
-        <label className="flex items-center gap-2 text-xs text-[#6B5744]">
+        {/* The override covers a book that is merely behind the shelf. It never
+            covers an item whose stock is still in Central (the server refuses it
+            with not_migrated until Migrate has run): a forced first entry here
+            would block Migrate and count that Central stock twice. */}
+        <label className="flex items-center gap-2 text-xs text-[#6B5744]"
+               title="Not for an item whose stock is still in Central stock: run Migrate on the store first.">
           <Toggle size="sm" checked={allowNeg} onChange={setAllowNeg} /> Allow issuing below on-hand
         </label>
+        {allowNeg && (
+          <span className="text-[11px] text-[#8B7355]">
+            Does not apply to an item still held in Central stock — run Migrate on the store first.
+          </span>
+        )}
       </div>
 
       <label className="text-xs text-[#6B5744] block">Remarks

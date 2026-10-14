@@ -11,8 +11,10 @@
  * become possible:
  *   · RATE MOVEMENT — an indent that arrives at a rate the master does not hold
  *     is visible (red) instead of quietly becoming the new normal.
- *   · LANDED COST — the master rate per bottle plus that line's share of the
- *     recorded TGBCL levies. Phases L3/L4/L5 read it.
+ *   · LANDED COST — the rate PAID on the indent line plus that line's share of
+ *     the recorded TGBCL levies (owner decision 2: value at the rate paid; the
+ *     master is the yardstick the drift is measured against). A material must
+ *     be mapped to be priced. Phases L3/L4/L5 read it.
  *   · THE BEER / SPIRIT SPLIT — product_type drives Summary §C and the §D
  *     uplift factors.
  *
@@ -217,6 +219,18 @@ export default function LiquorBrandMapPage() {
   const flash = useCallback((ok: boolean, text: string) => {
     setMsg({ ok, text });
     window.setTimeout(() => setMsg(null), 6000);
+  }, []);
+
+  /* ?tab=movement — the deep link into the Rate Movement card (owner decision
+     2: every drift shown, with a one-tap audited "accept new rate into
+     master"). The Reconciliation summary's §G links here, so a drift seen
+     there is one tap from being accepted. Read once at mount, after
+     hydration; any other value leaves the page on Mappings. */
+  useEffect(() => {
+    try {
+      const t = new URLSearchParams(window.location.search).get('tab');
+      if (t === 'movement' || t === 'import') setTab(t);
+    } catch { /* no URL to read */ }
   }, []);
 
   const load = useCallback(async (quiet = false) => {
@@ -446,7 +460,8 @@ export default function LiquorBrandMapPage() {
             </h1>
             <p className="text-sm text-[#8B7355] mt-1">
               Tell each bottle which TGBCL brand code and pack it is. That is what makes an indent&apos;s
-              rate comparable to the master, and what a landed cost per bottle is built from. A brand
+              rate comparable to the master, and what lets a landed cost per bottle (the rate paid + the
+              TGBCL levies) be worked out. A brand
               bought in two packs holds <b>two rows</b> — the key is the code + pack, not the material.
             </p>
           </div>
@@ -887,9 +902,12 @@ export default function LiquorBrandMapPage() {
             </div>
 
             <p className="text-[11px] text-[#8B7355] px-1">
-              <b>Landed / bottle</b> = the master rate for the pack + this line&apos;s share of the bill&apos;s TGBCL
-              levies (MRP rounding shared out by <b>bottles</b>, turnover tax / cess / TCS by <b>line value</b>, as the
-              workbook does it). It is an analytics figure: it does not enter stock valuation or recipe costing.
+              <b>Landed / bottle</b> = the <b>rate paid</b> on this indent line + this line&apos;s share of the bill&apos;s
+              TGBCL levies (MRP rounding shared out by <b>bottles</b>, turnover tax / cess / TCS by <b>line value</b>, as
+              the workbook does it). The master is the yardstick for the <b>Variance</b> column only — it is used for the
+              rate just when a line recorded none. Accepting a rate does not re-price a wine-shop buy or a withdrawal
+              already recorded: those keep the landed figure they were frozen at. It is an analytics figure: it does
+              not enter stock valuation or recipe costing.
             </p>
           </>
         )}

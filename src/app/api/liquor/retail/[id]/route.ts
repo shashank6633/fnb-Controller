@@ -1,9 +1,10 @@
 import { getDb } from '@/lib/db';
+import { isManagement } from '@/lib/auth';
 import { LQ_REIMBURSEMENT_STATUS, type LqReimbursementStatus } from '@/lib/liquor-recon';
 import {
   backfillDepotLanded, setReimbursementStatus, retailErrorResponse,
 } from '@/lib/liquor-retail';
-import { requireRetailRecord, gateResponse } from '../_lib/guard';
+import { requireRetailRecord, requireSignedInWrite, gateResponse } from '../_lib/guard';
 
 /**
  * PATCH /api/liquor/retail/[id] — the rest of a wine-shop record's lifecycle.
@@ -36,6 +37,10 @@ import { requireRetailRecord, gateResponse } from '../_lib/guard';
  * CSRF-checked in the guard, because '/api/liquor' is not in the proxy's CSRF
  * prefix list. Reimbursing stays on its own route at the petty-cash write level:
  * correcting a record and moving money are not the same authority.
+ *
+ * What it SAYS is narrower than who may call it: a frozen rate is refused
+ * without being quoted (backfillDepotLanded), and the recomputed excess is
+ * returned to management only — see the hasRate branch.
  */
 export const dynamic = 'force-dynamic';
 
@@ -44,19 +49,29 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ id
     const { id } = await params;
     if (!id) return Response.json({ error: 'A wine-shop record id is required.' }, { status: 400 });
 
+    // GATE BEFORE LOOKUP. Sign-in and CSRF first: the record lookup used to run
+    // ahead of every check, so an anonymous caller got 404 "no longer exists"
+    // where it should get 401 — the wrong refusal, and an existence oracle.
+    const pre = await requireSignedInWrite(request);
+    if (!pre.ok) return gateResponse(pre);
+
     const db = getDb();
     // Resolve the record's own material so the gate asks about the store the
-    // bottles were booked into — never a store the caller merely names.
+    // bottles were booked into — never a store the caller merely names. The
+    // flag carries it; a LEGACY flag's parent purchase is the second source.
     const flag = db.prepare(`
-      SELECT f.id, p.material_id AS material_id
+      SELECT f.id, COALESCE(f.material_id, p.material_id) AS material_id
         FROM lq_retail_flags f
         LEFT JOIN purchases p ON p.id = f.purchase_id
        WHERE f.id = ?
     `).get(id) as { id: string; material_id: string | null } | undefined;
-    if (!flag) return Response.json({ error: 'That wine-shop record no longer exists.' }, { status: 404 });
 
-    const gate = await requireRetailRecord(request, db, flag.material_id || undefined);
+    // A missing record is reported only to someone who could have edited one:
+    // the store gate runs on the liquor store itself, so a signed-in user with
+    // no procure right gets the same 403 whether the id exists or not.
+    const gate = await requireRetailRecord(request, db, flag?.material_id || undefined);
     if (!gate.ok) return gateResponse(gate);
+    if (!flag) return Response.json({ error: 'That wine-shop record no longer exists.' }, { status: 404 });
 
     const body = (await request.json().catch(() => null)) as Record<string, unknown> | null;
     if (!body || typeof body !== 'object') {
@@ -84,8 +99,15 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ id
         return Response.json({ error: 'depot_landed_per_bottle must be a number greater than 0 (₹ per bottle).' }, { status: 400 });
       }
       const res = backfillDepotLanded(db, { flagId: id, depotLandedPerBottle: rate, actorEmail: gate.user.email });
+      // The rate is the caller's own figure — echoing it tells them nothing.
       out.depot_landed_per_bottle = res.depotLandedPerBottle;
-      out.excess = res.excess;
+      // The EXCESS is not: it is the rate paid minus that figure, so it hands
+      // over SOMEONE ELSE'S retail price (measured: a can_procure bartender
+      // outside management priced a colleague's buy at ₹90 and was told excess
+      // ₹60/bottle — paid ₹150). Reading the money behind a buy is a management
+      // authority, never a can_procure one (requireRetailView), so only
+      // management — who see the rate paid on the register already — get it.
+      if (isManagement(gate.user)) out.excess = res.excess;
     }
 
     if (hasStatus) {

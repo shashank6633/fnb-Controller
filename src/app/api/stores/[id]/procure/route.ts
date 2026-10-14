@@ -124,6 +124,9 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
         ref: String(b.invoice_ref || '').trim(),
         notes: String(b.notes || '').trim(),
         created_by: user.email,
+        // Business date = the purchase date, as the created_at backdate below
+        // uses — see /procure-bill. Blank → today.
+        txn_date: backdate || undefined,
       });
       if (backdate) {
         db.prepare(`

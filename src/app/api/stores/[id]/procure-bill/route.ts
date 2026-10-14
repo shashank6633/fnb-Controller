@@ -158,6 +158,11 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
           notes: '',
           created_by: user.email,
           discount: p.discount, cgst: p.cgst, sgst: p.sgst, delivery_charges: p.delivery_charges,
+          // The movement record's business date (field 7) is the BILL date. It is
+          // written at insert, so the created_at backdate below cannot reach it:
+          // without this a bill keyed in today for yesterday sat on yesterday in
+          // the ledger but on TODAY in the movements register. Blank → today.
+          txn_date: backdate || undefined,
         });
         if (backdate) backdateStmt.run(backdate, id);
         ledgerIds.push(id);

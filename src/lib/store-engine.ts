@@ -10,11 +10,6 @@ import {
   movementCols, orient, storeParty, vendorParty,
   type MovementParty, type MovementPartyKind,
 } from './movement-record';
-// Phase L2 of the Liquor Purchase Reconciliation module. upsertBillCharges()
-// below is the ONE place a TGBCL Net Indent is ever written, and the plan
-// requires the wallet debit to be created in the SAME TRANSACTION as the
-// indent — see the note inside that function.
-import { autoDebitForIndent, type AutoDebitResult } from './liquor-wallet';
 
 /**
  * Multi-Store Inventory Engine — Phase A foundation (LIQUOR STORE first).
@@ -1584,6 +1579,37 @@ export function floorReconciliation(
     m.set(e.material_id, (m.get(e.material_id) || 0) + (Number(e.q) || 0));
   }
 
+  // [LIQUOR-RECON:BEGIN] ── liquor withdrawals are known non-sale too (L4) ──────
+  // GATED with the rest of Liquor Reconciliation ("Deploy Liqour Reconcilation").
+  // A pure insertion: a ship WITHOUT liquor deletes BEGIN..END and is left with
+  // production's floorReconciliation, byte for byte.
+  //
+  // A withdrawal (src/lib/liquor-withdrawals.ts) is a recorded, authorised
+  // non-sale issue: breakage, director/management use, staff welfare, sampling,
+  // a transfer out. In LEDGER mode it was already kept out of ACTUAL (it posts an
+  // 'adjustment', never an 'outward' pour). In PHYSICAL mode, the default, the
+  // bottle is missing from the closing count and nothing netted it, so every
+  // withdrawal read as unbilled leak — measured: one 1-BTL breakage WD on a
+  // zero-sales day gave actual 750 ml, known_non_sale 0, ₹4,299.97 of leak,
+  // while the same bottle logged in bar_empties is netted. Its quantity is added
+  // to the same per-store known-non-sale map, on the withdrawal's business date
+  // (lq_withdrawals.date, IST — the day its ledger row is also dated on), so
+  // both modes now agree that a recorded withdrawal is not a leak. ALL
+  // categories, for that reason: the ledger-mode rule already covers them all.
+  // The sqlite_master check keeps this a no-op on a database without the table.
+  if (db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'lq_withdrawals'").get()) {
+    for (const w of db.prepare(`
+      SELECT store_id, material_id, SUM(qty_recipe_units) AS q
+      FROM lq_withdrawals
+      WHERE date >= ? AND date <= ?
+      GROUP BY store_id, material_id
+    `).all(from, to) as { store_id: string; material_id: string; q: number }[]) {
+      let m = emptiesByStore.get(w.store_id);
+      if (!m) { m = new Map(); emptiesByStore.set(w.store_id, m); }
+      m.set(w.material_id, (m.get(w.material_id) || 0) + (Number(w.q) || 0));
+    }
+  }
+  // [LIQUOR-RECON:END] ─────────────────────────────────────────────────────────
   const rows: FloorReconRow[] = [];
   let tExpQ = 0, tActQ = 0, tVarQ = 0, tExpV = 0, tActV = 0, tVarV = 0, tUnbilled = 0, tKnownQ = 0, tKnownV = 0;
 
@@ -1804,6 +1830,19 @@ export function overallReconciliation(db: Database, opts: { from: string; to: st
   for (const e of db.prepare(`SELECT material_id, SUM(qty) AS q FROM bar_empties WHERE kind IN ('breakage','spillage') AND date >= ? AND date <= ? GROUP BY material_id`).all(from, to) as any[]) {
     knownT.set(e.material_id, (knownT.get(e.material_id) || 0) + (Number(e.q) || 0));
   }
+  // [LIQUOR-RECON:BEGIN] ── liquor withdrawals are known non-sale too (L4) ──────
+  // Same rule and reason as the block in floorReconciliation above (a pure
+  // insertion; a ship WITHOUT liquor deletes BEGIN..END). Kept to the ACTIVE
+  // stores ACTUAL is summed over, so a withdrawal from a deactivated store
+  // cannot net against a movement this report never counted.
+  if (db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'lq_withdrawals'").get()) {
+    const activeStoreIds = new Set(stores.map(s => s.id));
+    for (const w of db.prepare(`SELECT store_id, material_id, SUM(qty_recipe_units) AS q FROM lq_withdrawals WHERE date >= ? AND date <= ? GROUP BY store_id, material_id`).all(from, to) as { store_id: string; material_id: string; q: number }[]) {
+      if (!activeStoreIds.has(w.store_id)) continue;
+      knownT.set(w.material_id, (knownT.get(w.material_id) || 0) + (Number(w.q) || 0));
+    }
+  }
+  // [LIQUOR-RECON:END] ─────────────────────────────────────────────────────────
 
   // Accumulate purchase + sale-out per material and build the material universe.
   const purchaseT = new Map<string, number>();
@@ -1946,39 +1985,19 @@ export function invoiceRefHasPurchases(db: Database, storeId: string, invoiceRef
  *  amounts (bottle cost); net_indent_value is derived = invoiceValue + 4 charges.
  *  Keyed UNIQUE(store_id, invoice_ref) so re-save updates in place. Returns the
  *  stored figures (incl. net_indent_value). A no-op-safe write: only call when
- *  the caller actually has charges to record.
- *
- *  ── AND IT DEBITS THE TGBCL WALLET (phase L2) ────────────────────────────────
- *  The plan: "Indent debits AUTO-CREATED from the inward register's Net Indent
- *  (same transaction), so the wallet can never disagree with recorded indents."
- *  This function is where that promise is kept, for two reasons:
- *    · it is the ONE place net_indent_value is ever computed or written, so
- *      there is no second door a future caller could record an indent through;
- *      and
- *    · both callers (/procure-bill and /procure-bulk) already invoke it INSIDE
- *      their own db.transaction(), so the debit commits with the indent's
- *      ledger lines or not at all. A failed bill therefore leaves no orphan
- *      debit, and a debit that cannot be written takes the bill down with it —
- *      which is what "can never disagree" has to mean.
- *  The debit is keyed on this row's id (lq_wallet_txns.source_ref), so re-saving
- *  a bill re-derives the one debit instead of adding a second. See
- *  src/lib/liquor-wallet.ts autoDebitForIndent() for the idempotency rules.
- *  Every store_bill_charges row IS a TGBCL indent — the four charges are the
- *  government levies (see the block comment above BillCharges) and the only UI
- *  that records them is the Liquor Store bill entry. */
+ *  the caller actually has charges to record. */
 export function upsertBillCharges(
   db: Database,
   args: {
     store_id: string; invoice_ref: string; supplier?: string; date?: string;
     invoice_value: number; charges: BillCharges; created_by?: string;
   },
-): { id: string; invoice_value: number; net_indent_value: number; wallet_debit: AutoDebitResult | null } & BillCharges {
+): { invoice_value: number; net_indent_value: number } & BillCharges {
   const invoiceValue = Math.round((Number(args.invoice_value) || 0) * 100) / 100;
   const c = normalizeBillCharges(args.charges);
   const netIndent = Math.round(
     (invoiceValue + c.mrp_rounding + c.excise_turnover_tax + c.special_excise_cess + c.tcs) * 100,
   ) / 100;
-  const invoiceRef = String(args.invoice_ref || '').trim();
   db.prepare(`
     INSERT INTO store_bill_charges
       (id, store_id, invoice_ref, supplier, date, invoice_value,
@@ -1995,37 +2014,75 @@ export function upsertBillCharges(
       net_indent_value    = excluded.net_indent_value,
       updated_at          = datetime('now')
   `).run(
-    generateId(), args.store_id, invoiceRef,
+    generateId(), args.store_id, String(args.invoice_ref || '').trim(),
     String(args.supplier || '').trim(), String(args.date || '').trim(), invoiceValue,
     c.mrp_rounding, c.excise_turnover_tax, c.special_excise_cess, c.tcs, netIndent,
     String(args.created_by || '').trim(),
   );
-  // The row's id is read back rather than kept from the INSERT: on the UPDATE
-  // half of the upsert the generateId() above is discarded and the ORIGINAL id
-  // stands. That id is the wallet debit's identity (uq_lq_wallet_debit_source),
-  // so using the freshly generated one would create a SECOND debit on every
-  // re-save of the same bill — the exact doubling this module exists to prevent.
-  const stored = db.prepare(
-    'SELECT id FROM store_bill_charges WHERE store_id = ? AND invoice_ref = ?',
-  ).get(args.store_id, invoiceRef) as { id: string } | undefined;
-
-  // Same transaction as the indent, by construction (see the note above the
-  // function). Deliberately NOT wrapped in try/catch: a debit that quietly
-  // failed to write is the silent disagreement this exists to prevent, so if it
-  // cannot be written the whole bill save rolls back and says why.
-  let wallet: AutoDebitResult | null = null;
-  if (stored?.id && invoiceRef) {
-    wallet = autoDebitForIndent(db, {
-      source_ref: stored.id,
-      reference: invoiceRef,
-      date: String(args.date || '').trim(),
-      net_indent_value: netIndent,
-      store_id: args.store_id,
-      supplier: String(args.supplier || '').trim(),
-      created_by: String(args.created_by || '').trim(),
-    });
+  // [LIQUOR-RECON:BEGIN] ── TGBCL wallet auto-debit (Liquor Reconciliation, L2) ──
+  // GATED: ships only when the owner says "Deploy Liqour Reconcilation". This
+  // block and the two withdrawal blocks in floorReconciliation and
+  // overallReconciliation are that module's whole footprint in this file (three
+  // [LIQUOR-RECON] blocks), each a pure
+  // insertion. A ship WITHOUT liquor deletes every line from BEGIN to END and is
+  // left with production's upsertBillCharges, byte for byte. A liquor ship onto
+  // production store-engine inserts it, unchanged, above the final return.
+  //
+  // WHY HERE: every store_bill_charges row is a TGBCL indent, this function is
+  // the ONE place net_indent_value is computed or written, and both callers
+  // (/procure-bill and /procure-bulk) run it INSIDE their own db.transaction().
+  // So the debit is attempted in the bill's own transaction, and there is no
+  // second door an indent could be recorded through.
+  //
+  // A WALLET PROBLEM NEVER TAKES THE BILL DOWN. autoDebitForIndent writes the
+  // debit in a SAVEPOINT nested in that transaction. On success it commits with
+  // the bill. On any wallet-side error only the wallet's own writes roll back,
+  // the bill commits, wallet_debit says action 'failed', and the gap is filed in
+  // audit_events (the wallet page's "missing" list) and error_reports. The one
+  // exception is SQLite abandoning the outer transaction itself (disk full, I/O
+  // error): that re-throws and the bill route answers 500, as it would anyway.
+  // See the contract above autoDebitForIndent in liquor-wallet.ts.
+  //
+  // THE ROW ID IS READ BACK rather than kept from the INSERT: on the UPDATE half
+  // of the upsert the generateId() above is discarded and the ORIGINAL id
+  // stands. That id is the debit's identity (its source_ref), so the fresh one
+  // would add a SECOND debit on every re-save of the same bill.
+  //
+  // Both callers refuse a blank invoice_ref with 400 before they get here, so
+  // the `if` below is taken on every real call; a blank ref is not an indent.
+  //
+  // require(), not a top-of-file import, so that this module's whole footprint
+  // stays inside the two markers. The specifier is a literal, so the bundler and
+  // the type-checker still resolve it statically (the same pattern as db.ts's
+  // lazy require of this file).
+  {
+    const invoiceRef = String(args.invoice_ref || '').trim();
+    if (invoiceRef) {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { autoDebitForIndent } = require('./liquor-wallet') as typeof import('./liquor-wallet');
+      const stored = db.prepare(
+        'SELECT id FROM store_bill_charges WHERE store_id = ? AND invoice_ref = ?',
+      ).get(args.store_id, invoiceRef) as { id: string } | undefined;
+      const wallet = stored?.id
+        ? autoDebitForIndent(db, {
+          source_ref: stored.id,
+          reference: invoiceRef,
+          date: String(args.date || '').trim(),
+          net_indent_value: netIndent,
+          store_id: args.store_id,
+          supplier: String(args.supplier || '').trim(),
+          created_by: String(args.created_by || '').trim(),
+        })
+        : null;
+      // Built as a variable, not returned as a literal: the declared return type
+      // is production's, and these two extra keys ride along at runtime into the
+      // bill response (bill_charges.id / bill_charges.wallet_debit).
+      const withDebit = { id: stored?.id || '', invoice_value: invoiceValue, net_indent_value: netIndent, wallet_debit: wallet, ...c };
+      return withDebit;
+    }
   }
-  return { id: stored?.id || '', invoice_value: invoiceValue, net_indent_value: netIndent, wallet_debit: wallet, ...c };
+  // [LIQUOR-RECON:END] ─────────────────────────────────────────────────────────
+  return { invoice_value: invoiceValue, net_indent_value: netIndent, ...c };
 }
 
 /** All bill-charge rows for a store, keyed by invoice_ref (for ledger render). */

@@ -88,8 +88,8 @@ interface PortalCheck {
   note: string; observed_by: string; replaced_amount?: number | null;
 }
 interface Integrity {
-  missing: Array<{ source_ref: string; invoice_ref: string; date: string; net_indent_value: number; store: string }>;
-  mismatched: Array<{ id: string; reference: string; debit: number; net_indent_value: number; diff: number }>;
+  missing: Array<{ source_ref: string; invoice_ref: string; date: string; net_indent_value: number; store: string; failure?: string | null }>;
+  mismatched: Array<{ id: string; reference: string; debit: number; net_indent_value: number; diff: number; hand_entered?: boolean }>;
   orphaned: Array<{ id: string; reference: string; amount: number }>;
   non_positive: Array<{ invoice_ref: string; date: string; net_indent_value: number }>;
   undebited: Array<{ invoice_ref: string; store: string; date: string; recorded_value: number }>;
@@ -220,7 +220,7 @@ export default function LiquorWalletPage() {
 
             <RecordPanel data={data} onSaved={(m) => { setNotice(m); reload(); }} onError={setErr} />
 
-            <IntegrityPanel integrity={data.integrity} />
+            <IntegrityPanel integrity={data.integrity} onSaved={(m) => { setNotice(m); reload(); }} onError={setErr} />
 
             <Ledger data={data} from={from} to={to} setFrom={setFrom} setTo={setTo} onApply={() => load(from, to, planned)} />
           </>
@@ -672,7 +672,23 @@ function RecordPanel(
 }
 
 /* ── wallet vs recorded indents ───────────────────────────────────────────── */
-function IntegrityPanel({ integrity }: { integrity: Integrity }) {
+function IntegrityPanel(
+  { integrity, onSaved, onError }: { integrity: Integrity; onSaved: (m: string) => void; onError: (m: string) => void },
+) {
+  // The heal path for a debit that could not be written when its bill was
+  // saved: re-runs it from the RECORDED indent (POST action retry_auto_debit).
+  // Re-saving the bill cannot do it — a recorded invoice is refused as a duplicate.
+  const [busyRef, setBusyRef] = useState('');
+  const writeDebit = async (sourceRef: string, label: string) => {
+    setBusyRef(sourceRef); onError('');
+    try {
+      const r = await api('/api/liquor/wallet', { method: 'POST', body: { action: 'retry_auto_debit', source_ref: sourceRef } });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) { onError(j.error || `HTTP ${r.status}`); return; }
+      onSaved(`${label}: ${j.result?.note || 'wallet debit written.'}`);
+    } catch (e: any) { onError(e?.message || 'Could not write the debit.'); }
+    finally { setBusyRef(''); }
+  };
   const undebited = integrity.undebited || [];
   const foreign = integrity.foreign_store || [];
   const n = integrity.missing.length + integrity.mismatched.length + integrity.orphaned.length
@@ -686,13 +702,22 @@ function IntegrityPanel({ integrity }: { integrity: Integrity }) {
       {integrity.missing.length > 0 && (
         <div className="text-sm text-amber-900">
           <div className="font-medium">{integrity.missing.length} recorded indent(s) with NO wallet debit</div>
-          <ul className="text-xs mt-1 space-y-0.5">
+          <ul className="text-xs mt-1 space-y-1">
             {integrity.missing.slice(0, 8).map(m => (
-              <li key={m.source_ref}>{m.invoice_ref} · {m.date || 'no date'} · {rs(m.net_indent_value)} · {m.store}</li>
+              <li key={m.source_ref} className="flex flex-wrap items-start gap-x-2 gap-y-0.5">
+                <span>{m.invoice_ref} · {m.date || 'no date'} · {rs(m.net_indent_value)} · {m.store}</span>
+                <button onClick={() => writeDebit(m.source_ref, m.invoice_ref)} disabled={!!busyRef}
+                  className="px-2 py-0.5 rounded border border-amber-500 text-amber-900 hover:bg-amber-100 disabled:opacity-50">
+                  {busyRef === m.source_ref ? 'Writing…' : 'Write the debit'}
+                </button>
+                {m.failure && <span className="basis-full text-[11px] text-amber-800">Why it was not written: {m.failure}</span>}
+              </li>
             ))}
           </ul>
           <div className="text-[11px] mt-1">
-            Recorded before this ledger existed, or the debit was removed by hand. Record the matching debits, or re-save the indent.
+            Recorded before this ledger existed, the debit was removed by hand, or it could not be written when the bill
+            was saved (the reason is shown). Fix the cause, then press <b>Write the debit</b> — it writes the debit from
+            the recorded indent&apos;s Net Indent. Re-saving the bill does not: a recorded invoice is refused as a duplicate.
           </div>
         </div>
       )}
@@ -729,7 +754,7 @@ function IntegrityPanel({ integrity }: { integrity: Integrity }) {
           <div className="font-medium">{integrity.mismatched.length} debit(s) no longer equal to their Net Indent</div>
           <ul className="text-xs mt-1 space-y-0.5">
             {integrity.mismatched.slice(0, 8).map(m => (
-              <li key={m.id}>{m.reference}: debit {rs(m.debit)} vs Net Indent {rs(m.net_indent_value)} (out by {rs(m.diff)})</li>
+              <li key={m.id}>{m.reference}: debit {rs(m.debit)} vs Net Indent {rs(m.net_indent_value)} (out by {rs(m.diff)}){m.hand_entered ? ' · entered by hand' : ''}</li>
             ))}
           </ul>
         </div>

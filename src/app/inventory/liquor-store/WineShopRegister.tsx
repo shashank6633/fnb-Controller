@@ -25,13 +25,18 @@
  * a frozen depot rate is never re-priced, a payout-backed claim cannot be
  * re-statused. Refusals are shown in the server's own words, never paraphrased.
  *
- * WHO SEES IT. The tab is offered to can_procure on the selected store — the
- * same people who see the Wine-shop Purchase button. Pricing and status follow
- * that gate server-side (can_procure on the material's own store). Paying back
- * is the petty-cash gate (Petty Cash page access + Management or the Store
- * Manager); this file does NOT re-implement that membership test — a refusal
- * comes back as the route's sentence. Duplicating the rule here is how a read
- * path and a write path drift apart.
+ * WHO SEES IT. The tab is offered to MANAGEMENT (admin / manager / HOD) — the
+ * read gate of GET /api/liquor/retail, because this list is the §E money: the
+ * excess paid, depot spend and what is owed to named staff. Recording a buy
+ * (the Wine-shop Purchase button, can_procure) is a stock authority and does
+ * not open it. Inside, two write gates apply:
+ *   · Set depot rate / Change claim — PATCH, can_procure on the material's own
+ *     store. Offered only when `canCorrect` (the page: can_procure on any active
+ *     store); the route decides per material and its refusal is shown verbatim.
+ *   · Pay back — the petty-cash gate (Petty Cash page access + Management or
+ *     the Store Manager). Not re-implemented here: a refusal comes back as the
+ *     route's sentence. Duplicating the rule is how a read path and a write path
+ *     drift apart.
  *
  * UNITS. A flag's `bottles` and both ₹ rates are per PURCHASE unit (the modal
  * records "Qty in {pu}" and "₹ paid per {pu}"), so every figure here is labelled
@@ -56,17 +61,25 @@ export type ReimbStatus = 'not_required' | 'claimed_pending' | 'reimbursed' | 'r
 
 export interface RetailFlag {
   id: string;
-  purchase_id: string;
+  /** LEGACY anchor only (a flag from the first, central-purchase design). */
+  purchase_id: string | null;
+  /** The store-ledger 'inward' row that moved the bottles (new flags). */
+  ledger_id?: string | null;
   bill_ref: string;
   date: string;
   shop_name: string;
   shop_licence_no: string;
   bottles: number;
   rate_paid_per_bottle: number;
-  depot_landed_per_bottle: number;
-  excess_per_bottle: number;
-  excess_total: number;
-  excess_pct: number;
+  /** The four depot figures are null when WITHHELD from this viewer — they
+   *  re-derive the admin-only TGBCL master rate (liquor-retail.ts
+   *  retailSummaryForViewer). `priced` still says whether a rate is frozen. */
+  depot_landed_per_bottle: number | null;
+  excess_per_bottle: number | null;
+  excess_total: number | null;
+  excess_pct: number | null;
+  /** depot rate > 0 (the server's own test). Absent only from an older server. */
+  priced?: boolean;
   paid_by: string;
   payment_mode: string;
   reimbursement_status: ReimbStatus;
@@ -81,7 +94,11 @@ export interface RetailFlag {
 
 export interface RetailSummary {
   from: string; to: string;
-  excessTotal: number;
+  /** null when the depot figures are withheld from this viewer. */
+  excessTotal: number | null;
+  /** false → every depot figure on this summary is null; the note says why. */
+  depotFiguresVisible?: boolean;
+  depotFiguresNote?: string | null;
   unknownDepotCount: number;
   unknownDepotBottles: number;
   wineShopSpend: number;
@@ -139,7 +156,9 @@ export function retailRowState(r: RetailFlag): RowState {
   const payoutBacked = r.reimbursement_status === 'reimbursed' && !!r.petty_cash_id;
   const reopened = r.reimbursement_status === 'reimbursed' && !r.petty_cash_id;
   const owed = r.reimbursement_status === 'claimed_pending' || reopened;
-  const unpriced = !(Number(r.depot_landed_per_bottle) > 0);
+  // `priced` when the server sends it: a WITHHELD rate arrives as null, and
+  // reading null as "no rate" would offer Set depot rate on a priced buy (409).
+  const unpriced = r.priced !== undefined ? !r.priced : !(Number(r.depot_landed_per_bottle) > 0);
   const statusTargets = payoutBacked ? [] : SETTABLE.filter(s => s !== r.reimbursement_status);
   return { payoutBacked, reopened, owed, unpriced, statusTargets, open: owed || unpriced };
 }
@@ -212,8 +231,12 @@ function StatusChip({ r }: { r: RetailFlag }) {
 
 type Action = { kind: 'pay' | 'price' | 'status'; row: RetailFlag };
 
-/** The action buttons for one row — shared by the table and the phone cards. */
-export function RowActions({ r, onAction }: { r: RetailFlag; onAction: (a: Action) => void }) {
+/** The action buttons for one row — shared by the table and the phone cards.
+ *  `canCorrect` gates the two PATCH actions (price, claim status); Pay back is
+ *  the petty-cash route's own decision. */
+export function RowActions({ r, onAction, canCorrect = true }: {
+  r: RetailFlag; onAction: (a: Action) => void; canCorrect?: boolean;
+}) {
   const st = retailRowState(r);
   return (
     <div className="flex flex-wrap gap-1.5">
@@ -223,13 +246,13 @@ export function RowActions({ r, onAction }: { r: RetailFlag; onAction: (a: Actio
           <HandCoins className="w-3 h-3" /> Pay back {inr(r.total_paid)}
         </button>
       )}
-      {st.unpriced && (
+      {canCorrect && st.unpriced && (
         <button type="button" onClick={() => onAction({ kind: 'price', row: r })} className={btnGhost}
                 data-action="price" title="Enter the depot landed rate so the excess can be computed">
           <Tag className="w-3 h-3" /> Set depot rate
         </button>
       )}
-      {st.statusTargets.length > 0 && (
+      {canCorrect && st.statusTargets.length > 0 && (
         <button type="button" onClick={() => onAction({ kind: 'status', row: r })} className={btnGhost}
                 data-action="status" title="Correct whether anyone is owed this money">
           <Pencil className="w-3 h-3" /> Change claim
@@ -249,9 +272,11 @@ export function RowActions({ r, onAction }: { r: RetailFlag; onAction: (a: Actio
  * from a summary the caller already holds. Pure — no fetch, no effect — so the
  * proof can render it from the real GET's output.
  */
-export function RegisterView({ summary, rows, materials, onAction }: {
+export function RegisterView({ summary, rows, materials, onAction, canCorrect = true }: {
   summary: RetailSummary; rows: RetailFlag[]; materials: UnitMat[];
   onAction: (a: Action) => void;
+  /** Offer Set depot rate / Change claim (PATCH, can_procure). */
+  canCorrect?: boolean;
 }) {
   const mats = useMemo(() => new Map(materials.map(m => [m.id, m])), [materials]);
   const openClaims = summary.rows.filter(r => retailRowState(r).owed).length;
@@ -263,7 +288,8 @@ export function RegisterView({ summary, rows, materials, onAction }: {
               tone={summary.unreimbursedStaffSpend > 0 ? 'warn' : 'muted'} />
         <Tile label="Unpriced buys" value={String(summary.unknownDepotCount)}
               sub="excess not computed" tone={summary.unknownDepotCount > 0 ? 'warn' : 'muted'} />
-        <Tile label="Excess over depot" value={inr(summary.excessTotal)} sub="priced buys only" />
+        <Tile label="Excess over depot" value={summary.excessTotal == null ? 'Admin-only' : inr(summary.excessTotal)}
+              sub={summary.excessTotal == null ? 'withheld — see the note above' : 'priced buys only'} />
         <Tile label="Wine-shop spend" value={inr(summary.wineShopSpend)} sub={`${summary.flagCount} buy${summary.flagCount === 1 ? '' : 's'}`} />
       </div>
 
@@ -307,16 +333,19 @@ export function RegisterView({ summary, rows, materials, onAction }: {
                         <td className="px-3 py-2 text-right whitespace-nowrap font-medium text-[#2D1B0E]">{fq(r.bottles)} {pu}</td>
                         <td className="px-3 py-2 text-right whitespace-nowrap">{inr(r.rate_paid_per_bottle)}/{pu}</td>
                         <td className="px-3 py-2 text-right whitespace-nowrap">
-                          {st.unpriced ? <span className="text-amber-700">unknown</span> : <>{inr(r.depot_landed_per_bottle)}/{pu}</>}
+                          {st.unpriced ? <span className="text-amber-700">unknown</span>
+                            : r.depot_landed_per_bottle == null ? <span className="text-[#8B7355]">priced · admin-only</span>
+                            : <>{inr(r.depot_landed_per_bottle)}/{pu}</>}
                         </td>
                         <td className="px-3 py-2 text-right whitespace-nowrap">
                           {st.unpriced
                             ? <span className="text-[#8B7355]">not computed</span>
-                            : <span className="text-amber-800">{inr(r.excess_total)} <span className="text-[10px] text-[#8B7355]">({fq(r.excess_pct)}%)</span></span>}
+                            : r.excess_total == null ? <span className="text-[#8B7355]">admin-only</span>
+                            : <span className="text-amber-800">{inr(r.excess_total)} <span className="text-[10px] text-[#8B7355]">({fq(Number(r.excess_pct))}%)</span></span>}
                         </td>
                         <td className="px-3 py-2 text-[#6B5744]">{r.paid_by || '—'}</td>
                         <td className="px-3 py-2"><StatusChip r={r} /></td>
-                        <td className="px-3 py-2"><RowActions r={r} onAction={onAction} /></td>
+                        <td className="px-3 py-2"><RowActions r={r} onAction={onAction} canCorrect={canCorrect} /></td>
                       </tr>
                     );
                   })}
@@ -342,14 +371,16 @@ export function RegisterView({ summary, rows, materials, onAction }: {
                   </div>
                   <div className="text-[#6B5744]">
                     Depot {st.unpriced ? <span className="text-amber-700">unknown — excess not computed</span>
-                      : <>{inr(r.depot_landed_per_bottle)}/{pu} · excess <span className="text-amber-800">{inr(r.excess_total)}</span></>}
+                      : (r.depot_landed_per_bottle == null || r.excess_total == null)
+                        ? <span className="text-[#8B7355]">priced — rate and excess are admin-only</span>
+                        : <>{inr(r.depot_landed_per_bottle)}/{pu} · excess <span className="text-amber-800">{inr(r.excess_total)}</span></>}
                   </div>
                   <div className="text-[10px] text-[#8B7355] space-x-2">
                     {r.shop_name && <span>{r.shop_name}</span>}
                     {r.bill_ref && <span className="font-mono">bill {r.bill_ref}</span>}
                     {r.paid_by && <span>paid by {r.paid_by}</span>}
                   </div>
-                  <RowActions r={r} onAction={onAction} />
+                  <RowActions r={r} onAction={onAction} canCorrect={canCorrect} />
                 </div>
               );
             })}
@@ -372,8 +403,10 @@ function Tile({ label, value, sub, tone = 'muted' }: { label: string; value: str
 
 /* ── The tab ─────────────────────────────────────────────────────────────── */
 
-export default function WineShopRegister({ materials, refreshKey, onFlash }: {
+export default function WineShopRegister({ materials, canCorrect, refreshKey, onFlash }: {
   materials: UnitMat[];
+  /** can_procure on any active store — offers Set depot rate / Change claim. */
+  canCorrect: boolean;
   /** Bumped by the page when the Wine-shop Purchase modal records a buy. */
   refreshKey: number;
   onFlash: (msg: string) => void;
@@ -419,6 +452,11 @@ export default function WineShopRegister({ materials, refreshKey, onFlash }: {
           <b>Set depot rate</b>{' '}prices a buy recorded before its brand was in the TGBCL Brand Map, so
           its excess is counted. <b>Change claim</b>{' '}corrects whether anyone is owed. None of these
           changes stock, average price or recipe costs.
+          {!canCorrect && (
+            <>{' '}<b>Set depot rate</b>{' '}and <b>Change claim</b>{' '}need purchase rights on the liquor store,
+              which this login does not have — they are not shown.</>
+          )}
+          {summary?.depotFiguresNote && <>{' '}{summary.depotFiguresNote}</>}
         </span>
       </div>
 
@@ -471,7 +509,7 @@ export default function WineShopRegister({ materials, refreshKey, onFlash }: {
       {loading && !summary ? (
         <div className="p-8 text-center text-sm text-[#8B7355]"><Loader2 className="w-5 h-5 animate-spin inline mr-2" /> Loading wine-shop buys…</div>
       ) : summary ? (
-        <RegisterView summary={summary} rows={rows} materials={materials} onAction={setAction} />
+        <RegisterView summary={summary} rows={rows} materials={materials} onAction={setAction} canCorrect={canCorrect} />
       ) : null}
 
       {action && (
@@ -547,10 +585,15 @@ function ActionModal({ action, pu, onClose, onDone, onRefresh }: {
           warning: j.warning,
         });
       } else if (action.kind === 'price') {
-        const ex = j.excess || {};
+        // The server returns the recomputed excess to management only (it is
+        // the rate paid minus the rate typed). Absent → say it was computed,
+        // never print a ₹0 that reads as "no premium".
+        const ex = j.excess;
         setDone({
           msg: `Depot rate set to ${inr(Number(j.depot_landed_per_bottle) || nRate)} per ${pu}.`,
-          detail: `Excess now ${inr(Number(ex.excessTotal) || 0)} (${inr(Number(ex.excessPerBottle) || 0)} per ${pu}, ${fq(Number(ex.excessPct) || 0)}%) — counted in the “price of running out” total from now on.`,
+          detail: ex
+            ? `Excess now ${inr(Number(ex.excessTotal) || 0)} (${inr(Number(ex.excessPerBottle) || 0)} per ${pu}, ${fq(Number(ex.excessPct) || 0)}%) — counted in the “price of running out” total from now on.`
+            : 'The excess was computed and is counted in the “price of running out” total from now on.',
         });
       } else {
         setDone({ msg: `Claim changed from “${STATUS_LABEL[(j.reimbursement_status_from || r.reimbursement_status) as ReimbStatus]}” to “${STATUS_LABEL[(j.reimbursement_status || target) as ReimbStatus]}”.` });

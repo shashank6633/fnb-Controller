@@ -4,7 +4,7 @@ import {
   LQ_TOPUP_STEP_DEFAULT,
   WalletWriteError, buildWalletView, getTopUpStep, setTopUpStep, indentIntegrity,
   insertWalletTxn, isDate, listPortalChecks, signRuleText, topUpPlan, walletCsv,
-  walletBalanceAsOf, r2,
+  walletBalanceAsOf, r2, retryAutoDebit,
 } from '@/lib/liquor-wallet';
 import { LQ_WALLET_TXN_TYPES } from '@/lib/liquor-recon';
 import { csrfGuard, minusDays, walletGate, writeError } from './gate';
@@ -20,6 +20,8 @@ import { csrfGuard, minusDays, walletGate, writeError } from './gate';
  *   POST /api/liquor/wallet
  *        → record ONE movement: { date, type, amount, reference?, payment_mode?,
  *          bank_debit_date?, bank_amount?, bank_match?, portal_status?, remarks? }
+ *        → or { action: 'retry_auto_debit', source_ref }: write a recorded
+ *          indent's missing auto-debit from the indent itself (retryAutoDebit).
  *   PUT  /api/liquor/wallet
  *        → { top_up_step } — the planner's configurable rounding step (₹10k).
  *
@@ -120,6 +122,32 @@ export async function POST(request: Request) {
     if (!b || typeof b !== 'object') return Response.json({ error: 'Send a JSON body.' }, { status: 400 });
 
     const db = getDb();
+
+    // ── HEAL: write a recorded indent's missing debit FROM the recorded indent ──
+    // { action: 'retry_auto_debit', source_ref } — the "Write the debit" button
+    // on the "recorded indents with NO wallet debit" list. A bill whose debit
+    // failed cannot be re-saved to heal it (/procure-bill refuses the recorded
+    // invoice as a duplicate, and a re-upload that posts no new line never
+    // reaches the debit), so this re-runs autoDebitForIndent on the indent's own
+    // store_bill_charges row: the debit is keyed on that row exactly as a clean
+    // save would have keyed it. No amount is accepted from the form — it is the
+    // recorded Net Indent — and source_ref here NAMES the indent; it is never
+    // written from the body. Same gate and CSRF as every other wallet write.
+    if (b.action !== undefined) {
+      if (b.action !== 'retry_auto_debit') {
+        return Response.json({ error: `Unknown action "${String(b.action).slice(0, 40)}" — the only action is retry_auto_debit.` }, { status: 400 });
+      }
+      // IMMEDIATE for the reason given below: the debit's guards read then write.
+      const r = db.transaction(() => retryAutoDebit(db, String(b.source_ref ?? ''), me.email)).immediate();
+      const balance = walletBalanceAsOf(db).balance;
+      if (r.action === 'failed') {
+        // Still failing: the cause is not fixed. Recorded again (audit + errors
+        // bell) by autoDebitForIndent, exactly as on the bill save.
+        return Response.json({ error: r.note, code: r.error?.code || 'auto_debit_failed', result: r, balance }, { status: 409 });
+      }
+      return Response.json({ result: r, balance }, { status: 200 });
+    }
+
     const today = todayIST();
     let id = '';
     const txn = db.transaction(() => {

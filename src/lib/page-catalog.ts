@@ -537,8 +537,11 @@ export const PAGE_CATALOG: PageSection[] = [
       // before they existed, behind a temporary `unbuilt` flag that kept them
       // out of homePathFor / firstAllowedPath so nobody was redirected onto a
       // 404. With every page present that flag and its two skips were deleted,
-      // so these rows now resolve as landing pages like any other — a manager
-      // whose map is only ["/inventory/liquor-wallet"] lands on the wallet.
+      // so these rows now resolve as landing pages like any other. Measured on
+      // a DB copy for a manager whose map is only ["/inventory/liquor-wallet"]:
+      // firstAllowedPath (the proxy's forbidden bounce) went /login → the
+      // wallet; homePathFor still answers the first page in display order that
+      // user can open (/feedback for a manager), exactly as for any other page.
       // The HR section's rule ("only ever name pages that are BUILT") now holds
       // here too, with no exception left in this file.
       //
