@@ -7354,6 +7354,98 @@ function initializeSchema(db: Database.Database) {
     `);
   } catch (e) { console.error('department_material_transactions additive columns failed:', e); }
 
+  // ── DEPARTMENT → DEPARTMENT TRANSFERS (the document; the stock is the ledger) ─
+  // Direct Issue routes MEAT / POULTRY / SEAFOOD deliveries onto KITCHEN's
+  // department ledger, but every requisition for them comes from Kitchen's
+  // children (Akan Main Kitchen, Akan Tandoori, …), and roll-up runs downward
+  // only. A transfer is how Kitchen hands that stock on.
+  //
+  // THESE TWO TABLES HOLD NO BALANCE. The stock movement is the pair of ledger
+  // rows department_material_transactions 'transfer_out' (sender, −) and
+  // 'transfer_in' (receiver, +), written together by postDeptTransfer() in
+  // src/lib/dept-ledger.ts, both with reference_id = department_transfer_lines.id.
+  // A PENDING document moves nothing — the goods stay on the sender's ledger
+  // until the receiver confirms, so a kilo is never in two ledgers or none.
+  // Never SUM qty_sent / qty_received into a balance; the ledger is the truth.
+  //
+  // UNITS: qty_sent / qty_received are RECIPE units (the ledger's basis).
+  // entry_qty / entry_unit are what the person TYPED (purchase units on every
+  // screen); pack_factor is packFactor() at send time, snapshotted with the
+  // unit names so a later edit to the material cannot re-mean the line.
+  //
+  // Department NAMES are snapshotted for the same reason the movement record
+  // snapshots them: a rename must not rewrite where last month's goods went.
+  // No FOREIGN KEYs, house style (foreign_keys is off; a cascade would erase
+  // evidence). Schema only — the vocabulary, guards and writers live in
+  // dept-ledger.ts. Its own try/catch so a failure here cannot take the ledger
+  // above it down; the writers fail loudly on a missing table instead. One
+  // statement per prepare().run(), so a failing statement is the one named in
+  // the log line rather than "somewhere in a multi-statement string".
+  try {
+    const DEPT_TRANSFER_DDL: string[] = [
+      `CREATE TABLE IF NOT EXISTS department_transfers (
+        id                      TEXT PRIMARY KEY,
+        transfer_no             TEXT NOT NULL DEFAULT '',          -- DTR-<year>-####
+        outlet_id               TEXT,
+        from_department_id      TEXT NOT NULL,
+        from_department_name    TEXT NOT NULL DEFAULT '',
+        to_department_id        TEXT NOT NULL,
+        to_department_name      TEXT NOT NULL DEFAULT '',
+        status                  TEXT NOT NULL DEFAULT 'pending'
+                                CHECK (status IN ('pending', 'received', 'cancelled')),
+        notes                   TEXT NOT NULL DEFAULT '',
+        created_by              TEXT NOT NULL DEFAULT '',          -- session email of the SENDER
+        created_at              TEXT NOT NULL DEFAULT (datetime('now')),
+        received_by             TEXT NOT NULL DEFAULT '',
+        received_at             TEXT NOT NULL DEFAULT '',
+        receive_txn_date        TEXT NOT NULL DEFAULT '',          -- business date stamped on both ledger legs
+        receive_override_reason TEXT NOT NULL DEFAULT '',          -- non-blank ONLY when the sender confirmed their own transfer
+        cancelled_by            TEXT NOT NULL DEFAULT '',
+        cancelled_at            TEXT NOT NULL DEFAULT '',
+        cancel_reason           TEXT NOT NULL DEFAULT '',
+        updated_at              TEXT NOT NULL DEFAULT (datetime('now'))
+      )`,
+      `CREATE UNIQUE INDEX IF NOT EXISTS idx_dept_transfers_no
+        ON department_transfers(transfer_no) WHERE transfer_no <> ''`,
+      `CREATE INDEX IF NOT EXISTS idx_dept_transfers_from ON department_transfers(from_department_id, status)`,
+      `CREATE INDEX IF NOT EXISTS idx_dept_transfers_to ON department_transfers(to_department_id, status)`,
+      `CREATE TABLE IF NOT EXISTS department_transfer_lines (
+        id            TEXT PRIMARY KEY,                 -- = reference_id on BOTH ledger legs
+        transfer_id   TEXT NOT NULL,
+        material_id   TEXT NOT NULL,
+        material_name TEXT NOT NULL DEFAULT '',
+        unit          TEXT NOT NULL DEFAULT '',         -- recipe unit, snapshot
+        purchase_unit TEXT NOT NULL DEFAULT '',         -- purchase unit, snapshot
+        pack_factor   REAL NOT NULL DEFAULT 1,          -- packFactor() at send time
+        qty_sent      REAL NOT NULL,                    -- RECIPE units, > 0
+        entry_qty     REAL,                             -- as typed
+        entry_unit    TEXT NOT NULL DEFAULT '',         -- the unit it was typed in
+        qty_received  REAL,                             -- RECIPE units; NULL until received; 0 = none accepted
+        out_txn_id    TEXT,                             -- the sender's transfer_out ledger row
+        in_txn_id     TEXT,                             -- the receiver's transfer_in ledger row
+        notes         TEXT NOT NULL DEFAULT '',
+        created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+      )`,
+      `CREATE INDEX IF NOT EXISTS idx_dept_transfer_lines_transfer ON department_transfer_lines(transfer_id)`,
+      `CREATE INDEX IF NOT EXISTS idx_dept_transfer_lines_material ON department_transfer_lines(material_id)`,
+      // The pair lookup / integrity check reads transfer legs by reference_id.
+      // PARTIAL, so it indexes only transfer rows and costs nothing at boot on
+      // the rest of the ledger.
+      `CREATE INDEX IF NOT EXISTS idx_dmt_transfer_ref
+        ON department_material_transactions(reference_id) WHERE type IN ('transfer_out', 'transfer_in')`,
+    ];
+    for (const sql of DEPT_TRANSFER_DDL) {
+      try { db.prepare(sql).run(); }
+      catch (e) { console.error(`department transfer schema statement failed: ${sql.split('\n')[0]}`, e); }
+    }
+    // ASSERT, don't assume — an error above is only logged, and a missing table
+    // must be a named log line, not a 500 at the first transfer.
+    for (const t of ['department_transfers', 'department_transfer_lines']) {
+      const row = db.prepare(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`).get(t) as { name?: string } | undefined;
+      if (!row?.name) console.error(`department transfer schema verification failed: table ${t} is absent`);
+    }
+  } catch (e) { console.error('department transfer schema failed:', e); }
+
   // ── (e) CONSUMPTION SKIPS ─────────────────────────────────────────────────
   // Recipe consumption that moved NOTHING, and why. Written whenever applyDeduct
   // cannot name a department it is entitled to debit: blank station, unmapped

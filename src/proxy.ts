@@ -75,6 +75,14 @@ const CSRF_REQUIRED_PREFIXES = [
   '/api/butchering',          // carcass breakdown batches + seed
   '/api/party-consumption',   // post-party liquor consumption recording
   '/api/department-materials', // dept on-hand transfer view + post-party reconcile
+  // Department → department transfers: send / receive / cancel. Receive MOVES
+  // STOCK between two department ledgers, so a forged POST from a cross-site
+  // page driving a signed-in cook's browser is exactly the threat. Its own line
+  // because neither prefix above matches: '/api/departments' needs the 's' and
+  // '/api/department-materials' is a different path. CSRF is not authorisation —
+  // every handler under it authorises itself (src/app/api/department-transfers/
+  // access.ts); the proxy never checks page access on an API.
+  '/api/department-transfers',
   '/api/party-bookings',      // sheet refresh (POST forces live fetch)
   '/api/party-menus',         // party (limited) menu presets — create/enable/assign tables
   '/api/dine-in/tables',      // POS table management (create/edit/delete)

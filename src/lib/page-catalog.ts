@@ -549,6 +549,28 @@ export const PAGE_CATALOG: PageSection[] = [
       // own nav list ([[project_fnb_sidebar_catalog_drift]]).
       { path: '/inventory/movements', label: 'Stock Movements' },
       { path: '/inventory/department-stock', label: 'Department Stock' },
+      // DEPARTMENT → DEPARTMENT TRANSFER (owner decision, 2026-10-14): Kitchen
+      // receives a Direct Issue delivery (Meat / POULTRY / SEAFOOD rules) into
+      // its own department ledger, then hands stock on to its sub-kitchens —
+      // Akan Tandoori, Akan Main Kitchen, … — which hold every routed-category
+      // requisition line but cannot see their parent's stock. One transfer is a
+      // debit on the sender's department ledger and a credit on the receiver's,
+      // in one transaction; central stock is never touched.
+      //
+      // Deliberately NO tier flag. hodOnly / mgmtOnly run BEFORE the null-map
+      // grant, so either one would lock out exactly the people who use this
+      // daily — a sub-kitchen cook sending or receiving a hand-over. As on every
+      // row here the flag is not the security boundary: /api/department-
+      // transfers authorises send / receive itself, by department membership.
+      //
+      // A ROLE WITH AN EXPLICIT page_access LIST WILL NOT SEE THIS PAGE until
+      // the owner ticks it in Settings → Roles (e.g. the Head Chef and Staff
+      // roles carry explicit lists). That is the owner's call — this row only
+      // makes it tickable.
+      //
+      // Twin of the Sidebar.tsx row with the same href, character for character
+      // ([[project_fnb_sidebar_catalog_drift]]). Change one, change both.
+      { path: '/department-transfers', label: 'Department Transfers' },
       { path: '/inventory/reconciliation', label: 'Sales vs Consumption' },
       { path: '/store-dashboard',     label: 'Store Dashboard — Low Stock' },
       { path: '/store-requisitions',  label: 'Store Requisitions (Issue)' },

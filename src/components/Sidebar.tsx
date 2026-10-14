@@ -76,6 +76,7 @@ import {
   Megaphone,
   Undo2,
   Star,
+  SendHorizontal,
   type LucideIcon,
 } from "lucide-react";
 
@@ -317,6 +318,21 @@ const navTree: NavEntry[] = [
       // one of the two is either invisible or ungated.
       { kind: "link", label: "Stock Movements",    href: "/inventory/movements", icon: ArrowRightLeft },
       { kind: "link", label: "Department Stock",   href: "/inventory/department-stock", icon: Warehouse },
+      // DEPARTMENT → DEPARTMENT hand-over (Kitchen receives a Direct Issue
+      // delivery, then hands it to Akan Tandoori / Akan Main Kitchen …). Sits
+      // directly under Department Stock because it is that stock moving on, and
+      // NOT beside Store Transfers: that page is the liquor store → floor-bar
+      // rail (store_locations), a different ledger entirely. A transfer moves a
+      // quantity from one DEPARTMENT ledger to another in one transaction and
+      // never touches central stock.
+      //
+      // Twin of the '/department-transfers' row in src/lib/page-catalog.ts —
+      // href character for character. A page in only one of the two files is
+      // the drift that once hid /variance-approvals (gated but invisible).
+      // Deliberately carries NO tier flag there: the receiving sub-kitchen's
+      // cooks must reach it. Seeing the row is not permission to move stock —
+      // /api/department-transfers re-checks who may send and receive.
+      { kind: "link", label: "Department Transfers", href: "/department-transfers", icon: SendHorizontal },
       { kind: "link", label: "Sales vs Consumption", href: "/inventory/reconciliation", icon: Scale },
       { kind: "link", label: "Low Stock — Buy List", href: "/store-dashboard",  icon: AlertTriangle },
       { kind: "link", label: "Issue Requisitions", href: "/store-requisitions", icon: Package },

@@ -6,9 +6,11 @@ import type { SessionUser } from './auth';
 // either would be free to disagree with the screen it is supposed to explain.
 // No cycle: store-engine -> db.ts -> dept-ledger, and none of the three imports
 // this file (db.ts reaches store-engine through a deferred require).
-import { deptKey, deptOnHandBulk } from './dept-ledger';
-import type { DeptOnHandResult } from './dept-ledger';
-import { consolidatedStock, listStores } from './store-engine';
+import { deptKey, deptOnHandBulk, deptReleasableBulk, deptPendingOutgoing } from './dept-ledger';
+import type { DeptOnHandResult, DeptReleaseBasis } from './dept-ledger';
+import { consolidatedStock, listStores, isStoreMappedMaterial } from './store-engine';
+// The one recipe→purchase conversion (a leaf module). Display only, below.
+import { packFactor, toPurchaseQty } from './pack-units';
 
 /**
  * Department Stock — LEDGER-BACKED, anchored on a physical count.
@@ -52,7 +54,12 @@ import { consolidatedStock, listStores } from './store-engine';
  * deptSet: the department itself plus, when it is a MAIN department
  * (parent_id IS NULL), all of its sub-departments — a main-dept view rolls up
  * everything anchored/moved under it, each sub-dept measured from its OWN
- * anchor before the roll-up sums them.
+ * anchor before the roll-up sums them. It rolls DOWNWARD only — a child never
+ * sees its parent's stock. The way stock moves from a parent (Kitchen, where
+ * Direct Issue deliveries land) to a child is a department TRANSFER: a
+ * transfer_out on one ledger and a transfer_in on the other (dept-ledger.ts).
+ * Every sum below covers ALL types, so both legs count with no special case;
+ * a parent→child transfer nets to zero on the parent's roll-up.
  *
  * TIME BASIS. Every writer of this ledger uses datetime('now') → UTC
  * 'YYYY-MM-DD HH:MM:SS'. closing_stock.date is an IST business date. All
@@ -117,7 +124,11 @@ export interface DeptStockRow {
    *  read it; label it "net movement". */
   issued_since: number;
   /** The same window split by sign, so a screen can say "in 5 kg, out 3 kg"
-   *  instead of showing a net figure that hides both legs. */
+   *  instead of showing a net figure that hides both legs.
+   *  DEPARTMENT TRANSFERS: a transfer between two depts of the SAME roll-up
+   *  (Kitchen → Akan Tandoori, viewed as Kitchen) appears once on each side and
+   *  nets to zero in issued_since / on_hand — correct for the holding, but it
+   *  inflates both of these legs. They are not company inflow/outflow figures. */
   in_since: number;
   out_since: number;
   /** anchor_qty + issued_since. NULL when never_counted — never 0. */
@@ -667,6 +678,109 @@ export function computeDeptStock(db: Database.Database, deptId: string): { rows:
       anchored_mixed: mixed,
     },
   };
+}
+
+/* ════════════════════════════════════════════════════════════════════════════
+ * WHAT ONE DEPARTMENT CAN HAND ON — the sender's side of a transfer.
+ *
+ * NOT computeDeptStock(). That function rolls a MAIN department up over its
+ * children, so "Kitchen" there means Kitchen + Akan Tandoori + Akan Main
+ * Kitchen + …, and Kitchen's OWN holding — the stock it can actually hand
+ * over — is visible nowhere. This reads exactly ONE department, no roll-up:
+ * Kitchen must never be offered Akan Tandoori's stock to send.
+ *
+ * The figure is deptReleasable() from dept-ledger.ts — the SAME function the
+ * transfer writer's guard and the reversal guard use, so the screen cannot
+ * offer a quantity the server will refuse, or hide one it would accept:
+ *   counted        → the anchored balance
+ *   never counted  → the all-time signed ledger sum (NOT zero, NOT refused;
+ *                    Kitchen is in practice never counted). `basis` says which,
+ *                    and the screen must label it ("not counted — by ledger").
+ * minus what is already promised on PENDING transfers out of this department.
+ *
+ * Store-mapped (liquor) materials are left out: they live on the store rail
+ * and the writer refuses them.
+ *
+ * UNITS: every *_qty here is RECIPE units (the stored basis); the
+ * `transferable_purchase` field is the same figure through toPurchaseQty() so
+ * the screen can LEAD with the purchase unit (owner rule) without converting.
+ * ════════════════════════════════════════════════════════════════════════════ */
+
+export interface DeptTransferableRow {
+  material_id: string;
+  name: string;
+  category: string;
+  unit: string;
+  purchase_unit: string;
+  pack_size: number;
+  /** packFactor() — recipe units per purchase unit (1 = no real conversion). */
+  pack_factor: number;
+  basis: DeptReleaseBasis;
+  /** Anchored balance, RECIPE units; NULL when never counted (never 0). */
+  on_hand: number | null;
+  /** All-time signed ledger sum, RECIPE units. */
+  ledger_sum: number;
+  /** deptReleasable().available — RECIPE units; may be ≤ 0 (a problem to show). */
+  available: number;
+  /** RECIPE units already promised on pending transfers out of this department. */
+  pending_out: number;
+  /** MAX(0, available − pending_out), RECIPE units. The most a new send may ask for. */
+  transferable: number;
+  /** `transferable` in PURCHASE units — what the screen leads with. */
+  transferable_purchase: number;
+}
+
+/** The sender's own releasable stock. Null for an unknown department. */
+export function deptTransferableStock(
+  db: Database.Database, deptId: string,
+): { department: { id: string; name: string; parent_id: string | null }; rows: DeptTransferableRow[] } | null {
+  const dept = db.prepare('SELECT id, name, parent_id FROM departments WHERE id = ?').get(String(deptId || '')) as
+    { id: string; name: string; parent_id: string | null } | undefined;
+  if (!dept) return null;
+
+  const releasable = deptReleasableBulk(db, dept.id);
+  const pending = deptPendingOutgoing(db, dept.id);
+  const ids = [...new Set<string>([...releasable.keys(), ...pending.keys()])];
+  if (ids.length === 0) return { department: dept, rows: [] };
+
+  const metas = db.prepare(`
+    SELECT id, name, category, unit, purchase_unit, pack_size FROM raw_materials
+     WHERE id IN (SELECT value FROM json_each(?))
+  `).all(JSON.stringify(ids)) as Array<{
+    id: string; name: string; category: string | null; unit: string | null;
+    purchase_unit: string | null; pack_size: number | null;
+  }>;
+
+  const r4 = (n: number) => Math.round((Number(n) || 0) * 10000) / 10000;
+  const rows: DeptTransferableRow[] = [];
+  for (const m of metas) {
+    if (isStoreMappedMaterial(db, m.id)) continue;
+    const rel = releasable.get(m.id);
+    const pend = pending.get(m.id) || 0;
+    const available = rel ? rel.available : 0;
+    // Nothing held and nothing promised — not a row anyone can act on.
+    if (Math.abs(available) < 1e-9 && pend < 1e-9) continue;
+    const meta = { unit: m.unit, purchase_unit: m.purchase_unit, pack_size: m.pack_size };
+    const transferable = Math.max(0, r4(available - pend));
+    rows.push({
+      material_id: m.id,
+      name: m.name,
+      category: m.category || '',
+      unit: String(m.unit || ''),
+      purchase_unit: String(m.purchase_unit || m.unit || ''),
+      pack_size: Number(m.pack_size) || 1,
+      pack_factor: packFactor(meta),
+      basis: rel ? rel.basis : 'uncounted_ledger_sum',
+      on_hand: rel ? rel.onHand : null,
+      ledger_sum: rel ? r4(rel.ledgerSum) : 0,
+      available: r4(available),
+      pending_out: r4(pend),
+      transferable,
+      transferable_purchase: toPurchaseQty(transferable, meta),
+    });
+  }
+  rows.sort((x, y) => x.category.localeCompare(y.category) || x.name.localeCompare(y.name));
+  return { department: dept, rows };
 }
 
 /* ════════════════════════════════════════════════════════════════════════════
