@@ -17,9 +17,10 @@
  *       never seeds;
  *   [3] an UNJUDGED reading is NOT a pass (no range → judged:false), and
  *       out-of-range is caught WITHOUT ROUNDING (5.4 fails 0..5);
- *   [4] records are VOIDED, never deleted — on all eleven registers the shared
- *       void owns, through the real /api/fssai/void handler, and no FSSAI source
- *       file contains a DELETE against a record table;
+ *   [4] records are VOIDED, never deleted — on every register the shared void
+ *       owns (read from FSSAI_VOIDABLE_RECORDS, so a new register is covered the
+ *       day it is added), through the real /api/fssai/void handler, and no FSSAI
+ *       source file contains a DELETE against a record table;
  *   [5] a signed record's fingerprint verifies, a tampered one does not, and the
  *       things that must NOT break a signature (a re-save, the 12-month photo
  *       sweep dropping the image) do not;
@@ -1349,7 +1350,760 @@ function pdfTextOf(buf) {
       'readFssaiFoodHandlerCoverage (the audit file reads this) names Ravi as not in order');
   });
 
-  /* @@NEW_SECTIONS@@ */
+  /* ─────────────────────────────────────────────────────────────────────── */
+  section(9, 'EVIDENCE IS VOIDED, NEVER STRIPPED — the file stays; another record’s file is a 404');
+
+  const PEST_SVC = route('pest/services');
+  const PEST_SIGHT = route('pest/sightings');
+  const docJson = async (id) => { signIn(MANAGER); return (await call(DOCS, 'GET', `/api/fssai/documents?id=${id}`)).j.document; };
+  /** A licence with ONE scan uploaded by `uploader` (default the admin, so no manager is the uploader). */
+  async function licenceWithScan(title, uploader = ADMIN) {
+    const d = await docPost({ action: 'create', doc_type: 'fssai_licence', title, reference_no: 'LIC-' + title.length, expiry_date: F.addDaysISO(F.fssaiToday(), 300) });
+    const a = await docPost({ action: 'attach', id: d.j.document.id, data_uri: png(title) }, uploader);
+    return { doc: d.j.document.id, att: a.j.attachment.id };
+  }
+  /** A completed pest visit with one job-sheet scan, attached by the admin. */
+  async function pestVisitWithScan(label) {
+    signIn(MANAGER);
+    const v = await call(PEST_SVC, 'POST', '/api/fssai/pest/services', { action: 'create', vendor_name: `Agency ${label}`, status: 'completed', business_date: F.fssaiToday(), chemicals_none: true, chemicals_none_note: 'Inspection only' });
+    signIn(ADMIN);
+    const a = await call(PEST_SVC, 'POST', '/api/fssai/pest/services', { action: 'attach', id: v.j.service.id, data_uri: png('job-' + label) });
+    return { visit: v.j.service.id, att: a.j.attachment.id };
+  }
+
+  await test('a scan on a document: "remove_file" (the old name) now VOIDS it — the image, digest and size stay byte for byte', async () => {
+    seedUsers();
+    const { doc, att } = await licenceWithScan('FSSAI licence — central kitchen');
+    const before = attRow(att);
+    expectTrue(before.data_uri.length > 100 && before.status === 'active', `a live scan of ${before.data_uri.length} characters`);
+    let r = await docPost({ action: 'remove_file', id: doc, attachment_id: att, reason: 'Wrong page photographed' }, MANAGER2);
+    expectTrue(r.status === 200 && /voided/i.test(r.j.message || ''), `answered ${r.status}: "${r.j.message}"`);
+    const after = attRow(att);
+    expectSame([after.status, after.data_uri === before.data_uri, after.digest_sha256 === before.digest_sha256, after.size_bytes === before.size_bytes, after.image_dropped_at],
+      ['void', true, true, true, ''], 'status void · data_uri identical · digest identical · size identical · image_dropped_at blank');
+    expectSame([after.voided_by, after.void_reason], [MANAGER2.email, 'Wrong page photographed'], 'who voided it, and why');
+    const trail = auditRows('fssai_documents', doc, 'attachment_void');
+    const t = trail[0] ? JSON.parse(trail[0].after_json) : {};
+    expectSame([trail.length, t.file_kept, t.image_kept, t.digest_sha256 === before.digest_sha256], [1, true, true, true], 'ONE attachment_void trail row that restates the file was kept');
+    const d = await docJson(doc);
+    expectSame([d.file_count, d.void_file_count, (d.voided_files || []).map((f) => f.id)], [0, 1, [att]], 'the document lists it under voided_files and counts LIVE files only');
+    r = await docPost({ action: 'void_file', id: doc, attachment_id: att, reason: 'Again, to be sure' }, MANAGER2);
+    expect(r.status, 409, 'voiding it a second time (the first reason stands)');
+    expect(attRow(att).void_reason, 'Wrong page photographed', 'the first reason is still the one on file');
+  });
+
+  await test('the refusals: another record’s file is a 404; staff, no reason and the uploader are refused; nothing changes', async () => {
+    seedUsers();
+    const A = await licenceWithScan('Licence A — the one named');
+    const B = await licenceWithScan('Licence B — the file really lives here');
+    const P = await pestVisitWithScan('cross');
+    const snap = (id) => { const x = attRow(id); return [x.status, x.data_uri.length, x.voided_at]; };
+    const bSnap = snap(B.att), pSnap = snap(P.att);
+    let r = await docPost({ action: 'void_file', id: A.doc, attachment_id: B.att, reason: 'Reaching across documents' }, MANAGER2);
+    expectSame([r.status, r.j.error], [404, 'That file is not on this document.'], 'a scan on ANOTHER document, named against this one → 404');
+    r = await docPost({ action: 'remove_file', id: A.doc, attachment_id: P.att, reason: 'Reaching into the pest register' }, MANAGER2);
+    expect(r.status, 404, 'a pest job sheet named against a document → 404, the same answer as a missing file');
+    r = await docPost({ action: 'void_file', id: A.doc, attachment_id: 'no-such-file', reason: 'Nothing there' }, MANAGER2);
+    expect(r.status, 404, 'a file id that does not exist → 404');
+    expectSame([snap(B.att), snap(P.att)], [bSnap, pSnap], 'both files the refused calls named are untouched');
+    expectTrue(ROUTE_SAID.some((l) => l.includes(`attachment ${B.att} is on fssai_documents:${B.doc}`)), 'the mismatch is logged with both ids (never told to the caller)');
+    r = await docPost({ action: 'void_file', id: A.doc, attachment_id: A.att, reason: 'Staff trying' }, STAFF);
+    expect(r.status, 403, 'staff (the cupboard is management only)');
+    r = await docPost({ action: 'void_file', id: A.doc, attachment_id: A.att, reason: '' }, MANAGER2);
+    expect(r.status, 400, 'no reason in words');
+    const M = await licenceWithScan('Licence M — the manager uploaded it', MANAGER);
+    r = await docPost({ action: 'void_file', id: M.doc, attachment_id: M.att, reason: 'My own upload, gone' }, MANAGER);
+    expectTrue(r.status === 403 && /yourself/.test(r.j.error), `the manager who UPLOADED it may not void it → ${r.status}`);
+    expectSame([attRow(A.att).status, attRow(M.att).status], ['active', 'active'], 'neither file was voided by a refused call');
+    const AD = await licenceWithScan('Licence AD — the admin uploaded it', ADMIN);
+    r = await docPost({ action: 'void_file', id: AD.doc, attachment_id: AD.att, reason: 'Admin voids his own upload (Q23)' }, ADMIN);
+    const t = JSON.parse(auditRows('fssai_documents', AD.doc, 'attachment_void')[0].after_json);
+    expectSame([r.status, t.self_void], [200, true], 'an ADMIN may void his own upload, and the trail flags self_void');
+    signIn(MANAGER2);
+    await call(DOCS, 'POST', '/api/fssai/documents', { action: 'void', id: A.doc, reason: 'Superseded by the reissued licence' });
+    r = await docPost({ action: 'void_file', id: A.doc, attachment_id: A.att, reason: 'After the document was voided' }, MANAGER2);
+    expect(r.status, 409, 'a file on a VOIDED document is closed evidence');
+  });
+
+  await test('a void whose trail row cannot be written ROLLS BACK — 500, and the file is still live', async () => {
+    seedUsers();
+    const { doc, att } = await licenceWithScan('Licence — audit write will fail');
+    db.prepare(`CREATE TRIGGER fssai_t_no_void_trail BEFORE INSERT ON fssai_audit_log WHEN NEW.action = 'attachment_void'
+                BEGIN SELECT RAISE(ABORT, 'fssai-tests: the audit log is unwritable'); END`).run();
+    const r = await docPost({ action: 'void_file', id: doc, attachment_id: att, reason: 'This void must not stick' }, MANAGER2);
+    const row = attRow(att);
+    expectSame([r.status, row.status, row.voided_at, row.voided_by, row.void_reason], [500, 'active', '', '', ''], 'answered 500 and the file is exactly as it was');
+    expect(auditRows('fssai_documents', doc, 'attachment_void').length, 0, 'no half-written trail');
+  });
+
+  await test('a pest job sheet and a sighting photo are voided and KEPT; each route reaches only its own record', async () => {
+    seedUsers();
+    const P = await pestVisitWithScan('keep');
+    const before = attRow(P.att);
+    signIn(STAFF);
+    const s = await call(PEST_SIGHT, 'POST', '/api/fssai/pest/sightings', { action: 'create', pest_type: 'cockroach', evidence_kind: 'live', location_label: 'Under the dish-wash sink' });
+    const SIGHT = s.j.sighting.id;
+    signIn(ADMIN);
+    const sp = await call(PEST_SIGHT, 'POST', '/api/fssai/pest/sightings', { action: 'attach', id: SIGHT, data_uri: png('sighting-photo') });
+    const SP = sp.j.attachment.id;
+    signIn(MANAGER2);
+    let r = await call(PEST_SVC, 'POST', '/api/fssai/pest/services', { action: 'void_file', id: P.visit, attachment_id: SP, reason: 'Sighting photo via the visit' });
+    expect(r.status, 404, 'a SIGHTING photo named against a visit → 404');
+    r = await call(PEST_SIGHT, 'POST', '/api/fssai/pest/sightings', { action: 'void_file', id: SIGHT, attachment_id: P.att, reason: 'Job sheet via the sighting' });
+    expect(r.status, 404, 'a visit’s JOB SHEET named against a sighting → 404');
+    r = await call(PEST_SVC, 'POST', '/api/fssai/pest/services', { action: 'remove_file', id: P.visit, attachment_id: P.att, reason: 'Job sheet of another visit' });
+    const after = attRow(P.att);
+    expectSame([r.status, after.status, after.data_uri === before.data_uri, after.image_dropped_at, after.digest_sha256 === before.digest_sha256],
+      [200, 'void', true, '', true], '"remove_file" on the visit VOIDS the job sheet — image kept, nothing dropped');
+    r = await call(PEST_SIGHT, 'POST', '/api/fssai/pest/sightings', { action: 'void_file', id: SIGHT, attachment_id: SP, reason: 'Blurred, retaken' });
+    expectSame([r.status, attRow(SP).status, attRow(SP).data_uri.length > 100], [200, 'void', true], 'the sighting photo is voided on its own sighting, image kept');
+    expect(auditRows('fssai_pest_services', P.visit, 'attachment_void').length, 1, 'the visit carries one attachment_void trail row');
+  });
+
+  await test('no FSSAI route strips an image any more (static), and the stripping helper has no caller', () => {
+    const apiDir = path.join(SRC, 'app', 'api', 'fssai');
+    const walk = (d) => fs.readdirSync(d, { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? walk(path.join(d, e.name)) : [path.join(d, e.name)]));
+    const files = walk(apiDir).filter((f) => f.endsWith('.ts') && !f.endsWith('p6-shared.ts'));
+    const callers = files.filter((f) => /dropP6AttachmentImage\s*\(/.test(fs.readFileSync(f, 'utf8')));
+    expectSame(callers.map((f) => path.relative(REPO, f)), [], 'files that call dropP6AttachmentImage');
+    const blanks = files.filter((f) => /SET\s+data_uri\s*=\s*''/i.test(fs.readFileSync(f, 'utf8')));
+    expectSame(blanks.map((f) => path.relative(REPO, f)), [], "API files that write data_uri = ''");
+  });
+
+  /* ─────────────────────────────────────────────────────────────────────── */
+  section(10, 'PEST — what the contractor applied (#78) and the station-by-station sheet (#113)');
+
+  const PEST_CHECKS = route('pest/checks');
+  const MON = require(path.join(SRC, 'app', 'api', 'fssai', 'pest', '_pest', 'monitoring.ts'));
+  const P_TODAY = F.fssaiToday();
+  const P_YDAY = F.addDaysISO(P_TODAY, -1);
+  const visit = (body, who = MANAGER) => { signIn(who); return call(PEST_SVC, 'POST', '/api/fssai/pest/services', body); };
+  const walk = (body, who = STAFF) => { signIn(who); return call(PEST_CHECKS, 'POST', '/api/fssai/pest/checks', { action: 'submit_round', initials: 'RK', ...body }); };
+  const checksCount = () => count('fssai_pest_device_checks');
+  /** Stations on the pest map, as an administrator puts them there (the map itself is not under test). */
+  function stations() {
+    const ins = db.prepare(`INSERT INTO fssai_pest_devices (id, code, device_kind, location_label, check_frequency, is_active) VALUES (?, ?, ?, ?, ?, ?)`);
+    ins.run('pt-dev-a', 'BS-01', 'bait_station', 'Dry store door', 'weekly', 1);
+    ins.run('pt-dev-b', 'GB-02', 'glue_board', 'Behind the tandoor', 'daily', 1);
+    ins.run('pt-dev-c', 'BS-09', 'bait_station', 'Old back gate (removed)', 'weekly', 0);
+    ins.run('pt-dev-d', 'FU-03', 'fly_unit', 'Pass window', 'weekly', 1);
+  }
+
+  await test('#78 the chemicals: a completed visit lists them; unknown keys are dropped; expired or unregistered WARNS', async () => {
+    seedUsers();
+    const r = await visit({
+      action: 'create', vendor_name: 'Hyd Pest Services', status: 'completed', business_date: P_TODAY, agency_licence_no: 'PCO-TS-118',
+      chemicals: [
+        { name: 'Racumin Gel', active_ingredient: 'Coumatetralyl', licence_no: 'CIR-12345/2019', batch: 'B77', expiry: F.addDaysISO(P_TODAY, 200), dilution: 'ready to use', qty: '30', uom: 'g', method: 'Gel', target_pest: 'cockroach', area: 'Kitchen drains', injected: '<script>' },
+        { name: 'Old Spray', expiry: F.addDaysISO(P_TODAY, -10) },
+        { name: '', batch: '', area: '' },
+      ],
+    });
+    const stored = JSON.parse(db.prepare('SELECT chemicals_json FROM fssai_pest_services WHERE id = ?').get(r.j.service.id).chemicals_json);
+    expectSame([r.status, stored.length, stored[0].licence_no, 'injected' in stored[0]], [200, 2, 'CIR-12345/2019', false], 'two products stored (the blank line skipped), CIB&RC kept, an unknown key dropped');
+    expectTrue((r.j.warnings || []).some((w) => /past its expiry/.test(w)) && (r.j.warnings || []).some((w) => /CIB&RC/.test(w)),
+      `an expired product and a missing registration WARN, never refuse: ${JSON.stringify(r.j.warnings)}`);
+    for (const [label, body] of [
+      ['a line with no product name', { status: 'completed', chemicals: [{ batch: 'B1', area: 'Store' }] }],
+      ['an expiry that is not a date', { status: 'completed', chemicals: [{ name: 'Gel X', expiry: '31/12/2026' }] }],
+      ['chemicals on a visit that has not happened (planned)', { status: 'planned', business_date: F.addDaysISO(P_TODAY, 3), chemicals: [{ name: 'Gel X' }] }],
+      ['a list AND "nothing was applied" together', { status: 'completed', chemicals: [{ name: 'Gel X' }], chemicals_none: true, chemicals_none_note: 'Inspection only' }],
+      ['"nothing was applied" with no words', { status: 'completed', chemicals_none: true, chemicals_none_note: '' }],
+    ]) {
+      const x = await visit({ action: 'create', vendor_name: 'Hyd Pest Services', business_date: P_TODAY, ...body });
+      expect(x.status, 400, `refused: ${label}`);
+    }
+  });
+
+  await test('#78 "[]" is NOT RECORDED (never "none"); it is filled ONCE from the job sheet, audited, then frozen', async () => {
+    seedUsers();
+    let r = await visit({ action: 'create', vendor_name: 'Hyd Pest Services', status: 'completed', business_date: P_TODAY });
+    const V = r.j.service.id;
+    expectTrue(/does not say what was applied/.test(r.j.advice || ''), 'a completed visit with no list is told it is not recorded');
+    expect(db.prepare('SELECT chemicals_json FROM fssai_pest_services WHERE id = ?').get(V).chemicals_json, '[]', 'stored as []');
+    let reg = MON.readPestChemicalsApplied(db, { from: P_TODAY, to: P_TODAY });
+    expectSame([reg.totals.visits, reg.totals.not_recorded, reg.totals.none_applied], [1, 1, 0], '"[]" reads as not_recorded — never as none applied');
+    expectTrue(reg.problems.some((p) => /does not say what was applied/.test(p)), 'and the register names the gap');
+    r = await visit({ action: 'record_chemicals', id: V, chemicals: [] });
+    expect(r.status, 400, 'filling it with nothing at all is refused');
+    r = await visit({ action: 'record_chemicals', id: V, chemicals: [{ name: 'Maxforce Gel', licence_no: 'CIR-555/2020', area: 'Wash area' }] });
+    expectSame([r.status, r.j.recorded], [200, true], 'record_chemicals fills the empty list');
+    expect(auditRows('fssai_pest_services', V, 'record_chemicals').length, 1, 'one record_chemicals trail row');
+    r = await visit({ action: 'record_chemicals', id: V, chemicals: [{ name: 'A different gel' }] });
+    expect(r.status, 409, 'a second fill is refused — a completed visit is a record');
+    r = await visit({ action: 'create', vendor_name: 'Hyd Pest Services', status: 'planned', business_date: F.addDaysISO(P_TODAY, 5) });
+    const r2 = await visit({ action: 'record_chemicals', id: r.j.service.id, chemicals: [{ name: 'Gel' }] });
+    expect(r2.status, 409, 'chemicals on a PLANNED visit are refused');
+    await visit({ action: 'create', vendor_name: 'Hyd Pest Services', status: 'completed', business_date: P_TODAY, chemicals_none: true, chemicals_none_note: 'Monitoring visit only' });
+    reg = MON.readPestChemicalsApplied(db, { from: P_TODAY, to: P_TODAY });
+    expectSame([reg.totals.listed, reg.totals.none_applied, reg.totals.not_recorded], [1, 1, 0], 'the register: one listed, one "none applied" (in words), none unrecorded');
+    signIn(MANAGER);
+    const g = await call(PEST_CHECKS, 'GET', `/api/fssai/pest/checks?chemicals=1&from=${P_TODAY}&to=${P_TODAY}`);
+    expectSame([g.status, g.j.visits.length], [200, 2], 'GET ?chemicals=1 serves the printable register');
+  });
+
+  await test('#113 a walk is ALL OR NOTHING: every station needs Yes/No, initials, and an action when not in order', async () => {
+    seedUsers();
+    stations();
+    const ok = { device_id: 'pt-dev-a', activity: 'no', device_condition: 'ok' };
+    for (const [label, checks, extra, want] of [
+      ['a blank Yes/No (line 2)', [ok, { device_id: 'pt-dev-b', activity: '', device_condition: 'ok' }], {}, 400],
+      ['activity YES with no pest named', [ok, { device_id: 'pt-dev-b', activity: 'yes', device_condition: 'ok', action_taken: 'Board changed' }], {}, 400],
+      ['activity YES with no action', [ok, { device_id: 'pt-dev-b', activity: 'yes', activity_kind: 'cockroach', device_condition: 'ok' }], {}, 400],
+      ['a station NOT IN ORDER with no action', [ok, { device_id: 'pt-dev-b', activity: 'no', device_condition: 'not_ok' }], {}, 400],
+      ['no initials anywhere', [ok], { initials: '' }, 400],
+      ['the same station twice', [ok, ok], {}, 400],
+      ['a RETIRED station', [ok, { device_id: 'pt-dev-c', activity: 'no', device_condition: 'ok' }], {}, 409],
+      ['a station not on the map', [{ device_id: 'no-such-station', activity: 'no', device_condition: 'ok' }], {}, 400],
+      ['a future date', [ok], { business_date: F.addDaysISO(P_TODAY, 1) }, 400],
+      ['yesterday with no reason', [ok], { business_date: P_YDAY, checked_at: '21:00' }, 400],
+      ['yesterday with a reason but no time', [ok], { business_date: P_YDAY, backdate_reason: 'Sheet found in the morning' }, 400],
+      ['three days back', [ok], { business_date: F.addDaysISO(P_TODAY, -3), checked_at: '21:00', backdate_reason: 'Late' }, 400],
+      ['no stations at all', [], {}, 400],
+    ]) {
+      const r = await walk({ checks, ...extra });
+      expectSame([r.status, checksCount(), count('fssai_pest_sightings')], [want, 0, 0], `refused: ${label} — and NOTHING written`);
+    }
+    expectTrue(db.prepare(`SELECT COUNT(*) AS c FROM fssai_pest_devices WHERE last_checked_at <> ''`).get().c === 0, 'no station was stamped as checked by a refused walk');
+  });
+
+  await test('#113 a good walk: activity becomes a sighting, is_fail is frozen, last_checked_at only moves forward', async () => {
+    seedUsers();
+    stations();
+    let r = await walk({ checks: [
+      { device_id: 'pt-dev-a', activity: 'no', device_condition: 'ok' },
+      { device_id: 'pt-dev-b', activity: 'yes', activity_kind: 'cockroach', evidence_kind: 'device_catch', device_condition: 'ok', action_taken: 'Glue board replaced', initials: 'SB' },
+    ] });
+    expectSame([r.status, r.j.rows.length, r.j.sightings_raised.length, r.j.fails], [200, 2, 1, 1], 'two lines, one sighting raised, one fail');
+    const B = r.j.rows.find((x) => x.device_id === 'pt-dev-b');
+    const sighting = db.prepare('SELECT pest_type, device_id, status FROM fssai_pest_sightings WHERE id = ?').get(B.sighting_id);
+    expectSame([B.is_fail, B.initials, sighting && sighting.pest_type, sighting && sighting.device_id], [true, 'SB', 'cockroach', 'pt-dev-b'], 'the YES line is a fail with its own initials, linked to a cockroach sighting at that station');
+    expect(auditRows('fssai_pest_device_checks', B.id, 'create').length, 1, 'each line has its create trail row');
+    const stampA = db.prepare(`SELECT last_checked_at FROM fssai_pest_devices WHERE id = 'pt-dev-a'`).get().last_checked_at;
+    expectTrue(stampA > '', `station A stamped as checked (${stampA})`);
+    r = await walk({ business_date: P_YDAY, checked_at: '21:00', backdate_reason: 'Last night’s sheet, typed in this morning', checks: [{ device_id: 'pt-dev-a', activity: 'no', device_condition: 'ok' }] });
+    expectSame([r.status, r.j.backdated], [200, true], 'yesterday’s walk with a reason and a time is filed, marked backdated');
+    expect(db.prepare(`SELECT last_checked_at FROM fssai_pest_devices WHERE id = 'pt-dev-a'`).get().last_checked_at, stampA, 'an older walk never moves last_checked_at BACK');
+    const cov = MON.pestStationCoverage(db, P_TODAY);
+    const st = (id) => (cov.find((c) => c.device_id === id) || {}).state;
+    expectSame([st('pt-dev-a'), st('pt-dev-b'), st('pt-dev-d'), cov.some((c) => c.device_id === 'pt-dev-c')], ['ok', 'ok', 'never', false],
+      'coverage today: A and B checked, D NEVER checked, the retired station not counted');
+    const later = MON.pestStationCoverage(db, F.addDaysISO(P_TODAY, 8));
+    expectSame([later.find((c) => c.device_id === 'pt-dev-a').state, later.find((c) => c.device_id === 'pt-dev-b').state], ['overdue', 'overdue'], 'eight days on, both are overdue');
+    const sheet = MON.readPestMonitoringSheet(db, { from: P_YDAY, to: P_TODAY, today: P_TODAY });
+    expectSame([sheet.totals.lines, sheet.totals.rounds, sheet.totals.activity, sheet.verdict], [3, 2, 1, 'expiring'], 'the sheet: 3 lines in 2 walks, 1 activity — EXPIRING while station D has never been checked');
+  });
+
+  await test('#113 a line is VOIDED through the shared void and stays on the sheet; a corrective action from a failing line', async () => {
+    seedUsers();
+    stations();
+    const r = await walk({ checks: [
+      { device_id: 'pt-dev-a', activity: 'no', device_condition: 'not_ok', action_taken: 'Lid broken — replaced the station' },
+      { device_id: 'pt-dev-d', activity: 'no', device_condition: 'ok' },
+    ] });
+    const A = r.j.rows.find((x) => x.device_id === 'pt-dev-a');
+    const D = r.j.rows.find((x) => x.device_id === 'pt-dev-d');
+    const post = (body, who) => { signIn(who); return call(PEST_CHECKS, 'POST', '/api/fssai/pest/checks', body); };
+    let x = await post({ action: 'void', id: D.id, reason: 'Checked the wrong station' }, STAFF);
+    expect(x.status, 403, 'staff may file a walk but not void a line');
+    x = await post({ action: 'void', id: D.id, reason: 'Wrong station — it was FU-04' }, MANAGER);
+    expectSame([x.status, x.j.check.is_void, x.j.check.void_reason], [200, true, 'Wrong station — it was FU-04'], 'a manager voids the line, with the reason kept');
+    expect(checksCount(), 2, 'the voided line is still a row');
+    const sheet = MON.readPestMonitoringSheet(db, { from: P_TODAY, to: P_TODAY, today: P_TODAY });
+    expectSame([sheet.rows.length, sheet.totals.lines, sheet.totals.void_lines], [2, 1, 1], 'the sheet still prints it (2 rows), counting 1 live and 1 void');
+    expect(MON.pestStationCoverage(db, P_TODAY).find((c) => c.device_id === 'pt-dev-d').state, 'never', 'a voided line does not count as the station being checked');
+    signIn(ADMIN);
+    x = await call(VOID_ROUTE, 'POST', '/api/fssai/void', { entity_table: 'fssai_pest_device_checks', id: A.id, reason: 'Testing the generic void on a line' });
+    expectSame([x.status, x.j.status], [200, 'void'], 'the generic /api/fssai/void handles station-check lines too');
+    const r2 = await walk({ checks: [{ device_id: 'pt-dev-a', activity: 'no', device_condition: 'not_ok', action_taken: 'Station missing from the wall' }] });
+    const A2 = r2.j.rows[0];
+    x = await post({ action: 'raise_ca', id: A2.id, owner_email: MANAGER.email, title: 'Replace bait station BS-01' }, MANAGER);
+    const ca = x.j.raised && db.prepare('SELECT run_id, source_kind, title FROM fssai_corrective_actions WHERE id = ?').get(x.j.raised.ca_id);
+    expectSame([x.status, ca && ca.run_id, x.j.check.ca_id === x.j.raised.ca_id], [200, null, true], 'a corrective action is raised from the failing line (run_id NULL) and linked back');
+    x = await post({ action: 'raise_ca', id: A2.id, owner_email: MANAGER.email, title: 'Again' }, MANAGER);
+    expect(x.status, 409, 'a second action for the same line');
+    const ok2 = await walk({ checks: [{ device_id: 'pt-dev-d', activity: 'no', device_condition: 'ok' }] });
+    x = await post({ action: 'raise_ca', id: ok2.j.rows[0].id, owner_email: MANAGER.email, title: 'Nothing wrong' }, MANAGER);
+    expect(x.status, 409, 'an action from a line that was in order');
+  });
+
+  /* ─────────────────────────────────────────────────────────────────────── */
+  section(11, 'THE WASTE HANDOVER LOG (#114) — one row per handover, refused in words, voided never deleted');
+
+  const WASTE = route('waste');
+  const WL = require(path.join(SRC, 'app', 'api', 'fssai', '_waste', 'lib.ts'));
+  const W_TODAY = F.fssaiToday();
+  const waste = (body, who = STAFF, opts) => { signIn(who); return call(WASTE, 'POST', '/api/fssai/waste', { action: 'record', ...body }, opts); };
+  const GHMC = { collector_kind: 'ghmc', wet_qty: 12.5, dry_qty: 4, qty_uom: 'kg', vehicle_no: 'ts09ua1234', handed_at: '07:30' };
+
+  await test('the back-door path: GHMC, wet + dry, one tap — blank streams stay NULL, nothing about money or stock', async () => {
+    seedUsers();
+    const stockBefore = count('raw_materials');
+    const r = await waste({ ...GHMC, other_qty: '' });
+    const h = r.j.handover;
+    const row = db.prepare('SELECT * FROM fssai_waste_handovers WHERE id = ?').get(h.id);
+    expectSame([r.status, row.collector_name, row.wet_qty, row.dry_qty, row.other_qty, row.vehicle_no, row.handed_over_name],
+      [200, 'GHMC', 12.5, 4, null, 'TS09UA1234', STAFF.name], 'filed: GHMC named, other stream NULL (never 0), vehicle upper-cased, handed over by the signed-in porter');
+    expectTrue(/^WST/.test(h.handover_no), `a handover number is allocated: ${h.handover_no}`);
+    const cols = db.prepare(`SELECT name FROM pragma_table_xinfo('fssai_waste_handovers')`).all().map((c) => c.name);
+    expectSame([cols.some((c) => /amount|price|cost|rate|value/i.test(c)), r.j.has_money_column, r.j.stock_unchanged, count('raw_materials')], [false, false, true, stockBefore], 'no money column, and stock is untouched');
+    expect(auditRows('fssai_waste_handovers', h.id, 'create').length, 1, 'one create trail row');
+  });
+
+  await test('every refusal is a 400 with its OWN code, and writes nothing', async () => {
+    seedUsers();
+    const notWaste = await docPost({ action: 'create', doc_type: 'fssai_licence', title: 'A licence, not a waste agreement' });
+    for (const [code, body] of [
+      ['nothing_handed_over', { collector_kind: 'ghmc', vehicle_no: 'TS1' }],
+      ['qty_not_positive', { ...GHMC, wet_qty: 0 }],
+      ['qty_not_positive', { ...GHMC, dry_qty: -3 }],
+      ['bad_qty', { ...GHMC, wet_qty: 'twelve' }],
+      ['qty_implausible', { ...GHMC, wet_qty: 250000 }],
+      ['other_kind_required', { ...GHMC, other_qty: 2 }],
+      ['other_qty_required', { ...GHMC, other_kind: 'Glass' }],
+      ['bad_uom', { ...GHMC, qty_uom: 'tonnes' }],
+      ['collector_kind_required', { ...GHMC, collector_kind: '' }],
+      ['collector_name_required', { ...GHMC, collector_kind: 'other' }],
+      ['unknown_vendor', { ...GHMC, vendor_id: 'no-such-vendor' }],
+      ['unknown_department', { ...GHMC, department_id: 'no-such-department' }],
+      ['bad_document', { ...GHMC, document_id: notWaste.j.document.id }],
+      ['registration_or_note', { ...GHMC, collector_kind: 'agency', collector_name: 'Ramky Enviro' }],
+      ['receipt_or_vehicle_or_note', { ...GHMC, vehicle_no: '' }],
+      ['future_date', { ...GHMC, business_date: F.addDaysISO(W_TODAY, 1) }],
+      ['bad_date', { ...GHMC, business_date: '14/10/2026' }],
+      ['bad_time', { ...GHMC, handed_at: '7.30am' }],
+    ]) {
+      const r = await waste(body);
+      expectSame([r.status, r.j.code], [400, code], `refused ${code}`);
+    }
+    expect(count('fssai_waste_handovers'), 0, 'handovers written by the refused calls');
+  });
+
+  await test('duplicates: the same receipt from the same collector is 409; a double tap is 409; a voided row blocks nothing', async () => {
+    seedUsers();
+    const agency = { collector_kind: 'agency', collector_name: 'Ramky Enviro', agency_reg_no: 'TSPCB-AR-77', wet_qty: 40, qty_uom: 'kg', receipt_no: 'R-1001', handed_at: '08:00' };
+    let r = await waste(agency);
+    const first = r.j.handover;
+    r = await waste({ ...agency, collector_name: '  ramky enviro ', receipt_no: ' r-1001 ', wet_qty: 41, handed_at: '09:00' });
+    expectSame([r.status, r.j.code, r.j.duplicate_of && r.j.duplicate_of.handover_no], [409, 'duplicate_receipt', first.handover_no], 'the same receipt (case and spaces ignored) → 409, naming the first');
+    r = await waste(GHMC);
+    const g1 = r.j.handover;
+    r = await waste(GHMC);
+    expectSame([r.status, r.j.code, r.j.duplicate_of && r.j.duplicate_of.id], [409, 'duplicate_submit', g1.id], 'the same press again within 10 minutes → 409, nothing saved twice');
+    signIn(MANAGER2);
+    const v = await call(VOID_ROUTE, 'POST', '/api/fssai/void', { entity_table: 'fssai_waste_handovers', id: first.id, reason: 'Receipt number misread' });
+    expect(v.status, 200, 'the first is voided through the shared void');
+    r = await waste(agency);
+    expect(r.status, 200, 'and the same receipt can now be filed correctly');
+    expect(db.prepare(`SELECT COUNT(*) AS c FROM fssai_waste_handovers WHERE id = ? AND status = 'void'`).get(first.id).c, 1, 'the voided row is still there');
+  });
+
+  await test('backdated is accepted and the trail says so; CSRF and sign-in are enforced; staff see only what is theirs to see', async () => {
+    seedUsers();
+    const y = F.addDaysISO(W_TODAY, -2);
+    let r = await waste({ ...GHMC, business_date: y });
+    const trail = auditRows('fssai_waste_handovers', r.j.handover.id, 'create')[0];
+    expectSame([r.status, r.j.backdated, trail && trail.reason], [200, true, `Filed on ${W_TODAY} for ${y}.`], 'a handover two days back is filed, and the trail reads "Filed on X for Y"');
+    r = await waste(GHMC, STAFF, { csrf: false });
+    expect(r.status, 403, 'no CSRF pair');
+    signIn(null);
+    r = await call(WASTE, 'POST', '/api/fssai/waste', { action: 'record', ...GHMC }, {});
+    expect(r.status, 401, 'signed out');
+    const depts = db.prepare('SELECT id FROM departments ORDER BY id LIMIT 2').all().map((d) => d.id);
+    if (depts.length < 2) { ok(`(visibility by department not exercised: the fresh database holds ${depts.length} department(s), and this suite never creates one)`); return; }
+    const STAFF_D = { ...STAFF, id: 'u-staff-d', email: 'staffd@fssai.test', name: 'Dept Staff', department_id: depts[0] };
+    const OTHER_D = { ...STAFF, id: 'u-staff-o', email: 'staffo@fssai.test', name: 'Other Staff', department_id: depts[1] };
+    seedUsers(STAFF_D, OTHER_D);
+    await waste({ ...GHMC, handed_at: '10:00', department_id: depts[1] }, OTHER_D);
+    await waste({ ...GHMC, handed_at: '11:00', department_id: depts[0] }, MANAGER);
+    signIn(STAFF_D);
+    const mine = await call(WASTE, 'GET', `/api/fssai/waste?from=${y}&to=${W_TODAY}`);
+    const seen = mine.j.handovers.map((h) => h.department_id);
+    expectTrue(mine.status === 200 && !seen.includes(depts[1]) && seen.includes(depts[0]), `a staff member sees restaurant-wide and own-department handovers, never another department’s (${seen.length} seen)`);
+    signIn(MANAGER);
+    const all = await call(WASTE, 'GET', `/api/fssai/waste?from=${y}&to=${W_TODAY}`);
+    expectTrue(all.j.handovers.length > mine.j.handovers.length, `management sees all (${all.j.handovers.length})`);
+  });
+
+  await test('a handover is VOIDED only through /api/fssai/void; a photo is voided with its image KEPT; another handover’s photo is a 404', async () => {
+    seedUsers();
+    let r = await waste({ ...GHMC, photos: [{ data_uri: png('waste-1') }] }, MANAGER);
+    const H = r.j.handover;
+    const P1 = H.photos[0].id;
+    r = await waste({ ...GHMC, handed_at: '18:00', photos: [{ data_uri: png('waste-2') }] }, ADMIN);
+    const H2 = r.j.handover;
+    signIn(MANAGER);
+    r = await call(WASTE, 'POST', '/api/fssai/waste', { action: 'void', id: H.id, reason: 'Wrong day' });
+    expectSame([r.status, r.j.use_endpoint], [409, '/api/fssai/void'], 'action "void" on the log answers 409 and names the shared void');
+    signIn(STAFF);
+    expect((await call(VOID_ROUTE, 'POST', '/api/fssai/void', { entity_table: 'fssai_waste_handovers', id: H.id, reason: 'Staff trying' })).status, 403, 'staff cannot void a handover');
+    signIn(MANAGER);
+    expect((await call(VOID_ROUTE, 'POST', '/api/fssai/void', { entity_table: 'fssai_waste_handovers', id: H.id, reason: 'My own entry' })).status, 403, 'nor can the manager who filed it');
+    const before = attRow(P1);
+    signIn(MANAGER2);
+    r = await call(WASTE, 'POST', '/api/fssai/waste', { action: 'void_photo', id: H2.id, attachment_id: P1, reason: 'Reaching across handovers' });
+    expect(r.status, 404, 'the photo of handover 1 named against handover 2 → 404');
+    r = await call(WASTE, 'POST', '/api/fssai/waste', { action: 'void_photo', id: H.id, attachment_id: P1, reason: 'Photo of the wrong bins' });
+    const after = attRow(P1);
+    expectSame([r.status, after.status, after.data_uri === before.data_uri, after.image_dropped_at, after.digest_sha256 === before.digest_sha256], [200, 'void', true, '', true],
+      'another manager voids the photo: status void, image byte for byte, nothing dropped');
+    const t = JSON.parse(auditRows('fssai_waste_handovers', H.id, 'attachment_void')[0].after_json);
+    expectSame([t.file_kept, t.digest_sha256 === before.digest_sha256], [true, true], 'the trail records file_kept and the digest');
+    r = await call(VOID_ROUTE, 'POST', '/api/fssai/void', { entity_table: 'fssai_waste_handovers', id: H.id, reason: 'Filed against the wrong collector' });
+    const row = db.prepare('SELECT status, void_reason, voided_by FROM fssai_waste_handovers WHERE id = ?').get(H.id);
+    expectSame([r.status, row.status, row.void_reason, row.voided_by], [200, 'void', 'Filed against the wrong collector', MANAGER2.email], 'another manager voids the handover; the row stays with its reason');
+    expect(count('fssai_waste_handovers'), 2, 'rows (nothing deleted)');
+  });
+
+  await test('the audit-file part: the LAST live handover decides; voided handovers and voided photos never count', async () => {
+    seedUsers();
+    let part = WL.wasteHandoverAuditPart(db, { today: W_TODAY, since: F.addDaysISO(W_TODAY, -29) });
+    expectSame([part.status, part.headline], ['missing', 'Nothing on file'], 'no handover → MISSING');
+    const r1 = await waste({ ...GHMC, photos: [{ data_uri: png('ap-1') }] }, ADMIN);
+    const r2 = await waste({ ...GHMC, handed_at: '19:00', photos: [{ data_uri: png('ap-2') }] }, ADMIN);
+    signIn(MANAGER);
+    await call(WASTE, 'POST', '/api/fssai/waste', { action: 'void_photo', id: r1.j.handover.id, attachment_id: r1.j.handover.photos[0].id, reason: 'Blurred photograph' });
+    await call(VOID_ROUTE, 'POST', '/api/fssai/void', { entity_table: 'fssai_waste_handovers', id: r2.j.handover.id, reason: 'Entered twice' });
+    part = WL.wasteHandoverAuditPart(db, { today: W_TODAY, since: F.addDaysISO(W_TODAY, -29) });
+    expectSame([part.status, part.handovers.length, part.scans.length, part.tables[0].handover_rows], ['present', 1, 0, 1],
+      'PRESENT on one live handover; the voided handover and the voided photo are not counted, and no scan is a copy');
+    expectSame(['2', '5', '8'].map((n) => WL.judgeWasteRegister(F.addDaysISO(W_TODAY, -Number(n)), W_TODAY).status), ['present', 'expiring', 'missing'],
+      'cadence: 2 days old PRESENT, 5 EXPIRING, 8 MISSING');
+  });
+
+  await test('Q22: the 12-month sweep never touches a waste photo (fssai_attachments), however old', async () => {
+    seedUsers();
+    const RET = lib('fssai-retention.ts');
+    const r = await waste({ ...GHMC, photos: [{ data_uri: png('old-waste') }] }, ADMIN);
+    const P = r.j.handover.photos[0].id;
+    db.prepare(`UPDATE fssai_attachments SET created_at = '2023-01-02 10:00:00' WHERE id = ?`).run(P);
+    const before = attRow(P).data_uri;
+    const rep = RET.sweepFssaiPhotoRetention(db, { now: new Date() });
+    expectSame([attRow(P).data_uri === before, attRow(P).image_dropped_at], [true, ''], 'a three-year-old waste photo keeps its image after the real sweep');
+    expectSame([RET.FSSAI_RETENTION_SWEPT_STORES, RET.FSSAI_RETENTION_NEVER_SWEPT_STORES], [['fssai_evidence'], ['fssai_attachments']], 'swept: evidence only · never swept: attachments');
+    expectTrue(!JSON.stringify(rep).includes(P), 'the sweep report does not even list it');
+  });
+
+  /* ─────────────────────────────────────────────────────────────────────── */
+  section(12, 'CLOSURE PHOTOGRAPHS (#120) — on the fix, on the inspector’s point, and the report copy');
+
+  const CA_ROUTE = route('corrective-actions');
+  const INSP = route('inspections');
+  const CLO = require(path.join(SRC, 'app', 'api', 'fssai', '_closure', 'lib.ts'));
+  const caPost = (body, who) => { signIn(who); return call(CA_ROUTE, 'POST', '/api/fssai/corrective-actions', body); };
+  const inspPost = (body, who = MANAGER) => { signIn(who); return call(INSP, 'POST', '/api/fssai/inspections', body); };
+  /** A manual corrective action owned by the staff cook — the way a failed check hands one over. */
+  const manualCa = (title) => mkRow('fssai_corrective_actions', {
+    ca_number: 'CA-T-' + title.length, source_kind: 'manual', run_id: null, title, owner_email: STAFF.email,
+    status: 'open', severity: 'high', created_by: MANAGER.email, department_id: '', outlet_id: ROUTE_OUTLET,
+  });
+  const frozenPhotos = (table, id, action) => {
+    const rows = auditRows(table, id).filter((r) => (r.action === action) || (action === 'complete' && /"status":"done"/.test(r.after_json || '')) || (action === 'verify' && /"status":"verified"/.test(r.after_json || '')));
+    const last = rows[rows.length - 1];
+    return last ? (JSON.parse(last.after_json).closure_photos || null) : null;
+  };
+
+  await test('a corrective action takes a photograph of the fix; complete and verify FREEZE the live photos by digest', async () => {
+    seedUsers();
+    const ca = manualCa('Fridge 2 door seal replaced');
+    let r = await caPost({ action: 'attach_closure', id: ca.id, data_uri: png('seal-fixed'), caption: 'New seal fitted' }, STAFF);
+    expectSame([r.status, r.j.file && r.j.file.status, (r.j.closure_files || []).length], [200, 'active', 1], 'the cook who owns the action adds a photograph while it is open');
+    const P1 = r.j.file.attachment_id;
+    r = await caPost({ action: 'attach_closure', id: ca.id, data_uri: 'data:text/html;base64,PHNjcmlwdD4=' }, STAFF);
+    expect(r.status, 400, 'a non-image data URI is refused (stored XSS)');
+    r = await caPost({ action: 'complete', id: ca.id, action_taken: 'Replaced the gasket and checked it closes' }, STAFF);
+    const atDone = frozenPhotos('fssai_corrective_actions', ca.id, 'complete');
+    expectSame([r.status, r.j.closure_photos, atDone && atDone.length, atDone && atDone[0].digest_sha256 === attRow(P1).digest_sha256], [200, 1, 1, true],
+      'complete freezes the one live photo (id + SHA-256) into its audit row');
+    r = await caPost({ action: 'attach_closure', id: ca.id, data_uri: png('late-cook') }, STAFF);
+    expect(r.status, 403, 'once the fix is written down, the cook may not add another (the statement is frozen)');
+    r = await caPost({ action: 'attach_closure', id: ca.id, data_uri: png('checker') }, MANAGER);
+    expect(r.status, 200, 'the checker (management) may add the checking photograph');
+    r = await caPost({ action: 'verify', id: ca.id, verify_note: 'Door closes, seal intact' }, MANAGER2);
+    const atVerify = frozenPhotos('fssai_corrective_actions', ca.id, 'verify');
+    expectSame([r.status, r.j.closure_photos, atVerify && atVerify.length], [200, 2, 2], 'verify freezes both photos the checker had in front of them');
+    r = await caPost({ action: 'attach_closure', id: ca.id, data_uri: png('after-verify') }, MANAGER);
+    expect(r.status, 409, 'a VERIFIED action takes no more photographs');
+    r = await caPost({ action: 'void_file', id: ca.id, attachment_id: P1, reason: 'Trying after the check' }, MANAGER);
+    expectSame([r.status, attRow(P1).status], [409, 'active'], 'and its photographs can no longer be voided');
+  });
+
+  await test('a closure photo is VOIDED, never removed; another record’s file is a 404; staff and no-reason are refused', async () => {
+    seedUsers();
+    const ca = manualCa('Hand-wash sink soap dispenser');
+    const other = manualCa('Some other action entirely');
+    const a = (await caPost({ action: 'attach_closure', id: ca.id, data_uri: png('soap') }, STAFF)).j.file.attachment_id;
+    const b = (await caPost({ action: 'attach_closure', id: other.id, data_uri: png('other') }, STAFF)).j.file.attachment_id;
+    const { att: docScan } = await licenceWithScan('Licence — not a closure photo');
+    let r = await caPost({ action: 'void_file', id: ca.id, attachment_id: b, reason: 'Reaching across actions' }, MANAGER);
+    expectSame([r.status, r.j.code], [404, 'not_found'], 'another action’s photo named against this one → 404');
+    r = await caPost({ action: 'void_file', id: ca.id, attachment_id: docScan, reason: 'Reaching into the documents' }, MANAGER);
+    expect(r.status, 404, 'a licence scan named against an action → 404');
+    r = await caPost({ action: 'void_file', id: ca.id, attachment_id: a, reason: 'Staff trying' }, STAFF);
+    expect(r.status, 403, 'staff (even the owner) cannot void');
+    r = await caPost({ action: 'void_file', id: ca.id, attachment_id: a, reason: '' }, MANAGER);
+    expectTrue(r.status >= 400 && r.status < 500 && attRow(a).status === 'active', `no reason in words → refused (${r.status}), file still live`);
+    const before = attRow(a);
+    r = await caPost({ action: 'void_file', id: ca.id, attachment_id: a, reason: 'Photo of the wrong sink' }, MANAGER);
+    const after = attRow(a);
+    expectSame([r.status, after.status, after.data_uri === before.data_uri, after.image_dropped_at, (r.j.closure_files || []).find((f) => f.attachment_id === a).status],
+      [200, 'void', true, '', 'void'], 'voided: the image is kept and the file is still listed, marked void');
+    expectSame([auditRows('fssai_attachments', a, 'void').length, auditRows('fssai_corrective_actions', ca.id, 'attachment_void').length], [1, 1], 'a trail row on the file AND on the action');
+    expect(attRow(b).status, 'active', 'the other action’s photo was never touched');
+  });
+
+  await test('an inspection: report linked (and checked), report pages photographed, points closed WITH photographs', async () => {
+    seedUsers();
+    const report = await docPost({ action: 'create', doc_type: 'audit_report', title: 'GHMC food safety inspection report — Sept' });
+    await docPost({ action: 'attach', id: report.j.document.id, data_uri: png('report-scan') }, ADMIN);
+    const licence = await docPost({ action: 'create', doc_type: 'fssai_licence', title: 'The licence (not a report)' });
+    let r = await inspPost({ action: 'create', inspection_kind: 'fssai_officer', authority: 'FSSAI Hyderabad', business_date: F.fssaiToday(), document_id: 'no-such-document' });
+    expectTrue(r.status === 400 && r.j.code === 'bad_document', `a dangling report id on create is refused (${r.status})`);
+    r = await inspPost({ action: 'create', inspection_kind: 'fssai_officer', authority: 'FSSAI Hyderabad', business_date: F.fssaiToday() });
+    if (r.status !== 200) { bad('create the inspection', JSON.stringify(r.j)); return; }
+    const V = r.j.inspection.id;
+    r = await inspPost({ action: 'link_report', id: V, document_id: licence.j.document.id });
+    expectSame([r.status, r.j.code], [400, 'bad_document'], 'a licence cannot stand as the visit’s report');
+    r = await inspPost({ action: 'link_report', id: V, document_id: report.j.document.id });
+    expect(r.status, 200, 'the audit report is linked');
+    r = await inspPost({ action: 'link_report', id: V, document_id: '' });
+    expectSame([r.status, r.j.code], [400, 'reason_required'], 'removing the link needs a reason');
+    r = await inspPost({ action: 'attach_report', id: V, data_uri: png('report-page-1') });
+    const page = r.j.file.attachment_id;
+    expectSame([r.status, r.j.evidence.report.copies], [200, 2], 'a photographed page plus the linked scan = 2 copies of the report');
+    r = await inspPost({ action: 'add_finding', inspection_id: V, observation: 'Raw chicken stored above cooked food', severity: 'major' });
+    const PT = r.j.finding.id;
+    r = await inspPost({ action: 'update_finding', id: PT, status: 'closed' });
+    expectSame([r.status, r.j.code], [409, 'use_close_or_reopen'], 'a point cannot be CLOSED by editing it (the HEAD bypass)');
+    r = await inspPost({ action: 'attach_closure', id: PT, data_uri: png('shelves-reordered') });
+    const ph = r.j.file.attachment_id;
+    r = await inspPost({ action: 'void_file', id: V, attachment_id: ph, reason: 'Point photo named on the visit' });
+    expect(r.status, 404, 'a point’s photo named against the VISIT → 404');
+    r = await inspPost({ action: 'close_finding', id: PT, response: 'Shelving reordered: raw below cooked, staff briefed' });
+    const close = auditRows('fssai_inspection_findings', PT, 'close')[0];
+    expectSame([r.status, r.j.closure_photos, close && JSON.parse(close.after_json).closure_photos.length], [200, 1, 1], 'the point closes with its photograph frozen into the close row');
+    r = await inspPost({ action: 'void_file', id: V, attachment_id: page, reason: 'Page of another visit’s report' });
+    const ev = CLO.readFssaiOneVisitClosureEvidence(db, V);
+    expectSame([r.status, ev.report.copies, ev.report.voided_files.length, ev.counts.settled_with_photo, ev.counts.settled_without_photo],
+      [200, 1, 1, 1, 0], 'the voided page is kept apart and no longer a copy; one point settled WITH a photograph');
+    expect(attRow(page).data_uri.length > 100, true, 'the voided report page still holds its image');
+    signIn(STAFF);
+    expect((await call(INSP, 'POST', '/api/fssai/inspections', { action: 'attach_closure', id: PT, data_uri: png('staff') })).status, 403, 'staff (inspections are management only)');
+  });
+
+  await test('a CLOSED visit seals its points’ photographs; its report may still be added', async () => {
+    seedUsers();
+    let r = await inspPost({ action: 'create', inspection_kind: 'internal', inspector_name: 'Internal auditor', business_date: F.fssaiToday() });
+    const V = r.j.inspection.id;
+    r = await inspPost({ action: 'add_finding', inspection_id: V, observation: 'Fly screen torn', severity: 'minor' });
+    const PT = r.j.finding.id;
+    const ph = (await inspPost({ action: 'attach_closure', id: PT, data_uri: png('screen') })).j.file.attachment_id;
+    await inspPost({ action: 'close_finding', id: PT, response: 'Screen replaced the same day' });
+    r = await inspPost({ action: 'close', id: V, reason: 'All points answered' });
+    if (r.status !== 200) { bad('close the visit', JSON.stringify(r.j)); return; }
+    r = await inspPost({ action: 'attach_closure', id: PT, data_uri: png('late') });
+    expect(r.status, 409, 'no new photograph on a point of a closed visit');
+    r = await inspPost({ action: 'void_file', id: PT, attachment_id: ph, reason: 'After closing' });
+    expectSame([r.status, attRow(ph).status], [409, 'active'], 'nor can one be voided');
+    r = await inspPost({ action: 'attach_report', id: V, data_uri: png('report-arrived-later') });
+    expect(r.status, 200, 'the report, which often arrives later, can still be photographed onto it');
+  });
+
+  /* ─────────────────────────────────────────────────────────────────────── */
+  section(13, 'A DELETED READY-MADE CHECKLIST IS NEVER RESURRECTED by a later pack version');
+
+  const TPL = route('templates');
+  const SEED_ROUTE = route('seed');
+  const CUR_PACK = PACK.FSSAI_CHECKLIST_PACK;
+  /** The database as an earlier release left it: the pack applied at version N-1, under the routes' own outlet. */
+  const applyOlder = () => SEED.applyFssaiChecklistPack(db, { actor: { email: ADMIN.email, name: ADMIN.name }, outletId: ROUTE_OUTLET, pack: { ...CUR_PACK, version: CUR_PACK.version - 1 } });
+  const tplByCode = (code) => db.prepare('SELECT id, code, name, status FROM fssai_templates WHERE code = ? AND outlet_id = ?').get(code, ROUTE_OUTLET);
+
+  await test('the owner DELETES a never-used checklist; the next pack version (through the real seed route) skips it as retired', async () => {
+    seedUsers();
+    const old = applyOlder();
+    expectSame([old.ok, old.inserted], [true, CUR_PACK.templates.length], `version ${CUR_PACK.version - 1} applied: every checklist created`);
+    const victim = tplByCode('CHK-SAFE-MONTHLY') || tplByCode(CUR_PACK.templates[0].code);
+    signIn(ADMIN);
+    let r = await call(TPL, 'DELETE', `/api/fssai/templates?id=${victim.id}&purge=1&reason=${encodeURIComponent('We do not run this one')}`);
+    expectSame([r.status, !!tplByCode(victim.code)], [200, false], `the owner deletes ${victim.code} (never run) — it is gone`);
+    expect(auditRows('fssai_templates', victim.id, 'delete').length, 1, 'and the delete is in the trail');
+    r = await call(SEED_ROUTE, 'POST', '/api/fssai/seed', {});
+    const item = r.j && (r.j.items || []).find((i) => i.code === victim.code);
+    expectSame([r.status, item && item.action, item && item.reason], [200, 'skipped', 'retired'], `version ${CUR_PACK.version} through POST /api/fssai/seed: ${victim.code} skipped as RETIRED`);
+    expect(tplByCode(victim.code), undefined, 'it was NOT brought back');
+    const log = db.prepare(`SELECT detail FROM fssai_seed_log WHERE item_code = ? AND pack_version = ? AND action = 'skipped'`).get(victim.code, CUR_PACK.version);
+    expectTrue(!!log && /Retired/.test(log.detail), `the seed log says why: "${log && log.detail.slice(0, 90)}…"`);
+    r = await call(SEED_ROUTE, 'POST', '/api/fssai/seed', {});
+    expectSame([r.status, r.j.code], [409, 'already_applied'], 'a second press of the same version is refused');
+  });
+
+  await test('a checklist whose CODE the owner changed is not re-created under the old code either', async () => {
+    seedUsers();
+    applyOlder();
+    const t = tplByCode('CHK-HYD-AUDIT-1') || tplByCode(CUR_PACK.templates[1].code);
+    db.prepare(`UPDATE fssai_templates SET code = 'OWNER-HYD-1' WHERE id = ?`).run(t.id);
+    const r = SEED.applyFssaiChecklistPack(db, { actor: { email: ADMIN.email }, outletId: ROUTE_OUTLET });
+    const item = (r.items || []).find((i) => i.code === t.code);
+    expectSame([r.ok, item && item.reason, !!tplByCode(t.code), !!tplByCode('OWNER-HYD-1')], [true, 'retired', false, true], `${t.code} renamed by the owner: skipped as retired, his renamed copy kept`);
+  });
+
+  await test('NEGATIVE CONTROL: hide the seed log’s "inserted" rows and the same apply DOES resurrect it — so the log is the guard', async () => {
+    seedUsers();
+    applyOlder();
+    const victim = tplByCode('CHK-SAFE-MONTHLY') || tplByCode(CUR_PACK.templates[0].code);
+    signIn(ADMIN);
+    await call(TPL, 'DELETE', `/api/fssai/templates?id=${victim.id}&purge=1&reason=x`);
+    db.prepare(`UPDATE fssai_seed_log SET action = 'hidden-by-test' WHERE item_code = ? AND action = 'inserted'`).run(victim.code);
+    const r = SEED.applyFssaiChecklistPack(db, { actor: { email: ADMIN.email }, outletId: ROUTE_OUTLET });
+    expectSame([r.ok, !!tplByCode(victim.code)], [true, true], 'with the version-free record gone, the checklist comes back — the guard is real, not incidental');
+  });
+
+  /* ─────────────────────────────────────────────────────────────────────── */
+  section(14, 'THE AUDIT-FILE PDF — what the inspector’s copy SAYS it holds, and what it never prints');
+
+  const AF = route('audit-file');
+  const AF_PDF = route('audit-file/pdf');
+  const AFL = require(path.join(SRC, 'app', 'api', 'fssai', 'audit-file', 'lib.ts'));
+  const AF_SCANS = require(path.join(SRC, 'app', 'api', 'fssai', 'audit-file', 'scans.ts'));
+  const flat = (t) => t.replace(/\s+/g, ' ');
+
+  await test('a small real file through the routes: the handover copy states N of 20, never a gap and never a void; the management copy shows both', async () => {
+    seedUsers();
+    // One licence with a live scan and a VOIDED one.
+    const lic = await licenceWithScan('FSSAI licence — Akan');
+    const extra = await docPost({ action: 'attach', id: lic.doc, data_uri: png('licence-wrong-page') }, ADMIN);
+    const VOIDED = extra.j.attachment.id;
+    await docPost({ action: 'void_file', id: lic.doc, attachment_id: VOIDED, reason: 'Photographed the GST certificate by mistake' }, MANAGER2);
+    // A food handler with NO certificate at all.
+    await fhPost({ action: 'create', full_name: 'Mallesh Yadav', designation: 'Dishwash' });
+    // A cooking reading, and a cooling batch's 0-minute reading.
+    signIn(ADMIN);
+    await call(STD, 'POST', '/api/fssai/temp-standards', { action: 'create_suggested', codes: ['TEMP-COOKING', 'TEMP-COOLING'] });
+    await reading({ log_kind: 'cooking', value_num: 82, area_label: 'Line', item_label: 'Chicken 65', reading_at: '12:00' });
+    await reading({ log_kind: 'cooling', value_num: 70, area_label: 'Kitchen', item_label: 'Dal batch', reading_at: '13:00' });
+    // A waste handover.
+    await waste(GHMC);
+
+    signIn(MANAGER);
+    const j = (await call(AF, 'GET', '/api/fssai/audit-file?days=30')).j;
+    const item = (k) => j.items.find((i) => i.key === k);
+    expectSame([item('fssai_licence').scans.length, item('fssai_licence').voided_scans.length, item('fssai_licence').held],
+      [1, 1, true], 'record 1: ONE live copy, the voided scan kept apart (never a copy)');
+    expectTrue(item('medical').problems.some((p) => /Mallesh Yadav/.test(p) && /MISSING|missing|none/i.test(p)),
+      `record 6 NAMES the handler with no certificate: "${(item('medical').problems[0] || '').slice(0, 120)}"`);
+    expectSame([item('cooking_temps').status, item('waste').status], ['present', 'present'], 'record 11 (a cooking reading) and record 14 (a handover today) are PRESENT');
+    const r11 = JSON.stringify(item('cooking_temps').tables);
+    expectTrue(r11.includes('On schedule') && r11.includes('0 of 240') && !/"Dal batch[^"]*","[^"]*In range/.test(r11),
+      'the cooling batch’s first reading reads "On schedule", "0 of 240" — the same words as Reports');
+    expect(AF_SCANS.loadScanImages(db, [lic.att, VOIDED]).has(VOIDED), false, 'loadScanImages refuses the voided scan (it is never drawn)');
+
+    signIn(STAFF);
+    expect((await call(AF_PDF, 'GET', '/api/fssai/audit-file/pdf')).status, 403, 'staff cannot download the audit file');
+    signIn(MANAGER);
+    const hand = await call(AF_PDF, 'GET', '/api/fssai/audit-file/pdf?copy=handover&days=30');
+    const words = AFL.auditFileHoldsWords(j);
+    const ht = flat(pdfTextOf(hand.buf));
+    expectSame([hand.status, hand.headers.get('content-type'), hand.headers.get('x-audit-file-records')], [200, 'application/pdf', `${j.handover.count}/20`],
+      'the handover copy is a PDF whose header says how many of the 20 it holds');
+    expectTrue(ht.includes(flat(words)), `and the PDF itself says so: "${words}"`);
+    expectSame([j.pdf.holds_words, j.handover.count < 20], [words, true], 'the page promises the same sentence, and it is NOT "all 20"');
+    expectSame([/MANAGEMENT COPY/.test(ht), /\bMISSING\b/.test(ht), /VOID —/.test(ht), ht.includes('GST certificate by mistake'), ht.includes('Mallesh')],
+      [false, false, false, false, false], 'the handover copy carries no management band, no MISSING, no voided scan, no gap naming a person');
+    expectTrue(ht.includes('FSSAI licence') && ht.includes('Waste disposal record'), 'it does carry the records that are on file');
+    const leftOut = j.items.filter((i) => !i.held).map((i) => i.title);
+    expectSame(leftOut.filter((t) => ht.includes(t)), [], `none of the ${leftOut.length} records it does NOT hold is printed in it, not even by title`);
+    expectSame([/days with no handover/i.test(ht), /with no receipt or vehicle/i.test(ht)], [false, false], 'figures that only measure a gap (management-only) are not printed');
+
+    const mgmt = await call(AF_PDF, 'GET', '/api/fssai/audit-file/pdf?copy=readiness&days=30');
+    const mt = flat(pdfTextOf(mgmt.buf));
+    /* FSSAI_TESTS_DUMP=<dir> keeps both PDFs and their extracted text, to read a failure. */
+    if (process.env.FSSAI_TESTS_DUMP) {
+      fs.writeFileSync(path.join(process.env.FSSAI_TESTS_DUMP, 'audit-handover.pdf'), hand.buf);
+      fs.writeFileSync(path.join(process.env.FSSAI_TESTS_DUMP, 'audit-readiness.pdf'), mgmt.buf);
+      fs.writeFileSync(path.join(process.env.FSSAI_TESTS_DUMP, 'audit-handover.txt'), pdfTextOf(hand.buf));
+      fs.writeFileSync(path.join(process.env.FSSAI_TESTS_DUMP, 'audit-readiness.txt'), pdfTextOf(mgmt.buf));
+    }
+    expectSame([mgmt.status, /MANAGEMENT COPY — NOT FOR HANDING OVER/.test(mt), /\bMISSING\b/.test(mt)], [200, true, true], 'the management copy is marked as such and names the gaps');
+    expectTrue(/VOID — .*Photographed the GST certificate by mistake/.test(mt), 'and lists the voided scan, with its reason, as VOID');
+    expectTrue(mt.includes('Mallesh Yadav'), 'and names the food handler with no certificate');
+    expectTrue(/days with no handover/i.test(mt) && j.items.every((i) => mt.includes(i.title)), 'and carries the management-only figures and every one of the 20 records');
+  });
+
+  /* ─────────────────────────────────────────────────────────────────────── */
+  section(15, 'MISSED CHECKS ON WHATSAPP — DORMANT (bell only) with no approved template and no app secret');
+
+  const JOBS = lib('fssai-jobs.ts');
+  /** 07:00 IST today — after the 06:00 earliest hour, so the pass is due. */
+  const sevenIst = () => new Date(`${F.fssaiToday()}T07:00:00+05:30`);
+  /** A published checklist assigned daily to a person since last week, with nothing ever filed for it. */
+  function missedDaily(assignee) {
+    const t = mkRow('fssai_templates', { code: 'T-MISS-' + uid().slice(-6), name: 'Opening hygiene check', status: 'published', is_active: 1, frequency: 'daily', outlet_id: ROUTE_OUTLET });
+    const created = new Date(Date.now() - 8 * 86400000).toISOString().replace('T', ' ').slice(0, 19);
+    return mkRow('fssai_assignments', {
+      template_id: t.id, frequency: 'daily', assignee_email: assignee.email, is_active: 1, target_label: 'Main kitchen', shift: '',
+      next_due_date: F.addDaysISO(F.fssaiToday(), -7), created_at: created, outlet_id: ROUTE_OUTLET, department_id: '', responsible_role_id: '',
+    });
+  }
+  const noSecretEnv = () => {
+    const saved = {};
+    for (const k of ['WA_APP_SECRET', 'META_APP_SECRET', 'WHATSAPP_APP_SECRET']) { saved[k] = process.env[k]; delete process.env[k]; }
+    return () => { for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } };
+  };
+
+  await test('no template, no app secret: the BELL rings, WhatsApp is DORMANT, one notice row per person, and nothing leaves the machine', async () => {
+    const restore = noSecretEnv();
+    try {
+      const COOK = { ...STAFF, id: 'u-cook-wa', email: 'cookwa@fssai.test', name: 'Cook With Number', wa_mobile: '919848012345' };
+      seedUsers(COOK);
+      missedDaily(COOK);
+      const fetchBefore = FETCH.calls.length;
+      const ready = JOBS.fssaiMissedCheckWaReadiness(db);
+      expectSame([ready.ready, ready.skip_reason, ready.template_ok, ready.app_secret_present], [false, 'no_template', false, false], 'readiness: not ready — the first blocker is the template');
+      const bell = JOBS.runFssaiMissedCheckReminders(db, { now: sevenIst() });
+      expectSame([bell.outcome, bell.people.map((p) => p.email)], ['reminded', [COOK.email]], 'the bell rang for the person the check is assigned to');
+      expect(db.prepare(`SELECT COUNT(*) AS c FROM task_notifications WHERE recipient_email = ? AND kind = 'fssai_check_missed'`).get(COOK.email).c, 1, 'one bell notification for them');
+      const wa = await JOBS.runFssaiMissedCheckWhatsApp(db, bell);
+      expectSame([wa.outcome, wa.recipients, wa.dormant, wa.sent, wa.rows[0] && wa.rows[0].status, wa.rows[0] && wa.rows[0].skip_reason], ['dormant', 1, 1, 0, 'dormant', 'no_template'],
+        'WhatsApp is DORMANT for exactly the bell’s people');
+      const notice = db.prepare(`SELECT status, skip_reason, template_name, job_key FROM fssai_job_notices WHERE recipient_email = ?`).all(COOK.email);
+      expectSame(notice, [{ status: 'dormant', skip_reason: 'no_template', template_name: '', job_key: 'missed_checks' }], 'the dormant day is written down: one row, no template "used"');
+      expect(FETCH.calls.length - fetchBefore, 0, 'network calls caught by the tripwire');
+      const again = await JOBS.runFssaiMissedCheckWhatsApp(db, bell);
+      expectSame([again.already_claimed, db.prepare('SELECT COUNT(*) AS c FROM fssai_job_notices').get().c], [1, 1], 'a second pass of the same day finds the row and adds nothing');
+    } finally { restore(); }
+  });
+
+  await test('an APPROVED template is not enough: with no Meta app secret it stays dormant (no_app_secret), and still sends nothing', async () => {
+    const restore = noSecretEnv();
+    try {
+      const COOK = { ...STAFF, id: 'u-cook-wa2', email: 'cookwa2@fssai.test', name: 'Second Cook', wa_mobile: '919848054321' };
+      seedUsers(COOK);
+      missedDaily(COOK);
+      const cols = db.prepare(`SELECT name FROM pragma_table_xinfo('whatsapp_templates')`).all().map((c) => c.name);
+      const row = { id: uid(), name: JOBS.FSSAI_MISSED_WA_TEMPLATE, body: 'Food-safety checks not recorded on {{1}}: {{2}} check(s) — {{3}}. Please record them.', language: 'en', category: 'utility' };
+      if (cols.includes('meta_status')) row.meta_status = 'approved';
+      const keys = Object.keys(row).filter((k) => cols.includes(k));
+      db.prepare(`INSERT INTO whatsapp_templates (${keys.map(ident).join(', ')}) VALUES (${keys.map(() => '?').join(', ')})`).run(...keys.map((k) => row[k]));
+      const fetchBefore = FETCH.calls.length;
+      const ready = JOBS.fssaiMissedCheckWaReadiness(db);
+      expectSame([ready.template_status, ready.app_secret_present, ready.ready, ready.skip_reason], ['approved', false, false, 'no_app_secret'],
+        'readiness: the template is approved, the secret is absent → not ready (no_app_secret)');
+      const bell = JOBS.runFssaiMissedCheckReminders(db, { now: sevenIst() });
+      const wa = await JOBS.runFssaiMissedCheckWhatsApp(db, bell);
+      expectSame([wa.outcome, wa.sent, wa.rows[0] && wa.rows[0].skip_reason], ['dormant', 0, 'no_app_secret'], 'still dormant, bell only');
+      expect(FETCH.calls.length - fetchBefore, 0, 'network calls caught by the tripwire');
+      await new Promise((res) => setImmediate(res));   // the bell's push is fire-and-forget after the commit
+      expectTrue(PUSHES.some((p) => p.email === COOK.email), 'the bell’s web push went to the same person (stubbed here, so it reaches no phone)');
+    } finally { restore(); }
+  });
+
+  await test('static: the WhatsApp leg sends ONLY through the approved-template path — no free-text send exists in fssai-jobs.ts', () => {
+    const src = fs.readFileSync(path.join(SRC, 'lib', 'fssai-jobs.ts'), 'utf8');
+    const sends = [...src.matchAll(/\b(send[A-Za-z]*WhatsApp[A-Za-z]*|sendWa[A-Za-z]*|sendText[A-Za-z]*)\s*\(/g)].map((m) => m[1]);
+    expectSame([...new Set(sends)], ['sendWhatsAppTemplate'], 'the only WhatsApp send called');
+  });
+
 
   /* ── summary ─────────────────────────────────────────────────────────────── */
   console.log(`\n${pass} passed · ${fail} failed`);
