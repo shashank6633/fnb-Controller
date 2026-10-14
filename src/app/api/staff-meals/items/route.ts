@@ -159,6 +159,7 @@
  * gate is unchanged and predates the cutover.
  */
 import { getDb, generateId } from '@/lib/db';
+import { getCurrentUser } from '@/lib/auth';
 import { lineFactor } from '@/lib/issue-stock';
 // `purchasePrice` is the DISPLAY-basis lift Rs/recipe-unit -> Rs/purchase-unit.
 // Aliased because the loop below already owns a local named purchasePrice, and
@@ -309,6 +310,15 @@ export async function GET(request: Request) {
 // POST: Issue items (deducts from inventory)
 export async function POST(request: Request) {
   try {
+    // THE RESPONSIBLE USER, FROM THE SESSION — postDeptLedger refuses a blank
+    // one ("a responsible user is required"), so without this every DEPARTMENT
+    // issue 500'd and rolled the whole batch back. Read here, before the
+    // synchronous transaction, and never from the body: the body is the
+    // caller's to write. /api/staff-meals is session-gated by src/proxy.ts; the
+    // `system:` fallback is the honest label if a session is ever missing, and
+    // it reads as a machine actor on the register rather than a blank.
+    // Only the department rail takes it; the central branch is unchanged.
+    const itemActor = String((await getCurrentUser())?.email || '').trim() || 'system:staff-meal';
     const db = getDb();
     const body = await request.json();
     const { items, deduct_inventory } = body;
@@ -693,6 +703,10 @@ export async function POST(request: Request) {
               referenceId: item.meal_id,
               source: 'staff-meals/items:POST',
               notes: `Staff meal ${item.meal_id} — ${item.item_name} (${fmt(issuedQuantity)} ${lineUnit})`,
+              // Required by postDeptLedger. Its throw fires AFTER the
+              // staff_meal_items INSERT above, so a missing user took every
+              // other line of the batch down with it.
+              user: itemActor,
             });
           } else {
             // CENTRAL branch — unchanged, on purpose.
@@ -747,6 +761,9 @@ export async function POST(request: Request) {
 // PATCH: Record returns (restores unused to inventory)
 export async function PATCH(request: Request) {
   try {
+    // The responsible user, from the SESSION — see POST. A department return
+    // posts through postDeptLedger and failed the same way.
+    const itemActor = String((await getCurrentUser())?.email || '').trim() || 'system:staff-meal';
     const db = getDb();
     const body = await request.json();
     const { returns, restore_inventory } = body;
@@ -831,6 +848,8 @@ export async function PATCH(request: Request) {
               referenceId: item.meal_id,
               source: 'staff-meals/items:PATCH',
               notes: `Staff meal ${item.meal_id} — ${item.item_name} returned unused (${fmt(returnedQty)} ${item.unit})`,
+              // Required by postDeptLedger; see POST.
+              user: itemActor,
             });
           } else {
             // CENTRAL branch — unchanged. Carries the same line-unit-vs-recipe-unit
@@ -864,6 +883,9 @@ export async function PATCH(request: Request) {
 
 export async function DELETE(request: Request) {
   try {
+    // The responsible user, from the SESSION — see POST. Restoring a deleted
+    // department line posts through postDeptLedger and failed the same way.
+    const itemActor = String((await getCurrentUser())?.email || '').trim() || 'system:staff-meal';
     const db = getDb();
     const url = new URL(request.url);
     const id = url.searchParams.get('id');
@@ -910,6 +932,8 @@ export async function DELETE(request: Request) {
             referenceId: item.meal_id,
             source: 'staff-meals/items:DELETE',
             notes: `Staff meal item deleted — restored to ${move.departmentName} (${fmt(netRemoved)} ${item.unit})`,
+            // Required by postDeptLedger; see POST.
+            user: itemActor,
           });
         } else {
           // CENTRAL branch — unchanged, including its line-unit bug (see POST).

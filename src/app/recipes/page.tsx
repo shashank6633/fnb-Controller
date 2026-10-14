@@ -47,7 +47,13 @@ import { hydrateUnitRegistry } from '@/lib/recipe-cost';
 // carve-out declared in the pack-units header: a sub-recipe is batch-produced in
 // bulk, so the chef reasons in kg / L / BTL, not in grams. Display + entry only —
 // nothing stored or costed changes. Never re-derive the pack rule locally.
-import { packFactor, toPurchaseQty, purchasePrice, fmtQtyNum, type PackMeta } from '@/lib/pack-units';
+import { packFactor, toPurchaseQty, fmtQtyNum, type PackMeta } from '@/lib/pack-units';
+// …but the RATE on a sub-recipe line is never derived here: it is the
+// closing-valuation figure the server served, so it matches /closing-stock.
+import {
+  servedRate, hasBasis, rateSourceLabel, rateTitle, buildRateIndex,
+  type ServedRateFields, type ValuedRate,
+} from './sub-recipe-rate';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -71,6 +77,11 @@ interface Ingredient {
   material_unit?: string;
   purchase_unit?: string;
   pack_size?: number;
+  // ₹/PURCHASE-unit rate /api/sub-recipes resolves through closing-valuation
+  // (rate_per_purchase_unit / rate_source / rate_as_of). Sub-recipe rows only.
+  rate_per_purchase_unit?: ServedRateFields['rate_per_purchase_unit'];
+  rate_source?: ServedRateFields['rate_source'];
+  rate_as_of?: ServedRateFields['rate_as_of'];
 }
 
 interface SubRecipeRef {
@@ -378,8 +389,10 @@ function subLineDisplay(ing: Ingredient, mat?: RawMaterial) {
     purchaseUnit,
     hint,
     title: `As entered: ${entered} · recipe basis: ${fmtQtyNum(qtyRecipe)} ${matUnit}`,
-    /** ₹/purchase-unit — display only. Line cost still runs off ₹/recipe-unit. */
-    rate: purchasePrice(price, meta),
+    /** ₹/purchase-unit as /closing-stock values it (the row's served figure —
+     *  never average_price × pack). null = none served. Display only: line cost
+     *  still runs off ₹/recipe-unit. */
+    rate: servedRate(ing),
     qtyPurchase: toPurchaseQty(qtyRecipe, meta),
     effCost: computeIngredientCost({
       ...ing,
@@ -685,6 +698,26 @@ export default function RecipesPage() {
       console.error('Failed to fetch materials', e);
     }
   }, []);
+
+  // ₹/PURCHASE-unit rates for the SUB-RECIPE editor's picker and freshly added
+  // lines, which have no /api/sub-recipes row to carry one yet. Same
+  // closing-valuation ladder (see ./sub-recipe-rate.ts). Fetched each time the
+  // editor opens — never on page load, so the main-recipe screens are untouched.
+  // A failed fetch leaves those cells as an em-dash, never the naive figure.
+  const [valuationCatalog, setValuationCatalog] = useState<Record<string, ServedRateFields> | null>(null);
+  useEffect(() => {
+    if (!showSubRecipeModal) return;
+    let cancelled = false;
+    fetch('/api/closing-stock/rates')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => { if (!cancelled && d?.rates) setValuationCatalog(d.rates); })
+      .catch((e) => console.error('Failed to fetch material rates', e));
+    return () => { cancelled = true; };
+  }, [showSubRecipeModal]);
+  const subRateByMaterial = useMemo(
+    () => buildRateIndex(subRecipes, valuationCatalog),
+    [subRecipes, valuationCatalog],
+  );
 
   const fetchMenuItems = useCallback(async () => {
     try {
@@ -2145,11 +2178,16 @@ export default function RecipesPage() {
     const purchaseBasis = opts?.purchaseBasis === true;
     return list.map((ing, idx) => {
       const rowMat = purchaseBasis ? materials.find((m) => m.id === ing.material_id) : undefined;
-      // Rate is what the chef is buying at — ₹/purchase-unit. Display only:
-      // the cost beside it still comes from computeIngredientCost, which runs
-      // ₹/recipe-unit exactly like the server engine.
+      // Rate is what the chef is buying at — ₹/purchase-unit, the closing-
+      // valuation figure /closing-stock values this material at (never
+      // average_price × pack). Display only: the cost beside it still comes from
+      // computeIngredientCost, which runs ₹/recipe-unit exactly like the server.
+      const rowValued = rowMat ? subRateByMaterial.get(rowMat.id) : undefined;
+      const rowPu = rowMat ? (rowMat.purchase_unit || rowMat.unit) : '';
       const rowRate = rowMat
-        ? `${formatCurrency(purchasePrice(rowMat.average_price || 0, rowMat))}/${rowMat.purchase_unit || rowMat.unit}`
+        ? (hasBasis(rowValued)
+            ? `${formatCurrency(rowValued.rate)}/${rowPu}${rateSourceLabel(rowValued) ? ` · ${rateSourceLabel(rowValued)}` : ''}`
+            : `—/${rowPu}`)
         : null;
       return (
       <div key={idx} className="grid grid-cols-12 gap-2 items-end mb-2">
@@ -2160,6 +2198,7 @@ export default function RecipesPage() {
             value={ing.material_id}
             materials={materials}
             purchaseBasis={purchaseBasis}
+            rates={purchaseBasis ? subRateByMaterial : undefined}
             onChange={(id) => {
               // Auto-set the recipe unit to the material's stock unit (the
               // unit recipes are denominated in for that material). Saves the
@@ -2187,7 +2226,7 @@ export default function RecipesPage() {
             }}
           />
           {purchaseBasis && rowRate && (
-            <div className="text-[9px] text-[#B8A590] mt-0.5 truncate">{rowRate}</div>
+            <div className="text-[9px] text-[#B8A590] mt-0.5 truncate" title={rateTitle(rowValued ?? null, rowPu)}>{rowRate}</div>
           )}
         </div>
         {/* Qty */}
@@ -2665,9 +2704,18 @@ export default function RecipesPage() {
                         <td className="py-2 px-2 text-[#8B7355]">{d.purchaseUnit}</td>
                         <td className="py-2 px-2 text-right text-[#6B5744]">{ing.yield_percent}%</td>
                         <td className="py-2 px-2 text-right text-[#6B5744]">{ing.wastage_percent}%</td>
-                        <td className="py-2 px-2 text-right text-[#6B5744] tabular-nums">
-                          {formatCurrency(d.rate)}
-                          <span className="text-[9px] text-[#B8A590]">/{d.purchaseUnit}</span>
+                        <td className="py-2 px-2 text-right text-[#6B5744] tabular-nums" title={rateTitle(d.rate, d.purchaseUnit)}>
+                          {hasBasis(d.rate) ? (
+                            <>
+                              {formatCurrency(d.rate.rate)}
+                              <span className="text-[9px] text-[#B8A590]">/{d.purchaseUnit}</span>
+                              {rateSourceLabel(d.rate) && (
+                                <div className="text-[9px] text-[#B8A590]">{rateSourceLabel(d.rate)}</div>
+                              )}
+                            </>
+                          ) : (
+                            <span className="text-[#B8A590]">—</span>
+                          )}
                         </td>
                         <td className="py-2 px-2 text-right font-medium text-[#2D1B0E] tabular-nums">{formatCurrency(d.effCost)}</td>
                       </tr>
@@ -5871,6 +5919,7 @@ function MaterialPicker({
   materials,
   onChange,
   purchaseBasis = false,
+  rates,
 }: {
   value: string;
   materials: Array<{ id: string; name: string; unit: string; average_price: number; sku?: string; category?: string;
@@ -5878,6 +5927,9 @@ function MaterialPicker({
   onChange: (id: string) => void;
   /** Sub-recipe rows: list the PURCHASE unit and ₹/purchase-unit, not ₹/g. */
   purchaseBasis?: boolean;
+  /** Purchase basis only: material_id → the closing-valuation ₹/purchase-unit
+   *  rate (./sub-recipe-rate.ts). Absent = em-dash, never a local derivation. */
+  rates?: Map<string, ValuedRate>;
 }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
@@ -6002,7 +6054,12 @@ function MaterialPicker({
             <div className="space-y-0.5">
               {filtered.length === 0 ? (
                 <div className="text-xs text-[#8B7355] text-center py-4">No matches</div>
-              ) : filtered.map(m => (
+              ) : filtered.map(m => {
+                // Purchase basis: ₹/purchase-unit (₹180/kg reads as a price;
+                // ₹0.18/g reads as a rounding error), and the closing-valuation
+                // figure — the one /closing-stock values this material at.
+                const valued = purchaseBasis ? rates?.get(m.id) : undefined;
+                return (
                 <button
                   type="button"
                   key={m.id}
@@ -6014,14 +6071,21 @@ function MaterialPicker({
                   <span className="text-[10px] text-[#6B5744] shrink-0">
                     {purchaseBasis ? (m.purchase_unit || m.unit) : m.unit}
                   </span>
+                  {purchaseBasis ? (
+                    <span
+                      className={`text-[10px] font-mono shrink-0 ${hasBasis(valued) ? 'text-[#6B5744]' : 'text-red-500'}`}
+                      title={rateTitle(valued ?? null, m.purchase_unit || m.unit)}
+                    >
+                      {hasBasis(valued) ? `₹${valued.rate.toFixed(2)}` : '—'}
+                    </span>
+                  ) : (
                   <span className={`text-[10px] font-mono shrink-0 ${m.average_price > 0 ? 'text-[#6B5744]' : 'text-red-500'}`}>
-                    {/* Purchase basis: ₹/purchase-unit (₹180/kg reads as a price;
-                        ₹0.18/g reads as a rounding error). purchasePrice() also
-                        tolerates a null average_price, which .toFixed() does not. */}
-                    ₹{(purchaseBasis ? purchasePrice(m.average_price, m) : m.average_price).toFixed(2)}
+                    ₹{m.average_price.toFixed(2)}
                   </span>
+                  )}
                 </button>
-              ))}
+                );
+              })}
             </div>
           </div>
         </>,

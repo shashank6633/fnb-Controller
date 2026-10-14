@@ -1,12 +1,33 @@
 import { getDb } from '@/lib/db';
-import { getCurrentUser, canApproveTableOp } from '@/lib/auth';
+import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
+import { canDownloadBillCopy, BILL_COPY_REFUSED_MESSAGE } from '@/lib/bill-copy-access';
 import { buildBillPdf } from '@/lib/bill-pdf';
 
 /**
  * GET /api/dine-in/orders/[id]/bill-pdf — download a digital copy of the bill as
  * an 80mm PDF, identical to the printed thermal bill (same computeBill + the same
  * bill_design branding). For open orders it's a provisional bill; for settled
- * orders it's stamped DUPLICATE BILL (a reprint). Cashier / manager / admin.
+ * orders it's stamped DUPLICATE BILL (a reprint).
+ *
+ * THE GATE: canDownloadBillCopy() — Cashier, manager or admin; plain staff are
+ * refused. See src/lib/bill-copy-access.ts. It is production's own
+ * canApproveTableOp() (admin / manager tier, or the role named 'Cashier') OR
+ * settle-authority's tillCapable() (staff whose explicit page map grants
+ * '/cashier' — the people who may close the bill, and the only staff the
+ * Bills-on-Hold "Download / reprint" link is ever shown to). A NULL page map is
+ * NOT a grant here. canApproveTableOp itself is unchanged — its other callers
+ * (service-charge waiver, discount approval, transfer/merge, discount requests)
+ * are money and authority decisions that must stay tight.
+ *
+ * THE OUTLET SCOPE: the lookup below carries the SAME predicate the order LIST
+ * uses — `(o.outlet_id = ? OR o.outlet_id IS NULL)` from getCurrentOutletId()
+ * (api/dine-in/orders/route.ts) — so this endpoint hands back a copy of a bill
+ * the caller can already see on their own screen, and nothing else. Without it
+ * a till user pinned to one outlet could pull another outlet's bill (a guest
+ * name, a mobile number and a total) by id. An out-of-outlet id answers 'Order
+ * not found' (404), deliberately identical to an unknown id, so the route is no
+ * oracle for which ids exist elsewhere. An admin who needs another outlet's
+ * bill switches outlet, exactly as they must to see it in any list.
  */
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -15,15 +36,19 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
   try {
     const me = await getCurrentUser();
     if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-    if (!canApproveTableOp(me)) return Response.json({ error: 'Cashier, manager or admin required' }, { status: 403 });
+    if (!canDownloadBillCopy(me)) return Response.json({ error: BILL_COPY_REFUSED_MESSAGE }, { status: 403 });
     const { id } = await params;
     const db = getDb();
+    // Same outlet scope as the order list this copy is taken from. `outletId` is
+    // passed even when it resolves null, exactly as the list route passes it, so
+    // the two surfaces can never disagree about what is visible.
+    const outletId = await getCurrentOutletId();
 
     const order = db.prepare(`
       SELECT o.*, t.table_number, t.zone
       FROM orders o LEFT JOIN restaurant_tables t ON o.table_id = t.id
-      WHERE o.id = ?
-    `).get(id) as any;
+      WHERE o.id = ? AND (o.outlet_id = ? OR o.outlet_id IS NULL)
+    `).get(id, outletId) as any;
     if (!order) return Response.json({ error: 'Order not found' }, { status: 404 });
     if (order.status === 'void' || order.status === 'merged') {
       return Response.json({ error: `This order was ${order.status} — no bill` }, { status: 409 });

@@ -76,15 +76,55 @@ export function buildBillPdf(
   const W = 226;                       // 80mm
   const M = 10;                        // margin
   const CW = W - M * 2;                // content width
-  const height = 300 + items.length * 26 + (design.footerNote ? 60 : 0);
-  const doc = new PDFDocument({ size: [W, height], margins: { top: M, bottom: M, left: M, right: M } });
 
-  const chunks: Buffer[] = [];
-  const done = new Promise<Buffer>((resolve, reject) => {
-    doc.on('data', (c: Buffer) => chunks.push(c));
-    doc.on('end', () => resolve(Buffer.concat(chunks)));
-    doc.on('error', reject);
-  });
+  const newDoc = (h: number) =>
+    new PDFDocument({ size: [W, h], margins: { top: M, bottom: M, left: M, right: M } });
+  type Doc = ReturnType<typeof newDoc>;
+
+  // THE TWO DATE STRINGS ARE RENDERED ONCE, not per pass (see the measure pass
+  // below). istDateTime() with no argument reads the clock, so computing it
+  // inside the drawing would let the measure pass and the render pass disagree
+  // if the minute ticked between them.
+  const billDate = istDateTime(order.settled_at || order.created_at);
+  const printedOn = istDateTime();
+
+  // One line per tender (split payments itemise cash/upi/…); fall back to the
+  // single payment_method for non-split settlements. Hoisted out of the drawing
+  // so the measure pass and the render pass see the identical list.
+  const tenders = meta.payments && meta.payments.length
+    ? meta.payments
+    : (order.payment_method && order.payment_method !== 'split' ? [{ method: order.payment_method, amount: grand }] : []);
+
+  /**
+   * ── ONE PAGE, SIZED TO ITS CONTENT — WHY THIS IS RENDERED TWICE ──────────
+   *
+   * The owner's requirement (approved 2026-10-14): the bill PDF is one page,
+   * trimmed to its measured length, with the same content. A thermal receipt
+   * has no natural page count: the page IS the roll, so one page means one
+   * page sized to its own contents.
+   *
+   * This used to be a GUESS: `height = 300 + items.length * 26 + (footer?60:0)`.
+   * pdfkit adds a page BY ITSELF the moment text passes
+   * `page.height - margins.bottom` (there is no addPage() here to grep for), so
+   * a guess that came up short shipped as a second page, and one that came up
+   * long shipped as blank paper. MEASURED on the guessed height (2026-10-14,
+   * same inputs through both versions of this file):
+   *   · 1 item + service charge + discount + 2 tenders → 2 pages of 326pt
+   *   · the same 1 item with the Bill Design branding fields filled → 2 pages
+   *   · a 40-item open bill → 1 page of 1,400pt holding 927pt of content
+   *   · the live database's settled / held / open bills → 1 page, 55-96pt of
+   *     blank paper under the last line
+   *
+   * So the height is MEASURED instead of budgeted: draw() runs once on a page
+   * tall enough that nothing overflows, doc.y afterwards is the true bottom of
+   * the content, and the delivered document is drawn again at exactly that
+   * height. Identical inputs and the identical draw(), so the second pass
+   * draws the same strings in the same fonts at the same x positions (proved
+   * call-for-call against the guessed-height version) — only the page height
+   * changes, and a wrapped header line makes the page taller, never a second
+   * page.
+   */
+  const draw = (doc: Doc) => {
 
   const center = (t: string, size = 8, bold = false) => {
     doc.font(bold ? 'Helvetica-Bold' : 'Helvetica').fontSize(size).text(t, M, doc.y, { width: CW, align: 'center' });
@@ -116,7 +156,7 @@ export function buildBillPdf(
 
   doc.font('Helvetica').fontSize(8);
   doc.text('Order No:' + (order.order_number ?? '—'), M, doc.y); doc.moveDown(0.2);
-  doc.text('Date:' + istDateTime(order.settled_at || order.created_at), M, doc.y); doc.moveDown(0.2);
+  doc.text('Date:' + billDate, M, doc.y); doc.moveDown(0.2);
   if (order.server_name) { doc.text('Captain Name:' + order.server_name, M, doc.y); doc.moveDown(0.2); }
   // Guest details (QR self-order details page / captain-entered) — printed for
   // the cashier's reference on unpaid/hold bills.
@@ -161,19 +201,60 @@ export function buildBillPdf(
   row('TOTAL', rs(bill.total), 8);
   doc.moveDown(0.2);
   row('GRAND TOTAL', rs(grand), 10, true);
-  // One line per tender (split payments itemise cash/upi/…); fall back to the
-  // single payment_method for non-split settlements.
-  const tenders = meta.payments && meta.payments.length
-    ? meta.payments
-    : (order.payment_method && order.payment_method !== 'split' ? [{ method: order.payment_method, amount: grand }] : []);
   for (const t of tenders) row('- ' + String(t.method).toUpperCase(), rs(t.amount), 9, true);
   rule();
 
   if (design.footerNote) { doc.moveDown(0.2); center(design.footerNote, 7.5); doc.moveDown(0.3); }
   doc.font('Helvetica').fontSize(7);
   if (meta.printedBy) { doc.text('Printed By:' + meta.printedBy, M, doc.y); doc.moveDown(0.15); }
-  doc.text('Printed on:' + istDateTime(), M, doc.y);
+  doc.text('Printed on:' + printedOn, M, doc.y);
 
+  };  // ── end draw()
+
+  /* ── PASS 1: MEASURE ───────────────────────────────────────────────────────
+   * Draw onto a page tall enough that nothing overflows, so doc.y at the end is
+   * the real content bottom rather than wherever an automatic page break left
+   * the cursor. The first bound is deliberately loose (1,500pt of chrome plus
+   * 90pt per item and 24pt per tender — a 44-char name wraps to at most ~4
+   * lines at 8pt), but it is CHECKED, never assumed: pdfkit emits 'pageAdded'
+   * when it breaks, and the constructor's own first page happens before the
+   * listener is attached, so any event here means the bound was too small and
+   * probe.y is not the content bottom. Then measure again at 4x the bound,
+   * until it fits. Only an unbounded settings field (an address or footer
+   * thousands of characters long) ever needs a retry; measuring documents are
+   * discarded and only the final cursor is used.
+   *
+   * The retries are CAPPED rather than open-ended so a pathological input fails
+   * loudly instead of looping: 4^7 x the first bound is over twenty-five million
+   * points. Running out throws — the route answers 500 — because handing back a
+   * paginated bill would break the one-page rule silently. */
+  let contentBottom = 0;
+  for (let attempt = 0, factor = 1; attempt < 8 && contentBottom === 0; attempt++, factor *= 4) {
+    const probe = newDoc(factor * (1500 + items.length * 90 + tenders.length * 24));
+    probe.on('data', () => {});        // drain, so nothing buffers for a reader that never comes
+    probe.on('error', () => {});       // a measure-pass error must not become an unhandled event
+    let overflowed = false;
+    probe.on('pageAdded', () => { overflowed = true; });
+    draw(probe);
+    contentBottom = overflowed ? 0 : probe.y;
+    probe.end();
+  }
+  if (!(contentBottom > 0)) throw new Error('Bill is too long to render on a single page');
+
+  /* ── PASS 2: RENDER at the measured height ────────────────────────────────
+   * +2 of slack under the bottom margin: pdfkit breaks a line when
+   * `y + lineHeight > page.height - margins.bottom`, and landing exactly on
+   * that boundary should not depend on float equality. */
+  const height = Math.max(60, Math.ceil(contentBottom + M + 2));
+
+  const doc = newDoc(height);
+  const chunks: Buffer[] = [];
+  const done = new Promise<Buffer>((resolve, reject) => {
+    doc.on('data', (c: Buffer) => chunks.push(c));
+    doc.on('end', () => resolve(Buffer.concat(chunks)));
+    doc.on('error', reject);
+  });
+  draw(doc);
   doc.end();
   return done;
 }

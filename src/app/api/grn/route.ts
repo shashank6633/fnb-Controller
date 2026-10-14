@@ -29,6 +29,17 @@ import { canonNameInput } from '@/lib/name-canon';
 import { MAX_PAISE, mayRecordPettyCash, outflowWarning, fmtRs } from '@/lib/petty-cash';
 import { canAccessPage } from '@/lib/page-catalog';
 import { todayIST } from '@/lib/format-date';
+// TAX ACTUALLY CHARGED — the inward register's two appended columns (see
+// REGISTER_HEADER). ONE module owns the arithmetic, the base and the
+// blank-never-zero rule, shared with /reports/purchases, the purchase log and
+// /reports/purchase-bill-summary, so the same bill cannot read 18.00% on one
+// report and 16.20% on another. Cess is NOT in the figure: it is charged on the
+// GROSS line value and GST on the post-discount value, so no single percentage
+// can cover both — see src/lib/tax-applied.ts.
+import {
+  TAX_VALUE_CSV_HEADER, TAX_PERCENT_CSV_HEADER,
+  gstValue, taxAppliedPercent, taxCsvNumber,
+} from '@/lib/tax-applied';
 
 /**
  * GRN read API. Listing + detail.
@@ -230,7 +241,7 @@ const csvCell = (v: any): string => {
   return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 };
 
-/** The Inward Register column order. THE SAME 27 HEADINGS, IN THE SAME ORDER,
+/** The Inward Register column order. THE SAME 29 HEADINGS, IN THE SAME ORDER,
  *  as the client-side bulk export at src/app/grn/page.tsx — keep the two in
  *  step: two "inward register" files that disagree about column order are worse
  *  than one. COMPENSATION CESS sits between SGST and SPECIAL EXCISE CESS (the
@@ -242,10 +253,29 @@ const csvCell = (v: any): string => {
  *  on STATUS or SUPPLIER: status is what happened to the receipt, bill type is
  *  what kind of document it is, and one cell cannot carry both without losing
  *  one of them to the reader. */
+/*  TAX VALUE (GST) IS THE 28TH AND TAX % APPLIED (GST) THE 29TH, both APPENDED
+ *  for the same reason BILL TYPE was: the 27 ahead of them sit in filed sheets
+ *  and formulas point at them. The owner's "Ship B" ruling (98e1be7): tax
+ *  columns on TRANSACTION reports, and this register is one.
+ *
+ *  BOTH ARE DERIVED FROM COLUMNS ALREADY ON THE ROW — Tax Value is CGST + SGST,
+ *  and Tax % Applied is that pair over (SUBTOTAL − DISCOUNT), the base GST is
+ *  charged on. That is WHY they are appended rather than slotted beside CGST:
+ *  TOTAL INWARD AMOUNT is footable from the columns to its left, and a
+ *  duplicate rupee column inside that run would let a reader adding across the
+ *  row count GST twice. After the total they read as a restatement.
+ *
+ *  TAX % APPLIED IS A BLANK, NEVER 0%, when the line recorded no GST (its Tax
+ *  Value then reads 0, exactly as its CGST and SGST do). The arithmetic
+ *  and the headings come from src/lib/tax-applied.ts, the same module
+ *  /reports/purchases, /reports/purchase-bill-summary and the purchase log use,
+ *  so a figure on this file and the same figure on those reports cannot round
+ *  differently. Kept byte-identical to the /grn page's own bulk export. */
 const REGISTER_HEADER = ['GRN No.', 'INVOICE ID', 'INWARD DATE', 'SUPPLIER NAME', 'CATEGORY NAME', 'ITEM NAME',
   'PO QTY', 'INWARD QTY', 'PURCHASE UNIT', 'RATE', 'SUBTOTAL', 'DISCOUNT', 'CGST', 'SGST',
   'COMPENSATION CESS', 'SPECIAL EXCISE CESS', 'TCS', 'DELIVERY CHARGES', 'MRP ROUND OFF', 'TOTAL INWARD AMOUNT',
-  'ACCEPTED QTY', 'REJECTED QTY', 'REJECT REASON', 'STATUS', 'RECEIVED BY', 'INVOICE DATE', 'BILL TYPE'];
+  'ACCEPTED QTY', 'REJECTED QTY', 'REJECT REASON', 'STATUS', 'RECEIVED BY', 'INVOICE DATE', 'BILL TYPE',
+  TAX_VALUE_CSV_HEADER, TAX_PERCENT_CSV_HEADER];
 
 /** Same field order as REGISTER_HEADER, against a row of the register query. */
 const registerRow = (r: any) => [
@@ -254,6 +284,11 @@ const registerRow = (r: any) => [
   r.compensation_cess, r.special_excise_cess, r.tcs, r.delivery_charges, r.mrp_round_off, r.total_inward_amount,
   r.quantity_accepted, r.quantity_rejected, r.rejection_reason, r.status, r.received_by, r.invoice_date,
   r.bill_type,
+  // The 28th and 29th. Derived from this row's own cgst/sgst and its
+  // subtotal − discount by the shared helper; the percentage is '' (never 0)
+  // when no GST was recorded on the line.
+  taxCsvNumber(gstValue(r)),
+  taxCsvNumber(taxAppliedPercent(r)),
 ];
 
 /* ── DIRECT vs AGAINST PO ────────────────────────────────────────────────────
@@ -500,7 +535,13 @@ export async function GET(request: Request) {
       // JS, no Blob and no second copy of the column order to keep in step.
       // The JSON shape is unchanged for every caller that does not ask for csv.
       if (String(url.searchParams.get('format') || '').toLowerCase() === 'csv') {
-        const lines = [REGISTER_HEADER.join(',')];
+        // THE HEADING ROW IS ESCAPED WITH THE SAME csvCell THE DATA ROWS USE.
+        // The two tax headings are sentences that contain commas (they name the
+        // formula and the exclusions — see src/lib/tax-applied.ts); joined RAW
+        // they split into extra fields and every heading from TAX VALUE rightward
+        // slides off its own column. The 27 headings ahead of them contain no
+        // comma, quote or leading sign, so csvCell leaves each byte-identical.
+        const lines = [REGISTER_HEADER.map(csvCell).join(',')];
         for (const r of rows) lines.push(registerRow(r).map(csvCell).join(','));
         // Named off the GRN when it is one entry (that is the document's own
         // identity, and the number is what an auditor searches for), off the

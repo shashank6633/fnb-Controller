@@ -441,14 +441,35 @@ export async function POST(request: Request) {
     const cgstAmt = cgstPaise / 100;
     const sgstAmt = sgstPaise / 100;
 
-    // Compensation cess rides the SAME post-discount `taxable`, in the same
-    // whole paise — and there the similarity ends. It is ONE figure, never
-    // halved into a CGST/SGST pair, and it is deliberately kept OUT of
-    // cgstAmt/sgstAmt: the house invariant tax_value = cgst + sgst is a
-    // statement about GST alone, and folding cess into it would overstate the
-    // GST claimed on a return. Readers pick cess up as its own Total Inward
-    // term, exactly like the other recorded-only charges.
-    const cessPaise = cessRate > 0 ? Math.max(0, Math.round(taxable * cessRate)) : 0;
+    /* ── COMPENSATION CESS IS ON THE GROSS, NOT ON `taxable` ─────────────────
+     * THE OWNER'S RULING (2026-08-07, ff0f440), and the ONE line where this
+     * arithmetic deliberately diverges from the GST directly above it:
+     *   GST  → the POST-discount goods value  (`taxable`)
+     *   CESS → the GROSS line value, BEFORE the discount (`total_price`)
+     * On 10 kg @ ₹100 with a ₹100 discount that is GST 18% on ₹900 = ₹162 and
+     * cess 12% on ₹1,000 = ₹120. Do not "align" the two bases.
+     *
+     * THIS ROUTE WAS THE ONE THAT DID NOT FOLLOW IT. It charged the cess on
+     * `taxable` and so under-declared by 10% on that example — ₹108 where the
+     * ruling, api/grn/route.ts and purchase-orders/[id]/receive all give ₹120.
+     * Nothing stored is restated: no screen posts a cess_rate here (the bill
+     * form moved to /grn), and 0 stored purchases carry both a compensation
+     * cess and a discount.
+     *
+     * `total_price` is the GROSS here by construction: it is qty × unit_price,
+     * computed above, and `discountRecorded` is subtracted from it to make
+     * `taxable` rather than being inside it. On the other wire shape — the
+     * caller netted the discount into unit_price and sends none — total_price
+     * IS the only line value there is and the two bases coincide; a discount
+     * folded into a rate is no longer a discount this row can see.
+     *
+     * Everything else about the cess is unchanged: whole paise, floored at 0,
+     * ONE figure never halved into a CGST/SGST pair, and deliberately OUT of
+     * cgstAmt/sgstAmt — the house invariant tax_value = cgst + sgst is a
+     * statement about GST alone, and folding cess into it would overstate the
+     * GST claimed on a return. Readers pick cess up as its own Total Inward
+     * term, exactly like the other recorded-only charges. */
+    const cessPaise = cessRate > 0 ? Math.max(0, Math.round(total_price * cessRate)) : 0;
     const compensationCess = cessPaise / 100;
 
     // The client's own cgst/sgst are never stored. This row is the input-credit
@@ -618,8 +639,8 @@ export async function POST(request: Request) {
               // Both are 0 when no gst_rate was sent — an older client or the CSV
               // importer writes precisely the row it wrote before this field existed.
               cgstAmt, sgstAmt,
-              // Compensation cess, derived on the same base but NOT part of
-              // that invariant — one figure, no halves. 0 when no cess_rate
+              // Compensation cess, derived on the GROSS (pre-discount) value and
+              // NOT part of that invariant — one figure, no halves. 0 when no cess_rate
               // was sent, so an older client or the CSV importer writes
               // precisely the row it wrote before this column existed.
               compensationCess,
