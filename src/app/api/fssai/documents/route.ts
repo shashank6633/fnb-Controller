@@ -57,6 +57,10 @@ export const dynamic = 'force-dynamic';
 
 const LIST_LIMIT = 400;
 
+/** The FSSAI licence's doc_type (FSSAI_DOC_TYPES). If that key were ever renamed
+ *  the missing-licence warning would fire on every load — loud, never silent. */
+const FSSAI_LICENCE_TYPE = 'fssai_licence';
+
 const SELECT = `
   SELECT d.*,
          dep.name AS department_name,
@@ -320,9 +324,42 @@ export async function GET(request: Request) {
       counts[s] += 1;
     }
 
+    // THE FIRST PAPER AN INSPECTOR ASKS FOR. Worked out over every live row and
+    // NEVER over the filtered page: with the Kind filter on "Fire NOC" the
+    // licence must not look missing, and a missing licence must not hide behind
+    // a filter. Before this, nothing anywhere said when no licence was filed at
+    // all — the counts read "0 lapsed" and the screen looked healthy.
+    const licenceRows = db.prepare(
+      `SELECT id, title, reference_no, expiry_date, reminder_days
+         FROM fssai_documents
+        WHERE doc_type = ? AND is_active = 1 AND voided_at = ''`,
+    ).all(FSSAI_LICENCE_TYPE) as any[];
+    const licenceStates = licenceRows.map((r) => ({
+      id: String(r.id), title: str(r.title), reference_no: str(r.reference_no), expiry_date: str(r.expiry_date),
+      state: fssaiDocState(
+        str(r.expiry_date), today,
+        Number.isFinite(Number(r.reminder_days)) ? Number(r.reminder_days) : FSSAI_DOC_REMINDER_DAYS,
+      ),
+    }));
+    // The one to name on the screen: one still in force if there is one, the
+    // latest-expiring among those, else the most recently lapsed.
+    const inForce = licenceStates.filter((l) => l.state !== 'expired');
+    const pick = (inForce.length ? inForce : licenceStates)
+      .slice().sort((a, b) => (b.expiry_date || '9999-12-31').localeCompare(a.expiry_date || '9999-12-31'))[0] || null;
+    const licence = {
+      /** false = no live fssai_licence row at all. The screen's loudest warning. */
+      on_file: licenceStates.length > 0,
+      /** false when every licence on file has lapsed. */
+      in_force: inForce.length > 0,
+      current: pick
+        ? { ...pick, days_to_expiry: isISODate(pick.expiry_date) ? daysBetweenISO(today, pick.expiry_date) : null }
+        : null,
+    };
+
     return Response.json({
       documents: shaped,
       counts,
+      licence,
       doc_types: FSSAI_DOC_TYPES,
       states: FSSAI_DOC_STATES,
       default_reminder_days: FSSAI_DOC_REMINDER_DAYS,
@@ -528,8 +565,12 @@ export async function POST(request: Request) {
     }
 
     if (action === 'remove_file') {
+      // The scan must be on THIS document — dropP6AttachmentImage refuses one
+      // from any other record or register, and only allows a 24-hour correction
+      // (decision and rules documented there).
       const out = db.transaction(() => dropP6AttachmentImage(db, {
-        id: str(body.attachment_id), reason: str(body.reason), me: me as any, outlet_id: outletId,
+        id: str(body.attachment_id), entity_table: 'fssai_documents', entity_id: id,
+        reason: str(body.reason), me: me as any, outlet_id: outletId,
       }))();
       if ('error' in out) return Response.json({ error: out.error }, { status: out.status });
       return Response.json({ removed: out.dropped });

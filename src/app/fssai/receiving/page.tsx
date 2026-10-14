@@ -62,6 +62,18 @@ interface Check {
   remarks: string; checked_by: string; checked_name: string;
   verified_by: string; verify_note: string;
   voided_by: string; void_reason: string; photo_count: number;
+  /** Present only when the approved-vendor register has something to say. */
+  vendor_warning?: VendorWarning;
+}
+
+/** From /api/fssai/receiving — the approved-vendor register's warning. It never
+ *  blocks anything; it is absent when there is nothing to say. */
+interface VendorWarning {
+  vendor_id: string; vendor_name: string;
+  codes: Array<'not_approved' | 'licence_expired'>;
+  approval_label: string; approval_by: string; approval_at: string; approval_note: string;
+  licence_no: string; licence_expiry: string; on_date: string;
+  message: string; never_blocks: string;
 }
 
 interface Line {
@@ -101,7 +113,7 @@ export default function FssaiReceivingPage() {
   const [toast, setToast] = useState<string | null>(null);
 
   /* the open record */
-  const [detail, setDetail] = useState<{ check: Check; lines: Line[]; preview: any; photos: any[]; vocab: any; no_stock_movement: string } | null>(null);
+  const [detail, setDetail] = useState<{ check: Check; lines: Line[]; preview: any; photos: any[]; vocab: any; no_stock_movement: string; vendor_warning?: VendorWarning } | null>(null);
   const [lineForm, setLineForm] = useState<any | null>(null);
   const [starting, setStarting] = useState<any | null>(null);
   const [voiding, setVoiding] = useState<Check | null>(null);
@@ -196,6 +208,7 @@ export default function FssaiReceivingPage() {
         invoice_number: pre.grn.invoice_number,
         received_at: pre.grn.time || '',
         note: pre.note,
+        vendor_warning: pre.vendor_warning || null,
       });
     } catch (e) {
       setToast(e instanceof Error ? e.message : 'Could not read that delivery');
@@ -266,6 +279,8 @@ export default function FssaiReceivingPage() {
             sure the remarks say what was done about it.
           </div>
         )}
+
+        {detail.vendor_warning && <VendorWarningBanner w={detail.vendor_warning} />}
 
         <div className="bg-[#FFF1E3] border border-[#E8D5C4] rounded-xl p-3">
           <div className="flex flex-nowrap items-start gap-2.5">
@@ -597,6 +612,7 @@ export default function FssaiReceivingPage() {
                 <div className="flex flex-wrap items-center gap-1.5">
                   <span className="text-[13px] font-semibold text-[#2D1B0E]">{g.grn_number || '(no number)'}</span>
                   <span className="text-[13px] text-[#6B5744]">{g.vendor_name}</span>
+                  {g.vendor_warning && <VendorWarningBadge w={g.vendor_warning} />}
                   <span className="ml-auto text-[11px] text-[#8B7355]">{g.date}{g.time ? ` ${g.time}` : ''} · {g.line_count} line{g.line_count === 1 ? '' : 's'}</span>
                 </div>
               </button>
@@ -662,6 +678,7 @@ export default function FssaiReceivingPage() {
                 <span className="px-1.5 py-0.5 rounded text-[11px] bg-[#FFF1E3] border border-[#E8D5C4] text-[#6B5744]">{c.status_label}</span>
                 {c.outcome === 'fail' && <span className="px-1.5 py-0.5 rounded text-[11px] bg-red-100 border border-red-200 text-red-700">{c.fail_count} failed</span>}
                 {c.supplier_licence_state === 'expired' && <span className="px-1.5 py-0.5 rounded text-[11px] bg-red-100 border border-red-200 text-red-700">Licence lapsed</span>}
+                {c.vendor_warning && <VendorWarningBadge w={c.vendor_warning} />}
                 <span className="ml-auto text-[11px] text-[#8B7355]">{c.business_date}{c.received_at ? ` ${c.received_at}` : ''}</span>
               </div>
               <p className="text-xs text-[#8B7355] mt-1">
@@ -681,6 +698,7 @@ export default function FssaiReceivingPage() {
         <Modal title={`Inspect ${starting.grn?.grn_number || 'this delivery'}`} onClose={() => setStarting(null)}>
           <div className="space-y-3">
             <p className="text-[13px] text-[#3D2614]">{starting.note}</p>
+            {starting.vendor_warning && <VendorWarningBanner w={starting.vendor_warning} />}
             <div className="rounded-lg border border-[#E8D5C4] bg-[#FFF8F0] p-2.5 text-[13px]">
               <p><strong>{starting.vendor_name}</strong></p>
               <p className="text-xs text-[#6B5744] mt-0.5">
@@ -714,7 +732,7 @@ export default function FssaiReceivingPage() {
             <button
               disabled={busy}
               onClick={async () => {
-                const j = await post({ action: 'create', ...starting, grn: undefined });
+                const j = await post({ action: 'create', ...starting, grn: undefined, vendor_warning: undefined });
                 if (j) { setStarting(null); await openOne(j.check.id); }
               }}
               className="w-full py-3 rounded-lg bg-[#af4408] text-white text-sm font-semibold disabled:opacity-50 inline-flex flex-nowrap items-center justify-center gap-2"
@@ -973,6 +991,31 @@ function Toast({ children }: { children: React.ReactNode }) {
     <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-[70] max-w-[92vw] sm:max-w-xl px-4 py-3 rounded-xl bg-[#2D1B0E] text-white text-sm shadow-xl">
       {children}
     </div>
+  );
+}
+
+/** The approved-vendor register's warning, in full. Amber, not red-and-locked:
+ *  it is a warning and the screen goes on working exactly as before. */
+function VendorWarningBanner({ w }: { w: VendorWarning }) {
+  return (
+    <div className="bg-amber-50 border border-amber-300 rounded-xl p-3 text-[13px] text-amber-950" role="alert">
+      <p><strong>Approved vendor list:</strong> {w.message}</p>
+      {w.codes.includes('not_approved') && (w.approval_by || w.approval_at) && (
+        <p className="text-xs text-amber-900 mt-1">
+          Marked {w.approval_label.toLowerCase()}{w.approval_by ? ` by ${w.approval_by}` : ''}{w.approval_at && Number.isFinite(Date.parse(w.approval_at)) ? ` on ${new Date(Date.parse(w.approval_at) + 5.5 * 3600_000).toISOString().slice(0, 10)}` : ''}.
+        </p>
+      )}
+      <p className="text-xs text-amber-900 mt-1">{w.never_blocks}</p>
+    </div>
+  );
+}
+
+function VendorWarningBadge({ w }: { w: VendorWarning }) {
+  const label = w.codes.includes('not_approved') && w.codes.includes('licence_expired')
+    ? 'Not approved · licence expired'
+    : w.codes.includes('not_approved') ? 'Vendor not approved' : 'Vendor licence expired';
+  return (
+    <span title={w.message} className="px-1.5 py-0.5 rounded text-[11px] bg-amber-100 border border-amber-300 text-amber-900">{label}</span>
   );
 }
 

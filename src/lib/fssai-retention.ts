@@ -12,29 +12,47 @@ import { FSSAI_PHOTO_RETENTION_MONTHS, fssaiBytesLabel } from '@/lib/fssai';
  *    then drop the IMAGE but KEEP the record, the fact a photo existed, and its
  *    digest. Never delete the record."
  *
- * ═══ ⚠️ THIS IS NOT ARMED. NOTHING CALLS IT ON A SCHEDULE. ═══════════════════
+ * ═══ IT RUNS UNATTENDED NOW — SO ITS SCOPE IS WHAT Q13 RULED, AND NO MORE ═══
  *
- * Said plainly because the opposite assumption is the dangerous one: a reader
- * who believes a retention sweep is running will believe the database has a
- * ceiling, and it does not. THIS BRANCH HAS NO SCHEDULER AT ALL — measured, not
- * assumed: `src/instrumentation.ts` `register()` is an empty stub ("nothing to
- * set up here"), and the only route under `src/app/api/cron/` is
- * `refresh-parties`, which is a different module's job and never touches FSSAI.
- * So there is no boot-time arming here to hang a job off, and inventing one
- * would be a behaviour change nobody asked for on a build the owner is about to
- * judge.
+ * When this file was written nothing called the sweep on a schedule. That is no
+ * longer true: `runFssaiRetentionJob` (src/lib/fssai-jobs.ts) drives it once per
+ * IST day from the app scheduler (src/lib/scheduler.ts, armed in
+ * instrumentation.ts register()), and an administrator can still run it from
+ * /fssai/audit-log. A job that deletes image data with nobody watching must be
+ * held to EXACTLY what the owner ruled, so two things changed when it was armed:
  *
- * WHAT THAT MEANS TODAY: images are kept for ever until somebody calls
- * `sweepFssaiPhotoRetention` — from an admin action, a script, or a job armed by
- * whoever owns scheduling on the branch this is merged into. The function is
- * complete, transactional, audited and safe to call repeatedly; only the trigger
- * is missing.
+ *  1. IT WALKS fssai_evidence ONLY — the photographs on a checklist round, which
+ *     is the store Q13 was asked about and answered. fssai_attachments (a
+ *     delivery's photo, a pest sighting, a contractor's job sheet, a LICENCE or
+ *     CERTIFICATE SCAN) is NOT swept. Extending the window to that store is Q22,
+ *     and Q22 has NO RULING. The difference is not academic: an FSSAI licence is
+ *     valid for one to five years, a FoSTaC certificate for two, and a sweep that
+ *     treated their scans like a fridge photo would delete the copy of a licence
+ *     while the licence is still in force — the very document an inspector asks
+ *     for first. Measured on a copy of the database before this change: a licence
+ *     valid to 2029 whose scan was two years old lost its scan to one sweep.
+ *     Until the owner rules Q22 those files are KEPT, and the status payload
+ *     says so per store (`swept: false`, `past_window_kept`) rather than counting
+ *     them as "past the window" for a button that will never drop them.
  *
- * TO ARM IT, wherever this lands:
- *   · call `sweepFssaiPhotoRetention(getDb())` once a day (it is idempotent — a
- *     second call the same day finds nothing left to drop and writes nothing);
- *   · call it with `{ dryRun: true }` first and read the report, which names the
- *     rows and the bytes WITHOUT touching anything.
+ *  2. ONLY A WELL-FORMED created_at CAN EVER QUALIFY. The old SQL compared
+ *     `replace(created_at,' ','T') <= cutoff` AS STRINGS, so '' — and anything
+ *     else that sorts before a digit — was "older than every cutoff" and was
+ *     swept; so were '2024-02-30 10:00:00' and '2024-06-01 25:00:00', which are
+ *     not times at all. Measured on a copy: all three were dropped. Age is now
+ *     decided by `fssaiRetentionInstantMs`, which returns NaN unless the value is
+ *     a real calendar date and time, and a row whose age cannot be proved is KEPT
+ *     and COUNTED (`unprovable_age`) instead. A side effect worth knowing: the
+ *     scheduler's own guard used to refuse the WHOLE daily pass when one such row
+ *     reached the candidate list, so a single bad timestamp stopped retention for
+ *     every photograph for ever; now the bad row is skipped and named, and the
+ *     guard stays as the backstop it was meant to be.
+ *
+ * THE OTHER WAY AN IMAGE CAN LEAVE THE FILE — a manager correcting a file
+ * attached by mistake — is governed here too (`fssaiManualRemovalRefusal`,
+ * `recordFssaiManualImageRemoval`), so the two rules about how long a picture
+ * lives sit side by side and every image that ever leaves is in ONE ledger,
+ * fssai_retention_runs.
  *
  * ═══ WHAT THE SWEEP MUST NEVER CHANGE, AND WHY ══════════════════════════════
  *
@@ -61,17 +79,21 @@ import { FSSAI_PHOTO_RETENTION_MONTHS, fssaiBytesLabel } from '@/lib/fssai';
  * sheet digest hashes a run's evidence and run-less rows would then sit inside a
  * signed set.
  *
- * A sweep that walks only `fssai_evidence` therefore keeps EVERY record-module
- * photograph for ever while reporting success, which is the worst possible
- * failure for an unattended job: a growing database and a green report. Both
- * tables are walked below, the report says how many came from each, and the
- * per-table numbers are what `fssai_retention_runs.evidence_dropped` and
- * `.attachments_dropped` record.
+ * P10 walked BOTH tables, on the reasoning that a sweep over fssai_evidence
+ * alone "keeps every record-module photograph for ever while reporting success".
+ * That reasoning assumed Q13 covered both stores. It does not: Q13 was asked and
+ * answered about checklist photographs, and the question of the second store is
+ * Q22, which is unruled (see the header). So the sweep now walks
+ * FSSAI_RETENTION_SWEPT_STORES (fssai_evidence) and the "green report over a
+ * growing database" risk is answered the other way — by SAYING it: the report
+ * names the store it deliberately did not walk (`stores_not_swept`), every run
+ * row's detail says so, and the status payload reports fssai_attachments with
+ * `swept: false` and how many of its files are past twelve months and kept.
+ * `attachments_dropped` stays in the report and the run row, and stays 0 from
+ * the sweep; a manual correction (below) is the only thing that raises it.
  *
- * `fssai_attachments` is NOT inside any signature, so the same four-column rule
- * is not strictly forced there — it is applied anyway, identically, because one
- * sweep with two different rules about what it may write is how the rule gets
- * lost.
+ * The four-column rule is applied identically to both stores by the one UPDATE
+ * that can write either, so the day Q22 is ruled the rule is already there.
  *
  * ═══ AND IT NOW PROVES WHAT IT DID ══════════════════════════════════════════
  *
@@ -134,6 +156,21 @@ export interface FssaiRetentionReport {
    * tell "nothing had aged out" from "half the photographs were never looked at".
    */
   stores_skipped: string;
+  /**
+   * Stores the sweep DELIBERATELY does not walk, and why — today
+   * 'fssai_attachments' (Q22 unruled). Distinct from `stores_skipped`, which is a
+   * store the sweep wanted to walk and could not.
+   */
+  stores_not_swept: string;
+  /**
+   * Images in a swept store whose created_at is not a real date and time ('',
+   * '2024-02-30 10:00:00', 'yesterday', …). Their age cannot be proved, so they
+   * are KEPT, never treated as older than the cutoff — and counted, so a bad
+   * timestamp is visible rather than silently immortal.
+   */
+  unprovable_age: number;
+  /** The first few of those, by store and id, so somebody can go and look. */
+  unprovable_rows: { store: FssaiPhotoStore; id: string; created_at: string }[];
   /** The fssai_retention_runs row this pass wrote. '' on a dry run. */
   retention_run_id: string;
 }
@@ -174,17 +211,86 @@ export function fssaiRetentionCutoff(now: Date = new Date(), months = FSSAI_PHOT
   return d.toISOString();
 }
 
+/**
+ * THE AGE OF A STORED IMAGE, OR NaN WHEN IT CANNOT BE PROVED.
+ *
+ * The ONE place this file decides how old a picture is — the sweep, the status
+ * payload and the manual-removal window all call it, so they cannot disagree.
+ *
+ * Accepts exactly the two shapes this app writes:
+ *   · SQLite's datetime('now'):  'YYYY-MM-DD HH:MM:SS'      (UTC, no zone)
+ *   · an ISO instant:             'YYYY-MM-DDTHH:MM:SS.sssZ'  (or ±HH:MM)
+ * Seconds and up to three fractional digits are optional. Everything else is
+ * NaN: '', a bare date, 'yesterday', a locale string — and also values that
+ * have the right SHAPE but are not real times ('2024-02-30', '25:00:00'), which
+ * Date.parse would quietly roll over into a different, real instant.
+ *
+ * Deliberately no looser than parseStoredInstant in src/lib/fssai-jobs.ts (the
+ * scheduler's own guard): anything this accepts, that accepts with the same
+ * value, so a row the sweep calls old is never one the guard calls unprovable.
+ *
+ * A year before 2000 is also NaN. Nothing in this module was written then, and
+ * '0001-01-01 00:00:00' is a placeholder, not an upload time; calling it the
+ * oldest photograph in the file would make it the first one dropped.
+ */
+const STORED_INSTANT = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?(Z|[+-]\d{2}:\d{2})?$/;
+
+export function fssaiRetentionInstantMs(v: unknown): number {
+  const s = String(v ?? '').trim();
+  const m = s.match(STORED_INSTANT);
+  if (!m) return NaN;
+  const [, ys, mos, ds, hs, mis, ss, frac, zone] = m;
+  const y = Number(ys), mo = Number(mos), d = Number(ds), h = Number(hs), mi = Number(mis), sec = Number(ss || 0);
+  if (y < 2000 || mo < 1 || mo > 12 || h > 23 || mi > 59 || sec > 59) return NaN;
+  const daysInMonth = new Date(Date.UTC(y, mo, 0)).getUTCDate();
+  if (d < 1 || d > daysInMonth) return NaN;
+  let offsetMin = 0;
+  if (zone && zone !== 'Z') {
+    const oh = Number(zone.slice(1, 3)), om = Number(zone.slice(4, 6));
+    if (oh > 14 || om > 59) return NaN;
+    offsetMin = (zone[0] === '-' ? -1 : 1) * (oh * 60 + om);
+  }
+  const ms = Number(((frac || '') + '000').slice(0, 3));
+  return Date.UTC(y, mo - 1, d, h, mi, sec, ms) - offsetMin * 60_000;
+}
+
+/* ------------------------------------------------------------------ *
+ * WHICH STORES THE SWEEP MAY TOUCH
+ * ------------------------------------------------------------------ */
+
+/**
+ * THE STORES THE 12-MONTH SWEEP WALKS — what Q13 ruled, and nothing else.
+ *
+ * ⚠️ DO NOT ADD 'fssai_attachments' HERE WITHOUT THE OWNER'S RULING ON Q22.
+ * That store holds licence, certificate and contract scans that must outlive
+ * twelve months by years; a rule for it has to know whether the document it
+ * belongs to is still in force, and no such rule has been asked for or given.
+ */
+export const FSSAI_RETENTION_SWEPT_STORES: readonly FssaiPhotoStore[] = ['fssai_evidence'] as const;
+
+/** Why each store that is NOT swept is left alone — said on every report and status. */
+export const FSSAI_RETENTION_NOT_SWEPT: Readonly<Partial<Record<FssaiPhotoStore, string>>> = {
+  fssai_attachments:
+    'Register files (deliveries, pest control, documents and certificates) are not swept: the owner ruled the 12-month window for checklist photographs (§7 Q13), and extending it to these files (Q22) has no ruling. A licence or certificate scan must not vanish while the document is in force.',
+};
+
+function isSweptStore(store: FssaiPhotoStore): boolean {
+  return (FSSAI_RETENTION_SWEPT_STORES as readonly string[]).includes(store);
+}
+
 /* ------------------------------------------------------------------ *
  * THE TWO STORES
  * ------------------------------------------------------------------ */
 
 /**
- * Both photo tables, in the order the sweep walks them.
+ * Both photo tables — every image store in the module, in the order the STATUS
+ * payload reports them.
  *
- * A LIST AND NOT TWO CALLS, so that "the sweep forgot a table" becomes
- * impossible to express: every loop below iterates this, the report's skipped
- * field names anything it could not walk, and a third store added later is one
- * line here plus a row in `STORE_COLUMNS`.
+ * A LIST AND NOT TWO CALLS, so that "the status forgot a table" becomes
+ * impossible to express. The SWEEP does not iterate this: it iterates
+ * FSSAI_RETENTION_SWEPT_STORES above, and every store here that is not in that
+ * list is named on the report (`stores_not_swept`) with its reason from
+ * FSSAI_RETENTION_NOT_SWEPT, so leaving a store out is always said out loud.
  */
 export const FSSAI_PHOTO_STORES: readonly FssaiPhotoStore[] = ['fssai_evidence', 'fssai_attachments'] as const;
 
@@ -240,53 +346,87 @@ export function sweepFssaiPhotoRetention(
   const dryRun = !!opts.dryRun;
   const actor = opts.actor ?? { email: '', name: 'FSSAI photo retention' };
 
+  const cutoffMs = Date.parse(cutoff);
   const skipped: string[] = [];
-  const rows: FssaiRetentionCandidate[] = [];
+  const rows: (FssaiRetentionCandidate & { _ms: number })[] = [];
+  const unprovable: { store: FssaiPhotoStore; id: string; created_at: string }[] = [];
   let stillHeld = 0;
 
-  for (const store of FSSAI_PHOTO_STORES) {
+  for (const store of FSSAI_RETENTION_SWEPT_STORES) {
     if (!photoTableExists(db, store)) { skipped.push(store); continue; }
-    /* `created_at` is stored by SQLite's own datetime('now') as
-     * 'YYYY-MM-DD HH:MM:SS' (a space, no 'Z'), while an ISO instant uses a 'T'.
-     * Comparing the two as strings would be wrong at exactly the character that
-     * differs, so the column is normalised to the ISO shape for the comparison
-     * rather than the cutoff being loosened to a date. */
-    const found = db.prepare(
+    /* AGE IS DECIDED IN ONE PLACE, AND NOT BY STRING COMPARISON.
+     * This used to be `replace(created_at, ' ', 'T') <= ?` in the WHERE clause,
+     * which sorts '' and every non-ISO value BEFORE any cutoff — so a blank or
+     * malformed timestamp was "older than twelve months" and its image was
+     * dropped. Now every row still holding an image is read WITHOUT its image
+     * (metadata only), and fssaiRetentionInstantMs decides: a real instant at or
+     * before the cutoff qualifies, a real instant after it is still held, and
+     * anything that is not a real instant is KEPT and counted as unprovable. */
+    const held = db.prepare(
       `SELECT id, ${storeColumns(store)}, created_at, size_bytes, mime, filename, digest_sha256
          FROM ${store}
-        WHERE data_uri <> ''
-          AND replace(created_at, ' ', 'T') <= ?
-        ORDER BY created_at ASC`,
-    ).all(cutoff) as any[];
-    for (const r of found) rows.push({ ...r, store } as FssaiRetentionCandidate);
+        WHERE data_uri <> ''`,
+    ).all() as any[];
+    for (const r of held) {
+      const ms = fssaiRetentionInstantMs(r.created_at);
+      if (!Number.isFinite(ms) || !Number.isFinite(cutoffMs)) {
+        unprovable.push({ store, id: String(r.id), created_at: String(r.created_at ?? '') });
+      } else if (ms <= cutoffMs) {
+        rows.push({ ...r, store, _ms: ms } as FssaiRetentionCandidate & { _ms: number });
+      } else {
+        stillHeld += 1;
+      }
+    }
+  }
+  // Oldest first, by the parsed instant — never by the raw string.
+  rows.sort((a, b) => a._ms - b._ms);
+  const candidates: FssaiRetentionCandidate[] = rows.map(({ _ms, ...r }) => { void _ms; return r; });
 
-    stillHeld += Number((db.prepare(
-      `SELECT COUNT(*) AS n FROM ${store} WHERE data_uri <> '' AND replace(created_at, ' ', 'T') > ?`,
-    ).get(cutoff) as any)?.n) || 0;
+  const notSwept = FSSAI_PHOTO_STORES.filter((s) => !isSweptStore(s));
+  if (unprovable.length && !dryRun) {
+    console.error(
+      `[fssai] retention: ${unprovable.length} image(s) have no provable age and were KEPT:`,
+      unprovable.slice(0, 5).map((u) => `${u.store}:${u.id} ("${u.created_at}")`).join(', '),
+    );
   }
 
   const report: FssaiRetentionReport = {
     cutoff,
     retention_months: months,
-    candidates: rows.length,
+    candidates: candidates.length,
     dropped: 0,
     bytes_freed: 0,
     bytes_freed_label: '0 KB',
     dropped_without_digest: 0,
     dry_run: dryRun,
     still_held: stillHeld,
-    rows,
+    rows: candidates,
     evidence_dropped: 0,
     attachments_dropped: 0,
     stores_skipped: skipped.join(', '),
+    stores_not_swept: notSwept.join(', '),
+    unprovable_age: unprovable.length,
+    unprovable_rows: unprovable.slice(0, 20),
     retention_run_id: '',
   };
   if (dryRun) {
-    report.bytes_freed = rows.reduce((n, r) => n + (Number(r.size_bytes) || 0), 0);
+    report.bytes_freed = candidates.reduce((n, r) => n + (Number(r.size_bytes) || 0), 0);
     report.bytes_freed_label = fssaiBytesLabel(report.bytes_freed);
-    report.dropped_without_digest = rows.filter((r) => !String(r.digest_sha256 || '')).length;
+    report.dropped_without_digest = candidates.filter((r) => !String(r.digest_sha256 || '')).length;
     return report;
   }
+
+  /* What the run row says about everything the pass did NOT drop on purpose —
+   * so a reader of /fssai/audit-log sees, on every run, that register files are
+   * kept and that a bad timestamp kept an image, rather than inferring both
+   * from numbers that do not add up. */
+  const keptNotes = [
+    skipped.length ? `Could not walk: ${skipped.join(', ')}.` : '',
+    unprovable.length
+      ? `${unprovable.length} image(s) kept because their created_at is not a real date and time, so their age cannot be proved (first: ${unprovable.slice(0, 3).map((u) => `${u.store}:${u.id}`).join(', ')}).`
+      : '',
+    notSwept.length ? `Not swept, pending the owner's ruling on Q22: ${notSwept.join(', ')}.` : '',
+  ].filter(Boolean).join(' ');
 
   /* ── THE PROOF ROW ──────────────────────────────────────────────────────────
    * Written BEFORE the first drop and OUTSIDE the drop transaction, so that an
@@ -304,8 +444,8 @@ export function sweepFssaiPhotoRetention(
          (id, cutoff_date, months_kept, scanned_count, status, detail, triggered_by)
        VALUES (?, ?, ?, ?, 'running', ?, ?)`,
     ).run(
-      runId, cutoff, months, rows.length,
-      skipped.length ? `Could not walk: ${skipped.join(', ')}` : '',
+      runId, cutoff, months, candidates.length,
+      keptNotes,
       actor.email || String(actor.name || 'scheduler'),
     );
     report.retention_run_id = runId;
@@ -317,11 +457,11 @@ export function sweepFssaiPhotoRetention(
   /* ⚠️ THESE STATEMENTS WRITE TWO COLUMNS AND NO OTHERS. id, response_id, mime
    * and size_bytes are the four the sheet digest is taken over — see the header
    * of this file. Adding a column to this SET is how every signature in the file
-   * would quietly stop covering its sheet. The attachment store is held to the
-   * same rule even though it carries no signature, so there is one rule and not
-   * two. */
+   * would quietly stop covering its sheet.
+   * Prepared ONLY for the swept stores, so even a candidate that somehow named
+   * another store would find no statement to run (`if (!drop) continue`). */
   const droppers = new Map<FssaiPhotoStore, Database.Statement<[string, string]>>();
-  for (const store of FSSAI_PHOTO_STORES) {
+  for (const store of FSSAI_RETENTION_SWEPT_STORES) {
     if (skipped.includes(store)) continue;
     droppers.set(store, db.prepare(
       `UPDATE ${store} SET data_uri = '', image_dropped_at = ? WHERE id = ? AND data_uri <> ''`,
@@ -329,7 +469,7 @@ export function sweepFssaiPhotoRetention(
   }
 
   const run = db.transaction(() => {
-    for (const r of rows) {
+    for (const r of candidates) {
       const drop = droppers.get(r.store);
       if (!drop) continue;
       const res = drop.run(droppedAt, r.id);
@@ -400,7 +540,7 @@ export function sweepFssaiPhotoRetention(
           WHERE id=?`,
       ).run(
         report.dropped, report.bytes_freed, report.evidence_dropped, report.attachments_dropped,
-        skipped.length ? `Could not walk: ${skipped.join(', ')}` : '',
+        keptNotes,
         report.retention_run_id,
       );
     } catch (e: any) {
@@ -420,10 +560,23 @@ export interface FssaiPhotoStoreStatus {
   store: FssaiPhotoStore;
   /** false = the table is not in this database (see photoTableExists) */
   present: boolean;
+  /** true = the 12-month sweep walks this store (FSSAI_RETENTION_SWEPT_STORES). */
+  swept: boolean;
+  /** '' for a swept store; otherwise why it is left alone (FSSAI_RETENTION_NOT_SWEPT). */
+  not_swept_reason: string;
   held: number;
   held_bytes: number;
+  /**
+   * Past the window AND going to be dropped by the next sweep. Always 0 for a
+   * store the sweep does not walk — a screen that offers a "sweep now" button
+   * off this number must not count files the button will never touch.
+   */
   overdue: number;
   overdue_bytes: number;
+  /** Not-swept stores only: files older than the window that are KEPT on purpose. */
+  past_window_kept: number;
+  /** Images whose created_at is not a real date and time — kept, and counted here. */
+  unprovable_age: number;
   already_dropped: number;
 }
 
@@ -432,9 +585,14 @@ export interface FssaiRetentionStatus {
   held: number;
   held_bytes: number;
   held_bytes_label: string;
+  /** Swept stores only — see FssaiPhotoStoreStatus.overdue. */
   overdue: number;
   overdue_bytes: number;
   overdue_bytes_label: string;
+  /** Files past the window in stores the sweep does not walk, kept pending Q22. */
+  past_window_kept: number;
+  /** Images, in any store, whose age cannot be proved. Never swept. */
+  unprovable_age: number;
   already_dropped: number;
   cutoff: string;
   retention_months: number;
@@ -442,15 +600,27 @@ export interface FssaiRetentionStatus {
   stores: FssaiPhotoStoreStatus[];
   /** stores this database does not have — '' when both are present */
   stores_missing: string;
+  /** stores the sweep deliberately leaves alone — '' when it walks every store */
+  stores_not_swept: string;
+  /**
+   * ⚠️ LEGACY FIELD — NOT A STATEMENT ABOUT THE SCHEDULER. It was written when
+   * nothing ran this sweep on a schedule. runFssaiRetentionJob (fssai-jobs.ts)
+   * now does, once per IST day, and whether that driver is actually ticking is
+   * read off its heartbeat (readFssaiJobsHeartbeat), not off this constant. It
+   * stays on the wire only because removing a field is a contract change for
+   * whoever still reads it; /fssai/audit-log no longer does.
+   */
   armed: false;
 }
 
 /**
- * ⚠️ THE TOTALS NOW COVER BOTH STORES. Before P10 these three numbers were
- * fssai_evidence only, which was all there was. A caller that wants the old
- * meaning reads `stores[]`; a screen that shows `held` is showing every
- * photograph in the module, which is the only number that answers "how big is
- * this file going to get".
+ * ⚠️ `held` COVERS BOTH STORES; `overdue` COVERS ONLY WHAT THE SWEEP WALKS.
+ * `held` answers "how big is this file going to get", so it is every image in
+ * the module. `overdue` answers "what will the next sweep drop", so since the
+ * sweep was restricted to Q13's scope it counts fssai_evidence only, and the
+ * register files past twelve months are reported as `past_window_kept` instead.
+ * Age is fssaiRetentionInstantMs — the sweep's own rule — never a string
+ * comparison, so this payload and the sweep cannot disagree about a row.
  */
 export function fssaiPhotoRetentionStatus(
   db: Database.Database = getDb(),
@@ -458,30 +628,37 @@ export function fssaiPhotoRetentionStatus(
 ): FssaiRetentionStatus {
   const months = opts.months ?? FSSAI_PHOTO_RETENTION_MONTHS;
   const cutoff = fssaiRetentionCutoff(opts.now ?? new Date(), months);
+  const cutoffMs = Date.parse(cutoff);
 
   const stores: FssaiPhotoStoreStatus[] = FSSAI_PHOTO_STORES.map((store) => {
-    if (!photoTableExists(db, store)) {
-      return { store, present: false, held: 0, held_bytes: 0, overdue: 0, overdue_bytes: 0, already_dropped: 0 };
+    const swept = isSweptStore(store);
+    const notSweptReason = swept ? '' : String(FSSAI_RETENTION_NOT_SWEPT[store] || 'Not swept.');
+    const empty: FssaiPhotoStoreStatus = {
+      store, present: false, swept, not_swept_reason: notSweptReason,
+      held: 0, held_bytes: 0, overdue: 0, overdue_bytes: 0,
+      past_window_kept: 0, unprovable_age: 0, already_dropped: 0,
+    };
+    if (!photoTableExists(db, store)) return empty;
+    const out: FssaiPhotoStoreStatus = { ...empty, present: true };
+    // Metadata only — the image column is tested, never read.
+    const rows = db.prepare(
+      `SELECT created_at, size_bytes FROM ${store} WHERE data_uri <> ''`,
+    ).all() as { created_at: string; size_bytes: number }[];
+    for (const r of rows) {
+      const bytes = Number(r.size_bytes) || 0;
+      out.held += 1;
+      out.held_bytes += bytes;
+      const ms = fssaiRetentionInstantMs(r.created_at);
+      if (!Number.isFinite(ms) || !Number.isFinite(cutoffMs)) { out.unprovable_age += 1; continue; }
+      if (ms > cutoffMs) continue;
+      if (swept) { out.overdue += 1; out.overdue_bytes += bytes; }
+      else out.past_window_kept += 1;
     }
-    const held = db.prepare(
-      `SELECT COUNT(*) AS n, COALESCE(SUM(size_bytes), 0) AS b FROM ${store} WHERE data_uri <> ''`,
-    ).get() as any;
-    const overdue = db.prepare(
-      `SELECT COUNT(*) AS n, COALESCE(SUM(size_bytes), 0) AS b
-         FROM ${store} WHERE data_uri <> '' AND replace(created_at, ' ', 'T') <= ?`,
-    ).get(cutoff) as any;
     const gone = db.prepare(
       `SELECT COUNT(*) AS n FROM ${store} WHERE image_dropped_at <> ''`,
     ).get() as any;
-    return {
-      store,
-      present: true,
-      held: Number(held?.n) || 0,
-      held_bytes: Number(held?.b) || 0,
-      overdue: Number(overdue?.n) || 0,
-      overdue_bytes: Number(overdue?.b) || 0,
-      already_dropped: Number(gone?.n) || 0,
-    };
+    out.already_dropped = Number(gone?.n) || 0;
+    return out;
   });
 
   const sum = (pick: (s: FssaiPhotoStoreStatus) => number) => stores.reduce((n, s) => n + pick(s), 0);
@@ -495,16 +672,14 @@ export function fssaiPhotoRetentionStatus(
     overdue: sum((s) => s.overdue),
     overdue_bytes: overdueBytes,
     overdue_bytes_label: fssaiBytesLabel(overdueBytes),
+    past_window_kept: sum((s) => s.past_window_kept),
+    unprovable_age: sum((s) => s.unprovable_age),
     already_dropped: sum((s) => s.already_dropped),
     cutoff,
     retention_months: months,
     stores,
     stores_missing: stores.filter((s) => !s.present).map((s) => s.store).join(', '),
-    /* Stated in the payload, not just in a comment, so a screen that shows this
-     * cannot imply a sweep is running. It is still FALSE after P10: the sweep can
-     * now be run by an administrator from /fssai/audit-log and it records what it
-     * did, but NOTHING calls it on a schedule on this branch. Flip it only when a
-     * real job exists. */
+    stores_not_swept: stores.filter((s) => !s.swept).map((s) => s.store).join(', '),
     armed: false,
   };
 }
@@ -565,4 +740,127 @@ export function listFssaiRetentionRuns(
     triggered_by: x.triggered_by || '',
     interrupted: String(x.status || '') === 'running' && !String(x.finished_at || ''),
   }));
+}
+
+/* ------------------------------------------------------------------ *
+ * THE OTHER WAY AN IMAGE LEAVES THE FILE — a manager's correction
+ * ------------------------------------------------------------------ */
+
+/**
+ * HOW LONG A FILE ON A FILED RECORD CAN BE TAKEN BACK: 24 HOURS FROM UPLOAD.
+ *
+ * ═══ THE DECISION, AND WHY ══════════════════════════════════════════════════
+ *
+ * Is a filed record's image removable at all? FSSAI's rule — and this module's
+ * (§19) — is VOID, NEVER DELETE, and a pest visit's job sheet, a rat sighting's
+ * photograph and a licence scan are exactly the things an inspector asks to see.
+ * Before this, a manager could blank ANY of them at ANY age, with nothing in
+ * the retention ledger, and — worse — through ANY record's route, because the
+ * route never checked that the file belonged to the record it named.
+ *
+ * Decided: NOT REMOVABLE, with one narrow exception — a CORRECTION of a file
+ * attached by mistake, within FSSAI_FILE_CORRECTION_HOURS of its upload. That is
+ * the window in which "I attached the wrong photograph" is a correction; after
+ * it, the file has been part of the record long enough to be relied on, and the
+ * only honest remedies are the ones that leave it in place: attach the right
+ * file beside it, or void the whole record with a reason and file it again.
+ *
+ * Even inside the window, a correction is NOT a deletion: the row, its size and
+ * its sha256 stay (the image alone is blanked, exactly as the 12-month sweep
+ * does), an fssai_audit_log row names who, when and why, and an
+ * fssai_retention_runs row puts it in the SAME ledger as every sweep — so
+ * "which images have ever left this file, and why" has one answer. Both writes
+ * are mandatory: if either cannot be written, nothing is removed.
+ *
+ * Refused regardless of age: a file whose created_at is not a real instant (its
+ * age cannot be proved, so it cannot be proved to be inside the window), and any
+ * file on a record that has been VOIDED (a voided record is closed evidence).
+ *
+ * ASSUMPTION, REVERSIBLE: 24 hours. It is long enough to catch a mistake made at
+ * the end of a shift by the manager on the next one, and short enough that no
+ * inspection could have relied on the file in between. Changing it is one line.
+ */
+export const FSSAI_FILE_CORRECTION_HOURS = 24;
+
+/**
+ * '' if a file uploaded at `createdAt` may still be corrected at `now`; else the
+ * refusal in words. Uses fssaiRetentionInstantMs, so "how old is this image"
+ * has the same answer here as in the sweep.
+ */
+export function fssaiManualRemovalRefusal(
+  createdAt: unknown,
+  now: Date = new Date(),
+  hours: number = FSSAI_FILE_CORRECTION_HOURS,
+): string {
+  const ms = fssaiRetentionInstantMs(createdAt);
+  if (!Number.isFinite(ms)) {
+    return 'This file has no readable upload time, so it cannot be shown to be a same-day correction. It stays on the record. If it is the wrong file, attach the right one beside it, or void the record with a reason and file it again.';
+  }
+  const age = now.getTime() - ms;
+  // An upload time in the future (beyond a few minutes of clock skew) is not a
+  // recent upload, it is a timestamp nobody can vouch for — and "the future" is
+  // always inside any window, so it must not be the way round the window.
+  if (age < -5 * 60_000) {
+    return 'This file\'s upload time is in the future, so it cannot be shown to be a same-day correction. It stays on the record. If it is the wrong file, attach the right one beside it, or void the record with a reason and file it again.';
+  }
+  if (age > hours * 3600_000) {
+    return `This file was attached on ${new Date(ms).toISOString().slice(0, 16).replace('T', ' ')} UTC. A file can only be taken back within ${hours} hours of attaching it; after that it is part of the record (FSSAI: void, never delete). If it is the wrong file, attach the right one beside it, or void the record with a reason and file it again.`;
+  }
+  return '';
+}
+
+/**
+ * Write the fssai_retention_runs row for ONE manually removed image.
+ *
+ * THROWS on failure, deliberately — the opposite of the sweep's best-effort
+ * proof row. A sweep must leave a trace even when it fails; a manual removal
+ * must not HAPPEN without its trace. Call it inside the same transaction as the
+ * UPDATE that blanks the image, so the two commit or roll back together.
+ *
+ * The row reads on /fssai/audit-log as: scanned 1 · dropped 1 · window 0 months
+ * · by <manager>, with the record, the file, its digest and the reason in
+ * `detail`. months_kept = 0 is what distinguishes it from any sweep (the sweep
+ * never runs with a window under one month), and cutoff_date is the upload time
+ * of the file — the only "cutoff" a correction has.
+ */
+export const FSSAI_MANUAL_REMOVAL_PREFIX = 'Manual correction, not the retention sweep:';
+
+export function recordFssaiManualImageRemoval(
+  db: Database.Database,
+  p: {
+    store: FssaiPhotoStore;
+    file_id: string;
+    /** what the file is ON, in words and by id */
+    of_words: string;
+    of_table: string;
+    of_id: string;
+    filename: string;
+    size_bytes: number;
+    digest_sha256: string;
+    created_at: string;
+    created_by: string;
+    reason: string;
+    actor: { email?: string | null; name?: string | null };
+    outlet_id?: string;
+  },
+): string {
+  const id = generateId();
+  const detail = [
+    FSSAI_MANUAL_REMOVAL_PREFIX,
+    `one file taken off ${p.of_words} ${p.of_id} (${p.of_table}).`,
+    `File ${p.file_id} "${p.filename || 'unnamed'}", ${fssaiBytesLabel(Number(p.size_bytes) || 0)},`,
+    `sha256 ${p.digest_sha256 || '(none recorded)'}, attached ${p.created_at} by ${p.created_by || 'unknown'}.`,
+    `Reason: "${p.reason}". The row, its size and its digest are kept.`,
+  ].join(' ').slice(0, 1000);
+  db.prepare(
+    `INSERT INTO fssai_retention_runs
+       (id, finished_at, cutoff_date, months_kept, scanned_count, dropped_count, bytes_freed,
+        evidence_dropped, attachments_dropped, status, detail, triggered_by, outlet_id)
+     VALUES (?, datetime('now'), ?, 0, 1, 1, ?, ?, ?, 'done', ?, ?, ?)`,
+  ).run(
+    id, String(p.created_at || ''), Number(p.size_bytes) || 0,
+    p.store === 'fssai_evidence' ? 1 : 0, p.store === 'fssai_attachments' ? 1 : 0,
+    detail, String(p.actor.email || p.actor.name || 'unknown'), String(p.outlet_id || ''),
+  );
+  return id;
 }

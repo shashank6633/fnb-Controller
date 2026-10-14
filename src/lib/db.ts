@@ -1344,6 +1344,47 @@ function initializeSchema(db: Database.Database) {
     `);
   } catch (e) { console.error('vendors schema failed:', e); }
 
+  // FSSAI APPROVED-VENDOR REGISTER (Hyderabad audit checklist: "Approved vendor
+  // list maintained"). Its OWN block so a failure here can never take the vendors
+  // table above down with it — and the presence check at the end SAYS so, because
+  // this function swallows errors per block.
+  //
+  // ADDITIVE ONLY. Five columns, every one NOT NULL DEFAULT '' so every existing
+  // vendor reads '' = "not reviewed yet", which the receiving warning treats as
+  // nothing to say: every existing vendor and every existing flow behaves exactly
+  // as before until somebody marks a vendor. Purchasing, GRN and the PO screens
+  // never read these columns, and GET /api/vendors strips them from its ordinary
+  // replies, so those replies stay byte-identical.
+  //
+  // THE LICENCE IS NOT HERE ON PURPOSE. The vendor's FSSAI licence number and
+  // expiry already live in fssai_documents (doc_type 'supplier_licence',
+  // vendor_id), with its renewal chain and its scan. The register READS it from
+  // there (src/app/api/vendors/fssai-register.ts) rather than keeping a second
+  // copy that would drift from the first.
+  //   fssai_approval       '' not reviewed · 'approved' · 'not_approved'
+  //   fssai_approval_by    users.email of who made that call
+  //   fssai_approval_at    ISO time of that call
+  //   fssai_supplies       what they are approved to supply, in words
+  //   fssai_approval_note  why (required when marking 'not_approved')
+  try {
+    const want: Array<[string, string]> = [
+      ['fssai_approval',      `TEXT NOT NULL DEFAULT ''`],
+      ['fssai_approval_by',   `TEXT NOT NULL DEFAULT ''`],
+      ['fssai_approval_at',   `TEXT NOT NULL DEFAULT ''`],
+      ['fssai_supplies',      `TEXT NOT NULL DEFAULT ''`],
+      ['fssai_approval_note', `TEXT NOT NULL DEFAULT ''`],
+    ];
+    const vendorCols = () => new Set((db.prepare('PRAGMA table_info(vendors)').all() as any[]).map((c: any) => String(c.name)));
+    const have = vendorCols();
+    for (const [name, ddl] of want) {
+      // Identifiers come from the constant list above, never from input.
+      if (!have.has(name)) db.prepare(`ALTER TABLE vendors ADD COLUMN ${name} ${ddl}`).run();
+    }
+    const after = vendorCols();
+    const missing = want.map(([n]) => n).filter((n) => !after.has(n));
+    if (missing.length) console.error(`[db] VENDOR REGISTER COLUMNS MISSING after migration: ${missing.join(', ')}`);
+  } catch (e) { console.error('vendor fssai register columns failed:', e); }
+
   // Migration: add vendor_id FK to purchase_orders, backfilled from name
   try {
     const cols = db.prepare("PRAGMA table_info(purchase_orders)").all() as any[];

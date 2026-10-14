@@ -16,6 +16,9 @@ import {
   resolveFssaiRange, judgeFssaiReading, raiseFssaiRecordCa, writeFssaiAttachment,
   fssaiAttachmentCounts, fssaiRecordVisibility, fssaiClock, fssaiNum, fssaiInt,
   FSSAI_BACKDATE_DAYS,
+  resolveFssaiCurve, fssaiCurveMembers, fssaiCurveReached, fssaiCurveExpected,
+  fssaiCurveExpectedShown, fssaiTempDirection, fssaiClockMinute,
+  type FssaiCurveResolution,
 } from '../_p4/lib';
 
 /**
@@ -160,11 +163,84 @@ function shapeLog(row: any, photoCount = 0) {
     voided_by: String(row.voided_by || ''),
     void_reason: String(row.void_reason || ''),
     created_at: String(row.created_at || ''),
+    /* Cooling and reheating only: the batch whose curve this reading is on
+     * (GET ?curve=<this> returns the whole curve). '' for every other kind. */
+    curve_id: isRateKind(row.log_kind) ? (String(row.batch_id || '') || String(row.id)) : '',
     photo_count: photoCount,
     /* The range in words, computed from the FROZEN columns and not from any live
      * rule, so a list and a record can never disagree. */
     range_label: rangeWords(fssaiNum(row.min_used), fssaiNum(row.max_used), String(row.uom || 'C')),
   };
+}
+
+/** Cooling and reheating — the kinds whose FSSAI rule is a RATE against a clock. */
+function isRateKind(logKind: unknown): boolean {
+  return !!FSSAI_TEMP_LOG_KINDS.find((k) => k.key === String(logKind || ''))?.window_minutes;
+}
+
+/** The current IST time on the same clock as a reading. */
+function nowMinuteIST(): number | null {
+  const hhmm = new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata' });
+  return fssaiClockMinute(fssaiToday(), hhmm);
+}
+
+/**
+ * ONE BATCH'S CURVE, as the sheet reads it: the first reading, the target and
+ * the time limit it was judged against, where it stands now, and each reading
+ * with the figure the schedule asked for at that point.
+ *
+ * Every verdict here is the FROZEN one. `schedule_value` is the one shared line
+ * (`fssaiCurveExpected`) drawn from the first LIVE reading; it is shown beside a
+ * reading and never used to change its verdict.
+ */
+function curveSummary(db: any, logKind: string, key: string, nowMinute: number | null) {
+  const all = fssaiCurveMembers(db, logKind, key, true);
+  const live = all.filter((m) => m.status !== 'void');
+  const dir = fssaiTempDirection(logKind);
+  const start = live[0] || null;
+  const limit = start ? start.max_minutes : null;
+  const goal = start ? start.goal : null;
+  const reached = fssaiCurveReached(live, logKind);
+  const last = live[live.length - 1] || null;
+  const elapsedNow = start && start.minute !== null && nowMinute !== null
+    ? (start.elapsed ?? 0) + (nowMinute - start.minute) : null;
+  const breach = live.some((m) => m.is_fail === 1);
+  /* A breach anywhere on the batch outranks how it ended: a pot that fell behind
+   * and then caught up still had a breach, and the sheet must say so first. */
+  const outcome = breach ? 'breach'
+    : reached
+      ? (limit !== null && reached.elapsed !== null && reached.elapsed > limit ? 'reached_late' : 'reached_in_time')
+      : (limit !== null && elapsedNow !== null && elapsedNow > limit ? 'overdue' : 'in_progress');
+  const OUTCOME_WORDS: Record<string, string> = {
+    reached_in_time: 'Reached the target within the time allowed',
+    reached_late: 'Reached the target, but after the time allowed',
+    breach: 'A reading on this batch was a breach',
+    overdue: 'Past the time allowed with no reading at the target',
+    in_progress: 'Still in progress',
+  };
+  const summary = {
+    id: key,
+    log_kind: logKind,
+    log_kind_label: fssaiTempLogKindLabel(logKind),
+    direction: dir,
+    goal,
+    max_minutes: limit,
+    start: start ? { id: start.id, business_date: start.business_date, reading_at: start.reading_at, value_num: start.value, elapsed_minutes: start.elapsed } : null,
+    last: last ? { id: last.id, business_date: last.business_date, reading_at: last.reading_at, value_num: last.value, elapsed_minutes: last.elapsed } : null,
+    reached: reached ? { id: reached.id, reading_at: reached.reading_at, value_num: reached.value, elapsed_minutes: reached.elapsed } : null,
+    elapsed_now: reached ? null : elapsedNow,
+    has_breach: breach,
+    outcome,
+    outcome_label: OUTCOME_WORDS[outcome],
+  };
+  const schedule = (m: { elapsed: number | null }): number | null => {
+    const e = fssaiCurveExpected({
+      startValue: start ? start.value : null, startElapsed: start ? start.elapsed : null,
+      goal, maxMinutes: limit, elapsed: m.elapsed,
+    });
+    return e === null ? null : Number(fssaiCurveExpectedShown(e, dir));
+  };
+  return { summary, members: all, schedule };
 }
 
 /** "0 to 5 °C" / "at or below −18 °C" / "no range was set". */
@@ -210,19 +286,109 @@ export async function GET(request: Request) {
         uom: str(url.searchParams.get('uom')),
       });
       const kindMeta = FSSAI_TEMP_LOG_KINDS.find((k) => k.key === logKind);
+      const dir = kindMeta?.direction || 'either';
+      const goal = range.target !== null ? range.target : (dir === 'hot' ? range.min : range.max);
+      const u = range.uom === 'C' || range.uom === 'F' ? ` °${range.uom}` : ` ${range.uom}`;
       return Response.json({
         range,
         equipment_label: equipmentLabel,
         range_label: rangeWords(range.min, range.max, range.uom),
-        direction: kindMeta?.direction || 'either',
+        direction: dir,
         wants_clock: !!kindMeta?.window_minutes,
         /* The honest sentence, written here so every screen says the same thing. */
         note: range.source === 'none'
           ? 'No safe range has been set for this, so the reading will be recorded and marked as not judged. It will not be counted as a pass.'
           : range.source === 'equipment'
             ? 'This unit has its own range, which beats the general rule for its kind.'
-            : `Judged against "${range.standard_label}".`,
+            : (kindMeta?.window_minutes && range.max_minutes && goal !== null
+              /* Said BEFORE the number is typed, so a cook does not read the red
+               * "out of range" on 30 °C as a breach half-way down. */
+              ? `Judged against "${range.standard_label}". While it is still ${dir === 'hot' ? 'heating' : 'cooling'}, a reading is judged against where it should be by then — on a straight line from this batch's first reading to ${goal}${u} at ${range.max_minutes} minutes — not against ${goal}${u} itself. At ${range.max_minutes} minutes it has to be at ${goal}${u}. Minutes are counted from the batch's first reading; enter 0 minutes to start a new batch.`
+              : `Judged against "${range.standard_label}".`),
       });
+    }
+
+    /* ══ ONE BATCH'S COOLING OR REHEATING CURVE ═══════════════════════════
+     * ?curve=<any reading on it, or the batch id>[&log_kind=cooling]
+     * The readings in the order they were taken, the minutes counted for each,
+     * the frozen verdict, and the figure the schedule asked for at that point.
+     * ════════════════════════════════════════════════════════════════════════ */
+    const curveRef = str(url.searchParams.get('curve'));
+    if (curveRef) {
+      const ref = db.prepare(`SELECT id, batch_id, log_kind FROM fssai_temperature_logs WHERE id = ?`).get(curveRef) as any;
+      const logKind = ref ? String(ref.log_kind) : (str(url.searchParams.get('log_kind')) || 'cooling');
+      const key = ref ? (String(ref.batch_id || '') || String(ref.id)) : curveRef;
+      if (!isRateKind(logKind)) {
+        return Response.json({ error: 'Only cooling and reheating readings are kept as a curve.' }, { status: 400 });
+      }
+      const s = curveSummary(db, logKind, key, nowMinuteIST());
+      if (!s.members.length) return Response.json({ error: 'That batch is not in the file.' }, { status: 404 });
+      const ids = s.members.map((m) => m.id);
+      const rows = db.prepare(`${LOG_SELECT} WHERE t.id IN (${ids.map(() => '?').join(',')})`).all(...ids) as any[];
+      const byId = new Map(rows.map((r) => [String(r.id), r]));
+      const visible = (r: any) => {
+        if (mgmt) return true;
+        const dept = String(r.department_id || '');
+        const mine = String(me.email || '').toLowerCase() === String(r.recorded_by || '').toLowerCase();
+        return !dept || dept === me.department_id || mine;
+      };
+      const readings = s.members
+        .map((m) => ({ m, row: byId.get(m.id) }))
+        .filter((x) => x.row && visible(x.row))
+        .map((x) => ({ ...shapeLog(x.row), schedule_value: x.m.status === 'void' ? null : s.schedule(x.m) }));
+      if (!readings.length) {
+        return Response.json({ error: 'That batch belongs to another department.' }, { status: 403 });
+      }
+      return Response.json({
+        curve: s.summary,
+        readings,
+        note: 'Each verdict is the one frozen on the reading when it was taken. "Schedule" is where the batch needed to be at that point, on a straight line from its first reading to the target at the time limit.',
+      });
+    }
+
+    /* ══ THE BATCHES STILL COOLING OR HEATING ══════════════════════════════
+     * ?curves=open[&log_kind=cooling|reheating] — every batch from today or
+     * yesterday that has not reached its target: the list a cook picks from to
+     * add the next reading, and the one a manager reads for a pot left unfinished.
+     * ════════════════════════════════════════════════════════════════════════ */
+    if (url.searchParams.get('curves') === 'open') {
+      const kindParam = str(url.searchParams.get('log_kind'));
+      if (kindParam && !isRateKind(kindParam)) {
+        return Response.json({ error: 'Only cooling and reheating readings are kept as a curve.' }, { status: 400 });
+      }
+      const kinds = kindParam ? [kindParam] : FSSAI_TEMP_LOG_KINDS.filter((k) => k.window_minutes).map((k) => k.key);
+      const today = fssaiToday();
+      const where = [
+        `t.log_kind IN (${kinds.map(() => '?').join(',')})`,
+        `t.status <> 'void'`,
+        `t.business_date >= ?`,
+        `t.business_date <= ?`,
+      ];
+      const args: any[] = [...kinds, addDaysISO(today, -1), today];
+      const vis = fssaiRecordVisibility(me, { department: 't.department_id', recordedBy: 't.recorded_by' }, mgmt, FSSAI_NO_MATCH);
+      if (vis.sql) { where.push(vis.sql); args.push(...vis.args); }
+      const rows = db.prepare(
+        `SELECT t.id, t.batch_id, t.log_kind, t.equipment_label, t.area_label, t.item_label
+           FROM fssai_temperature_logs t WHERE ${where.join(' AND ')}`,
+      ).all(...args) as any[];
+      const seen = new Map<string, any>();
+      for (const r of rows) {
+        const k = `${String(r.log_kind)}|${String(r.batch_id || '') || String(r.id)}`;
+        if (!seen.has(k)) seen.set(k, r);
+      }
+      const now = nowMinuteIST();
+      const open: any[] = [];
+      for (const [k, r] of seen) {
+        const key = k.slice(k.indexOf('|') + 1);
+        const s = curveSummary(db, String(r.log_kind), key, now);
+        if (!s.summary.start || s.summary.reached) continue;
+        open.push({
+          ...s.summary,
+          label: [String(r.item_label || ''), String(r.equipment_label || r.area_label || '')].filter(Boolean).join(' · ') || 'Unnamed',
+        });
+      }
+      open.sort((a, b) => `${a.start.business_date} ${a.start.reading_at}`.localeCompare(`${b.start.business_date} ${b.start.reading_at}`));
+      return Response.json({ curves: open });
     }
 
     /* ══ ONE READING ════════════════════════════════════════════════════════ */
@@ -590,8 +756,8 @@ export async function POST(request: Request) {
         );
       }
 
-      const elapsed = fssaiInt(body?.elapsed_minutes);
-      if (elapsed !== null && elapsed < 0) {
+      const typedElapsed = fssaiInt(body?.elapsed_minutes);
+      if (typedElapsed !== null && typedElapsed < 0) {
         return Response.json({ error: 'Minutes elapsed cannot be negative.' }, { status: 400 });
       }
       /* The clock only applies to the two kinds the FSSAI rule is a RATE for. A
@@ -599,20 +765,57 @@ export async function POST(request: Request) {
       const clockApplies = !!kindMeta.window_minutes;
       const maxMinutesUsed = clockApplies ? range.max_minutes : null;
 
+      const id = generateId();
+      const readingAt = fssaiClock(body?.reading_at)
+        || new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata' });
+
+      /* ── ONE BATCH, ONE CURVE ────────────────────────────────────────────
+       * A cooling or reheating reading is placed on its batch's curve, and its
+       * minutes are COUNTED from that batch's first reading — never typed per
+       * reading. The first reading is also where the schedule line starts, which
+       * is what lets a reading taken half-way down be judged against where it
+       * should be by then instead of against the final target. */
+      let curve: FssaiCurveResolution | null = null;
+      if (clockApplies) {
+        curve = resolveFssaiCurve(db, {
+          logKind,
+          curveId: str(body?.curve_id),
+          batchId: str(body?.batch_id),
+          newCurve: body?.new_curve === true,
+          typedElapsed,
+          businessDate,
+          readingAt,
+          uom,
+          maxMinutes: maxMinutesUsed,
+          subject: { equipmentId, materialId, itemLabel, areaLabel, outletId },
+        });
+        if (!curve.ok) {
+          return Response.json({ error: curve.error, code: curve.code }, { status: curve.status });
+        }
+      }
+      const placed = curve && curve.ok ? curve : null;
+      const elapsed = placed ? placed.elapsed : null;
+      /* The curve's key goes in batch_id: the production batch when one was named,
+       * otherwise the id of the curve's first reading — THIS reading, when it
+       * starts one. Any other kind keeps whatever batch it was given. */
+      const batchIdToStore = placed ? (placed.key || id) : str(body?.batch_id);
+
       const verdict = judgeFssaiReading({
         value,
         min: range.min,
         max: range.max,
         uomForWords: uom === 'C' || uom === 'F' ? `°${uom}` : uom,
-        elapsedMinutes: clockApplies ? elapsed : null,
+        elapsedMinutes: elapsed,
         maxMinutes: maxMinutesUsed,
         target: range.target,
         direction: kindMeta.direction,
+        curveStart: placed
+          ? (placed.start
+            ? { value: placed.start.value, elapsedMinutes: placed.start.elapsed }
+            : { value, elapsedMinutes: placed.elapsed })
+          : null,
       });
 
-      const id = generateId();
-      const readingAt = fssaiClock(body?.reading_at)
-        || new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata' });
       const actionTaken = str(body?.action_taken).slice(0, 2000);
       const note = str(body?.note).slice(0, 2000);
 
@@ -651,9 +854,9 @@ export async function POST(request: Request) {
         ).run(
           id, businessDate, readingAt, shift, logKind,
           equipmentId, equipmentLabel, equipmentKind, areaLabel, departmentId,
-          materialId, itemLabel, str(body?.batch_id), range.standard_id,
+          materialId, itemLabel, batchIdToStore, range.standard_id,
           value, uom, range.decimals, range.min, range.max, range.target,
-          clockApplies ? elapsed : null, maxMinutesUsed,
+          elapsed, maxMinutesUsed,
           verdict.is_fail, verdict.is_judged, verdict.fail_reason, actionTaken, note,
           me.email || '', me.name || '', outletId,
         );
@@ -670,11 +873,12 @@ export async function POST(request: Request) {
             sourceKind: 'temperature',
             entityTable: 'fssai_temperature_logs',
             entityId: id,
-            title: `${fssaiTempLogKindLabel(logKind)} out of range — ${equipmentLabel || areaLabel || itemLabel || 'unnamed'}`,
+            title: `${fssaiTempLogKindLabel(logKind)} ${verdict.fail_reason.startsWith('Behind schedule') ? 'behind schedule' : 'out of range'} — ${equipmentLabel || areaLabel || itemLabel || 'unnamed'}`,
             description: [
               `${verdict.fail_reason}`,
               `Read as ${fssaiDisplayReading(value, range.decimals)} °${uom} at ${readingAt} on ${businessDate}${where ? ` (${where})` : ''}.`,
               range.source === 'none' ? '' : `Judged against ${rangeWords(range.min, range.max, uom)} — ${range.standard_label}.`,
+              placed ? placed.how : '',
               actionTaken ? `Done at the time: “${actionTaken}”` : '',
               note ? `Note on the reading: “${note}”` : '',
             ].filter(Boolean).join(' '),
@@ -706,6 +910,11 @@ export async function POST(request: Request) {
             equipment_label: equipmentLabel, area_label: areaLabel, item_label: itemLabel,
             value_num: value, uom, min_used: range.min, max_used: range.max,
             standard_id: range.standard_id, is_judged: verdict.is_judged, is_fail: verdict.is_fail,
+            ...(placed ? {
+              batch_id: batchIdToStore, curve_mode: placed.mode, elapsed_minutes: elapsed,
+              elapsed_typed: typedElapsed, max_minutes_used: maxMinutesUsed,
+              curve_start_id: placed.start ? placed.start.id : id,
+            } : {}),
           },
           reason: daysBack > 0
             ? `Entered for ${businessDate}, ${daysBack} day(s) back. Reason given: ${backdateReason}`
@@ -734,14 +943,32 @@ export async function POST(request: Request) {
         reading: shapeLog(row, photo?.ok ? 1 : 0),
         corrective_action: r ? { id: r.id, ca_number: r.ca_number, due_date: r.due_date, severity: r.severity } : null,
         photo,
+        /* Which batch this reading went onto, and the minutes the file counted —
+         * so the person can see at once if it joined the wrong pot. */
+        curve: placed ? {
+          id: batchIdToStore,
+          mode: placed.mode,
+          elapsed_minutes: elapsed,
+          elapsed_typed: typedElapsed,
+          max_minutes: maxMinutesUsed,
+          start: placed.start
+            ? { id: placed.start.id, business_date: placed.start.business_date, reading_at: placed.start.reading_at, value_num: placed.start.value }
+            : { id, business_date: businessDate, reading_at: readingAt, value_num: value },
+          how: placed.how,
+        } : null,
         /* THE ONE SENTENCE THAT MUST NOT BE LEFT TO THE SCREEN. An unjudged
          * reading is NOT a pass, and the person who just took it is the person who
          * most needs to know that. */
-        note_to_staff: verdict.is_judged
-          ? (verdict.is_fail
-            ? `Recorded as a failure. ${r ? `A follow-up job (${r.ca_number}) has been raised and is due by ${r.due_date}.` : 'The follow-up job could not be raised — tell a manager; the failure is on the record either way.'}`
-            : `Recorded. ${verdict.why}`)
-          : 'Recorded, but nothing judged it: no safe range has been set for this. It is NOT counted as a pass. Ask an administrator to set the range on the unit or add a rule in Settings.',
+        note_to_staff: [
+          verdict.is_judged
+            ? (verdict.is_fail
+              ? `Recorded as a failure. ${r ? `A follow-up job (${r.ca_number}) has been raised and is due by ${r.due_date}.` : 'The follow-up job could not be raised — tell a manager; the failure is on the record either way.'}`
+              : `Recorded. ${verdict.why}`)
+            : (range.source === 'none'
+              ? 'Recorded, but nothing judged it: no safe range has been set for this. It is NOT counted as a pass. Ask an administrator to set the range on the unit or add a rule in Settings.'
+              : `Recorded, but not judged. ${verdict.why}`),
+          placed ? placed.how : '',
+        ].filter(Boolean).join(' '),
       });
     }
 

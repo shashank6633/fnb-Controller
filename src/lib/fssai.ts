@@ -2531,22 +2531,53 @@ export const FSSAI_PEST_DEVICE_KINDS: readonly { key: string; label: string }[] 
  * 'vendor' needs a supplier, 'person' needs a staff email, 'equipment' needs a
  * unit, 'outlet' needs nothing. Without it, every document form would show
  * every field.
+ *
+ * THE AUTHORITY'S "ONE AUDIT FILE". The Hyderabad Food Safety Authority's
+ * checklist (docs/fssai/hyderabad-audit-checklist.json, section "Records You
+ * Should Keep Ready in One Audit File") asks for papers that had no slot here
+ * and could only be filed as an untyped 'Other': the FSDB photograph, the water
+ * bill, food sampling/lab reports, the waste disposal record and the previous
+ * audit report with its closure evidence. Its "Food-Grade Equipment &
+ * Packaging" section is answered on paper by the suppliers' food-grade
+ * declarations, which had no slot either.
+ * Those seven are marked below and labelled in the authority's own words, so
+ * the screen, the Documents report and Inspection Mode all print the line the
+ * inspector is reading from. ADDITIVE ONLY: no existing key or label changed,
+ * fssai_documents.doc_type has no CHECK constraint, and an existing row reads
+ * exactly as before. They are all 'outlet' scope on purpose — a packaging or
+ * equipment supplier and the waste collector are usually NOT in the vendors
+ * master, and a 'vendor' scope would refuse to file their paper at all; the
+ * supplier's name goes in "Who issued it".
  */
 export const FSSAI_DOC_TYPES: readonly {
   key: string; label: string; scope: 'outlet' | 'vendor' | 'person' | 'equipment'; renews?: true;
 }[] = [
   { key: 'fssai_licence',      label: 'FSSAI licence or registration', scope: 'outlet',    renews: true },
+  // Audit file: "FSDB photograph" / "Food Safety Display Board (FSDB) displayed and readable".
+  { key: 'fsdb_photo',         label: 'FSDB photograph (Food Safety Display Board)', scope: 'outlet' },
   { key: 'trade_licence',      label: 'Trade licence',                 scope: 'outlet',    renews: true },
   { key: 'fire_noc',           label: 'Fire NOC',                      scope: 'outlet',    renews: true },
   { key: 'gst',                label: 'GST registration',              scope: 'outlet' },
   { key: 'insurance',          label: 'Insurance',                     scope: 'outlet',    renews: true },
   { key: 'water_test',         label: 'Water test report',             scope: 'outlet',    renews: true },
+  // Audit file: "Water test report / water bill" — the bill half had no slot.
+  { key: 'water_bill',         label: 'Municipal water bill',          scope: 'outlet' },
   { key: 'pest_contract',      label: 'Pest control contract',         scope: 'vendor',    renews: true },
   { key: 'supplier_licence',   label: 'Supplier FSSAI licence',        scope: 'vendor',    renews: true },
   { key: 'medical_fitness',    label: 'Medical fitness certificate',   scope: 'person',    renews: true },
   { key: 'food_handler_training', label: 'Food handler training',      scope: 'person',    renews: true },
   { key: 'calibration_certificate', label: 'Calibration certificate',  scope: 'equipment', renews: true },
   { key: 'amc',                label: 'Service contract (AMC)',        scope: 'equipment', renews: true },
+  // Food-Grade Equipment & Packaging: "Food-contact equipment is food-safe".
+  { key: 'food_grade_equipment_declaration', label: 'Food-grade declaration — food-contact equipment', scope: 'outlet' },
+  // Food-Grade Equipment & Packaging: "Food-grade packaging for delivery".
+  { key: 'food_grade_packaging_declaration', label: 'Food-grade declaration — packaging for delivery', scope: 'outlet' },
+  // Audit file: "Food sampling/lab reports, where applicable". Water has its own register.
+  { key: 'food_lab_report',    label: 'Food sampling/lab report',      scope: 'outlet' },
+  // Audit file: "Waste disposal record" — the collector's (GHMC or agency) receipt or agreement.
+  { key: 'waste_disposal_record', label: 'Waste disposal record',      scope: 'outlet' },
+  // Audit file: "Previous audit report and closure evidence".
+  { key: 'audit_report',       label: 'Previous audit report and closure evidence', scope: 'outlet' },
   { key: 'lease',              label: 'Lease or premises document',    scope: 'outlet' },
   { key: 'other',              label: 'Other',                         scope: 'outlet' },
 ] as const;

@@ -19,6 +19,7 @@ import {
   fssaiRecordVisibility, fssaiClock, fssaiNum, fssaiInt, FSSAI_BACKDATE_DAYS,
   fssaiReceivingLineFails as lineFails, fssaiReceivingLineGaps as lineGaps,
 } from '../_p4/lib';
+import { vendorWarningLookup } from '@/app/api/vendors/fssai-register';
 
 /**
  * RECEIVING QC (/api/fssai/receiving) — owner §2: check the delivery at the door.
@@ -59,6 +60,15 @@ import {
  *   GET  [?from=&to=&vendor_id=&status=&fails=1&q=]
  *   POST { action: 'create'|'save_header'|'save_line'|'remove_line'|'submit'
  *                  |'verify'|'void'|'attach', … }
+ *
+ * ── THE APPROVED-VENDOR WARNING (Hyderabad checklist, owner's ruling) ────────
+ * When the supplier is marked NOT APPROVED on the vendor register, or the
+ * supplier licence filed for them had expired before the delivery day, the
+ * prefill, the open-delivery queue, the list, the record, create and submit all
+ * carry a `vendor_warning` object. It WARNS AND NEVER BLOCKS: nothing here reads
+ * it to refuse, and it writes nothing. When there is nothing to say the key is
+ * ABSENT — not null — so an ordinary delivery's reply is byte-identical to the
+ * one before the register existed. See src/app/api/vendors/fssai-register.ts.
  */
 export const dynamic = 'force-dynamic';
 
@@ -237,6 +247,23 @@ function shapeLine(row: any, today: string, photoCount = 0) {
  * are the only pieces of this route a throwaway probe can call directly, and a
  * verdict rule that cannot be exercised is a verdict rule nobody has checked. */
 
+/**
+ * `{ vendor_warning }` when the register has something to say, and `{}` when it
+ * does not — spread LAST into a reply, so an ordinary delivery's reply keeps
+ * exactly the keys, in exactly the order, it had before the register existed.
+ * A lookup that fails is logged and treated as nothing to say: the warning is
+ * advisory and must never be the reason a delivery cannot be recorded.
+ */
+function withVendorWarning(compute: () => unknown): Record<string, unknown> {
+  try {
+    const w = compute();
+    return w ? { vendor_warning: w } : {};
+  } catch (e) {
+    console.error('receiving: the approved-vendor check could not run (the delivery is unaffected):', e);
+    return {};
+  }
+}
+
 export async function GET(request: Request) {
   const g = await requireFssaiUser();
   if ('resp' in g) return g.resp;
@@ -347,6 +374,9 @@ export async function GET(request: Request) {
         note: items.length
           ? 'These are the lines already recorded on the goods receipt. Checking them here does not change any quantity on the delivery or in stock — this record says whether what arrived was fit, and the goods receipt stays the place the quantity lives.'
           : 'That delivery has no lines recorded on it yet.',
+        ...withVendorWarning(() =>
+          vendorWarningLookup(db, today).forVendor(String(grn.vendor_id || ''), String(grn.vendor || grn.vendor_name_now || ''), String(grn.date || '')),
+        ),
       });
     }
 
@@ -369,6 +399,7 @@ export async function GET(request: Request) {
           ORDER BY g.date DESC, g.rowid DESC
           LIMIT 100`,
       ).all(since) as any[];
+      const warnFor = vendorWarningLookup(db, today);
       return Response.json({
         since,
         grns: rows.map((r) => ({
@@ -377,6 +408,7 @@ export async function GET(request: Request) {
           vendor_name: String(r.vendor || ''), invoice_number: String(r.invoice_number || ''),
           status: String(r.status || ''), qc_outcome: String(r.qc_outcome || ''),
           line_count: Number(r.line_count) || 0,
+          ...withVendorWarning(() => warnFor.forVendor(String(r.vendor_id || ''), String(r.vendor || ''), String(r.date || ''))),
         })),
       });
     }
@@ -434,6 +466,9 @@ export async function GET(request: Request) {
          * likely to be mistaken for a stock screen. */
         no_stock_movement: 'Accepting or rejecting a line here records what you found. It does not change any quantity on the goods receipt or in stock — that stays with the delivery.',
         today,
+        ...withVendorWarning(() =>
+          vendorWarningLookup(db, today).forVendor(String(row.vendor_id || ''), String(row.vendor_name || ''), String(row.business_date || '')),
+        ),
       });
     }
 
@@ -476,8 +511,12 @@ export async function GET(request: Request) {
 
     const photoCounts = fssaiAttachmentCounts(db, 'fssai_receiving_checks', rows.map((r) => String(r.id)));
     const q = str(url.searchParams.get('q')).toLowerCase();
+    const warnFor = vendorWarningLookup(db, today);
     const shaped = rows
-      .map((r) => shapeCheck(r, photoCounts.get(String(r.id)) || 0))
+      .map((r) => ({
+        ...shapeCheck(r, photoCounts.get(String(r.id)) || 0),
+        ...withVendorWarning(() => warnFor.forVendor(String(r.vendor_id || ''), String(r.vendor_name || ''), String(r.business_date || ''))),
+      }))
       .filter((r) => !q
         || r.check_no.toLowerCase().includes(q)
         || r.vendor_name.toLowerCase().includes(q)
@@ -706,6 +745,9 @@ export async function POST(request: Request) {
         check: shapeCheck(row),
         lines: lineRows.map((l) => shapeLine(l, today)),
         note: 'Draft started. Nothing is in the file until you submit it, and the inspection number is given then — so an inspection abandoned at the door does not leave a gap in the series.',
+        /* Computed AFTER the draft is written and never before: the warning cannot
+         * stop the draft, by construction. */
+        ...withVendorWarning(() => vendorWarningLookup(db, today).forVendor(vendorId, vendorName, businessDate)),
       });
     }
 
@@ -1287,6 +1329,11 @@ export async function POST(request: Request) {
         /* Said out loud, because a checker who has just rejected a pallet will
          * reasonably expect the stock to have moved. HARD RULE 5. */
         no_stock_movement: 'Nothing was taken out of stock. FSSAI records what was found; the quantity is still the goods receipt\'s to change.',
+        /* After the filing committed — the warning rides on a receipt that is
+         * already complete, and cannot undo it. */
+        ...withVendorWarning(() =>
+          vendorWarningLookup(db, today).forVendor(String(out?.vendor_id || ''), String(out?.vendor_name || ''), String(out?.business_date || '')),
+        ),
       });
     }
 

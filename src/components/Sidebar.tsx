@@ -91,6 +91,7 @@ import {
   Droplets,
   Beaker,
   Eye,
+  FolderCheck,
   type LucideIcon,
 } from "lucide-react";
 
@@ -574,6 +575,8 @@ const navTree: NavEntry[] = [
       // carries adminOnly, so it hides itself for everyone else.
       { kind: "link", label: "Equipment & Cold Units",              href: "/fssai/settings/equipment", icon: Snowflake },
       { kind: "link", label: "Inspection Mode",                     href: "/fssai/inspection-mode",    icon: Eye },
+      // mgmtOnly in the catalog — the authority's 20-record audit file and its PDF.
+      { kind: "link", label: "Audit File",                          href: "/fssai/audit-file",         icon: FolderCheck },
     ],
   },
 

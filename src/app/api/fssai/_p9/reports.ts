@@ -6,9 +6,13 @@ import {
   fssaiInspectionStatusMeta, fssaiCaStatusMeta, fssaiCaSeverityMeta,
   fssaiReceivingDecisionMeta, fssaiRecordStatusMeta, fssaiRunStatusMeta,
   fssaiPestServiceStatusMeta, fssaiPestSeverityMeta,
-  fssaiTempLogKindLabel, fssaiWaterTestKind,
+  fssaiTempLogKindLabel, fssaiWaterTestKind, FSSAI_TEMP_LOG_KINDS,
 } from '@/lib/fssai';
 import { dateClause, deptLabel, intOr, intOrBlank, numOrBlank, whereAll, type DateWindow } from './lib';
+import {
+  fssaiCurveMembers, fssaiCurveReached, fssaiCurveExpected, fssaiCurveExpectedShown, fssaiTempDirection,
+  type FssaiCurveMember,
+} from '../_p4/lib';
 
 /**
  * THE FSSAI REPORT REGISTRY (owner §18).
@@ -149,6 +153,44 @@ export function primeDeptNames(db: Database.Database, names: Map<string, string>
 function verdictWord(isFail: unknown, isJudged: unknown): string {
   if (intOr(isJudged, 1) === 0) return 'Not judged';
   return intOr(isFail, 0) === 1 ? 'FAIL' : 'In range';
+}
+
+/**
+ * The verdict word for a temperature reading. Identical to verdictWord except
+ * for a cooling or reheating reading that PASSED while still short of its target:
+ * that is "On schedule", not "In range" — 30 °C an hour into cooling is not in a
+ * 5 °C range, it is where the schedule allowed it to be. Read from the frozen
+ * columns only (is_fail, is_judged, value_num, target/min/max_used); nothing is
+ * re-judged.
+ */
+function tempVerdictWord(r: any): string {
+  const base = verdictWord(r.is_fail, r.is_judged);
+  if (base !== 'In range' || !isRateKind(r.log_kind)) return base;
+  const v = numOrNull(r.value_num);
+  const dir = fssaiTempDirection(String(r.log_kind || ''));
+  const goal = numOrNull(r.target_used) ?? (dir === 'hot' ? numOrNull(r.min_used) : numOrNull(r.max_used));
+  if (v === null || goal === null) return base;
+  const short = dir === 'hot' ? v < goal : v > goal;
+  return short ? 'On schedule' : base;
+}
+
+/** "60 of 240" — minutes counted on the batch's clock, and the time allowed. */
+function minutesWords(r: any): string {
+  const e = intOrBlank(r.elapsed_minutes);
+  if (!e) return '';
+  const m = intOrBlank(r.max_minutes_used);
+  return m ? `${e} of ${m}` : e;
+}
+
+function numOrNull(v: unknown): number | null {
+  if (v === null || v === undefined || v === '') return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+/** Cooling and reheating — the kinds judged on a clock and kept as a curve. */
+function isRateKind(logKind: unknown): boolean {
+  return !!FSSAI_TEMP_LOG_KINDS.find((k) => k.key === String(logKind || ''))?.window_minutes;
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -600,6 +642,7 @@ export const FSSAI_REPORTS: FssaiReportDef[] = [
       { key: 'value', label: 'Reading', align: 'right', width: 0.9 },
       { key: 'uom', label: 'Unit', width: 0.6 },
       { key: 'range', label: 'Range applied', width: 1.2 },
+      { key: 'minutes', label: 'Minutes', align: 'right', width: 0.9, secondary: true },
       { key: 'verdict', label: 'Verdict', width: 1 },
       { key: 'action', label: 'Action taken', width: 1.8, secondary: true },
       { key: 'by', label: 'By', width: 1.3, secondary: true },
@@ -634,7 +677,8 @@ export const FSSAI_REPORTS: FssaiReportDef[] = [
           numOrBlank(r.value_num, intOr(r.decimals, 1)),
           String(r.uom || ''),
           range.length ? range.join(' and ') : 'none set',
-          verdictWord(r.is_fail, r.is_judged),
+          minutesWords(r),
+          tempVerdictWord(r),
           String(r.action_taken || ''),
           String(r.recorded_name || r.recorded_by || ''),
           fssaiRecordStatusMeta(r.status).label,
@@ -650,7 +694,10 @@ export const FSSAI_REPORTS: FssaiReportDef[] = [
         ],
         note:
           'The range shown is the one that WAS APPLIED when the reading was taken, frozen on the record. ' +
-          '"No range set" is not a pass — it means the reading exists and nothing judged it.',
+          '"No range set" is not a pass — it means the reading exists and nothing judged it. ' +
+          'For cooling and reheating, "Minutes" is counted from the batch\'s first reading against the time allowed, ' +
+          'and "On schedule" means the food had not reached the target yet but was where it needed to be by then — ' +
+          'see the Cooling and reheating sheet for each batch reading by reading.',
       };
     },
   },
@@ -713,6 +760,151 @@ export const FSSAI_REPORTS: FssaiReportDef[] = [
           { label: 'With nothing recorded as done', value: String(noAction) },
         ],
         note: 'Voided readings are excluded from this one report, because a breach that was entered in error is not a breach.',
+      };
+    },
+  },
+
+  /* ── 8b. the cooling (and reheating) monitoring sheet ─────────────────── */
+  {
+    key: 'cooling-sheet',
+    label: 'Cooling and reheating sheet',
+    group: 'Temperature',
+    blurb: 'Each batch cooled or reheated, reading by reading: when it started and at what temperature, the minutes counted for each reading, where it needed to be by then, and whether it reached the target in time.',
+    requires: ['fssai_temperature_logs'],
+    dateLabel: 'the day the reading belongs to',
+    hasDepartment: true,
+    columns: [
+      { key: 'batch', label: 'Batch', width: 1.8 },
+      { key: 'kind', label: 'What', width: 0.9 },
+      { key: 'started', label: 'Started', width: 1.5 },
+      { key: 'business_date', label: 'Date', width: 0.9, secondary: true },
+      { key: 'reading_at', label: 'Time', width: 0.7 },
+      { key: 'minutes', label: 'Minutes', align: 'right', width: 0.8 },
+      { key: 'value', label: 'Reading', align: 'right', width: 0.8 },
+      { key: 'needed', label: 'Needed by then', align: 'right', width: 1 },
+      { key: 'rule', label: 'Rule', width: 1.4 },
+      { key: 'verdict', label: 'Verdict', width: 1 },
+      { key: 'outcome', label: 'Batch outcome', width: 1.7 },
+      { key: 'detail', label: 'Why / action taken', width: 2, secondary: true },
+      { key: 'by', label: 'By', width: 1.2, secondary: true },
+      { key: 'status', label: 'Status', width: 0.8 },
+    ],
+    run(ctx) {
+      const kinds = FSSAI_TEMP_LOG_KINDS.filter((k) => k.window_minutes).map((k) => k.key);
+      const w = whereAll([
+        { sql: `tl.log_kind IN (${kinds.map(() => '?').join(',')})`, args: kinds },
+        dateClause('tl.business_date', ctx.window),
+        deptFilter(ctx, 'tl'),
+        statusFilter(ctx, 'tl'),
+        textFilter(ctx, ['tl.equipment_label', 'tl.area_label', 'tl.item_label', 'tl.recorded_by']),
+      ]);
+      const rows = ctx.db.prepare(
+        `SELECT tl.* FROM fssai_temperature_logs tl ${w.sql}
+          ORDER BY tl.business_date DESC, tl.reading_at DESC LIMIT ?`,
+      ).all(...w.args, lim(ctx) + 1) as any[];
+      const truncated = rows.length > lim(ctx);
+      const page = truncated ? rows.slice(0, lim(ctx)) : rows;
+
+      /* ONE BATCH = ONE CURVE. Its key is batch_id, or the reading's own id for a
+       * batch's first reading (see resolveFssaiCurve). The start, the outcome and
+       * the schedule are read from the WHOLE batch, not just the rows inside the
+       * date window, so a batch that began late last night still shows where it
+       * started. Each reading's verdict is its own frozen one. */
+      interface Batch {
+        key: string; kind: string; members: FssaiCurveMember[]; start: FssaiCurveMember | null;
+        rows: any[]; outcome: string; firstMinute: string;
+      }
+      const batches = new Map<string, Batch>();
+      for (const r of page) {
+        const kind = String(r.log_kind || '');
+        const key = String(r.batch_id || '') || String(r.id);
+        const id = `${kind}|${key}`;
+        let b = batches.get(id);
+        if (!b) {
+          const members = fssaiCurveMembers(ctx.db, kind, key, true);
+          const live = members.filter((m) => m.status !== 'void');
+          const start = live[0] || null;
+          const reached = fssaiCurveReached(live, kind);
+          const breach = live.some((m) => m.is_fail === 1);
+          const limit = start ? start.max_minutes : null;
+          const lastLive = live[live.length - 1] || null;
+          const outcome = breach
+            ? 'Breach recorded on this batch'
+            : reached
+              ? (limit !== null && reached.elapsed !== null && reached.elapsed > limit
+                ? `Reached ${numOrBlank(reached.value, 1)} at ${reached.elapsed} min — AFTER the ${limit} allowed`
+                : `Reached ${numOrBlank(reached.value, 1)} at ${reached.elapsed ?? '?'} min — in time`)
+              : (lastLive
+                ? `Not finished — last ${numOrBlank(lastLive.value, 1)} at ${lastLive.elapsed ?? '?'} min, no reading at the target`
+                : 'Every reading voided');
+          b = {
+            key, kind, members, start, rows: [], outcome,
+            firstMinute: start ? `${start.business_date} ${start.reading_at}` : `${String(r.business_date || '')} ${String(r.reading_at || '')}`,
+          };
+          batches.set(id, b);
+        }
+        b.rows.push(r);
+      }
+
+      const ordered = Array.from(batches.values()).sort((a, b) => b.firstMinute.localeCompare(a.firstMinute));
+      let inTime = 0; let breaches = 0; let unfinished = 0;
+      const cells: Array<Array<string | number>> = [];
+      for (const b of ordered) {
+        if (b.outcome.startsWith('Breach')) breaches++;
+        else if (b.outcome.startsWith('Reached') && b.outcome.endsWith('in time')) inTime++;
+        else if (b.outcome.startsWith('Not finished')) unfinished++;
+        const dir = fssaiTempDirection(b.kind);
+        const order = new Map(b.members.map((m, i) => [m.id, i]));
+        b.rows.sort((x, y) => (order.get(String(x.id)) ?? 0) - (order.get(String(y.id)) ?? 0));
+        for (const r of b.rows) {
+          const uom = String(r.uom || 'C');
+          const u = uom === 'C' || uom === 'F' ? ` °${uom}` : ` ${uom}`;
+          const m = b.members.find((x) => x.id === String(r.id)) || null;
+          const goal = b.start ? b.start.goal : null;
+          const limit = b.start ? b.start.max_minutes : null;
+          const expected = m && String(r.status) !== 'void'
+            ? fssaiCurveExpected({
+              startValue: b.start ? b.start.value : null, startElapsed: b.start ? b.start.elapsed : null,
+              goal, maxMinutes: limit, elapsed: m.elapsed,
+            })
+            : null;
+          const side = dir === 'hot' ? '≥' : '≤';
+          const ruleGoal = numOrNull(r.target_used) ?? (dir === 'hot' ? numOrNull(r.min_used) : numOrNull(r.max_used));
+          const ruleLimit = intOrBlank(r.max_minutes_used);
+          cells.push([
+            [String(r.item_label || ''), String(r.equipment_label || r.area_label || '')].filter(Boolean).join(' · ') || 'Unnamed',
+            fssaiTempLogKindLabel(r.log_kind),
+            b.start
+              ? `${b.start.business_date !== String(r.business_date || '') ? `${b.start.business_date} ` : ''}${b.start.reading_at} at ${numOrBlank(b.start.value, 1)}${u}`
+              : '',
+            String(r.business_date || ''),
+            String(r.reading_at || ''),
+            intOrBlank(r.elapsed_minutes),
+            numOrBlank(r.value_num, intOr(r.decimals, 1)),
+            expected === null ? '' : `${side} ${fssaiCurveExpectedShown(expected, dir)}`,
+            ruleGoal === null ? 'none set' : `${side} ${numOrBlank(ruleGoal, 1)}${u}${ruleLimit ? ` within ${ruleLimit} min` : ''}`,
+            tempVerdictWord(r),
+            b.outcome,
+            [String(r.fail_reason || ''), String(r.action_taken || '') ? `Done: ${String(r.action_taken)}` : ''].filter(Boolean).join(' '),
+            String(r.recorded_name || r.recorded_by || ''),
+            fssaiRecordStatusMeta(r.status).label,
+          ]);
+        }
+      }
+      return {
+        cells,
+        truncated,
+        kpis: [
+          { label: 'Batches', value: String(ordered.length) },
+          { label: 'Reached the target in time', value: String(inTime) },
+          { label: 'With a breach', value: String(breaches) },
+          { label: 'Not finished', value: String(unfinished), sub: 'no reading at the target' },
+        ],
+        note:
+          'One block per batch, readings in the order they were taken. "Minutes" is counted by the system from the batch\'s first reading, not typed. ' +
+          '"Needed by then" is where the batch had to be at that point — a straight line from its first reading to the target at the time allowed; ' +
+          '"On schedule" means short of the target but where it needed to be. Each verdict is the one frozen on the reading when it was taken. ' +
+          '"Not finished" means no reading at the target was ever recorded.',
       };
     },
   },
@@ -1183,10 +1375,14 @@ export const FSSAI_REPORTS: FssaiReportDef[] = [
         dateClause('d.expiry_date', ctx.window),
         deptFilter(ctx, 'd'),
         statusFilter(ctx, 'd'),
-        textFilter(ctx, ['d.title', 'd.reference_no', 'd.issuer', 'd.owner_email', 'd.person_email']),
+        textFilter(ctx, ['d.title', 'd.reference_no', 'd.issuer', 'd.owner_email', 'd.person_email', 'v.name']),
       ]);
+      /* The supplier's NAME, joined — the column used to print the raw vendor_id
+       * UUID, which tells an inspector nothing about whose licence it is. */
       const rows = ctx.db.prepare(
-        `SELECT d.* FROM fssai_documents d ${w.sql}
+        `SELECT d.*, IFNULL(v.name, '') AS vendor_name
+           FROM fssai_documents d
+           LEFT JOIN vendors v ON v.id = d.vendor_id ${w.sql}
           ORDER BY (CASE WHEN d.expiry_date = '' THEN 1 ELSE 0 END) ASC, d.expiry_date ASC LIMIT ?`,
       ).all(...w.args, lim(ctx) + 1) as any[];
       const truncated = rows.length > lim(ctx);
@@ -1200,7 +1396,12 @@ export const FSSAI_REPORTS: FssaiReportDef[] = [
         const days = exp
           ? String(Math.round((Date.parse(`${exp}T00:00:00Z`) - Date.parse(`${ctx.today}T00:00:00Z`)) / 86400000))
           : '';
-        const belongs = String(r.person_email || '') || String(r.vendor_id || '') || deptName(ctx, r.department_id) || '';
+        /* A supplier document whose vendor row has gone says so in words rather
+         * than falling back to an id nobody can read. */
+        const vendor = String(r.vendor_id || '')
+          ? (String(r.vendor_name || '').trim() || 'A supplier no longer on the vendor list')
+          : '';
+        const belongs = String(r.person_email || '') || vendor || deptName(ctx, r.department_id) || '';
         return [
           fssaiDocType(r.doc_type)?.label || String(r.doc_type || ''),
           String(r.title || ''),

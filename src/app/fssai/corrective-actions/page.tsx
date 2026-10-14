@@ -42,11 +42,13 @@
  *   somebody was told yesterday. The rules live behind "Chasing" (management
  *   reads them, an administrator changes them).
  *
- * ONE THING IT STILL CANNOT PROMISE, said on the panel rather than hidden: there
- * is no fixed-time job on the server for the chase. An action is chased the
- * first time somebody opens this queue each day, and whenever a manager presses
- * "Chase now". Arming it unattended needs one line in the app's scheduler, which
- * is not this module's file to edit.
+ * WHETHER THE CHASE RUNS UNATTENDED IS SAID ON EVIDENCE, NOT FROM THE CODE. The
+ * app's scheduler now runs it (src/lib/fssai-jobs.ts), but a wired job is not a
+ * running one — the scheduler is production-only, and a stopped server ticks
+ * nothing. So the Chasing panel prints what GET /api/fssai/escalations reads off
+ * the scheduler's heartbeat: when it last ran and what that run did, or that
+ * there is no record of it running, or that it has stopped. Opening this queue
+ * and "Chase now" still chase too.
  *
  * Styling is the house skeleton (RECON §1.3-1.6) as /fssai/verification uses
  * it: the #FFF8F0 page, the #af4408 heading with an icon tile, white cards
@@ -106,6 +108,14 @@ interface EscalationPicture {
   told_today: number; last_sweep_at: string;
 }
 
+/** What GET /api/fssai/escalations read off the scheduler's heartbeat. */
+interface JobsTruth {
+  state: 'never' | 'running' | 'stopped';
+  last_tick_at: string;
+  minutes_since: number | null;
+  chase: { outcome: string; people_told: number; errors: number; words: string } | null;
+}
+
 interface RulesResponse {
   rules: FssaiEscalationRules;
   defaults: FssaiEscalationRules;
@@ -113,7 +123,9 @@ interface RulesResponse {
   targets: { key: FssaiEscalationTarget; label: string; note: string }[];
   can_edit: boolean;
   today: string;
+  /** The heartbeat in one sentence — when the scheduler last chased and what it did. */
   arming: string;
+  jobs?: JobsTruth;
 }
 
 const TABS = [
@@ -163,6 +175,45 @@ function whereFrom(a: FssaiCaView): string {
     a.run.target_label,
     a.run.shift,
   ].filter(Boolean).join(' · ');
+}
+
+/**
+ * THE FAILED ANSWER — only when this action really hangs off a checklist answer.
+ *
+ * Actions raised from a temperature reading (_p4 raiseFssaiRecordCa) or a
+ * delivery line (receiving) put THAT RECORD's id in response_id; the _p5
+ * oil/water/expiry raiser writes '' today, but nothing stops it — or the next
+ * raiser — from doing the same. The shared
+ * FSSAI_CA_SELECT then joins it to fssai_responses, misses, and shapeFssaiCa
+ * still builds an answer out of the empty columns — fssaiAnswerInWords of
+ * nothing is '—' — which printed 'Recorded as "—" — which failed.' about a
+ * reading that had a real value. fssai_responses.question_id is NOT NULL, so
+ * a real join always carries one: an empty question_id is the join missing, and
+ * there is no answer to show. The reading itself is in the description.
+ */
+function failedAnswer(a: FssaiCaView): FssaiCaView['answer'] {
+  return a.answer && a.question_id ? a.answer : null;
+}
+
+function FailedAnswer({ a, variant }: { a: FssaiCaView; variant: 'row' | 'detail' }) {
+  const ans = failedAnswer(a);
+  if (!ans) return null;
+  const said = `${ans.text}${ans.uom ? ` ${ans.uom}` : ''}`;
+  if (variant === 'row') {
+    return ans.text ? (
+      <span className="block text-xs text-[#8B7355]">recorded as “{said}”</span>
+    ) : null;
+  }
+  return (
+    <>
+      {ans.text && (
+        <p className="text-sm text-red-800 mt-1">Recorded as “{said}” — which failed.</p>
+      )}
+      {ans.note && (
+        <p className="text-xs text-[#6B5744] mt-1">Note on the answer: “{ans.note}”</p>
+      )}
+    </>
+  );
 }
 
 function Pills({ a }: { a: FssaiCaView }) {
@@ -482,11 +533,7 @@ export default function FssaiCorrectiveActionsPage() {
                     </td>
                     <td className="px-4 py-2 align-top max-w-[22rem]">
                       <span className="text-[#2D1B0E]">{a.title}</span>
-                      {a.answer?.text && (
-                        <span className="block text-xs text-[#8B7355]">
-                          recorded as “{a.answer.text}{a.answer.uom ? ` ${a.answer.uom}` : ''}”
-                        </span>
-                      )}
+                      <FailedAnswer a={a} variant="row" />
                     </td>
                     <td className="px-4 py-2 align-top text-xs text-[#6B5744] max-w-[16rem] truncate">{whereFrom(a)}</td>
                     <td className="px-4 py-2 align-top text-xs">
@@ -642,14 +689,7 @@ function ActionModal({
               <div className="bg-white border border-[#E8D5C4] rounded-xl p-3">
                 <Pills a={a} />
                 <p className="text-base font-semibold text-[#2D1B0E] mt-1.5">{a.title}</p>
-                {a.answer?.text && (
-                  <p className="text-sm text-red-800 mt-1">
-                    Recorded as “{a.answer.text}{a.answer.uom ? ` ${a.answer.uom}` : ''}” — which failed.
-                  </p>
-                )}
-                {a.answer?.note && (
-                  <p className="text-xs text-[#6B5744] mt-1">Note on the answer: “{a.answer.note}”</p>
-                )}
+                <FailedAnswer a={a} variant="detail" />
                 <p className="text-xs text-[#6B5744] mt-1.5">{whereFrom(a)}</p>
                 {a.run && (
                   <p className="text-xs text-[#6B5744] mt-0.5">
@@ -1161,11 +1201,47 @@ function ActionModal({
  * anybody else, 403, and the save button is not offered without `can_edit`).
  *
  * THE ONE SENTENCE THIS PANEL MUST NOT LEAVE OUT is the arming note the server
- * sends: there is no fixed-time job for the chase, so an action is chased the
- * first time somebody opens this queue each day. A screen promising scheduled
- * escalation it does not have is exactly the guard that reads correctly and
- * never fires.
+ * sends, built from the scheduler's heartbeat: when the unattended chase last
+ * ran and what it did — or that there is no record of it running, or that it
+ * has stopped. A screen promising a scheduled chase that is not happening is
+ * the guard that reads correctly and never fires; a screen denying one that is
+ * happening tells a manager nobody is chasing when somebody is. Both are wrong,
+ * so the panel prints the evidence and nothing else.
  * ------------------------------------------------------------------ */
+
+/** The arming note, toned by what the heartbeat shows. No heartbeat data → plain. */
+function SchedulerNote({ arming, jobs }: { arming: string; jobs?: JobsTruth }) {
+  const state = jobs?.state;
+  const tone = state === 'running'
+    ? 'bg-green-50 border-green-200'
+    : state === 'stopped'
+      ? 'bg-red-50 border-red-200'
+      : state === 'never'
+        ? 'bg-amber-50 border-amber-200'
+        : 'bg-[#FFF1E3] border-[#E8D5C4]';
+  const head = state === 'running'
+    ? 'Running by itself.'
+    : state === 'stopped'
+      ? 'Stopped.'
+      : state === 'never'
+        ? 'Never run by itself here.'
+        : null;
+  return (
+    <div className={`border rounded-xl p-3 ${tone}`}>
+      <div className="flex flex-nowrap items-start gap-2.5">
+        {state === 'running'
+          ? <BellRing size={15} className="text-green-700 shrink-0 mt-0.5" />
+          : state === 'stopped' || state === 'never'
+            ? <AlertTriangle size={15} className={`${state === 'stopped' ? 'text-red-700' : 'text-amber-800'} shrink-0 mt-0.5`} />
+            : <Info size={15} className="text-[#af4408] shrink-0 mt-0.5" />}
+        <div className="min-w-0">
+          {head && <p className="text-xs font-semibold text-[#2D1B0E]">{head}</p>}
+          <p className="text-xs text-[#3D2614]">{arming}</p>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 function ChasingModal({
   onClose, onChanged,
@@ -1308,13 +1384,8 @@ function ChasingModal({
                 </p>
               </div>
 
-              {/* ── the honest sentence about arming ───────────────────────── */}
-              <div className="bg-[#FFF1E3] border border-[#E8D5C4] rounded-xl p-3">
-                <div className="flex flex-nowrap items-start gap-2.5">
-                  <Info size={15} className="text-[#af4408] shrink-0 mt-0.5" />
-                  <p className="text-xs text-[#3D2614]">{v.arming}</p>
-                </div>
-              </div>
+              {/* ── the honest sentence about arming, off the heartbeat ────── */}
+              <SchedulerNote arming={v.arming} jobs={v.jobs} />
 
               <button
                 onClick={() => void chaseNow()}

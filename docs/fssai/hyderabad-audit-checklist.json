@@ -1,0 +1,489 @@
+{
+  "source": "Hyderabad Food Safety Authority — FOOD SAFETY AUDIT CHECKLIST.xlsx (owner-supplied 2026-10-13)",
+  "format": "YES / NO / REMARK per line",
+  "sections": [
+    {
+      "section": "Licences & Display",
+      "items": [
+        {
+          "item": "FSSAI licence displayed prominently"
+        },
+        {
+          "item": "Food Safety Display Board (FSDB) displayed and readable"
+        },
+        {
+          "item": "GHMC trade/municipal licence available"
+        },
+        {
+          "item": "Fire/safety documents as applicable"
+        },
+        {
+          "item": "Pest-control agency agreement and latest service report"
+        },
+        {
+          "item": "Food-handler medical examination records"
+        },
+        {
+          "item": "Water testing report / municipal water bill records"
+        },
+        {
+          "item": "Approved vendor list maintained"
+        }
+      ]
+    },
+    {
+      "section": "Kitchen & Premises Hygiene",
+      "items": [
+        {
+          "item": "Kitchen floors clean, dry and non-slippery"
+        },
+        {
+          "item": "Walls and ceiling clean; no peeling paint/plaster"
+        },
+        {
+          "item": "No water stagnation"
+        },
+        {
+          "item": "Proper drainage"
+        },
+        {
+          "item": "Exhaust/hood clean"
+        },
+        {
+          "item": "Adequate lighting"
+        },
+        {
+          "item": "Light fittings protected against breakage"
+        },
+        {
+          "item": "Doors/windows clean and pest-proof"
+        },
+        {
+          "item": "No unnecessary items stored in food areas"
+        }
+      ]
+    },
+    {
+      "section": "Storage – Very Important",
+      "items": [
+        {
+          "item": "FIFO followed"
+        },
+        {
+          "item": "FEFO followed"
+        },
+        {
+          "item": "All containers properly covered"
+        },
+        {
+          "item": "Food-grade containers used"
+        },
+        {
+          "item": "No food stored directly on floor"
+        },
+        {
+          "item": "Raw and cooked food separated"
+        },
+        {
+          "item": "Veg and non-veg properly segregated"
+        },
+        {
+          "item": "Chemicals stored separately from food"
+        },
+        {
+          "item": "Personal items kept outside food-storage areas"
+        },
+        {
+          "item": "Dry store clean and pest-free"
+        },
+        {
+          "item": "Refrigerator/freezer temperature recorded daily"
+        },
+        {
+          "item": "Expired/damaged products immediately removed"
+        }
+      ]
+    },
+    {
+      "section": "Food Temperature Control",
+      "items": [
+        {
+          "item": "Receiving",
+          "group": "Maintain a temperature monitoring sheet for"
+        },
+        {
+          "item": "Refrigerators",
+          "group": "Maintain a temperature monitoring sheet for"
+        },
+        {
+          "item": "Freezers",
+          "group": "Maintain a temperature monitoring sheet for"
+        },
+        {
+          "item": "Hot holding",
+          "group": "Maintain a temperature monitoring sheet for"
+        },
+        {
+          "item": "Cooking",
+          "group": "Maintain a temperature monitoring sheet for"
+        },
+        {
+          "item": "Reheating",
+          "group": "Maintain a temperature monitoring sheet for"
+        },
+        {
+          "item": "Cooling",
+          "group": "Maintain a temperature monitoring sheet for"
+        }
+      ]
+    },
+    {
+      "section": "Food Preparation",
+      "items": [
+        {
+          "item": "Raw materials washed/cleaned properly"
+        },
+        {
+          "item": "Separate cutting boards/knives where required"
+        },
+        {
+          "item": "Raw and cooked food not cross-contaminated"
+        },
+        {
+          "item": "Food handlers wash hands before food preparation"
+        },
+        {
+          "item": "Food covered during preparation/storage"
+        },
+        {
+          "item": "No direct hand contact with ready-to-eat food where avoidable"
+        },
+        {
+          "item": "Cooking temperature/process monitored"
+        },
+        {
+          "item": "Reheating controlled and recorded"
+        },
+        {
+          "item": "No expired ingredients used"
+        }
+      ]
+    },
+    {
+      "section": "Personal Hygiene – Critical",
+      "items": [
+        {
+          "item": "Clean uniform",
+          "group": "Every food handler should have"
+        },
+        {
+          "item": "Hairnet/cap",
+          "group": "Every food handler should have"
+        },
+        {
+          "item": "Appropriate apron",
+          "group": "Every food handler should have"
+        },
+        {
+          "item": "Clean, trimmed nails",
+          "group": "Every food handler should have"
+        },
+        {
+          "item": "No loose jewellery",
+          "group": "Every food handler should have"
+        },
+        {
+          "item": "Proper handwashing practice",
+          "group": "Every food handler should have"
+        },
+        {
+          "item": "Waterproof dressing for minor wounds",
+          "group": "Every food handler should have"
+        },
+        {
+          "item": "No smoking/spitting in food areas",
+          "group": "Every food handler should have"
+        },
+        {
+          "item": "No handling food while suffering from an illness/open wound",
+          "group": "Every food handler should have"
+        },
+        {
+          "item": "Medical examination records available",
+          "group": "Every food handler should have"
+        },
+        {
+          "item": "Food-safety training records available",
+          "group": "Every food handler should have"
+        }
+      ]
+    },
+    {
+      "section": "Cleaning & Sanitation",
+      "items": [
+        {
+          "item": "Kitchen",
+          "group": "Maintain daily cleaning checklists for"
+        },
+        {
+          "item": "Floors",
+          "group": "Maintain daily cleaning checklists for"
+        },
+        {
+          "item": "Walls",
+          "group": "Maintain daily cleaning checklists for"
+        },
+        {
+          "item": "Work tables",
+          "group": "Maintain daily cleaning checklists for"
+        },
+        {
+          "item": "Cutting boards",
+          "group": "Maintain daily cleaning checklists for"
+        },
+        {
+          "item": "Cooking equipment",
+          "group": "Maintain daily cleaning checklists for"
+        },
+        {
+          "item": "Refrigerators",
+          "group": "Maintain daily cleaning checklists for"
+        },
+        {
+          "item": "Freezers",
+          "group": "Maintain daily cleaning checklists for"
+        },
+        {
+          "item": "Exhaust/hood",
+          "group": "Maintain daily cleaning checklists for"
+        },
+        {
+          "item": "Sinks",
+          "group": "Maintain daily cleaning checklists for"
+        },
+        {
+          "item": "Racks",
+          "group": "Maintain daily cleaning checklists for"
+        },
+        {
+          "item": "Tables/chairs",
+          "group": "FOH"
+        },
+        {
+          "item": "Service stations",
+          "group": "FOH"
+        },
+        {
+          "item": "Crockery/cutlery",
+          "group": "FOH"
+        },
+        {
+          "item": "Water station",
+          "group": "FOH"
+        },
+        {
+          "item": "Toilet",
+          "group": "Washrooms"
+        },
+        {
+          "item": "Wash basin",
+          "group": "Washrooms"
+        },
+        {
+          "item": "Soap",
+          "group": "Washrooms"
+        },
+        {
+          "item": "Hand-drying facility",
+          "group": "Washrooms"
+        },
+        {
+          "item": "Cleaning record",
+          "group": "Washrooms"
+        }
+      ]
+    },
+    {
+      "section": "Pest Control",
+      "items": [
+        {
+          "item": "Monthly pest-control report"
+        },
+        {
+          "item": "Pest-control chemicals/records maintained"
+        },
+        {
+          "item": "No cockroaches"
+        },
+        {
+          "item": "No flies"
+        },
+        {
+          "item": "No rodents"
+        },
+        {
+          "item": "No pest droppings/eggs/larvae"
+        },
+        {
+          "item": "Insect-proof screens where required"
+        },
+        {
+          "item": "Door gaps sealed"
+        },
+        {
+          "item": "Drain/grease traps maintained"
+        }
+      ]
+    },
+    {
+      "section": "Waste Management",
+      "items": [
+        {
+          "item": "Separate wet/dry waste as applicable"
+        },
+        {
+          "item": "Bins have lids"
+        },
+        {
+          "item": "Bins are cleaned regularly"
+        },
+        {
+          "item": "Waste removed from kitchen periodically"
+        },
+        {
+          "item": "No overflowing bins"
+        },
+        {
+          "item": "Waste area kept clean"
+        },
+        {
+          "item": "Used oil disposal records maintained"
+        },
+        {
+          "item": "No food waste accumulated near preparation areas"
+        }
+      ]
+    },
+    {
+      "section": "Food-Grade Equipment & Packaging",
+      "items": [
+        {
+          "item": "Food-contact equipment is food-safe"
+        },
+        {
+          "item": "Containers are non-toxic and easy to clean"
+        },
+        {
+          "item": "No rusted/damaged food-contact equipment"
+        },
+        {
+          "item": "Food-grade storage containers"
+        },
+        {
+          "item": "Food-grade packaging for delivery"
+        },
+        {
+          "item": "No newspaper used for food wrapping"
+        },
+        {
+          "item": "Packaging properly stored"
+        }
+      ]
+    },
+    {
+      "section": "Records You Should Keep Ready in One Audit File",
+      "items": [
+        {
+          "item": "FSSAI licence copy"
+        },
+        {
+          "item": "FSDB photograph"
+        },
+        {
+          "item": "GHMC licence"
+        },
+        {
+          "item": "Water test report / water bill"
+        },
+        {
+          "item": "Pest-control agreement + reports"
+        },
+        {
+          "item": "Food-handler medical certificates"
+        },
+        {
+          "item": "Food-safety training records"
+        },
+        {
+          "item": "Approved vendor list"
+        },
+        {
+          "item": "Receiving checklist"
+        },
+        {
+          "item": "Refrigerator/freezer temperature log"
+        },
+        {
+          "item": "Cooking/reheating temperature log"
+        },
+        {
+          "item": "Cleaning & sanitation checklist"
+        },
+        {
+          "item": "Pest-control monitoring sheet"
+        },
+        {
+          "item": "Waste disposal record"
+        },
+        {
+          "item": "Used cooking-oil/TPC records"
+        },
+        {
+          "item": "Equipment maintenance records"
+        },
+        {
+          "item": "Calibration certificates"
+        },
+        {
+          "item": "FIFO/FEFO checklist"
+        },
+        {
+          "item": "Food sampling/lab reports, where applicable"
+        },
+        {
+          "item": "Previous audit report and closure evidence"
+        }
+      ]
+    }
+  ],
+  "total_items": 120,
+  "authority_pages": {
+    "CHECKLIST 1": {
+      "items": 36,
+      "sections": {
+        "Licences & Display": 8,
+        "Kitchen & Premises Hygiene": 9,
+        "Storage – Very Important": 12,
+        "Food Temperature Control": 5,
+        "Cleaning & Sanitation": 2
+      }
+    },
+    "CHECKLIST 2": {
+      "items": 31,
+      "sections": {
+        "Food Preparation": 9,
+        "Personal Hygiene – Critical": 11,
+        "Cleaning & Sanitation": 11
+      }
+    },
+    "CHECKLIST 3": {
+      "items": 33,
+      "sections": {
+        "Cleaning & Sanitation": 9,
+        "Pest Control": 9,
+        "Waste Management": 8,
+        "Food-Grade Equipment & Packaging": 7
+      }
+    }
+  }
+}

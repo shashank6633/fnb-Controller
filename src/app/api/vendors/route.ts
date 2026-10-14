@@ -1,4 +1,19 @@
 import { getDb, generateId } from '@/lib/db';
+import { getCurrentUser, getCurrentOutletId, isManagement } from '@/lib/auth';
+import { fssaiToday } from '@/lib/fssai';
+import { fssaiCsrfGuard, fssaiAudit, fssaiAppAudit } from '@/lib/fssai-server';
+import {
+  VENDOR_APPROVALS, isVendorApproval, vendorApprovalLabel, vendorRegisterReady,
+  stripVendorRegister, supplierLicencesByVendor, shapeRegisterRow,
+} from './fssai-register';
+
+/* THE APPROVED-VENDOR REGISTER rides on this route (Hyderabad audit checklist:
+ * "Approved vendor list maintained"):
+ *   GET   ?register=1                         the register as one list
+ *   PATCH { id, approval, supplies?, note? }  management marks a vendor
+ * The ordinary GETs below strip the register's five columns (stripVendorRegister)
+ * so every purchasing, GRN and PO screen that reads this route gets the reply it
+ * got before those columns existed, byte for byte. POST and PUT never touch them. */
 
 export async function GET(request: Request) {
   try {
@@ -8,8 +23,10 @@ export async function GET(request: Request) {
     const search = url.searchParams.get('search') || '';
     const includeStats = url.searchParams.get('stats') === '1';
 
+    if (url.searchParams.get('register') === '1') return registerList(db);
+
     if (id) {
-      const v = db.prepare('SELECT * FROM vendors WHERE id = ?').get(id);
+      const v = stripVendorRegister(db.prepare('SELECT * FROM vendors WHERE id = ?').get(id));
       return Response.json({ vendor: v });
     }
 
@@ -27,12 +44,134 @@ export async function GET(request: Request) {
         ${where}
         ORDER BY v.name ASC
       `).all(...params);
-      return Response.json({ vendors: rows });
+      return Response.json({ vendors: rows.map(stripVendorRegister) });
     }
 
     const rows = db.prepare(`SELECT * FROM vendors ${where} ORDER BY name ASC`).all(...params);
-    return Response.json({ vendors: rows });
+    return Response.json({ vendors: rows.map(stripVendorRegister) });
   } catch (e: any) { return Response.json({ error: e.message }, { status: 500 }); }
+}
+
+/** GET ?register=1 — every vendor with its approval and the supplier licence on
+ *  file, as one list. Read by /vendors (the register view and its download). */
+async function registerList(db: ReturnType<typeof getDb>) {
+  const today = fssaiToday();
+  const me = await getCurrentUser().catch(() => null);
+  if (!vendorRegisterReady(db)) {
+    // Said, never shown as an empty register: an empty list here would read as
+    // "nobody is approved" when the truth is "the columns did not migrate".
+    return Response.json({
+      error: 'The approved-vendor register is not set up on this database yet (the vendor columns did not migrate). Restart the app; if it persists, the server log says why.',
+    }, { status: 503 });
+  }
+  const rows = db.prepare(`SELECT * FROM vendors ORDER BY name ASC`).all() as any[];
+  const licences = supplierLicencesByVendor(db, today);
+  const vendors = rows.map((r) => shapeRegisterRow(r, licences.get(String(r.id)) || null));
+  const live = vendors.filter((v) => v.is_active);
+  return Response.json({
+    vendors,
+    counts: {
+      active: live.length,
+      approved: live.filter((v) => v.approval === 'approved').length,
+      not_approved: live.filter((v) => v.approval === 'not_approved').length,
+      not_reviewed: live.filter((v) => v.approval === '').length,
+      no_licence: live.filter((v) => !v.licence).length,
+      licence_expired: live.filter((v) => v.licence?.state === 'expired').length,
+      licence_expiring: live.filter((v) => v.licence?.state === 'expiring').length,
+      would_warn: live.filter((v) => v.would_warn).length,
+    },
+    approvals: VENDOR_APPROVALS,
+    can_manage: isManagement(me),
+    licence_source: 'The licence number and expiry come from the supplier licence filed for this vendor under FSSAI → Documents (type "Supplier FSSAI licence"). Renewing it there updates this list.',
+    today,
+  });
+}
+
+/**
+ * PATCH — mark a vendor approved / not approved / not reviewed, and record what
+ * they supply. Management only. Written with the compliance audit row in the
+ * same transaction, so a decision that cannot be recorded is not applied.
+ *
+ * This writes ONLY the five fssai_* columns. It does not touch updated_at or any
+ * column purchasing reads, and it never blocks anything: the receiving screen
+ * reads the result and warns.
+ */
+export async function PATCH(request: Request) {
+  const csrf = fssaiCsrfGuard(request);
+  if (csrf) return csrf;
+  const me = await getCurrentUser();
+  if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
+  if (!isManagement(me)) {
+    return Response.json({ error: 'Approving a vendor is a management decision. Ask a manager to mark it.' }, { status: 403 });
+  }
+  let b: any = {};
+  try { b = await request.json(); } catch { b = {}; }
+  try {
+    const db = getDb();
+    if (!vendorRegisterReady(db)) {
+      return Response.json({ error: 'The approved-vendor register is not set up on this database yet. Restart the app.' }, { status: 503 });
+    }
+    const id = typeof b.id === 'string' ? b.id.trim() : '';
+    if (!id) return Response.json({ error: 'Which vendor? No id was sent.' }, { status: 400 });
+    const row = db.prepare(
+      `SELECT id, name, fssai_approval, fssai_approval_by, fssai_approval_at, fssai_supplies, fssai_approval_note
+         FROM vendors WHERE id = ?`,
+    ).get(id) as any;
+    if (!row) return Response.json({ error: 'That vendor is not in the vendor list.' }, { status: 404 });
+
+    const approval = b.approval === undefined ? String(row.fssai_approval || '') : String(b.approval ?? '');
+    if (!isVendorApproval(approval)) {
+      return Response.json({ error: `"${approval}" is not a choice here. Use approved, not approved, or not reviewed yet.` }, { status: 400 });
+    }
+    const supplies = (b.supplies === undefined ? String(row.fssai_supplies || '') : String(b.supplies ?? '')).trim().slice(0, 500);
+    const note = (b.note === undefined ? String(row.fssai_approval_note || '') : String(b.note ?? '')).trim().slice(0, 1000);
+    if (approval === 'not_approved' && note.length < 4) {
+      return Response.json({ error: 'Say why this vendor is not approved — the note is what an inspector reads next to the name.' }, { status: 400 });
+    }
+
+    const before = {
+      fssai_approval: String(row.fssai_approval || ''), fssai_approval_by: String(row.fssai_approval_by || ''),
+      fssai_approval_at: String(row.fssai_approval_at || ''), fssai_supplies: String(row.fssai_supplies || ''),
+      fssai_approval_note: String(row.fssai_approval_note || ''),
+    };
+    const approvalChanged = approval !== before.fssai_approval;
+    if (!approvalChanged && supplies === before.fssai_supplies && note === before.fssai_approval_note) {
+      return Response.json({ vendor: { ...before, id, name: String(row.name || '') }, unchanged: true });
+    }
+    // Who and when describe the APPROVAL DECISION, so they move only when it does.
+    const after = {
+      fssai_approval: approval,
+      fssai_approval_by: approvalChanged ? String(me.email || '') : before.fssai_approval_by,
+      fssai_approval_at: approvalChanged ? new Date().toISOString() : before.fssai_approval_at,
+      fssai_supplies: supplies,
+      fssai_approval_note: note,
+    };
+    const outletId = (await getCurrentOutletId().catch(() => null)) || '';
+    // better-sqlite3 is synchronous: nothing is awaited inside this transaction.
+    db.transaction(() => {
+      db.prepare(
+        `UPDATE vendors SET fssai_approval = ?, fssai_approval_by = ?, fssai_approval_at = ?,
+                            fssai_supplies = ?, fssai_approval_note = ?
+          WHERE id = ?`,
+      ).run(after.fssai_approval, after.fssai_approval_by, after.fssai_approval_at, after.fssai_supplies, after.fssai_approval_note, id);
+      fssaiAudit(db, {
+        entity_table: 'vendors', entity_id: id, action: 'approval',
+        field: approvalChanged ? 'fssai_approval' : '',
+        before, after, reason: note,
+        actor: { email: me.email, name: me.name }, outlet_id: outletId,
+      });
+    })();
+    try {
+      fssaiAppAudit(db, {
+        event_type: 'fssai_vendor_approval', entity_type: 'vendors', entity_id: id, actor_email: me.email,
+        before: { approval: before.fssai_approval }, after: { approval, supplies },
+        note: `${String(row.name || '')}: ${vendorApprovalLabel(approval)}`,
+      });
+    } catch (e) { console.error('vendor approval: app audit mirror failed (the decision and its fssai audit row stand):', e); }
+    return Response.json({ vendor: { ...after, id, name: String(row.name || '') }, updated: true });
+  } catch (e: any) {
+    return Response.json({ error: e?.message || 'Could not save the approval' }, { status: 500 });
+  }
 }
 
 export async function POST(request: Request) {
@@ -53,7 +192,7 @@ export async function POST(request: Request) {
     `).run(id, name, b.contact_person || '', b.phone || '', b.email || '', b.gstin || '',
             b.address || '', b.payment_terms || '', Number(b.lead_time_days) || 0,
             b.is_active === false ? 0 : 1, b.notes || '');
-    const v = db.prepare('SELECT * FROM vendors WHERE id = ?').get(id);
+    const v = stripVendorRegister(db.prepare('SELECT * FROM vendors WHERE id = ?').get(id));
     return Response.json({ vendor: v }, { status: 201 });
   } catch (e: any) { return Response.json({ error: e.message }, { status: 500 }); }
 }
@@ -88,7 +227,7 @@ export async function PUT(request: Request) {
       b.is_active != null ? (b.is_active ? 1 : 0) : null,
       b.notes ?? null, b.id,
     );
-    const v = db.prepare('SELECT * FROM vendors WHERE id = ?').get(b.id);
+    const v = stripVendorRegister(db.prepare('SELECT * FROM vendors WHERE id = ?').get(b.id));
     return Response.json({ vendor: v });
   } catch (e: any) { return Response.json({ error: e.message }, { status: 500 }); }
 }

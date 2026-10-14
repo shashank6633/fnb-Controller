@@ -25,10 +25,15 @@
  *    '+330 minutes' for every date filter, so "today" means today in Hyderabad and
  *    not a window that starts at 05:30. The stamp is rendered with fmtIST, the
  *    same helper every other screen uses.
- * 2. The retention panel says `armed: false` in words, because it is. The sweep
- *    drops images that have passed the 12-month window the owner ruled, it records
- *    what it dropped, and NOTHING runs it on a schedule on this branch. A screen
- *    that implied otherwise would be telling a manager the database has a ceiling.
+ * 2. The retention panel says whether the sweep runs by itself ON EVIDENCE. The
+ *    sweep drops images that have passed the 12-month window the owner ruled and
+ *    records what it dropped, and the app's scheduler now runs it once a day
+ *    (src/lib/fssai-jobs.ts). Wired is not the same as running — the scheduler
+ *    is production-only and a stopped server ticks nothing — so the banner prints
+ *    what GET /api/fssai/escalations reads off the scheduler's heartbeat: when it
+ *    last ran and what that run did, that it has stopped, or that there is no
+ *    record of it ever running here. The retention payload's `armed: false` is
+ *    NOT read: it predates the scheduler and no longer describes it.
  *
  * Styling is the house skeleton (RECON §1.3-1.6): the #FFF8F0 page, the #af4408
  * heading with an icon tile, white cards bordered #E8D5C4, cards under md and a
@@ -135,11 +140,31 @@ interface RetentionPayload {
     held: number; held_bytes_label: string;
     overdue: number; overdue_bytes_label: string;
     already_dropped: number; cutoff: string; retention_months: number;
-    stores: RetentionStoreRow[]; stores_missing: string; armed: false;
+    /* `armed` is still sent by the retention lib and is NOT read here — it was
+     * written before the scheduler ran this sweep. JobsTruth below is the answer. */
+    stores: RetentionStoreRow[]; stores_missing: string; armed?: boolean;
   };
   runs: RetentionRun[];
   ruled_months: number;
   can_sweep: boolean;
+}
+
+/** What GET /api/fssai/escalations read off the scheduler's heartbeat (its `jobs`). */
+interface JobsTruth {
+  state: 'never' | 'running' | 'stopped';
+  last_tick_at: string;
+  minutes_since: number | null;
+  retention: {
+    tick_outcome: string;
+    tick_day: string;
+    tick_dropped: number;
+    words: string;
+    last_pass: null | {
+      id: string; started_at: string; finished_at: string; status: string;
+      scanned: number; dropped: number; detail: string;
+    };
+  } | null;
+  retention_sentence: string;
 }
 
 const INPUT =
@@ -174,6 +199,8 @@ export default function FssaiAuditLogPage() {
   const [retBusy, setRetBusy] = useState(false);
   const [retMsg, setRetMsg] = useState<string | null>(null);
   const [confirmSweep, setConfirmSweep] = useState(false);
+  const [jobs, setJobs] = useState<JobsTruth | null>(null);
+  const [jobsErr, setJobsErr] = useState<string | null>(null);
 
   useEffect(() => {
     if (!toast) return;
@@ -217,14 +244,31 @@ export default function FssaiAuditLogPage() {
 
   useEffect(() => { void load(); }, [load]);
 
+  /* Whether the sweep runs by itself is read off the scheduler's heartbeat,
+   * which GET /api/fssai/escalations serves to the same management audience as
+   * this screen. Fetched beside the retention state, and a failure here is
+   * shown as "could not read" — never filled in with a guess either way. */
+  const loadJobs = useCallback(async () => {
+    try {
+      const j = await apiJson<{ jobs?: JobsTruth }>('/api/fssai/escalations');
+      if (!j.jobs) throw new Error('The server did not say whether the scheduler has run.');
+      setJobs(j.jobs);
+      setJobsErr(null);
+    } catch (e) {
+      setJobs(null);
+      setJobsErr(e instanceof Error ? e.message : 'Could not read whether the scheduler has run');
+    }
+  }, []);
+
   const loadRetention = useCallback(async () => {
+    void loadJobs();
     try {
       const j = await apiJson<RetentionPayload>('/api/fssai/retention');
       setRet(j);
     } catch (e) {
       setRetMsg(e instanceof Error ? e.message : 'Could not read the retention state');
     }
-  }, []);
+  }, [loadJobs]);
 
   useEffect(() => { if (tab === 'retention') void loadRetention(); }, [tab, loadRetention]);
 
@@ -567,6 +611,8 @@ export default function FssaiAuditLogPage() {
           confirming={confirmSweep}
           onConfirm={setConfirmSweep}
           onRun={runRetention}
+          jobs={jobs}
+          jobsErr={jobsErr}
         />
       )}
 
@@ -938,8 +984,72 @@ const STORE_WORDS: Record<string, string> = {
   fssai_attachments: 'Registers (deliveries, sightings, certificates)',
 };
 
+/**
+ * THE SENTENCE A MANAGER MUST NOT MISREAD — does the sweep run by itself? Said
+ * from the scheduler's heartbeat only: running (when it last ran, what it did),
+ * stopped, or no record of it ever running. When the heartbeat could not be
+ * read, it says exactly that and claims nothing either way.
+ */
+function RetentionArming({
+  jobs, jobsErr, months,
+}: {
+  jobs: JobsTruth | null;
+  jobsErr: string | null;
+  months: number;
+}) {
+  const keep = (
+    <>
+      Photographs are kept for {months} months, after which the PICTURE can be dropped while the
+      record, its size and its fingerprint stay for ever.
+    </>
+  );
+  if (!jobs) {
+    return (
+      <div className="bg-[#FFF1E3] border border-[#E8D5C4] rounded-xl p-3 sm:p-4">
+        <div className="flex flex-nowrap items-start gap-2.5">
+          {jobsErr
+            ? <AlertTriangle size={16} className="text-[#af4408] shrink-0 mt-0.5" />
+            : <Loader2 size={16} className="text-[#af4408] shrink-0 mt-0.5 animate-spin" />}
+          <p className="text-[13px] text-[#3D2614] leading-relaxed">
+            {jobsErr ? (
+              <>
+                <strong>Whether the sweep runs by itself could not be read.</strong> ({jobsErr})
+                Nothing here says it is scheduled, or that it is not. {keep}
+              </>
+            ) : (
+              <>Reading whether the sweep has run by itself… {keep}</>
+            )}
+          </p>
+        </div>
+      </div>
+    );
+  }
+  const tone = jobs.state === 'running'
+    ? 'bg-green-50 border-green-200'
+    : jobs.state === 'stopped'
+      ? 'bg-red-50 border-red-200'
+      : 'bg-amber-50 border-amber-200';
+  const head = jobs.state === 'running'
+    ? 'Running by itself.'
+    : jobs.state === 'stopped'
+      ? 'Stopped.'
+      : 'Never run by itself here.';
+  return (
+    <div className={`border rounded-xl p-3 sm:p-4 ${tone}`}>
+      <div className="flex flex-nowrap items-start gap-2.5">
+        {jobs.state === 'running'
+          ? <ShieldCheck size={16} className="text-green-700 shrink-0 mt-0.5" />
+          : <AlertTriangle size={16} className={`${jobs.state === 'stopped' ? 'text-red-700' : 'text-amber-800'} shrink-0 mt-0.5`} />}
+        <p className="text-[13px] text-[#3D2614] leading-relaxed">
+          <strong>{head}</strong> {jobs.retention_sentence} {keep}
+        </p>
+      </div>
+    </div>
+  );
+}
+
 function RetentionPanel({
-  data, busy, msg, confirming, onConfirm, onRun,
+  data, busy, msg, confirming, onConfirm, onRun, jobs, jobsErr,
 }: {
   data: RetentionPayload | null;
   busy: boolean;
@@ -947,6 +1057,8 @@ function RetentionPanel({
   confirming: boolean;
   onConfirm: (v: boolean) => void;
   onRun: (which: 'preview' | 'sweep') => void;
+  jobs: JobsTruth | null;
+  jobsErr: string | null;
 }) {
   if (!data) {
     return (
@@ -960,18 +1072,7 @@ function RetentionPanel({
   return (
     <div className="space-y-3">
       {/* The honest sentence first — it is the one a manager must not misread. */}
-      <div className="bg-[#FFF1E3] border border-[#E8D5C4] rounded-xl p-3 sm:p-4">
-        <div className="flex flex-nowrap items-start gap-2.5">
-          <AlertTriangle size={16} className="text-[#af4408] shrink-0 mt-0.5" />
-          <p className="text-[13px] text-[#3D2614] leading-relaxed">
-            <strong>No sweep runs by itself.</strong> Photographs are kept for{' '}
-            {st.retention_months} months, after which the PICTURE can be dropped while the record,
-            its size and its fingerprint stay for ever. Nothing on this build does that on a
-            schedule, so until an administrator runs it below, every photograph ever taken is still
-            in the database.
-          </p>
-        </div>
-      </div>
+      <RetentionArming jobs={jobs} jobsErr={jobsErr} months={st.retention_months} />
 
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
         <Stat label="Images held" value={st.held} />

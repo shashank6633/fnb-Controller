@@ -38,6 +38,7 @@ import {
   fssaiRangeCheck, fssaiCaDueDate, fssaiToday, isFssaiCaSeverity,
   isFssaiAttachmentEntity, parseFssaiDataUri, FSSAI_PHOTO_MIMES,
   FSSAI_RECEIVING_CHECKPOINTS, fssaiCheckResultIsFail, fssaiCheckResultAnswered,
+  FSSAI_TEMP_LOG_KINDS, isISODate, addDaysISO,
   type FssaiActor,
 } from '@/lib/fssai';
 import { fssaiAuditBestEffort, nextFssaiCaNumber, str } from '@/lib/fssai-server';
@@ -140,7 +141,15 @@ export function resolveFssaiRange(
   };
 
   const equipmentId = str(input.equipmentId);
-  if (equipmentId) {
+  /* ⚠️ A RATE RULE IS NOT REPLACED BY A UNIT'S RANGE. Cooling and reheating are
+   * judged against the CLOCK (`max_minutes`), and a unit's own range never carries
+   * one — it is the range for the AIR in that unit. Letting the blast chiller's
+   * "0 to 5 °C" win for a cooling probe turned every curry still on its way down
+   * (30 °C at 60 minutes) into a breach, because with no clock the reading could
+   * only be judged on its level. The unit is still recorded as WHERE the food was;
+   * the cooling or reheating standard is WHAT it is judged against. */
+  const isRateKind = !!FSSAI_TEMP_LOG_KINDS.find((k) => k.key === str(input.logKind))?.window_minutes;
+  if (equipmentId && !isRateKind) {
     const eq = db.prepare(
       `SELECT id, name, kind, min_temp, max_temp, temp_uom FROM fssai_equipment WHERE id = ?`,
     ).get(equipmentId) as any;
@@ -228,6 +237,27 @@ export interface FssaiReadingVerdict {
  * nothing here converts, because `min_used`/`max_used` are frozen in the unit the
  * reading was taken in and a record that silently restates a number in another
  * unit is unreadable beside the probe that produced it.
+ *
+ * ── A READING TAKEN WHILE THE FOOD IS STILL ON ITS WAY ───────────────────────
+ * This used to be judged on its LEVEL: the range test ran first and on its own,
+ * so a curry at 30 °C sixty minutes into a 240-minute cooling window "failed" the
+ * 5 °C maximum, demanded an "action taken", and raised a corrective action. Staff
+ * learned to log only the end point — and the authority asks for a cooling
+ * MONITORING SHEET, which is the readings in between.
+ *
+ * Inside the window, a reading that has not yet reached its target is now judged
+ * against WHERE IT SHOULD BE BY THEN: a straight line from the curve's first
+ * reading (`curveStart`) down to the target at the end of the window
+ * (`fssaiCurveExpected`). At or past that line it is on schedule and is NOT a
+ * breach; behind it, it is. A straight line is the lenient-looking but honest
+ * choice — real food cools fastest at the start, so a pot that is above the
+ * straight line is genuinely behind. At the end of the window the line IS the
+ * target, so the final reading above target is still a breach, and past the
+ * window the clock test above still fails anything that has not got there.
+ *
+ * With no first reading to measure from, a reading inside the window that has
+ * not reached the target is NEITHER a pass NOR a breach: it is recorded as not
+ * judged (`is_judged = 0`), which this module never counts as a pass.
  */
 export function judgeFssaiReading(input: {
   value: number | null;
@@ -240,11 +270,15 @@ export function judgeFssaiReading(input: {
   target?: number | null;
   /** 'cold' | 'hot' | 'either' — which side of the target counts as "reached". */
   direction?: 'cold' | 'hot' | 'either';
+  /** The curve's FIRST reading — where the schedule line starts. Its own
+   *  `elapsedMinutes` is when, on the curve's clock, it was taken. */
+  curveStart?: { value: number | null; elapsedMinutes: number | null } | null;
 }): FssaiReadingVerdict {
   const r = fssaiRangeCheck(input.value, input.min, input.max, input.uomForWords || '');
   let judged: 0 | 1 = r.judged ? 1 : 0;
   let fail: 0 | 1 = r.out_of_range ? 1 : 0;
-  const reasons: string[] = r.out_of_range ? [r.why] : [];
+  let reasons: string[] = r.out_of_range ? [r.why] : [];
+  let passWhy = r.why;
 
   const elapsed = input.elapsedMinutes === null || input.elapsedMinutes === undefined
     ? null : Number(input.elapsedMinutes);
@@ -264,14 +298,51 @@ export function judgeFssaiReading(input: {
     if (v !== null && goal !== null && Number.isFinite(goal)) {
       reached = dir === 'hot' ? v >= Number(goal) : v <= Number(goal);
     }
+    const u = input.uomForWords ? ` ${input.uomForWords}` : '';
     if ((elapsed as number) > (limit as number) && reached !== true) {
       fail = 1;
-      const u = input.uomForWords ? ` ${input.uomForWords}` : '';
       reasons.push(
         reached === false && goal !== null
           ? `${elapsed} minutes have passed and it is still at ${v}${u} — the rule allows ${limit} minutes to reach ${goal}${u}.`
           : `${elapsed} minutes have passed, and the rule allows ${limit}.`,
       );
+    } else if (reached !== true) {
+      /* INSIDE THE WINDOW AND NOT THERE YET. The level test above does not decide
+       * this reading — the schedule does. Whatever the level test said is
+       * replaced, in both directions. */
+      const startV = input.curveStart ? num(input.curveStart.value) : null;
+      const startE = input.curveStart ? (num(input.curveStart.elapsedMinutes) ?? 0) : null;
+      const expected = fssaiCurveExpected({
+        startValue: startV, startElapsed: startE, goal: goal === null ? null : Number(goal),
+        maxMinutes: limit, elapsed,
+      });
+      const goingWord = dir === 'hot' ? 'heating' : 'cooling';
+      const sideWord = dir === 'hot' ? 'at or above' : 'at or below';
+      if (v === null || expected === null || goal === null) {
+        judged = 0;
+        fail = 0;
+        reasons = [];
+        passWhy = `Taken ${elapsed} minutes in, while still ${goingWord}, with no first reading on this batch to measure progress from — so it cannot be judged against the schedule. It is recorded, not passed.`;
+      } else {
+        /* A float tolerance, NOT rounding: 57.5 must not lose to 57.49999999 that
+         * only exists because of the division. The displayed figure is rounded in
+         * the SAFE direction so the sentence never contradicts the verdict. */
+        const behind = dir === 'hot' ? v < expected - 1e-9 : v > expected + 1e-9;
+        const shown = fssaiCurveExpectedShown(expected, dir);
+        if (behind) {
+          fail = 1;
+          reasons = [
+            `Behind schedule: ${elapsed} minutes in it should be ${sideWord} ${shown}${u} to reach ${goal}${u} within ${limit} minutes from ${startV}${u}, and it is at ${v}${u}.`,
+          ];
+        } else {
+          fail = 0;
+          reasons = [];
+          const isStart = startV === v && startE === elapsed;
+          passWhy = isStart
+            ? `The first reading of this batch: ${v}${u} at ${elapsed} minutes. It has until ${limit} minutes to reach ${goal}${u}, and each reading in between is judged against where it should be by then.`
+            : `Still ${goingWord} and on schedule: ${v}${u} at ${elapsed} minutes, where it needed to be ${sideWord} ${shown}${u}. It has until ${limit} minutes to reach ${goal}${u}.`;
+        }
+      }
     }
   }
 
@@ -279,8 +350,327 @@ export function judgeFssaiReading(input: {
     is_judged: judged,
     is_fail: fail,
     fail_reason: reasons.join(' '),
-    why: reasons.length ? reasons.join(' ') : r.why,
+    why: reasons.length ? reasons.join(' ') : passWhy,
   };
+}
+
+/**
+ * WHERE A CURVE SHOULD BE AT `elapsed` MINUTES — the one definition, used by the
+ * verdict above, the curve view and the cooling sheet, so the three can never
+ * disagree about the same reading.
+ *
+ * A straight line from the first reading (`startValue` at `startElapsed`) to the
+ * `goal` at `maxMinutes`. At or past the end of the window the answer is the goal
+ * itself. null when there is nothing to draw the line from.
+ */
+export function fssaiCurveExpected(p: {
+  startValue: number | null;
+  startElapsed: number | null;
+  goal: number | null;
+  maxMinutes: number | null;
+  elapsed: number | null;
+}): number | null {
+  const goal = num(p.goal);
+  const limit = num(p.maxMinutes);
+  const e = num(p.elapsed);
+  if (goal === null || limit === null || limit <= 0 || e === null) return null;
+  if (e >= limit) return goal;
+  const sv = num(p.startValue);
+  const se = num(p.startElapsed) ?? 0;
+  if (sv === null || se >= limit) return null;
+  const at = Math.max(e, se);
+  return sv + (goal - sv) * ((at - se) / (limit - se));
+}
+
+/** The schedule figure for a sentence, rounded to 0.1 in the SAFE direction. */
+export function fssaiCurveExpectedShown(expected: number, dir: 'cold' | 'hot' | 'either'): string {
+  const tenths = dir === 'hot' ? Math.ceil(expected * 10 - 1e-9) : Math.floor(expected * 10 + 1e-9);
+  return (tenths / 10).toFixed(1);
+}
+
+/* ================================================================== *
+ * 3b. ONE BATCH, ONE CURVE — linking the readings of a cooling or reheating
+ * ================================================================== */
+
+/**
+ * Minutes on one clock for a business date and an HH:MM, so two readings on a
+ * curve that crosses midnight still subtract correctly. null when either half is
+ * not a real date or time.
+ */
+export function fssaiClockMinute(isoDate: unknown, hhmm: unknown): number | null {
+  const d = str(isoDate);
+  const t = str(hhmm);
+  if (!isISODate(d) || !/^([01]\d|2[0-3]):[0-5]\d$/.test(t)) return null;
+  const [y, m, dd] = d.split('-').map(Number);
+  const [hh, mi] = t.split(':').map(Number);
+  return Math.round(Date.UTC(y, m - 1, dd, hh, mi) / 60000);
+}
+
+export interface FssaiCurveMember {
+  id: string;
+  key: string;
+  business_date: string;
+  reading_at: string;
+  minute: number | null;
+  value: number | null;
+  elapsed: number | null;
+  uom: string;
+  goal: number | null;
+  /** The time limit frozen on this reading (`max_minutes_used`). */
+  max_minutes: number | null;
+  is_fail: number;
+  status: string;
+}
+
+/** Which side "reached" is on for a rate kind. */
+export function fssaiTempDirection(logKind: string): 'cold' | 'hot' | 'either' {
+  return FSSAI_TEMP_LOG_KINDS.find((k) => k.key === str(logKind))?.direction || 'either';
+}
+
+function memberGoal(row: any, dir: 'cold' | 'hot' | 'either'): number | null {
+  const t = num(row?.target_used);
+  if (t !== null) return t;
+  return dir === 'hot' ? num(row?.min_used) : num(row?.max_used);
+}
+
+function shapeMember(row: any, dir: 'cold' | 'hot' | 'either'): FssaiCurveMember {
+  return {
+    id: String(row.id),
+    key: String(row.batch_id || '') || String(row.id),
+    business_date: String(row.business_date || ''),
+    reading_at: String(row.reading_at || ''),
+    minute: fssaiClockMinute(row.business_date, row.reading_at),
+    value: num(row.value_num),
+    elapsed: int(row.elapsed_minutes),
+    uom: String(row.uom || 'C'),
+    goal: memberGoal(row, dir),
+    max_minutes: int(row.max_minutes_used),
+    is_fail: Number(row.is_fail) ? 1 : 0,
+    status: String(row.status || ''),
+  };
+}
+
+/* Clock order, then filing order — two readings in the same minute keep the
+ * order they were entered in. A row with no usable time sorts last. */
+function byClock(a: { m: FssaiCurveMember; rowid: number }, b: { m: FssaiCurveMember; rowid: number }): number {
+  const am = a.m.minute ?? Number.MAX_SAFE_INTEGER;
+  const bm = b.m.minute ?? Number.MAX_SAFE_INTEGER;
+  if (am !== bm) return am - bm;
+  return a.rowid - b.rowid;
+}
+
+/**
+ * EVERY READING ON ONE CURVE, in the order they were taken.
+ *
+ * The curve's key lives in `batch_id`: the production batch when the kitchen
+ * named one, otherwise the id of the curve's FIRST reading (written there by the
+ * route when the curve starts). So membership is "batch_id is the key, or the row
+ * IS the key" — the second half is what keeps the first reading on its own curve.
+ * `includeVoid` is for the sheet, which shows struck-out readings; the verdict
+ * path never measures from a voided one.
+ */
+export function fssaiCurveMembers(
+  db: Database.Database,
+  logKind: string,
+  key: string,
+  includeVoid = false,
+): FssaiCurveMember[] {
+  const k = str(key);
+  if (!k) return [];
+  const dir = fssaiTempDirection(logKind);
+  const rows = db.prepare(
+    `SELECT rowid AS rowid, id, batch_id, business_date, reading_at, value_num, elapsed_minutes, uom,
+            target_used, min_used, max_used, max_minutes_used, is_fail, status
+       FROM fssai_temperature_logs
+      WHERE log_kind = ? AND (batch_id = ? OR id = ?)
+        ${includeVoid ? '' : `AND status <> 'void'`}`,
+  ).all(str(logKind), k, k) as any[];
+  return rows
+    .map((r) => ({ m: shapeMember(r, dir), rowid: Number(r.rowid) || 0 }))
+    .sort(byClock)
+    .map((x) => x.m);
+}
+
+/** Has any live reading on this curve reached its goal? */
+export function fssaiCurveReached(members: FssaiCurveMember[], logKind: string): FssaiCurveMember | null {
+  const dir = fssaiTempDirection(logKind);
+  for (const m of members) {
+    if (m.status === 'void' || m.value === null || m.goal === null) continue;
+    if (dir === 'hot' ? m.value >= m.goal : m.value <= m.goal) return m;
+  }
+  return null;
+}
+
+export type FssaiCurveResolution =
+  | {
+      ok: true;
+      /** '' = this reading starts the curve and its own id becomes the key. */
+      key: string;
+      mode: 'new' | 'joined';
+      /** The first live reading, when joining. null when this reading is the start. */
+      start: FssaiCurveMember | null;
+      /** Minutes on the curve's clock at this reading — COUNTED, not typed. */
+      elapsed: number;
+      /** What the person typed, kept only to say so when it differed. */
+      typed: number | null;
+      how: string;
+    }
+  | { ok: false; status: number; error: string; code: string };
+
+/**
+ * WHICH CURVE IS THIS READING ON, AND HOW MANY MINUTES INTO IT — counted by the
+ * server from the curve's first reading, never typed per reading.
+ *
+ * In order:
+ *   1. `curveId` — any reading already on the curve. The kitchen said which batch.
+ *   2. `batchId` — a production batch. Every cooling reading of that batch is one
+ *      curve; the first one taken starts it.
+ *   3. `newCurve`, or minutes typed as 0 — "this has just started coming down".
+ *   4. Otherwise the OPEN curve for the same thing (same unit, item, place,
+ *      outlet): one that has not reached its target, began no more than twice the
+ *      window ago (the window, and as long again for the late readings that prove
+ *      a curve failed), and has no reading timed after this one.
+ *   5. Nothing open: this reading starts a curve.
+ *
+ * THE CLOCK. A curve's first reading sits at minute 0 — or at the minutes typed on
+ * it, which can only move the start EARLIER (a cook saying "it has been cooling
+ * 30 minutes already"), so the deadline can only get stricter. Every later
+ * reading is that plus the time between the two readings. A minutes figure typed
+ * on a later reading is not used; the response says when it differed.
+ *
+ * REFUSED: a reading timed before its curve's first reading, or in the middle of
+ * readings already filed — the verdicts already frozen on that curve were judged
+ * from its start, and slipping an earlier reading in would change what they were
+ * measured against.
+ */
+export function resolveFssaiCurve(
+  db: Database.Database,
+  p: {
+    logKind: string;
+    curveId?: string | null;
+    batchId?: string | null;
+    newCurve?: boolean;
+    typedElapsed: number | null;
+    businessDate: string;
+    readingAt: string;
+    uom: string;
+    maxMinutes: number | null;
+    subject: { equipmentId: string; materialId: string; itemLabel: string; areaLabel: string; outletId: string };
+  },
+): FssaiCurveResolution {
+  const logKind = str(p.logKind);
+  const typed = p.typedElapsed === null || p.typedElapsed === undefined ? null : Number(p.typedElapsed);
+  const now = fssaiClockMinute(p.businessDate, p.readingAt);
+  if (now === null) {
+    return { ok: false, status: 400, code: 'bad_time', error: 'The time of the reading is needed to place it on its cooling or reheating curve.' };
+  }
+  const start = (): FssaiCurveResolution => ({
+    ok: true, key: str(p.batchId), mode: 'new', start: null,
+    elapsed: typed !== null && typed > 0 ? Math.trunc(typed) : 0, typed,
+    how: typed !== null && typed > 0
+      ? `This starts a new batch, ${Math.trunc(typed)} minutes after it began — the time you gave. Later readings on it are counted from here.`
+      : 'This starts a new batch. Later readings on it are timed from this one.',
+  });
+
+  const join = (members: FssaiCurveMember[], key: string, said: string): FssaiCurveResolution => {
+    const first = members[0];
+    if (first.minute === null) {
+      return { ok: false, status: 409, code: 'curve_unreadable', error: 'The first reading on that batch has no usable time, so minutes cannot be counted from it. Start a new batch.' };
+    }
+    if (now < first.minute) {
+      return {
+        ok: false, status: 409, code: 'before_curve_start',
+        error: `This reading is timed ${p.readingAt} on ${p.businessDate}, before the batch's first reading at ${first.reading_at} on ${first.business_date}. Readings go onto a batch in the order they were taken.`,
+      };
+    }
+    const later = members.find((m) => m.minute !== null && (m.minute as number) > now);
+    if (later) {
+      return {
+        ok: false, status: 409, code: 'out_of_order',
+        error: `A reading at ${later.reading_at} on ${later.business_date} is already filed on this batch, after the time given for this one (${p.readingAt}). The readings after it were judged from the batch's start, so an earlier one cannot be slipped in. If this is a different pot, start a new batch.`,
+      };
+    }
+    if (first.uom !== p.uom) {
+      return { ok: false, status: 400, code: 'uom_mismatch', error: `This batch was started in °${first.uom}. Enter the reading in °${first.uom}.`, };
+    }
+    const elapsed = (first.elapsed ?? 0) + (now - (first.minute as number));
+    return {
+      ok: true, key, mode: 'joined', start: first, elapsed, typed,
+      how: `${said} — the batch started at ${first.reading_at}${first.business_date !== p.businessDate ? ` on ${first.business_date}` : ''} at ${first.value ?? '?'} °${first.uom}. ${elapsed} minutes in, counted from that reading.`
+        + (typed !== null && typed !== elapsed ? ` You entered ${typed} minutes; the counted ${elapsed} is what is recorded.` : ''),
+    };
+  };
+
+  /* 1. Named by a reading on the curve. */
+  const curveId = str(p.curveId);
+  if (curveId) {
+    const row = db.prepare(`SELECT id, batch_id, log_kind FROM fssai_temperature_logs WHERE id = ?`).get(curveId) as any;
+    if (!row) return { ok: false, status: 400, code: 'curve_unknown', error: 'That batch is not in the file.' };
+    if (String(row.log_kind) !== logKind) {
+      return { ok: false, status: 400, code: 'curve_kind', error: `That batch is a ${String(row.log_kind)} curve, not ${logKind}.` };
+    }
+    const key = String(row.batch_id || '') || String(row.id);
+    const members = fssaiCurveMembers(db, logKind, key);
+    if (!members.length) {
+      return { ok: false, status: 409, code: 'curve_voided', error: 'Every reading on that batch has been voided. Start a new batch.' };
+    }
+    return join(members, key, 'Added to the batch you picked');
+  }
+
+  /* 2. A production batch. */
+  const batchId = str(p.batchId);
+  if (batchId) {
+    const members = fssaiCurveMembers(db, logKind, batchId);
+    return members.length ? join(members, batchId, 'Added to this production batch') : start();
+  }
+
+  /* 3. Said to be a new one. */
+  if (p.newCurve || typed === 0) return start();
+
+  /* 4. The open curve for the same thing. */
+  const s = p.subject;
+  const norm = (v: unknown) => str(v).toLowerCase();
+  const limit = num(p.maxMinutes);
+  /* The horizon: the window and as long again. With no time limit set there is no
+   * window to double, so only today's and yesterday's readings are considered. */
+  const horizon = limit !== null && limit > 0 ? limit * 2 : 24 * 60;
+  const rows = db.prepare(
+    `SELECT id, batch_id, item_label, area_label
+       FROM fssai_temperature_logs
+      WHERE log_kind = ? AND status <> 'void'
+        AND equipment_id = ? AND material_id = ? AND outlet_id = ?
+        AND business_date >= ? AND business_date <= ?`,
+  ).all(
+    logKind, str(s.equipmentId), str(s.materialId), str(s.outletId),
+    addDaysISO(p.businessDate, -Math.ceil(horizon / (24 * 60))) || p.businessDate, p.businessDate,
+  ) as any[];
+  const keys = new Set<string>();
+  for (const r of rows) {
+    if (norm(r.item_label) !== norm(s.itemLabel) || norm(r.area_label) !== norm(s.areaLabel)) continue;
+    keys.add(String(r.batch_id || '') || String(r.id));
+  }
+  let best: { key: string; members: FssaiCurveMember[] } | null = null;
+  let blockedBy: FssaiCurveMember[] | null = null;
+  for (const key of keys) {
+    const members = fssaiCurveMembers(db, logKind, key);
+    if (!members.length) continue;
+    const first = members[0];
+    if (first.minute === null || first.minute > now) continue;
+    if ((first.elapsed ?? 0) + (now - first.minute) > horizon) continue;
+    if (fssaiCurveReached(members, logKind)) continue;
+    if (members.some((m) => m.minute !== null && (m.minute as number) > now)) { blockedBy = members; continue; }
+    if (!best || (best.members[0].minute as number) < first.minute) best = { key, members };
+  }
+  if (best) return join(best.members, best.key, 'Added to the open batch of the same thing');
+  if (blockedBy) {
+    const f = blockedBy[0];
+    const later = blockedBy[blockedBy.length - 1];
+    return {
+      ok: false, status: 409, code: 'out_of_order',
+      error: `The open batch of this started at ${f.reading_at} and already has a reading at ${later.reading_at}, after the time given for this one (${p.readingAt}). Readings go onto a batch in the order they were taken. If this is a different pot, enter 0 minutes to start a new batch.`,
+    };
+  }
+  return start();
 }
 
 /* ================================================================== *

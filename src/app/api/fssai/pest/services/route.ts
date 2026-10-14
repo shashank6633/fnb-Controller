@@ -415,8 +415,12 @@ export async function POST(request: Request) {
     }
 
     if (action === 'remove_file') {
+      // The file must be on THIS visit — dropP6AttachmentImage refuses one from
+      // any other record or register, and only allows a 24-hour correction
+      // (decision and rules documented there).
       const out = db.transaction(() => dropP6AttachmentImage(db, {
-        id: str(body.attachment_id), reason: str(body.reason), me: me as any, outlet_id: outletId,
+        id: str(body.attachment_id), entity_table: 'fssai_pest_services', entity_id: id,
+        reason: str(body.reason), me: me as any, outlet_id: outletId,
       }))();
       if ('error' in out) return Response.json({ error: out.error }, { status: out.status });
       return Response.json({ removed: out.dropped });

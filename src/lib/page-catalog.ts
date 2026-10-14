@@ -918,6 +918,14 @@ export const PAGE_CATALOG: PageSection[] = [
       // value here silently re-grades the whole file.
       { path: '/fssai/settings/equipment', label: 'Equipment & Cold Units',   adminOnly: true },
       { path: '/fssai/inspection-mode',    label: 'Inspection Mode',          mgmtOnly: true },
+      // AUDIT FILE — the Hyderabad authority's "Records You Should Keep Ready in
+      // One Audit File": all 20, each PRESENT / EXPIRING / MISSING, plus the one
+      // PDF of the whole file. mgmtOnly, the SAME set as Inspection Mode and for
+      // the same reason: a manager must be able to produce the file during a
+      // visit without the owner, and the page names every gap in plain words, so
+      // it is not a staff surface. /api/fssai/audit-file* gate themselves with
+      // isManagement() as well — this row is visibility, never security.
+      { path: '/fssai/audit-file',         label: 'Audit File',               mgmtOnly: true },
     ],
   },
   {
@@ -1457,9 +1465,10 @@ export function canAccessPage(
  * The problem is that many catalog parents are ALSO the URL prefix of their
  * SIBLING catalog pages. /tasks is the Task Dashboard *and* the prefix of the
  * 14 other Task Management pages, so ticking the dashboard silently hands over
- * the whole module. Across the catalog 12 parents carry 92 such grants:
- *   /fssai +22, /hr +18, /crm-calls +16, /tasks +14, /inventory +8,
- *   /reports +6, /kitchen-production +3, /dine-in/kitchen +1, /grn +1,
+ * the whole module. Across the catalog 16 parents carry 103 such grants:
+ *   /fssai +23, /hr +18, /crm-calls +16, /tasks +14, /inventory +9,
+ *   /reports +6, /feedback +3, /kitchen-production +3, /boh +2, /grn +2,
+ *   /bill-submissions +2, /dine-in/kitchen +1, /grn/qc +1,
  *   /settings/integrations +1, /vendors +1, /fssai/settings +1
  * proxy.ts imports canAccessPage rather than duplicating it, so this is real
  * server-side reach, not just a sidebar that shows too much.
@@ -1474,7 +1483,11 @@ export function canAccessPage(
  * 'Record Changes & Voids' and 'Equipment & Cold Units', it is
  * **12 parents / 92 grants** — and /fssai/settings is a NEW KIND of entry in
  * this list: a catalog parent that is itself the child of another one, so
- * /fssai/settings/equipment inherits from it and not from /fssai. FSSAI remains
+ * /fssai/settings/equipment inherits from it and not from /fssai. Re-measured
+ * again on 2026-10-14 when 'Audit File' (/fssai/audit-file) was added: it was
+ * already 16 / 102 before that row (/boh, /feedback, /bill-submissions and
+ * /grn/qc had arrived, /grn and /inventory had grown), and that row makes it
+ * **16 parents / 103 grants**. FSSAI remains
  * the single largest carrier. Nothing recomputes this comment, so any section
  * added here must re-measure it. The live figure is whatever
  * GET /api/admin/page-access-impact reports, not whatever this comment says.

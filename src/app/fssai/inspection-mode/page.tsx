@@ -29,7 +29,7 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import {
-  AlertTriangle, ArrowLeft, CheckCircle2, Eye, FileText, Loader2, RefreshCw, ShieldCheck, X,
+  AlertTriangle, ArrowLeft, CheckCircle2, Download, Eye, FileText, FolderCheck, Loader2, RefreshCw, ShieldCheck, X,
 } from 'lucide-react';
 import { apiJson } from '@/lib/api';
 import {
@@ -109,6 +109,15 @@ export default function FssaiInspectionModePage() {
                 Records for {pack.since} to {pack.today}. This screen is read-only.
               </p>
             </div>
+            {/* Straight to the file: the audit-file PDF states what is on file
+                and nothing about gaps, so it is safe on this screen (§7 Q11). */}
+            <a
+              href={`/api/fssai/audit-file/pdf?days=${days <= 7 ? 7 : days <= 30 ? 30 : 90}`}
+              target="_blank" rel="noopener noreferrer"
+              className="inline-flex items-center gap-1.5 text-sm font-semibold bg-[#af4408] hover:bg-[#8a3606] text-white rounded-lg px-4 py-2 min-h-[44px]"
+            >
+              <Download size={16} /> The audit file (PDF)
+            </a>
             <button
               onClick={() => setHandover(false)}
               className="inline-flex items-center gap-1.5 text-sm border border-[#E8D5C4] bg-white rounded-lg px-3 py-2 hover:bg-[#FFF1E3]"
@@ -199,6 +208,25 @@ export default function FssaiInspectionModePage() {
 
       {pack && (
         <>
+          {/* The authority's own list of what an audit file must hold — check it
+              before the inspector does. It names gaps, so it lives here, in the
+              manager's half, never on the handover view. */}
+          <div className="bg-white border-2 border-[#af4408] rounded-xl p-4 sm:p-5 flex flex-wrap items-center gap-3">
+            <FolderCheck className="w-8 h-8 text-[#af4408] shrink-0" />
+            <div className="min-w-0 flex-1">
+              <p className="font-bold">The audit file — all 20 records the Hyderabad authority asks for</p>
+              <p className="text-sm text-[#3D2614] mt-0.5">
+                Each one marked present, expiring or missing, with one PDF of the whole file to print or hand over.
+              </p>
+            </div>
+            <a
+              href="/fssai/audit-file"
+              className="inline-flex items-center gap-1.5 text-sm font-semibold bg-[#af4408] hover:bg-[#8a3606] text-white rounded-lg px-4 py-2 min-h-[44px]"
+            >
+              <FolderCheck size={16} /> Open the audit file
+            </a>
+          </div>
+
           {/* This panel is the whole reason the screen has two states. It is for
               the manager, before the tablet changes hands, and the officer never
               sees a word of it. */}

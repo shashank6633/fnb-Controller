@@ -43,6 +43,7 @@ import {
   type FssaiActor,
 } from '@/lib/fssai';
 import { fssaiAudit, fssaiAppAudit, str } from '@/lib/fssai-server';
+import { fssaiManualRemovalRefusal, recordFssaiManualImageRemoval } from '@/lib/fssai-retention';
 
 /* ------------------------------------------------------------------ *
  * 1. THE THREE TABLES THIS LANE OWNS
@@ -93,8 +94,11 @@ export const P6_ENTITY_WORDS: Record<P6EntityTable, string> = {
  * caps the AGE of an image, not the COUNT). FSSAI_EVIDENCE_MAX_PER_ANSWER is 4,
  * which is right for one answer on a checklist; a pest contractor's job sheet
  * and a renewed licence both routinely run to several pages, so eight. At the
- * 400 KB server ceiling that is at most ~3.2 MB on the worst record, and the
- * retention sweep clears the images at twelve months either way.
+ * 400 KB server ceiling that is at most ~3.2 MB on the worst record.
+ * ⚠️ These files are NOT cleared at twelve months: the retention sweep walks
+ * checklist photographs only (§7 Q13), and whether register files ever age out
+ * is Q22, unruled — see src/lib/fssai-retention.ts. So this cap is, for now, the
+ * only bound on a record's size.
  */
 export const P6_ATTACHMENTS_PER_RECORD = 8;
 
@@ -282,59 +286,157 @@ export function insertP6Attachment(
 }
 
 /**
- * REMOVE THE IMAGE, KEEP THE ROW — the only way a file leaves a P6 record.
+ * TAKE BACK A FILE ATTACHED BY MISTAKE — the only way an image leaves a filed
+ * P6 record (the 12-month sweep does not walk fssai_attachments; see
+ * src/lib/fssai-retention.ts and the Q22 note there).
  *
- * §19 is "void with a reason, never delete", and fssai_attachments has no void
- * trio of its own (14 columns, no voided_at) because it is not a record — it
- * hangs off one. So a mis-attached photograph is handled exactly as RETENTION
- * handles an old one: data_uri is blanked, image_dropped_at is stamped, and
- * size_bytes and digest_sha256 are left ALONE so the file that was once there
- * remains provable. The row, its caption and its audit history survive.
+ * ═══ DECISION: A FILED RECORD'S FILE IS NOT REMOVABLE — EXCEPT A SAME-DAY ═══
+ * ═══ CORRECTION, AND EVEN THAT IS A VOID, NOT A DELETE                     ═══
  *
- * Management only, and a reason in words, because the person who attached the
- * wrong photograph of the right delivery is also the person with a motive to
- * remove the right photograph of the wrong one.
+ * A pest visit's job sheet, a sighting's photograph and a licence scan are
+ * records an inspector can demand, and §19 is "void with a reason, never
+ * delete". Adversarial verification found this function let a manager blank
+ * ANY of them at ANY age with no retention row — and, because it never checked
+ * that the file belonged to the record the request named, one call through the
+ * pest-visit route could strip the scan off a LICENCE in the documents register.
+ * What it does now, in order, refusing at the first rule that fails:
+ *
+ *  1. THE FILE MUST BELONG TO THE RECORD THE REQUEST NAMED — same table AND same
+ *     id. The caller passes the record it has already loaded and
+ *     permission-checked; a mismatch is answered exactly like a missing file
+ *     (404), so the refusal does not tell a caller where the file really lives.
+ *  2. Management only, with a reason in words (fssaiVoidRefusal, the module's
+ *     single §19 rule) — the person who attached the wrong photograph of the
+ *     right delivery is also the person with a motive to remove the right
+ *     photograph of the wrong one, so the reason is kept for ever.
+ *  3. Not on a VOIDED record: a voided record is closed evidence, files included.
+ *  4. Only within FSSAI_FILE_CORRECTION_HOURS (24 h) of the upload, judged by
+ *     fssaiManualRemovalRefusal — a file whose upload time is unreadable is
+ *     refused, because it cannot be shown to be inside the window. After that
+ *     the file stays; the remedies are to attach the right file beside it, or to
+ *     void the record with a reason and file it again.
+ *  5. Then, IN ONE TRANSACTION: blank data_uri and stamp image_dropped_at
+ *     (size_bytes and digest_sha256 are left ALONE, so the file that was there
+ *     stays provable — exactly what the sweep does), write fssai_audit_log
+ *     (fssaiAudit throws), and write an fssai_retention_runs row
+ *     (recordFssaiManualImageRemoval throws) so every image that ever leaves the
+ *     file is in the same ledger as the sweep. No trace, no removal.
  */
 export function dropP6AttachmentImage(
   db: Database.Database,
   p: {
+    /** the attachment */
     id: string;
+    /** THE RECORD THE REQUEST NAMED — the file must be on this one. */
+    entity_table: P6EntityTable;
+    entity_id: string;
     reason: string;
     me: FssaiActor & { email?: string; name?: string };
     outlet_id?: string;
+    /** injectable for proofs; the server clock otherwise */
+    now?: Date;
   },
 ): { error: string; status: number } | { dropped: P6Attachment } {
-  const row = db.prepare(`SELECT * FROM fssai_attachments WHERE id = ?`).get(str(p.id)) as any;
-  if (!row) return { error: 'That file is no longer on this record.', status: 404 };
-  if (!isP6Entity(row.entity_table)) {
-    return { error: 'That file belongs to another part of the module.', status: 403 };
+  if (!isP6Entity(p.entity_table)) {
+    return { error: 'That is not a record this screen can remove a file from.', status: 400 };
   }
-  // fssaiVoidRefusal is the module's single §19 rule. It is given the
-  // attachment's own already-dropped state as `voided_at` so "already voided"
-  // and "image already removed" produce one consistent refusal.
-  const refusal = fssaiVoidRefusal(p.me, { status: '', voided_at: str(row.image_dropped_at) }, p.reason);
-  if (refusal) {
+  const entityId = str(p.entity_id);
+  const row = db.prepare(`SELECT * FROM fssai_attachments WHERE id = ?`).get(str(p.id)) as any;
+  // RULE 1 — same answer for "no such file" and "not on THIS record".
+  if (!row || !entityId || String(row.entity_table) !== p.entity_table || String(row.entity_id) !== entityId) {
+    if (row) {
+      console.warn(
+        `[fssai] remove_file refused: attachment ${row.id} is on ${row.entity_table}:${row.entity_id}, the request named ${p.entity_table}:${entityId || '(none)'} — by ${p.me?.email || 'unknown'}`,
+      );
+    }
+    return { error: 'That file is not on this record.', status: 404 };
+  }
+  if (str(row.image_dropped_at)) {
+    return { error: 'That file has already been removed from this record.', status: 409 };
+  }
+  // RULE 2 — fssaiVoidRefusal is the module's single §19 rule (tier + reason).
+  const refusal = fssaiVoidRefusal(p.me, { status: '', voided_at: '' }, p.reason);
+  if (refusal) return { error: refusal, status: 403 };
+
+  // RULE 3 — the record itself. The table name was checked by isP6Entity above,
+  // so it is one of three literals before it is interpolated.
+  const record = db.prepare(`SELECT id, status, voided_at FROM ${p.entity_table} WHERE id = ?`).get(entityId) as any;
+  if (!record) return { error: 'That file is not on this record.', status: 404 };
+  if (str(record.voided_at) || str(record.status) === 'void') {
     return {
-      error: str(row.image_dropped_at)
-        ? 'That file has already been removed from this record.'
-        : refusal,
-      status: str(row.image_dropped_at) ? 409 : 403,
+      error: `This ${P6_ENTITY_WORDS[p.entity_table]} has been voided, so it is closed evidence and its files stay with it.`,
+      status: 409,
     };
   }
-  const when = new Date().toISOString();
-  db.prepare(
-    `UPDATE fssai_attachments SET data_uri = '', image_dropped_at = ? WHERE id = ?`,
-  ).run(when, row.id);
-  fssaiAudit(db, {
-    entity_table: String(row.entity_table),
-    entity_id: String(row.entity_id),
-    action: 'attachment_removed',
-    field: 'attachment',
-    before: { attachment_id: row.id, filename: row.filename, size_bytes: row.size_bytes, digest_sha256: row.digest_sha256, had_image: true },
-    after: { attachment_id: row.id, had_image: false, image_dropped_at: when },
-    reason: str(p.reason),
-    actor: { email: p.me.email, name: (p.me as any).name },
-    outlet_id: p.outlet_id,
+
+  // RULE 4 — the correction window.
+  const late = fssaiManualRemovalRefusal(row.created_at, p.now ?? new Date());
+  if (late) return { error: late, status: 409 };
+
+  // RULE 5 — the image, the audit row and the ledger row, together or not at all.
+  const when = (p.now ?? new Date()).toISOString();
+  const remove = db.transaction(() => {
+    const res = db.prepare(
+      `UPDATE fssai_attachments SET data_uri = '', image_dropped_at = ?
+        WHERE id = ? AND entity_table = ? AND entity_id = ? AND data_uri <> ''`,
+    ).run(when, row.id, p.entity_table, entityId);
+    if (res.changes !== 1) return false;   // removed by somebody else a moment ago
+    const ledgerId = recordFssaiManualImageRemoval(db, {
+      store: 'fssai_attachments',
+      file_id: String(row.id),
+      of_words: P6_ENTITY_WORDS[p.entity_table],
+      of_table: p.entity_table,
+      of_id: entityId,
+      filename: str(row.filename),
+      size_bytes: Number(row.size_bytes) || 0,
+      digest_sha256: str(row.digest_sha256),
+      created_at: str(row.created_at),
+      created_by: str(row.created_by),
+      reason: str(p.reason),
+      actor: { email: p.me.email, name: (p.me as any).name },
+      outlet_id: p.outlet_id,
+    });
+    fssaiAudit(db, {
+      entity_table: p.entity_table,
+      entity_id: entityId,
+      action: 'attachment_removed',
+      field: 'attachment',
+      before: {
+        attachment_id: row.id, filename: row.filename, mime: row.mime, size_bytes: row.size_bytes,
+        digest_sha256: row.digest_sha256, created_at: row.created_at, created_by: row.created_by,
+        had_image: true,
+      },
+      after: {
+        attachment_id: row.id, had_image: false, image_dropped_at: when,
+        // Unchanged, restated so the log row proves they were unchanged.
+        size_bytes: row.size_bytes, digest_sha256: row.digest_sha256,
+        retention_run_id: ledgerId,
+      },
+      reason: str(p.reason),
+      actor: { email: p.me.email, name: (p.me as any).name },
+      outlet_id: p.outlet_id,
+    });
+    return true;
+  });
+  let removed = false;
+  try {
+    removed = remove();
+  } catch (e: any) {
+    // The ledger row or the audit row could not be written, so the transaction
+    // rolled back and the image is still there. Said in words, not as SQLite's.
+    console.error('[fssai] remove_file rolled back — its trace could not be written:', e?.message);
+    return { error: 'The removal could not be recorded, so nothing was removed. The file is still on the record.', status: 500 };
+  }
+  if (!removed) return { error: 'That file has already been removed from this record.', status: 409 };
+
+  fssaiAppAudit(db, {
+    event_type: 'fssai.attachment.remove',
+    entity_type: p.entity_table,
+    entity_id: entityId,
+    actor_email: p.me.email || '',
+    before: { attachment_id: row.id, filename: row.filename, digest_sha256: row.digest_sha256 },
+    after: { image_dropped_at: when },
+    note: str(p.reason),
   });
   const after = db.prepare(`SELECT * FROM fssai_attachments WHERE id = ?`).get(row.id) as any;
   return { dropped: shapeP6Attachment(after) };

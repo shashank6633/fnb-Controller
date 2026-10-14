@@ -92,8 +92,21 @@ interface ChainRow {
   valid_from: string; expiry_date: string; version: number;
   is_active: number; voided_at: string;
 }
+/**
+ * Whether an FSSAI licence is on file at all, worked out by the server over every
+ * live row — never over the filtered list, so a Kind filter cannot hide it.
+ */
+interface LicenceInfo {
+  on_file: boolean;
+  in_force: boolean;
+  current: {
+    id: string; title: string; reference_no: string; expiry_date: string;
+    state: string; days_to_expiry: number | null;
+  } | null;
+}
 interface DocListResponse {
   documents: Doc[]; counts: Counts; can_void: boolean; truncated: boolean;
+  licence?: LicenceInfo;
 }
 interface DocOneResponse { document: Doc; chain: ChainRow[] }
 interface DocSaveResponse { document?: Doc; advice?: string }
@@ -168,6 +181,8 @@ function expiryWords(d: Doc): string {
 export default function FssaiDocumentsPage() {
   const [rows, setRows] = useState<Doc[]>([]);
   const [counts, setCounts] = useState<Counts>(ZERO);
+  // null until the server has answered — no warning is shown on a guess.
+  const [licence, setLicence] = useState<LicenceInfo | null>(null);
   const [canVoid, setCanVoid] = useState(false);
   const [loading, setLoading] = useState(true);
   const [forbidden, setForbidden] = useState(false);
@@ -199,6 +214,7 @@ export default function FssaiDocumentsPage() {
       const j = await apiJson<DocListResponse>(`/api/fssai/documents?${sp.toString()}`);
       setRows(j.documents || []);
       setCounts(j.counts || ZERO);
+      setLicence(j.licence || null);
       setCanVoid(!!j.can_void);
       setTruncated(!!j.truncated);
     } catch (e: unknown) {
@@ -246,6 +262,43 @@ export default function FssaiDocumentsPage() {
             <Plus size={15} /> Add a document
           </button>
         </div>
+
+        {/* THE LICENCE BEFORE ANYTHING ELSE. It is the first paper an inspector
+            asks for, and before this nothing said when none was filed at all —
+            the counts read "0 lapsed" and the screen looked healthy. The server
+            works this out over every live row, so a Kind filter cannot hide it. */}
+        {licence && !licence.on_file && (
+          <div role="alert" className="bg-red-50 border border-red-300 rounded-lg p-3 text-sm text-red-900 flex flex-wrap items-center gap-3">
+            <span className="flex flex-nowrap items-start gap-2 min-w-0 flex-1">
+              <AlertTriangle size={16} className="mt-0.5 shrink-0" />
+              <span>
+                <strong>No FSSAI licence is on file.</strong> It is the first thing an inspector asks for. File the
+                licence or registration here with a scan of it, so it can be produced in two taps.
+              </span>
+            </span>
+            <button onClick={() => setFormFor({ mode: 'create', doc: null })} className={BTN_PRIMARY}>
+              <Plus size={15} /> File the FSSAI licence
+            </button>
+          </div>
+        )}
+        {licence && licence.on_file && !licence.in_force && licence.current && (
+          <div role="alert" className="bg-red-50 border border-red-300 rounded-lg p-3 text-sm text-red-900 flex flex-wrap items-center gap-3">
+            <span className="flex flex-nowrap items-start gap-2 min-w-0 flex-1">
+              <AlertTriangle size={16} className="mt-0.5 shrink-0" />
+              <span>
+                <strong>The FSSAI licence on file has lapsed</strong>
+                {licence.current.reference_no ? ` (${licence.current.reference_no})` : ''}
+                {licence.current.days_to_expiry !== null && licence.current.days_to_expiry < 0
+                  ? ` — ${Math.abs(licence.current.days_to_expiry)} day${Math.abs(licence.current.days_to_expiry) === 1 ? '' : 's'} ago`
+                  : ''}
+                . Renew it before anything else; an inspector checks it first.
+              </span>
+            </span>
+            <button onClick={() => setDetailId(licence.current!.id)} className={BTN_PLAIN}>
+              Open the licence
+            </button>
+          </div>
+        )}
 
         {/* EXPIRED FIRST, and loud. Everything else on this screen is secondary to
             the question "is anything out of date right now". */}
@@ -399,6 +452,15 @@ export default function FssaiDocumentsPage() {
             <span>
               <strong>Renewing never overwrites.</strong> The new certificate is filed as a new version pointing at the
               one it replaces, and the old row stays — so &ldquo;were we covered in March&rdquo; always has an answer.
+            </span>
+          </p>
+          <p className="flex flex-nowrap items-start gap-2">
+            <FileText size={14} className="mt-0.5 shrink-0 text-[#af4408]" />
+            <span>
+              <strong>The authority&apos;s one audit file.</strong> The FSDB photograph, the municipal water bill, the
+              food-grade declarations for equipment and for delivery packaging, food sampling/lab reports, the waste
+              disposal record and the previous audit report with its closure evidence each have their own Kind — file
+              them under it rather than &ldquo;Other&rdquo;, so they can be found when asked for.
             </span>
           </p>
           <p className="flex flex-nowrap items-start gap-2">
