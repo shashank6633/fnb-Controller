@@ -56,7 +56,7 @@ import {
 import { api } from '@/lib/api';
 import { fmtIST, fmtISTDate, fmtISTIsoDate, fmtISTShort, todayIST } from '@/lib/format-date';
 import TabScroller from '@/components/TabScroller';
-import { packFactor } from '@/lib/pack-units';
+import { packFactor, toPurchaseQty } from '@/lib/pack-units';
 
 interface Department { id: string; name: string; }
 interface ReqLine {
@@ -164,6 +164,25 @@ interface Requisition {
 // Storage stays UTC; conversion happens here at display time.
 const fmtDateTime = (iso: string | null) => fmtIST(iso);
 const fmtNum = (v: number) => (v || 0).toLocaleString('en-IN', { maximumFractionDigits: 3 });
+/**
+ * A central-store CAP in the purchase unit — fmtNum, except for the one figure
+ * fmtNum cannot carry: a balance the "In store" column shows as 0 that the store
+ * still holds (a sub-display crumb, under half a 0.001 step — 0.4 g on a
+ * 1000-pack). The server names that cap at the precision that takes it when
+ * typed back (issue-stock.ts puFine: 6 dp of the recipe unit, carried through
+ * the pack); fmtNum printed it as "0", so this desk read "Most it can give now:
+ * 0 kg" and offered "Issue 0 kg" over a real 0.4 g. Every figure of 0.001 or
+ * more prints exactly as fmtNum prints it, so nothing that was legible changes.
+ * The SAME expression as fmtCapPU on /requisitions (requisitions/page.tsx), so
+ * the two desks print one crumb one way. `pf` = the material's purchase pack
+ * factor; pass 1 for a recipe-unit figure (it then prints 6 dp, the grid).
+ */
+const fmtCapPU = (v: number, pf = 1) => {
+  const n = Number(v) || 0;
+  if (!(n > 0 && n < 0.001)) return fmtNum(n);
+  const dp = Math.min(20, 6 + Math.max(0, Math.ceil(Math.log10(pf > 1 ? pf : 1))));
+  return n.toLocaleString('en-IN', { maximumFractionDigits: dp });
+};
 // Stable empty set — passed as the default `selectedIds` so ReqCard doesn't get
 // a fresh Set identity every render when a requisition has no selection yet.
 const EMPTY_SET: Set<string> = new Set();
@@ -286,10 +305,13 @@ function readBlockedReversals(
    IT GETS ITS OWN TYPE AND ITS OWN READER, and that is the whole point rather
    than duplication for its own sake: BlockedReversal's `requested`/`available`
    arrive in RECIPE units (the department ledger is material-level) and render
-   through U.stockPU, while these arrive ALREADY IN THE PURCHASE UNIT, floored by
-   the server (issue-stock.ts purchaseQtyDown) so that they are typeable. Feeding
-   a central row into readBlockedReversals would print kilograms through a
-   gram→kilogram converter — the 1000x error this app has had before.
+   through U.stockPU, while these arrive ALREADY IN THE PURCHASE UNIT, as the
+   balance's SHOWN figure (issue-stock.ts checkCentralIssue `availablePurchase`:
+   toPurchaseQty, 3 dp half-up — the "In store" column's own number), which the
+   server accepts when typed back and debits as the whole balance; below 0.001 a
+   sub-display crumb at the precision that takes it (print it with fmtCapPU).
+   Feeding a central row into readBlockedReversals would print kilograms through
+   a gram→kilogram converter — the 1000x error this app has had before.
 
    WHAT WAS WRONG BEFORE THIS. The sentence existed and was correct; it reached
    the storekeeper as `alert(j.error)` and vanished on OK, leaving him in front
@@ -300,11 +322,14 @@ const CENTRAL_SHORT_CODE = 'central_stock_short';
 
 interface CentralShort {
   material: string;
-  /** PURCHASE units, floored by the server — the figure THIS page's quantity
-   *  box takes, because that box holds a DELTA added to quantity_issued and
-   *  `available` is exactly the headroom on top of what is already issued. */
+  /** PURCHASE units — the balance's shown figure (or a sub-display crumb's
+   *  exact figure; print with fmtCapPU, never fmtNum). The figure THIS page's
+   *  quantity box takes, because that box holds a DELTA added to
+   *  quantity_issued and `available` is exactly the headroom on top of what is
+   *  already issued. Typed back, it is accepted. */
   available: number;
-  /** PURCHASE units, rounded UP by the server — never less than was asked. */
+  /** PURCHASE units — the ask's shown figure (3 dp half-up, the same converter
+   *  as `available`); unrounded only for a sub-display ask. */
   requested: number;
   /** The unit both figures above are in. Blank only if the server sent none. */
   purchaseUnit: string;
@@ -392,6 +417,201 @@ function readCentralHeld(
   const out = readCentralShort({ code: CENTRAL_SHORT_CODE, blocked: rows, error: '' }, submitted);
   for (const id of Object.keys(out)) out[id] = { ...out[id], held: true };
   return out;
+}
+
+/* ── BEFORE THE CLICK: WHICH LINES THE CENTRAL STORE WILL NOT ISSUE ──────────
+   Everything above reads the server's answer AFTER a gesture. This is the same
+   answer asked BEFORE it, so the storekeeper reads "MIRCHI will NOT be issued"
+   on the card and in the Issue All confirmation instead of a list headed "these
+   items are being issued" that names a line the server then holds. Measured
+   (4-line batch, MIRCHI 3 kg over 1,000 g): the confirmation listed MIRCHI × 3
+   kg under "being issued", the card's only signal was a red In-store figure and
+   a hover title, and the POST came back 200 with MIRCHI held.
+
+   IT DECIDES NOTHING. The rule is the server's — store-issue/route.ts's
+   pre-flight, which asks src/lib/issue-stock.ts checkCentralIssue, which asks
+   src/lib/central-debit-clamp.ts planCentralDebit (the one rule every central
+   floor shares). That file imports the database, so it cannot be bundled into
+   this page; this function asks the SAME questions in the same order on the
+   same converters and cites them, exactly as requisitions/page.tsx centralCapOf
+   does for the management desk:
+     · the three carve-outs: a PARTY requisition (the internal rail moves no
+       central stock for it), a line whose unit cannot be resolved (lineFactor's
+       needsReview: a blank or unrecognised unit on a packed material), and a
+       zero / negative delta — none of them is floored, so none is "held";
+     · the ask: (before + typed) − before, × lineFactor, snapped to 6 dp;
+     · FITS ⇔ qtyGrid(ask) ≤ qtyGrid(max(0, balance − claimed))  OR  the ask's
+       shown figure IS the balance's and that is above 0 (round 6, "THE SHOWN
+       FIGURE IS THE BALANCE" — 14.843 kg typed over 14,842.5 g fits);
+     · the running claim: per MATERIAL, in the batch's own order, a line that
+       fits claims what it will debit (the balance itself when it takes all),
+       and a HELD line claims nothing — so two lines of one material are scored
+       the way the floor will see them.
+   The cap it reports is checkCentralIssue's `availablePurchase`: the balance's
+   shown figure at this line's turn, or a sub-display crumb's exact figure, 0
+   only when holdsAny() is false.
+
+   IT IS A COURTESY, NOT A GUARD, and it says so in its words. One carve-out is
+   invisible from here: a liquor / store-mapped material (store-engine.ts
+   centralFlowBlock) is never floored, and the queue payload does not say which
+   materials those are — the management desk has the same blind spot and names
+   it in the same sentence ("If it is liquor-store items ..."). The balance is
+   the one this page loaded, not the one the server will read. So the forecast
+   only ever adds WORDS; nothing is disabled, nothing is clamped, and the POST
+   is byte-identical to what it was. A batch it calls fully coverable renders
+   exactly as before. */
+
+/** The house quantity grid — central-debit-clamp.ts qtyGrid(): a RECIPE
+ *  quantity as a whole count of 6-dp steps. */
+const grid6 = (n: number) => { const v = Math.round((Number(n) || 0) * 1e6); return v === 0 ? 0 : v; };
+
+interface CentralHoldForecast {
+  /** The floor will not let this entry run: held on a 200, or (when no other
+   *  entry of the gesture hands anything over) the whole gesture refused. */
+  held: boolean;
+  /** PURCHASE units the books hold at this entry's turn — checkCentralIssue's
+   *  `availablePurchase`. Print with fmtCapPU(availPU, pf). */
+  availPU: number;
+  /** holdsAny() is false — the books hold none of it. */
+  empty: boolean;
+  /** The material's purchase pack factor (for fmtCapPU). */
+  pf: number;
+  purchaseUnit: string;
+}
+
+interface CentralBatchForecast {
+  /** One entry per FLOORED line of the batch, fitting or not. */
+  byLine: Record<string, CentralHoldForecast>;
+  /** The held lines, in batch order. */
+  held: ReqLine[];
+  /** Not one entry of the gesture hands anything over, so the server answers
+   *  400 and writes nothing (store-issue: `issuableEntries === 0`). */
+  refusedWhole: boolean;
+}
+
+/**
+ * Score a gesture the way /store-issue's pre-flight will. `batch` is in POST
+ * order, each entry's `qty` the figure that will be POSTed (in the LINE's own
+ * stored unit — resolveIssueQty's `qty`), so the forecast is about exactly the
+ * numbers the button sends. Pure; reads only the queue payload.
+ */
+function forecastCentralHolds(
+  req: Requisition,
+  batch: Array<{ line: ReqLine; qty: number }>,
+): CentralBatchForecast {
+  const byLine: Record<string, CentralHoldForecast> = {};
+  const held: ReqLine[] = [];
+  let issuable = 0;
+  const claimed = new Map<string, number>();
+  for (const { line, qty } of batch) {
+    const q = Number(qty);
+    // The route skips a non-positive or non-finite quantity before it scores
+    // anything (`addQty <= 0 → continue`), so such an entry is neither held
+    // nor counted as handing anything over.
+    if (!Number.isFinite(q) || q <= 0) continue;
+    const verdict = (() => {
+      // Carve-out 1 — the internal rail moves no central stock for a party line.
+      if (req.purpose === 'party') return null;
+      // A balance this page was not given is not guessed at (the In store
+      // column prints "—" for it): say nothing rather than cry wolf.
+      const raw = (line as any).current_stock;
+      if (raw == null) return null;
+      const ru = String(line.material_unit || '').trim();
+      if (!ru) return null;
+      const meta = { unit: ru, purchase_unit: line.material_purchase_unit, pack_size: line.material_pack_size };
+      const pf = packFactor(meta);
+      // Carve-out 2 — lineFactor (issue-stock.ts), resolved the same way.
+      let factor = 1;
+      if (pf > 1) {
+        const lu = String(line.unit ?? '').toLowerCase().trim();
+        const pu = String(line.material_purchase_unit ?? '').toLowerCase().trim();
+        if (lu === '') return null;
+        if (lu === pu) factor = pf;
+        else if (lu === ru.toLowerCase()) factor = 1;
+        else return null;
+      }
+      // Carve-out 3 — a zero (or credit) delta is not a debit.
+      const before = Number(line.quantity_issued) || 0;
+      const deltaLine = (before + q) - before;
+      const ask = Math.round(deltaLine * factor * 1e6) / 1e6;
+      if (ask <= 1e-9) return null;
+      const matId = String(line.material_id || '');
+      const already = claimed.get(matId) || 0;
+      const s = (Number(raw) || 0) - already;
+      const available = s > 0 ? s : 0;
+      const shownAvail = toPurchaseQty(available, meta);
+      const byShownFigure = shownAvail > 0 && toPurchaseQty(ask, meta) === shownAvail;
+      const fits = grid6(ask) <= grid6(available) || byShownFigure;
+      if (fits) {
+        const takesAll = grid6(ask) >= grid6(available) || byShownFigure;
+        claimed.set(matId, already + (takesAll ? available : ask));
+      }
+      const holds = grid6(available) > 0;
+      const f: CentralHoldForecast = {
+        held: !fits,
+        availPU: shownAvail > 0 ? shownAvail : holds ? (grid6(available) / 1e6) / pf : 0,
+        empty: !holds,
+        pf,
+        purchaseUnit: String(line.material_purchase_unit || ru).trim(),
+      };
+      return f;
+    })();
+    if (verdict) byLine[line.id] = verdict;
+    if (verdict?.held) held.push(line);
+    else issuable++;
+  }
+  return { byLine, held, refusedWhole: held.length > 0 && issuable === 0 };
+}
+
+/**
+ * The advance warning for a gesture that will leave lines behind — the
+ * management desk's round-6 banner (requisitions/page.tsx, "⛔ … ask for more
+ * than the central store's books hold"), word for word except where this desk
+ * is different: the gesture is named ("on Issue All", not "on submit"), "every
+ * other line" is scoped to the lines the gesture actually sends, and the
+ * pointer to Issue Requisitions is dropped because this IS Issue Requisitions —
+ * a held line simply stays open here. Rendered only when something is held,
+ * so a fully-coverable batch renders exactly as it always has.
+ */
+function CentralHoldBanner({ forecast, gesture, scope }: {
+  forecast: CentralBatchForecast;
+  /** The button, as the storekeeper reads it: "Issue All", "Issue Selected", "Confirm". */
+  gesture: string;
+  /** What "every other …" means for this gesture: "open line", "selected line". */
+  scope: string;
+}) {
+  const n = forecast.held.length;
+  if (n === 0) return null;
+  const one = n === 1;
+  return (
+    <div className="text-[11px] px-3 py-2 bg-red-50 border-2 border-red-300 rounded text-red-900">
+      <div className="font-semibold">
+        ⛔ {n} line{one ? '' : 's'} ask{one ? 's' : ''} for more than the central store&apos;s books hold
+        {forecast.refusedWhole ? (
+          <> — and no other line hands anything over, so the store will <b>refuse the whole issue</b> and save nothing.</>
+        ) : (
+          <> — on {gesture} {one ? 'it is' : 'they are'} <b>NOT issued and {one ? 'stays' : 'stay'} outstanding</b>.
+            Every other {scope} is issued.</>
+        )}
+      </div>
+      <div className="text-[10px] mt-0.5">
+        {forecast.held.map(l => {
+          const c = forecast.byLine[l.id];
+          return `${l.material_name} (books: ${c.empty ? 'none' : `${fmtCapPU(c.availPU, c.pf)} ${c.purchaseUnit}`})`;
+        }).join(', ')}
+        .{' '}
+        {forecast.refusedWhole ? (
+          <>Lower {one ? 'that line' : 'those lines'} to what the store can give — the rest needs stock received
+            or a closing count recorded.</>
+        ) : (
+          <>Lower {one ? 'that line' : 'those lines'} to what the store can give and {one ? 'it goes' : 'they go'} out
+            with the rest.</>
+        )}
+        {' '}If {one ? 'it is' : 'they are'} liquor-store items, the stock moves on the Liquor
+        Store ledger and the store will accept the hand-over as entered.
+      </div>
+    </div>
+  );
 }
 
 export default function StoreRequisitionsPage() {
@@ -1246,6 +1466,7 @@ export default function StoreRequisitionsPage() {
                      onIssueSelected={() => issueSelected(req)}
                      issuingSelected={issuingSelected === req.id}
                      busyLine={busyLine}
+                     resolveQty={(line, remaining) => resolveIssueQty(line, remaining)}
                      editQty={editQty}
                      issueNotes={issueNotes} setIssueNotes={setIssueNotes}
                      setEditQty={setEditQty}
@@ -1301,6 +1522,98 @@ function IssueAllModal({ req, resolveQty, busy, onCancel, onConfirm }: {
   busy: boolean; onCancel: () => void; onConfirm: () => void;
 }) {
   const lines = openIssuableLines(req);
+  /* WHAT THE SERVER WILL HOLD, forecast on the very batch Confirm posts (same
+     lines, same order, same resolver — see forecastCentralHolds). The list
+     below used to put every open line under "these items are being issued",
+     including one the server then held: the confirmation said the opposite of
+     what happened. A held line now leaves that list and is named under its own
+     heading, in the words the server's alert will use after the click. Nothing
+     held ⇒ the original markup, untouched. */
+  const forecast = forecastCentralHolds(req, lines.map(l => ({ line: l, qty: resolveQty(l, l.remaining).qty })));
+  const heldIds = new Set(forecast.held.map(l => l.id));
+  const item = (l: ReqLine & { remaining: number }) => {
+    const U = lineUnits(l);
+    const u = U.pu;
+    const rq = resolveQty(l, l.remaining);
+    return (
+      <li key={l.id} className="flex items-center justify-between text-sm border-b border-[#E8D5C4]/50 py-1.5">
+        <span className="text-[#2D1B0E]">{l.material_name}</span>
+        <span className="font-mono font-semibold text-emerald-700">
+          × {fmtNum(U.toPU(rq.qty))}{u && <span className="text-[10px] text-[#8B7355] ml-0.5">{u}</span>}
+          {U.pf > 1 && <span className="text-[9px] text-[#B8A590] ml-1">= {fmtNum(U.toRecipe(rq.qty))} {U.recipeUnit}</span>}
+          {rq.over && (
+            <span className="ml-1 text-[9px] px-1 rounded bg-amber-100 text-amber-800 border border-amber-300">
+              over approved ({fmtNum(U.toPU(l.remaining))} {u})
+            </span>
+          )}
+        </span>
+      </li>
+    );
+  };
+  if (forecast.held.length > 0) {
+    const going = lines.filter(l => !heldIds.has(l.id));
+    const kept = lines.filter(l => heldIds.has(l.id));
+    return (
+      <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4" onClick={onCancel}>
+        <div className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-md shadow-xl" onClick={e => e.stopPropagation()}>
+          <div className="px-5 py-3 border-b border-[#E8D5C4]">
+            <div className="font-semibold text-[#2D1B0E] flex items-center gap-2">
+              <Send className="w-4 h-4 text-emerald-600" /> Issue all items
+            </div>
+            <div className="text-[11px] text-[#8B7355] mt-0.5">
+              {going.length > 0
+                ? <>{req.req_number} — these items are being issued to <b className="text-[#6B5744]">{req.department_name}</b>:</>
+                : <>{req.req_number} — nothing will be issued to <b className="text-[#6B5744]">{req.department_name}</b>:</>}
+            </div>
+          </div>
+          <div className="p-4 max-h-[50vh] overflow-y-auto space-y-3">
+            {going.length > 0 && (
+              <ul className="space-y-1">
+                {going.map(item)}
+              </ul>
+            )}
+            <div>
+              <div className="text-[11px] font-semibold text-red-800 mb-1">
+                NOT issued — the central store does not hold the quantity asked:
+              </div>
+              <ul className="space-y-1">
+                {kept.map(l => {
+                  const U = lineUnits(l);
+                  const u = U.pu;
+                  const rq = resolveQty(l, l.remaining);
+                  return (
+                    <li key={l.id} className="flex items-center justify-between text-sm border-b border-red-200/60 py-1.5">
+                      <span className="text-red-900">{l.material_name}</span>
+                      <span className="font-mono font-semibold text-red-700">
+                        × {fmtNum(U.toPU(rq.qty))}{u && <span className="text-[10px] text-[#8B7355] ml-0.5">{u}</span>}
+                        {U.pf > 1 && <span className="text-[9px] text-[#B8A590] ml-1">= {fmtNum(U.toRecipe(rq.qty))} {U.recipeUnit}</span>}
+                      </span>
+                    </li>
+                  );
+                })}
+              </ul>
+            </div>
+            <CentralHoldBanner forecast={forecast} gesture="Confirm & Issue" scope="open line" />
+          </div>
+          <div className="px-5 py-3 border-t border-[#E8D5C4] flex items-center justify-end gap-2">
+            <button onClick={onCancel} disabled={busy}
+                    className="px-3 py-1.5 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm disabled:opacity-50">
+              Cancel
+            </button>
+            {/* NOT disabled — the forecast is advisory (a liquor / store-mapped
+                line is never floored and this page cannot tell which those
+                are). A hold writes the covered lines and reports the rest; a
+                whole refusal writes nothing. Both are safe to let through. */}
+            <button onClick={onConfirm} disabled={busy}
+                    className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-sm flex items-center gap-1.5 disabled:opacity-50">
+              {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
+              Confirm & Issue
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
   return (
     <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4" onClick={onCancel}>
       <div className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-md shadow-xl" onClick={e => e.stopPropagation()}>
@@ -1317,25 +1630,7 @@ function IssueAllModal({ req, resolveQty, busy, onCancel, onConfirm }: {
             <div className="text-sm text-[#8B7355] text-center py-4">No open items to issue.</div>
           ) : (
             <ul className="space-y-1">
-              {lines.map(l => {
-                const U = lineUnits(l);
-                const u = U.pu;
-                const rq = resolveQty(l, l.remaining);
-                return (
-                  <li key={l.id} className="flex items-center justify-between text-sm border-b border-[#E8D5C4]/50 py-1.5">
-                    <span className="text-[#2D1B0E]">{l.material_name}</span>
-                    <span className="font-mono font-semibold text-emerald-700">
-                      × {fmtNum(U.toPU(rq.qty))}{u && <span className="text-[10px] text-[#8B7355] ml-0.5">{u}</span>}
-                      {U.pf > 1 && <span className="text-[9px] text-[#B8A590] ml-1">= {fmtNum(U.toRecipe(rq.qty))} {U.recipeUnit}</span>}
-                      {rq.over && (
-                        <span className="ml-1 text-[9px] px-1 rounded bg-amber-100 text-amber-800 border border-amber-300">
-                          over approved ({fmtNum(U.toPU(l.remaining))} {u})
-                        </span>
-                      )}
-                    </span>
-                  </li>
-                );
-              })}
+              {lines.map(item)}
             </ul>
           )}
         </div>
@@ -1805,6 +2100,9 @@ function ReqCard(props: {
   onIssueSelected: () => void;
   issuingSelected: boolean;
   busyLine: string | null;
+  /** The SAME resolver every issue POST uses (resolveIssueQty) — so the advance
+   *  warnings are about exactly the figures the buttons will send. */
+  resolveQty: (line: ReqLine, remaining: number) => { qty: number; over: boolean; note: string };
   editQty: Record<string, string>; setEditQty: (f: any) => void;
   issueNotes: Record<string, string>; setIssueNotes: (f: any) => void;
   editDefer: Record<string, { until: string; reason: string }>;
@@ -1833,6 +2131,32 @@ function ReqCard(props: {
   const selectedCount = openIds.filter(id => props.selectedIds.has(id)).length;
   const allOpenSelected = openIds.length > 0 && selectedCount === openIds.length;
   const someOpenSelected = selectedCount > 0 && !allOpenSelected;
+  /* THE CENTRAL FLOOR, FORECAST PER GESTURE (see forecastCentralHolds). Each
+     batch is built exactly as its button builds the POST: same lines, same
+     order (openIssuableLines), same resolver — so a line typed down to what the
+     store holds stops being flagged the moment it is typed. */
+  const allForecast = forecastCentralHolds(
+    req, openLines.map(l => ({ line: l, qty: props.resolveQty(l, l.remaining).qty })));
+  const selForecast = forecastCentralHolds(
+    req, openLines.filter(l => props.selectedIds.has(l.id))
+      .map(l => ({ line: l, qty: props.resolveQty(l, l.remaining).qty })));
+  /* AND PER ROW, ALONE — the row's own Issue Now (or "Issue & defer balance")
+     sends that one line, and the floor refuses a lone short entry whole. Scored
+     alone on purpose: an issue only ever REMOVES headroom from a later line of
+     the same material, so a line held alone is held in every batch too, and
+     the row's sentence is true whichever button is pressed. (A line that fits
+     alone but is held only behind an earlier line of the same item in a batch
+     is named by that batch's own banner, not by the row.) */
+  const rowHold = (line: ReqLine): CentralHoldForecast | undefined => {
+    if (line.is_rejected || line.store_rejected) return undefined;
+    const outstanding = lineSplit(line).outstanding;
+    if (!(outstanding > 0)) return undefined;
+    const sq = props.splitIssueQty[line.id]?.qty;
+    const split = !!props.editDefer[line.id] && Number.isFinite(sq) && sq > 0;
+    const qty = split ? sq : props.resolveQty(line, outstanding).qty;
+    const f = forecastCentralHolds(req, [{ line, qty }]).byLine[line.id];
+    return f?.held ? f : undefined;
+  };
   const partialText = partialSummary(req);
   const statusTone: Record<string, string> = {
     mgmt_approved:   'bg-amber-100 text-amber-800 border-amber-200',
@@ -1964,7 +2288,7 @@ function ReqCard(props: {
           non-deferred, remaining>0) line. Only on the Pending Issue tab, and
           only when at least one such line exists. Clicking opens a confirmation
           modal (handled by the page) before anything is POSTed. */}
-      {props.showIssueAll && openIssuableLines(req).length > 0 && (
+      {props.showIssueAll && openIssuableLines(req).length > 0 && allForecast.held.length === 0 && (
         <div className="px-4 py-2 border-t border-[#E8D5C4] bg-[#FFF8F0] flex items-center justify-between gap-2">
           <span className="text-[11px] text-[#8B7355]">
             {openIssuableLines(req).length} open item{openIssuableLines(req).length > 1 ? 's' : ''} ready to hand over.
@@ -1975,6 +2299,31 @@ function ReqCard(props: {
           </button>
         </div>
       )}
+      {/* THE SAME BAR WHEN THE CENTRAL STORE CANNOT COVER EVERY LINE. A separate
+          branch, not a conditional inside the one above, so a fully-coverable
+          card renders byte-for-byte as it always has. "N open items ready to
+          hand over" stops counting a line the server will hold — it is open, it
+          is not ready — and the banner says before the click what the alert
+          says after it. Shown on the bar, not inside the rows, because the bar
+          is visible on a COLLAPSED card, which is where Issue All is pressed. */}
+      {props.showIssueAll && openIssuableLines(req).length > 0 && allForecast.held.length > 0 && (() => {
+        const n = openLines.length;
+        const ready = n - allForecast.held.length;
+        return (
+          <div className="px-4 py-2 border-t border-[#E8D5C4] bg-[#FFF8F0] space-y-1.5">
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-[11px] text-[#8B7355]">
+                {ready} of {n} open item{n > 1 ? 's' : ''} ready to hand over.
+              </span>
+              <button onClick={props.onIssueAll}
+                      className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-xs font-medium flex items-center gap-1.5">
+                <Send className="w-3.5 h-3.5" /> Issue All Items
+              </button>
+            </div>
+            <CentralHoldBanner forecast={allForecast} gesture="Issue All" scope="open line" />
+          </div>
+        );
+      })()}
 
       {/* Issue Selected — appears when the card is expanded, selection is
           enabled (Pending Issue tab) and at least one open line is checked.
@@ -1995,6 +2344,15 @@ function ReqCard(props: {
               Issue Selected
             </button>
           </div>
+        </div>
+      )}
+      {/* Issue Selected is the other multi-line gesture, so it gets the same
+          advance warning, scored on the checked lines only. Its own row below
+          the bar (nothing renders when every checked line is covered), so the
+          bar above is unchanged markup. */}
+      {props.selectable && expanded && selectedCount > 0 && selForecast.held.length > 0 && (
+        <div className="px-4 pb-2 bg-emerald-50/60">
+          <CentralHoldBanner forecast={selForecast} gesture="Issue Selected" scope="selected line" />
         </div>
       )}
 
@@ -2087,6 +2445,7 @@ function ReqCard(props: {
                          onIssue={props.onIssue} onDefer={props.onDefer}
                          blocked={props.blockedReversals[line.id]}
                          short={props.centralShort[line.id]}
+                         centralHold={rowHold(line)}
                          onUndo={props.onUndo} onReject={props.onReject} onUnreject={props.onUnreject}
                          onShowHistory={props.onShowHistory} />
                     ))}
@@ -2128,6 +2487,9 @@ function LineRow(props: {
   blocked?: BlockedReversal;
   /** Set when the central floor refused an ISSUE on THIS line. */
   short?: CentralShort;
+  /** Set when the central floor WILL refuse the quantity this row's own Issue
+   *  button is about to send — the forecast, before the click. */
+  centralHold?: CentralHoldForecast;
   onUndo: (line: ReqLine) => void;
   onReject: (line: ReqLine) => void;
   onUnreject: (line: ReqLine) => void;
@@ -2478,6 +2840,17 @@ function LineRow(props: {
           // substitute the full outstanding whenever the cap and the outstanding
           // round into the same 3rd decimal, and that substitution is refused.
           const exactLineQty = U.fromPU(s.available);
+          // THE CAP AS A FIGURE, NEVER "0" OVER A REAL CRUMB. fmtNum's 3 dp
+          // printed a 0.4 g balance as "Most it can give now: 0 kg" and the
+          // button as "Issue 0 kg" while the server's sentence one line up said
+          // "holds only 0.4 g ... Issue 0.0004 kg or less" — and the printed 0,
+          // typed back, was refused here as "Enter a quantity > 0". fmtCapPU
+          // prints the crumb at the precision the server named it in (puFine:
+          // 6 dp of the recipe unit through the pack), so the figure, the
+          // sentence and the button agree, and typing the figure back is
+          // accepted. At 0.001 or more it is fmtNum, byte for byte.
+          const capPf = sameBasis ? U.pf : 1;
+          const capFig = fmtCapPU(s.available, capPf);
           return (
             <div className="mb-1 rounded border border-rose-300 bg-rose-50 px-1.5 py-1 text-[10px] leading-snug text-rose-900 max-w-[15rem] md:max-w-[22rem]">
               <div className="font-semibold flex items-start gap-1">
@@ -2485,23 +2858,24 @@ function LineRow(props: {
                 <span>The central store does not hold this much</span>
               </div>
               {/* Verbatim. It is written for a storekeeper, it names both
-                  figures in the purchase unit, and its cap is floored server-side
-                  so it is a quantity that passes on the retry. */}
+                  figures in the purchase unit, and its cap is the balance's
+                  shown figure (or a crumb's exact figure), which the server
+                  accepts on the retry and debits as the whole balance. */}
               {s.message ? <div className="mt-0.5 opacity-90">{s.message}</div> : null}
               {s.available > 0 && (
                 <div className="mt-1 flex items-center justify-between gap-1">
                   <span>
                     Most it can give now:{' '}
-                    <b className="font-mono">{fmtNum(s.available)}{s.purchaseUnit ? ` ${s.purchaseUnit}` : ''}</b>
+                    <b className="font-mono">{capFig}{s.purchaseUnit ? ` ${s.purchaseUnit}` : ''}</b>
                     {U.pf > 1 && sameBasis
-                      ? <span className="text-[9px] opacity-70"> (= {fmtNum(U.toRecipe(exactLineQty))} {U.recipeUnit})</span>
+                      ? <span className="text-[9px] opacity-70"> (= {fmtCapPU(U.toRecipe(exactLineQty), 1)} {U.recipeUnit})</span>
                       : null}
                   </span>
                   {canOffer && (
                     <button onClick={() => props.onIssue(line, exactLineQty)} disabled={busy}
-                            title={`Hand over ${fmtNum(s.available)} ${s.purchaseUnit} — the most the central books cover on this line. The rest stays outstanding and can be deferred or ordered.`}
+                            title={`Hand over ${capFig} ${s.purchaseUnit} — the most the central books cover on this line. The rest stays outstanding and can be deferred or ordered.`}
                             className="shrink-0 px-1.5 py-0.5 rounded border border-rose-400 bg-white hover:bg-rose-100 font-semibold disabled:opacity-50">
-                      Issue {fmtNum(s.available)} {s.purchaseUnit}
+                      Issue {capFig} {s.purchaseUnit}
                     </button>
                   )}
                 </div>
@@ -2669,6 +3043,34 @@ function LineRow(props: {
                         className={`text-[10px] px-1 ${splitMode ? 'text-violet-700' : 'text-blue-700'}`}>cancel</button>
               </div>
             )}
+            {/* THE CENTRAL STORE WILL NOT GIVE THIS — SAID BEFORE THE CLICK, in
+                words, under the box it is about. The management desk's round-6
+                row sentence and "Issuable now" figure, verbatim; the figure is
+                the delta this box takes (the box adds to what is issued), which
+                is checkCentralIssue's `availablePurchase` — typed back, it is
+                accepted. Live: it follows the typed figure (and, in the split
+                panel, the captured hand-over), and disappears the moment the
+                quantity is one the store can give.
+                Stood down while the server's own panel is on this line: that is
+                the fresher reading of the same fact, in the server's words.
+                Hidden on a plain Defer — nothing is being handed over. */}
+            {props.centralHold && !props.short && outstanding > 0 && (!deferOpen || splitMode) && (() => {
+              const h = props.centralHold!;
+              const cap = `${fmtCapPU(h.availPU, h.pf)} ${h.purchaseUnit}`;
+              return (
+                <div className="w-full text-[9px] text-red-800 font-semibold"
+                     title={h.empty
+                       ? `The central store's books hold NONE of this material, so the store will NOT issue this line — get stock received or a closing count recorded first. (Liquor-store items are the exception: their stock moves on the Liquor Store ledger.)`
+                       : `The central store's books hold ${cap} — more than that is NOT issued. (Liquor-store items are the exception: their stock moves on the Liquor Store ledger.)`}>
+                  {h.empty
+                    ? <>The store&apos;s books hold <b>none</b> of this — the central store will NOT issue this line.</>
+                    : <>Over the store&apos;s balance of <b>{cap}</b> — the central store will NOT issue this line.</>}
+                  {!h.empty && (
+                    <div className="text-red-900 font-normal">Issuable now: <b className="font-mono">{cap}</b></div>
+                  )}
+                </div>
+              );
+            })()}
             {/* UNDO STAYS VISIBLE ON A FULFILLED REQUISITION. The condition is
                 the LINE's own state (something was issued, or a time was
                 promised) and never the requisition's status — the card flips to

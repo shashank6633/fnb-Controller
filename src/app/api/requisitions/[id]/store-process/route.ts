@@ -4,7 +4,7 @@ import { applyPartyFulfillment } from '@/lib/party-fulfillment';
 import { mergeDuplicateLines } from '@/lib/po-helpers';
 import {
   applyIssueDelta, checkCentralIssue, isCentralStockShort,
-  issueLineQtyToRecord, rescoreHeldIssue,
+  issueLineQtyToRecord, rescoreHeldIssue, scoreHeldAtTurn, lineIssueComplete,
 } from '@/lib/issue-stock';
 import { vendorMappingError, vendorResolver } from '@/lib/vendor-mapping';
 import { centralFlowBlock } from '@/lib/store-engine';
@@ -450,6 +450,10 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // the floor exists inside the writer.
       const selIssuedNow = db.prepare(`SELECT quantity_issued FROM requisition_items WHERE id = ?`);
       const claimed = new Map<string, number>();
+      // What earlier HELD lines of the same material are given first, for the
+      // FIGURES only (round 7 — scoreHeldAtTurn). Never read by the decision:
+      // a held line writes nothing, so it must not hold a later line that fits.
+      const heldShare = new Map<string, { recipe: number; lines: number }>();
       for (const it of items) {
         const ln = lineMap.get(it.id) || {};
         const beforeIssued = Number((selIssuedNow.get(it.id) as any)?.quantity_issued) || 0;
@@ -481,13 +485,29 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           continue;
         }
         heldItemIds.add(String(it.id));
+        // ── HELD LINES OF ONE MATERIAL SHARE THE POOL (round 7) ─────────────
+        // Each held line used to print the whole remaining pool as its cap, so
+        // two short lines over 1 kg both said "Issue 1 kg or less" and typing
+        // both back held one. The first is given what it can take, the next
+        // what is left. With no earlier held sibling this is `c`, byte for byte.
+        const share = heldShare.get(String(it.material_id));
+        const h = share
+          ? scoreHeldAtTurn(db, {
+              reqItemId: it.id, beforeLineQty: beforeIssued, afterLineQty: afterIssued,
+              alreadyClaimedRecipe: already, siblingRecipe: share.recipe, siblingLines: share.lines,
+            })
+          : c;
+        heldShare.set(String(it.material_id), {
+          recipe: (share?.recipe || 0) + Math.max(0, Number(h.debitRecipe) || 0),
+          lines: (share?.lines || 0) + 1,
+        });
         const row = {
           code: 'central_stock_short' as const,
-          material: c.materialName, material_id: c.materialId, req_item_id: c.reqItemId,
-          requested: c.requestedPurchase, available: c.availablePurchase,
-          purchase_unit: c.purchaseUnit,
-          max_issue_qty: c.maxIssueLineQty, line_unit: c.lineUnit,
-          message: c.message,
+          material: h.materialName, material_id: h.materialId, req_item_id: h.reqItemId,
+          requested: h.requestedPurchase, available: h.availablePurchase,
+          purchase_unit: h.purchaseUnit,
+          max_issue_qty: h.maxIssueLineQty, line_unit: h.lineUnit,
+          message: h.message,
         };
         centralShort.push(row);
         heldRowOf.set(String(it.id), row);
@@ -1167,13 +1187,25 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // in the transaction moves central for an internal line (the party
       // transfer below runs only with no held line; a PO moves nothing until it
       // is received). The hold stands; only the figures follow the balance.
+      //
+      // AND SIBLING HELD LINES SHARE WHAT IS LEFT, in line order (round 7), so
+      // the caps on the 200 add up to the shelf and are all accepted when typed
+      // back together (rescoreHeldIssue's siblingRecipe; the running sum is each
+      // line's own debitRecipe).
+      const heldShareAfter = new Map<string, { recipe: number; lines: number }>();
       for (const [itemId, row] of heldRowOf) {
         const ln = lineMap.get(itemId) || {};
         const beforeNow = Number((selBefore.get(itemId) as any)?.quantity_issued) || 0;
+        const share = heldShareAfter.get(String(row.material_id));
         const c = rescoreHeldIssue(db, {
           reqItemId: itemId, beforeLineQty: beforeNow, afterLineQty: Number(ln.quantity_issued) || 0,
+          siblingRecipe: share?.recipe || 0, siblingLines: share?.lines || 0,
         });
         if (!c.debits) continue;
+        heldShareAfter.set(String(row.material_id), {
+          recipe: (share?.recipe || 0) + Math.max(0, Number(c.debitRecipe) || 0),
+          lines: (share?.lines || 0) + 1,
+        });
         row.requested = c.requestedPurchase;
         row.available = c.availablePurchase;
         row.max_issue_qty = c.maxIssueLineQty;
@@ -1330,17 +1362,25 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // test store-issue uses — effective qty = chef_approved_qty ??
       // quantity_requested, either rejection counts as done, and a deferred line
       // is never done even at full quantity.
+      //
+      // "Issued in full" is lineIssueComplete (round 7), the predicate
+      // store-issue's defer rule and auto-advance call too: the old
+      // `issued >= effective`, OR the desk shows the two as one figure. A line
+      // the shown figure took in full (14.843 kg typed over 14,842.5 g, so
+      // 14.8425 kg recorded of 14.843 approved) closes, instead of keeping the
+      // requisition 'store_processed' over 0.0005 kg the store does not hold.
       const fresh = db.prepare(`
-        SELECT is_rejected, store_rejected, quantity_requested, chef_approved_qty,
-               quantity_issued, deferred_until
-        FROM requisition_items WHERE req_id = ?
+        SELECT ri.is_rejected, ri.store_rejected, ri.quantity_requested, ri.chef_approved_qty,
+               ri.quantity_issued, ri.deferred_until,
+               ri.unit AS line_unit, rm.unit, rm.purchase_unit, rm.pack_size
+        FROM requisition_items ri
+        LEFT JOIN raw_materials rm ON rm.id = ri.material_id
+        WHERE ri.req_id = ?
       `).all(id) as any[];
       const allDone = fresh.every(it => {
         if (it.is_rejected) return true;
         if (it.store_rejected) return true;
-        const eff = (it.chef_approved_qty != null ? Number(it.chef_approved_qty) : Number(it.quantity_requested)) || 0;
-        const got = Number(it.quantity_issued) || 0;
-        return got >= eff && !it.deferred_until;
+        return lineIssueComplete(it) && !it.deferred_until;
       });
       // A line left off the PO for an unmapped vendor counts as OUTSTANDING, the
       // same as a PO that was raised. Without `poSkipped.length` here, the one

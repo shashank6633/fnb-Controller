@@ -4,7 +4,8 @@ import { GrnRefused, logAuditOrThrow, r6 } from './grn-reversal';
 import {
   postCentralTxn, deptParty, PARTY_TRANSFER_TYPE, PARTY_TRANSFER_TYPES_SQL,
 } from '@/lib/movement-record';
-import { checkCentralIssue } from '@/lib/issue-stock';
+import { checkCentralIssue, recordPartyShelfTake } from '@/lib/issue-stock';
+import { qtyGrid } from '@/lib/central-debit-clamp';
 
 /* ══════════════════════════════════════════════════════════════════════════
  * THE PO → REQUISITION FULFIL CASCADE, IN ONE PLACE.
@@ -138,6 +139,12 @@ export function fulfilRequisitionFromPo(
         reason: string; wanted_recipe: number; issued_recipe: number;
         short_recipe: number; central_stock_recipe: number;
       }> = [];
+      // Lines the shelf rule resolved to the balance, corrected to what left the
+      // shelf (round 7) — see THE LINE RECORDS WHAT LEFT THE SHELF below.
+      const shelfRecorded: Array<{
+        req_item_id: string; material_id: string; material_name: string; line_unit: string;
+        asked_line_qty: number; recorded_line_qty: number; debit_recipe: number;
+      }> = [];
       let totalCost = 0;
       for (const it of reqItems) {
         /* EFFECTIVE QTY — the house rule (store-issue/route.ts, dept-stock,
@@ -260,6 +267,32 @@ export function fulfilRequisitionFromPo(
         // `issuedReq <= 0` skip above does — a zero-quantity party row would be
         // a movement that did not happen, and the void refuses rows of that shape.
         if (issued <= 0) continue;
+
+        // ── THE LINE RECORDS WHAT LEFT THE SHELF (round 7) ──────────────────
+        // The rule above can FIT a line by taking the balance instead of its
+        // figure — the shown-figure rule: two party lines of 10 + 4.843 kg over
+        // 14,842.5 g, the second takes 4,842.5 g. The movement row and the
+        // consumption audit always carried that; the line kept 4.843 kg, the
+        // issue ledger 4,843 g, and nothing named the half gram (measured: no
+        // .short row — rightly, nothing was short). The contract in
+        // src/lib/central-debit-clamp.ts is that a caller whose debit is not the
+        // ask records the debit, so the line is corrected to recordAfterLineQty,
+        // the floor's own figure (recordPartyShelfTake, shared with the desks'
+        // party rail). Only on a FIT: a clamped line (!c.ok) is a shortfall and
+        // goes on the .short row as before. Only when the line itself carried
+        // the figure weighed — a line issued nothing is weighed at its approved
+        // quantity, and that is not this line's record to rewrite.
+        if (c.ok && c.recordAfterLineQty !== issuedReq
+            && recordPartyShelfTake(db, {
+              reqItemId: String(it.id), askedLineQty: issuedReq,
+              recordLineQty: c.recordAfterLineQty, actor: actorEmail || 'system:po-requisition-fulfil',
+            })) {
+          shelfRecorded.push({
+            req_item_id: String(it.id), material_id: String(it.material_id),
+            material_name: String(it.material_name || ''), line_unit: String(it.unit ?? ''),
+            asked_line_qty: issuedReq, recorded_line_qty: c.recordAfterLineQty, debit_recipe: issued,
+          });
+        }
         decStock.run(issued, it.material_id);
         // MOVEMENT RECORD: the party's draw on central. The destination was
         // implicit in the type; it is now the requisition's own department when
@@ -311,10 +344,17 @@ export function fulfilRequisitionFromPo(
           line_cost: lineCost,
           // Stated on the line itself as well as in the shortfall event below,
           // so the consumption record cannot read as a full hand-over when the
-          // clamp reduced it. Only present when it actually bit.
-          ...(issued < wanted - 1e-9
+          // clamp reduced it. Only present when it actually bit — `!c.ok`, the
+          // rule's own verdict (round 7). A FIT that took the balance by the
+          // shown figure (4,842.5 g for 4.843 kg typed) is not a shortfall and
+          // must not read as one: it carries the typed figure as
+          // asked_quantity instead, beside the quantity that moved, and the line
+          // itself now records that quantity (above).
+          ...(!c.ok && issued < wanted - 1e-9
             ? { requested_quantity: wanted, short_quantity: Math.round((wanted - issued) * 1e6) / 1e6 }
-            : {}),
+            : c.ok && qtyGrid(issued) !== qtyGrid(wanted)
+              ? { asked_quantity: wanted }
+              : {}),
         });
       }
       logAuditEvent(db, {
@@ -347,6 +387,25 @@ export function fulfilRequisitionFromPo(
           },
           note: `${partyNote} — ${shortfalls.length} line(s) could not be issued in full from central: `
             + shortfalls.map(s => `${s.material_name || s.material_id} (${s.reason})`).join(', '),
+        });
+      }
+      // THE LINES THE SHELF RULE CORRECTED, on the same row the desks' party
+      // rail writes (party-fulfillment.ts). A fourth event type, and like the
+      // .short row a report to the owner, NOT a discriminator: do not add it to
+      // cascadeDeductionWitness's IN list. Written only when a line was
+      // corrected, so an ordinary cascade is byte-identical.
+      if (shelfRecorded.length > 0) {
+        logAuditEvent(db, {
+          event_type: 'requisition.party_transfer.shelf',
+          entity_type: 'requisition',
+          entity_id: requisitionId,
+          actor_email: actorEmail,
+          after: { lines: shelfRecorded, source: 'po_cascade' },
+          note: `${partyNote} — the purchase-order cascade took what the central store held on `
+            + `${shelfRecorded.length} line(s) typed at the store's shown figure; each line now records what left `
+            + `the shelf (the typed figure is kept as asked): `
+            + shelfRecorded.map(r => `${r.material_name || r.material_id} ${r.asked_line_qty} → ${r.recorded_line_qty}`
+              + `${r.line_unit ? ` ${r.line_unit}` : ''}`).join(', '),
         });
       }
     }

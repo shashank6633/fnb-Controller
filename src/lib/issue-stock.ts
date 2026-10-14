@@ -195,13 +195,17 @@ import { postCentralTxn, deptParty } from '@/lib/movement-record';
 // THE ONE RULE for "does this debit fit, and what do we subtract" — shared with
 // every other central floor. See its header for the grid and why 1e-6, and for
 // the shown-figure rule the desks' purchase-unit figure obeys (round 6).
-import { planCentralDebit, holdsAny, qtyDown, qtyGrid, fmtGridQty } from '@/lib/central-debit-clamp';
+import {
+  planCentralDebit, holdsAny, qtyDown, qtyGrid, fmtGridQty, issuedCoversAsk, type ShownAs,
+} from '@/lib/central-debit-clamp';
 
 export interface IssueDeltaInput {
   reqItemId: string;
   beforeLineQty: number;
   afterLineQty: number;
-  /** issue | store_process | undo | store_reject | admin_adjust */
+  /** issue | store_process | undo | store_reject | admin_adjust | party_shelf
+   *  (party_shelf: the party rail correcting a line to what its transfer took
+   *  off the shelf — recordPartyShelfTake). */
   reason: string;
   actor?: string;
   /** Per-gesture token. Present => a replay collides on uq_req_issue_token_item. */
@@ -316,6 +320,58 @@ export function lineFactor(
   if (lu === pu) return { factor: pf, needsReview: false };  // line is in purchase units
   if (lu === ru) return { factor: 1, needsReview: false };   // line is already recipe units
   return { factor: 1, needsReview: true };                   // unrecognised unit — refuse
+}
+
+/**
+ * The figure a desk SHOWS for a quantity of this LINE: line units → recipe
+ * (lineFactor, snapped to the 6-dp grid every debit is snapped to) → the
+ * purchase-unit figure toPurchaseQty prints, the arithmetic of both desks'
+ * "In store" column. The same converter checkCentralIssue hands
+ * planCentralDebit, applied to a line quantity instead of a balance.
+ *
+ * null for a line whose unit cannot be resolved (lineFactor's needsReview):
+ * nobody can say what such a line "shows", so only exact comparisons apply.
+ */
+export function lineShownAs(
+  lineUnit: string | null | undefined,
+  rm: { unit?: string | null; purchase_unit?: string | null; pack_size?: number | null },
+): ShownAs | null {
+  const { factor, needsReview } = lineFactor(lineUnit, rm);
+  if (needsReview) return null;
+  const meta = { unit: rm.unit, purchase_unit: rm.purchase_unit, pack_size: rm.pack_size };
+  return (lineQty: number) => toPurchaseQty(Math.round((Number(lineQty) || 0) * factor * 1e6) / 1e6, meta);
+}
+
+/** The columns lineIssueComplete reads. `line_unit` is requisition_items.unit;
+ *  unit / purchase_unit / pack_size are the material's (raw_materials). */
+export interface LineCompletenessRow {
+  quantity_issued: number | null;
+  chef_approved_qty: number | null;
+  quantity_requested: number | null;
+  line_unit: string | null;
+  unit: string | null;
+  purchase_unit: string | null;
+  pack_size: number | null;
+}
+
+/**
+ * IS THIS REQUISITION LINE ISSUED IN FULL? (round 7) — the ONE predicate both
+ * issue desks use for "this line is done": store-issue's defer rule and its
+ * auto-advance, and store-process's final status. They used to spell it
+ * `quantity_issued >= (chef_approved_qty ?? quantity_requested)` three times.
+ *
+ * The rule is issuedCoversAsk (src/lib/central-debit-clamp.ts), decided there
+ * beside the shown-figure rule it completes: the old comparison, OR the issued
+ * and the approved figures show as the same number on the desk. That second
+ * arm is what lets a line the store emptied itself into by the shown figure
+ * (14.843 kg typed, 14,842.5 g on the shelf, 14.8425 kg recorded) close as
+ * fulfilled instead of sitting forever 0.0005 kg short. Every line the old
+ * predicate called complete is still complete.
+ */
+export function lineIssueComplete(l: LineCompletenessRow): boolean {
+  const eff = (l.chef_approved_qty != null ? Number(l.chef_approved_qty) : Number(l.quantity_requested)) || 0;
+  const got = Number(l.quantity_issued) || 0;
+  return issuedCoversAsk(got, eff, lineShownAs(l.line_unit, l));
 }
 
 /* ────────────────────────────────────────────────────────────────────────────
@@ -786,10 +842,37 @@ export function assertCentralIssue(
     reqItemId: string; beforeLineQty: number; afterLineQty: number;
     /** See `rail` on checkCentralIssue. Passed straight through. */
     rail?: 'internal' | 'party';
+    /**
+     * RECIPE units EARLIER lines of the same material already took in this same
+     * gesture, and how many lines (round 7). The DECISION ignores it — the
+     * balance read here already has those debits subtracted, which is the whole
+     * floor. It changes only the SENTENCE on a refusal: the party rail debits a
+     * requisition naming one material twice line by line, so the second line
+     * met a shelf the first had just emptied and was told "the central store
+     * holds none of it" while the unwound gesture left 14,842.5 g on the shelf.
+     * With this the refusal names the pool and the line that took it.
+     */
+    siblingRecipe?: number;
+    siblingLines?: number;
   },
 ): CentralIssueCheck {
-  const c = checkCentralIssue(db, a);
-  if (!c.ok) throw new CentralStockShort(c);
+  const c = checkCentralIssue(db, {
+    reqItemId: a.reqItemId, beforeLineQty: a.beforeLineQty, afterLineQty: a.afterLineQty, rail: a.rail,
+  });
+  if (!c.ok) {
+    const sib = Math.max(0, Number(a.siblingRecipe) || 0);
+    throw new CentralStockShort(holdsAny(sib)
+      ? scoreShortLine(db, {
+          reqItemId: a.reqItemId, beforeLineQty: a.beforeLineQty, afterLineQty: a.afterLineQty, rail: a.rail,
+          // The siblings' debits are already OUT of the balance this read; adding
+          // them back as a negative claim and then handing them to the siblings
+          // re-states the same balance as "the pool, of which this much went to
+          // the lines above". The decision is unchanged (claimed nets to 0).
+          alreadyClaimedRecipe: -sib, siblingRecipe: sib, siblingLines: a.siblingLines,
+          afterGesture: false,
+        })
+      : c);
+  }
   return c;
 }
 
@@ -829,6 +912,81 @@ export function issueLineQtyToRecord(
 }
 
 /**
+ * THE PARTY RAIL KEEPS THE SAME CONTRACT (round 7): when its debit is not the
+ * ask, the LINE says what left the shelf.
+ *
+ * THE DEFECT, MEASURED. A party line typed at the balance's shown figure —
+ * THREE MANGO 14.843 kg over 14,842.5 g — is debited by the party transfer
+ * (applyPartyFulfillment on both desks, fulfilRequisitionFromPo on a PO
+ * receipt) as the balance itself, 14,842.5 g, through the shown-figure rule.
+ * Central, the movement row and the department credit all said 14,842.5 g; the
+ * requisition line said 14.843 kg and the issue ledger 14,843 g — so the Issue
+ * Log claimed half a gram that never left the shelf (and, from below, 14.842 kg
+ * typed over 14,842.4 g under-claimed 0.4 g). central-debit-clamp.ts states
+ * the contract: when debitIsAsk is false the caller MUST record the debit. The
+ * internal rail did; the party rail could not, because it debits AFTER the desk
+ * has written the line — at fulfilment, in one lump.
+ *
+ * So the party rail calls this, inside its transaction, right after its floor
+ * returned a recordAfterLineQty that differs from the line's figure:
+ *   · quantity_issued becomes that figure — what left the shelf;
+ *   · the LAST issue_history entry (the hand-over that completed the line) is
+ *     corrected by the difference, carrying the typed figure as `asked` — the
+ *     shape the internal rail writes ({qty, asked}) — when it can stay positive;
+ *   · the difference goes through applyIssueDelta like every other write of
+ *     quantity_issued (reason 'party_shelf'): for a party line that moves NO
+ *     stock (the party carve-out) and writes one ledger row whose
+ *     recorded_recipe_qty is the difference, so SUM(recorded_recipe_qty) — what
+ *     the Issue Log reads as handed over — equals what the transfer took, and
+ *     the log's pre-ledger remainder (quantity_issued − the ledger) stays 0.
+ *     The record clamp still applies: a line with no ledger history (written
+ *     before the ledger, or by a script) records nothing below zero.
+ *
+ * ONLY WHEN THE LINE STILL SAYS WHAT WAS WEIGHED. If quantity_issued is not
+ * `askedLineQty` (the PO cascade weighs min(issued, approved), and falls back
+ * to the approved figure on a line issued nothing) the line was not the figure
+ * the shelf rule resolved, so it is left exactly as it is and false is
+ * returned; the caller's own audit row still names both figures.
+ */
+export function recordPartyShelfTake(
+  db: any,
+  a: { reqItemId: string; askedLineQty: number; recordLineQty: number; actor: string },
+): boolean {
+  const cur = db.prepare(`
+    SELECT ri.quantity_issued, ri.issue_history, r.purpose
+      FROM requisition_items ri JOIN requisitions r ON r.id = ri.req_id
+     WHERE ri.id = ?
+  `).get(String(a.reqItemId)) as any;
+  // PARTY LINES ONLY. The applyIssueDelta call below moves no stock BECAUSE
+  // the line is a party line (its carve-out); on an internal line the same
+  // call would debit or credit central for a correction of the record.
+  if (!cur || String(cur.purpose || '') !== 'party') return false;
+  const before = Number(cur.quantity_issued) || 0;
+  const after = Number(a.recordLineQty) || 0;
+  if (before !== (Number(a.askedLineQty) || 0) || after === before || !(after > 0)) return false;
+  const diff = after - before;
+  let history: any[] | null = null;
+  try { const h = JSON.parse(cur.issue_history || '[]'); history = Array.isArray(h) ? h : null; } catch { history = null; }
+  if (history && history.length > 0) {
+    const last = history[history.length - 1] || {};
+    const q = Number(last.qty) || 0;
+    // Snapped to 1e-9 LINE units — below the recipe grid on every pack the
+    // catalogue uses — so the entry reads 4.8425, not 4.842499999999999.
+    const corrected = Math.round((q + diff) * 1e9) / 1e9;
+    if (corrected > 0) {
+      history[history.length - 1] = { ...last, qty: corrected, asked: last.asked != null ? last.asked : q };
+    }
+  }
+  db.prepare(`UPDATE requisition_items SET quantity_issued = ?, issue_history = ? WHERE id = ?`)
+    .run(after, history ? JSON.stringify(history) : (cur.issue_history ?? '[]'), String(a.reqItemId));
+  applyIssueDelta(db, {
+    reqItemId: String(a.reqItemId), beforeLineQty: before, afterLineQty: after,
+    reason: 'party_shelf', actor: a.actor,
+  });
+  return true;
+}
+
+/**
  * A HELD LINE'S ROW, SCORED AGAINST WHAT IS LEFT AFTER THE GESTURE (round 6).
  *
  * THE DEFECT, MEASURED SHAPE. One POST names the same material twice: line A
@@ -852,22 +1010,141 @@ export function issueLineQtyToRecord(
  */
 export function rescoreHeldIssue(
   db: any,
-  a: { reqItemId: string; beforeLineQty: number; afterLineQty: number },
+  a: {
+    reqItemId: string; beforeLineQty: number; afterLineQty: number;
+    /** See scoreHeldAtTurn: what earlier HELD rows of the same material are
+     *  given first, re-scored after the gesture in the same order (round 7). */
+    siblingRecipe?: number; siblingLines?: number;
+  },
 ): CentralIssueCheck {
-  const c = checkCentralIssue(db, a);
-  if (!c.debits || !c.ok) return c;
+  return scoreShortLine(db, { ...a, afterGesture: true });
+}
+
+/**
+ * A HELD LINE'S ROW, SCORED AT ITS TURN — the pre-flight's twin of
+ * rescoreHeldIssue (round 7), for the figures a route prints when nothing ran
+ * (the whole-gesture 400) and as the first draft of the 200's rows.
+ *
+ * THE DEFECT, MEASURED. One POST names the same material on two short lines —
+ * MANGO-like 1,000 g, lines 1.5 kg and 1.2 kg. Each row was scored on its own
+ * and each printed "Issue 1 kg or less on this line"; typing both printed caps
+ * back in one batch (what the store desk's Issue selected sends) issued the
+ * first and held the second "holds none of it". Two caps that add up to twice
+ * the shelf are one cap too many.
+ *
+ * SO HELD ROWS OF ONE MATERIAL SHARE THE POOL IN ROW ORDER: the first is given
+ * what it can take, the next what is left, and so on — `siblingRecipe` is the
+ * running sum of the earlier held rows' own `debitRecipe` (the whole remainder
+ * for a row its cap empties, its ask for a row that now fits), so the caps
+ * printed across sibling rows add up to exactly what is there and every one of
+ * them is accepted when typed back together. A row left nothing says so, and
+ * names the line that has first call — never "holds none" over a stocked shelf.
+ *
+ * THE HOLD DECISION IS NOT THIS FUNCTION'S. The route decides with
+ * checkCentralIssue and the claims of lines that actually RUN (a held line
+ * claims nothing — see the routes); this scores only the figures of a row that
+ * decision already held. With no sibling it is checkCentralIssue's own answer,
+ * byte for byte.
+ */
+export function scoreHeldAtTurn(
+  db: any,
+  a: {
+    reqItemId: string; beforeLineQty: number; afterLineQty: number;
+    alreadyClaimedRecipe?: number; siblingRecipe?: number; siblingLines?: number;
+  },
+): CentralIssueCheck {
+  return scoreShortLine(db, { ...a, afterGesture: false });
+}
+
+/** The body behind rescoreHeldIssue, scoreHeldAtTurn and assertCentralIssue's
+ *  sibling sentence. One function, so the three can never word the same pool
+ *  three ways. */
+function scoreShortLine(
+  db: any,
+  a: {
+    reqItemId: string; beforeLineQty: number; afterLineQty: number;
+    alreadyClaimedRecipe?: number; rail?: 'internal' | 'party';
+    siblingRecipe?: number; siblingLines?: number;
+    afterGesture: boolean;
+  },
+): CentralIssueCheck {
+  const already = Number(a.alreadyClaimedRecipe) || 0;
+  const sib = Math.max(0, Number(a.siblingRecipe) || 0);
+  const hasSib = holdsAny(sib);
+  const c = checkCentralIssue(db, {
+    reqItemId: a.reqItemId, beforeLineQty: a.beforeLineQty, afterLineQty: a.afterLineQty,
+    rail: a.rail, alreadyClaimedRecipe: already + (hasSib ? sib : 0),
+  });
+  if (!c.debits) return c;
   const pu = c.purchaseUnit ? ` ${c.purchaseUnit}` : '';
   // >= 0.001 ⇔ it is a shown figure (checkCentralIssue carries the shown
   // figure whenever there is one); below that it is a sub-display crumb,
   // printed exactly so it can be typed back.
   const fig = (n: number) => n >= 0.001 ? `${fmtQtyNum(n)}${pu}` : `${puFine(n, c.purchasePackFactor)}${pu}`;
-  const cap = fig(c.availablePurchase);
   const ask = fig(c.requestedPurchase);
-  return {
-    ...c, ok: false,
-    message: `${c.materialName}: not issued with the rest of this gesture — when its turn came the central `
-      + `store held less than ${ask}. After the gesture it holds ${cap}; issue ${ask} again.`,
+
+  // A ROW THAT FITS NOW (only after the gesture: a credit later in it put stock
+  // back after this line's turn) is offered ITS OWN ASK, not the pool (round
+  // 7). Its sentence already said "issue <ask> again", but its cap — the figure
+  // the store desk turns into the "Issue …" button — was the whole pool: 2 kg on
+  // a 1.5 kg line, an over-issue one click away, and with a sibling row the two
+  // caps added up to more than the shelf. The ask is what this row is given;
+  // the next sibling is given what is left after it.
+  const offerAsk = (x: CentralIssueCheck): CentralIssueCheck => ({
+    ...x,
+    availablePurchase: x.requestedPurchase,
+    maxIssueLineQty: Number(a.afterLineQty) || 0,
+  });
+
+  if (!hasSib) {
+    // No sibling: a row that does not fit carries the floor's own refusal
+    // sentence, exactly round 6; a row that fits only after the gesture says so.
+    if (!c.ok || !a.afterGesture) return c;
+    return {
+      ...offerAsk(c), ok: false,
+      message: `${c.materialName}: not issued with the rest of this gesture — when its turn came the central `
+        + `store held less than ${ask}. After the gesture it holds ${fig(c.availablePurchase)}; issue ${ask} again.`,
+    };
+  }
+
+  // ── SIBLINGS: the pool this line meets, and how much of it goes first ──────
+  // pool = what the store holds as this line meets it (before the siblings'
+  // share); the share is capped at the pool for the sentence.
+  const meta = db.prepare(`
+    SELECT rm.unit, rm.purchase_unit, rm.pack_size
+      FROM requisition_items ri JOIN raw_materials rm ON rm.id = ri.material_id
+     WHERE ri.id = ?
+  `).get(String(a.reqItemId)) as any || {};
+  const pool = Math.max(0, (Number(c.centralStockRecipe) || 0) - already);
+  // A pool that holds nothing is "holds none" whoever else asked — the floor's
+  // own sentence (computed against an empty remainder) is then the truth.
+  if (!holdsAny(pool)) return { ...c, ok: false };
+  const ru = String(meta.unit || '').trim() ? ` ${String(meta.unit).trim()}` : '';
+  const figRecipe = (r: number) => {
+    const s = toPurchaseQty(r, meta);
+    return s > 0 ? `${fmtQtyNum(s)}${pu}` : holdsAny(r) ? `${fmtGridQty(r)}${ru}` : `0${pu}`;
   };
+  const n = Math.max(1, Math.round(Number(a.siblingLines) || 1));
+  const above = n === 1 ? 'the line above for the same item' : `the ${n} lines above for the same item`;
+  const share = Math.min(sib, pool);
+  const holdsSome = holdsAny(c.availableRecipe);
+
+  let message: string;
+  if (c.ok) {
+    // Fits in what is left after the siblings' share (only after the gesture:
+    // a credit later in it put stock back after this line's turn).
+    message = `${c.materialName}: not issued with the rest of this gesture — when its turn came the central `
+      + `store held less than ${ask}. After the gesture it holds ${figRecipe(pool)}, and ${figRecipe(share)} of it `
+      + `goes to ${above}; issue ${ask} again.`;
+    return { ...offerAsk(c), ok: false, message };
+  } else if (holdsSome) {
+    message = `${c.materialName}: the central store holds only ${figRecipe(pool)}, and ${figRecipe(share)} of it `
+      + `goes to ${above} — so ${ask} cannot be issued on this line. Issue ${fig(c.availablePurchase)} or less on this line.`;
+  } else {
+    message = `${c.materialName}: the central store holds only ${figRecipe(pool)}, and all of it goes to ${above} `
+      + `— so ${ask} cannot be issued on this line as well. Receive more stock, or record a closing count, before issuing it.`;
+  }
+  return { ...c, ok: false, message };
 }
 
 /* ────────────────────────────────────────────────────────────────────────────

@@ -59,10 +59,12 @@
  */
 import { logAuditEvent } from '@/lib/db';
 
-/** Round DOWN to the house 6dp. Same definition and same reason as `floor6` in
- *  src/lib/issue-stock.ts: a figure that bounds a balance must never round
- *  itself up past the balance it is bounding. Used only on the REPORTED
- *  shortfall — the clamp itself needs no rounding (see `allowedDebit`). */
+/** Round DOWN to the house 6dp: a figure that bounds a balance must never round
+ *  itself up past the balance it is bounding. Used ONLY on the two figures
+ *  recordCentralDebitClamp REPORTS (wanted and debited) — this file's own
+ *  helper, the only one left (issue-stock.ts no longer has a copy). The clamp
+ *  itself needs no rounding: clampCentralDelta writes planCentralDebit's
+ *  `debit`, which is the balance itself when it bites. */
 const floor6 = (n: number) => Math.floor((Number(n) || 0) * 1e6) / 1e6;
 
 /** Below this a delta is float dust, not a movement. The same 1e-9 the sales
@@ -317,6 +319,62 @@ export function planCentralDebit(stock: number, ask: number, shownAs?: ShownAs |
 }
 
 /**
+ * IS A LINE ISSUED IN FULL? — the shown-figure rule's other half (round 7).
+ *
+ * THE DEFECT, MEASURED. A line approved at exactly the balance's shown figure
+ * (THREE MANGO RED CHILLI POWDER 14,842.5 g, approved and typed 14.843 kg) is
+ * taken in full by the rule above, lands on exactly 0 and records 14.8425 kg —
+ * what left the shelf. Every desk then compared `issued >= approved`, found
+ * 0.0005 kg missing, and kept the line OUTSTANDING: the requisition stayed
+ * 'store_processed', the desk printed "0.001 kg" still owed, and the one-click
+ * retry was refused "holds none of it" — correctly, the shelf is empty. A line
+ * the store had emptied itself into could never close. Production marked it
+ * fulfilled (and went to −0.5 g). WHOLE DHANIYA (kg/kg, 3.2175 kg, approved
+ * 3.218) and GREEN APPLE (8,368.5 g, 8.369 kg) the same; at 14,842.6 g the line
+ * stayed open with "0 kg" outstanding.
+ *
+ * THE RULE, decided HERE because it is the same rule:
+ *
+ *     complete  ⇔  issued ≥ wanted
+ *               ∨  ( shownAs(issued) === shownAs(wanted)  ∧  shownAs(wanted) > 0 )
+ *
+ * The first arm is the predicate every desk used, byte for byte, so nothing
+ * that was complete stops being complete. The second is the shown-figure rule
+ * read in the other direction: "the ask's shown figure IS the balance's" makes
+ * a take of everything an issue of the typed figure, so "the issued shown
+ * figure IS the approved one" makes it an issue of the approved line. The
+ * storekeeper reads "14.843 of 14.843" — the line is done.
+ *
+ * WHY NOT "AFTER TAKING EVERYTHING ON THE SHELF" AS A SEPARATE TEST. Every gap
+ * the rule above can open is at most half a display step (the shown figure is
+ * the 3-dp half-up rounding of the balance), and that is exactly the gap this
+ * test closes; it needs no memory of HOW the line got there, so it gives the
+ * same answer on every later re-read — the auto-advance re-scores every line of
+ * the requisition on every gesture, long after the shelf has been restocked. A
+ * test keyed on "the store is empty now" would re-open the line the day a
+ * delivery arrived.
+ *
+ * WHAT IT CANNOT DO: close a line the desk shows as short. A line at 14.842 of
+ * 14.843 (the store held 14,842.4 g and all of it went) shows two different
+ * figures and stays outstanding — the store really is 0.6 g short, at a
+ * precision the desk prints. `> 0` keeps a line approved at a sub-display
+ * figure and issued nothing from "matching" at 0.
+ *
+ * `shownAs` is the caller's display converter, as for planCentralDebit (for a
+ * requisition line: the line quantity ↦ its purchase-unit "In store" figure).
+ * Without one the first arm stands alone, exactly as before. Pure; reads
+ * nothing.
+ */
+export function issuedCoversAsk(issued: number, wanted: number, shownAs?: ShownAs | null): boolean {
+  const i = Number(issued) || 0;
+  const w = Number(wanted) || 0;
+  if (i >= w) return true;
+  if (typeof shownAs !== 'function') return false;
+  const sw = Number(shownAs(w)) || 0;
+  return sw > 0 && (Number(shownAs(i)) || 0) === sw;
+}
+
+/**
  * DOES THE CENTRAL STORE HOLD ANY OF IT? — the ONE test every floor uses to
  * choose between "holds only X" and "holds none of it".
  *
@@ -350,9 +408,19 @@ export function printableCap(available: number, dp: number): { value: number; dp
 
 /** A quantity at the house grid's 6 dp, trailing zeros dropped, never in
  *  exponent notation (String(1e-6) is "0.000001"; anything that holdsAny is at
- *  least that). For the sub-display figures printableCap can return. */
+ *  least that). For the sub-display figures printableCap can return.
+ *
+ *  SNAPPED THROUGH qtyGrid, NOT toFixed (round 7). toFixed rounds the double's
+ *  exact binary value, Math.round rounds the product — and at a half-grid tie
+ *  they disagree: 5e-7 is stored as 4.99999…e-7, so (5e-7).toFixed(6) is
+ *  "0.000000" while qtyGrid(5e-7) is 1 and holdsAny(5e-7) is true. Printed
+ *  through toFixed, a floor read "holds only 0 g" over a balance it had just
+ *  said was there (measured on /api/butchering). Printing the grid point the
+ *  decision was taken on cannot disagree with the decision. On any figure
+ *  already on the grid (every qtyDown / printableCap result) the string is
+ *  identical to the old one. */
 export function fmtGridQty(n: number): string {
-  return String(Number((Number(n) || 0).toFixed(6)));
+  return String(qtyGrid(n) / GRID_SCALE);
 }
 
 /**

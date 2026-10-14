@@ -4,7 +4,7 @@ import { applyPartyFulfillment } from '@/lib/party-fulfillment';
 import {
   applyIssueDelta, checkCentralIssue, isCentralStockShort,
   isIssueGestureRecorded, isIssueTokenReplayError,
-  issueLineQtyToRecord, rescoreHeldIssue,
+  issueLineQtyToRecord, rescoreHeldIssue, scoreHeldAtTurn, lineIssueComplete,
 } from '@/lib/issue-stock';
 import { isDeptReversalBlocked } from '@/lib/dept-ledger';
 
@@ -92,8 +92,11 @@ function isIssueTokenReplay(e: any): boolean {
  *   unreject → clears store_rejected + store_reject_reason (line becomes issuable again).
  *
  * Parent requisition status auto-advances to 'fulfilled' when every
- * non-rejected item has quantity_issued >= effective_qty (chef_approved_qty
- * if set, else quantity_requested). A line rejected by the chef (is_rejected)
+ * non-rejected item is issued in full — lineIssueComplete (src/lib/issue-stock.ts):
+ * quantity_issued >= effective_qty (chef_approved_qty if set, else
+ * quantity_requested), or the desk shows the two as the same figure (round 7:
+ * a line the shown-figure rule took in full, 14.8425 kg recorded of 14.843
+ * approved, is done). A line rejected by the chef (is_rejected)
  * OR by the store (store_rejected) counts as "done" and is not required to be
  * issued. Otherwise stays 'mgmt_approved' / 'chef_approved' / 'store_processed'
  * so it remains in the store queue.
@@ -242,10 +245,10 @@ function isIssueTokenReplay(e: any): boolean {
  * issue destroyed the defer the moment it landed. An issue now clears the
  * defer ONLY when the line is fully satisfied:
  *
- *     newQty >= (chef_approved_qty ?? quantity_requested)
+ *     lineIssueComplete({ ...line, quantity_issued: newQty })
  *
- * — character-for-character the predicate the auto-advance below uses, on
- * purpose. If the two ever disagreed, a line could satisfy the auto-advance's
+ * — the SAME FUNCTION the auto-advance below calls, on purpose (it was the
+ * same expression typed twice until round 7). If the two ever disagreed, a line could satisfy the auto-advance's
  * qty test while still carrying a deferred_until, and its `!deferred_until`
  * clause would keep the requisition out of 'fulfilled' forever. A line that is
  * not deferred is unaffected: the partial UPDATE simply leaves an already-NULL
@@ -302,6 +305,17 @@ function isIssueTokenReplay(e: any): boolean {
  *     later line of the same material spent part of it and typing the printed
  *     cap back was refused. The rows are now re-scored inside the transaction
  *     after every write (rescoreHeldIssue), so the 200 prints what is left.
+ *
+ * ROUND 7, THREE MORE:
+ *   - THE STUCK LINE. The shown figure took the whole shelf and recorded
+ *     14.8425 kg of 14.843 approved; `issued >= approved` then held the line
+ *     0.0005 kg outstanding forever. lineIssueComplete closes it.
+ *   - SIBLING CAPS. Two held rows of one material each printed the whole pool;
+ *     they now share it in row order (scoreHeldAtTurn / rescoreHeldIssue's
+ *     siblingRecipe), so the caps add up to the shelf.
+ *   - THE PARTY RAIL'S RECORD. A party line's transfer can take the balance
+ *     instead of the typed figure; the line, the ledger and the audit row now
+ *     say what it took (applyPartyFulfillment's `recorded`).
  *
  * AND NEITHER LAYER MAY ANSWER FOR A REPLAY. Both of them sit in front of the
  * ledger insert that used to be the only thing aware of client_token, so a
@@ -436,12 +450,18 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     // THIS requisition and to name the material in the audit trail. Every
     // mutable field is re-read from here INSIDE the transaction, immediately
     // before the UPDATE that changes it.
+    // line_unit + the material's pack meta ride along for lineIssueComplete
+    // (round 7) — the defer rule's "fully satisfied" reads what the desk SHOWS.
+    // LEFT JOIN, so a line whose material row is gone is still read exactly as
+    // before (its meta is NULL and only the exact comparison applies).
     const selLine = db.prepare(`
-      SELECT id, quantity_issued, issue_history, is_rejected, store_rejected,
-             store_reject_reason, deferred_until, defer_reason,
-             quantity_requested, chef_approved_qty
-      FROM requisition_items
-      WHERE id = ? AND req_id = ?
+      SELECT ri.id, ri.quantity_issued, ri.issue_history, ri.is_rejected, ri.store_rejected,
+             ri.store_reject_reason, ri.deferred_until, ri.defer_reason,
+             ri.quantity_requested, ri.chef_approved_qty,
+             ri.unit AS line_unit, rm.unit, rm.purchase_unit, rm.pack_size
+      FROM requisition_items ri
+      LEFT JOIN raw_materials rm ON rm.id = ri.material_id
+      WHERE ri.id = ? AND ri.req_id = ?
     `);
 
     // Fully-satisfied issue: clears the defer. See THE DEFER RULE in the header.
@@ -604,6 +624,10 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // one line — which this route documents and has measured — and two lines
       // of one material are both scored the way the floor will see them.
       const claimed = new Map<string, number>();
+      // What earlier HELD rows of the same material are given first, for the
+      // FIGURES only (round 7 — scoreHeldAtTurn). Never read by the decision:
+      // a held line runs nothing, so it must not hold a later line that fits.
+      const heldShare = new Map<string, { recipe: number; lines: number }>();
       for (let li = 0; li < lines.length; li++) {
         const ln = lines[li];
         if (!itemMap.get(ln.id)) continue;
@@ -693,14 +717,31 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           continue;
         }
         heldEntries.add(li);
+        // ── HELD ROWS OF ONE MATERIAL SHARE THE POOL (round 7) ──────────────
+        // Each held row used to print the whole remaining pool as its cap, so
+        // two short MANGO lines over 1 kg both said "Issue 1 kg or less" and
+        // typing both back held one of them. The first held row is given what
+        // it can take, the next what is left — the caps add up to what is
+        // there. With no earlier held sibling this is `c`, byte for byte.
+        const share = heldShare.get(matId);
+        const h = share
+          ? scoreHeldAtTurn(db, {
+              reqItemId: String(cur.id), beforeLineQty: beforeQty, afterLineQty: afterQty,
+              alreadyClaimedRecipe: already, siblingRecipe: share.recipe, siblingLines: share.lines,
+            })
+          : c;
+        heldShare.set(matId, {
+          recipe: (share?.recipe || 0) + Math.max(0, Number(h.debitRecipe) || 0),
+          lines: (share?.lines || 0) + 1,
+        });
         const row = {
           code: 'central_stock_short' as const,
           line_id: String(ln.id ?? ''),
-          material: c.materialName, material_id: c.materialId, req_item_id: c.reqItemId,
-          requested: c.requestedPurchase, available: c.availablePurchase,
-          purchase_unit: c.purchaseUnit,
-          max_issue_qty: c.maxIssueLineQty, line_unit: c.lineUnit,
-          message: c.message,
+          material: h.materialName, material_id: h.materialId, req_item_id: h.reqItemId,
+          requested: h.requestedPurchase, available: h.availablePurchase,
+          purchase_unit: h.purchaseUnit,
+          max_issue_qty: h.maxIssueLineQty, line_unit: h.lineUnit,
+          message: h.message,
         };
         centralShort.push(row);
         heldRowOf.set(li, row);
@@ -814,12 +855,12 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
             qty: addedQty, at: nowIso, by: me.email, note: ln.note || '',
             ...(shelf.changed ? { asked: addQty } : {}),
           });
-          // THE DEFER RULE — half-transfer. Same expression as the auto-advance
-          // below; see the header for why they must stay identical.
-          const eff = (cur.chef_approved_qty != null
-            ? Number(cur.chef_approved_qty)
-            : Number(cur.quantity_requested)) || 0;
-          const fullySatisfied = newQty >= eff;
+          // THE DEFER RULE — half-transfer. The SAME FUNCTION as the
+          // auto-advance below (lineIssueComplete); see the header for why they
+          // must agree. Round 7: a line taken in full by the shown figure
+          // (14.8425 kg recorded of 14.843 approved — the store emptied itself
+          // into it) is complete, so its defer is cleared with it.
+          const fullySatisfied = lineIssueComplete({ ...cur, quantity_issued: newQty });
           const stmt = fullySatisfied ? updIssue : updIssuePartial;
           stmt.run(newQty, nowIso, me.email, JSON.stringify(history), cur.id);
           applyIssueDelta(db, {
@@ -941,16 +982,23 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // Treat is_rejected items as "complete" (chef said no).
       // Treat store_rejected items as "complete" too (store said it can't fulfil).
       // Treat items with deferred_until in the future as still-open (don't fulfill).
+      // lineIssueComplete (round 7) — the defer rule's own predicate, so the
+      // two cannot disagree. It is the old `issued >= effective` OR the desk
+      // shows the two as one figure: a line the shown figure took in full
+      // (MANGO 14.8425 kg recorded of 14.843 approved) closes instead of
+      // sitting 0.0005 kg outstanding forever behind a "holds none" retry.
       const fresh = db.prepare(`
-        SELECT id, is_rejected, store_rejected, quantity_requested, chef_approved_qty, quantity_issued, deferred_until
-        FROM requisition_items WHERE req_id = ?
+        SELECT ri.id, ri.is_rejected, ri.store_rejected, ri.quantity_requested, ri.chef_approved_qty,
+               ri.quantity_issued, ri.deferred_until,
+               ri.unit AS line_unit, rm.unit, rm.purchase_unit, rm.pack_size
+        FROM requisition_items ri
+        LEFT JOIN raw_materials rm ON rm.id = ri.material_id
+        WHERE ri.req_id = ?
       `).all(id) as any[];
       const allDone = fresh.every(it => {
         if (it.is_rejected) return true;
         if (it.store_rejected) return true;
-        const eff = (it.chef_approved_qty != null ? Number(it.chef_approved_qty) : Number(it.quantity_requested)) || 0;
-        const got = Number(it.quantity_issued) || 0;
-        return got >= eff && !it.deferred_until;     // deferred = still pending even if qty matches
+        return lineIssueComplete(it) && !it.deferred_until;     // deferred = still pending even if qty matches
       });
 
       if (allDone) {
@@ -969,7 +1017,29 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         // credit). The helper is idempotent via the party_consumption ledger row,
         // so re-fulfilment or the store-process path can never double-transfer.
         if (r.purpose === 'party') {
-          applyPartyFulfillment(db, id, me.email);
+          const pf = applyPartyFulfillment(db, id, me.email);
+          // THE AUDIT ROW SAYS WHAT LEFT THE SHELF TOO (round 7). The transfer
+          // corrected these lines to what it took (14.843 kg typed over
+          // 14,842.5 g → 14.8425 kg); the per-line after-images below were
+          // written before it ran and still carry the typed figure. Bring the
+          // LAST issue entry for each such line into line with the row, the
+          // shape the internal rail writes: quantity_issued what moved, `added`
+          // what this gesture moved, `asked` what was typed.
+          for (const rec of pf.recorded) {
+            for (let k = auditPerLine.length - 1; k >= 0; k--) {
+              const a = auditPerLine[k];
+              if (a.id !== rec.req_item_id || a.action !== 'issue') continue;
+              const typedAdded = Number(a.after?.added) || 0;
+              a.after = {
+                ...a.after,
+                quantity_issued: rec.recorded_line_qty,
+                // 1e-9 line units, as recordPartyShelfTake snaps the history entry.
+                added: Math.round((typedAdded + (rec.recorded_line_qty - rec.asked_line_qty)) * 1e9) / 1e9,
+                asked: a.after?.asked != null ? a.after.asked : typedAdded,
+              };
+              break;
+            }
+          }
         }
       } else {
         // Mark in-progress so the queue knows it's been touched.
@@ -1028,16 +1098,29 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // is the figure the storekeeper's next POST will meet. Only the figures
       // move; the hold stands — the floor runs in order and would have refused
       // the line at its turn.
+      //
+      // AND SIBLING HELD ROWS SHARE WHAT IS LEFT, in row order (round 7): the
+      // first held row of a material is given what it can take, the next what
+      // remains, so the caps on this 200 add up to the shelf and every one of
+      // them is accepted when typed back together (rescoreHeldIssue's
+      // siblingRecipe; the running sum is each row's own debitRecipe).
+      const heldShareAfter = new Map<string, { recipe: number; lines: number }>();
       for (const [li, row] of heldRowOf) {
         const ln = lines[li];
         const cur = selLine.get(ln.id, id) as any;
         if (!cur) continue;
         const beforeQty = Number(cur.quantity_issued) || 0;
         const addQty = Number(ln.quantity) || 0;
+        const share = heldShareAfter.get(String(row.material_id));
         const c = rescoreHeldIssue(db, {
           reqItemId: String(cur.id), beforeLineQty: beforeQty, afterLineQty: beforeQty + addQty,
+          siblingRecipe: share?.recipe || 0, siblingLines: share?.lines || 0,
         });
         if (!c.debits) continue;
+        heldShareAfter.set(String(row.material_id), {
+          recipe: (share?.recipe || 0) + Math.max(0, Number(c.debitRecipe) || 0),
+          lines: (share?.lines || 0) + 1,
+        });
         row.requested = c.requestedPurchase;
         row.available = c.availablePurchase;
         row.max_issue_qty = c.maxIssueLineQty;

@@ -1,6 +1,6 @@
 import type Database from 'better-sqlite3';
 import { generateId, logAuditEvent } from '@/lib/db';
-import { assertCentralIssue } from '@/lib/issue-stock';
+import { assertCentralIssue, recordPartyShelfTake } from '@/lib/issue-stock';
 // THE MOVEMENT RECORD (owner's eight fields, 2026-09-10). This module writes
 // BOTH rails with its own raw INSERTs — it maintains the department_materials
 // cache itself, so it deliberately does NOT route through postDeptLedger (that
@@ -11,6 +11,21 @@ import {
   movementCols, postCentralTxn, deptParty, CENTRAL_PARTY,
   PARTY_TRANSFER_TYPE, PARTY_TRANSFER_TYPES_SQL,
 } from '@/lib/movement-record';
+
+/** One party line the transfer corrected to what left the shelf (round 7) —
+ *  see "THE LINE RECORDS WHAT LEFT THE SHELF" below. */
+export interface PartyShelfRecord {
+  req_item_id: string;
+  material_id: string;
+  material_name: string;
+  line_unit: string;
+  /** quantity_issued before the transfer — the figure typed, in the LINE's unit. */
+  asked_line_qty: number;
+  /** quantity_issued now — what left the shelf, in the LINE's unit. */
+  recorded_line_qty: number;
+  /** RECIPE units the transfer debited (central) and credited (department). */
+  debit_recipe: number;
+}
 
 /**
  * Centralised PARTY fulfilment TRANSFER: store → department.
@@ -95,20 +110,36 @@ import {
  *
  * All writes run inside a single db.transaction.
  *
+ * ── THE LINE RECORDS WHAT LEFT THE SHELF (round 7) ─────────────────────────
+ * The floor below can take the BALANCE rather than the line's figure — the
+ * shown-figure rule: 14.843 kg typed over 14,842.5 g takes 14,842.5 g. Central,
+ * the movement row and the department credit always carried that debit; the
+ * requisition line and the issue ledger kept the typed 14.843 kg, so the Issue
+ * Log claimed half a gram that never moved. The contract in
+ * src/lib/central-debit-clamp.ts is that a caller whose debit is not the ask
+ * records the debit, so each such line is corrected here, in this transaction
+ * (recordPartyShelfTake), and the gesture is named on one audit row,
+ * 'requisition.party_transfer.shelf'. An ordinary transfer writes neither.
+ *
  * @param db         open better-sqlite3 database
  * @param reqId      requisition id
  * @param actorEmail the store person performing the fulfilment (stamped on dept ledger)
- * @returns { transferred: Array<{material_id, issued, department_id}>, total } — issued in RECIPE units
+ * @returns { transferred: Array<{material_id, issued, department_id}>, total, recorded } — issued in RECIPE
+ *          units; `recorded` lists the lines whose quantity_issued was corrected to what left the shelf.
  */
 export function applyPartyFulfillment(
   db: Database.Database,
   reqId: string,
   actorEmail: string,
-): { transferred: Array<{ material_id: string; issued: number; department_id: string | null }>; total: number } {
+): {
+  transferred: Array<{ material_id: string; issued: number; department_id: string | null }>;
+  total: number;
+  recorded: PartyShelfRecord[];
+} {
   const req = db.prepare('SELECT * FROM requisitions WHERE id = ?').get(reqId) as any;
   if (!req) {
     console.warn(`[party-fulfillment] requisition ${reqId} not found — skip`);
-    return { transferred: [], total: 0 };
+    return { transferred: [], total: 0, recorded: [] };
   }
 
   // IDEMPOTENCY GUARD — the presence of a party transfer ledger row for this
@@ -179,6 +210,7 @@ export function applyPartyFulfillment(
   `);
 
   const transferred: Array<{ material_id: string; issued: number; department_id: string | null }> = [];
+  const recorded: PartyShelfRecord[] = [];
 
   const txn = db.transaction((): boolean => {
     // THE GUARD, UNDER THE WRITE LOCK. Everything this function decides — has
@@ -199,9 +231,15 @@ export function applyPartyFulfillment(
       req_item_id: string; material_id: string; material_name: string;
       reason: string; requested_line_qty: number; line_unit: string;
     }> = [];
+    // What earlier lines of THIS transfer took, per material, and how many
+    // lines — for the refusal SENTENCE only (assertCentralIssue's siblings).
+    // The floor's decision needs no claim: each line re-reads a balance the
+    // earlier debits have already reduced.
+    const takenBy = new Map<string, { recipe: number; lines: number }>();
     for (const it of items) {
       const issuedReq = Number(it.quantity_issued) || 0; // in ri.unit
       if (issuedReq <= 0) continue;
+      const prior = takenBy.get(String(it.material_id));
 
       // THE FLOOR AND THE CONVERSION, FROM ONE CALL, INSIDE THIS TRANSACTION.
       //
@@ -216,11 +254,21 @@ export function applyPartyFulfillment(
       // claim: by the time the second is checked the first has already been
       // subtracted. better-sqlite3 is synchronous and nothing awaits inside this
       // transaction, so nothing can interleave between the read and the write.
+      //
+      // A REFUSAL AFTER AN EARLIER LINE OF THE SAME MATERIAL names that line
+      // (round 7). Two party lines of one material at 14.843 kg over 14,842.5 g:
+      // the first took everything, so the second met an empty shelf and the
+      // gesture was refused "the central store holds none of it" — while the
+      // unwound gesture left all 14,842.5 g on the shelf. The decision is the
+      // same; the sentence now says the store holds 14.843 kg and all of it
+      // goes to the line above.
       const c = assertCentralIssue(db, {
         reqItemId: String(it.id),
         beforeLineQty: 0,
         afterLineQty: issuedReq,
         rail: 'party',
+        siblingRecipe: prior?.recipe || 0,
+        siblingLines: prior?.lines || 0,
       });
 
       // THE OTHER TWO CARVE-OUTS, HONOURED — AND THEY GATE BOTH SIDES.
@@ -264,6 +312,26 @@ export function applyPartyFulfillment(
       // movement row below carry the same figure, so the two rails still agree.
       const issued = c.debitRecipe;
       const deptId: string | null = it.department_id || req.department_id || null;
+      takenBy.set(String(it.material_id), {
+        recipe: (prior?.recipe || 0) + issued, lines: (prior?.lines || 0) + 1,
+      });
+
+      // THE LINE SAYS WHAT LEFT THE SHELF (round 7). recordAfterLineQty is the
+      // floor's own answer: the line's figure untouched on every ordinary
+      // transfer, the balance (in the line's unit) when the shown-figure rule
+      // took it instead. Written before the debit only because the debit does
+      // not read the line; both are inside this one transaction.
+      if (c.recordAfterLineQty !== issuedReq
+          && recordPartyShelfTake(db, {
+            reqItemId: String(it.id), askedLineQty: issuedReq,
+            recordLineQty: c.recordAfterLineQty, actor: actorEmail,
+          })) {
+        recorded.push({
+          req_item_id: String(it.id), material_id: String(it.material_id),
+          material_name: String(c.materialName || ''), line_unit: String(it.req_unit ?? ''),
+          asked_line_qty: issuedReq, recorded_line_qty: c.recordAfterLineQty, debit_recipe: issued,
+        });
+      }
 
       // STORE: decrement current_stock + ledger row.
       decStock.run(issued, it.material_id);
@@ -343,6 +411,22 @@ export function applyPartyFulfillment(
           + declined.map(d => `${d.material_name || d.material_id} (${d.reason})`).join(', '),
       });
     }
+    // WHAT THE SHELF RULE RESOLVED, on its own row — written ONLY when a line
+    // was corrected, so an ordinary transfer is byte-identical. Not one of the
+    // cascade witness names either (see the note above), for the same reason.
+    if (recorded.length > 0) {
+      logAuditEvent(db, {
+        event_type: 'requisition.party_transfer.shelf',
+        entity_type: 'requisition',
+        entity_id: reqId,
+        actor_email: actorEmail,
+        after: { lines: recorded },
+        note: `Party transfer took what the central store held on ${recorded.length} line(s) typed at the `
+          + `store's shown figure; each line now records what left the shelf (the typed figure is kept as asked): `
+          + recorded.map(r => `${r.material_name || r.material_id} ${r.asked_line_qty} → ${r.recorded_line_qty}`
+            + `${r.line_unit ? ` ${r.line_unit}` : ''}`).join(', '),
+      });
+    }
     return true;
   });
   // IMMEDIATE, not the default deferred — see the header. Nested inside a
@@ -351,5 +435,5 @@ export function applyPartyFulfillment(
   // a standalone call.
   txn.immediate();
 
-  return { transferred, total: transferred.length };
+  return { transferred, total: transferred.length, recorded };
 }
