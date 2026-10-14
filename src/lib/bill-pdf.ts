@@ -112,8 +112,8 @@ export function buildBillPdf(
    *   · 1 item + service charge + discount + 2 tenders → 2 pages of 326pt
    *   · the same 1 item with the Bill Design branding fields filled → 2 pages
    *   · a 40-item open bill → 1 page of 1,400pt holding 927pt of content
-   *   · the live database's settled / held / open bills → 1 page, 55-96pt of
-   *     blank paper under the last line
+   *   · the live database's settled / held / open bills → 1 page, 57-110pt of
+   *     blank paper under the last line (now ~14pt: the margin plus 2pt)
    *
    * So the height is MEASURED instead of budgeted: draw() runs once on a page
    * tall enough that nothing overflows, doc.y afterwards is the true bottom of

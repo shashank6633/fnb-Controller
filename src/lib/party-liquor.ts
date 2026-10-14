@@ -327,6 +327,73 @@ export function pnlCandidateNames(p: { contact_person?: string; guest_name?: str
     .map(x => String(x || '').trim()).filter(Boolean))];
 }
 
+export interface PartyEventKey {
+  party_unique_id?: string;
+  /** The F&P id. Names a party that has no party_unique_id yet — the ONLY key
+   *  that tells two such parties apart when they share a display name. */
+  fp_id?: string;
+  event_name?: string;
+  event_date?: string;
+}
+
+/**
+ * Which cached party an event key names. ONE predicate, used by the P&L's
+ * single-party GET, the consumption modal, the POST double-count gate and the
+ * orphan claim below, so they can never pick different parties for the same key.
+ * -1 = not cached.
+ *
+ *   1. party_unique_id, when the key carries one (unchanged).
+ *   2. else fp_id, when the key carries one. The /party-pnl page sends it for
+ *      every party without an id. WHY: the display name (event_name) is NOT
+ *      unique. Two parties without an id can share it ("Twin Name" / "Twin Name"
+ *      on one evening), and a party without an id can share it with an earlier
+ *      party that HAS one (guest "Ravi Kumar" on both). Matching by name returned
+ *      the FIRST such party, so the second one's modal showed the first one's
+ *      requisition lines and orphan share, printed a liquor figure its own board
+ *      row does not carry, and its 409 gate checked the other party's
+ *      requisitions. An fp_id that is not in the cache is NOT re-guessed by name
+ *      (that guess is the defect): the key is then an uncached party (-1).
+ *   3. else (a caller that sends neither) by event_name + event_date, preferring
+ *      a party WITHOUT an id: a key without an id can only be describing one, and
+ *      a party with an id is always addressed by it. Twins that share the name
+ *      and have no id cannot be told apart this way; that is what fp_id is for.
+ */
+export function findPnlPartyIndex(parties: CachedPnlParty[], key: PartyEventKey): number {
+  if (key.party_unique_id) return parties.findIndex(x => x.party_unique_id === key.party_unique_id);
+  const fp = String(key.fp_id || '').trim();
+  if (fp) return parties.findIndex(x => String(x.fp_id || '').trim() === fp);
+  const byName = (x: CachedPnlParty) => x.event_name === key.event_name && x.event_date === key.event_date;
+  const noId = parties.findIndex(x => !x.party_unique_id && byName(x));
+  return noId >= 0 ? noId : parties.findIndex(byName);
+}
+
+/**
+ * The cached parties WITHOUT an id whose P&L counts an ID-BEARING
+ * party_consumption row recorded under (eventName, eventDate).
+ *
+ * This mirrors the no-id arm of pnlFor() in /api/party-events/pnl exactly: a party
+ * with no party_unique_id, a display name and a date counts
+ *   WHERE event_name = <its display name> AND event_date = <its date>
+ *     AND party_unique_id IS NOT NULL
+ * — a plain SQL `=` (BINARY collation, untrimmed), hence the untrimmed string
+ * comparison here. That arm is production behaviour and is left as it is. It is
+ * why PATCH /api/party-consumption must not give an orphan a party id while such
+ * a party exists: the row would then count on the party it was assigned to AND
+ * on this one. The PATCH refuses on this list, and the P&L board shows the same
+ * list in place of the Assign buttons, so the screen never offers an assignment
+ * the server will refuse.
+ */
+export function noIdPartiesCountingName(parties: CachedPnlParty[], eventName: unknown, eventDate: unknown): number[] {
+  const n = eventName == null ? '' : String(eventName);
+  const d = eventDate == null ? '' : String(eventDate);
+  const out: number[] = [];
+  parties.forEach((x, i) => {
+    if (x.party_unique_id || !x.event_name || !x.event_date) return;
+    if (String(x.event_name) === n && String(x.event_date) === d) out.push(i);
+  });
+  return out;
+}
+
 /**
  * Resolve an event key (what the modal has) to the name list + date the
  * requisition queries need — the SAME resolution /api/party-events/pnl's GET
@@ -334,12 +401,11 @@ export function pnlCandidateNames(p: { contact_person?: string; guest_name?: str
  * requisitions under one name while the badge counted them under five, and the
  * rows would not reconcile with the cost.
  */
-export function resolvePartyEventNames(db: DB, key: { party_unique_id?: string; event_name?: string; event_date?: string }):
+export function resolvePartyEventNames(db: DB, key: PartyEventKey):
   { names: string[]; eventDate: string | undefined; party: CachedPnlParty | undefined } {
   const parties = loadPnlParties(db);
-  const p = parties.find(x =>
-    (key.party_unique_id && x.party_unique_id === key.party_unique_id) ||
-    (!key.party_unique_id && x.event_name === key.event_name && x.event_date === key.event_date));
+  const idx = findPnlPartyIndex(parties, key);
+  const p = idx >= 0 ? parties[idx] : undefined;
   const names = p
     ? pnlCandidateNames(p).concat(key.event_name ? [key.event_name] : [])
     : (key.event_name ? [key.event_name] : []);
@@ -347,5 +413,152 @@ export function resolvePartyEventNames(db: DB, key: { party_unique_id?: string; 
     names: [...new Set(names.map(n => String(n || '').trim()).filter(Boolean))],
     eventDate: p?.event_date ?? key.event_date,
     party: p,
+  };
+}
+
+/* ────────────────────────────────────────────────────────────────────────────
+ * ORPHAN LIQUOR — party_consumption rows that carry NO party_unique_id.
+ * ────────────────────────────────────────────────────────────────────────────
+ *
+ * POST /api/party-consumption stores `party_unique_id || null` and validates only
+ * event_name + event_date, so the bar can record liquor before the AKAN sheet has
+ * issued the party an id. Such a row still belongs to SOME party, but the only
+ * thing tying it to one is the NAME it was recorded under and its date.
+ *
+ * OWNER RULING (2026-10-14) — and this is the whole rule:
+ *   · count an orphan ONLY when EXACTLY ONE party that evening matches its name
+ *     (the row's event_name is one of that party's candidate names —
+ *     pnlCandidateNames — and the dates are equal). Give it to that party and
+ *     mark it "matched by name";
+ *   · when TWO OR MORE parties match, count it NOWHERE and list it for the owner
+ *     to assign (PATCH /api/party-consumption sets its party_unique_id, after
+ *     which it is an ordinary id-bearing row). The PATCH is REFUSED while a
+ *     party without an id is listed under the row's name that evening
+ *     (noIdPartiesCountingName above): that party's P&L counts every
+ *     id-bearing row under its name, so the assignment would charge the bottle
+ *     twice. It can be assigned once that party has an id;
+ *   · when NO party matches, it is counted nowhere, as before, and is listed too
+ *     so a recorded bottle can never vanish without a trace.
+ *
+ * WHY ONE FUNCTION. The parked build had two different rules for the same rows:
+ * the P&L handed each orphan to one party (own name first, else cache order)
+ * while the modal's SQL showed it to EVERY party whose names matched — so with
+ * two "Ravi Kumar" parties on 2026-10-10 one modal listed a bottle its P&L did
+ * not charge, and offered to delete it. Now the board, the single-party P&L, the
+ * modal and the badge all call claimOrphanConsumption() over the SAME claimant
+ * list (orphanSlot), so they cannot disagree about who owns a row.
+ *
+ * The claim is a pure function of the cached party list and the rows, decided
+ * across EVERY party at once — a per-party query cannot see the other parties,
+ * which is how one bottle used to land on two P&Ls.
+ */
+
+/** One party's claim on orphan rows: every name its liquor might have been
+ *  recorded under, and its event date. */
+export interface OrphanClaimant {
+  names: string[];
+  date?: string;
+}
+
+/** An orphan party_consumption row, as the claim reads it. */
+export interface OrphanRow {
+  id: string;
+  event_name: string;   // trimmed
+  event_date: string;   // trimmed
+  cost: number;         // cost_at_time (₹, snapshotted at recording)
+}
+
+export interface OrphanClaims {
+  /** claimant index → the rows it OWNS: it was the ONLY party matching them. */
+  owned: Map<number, OrphanRow[]>;
+  /** Rows two or more claimants match. Counted on NO party until assigned. */
+  ambiguous: { row: OrphanRow; candidates: number[] }[];
+  /** Rows no claimant matches. Counted nowhere (unchanged), listed for the owner. */
+  unmatched: OrphanRow[];
+}
+
+/** Claimants for the cached party list, index-aligned with it. */
+export function orphanClaimants(parties: CachedPnlParty[]): OrphanClaimant[] {
+  return parties.map(p => ({ names: pnlCandidateNames(p), date: p.event_date }));
+}
+
+/**
+ * Where an event key sits in the claim. A CACHED party (found by
+ * findPnlPartyIndex — id, else fp_id, else name) is its own index in the
+ * cached list — so its share is exactly the share the bulk board gives it. A key
+ * no cached party matches but which names a date (an ad-hoc single-party GET) is
+ * appended LAST as one more party that evening; under the exactly-one rule it can
+ * then only win a row that no cached party also matches, so it can never take a
+ * bottle the board has already charged. No date → no orphans at all (index -1).
+ */
+export function orphanSlot(parties: CachedPnlParty[], key: PartyEventKey):
+  { claimants: OrphanClaimant[]; index: number } {
+  const claimants = orphanClaimants(parties);
+  const idx = findPnlPartyIndex(parties, key);
+  if (idx >= 0) return { claimants, index: idx };
+  const date = String(key.event_date || '').trim();
+  if (!date) return { claimants, index: -1 };
+  const name = String(key.event_name || '').trim();
+  claimants.push({ names: name ? [name] : [], date });
+  return { claimants, index: claimants.length - 1 };
+}
+
+/** THE RULE. See the block comment above. */
+export function claimOrphanConsumption(db: DB, claimants: OrphanClaimant[]): OrphanClaims {
+  const out: OrphanClaims = { owned: new Map(), ambiguous: [], unmatched: [] };
+  const rows = db.prepare(`
+    SELECT id,
+           TRIM(COALESCE(event_name, '')) AS event_name,
+           TRIM(COALESCE(event_date, '')) AS event_date,
+           COALESCE(cost_at_time, 0)      AS cost
+    FROM party_consumption
+    WHERE party_unique_id IS NULL
+    ORDER BY recorded_at, id
+  `).all() as OrphanRow[];
+  if (!rows.length) return out;
+
+  // date -> name -> DISTINCT claimant indexes. Nested rather than a concatenated
+  // key so no separator can ever collide two different pairs; a Set so a party
+  // whose guest_name and company are the same string is still ONE party.
+  const byDate = new Map<string, Map<string, Set<number>>>();
+  claimants.forEach((c, i) => {
+    const d = String(c.date || '').trim();
+    if (!d) return;
+    let byName = byDate.get(d);
+    if (!byName) { byName = new Map(); byDate.set(d, byName); }
+    for (const raw of c.names) {
+      const n = String(raw || '').trim();
+      if (!n) continue;
+      let set = byName.get(n);
+      if (!set) { set = new Set(); byName.set(n, set); }
+      set.add(i);
+    }
+  });
+
+  for (const row of rows) {
+    const cands = (row.event_date && row.event_name)
+      ? [...(byDate.get(row.event_date)?.get(row.event_name) ?? [])]
+      : [];
+    if (cands.length === 1) {
+      const list = out.owned.get(cands[0]);
+      if (list) list.push(row); else out.owned.set(cands[0], [row]);
+    } else if (cands.length >= 2) {
+      out.ambiguous.push({ row, candidates: cands.sort((a, b) => a - b) });
+    } else {
+      out.unmatched.push(row);
+    }
+  }
+  return out;
+}
+
+/** One party's view of the claim: the rows it is charged for ("matched by
+ *  name"), and the rows that name it AND another party that evening — charged to
+ *  nobody, shown so nobody re-types them and the owner can assign them. */
+export function orphanShareOf(claims: OrphanClaims, index: number):
+  { matched: OrphanRow[]; awaiting: { row: OrphanRow; candidates: number[] }[] } {
+  if (index < 0) return { matched: [], awaiting: [] };
+  return {
+    matched: claims.owned.get(index) || [],
+    awaiting: claims.ambiguous.filter(a => a.candidates.includes(index)),
   };
 }

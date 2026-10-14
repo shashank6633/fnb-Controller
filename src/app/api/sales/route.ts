@@ -117,6 +117,54 @@ export async function DELETE(request: Request) {
         deptByMaterial.set(r.material_id, (deptByMaterial.get(r.material_id) || 0) + Number(r.qty || 0));
       }
 
+      // FOURTH LEG — THE SKIPS, WHICH MOVED NOTHING AT ALL.
+      // applyDeduct (src/lib/db.ts) has outcomes that move no stock anywhere: a
+      // store-mapped (liquor) material, an unmapped / blank station, a
+      // department with recipe deduction switched off, a failed department
+      // post. Each takes a recordSkip() branch, while the inventory_transactions
+      // audit row is still written unconditionally (Variance / Daily Roll-up /
+      // Sales-vs-Purchase read it). That audit row is `totalDeducted` below, so
+      // a skipped portion has to be excluded exactly like the floor and
+      // department portions — and it was not: the full audit quantity went back
+      // to central for stock central never lost. Every sale this route POSTs
+      // has a recipe skip (it passes station: null), so posting one and
+      // deleting it invented every ingredient on central.
+      // /api/admin/reset (its `consumption_skips` block) has always subtracted
+      // this leg; this is the same read, matched the same way.
+      //
+      // COUPLING, STATED OUT LOUD — the same one admin/reset declares:
+      // consumption_skips has no sale_id column, so the only link back to a sale
+      // is the notes string db.ts writes as `recipe:<id> sale:<id>`. If that
+      // format changes, this subtraction silently stops matching. source =
+      // 'recipe_consumption' keeps wastage and staff-meal skips — which have
+      // their own reversal paths — out of the sum.
+      //
+      // quantity is stored POSITIVE ("what WOULD have been deducted") and is
+      // rounded to 6 dp by recordConsumptionSkip, while the audit row is not.
+      // `rows` is kept so the arithmetic below can tell that rounding apart from
+      // stock (see THE SKIP LOG'S ROUNDING GRID).
+      //
+      // NOT fail-soft: a database without the table has no skips to exclude, so
+      // that one case is checked explicitly; any other failure throws and rolls
+      // the whole deletion back rather than silently crediting central again.
+      const skipByMaterial = new Map<string, { qty: number; rows: number }>();
+      const hasSkipLog = !!db.prepare(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'consumption_skips'"
+      ).get();
+      if (hasSkipLog) {
+        const skipRows = db.prepare(`
+          SELECT material_id, COALESCE(SUM(quantity), 0) AS qty, COUNT(*) AS n
+          FROM consumption_skips
+          WHERE source = 'recipe_consumption'
+            AND material_id IS NOT NULL
+            AND notes LIKE '%sale:' || ?
+          GROUP BY material_id
+        `).all(id) as any[];
+        for (const r of skipRows) {
+          skipByMaterial.set(r.material_id, { qty: Number(r.qty || 0), rows: Number(r.n || 0) });
+        }
+      }
+
       const txRows = db.prepare(`
         SELECT material_id, COALESCE(SUM(quantity), 0) AS qty
         FROM inventory_transactions WHERE reference_id = ? GROUP BY material_id
@@ -128,12 +176,27 @@ export async function DELETE(request: Request) {
         const totalDeducted = -r.qty;                                   // deduction rows are negative
         const floorDeducted = -(floorByMaterial.get(r.material_id) || 0); // ledger deductions are negative too
         const deptDeducted  = -(deptByMaterial.get(r.material_id) || 0); // department rows are negative too
-        // What central actually lost = the audit total minus the two rails that
-        // were never central's. The inventory_transactions row is written on
-        // EVERY path (db.ts applyDeduct keeps it unconditional so Variance and
+        const skip = skipByMaterial.get(r.material_id);
+        const skipDeducted  = skip ? skip.qty : 0;                       // already positive (see above)
+        // What central actually lost = the audit total minus every leg that was
+        // never central's — the two other rails AND the skips, which moved
+        // nothing at all. The inventory_transactions row is written on EVERY
+        // path (db.ts applyDeduct keeps it unconditional so Variance and
         // Sales-vs-Purchase stay bit-identical), which is exactly why it is the
         // total and not the central figure.
-        const centralDeducted = totalDeducted - floorDeducted - deptDeducted;
+        let centralDeducted = totalDeducted - floorDeducted - deptDeducted - skipDeducted;
+        // THE SKIP LOG'S ROUNDING GRID. Each skip row is stored at 6 dp and the
+        // audit row is not, so a fully skipped material can leave up to half a
+        // micro-unit per skip row behind — of either sign. A NEGATIVE residue
+        // would reach the restore below as a DEBIT (a sale deletion taking stock
+        // off central, the shape the owner ruled out); a positive one is a
+        // sub-micro-unit credit of stock central never lost. Neither is stock:
+        // within that grid, the skips account for the whole audit quantity.
+        // Applies only where a skip leg exists, so every other sale's arithmetic
+        // is unchanged.
+        if (skip && skip.rows > 0 && Math.abs(centralDeducted) <= skip.rows * 5e-7 + 1e-9) {
+          centralDeducted = 0;
+        }
         /* ── THE CENTRAL FLOOR ON A RESTORE THAT CAN TURN INTO A DEBIT ────────
          * `centralDeducted` IS SIGNED, and restoreStmt is
          * `current_stock = current_stock + ?`. Positive is the credit this whole
