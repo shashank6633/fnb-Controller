@@ -57,9 +57,16 @@ export async function GET(request: Request) {
     const result = deptTransferableStock(db, departmentId);
     if (!result) return Response.json({ error: 'Unknown department' }, { status: 404 });
     const usageHere = result.department.usage_booked_here;
+    const stationList = result.department.stations.join(', ');
     // Added, never overriding a library field: the basis in words, so no
     // screen prints the raw token 'uncounted_ledger_sum' to a cook. The figures
     // themselves are deptTransferableStock's, untouched.
+    //
+    // WHAT THE APP CANNOT SEE, SAID PLAINLY. A mapped station books only the
+    // dishes fired on THAT station: routed chicken grilled on the tandoor
+    // station is booked to top-level Tandoor (the owner's mapping), never to
+    // Kitchen, even though Kitchen has the 'kitchen' station. So the label
+    // names the stations rather than claiming "cooking here is deducted".
     const rows = result.rows.map((r) => {
       const pu = r.purchase_unit || r.unit;
       const upTo = `${fmtQtyNum(r.transferable_purchase)} ${pu}`;
@@ -68,7 +75,8 @@ export async function GET(request: Request) {
         label = `Up to ${upTo}. ${dept.name} has never counted this, so this is its ledger — everything received ` +
           `minus everything used or sent — not a count. ` +
           (usageHere
-            ? 'Cooking here is deducted at the till, but waste nobody recorded is not.'
+            ? `Only dishes fired on the ${stationList} station${result.department.stations.length > 1 ? 's' : ''} are taken off here at the till; ` +
+              `anything cooked from this stock on another station, and waste nobody recorded, is not — the shelf may hold less.`
             : `No till station books ${dept.name}'s cooking to it, so whatever was cooked from this stock is NOT taken off here — the shelf may hold less.`) +
           ` Count it to send an exact figure.`;
       } else if (r.since_anchor != null && r.since_anchor < (r.on_hand ?? 0)) {

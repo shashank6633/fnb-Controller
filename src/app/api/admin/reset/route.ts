@@ -619,6 +619,19 @@ export async function POST(req: Request) {
             }
           } catch { deleted[`${r.table}_skipped`] = -1; }
         }
+        // The loop above just deleted EVERY department ledger row (MATERIAL_REFS
+        // 'department_material_transactions' is an unscoped DELETE here), which
+        // includes every transfer_out / transfer_in pair. The transfer DOCUMENTS
+        // describe those pairs and hold no balance, so they go with them — the
+        // same three tables, same order, as the phase-1 full wipe below. Left
+        // behind, every line fails the pair check (line_missing_legs) and
+        // "Transfers in" lists goods that are on no ledger. Measured before this
+        // block (xfer-r3-ledger r3-prove G1): 28 documents / 28 lines / 2
+        // disputes survived an inventory_all with 0 ledger rows left.
+        for (const t of ['department_transfer_disputes', 'department_transfer_lines', 'department_transfers']) {
+          if (!tableExists(t)) { deleted[`${t}_skipped`] = -1; continue; }
+          deleted[t] = db.prepare(`DELETE FROM ${t}`).run().changes;
+        }
         // Recipe/sub-recipe costs are meaningless now (ingredients gone) — zero them.
         try { db.prepare(`UPDATE recipes SET total_cost = 0, food_cost_percent = 0, updated_at = datetime('now')`).run(); } catch {}
         try { db.prepare(`UPDATE sub_recipes SET total_cost = 0, cost_per_unit = 0, updated_at = datetime('now')`).run(); } catch {}
@@ -799,8 +812,9 @@ export async function POST(req: Request) {
       // transfer_in pair that was just deleted above; left behind, every line
       // would fail the pair check (/api/department-ledger/check →
       // line_missing_legs) and "Transfers in" would list goods that are on no
-      // ledger. They hold no balance, so deleting them moves nothing. Full wipe
-      // only — this is the one place the ledger itself is deleted.
+      // ledger. They hold no balance, so deleting them moves nothing. Full wipes
+      // only — here and inventory_all above, the two places the whole ledger is
+      // deleted.
       safeDel('department_transfer_disputes');
       safeDel('department_transfer_lines');
       safeDel('department_transfers');

@@ -5,6 +5,7 @@ import {
   isDeptTransferBlocked, type DeptTransferWithLines, type DeptTransferDisputeRow, type TransferEntryUnit,
 } from '@/lib/dept-ledger';
 import { toPurchaseQty } from '@/lib/pack-units';
+import { resolveDirectIssueBulk } from '@/lib/direct-issue';
 
 /**
  * 'purchase' | 'recipe' | a unit's own NAME ('kg', 'g', 'btl') → the entry
@@ -50,8 +51,9 @@ export function bodyNumber(v: unknown): number {
  * SEND (one step — the stock moves when the document is written):
  *   the SENDING department's head — departments.head_user_id, or an HOD
  *   (is_head_chef) POSTED to that department (users.department_id) — plus
- *   managers (manager tier) and admin. Nobody else: staff, an HOD posted
- *   elsewhere, the head of a parent department, can_approve_requisitions.
+ *   managers (manager tier, NOT an HOD — see isAdminOrManager) and admin.
+ *   Nobody else: staff, an HOD posted elsewhere (even on the manager-tier Head
+ *   Chef role), the head of a parent department, can_approve_requisitions.
  *
  * SEE: admin / manager / HOD / store manager see every transfer
  *   (canSeeAllDeptStock — the /api/department-stock rule). Everyone else sees
@@ -71,7 +73,9 @@ export function bodyNumber(v: unknown): number {
  *
  * DISMISS A DISPUTE (closes it, moves nothing): the person who raised it
  *   (withdrawing their own claim), managers and admin. NOT the sender's head
- *   alone — a claim against your own department is not yours to close.
+ *   or HOD — a claim against your own department is not yours to close, and
+ *   the Head Chef role being manager tier does not make its holder a
+ *   "manager" here (isAdminOrManager).
  */
 
 export interface DeptLite {
@@ -95,9 +99,25 @@ export function isAdmin(user: Pick<SessionUser, 'role'>): boolean {
   return user.role === 'admin';
 }
 
-/** Admin or manager tier — the two global arms of the ruling. */
-export function isAdminOrManager(user: Pick<SessionUser, 'role'>): boolean {
-  return user.role === 'admin' || user.role === 'manager';
+/**
+ * The two GLOBAL arms of the ruling: admin, and "managers".
+ *
+ * "MANAGERS" IS THE MANAGER TIER **WITHOUT** THE HOD FLAG. The ruling names
+ * HODs separately — "an HOD posted to that department" — and on this database
+ * the real Head Chef role is itself manager tier (roles.base_role 'manager',
+ * is_head_chef 1). Read "managers" as the bare tier and that HOD clause never
+ * binds anyone: every Head Chef could send any department's stock, and the
+ * Kitchen HOD could close a dispute raised AGAINST Kitchen. So an HOD is
+ * governed by the HOD clause whatever their tier — they act for the department
+ * they are posted to (or one whose head_user_id names them). Measured before
+ * this line (xfer-r3-ledger r3-prove B/D8): a Head Chef posted to Akan Bar sent
+ * Kitchen's chicken (201) and the Kitchen Head Chef dismissed Tandoori's claim
+ * against Kitchen (200). If the owner wants every Head Chef to send from every
+ * department, this is the one line to change.
+ */
+export function isAdminOrManager(user: Pick<SessionUser, 'role' | 'is_head_chef'>): boolean {
+  if (user.role === 'admin') return true;
+  return user.role === 'manager' && !user.is_head_chef;
 }
 
 export function canSendFrom(
@@ -225,11 +245,21 @@ export function presentTransfer(user: SessionUser, doc: DeptTransferWithLines, a
 /**
  * RECEIVERS for one sender, in the order the owner ruled: the sender's OWN
  * FAMILY first (its children; or, for a child, its parent and siblings), and
- * within each group the departments where requisitions LAND first (Kitchen
+ * within each group the departments where requisitions LAND first — busiest
+ * first. Every other active department follows; any may still be chosen.
+ *
+ * "WHERE REQUISITIONS LAND" IS MEASURED ON THE GOODS THIS SENDER HOLDS. Kitchen
  * hands routed meat / poultry / seafood to the AKAN-* departments that raise
- * the requisitions). Every other active department follows — any may still be
- * chosen. `usage_booked_here` repeats the station-mapping fact per receiver
- * (the owner's mapping; read, never edited): false = sales never deduct there.
+ * the requisitions FOR THOSE GOODS, so the count is requisition LINES for the
+ * materials Direct Issue routes to this sender (resolveDirectIssueBulk — the
+ * ONE resolver, so a material rule beats a category rule exactly as at
+ * receipt). Counting any requisition instead put Akan Security and Akan
+ * Stationery (4 and 1 lines of anything, none of it meat) level with Akan
+ * Tandoori. A sender nothing is routed to (a sub-kitchen handing stock on)
+ * falls back to all requisition lines. Cancelled requisitions never count.
+ *
+ * `usage_booked_here` repeats the station-mapping fact per receiver (the
+ * owner's mapping; read, never edited): false = sales never deduct there.
  */
 export function receiversFor(db: Database.Database, fromId: string, all: Map<string, DeptLite>) {
   const from = all.get(fromId);
@@ -241,15 +271,33 @@ export function receiversFor(db: Database.Database, fromId: string, all: Map<str
     for (const d of all.values()) if (d.parent_id === from.parent_id) family.add(d.id);
   }
   family.delete(from.id);
+
+  // Materials Direct Issue routes to THIS sender (empty when it routes nothing).
+  let routedTo: string[] = [];
+  try {
+    const ids = (db.prepare(`SELECT DISTINCT material_id FROM requisition_items WHERE TRIM(COALESCE(material_id, '')) <> ''`)
+      .all() as Array<{ material_id: string }>).map((r) => String(r.material_id));
+    for (const [mid, t] of resolveDirectIssueBulk(db, ids)) if (t.departmentId === from.id) routedTo.push(mid);
+  } catch { routedTo = []; }
+  const basis: 'routed' | 'all' = routedTo.length > 0 ? 'routed' : 'all';
+
   const reqs = new Map<string, { n: number; last: string }>();
   try {
-    for (const r of db.prepare(`
-      SELECT department_id, COUNT(*) AS n, MAX(date) AS last FROM requisitions
-       WHERE COALESCE(status, '') <> 'cancelled' AND TRIM(COALESCE(department_id, '')) <> ''
-       GROUP BY department_id
-    `).all() as Array<{ department_id: string; n: number; last: string }>) {
-      reqs.set(String(r.department_id), { n: Number(r.n) || 0, last: String(r.last || '') });
-    }
+    const rows = (basis === 'routed'
+      ? db.prepare(`
+          SELECT r.department_id, COUNT(*) AS n, MAX(r.date) AS last
+            FROM requisition_items ri JOIN requisitions r ON r.id = ri.req_id
+           WHERE COALESCE(r.status, '') <> 'cancelled' AND TRIM(COALESCE(r.department_id, '')) <> ''
+             AND ri.material_id IN (SELECT value FROM json_each(?))
+           GROUP BY r.department_id
+        `).all(JSON.stringify(routedTo))
+      : db.prepare(`
+          SELECT r.department_id, COUNT(*) AS n, MAX(r.date) AS last
+            FROM requisition_items ri JOIN requisitions r ON r.id = ri.req_id
+           WHERE COALESCE(r.status, '') <> 'cancelled' AND TRIM(COALESCE(r.department_id, '')) <> ''
+           GROUP BY r.department_id
+        `).all()) as Array<{ department_id: string; n: number; last: string }>;
+    for (const r of rows) reqs.set(String(r.department_id), { n: Number(r.n) || 0, last: String(r.last || '') });
   } catch { /* no requisitions table — ordering falls back to family + name */ }
   const mapped = new Set<string>();
   try {
@@ -271,13 +319,17 @@ export function receiversFor(db: Database.Database, fromId: string, all: Map<str
         parent_name: d.parent_id ? all.get(d.parent_id)?.name || '' : '',
         family: fam,
         requisitions_land: lands,
+        /** Requisition LINES counted for the ordering — see `requisition_basis`. */
         requisition_count: rq?.n || 0,
+        /** 'routed' = lines for the materials Direct Issue routes to the sender;
+         *  'all' = every line (the sender has nothing routed to it). */
+        requisition_basis: basis,
         last_requisition_date: rq?.last || null,
         usage_booked_here: mapped.has(d.id),
         rank: (fam ? 0 : 2) + (lands ? 0 : 1),
       };
     })
-    .sort((a, b) => a.rank - b.rank || a.name.localeCompare(b.name));
+    .sort((a, b) => a.rank - b.rank || b.requisition_count - a.requisition_count || a.name.localeCompare(b.name));
 }
 
 /**

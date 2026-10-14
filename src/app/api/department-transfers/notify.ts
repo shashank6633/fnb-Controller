@@ -4,7 +4,7 @@ import { generateId } from '@/lib/db';
 import { sendPushToUser } from '@/lib/push';
 import type { DeptTransferWithLines, DeptTransferDisputeRow } from '@/lib/dept-ledger';
 import { toPurchaseQty } from '@/lib/pack-units';
-import { canSendFrom, type DeptLite } from './access';
+import { canSendFrom, isAdminOrManager, type DeptLite } from './access';
 
 /* ══════════════════════════════════════════════════════════════════════════
  * TELLING THE SENDER'S SIDE A TRANSFER IS DISPUTED.
@@ -18,10 +18,12 @@ import { canSendFrom, type DeptLite } from './access';
  * house rule grn-qc-notify.ts states ("a badge that reached people who cannot
  * act, or an action nobody was told about, would each be worse than the
  * other"): everyone who may send from the ORIGINAL SENDING department
- * (access.ts canSendFrom: its head_user_id, an HOD posted there, managers,
- * admin) — exactly the people who can make the one-tap reverse — plus the
- * person who sent it. Tier and flags are re-derived as getCurrentUser() does
- * (roles.base_role wins the tier, per-user flags only ADD).
+ * (access.ts canSendFrom: its head_user_id, an HOD posted there, managers —
+ * manager tier without the HOD flag — and admin) — exactly the people who can
+ * make the one-tap reverse — plus the person who sent it. An HOD posted to
+ * another department is NOT told: it is not their department's transfer.
+ * Tier and flags are re-derived as getCurrentUser() does (roles.base_role
+ * wins the tier, per-user flags only ADD).
  *
  * TWO RAILS, as grn-qc-notify:
  *  1. THE DURABLE ROW in `notifications` (kind 'dept_transfer_dispute'),
@@ -70,9 +72,12 @@ export function transferAlertRecipients(
       const isTheSender = email.toLowerCase() === sentBy;
       const mayAct = canSendFrom(u, from);
       if (!isTheSender && !mayAct) continue;
+      // Same arms, same order as canSendFrom — an HOD on the manager-tier Head
+      // Chef role is here as the HOD posted to the sending department, not as a
+      // "manager" (access.ts isAdminOrManager).
       const why: TransferAlertRecipient['why'] = !mayAct ? 'sender'
         : u.role === 'admin' ? 'admin'
-          : u.role === 'manager' ? 'manager'
+          : isAdminOrManager(u) ? 'manager'
             : (from && from.head_user_id === u.id) ? 'head'
               : 'hod';
       out.set(email.toLowerCase(), { email, name: String(row.name || email), why });
