@@ -295,19 +295,6 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
  *   A payload with no gst_rate writes precisely the row it wrote before this
  *   field existed.
  *
- *   ⚠ THE LINE ABOVE SAYS "0/absent = no tax recorded" AND THAT COLLAPSE IS THE
- *   POINT OF `tax_applicable`. In rupees the two are identical, but as facts
- *   they are not: an explicit 0 is somebody deciding the line is exempt, an
- *   absent rate is nobody having looked. `tax_applicable` is the per-line
- *   DECISION (not a rate) behind the "Tax applicable (GST + cess)" tick:
- *     false   → declared exempt; this route FORCES both rates to 0 rather than
- *               trusting the client's zeros, and stores tax_decision 'exempt'.
- *     true    → declared taxable; rates as sent, tax_decision 'taxable'.
- *     absent  → nobody decided; every line below behaves exactly as it did
- *               before the field existed and tax_decision stores ''.
- *   It covers BOTH levies — GST and compensation cess — because a receiver who
- *   unticks "tax" and is still charged a 12% cess was not told the truth.
- *
  * Optional body: { line_ids? }
  *   — a SUBSET of that vendor's outstanding lines, when they split the delivery
  *   across two bills. Omitted = all of them. Lines left out stay outstanding and
@@ -466,10 +453,6 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           deviation_reason: o.deviation_reason,
           gst_rate: o.gst_rate, cgst: o.cgst, sgst: o.sgst,
           cess_rate: o.cess_rate,
-          // The receiver's "Tax applicable" decision for this line — a decision,
-          // not a rate. Carried through unchanged so taxApplicableOf() below is
-          // the only place that interprets it.
-          tax_applicable: o.tax_applicable,
         });
       }
     }
@@ -481,18 +464,6 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
      * /api/purchases' `gstProvided`, so the two purchase paths agree on what
      * "no tax" is.
      */
-    /* A RATE IS A NUMBER, OR THE NUMERIC STRING A FORM ROUND-TRIP MAKES OF ONE.
-     * `String(v).trim() !== ''` alone only says "something was sent", and then
-     * Number() coerces it: `gst_rate: true` becomes 1 (a 1% GST nobody typed,
-     * stored with a 201) and `gst_rate: [18]` becomes 18. `tax_applicable` is a
-     * BOOLEAN on the same line object now, so a client writing `gst_rate: true`
-     * meaning "yes, taxable" is one keystroke away. TYPE FIRST, THEN RANGE — and
-     * refused, not read as absent, because dropping a bill's tax silently
-     * forfeits the input credit (this route's own rule, at the check below).
-     * `[]` still reads as absent — String([]) is '' — exactly as before.
-     * Byte-identical in shape to /api/grn's rateSent/rateScalar pair. */
-    const rateSent   = (v: any): boolean => v !== undefined && v !== null && String(v).trim() !== '';
-    const rateScalar = (v: any): boolean => typeof v === 'number' || typeof v === 'string';
     const gstProvidedFor = (ov: any): boolean =>
       ov?.gst_rate !== undefined && ov?.gst_rate !== null && String(ov.gst_rate).trim() !== '';
     /**
@@ -504,32 +475,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
      * existed — a rate is never inferred, and 0 is never assumed to be a rate.
      */
     const cessProvidedFor = (ov: any): boolean =>
-<<<<<<< WIP-MIXED production side — these lines came from: ff0f440 Req 71: PO Receive and GRN auto-pick Cess % from the Raw Mater (1)
       ov?.cess_rate !== undefined && ov?.cess_rate !== null && String(ov.cess_rate).trim() !== '';
-======= WIP side
-      rateSent(ov?.cess_rate) && rateScalar(ov?.cess_rate);
-    /**
-     * THE RECEIVER'S "TAX APPLICABLE" DECISION for this line — a DECISION, not a
-     * rate, and the wire half of the tick on the Receive screen.
-     *   false  → declared exempt: BOTH rates are forced to 0 below and the GRN
-     *            row records tax_decision 'exempt'.
-     *   true   → declared taxable: rates as sent, tax_decision 'taxable'.
-     *   absent → nobody decided; this route writes precisely the row it wrote
-     *            before the field existed, tax_decision ''.
-     * Byte-identical in shape and meaning to /api/grn's taxApplicableOf, because
-     * the two receiving paths feed ONE inward register and a decision recorded
-     * on one screen must read the same as the same decision on the other.
-     * An unrecognised value is "no decision", never a silent yes — a typo must
-     * not be able to manufacture an exemption nobody made.
-     */
-    const taxApplicableOf = (ov: any): boolean | undefined => {
-      const v = ov?.tax_applicable;
-      if (v === undefined || v === null || v === '') return undefined;
-      if (v === true || v === 'true' || v === 1 || v === '1') return true;
-      if (v === false || v === 'false' || v === 0 || v === '0') return false;
-      return undefined;
-    };
->>>>>>> WIP-MIXED
 
     // ── Bill-level charges (shape only — the money gates need the accepted
     // lines and run after the per-line validation below) ──────────────────
@@ -928,16 +874,8 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // silently dropping the tax on a bill forfeits the input credit, and
       // nothing in the stored row would ever show that it went missing. Same
       // bounds and same wording as /api/purchases.
-<<<<<<< WIP-MIXED production side — these lines came from: a0ace36 PO Receive: the receiver can correct the rate, and per-item ta (2)
       if (gstProvidedFor(ov)) {
         const g = Number(ov!.gst_rate);
-======= WIP side
-      // `rateSent`, not `gstProvidedFor`: a boolean or an array HAS been sent
-      // and must be answered with the 400 below rather than skipped as absent.
-      // A non-scalar becomes NaN here and falls into the same refusal.
-      if (rateSent(ov?.gst_rate)) {
-        const g = rateScalar(ov!.gst_rate) ? Number(ov!.gst_rate) : NaN;
->>>>>>> WIP-MIXED
         if (!Number.isFinite(g) || g < 0 || g > 100) {
           return Response.json({
             error: `GST on "${it.material_name}" must be a percentage between 0 and 100 (0 = exempt) — received "${ov!.gst_rate}". Send no gst_rate at all to record the line with no tax.`,
@@ -953,14 +891,8 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // (12% on aerated drinks, tobacco at the bar), not a third slice of the GST
       // split, and not the TGBCL `special_excise_cess`, which means state excise
       // everywhere it is read and labelled. Wording mirrored from /api/purchases.
-<<<<<<< WIP-MIXED production side — these lines came from: ff0f440 Req 71: PO Receive and GRN auto-pick Cess % from the Raw Mater (2)
       if (cessProvidedFor(ov)) {
         const c = Number(ov!.cess_rate);
-======= WIP side
-      // Same rule as the GST check directly above — see the type note there.
-      if (rateSent(ov?.cess_rate)) {
-        const c = rateScalar(ov!.cess_rate) ? Number(ov!.cess_rate) : NaN;
->>>>>>> WIP-MIXED
         if (!Number.isFinite(c) || c < 0 || c > 100) {
           return Response.json({
             error: `Compensation cess on "${it.material_name}" must be a percentage between 0 and 100 (0 = none) — received "${ov!.cess_rate}". Send no cess_rate at all to record the line with no compensation cess.`,
@@ -1261,23 +1193,8 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // as well would claim the same duty twice under a levy the government
       // never charged on it.
       const storeMapped = isStoreMappedMaterial(db, String(it.material_id || ''));
-<<<<<<< WIP-MIXED production side — these lines came from: a0ace36 PO Receive: the receiver can correct the rate, and per-item ta (1); ff0f440 Req 71: PO Receive and GRN auto-pick Cess % from the Raw Mater (1)
       const gstRate = (!gstProvidedFor(ov) || storeMapped) ? 0 : Number(ov!.gst_rate);
       const cessRate = (!cessProvidedFor(ov) || storeMapped) ? 0 : Number(ov!.cess_rate);
-======= WIP side
-      /* THE RECEIVER'S DECISION, resolved once and applied to BOTH levies.
-       * OFF forces the rates to 0 here rather than trusting the client's zeros:
-       * the screen does send explicit zeros (an exemption must be a recorded 0,
-       * never an omitted field), but a rate surviving a stale form state or a
-       * replayed payload must not be able to tax a line somebody declared
-       * exempt. The stored decision and the stored rupees have to agree.
-       * The cess half is the one that would otherwise be silent — the receiver
-       * unticks "Tax applicable" and a master cess% keeps running on the line. */
-      const taxDecided = taxApplicableOf(ov);
-      const taxOff = taxDecided === false;
-      const gstRate = (!gstProvidedFor(ov) || taxOff || storeMapped) ? 0 : Number(ov!.gst_rate);
-      const cessRate = (!cessProvidedFor(ov) || taxOff || storeMapped) ? 0 : Number(ov!.cess_rate);
->>>>>>> WIP-MIXED
       // GROSS accepted value — identical expression to `acceptedTotal` in the txn
       // loop, and to the GRN row's ROUND(quantity_accepted × unit_price, 2) that
       // every register totals from. A fully-rejected line is 0 here and therefore
@@ -1311,10 +1228,6 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         cess_base: grossTotal,
         cess: cessPaise / 100,
         cess_forced_zero: storeMapped && cessProvidedFor(ov) && Number(ov!.cess_rate) > 0,
-        // THE DECISION BEHIND THE RATES — '' when the payload said nothing, which
-        // is every client that predates the tick. Stored on the GRN line below;
-        // db.ts declares the column and spells out the three values.
-        tax_decision: taxDecided === undefined ? '' : (taxDecided ? 'taxable' : 'exempt'),
       });
       // A client whose split disagrees with the server's is LOGGED, never
       // obeyed — a UI drift must stay visible instead of being silently
@@ -1428,47 +1341,10 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // recipe and sub-recipe cost in the app derives from, so a tax-inclusive
       // rate would inflate every one of them by the GST rate — silently, forever —
       // and the tax, once buried inside a cost, is no longer reclaimable as input
-<<<<<<< WIP-MIXED production side — these lines came from: a0ace36 PO Receive: the receiver can correct the rate, and per-item ta (4)
       // credit. The tax for this receipt lives on the GRN line written just above,
       // which IS the bill document; this row is the COST mirror of it, and
       // src/lib/purchase-log.ts reads the two separately (is_mirror) precisely so
       // the same rupee is not counted on both.
-======= WIP side
-      // credit.
-      //
-      // ── THE TAX ITSELF IS NOW RECORDED IN ITS OWN COLUMNS, AND WAS NOT ──────
-      // This INSERT used to name no cgst / sgst / compensation_cess at all, so a
-      // PO-borne receipt wrote ₹0 tax on the cost rail while its GRN line carried
-      // the real figure. Measured on the owner's data before the fix:
-      //   GRN-2026-0001 Pasta   gi.cgst 81 / gi.sgst 81   vs   p.cgst 0 / p.sgst 0
-      //   GRN-2026-0004 Sugar   gi.cgst 72 / gi.sgst 72   vs   p.cgst 0 / p.sgst 0
-      // That is a rupee figure that is WRONG, not merely absent, on every reader
-      // that takes `purchases` as the tax record: src/lib/purchase-bill-summary.ts
-      // reads that table AND NOTHING ELSE (its own header says so), and
-      // /api/reports/purchases sums p.cgst / p.sgst. Both under-reported the
-      // input credit on every bill received against a PO.
-      //
-      // THIS ROUTE WAS THE ONLY WRITER THAT DID NOT. All three of its siblings on
-      // the same rail bind these columns already: POST /api/grn (the ad-hoc bill),
-      // src/lib/grn-qc.ts (the same delivery when the QC gate held it) and
-      // src/lib/grn-reversal.ts (an amendment, which re-derives them precisely so
-      // "the mirror never tells a lie"). The consequence of being the odd one out
-      // was absurd on its face: the SAME PO bill booked tax on the cost rail if it
-      // happened to contain a perishable and was signed off, and no tax if it did
-      // not — and an amendment to an unheld one moved it from ₹0 to the full
-      // figure with no receipt for the change.
-      //
-      // NOT A DOUBLE COUNT, and the two readers that could have made it one were
-      // checked line by line: src/lib/purchase-log.ts returns totals PER SOURCE
-      // and never sums the GRN branch beside the PURCHASE branch (its header
-      // block is entirely about that hazard), and purchase-bill-summary.ts reads
-      // one table by construction. No reader adds gi.cgst to p.cgst.
-      // FORWARD-ONLY: historical rows keep their ₹0 and no period already filed
-      // is restated.
-      // Bound from taxByPoItem — the SAME figures the GRN line above is written
-      // from, derived from the accepted quantity on the server — so the bill
-      // document and its cost mirror cannot disagree by construction.
->>>>>>> WIP-MIXED
       //
       // TRACEABILITY (Break 2) — `grn_id` is the HARD link from the cost row back
       // to the delivery that created it. Until it existed the ONLY tie between a
@@ -1490,14 +1366,8 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // today is not a trade worth making.
       const insPurchase = db.prepare(`
         INSERT INTO purchases (id, material_id, vendor, brand, quantity, unit_price, total_price, date, notes, outlet_id,
-<<<<<<< WIP-MIXED production side — these lines came from: 84e59a0 Close the four traceability breaks; add the issue log and a re (2)
                                discount, delivery_charges, bill_no, grn_id, created_at)
         VALUES (?, ?, ?, '', ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, datetime('now'))
-======= WIP side
-                               discount, delivery_charges, bill_no, grn_id,
-                               cgst, sgst, compensation_cess, tax_decision, created_at)
-        VALUES (?, ?, ?, '', ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
->>>>>>> WIP-MIXED
       `);
       const bumpStock = db.prepare(`
         UPDATE raw_materials
@@ -1837,11 +1707,6 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
                        noteBits.join(' | '),
                        discShare, cgstAmt, sgstAmt, delivShare, cessAmt,
                        lineTax ? lineTax.gst_rate : 0, lineTax ? lineTax.cess_rate : 0,
-                       // THE DECISION BEHIND THOSE RATES. '' for a line that sent
-                       // no tax_applicable — which is every line this route has
-                       // ever received until now, so an untouched receive writes
-                       // precisely the row it wrote before.
-                       lineTax ? lineTax.tax_decision : '',
                        lineVendorForCost, costNote);
 
         // Stock + financials reflect ONLY the accepted qty (rejections never enter stock)
@@ -1892,18 +1757,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           // committed together or not at all. Nothing else on this call changes —
           // quantity, netPrice, netTotal, delivShare and purchaseNote are untouched.
           insPurchase.run(purchaseId, it.material_id, lineVendor, accepted, netPrice, netTotal, receivedAt,
-<<<<<<< WIP-MIXED production side — these lines came from: 84e59a0 Close the four traceability breaks; add the issue log and a re (1)
             purchaseNote, po.outlet_id, delivShare, billNo, grnId);
-======= WIP side
-            purchaseNote, po.outlet_id, delivShare, billNo, grnId,
-            // The four new binds, all read off the SAME line objects the GRN row
-            // two blocks up was written from: cgstAmt / sgstAmt / cessAmt are the
-            // server-derived figures for THIS accepted quantity, and the decision
-            // is '' for every payload that sends no tax_applicable — which is
-            // every client that predates the tick, so an untouched receive still
-            // writes ₹0 in all three tax columns exactly as it did before.
-            cgstAmt, sgstAmt, cessAmt, lineTax ? lineTax.tax_decision : '');
->>>>>>> WIP-MIXED
           // last_purchase_price keeps the GROSS rate, and that divergence from
           // the purchases.unit_price written one line above is deliberate: this
           // column is the vendor's LIST rate, and it seeds the next PO's rate
@@ -1937,9 +1791,6 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
             });
           } else {
             bumpStock.run(stockQty, price, receivedAt, it.material_id);
-<<<<<<< WIP-MIXED production side — these lines came from: 82e23ba Direct Issue: vendor deliveries routed straight to a departmen (1)
-            insTx.run(generateId(), it.material_id, stockQty, purchaseId, `PO ${po.po_number} received via GRN ${grnNumber}`, po.outlet_id);
-======= WIP side
             postCentralTxn(db, {
               materialId: it.material_id,
               type: 'purchase',
@@ -1961,7 +1812,6 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
               // never a blank, and never a name off the request body.
               actor: receivedByEmail || 'system:po-receive',
             });
->>>>>>> WIP-MIXED
           }
           touchedMaterials.add(it.material_id);
         }

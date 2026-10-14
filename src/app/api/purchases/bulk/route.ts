@@ -609,9 +609,6 @@ export async function POST(request: Request) {
           });
         } else {
           updateStock.run(stockQty, materialId);
-<<<<<<< WIP-MIXED production side — these lines came from: 82e23ba Direct Issue: vendor deliveries routed straight to a departmen (1)
-          insertTransaction.run(generateId(), materialId, stockQty, id, `Bulk import: ${item.vendor || 'unknown'}`);
-======= WIP side
           postCentralTxn(db, {
             materialId,
             type: 'purchase',
@@ -624,7 +621,6 @@ export async function POST(request: Request) {
             txnDate: item.date,
             actor: me?.email || 'system:purchase-import',
           });
->>>>>>> WIP-MIXED
         }
         touchedMaterials.add(materialId);
         results.success++;

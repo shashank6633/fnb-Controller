@@ -52,20 +52,6 @@ import {
   recordBillHandoverForReceipt,
   type BillHandoverAnswer,
 } from '@/lib/bill-handover-client';
-/* TAX ACTUALLY CHARGED — the inward register's two appended columns, on screen
-   and in this page's own CSV. ONE module owns the arithmetic, the base and the
-   blank-never-zero rule, shared with the server's csv branch in
-   src/app/api/grn/route.ts and with /reports/purchases,
-   /reports/purchase-bill-summary and the purchase log, so one bill cannot read
-   18.00% on this register and 16.20% on a report. It imports only
-   purchase-charges.ts, which imports nothing — safe in a 'use client' page.
-   Cess is NOT in the figure: it is charged on the GROSS line value and GST on
-   the post-discount value, so no single percentage covers both. */
-import {
-  TAX_VALUE_LABEL, TAX_PERCENT_LABEL, TAX_VALUE_TITLE, TAX_PERCENT_TITLE,
-  TAX_VALUE_CSV_HEADER, TAX_PERCENT_CSV_HEADER,
-  gstValue, taxAppliedPercent, fmtTaxPercent, taxCsvNumber,
-} from '@/lib/tax-applied';
 
 const fmt = (v: number) => '₹' + Math.round(v || 0).toLocaleString('en-IN');
 /** ₹ with 2 decimals — for the inward register (taxes/charges carry paise). */
@@ -141,26 +127,6 @@ interface GrnLine {
   gst_rate: string;
   /** GST compensation cess %, seeded from raw_materials.cess_percent. */
   cess_rate: string;
-  /**
-   * THE "TAX APPLICABLE" TICK — the receiver's DECISION about this line, which
-   * is a different fact from the rates above and is stored in its own column.
-   *
-   *   ''     UNDECIDED. Nobody touched the tick. The payload sends no
-   *          tax_applicable at all and POST /api/grn writes precisely the row it
-   *          has always written (tax_decision ''). THIS IS THE DEFAULT AND IT
-   *          MATTERS: 925 of 952 materials have no configured tax %, so an
-   *          untouched line is the overwhelmingly common case, and making it
-   *          post something new would change what ~97% of receipts record.
-   *   'yes'  DECLARED TAXABLE — the tick is on because somebody put it on.
-   *   'no'   DECLARED EXEMPT — the receiver unticked it. Posts an explicit
-   *          gst_rate 0 AND cess_rate 0 (a recorded decision), never an omitted
-   *          field, plus tax_applicable:false so the row can say which.
-   *
-   * ⚠ THE TICK'S VISUAL STATE IS NOT THIS FIELD. A line with a seeded 18% shows
-   * a ticked box while still sitting at '' — it is taxed because the master says
-   * so, not because anyone decided. taxTicked() renders; this records.
-   */
-  tax_applicable: '' | 'yes' | 'no';
   discount: string; cgst: string; sgst: string; special_excise_cess: string;
   tcs: string; delivery_charges: string; mrp_round_off: string;
 }
@@ -186,9 +152,6 @@ const blankLine = (): GrnLine => ({
   material_id: '', quantity_received: '', quantity_accepted: '', rejection_reason: '', unit_price: '', notes: '',
   brand: '', entry_mode: 'btl',
   gst_rate: BILL_GST, cess_rate: '',
-  // UNDECIDED, deliberately — see the field doc. A fresh line must post what a
-  // fresh line has always posted.
-  tax_applicable: '',
   discount: '', cgst: '', sgst: '', special_excise_cess: '', tcs: '', delivery_charges: '', mrp_round_off: '',
 });
 const n0 = (s?: string) => { const v = Number(s); return Number.isFinite(v) ? v : 0; };
@@ -333,49 +296,6 @@ const STORE_QC_FIELDS: QcFieldDef[] = [
   { k: 'qc_weight',        label: 'Weight / count verified vs invoice',    short: 'Weight' },
   { k: 'qc_invoice_match', label: 'Invoice matches PO (rate, qty, vendor)', short: 'Invoice match' },
 ];
-/* ── THE RECEIVER'S TAX DECISION, AS A READER SEES IT ──────────────────────
- * goods_receipt_note_items.tax_decision holds '' | 'taxable' | 'exempt' (db.ts
- * declares it). In RUPEES a declared-exempt line and a line nobody looked at are
- * identical — ₹0 CGST, ₹0 SGST, ₹0 cess on both — so this column is the only
- * thing that can tell them apart, and until it was rendered the distinction was
- * reachable only from a SQL prompt. Which made the tick, whose whole purpose is
- * "we decided this line is exempt", indistinguishable from nobody having
- * thought about it.
- *
- * TWO RENDERINGS, ONE VOCABULARY. `TAX_DECISION_LABEL` is the CSV wording and
- * is byte-identical to taxDecisionLabel() in src/app/api/grn/route.ts, which
- * renders the server-side register download — keep the two in step, exactly as
- * the 28 REGISTER_HEADER columns already are. `taxDecisionChip` is the screen
- * form, where a row has one line of space and colour can do some of the work.
- *
- * WHY THE SCREEN SHOWS NOTHING FOR '' AND THE FILE SAYS "NOT RECORDED": on the
- * panel the decided rows carry a chip and the undecided ones do not, so the
- * distinction is visible at a glance and a chip on every one of 2,165 historical
- * lines would be noise. In a spreadsheet a blank cell reads as "this export has
- * no data here", a fourth meaning nobody intended — so the file spells it out.
- */
-const TAX_DECISION_LABEL = (v: any): string => {
-  const s = String(v ?? '').trim();
-  return s === 'taxable' ? 'DECLARED TAXABLE'
-       : s === 'exempt'  ? 'DECLARED EXEMPT'
-       : 'NOT RECORDED';
-};
-/** The screen chip, or null when no decision was recorded. */
-const taxDecisionChip = (v: any): { text: string; cls: string; title: string } | null => {
-  const s = String(v ?? '').trim();
-  if (s === 'exempt') return {
-    text: 'no tax — declared',
-    cls: 'bg-amber-50 text-amber-800 border-amber-200',
-    title: 'The receiver DECLARED this line not taxable: it posts GST 0% and compensation cess 0%, and the receipt records that decision. This is not the same as a line nobody looked at — that one carries no chip at all.',
-  };
-  if (s === 'taxable') return {
-    text: 'tax — declared',
-    cls: 'bg-emerald-50 text-emerald-700 border-emerald-200',
-    title: 'The receiver DECLARED this line taxable. The CGST / SGST / Comp. Cess columns on this row are what it bears.',
-  };
-  return null;   // '' — nobody recorded a decision. The absence IS the answer.
-};
-
 /** Store first, then kitchen — the order the receiving desk meets them. Used to
  *  name the six ticks in the amendment trail, where "QC · Quality" alone left a
  *  reader unable to tell whose answer had been changed. */
@@ -863,50 +783,11 @@ export default function GrnPage() {
       // column at the end. It is its own column and overloads none of the
       // others: STATUS is what happened to the receipt, BILL TYPE is what kind
       // of document it is, and folding the two together would lose one of them.
-      // TAX DECISION is the 28th and is APPENDED for the same reason BILL TYPE
-      // was. It carries the ONE thing a ₹0 tax row cannot otherwise tell its
-      // reader: whether the zero is a decision somebody made at the delivery
-      // door ("this line is exempt") or a field nobody ever looked at. The
-      // rupees are identical either way, so no existing column can say it, and
-      // the person reading this file is exactly the person who needs to know.
       const header = ['GRN No.', 'INVOICE ID', 'INWARD DATE', 'SUPPLIER NAME', 'CATEGORY NAME', 'ITEM NAME',
         'PO QTY', 'INWARD QTY', 'PURCHASE UNIT', 'RATE', 'SUBTOTAL', 'DISCOUNT', 'CGST', 'SGST',
         'COMPENSATION CESS', 'SPECIAL EXCISE CESS', 'TCS', 'DELIVERY CHARGES', 'MRP ROUND OFF', 'TOTAL INWARD AMOUNT',
-<<<<<<< WIP-MIXED production side — these lines came from: ceace04 GRN list: every row says DIRECT or AGAINST PO (1)
         'ACCEPTED QTY', 'REJECTED QTY', 'REJECT REASON', 'STATUS', 'RECEIVED BY', 'INVOICE DATE', 'BILL TYPE'];
       const lines = [header.join(',')];
-======= WIP side
-        'ACCEPTED QTY', 'REJECTED QTY', 'REJECT REASON', 'STATUS', 'RECEIVED BY', 'INVOICE DATE', 'BILL TYPE',
-        // TAX VALUE (GST) is the 29th and TAX % APPLIED (GST) the 30th, APPENDED
-        // for the third time for the same reason BILL TYPE and TAX DECISION
-        // were. Both are DERIVED from columns already on the row (CGST + SGST,
-        // over SUBTOTAL − DISCOUNT, which is the base GST is charged on), which
-        // is why they go AFTER TOTAL INWARD AMOUNT and not beside CGST: the
-        // total is footable from the columns to its left, and a duplicate rupee
-        // column inside that run would let a reader adding across the row count
-        // GST twice. Kept byte-identical to the server's own csv branch in
-        // src/app/api/grn/route.ts — two "inward register" files that disagree
-        // about a column are worse than one.
-        //
-        // 'TAX DECISION' IS THE 28th AND MUST BE LISTED HERE. The comment above
-        // has described it as the 28th column since it shipped, and the row
-        // builder below has always emitted it — but the heading itself was
-        // never added to this array, so THIS file (the button on the page, the
-        // one users actually click) shipped 29 headings against 30 values. In a
-        // spreadsheet that shifted every column from TAX DECISION rightward one
-        // to the LEFT of its own heading: the word "NOT RECORDED" was filed
-        // under the rupees heading "Tax Value INR (GST = CGST+SGST…)". The
-        // server's REGISTER_HEADER has always carried it; this is the copy that
-        // drifted, and the two are byte-identical again with it restored.
-        'TAX DECISION',
-        TAX_VALUE_CSV_HEADER, TAX_PERCENT_CSV_HEADER];
-      // ESCAPED WITH THE SAME `clean` THE DATA ROWS USE — the two tax headings
-      // are sentences containing commas, so a raw join split them into extra
-      // fields (measured 31 header fields over 30 data values here, 32 over 30
-      // on the server). Headings are data too; the server branch now does the
-      // same, as issue-log.ts and petty-cash.ts already did.
-      const lines = [header.map(clean).join(',')];
->>>>>>> WIP-MIXED
       for (const r of rows) lines.push([
         r.grn_number, r.invoice_number, r.inward_date, r.supplier, r.category_name, r.item_name,
         r.po_qty, r.inward_qty, r.purchase_unit, r.rate, r.subtotal, r.discount, r.cgst, r.sgst,
@@ -915,21 +796,6 @@ export default function GrnPage() {
         // Computed by the register SQL (one CASE over g.po_id), never re-derived
         // here — one rule, one place, so the file and the screen cannot drift.
         r.bill_type,
-        // The raw column travels on the wire ('', 'taxable', 'exempt') and the
-        // WORDS are rendered here, byte-identically to the server's own csv
-        // branch (taxDecisionLabel in src/app/api/grn/route.ts) — two "inward
-        // register" files that disagree about what a cell means are worse than
-        // one. A blank is never printed: in a spreadsheet an empty cell reads as
-        // "this export has no data here", which is a fourth meaning nobody
-        // intended, so the absence of a decision says so in words.
-        TAX_DECISION_LABEL(r.tax_decision),
-        // BLANK, never 0 and never 0%, when the line recorded no GST — TAX
-        // DECISION beside it is what separates DECLARED EXEMPT from NOT
-        // RECORDED, and in rupees those two are identical. The arithmetic comes
-        // from the shared helper, so this file and the four reports that print
-        // the same figure cannot round differently.
-        taxCsvNumber(gstValue(r)),
-        taxCsvNumber(taxAppliedPercent(r)),
       ].map(clean).join(','));
       const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8;' });
       const url = URL.createObjectURL(blob); const a = document.createElement('a');
@@ -1966,18 +1832,6 @@ function GrnRow({ g, expanded, onToggle, isAdmin, canAmend, dataVersion, onEdit,
                     <th className="text-right py-1 px-2 font-medium">Delivery</th>
                     <th className="text-right py-1 px-2 font-medium">MRP Round Off</th>
                     <th className="text-right py-1 px-2 font-medium text-[#af4408]">Total Inward</th>
-                    {/* THE OWNER'S TWO TAX COLUMNS, AFTER Total Inward and not
-                        beside CGST. Both are DERIVED from cells already on this
-                        row — Tax Value is CGST + SGST, Tax % Applied is that pair
-                        over (Subtotal − Discount), the base GST is charged on —
-                        and the run of columns to the left of Total Inward has to
-                        keep adding up to it. A duplicate rupee column inside that
-                        run would let a reader checking the row's own breakdown
-                        count GST twice. Same position, same wording and the same
-                        shared helper as the 29th and 30th columns of the register
-                        CSV. */}
-                    <th className="text-right py-1 px-2 font-medium border-l border-[#E8D5C4]" title={TAX_VALUE_TITLE}>{TAX_VALUE_LABEL}</th>
-                    <th className="text-right py-1 px-2 font-medium" title={TAX_PERCENT_TITLE}>{TAX_PERCENT_LABEL}</th>
                     <th className="text-right py-1 px-2 font-medium border-l border-[#E8D5C4]">Accepted</th>
                     <th className="text-right py-1 px-2 font-medium">Rejected</th>
                     <th className="text-left  py-1 px-2 font-medium">Reason</th>
@@ -2002,25 +1856,7 @@ function GrnRow({ g, expanded, onToggle, isAdmin, canAmend, dataVersion, onEdit,
                     return (
                     <tr key={it.id} className="border-t border-[#E8D5C4]/50">
                       <td className="py-1 px-2 text-[#6B5744]">{it.material_category || '—'}</td>
-                      {/* THE DECISION RIDES WITH THE ITEM NAME, not in a column
-                          of its own: this table already carries 19 headings and
-                          its tfoot spans them by count (colSpan 6 / 8 / 3), so a
-                          20th would have to be paid for in three places and the
-                          Total Inward figure slides out of its column the moment
-                          one is missed. The chip is only rendered for a line
-                          somebody actually decided — a row with no chip is a row
-                          nobody looked at, which is the honest reading and keeps
-                          the historical lines quiet. */}
-                      <td className="py-1 px-2 text-[#2D1B0E]">
-                        {it.material_name}
-                        {(() => {
-                          const c = taxDecisionChip(it.tax_decision);
-                          return c ? (
-                            <span className={`ml-1.5 align-middle inline-block px-1.5 py-[1px] rounded border text-[9px] font-medium ${c.cls}`}
-                                  title={c.title}>{c.text}</span>
-                          ) : null;
-                        })()}
-                      </td>
+                      <td className="py-1 px-2 text-[#2D1B0E]">{it.material_name}</td>
                       <td className="py-1 px-2 text-right font-mono">{Number(it.quantity_ordered) || 0}</td>
                       <td className="py-1 px-2 text-right font-mono">{it.quantity_received}</td>
                       <td className="py-1 px-2 text-[#6B5744]">{it.purchase_unit || it.material_unit || '—'}</td>
@@ -2035,17 +1871,6 @@ function GrnRow({ g, expanded, onToggle, isAdmin, canAmend, dataVersion, onEdit,
                       {chargeCell(it.delivery_charges)}
                       {chargeCell(it.mrp_round_off)}
                       <td className="py-1 px-2 text-right font-mono font-semibold text-[#af4408]">{m2(it.total_inward_amount)}</td>
-                      {/* A DASH, never 0 and never 0.00%, on a line that recorded
-                          no GST — the tax-decision chip on the item name is what
-                          says whether that zero was a decision (DECLARED EXEMPT)
-                          or a field nobody filled (no chip). In rupees the two are
-                          identical, so this column must not assert a rate. */}
-                      <td className={`py-1 px-2 text-right font-mono border-l border-[#E8D5C4] ${gstValue(it) ? 'text-[#2D1B0E]' : muted}`}>
-                        {gstValue(it) == null ? '—' : q2(gstValue(it))}
-                      </td>
-                      <td className={`py-1 px-2 text-right font-mono ${taxAppliedPercent(it) == null ? muted : 'text-[#2D1B0E] font-semibold'}`}>
-                        {fmtTaxPercent(taxAppliedPercent(it))}
-                      </td>
                       {/* Same rule as the list row's accepted-value cell: while
                           the receipt is held these are stored 0 because no
                           decision exists, and printing "0 kg accepted / 0 kg
@@ -2084,30 +1909,6 @@ function GrnRow({ g, expanded, onToggle, isAdmin, canAmend, dataVersion, onEdit,
                         figure slides left out of its own column. */}
                     <td className="py-1.5 px-2 text-right font-mono" colSpan={8}></td>
                     <td className="py-1.5 px-2 text-right font-mono text-[#af4408]">{m2(detail.items.reduce((s: number, it: any) => s + (Number(it.total_inward_amount) || 0), 0))}</td>
-                    {/* THE BILL'S OWN TAX FOOTER. Sigma(CGST+SGST), and the rate as
-                        Sigma(GST) / Sigma(taxed base) — money-weighted, and the base counts
-                        ONLY the lines that carried GST, so a bill whose exempt
-                        lines outweigh its taxed ones still reports the rate the
-                        vendor charged. An average of the lines' percentages would
-                        weight a Rs 100 line like a Rs 1,00,000 one. */}
-                    {(() => {
-                      const foot = detail.items.reduce((a: any, it: any) => {
-                        const g = gstValue(it) || 0;
-                        a.cgst += Number(it.cgst) || 0;
-                        a.sgst += Number(it.sgst) || 0;
-                        if (g > 0) {
-                          a.taxed_bill_value += (Number(it.subtotal) || 0) - (Number(it.discount) || 0);
-                          a.taxed_lines += 1;
-                        }
-                        return a;
-                      }, { cgst: 0, sgst: 0, taxed_bill_value: 0, taxed_lines: 0, count: detail.items.length });
-                      return (<>
-                        <td className="py-1.5 px-2 text-right font-mono border-l border-[#E8D5C4]">
-                          {gstValue(foot) == null ? '—' : q2(gstValue(foot))}
-                        </td>
-                        <td className="py-1.5 px-2 text-right font-mono">{fmtTaxPercent(taxAppliedPercent(foot))}</td>
-                      </>);
-                    })()}
                     <td colSpan={3}></td>
                   </tr>
                 </tfoot>
@@ -2829,76 +2630,6 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
   };
 
   /**
-   * DOES THIS LINE ACTUALLY CARRY TAX, as the line stands right now?
-   * Three ways it can, and the third is the one that is easy to forget:
-   *   · a resolved GST rate above 0 (seeded from the master, the bill, or picked)
-   *   · a compensation cess rate above 0 — CESS COUNTS ON ITS OWN, because a
-   *     line with 12% cess and no GST at all is a real bill (cess is item-
-   *     specific), and reading "no tax" off it would be wrong by real money
-   *   · the MANUAL path: no rate, but hand-typed CGST/SGST rupees. That line is
-   *     taxed. Missing this would render the tick OFF on a bill the clerk had
-   *     just typed the tax onto.
-   * Store-mapped (TGBCL) lines are never this form's to tax, so they answer no
-   * and the tick is not offered on them at all.
-   */
-  const lineBearsTax = (l: GrnLine): boolean => {
-    if (storeMappedLine(l.material_id)) return false;
-    const eff = resolveGst(l);
-    if (eff !== '' && Number(eff) > 0) return true;
-    if (n0(l.cess_rate) > 0) return true;
-    if (eff === '' && (n0(l.cgst) > 0 || n0(l.sgst) > 0)) return true;
-    return false;
-  };
-
-  /**
-   * IS THE TICK SHOWN AS ON? A DECISION WINS OVER THE LINE'S STATE; with no
-   * decision the tick simply mirrors what the line is carrying, so a seeded 18%
-   * reads as ticked without anyone having claimed to decide it.
-   */
-  const taxTicked = (l: GrnLine): boolean =>
-    l.tax_applicable === 'no' ? false
-      : l.tax_applicable === 'yes' ? true
-      : lineBearsTax(l);
-
-  /**
-   * THE TICK ITSELF. Both directions write a DECISION, so from here on the line
-   * posts tax_applicable and the row records which of the two zeroes it is.
-   *
-   * OFF — and this is the half that has to be thorough, because a half-cleared
-   * line would show "No tax" while still posting money:
-   *   · gst_rate '0', not '' and not removed. An EXPLICIT zero is the whole
-   *     point: POST /api/grn reads an ABSENT gst_rate as "keep the hand-typed ₹"
-   *     and stores tax_decision '', which is the "nobody looked" row we are
-   *     trying to stop writing. '0' is a decision; absent is an absence.
-   *   · cess_rate '0' for the same reason, in the same breath. The tick says
-   *     GST + cess, so it has to mean it.
-   *   · the hand-typed CGST/SGST boxes are CLEARED. The server already ignores
-   *     them once a rate is present, but leaving rupees sitting in the boxes
-   *     would show a tax on screen that the stored row does not have.
-   * ON — re-seeds both rates from the material master, which is exactly the
-   * owner's "tax % configured to an item should automatically pick up". If the
-   * master has no rate the line will carry none, so the charges panel is opened
-   * for the receiver to pick one; submit() refuses the line until they do.
-   */
-  const setTaxApplicable = (i: number, on: boolean) => {
-    const cur = items[i];
-    if (!cur) return;
-    if (on) {
-      const next: GrnLine = {
-        ...cur, tax_applicable: 'yes',
-        gst_rate: seedGstForMaterial(cur.material_id),
-        cess_rate: seedCessForMaterial(cur.material_id),
-      };
-      updateLine(i, { tax_applicable: next.tax_applicable, gst_rate: next.gst_rate, cess_rate: next.cess_rate });
-      // Nothing to tax with: show the receiver where the rate is set rather than
-      // letting them discover it at submit.
-      if (!lineBearsTax(next)) setOpenCharges(p => new Set(p).add(i));
-    } else {
-      updateLine(i, { tax_applicable: 'no', gst_rate: '0', cess_rate: '0', cgst: '', sgst: '' });
-    }
-  };
-
-  /**
    * Is this quantity/price box on the CASE basis? The LABEL mirror of the guard
    * inside normaliseCaseEntry() on the server: it expands ONLY when the mode is
    * 'case' AND case_size > 1. A mode left on 'case' after switching to a
@@ -3264,15 +2995,6 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
       material_id: id,
       gst_rate:  keep     ? cur.gst_rate  : seedGstForMaterial(id),
       cess_rate: keepCess ? cur.cess_rate : seedCessForMaterial(id),
-      /* THE DECISION DOES NOT FOLLOW THE MATERIAL. "This line is not taxable"
-       * was said about the item that WAS on the line; carrying it onto a
-       * different item would record a decision about goods nobody looked at —
-       * the precise failure this field exists to prevent, inverted. Swapping the
-       * material returns the line to undecided, and the receiver ticks again if
-       * they mean it. Unlike the two rates above there is no "still machine-set"
-       * test to make: a decision is never machine-set, so there is nothing to
-       * preserve and everything to re-ask. */
-      tax_applicable: '' as const,
     });
   };
 
@@ -3597,38 +3319,6 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
       );
       return;
     }
-    /* A LINE TICKED "TAX APPLICABLE" THAT CARRIES NO TAX IS AN UNFINISHED
-     * SENTENCE, and it is the one state the tick can reach that the row could
-     * not record honestly: the receipt would claim somebody declared the line
-     * taxable while charging nothing, which reads back as exempt. It only ever
-     * fires when the receiver actively ticked a line whose material has no
-     * configured rate (925 of 952 materials today) and then did not pick one —
-     * so it costs an untouched receipt nothing. Named per line, with the two
-     * ways out, because "pick a rate" and "untick it" are both correct answers
-     * and only the receiver knows which. */
-    const taxedButRateless = items
-      .map((l, idx) => ({ l, idx }))
-      .filter(({ l }) => {
-        if (!l.material_id || l.tax_applicable !== 'yes' || lineBearsTax(l)) return false;
-        // ONLY LINES THAT WILL ACTUALLY POST. `cleaned` above drops a line with
-        // no quantity, so a half-filled row the receiver ticked and then
-        // abandoned must not block a bill it is not even part of — the same
-        // reason the zero-cost gate below tests the accepted quantity first.
-        return !Number.isNaN(parseFloat(l.quantity_received)) && parseFloat(l.quantity_received) !== 0;
-      });
-    if (taxedButRateless.length > 0) {
-      const names = taxedButRateless.map(({ l, idx }) => {
-        const mat = materials.find((m: any) => String(m.id) === String(l.material_id)) as any;
-        return `• line ${idx + 1}: ${mat?.name || 'item'}`;
-      });
-      alert(
-        `These lines are marked "Tax applicable" but carry no GST% and no cess%:\n\n${names.join('\n')}\n\n`
-        + `Set the rate in the line's charges panel (or on the bill-level GST% above), `
-        + `or untick "Tax applicable" to record the line as not taxable.\n\n`
-        + `Saying a line is taxed and charging nothing on it would be recorded as a decision, and read back as one.`,
-      );
-      return;
-    }
     // A discount that swallows the whole goods value zeroes every line's cost
     // basis. Carried over from "Enter Full Bill", which named this rather than
     // letting the lines fall out of the filter as "no items entered".
@@ -3787,15 +3477,6 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
             // the sole author of that rupee and no payload can write money this
             // line's goods value cannot justify. undefined → no cess on the line.
             cess_rate:           i.cess_rate === '' ? undefined : Number(i.cess_rate),
-            /* THE RECEIVER'S DECISION — sent ONLY when they actually made one.
-             * An untouched line ('') sends nothing, so the payload is byte-
-             * identical to the one this form has always posted and the row
-             * records tax_decision '' — "nobody looked", which is the truth.
-             * Unticked sends FALSE alongside the explicit gst_rate 0 / cess_rate
-             * 0 above: the zeroes are what the line is taxed at, this is what
-             * says the zeroes were chosen. The server trusts neither on its own —
-             * it forces the rates to 0 off this field. */
-            tax_applicable:      i.tax_applicable === '' ? undefined : i.tax_applicable === 'yes',
             // GRN Inward per-line charges (₹). Blank → 0 on the server.
             // cgst/sgst come from lineTax so what was on screen is what is sent —
             // on a rated line these are DERIVED, never the stale box contents.
@@ -5181,53 +4862,7 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
                           {/* The charges panel is collapsed by default, so a rate
                               seeded from the master would otherwise change the row
                               total with nothing on screen explaining it. */}
-<<<<<<< WIP-MIXED production side — these lines came from: 9b927e2 Every vendor bill is a GRN now — one entry point, one number,  (1)
                           {resolveGst(it) !== '' && !storeMappedLine(it.material_id) && (
-======= WIP side
-                          {/* ── "TAX APPLICABLE" — ONE TAP, AND ITS STATE READS
-                              DOWN A COLUMN OF TWENTY LINES AT A GLANCE.
-                              It sits BEFORE the rate badges because it governs
-                              them: unticked, there are no rates to show.
-                              THREE VISUAL STATES, because there are three facts:
-                                ✓ solid emerald  — this line is taxed
-                                ▫ solid slate    — DECLARED exempt, somebody said so
-                                ▫ dashed grey    — no rate set and nobody has said
-                                                   either way (the default on 925
-                                                   of 952 materials, which post
-                                                   exactly what they always did)
-                              The label says GST + cess in the tooltip AND in the
-                              chip when it is off, so nobody has to guess whether
-                              "tax" included the compensation cess. */}
-                          {!storeMappedLine(it.material_id) && (() => {
-                            const on = taxTicked(it);
-                            const decided = it.tax_applicable !== '';
-                            return (
-                              <button type="button" role="switch" aria-checked={on}
-                                      aria-label="Tax applicable (GST and compensation cess)"
-                                      onClick={() => setTaxApplicable(i, !on)}
-                                      title={on
-                                        ? 'TAX APPLICABLE — this line carries GST and/or compensation cess at the rates shown. Click to mark it not taxable: the rates become an explicit 0 and the bill records that somebody decided it, not that nobody looked.'
-                                        : decided
-                                          ? 'NOT TAXABLE — declared. This line posts GST 0% and cess 0% and the receipt records the decision. Click to tax it again at the material master rates.'
-                                          : 'NO RATE SET, and nothing declared either way — this line posts exactly what it always has. Click to apply the material master rates (GST % / Cess % on the item), or set a rate in the charges panel.'}
-                                      className={`px-1.5 py-0.5 rounded border text-[10px] font-semibold flex items-center gap-1 ${
-                                        on ? 'border-emerald-300 bg-emerald-50 text-emerald-800'
-                                           : decided ? 'border-slate-300 bg-slate-100 text-slate-700'
-                                           : 'border-dashed border-[#D9C6B0] bg-white text-[#8B7355]'}`}>
-                                <span className={`w-2.5 h-2.5 rounded-[2px] border flex items-center justify-center leading-none text-[8px] ${
-                                  on ? 'border-emerald-600 bg-emerald-600 text-white'
-                                     : decided ? 'border-slate-400 bg-white' : 'border-dashed border-[#C9B69F] bg-white'}`}>
-                                  {on ? '✓' : ''}
-                                </span>
-                                {on ? 'Tax' : decided ? 'No tax (GST + cess)' : 'Tax?'}
-                              </button>
-                            );
-                          })()}
-                          {/* The rate badges answer to the tick: an unticked line
-                              has no rate to advertise, and showing "GST 0%" beside
-                              "No tax" would be two ways of saying one thing. */}
-                          {taxTicked(it) && resolveGst(it) !== '' && !storeMappedLine(it.material_id) && (
->>>>>>> WIP-MIXED
                             <span className="px-1.5 py-0.5 rounded border border-emerald-200 bg-emerald-50 text-emerald-800 text-[10px] font-semibold"
                                   title={it.gst_rate === BILL_GST
                                     ? 'GST% inherited from the bill-level rate above. Override it in the charges panel for a line the vendor billed differently.'
@@ -5291,20 +4926,6 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
                                         0%
                                         <span className="block text-[9px] text-[#8B7355]">store item — taxed on the TGBCL bill</span>
                                       </div>
-                                    ) : it.tax_applicable === 'no' ? (
-                                      // DECLARED NOT TAXABLE. The rate control is
-                                      // replaced rather than disabled-and-left, for
-                                      // the same reason the store-mapped branch
-                                      // above replaces it: a dropdown sitting on 0%
-                                      // invites someone to "fix" it to 18 and quietly
-                                      // undo a recorded decision from the one place
-                                      // that does not record the change. The tick is
-                                      // the only way in or out, so there is exactly
-                                      // one way to say this.
-                                      <div className="text-[10px] text-slate-700 leading-tight normal-case px-1.5 py-1">
-                                        0%
-                                        <span className="block text-[9px] text-[#8B7355]">not taxable — declared; re-tick “Tax” to rate it</span>
-                                      </div>
                                     ) : (
                                       <select value={it.gst_rate}
                                               onChange={e => {
@@ -5352,16 +4973,6 @@ function AdHocGrnModal({ onClose, onCreated }: { onClose: () => void; onCreated:
                                         <div className="text-[10px] text-blue-700 leading-tight normal-case px-1.5 py-1">
                                           0%
                                           <span className="block text-[9px] text-[#8B7355]">store item — cess rides on the TGBCL bill</span>
-                                        </div>
-                                      ) : it.tax_applicable === 'no' ? (
-                                        // The cess half of the same declaration —
-                                        // and the half that would otherwise be
-                                        // silent, since this panel is collapsed by
-                                        // default. The tick says "GST + cess", so
-                                        // the cess control has to say it too.
-                                        <div className="text-[10px] text-slate-700 leading-tight normal-case px-1.5 py-1">
-                                          0%
-                                          <span className="block text-[9px] text-[#8B7355]">not taxable — declared</span>
                                         </div>
                                       ) : (
                                         // A FREE number box, not a <select>: compensation cess

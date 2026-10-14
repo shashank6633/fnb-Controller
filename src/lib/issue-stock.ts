@@ -281,15 +281,6 @@ export function applyIssueDelta(db: any, input: IssueDeltaInput): IssueDeltaResu
   `).get(input.reqItemId) as any;
   if (!line) return { applied: false, skipped: 'missing_line' };
 
-<<<<<<< WIP-MIXED production side — these lines came from: 44431ea Department-based inventory: central issues to a department, re (3); 84e59a0 Close the four traceability breaks; add the issue log and a re (1)
-  // Party requisitions already deduct at fulfilment, from three separate
-  // implementations that all dedup on inventory_transactions.type =
-  // 'party_consumption'. A row typed 'requisition_issue' walks straight past
-  // those guards, so the only safe move is to leave the party rail's STOCK
-  // alone — central AND department. The hand-over itself is still a real
-  // hand-over and belongs in the owner's log, so it is recorded with
-  // skip_reason 'party'.
-======= WIP side
   // Party requisitions already deduct at fulfilment, on the party rail, whose
   // guards dedup on inventory_transactions.type IN ('party_issue',
   // 'party_consumption') — the current name and the legacy one (renamed
@@ -298,7 +289,6 @@ export function applyIssueDelta(db: any, input: IssueDeltaInput): IssueDeltaResu
   // called, so the only safe move is to leave the party rail's STOCK alone —
   // central AND department. The hand-over itself is still a real hand-over and
   // belongs in the owner's log, so it is recorded with skip_reason 'party'.
->>>>>>> WIP-MIXED
   const isParty = String(line.purpose || '') === 'party';
 
   // LIQUOR CARVE-OUT. Store-mapped materials live on the TGBCL store ledger

@@ -107,17 +107,9 @@ export async function POST(req: Request) {
     const insertPurchase = db.prepare(`
       INSERT INTO purchases (
         id, material_id, vendor, brand, quantity, unit_price, total_price, date, notes, outlet_id,
-        discount, cgst, sgst, special_excise_cess, tcs, delivery_charges, mrp_round_off, created_at
+        discount, cgst, sgst, special_excise_cess, tcs, delivery_charges, mrp_round_off, bill_no, created_at
       )
-<<<<<<< WIP-MIXED production side — these lines came from: 17e008d GST/Cess from the material master, Total Inward always shown,  (1)
-      VALUES (?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-    `);
-    const insertTx = db.prepare(`
-      INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, outlet_id, created_at)
-      VALUES (?, ?, 'purchase', ?, ?, ?, ?, datetime('now'))
-======= WIP side
       VALUES (?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
->>>>>>> WIP-MIXED
     `);
     // The raw INSERT that stood here is now postCentralTxn at the call site, so
     // an imported inward line records the supplier it came from and the sheet's

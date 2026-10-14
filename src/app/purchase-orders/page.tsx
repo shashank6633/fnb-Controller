@@ -933,64 +933,6 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
      were never charged any. Here '' means simply "no cess on this line", never
      "follow the bill". */
   const [lineCess, setLineCess] = useState<Record<string, string>>({});
-  /* "TAX APPLICABLE", per line — the receiver's DECISION, which is a different
-     fact from the two rates above and is recorded in its own column
-     (goods_receipt_note_items.tax_decision; see db.ts).
-       absent  UNDECIDED. Nobody touched the tick, the payload sends no
-               tax_applicable, and the row records '' — "nobody looked", which is
-               the truth and is what every receive this screen has ever posted
-               already recorded. THE DEFAULT, deliberately: 925 of 952 materials
-               carry no configured tax %, so an untouched line is the common
-               case and must keep posting exactly what it posted before.
-       'yes'   DECLARED TAXABLE.
-       'no'    DECLARED EXEMPT — posts an explicit gst_rate 0 AND cess_rate 0
-               (a recorded decision, never an omitted field) plus
-               tax_applicable:false so the row can tell the two zeroes apart.
-     ⚠ NOT the same thing as the tick's VISUAL state: a line with a seeded 18%
-     shows ticked while still absent here — it is taxed because the master says
-     so, not because anyone decided. taxTicked() renders; this records.
-     Keyed by po_item_id like lineGst/lineCess, and cleared with them on a vendor
-     switch for the same reason: the next bill is a different bill. */
-  const [lineTaxDecision, setLineTaxDecision] = useState<Record<string, 'yes' | 'no'>>({});
-  /** IS THE TICK SHOWN AS ON? A decision wins; with none the tick simply mirrors
-   *  what the line is carrying, so a seeded 18% reads as ticked without anyone
-   *  having claimed to decide it. `t` is the line's own row from billCalc, so
-   *  the tick and the rupees beside it can never disagree. */
-  const taxTickedFor = (it: any, t?: { rate: number; cess_rate: number } | null): boolean => {
-    const d = lineTaxDecision[it.id];
-    if (d) return d === 'yes';
-    return (t?.rate || 0) > 0 || (t?.cess_rate || 0) > 0;
-  };
-  /**
-   * THE TICK. Both directions record a DECISION, so from here on the line posts
-   * tax_applicable and the GRN row can say which of the two zeroes it holds.
-   *   ON  — re-seeds both rates from the material master, which IS the owner's
-   *         "tax % configured to an item should automatically pick up". A master
-   *         with no usable rate leaves the line on "follow the bill" (its
-   *         pre-existing default), exactly as the initial seed does.
-   *   OFF — writes EXPLICIT '0' into both boxes, not '' and not a deletion. ''
-   *         on this screen means "follow the bill" for GST, so clearing it would
-   *         re-inherit the bill's rate and tax a line somebody just declared
-   *         exempt; and an absent rate on the wire records the "nobody looked"
-   *         row we are trying to stop writing. '0' is a decision.
-   * The GST_RATES membership test is the initial seed's, verbatim and for its
-   * reason: a rate matching no <option> renders the select blank while the
-   * compute books it, so the receiver would read 0% and sign a 28% bill.
-   */
-  const setTaxApplicableFor = (it: any, on: boolean) => {
-    if (on) {
-      setLineTaxDecision(m => ({ ...m, [it.id]: 'yes' }));
-      const tp = Number(it.material_tax_percent) || 0;
-      const s = String(tp);
-      setLineGst(m => ({ ...m, [it.id]: (tp > 0 && (GST_RATES as readonly string[]).includes(s)) ? s : '' }));
-      const c = Number(it.material_cess_percent);
-      setLineCess(m => ({ ...m, [it.id]: (Number.isFinite(c) && c > 0 && c <= 100) ? String(c) : '' }));
-    } else {
-      setLineTaxDecision(m => ({ ...m, [it.id]: 'no' }));
-      setLineGst(m => ({ ...m, [it.id]: '0' }));
-      setLineCess(m => ({ ...m, [it.id]: '0' }));
-    }
-  };
   /* po_item_id → why that line cannot come in through Central (the server's own
      centralFlowBlock message, from GET …/receive). These are TGBCL/liquor lines:
      they are taxed on the store's bill through excise / cess / TCS, never GST,
@@ -1203,13 +1145,6 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
       cseed[it.id] = String(c);
     }
     setLineCess(cseed);
-    /* …and CLEAR every "Tax applicable" decision. Like the two seed maps above
-       this REPLACES wholesale rather than merging, and it must: a decision was
-       made about the line on the PREVIOUS vendor's bill, and carrying it onto
-       this one would record somebody declaring goods they never saw exempt —
-       the exact failure the column exists to prevent, inverted. Seeds are
-       machine-set and can be re-derived; a decision cannot, so it is re-asked. */
-    setLineTaxDecision({});
     const list: VendorStake[] = Array.isArray(recv?.vendors) ? recv.vendors : [];
     setStakes(list);
     // Auto-select the vendor still owing goods when there is only one — that is
@@ -1387,13 +1322,6 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
     }>();
     for (const l of allocation.lines) {
       const zeroRated = storeZeroRated.has(l.id);
-      /* THE RECEIVER'S DECISION, read once and applied to BOTH levies below.
-         'no' zero-rates the line here on exactly the same footing as the TGBCL
-         lock beside it — the screen, the payload and the stored row then agree
-         that this line bears nothing, instead of the screen showing 18% while
-         the server throws it away. */
-      const decision = lineTaxDecision[l.id];
-      const taxOff = decision === 'no';
       const raw = lineGst[l.id];
       const rate = zeroRated ? 0 : ((raw == null || raw === '') ? billRate : (parseFloat(raw) || 0));
       const taxable = r2(l.net_total);
@@ -1434,15 +1362,7 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
       // rate-basis: purchase — `l.gross` is the allocator's PURCHASE-unit qty ×
       // Rs/purchase-unit; `cessRate` is a PERCENT, not a per-unit rate, so it
       // carries no basis of its own and cannot disagree with that quantity.
-<<<<<<< WIP-MIXED production side — these lines came from: ff0f440 Req 71: PO Receive and GRN auto-pick Cess % from the Raw Mater (1)
       const cessRate = zeroRated ? 0 : (parseFloat(lineCess[l.id] ?? '') || 0);
-======= WIP side
-      // …and the cess half of the same decision. THIS IS THE ONE THAT WOULD
-      // OTHERWISE BE SILENT: the tick says "GST + cess", and a master cess% left
-      // running on a line the receiver marked not taxable is real money charged
-      // after somebody said not to charge it.
-      const cessRate = (zeroRated || taxOff) ? 0 : (parseFloat(lineCess[l.id] ?? '') || 0);
->>>>>>> WIP-MIXED
       const cessPaise = cessRate > 0 ? Math.max(0, Math.round(l.gross * cessRate)) : 0;
       const compensationCess = cessPaise / 100;
 
@@ -1458,9 +1378,6 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
         // both levies share it, which is the mistake this whole block guards.
         gross: l.gross,
         cess_rate: cessRate, compensation_cess: compensationCess,
-        // The DECISION behind the two rates, carried to the payload so the wire
-        // and the screen cannot disagree about what was decided. '' = undecided.
-        tax_decision: decision || '',
       });
     }
     const cgstTotal = r2([...byId.values()].reduce((s, t) => s + t.cgst, 0));
@@ -1640,27 +1557,6 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
           + 'record it at Purchasing → Goods Receipt (GRN), where "No vendor bill number" can be declared.');
       return;
     }
-    /* A LINE TICKED "TAX APPLICABLE" THAT CARRIES NO TAX IS AN UNFINISHED
-       SENTENCE — the one state the tick can reach that the row cannot record
-       honestly: the receipt would say somebody declared the line taxable while
-       charging nothing on it, and that reads back as exempt. It fires only when
-       the receiver actively ticked a line whose material has no configured rate
-       (925 of 952 materials today) and the bill-level rate is 0 too, so an
-       untouched receive never sees it. Both ways out are named, because "pick a
-       rate" and "untick it" are both right and only the receiver knows which. */
-    const taxedButRateless = activeDeviations.filter(d => {
-      if (lineTaxDecision[d.it.id] !== 'yes') return false;
-      const t = billCalc.tax.byId.get(d.it.id);
-      return (t?.rate || 0) <= 0 && (t?.cess_rate || 0) <= 0;
-    });
-    if (taxedButRateless.length > 0) {
-      alert('These lines are marked "Tax applicable" but carry no GST% and no cess%:\n\n'
-          + taxedButRateless.map(d => `• ${d.it.material_name}`).join('\n')
-          + '\n\nPick a rate on the line (or set the bill GST% above), '
-          + 'or untick "Tax applicable" to record the line as not taxable.\n\n'
-          + 'Saying a line is taxed and charging nothing on it would be recorded as a decision, and read back as one.');
-      return;
-    }
     // Same belt-and-braces as the reason gate — the route re-checks every one of
     // these; this is only so the receiver gets a readable message.
     if (chargeBlockers.length > 0) {
@@ -1684,13 +1580,6 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
          absent rate and an explicit 0 mean the same thing to the server, so on a
          bill with no GST and no cess this payload is byte-identical to the one
          this screen has always sent. */
-      /* …AND ANY LINE CARRYING A DECISION, rated or not. This is the one
-         addition to the filter and it is the whole feature: a DECLARED-EXEMPT
-         line is 0% on both levies, so the two clauses above would drop it from
-         the payload and the server would record the absence — "nobody looked" —
-         which is exactly the row the tick exists to stop writing. A line with no
-         decision and no rate is still left out, so a bill with no GST and no
-         cess and no ticks posts the byte-identical payload it always has. */
       const taxedOrDeviating = activeDeviations.filter(d => {
         const t = billCalc.tax.byId.get(d.it.id);
         return d.deviates || (t?.rate || 0) > 0 || (t?.cess_rate || 0) > 0;
@@ -1719,14 +1608,6 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
           // figure on the wire could only ever be a second opinion this row's
           // goods value cannot justify, so none is sent.
           cess_rate: t?.cess_rate ?? 0,
-          /* THE RECEIVER'S DECISION — sent ONLY when they made one. Undecided
-           * sends undefined, which JSON.stringify drops, so an untouched line's
-           * override is byte-identical to the one this screen has always sent
-           * and the GRN row records tax_decision ''. Unticked sends FALSE
-           * alongside the explicit 0 rates above: the zeroes are what the line
-           * is taxed at, this is what says the zeroes were chosen. The server
-           * trusts neither alone — it forces the rates to 0 off this field. */
-          tax_applicable: t?.tax_decision ? t.tax_decision === 'yes' : undefined,
         };
       });
       const r = await api(`/api/purchase-orders/${poId}/receive`, {
@@ -2444,59 +2325,6 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
                             </div>
                            ) : (
                             <div className="space-y-1">
-                              {/* ── "TAX APPLICABLE" — one tap, and its state
-                                  reads down the column at a glance. It sits
-                                  ABOVE the rate controls because it governs
-                                  them: unticked, there is nothing to rate.
-                                  THREE VISUAL STATES for three facts —
-                                    ✓ emerald — taxed at the rates below
-                                    ▫ slate   — DECLARED exempt, somebody said so
-                                    ▫ dashed  — no rate and nobody has said either
-                                                way (the default, and what this
-                                                screen has always posted)
-                                  Labelled GST + cess so nobody has to guess
-                                  whether "tax" covered the compensation cess. */}
-                              {(() => {
-                                const on = taxTickedFor(it, t);
-                                const decided = !!lineTaxDecision[it.id];
-                                return (
-                                  <button type="button" role="switch" aria-checked={on}
-                                          aria-label="Tax applicable (GST and compensation cess)"
-                                          onClick={() => setTaxApplicableFor(it, !on)}
-                                          title={on
-                                            ? 'TAX APPLICABLE — this line carries GST and/or compensation cess at the rates below. Click to mark it not taxable: both become an explicit 0 and the receipt records that somebody decided it, not that nobody looked.'
-                                            : decided
-                                              ? 'NOT TAXABLE — declared. This line posts GST 0% and cess 0% and the receipt records the decision. Click to tax it again at the material master rates.'
-                                              : 'NO RATE SET, and nothing declared either way — this line posts exactly what it always has. Click to apply the material master rates (GST % / Cess % on the item), or pick a rate below.'}
-                                          className={`w-full px-1 py-0.5 rounded border text-[10px] font-semibold flex items-center justify-center gap-1 ${
-                                            on ? 'border-emerald-300 bg-emerald-50 text-emerald-800'
-                                               : decided ? 'border-slate-300 bg-slate-100 text-slate-700'
-                                               : 'border-dashed border-[#D9C6B0] bg-white text-[#8B7355]'}`}>
-                                    <span className={`w-2.5 h-2.5 rounded-[2px] border flex items-center justify-center leading-none text-[8px] ${
-                                      on ? 'border-emerald-600 bg-emerald-600 text-white'
-                                         : decided ? 'border-slate-400 bg-white' : 'border-dashed border-[#C9B69F] bg-white'}`}>
-                                      {on ? '✓' : ''}
-                                    </span>
-                                    {on ? 'Tax' : decided ? 'No tax (GST + cess)' : 'Tax?'}
-                                  </button>
-                                );
-                              })()}
-                              {lineTaxDecision[it.id] === 'no' ? (
-                                /* DECLARED NOT TAXABLE. Both controls are
-                                   REPLACED rather than left sitting on 0, for the
-                                   same reason the store-mapped branch above
-                                   replaces them: a dropdown showing 0% invites
-                                   someone to "fix" it to 18 and quietly undo a
-                                   recorded decision from the one place that does
-                                   not record the change. The tick is the only way
-                                   in or out, so there is exactly one way to say
-                                   this. */
-                                <div className="text-[10px] text-slate-700 leading-tight text-right">
-                                  GST 0% · Cess 0%
-                                  <span className="block text-[9px] text-[#8B7355]">not taxable — declared on this receipt</span>
-                                </div>
-                              ) : (
-                               <>
                               <select value={lineGst[it.id] ?? ''}
                                       onChange={e => setLineGst(m => ({ ...m, [it.id]: e.target.value }))}
                                       title="Blank follows the bill's GST rate. Change it only for a line the vendor billed at a different rate."
@@ -2526,8 +2354,6 @@ function ReceiveModal({ poId, role, onClose, onReceived }: {
                                   cess {fmt(t.compensation_cess)}
                                   <span className="block font-sans">on gross {fmt(t.gross)}, pre-discount</span>
                                 </div>
-                              )}
-                               </>
                               )}
                             </div>
                            )}

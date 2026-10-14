@@ -761,17 +761,7 @@ const LINE_COLS = `
   gi.quantity_accepted, gi.quantity_rejected, gi.rejection_reason, gi.unit_price, gi.notes,
   gi.discount, gi.cgst, gi.sgst, gi.compensation_cess, gi.special_excise_cess, gi.tcs,
   gi.delivery_charges, gi.mrp_round_off, gi.gst_rate, gi.cess_rate, gi.cost_vendor, gi.cost_note,
-<<<<<<< WIP-MIXED production side — these lines came from: 9b927e2 Every vendor bill is a GRN now — one entry point, one number,  (1)
   gi.qc_applied_at, gi.brand
-======= WIP side
-  gi.qc_applied_at, gi.brand,
-  -- The receiver's tax decision ('' | 'taxable' | 'exempt'). Read, never
-  -- re-decided: an amendment corrects a quantity or a rate, not whether the
-  -- line bears tax. It is carried onto a cost row that books for the FIRST
-  -- time at amend time (the rescue INSERT below), so such a row lands the same
-  -- decision the originating route would have landed.
-  gi.tax_decision
->>>>>>> WIP-MIXED
 `;
 
 /**
@@ -1784,16 +1774,7 @@ export function amendGrnLines(
                tax.cgst, tax.sgst, tax.compensation_cess,
                Number(line.special_excise_cess) || 0,
                Number(line.tcs) || 0,
-<<<<<<< WIP-MIXED production side — these lines came from: 9b927e2 Every vendor bill is a GRN now — one entry point, one number,  (1)
                Number(line.mrp_round_off) || 0);
-======= WIP side
-               Number(line.mrp_round_off) || 0,
-               // The decision the RECEIVER made, off the stored line — the same
-               // value the originating route would have written here. Not
-               // re-derived and not defaulted to 'taxable': an amendment has no
-               // standing to declare a line taxable or exempt.
-               String((line as any).tax_decision || ''));
->>>>>>> WIP-MIXED
         // ── WHERE DOES A FIRST-TIME BOOKING'S STOCK GO? By TODAY's config,
         //    like any other booking event: this line never entered any ledger
         //    (accepted was 0), so there is no recorded rail to honour — the

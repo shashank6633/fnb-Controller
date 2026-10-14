@@ -176,7 +176,6 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
             : `Split payments total ₹${sum} but the bill is ₹${grand}`,
         }, { status: 400 });
       }
-<<<<<<< WIP-MIXED production side — these lines came from: 3450f62 Bills on Hold, and a mandatory field that could not be switche (38)
       // ── A HELD BILL MAY NEVER BE SETTLED FOR MORE THAN IT OWES ───────────
       // MEASURED on a booted server (lane-A money probe, round 3): a ₹252 held
       // bill carrying ₹40 already collected on its BOH record settled for ₹213
@@ -216,8 +215,6 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           boh_id: bohNet.bohId,
         }, { status: 400 });
       }
-======= WIP side
->>>>>>> WIP-MIXED
     } else {
       const method = String(b.payment_method || '').toLowerCase();
       if (!VALID_METHODS.includes(method)) {

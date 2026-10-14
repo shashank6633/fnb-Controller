@@ -79,7 +79,6 @@
  */
 import { getDb, generateId } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
-import { postCentralTxn } from '@/lib/movement-record';
 import { lineFactor } from '@/lib/issue-stock';
 // `purchasePrice` is the DISPLAY-basis lift Rs/recipe-unit -> Rs/purchase-unit.
 // Aliased because the loop below already owns a local named purchasePrice, and
@@ -471,8 +470,9 @@ export async function POST(request: Request) {
               notes: `Staff meal ${item.meal_id} — ${item.item_name} (${fmt(issuedQuantity)} ${lineUnit})`,
               // FIELD 8 — postDeptLedger REFUSES a blank actor, and the throw
               // fires AFTER the staff_meal_items INSERT, so omitting it would
-              // take every other line in this batch down with it. Same session
-              // actor the central branch below already passes.
+              // take every other line in this batch down with it. (The central
+              // branch below keeps production's raw inventory_transactions
+              // INSERT, which carries no actor column at all.)
               user: itemActor,
             });
           } else {
@@ -499,7 +499,6 @@ export async function POST(request: Request) {
               WHERE id = ?
             `).run(issuedQuantity, materialId);
 
-<<<<<<< WIP-MIXED production side — these lines came from: 44431ea Department-based inventory: central issues to a department, re (7)
             db.prepare(`
               INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, created_at)
               VALUES (?, ?, 'staff_meal_issue', ?, ?, ?, datetime('now'))
@@ -507,17 +506,6 @@ export async function POST(request: Request) {
               generateId(), materialId, -issuedQuantity, id,
               `Issued to staff meal ${item.meal_id}`
             );
-======= WIP side
-            postCentralTxn(db, {
-              materialId,
-              type: 'staff_meal_issue',
-              quantity: -issuedQuantity,
-              referenceId: id,
-              notes: `Issued to staff meal ${item.meal_id}`,
-              counterparty: { kind: 'staff_meal', name: `Staff meal ${item.meal_id}` },
-              actor: itemActor,
-            });
->>>>>>> WIP-MIXED
           }
         }
 
@@ -637,7 +625,6 @@ export async function PATCH(request: Request) {
               WHERE id = ?
             `).run(returnedQty, item.material_id);
 
-<<<<<<< WIP-MIXED production side — these lines came from: 44431ea Department-based inventory: central issues to a department, re (7)
             db.prepare(`
               INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, created_at)
               VALUES (?, ?, 'staff_meal_return', ?, ?, ?, datetime('now'))
@@ -645,17 +632,6 @@ export async function PATCH(request: Request) {
               generateId(), item.material_id, returnedQty, ret.id,
               `Returned from staff meal ${item.meal_id} (unused)`
             );
-======= WIP side
-            postCentralTxn(db, {
-              materialId: item.material_id,
-              type: 'staff_meal_return',
-              quantity: returnedQty,
-              referenceId: ret.id,
-              notes: `Returned from staff meal ${item.meal_id} (unused)`,
-              counterparty: { kind: 'staff_meal', name: `Staff meal ${item.meal_id}` },
-              actor: itemActor,
-            });
->>>>>>> WIP-MIXED
           }
         }
 
@@ -731,22 +707,10 @@ export async function DELETE(request: Request) {
           // CENTRAL branch — unchanged, including its line-unit bug (see POST).
           db.prepare('UPDATE raw_materials SET current_stock = current_stock + ? WHERE id = ?')
             .run(netRemoved, item.material_id);
-<<<<<<< WIP-MIXED production side — these lines came from: 44431ea Department-based inventory: central issues to a department, re (4)
           db.prepare(`
             INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, created_at)
             VALUES (?, ?, 'adjustment', ?, ?, ?, datetime('now'))
           `).run(generateId(), item.material_id, netRemoved, id, `Staff meal item deleted — restored`);
-======= WIP side
-          postCentralTxn(db, {
-            materialId: item.material_id,
-            type: 'adjustment',
-            quantity: netRemoved,
-            referenceId: id,
-            notes: `Staff meal item deleted — restored`,
-            counterparty: { kind: 'staff_meal', name: 'Staff meal (item deleted)' },
-            actor: itemActor,
-          });
->>>>>>> WIP-MIXED
         }
       }
       db.prepare('DELETE FROM staff_meal_items WHERE id = ?').run(id);

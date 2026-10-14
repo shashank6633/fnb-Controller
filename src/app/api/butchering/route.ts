@@ -1,7 +1,6 @@
 import { getDb, generateId } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
 import { deptOnHandBulk, deptKey } from '@/lib/dept-ledger';
-import { postCentralTxn } from '@/lib/movement-record';
 
 /**
  * Butchering — carcass breakdown into named cuts.
@@ -404,29 +403,11 @@ export async function PUT(request: Request) {
         //    because the guard above proved no department holds this carcass.
         db.prepare(`UPDATE raw_materials SET current_stock = COALESCE(current_stock, 0) - ? WHERE id = ?`)
           .run(fresh.gross_weight, fresh.source_material_id);
-<<<<<<< WIP-MIXED production side — these lines came from: b213e6d Rate-basis lock: resolve all 57 findings and promote it to a b (1)
         db.prepare(`
           INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, outlet_id)
           VALUES (?, ?, 'butchering_input', ?, ?, ?, ?)
         `).run(generateId(), fresh.source_material_id, -fresh.gross_weight, fresh.id,
                 `Carcass breakdown ${fresh.batch_id} @ ${srcRateLabel}`, fresh.outlet_id || null);
-======= WIP side
-        // MOVEMENT RECORD: a breakdown is a CONVERSION, not a loss — the carcass
-        // leaves central for the butchery and comes back as cuts (the credit
-        // below). Both legs face 'production' so the pair reads as one event on
-        // the movements register instead of a write-off plus a windfall.
-        postCentralTxn(db, {
-          materialId: fresh.source_material_id,
-          type: 'butchering_input',
-          quantity: -fresh.gross_weight,
-          referenceId: fresh.id,
-          notes: `Carcass breakdown ${fresh.batch_id} @ ${srcRateLabel}`,
-          outletId: fresh.outlet_id || null,
-          counterparty: { kind: 'production', name: `Butchering ${fresh.batch_id}` },
-          txnDate: fresh.date,
-          actor: me.email,
-        });
->>>>>>> WIP-MIXED
 
         // 2. Credit each cut
         for (const o of outs) {
@@ -443,25 +424,11 @@ export async function PUT(request: Request) {
           const unitCost = o.weight > 0 ? o.cost_allocated / o.weight : 0;
           const cutRateUnit = String(o.material_unit || '').trim();
           const cutRateLabel = `₹${unitCost.toFixed(2)}${cutRateUnit ? '/' + cutRateUnit : ''}`;
-<<<<<<< WIP-MIXED production side — these lines came from: b213e6d Rate-basis lock: resolve all 57 findings and promote it to a b (1)
           db.prepare(`
             INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, outlet_id)
             VALUES (?, ?, 'butchering_output', ?, ?, ?, ?)
           `).run(generateId(), o.material_id, o.weight, fresh.id,
                   `Cut from ${fresh.batch_id} (${o.yield_pct.toFixed(1)}% yield, ${cutRateLabel})`, fresh.outlet_id || null);
-======= WIP side
-          postCentralTxn(db, {
-            materialId: o.material_id,
-            type: 'butchering_output',
-            quantity: o.weight,
-            referenceId: fresh.id,
-            notes: `Cut from ${fresh.batch_id} (${o.yield_pct.toFixed(1)}% yield, ${cutRateLabel})`,
-            outletId: fresh.outlet_id || null,
-            counterparty: { kind: 'production', name: `Butchering ${fresh.batch_id}` },
-            txnDate: fresh.date,
-            actor: me.email,
-          });
->>>>>>> WIP-MIXED
         }
 
         // 3. Log waste rows against the source material

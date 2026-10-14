@@ -21,14 +21,8 @@
  *                                    overdue sweep + escalation, once per IST day
  *   - runBohReminders()            — Bill-on-Hold payment follow-ups, one per
  *                                    (BOH, expected date). Placed ABOVE
-<<<<<<< WIP-MIXED production side — these lines came from: 3450f62 Bills on Hold, and a mandatory field that could not be switche (2)
  *                                    refreshUpcomingParties so a Sheets failure
  *                                    can never starve the money chase.
-======= WIP side
- *                                    refreshUpcomingParties on purpose: that
- *                                    call is unguarded and starves everything
- *                                    after it when Google Sheets fails.
->>>>>>> WIP-MIXED
  *   - refreshUpcomingParties() + refreshPartyBookings()
  *   - checkDeferDueSoon()          — deferred requisition items coming due
  *   - sweepRecordingRetention()    — call recordings past the admin's window
@@ -195,7 +189,6 @@ export function startSchedulerOnce(): void {
       // nothing is due) and deliberately in the same place: ABOVE the
       // `refreshUpcomingParties` call below.
       //
-<<<<<<< WIP-MIXED production side — these lines came from: 3450f62 Bills on Hold, and a mandatory field that could not be switche (7)
       // WHY ABOVE IT. refreshUpcomingParties is a Google Sheets call; when it
       // fails (expired ADC, org policy, Sheets quota, network) the tick has
       // nothing useful left to do for the parties rail, and a reminder that
@@ -203,15 +196,6 @@ export function startSchedulerOnce(): void {
       // money has to be chased on the other days too. (The try/catch that now
       // wraps that call below came from commit 93962d2; this block sitting
       // above it is belt and braces, not a substitute for it.)
-======= WIP side
-      // WHY ABOVE IT, AND NOT BELOW. refreshUpcomingParties is the tick's
-      // UNGUARDED first statement — it is a Google Sheets call with no
-      // try/catch of its own, so when it throws (expired ADC, org policy,
-      // Sheets quota, network) control jumps to the outer catch and EVERY job
-      // after it is skipped for that tick. A reminder that fires only on days
-      // Sheets is reachable is not a reminder; the owner's money has to be
-      // chased on the other days too.
->>>>>>> WIP-MIXED
       //
       // SAFE ON EVERY TICK. runBohReminders' first statement is one indexed
       // COUNT over idx_boh_bills_due; it returns 'not_due' in microseconds on
@@ -439,7 +423,6 @@ export function startSchedulerOnce(): void {
       } catch (e) {
         console.error('[scheduler] price-hike alert flush failed:', e instanceof Error ? e.message : e);
       }
-
     } catch (e: any) {
       console.error('[scheduler] refresh failed:', e?.message);
       globalThis.__fnbScheduler__!.lastResult = { error: e?.message };

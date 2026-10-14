@@ -103,17 +103,9 @@ export interface PageEntry {
    */
   adminOnly?: boolean;
   /**
-<<<<<<< WIP-MIXED production side — these lines came from: 3450f62 Bills on Hold, and a mandatory field that could not be switche (2)
    * A COMPANION GRANT: an explicit page map that opens `impliedBy` also opens
    * THIS page, even when the map never names it.
-======= WIP side
-   * The path is REGISTERED but its page.tsx does not exist yet — a page whose
-   * build is split across phases and whose catalog row is claimed up front so
-   * the phase builds do not collide on this file. Normally a page is added here
-   * only once it is BUILT; this is the exception, and it is not free.
->>>>>>> WIP-MIXED
    *
-<<<<<<< WIP-MIXED production side — these lines came from: 3450f62 Bills on Hold, and a mandatory field that could not be switche (7)
    * ── WHY THIS EXISTS AT ALL, AND WHY IT IS NOT A BACK DOOR ──────────────────
    * It is for the case where some OTHER module has already made the real
    * capability decision from a DIFFERENT fact, and this file's map test would
@@ -121,14 +113,6 @@ export interface PageEntry {
    * API hands the user data for but the proxy bounces them off. That is not a
    * safety margin, it is the drift settle-authority.ts's header warns about,
    * read from the other end: two surfaces, two copies of one authority rule.
-======= WIP side
-   * What it does: keeps the entry out of the app's AUTOMATIC landing-page
-   * resolution (homePathFor / firstAllowedPath). Those two answer "the first
-   * catalog page in display order this user can open", and they drive the
-   * post-login redirect, the Captain APK start URL, Android-Back home and the
-   * proxy's forbidden bounce — so without this a user whose map happened to
-   * contain only an unbuilt path was REDIRECTED onto a 404 with no click.
->>>>>>> WIP-MIXED
    *
    * THREE PROPERTIES, all load-bearing:
    *   1. IT ONLY EVER FILLS IN. It runs AFTER the ordinary map test has already
@@ -149,6 +133,28 @@ export interface PageEntry {
    * see the '/boh' entry below.
    */
   impliedBy?: string;
+
+  /**
+   * The path is REGISTERED but its page.tsx does not exist yet — a page whose
+   * build is split across phases and whose catalog row is claimed up front so
+   * the phase builds do not collide on this file. Normally a page is added here
+   * only once it is BUILT; this is the exception, and it is not free.
+   *
+   * What it does: keeps the entry out of the app's AUTOMATIC landing-page
+   * resolution (homePathFor / firstAllowedPath). Those two answer "the first
+   * catalog page in display order this user can open", and they drive the
+   * post-login redirect, the Captain APK start URL, Android-Back home and the
+   * proxy's forbidden bounce — so without this a user whose map happened to
+   * contain only an unbuilt path was REDIRECTED onto a 404 with no click.
+   *
+   * What it does NOT do: it is not a gate. canAccessPage ignores it, the page
+   * still appears in the sidebar and in Settings → Page Access, and a granted
+   * user who clicks it still reaches a 404. That residue is the point of the
+   * flag being temporary.
+   *
+   * DELETE IT in the same commit that adds the page's page.tsx.
+   */
+  unbuilt?: boolean;
 
   /**
    * When true, only the NAMED GRE role (`roles.name`, matched by
@@ -1447,25 +1453,23 @@ export function canAccessPage(
  * The problem is that many catalog parents are ALSO the URL prefix of their
  * SIBLING catalog pages. /tasks is the Task Dashboard *and* the prefix of the
  * 14 other Task Management pages, so ticking the dashboard silently hands over
-<<<<<<< WIP-MIXED production side — these lines came from: 425f092 Page Access: impact preview before the prefix leak is closed ( (3)
- * the whole module. Across the catalog 8 parents carry 43 such grants:
- *   /tasks +14, /crm-calls +10, /inventory +7, /reports +6,
- *   /kitchen-production +3, /dine-in/kitchen +1, /vendors +1,
-======= WIP side
- * the whole module. Re-measured 2026-08-28 over the current catalog (160 paths,
- * counted by running this rule over PAGE_CATALOG): 10 parents carry 69 such
+ * the whole module. Re-measured 2026-10-14 over the current catalog (178 paths,
+ * counted by running this rule over PAGE_CATALOG): 14 parents carry 83 such
  * grants:
- *   /hr +18, /tasks +14, /inventory +12, /crm-calls +12, /reports +6,
- *   /kitchen-production +3, /dine-in/kitchen +1, /grn +1, /vendors +1,
->>>>>>> WIP-MIXED
+ *   /hr +18, /crm-calls +16, /tasks +14, /inventory +13, /reports +6,
+ *   /feedback +3, /kitchen-production +3, /boh +2, /grn +2,
+ *   /bill-submissions +2, /dine-in/kitchen +1, /grn/qc +1, /vendors +1,
  *   /settings/integrations +1
- * (The previous figures — 8 parents / 43 grants / /inventory +7 — predated the
- * HR module and the liquor-reconciliation pages. This count is RAW reach, i.e.
- * what the prefix rule alone hands over. THREE of /inventory's twelve children
- * are adminOnly — liquor-brand-map, liquor-withdrawals and central-cutover —
- * and the tier gate stops those first, so what a MANAGER actually gains from a
- * bare '/inventory' grant is +9, not +12. Every other parent in the list is
- * counted raw the same way.)
+ * (Earlier figures — 8 parents / 43 grants when this was written in 425f092,
+ * then 10 / 69 on 2026-08-28 — predate rows added since; re-run the rule rather
+ * than trusting a figure here. This count is RAW reach, i.e. what the prefix
+ * rule alone hands over. THREE of /inventory's thirteen children are adminOnly
+ * — liquor-brand-map, liquor-withdrawals and central-cutover — and the tier
+ * gate stops those first, so what a MANAGER actually gains from a bare
+ * '/inventory' grant is +10, not +13. Four of the thirteen are the gated
+ * liquor-reconciliation rows; without them /inventory is +9 and the total is
+ * 79 over 174 paths. Every other parent in the list is counted raw the same
+ * way.)
  * proxy.ts imports canAccessPage rather than duplicating it, so this is real
  * server-side reach, not just a sidebar that shows too much.
  *

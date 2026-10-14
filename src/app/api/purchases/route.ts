@@ -2,7 +2,6 @@ import { getDb, generateId, updateMaterialPrice } from '@/lib/db';
 import { readPoSnapshots, snapshotKey } from '@/lib/po-stock-snapshot';
 import { centralFlowBlock, isStoreMappedMaterial } from '@/lib/store-engine';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
-import { postCentralTxn, vendorParty } from '@/lib/movement-record';
 // THE PURCHASES ROLE GATE LIVES IN ONE MODULE — src/lib/purchases-access.ts —
 // shared with the two importer routes (/api/purchases/bulk and
 // /api/purchases/opening-stock) that write the same purchases rows. It used to
@@ -324,23 +323,7 @@ export async function POST(request: Request) {
     // still POST without it. A PRESENT but unusable value is rejected instead of
     // quietly zeroed: silently dropping the tax on a bill forfeits the input
     // credit, and nothing in the stored row would ever show that it went missing.
-<<<<<<< WIP-MIXED production side — these lines came from: 45cf9da Purchase log, closing-stock history, Full Bill vendor + per-it (1)
     const gstProvided = gst_rate !== undefined && gst_rate !== null && String(gst_rate).trim() !== '';
-======= WIP side
-    /* A RATE IS A NUMBER, OR THE NUMERIC STRING A FORM/JSON ROUND-TRIP MAKES OF
-     * ONE — never a boolean and never an array. "Something was sent" plus
-     * Number() turns `true` into a 1% GST and `[18]` into 18%, both stored with
-     * a success response. This route has no UI, so every caller is a script, and
-     * `tax_applicable` is a BOOLEAN on the same body: `gst_rate: true` meaning
-     * "yes, taxable" is the obvious slip. TYPE FIRST, THEN RANGE — and REFUSED
-     * rather than read as absent, because a silently dropped tax forfeits the
-     * input credit and the stored row would never show it went missing.
-     * `[]` still reads as absent (String([]) is ''), exactly as before.
-     * The same pair guards /api/grn and PO-receive, in the same words. */
-    const rateSent   = (v: any) => v !== undefined && v !== null && String(v).trim() !== '';
-    const rateScalar = (v: any) => typeof v === 'number' || typeof v === 'string';
-    const gstProvided = rateSent(gst_rate) && rateScalar(gst_rate);
->>>>>>> WIP-MIXED
     const gstRateRaw = gstProvided ? Number(gst_rate) : 0;
     if (gstProvided && (!Number.isFinite(gstRateRaw) || gstRateRaw < 0 || gstRateRaw > 100)) {
       return Response.json({
@@ -356,44 +339,7 @@ export async function POST(request: Request) {
     // reason. The rupees are ONLY EVER server-derived: unlike cgst/sgst there is
     // no legacy client posting a figure, so a `compensation_cess` in the body is
     // not read at all and cannot write money this row's goods value can't justify.
-<<<<<<< WIP-MIXED production side — these lines came from: 17e008d GST/Cess from the material master, Total Inward always shown,  (1)
     const cessProvided = cess_rate !== undefined && cess_rate !== null && String(cess_rate).trim() !== '';
-======= WIP side
-    /* ── "TAX APPLICABLE" — HONOURED **AND** RECORDED ────────────────────────
-     * The per-line tick the receiving screens carry. This route accepts it so
-     * the three inward paths enforce ONE contract:
-     *   false  → declared exempt; BOTH rates are forced to 0 below, whatever the
-     *            payload's gst_rate/cess_rate said, and the row records 'exempt'.
-     *   true   → declared taxable; the rates sent stand, the row records
-     *            'taxable'.
-     *   absent → nobody decided. Byte-identical to every payload this route has
-     *            ever accepted, right down to a stored tax_decision of ''.
-     *
-     * IT USED TO HONOUR THE DECISION AND THEN DROP IT. `purchases` has no rate
-     * column (only cgst/sgst RUPEES), so before purchases.tax_decision existed
-     * there was nowhere to say WHICH of the two zeroes a line was: two rows —
-     * one declared exempt, one nobody looked at — came back byte-identical in
-     * every money column, and the caller got a 201 with no signal that the one
-     * fact it asked to record had been discarded. A route that accepts a fact,
-     * acts on it, and silently forgets it is worse than one that refuses it.
-     * db.ts now declares the column on `purchases` as well, with the same three
-     * values, so this route records what it enforces. See the bind below.
-     *
-     * NOTE FOR A READER CHASING A BLANK: '' is the honest value on 2,165
-     * historical rows and on every bulk / opening-stock / CSV row. It means
-     * "nobody recorded a decision", never "taxable".
-     */
-    const taxApplicable: boolean | undefined = (() => {
-      const v = tax_applicable;
-      if (v === undefined || v === null || v === '') return undefined;
-      if (v === true || v === 'true' || v === 1 || v === '1') return true;
-      if (v === false || v === 'false' || v === 0 || v === '0') return false;
-      return undefined;   // unrecognised ⇒ no decision, never a silent yes
-    })();
-    const taxOff = taxApplicable === false;
-    // Same type-then-range rule as gst_rate above — see the note there.
-    const cessProvided = rateSent(cess_rate) && rateScalar(cess_rate);
->>>>>>> WIP-MIXED
     const cessRateRaw = cessProvided ? Number(cess_rate) : 0;
     if (cessProvided && (!Number.isFinite(cessRateRaw) || cessRateRaw < 0 || cessRateRaw > 100)) {
       return Response.json({
@@ -465,15 +411,7 @@ export async function POST(request: Request) {
     // above already rejects them outright today, so this is the second lock —
     // if that guard is ever relaxed for a category, a client that sent 18% must
     // still not write an input-credit figure the TGBCL charges already carry.
-<<<<<<< WIP-MIXED production side — these lines came from: 45cf9da Purchase log, closing-stock history, Full Bill vendor + per-it (1)
     const gstRate = isStoreMappedMaterial(db, material_id) ? 0 : gstRateRaw;
-======= WIP side
-    // `taxOff` is the caller's explicit "this line is not taxable" and sits
-    // beside the store lock for the same reason both exist: a rate that reaches
-    // the arithmetic after somebody declared the line exempt is tax the bill
-    // never carried.
-    const gstRate = (taxOff || isStoreMappedMaterial(db, material_id)) ? 0 : gstRateRaw;
->>>>>>> WIP-MIXED
     // Same lock, same reason, and it matters MORE here: the TGBCL bill already
     // carries its own special cess, so a master cess% seeded onto a liquor line
     // would charge the venue the cess twice over — once in the store's excise
@@ -517,7 +455,6 @@ export async function POST(request: Request) {
     const cgstAmt = cgstPaise / 100;
     const sgstAmt = sgstPaise / 100;
 
-<<<<<<< WIP-MIXED production side — these lines came from: 17e008d GST/Cess from the material master, Total Inward always shown,  (8)
     // Compensation cess rides the SAME post-discount `taxable`, in the same
     // whole paise — and there the similarity ends. It is ONE figure, never
     // halved into a CGST/SGST pair, and it is deliberately kept OUT of
@@ -526,40 +463,6 @@ export async function POST(request: Request) {
     // GST claimed on a return. Readers pick cess up as its own Total Inward
     // term, exactly like the other recorded-only charges.
     const cessPaise = cessRate > 0 ? Math.max(0, Math.round(taxable * cessRate)) : 0;
-======= WIP side
-    /* ── COMPENSATION CESS IS ON THE GROSS, NOT ON `taxable` ─────────────────
-     * THE OWNER'S RULING (2026-08-07), and the ONE line where this arithmetic
-     * deliberately diverges from the GST directly above it:
-     *   GST  → the POST-discount goods value  (`taxable`)
-     *   CESS → the GROSS line value, BEFORE the discount (`total_price`)
-     * On 10 kg @ ₹100 with a ₹100 discount that is GST 18% on ₹900 = ₹162 and
-     * cess 12% on ₹1,000 = ₹120. Do not "align" the two bases.
-     *
-     * THIS ROUTE WAS THE ONE THAT DID NOT FOLLOW IT. It charged the cess on
-     * `taxable` and so under-declared by 10% on every discounted line — ₹108
-     * where the ruling, api/grn/route.ts and purchase-orders/[id]/receive all
-     * give ₹120. Verified identical on HEAD, so this was never a regression,
-     * just the third route left behind when the ruling landed on the other two.
-     * Nothing on today's data is restated: no caller of this route sends a
-     * cess_rate (it has no UI — the bill form moved to /grn), and 0 stored rows
-     * carry both a compensation cess and a discount.
-     *
-     * `total_price` is the GROSS here by construction: it is qty × unit_price,
-     * computed above, and `discountRecorded` is subtracted from it to make
-     * `taxable` rather than being inside it. On the other wire shape — where the
-     * caller already netted the discount into unit_price and sends no discount —
-     * total_price IS the only line value there is, and the two bases coincide;
-     * that is the honest answer, not an approximation, because a discount folded
-     * into a rate is no longer a discount this row can see.
-     *
-     * Everything else about the cess is unchanged: ONE figure, never halved into
-     * a CGST/SGST pair, and deliberately OUT of cgstAmt/sgstAmt — the house
-     * invariant tax_value = cgst + sgst is a statement about GST alone, and
-     * folding cess into it would overstate the GST claimed on a return. Readers
-     * pick cess up as its own Total Inward term, like the other recorded-only
-     * charges. Whole paise, floored at 0, same shape as taxPaise. */
-    const cessPaise = cessRate > 0 ? Math.max(0, Math.round(total_price * cessRate)) : 0;
->>>>>>> WIP-MIXED
     const compensationCess = cessPaise / 100;
 
     // The client's own cgst/sgst are never stored. This row is the input-credit
@@ -734,17 +637,7 @@ export async function POST(request: Request) {
               // was sent, so an older client or the CSV importer writes
               // precisely the row it wrote before this column existed.
               compensationCess,
-<<<<<<< WIP-MIXED production side — these lines came from: 08a41e2 Enter Full Bill refuses duplicate items exactly like a PO, via (1)
               Math.max(0, Number(delivery_charges) || 0));
-======= WIP side
-              Math.max(0, Number(delivery_charges) || 0),
-              // THE DECISION BEHIND THOSE FIGURES — the one fact the rupees
-              // cannot carry, because ₹0 exempt and ₹0 nobody-asked are the same
-              // rupees. Derived from the SAME `taxApplicable` that forced the
-              // rates to 0 above, so the stored decision and the stored money can
-              // never disagree. '' on every payload that sends no tax_applicable.
-              taxApplicable === undefined ? '' : (taxApplicable ? 'taxable' : 'exempt'));
->>>>>>> WIP-MIXED
 
       // Stock is kept in RECIPE units (sales deduction, closing-stock variance
       // × average_price). quantity is entered in PURCHASE units, so multiply by
@@ -785,32 +678,12 @@ export async function POST(request: Request) {
 
         // Create inventory transaction. reference_id points at the row this line
         // was written to, which is now always the row this request inserted.
-<<<<<<< WIP-MIXED production side — these lines came from: 82e23ba Direct Issue: vendor deliveries routed straight to a departmen (6)
         db.prepare(`
           INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, created_at, outlet_id)
           VALUES (?, ?, 'purchase', ?, ?, ?, datetime('now'), ?)
         `).run(generateId(), material_id, stockQty, recordedId,
                 `Purchase from ${vendor || 'unknown'}`,
                 outletId);
-======= WIP side
-        //
-        // MOVEMENT RECORD (owner's eight fields, 2026-09-10): same receipt,
-        // same sign, same reference — now also carrying the unit the quantity
-        // is in, the VENDOR it came from, the central store it landed in, the
-        // BILL's date (a backdated purchase used to be filed under "today")
-        // and the SESSION user. See src/lib/movement-record.ts.
-        postCentralTxn(db, {
-          materialId: material_id,
-          type: 'purchase',
-          quantity: stockQty,
-          referenceId: recordedId,
-          notes: `Purchase from ${vendor || 'unknown'}`,
-          outletId,
-          counterparty: vendorParty(vendor),
-          txnDate: date,
-          actor: me.email,
-        });
->>>>>>> WIP-MIXED
       }
 
       // Update material price and cascade

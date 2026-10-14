@@ -3312,7 +3312,6 @@ function ClosingSection({ storeId, storeName, stock, isAdmin, date, onDateChange
   onSaved: (msg: string) => void;
 }) {
   const [showHistory, setShowHistory] = useState(false);
-  const [date, setDate] = useState(today());
   const [counts, setCounts] = useState<ClosingCount[]>([]);
   const [systemAsof, setSystemAsof] = useState<Record<string, number>>({});
   /* TRUE on mount, not false. A fresh instance must never paint the count
