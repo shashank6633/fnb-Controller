@@ -1,12 +1,12 @@
 import { getDb } from '@/lib/db';
-import { getCurrentUser } from '@/lib/auth';
 import { getWithdrawalById, recordRecovery } from '@/lib/liquor-withdrawals';
+import { requireWithdrawalsAdmin } from '../_lib/guard';
 
 /**
  * PATCH /api/liquor/withdrawals/[id] — record a recovery against a withdrawal.
- * ADMIN-ONLY (same boundary as the register). Money only: this updates
- * recovered / recoverable / remarks and never touches the stock movement or the
- * generated `outstanding` column.
+ * ADMIN-ONLY and CSRF-checked (the same gate as the register, ../_lib/guard.ts).
+ * Money only: this updates recovered / recoverable / remarks and never touches
+ * the stock movement or the generated `outstanding` column.
  *
  * body: { recovered?, recoverable_custom?, remarks? }
  */
@@ -14,9 +14,11 @@ export const dynamic = 'force-dynamic';
 
 export async function PATCH(request: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
-    const user = await getCurrentUser();
-    if (!user) return Response.json({ error: 'Sign in required' }, { status: 401 });
-    if (user.role !== 'admin') return Response.json({ error: 'Admin only' }, { status: 403 });
+    // Auth + admin + CSRF, BEFORE the row is looked up: a forged request must not
+    // even learn whether an id exists.
+    const gate = await requireWithdrawalsAdmin(request);
+    if (!gate.ok) return gate.response;
+    const user = gate.user;
     const { id } = await params;
     const db = getDb();
 
@@ -44,11 +46,10 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ id
   }
 }
 
-export async function GET(_request: Request, { params }: { params: Promise<{ id: string }> }) {
+export async function GET(request: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
-    const user = await getCurrentUser();
-    if (!user) return Response.json({ error: 'Sign in required' }, { status: 401 });
-    if (user.role !== 'admin') return Response.json({ error: 'Admin only' }, { status: 403 });
+    const gate = await requireWithdrawalsAdmin(request);
+    if (!gate.ok) return gate.response;
     const { id } = await params;
     const db = getDb();
     const row = getWithdrawalById(db, id);

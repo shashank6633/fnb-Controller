@@ -1,6 +1,6 @@
 import type { Database } from 'better-sqlite3';
 import { generateId, logAuditEvent } from '@/lib/db';
-import { materialStoreId } from '@/lib/store-engine';
+import { materialStoreId, getStoreById, postLedger } from '@/lib/store-engine';
 import {
   LQ_REIMBURSEMENT_STATUS,
   landedCostPerBottleExplained,
@@ -9,7 +9,7 @@ import {
 import { CASH_CATEGORY } from '@/lib/cash-purchase';
 import { toPaise, toRupees, fmtRs, outflowWarning, MAX_PAISE } from '@/lib/petty-cash';
 import { todayIST } from '@/lib/format-date';
-import { postCentralTxn, vendorParty } from '@/lib/movement-record';
+import { vendorParty } from '@/lib/movement-record';
 
 /**
  * LIQUOR PURCHASE RECONCILIATION — phase L3, EMERGENCY WINE-SHOP PURCHASES.
@@ -18,34 +18,40 @@ import { postCentralTxn, vendorParty } from '@/lib/movement-record';
  * ── WHAT A WINE-SHOP BUY IS, AND WHY IT NEEDS ITS OWN WRITER ─────────────────
  * When the TGBCL depot runs dry mid-service, staff run to a local wine shop and
  * buy bottles at retail (MRP), well above the depot's landed cost. Those bottles
- * are a REAL purchase: the stock must move so the bar can pour them. The excess
+ * are a REAL receipt: the stock must move so the bar can pour them. The excess
  * over depot landed cost — "the price of running out" — plus who fronted the
  * money and whether they were paid back, are the facts §E of the Summary reports.
  *
- * ── THE ONE DESIGN DECISION THIS FILE TURNS ON (read before changing it) ─────
- * lq_retail_flags.purchase_id REFERENCES purchases(id) — the L0 schema anchors
- * the flag to a row in the CENTRAL `purchases` table, not to store_stock_ledger.
- * So a wine-shop buy writes ONE `purchases` row (the document + FK anchor) and
- * moves stock the way a central purchase does — raw_materials.current_stock +
- * ONE inventory_transactions('purchase') row — with THREE deliberate departures:
+ * ── WHERE THE STOCK GOES: WHERE LIQUOR LIVES ────────────────────────────────
+ * Liquor stock lives in its store's ledger (store_stock_ledger) — that is what
+ * Liquor Store on-hand, withdrawals and closing counts all read. So a wine-shop
+ * buy posts ONE store_stock_ledger row into the material's OWN store, and moves
+ * nothing central. The row is shaped so it can change NOTHING but the quantity:
  *
- *   1. NO updateMaterialPrice(). The retail price is an outlier we must never let
- *      into average_price / last_purchase_price / recipe cost. Plan decision 1(a)
- *      and rule 1 of the L0 header: liquor valuation stays whatever it was. This
- *      is also the proof the owner asked for — "average_price untouched".
- *   2. NOT through store_stock_ledger. L1's landedCostPerBottle() reads that
- *      ledger's txn_type='purchase' rows as TGBCL DEPOT indent lines to derive
- *      the depot landed cost. Writing a RETAIL buy there would poison the very
- *      figure this module measures the excess against. The emergency stock
- *      therefore lands in central current_stock (where this venue's liquor stock
- *      lives) and never in the depot ledger.
- *   3. It BYPASSES centralFlowBlock (which normally keeps store-mapped liquor out
- *      of central purchases). The wine-shop buy is the deliberate exception the
- *      L0 FK was written for; the block still guards /api/purchases itself.
+ *   · txn_type 'inward', NOT 'purchase'. Every depot reader keys on 'purchase':
+ *     L1's landedCostPerBottle (the figure the excess is measured against), the
+ *     GRN Inward register, the Rate Movement drift card, the per-invoice levy
+ *     checks. A retail buy in any of them would poison exactly the depot record
+ *     this module measures against.
+ *   · unit_cost 0. Every store valuation (storeStock, consolidatedStock, the
+ *     transfer cost map) averages ONLY inflow rows with unit_cost > 0, so the
+ *     bottles are valued at the store's EXISTING recorded basis — never at MRP.
+ *     The L0 rule says the same thing for landed cost: never written back to
+ *     store_stock_ledger.unit_cost.
  *
- * Net effect, and what the L3 proof verifies on a copy: ONE purchases row, ONE
- * stock movement (not double-counted), ONE lq_retail_flags side record, and
- * average_price + every other material's stock + the depot ledger all untouched.
+ * ── WHY THERE IS NO `purchases` ROW ANY MORE ───────────────────────────────
+ * The first version wrote a documentary central `purchases` row (is_emergency=1)
+ * and moved central current_stock. Measured on a copy: the retail MRP became
+ * closing-valuation's rung-#1 rate at once (₹4,299.99 → ₹4,500/BTL, +₹4,800 on
+ * 18,000 ml) and average_price on the next Recompute (5.7333 → 6.0 ₹/ml), and
+ * the bottles never reached the Liquor Store ledger. Every reader of `purchases`
+ * (updateMaterialPrice, materialRate/rateMap, the LPP boot backfill, cost
+ * spikes) consumes it with no exclusion, and the store-procure house rule is the
+ * same: "store purchases live ONLY in the store ledger. NO purchases row".
+ * Owner decision 1 — the retail price is ANALYTICS ONLY — is therefore met by
+ * construction: the retail ₹ is written in exactly one place, lq_retail_flags,
+ * which no rate, valuation or costing reader touches. closing-valuation.ts is
+ * not edited and needs no exclusion, because there is nothing to exclude.
  *
  * ── THE FOUR EXCESS FIGURES ARE FROZEN AT ENTRY ─────────────────────────────
  * depot landed cost moves with every later indent; re-pricing last quarter's
@@ -53,44 +59,15 @@ import { postCentralTxn, vendorParty } from '@/lib/movement-record';
  * three excess figures are computed once, here, and stored — exactly as the
  * schema comment on lq_retail_flags demands.
  *
- * The only tables this module writes are `purchases` (one documentary row, no
- * price cascade), inventory_transactions (the stock movement's audit leg),
- * raw_materials.current_stock (the movement itself), lq_retail_flags,
- * petty_cash_ledger (a reimbursement payout) and audit_events.
+ * The only tables this module writes are store_stock_ledger (ONE 'inward' row,
+ * unit_cost 0), lq_retail_flags, petty_cash_ledger (a reimbursement payout) and
+ * audit_events. It never writes `purchases`, inventory_transactions,
+ * raw_materials, or any price column.
  *
- * ── WHAT "average_price UNTOUCHED" DOES AND DOES NOT PROMISE ────────────────
- * AT WRITE TIME it is exact and verified: this file never calls
- * updateMaterialPrice(), so average_price, last_purchase_price, sub-recipe and
- * recipe costs are all byte-identical after a wine-shop buy.
- *
- * IT IS NOT A DURABLE GUARANTEE, and the earlier claim here that "VALUATION IS
- * NOT TOUCHED" overstated it. The documentary row this file must write (L0
- * anchors lq_retail_flags.purchase_id to purchases(id) NOT NULL) is a `purchases`
- * row, and two shared readers consume `purchases` with no exclusion:
- *
- *   · db.ts updateMaterialPrice() averages EVERY purchases row in the calendar
- *     month of MAX(date). /api/admin/recompute-prices and
- *     /api/admin/restore-prices (both buttons on /recipes) run it over the whole
- *     catalogue. MEASURED on a copy of the live DB: one 6-bottle emergency buy
- *     at ₹3,500 MRP moves KAHLUA average_price 3.3063 → 4.6667 ₹/ml (+41.2%,
- *     = 3500 ÷ 750) on the next such run, and cascades into sub-recipe cost.
- *   · closing-valuation.ts materialRate() takes rung #1 = "unit_price on the most
- *     recent purchases row". MEASURED: rate 2,479.74 → 3,500 ₹/BTL, and
- *     valueCount(6,630 ml) 21,920.92 → 30,940 (+₹9,019).
- *
- * THIS CANNOT BE CLOSED FROM INSIDE THIS FILE. There is no shape of the
- * documentary row that is both honest and invisible to those readers:
- * unit_price = 0 makes updateMaterialPrice store average_price = 0 (worse),
- * quantity = 0 destroys the document, and the FK forbids omitting the row. The
- * fix belongs to whoever owns the two readers — ONE predicate each, excluding
- * emergency retail rows on store-mapped materials from the price/valuation
- * basis, e.g. `AND COALESCE(is_emergency, 0) = 0` in updateMaterialPrice()'s
- * two SELECTs and in closing-valuation's `last` lookup. Until that lands, an
- * admin re-price run re-prices liquor from wine-shop MRP — which is exactly what
- * Owner Decision 1 (landed/retail cost is ANALYTICS ONLY) forbids. What this
- * file CAN do, and now does, is stop the row multiplying (duplicate guard) and
- * stop a future-dated row seizing MAX(date) for a whole month's basis (the
- * purchase-date window, enforced at the route).
+ * LEGACY ROWS: a flag written by the first version has purchase_id set and its
+ * stock in central current_stock; it stays readable (material and outlet are
+ * read off it, backfilled by db.ts from its purchase), and nothing new is ever
+ * written that way.
  */
 
 const r2 = (n: number) => Math.round((Number(n) || 0) * 100) / 100;
@@ -251,10 +228,15 @@ export interface RecordWineShopInput {
 }
 
 export interface WineShopRecordResult {
-  purchaseId: string;
+  /** Always null on a new buy — no central purchases row is written (see header). */
+  purchaseId: null;
   flagId: string;
-  inventoryTxnId: string;
-  /** Recipe units added to raw_materials.current_stock. */
+  /** The store_stock_ledger 'inward' row that moved the stock. */
+  ledgerId: string;
+  /** The store the bottles were booked into (the material's own store). */
+  storeId: string;
+  storeName: string;
+  /** Recipe units added to that store's ledger. */
   stockQty: number;
   depotLandedPerBottle: number;
   depotSource: DepotLandedResolved['source'];
@@ -268,7 +250,7 @@ export interface WineShopRecordResult {
 /**
  * Record ONE emergency wine-shop purchase. Everything below commits together or
  * not at all — a flag that outlived a rolled-back stock move would be a phantom
- * excess against a bar; a purchases row with no flag would be an untracked
+ * excess against a bar; a stock movement with no flag would be an untracked
  * retail buy. better-sqlite3 is synchronous, so the read-then-write inside the
  * transaction is indivisible within this process.
  */
@@ -278,7 +260,7 @@ export function recordWineShopPurchase(
   actorEmail: string,
 ): WineShopRecordResult {
   const mat = db.prepare(
-    'SELECT id, name, category, unit, purchase_unit, pack_size FROM raw_materials WHERE id = ?',
+    'SELECT id, name, category, unit, purchase_unit, pack_size, current_stock FROM raw_materials WHERE id = ?',
   ).get(input.materialId) as any;
   if (!mat) throw new RetailError('Material not found.', 404, 'material_not_found');
 
@@ -287,6 +269,31 @@ export function recordWineShopPurchase(
   // on the ordinary purchase flow.
   if (materialStoreId(db, mat) !== input.storeId) {
     throw new RetailError(`"${mat.name}" is not a material of this liquor store — an emergency wine-shop buy is for a store-mapped liquor item.`, 400, 'not_store_material');
+  }
+  const store = getStoreById(db, input.storeId);
+  if (!store) throw new RetailError('That liquor store no longer exists.', 404, 'store_not_found');
+  if (!store.is_active) {
+    throw new RetailError(`${store.name} is deactivated — reactivate it before booking stock into it.`, 409, 'store_inactive');
+  }
+
+  // NOT YET MIGRATED: an item whose stock still sits in CENTRAL (it predates the
+  // store) and has never had a store-ledger row. Booking the wine-shop bottles
+  // into the store now would give it "store history", and /api/stores/[id]/migrate
+  // skips any item with store history — stranding the central stock, reachable
+  // only by a hand Adjustment. Refuse, and name the one-step fix instead.
+  const centralQty = Number(mat.current_stock) || 0;
+  if (centralQty > 0) {
+    const hist = db.prepare(
+      'SELECT 1 FROM store_stock_ledger WHERE store_id = ? AND material_id = ? LIMIT 1',
+    ).get(input.storeId, input.materialId);
+    if (!hist) {
+      throw new RetailError(
+        `"${mat.name}" still holds ${centralQty} ${String(mat.unit || '').trim() || 'units'} in Central stock and has never been moved into ${store.name}. `
+        + `Recording this buy into ${store.name} now would strand that Central stock (Migrate skips any item that already has store history). `
+        + `Ask an admin to run Migrate on ${store.name} for this item first, then record the wine-shop buy. Nothing was saved.`,
+        409, 'not_migrated',
+      );
+    }
   }
 
   const bottles = Number(input.bottles);
@@ -314,7 +321,7 @@ export function recordWineShopPurchase(
   }
 
   // Purchase units → recipe units, the house pack convention (mirrors
-  // updateMaterialPrice / /api/purchases): current_stock is RECIPE units.
+  // /api/stores/[id]/procure): the store ledger quantity is RECIPE units.
   const packSize = Number(mat.pack_size) || 1;
   const ru = String(mat.unit || '').toLowerCase().trim();
   const pu = String(mat.purchase_unit || mat.unit || '').toLowerCase().trim();
@@ -357,13 +364,16 @@ export function recordWineShopPurchase(
    * NO RACE: there is no `await` between this read and the synchronous
    * better-sqlite3 transaction below, and the transaction is IMMEDIATE. Keep it
    * that way — an await added here reopens the window. */
+  // The flag carries its own material/outlet now; a LEGACY flag carries them on
+  // its parent purchases row — COALESCE reads either, so a retry of a buy first
+  // recorded under the old design is still caught.
   const dupe = db.prepare(`
-    SELECT p.id, p.quantity, p.unit_price, p.date, f.bill_ref
-      FROM purchases p
-      JOIN lq_retail_flags f ON f.purchase_id = p.id
-     WHERE p.material_id = ?
-       AND p.date = ?
-       AND COALESCE(p.outlet_id, '') = COALESCE(?, '')
+    SELECT f.id, f.bottles, f.rate_paid_per_bottle, f.date, f.bill_ref
+      FROM lq_retail_flags f
+      LEFT JOIN purchases p ON p.id = f.purchase_id
+     WHERE COALESCE(f.material_id, p.material_id) = ?
+       AND f.date = ?
+       AND COALESCE(f.outlet_id, p.outlet_id, '') = COALESCE(?, '')
        AND LOWER(TRIM(COALESCE(f.shop_name, ''))) = ?
        AND ${billRef
          ? "LOWER(TRIM(COALESCE(f.bill_ref, ''))) = ?"
@@ -379,7 +389,7 @@ export function recordWineShopPurchase(
     throw new RetailError(
       billRef
         ? `"${mat.name}" is already recorded on wine-shop bill ${billRef} from ${shopName || 'this shop'} dated ${input.date} `
-          + `— ${dupe.quantity} ${purchaseUnitLabel} at ${fmtRs(toPaise(Number(dupe.unit_price)))} each. `
+          + `— ${dupe.bottles} ${purchaseUnitLabel} at ${fmtRs(toPaise(Number(dupe.rate_paid_per_bottle)))} each. `
           + `Nothing was saved; if you are re-trying after a failed save, that buy is already in.`
         : `An identical wine-shop buy (${bottles} ${purchaseUnitLabel} × "${mat.name}" at ${fmtRs(toPaise(rate))} each from ${shopName || 'this shop'} on ${input.date}) `
           + `was recorded moments ago. Nothing was saved. If the bottles really were bought twice, enter the shop's bill number to record the second run.`,
@@ -387,63 +397,57 @@ export function recordWineShopPurchase(
     );
   }
 
-  const purchaseId = generateId();
   const flagId = generateId();
-  const inventoryTxnId = generateId();
+  let ledgerId = '';
+  const today = todayIST();
 
   const run = db.transaction(() => {
-    // 1. THE DOCUMENTARY purchases ROW. is_emergency=1 marks it; vendor is the
-    //    shop; unit_price is the retail ₹/bottle. NO invoice_id/GST/discount —
-    //    a wine-shop cash run has no PINV and no input credit. NO
-    //    updateMaterialPrice(): the retail rate must not touch average_price.
-    db.prepare(`
-      INSERT INTO purchases
-        (id, material_id, vendor, brand, quantity, unit_price, total_price, date, notes,
-         is_emergency, payment_mode, emergency_reason, bill_no, outlet_id, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, datetime('now'))
-    `).run(
-      purchaseId, input.materialId, shopName,
-      String(input.brand || '').slice(0, 200), bottles, rate, totalPaid, input.date,
-      String(input.notes || '').slice(0, 500),
-      String(input.paymentMode || '').slice(0, 60),
-      String(input.reason || '').slice(0, 500),
-      billRef, input.outletId,
-    );
-
-    // 2. THE STOCK MOVEMENT — central current_stock + its audit leg. This is the
-    //    ONLY place the stock moves; the store ledger is deliberately untouched
-    //    (see the header: it would poison L1's depot landed cost).
-    db.prepare(
-      "UPDATE raw_materials SET current_stock = current_stock + ?, updated_at = datetime('now') WHERE id = ?",
-    ).run(stockQty, input.materialId);
-    // MOVEMENT RECORD: an emergency wine-shop buy is still a VENDOR receipt —
-    // the shop is the source, central the destination — and the purchase's own
-    // date is the business date, not the day it was keyed in.
-    postCentralTxn(db, {
-      id: inventoryTxnId,        // pre-minted: the caller cross-references it
-      materialId: input.materialId,
-      type: 'purchase',
+    // 1. THE STOCK MOVEMENT — ONE row on the store's own ledger, where Liquor
+    //    Store on-hand, withdrawals and closing counts read it. 'inward' (not
+    //    'purchase', which every DEPOT reader keys on) and unit_cost 0 (so every
+    //    store valuation keeps its existing basis) — see the header. Nothing
+    //    central moves: no purchases row, no inventory_transactions, no
+    //    current_stock, no price column. postLedger is the only door stock uses.
+    ledgerId = postLedger(db, {
+      store_id: input.storeId,
+      material_id: input.materialId,
+      txn_type: 'inward',
       quantity: stockQty,
-      referenceId: purchaseId,
-      notes: `Emergency wine-shop purchase from ${input.shopName || 'wine shop'}`,
-      outletId: input.outletId,
-      counterparty: vendorParty(input.shopName || 'wine shop'),
-      txnDate: input.date,
-      actor: actorEmail,
+      unit_cost: 0,
+      supplier: shopName,
+      ref: billRef,
+      notes: `Emergency wine-shop buy${shopName ? ` from ${shopName}` : ''} — retail price is on the wine-shop register (lq_retail_flags ${flagId}), never a cost basis`.slice(0, 500),
+      created_by: actorEmail,
+      // MOVEMENT RECORD: still a VENDOR receipt — the shop is the source, the
+      // store the destination — on the buy's own business date.
+      counterparty: vendorParty(shopName || 'wine shop'),
+      txn_date: input.date,
     });
+    // BACKDATE, IST-exact. Every IST-day reader of this ledger (floor
+    // reconciliation, the §H denominator, depot spend) buckets on
+    // date(created_at, '+330 minutes'). A buy keyed in today for yesterday must
+    // land on yesterday: the instant is the buy's date at the current IST
+    // time-of-day, converted back to UTC, so its IST day is exactly input.date.
+    if (input.date !== today) {
+      db.prepare(`
+        UPDATE store_stock_ledger
+           SET created_at = datetime(? || ' ' || strftime('%H:%M:%S', 'now', '+330 minutes'), '-330 minutes')
+         WHERE id = ?
+      `).run(input.date, ledgerId);
+    }
 
-    // 3. THE SIDE RECORD — the flag. Never names the stock or the money twice;
-    //    it carries only what the purchase row has nowhere to put. The four
+    // 2. THE SIDE RECORD — the flag. The ONLY place the retail ₹ is written. It
+    //    names the stock movement (ledger_id) rather than repeating it. The four
     //    excess figures are frozen above.
     db.prepare(`
       INSERT INTO lq_retail_flags
-        (id, purchase_id, bill_ref, date, shop_name, shop_licence_no, bottles,
+        (id, purchase_id, material_id, ledger_id, outlet_id, bill_ref, date, shop_name, shop_licence_no, bottles,
          rate_paid_per_bottle, depot_landed_per_bottle, excess_per_bottle,
          excess_total, excess_pct, paid_by, payment_mode, reimbursement_status,
          reason, approved_by, recorded_by)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
-      flagId, purchaseId, billRef, input.date,
+      flagId, input.materialId, ledgerId, input.outletId ?? null, billRef, input.date,
       shopName, String(input.shopLicenceNo || '').slice(0, 120),
       bottles, rate, depotPerBottle, excess.excessPerBottle, excess.excessTotal, excess.excessPct,
       String(input.paidBy || '').slice(0, 200), String(input.paymentMode || '').slice(0, 60),
@@ -458,7 +462,9 @@ export function recordWineShopPurchase(
       actor_email: actorEmail,
       outlet_id: input.outletId,
       after: {
-        purchase_id: purchaseId, material_id: input.materialId, material: mat.name,
+        ledger_id: ledgerId, store_id: input.storeId, store: store.name,
+        material_id: input.materialId, material: mat.name, stock_qty: stockQty, recipe_unit: mat.unit,
+        brand: String(input.brand || '').slice(0, 200) || undefined, notes: String(input.notes || '').slice(0, 500) || undefined,
         bottles, rate_paid_per_bottle: rate, total_paid: totalPaid,
         depot_landed_per_bottle: depotPerBottle, depot_source: depot.source,
         excess_per_bottle: excess.excessPerBottle, excess_total: excess.excessTotal,

@@ -135,28 +135,6 @@ export interface PageEntry {
   impliedBy?: string;
 
   /**
-   * The path is REGISTERED but its page.tsx does not exist yet — a page whose
-   * build is split across phases and whose catalog row is claimed up front so
-   * the phase builds do not collide on this file. Normally a page is added here
-   * only once it is BUILT; this is the exception, and it is not free.
-   *
-   * What it does: keeps the entry out of the app's AUTOMATIC landing-page
-   * resolution (homePathFor / firstAllowedPath). Those two answer "the first
-   * catalog page in display order this user can open", and they drive the
-   * post-login redirect, the Captain APK start URL, Android-Back home and the
-   * proxy's forbidden bounce — so without this a user whose map happened to
-   * contain only an unbuilt path was REDIRECTED onto a 404 with no click.
-   *
-   * What it does NOT do: it is not a gate. canAccessPage ignores it, the page
-   * still appears in the sidebar and in Settings → Page Access, and a granted
-   * user who clicks it still reaches a 404. That residue is the point of the
-   * flag being temporary.
-   *
-   * DELETE IT in the same commit that adds the page's page.tsx.
-   */
-  unbuilt?: boolean;
-
-  /**
    * When true, only the NAMED GRE role (`roles.name`, matched by
    * `canOpenFeedbackFloor` in `src/lib/feedback/access.ts`) or management —
    * Admin, any Manager tier including Floor Manager, or an HOD — may see/open
@@ -554,21 +532,15 @@ export const PAGE_CATALOG: PageSection[] = [
       // A catalog entry on its own gates a page correctly and leaves it
       // INVISIBLE; the two lists are separate and must be edited together.
       //
-      // ⚠️ THESE PATHS ARE REGISTERED BEFORE THEIR page.tsx EXISTS, and each
-      // carries `unbuilt: true` until its phase ships. The HR section below
-      // states the opposite rule — "this list must only ever name pages that
-      // are BUILT" — and that rule stands everywhere else; this block is the
-      // one deliberate, time-boxed exception, taken because five phase builds
-      // would otherwise collide on this file. `unbuilt` is what pays for it:
-      // it keeps the four out of the app's AUTOMATIC landing-page resolution
-      // (homePathFor / firstAllowedPath), so nobody can be REDIRECTED onto a
-      // page that does not exist. Measured before it existed: a manager whose
-      // map was ["/inventory/liquor-wallet"] got homePathFor =
-      // /inventory/liquor-wallet — a 404 after login, after an Android Back, on
-      // the Captain APK's start URL, and on every proxy bounce.
-      // A granted user who CLICKS one still reaches a 404; that is the residue,
-      // and the phase that builds each page removes its own `unbuilt: true`
-      // together with this caveat.
+      // All four page.tsx files are BUILT (src/app/inventory/liquor-{brand-map,
+      // wallet,withdrawals,reconciliation}/page.tsx). They were registered here
+      // before they existed, behind a temporary `unbuilt` flag that kept them
+      // out of homePathFor / firstAllowedPath so nobody was redirected onto a
+      // 404. With every page present that flag and its two skips were deleted,
+      // so these rows now resolve as landing pages like any other — a manager
+      // whose map is only ["/inventory/liquor-wallet"] lands on the wallet.
+      // The HR section's rule ("only ever name pages that are BUILT") now holds
+      // here too, with no exception left in this file.
       //
       // Every entry is tier-flagged, and that is the real lock: canAccessPage
       // FAILS OPEN for a legacy user whose page_access is null, and only the
@@ -588,23 +560,25 @@ export const PAGE_CATALOG: PageSection[] = [
       // "accept new rate into master" one-tap to be manager-usable, that
       // decision is made ONCE server-side and this flag revisited with it —
       // do not let a manager write the master from a card while this page 403s.
-      { path: '/inventory/liquor-brand-map',      label: 'Liquor Brand Map (TGBCL)',   adminOnly: true, unbuilt: true },
+      { path: '/inventory/liquor-brand-map',      label: 'Liquor Brand Map (TGBCL)',   adminOnly: true },
       // L2 · mgmtOnly: the TGBCL wallet is working capital parked with the
       // government — deposits, challans, bank-match state and the top-up
       // planner. Management money, not a counting surface.
-      { path: '/inventory/liquor-wallet',         label: 'Liquor Wallet (TGBCL)',      mgmtOnly: true, unbuilt: true },
+      { path: '/inventory/liquor-wallet',         label: 'Liquor Wallet (TGBCL)',      mgmtOnly: true },
       // L4 · adminOnly per the plan ("Admin-only page"): this is the
       // director/management personal-use ledger with amounts recoverable from
       // named people, and it MOVES STOCK. It stays out of reach of everyone
       // else, including a manager with an explicit grant.
-      { path: '/inventory/liquor-withdrawals',    label: 'Liquor Withdrawals',         adminOnly: true, unbuilt: true },
+      { path: '/inventory/liquor-withdrawals',    label: 'Liquor Withdrawals',         adminOnly: true },
       // L5 · mgmtOnly per the plan ("(mgmt/admin)"): the reconciliation summary
       // — wallet check, per-indent value vs portal, retail excess, non-sale
       // issues as a % of purchases.
-      { path: '/inventory/liquor-reconciliation', label: 'Liquor Reconciliation',      mgmtOnly: true, unbuilt: true },
+      { path: '/inventory/liquor-reconciliation', label: 'Liquor Reconciliation',      mgmtOnly: true },
       // L3 (emergency wine-shop buys) deliberately has NO entry: it is a side
-      // record on the EXISTING purchase flow plus a card on the L5 summary, so
-      // it adds no page of its own. Do not invent one to "complete the set".
+      // record on the EXISTING purchase flow, a "Wine-shop buys" TAB on the
+      // Liquor Store page (where a pending claim is paid back and an unpriced
+      // buy is priced) and a card on the L5 summary, so it adds no page of its
+      // own. Do not invent one to "complete the set".
       { path: '/inventory/stock-overview', label: 'Stock Overview' },
       // Read-only board: counted stock by storage area x department. Counts are
       // still recorded on /closing-stock — this only makes them comparable.
@@ -863,14 +837,6 @@ export const PAGE_CATALOG: PageSection[] = [
     // granted users a 404 (the proxy happily lets them through), so this list
     // must only ever name pages that are BUILT. Phase 1: dashboard, employees,
     // settings.
-    // (Scope of that rule, added 2026-08-28 so the file does not read as two
-    // contradictory laws: it is the DEFAULT for every section, and it still is.
-    // The one exception is the liquor-reconciliation block in Inventory above,
-    // where five phase builds would otherwise collide on this file; those four
-    // entries carry `unbuilt: true`, which buys the exception by keeping them
-    // out of the automatic landing-page resolution. Do NOT read `unbuilt` as
-    // permission to pre-register pages here — HR adds an entry when the page
-    // ships, which is still the better shape when nothing forces the split.)
     //
     // Every entry here is tier-flagged on purpose: canAccessPage fails OPEN for
     // legacy NULL page_access users (8 of 9 on the reference DB), so an
@@ -1313,10 +1279,8 @@ export function homePathFor(user: CatalogUser | null): string {
   // decided by canAccessPage — the SAME authority the proxy enforces, so
   // homePathFor can never return a page the proxy then bounces (no loop). A
   // user with no openable page → '/login' (LaunchPage shows a friendly notice).
-  // `unbuilt` entries are skipped: a registered-but-not-yet-built path would
-  // land the user on a 404 they did not click (see PageEntry.unbuilt).
   for (const section of PAGE_CATALOG) {
-    for (const pg of section.pages) if (!pg.unbuilt && canAccessPage(pg.path, user)) return pg.path;
+    for (const pg of section.pages) if (canAccessPage(pg.path, user)) return pg.path;
   }
   return '/login';
 }
@@ -1347,9 +1311,6 @@ export function firstAllowedPath(user: CatalogUser | null): string {
       // matches NO row, falls through to '/login', and is bounced straight back
       // by the proxy. That is the redirect loop this comment warns about.
       if (allowed.includes(p.path)
-        // Registered but not yet built — redirecting here is a 404 the user
-        // never asked for (see PageEntry.unbuilt).
-        && !p.unbuilt
         && !(p.hodOnly && !user.is_head_chef)
         && !(p.mgmtOnly && !(user.role === 'manager' || user.is_head_chef)
              && !(p.financeCap && user.can_view_finance_reports))

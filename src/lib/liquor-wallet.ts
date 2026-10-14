@@ -85,6 +85,7 @@
 
 import type { Database } from 'better-sqlite3';
 import { generateId, logAuditEvent } from './db';
+import { recordError, maybeNotifyAdmins } from './error-alerts';
 import { todayIST } from './format-date';
 import type { LqWalletTxnType, LqBankMatch } from './liquor-recon';
 import { LQ_WALLET_TXN_TYPES, LQ_BANK_MATCH, lqBillKey } from './liquor-recon';
@@ -835,29 +836,64 @@ export interface AutoDebitArgs {
  */
 const ADOPTED_MARK = ' [adopted a hand-entered debit';
 
-export type AutoDebitAction = 'inserted' | 'updated' | 'adopted' | 'removed' | 'none';
+export type AutoDebitAction = 'inserted' | 'updated' | 'adopted' | 'removed' | 'none' | 'failed';
 export interface AutoDebitResult {
   action: AutoDebitAction;
   id: string | null;
   /** The signed ₹ written (negative), or 0 when no debit row exists after this. */
   amount: number;
   note: string;
+  /** Present only on action 'failed': why the debit was not written. The bill
+   *  WAS saved; this names what the wallet could not do alongside it. */
+  error?: { code: string; message: string };
 }
 
+/** audit_events.event_type of a debit that could not be written alongside its
+ *  saved bill. indentIntegrity() reads the newest one per indent back onto the
+ *  wallet page's "recorded indents with no debit" list, so the reason travels
+ *  with the gap instead of living only in a server log. */
+export const LQ_AUTO_DEBIT_FAILED_EVENT = 'liquor_wallet.auto_debit_failed';
+
 /**
- * AUTO-CREATE (or re-derive) THE WALLET DEBIT FOR ONE RECORDED INDENT.
+ * AUTO-CREATE (or re-derive) THE WALLET DEBIT FOR ONE RECORDED INDENT — AND
+ * NEVER TAKE THE BILL DOWN WITH IT.
  *
  * Called from upsertBillCharges() in src/lib/store-engine.ts, which is the ONE
  * place a Net Indent is ever written and which is itself called inside the
- * indent's own db.transaction(). That is the whole point of the plan's "in the
- * same transaction": if the ledger lines roll back, this debit rolls back with
- * them, and if this throws, the indent does not exist either. The wallet
- * therefore cannot disagree with the recorded indents — not by convention, but
- * because there is no moment at which one exists without the other.
+ * indent's own db.transaction() (/procure-bill and /procure-bulk).
  *
- * MUST NOT be wrapped in its own transaction, and MUST NOT swallow its errors:
- * a debit that quietly failed to write is exactly the silent disagreement this
- * exists to prevent.
+ * ── THE DECISION (2026-10-14): A WALLET-SIDE PROBLEM NEVER BLOCKS A BILL ──────
+ * The TGBCL bill save is a DEPLOYED stock flow: it puts bottles on the Liquor
+ * Store ledger that the bar is about to pour. The wallet is an analytics ledger
+ * layered on top of it. This function used to throw straight through the bill's
+ * transaction, so a missing lq_wallet_txns table, a CHECK, or two stores filing
+ * one indent number rolled the WHOLE BILL back — measured on the DB copy: HTTP
+ * 500 and zero ledger lines, zero charges rows, for a bill that had nothing
+ * wrong with it. A delivery that cannot be booked is a far worse failure than a
+ * wallet line that is late, so the priority is now explicit:
+ *
+ *   1. The debit is written in a SAVEPOINT nested inside the bill's own
+ *      transaction (better-sqlite3 turns a nested db.transaction() into
+ *      SAVEPOINT / RELEASE). On success it commits with the bill, exactly as
+ *      before — the same-transaction promise is unchanged for every bill that
+ *      can be debited.
+ *   2. On ANY wallet-side throw the savepoint rolls back ONLY the wallet's own
+ *      writes, the bill carries on and commits, and this returns action
+ *      'failed'. Nothing is half-written: no debit, no stray adoption.
+ *   3. The gap is never silent. The failure is (a) written to audit_events as
+ *      LQ_AUTO_DEBIT_FAILED_EVENT against the store_bill_charges id, which
+ *      indentIntegrity().missing reads back onto the wallet page with the
+ *      reason; (b) filed in error_reports, the admin "App errors" bell; and
+ *      (c) returned in the bill response as bill_charges.wallet_debit. The
+ *      indent still has a positive Net Indent and no debit, so it is on the
+ *      wallet page's "missing" list until somebody fixes it.
+ *   4. Re-saving the bill (or its charges) after the cause is fixed re-runs this
+ *      and writes the debit — the upsert is idempotent, so healing is a re-save.
+ *
+ * The ONE exception: if SQLite abandoned the OUTER transaction itself (disk
+ * full, I/O error — db.inTransaction flips to false), there is no bill left to
+ * protect, so the error is re-thrown and the bill route answers 500 exactly as
+ * it would have without this module.
  *
  * IDEMPOTENT, and that matters more than it looks: upsertBillCharges is an
  * UPSERT, so re-saving a bill (a balance CSV re-upload, a corrected levy) calls
@@ -876,11 +912,72 @@ export interface AutoDebitResult {
  * A NON-POSITIVE NET INDENT writes NO debit and removes any earlier one. A ₹0
  * indent spends nothing, and a negative Net Indent (only reachable when MRP
  * rounding exceeds the whole bill) is not a debit at all — writing it would
- * need a positive `amount` on an indent_debit, which the table refuses, and
- * refusing would take the bill save down with it. The wallet page's integrity
- * panel lists indents with no debit, so nothing here goes unseen.
+ * need a positive `amount` on an indent_debit, which the table refuses. The
+ * wallet page's integrity panel lists indents with no debit, so nothing here
+ * goes unseen.
  */
 export function autoDebitForIndent(db: Database, args: AutoDebitArgs): AutoDebitResult {
+  const outerTxn = db.inTransaction;
+  try {
+    // Nested inside the bill's transaction this is a SAVEPOINT: a throw rolls
+    // back to it (undoing only what writeAutoDebit wrote) and re-throws here.
+    return db.transaction(() => writeAutoDebit(db, args))();
+  } catch (e: any) {
+    if (outerTxn && !db.inTransaction) throw e;   // SQLite dropped the bill's own transaction
+    return recordAutoDebitFailure(db, args, e);
+  }
+}
+
+/** The wallet-side failure, recorded where it will be seen — and never thrown. */
+function recordAutoDebitFailure(db: Database, args: AutoDebitArgs, e: any): AutoDebitResult {
+  const reference = String(args.reference || '').trim().slice(0, 120);
+  const sourceRef = String(args.source_ref || '').trim();
+  const raw = String(e?.message || e || 'unknown error');
+  const code = e instanceof WalletWriteError
+    ? e.code
+    : (/no such table/i.test(raw) ? 'wallet_table_missing' : 'wallet_write_failed');
+  const message = code === 'wallet_table_missing'
+    ? 'the TGBCL wallet table is not on this database'
+    : raw;
+  const net = toRupees(toPaise(args.net_indent_value));
+  try {
+    console.error(`[liquor-wallet] auto-debit NOT written for indent ${reference || '(no ref)'} (bill saved): ${code} — ${raw}`);
+  } catch { /* logging must not fail a bill */ }
+  if (sourceRef) {
+    logAuditEvent(db, {          // swallows its own errors
+      event_type: LQ_AUTO_DEBIT_FAILED_EVENT,
+      entity_type: 'store_bill_charges',
+      entity_id: sourceRef,
+      actor_email: String(args.created_by || '').trim(),
+      after: { reference, net_indent_value: net, store_id: args.store_id || '', code, message },
+      note: `TGBCL wallet: indent ${reference} was SAVED but its wallet debit of ₹${net.toFixed(2)} was NOT written — ${message}`,
+    });
+  }
+  try {
+    // The admin "App errors" bell. One stable message per failure kind, so a
+    // run of bills on a broken wallet collapses onto ONE open row with a count
+    // instead of one row per indent; the indent itself is in `stack`.
+    const res = recordError({
+      source: 'server',
+      message: `TGBCL wallet auto-debit failed (${code}) — the bill was saved, its wallet debit was not. Liquor Wallet → "recorded indents with no debit" lists each one.`,
+      stack: `indent ${reference} · store_bill_charges ${sourceRef} · Net Indent ₹${net.toFixed(2)}\n${raw}`,
+      url: '/inventory/liquor-wallet',
+    });
+    if (res?.isNew) void maybeNotifyAdmins(res);
+  } catch { /* the reporter must never be the thing that fails a bill */ }
+  return {
+    action: 'failed',
+    id: null,
+    amount: 0,
+    note: `The bill was saved, but its TGBCL wallet debit (₹${net.toFixed(2)} for ${reference || 'this indent'}) was NOT written: ${message}. `
+      + 'The Liquor Wallet page lists it under recorded indents with no debit; re-saving the bill once the cause is fixed writes it.',
+    error: { code, message },
+  };
+}
+
+/** The write itself. Throws on any wallet-side problem; autoDebitForIndent is
+ *  the only caller and turns a throw into a recorded, non-blocking 'failed'. */
+function writeAutoDebit(db: Database, args: AutoDebitArgs): AutoDebitResult {
   const sourceRef = String(args.source_ref || '').trim();
   const reference = String(args.reference || '').trim().slice(0, 120);
   if (!sourceRef) {
@@ -969,16 +1066,18 @@ export function autoDebitForIndent(db: Database, args: AutoDebitArgs): AutoDebit
   //   · source_ref = ''  → a HAND-ENTERED debit standing in for this indent (a
   //     history import, or someone who recorded it before the indent was keyed
   //     in). ADOPT it below: stamp the source on and re-derive it. Without this
-  //     the INSERT would hit uq_lq_wallet_indent_debit and take the whole bill
-  //     save down with it.
+  //     the INSERT would hit uq_lq_wallet_indent_debit and the indent would be
+  //     left with no debit of its own.
   //   · source_ref set   → ANOTHER recorded indent already claims this number.
   //     store_bill_charges is keyed UNIQUE(store_id, invoice_ref), so this can
   //     only be two DIFFERENT stores filing the same TGBCL indent number. The
   //     wallet is ONE wallet and cannot tell "two indents that share a number"
   //     from "one indent recorded twice", and guessing wrong DOUBLES the spend —
-  //     the exact failure this module exists to prevent. So it refuses, by name,
-  //     inside the indent's transaction: the bill save rolls back whole and the
-  //     person fixes the number rather than the wallet silently absorbing it.
+  //     the exact failure this module exists to prevent. So it refuses, by
+  //     name. The refusal is the WALLET's, not the bill's: autoDebitForIndent
+  //     rolls back to its savepoint, the bill is saved, and the indent sits on
+  //     the wallet page's "no debit" list with this sentence beside it until the
+  //     number is corrected — the wallet never silently absorbs it.
   //
   // Matched on walletIndentKey, so `IND/9` and `ind/9` are ONE indent here as
   // they already are to the register, to invoiceRefHasPurchases and to
@@ -996,8 +1095,8 @@ export function autoDebitForIndent(db: Database, args: AutoDebitArgs): AutoDebit
       `The TGBCL wallet already holds a debit of ₹${r2(sameRef.amount).toFixed(2)} for indent "${sameRef.reference}", `
       + (sameRef.reference === reference ? '' : `which is the same indent number as "${reference}" (case is ignored, exactly as the bill register ignores it) — `)
       + 'created from a different recorded bill. One wallet cannot tell two indents that share a number apart from '
-      + 'one indent recorded twice, and guessing would double the spend — so this bill was NOT saved. '
-      + 'Use the indent\'s real TGBCL number, or correct the other bill that is using it.',
+      + 'one indent recorded twice, and guessing would double the spend — so this indent was NOT debited. '
+      + 'Use the indent\'s real TGBCL number, or correct the other bill that is using it, then re-save.',
       409,
     );
   }
@@ -1006,8 +1105,8 @@ export function autoDebitForIndent(db: Database, args: AutoDebitArgs): AutoDebit
     // ADOPTION REWRITES A ROW A PERSON TYPED — its amount, its date and its
     // remark — inside somebody else's bill save (measured: −₹99,999 "my own
     // note" became −₹350 "Auto: indent …", moving the balance ₹99,649). It is
-    // still the right call (the alternative is a unique-index failure that takes
-    // the bill down), but what the human recorded is carried INTO the row it
+    // still the right call (the alternative is a unique-index failure that
+    // leaves the indent undebited), but what the human recorded is carried INTO the row it
     // replaces, not left only in audit_events, and ADOPTED_MARK is what stops a
     // later correction deleting it. The reference is re-stamped to the indent's
     // own spelling so the ledger shows the number the bill was filed under.
@@ -1062,8 +1161,11 @@ export function autoDebitForIndent(db: Database, args: AutoDebitArgs): AutoDebit
 export interface IndentIntegrity {
   /** Recorded indents (store_bill_charges) with a positive Net Indent and NO
    *  wallet debit. Should be empty — a non-empty list means an indent was
-   *  recorded before this module existed, or its debit was deleted by hand. */
-  missing: Array<{ source_ref: string; invoice_ref: string; date: string; net_indent_value: number; store: string }>;
+   *  recorded before this module existed, its debit was deleted by hand, or the
+   *  debit could not be written when the bill was saved. In that last case
+   *  `failure` carries the reason (the newest LQ_AUTO_DEBIT_FAILED_EVENT for the
+   *  indent); it is null otherwise. */
+  missing: Array<{ source_ref: string; invoice_ref: string; date: string; net_indent_value: number; store: string; failure: string | null }>;
   /** Debits whose amount no longer matches their indent's Net Indent. */
   mismatched: Array<{ id: string; reference: string; debit: number; net_indent_value: number; diff: number }>;
   /** Debits with a source_ref that no longer names a recorded indent. */
@@ -1105,9 +1207,15 @@ function liquorStoreIds(db: Database): string[] {
  * one debit, of exactly its Net Indent.
  */
 export function indentIntegrity(db: Database): IndentIntegrity {
+  // `failure` is a correlated read of audit_events, served by idx_audit_entity
+  // (entity_type, entity_id) and run at most 200 times (the LIMIT).
   const missing = db.prepare(`
     SELECT c.id AS source_ref, c.invoice_ref, COALESCE(c.date,'') AS date,
-           c.net_indent_value, COALESCE(s.name,'') AS store
+           c.net_indent_value, COALESCE(s.name,'') AS store,
+           (SELECT a.note FROM audit_events a
+             WHERE a.entity_type = 'store_bill_charges' AND a.entity_id = c.id
+               AND a.event_type = ?
+             ORDER BY a.created_at DESC, a.rowid DESC LIMIT 1) AS failure
       FROM store_bill_charges c
       LEFT JOIN store_locations s ON s.id = c.store_id
      WHERE c.net_indent_value > 0
@@ -1115,7 +1223,7 @@ export function indentIntegrity(db: Database): IndentIntegrity {
                         WHERE w.type = 'indent_debit' AND w.source_ref = c.id)
      ORDER BY c.date DESC, c.invoice_ref
      LIMIT 200
-  `).all() as IndentIntegrity['missing'];
+  `).all(LQ_AUTO_DEBIT_FAILED_EVENT) as IndentIntegrity['missing'];
 
   const mismatched = db.prepare(`
     SELECT w.id, w.reference, w.amount AS debit, c.net_indent_value,
@@ -1351,6 +1459,230 @@ export function recordPortalCheck(
     created_at: stored?.created_at,
     replaced_amount: replacedAmount,
   };
+}
+
+/* ── the per-indent portal check (Summary check B) — also an OBSERVATION ───── */
+
+export interface IndentPortalCheckResult {
+  id: string;
+  as_of_date: string;
+  /** The indent number as it was typed (trimmed). Matched to recorded indents
+   *  ignoring case — walletIndentKey — exactly as the wallet and the bill
+   *  register match them; the spelling itself is kept, never folded. */
+  reference: string;
+  portal_amount: number;
+  /** The recorded indent this reading was compared against, or null when no
+   *  recorded bill carries this number yet (a reading can be taken off the
+   *  portal before the bill is keyed in — it is kept, and check B shows it as a
+   *  reading with no indent behind it). */
+  matched_invoice_ref: string | null;
+  store: string | null;
+  /** That indent's recorded Net Indent (invoice value + the four levies). */
+  net_indent_value: number | null;
+  /** portal − Net Indent. null when no recorded indent matched. */
+  difference: number | null;
+  difference_direction: string;
+  matched: boolean | null;
+  /** More than one recorded bill carries this number (two stores); the reading
+   *  is compared against the LIQUOR STORE's, else the oldest, and says so. */
+  warning: string | null;
+  source: string;
+  note: string;
+  observed_by: string;
+  created_at?: string;
+  replaced_amount?: number | null;
+}
+
+/** The recorded indent(s) a reference names, LIQUOR STORE first. */
+function recordedIndentsFor(db: Database, reference: string): Array<{ invoice_ref: string; net_indent_value: number; store: string }> {
+  return db.prepare(`
+    SELECT c.invoice_ref, c.net_indent_value, COALESCE(s.name,'') AS store
+      FROM store_bill_charges c
+      LEFT JOIN store_locations s ON s.id = c.store_id
+     WHERE LOWER(TRIM(c.invoice_ref)) = ?
+     ORDER BY CASE WHEN TRIM(COALESCE(s.name,'')) = 'LIQUOR STORE' COLLATE NOCASE THEN 0 ELSE 1 END, c.rowid
+  `).all(walletIndentKey(reference)) as Array<{ invoice_ref: string; net_indent_value: number; store: string }>;
+}
+
+function indentComparison(db: Database, reference: string, portalAmount: number) {
+  const hits = recordedIndentsFor(db, reference);
+  const hit = hits[0];
+  if (!hit) {
+    return {
+      matched_invoice_ref: null, store: null, net_indent_value: null, difference: null, matched: null,
+      difference_direction: `No recorded bill carries indent "${reference}" yet — the reading is kept, and check B lists it as a reading with no indent behind it until the bill is recorded.`,
+      warning: null as string | null,
+    };
+  }
+  const net = r2(Number(hit.net_indent_value) || 0);
+  const difference = r2(portalAmount - net);
+  const p = toPaise(difference);
+  return {
+    matched_invoice_ref: hit.invoice_ref,
+    store: hit.store || null,
+    net_indent_value: net,
+    difference,
+    matched: p === 0,
+    difference_direction: p === 0
+      ? 'The portal and the recorded Net Indent agree.'
+      : (p > 0
+        ? `The PORTAL charged ${rs(difference)} MORE than the recorded Net Indent — check the bill's lines and its four levies against the indent PDF.`
+        : `The recorded Net Indent is ${rs(-difference)} MORE than the portal charged — check for a line or a levy keyed in twice.`),
+    warning: hits.length > 1
+      ? `${hits.length} recorded bills carry this indent number (${hits.map(h => h.store || '?').join(', ')}); compared against ${hit.store || 'the first'}.`
+      : null,
+  };
+}
+
+/**
+ * Record what the TGBCL portal shows as ONE INDENT's value, and report it
+ * against that indent's recorded Net Indent. This is Summary check B's input —
+ * nothing wrote kind='indent_value' before, so check B could never run.
+ *
+ * Like the wallet-balance reading it is an OBSERVATION in lq_portal_checks: it
+ * moves no money, no stock and no Net Indent. One reading per indent per day:
+ * re-typing the same day CORRECTS it (the indent is matched ignoring case, so
+ * "IND/9" and "ind/9" on one day are one reading, not two); a later day files a
+ * new reading, and check B uses the newest in its range.
+ */
+export function recordIndentPortalCheck(
+  db: Database,
+  args: { reference: string; as_of_date: string; portal_amount: number; source?: string; note?: string },
+  actorEmail: string,
+  today: string,
+): IndentPortalCheckResult {
+  const reference = String(args.reference ?? '').trim();
+  if (!reference) {
+    throw new WalletWriteError('blank_reference', 'Name the indent — a per-indent portal reading is compared against that indent\'s recorded Net Indent.');
+  }
+  if (reference.length > 120) {
+    throw new WalletWriteError('bad_reference', 'That indent number is longer than 120 characters — check what was pasted.');
+  }
+  if (!isDate(args.as_of_date)) {
+    throw new WalletWriteError(
+      'bad_date',
+      /^\d{4}-\d{2}-\d{2}$/.test(String(args.as_of_date))
+        ? `${args.as_of_date} is not a real date — there is no such day on the calendar.`
+        : 'as_of_date must be YYYY-MM-DD.',
+    );
+  }
+  if (isDate(today) && args.as_of_date > today) {
+    throw new WalletWriteError('future_date', `Cannot record a portal reading dated ${args.as_of_date} — that is in the future.`);
+  }
+  if (typeof args.portal_amount !== 'number' && typeof args.portal_amount !== 'string') {
+    throw new WalletWriteError('amount_not_a_number', 'portal_amount must be a number.');
+  }
+  if (typeof (args.portal_amount as unknown) === 'string' && String(args.portal_amount).trim() === '') {
+    throw new WalletWriteError('blank_amount', 'Type the indent value the portal shows — a blank field would be stored as a ₹0.00 reading.');
+  }
+  const portal = Number(args.portal_amount);
+  if (!Number.isFinite(portal)) throw new WalletWriteError('amount_not_a_number', 'portal_amount must be a number.');
+  if (portal < 0) {
+    throw new WalletWriteError('wrong_sign', 'An indent value on the portal is what TGBCL charged for it — it cannot be negative. Type it without the minus sign.');
+  }
+  if (portal > MAX_ROW) {
+    throw new WalletWriteError('amount_too_large', 'That indent value is over ₹10 crore — check for an extra zero.');
+  }
+  const portalAmount = r2(portal);
+  const source = String(args.source ?? '').trim().slice(0, 120) || 'indent PDF';
+  const note = String(args.note ?? '').trim().slice(0, 500);
+
+  // The same indent on the same day, matched ignoring case: uq_lq_portal_check
+  // is BINARY on `reference`, so the index alone would file "IND/9" and "ind/9"
+  // as two readings of one indent and check B would count whichever was newer.
+  const prior = db.prepare(`
+    SELECT id, portal_amount FROM lq_portal_checks
+     WHERE COALESCE(outlet_id,'') = '' AND kind = 'indent_value' AND as_of_date = ?
+       AND LOWER(TRIM(reference)) = ?
+     ORDER BY created_at DESC LIMIT 1
+  `).get(args.as_of_date, walletIndentKey(reference)) as { id: string; portal_amount: number } | undefined;
+  const replacedAmount = prior ? r2(Number(prior.portal_amount) || 0) : null;
+
+  let id: string;
+  if (prior) {
+    // The reading keeps the spelling it was FIRST filed under; only the figure,
+    // its source and who read it change.
+    id = prior.id;
+    db.prepare(`
+      UPDATE lq_portal_checks
+         SET portal_amount = ?, source = ?, observed_by = ?, note = ?, updated_at = datetime('now')
+       WHERE id = ?
+    `).run(portalAmount, source, actorEmail, note, id);
+  } else {
+    id = generateId();
+    db.prepare(`
+      INSERT INTO lq_portal_checks
+        (id, outlet_id, kind, as_of_date, reference, portal_amount, source, observed_by, note)
+      VALUES (?, ?, 'indent_value', ?, ?, ?, ?, ?, ?)
+      ON CONFLICT (COALESCE(outlet_id,''), kind, reference, as_of_date) DO UPDATE SET
+        portal_amount = excluded.portal_amount,
+        source        = excluded.source,
+        observed_by   = excluded.observed_by,
+        note          = excluded.note,
+        updated_at    = datetime('now')
+    `).run(id, walletOutletId(), args.as_of_date, reference, portalAmount, source, actorEmail, note);
+  }
+  // Read back by the row's real key: on the ON CONFLICT half of the INSERT the
+  // generated id above is discarded and the existing row's id stands.
+  const stored = db.prepare(`
+    SELECT id, reference, created_at FROM lq_portal_checks
+     WHERE COALESCE(outlet_id,'') = '' AND kind = 'indent_value' AND as_of_date = ?
+       AND (id = ? OR reference = ?)
+     ORDER BY CASE WHEN id = ? THEN 0 ELSE 1 END LIMIT 1
+  `).get(args.as_of_date, id, reference, id) as { id: string; reference: string; created_at: string } | undefined;
+  const storedRef = stored?.reference || reference;
+
+  const cmp = indentComparison(db, storedRef, portalAmount);
+  logAuditEvent(db, {
+    event_type: 'liquor_wallet.portal_indent_check',
+    entity_type: 'lq_portal_checks',
+    entity_id: stored?.id || id,
+    actor_email: actorEmail,
+    before: replacedAmount === null ? undefined : { portal_amount: replacedAmount },
+    after: { as_of_date: args.as_of_date, reference: storedRef, portal_amount: portalAmount, net_indent_value: cmp.net_indent_value, difference: cmp.difference },
+    note: `TGBCL portal indent check ${storedRef} ${args.as_of_date}: portal ₹${portalAmount.toFixed(2)} vs recorded Net Indent `
+      + (cmp.net_indent_value == null ? '(no recorded bill yet)' : `₹${cmp.net_indent_value.toFixed(2)} (difference ₹${(cmp.difference ?? 0).toFixed(2)})`)
+      + (replacedAmount === null ? '' : ` — replaced an earlier reading of ₹${replacedAmount.toFixed(2)} for the same day`),
+  });
+
+  return {
+    id: stored?.id || id,
+    as_of_date: args.as_of_date,
+    reference: storedRef,
+    portal_amount: portalAmount,
+    ...cmp,
+    source,
+    note,
+    observed_by: actorEmail,
+    created_at: stored?.created_at,
+    replaced_amount: replacedAmount,
+  };
+}
+
+/** The recorded per-indent readings, newest first, each re-compared against
+ *  the indent's CURRENT recorded Net Indent (a corrected levy re-reads). */
+export function listIndentPortalChecks(db: Database, limit = 50): IndentPortalCheckResult[] {
+  const rows = db.prepare(`
+    SELECT id, as_of_date, reference, portal_amount, source, note, observed_by, created_at
+      FROM lq_portal_checks
+     WHERE kind = 'indent_value'
+     ORDER BY as_of_date DESC, created_at DESC
+     LIMIT ?
+  `).all(Math.max(1, Math.min(200, limit))) as any[];
+  return rows.map(r => {
+    const portalAmount = r2(Number(r.portal_amount) || 0);
+    return {
+      id: r.id,
+      as_of_date: r.as_of_date,
+      reference: r.reference || '',
+      portal_amount: portalAmount,
+      ...indentComparison(db, String(r.reference || ''), portalAmount),
+      source: r.source || '',
+      note: r.note || '',
+      observed_by: r.observed_by || '',
+      created_at: r.created_at || '',
+    };
+  });
 }
 
 /** The recorded portal readings, newest first, each with the balance we compute

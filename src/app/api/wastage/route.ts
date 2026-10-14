@@ -73,6 +73,31 @@ class WastageBlocked extends Error {
 }
 
 /**
+ * The ref of the liquor withdrawal that co-wrote this wastage row, or null.
+ *
+ * The table belongs to the Liquor Reconciliation module, whose schema only
+ * exists once that module has booted. Where it does not exist no withdrawal can
+ * have co-written a row, so this returns null and DELETE behaves exactly as it
+ * always has. Checked by table name rather than try/catch so a real fault in
+ * the lookup still fails loudly instead of being read as "not co-written".
+ *
+ * Read OUTSIDE the delete transaction on purpose: the link is set when the
+ * withdrawal and its wastage row are inserted together, and nothing ever
+ * updates lq_withdrawals.wastage_id afterwards, so it cannot change between
+ * this read and the delete.
+ */
+function liquorWithdrawalRefFor(db: ReturnType<typeof getDb>, wastageId: string): string | null {
+  const hasTable = db.prepare(
+    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'lq_withdrawals'",
+  ).get();
+  if (!hasTable) return null;
+  const row = db.prepare(
+    'SELECT ref FROM lq_withdrawals WHERE wastage_id = ? LIMIT 1',
+  ).get(wastageId) as { ref: string } | undefined;
+  return row ? String(row.ref || 'a liquor withdrawal') : null;
+}
+
+/**
  * NOTE ON READING THE BALANCE. The guard below calls deptOnHand() from
  * dept-ledger.ts — the ONE derivation of a department balance in this
  * codebase (anchor = latest closing count or cutover opening row, plus the
@@ -282,6 +307,22 @@ export async function DELETE(request: Request) {
     const db = getDb();
     const w = db.prepare('SELECT * FROM wastages WHERE id = ?').get(id) as any;
     if (!w) return Response.json({ error: 'Not found' }, { status: 404 });
+    // A LIQUOR WITHDRAWAL'S RECORD-ONLY COPY IS REFUSED, BEFORE EITHER RAIL.
+    // A breakage withdrawal can co-write this table for visibility; its stock
+    // left the Liquor Store ledger, and this rail never debited central for it.
+    // The central branch below would credit current_stock for stock central
+    // never lost (measured on a DB copy: 100 PIPERS 4020 -> 4770 ml), with the
+    // Liquor Store deduction still standing and the withdrawal pointing at a
+    // deleted row. Unwinding instead would mean voiding a withdrawal that can
+    // carry money billed to a named person, which has no approved flow, so the
+    // delete is refused and nothing is written.
+    const coWrittenRef = liquorWithdrawalRefFor(db, id);
+    if (coWrittenRef) {
+      return Response.json({
+        error: `This entry is the record-only copy of liquor withdrawal ${coWrittenRef}. Its stock left the Liquor Store, not Central, so deleting it here would credit Central with stock it never lost. Nothing was changed. Correct it on the Liquor Store instead.`,
+        withdrawal_ref: coWrittenRef,
+      }, { status: 409 });
+    }
     // WHICH RAIL IS READ OFF THE STORED ROW, NEVER OFF THE REQUEST. A caller
     // who could name the department here would have central's deduction
     // reversed into a department's ledger — grams appearing on a shelf that

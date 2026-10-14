@@ -32,6 +32,7 @@ import TabScroller from '@/components/TabScroller';
 import MaterialTypeahead, { MaterialLite } from '@/components/MaterialTypeahead';
 import ZeroCountGuard, { readZeroGuard, type ZeroGuardInfo } from '@/components/ZeroCountGuard';
 import CountState from '@/components/CountState';
+import WineShopRegister from './WineShopRegister';
 import {
   packFactor, caseFactor, entryMode, tripleToRecipe, breakdownQty, fmtBreakdown,
   toPurchaseQty, csvQty, PackMeta,
@@ -297,7 +298,7 @@ export default function LiquorStorePage() {
   // stores with zero ledger history, keyed by store so it can't go stale.
   const [latestCountByStore, setLatestCountByStore] = useState<Record<string, string | null>>({});
 
-  const [tab, setTab] = useState<'stock' | 'ledger' | 'closing' | 'reports'>('stock');
+  const [tab, setTab] = useState<'stock' | 'ledger' | 'closing' | 'reports' | 'retail'>('stock');
   /* The Closing Stock sheet's business date, held HERE rather than inside
      ClosingSection because that component is keyed on the store (see its
      render site) and is therefore destroyed and rebuilt on every floor
@@ -330,6 +331,8 @@ export default function LiquorStorePage() {
   // in: it IS a liquor purchase, and /api/liquor/retail gates on exactly that
   // (can_procure on the store the MATERIAL belongs to) server-side.
   const [showRetail, setShowRetail] = useState(false);
+  // Bumped when the modal records a buy, so an open Wine-shop buys tab reloads.
+  const [retailKey, setRetailKey] = useState(0);
   // Migration modal target: material_ids to preview, or 'all'
   const [migrateTarget, setMigrateTarget] = useState<string[] | 'all' | null>(null);
 
@@ -341,6 +344,23 @@ export default function LiquorStorePage() {
   useEffect(() => {
     if (tab === 'closing' && !access.can_close_stock) setTab('stock');
   }, [tab, access.can_close_stock]);
+  // Wine-shop buys follows the Wine-shop Purchase button's gate (can_procure).
+  useEffect(() => {
+    if (tab === 'retail' && !access.can_procure) setTab('stock');
+  }, [tab, access.can_procure]);
+  /* ?tab=retail — the Reconciliation summary's §E links here so a pending
+     claim it lists can be paid back. Applied only once boot has resolved this
+     user's access: applied at mount, `access` is still the all-false default
+     and the bounce above would throw the link away before it could land. */
+  const wantTab = useRef<string | null>(null);
+  useEffect(() => {
+    try { wantTab.current = new URLSearchParams(window.location.search).get('tab'); } catch { /* no URL */ }
+  }, []);
+  useEffect(() => {
+    if (bootLoading || wantTab.current !== 'retail') return;
+    wantTab.current = null;
+    if (access.can_procure) setTab('retail');
+  }, [bootLoading, access.can_procure]);
 
   /* Boot: active stores + my access per store */
   useEffect(() => {
@@ -714,6 +734,13 @@ export default function LiquorStorePage() {
                   tab === 'reports' ? 'bg-[#af4408] border-[#af4408] text-white' : 'bg-white border-[#E8D5C4] text-[#6B5744]'}`}>
           <BarChart3 className="w-3.5 h-3.5" /> Reports
         </button>
+        {access.can_procure && (
+          <button onClick={() => setTab('retail')}
+                  className={`px-3 py-1.5 rounded-full text-xs font-medium border flex items-center gap-1.5 ${
+                    tab === 'retail' ? 'bg-[#af4408] border-[#af4408] text-white' : 'bg-white border-[#E8D5C4] text-[#6B5744]'}`}>
+            <Siren className="w-3.5 h-3.5" /> Wine-shop buys
+          </button>
+        )}
       </TabScroller>
 
       {tab === 'stock' ? (
@@ -982,6 +1009,16 @@ export default function LiquorStorePage() {
         )
       ) : tab === 'reports' && store ? (
         <ReportsSection storeId={store.id} storeCode={store.code || 'store'} />
+      ) : tab === 'retail' && access.can_procure ? (
+        /* The L3 register: pay a pending claim back, price an unpriced buy,
+           correct a claim. See WineShopRegister.tsx. Not keyed on the store —
+           a wine-shop buy is booked against its MATERIAL's own store, so the
+           list is the same whichever store is selected. */
+        <WineShopRegister
+          materials={materials}
+          refreshKey={retailKey}
+          onFlash={msg => { setFlash(msg); setTimeout(() => setFlash(null), 5000); }}
+        />
       ) : (
         <>
           {/* Ledger filters */}
@@ -1209,8 +1246,8 @@ export default function LiquorStorePage() {
         <WineShopModal
           materials={materials}
           onClose={() => setShowRetail(false)}
-          onSaved={msg => { setShowRetail(false); afterWrite(msg); }}
-          onRefresh={() => { loadStock(); loadLedger(); }}
+          onSaved={msg => { setShowRetail(false); afterWrite(msg); setRetailKey(k => k + 1); }}
+          onRefresh={() => { loadStock(); loadLedger(); setRetailKey(k => k + 1); }}
         />
       )}
       {migrateTarget && store && (
@@ -3028,7 +3065,8 @@ function WineShopModal({ materials, onClose, onSaved, onRefresh }: {
                  and no depot rate was supplied"). One sentence, in words. */
               <div>
                 Depot landed cost <b>unknown</b> — the excess was <b>not computed</b> for this buy
-                (stored as 0 and left out of the “price of running out” total).
+                (stored as 0 and left out of the “price of running out” total). Price it later from
+                the <b>Wine-shop buys</b>{' '}tab → <b>Set depot rate</b>.
               </div>
             ) : (
               <div>
@@ -3163,26 +3201,14 @@ function WineShopModal({ materials, onClose, onSaved, onRefresh }: {
                 “Reimbursed” is not on this list: a claim reaches that state only when a real petty-cash
                 payout closes it, so the box always has the cash behind the status.
               </div>
-              {/* AND SAY WHERE THAT PAYOUT IS, BECAUSE TODAY IT IS NOWHERE.
-                  POST /api/liquor/retail/<id>/reimburse is the only writer of
-                  'reimbursed', and grepping every client file (src/app,
-                  src/components, excluding src/app/api) finds NO caller: L5's
-                  reconciliation page renders reimbursement_status read-only.
-                  This dropdown is therefore the only writer of
-                  'claimed_pending' and nothing in the app can close what it
-                  writes — the amount sits in §E's "unreimbursed staff spend"
-                  until a screen exists. Refusing to offer the state would be
-                  worse (someone really did front the money, and that is the
-                  fact §E is for), and faking 'reimbursed' is exactly what the
-                  library refuses. So the operator is told, the same way the
-                  restart-backfill warning above tells them a truth whose fix
-                  belongs in another file. Delete this line when the payout
-                  screen ships. */}
+              {/* AND SAY WHERE THAT PAYOUT IS. POST /api/liquor/retail/<id>/reimburse
+                  is the only writer of 'reimbursed'; its caller is the Wine-shop
+                  buys tab on this page (WineShopRegister.tsx → Pay back), which
+                  also corrects a claim recorded pending by mistake. */}
               {status === 'claimed_pending' && (
-                <div className="text-[10px] text-amber-800 mt-0.5">
-                  No screen closes a pending claim yet — the petty-cash payout that sets “Reimbursed”
-                  has a route but no button, so this amount stays in “unreimbursed staff spend” until
-                  one is built. Record it anyway if someone is genuinely owed: the claim is the fact.
+                <div className="text-[10px] text-[#8B7355] mt-0.5">
+                  Pay it back later from the <b>Wine-shop buys</b>{' '}tab → <b>Pay back</b>{' '}— that petty-cash
+                  payout is what sets “Reimbursed”. Until then it counts in “unreimbursed staff spend”.
                 </div>
               )}
             </div>
@@ -3240,7 +3266,8 @@ function WineShopModal({ materials, onClose, onSaved, onRefresh }: {
               read from there and the excess is computed against it. <b>If the brand is not mapped and you
               leave this blank the buy is still recorded, but the excess is stored as 0 with the depot rate
               marked “unknown”.</b> That 0 means “not computed”, not “this run cost us nothing”, and the buy
-              stays out of the “price of running out” total until a rate is supplied.
+              stays out of the “price of running out” total until a rate is supplied on the Wine-shop buys
+              tab.
               {/* BASIS, SAID OUT LOUD. The Brand Map's figure is TGBCL's ₹ per
                   BOTTLE (rate_per_case_master ÷ bottles_per_case) and the excess
                   compares it, one for one, with the rate typed above. On this

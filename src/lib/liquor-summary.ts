@@ -58,7 +58,11 @@ import {
   type LqIndentLine, type LqRateVarianceRow,
 } from './liquor-recon';
 import { retailExcessSummary, type RetailExcessSummary } from './liquor-retail';
+import { withdrawalSummary, type WithdrawalSummary } from './liquor-withdrawals';
 import { getBillChargesForStore } from './store-engine';
+
+/** The catalog path this report and its API are gated on (mgmtOnly). */
+export const LQ_RECON_PAGE = '/inventory/liquor-reconciliation';
 
 /* ── rounding, mirrored from the deployed register + the wallet lib ──────────── */
 const r2 = (n: number): number => Math.round((Number(n) || 0) * 100) / 100;
@@ -228,10 +232,15 @@ export interface LqSectionD {
   mrp_rounding_per_bottle: number | null;
   /** Σ landed ÷ Σ bottles. Analytics only. */
   avg_landed_per_bottle: number | null;
-  /** bottles on case-packed lines (case_size > 1) — `cases` counts these alone. */
+  /** bottles on case-packed lines (a case of more than 1 bottle) — `cases`
+   *  counts these alone. */
   case_packed_bottles: number;
   /** bottles bought loose (no outer case). They are NOT in `cases`. */
   loose_bottles: number;
+  /** Where each line's case size came from: the TGBCL brand master
+   *  (lq_brand_map.bottles_per_case — preferred), the material's own
+   *  raw_materials.case_size (no usable master row), or neither (loose). */
+  case_source: { master_lines: number; material_lines: number; loose_lines: number };
   pending: LqPending | null;
 }
 
@@ -271,11 +280,33 @@ export interface LqSectionE {
 }
 
 /* ── §F total liquor cost ────────────────────────────────────────────────────── */
+/**
+ * §F. The TOTAL is the workbook's cash figure (depot Net Indent + retail spend).
+ * The SHARE follows owner decision 1 (2026-08-31): reports default to the
+ * EXISTING RECORDED basis and landed is opt-in. So `retail_share_pct` is L3's
+ * own figure — wine-shop spend ÷ (recorded depot purchase value + wine-shop
+ * spend), the one retailExcessSummary returns as wineShopSharePct — and the two
+ * screens that print a "retail share" now print the SAME number. It used to
+ * divide by the Net Indent total instead (measured: 7.55% here, 8.03% on the
+ * retail API for the same range). The landed-basis share of §F's own total is
+ * kept, opt-in and named, as `retail_share_pct_of_total`.
+ */
 export interface LqSectionF {
   depot_net_indent: number;
   retail_spend: number;
   total: number;
+  /** Recorded depot purchase value in range (L3's depotSpend: Σ store-ledger
+   *  purchase lines, IST day) — the denominator basis of retail_share_pct. */
+  depot_recorded_value: number;
+  /** depot_recorded_value + retail_spend (L3's liquorSpend). */
+  total_recorded: number;
+  /** DEFAULT (recorded basis): retail_spend ÷ total_recorded × 100 — identical
+   *  to L3's wineShopSharePct. null when there is nothing to divide by. */
   retail_share_pct: number | null;
+  /** One sentence naming the default share's denominator, for the page/CSV. */
+  retail_share_basis: string;
+  /** OPT-IN (landed basis): retail_spend ÷ `total` (Net Indent + retail) × 100. */
+  retail_share_pct_of_total: number | null;
   pending: LqPending | null;
 }
 
@@ -313,12 +344,29 @@ export interface LqWithdrawalBucket {
   recovered: number;
   outstanding: number;
 }
+/**
+ * §H. `pct_of_purchases` is L4's own figure (withdrawalSummary — the number the
+ * Withdrawals page prints as "% of purchases (₹…) in range"), so the two
+ * screens agree to the digit. It used to divide by the depot Net Indent
+ * instead (measured: 1.74% here against 1.86% on the Withdrawals page for the
+ * same store and range). Per owner decision 1 the default denominator is the
+ * RECORDED purchase value; the landed-basis ratio is kept, opt-in and named,
+ * as `pct_of_net_indent`.
+ */
 export interface LqSectionH {
   buckets: LqWithdrawalBucket[];
   total_landed_value: number;
   total_outstanding: number;
-  /** total landed value ÷ depot Net Indent × 100 — like-for-like, store-scoped. */
+  /** L4's denominator: recorded purchase value in range (Σ store-ledger
+   *  purchase/inward lines, IST day). */
+  purchases_value: number;
+  /** DEFAULT: total withdrawn landed value ÷ purchases_value × 100 — identical
+   *  to the Withdrawals page. null when there were no purchases. */
   pct_of_purchases: number | null;
+  /** One sentence naming numerator and denominator, for the page/CSV. */
+  pct_basis: string;
+  /** OPT-IN (landed basis): total landed value ÷ depot Net Indent (§B) × 100. */
+  pct_of_net_indent: number | null;
   pending: LqPending | null;
 }
 
@@ -387,6 +435,8 @@ interface LineRow {
   mrp: number;
   turnover: number;
   bucket: LqBucketKey;
+  /** true when `cases` used the TGBCL brand master's bottles_per_case. */
+  caseFromMaster: boolean;
 }
 
 interface LinesRead {
@@ -431,22 +481,40 @@ function readLines(db: Database, storeId: string, from: string, to: string): Lin
     for (const ln of alloc.lines) allocByLedger.set(ln.ledgerId, ln);
   }
 
-  // product_type per material, cached — a material maps to one product type
-  // across its pack variants, so this is cheap and stable.
-  const bucketByMaterial = new Map<string, LqBucketKey>();
-  const bucketFor = (materialId: string): LqBucketKey => {
-    const hit = bucketByMaterial.get(materialId);
+  // product_type AND the TGBCL case size per material, cached — a material maps
+  // to one product type across its pack variants, so this is cheap and stable.
+  //
+  // CASES COME FROM THE TGBCL BRAND MASTER FIRST. TGBCL indents in cases, and
+  // lq_brand_map.bottles_per_case is the master's own case (CHECKed > 0, set by
+  // the brand import). raw_materials.case_size is the store's pack metadata and
+  // is 1 on almost every liquor material (measured: 2 of 127 store-mapped
+  // materials carry a case), so reading only it reported 0 cases and a null
+  // cess-per-case even after the master said 24 and 12. Order:
+  //   1. the picked brand-map row's bottles_per_case;
+  //   2. when the pack is ambiguous but every candidate pack agrees on one
+  //      bottles_per_case, that figure (the case is not what is ambiguous);
+  //   3. otherwise raw_materials.case_size via caseFactor (unchanged rule).
+  // A case of 1 is "no outer case" on every path — the loose-bottle rule below.
+  const metaByMaterial = new Map<string, { bucket: LqBucketKey; bpc: number }>();
+  const metaFor = (materialId: string): { bucket: LqBucketKey; bpc: number } => {
+    const hit = metaByMaterial.get(materialId);
     if (hit) return hit;
     let bucket: LqBucketKey = 'Unmapped';
+    let bpc = 0;
     try {
       const pick = pickBrandMap(db, materialId);
       if (pick.row) {
         const pt = String(pick.row.product_type || '');
         bucket = pt === 'BEER' || pt === 'IML' || pt === 'Duty Paid' ? (pt as LqBucketKey) : 'Unmapped';
+        bpc = Number(pick.row.bottles_per_case) || 0;
+      } else if (pick.candidates.length > 0) {
+        const sizes = new Set(pick.candidates.map(c => Number(c.bottles_per_case) || 0));
+        if (sizes.size === 1) bpc = [...sizes][0];
       }
-    } catch { bucket = 'Unmapped'; }
-    bucketByMaterial.set(materialId, bucket);
-    return bucket;
+    } catch { bucket = 'Unmapped'; bpc = 0; }
+    const m = { bucket, bpc };
+    metaByMaterial.set(materialId, m);
+    return m;
   };
 
   const lines = raw.map(r => {
@@ -455,7 +523,8 @@ function readLines(db: Database, storeId: string, from: string, to: string): Lin
       pack_size: r.pack_size, case_size: r.case_size,
     };
     const pf = packFactor(meta);
-    const cf = caseFactor(meta);
+    const mm = metaFor(String(r.materialId));
+    const cf = mm.bpc > 1 ? mm.bpc : caseFactor(meta);
     const qty = Number(r.quantity) || 0;
     const uc = Number(r.unit_cost) || 0;
     const bottles = pf > 1 ? qty / pf : qty;
@@ -486,7 +555,8 @@ function readLines(db: Database, storeId: string, from: string, to: string): Lin
       tcs: a.tcs,
       mrp: a.mrp_rounding,
       turnover: a.excise_turnover_tax,
-      bucket: bucketFor(String(r.materialId)),
+      bucket: mm.bucket,
+      caseFromMaster: mm.bpc > 1,
     };
   });
   return { lines, wholeBillLines };
@@ -746,6 +816,11 @@ export function buildLiquorSummary(db: Database, opts: LqSummaryOpts): LqSummary
     avg_landed_per_bottle: (() => { const v = safeDiv(totLanded, totBottles); return v == null ? null : r4(v); })(),
     case_packed_bottles: r4(casePackedBottles),
     loose_bottles: r4(looseBottles),
+    case_source: {
+      master_lines: lines.filter(l => l.caseSized && l.caseFromMaster).length,
+      material_lines: lines.filter(l => l.caseSized && !l.caseFromMaster).length,
+      loose_lines: lines.filter(l => !l.caseSized).length,
+    },
     pending: linesErr
       ? unavailable('L1', 'The recorded indent lines')
       : (lines.length === 0
@@ -822,11 +897,21 @@ export function buildLiquorSummary(db: Database, opts: LqSummaryOpts): LqSummary
 
   /* ── §F total liquor cost ────────────────────────────────────────────────── */
   const totalCost = r2(depotNetIndent + retailSpend);
+  // The recorded-basis share is L3's, read off the same retailExcessSummary §E
+  // already called — one definition, so the two screens cannot drift apart.
+  const depotRecorded = r2(rx?.depotSpend ?? 0);
+  const totalRecorded = r2(rx?.liquorSpend ?? 0);
   const F: LqSectionF = {
     depot_net_indent: depotNetIndent,
     retail_spend: retailSpend,
     total: totalCost,
-    retail_share_pct: totalCost > 0 ? r4((retailSpend / totalCost) * 100) : null,
+    depot_recorded_value: depotRecorded,
+    total_recorded: totalRecorded,
+    retail_share_pct: rx && totalRecorded > 0 ? rx.wineShopSharePct : null,
+    retail_share_basis: 'Wine-shop spend ÷ (recorded depot purchase value + wine-shop spend) — the recorded basis '
+      + '(owner decision 1), the same figure as the retail register. The landed basis (÷ the Net Indent total above) '
+      + 'is retail_share_pct_of_total.',
+    retail_share_pct_of_total: totalCost > 0 ? r4((retailSpend / totalCost) * 100) : null,
     pending: linesErr
       ? unavailable('L1', 'The recorded indent lines')
       : ((indents.length === 0 && retailRows.length === 0)
@@ -898,11 +983,20 @@ export function buildLiquorSummary(db: Database, opts: LqSummaryOpts): LqSummary
   }));
   const wdLanded = r2(wdBuckets.reduce((s, b) => s + b.landed_value, 0));
   const wdOutstanding = r2(wdBuckets.reduce((s, b) => s + b.outstanding, 0));
+  // L4's own summary, for the "% of purchases" it prints — one definition.
+  const wdSumRead = readOr<WithdrawalSummary | null>(
+    () => withdrawalSummary(db, { from, to, store_id: storeId }), null);
+  const wdSum = wdSumRead.value;
   const H: LqSectionH = {
     buckets: wdBuckets,
     total_landed_value: wdLanded,
     total_outstanding: wdOutstanding,
-    pct_of_purchases: depotNetIndent > 0 ? r4((wdLanded / depotNetIndent) * 100) : null,
+    purchases_value: r2(wdSum?.purchases_value ?? 0),
+    pct_of_purchases: wdSum ? wdSum.pct_of_purchases : null,
+    pct_basis: 'Withdrawn landed value ÷ recorded purchase value in range (store-ledger purchase and inward lines, '
+      + 'IST day) — the recorded-basis denominator (owner decision 1), the same figure as the Withdrawals page. '
+      + 'The landed-basis ratio (÷ the §B Net Indent) is pct_of_net_indent.',
+    pct_of_net_indent: depotNetIndent > 0 ? r4((wdLanded / depotNetIndent) * 100) : null,
     pending: wdRead.error
       ? unavailable('L4', 'The stock-withdrawal register')
       : (wdBuckets.length === 0

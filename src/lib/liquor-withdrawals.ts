@@ -299,26 +299,31 @@ export const FORCED_BELOW_ON_HAND_TAG = '[forced below on-hand]';
  *  one bucket per row. 'damage' is the rail's word for a broken bottle. */
 export const CO_WRITE_WASTAGE_REASON = 'damage';
 
-/* ── ⚠ KNOWN HAZARD OF THE WASTAGE CO-WRITE (opt-in, default OFF) ─────────────
+/* ── THE WASTAGE CO-WRITE AND /wastage's TRASH BUTTON (opt-in, default OFF) ────
  * DELETE /api/wastage credits stock back for any row whose `department_id` is
  * blank: `UPDATE raw_materials SET current_stock = current_stock + qty`. That is
  * right for every row that rail creates (its POST debited central first) and
  * WRONG for a co-written row, whose movement is the store_stock_ledger row this
- * file posts. Deleting one from /wastage's Trash button ("Delete + credit stock
- * back") therefore INVENTS central stock — measured: 100 PIPERS (750ML)
- * current_stock 4020 → 4770 ml, with the liquor deduction still standing.
+ * file posts. Before the guard below existed, deleting one from /wastage
+ * INVENTED central stock — measured: 100 PIPERS (750ML) current_stock
+ * 4020 → 4770 ml, with the liquor deduction still standing and
+ * lq_withdrawals.wastage_id left pointing at a deleted row.
  *
- * It cannot be closed from inside phase L4: setting `department_id` only moves
- * the invented credit onto a department ledger, and the delete handler is not
- * this phase's file. The one-line owner fix, for when this lands:
+ * CLOSED IN DELETE /api/wastage (liquorWithdrawalRefFor): before either stock
+ * branch it looks the row up by `lq_withdrawals.wastage_id` and REFUSES (409,
+ * nothing written) when a withdrawal co-wrote it. Refuse, not "delete the row
+ * and credit nothing": that would still orphan wastage_id and quietly remove
+ * the breakage from /wastage while the register kept it. Not "unwind" either:
+ * there is no approved void for a withdrawal, which may carry money billed to a
+ * named person.
  *
- *   -- in DELETE /api/wastage, before either stock branch:
- *   const coWritten = db.prepare('SELECT 1 FROM lq_withdrawals WHERE wastage_id = ?').get(id);
- *   -- if coWritten: delete the row and return; credit NOTHING.
+ * THAT GUARD READS `wastage_id`, so the link is load-bearing: never write a
+ * co-written row without stamping its id on the register row in the SAME
+ * transaction (createWithdrawal does), and never clear or rewrite wastage_id
+ * afterwards. department_id stays NULL for the reason given at the INSERT.
  *
- * Until then the toggle stays OFF by default, the UI warns beside it, and every
- * co-written row carries the warning in its `notes`. Do not enable it by
- * default and do not remove the warnings without that guard in place. */
+ * The toggle stays OFF by default and the page still warns beside it: a
+ * breakage normally belongs on the Liquor Store register alone. */
 
 export function createWithdrawal(
   db: Database.Database,
@@ -519,15 +524,16 @@ export function createWithdrawal(
       // department_id is left NULL DELIBERATELY and is NOT a fix waiting to
       // happen: DELETE /api/wastage compensates a departmental row by posting
       // +qty to that department's ledger, which would invent the stock on a
-      // department rail instead of the central one. See the WARNING above
-      // co_write_wastage for what still bites on the central branch.
+      // department rail instead of the central one. DELETE /api/wastage refuses
+      // this row outright, keyed on the wastage_id stamped below in this same
+      // transaction (see the block above co_write_wastage).
       wastageId = generateId();
       insertWastage.run(
         wastageId, date, input.material_id, qtyRecipe,
         CO_WRITE_WASTAGE_REASON,
         input.recorded_by,
         `${ref} · liquor withdrawal, RECORD ONLY — stock already off the ${store.name} ledger`
-          + ` (₹${landedValue} landed); deleting this row credits stock that never left central`
+          + ` (₹${landedValue} landed); cannot be deleted from /wastage — it never left central`
           + `${remarks ? ` — ${remarks}` : ''}`,
         input.outlet_id || null,
       );
@@ -586,9 +592,25 @@ export function createWithdrawal(
 }
 
 /* ── Reads ────────────────────────────────────────────────────────────────── */
+
+/** `outstanding` is a GENERATED column, recoverable − recovered in SQLite REAL
+ *  arithmetic, so two clean 2dp figures can subtract to binary noise: measured,
+ *  1915.62 − 1000 came back as 915.6199999999999 on the PATCH response and on
+ *  every list row, while the §H summary (which rounds) said 915.62. Both inputs
+ *  are stored at 2dp, so 2dp is the exact answer, not a display choice. Applied
+ *  on EVERY read path that returns a row, so the PATCH reply, GET [id], the list,
+ *  the CSV and the audit note all carry the same figure the summary does. The
+ *  column itself stays untouched (it is unwritable, and db.ts is not this file). */
+function withCleanOutstanding<T extends { outstanding?: unknown }>(row: T): T {
+  if (row && row.outstanding !== undefined && row.outstanding !== null) {
+    (row as any).outstanding = round2(Number(row.outstanding));
+  }
+  return row;
+}
+
 export function getWithdrawalById(db: Database.Database, id: string): LqWithdrawal | null {
   const r = db.prepare('SELECT * FROM lq_withdrawals WHERE id = ?').get(id) as LqWithdrawal | undefined;
-  return r || null;
+  return r ? withCleanOutstanding(r) : null;
 }
 
 export interface WithdrawalFilter {
@@ -629,7 +651,7 @@ export function listWithdrawals(db: Database.Database, f: WithdrawalFilter = {})
     ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
     ORDER BY w.date DESC, w.created_at DESC
   `;
-  return db.prepare(sql).all(...args) as WithdrawalRow[];
+  return (db.prepare(sql).all(...args) as WithdrawalRow[]).map(withCleanOutstanding);
 }
 
 /* ── Section H — split by category, % of purchases, recoverable outstanding ───

@@ -309,13 +309,8 @@ const navTree: NavEntry[] = [
       // completely invisible — that is what once hid 8 pages including
       // /variance-approvals. canAccessPage filters these rows per user, so the
       // adminOnly / mgmtOnly flags set in the catalog hide them automatically.
-      //
-      // ⚠️ These pages are registered before they are BUILT (phases L1/L2/L4/L5)
-      // — until the owning phase ships, clicking one lands on a 404. Being
-      // *redirected* to one is already prevented: each carries `unbuilt: true`
-      // in the catalog, which keeps it out of homePathFor / firstAllowedPath.
-      // The phase that ships each page deletes its `unbuilt` flag and this row's
-      // share of this caveat.
+      // All four pages are built (src/app/inventory/liquor-*/page.tsx), so every
+      // row here opens a real page; none of them is a placeholder any more.
       { kind: "link", label: "Liquor Brand Map",   href: "/inventory/liquor-brand-map", icon: Link2 },
       { kind: "link", label: "Liquor Wallet",      href: "/inventory/liquor-wallet", icon: Wallet },
       { kind: "link", label: "Liquor Withdrawals", href: "/inventory/liquor-withdrawals", icon: PackageMinus },

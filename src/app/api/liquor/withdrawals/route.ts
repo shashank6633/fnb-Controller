@@ -1,6 +1,7 @@
 import { getDb } from '@/lib/db';
-import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
+import { getCurrentOutletId } from '@/lib/auth';
 import { getStoreById, listStores, materialStoreId } from '@/lib/store-engine';
+import { requireWithdrawalsAdmin } from './_lib/guard';
 import {
   createWithdrawal, listWithdrawals, withdrawalSummary, storeMaterialOnHand,
   type WithdrawalMaterial, type CreateWithdrawalInput,
@@ -12,11 +13,11 @@ import {
 /**
  * /api/liquor/withdrawals — liquor stock withdrawals register (phase L4).
  *
- * ADMIN-ONLY, server-side, on BOTH verbs. page-catalog flags the page adminOnly
- * and proxy.ts gates the navigation, but "This list is never the security
- * boundary" (page-catalog.ts): every route re-checks here. This is the
- * director/management personal-use ledger and it MOVES STOCK, so a manager with
- * a bare '/inventory' grant must still be refused.
+ * ADMIN-ONLY, server-side, on BOTH verbs, and CSRF-checked on POST. The gate is
+ * ./_lib/guard.ts, shared with /[id]; see it for why the double-submit check
+ * lives here and not in proxy.ts. This is the director/management personal-use
+ * ledger and it MOVES STOCK, so a manager with a bare '/inventory' grant must
+ * still be refused.
  *
  * GET  → { withdrawals, summary, stores, categories, recovery_basis }
  *        query: from, to, category, store_id, outstanding_only=1
@@ -39,9 +40,8 @@ function loadMaterial(db: ReturnType<typeof getDb>, id: string): WithdrawalMater
 
 export async function GET(request: Request) {
   try {
-    const user = await getCurrentUser();
-    if (!user) return Response.json({ error: 'Sign in required' }, { status: 401 });
-    if (user.role !== 'admin') return Response.json({ error: 'Admin only' }, { status: 403 });
+    const gate = await requireWithdrawalsAdmin(request);
+    if (!gate.ok) return gate.response;
     const db = getDb();
 
     const url = new URL(request.url);
@@ -70,9 +70,10 @@ export async function GET(request: Request) {
 
 export async function POST(request: Request) {
   try {
-    const user = await getCurrentUser();
-    if (!user) return Response.json({ error: 'Sign in required' }, { status: 401 });
-    if (user.role !== 'admin') return Response.json({ error: 'Admin only' }, { status: 403 });
+    // Auth + admin + CSRF, BEFORE the body is read or anything is looked up.
+    const gate = await requireWithdrawalsAdmin(request);
+    if (!gate.ok) return gate.response;
+    const user = gate.user;
     const db = getDb();
 
     const b = await request.json();

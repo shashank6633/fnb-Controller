@@ -8943,9 +8943,11 @@ function initializeSchema(db: Database.Database) {
   //   lq_withdrawals   NO   (it is store-scoped: it posts a store_stock_ledger row,
   //                          and that table has store_id and NO outlet_id. Carrying
   //                          both would create two scopes that can disagree.)
-  //   lq_retail_flags  NO   (a side record on a purchases row — outlet is read from
-  //                          the parent purchase, the same way store_bill_charges
-  //                          derives scope from its invoice instead of copying it.)
+  //   lq_retail_flags  YES  (it has no parent row to read one from any more: the
+  //                          stock moves on the store ledger, which has no outlet,
+  //                          and the claim is paid from an OUTLET's petty-cash box.
+  //                          Legacy rows anchored on a purchases row were backfilled
+  //                          from it by the rebuild below.)
   //   NOTE none of these are in TABLES_NEEDING_OUTLET (the boot backfill list near
   //   the top of this function) and they must not be added to it: that loop
   //   UPDATEs every NULL outlet_id to the default outlet on EVERY boot, which is
@@ -9088,18 +9090,33 @@ function initializeSchema(db: Database.Database) {
     `,
     `
       -- ── L3. Emergency wine-shop purchase — SIDE RECORD, not a purchase ────
-      -- The bottles are a REAL purchase and move stock through the existing
-      -- purchase flow (vendor = the wine shop). This row only carries what that
-      -- flow has nowhere to put. One row per PURCHASE LINE, because the
-      -- purchases table holds one row per ITEM and the excess is per bottle;
-      -- bill_ref groups the
-      -- lines of one trip for the petty-cash claim.
+      -- The bottles move stock WHERE LIQUOR LIVES: ONE store_stock_ledger
+      -- 'inward' row into the material's own store (ledger_id), at unit_cost 0
+      -- so the store keeps valuing it at its EXISTING recorded basis. There is
+      -- NO central `purchases` row: every reader of that table (updateMaterialPrice,
+      -- closing-valuation's last-purchase rung, the LPP boot backfill, cost
+      -- spikes) would take the retail MRP as the item's rate — owner decision 1.
+      -- The retail price lives ONLY here, as analytics. One row per ITEM LINE
+      -- (the excess is per bottle); bill_ref groups the lines of one trip for
+      -- the petty-cash claim.
+      -- purchase_id is the LEGACY anchor of rows written before this design
+      -- (a central purchases row); it is NULL on every new row, and the CHECK
+      -- below requires one anchor or the other.
       -- The four excess figures are FROZEN AT ENTRY, like landed_value below:
       -- depot landed cost moves with every later indent, and a report that
       -- silently re-prices last quarter's emergency buy is worse than no report.
       CREATE TABLE IF NOT EXISTS lq_retail_flags (
         id                      TEXT PRIMARY KEY,
-        purchase_id             TEXT NOT NULL,
+        purchase_id             TEXT,                      -- LEGACY anchor only; NULL on new rows
+        material_id             TEXT,                      -- the liquor material bought
+        -- The store_stock_ledger 'inward' row that moved the stock. NO FK, like
+        -- lq_withdrawals.ledger_id: /api/inventory/reset-liquor deletes the
+        -- whole ledger, and an FK here would make that existing flow fail.
+        ledger_id               TEXT,
+        -- The outlet whose petty-cash box owes the claim and whose §E view shows
+        -- it. Nullable like petty_cash_ledger.outlet_id; it used to be read off
+        -- the parent purchases row, which new rows no longer have.
+        outlet_id               TEXT,
         bill_ref                TEXT NOT NULL DEFAULT '',  -- wine-shop bill no (groups a trip)
         -- NO DEFAULT, like its parent purchases.date and like the two other
         -- lq_ date columns. A default of '' let a route that forgot the field
@@ -9126,10 +9143,17 @@ function initializeSchema(db: Database.Database) {
         created_at              TEXT NOT NULL DEFAULT (datetime('now')),
         updated_at              TEXT NOT NULL DEFAULT (datetime('now')),
         UNIQUE (purchase_id),
+        UNIQUE (ledger_id),
+        -- Every flag is anchored: a legacy purchases row, or (every new row)
+        -- the material AND the store-ledger movement it made.
+        CHECK (purchase_id IS NOT NULL OR (material_id IS NOT NULL AND ledger_id IS NOT NULL)),
         -- CASCADE: deleting the purchase deletes the note about it. Without this
         -- the FK would BLOCK an ordinary purchase delete — a new failure mode
         -- bolted onto an existing flow, which this module must not create.
         FOREIGN KEY (purchase_id)   REFERENCES purchases(id) ON DELETE CASCADE,
+        -- Bare, the same choice lq_withdrawals.material_id makes: a material a
+        -- money record names must not be deletable out from under it.
+        FOREIGN KEY (material_id)   REFERENCES raw_materials(id),
         -- SET NULL, not CASCADE and not blocking: deleting the petty-cash payout
         -- must reopen the claim, never delete the purchase's excess record.
         FOREIGN KEY (petty_cash_id) REFERENCES petty_cash_ledger(id) ON DELETE SET NULL
@@ -9242,6 +9266,49 @@ function initializeSchema(db: Database.Database) {
     try { db.exec(stmt); }
     catch (e) { console.error('liquor reconciliation (lq_*) schema failed for ' + (named ? named[1] : '?') + ':', e); }
   }
+
+  // ── lq_retail_flags: purchase_id NOT NULL → nullable (L3 store-ledger design)
+  // A database booted before the wine-shop buy moved onto the store ledger has
+  // purchase_id NOT NULL, which no ALTER can relax, so every new flag (which has
+  // no purchases row) would fail its INSERT. Rebuild it ONCE — the store_transfers
+  // "Option B" procedure above: foreign_keys OFF around the swap, guarded on
+  // notnull so a correct table is a no-op. The new table is created from the SAME
+  // CREATE TABLE text as the loop above (no second column list to rot); rows are
+  // copied by the columns both shapes share, and legacy rows get material_id /
+  // outlet_id read ONCE from their parent purchase. Indexes are recreated by the
+  // index block below. Single statements only (prepare/run), so nothing in the
+  // swap can be silently skipped the way a multi-statement string can.
+  try {
+    const pcol = db.prepare(`SELECT "notnull" AS nn FROM pragma_table_info('lq_retail_flags') WHERE name = 'purchase_id'`).get() as { nn: number } | undefined;
+    if (pcol && Number(pcol.nn) === 1) {
+      const ddl = LQ_TABLE_DDL.find(s => /CREATE TABLE IF NOT EXISTS lq_retail_flags\b/.test(s));
+      if (!ddl) throw new Error('lq_retail_flags CREATE TABLE text not found');
+      const oldCols = new Set((db.prepare(`SELECT name FROM pragma_table_info('lq_retail_flags')`).all() as Array<{ name: string }>).map(c => c.name));
+      db.pragma('foreign_keys = OFF');
+      try {
+        db.transaction(() => {
+          db.prepare('DROP TABLE IF EXISTS lq_retail_flags__rebuild').run();
+          db.prepare(ddl.replace(/CREATE TABLE IF NOT EXISTS lq_retail_flags\b/, 'CREATE TABLE lq_retail_flags__rebuild')).run();
+          const shared = (db.prepare(`SELECT name FROM pragma_table_info('lq_retail_flags__rebuild')`).all() as Array<{ name: string }>)
+            .map(c => c.name).filter(n => oldCols.has(n));
+          db.prepare(`INSERT INTO lq_retail_flags__rebuild (${shared.join(', ')}) SELECT ${shared.join(', ')} FROM lq_retail_flags`).run();
+          db.prepare(`
+            UPDATE lq_retail_flags__rebuild
+               SET material_id = COALESCE(material_id, (SELECT p.material_id FROM purchases p WHERE p.id = lq_retail_flags__rebuild.purchase_id)),
+                   outlet_id   = COALESCE(outlet_id,   (SELECT p.outlet_id   FROM purchases p WHERE p.id = lq_retail_flags__rebuild.purchase_id))
+             WHERE purchase_id IS NOT NULL
+          `).run();
+          db.prepare('DROP TABLE lq_retail_flags').run();
+          db.prepare('ALTER TABLE lq_retail_flags__rebuild RENAME TO lq_retail_flags').run();
+          const bad = db.prepare(`SELECT COUNT(*) AS c FROM pragma_foreign_key_check('lq_retail_flags')`).get() as { c: number };
+          if (Number(bad.c) > 0) throw new Error(bad.c + ' foreign-key violation(s) after the rebuild — rolled back');
+        })();
+        console.log('[db] lq_retail_flags rebuilt: purchase_id is now nullable (wine-shop buys anchor on the store ledger)');
+      } finally {
+        db.pragma('foreign_keys = ON');
+      }
+    }
+  } catch (e) { console.error('liquor reconciliation (lq_*) lq_retail_flags rebuild failed:', e); }
 
   // ── SHAPE GUARD — the thing CREATE TABLE IF NOT EXISTS cannot do ──────────
   // IF NOT EXISTS answers "is there an object with this name", never "does it
@@ -9386,6 +9453,7 @@ function initializeSchema(db: Database.Database) {
       CREATE INDEX IF NOT EXISTS idx_lq_retail_bill  ON lq_retail_flags(bill_ref);
       CREATE INDEX IF NOT EXISTS idx_lq_retail_reimb ON lq_retail_flags(reimbursement_status);
       CREATE INDEX IF NOT EXISTS idx_lq_retail_petty ON lq_retail_flags(petty_cash_id);
+      CREATE INDEX IF NOT EXISTS idx_lq_retail_material ON lq_retail_flags(material_id, date);
 
       CREATE INDEX IF NOT EXISTS idx_lq_withdrawals_date     ON lq_withdrawals(date);
       CREATE INDEX IF NOT EXISTS idx_lq_withdrawals_store    ON lq_withdrawals(store_id, date);
