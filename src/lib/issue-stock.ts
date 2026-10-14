@@ -187,14 +187,15 @@
  * material's factor, and the pre-ledger remainder arithmetic in the end-to-end
  * log depends on that reversal being exact.
  */
-import { packFactor, fmtQtyNum, type PackMeta } from '@/lib/pack-units';
+import { packFactor, fmtQtyNum, toPurchaseQty } from '@/lib/pack-units';
 import { generateId } from '@/lib/db';
 import { centralFlowBlock } from '@/lib/store-engine';
 import { postDeptLedger, assertReversible } from '@/lib/dept-ledger';
 import { postCentralTxn, deptParty } from '@/lib/movement-record';
 // THE ONE RULE for "does this debit fit, and what do we subtract" — shared with
-// every other central floor. See its header for the grid and why 1e-6.
-import { planCentralDebit } from '@/lib/central-debit-clamp';
+// every other central floor. See its header for the grid and why 1e-6, and for
+// the shown-figure rule the desks' purchase-unit figure obeys (round 6).
+import { planCentralDebit, holdsAny, qtyDown, qtyGrid, fmtGridQty } from '@/lib/central-debit-clamp';
 
 export interface IssueDeltaInput {
   reqItemId: string;
@@ -422,85 +423,86 @@ export interface CentralIssueCheck {
   availableRecipe: number;
   /** The raw stored balance, negative included, so nothing is hidden. */
   centralStockRecipe: number;
-  /** Largest afterLineQty this line can reach, in the LINE'S OWN unit. */
+  /** The afterLineQty to TYPE to issue everything the store can give this line,
+   *  in the LINE'S OWN unit: the line-unit image of the shown figure
+   *  `availablePurchase`, so typing it back is accepted (and, being the shown
+   *  balance, takes all of it). */
   maxIssueLineQty: number;
+  /**
+   * The afterLineQty the caller must WRITE to requisition_items.quantity_issued
+   * so the line records what actually left the shelf. Equal to the afterLineQty
+   * it was given on every ordinary issue (byte-identical, no float re-sum);
+   * different ONLY when the shown-figure rule took the balance and the balance
+   * differs from the typed figure by at least one grid step — then it is
+   * beforeLineQty + debitRecipe / packFactor. See issueLineQtyToRecord.
+   */
+  recordAfterLineQty: number;
   /** requisition_items.unit as stored ('' means the recipe basis — Option B). */
   lineUnit: string;
+  /** The ask in PURCHASE units as the desk shows it (toPurchaseQty, 3 dp
+   *  half-up); unrounded only for a sub-display ask that would show as 0. */
   requestedPurchase: number;
+  /** The cap in PURCHASE units: the balance's SHOWN figure (toPurchaseQty — the
+   *  "In store" column's own number), which the shown-figure rule accepts when
+   *  typed back and debits as the whole balance. For a sub-display crumb (shows
+   *  0, holds ≥ one grid step) the exact purchase image of its 6-dp recipe
+   *  figure. 0 only when holdsAny() is false. */
   availablePurchase: number;
   /** raw_materials.purchase_unit as stored. Never blank on any of the 952 live
    *  materials (checked), so a message may lean on it. */
   purchaseUnit: string;
+  /** LINE ↔ recipe factor (lineFactor) — what the debit is converted with. */
   packFactor: number;
+  /** PURCHASE ↔ recipe factor of the material (packFactor of its pack meta) —
+   *  what the purchase-unit figures above are converted with. Equal to
+   *  packFactor on a purchase-unit line, 1 on a line already in recipe units. */
+  purchasePackFactor: number;
   /** '' when ok. Already phrased for a storekeeper, in PURCHASE units. */
   message: string;
 }
 
-/** Round DOWN to the house 6dp. A cap must never round itself up past the
- *  balance it is capping. */
-const floor6 = (n: number) => Math.floor((Number(n) || 0) * 1e6) / 1e6;
-
 /* ────────────────────────────────────────────────────────────────────────────
- * THE SAME RULE, ONE CONVERSION LATER: THE PURCHASE-BASIS DISPLAY PRECISION.
+ * THE PURCHASE-BASIS FIGURE: THE ONE THE DESK SHOWS, AND THE RULE THAT OBEYS IT.
  *
- * toPurchaseQty() (pack-units.ts:212) is the one converter every purchase-unit
- * display in this app goes through, and it ROUNDS to 3 dp. That is right for a
- * figure that is only being READ and wrong for a figure that is being OBEYED,
- * and the refusal below is the second kind: the storekeeper types it back.
+ * toPurchaseQty() (pack-units.ts) is the one converter every purchase-unit
+ * display goes through, and it rounds to 3 dp, half-up. Both desks print the
+ * central balance through exactly that arithmetic (U.stockPU, the "In store"
+ * column) and the storekeeper types what he reads.
  *
- * MEASURED on live data. THREE MANGO RED CHILLI POWDER 500 GM (g/kg, pack 1000)
- * holds 14,842.5 g. toPurchaseQty rounded that UP to 14.843 kg, the refusal read
- * "the central store holds only 14.843 kg, so 20 kg cannot be issued. Issue
- * 14.843 kg or less on this line." — and typing 14.843 back came back refused
- * with the identical sentence, because 14,843 g > 14,842.5 g. GREEN APPLE
- * (8,368.5 g) behaved the same. 2 of the 466 materials holding stock were in
- * that state, and every fractional-gram issue adds another. floor6 above states
- * the rule this file already applies to max_issue_qty; these two apply it to the
- * printed figures, which is where it was missing.
+ * ROUND 5 FLOORED THE CAP AND CEILED THE ASK, and that was a trap. MEASURED on
+ * THREE MANGO RED CHILLI POWDER 500 GM (g/kg, pack 1000, 14,842.5 g; GREEN APPLE
+ * 8,368.5 g the same): the column showed 14.843 kg, typing it was refused
+ * "holds only 14.842 kg", clicking the offered 14.842 left 0.5 g behind, and the
+ * NEXT ask read "the central store holds none of it" over that 0.5 g — whose
+ * only way out was typing 0.0005 kg, a figure no screen shows. Production
+ * accepted 14.843 and went to −0.5 g.
  *
- * SO THE TWO NUMBERS IN THE SENTENCE GET THE ONLY ROUNDING EACH CAN SURVIVE:
- *   · the CAP rounds DOWN — it may never name more than the store holds, or the
- *     storekeeper is refused for typing what he was told to type.
- *   · the ASK rounds UP — it may never name less than was actually asked for.
- * That also makes the sentence structurally honest rather than honest by luck:
- * capShown ≤ cap < ask ≤ askShown, so the printed cap is ALWAYS strictly below
- * the printed ask and "holds only 14.842 kg, so 14.842 kg cannot be issued" —
- * reachable today whenever both figures round into the same 3rd decimal — cannot
- * be printed at all.
+ * ROUND 6 OBEYS THE SHOWN FIGURE INSTEAD — the rule is planCentralDebit's
+ * `shownAs` (src/lib/central-debit-clamp.ts, "THE SHOWN FIGURE IS THE BALANCE"),
+ * decided there once; this file only hands it the converter:
+ *   · an ask whose toPurchaseQty equals the balance's (and is > 0) is "all of
+ *     it": it fits, the debit is the balance itself, the landing is exactly 0,
+ *     and the line RECORDS that balance (recordAfterLineQty) — not the typed
+ *     figure, which is up to half a 0.001 step away from what left the shelf;
+ *   · the CAP this file prints is therefore the SHOWN figure itself (14.843 kg,
+ *     the column's own number), and typing it back is accepted by construction;
+ *   · the ASK is printed through the same converter. On every refusal that
+ *     remains the two shown figures differ and the ask's is the larger, so the
+ *     sentence can never read "holds only X, so X cannot be issued".
  *
- * WHY ROUND-THEN-STEP AND NOT Math.floor(x * 1000) / 1000. 8,369 g on a pack of
- * 1000 is EXACTLY 8.369 kg, and in binary x * 1000 can land at
- * 8368.999999999999; a bare floor would quietly shave 0.001 off clean balances
- * all over the app. The tick only moves when the rounding went the wrong way by
- * more than EPS — a real rounding, never float dust. Measured over the 466
- * materials holding stock, exactly 2 printed figures change (the 2 broken ones,
- * by 0.001 each) and the other 464 are byte-identical.
- *
- * THE ZERO BRANCH DOES NOT WIDEN, measured rather than assumed: the only two
- * materials whose purchase-basis cap reads 0 are float dust (7.1e-15 kg,
- * 1.8e-15 kg), which rounded to 0 before this and floors to 0 after it. No live
- * balance sits in the band [0.0005, 0.001) purchase units where a floor would
- * newly print "holds none of it".
+ * A BALANCE THE COLUMN SHOWS AS 0 BUT THE STORE STILL HOLDS (a crumb under half
+ * a step — 0.4 g on a 1000-pack — left by a floor that works in recipe units) is
+ * NOT "none of it": holdsAny() says so, and the refusal names it in recipe units
+ * with the purchase figure that, typed back, takes it (puFine below).
  * ──────────────────────────────────────────────────────────────────────────*/
 
-/** One tick of the purchase-basis display precision (toPurchaseQty's 3 dp). */
-const PU_TICK = 0.001;
-const r3 = (n: number) => Math.round((Number(n) || 0) * 1000) / 1000;
-
-/** recipe → purchase units, never ABOVE the true figure. For a CAP. */
-function purchaseQtyDown(recipeQty: number, m: PackMeta): number {
-  const exact = (Number(recipeQty) || 0) / packFactor(m);
-  const r = r3(exact);
-  const v = r <= exact + EPS ? r : r3(r - PU_TICK);
-  return v === 0 ? 0 : v; // normalises -0, as toPurchaseQty does
-}
-
-/** recipe → purchase units, never BELOW the true figure. For an ASK. */
-function purchaseQtyUp(recipeQty: number, m: PackMeta): number {
-  const exact = (Number(recipeQty) || 0) / packFactor(m);
-  const r = r3(exact);
-  const v = r >= exact - EPS ? r : r3(r + PU_TICK);
-  return v === 0 ? 0 : v;
+/** A purchase-unit figure printed at enough decimals to carry a 6-dp RECIPE
+ *  quantity exactly (6 + log10 of the pack). Only for the sub-display crumb
+ *  case, where the 3-dp figure would read 0. Typed back through either desk's
+ *  fromPU (× pack, rounded to 6 dp) it lands on the same recipe grid point. */
+function puFine(purchaseQty: number, pf: number): string {
+  const dp = Math.min(20, 6 + Math.max(0, Math.ceil(Math.log10(pf > 1 ? pf : 1))));
+  return (Number(purchaseQty) || 0).toLocaleString('en-IN', { maximumFractionDigits: dp });
 }
 
 /**
@@ -574,8 +576,9 @@ export function checkCentralIssue(
     materialId: '', materialName: '', requestedRecipe: 0, netRecipe: 0,
     debitRecipe: 0, availableRecipe: 0,
     centralStockRecipe: 0, maxIssueLineQty: Number(a.afterLineQty) || 0,
+    recordAfterLineQty: Number(a.afterLineQty) || 0,
     lineUnit: '', requestedPurchase: 0, availablePurchase: 0,
-    purchaseUnit: '', packFactor: 1, message: '', ...over,
+    purchaseUnit: '', packFactor: 1, purchasePackFactor: 1, message: '', ...over,
   });
 
   const line = db.prepare(`
@@ -645,13 +648,32 @@ export function checkCentralIssue(
   // subtract, so the floor and the write cannot disagree. Against
   // `stock − claimed`, so the pre-flight's running claim and the floor's
   // per-line re-read see the same balance.
-  const plan = planCentralDebit(stock - claimed, requestedRecipe);
+  //
+  // THE SHOWN FIGURE (round 6): the converter is toPurchaseQty — the arithmetic
+  // of both desks' "In store" column — so an ask typed from that column is
+  // matched against the very figure the storekeeper read. The rule itself is
+  // planCentralDebit's; nothing here decides "fits".
+  const pf = packFactor(meta);
+  const plan = planCentralDebit(stock - claimed, requestedRecipe, r => toPurchaseQty(r, meta));
   const purchaseUnit = String(line.purchase_unit || line.unit || '').trim();
-  // DOWN for the cap, UP for the ask — see purchaseQtyDown/Up above. These two
-  // are what the message prints and what both desks print, so this is the only
-  // place the direction is decided.
-  const availablePurchase = purchaseQtyDown(availableRecipe, meta);
-  const requestedPurchase = purchaseQtyUp(requestedRecipe, meta);
+  const recipeUnit = String(line.unit || '').trim();
+  const shownAvail = Number(plan.shownAvailable) || 0;
+  const shownAsk = Number(plan.shownAsk) || 0;
+  // THE SUB-DISPLAY CRUMB: the store holds at least one grid step, but less than
+  // half a 0.001 purchase step, so the column shows 0. Its typeable figure is the
+  // balance's own grid point, carried in purchase units without the 3-dp
+  // rounding (puFine prints it).
+  const gridAvail = qtyDown(plan.available, 6);
+  const crumb = shownAvail <= 0 && holdsAny(plan.available);
+  // THE CAP IS THE SHOWN FIGURE — the column's own number, accepted when typed
+  // back because it IS the balance's shown figure (byShownFigure). Never a
+  // floored figure: round 5's floor sent the storekeeper to 14.842, which left a
+  // 0.5 g crumb the column then showed as nothing.
+  const availablePurchase = shownAvail > 0 ? shownAvail : crumb ? gridAvail / pf : 0;
+  // The ask through the same converter. A sub-display ask (it shows as 0) is
+  // carried unrounded so the sentence never says "0 kg cannot be issued".
+  const requestedPurchase = shownAsk > 0 ? shownAsk : requestedRecipe / pf;
+  const beforeLine = Number(a.beforeLineQty) || 0;
   const base: CentralIssueCheck = {
     ok: true, debits: true, skipReason: '',
     reqItemId: String(line.id),
@@ -664,15 +686,29 @@ export function checkCentralIssue(
     requestedRecipe, netRecipe: plan.fits ? plan.debit : requestedRecipe,
     debitRecipe: plan.debit,
     availableRecipe, centralStockRecipe: stock,
-    // In the LINE's unit, floored, so the value can be typed straight back into
-    // the Issue box and pass this very check on the retry.
-    maxIssueLineQty: Math.max(
-      Number(a.beforeLineQty) || 0,
-      floor6((Number(a.beforeLineQty) || 0) + availableRecipe / (factor || 1)),
-    ),
+    // In the LINE's unit: the line-unit image of `availablePurchase`, so the
+    // value typed straight back into the Issue box is the shown figure and
+    // passes this very check on the retry. purchase → recipe is × pf, recipe →
+    // line is ÷ factor (a purchase-unit line has factor = pf, so it is the shown
+    // figure itself); rounded at the 6 dp both desks' fromPU rounds an entry to.
+    // A crumb is carried unrounded — 6 dp of a purchase-unit line would shave a
+    // 0.4 g crumb on a 1000-pack to nothing.
+    maxIssueLineQty: shownAvail > 0
+      ? beforeLine + Math.round((shownAvail * pf / (factor || 1)) * 1e6) / 1e6
+      : crumb
+        ? beforeLine + gridAvail / (factor || 1)
+        : beforeLine,
+    // WHAT THE LINE MUST RECORD. The afterLineQty as given, untouched (so an
+    // ordinary issue is byte-identical — no `before + delta` float re-sum),
+    // unless the shown-figure rule took a balance that differs from the typed
+    // figure by a grid step or more: then the line says what left the shelf.
+    recordAfterLineQty: plan.fits && !plan.debitIsAsk
+      ? beforeLine + plan.debit / (factor || 1)
+      : (Number(a.afterLineQty) || 0),
     lineUnit: String(line.line_unit ?? ''),
     requestedPurchase, availablePurchase, purchaseUnit,
     packFactor: factor,
+    purchasePackFactor: pf,
     message: '',
   };
   // An issue of everything on the shelf — binary noise included, or the 6-dp
@@ -688,21 +724,53 @@ export function checkCentralIssue(
   // pattern (9 recorded instances) in message form. So the empty case gets its
   // own sentence and names the way out, and only the 56 are offered a partial.
   //
-  // AND THE PARTIAL IT OFFERS IS NOW TYPEABLE. `availablePurchase` is floored
-  // (purchaseQtyDown), so the figure in "Issue X or less" is a figure this very
-  // function accepts on the retry — proved by typing it back on the real
-  // 14,842.5 g balance, not by reading this code. The PURCHASE unit is the right
-  // basis for it because that is the unit BOTH desks' Issue boxes are entered in
-  // (requisitions/page.tsx `issued_pu` → U.fromPU, store-requisitions/page.tsx
-  // `editQty` → U.fromPU); the line unit the API itself takes is reached only
-  // through those converters, never typed by a human.
-  const q = (n: number) => `${fmtQtyNum(n)}${purchaseUnit ? ` ${purchaseUnit}` : ''}`;
-  const message = availablePurchase > 0
-    ? `${base.materialName}: the central store holds only ${q(availablePurchase)}, `
-      + `so ${q(requestedPurchase)} cannot be issued. Issue ${q(availablePurchase)} or less on this line.`
-    : `${base.materialName}: the central store holds none of it, `
-      + `so ${q(requestedPurchase)} cannot be issued. Receive the stock, or record a closing count, first.`;
-  return { ...base, ok: false, message };
+  // AND THE PARTIAL IT OFFERS IS TYPEABLE, AND TAKES IT ALL. `availablePurchase`
+  // is the SHOWN figure (the "In store" column's own number), which the
+  // shown-figure rule accepts on the retry and debits as the whole balance —
+  // proved by typing it back on the real 14,842.5 g and 8,368.5 g balances, not
+  // by reading this code. The PURCHASE unit is the right basis because that is
+  // the unit BOTH desks' Issue boxes are entered in (requisitions/page.tsx
+  // `issued_pu` → U.fromPU, store-requisitions/page.tsx `editQty` → U.fromPU);
+  // the line unit the API takes is reached only through those converters.
+  //
+  // "HOLDS NONE OF IT" ONLY WHEN IT HOLDS NONE — holdsAny(), the one test every
+  // floor uses. A crumb the column shows as 0 is named in recipe units, with the
+  // purchase figure that takes it.
+  return {
+    ...base, ok: false,
+    message: centralShortMessage(base, {
+      holds: holdsAny(plan.available), shownAvail, shownAsk, gridAvail, recipeUnit, pf,
+    }),
+  };
+}
+
+/** The refusal sentence for a short line, in the purchase unit the desks type
+ *  in. Three branches, chosen by holdsAny and the shown figure — never by a
+ *  rounded display figure on its own. Shared by checkCentralIssue (so the
+ *  pre-flight and the floor) and by the after-the-gesture re-score of a held
+ *  line, so the sentences cannot drift. */
+function centralShortMessage(
+  c: CentralIssueCheck,
+  f: { holds: boolean; shownAvail: number; shownAsk: number; gridAvail: number; recipeUnit: string; pf: number },
+): string {
+  const pu = c.purchaseUnit;
+  const q = (n: number) => `${fmtQtyNum(n)}${pu ? ` ${pu}` : ''}`;
+  const ru = f.recipeUnit ? ` ${f.recipeUnit}` : '';
+  // The ask: its shown figure when it has one, otherwise (a sub-display ask) its
+  // recipe figure — never "0 kg cannot be issued".
+  const askFig = f.shownAsk > 0 ? q(f.shownAsk) : `${fmtGridQty(c.requestedRecipe)}${ru}`;
+  if (!f.holds) {
+    return `${c.materialName}: the central store holds none of it, `
+      + `so ${askFig} cannot be issued. Receive the stock, or record a closing count, first.`;
+  }
+  if (f.shownAvail > 0) {
+    return `${c.materialName}: the central store holds only ${q(f.shownAvail)}, `
+      + `so ${askFig} cannot be issued. Issue ${q(f.shownAvail)} or less on this line.`;
+  }
+  const fine = `${puFine(c.availablePurchase, f.pf)}${pu ? ` ${pu}` : ''}`;
+  return `${c.materialName}: the central store holds only ${fmtGridQty(f.gridAvail)}${ru} of it `
+    + `— less than the 0.001${pu ? ` ${pu}` : ''} the store desk shows — so ${askFig} cannot be issued. `
+    + `Issue ${fine} or less on this line, or record a closing count.`;
 }
 
 /**
@@ -723,6 +791,83 @@ export function assertCentralIssue(
   const c = checkCentralIssue(db, a);
   if (!c.ok) throw new CentralStockShort(c);
   return c;
+}
+
+/**
+ * THE QUANTITY A ROUTE MUST WRITE TO requisition_items.quantity_issued (round 6).
+ *
+ * Both desks write quantity_issued BEFORE they call applyIssueDelta (the caller
+ * contract above). Until round 6 the figure written was always the figure typed,
+ * and that was safe because the floor's debit never differed from it by a grid
+ * step. The shown-figure rule (planCentralDebit) changes that on exactly one
+ * gesture: typing the balance's shown figure — 14.843 kg over 14,842.5 g — takes
+ * the balance, 0.5 g less than typed. Writing 14.843 would leave the line, the
+ * issue_history and the audit row claiming half a gram that never left the
+ * shelf; so the route asks HERE, writes what this returns, and passes the same
+ * figure to applyIssueDelta.
+ *
+ * CALL IT INSIDE THE TRANSACTION, IMMEDIATELY BEFORE THE UPDATE — the same rule
+ * as the pre-image: it reads current_stock, and better-sqlite3 lets nothing
+ * interleave between this read, the UPDATE and applyIssueDelta's own floor, so
+ * the floor then sees an ask on the balance's grid point and takes exactly it.
+ *
+ * `changed` is false on every ordinary issue, and then `afterLineQty` is the
+ * value passed in, untouched — so a route that keys "did the figure move" on it
+ * stays byte-identical to round 5 everywhere the rule did not fire. A line that
+ * does not debit central (party, store-mapped, unit review, a credit, a zero
+ * delta) and a line the floor would refuse are returned as given: the first
+ * moves no stock to record, the second is the floor's to refuse.
+ */
+export function issueLineQtyToRecord(
+  db: any,
+  a: { reqItemId: string; beforeLineQty: number; afterLineQty: number },
+): { afterLineQty: number; changed: boolean } {
+  const asked = Number(a.afterLineQty) || 0;
+  const c = checkCentralIssue(db, a);
+  if (!c.debits || !c.ok || c.recordAfterLineQty === asked) return { afterLineQty: asked, changed: false };
+  return { afterLineQty: c.recordAfterLineQty, changed: true };
+}
+
+/**
+ * A HELD LINE'S ROW, SCORED AGAINST WHAT IS LEFT AFTER THE GESTURE (round 6).
+ *
+ * THE DEFECT, MEASURED SHAPE. One POST names the same material twice: line A
+ * asks 1.5 kg of a 1 kg balance and is held with cap 1 kg; line B (0.4 kg) then
+ * issues. The pre-flight scored A before B ran, so the 200 told the storekeeper
+ * "issue 1 kg or less" — and typing 1 kg back was refused, because 0.6 kg was
+ * left. A cap printed after the gesture must be the cap after the gesture.
+ *
+ * So the routes keep the pre-flight's HOLD decision (it is the floor's decision
+ * in write order, and it is right), and re-score only the FIGURES of each held
+ * row here, INSIDE the transaction, after every write of the gesture — reading
+ * current_stock as it now stands, with nothing claimed, because everything the
+ * gesture took is already out of the balance. That is exactly the balance the
+ * storekeeper's next POST will meet.
+ *
+ * IF IT NOW FITS — a credit later in the same gesture (an undo, an omitted line
+ * on store-process) put stock back after this line's turn — the line was still
+ * correctly held (the floor runs in order and would have refused it at its
+ * turn), and the row says so and gives the figure that now fits, instead of a
+ * refusal sentence that is no longer true.
+ */
+export function rescoreHeldIssue(
+  db: any,
+  a: { reqItemId: string; beforeLineQty: number; afterLineQty: number },
+): CentralIssueCheck {
+  const c = checkCentralIssue(db, a);
+  if (!c.debits || !c.ok) return c;
+  const pu = c.purchaseUnit ? ` ${c.purchaseUnit}` : '';
+  // >= 0.001 ⇔ it is a shown figure (checkCentralIssue carries the shown
+  // figure whenever there is one); below that it is a sub-display crumb,
+  // printed exactly so it can be typed back.
+  const fig = (n: number) => n >= 0.001 ? `${fmtQtyNum(n)}${pu}` : `${puFine(n, c.purchasePackFactor)}${pu}`;
+  const cap = fig(c.availablePurchase);
+  const ask = fig(c.requestedPurchase);
+  return {
+    ...c, ok: false,
+    message: `${c.materialName}: not issued with the rest of this gesture — when its turn came the central `
+      + `store held less than ${ask}. After the gesture it holds ${cap}; issue ${ask} again.`,
+  };
 }
 
 /* ────────────────────────────────────────────────────────────────────────────
@@ -1051,6 +1196,15 @@ export function applyIssueDelta(db: any, input: IssueDeltaInput): IssueDeltaResu
       // be 0 here: deltaRecipe is 6-dp rounded and > 0, so it is at least one
       // grid step, which a zero balance does not fit.
       stockQty = c.debitRecipe;
+      // THE HAND-OVER RECORD FOLLOWS THE SHELF, NOT THE TYPING (round 6). The
+      // shown-figure rule can take a balance up to half a 0.001 purchase step
+      // away from the figure typed (14,842.5 g for 14.843 kg). Both desks resolve
+      // the line to that figure first (issueLineQtyToRecord), so here the two
+      // agree on the grid and nothing changes; this is the backstop for a caller
+      // that did not, so recorded_recipe_qty never claims a gram the debit did
+      // not move. Only when they differ by a whole grid step — on the grid rule
+      // alone they never do, so every round-5 row is byte-identical.
+      if (qtyGrid(stockQty) !== qtyGrid(recordQty)) recordQty = stockQty;
     }
 
     // Positive delta = goods left the store.

@@ -2,7 +2,7 @@ import { getDb, generateId } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
 import { isStoreMappedMaterial } from '@/lib/store-engine';
 import { postDeptLedger, deptOnHand } from '@/lib/dept-ledger';
-import { planCentralDebit, qtyDown } from '@/lib/central-debit-clamp';
+import { planCentralDebit, printableCap, fmtGridQty } from '@/lib/central-debit-clamp';
 
 /**
  * Wastages — Phase 1 §6 consumption channel.
@@ -285,7 +285,12 @@ export async function POST(request: Request) {
           centralQty = plan.debit;
           // DISPLAY ONLY, at the precision fmtQty prints (4 dp), never naming
           // more than the plan accepts — a "holds only X" the operator can type.
-          const onHand = qtyDown(plan.available, 4);
+          // printableCap, not a bare qtyDown: it never reads 0 while the store
+          // holds a grid step or more (holdsAny), falling to 6 dp for a crumb
+          // under 0.0001 — so "holds none" below is said only when it is true.
+          const cap = printableCap(plan.available, 4);
+          const onHand = cap.value;
+          const fmtCap = (n: number) => (cap.dp > 4 ? fmtGridQty(n) : fmtQty(n));
           if (!plan.fits) {
             // REFUSE, never clamp — see the department branch above and the
             // header. The sentence is the department branch's, word for word,
@@ -316,7 +321,7 @@ export async function POST(request: Request) {
             // unit-lock: recipe basis — the stored, posted and caller-supplied
             // basis for wastage; reasoned out in full a few lines above.
             const wayOut = onHand > 0
-              ? `Record ${fmtQty(onHand)} ${rm.unit} or less against Central Store.`
+              ? `Record ${fmtCap(onHand)} ${rm.unit} or less against Central Store.`
               : isStoreMappedMaterial(db, String(material_id))
                 ? `"${rm.name}" is a store-mapped (liquor) material — record the loss on the Liquor Store instead.`
                 : `Receive the stock, or record a closing count, first.`;
@@ -324,7 +329,7 @@ export async function POST(request: Request) {
             // refusal prints the same unit for the same reason.
             throw new WastageBlocked(
               (onHand > 0
-                ? `Central Store holds only ${fmtQty(onHand)} ${rm.unit} of this item; cannot record ${fmtQty(qty)} ${rm.unit} of wastage against it. `
+                ? `Central Store holds only ${fmtCap(onHand)} ${rm.unit} of this item; cannot record ${fmtQty(qty)} ${rm.unit} of wastage against it. `
                 : `Central Store holds none of this item; cannot record ${fmtQty(qty)} ${rm.unit} of wastage against it. `)
               + wayOut
             );

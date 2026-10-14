@@ -4,6 +4,7 @@ import { applyPartyFulfillment } from '@/lib/party-fulfillment';
 import {
   applyIssueDelta, checkCentralIssue, isCentralStockShort,
   isIssueGestureRecorded, isIssueTokenReplayError,
+  issueLineQtyToRecord, rescoreHeldIssue,
 } from '@/lib/issue-stock';
 import { isDeptReversalBlocked } from '@/lib/dept-ledger';
 
@@ -289,6 +290,18 @@ function isIssueTokenReplay(e: any): boolean {
  * A PARTIAL issue of what the store genuinely holds still works; both the
  * refusal and the held row carry that number, in the line's own unit, as
  * max_issue_qty.
+ *
+ * ROUND 6, TWO THINGS THE STOREKEEPER READS WERE FALSE, AND ARE NOT NOW:
+ *   - THE SHOWN FIGURE. Typing the "In store" figure (14.843 kg over 14,842.5 g)
+ *     is accepted and takes the whole balance — planCentralDebit's shown-figure
+ *     rule — and the line RECORDS what left the shelf: quantity_issued,
+ *     issue_history and the audit row all carry issueLineQtyToRecord()'s figure,
+ *     not the typed one, whenever the two differ (the typed figure rides along
+ *     as `asked`). Never below zero, never phantom stock.
+ *   - THE STALE CAP. A held row's cap was scored BEFORE the gesture ran, so a
+ *     later line of the same material spent part of it and typing the printed
+ *     cap back was refused. The rows are now re-scored inside the transaction
+ *     after every write (rescoreHeldIssue), so the 200 prints what is left.
  *
  * AND NEITHER LAYER MAY ANSWER FOR A REPLAY. Both of them sit in front of the
  * ledger insert that used to be the only thing aware of client_token, so a
@@ -578,6 +591,12 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
      * index, so the two can never drift apart.
      */
     const heldEntries = new Set<number>();
+    /**
+     * Entry index → its row in `centralShort`, so the transaction can re-score
+     * the row's FIGURES after the gesture has run (rescoreHeldIssue). The hold
+     * decision itself is the pre-flight's and is never revisited.
+     */
+    const heldRowOf = new Map<number, (typeof centralShort)[number]>();
     /** 'issue' entries the floor cleared. 0 with a held line ⇒ refuse whole. */
     let issuableEntries = 0;
     {
@@ -674,15 +693,17 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           continue;
         }
         heldEntries.add(li);
-        centralShort.push({
-          code: 'central_stock_short',
+        const row = {
+          code: 'central_stock_short' as const,
           line_id: String(ln.id ?? ''),
           material: c.materialName, material_id: c.materialId, req_item_id: c.reqItemId,
           requested: c.requestedPurchase, available: c.availablePurchase,
           purchase_unit: c.purchaseUnit,
           max_issue_qty: c.maxIssueLineQty, line_unit: c.lineUnit,
           message: c.message,
-        });
+        };
+        centralShort.push(row);
+        heldRowOf.set(li, row);
       }
     }
     // NOTHING LEFT TO HAND OVER ⇒ THE WHOLE GESTURE IS REFUSED, unchanged in
@@ -774,11 +795,25 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           const addQty = Number(ln.quantity);
           if (!Number.isFinite(addQty) || addQty <= 0) continue;
           const beforeQty = Number(cur.quantity_issued) || 0;   // in-txn pre-image
-          const newQty = beforeQty + addQty;
+          // WHAT LEFT THE SHELF, NOT WHAT WAS TYPED (round 6). Identical to
+          // beforeQty + addQty on every ordinary issue (`shelf.changed` false, the
+          // sum untouched); different only when the typed figure was the balance's
+          // shown figure and the shown-figure rule took the balance itself — then
+          // every record below says that balance. Asked here, inside the
+          // transaction and immediately before the UPDATE, so applyIssueDelta's
+          // floor reads the same balance and takes exactly this.
+          const shelf = issueLineQtyToRecord(db, {
+            reqItemId: cur.id, beforeLineQty: beforeQty, afterLineQty: beforeQty + addQty,
+          });
+          const newQty = shelf.afterLineQty;
+          const addedQty = shelf.changed ? newQty - beforeQty : addQty;
           const history = (() => {
             try { return JSON.parse(cur.issue_history || '[]'); } catch { return []; }
           })();
-          history.push({ qty: addQty, at: nowIso, by: me.email, note: ln.note || '' });
+          history.push({
+            qty: addedQty, at: nowIso, by: me.email, note: ln.note || '',
+            ...(shelf.changed ? { asked: addQty } : {}),
+          });
           // THE DEFER RULE — half-transfer. Same expression as the auto-advance
           // below; see the header for why they must stay identical.
           const eff = (cur.chef_approved_qty != null
@@ -792,7 +827,8 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
             reason: 'issue', actor: me.email, clientToken,
           });
           auditPerLine.push({ id: it.id, material: it.material_name, action, before, after: {
-            quantity_issued: newQty, issued_at: nowIso, issued_by: me.email, added: addQty,
+            quantity_issued: newQty, issued_at: nowIso, issued_by: me.email, added: addedQty,
+            ...(shelf.changed ? { asked: addQty } : {}),
           }});
         } else if (action === 'defer') {
           const until = String(ln.defer_until || '').trim();
@@ -980,6 +1016,32 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         } else if (note) {
           db.prepare(`UPDATE requisitions SET store_note = ?, updated_at = datetime('now') WHERE id = ?`).run(note, id);
         }
+      }
+
+      // ── THE HELD ROWS' FIGURES, AFTER THE GESTURE (round 6) ───────────────
+      // The pre-flight scored each held entry in write order, BEFORE any line
+      // ran — so a later line of the same material that then issued had already
+      // spent part of the cap it printed (1 kg held, 0.4 kg of the same material
+      // issued after it, the 200 said "issue 1 kg or less" and 1 kg was then
+      // refused with 0.6 kg left). Re-scored HERE, last in the transaction,
+      // against current_stock as this gesture leaves it, so the cap on the 200
+      // is the figure the storekeeper's next POST will meet. Only the figures
+      // move; the hold stands — the floor runs in order and would have refused
+      // the line at its turn.
+      for (const [li, row] of heldRowOf) {
+        const ln = lines[li];
+        const cur = selLine.get(ln.id, id) as any;
+        if (!cur) continue;
+        const beforeQty = Number(cur.quantity_issued) || 0;
+        const addQty = Number(ln.quantity) || 0;
+        const c = rescoreHeldIssue(db, {
+          reqItemId: String(cur.id), beforeLineQty: beforeQty, afterLineQty: beforeQty + addQty,
+        });
+        if (!c.debits) continue;
+        row.requested = c.requestedPurchase;
+        row.available = c.availablePurchase;
+        row.max_issue_qty = c.maxIssueLineQty;
+        row.message = c.message;
       }
     });
     try {

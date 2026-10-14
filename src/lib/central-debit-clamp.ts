@@ -148,8 +148,66 @@ export const CLAMP_EPS = 1e-9;
  *     is 0: the hole is never dug deeper, and is left for
  *     /api/inventory/fix-negative-stock exactly as before.
  * The movement row a caller writes beside the UPDATE should carry `debit`, not
- * the ask, so SUM(movements) keeps reconciling to the column. The two differ by
- * strictly less than one grid step, and only when the ask was "everything".
+ * the ask, so SUM(movements) keeps reconciling to the column. On the grid rule
+ * alone the two differ by strictly less than one grid step, and only when the
+ * ask was "everything". (The shown-figure rule below can widen that to under
+ * one DISPLAY step, and then the caller must record `debit` — see there.)
+ *
+ * ── THE SHOWN FIGURE IS THE BALANCE (round 6) ───────────────────────────────
+ * The grid above is the house precision; it is NOT the precision the operator
+ * reads. Both requisition desks print central's balance in the PURCHASE unit at
+ * 3 dp, half-up (toPurchaseQty — the "In store" column, U.stockPU on both
+ * pages), and the storekeeper types what he reads. MEASURED on the live book,
+ * 2 of the 466 materials holding stock: THREE MANGO RED CHILLI POWDER holds
+ * 14,842.5 g (g/kg, pack 1000) and the desk shows 14.843 kg; GREEN APPLE holds
+ * 8,368.5 g and shows 8.369 kg. On the grid alone:
+ *   · typing 14.843 was REFUSED ("holds only 14.842 kg") — production accepted
+ *     it and went to −0.5 g;
+ *   · clicking the offered 14.842 left a 0.5 g crumb, and the NEXT ask was told
+ *     "the central store holds none of it" while it held 0.5 g — escapable only
+ *     by typing 0.0005 kg, a figure no screen ever shows.
+ *
+ * So, ONE rule for every floor whose operator reads a coarser figure than the
+ * grid, decided HERE and nowhere else:
+ *
+ *     the ask's shown figure  ===  the balance's shown figure  >  0
+ *       ⇒  the ask IS "everything on the shelf": it fits, and the debit is the
+ *          balance itself, so the landing is exactly 0.
+ *
+ * `shownAs` is the caller's own display converter (for the desks,
+ * r ↦ toPurchaseQty(r, material) — literally the function the column uses), so
+ * the comparison is made on the very figure the operator was shown and THIS
+ * FILE STILL PERFORMS NO UNIT CONVERSION. A caller that passes none gets the
+ * grid rule exactly as before, byte for byte.
+ *
+ * WHY EQUALITY OF SHOWN FIGURES AND NOT "ask ≤ balance + half a display step":
+ *   · it is the operator's own question ("is that what the column said?"), so
+ *     it holds by construction for every figure any surface prints through the
+ *     same converter — no slack to size, no tie at x.xxx5 a float can push the
+ *     wrong way, because both sides go through the identical function;
+ *   · it is SYMMETRIC, and must be. 14,842.4 g shows 14.842 kg; typing 14.842
+ *     is an ordinary partial on the grid and would leave a 0.4 g crumb the
+ *     column then shows as "0". The shown figure means "all of it" from below
+ *     as much as from above, so it takes the 0.4 g too and lands on 0;
+ *   · "> 0" keeps it from ever manufacturing a fit: a balance that shows 0 is
+ *     not matched by an ask that also shows 0 (0.0004 kg asked of an empty
+ *     shelf stays refused), so a store holding nothing never "issues" anything.
+ *
+ * WHAT IT COSTS, STATED: a take by the shown figure moves up to half a display
+ * step more or less than was typed (≤ 0.5 g on a 1000-pack, 0.375 ml on a
+ * 750 ml bottle). That is why `debitIsAsk` exists. When it is FALSE the caller
+ * MUST record `debit` — on the requisition line, the movement row, the ledger
+ * and the department credit — never the ask: the line then says what left the
+ * shelf, which is the only figure that is not phantom stock in one direction or
+ * a hole in the other. It can never go below zero, because `debit` is still
+ * `available` and `stock − available` is still exactly 0.
+ *
+ * WHAT IT CANNOT DO: refuse anything the grid accepted. It only ever ADDS fits
+ * (an ask whose shown figure equals the balance's), so every ask production or
+ * round 5 accepted is still accepted. On every refusal it leaves standing,
+ * shownAsk > shownAvailable strictly (ask > balance on the grid, Math.round is
+ * monotonic, and the two shown figures differ), so a refusal printed in shown
+ * figures can never read "holds only 14.843 kg, so 14.843 kg cannot be issued".
  * ══════════════════════════════════════════════════════════════════════════ */
 
 /** The house quantity grid for RECIPE units: 6 dp. ONE step of it is the floor's
@@ -180,10 +238,28 @@ export interface CentralDebitPlan {
   /** How far past the balance the ask reaches, in whole 6-dp grid steps (so
    *  never 0 on a refusal); 0 when it fit. */
   short: number;
-  /** The ask was on (or past) the balance's grid point, so the write takes the
-   *  balance itself and lands on exactly 0. */
+  /** The ask was on (or past) the balance's grid point — or was the balance's
+   *  shown figure — so the write takes the balance itself and lands on exactly 0. */
   takesAll: boolean;
+  /** shownAs(available), or null when the caller passed no converter. The
+   *  figure the operator was shown for the balance; print THIS as the cap. */
+  shownAvailable: number | null;
+  /** shownAs(ask), or null when the caller passed no converter. */
+  shownAsk: number | null;
+  /** The ask IS the balance's shown figure (see "THE SHOWN FIGURE IS THE
+   *  BALANCE"), so it fits and takes all of it — whether or not the grid alone
+   *  would also have accepted it. Always false without a converter. */
+  byShownFigure: boolean;
+  /** `debit` and `ask` are the same quantity on the house grid, so a caller that
+   *  records the ask records the truth. FALSE only when the shown-figure rule
+   *  took the balance and it differs from the ask by at least one grid step —
+   *  then the caller MUST record `debit`, never the ask. */
+  debitIsAsk: boolean;
 }
+
+/** A display converter: a RECIPE quantity ↦ the figure the operator is shown
+ *  for it. Supplied by the caller (this file converts nothing). */
+export type ShownAs = (recipeQty: number) => number;
 
 /**
  * DOES THIS DEBIT FIT, AND WHAT EXACTLY DO WE SUBTRACT?
@@ -192,25 +268,41 @@ export interface CentralDebitPlan {
  * immediately before the UPDATE (a balance read earlier races), and passes the
  * figure it is about to subtract as `ask` — in RECIPE units, already converted
  * with packFactor where needed. This function converts nothing.
+ *
+ * `shownAs`, optional: the converter the operator READ the balance through (see
+ * "THE SHOWN FIGURE IS THE BALANCE" above). Pass it only on a floor whose
+ * operator typed from that figure; without it the grid rule stands alone.
  */
-export function planCentralDebit(stock: number, ask: number): CentralDebitPlan {
+export function planCentralDebit(stock: number, ask: number, shownAs?: ShownAs | null): CentralDebitPlan {
   const s = Number(stock) || 0;
   const a = Number(ask) || 0;
   const available = s > 0 ? s : 0;
+  const shown = typeof shownAs === 'function' ? shownAs : null;
+  const shownAvailable = shown ? (Number(shown(available)) || 0) : null;
   if (!(a > 0)) {
     // Not a debit — a credit or nothing. Not this rule's business; callers handle
     // credits on their own rails (see clampCentralDelta for why a credit is never
     // touched).
-    return { stock: s, available, ask: 0, fits: true, debit: 0, short: 0, takesAll: false };
+    return {
+      stock: s, available, ask: 0, fits: true, debit: 0, short: 0, takesAll: false,
+      shownAvailable, shownAsk: shown ? 0 : null, byShownFigure: false, debitIsAsk: true,
+    };
   }
   const gAsk = qtyGrid(a);
   const gAvail = qtyGrid(available);
-  const fits = gAsk <= gAvail;
+  const shownAsk = shown ? (Number(shown(a)) || 0) : null;
+  // THE SHOWN-FIGURE RULE, the only place it is written. `> 0` so a balance the
+  // operator was shown as nothing is never "matched" by an ask that also shows
+  // as nothing — the rule adds fits only where there is stock to take.
+  const byShownFigure = shownAvailable !== null && shownAvailable > 0 && shownAsk === shownAvailable;
+  const fits = gAsk <= gAvail || byShownFigure;
   // On the balance's own grid point or past it ⇒ take the balance itself, which
   // lands on exactly 0 (fits) or is the clamp (does not fit). Below it ⇒ the ask
   // is strictly less than the balance (Math.round is monotonic), so the landing
-  // is strictly positive.
-  const takesAll = gAsk >= gAvail;
+  // is strictly positive — UNLESS the ask is the balance's shown figure, which
+  // means "all of it" from below too (14.842 typed against 14,842.4 g shown as
+  // 14.842 kg takes the 0.4 g with it instead of leaving a crumb that shows 0).
+  const takesAll = gAsk >= gAvail || byShownFigure;
   const debit = takesAll ? available : a;
   return {
     stock: s, available, ask: a, fits, debit, takesAll,
@@ -219,7 +311,48 @@ export function planCentralDebit(stock: number, ask: number): CentralDebitPlan {
     // floor6(100 − 99.999999) would print 0.000000 (the float difference is
     // 9.99999997e-7). Measured with the unit check in this round.
     short: fits ? 0 : (gAsk - gAvail) / GRID_SCALE,
+    shownAvailable, shownAsk, byShownFigure,
+    debitIsAsk: qtyGrid(debit) === gAsk,
   };
+}
+
+/**
+ * DOES THE CENTRAL STORE HOLD ANY OF IT? — the ONE test every floor uses to
+ * choose between "holds only X" and "holds none of it".
+ *
+ * At least one grid step, by the same qtyGrid every comparison above uses. A
+ * balance below that (the 7.1e-15 kg float dust two live materials carry) is
+ * zero to every floor: no ask of one step or more fits it, so "holds none" is
+ * the truth at every precision the app can print or weigh. A balance AT or
+ * above one step is never called "none", however small — the round-6 defect
+ * was a floor printing "holds none of it" over a 0.5 g balance because its
+ * display figure rounded to 0. A refusal over a sub-display balance must name
+ * the balance (printableCap below), not deny it.
+ */
+export function holdsAny(available: number): boolean {
+  const x = Number(available) || 0;
+  return x > 0 && qtyGrid(x) > 0;
+}
+
+/**
+ * The cap to PRINT at `dp` decimals: qtyDown(available, dp) — never more than the
+ * floor accepts — except that it NEVER PRINTS 0 WHILE holdsAny(available). When
+ * `dp` would round a real balance to nothing it falls back to the house grid
+ * (6 dp), which qtyDown leaves on the balance's own grid point, so the figure
+ * still fits when typed back. Print `value` at `dp` (fmtGridQty prints 6 dp).
+ */
+export function printableCap(available: number, dp: number): { value: number; dp: number } {
+  const x = Math.max(0, Number(available) || 0);
+  const v = qtyDown(x, dp);
+  if (v > 0 || !holdsAny(x)) return { value: v, dp };
+  return { value: qtyDown(x, 6), dp: 6 };
+}
+
+/** A quantity at the house grid's 6 dp, trailing zeros dropped, never in
+ *  exponent notation (String(1e-6) is "0.000001"; anything that holdsAny is at
+ *  least that). For the sub-display figures printableCap can return. */
+export function fmtGridQty(n: number): string {
+  return String(Number((Number(n) || 0).toFixed(6)));
 }
 
 /**

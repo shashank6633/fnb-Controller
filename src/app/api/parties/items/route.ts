@@ -1,6 +1,6 @@
 import { getDb, generateId } from '@/lib/db';
 import { packFactor, toPurchaseQty, fmtQtyNum } from '@/lib/pack-units';
-import { planCentralDebit, qtyDown } from '@/lib/central-debit-clamp';
+import { planCentralDebit, qtyDown, printableCap, fmtGridQty } from '@/lib/central-debit-clamp';
 
 /**
  * PARTY ITEMS — Issue → Return → Consumption, with the stock movement it drives.
@@ -224,7 +224,11 @@ export async function POST(request: Request) {
             // A DISPLAY figure only — never compared. Rounded at the precision the
             // sentence prints (fmtQtyNum, 3 dp) without ever naming more than the
             // floor accepts, so "re-send it for X or less" is a figure that fits.
-            const available = qtyDown(plan.available, 3);
+            // printableCap: never 0 while the store holds a grid step or more —
+            // a crumb under 0.001 falls to 6 dp, so "holds none" is said only
+            // when holdsAny() says it is true.
+            const cap = printableCap(plan.available, 3);
+            const available = cap.value;
             if (!plan.fits) {
               // BOTH BASES IN ONE SENTENCE. The caller's issued_quantity is
               // RECIPE units (this file's basis contract), so the recipe figure
@@ -244,10 +248,15 @@ export async function POST(request: Request) {
               // 3 dp and printed 14,842.5 g as "14.843 kg" — more than is there.
               // `available` is already floored on the recipe side; this keeps the
               // parenthetical from undoing that. The ASK keeps q() above.
+              // The purchase parenthetical is DROPPED when its 3-dp floor reads 0
+              // (0.4 g of a 1000-pack): "holds only 0.4 g (0 kg)" says nothing is
+              // there in the very unit the store reads. A sub-display recipe
+              // figure (cap.dp 6) prints at the grid's 6 dp.
               const qCap = (n: number) => {
-                const recipe = `${fmtQtyNum(n)}${ru ? ` ${ru}` : ''}`;
-                return packed
-                  ? `${recipe} (${fmtQtyNum(qtyDown(n / packFactor(meta), 3))}${pu ? ` ${pu}` : ''})`
+                const recipe = `${cap.dp > 3 ? fmtGridQty(n) : fmtQtyNum(n)}${ru ? ` ${ru}` : ''}`;
+                const puFig = qtyDown(n / packFactor(meta), 3);
+                return packed && puFig > 0
+                  ? `${recipe} (${fmtQtyNum(puFig)}${pu ? ` ${pu}` : ''})`
                   : recipe;
               };
               results.errors.push(

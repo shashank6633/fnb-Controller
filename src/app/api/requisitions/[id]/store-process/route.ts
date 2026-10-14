@@ -2,7 +2,10 @@ import { getDb, generateId } from '@/lib/db';
 import { getCurrentUser, canIssueAsStore, getCurrentOutletId } from '@/lib/auth';
 import { applyPartyFulfillment } from '@/lib/party-fulfillment';
 import { mergeDuplicateLines } from '@/lib/po-helpers';
-import { applyIssueDelta, checkCentralIssue, isCentralStockShort } from '@/lib/issue-stock';
+import {
+  applyIssueDelta, checkCentralIssue, isCentralStockShort,
+  issueLineQtyToRecord, rescoreHeldIssue,
+} from '@/lib/issue-stock';
 import { vendorMappingError, vendorResolver } from '@/lib/vendor-mapping';
 import { centralFlowBlock } from '@/lib/store-engine';
 
@@ -104,8 +107,9 @@ import { centralFlowBlock } from '@/lib/store-engine';
  *     material, material_id,               // line stays outstanding. Same row shape as the
  *     req_item_id, requested, available,   // 400's `blocked`, so one reader serves both.
  *     purchase_unit, max_issue_qty,        // Never empty-but-silent: absent = nothing held.
- *     line_unit, message
- *   }],
+ *     line_unit, message                   // available / max_issue_qty / message are scored
+ *   }],                                    // AFTER the gesture (what is left once every
+ *                                          // other line has run) — round 6.
  *   stock_held_note?,                      // the same list as one printable sentence; also
  *                                          // folded into po_note, the field every shipped
  *                                          // caller prints verbatim.
@@ -418,6 +422,12 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
      */
     const heldItemIds = new Set<string>();
     /**
+     * requisition_items.id → its row in `centralShort`, so the transaction can
+     * re-score the row's FIGURES once the gesture has run (rescoreHeldIssue,
+     * round 6). The hold itself is the pre-flight's decision and stands.
+     */
+    const heldRowOf = new Map<string, (typeof centralShort)[number]>();
+    /**
      * Lines the floor CLEARED that actually hand goods over on this POST
      * (posted quantity_issued above the stored one). 0 of these alongside a
      * held line ⇒ nothing issuable ⇒ refuse the gesture whole.
@@ -471,14 +481,16 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           continue;
         }
         heldItemIds.add(String(it.id));
-        centralShort.push({
-          code: 'central_stock_short',
+        const row = {
+          code: 'central_stock_short' as const,
           material: c.materialName, material_id: c.materialId, req_item_id: c.reqItemId,
           requested: c.requestedPurchase, available: c.availablePurchase,
           purchase_unit: c.purchaseUnit,
           max_issue_qty: c.maxIssueLineQty, line_unit: c.lineUnit,
           message: c.message,
-        });
+        };
+        centralShort.push(row);
+        heldRowOf.set(String(it.id), row);
       }
     }
     if (centralShort.length > 0 && issuableLines === 0) {
@@ -1094,7 +1106,21 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         // THE PURCHASE HALF IS NOT HELD. A Buy qty is a statement about what to
         // order, and the central store being empty is the very reason to order
         // it — holding the PO line as well would punish the short line twice.
-        const issuedToWrite = heldItemIds.has(String(it.id)) ? beforeIssued : issued;
+        //
+        // AND A LINE THAT RUNS RECORDS WHAT LEFT THE SHELF (round 6). Typing the
+        // balance's shown figure — 14.843 kg over 14,842.5 g — is accepted and
+        // takes the balance itself (planCentralDebit's shown-figure rule), so the
+        // absolute figure written is that balance, not the typed one: otherwise
+        // the line claims half a gram that never moved. issueLineQtyToRecord
+        // returns `issued` itself, untouched, on every other line (a credit, a
+        // zero delta, an ordinary partial, a carve-out), so they are byte-
+        // identical. Asked here, in the transaction and immediately before the
+        // UPDATE, so applyIssueDelta's floor reads the same balance and agrees.
+        const issuedToWrite = heldItemIds.has(String(it.id))
+          ? beforeIssued
+          : issueLineQtyToRecord(db, {
+              reqItemId: it.id, beforeLineQty: beforeIssued, afterLineQty: issued,
+            }).afterLineQty;
         // `!it.is_rejected` on the purchase half only. The ISSUE half stays
         // unfiltered and absolute on purpose (see the note below — a rejected
         // line that held 5 must still credit 5 back), but writing
@@ -1130,6 +1156,29 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // unit — impossible while the deduct flag is off, so the response body is
       // byte-identical to today's.
       if (unitReview.length > 0) result.issue_unit_review = unitReview;
+
+      // ── THE HELD ROWS' FIGURES, AFTER THE GESTURE (round 6) ───────────────
+      // The pre-flight scored each held line BEFORE the write loop ran, so a
+      // later line of the same material that then issued had already spent part
+      // of the cap the row printed (1.5 kg held on a 1 kg balance, 0.4 kg of the
+      // same material written after it: the row said "issue 1 kg or less", and
+      // 1 kg was refused with 0.6 kg left). Re-scored here, against
+      // current_stock as the write loop has left it — nothing after this point
+      // in the transaction moves central for an internal line (the party
+      // transfer below runs only with no held line; a PO moves nothing until it
+      // is received). The hold stands; only the figures follow the balance.
+      for (const [itemId, row] of heldRowOf) {
+        const ln = lineMap.get(itemId) || {};
+        const beforeNow = Number((selBefore.get(itemId) as any)?.quantity_issued) || 0;
+        const c = rescoreHeldIssue(db, {
+          reqItemId: itemId, beforeLineQty: beforeNow, afterLineQty: Number(ln.quantity_issued) || 0,
+        });
+        if (!c.debits) continue;
+        row.requested = c.requestedPurchase;
+        row.available = c.availablePurchase;
+        row.max_issue_qty = c.maxIssueLineQty;
+        row.message = c.message;
+      }
 
       // --- 2. Create vendor PO for the shortfall (if any) ---
       let linkedPoId: string | null = null;

@@ -171,7 +171,7 @@ import { centralFlowBlock } from '@/lib/store-engine';
 // as one that must call it instead of growing a near-copy; see THE CENTRAL FLOOR
 // below for why this route uses its ANSWER as a refusal rather than writing the
 // clamped delta it is built for.
-import { clampCentralDelta, qtyDown } from '@/lib/central-debit-clamp';
+import { clampCentralDelta, printableCap, fmtGridQty } from '@/lib/central-debit-clamp';
 
 /** Float noise floor, matching dept-ledger's own. */
 const EPS = 1e-9;
@@ -588,7 +588,11 @@ export async function POST(request: Request) {
             // Rounded DOWN at the precision `fmt` prints (3 dp) — a "holds only X"
             // that names more than the floor accepts sends the operator to retype
             // a refused figure (99.9996 g used to print as 100 g).
-            const available = qtyDown(-clamp.deltaToWrite, 3);
+            // printableCap, not a bare qtyDown: a crumb under 0.001 would round to
+            // 0 and the sentence would say "holds no X" over a balance that is
+            // there. It falls to 6 dp instead (holdsAny decides "none").
+            const cap = printableCap(-clamp.deltaToWrite, 3);
+            const available = cap.value;
             // The PACK SHAPE comes from the pre-loop catalog snapshot, and that
             // is correct rather than lazy: unit / purchase_unit / pack_size are
             // CATALOG METADATA and nothing in this loop writes them, so there is
@@ -611,12 +615,13 @@ export async function POST(request: Request) {
             // not accept, because the debit never divides by pack_size.
             const ru = String(shape?.unit || '').trim();
             const q = (n: number) => `${fmt(n)}${ru ? ` ${ru}` : ''}`;
+            const qCap = (n: number) => (cap.dp > 3 ? `${fmtGridQty(n)}${ru ? ` ${ru}` : ''}` : q(n));
 
             // THE WAY OUT answers "what do I do now", and it is the department
             // branch's own shape: name the figure when there is one, name the
             // screen when there is not.
             const wayOut = available > 0
-              ? `Issue ${q(available)} or less on this line.`
+              ? `Issue ${qCap(available)} or less on this line.`
               : centralFlowBlock(db, materialId)
                 // 95 of the 127 store-mapped materials hold a central balance
                 // of 0, so "receive the stock" would send the operator to a
@@ -651,7 +656,7 @@ export async function POST(request: Request) {
 
             results.errors.push(
               (available > 0
-                ? `Row ${i + 1}: the Central Store holds only ${q(available)} of ${matName} — `
+                ? `Row ${i + 1}: the Central Store holds only ${qCap(available)} of ${matName} — `
                   + `cannot issue ${q(issuedQuantity)}. `
                 : `Row ${i + 1}: the Central Store holds no ${matName} — `
                   + `cannot issue ${q(issuedQuantity)}. `)
