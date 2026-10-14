@@ -9,20 +9,23 @@ import { readFssaiChecklistSeedState, applyFssaiChecklistPack } from '@/lib/fssa
  * THE READY-MADE CHECKLISTS (/api/fssai/seed) — P8.
  *
  * GET  → { state } : what the pack contains, whether it has already been set
- *        up, which of the twelve codes already exist in this outlet, the
+ *        up, which of the fifteen codes already exist in this outlet (and which
+ *        an earlier version created and the owner has since retired), the
  *        configuration warnings each one would carry, and the seed log. Also
  *        `departments`, read-only, so the screen's optional department pickers
  *        match on ID and never on a name (RECON §5 row 5 — live names carry
  *        double spaces).
  *
  * POST { publish?: boolean, department_by_code?: { CODE: department_id } }
- *      → creates the twelve, ONCE. Default is DRAFT, deliberately: a draft is
+ *      → creates the fifteen, ONCE per pack version, never one an earlier
+ *        version created that the owner retired. Default is DRAFT, deliberately: a draft is
  *        invisible to staff, so the owner reads each checklist and publishes it
- *        himself. `publish: true` creates them live for an owner who wants that.
+ *        himself — or all of them at once through /api/fssai/seed/publish.
+ *        `publish: true` creates them live for an owner who wants that.
  *
  * ⚠️ THERE IS NO PUT AND NO DELETE, and that is the point of the whole phase.
  * A pack cannot be re-run (`uq_fssai_seed_item` on the marker row refuses it)
- * and it cannot be rolled back from here: once the twelve exist they are the
+ * and it cannot be rolled back from here: once the fifteen exist they are the
  * owner's checklists, edited and retired in the builder like any other. A seed
  * that could delete what it made would be able to delete his edits with them.
  *
@@ -76,7 +79,7 @@ export async function POST(request: Request) {
     const db = getDb();
     const outletId = (await getCurrentOutletId()) || '';
 
-    // Only the twelve codes the pack knows are accepted as keys, so a stray key
+    // Only the codes the pack knows are accepted as keys, so a stray key
     // cannot quietly become a department nobody asked for.
     const rawMap = body?.department_by_code && typeof body.department_by_code === 'object'
       ? body.department_by_code as Record<string, unknown>

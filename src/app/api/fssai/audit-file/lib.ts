@@ -4,7 +4,19 @@ import {
   addDaysISO, daysBetweenISO, fssaiDocState, fssaiDocType, fssaiTempLogKindLabel, isISODate,
   FSSAI_DOC_REMINDER_DAYS,
 } from '@/lib/fssai';
+import {
+  fssaiDocumentHolders, readFssaiFoodHandlerCoverage,
+  type FssaiFoodHandlerWithCoverage, type FssaiHandlerCoverage, type FssaiHandlerRequirementKey,
+} from '@/lib/fssai-food-handlers';
+import {
+  FSSAI_HYD_AUDIT_CODES, FSSAI_HYD_WORKBOOK, fssaiHydAnswerSheet, fssaiHydAuditTemplateSql,
+  type HydAnswer, type HydAnswerSheetRow,
+} from '@/lib/fssai-checklist-pack';
 import { fssaiTablesPresent, intOr, numOrBlank } from '../_p9/lib';
+import { fssaiReadingScheduleValue, fssaiTempMinutesWords, fssaiTempVerdictWord } from '../_p4/lib';
+import { readPestChemicalsApplied, readPestMonitoringSheet } from '../pest/_pest/monitoring';
+import { wasteHandoverAuditPart } from '../_waste/lib';
+import { readFssaiVisitClosureEvidence, type FssaiClosureFile } from '../_closure/lib';
 import { supplierLicencesByVendor, vendorRegisterReady } from '../../vendors/fssai-register';
 
 /**
@@ -37,16 +49,41 @@ import { supplierLicencesByVendor, vendorRegisterReady } from '../../vendors/fss
  * The authority asks for a "licence copy", "certificates" and "reports". A
  * fssai_documents row with a licence number and no scan attached is the app
  * knowing the number — the inspector cannot read it off a screen row. So a
- * document counts only when an image of it is still STORED
- * (fssai_attachments.data_uri <> ''). The 12-month photo sweep can empty that
- * column on a document still in force (fssai-retention.ts); when it has, the
- * record turns MISSING here and says the scan was removed and when — which is
- * exactly the moment somebody needs to re-attach it.
+ * document counts only when a LIVE image of it is stored: a fssai_attachments
+ * row with data_uri <> '' AND status <> 'void'.
+ *   · Owner ruling Q22 (2026-10-14, FSSAI_Q22_RULING in fssai-retention.ts):
+ *     document scans in fssai_attachments are NEVER auto-deleted — the photo
+ *     sweep walks checklist photos (fssai_evidence) only. A blank data_uri can
+ *     therefore only be a row an earlier build stripped (image_dropped_at); it
+ *     still reads MISSING here, with the date, so somebody re-attaches it.
+ *   · A VOIDED file (attached by mistake — kept, with who, when and why) is
+ *     never a copy. It is listed apart (`voided_scans`) on the page and in the
+ *     management copy, and never drawn into either PDF (scans.ts is the second
+ *     gate). buildAuditFile() makes that split once, for every record, so no
+ *     single record can forget it.
  *
  * ── READ-ONLY ───────────────────────────────────────────────────────────────
  * There is no INSERT, UPDATE or DELETE in this file. Voided records (§19: void,
  * never delete) are excluded from what counts, and drafts are not filed
  * records, so neither can make a record PRESENT.
+ *
+ * ── WHAT OTHER LANES' REGISTERS DECIDE HERE (2026-10-14) ────────────────────
+ *   6, 7  readFssaiFoodHandlerCoverage — the food-handler register, which NAMES
+ *         every handler without a valid certificate, and the FoSTaC line.
+ *   11    cooking and reheating readings only — a cooling or hot-holding reading
+ *         is listed, never what makes the log PRESENT.
+ *   13    readPestMonitoringSheet — the station-by-station check, never a
+ *         checklist round (the monthly Hyderabad Checklist 3 has a Pests
+ *         section and is NOT the monitoring sheet: fssaiHydAuditTemplateSql).
+ *   14    wasteHandoverAuditPart — the handover log; the agreement beside it.
+ *   20    readFssaiVisitClosureEvidence — live report copies and closure photos.
+ *   5     readPestChemicalsApplied — what each visit applied, printed with it.
+ * And beyond the 20: the authority's own three checklist pages, the last
+ * self-audit of each laid back onto the page as YES / NO / REMARK
+ * (fssaiHydAnswerSheet) — an inspector can read the passing answers.
+ * Every temperature verdict word and minutes cell comes from _p4/lib
+ * (fssaiTempVerdictWord, fssaiTempMinutesWords), the same words the Reports
+ * screen prints, so the PDF cannot call a pot still cooling "In range".
  *
  * ── TABLES THAT ARE NOT THERE ───────────────────────────────────────────────
  * initializeSchema swallows errors per block, so a register can be absent on a
@@ -159,8 +196,12 @@ export interface AuditFileRow {
   cells: string[];
   /** Where this one record lives in the app ('' = no per-record page). */
   href: string;
-  /** 'bad' = a failed/expired line, 'warn' = expiring. Colours only. */
-  tone: '' | 'bad' | 'warn';
+  /**
+   * 'bad' = a failed/expired line, 'warn' = expiring, 'void' = a line voided
+   * and KEPT (printed greyed and struck through, with its reason in a cell).
+   * Colours only — nothing is judged from it.
+   */
+  tone: '' | 'bad' | 'warn' | 'void';
   /**
    * false = this line only describes a gap (a document row with no copy
    * attached), so the handover PDF leaves it out (§7 Q11). The page and the
@@ -192,9 +233,17 @@ export interface AuditFileScan {
   size_bytes: number;
   caption: string;
   created_at: string;
-  /** false once the retention sweep (or a manager) removed the image. */
+  /** false only on a row an earlier build stripped (image_dropped_at). */
   has_image: boolean;
   image_dropped_at: string;
+  /**
+   * 'void' = attached by mistake and voided — KEPT, with who, when and why. A
+   * void file is never a copy: buildAuditFile moves it to `voided_scans`.
+   */
+  status: 'active' | 'void';
+  voided_at: string;
+  voided_by: string;
+  void_reason: string;
 }
 
 export interface AuditFileItem {
@@ -223,7 +272,54 @@ export interface AuditFileItem {
   /** `mgmt` = a figure that only measures a gap; the handover PDF leaves it out. */
   summary: Array<{ label: string; value: string; mgmt?: true }>;
   tables: AuditFileTable[];
+  /** LIVE copies only — what counts, what the PDF draws. */
   scans: AuditFileScan[];
+  /**
+   * Files on these records that were VOIDED — kept and shown (the page, the
+   * management copy) with the reason, never counted, never in the handover.
+   */
+  voided_scans: AuditFileScan[];
+}
+
+/* ── the authority's own checklist pages, answered ───────────────────────── */
+
+export interface AuditFileSelfAuditRow {
+  /** 'heading' | 'lead_in' | 'subheading' | 'line' (the workbook row's kind). */
+  kind: string;
+  /** The authority's words, exactly as on its page. */
+  text: string;
+  /** On a line: 'YES' | 'NO' | 'N/A' | '' (not answered). */
+  mark: string;
+  remark: string;
+  /** The question code the line is asked as (Q01…), '' on a heading. */
+  question_code: string;
+}
+
+export interface AuditFileSelfAudit {
+  /** The tab name on the authority's workbook ("CHECKLIST 1"). */
+  sheet: string;
+  /** The pack code the page was seeded as (CHK-HYD-AUDIT-k). */
+  template_code: string;
+  /** The checklist's name as the outlet now calls it. */
+  template_name: string;
+  /** The latest submitted or verified round of it, or null when none. */
+  run: null | {
+    id: string;
+    business_date: string;
+    status: string;
+    outcome: string;
+    recorded_by: string;
+    signed_by: string;
+    href: string;
+  };
+  rows: AuditFileSelfAuditRow[];
+  counts: { lines: number; yes: number; no: number; na: number; unanswered: number };
+  /** Answers to questions the owner added in the builder (not lines of the page). */
+  extra: Array<{ question_code: string; prompt: string; mark: string; remark: string }>;
+  /** Rounds of this page submitted in the audit file's window. */
+  rounds_in_window: number;
+  /** Management words: why there is no sheet. '' when there is one. */
+  problem: string;
 }
 
 export interface AuditFile {
@@ -233,6 +329,13 @@ export interface AuditFile {
   since: string;
   counts: { present: number; expiring: number; missing: number; total: number };
   items: AuditFileItem[];
+  /**
+   * What the inspector's copy (the handover PDF) holds — worked out once, here,
+   * so the page, Inspection Mode and the PDF all state the same N of 20.
+   */
+  handover: { held: number[]; left_out: number[]; count: number; total: number };
+  /** The authority's three checklist pages, each with its last self-audit. */
+  self_audit: AuditFileSelfAudit[];
 }
 
 export interface AuditFileOptions {
@@ -338,11 +441,17 @@ interface DocRow {
   vendor_name: string;
   person_email: string;
   person_name: string;
+  /** fssai_documents.handler_id — the food handler the certificate belongs to. */
+  handler_id: string;
+  /** Whose certificate, in words ("Ravi Kumar (FH-0001)"), from fssaiDocumentHolders. */
+  holder: string;
   equipment_id: string;
   equipment_name: string;
   created_on: string;
-  /** Images still stored. A row with 0 has no copy anyone can read. */
+  /** LIVE images still stored. A row with 0 has no copy anyone can read. */
   stored: number;
+  /** Files on it that were voided — kept, never a copy. */
+  voided: number;
   /** When the most recent image on it was removed, '' if none was. */
   dropped_at: string;
   scans: AuditFileScan[];
@@ -352,6 +461,12 @@ function docLabel(d: DocRow): string {
   return [d.title || d.type_label, d.reference_no ? `no. ${d.reference_no}` : ''].filter(Boolean).join(', ');
 }
 
+/**
+ * Every file on these records of ONE register — live AND voided, each marked.
+ * A caller never decides by itself whether a voided file counts: it does not.
+ * Anything that counts copies tests `isLiveCopy`, and buildAuditFile() moves
+ * the voided ones out of `scans` for every record at the end.
+ */
 function readScans(db: Database.Database, entityTable: string, ids: string[], label: (id: string) => string): AuditFileScan[] {
   const uniq = [...new Set(ids.filter(Boolean))];
   if (!uniq.length) return [];
@@ -360,35 +475,55 @@ function readScans(db: Database.Database, entityTable: string, ids: string[], la
     const chunk = uniq.slice(i, i + 400);
     const rows = db.prepare(
       `SELECT id, entity_table, entity_id, mime, filename, size_bytes, caption, created_at, image_dropped_at,
+              status, voided_at, voided_by, void_reason,
               (data_uri <> '') AS has_image
          FROM fssai_attachments
         WHERE entity_table = ? AND entity_id IN (${chunk.map(() => '?').join(',')})
         ORDER BY created_at ASC, rowid ASC`,
     ).all(entityTable, ...chunk) as any[];
-    for (const r of rows) {
-      out.push({
-        attachment_id: s(r.id),
-        entity_table: s(r.entity_table),
-        entity_id: s(r.entity_id),
-        record_label: label(s(r.entity_id)),
-        filename: s(r.filename),
-        mime: s(r.mime),
-        size_bytes: intOr(r.size_bytes),
-        caption: s(r.caption),
-        created_at: s(r.created_at),
-        has_image: intOr(r.has_image) === 1,
-        image_dropped_at: s(r.image_dropped_at),
-      });
-    }
+    for (const r of rows) out.push(shapeScan(r, label(s(r.entity_id))));
   }
   return out;
 }
 
+function shapeScan(r: any, recordLabel: string): AuditFileScan {
+  const isVoid = s(r.status) === 'void' || !!s(r.voided_at);
+  return {
+    attachment_id: s(r.id ?? r.attachment_id),
+    entity_table: s(r.entity_table),
+    entity_id: s(r.entity_id),
+    record_label: recordLabel,
+    filename: s(r.filename),
+    mime: s(r.mime),
+    size_bytes: intOr(r.size_bytes),
+    caption: s(r.caption),
+    created_at: s(r.created_at),
+    has_image: r.has_image === true || intOr(r.has_image) === 1,
+    image_dropped_at: s(r.image_dropped_at),
+    status: isVoid ? 'void' : 'active',
+    voided_at: s(r.voided_at),
+    voided_by: s(r.voided_by),
+    void_reason: s(r.void_reason),
+  };
+}
+
+/** A copy anyone can read: live (not voided) and its image still stored. */
+function isLiveCopy(sc: AuditFileScan): boolean {
+  return sc.status !== 'void' && sc.has_image;
+}
+
+/** A closure-lane file (FssaiClosureFile) in this file's scan shape. */
+function closureScan(f: FssaiClosureFile, recordLabel: string): AuditFileScan {
+  return shapeScan({ ...f, id: f.attachment_id }, recordLabel);
+}
+
 function readDocs(ctx: Ctx, types: string[]): DocRow[] {
   const { db, today } = ctx;
+  const hasHandler = !!db.prepare(`SELECT 1 FROM pragma_table_xinfo('fssai_documents') WHERE name = 'handler_id'`).get();
   const rows = db.prepare(
     `SELECT d.id, d.doc_type, d.title, d.reference_no, d.issuer, d.issued_on, d.valid_from, d.expiry_date,
             d.reminder_days, d.vendor_id, d.person_email, d.equipment_id, d.created_at,
+            ${hasHandler ? 'd.handler_id' : `''`} AS handler_id,
             (SELECT v.name FROM vendors v WHERE v.id = d.vendor_id) AS vendor_name,
             (SELECT u.name FROM users u WHERE lower(u.email) = lower(d.person_email) AND d.person_email <> '' LIMIT 1) AS person_name,
             ${ctx.present.has('fssai_equipment') ? `(SELECT e.name FROM fssai_equipment e WHERE e.id = d.equipment_id)` : `''`} AS equipment_name
@@ -415,14 +550,24 @@ function readDocs(ctx: Ctx, types: string[]): DocRow[] {
       vendor_name: s(r.vendor_name),
       person_email: s(r.person_email),
       person_name: s(r.person_name),
+      handler_id: s(r.handler_id),
+      holder: '',
       equipment_id: s(r.equipment_id),
       equipment_name: s(r.equipment_name),
       created_on: dateOf(r.created_at),
       stored: 0,
+      voided: 0,
       dropped_at: '',
       scans: [],
     };
   });
+  // Whose certificate — the food-handler register first (a cook with no login
+  // has a name there and nowhere else), then the login. Person scope only.
+  const personDocs = docs.filter((d) => fssaiDocType(d.doc_type)?.scope === 'person');
+  if (personDocs.length) {
+    const holders = fssaiDocumentHolders(db, personDocs.map((d) => ({ id: d.id, handler_id: d.handler_id, person_email: d.person_email })));
+    for (const d of personDocs) d.holder = holders.get(d.id)?.label || d.person_name || d.person_email;
+  }
   if (!docs.length || !ctx.present.has('fssai_attachments')) return docs;
 
   const byId = new Map(docs.map((d) => [d.id, d]));
@@ -434,6 +579,7 @@ function readDocs(ctx: Ctx, types: string[]): DocRow[] {
     const d = byId.get(sc.entity_id);
     if (!d) continue;
     d.scans.push(sc);
+    if (sc.status === 'void') { d.voided++; continue; }   // kept, listed apart, never a copy
     if (sc.has_image) d.stored++;
     else if (sc.image_dropped_at && sc.image_dropped_at > d.dropped_at) d.dropped_at = sc.image_dropped_at;
   }
@@ -466,7 +612,7 @@ function docRows(docs: DocRow[], who?: (d: DocRow) => string): AuditFileRow[] {
       d.valid_from || d.issued_on,
       d.expiry_date || '—',
       STATE_WORDS[d.state],
-      d.stored ? plural(d.stored, 'scan') : 'none',
+      d.stored ? plural(d.stored, 'scan') : d.voided ? 'voided only' : 'none',
     ],
     '/fssai/documents',
     d.state === 'expired' || !d.stored ? 'bad' : d.state === 'expiring' ? 'warn' : '',
@@ -509,7 +655,9 @@ function judgeDocs(docs: DocRow[], what: string, today: string): DocVerdict {
     const d = inForce[0];
     const why = d.dropped_at
       ? `its scan was removed on ${d.dropped_at.slice(0, 10)}`
-      : 'no scan or photograph of it is attached';
+      : d.voided
+        ? `its only ${d.voided === 1 ? 'scan was' : `${d.voided} scans were`} voided as attached by mistake, and no other copy is attached`
+        : 'no scan or photograph of it is attached';
     return {
       status: 'missing',
       problems: [`${docLabel(d)} is recorded, but ${why} — the file has the number, not the copy.`],
@@ -603,6 +751,14 @@ interface Ctx {
   days: number;
   limit: number;
   present: Set<string>;
+  /**
+   * SQL (alias t = fssai_templates) TRUE for a template that is NOT one of the
+   * authority's three Hyderabad audit pages. Every checklist-round record ANDs
+   * it in: a monthly self-audit of the whole checklist is not the daily
+   * cleaning round, the storage round or the pest monitoring sheet, even where
+   * it has a section of that name (CHECKLIST 3 has "Pests").
+   */
+  notHydAudit: string;
 }
 
 type Part = Omit<AuditFileItem, 'n' | 'key' | 'title'>;
@@ -610,7 +766,7 @@ type Part = Omit<AuditFileItem, 'n' | 'key' | 'title'>;
 function blank(): Part {
   return {
     status: 'missing', held: false, headline: '', problems: [], todo: '', lapses_on: '', basis: '',
-    links: [], summary: [], tables: [], scans: [],
+    links: [], summary: [], tables: [], scans: [], voided_scans: [],
   };
 }
 
@@ -761,7 +917,9 @@ function pestControl(ctx: Ctx): Part {
   p.links = [{ href: '/fssai/pest-control', label: 'Pest Control Logs' }, DOCS_LINK];
   p.basis =
     `Both halves are needed. The agreement: a pest-control contract in force with a copy attached. The reports: a completed visit whose next visit date has not passed ` +
-    `(or within ${CURRENCY_DAYS.pest_visit} days when the technician wrote none). EXPIRING when the contract is inside its renewal window or the next visit is due within ${PEST_WARN_DAYS} days.`;
+    `(or within ${CURRENCY_DAYS.pest_visit} days when the technician wrote none). EXPIRING when the contract is inside its renewal window or the next visit is due within ${PEST_WARN_DAYS} days. ` +
+    'What each visit applied — product, CIB&RC registration number, batch, expiry, dilution, quantity, method and where — is printed with it; ' +
+    'EXPIRING too when the last visit does not say what was applied.';
   const todo =
     'File the pest-control agreement under Documents & Certificates as "Pest control contract" with a scan, and record every visit, with the technician\'s report, under Pest Control Logs.';
   const miss = absent(ctx.present, ['fssai_documents', 'fssai_pest_services']);
@@ -788,6 +946,24 @@ function pestControl(ctx: Ctx): Part {
     else r = { status: 'present', problems: [] };
   }
 
+  // WHAT EACH VISIT APPLIED (#78) — a pest-control report that does not say
+  // which chemical went down, where, of what registration and batch, is half a
+  // report. Read through the pest lane's own reader so '[]' is "not recorded",
+  // never "nothing applied". The LAST visit with nothing recorded turns the
+  // record EXPIRING (the job sheet can still be copied in, once, with an audit
+  // row); older visits are listed and named.
+  const from = periodicFrom(ctx);
+  const chem = ctx.present.has('fssai_pest_services')
+    ? readPestChemicalsApplied(ctx.db, { from, to: ctx.today })
+    : null;
+  const lastChem = last && chem ? chem.visits.find((v) => v.id === s(last.id)) : undefined;
+  if (lastChem && lastChem.state === 'not_recorded') {
+    r = {
+      status: worst(r.status, 'expiring'),
+      problems: [...r.problems, `The last visit (${s(last.business_date)}) does not say which chemicals were applied. Copy them in from the technician's job sheet on Pest Control Logs.`],
+    };
+  }
+
   p.status = worst(c.status, r.status);
   p.problems = [...c.problems, ...r.problems];
   p.lapses_on = earliest([c.lapses_on, end]);
@@ -800,19 +976,57 @@ function pestControl(ctx: Ctx): Part {
     { label: 'Visits recorded', value: String(visits.length) },
     { label: 'Last visit', value: last ? s(last.business_date) : '—' },
     { label: 'Next due', value: end || '—' },
+    ...(chem ? [{ label: 'Products applied', value: String(chem.totals.products) }] : []),
   ];
-  const from = periodicFrom(ctx);
   const inWindow = visits.filter((v) => s(v.business_date) >= from);
+  const chemById = new Map((chem?.visits || []).map((v) => [v.id, v]));
+  const chemWords = (id: string): string => {
+    const v = chemById.get(id);
+    if (!v) return '';
+    if (v.state === 'none_applied') return `None applied${v.none_note ? ` (${v.none_note})` : ''}`;
+    if (v.state === 'not_recorded') return 'Not recorded';
+    return v.chemicals.map((c) => c.name).filter(Boolean).join(', ');
+  };
+  // One line per product, under the visit that applied it. A visit that applied
+  // nothing says so in its own words; one whose list nobody recorded is a gap,
+  // so it stays on the page and the management copy but not in the handover.
+  const chemRows: AuditFileRow[] = [];
+  for (const v of [...(chem?.visits || [])].reverse()) {
+    const visit = `${v.business_date} · ${v.report_no || v.service_no}`;
+    if (v.state === 'listed') {
+      for (const c of v.chemicals) {
+        const expiredOnDay = !!c.expiry && c.expiry < v.business_date;
+        chemRows.push(row([
+          visit, [c.name, c.active_ingredient].filter(Boolean).join(' — '), c.licence_no || '—', c.batch,
+          c.expiry ? `${c.expiry}${expiredOnDay ? ' (EXPIRED when used)' : ''}` : '', c.dilution, [c.qty, c.uom].filter(Boolean).join(' '),
+          [c.method, c.target_pest].filter(Boolean).join(' · '), c.area,
+        ], '/fssai/pest-control', expiredOnDay || !c.licence_no ? 'warn' : ''));
+      }
+    } else if (v.state === 'none_applied') {
+      chemRows.push(row([visit, `None applied${v.none_note ? ` — ${v.none_note}` : ''}`, '', '', '', '', '', '', ''], '/fssai/pest-control'));
+    } else {
+      chemRows.push(row([visit, 'Not recorded on this visit', '', '', '', '', '', '', ''], '/fssai/pest-control', 'bad', false));
+    }
+  }
   p.tables = [
     table('Agreement', DOC_COLUMNS, docRows(docs), ctx.limit, 'No agreement is on file.'),
     table(`Service reports from ${from}`, [
       { label: 'Date', width: 0.9 }, { label: 'Agency', width: 1.5 }, { label: 'Report no.', width: 1 },
-      { label: 'Technician', width: 1.1 }, { label: 'Areas', width: 1.6 }, { label: 'Findings', width: 2 }, { label: 'Next due', width: 0.9 },
+      { label: 'Technician', width: 1.1 }, { label: 'Areas', width: 1.5 }, { label: 'Findings', width: 1.7 },
+      { label: 'Chemicals', width: 1.5 }, { label: 'Next due', width: 0.9 },
     ], inWindow.map((v) => row([
       s(v.business_date), [s(v.vendor_name), s(v.agency_licence_no)].filter(Boolean).join(' · '), s(v.report_no) || s(v.service_no),
-      s(v.technician_name), s(v.areas_covered), s(v.findings), s(v.next_due_date),
+      s(v.technician_name), s(v.areas_covered), s(v.findings), chemWords(s(v.id)), s(v.next_due_date),
     ], '/fssai/pest-control')), ctx.limit),
+    table(`Chemicals applied from ${from}`, [
+      { label: 'Visit', width: 1.2 }, { label: 'Product — active ingredient', width: 2 }, { label: 'CIB&RC reg. no.', width: 1.5 },
+      { label: 'Batch', width: 0.7 }, { label: 'Expiry', width: 1 }, { label: 'Dilution', width: 0.9 }, { label: 'Qty', width: 0.6 },
+      { label: 'Method · target', width: 1.1 }, { label: 'Where', width: 1.3 },
+    ], chemRows, ctx.limit, 'No completed visit in these dates.'),
   ];
+  // A product line with no registration number, or past its expiry on the day,
+  // is coloured on its row (and the pest print marks it). It does not by itself
+  // change the status: the line asks for the records, and these ARE the records.
   p.scans = [
     ...docs.flatMap((d) => d.scans),
     ...readScans(ctx.db, 'fssai_pest_services', inWindow.slice(0, 6).map((v) => s(v.id)),
@@ -822,49 +1036,166 @@ function pestControl(ctx: Ctx): Part {
   return p;
 }
 
-/* 6, 7 ─ certificates held per person */
-function perPerson(ctx: Ctx, docType: string, what: string, todo: string): Part {
+/* 6, 7 ─ the food handlers, each by name (the food-handler register) */
+const HANDLERS_LINK: AuditFileLink = { href: '/fssai/documents/food-handlers', label: 'Food Handlers' };
+
+/** "Ravi Kumar (FH-0001)" */
+function handlerName(h: { full_name: string; handler_no: string }): string {
+  return h.handler_no ? `${h.full_name} (${h.handler_no})` : h.full_name;
+}
+
+/** "Valid until 2027-02-28" / "EXPIRED 2026-10-11" / "MISSING" — one requirement, in words. */
+function verdictCell(c: FssaiFoodHandlerWithCoverage['coverage'][FssaiHandlerRequirementKey]): string {
+  if (!c.required) return '—';
+  const exp = c.best?.expiry_date || '';
+  if (c.verdict === 'valid') return exp ? `Valid until ${exp}` : 'Valid';
+  if (c.verdict === 'expiring') return `Expiring ${exp}`;
+  if (c.verdict === 'expired') return `EXPIRED ${exp}`;
+  if (c.verdict === 'no_expiry') return c.in_order ? 'On file (no expiry)' : 'No expiry date';
+  return c.verdict_label;
+}
+
+/**
+ * Records 6 and 7, judged PER FOOD HANDLER on the register (owner ruling Q18:
+ * the key is the HRMS employee, else the login, else the name — a cook with no
+ * login is on it). The authority asks for "every food handler", so a person on
+ * the register with no certificate is named here: the old per-email reading
+ * could only judge people who already had one.
+ *   6 — medical fitness: every active food handler.
+ *   7 — food-safety training (a FoSTaC certificate counts) for every active food
+ *       handler, AND the FoSTaC line: at least one certified supervisor per
+ *       FSSAI_FOSTAC_HANDLERS_PER_SUPERVISOR food handlers.
+ * Coverage is readFssaiFoodHandlerCoverage() — the same function the Food
+ * Handlers page shows — so the page and this record cannot disagree.
+ */
+function handlerRecord(ctx: Ctx, key: 'medical' | 'training'): Part {
   const p = blank();
-  p.links = [DOCS_LINK, { href: '/fssai/hygiene', label: 'Personal Hygiene' }];
+  const isMed = key === 'medical';
+  const what = isMed ? 'medical fitness certificate' : 'food-safety training record';
+  const docTypes = isMed ? ['medical_fitness'] : ['food_handler_training', 'fostac_certificate'];
+  p.links = [HANDLERS_LINK, DOCS_LINK, { href: '/fssai/hygiene', label: 'Personal Hygiene' }];
+  const todo = isMed
+    ? 'Open Food Handlers: put every food handler on the register (from HRMS, the logins, or by hand), then file each one\'s medical fitness certificate — with its expiry date and a scan — from their row.'
+    : 'Open Food Handlers: file each food handler\'s food-safety training (FoSTaC or in-house, with a scan) from their row, and mark the FoSTaC-trained Food Safety Supervisor with their FoSTaC certificate.';
   p.basis =
-    `Each person's latest certificate is judged on its own: in force with a copy → PRESENT, inside its renewal window → EXPIRING, expired or no copy → MISSING. ` +
-    `The record is only as good as its worst person. Certificates are filed against a person's sign-in email.`;
-  const miss = absent(ctx.present, ['fssai_documents']);
+    'From the food-handler register (Food Handlers). Every person marked a food handler who works here is judged on their own, ' +
+    (isMed
+      ? 'and needs a medical fitness certificate in force with a scan (one with no expiry date cannot be judged, so it is not in order). '
+      : 'and needs food-safety training on file (a FoSTaC certificate counts; an in-house record need not expire). The FoSTaC supervisor needs a FoSTaC certificate in force: ' +
+        'at least one certified supervisor for every 25 food handlers. ') +
+    'PRESENT when every one is in order; EXPIRING when one falls inside its renewal window; MISSING when anyone has none, it has lapsed or no copy is attached — the record names them. ' +
+    'Voided and superseded certificates, and voided scans, never count.';
+  const miss = absent(ctx.present, ['fssai_documents', 'fssai_food_handlers']);
   if (miss.length) { p.problems = [NOT_IN_DB(miss)]; p.todo = todo; return p; }
 
-  const docs = readDocs(ctx, [docType]);
-  const groups = new Map<string, DocRow[]>();
-  for (const d of docs) {
-    const k = (d.person_email || `doc:${d.id}`).toLowerCase();
-    if (!groups.has(k)) groups.set(k, []);
-    groups.get(k)!.push(d);
+  const cov: FssaiHandlerCoverage = readFssaiFoodHandlerCoverage(ctx.db, { today: ctx.today });
+  const active = cov.handlers.filter((h) => h.status === 'active');
+  const needed = active.filter((h) => h.coverage[key].required);
+  const notIn = cov.not_in_order[key];
+  const fostacBad = !isMed && !cov.fostac.ok;
+  const expiring = needed.filter((h) => h.coverage[key].verdict === 'expiring');
+  const supExpiring = isMed ? [] : active.filter((h) => h.coverage.fostac.required && h.coverage.fostac.verdict === 'expiring');
+
+  let status: AuditFileStatus = 'present';
+  const problems: string[] = [];
+  if (!needed.length) {
+    status = 'missing';
+    problems.push(active.length
+      ? `${plural(active.length, 'person', 'people')} on the register, but nobody is marked a food handler.`
+      : 'Nobody is on the food-handler register yet, so there is nobody to judge — the authority asks for every food handler.');
   }
-  const who = (d: DocRow) => d.person_name || d.person_email || '(no person named)';
-  let status: AuditFileStatus = groups.size ? 'present' : 'missing';
-  const problems: string[] = groups.size ? [] : [`No ${what} is on file for anybody.`];
-  const lapses: string[] = [];
-  let covered = 0;
-  for (const list of groups.values()) {
-    const v = judgeDocs(list, what, ctx.today);
-    status = worst(status, v.status);
-    if (v.status === 'present') covered++;
-    if (v.status !== 'present') problems.push(`${who(list[0])}: ${v.problems[0] || ''}`);
-    if (v.lapses_on) lapses.push(v.lapses_on);
+  if (notIn.length) {
+    status = 'missing';
+    problems.push(`No valid ${what}: ${notIn.map((x) => `${handlerName(x)} — ${x.verdict_label}${x.expiry_date ? ` ${x.expiry_date}` : ''}`).join('; ')}.`);
   }
+  if (fostacBad) {
+    status = 'missing';
+    const supNotIn = cov.not_in_order.fostac;
+    problems.push(`FoSTaC: ${cov.fostac.words}${supNotIn.length ? ` (${supNotIn.map((x) => `${handlerName(x)} — ${x.verdict_label}`).join('; ')})` : ''}`);
+  }
+  if (expiring.length || supExpiring.length) {
+    status = worst(status, 'expiring');
+    const list = [...expiring.map((h) => ({ h, c: h.coverage[key] })), ...supExpiring.map((h) => ({ h, c: h.coverage.fostac }))];
+    problems.push(`Expiring soon: ${list.map(({ h, c }) => `${handlerName(h)} (${c.label}, ${c.best?.expiry_date || ''})`).join('; ')}. Renew before then.`);
+  }
+  const lapses = needed.map((h) => h.coverage[key]).filter((c) => c.in_order && c.best?.expiry_date).map((c) => c.best!.expiry_date);
+  if (!isMed) for (const h of active) if (h.coverage.fostac.in_order && h.coverage.fostac.best?.expiry_date) lapses.push(h.coverage.fostac.best.expiry_date);
+
+  const inOrder = needed.filter((h) => h.coverage[key].in_order).length;
   p.status = status;
   p.problems = problems;
   p.lapses_on = earliest(lapses);
-  p.headline = groups.size
-    ? `${plural(groups.size, 'person', 'people')} on file · ${covered} fully in order`
-    : 'Nothing on file';
+  p.headline = needed.length
+    ? `${plural(needed.length, 'food handler')} on the register · ${inOrder} with a ${isMed ? 'medical certificate' : 'training record'} in order` +
+      (isMed ? '' : ` · FoSTaC: ${cov.fostac.certified} certified supervisor${cov.fostac.certified === 1 ? '' : 's'}, ${cov.fostac.required} needed`)
+    : 'Nobody on the food-handler register';
+  // A figure that only measures a gap is management's (mgmt: true) — "1 in
+  // order" beside "3 food handlers" says two are not, on paper handed over.
+  const gapIn = inOrder < needed.length;
   p.summary = [
-    { label: 'People on file', value: String(groups.size) },
-    { label: 'In order', value: String(covered) },
+    { label: 'Food handlers', value: String(needed.length) },
+    gapIn ? { label: 'In order', value: String(inOrder), mgmt: true as const } : { label: 'In order', value: String(inOrder) },
+    { label: 'Not in order', value: String(notIn.length), mgmt: true },
+    ...(isMed ? [] : [fostacBad
+      ? { label: 'FoSTaC supervisors', value: `${cov.fostac.certified} of ${cov.fostac.required} needed`, mgmt: true as const }
+      : { label: 'FoSTaC supervisors', value: `${cov.fostac.certified} certified (${cov.fostac.required} needed)` }]),
     { label: 'Next to lapse', value: p.lapses_on || '—' },
   ];
-  p.tables = [table('Certificates on file', [{ label: 'Person — certificate', width: 2.6 }, ...DOC_COLUMNS.slice(1)], docRows(docs, who), ctx.limit,
-    'Nothing of this kind is on file.')];
-  p.scans = docs.flatMap((d) => d.scans.map((sc) => ({ ...sc, record_label: `${who(d)} — ${sc.record_label}` })));
+
+  // THE REGISTER, one line per person. It goes into the inspector's copy only
+  // when EVERY food handler on it is in order — a partial roster under the
+  // heading "food handlers" would read as the whole staff (§7 Q11, and the
+  // owner's "never imply a complete file").
+  const complete = needed.length > 0 && !notIn.length && !fostacBad;
+  const regRows = active
+    .filter((h) => h.coverage[key].required || (!isMed && h.coverage.fostac.required))
+    .map((h) => {
+      const c = h.coverage[key];
+      const f = h.coverage.fostac;
+      const bad = (c.required && !c.in_order) || (!isMed && f.required && !f.in_order);
+      const warn = c.verdict === 'expiring' || (!isMed && f.verdict === 'expiring');
+      const certWords = c.best ? [c.best.type_label, c.best.reference_no ? `no. ${c.best.reference_no}` : ''].filter(Boolean).join(', ') : '';
+      return row([
+        handlerName(h), [h.designation, h.department_name].filter(Boolean).join(' · '),
+        verdictCell(c), certWords,
+        ...(isMed ? [] : [f.required ? verdictCell(f) : '—']),
+      ], HANDLERS_LINK.href, bad ? 'bad' : warn ? 'warn' : '', complete);
+    });
+
+  // THE CERTIFICATES THEMSELVES, with whose they are — the copies an inspector
+  // reads. A row with no live scan is a gap, so not in the handover.
+  const docs = readDocs(ctx, docTypes);
+  const holderOf = (d: DocRow) => d.holder || '(nobody named)';
+  const certRows = docRows(docs, holderOf);
+  // An HRMS training completion mapped on the Food Handlers page IS the record
+  // of the training — there is no scan to lose.
+  if (!isMed) {
+    for (const h of active) {
+      for (const e of h.coverage.training.evidence.filter((x) => x.source === 'hrms')) {
+        certRows.push(row([
+          `${handlerName(h)} — ${e.title || e.type_label}`, 'HRMS', 'HRMS training record', e.issued_on, e.expiry_date || '—',
+          STATE_WORDS[e.state], 'HRMS record',
+        ], HANDLERS_LINK.href, e.state === 'expired' ? 'bad' : e.state === 'expiring' ? 'warn' : ''));
+      }
+    }
+  }
+
+  p.tables = [
+    table('Food handlers on the register', [
+      { label: 'Food handler', width: 1.8 }, { label: 'Role', width: 1.3 },
+      { label: isMed ? 'Medical fitness' : 'Food-safety training', width: 1.4 }, { label: 'Certificate', width: 1.7 },
+      ...(isMed ? [] : [{ label: 'FoSTaC (supervisor)', width: 1.3 }]),
+    ], regRows, ctx.limit, 'Nobody is on the food-handler register.'),
+    table('Certificates on file', [{ label: 'Food handler — certificate', width: 2.6 }, ...DOC_COLUMNS.slice(1)], certRows, ctx.limit,
+      'Nothing of this kind is on file.'),
+  ];
+  const stray = cov.unassigned_certificates.filter((u) => docTypes.includes(u.doc_type));
+  if (stray.length) {
+    p.tables.push(table('Certificates that match nobody on the register', [
+      { label: 'Certificate', width: 2 }, { label: 'Filed against', width: 1.6 }, { label: 'Expires', width: 0.9 }, { label: 'Why it does not count', width: 3 },
+    ], stray.map((u) => row([u.title || u.type_label, u.person_email || '—', u.expiry_date || '—', u.why], HANDLERS_LINK.href, 'warn', false)), ctx.limit));
+  }
+  p.scans = docs.flatMap((d) => d.scans.map((sc) => ({ ...sc, record_label: `${holderOf(d)} — ${sc.record_label}` })));
   if (p.status !== 'present') p.todo = todo;
   return p;
 }
@@ -991,34 +1322,71 @@ function rangeWords(min: unknown, max: unknown, uom: string): string {
   return '';
 }
 
-function tempVerdict(r: any): string {
-  if (intOr(r.is_judged, 1) === 0) return 'Not judged';
-  return intOr(r.is_fail) ? 'FAIL' : 'In range';
+/**
+ * "≤ 37.5 C by then" — where a cooling or reheating reading had to be at its
+ * minute, from the reading's own FROZEN line (fssaiReadingScheduleValue). ''
+ * for any other reading, or a line that cannot be drawn.
+ */
+function scheduleWords(r: any): string {
+  const v = fssaiReadingScheduleValue(r);
+  if (v === null || !Number.isFinite(v)) return '';
+  const hot = s(r.log_kind) === 'reheating' || s(r.log_kind) === 'hot_holding';
+  return `${hot ? '>=' : '<='} ${Number(v).toFixed(1)} ${s(r.uom)} by then`.trim();
 }
 
-function tempLog(ctx: Ctx, key: 'cold_temps' | 'cooking_temps', kinds: string[], what: string, todo: string, links: AuditFileLink[]): Part {
+/**
+ * Records 10 and 11. `kinds` are the readings LISTED; `judgedKinds` the ones
+ * whose last entry decides the status. For record 11 ("Cooking/reheating
+ * temperature log") that is cooking and reheating ONLY: a cooling or
+ * hot-holding reading is a real record and is printed with it, but a kitchen
+ * that logged only cooling has no cooking/reheating log, and the record says
+ * so instead of turning PRESENT.
+ *
+ * Every verdict word and minutes cell comes from _p4/lib — the words Reports
+ * prints — so a pot still on its way down reads "On schedule", never "In
+ * range" of a 5 °C rule, and a reading at minute 0 reads "0 of 240".
+ */
+function tempLog(
+  ctx: Ctx, key: 'cold_temps' | 'cooking_temps', kinds: string[], judgedKinds: string[],
+  what: string, todo: string, links: AuditFileLink[],
+): Part {
   const p = blank();
   const cadence = CADENCE[key];
   p.links = links;
-  p.basis = logBasis(cadence) + (key === 'cold_temps' ? ' A unit read in this period that has gone quiet for longer than that makes it EXPIRING too.' : '');
+  const others = kinds.filter((k) => !judgedKinds.includes(k));
+  p.basis = logBasis(cadence) +
+    (key === 'cold_temps' ? ' A unit read in this period that has gone quiet for longer than that makes it EXPIRING too.' : '') +
+    (others.length
+      ? ` Only ${judgedKinds.map((k) => fssaiTempLogKindLabel(k).toLowerCase()).join(' and ')} readings decide it; ` +
+        `${others.map((k) => fssaiTempLogKindLabel(k).toLowerCase()).join(' and ')} readings are listed with it but never make it PRESENT. ` +
+        'A cooling or reheating reading is judged against its batch\'s schedule: one that is where the schedule allows reads "On schedule".'
+      : '');
   const miss = absent(ctx.present, ['fssai_temperature_logs']);
   if (miss.length) { p.problems = [NOT_IN_DB(miss)]; p.todo = todo; return p; }
 
-  const marks = kinds.map(() => '?').join(',');
+  const marks = (list: string[]) => list.map(() => '?').join(',');
   const latest = s((ctx.db.prepare(
-    `SELECT MAX(business_date) AS d FROM fssai_temperature_logs t WHERE t.log_kind IN (${marks}) AND ${LIVE('t')}`,
-  ).get(...kinds) as any)?.d);
+    `SELECT MAX(business_date) AS d FROM fssai_temperature_logs t WHERE t.log_kind IN (${marks(judgedKinds)}) AND ${LIVE('t')}`,
+  ).get(...judgedKinds) as any)?.d);
+  const hasCurveCols = !!ctx.db.prepare(`SELECT 1 FROM pragma_table_xinfo('fssai_temperature_logs') WHERE name = 'curve_start_source'`).get();
   const rows = ctx.db.prepare(
     `SELECT id, business_date, reading_at, log_kind, equipment_label, area_label, item_label, value_num, uom, decimals,
-            min_used, max_used, is_fail, is_judged, action_taken, recorded_name, recorded_by, elapsed_minutes, max_minutes_used
+            min_used, max_used, target_used, is_fail, is_judged, action_taken, recorded_name, recorded_by,
+            elapsed_minutes, max_minutes_used
+            ${hasCurveCols ? ', curve_start_used, curve_start_minute, curve_start_source' : ''}
        FROM fssai_temperature_logs t
-      WHERE t.log_kind IN (${marks}) AND ${LIVE('t')} AND business_date >= ? AND business_date <= ?
+      WHERE t.log_kind IN (${marks(kinds)}) AND ${LIVE('t')} AND business_date >= ? AND business_date <= ?
       ORDER BY business_date DESC, reading_at DESC`,
   ).all(...kinds, ctx.since, ctx.today) as any[];
+  const judgedRows = rows.filter((r) => judgedKinds.includes(s(r.log_kind)));
 
   const v = judgeLog(latest, ctx.today, cadence, what);
   let status = v.status;
   const problems = [...v.problems];
+  if (!latest && rows.length) {
+    const seen = [...new Set(rows.map((r) => fssaiTempLogKindLabel(r.log_kind).toLowerCase()))];
+    problems.push(`${plural(rows.length, 'reading')} since ${ctx.since}, all ${seen.join(' / ')} — none is a ${judgedKinds.map((k) => fssaiTempLogKindLabel(k).toLowerCase()).join(' or ')} reading, which is what this log is.`);
+  }
   if (key === 'cold_temps' && rows.length) {
     // A unit that WAS being read and has stopped is the gap an inspector finds
     // by turning the pages — the overall "last entry" hides it.
@@ -1033,14 +1401,18 @@ function tempLog(ctx: Ctx, key: 'cold_temps' | 'cooking_temps', kinds: string[],
   }
   const fails = rows.filter((r) => intOr(r.is_fail) === 1);
   const unactioned = fails.filter((r) => !s(r.action_taken));
-  if (unactioned.length) problems.push(`${plural(unactioned.length, 'out-of-range reading')} in this period ${unactioned.length === 1 ? 'has' : 'have'} no action written against ${unactioned.length === 1 ? 'it' : 'them'}.`);
+  if (unactioned.length) problems.push(`${plural(unactioned.length, 'failed reading')} in this period ${unactioned.length === 1 ? 'has' : 'have'} no action written against ${unactioned.length === 1 ? 'it' : 'them'}.`);
 
   p.status = status;
   p.problems = problems;
-  p.headline = latest ? `${plural(rows.length, 'reading')} since ${ctx.since} · last on ${latest}` : `No ${what} recorded`;
+  p.headline = latest
+    ? `${plural(judgedRows.length, `${judgedKinds.map((k) => fssaiTempLogKindLabel(k).toLowerCase()).join('/')} reading`)} since ${ctx.since} · last on ${latest}` +
+      (others.length && rows.length > judgedRows.length ? ` · ${rows.length - judgedRows.length} ${others.map((k) => fssaiTempLogKindLabel(k).toLowerCase()).join('/')} listed with it` : '')
+    : rows.length ? `No ${what} recorded · ${plural(rows.length, 'other reading')} listed` : `No ${what} recorded`;
   p.summary = [
-    { label: 'Readings', value: String(rows.length) },
-    { label: 'Out of range', value: String(fails.length) },
+    { label: others.length ? 'Cooking/reheating readings' : 'Readings', value: String(judgedRows.length) },
+    ...(others.length ? [{ label: 'Cooling/hot-holding listed', value: String(rows.length - judgedRows.length) }] : []),
+    { label: 'Failed', value: String(fails.length) },
     { label: 'Not judged', value: String(rows.filter((r) => intOr(r.is_judged, 1) === 0).length), mgmt: true },
     { label: 'Last reading', value: latest || '—' },
   ];
@@ -1049,19 +1421,23 @@ function tempLog(ctx: Ctx, key: 'cold_temps' | 'cooking_temps', kinds: string[],
     { label: 'Date', width: 1.05 }, { label: 'Time', width: 0.6 },
     { label: isCold ? 'Unit' : 'What', width: isCold ? 1.7 : 1.5 }, { label: isCold ? 'Area' : 'Kind', width: 0.9 },
     ...(isCold ? [] : [{ label: 'Minutes', width: 0.8 }]),
-    { label: 'Reading', width: 0.8, align: 'right' as const }, { label: 'Range applied', width: 1.15 }, { label: 'Verdict', width: 1.05 },
+    { label: 'Reading', width: 0.8, align: 'right' as const }, { label: 'Range applied', width: isCold ? 1.15 : 1.5 }, { label: 'Verdict', width: 1.05 },
     { label: 'Action taken', width: 1.4 }, { label: 'By', width: 1 },
   ], rows.map((r) => {
     const reading = numOrBlank(r.value_num, intOr(r.decimals, 1));
-    const mins = intOr(r.elapsed_minutes) ? `${intOr(r.elapsed_minutes)}${intOr(r.max_minutes_used) ? ` of ${intOr(r.max_minutes_used)}` : ''}` : '';
+    const range = [rangeWords(r.min_used, r.max_used, s(r.uom)), scheduleWords(r)].filter(Boolean).join('; ');
     return row([
       s(r.business_date), s(r.reading_at).slice(11, 16) || s(r.reading_at).slice(0, 5),
       isCold ? s(r.equipment_label || r.area_label) : [s(r.item_label), s(r.equipment_label || r.area_label)].filter(Boolean).join(' · '),
       isCold ? s(r.area_label) : fssaiTempLogKindLabel(r.log_kind),
-      ...(isCold ? [] : [mins]),
-      reading ? `${reading} ${s(r.uom)}`.trim() : '—', rangeWords(r.min_used, r.max_used, s(r.uom)), tempVerdict(r),
+      ...(isCold ? [] : [fssaiTempMinutesWords(r)]),
+      reading ? `${reading} ${s(r.uom)}`.trim() : '—', range, fssaiTempVerdictWord(r),
       s(r.action_taken), s(r.recorded_name || r.recorded_by),
-    ], '/fssai/temperature', intOr(r.is_fail) ? 'bad' : '');
+    ], '/fssai/temperature', intOr(r.is_fail) ? 'bad' : '',
+    // A cooling or hot-holding reading goes into the inspector's copy only
+    // beside at least one reading of the log itself: alone, it would put
+    // "Cooking/reheating temperature log" in the copy with no such reading.
+    judgedKinds.includes(s(r.log_kind)) || judgedRows.length > 0);
   }), ctx.limit)];
   if (p.status !== 'present') p.todo = todo;
   return p;
@@ -1071,13 +1447,13 @@ function tempLog(ctx: Ctx, key: 'cold_temps' | 'cooking_temps', kinds: string[],
 function runsOf(ctx: Ctx, where: string, args: any[]): { latest: string; rows: any[] } {
   const latest = s((ctx.db.prepare(
     `SELECT MAX(r.business_date) AS d FROM fssai_runs r JOIN fssai_templates t ON t.id = r.template_id
-      WHERE r.status IN ('submitted','verified') AND r.voided_at = '' AND (${where})`,
+      WHERE r.status IN ('submitted','verified') AND r.voided_at = '' AND (${where}) AND ${ctx.notHydAudit}`,
   ).get(...args) as any)?.d);
   const rows = ctx.db.prepare(
     `SELECT r.id, r.business_date, r.shift, r.target_label, r.status, r.outcome, r.answered_count, r.total_count,
             r.fail_count, r.recorded_name, r.recorded_by, r.signed_by, t.name AS template_name, t.code AS template_code
        FROM fssai_runs r JOIN fssai_templates t ON t.id = r.template_id
-      WHERE r.status IN ('submitted','verified') AND r.voided_at = '' AND (${where})
+      WHERE r.status IN ('submitted','verified') AND r.voided_at = '' AND (${where}) AND ${ctx.notHydAudit}
         AND r.business_date >= ? AND r.business_date <= ?
       ORDER BY r.business_date DESC, r.started_at DESC`,
   ).all(...args, ctx.since, ctx.today) as any[];
@@ -1098,7 +1474,7 @@ function runRows(rows: any[]): AuditFileRow[] {
 
 function templatesSetUp(ctx: Ctx, where: string, args: any[]): number {
   return intOr((ctx.db.prepare(
-    `SELECT COUNT(*) AS n FROM fssai_templates t WHERE t.is_active = 1 AND t.status = 'published' AND (${where})`,
+    `SELECT COUNT(*) AS n FROM fssai_templates t WHERE t.is_active = 1 AND t.status = 'published' AND (${where}) AND ${ctx.notHydAudit}`,
   ).get(...args) as any)?.n);
 }
 
@@ -1145,18 +1521,89 @@ function cleaning(ctx: Ctx): Part {
     'No cleaning checklist is published. An administrator publishes the ready-made ones under FSSAI Settings.');
 }
 
-/** A template with a Pests section — the daily look for pests is part of that round. */
+/** A template with a Pests section — the daily pest LOOK on the kitchen round. */
 const PEST_TEMPLATE_WHERE =
   `EXISTS (SELECT 1 FROM fssai_sections sx WHERE sx.template_id = t.id AND sx.is_active = 1
             AND (sx.code = 'PEST' OR lower(sx.title) LIKE '%pest%'))`;
 
+/**
+ * 13 — PEST-CONTROL MONITORING SHEET. The authority's sheet is one line per
+ * station per check: date, device, activity yes/no, action, initials. That is
+ * fssai_pest_device_checks, read through the pest lane's own reader
+ * (readPestMonitoringSheet) — its verdict decides this record:
+ *   missing  — no station on the pest map, or none checked in these dates
+ *   expiring — a station in use is overdue or was never checked (or a pest
+ *              sighting in these dates is still open)
+ *   present  — stations checked, every one inside its own frequency.
+ * A checklist round is NEVER the monitoring sheet: the daily kitchen round's
+ * Pests section is a look, listed beside it; the authority's monthly Checklist
+ * 3 is a self-audit and is not even listed here (ctx.notHydAudit).
+ * Voided check lines stay on the sheet, marked VOID with the reason.
+ */
 function pestMonitoring(ctx: Ctx): Part {
-  const p = checklistRecord(ctx, 'pest_monitoring', PEST_TEMPLATE_WHERE, [], 'pest check',
-    'Run the daily kitchen cleaning round — its Pests section is the daily pest look — and log every sighting under Pest Control Logs.',
-    [{ href: '/fssai/pest-control', label: 'Pest Control Logs' }, { href: '/fssai/cleaning', label: 'Cleaning & Sanitation' }],
-    'No published checklist has a Pests section. An administrator publishes the ready-made daily kitchen cleaning checklist under FSSAI Settings.');
-  p.basis = 'The daily pest look is the Pests section of a checklist round (the daily kitchen clean carries one). ' + p.basis +
-    ' Sightings and the bait-station register are listed alongside it.';
+  const p = blank();
+  p.links = [{ href: '/fssai/pest-control', label: 'Pest Control Logs — Station checks' }, { href: '/fssai/cleaning', label: 'Cleaning & Sanitation' }];
+  p.basis =
+    'The station-by-station monitoring sheet (Pest Control Logs → Station checks): one line per bait station, glue board or insect-light trap ' +
+    'at every check — date, device, activity yes or no, action taken, initials. PRESENT when stations were checked in these dates and every ' +
+    'station in use is inside its own check frequency; EXPIRING when a station is overdue or has never been checked, or a pest sighting in ' +
+    'these dates is still open; MISSING when no station is on the pest map or none was checked in these dates. A checklist round is not the ' +
+    'monitoring sheet: the daily pest look on the kitchen round is listed beside it, and the authority\'s monthly self-audit pages never count.';
+  const todo =
+    'Put every bait station, glue board and insect-light trap on the pest map (Pest Control Logs → Monitoring points), then walk them on the ' +
+    'Station checks tab — every station on its own schedule, activity yes or no, the action and your initials.';
+  const miss = absent(ctx.present, ['fssai_pest_device_checks', 'fssai_pest_devices']);
+  if (miss.length) { p.problems = [NOT_IN_DB(miss)]; p.todo = todo; return p; }
+
+  const sheet = readPestMonitoringSheet(ctx.db, { from: ctx.since, to: ctx.today, today: ctx.today });
+  p.status = sheet.verdict;
+  // The sheet's own sentences, minus the one that only says where activity was
+  // filed (it is not a gap: activity found and acted on IS the record working).
+  p.problems = sheet.problems.filter((x) => !/^Activity was found/.test(x));
+  const dues = sheet.stations.map((st) => st.due_on).filter((d) => isISODate(d));
+  p.lapses_on = earliest(dues);
+  const live = sheet.rows.filter((r) => !r.is_void);
+  p.headline = live.length
+    ? `${plural(live.length, 'station check')} in ${plural(sheet.totals.rounds, 'round')} since ${ctx.since} · last on ${sheet.last_check_date} · ${plural(sheet.totals.stations_in_use, 'station')} on the map`
+    : sheet.totals.stations_in_use ? `${plural(sheet.totals.stations_in_use, 'station')} on the map, none checked since ${ctx.since}` : 'No station on the pest map';
+  p.summary = [
+    { label: 'Rounds', value: String(sheet.totals.rounds) },
+    { label: 'Station checks', value: String(sheet.totals.lines) },
+    { label: 'Activity found', value: String(sheet.totals.activity) },
+    // The station count beside a sheet with a station missing from it measures
+    // the gap, so it is management's then.
+    sheet.totals.stations_overdue + sheet.totals.stations_never
+      ? { label: 'Stations', value: String(sheet.totals.stations_in_use), mgmt: true as const }
+      : { label: 'Stations', value: String(sheet.totals.stations_in_use) },
+    { label: 'Overdue or never checked', value: String(sheet.totals.stations_overdue + sheet.totals.stations_never), mgmt: true },
+  ];
+
+  // THE SHEET — newest first, like every other log here. A voided line stays,
+  // marked VOID with its reason (void, never delete).
+  const lines = [...sheet.rows].reverse();
+  p.tables.push(table(`Station checks from ${ctx.since}`, [
+    { label: 'Date', width: 0.9 }, { label: 'Time', width: 0.5 }, { label: 'Station', width: 0.7 }, { label: 'Kind · where', width: 1.8 },
+    { label: 'Activity', width: 0.6 }, { label: 'Pest', width: 0.8 }, { label: 'Device', width: 0.8 },
+    { label: 'Action taken', width: 1.9 }, { label: 'Initials', width: 0.6 },
+  ], lines.map((r) => row([
+    r.business_date, r.checked_at, r.device_code, [r.device_kind_label, r.location_label].filter(Boolean).join(' · '),
+    r.activity_label, r.activity_kind_label, r.device_condition_label,
+    r.is_void ? `VOID — ${r.void_reason || 'voided'}${r.voided_by ? ` (${r.voided_by})` : ''}` : r.action_taken,
+    r.initials,
+  ], '/fssai/pest-control', r.is_void ? 'void' : r.is_fail ? 'bad' : '')), ctx.limit, 'No station was checked in these dates.'));
+
+  // THE STATIONS — in the inspector's copy only when every one is inside its
+  // schedule: a station list with gaps cut out would read as the whole map.
+  const allOk = sheet.stations.length > 0 && sheet.stations.every((st) => st.state === 'ok' || st.state === 'due');
+  p.tables.push(table('Stations on the pest map', [
+    { label: 'Code', width: 0.7 }, { label: 'Kind', width: 1.1 }, { label: 'Location', width: 2 }, { label: 'Checked', width: 0.9 },
+    { label: 'Last check', width: 1.1 }, { label: 'Next due', width: 0.9 }, { label: 'State', width: 0.9 },
+  ], sheet.stations.map((st) => row([
+    st.code, st.device_kind_label, st.location_label, st.check_frequency + (st.frequency_assumed ? ' (assumed)' : ''),
+    [st.last_check_date, st.last_check_time].filter(Boolean).join(' ') || '—', st.due_on || '—', st.state_label,
+  ], '/fssai/pest-control', st.state === 'overdue' || st.state === 'never' ? 'bad' : st.state === 'due' ? 'warn' : '', allOk)), ctx.limit,
+  'No station is on the pest map.'));
+
   if (ctx.present.has('fssai_pest_sightings')) {
     const sightings = ctx.db.prepare(
       `SELECT business_date, pest_type, evidence_kind, location_label, severity, immediate_action, closed_at
@@ -1176,23 +1623,28 @@ function pestMonitoring(ctx: Ctx): Part {
       s(x.closed_at).slice(0, 10) || 'open',
     ], '/fssai/pest-control', s(x.closed_at) ? '' : 'bad')), ctx.limit, 'No pest sighting was reported in these dates.'));
   }
-  if (ctx.present.has('fssai_pest_devices')) {
-    const devices = ctx.db.prepare(
-      `SELECT code, device_kind, location_label, check_frequency, last_checked_at
-         FROM fssai_pest_devices WHERE is_active = 1 ORDER BY sort_order, code`,
-    ).all() as any[];
-    if (devices.length) {
-      p.summary.push({ label: 'Stations', value: String(devices.length) });
-      p.tables.push(table('Bait stations and traps', [
-        { label: 'Code', width: 0.8 }, { label: 'Kind', width: 1.2 }, { label: 'Location', width: 2.2 },
-        { label: 'Checked', width: 1 }, { label: 'Last checked', width: 1.2 },
-      ], devices.map((d) => row([
-        s(d.code), s(d.device_kind), s(d.location_label), s(d.check_frequency), s(d.last_checked_at).slice(0, 10) || '—',
-      ], '/fssai/pest-control')), ctx.limit));
+
+  // THE DAILY PEST LOOK — listed, never deciding (see the header).
+  if (absent(ctx.present, ['fssai_runs', 'fssai_templates', 'fssai_sections']).length === 0) {
+    const { rows } = runsOf(ctx, PEST_TEMPLATE_WHERE, []);
+    if (rows.length) {
+      p.summary.push({ label: 'Daily pest looks', value: String(rows.length) });
+      p.tables.push(table(`Daily pest look on the kitchen round, from ${ctx.since}`, RUN_COLUMNS, runRows(rows), ctx.limit));
     }
   }
-  if (p.status !== 'present' && !p.todo) {
-    p.todo = 'Close each open sighting on Pest Control Logs with what was done about it.';
+
+  // Sightings and the daily look are not the sheet: with no station check in
+  // these dates they stay out of the inspector's copy, so the copy never holds
+  // a "Pest-control monitoring sheet" that is not one.
+  if (!live.length) {
+    for (const t of p.tables) {
+      for (const r of t.rows) r.in_handover = false;
+      t.handover_rows = 0;
+    }
+  }
+
+  if (p.status !== 'present') {
+    p.todo = sheet.verdict !== 'present' ? todo : 'Close each open sighting on Pest Control Logs with what was done about it.';
   }
   return p;
 }
@@ -1222,32 +1674,41 @@ function fifo(ctx: Ctx): Part {
 }
 
 /* 14 ─ Waste disposal record */
+/**
+ * The HANDOVER LOG decides it (wasteHandoverAuditPart, the waste lane's own
+ * reader, judged on the last live handover against WASTE_HANDOVER_CADENCE):
+ * one line per handover — date, wet / dry / other, quantity, collector, receipt
+ * or vehicle, who handed it over — is what the authority asks to see. The
+ * collector's agreement (a document) is listed BESIDE it with its copy, and so
+ * are expired stock discarded and used oil handed over; none of them decides.
+ */
 function waste(ctx: Ctx): Part {
-  const p = blank();
-  p.links = [DOCS_LINK, { href: '/fssai/fifo', label: 'FIFO & Expiry Management' }, { href: '/fssai/oil-quality', label: 'Oil Quality Checks' }];
-  p.basis =
-    `From Documents & Certificates ("Waste disposal record": the GHMC or authorised collector's agreement or receipts). One with an end date counts until then; ` +
-    `one without counts for ${CURRENCY_DAYS.waste_record} days from its date. A copy must be attached. EXPIRING inside ${WARN_DAYS} days of the end. ` +
-    'Expired stock discarded and used oil handed over are listed alongside it.';
-  const todo =
-    'File the waste collector\'s agreement or the latest collection receipts under Documents & Certificates as "Waste disposal record", with a scan.';
-  const miss = absent(ctx.present, ['fssai_documents']);
-  if (miss.length) { p.problems = [NOT_IN_DB(miss)]; p.todo = todo; return p; }
+  const part = wasteHandoverAuditPart(ctx.db, { today: ctx.today, since: ctx.since, rowLimit: ctx.limit });
+  const p: Part = {
+    ...blank(),
+    status: part.status,
+    headline: part.headline,
+    problems: [...part.problems],
+    todo: part.todo,
+    lapses_on: part.lapses_on,
+    basis: part.basis + ' The collector\'s agreement or receipts (Documents & Certificates, "Waste disposal record"), expired stock discarded and used oil handed over are listed beside it; they do not decide it.',
+    links: [...part.links, DOCS_LINK, { href: '/fssai/fifo', label: 'FIFO & Expiry Management' }, { href: '/fssai/oil-quality', label: 'Oil Quality Checks' }],
+    summary: part.summary.map((x) => ({ ...x })),
+    tables: part.tables.map((t) => ({ ...t, rows: t.rows.map((r) => ({ ...r })) })),
+    // The lane lists ACTIVE photos on live handovers only; shaped here so the
+    // one partition in buildAuditFile sees the same fields as every record.
+    scans: part.scans.map((sc) => shapeScan({ ...sc, id: sc.attachment_id, status: 'active' }, sc.record_label)),
+  };
 
-  const docs = readDocs(ctx, ['waste_disposal_record']);
-  const usable = docs.filter((d) => d.stored > 0);
-  const ends = usable.map((d) => ({ d, end: docCurrentUntil(d, CURRENCY_DAYS.waste_record) })).filter((x) => x.end).sort((a, b) => (a.end < b.end ? 1 : -1));
-  const best = ends[0];
-  const v = judgePeriod(best?.end || '', ctx.today, 'waste disposal record');
-  p.status = v.status;
-  p.problems = v.problems;
-  if (!best && docs.length) p.problems = [`${docLabel(docs[0])} is recorded, but no copy of it is attached.`];
-  p.lapses_on = best?.end || '';
-  p.headline = best ? `${docLabel(best.d)}, good until ${best.end}` : docs.length ? `${plural(docs.length, 'record')} on file, none usable` : 'Nothing on file';
-  p.summary = [{ label: 'On file', value: String(docs.length) }, { label: 'Good until', value: best?.end || '—' }];
-  p.tables = [table('Waste disposal records', DOC_COLUMNS, docRows(docs), ctx.limit, 'Nothing of this kind is on file.')];
-  p.scans = docs.flatMap((d) => d.scans);
-
+  if (ctx.present.has('fssai_documents')) {
+    const docs = readDocs(ctx, ['waste_disposal_record']);
+    const usable = docs.filter((d) => d.stored > 0)
+      .map((d) => ({ d, end: docCurrentUntil(d, CURRENCY_DAYS.waste_record) })).filter((x) => x.end)
+      .sort((a, b) => (a.end < b.end ? 1 : -1));
+    p.summary.push({ label: 'Agreement', value: usable[0] ? `until ${usable[0].end}` : '—' });
+    p.tables.push(table('The collector\'s agreement and receipts', DOC_COLUMNS, docRows(docs), ctx.limit, 'Nothing of this kind is on file.'));
+    p.scans.push(...docs.flatMap((d) => d.scans));
+  }
   if (ctx.present.has('fssai_expiry_items')) {
     const discards = ctx.db.prepare(
       `SELECT business_date, material_name, batch_label, discard_qty, uom, discard_method, witnessed_by
@@ -1277,7 +1738,6 @@ function waste(ctx: Ctx): Part {
       s(x.business_date), s(x.collector_name), s(x.agency_reg_no), s(x.vehicle_no), [numOrBlank(x.quantity, 1), s(x.uom)].filter(Boolean).join(' '), s(x.receipt_no),
     ], '/fssai/oil-quality')), ctx.limit, 'No used oil was handed over in these dates.'));
   }
-  if (p.status !== 'present') p.todo = todo;
   return p;
 }
 
@@ -1511,14 +1971,25 @@ function foodLab(ctx: Ctx): Part {
 }
 
 /* 20 ─ Previous audit report and closure evidence */
+/**
+ * The last visit, its report and how every point it raised was closed — read
+ * through readFssaiVisitClosureEvidence (the closure lane's reader): the
+ * report's LIVE copies (the linked document's live scans and the pages filed
+ * on the visit itself), and per point the LIVE closure photographs from the
+ * point AND from the corrective action it raised. Voided files are listed
+ * apart and never counted. A photograph is optional (the owner has not ruled
+ * it required), so its absence is shown, not judged.
+ */
 function previousAudit(ctx: Ctx): Part {
   const p = blank();
   p.links = [{ href: '/fssai/inspections', label: 'Inspection Reports' }, { href: '/fssai/corrective-actions', label: 'Corrective Actions' }, DOCS_LINK];
   p.basis =
-    'The last visit recorded under Inspection Reports, its report (a copy filed under Documents & Certificates as "Previous audit report and closure evidence", or attached to the visit), ' +
-    'and every point it raised. PRESENT when the report copy is on file and every point is closed; EXPIRING while points are open but not yet due; MISSING without a copy, or when an open point is past its due date.';
+    'The last visit recorded under Inspection Reports, its report (a copy filed under Documents & Certificates as "Previous audit report and closure evidence", ' +
+    'linked to the visit, or photographed onto the visit), and every point it raised with what was done and the photographs of the fix (on the point or on ' +
+    'its corrective action). PRESENT when a report copy is on file and every point is closed; EXPIRING while points are open but not yet due; MISSING without ' +
+    'a copy, or when an open point is past its due date. Voided pages and photographs are kept and listed, never counted.';
   const todo =
-    'Record the last visit under Inspection Reports with each point it raised, close each point with what was done, and file the authority\'s report under Documents & Certificates with a scan.';
+    'Record the last visit under Inspection Reports with each point it raised, close each point with what was done (and a photograph of the fix), and link or photograph the authority\'s report onto the visit.';
   const miss = absent(ctx.present, ['fssai_inspections', 'fssai_inspection_findings', 'fssai_documents']);
   if (miss.length) { p.problems = [NOT_IN_DB(miss)]; p.todo = todo; return p; }
 
@@ -1531,31 +2002,41 @@ function previousAudit(ctx: Ctx): Part {
   ).all(ctx.today) as any[];
   const reportDocs = readDocs(ctx, ['audit_report']);
   const last = visits[0];
+  const ev = last && ctx.present.has('fssai_attachments') ? readFssaiVisitClosureEvidence(ctx.db, [s(last.id)]).get(s(last.id)) : undefined;
 
-  // The report copy: an audit-report document, the document the visit points
-  // at, or a file attached to the visit itself.
-  let copies = reportDocs.filter((d) => d.stored > 0).length;
+  // THE REPORT COPIES — every audit-report document on file, plus the visit's
+  // own report pages, plus the linked document when it is not already one of
+  // the audit-report documents (no copy counted twice).
   const scans: AuditFileScan[] = reportDocs.flatMap((d) => d.scans);
-  if (last && s(last.document_id)) {
-    const linked = scans.some((sc) => sc.entity_id === s(last.document_id)) ? [] :
-      readScans(ctx.db, 'fssai_documents', [s(last.document_id)], () => `Report of the visit on ${s(last.business_date)}`);
-    copies += linked.filter((sc) => sc.has_image).length;
-    scans.push(...linked);
-  }
-  if (last) {
-    const own = readScans(ctx.db, 'fssai_inspections', [s(last.id)], () => `Visit on ${s(last.business_date)}`);
-    copies += own.filter((sc) => sc.has_image).length;
-    scans.push(...own);
+  let copies = reportDocs.reduce((a, d) => a + d.stored, 0);
+  const visitLabel = last ? `Report of the visit on ${s(last.business_date)}` : 'Report';
+  if (ev) {
+    const doc = ev.report.document;
+    if (doc && !reportDocs.some((d) => d.id === doc.id)) {
+      scans.push(...doc.scans.map((f) => closureScan(f, `${visitLabel} — ${doc.title || doc.doc_type_label}`)));
+      if (!doc.voided) copies += doc.live_scans;
+    }
+    scans.push(...ev.report.files.map((f) => closureScan(f, `${visitLabel} — page filed on the visit`)));
+    scans.push(...ev.report.voided_files.map((f) => closureScan(f, `${visitLabel} — page filed on the visit`)));
+    copies += ev.report.files.filter((f) => f.has_image).length;
   }
 
   const findings = last ? ctx.db.prepare(
-    `SELECT f.finding_no, f.clause_ref, f.severity, f.observation, f.due_date, f.status, f.response, f.closed_at,
+    `SELECT f.id, f.finding_no, f.clause_ref, f.severity, f.observation, f.due_date, f.status, f.response, f.closed_at, f.closed_by,
             ca.ca_number, ca.status AS ca_status, ca.action_taken, ca.verified_by
        FROM fssai_inspection_findings f
        LEFT JOIN fssai_corrective_actions ca ON ca.id = f.ca_id
       WHERE f.inspection_id = ?
       ORDER BY f.sort_order, f.finding_no`,
   ).all(s(last.id)) as any[] : [];
+  const evBy = new Map((ev?.findings || []).map((f) => [f.finding_id, f]));
+  for (const f of findings) {
+    const e = evBy.get(s(f.id));
+    if (!e) continue;
+    const lbl = `Point ${s(f.finding_no) || e.finding_no}: ${s(f.observation).slice(0, 60)} — closure photograph`;
+    scans.push(...e.closure_files.map((x) => closureScan(x, lbl)));
+    scans.push(...e.voided_files.map((x) => closureScan(x, lbl)));
+  }
   const isOpen = (f: any) => ['open', 'in_progress'].includes(s(f.status));
   const open = findings.filter(isOpen);
   const overdue = open.filter((f) => isISODate(s(f.due_date)) && s(f.due_date) < ctx.today);
@@ -1568,9 +2049,10 @@ function previousAudit(ctx: Ctx): Part {
   } else if (!copies) {
     status = 'missing';
     problems.push(last
-      ? `The visit on ${s(last.business_date)}${s(last.authority) ? ` by ${s(last.authority)}` : ''} is recorded, but no copy of its report is on file.`
+      ? `The visit on ${s(last.business_date)}${s(last.authority) ? ` by ${s(last.authority)}` : ''} is recorded, but no live copy of its report is on file.`
       : 'An audit report is recorded, but no copy of it is attached.');
   }
+  if (ev && ev.report.document_problem) problems.push(ev.report.document_problem);
   if (overdue.length) {
     status = 'missing';
     problems.push(`${plural(overdue.length, 'point')} from the visit on ${s(last.business_date)} ${overdue.length === 1 ? 'is' : 'are'} past the due date and not closed.`);
@@ -1581,16 +2063,21 @@ function previousAudit(ctx: Ctx): Part {
     p.lapses_on = due;
   }
 
+  const settled = ev ? ev.counts.settled : 0;
+  const withPhoto = ev ? ev.counts.settled_with_photo : 0;
   p.status = status;
   p.problems = problems;
   p.headline = last
-    ? `Last visit ${s(last.business_date)}${s(last.authority) ? ` — ${s(last.authority)}` : ''} · ${plural(findings.length, 'point')}, ${open.length} open · ${plural(copies, 'report copy', 'report copies')}`
+    ? `Last visit ${s(last.business_date)}${s(last.authority) ? ` — ${s(last.authority)}` : ''} · ${plural(findings.length, 'point')}, ${open.length} open · ` +
+      `${plural(copies, 'report copy', 'report copies')}${settled ? ` · ${withPhoto} of ${settled} closed with a photograph` : ''}`
     : reportDocs.length ? `${plural(reportDocs.length, 'audit report')} on file` : 'Nothing recorded';
   p.summary = [
     { label: 'Visits recorded', value: String(visits.length) },
     { label: 'Last visit', value: last ? s(last.business_date) : '—' },
     { label: 'Points raised', value: String(findings.length) },
     { label: 'Still open', value: String(open.length) },
+    { label: 'Report copies', value: String(copies) },
+    { label: 'Closed with a photograph', value: `${withPhoto} of ${settled}`, mgmt: true },
   ];
   p.tables = [
     table('Visits', [
@@ -1601,17 +2088,120 @@ function previousAudit(ctx: Ctx): Part {
       v.score === null || v.score === undefined ? '' : `${v.score}${v.score_max ? ` / ${v.score_max}` : ''}`, s(v.grade), intOr(v.finding_count), intOr(v.open_count),
     ], '/fssai/inspections', intOr(v.open_count) > 0 ? 'warn' : '')), ctx.limit, 'No visit is recorded.'),
     table(last ? `Points raised on ${s(last.business_date)} and how each was closed` : 'Points raised', [
-      { label: 'No.', width: 0.5 }, { label: 'Clause', width: 0.8 }, { label: 'Observation', width: 2.4 }, { label: 'Due', width: 0.9 },
-      { label: 'Status', width: 0.8 }, { label: 'What was done', width: 2.2 }, { label: 'Checked by', width: 1.1 },
-    ], findings.map((f) => row([
-      s(f.finding_no), s(f.clause_ref), s(f.observation), s(f.due_date), s(f.status).replace(/_/g, ' '),
-      s(f.action_taken) || s(f.response), s(f.verified_by),
-    ], '/fssai/inspections', overdue.includes(f) ? 'bad' : isOpen(f) ? 'warn' : '')), ctx.limit, 'The visit raised no points.'),
+      { label: 'No.', width: 0.5 }, { label: 'Clause', width: 0.7 }, { label: 'Observation', width: 2.2 }, { label: 'Due', width: 0.9 },
+      { label: 'Status', width: 0.8 }, { label: 'What was done', width: 2.1 }, { label: 'Checked by', width: 1.1 }, { label: 'Photos', width: 0.6, align: 'right' },
+    ], findings.map((f) => {
+      const e = evBy.get(s(f.id));
+      const photos = e ? e.closure_files.filter((x) => x.has_image).length : 0;
+      return row([
+        s(f.finding_no), s(f.clause_ref), s(f.observation), s(f.due_date), s(f.status).replace(/_/g, ' '),
+        s(f.action_taken) || s(f.response), s(f.verified_by) || s(f.closed_by), photos ? String(photos) : '—',
+      ], '/fssai/inspections', overdue.includes(f) ? 'bad' : isOpen(f) ? 'warn' : '');
+    }), ctx.limit, 'The visit raised no points.'),
     table('Audit reports on file', DOC_COLUMNS, docRows(reportDocs), ctx.limit, 'No audit report document is on file.'),
   ];
   p.scans = scans;
   if (p.status !== 'present') p.todo = todo;
   return p;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * BEYOND THE 20 — the authority's own checklist pages, answered
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * The authority's three checklist pages (CHECKLIST 1–3 of its workbook), each
+ * with the LAST submitted or verified self-audit round laid back onto the page:
+ * the same rows, words and order, YES / NO / REMARK filled in (the pack's
+ * fssaiHydAnswerSheet). This is how an inspector reads the PASSING answers —
+ * every other screen shows a round as a name, a date and a fail count.
+ *
+ * The template is found by the code the pack seeded it as, or — after the owner
+ * renamed it — by the seed log's record of what that code created. Read-only.
+ * Never throws: a page that cannot be read says why in `problem`.
+ */
+export function readHydSelfAudit(db: Database.Database, today: string, since: string): AuditFileSelfAudit[] {
+  const present = fssaiTablesPresent(db);
+  const need = ['fssai_runs', 'fssai_templates', 'fssai_responses', 'fssai_questions'];
+  const missing = need.filter((t) => !present.has(t));
+  const out: AuditFileSelfAudit[] = [];
+  for (const sheet of FSSAI_HYD_WORKBOOK.slice(1)) {
+    const code = sheet.template_code;
+    const page: AuditFileSelfAudit = {
+      sheet: sheet.name, template_code: code, template_name: '', run: null,
+      rows: sheet.rows.filter((r) => r.kind !== 'title').map((r) => ({
+        kind: r.kind, text: r.text, mark: '', remark: '', question_code: String(r.question_code || ''),
+      })),
+      counts: { lines: sheet.rows.filter((r) => r.kind === 'line').length, yes: 0, no: 0, na: 0, unanswered: sheet.rows.filter((r) => r.kind === 'line').length },
+      extra: [], rounds_in_window: 0, problem: '',
+    };
+    out.push(page);
+    if (missing.length) { page.problem = NOT_IN_DB(missing); continue; }
+    try {
+      const viaSeed = present.has('fssai_seed_log')
+        ? ` OR t.id IN (SELECT item_id FROM fssai_seed_log WHERE item_kind = 'template' AND action = 'inserted' AND item_code = ?)`
+        : '';
+      const tpls = db.prepare(
+        `SELECT t.id, t.name, t.code, t.status FROM fssai_templates t WHERE t.code = ?${viaSeed}`,
+      ).all(...(viaSeed ? [code, code] : [code])) as any[];
+      if (!tpls.length) {
+        page.problem = `The ready-made ${sheet.name} checklist (${code}) is not in this database. An administrator adds it under FSSAI Settings → Ready-made checklists.`;
+        continue;
+      }
+      page.template_name = s(tpls[0].name);
+      const ids = tpls.map((t) => s(t.id));
+      const marks = ids.map(() => '?').join(',');
+      const run = db.prepare(
+        `SELECT r.id, r.business_date, r.status, r.outcome, r.recorded_name, r.recorded_by, r.signed_by
+           FROM fssai_runs r
+          WHERE r.template_id IN (${marks}) AND r.status IN ('submitted','verified') AND r.voided_at = '' AND r.business_date <= ?
+          ORDER BY r.business_date DESC, r.submitted_at DESC, r.started_at DESC LIMIT 1`,
+      ).get(...ids, today) as any;
+      page.rounds_in_window = intOr((db.prepare(
+        `SELECT COUNT(*) AS n FROM fssai_runs r
+          WHERE r.template_id IN (${marks}) AND r.status IN ('submitted','verified') AND r.voided_at = ''
+            AND r.business_date >= ? AND r.business_date <= ?`,
+      ).get(...ids, since, today) as any)?.n);
+      if (!run) {
+        page.problem = tpls.every((t) => s(t.status) !== 'published')
+          ? `${sheet.name} (${page.template_name}) is not published yet, so nobody can run it. An administrator publishes it under FSSAI Settings → Ready-made checklists.`
+          : `No round of ${sheet.name} (${page.template_name}) has been submitted yet. Run it on FSSAI Checklists.`;
+        continue;
+      }
+      page.run = {
+        id: s(run.id), business_date: s(run.business_date), status: s(run.status), outcome: s(run.outcome),
+        recorded_by: s(run.recorded_name || run.recorded_by), signed_by: s(run.signed_by),
+        href: `/fssai/checklists/run/${encodeURIComponent(s(run.id))}`,
+      };
+      const answers = db.prepare(
+        `SELECT q.code AS question_code, COALESCE(NULLIF(r.prompt_snapshot, ''), q.prompt) AS prompt,
+                r.value_bool, r.is_na, r.note
+           FROM fssai_responses r JOIN fssai_questions q ON q.id = r.question_id
+          WHERE r.run_id = ?`,
+      ).all(s(run.id)) as any[];
+      const map = new Map<string, HydAnswer>();
+      const promptOf = new Map<string, string>();
+      for (const a of answers) {
+        const qc = s(a.question_code);
+        if (!qc) continue;
+        map.set(qc, {
+          value_bool: a.value_bool === null || a.value_bool === undefined ? null : Number(a.value_bool),
+          is_na: intOr(a.is_na), note: s(a.note),
+        });
+        promptOf.set(qc, s(a.prompt));
+      }
+      const sheetAns = fssaiHydAnswerSheet(code, map);
+      if (!sheetAns) { page.problem = `${code} is not one of the authority's pages.`; continue; }
+      page.rows = sheetAns.rows.filter((r) => r.kind !== 'title').map((r: HydAnswerSheetRow) => ({
+        kind: r.kind, text: r.text, mark: String(r.mark || ''), remark: String(r.remark || ''), question_code: String(r.question_code || ''),
+      }));
+      page.counts = { ...sheetAns.counts };
+      page.extra = sheetAns.extra.map((x) => ({ ...x, prompt: promptOf.get(x.question_code) || '' }));
+    } catch (e: any) {
+      page.problem = `This page could not be read (${String(e?.message || e)}).`;
+    }
+  }
+  return out;
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -1624,17 +2214,16 @@ const BUILDERS: Record<AuditFileKey, (ctx: Ctx) => Part> = {
   ghmc_licence: ghmcLicence,
   water,
   pest_control: pestControl,
-  medical: (ctx) => perPerson(ctx, 'medical_fitness', 'medical fitness certificate',
-    'File a medical fitness certificate for every food handler under Documents & Certificates as "Medical fitness certificate", against the person, with a scan.'),
-  training: (ctx) => perPerson(ctx, 'food_handler_training', 'food-safety training certificate',
-    'File each food handler\'s food-safety training (FoSTaC or in-house) under Documents & Certificates as "Food handler training", against the person, with a scan.'),
+  medical: (ctx) => handlerRecord(ctx, 'medical'),
+  training: (ctx) => handlerRecord(ctx, 'training'),
   vendors,
   receiving,
-  cold_temps: (ctx) => tempLog(ctx, 'cold_temps', ['equipment'], 'refrigerator or freezer reading',
+  cold_temps: (ctx) => tempLog(ctx, 'cold_temps', ['equipment'], ['equipment'], 'refrigerator or freezer reading',
     'Read every refrigerator, freezer and cold room on its round and record it under Temperature Logs (or on the cold-store checklist).',
     [{ href: '/fssai/temperature', label: 'Temperature Logs' }, { href: '/fssai/cold-rooms', label: 'Cold Room Climate Control' }]),
-  cooking_temps: (ctx) => tempLog(ctx, 'cooking_temps', ['cooking', 'reheating', 'cooling', 'hot_holding'], 'cooking or reheating temperature',
-    'Probe cooked, reheated, hot-held and cooling food and record each reading under Temperature Logs.',
+  cooking_temps: (ctx) => tempLog(ctx, 'cooking_temps', ['cooking', 'reheating', 'cooling', 'hot_holding'], ['cooking', 'reheating'],
+    'cooking or reheating temperature',
+    'Probe the core of cooked and reheated food and record each reading under Temperature Logs (kind "Cooking" or "Reheating") — cooling and hot-holding readings are kept too, but they are not this log.',
     [{ href: '/fssai/temperature', label: 'Temperature Logs' }]),
   cleaning,
   pest_monitoring: pestMonitoring,
@@ -1653,13 +2242,21 @@ const BUILDERS: Record<AuditFileKey, (ctx: Ctx) => Part> = {
  */
 export function buildAuditFile(db: Database.Database, today: string, opts: AuditFileOptions = {}): AuditFile {
   const days = AUDIT_FILE_DAY_CHOICES.includes(Number(opts.days) as any) ? Number(opts.days) : AUDIT_FILE_DEFAULT_DAYS;
+  const present = fssaiTablesPresent(db);
+  const since = addDaysISO(today, -(days - 1));
   const ctx: Ctx = {
     db,
     today,
     days,
-    since: addDaysISO(today, -(days - 1)),
+    since,
     limit: Math.max(1, Math.min(Number(opts.rowLimit) || 8, 2000)),
-    present: fssaiTablesPresent(db),
+    present,
+    // The pack's own test (code, category, or "the pack created it under that
+    // code" from the seed log) when the seed log is here; the code and the
+    // category alone when it is not — never a SQL error on an older database.
+    notHydAudit: present.has('fssai_seed_log')
+      ? `NOT ${fssaiHydAuditTemplateSql('t')}`
+      : `NOT (t.code IN (${FSSAI_HYD_AUDIT_CODES.map((c) => `'${c.replace(/'/g, "''")}'`).join(', ')}))`,
   };
 
   const items: AuditFileItem[] = AUDIT_FILE_RECORDS.map((rec) => {
@@ -1674,15 +2271,51 @@ export function buildAuditFile(db: Database.Database, today: string, opts: Audit
         todo: 'Open the record\'s own screen to check it, and report the error.',
       };
     }
+    // VOID, NEVER A COPY — one partition for all 20, so no record can forget
+    // it: a voided file leaves `scans` (what counts, what the PDF draws) for
+    // `voided_scans` (kept, shown with its reason on the page and the
+    // management copy, never in the handover).
+    const seen = new Set<string>();
+    const voided: AuditFileScan[] = [];
+    for (const sc of [...part.voided_scans, ...part.scans.filter((x) => x.status === 'void')]) {
+      if (seen.has(sc.attachment_id)) continue;
+      seen.add(sc.attachment_id);
+      voided.push(sc);
+    }
+    part.voided_scans = voided;
+    part.scans = part.scans.filter((x) => x.status !== 'void');
     // HELD — one rule for all 20, from what the record will actually print:
-    // a line the handover may carry, or a copy still stored.
-    part.held = part.tables.some((t) => t.handover_rows > 0) || part.scans.some((sc) => sc.has_image);
+    // a line the handover may carry, or a LIVE copy still stored.
+    part.held = part.tables.some((t) => t.handover_rows > 0) || part.scans.some(isLiveCopy);
     return { n: rec.n, key: rec.key, title: rec.title, ...part };
   });
 
   const counts = { present: 0, expiring: 0, missing: 0, total: items.length };
   for (const it of items) counts[it.status]++;
-  return { section: AUDIT_FILE_SECTION, today, days, since: ctx.since, counts, items };
+  const held = items.filter((i) => i.held).map((i) => i.n);
+  let selfAudit: AuditFileSelfAudit[] = [];
+  try {
+    selfAudit = readHydSelfAudit(db, today, since);
+  } catch (e: any) {
+    console.error('[fssai/audit-file] self-audit pages failed:', e?.message || e);
+  }
+  return {
+    section: AUDIT_FILE_SECTION, today, days, since, counts, items,
+    handover: { held, left_out: items.filter((i) => !i.held).map((i) => i.n), count: held.length, total: items.length },
+    self_audit: selfAudit,
+  };
+}
+
+/**
+ * The one sentence every copy handed over carries about itself — how many of
+ * the authority's 20 it holds. Never implies a complete file: a copy holding
+ * 14 says 14 (owner, 2026-10-14). Facts about the DOCUMENT, not the premises.
+ */
+export function auditFileHoldsWords(f: Pick<AuditFile, 'handover'>): string {
+  const { count, total, held } = f.handover;
+  if (count === total) return `This copy contains all ${total} records on the authority's list.`;
+  if (!count) return `This copy contains none of the ${total} records on the authority's list.`;
+  return `This copy contains ${count} of the ${total} records on the authority's list — numbers ${held.join(', ')}.`;
 }
 
 export const AUDIT_FILE_STATUS_WORDS: Record<AuditFileStatus, string> = {

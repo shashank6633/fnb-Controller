@@ -26,6 +26,7 @@
   "authority_pages: CHECKLIST 3 is headed \"FOH\" (4 lines) and \"Washrooms\" (5 lines), not \"Cleaning & Sanitation\" (9).",
   "authority_pages: CHECKLIST 2 has 30 lines, not 31 — \"Kitchen\" is a sub-heading on the sheet, not a line."
  ],
+ "sections_note": "sections[] is the 11 groups of the original summary, kept for its #1-#120 numbering. The workbook itself has 13 headings on the master sheet: \"FOH\" and \"Washrooms\" are headings of their own, not part of \"Cleaning & Sanitation\" — see each item's \"heading\" and workbook[] for the sheet exactly as it is.",
  "sections": [
   {
    "section": "Licences & Display",
@@ -33,6 +34,7 @@
     {
      "n": 1,
      "item": "FSSAI licence displayed prominently",
+     "heading": "Licences & Display",
      "kind": "line",
      "master_row": 3,
      "page": "CHECKLIST 1",
@@ -42,6 +44,7 @@
     {
      "n": 2,
      "item": "Food Safety Display Board (FSDB) displayed and readable",
+     "heading": "Licences & Display",
      "kind": "line",
      "master_row": 4,
      "page": "CHECKLIST 1",
@@ -51,6 +54,7 @@
     {
      "n": 3,
      "item": "GHMC trade/municipal licence available",
+     "heading": "Licences & Display",
      "kind": "line",
      "master_row": 5,
      "page": "CHECKLIST 1",
@@ -60,6 +64,7 @@
     {
      "n": 4,
      "item": "Fire/safety documents as applicable",
+     "heading": "Licences & Display",
      "kind": "line",
      "master_row": 6,
      "page": "CHECKLIST 1",
@@ -69,6 +74,7 @@
     {
      "n": 5,
      "item": "Pest-control agency agreement and latest service report",
+     "heading": "Licences & Display",
      "kind": "line",
      "master_row": 7,
      "page": "CHECKLIST 1",
@@ -78,6 +84,7 @@
     {
      "n": 6,
      "item": "Food-handler medical examination records",
+     "heading": "Licences & Display",
      "kind": "line",
      "master_row": 8,
      "page": "CHECKLIST 1",
@@ -87,6 +94,7 @@
     {
      "n": 7,
      "item": "Water testing report / municipal water bill records",
+     "heading": "Licences & Display",
      "kind": "line",
      "master_row": 9,
      "page": "CHECKLIST 1",
@@ -96,6 +104,7 @@
     {
      "n": 8,
      "item": "Approved vendor list maintained",
+     "heading": "Licences & Display",
      "kind": "line",
      "master_row": 10,
      "page": "CHECKLIST 1",
@@ -110,6 +119,7 @@
     {
      "n": 9,
      "item": "Kitchen floors clean, dry and non-slippery",
+     "heading": "Kitchen & Premises Hygiene",
      "kind": "line",
      "master_row": 12,
      "page": "CHECKLIST 1",
@@ -119,6 +129,7 @@
     {
      "n": 10,
      "item": "Walls and ceiling clean; no peeling paint/plaster",
+     "heading": "Kitchen & Premises Hygiene",
      "kind": "line",
      "master_row": 13,
      "page": "CHECKLIST 1",
@@ -128,6 +139,7 @@
     {
      "n": 11,
      "item": "No water stagnation",
+     "heading": "Kitchen & Premises Hygiene",
      "kind": "line",
      "master_row": 14,
      "page": "CHECKLIST 1",
@@ -137,6 +149,7 @@
     {
      "n": 12,
      "item": "Proper drainage",
+     "heading": "Kitchen & Premises Hygiene",
      "kind": "line",
      "master_row": 15,
      "page": "CHECKLIST 1",
@@ -146,6 +159,7 @@
     {
      "n": 13,
      "item": "Exhaust/hood clean",
+     "heading": "Kitchen & Premises Hygiene",
      "kind": "line",
      "master_row": 16,
      "page": "CHECKLIST 1",
@@ -155,6 +169,7 @@
     {
      "n": 14,
      "item": "Adequate lighting",
+     "heading": "Kitchen & Premises Hygiene",
      "kind": "line",
      "master_row": 17,
      "page": "CHECKLIST 1",
@@ -164,6 +179,7 @@
     {
      "n": 15,
      "item": "Light fittings protected against breakage",
+     "heading": "Kitchen & Premises Hygiene",
      "kind": "line",
      "master_row": 18,
      "page": "CHECKLIST 1",
@@ -173,6 +189,7 @@
     {
      "n": 16,
      "item": "Doors/windows clean and pest-proof",
+     "heading": "Kitchen & Premises Hygiene",
      "kind": "line",
      "master_row": 19,
      "page": "CHECKLIST 1",
@@ -182,6 +199,7 @@
     {
      "n": 17,
      "item": "No unnecessary items stored in food areas",
+     "heading": "Kitchen & Premises Hygiene",
      "kind": "line",
      "master_row": 20,
      "page": "CHECKLIST 1",
@@ -196,6 +214,7 @@
     {
      "n": 18,
      "item": "FIFO followed",
+     "heading": "Storage – Very Important",
      "kind": "line",
      "master_row": 22,
      "page": "CHECKLIST 1",
@@ -205,6 +224,7 @@
     {
      "n": 19,
      "item": "FEFO followed",
+     "heading": "Storage – Very Important",
      "kind": "line",
      "master_row": 23,
      "page": "CHECKLIST 1",
@@ -214,6 +234,7 @@
     {
      "n": 20,
      "item": "All containers properly covered",
+     "heading": "Storage – Very Important",
      "kind": "line",
      "master_row": 24,
      "page": "CHECKLIST 1",
@@ -223,6 +244,7 @@
     {
      "n": 21,
      "item": "Food-grade containers used",
+     "heading": "Storage – Very Important",
      "kind": "line",
      "master_row": 25,
      "page": "CHECKLIST 1",
@@ -232,6 +254,7 @@
     {
      "n": 22,
      "item": "No food stored directly on floor",
+     "heading": "Storage – Very Important",
      "kind": "line",
      "master_row": 26,
      "page": "CHECKLIST 1",
@@ -241,6 +264,7 @@
     {
      "n": 23,
      "item": "Raw and cooked food separated",
+     "heading": "Storage – Very Important",
      "kind": "line",
      "master_row": 27,
      "page": "CHECKLIST 1",
@@ -250,6 +274,7 @@
     {
      "n": 24,
      "item": "Veg and non-veg properly segregated",
+     "heading": "Storage – Very Important",
      "kind": "line",
      "master_row": 28,
      "page": "CHECKLIST 1",
@@ -259,6 +284,7 @@
     {
      "n": 25,
      "item": "Chemicals stored separately from food",
+     "heading": "Storage – Very Important",
      "kind": "line",
      "master_row": 29,
      "page": "CHECKLIST 1",
@@ -268,6 +294,7 @@
     {
      "n": 26,
      "item": "Personal items kept outside food-storage areas",
+     "heading": "Storage – Very Important",
      "kind": "line",
      "master_row": 30,
      "page": "CHECKLIST 1",
@@ -277,6 +304,7 @@
     {
      "n": 27,
      "item": "Dry store clean and pest-free",
+     "heading": "Storage – Very Important",
      "kind": "line",
      "master_row": 31,
      "page": "CHECKLIST 1",
@@ -286,6 +314,7 @@
     {
      "n": 28,
      "item": "Refrigerator/freezer temperature recorded daily",
+     "heading": "Storage – Very Important",
      "kind": "line",
      "master_row": 32,
      "page": "CHECKLIST 1",
@@ -295,6 +324,7 @@
     {
      "n": 29,
      "item": "Expired/damaged products immediately removed",
+     "heading": "Storage – Very Important",
      "kind": "line",
      "master_row": 33,
      "page": "CHECKLIST 1",
@@ -309,6 +339,7 @@
     {
      "n": 30,
      "item": "Receiving",
+     "heading": "Food Temperature Control",
      "group": "Maintain a temperature monitoring sheet for",
      "kind": "line",
      "master_row": 36,
@@ -319,6 +350,7 @@
     {
      "n": 31,
      "item": "Refrigerators",
+     "heading": "Food Temperature Control",
      "group": "Maintain a temperature monitoring sheet for",
      "kind": "line",
      "master_row": 37,
@@ -329,6 +361,7 @@
     {
      "n": 32,
      "item": "Freezers",
+     "heading": "Food Temperature Control",
      "group": "Maintain a temperature monitoring sheet for",
      "kind": "line",
      "master_row": 38,
@@ -339,6 +372,7 @@
     {
      "n": 33,
      "item": "Hot holding",
+     "heading": "Food Temperature Control",
      "group": "Maintain a temperature monitoring sheet for",
      "kind": "line",
      "master_row": 39,
@@ -349,6 +383,7 @@
     {
      "n": 34,
      "item": "Cooking",
+     "heading": "Food Temperature Control",
      "group": "Maintain a temperature monitoring sheet for",
      "kind": "line",
      "master_row": 40,
@@ -359,6 +394,7 @@
     {
      "n": 35,
      "item": "Reheating",
+     "heading": "Food Temperature Control",
      "group": "Maintain a temperature monitoring sheet for",
      "kind": "line",
      "master_row": 41,
@@ -369,6 +405,7 @@
     {
      "n": 36,
      "item": "Cooling",
+     "heading": "Food Temperature Control",
      "group": "Maintain a temperature monitoring sheet for",
      "kind": "line",
      "master_row": 42,
@@ -384,6 +421,7 @@
     {
      "n": 37,
      "item": "Raw materials washed/cleaned properly",
+     "heading": "Food Preparation",
      "kind": "line",
      "master_row": 44,
      "page": "CHECKLIST 2",
@@ -393,6 +431,7 @@
     {
      "n": 38,
      "item": "Separate cutting boards/knives where required",
+     "heading": "Food Preparation",
      "kind": "line",
      "master_row": 45,
      "page": "CHECKLIST 2",
@@ -402,6 +441,7 @@
     {
      "n": 39,
      "item": "Raw and cooked food not cross-contaminated",
+     "heading": "Food Preparation",
      "kind": "line",
      "master_row": 46,
      "page": "CHECKLIST 2",
@@ -411,6 +451,7 @@
     {
      "n": 40,
      "item": "Food handlers wash hands before food preparation",
+     "heading": "Food Preparation",
      "kind": "line",
      "master_row": 47,
      "page": "CHECKLIST 2",
@@ -420,6 +461,7 @@
     {
      "n": 41,
      "item": "Food covered during preparation/storage",
+     "heading": "Food Preparation",
      "kind": "line",
      "master_row": 48,
      "page": "CHECKLIST 2",
@@ -429,6 +471,7 @@
     {
      "n": 42,
      "item": "No direct hand contact with ready-to-eat food where avoidable",
+     "heading": "Food Preparation",
      "kind": "line",
      "master_row": 49,
      "page": "CHECKLIST 2",
@@ -438,6 +481,7 @@
     {
      "n": 43,
      "item": "Cooking temperature/process monitored",
+     "heading": "Food Preparation",
      "kind": "line",
      "master_row": 50,
      "page": "CHECKLIST 2",
@@ -447,6 +491,7 @@
     {
      "n": 44,
      "item": "Reheating controlled and recorded",
+     "heading": "Food Preparation",
      "kind": "line",
      "master_row": 51,
      "page": "CHECKLIST 2",
@@ -456,6 +501,7 @@
     {
      "n": 45,
      "item": "No expired ingredients used",
+     "heading": "Food Preparation",
      "kind": "line",
      "master_row": 52,
      "page": "CHECKLIST 2",
@@ -470,6 +516,7 @@
     {
      "n": 46,
      "item": "Clean uniform",
+     "heading": "Personal Hygiene – Critical",
      "group": "Every food handler should have",
      "kind": "line",
      "master_row": 55,
@@ -480,6 +527,7 @@
     {
      "n": 47,
      "item": "Hairnet/cap",
+     "heading": "Personal Hygiene – Critical",
      "group": "Every food handler should have",
      "kind": "line",
      "master_row": 56,
@@ -490,6 +538,7 @@
     {
      "n": 48,
      "item": "Appropriate apron",
+     "heading": "Personal Hygiene – Critical",
      "group": "Every food handler should have",
      "kind": "line",
      "master_row": 57,
@@ -500,6 +549,7 @@
     {
      "n": 49,
      "item": "Clean, trimmed nails",
+     "heading": "Personal Hygiene – Critical",
      "group": "Every food handler should have",
      "kind": "line",
      "master_row": 58,
@@ -510,6 +560,7 @@
     {
      "n": 50,
      "item": "No loose jewellery",
+     "heading": "Personal Hygiene – Critical",
      "group": "Every food handler should have",
      "kind": "line",
      "master_row": 59,
@@ -520,6 +571,7 @@
     {
      "n": 51,
      "item": "Proper handwashing practice",
+     "heading": "Personal Hygiene – Critical",
      "group": "Every food handler should have",
      "kind": "line",
      "master_row": 60,
@@ -530,6 +582,7 @@
     {
      "n": 52,
      "item": "Waterproof dressing for minor wounds",
+     "heading": "Personal Hygiene – Critical",
      "group": "Every food handler should have",
      "kind": "line",
      "master_row": 61,
@@ -540,6 +593,7 @@
     {
      "n": 53,
      "item": "No smoking/spitting in food areas",
+     "heading": "Personal Hygiene – Critical",
      "group": "Every food handler should have",
      "kind": "line",
      "master_row": 62,
@@ -550,6 +604,7 @@
     {
      "n": 54,
      "item": "No handling food while suffering from an illness/open wound",
+     "heading": "Personal Hygiene – Critical",
      "group": "Every food handler should have",
      "kind": "line",
      "master_row": 63,
@@ -560,6 +615,7 @@
     {
      "n": 55,
      "item": "Medical examination records available",
+     "heading": "Personal Hygiene – Critical",
      "group": "Every food handler should have",
      "kind": "line",
      "master_row": 64,
@@ -570,6 +626,7 @@
     {
      "n": 56,
      "item": "Food-safety training records available",
+     "heading": "Personal Hygiene – Critical",
      "group": "Every food handler should have",
      "kind": "line",
      "master_row": 65,
@@ -581,10 +638,17 @@
   },
   {
    "section": "Cleaning & Sanitation",
+   "master_sheet_headings": [
+    "Cleaning & Sanitation",
+    "FOH",
+    "Washrooms"
+   ],
+   "note": "On the master sheet this block is 3 headings, each bold and shaded: \"Cleaning & Sanitation\", \"FOH\", \"Washrooms\". They are kept together here, under \"Cleaning & Sanitation\", only so the #1-#120 numbering every earlier coverage report uses does not shift. Each item's \"heading\" is the heading it sits under on the sheet; CHECKLIST 2 asks the Kitchen lines and CHECKLIST 3 opens with FOH and Washrooms as its own first two headings.",
    "items": [
     {
      "n": 57,
      "item": "Kitchen",
+     "heading": "Cleaning & Sanitation",
      "group": "Maintain daily cleaning checklists for",
      "kind": "subheading",
      "master_row": 68,
@@ -593,6 +657,7 @@
     {
      "n": 58,
      "item": "Floors",
+     "heading": "Cleaning & Sanitation",
      "group": "Maintain daily cleaning checklists for",
      "kind": "line",
      "master_row": 69,
@@ -604,6 +669,7 @@
     {
      "n": 59,
      "item": "Walls",
+     "heading": "Cleaning & Sanitation",
      "group": "Maintain daily cleaning checklists for",
      "kind": "line",
      "master_row": 70,
@@ -615,6 +681,7 @@
     {
      "n": 60,
      "item": "Work tables",
+     "heading": "Cleaning & Sanitation",
      "group": "Maintain daily cleaning checklists for",
      "kind": "line",
      "master_row": 71,
@@ -626,6 +693,7 @@
     {
      "n": 61,
      "item": "Cutting boards",
+     "heading": "Cleaning & Sanitation",
      "group": "Maintain daily cleaning checklists for",
      "kind": "line",
      "master_row": 72,
@@ -637,6 +705,7 @@
     {
      "n": 62,
      "item": "Cooking equipment",
+     "heading": "Cleaning & Sanitation",
      "group": "Maintain daily cleaning checklists for",
      "kind": "line",
      "master_row": 73,
@@ -648,6 +717,7 @@
     {
      "n": 63,
      "item": "Refrigerators",
+     "heading": "Cleaning & Sanitation",
      "group": "Maintain daily cleaning checklists for",
      "kind": "line",
      "master_row": 74,
@@ -659,6 +729,7 @@
     {
      "n": 64,
      "item": "Freezers",
+     "heading": "Cleaning & Sanitation",
      "group": "Maintain daily cleaning checklists for",
      "kind": "line",
      "master_row": 75,
@@ -670,6 +741,7 @@
     {
      "n": 65,
      "item": "Exhaust/hood",
+     "heading": "Cleaning & Sanitation",
      "group": "Maintain daily cleaning checklists for",
      "kind": "line",
      "master_row": 76,
@@ -681,6 +753,7 @@
     {
      "n": 66,
      "item": "Sinks",
+     "heading": "Cleaning & Sanitation",
      "group": "Maintain daily cleaning checklists for",
      "kind": "line",
      "master_row": 77,
@@ -692,6 +765,7 @@
     {
      "n": 67,
      "item": "Racks",
+     "heading": "Cleaning & Sanitation",
      "group": "Maintain daily cleaning checklists for",
      "kind": "line",
      "master_row": 78,
@@ -703,6 +777,7 @@
     {
      "n": 68,
      "item": "Tables/chairs",
+     "heading": "FOH",
      "group": "FOH",
      "kind": "line",
      "master_row": 80,
@@ -713,6 +788,7 @@
     {
      "n": 69,
      "item": "Service stations",
+     "heading": "FOH",
      "group": "FOH",
      "kind": "line",
      "master_row": 81,
@@ -723,6 +799,7 @@
     {
      "n": 70,
      "item": "Crockery/cutlery",
+     "heading": "FOH",
      "group": "FOH",
      "kind": "line",
      "master_row": 82,
@@ -733,6 +810,7 @@
     {
      "n": 71,
      "item": "Water station",
+     "heading": "FOH",
      "group": "FOH",
      "kind": "line",
      "master_row": 83,
@@ -743,6 +821,7 @@
     {
      "n": 72,
      "item": "Toilet",
+     "heading": "Washrooms",
      "group": "Washrooms",
      "kind": "line",
      "master_row": 85,
@@ -753,6 +832,7 @@
     {
      "n": 73,
      "item": "Wash basin",
+     "heading": "Washrooms",
      "group": "Washrooms",
      "kind": "line",
      "master_row": 86,
@@ -763,6 +843,7 @@
     {
      "n": 74,
      "item": "Soap",
+     "heading": "Washrooms",
      "group": "Washrooms",
      "kind": "line",
      "master_row": 87,
@@ -773,6 +854,7 @@
     {
      "n": 75,
      "item": "Hand-drying facility",
+     "heading": "Washrooms",
      "group": "Washrooms",
      "kind": "line",
      "master_row": 88,
@@ -783,6 +865,7 @@
     {
      "n": 76,
      "item": "Cleaning record",
+     "heading": "Washrooms",
      "group": "Washrooms",
      "kind": "line",
      "master_row": 89,
@@ -798,6 +881,7 @@
     {
      "n": 77,
      "item": "Monthly pest-control report",
+     "heading": "Pest Control",
      "kind": "line",
      "master_row": 91,
      "page": "CHECKLIST 3",
@@ -807,6 +891,7 @@
     {
      "n": 78,
      "item": "Pest-control chemicals/records maintained",
+     "heading": "Pest Control",
      "kind": "line",
      "master_row": 92,
      "page": "CHECKLIST 3",
@@ -816,6 +901,7 @@
     {
      "n": 79,
      "item": "No cockroaches",
+     "heading": "Pest Control",
      "kind": "line",
      "master_row": 93,
      "page": "CHECKLIST 3",
@@ -825,6 +911,7 @@
     {
      "n": 80,
      "item": "No flies",
+     "heading": "Pest Control",
      "kind": "line",
      "master_row": 94,
      "page": "CHECKLIST 3",
@@ -834,6 +921,7 @@
     {
      "n": 81,
      "item": "No rodents",
+     "heading": "Pest Control",
      "kind": "line",
      "master_row": 95,
      "page": "CHECKLIST 3",
@@ -843,6 +931,7 @@
     {
      "n": 82,
      "item": "No pest droppings/eggs/larvae",
+     "heading": "Pest Control",
      "kind": "line",
      "master_row": 96,
      "page": "CHECKLIST 3",
@@ -852,6 +941,7 @@
     {
      "n": 83,
      "item": "Insect-proof screens where required",
+     "heading": "Pest Control",
      "kind": "line",
      "master_row": 97,
      "page": "CHECKLIST 3",
@@ -861,6 +951,7 @@
     {
      "n": 84,
      "item": "Door gaps sealed",
+     "heading": "Pest Control",
      "kind": "line",
      "master_row": 98,
      "page": "CHECKLIST 3",
@@ -870,6 +961,7 @@
     {
      "n": 85,
      "item": "Drain/grease traps maintained",
+     "heading": "Pest Control",
      "kind": "line",
      "master_row": 99,
      "page": "CHECKLIST 3",
@@ -884,6 +976,7 @@
     {
      "n": 86,
      "item": "Separate wet/dry waste as applicable",
+     "heading": "Waste Management",
      "kind": "line",
      "master_row": 101,
      "page": "CHECKLIST 3",
@@ -893,6 +986,7 @@
     {
      "n": 87,
      "item": "Bins have lids",
+     "heading": "Waste Management",
      "kind": "line",
      "master_row": 102,
      "page": "CHECKLIST 3",
@@ -902,6 +996,7 @@
     {
      "n": 88,
      "item": "Bins are cleaned regularly",
+     "heading": "Waste Management",
      "kind": "line",
      "master_row": 103,
      "page": "CHECKLIST 3",
@@ -911,6 +1006,7 @@
     {
      "n": 89,
      "item": "Waste removed from kitchen periodically",
+     "heading": "Waste Management",
      "kind": "line",
      "master_row": 104,
      "page": "CHECKLIST 3",
@@ -920,6 +1016,7 @@
     {
      "n": 90,
      "item": "No overflowing bins",
+     "heading": "Waste Management",
      "kind": "line",
      "master_row": 105,
      "page": "CHECKLIST 3",
@@ -929,6 +1026,7 @@
     {
      "n": 91,
      "item": "Waste area kept clean",
+     "heading": "Waste Management",
      "kind": "line",
      "master_row": 106,
      "page": "CHECKLIST 3",
@@ -938,6 +1036,7 @@
     {
      "n": 92,
      "item": "Used oil disposal records maintained",
+     "heading": "Waste Management",
      "kind": "line",
      "master_row": 107,
      "page": "CHECKLIST 3",
@@ -947,6 +1046,7 @@
     {
      "n": 93,
      "item": "No food waste accumulated near preparation areas",
+     "heading": "Waste Management",
      "kind": "line",
      "master_row": 108,
      "page": "CHECKLIST 3",
@@ -961,6 +1061,7 @@
     {
      "n": 94,
      "item": "Food-contact equipment is food-safe",
+     "heading": "Food-Grade Equipment & Packaging",
      "kind": "line",
      "master_row": 110,
      "page": "CHECKLIST 3",
@@ -970,6 +1071,7 @@
     {
      "n": 95,
      "item": "Containers are non-toxic and easy to clean",
+     "heading": "Food-Grade Equipment & Packaging",
      "kind": "line",
      "master_row": 111,
      "page": "CHECKLIST 3",
@@ -979,6 +1081,7 @@
     {
      "n": 96,
      "item": "No rusted/damaged food-contact equipment",
+     "heading": "Food-Grade Equipment & Packaging",
      "kind": "line",
      "master_row": 112,
      "page": "CHECKLIST 3",
@@ -988,6 +1091,7 @@
     {
      "n": 97,
      "item": "Food-grade storage containers",
+     "heading": "Food-Grade Equipment & Packaging",
      "kind": "line",
      "master_row": 113,
      "page": "CHECKLIST 3",
@@ -997,6 +1101,7 @@
     {
      "n": 98,
      "item": "Food-grade packaging for delivery",
+     "heading": "Food-Grade Equipment & Packaging",
      "kind": "line",
      "master_row": 114,
      "page": "CHECKLIST 3",
@@ -1006,6 +1111,7 @@
     {
      "n": 99,
      "item": "No newspaper used for food wrapping",
+     "heading": "Food-Grade Equipment & Packaging",
      "kind": "line",
      "master_row": 115,
      "page": "CHECKLIST 3",
@@ -1015,6 +1121,7 @@
     {
      "n": 100,
      "item": "Packaging properly stored",
+     "heading": "Food-Grade Equipment & Packaging",
      "kind": "line",
      "master_row": 116,
      "page": "CHECKLIST 3",
@@ -1029,6 +1136,7 @@
     {
      "n": 101,
      "item": "FSSAI licence copy",
+     "heading": "Records You Should Keep Ready in One Audit File",
      "kind": "line",
      "master_row": 118,
      "audit_file_record": 1
@@ -1036,6 +1144,7 @@
     {
      "n": 102,
      "item": "FSDB photograph",
+     "heading": "Records You Should Keep Ready in One Audit File",
      "kind": "line",
      "master_row": 119,
      "audit_file_record": 2
@@ -1043,6 +1152,7 @@
     {
      "n": 103,
      "item": "GHMC licence",
+     "heading": "Records You Should Keep Ready in One Audit File",
      "kind": "line",
      "master_row": 120,
      "audit_file_record": 3
@@ -1050,6 +1160,7 @@
     {
      "n": 104,
      "item": "Water test report / water bill",
+     "heading": "Records You Should Keep Ready in One Audit File",
      "kind": "line",
      "master_row": 121,
      "audit_file_record": 4
@@ -1057,6 +1168,7 @@
     {
      "n": 105,
      "item": "Pest-control agreement + reports",
+     "heading": "Records You Should Keep Ready in One Audit File",
      "kind": "line",
      "master_row": 122,
      "audit_file_record": 5
@@ -1064,6 +1176,7 @@
     {
      "n": 106,
      "item": "Food-handler medical certificates",
+     "heading": "Records You Should Keep Ready in One Audit File",
      "kind": "line",
      "master_row": 123,
      "audit_file_record": 6
@@ -1071,6 +1184,7 @@
     {
      "n": 107,
      "item": "Food-safety training records",
+     "heading": "Records You Should Keep Ready in One Audit File",
      "kind": "line",
      "master_row": 124,
      "audit_file_record": 7
@@ -1078,6 +1192,7 @@
     {
      "n": 108,
      "item": "Approved vendor list",
+     "heading": "Records You Should Keep Ready in One Audit File",
      "kind": "line",
      "master_row": 125,
      "audit_file_record": 8
@@ -1085,6 +1200,7 @@
     {
      "n": 109,
      "item": "Receiving checklist",
+     "heading": "Records You Should Keep Ready in One Audit File",
      "kind": "line",
      "master_row": 126,
      "audit_file_record": 9
@@ -1092,6 +1208,7 @@
     {
      "n": 110,
      "item": "Refrigerator/freezer temperature log",
+     "heading": "Records You Should Keep Ready in One Audit File",
      "kind": "line",
      "master_row": 127,
      "audit_file_record": 10
@@ -1099,6 +1216,7 @@
     {
      "n": 111,
      "item": "Cooking/reheating temperature log",
+     "heading": "Records You Should Keep Ready in One Audit File",
      "kind": "line",
      "master_row": 128,
      "audit_file_record": 11
@@ -1106,6 +1224,7 @@
     {
      "n": 112,
      "item": "Cleaning & sanitation checklist",
+     "heading": "Records You Should Keep Ready in One Audit File",
      "kind": "line",
      "master_row": 129,
      "audit_file_record": 12
@@ -1113,6 +1232,7 @@
     {
      "n": 113,
      "item": "Pest-control monitoring sheet",
+     "heading": "Records You Should Keep Ready in One Audit File",
      "kind": "line",
      "master_row": 130,
      "audit_file_record": 13
@@ -1120,6 +1240,7 @@
     {
      "n": 114,
      "item": "Waste disposal record",
+     "heading": "Records You Should Keep Ready in One Audit File",
      "kind": "line",
      "master_row": 131,
      "audit_file_record": 14
@@ -1127,6 +1248,7 @@
     {
      "n": 115,
      "item": "Used cooking-oil/TPC records",
+     "heading": "Records You Should Keep Ready in One Audit File",
      "kind": "line",
      "master_row": 132,
      "audit_file_record": 15
@@ -1134,6 +1256,7 @@
     {
      "n": 116,
      "item": "Equipment maintenance records",
+     "heading": "Records You Should Keep Ready in One Audit File",
      "kind": "line",
      "master_row": 133,
      "audit_file_record": 16
@@ -1141,6 +1264,7 @@
     {
      "n": 117,
      "item": "Calibration certificates",
+     "heading": "Records You Should Keep Ready in One Audit File",
      "kind": "line",
      "master_row": 134,
      "audit_file_record": 17
@@ -1148,6 +1272,7 @@
     {
      "n": 118,
      "item": "FIFO/FEFO checklist",
+     "heading": "Records You Should Keep Ready in One Audit File",
      "kind": "line",
      "master_row": 135,
      "audit_file_record": 18
@@ -1155,6 +1280,7 @@
     {
      "n": 119,
      "item": "Food sampling/lab reports, where applicable",
+     "heading": "Records You Should Keep Ready in One Audit File",
      "kind": "line",
      "master_row": 136,
      "audit_file_record": 19
@@ -1162,6 +1288,7 @@
     {
      "n": 120,
      "item": "Previous audit report and closure evidence",
+     "heading": "Records You Should Keep Ready in One Audit File",
      "kind": "line",
      "master_row": 137,
      "audit_file_record": 20

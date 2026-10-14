@@ -25,6 +25,15 @@
  * There is no editable control anywhere in the handover state. The only write on
  * this screen is noting the handover itself (§16: "note who opened it and when"),
  * and it happens in step 1, before the tablet changes hands.
+ *
+ * ── 2026-10-14 ──────────────────────────────────────────────────────────────
+ * The PDF button says how many of the authority's 20 records the audit file
+ * holds ("17 of 20") — never implying a complete file; step 1 names the ones
+ * left out and why. The handover shows the authority's own checklist pages with
+ * every answer (the passing ones too), the food handlers by name, the pest
+ * monitoring sheet station by station, the waste handovers, the chemicals each
+ * pest visit applied, whose each certificate is, and each temperature's verdict
+ * in the words Reports uses ("On schedule" for a pot still cooling).
  */
 
 import { useCallback, useEffect, useState } from 'react';
@@ -51,8 +60,22 @@ interface Pack {
     warnings: Array<{ key: string; title: string; note: string }>;
   };
   recent_handovers: Array<{ id: string; at: string; by: string; note: string; inspector_name: string; authority: string; inspection_id: string }>;
+  /** The audit-file PDF behind the handover button — how many of the 20 it holds. */
+  audit_file: null | {
+    days: number; count: number; total: number; holds_words: string; pdf_href: string;
+    held: Array<{ n: number; title: string }>;
+    left_out: Array<{ n: number; title: string; why: string }>;
+  };
   open_inspections: Array<{ id: string; inspection_no: string; business_date: string; authority: string; inspector_name: string; status: string }>;
 }
+
+/** One product a pest visit applied (the pest lane's PestChemical, as the route sends it). */
+interface PestChemLine {
+  name: string; active_ingredient: string; licence_no: string; batch: string; expiry: string;
+  dilution: string; qty: string; uom: string; method: string; target_pest: string; area: string;
+}
+/** One row of the authority's checklist page, answered (AuditFileSelfAuditRow). */
+interface SheetLine { kind: string; text: string; mark: string; remark: string; question_code: string }
 
 const FIELD = 'mt-1 w-full bg-white border border-[#D4B896] rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-[#af4408]';
 
@@ -112,11 +135,13 @@ export default function FssaiInspectionModePage() {
             {/* Straight to the file: the audit-file PDF states what is on file
                 and nothing about gaps, so it is safe on this screen (§7 Q11). */}
             <a
-              href={`/api/fssai/audit-file/pdf?days=${days <= 7 ? 7 : days <= 30 ? 30 : 90}`}
+              href={pack.audit_file?.pdf_href || `/api/fssai/audit-file/pdf?days=${days <= 7 ? 7 : days <= 30 ? 30 : 90}`}
               target="_blank" rel="noopener noreferrer"
               className="inline-flex items-center gap-1.5 text-sm font-semibold bg-[#af4408] hover:bg-[#8a3606] text-white rounded-lg px-4 py-2 min-h-[44px]"
             >
-              <Download size={16} /> The audit file (PDF)
+              {/* The count is a fact about the document, never about the
+                  premises — and it stops the PDF passing for the whole file. */}
+              <Download size={16} /> The audit file (PDF){pack.audit_file ? ` — ${pack.audit_file.count} of ${pack.audit_file.total} records` : ''}
             </a>
             <button
               onClick={() => setHandover(false)}
@@ -218,6 +243,21 @@ export default function FssaiInspectionModePage() {
               <p className="text-sm text-[#3D2614] mt-0.5">
                 Each one marked present, expiring or missing, with one PDF of the whole file to print or hand over.
               </p>
+              {pack.audit_file && (
+                <div className="text-sm mt-2">
+                  <p className="font-semibold">
+                    The PDF on the handover view contains {pack.audit_file.count} of the {pack.audit_file.total} records, and says so on
+                    every page.
+                  </p>
+                  {pack.audit_file.left_out.length > 0 && (
+                    <ul className="mt-1 space-y-0.5 text-xs text-red-800">
+                      {pack.audit_file.left_out.map((x) => (
+                        <li key={x.n}><span className="font-semibold">Not in it — {x.n}. {x.title}:</span> {x.why}</li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              )}
             </div>
             <a
               href="/fssai/audit-file"
@@ -376,7 +416,7 @@ function SectionRows({ sectionKey, rows, today }: { sectionKey: string; rows: an
         {rows.map((r) => (
           <li key={r.id} className="py-2.5 flex flex-wrap items-start gap-2">
             <div className="min-w-0 flex-1">
-              <p className="text-sm font-semibold">{r.title}</p>
+              <p className="text-sm font-semibold">{r.holder ? `${r.holder} — ` : ''}{r.title}</p>
               <p className="text-xs text-[#6B5744]">
                 {[r.type_label, r.reference_no, r.issuer].filter(Boolean).join(' · ')}
               </p>
@@ -384,6 +424,7 @@ function SectionRows({ sectionKey, rows, today }: { sectionKey: string; rows: an
             <div className="text-right shrink-0">
               <Badge meta={fssaiDocStateMeta(r.state)} />
               <p className="text-xs text-[#8B7355] mt-0.5">{r.expiry_date || 'does not expire'}</p>
+              {r.copies > 0 && <p className="text-xs text-[#8B7355]">{r.copies} cop{r.copies === 1 ? 'y' : 'ies'} on file</p>}
             </div>
           </li>
         ))}
@@ -428,7 +469,7 @@ function SectionRows({ sectionKey, rows, today }: { sectionKey: string; rows: an
         <table className="w-full text-sm">
           <thead className="text-[#6B5744]">
             <tr>
-              <Th>Date</Th><Th>Time</Th><Th>Where</Th><Th>What</Th><Th right>Reading</Th><Th>Range applied</Th><Th>By</Th>
+              <Th>Date</Th><Th>Time</Th><Th>Where</Th><Th>What</Th><Th>Minutes</Th><Th right>Reading</Th><Th>Range applied</Th><Th>Verdict</Th><Th>By</Th>
             </tr>
           </thead>
           <tbody className="divide-y divide-[#E8D5C4]">
@@ -438,9 +479,15 @@ function SectionRows({ sectionKey, rows, today }: { sectionKey: string; rows: an
                 <Td>{r.reading_at}</Td>
                 <Td>{r.where_label}{r.item_label ? ` · ${r.item_label}` : ''}</Td>
                 <Td>{r.kind}</Td>
+                {/* "0 of 240" at a batch's start — never a blank for minute 0. */}
+                <Td>{r.minutes || ''}</Td>
                 {/* A reading nobody took is blank. It is never a nought. */}
                 <Td right><span className={r.is_fail ? 'font-bold text-red-700' : ''}>{r.reading ? `${r.reading} ${r.uom}` : '—'}</span></Td>
-                <Td>{rangeText(r.min_used, r.max_used) || (r.is_judged ? '—' : 'none set')}</Td>
+                <Td>
+                  {rangeText(r.min_used, r.max_used) || (r.is_judged ? '—' : 'none set')}
+                  {r.needed_by_then ? <span className="text-[#8B7355]"> · by then {r.needed_by_then}</span> : null}
+                </Td>
+                <Td><span className={r.is_fail ? 'font-bold text-red-700' : ''}>{r.verdict || ''}</span></Td>
                 <Td>{r.by}</Td>
               </tr>
             ))}
@@ -501,6 +548,23 @@ function SectionRows({ sectionKey, rows, today }: { sectionKey: string; rows: an
                 {r.areas_covered && <p className="text-xs text-[#8B7355] mt-0.5">Areas: {r.areas_covered}</p>}
                 {r.findings && <p className="text-sm mt-1">{r.findings}</p>}
                 {r.recommendations && <p className="text-xs text-[#3D2614] mt-0.5">Recommended: {r.recommendations}</p>}
+                {r.status === 'completed' && (
+                  <div className="text-xs text-[#3D2614] mt-1">
+                    <span className="font-semibold">Chemicals applied: </span>
+                    {r.chemicals_state === 'listed'
+                      ? (r.chemicals || []).map((c: PestChemLine, i: number) => (
+                          <span key={i} className="block">
+                            {[c.name, c.active_ingredient].filter(Boolean).join(' — ')}
+                            {c.licence_no ? ` · CIB&RC ${c.licence_no}` : ''}{c.batch ? ` · batch ${c.batch}` : ''}{c.expiry ? ` · exp ${c.expiry}` : ''}
+                            {c.dilution ? ` · ${c.dilution}` : ''}{c.qty ? ` · ${[c.qty, c.uom].filter(Boolean).join(' ')}` : ''}
+                            {c.method ? ` · ${c.method}` : ''}{c.area ? ` · ${c.area}` : ''}
+                          </span>
+                        ))
+                      : r.chemicals_state === 'none_applied'
+                        ? `none applied${r.chemicals_none_note ? ` — ${r.chemicals_none_note}` : ''}`
+                        : 'not recorded'}
+                  </div>
+                )}
               </div>
               <div className="text-right shrink-0">
                 {r.next_due_date && <p className="text-xs text-[#8B7355]">next due {r.next_due_date}</p>}
@@ -573,7 +637,7 @@ function SectionRows({ sectionKey, rows, today }: { sectionKey: string; rows: an
       <div className="overflow-x-auto -mx-1">
         <table className="w-full text-sm">
           <thead className="text-[#6B5744]">
-            <tr><Th>Date</Th><Th>Ref</Th><Th>Authority</Th><Th>Inspector</Th><Th right>Score</Th><Th>Grade</Th><Th right>Points open</Th></tr>
+            <tr><Th>Date</Th><Th>Ref</Th><Th>Authority</Th><Th>Inspector</Th><Th right>Score</Th><Th>Grade</Th><Th right>Points open</Th><Th right>Report copies</Th><Th right>Closed with a photo</Th></tr>
           </thead>
           <tbody className="divide-y divide-[#E8D5C4]">
             {rows.map((r) => (
@@ -586,6 +650,124 @@ function SectionRows({ sectionKey, rows, today }: { sectionKey: string; rows: an
                 <Td right>{r.score === null ? '—' : r.score_max === null ? String(r.score) : `${r.score} / ${r.score_max}`}</Td>
                 <Td>{r.grade || '—'}</Td>
                 <Td right><span className={r.open_count > 0 ? 'font-semibold text-red-700' : ''}>{r.open_count}/{r.finding_count}</span></Td>
+                <Td right>{r.report_copies ?? '—'}</Td>
+                <Td right>{r.settled ? `${r.settled_with_photo}/${r.settled}` : '—'}</Td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    );
+  }
+
+  if (sectionKey === 'food_handlers') {
+    return (
+      <div className="overflow-x-auto -mx-1">
+        <table className="w-full text-sm">
+          <thead className="text-[#6B5744]">
+            <tr><Th>Food handler</Th><Th>Role</Th><Th>Medical fitness</Th><Th>Food-safety training</Th><Th>FoSTaC</Th></tr>
+          </thead>
+          <tbody className="divide-y divide-[#E8D5C4]">
+            {rows.map((r) => (
+              <tr key={r.id}>
+                <Td><span className="font-semibold">{r.name}</span>{r.handler_no ? <span className="text-[#8B7355]"> · {r.handler_no}</span> : null}</Td>
+                <Td>{[r.designation, r.department_name].filter(Boolean).join(' · ')}</Td>
+                <Td>{r.medical.verdict}{r.medical.until ? ` · until ${r.medical.until}` : ''}{r.medical.certificate ? <span className="block text-xs text-[#8B7355]">{r.medical.certificate}</span> : null}</Td>
+                <Td>{r.training.verdict}{r.training.until ? ` · until ${r.training.until}` : ''}{r.training.certificate ? <span className="block text-xs text-[#8B7355]">{r.training.certificate}</span> : null}</Td>
+                <Td>{r.fostac ? `${r.fostac.verdict}${r.fostac.until ? ` · until ${r.fostac.until}` : ''}` : '—'}</Td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    );
+  }
+
+  if (sectionKey === 'self_audit') {
+    return (
+      <div className="space-y-3">
+        {rows.map((pg) => (
+          <details key={pg.id} className="rounded-lg border border-[#E8D5C4]" open>
+            <summary className="cursor-pointer select-none px-3 py-2 text-sm">
+              <span className="font-bold">{pg.sheet}</span>
+              {pg.template_name ? <span className="text-[#6B5744]"> — {pg.template_name}</span> : null}
+              <span className="block text-xs text-[#6B5744]">
+                Self-audit of {pg.run?.business_date}{pg.run?.recorded_by ? ` · recorded by ${pg.run.recorded_by}` : ''}
+                {pg.run?.signed_by ? ` · signed by ${pg.run.signed_by}` : ''} · {pg.counts.yes} YES · {pg.counts.no} NO
+                {pg.counts.na ? ` · ${pg.counts.na} N/A` : ''}
+              </span>
+            </summary>
+            <div className="overflow-x-auto border-t border-[#E8D5C4]">
+              <table className="w-full text-sm">
+                <thead className="text-[#6B5744]">
+                  <tr><Th>Line, as the authority words it</Th><Th>YES</Th><Th>NO</Th><Th>REMARK</Th></tr>
+                </thead>
+                <tbody className="divide-y divide-[#E8D5C4]">
+                  {(pg.lines || []).map((l: SheetLine, i: number) => l.kind === 'line' ? (
+                    <tr key={i}>
+                      <Td>{String(l.text || '').trim()}</Td>
+                      <Td><span className="font-bold text-green-800">{l.mark === 'YES' ? 'YES' : ''}</span></Td>
+                      <Td><span className="font-bold text-red-700">{l.mark === 'NO' ? 'NO' : ''}</span></Td>
+                      <Td>{l.mark === 'N/A' ? `Not applicable${l.remark ? ` — ${l.remark}` : ''}` : l.remark}</Td>
+                    </tr>
+                  ) : (
+                    <tr key={i} className={l.kind === 'heading' ? 'bg-[#FFF1E3]' : ''}>
+                      <td colSpan={4} className={`px-2 py-1.5 ${l.kind === 'heading' ? 'font-bold' : 'italic text-[#6B5744]'}`}>{String(l.text || '').trim()}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </details>
+        ))}
+      </div>
+    );
+  }
+
+  if (sectionKey === 'pest_checks') {
+    return (
+      <div className="overflow-x-auto -mx-1">
+        <table className="w-full text-sm">
+          <thead className="text-[#6B5744]">
+            <tr><Th>Date</Th><Th>Time</Th><Th>Station</Th><Th>Where</Th><Th>Activity</Th><Th>Device</Th><Th>Action taken</Th><Th>Initials</Th></tr>
+          </thead>
+          <tbody className="divide-y divide-[#E8D5C4]">
+            {rows.map((r) => (
+              <tr key={r.id} className={r.is_void ? 'text-gray-500' : r.activity === 'yes' ? 'bg-red-50' : ''}>
+                <Td><span className={r.is_void ? 'line-through' : ''}>{r.business_date}</span></Td>
+                <Td><span className={r.is_void ? 'line-through' : ''}>{r.checked_at}</span></Td>
+                <Td><span className={r.is_void ? 'line-through' : ''}>{r.device_code}</span></Td>
+                <Td><span className={r.is_void ? 'line-through' : ''}>{[r.device_kind_label, r.location_label].filter(Boolean).join(' · ')}</span></Td>
+                <Td><span className={r.is_void ? 'line-through' : ''}>{r.activity_label}{r.activity_kind_label ? ` · ${r.activity_kind_label}` : ''}</span></Td>
+                <Td><span className={r.is_void ? 'line-through' : ''}>{r.device_condition_label}</span></Td>
+                <Td>{r.is_void ? <span>VOID — {r.void_reason}</span> : r.action_taken}</Td>
+                <Td><span className={r.is_void ? 'line-through' : ''}>{r.initials}</span></Td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    );
+  }
+
+  if (sectionKey === 'waste') {
+    return (
+      <div className="overflow-x-auto -mx-1">
+        <table className="w-full text-sm">
+          <thead className="text-[#6B5744]">
+            <tr><Th>Date</Th><Th>No.</Th><Th right>Wet</Th><Th right>Dry</Th><Th>Other</Th><Th>Collector</Th><Th>Receipt / vehicle</Th><Th>Handed over by</Th></tr>
+          </thead>
+          <tbody className="divide-y divide-[#E8D5C4]">
+            {rows.map((r) => (
+              <tr key={r.id}>
+                <Td>{r.business_date}{r.handed_at ? ` ${r.handed_at}` : ''}</Td>
+                <Td>{r.handover_no}</Td>
+                <Td right>{r.wet || '—'}</Td>
+                <Td right>{r.dry || '—'}</Td>
+                <Td>{r.other || '—'}</Td>
+                <Td>{r.collector}</Td>
+                <Td>{[r.receipt_no && `Rcpt ${r.receipt_no}`, r.vehicle_no && `Veh ${r.vehicle_no}`].filter(Boolean).join(' · ') || '—'}</Td>
+                <Td>{r.handed_over_by}</Td>
               </tr>
             ))}
           </tbody>

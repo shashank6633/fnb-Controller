@@ -8,7 +8,7 @@
  * (check-boot-migrations.js:8-23): *"The migration block in src/lib/db.ts runs on
  * EVERY getDb() cold start, and a deploy restarts the process — so 'runs on boot'
  * means 'runs on every deploy'. That is fine for a schema change … It is NOT fine
- * for anything a human has decided."* The twelve checklists are exactly that: the
+ * for anything a human has decided."* The fifteen checklists are exactly that: the
  * owner is meant to edit them, reorder them and RETIRE the ones he does not want
  * (owner §24). A boot seed keyed on `code` with INSERT OR IGNORE cannot tell
  * "never seeded" from "seeded and then deliberately thrown out" — both look like
@@ -29,7 +29,7 @@
  *     version brought back what the owner deleted (measured 2026-10-14).
  *
  * The pack seeds DRAFTS, and a draft cannot be run, so
- * publishFssaiReadyMadeDrafts publishes every untouched ready-made draft in one
+ * publishFssaiReadyMadeDrafts publishes every ready-made draft whose status nobody has changed in one
  * click — never an archived one, and never one whose status a person already
  * changed.
  *
@@ -146,6 +146,13 @@ export interface ReadyMadeDraft {
   code: string;
   name: string;
   question_count: number;
+  /**
+   * Somebody changed it in the builder since the pack added it (its version
+   * moved, or fssai_audit_log holds an edit to it, its questions or its
+   * sections). Still published by the one click — as he left it — but the
+   * screen says so, because he may still be half-way through it.
+   */
+  edited: boolean;
 }
 
 export interface ReadyMadeHeld {
@@ -187,7 +194,7 @@ export function readFssaiReadyMadeDrafts(
   pack: ChecklistPack = FSSAI_CHECKLIST_PACK,
 ): ReadyMadeDrafts {
   const rows = db.prepare(
-    `SELECT t.id, t.code, t.name, t.status, t.is_active, t.sort_order
+    `SELECT t.id, t.code, t.name, t.status, t.is_active, t.sort_order, t.version
        FROM fssai_templates t
       WHERE t.outlet_id = ?
         AND t.id IN (SELECT item_id FROM fssai_seed_log
@@ -200,6 +207,16 @@ export function readFssaiReadyMadeDrafts(
       ORDER BY created_at DESC, rowid DESC LIMIT 1`,
   );
   const activeQs = db.prepare(`SELECT qtype FROM fssai_questions WHERE template_id = ? AND is_active = 1`);
+  // An edit since the pack added it: the header (any field but the status), a
+  // question or a section. A deleted question bumps the version, caught below.
+  const edits = db.prepare(
+    `SELECT COUNT(*) AS n FROM fssai_audit_log a
+      WHERE (a.entity_table = 'fssai_templates' AND a.entity_id = @id AND a.action = 'update' AND a.field <> 'status')
+         OR (a.entity_table IN ('fssai_questions', 'fssai_sections')
+             AND (a.entity_id = @id
+                  OR a.entity_id IN (SELECT id FROM fssai_questions WHERE template_id = @id)
+                  OR a.entity_id IN (SELECT id FROM fssai_sections WHERE template_id = @id)))`,
+  );
 
   const out: ReadyMadeDrafts = { publishable: [], held: [], published: 0 };
   for (const r of rows) {
@@ -235,7 +252,8 @@ export function readFssaiReadyMadeDrafts(
       out.held.push({ ...base, why: `It has ${unknown.length} question(s) of a type this system does not know. Fix them before publishing.` });
       continue;
     }
-    out.publishable.push({ template_id: base.template_id, code: base.code, name: base.name, question_count: qs.length });
+    const edited = Number(r.version) > 1 || Number((edits.get({ id: r.id }) as any)?.n || 0) > 0;
+    out.publishable.push({ template_id: base.template_id, code: base.code, name: base.name, question_count: qs.length, edited });
   }
   return out;
 }
@@ -354,8 +372,9 @@ export interface ApplyOptions {
    * The default is `false` and that is the deliberate, reversible choice: a
    * draft is invisible to staff (templates/route.ts shows a non-admin only
    * published, active checklists), so the owner reads each one, changes what he
-   * wants and publishes it himself. Publishing is one click per checklist;
-   * un-publishing twelve checklists staff have already filed in is not.
+   * wants and publishes it himself — one at a time, or every ready-made draft
+   * whose status nobody has changed in one click (publishFssaiReadyMadeDrafts); un-publishing fifteen
+   * checklists staff have already filed in is not one click.
    */
   publish?: boolean;
   pack?: ChecklistPack;

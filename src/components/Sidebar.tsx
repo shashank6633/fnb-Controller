@@ -92,6 +92,8 @@ import {
   Beaker,
   Eye,
   FolderCheck,
+  Recycle,
+  UserCheck,
   type LucideIcon,
 } from "lucide-react";
 
@@ -557,6 +559,9 @@ const navTree: NavEntry[] = [
       { kind: "link", label: "Kitchen Safety Checks",               href: "/fssai/kitchen-safety",     icon: HardHat },
       { kind: "link", label: "Water & Ice Checks",                  href: "/fssai/water-ice",          icon: Droplets },
       { kind: "link", label: "Oil Quality Checks",                  href: "/fssai/oil-quality",        icon: Beaker },
+      // No tier flag in the catalog: porters file a handover at the back door.
+      // Hyderabad audit line #114 / audit-file record 14.
+      { kind: "link", label: "Waste Handover Log",                  href: "/fssai/waste",              icon: Recycle },
       { kind: "link", label: "Corrective Actions",                  href: "/fssai/corrective-actions", icon: Wrench },
       { kind: "link", label: "FSSAI Checklists",                    href: "/fssai/checklists",         icon: ListChecks },
       // mgmtOnly in the catalog (admin | manager | HOD).
@@ -565,6 +570,10 @@ const navTree: NavEntry[] = [
       { kind: "link", label: "Verify Records",                      href: "/fssai/verification",       icon: ClipboardCheck },
       { kind: "link", label: "Inspection Reports",                  href: "/fssai/inspections",        icon: ClipboardList },
       { kind: "link", label: "Documents & Certificates",            href: "/fssai/documents",          icon: FileText },
+      // mgmtOnly in the catalog, the same set as Documents & Certificates it sits
+      // under: the food-handler register and who has no valid certificate
+      // (Hyderabad audit lines #55, #56, #106, #107; audit-file records 6 and 7).
+      { kind: "link", label: "Food Handlers",                       href: "/fssai/documents/food-handlers", icon: UserCheck },
       { kind: "link", label: "Reports & Downloads",                 href: "/fssai/reports",            icon: BarChart3 },
       { kind: "link", label: "Record Changes & Voids",              href: "/fssai/audit-log",          icon: History },
       // adminOnly in the catalog.

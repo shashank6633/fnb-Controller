@@ -842,7 +842,7 @@ export const PAGE_CATALOG: PageSection[] = [
     // switch OFF at runtime with no deploy (settings key hod_only_overrides, read
     // in proxy.ts), so it cannot hold a compliance gate.
     //
-    // The 15 unflagged rows follow the /grn/qc precedent in this same file (the
+    // The 16 unflagged rows follow the /grn/qc precedent in this same file (the
     // owner's own words there: NOT HOD-only, because "at 6am with a truck
     // waiting that guarantees workarounds"). A flag that stops a porter filling
     // in a hygiene check has broken the module. Per-record scoping — own
@@ -871,6 +871,11 @@ export const PAGE_CATALOG: PageSection[] = [
       { path: '/fssai/kitchen-safety',     label: 'Kitchen Safety Checks' },
       { path: '/fssai/water-ice',          label: 'Water & Ice Checks' },
       { path: '/fssai/oil-quality',        label: 'Oil Quality Checks' },
+      // WASTE HANDOVER LOG — one line per handover of wet / dry / other waste to
+      // GHMC or an authorised collector (Hyderabad audit line #114, audit-file
+      // record 14). UNFLAGGED on purpose, like the rows above it: the porter at
+      // the back door files it. The route scopes each record itself.
+      { path: '/fssai/waste',              label: 'Waste Handover Log' },
       { path: '/fssai/corrective-actions', label: 'Corrective Actions' },
       { path: '/fssai/checklists',         label: 'FSSAI Checklists' },
       // Management surfaces. mgmtOnly (admin | manager | HOD), NOT adminOnly:
@@ -884,6 +889,14 @@ export const PAGE_CATALOG: PageSection[] = [
       // could produce the licence or the inspection pack to an inspector.
       { path: '/fssai/inspections',        label: 'Inspection Reports',       mgmtOnly: true },
       { path: '/fssai/documents',          label: 'Documents & Certificates', mgmtOnly: true },
+      // FOOD HANDLERS — the food-handler register and, for each person, the
+      // medical, training and FoSTaC certificates (Hyderabad audit lines #55,
+      // #56, #106, #107; audit-file records 6 and 7). mgmtOnly, the SAME tier as
+      // Documents & Certificates: bestEntry()'s longest prefix already gave it
+      // that gate from /fssai/documents; the row is here so it is VISIBLE and can
+      // be granted on its own, and it states the flag rather than leaving a
+      // reader to re-derive it. The API gates itself with isManagement().
+      { path: '/fssai/documents/food-handlers', label: 'Food Handlers',     mgmtOnly: true },
       { path: '/fssai/reports',            label: 'Reports & Downloads',      mgmtOnly: true },
       // RECORD CHANGES & VOIDS — the owner's §19 surface: who changed a
       // compliance record, from what to what, and the reason they gave for
@@ -1487,7 +1500,12 @@ export function canAccessPage(
  * again on 2026-10-14 when 'Audit File' (/fssai/audit-file) was added: it was
  * already 16 / 102 before that row (/boh, /feedback, /bill-submissions and
  * /grn/qc had arrived, /grn and /inventory had grown), and that row makes it
- * **16 parents / 103 grants**. FSSAI remains
+ * 16 parents / 103 grants. Re-measured the same day when 'Waste Handover Log'
+ * (/fssai/waste) and 'Food Handlers' (/fssai/documents/food-handlers) were
+ * added: 16 / 103 without them (confirmed), **17 parents / 106 grants** with
+ * them — /fssai +2 (now 25) and /fssai/documents a NEW parent (+1). Neither row
+ * changes who can open either path (both resolved to the same tier before).
+ * FSSAI remains
  * the single largest carrier. Nothing recomputes this comment, so any section
  * added here must re-measure it. The live figure is whatever
  * GET /api/admin/page-access-impact reports, not whatever this comment says.

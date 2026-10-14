@@ -8,7 +8,7 @@
  * reboot. This file is the part of those probes that must never be lost again.
  *
  * WHAT IT GUARDS — the rules a food-safety record lives or dies by:
- *   [1] the schema boots: 30 fssai_ tables, 99 indexes, and the app's own boot
+ *   [1] the schema boots: 35 fssai_ tables, 116 indexes, and the app's own boot
  *       assertion says OK — on a fresh install, on a database one deploy behind,
  *       and on a snapshot of the real database when one is present;
  *   [2] the fifteen ready-made checklists seed ONCE: a second apply is refused and
@@ -26,6 +26,31 @@
  *   [6] the page gate refuses staff on admin and management pages under BOTH a
  *       NULL page_access map (NULL = all pages) and an empty [] map ([] = follow
  *       the role) — and neither ever turns into deny-all for a staff page.
+ *
+ * THE HYDERABAD AUDIT ROUND (2026-10-14) — every one through the REAL route
+ * modules, each guard constructed and watched firing:
+ *   [7]  the cooling curve: create_suggested on an EMPTY standards table, the
+ *        fail-open case (a lone reading with minutes typed is judged against the
+ *        rule's anchor; no anchor fails CLOSED), reheating (the hot direction),
+ *        a batch across midnight, and an abandoned batch read as overdue;
+ *   [8]  the food-handler register (#55 #56 #106 #107): per-person coverage,
+ *        who is NOT in order named, FoSTaC 1-per-25, left/rejoined on one row,
+ *        the void author rule, the HRMS training link, CSV formula escaping;
+ *   [9]  evidence is VOIDED, never stripped: a file on a document or a pest
+ *        visit keeps its image, the cross-record call is refused 404, the
+ *        uploader may not void, a failed audit write rolls the void back;
+ *   [10] pest: the chemicals applied (#78) and the station-by-station sheet
+ *        (#113), all-or-nothing walks, a voided line kept on the sheet;
+ *   [11] the waste handover log (#114);
+ *   [12] closure photographs on corrective actions and inspection points (#120);
+ *   [13] a deleted ready-made checklist is never resurrected by a later pack;
+ *   [14] the audit-file PDF text — what the inspector's copy says it holds;
+ *   [15] missed checks on WhatsApp stay DORMANT (bell only) with no approved
+ *        template and no Meta app secret, and nothing leaves the machine.
+ *
+ * NOTHING LEAVES THIS MACHINE: global fetch is a tripwire that records every
+ * call and answers 599, and web push is stubbed. Sections can be run alone:
+ *   node scripts/fssai-tests.js --only=7,9
  *
  * HOW IT STAYS HERMETIC. The main database is a FRESH, EMPTY file in a temp dir,
  * booted by the app's own getDb() → initializeSchema() — so the suite never
@@ -56,6 +81,11 @@ const SRC = path.join(REPO, 'src');
 const LIVE_DB = path.join(REPO, 'fnb-controller.db');
 const KEEP = process.argv.includes('--keep');
 const BOOT_CHILD = process.argv.includes('--boot-child');
+/* --only=7,9 runs just those sections (the summary says what was skipped). */
+const ONLY = (() => {
+  const a = process.argv.find((x) => x.startsWith('--only='));
+  return a ? new Set(a.slice('--only='.length).split(',').map((s) => Number(s.trim())).filter(Boolean)) : null;
+})();
 const Database = require(path.join(REPO, 'node_modules', 'better-sqlite3'));
 
 /* ── TypeScript loader (same as hr-payroll-tests.js) ───────────────────────── */
@@ -140,6 +170,17 @@ fs.mkdirSync(FRESH_DIR);
 process.chdir(FRESH_DIR);
 installTsLoader();
 
+/* THE NETWORK TRIPWIRE — installed before any app module loads. Every fetch is
+ * recorded and answered 599, so a send path that should be DORMANT and is not
+ * shows up as a recorded call instead of a message to a real phone. */
+const FETCH = { calls: [] };
+global.fetch = async (url, init) => {
+  let body = null;
+  try { body = init && init.body ? JSON.parse(init.body) : null; } catch { body = String(init && init.body); }
+  FETCH.calls.push({ url: String(url), method: init && init.method, body });
+  return { ok: false, status: 599, json: async () => ({ error: { message: 'fssai-tests tripwire: no network' } }), text: async () => 'tripwire' };
+};
+
 const BOOT = bootQuietly();
 const db = BOOT.db;
 
@@ -169,8 +210,15 @@ const P4 = require(path.join(SRC, 'app', 'api', 'fssai', '_p4', 'lib.ts'));
  * replacing the export reaches every caller. */
 let CURRENT_USER = null;
 AUTH.getCurrentUser = async () => CURRENT_USER;
+/* The outlet the routes write under: the fresh database's own default outlet. */
+const ROUTE_OUTLET = (db.prepare('SELECT id FROM outlets WHERE is_default = 1 LIMIT 1').get() || {}).id || '';
+AUTH.getCurrentOutletId = async () => ROUTE_OUTLET;
+/* Web push talks https directly, past the fetch tripwire — so it is stubbed. */
+const PUSHES = [];
+lib('push.ts').sendPushToUser = async (_db, email, payload) => { PUSHES.push({ email, title: payload && payload.title }); return { sent: 0 }; };
 const VOID_ROUTE = require(path.join(SRC, 'app', 'api', 'fssai', 'void', 'route.ts'));
 const PAGE_GATE = lib('fssai-page-gate.ts');
+const route = (rel) => require(path.join(SRC, 'app', 'api', 'fssai', ...rel.split('/'), 'route.ts'));
 
 /* ── harness ───────────────────────────────────────────────────────────────── */
 let pass = 0, fail = 0;
@@ -182,17 +230,31 @@ function expect(a, e, l) {
   else bad(l, `expected ${JSON.stringify(e)}, got ${JSON.stringify(a)}`);
 }
 function expectTrue(c, l, h) { c ? ok(l) : bad(l, h); }
-function section(n, t) { console.log(`\n[${n}] ${t}`); }
+/** Deep equality by JSON — for the tuples the route tests compare. */
+function expectSame(a, e, l) {
+  const A = JSON.stringify(a), B = JSON.stringify(e);
+  A === B ? ok(`${l} — ${A}`) : bad(l, `expected ${B}, got ${A}`);
+}
+let CURRENT_SECTION = 0;
+const skippedSections = [];
+const want = (n) => !ONLY || ONLY.has(n);
+function section(n, t) {
+  CURRENT_SECTION = n;
+  if (!want(n)) { skippedSections.push(n); return; }
+  console.log(`\n[${n}] ${t}`);
+}
 
 // Constant savepoint name — tests never nest, so nothing needs to be generated.
 const SP_BEGIN = 'SAVEPOINT fssai_t';
 const SP_UNDO = 'ROLLBACK TO SAVEPOINT fssai_t';
 const SP_DONE = 'RELEASE SAVEPOINT fssai_t';
 async function test(name, fn) {
+  if (!want(CURRENT_SECTION)) return;
   db.prepare(SP_BEGIN).run();
   try { await fn(); }
   catch (e) { bad(`${name} — threw`, String((e && e.stack) || e)); }
   finally {
+    CURRENT_USER = null;
     try { db.prepare(SP_UNDO).run(); db.prepare(SP_DONE).run(); }
     catch (e) { bad(`${name} — savepoint unwind failed`, String(e)); }
   }
@@ -246,6 +308,98 @@ function mkRow(table, over = {}, depth = 0) {
   return db.prepare(`SELECT * FROM ${ident(table)} WHERE rowid = ?`).get(info.lastInsertRowid);
 }
 
+/* ── ROUTE HARNESS (sections 7–15) ─────────────────────────────────────────────
+ * The REAL route modules, called with a real Request. Only getCurrentUser and
+ * getCurrentOutletId are stubbed (above); the CSRF guard, the tier checks, the
+ * refusals and the SQL are the shipped code. */
+const CSRF_HEADERS = { 'content-type': 'application/json', cookie: 'fnb_csrf=fssai-test-token', 'x-csrf-token': 'fssai-test-token' };
+const signIn = (u) => { CURRENT_USER = u; };
+/* What the routes said on console.error / console.warn while the suite called
+ * them — a refusal path that logs is expected; printed only with --keep. */
+const ROUTE_SAID = [];
+async function call(mod, method, url, body, { csrf = true } = {}) {
+  const init = { method, headers: csrf ? CSRF_HEADERS : { 'content-type': 'application/json' } };
+  if (body !== undefined) init.body = JSON.stringify(body);
+  const keep = { error: console.error, warn: console.warn };
+  console.error = (...a) => ROUTE_SAID.push(`${method} ${url}: ` + a.map((x) => (x && x.message) || String(x)).join(' '));
+  console.warn = console.error;
+  let res;
+  try { res = await mod[method](new Request('http://localhost' + url, init)); }
+  finally { Object.assign(console, keep); }
+  const ct = res.headers.get('content-type') || '';
+  const out = { status: res.status, headers: res.headers, j: null, buf: null, text: '' };
+  if (ct.includes('json')) { try { out.j = await res.json(); } catch { out.j = null; } }
+  else if (ct.includes('csv') || ct.startsWith('text/')) out.text = await res.text();
+  else out.buf = Buffer.from(await res.arrayBuffer());
+  return out;
+}
+/** The suite's people as LOGINS — some routes look an address up in users. */
+function seedUsers(...extra) {
+  const ins = db.prepare(
+    `INSERT OR IGNORE INTO users (id, email, password_hash, name, role, is_head_chef, department_id, wa_mobile)
+     VALUES (?, ?, 'not-a-real-hash', ?, ?, ?, ?, ?)`,
+  );
+  for (const u of [ADMIN, MANAGER, MANAGER2, HOD, STAFF, ...extra]) {
+    ins.run(u.id, u.email, u.name, u.role, u.is_head_chef ? 1 : 0, u.department_id || null, u.wa_mobile || '');
+  }
+}
+/** A valid 1×1 PNG whose bytes differ per seed (a tEXt chunk), so digests differ. */
+function png(seed) {
+  const head = Buffer.from('89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d49444154789c6360000002000154a24f5d', 'hex');
+  const txt = Buffer.from('seed' + seed);
+  const len = Buffer.alloc(4); len.writeUInt32BE(txt.length);
+  const end = Buffer.from('0000000049454e44ae426082', 'hex');
+  const bytes = Buffer.concat([head, len, Buffer.from('tEXt'), txt, Buffer.alloc(4), end]);
+  return 'data:image/png;base64,' + bytes.toString('base64');
+}
+const attRow = (id) => db.prepare('SELECT * FROM fssai_attachments WHERE id = ?').get(id);
+const auditRows = (table, id, action) => db.prepare(
+  `SELECT * FROM fssai_audit_log WHERE entity_table = ? AND entity_id = ?${action ? ' AND action = ?' : ''} ORDER BY rowid`,
+).all(...[table, id, action].filter((x) => x !== undefined));
+
+/**
+ * THE TEXT OF A PDF, without a dependency. The audit file is drawn by pdfkit in
+ * the standard Helvetica faces, which write every run of text as a hex string
+ * of WinAnsi codes inside a TJ/Tj operator in a Flate-compressed content
+ * stream. Inflate each stream, decode each string, keep one line per BT…ET.
+ * Enough to ask "does the inspector's copy SAY this?" — not a layout engine.
+ */
+function pdfTextOf(buf) {
+  const zlib = require('zlib');
+  const src = buf.toString('latin1');
+  const lines = [];
+  let at = 0;
+  for (;;) {
+    const s = src.indexOf('stream', at);
+    if (s < 0) break;
+    let start = s + 'stream'.length;
+    if (src[start] === '\r') start += 1;
+    if (src[start] === '\n') start += 1;
+    const end = src.indexOf('endstream', start);
+    if (end < 0) break;
+    at = end + 'endstream'.length;
+    let content = '';
+    try { content = zlib.inflateSync(buf.subarray(start, end)).toString('latin1'); }
+    catch { continue; }
+    for (const bt of content.split(/\bBT\b/).slice(1)) {
+      const body = bt.split(/\bET\b/)[0];
+      let line = '';
+      for (const t of body.matchAll(/<([0-9a-fA-F\s]*)>|\(((?:\\.|[^\\)])*)\)/g)) {
+        if (t[1] !== undefined) {
+          const hex = t[1].replace(/\s+/g, '');
+          for (let i = 0; i + 1 < hex.length; i += 2) line += String.fromCharCode(parseInt(hex.slice(i, i + 2), 16));
+        } else {
+          line += t[2].replace(/\\([()\\])/g, '$1');
+        }
+      }
+      if (line.trim()) lines.push(line);
+    }
+  }
+  // WinAnsi → the characters the renderer meant (the few that differ from Latin-1).
+  const WIN = { '\x95': '•', '\x96': '–', '\x97': '—', '\x91': '‘', '\x92': '’', '\x93': '“', '\x94': '”', '\x85': '…' };
+  return lines.join('\n').replace(/[\x85\x91-\x97]/g, (c) => WIN[c] || c);
+}
+
 /* ════════════════════════════════════════════════════════════════════════════
  * TESTS
  * ══════════════════════════════════════════════════════════════════════════*/
@@ -255,7 +409,15 @@ function mkRow(table, over = {}, depth = 0) {
   console.log(`scratch database: ${db.name}`);
 
   /* ─────────────────────────────────────────────────────────────────────── */
-  section(1, 'SCHEMA BOOTS — 30 tables, 99 indexes, and the boot assertion says OK');
+  /* THE SCHEMA CONTRACT, ASSERTED EXACTLY AND ON PURPOSE. It was 30 / 99 until
+   * the Hyderabad audit round (2026-10-14) added five tables — fssai_food_handlers,
+   * fssai_training_links, fssai_pest_device_checks, fssai_waste_handovers,
+   * fssai_job_notices — and seventeen indexes. A table or index added or lost by
+   * accident must fail here; one added deliberately changes these numbers. */
+  const FSSAI_TABLES = 35;
+  const FSSAI_INDEXES = 116;
+  const P1_TABLE_COUNT = 11;
+  section(1, `SCHEMA BOOTS — ${FSSAI_TABLES} tables, ${FSSAI_INDEXES} indexes, and the boot assertion says OK`);
 
   // The DECLARED lists, read out of db.ts exactly as assertFssaiSchema reads them.
   const dbSrc = fs.readFileSync(path.join(SRC, 'lib', 'db.ts'), 'utf8');
@@ -266,15 +428,15 @@ function mkRow(table, over = {}, depth = 0) {
   const declIndexes = [...new Set([...dbSrc.slice(iStart, iEnd).matchAll(/`\s*CREATE (?:UNIQUE )?INDEX IF NOT EXISTS ([a-z_]+)/g)].map((m) => m[1]))];
   const live = countFssaiObjects(db);
 
-  await test('the DDL declares 30 tables and 99 indexes', () => {
+  await test(`the DDL declares ${FSSAI_TABLES} tables and ${FSSAI_INDEXES} indexes`, () => {
     expectTrue(tStart > -1 && iStart > tStart && iEnd > iStart, 'both DDL arrays found in src/lib/db.ts');
     // If the schema grows on purpose, change these two numbers on purpose.
-    expect(declTables.length, 30, 'declared fssai_ tables');
-    expect(declIndexes.length, 99, 'declared idx_fssai_/uq_fssai_ indexes');
+    expect(declTables.length, FSSAI_TABLES, 'declared fssai_ tables');
+    expect(declIndexes.length, FSSAI_INDEXES, 'declared idx_fssai_/uq_fssai_ indexes');
   });
   await test('a FRESH database boots every declared table and index', () => {
-    expect(live.tables.length, 30, 'fssai_ tables in sqlite_master');
-    expect(live.indexes.length, 99, 'fssai indexes in sqlite_master');
+    expect(live.tables.length, FSSAI_TABLES, 'fssai_ tables in sqlite_master');
+    expect(live.indexes.length, FSSAI_INDEXES, 'fssai indexes in sqlite_master');
     const missT = declTables.filter((t) => !live.tables.includes(t));
     const missI = declIndexes.filter((i) => !live.indexes.includes(i));
     expectTrue(missT.length === 0, 'no declared table is missing', missT.join(', '));
@@ -284,7 +446,7 @@ function mkRow(table, over = {}, depth = 0) {
   });
   await test("the app's own boot assertion said OK, and nothing said NOT OK", () => {
     const okLine = BOOT.said.find((l) => /\[db\] fssai schema OK/.test(l)) || '';
-    expectTrue(/fssai schema OK \(30 tables, 99 indexes\)/.test(okLine),
+    expectTrue(okLine.includes(`fssai schema OK (${FSSAI_TABLES} tables, ${FSSAI_INDEXES} indexes)`),
       `boot printed "${okLine.replace(/^LOG /, '')}"`, 'no OK line was printed — initializeSchema swallows errors per block, so this is the only proof');
     const notOk = BOOT.said.filter((l) => /FSSAI SCHEMA NOT OK|fssai schema failed|FSSAI NAME CONFLICT|INCOMPLETE/.test(l));
     expectTrue(notOk.length === 0, 'no FSSAI failure line during boot', notOk.join(' | '));
@@ -320,11 +482,11 @@ function mkRow(table, over = {}, depth = 0) {
     return JSON.parse(line.slice('FSSAI_BOOT_CHILD '.length));
   }
 
-  {
+  if (want(1)) {
     // A DATABASE ONE DEPLOY BEHIND — the measured W1 upgrade: only the eleven P1
-    // tables exist (the nineteen record-module tables and their indexes are
-    // absent) and two live rows sit in them. The next boot must build the
-    // nineteen and leave both rows exactly as they were.
+    // tables exist (every record-module table and its indexes are absent) and
+    // two live rows sit in them. The next boot must build the rest and leave
+    // both rows exactly as they were.
     const P1_TABLES = ['fssai_templates', 'fssai_sections', 'fssai_questions', 'fssai_equipment',
       'fssai_assignments', 'fssai_runs', 'fssai_responses', 'fssai_evidence', 'fssai_approvals',
       'fssai_corrective_actions', 'fssai_audit_log'];
@@ -343,13 +505,13 @@ function mkRow(table, over = {}, depth = 0) {
     old.close();
 
     const child = bootChild(dir);
-    await test('a database ONE DEPLOY BEHIND (11 tables) is brought to 30 by the next boot', () => {
-      expect(dropped.length, 19, 'record-module tables absent before the boot');
-      expect(before.tables.length, 11, 'tables before the boot');
+    await test(`a database ONE DEPLOY BEHIND (${P1_TABLE_COUNT} tables) is brought to ${FSSAI_TABLES} by the next boot`, () => {
+      expect(dropped.length, FSSAI_TABLES - P1_TABLE_COUNT, 'record-module tables absent before the boot');
+      expect(before.tables.length, P1_TABLE_COUNT, 'tables before the boot');
       if (child.error) { bad('the child boot ran', child.error); return; }
-      expect(child.tables, 30, 'tables after the boot');
-      expect(child.indexes, 99, 'indexes after the boot');
-      expectTrue(child.ok.length === 1 && /30 tables, 99 indexes/.test(child.ok[0]), 'the boot assertion said OK', JSON.stringify(child.ok));
+      expect(child.tables, FSSAI_TABLES, 'tables after the boot');
+      expect(child.indexes, FSSAI_INDEXES, 'indexes after the boot');
+      expectTrue(child.ok.length === 1 && child.ok[0].includes(`${FSSAI_TABLES} tables, ${FSSAI_INDEXES} indexes`), 'the boot assertion said OK', JSON.stringify(child.ok));
       expectTrue(child.notOk.length === 0, 'and nothing said NOT OK', child.notOk.join(' | '));
       const after = new Database(file, { readonly: true });
       const tpl = after.prepare('SELECT name FROM fssai_templates WHERE id = ?').get(tplId);
@@ -360,7 +522,7 @@ function mkRow(table, over = {}, depth = 0) {
     });
   }
 
-  {
+  if (want(1)) {
     // THE REAL DATABASE, if this checkout has one: snapshot READ-ONLY, boot the
     // copy. Proves the boot is idempotent on a database that already has the
     // module, and that it neither seeds nor removes records.
@@ -385,8 +547,8 @@ function mkRow(table, over = {}, depth = 0) {
       const child = bootChild(dir);
       await test('a snapshot of the REAL database boots clean, and the boot changes no record', () => {
         if (child.error) { bad('the child boot ran', child.error); return; }
-        expect(child.tables, 30, 'tables after booting the snapshot');
-        expect(child.indexes, 99, 'indexes after booting the snapshot');
+        expect(child.tables, FSSAI_TABLES, 'tables after booting the snapshot');
+        expect(child.indexes, FSSAI_INDEXES, 'indexes after booting the snapshot');
         expectTrue(child.ok.length === 1, 'the boot assertion said OK', JSON.stringify(child.ok));
         expectTrue(child.notOk.length === 0, 'and nothing said NOT OK', child.notOk.join(' | '));
         const after = peek(file);
@@ -810,8 +972,12 @@ function mkRow(table, over = {}, depth = 0) {
   section(6, 'THE PAGE GATE — staff refused on admin/management pages under NULL and []');
 
   const ADMIN_PAGES = ['/fssai/settings', '/fssai/settings/equipment', '/fssai/settings/checklists', '/fssai/settings/checklists/abc123', '/fssai/settings/ready-made'];
-  const MGMT_PAGES = ['/fssai/verification', '/fssai/inspections', '/fssai/inspection-mode', '/fssai/documents', '/fssai/reports', '/fssai/audit-log'];
-  const STAFF_PAGES = ['/fssai', '/fssai/temperature', '/fssai/checklists', '/fssai/checklists/run/abc123', '/fssai/receiving', '/fssai/pest-control', '/fssai/corrective-actions'];
+  const MGMT_PAGES = ['/fssai/verification', '/fssai/inspections', '/fssai/inspection-mode', '/fssai/documents', '/fssai/reports', '/fssai/audit-log',
+    // the Hyderabad round: the audit file, and the food-handler register (gated by its /fssai/documents prefix)
+    '/fssai/audit-file', '/fssai/documents/food-handlers'];
+  const STAFF_PAGES = ['/fssai', '/fssai/temperature', '/fssai/checklists', '/fssai/checklists/run/abc123', '/fssai/receiving', '/fssai/pest-control', '/fssai/corrective-actions',
+    // porters file the waste handover at the back door — no tier flag
+    '/fssai/waste'];
   const MAPS = [['NULL (all pages)', null], ['[] (follow the role)', '[]']];
   const as = (u, page_access) => ({ ...u, page_access });
 
@@ -875,13 +1041,326 @@ function mkRow(table, over = {}, depth = 0) {
     expect(F.canAuthorFssai(null), false, 'signed out');
   });
 
+  /* ─────────────────────────────────────────────────────────────────────── */
+  section(7, 'THE COOLING CURVE — anchored, fail-closed, both directions, across midnight');
+
+  const TEMP = route('temperature');
+  const STD = route('temp-standards');
+  const T_TODAY = F.fssaiToday();
+  const T_YDAY = F.addDaysISO(T_TODAY, -1);
+  /** One reading, as the cook files it (staff, no department). */
+  const reading = (body) => { signIn(STAFF); return call(TEMP, 'POST', '/api/fssai/temperature', { action: 'record', uom: 'C', shift: '', business_date: T_TODAY, ...body }); };
+  const suggest = () => { signIn(ADMIN); return call(STD, 'POST', '/api/fssai/temp-standards', { action: 'create_suggested', codes: ['TEMP-COOLING', 'TEMP-REHEAT', 'TEMP-CHILLER'] }); };
+  const stdRow = (code) => db.prepare('SELECT * FROM fssai_temp_standards WHERE code = ?').get(code);
+  const setAnchor = (code, v) => { signIn(ADMIN); return call(STD, 'POST', '/api/fssai/temp-standards', { action: 'update', id: stdRow(code).id, start_value: v, reason: 'fssai-tests: anchor changed' }); };
+  const caOf = (readingId) => db.prepare(`SELECT ca_number, title FROM fssai_corrective_actions WHERE response_id = ?`).get(readingId);
+
+  await test('create_suggested on an EMPTY standards table answers 200 and stores the anchors', async () => {
+    expect(count('fssai_temp_standards'), 0, 'standards before');
+    let r = await suggest();
+    expect(r.status, 200, 'create_suggested (the 2026-10-14 finding: it answered 409 duplicate_code and wrote nothing)');
+    expectSame([stdRow('TEMP-COOLING').start_value, stdRow('TEMP-COOLING').max_minutes, stdRow('TEMP-COOLING').target_value], [60, 240, 5], 'TEMP-COOLING anchor/minutes/target');
+    expectSame([stdRow('TEMP-REHEAT').start_value, stdRow('TEMP-REHEAT').max_minutes, stdRow('TEMP-REHEAT').target_value], [5, 120, 75], 'TEMP-REHEAT anchor/minutes/target');
+    expect(stdRow('TEMP-CHILLER').start_value, null, 'a level rule (TEMP-CHILLER) carries no anchor');
+    r = await suggest();
+    expectSame([r.status, r.j.created.length, r.j.skipped.length], [200, 0, 3], 'a second press skips all three, never duplicates');
+    r = await call(STD, 'POST', '/api/fssai/temp-standards', { action: 'create', code: 'TEMP-COOLING', label: 'dupe', applies_to: 'cooling', max_value: 5, max_minutes: 240 });
+    expectSame([r.status, r.j.code], [409, 'duplicate_code'], 'a real reused code is still refused 409 duplicate_code');
+    // A constraint that is NOT a duplicate must never be dressed up as one.
+    db.prepare(`CREATE TRIGGER fssai_t_block BEFORE INSERT ON fssai_temp_standards WHEN NEW.label = 'FSSAI-T-TRIGGER'
+                BEGIN SELECT RAISE(ABORT, 'fssai-tests constraint'); END`).run();
+    r = await call(STD, 'POST', '/api/fssai/temp-standards', { action: 'create', code: 'T-TRIG', label: 'FSSAI-T-TRIGGER', applies_to: 'equipment', max_value: 5 });
+    expectSame([r.status, r.j.code || null], [500, null], 'a non-UNIQUE constraint is a 500, not "duplicate"');
+    for (const [label, body] of [
+      ['a cooling rule with no temperature to reach', { label: 'No goal', applies_to: 'cooling', max_minutes: 240 }],
+      ['an anchor on a level rule', { label: 'Fridge anchor', applies_to: 'equipment', max_value: 5, start_value: 10 }],
+      ['a cooling anchor at or below its target', { label: 'Bad cool anchor', applies_to: 'cooling', max_value: 5, target_value: 5, max_minutes: 240, start_value: 4 }],
+      ['a reheating anchor at or above its target', { label: 'Bad reheat anchor', applies_to: 'reheating', min_value: 75, max_minutes: 120, start_value: 80 }],
+    ]) {
+      r = await call(STD, 'POST', '/api/fssai/temp-standards', { action: 'create', ...body });
+      expect(r.status, 400, `refused: ${label}`);
+    }
+  });
+
+  await test('THE FAIL-OPEN CASE: a lone reading with minutes typed is judged against the rule’s anchor', async () => {
+    await suggest();
+    let r = await reading({ log_kind: 'cooling', value_num: 65, area_label: 'Kitchen', item_label: 'Curry B1', reading_at: '05:00', elapsed_minutes: 239 });
+    expectSame([r.status, r.j.code], [400, 'action_taken_required'], '65 °C typed 239 min is a FAILURE — refused until the action is said (it used to PASS)');
+    r = await reading({ log_kind: 'cooling', value_num: 65, area_label: 'Kitchen', item_label: 'Curry B1', reading_at: '05:00', elapsed_minutes: 239, action_taken: 'Binned the batch' });
+    const rd = r.j.reading;
+    expectSame([rd.is_judged, rd.is_fail, rd.curve_start_source, rd.curve_start_used, rd.curve_start_minute], [1, 1, 'standard_anchor', 60, 0], '65 @239 judged FAIL from the frozen 60 °C anchor');
+    const ca = caOf(rd.id);
+    expectTrue(!!ca && ca.title.indexOf('Curry B1') > -1 && ca.title.indexOf('Curry B1') < ca.title.indexOf('Kitchen'),
+      `a corrective action was raised, naming the FOOD first: "${ca && ca.title}"`);
+    const create = auditRows('fssai_temperature_logs', rd.id, 'create')[0];
+    const after = create ? JSON.parse(create.after_json) : {};
+    expectSame([after.curve_start_used, after.curve_start_minute, after.curve_start_source], [60, 0, 'standard_anchor'], 'the create audit row freezes where the line started');
+    for (const [v, e, wantFail] of [[60, 230, 1], [40, 120, 1], [30, 60, 0], [5, 100, 0]]) {
+      r = await reading({ log_kind: 'cooling', value_num: v, area_label: 'Kitchen', item_label: `Lone ${v}@${e}`, reading_at: '05:00', elapsed_minutes: e, action_taken: wantFail ? 'Moved to the blast chiller' : '' });
+      expectSame([r.status, r.j.reading && r.j.reading.is_judged, r.j.reading && r.j.reading.is_fail], [200, 1, wantFail], `lone ${v} °C typed ${e} min → ${wantFail ? 'FAIL (behind the line from 60 °C)' : 'on schedule'}`);
+    }
+  });
+
+  await test('NO ANCHOR fails CLOSED — a part-way reading short of the target is never passed', async () => {
+    await suggest();
+    let r = await setAnchor('TEMP-COOLING', null);
+    expectSame([r.status, stdRow('TEMP-COOLING').start_value], [200, null], 'the anchor is cleared');
+    r = await reading({ log_kind: 'cooling', value_num: 30, area_label: 'Kitchen', item_label: 'No anchor D1', reading_at: '07:00', elapsed_minutes: 60, action_taken: 'Rechecked the probe' });
+    expectSame([r.j.reading.is_judged, r.j.reading.is_fail, r.j.reading.curve_start_source], [1, 1, ''], '30 °C typed 60 min with no anchor → FAIL (it used to pass)');
+    r = await reading({ log_kind: 'cooling', value_num: 4, area_label: 'Kitchen', item_label: 'No anchor D2', reading_at: '07:00', elapsed_minutes: 60 });
+    expectSame([r.j.reading.is_judged, r.j.reading.is_fail], [1, 0], '4 °C typed 60 min reached the target — a real pass');
+    r = await reading({ log_kind: 'cooling', value_num: 70, area_label: 'Kitchen', item_label: 'No anchor D3', reading_at: '07:00' });
+    const d3 = r.j.reading;
+    expectSame([d3.is_fail, d3.elapsed_minutes, d3.curve_start_source, d3.curve_start_used, d3.verdict_word, d3.minutes_words], [0, 0, 'first_reading', 70, 'On schedule', '0 of 240'],
+      'a 0-minute first reading starts its own line, and reads "On schedule", "0 of 240"');
+    r = await reading({ log_kind: 'cooling', value_num: 50, area_label: 'Kitchen', item_label: 'No anchor D3', reading_at: '08:00' });
+    expectSame([r.j.reading.curve_id, r.j.reading.is_fail, r.j.reading.schedule_value], [d3.id, 0, 53.7], '50 °C an hour later joins the batch, on schedule (needed ≤ 53.7)');
+    r = await reading({ log_kind: 'cooling', value_num: 40, area_label: 'Kitchen', item_label: 'No anchor D3', reading_at: '09:00', action_taken: 'Ice bath' });
+    expectSame([r.j.reading.is_fail, r.j.reading.schedule_value], [1, 37.5], '40 °C at 120 min is behind its own line (needed ≤ 37.5) → FAIL');
+  });
+
+  await test('REHEATING — the hot direction: below the rising line fails, ahead of it passes', async () => {
+    await suggest();
+    let r = await reading({ log_kind: 'reheating', value_num: 4, area_label: 'Line', item_label: 'Dal E1', reading_at: '10:00' });
+    const e1 = r.j.reading;
+    expectSame([e1.is_fail, e1.curve_start_source, e1.verdict_word], [0, 'first_reading', 'On schedule'], 'a reheat batch starts from its own 0-minute reading');
+    r = await reading({ log_kind: 'reheating', value_num: 35, area_label: 'Line', item_label: 'Dal E1', reading_at: '11:00', action_taken: 'Turned the burner up' });
+    expectSame([r.j.reading.curve_id, r.j.reading.is_fail, r.j.reading.schedule_value], [e1.id, 1, 39.5], '35 °C at 60 min is BELOW the rising line (needed ≥ 39.5) → FAIL');
+    expectTrue(/^Reheating behind schedule/.test((caOf(r.j.reading.id) || {}).title || ''), 'and raises "Reheating behind schedule"');
+    r = await reading({ log_kind: 'reheating', value_num: 76, area_label: 'Line', item_label: 'Dal E1', reading_at: '12:00' });
+    expectSame([r.j.reading.is_fail, r.j.reading.elapsed_minutes, r.j.reading.verdict_word], [0, 120, 'In range'], '76 °C at 120 min reached 75 °C in time');
+    r = await reading({ log_kind: 'reheating', value_num: 70, area_label: 'Line', item_label: 'Lone E3', reading_at: '10:00', elapsed_minutes: 90 });
+    expectSame([r.j.reading.is_fail, r.j.reading.verdict_word], [0, 'On schedule'], 'a lone 70 °C typed 90 min is ahead of the line from the 5 °C anchor');
+    r = await reading({ log_kind: 'reheating', value_num: 30, area_label: 'Line', item_label: 'Lone E2', reading_at: '10:00', elapsed_minutes: 90, action_taken: 'Kept heating' });
+    expectSame([r.j.reading.is_fail, r.j.reading.curve_start_source], [1, 'standard_anchor'], 'a lone 30 °C typed 90 min is short of the line → FAIL');
+    r = await reading({ log_kind: 'reheating', value_num: 60, area_label: 'Line', item_label: 'Lone E4', reading_at: '10:00', elapsed_minutes: 130, action_taken: 'Discarded' });
+    expect(r.j.reading.is_fail, 1, '60 °C typed 130 min (past the 120 allowed) fails on the clock');
+    await setAnchor('TEMP-REHEAT', null);
+    r = await reading({ log_kind: 'reheating', value_num: 70, area_label: 'Line', item_label: 'Lone E5', reading_at: '10:00', elapsed_minutes: 90, action_taken: 'Kept heating' });
+    expectSame([r.j.reading.is_judged, r.j.reading.is_fail], [1, 1], 'with no reheat anchor, a part-way reading short of 75 °C fails closed');
+  });
+
+  await test('A BATCH ACROSS MIDNIGHT is one curve; a post-midnight reading under the old date is refused', async () => {
+    await suggest();
+    let r = await reading({ log_kind: 'cooling', value_num: 72, area_label: 'Kitchen', item_label: 'Biryani F1', business_date: T_YDAY, reading_at: '23:30', backdate_reason: 'Last night’s batch' });
+    const f1 = r.j.reading;
+    r = await reading({ log_kind: 'cooling', value_num: 55, area_label: 'Kitchen', item_label: 'Biryani F1', reading_at: '00:30' });
+    expectSame([r.j.reading.curve_id, r.j.reading.elapsed_minutes, r.j.reading.is_fail, r.j.reading.schedule_value], [f1.id, 60, 0, 55.2], 'after midnight it JOINS the batch: 60 minutes counted across the date change');
+    r = await reading({ log_kind: 'cooling', value_num: 4, area_label: 'Kitchen', item_label: 'Biryani F1', reading_at: '03:30' });
+    expectSame([r.j.reading.elapsed_minutes, r.j.reading.is_fail], [240, 0], 'reached 4 °C at minute 240: in time');
+    signIn(MANAGER);
+    const curve = await call(TEMP, 'GET', `/api/fssai/temperature?curve=${f1.id}`);
+    expectSame([curve.j.curve.outcome, curve.j.readings.map((x) => x.elapsed_minutes)], ['reached_in_time', [0, 60, 240]], 'GET ?curve= reads the batch across midnight, in order');
+    r = await reading({ log_kind: 'cooling', value_num: 70, area_label: 'Kitchen', item_label: 'Pulao F2', business_date: T_YDAY, reading_at: '23:40', backdate_reason: 'Last night’s batch' });
+    const f2 = r.j.reading;
+    r = await reading({ log_kind: 'cooling', value_num: 60, area_label: 'Kitchen', item_label: 'Pulao F2', business_date: T_YDAY, reading_at: '00:40', backdate_reason: 'Last night’s batch' });
+    expectSame([r.status, r.j.code], [409, 'before_curve_start'], 'dated yesterday at 00:40 → refused (it used to start a new batch that passed at minute 0)');
+    expectTrue(String(r.j.error).includes(`date it ${T_TODAY}`), 'and the refusal names the date it needs');
+    r = await reading({ log_kind: 'cooling', value_num: 50, area_label: 'Kitchen', item_label: 'Pulao F2', curve_id: f2.id, reading_at: '00:40' });
+    expectSame([r.status, r.j.reading.elapsed_minutes, r.j.reading.curve_id, r.j.reading.is_fail], [200, 60, f2.id, 0], 'dated today, it joins its batch at 60 minutes, on schedule');
+  });
+
+  await test('an ABANDONED batch reads as overdue (fssaiOpenCurves, which the escalation job reads)', async () => {
+    await suggest();
+    const r = await reading({ log_kind: 'cooling', value_num: 68, area_label: 'Kitchen', item_label: 'Abandoned G1', business_date: T_YDAY, reading_at: '05:00', backdate_reason: 'Found on the sheet' });
+    const g1 = r.j.reading;
+    const open = P4.fssaiOpenCurves(db, { today: T_TODAY, nowMinute: P4.fssaiClockMinute(T_TODAY, '10:00') });
+    const og = open.find((c) => c.id === g1.id);
+    expectSame([!!og, og && og.outcome, og && og.label], [true, 'overdue', 'Abandoned G1 · Kitchen'], 'the batch with no reading at the target is overdue');
+    signIn(MANAGER);
+    const g = await call(TEMP, 'GET', '/api/fssai/temperature?curves=open');
+    expectTrue(g.status === 200 && g.j.curves.some((c) => c.id === g1.id), 'GET ?curves=open lists it');
+    expectSame(P4.fssaiTempVerdictWord({ log_kind: 'cooling', is_judged: 1, is_fail: 0, value_num: 68, max_used: 5 }), 'On schedule', 'fssaiTempVerdictWord never says "In range" for a cooling reading above its target');
+  });
+
+  /* ─────────────────────────────────────────────────────────────────────── */
+  section(8, 'THE FOOD-HANDLER REGISTER — who is covered, who is NOT, by name (#55 #56 #106 #107)');
+
+  const FH = route('documents/food-handlers');
+  const DOCS = route('documents');
+  const FHL = lib('fssai-food-handlers.ts');
+  const D_TODAY = F.fssaiToday();
+  const plus = (n) => F.addDaysISO(D_TODAY, n);
+  const fhGet = async (q = '') => { signIn(MANAGER); return (await call(FH, 'GET', `/api/fssai/documents/food-handlers${q}`)).j; };
+  const fhPost = (body, who = MANAGER) => { signIn(who); return call(FH, 'POST', '/api/fssai/documents/food-handlers', body); };
+  const docPost = (body, who = MANAGER) => { signIn(who); return call(DOCS, 'POST', '/api/fssai/documents', body); };
+  /** File a certificate and (by default) its scan — the scan by the ADMIN, so a manager is never the uploader. */
+  async function fileCert(body, scan = true) {
+    const r = await docPost({ action: 'create', ...body });
+    if (r.status === 200 && scan) await docPost({ action: 'attach', id: r.j.document.id, data_uri: png(body.title) }, ADMIN);
+    return r;
+  }
+  const covOf = (j, id) => j.handlers.find((h) => h.id === id);
+
+  await test('a cook with NO login is on the register, and a certificate counts only with a live scan', async () => {
+    seedUsers();
+    let j = await fhGet();
+    expectTrue(j.available === true && j.handlers.length === 0, 'an empty register answers');
+    let r = await fhPost({ action: 'create', full_name: 'Ravi Kumar', designation: 'Tandoor cook', phone10: '+91 98480 12345', joined_on: '2025-04-01' });
+    expectSame([r.status, r.j.handler.handler_no, r.j.handler.key_kind, r.j.handler.phone10], [200, 'FH-0001', 'name_only', '9848012345'], 'name-only row (Q18: the name alone is legal)');
+    const RAVI = r.j.handler.id;
+    r = await docPost({ action: 'create', doc_type: 'medical_fitness', title: 'Medical — Ravi', person_email: 'ravi@nowhere.example', expiry_date: plus(200) });
+    expect(r.status, 400, 'a person_email that is not a login is refused (file it against the register instead)');
+    r = await fileCert({ doc_type: 'medical_fitness', title: 'Medical fitness — Ravi Kumar', handler_id: RAVI, issued_on: plus(-100), expiry_date: plus(265) }, false);
+    expectSame([r.status, r.j.document.handler_id, r.j.document.holder_label], [200, RAVI, 'Ravi Kumar (FH-0001)'], 'a certificate filed against the handler, holder named');
+    const MED = r.j.document.id;
+    j = await fhGet();
+    expectSame([covOf(j, RAVI).coverage.medical.verdict, covOf(j, RAVI).coverage.medical.in_order], ['no_copy', false], 'before a scan: medical is NOT in order (no copy)');
+    expectTrue(j.not_in_order.medical.some((x) => x.id === RAVI) && j.not_in_order.training.some((x) => x.id === RAVI),
+      'not_in_order NAMES Ravi under medical and training — a person with no certificate is a row');
+    await docPost({ action: 'attach', id: MED, data_uri: png('ravi-med') }, ADMIN);
+    j = await fhGet();
+    expectSame([covOf(j, RAVI).coverage.medical.verdict, covOf(j, RAVI).coverage.medical.in_order], ['valid', true], 'after the scan: medical valid');
+    // VOIDED scans never count as a copy.
+    const att = db.prepare(`SELECT id FROM fssai_attachments WHERE entity_table = 'fssai_documents' AND entity_id = ? AND status <> 'void'`).get(MED);
+    r = await docPost({ action: 'void_file', id: MED, attachment_id: att.id, reason: 'The scan was of the wrong person' }, MANAGER2);
+    expect(r.status, 200, 'another manager voids the scan');
+    j = await fhGet();
+    expect(covOf(j, RAVI).coverage.medical.verdict, 'no_copy', 'with its only scan VOIDED the certificate has no copy again');
+  });
+
+  await test('expiry rules: medical/FoSTaC with no expiry is NOT in order, training is; FoSTaC counts as training', async () => {
+    seedUsers();
+    const S = (await fhPost({ action: 'create', full_name: 'Store Supervisor', is_fostac_supervisor: 1 })).j.handler.id;
+    await fileCert({ doc_type: 'medical_fitness', title: 'Medical — no date', handler_id: S, expiry_date: '' });
+    await fileCert({ doc_type: 'food_handler_training', title: 'Training — no date', handler_id: S, expiry_date: '' });
+    let h = covOf(await fhGet(), S);
+    expectSame([h.coverage.medical.verdict, h.coverage.medical.in_order], ['no_expiry', false], 'medical with no expiry date');
+    expectSame([h.coverage.training.verdict, h.coverage.training.in_order], ['no_expiry', true], 'training with no expiry date');
+    await fileCert({ doc_type: 'food_handler_training', title: 'Training — ending soon', handler_id: S, issued_on: plus(-355), expiry_date: plus(10) });
+    const A = (await fhPost({ action: 'create', full_name: 'Anil Sous Chef', is_food_handler: 1 })).j.handler.id;
+    await fileCert({ doc_type: 'fostac_certificate', title: 'FoSTaC Basic — Anil', handler_id: A, expiry_date: plus(500) });
+    h = covOf(await fhGet(), A);
+    expectSame([h.coverage.training.verdict, h.coverage.training.best && h.coverage.training.best.doc_type], ['valid', 'fostac_certificate'], 'a FoSTaC certificate satisfies TRAINING');
+    const old = await fileCert({ doc_type: 'medical_fitness', title: 'Medical — lapsed', handler_id: A, issued_on: plus(-400), expiry_date: plus(-3) });
+    h = covOf(await fhGet(), A);
+    expectSame([h.coverage.medical.verdict, h.coverage.medical.in_order], ['expired', false], 'a lapsed medical is expired');
+    const ren = await docPost({ action: 'renew', id: old.j.document.id, issued_on: D_TODAY, expiry_date: plus(365) });
+    expectSame([ren.status, ren.j.document.handler_id], [200, A], 'a renewal keeps the same person');
+    h = covOf(await fhGet(), A);
+    expect(h.coverage.medical.verdict, 'no_copy', 'the renewed version has no scan yet — the SUPERSEDED one never counts');
+    const r = await fhPost({ action: 'create', full_name: 'Nobody Special', is_food_handler: 0, is_fostac_supervisor: 0 });
+    expect(r.status, 400, 'neither a food handler nor the supervisor is refused');
+  });
+
+  await test('FoSTaC: at least ONE certified supervisor per 25 food handlers', async () => {
+    seedUsers();
+    let j = await fhGet();
+    const S = (await fhPost({ action: 'create', full_name: 'Head Supervisor', is_fostac_supervisor: 1 })).j.handler.id;
+    j = await fhGet();
+    expectSame([j.fostac.supervisors, j.fostac.certified, j.fostac.required, j.fostac.ok], [1, 0, 1, false], 'a supervisor with no certificate → not ok');
+    await fileCert({ doc_type: 'fostac_certificate', title: 'FoSTaC Advanced — supervisor', handler_id: S, issued_on: plus(-30), expiry_date: plus(700) });
+    j = await fhGet();
+    expectSame([j.fostac.certified, j.fostac.ok], [1, true], 'one certified supervisor for up to 25 handlers → ok');
+    const n = j.totals && j.totals.active !== undefined ? j.totals.active : j.handlers.length;
+    for (let i = n; i < 26; i++) await fhPost({ action: 'create', full_name: `Handler ${String(i).padStart(2, '0')}` });
+    j = await fhGet();
+    expectSame([j.fostac.required, j.fostac.ok], [2, false], `26 food handlers need 2 certified supervisors — 1 is not enough (${j.fostac.words})`);
+  });
+
+  await test('one person, one row: LEFT keeps the row; a re-add is 409; Rejoined reactivates the SAME row', async () => {
+    seedUsers();
+    db.prepare(`INSERT INTO hr_employees (id, employee_code, full_name, status) VALUES ('fh-t-emp-1', 'T-EMP-1', 'Suresh Babu', 'active')`).run();
+    db.prepare(`INSERT INTO hr_employees (id, employee_code, full_name, status, exit_date) VALUES ('fh-t-emp-2', 'T-EMP-2', 'Gone Person', 'resigned', '2026-09-01')`).run();
+    let r = await fhPost({ action: 'import', source: 'hrms', ids: ['fh-t-emp-1', 'fh-t-emp-2'] });
+    expectSame([r.status, r.j.created.length, r.j.skipped.length], [200, 1, 1], 'import from HRMS: the active one added, the resigned one skipped');
+    const SURESH = r.j.created[0].id;
+    expect(r.j.created[0].key_kind, 'hrms', 'keyed by the HRMS employee_id');
+    r = await fhPost({ action: 'create', employee_id: 'fh-t-emp-1', full_name: 'Suresh again' });
+    expectSame([r.status, r.j.code], [409, 'already_on_register'], 'the same HR record twice');
+    r = await fhPost({ action: 'leave', id: SURESH, left_on: plus(5) });
+    expect(r.status, 400, 'a leaving date in the future');
+    r = await fhPost({ action: 'leave', id: SURESH, left_on: D_TODAY, note: 'Resigned' });
+    expectSame([r.status, r.j.handler.status], [200, 'left'], 'has left');
+    expectTrue(!covOf(await fhGet(), SURESH) && !!covOf(await fhGet('?include_left=1'), SURESH), 'off the active register, still there with include_left');
+    r = await fhPost({ action: 'create', employee_id: 'fh-t-emp-1' });
+    expectSame([r.status, r.j.code, r.j.existing_id], [409, 'left_row_exists', SURESH], 're-adding the person who left → 409 left_row_exists');
+    r = await fhPost({ action: 'rejoin', id: SURESH, note: 'Came back' });
+    expectSame([r.status, r.j.handler.id, r.j.handler.status], [200, SURESH, 'active'], 'Rejoined → the SAME row, active');
+    expect(db.prepare(`SELECT COUNT(*) AS c FROM fssai_food_handlers WHERE employee_id = 'fh-t-emp-1'`).get().c, 1, 'rows for that employee');
+    r = await fhPost({ action: 'create', full_name: 'Suresh Babu' });
+    expectTrue(r.status === 200 && (r.j.warnings || []).length > 0, `a duplicate NAME warns, never refuses (Q16): "${(r.j.warnings || [])[0]}"`);
+    expect(db.prepare(`SELECT COUNT(*) AS c FROM hr_employees`).get().c, 2, 'HRMS rows (read, never written)');
+  });
+
+  await test('a row entered by MISTAKE is voided — never by the manager who added it; the row stays', async () => {
+    seedUsers();
+    const X = (await fhPost({ action: 'create', full_name: 'Typo Persn' })).j.handler.id;
+    let r = await fhPost({ action: 'void', id: X, reason: 'Duplicate of Ravi' });
+    expectTrue(r.status === 403 && /yourself/.test(r.j.error), `the manager who added the row → ${r.status}`);
+    r = await fhPost({ action: 'void', id: X, reason: 'x' }, MANAGER2);
+    expect(r.status, 400, 'no real reason');
+    const before = count('fssai_food_handlers');
+    r = await fhPost({ action: 'void', id: X, reason: 'Entered twice — same person as Ravi' }, MANAGER2);
+    const row = db.prepare('SELECT status, voided_by, void_reason FROM fssai_food_handlers WHERE id = ?').get(X);
+    expectSame([r.status, row.status, row.voided_by, count('fssai_food_handlers')], [200, 'void', MANAGER2.email, before], 'another manager voids it; the row is kept');
+    expectTrue(auditRows('fssai_food_handlers', X, 'void').length === 1, 'one void row in fssai_audit_log');
+    r = await docPost({ action: 'create', doc_type: 'medical_fitness', title: 'Medical — typo', handler_id: X, expiry_date: plus(100) });
+    expect(r.status, 400, 'a certificate cannot be filed against a voided person');
+    const Y = (await fhPost({ action: 'create', full_name: 'Second Typo' })).j.handler.id;
+    signIn(ADMIN);
+    r = await call(VOID_ROUTE, 'POST', '/api/fssai/void', { entity_table: 'fssai_food_handlers', id: Y, reason: 'Misspelt duplicate row' });
+    expectSame([r.status, r.j.status], [200, 'void'], 'the generic /api/fssai/void handles the register too');
+  });
+
+  await test('the HRMS training link: completions joined LIVE; switching it off needs a reason; never medical', async () => {
+    seedUsers();
+    db.prepare(`INSERT INTO hr_employees (id, employee_code, full_name, status) VALUES ('fh-t-emp-3', 'T-EMP-3', 'Lakshmi P', 'active')`).run();
+    db.prepare(`INSERT INTO hr_trainings (id, name) VALUES ('fh-t-train', 'Food Safety Basics (test)')`).run();
+    db.prepare(`INSERT INTO hr_training_assignments (id, training_id, employee_id, completed_date, status) VALUES ('fh-t-ta', 'fh-t-train', 'fh-t-emp-3', ?, 'completed')`).run(plus(-30));
+    const L = (await fhPost({ action: 'import', source: 'hrms', ids: ['fh-t-emp-3'] })).j.created[0].id;
+    expect(covOf(await fhGet(), L).coverage.training.verdict, 'missing', 'before the mapping the HRMS completion does not count');
+    let r = await fhPost({ action: 'link_training', hr_training_id: 'fh-t-train', counts_as: 'food_handler_training', valid_months: 12 });
+    expectSame([r.status, r.j.link.completions], [200, 1], 'map the HRMS training');
+    const LINK = r.j.link.id;
+    const h = covOf(await fhGet(), L);
+    expectSame([h.coverage.training.in_order, h.coverage.training.best && h.coverage.training.best.source], [true, 'hrms'], 'the completion now counts as training');
+    r = await fhPost({ action: 'link_training', hr_training_id: 'fh-t-train', counts_as: 'food_handler_training' });
+    expectSame([r.status, r.j.code], [409, 'link_exists'], 'the same training mapped twice');
+    r = await fhPost({ action: 'update_link', id: LINK, counts_as: 'medical_fitness' });
+    expect(r.status, 400, 'an HRMS training can never count as a MEDICAL');
+    r = await fhPost({ action: 'update_link', id: LINK, is_active: 0 });
+    expect(r.status, 400, 'switching it off with no reason');
+    r = await fhPost({ action: 'update_link', id: LINK, is_active: 0, reason: 'HR renamed the course' });
+    expectSame([r.status, covOf(await fhGet(), L).coverage.training.verdict], [200, 'missing'], 'switched off with a reason → the completion stops counting');
+    expect(auditRows('fssai_training_links', LINK).length, 2, 'create + update on the mapping, both audited');
+    expect(db.prepare('SELECT COUNT(*) AS c FROM hr_training_assignments').get().c, 1, 'HRMS assignments (never written)');
+  });
+
+  await test('gates, the CSV (formula cells escaped) and the holder names for Inspection Mode', async () => {
+    seedUsers();
+    const R = (await fhPost({ action: 'create', full_name: 'Ravi Kumar' })).j.handler.id;
+    await fhPost({ action: 'create', full_name: '=HYPERLINK("http://x")' });
+    signIn(STAFF);
+    expect((await call(FH, 'GET', '/api/fssai/documents/food-handlers')).status, 403, 'staff GET');
+    expect((await call(FH, 'POST', '/api/fssai/documents/food-handlers', { action: 'create', full_name: 'Sneaky' })).status, 403, 'staff POST');
+    signIn(null);
+    expect((await call(FH, 'GET', '/api/fssai/documents/food-handlers')).status, 401, 'signed out');
+    signIn(MANAGER);
+    expect((await call(FH, 'POST', '/api/fssai/documents/food-handlers', { action: 'create', full_name: 'No CSRF' }, { csrf: false })).status, 403, 'no CSRF pair');
+    const csv = await call(FH, 'GET', '/api/fssai/documents/food-handlers?format=csv');
+    const lines = csv.text.split('\r\n');
+    expectTrue(csv.status === 200 && lines.some((l) => l.includes('Ravi Kumar')), 'the CSV lists the register');
+    expectTrue(lines.some((l) => l.includes(`"'=HYPERLINK`)), 'a name starting with "=" is written as text, not a formula');
+    const holders = FHL.fssaiDocumentHolders(db, [{ id: 'd1', handler_id: R, person_email: '' }]);
+    expect(holders.get('d1').label, 'Ravi Kumar (FH-0001)', 'fssaiDocumentHolders labels whose certificate it is');
+    const cov = FHL.readFssaiFoodHandlerCoverage(db, { today: D_TODAY });
+    expectTrue(cov.available && cov.not_in_order.medical.some((x) => /Ravi Kumar/.test(x.full_name || x.name || x.label || '')),
+      'readFssaiFoodHandlerCoverage (the audit file reads this) names Ravi as not in order');
+  });
+
+  /* @@NEW_SECTIONS@@ */
+
   /* ── summary ─────────────────────────────────────────────────────────────── */
   console.log(`\n${pass} passed · ${fail} failed`);
+  if (skippedSections.length) console.log(`(--only: sections ${skippedSections.join(', ')} were not run)`);
+  if (FETCH.calls.length) console.log(`network calls caught by the tripwire: ${FETCH.calls.length}`);
   if (fail) {
     console.log('failing:');
     failures.forEach((f) => console.log(`  · ${f}`));
   }
   try { db.close(); } catch { /* already closed */ }
+  if (KEEP && ROUTE_SAID.length) console.log(`\nroutes logged ${ROUTE_SAID.length} line(s):\n  ` + ROUTE_SAID.slice(0, 200).join('\n  '));
   if (KEEP) console.log(`\nscratch kept at ${TMP}`);
   else fs.rmSync(TMP, { recursive: true, force: true });
   process.exit(fail ? 1 : 0);

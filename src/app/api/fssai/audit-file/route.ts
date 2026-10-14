@@ -3,8 +3,9 @@ import { getDb } from '@/lib/db';
 import { isManagement } from '@/lib/auth';
 import { fssaiToday } from '@/lib/fssai';
 import { requireFssaiUser } from '@/lib/fssai-server';
+import { fssaiJobsAuditSummary } from '@/lib/fssai-jobs';
 import { businessName } from '../_p9/lib';
-import { buildAuditFile } from './lib';
+import { auditFileHoldsWords, buildAuditFile } from './lib';
 
 /**
  * THE ONE AUDIT FILE, AS JSON (/api/fssai/audit-file?days=7|30|90).
@@ -43,14 +44,22 @@ export async function GET(request: Request) {
     const url = new URL(request.url);
     const today = fssaiToday();
     const file = buildAuditFile(db, today, { days: Number(url.searchParams.get('days')) || undefined, rowLimit: SCREEN_ROWS });
+    // What the unattended jobs did over the same dates (missed-check bell and
+    // WhatsApp, abandoned cooling batches, the photo rule) — management
+    // reading for this page only; it never goes into a PDF. Read-only and
+    // never throws (fssai-jobs.ts); guarded anyway so it cannot cost the page.
+    let jobs: ReturnType<typeof fssaiJobsAuditSummary> | null = null;
+    try { jobs = fssaiJobsAuditSummary(db, { since: file.since, until: file.today }); } catch { jobs = null; }
     return Response.json({
       ...file,
       business_name: businessName(db),
-      /** What the handover PDF will hold: every record with something on file. */
+      /** What the handover PDF will hold: every record with something on file — the same N of 20 it prints about itself. */
       pdf: {
-        includes: file.items.filter((i) => i.held).map((i) => i.n),
-        leaves_out: file.items.filter((i) => !i.held).map((i) => i.n),
+        includes: file.handover.held,
+        leaves_out: file.handover.left_out,
+        holds_words: auditFileHoldsWords(file),
       },
+      jobs,
       generated_at: new Date().toISOString(),
     });
   } catch (e: any) {

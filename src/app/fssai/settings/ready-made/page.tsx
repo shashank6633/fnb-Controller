@@ -20,8 +20,8 @@
  *   2. They arrive as DRAFTS by default. A draft is invisible to staff
  *      (/api/fssai/templates shows a non-admin only published, active
  *      checklists), which is the reversible choice: read each one, change what
- *      you want, publish it — one at a time on its own page, or every untouched
- *      ready-made draft at once with "Publish the ready-made checklists" (never
+ *      you want, publish it — one at a time on its own page, or every ready-made
+ *      draft whose status nobody has changed at once with "Publish the ready-made checklists" (never
  *      an archived one, never one whose status a person already changed).
  *      Un-publishing fifteen that staff have already filed in is not one click.
  *   3. Several of them carry a configuration WARNING, and it is shown next to
@@ -110,7 +110,7 @@ interface SeedState {
   drafts: ReadyMadeDrafts;
 }
 
-interface DraftRow { template_id: string; code: string; name: string; question_count: number }
+interface DraftRow { template_id: string; code: string; name: string; question_count: number; edited: boolean }
 interface HeldRow { template_id: string; code: string; name: string; status: string; why: string }
 interface ReadyMadeDrafts { publishable: DraftRow[]; held: HeldRow[]; published: number }
 
@@ -192,8 +192,8 @@ export default function FssaiReadyMadeChecklistsPage() {
       const j = await apiJson<StateResponse>('/api/fssai/seed');
       setData(j);
       setForbidden(false);
-    } catch (e: any) {
-      const m = String(e?.message || '');
+    } catch (e: unknown) {
+      const m = String((e as Error)?.message || '');
       // A 403 is a normal outcome on an admin-only screen, not an error state:
       // the catalog's tier flag is visibility only and the route is the gate.
       if (/administrator/i.test(m) || /Sign in required/i.test(m)) setForbidden(true);
@@ -246,8 +246,8 @@ export default function FssaiReadyMadeChecklistsPage() {
         `${j.inserted} checklist${j.inserted === 1 ? '' : 's'} created as ${j.status === 'published' ? 'published' : 'drafts'}` +
         (j.skipped ? `, ${j.skipped} left alone` : ''),
       );
-    } catch (e: any) {
-      setErr(String(e?.message || 'Could not set the checklists up.'));
+    } catch (e: unknown) {
+      setErr(String((e as Error)?.message || 'Could not set the checklists up.'));
       setConfirming(false);
       void load();
     } finally {
@@ -255,7 +255,7 @@ export default function FssaiReadyMadeChecklistsPage() {
     }
   }, [publish, deptByCode, load]);
 
-  /** ONE CLICK: every untouched ready-made draft goes live. The route says what it left alone and why. */
+  /** ONE CLICK: every ready-made draft whose status nobody has changed goes live. The route says what it left alone and why. */
   const publishAll = useCallback(async () => {
     setPublishing(true);
     setErr('');
@@ -267,8 +267,8 @@ export default function FssaiReadyMadeChecklistsPage() {
         `${j.published.length} checklist${j.published.length === 1 ? '' : 's'} published — staff can run ` +
         `${j.published.length === 1 ? 'it' : 'them'} now` + (j.held.length ? `, ${j.held.length} left alone` : ''),
       );
-    } catch (e: any) {
-      setErr(String(e?.message || 'Could not publish the ready-made checklists.'));
+    } catch (e: unknown) {
+      setErr(String((e as Error)?.message || 'Could not publish the ready-made checklists.'));
       void load();
     } finally {
       setPublishing(false);
@@ -424,7 +424,7 @@ export default function FssaiReadyMadeChecklistsPage() {
           </div>
         )}
 
-        {/* ONE CLICK — publish every untouched ready-made draft. The pack adds them
+        {/* ONE CLICK — publish every ready-made draft whose status nobody has changed. The pack adds them
             as drafts and a draft cannot be run; this is the button that makes
             them runnable without opening fifteen pages. */}
         {state && (state.drafts.publishable.length > 0 || published || state.drafts.held.length > 0) && (
@@ -435,9 +435,9 @@ export default function FssaiReadyMadeChecklistsPage() {
                 <p className="font-bold text-[#af4408]">Publish the ready-made checklists</p>
                 <p className="text-sm text-[#6B5744] mt-1">
                   They were added as drafts, and staff cannot see or run a draft. One click publishes every ready-made
-                  draft nobody has touched, so staff can run them straight away. Nothing else about them changes — not
-                  a question, not a range. A checklist you archived, or whose status you already changed yourself, is
-                  left alone.
+                  draft listed below, so staff can run them straight away — as they are now, including any change you
+                  made in the builder. Nothing else about them changes — not a question, not a range. A checklist you
+                  archived, or one you already published or took back yourself, is left alone.
                   {state.drafts.published ? ` ${state.drafts.published} already published.` : ''}
                 </p>
               </div>
@@ -447,7 +447,12 @@ export default function FssaiReadyMadeChecklistsPage() {
               <>
                 <ul className="text-xs text-[#6B5744] space-y-0.5 pl-8">
                   {state.drafts.publishable.map((d) => (
-                    <li key={d.template_id}>{d.name} · {d.question_count} questions</li>
+                    <li key={d.template_id}>
+                      {d.name} · {d.question_count} questions
+                      {d.edited && (
+                        <span className="text-amber-800"> · changed in the builder since it was added — it is published as you left it</span>
+                      )}
+                    </li>
                   ))}
                 </ul>
                 <div className="pl-8">
@@ -611,7 +616,8 @@ export default function FssaiReadyMadeChecklistsPage() {
                   <span className="min-w-0">
                     <span className="font-semibold">Published straight away</span>
                     <span className="block text-xs text-[#6B5744]">
-                      Staff can run all fifteen immediately, with the standard FSSAI ranges exactly as written here.
+                      Staff can run {willCreate.length === state.counts.templates ? `all ${willCreate.length}` : 'them'}{' '}
+                      immediately, with the standard FSSAI ranges exactly as written here.
                     </span>
                   </span>
                 </label>
@@ -623,8 +629,8 @@ export default function FssaiReadyMadeChecklistsPage() {
                 <Info className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
                 <p className="text-xs text-amber-900 min-w-0">
                   This can only be done once. Nothing sets a rota — no checklist becomes &ldquo;due&rdquo; until you add
-                  it to the schedule yourself, so nobody is marked late for a check nobody asked them to do. The fifteen
-                  are added to your own library and are yours to change after that.
+                  it to the schedule yourself, so nobody is marked late for a check nobody asked them to do. They are
+                  added to your own library and are yours to change after that.
                 </p>
               </div>
             </div>

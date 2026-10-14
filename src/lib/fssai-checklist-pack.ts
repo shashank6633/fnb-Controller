@@ -45,7 +45,7 @@
  *     says who owes it and when, and that needs a person or a role. Roles and
  *     departments are the owner's (HARD RULE 4), and seeding a rota would start
  *     generating "overdue" against staff nobody rostered. The pack seeds the
- *     twelve checklists; the owner builds the rota.
+ *     fifteen checklists; the owner builds the rota.
  *   · **No department.** Live department names are messy ("Akan  Indian",
  *     "Akan Main Kitchen") and matching on a name is forbidden (RECON §5 row 5:
  *     match on id). So `department_id` is '' — restaurant-wide — unless the
@@ -57,7 +57,7 @@
  *     from a register, and `fssai_equipment` holds 0 rows — a seeded
  *     cold-room-targeted checklist would be impossible to start on the phone
  *     (runs/route.ts:381 refuses a non-'none' kind with no `target_id`). Every
- *     one of the twelve is runnable the moment it is published. The owner can
+ *     one of the fifteen is runnable the moment it is published. The owner can
  *     change a template to per-cold-room in the builder once the equipment
  *     register has rows.
  *   · **No `photo_rule: 'always'` on a non-photo question.** That rule makes an
@@ -74,6 +74,7 @@ import {
   isFssaiFrequency,
   isFssaiTargetKind,
   FSSAI_MODULE_KEYS,
+  FSSAI_EVIDENCE_MAX_PER_RUN,
   type FssaiQuestionInput,
   type FssaiQuestionNormalized,
 } from './fssai';
@@ -823,10 +824,23 @@ const T_SAFE_MONTHLY: PackTemplate = {
  *     Preparation lines the twelve already treat as critical.
  *   · A PHOTOGRAPH IS DEMANDED ON A NO WHEREVER A PICTURE CAN SHOW THE FAILURE —
  *     on every line that names a thing you can point a camera at (a floor, a
- *     bin, a container, a light fitting, a toilet, a cockroach). It is NOT
- *     demanded where a NO is a missing document or record (`noPhoto`), and never
+ *     bin, a container, a light fitting, a toilet, a cockroach), critical or
+ *     not. It is NOT demanded (`noPhoto`) where a NO is a missing document or
+ *     record, where the line is about how OFTEN something happens ("cleaned
+ *     regularly", "removed periodically" — one photograph shows one moment), or
+ *     where it is about what a thing is MADE of ("food-safe", "non-toxic",
+ *     "food-grade packaging" — the supplier's declaration proves that); and never
  *     in Personal Hygiene or for a handler's own hands, where it would be a
- *     photograph of a person. 66 of the 99 lines take one.
+ *     photograph of a person. Staff can still add a photograph to ANY answer; the
+ *     rule only says where one is demanded. 61 of the 99 lines demand one:
+ *     22 + 15 + 24.
+ *   · ⚠️ NO PAGE MAY DEMAND MORE PHOTOGRAPHS THAN ONE ROUND CAN HOLD. The
+ *     evidence route refuses the 25th photograph on a round
+ *     (FSSAI_EVIDENCE_MAX_PER_RUN = 24), and the submit gate refuses a NO that
+ *     is owed one — so a page with 29 photo lines (CHECKLIST 3 as first built)
+ *     could not be submitted on a day 25 of them failed, and staff would be
+ *     pushed to answer YES to get it filed. Measured 2026-10-14. The validator
+ *     now refuses any checklist that can demand more than the cap.
  *
  * A line the authority lists under a lead-in ("Maintain a temperature
  * monitoring sheet for:" → "Receiving") is asked as lead-in + line, because
@@ -1112,17 +1126,17 @@ const HYD_PAGE_3: HydPage = {
     {
       code: 'WASTE', heading: 'Waste Management',
       description:
-        'Look at the kitchen bins and the waste area outside. On a NO, photograph what you saw (not needed for missing ' +
-        'oil-disposal records).',
+        'Look at the kitchen bins and the waste area outside. On a NO, photograph what you saw. Not demanded for ' +
+        'how OFTEN something happens (cleaned regularly, removed periodically — the cleaning and waste records show ' +
+        'that) or for missing oil-disposal records; you can still add one to any answer.',
       lines: [
         { words: 'Separate wet/dry waste as applicable', na: true },
-        ...lines([
-          'Bins have lids',
-          'Bins are cleaned regularly',
-          'Waste removed from kitchen periodically',
-          'No overflowing bins',
-          'Waste area kept clean',
-        ]),
+        { words: 'Bins have lids' },
+        // How often: a photograph shows one moment. The visible state is photographed on the bin lines below.
+        { words: 'Bins are cleaned regularly', noPhoto: true },
+        { words: 'Waste removed from kitchen periodically', noPhoto: true },
+        { words: 'No overflowing bins' },
+        { words: 'Waste area kept clean' },
         { words: 'Used oil disposal records maintained', noPhoto: true },
         { words: 'No food waste accumulated near preparation areas' },
       ],
@@ -1131,16 +1145,19 @@ const HYD_PAGE_3: HydPage = {
       code: 'EQUIPMENT', heading: 'Food-Grade Equipment & Packaging',
       description:
         'Anything that touches food — utensils, boards, containers, and the packaging it leaves in. On a NO, ' +
-        'photograph the item.',
-      lines: lines([
-        'Food-contact equipment is food-safe',
-        'Containers are non-toxic and easy to clean',
-        'No rusted/damaged food-contact equipment',
-        'Food-grade storage containers',
-        'Food-grade packaging for delivery',
-        'No newspaper used for food wrapping',
-        'Packaging properly stored',
-      ]),
+        'photograph the item. Not demanded where the line is about what something is MADE of (food-safe, non-toxic, ' +
+        'food-grade packaging) — the supplier’s declaration under Documents & Certificates is the proof of that; ' +
+        'you can still add one to any answer.',
+      lines: [
+        // What it is made of: proved by the supplier's declaration, not by a picture.
+        { words: 'Food-contact equipment is food-safe', noPhoto: true },
+        { words: 'Containers are non-toxic and easy to clean', noPhoto: true },
+        { words: 'No rusted/damaged food-contact equipment' },
+        { words: 'Food-grade storage containers' },
+        { words: 'Food-grade packaging for delivery', noPhoto: true },
+        { words: 'No newspaper used for food wrapping' },
+        { words: 'Packaging properly stored' },
+      ],
     },
   ],
 };
@@ -1298,6 +1315,120 @@ export function fssaiHydLineForQuestion(templateCode: string, questionCode: stri
   return null;
 }
 
+/* ------------------------------------------------------------------ *
+ * For the audit file, Inspection Mode and the reports
+ * ------------------------------------------------------------------ */
+
+/** fssai_templates.category the pack gives the authority's three audit pages. */
+export const FSSAI_HYD_AUDIT_CATEGORY: string = HYD_CATEGORY;
+
+/** The three audit pages' checklist codes, in page order. */
+export const FSSAI_HYD_AUDIT_CODES: readonly string[] = HYD_PAGES.map((p) => p.head.code);
+
+/**
+ * A SQL condition that is TRUE for an `fssai_templates` row that is one of the
+ * authority's three audit pages — so a reader can leave them OUT of a record
+ * they are not. Measured 2026-10-14: the audit file's "Pest-control monitoring
+ * sheet" counted a monthly CHECKLIST 3 self-audit as the daily pest sheet,
+ * because that page has a section called PEST.
+ *
+ * Three ways to be one, any of them enough, because the owner can change the
+ * code and the category in the builder:
+ *   · the pack created it from a CHK-HYD-AUDIT code (fssai_seed_log — kept for
+ *     ever, and it survives a rename);
+ *   · its code is one of FSSAI_HYD_AUDIT_CODES;
+ *   · its category is FSSAI_HYD_AUDIT_CATEGORY.
+ * Every literal in it comes from this file — nothing from a request.
+ *
+ *   `... WHERE ${PEST_WHERE} AND NOT ${fssaiHydAuditTemplateSql('t')}`
+ */
+export function fssaiHydAuditTemplateSql(alias = 't'): string {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(alias)) throw new Error(`"${alias}" is not a table alias.`);
+  const q = (s: string) => `'${s.replace(/'/g, "''")}'`;
+  const codes = FSSAI_HYD_AUDIT_CODES.map(q).join(', ');
+  return (
+    `(${alias}.code IN (${codes}) OR ${alias}.category = ${q(FSSAI_HYD_AUDIT_CATEGORY)} OR ${alias}.id IN (` +
+    `SELECT item_id FROM fssai_seed_log WHERE pack_key = ${q(FSSAI_CHECKLIST_PACK.key)} AND item_kind = 'template' ` +
+    `AND action = 'inserted' AND item_code IN (${codes})))`
+  );
+}
+
+/** One answer as fssai_responses froze it — keyed by its question's code. */
+export interface HydAnswer {
+  /** fssai_responses.value_bool: 1 = YES, 0 = NO, null = not answered. */
+  value_bool: number | null;
+  /** fssai_responses.is_na. */
+  is_na?: number;
+  /** fssai_responses.note — the REMARK column. */
+  note?: string;
+}
+
+export interface HydAnswerSheetRow extends HydWorkbookRow {
+  /** On a 'line' only: what goes in the authority's YES / NO columns ('N/A' when it was marked not applicable). */
+  mark?: 'YES' | 'NO' | 'N/A' | '';
+  /** On a 'line' only: the REMARK column. */
+  remark?: string;
+}
+
+export interface HydAnswerSheet {
+  /** The tab name, exactly ("CHECKLIST 2"). */
+  sheet: string;
+  template_code: string;
+  columns: readonly string[];
+  /** Every row of the authority's page, in its order — headings, lead-ins, the sub-heading and the lines. */
+  rows: HydAnswerSheetRow[];
+  counts: { lines: number; yes: number; no: number; na: number; unanswered: number };
+  /** Answers to questions that are NOT a line of the page (one the owner added in the builder), so none is lost. */
+  extra: { question_code: string; mark: 'YES' | 'NO' | 'N/A' | ''; remark: string }[];
+}
+
+function hydMark(a: HydAnswer | undefined): 'YES' | 'NO' | 'N/A' | '' {
+  if (!a) return '';
+  if (Number(a.is_na) === 1) return 'N/A';
+  if (a.value_bool === null || a.value_bool === undefined) return '';
+  return Number(a.value_bool) === 1 ? 'YES' : 'NO';
+}
+
+/**
+ * A submitted round of CHK-HYD-AUDIT-k laid back onto the authority's own page —
+ * the same rows, words and order as the .xlsx, with YES / NO / REMARK filled in —
+ * so the audit file, Inspection Mode or a report can print the self-audit
+ * exactly as the inspector's sheet looks. Pure: the caller reads the run's
+ * fssai_responses, maps each to its question's code, and passes them in.
+ *
+ * Null when the code is not one of the three pages. A question code that is not
+ * a line of the page goes to `extra` rather than vanishing.
+ */
+export function fssaiHydAnswerSheet(
+  templateCode: string,
+  answers: Record<string, HydAnswer> | Map<string, HydAnswer>,
+): HydAnswerSheet | null {
+  const sheet = FSSAI_HYD_WORKBOOK.slice(1).find((s) => s.template_code === templateCode);
+  if (!sheet) return null;
+  const get = (code: string): HydAnswer | undefined =>
+    answers instanceof Map ? answers.get(code) : (answers as Record<string, HydAnswer>)[code];
+  const counts = { lines: 0, yes: 0, no: 0, na: 0, unanswered: 0 };
+  const onPage = new Set<string>();
+  const rows: HydAnswerSheetRow[] = sheet.rows.map((r) => {
+    if (r.kind !== 'line') return { ...r };
+    counts.lines++;
+    onPage.add(String(r.question_code));
+    const a = get(String(r.question_code));
+    const mark = hydMark(a);
+    if (mark === 'YES') counts.yes++;
+    else if (mark === 'NO') counts.no++;
+    else if (mark === 'N/A') counts.na++;
+    else counts.unanswered++;
+    return { ...r, mark, remark: String(a?.note || '') };
+  });
+  const keys = answers instanceof Map ? Array.from(answers.keys()) : Object.keys(answers);
+  const extra = keys
+    .filter((k) => !onPage.has(k))
+    .sort()
+    .map((k) => ({ question_code: k, mark: hydMark(get(k)), remark: String(get(k)?.note || '') }));
+  return { sheet: sheet.name, template_code: templateCode, columns: sheet.columns, rows, counts, extra };
+}
+
 const T_HYD_AUDIT_1: PackTemplate = hydTemplate(HYD_PAGE_1);
 const T_HYD_AUDIT_2: PackTemplate = hydTemplate(HYD_PAGE_2);
 const T_HYD_AUDIT_3: PackTemplate = hydTemplate(HYD_PAGE_3);
@@ -1399,6 +1530,8 @@ export interface PackValidation {
  *   · a question pointing at a section that is not in its template;
  *   · a `photo_rule: 'always'` on a REQUIRED non-photo question, which would
  *     make the round unsubmittable without a camera;
+ *   · a checklist that can demand more photographs than one round can hold
+ *     (FSSAI_EVIDENCE_MAX_PER_RUN), which a bad enough day makes unsubmittable;
  *   · a Hyderabad audit page that no longer matches the authority's workbook
  *     (FSSAI_HYD_WORKBOOK) — headings, line order, words or photo rule.
  */
@@ -1476,6 +1609,22 @@ export function validateFssaiChecklistPack(pack: ChecklistPack = FSSAI_CHECKLIST
       validated.push({ code: q.code, section: q.section || '', value: v.value });
     }
     templates.push({ template: t, questions: validated });
+
+    /* NO CHECKLIST MAY DEMAND MORE PHOTOGRAPHS THAN ONE ROUND CAN HOLD. Every
+     * 'on_fail' line owes one photograph on a fail and every 'always' line owes
+     * one regardless; the evidence route refuses the photograph after
+     * FSSAI_EVIDENCE_MAX_PER_RUN, and the submit gate refuses an answer still
+     * owed one. Over the cap, a round on a bad enough day can never be filed —
+     * and the only way out is a false YES. */
+    const photoOwed = validated.filter((vq) => vq.value.photo_rule === 'on_fail' || vq.value.photo_rule === 'always').length;
+    if (photoOwed > FSSAI_EVIDENCE_MAX_PER_RUN) {
+      problems.push({
+        template_code: where, item: 'photographs',
+        problem:
+          `${photoOwed} questions can each demand a photograph, but one round can hold only ${FSSAI_EVIDENCE_MAX_PER_RUN}. ` +
+          `On a day more than ${FSSAI_EVIDENCE_MAX_PER_RUN} of them fail, the round could never be submitted.`,
+      });
+    }
 
     /* THE AUTHORITY'S PAGES MAY NOT DRIFT. A checklist carrying a CHK-HYD-AUDIT
      * code must still be its page of the workbook: the headings as sections in

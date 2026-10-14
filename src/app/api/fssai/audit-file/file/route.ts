@@ -20,6 +20,11 @@ import { AUDIT_FILE_SCAN_TABLES, decodeImageDataUri } from '../scans';
  * FSSAI upload path accepts — the Content-Type comes from that allowlist, never
  * from the stored string as-is, and nosniff stops a browser second-guessing it.
  * Read-only.
+ *
+ * A VOIDED file is still served (void, never delete: the row and its image are
+ * the record of the mistake, and the page lists it as VOID with its reason),
+ * marked by an X-FSSAI-Status: void header. It is never counted or printed as
+ * a copy — that is buildAuditFile's split and loadScanImages' second gate.
  */
 export const dynamic = 'force-dynamic';
 
@@ -38,7 +43,7 @@ export async function GET(request: Request) {
       return Response.json({ error: 'There are no files in this copy of the database yet.' }, { status: 404 });
     }
     const row = db.prepare(
-      `SELECT id, entity_table, mime, filename, data_uri, image_dropped_at FROM fssai_attachments WHERE id = ?`,
+      `SELECT id, entity_table, mime, filename, data_uri, image_dropped_at, status FROM fssai_attachments WHERE id = ?`,
     ).get(id) as any;
     if (!row || !AUDIT_FILE_SCAN_TABLES.includes(String(row.entity_table))) {
       return Response.json({ error: 'That file is not part of the audit file.' }, { status: 404 });
@@ -63,6 +68,7 @@ export async function GET(request: Request) {
         'Content-Disposition': `inline; filename="${safeName}"`,
         'X-Content-Type-Options': 'nosniff',
         'Cache-Control': 'private, no-store',
+        'X-FSSAI-Status': str(row.status) === 'void' ? 'void' : 'active',
       },
     });
   } catch (e: any) {

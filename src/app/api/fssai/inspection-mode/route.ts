@@ -4,6 +4,13 @@ import { getCurrentOutletId, isManagement } from '@/lib/auth';
 import { addDaysISO, fssaiDocState, fssaiDocType, fssaiToday, fssaiTempLogKindLabel } from '@/lib/fssai';
 import { requireFssaiUser, fssaiCsrfGuard, fssaiAuditBestEffort, fssaiAppAudit, str } from '@/lib/fssai-server';
 import { businessName, fssaiTablesPresent, intOr, numOrBlank } from '../_p9/lib';
+import { fssaiDocumentHolders, readFssaiFoodHandlerCoverage } from '@/lib/fssai-food-handlers';
+import { fssaiReadingScheduleValue, fssaiTempMinutesWords, fssaiTempVerdictWord } from '../_p4/lib';
+import { readPestChemicals } from '../pest/_pest/chemicals';
+import { readPestMonitoringSheet } from '../pest/_pest/monitoring';
+import { wasteCollectorText, wasteHandoverAuditPart } from '../_waste/lib';
+import { readFssaiVisitClosureEvidence, type FssaiVisitClosureEvidence } from '../_closure/lib';
+import { AUDIT_FILE_DAY_CHOICES, auditFileHoldsWords, buildAuditFile } from '../audit-file/lib';
 
 /**
  * INSPECTION MODE (/api/fssai/inspection-mode) — owner §16.
@@ -53,6 +60,24 @@ import { businessName, fssaiTablesPresent, intOr, numOrBlank } from '../_p9/lib'
  * MANAGEMENT ONLY (page-catalog mgmtOnly). A manager must be able to open it
  * during a visit, so it is not admin-only; an outsider must never be handed an
  * editable screen, so it is not open to everyone.
+ *
+ * ── 2026-10-14: WHAT THE HYDERABAD AUTHORITY'S CHECKLIST ASKS TO SEE ────────
+ *   · `audit_file` — how many of the authority's 20 records the audit-file PDF
+ *     (the button on the handover view) contains, from the same buildAuditFile
+ *     the PDF is drawn from. The handover button says "N of 20"; which ones
+ *     are left out, and why, is in `audit_file.left_out` — management's half.
+ *   · self_audit — the authority's own three checklist pages with the last
+ *     round's YES / NO / REMARK on every line: the PASSING answers, which no
+ *     other section shows.
+ *   · food_handlers — the register's people with their certificates in order
+ *     (whose certificate, by name); the names NOT in order go to prepare only.
+ *   · pest_checks — the station-by-station monitoring sheet; waste — the
+ *     handover log; pest visits carry the chemicals applied; previous visits
+ *     carry their live report copies and closure photographs.
+ *   · documents name whose certificate it is (fssaiDocumentHolders) and count
+ *     only LIVE copies (a voided scan is never a copy).
+ *   · temperature rows carry the verdict word and the minutes from _p4/lib —
+ *     a pot still cooling reads "On schedule", a minute-0 reading "0 of 240".
  */
 export const dynamic = 'force-dynamic';
 
@@ -124,17 +149,31 @@ export async function GET(request: Request) {
       sections.push(notAvailable('documents', 'Licence and certificates', 'The licences, certificates and reports held on file.', NOT_IN_DB));
     } else {
       try {
+        const hasHandler = !!db.prepare(`SELECT 1 FROM pragma_table_xinfo('fssai_documents') WHERE name = 'handler_id'`).get();
         const rows = db.prepare(
-          `SELECT id, doc_code, doc_type, title, reference_no, issuer, issued_on, valid_from,
-                  expiry_date, reminder_days, person_email, vendor_id
-             FROM fssai_documents
-            WHERE status <> 'void' AND is_active = 1
-            ORDER BY (CASE WHEN expiry_date = '' THEN 1 ELSE 0 END) ASC, expiry_date ASC`,
+          `SELECT d.id, d.doc_code, d.doc_type, d.title, d.reference_no, d.issuer, d.issued_on, d.valid_from,
+                  d.expiry_date, d.reminder_days, d.person_email, d.vendor_id, d.equipment_id,
+                  ${hasHandler ? 'd.handler_id' : `''`} AS handler_id,
+                  (SELECT v.name FROM vendors v WHERE v.id = d.vendor_id) AS vendor_name,
+                  ${present.has('fssai_equipment') ? '(SELECT e.name FROM fssai_equipment e WHERE e.id = d.equipment_id)' : `''`} AS equipment_name,
+                  ${present.has('fssai_attachments')
+                    ? `(SELECT COUNT(*) FROM fssai_attachments a WHERE a.entity_table = 'fssai_documents' AND a.entity_id = d.id
+                         AND a.data_uri <> '' AND a.status <> 'void')`
+                    : '0'} AS copies
+             FROM fssai_documents d
+            WHERE d.status <> 'void' AND d.is_active = 1
+            ORDER BY (CASE WHEN d.expiry_date = '' THEN 1 ELSE 0 END) ASC, d.expiry_date ASC`,
         ).all() as any[];
+        // WHOSE certificate — the food-handler register first (a cook with no
+        // login has a name only there), then the login. Person scope only.
+        const holders = fssaiDocumentHolders(db, rows
+          .filter((r) => fssaiDocType(r.doc_type)?.scope === 'person')
+          .map((r) => ({ id: String(r.id), handler_id: r.handler_id, person_email: r.person_email })));
         let valid = 0; let expiring = 0; let expired = 0;
         const shaped = rows.map((r) => {
           const state = fssaiDocState(r.expiry_date, today, intOr(r.reminder_days, 30));
           if (state === 'expired') expired++; else if (state === 'expiring') expiring++; else valid++;
+          const scope = fssaiDocType(r.doc_type)?.scope || 'outlet';
           return {
             id: String(r.id),
             type_label: fssaiDocType(r.doc_type)?.label || String(r.doc_type || ''),
@@ -144,6 +183,13 @@ export async function GET(request: Request) {
             issued_on: String(r.issued_on || ''),
             expiry_date: String(r.expiry_date || ''),
             state,
+            /** Whose it is: the person, the supplier or the unit. '' for the outlet's own papers. */
+            holder: scope === 'person'
+              ? (holders.get(String(r.id))?.label || String(r.person_email || ''))
+              : scope === 'vendor' ? String(r.vendor_name || '')
+                : scope === 'equipment' ? String(r.equipment_name || '') : '',
+            /** Live copies (scans) on file — a voided scan is never one. */
+            copies: intOr(r.copies),
           };
         });
         sections.push({
@@ -236,10 +282,12 @@ export async function GET(request: Request) {
              FROM fssai_temperature_logs
             WHERE status <> 'void' AND business_date >= ? AND business_date <= ?`,
         ).get(since, today) as any;
+        const hasCurve = !!db.prepare(`SELECT 1 FROM pragma_table_xinfo('fssai_temperature_logs') WHERE name = 'curve_start_source'`).get();
         const rows = db.prepare(
           `SELECT id, business_date, reading_at, log_kind, equipment_label, area_label, item_label,
-                  value_num, uom, decimals, min_used, max_used, is_fail, is_judged, action_taken,
-                  recorded_name, recorded_by
+                  value_num, uom, decimals, min_used, max_used, target_used, is_fail, is_judged, action_taken,
+                  recorded_name, recorded_by, elapsed_minutes, max_minutes_used
+                  ${hasCurve ? ', curve_start_used, curve_start_minute, curve_start_source' : ''}
              FROM fssai_temperature_logs
             WHERE status <> 'void' AND business_date >= ? AND business_date <= ?
             ORDER BY business_date DESC, reading_at DESC LIMIT ?`,
@@ -267,6 +315,12 @@ export async function GET(request: Request) {
             max_used: r.max_used === null || r.max_used === undefined ? null : Number(r.max_used),
             is_fail: intOr(r.is_fail),
             is_judged: intOr(r.is_judged, 1),
+            /** The same word Reports and the audit-file PDF print: 'On schedule' for a pot still cooling. */
+            verdict: fssaiTempVerdictWord(r),
+            /** "60 of 240" on a cooling or reheating batch; "0 of 240" at its start; '' otherwise. */
+            minutes: fssaiTempMinutesWords(r),
+            /** Where the schedule said it had to be by that minute ('' when not a curve reading). */
+            needed_by_then: (() => { const v = fssaiReadingScheduleValue(r); return v === null || !Number.isFinite(v) ? '' : Number(v).toFixed(1); })(),
             action_taken: String(r.action_taken || ''),
             by: String(r.recorded_name || r.recorded_by || ''),
           })),
@@ -340,7 +394,8 @@ export async function GET(request: Request) {
       try {
         const rows = db.prepare(
           `SELECT id, service_no, business_date, vendor_name, agency_licence_no, technician_name,
-                  service_kind, areas_covered, findings, recommendations, next_due_date, status, staff_witness
+                  service_kind, areas_covered, findings, recommendations, next_due_date, status, staff_witness,
+                  report_no, chemicals_json
              FROM fssai_pest_services
             WHERE status <> 'void'
             ORDER BY business_date DESC LIMIT 12`,
@@ -352,6 +407,8 @@ export async function GET(request: Request) {
             ).get(since) as any)
           : { n: 0, open: 0 };
         const next = rows.find((r) => String(r.next_due_date || ''));
+        const chem = (r: any) => readPestChemicals(r.chemicals_json);
+        const unrecorded = rows.filter((r) => String(r.status) === 'completed' && chem(r).state === 'not_recorded').length;
         sections.push({
           key: 'pest',
           title: 'Pest control',
@@ -376,10 +433,20 @@ export async function GET(request: Request) {
             next_due_date: String(r.next_due_date || ''),
             status: String(r.status || ''),
             staff_witness: String(r.staff_witness || ''),
+            report_no: String(r.report_no || ''),
+            /** What was applied (#78), read so that '[]' is "not recorded", never "none". */
+            chemicals_state: chem(r).state,
+            chemicals_none_note: chem(r).none_note,
+            chemicals: chem(r).rows,
           })),
-          prepare_note: intOr(sightings?.open)
-            ? `${intOr(sightings?.open)} pest sighting${intOr(sightings?.open) === 1 ? '' : 's'} reported in this period ${intOr(sightings?.open) === 1 ? 'is' : 'are'} still open.`
-            : '',
+          prepare_note: [
+            intOr(sightings?.open)
+              ? `${intOr(sightings?.open)} pest sighting${intOr(sightings?.open) === 1 ? '' : 's'} reported in this period ${intOr(sightings?.open) === 1 ? 'is' : 'are'} still open.`
+              : '',
+            unrecorded
+              ? `${unrecorded} completed visit${unrecorded === 1 ? ' does' : 's do'} not say which chemicals were applied — the handover will show "not recorded" on ${unrecorded === 1 ? 'it' : 'them'}. Copy them in from the job sheet on Pest Control Logs.`
+              : '',
+          ].filter(Boolean).join(' '),
         });
       } catch (e: any) {
         console.error('[fssai/inspection-mode] pest failed:', e?.message);
@@ -496,6 +563,9 @@ export async function GET(request: Request) {
              FROM fssai_inspections WHERE status <> 'void'
             ORDER BY business_date DESC LIMIT 12`,
         ).all() as any[];
+        const ev = present.has('fssai_attachments')
+          ? readFssaiVisitClosureEvidence(db, rows.map((r) => String(r.id)))
+          : new Map<string, FssaiVisitClosureEvidence>();
         sections.push({
           key: 'inspections',
           title: 'Previous visits',
@@ -519,6 +589,11 @@ export async function GET(request: Request) {
             finding_count: intOr(r.finding_count),
             open_count: intOr(r.open_count),
             status: String(r.status || ''),
+            /** Live copies of their report on file (a voided page never counts). */
+            report_copies: ev.get(String(r.id))?.counts.report_copies ?? 0,
+            /** Points closed, and how many of those carry a live photograph of the fix. */
+            settled: ev.get(String(r.id))?.counts.settled ?? 0,
+            settled_with_photo: ev.get(String(r.id))?.counts.settled_with_photo ?? 0,
           })),
           prepare_note: '',
         });
@@ -527,6 +602,178 @@ export async function GET(request: Request) {
         sections.push(notAvailable('inspections', 'Previous visits', 'Earlier inspections and how each point was closed.', 'This section could not be read.'));
       }
     }
+
+    /* ══ 9. THE FOOD HANDLERS — whose certificates, by name ═════════════════
+     * The handover lists the people whose certificates are in order; the
+     * names that are not go to `prepare` (Q11) — never on the officer's screen. */
+    if (!present.has('fssai_food_handlers') || !present.has('fssai_documents')) {
+      sections.push(notAvailable('food_handlers', 'Food handlers and their certificates', 'Food handlers on the register and their medical and training certificates.', NOT_IN_DB));
+    } else {
+      try {
+        const cov = readFssaiFoodHandlerCoverage(db, { today });
+        const handlers = cov.handlers.filter((h) => h.status === 'active' && h.is_food_handler);
+        const ok = handlers.filter((h) => h.in_order);
+        const notOk = handlers.filter((h) => !h.in_order);
+        const cell = (c: { required: boolean; verdict_label: string; best: { expiry_date: string; type_label: string; reference_no: string } | null }) => ({
+          verdict: c.required ? c.verdict_label : 'Not required',
+          until: c.best?.expiry_date || '',
+          certificate: c.best ? [c.best.type_label, c.best.reference_no].filter(Boolean).join(' · ') : '',
+        });
+        sections.push({
+          key: 'food_handlers',
+          title: 'Food handlers and their certificates',
+          lead: notOk.length
+            ? 'Food handlers on the register whose medical fitness and food-safety training certificates are in order, each by name.'
+            : 'Every food handler on the register, by name, with their medical fitness and food-safety training certificates.',
+          available: true,
+          summary: [
+            { label: 'Food handlers shown', value: String(ok.length) },
+            ...(cov.fostac.ok ? [{ label: 'FoSTaC supervisors certified', value: String(cov.fostac.certified) }] : []),
+          ],
+          rows: ok.map((h) => ({
+            id: h.id,
+            name: h.full_name,
+            handler_no: h.handler_no,
+            designation: h.designation,
+            department_name: h.department_name,
+            medical: cell(h.coverage.medical),
+            training: cell(h.coverage.training),
+            fostac: h.coverage.fostac.required ? cell(h.coverage.fostac) : null,
+          })),
+          prepare_note: [
+            notOk.length
+              ? `${notOk.length} food handler${notOk.length === 1 ? ' is' : 's are'} left off the handover because a certificate is not in order: ` +
+                notOk.map((h) => `${h.full_name}${h.handler_no ? ` (${h.handler_no})` : ''} — ${h.problems.join(', ')}`).join('; ') + '.'
+              : '',
+            !handlers.length ? 'Nobody is marked a food handler on the register yet (Food Handlers).' : '',
+            !cov.fostac.ok ? `FoSTaC: ${cov.fostac.words}` : '',
+          ].filter(Boolean).join(' '),
+        });
+      } catch (e: any) {
+        console.error('[fssai/inspection-mode] food_handlers failed:', e?.message);
+        sections.push(notAvailable('food_handlers', 'Food handlers and their certificates', 'Food handlers on the register.', 'This section could not be read.'));
+      }
+    }
+
+    /* ══ 10. THE AUTHORITY'S OWN CHECKLIST PAGES, ANSWERED ═══════════════════
+     * The last round of each of the three Hyderabad pages, line by line, YES /
+     * NO / REMARK — the passing answers, which nothing else here shows. A page
+     * never run is simply not in the handover; prepare says so. */
+    let auditFile: ReturnType<typeof buildAuditFile> | null = null;
+    const afDays = days <= 7 ? 7 : days <= 30 ? 30 : 90;
+    try {
+      auditFile = buildAuditFile(db, today, { days: (AUDIT_FILE_DAY_CHOICES as readonly number[]).includes(afDays) ? afDays : 30, rowLimit: 1 });
+    } catch (e: any) {
+      console.error('[fssai/inspection-mode] audit file failed:', e?.message);
+      auditFile = null;
+    }
+    if (!auditFile) {
+      sections.push(notAvailable('self_audit', "The authority's checklist, answered", 'The last self-audit on each page of the authority\'s checklist.', 'This section could not be read.'));
+    } else {
+      const pages = auditFile.self_audit;
+      const withRun = pages.filter((pg) => !!pg.run);
+      sections.push({
+        key: 'self_audit',
+        title: "The authority's checklist, answered",
+        lead: 'The last self-audit on each page of the Hyderabad Food Safety Authority\'s own checklist — every line as the authority words it, with our YES or NO and the remark.',
+        available: true,
+        summary: withRun.map((pg) => ({ label: pg.sheet.trim(), value: `${pg.run!.business_date} · ${pg.counts.yes} yes / ${pg.counts.no} no` })),
+        rows: withRun.map((pg) => ({
+          id: pg.template_code,
+          sheet: pg.sheet.trim(),
+          template_name: pg.template_name,
+          run: pg.run,
+          counts: pg.counts,
+          lines: pg.rows,
+          extra: pg.extra,
+        })),
+        prepare_note: pages.filter((pg) => !pg.run).map((pg) => `${pg.sheet.trim()}: ${pg.problem}`).join(' '),
+      });
+    }
+
+    /* ══ 11. THE PEST MONITORING SHEET — station by station ═════════════════ */
+    if (!present.has('fssai_pest_device_checks') || !present.has('fssai_pest_devices')) {
+      sections.push(notAvailable('pest_checks', 'Pest monitoring sheet', 'Every bait station, glue board and insect-light trap, checked.', NOT_IN_DB));
+    } else {
+      try {
+        const sheet = readPestMonitoringSheet(db, { from: since, to: today, today });
+        sections.push({
+          key: 'pest_checks',
+          title: 'Pest monitoring sheet',
+          lead: `Every station check from ${since} to ${today}: the station, activity found yes or no, what was done and the initials of who checked. A line voided by mistake stays, with its reason.`,
+          available: true,
+          summary: [
+            { label: 'Rounds', value: String(sheet.totals.rounds) },
+            { label: 'Station checks', value: String(sheet.totals.lines) },
+            { label: 'Activity found', value: String(sheet.totals.activity) },
+            // A station count beside a sheet missing a station would say so on
+            // the officer's screen (Q11) — shown only when every one is in date.
+            ...(sheet.totals.stations_overdue + sheet.totals.stations_never
+              ? []
+              : [{ label: 'Stations', value: String(sheet.totals.stations_in_use) }]),
+          ],
+          rows: [...sheet.rows].reverse().slice(0, RECENT_ROWS * 4).map((r) => ({
+            id: r.id,
+            business_date: r.business_date,
+            checked_at: r.checked_at,
+            device_code: r.device_code,
+            device_kind_label: r.device_kind_label,
+            location_label: r.location_label,
+            activity: r.activity,
+            activity_label: r.activity_label,
+            activity_kind_label: r.activity_kind_label,
+            device_condition_label: r.device_condition_label,
+            action_taken: r.action_taken,
+            initials: r.initials,
+            is_void: r.is_void,
+            void_reason: r.void_reason,
+          })),
+          prepare_note: sheet.problems.filter((x) => !/^Activity was found/.test(x)).join(' '),
+        });
+      } catch (e: any) {
+        console.error('[fssai/inspection-mode] pest_checks failed:', e?.message);
+        sections.push(notAvailable('pest_checks', 'Pest monitoring sheet', 'Every bait station checked.', 'This section could not be read.'));
+      }
+    }
+
+    /* ══ 12. WASTE HANDED OVER ══════════════════════════════════════════════ */
+    if (!present.has('fssai_waste_handovers')) {
+      sections.push(notAvailable('waste', 'Waste handed over', 'Each handover of wet, dry and other waste to GHMC or an authorised collector.', NOT_IN_DB));
+    } else {
+      try {
+        const part = wasteHandoverAuditPart(db, { today, since, rowLimit: RECENT_ROWS });
+        sections.push({
+          key: 'waste',
+          title: 'Waste handed over',
+          lead: `Each handover from ${since} to ${today}: what went, how much, to which collector, with the receipt or vehicle number and who handed it over.`,
+          available: true,
+          summary: part.summary.filter((x) => !x.mgmt).map((x) => ({ label: x.label, value: x.value })),
+          rows: part.handovers.slice(0, RECENT_ROWS).map((h) => ({
+            id: h.id,
+            handover_no: h.handover_no,
+            business_date: h.business_date,
+            handed_at: h.handed_at,
+            wet: h.wet_text,
+            dry: h.dry_text,
+            other: h.other_text ? `${h.other_text}${h.other_kind ? ` (${h.other_kind})` : ''}` : '',
+            collector: wasteCollectorText(h),
+            receipt_no: h.receipt_no,
+            vehicle_no: h.vehicle_no,
+            handed_over_by: h.handed_over_name,
+            received_by: h.received_by_name,
+          })),
+          prepare_note: part.status === 'present' ? '' : part.problems.join(' '),
+        });
+      } catch (e: any) {
+        console.error('[fssai/inspection-mode] waste failed:', e?.message);
+        sections.push(notAvailable('waste', 'Waste handed over', 'Each waste handover.', 'This section could not be read.'));
+      }
+    }
+
+    /* The order an officer reads it in: papers and people, then the checks
+     * (the authority's own pages beside our rounds), then the logs. */
+    const ORDER = ['documents', 'food_handlers', 'checks', 'self_audit', 'temperature', 'receiving', 'pest', 'pest_checks', 'water', 'waste', 'corrective', 'inspections'];
+    sections.sort((a, b) => (ORDER.indexOf(a.key) + 1 || 99) - (ORDER.indexOf(b.key) + 1 || 99));
 
     /* ══ RECENT HANDOVERS — read from the app-wide trail ═══════════════════ */
     let handovers: any[] = [];
@@ -560,6 +807,20 @@ export async function GET(request: Request) {
       business_name: businessName(db),
       opened_by: { email: String(me.email || ''), name: String(me.name || '') },
       sections,
+      /* THE AUDIT-FILE PDF behind the handover button: how many of the
+       * authority's 20 records it contains — the same count the PDF prints on
+       * itself. `left_out` (which, and why) is management's reading only. */
+      audit_file: auditFile
+        ? {
+            days: auditFile.days,
+            count: auditFile.handover.count,
+            total: auditFile.handover.total,
+            holds_words: auditFileHoldsWords(auditFile),
+            held: auditFile.items.filter((i) => i.held).map((i) => ({ n: i.n, title: i.title })),
+            left_out: auditFile.items.filter((i) => !i.held).map((i) => ({ n: i.n, title: i.title, why: i.problems[0] || 'Nothing on file.' })),
+            pdf_href: `/api/fssai/audit-file/pdf?days=${auditFile.days}`,
+          }
+        : null,
       /* MANAGEMENT'S READINESS LIST. Everything that would otherwise have to be
        * said on the handover screen itself lives here instead. */
       prepare: {

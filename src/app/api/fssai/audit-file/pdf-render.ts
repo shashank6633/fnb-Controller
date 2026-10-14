@@ -2,8 +2,8 @@ import PDFDocument from 'pdfkit';
 import { humanDate, istStamp } from '@/lib/report-pdf';
 import { pdfImageKind } from './scans';
 import {
-  AUDIT_FILE_STATUS_WORDS,
-  type AuditFile, type AuditFileItem, type AuditFileStatus, type AuditFileTable,
+  AUDIT_FILE_STATUS_WORDS, auditFileHoldsWords,
+  type AuditFile, type AuditFileItem, type AuditFileSelfAudit, type AuditFileStatus, type AuditFileTable,
 } from './lib';
 
 /**
@@ -22,10 +22,19 @@ import {
  *               order and numbering, stated as facts. A record with nothing on
  *               file is left out of it and out of its contents list; an empty
  *               table is left out rather than printed as "nothing on file".
- *               Not one sentence about a gap.
+ *               Not one sentence about a gap — but it SAYS HOW MANY of the 20
+ *               it contains, on the cover, the contents page and every footer
+ *               (owner, 2026-10-14: never imply a complete file). That is a
+ *               fact about this document, worked out once in buildAuditFile
+ *               (file.handover), so the page and Inspection Mode say the same.
  *   readiness — the MANAGEMENT COPY. All 20, each with its PRESENT / EXPIRING /
- *               MISSING band, the reasons and what closes it. Every page says
- *               it is not for handing over.
+ *               MISSING band, the reasons and what closes it, and every voided
+ *               file listed with its reason. Every page says it is not for
+ *               handing over.
+ * Both end with THE AUTHORITY'S OWN CHECKLIST PAGES, the last self-audit of
+ * each laid onto the page as YES / NO / REMARK — the passing answers an
+ * inspector otherwise never sees (the handover prints the pages that have a
+ * round; the management copy all three, saying why one has none).
  *
  * ── FONTS ───────────────────────────────────────────────────────────────────
  * pdfkit's built-in Helvetica is WinAnsi-encoded. A character outside it (the
@@ -43,7 +52,7 @@ const INK = '#111111';
 const MUTED = '#666666';
 const RULE = '#cccccc';
 const HEAD_BG = '#f0f0f0';
-const TONE = { bad: '#b42318', warn: '#9a5b00' } as const;
+const TONE = { bad: '#b42318', warn: '#9a5b00', void: '#8a8a8a' } as const;
 const BAND: Record<AuditFileStatus, { fill: string; ink: string }> = {
   missing: { fill: '#b42318', ink: '#ffffff' },
   expiring: { fill: '#c77700', ink: '#ffffff' },
@@ -86,6 +95,8 @@ export function buildAuditFilePdf(spec: AuditPdfSpec): Promise<Buffer> {
   const readiness = copy === 'readiness';
   const stampMs = spec.generatedAtMs ?? Date.now();
   const items = readiness ? file.items : file.items.filter((i) => i.held);
+  const sheets = (file.self_audit || []).filter((sa) => readiness || !!sa.run);
+  const holds = auditFileHoldsWords(file);
 
   const doc = new PDFDocument({
     size: [PAGE_W, PAGE_H],
@@ -141,10 +152,17 @@ export function buildAuditFilePdf(spec: AuditPdfSpec): Promise<Buffer> {
   para(
     readiness
       ? 'Every one of the 20 records is in this copy, in the authority\'s order and wording.'
-      // Neutral, and about this document (§7 Q11): no count of what is not here.
+      // Neutral, and about this document (§7 Q11) — and it says how many of
+      // the 20 it holds, so it can never pass for the complete file.
       : 'Each record is filed under the number and the wording it has on the authority\'s checklist.',
-    { size: 10, gap: 14 },
+    { size: 10, gap: 6 },
   );
+  if (!readiness) para(holds, { size: 10.5, font: 'Helvetica-Bold', gap: 6 });
+  if (sheets.length) {
+    para(`After the records: the authority's own checklist ${sheets.length === 1 ? 'page' : 'pages'} (${sheets.map((sa) => sa.sheet.trim()).join(', ')}) with the answers of the last self-audit on ${sheets.length === 1 ? 'it' : 'each'} — YES, NO and REMARK, line by line.`, { size: 10, gap: 14 });
+  } else {
+    doc.y += 8;
+  }
 
   if (readiness) {
     const y = doc.y;
@@ -154,7 +172,8 @@ export function buildAuditFilePdf(spec: AuditPdfSpec): Promise<Buffer> {
       .text('MANAGEMENT COPY — NOT FOR HANDING OVER', M + 14, y + 10, { width: W - 24 });
     doc.font('Helvetica').fontSize(9.5).fillColor(INK).text(
       `This copy marks what is missing or about to lapse. Present: ${file.counts.present} · Expiring: ${file.counts.expiring} · Missing: ${file.counts.missing}. ` +
-      'Hand the inspector the ordinary audit-file PDF instead.',
+      `Hand the inspector the ordinary audit-file PDF instead — it contains ${file.handover.count} of the ${file.handover.total} records` +
+      `${file.handover.left_out.length ? ` (not in it: ${file.handover.left_out.join(', ')})` : ''}.`,
       M + 14, y + 28, { width: W - 24 },
     );
     doc.y = y + 76;
@@ -171,6 +190,12 @@ export function buildAuditFilePdf(spec: AuditPdfSpec): Promise<Buffer> {
     startPage.set(it.n, page());
     drawSection(it);
   }
+  const sheetPage = new Map<string, number>();
+  for (const sa of sheets) {
+    newPage();
+    sheetPage.set(sa.template_code, page());
+    drawSelfAudit(sa);
+  }
 
   /* contents */
   doc.switchToPage(contentsPage);
@@ -178,6 +203,8 @@ export function buildAuditFilePdf(spec: AuditPdfSpec): Promise<Buffer> {
   doc.font('Helvetica-Bold').fontSize(17).fillColor(INK).text('Contents', M, M, { width: W });
   doc.font('Helvetica').fontSize(9).fillColor(MUTED)
     .text(pdfText(`${file.section} — numbered as on the authority's checklist.`), M, doc.y + 2, { width: W });
+  doc.font('Helvetica-Bold').fontSize(9.5).fillColor(INK)
+    .text(pdfText(readiness ? `All 20 records, with their status. The inspector's copy contains ${file.handover.count} of the ${file.handover.total}.` : holds), M, doc.y + 4, { width: W });
   doc.y += 10;
   {
     const cols = readiness ? [0.5, 4.2, 1.1, 0.6] : [0.5, 5.3, 0.6];
@@ -206,6 +233,24 @@ export function buildAuditFilePdf(spec: AuditPdfSpec): Promise<Buffer> {
       doc.moveTo(M, y + 20).lineTo(PAGE_W - M, y + 20).strokeColor('#e6e6e6').lineWidth(0.5).stroke();
       y += 20;
     }
+    // The authority's own pages, after the 20 — lettered, so the 1–20
+    // numbering stays the authority's.
+    sheets.forEach((sa, i) => {
+      const p = sheetPage.get(sa.template_code);
+      doc.font('Helvetica').fontSize(9.5).fillColor(INK);
+      doc.text(`A${i + 1}`, xs[0] + 4, y + 5, { width: ws[0] - 8, lineBreak: false });
+      const what = `The authority's ${sa.sheet.trim()} — ${sa.run ? `self-audit of ${sa.run.business_date}` : 'no round yet'}`;
+      doc.text(fit(pdfText(what), ws[1] - 8), xs[1] + 4, y + 5, { width: ws[1] - 8, lineBreak: false });
+      if (readiness) {
+        const word = !sa.run ? 'NONE' : sa.counts.no ? `${sa.counts.no} NO` : 'ALL YES';
+        doc.font('Helvetica-Bold').fillColor(!sa.run || sa.counts.no ? BAND.missing.fill : BAND.present.fill)
+          .text(word, xs[2] + 4, y + 5, { width: ws[2] - 8, lineBreak: false });
+      }
+      doc.font('Helvetica').fillColor(INK)
+        .text(p === undefined ? '' : String(p + 1), xs[head.length - 1] + 4, y + 5, { width: ws[head.length - 1] - 8, lineBreak: false, align: 'right' });
+      doc.moveTo(M, y + 20).lineTo(PAGE_W - M, y + 20).strokeColor('#e6e6e6').lineWidth(0.5).stroke();
+      y += 20;
+    });
   }
 
   /* ══ FOOTER ON EVERY PAGE ═══════════════════════════════════════════════ */
@@ -216,7 +261,7 @@ export function buildAuditFilePdf(spec: AuditPdfSpec): Promise<Buffer> {
     doc.font('Helvetica').fontSize(7).fillColor(MUTED);
     const left = readiness
       ? 'MANAGEMENT COPY — NOT FOR HANDING OVER'
-      : pdfText(`${spec.businessName ? `${spec.businessName} — ` : ''}Food Safety Audit File`);
+      : pdfText(`${spec.businessName ? `${spec.businessName} — ` : ''}Food Safety Audit File · ${file.handover.count} of ${file.handover.total} records`);
     doc.text(fit(left, W * 0.45), M, y, { width: W * 0.45, lineBreak: false });
     doc.text(`Prepared ${istStamp(stampMs)} IST`, M + W * 0.45, y, { width: W * 0.33, lineBreak: false });
     doc.text(`Page ${i + 1} of ${range.count}`, M + W * 0.78, y, { width: W * 0.22, align: 'right', lineBreak: false });
@@ -287,6 +332,7 @@ export function buildAuditFilePdf(spec: AuditPdfSpec): Promise<Buffer> {
     }
 
     drawScans(it);
+    drawVoided(it);
   }
 
   function drawTable(t: AuditFileTable) {
@@ -297,14 +343,18 @@ export function buildAuditFilePdf(spec: AuditPdfSpec): Promise<Buffer> {
     const tot = cols.reduce((a, c) => a + (Number(c.width) || 1), 0);
     let ws = cols.map((c) => ((Number(c.width) || 1) / tot) * W);
     // A short value — a date, a number, a status word — must never be cut to
-    // "2026-10-…". Give each column at least the width of its longest short
-    // value, taken from the columns with room to spare.
+    // "2026-10-…", and a single token — a registration number, a batch, a
+    // receipt — must never break in the middle ("CIR-12345/201" + "9"). Give
+    // each column at least the width of its longest short value and of its
+    // longest word (up to 22 characters), taken from the columns with room to
+    // spare. Longer text wraps between words (see the rows below).
     doc.font('Helvetica').fontSize(7.5);
     const need = cols.map((_, i) => {
       let m = 0;
       for (const r of t.rows.slice(0, 80)) {
         const v = pdfText(r.cells[i] ?? '');
         if (v.length <= 12) m = Math.max(m, doc.widthOfString(v));
+        for (const w of v.split(/\s+/)) if (w.length <= 22) m = Math.max(m, doc.widthOfString(w));
       }
       return m ? m + PAD * 2 + 1 : 0;
     });
@@ -336,14 +386,31 @@ export function buildAuditFilePdf(spec: AuditPdfSpec): Promise<Buffer> {
     }
     room(headH + rowH * 2);
     head();
+    // ROWS WRAP. A cell is never cut to "CIR-12345/2…": a registration number,
+    // a batch, a name the inspector reads must print whole. A row grows to its
+    // tallest cell (up to MAX_ROW_H, past which the cell ends in an ellipsis —
+    // the application holds the full text).
+    const MAX_ROW_H = 64;
     for (const r of t.rows) {
-      if (doc.y + rowH > BOTTOM) { newPage(); head(); }
+      doc.font('Helvetica').fontSize(7.5);
+      const texts = cols.map((_, i) => pdfText(r.cells[i] ?? ''));
+      const tall = texts.reduce((m, tx, i) => (tx ? Math.max(m, doc.heightOfString(tx, { width: ws[i] - PAD * 2 })) : m), 0);
+      const h = Math.max(rowH, Math.min(tall + 5, MAX_ROW_H));
+      if (doc.y + h > BOTTOM) { newPage(); head(); }
       const y = doc.y;
       doc.font('Helvetica').fontSize(7.5).fillColor(r.tone ? TONE[r.tone] : INK);
-      cols.forEach((c, i) => doc.text(fit(pdfText(r.cells[i] ?? ''), ws[i] - PAD * 2), xs[i] + PAD, y + 3,
-        { width: ws[i] - PAD * 2, lineBreak: false, align: c.align === 'right' ? 'right' : 'left' }));
-      doc.moveTo(M, y + rowH).lineTo(PAGE_W - M, y + rowH).strokeColor('#eeeeee').lineWidth(0.5).stroke();
-      doc.y = y + rowH;
+      // A voided line is KEPT and printed — greyed and struck through, its
+      // reason readable in its own cell (void, never delete).
+      cols.forEach((c, i) => {
+        if (!texts[i]) return;
+        doc.text(texts[i], xs[i] + PAD, y + 3, {
+          width: ws[i] - PAD * 2, height: h - 4, ellipsis: true,
+          align: c.align === 'right' ? 'right' : 'left',
+          strike: r.tone === 'void' && !/^VOID/.test(texts[i]),
+        });
+      });
+      doc.moveTo(M, y + h).lineTo(PAGE_W - M, y + h).strokeColor('#eeeeee').lineWidth(0.5).stroke();
+      doc.y = y + h;
     }
     if (t.more) {
       doc.font('Helvetica').fontSize(7.5).fillColor(MUTED)
@@ -421,6 +488,92 @@ export function buildAuditFilePdf(spec: AuditPdfSpec): Promise<Buffer> {
       doc.font('Helvetica').fontSize(8).fillColor(MUTED).text(pdfText(caption), M, doc.y, { width: W, align: 'center' });
       doc.y += 10;
       drawn++;
+    }
+  }
+
+  /**
+   * MANAGEMENT COPY ONLY: the files on this record that were voided — kept,
+   * with who, when and why. Listed by name; never drawn, never a copy.
+   */
+  function drawVoided(it: AuditFileItem) {
+    if (!readiness || !it.voided_scans.length) return;
+    room(30);
+    doc.font('Helvetica-Bold').fontSize(9.5).fillColor(INK).text('Voided files (kept, not a copy)', M, doc.y + 4, { width: W });
+    doc.y += 3;
+    for (const sc of it.voided_scans) {
+      const when = sc.voided_at ? sc.voided_at.slice(0, 10) : '';
+      para(`VOID — ${sc.record_label}${sc.filename ? ` (${sc.filename})` : ''}: ${sc.void_reason || 'no reason recorded'}${sc.voided_by ? ` — voided by ${sc.voided_by}` : ''}${when ? ` on ${when}` : ''}.`,
+        { size: 8.5, color: TONE.void });
+    }
+  }
+
+  /**
+   * ONE OF THE AUTHORITY'S CHECKLIST PAGES, ANSWERED. The rows, words and order
+   * of the authority's own sheet (headings, lead-ins, the sub-heading, the
+   * lines), with the last self-audit's YES / NO and REMARK beside each line —
+   * the passing answers included. A line answered N/A says so in the remark
+   * column. Rows wrap; nothing is cut.
+   */
+  function drawSelfAudit(sa: AuditFileSelfAudit) {
+    const title = sa.sheet.trim();
+    doc.font('Helvetica').fontSize(8.5).fillColor(MUTED)
+      .text(pdfText(`The authority's own checklist — after the 20 records`), M, M, { width: W });
+    doc.font('Helvetica-Bold').fontSize(18).fillColor(INK).text(pdfText(`${title}${sa.template_name ? ` — ${sa.template_name}` : ''}`), M, doc.y + 2, { width: W });
+    doc.y += 6;
+    if (!sa.run) {
+      // Management copy only (the handover leaves such a page out).
+      para(`No self-audit on this page yet. ${sa.problem}`, { size: 10, color: TONE.bad, gap: 8 });
+    } else {
+      const r = sa.run;
+      para(`Self-audit of ${humanDate(r.business_date)} — ${r.status === 'verified' ? 'verified' : 'submitted'}${r.recorded_by ? `, recorded by ${r.recorded_by}` : ''}${r.signed_by ? `, signed by ${r.signed_by}` : ''}.`,
+        { size: 10, gap: 2 });
+      para(`${sa.counts.lines} lines: ${sa.counts.yes} YES · ${sa.counts.no} NO${sa.counts.na ? ` · ${sa.counts.na} not applicable` : ''}${sa.counts.unanswered ? ` · ${sa.counts.unanswered} not answered` : ''}.` +
+        (readiness && sa.rounds_in_window ? ` ${sa.rounds_in_window} round${sa.rounds_in_window === 1 ? '' : 's'} of this page in the file's dates.` : ''),
+      { size: 9.5, color: MUTED, gap: 8 });
+    }
+
+    const cw = [W * 0.6, W * 0.07, W * 0.07, W * 0.26];
+    const cx = [M, M + cw[0], M + cw[0] + cw[1], M + cw[0] + cw[1] + cw[2]];
+    const PAD = 4;
+    const head = () => {
+      const y = doc.y;
+      doc.rect(M, y, W, 16).fillColor(HEAD_BG).fill();
+      doc.font('Helvetica-Bold').fontSize(8).fillColor(INK);
+      ['Line, as the authority words it', 'YES', 'NO', 'REMARK'].forEach((h, i) =>
+        doc.text(h, cx[i] + PAD, y + 4.5, { width: cw[i] - PAD * 2, lineBreak: false, align: i === 1 || i === 2 ? 'center' : 'left' }));
+      doc.y = y + 16;
+    };
+    room(40);
+    head();
+    for (const row of sa.rows) {
+      const isLine = row.kind === 'line';
+      const text = pdfText(row.text.trim());
+      const remark = pdfText(row.mark === 'N/A' ? `Not applicable${row.remark ? ` — ${row.remark}` : ''}` : row.remark);
+      const font = row.kind === 'heading' ? 'Helvetica-Bold' : row.kind === 'line' ? 'Helvetica' : 'Helvetica-Oblique';
+      doc.font(font).fontSize(row.kind === 'heading' ? 9 : 8);
+      const h1 = doc.heightOfString(text || ' ', { width: (isLine ? cw[0] : W) - PAD * 2 });
+      doc.font('Helvetica').fontSize(8);
+      const h2 = isLine && remark ? doc.heightOfString(remark, { width: cw[3] - PAD * 2 }) : 0;
+      const h = Math.max(h1, h2) + 6;
+      if (doc.y + h > BOTTOM) { newPage(); head(); }
+      const y = doc.y;
+      if (row.kind === 'heading') doc.rect(M, y, W, h).fillColor('#f7f3ee').fill();
+      doc.font(font).fontSize(row.kind === 'heading' ? 9 : 8).fillColor(INK)
+        .text(text, cx[0] + PAD, y + 3, { width: (isLine ? cw[0] : W) - PAD * 2 });
+      if (isLine) {
+        doc.font('Helvetica-Bold').fontSize(9);
+        if (row.mark === 'YES') doc.fillColor(BAND.present.fill).text('YES', cx[1], y + 3, { width: cw[1], align: 'center', lineBreak: false });
+        if (row.mark === 'NO') doc.fillColor(BAND.missing.fill).text('NO', cx[2], y + 3, { width: cw[2], align: 'center', lineBreak: false });
+        if (!row.mark) doc.font('Helvetica').fontSize(8).fillColor(MUTED).text('—', cx[1], y + 3, { width: cw[1] + cw[2], align: 'center', lineBreak: false });
+        if (remark) doc.font('Helvetica').fontSize(8).fillColor(INK).text(remark, cx[3] + PAD, y + 3, { width: cw[3] - PAD * 2 });
+      }
+      doc.moveTo(M, y + h).lineTo(PAGE_W - M, y + h).strokeColor('#eeeeee').lineWidth(0.5).stroke();
+      doc.y = y + h;
+    }
+    if (sa.run && sa.extra.length) {
+      doc.y += 8;
+      para('Questions this outlet added to the page:', { size: 9, font: 'Helvetica-Bold', gap: 2 });
+      for (const x of sa.extra) para(`${x.prompt || x.question_code}: ${x.mark || 'not answered'}${x.remark ? ` — ${x.remark}` : ''}`, { size: 8.5 });
     }
   }
 }

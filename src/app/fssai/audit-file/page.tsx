@@ -14,10 +14,17 @@
  * disagree.
  *
  * TWO PDFs, ONE BUTTON TO HAND OVER. The audit-file PDF holds what is on file,
- * stated as facts, and says nothing about gaps (Inspection Mode's rule, §7 Q11),
- * so it is the one to print or give the inspector. The management copy has all
- * 20 with their status, and says on every page that it is not for handing over.
- * This page itself names every gap, so it is never the screen handed over.
+ * stated as facts, and says nothing about gaps (Inspection Mode's rule, §7 Q11)
+ * — but it says how many of the 20 it contains, so it never passes for the
+ * complete file; this page shows that same count before it is downloaded. The
+ * management copy has all 20 with their status, and says on every page that it
+ * is not for handing over. This page itself names every gap, so it is never the
+ * screen handed over.
+ *
+ * Below the 20: the authority's own three checklist pages, each with the last
+ * self-audit's YES / NO / REMARK on every line — the passing answers included.
+ * Voided files are shown apart on each record, greyed, with their reason; they
+ * never count as a copy.
  */
 
 import { useCallback, useEffect, useState } from 'react';
@@ -26,11 +33,26 @@ import {
   AlertTriangle, CheckCircle2, Clock, Download, ExternalLink, FileWarning, FolderCheck, ImageIcon, Loader2, RefreshCw, XCircle,
 } from 'lucide-react';
 import { apiJson } from '@/lib/api';
-import type { AuditFile, AuditFileItem, AuditFileStatus, AuditFileTable } from '@/app/api/fssai/audit-file/lib';
+import type {
+  AuditFile, AuditFileItem, AuditFileSelfAudit, AuditFileStatus, AuditFileTable,
+} from '@/app/api/fssai/audit-file/lib';
+
+/** What the unattended jobs did (fssaiJobsAuditSummary) — the fields this page reads. */
+interface JobsSummary {
+  driver: { alive: boolean; words: string };
+  missed_checks: {
+    days: Array<{ business_date: string; checks_missed: number; bell_people: number; whatsapp: { sent: number; failed: number; dormant: number; no_phone: number } }>;
+    whatsapp: { ready: boolean; blockers: string[] };
+  };
+  cooling_overdue: Array<{ ca_number: string; ca_status: string; ca_title: string; raised_at: string; people_rung: number }>;
+  retention: { ruling: string };
+  unreadable: string[];
+}
 
 interface Payload extends AuditFile {
   business_name: string;
-  pdf: { includes: number[]; leaves_out: number[] };
+  pdf: { includes: number[]; leaves_out: number[]; holds_words: string };
+  jobs: JobsSummary | null;
   generated_at: string;
 }
 
@@ -143,6 +165,10 @@ export default function FssaiAuditFilePage() {
               {data.since} to {data.today}. It states what is on file and says nothing about what is not.
               The management copy has all 20 with their status — it is for you, not the inspector.
             </p>
+            <p className="text-sm font-semibold text-[#2D1B0E]">
+              The audit file PDF contains {data.handover.count} of the {data.handover.total} records — it says so on its cover, its
+              contents page and the foot of every page, so it never passes for the complete file.
+            </p>
             {data.pdf.leaves_out.length > 0 && (
               <p className="text-xs font-semibold text-red-800">
                 Not in the audit file PDF until something is filed ({data.pdf.leaves_out.length}):{' '}
@@ -165,9 +191,13 @@ export default function FssaiAuditFilePage() {
             {data.items.map((it) => <RecordCard key={it.n} it={it} />)}
           </div>
 
+          <SelfAuditPages pages={data.self_audit || []} />
+
+          {data.jobs && <JobsPanel jobs={data.jobs} />}
+
           <p className="text-xs text-[#8B7355]">
-            A document counts only with a copy of it attached — the inspector asks for the licence, not its number. Voided
-            records and drafts never count. Every status is worked out again each time this page or the PDF is opened;
+            A document counts only with a live copy of it attached — the inspector asks for the licence, not its number.
+            Voided records, voided scans and drafts never count; a voided scan stays on its record, marked void with the reason. Every status is worked out again each time this page or the PDF is opened;
             nothing is stored. Records are read across all outlets together, as on the Reports screen.
           </p>
         </>
@@ -320,6 +350,27 @@ function RecordCard({ it }: { it: AuditFileItem }) {
           </div>
         )}
 
+        {/* VOIDED FILES — kept and shown, never a copy (void, never delete). */}
+        {it.voided_scans.length > 0 && (
+          <div className="rounded-lg border border-gray-200 bg-gray-50 px-3 py-2 space-y-1">
+            <p className="text-[11px] font-bold uppercase tracking-wider text-gray-500">
+              Voided — kept, not counted as a copy ({it.voided_scans.length})
+            </p>
+            {it.voided_scans.map((sc) => (
+              <p key={sc.attachment_id} className="text-xs text-gray-600 flex flex-wrap items-center gap-1.5">
+                <span className="font-bold text-[10px] border border-gray-400 rounded px-1">VOID</span>
+                <span className="line-through">{sc.record_label}{sc.filename ? ` (${sc.filename})` : ''}</span>
+                <span>— {sc.void_reason || 'no reason recorded'}{sc.voided_by ? `, by ${sc.voided_by}` : ''}{sc.voided_at ? ` on ${sc.voided_at.slice(0, 10)}` : ''}</span>
+                {sc.has_image && (
+                  <a href={`/api/fssai/audit-file/file?id=${encodeURIComponent(sc.attachment_id)}`} target="_blank" rel="noopener noreferrer" className="underline underline-offset-2">
+                    view
+                  </a>
+                )}
+              </p>
+            ))}
+          </div>
+        )}
+
         {it.tables.map((t, i) => <MiniTable key={i} t={t} />)}
 
         <details className="text-xs text-[#6B5744]">
@@ -349,7 +400,7 @@ function MiniTable({ t }: { t: AuditFileTable }) {
           </thead>
           <tbody className="divide-y divide-[#E8D5C4]">
             {t.rows.map((r, ri) => (
-              <tr key={ri} className={r.tone === 'bad' ? 'bg-red-50 text-red-900' : r.tone === 'warn' ? 'bg-amber-50 text-amber-950' : ''}>
+              <tr key={ri} className={r.tone === 'bad' ? 'bg-red-50 text-red-900' : r.tone === 'warn' ? 'bg-amber-50 text-amber-950' : r.tone === 'void' ? 'bg-gray-50 text-gray-500 line-through decoration-gray-400' : ''}>
                 {r.cells.map((c, ci) => (
                   <td key={ci} className={`px-2 py-1.5 ${t.columns[ci]?.align === 'right' ? 'text-right' : 'text-left'} ${ci === 0 ? 'whitespace-nowrap' : ''}`}>
                     {ci === 0 && r.href ? <Link href={r.href} className="underline underline-offset-2">{c || '—'}</Link> : c}
@@ -362,6 +413,122 @@ function MiniTable({ t }: { t: AuditFileTable }) {
       </div>
       {t.more > 0 && <p className="text-[11px] text-[#8B7355] mt-1">…and {t.more} more in this period, listed in the PDF and on the record&apos;s own screen.</p>}
     </div>
+  );
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * THE AUTHORITY'S OWN CHECKLIST PAGES, ANSWERED
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+function SelfAuditPages({ pages }: { pages: AuditFileSelfAudit[] }) {
+  if (!pages.length) return null;
+  return (
+    <div className="space-y-3">
+      <div>
+        <p className="text-xs font-bold uppercase tracking-wider text-[#8B7355]">The authority&apos;s own checklist pages</p>
+        <p className="text-xs text-[#8B7355] mt-0.5">
+          The last self-audit on each of the authority&apos;s three pages, line by line, as the inspector&apos;s sheet looks —
+          YES, NO and the remark. These pages print after the 20 records in both PDFs (the inspector&apos;s copy carries the
+          pages that have a round).
+        </p>
+      </div>
+      {pages.map((pg) => <SelfAuditPage key={pg.template_code} pg={pg} />)}
+    </div>
+  );
+}
+
+function SelfAuditPage({ pg }: { pg: AuditFileSelfAudit }) {
+  const title = pg.sheet.trim();
+  return (
+    <details className={`rounded-xl border overflow-hidden ${pg.run ? (pg.counts.no ? 'bg-white border-amber-300' : 'bg-white border-[#E8D5C4]') : 'bg-red-50 border-red-300'}`}>
+      <summary className="cursor-pointer select-none px-4 py-3 flex flex-wrap items-center gap-2">
+        <span className="font-bold">{title}</span>
+        {pg.template_name && <span className="text-sm text-[#6B5744]">— {pg.template_name}</span>}
+        <span className="ml-auto text-xs font-semibold">
+          {pg.run
+            ? `${pg.run.business_date} · ${pg.counts.yes} YES · ${pg.counts.no} NO${pg.counts.na ? ` · ${pg.counts.na} N/A` : ''}${pg.counts.unanswered ? ` · ${pg.counts.unanswered} not answered` : ''}`
+            : 'No round yet'}
+        </span>
+      </summary>
+      <div className="px-4 pb-4 space-y-2">
+        {!pg.run && <p className="text-sm text-red-800">{pg.problem}</p>}
+        {pg.run && (
+          <p className="text-xs text-[#6B5744]">
+            {pg.run.status === 'verified' ? 'Verified' : 'Submitted'} round of {pg.run.business_date}
+            {pg.run.recorded_by ? `, recorded by ${pg.run.recorded_by}` : ''}{pg.run.signed_by ? `, signed by ${pg.run.signed_by}` : ''} ·{' '}
+            {pg.rounds_in_window} round{pg.rounds_in_window === 1 ? '' : 's'} in these dates ·{' '}
+            <Link href={pg.run.href} className="underline underline-offset-2">open the round</Link>
+          </p>
+        )}
+        <div className="overflow-x-auto bg-white rounded-lg border border-[#E8D5C4]">
+          <table className="w-full text-xs">
+            <thead className="text-[#6B5744] bg-[#FFF1E3]">
+              <tr>
+                <th className="text-left font-semibold px-2 py-1.5">Line, as the authority words it</th>
+                <th className="font-semibold px-2 py-1.5 w-12 text-center">YES</th>
+                <th className="font-semibold px-2 py-1.5 w-12 text-center">NO</th>
+                <th className="text-left font-semibold px-2 py-1.5">REMARK</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-[#E8D5C4]">
+              {pg.rows.map((r, i) => r.kind === 'line' ? (
+                <tr key={i} className={r.mark === 'NO' ? 'bg-red-50' : ''}>
+                  <td className="px-2 py-1.5">{r.text.trim()}</td>
+                  <td className="px-2 py-1.5 text-center font-bold text-green-800">{r.mark === 'YES' ? 'YES' : ''}</td>
+                  <td className="px-2 py-1.5 text-center font-bold text-red-700">{r.mark === 'NO' ? 'NO' : ''}</td>
+                  <td className="px-2 py-1.5">{r.mark === 'N/A' ? `Not applicable${r.remark ? ` — ${r.remark}` : ''}` : r.remark || (r.mark ? '' : <span className="text-[#8B7355]">—</span>)}</td>
+                </tr>
+              ) : (
+                <tr key={i} className={r.kind === 'heading' ? 'bg-[#FBF6F0]' : ''}>
+                  <td colSpan={4} className={`px-2 py-1.5 ${r.kind === 'heading' ? 'font-bold' : 'italic text-[#6B5744]'}`}>{r.text.trim()}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        {pg.extra.length > 0 && (
+          <p className="text-xs text-[#6B5744]">
+            Questions this outlet added: {pg.extra.map((x) => `${x.prompt || x.question_code} — ${x.mark || 'not answered'}${x.remark ? ` (${x.remark})` : ''}`).join(' · ')}
+          </p>
+        )}
+      </div>
+    </details>
+  );
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * WHAT THE UNATTENDED JOBS DID — management reading, never printed
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+function JobsPanel({ jobs }: { jobs: JobsSummary }) {
+  const missedDays = jobs.missed_checks.days.filter((d) => d.checks_missed > 0);
+  return (
+    <details className="bg-white rounded-xl border border-[#E8D5C4]">
+      <summary className="cursor-pointer select-none px-4 py-3 text-sm font-semibold">
+        Chasing done by the app in these dates{' '}
+        <span className={`text-xs font-semibold ${jobs.driver.alive ? 'text-green-800' : 'text-red-700'}`}>
+          ({jobs.driver.alive ? 'jobs running' : 'jobs NOT running'})
+        </span>
+      </summary>
+      <div className="px-4 pb-4 space-y-2 text-xs text-[#3D2614]">
+        <p>{jobs.driver.words}</p>
+        <p>
+          Missed checks: {missedDays.length ? `${missedDays.length} day${missedDays.length === 1 ? '' : 's'} with missed checks — ` +
+            missedDays.map((d) => `${d.business_date}: ${d.checks_missed} missed, bell rang for ${d.bell_people}, WhatsApp ${d.whatsapp.sent} sent${d.whatsapp.dormant ? ` / ${d.whatsapp.dormant} dormant` : ''}${d.whatsapp.no_phone ? ` / ${d.whatsapp.no_phone} with no number` : ''}${d.whatsapp.failed ? ` / ${d.whatsapp.failed} failed` : ''}`).join('; ')
+            : 'none reported.'}
+        </p>
+        <p>
+          WhatsApp for missed checks: {jobs.missed_checks.whatsapp.ready ? 'ready.' : `dormant (bell only) — ${jobs.missed_checks.whatsapp.blockers.join(' ') || 'not configured.'}`}
+        </p>
+        <p>
+          Abandoned cooling batches raised: {jobs.cooling_overdue.length
+            ? jobs.cooling_overdue.map((c) => `${c.ca_number} (${c.ca_status}) ${c.ca_title} — ${c.raised_at}, ${c.people_rung} rung`).join('; ')
+            : 'none.'}
+        </p>
+        <p className="text-[#6B5744]">Photo rule: {jobs.retention.ruling}</p>
+        {jobs.unreadable.length > 0 && <p className="text-amber-800">Could not read: {jobs.unreadable.join('; ')}</p>}
+      </div>
+    </details>
   );
 }
 

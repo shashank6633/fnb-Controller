@@ -13,7 +13,9 @@ import { loadScanImages } from '../scans';
  *
  *   copy=handover   (default) — what is on file, stated as facts, to print or
  *                   hand to the inspector. Nothing in it describes a gap
- *                   (Inspection Mode's rule, FSSAI-BUILD-STATE.md §7 Q11).
+ *                   (Inspection Mode's rule, FSSAI-BUILD-STATE.md §7 Q11), and
+ *                   it says how many of the 20 it contains (cover, contents,
+ *                   every footer) so it never passes for the complete file.
  *   copy=readiness  — the management copy: all 20 with PRESENT / EXPIRING /
  *                   MISSING and what closes each. Marked on every page as not
  *                   for handing over.
@@ -54,6 +56,8 @@ export async function GET(request: Request) {
     const today = fssaiToday();
     const file = buildAuditFile(db, today, { days: Number(url.searchParams.get('days')) || undefined, rowLimit: PDF_ROWS });
     const included = copy === 'readiness' ? file.items : file.items.filter((i) => i.held);
+    // `scans` holds LIVE copies only (buildAuditFile moves voided files out), and
+    // loadScanImages refuses a voided id again — a voided scan is never drawn.
     // Load only the images the renderer will draw (it draws at most
     // MAX_SCANS_PER_SECTION per record and names the rest), so a large staff
     // roster of certificates cannot pull hundreds of images into memory.
@@ -76,6 +80,8 @@ export async function GET(request: Request) {
         'Content-Disposition': `inline; filename="${fname}"`,
         'Content-Length': String(bytes.byteLength),
         'Cache-Control': 'no-store',
+        // The count the copy prints about itself, for a caller that only reads headers.
+        'X-Audit-File-Records': `${file.handover.count}/${file.handover.total}`,
       },
     });
   } catch (e: any) {
