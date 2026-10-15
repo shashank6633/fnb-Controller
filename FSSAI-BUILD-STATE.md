@@ -20,8 +20,10 @@ This is the third standing gate in this project, alongside:
 - **Akan Party Manager** — held until he informs
 
 Every deploy bundle carved from the main repo must prove, with a command and its real output,
-**three zero-counts**: zero `lq_`/liquor paths, zero `party-manager`/`src/lib/pm/` paths, and zero
-`fssai` paths. Never assert a count. Show the `0`.
+**three zero-counts**: zero liquor paths (the liquor tables' prefix, matched by `grep 'l[q]_'`, or
+`liquor` in the path), zero `party-manager`/`src/lib/pm/` paths, and zero `fssai` paths. Never
+assert a count. Show the `0`. (The prefix is written as a bracket pattern so this file is not
+itself a line that carries it.)
 
 > **⚠️ GREP THE SIGNATURE, NOT THE WORD (measured 2026-09-17).** A bare `grep -ri fssai src/` in the
 > live repo returns **11**, and always has. Those are the **FSSAI licence number printed on a
