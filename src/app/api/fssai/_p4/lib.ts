@@ -925,14 +925,18 @@ export function fssaiCurveKeyOf(db: Database.Database, logKind: string, ref: str
  *                  longer than that batch's clock (beyond the tolerance): an older
  *                  pot than any on file, which starts its own batch at the minutes
  *                  typed (closing round 2, 2026-10-15: typed 300 joined a batch
- *                  that reached in time and passed against a 240 limit). One back
+ *                  that reached in time and passed against a 240 limit) — or
+ *                  SHORTER than it (beyond the same tolerance): a newer pot, which
+ *                  starts its own batch at the minutes typed the same way (final
+ *                  round 2026-10-15: a second pot typed 250 joined a batch whose
+ *                  clock read 300, and passed "still there" against 240). One back
  *                  past the target that is not a fresh start (at or beyond the
  *                  rule's starting temperature) is REFUSED (`after_target`),
  *                  whatever was typed — same pot warming up again (pick it: filed
  *                  as a failure) or a new pot (say so).
  *      THE MINUTES TYPED ARE NO WAY PAST ANY OF THESE (closing round 2026-10-15).
  *      They tell OPEN batches apart, and a reading AT a reached batch's target
- *      from an older pot, and nothing else: a spanning or stale batch, and a
+ *      from an older or a newer pot, and nothing else: a spanning or stale batch, and a
  *      reached one for a reading back past its target, is weighed whatever was
  *      typed. Typing 11 minutes more than a reached batch's clock took a re-warmed
  *      reading out of the check, and it passed.
@@ -1370,13 +1374,25 @@ export function resolveFssaiCurve(
    * that reached 4 °C at 120 minutes joined it and passed "still there", judged
    * at 300 against a 240 limit, and no job raised it; typed 241 passed the same
    * way. So at the target it joins the newest reached batch its minutes fit; with
-   * none, it goes on below to a batch of its own, judged at the minutes typed. */
+   * none, it goes on below to a batch of its own, judged at the minutes typed.
+   * THE MIRROR (final round, 2026-10-15): minutes typed SHORTER than a reached
+   * batch's clock (beyond the same tolerance — `disagrees`, as for an open batch)
+   * say a NEWER pot than that one, and are no fit either. Joining a reached batch
+   * is the lenient choice — "still there", whatever the clock — so the cook's
+   * shorter figure must not be swapped for it. Measured: a second pot of Rajma,
+   * 3 °C at 15:00 typed 250, beside a batch begun at 10:00 that reached 4 °C at
+   * 120 minutes, joined it and passed "In range" against a 240 limit — no action
+   * asked, no job raised it, screen and report "in time"; reheating typed 130
+   * beside a 210-minute clock the same; a third pot typed 121 joined a batch
+   * already late (clock 151) and passed. On a batch of its own at the minutes
+   * typed it fails, with a corrective action, exactly as with no other pot on
+   * file. */
   const reachedNewest = [...reachedRecent].sort(newestFirst);
   const reachedGoalOf = (c: Cand): number | null => (c.reached as FssaiCurveMember).goal ?? (ruleOf(c.members)?.goal ?? goalNow);
   const newestReached = reachedNewest[0] || null;
   const newestGoal = newestReached ? reachedGoalOf(newestReached) : null;
   const atNewestTarget = !!newestReached && value !== null && newestGoal !== null && !backPast(value, newestGoal);
-  const pickedReached = atNewestTarget ? (reachedNewest.filter(fits)[0] || null) : newestReached;
+  const pickedReached = atNewestTarget ? (reachedNewest.filter((c) => fits(c) && !disagrees(c))[0] || null) : newestReached;
   let note = '';
   if (pickedReached) {
     const R = pickedReached;

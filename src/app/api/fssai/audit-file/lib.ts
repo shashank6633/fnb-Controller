@@ -5,7 +5,7 @@ import {
   FSSAI_DOC_REMINDER_DAYS, type FssaiDocState,
 } from '@/lib/fssai';
 import {
-  FSSAI_HANDLER_REQUIREMENTS, fssaiDocumentHolders, readFssaiFoodHandlerCoverage,
+  FSSAI_HANDLER_REQUIREMENTS, fssaiDocumentHolders, fssaiNotYetWords, fssaiPaperStartsOn, readFssaiFoodHandlerCoverage,
   type FssaiFoodHandlerWithCoverage, type FssaiHandlerCoverage, type FssaiHandlerRequirementKey,
 } from '@/lib/fssai-food-handlers';
 import {
@@ -76,6 +76,10 @@ import { vendorRegisterReady } from '../../vendors/fssai-register';
  * section asks the same function, so the two copies an inspector is given
  * cannot disagree (2026-10-15). A paper is in order when
  *   · it has not EXPIRED;
+ *   · it has STARTED — a paper is in force only from its valid_from date
+ *     (owner ruling 2026-10-15): a renewal filed early reads "Not yet in
+ *     force (from <date>)", is never the paper a record or a person rests
+ *     on, and the record is judged on what is in force today;
  *   · it has not lapsed BY PERIOD — a paper with no expiry date of its own
  *     stands for FSSAI_DOC_PERIOD_DAYS from its date (a water bill the quarter
  *     it was issued in, a food lab report a year); a laboratory water report
@@ -553,7 +557,13 @@ interface DocRow {
   in_order: boolean;
   /** The day it stops standing: its expiry, or its period's end ('' = does not lapse). */
   until: string;
-  /** The State cell, in words ("Valid", "EXPIRED", "Lapsed 2026-09-17", "No expiry date"). */
+  /**
+   * Its valid_from when that is after today: on file but NOT in force yet (a
+   * renewal filed early, owner ruling 2026-10-15) — never the paper a record
+   * rests on today. '' when it has started (or has expired).
+   */
+  starts_on: string;
+  /** The State cell, in words ("Valid", "EXPIRED", "Lapsed 2026-09-17", "No expiry date", "Not yet in force (from 2026-10-22)"). */
   state_words: string;
   /** Management words: why it is not in order ('' when it is). */
   why_not: string;
@@ -598,6 +608,10 @@ export interface FssaiPaperForce {
  * older than its quarter, a food lab report with no validity date older than a
  * year, are as out of date as an expired licence, though neither carries an
  * expiry date to say so.
+ * Whether it has STARTED (its valid_from, owner ruling 2026-10-15) is the one
+ * judge's own test (fssaiHandoverPaperJudge → fssaiPaperNotYetInForce), kept
+ * apart because the Documents register report (_p9/reports.ts) counts every
+ * paper this calls not in force as Expired — a renewal filed early is not that.
  */
 export function fssaiPaperInForce(d: FssaiPaperDates, state: FssaiDocState, today: string): FssaiPaperForce {
   const end = fssaiPaperUntil(d);
@@ -618,6 +632,24 @@ export function fssaiPaperInForce(d: FssaiPaperDates, state: FssaiDocState, toda
     return { in_force: true, until: end, state_words: `Until ${end}`, why: '' };
   }
   return { in_force: true, until: end, state_words: STATE_WORDS[state], why: '' };
+}
+
+/** Management words for a paper in force only from a day still to come. */
+function notYetWhy(startsOn: string, today: string): string {
+  return `it is in force only from ${startsOn} — ${until(startsOn, today)}; a paper filed ahead of its valid-from date (a renewal filed early) does not stand until then`;
+}
+
+/**
+ * NOT YET IN FORCE (owner ruling 2026-10-15): a paper is in force only from its
+ * valid_from date. A renewal filed early is not in force until then, so it is
+ * never handed over as the paper the outlet (or the person) holds today, and
+ * the record is judged on what IS in force today. '' starts_on = it has started.
+ */
+export function fssaiPaperNotYetInForce(d: { valid_from: string }, today: string): { starts_on: string; state_words: string; why: string } {
+  const starts = fssaiPaperStartsOn(d.valid_from, today);
+  return starts
+    ? { starts_on: starts, state_words: fssaiNotYetWords(starts), why: notYetWhy(starts, today) }
+    : { starts_on: '', state_words: '', why: '' };
 }
 
 /**
@@ -669,6 +701,8 @@ export function fssaiPersonPapersInOrder(cov: FssaiHandlerCoverage): Map<string,
   const good = new Set<string>();
   const fails = new Map<string, { label: string; verdict_label: string }>();
   const seen = new Map<string, string>();
+  /** Papers in force only from a day still to come (owner ruling 2026-10-15) → that day. */
+  const notYet = new Map<string, string>();
   /** The person a paper belongs to, when that person is NOT in order overall. */
   const holderNotInOrder = new Map<string, { name: string; problems: string[] }>();
   for (const h of cov.handlers) {
@@ -678,11 +712,14 @@ export function fssaiPersonPapersInOrder(cov: FssaiHandlerCoverage): Map<string,
       if (!c || !c.required) continue;
       for (const e of c.evidence) {
         const key = `${e.source}:${e.id}`;
-        const ok = e.state !== 'expired' && e.copies > 0 &&
+        // NOT YET IN FORCE: a renewal filed early does not stand before its
+        // valid_from, so it is never a paper in order today, whatever its expiry.
+        const ok = e.state !== 'expired' && !e.starts_on && e.copies > 0 &&
           (e.state === 'valid' || e.state === 'expiring' || (e.state === 'no_expiry' && req.no_expiry_ok));
         if (ok) good.add(key);
+        if (e.state !== 'expired' && e.starts_on) notYet.set(key, e.starts_on);
         if (!seen.has(key)) {
-          seen.set(key, e.state === 'expired' ? 'EXPIRED' : e.copies <= 0 ? 'No copy on file' : e.state === 'no_expiry' ? 'No expiry date' : '');
+          seen.set(key, e.state === 'expired' ? 'EXPIRED' : e.starts_on ? fssaiNotYetWords(e.starts_on) : e.copies <= 0 ? 'No copy on file' : e.state === 'no_expiry' ? 'No expiry date' : '');
         }
         if (!h.in_order && !holderNotInOrder.has(key)) {
           holderNotInOrder.set(key, { name: handlerName(h), problems: h.problems });
@@ -693,6 +730,12 @@ export function fssaiPersonPapersInOrder(cov: FssaiHandlerCoverage): Map<string,
   }
   const out = new Map<string, FssaiPersonPaperVerdict>();
   for (const [key, stateWord] of seen) {
+    const starts = notYet.get(key);
+    if (starts) {
+      // Its reason is its date, whoever holds it and whatever else they lack.
+      out.set(key, { in_order: false, words: fssaiNotYetWords(starts), why: notYetWhy(starts, cov.today) });
+      continue;
+    }
     const f = fails.get(key);
     const holder = holderNotInOrder.get(key);
     if (good.has(key) && !f && holder) {
@@ -731,6 +774,8 @@ export interface FssaiHandoverPaperVerdict {
   until: string;
   state_words: string;
   why: string;
+  /** Its valid_from when that is after today — NOT in force yet; '' when it has started. */
+  starts_on: string;
 }
 
 /**
@@ -765,6 +810,10 @@ export function fssaiHandoverPaperJudge(db: Database.Database, today: string): (
     let inOrder = f.in_force;
     let words = f.state_words;
     let why = f.why;
+    // NOT YET IN FORCE (owner ruling 2026-10-15): in force only from its
+    // valid_from — a renewal filed early is "Not yet in force (from <date>)".
+    const nyf = fssaiPaperNotYetInForce(d, today);
+    if (inOrder && nyf.starts_on) { inOrder = false; words = nyf.state_words; why = nyf.why; }
     if (inOrder && fssaiDocType(d.doc_type)?.scope === 'person') {
       const v = personVerdicts().get(`document:${d.id}`);
       if (!v) {
@@ -778,7 +827,7 @@ export function fssaiHandoverPaperJudge(db: Database.Database, today: string): (
       }
     }
     if (inOrder && d.copies <= 0) { inOrder = false; why = 'no live copy of it is attached'; }
-    return { state, in_order: inOrder, until: f.until, state_words: words, why };
+    return { state, in_order: inOrder, until: f.until, state_words: words, why, starts_on: f.in_force ? nyf.starts_on : '' };
   };
 }
 
@@ -953,6 +1002,7 @@ function readDocs(ctx: Ctx, types: string[]): DocRow[] {
       scans: [],
       in_order: false,
       until: '',
+      starts_on: '',
       state_words: '',
       why_not: '',
     };
@@ -994,6 +1044,7 @@ function readDocs(ctx: Ctx, types: string[]): DocRow[] {
     d.state = v.state;
     d.in_order = v.in_order;
     d.until = v.until;
+    d.starts_on = v.starts_on;
     d.state_words = v.state_words;
     d.why_not = v.why;
     for (const sc of d.scans) sc.in_handover = v.in_order;
@@ -1052,6 +1103,8 @@ interface DocVerdict {
   problems: string[];
   best: DocRow | null;
   lapses_on: string;
+  /** None is in force today, but one on file comes into force later: the first such day ('' otherwise). */
+  starts_on: string;
 }
 
 /**
@@ -1061,18 +1114,34 @@ interface DocVerdict {
  *   the best one inside its renewal window → EXPIRING · otherwise PRESENT.
  * "Best" = in force, with a copy, latest expiry (a dated one beats an undated
  * one, because an undated one cannot be judged either way).
+ * NOT YET IN FORCE (owner ruling 2026-10-15): a paper whose valid_from is still
+ * to come (DocRow.starts_on — a renewal filed early) is on file, but it is not
+ * what the outlet holds today, so it is never the best: the record is judged
+ * on what is in force today. With nothing else in force it is MISSING, the
+ * problem naming the day the filed one starts; a current paper inside its
+ * renewal window is not flagged EXPIRING when its renewal is filed, with a
+ * copy, and starts by the day after it lapses.
  */
 function judgeDocs(docs: DocRow[], what: string, today: string): DocVerdict {
-  if (!docs.length) return { status: 'missing', problems: [`No ${what} is on file.`], best: null, lapses_on: '' };
+  if (!docs.length) return { status: 'missing', problems: [`No ${what} is on file.`], best: null, lapses_on: '', starts_on: '' };
 
-  const inForce = docs.filter((d) => d.state !== 'expired');
+  /** Filed ahead of their valid_from, the first to start first. */
+  const pending = docs.filter((d) => d.starts_on && d.state !== 'expired')
+    .sort((a, b) => (a.starts_on < b.starts_on ? -1 : a.starts_on > b.starts_on ? 1 : 0));
+  const inForce = docs.filter((d) => d.state !== 'expired' && !d.starts_on);
   if (!inForce.length) {
-    const last = [...docs].sort((a, b) => (a.expiry_date < b.expiry_date ? 1 : -1))[0];
+    const lapsed = docs.filter((d) => !d.starts_on);
+    const last = lapsed.length ? [...lapsed].sort((a, b) => (a.expiry_date < b.expiry_date ? 1 : -1))[0] : null;
+    const next = pending[0] || null;
     return {
       status: 'missing',
-      problems: [`The ${what} on file (${docLabel(last)}) expired on ${last.expiry_date} — ${until(last.expiry_date, today)}.`],
+      problems: [[
+        last ? `The ${what} on file (${docLabel(last)}) expired on ${last.expiry_date} — ${until(last.expiry_date, today)}.` : '',
+        next ? `${docLabel(next)} is on file, but it is in force only from ${next.starts_on} — ${until(next.starts_on, today)}; until then no ${what} is in force.` : '',
+      ].filter(Boolean).join(' ')],
       best: null,
-      lapses_on: last.expiry_date,
+      lapses_on: last ? last.expiry_date : '',
+      starts_on: next ? next.starts_on : '',
     };
   }
 
@@ -1089,6 +1158,7 @@ function judgeDocs(docs: DocRow[], what: string, today: string): DocVerdict {
       problems: [`${docLabel(d)} is recorded, but ${why} — the file has the number, not the copy.`],
       best: d,
       lapses_on: d.expiry_date,
+      starts_on: '',
     };
   }
 
@@ -1097,14 +1167,25 @@ function judgeDocs(docs: DocRow[], what: string, today: string): DocVerdict {
     return a.expiry_date < b.expiry_date ? 1 : a.expiry_date > b.expiry_date ? -1 : 0;
   })[0];
   if (best.state === 'expiring') {
-    return {
-      status: 'expiring',
-      problems: [`${docLabel(best)} expires on ${best.expiry_date} — ${until(best.expiry_date, today)}. Renew it before then.`],
-      best,
-      lapses_on: best.expiry_date,
-    };
+    // Its renewal already filed (with a copy) and starting by the day after it
+    // lapses: there is nothing to renew. Starting later leaves a gap: say so.
+    const dayAfter = addDaysISO(best.expiry_date, 1);
+    const renewal = pending.find((d) => d.stored > 0 && d.starts_on <= dayAfter);
+    const later = renewal ? null : pending.find((d) => d.stored > 0) || null;
+    if (!renewal) {
+      return {
+        status: 'expiring',
+        problems: [`${docLabel(best)} expires on ${best.expiry_date} — ${until(best.expiry_date, today)}. ` +
+          (later
+            ? `Its renewal on file (${docLabel(later)}) comes into force only on ${later.starts_on}, so none will be in force from ${dayAfter} until then.`
+            : 'Renew it before then.')],
+        best,
+        lapses_on: best.expiry_date,
+        starts_on: '',
+      };
+    }
   }
-  return { status: 'present', problems: [], best, lapses_on: best.expiry_date };
+  return { status: 'present', problems: [], best, lapses_on: best.expiry_date, starts_on: '' };
 }
 
 /** Judge "is there a current one" over dated periods, with the warning window. */
@@ -1326,17 +1407,21 @@ function water(ctx: Ctx): Part {
     p.scans.push(...labScans);
   }
 
+  /** Filed ahead of their valid-from date: on file, not in force yet (never the current one). */
+  let waterNotYet: DocRow[] = [];
   if (ctx.present.has('fssai_documents')) {
     const docs = readDocs(ctx, ['water_test', 'water_bill']);
     held += docs.length;
+    waterNotYet = docs.filter((d) => d.starts_on && d.stored > 0);
     for (const d of docs) {
       const isBill = d.doc_type === 'water_bill';
       // d.until: its expiry, else its period from its date (fssaiPaperUntil —
       // a bill the quarter it was issued in). In the inspector's copy only
       // while it is in order (d.in_order: in force by that date, with a copy).
       const end = d.until;
-      // A document counts only with its copy (see the header).
-      if (end && d.stored > 0) ends.push({ end, label: isBill ? `water bill (${docLabel(d)})` : `water test report (${docLabel(d)})` });
+      // A document counts only with its copy (see the header), and only once in
+      // force: one filed ahead of its valid-from date is not current yet.
+      if (end && d.stored > 0 && !d.starts_on) ends.push({ end, label: isBill ? `water bill (${docLabel(d)})` : `water test report (${docLabel(d)})` });
       rows.push(row(
         [isBill ? 'Water bill' : 'Water test document', d.issuer, d.reference_no, d.issued_on || d.valid_from || d.created_on, end || '—',
           [d.stored ? plural(d.stored, 'scan') : 'no copy attached', d.in_order || !d.stored ? '' : d.state_words].filter(Boolean).join(' · ')],
@@ -1355,6 +1440,9 @@ function water(ctx: Ctx): Part {
   p.status = v.status;
   p.problems = v.problems;
   if (!best && held) p.problems = ['Water records are on file, but none is a dated laboratory report or a filed document with a copy attached.'];
+  if (p.status !== 'present' && waterNotYet.length) {
+    p.problems.push(...waterNotYet.map((d) => `${docLabel(d)} is on file, but it is in force only from ${d.starts_on} — ${until(d.starts_on, ctx.today)}.`));
+  }
   // A lab report recorded without its copy is named while the record is not
   // PRESENT — it is the quickest way to close it (attach the paper).
   if (p.status !== 'present') p.problems.push(...noCopy);
@@ -1828,6 +1916,8 @@ function vendors(ctx: Ctx): Part {
   const expired: string[] = [];
   const none: string[] = [];
   const noCopy: string[] = [];
+  /** Approved, with no licence in force today, but one filed ahead of its valid-from date. */
+  const notYet: string[] = [];
   const soon: string[] = [];
   const lapses: string[] = [];
   const judged = approved.map((v) => {
@@ -1838,7 +1928,10 @@ function vendors(ctx: Ctx): Part {
     const shown: DocRow | null = j?.best || list[0] || null;
     if (!j || !shown) none.push(name);
     else if (j.status === 'missing' && list.every((d) => d.state === 'expired')) expired.push(`${name} (expired ${j.lapses_on || shown.expiry_date})`);
-    else if (j.status === 'missing') {
+    else if (j.status === 'missing' && j.starts_on) {
+      const next = list.find((d) => d.starts_on === j.starts_on) || shown;
+      notYet.push(`${name} (${docLabel(next)}, in force only from ${j.starts_on}${j.lapses_on ? `; the one before expired on ${j.lapses_on}` : ''})`);
+    } else if (j.status === 'missing') {
       noCopy.push(`${name} (${docLabel(shown)}${shown.voided ? ' — its only scan was voided' : ''})`);
     } else if (j.status === 'expiring') { soon.push(`${name} (expires ${shown.expiry_date})`); lapses.push(shown.expiry_date); }
     else if (shown.expiry_date) lapses.push(shown.expiry_date);
@@ -1854,6 +1947,7 @@ function vendors(ctx: Ctx): Part {
   if (expired.length) { status = 'missing'; problems.push(`Approved, but their FSSAI licence has expired: ${expired.join(', ')}.`); }
   if (none.length) { status = 'missing'; problems.push(`Approved, but no FSSAI licence is on file: ${none.join(', ')}.`); }
   if (noCopy.length) { status = 'missing'; problems.push(`Approved, but no copy of their FSSAI licence is attached — the file has the number, not the licence: ${noCopy.join(', ')}.`); }
+  if (notYet.length) { status = 'missing'; problems.push(`Approved, but no FSSAI licence of theirs is in force today — the one on file is not yet in force: ${notYet.join(', ')}.`); }
   if (soon.length) { status = worst(status, 'expiring'); problems.push(`Licence expiring soon: ${soon.join(', ')}.`); }
 
   // THE LIST goes into the inspector's copy only when EVERY approved supplier
@@ -1870,7 +1964,9 @@ function vendors(ctx: Ctx): Part {
       s(v.approver_name) || personWords(ctx.db, v.fssai_approval_by),
       s(v.fssai_approval_at).slice(0, 10),
     ].filter(Boolean).join(' · '),
-    shown?.reference_no || '—', shown?.expiry_date || '—', shown ? STATE_WORDS[shown.state] : 'Not on file',
+    shown?.reference_no || '—', shown?.expiry_date || '—',
+    // A licence filed ahead of its valid-from date says so ("Not yet in force (from …)").
+    shown ? (shown.starts_on ? shown.state_words : STATE_WORDS[shown.state]) : 'Not on file',
     !shown ? '—' : shown.stored ? plural(shown.stored, 'scan') : shown.voided ? 'voided only' : 'none',
   ], '/vendors', !ok ? 'bad' : expiring ? 'warn' : '', complete));
 
@@ -2340,13 +2436,19 @@ function waste(ctx: Ctx): Part {
 
   if (ctx.present.has('fssai_documents')) {
     const docs = readDocs(ctx, ['waste_disposal_record']);
-    const usable = docs.filter((d) => d.stored > 0)
+    // One filed ahead of its valid-from date is not in force yet: never "the" agreement today.
+    const usable = docs.filter((d) => d.stored > 0 && !d.starts_on)
       .map((d) => ({ d, end: d.until })).filter((x) => x.end)
       .sort((a, b) => (a.end < b.end ? 1 : -1));
+    const pendingAgreement = docs.find((d) => d.stored > 0 && d.starts_on);
     // An agreement that has run out is a sentence about a lapse: management's.
     p.summary.push(usable[0]?.d.in_order
       ? { label: 'Agreement', value: `until ${usable[0].end}` }
-      : { label: 'Agreement', value: usable[0] ? `ran out ${usable[0].end}` : '—', mgmt: true as const });
+      : {
+        label: 'Agreement',
+        value: usable[0] ? `ran out ${usable[0].end}` : pendingAgreement ? fssaiNotYetWords(pendingAgreement.starts_on).toLowerCase() : '—',
+        mgmt: true as const,
+      });
     p.tables.push(table('The collector\'s agreement and receipts', DOC_COLUMNS, docRows(docs), ctx.limit, 'Nothing of this kind is on file.'));
     p.scans.push(...docs.flatMap((d) => d.scans));
   }
@@ -2671,13 +2773,19 @@ function foodLab(ctx: Ctx): Part {
   // d.until: its own end date, else CURRENCY_DAYS.food_lab from its date
   // (fssaiPaperUntil) — the same end that decides d.in_order, so a report a
   // year and more old is MISSING here and absent from the inspector's copy.
-  const ends = docs.filter((d) => d.stored > 0).map((d) => ({ d, end: d.until }))
+  // A report filed ahead of its valid-from date is not in force yet: never the current one.
+  const ends = docs.filter((d) => d.stored > 0 && !d.starts_on).map((d) => ({ d, end: d.until }))
     .filter((x) => x.end).sort((a, b) => (a.end < b.end ? 1 : -1));
   const best = ends[0];
   const v = judgePeriod(best?.end || '', ctx.today, 'food lab report');
   p.status = v.status;
   p.problems = v.problems.map((x) => (x.startsWith('No ') ? `${x} (Needed only where applicable.)` : x));
-  if (!best && docs.length) p.problems = [`${docLabel(docs[0])} is recorded, but no copy of it is attached.`];
+  const labNotYet = docs.filter((d) => d.starts_on && d.stored > 0);
+  if (!best && docs.length) {
+    p.problems = labNotYet.length
+      ? labNotYet.map((d) => `${docLabel(d)} is on file, but it is in force only from ${d.starts_on} — ${until(d.starts_on, ctx.today)}.`)
+      : [`${docLabel(docs[0])} is recorded, but no copy of it is attached.`];
+  }
   p.lapses_on = best?.end || '';
   const bestLapsed = !!best && best.end < ctx.today;
   p.headline = best

@@ -2,7 +2,7 @@
 import type Database from 'better-sqlite3';
 import { generateId } from '@/lib/db';
 import {
-  fssaiDocState, fssaiDocType, isISODate, daysBetweenISO,
+  addDaysISO, fssaiDocState, fssaiDocType, isISODate, daysBetweenISO,
   FSSAI_DOC_REMINDER_DAYS, FSSAI_DOC_TYPES,
   type FssaiStatusMeta,
 } from '@/lib/fssai';
@@ -135,25 +135,46 @@ export const FSSAI_HANDLER_REQUIREMENTS: readonly {
  *  expiring    in force, inside its renewal window
  *  no_expiry   on file with no expiry date (in order only where no_expiry_ok)
  *  no_copy     on file and in force, but no scan anyone can read
+ *  not_yet     on file, but in force only from a valid_from date still to come
+ *              (owner ruling 2026-10-15: a renewal filed early is NOT in force
+ *              yet) — so the person is judged on what is in force today
  *  expired     the latest one has lapsed
  *  missing     nothing on file at all
  *  not_required  this person does not need it (not a food handler / not the supervisor)
  */
-export type FssaiHandlerVerdict = 'valid' | 'expiring' | 'no_expiry' | 'no_copy' | 'expired' | 'missing' | 'not_required';
+export type FssaiHandlerVerdict = 'valid' | 'expiring' | 'no_expiry' | 'no_copy' | 'not_yet' | 'expired' | 'missing' | 'not_required';
 
 export const FSSAI_HANDLER_VERDICTS: readonly (FssaiStatusMeta & { key: FssaiHandlerVerdict })[] = [
   { key: 'valid',        label: 'Valid',            color: 'bg-green-100 text-green-700 border-green-200' },
   { key: 'expiring',     label: 'Expiring soon',    color: 'bg-amber-100 text-amber-800 border-amber-200' },
   { key: 'no_expiry',    label: 'No expiry date',   color: 'bg-yellow-50 text-yellow-800 border-yellow-200' },
   { key: 'no_copy',      label: 'No copy on file',  color: 'bg-orange-100 text-orange-700 border-orange-200' },
+  { key: 'not_yet',      label: 'Not yet in force', color: 'bg-orange-100 text-orange-700 border-orange-200' },
   { key: 'expired',      label: 'EXPIRED',          color: 'bg-red-100 text-red-700 border-red-200' },
   { key: 'missing',      label: 'MISSING',          color: 'bg-red-100 text-red-700 border-red-200' },
   { key: 'not_required', label: 'Not required',     color: 'bg-gray-50 text-gray-400 border-gray-200' },
 ] as const;
 
 const VERDICT_RANK: Record<FssaiHandlerVerdict, number> = {
-  valid: 0, expiring: 1, no_expiry: 2, no_copy: 3, expired: 4, missing: 5, not_required: 6,
+  valid: 0, expiring: 1, no_expiry: 2, no_copy: 3, not_yet: 4, expired: 5, missing: 6, not_required: 7,
 };
+
+/**
+ * NOT YET IN FORCE (owner ruling 2026-10-15): a paper is in force only from its
+ * valid_from date — a renewal filed early does not stand until then. The day it
+ * comes into force when that is still to come; '' when it is in force by its
+ * start (or carries no valid_from). The one test for the food-handler record,
+ * the audit file's paper judge and Inspection Mode (fssaiHandoverPaperJudge).
+ */
+export function fssaiPaperStartsOn(validFrom: unknown, today: string): string {
+  const v = (validFrom === null || validFrom === undefined ? '' : String(validFrom)).trim();
+  return isISODate(v) && isISODate(today) && v > today ? v : '';
+}
+
+/** "Not yet in force (from 2026-10-22)" — the State words of a paper not in force yet. */
+export function fssaiNotYetWords(startsOn: string): string {
+  return `Not yet in force (from ${startsOn})`;
+}
 
 export function fssaiHandlerVerdictMeta(v: string | null | undefined): FssaiStatusMeta {
   return FSSAI_HANDLER_VERDICTS.find((x) => x.key === v) || { key: String(v || ''), label: String(v || ''), color: 'bg-gray-100 text-gray-600 border-gray-200' };
@@ -228,6 +249,11 @@ export interface FssaiHandlerEvidence {
   issued_on: string;
   expiry_date: string;
   state: 'no_expiry' | 'valid' | 'expiring' | 'expired';
+  /**
+   * The day it comes into force (its valid_from) when that is after today —
+   * NOT in force yet (fssaiPaperStartsOn); '' when it is in force by its start.
+   */
+  starts_on: string;
   days_to_expiry: number | null;
   /** live, readable scans on the document (void and blanked ones excluded); HRMS = 1 */
   copies: number;
@@ -418,11 +444,13 @@ export interface FssaiHandlerCoverage {
 }
 
 function emptyCounts(): Record<FssaiHandlerVerdict, number> {
-  return { valid: 0, expiring: 0, no_expiry: 0, no_copy: 0, expired: 0, missing: 0, not_required: 0 };
+  return { valid: 0, expiring: 0, no_expiry: 0, no_copy: 0, not_yet: 0, expired: 0, missing: 0, not_required: 0 };
 }
 
 function evidenceVerdict(e: FssaiHandlerEvidence): FssaiHandlerVerdict {
   if (e.state === 'expired') return 'expired';
+  // In force only from a day still to come: not in force today, whatever its expiry.
+  if (e.starts_on) return 'not_yet';
   if (e.copies <= 0) return 'no_copy';
   if (e.state === 'expiring') return 'expiring';
   if (e.state === 'no_expiry') return 'no_expiry';
@@ -447,24 +475,37 @@ function judgeRequirement(
   if (!required) verdict = 'not_required';
   else if (!ranked.length) verdict = 'missing';
   else verdict = ranked[0].v;
+  const best = required && ranked.length ? ranked[0].e : null;
+  // A RENEWAL ALREADY FILED. The certificate in force today is inside its
+  // renewal window, and the next one is on file, with a copy, and comes into
+  // force by the day after it lapses: the person is judged on the one in force
+  // (it is the best), but there is nothing left to renew, so it is not flagged
+  // "Expiring soon". A renewal that leaves a gap is not this case.
+  if (verdict === 'expiring' && best && isISODate(best.expiry_date)) {
+    const dayAfter = addDaysISO(best.expiry_date, 1);
+    const renewed = mine.some((e) => e.starts_on && e.starts_on <= dayAfter && e.copies > 0 && e.state !== 'expired' &&
+      (e.state !== 'no_expiry' || req.no_expiry_ok));
+    if (renewed) verdict = 'valid';
+  }
   const inOrder = required && (verdict === 'valid' || verdict === 'expiring' || (verdict === 'no_expiry' && req.no_expiry_ok));
   const meta = fssaiHandlerVerdictMeta(verdict);
   const what = req.key === 'medical' ? 'medical fitness certificate'
     : req.key === 'training' ? 'food-safety training certificate (or a FoSTaC certificate)'
       : 'FoSTaC certificate';
-  const best = required && ranked.length ? ranked[0].e : null;
   const todo = !required || inOrder ? (verdict === 'expiring' && best ? `Renew the ${what} before ${best.expiry_date}.` : '')
     : verdict === 'missing' ? `File a ${what} for ${handler.full_name}, with a scan.`
       : verdict === 'expired' ? `${handler.full_name}'s ${what} expired on ${best?.expiry_date}. File the new one.`
         : verdict === 'no_copy' ? `Attach a scan of ${handler.full_name}'s ${what} — without a copy it cannot be shown.`
           : verdict === 'no_expiry' ? `Add the expiry date to ${handler.full_name}'s ${what}.`
-            : '';
+            : verdict === 'not_yet' && best ? `${handler.full_name}'s ${what} on file is in force only from ${best.starts_on}; until then none is in force. File the one in force today, if there is one.`
+              : '';
   return {
     key: req.key,
     label: req.label,
     required,
     verdict,
-    verdict_label: meta.label,
+    // "Not yet in force (from 2026-10-22)" — the date is the reason.
+    verdict_label: verdict === 'not_yet' && best ? fssaiNotYetWords(best.starts_on) : meta.label,
     verdict_color: meta.color,
     in_order: inOrder,
     best,
@@ -528,7 +569,7 @@ export function readFssaiFoodHandlerCoverage(db: Database.Database, opts: FssaiH
   const hasAttStatus = !!db.prepare(`SELECT 1 FROM pragma_table_xinfo('fssai_attachments') WHERE name = 'status'`).get();
   const types = [...FSSAI_HANDLER_DOC_TYPES];
   const docs = db.prepare(
-    `SELECT d.id, d.doc_type, d.title, d.reference_no, d.issued_on, d.expiry_date, d.reminder_days,
+    `SELECT d.id, d.doc_type, d.title, d.reference_no, d.issued_on, d.valid_from, d.expiry_date, d.reminder_days,
             d.handler_id, lower(d.person_email) AS person_email,
             (SELECT COUNT(*) FROM fssai_attachments a
               WHERE a.entity_table = 'fssai_documents' AND a.entity_id = d.id AND a.data_uri <> ''
@@ -567,7 +608,8 @@ export function readFssaiFoodHandlerCoverage(db: Database.Database, opts: FssaiH
       source: 'document', id: s(d.id), doc_type: s(d.doc_type),
       type_label: fssaiDocType(s(d.doc_type))?.label || s(d.doc_type),
       title: s(d.title), reference_no: s(d.reference_no), issued_on: s(d.issued_on),
-      expiry_date: s(d.expiry_date), state, days_to_expiry: days !== null && Number.isFinite(days) ? days : null,
+      expiry_date: s(d.expiry_date), state, starts_on: fssaiPaperStartsOn(d.valid_from, today),
+      days_to_expiry: days !== null && Number.isFinite(days) ? days : null,
       copies: Number(d.copies) || 0, matched_by: matched,
     };
     if (hid) push(hid, ev);
@@ -607,7 +649,8 @@ export function readFssaiFoodHandlerCoverage(db: Database.Database, opts: FssaiH
           source: 'hrms', id: s(c.id), doc_type: s(c.counts_as),
           type_label: `${fssaiDocType(s(c.counts_as))?.label || s(c.counts_as)} (HRMS)`,
           title: s(c.training_name), reference_no: '', issued_on: s(c.completed_date),
-          expiry_date: expiry, state, days_to_expiry: days !== null && Number.isFinite(days) ? days : null,
+          // A completion stands from the day it was completed (HRMS writes it after the fact).
+          expiry_date: expiry, state, starts_on: '', days_to_expiry: days !== null && Number.isFinite(days) ? days : null,
           // The HRMS completion IS the record of the training; there is no scan to lose.
           copies: 1, matched_by: 'employee_id',
         });
@@ -639,7 +682,9 @@ export function readFssaiFoodHandlerCoverage(db: Database.Database, opts: FssaiH
       if (c.required && !c.in_order) {
         notInOrder[req.key].push({
           id: h.id, handler_no: h.handler_no, full_name: h.full_name,
-          verdict: c.verdict, verdict_label: c.verdict_label, expiry_date: c.best?.expiry_date || '',
+          // A paper not in force yet carries its start date in verdict_label; its
+          // expiry beside that would read as when it lapses, so it is left off.
+          verdict: c.verdict, verdict_label: c.verdict_label, expiry_date: c.verdict === 'not_yet' ? '' : c.best?.expiry_date || '',
         });
       }
     }
@@ -677,7 +722,9 @@ export function readFssaiFoodHandlerCoverage(db: Database.Database, opts: FssaiH
       'Every person on the food-handler register who works here is judged on their own. A food handler needs a medical fitness ' +
       'certificate and food-safety training (a FoSTaC certificate counts as training); the FoSTaC supervisor needs a FoSTaC ' +
       'certificate. The best current certificate decides: in force with a scan → Valid; inside its renewal window → Expiring; ' +
-      'no scan → No copy; lapsed → EXPIRED; nothing on file → MISSING. A medical or FoSTaC certificate with no expiry date is ' +
+      'no scan → No copy; lapsed → EXPIRED; nothing on file → MISSING. A certificate is in force only from its valid-from date: ' +
+      'one dated to start on a day still to come (a renewal filed early) is Not yet in force, and the person is judged on what is in force today. ' +
+      'A medical or FoSTaC certificate with no expiry date is ' +
       'not in order (nobody can say it still counts); a training record with no expiry is. HRMS training completions count ' +
       'when an HRMS training is mapped on this screen. Voided and superseded certificates, and voided scans, never count. ' +
       `At least one certified FoSTaC supervisor is needed for every ${FSSAI_FOSTAC_HANDLERS_PER_SUPERVISOR} food handlers.`,
