@@ -36,9 +36,10 @@ import { canApproveTableOp, type SessionUser } from './auth';
  * copy opens; take it away and it closes. This file assigns nothing.
  *
  * ── WHAT THIS DOES NOT DECIDE ───────────────────────────────────────────────
- * "May this person take a copy of a bill" — never "which bills". The route
- * looks the bill up by id alone, as production always has; it adds no outlet
- * scope, because the approval did not name one.
+ * "May this person take a copy of a bill" — never "which bills". WHICH bills is
+ * the route's outlet scope (owner ruling 35: each login reprints only its own
+ * outlet's bills; admin all) — see the header of
+ * src/app/api/dine-in/orders/[id]/bill-pdf/route.ts.
  *
  * WHY A FILE OF ITS OWN when the answer is canApproveTableOp(): that predicate
  * also gates money and authority decisions (service-charge waiver, discount

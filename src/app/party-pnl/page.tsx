@@ -9,7 +9,10 @@
  *             + party_consumption × material avg price (snapshotted), including
  *               rows with no party id that ONLY this party matches by name;
  *               a row that matches two or more parties counts on none until the
- *               owner assigns it (owner ruling 2026-10-14)
+ *               owner assigns it (owner ruling 2026-10-14). A row carrying an
+ *               AKAN id that is on two or more F&P rows counts only on the F&P
+ *               it was recorded from (else the one on its date, else on none
+ *               until assigned) — never on every row with the id.
  * Profit    = Revenue − (Food + Liquor)
  *
  * Bar manager records bottle counts the night of / morning after the event
@@ -168,13 +171,18 @@ interface PnLRow {
   has_liquor_recorded: boolean;
 }
 
-/** A party_consumption row charged to NO party: its name matches two or more
- *  parties that evening ('several_parties') or none ('no_party'). */
+/** A party_consumption row charged to NO party: recorded without a party id
+ *  under a name that matches two or more parties that evening
+ *  ('several_parties') or none ('no_party'); or recorded WITH an id that is on
+ *  two or more F&P rows when neither the F&P it was recorded from nor its date
+ *  picks one ('id_on_several_parties'). */
 interface UnassignedLiquor {
   id: string;
   event_name: string;
   event_date: string;
-  reason: 'several_parties' | 'no_party';
+  reason: 'several_parties' | 'no_party' | 'id_on_several_parties';
+  /** The entry's own party id (null for one recorded without an id). */
+  party_unique_id?: string | null;
   material_name: string | null;
   material_unit: string | null;
   qty_consumed: number | null;
@@ -362,7 +370,7 @@ export default function PartyPnLPage() {
                       {(r.liquor_unassigned_items || 0) > 0 && (
                         <button onClick={() => setRecordFor(r)}
                                 className="block text-[10px] text-red-700 hover:underline text-left"
-                                title="Recorded under a name that matches more than one party that evening — not counted on any P&L until the owner assigns it.">
+                                title="Recorded under a name that matches more than one party that evening, or with a party id that is on more than one F&P when nothing picks one — not counted on any P&L until the owner assigns it.">
                           {r.liquor_unassigned_items} awaiting owner assignment — not counted
                         </button>
                       )}
@@ -422,11 +430,15 @@ export default function PartyPnLPage() {
  * A bottle recorded without a party id is counted only when exactly ONE party
  * that evening matches the name it was recorded under. These matched two or
  * more (or none), so every P&L above leaves them out; the list is what keeps
- * them from silently disappearing. Assigning sets the row's party id (admin
- * only, and only to a party the name and date actually match); its quantity and
- * snapshotted cost stay exactly as recorded, and it then counts on that party
- * alone (owner ruling 34: a party without an id never counts an entry carrying
- * an id). A party without an id cannot be chosen until the sheet gives it one;
+ * them from silently disappearing. Assigning sets the row's party id and F&P
+ * (admin only, and only to a party the name and date actually match); its
+ * quantity and snapshotted cost stay exactly as recorded, and it then counts on
+ * that F&P row alone (owner ruling 34: a party without an id never counts an
+ * entry carrying an id, and when one AKAN id is on two F&P rows an entry counts
+ * only on the F&P it belongs to). The button sends the clicked row's fp_id, so
+ * the second F&P of a booking can be chosen. Entries already carrying an id
+ * that is on several F&P rows, with nothing to pick one, are listed here too.
+ * A party without an id cannot be chosen until the sheet gives it one;
  * "recorded from" names the F&P whose screen the entry was typed on.
  */
 function UnassignedLiquorPanel({ items, canAssign, onChanged }: {
@@ -438,11 +450,16 @@ function UnassignedLiquorPanel({ items, canAssign, onChanged }: {
   const [err, setErr] = useState<string | null>(null);
   const total = items.reduce((a, x) => a + (x.cost_at_time || 0), 0);
 
-  const assign = async (id: string, partyUniqueId: string, label: string) => {
+  // fp_id names WHICH F&P row was clicked: one AKAN id can sit on two F&P rows
+  // (two functions of one booking), and the entry must count on the one chosen.
+  const assign = async (id: string, partyUniqueId: string, fpId: string | null, label: string) => {
     if (typeof window !== 'undefined' && !window.confirm(`Assign this entry to ${label}? It will then count on that party's P&L.`)) return;
     setBusy(id); setErr(null);
     try {
-      const r = await api('/api/party-consumption', { method: 'PATCH', body: { id, party_unique_id: partyUniqueId } });
+      const r = await api('/api/party-consumption', {
+        method: 'PATCH',
+        body: { id, party_unique_id: partyUniqueId, ...(fpId ? { fp_id: fpId } : {}) },
+      });
       const j = await r.json().catch(() => ({}));
       if (!r.ok) { setErr(j.error || `HTTP ${r.status}`); return; }
       onChanged();
@@ -456,8 +473,10 @@ function UnassignedLiquorPanel({ items, canAssign, onChanged }: {
           <AlertTriangle size={14} /> Liquor counted on no party — {items.length} entr{items.length === 1 ? 'y' : 'ies'} · {fmt(total)}
         </div>
         <div className="text-[11px] text-red-700 mt-0.5">
-          Recorded without a party id under a name that matches more than one party that evening (or none).
-          None of the P&amp;Ls above includes these until {canAssign ? 'you assign' : 'the owner assigns'} each one to its party.
+          Recorded without a party id under a name that matches more than one party that evening (or none) — or
+          recorded with a party id that is on more than one F&amp;P, when neither the F&amp;P it was recorded from nor its
+          date picks one. None of the P&amp;Ls above includes these until {canAssign ? 'you assign' : 'the owner assigns'} each
+          one to its party.
         </div>
       </div>
       {err && <div className="px-4 py-2 text-xs bg-red-50 text-red-700 border-b border-red-200">{err}</div>}
@@ -478,6 +497,9 @@ function UnassignedLiquorPanel({ items, canAssign, onChanged }: {
                 <td className="py-1.5 px-3 font-mono whitespace-nowrap">{x.event_date}</td>
                 <td className="py-1.5 px-3 text-[#2D1B0E]">
                   {x.event_name}
+                  {x.reason === 'id_on_several_parties' && x.party_unique_id && (
+                    <div className="text-[10px] text-[#8B7355]">carries id {x.party_unique_id} — on more than one F&amp;P</div>
+                  )}
                   {x.recorded_by && <div className="text-[10px] text-[#8B7355]">by {String(x.recorded_by).split('@')[0]}</div>}
                   {x.recorded_fp_id && (
                     <div className="text-[10px] text-[#8B7355]"
@@ -501,7 +523,8 @@ function UnassignedLiquorPanel({ items, canAssign, onChanged }: {
                             {c.fp_id && <span className="text-[9px] font-mono text-[#af4408]">{c.fp_id}</span>}
                             {canAssign && (c.party_unique_id
                               ? <button type="button" disabled={busy === x.id}
-                                        onClick={() => assign(x.id, c.party_unique_id!, c.event_name || c.party_unique_id!)}
+                                        onClick={() => assign(x.id, c.party_unique_id!, c.fp_id,
+                                          (c.event_name || c.party_unique_id!) + (c.fp_id ? ` (${c.fp_id})` : ''))}
                                         className="px-2 py-0.5 rounded text-[10px] bg-[#af4408] hover:bg-[#933807] text-white disabled:opacity-50">
                                   {busy === x.id ? 'Assigning…' : 'Assign here'}
                                 </button>
@@ -615,9 +638,14 @@ interface ConsumptionEntry {
 }
 
 /** Recorded without a party id under a name that matches this party AND another
- *  that evening — counted on NEITHER until the owner assigns it. Never summed. */
+ *  that evening ('several_parties'), or recorded with an id this row shares with
+ *  another F&P when neither the F&P it was recorded from nor its date picks one
+ *  ('id_on_several_parties') — counted on NEITHER until the owner assigns it.
+ *  Never summed. */
 interface UnassignedEntry extends ConsumptionEntry {
   event_name: string;
+  reason?: 'several_parties' | 'id_on_several_parties';
+  party_unique_id?: string | null;
   candidates: { party_unique_id: string | null; fp_id?: string | null; event_name: string; event_date: string }[];
 }
 
@@ -963,7 +991,8 @@ function RecordConsumptionModal({ target, onClose, onChanged }: {
             <div className="border border-red-200 rounded-lg overflow-hidden">
               <div className="px-2 py-1.5 text-[10px] text-red-800 bg-red-50 border-b border-red-200">
                 <b>Not counted on this P&amp;L — awaiting the owner.</b> Recorded without a party id under a name that
-                matches more than one party on {target.event_date}. Do not record it again; the owner assigns it to one party.
+                matches more than one party on {target.event_date}, or with a party id that is on more than one F&amp;P
+                when nothing picks one. Do not record it again; the owner assigns it to one party.
               </div>
               <div className="overflow-x-auto">
                 <table className="w-full text-xs">
@@ -973,7 +1002,9 @@ function RecordConsumptionModal({ target, onClose, onChanged }: {
                         <td className="py-1.5 px-2">
                           <div className="text-[#2D1B0E]">{e.material_name}</div>
                           <div className="text-[10px] text-[#8B7355]">
-                            under &ldquo;{e.event_name}&rdquo; · matches {e.candidates.map(candidateLabel).join(', ')}
+                            under &ldquo;{e.event_name}&rdquo;
+                            {e.reason === 'id_on_several_parties' && e.party_unique_id && <> (id {e.party_unique_id})</>}
+                            {' '}· matches {e.candidates.map(candidateLabel).join(', ')}
                           </div>
                         </td>
                         <td className="py-1.5 px-2 text-right font-mono whitespace-nowrap">{prettyQty(e.qty_consumed, e.material_unit)}</td>

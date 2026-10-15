@@ -440,10 +440,12 @@ export function findPnlPartyIndex(parties: CachedPnlParty[], key: PartyEventKey)
  *     pnlCandidateNames — and the dates are equal). Give it to that party and
  *     mark it "matched by name";
  *   · when TWO OR MORE parties match, count it NOWHERE and list it for the owner
- *     to assign (PATCH /api/party-consumption sets its party_unique_id, after
- *     which it is an ordinary id-bearing row and counts on that party alone —
- *     since ruling 34(b) no party without an id counts an id-bearing row, so an
- *     assignment can no longer land a bottle on a second P&L);
+ *     to assign (PATCH /api/party-consumption sets its party_unique_id AND its
+ *     fp_id to the F&P chosen, after which it is an ordinary id-bearing row and
+ *     counts on that F&P alone — since ruling 34(b) no party without an id
+ *     counts an id-bearing row, and claimIdConsumption below charges an entry
+ *     whose id is on several rows to the one it names by fp_id; PATCH re-runs
+ *     that claim before it commits);
  *   · when NO party matches, it is counted nowhere, as before, and is listed too
  *     so a recorded bottle can never vanish without a trace.
  *
@@ -468,6 +470,13 @@ export interface OrphanClaimant {
   names: string[];
   date?: string;
   party_unique_id?: string;
+  /** The F&P id, trimmed. Names the row an id-bearing party_consumption entry
+   *  was recorded from when its id is on two or more rows (claimIdConsumption). */
+  fp_id?: string;
+  /** The AKAN id EXACTLY as the cache holds it (untrimmed) — the string the
+   *  party_consumption id arm has always bound, so a party that alone holds its
+   *  id is charged the very rows it was charged before (claimIdConsumption). */
+  party_unique_id_raw?: string;
 }
 
 /** An orphan party_consumption row, as the claim reads it. */
@@ -493,6 +502,8 @@ export function partyClaimants(parties: CachedPnlParty[]): OrphanClaimant[] {
     names: pnlCandidateNames(p),
     date: p.event_date,
     party_unique_id: String(p.party_unique_id || '').trim() || undefined,
+    fp_id: String(p.fp_id || '').trim() || undefined,
+    party_unique_id_raw: p.party_unique_id || undefined,
   }));
 }
 
@@ -521,7 +532,11 @@ export function partySlot(parties: CachedPnlParty[], key: PartyEventKey):
   const id = String(key.party_unique_id || '').trim() || undefined;
   if (!date && !id) return { claimants, index: -1, party: undefined, party_unique_id: undefined };
   const name = String(key.event_name || '').trim();
-  claimants.push({ names: name ? [name] : [], date: date || undefined, party_unique_id: id });
+  claimants.push({
+    names: name ? [name] : [], date: date || undefined, party_unique_id: id,
+    fp_id: String(key.fp_id || '').trim() || undefined,
+    party_unique_id_raw: key.party_unique_id || undefined,
+  });
   // The key's id as sent, as the id arm has always bound it.
   return { claimants, index: claimants.length - 1, party: undefined, party_unique_id: key.party_unique_id || undefined };
 }
@@ -593,6 +608,108 @@ export function orphanShareOf(claims: OrphanClaims, index: number):
     matched: claims.owned.get(index) || [],
     awaiting: claims.ambiguous.filter(a => a.candidates.includes(index)),
   };
+}
+
+/* ────────────────────────────────────────────────────────────────────────────
+ * RECORDED LIQUOR THAT CARRIES AN AKAN ID — whose row is it?
+ * ────────────────────────────────────────────────────────────────────────────
+ *
+ * A party_consumption row with a party_unique_id used to count on EVERY cached
+ * row holding that id: the P&L ran `WHERE party_unique_id = ?` once per row.
+ * One AKAN id can sit on two or three F&P rows (Party Manager can create a
+ * second F&P for a party; pm_fp_records is unique on fp_id only), so one
+ * recorded bottle showed on two or three P&Ls — the defect ruling 34 removed
+ * for requisitions, on the other half of the liquor cost.
+ *
+ * THE RULE, for an entry carrying an id:
+ *   · ONE cached row holds the id — that row, whatever the entry's F&P or date.
+ *     Exactly the rows it was charged before (same id string, untrimmed).
+ *   · TWO OR MORE hold it — the row it was RECORDED FROM: the holder whose fp_id
+ *     is the entry's fp_id (the page posts the clicked row's fp_id with every
+ *     entry, and Assign sets it to the row the owner chose). An entry with no
+ *     fp_id, or one naming none of the holders, goes by its date, like a
+ *     requisition (ruling 34): the one holder on its event_date. Otherwise it
+ *     is counted on NONE of them and listed for the owner to assign
+ *     (candidates = the holders on its date, else every holder).
+ *   · NO cached row holds it — counted on no board row, as before (the
+ *     single-party P&L for that id still counts it: partySlot appends the key
+ *     as the one holder).
+ * Decided across every claimant at once, like the orphan claim, because "this
+ * row and no other" cannot be seen from a per-row query.
+ */
+
+/** A party_consumption row that carries an AKAN id, as the claim reads it. */
+export interface IdConsumptionRow extends OrphanRow {
+  party_unique_id: string;  // as stored (the id arm binds it untrimmed)
+  fp_id: string;            // trimmed; '' = none
+}
+
+export interface IdConsumptionClaims {
+  /** claimant index → the id-bearing rows it is charged for. */
+  owned: Map<number, IdConsumptionRow[]>;
+  /** Its id is on two or more rows and neither its F&P nor its date picks one:
+   *  counted on none until the owner assigns it. */
+  shared: { row: IdConsumptionRow; candidates: number[] }[];
+}
+
+/** THE RULE for id-bearing entries. See the block comment above. */
+export function claimIdConsumption(db: DB, claimants: OrphanClaimant[]): IdConsumptionClaims {
+  const out: IdConsumptionClaims = { owned: new Map(), shared: [] };
+  const byId = new Map<string, number[]>();
+  claimants.forEach((c, i) => {
+    const id = c.party_unique_id_raw;
+    if (!id) return;
+    const list = byId.get(id);
+    if (list) list.push(i); else byId.set(id, [i]);
+  });
+  if (!byId.size) return out;
+  const rows = db.prepare(`
+    SELECT id,
+           TRIM(COALESCE(event_name, '')) AS event_name,
+           TRIM(COALESCE(event_date, '')) AS event_date,
+           COALESCE(cost_at_time, 0)      AS cost,
+           party_unique_id,
+           TRIM(COALESCE(fp_id, ''))      AS fp_id
+    FROM party_consumption
+    WHERE party_unique_id IS NOT NULL
+    ORDER BY recorded_at, id
+  `).all() as IdConsumptionRow[];
+  const give = (i: number, row: IdConsumptionRow) => {
+    const list = out.owned.get(i);
+    if (list) list.push(row); else out.owned.set(i, [row]);
+  };
+  for (const row of rows) {
+    const holders = byId.get(row.party_unique_id);
+    if (!holders) continue;
+    if (holders.length === 1) { give(holders[0], row); continue; }
+    // The F&P it was recorded from, when that is one of the holders.
+    const byFp = row.fp_id ? holders.filter(i => (claimants[i].fp_id || '') === row.fp_id) : [];
+    const pool = byFp.length ? byFp : holders;
+    if (pool.length === 1) { give(pool[0], row); continue; }
+    // Else its date, as a requisition's date picks its row (ruling 34).
+    const onDate = pool.filter(i => String(claimants[i].date || '').trim() === row.event_date);
+    if (onDate.length === 1) give(onDate[0], row);
+    else out.shared.push({ row, candidates: [...(onDate.length ? onDate : pool)].sort((a, b) => a - b) });
+  }
+  return out;
+}
+
+/** One party's view of the id claim: the entries it is charged for, and the
+ *  ones costed on nobody that list it as a candidate (never summed). */
+export function idConsumptionShareOf(claims: IdConsumptionClaims, index: number):
+  { rows: IdConsumptionRow[]; awaiting: { row: IdConsumptionRow; candidates: number[] }[] } {
+  if (index < 0) return { rows: [], awaiting: [] };
+  return {
+    rows: claims.owned.get(index) || [],
+    awaiting: claims.shared.filter(a => a.candidates.includes(index)),
+  };
+}
+
+/** Which claimant an entry is charged to under claimIdConsumption, or -1 when
+ *  it is charged to none (listed, or no listed row holds its id). */
+export function idConsumptionOwnerOf(claims: IdConsumptionClaims, entryId: string): number {
+  for (const [i, rows] of claims.owned) if (rows.some(r => r.id === entryId)) return i;
+  return -1;
 }
 
 /* ────────────────────────────────────────────────────────────────────────────
@@ -739,11 +856,17 @@ export function partyReqShareOf(claims: ReqClaims, index: number):
  * resolve the same key to different requisitions, rows or id. The bulk board
  * computes the same claims over partyClaimants(parties) and reads each party's
  * own index, which is the index partySlot() returns for that party's key.
+ * idShare.rows are the id-bearing entries this row is charged for
+ * (claimIdConsumption) — the modal lists exactly those, never every entry
+ * carrying the id.
  */
 export function partyScope(db: DB, key: PartyEventKey) {
   const parties = loadPnlParties(db);
   const slot = partySlot(parties, key);
   const reqShare = partyReqShareOf(claimPartyRequisitions(db, slot.claimants), slot.index);
   const orphanShare = orphanShareOf(claimOrphanConsumption(db, slot.claimants), slot.index);
-  return { parties, ...slot, reqIds: reqShare.reqIds, reqAwaiting: reqShare.awaiting, orphanShare };
+  // The entries carrying an id that THIS row is charged for (its id alone, or —
+  // when the id is on several rows — the ones recorded from / dated on this row).
+  const idShare = idConsumptionShareOf(claimIdConsumption(db, slot.claimants), slot.index);
+  return { parties, ...slot, reqIds: reqShare.reqIds, reqAwaiting: reqShare.awaiting, orphanShare, idShare };
 }

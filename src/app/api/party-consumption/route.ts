@@ -2,6 +2,7 @@ import { getDb, generateId, logAuditEvent } from '@/lib/db';
 import { getCurrentUser } from '@/lib/auth';
 import {
   partyScope, partyLiquorReqItems, loadPnlParties, pnlCandidateNames,
+  partyClaimants, claimIdConsumption, idConsumptionOwnerOf,
 } from '@/lib/party-liquor';
 
 /**
@@ -27,6 +28,10 @@ import {
  * the ONLY party that evening its name matches; when another party matches too it
  * is in `unassigned_entries` instead — shown, never summed — until the owner
  * assigns it with PATCH. So the modal, the badge and the P&L cannot disagree.
+ * ROWS THAT CARRY AN ID go through claimIdConsumption, the claim the P&L's id arm
+ * uses: when one AKAN id is on two or more F&P rows, an entry is in the `entries`
+ * of the row it was recorded from (fp_id), else of the one row on its date, else
+ * in every candidate's `unassigned_entries` (reason 'id_on_several_parties').
  *
  * OWNER RULING 34 (2026-10-14). The requisition lines shown, and the ones the
  * POST 409 gate checks, are exactly the requisitions the P&L costs on this party
@@ -45,8 +50,10 @@ import {
  *                items: [{ material_id, qty, notes? }], confirm_duplicates? }
  *        -> 409 { error, duplicates } when an item is already costed from the
  *           party's requisition and confirm_duplicates is not true
- * PATCH  /api/party-consumption   body: { id, party_unique_id }   (admin only)
- *        assigns an orphan row to one of the parties its name + date match
+ * PATCH  /api/party-consumption   body: { id, party_unique_id, fp_id? }   (admin only)
+ *        assigns an orphan row to one of the parties its name + date match, or
+ *        an entry whose id is on several F&P rows to one of them; fp_id names
+ *        the F&P row (the page always sends it)
  * DELETE /api/party-consumption?id=<uuid>
  */
 export const dynamic = 'force-dynamic';
@@ -81,18 +88,22 @@ export async function GET(request: Request) {
     const scope = partyScope(db, key);
     const { parties } = scope;
 
-    // THE ID-BEARING ROWS — pnlFor's id arm, on the id of the party the key
-    // resolved to (a party that gained an id since the page loaded is read by
-    // it, as the board reads it). A party WITHOUT an id has none (ruling 34b): an
-    // id-bearing row recorded under its display name is the id's party's bottle,
-    // and the P&L no longer counts it here.
+    // THE ID-BEARING ROWS — exactly the ones pnlFor's id arm charges the row the
+    // key resolved to (scope.idShare, claimIdConsumption): every entry carrying
+    // its id when it alone holds the id; when the id is on two or more F&P rows,
+    // only those recorded from THIS row (or dated on its date when nothing else
+    // picks one). This used to be `WHERE pc.party_unique_id = ?`, which showed
+    // every F&P of one booking the others' bottles — and offered to delete them.
+    // A party WITHOUT an id has none (ruling 34b): an id-bearing row recorded
+    // under its display name is the id's party's bottle.
     const SELECT_ROWS = `
         SELECT pc.*, rm.name AS material_name, rm.unit AS material_unit,
                rm.average_price AS current_avg_price
         FROM party_consumption pc
         JOIN raw_materials rm ON rm.id = pc.material_id`;
+    const byId = db.prepare(`${SELECT_ROWS} WHERE pc.id = ?`);
     const own = (scope.party_unique_id
-      ? db.prepare(`${SELECT_ROWS} WHERE pc.party_unique_id = ?`).all(scope.party_unique_id)
+      ? scope.idShare.rows.map(r => byId.get(r.id) as any).filter(Boolean)
       : []) as any[];
 
     // THE ORPHAN ROWS (no party id) — through the P&L's own claim, over the P&L's
@@ -100,7 +111,6 @@ export async function GET(request: Request) {
     // route's. A per-party SQL arm cannot see the OTHER parties, which is exactly
     // how the parked build showed party A a bottle only party B was charged for.
     const { matched, awaiting } = scope.orphanShare;
-    const byId = db.prepare(`${SELECT_ROWS} WHERE pc.id = ?`);
     // A claimant index, described. fp_id is what tells two parties of the same
     // display name apart ("Ravi Kumar" / "Ravi Kumar"). An index past the cached
     // list is the key itself (appended by partySlot).
@@ -126,12 +136,19 @@ export async function GET(request: Request) {
     // Rows that name this party AND another that evening: charged to NOBODY. They
     // are listed — never summed — so the recorder can see the bottle is waiting
     // for the owner rather than missing, and does not type it in again.
-    const unassigned = awaiting
-      .map(a => {
+    // Then the entries CARRYING this row's id that the id claim charged to no row:
+    // the id is on two or more F&P rows and neither the F&P they were recorded
+    // from nor their date picks one. Listed the same way, never summed.
+    const unassigned = [
+      ...awaiting.map(a => ({ a, reason: 'several_parties' as const })),
+      ...scope.idShare.awaiting.map(a => ({ a, reason: 'id_on_several_parties' as const })),
+    ]
+      .map(({ a, reason }) => {
         const r = byId.get(a.row.id) as any;
         if (!r) return null;
         return {
           ...r,
+          reason,
           candidates: a.candidates.map(i => candidateOf(i)),
         };
       })
@@ -288,18 +305,41 @@ export async function POST(request: Request) {
 }
 
 /**
- * ASSIGN AN ORPHAN ROW (owner ruling 2026-10-14). A party_consumption row with
- * no party_unique_id whose name matches two or more parties that evening is
- * charged to NONE of them until the owner says whose it is. This sets its
- * party_unique_id, after which it is an ordinary id-bearing row and counts on
- * exactly that party through the P&L's id arm.
+ * ASSIGN AN ENTRY TO ONE F&P ROW (owner ruling 2026-10-14; ruling 34). Body
+ * { id, party_unique_id, fp_id } — the page sends the fp_id of the row whose
+ * "Assign here" was clicked.
  *
- * Bounded on purpose: admin only; only a row that is STILL an orphan (the UPDATE
- * re-checks IS NULL, so two clicks cannot reassign it); and only to a cached
- * party that has an id, the row's date, and the row's name among its candidate
- * names — i.e. one of the parties the claim itself found. Nothing else on the row
- * changes: the name it was recorded under, its qty and its snapshotted
- * cost_at_time stay as recorded (re-recording would re-snapshot the price).
+ *  · AN ORPHAN (no party_unique_id) whose name matches two or more parties that
+ *    evening is charged to NONE of them until the owner says whose it is. This
+ *    sets its party_unique_id AND its fp_id to the chosen F&P, after which it is
+ *    an ordinary id-bearing row and counts on exactly that row (claimIdConsumption
+ *    in src/lib/party-liquor.ts). The chosen row must have an id, the entry's
+ *    date, and the entry's name among its candidate names — one of the parties
+ *    the claim itself found.
+ *  · AN ENTRY THAT CARRIES AN ID on two or more F&P rows, where neither the F&P
+ *    it was recorded from nor its date picks one, is charged to none of them
+ *    either; this sets its fp_id to one of the listed candidates. An entry the
+ *    claim already charges to a row is refused (409 "Already assigned"), as
+ *    before.
+ *
+ * ONE ID ON TWO ROWS. The row is found by id AND fp_id. It used to be the FIRST
+ * cached row with the id: Assign for the second F&P of a booking was refused
+ * ("does not match this entry") when the first was on another date, and one that
+ * succeeded set only the id — and the P&L then charged the bottle on EVERY row
+ * with that id. Without an fp_id the row is the one holder of the id, else the
+ * one holder whose date and names match the entry; anything else is refused with
+ * a request to choose the F&P.
+ *
+ * NOTHING CAN LAND ON TWO ROWS OR THE WRONG ONE: after the update, inside the
+ * same transaction, the very claim the P&L runs is re-run, and unless it charges
+ * the entry to exactly the chosen row everything is rolled back (409).
+ *
+ * Bounded on purpose: admin only; the UPDATE re-checks the entry's state (still
+ * an orphan, or still the id and F&P it had), so two clicks cannot reassign it.
+ * Nothing else on the row changes: the name it was recorded under, its qty and
+ * its snapshotted cost_at_time stay as recorded (re-recording would re-snapshot
+ * the price). The F&P it was recorded from is kept in the audit event's
+ * `before`.
  *
  * NO LONGER REFUSED because a party without an id shares the row's name. That
  * 409 existed only because such a party's P&L counted every id-bearing row under
@@ -309,6 +349,11 @@ export async function POST(request: Request) {
  * counts on the chosen party alone. The board names the F&P the row was recorded
  * from (recorded_fp_id), so the owner can see whose bottle it is before choosing.
  */
+class AssignRefused extends Error {
+  status: number;
+  constructor(status: number, message: string) { super(message); this.status = status; }
+}
+
 export async function PATCH(request: Request) {
   try {
     const me = await getCurrentUser();
@@ -320,40 +365,102 @@ export async function PATCH(request: Request) {
     const b = await request.json().catch(() => ({}));
     const id = typeof b?.id === 'string' ? b.id : '';
     const target = typeof b?.party_unique_id === 'string' ? b.party_unique_id.trim() : '';
+    const fpWanted = typeof b?.fp_id === 'string' ? b.fp_id.trim() : '';
     if (!id || !target) return Response.json({ error: 'id and party_unique_id required' }, { status: 400 });
 
     const row = db.prepare('SELECT * FROM party_consumption WHERE id = ?').get(id) as any;
     if (!row) return Response.json({ error: 'Not found' }, { status: 404 });
-    if (row.party_unique_id !== null) {
-      return Response.json({ error: `Already assigned to party ${row.party_unique_id}` }, { status: 409 });
-    }
     const name = String(row.event_name || '').trim();
     const date = String(row.event_date || '').trim();
     const parties = loadPnlParties(db);
-    const party = parties.find(p => p.party_unique_id === target);
-    if (!party) return Response.json({ error: 'That party is not in the party list' }, { status: 400 });
-    if (String(party.event_date || '').trim() !== date || !pnlCandidateNames(party).includes(name)) {
-      return Response.json({
-        error: `That party does not match this entry: it was recorded under "${name}" on ${date}.`,
-      }, { status: 400 });
+    const claimants = partyClaimants(parties);
+    const fpOf = (i: number) => String(parties[i]?.fp_id || '').trim();
+    const labelOf = (i: number) => `${parties[i]?.event_name || target}${fpOf(i) ? ` (${fpOf(i)})` : ''}`;
+    const orphan = row.party_unique_id === null;
+
+    let chosen: number;
+    if (!orphan) {
+      // Re-pointable ONLY while the P&L charges it to nobody (its id is on two or
+      // more rows and nothing picks one) — and only to one of its candidates.
+      const listed = claimIdConsumption(db, claimants).shared.find(s => s.row.id === id);
+      if (!listed) {
+        return Response.json({ error: `Already assigned to party ${row.party_unique_id}` }, { status: 409 });
+      }
+      if (row.party_unique_id !== target) {
+        return Response.json({ error: `This entry carries party id ${row.party_unique_id}; choose one of its F&P rows.` }, { status: 400 });
+      }
+      const pick = fpWanted ? listed.candidates.find(i => fpOf(i) === fpWanted) : undefined;
+      if (pick === undefined) {
+        return Response.json({
+          error: `Party id ${target} is on more than one F&P — choose the one this entry belongs to: ${listed.candidates.map(labelOf).join(', ')}.`,
+        }, { status: 400 });
+      }
+      chosen = pick;
+    } else {
+      // The cached rows holding the id, compared exactly as before.
+      const holders = parties.map((_, i) => i).filter(i => parties[i].party_unique_id === target);
+      if (!holders.length) return Response.json({ error: 'That party is not in the party list' }, { status: 400 });
+      const fits = (i: number) => String(parties[i].event_date || '').trim() === date
+                                  && pnlCandidateNames(parties[i]).includes(name);
+      let pick: number | undefined;
+      if (fpWanted) {
+        pick = holders.find(i => fpOf(i) === fpWanted);
+        if (pick === undefined) {
+          return Response.json({ error: `${fpWanted} is not on the party list with party id ${target}.` }, { status: 400 });
+        }
+      } else if (holders.length === 1) {
+        pick = holders[0];
+      } else {
+        const fitting = holders.filter(fits);
+        if (fitting.length !== 1) {
+          return Response.json({
+            error: `Party id ${target} is on ${holders.length} F&P rows (${holders.map(labelOf).join(', ')}) — choose the F&P to assign this entry to.`,
+          }, { status: 400 });
+        }
+        pick = fitting[0];
+      }
+      if (!fits(pick)) {
+        return Response.json({
+          error: `That party does not match this entry: it was recorded under "${name}" on ${date}.`,
+        }, { status: 400 });
+      }
+      chosen = pick;
     }
-    const changed = db.prepare(
-      'UPDATE party_consumption SET party_unique_id = ? WHERE id = ? AND party_unique_id IS NULL',
-    ).run(target, id).changes;
-    if (changed !== 1) {
-      return Response.json({ error: 'This entry was assigned by someone else just now — reload' }, { status: 409 });
-    }
+
+    // The F&P the entry now belongs to. A cached row without an fp_id clears it,
+    // so the entry cannot keep pointing at ANOTHER row with the id; its date then
+    // decides, and the claim below refuses the assignment if that does not pick
+    // the chosen row.
+    const newFp: string | null = fpOf(chosen) || null;
+    db.transaction(() => {
+      const changed = orphan
+        ? db.prepare(
+            'UPDATE party_consumption SET party_unique_id = ?, fp_id = ? WHERE id = ? AND party_unique_id IS NULL',
+          ).run(target, newFp, id).changes
+        : db.prepare(
+            `UPDATE party_consumption SET fp_id = ?
+             WHERE id = ? AND party_unique_id = ? AND COALESCE(fp_id, '') = ?`,
+          ).run(newFp, id, row.party_unique_id, row.fp_id ?? '').changes;
+      if (changed !== 1) throw new AssignRefused(409, 'This entry was assigned by someone else just now — reload');
+      // The entry must now be charged to EXACTLY the row chosen, by the P&L's own
+      // claim — never to a second row, never to another one.
+      const owner = idConsumptionOwnerOf(claimIdConsumption(db, claimants), id);
+      if (owner !== chosen) {
+        throw new AssignRefused(409, `This entry cannot be pinned to ${labelOf(chosen)}: the party list cannot tell that F&P apart from another row with id ${target}. Nothing was changed.`);
+      }
+    })();
     logAuditEvent(db, {
       event_type: 'party_consumption.assign',
       entity_type: 'party_consumption',
       entity_id: id,
       actor_email: me.email,
-      before: { party_unique_id: null, event_name: name, event_date: date },
-      after: { party_unique_id: target },
-      note: `Recorded liquor under "${name}" (${date}) assigned to party ${party.event_name || target}`,
+      before: { party_unique_id: row.party_unique_id ?? null, fp_id: row.fp_id ?? null, event_name: name, event_date: date },
+      after: { party_unique_id: target, fp_id: newFp },
+      note: `Recorded liquor under "${name}" (${date}) assigned to party ${labelOf(chosen)}`,
     });
     return Response.json({ success: true });
   } catch (e: any) {
+    if (e instanceof AssignRefused) return Response.json({ error: e.message }, { status: e.status });
     console.error('[/api/party-consumption PATCH]', e);
     return Response.json({ error: e.message }, { status: 500 });
   }
