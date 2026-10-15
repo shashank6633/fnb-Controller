@@ -1,8 +1,8 @@
 import type DatabaseT from 'better-sqlite3';
 import { getDb } from './db';
-import { packFactor, toPurchaseQty, type PackMeta } from './pack-units';
+import { packFactor, shownPurchaseQty, type PackMeta } from './pack-units';
 import { lineFactor, lineShownAs } from './issue-stock';
-import { issuedCoversAsk, type ShownAs } from './central-debit-clamp';
+import { issuedCoversAsk, shelfMarkHolds, type ShownAs } from './central-debit-clamp';
 import { resolvePurchaseLogRange } from './purchase-log';
 
 /**
@@ -174,7 +174,7 @@ import { resolvePurchaseLogRange } from './purchase-log';
  *
  * Per the owner rule (pack-units.ts), every row ALSO carries `purchase_qty`,
  * the same physical quantity in PURCHASE units. It is derived only through the
- * IMPORTED packFactor / toPurchaseQty / lineFactor — never re-derived here — so
+ * IMPORTED packFactor / shownPurchaseQty / lineFactor — never re-derived here — so
  * the both-halves guard holds:
  *
  *     pack_size > 1  AND  lower(trim(unit)) !== lower(trim(purchase_unit))
@@ -662,17 +662,48 @@ function grnToken(raw: unknown): string | null {
  * answer and one of the three must NOT be divided at all:
  *   purchase  purchases.quantity is ALREADY purchase units. Dividing it by the
  *             pack factor is the standing unit bug of this codebase.
- *   recipe    the honest conversion: toPurchaseQty (packFactor, both halves).
+ *   recipe    the honest conversion: shownPu below (packFactor, both halves,
+ *             through shownPurchaseQty — the desks' own printed figure).
  *   line      Option B — the line is stored in its OWN unit, which may be
  *             either basis. lineFactor() decides, and refuses on a blank unit
  *             over a packed material rather than guess between g and kg.
  */
 function toPu(qty: number, basis: IssueLogQtyBasis, lineUnit: string, m: PackMeta): number | null {
   if (basis === 'purchase') return r6(qty);
-  if (basis === 'recipe') return toPurchaseQty(qty, m);
+  if (basis === 'recipe') return shownPu(qty, m);
   const lf = lineFactor(lineUnit, m);
   if (lf.needsReview) return null;
-  return toPurchaseQty(qty * lf.factor, m);
+  return shownPu(qty * lf.factor, m);
+}
+
+/**
+ * A RECIPE quantity restated in the purchase unit THE WAY BOTH DESKS PRINT IT
+ * (round 8) — pack-units.ts shownPurchaseQty (the 6-dp grid point, then integer
+ * half-up), so this column agrees with "In store" / "In Stock" and with the
+ * figure the server's shown-figure rule names:
+ *   · FRESH CREAM 1 LTR 130,125.5 ml read "= 130.125 BTL" here through
+ *     toPurchaseQty's division while both desks print 130.126;
+ *   · SIGN-SYMMETRIC: an undo restates exactly as its issue did (−14,842.5 g
+ *     read "−14.842 kg" against "14.843 kg", so a fully undone line netted
+ *     +0.001 kg in this column);
+ *   · NEVER 0 OVER A REAL CRUMB: the party-shelf correction row "−0.5 g" read
+ *     "= 0 kg". A figure below one 0.001 step that is at least one grid step is
+ *     carried at the grid, unrounded (the page prints it at that precision).
+ * Identical to toPurchaseQty on every positive figure no float effect reaches.
+ */
+function shownPu(recipeQty: number, m: PackMeta): number {
+  const x = Number(recipeQty) || 0;
+  const g = Math.round(Math.abs(x) * 1e6);
+  if (g === 0) return 0;
+  // Below one printed step (0.001 purchase unit) the exact grid figure, not a
+  // rounding: 0.5 g is "0.0005 kg", never "0" and never a whole "0.001 kg".
+  const exact = (g / 1e6) / packFactor(m);
+  // No pack conversion (pack 1, or one unit for both): the recipe figure IS
+  // the purchase figure, so there is nothing to round — WHITE DAL 3.1505 kg
+  // is "= 3.1505 kg", never the "= 3.151 kg" a 3-dp restatement made of it
+  // beside its own recipe column (round 8b).
+  const v = exact < 0.001 || packFactor(m) <= 1 ? exact : shownPurchaseQty(g / 1e6, m);
+  return x < 0 ? -v : v;
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
@@ -704,6 +735,15 @@ interface IssueLogSchema {
   deptTrace: boolean;
   /** consumption_skips exists (created by the cutover migration block). */
   skips: boolean;
+  /** requisition_items.shelf_emptied_qty exists — THE RULE's shelf mark (round
+   *  8, an additive boot migration in db.ts). Probed like the tables above so
+   *  a database that has not booted the migration still answers (every line
+   *  then reads by the first arm alone, as before round 8). */
+  shelfMark: boolean;
+  /** requisition_issue_ledger.shelf_mark exists — the same fact stamped on the
+   *  ROW of the take that closed the line (round 8b, issue-stock.ts
+   *  markLedgerShelfClose), which a later undo cannot retire. */
+  ledgerShelfMark: boolean;
 }
 
 function probeSchema(db: DatabaseT.Database): IssueLogSchema {
@@ -725,7 +765,17 @@ function probeSchema(db: DatabaseT.Database): IssueLogSchema {
       deptTrace = names.has('req_item_id') && names.has('station') && names.has('source');
     } catch { deptTrace = false; }
   }
-  return { deptLedger, deptTrace, skips: has('consumption_skips') };
+  let shelfMark = false;
+  try {
+    const cols = db.prepare('PRAGMA table_info(requisition_items)').all() as Array<{ name: string }>;
+    shelfMark = cols.some(c => String(c.name) === 'shelf_emptied_qty');
+  } catch { shelfMark = false; }
+  let ledgerShelfMark = false;
+  try {
+    const cols = db.prepare('PRAGMA table_info(requisition_issue_ledger)').all() as Array<{ name: string }>;
+    ledgerShelfMark = cols.some(c => String(c.name) === 'shelf_mark');
+  } catch { ledgerShelfMark = false; }
+  return { deptLedger, deptTrace, skips: has('consumption_skips'), shelfMark, ledgerShelfMark };
 }
 
 /**
@@ -734,25 +784,33 @@ function probeSchema(db: DatabaseT.Database): IssueLogSchema {
  * A negative issued figure is a reversal (undo / store reject) and gets no
  * fulfilment verdict at all rather than a misleading "PART".
  *
- * FULL IS THE DESKS' OWN "ISSUED IN FULL" (round 7). Both desks close a line by
- * lineIssueComplete — issuedCoversAsk in src/lib/central-debit-clamp.ts: the
- * old `issued >= effective`, OR the issued and the approved figures show as
- * the same non-zero number in the purchase unit. A line the store emptied
- * itself into by the shown figure (THREE MANGO 14,842.5 g on the shelf, 14.843
- * kg typed and approved, 14.8425 kg recorded) is 'fulfilled' on both desks; this
- * report printed it "PART | still open 0.001 kg | 14.843 of 14.843 kg" (and a
- * 4-BTL line over 2,999.7 ml "still open 0 BTL"). `shownAs` is the converter the
- * caller resolves for the row's basis; without one (an ambiguous unit) the
- * first arm stands alone, exactly as before. The EPS arm stays first, so a row
- * this called FULL is still FULL.
+ * FULL IS THE DESKS' OWN "COMPLETE" — THE RULE (round 8). Both desks and both
+ * routes close a line by lineIssueComplete — issuedCoversAsk in
+ * src/lib/central-debit-clamp.ts: `issued >= effective`, OR a take EMPTIED the
+ * central shelf for the line and less than one printed step is still owed. The
+ * second arm needs the line's shelf mark (requisition_items.shelf_emptied_qty,
+ * stamped at the take), passed here as `shelfEmptied` =
+ * shelfMarkHolds(mark, x) where x is the line-unit figure the row's `issued`
+ * was built from (REQUISITION / pre-ledger: quantity_issued; ISSUE: the
+ * ledger row's after_line_qty, before the snapshot factor) — so the mark
+ * speaks for exactly the issue row that closed the line, and for the line's
+ * current figure. THREE MANGO 14,842.5 g on the shelf, 14.843 kg typed and
+ * approved, 14.8425 kg recorded and stamped: 'fulfilled' on both desks, FULL
+ * here. Without the mark this report printed "PART | still open 0.001 kg |
+ * 14.843 of 14.843 kg" on lines both desks had closed (round-7 verifier, 6,600
+ * boundary cases). A remainder below a step with no mark (the shelf still held
+ * stock) is PART, as the desks say. `shownAs` is the converter the caller
+ * resolves for the row's basis; without one (an ambiguous unit) the first arm
+ * stands alone. The EPS arm stays first, so a row this called FULL is still
+ * FULL.
  */
 function fulfilmentOf(
-  issued: number, effective: number | null, shownAs?: ShownAs | null,
+  issued: number, effective: number | null, shownAs?: ShownAs | null, shelfEmptied?: boolean,
 ): 'FULL' | 'PART' | 'OPEN' | null {
   if (effective === null || effective <= 0) return null;
   if (issued < -EPS) return null;
   if (issued <= EPS) return 'OPEN';
-  return issued + EPS >= effective || issuedCoversAsk(issued, effective, shownAs) ? 'FULL' : 'PART';
+  return issued + EPS >= effective || issuedCoversAsk(issued, effective, shownAs, shelfEmptied) ? 'FULL' : 'PART';
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -800,6 +858,17 @@ function buildUnion(f: {
   // screen is free text with a datalist, and a datalist constrains nothing —
   // "Metro" against a stored "Metro Cash & Carry Pvt Ltd" matched zero rows and
   // rendered a page of confident zeroes.
+  // THE RULE'S SHELF MARK (round 8) on every requisition-chain row, so
+  // fulfilmentOf can read the second arm the desks read. NULL on the other
+  // stages and on a database that has not booted the column (schema.shelfMark).
+  // The ISSUE branch reads the mark stamped on ITS OWN ROW (round 8b): the
+  // row of the take that closed the line by the shelf carries the quantity it
+  // closed at, and keeps it when the line is later undone — the line's mark is
+  // about the line NOW, and an undo retires it (round-8 verifier,
+  // sd_undo_shelf: the issue that had closed THREE MANGO read "PART" after the
+  // undo). A row written before the column existed carries none.
+  const shelfRi = f.schema.shelfMark ? 'ri.shelf_emptied_qty' : 'NULL';
+  const shelfLedger = f.schema.ledgerShelfMark ? 'l.shelf_mark' : 'NULL';
   const venFilter = (expr: string) =>
     (f.vendor ? ` AND LOWER(TRIM(${expr})) LIKE '%' || LOWER(TRIM(?)) || '%'` : '');
   const deptFilter = (col: string) => (f.departmentId ? ` AND ${col} = ?` : '');
@@ -863,7 +932,8 @@ function buildUnion(f: {
         COALESCE(rm.unit, '')                             AS rm_unit,
         COALESCE(rm.purchase_unit, '')                    AS rm_purchase_unit,
         COALESCE(rm.pack_size, 1)                         AS rm_pack_size,
-        ''                                                AS line_unit
+        ''                                                AS line_unit,
+        NULL                                              AS shelf_mark
       FROM purchases p
       LEFT JOIN goods_receipt_notes g ON g.id = p.grn_id
       LEFT JOIN raw_materials rm ON rm.id = p.material_id
@@ -937,7 +1007,8 @@ function buildUnion(f: {
         COALESCE(rm.unit, '')                             AS rm_unit,
         COALESCE(rm.purchase_unit, '')                    AS rm_purchase_unit,
         COALESCE(rm.pack_size, 1)                         AS rm_pack_size,
-        COALESCE(NULLIF(TRIM(ri.unit), ''), '')           AS line_unit
+        COALESCE(NULLIF(TRIM(ri.unit), ''), '')           AS line_unit,
+        ${shelfRi}                                        AS shelf_mark
       FROM requisition_items ri
       JOIN requisitions r ON r.id = ri.req_id
       LEFT JOIN raw_materials rm ON rm.id = ri.material_id
@@ -1019,7 +1090,8 @@ function buildUnion(f: {
         COALESCE(rm.unit, '')                             AS rm_unit,
         COALESCE(rm.purchase_unit, '')                    AS rm_purchase_unit,
         COALESCE(rm.pack_size, 1)                         AS rm_pack_size,
-        COALESCE(l.line_unit, '')                         AS line_unit
+        COALESCE(l.line_unit, '')                         AS line_unit,
+        ${shelfLedger}                                    AS shelf_mark
       FROM requisition_issue_ledger l
       LEFT JOIN requisitions r ON r.id = l.req_id
       LEFT JOIN raw_materials rm ON rm.id = l.material_id
@@ -1099,7 +1171,8 @@ function buildUnion(f: {
         COALESCE(rm.unit, '')                             AS rm_unit,
         COALESCE(rm.purchase_unit, '')                    AS rm_purchase_unit,
         COALESCE(rm.pack_size, 1)                         AS rm_pack_size,
-        COALESCE(NULLIF(TRIM(ri.unit), ''), '')           AS line_unit
+        COALESCE(NULLIF(TRIM(ri.unit), ''), '')           AS line_unit,
+        ${shelfRi}                                        AS shelf_mark
       FROM requisition_items ri
       JOIN requisitions r ON r.id = ri.req_id
       LEFT JOIN raw_materials rm ON rm.id = ri.material_id
@@ -1295,7 +1368,8 @@ function buildUnion(f: {
         COALESCE(rm.unit, '')                             AS rm_unit,
         COALESCE(rm.purchase_unit, '')                    AS rm_purchase_unit,
         COALESCE(rm.pack_size, 1)                         AS rm_pack_size,
-        ''                                                AS line_unit
+        ''                                                AS line_unit,
+        NULL                                              AS shelf_mark
       FROM inventory_transactions it
       LEFT JOIN raw_materials rm ON rm.id = it.material_id
       WHERE substr(it.created_at, 1, 10) >= ? AND substr(it.created_at, 1, 10) <= ?
@@ -1403,7 +1477,8 @@ function buildUnion(f: {
         COALESCE(rm.unit, '')                             AS rm_unit,
         COALESCE(rm.purchase_unit, '')                    AS rm_purchase_unit,
         COALESCE(rm.pack_size, 1)                         AS rm_pack_size,
-        ''                                                AS line_unit
+        ''                                                AS line_unit,
+        NULL                                              AS shelf_mark
       FROM department_material_transactions dmt
       LEFT JOIN raw_materials rm ON rm.id = dmt.material_id
       LEFT JOIN departments d ON d.id = dmt.department_id
@@ -1486,7 +1561,8 @@ function buildUnion(f: {
         COALESCE(rm.unit, '')                             AS rm_unit,
         COALESCE(rm.purchase_unit, '')                    AS rm_purchase_unit,
         COALESCE(rm.pack_size, 1)                         AS rm_pack_size,
-        ''                                                AS line_unit
+        ''                                                AS line_unit,
+        NULL                                              AS shelf_mark
       FROM consumption_skips cs
       LEFT JOIN raw_materials rm ON rm.id = cs.material_id
       WHERE COALESCE(cs.date, substr(cs.created_at, 1, 10)) >= ?
@@ -1710,7 +1786,13 @@ export function getIssueLog(
       : st === 'ISSUE'
         ? (Number(r.needs_unit_review) === 1 ? null : lineShownAs(meta.unit, meta))
         : lineShownAs(lineUnit, meta);
-    const fulfilment = fulfilmentOf(issued ?? 0, effective, shownAs);
+    // THE RULE's shelf arm reads the line's mark against the LINE-unit figure
+    // this row's `issued` was built from, before the snapshot factor:
+    // quantity_issued on a REQUISITION / pre-ledger row, after_line_qty on an
+    // ISSUE row. The mark speaks only for the exact quantity it was stamped at.
+    const shelfEmptied = issued === null ? false
+      : shelfMarkHolds(r.shelf_mark == null ? null : Number(r.shelf_mark), Number(r.issued_qty) || 0);
+    const fulfilment = fulfilmentOf(issued ?? 0, effective, shownAs, shelfEmptied);
     // A FULL line owes nothing, whichever arm closed it. Without this the row
     // printed "FULL" beside "still open 0.0005 kg" — the R1 stuck-line text.
     const stillOpen = effective === null || issued === null

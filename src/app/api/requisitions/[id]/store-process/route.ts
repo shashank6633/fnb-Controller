@@ -1385,49 +1385,6 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         result.po_total_cost = total;
       }
 
-      // --- 3. Mark the requisition as processed ---
-      // 'fulfilled' means NOTHING is still owed to the department. The old rule
-      // asked only "was a PO raised?", so issuing 3,000 against an approved
-      // 4,500 and raising no PO closed the requisition outright: it dropped out
-      // of the store queue after a day and the 1,500 balance was never handed
-      // over. Re-read the lines this transaction just wrote and apply the SAME
-      // test store-issue uses — effective qty = chef_approved_qty ??
-      // quantity_requested, either rejection counts as done, and a deferred line
-      // is never done even at full quantity.
-      //
-      // "Issued in full" is lineIssueComplete (round 7), the predicate
-      // store-issue's defer rule and auto-advance call too: the old
-      // `issued >= effective`, OR the desk shows the two as one figure. A line
-      // the shown figure took in full (14.843 kg typed over 14,842.5 g, so
-      // 14.8425 kg recorded of 14.843 approved) closes, instead of keeping the
-      // requisition 'store_processed' over 0.0005 kg the store does not hold.
-      const fresh = db.prepare(`
-        SELECT ri.is_rejected, ri.store_rejected, ri.quantity_requested, ri.chef_approved_qty,
-               ri.quantity_issued, ri.deferred_until,
-               ri.unit AS line_unit, rm.unit, rm.purchase_unit, rm.pack_size
-        FROM requisition_items ri
-        LEFT JOIN raw_materials rm ON rm.id = ri.material_id
-        WHERE ri.req_id = ?
-      `).all(id) as any[];
-      const allDone = fresh.every(it => {
-        if (it.is_rejected) return true;
-        if (it.store_rejected) return true;
-        return lineIssueComplete(it) && !it.deferred_until;
-      });
-      // A line left off the PO for an unmapped vendor counts as OUTSTANDING, the
-      // same as a PO that was raised. Without `poSkipped.length` here, the one
-      // case where dropping a line changes the status is a full issue plus a
-      // buy-extra line: pre-fix it raised a PO and stayed 'store_processed', and
-      // it would now close as 'fulfilled' — dropping out of the store queue with
-      // a purchase still to arrange and this requisition its only record.
-      //
-      // poDropped, NOT poSkipped: a line reported as 'no_quantity' (a vendor
-      // picked with an empty Buy box) or 'chef_rejected' orders nothing and
-      // owes nothing, so counting it here would hold a fully-issued requisition
-      // open in the store queue forever over a stray dropdown click.
-      const finalStatus = (linkedPoId || poDropped.length > 0 || !allDone) ? 'store_processed' : 'fulfilled';
-      const fulfilledAt = finalStatus === 'fulfilled' ? new Date().toISOString() : null;
-
       // --- 3a. PARTY requisition TRANSFER (store → department) ---
       // Business rule: party requisitions consume directly (no recipe). On the
       // final 'fulfilled' transition, TRANSFER the issued materials out of the
@@ -1455,7 +1412,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       //
       // So it is gated on nothing being outstanding: no PO raised AND no line
       // dropped. A dropped line is exactly as "still to come" as a PO line.
-      // Same poDropped/poSkipped distinction as finalStatus above: only a line
+      // Same poDropped/poSkipped distinction as finalStatus below: only a line
       // that WOULD have been ordered and was not still counts as outstanding.
       //
       // A HELD LINE IS OUTSTANDING FOR THE SAME REASON, and is listed here for
@@ -1469,17 +1426,73 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // party_consumption ledger row makes the transfer one-shot, so a transfer
       // fired on a partial could never move the remainder afterwards.
       //
-      // ROUND 7: THE TRANSFER IS NO LONGER ONE-SHOT. The "one-shot" above was
-      // the defect behind a measured gap: a party line processed here at 10 of
-      // 14.843 kg moved 10 kg, the store-issue top-up that completed it was
-      // skipped, and the line, ledger and Issue Log claimed 4.843 kg that never
-      // left central. applyPartyFulfillment now tops up what an earlier call
-      // moved (see "A LATER CALL TOPS UP" in party-fulfillment.ts), so the
-      // completing gesture moves the remainder. The three gates here are left
-      // exactly as they are — they still decide WHEN goods first move.
+      // THAT ONE-SHOT IS PRE-EXISTING AND IS LEFT AS IT IS (round 8): a party
+      // line processed here short, and completed later on the store desk,
+      // records the completion but the second transfer is skipped — identical
+      // on production, listed open for the owner, not changed by side effect.
+      //
+      // IT RUNS BEFORE THE STATUS IS DECIDED (round 8). The transfer is a TAKE:
+      // it can take the whole shelf by the shown-figure rule and leave the line
+      // recording what left it (recordPartyShelfTake) and stamped complete by
+      // THE RULE's shelf arm (stampShelfClose). Deciding the status first — the
+      // round-7 order — read the typed 14.842 of 14.843 kg as owing, wrote
+      // 'store_processed', and then the transfer made the line complete: a
+      // requisition with nothing anyone could press (round-7 verifier,
+      // pmgmt-party). Status is now decided once, below, after every take.
       if (!linkedPoId && poDropped.length === 0 && heldItemIds.size === 0 && r.purpose === 'party') {
         applyPartyFulfillment(db, id, me.email);
       }
+
+      // --- 3. Mark the requisition as processed ---
+      // 'fulfilled' means NOTHING is still owed to the department. The old rule
+      // asked only "was a PO raised?", so issuing 3,000 against an approved
+      // 4,500 and raising no PO closed the requisition outright: it dropped out
+      // of the store queue after a day and the 1,500 balance was never handed
+      // over. Re-read the lines this transaction just wrote and apply the SAME
+      // test store-issue uses — effective qty = chef_approved_qty ??
+      // quantity_requested, either rejection counts as done, and a deferred line
+      // is never done even at full quantity.
+      //
+      // "Issued in full" is lineIssueComplete — THE RULE (round 8,
+      // central-debit-clamp.ts issuedCoversAsk), the predicate store-issue's
+      // defer rule and auto-advance call too: issued ≥ approved, OR a take in
+      // this transaction (or an earlier one, remembered on the line) emptied the
+      // central shelf and what remains owing is below one printed step. A line
+      // the shown figure took in full (14.843 kg typed over 14,842.5 g, so
+      // 14.8425 kg recorded of 14.843 approved) closes; a remainder below a step
+      // over a shelf that still holds stock stays open, an ordinary partial.
+      //
+      // DECIDED ONCE, AFTER EVERY TAKE (round 8). Both rails have taken by now —
+      // the internal lines in the write loop above, the party lines in the
+      // transfer just above — so this reads the lines as the gesture leaves
+      // them.
+      const fresh = db.prepare(`
+        SELECT ri.is_rejected, ri.store_rejected, ri.quantity_requested, ri.chef_approved_qty,
+               ri.quantity_issued, ri.deferred_until, ri.shelf_emptied_qty,
+               ri.unit AS line_unit, rm.unit, rm.purchase_unit, rm.pack_size
+        FROM requisition_items ri
+        LEFT JOIN raw_materials rm ON rm.id = ri.material_id
+        WHERE ri.req_id = ?
+      `).all(id) as any[];
+      const allDone = fresh.every(it => {
+        if (it.is_rejected) return true;
+        if (it.store_rejected) return true;
+        return lineIssueComplete(it) && !it.deferred_until;
+      });
+      // A line left off the PO for an unmapped vendor counts as OUTSTANDING, the
+      // same as a PO that was raised. Without `poSkipped.length` here, the one
+      // case where dropping a line changes the status is a full issue plus a
+      // buy-extra line: pre-fix it raised a PO and stayed 'store_processed', and
+      // it would now close as 'fulfilled' — dropping out of the store queue with
+      // a purchase still to arrange and this requisition its only record.
+      //
+      // poDropped, NOT poSkipped: a line reported as 'no_quantity' (a vendor
+      // picked with an empty Buy box) or 'chef_rejected' orders nothing and
+      // owes nothing, so counting it here would hold a fully-issued requisition
+      // open in the store queue forever over a stray dropdown click.
+      const finalStatus = (linkedPoId || poDropped.length > 0 || !allDone) ? 'store_processed' : 'fulfilled';
+      const fulfilledAt = finalStatus === 'fulfilled' ? new Date().toISOString() : null;
+
       db.prepare(`
         UPDATE requisitions
         SET status = ?, store_processed_at = datetime('now'), store_processed_by = ?,

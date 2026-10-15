@@ -4,7 +4,9 @@ import { GrnRefused, logAuditOrThrow, r6 } from './grn-reversal';
 import {
   postCentralTxn, deptParty, PARTY_TRANSFER_TYPE, PARTY_TRANSFER_TYPES_SQL,
 } from '@/lib/movement-record';
-import { checkCentralIssue, recordPartyShelfTake } from '@/lib/issue-stock';
+import {
+  checkCentralIssue, recordPartyShelfTake, stampShelfClose, centralShelfEmpty, markLedgerShelfClose,
+} from '@/lib/issue-stock';
 import { qtyGrid } from '@/lib/central-debit-clamp';
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -195,13 +197,10 @@ export function fulfilRequisitionFromPo(
                 removes.
 
            A CLAMPED LINE IS PERMANENT, WHICH IS WHY THE RECORD IS NOT OPTIONAL.
-           This cascade treats ONE party transfer row on the requisition as
-           proof the whole transfer happened, and the desks' party rail — which
-           since round 7 tops up what an earlier call moved — cannot act on the
-           'fulfilled' requisition this cascade leaves (store-issue refuses a
-           fulfilled party requisition; store-process claims only approved
-           ones). So a short line will not be topped up on a later call. The
-           audit row is the only thing that will ever say so.
+           Both party rails treat ONE party transfer row on the requisition as
+           proof the whole transfer happened, so a short line will not be topped
+           up on a later call by either of them. The audit row is the only thing
+           that will ever say so.
 
            THE VOID STAYS CORRECT FOR FREE. reverseRequisitionFulfilFromPo
            credits back ABS(the stored inventory_transactions.quantity) and never
@@ -297,6 +296,18 @@ export function fulfilRequisitionFromPo(
           });
         }
         decStock.run(issued, it.material_id);
+        // THE RULE'S MEMORY (round 8) — a record, not a movement: when this take
+        // emptied the shelf and the line (as corrected above) owes less than one
+        // printed step, the line is stamped complete (stampShelfClose), so the
+        // Issue Log and both desks read the line this cascade fulfilled as done.
+        // It moves nothing, credits nothing and decides no status — the
+        // cascade's own behaviour (what it debits, what it does not credit, the
+        // fulfilled stamp above) is exactly as it was.
+        // The ledger row carrying the line's figure keeps the fact as history
+        // (round 8b, markLedgerShelfClose) — still a record, nothing moves.
+        if (stampShelfClose(db, String(it.id), centralShelfEmpty(db, String(it.material_id))).byShelf) {
+          markLedgerShelfClose(db, String(it.id));
+        }
         // MOVEMENT RECORD: the party's draw on central. The destination was
         // implicit in the type; it is now the requisition's own department when
         // one is named, and the party sink otherwise.

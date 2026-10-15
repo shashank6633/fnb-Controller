@@ -187,7 +187,7 @@
  * material's factor, and the pre-ledger remainder arithmetic in the end-to-end
  * log depends on that reversal being exact.
  */
-import { packFactor, fmtQtyNum, toPurchaseQty } from '@/lib/pack-units';
+import { packFactor, fmtQtyNum, toPurchaseQty, shownPurchaseQty } from '@/lib/pack-units';
 import { generateId } from '@/lib/db';
 import { centralFlowBlock } from '@/lib/store-engine';
 import { postDeptLedger, assertReversible } from '@/lib/dept-ledger';
@@ -196,7 +196,8 @@ import { postCentralTxn, deptParty } from '@/lib/movement-record';
 // every other central floor. See its header for the grid and why 1e-6, and for
 // the shown-figure rule the desks' purchase-unit figure obeys (round 6).
 import {
-  planCentralDebit, holdsAny, qtyDown, qtyGrid, fmtGridQty, issuedCoversAsk, shownWithStep, type ShownAs,
+  planCentralDebit, holdsAny, qtyDown, qtyGrid, fmtGridQty, issuedCoversAsk, shownWithStep,
+  shelfMarkHolds, type ShownAs,
 } from '@/lib/central-debit-clamp';
 
 export interface IssueDeltaInput {
@@ -324,8 +325,8 @@ export function lineFactor(
 
 /**
  * The figure a desk SHOWS for a quantity of this LINE: line units → recipe
- * (lineFactor, snapped to the 6-dp grid every debit is snapped to) → the
- * purchase-unit figure toPurchaseQty prints, the arithmetic of both desks'
+ * (lineFactor) → the purchase-unit figure shownPurchaseQty prints (round 8:
+ * the 6-dp grid point, then integer half-up), the arithmetic of both desks'
  * "In store" column. The same converter checkCentralIssue hands
  * planCentralDebit, applied to a line quantity instead of a balance.
  *
@@ -335,9 +336,10 @@ export function lineFactor(
  * It CARRIES ITS PRINTED STEP (round 7b): toPurchaseQty prints 3 dp of the
  * purchase unit, so one step is 0.001 purchase unit = 0.001 × packFactor
  * recipe units = that ÷ factor in the LINE's units (0.001 on a line kept in
- * the purchase unit, 1 g on a gram line of a 1000-pack). issuedCoversAsk reads
- * it to close a line whose outstanding is below what the desk can print;
- * planCentralDebit ignores it.
+ * the purchase unit, 1 g on a gram line of a 1000-pack). issuedCoversAsk (THE
+ * RULE) reads it for its shelf arm — "what remains owing is below one printed
+ * step" — and only after a take that emptied the shelf; planCentralDebit
+ * ignores it.
  */
 export function lineShownAs(
   lineUnit: string | null | undefined,
@@ -347,13 +349,17 @@ export function lineShownAs(
   if (needsReview) return null;
   const meta = { unit: rm.unit, purchase_unit: rm.purchase_unit, pack_size: rm.pack_size };
   return shownWithStep(
-    (lineQty: number) => toPurchaseQty(Math.round((Number(lineQty) || 0) * factor * 1e6) / 1e6, meta),
+    (lineQty: number) => shownPurchaseQty((Number(lineQty) || 0) * factor, meta),
     (0.001 * packFactor(meta)) / factor,
   );
 }
 
 /** The columns lineIssueComplete reads. `line_unit` is requisition_items.unit;
- *  unit / purchase_unit / pack_size are the material's (raw_materials). */
+ *  unit / purchase_unit / pack_size are the material's (raw_materials).
+ *  `shelf_emptied_qty` is requisition_items.shelf_emptied_qty — THE RULE's
+ *  memory of a take that emptied the shelf (central-debit-clamp.ts). A reader
+ *  that does not select it reads every line by the first arm only, so EVERY
+ *  caller of lineIssueComplete must select it (round 8). */
 export interface LineCompletenessRow {
   quantity_issued: number | null;
   chef_approved_qty: number | null;
@@ -362,30 +368,128 @@ export interface LineCompletenessRow {
   unit: string | null;
   purchase_unit: string | null;
   pack_size: number | null;
+  shelf_emptied_qty?: number | null;
 }
 
 /**
- * IS THIS REQUISITION LINE ISSUED IN FULL? (round 7) — the ONE predicate both
- * issue desks use for "this line is done": store-issue's defer rule and its
- * auto-advance, and store-process's final status. They used to spell it
- * `quantity_issued >= (chef_approved_qty ?? quantity_requested)` three times.
+ * IS THIS REQUISITION LINE COMPLETE? — THE RULE (src/lib/central-debit-clamp.ts
+ * issuedCoversAsk), read from a stored line. The ONE predicate every server
+ * reader of "this line is done" calls: store-issue's defer rule and its
+ * auto-advance, store-process's final status, the list's lines_owing and the
+ * defer-due alert.
  *
- * The rule is issuedCoversAsk (src/lib/central-debit-clamp.ts), decided there
- * beside the shown-figure rule it completes: the old comparison, OR the issued
- * and the approved figures show as the same number on the desk. That second
- * arm is what lets a line the store emptied itself into by the shown figure
- * (14.843 kg typed, 14,842.5 g on the shelf, 14.8425 kg recorded) close as
- * fulfilled instead of sitting forever 0.0005 kg short. The third arm (round
- * 7b, via the step lineShownAs carries) closes its neighbour: 14,842.4 g taken
- * whole against 14.843 kg approved, 0.0006 kg outstanding — below one printed
- * step, so nothing on a desk could ever issue it. A line short by a printed
- * step or more stays open. Every line the old predicate called complete is
- * still complete.
+ *     issued ≥ approved (within 1e-9)
+ *     ∨ ( the line's shelf mark speaks for its quantity_issued — a take that
+ *         emptied the central shelf closed it there (stampShelfClose) —
+ *         ∧ what remains owing is below one printed step )
+ *
+ * The mark is written at the take, by the writer that took (applyIssueDelta;
+ * the two party rails), never inferred here: 14.8424 kg recorded of 14.843
+ * reads the same whether the take emptied the shelf or not, and only the first
+ * is complete. A remainder below a step over a shelf that still holds stock is
+ * an ordinary open line.
  */
 export function lineIssueComplete(l: LineCompletenessRow): boolean {
   const eff = (l.chef_approved_qty != null ? Number(l.chef_approved_qty) : Number(l.quantity_requested)) || 0;
   const got = Number(l.quantity_issued) || 0;
-  return issuedCoversAsk(got, eff, lineShownAs(l.line_unit, l));
+  return issuedCoversAsk(got, eff, lineShownAs(l.line_unit, l), shelfMarkHolds(l.shelf_emptied_qty, got));
+}
+
+/**
+ * THE RULE'S MEMORY, WRITTEN AT THE TAKE (round 8).
+ *
+ * Called by every writer that takes central stock for a requisition line,
+ * inside its transaction, immediately after the debit — applyIssueDelta (both
+ * desks' internal rail), applyPartyFulfillment (both desks' party rail) and
+ * fulfilRequisitionFromPo (the PO cascade) — with `emptied` = this take left
+ * the material holding nothing (holdsAny false on the balance it just wrote).
+ * applyIssueDelta also calls it on every other write of quantity_issued that
+ * moves no stock (a credit, a party or carve-out line) with `emptied` false.
+ *
+ * It applies THE RULE to the line as it now stands. When the line is complete
+ * ONLY by the shelf arm — the take emptied the shelf and what remains owing is
+ * below one printed step — it stamps requisition_items.shelf_emptied_qty with
+ * the quantity_issued it closed at; otherwise it clears any stamp. It writes
+ * nothing when the column already says the right thing, so an ordinary issue
+ * changes no row beyond what it always changed.
+ *
+ * Returns whether the line is now complete, and whether by the shelf.
+ */
+export function stampShelfClose(
+  db: any, reqItemId: string, emptied: boolean,
+): { complete: boolean; byShelf: boolean } {
+  const l = db.prepare(`
+    SELECT ri.quantity_issued, ri.chef_approved_qty, ri.quantity_requested, ri.shelf_emptied_qty,
+           ri.unit AS line_unit, rm.unit, rm.purchase_unit, rm.pack_size
+      FROM requisition_items ri
+      LEFT JOIN raw_materials rm ON rm.id = ri.material_id
+     WHERE ri.id = ?
+  `).get(String(reqItemId)) as (LineCompletenessRow & { shelf_emptied_qty: number | null }) | undefined;
+  if (!l) return { complete: false, byShelf: false };
+  const eff = (l.chef_approved_qty != null ? Number(l.chef_approved_qty) : Number(l.quantity_requested)) || 0;
+  const got = Number(l.quantity_issued) || 0;
+  const shown = lineShownAs(l.line_unit, l);
+  const inFull = issuedCoversAsk(got, eff, shown, false);
+  const byShelf = !inFull && emptied === true && issuedCoversAsk(got, eff, shown, true);
+  const want: number | null = byShelf ? got : null;
+  const have: number | null = l.shelf_emptied_qty == null ? null : Number(l.shelf_emptied_qty);
+  if (want !== have) {
+    db.prepare(`UPDATE requisition_items SET shelf_emptied_qty = ? WHERE id = ?`).run(want, String(reqItemId));
+  }
+  return { complete: inFull || byShelf, byShelf };
+}
+
+/**
+ * THE SAME FACT, KEPT AS HISTORY (round 8b). When a take closes a line by the
+ * shelf arm (stampShelfClose's `byShelf`), the ledger ROW of that take is
+ * stamped with the quantity the line closed at (requisition_issue_ledger.
+ * shelf_mark). The line's own mark is retired by the next write of
+ * quantity_issued — an undo, a later issue — which is right for "is the line
+ * complete NOW", and wrong for "was it complete after THIS issue": the Issue
+ * Log read the issue that had closed THREE MANGO (14.8424 of 14.843 kg, the
+ * 14,842.4 g shelf emptied) as "PART still open 0.6 g" once the line was undone
+ * (round-8 verifier, sd_undo_shelf). The row's copy is never cleared.
+ *
+ * `ledgerId` names the row when the caller has it (applyIssueDelta, right after
+ * inserting it); otherwise the line's latest row whose after_line_qty is the
+ * closing quantity — the party transfer's correction row, or the issue row the
+ * transfer moved unchanged. A database that has not booted the column (or has
+ * no ledger) is left alone: the Issue Log then reads the first arm only.
+ */
+export function markLedgerShelfClose(db: any, reqItemId: string, closedAt?: number | null, ledgerId?: string | null): void {
+  if (!ledgerHasShelfMark(db)) return;
+  // The quantity stampShelfClose stamped: the line's quantity_issued as it now
+  // stands, unless the caller already holds it.
+  const q = closedAt != null ? (Number(closedAt) || 0)
+    : (Number((db.prepare(`SELECT quantity_issued FROM requisition_items WHERE id = ?`)
+        .get(String(reqItemId)) as { quantity_issued?: number } | undefined)?.quantity_issued) || 0);
+  if (!(q > 0)) return;
+  const id = ledgerId || (db.prepare(`
+    SELECT id FROM requisition_issue_ledger
+     WHERE req_item_id = ? AND ABS(after_line_qty - ?) <= 1e-9
+     ORDER BY rowid DESC LIMIT 1
+  `).get(String(reqItemId), q) as { id?: string } | undefined)?.id;
+  if (id) db.prepare(`UPDATE requisition_issue_ledger SET shelf_mark = ? WHERE id = ?`).run(q, String(id));
+}
+const ledgerShelfMarkProbe = new WeakMap<object, boolean>();
+function ledgerHasShelfMark(db: any): boolean {
+  const k = db as object;
+  const known = ledgerShelfMarkProbe.get(k);
+  if (known !== undefined) return known;
+  let ok = false;
+  try {
+    ok = (db.prepare(`PRAGMA table_info(requisition_issue_ledger)`).all() as Array<{ name: string }>)
+      .some(c => String(c.name) === 'shelf_mark');
+  } catch { ok = false; }
+  ledgerShelfMarkProbe.set(k, ok);
+  return ok;
+}
+
+/** Did the take that just ran leave this material holding nothing? Read
+ *  inside the caller's transaction, immediately after its debit. */
+export function centralShelfEmpty(db: any, materialId: string): boolean {
+  const r = db.prepare(`SELECT current_stock FROM raw_materials WHERE id = ?`).get(String(materialId)) as any;
+  return !holdsAny(Math.max(0, Number(r?.current_stock) || 0));
 }
 
 /**
@@ -528,11 +632,12 @@ export interface CentralIssueCheck {
   recordAfterLineQty: number;
   /** requisition_items.unit as stored ('' means the recipe basis — Option B). */
   lineUnit: string;
-  /** The ask in PURCHASE units as the desk shows it (toPurchaseQty, 3 dp
-   *  half-up); unrounded only for a sub-display ask that would show as 0. */
+  /** The ask in PURCHASE units as the desk shows it (shownPurchaseQty, 3 dp
+   *  half-up on the 6-dp grid); unrounded only for a sub-display ask that
+   *  would show as 0. */
   requestedPurchase: number;
-  /** The cap in PURCHASE units: the balance's SHOWN figure (toPurchaseQty — the
-   *  "In store" column's own number), which the shown-figure rule accepts when
+  /** The cap in PURCHASE units: the balance's SHOWN figure (shownPurchaseQty —
+   *  the "In store" column's own number), which the shown-figure rule accepts when
    *  typed back and debits as the whole balance. For a sub-display crumb (shows
    *  0, holds ≥ one grid step) the exact purchase image of its 6-dp recipe
    *  figure. 0 only when holdsAny() is false. */
@@ -738,12 +843,19 @@ export function checkCentralIssue(
   // `stock − claimed`, so the pre-flight's running claim and the floor's
   // per-line re-read see the same balance.
   //
-  // THE SHOWN FIGURE (round 6): the converter is toPurchaseQty — the arithmetic
-  // of both desks' "In store" column — so an ask typed from that column is
-  // matched against the very figure the storekeeper read. The rule itself is
-  // planCentralDebit's; nothing here decides "fits".
+  // THE SHOWN FIGURE (round 6): the converter is the arithmetic of both desks'
+  // "In store" column, so an ask typed from that column is matched against the
+  // very figure the storekeeper read. The rule itself is planCentralDebit's;
+  // nothing here decides "fits".
   const pf = packFactor(meta);
-  const plan = planCentralDebit(stock - claimed, requestedRecipe, r => toPurchaseQty(r, meta));
+  // The converter is the desks' "In store" figure, shownPurchaseQty (round 8:
+  // the grid point, then integer half-up — so neither SQL dust nor the
+  // division moves it). Its `alts` keep round 7's raw toPurchaseQty figure
+  // matchable, so a screen still printing that one is never refused for typing
+  // it; the cap and the sentences print shownPurchaseQty.
+  const plan = planCentralDebit(stock - claimed, requestedRecipe, shownWithStep(
+    r => shownPurchaseQty(r, meta), 0.001 * pf, [r => toPurchaseQty(r, meta)],
+  ));
   const purchaseUnit = String(line.purchase_unit || line.unit || '').trim();
   const recipeUnit = String(line.unit || '').trim();
   const shownAvail = Number(plan.shownAvailable) || 0;
@@ -1154,7 +1266,9 @@ function scoreShortLine(
   if (!holdsAny(pool)) return { ...c, ok: false };
   const ru = String(meta.unit || '').trim() ? ` ${String(meta.unit).trim()}` : '';
   const figRecipe = (r: number) => {
-    const s = toPurchaseQty(r, meta);
+    // The desks' "In store" figure (round 8, shownPurchaseQty) — the same
+    // figure planCentralDebit's shown-figure check prints for this balance.
+    const s = shownPurchaseQty(r, meta);
     return s > 0 ? `${fmtQtyNum(s)}${pu}` : holdsAny(r) ? `${fmtGridQty(r)}${ru}` : `0${pu}`;
   };
   const n = Math.max(1, Math.round(Number(a.siblingLines) || 1));
@@ -1420,6 +1534,11 @@ export function applyIssueDelta(db: any, input: IssueDeltaInput): IssueDeltaResu
   }
 
   let invTxnId: string | null = null;
+  // Did THIS take leave the material holding nothing? THE RULE's shelf arm
+  // (central-debit-clamp.ts) needs it, and only the writer that took can say
+  // it — read from the balance right after the debit below. False on every
+  // write that moves no central stock (a credit, a party or carve-out line).
+  let takeEmptied = false;
   if (stockQty !== 0) {
     // A DEBIT WITHOUT A CREDIT DESTROYS A GRAM SILENTLY, so the department is
     // resolved and validated BEFORE central is touched. 0 of the 14,149 issued
@@ -1520,6 +1639,7 @@ export function applyIssueDelta(db: any, input: IssueDeltaInput): IssueDeltaResu
     // Positive delta = goods left the store.
     db.prepare(`UPDATE raw_materials SET current_stock = current_stock - ? WHERE id = ?`)
       .run(stockQty, line.material_id);
+    if (stockQty > 0) takeEmptied = centralShelfEmpty(db, String(line.material_id));
 
     // MOVEMENT RECORD: the central debit half of an issue. The RECEIVING
     // DEPARTMENT was never on this row — it lived only on the paired department
@@ -1538,6 +1658,15 @@ export function applyIssueDelta(db: any, input: IssueDeltaInput): IssueDeltaResu
       actor: String(input.actor || '').trim() || 'system:requisition-issue',
     });
   }
+
+  // THE RULE'S MEMORY (round 8). quantity_issued just changed (the zero-delta
+  // gate above returned on every write that did not change it), so the line's
+  // shelf mark is re-decided HERE, by the single writer, for every writer of the
+  // column: stamped when this take emptied the shelf and THE RULE closes the
+  // line by that arm, cleared otherwise. See stampShelfClose. Before the early
+  // return below on purpose — an undo of a pre-ledger line writes no row but
+  // still changes the quantity the mark spoke for.
+  const stamp = stampShelfClose(db, String(input.reqItemId), takeEmptied);
 
   // Nothing to record and nothing moved. The live case is an undo of one of the
   // 14,149 pre-ledger issues: the record clamp took it to 0, and writing a row
@@ -1576,6 +1705,9 @@ export function applyIssueDelta(db: any, input: IssueDeltaInput): IssueDeltaResu
     factor, deltaLine, deltaRecipe: stockQty, recordedRecipe: recordQty,
     needsReview, invTxnId, storeMapped, effectiveLineQty, skipReason,
   });
+  // This row's take closed the line by the shelf arm: say so on the row too,
+  // where a later undo cannot retire it (markLedgerShelfClose).
+  if (stamp.byShelf) markLedgerShelfClose(db, String(input.reqItemId), Number(input.afterLineQty) || 0, ledgerId);
 
   if (stockQty !== 0) {
     // THE MIRROR OF THE CENTRAL DEBIT. Signed, in RECIPE units: positive = into

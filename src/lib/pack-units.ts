@@ -213,6 +213,39 @@ export function toPurchaseQty(recipeQty: number, m: PackMeta): number {
   return v === 0 ? 0 : v; // normalises -0 → 0 ((-0).toLocaleString prints "-0")
 }
 
+/**
+ * THE FIGURE THE REQUISITION DESKS SHOW FOR A CENTRAL BALANCE ("In store") —
+ * and the figure the central floor's shown-figure rule matches an ask against
+ * (src/lib/central-debit-clamp.ts planCentralDebit, via issue-stock.ts
+ * checkCentralIssue). Round 8.
+ *
+ * The quantity is SNAPPED TO THE 6-dp RECIPE GRID FIRST, as an integer, and
+ * only then rounded half-up to 3 dp of the purchase unit, in integer
+ * arithmetic. toPurchaseQty rounds the raw double, and two float effects then
+ * move a printed figure by a whole step at a half-step balance (MEASURED, real
+ * store-issue route, round-7/8 sweeps):
+ *   · dust left by an SQL debit — WHITE DAL 5.0005 kg less 1.85 is stored as
+ *     3.1504999999999996, which toPurchaseQty prints 3.15 though the balance IS
+ *     3.1505 kg on the grid (3.151);
+ *   · the division itself — FRESH CREAM 1 LTR (ml/BTL, pack 1000) holding
+ *     130,125.5 ml, exactly on the grid: 130125.5 / 1000 × 1000 is
+ *     130125.49999999999, so toPurchaseQty prints 130.125 BTL, not 130.126.
+ * Either way the desk's own exact outstanding was refused "holds only …" over a
+ * shelf that holds it to the half step. Here both sides are integers until the
+ * last division (the grid count over 1000 × pack, which IEEE divides exactly
+ * whenever the true quotient is a representable k + 0.5), so the half-up
+ * decision is the decimal one. Identical to toPurchaseQty on every figure whose
+ * rounding no float effect reaches — every balance on the live book today.
+ *
+ * Pure, and importable by the desks (this module imports nothing), so the
+ * server and both desks print the same "In store" figure from ONE function.
+ */
+export function shownPurchaseQty(recipeQty: number, m: PackMeta): number {
+  const grid = Math.round((Number(recipeQty) || 0) * 1e6);   // 6-dp recipe grid, an integer
+  const v = Math.round(grid / (packFactor(m) * 1000)) / 1000;
+  return v === 0 ? 0 : v;
+}
+
 /** Build the frozen wire shape from a recipe qty + the material's pack meta. */
 export function dualQty(recipeQty: number, m: PackMeta): DualQty {
   const q = Number(recipeQty) || 0;

@@ -257,8 +257,25 @@ type StageFilter = (typeof STAGE_FILTERS)[number]['k'];
 
 const fmtINR = (n: number) => '₹' + (Math.round((Number(n) || 0) * 100) / 100).toLocaleString('en-IN');
 const fmtNum = (n: number) => (Number(n) || 0).toLocaleString('en-IN');
-/** Quantities are routinely fractional (0.5 CTN, 12.5 g) — never round them away. */
-const fmtQty = (n: number) => (Number(n) || 0).toLocaleString('en-IN', { maximumFractionDigits: 3 });
+/** Quantities are routinely fractional (0.5 CTN, 12.5 g) — never round them away.
+ *  Printed on the house 6-dp grid (central-debit-clamp.ts qtyGrid), not at 3 dp
+ *  (round 8b): on a material bought and cooked in one unit (kg / kg, pack 1)
+ *  the shelf rule records figures like WHITE DAL 5.0005 kg and WHOLE DHANIYA
+ *  3.2174 kg, which 3 dp printed as "FULL 5.001 of 5.001 kg", "3.151 kg
+ *  recipe units" for 3.1505, and "0 kg recipe units = 0.0004 kg" for a 0.4 g
+ *  party-shelf correction (round-8 verifier). The grid snap sheds float dust,
+ *  so a figure with three decimals or fewer prints exactly as it always did. */
+const fmtQty = (n: number) => (Math.round((Number(n) || 0) * 1e6) / 1e6 || 0)
+  .toLocaleString('en-IN', { maximumFractionDigits: 6 });
+/** A purchase-unit restatement: fmtQty, except a sub-display crumb (|x| below
+ *  0.001, carried by the server at its grid point — issue-log.ts shownPu) is
+ *  printed at the precision that names it, never as "0" (round 8: the
+ *  party-shelf correction "−0.5 g" read "= 0 kg"). */
+const fmtPuQty = (n: number) => {
+  const v = Number(n) || 0;
+  if (v === 0 || Math.abs(v) >= 0.001) return fmtQty(v);
+  return v.toLocaleString('en-IN', { maximumFractionDigits: 12 });
+};
 
 function shiftDays(ymd: string, days: number) {
   // Parsed as UTC midnight on purpose: the input is already an IST calendar date
@@ -763,7 +780,7 @@ function LogRow({ r }: { r: IssueLogRow }) {
             <span className="font-semibold">{fmtQty(r.qty)} <span className="text-[11px] text-[#8B7355] font-normal">{r.unit}</span></span>
             <span className="block text-[10px] text-[#B8A48E]">{r.qty_basis === 'line' ? 'line unit' : r.qty_basis === 'recipe' ? 'recipe units' : r.qty_basis || ''}</span>
             {r.purchase_qty != null && r.purchase_unit && (
-              <span className="block text-[10px] text-[#8B7355]">= {fmtQty(r.purchase_qty)} {r.purchase_unit}</span>
+              <span className="block text-[10px] text-[#8B7355]">= {fmtPuQty(r.purchase_qty)} {r.purchase_unit}</span>
             )}
           </>
         )}

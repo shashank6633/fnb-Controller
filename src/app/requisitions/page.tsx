@@ -17,7 +17,11 @@ import {
   AlertTriangle, AlertCircle, ChevronDown, ChevronRight, Loader2, Upload, Search, X, Eye, Pencil,
 } from 'lucide-react';
 import { api } from '@/lib/api';
-import { packFactor, toPurchaseQty } from '@/lib/pack-units';
+import { packFactor, toPurchaseQty, shownPurchaseQty } from '@/lib/pack-units';
+// THE RULE and the shelf take, as both desks run them — ONE transcription of the
+// server's (central-debit-clamp.ts / issue-stock.ts), proved against it by
+// scripts/desk-rule-tests.ts. Never re-type any of it on this page.
+import { deskLineComplete, planDeskDebit, forecastDeskTake, type DeskTakeForecast } from '@/lib/desk-rule';
 import { fmtIST } from '@/lib/format-date';
 import MaterialTypeahead from '@/components/MaterialTypeahead';
 import TabScroller from '@/components/TabScroller';
@@ -103,8 +107,8 @@ interface ServerBlock {
   requested?: number;
   /** PURCHASE unit. 0 on 508 of the 564 refusable live lines — a reader must
    *  make sense at zero and never print "issue up to 0".
-   *  Since round 6 it is the balance's SHOWN figure (toPurchaseQty, 3 dp
-   *  half-up — the "In Stock" column's own number), which the server accepts
+   *  Since round 6 it is the balance's SHOWN figure (round 8: shownPurchaseQty
+   *  — the 6-dp grid point, then 3 dp half-up — the "In Stock" column's own number), which the server accepts
    *  when typed back and debits as the whole balance; below 0.001 it is a
    *  sub-display crumb carried at the precision that takes it (print it with
    *  fmtCapPU, never fmtNum). 0 when the store holds none of it — OR (round 7)
@@ -139,6 +143,11 @@ interface ReqItem {
   is_rejected?: number | boolean;
   /** Chef's per-line note ("over budget", "out of season", etc.). */
   chef_note?: string;
+  /** requisition_items.shelf_emptied_qty — THE RULE's memory (round 8): the
+   *  quantity_issued a take that EMPTIED the central shelf closed this line at.
+   *  Written by the server at the take, never inferred here (desk-rule.ts
+   *  deskShelfMarkHolds). Arrives with ri.* on the ?id= detail payload. */
+  shelf_emptied_qty?: number | null;
 }
 interface Requisition {
   id: string; req_number: string;
@@ -250,6 +259,7 @@ function lineUnits(it: ReqItem) {
   const lu = String(it.unit || '').toLowerCase().trim();
   // Already stored in the purchase unit → no conversion in either direction.
   const isPU = pf > 1 && lu !== '' && lu === String(pu).toLowerCase().trim();
+  const meta = { unit: recipeUnit, purchase_unit: it.material_purchase_unit, pack_size: it.material_pack_size };
   return {
     pf, pu, recipeUnit, isPU,
     /* Qty params are `number | null | undefined` rather than the siblings' `any`
@@ -261,8 +271,16 @@ function lineUnits(it: ReqItem) {
     /** stored line qty → recipe units (the small "= N g" hint) */
     toRecipe: (q: Q) => isPU ? (Number(q) || 0) * pf : (Number(q) || 0),
     /** material-level recipe figure (current_stock) → purchase units. Stock is
-     *  ALWAYS recipe units — never route it through toPU, which reads the line. */
-    stockPU: (q: Q) => Math.round(((Number(q) || 0) / pf) * 1000) / 1000,
+     *  ALWAYS recipe units — never route it through toPU, which reads the line.
+     *  SNAPPED TO THE 6-dp GRID BEFORE THE 3-dp ROUNDING (round 8):
+     *  pack-units.ts shownPurchaseQty, the function the server's shown-figure
+     *  rule prints and matches against — the store desk's U.stockPU is the same
+     *  call. Rounded raw, float dust moved a printed balance a whole step
+     *  (WHITE DAL 3.1504999999999996 kg printed 3.15 for a 3.1505 kg shelf;
+     *  FRESH CREAM 130,125.5 ml printed 130.125 BTL through the division). On
+     *  every live balance today the figure is the one this column always
+     *  printed. */
+    stockPU: (q: Q) => shownPurchaseQty(Number(q) || 0, meta),
   };
 }
 
@@ -283,63 +301,34 @@ function effectiveQty(it: ReqItem): number {
 }
 
 /**
- * IS THIS LINE ISSUED IN FULL? — the server's own predicate, so this desk, the
- * store desk and the routes can never disagree about which lines are done.
- * issue-stock.ts lineIssueComplete → central-debit-clamp.ts issuedCoversAsk
- * (round 7), transcribed exactly as store-requisitions/page.tsx carries it
- * (those files import the database and cannot be bundled here):
+ * IS THIS LINE COMPLETE? — THE RULE (round 8), the server's own predicate, so
+ * this desk, the store desk and the routes can never disagree about which lines
+ * are done. issue-stock.ts lineIssueComplete → central-debit-clamp.ts
+ * issuedCoversAsk, through the desks' ONE transcription of it
+ * (src/lib/desk-rule.ts deskLineComplete, proved against the server by
+ * scripts/desk-rule-tests.ts — store-requisitions/page.tsx calls the same):
  *
- *     complete ⇔ issued ≥ approved
- *              ∨ ( shown(issued) = shown(approved) ∧ shown(approved) > 0 )
- *              ∨ ( approved − issued < one printed step ∧ issued > 0
- *                  ∧ shown(approved) > 0 )                        (round 7b)
+ *     complete ⇔ issued + 1e-9 ≥ approved
+ *              ∨ ( the line's shelf mark speaks for its quantity_issued
+ *                  ∧ step > 0 ∧ grid(issued) > 0
+ *                  ∧ grid(approved − issued) < grid(step) )
  *
- * The third arm: the shelf held 14,842.4 g (shown 14.842) against 14.843
- * approved, the offered 14.842 took all of it, and the line owed 0.0006 kg —
- * printed "0.001 still to come" here while no desk could ever issue it (the
- * store's retry is refused "holds none of it"). One printed step is 0.001
- * purchase unit in the LINE's units (0.001 × pf ÷ factor, the step the
- * server's lineShownAs carries), compared on the 6-dp grid as the server
- * compares it. A whole step or more short (14.842 of 14.843 exactly) stays open.
- *
- * shown() is issue-stock.ts lineShownAs: line unit → recipe through lineFactor
- * (a blank or unrecognised unit on a packed material has no shown figure, and
- * then only the exact comparison applies), snapped to the 6-dp grid, then
- * toPurchaseQty — the "In Stock" column's arithmetic.
- *
- * WHY THIS DESK NEEDS IT (round 7 verifier). THREE MANGO approved 14.843 kg,
- * 14,842.5 g on the shelf, typed 14.843: the store takes the whole shelf and
- * records 14.8425 kg — and the server calls the line COMPLETE (both figures
- * show as 14.843). The department view here subtracted and printed "0.001
- * still to come" (store_processed) / "0.001 short" (fulfilled) on a line no
- * desk will ever issue again, while the store desk printed Outstanding 0 kg.
- * A line genuinely short at a printed figure (14.842 of 14.843) stays open.
- * Any change to issuedCoversAsk must be mirrored here and on the store desk.
+ * The shelf mark (shelf_emptied_qty) is the server's record that a take
+ * EMPTIED the central shelf and closed the line there — THREE MANGO approved
+ * 14.843 kg, the take emptied a 14,842.5 g shelf and recorded 14.8425: complete,
+ * so this desk prints no "0.001 still to come" on a line nobody can issue.
+ * Round 7's arms that closed a line on the figures alone (the two SHOW as one
+ * number; anything below one printed step owed) are gone: MALA MANGO CRUSH 5
+ * LTR, 1,000 of 1,004 ml issued with 49 L on the shelf, printed Fulfilled here
+ * and dropped "· 0.001 still to come" while the store could serve the 4 ml. A
+ * remainder below a step over a stocked shelf is an ordinary partial.
  */
 function lineIssueComplete(it: ReqItem): boolean {
-  const eff = effectiveQty(it);
-  const got = Number(it.quantity_issued) || 0;
-  if (got >= eff) return true;
-  const ru = String(it.material_unit || '').trim();
-  if (!ru) return false;
-  const meta = { unit: ru, purchase_unit: it.material_purchase_unit, pack_size: it.material_pack_size };
-  const pf = packFactor(meta);
-  let factor = 1;
-  if (pf > 1) {
-    const lu = String(it.unit ?? '').toLowerCase().trim();
-    const pu = String(it.material_purchase_unit ?? '').toLowerCase().trim();
-    if (lu === '') return false;
-    if (lu === pu) factor = pf;
-    else if (lu === ru.toLowerCase()) factor = 1;
-    else return false;
-  }
-  const shown = (q: number) => toPurchaseQty(Math.round((Number(q) || 0) * factor * 1e6) / 1e6, meta);
-  const sw = Number(shown(eff)) || 0;
-  if (!(sw > 0)) return false;
-  if ((Number(shown(got)) || 0) === sw) return true;
-  const grid6 = (n: number) => Math.round((Number(n) || 0) * 1e6);
-  const step = (0.001 * pf) / factor;
-  return grid6(got) > 0 && grid6(eff - got) < grid6(step);
+  return deskLineComplete(Number(it.quantity_issued) || 0, effectiveQty(it), {
+    unit: it.unit, material_unit: it.material_unit,
+    material_purchase_unit: it.material_purchase_unit, material_pack_size: it.material_pack_size,
+    shelf_emptied_qty: it.shelf_emptied_qty,
+  });
 }
 
 /**
@@ -1343,7 +1332,8 @@ function RequisitionDetail({ r, materials, viewer, requireMgmt, reload, onEdit }
                     const approved = effectiveQty(it);
                     const issued = Number(it.quantity_issued) || 0;
                     // Nothing is still to come on a line the server calls
-                    // complete (lineIssueComplete — the shown-figure close).
+                    // complete (lineIssueComplete — THE RULE: in full, or a
+                    // take emptied the shelf with less than a step owed).
                     const open = lineIssueComplete(it) ? 0 : Math.max(0, approved - issued);
                     const over = issued - approved;
                     // "requested" vs "approved" — say which number the line fell
@@ -2366,8 +2356,31 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
       // is NOT zero: treating it as zero would seed a blank box on every line in
       // the grid and tell the storekeeper the store holds nothing. It leaves the
       // check UNARMED, which the amber panel below says out loud.
-      const issuable = (isPartyReq || !stockKnown)
-        ? effective
+      // A PARTY line (round 8b) is NOT exempt from the balance on this desk: the
+      // party transfer runs on this very submit whenever no PO is raised
+      // (store-process 3a) and is bounded by the same floor, all-or-nothing, so
+      // the full demand over a short shelf was refused whole — THREE MANGO
+      // 14.843 kg over 14,842.4 g seeded 14.843, printed "✓ Every line fully
+      // issued", and answered 400 (round-8 verifier, md_party_seeded). It is
+      // seeded at what the transfer accepts: the demand when it fits (the
+      // shown-figure rule included), otherwise the server's own cap on the
+      // line's total — the balance's shown figure, which takes everything the
+      // store holds (and closes the line by THE RULE when less than one printed
+      // step is left owing).
+      const partySeed = (() => {
+        if (!isPartyReq || !stockKnown || Number((it as any).central_flow_blocked || 0)) return effective;
+        const meta = { unit: it.material_unit, purchase_unit: it.material_purchase_unit, pack_size: it.material_pack_size };
+        const ask = Math.round(effective * reqFactor * 1e6) / 1e6;
+        const plan = planDeskDebit(bookStock, ask, meta);
+        if (plan.fits) return effective;
+        const pfm = packFactor(meta);
+        const gAvail = Math.round(Math.max(0, bookStock) * 1e6);
+        return plan.shownAvailable > 0
+          ? Math.round((plan.shownAvailable * pfm / reqFactor) * 1e6) / 1e6
+          : gAvail > 0 ? (gAvail / 1e6) / reqFactor : 0;
+      })();
+      const issuable = isPartyReq ? partySeed
+        : !stockKnown ? effective
         : Math.max(alreadyIssued, Math.min(effective, alreadyIssued + Math.max(0, stockInReqUnits)));
       // (There used to be a `const shortfall = effective - issuable` here, frozen
       //  into the Buy box below. See the note above buyInPurchaseUnit.)
@@ -2439,6 +2452,13 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
         material_category: it.material_category,
         material_unit: it.material_unit,     // recipe unit (canonical)
         req_unit: reqUnit(it),               // unit the dept requested in — requested/issued qtys are STORED in THIS unit
+        /** requisition_items.unit RAW (no fallback) — what the server's
+         *  lineFactor reads; the take forecast (desk-rule.ts) needs it to tell
+         *  a blank unit (needsReview, no take forecast) from a recipe-unit line. */
+        line_unit: it.unit ?? '',
+        /** 1 for a liquor / store-mapped material (round 8b) — the take
+         *  forecast says nothing about it (desk-rule.ts). */
+        central_flow_blocked: Number((it as any).central_flow_blocked || 0),
         U,                                   // purchase-unit view of req_unit (display only — see lineUnits)
         purchase_unit: purchaseUnit,         // vendor-facing unit
         pack_size: packConv,                 // recipe-units per purchase-unit, canon-guarded (1 = no real conversion, so every `pack_size > 1` test below is the full guard)
@@ -2627,7 +2647,14 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
   };
   /** What is still short on this line, in the line's STORED unit — the exact
    *  subtraction the Shortfall column prints (`requested − Issue Now`). */
-  const shortOf = (ln: Line) => Math.max(0, ln.requested - issuedOf(ln));
+  // THE TAKE'S OWN BALANCE where the take is not the figure (round 8b): 20 kg
+  // approved, 14.842 typed over 14,842.4 g takes 14,842.4 g and records
+  // 14.8424, so 5,157.6 g is owed — "requested − typed" printed 5,158 g.
+  // owingLine is 0 on a line THE RULE closes.
+  const shortOf = (ln: Line) => {
+    const tk = takeOf(ln);
+    return tk ? tk.owingLine : Math.max(0, ln.requested - issuedOf(ln));
+  };
 
   /* ──────────────────────────────────────────────────────────────────────────
    * THE CENTRAL CAP — THE SCREEN'S COPY OF THE SERVER'S FLOOR.
@@ -2661,8 +2688,9 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
    * src/lib/central-debit-clamp.ts planCentralDebit ("THE SHOWN FIGURE IS THE
    * BALANCE"): an ask whose SHOWN figure equals the balance's shown figure, and
    * that figure is above 0, is "all of it" — it fits and lands on exactly 0.
-   * checkCentralIssue hands it toPurchaseQty, which is U.stockPU's arithmetic
-   * here — the "In Stock" column's own number. That file imports the database,
+   * checkCentralIssue hands it shownPurchaseQty (round 8: the grid point, then
+   * integer half-up; toPurchaseQty renderings still matched), which is
+   * U.stockPU here — the "In Stock" column's own number. That file imports the database,
    * so it cannot be bundled into this page; `wouldHold` below asks the SAME two
    * questions in the same order on the same converter (grid fit, then shown
    * figure) and cites it, rather than deciding anything of its own. Before
@@ -2689,14 +2717,24 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
     // ARMED only when the screen genuinely knows the balance. A party
     // requisition is EXEMPT by the server's own rule, so there is nothing to
     // cap; an unknown balance leaves the cap off rather than guessing 0.
-    const exempt = isPartyReq;
+    // A PARTY line is floored by the TRANSFER (round 8b), which runs on this
+    // submit when the PO box is unticked (store-process 3a) and moves the line's
+    // WHOLE quantity from 0 — so its base is 0, not what the line held before.
+    // With the box ticked the transfer may wait for a later gesture, and the
+    // screen does not guess.
+    // A liquor / store-mapped PARTY line is declined by the transfer, never
+    // refused, so it is exempt too (central_flow_blocked, round 8b). An
+    // internal one keeps its round-6 advisory cap and words: its seed is
+    // capped to the books, and the banner is what explains the blank box.
+    const exempt = isPartyReq && (raisePo || !!ln.central_flow_blocked);
     const armed = !exempt && (ln.stock_known || !!srv);
+    const base = isPartyReq ? 0 : ln.already_issued;
     const availRecipe = Math.max(0, Number(ln.current_stock) || 0);
     const factor = ln.req_factor || 1;
     const pf = ln.U.pf || 1;
     /* ── THE BOOKS' CAP, FIELD FOR FIELD AS checkCentralIssue BUILDS IT ──────
        availablePurchase — the balance's SHOWN figure (U.stockPU is
-         toPurchaseQty's arithmetic, the In Stock column's own number). Below
+         shownPurchaseQty, the In Stock column's own number). Below
          the display (it shows 0 but holds at least one grid step — holdsAny)
          the balance's 6-dp grid point carried in purchase units, so the cap
          is never printed as 0 over stock that is there. 0 only when the store
@@ -2710,8 +2748,8 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
     const gridAvail = grid6(availRecipe) / 1e6;           // qtyDown(x, 6)
     const booksPU = shownAvail > 0 ? shownAvail : holds ? gridAvail / pf : 0;
     const booksMaxLine = shownAvail > 0
-      ? ln.already_issued + Math.round((shownAvail * pf / factor) * 1e6) / 1e6
-      : holds ? ln.already_issued + gridAvail / factor : ln.already_issued;
+      ? base + Math.round((shownAvail * pf / factor) * 1e6) / 1e6
+      : holds ? base + gridAvail / factor : base;
     // THE SERVER'S OWN NUMBER WINS once it has spoken about this line. It is
     // the only fresh reading available — `current_stock` here is a snapshot
     // taken when the modal opened, and max_issue_qty arrives in the LINE's unit
@@ -2766,10 +2804,21 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
     const wouldHold = (lineQty: number) => {
       if (!armed) return false;
       const q = Number(lineQty) || 0;
-      const askRecipe = Math.round((q - ln.already_issued) * factor * 1e6) / 1e6;
+      const askRecipe = Math.round((q - base) * factor * 1e6) / 1e6;
       if (!(askRecipe > EPSQ)) return false;
       if (q <= maxLine + EPSQ) return false;
       if (sameBasis && availPU >= 0.001 && ln.U.stockPU(askRecipe) === availPU) return false;
+      // THE SERVER'S OTHER RENDERINGS OF THE SAME BALANCE (round 8). Its match
+      // compares the ask's grid-point figure with the balance's
+      // shownPurchaseQty AND with toPurchaseQty of the raw balance and of its
+      // grid point (checkCentralIssue's `alts`), so a figure an older screen
+      // printed is never refused. Asked through desk-rule.ts planDeskDebit —
+      // the same function the store desk's forecast asks — on the snapshot the
+      // modal opened with. Once the server has spoken (srv) its own figure
+      // stands alone, as above.
+      if (!srv && sameBasis && planDeskDebit(availRecipe, askRecipe, {
+        unit: ln.material_unit, purchase_unit: ln.purchase_unit, pack_size: ln.pack_size,
+      }).byShownFigure) return false;
       return true;
     };
     /* ── THE BOX'S OWN NUMBER ────────────────────────────────────────────────
@@ -2829,6 +2878,91 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
    *  on the stored basis, by the same rule. Silent whenever the cap is not
    *  armed — an unsure screen says nothing rather than crying wolf. */
   const overCapOf = (ln: Line) => centralCapOf(ln).wouldHold(issuedOf(ln));
+  /* ──────────────────────────────────────────────────────────────────────────
+   * WHAT THE TAKE WILL RECORD (round 8) — the server's shelf take, asked before
+   * the click through desk-rule.ts forecastDeskTake (the store desk asks the
+   * same function). The shelf rule takes the whole balance when the figure sent
+   * IS the balance's shown figure: 14.842 kg typed over a 14,842.4 g shelf
+   * takes all 14,842.4 g, the line records 14.8424, and THE RULE closes it —
+   * the 0.6 g left is below one printed step and no desk can issue it. This
+   * screen printed "Shortfall 0.001 kg = 1 g" and "⚠ 1 line is short … To buy
+   * the rest, tick Also raise a vendor PO", then "Requisition is now
+   * Fulfilled" (round-7 verifier). The two rails:
+   *   · internal: each line's increment, in row order, with a running claim per
+   *     material (store-process's write loop → applyIssueDelta);
+   *   · PARTY: the transfer moves each line's whole quantity once, after the
+   *     write loop, when no PO is raised and nothing is held
+   *     (store-process 3a, applyPartyFulfillment) — forecast only with the PO
+   *     box unticked and on a line nothing was issued on before.
+   * Printed ONLY where the take is not the typed figure (`changed`) or THE RULE
+   * closes the line by the shelf (`byShelf`); every other row is untouched. A
+   * line the server has already spoken about (blockedRows) keeps the server's
+   * figures. Advisory: liquor / store-mapped lines are invisible from here.
+   * ────────────────────────────────────────────────────────────────────────── */
+  let takeMemo: Record<string, DeskTakeForecast> | null = null;
+  const takeOf = (ln: Line): DeskTakeForecast | undefined => {
+    if (!takeMemo) {
+      const out: Record<string, DeskTakeForecast> = {};
+      const claimed = new Map<string, number>();
+      const partyRuns = isPartyReq && !raisePo;
+      // The transfer is all-or-nothing: one line it cannot move refuses the
+      // whole submit, and then nothing is taken anywhere.
+      const partyRefused = partyRuns && lines.some(l => overCapOf(l));
+      for (const l of lines) {
+        if (partyRefused) break;
+        if (blockedRows[l.id] || !l.stock_known) continue;
+        const after = issuedOf(l);
+        const units = {
+          unit: l.line_unit, material_unit: l.material_unit,
+          material_purchase_unit: l.purchase_unit, material_pack_size: l.pack_size,
+          current_stock: l.current_stock,
+          // A liquor / store-mapped line has no central take (round 8b).
+          central_flow_blocked: l.central_flow_blocked,
+        };
+        let tk: DeskTakeForecast | null = null;
+        if (!isPartyReq) {
+          if (overCapOf(l)) continue;      // held — the hold forecasts say so
+          tk = forecastDeskTake({
+            line: { ...units, quantity_issued: l.already_issued }, purpose: 'internal',
+            approved: l.requested, deltaLine: after - l.already_issued,
+            claimedRecipe: claimed.get(l.material_id) || 0,
+          });
+        } else if (partyRuns) {
+          // The line's WHOLE quantity, from 0 (the transfer's beforeLineQty).
+          tk = forecastDeskTake({
+            line: { ...units, quantity_issued: 0 }, purpose: 'internal',
+            approved: l.requested, deltaLine: after,
+            claimedRecipe: claimed.get(l.material_id) || 0,
+          });
+        }
+        if (!tk) continue;
+        claimed.set(l.material_id, (claimed.get(l.material_id) || 0) + tk.takeRecipe);
+        if (tk.changed || tk.byShelf) out[l.id] = tk;
+      }
+      takeMemo = out;
+    }
+    return takeMemo[ln.id];
+  };
+  /** Typed down to the books' cap, does the take close the line (round 8b)?
+   *  The cap is the shown figure of what is left (`maxLine`), so the take is
+   *  everything left; THE RULE closes the line when less than one printed step
+   *  is then owed. Asked of desk-rule.ts forecastDeskTake from the line's base
+   *  (the party transfer's 0, or what the line already held). */
+  const capClosesLine = (ln: Line): boolean => {
+    const cap = centralCapOf(ln);
+    if (!cap.armed || cap.empty) return false;
+    const base = isPartyReq ? 0 : ln.already_issued;
+    const tk = forecastDeskTake({
+      line: {
+        unit: ln.line_unit, material_unit: ln.material_unit,
+        material_purchase_unit: ln.purchase_unit, material_pack_size: ln.pack_size,
+        current_stock: ln.current_stock, central_flow_blocked: ln.central_flow_blocked,
+        quantity_issued: base,
+      },
+      purpose: 'internal', approved: ln.requested, deltaLine: cap.maxLine - base,
+    });
+    return !!tk?.complete;
+  };
   /**
    * The Buy qty a line offers while nobody has overridden it: the LIVE shortfall,
    * expressed in whatever unit the Buy box is currently entering in.
@@ -2948,7 +3082,10 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
   /* Lines the central store's books cannot cover in full — the set the red
      banner is about. Derived through centralCapOf, so the banner, the row and
      the box can never quote three different ceilings. */
-  const cappedLines = lines.filter(ln => centralCapOf(ln).capped);
+  // A line THE RULE closes by the shelf on this submit (takeOf: the take
+  // empties the shelf and less than one printed step is left owing) is not one
+  // the books "cannot cover" — there is no rest to receive stock for (round 8b).
+  const cappedLines = lines.filter(ln => centralCapOf(ln).capped && !takeOf(ln)?.byShelf);
   /** Lines currently holding a quantity the server will hold back (not issue). */
   const overCapLines = lines.filter(ln => overCapOf(ln));
   /** Lines that clear the floor AND hand goods over on this submit — the
@@ -2958,7 +3095,10 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
    *  written); with at least one, it issues them and holds the rest (200,
    *  `held_lines`). Advisory like every cap on this screen. */
   const handOverLines = lines.filter(ln => !overCapOf(ln) && issuedOf(ln) > ln.already_issued + EPSQ);
-  const refusedWhole = overCapLines.length > 0 && handOverLines.length === 0;
+  // A PARTY submit's transfer is all-or-nothing (round 8b): one line it cannot
+  // move refuses the whole submit, whatever the other lines hand over.
+  const partyWhole = isPartyReq && !raisePo && overCapLines.length > 0;
+  const refusedWhole = partyWhole || (overCapLines.length > 0 && handOverLines.length === 0);
   /** Lines entered as 0 that are still owed: not held, and nothing goes out on
    *  them — they stay outstanding exactly like a held line. The ⛔ banner's
    *  "Every other line is issued" must not count them (round 7 verifier:
@@ -2974,8 +3114,10 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
 
   // A cross-line SUM of shortfalls mixes units (kg + BTL + pcs) and is
   // meaningless as a number — count the lines that are short instead.
-  const shortLineCount = lines.filter(ln => (ln.requested - issuedOf(ln)) > 0).length;
-  const totalShortfall = lines.reduce((s, ln) => s + Math.max(0, ln.requested - issuedOf(ln)), 0);
+  // shortOf, not a bare subtraction: a line THE RULE will close by the shelf
+  // (takeOf) is not short — nothing more can be issued on it.
+  const shortLineCount = lines.filter(ln => shortOf(ln) > 0).length;
+  const totalShortfall = lines.reduce((s, ln) => s + shortOf(ln), 0);
   const poTotal = lines.reduce((s, ln) => s + (buyOf(ln) * priceOf(ln)), 0);
 
   const submit = async () => {
@@ -3706,7 +3848,11 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                   // stays on the stored basis (exact, and it is what gets saved);
                   // only the PRINTING is converted to purchase units.
                   const issued = issuedOf(ln);
-                  const short = Math.max(0, ln.requested - issued);
+                  // THE TAKE, when it is not the typed figure or closes the line
+                  // by the shelf (takeOf, round 8). shortOf is 0 on a line the
+                  // shelf closes; on every other row it is the subtraction below.
+                  const take = takeOf(ln);
+                  const short = shortOf(ln);
                   /* OVER-ISSUE. The field is seeded with the APPROVED qty
                      (min(approved, stock)), so a store that physically handed
                      over more had no way to know it could type the real figure —
@@ -3735,9 +3881,14 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                   /** Recipe-unit hint under a purchase-lead figure. Takes a qty in
                    *  the LINE's stored unit — same signature as the approve grid's
                    *  hint(), so the two screens print identical equivalents. */
-                  const hint = (q: number) => U.pf > 1
-                    ? <div className="text-[9px] text-[#B8A590] font-normal">= {fmtNum(U.toRecipe(q))} {U.recipeUnit}</div>
-                    : null;
+                  // On an unpacked material (pack 1) the exact figure when 3 dp
+                  // would hide it (round 8b): 3.2174 kg stored reads "3.217".
+                  const hint = (q: number) => {
+                    if (U.pf > 1) return <div className="text-[9px] text-[#B8A590] font-normal">= {fmtNum(U.toRecipe(q))} {U.recipeUnit}</div>;
+                    const r = Math.round((Number(q) || 0) * 1e6) / 1e6;
+                    const ex = r.toLocaleString('en-IN', { maximumFractionDigits: 6 });
+                    return r > 0 && ex !== fmtNum(r) ? <div className="text-[9px] text-[#B8A590] font-normal">= {ex} {U.recipeUnit}</div> : null;
+                  };
                   // PO-side state for this row, all read through the one set of
                   // accessors so the row, the footer and the POST body agree.
                   const buy      = buyOf(ln);
@@ -3916,7 +4067,10 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                             hint below is that stored figure, so the store user can
                             see both sides of the one conversion. */}
                         <span className="ml-1 text-[10px] text-[#8B7355]">{U.pu}</span>
-                        {hint(issued)}
+                        {/* What gets STORED (the header's promise): the take's
+                            record when the shelf rule takes a balance that is not
+                            the typed figure — 14,842.4 g, not 14,842 (round 8b). */}
+                        {hint(take?.changed ? take.recordedLine : issued)}
                       </td>
                       <td className="py-1.5 px-2 text-right font-mono">
                         {/* requested − issued: both stored-basis, printed in PU. */}
@@ -3924,6 +4078,31 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                           ? <span className="text-amber-700">{fmtNum(U.toPU(short))} {U.pu}</span>
                           : <span className="text-emerald-700">0 {U.pu}</span>}
                         {short > 0 && hint(short)}
+                        {/* What leaves the shelf and what it leaves the line at —
+                            only when the take is not the typed figure or THE RULE
+                            closes the line (takeOf). Round 8. */}
+                        {take && (() => {
+                          const takePU = U.stockPU(take.takeRecipe);
+                          const rem = Math.max(0, ln.requested - take.recordedLine);
+                          const remPU = U.isPU ? rem : rem / (U.pf || 1);
+                          return (
+                            <div className="text-[9px] font-sans text-emerald-800 mt-0.5 text-right max-w-[14rem] ml-auto"
+                                 title="The central store's shelf rule: a figure that IS the balance's shown figure takes the whole balance and lands the shelf on exactly 0. The line records what left the shelf.">
+                              takes everything the store holds — {takePU > 0 ? fmtNum(takePU) : fmtCapPU(take.takeRecipe / (U.pf || 1), U.pf)} {U.pu}
+                              {U.pf > 1
+                                ? <> (= {fmtNum(take.takeRecipe)} {U.recipeUnit})</>
+                                // Unpacked (pf 1): the exact figure when 3 dp would hide it
+                                // (WHOLE DHANIYA 3.2174 kg prints 3.217 above).
+                                : (Math.round(take.takeRecipe * 1e6) / 1e6) !== takePU
+                                  ? <> (= {(Math.round(take.takeRecipe * 1e6) / 1e6).toLocaleString('en-IN', { maximumFractionDigits: 6 })} {U.recipeUnit})</>
+                                  : null}
+                              {take.byShelf && rem > 1e-9 && (
+                                <> — the line closes: the {fmtCapPU(remPU, U.pf)} {U.pu}{U.pf > 1 && <> (= {fmtNum(U.toRecipe(rem))} {U.recipeUnit})</>} still
+                                  owing is below the 0.001 {U.pu} the store can issue</>
+                              )}
+                            </div>
+                          );
+                        })()}
                       </td>
                       {raisePo && <>
                         <td className="py-1.5 px-2">
@@ -4219,7 +4398,10 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
               <div className="text-[11px] px-3 py-2 bg-red-50 border-2 border-red-300 rounded text-red-900">
                 <div className="font-semibold">
                   ⛔ {n} line{one ? '' : 's'} ask{one ? 's' : ''} for more than the central store&apos;s books hold
-                  {refusedWhole ? (
+                  {partyWhole ? (
+                    <> — a party requisition&apos;s goods leave the store in one transfer, every line at once, so the store
+                      will <b>refuse the whole issue</b> and save nothing, the other lines included.</>
+                  ) : refusedWhole ? (
                     <> — and no other line hands anything over, so the store will <b>refuse the whole issue</b> and save nothing.</>
                   ) : zeroEntryLines.length === 0 ? (
                     <> — on submit {one ? 'it is' : 'they are'} <b>NOT issued and {one ? 'stays' : 'stay'} outstanding</b>.
@@ -4242,7 +4424,13 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                     return `${ln.material_name} (books: ${c.empty ? 'none' : `${fmtCapPU(c.availPU, c.pf)} ${c.purchaseUnit}`})`;
                   }).join(', ')}
                   .{' '}
-                  {refusedWhole ? (
+                  {refusedWhole && overCapLines.every(ln => capClosesLine(ln)) ? (
+                    /* Round 8b: the cap takes everything left and closes the
+                       line — there is no "rest" to receive stock for. */
+                    <>Lower {one ? 'that line' : 'those lines'} to what the store can give — it then takes everything the
+                      store holds and {one ? 'the line closes' : 'the lines close'} (what is still owed is below one printed
+                      step). The whole gesture replays once the number is corrected.</>
+                  ) : refusedWhole ? (
                     <>Lower {one ? 'that line' : 'those lines'} to what the store can give — the rest needs stock received
                       or a closing count recorded. The whole gesture replays once the number is corrected.</>
                   ) : (
@@ -4323,7 +4511,13 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
             </div>
           ) : overCapLines.length > 0 ? null : (
             <div className="text-[11px] px-3 py-2 bg-emerald-50 border border-emerald-200 rounded">
-              ✓ Every line fully issued — requisition will move to <b>Fulfilled</b> on submit.
+              {/* A line THE RULE closes by the shelf is complete, not "fully
+                  issued" — it owes less than one printed step the store cannot
+                  give. Said so only when there is one; otherwise the original
+                  sentence, byte for byte (round 8). */}
+              {lines.some(ln => takeOf(ln)?.byShelf)
+                ? <>✓ Every line complete — the lines marked &quot;takes everything the store holds&quot; close below one printed step — requisition will move to <b>Fulfilled</b> on submit.</>
+                : <>✓ Every line fully issued — requisition will move to <b>Fulfilled</b> on submit.</>}
             </div>
           )}
         </div>

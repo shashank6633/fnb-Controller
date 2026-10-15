@@ -3,6 +3,8 @@ import { getCurrentUser, getCurrentOutletId, canApproveAsChef, canApproveAsMgmt,
 import { requisitionVisibility, isMainDeptHead, isAnyMainDeptHead, effectiveCategoriesForUser } from '@/lib/dept-hierarchy';
 import { requisitionHasMovedStock, lineIssueComplete, type LineCompletenessRow } from '@/lib/issue-stock';
 import { duplicateLineError } from '@/lib/po-helpers';
+import { PARTY_TRANSFER_TYPES_SQL } from '@/lib/movement-record';
+import { centralFlowBlock } from '@/lib/store-engine';
 
 // Statuses at which a requisition can be edited, by whom:
 //   draft                                            → drafter or admin
@@ -59,11 +61,13 @@ const ESTIMATED_VALUE_SQL = `(SELECT COALESCE(SUM(
  * lines_owing BY THE ISSUE DESKS' OWN RULE (round 7).
  *
  * The list's lines_owing is a bare SQL `quantity_issued < approved`. Both issue
- * routes now close a line by issue-stock.ts lineIssueComplete, which adds one
- * arm SQL cannot express: the issued and approved figures SHOW as the same
- * number (central-debit-clamp.ts issuedCoversAsk). THREE MANGO approved 14.843
- * kg, the whole 14,842.5 g shelf taken and recorded as 14.8425 kg, is COMPLETE
- * on both desks — but this count kept it owing, so the list row's hover read
+ * routes now close a line by issue-stock.ts lineIssueComplete — THE RULE
+ * (central-debit-clamp.ts issuedCoversAsk) — which adds one arm this SQL does
+ * not spell: a take emptied the central shelf and what remains owing is below
+ * one printed step, remembered on the line as shelf_emptied_qty (round 8; it
+ * must be selected below, or the rule reads the first arm only). THREE MANGO
+ * approved 14.843 kg, the whole 14,842.5 g shelf taken and recorded as 14.8425
+ * kg, is COMPLETE on both desks — but this count kept it owing, so the list row's hover read
  * "1 line(s) handed over, 2 still owed" with only SALT owed, and the Part chip
  * (isPartIssued) would stay lit on a requisition whose every other line was
  * done. Measured by the round-7 verifier (md_r1_detail).
@@ -88,6 +92,7 @@ function uncountShownFigureCloses(
     const part = ids.slice(i, i + CHUNK);
     const lines = db.prepare(`
       SELECT ri.req_id, ri.quantity_issued, ri.chef_approved_qty, ri.quantity_requested,
+             ri.shelf_emptied_qty,
              ri.unit AS line_unit, rm.unit, rm.purchase_unit, rm.pack_size
         FROM requisition_items ri JOIN raw_materials rm ON rm.id = ri.material_id
        WHERE ri.req_id IN (${part.map(() => '?').join(',')})
@@ -141,9 +146,18 @@ export async function GET(request: Request) {
     const { sql: visSql, params: visParams, me: visMe } = await visibilityFilter();
 
     if (id) {
+      // party_transferred (round 8b): has the one-shot party transfer already
+      // moved this requisition's goods? Both issue desks forecast a party
+      // gesture's take as the transfer (desk-rule.ts forecastDeskPartyTransfer),
+      // and once it has run it never runs again — a later issue moves nothing
+      // and is never refused — so a desk must not forecast a take (or a
+      // refusal) that cannot happen. Same probe as party-fulfillment.ts's guard.
       const r = db.prepare(`
         SELECT r.*, d.name AS department_name, d.code AS department_code,
-               po.po_number AS linked_po_number, po.status AS linked_po_status
+               po.po_number AS linked_po_number, po.status AS linked_po_status,
+               CASE WHEN EXISTS (SELECT 1 FROM inventory_transactions it
+                                  WHERE it.reference_id = r.id AND it.type IN (${PARTY_TRANSFER_TYPES_SQL}))
+                    THEN 1 ELSE 0 END AS party_transferred
         FROM requisitions r
         JOIN departments d ON d.id = r.department_id
         LEFT JOIN purchase_orders po ON po.id = r.linked_po_id
@@ -202,7 +216,20 @@ export async function GET(request: Request) {
         LEFT JOIN departments d ON d.id = ri.department_id
         WHERE ri.req_id = ?
         ORDER BY d.name, rm.name
-      `).all(id);
+      `).all(id) as any[];
+      // central_flow_blocked (round 8b): a liquor / store-mapped material moves
+      // on its store's ledger and the central floor NEVER applies to it
+      // (issue-stock.ts checkCentralIssue: skipReason 'store_mapped', the same
+      // store-engine.ts centralFlowBlock call). Both issue desks forecast the
+      // central take before the click (desk-rule.ts) and could not tell such a
+      // line apart — so a split over a bar bottle read "the line closes, so
+      // nothing is deferred" and the server kept the defer (round-8 fuzz,
+      // 100 PIPERS). The flag lets a desk say nothing it cannot know.
+      for (const it of items) {
+        let blocked = false;
+        try { blocked = centralFlowBlock(db, String(it.material_id)) !== null; } catch { blocked = false; }
+        it.central_flow_blocked = blocked ? 1 : 0;
+      }
       // Approve permission for the detail view: any HOD (is_head_chef) or admin —
       // matching the chef-approve/reject API (canApproveAsChef) — OR this req's
       // main-dept head. (UI was gating only on dept-head, so is_head_chef HODs saw

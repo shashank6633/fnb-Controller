@@ -1,6 +1,8 @@
 import type Database from 'better-sqlite3';
 import { generateId, logAuditEvent } from '@/lib/db';
-import { assertCentralIssue, recordPartyShelfTake, lineFactor } from '@/lib/issue-stock';
+import {
+  assertCentralIssue, recordPartyShelfTake, stampShelfClose, centralShelfEmpty, markLedgerShelfClose,
+} from '@/lib/issue-stock';
 // THE MOVEMENT RECORD (owner's eight fields, 2026-09-10). This module writes
 // BOTH rails with its own raw INSERTs — it maintains the department_materials
 // cache itself, so it deliberately does NOT route through postDeptLedger (that
@@ -65,11 +67,10 @@ export interface PartyShelfRecord {
  * both already catch it and answer 400 with the storekeeper-phrased message
  * (store-issue/route.ts:971, store-process/route.ts:1307), so the whole gesture
  * unwinds and the requisition is left exactly as it was. It must be
- * all-or-nothing rather than a quietly short transfer: a line that moved less
- * than it records would read as handed over in full on the line, the ledger and
- * the Issue Log, with nobody told. (A later call now TOPS UP what an earlier one
- * moved — see below — but only a line that records more than has moved; a short
- * line written as if it had moved in full would never be seen as owed.) The UNATTENDED third route (the PO-receipt / GRN-QC cascade in
+ * all-or-nothing rather than a partial transfer, because the idempotency guard
+ * below is per-REQUISITION: one line's party row makes the whole requisition
+ * read as already-transferred, so a quietly short line could never be completed
+ * later. The UNATTENDED third route (the PO-receipt / GRN-QC cascade in
  * po-requisition-fulfil.ts) deliberately does the opposite — see the judgement
  * recorded there.
  *
@@ -86,41 +87,12 @@ export interface PartyShelfRecord {
  * return 1 on the other 3 — which are exactly the blank-unit packed lines the
  * two now REFUSE rather than guess (see the carve-outs below).
  *
- * The party transfer inventory_transactions rows are the single source of truth
- * for de-duplication: what they already moved for this requisition is never
- * moved again. That makes the helper safe to call from BOTH fulfilment paths
- * (store-process batch + store-issue incremental) without any risk of
- * double-deduction. The probe matches BOTH the current 'party_issue' and the
- * legacy 'party_consumption' — see the guard below.
- *
- * ── A LATER CALL TOPS UP; IT NEVER REPEATS (round 7) ───────────────────────
- * The guard used to be ONE-SHOT: any party row on the requisition ⇒ skip the
- * whole call. store-process fires this transfer on a PARTIAL hand-over (its
- * trigger is "nothing on order", deliberately not "fulfilled" — the goods
- * leave the store the day they leave), so a party line processed at 10 of
- * 14.843 kg moved 10 kg, and the store-issue top-up that completed the line
- * met the one-shot guard: the line, the issue ledger and the Issue Log said
- * 14.843 kg handed over while only 10 kg ever left central or reached the
- * department (measured, lv.ts party_mixed_process_then_issue; the same on
- * ca91b18 and production).
- *
- * Now the rows say how much has moved, PER MATERIAL, and a later call moves
- * only what the lines record beyond it — attributed to the material's lines in
- * the same row order this loop always walked, each line through the same floor
- * with beforeLineQty = its moved share. A requisition already moved in full
- * finds nothing left and writes nothing, exactly as the old skip did; a
- * concurrent second process still waits on the IMMEDIATE lock and then reads
- * the first one's rows. Only POSITIVE remainders move: a line that now records
- * LESS than its share moved (an undo after a partial transfer) is not credited
- * back here — this rail does not unwind, which is the existing rule (see
- * store-issue's party reversal refusal), and it is left for the department
- * reconcile screen.
- *
- * NEITHER OTHER RAIL CHANGES. The PO cascade keeps its own any-row skip (it is
- * unattended; see po-requisition-fulfil.ts), and the void's three
- * discriminators read the same row shapes as before. Proved a no-op on the
- * live book: it holds 0 party transfer rows (both party requisitions are
- * still 'submitted'), so no stored requisition reads differently.
+ * The party transfer inventory_transactions row is the single source of truth
+ * for de-duplication: if one already exists for this requisition, the transfer
+ * has already happened and this is a no-op. That makes the helper safe to call
+ * from BOTH fulfilment paths (store-process batch + store-issue incremental)
+ * without any risk of double-deduction. The probe matches BOTH the current
+ * 'party_issue' and the legacy 'party_consumption' — see the guard below.
  *
  * THE GUARD READ AND THE WRITES SHARE ONE TRANSACTION, and that transaction is
  * IMMEDIATE. Until 2026-09-17 the guard ran outside the db.transaction that
@@ -186,14 +158,10 @@ export function applyPartyFulfillment(
   //
   // PREPARED HERE, EXECUTED INSIDE THE TRANSACTION (see the header): preparing
   // takes no lock, so only the read itself needs to be under the write lock.
-  //
-  // WHAT HAS ALREADY MOVED, PER MATERIAL (round 7 — "A LATER CALL TOPS UP" in
-  // the header). The rows are negative debits, so −SUM is RECIPE units out.
-  const selMoved = db.prepare(`
-    SELECT material_id, -COALESCE(SUM(quantity), 0) AS moved
-    FROM inventory_transactions
+  const selAlready = db.prepare(`
+    SELECT 1 FROM inventory_transactions
     WHERE reference_id = ? AND type IN (${PARTY_TRANSFER_TYPES_SQL})
-    GROUP BY material_id
+    LIMIT 1
   `);
 
   // Also read INSIDE the transaction. quantity_issued is what this helper
@@ -250,13 +218,11 @@ export function applyPartyFulfillment(
     // THE GUARD, UNDER THE WRITE LOCK. Everything this function decides — has
     // the transfer already happened, and for how much — is read here, after
     // BEGIN IMMEDIATE has excluded every other writer.
-    const movedRows = selMoved.all(reqId) as Array<{ material_id: string; moved: number }>;
-    // topUp: an earlier call already moved some of this requisition. Each line
-    // is then floored from its moved share, not from 0, so nothing moves twice.
-    const topUp = movedRows.length > 0;
-    const movedPool = new Map<string, number>(
-      movedRows.map(m => [String(m.material_id), Math.max(0, Number(m.moved) || 0)]),
-    );
+    const already = selAlready.get(reqId);
+    if (already) {
+      console.log(`[party-fulfillment] requisition ${reqId} already transferred — skip`);
+      return false;
+    }
     const items = selItems.all(reqId) as any[];
     // Lines this transfer DECLINED to move, for the audit row below. A declined
     // line leaves no other trace: unlike applyIssueDelta, this rail writes no
@@ -276,24 +242,6 @@ export function applyPartyFulfillment(
       const issuedReq = Number(it.quantity_issued) || 0; // in ri.unit
       if (issuedReq <= 0) continue;
       const prior = takenBy.get(String(it.material_id));
-
-      // THIS LINE'S SHARE OF WHAT EARLIER CALLS MOVED, in the LINE's unit. The
-      // rows are per material, so the moved recipe quantity is handed to the
-      // material's lines in this loop's own order, each taking up to what it
-      // records. 0 on a first transfer (topUp false), which is exactly the
-      // beforeLineQty this call always passed. A line whose unit cannot be
-      // resolved never moved (the floor declines it) and takes no share.
-      let movedLine = 0;
-      if (topUp) {
-        const lf = lineFactor(it.req_unit, it);
-        const left = movedPool.get(String(it.material_id)) || 0;
-        if (!lf.needsReview && left > 0 && lf.factor > 0) {
-          const lineRecipe = Math.round(issuedReq * lf.factor * 1e6) / 1e6;
-          const share = Math.min(left, lineRecipe);
-          movedPool.set(String(it.material_id), left - share);
-          movedLine = share >= lineRecipe ? issuedReq : share / lf.factor;
-        }
-      }
 
       // THE FLOOR AND THE CONVERSION, FROM ONE CALL, INSIDE THIS TRANSACTION.
       //
@@ -316,21 +264,14 @@ export function applyPartyFulfillment(
       // unwound gesture left all 14,842.5 g on the shelf. The decision is the
       // same; the sentence now says the store holds 14.843 kg and all of it
       // goes to the line above.
-      //
-      // ON A TOP-UP the floor bounds only the remainder: beforeLineQty is the
-      // line's moved share, so the delta is what the line records beyond it.
       const c = assertCentralIssue(db, {
         reqItemId: String(it.id),
-        beforeLineQty: movedLine,
+        beforeLineQty: 0,
         afterLineQty: issuedReq,
         rail: 'party',
         siblingRecipe: prior?.recipe || 0,
         siblingLines: prior?.lines || 0,
       });
-      // Already moved in full (or, after an undo, moved MORE than the line now
-      // records — see the header: this rail does not credit back). Nothing to
-      // move and nothing declined: the earlier call's rows are the record.
-      if (topUp && !c.debits && c.skipReason === 'zero_delta') continue;
 
       // THE OTHER TWO CARVE-OUTS, HONOURED — AND THEY GATE BOTH SIDES.
       //
@@ -396,6 +337,17 @@ export function applyPartyFulfillment(
 
       // STORE: decrement current_stock + ledger row.
       decStock.run(issued, it.material_id);
+      // THE RULE'S MEMORY (round 8). Did THIS take empty the shelf? Read
+      // straight after the debit: a party line it closed by the shelf — the take
+      // emptied the material and what the line still owes is below one printed
+      // step (14.842 of 14.843 kg typed over 14,842.4 g, recorded 14.8424) — is
+      // stamped complete (stampShelfClose), so the status the caller decides
+      // AFTER this transfer reads it complete, and so does every later reader.
+      const stamp = stampShelfClose(db, String(it.id), centralShelfEmpty(db, String(it.material_id)));
+      // And on the ledger row that now carries the line's figure (the
+      // party_shelf correction, or the issue row moved unchanged), as history
+      // a later undo cannot retire (round 8b, markLedgerShelfClose).
+      if (stamp.byShelf) markLedgerShelfClose(db, String(it.id));
       // Same debit as before — same type, same sign, same reference, same note.
       // What is new is that the row now says WHERE the goods went (this party's
       // department, by id and by name), in WHAT unit, on WHAT business date and
@@ -487,9 +439,6 @@ export function applyPartyFulfillment(
           + recorded.map(r => `${r.material_name || r.material_id} ${r.asked_line_qty} → ${r.recorded_line_qty}`
             + `${r.line_unit ? ` ${r.line_unit}` : ''}`).join(', '),
       });
-    }
-    if (topUp && transferred.length === 0 && declined.length === 0) {
-      console.log(`[party-fulfillment] requisition ${reqId} already transferred in full — nothing to top up`);
     }
     return true;
   });

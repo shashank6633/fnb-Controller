@@ -27,9 +27,10 @@
  * Status auto-advances:
  *   mgmt_approved / chef_approved → store_processed (once any action taken)
  *   store_processed → fulfilled (when every non-rejected, non-deferred line
- *                                has quantity_issued >= chef_approved_qty, or
- *                                the two show as the same figure — see
- *                                lineIssueComplete).
+ *                                is complete by THE RULE — quantity_issued >=
+ *                                chef_approved_qty, or a take emptied the
+ *                                central shelf and less than one printed step
+ *                                is still owed; see lineIssueComplete).
  *
  * 'fulfilled' IS A WORKFLOW STATE, NOT A DELIVERY CLAIM, and this page prints
  * three different words for it — Fulfilled / Closed short / Closed — depending
@@ -58,7 +59,14 @@ import {
 import { api } from '@/lib/api';
 import { fmtIST, fmtISTDate, fmtISTIsoDate, fmtISTShort, todayIST } from '@/lib/format-date';
 import TabScroller from '@/components/TabScroller';
-import { packFactor, toPurchaseQty } from '@/lib/pack-units';
+import { packFactor, shownPurchaseQty, type PackMeta } from '@/lib/pack-units';
+// THE RULE and the shelf take, as both desks run them — ONE transcription of the
+// server's (central-debit-clamp.ts / issue-stock.ts), proved against it by
+// scripts/desk-rule-tests.ts. Never re-type any of it on this page.
+import {
+  deskLineComplete, deskLineBasis, planDeskDebit, forecastDeskTake, type DeskTakeForecast,
+  forecastDeskPartyTransfer, deskPartyHeadroom, deskCovers, type DeskPartyForecast, type DeskPartyShort,
+} from '@/lib/desk-rule';
 
 interface Department { id: string; name: string; }
 interface ReqLine {
@@ -101,6 +109,16 @@ interface ReqLine {
   mat_last_issue_qty?: number | null;
   mat_last_issue_unit?: string | null;
   mat_last_issue_dept?: string | null;
+  /** rm.current_stock — the central balance, RECIPE units (the "In store" column). */
+  current_stock?: number | null;
+  /** requisition_items.shelf_emptied_qty — THE RULE's memory (round 8): the
+   *  quantity_issued a take that EMPTIED the central shelf closed this line at.
+   *  Written by the server at the take, never inferred here; it speaks only for
+   *  that exact quantity (deskShelfMarkHolds). Arrives with ri.*. */
+  shelf_emptied_qty?: number | null;
+  /** 1 for a liquor / store-mapped material (round 8b): the central floor never
+   *  applies, so no hold or take is forecast for it (desk-rule.ts). */
+  central_flow_blocked?: number | null;
 }
 interface Requisition {
   id: string; req_number: string; purpose: string;
@@ -160,6 +178,10 @@ interface Requisition {
   qty_cancelled: number;
   /** Did any line move goods today (IST)? Independent of `status`. */
   issued_today: boolean;
+  /** 1 once the one-shot party transfer has moved this requisition's goods
+   *  (api/requisitions ?id=, round 8b): it never runs again, so no later
+   *  gesture takes stock or is refused for it (forecastDeskPartyTransfer). */
+  party_transferred?: number | boolean | null;
 }
 
 // All timestamps render in IST (Asia/Kolkata) via the shared formatter.
@@ -211,6 +233,7 @@ function lineUnits(line: ReqLine) {
   const lu = String(line.unit || '').toLowerCase().trim();
   // Already stored in the purchase unit → no conversion in either direction.
   const isPU = pf > 1 && lu !== '' && lu === String(pu).toLowerCase().trim();
+  const meta = { unit: recipeUnit, purchase_unit: line.material_purchase_unit, pack_size: line.material_pack_size };
   return {
     pf, pu, recipeUnit, isPU,
     /** stored line qty → purchase-unit display figure (3 dp, display only) */
@@ -222,8 +245,19 @@ function lineUnits(line: ReqLine) {
     /** MATERIAL-level qty → purchase-unit display. current_stock is ALWAYS
      *  recipe units regardless of what basis this LINE is stored in, so it must
      *  never go through toPU — that would leave a purchase-basis line's stock
-     *  undivided and print grams as kilos. */
-    stockPU: (q: any) => Math.round(((Number(q) || 0) / pf) * 1000) / 1000,
+     *  undivided and print grams as kilos.
+     *
+     *  SNAPPED TO THE 6-dp GRID BEFORE THE 3-dp ROUNDING (round 8):
+     *  pack-units.ts shownPurchaseQty, the very function the server's
+     *  shown-figure rule prints and matches against, so "In store" and the
+     *  server's "holds only …" can never print one balance two ways. Rounded
+     *  raw (round 7), float dust moved the printed figure a whole step: WHITE
+     *  DAL 5.0005 kg less 1.85 is stored 3.1504999999999996 and printed 3.15,
+     *  and the desk's own Issue All of 3.151 was refused; FRESH CREAM
+     *  130,125.5 ml printed 130.125 BTL through the division alone. On every
+     *  balance no float effect reaches — every live balance today — the figure
+     *  is the one this column always printed. */
+    stockPU: (q: any) => shownPurchaseQty(Number(q) || 0, meta),
   };
 }
 
@@ -239,6 +273,56 @@ function lineUnits(line: ReqLine) {
 function fmtHandOverPU(U: ReturnType<typeof lineUnits>, q: number): string {
   const pu = U.isPU ? (Number(q) || 0) : (Number(q) || 0) / U.pf;
   return pu > 0 && pu < 0.001 ? fmtCapPU(pu, U.pf) : fmtNum(U.toPU(q));
+}
+
+/**
+ * A TAKE — RECIPE units leaving the central shelf (desk-rule.ts
+ * forecastDeskTake `takeRecipe`) — in the purchase unit, printed exactly as the
+ * "In store" column prints a balance (U.stockPU, shownPurchaseQty), so "takes
+ * everything the store holds — 14.843 kg" reads the figure the storekeeper saw
+ * in the column. A sub-display crumb through fmtCapPU, never "0".
+ */
+function fmtTakePU(U: ReturnType<typeof lineUnits>, recipe: number): string {
+  const v = U.stockPU(recipe);
+  return v > 0 ? fmtNum(v) : fmtCapPU((Number(recipe) || 0) / U.pf, U.pf);
+}
+
+/** The take's "= …" hint: the recipe figure on a packed material (14,842.4 g),
+ *  and on an unpacked one (pf 1) the exact figure when 3 dp would hide it
+ *  (WHOLE DHANIYA 3.2174 kg prints 3.217 above it). '' when it adds nothing. */
+function fmtTakeHint(U: ReturnType<typeof lineUnits>, recipe: number): string {
+  const r = Number(recipe) || 0;
+  if (U.pf > 1) return `= ${fmtNum(r)} ${U.recipeUnit}`;
+  const exact = (Math.round(r * 1e6) / 1e6).toLocaleString('en-IN', { maximumFractionDigits: 6 });
+  return exact !== fmtNum(r) ? `= ${exact} ${U.recipeUnit}` : '';
+}
+
+/**
+ * WHAT A TAKE LEAVES THE LINE AT, in words (round 8) — for a take the shelf
+ * rule changed (`changed`) or that empties the shelf. THE RULE's three answers:
+ *   · complete in full                 → "the line is issued in full"
+ *   · complete by the shelf arm        → "the line closes — the 0.0006 kg (= 0.6 g)
+ *                                         still owing is below the 0.001 kg the
+ *                                         store can issue"
+ *   · not complete                     → "5.158 kg stays outstanding"
+ * The remainder below a step is printed at the precision that names it
+ * (fmtCapPU), never as the "0.001 kg" a 3-dp rounding would make of 0.6 g.
+ */
+function takeOutcomeWords(U: ReturnType<typeof lineUnits>, approved: number, tk: DeskTakeForecast): string {
+  const u = U.pu ? ` ${U.pu}` : '';
+  if (!tk.complete) {
+    // With its exact recipe figure (round 8b): after a take that is not the
+    // typed figure the balance is not a round number — 20 kg less 14,842.4 g
+    // is 5,157.6 g, which "5.158 kg" alone overstates by 0.4 g.
+    const hint = fmtTakeHint(U, U.toRecipe(tk.owingLine));
+    return `${fmtNum(U.toPU(tk.owingLine))}${u}${hint ? ` (${hint})` : ''} stays outstanding`;
+  }
+  const rem = Math.max(0, (Number(approved) || 0) - tk.recordedLine);
+  if (!tk.byShelf || !(rem > 1e-9)) return 'the line is issued in full';
+  const remPU = U.isPU ? rem : rem / U.pf;
+  const recipe = U.pf > 1 ? ` (= ${fmtNum(U.toRecipe(rem))} ${U.recipeUnit})` : '';
+  const stepRecipe = U.pf > 1 ? ` (${fmtNum(0.001 * U.pf)} ${U.recipeUnit})` : '';
+  return `the line closes — the ${fmtCapPU(remPU, U.pf)}${u}${recipe} still owing is below the 0.001${u}${stepRecipe} the store can issue`;
 }
 
 /* ── A REFUSED REVERSAL ────────────────────────────────────────────────────
@@ -323,7 +407,8 @@ function readBlockedReversals(
    arrive in RECIPE units (the department ledger is material-level) and render
    through U.stockPU, while these arrive ALREADY IN THE PURCHASE UNIT, as the
    balance's SHOWN figure (issue-stock.ts checkCentralIssue `availablePurchase`:
-   toPurchaseQty, 3 dp half-up — the "In store" column's own number), which the
+   shownPurchaseQty, the grid point then 3 dp half-up — the "In store" column's
+   own number), which the
    server accepts when typed back and debits as the whole balance; below 0.001 a
    sub-display crumb at the precision that takes it (print it with fmtCapPU).
    Feeding a central row into readBlockedReversals would print kilograms through
@@ -351,6 +436,12 @@ interface CentralShort {
   purchaseUnit: string;
   /** The server's finished sentence. Printed verbatim — never re-worded. */
   message: string;
+  /** max_issue_qty — the server's cap on the line's TOTAL quantity_issued, in
+   *  the LINE's own unit (checkCentralIssue maxIssueLineQty). On the internal
+   *  rail it is before + `available`; on a PARTY line (the transfer moves the
+   *  whole line, from 0) it is the cap on the whole line, so the box's delta
+   *  is this less what the line already holds (round 8b). NaN when absent. */
+  maxIssueLine?: number;
   /** TRUE when this row came off a 200's `held[]` and NOT a 400's `blocked[]`.
    *  The figures and the sentence are identical; what differs is the fact about
    *  the GESTURE. A refusal wrote nothing ("Nothing was issued"), a hold means
@@ -378,7 +469,12 @@ function readCentralShort(
     // `line_id` is what /store-issue sends; `req_item_id` is the same id by
     // another name (this page submits requisition_item ids), accepted so a
     // reshaped envelope cannot silently swallow the refusal.
-    const id = String(b?.line_id || b?.req_item_id || b?.id
+    // req_item_id FIRST (round 8b): it is the line the floor refused, named by
+    // the floor itself. `line_id` on a 400 is the route's "last entry it was
+    // working on" — on a PARTY requisition the transfer runs after the loop,
+    // so a refusal of THREE MANGO arrived with SALT's id whenever SALT was the
+    // last entry, and the panel would have landed on the wrong row.
+    const id = String(b?.req_item_id || b?.line_id || b?.id
                       || (submitted.length === 1 ? submitted[0].id : ''));
     if (!id) continue;
     out[id] = {
@@ -387,6 +483,7 @@ function readCentralShort(
       requested: Number(b?.requested) || 0,
       purchaseUnit: String(b?.purchase_unit || '').trim(),
       message: String(b?.message || b?.error || payload?.error || '').trim(),
+      maxIssueLine: b?.max_issue_qty == null ? NaN : Number(b.max_issue_qty),
     };
   }
   // Typed refusal with no per-line detail and a single-line batch → it is that
@@ -510,10 +607,31 @@ interface CentralHoldForecast {
   poolPU: number;
   sharePU: number;
   others: number;
+  /** Typed down to `availPU`, the take empties what is left and THE RULE
+   *  closes the line (less than one printed step owed) — round 8b. */
+  closesAtCap?: boolean;
   /** Row hint only (ReqCard rowHold): how many OTHER open lines of this
    *  requisition draw on the same item — its "Issuable now" is their balance
    *  too. Absent when none do. */
   sharedWith?: number;
+  /** THE PARTY RAIL (round 8b). The party transfer moves the line's WHOLE
+   *  quantity, so its hold is about the line's TOTAL, and `availPU` above is
+   *  then the DELTA this row's box can still add (desk-rule.ts
+   *  deskPartyHeadroom) — 0 when nothing fits. */
+  party?: {
+    /** The shown figure of what the store holds for this line (purchase units). */
+    holdsPU: number;
+    /** The line's whole quantity the transfer would ask (purchase units). */
+    totalPU: number;
+    /** The DELTA to add, LINE units (0 = nothing fits). */
+    headroomLine: number;
+    /** Lowered to that, the transfer takes everything left and THE RULE closes
+     *  the line (what is still owed is below one printed step). */
+    closesAtCap: boolean;
+    /** This row's gesture is refused for ANOTHER line the transfer cannot move
+     *  (completing this line runs the transfer). Their material names. */
+    blockedBy?: string[];
+  };
 }
 
 interface CentralBatchForecast {
@@ -531,6 +649,51 @@ interface CentralBatchForecast {
   /** Not one entry of the gesture hands anything over, so the server answers
    *  400 and writes nothing (store-issue: `issuableEntries === 0`). */
   refusedWhole: boolean;
+  /** WHAT EACH ENTRY THAT RUNS WILL TAKE AND RECORD (round 8), by line id —
+   *  desk-rule.ts forecastDeskTake on the same running claim as the holds.
+   *  Absent for a held line and for every carve-out. A screen prints from it
+   *  ONLY where `changed` (the shelf rule takes a balance that is not the typed
+   *  figure) — everywhere else the take IS the typed figure, and the markup
+   *  stays byte-identical to production. (Also where `byShelf`: THE RULE
+   *  closes the line by the shelf arm, which an ordinary batch never does.) */
+  takes: Record<string, DeskTakeForecast>;
+  /** A PARTY requisition's transfer on this gesture (round 8b): whether it runs
+   *  ('certain' — every line complete, so it must; 'closes' — it is tried and
+   *  closes every line; 'none'), and the lines it cannot move — any one of which
+   *  refuses the WHOLE gesture, every other line included. */
+  party?: {
+    runs: DeskPartyForecast['runs'];
+    refused: boolean;
+    short: Array<{ line: ReqLine; s: DeskPartyShort; headroomLine: number; closesAtCap: boolean }>;
+  };
+}
+
+/** Will this gesture leave anything behind — a held line, or (party) the
+ *  whole gesture refused by the transfer? The one test every banner, bar and
+ *  modal branch asks, so a party refusal over a line OUTSIDE the batch (the
+ *  completing line's transfer meeting an earlier line the shelf cannot cover)
+ *  is never shown as "these items are being issued". */
+function forecastBlocks(f: CentralBatchForecast): boolean {
+  return f.held.length > 0 || !!f.party?.refused;
+}
+
+/** The party transfer forecast for a gesture on this requisition — desk-rule.ts
+ *  forecastDeskPartyTransfer over every line in the requisition's order, with
+ *  each entry's quantity added to its line (a delta, as /store-issue adds it). */
+function partyForecastFor(
+  req: Requisition, batch: Array<{ line: ReqLine; qty: number }>, deferIds?: Set<string>,
+): DeskPartyForecast {
+  const after = new Map<string, number>();
+  for (const { line, qty } of batch) {
+    const q = Number(qty);
+    if (Number.isFinite(q) && q > 0) after.set(line.id, (after.get(line.id) ?? (Number(line.quantity_issued) || 0)) + q);
+  }
+  return forecastDeskPartyTransfer({
+    lines: req.items || [],
+    approvedOf: l => effectiveQty(l as ReqLine),
+    rejectedOf: l => !!((l as ReqLine).is_rejected || (l as ReqLine).store_rejected),
+    after, deferIds, transferred: !!Number(req.party_transferred || 0),
+  });
 }
 
 /**
@@ -542,6 +705,9 @@ interface CentralBatchForecast {
 function forecastCentralHolds(
   req: Requisition,
   batch: Array<{ line: ReqLine; qty: number }>,
+  /** Lines the gesture also DEFERS (the split's "defer the balance"): on a party
+   *  requisition a deferred line keeps the transfer from closing it. */
+  deferIds?: Set<string>,
 ): CentralBatchForecast {
   const byLine: Record<string, CentralHoldForecast> = {};
   const held: ReqLine[] = [];
@@ -550,7 +716,8 @@ function forecastCentralHolds(
   const claimed = new Map<string, number>();
   /** How many running entries take something, per material — for the words. */
   const takers = new Map<string, number>();
-  const heldMeta: Array<{ line: ReqLine; matId: string; raw: number; meta: { unit: string; purchase_unit?: string; pack_size?: number }; pf: number }> = [];
+  const heldMeta: Array<{ line: ReqLine; matId: string; raw: number; meta: PackMeta; pf: number }> = [];
+  const takes: Record<string, DeskTakeForecast> = {};
   for (const { line, qty } of batch) {
     const q = Number(qty);
     // The route skips a non-positive or non-finite quantity before it scores
@@ -560,24 +727,21 @@ function forecastCentralHolds(
     const verdict = (() => {
       // Carve-out 1 — the internal rail moves no central stock for a party line.
       if (req.purpose === 'party') return null;
+      // Carve-out 2a — a liquor / store-mapped material: its stock moves on its
+      // store's ledger and the central floor never applies (round 8b: the
+      // payload now says which lines those are).
+      if (Number(line.central_flow_blocked || 0)) return null;
       // A balance this page was not given is not guessed at (the In store
       // column prints "—" for it): say nothing rather than cry wolf.
-      const raw = (line as ReqLine & { current_stock?: number | null }).current_stock;
+      const raw = line.current_stock;
       if (raw == null) return null;
       const ru = String(line.material_unit || '').trim();
       if (!ru) return null;
-      const meta = { unit: ru, purchase_unit: line.material_purchase_unit, pack_size: line.material_pack_size };
-      const pf = packFactor(meta);
-      // Carve-out 2 — lineFactor (issue-stock.ts), resolved the same way.
-      let factor = 1;
-      if (pf > 1) {
-        const lu = String(line.unit ?? '').toLowerCase().trim();
-        const pu = String(line.material_purchase_unit ?? '').toLowerCase().trim();
-        if (lu === '') return null;
-        if (lu === pu) factor = pf;
-        else if (lu === ru.toLowerCase()) factor = 1;
-        else return null;
-      }
+      // Carve-out 2 — lineFactor (issue-stock.ts), resolved by the desks' one
+      // transcription of it (src/lib/desk-rule.ts deskLineBasis).
+      const basis = deskLineBasis(line);
+      if (!basis) return null;
+      const { meta, pf, factor } = basis;
       // Carve-out 3 — a zero (or credit) delta is not a debit.
       const before = Number(line.quantity_issued) || 0;
       const deltaLine = (before + q) - before;
@@ -585,20 +749,27 @@ function forecastCentralHolds(
       if (ask <= 1e-9) return null;
       const matId = String(line.material_id || '');
       const already = claimed.get(matId) || 0;
-      const s = (Number(raw) || 0) - already;
-      const available = s > 0 ? s : 0;
-      const shownAvail = toPurchaseQty(available, meta);
-      const byShownFigure = shownAvail > 0 && toPurchaseQty(ask, meta) === shownAvail;
-      const fits = grid6(ask) <= grid6(available) || byShownFigure;
+      // THE SHOWN-FIGURE RULE — planCentralDebit with checkCentralIssue's own
+      // converter (round 8: the grid point's shownPurchaseQty, its toPurchaseQty
+      // renderings still matched), through desk-rule.ts planDeskDebit, so the
+      // forecast and the server's pre-flight cannot score one ask two ways.
+      const plan = planDeskDebit((Number(raw) || 0) - already, ask, meta);
+      const { available, fits } = plan;
       if (fits) {
-        const takesAll = grid6(ask) >= grid6(available) || byShownFigure;
-        const take = takesAll ? available : ask;
-        claimed.set(matId, already + take);
-        if (grid6(take) > 0) takers.set(matId, (takers.get(matId) || 0) + 1);
+        claimed.set(matId, already + plan.debit);
+        if (grid6(plan.debit) > 0) takers.set(matId, (takers.get(matId) || 0) + 1);
+        // WHAT THE TAKE WILL RECORD, AND WHETHER IT CLOSES THE LINE — the same
+        // pass, the same running claim (forecastDeskTake: checkCentralIssue's
+        // recordAfterLineQty, the shelf mark applyIssueDelta stamps, THE RULE).
+        const tk = forecastDeskTake({
+          line, purpose: req.purpose, approved: effectiveQty(line), deltaLine: q, claimedRecipe: already,
+        });
+        if (tk) takes[line.id] = tk;
       } else {
         heldMeta.push({ line, matId, raw: Number(raw) || 0, meta, pf });
       }
       const holds = grid6(available) > 0;
+      const shownAvail = plan.shownAvailable;
       const f: CentralHoldForecast = {
         held: !fits,
         availPU: shownAvail > 0 ? shownAvail : holds ? (grid6(available) / 1e6) / pf : 0,
@@ -628,8 +799,10 @@ function forecastCentralHolds(
      from one. */
   const heldShare = new Map<string, number>();
   const heldTakers = new Map<string, number>();
-  const capOf = (x: number, meta: { unit: string; purchase_unit?: string; pack_size?: number }, pf: number) => {
-    const shown = toPurchaseQty(x, meta);
+  const capOf = (x: number, meta: PackMeta, pf: number) => {
+    // The server's cap figure (checkCentralIssue `availablePurchase`):
+    // shownPurchaseQty — the grid point, then integer half-up (round 8).
+    const shown = shownPurchaseQty(x, meta);
     return shown > 0 ? shown : grid6(x) > 0 ? (grid6(x) / 1e6) / pf : 0;
   };
   for (const h of heldMeta) {
@@ -646,8 +819,68 @@ function forecastCentralHolds(
     f.poolPU = capOf(pool, h.meta, h.pf);
     f.sharePU = capOf(Math.max(0, pool - left), h.meta, h.pf);
     f.others = grid6(pool - left) > 0 ? others : 0;
+    // Lowered to that cap, does the take close the line (round 8b)? The cap
+    // is the shown figure of what is left, so it takes everything left; when
+    // less than one printed step is then owed THE RULE closes the line, and
+    // "the rest needs stock received" would be false — there is no rest.
+    if (!f.empty) {
+      const tk = forecastDeskTake({
+        line: h.line, purpose: req.purpose, approved: effectiveQty(h.line),
+        deltaLine: lineUnits(h.line).fromPU(f.availPU), claimedRecipe: Math.max(0, pool - left),
+      });
+      f.closesAtCap = !!tk?.complete;
+    }
   }
-  return { byLine, held, idle, refusedWhole: held.length > 0 && issuable === 0 };
+  /* THE PARTY TAKE (round 8b). On a PARTY requisition the internal rail moves
+     no central stock (carve-out 1 above); the take is the store → department
+     TRANSFER, which moves each line's WHOLE quantity_issued once, line by line,
+     by the same shelf rule — and refuses the WHOLE gesture over one line the
+     shelf cannot cover. desk-rule.ts forecastDeskPartyTransfer says whether this
+     gesture runs it (store-issue: every line complete → it must; or it is tried
+     and closes every line) and what each line's take records. Measured without
+     it: Issue All listed "THREE MANGO × 14.843 kg = 14,843 g" and "SALT × 2 kg"
+     under "being issued" over a 14,842.4 g shelf, and the server refused the
+     lot; a line issued 14.842 earlier read "× 0.001 kg = 1 g" while the
+     transfer moved 14,842.5 g (round-8 verifier). */
+  let party: CentralBatchForecast['party'];
+  if (req.purpose === 'party') {
+    const pfc = partyForecastFor(req, batch, deferIds);
+    party = { runs: pfc.runs, refused: false, short: [] };
+    if (pfc.runs !== 'none') for (const [id, tk] of Object.entries(pfc.takes)) takes[id] = tk;
+    if (pfc.runs === 'certain' && pfc.short.length > 0) {
+      party.refused = true;
+      const inBatch = new Set(batch.map(b => b.line.id));
+      for (const s of pfc.short) {
+        const line = (req.items || []).find(l => l.id === s.id);
+        const basis = line ? deskLineBasis(line) : null;
+        if (!line || !basis) continue;
+        const before = Number(line.quantity_issued) || 0;
+        const headroomLine = deskPartyHeadroom(before, s.capTotalLine, s.exactLeftLine);
+        // Lowered to the headroom the line's total is the shown cap (or the
+        // shelf's own grid point), which takes everything left: it records
+        // that, and THE RULE closes it if less than one printed step is owed.
+        const closesAtCap = headroomLine > 0 && deskCovers(s.exactLeftLine, effectiveQty(line), basis.step, true);
+        const U = lineUnits(line);
+        const toPUexact = (q: number) => U.isPU ? q : q / (U.pf || 1);
+        byLine[line.id] = {
+          held: true,
+          availPU: toPUexact(headroomLine),
+          empty: !(headroomLine > 0),
+          pf: U.pf,
+          purchaseUnit: String(line.material_purchase_unit || line.material_unit || '').trim(),
+          poolPU: s.availPU, sharePU: 0, others: 0,
+          party: { holdsPU: s.availPU, totalPU: U.toPU(s.totalLine), headroomLine, closesAtCap },
+        };
+        if (inBatch.has(line.id)) held.push(line);
+        party.short.push({ line, s, headroomLine, closesAtCap });
+      }
+    }
+  }
+  return {
+    byLine, held, idle, takes, party,
+    // A party line the transfer cannot move refuses the WHOLE gesture.
+    refusedWhole: (held.length > 0 && issuable === 0) || !!party?.refused,
+  };
 }
 
 /**
@@ -679,6 +912,7 @@ function CentralHoldBanner({ forecast, gesture, scope }: {
   /** What "every other …" means for this gesture: "open line", "selected line". */
   scope: string;
 }) {
+  if (forecast.party?.refused) return <PartyRefusalBanner forecast={forecast} gesture={gesture} />;
   const n = forecast.held.length;
   if (n === 0) return null;
   const one = n === 1;
@@ -719,7 +953,12 @@ function CentralHoldBanner({ forecast, gesture, scope }: {
           return `${l.material_name} (books: ${c.empty ? 'none' : fig(c.availPU)})`;
         }).join(', ')}
         .{' '}
-        {forecast.refusedWhole ? (
+        {forecast.refusedWhole && forecast.held.every(l => forecast.byLine[l.id]?.closesAtCap) ? (
+          /* Round 8b: the cap takes everything left and closes the line — say
+             that, not "the rest needs stock" over a rest below one step. */
+          <>Lower {one ? 'that line' : 'those lines'} to what the store can give — it then takes everything the store
+            holds and {one ? 'the line closes' : 'the lines close'} (what is still owed is below one printed step).</>
+        ) : forecast.refusedWhole ? (
           <>Lower {one ? 'that line' : 'those lines'} to what the store can give — the rest needs stock received
             or a closing count recorded.</>
         ) : (
@@ -728,6 +967,69 @@ function CentralHoldBanner({ forecast, gesture, scope }: {
         )}
         {' '}If {one ? 'it is' : 'they are'} liquor-store items, the stock moves on the Liquor
         Store ledger and the store will accept the hand-over as entered.
+      </div>
+    </div>
+  );
+}
+
+/**
+ * THE PARTY TRANSFER WILL REFUSE THIS GESTURE (round 8b) — said before the
+ * click. On a party requisition completing the last line runs the store →
+ * department transfer, which moves EVERY line at once and refuses the whole
+ * POST over one line the shelf cannot cover: SALT is not issued either. So the
+ * internal banner's "Every other line is issued" / "no other line hands
+ * anything over" would both be false here. The way out it names is the one the
+ * server accepts: the line lowered to its headroom (desk-rule.ts
+ * deskPartyHeadroom), which the transfer then takes as everything the store
+ * holds — closing the line by THE RULE when less than one printed step is left
+ * owing, and otherwise recording it while nothing moves until the rest arrives.
+ */
+function PartyRefusalBanner({ forecast, gesture }: { forecast: CentralBatchForecast; gesture: string }) {
+  const sh = forecast.party?.short || [];
+  if (sh.length === 0) return null;
+  const n = sh.length;
+  const one = n === 1;
+  const fig = (v: number, pf: number, pu: string) => `${fmtCapPU(v, pf)}${pu ? ` ${pu}` : ''}`;
+  const withRoom = sh.filter(x => x.headroomLine > 0);
+  const allClose = withRoom.length === n && sh.every(x => x.closesAtCap);
+  return (
+    <div className="text-[11px] px-3 py-2 bg-red-50 border-2 border-red-300 rounded text-red-900">
+      <div className="font-semibold">
+        ⛔ {n} line{one ? '' : 's'} ask{one ? 's' : ''} for more than the central store&apos;s books hold — a party
+        requisition&apos;s goods leave the store in one transfer, every line at once, so on {gesture} the store
+        will <b>refuse the whole issue</b> and save nothing, the other lines included.
+      </div>
+      <div className="text-[10px] mt-0.5">
+        {sh.map(x => {
+          const c = forecast.byLine[x.line.id];
+          const pu = c?.purchaseUnit || '';
+          const pf = c?.pf || 1;
+          return `${x.line.material_name} (books: ${x.s.empty ? 'none' : fig(x.s.availPU, pf, pu)} of the ${fig(c?.party?.totalPU || 0, pf, pu)} the line asks in all)`;
+        }).join(', ')}
+        .{' '}
+        {sh.every(x => x.s.empty) ? (
+          <>The store&apos;s books hold none of {one ? 'it' : 'them'} — get stock received or a closing count recorded
+            first.</>
+        ) : withRoom.length === 0 ? (
+          /* The line already holds at least what the shelf has (it was
+             recorded while other lines were open, or the shelf fell since):
+             the only figures that fit are lower than what it holds, and the
+             only way to lower it is an undo. */
+          <>Nothing more fits on {one ? 'that line' : 'those lines'} — {one ? 'it already holds' : 'they already hold'} at
+            least what the store has. Undo {one ? 'it' : 'them'} and issue what the store holds again, or get stock
+            received or a closing count recorded first.</>
+        ) : allClose ? (
+          <>Enter {withRoom.map(x => {
+            const c = forecast.byLine[x.line.id];
+            return `${fmtCapPU(c?.availPU || 0, c?.pf || 1)}${c?.purchaseUnit ? ` ${c.purchaseUnit}` : ''} for ${x.line.material_name}`;
+          }).join(', ')} instead — the transfer then takes everything the store holds, {one ? 'the line closes' : 'those lines close'} (what
+            is still owed is below one printed step), and the whole requisition goes out together.</>
+        ) : (
+          <>Enter what the store can give and every line is recorded — but nothing leaves the store until every line
+            of this party requisition is complete, so the rest needs stock received or a closing count recorded first.</>
+        )}
+        {' '}If {one ? 'it is' : 'they are'} liquor-store items, the stock moves on the Liquor Store ledger and the store
+        will accept the hand-over as entered.
       </div>
     </div>
   );
@@ -895,6 +1197,16 @@ export default function StoreRequisitionsPage() {
     if (reqId) setExpanded(p => (p.has(reqId) ? p : new Set(p).add(reqId)));
     if (msg) alert(msg);
     return new Set(ids);
+  };
+  /* THE DEFER THE SERVER DID NOT WRITE (round 8). /store-issue drops a 'defer'
+     on a line that is complete — issued in full, or a take in the same POST
+     emptied the central shelf and less than one printed step is owed — and
+     names it on the 200 (`defer_dropped[]`, `defer_dropped_message`). Printed
+     VERBATIM, like held_message. A 200 without it (every other gesture) does
+     nothing at all. */
+  const announceDeferDropped = (j: { defer_dropped_message?: unknown } | null | undefined) => {
+    const msg = String(j?.defer_dropped_message || '').trim();
+    if (msg) alert(msg);
   };
   // "Issue All Items" confirmation — holds the requisition whose bulk-issue is
   // awaiting confirmation (null = no modal). We compute the lines to issue at
@@ -1151,7 +1463,20 @@ export default function StoreRequisitionsPage() {
       if (!heldIds.has(line.id)) {
         setEditQty(s => ({ ...s, [line.id]: '' }));
         setIssueNotes(s => { const n = { ...s }; delete n[line.id]; return n; });
+        // A SPLIT CAPTURED BEFORE THIS ISSUE IS STALE NOW (round 8b). "Issue
+        // part, defer rest" parks its hand-over figure; when that gesture is
+        // refused and the held panel's cap goes out instead, the split panel
+        // stayed open still reading "Handing over 15 kg now, the balance 0 kg
+        // is promised for" over a line that now held 14.8424 kg (round-8
+        // verifier, sd_cap_title_split). The figure it was built on is gone, so
+        // the split closes with it; the row's own Defer is there for the rest.
+        if (splitIssueQty[line.id]) {
+          setSplitIssueQty(s => { const n = { ...s }; delete n[line.id]; return n; });
+          setEditDefer(s => { const n = { ...s }; delete n[line.id]; return n; });
+        }
       }
+      // A defer the server dropped because this issue completed the line.
+      announceDeferDropped(j);
       setRefreshKey(k => k + 1);
     } finally { setBusyLine(null); }
   };
@@ -1168,6 +1493,9 @@ export default function StoreRequisitionsPage() {
       });
       const j = await r.json();
       if (!r.ok) { alert(j.error || 'Defer failed'); return; }
+      // A defer on a line that is already complete is dropped, not written
+      // (round 8) — say so rather than let the panel close as if it were kept.
+      announceDeferDropped(j);
       setEditDefer(s => { const n = { ...s }; delete n[line.id]; return n; });
       setRefreshKey(k => k + 1);
     } finally { setBusyLine(null); }
@@ -1232,7 +1560,13 @@ export default function StoreRequisitionsPage() {
       return;
     }
     if (!cfg?.until) { alert('Pick the date/time you can issue the balance'); return; }
-    const restPU = fmtNum(U.toPU(s.outstanding - qty));
+    // The balance the promise is FOR is what the take leaves owing (round 8):
+    // when the shelf rule takes a balance that is not the typed figure, the
+    // line records what left the shelf and the rest is approved − that. On
+    // every other gesture the take IS the typed figure and this is the
+    // subtraction it always was.
+    const take = forecastDeskTake({ line, purpose: req.purpose, approved: effectiveQty(line), deltaLine: qty });
+    const restPU = fmtNum(U.toPU(take && take.changed ? take.owingLine : s.outstanding - qty));
     setBusyLine(line.id);
     clearBlocked(line.id);
     try {
@@ -1258,6 +1592,13 @@ export default function StoreRequisitionsPage() {
       // it ever is held on a 200, the captured gesture (quantity, promised
       // time, token) is kept so the storekeeper can correct one figure and replay.
       const heldIds = announceHeld(j, [{ id: line.id, material_name: line.material_name }], req.id);
+      // The issue may have COMPLETED the line — it took everything the central
+      // store held and less than one printed step is still owed — and then the
+      // server drops the defer instead of writing it onto a finished line
+      // (round 8; round 7 wrote it and the requisition sat with nothing to
+      // press). Its own sentence, verbatim, so the storekeeper who asked for a
+      // promise reads why none was made.
+      announceDeferDropped(j);
       if (!heldIds.has(line.id)) {
         setEditQty(sm => ({ ...sm, [line.id]: '' }));
         setIssueNotes(sm => { const n = { ...sm }; delete n[line.id]; return n; });
@@ -1403,7 +1744,10 @@ export default function StoreRequisitionsPage() {
     const U = lineUnits(line);
     const s = lineSplit(line);
     const q = (v: number) => `${fmtNum(U.toPU(v))}${U.pu ? ` ${U.pu}` : ''}`;
-    const reopens = req.status === 'fulfilled' && s.issued < s.effective;
+    // THE RULE, not a bare `issued < effective`: a line a take closed by
+    // emptying the shelf stays complete when its rejection is cleared, and the
+    // server's re-score will not reopen the requisition over it.
+    const reopens = req.status === 'fulfilled' && !lineIssueComplete(line);
     // The cancelled clause is dropped when the reject cancelled nothing (the
     // line had already been issued in full), where "0 BTL goes back to
     // outstanding" is noise rather than information.
@@ -1653,6 +1997,60 @@ function IssueAllModal({ req, resolveQty, busy, onCancel, onConfirm }: {
     const U = lineUnits(l);
     const u = U.pu;
     const rq = resolveQty(l, l.remaining);
+    /* THE TAKE, WHEN IT IS NOT THE FIGURE POSTED (round 8). The shelf rule takes
+       the whole balance when the figure IS its shown figure (THREE MANGO 14.843
+       kg over 14,842.5 g; WHITE DAL 3.151 kg over 3.1505), so the line records
+       what left the shelf and THE RULE closes it when less than one printed step
+       is owed. "× 14.843 kg = 14,843 g" was a claim about 0.5 g that never
+       left. The figure printed is the take (as In store prints it) and the line
+       says what it leaves. Only where the take differs — every ordinary line
+       is the markup below, byte for byte. */
+    const tk = forecast.takes[l.id];
+    /* A PARTY LINE ISSUED BEFORE (round 8b): this gesture adds the typed figure,
+       and the transfer it completes then moves the line's WHOLE quantity — THREE
+       MANGO 14.842 kg issued earlier, 0.001 typed, 14,842.5 g left the shelf and
+       the line closed, while this list read "× 0.001 kg = 1 g". Both figures
+       are printed: what this gesture adds, and what the transfer moves. */
+    if (tk && tk.rail === 'party' && (Number(l.quantity_issued) || 0) > 0) {
+      return (
+        <li key={l.id} className="flex items-center justify-between text-sm border-b border-[#E8D5C4]/50 py-1.5">
+          <span className="text-[#2D1B0E]">{l.material_name}</span>
+          <span className="font-mono font-semibold text-emerald-700 text-right">
+            × {fmtHandOverPU(U, rq.qty)}{u && <span className="text-[10px] text-[#8B7355] ml-0.5">{u}</span>}
+            {U.pf > 1 && <span className="text-[9px] text-[#B8A590] ml-1">= {fmtNum(U.toRecipe(rq.qty))} {U.recipeUnit}</span>}
+            {rq.over && (
+              <span className="ml-1 text-[9px] px-1 rounded bg-amber-100 text-amber-800 border border-amber-300">
+                over approved ({fmtNum(U.toPU(l.remaining))} {u})
+              </span>
+            )}
+            <span className="block text-[9px] font-sans font-normal text-[#8B7355]">
+              then the party transfer moves the line&apos;s whole {fmtTakePU(U, tk.takeRecipe)}{u ? ` ${u}` : ''}
+              {fmtTakeHint(U, tk.takeRecipe) ? ` (${fmtTakeHint(U, tk.takeRecipe)})` : ''}
+              {tk.plan.takesAll ? ' — everything the central store holds' : ''} — {takeOutcomeWords(U, effectiveQty(l), tk)}
+            </span>
+          </span>
+        </li>
+      );
+    }
+    if (tk && (tk.changed || tk.byShelf)) {
+      return (
+        <li key={l.id} className="flex items-center justify-between text-sm border-b border-[#E8D5C4]/50 py-1.5">
+          <span className="text-[#2D1B0E]">{l.material_name}</span>
+          <span className="font-mono font-semibold text-emerald-700 text-right">
+            × {fmtTakePU(U, tk.takeRecipe)}{u && <span className="text-[10px] text-[#8B7355] ml-0.5">{u}</span>}
+            {fmtTakeHint(U, tk.takeRecipe) && <span className="text-[9px] text-[#B8A590] ml-1">{fmtTakeHint(U, tk.takeRecipe)}</span>}
+            {rq.over && (
+              <span className="ml-1 text-[9px] px-1 rounded bg-amber-100 text-amber-800 border border-amber-300">
+                over approved ({fmtNum(U.toPU(l.remaining))} {u})
+              </span>
+            )}
+            <span className="block text-[9px] font-sans font-normal text-[#8B7355]">
+              everything the central store holds — {takeOutcomeWords(U, effectiveQty(l), tk)}
+            </span>
+          </span>
+        </li>
+      );
+    }
     return (
       <li key={l.id} className="flex items-center justify-between text-sm border-b border-[#E8D5C4]/50 py-1.5">
         <span className="text-[#2D1B0E]">{l.material_name}</span>
@@ -1668,13 +2066,17 @@ function IssueAllModal({ req, resolveQty, busy, onCancel, onConfirm }: {
       </li>
     );
   };
-  if (forecast.held.length > 0) {
+  if (forecastBlocks(forecast)) {
     // "Being issued" lists only what will move: not held, and a quantity the
     // route acts on (it skips a line whose figure is 0 — a box typed to 0 —
     // without issuing it, so listing it here would contradict the banner's
     // "refuse the whole issue").
-    const going = lines.filter(l => !heldIds.has(l.id) && resolveQty(l, l.remaining).qty > 0);
-    const kept = lines.filter(l => heldIds.has(l.id));
+    // A PARTY refusal is whole (PartyRefusalBanner): nothing goes, and the
+    // lines the transfer could move are named as not issued either.
+    const partyWhole = !!forecast.party?.refused;
+    const going = partyWhole ? []
+      : lines.filter(l => !heldIds.has(l.id) && resolveQty(l, l.remaining).qty > 0);
+    const kept = partyWhole ? lines : lines.filter(l => heldIds.has(l.id));
     return (
       <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4" onClick={onCancel}>
         <div className="bg-white rounded-xl border border-[#E8D5C4] w-full max-w-md shadow-xl" onClick={e => e.stopPropagation()}>
@@ -1696,7 +2098,9 @@ function IssueAllModal({ req, resolveQty, busy, onCancel, onConfirm }: {
             )}
             <div>
               <div className="text-[11px] font-semibold text-red-800 mb-1">
-                NOT issued — the central store does not hold the quantity asked:
+                {partyWhole
+                  ? <>NOT issued — the party transfer cannot move every line, so none of them goes:</>
+                  : <>NOT issued — the central store does not hold the quantity asked:</>}
               </div>
               <ul className="space-y-1">
                 {kept.map(l => {
@@ -1779,81 +2183,32 @@ function effectiveQty(line: ReqLine): number {
 }
 
 /**
- * The figure the desk SHOWS for a quantity of this LINE — issue-stock.ts
- * lineShownAs, transcribed (that file imports the database, so it cannot be
- * bundled here): line unit → recipe through lineFactor, snapped to the 6-dp
- * grid → toPurchaseQty, the "In store" column's own arithmetic. null where
- * lineFactor says needsReview (a blank or unrecognised unit on a packed
- * material) or the payload lacks the material's unit — then nobody can say
- * what the line "shows" and only the exact comparison applies, as on the
- * server when it has no converter.
+ * IS THIS LINE COMPLETE? — THE RULE (round 8), the server's own predicate, so
+ * this desk, the management desk and the routes can never disagree about which
+ * lines are done. issue-stock.ts lineIssueComplete → central-debit-clamp.ts
+ * issuedCoversAsk, run through the desks' ONE transcription of it
+ * (src/lib/desk-rule.ts deskLineComplete, proved against the server by
+ * scripts/desk-rule-tests.ts):
  *
- * It carries `step` exactly as the server's does (round 7b): ONE printed step
- * of toPurchaseQty — 0.001 purchase unit — in the LINE's units, 0.001 × pf ÷
- * factor (0.001 on a purchase-unit line, 1 g on a gram line of a 1000-pack).
- */
-function lineShownAs(line: ReqLine): (((lineQty: number) => number) & { step: number }) | null {
-  const ru = String(line.material_unit || '').trim();
-  if (!ru) return null;
-  const meta = { unit: ru, purchase_unit: line.material_purchase_unit, pack_size: line.material_pack_size };
-  const pf = packFactor(meta);
-  let factor = 1;
-  if (pf > 1) {
-    const lu = String(line.unit ?? '').toLowerCase().trim();
-    const pu = String(line.material_purchase_unit ?? '').toLowerCase().trim();
-    if (lu === '') return null;
-    if (lu === pu) factor = pf;
-    else if (lu === ru.toLowerCase()) factor = 1;
-    else return null;
-  }
-  return Object.assign(
-    (q: number) => toPurchaseQty(Math.round((Number(q) || 0) * factor * 1e6) / 1e6, meta),
-    { step: (0.001 * pf) / factor },
-  );
-}
-
-/**
- * IS THIS LINE ISSUED IN FULL? — the server's own predicate, so this desk and
- * the routes can never disagree about which lines are done. issue-stock.ts
- * lineIssueComplete → central-debit-clamp.ts issuedCoversAsk (round 7):
+ *     complete ⇔ issued + 1e-9 ≥ approved
+ *              ∨ ( the line's shelf mark speaks for its quantity_issued
+ *                  ∧ step > 0 ∧ grid(issued) > 0
+ *                  ∧ grid(approved − issued) < grid(step) )
  *
- *     complete ⇔ issued ≥ approved
- *              ∨ ( shown(issued) = shown(approved) ∧ shown(approved) > 0 )
- *              ∨ ( approved − issued < one printed step ∧ issued > 0
- *                  ∧ shown(approved) > 0 )                        (round 7b)
- *
- * The first arm is the `got >= eff` this page always used, so nothing that was
- * complete stops being complete. The second is the shown-figure rule's other
- * half: a line approved at exactly the shelf's shown figure (THREE MANGO RED
- * CHILLI POWDER, 14.843 kg approved, 14,842.5 g on the shelf) is taken in
- * full, records 14.8425 kg — what left — and is FULFILLED on the server. This
- * page compared 14.8425 with 14.843, printed "14.843 of 14.843 kg issued —
- * 0.001 kg still open" on the Fulfilled card, kept the line in Issue All and
- * Pending Issue, and offered an Issue Now the store then refused "holds none of
- * it" (measured, real route on a copy of the live book). A line genuinely
- * short at a figure the desk prints (14.842 of 14.843) shows two different
- * figures and stays open. Census on the live book: the second arm changes the
- * answer for 0 of today's lines — it only ever closes lines the shown-figure
- * rule creates.
- *
- * The third arm (round 7b) is its neighbour: the shelf held 14,842.4 g (shown
- * 14.842) against 14.843 approved; the offered 14.842 took the whole shelf and
- * the line owed 0.0006 kg, printed here as "0.001 kg", whose Issue Now the
- * store refused "holds none of it" — stuck on a figure nobody can type. An
- * outstanding below ONE printed step after something left the shelf is done;
- * a whole step or more (14.842 of 14.843 exactly) stays open. Compared on the
- * house grid (grid6) as the server compares it. Census: 0 live lines change.
+ * The shelf mark (shelf_emptied_qty) is the server's record that a take EMPTIED
+ * the central shelf and closed the line there: THREE MANGO approved 14.843 kg
+ * over a 14,842.4 g shelf, the 14.842 typed took the whole shelf and recorded
+ * 14.8424 — complete, 0.6 g owed that nobody can issue. Round 7's second arm
+ * (the two figures SHOW as one number) and third arm (anything owing less than
+ * one printed step) closed lines whether or not the shelf was emptied: MALA
+ * MANGO CRUSH 5 LTR, 1,000 of 1,004 ml issued with 49 L on the shelf, read
+ * Fulfilled here while the store could serve the 4 ml, and with a defer in the
+ * same POST the requisition sat with nothing to press. A remainder below one
+ * step over a shelf that still holds stock is now an ordinary open line.
+ * `effectiveQty` stays this page's (a chef-rejected line reads 0 — done).
  */
 function lineIssueComplete(line: ReqLine): boolean {
-  const eff = effectiveQty(line);
-  const got = Number(line.quantity_issued) || 0;
-  if (got >= eff) return true;
-  const shown = lineShownAs(line);
-  if (!shown) return false;
-  const sw = Number(shown(eff)) || 0;
-  if (!(sw > 0)) return false;
-  if ((Number(shown(got)) || 0) === sw) return true;
-  return shown.step > 0 && grid6(got) > 0 && grid6(eff - got) < grid6(shown.step);
+  return deskLineComplete(Number(line.quantity_issued) || 0, effectiveQty(line), line);
 }
 
 /** What is still owed on the line in its own unit: effective − issued, or 0
@@ -1965,8 +2320,8 @@ function lineSplit(line: ReqLine): {
 } {
   const effective = effectiveQty(line);
   const issued = Math.max(0, Number(line.quantity_issued) || 0);
-  // 0 once the line is issued in full by the server's own rule (see
-  // lineIssueComplete) — a line closed at the shelf's shown figure owes nothing.
+  // 0 once the line is complete by the server's own rule (see
+  // lineIssueComplete) — a line a take closed by emptying the shelf owes nothing.
   const remainder = lineIssueComplete(line) ? 0 : Math.max(0, effective - issued);
   // A STORE-REJECTED LINE OWES NOTHING. The reject cancelled the outstanding
   // balance — that is the whole meaning of the gesture — so the remainder moves
@@ -2103,9 +2458,10 @@ function mergeStats(req: any): Requisition {
     // nothing.
     if (it.is_rejected) continue;
     if (it.store_rejected) continue;
-    // "Issued in full" is lineIssueComplete — the server's predicate (`got >=
-    // eff`, or the shown-figure arm) — so a line the route closed is counted
-    // closed here too, and owedQty is 0 for exactly those lines.
+    // "Issued in full" is lineIssueComplete — THE RULE, the server's predicate
+    // (`got + 1e-9 >= eff`, or the shelf arm on the line's shelf mark) — so a
+    // line the route closed is counted closed here too, and owedQty is 0 for
+    // exactly those lines.
     const done = lineIssueComplete(it);
     if (done && !it.deferred_until) issued++;
     else if (it.deferred_until) deferred++;
@@ -2144,8 +2500,9 @@ function mergeStats(req: any): Requisition {
  *
  *     allDone = every(line => is_rejected || store_rejected || lineIssueComplete(line))
  *
- * (lineIssueComplete — issued ≥ effective, or the two show as the same figure;
- * this page carries the same predicate, see lineIssueComplete above.)
+ * (lineIssueComplete — THE RULE: issued ≥ effective, or a take emptied the
+ * central shelf and less than one printed step is owed; this page runs the
+ * same predicate through src/lib/desk-rule.ts, see lineIssueComplete above.)
  *
  * As a WORKFLOW state that is right, and this function does not argue with it —
  * it does not read a new column, it does not ask the server for one, and the
@@ -2370,8 +2727,23 @@ function ReqCard(props: {
     const sq = props.splitIssueQty[line.id]?.qty;
     const split = !!props.editDefer[line.id] && Number.isFinite(sq) && sq > 0;
     const qty = split ? sq : props.resolveQty(line, outstanding).qty;
-    const f = forecastCentralHolds(req, [{ line, qty }]).byLine[line.id];
-    if (!f?.held) return undefined;
+    const fc = forecastCentralHolds(req, [{ line, qty }], split ? new Set([line.id]) : undefined);
+    const f = fc.byLine[line.id];
+    if (!f?.held) {
+      // PARTY (round 8b): this line fits, but issuing it completes the
+      // requisition, and the transfer that then runs refuses the WHOLE POST
+      // over another line the store's books cannot cover — so this row's own
+      // button is refused too, and its row says so before the click.
+      const others = fc.party?.refused ? fc.party.short.filter(x => x.line.id !== line.id) : [];
+      if (others.length === 0) return undefined;
+      const U = lineUnits(line);
+      return {
+        held: true, availPU: 0, empty: true, pf: U.pf,
+        purchaseUnit: String(line.material_purchase_unit || line.material_unit || '').trim(),
+        poolPU: 0, sharePU: 0, others: 0,
+        party: { holdsPU: 0, totalPU: 0, headroomLine: 0, closesAtCap: false, blockedBy: others.map(x => x.line.material_name) },
+      };
+    }
     // Scored alone, so its "Issuable now" is the whole balance — true for this
     // row's own button, and the SAME balance every other open line of the item
     // is offered. Said on the row, so two figures are never read as two
@@ -2380,6 +2752,21 @@ function ReqCard(props: {
     // balance between them exactly as the server's rows will.
     const sharedWith = openLines.filter(o => o.id !== line.id && o.material_id === line.material_id).length;
     return sharedWith > 0 ? { ...f, sharedWith } : f;
+  };
+  /* WHAT THE ROW'S OWN BUTTON WILL TAKE (round 8) — the same lone-row score as
+     rowHold, read for the take instead of the hold: desk-rule.ts
+     forecastDeskTake via forecastCentralHolds. Only a take the shelf rule
+     CHANGES is ever printed (the line records what left the shelf, and may
+     close by THE RULE's shelf arm); an ordinary take is the typed figure and
+     the row renders exactly as before. */
+  const rowTake = (line: ReqLine): DeskTakeForecast | undefined => {
+    if (line.is_rejected || line.store_rejected) return undefined;
+    const outstanding = lineSplit(line).outstanding;
+    if (!(outstanding > 0)) return undefined;
+    const sq = props.splitIssueQty[line.id]?.qty;
+    const split = !!props.editDefer[line.id] && Number.isFinite(sq) && sq > 0;
+    const qty = split ? sq : props.resolveQty(line, outstanding).qty;
+    return forecastCentralHolds(req, [{ line, qty }], split ? new Set([line.id]) : undefined).takes[line.id];
   };
   const partialText = partialSummary(req);
   const statusTone: Record<string, string> = {
@@ -2512,7 +2899,7 @@ function ReqCard(props: {
           non-deferred, remaining>0) line. Only on the Pending Issue tab, and
           only when at least one such line exists. Clicking opens a confirmation
           modal (handled by the page) before anything is POSTed. */}
-      {props.showIssueAll && openIssuableLines(req).length > 0 && allForecast.held.length === 0 && (
+      {props.showIssueAll && openIssuableLines(req).length > 0 && !forecastBlocks(allForecast) && (
         <div className="px-4 py-2 border-t border-[#E8D5C4] bg-[#FFF8F0] flex items-center justify-between gap-2">
           <span className="text-[11px] text-[#8B7355]">
             {openIssuableLines(req).length} open item{openIssuableLines(req).length > 1 ? 's' : ''} ready to hand over.
@@ -2530,11 +2917,13 @@ function ReqCard(props: {
           is not ready — and the banner says before the click what the alert
           says after it. Shown on the bar, not inside the rows, because the bar
           is visible on a COLLAPSED card, which is where Issue All is pressed. */}
-      {props.showIssueAll && openIssuableLines(req).length > 0 && allForecast.held.length > 0 && (() => {
+      {props.showIssueAll && openIssuableLines(req).length > 0 && forecastBlocks(allForecast) && (() => {
         const n = openLines.length;
         // Neither a held line nor one typed to 0 is going out: the route holds
-        // the first and skips the second (forecastCentralHolds `idle`).
-        const ready = n - allForecast.held.length - allForecast.idle.length;
+        // the first and skips the second (forecastCentralHolds `idle`). On a
+        // party refusal nothing goes out at all.
+        const ready = allForecast.party?.refused ? 0
+          : n - allForecast.held.length - allForecast.idle.length;
         return (
           <div className="px-4 py-2 border-t border-[#E8D5C4] bg-[#FFF8F0] space-y-1.5">
             <div className="flex items-center justify-between gap-2">
@@ -2576,7 +2965,7 @@ function ReqCard(props: {
           advance warning, scored on the checked lines only. Its own row below
           the bar (nothing renders when every checked line is covered), so the
           bar above is unchanged markup. */}
-      {props.selectable && expanded && selectedCount > 0 && selForecast.held.length > 0 && (
+      {props.selectable && expanded && selectedCount > 0 && forecastBlocks(selForecast) && (
         <div className="px-4 pb-2 bg-emerald-50/60">
           <CentralHoldBanner forecast={selForecast} gesture="Issue Selected" scope="selected line" />
         </div>
@@ -2672,6 +3061,7 @@ function ReqCard(props: {
                          blocked={props.blockedReversals[line.id]}
                          short={props.centralShort[line.id]}
                          centralHold={rowHold(line)}
+                         centralTake={rowTake(line)}
                          onUndo={props.onUndo} onReject={props.onReject} onUnreject={props.onUnreject}
                          onShowHistory={props.onShowHistory} />
                     ))}
@@ -2716,6 +3106,10 @@ function LineRow(props: {
   /** Set when the central floor WILL refuse the quantity this row's own Issue
    *  button is about to send — the forecast, before the click. */
   centralHold?: CentralHoldForecast;
+  /** What this row's own button will TAKE off the central shelf and record —
+   *  set by ReqCard (rowTake) for the quantity the button sends (the captured
+   *  hand-over in split mode). Read only where `changed` / `emptied`. */
+  centralTake?: DeskTakeForecast;
   onUndo: (line: ReqLine) => void;
   onReject: (line: ReqLine) => void;
   onUnreject: (line: ReqLine) => void;
@@ -2746,9 +3140,15 @@ function LineRow(props: {
   // appear on every fully-issued row's Outstanding cell. Gate on the STORED qty,
   // not the 3-dp purchase figure — a 0.25 ml residue shows "<0.001 BTL" up top
   // and its hint is the only place the real remainder is legible.
-  const hint = (q: number) => U.pf > 1 && (Number(q) || 0) > 0
-    ? <div className="text-[9px] text-[#B8A590] font-normal">= {fmtNum(U.toRecipe(q))} {U.recipeUnit}</div>
-    : null;
+  // On an UNPACKED material (pack 1, kg / kg) there is no recipe figure to
+  // add — except when 3 dp hides the stored one (round 8b): the shelf rule
+  // records WHOLE DHANIYA 3.2174 kg and WHITE DAL 5.0005 kg, which this row
+  // printed as "Issued so far 3.217 kg" and "5.001 kg" while the forecasts
+  // said the exact figure (round-8 verifier). fmtTakeHint prints it only then.
+  const hint = (q: number) => {
+    const h = (Number(q) || 0) > 0 ? fmtTakeHint(U, U.toRecipe(q)) : '';
+    return h ? <div className="text-[9px] text-[#B8A590] font-normal">{h}</div> : null;
+  };
   const outstandingPU = U.toPU(outstanding);
   // A remainder smaller than the 3-dp display (e.g. 0.25 ml of a 750 ml bottle)
   // would print a flat "0" on a line the card still counts as OPEN. Say "<0.001"
@@ -2780,6 +3180,34 @@ function LineRow(props: {
   const splitMode = deferOpen && Number.isFinite(splitQty) && splitQty > 0;
   const splitRest = splitMode ? Math.max(0, outstanding - splitQty) : 0;
   const typedIsPartial = Number.isFinite(typedPU) && typedPU > 0 && outstandingPU - typedPU > 1e-9;
+  /* WHAT THE TAKE WILL DO (round 8). The split panel and the split button used
+     to forecast the hand-over with their own subtraction — "Handing over 14.842
+     kg now, the balance 0.001 kg is promised for" — over a 14,842.4 g shelf,
+     where the server's shelf rule takes all 14,842.4 g, records 14.8424 and the
+     0.6 g left is below one printed step: THE RULE closes the line and the
+     defer is dropped. Both figures were false. Now both ask the server's own
+     arithmetic (desk-rule.ts forecastDeskTake) and print from it ONLY when the
+     take is not the typed figure or empties the shelf; every other gesture
+     renders exactly as before. `splitTake` is the captured hand-over (ReqCard
+     scores the row with it), `typedTake` the figure in the box before the
+     split is opened (beginIssueAndDeferRest posts U.fromPU of it). */
+  // Printed only when the take is NOT the typed figure (`changed`) or THE RULE
+  // closes the line by the shelf (`byShelf` — the defer will be dropped). A
+  // hand-over that is exactly the typed figure — even one that happens to empty
+  // the shelf — keeps the original words, byte for byte.
+  // A PARTY take is the transfer (round 8b): it moves the line's whole
+  // quantity, so on a line issued before it is never "the typed figure" and is
+  // always said.
+  const saysTake = (tk: DeskTakeForecast | null | undefined): tk is DeskTakeForecast =>
+    !!tk && (tk.changed || tk.byShelf || (tk.rail === 'party' && issued > 0));
+  const splitTake = splitMode && saysTake(props.centralTake) ? props.centralTake! : null;
+  const typedTake = (() => {
+    if (!typedIsPartial || deferOpen) return null;
+    const tk = props.req.purpose === 'party'
+      ? forecastCentralHolds(props.req, [{ line, qty: U.fromPU(typedPU) }], new Set([line.id])).takes[line.id]
+      : forecastDeskTake({ line, purpose: props.req.purpose, approved: eff, deltaLine: U.fromPU(typedPU) });
+    return saysTake(tk) ? tk : null;
+  })();
   // A line is selectable only when it's an open issuable line: not rejected by
   // chef or store, not deferred, and with a positive outstanding qty. Matches
   // openIssuableLines() so header select-all and per-line boxes stay in sync.
@@ -3060,13 +3488,34 @@ function LineRow(props: {
           // sentence and the figure still show; only the button is withheld.
           const sameBasis = !!s.purchaseUnit
             && s.purchaseUnit.toLowerCase() === String(u || '').toLowerCase();
-          const canOffer = s.available > 0 && sameBasis;
-          // In the LINE's stored unit — the basis /store-issue adds verbatim.
-          // Passed as onIssue's qtyOverride, which skips resolveIssueQty: its
-          // "typed exactly what the row shows means all of it" shortcut would
-          // substitute the full outstanding whenever the cap and the outstanding
-          // round into the same 3rd decimal, and that substitution is refused.
-          const exactLineQty = U.fromPU(s.available);
+          const isParty = props.req.purpose === 'party';
+          /* THE DELTA THIS BOX TAKES, in the LINE's stored unit — the basis
+             /store-issue adds verbatim. Passed as onIssue's qtyOverride, which
+             skips resolveIssueQty: its "typed exactly what the row shows means
+             all of it" shortcut would substitute the full outstanding whenever
+             the cap and the outstanding round into the same 3rd decimal, and
+             that substitution is refused.
+               · internal: `available` IS the headroom on top of what is issued
+                 (checkCentralIssue's availablePurchase), so it converts as is;
+               · PARTY (round 8b): the transfer moves the line's WHOLE quantity,
+                 so the server's cap is on the TOTAL (max_issue_qty) and the box
+                 can add only that less what the line holds — or, where the line
+                 already holds the shown cap, the shelf's own grid point less it
+                 (deskPartyHeadroom). Offering `available` itself on THREE MANGO
+                 14.842 of 14.843 kg posted +14.842 and was refused again "so
+                 29.684 kg cannot be issued" (round-8 verifier, sd_party_tail). */
+          const partyHeadroom = (() => {
+            if (!isParty) return 0;
+            const f = forecastCentralHolds(props.req, [{ line, qty: outstanding }]);
+            const mine = f.party?.short.find(x => x.line.id === line.id);
+            if (mine) return mine.headroomLine;
+            const cap = Number(s.maxIssueLine);
+            return Number.isFinite(cap) ? deskPartyHeadroom(issued, cap, 0) : 0;
+          })();
+          const exactLineQty = isParty ? partyHeadroom : U.fromPU(s.available);
+          // The figure the panel and the button print, in the box's own unit.
+          const capPU = isParty ? (U.isPU ? exactLineQty : exactLineQty / (U.pf || 1)) : s.available;
+          const canOffer = capPU > 0 && sameBasis;
           // THE CAP AS A FIGURE, NEVER "0" OVER A REAL CRUMB. fmtNum's 3 dp
           // printed a 0.4 g balance as "Most it can give now: 0 kg" and the
           // button as "Issue 0 kg" while the server's sentence one line up said
@@ -3077,7 +3526,38 @@ function LineRow(props: {
           // sentence and the button agree, and typing the figure back is
           // accepted. At 0.001 or more it is fmtNum, byte for byte.
           const capPf = sameBasis ? U.pf : 1;
-          const capFig = fmtCapPU(s.available, capPf);
+          const capFig = fmtCapPU(capPU, capPf);
+          const capUnit = s.purchaseUnit ? ` ${s.purchaseUnit}` : '';
+          /* WHAT PRESSING IT WILL DO (round 8b) — the server's take, asked
+             before the click (desk-rule.ts): the shelf rule takes the whole
+             balance when the figure IS its shown figure, so THREE MANGO's
+             "Issue 14.842 kg" over 14,842.4 g takes 14,842.4 g, records 14.8424
+             and closes the line. This panel printed "(= 14,842 g)" and "The rest
+             stays outstanding" over that take (round-8 verifier, sd_cap_title).
+             Only a take that is not the figure, or that closes the line, changes
+             the words; every ordinary cap reads as it always did. */
+          const capTake: DeskTakeForecast | null = !canOffer ? null
+            : isParty
+              ? (forecastCentralHolds(props.req, [{ line, qty: exactLineQty }]).takes[line.id] || null)
+              : forecastDeskTake({ line, purpose: props.req.purpose, approved: eff, deltaLine: exactLineQty });
+          const partyIdle = isParty && canOffer && !capTake;
+          const capSays = !!capTake && (capTake.changed || capTake.complete || capTake.rail === 'party');
+          // The "= …" beside the cap: on the internal rail, what leaves the
+          // shelf when the take is not the figure (14,842.4 g, not 14,842 g);
+          // otherwise the figure's own recipe image, as it always was.
+          const capHint = capSays && capTake!.rail !== 'party' ? fmtTakeHint(U, capTake!.takeRecipe)
+            : U.pf > 1 && sameBasis ? `= ${fmtCapPU(U.toRecipe(exactLineQty), 1)} ${U.recipeUnit}` : '';
+          const takeHint = capTake ? fmtTakeHint(U, capTake.takeRecipe) : '';
+          const capWhat = capSays
+            ? (capTake!.rail === 'party'
+                ? `Issuing it completes the requisition, and the party transfer then moves the line's whole `
+                  + `${fmtTakePU(U, capTake!.takeRecipe)}${u ? ` ${u}` : ''}${takeHint ? ` (${takeHint})` : ''}`
+                  + `${capTake!.plan.takesAll ? ' — everything the central store holds' : ''}`
+                : capTake!.plan.takesAll ? 'It takes everything the central store holds' : 'It goes out as entered')
+              + ` — and ${takeOutcomeWords(U, eff, capTake!)}.`
+            : partyIdle
+              ? 'It is recorded on the line. A party requisition\'s goods leave the store in one transfer once every line is complete, so nothing moves yet.'
+              : 'The rest stays outstanding and can be deferred or ordered.';
           return (
             <div className="mb-1 rounded border border-rose-300 bg-rose-50 px-1.5 py-1 text-[10px] leading-snug text-rose-900 max-w-[15rem] md:max-w-[22rem]">
               <div className="font-semibold flex items-start gap-1">
@@ -3089,20 +3569,36 @@ function LineRow(props: {
                   shown figure (or a crumb's exact figure), which the server
                   accepts on the retry and debits as the whole balance. */}
               {s.message ? <div className="mt-0.5 opacity-90">{s.message}</div> : null}
-              {s.available > 0 && (
+              {/* A party line already holding everything the store can cover:
+                  the transfer moves the WHOLE line at once, so nothing more
+                  fits — said instead of a figure that would be refused. */}
+              {isParty && !(capPU > 0) && (
+                <div className="mt-1">
+                  This party line already holds <b className="font-mono">{fmtNum(U.toPU(issued))}{u ? ` ${u}` : ''}</b>, and
+                  the transfer moves the whole line at once
+                  {s.available > 0
+                    ? <> — the store&apos;s books hold <b className="font-mono">{fmtCapPU(s.available, capPf)}{capUnit}</b>, so
+                        nothing more fits on it. To send what the store has, undo the line and issue{' '}
+                        <b className="font-mono">{fmtCapPU(s.available, capPf)}{capUnit}</b> again; otherwise receive stock or
+                        record a closing count first.</>
+                    : <> — the store&apos;s books hold none of it. Receive stock or record a closing count first.</>}
+                </div>
+              )}
+              {capPU > 0 && (
                 <div className="mt-1 flex items-center justify-between gap-1">
                   <span>
                     Most it can give now:{' '}
-                    <b className="font-mono">{capFig}{s.purchaseUnit ? ` ${s.purchaseUnit}` : ''}</b>
-                    {U.pf > 1 && sameBasis
-                      ? <span className="text-[9px] opacity-70"> (= {fmtCapPU(U.toRecipe(exactLineQty), 1)} {U.recipeUnit})</span>
+                    <b className="font-mono">{capFig}{capUnit}</b>
+                    {capHint
+                      ? <span className="text-[9px] opacity-70"> ({capHint})</span>
                       : null}
+                    {(capSays || partyIdle) && <span className="block text-[9px] opacity-90">{capWhat}</span>}
                   </span>
                   {canOffer && (
                     <button onClick={() => props.onIssue(line, exactLineQty)} disabled={busy}
-                            title={`Hand over ${capFig} ${s.purchaseUnit} — the most the central books cover on this line. The rest stays outstanding and can be deferred or ordered.`}
+                            title={`Hand over ${capFig}${capUnit} — the most the central books cover on this line. ${capWhat}`}
                             className="shrink-0 px-1.5 py-0.5 rounded border border-rose-400 bg-white hover:bg-rose-100 font-semibold disabled:opacity-50">
-                      Issue {capFig} {s.purchaseUnit}
+                      Issue {capFig}{capUnit}{capTake?.complete && capTake.byShelf ? ' — closes the line' : ''}
                     </button>
                   )}
                 </div>
@@ -3181,7 +3677,13 @@ function LineRow(props: {
                       typed from the panel (0.0004 kg) read "Issue 0 kg". At
                       0.001 or more the two print the same string. */}
                   {typedIsPartial
-                    ? <>Issue {fmtCapPU(typedPU, U.pf)} {u}, defer {fmtNum(Math.round((outstandingPU - typedPU) * 1000) / 1000)} {u}</>
+                    ? (typedTake?.complete
+                        /* The take empties the shelf and THE RULE closes the
+                           line — there is no balance to defer (round 8). */
+                        ? <>Issue {fmtCapPU(typedPU, U.pf)} {u} — closes the line</>
+                        : typedTake
+                          ? <>Issue {fmtCapPU(typedPU, U.pf)} {u}, defer {fmtNum(U.toPU(typedTake.owingLine))} {u}</>
+                          : <>Issue {fmtCapPU(typedPU, U.pf)} {u}, defer {fmtNum(Math.round((outstandingPU - typedPU) * 1000) / 1000)} {u}</>)
                     : <>Issue part, defer rest</>}
                 </button>
                 {/* Store rejection — distinct from the chef's. Prompts for a reason. */}
@@ -3234,7 +3736,7 @@ function LineRow(props: {
               // the plain defer it has always been, unchanged.
               <div className={`flex flex-wrap items-center gap-1 border rounded px-1.5 py-1 ${
                 splitMode ? 'bg-violet-50 border-violet-200' : 'bg-blue-50 border-blue-200'}`}>
-                {splitMode && (
+                {splitMode && !splitTake && (
                   <span className="w-full sm:w-auto text-[10px] text-[#6B5744] shrink-0">
                     Handing over <b className="text-emerald-700">{fmtFinePU(splitQty)} {u}</b> now
                     {U.pf > 1 && <span className="text-[9px] text-[#B8A590] ml-0.5">= {fmtNum(U.toRecipe(splitQty))} {U.recipeUnit}</span>}
@@ -3243,19 +3745,65 @@ function LineRow(props: {
                     {' '}is promised for
                   </span>
                 )}
-                <input type="datetime-local" value={props.editDefer[line.id]?.until || ''}
-                       onChange={e => props.setEditDefer((s: any) => ({ ...s, [line.id]: { ...s[line.id], until: e.target.value } }))}
-                       className={`px-1 py-0.5 border rounded text-[10px] bg-white ${splitMode ? 'border-violet-200' : 'border-blue-200'}`} />
-                <input type="text" placeholder="reason (optional)"
-                       value={props.editDefer[line.id]?.reason || ''}
-                       onChange={e => props.setEditDefer((s: any) => ({ ...s, [line.id]: { ...s[line.id], reason: e.target.value } }))}
-                       className={`w-32 px-1 py-0.5 border rounded text-[10px] bg-white ${splitMode ? 'border-violet-200' : 'border-blue-200'}`} />
+                {/* THE SAME PANEL WHEN THE TAKE IS NOT THE TYPED FIGURE (round 8):
+                    the shelf rule takes everything the central store holds, the
+                    line records what left the shelf, and THE RULE either closes
+                    it (nothing to defer — the server drops the defer and says
+                    so, announceDeferDropped) or leaves a real balance, which is
+                    the one the promise is for. A separate branch, so an
+                    ordinary split renders exactly as before. */}
+                {splitMode && splitTake && splitTake.rail === 'party' && (
+                  /* The PARTY split (round 8b): the hand-over is recorded and the
+                     transfer it triggers moves the line's whole quantity — so the
+                     two figures are said apart. */
+                  <span className="w-full sm:w-auto text-[10px] text-[#6B5744] shrink-0">
+                    Handing over <b className="text-emerald-700">{fmtFinePU(splitQty)} {u}</b> now
+                    {U.pf > 1 && <span className="text-[9px] text-[#B8A590] ml-0.5">= {fmtNum(U.toRecipe(splitQty))} {U.recipeUnit}</span>}
+                    {' '}completes the requisition, and the party transfer then moves the line&apos;s whole{' '}
+                    <b className="text-emerald-700">{fmtTakePU(U, splitTake.takeRecipe)} {u}</b>
+                    {fmtTakeHint(U, splitTake.takeRecipe) && <span className="text-[9px] text-[#B8A590] ml-0.5">{fmtTakeHint(U, splitTake.takeRecipe)}</span>}
+                    {splitTake.plan.takesAll ? ' — everything the central store holds' : ''}
+                    . <b className="text-emerald-700">{takeOutcomeWords(U, eff, splitTake).replace(/^the line/, 'The line')}</b>, so nothing is deferred.
+                  </span>
+                )}
+                {splitMode && splitTake && splitTake.rail !== 'party' && (
+                  <span className="w-full sm:w-auto text-[10px] text-[#6B5744] shrink-0">
+                    Handing over <b className="text-emerald-700">{fmtTakePU(U, splitTake.takeRecipe)} {u}</b> now
+                    {fmtTakeHint(U, splitTake.takeRecipe) && <span className="text-[9px] text-[#B8A590] ml-0.5">{fmtTakeHint(U, splitTake.takeRecipe)}</span>}
+                    {' '}— everything the central store holds
+                    {splitTake.complete ? (
+                      <>. <b className="text-emerald-700">{takeOutcomeWords(U, eff, splitTake).replace(/^the line/, 'The line')}</b>, so nothing is deferred.</>
+                    ) : (
+                      <>
+                        , the balance <b className="text-violet-700">{fmtNum(U.toPU(splitTake.owingLine))} {u}</b>
+                        {U.pf > 1 && <span className="text-[9px] text-[#B8A590] ml-0.5">= {fmtNum(U.toRecipe(splitTake.owingLine))} {U.recipeUnit}</span>}
+                        {' '}is promised for
+                      </>
+                    )}
+                  </span>
+                )}
+                {/* No time to pick when the take closes the line — there is no
+                    balance to promise (the captured time still rides the POST,
+                    and the server drops it and says so). */}
+                {!splitTake?.complete && (
+                  <>
+                    <input type="datetime-local" value={props.editDefer[line.id]?.until || ''}
+                           onChange={e => props.setEditDefer((s: any) => ({ ...s, [line.id]: { ...s[line.id], until: e.target.value } }))}
+                           className={`px-1 py-0.5 border rounded text-[10px] bg-white ${splitMode ? 'border-violet-200' : 'border-blue-200'}`} />
+                    <input type="text" placeholder="reason (optional)"
+                           value={props.editDefer[line.id]?.reason || ''}
+                           onChange={e => props.setEditDefer((s: any) => ({ ...s, [line.id]: { ...s[line.id], reason: e.target.value } }))}
+                           className={`w-32 px-1 py-0.5 border rounded text-[10px] bg-white ${splitMode ? 'border-violet-200' : 'border-blue-200'}`} />
+                  </>
+                )}
                 {splitMode ? (
                   <button onClick={() => props.onIssueDeferRest(line)} disabled={busy}
-                          title="Records the hand-over AND the promised time in one transaction"
+                          title={splitTake?.complete
+                            ? 'Records the hand-over. It takes everything the central store holds and completes the line, so the store drops the promised time and tells you why.'
+                            : 'Records the hand-over AND the promised time in one transaction'}
                           className="px-2 py-0.5 bg-violet-600 hover:bg-violet-700 text-white rounded text-[10px] disabled:opacity-50 flex items-center gap-1">
                     {busy ? <Loader2 className="w-3 h-3 animate-spin" /> : <Split className="w-3 h-3" />}
-                    Issue &amp; defer balance
+                    {splitTake?.complete ? <>Issue — closes the line</> : <>Issue &amp; defer balance</>}
                   </button>
                 ) : (
                   <button onClick={() => props.onDefer(line)} disabled={busy}
@@ -3284,9 +3832,65 @@ function LineRow(props: {
                 Stood down while the server's own panel is on this line: that is
                 the fresher reading of the same fact, in the server's words.
                 Hidden on a plain Defer — nothing is being handed over. */}
+            {/* WHAT ISSUE NOW WILL TAKE, WHEN IT IS NOT THE FIGURE IN THE BOX
+                (round 8). The shelf rule takes everything the central store
+                holds when the figure sent IS the balance's shown figure (14.843
+                kg over 14,842.5 g, 14.842 over 14,842.4): the line records what
+                left the shelf, and THE RULE closes it when less than one printed
+                step is still owed. Said under the box so the storekeeper reads
+                the gram figure before the click. Silent on every ordinary row. */}
+            {saysTake(props.centralTake) && !props.centralHold && !props.short && outstanding > 0 && !deferOpen && (() => {
+              const tk = props.centralTake!;
+              if (tk.rail === 'party') {
+                return (
+                  <div className="w-full text-[9px] text-emerald-800"
+                       title="A party requisition's goods leave the store in one transfer, each line's whole quantity, when every line is complete — under the same shelf rule: a figure that IS the balance's shown figure takes the whole balance and the line records what left the shelf.">
+                    Issue Now completes the requisition, and the party transfer then moves the line&apos;s whole{' '}
+                    <b className="font-mono">{fmtTakePU(U, tk.takeRecipe)} {u}</b>
+                    {fmtTakeHint(U, tk.takeRecipe) && <> ({fmtTakeHint(U, tk.takeRecipe)})</>}
+                    {tk.plan.takesAll ? ' — everything the central store holds' : ''} — and {takeOutcomeWords(U, eff, tk)}.
+                  </div>
+                );
+              }
+              return (
+                <div className="w-full text-[9px] text-emerald-800"
+                     title="The central store's shelf rule: a figure that IS the balance's shown figure takes the whole balance and lands the shelf on exactly 0. The line records what left the shelf.">
+                  Issue Now takes everything the central store holds — <b className="font-mono">{fmtTakePU(U, tk.takeRecipe)} {u}</b>
+                  {fmtTakeHint(U, tk.takeRecipe) && <> ({fmtTakeHint(U, tk.takeRecipe)})</>} — and {takeOutcomeWords(U, eff, tk)}.
+                </div>
+              );
+            })()}
             {props.centralHold && !props.short && outstanding > 0 && (!deferOpen || splitMode) && (() => {
               const h = props.centralHold!;
               const cap = `${fmtCapPU(h.availPU, h.pf)} ${h.purchaseUnit}`;
+              /* THE PARTY TRANSFER WILL REFUSE THIS (round 8b): it moves every
+                 line's WHOLE quantity at once, so the hold is about the line's
+                 total, and "Issuable now" is the delta this box can still add
+                 (0 when the line already holds all the store can cover). */
+              if (h.party) {
+                const pu = h.purchaseUnit ? ` ${h.purchaseUnit}` : '';
+                return (
+                  <div className="w-full text-[9px] text-red-800 font-semibold"
+                       title="A party requisition's goods leave the store in one transfer, every line's whole quantity at once, when the last line is complete — and the transfer is refused whole if the store's books cannot cover one line. (Liquor-store items are the exception: their stock moves on the Liquor Store ledger.)">
+                    {h.party.blockedBy && h.party.blockedBy.length > 0 ? (
+                      <>Issuing this completes the requisition, and the party transfer then moves every line at once
+                        — the store&apos;s books cannot cover {h.party.blockedBy.join(', ')}, so the central store will
+                        NOT issue this either.</>
+                    ) : (
+                      <>
+                        The party transfer moves this line&apos;s whole <b>{fmtNum(h.party.totalPU)}{pu}</b> at once, and the
+                        store&apos;s books hold <b>{fmtCapPU(h.party.holdsPU, h.pf)}{pu}</b> — the central store will NOT issue it.
+                        <div className="text-red-900 font-normal">
+                          {h.party.headroomLine > 0
+                            ? <>Issuable now: <b className="font-mono">{cap}</b>
+                                {h.party.closesAtCap ? ' — it takes everything the store holds and the line closes' : ''}</>
+                            : <>Nothing more fits on this line until stock is received or a closing count recorded.</>}
+                        </div>
+                      </>
+                    )}
+                  </div>
+                );
+              }
               return (
                 <div className="w-full text-[9px] text-red-800 font-semibold"
                      title={h.empty
