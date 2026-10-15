@@ -1,7 +1,7 @@
 import type Database from 'better-sqlite3';
 import { getDb, logAuditEvent } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
-import { postDeptLedger, deptOnHand, cutoverAt } from '@/lib/dept-ledger';
+import { postDeptLedger, deptOnHand, deptSendableFor, cutoverAt } from '@/lib/dept-ledger';
 import { isStoreMappedMaterial } from '@/lib/store-engine';
 import { packFactor } from '@/lib/pack-units';
 
@@ -47,7 +47,10 @@ import { packFactor } from '@/lib/pack-units';
  * is a fresh count, not a looser guard. The trap is measured from the count
  * being ADOPTED, and refuses outright when a NEWER count exists for the pair
  * (COUNT_NOT_CURRENT) — see adoptTrap() for what windowing from the current
- * anchor instead let through.
+ * anchor instead let through. It also refuses (MOVED_SINCE_COUNT) when the
+ * opening would leave the balance alone but RAISE the transfer send figure: a
+ * count older than the cutover floor with an outflow hidden behind the floor
+ * (adoptTrap, floor_hidden).
  *
  * ── IDEMPOTENT, BY REFUSING ────────────────────────────────────────────────
  * One opening row per (department, material), ever. A second attempt is
@@ -85,6 +88,17 @@ const fmt = (n: number) => {
 type Db = Database.Database;
 
 const norm = (s: unknown) => String(s ?? '').trim().toLowerCase();
+
+/** A RECIPE-unit quantity for a message, LEADING with the purchase unit when
+ *  the material converts (owner rule; packFactor carries the both-halves
+ *  guard): "0.5 BTL (= 375 ml)", or "2 kg" when there is nothing to convert. */
+function qtyLabel(m: { unit: string; purchase_unit: string | null; pack_size: number | null } | undefined, recipeQty: number): string {
+  if (!m) return fmt(recipeQty);
+  const pf = packFactor(m);
+  return pf > 1
+    ? `${fmt(recipeQty / pf)} ${m.purchase_unit} (= ${fmt(recipeQty)} ${m.unit})`
+    : `${fmt(recipeQty)} ${m.unit}`;
+}
 
 /** Defensive: this route reads three tables that arrived with the cutover. A
  *  503 that says "run the migration" beats a 500 stack trace on the one screen
@@ -140,11 +154,18 @@ function countAnchorAt(date: string, createdAt: string): string {
 
 /** One adopt refusal. `newer_count` and `not_the_anchor` mean the count being
  *  adopted is not the one the balance stands on; `moved` means it is, but the
- *  pair has moved since it. */
+ *  pair has moved since it; `floor_hidden` means the balance is unchanged but
+ *  the SEND figure would rise (see adoptTrap). */
 type AdoptRefusal =
   | { kind: 'newer_count'; newest_count_date: string; newest_count_qty: number; newest_count_at: string }
   | { kind: 'not_the_anchor'; anchor_source: string; anchor_at: string | null; anchor_qty: number | null }
-  | { kind: 'moved'; moved_rows: number };
+  | { kind: 'moved'; moved_rows: number }
+  | { kind: 'floor_hidden'; moved_rows: number; hidden_outflow: number; send_figure_now: number; cutover_floor: string };
+
+/** The refusals the admin answers with a fresh count (MOVED_SINCE_COUNT), as
+ *  opposed to adopting a different count date (COUNT_NOT_CURRENT). */
+type MovedRefusal = Extract<AdoptRefusal, { kind: 'moved' | 'floor_hidden' }>;
+const isMovedRefusal = (r: AdoptRefusal): r is MovedRefusal => r.kind === 'moved' || r.kind === 'floor_hidden';
 
 /**
  * THE ADOPT TRAP, measured from the ADOPTED count — never from whatever count
@@ -172,7 +193,24 @@ type AdoptRefusal =
  *     dept-ledger deptOnHand): every movement after MAX(count, cutover floor),
  *     and transfer legs after the count itself, never the floor. A movement
  *     that rule leaves out of the balance today stays out after the opening, so
- *     it cannot be dropped and is not counted here.
+ *     it cannot be dropped FROM THE BALANCE and is not counted here.
+ *   floor_hidden — the balance is unchanged, but the SEND figure would rise.
+ *     A count taken before the cutover floor (on cutover day, counted before
+ *     the first department's cutover stamped it) has movement between the
+ *     count and the floor that the balance hides. The send check does not:
+ *     deptSendable is MIN(balance, count + every movement after it), so a
+ *     wastage or staff meal booked in that gap holds the send figure down to
+ *     what is really on the shelf. An opening is stamped NOW, after the floor,
+ *     so that MIN disappears and the send figure jumps back to the count.
+ *     Measured before this check (scratchpad adopt-r3, floor-hide.cjs W):
+ *     Kitchen counted 6, wasted 2, floor stamped, count adopted: 200, send
+ *     figure 4 → 6, then "ACCEPTED 6 kg from a 4 kg shelf". The 2 phantom kilos
+ *     would land in the receiver's ledger. The check reads the send figure from
+ *     the ledger's own deptSendableFor, so it cannot drift from the send check:
+ *     with nothing moved (the check above), the opening makes that figure
+ *     exactly the count, so the adopt is refused only when the figure is
+ *     LOWER than the count today. A hidden RECEIPT never trips it: the figure
+ *     is already capped at the count, and stays there (prod parity, D4/W2).
  *
  * Run twice: while planning (so every refusal is answered in one list), and
  * again inside the IMMEDIATE write transaction, so nothing that posts between
@@ -207,7 +245,26 @@ function adoptTrap(
             OR (type IN ('transfer_out', 'transfer_in') AND ${LEDGER_TS_SQL} > ?))
   `).get(departmentId, materialId, windowFrom, adopted.at) as { n: number } | undefined;
   const n = Number(moved?.n) || 0;
-  return n > 0 ? { kind: 'moved', moved_rows: n } : null;
+  if (n > 0) return { kind: 'moved', moved_rows: n };
+
+  /* floor_hidden (see above). Nothing has moved, so the balance IS the count
+   * and the opening would make the send figure exactly the count. */
+  const send = deptSendableFor(db, departmentId, materialId);
+  const qty = r6(adopted.qty);
+  if (r6(send.available) < qty - EPS) {
+    const gap = db.prepare(`
+      SELECT COUNT(*) AS n FROM department_material_transactions
+       WHERE department_id = ? AND material_id = ? AND type <> 'opening' AND ${LEDGER_TS_SQL} > ?
+    `).get(departmentId, materialId, adopted.at) as { n: number } | undefined;
+    return {
+      kind: 'floor_hidden',
+      moved_rows: Number(gap?.n) || 0,
+      hidden_outflow: r6(qty - Number(send.available)),
+      send_figure_now: r6(Number(send.available)),
+      cutover_floor: floor,
+    };
+  }
+  return null;
 }
 
 /** Thrown inside the write transaction when the re-run trap refuses — rolls
@@ -574,8 +631,8 @@ export async function POST(request: Request) {
     const badUnit: Refused[] = [];
     const badQty: Refused[] = [];
     const already: Array<{ material_id: string; name: string; cutover_date: string; quantity: number }> = [];
-    const movedSinceCount: Array<{ material_id: string; name: string; moved_rows: number; count_at: string }> = [];
-    const notCurrent: Array<{ material_id: string; name: string; adopted_count_at: string } & Exclude<AdoptRefusal, { kind: 'moved' }>> = [];
+    const movedSinceCount: Array<{ material_id: string; name: string; count_at: string } & MovedRefusal> = [];
+    const notCurrent: Array<{ material_id: string; name: string; adopted_count_at: string } & Exclude<AdoptRefusal, MovedRefusal>> = [];
 
     for (const it of intended) {
       const m = getMat.get(it.material_id) as Mat | undefined;
@@ -682,8 +739,8 @@ export async function POST(request: Request) {
           ? adoptTrap(db, departmentId, m.id, a)
           : { kind: 'not_the_anchor', anchor_source: 'none', anchor_at: null, anchor_qty: null };
         if (ref) {
-          if (ref.kind === 'moved') {
-            movedSinceCount.push({ material_id: m.id, name: m.name, moved_rows: ref.moved_rows, count_at: a ? a.at : '' });
+          if (isMovedRefusal(ref)) {
+            movedSinceCount.push({ material_id: m.id, name: m.name, count_at: a ? a.at : '', ...ref });
           } else {
             notCurrent.push({ material_id: m.id, name: m.name, adopted_count_at: a ? a.at : '', ...ref });
           }
@@ -759,11 +816,25 @@ export async function POST(request: Request) {
       );
     }
     if (movedSinceCount.length) {
+      const hidden = movedSinceCount.filter(x => x.kind === 'floor_hidden');
+      const plainN = movedSinceCount.length - hidden.length;
+      const mixed = plainN > 0 && hidden.length > 0;
+      const hiddenList = hidden.slice(0, 3)
+        .map(h => `${h.name}: ${qtyLabel(mats.get(h.material_id), h.kind === 'floor_hidden' ? h.hidden_outflow : 0)}`)
+        .join('; ') + (hidden.length > 3 ? `; +${hidden.length - 3} more` : '');
       return Response.json(
         {
           error:
-            `${movedSinceCount.length} material(s) in ${dept.name} have moved since the ${cutoverDate} count. Adopting it now would drop those movements ` +
-            `out of the balance. Take a fresh count dated today and adopt that, or send lines[] with the quantities on the shelf right now.`,
+            `${movedSinceCount.length} material(s) in ${dept.name} have moved since the ${cutoverDate} count.` +
+            (plainN > 0
+              ? ` Adopting it now would drop those movements out of the balance${mixed ? ` (${plainN} of them)` : ''}.`
+              : '') +
+            (hidden.length > 0
+              ? ` ${mixed ? `For the other ${hidden.length}` : 'For these'}, stock was used or written off after the count but before the ` +
+                `department rail went live (${hiddenList}). The balance already leaves that out; the transfer check does not, and adopting ` +
+                `would let more leave the shelf than is on it.`
+              : '') +
+            ` Take a fresh count dated today and adopt that, or send lines[] with the quantities on the shelf right now.`,
           code: 'MOVED_SINCE_COUNT',
           materials: movedSinceCount,
         },
@@ -908,9 +979,13 @@ export async function POST(request: Request) {
         {
           error:
             `${name} in ${dept.name} changed while the cutover was being written ` +
-            `(${e.refusal.kind === 'moved' ? 'it moved after the ' + cutoverDate + ' count' : 'its ' + cutoverDate + ' count is no longer the latest'}). ` +
+            `(${e.refusal.kind === 'moved'
+              ? 'it moved after the ' + cutoverDate + ' count'
+              : e.refusal.kind === 'floor_hidden'
+                ? qtyLabel(mats.get(e.materialId), e.refusal.hidden_outflow) + ' was used or written off after the ' + cutoverDate + ' count, before the department rail went live'
+                : 'its ' + cutoverDate + ' count is no longer the latest'}). ` +
             `Nothing was written. Run the cutover again.`,
-          code: e.refusal.kind === 'moved' ? 'MOVED_SINCE_COUNT' : 'COUNT_NOT_CURRENT',
+          code: isMovedRefusal(e.refusal) ? 'MOVED_SINCE_COUNT' : 'COUNT_NOT_CURRENT',
           materials: [{ material_id: e.materialId, name, ...e.refusal }],
         },
         { status: 409 },

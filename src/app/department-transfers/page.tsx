@@ -732,9 +732,21 @@ export default function DepartmentTransfersPage() {
   /* what needs this person: open disputes they can settle (send back / close) */
   const needsMe = useMemo(() => attention.filter(t => t.dispute_status === 'open' && (
     t.permissions?.can_reverse
-    // Counted since it moved: no take-back, but the person still has to act
-    // (count the other side, or close it) — so it stays in front of them.
-    || !!t.permissions?.reverse_blocked
+    // Counted on ONE side since it moved: no take-back, but a count of the
+    // OTHER side is still owed (the server's reverse_blocked words say which),
+    // so it stays in front of whoever may be the one to count it. Only the
+    // viewer who acts for the SENDER alone (reverse_authority 'disputed_only')
+    // is left out when the sender is the side that already counted — the count
+    // owed is the receiver's. ('receiver' authority may act for both sides:
+    // managers, a head of both — kept.) Counted on BOTH sides: nothing is left
+    // to do but close it, so it is theirs only if they hold a close button (the
+    // arm below); the sender's head never does, and must not be shown a
+    // "to settle" item with no control that works.
+    || (!!t.permissions?.reverse_blocked && t.lines.some(l => {
+      const c = l.counted_since;
+      if (!(l.qty_open_disputed > EPS) || !c || (c.sender && c.receiver)) return false;
+      return !!c.receiver || t.permissions.reverse_authority === 'receiver';
+    }))
     || (t.permissions?.dismissable_dispute_ids || []).some(id => !isMe(t.disputes.find(d => d.id === id)?.raised_by || ''))
   )), [attention, isMe]);
   /** A document settled from the panel above carries its buttons THERE only. */

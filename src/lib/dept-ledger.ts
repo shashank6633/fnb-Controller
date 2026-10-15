@@ -2576,9 +2576,10 @@ export function deptTransferCountedSinceMessage(doc: DeptTransferWithLines): str
   }
   if (parts.length === 0) return null;
   // Who closes it — access.ts canDismissDispute: the flagger, a manager or an
-  // admin at any time; the head of either department once BOTH have counted.
+  // admin at any time; the RECEIVING department's head once BOTH have counted
+  // (never the sender's head — the claim is against his own department).
   return `${parts.join(' ')} The person who flagged it, a manager or an admin can close it; once both ` +
-    `${from} and ${to} have counted it, either department's head can close it too.`;
+    `${from} and ${to} have counted it, ${to}'s head can close it too.`;
 }
 
 /* ── reading ────────────────────────────────────────────────────────────── */

@@ -79,7 +79,8 @@ export function bodyNumber(v: unknown): number {
  *   "manager" here (isAdminOrManager). ONE exception: once BOTH departments
  *   have counted the disputed line since it moved, the claim can no longer
  *   change any book (the take-back is refused, counted_since), and the head of
- *   either department may close it too — see canDismissDispute.
+ *   the RECEIVING department (whose claim it is) may close it too — never the
+ *   sender's head: see canDismissDispute.
  */
 
 export interface DeptLite {
@@ -157,17 +158,25 @@ export function canFlagDispute(user: SessionUser, doc: DeptTransferWithLines, al
  * Who may CLOSE one open dispute (moves nothing): the person who raised it,
  * managers and admin — and, ONLY ONCE BOTH ENDS HAVE COUNTED the disputed
  * line's material since it moved (dept-ledger line.counted_since.sender AND
- * .receiver), the head of either department too.
+ * .receiver), whoever may send from the RECEIVING department (its head, an HOD
+ * posted there) too. NEVER the sending department's head on that ground.
  *
- * Why that one extra arm. A claim against your own department is not yours to
- * close while it can still change the books — that is the rule above. Once both
- * shelves have been counted since the transfer, it cannot: both books already
- * say what is on each shelf, and the take-back is REFUSED (reason
- * 'counted_since', or it would correct the books twice). The server's own words
- * then say "close the dispute with a note"; without this arm the Kitchen head
- * was told that and refused it (403), with the dispute sat in his "to settle"
- * list and no button that worked. Measured (the-real-case order.cjs, ORDER=both,
- * re-run as rc-fix order-fix.cjs).
+ * Why the one extra arm. Once both shelves have been counted since the
+ * transfer, both books already say what is on each shelf, the take-back is
+ * REFUSED (reason 'counted_since', or it would correct the books twice), and
+ * the server's own words say "close the dispute with a note". The claim is the
+ * RECEIVER's, so its own head may then close it when the cook who raised it is
+ * off shift.
+ *
+ * Why NOT the sender's head. A claim against your own department is not yours
+ * to close — and "both counted" is something the sender's head can make true
+ * alone: the closing-stock API lets him count the RECEIVER's department too.
+ * Measured with the arm open to either head (rc-v2 edge.cjs SC=silence): the
+ * Kitchen head counted Akan Tandoori at its book figure (4, shelf 3.5) and
+ * Kitchen at 6 (shelf 6.5), then closed Tandoori's claim against Kitchen
+ * (200); the managers' to-act count fell to 0 with both books wrong. The
+ * sender's head still sees the dispute and the server's words (who closes it);
+ * a manager, the flagger or the receiver's head closes it.
  *
  * `doc` / `all` omitted = the strict rule only (fail closed for any caller that
  * does not pass the document).
@@ -184,7 +193,8 @@ export function canDismissDispute(
   if (!doc || !all) return false;
   const c = doc.lines.find((l) => l.id === d.line_id)?.counted_since;
   if (!c || !c.sender || !c.receiver) return false;
-  return canSendFrom(user, all.get(doc.from_department_id)) || canSendFrom(user, all.get(doc.to_department_id));
+  // The RECEIVER's side only — see "Why NOT the sender's head" above.
+  return canSendFrom(user, all.get(doc.to_department_id));
 }
 
 export type ReverseAuthority = 'receiver' | 'disputed_only';

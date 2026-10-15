@@ -10,19 +10,22 @@ import { loadDepartments, canSeeTransfer, canDismissDispute, presentTransfer, tr
  * answer is …/reverse, not this.
  *
  * Body: { note, dispute_ids? }  — omit dispute_ids to close every open dispute
- * on the document that the caller may close. An EMPTY dispute_ids is refused
- * (400): it names nothing, so it must never mean "all".
+ * on the document that the caller may close. An EMPTY dispute_ids is refused:
+ * it names nothing, so it must never mean "all" — 403 for a caller who may
+ * close none of the open disputes (the same answer as any other spelling),
+ * 400 for one who may close at least one.
  *
  * Who (../access.ts canDismissDispute): the person who raised the dispute
  * (withdrawing their own claim), managers and admin. The sender's head alone
  * may not close a claim against their own department — they reverse it, or a
- * manager closes it — UNTIL both departments have counted the disputed line
- * since it moved: then the take-back is refused (it would correct the books
- * twice) and either department's head may close it.
+ * manager closes it. Once both departments have counted the disputed line
+ * since it moved, the take-back is refused (it would correct the books twice)
+ * and the RECEIVING department's head may close it too — never the sender's
+ * head, who could make "both counted" true alone by counting the receiver.
  */
 
 const CLOSE_WHO = 'Only the person who raised a dispute, a manager or an admin can close it — or, once both ' +
-  'departments have counted it since the transfer, the head of either department.';
+  'departments have counted it since the transfer, the receiving department\'s head.';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -58,7 +61,15 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       // visible_department_ids grantee) could silence the receiver's claim with a
       // hand-made `dispute_ids: []`. Measured: 6 such callers got 200. The screen
       // never sends [] (it sends dismissable_dispute_ids, and only when non-empty).
+      //
+      // Who-may comes BEFORE what-was-named, so the answer never depends on the
+      // spelling: a caller who may close none of the open disputes here gets the
+      // same 403 they get for naming an id or for leaving the field out. Only a
+      // caller who may close one is told the empty list names nothing (400).
       if (body.dispute_ids.length === 0) {
+        if (open.length > 0 && !open.some((d) => canDismissDispute(me, d, doc, depts))) {
+          return Response.json({ error: CLOSE_WHO }, { status: 403 });
+        }
         return Response.json({ error: 'dispute_ids is empty — name the disputes to close, or leave the field out to close every open dispute you may close.' }, { status: 400 });
       }
       const want = new Set(body.dispute_ids.map((x: unknown) => String(x)));
