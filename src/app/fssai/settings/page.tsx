@@ -355,6 +355,13 @@ export default function FssaiSettingsPage() {
               className="inline-flex items-center gap-1.5 text-sm border border-[#E8D5C4] bg-white rounded-lg px-3 py-2 hover:bg-[#FFF1E3]">
               <ClipboardList size={15} /> Compliance dashboard
             </a>
+            {/* The 15 ready-made checklists (incl. the Hyderabad audit) arrive as
+                drafts; staff cannot run any of them until an admin publishes them
+                here, so the way in must not depend on an empty module screen. */}
+            <a href="/fssai/settings/ready-made"
+              className="inline-flex items-center gap-1.5 text-sm border border-[#E8D5C4] bg-white rounded-lg px-3 py-2 hover:bg-[#FFF1E3]">
+              <ListChecks size={15} /> Ready-made checklists — add &amp; publish
+            </a>
           </div>
         </div>
 
