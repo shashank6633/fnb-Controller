@@ -11,7 +11,7 @@ import {
 import { dateClause, deptLabel, fssaiTablesPresent, intOr, intOrBlank, numOrBlank, whereAll, type DateWindow } from './lib';
 import { fssaiPaperInForce } from '../audit-file/lib';
 import {
-  fssaiCurveMembers, fssaiCurveReached, fssaiCurveExpectedShown, fssaiTempDirection,
+  fssaiCurveMembers, fssaiCurveReached, fssaiCurveRule, fssaiCurveExpectedShown, fssaiTempDirection,
   fssaiReadingScheduleValue, fssaiTempVerdictWord, fssaiTempMinutesWords, fssaiNowMinuteIST,
   type FssaiCurveMember,
 } from '../_p4/lib';
@@ -816,9 +816,16 @@ export const FSSAI_REPORTS: FssaiReportDef[] = [
           const members = fssaiCurveMembers(ctx.db, kind, key, true);
           const live = members.filter((m) => m.status !== 'void');
           const start = live[0] || null;
-          const reached = fssaiCurveReached(live, kind);
+          /* THE BATCH'S RULE (fssaiCurveRule), the one the screen's summary and
+           * both overdue jobs judge it on — not its first reading's (closing
+           * round 2, 2026-10-15). Read off the first reading only, a batch begun
+           * before cooling was switched on had no limit and no target here: its
+           * 4 °C read "no reading at the target" while the screen said "reached
+           * in time" and the job raised nothing. */
+          const rule = fssaiCurveRule(ctx.db, kind, live);
+          const reached = fssaiCurveReached(live, kind, rule.goal);
           const breach = live.some((m) => m.is_fail === 1);
-          const limit = start ? start.max_minutes : null;
+          const limit = rule.limit;
           const lastLive = live[live.length - 1] || null;
           /* Past its time with nothing at the target, on the batch's own clock —
            * the same sum fssaiCurveSummary does for the screen. */

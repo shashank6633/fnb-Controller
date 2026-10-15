@@ -921,14 +921,21 @@ export function fssaiCurveKeyOf(db: Database.Database, logKind: string, ref: str
  *                  been filed, even one long finished. A finished newer batch no
  *                  longer hides it; beside one, only a FRESH start goes through.
  *        REACHED — already at its target, within twice its window. A reading
- *                  still at the target joins it; one back past the target that is
- *                  not a fresh start (at or beyond the rule's starting
- *                  temperature) is REFUSED (`after_target`) — same pot warming up
- *                  again (pick it: filed as a failure) or a new pot (say so).
+ *                  still at the target joins it — unless its minutes typed are
+ *                  longer than that batch's clock (beyond the tolerance): an older
+ *                  pot than any on file, which starts its own batch at the minutes
+ *                  typed (closing round 2, 2026-10-15: typed 300 joined a batch
+ *                  that reached in time and passed against a 240 limit). One back
+ *                  past the target that is not a fresh start (at or beyond the
+ *                  rule's starting temperature) is REFUSED (`after_target`),
+ *                  whatever was typed — same pot warming up again (pick it: filed
+ *                  as a failure) or a new pot (say so).
  *      THE MINUTES TYPED ARE NO WAY PAST ANY OF THESE (closing round 2026-10-15).
- *      They tell OPEN batches apart and nothing else: a spanning, stale or reached
- *      batch is weighed whatever was typed. Typing 11 minutes more than a reached
- *      batch's clock took a re-warmed reading out of the check, and it passed.
+ *      They tell OPEN batches apart, and a reading AT a reached batch's target
+ *      from an older pot, and nothing else: a spanning or stale batch, and a
+ *      reached one for a reading back past its target, is weighed whatever was
+ *      typed. Typing 11 minutes more than a reached batch's clock took a re-warmed
+ *      reading out of the check, and it passed.
  *      A post-midnight reading entered under the old date lands BEFORE a batch
  *      begun late that evening: REFUSED (`before_curve_start`, naming the date it
  *      needs) beside an open batch, and — closing round 2026-10-15 — beside a
@@ -1352,14 +1359,29 @@ export function resolveFssaiCurve(
     }
   }
 
-  /* REACHED — the newest batch of the same thing that already got there,
-   * whatever minutes were typed. */
+  /* REACHED — the newest batch of the same thing that already got there. A
+   * reading BACK PAST its target is weighed against it whatever minutes were
+   * typed: typing 11 minutes more than its clock took a re-warmed reading out of
+   * this check, and it passed (closing round 2026-10-15).
+   * A reading still AT the target is told apart by the minutes typed (closing
+   * round 2, 2026-10-15). Minutes typed longer than a reached batch's clock
+   * (beyond FSSAI_CURVE_TYPED_TOLERANCE_MINUTES) say an older pot than any on
+   * file, not that one. Measured: 3 °C typed 300 beside a batch begun at 10:00
+   * that reached 4 °C at 120 minutes joined it and passed "still there", judged
+   * at 300 against a 240 limit, and no job raised it; typed 241 passed the same
+   * way. So at the target it joins the newest reached batch its minutes fit; with
+   * none, it goes on below to a batch of its own, judged at the minutes typed. */
   const reachedNewest = [...reachedRecent].sort(newestFirst);
+  const reachedGoalOf = (c: Cand): number | null => (c.reached as FssaiCurveMember).goal ?? (ruleOf(c.members)?.goal ?? goalNow);
+  const newestReached = reachedNewest[0] || null;
+  const newestGoal = newestReached ? reachedGoalOf(newestReached) : null;
+  const atNewestTarget = !!newestReached && value !== null && newestGoal !== null && !backPast(value, newestGoal);
+  const pickedReached = atNewestTarget ? (reachedNewest.filter(fits)[0] || null) : newestReached;
   let note = '';
-  if (reachedNewest.length) {
-    const R = reachedNewest[0];
+  if (pickedReached) {
+    const R = pickedReached;
     const reachedM = R.reached as FssaiCurveMember;
-    const goal = reachedM.goal ?? (ruleOf(R.members)?.goal ?? goalNow);
+    const goal = reachedGoalOf(R);
     if (value !== null && goal !== null) {
       const atTarget = !backPast(value, goal);
       if (atTarget) return join(R.members, R.key, 'Added to the batch of the same thing, which has already reached its target', false);

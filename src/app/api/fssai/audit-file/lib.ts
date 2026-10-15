@@ -1633,19 +1633,81 @@ function handlerRecord(ctx: Ctx, key: 'medical' | 'training'): Part {
     const list = [...expiring.map((h) => ({ h, c: h.coverage[key] })), ...supExpiring.map((h) => ({ h, c: h.coverage.fostac }))];
     problems.push(`Expiring soon: ${list.map(({ h, c }) => `${handlerName(h)} (${c.label}, ${c.best?.expiry_date || ''})`).join('; ')}. Renew before then.`);
   }
+
+  // THE CERTIFICATES THEMSELVES, with whose they are — the copies an inspector
+  // reads. A row with no live scan is a gap, so not in the handover. Read
+  // FIRST: they carry the ONE per-person verdict (readDocs → ctx.paper →
+  // fssaiPersonPapersInOrder), and the register, the "In order" count, the
+  // FoSTaC box and "Next to lapse" below go into the inspector's copy only on
+  // a paper these rows hand over — so the copy never names, counts or dates a
+  // person whose certificate it holds back (a holder not in order).
+  const docs = readDocs(ctx, docTypes);
+  const holderOf = (d: DocRow) => d.holder || '(nobody named)';
+  const certRows = docRows(docs, holderOf);
+  /** 'document:<id>' | 'hrms:<id>' — every paper whose row goes into the inspector's copy. */
+  const handedKeys = new Set<string>(docs.filter((d) => d.in_order).map((d) => `document:${d.id}`));
+  // An HRMS training completion mapped on the Food Handlers page IS the record
+  // of the training — there is no scan to lose. It goes into the inspector's
+  // copy on the same rule as a filed certificate: only when the food-handler
+  // record judges it in order (fssaiPersonPapersInOrder) — an EXPIRED one, or
+  // an undated one counted as a FoSTaC certificate, never.
+  if (!isMed) {
+    const papers = fssaiPersonPapersInOrder(cov);
+    for (const h of active) {
+      for (const e of h.coverage.training.evidence.filter((x) => x.source === 'hrms')) {
+        const v = papers.get(`hrms:${e.id}`);
+        const ok = !!v?.in_order;
+        if (ok) handedKeys.add(`hrms:${e.id}`);
+        certRows.push(row([
+          `${handlerName(h)} — ${e.title || e.type_label}`, 'HRMS', 'HRMS training record', e.issued_on, e.expiry_date || '—',
+          ok ? STATE_WORDS[e.state] : (v?.words || STATE_WORDS[e.state]), 'HRMS record',
+        ], HANDLERS_LINK.href, !ok ? 'bad' : e.state === 'expiring' ? 'warn' : '', ok));
+      }
+    }
+  }
+  type Req = FssaiFoodHandlerWithCoverage['coverage'][FssaiHandlerRequirementKey];
+  /** The requirement rests on a paper the inspector's copy hands over. */
+  const handed = (c: Req): boolean => c.in_order && !!c.best && handedKeys.has(`${c.best.source}:${c.best.id}`);
+  /** The people this record's register lists: its food handlers, and (record 7) the FoSTaC supervisors. */
+  const regPeople = active.filter((h) => h.coverage[key].required || (!isMed && h.coverage.fostac.required));
+  /** Every certificate the register prints for this person is in the copy. */
+  const personHanded = (h: FssaiFoodHandlerWithCoverage): boolean =>
+    (!h.coverage[key].required || handed(h.coverage[key])) && (isMed || !h.coverage.fostac.required || handed(h.coverage.fostac));
+  /**
+   * In order for THIS record, but held back from the inspector's copy: the
+   * person is not in order on another requirement (a holder not in order), or
+   * the paper it rests on is the one another requirement of theirs fails.
+   */
+  const heldBack = regPeople.filter((h) => {
+    const c = h.coverage[key];
+    const f = h.coverage.fostac;
+    return (c.required && c.in_order && !handed(c)) || (!isMed && f.required && f.in_order && !handed(f));
+  });
+  if (heldBack.length) {
+    // The reason, for the page and the management copy (never the handover).
+    problems.push(
+      `Left out of the inspector's copy, because the person is not in order: ` +
+      `${heldBack.map((h) => `${handlerName(h)} — ${h.problems.join(', ') || 'a certificate is not in order'}`).join('; ')}. ` +
+      'The copy never names a person who is not in order.',
+    );
+  }
+
   const lapses = needed.map((h) => h.coverage[key]).filter((c) => c.in_order && c.best?.expiry_date).map((c) => c.best!.expiry_date);
   if (!isMed) for (const h of active) if (h.coverage.fostac.in_order && h.coverage.fostac.best?.expiry_date) lapses.push(h.coverage.fostac.best.expiry_date);
   // The handover's "Next to lapse" names a date on a certificate the copy
-  // prints — only a person in order has theirs handed over
-  // (fssaiPersonPapersInOrder), so a lapse date of anyone else's is
-  // management's, like the person.
+  // prints — only one these rows hand over, so a lapse date of anyone held
+  // back is management's, like the person.
   const handedLapses = [
-    ...needed.filter((h) => h.in_order).map((h) => h.coverage[key]).filter((c) => c.in_order && c.best?.expiry_date).map((c) => c.best!.expiry_date),
-    ...(isMed ? [] : active.filter((h) => h.in_order && h.coverage.fostac.in_order && h.coverage.fostac.best?.expiry_date).map((h) => h.coverage.fostac.best!.expiry_date)),
+    ...needed.map((h) => h.coverage[key]).filter((c) => handed(c) && c.best?.expiry_date).map((c) => c.best!.expiry_date),
+    ...(isMed ? [] : active.map((h) => h.coverage.fostac).filter((f) => f.required && handed(f) && f.best?.expiry_date).map((f) => f.best!.expiry_date)),
   ];
   const handedLapse = earliest(handedLapses);
 
   const inOrder = needed.filter((h) => h.coverage[key].in_order).length;
+  /** "In order" as the inspector's copy can show it: a paper of theirs handed over. */
+  const handedIn = needed.filter((h) => handed(h.coverage[key])).length;
+  /** FoSTaC supervisors whose FoSTaC certificate the copy hands over. */
+  const supHanded = isMed ? 0 : active.filter((h) => h.coverage.fostac.required && handed(h.coverage.fostac)).length;
   p.status = status;
   p.problems = problems;
   p.lapses_on = earliest(lapses);
@@ -1657,15 +1719,20 @@ function handlerRecord(ctx: Ctx, key: 'medical' | 'training'): Part {
   // order" beside "3 food handlers" says two are not, on paper handed over.
   // So is the head-count itself while the roster is incomplete: "3 food
   // handlers" over the certificates of one says the other two have none.
-  const gapIn = inOrder < needed.length;
-  const complete = needed.length > 0 && !notIn.length && !fostacBad;
+  // Both are judged on the papers the copy hands over (handed), so a person
+  // held back is never counted in it either.
+  const gapIn = handedIn < needed.length;
+  const complete = needed.length > 0 && !notIn.length && !fostacBad && regPeople.every(personHanded);
   p.summary = [
     complete ? { label: 'Food handlers', value: String(needed.length) } : { label: 'Food handlers', value: String(needed.length), mgmt: true as const },
-    gapIn ? { label: 'In order', value: String(inOrder), mgmt: true as const } : { label: 'In order', value: String(inOrder) },
+    gapIn ? { label: 'In order', value: String(inOrder), mgmt: true as const } : { label: 'In order', value: String(handedIn) },
     { label: 'Not in order', value: String(notIn.length), mgmt: true },
+    ...(heldBack.length ? [{ label: 'Held back', value: String(heldBack.length), mgmt: true as const }] : []),
     ...(isMed ? [] : [fostacBad
       ? { label: 'FoSTaC supervisors', value: `${cov.fostac.certified} of ${cov.fostac.required} needed`, mgmt: true as const }
-      : { label: 'FoSTaC supervisors', value: `${cov.fostac.certified} certified (${cov.fostac.required} needed)` }]),
+      : supHanded >= cov.fostac.required
+        ? { label: 'FoSTaC supervisors', value: `${supHanded} certified (${cov.fostac.required} needed)` }
+        : { label: 'FoSTaC supervisors', value: `${cov.fostac.certified} certified (${cov.fostac.required} needed)`, mgmt: true as const }]),
     handedLapse
       ? { label: 'Next to lapse', value: handedLapse }
       : { label: 'Next to lapse', value: p.lapses_on || '—', mgmt: true as const },
@@ -1675,11 +1742,12 @@ function handlerRecord(ctx: Ctx, key: 'medical' | 'training'): Part {
   ];
 
   // THE REGISTER, one line per person. It goes into the inspector's copy only
-  // when EVERY food handler on it is in order — a partial roster under the
-  // heading "food handlers" would read as the whole staff (§7 Q11, and the
-  // owner's "never imply a complete file").
-  const regRows = active
-    .filter((h) => h.coverage[key].required || (!isMed && h.coverage.fostac.required))
+  // when EVERY person on it is in order AND has every certificate it prints
+  // handed over (personHanded, the certificate rows' own verdict) — a partial
+  // roster under the heading "food handlers" would read as the whole staff
+  // (§7 Q11, and the owner's "never imply a complete file"), and a line for a
+  // person whose certificate the copy holds back names who is not in order.
+  const regRows = regPeople
     .map((h) => {
       const c = h.coverage[key];
       const f = h.coverage.fostac;
@@ -1692,30 +1760,6 @@ function handlerRecord(ctx: Ctx, key: 'medical' | 'training'): Part {
         ...(isMed ? [] : [f.required ? verdictCell(f) : '—']),
       ], HANDLERS_LINK.href, bad ? 'bad' : warn ? 'warn' : '', complete);
     });
-
-  // THE CERTIFICATES THEMSELVES, with whose they are — the copies an inspector
-  // reads. A row with no live scan is a gap, so not in the handover.
-  const docs = readDocs(ctx, docTypes);
-  const holderOf = (d: DocRow) => d.holder || '(nobody named)';
-  const certRows = docRows(docs, holderOf);
-  // An HRMS training completion mapped on the Food Handlers page IS the record
-  // of the training — there is no scan to lose. It goes into the inspector's
-  // copy on the same rule as a filed certificate: only when the food-handler
-  // record judges it in order (fssaiPersonPapersInOrder) — an EXPIRED one, or
-  // an undated one counted as a FoSTaC certificate, never.
-  if (!isMed) {
-    const papers = fssaiPersonPapersInOrder(cov);
-    for (const h of active) {
-      for (const e of h.coverage.training.evidence.filter((x) => x.source === 'hrms')) {
-        const v = papers.get(`hrms:${e.id}`);
-        const ok = !!v?.in_order;
-        certRows.push(row([
-          `${handlerName(h)} — ${e.title || e.type_label}`, 'HRMS', 'HRMS training record', e.issued_on, e.expiry_date || '—',
-          ok ? STATE_WORDS[e.state] : (v?.words || STATE_WORDS[e.state]), 'HRMS record',
-        ], HANDLERS_LINK.href, !ok ? 'bad' : e.state === 'expiring' ? 'warn' : '', ok));
-      }
-    }
-  }
 
   p.tables = [
     table('Food handlers on the register', [
