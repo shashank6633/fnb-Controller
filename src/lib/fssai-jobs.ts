@@ -15,12 +15,17 @@
  *      so "nobody was told" and "we hold no number for them" are different rows.
  *      Nothing here configures WhatsApp or writes a credential.
  *
- *   5. AN ABANDONED OR OVERDUE COOLING BATCH IS ESCALATED — runFssaiCoolingOverdueJob.
+ *   5. AN ABANDONED OR OVERDUE COOLING — OR REHEATING — BATCH IS ESCALATED —
+ *      runFssaiCoolingOverdueJob / runFssaiReheatingOverdueJob (one engine,
+ *      runFssaiCurveOverdueJob; job keys 'cooling_overdue' / 'reheating_overdue').
  *      A batch whose time limit has passed with no reading at the target used to
  *      sit as "overdue" on a screen nobody opened. Now, once the window plus a
  *      short grace has passed, it raises ONE corrective action and rings the
  *      bell of the people who recorded it and their department's head — claimed
- *      once per batch on fssai_job_notices' UNIQUE index.
+ *      once per batch on fssai_job_notices' UNIQUE index. A batch whose first
+ *      reading at the target came AFTER the time allowed is raised too
+ *      (2026-10-15: it used to count as reached). Reheating had no job at all
+ *      until 2026-10-15.
  *
  *   6. OWNER RULING Q19 — applyFssaiOwnerRulings. The leftover test checklist
  *      ZZ-P2B-COLDROOM is deleted from any database this app runs on, only while
@@ -1201,7 +1206,7 @@ export async function runFssaiMissedCheckWhatsApp(
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
- * 4. AN ABANDONED OR OVERDUE COOLING BATCH — raise it, once
+ * 4. AN ABANDONED OR OVERDUE COOLING — OR REHEATING — BATCH: raise it, once
  * ════════════════════════════════════════════════════════════════════════ */
 
 /**
@@ -1212,7 +1217,8 @@ export async function runFssaiMissedCheckWhatsApp(
  * abandoned. Thirty minutes is long enough for a late entry and short enough
  * that the food is still in front of somebody. ASSUMPTION, REVERSIBLE: one line.
  * A reading at the target typed AFTER the action was raised does not withdraw
- * it — a manager closes it with that reading as the note.
+ * it — a manager closes it with that reading as the note. Reheating uses the
+ * same grace.
  */
 export const FSSAI_COOLING_OVERDUE_GRACE_MINUTES = 30;
 
@@ -1221,6 +1227,19 @@ export const FSSAI_COOLING_OVERDUE_LOOKBACK_DAYS = 2;
 
 /** Severity of the action an abandoned batch raises — 'urgent' = due the same day. */
 export const FSSAI_COOLING_OVERDUE_SEVERITY = 'urgent';
+
+/**
+ * THE TWO CLOCK-JUDGED KINDS, AND THE JOB EACH ONE HAS (2026-10-15).
+ * Only cooling was escalated; an abandoned REHEATING batch (20 °C at 07:00 and
+ * never followed up) read "overdue" on the temperature screen and raised nothing
+ * — no corrective action, no notice, no bell. Reheating now runs the same job
+ * under its own job_key, so the two claims can never collide.
+ */
+export const FSSAI_CURVE_OVERDUE_JOBS = {
+  cooling: { job_key: 'cooling_overdue', notice_kind: 'fssai_cooling_overdue', label: 'Cooling', actor: 'Cooling overdue check' },
+  reheating: { job_key: 'reheating_overdue', notice_kind: 'fssai_reheating_overdue', label: 'Reheating', actor: 'Reheating overdue check' },
+} as const;
+export type FssaiCurveOverdueKind = keyof typeof FSSAI_CURVE_OVERDUE_JOBS;
 
 export interface FssaiCoolingOverdueItem {
   curve_key: string;
@@ -1235,6 +1254,9 @@ export interface FssaiCoolingOverdueItem {
   elapsed_now: number;
   /** IST 'YYYY-MM-DD HH:MM' at which the time limit ran out. */
   window_ended_at: string;
+  /** 'overdue' = no reading at the target; 'reached_late' = the first reading at
+   *  the target came after the time allowed, and nothing raised an action for it. */
+  why: 'overdue' | 'reached_late';
   /** Actions already raised against single readings on this batch (behind schedule). */
   earlier_actions: string[];
   ca_id: string;
@@ -1246,12 +1268,19 @@ export interface FssaiCoolingOverdueItem {
 }
 
 export interface FssaiCoolingOverdueResult {
+  /** Which kind of batch this pass looked at, and the job key its claims use. */
+  log_kind: FssaiCurveOverdueKind;
+  job_key: string;
   outcome: 'none_overdue' | 'raised' | 'already_raised' | 'not_ready' | 'failed';
   /** IST instant this pass judged "now" by. */
   now_ist: string;
   scanned_curves: number;
   in_progress: number;
+  /** Reached the target WITHIN the time allowed. */
   reached: number;
+  /** Reached the target only after the time allowed (2026-10-15: these used to
+   *  count as `reached` and were never escalated). */
+  reached_late: number;
   /** No time limit or no target frozen on the first reading — nothing can be overdue. */
   unjudged: number;
   /** A reading taken AFTER the limit was filed and failed — that reading already raised its own action. */
@@ -1272,19 +1301,41 @@ function clockMinuteWords(minute: number): string {
 }
 
 /**
- * RAISE EVERY COOLING BATCH WHOSE TIME RAN OUT WITHOUT A READING AT THE TARGET.
+ * RAISE EVERY COOLING BATCH WHOSE TIME RAN OUT WITHOUT A READING AT THE TARGET
+ * IN TIME. The cooling half of runFssaiCurveOverdueJob (job_key 'cooling_overdue').
+ */
+export function runFssaiCoolingOverdueJob(db: Db, opts: { now?: Date } = {}): FssaiCoolingOverdueResult {
+  return runFssaiCurveOverdueJob(db, 'cooling', opts);
+}
+
+/**
+ * THE SAME FOR REHEATING (job_key 'reheating_overdue'): a batch that never
+ * reached its target (75 °C on the suggested rule) within the time allowed.
+ */
+export function runFssaiReheatingOverdueJob(db: Db, opts: { now?: Date } = {}): FssaiCoolingOverdueResult {
+  return runFssaiCurveOverdueJob(db, 'reheating', opts);
+}
+
+/**
+ * RAISE EVERY BATCH OF ONE CLOCK-JUDGED KIND WHOSE TIME RAN OUT WITHOUT A
+ * READING AT THE TARGET IN TIME.
  *
  * Reads the batches exactly as the temperature screen does — fssaiCurveMembers
  * (the one membership rule), fssaiCurveReached (the one "got there" rule), the
  * FROZEN goal and time limit on the batch's first reading, minutes counted on
- * fssaiClockMinute's clock — so this job and the cooling sheet cannot disagree
- * about which batch is overdue.
+ * fssaiClockMinute's clock — so this job and the sheet cannot disagree about
+ * which batch is overdue.
  *
  * A BATCH IS RAISED WHEN ALL OF:
  *   · its first live reading carries a time limit and a target (otherwise it
  *     was never judged on the clock — counted as `unjudged`, not raised);
- *   · no live reading on it is at or below the target;
- *   · the time limit plus FSSAI_COOLING_OVERDUE_GRACE_MINUTES has passed;
+ *   · EITHER no live reading on it is at the target and the time limit plus
+ *     FSSAI_COOLING_OVERDUE_GRACE_MINUTES has passed ('overdue'),
+ *     OR its first reading at the target came after the time limit
+ *     ('reached_late' — 2026-10-15: these were counted as reached and never
+ *     raised; the temperature route now fails such a reading itself, so this
+ *     catches the ones filed before that, and any whose action was never
+ *     written);
  *   · no reading taken AFTER the limit failed AND carries its own corrective
  *     action — the temperature route already judged that one a breach and
  *     raised an action for it, and a second one for the same fact would
@@ -1292,7 +1343,7 @@ function clockMinuteWords(minute: number): string {
  *     never written (the route raises best-effort) does NOT cover the batch.
  *
  * WHAT IT WRITES, IN ONE TRANSACTION PER BATCH:
- *   1. THE CLAIM — fssai_job_notices (cooling_overdue, curve key, 'ca', '').
+ *   1. THE CLAIM — fssai_job_notices (job_key, curve key, 'ca', '').
  *      INSERT OR IGNORE; changes === 1 means this pass owns the batch. Never
  *      raised twice, whatever ticks, workers or restarts follow.
  *   2. ONE corrective action (source_kind 'temperature', response_id = the
@@ -1308,12 +1359,20 @@ function clockMinuteWords(minute: number): string {
  * If any of it throws, all of it rolls back and the next tick tries again.
  * No filed reading is changed.
  */
-export function runFssaiCoolingOverdueJob(db: Db, opts: { now?: Date } = {}): FssaiCoolingOverdueResult {
+export function runFssaiCurveOverdueJob(
+  db: Db,
+  logKind: FssaiCurveOverdueKind,
+  opts: { now?: Date } = {},
+): FssaiCoolingOverdueResult {
+  const meta = FSSAI_CURVE_OVERDUE_JOBS[logKind];
+  const hot = logKind === 'reheating';
+  const lower = meta.label.toLowerCase();
   const now = opts.now ?? new Date();
   const today = fssaiToday(now);
   const hhmm = istHHMMOf(now);
   const res: FssaiCoolingOverdueResult = {
-    outcome: 'none_overdue', now_ist: `${today} ${hhmm}`, scanned_curves: 0, in_progress: 0, reached: 0,
+    log_kind: logKind, job_key: meta.job_key,
+    outcome: 'none_overdue', now_ist: `${today} ${hhmm}`, scanned_curves: 0, in_progress: 0, reached: 0, reached_late: 0,
     unjudged: 0, covered_by_reading: 0, overdue: 0, raised: 0, already_raised: 0, people_told: 0,
     bell: 'on', items: [], errors: [], detail: '',
   };
@@ -1338,31 +1397,36 @@ export function runFssaiCoolingOverdueJob(db: Db, opts: { now?: Date } = {}): Fs
     const keys = db.prepare(
       `SELECT DISTINCT CASE WHEN batch_id <> '' THEN batch_id ELSE id END AS k
          FROM fssai_temperature_logs
-        WHERE log_kind = 'cooling' AND status <> 'void'
+        WHERE log_kind = ? AND status <> 'void'
           AND business_date >= ? AND business_date <= ?`,
-    ).all(addDaysISO(today, -FSSAI_COOLING_OVERDUE_LOOKBACK_DAYS), today) as any[];
+    ).all(logKind, addDaysISO(today, -FSSAI_COOLING_OVERDUE_LOOKBACK_DAYS), today) as any[];
 
     const pushes: { email: string; title: string; body: string }[] = [];
     for (const { k } of keys) {
       const key = String(k || '');
       if (!key) continue;
-      const members = fssaiCurveMembers(db, 'cooling', key);
+      const members = fssaiCurveMembers(db, logKind, key);
       if (!members.length) continue;
       res.scanned_curves += 1;
       const start = members[0];
       const limit = start.max_minutes;
       const goal = start.goal;
       if (start.minute === null || limit === null || !(limit > 0) || goal === null) { res.unjudged += 1; continue; }
-      if (fssaiCurveReached(members, 'cooling')) { res.reached += 1; continue; }
+      const reachedM = fssaiCurveReached(members, logKind);
+      const reachedLate = !!reachedM && !(reachedM.elapsed !== null && reachedM.elapsed <= limit);
+      if (reachedM && !reachedLate) { res.reached += 1; continue; }
       const elapsedNow = (start.elapsed ?? 0) + (nowMinute - start.minute);
-      if (!(elapsedNow > limit + FSSAI_COOLING_OVERDUE_GRACE_MINUTES)) { res.in_progress += 1; continue; }
+      if (!reachedLate && !(elapsedNow > limit + FSSAI_COOLING_OVERDUE_GRACE_MINUTES)) { res.in_progress += 1; continue; }
+      if (reachedLate) res.reached_late += 1;
       /* COVERED only when a reading taken AFTER the limit failed AND that reading
        * really carries its corrective action. The route raises it best-effort
        * (raiseFssaiRecordCa: "a failure to raise cannot roll back the record"), so
        * a late failed reading whose action never got written would otherwise
        * leave an abandoned batch with NO action at all — the very gap this job
-       * closes. The action's existence is read, not assumed from is_fail. */
-      const lateFails = members.filter((m) => m.is_fail === 1 && m.elapsed !== null && m.elapsed > (m.max_minutes ?? limit));
+       * closes. The action's existence is read, not assumed from is_fail. Every
+       * late reading is judged against the BATCH's limit (frozen on its first
+       * reading), never a later rule's. */
+      const lateFails = members.filter((m) => m.is_fail === 1 && m.elapsed !== null && m.elapsed > limit);
       if (lateFails.length) {
         const ph0 = lateFails.map(() => '?').join(',');
         const carried = Number((db.prepare(
@@ -1400,35 +1464,46 @@ export function runFssaiCoolingOverdueJob(db: Db, opts: { now?: Date } = {}): Fs
       const recipients = [...new Set([...recorders, ...heads, ...(heads.length ? [] : managementTier(db))])];
 
       const u = start.uom === 'C' || start.uom === 'F' ? ` °${start.uom}` : ` ${start.uom}`;
+      const side = hot ? 'at or above' : 'at or below';
       const endMinute = start.minute + (limit - (start.elapsed ?? 0));
       const item: FssaiCoolingOverdueItem = {
         curve_key: key, label, department_id: dept, outlet_id: String(first.outlet_id || ''),
         start: { id: start.id, business_date: start.business_date, reading_at: start.reading_at, value: start.value, elapsed: start.elapsed },
         last: { id: last.id, business_date: last.business_date, reading_at: last.reading_at, value: last.value, elapsed: last.elapsed },
         goal, max_minutes: limit, uom: start.uom, elapsed_now: elapsedNow,
-        window_ended_at: clockMinuteWords(endMinute), earlier_actions: earlier,
+        window_ended_at: clockMinuteWords(endMinute), why: reachedLate ? 'reached_late' : 'overdue', earlier_actions: earlier,
         ca_id: '', ca_number: '', recipients, people_told: 0, raised: false,
       };
-      const title = `Cooling not finished in time — ${label}`.slice(0, 300);
+      const title = (reachedLate
+        ? `${meta.label} reached its target late — ${label}`
+        : `${meta.label} not finished in time — ${label}`).slice(0, 300);
       const description = [
-        `This cooling batch passed its time limit without a reading at the target.`,
+        reachedLate
+          ? `This ${lower} batch did not reach its target within the time allowed.`
+          : `This ${lower} batch passed its time limit without a reading at the target.`,
         `It started at ${start.value ?? '?'}${u} at ${start.reading_at} on ${start.business_date}${where ? ` (${where})` : ''}; the rule allows ${limit} minutes to reach ${goal}${u}, so its time ran out at ${item.window_ended_at.slice(11)} on ${item.window_ended_at.slice(0, 10)}.`,
-        members.length > 1
-          ? `The last reading on it was ${last.value ?? '?'}${u} at ${last.reading_at} (${last.elapsed ?? '?'} minutes in), ${members.length} reading(s) in all.`
-          : 'Only the first reading was ever taken.',
-        `No reading at or below ${goal}${u} has been recorded, ${elapsedNow} minutes after it began.`,
+        reachedLate && reachedM
+          ? `The first reading ${side} ${goal}${u} was ${reachedM.value ?? '?'}${u} at ${reachedM.reading_at}, ${reachedM.elapsed ?? '?'} minutes in — after the ${limit} allowed.`
+          : (members.length > 1
+            ? `The last reading on it was ${last.value ?? '?'}${u} at ${last.reading_at} (${last.elapsed ?? '?'} minutes in), ${members.length} reading(s) in all.`
+            : 'Only the first reading was ever taken.'),
+        reachedLate ? '' : `No reading ${side} ${goal}${u} has been recorded, ${elapsedNow} minutes after it began.`,
         earlier.length ? `Already raised against single readings on this batch: ${earlier.join(', ')}.` : '',
-        `Decide today what happened to this food and record it: if it was discarded, say so; if it is still held, it is not safe to use until a reading at the target is on file.`,
+        hot
+          ? `Decide today what happened to this food and record it: reheated food that did not reach ${goal}${u} in time is not to be served or held; if it was discarded, say so.`
+          : `Decide today what happened to this food and record it: if it was discarded, say so; if it is still held, it is not safe to use until a reading at the target is on file.`,
       ].filter(Boolean).join(' ');
-      const bellTitle = `Cooling not finished in time — ${label}`;
+      const bellTitle = title;
 
       const raise = db.transaction(() => {
         const claimId = generateId();
         const claimed = db.prepare(
           `INSERT OR IGNORE INTO fssai_job_notices
              (id, job_key, subject_key, channel, recipient_email, status, ref_table, detail, outlet_id)
-           VALUES (?, 'cooling_overdue', ?, 'ca', '', 'raised', 'fssai_corrective_actions', ?, ?)`,
-        ).run(claimId, key, `Raised ${elapsedNow} minutes into a ${limit}-minute window with no reading at ${goal}${u}.`, item.outlet_id);
+           VALUES (?, ?, ?, 'ca', '', 'raised', 'fssai_corrective_actions', ?, ?)`,
+        ).run(claimId, meta.job_key, key, reachedLate
+          ? `Raised: the first reading at ${goal}${u} came ${reachedM?.elapsed ?? '?'} minutes in, past the ${limit}-minute window.`
+          : `Raised ${elapsedNow} minutes into a ${limit}-minute window with no reading at ${goal}${u}.`, item.outlet_id);
         if (claimed.changes !== 1) return null;
 
         const caId = generateId();
@@ -1452,12 +1527,16 @@ export function runFssaiCoolingOverdueJob(db: Db, opts: { now?: Date } = {}): Fs
           entity_table: 'fssai_corrective_actions', entity_id: caId, action: 'create',
           after: {
             ca_number: caNumber, source_kind: 'temperature', source_table: 'fssai_temperature_logs',
+            job_key: meta.job_key, log_kind: logKind, why: item.why,
             curve_key: key, start_reading_id: start.id, last_reading_id: last.id,
+            reached_reading_id: reachedLate && reachedM ? reachedM.id : '',
             severity: FSSAI_COOLING_OVERDUE_SEVERITY, status: 'open', title,
             goal, max_minutes: limit, elapsed_now: elapsedNow, window_ended_at: item.window_ended_at,
           },
-          reason: `Raised automatically: this cooling batch passed its ${limit}-minute limit (plus ${FSSAI_COOLING_OVERDUE_GRACE_MINUTES} minutes' grace) without a reading at ${goal}${u}.`,
-          actor: { email: 'system', name: 'Cooling overdue check' },
+          reason: reachedLate
+            ? `Raised automatically: this ${lower} batch first reached ${goal}${u} after its ${limit}-minute limit.`
+            : `Raised automatically: this ${lower} batch passed its ${limit}-minute limit (plus ${FSSAI_COOLING_OVERDUE_GRACE_MINUTES} minutes' grace) without a reading at ${goal}${u}.`,
+          actor: { email: 'system', name: meta.actor },
           outlet_id: item.outlet_id,
         });
 
@@ -1465,21 +1544,21 @@ export function runFssaiCoolingOverdueJob(db: Db, opts: { now?: Date } = {}): Fs
         const bellClaim = db.prepare(
           `INSERT OR IGNORE INTO fssai_job_notices
              (id, job_key, subject_key, channel, recipient_email, status, skip_reason, ref_table, ref_id, detail, outlet_id)
-           VALUES (?, 'cooling_overdue', ?, 'bell', ?, ?, ?, 'fssai_corrective_actions', ?, ?, ?)`,
+           VALUES (?, ?, ?, 'bell', ?, ?, ?, 'fssai_corrective_actions', ?, ?, ?)`,
         );
         const bell = db.prepare(
           `INSERT INTO task_notifications (id, recipient_email, kind, title, body, task_id, href)
-           VALUES (?, ?, 'fssai_cooling_overdue', ?, ?, '', '/fssai/corrective-actions')`,
+           VALUES (?, ?, ?, ?, ?, '', '/fssai/corrective-actions')`,
         );
         const body = `${caNumber}: ${description}`;
         for (const email of recipients) {
           const c = bellClaim.run(
-            generateId(), key, email, bellOn ? 'sent' : 'skipped', bellOn ? '' : 'disabled', caId,
+            generateId(), meta.job_key, key, email, bellOn ? 'sent' : 'skipped', bellOn ? '' : 'disabled', caId,
             bellOn ? '' : 'Chasing is switched off on the Chasing panel; the action was raised, nobody was rung.',
             item.outlet_id,
           );
           if (c.changes !== 1 || !bellOn) continue;
-          bell.run(generateId(), email, bellTitle, body);
+          bell.run(generateId(), email, meta.notice_kind, bellTitle, body);
           told += 1;
           pushes.push({ email, title: bellTitle, body });
         }
@@ -1493,8 +1572,8 @@ export function runFssaiCoolingOverdueJob(db: Db, opts: { now?: Date } = {}): Fs
           const prior = db.prepare(
             `SELECT n.ref_id, IFNULL(ca.ca_number, '') AS ca_number FROM fssai_job_notices n
                LEFT JOIN fssai_corrective_actions ca ON ca.id = n.ref_id
-              WHERE n.job_key = 'cooling_overdue' AND n.subject_key = ? AND n.channel = 'ca' AND n.recipient_email = ''`,
-          ).get(key) as any;
+              WHERE n.job_key = ? AND n.subject_key = ? AND n.channel = 'ca' AND n.recipient_email = ''`,
+          ).get(meta.job_key, key) as any;
           item.ca_id = String(prior?.ref_id || '');
           item.ca_number = String(prior?.ca_number || '');
         } else {
@@ -1507,7 +1586,7 @@ export function runFssaiCoolingOverdueJob(db: Db, opts: { now?: Date } = {}): Fs
         }
       } catch (e: any) {
         res.errors.push(`${key}: ${e?.message || e}`);
-        console.error(`[fssai-jobs] cooling overdue: batch ${key} could not be raised (rolled back, retried next tick):`, e?.message);
+        console.error(`[fssai-jobs] ${lower} overdue: batch ${key} could not be raised (rolled back, retried next tick):`, e?.message);
       }
       res.items.push(item);
     }
@@ -1521,7 +1600,7 @@ export function runFssaiCoolingOverdueJob(db: Db, opts: { now?: Date } = {}): Fs
   } catch (e: any) {
     res.outcome = 'failed';
     res.errors.push(String(e?.message || e));
-    res.detail = `The cooling overdue check failed: ${e?.message || e}`;
+    res.detail = `The ${lower} overdue check failed: ${e?.message || e}`;
     console.error(`[fssai-jobs] ${res.detail}`);
     return res;
   }
@@ -1531,9 +1610,9 @@ export function runFssaiCoolingOverdueJob(db: Db, opts: { now?: Date } = {}): Fs
       : res.already_raised ? 'already_raised'
         : 'none_overdue';
   res.detail = res.raised
-    ? `${res.raised} cooling batch(es) raised as corrective actions; ${res.people_told} person(s) told.`
+    ? `${res.raised} ${lower} batch(es) raised as corrective actions; ${res.people_told} person(s) told.`
     : res.errors.length ? `${res.errors.length} batch(es) could not be raised: ${res.errors.slice(0, 3).join('; ')}`
-      : `${res.scanned_curves} batch(es) looked at; none newly overdue.`;
+      : `${res.scanned_curves} ${lower} batch(es) looked at; none newly overdue.`;
   return res;
 }
 
@@ -1688,6 +1767,8 @@ export interface FssaiJobsAuditSummary {
     whatsapp: { ready: boolean; skip_reason: FssaiJobSkipReason; blockers: string[] };
   };
   cooling_overdue: FssaiCoolingOverdueSummaryRow[];
+  /** Abandoned REHEATING batches the job raised (job_key 'reheating_overdue'). */
+  reheating_overdue: FssaiCoolingOverdueSummaryRow[];
   retention: {
     /** Owner ruling Q22, word for word. */
     ruling: string;
@@ -1738,6 +1819,7 @@ export function fssaiJobsAuditSummary(
     driver: { last_tick_at: '', minutes_since: null, alive: false, words: '' },
     missed_checks: { days: [], whatsapp: { ready: false, skip_reason: '', blockers: [] } },
     cooling_overdue: [],
+    reheating_overdue: [],
     retention: {
       ruling: FSSAI_Q22_RULING,
       swept_stores: [...FSSAI_RETENTION_SWEPT_STORES].filter((s) => !(FSSAI_RETENTION_NEVER_SWEPT_STORES as readonly string[]).includes(s)),
@@ -1832,8 +1914,8 @@ export function fssaiJobsAuditSummary(
     out.missed_checks.whatsapp = { ready: r.ready, skip_reason: r.skip_reason, blockers: r.blockers };
   } catch (e: any) { out.unreadable.push(`whatsapp readiness: ${e?.message || e}`); }
 
-  // ── abandoned cooling batches the job raised
-  try {
+  // ── abandoned cooling (and reheating) batches the job raised
+  for (const [jobKey, sink] of [['cooling_overdue', out.cooling_overdue], ['reheating_overdue', out.reheating_overdue]] as const) try {
     if (tableExists(db, 'fssai_job_notices') && tableExists(db, 'fssai_corrective_actions')) {
       const rows = db.prepare(
         `SELECT n.subject_key, n.created_at, n.ref_id,
@@ -1841,18 +1923,18 @@ export function fssaiJobsAuditSummary(
                 IFNULL(ca.title, '') AS ca_title, IFNULL(ca.severity, '') AS severity, IFNULL(ca.due_date, '') AS due_date
            FROM fssai_job_notices n
            LEFT JOIN fssai_corrective_actions ca ON ca.id = n.ref_id
-          WHERE n.job_key = 'cooling_overdue' AND n.channel = 'ca'
+          WHERE n.job_key = ? AND n.channel = 'ca'
             AND date(n.created_at, '+330 minutes') >= ? AND date(n.created_at, '+330 minutes') <= ?
           ORDER BY n.created_at DESC, n.rowid DESC`,
-      ).all(since, until) as any[];
+      ).all(jobKey, since, until) as any[];
       const bells = db.prepare(
         `SELECT SUM(CASE WHEN status = 'sent' THEN 1 ELSE 0 END) AS rung,
                 SUM(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END) AS skipped
-           FROM fssai_job_notices WHERE job_key = 'cooling_overdue' AND channel = 'bell' AND subject_key = ?`,
+           FROM fssai_job_notices WHERE job_key = ? AND channel = 'bell' AND subject_key = ?`,
       );
       for (const r of rows) {
-        const b = bells.get(String(r.subject_key || '')) as any;
-        out.cooling_overdue.push({
+        const b = bells.get(jobKey, String(r.subject_key || '')) as any;
+        sink.push({
           curve_key: String(r.subject_key || ''), raised_at: istStamp(r.created_at),
           ca_id: String(r.ref_id || ''), ca_number: String(r.ca_number || ''), ca_status: String(r.ca_status || ''),
           ca_title: String(r.ca_title || ''), severity: String(r.severity || ''), due_date: String(r.due_date || ''),
@@ -1860,7 +1942,7 @@ export function fssaiJobsAuditSummary(
         });
       }
     }
-  } catch (e: any) { out.unreadable.push(`cooling overdue: ${e?.message || e}`); }
+  } catch (e: any) { out.unreadable.push(`${jobKey.replace('_', ' ')}: ${e?.message || e}`); }
 
   // ── retention: the ruling, and what the sweep last did
   try {
@@ -1909,6 +1991,8 @@ export interface FssaiJobsReport {
   /** The WhatsApp leg of missed_checks (owner ruling 2026-10-14). */
   missed_checks_whatsapp: FssaiMissedWaResult | { error: string };
   cooling_overdue: FssaiCoolingOverdueResult | { error: string };
+  /** The same job for reheating batches (2026-10-15). */
+  reheating_overdue: FssaiCoolingOverdueResult | { error: string };
   rulings: FssaiRulingsResult | { error: string };
 }
 
@@ -1927,6 +2011,7 @@ export async function runFssaiScheduledJobs(db: Db, opts: { now?: Date } = {}): 
     missed_checks: { error: 'not run' },
     missed_checks_whatsapp: { error: 'not run' },
     cooling_overdue: { error: 'not run' },
+    reheating_overdue: { error: 'not run' },
     rulings: { error: 'not run' },
   };
   try { report.escalation = await runFssaiEscalationJob(db); } catch (e: any) { report.escalation = { error: String(e?.message || e) }; }
@@ -1939,6 +2024,7 @@ export async function runFssaiScheduledJobs(db: Db, opts: { now?: Date } = {}): 
       : await runFssaiMissedCheckWhatsApp(db, mc as FssaiMissedCheckResult);
   } catch (e: any) { report.missed_checks_whatsapp = { error: String(e?.message || e) }; }
   try { report.cooling_overdue = runFssaiCoolingOverdueJob(db, { now }); } catch (e: any) { report.cooling_overdue = { error: String(e?.message || e) }; }
+  try { report.reheating_overdue = runFssaiReheatingOverdueJob(db, { now }); } catch (e: any) { report.reheating_overdue = { error: String(e?.message || e) }; }
   try { report.rulings = applyFssaiOwnerRulings(db); } catch (e: any) { report.rulings = { error: String(e?.message || e) }; }
 
   try {
@@ -1947,6 +2033,7 @@ export async function runFssaiScheduledJobs(db: Db, opts: { now?: Date } = {}): 
     const mis: any = report.missed_checks;
     const wa: any = report.missed_checks_whatsapp;
     const cool: any = report.cooling_overdue;
+    const reheat: any = report.reheating_overdue;
     const rul: any = report.rulings;
     setSetting(db, KEY_HEARTBEAT, JSON.stringify({
       at: report.at,
@@ -1967,6 +2054,10 @@ export async function runFssaiScheduledJobs(db: Db, opts: { now?: Date } = {}): 
       cooling_overdue: cool.error ? { error: cool.error } : {
         outcome: cool.outcome, scanned: cool.scanned_curves, overdue: cool.overdue, raised: cool.raised,
         people_told: cool.people_told, errors: (cool.errors || []).length,
+      },
+      reheating_overdue: reheat.error ? { error: reheat.error } : {
+        outcome: reheat.outcome, scanned: reheat.scanned_curves, overdue: reheat.overdue, raised: reheat.raised,
+        people_told: reheat.people_told, errors: (reheat.errors || []).length,
       },
       rulings: rul.error ? { error: rul.error } : { q19: rul.q19?.outcome || '' },
     }));
@@ -2015,6 +2106,9 @@ export function fssaiJobsLogLine(r: FssaiJobsReport): string | null {
   const cool: any = r.cooling_overdue;
   if (cool?.error) parts.push(`cooling-overdue ERROR ${cool.error}`);
   else if (cool && ['raised', 'failed'].includes(cool.outcome)) parts.push(`cooling-overdue ${cool.outcome}: ${cool.detail}`);
+  const reheat: any = r.reheating_overdue;
+  if (reheat?.error) parts.push(`reheating-overdue ERROR ${reheat.error}`);
+  else if (reheat && ['raised', 'failed'].includes(reheat.outcome)) parts.push(`reheating-overdue ${reheat.outcome}: ${reheat.detail}`);
   const rul: any = r.rulings;
   if (rul?.error) parts.push(`rulings ERROR ${rul.error}`);
   else if (rul?.q19 && ['removed', 'failed'].includes(rul.q19.outcome)) parts.push(`ruling Q19 ${rul.q19.outcome}: ${rul.q19.detail}`);

@@ -10909,8 +10909,8 @@ function applyFssaiSchema(db: Database.Database) {
    *
    * The CREATE text IS the specification: re-run each CREATE into temp.zz_* and
    * diff against the live table, so there is no second column list to keep in
-   * sync. Technique copied from the lq_* block in the live repo (the TECHNIQUE
-   * only, never that code).
+   * sync. Technique copied from the owner's uncommitted reconciliation block in
+   * the live repo (the TECHNIQUE only, never that code).
    *
    * WHAT IS COMPARED, and why it is not just the column NAME. The first version
    * of this guard tested membership only (`if (have.has(c.name)) continue`), and

@@ -61,7 +61,11 @@ export async function GET(request: Request) {
     // Load only the images the renderer will draw (it draws at most
     // MAX_SCANS_PER_SECTION per record and names the rest), so a large staff
     // roster of certificates cannot pull hundreds of images into memory.
-    const ids = included.flatMap((i) => i.scans.filter((sc) => sc.has_image).slice(0, MAX_SCANS_PER_SECTION).map((sc) => sc.attachment_id));
+    // The handover draws only the copies it may carry (sc.in_handover: never the
+    // scan of an expired paper) — load exactly those, in the renderer's order.
+    const ids = included.flatMap((i) => i.scans
+      .filter((sc) => sc.has_image && (copy === 'readiness' || sc.in_handover))
+      .slice(0, MAX_SCANS_PER_SECTION).map((sc) => sc.attachment_id));
     const images = ids.length ? loadScanImages(db, ids) : new Map<string, { mime: string; bytes: Buffer }>();
     const name = businessName(db);
 

@@ -130,6 +130,32 @@ interface CurveSummary {
   outcome_label: string;
   label?: string;
   open_ca?: number;
+  /* What the batch is (GET ?curves=open): the picker offers only the batches of
+   * the dish being entered, and picking one fills the form from it. */
+  item_label?: string;
+  place_label?: string;
+  equipment_id?: string;
+  equipment_label?: string;
+  area_label?: string;
+  material_id?: string;
+}
+
+/** Same dish? Case and surrounding spaces do not count — the server's own rule. */
+const sameText = (a: unknown, b: unknown) => String(a ?? '').trim().toLowerCase() === String(b ?? '').trim().toLowerCase();
+
+/** The form fields a batch picked from the list fills in, when the form left them empty. */
+function subjectFromBatch(
+  form: { item_label?: string; equipment_id?: string; area_label?: string } | null | undefined,
+  c: CurveSummary | undefined,
+): Record<string, string> {
+  if (!c) return {};
+  const out: Record<string, string> = {};
+  if (!String(form?.item_label || '').trim() && c.item_label) out.item_label = c.item_label;
+  if (!form?.equipment_id && !String(form?.area_label || '').trim()) {
+    if (c.equipment_id) out.equipment_id = c.equipment_id;
+    if (c.area_label) out.area_label = c.area_label;
+  }
+  return out;
 }
 
 /** Cooling and reheating — judged on a clock, kept as a batch. */
@@ -253,6 +279,9 @@ export default function FssaiTemperaturePage() {
         }
         if (f.item_label) p.set('item_label', f.item_label);
         if (f.area_label) p.set('area_label', f.area_label);
+        /* The number decides what happens after a batch has reached its target
+         * (still there, gone back past it, or a fresh pot), so the server sees it. */
+        if (f.value_num !== '' && f.value_num !== undefined && f.value_num !== null) p.set('value_num', String(f.value_num));
       }
       setPreview(await apiJson<any>(`/api/fssai/temperature?${p}`));
     } catch { setPreview(null); }
@@ -265,19 +294,29 @@ export default function FssaiTemperaturePage() {
     const t = setTimeout(() => { void refreshPreview(form); }, 250);
     return () => clearTimeout(t);
   }, [form?.log_kind, form?.equipment_id, form?.uom, form?.reading_at, form?.business_date,
-    form?.curve_choice, form?.elapsed_minutes, form?.item_label, form?.area_label, refreshPreview]);
+    form?.curve_choice, form?.elapsed_minutes, form?.item_label, form?.area_label, form?.value_num, refreshPreview]);
 
-  /* The open batches of THIS kind, for the picker on the form. */
+  /* The open batches of THIS kind — and, once a dish is named, only that dish's
+   * (2026-10-15: the list offered every dish, and one mis-pick judged a curry on
+   * a dal's clock; the server now refuses a different food on a picked batch).
+   * A batch that names no dish (a place or unit only) is always offered, and the
+   * batch already chosen stays in the list. */
   const pickable = useMemo(
-    () => (form && isRateKind(form.log_kind) ? openCurves.filter((c) => c.log_kind === form.log_kind) : []),
+    () => {
+      if (!form || !isRateKind(form.log_kind)) return [];
+      const item = String(form.item_label || '').trim();
+      return openCurves.filter((c) => c.log_kind === form.log_kind
+        && (c.id === form.curve_choice || !item || !c.item_label || sameText(c.item_label, item)));
+    },
     [form, openCurves],
   );
 
-  /** Open the form already pointed at a batch (from the panel or a reading). */
+  /** Open the form already pointed at a batch (from the panel or a reading) —
+   *  with the batch's dish and place filled in. */
   function addToBatch(c: CurveSummary) {
     setViewCurve(null);
     setOpen(null);
-    setForm({ log_kind: c.log_kind, uom: 'C', business_date: today, shift: '', curve_choice: c.id });
+    setForm({ log_kind: c.log_kind, uom: 'C', business_date: today, shift: '', curve_choice: c.id, ...subjectFromBatch({}, c) });
   }
 
   const unjudgedShare = useMemo(
@@ -555,7 +594,10 @@ export default function FssaiTemperaturePage() {
                 <div>
                   <label className={labelCls}>Which batch</label>
                   <select className={inputCls} value={form.curve_choice ?? ''}
-                    onChange={(e) => setForm({ ...form, curve_choice: e.target.value, elapsed_minutes: '' })}>
+                    onChange={(e) => setForm({
+                      ...form, curve_choice: e.target.value, elapsed_minutes: '',
+                      ...subjectFromBatch(form, openCurves.find((c) => c.id === e.target.value)),
+                    })}>
                     <option value="">Match it to the open batch of the same dish and place</option>
                     <option value="new">A new batch — this is its first reading</option>
                     {pickable.map((c) => (
@@ -570,7 +612,7 @@ export default function FssaiTemperaturePage() {
                 {(!form.curve_choice || form.curve_choice === 'new') && (
                   <div>
                     <label className={labelCls}>Minutes it has already been {FSSAI_TEMP_LOG_KINDS.find((k) => k.key === form.log_kind)?.direction === 'hot' ? 'heating' : 'cooling'} (leave empty if it has just started)</label>
-                    <input type="number" inputMode="numeric" min={0} className={inputCls}
+                    <input type="number" inputMode="numeric" min={0} step={1} className={inputCls}
                       value={form.elapsed_minutes ?? ''}
                       onChange={(e) => setForm({ ...form, elapsed_minutes: e.target.value === '' ? '' : Number(e.target.value) })} />
                     <p className="text-[11px] text-[#8B7355] mt-1">
@@ -592,6 +634,8 @@ export default function FssaiTemperaturePage() {
                   }`}>
                     {!preview.curve_preview.ok
                       ? preview.curve_preview.error
+                      : preview.curve_preview.after_target
+                        ? `This batch has already reached ${preview.curve_preview.goal} °C. This reading has to be ${preview.direction === 'hot' ? 'at or above' : 'at or below'} it still — one back past it is filed as a failure.`
                       : preview.curve_preview.starts_line
                         ? `This starts a new batch at 0 minutes. Later readings are measured from the number you enter now${preview.curve_preview.max_minutes ? `, and it has ${preview.curve_preview.max_minutes} minutes to reach ${preview.curve_preview.goal} °C` : ''}.`
                         : preview.curve_preview.past_window
@@ -635,7 +679,7 @@ export default function FssaiTemperaturePage() {
                  * before the refusal does. */}
                 {preview && form.value_num !== '' && form.value_num !== undefined && outOfPreviewRange(form, preview) && (
                   <span className="text-red-700">
-                    {isRateKind(form.log_kind) ? ' * — this reading is behind its schedule' : ' * — this reading is out of range'}
+                    {isRateKind(form.log_kind) ? ' * — this reading fails its batch\'s schedule' : ' * — this reading is out of range'}
                   </span>
                 )}
               </label>
@@ -714,7 +758,7 @@ export default function FssaiTemperaturePage() {
                   {open.curve_start_source === 'standard_anchor' && open.curve_start_used !== null
                     ? ` · no 0-minute reading on this batch, so measured from the rule's ${open.curve_start_used} °${open.uom}`
                     : open.curve_start_source === 'first_reading' && open.curve_start_used !== null
-                      ? ` · measured from the batch's first reading, ${open.curve_start_used} °${open.uom}`
+                      ? ` · measured from ${open.curve_start_used} °${open.uom} at 0 minutes (the batch's first reading, or the rule's starting temperature where that is stricter)`
                       : ''}
                 </p>
               )}
@@ -860,7 +904,10 @@ function outOfPreviewRange(form: any, preview: any): boolean {
     const hot = preview.direction === 'hot';
     const goal = cp.goal === null || cp.goal === undefined ? null : Number(cp.goal);
     const reached = goal !== null && (hot ? v >= goal : v <= goal);
-    if (reached) return false;
+    /* After the batch reached its target: still there is fine, back past it fails. */
+    if (cp.after_target) return !reached;
+    /* At the target but past the window: no reading showed it there in time — a failure. */
+    if (reached) return !!cp.past_window;
     if (cp.past_window) return true;
     if (cp.needed === null || cp.needed === undefined) return goal !== null;
     return hot ? v < Number(cp.needed) : v > Number(cp.needed);

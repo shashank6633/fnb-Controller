@@ -422,7 +422,11 @@ export function buildAuditFilePdf(spec: AuditPdfSpec): Promise<Buffer> {
   }
 
   function drawScans(it: AuditFileItem) {
-    const scans = it.scans.filter((sc) => readiness || sc.has_image);
+    // The handover draws only copies it may carry: an image still stored, and
+    // not the scan of an EXPIRED paper (its cover says "those in force") nor a
+    // file that only travels beside a record the copy does not hold
+    // (sc.in_handover, worked out in buildAuditFile's lib).
+    const scans = it.scans.filter((sc) => readiness || (sc.has_image && sc.in_handover));
     if (!scans.length) return;
     // The heading is drawn with the first copy, on the page that copy lands on,
     // so it is never left alone at the foot of a page above an image overleaf.

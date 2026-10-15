@@ -19,8 +19,33 @@ import {
   resolveFssaiCurve, fssaiCurveExpectedShown, fssaiTempDirection,
   fssaiCurveLineStart, fssaiCurveExpected, fssaiReadingScheduleValue, fssaiTempVerdictWord,
   fssaiTempMinutesWords, fssaiCurveSummary, fssaiOpenCurves, fssaiNowMinuteIST,
+  fssaiClockMinute, fssaiCurveMembers, fssaiFailKindWords, fssaiTempImplausible,
   type FssaiCurveResolution, type FssaiCurveStart,
 } from '../_p4/lib';
+
+/**
+ * How far AHEAD of the server's IST clock a reading's time may be and still be
+ * filed — for a tablet whose clock runs a few minutes fast. Beyond it the time is
+ * in the future and refused (2026-10-15: a cooling target reading timed three
+ * hours ahead closed its batch as "reached in time", stopped the overdue job,
+ * and every real reading after it was refused as out of order).
+ */
+const FSSAI_FUTURE_TIME_TOLERANCE_MINUTES = 5;
+
+/**
+ * Minutes typed for a cooling or reheating reading: '' / null / absent = not
+ * given; otherwise a whole number, 0 or more. Anything else is refused rather
+ * than silently read as "not given" — '239abc' used to become blank and start a
+ * batch at minute 0 that passed, and −0.5 truncated to 0 did the same.
+ */
+function typedMinutes(raw: unknown): { ok: true; value: number | null } | { ok: false } {
+  if (raw === null || raw === undefined) return { ok: true, value: null };
+  if (typeof raw === 'string' && raw.trim() === '') return { ok: true, value: null };
+  if (typeof raw !== 'number' && typeof raw !== 'string') return { ok: false };
+  const n = typeof raw === 'number' ? raw : Number(raw.trim());
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n < 0) return { ok: false };
+  return { ok: true, value: n + 0 };
+}
 
 /**
  * TEMPERATURE LOGS (/api/fssai/temperature) — owner §4 and §5.
@@ -253,36 +278,48 @@ export async function GET(request: Request) {
       const pvAt = fssaiClock(url.searchParams.get('reading_at'));
       if (kindMeta?.window_minutes && pvAt && range.source !== 'none') {
         const pvDate = isISODate(str(url.searchParams.get('business_date'))) ? str(url.searchParams.get('business_date')) : fssaiToday();
-        const typed = fssaiInt(url.searchParams.get('elapsed_minutes'));
-        const c = resolveFssaiCurve(db, {
-          logKind,
-          curveId: str(url.searchParams.get('curve_id')),
-          batchId: str(url.searchParams.get('batch_id')),
-          newCurve: url.searchParams.get('new_curve') === '1',
-          typedElapsed: typed !== null && typed >= 0 ? typed : null,
-          businessDate: pvDate,
-          readingAt: pvAt,
-          uom: range.uom === 'F' ? 'F' : 'C',
-          maxMinutes: range.max_minutes,
-          subject: {
-            equipmentId, materialId: str(url.searchParams.get('material_id')),
-            itemLabel: str(url.searchParams.get('item_label')).slice(0, 200),
-            areaLabel: str(url.searchParams.get('area_label')).slice(0, 200),
-            outletId: (await getCurrentOutletId()) || '',
-          },
-        });
+        const tm = typedMinutes(url.searchParams.get('elapsed_minutes'));
+        const pvValue = fssaiNum(url.searchParams.get('value_num'));
+        const c = !tm.ok
+          ? { ok: false as const, status: 400, code: 'bad_minutes', error: 'Minutes must be a whole number, 0 or more.' }
+          : resolveFssaiCurve(db, {
+            logKind,
+            curveId: str(url.searchParams.get('curve_id')),
+            batchId: str(url.searchParams.get('batch_id')),
+            newCurve: url.searchParams.get('new_curve') === '1',
+            typedElapsed: tm.value,
+            businessDate: pvDate,
+            readingAt: pvAt,
+            uom: range.uom === 'F' ? 'F' : 'C',
+            maxMinutes: range.max_minutes,
+            subject: {
+              equipmentId, materialId: str(url.searchParams.get('material_id')),
+              itemLabel: str(url.searchParams.get('item_label')).slice(0, 200),
+              areaLabel: str(url.searchParams.get('area_label')).slice(0, 200),
+              outletId: (await getCurrentOutletId()) || '',
+            },
+            value: pvValue,
+            anchor: range.start_value,
+          });
         if (!c.ok) {
           curvePreview = { ok: false, error: c.error, code: c.code };
         } else {
+          /* A JOINED batch is judged on the rule frozen on its first reading —
+           * the same numbers the write path will use. */
+          const frozen = c.start && c.start.max_minutes !== null ? c.start : null;
+          const limitUsed = frozen ? frozen.max_minutes : range.max_minutes;
+          const goalUsed = frozen ? frozen.goal : goal;
           /* A new batch at 0 minutes starts its own line from the number about to
            * be typed — nothing is "needed" of it yet. */
           const startsLine = !c.start && c.elapsed === 0;
           const line = startsLine
             ? null
-            : fssaiCurveLineStart({ first: c.start, self: { value: null, elapsed: c.elapsed }, anchor: range.start_value });
-          const needed = line
-            ? fssaiCurveExpected({ startValue: line.value, startElapsed: line.minute, goal, maxMinutes: range.max_minutes, elapsed: c.elapsed })
-            : null;
+            : fssaiCurveLineStart({ first: c.start, self: { value: null, elapsed: c.elapsed }, anchor: range.start_value, direction: dir });
+          const needed = c.reached
+            ? goalUsed
+            : line
+              ? fssaiCurveExpected({ startValue: line.value, startElapsed: line.minute, goal: goalUsed, maxMinutes: limitUsed, elapsed: c.elapsed })
+              : null;
           curvePreview = {
             ok: true,
             mode: c.mode,
@@ -293,9 +330,13 @@ export async function GET(request: Request) {
             /* null with starts_line false = no line at all: a reading short of
              * the target will be filed as a failure (see the note). */
             needed: needed === null ? null : Number(fssaiCurveExpectedShown(needed, dir)),
-            goal,
-            max_minutes: range.max_minutes,
-            past_window: range.max_minutes !== null && c.elapsed > range.max_minutes,
+            goal: goalUsed,
+            max_minutes: limitUsed,
+            past_window: limitUsed !== null && c.elapsed > limitUsed,
+            /* The batch already reached its target: this reading has to still be
+             * there, or it is filed as a failure. */
+            after_target: !!c.reached,
+            rule_frozen_from_batch: !!frozen,
             how: c.how,
           };
         }
@@ -641,6 +682,31 @@ export async function POST(request: Request) {
         return Response.json({ error: 'A temperature must be in °C or °F.' }, { status: 400 });
       }
 
+      /* A NUMBER NOBODY COULD HAVE READ is refused before anything is judged —
+       * a typing guard, not a safety rule (fssaiTempImplausible). Measured: a
+       * cooling −45 (for 45) closed its batch as reached; a reheat 750 passed. */
+      const implausible = fssaiTempImplausible(logKind, value, uom);
+      if (implausible) {
+        return Response.json(
+          {
+            error: `${value} °${uom} cannot be a ${fssaiTempLogKindLabel(logKind).toLowerCase()} reading — it has to be between ${implausible.min} and ${implausible.max} °${implausible.uom}. Check the minus sign and the decimal point, and enter it again.`,
+            code: 'implausible_value', min: implausible.min, max: implausible.max,
+          },
+          { status: 400 },
+        );
+      }
+
+      /* Minutes typed for a cooling or reheating reading must be a whole number,
+       * 0 or more — never silently read as "not given". On any other kind the
+       * figure is ignored, as before. */
+      const tm = kindMeta.window_minutes ? typedMinutes(body?.elapsed_minutes) : { ok: true as const, value: null };
+      if (!tm.ok) {
+        return Response.json(
+          { error: 'Minutes since the batch started must be a whole number, 0 or more — or leave it blank.', code: 'bad_minutes' },
+          { status: 400 },
+        );
+      }
+
       const shift = str(body?.shift);
       if (!isFssaiShift(shift)) {
         return Response.json({ error: `"${shift}" is not one of the shifts.` }, { status: 400 });
@@ -649,13 +715,38 @@ export async function POST(request: Request) {
       /* ── WHAT WAS READ ───────────────────────────────────────────────────
        * A reading needs a subject. "17 °C" with nothing attached cannot be
        * audited, cannot be judged and cannot be put in front of anyone. */
-      const equipmentId = str(body?.equipment_id);
-      const areaLabel = str(body?.area_label).slice(0, 200);
-      const itemLabel = str(body?.item_label).slice(0, 200);
-      const materialId = str(body?.material_id);
+      let equipmentId = str(body?.equipment_id);
+      let areaLabel = str(body?.area_label).slice(0, 200);
+      let itemLabel = str(body?.item_label).slice(0, 200);
+      let materialId = str(body?.material_id);
       let equipmentLabel = '';
       let equipmentKind = '';
       let departmentId = str(body?.department_id);
+
+      /* A BATCH PICKED FROM THE LIST carries its own subject. A reading added to
+       * it that names no food takes the batch's food, and one that names no place
+       * takes where the batch was last read — so "add the next reading" from the
+       * batch panel works without retyping, and the resolver's same-food check
+       * (fssaiCurveSubjectMismatch) has something to compare. A reading that DOES
+       * name a food keeps it, and is refused there if it is a different one. */
+      if (kindMeta.window_minutes && str(body?.curve_id)) {
+        const pick = db.prepare(`SELECT id, batch_id, log_kind FROM fssai_temperature_logs WHERE id = ?`).get(str(body.curve_id)) as any;
+        if (pick && String(pick.log_kind) === logKind) {
+          const batchMembers = fssaiCurveMembers(db, logKind, String(pick.batch_id || '') || String(pick.id));
+          const bFirst = batchMembers[0];
+          const bLast = batchMembers[batchMembers.length - 1];
+          if (bFirst && bLast) {
+            const namesFood = !!(itemLabel || materialId);
+            const namesPlace = !!(equipmentId || areaLabel);
+            if (!namesFood) { itemLabel = bFirst.item_label; materialId = bFirst.material_id; }
+            if (!namesPlace) { equipmentId = bLast.equipment_id; areaLabel = bLast.area_label; }
+            if (!departmentId) {
+              const d = db.prepare(`SELECT department_id FROM fssai_temperature_logs WHERE id = ?`).get(bLast.id) as any;
+              departmentId = str(d?.department_id);
+            }
+          }
+        }
+      }
 
       if (equipmentId) {
         const eq = db.prepare(
@@ -754,10 +845,7 @@ export async function POST(request: Request) {
         );
       }
 
-      const typedElapsed = fssaiInt(body?.elapsed_minutes);
-      if (typedElapsed !== null && typedElapsed < 0) {
-        return Response.json({ error: 'Minutes elapsed cannot be negative.' }, { status: 400 });
-      }
+      const typedElapsed = tm.value;
       /* The clock only applies to the two kinds the FSSAI rule is a RATE for. A
        * number typed on a fridge reading is ignored rather than silently judged. */
       const clockApplies = !!kindMeta.window_minutes;
@@ -766,6 +854,21 @@ export async function POST(request: Request) {
       const id = generateId();
       const readingAt = fssaiClock(body?.reading_at)
         || new Date().toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata' });
+
+      /* A TIME IN THE FUTURE is refused, like a date in the future. Measured
+       * 2026-10-15: a cooling reading at the target timed three hours ahead was
+       * filed, closed its batch as "reached in time" (so the overdue job skipped
+       * it), and every real reading after it was refused as out of order. */
+      if (businessDate === today) {
+        const nowMinute = fssaiNowMinuteIST();
+        const atMinute = fssaiClockMinute(businessDate, readingAt);
+        if (nowMinute !== null && atMinute !== null && atMinute > nowMinute + FSSAI_FUTURE_TIME_TOLERANCE_MINUTES) {
+          return Response.json(
+            { error: `${readingAt} today has not happened yet. Enter the time the reading was actually taken.`, code: 'future_time' },
+            { status: 400 },
+          );
+        }
+      }
 
       /* ── ONE BATCH, ONE CURVE ────────────────────────────────────────────
        * A cooling or reheating reading is placed on its batch's curve, and its
@@ -786,6 +889,8 @@ export async function POST(request: Request) {
           uom,
           maxMinutes: maxMinutesUsed,
           subject: { equipmentId, materialId, itemLabel, areaLabel, outletId },
+          value,
+          anchor: range.start_value,
         });
         if (!curve.ok) {
           return Response.json({ error: curve.error, code: curve.code }, { status: curve.status });
@@ -793,6 +898,23 @@ export async function POST(request: Request) {
       }
       const placed = curve && curve.ok ? curve : null;
       const elapsed = placed ? placed.elapsed : null;
+
+      /* ONE RULE PER BATCH (2026-10-15). A reading JOINING a batch is judged on
+       * the rule frozen on the batch's first reading — its time limit, target and
+       * bounds — not on whatever the rule says now. Measured: an admin lengthened
+       * cooling from 240 to 480 minutes half-way through a batch, and 10 °C at
+       * minute 300 then passed, while the batch's own summary and the overdue job
+       * still used 240. A batch whose first reading was never judged on a clock
+       * (no rule then) takes the rule as it is now. */
+      const batchRule = placed && placed.start && placed.start.max_minutes !== null ? placed.start : null;
+      const ruleUsed = batchRule
+        ? {
+          standard_id: batchRule.standard_id || range.standard_id,
+          min: batchRule.min_used, max: batchRule.max_used, target: batchRule.target_used,
+          max_minutes: batchRule.max_minutes as number | null,
+        }
+        : { standard_id: range.standard_id, min: range.min, max: range.max, target: range.target, max_minutes: maxMinutesUsed };
+      const limitUsed = clockApplies ? ruleUsed.max_minutes : null;
       /* The curve's key goes in batch_id: the production batch when one was named,
        * otherwise the id of the curve's first reading — THIS reading, when it
        * starts one. Any other kind keeps whatever batch it was given. */
@@ -806,19 +928,30 @@ export async function POST(request: Request) {
        * line. fssaiCurveLineStart is the one rule; see it for why a part-way
        * first reading can never be its own start. */
       const lineStart: FssaiCurveStart | null = placed
-        ? fssaiCurveLineStart({ first: placed.start, self: { value, elapsed: placed.elapsed }, anchor: range.start_value })
+        ? fssaiCurveLineStart({ first: placed.start, self: { value, elapsed: placed.elapsed }, anchor: range.start_value, direction: kindMeta.direction })
+        : null;
+      /* The batch's own 0-minute reading, for the verdict's words only (its line
+       * may start from the rule's stricter figure instead). */
+      const firstValue = placed
+        ? (placed.start ? ((placed.start.elapsed ?? 0) === 0 ? placed.start.value : null) : (placed.elapsed === 0 ? value : null))
         : null;
 
       const verdict = judgeFssaiReading({
         value,
-        min: range.min,
-        max: range.max,
+        min: ruleUsed.min,
+        max: ruleUsed.max,
         uomForWords: uom === 'C' || uom === 'F' ? `°${uom}` : uom,
         elapsedMinutes: elapsed,
-        maxMinutes: maxMinutesUsed,
-        target: range.target,
+        maxMinutes: limitUsed,
+        target: ruleUsed.target,
         direction: kindMeta.direction,
-        curveStart: lineStart ? { value: lineStart.value, elapsedMinutes: lineStart.minute, source: lineStart.source } : null,
+        curveStart: lineStart ? { value: lineStart.value, elapsedMinutes: lineStart.minute, source: lineStart.source, firstValue } : null,
+        /* This reading starts its batch at minute 0: the clock begins here. */
+        batchStart: !!placed && !placed.start && placed.elapsed === 0,
+        /* The batch already reached its target: judged on whether it is still there. */
+        reachedBefore: placed && placed.reached
+          ? { value: placed.reached.value, elapsed: placed.reached.elapsed, reading_at: placed.reached.reading_at }
+          : null,
       });
 
       const actionTaken = str(body?.action_taken).slice(0, 2000);
@@ -861,9 +994,9 @@ export async function POST(request: Request) {
         ).run(
           id, businessDate, readingAt, shift, logKind,
           equipmentId, equipmentLabel, equipmentKind, areaLabel, departmentId,
-          materialId, itemLabel, batchIdToStore, range.standard_id,
-          value, uom, range.decimals, range.min, range.max, range.target,
-          elapsed, maxMinutesUsed,
+          materialId, itemLabel, batchIdToStore, ruleUsed.standard_id,
+          value, uom, range.decimals, ruleUsed.min, ruleUsed.max, ruleUsed.target,
+          elapsed, limitUsed,
           verdict.is_fail, verdict.is_judged, verdict.fail_reason, actionTaken, note,
           me.email || '', me.name || '', outletId,
           lineStart ? lineStart.value : null, lineStart ? lineStart.minute : null, lineStart ? lineStart.source : '',
@@ -887,11 +1020,15 @@ export async function POST(request: Request) {
             sourceKind: 'temperature',
             entityTable: 'fssai_temperature_logs',
             entityId: id,
-            title: `${fssaiTempLogKindLabel(logKind)} ${verdict.fail_reason.startsWith('Behind schedule') ? 'behind schedule' : 'out of range'} — ${subjectWords || 'unnamed'}`,
+            /* The title says WHICH rule failed (fssaiFailKindWords): "behind schedule",
+             * "reached its target late", "went back past its target", … */
+            title: `${fssaiTempLogKindLabel(logKind)} ${fssaiFailKindWords(verdict.fail_kind)} — ${subjectWords || 'unnamed'}`,
             description: [
               `${verdict.fail_reason}`,
               `Read as ${fssaiDisplayReading(value, range.decimals)} °${uom} at ${readingAt} on ${businessDate}${where ? ` (${where})` : ''}.`,
-              range.source === 'none' ? '' : `Judged against ${rangeWords(range.min, range.max, uom)} — ${range.standard_label}.`,
+              batchRule
+                ? `Judged against ${rangeWords(ruleUsed.min, ruleUsed.max, uom)}${limitUsed !== null ? ` within ${limitUsed} minutes` : ''} — the rule as it stood when this batch started.`
+                : (range.source === 'none' ? '' : `Judged against ${rangeWords(range.min, range.max, uom)} — ${range.standard_label}.`),
               placed ? placed.how : '',
               actionTaken ? `Done at the time: “${actionTaken}”` : '',
               note ? `Note on the reading: “${note}”` : '',
@@ -922,11 +1059,16 @@ export async function POST(request: Request) {
           after: {
             business_date: businessDate, reading_at: readingAt, log_kind: logKind,
             equipment_label: equipmentLabel, area_label: areaLabel, item_label: itemLabel,
-            value_num: value, uom, min_used: range.min, max_used: range.max,
-            standard_id: range.standard_id, is_judged: verdict.is_judged, is_fail: verdict.is_fail,
+            value_num: value, uom, min_used: ruleUsed.min, max_used: ruleUsed.max, target_used: ruleUsed.target,
+            standard_id: ruleUsed.standard_id, is_judged: verdict.is_judged, is_fail: verdict.is_fail,
+            fail_kind: verdict.fail_kind,
             ...(placed ? {
               batch_id: batchIdToStore, curve_mode: placed.mode, elapsed_minutes: elapsed,
-              elapsed_typed: typedElapsed, max_minutes_used: maxMinutesUsed,
+              elapsed_typed: typedElapsed, max_minutes_used: limitUsed,
+              rule_frozen_from_batch: !!batchRule,
+              ...(batchRule && (range.max_minutes !== batchRule.max_minutes || range.target !== batchRule.target_used)
+                ? { rule_now: { max_minutes: range.max_minutes, target: range.target, min: range.min, max: range.max } } : {}),
+              reached_before: placed.reached ? { id: placed.reached.id, reading_at: placed.reached.reading_at, elapsed: placed.reached.elapsed } : null,
               curve_start_id: placed.start ? placed.start.id : id,
               curve_start_used: lineStart ? lineStart.value : null,
               curve_start_minute: lineStart ? lineStart.minute : null,
@@ -967,7 +1109,10 @@ export async function POST(request: Request) {
           mode: placed.mode,
           elapsed_minutes: elapsed,
           elapsed_typed: typedElapsed,
-          max_minutes: maxMinutesUsed,
+          max_minutes: limitUsed,
+          /* true = judged on the rule frozen when the batch started. */
+          rule_frozen_from_batch: !!batchRule,
+          reached_before: placed.reached ? { id: placed.reached.id, reading_at: placed.reached.reading_at, elapsed_minutes: placed.reached.elapsed } : null,
           start: placed.start
             ? { id: placed.start.id, business_date: placed.start.business_date, reading_at: placed.start.reading_at, value_num: placed.start.value }
             : { id, business_date: businessDate, reading_at: readingAt, value_num: value },

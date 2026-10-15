@@ -17,7 +17,7 @@ import { fssaiReadingScheduleValue, fssaiTempMinutesWords, fssaiTempVerdictWord 
 import { readPestChemicalsApplied, readPestMonitoringSheet } from '../pest/_pest/monitoring';
 import { wasteHandoverAuditPart } from '../_waste/lib';
 import { readFssaiVisitClosureEvidence, type FssaiClosureFile } from '../_closure/lib';
-import { supplierLicencesByVendor, vendorRegisterReady } from '../../vendors/fssai-register';
+import { vendorRegisterReady } from '../../vendors/fssai-register';
 
 /**
  * THE ONE AUDIT FILE (/fssai/audit-file) — the Hyderabad Food Safety Authority's
@@ -61,6 +61,22 @@ import { supplierLicencesByVendor, vendorRegisterReady } from '../../vendors/fss
  *     management copy, and never drawn into either PDF (scans.ts is the second
  *     gate). buildAuditFile() makes that split once, for every record, so no
  *     single record can forget it.
+ *   · The rule holds for third-party papers that live outside Documents too:
+ *     a lab report typed in under Water & Ice (4) counts only with a live copy
+ *     of the laboratory's report on it; the last pest visit (5) only with a
+ *     live copy of the technician's job sheet; an approved supplier (8) only
+ *     with a licence in force WITH its copy (judgeDocs, like records 1–3).
+ *
+ * ── THE INSPECTOR'S COPY HOLDS WHAT IS IN FORCE, AND NOTHING BESIDE A GAP ──
+ * The handover PDF's cover says "Documents and certificates: those in force".
+ * So an EXPIRED document's row and its scan (AuditFileScan.in_handover) stay
+ * on the page and the management copy and never go into the handover — an
+ * EXPIRED line is a sentence about a lapse, and on a person's certificate it
+ * names someone not in order (§7 Q11). And a register listed BESIDE a record
+ * never carries that record into the handover alone (keepOutOfHandover):
+ * cooling readings (11), the daily pest look (13), the agreement / discards /
+ * used oil (14), breakdowns (16), in-house probe checks (17), the expiry
+ * register (18), and another visit's audit report (20).
  *
  * ── READ-ONLY ───────────────────────────────────────────────────────────────
  * There is no INSERT, UPDATE or DELETE in this file. Voided records (§19: void,
@@ -244,6 +260,13 @@ export interface AuditFileScan {
   voided_at: string;
   voided_by: string;
   void_reason: string;
+  /**
+   * false = a LIVE copy the inspector's copy (the handover PDF) must not carry:
+   * the scan of a document that has EXPIRED (the cover says "those in force"),
+   * or a file that only travels beside a record the copy does not hold. The
+   * page and the management copy show it either way. Never decides a status.
+   */
+  in_handover: boolean;
 }
 
 export interface AuditFileItem {
@@ -504,7 +527,24 @@ function shapeScan(r: any, recordLabel: string): AuditFileScan {
     voided_at: s(r.voided_at),
     voided_by: s(r.voided_by),
     void_reason: s(r.void_reason),
+    in_handover: r.in_handover !== false,
   };
+}
+
+/**
+ * Keep a list-beside-it table (and its files) OUT of the inspector's copy. A
+ * record whose own register has nothing to print must not reach the handover
+ * on a side register alone: "14. Waste disposal record" holding only the
+ * collector's agreement, or "18. FIFO/FEFO checklist" holding only the expiry
+ * register, implies a record that is not on file (§7 Q11). The page and the
+ * management copy still show every line.
+ */
+function keepOutOfHandover(tables: AuditFileTable[], scans: AuditFileScan[] = []): void {
+  for (const t of tables) {
+    for (const r of t.rows) r.in_handover = false;
+    t.handover_rows = 0;
+  }
+  for (const sc of scans) sc.in_handover = false;
 }
 
 /** A copy anyone can read: live (not voided) and its image still stored. */
@@ -578,6 +618,10 @@ function readDocs(ctx: Ctx, types: string[]): DocRow[] {
   for (const sc of scans) {
     const d = byId.get(sc.entity_id);
     if (!d) continue;
+    // The copy of an EXPIRED document is real and stays on the page and the
+    // management copy — but the inspector's copy is "those in force" (its
+    // cover says so), so the scan of a lapsed paper never goes into it.
+    sc.in_handover = d.state !== 'expired';
     d.scans.push(sc);
     if (sc.status === 'void') { d.voided++; continue; }   // kept, listed apart, never a copy
     if (sc.has_image) d.stored++;
@@ -617,7 +661,10 @@ function docRows(docs: DocRow[], who?: (d: DocRow) => string): AuditFileRow[] {
     '/fssai/documents',
     d.state === 'expired' || !d.stored ? 'bad' : d.state === 'expiring' ? 'warn' : '',
     // A row with no copy is the number without the paper: not part of the file.
-    d.stored > 0,
+    // An EXPIRED one is not in force — the inspector's copy says it holds the
+    // documents "in force" on the day, and an EXPIRED line is a sentence about
+    // a lapse (§7 Q11). Both stay on the page and the management copy.
+    d.stored > 0 && d.state !== 'expired',
   ));
 }
 
@@ -842,12 +889,16 @@ function water(ctx: Ctx): Part {
   p.links = [{ href: '/fssai/water-ice', label: 'Water & Ice Checks' }, DOCS_LINK];
   p.basis =
     `Either half satisfies the line. A laboratory report counts until the next test date written on it (or ${CURRENCY_DAYS.water_test} days after the report when none is written); ` +
-    `a filed water-test document until its expiry; a municipal water bill for ${CURRENCY_DAYS.water_bill} days from its date. EXPIRING inside ${WARN_DAYS} days of the end.`;
+    `a filed water-test document until its expiry; a municipal water bill for ${CURRENCY_DAYS.water_bill} days from its date. EXPIRING inside ${WARN_DAYS} days of the end. ` +
+    'Each counts only with a copy of the paper attached — a lab report typed in under Water & Ice Checks with no photograph or scan of the laboratory\'s report is the number, not the report.';
   const todo =
-    'Get the water tested by a laboratory and record the report under Water & Ice Checks (kind "Lab report"), or file the latest municipal water bill under Documents & Certificates as "Municipal water bill".';
+    'Get the water tested by a laboratory and record the report under Water & Ice Checks (kind "Lab report") with a photograph or scan of the laboratory\'s report attached, or file the latest municipal water bill under Documents & Certificates as "Municipal water bill" with a scan. ' +
+    'A lab report already recorded without its copy: file the laboratory\'s report under Documents & Certificates as "Water test report", with its scan.';
 
   const ends: Array<{ end: string; label: string }> = [];
   const rows: AuditFileRow[] = [];
+  /** Lab reports recorded with no live copy attached, in words. */
+  const noCopy: string[] = [];
   let held = 0;
 
   if (ctx.present.has('fssai_water_tests')) {
@@ -858,17 +909,36 @@ function water(ctx: Ctx): Part {
         ORDER BY business_date DESC, created_at DESC`,
     ).all() as any[];
     held += labs.length;
+    // A COPY IS THE RECORD (see the header). A lab report typed in under Water
+    // & Ice is the app knowing the report's number and result — the laboratory's
+    // paper is the record the authority asks for. So a lab report counts, and is
+    // printed in the inspector's copy, only with a LIVE copy of it attached; one
+    // without is listed (page, management copy) as "no copy attached".
+    const labScans = readScans(ctx.db, 'fssai_water_tests', labs.map((r) => s(r.id)), () => 'Laboratory water report');
+    const liveByLab = new Map<string, number>();
+    const voidByLab = new Map<string, number>();
+    for (const sc of labScans) {
+      const m = sc.status === 'void' ? voidByLab : isLiveCopy(sc) ? liveByLab : null;
+      if (m) m.set(sc.entity_id, (m.get(sc.entity_id) || 0) + 1);
+    }
     for (const r of labs) {
+      const copies = liveByLab.get(s(r.id)) || 0;
       const from = [s(r.report_date), s(r.sample_date), s(r.business_date)].find((x) => isISODate(x)) || '';
       const end = isISODate(s(r.next_due_date)) ? s(r.next_due_date) : from ? addDaysISO(from, CURRENCY_DAYS.water_test) : '';
-      if (end) ends.push({ end, label: `laboratory water report${r.report_no ? ` no. ${s(r.report_no)}` : ''}` });
+      const label = `laboratory water report${r.report_no ? ` no. ${s(r.report_no)}` : ''}`;
+      if (end && copies > 0) ends.push({ end, label });
+      else if (!copies) {
+        noCopy.push(`The ${label}${from ? ` of ${from}` : ''} is recorded under Water & Ice Checks, but ${voidByLab.get(s(r.id))
+          ? 'its only copy was voided as attached by mistake, and no other copy is attached'
+          : 'no copy of the laboratory\'s report is attached'} — the file has the number, not the report.`);
+      }
       rows.push(row(
         ['Lab report', [s(r.lab_name), s(r.lab_licence_no)].filter(Boolean).join(' · '), s(r.report_no), from, end || '—',
-          intOr(r.is_fail) ? 'FAIL' : (s(r.result) || 'Recorded')],
-        '/fssai/water-ice', intOr(r.is_fail) ? 'bad' : '',
+          [intOr(r.is_fail) ? 'FAIL' : (s(r.result) || 'Recorded'), copies ? plural(copies, 'scan') : 'no copy attached'].join(' · ')],
+        '/fssai/water-ice', intOr(r.is_fail) || !copies ? 'bad' : '', copies > 0,
       ));
     }
-    p.scans.push(...readScans(ctx.db, 'fssai_water_tests', labs.map((r) => s(r.id)), () => 'Laboratory water report'));
+    p.scans.push(...labScans);
   }
 
   if (ctx.present.has('fssai_documents')) {
@@ -882,7 +952,7 @@ function water(ctx: Ctx): Part {
       rows.push(row(
         [isBill ? 'Water bill' : 'Water test document', d.issuer, d.reference_no, d.issued_on || d.valid_from || d.created_on, end || '—',
           d.stored ? plural(d.stored, 'scan') : 'no copy attached'],
-        '/fssai/documents', d.stored ? '' : 'bad', d.stored > 0,
+        '/fssai/documents', d.stored && d.state !== 'expired' ? '' : 'bad', d.stored > 0 && d.state !== 'expired',
       ));
       p.scans.push(...d.scans);
     }
@@ -896,11 +966,17 @@ function water(ctx: Ctx): Part {
   const v = judgePeriod(best?.end || '', ctx.today, 'water test report or water bill');
   p.status = v.status;
   p.problems = v.problems;
-  if (!best && held) p.problems = ['Water records are on file, but none is a laboratory report with a date or a filed document with a copy attached.'];
+  if (!best && held) p.problems = ['Water records are on file, but none is a dated laboratory report or a filed document with a copy attached.'];
+  // A lab report recorded without its copy is named while the record is not
+  // PRESENT — it is the quickest way to close it (attach the paper).
+  if (p.status !== 'present') p.problems.push(...noCopy);
   p.lapses_on = best?.end || '';
-  p.headline = best ? `Current: ${best.label}, good until ${best.end}` : held ? `${plural(held, 'record')} on file, none current` : 'Nothing on file';
+  p.headline = best ? `Current: ${best.label}, good until ${best.end}` : held ? `${plural(held, 'record')} on file, none current with a copy` : 'Nothing on file';
+  const withCopy = rows.filter((r) => r.in_handover).length;
   p.summary = [
-    { label: 'On file', value: String(held) },
+    // Only what the inspector's copy can show: a record with its copy, in force.
+    { label: 'On file', value: String(withCopy) },
+    ...(held > withCopy ? [{ label: 'Without a copy, or lapsed', value: String(held - withCopy), mgmt: true as const }] : []),
     { label: 'Good until', value: best?.end || '—' },
   ];
   p.tables = [table('Water reports and bills', [
@@ -916,12 +992,13 @@ function pestControl(ctx: Ctx): Part {
   const p = blank();
   p.links = [{ href: '/fssai/pest-control', label: 'Pest Control Logs' }, DOCS_LINK];
   p.basis =
-    `Both halves are needed. The agreement: a pest-control contract in force with a copy attached. The reports: a completed visit whose next visit date has not passed ` +
-    `(or within ${CURRENCY_DAYS.pest_visit} days when the technician wrote none). EXPIRING when the contract is inside its renewal window or the next visit is due within ${PEST_WARN_DAYS} days. ` +
+    `Both halves are needed. The agreement: a pest-control contract in force with a copy attached. The reports: the last completed visit, with a photograph of the technician's job sheet or service report attached to it, whose next visit date has not passed ` +
+    `(or within ${CURRENCY_DAYS.pest_visit} days when the technician wrote none) — a visit typed in with no copy of the agency's report is the visit, not the report. ` +
+    `EXPIRING when the contract is inside its renewal window or the next visit is due within ${PEST_WARN_DAYS} days. ` +
     'What each visit applied — product, CIB&RC registration number, batch, expiry, dilution, quantity, method and where — is printed with it; ' +
     'EXPIRING too when the last visit does not say what was applied.';
   const todo =
-    'File the pest-control agreement under Documents & Certificates as "Pest control contract" with a scan, and record every visit, with the technician\'s report, under Pest Control Logs.';
+    'File the pest-control agreement under Documents & Certificates as "Pest control contract" with a scan, and record every visit under Pest Control Logs with a photograph of the technician\'s job sheet or report attached to it.';
   const miss = absent(ctx.present, ['fssai_documents', 'fssai_pest_services']);
   if (miss.length) { p.problems = [NOT_IN_DB(miss)]; p.todo = todo; return p; }
 
@@ -946,13 +1023,35 @@ function pestControl(ctx: Ctx): Part {
     else r = { status: 'present', problems: [] };
   }
 
+  // THE REPORT IS THE AGENCY'S PAPER (A COPY IS THE RECORD — see the header).
+  // The visit row is the outlet's own entry; the "report" the authority asks
+  // for is the technician's job sheet / service report, so the LAST visit
+  // counts only with a LIVE copy of it on the visit. A voided job sheet is
+  // never that copy. The agreement half is judged the same way (judgeDocs).
+  const from = periodicFrom(ctx);
+  const inWindow = visits.filter((v) => s(v.business_date) >= from);
+  const visitScans = readScans(ctx.db, 'fssai_pest_services',
+    [...(last ? [s(last.id)] : []), ...inWindow.slice(0, 6).map((v) => s(v.id))],
+    (id) => { const v = visits.find((x) => s(x.id) === id); return v ? `Pest-control report ${s(v.report_no) || s(v.service_no)} (${s(v.business_date)})` : 'Pest-control report'; });
+  if (last) {
+    const own = visitScans.filter((sc) => sc.entity_id === s(last.id));
+    if (!own.some(isLiveCopy)) {
+      const why = own.some((sc) => sc.status === 'void')
+        ? 'its only job sheet was voided as attached by mistake, and no other copy is attached'
+        : 'no photograph of the technician\'s job sheet or service report is attached to it';
+      r = {
+        status: 'missing',
+        problems: [...r.problems, `The last visit (${s(last.business_date)}${s(last.report_no) ? `, report no. ${s(last.report_no)}` : ''}) is recorded, but ${why} — the file has the visit, not the report.`],
+      };
+    }
+  }
+
   // WHAT EACH VISIT APPLIED (#78) — a pest-control report that does not say
   // which chemical went down, where, of what registration and batch, is half a
   // report. Read through the pest lane's own reader so '[]' is "not recorded",
   // never "nothing applied". The LAST visit with nothing recorded turns the
   // record EXPIRING (the job sheet can still be copied in, once, with an audit
   // row); older visits are listed and named.
-  const from = periodicFrom(ctx);
   const chem = ctx.present.has('fssai_pest_services')
     ? readPestChemicalsApplied(ctx.db, { from, to: ctx.today })
     : null;
@@ -978,7 +1077,6 @@ function pestControl(ctx: Ctx): Part {
     { label: 'Next due', value: end || '—' },
     ...(chem ? [{ label: 'Products applied', value: String(chem.totals.products) }] : []),
   ];
-  const inWindow = visits.filter((v) => s(v.business_date) >= from);
   const chemById = new Map((chem?.visits || []).map((v) => [v.id, v]));
   const chemWords = (id: string): string => {
     const v = chemById.get(id);
@@ -1027,11 +1125,7 @@ function pestControl(ctx: Ctx): Part {
   // A product line with no registration number, or past its expiry on the day,
   // is coloured on its row (and the pest print marks it). It does not by itself
   // change the status: the line asks for the records, and these ARE the records.
-  p.scans = [
-    ...docs.flatMap((d) => d.scans),
-    ...readScans(ctx.db, 'fssai_pest_services', inWindow.slice(0, 6).map((v) => s(v.id)),
-      (id) => { const v = visits.find((x) => s(x.id) === id); return v ? `Pest-control report ${s(v.report_no) || s(v.service_no)} (${s(v.business_date)})` : 'Pest-control report'; }),
-  ];
+  p.scans = [...docs.flatMap((d) => d.scans), ...visitScans];
   if (p.status !== 'present') p.todo = todo;
   return p;
 }
@@ -1131,9 +1225,12 @@ function handlerRecord(ctx: Ctx, key: 'medical' | 'training'): Part {
     : 'Nobody on the food-handler register';
   // A figure that only measures a gap is management's (mgmt: true) — "1 in
   // order" beside "3 food handlers" says two are not, on paper handed over.
+  // So is the head-count itself while the roster is incomplete: "3 food
+  // handlers" over the certificates of one says the other two have none.
   const gapIn = inOrder < needed.length;
+  const complete = needed.length > 0 && !notIn.length && !fostacBad;
   p.summary = [
-    { label: 'Food handlers', value: String(needed.length) },
+    complete ? { label: 'Food handlers', value: String(needed.length) } : { label: 'Food handlers', value: String(needed.length), mgmt: true as const },
     gapIn ? { label: 'In order', value: String(inOrder), mgmt: true as const } : { label: 'In order', value: String(inOrder) },
     { label: 'Not in order', value: String(notIn.length), mgmt: true },
     ...(isMed ? [] : [fostacBad
@@ -1146,7 +1243,6 @@ function handlerRecord(ctx: Ctx, key: 'medical' | 'training'): Part {
   // when EVERY food handler on it is in order — a partial roster under the
   // heading "food handlers" would read as the whole staff (§7 Q11, and the
   // owner's "never imply a complete file").
-  const complete = needed.length > 0 && !notIn.length && !fostacBad;
   const regRows = active
     .filter((h) => h.coverage[key].required || (!isMed && h.coverage.fostac.required))
     .map((h) => {
@@ -1175,7 +1271,8 @@ function handlerRecord(ctx: Ctx, key: 'medical' | 'training'): Part {
         certRows.push(row([
           `${handlerName(h)} — ${e.title || e.type_label}`, 'HRMS', 'HRMS training record', e.issued_on, e.expiry_date || '—',
           STATE_WORDS[e.state], 'HRMS record',
-        ], HANDLERS_LINK.href, e.state === 'expired' ? 'bad' : e.state === 'expiring' ? 'warn' : ''));
+        // An EXPIRED training is not in force: never in the inspector's copy.
+        ], HANDLERS_LINK.href, e.state === 'expired' ? 'bad' : e.state === 'expiring' ? 'warn' : '', e.state !== 'expired'));
       }
     }
   }
@@ -1205,8 +1302,9 @@ function vendors(ctx: Ctx): Part {
   const p = blank();
   p.links = [{ href: '/vendors', label: 'Vendors — Approved vendor list' }, DOCS_LINK];
   p.basis =
-    'From the approved-vendor register on Vendors. PRESENT when at least one supplier is marked approved and every approved supplier has an FSSAI licence in force on file; ' +
-    'EXPIRING when an approved supplier\'s licence is inside its renewal window; MISSING when no supplier is approved, or an approved supplier\'s licence has expired or is not on file.';
+    'From the approved-vendor register on Vendors. PRESENT when at least one supplier is marked approved and every approved supplier has an FSSAI licence in force on file with a copy attached; ' +
+    'EXPIRING when an approved supplier\'s licence is inside its renewal window; MISSING when no supplier is approved, or an approved supplier\'s licence has expired, is not on file, or has no copy attached. ' +
+    'The list goes into the inspector\'s copy only when every approved supplier on it is in order.';
   const todo =
     'On Vendors, open the Approved vendor list, mark each supplier you buy food from as approved (and what they supply), and file each one\'s FSSAI licence with a scan.';
   if (!vendorRegisterReady(ctx.db)) {
@@ -1226,22 +1324,40 @@ function vendors(ctx: Ctx): Part {
             SUM(CASE WHEN fssai_approval = '' THEN 1 ELSE 0 END) AS unreviewed
        FROM vendors WHERE IFNULL(is_active, 1) = 1`,
   ).get() as any;
-  const lic = supplierLicencesByVendor(ctx.db, ctx.today, approved.map((v) => s(v.id)));
+  // A COPY IS THE RECORD (see the header). A supplier's FSSAI licence is a
+  // document like the outlet's own — fssai_documents 'supplier_licence' with
+  // its vendor_id, the register's own source (vendors/fssai-register.ts) — so
+  // it is judged by the same paper rule as records 1–3 (judgeDocs): in force
+  // WITH a live copy attached. A licence number typed in with no scan, or whose
+  // only scan was voided, is the number, not the licence.
+  const approvedIds = new Set(approved.map((v) => s(v.id)));
+  const licDocs = ctx.present.has('fssai_documents')
+    ? readDocs(ctx, ['supplier_licence']).filter((d) => approvedIds.has(d.vendor_id))
+    : [];
+  const docsByVendor = new Map<string, DocRow[]>();
+  for (const d of licDocs) {
+    if (!docsByVendor.has(d.vendor_id)) docsByVendor.set(d.vendor_id, []);
+    docsByVendor.get(d.vendor_id)!.push(d);
+  }
 
   const expired: string[] = [];
   const none: string[] = [];
+  const noCopy: string[] = [];
   const soon: string[] = [];
   const lapses: string[] = [];
-  const rows = approved.map((v) => {
-    const l = lic.get(s(v.id)) || null;
-    if (!l) none.push(s(v.name));
-    else if (l.state === 'expired') expired.push(`${s(v.name)} (expired ${l.expiry_date})`);
-    else if (l.state === 'expiring') { soon.push(`${s(v.name)} (expires ${l.expiry_date})`); lapses.push(l.expiry_date); }
-    else if (l.expiry_date) lapses.push(l.expiry_date);
-    return row([
-      s(v.name), s(v.fssai_supplies), [s(v.fssai_approval_by), s(v.fssai_approval_at).slice(0, 10)].filter(Boolean).join(' · '),
-      l?.reference_no || '—', l?.expiry_date || '—', l ? STATE_WORDS[l.state] : 'Not on file',
-    ], '/vendors', !l || l.state === 'expired' ? 'bad' : l.state === 'expiring' ? 'warn' : '');
+  const judged = approved.map((v) => {
+    const name = s(v.name);
+    const list = docsByVendor.get(s(v.id)) || [];
+    const j = list.length ? judgeDocs(list, 'FSSAI licence', ctx.today) : null;
+    // The licence the row shows: the one judged best, else the latest on file.
+    const shown: DocRow | null = j?.best || list[0] || null;
+    if (!j || !shown) none.push(name);
+    else if (j.status === 'missing' && list.every((d) => d.state === 'expired')) expired.push(`${name} (expired ${j.lapses_on || shown.expiry_date})`);
+    else if (j.status === 'missing') {
+      noCopy.push(`${name} (${docLabel(shown)}${shown.voided ? ' — its only scan was voided' : ''})`);
+    } else if (j.status === 'expiring') { soon.push(`${name} (expires ${shown.expiry_date})`); lapses.push(shown.expiry_date); }
+    else if (shown.expiry_date) lapses.push(shown.expiry_date);
+    return { v, name, list, shown, ok: !!j && j.status !== 'missing', expiring: j?.status === 'expiring' };
   });
 
   const problems: string[] = [];
@@ -1252,13 +1368,26 @@ function vendors(ctx: Ctx): Part {
   }
   if (expired.length) { status = 'missing'; problems.push(`Approved, but their FSSAI licence has expired: ${expired.join(', ')}.`); }
   if (none.length) { status = 'missing'; problems.push(`Approved, but no FSSAI licence is on file: ${none.join(', ')}.`); }
+  if (noCopy.length) { status = 'missing'; problems.push(`Approved, but no copy of their FSSAI licence is attached — the file has the number, not the licence: ${noCopy.join(', ')}.`); }
   if (soon.length) { status = worst(status, 'expiring'); problems.push(`Licence expiring soon: ${soon.join(', ')}.`); }
+
+  // THE LIST goes into the inspector's copy only when EVERY approved supplier
+  // on it holds a licence in force with its copy — the same rule as the
+  // food-handler roster (records 6, 7): a list with suppliers cut out would
+  // read as the whole list, and a line reading EXPIRED or "Not on file" is a
+  // sentence about a gap (§7 Q11). The page and the management copy show all.
+  const complete = approved.length > 0 && judged.every((x) => x.ok);
+  const rows = judged.map(({ v, name, shown, ok, expiring }) => row([
+    name, s(v.fssai_supplies), [s(v.fssai_approval_by), s(v.fssai_approval_at).slice(0, 10)].filter(Boolean).join(' · '),
+    shown?.reference_no || '—', shown?.expiry_date || '—', shown ? STATE_WORDS[shown.state] : 'Not on file',
+    !shown ? '—' : shown.stored ? plural(shown.stored, 'scan') : shown.voided ? 'voided only' : 'none',
+  ], '/vendors', !ok ? 'bad' : expiring ? 'warn' : '', complete));
 
   p.status = status;
   p.problems = problems;
   p.lapses_on = earliest(lapses);
   p.headline = approved.length
-    ? `${plural(approved.length, 'approved supplier')} · ${approved.length - none.length - expired.length} with a licence in force`
+    ? `${plural(approved.length, 'approved supplier')} · ${judged.filter((x) => x.ok).length} with a licence in force and its copy on file`
     : 'No supplier approved yet';
   p.summary = [
     { label: 'Approved', value: String(approved.length) },
@@ -1266,9 +1395,14 @@ function vendors(ctx: Ctx): Part {
     { label: 'Not reviewed', value: String(intOr(totals?.unreviewed)), mgmt: true },
   ];
   p.tables = [table('Approved suppliers', [
-    { label: 'Supplier', width: 2 }, { label: 'Approved to supply', width: 2 }, { label: 'Approved by', width: 1.8 },
-    { label: 'FSSAI licence', width: 1.4 }, { label: 'Expires', width: 0.9 }, { label: 'Licence', width: 0.9 },
+    { label: 'Supplier', width: 2 }, { label: 'Approved to supply', width: 1.9 }, { label: 'Approved by', width: 1.6 },
+    { label: 'FSSAI licence', width: 1.4 }, { label: 'Expires', width: 0.9 }, { label: 'Licence', width: 0.9 }, { label: 'Copy', width: 0.7 },
   ], rows, ctx.limit, 'No supplier is marked approved.')];
+  // The suppliers' licence copies, under whose they are. In the inspector's
+  // copy only with the complete list (and never the scan of an expired one).
+  p.scans = judged.flatMap(({ name, list }) => list.flatMap((d) => d.scans.map((sc) => ({
+    ...sc, record_label: `${name} — ${sc.record_label}`, in_handover: complete && sc.in_handover,
+  }))));
   if (p.status !== 'present') p.todo = todo;
   return p;
 }
@@ -1355,7 +1489,10 @@ function tempLog(
   p.links = links;
   const others = kinds.filter((k) => !judgedKinds.includes(k));
   p.basis = logBasis(cadence) +
-    (key === 'cold_temps' ? ' A unit read in this period that has gone quiet for longer than that makes it EXPIRING too.' : '') +
+    (key === 'cold_temps'
+      ? ' A unit read in this period that has gone quiet for longer than that makes it EXPIRING too. Only per-unit readings under Temperature Logs count: ' +
+        'the cold-store checklist\'s single "reading seen on this round" is a spot check of the round, not this log.'
+      : '') +
     (others.length
       ? ` Only ${judgedKinds.map((k) => fssaiTempLogKindLabel(k).toLowerCase()).join(' and ')} readings decide it; ` +
         `${others.map((k) => fssaiTempLogKindLabel(k).toLowerCase()).join(' and ')} readings are listed with it but never make it PRESENT. ` +
@@ -1654,7 +1791,10 @@ function fifo(ctx: Ctx): Part {
     'Run the storage checklists on Food Storage Checks — the daily dry-store and cold-store rounds (oldest stock to the front, FEFO) and the weekly rotation round.',
     [{ href: '/fssai/storage', label: 'Food Storage Checks' }, { href: '/fssai/fifo', label: 'FIFO & Expiry Management' }],
     'No storage checklist is published. An administrator publishes the ready-made ones under FSSAI Settings.');
-  p.basis = 'FIFO and FEFO are asked on the storage rounds (dry store, cold store, weekly rotation). ' + p.basis;
+  p.basis = 'FIFO and FEFO are asked on the storage rounds (dry store, cold store, weekly rotation). ' + p.basis +
+    ' The expiry register is listed beside the rounds; it never decides, and without a round it is not handed over.';
+  /** The storage rounds — the checklist itself (undefined when its tables are absent). */
+  const roundTable: AuditFileTable | undefined = p.tables[0];
   if (ctx.present.has('fssai_expiry_items')) {
     const items = ctx.db.prepare(
       `SELECT business_date, material_name, batch_label, lot_no, location_label, expiry_date, state, action_taken, qty, uom
@@ -1669,6 +1809,10 @@ function fifo(ctx: Ctx): Part {
     ], items.map((x) => row([
       s(x.business_date), s(x.material_name || x.batch_label), s(x.lot_no), s(x.location_label), s(x.expiry_date), s(x.state), s(x.action_taken),
     ], '/fssai/fifo', s(x.state) === 'expired' ? 'bad' : '')), ctx.limit, 'Nothing was entered in the expiry register in these dates.'));
+    // The expiry register is listed BESIDE the rounds and never decides. With
+    // no storage round in these dates it stays out of the inspector's copy, so
+    // "18. FIFO/FEFO checklist" is never handed over holding no checklist.
+    if (!(roundTable?.handover_rows)) keepOutOfHandover(p.tables.filter((t) => t !== roundTable));
   }
   return p;
 }
@@ -1691,7 +1835,7 @@ function waste(ctx: Ctx): Part {
     problems: [...part.problems],
     todo: part.todo,
     lapses_on: part.lapses_on,
-    basis: part.basis + ' The collector\'s agreement or receipts (Documents & Certificates, "Waste disposal record"), expired stock discarded and used oil handed over are listed beside it; they do not decide it.',
+    basis: part.basis + ' The collector\'s agreement or receipts (Documents & Certificates, "Waste disposal record"), expired stock discarded and used oil handed over are listed beside it; they do not decide it, and with no handover in these dates they are not handed over.',
     links: [...part.links, DOCS_LINK, { href: '/fssai/fifo', label: 'FIFO & Expiry Management' }, { href: '/fssai/oil-quality', label: 'Oil Quality Checks' }],
     summary: part.summary.map((x) => ({ ...x })),
     tables: part.tables.map((t) => ({ ...t, rows: t.rows.map((r) => ({ ...r })) })),
@@ -1699,6 +1843,9 @@ function waste(ctx: Ctx): Part {
     // one partition in buildAuditFile sees the same fields as every record.
     scans: part.scans.map((sc) => shapeScan({ ...sc, id: sc.attachment_id, status: 'active' }, sc.record_label)),
   };
+  /** The handover log's own table(s), and how many of its lines the handover may carry. */
+  const logTables = [...p.tables];
+  const logRows = logTables.reduce((a, t) => a + t.handover_rows, 0);
 
   if (ctx.present.has('fssai_documents')) {
     const docs = readDocs(ctx, ['waste_disposal_record']);
@@ -1738,6 +1885,11 @@ function waste(ctx: Ctx): Part {
       s(x.business_date), s(x.collector_name), s(x.agency_reg_no), s(x.vehicle_no), [numOrBlank(x.quantity, 1), s(x.uom)].filter(Boolean).join(' '), s(x.receipt_no),
     ], '/fssai/oil-quality')), ctx.limit, 'No used oil was handed over in these dates.'));
   }
+  // The agreement, the discarded stock and the used oil are listed BESIDE the
+  // log and never decide. With no handover of the log itself in these dates
+  // they stay out of the inspector's copy (and so do the agreement's scans):
+  // "14. Waste disposal record" is never handed over holding no waste record.
+  if (!logRows) keepOutOfHandover(p.tables.filter((t) => !logTables.includes(t)), p.scans.filter((sc) => sc.entity_table !== 'fssai_waste_handovers'));
   return p;
 }
 
@@ -1796,41 +1948,65 @@ function oil(ctx: Ctx): Part {
 }
 
 /* 16 ─ Equipment maintenance records */
-const MAINTENANCE_KINDS = ['repair', 'cleaning', 'defrost', 'breakdown', 'out_of_service', 'back_in_service', 'filter_change'];
+/**
+ * What IS maintenance — a service or repair, a deep clean, a defrost, a filter
+ * change (FSSAI_EQUIPMENT_EVENT_KINDS). Only these decide the record and set a
+ * unit's next-service date.
+ */
+const MAINTENANCE_KINDS = ['repair', 'cleaning', 'defrost', 'filter_change'];
+/**
+ * What happened TO a unit that is not maintenance: it broke down, was taken
+ * out of use, came back. A unit failing is not a maintenance record, so these
+ * are LISTED beside the maintenance (the inspector asks about them when a
+ * reading is out of range) and never make the record PRESENT. Without a
+ * maintenance entry or an AMC in force they stay out of the inspector's copy.
+ */
+const UNIT_INCIDENT_KINDS = ['breakdown', 'out_of_service', 'back_in_service'];
 
 function maintenance(ctx: Ctx): Part {
   const p = blank();
   p.links = [{ href: '/fssai/cold-rooms', label: 'Cold Room Climate Control' }, DOCS_LINK];
   p.basis =
     `PRESENT when a service, repair, defrost, deep clean or filter change was recorded in the last ${CURRENCY_DAYS.maintenance} days, or a service contract (AMC) is in force with a copy. ` +
-    `MISSING when neither, or when a unit's own next-service date has passed. EXPIRING when a next-service date or the AMC falls within ${WARN_DAYS} days.`;
+    `MISSING when neither, or when a unit's own next-service date has passed. EXPIRING when a next-service date or the AMC falls within ${WARN_DAYS} days. ` +
+    'A breakdown, or a unit taken out of use or put back, is listed with it but is not maintenance and never makes it PRESENT.';
   const todo =
     'Record each service, repair and deep clean against the unit under Cold Room Climate Control (with the next due date), and file any AMC under Documents & Certificates.';
   const miss = absent(ctx.present, ['fssai_equipment_events', 'fssai_documents']);
   if (miss.length) { p.problems = [NOT_IN_DB(miss)]; p.todo = todo; return p; }
 
-  const marks = MAINTENANCE_KINDS.map(() => '?').join(',');
-  const events = ctx.db.prepare(
+  const kinds = [...MAINTENANCE_KINDS, ...UNIT_INCIDENT_KINDS];
+  const marks = kinds.map(() => '?').join(',');
+  const all = ctx.db.prepare(
     `SELECT id, equipment_id, equipment_label, event_kind, business_date, detail, performed_by, reference_no, next_due_date
        FROM fssai_equipment_events ev
       WHERE ev.event_kind IN (${marks}) AND ev.voided_at = '' AND ev.status <> 'void'
       ORDER BY business_date DESC, created_at DESC`,
-  ).all(...MAINTENANCE_KINDS) as any[];
+  ).all(...kinds) as any[];
+  const isMaint = (e: any) => MAINTENANCE_KINDS.includes(s(e.event_kind));
+  /** Maintenance only — what decides the record. */
+  const events = all.filter(isMaint);
   const amc = readDocs(ctx, ['amc']);
   const amcV = judgeDocs(amc, 'service contract (AMC)', ctx.today);
 
   const recentCut = addDaysISO(ctx.today, -CURRENCY_DAYS.maintenance);
   const recent = events.filter((e) => s(e.business_date) >= recentCut);
+  const incidentsRecent = all.filter((e) => !isMaint(e) && s(e.business_date) >= recentCut);
   const problems: string[] = [];
   let status: AuditFileStatus = recent.length || amcV.status !== 'missing' ? 'present' : 'missing';
   if (status === 'missing') {
     problems.push(events.length
       ? `No maintenance recorded in the last ${CURRENCY_DAYS.maintenance} days — the last was on ${s(events[0].business_date)}, and no service contract is in force.`
       : 'No maintenance has been recorded for any unit, and no service contract (AMC) is on file.');
+    if (incidentsRecent.length) {
+      problems.push(`${plural(incidentsRecent.length, 'breakdown or out-of-use entry', 'breakdown or out-of-use entries')} in that time ${incidentsRecent.length === 1 ? 'is' : 'are'} listed, but a unit failing is not maintenance — record the repair or service that followed.`);
+    }
   }
   if (amcV.status === 'expiring') { status = worst(status, 'expiring'); problems.push(...amcV.problems); }
 
-  // Each unit's LATEST event sets its next-service date; an older one is history.
+  // Each unit's LATEST MAINTENANCE entry sets its next-service date; an older
+  // one is history. A breakdown after a service never hides that service's
+  // next-due date (it carries none of its own).
   const latestByUnit = new Map<string, any>();
   for (const e of events) {
     const k = s(e.equipment_id) || `label:${s(e.equipment_label)}`;
@@ -1846,33 +2022,46 @@ function maintenance(ctx: Ctx): Part {
     else if (d <= WARN_DAYS) { status = worst(status, 'expiring'); problems.push(`${s(e.equipment_label) || 'A unit'}: next service due on ${due} — ${until(due, ctx.today)}.`); }
   }
 
+  const from = periodicFrom(ctx);
+  const inWindow = all.filter((e) => s(e.business_date) >= from);
+  const maintInWindow = inWindow.filter(isMaint);
+  const incidentsInWindow = inWindow.length - maintInWindow.length;
+  // A breakdown / out-of-use line goes into the inspector's copy only BESIDE
+  // maintenance on file (an entry in these dates, or an AMC in force with its
+  // copy) — alone it would put "16. Equipment maintenance records" in the copy
+  // with no maintenance record in it.
+  const incidentsHanded = maintInWindow.length > 0 || amcV.status !== 'missing';
+
   p.status = status;
   p.problems = problems;
   p.lapses_on = earliest(lapses);
   p.headline = events.length
-    ? `${plural(recent.length, 'maintenance entry', 'maintenance entries')} in the last ${CURRENCY_DAYS.maintenance} days · last on ${s(events[0].business_date)}`
-    : amcV.best ? `AMC ${docLabel(amcV.best)}` : 'Nothing recorded';
+    ? `${plural(recent.length, 'maintenance entry', 'maintenance entries')} in the last ${CURRENCY_DAYS.maintenance} days · last on ${s(events[0].business_date)}` +
+      (incidentsInWindow ? ` · ${plural(incidentsInWindow, 'breakdown or out-of-use entry', 'breakdown or out-of-use entries')} listed with it` : '')
+    : amcV.best ? `AMC ${docLabel(amcV.best)}` + (incidentsInWindow ? ` · ${plural(incidentsInWindow, 'breakdown or out-of-use entry', 'breakdown or out-of-use entries')} listed` : '')
+      : incidentsInWindow ? `No maintenance recorded · ${plural(incidentsInWindow, 'breakdown or out-of-use entry', 'breakdown or out-of-use entries')} listed` : 'Nothing recorded';
   p.summary = [
     { label: 'Entries (92 days)', value: String(recent.length) },
     { label: 'Units', value: String(latestByUnit.size) },
     { label: 'AMC', value: amcV.best ? (amcV.best.expiry_date || 'no expiry') : '—' },
+    ...(incidentsInWindow ? [{ label: 'Breakdowns / out of use', value: String(incidentsInWindow) }] : []),
   ];
-  const from = periodicFrom(ctx);
-  const inWindow = events.filter((e) => s(e.business_date) >= from);
   p.tables = [
     table(`Maintenance from ${from}`, [
       { label: 'Date', width: 0.9 }, { label: 'Unit', width: 1.5 }, { label: 'What', width: 1.1 }, { label: 'Detail', width: 2.2 },
       { label: 'Done by', width: 1.2 }, { label: 'Ref.', width: 0.8 }, { label: 'Next due', width: 0.9 },
     ], inWindow.map((e) => row([
       s(e.business_date), s(e.equipment_label), s(e.event_kind).replace(/_/g, ' '), s(e.detail), s(e.performed_by), s(e.reference_no), s(e.next_due_date),
-    ], '/fssai/cold-rooms', s(e.event_kind) === 'breakdown' ? 'bad' : '')), ctx.limit),
+    ], '/fssai/cold-rooms', s(e.event_kind) === 'breakdown' ? 'bad' : '', isMaint(e) || incidentsHanded)), ctx.limit),
     table('Service contracts (AMC)', DOC_COLUMNS, docRows(amc), ctx.limit, 'No service contract is on file.'),
   ];
-  p.scans = [
-    ...amc.flatMap((d) => d.scans),
-    ...readScans(ctx.db, 'fssai_equipment_events', inWindow.slice(0, 6).map((e) => s(e.id)),
-      (id) => { const e = events.find((x) => s(x.id) === id); return e ? `${s(e.equipment_label)} — ${s(e.event_kind).replace(/_/g, ' ')} (${s(e.business_date)})` : 'Maintenance'; }),
-  ];
+  const eventScans = readScans(ctx.db, 'fssai_equipment_events', inWindow.slice(0, 6).map((e) => s(e.id)),
+    (id) => { const e = all.find((x) => s(x.id) === id); return e ? `${s(e.equipment_label)} — ${s(e.event_kind).replace(/_/g, ' ')} (${s(e.business_date)})` : 'Maintenance'; });
+  for (const sc of eventScans) {
+    const e = all.find((x) => s(x.id) === sc.entity_id);
+    if (e && !isMaint(e) && !incidentsHanded) sc.in_handover = false;
+  }
+  p.scans = [...amc.flatMap((d) => d.scans), ...eventScans];
   if (p.status !== 'present') p.todo = todo;
   return p;
 }
@@ -1883,7 +2072,8 @@ function calibration(ctx: Ctx): Part {
   p.links = [DOCS_LINK, { href: '/fssai/cold-rooms', label: 'Cold Room Climate Control' }];
   p.basis =
     "From Documents & Certificates (\"Calibration certificate\", filed against the instrument). Each instrument's latest certificate is judged on its own; " +
-    'in force with a copy → PRESENT, inside its renewal window → EXPIRING, expired or no copy → MISSING. In-house probe checks are listed alongside.';
+    'in force with a copy → PRESENT, inside its renewal window → EXPIRING, expired or no copy → MISSING. In-house probe checks are listed alongside; ' +
+    'they are not certificates, never decide it, and without a certificate in force they are not handed over.';
   const todo =
     'Have the thermometers and probes calibrated by an accredited lab and file each certificate under Documents & Certificates as "Calibration certificate", with a scan.';
   const miss = absent(ctx.present, ['fssai_documents']);
@@ -1931,6 +2121,11 @@ function calibration(ctx: Ctx): Part {
       ], '/fssai/cold-rooms', intOr(e.is_fail) ? 'bad' : ''));
     }
   }
+  // The in-house probe checks are listed BESIDE the certificates and never
+  // decide. Without a certificate the inspector's copy can carry, they stay out
+  // of it: "17. Calibration certificates" is never handed over holding none.
+  const certHanded = p.tables.some((t) => t.handover_rows > 0) || p.scans.some((sc) => isLiveCopy(sc) && sc.in_handover);
+  if (!certHanded) for (const r of inHouse) r.in_handover = false;
   if (inHouse.length) {
     p.tables.push(table(`In-house calibration checks from ${ctx.since}`, [
       { label: 'Date', width: 0.9 }, { label: 'Instrument', width: 1.8 }, { label: 'Before', width: 0.7, align: 'right' },
@@ -1986,8 +2181,9 @@ function previousAudit(ctx: Ctx): Part {
   p.basis =
     'The last visit recorded under Inspection Reports, its report (a copy filed under Documents & Certificates as "Previous audit report and closure evidence", ' +
     'linked to the visit, or photographed onto the visit), and every point it raised with what was done and the photographs of the fix (on the point or on ' +
-    'its corrective action). PRESENT when a report copy is on file and every point is closed; EXPIRING while points are open but not yet due; MISSING without ' +
-    'a copy, or when an open point is past its due date. Voided pages and photographs are kept and listed, never counted.';
+    'its corrective action). PRESENT when a copy of THAT visit\'s report is on file and every point is closed; EXPIRING while points are open but not yet due; MISSING without ' +
+    'a copy, or when an open point is past its due date. An audit report linked to another visit, or to none, is listed but is not the last visit\'s report. ' +
+    'Voided pages and photographs are kept and listed, never counted.';
   const todo =
     'Record the last visit under Inspection Reports with each point it raised, close each point with what was done (and a photograph of the fix), and link or photograph the authority\'s report onto the visit.';
   const miss = absent(ctx.present, ['fssai_inspections', 'fssai_inspection_findings', 'fssai_documents']);
@@ -2004,22 +2200,29 @@ function previousAudit(ctx: Ctx): Part {
   const last = visits[0];
   const ev = last && ctx.present.has('fssai_attachments') ? readFssaiVisitClosureEvidence(ctx.db, [s(last.id)]).get(s(last.id)) : undefined;
 
-  // THE REPORT COPIES — every audit-report document on file, plus the visit's
-  // own report pages, plus the linked document when it is not already one of
-  // the audit-report documents (no copy counted twice).
-  const scans: AuditFileScan[] = reportDocs.flatMap((d) => d.scans);
-  let copies = reportDocs.reduce((a, d) => a + d.stored, 0);
+  // THE REPORT COPIES — of the LAST VISIT ONLY: the document linked to it (its
+  // live scans) and the pages photographed onto the visit itself. That is
+  // ev.report.copies, the closure lane's own count, so this record and the
+  // Inspection Reports screen cannot disagree. An audit-report document that
+  // belongs to another visit, or is linked to none, is listed under "Audit
+  // reports on file" — but it is never THIS visit's report: counting it would
+  // let a newer visit with no report of its own read PRESENT on an older one.
+  const scans: AuditFileScan[] = [];
   const visitLabel = last ? `Report of the visit on ${s(last.business_date)}` : 'Report';
+  const linkedId = ev?.report.document?.id || '';
+  let copies = 0;
   if (ev) {
+    copies = ev.report.copies;
     const doc = ev.report.document;
-    if (doc && !reportDocs.some((d) => d.id === doc.id)) {
-      scans.push(...doc.scans.map((f) => closureScan(f, `${visitLabel} — ${doc.title || doc.doc_type_label}`)));
-      if (!doc.voided) copies += doc.live_scans;
-    }
+    if (doc) scans.push(...doc.scans.map((f) => closureScan(f, `${visitLabel} — ${doc.title || doc.doc_type_label}`)));
     scans.push(...ev.report.files.map((f) => closureScan(f, `${visitLabel} — page filed on the visit`)));
     scans.push(...ev.report.voided_files.map((f) => closureScan(f, `${visitLabel} — page filed on the visit`)));
-    copies += ev.report.files.filter((f) => f.has_image).length;
   }
+  // With no visit recorded at all, a filed audit report is the only record of
+  // the last audit there is: its live copies stand (no points to judge).
+  if (!last) copies = reportDocs.reduce((a, d) => a + d.stored, 0);
+  const otherReports = reportDocs.filter((d) => d.id !== linkedId);
+  scans.push(...otherReports.flatMap((d) => d.scans));
 
   const findings = last ? ctx.db.prepare(
     `SELECT f.id, f.finding_no, f.clause_ref, f.severity, f.observation, f.due_date, f.status, f.response, f.closed_at, f.closed_by,
@@ -2049,7 +2252,11 @@ function previousAudit(ctx: Ctx): Part {
   } else if (!copies) {
     status = 'missing';
     problems.push(last
-      ? `The visit on ${s(last.business_date)}${s(last.authority) ? ` by ${s(last.authority)}` : ''} is recorded, but no live copy of its report is on file.`
+      ? `The visit on ${s(last.business_date)}${s(last.authority) ? ` by ${s(last.authority)}` : ''} is recorded, but no live copy of its report is on file.` +
+        (otherReports.length
+          ? ` ${otherReports.length === 1 ? 'The audit report on file is' : `The ${otherReports.length} audit reports on file are`} not linked to this visit, so ${otherReports.length === 1 ? 'it is' : 'they are'} not its report — ` +
+            'link the right one to the visit on Inspection Reports, or photograph the report\'s pages onto the visit.'
+          : '')
       : 'An audit report is recorded, but no copy of it is attached.');
   }
   if (ev && ev.report.document_problem) problems.push(ev.report.document_problem);
@@ -2101,6 +2308,10 @@ function previousAudit(ctx: Ctx): Part {
     table('Audit reports on file', DOC_COLUMNS, docRows(reportDocs), ctx.limit, 'No audit report document is on file.'),
   ];
   p.scans = scans;
+  // The last visit with no report copy of its own: nothing of this record goes
+  // into the inspector's copy — not the visit list, not another visit's report
+  // printed under "20. Previous audit report" as if it were the last one.
+  if (last && !copies) keepOutOfHandover(p.tables, p.scans);
   if (p.status !== 'present') p.todo = todo;
   return p;
 }
@@ -2218,8 +2429,14 @@ const BUILDERS: Record<AuditFileKey, (ctx: Ctx) => Part> = {
   training: (ctx) => handlerRecord(ctx, 'training'),
   vendors,
   receiving,
+  // The log is one reading per UNIT under Temperature Logs. The cold-store
+  // checklist's "coldest chiller / freezer reading seen on this round" is one
+  // spot figure for the whole round — its own description says "the
+  // temperature of each unit is logged separately under Temperature Logs" —
+  // so it never counts here, and the todo never sends anyone to it.
   cold_temps: (ctx) => tempLog(ctx, 'cold_temps', ['equipment'], ['equipment'], 'refrigerator or freezer reading',
-    'Read every refrigerator, freezer and cold room on its round and record it under Temperature Logs (or on the cold-store checklist).',
+    'Read every refrigerator, freezer and cold room on its round and record each unit\'s reading under Temperature Logs (kind "Equipment"). ' +
+    'The cold-store checklist\'s single "reading seen on this round" does not replace this log.',
     [{ href: '/fssai/temperature', label: 'Temperature Logs' }, { href: '/fssai/cold-rooms', label: 'Cold Room Climate Control' }]),
   cooking_temps: (ctx) => tempLog(ctx, 'cooking_temps', ['cooking', 'reheating', 'cooling', 'hot_holding'], ['cooking', 'reheating'],
     'cooking or reheating temperature',
@@ -2285,8 +2502,10 @@ export function buildAuditFile(db: Database.Database, today: string, opts: Audit
     part.voided_scans = voided;
     part.scans = part.scans.filter((x) => x.status !== 'void');
     // HELD — one rule for all 20, from what the record will actually print:
-    // a line the handover may carry, or a LIVE copy still stored.
-    part.held = part.tables.some((t) => t.handover_rows > 0) || part.scans.some(isLiveCopy);
+    // a line the handover may carry, or a LIVE copy still stored that the
+    // handover may carry (not the scan of an expired paper, not a file that
+    // only travels beside a record the copy does not hold).
+    part.held = part.tables.some((t) => t.handover_rows > 0) || part.scans.some((sc) => isLiveCopy(sc) && sc.in_handover);
     return { n: rec.n, key: rec.key, title: rec.title, ...part };
   });
 

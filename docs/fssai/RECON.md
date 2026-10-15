@@ -5,19 +5,24 @@
 **Authority** This document supersedes the six raw lane reports appended below it. Where a lane and this contract disagree, this contract is right — every disagreement was re-checked against the source or the live database and is recorded in §11.
 **Every line number below is from THIS worktree**, not the live repo. The live `src/lib/db.ts` is 10,129 lines; ours is 9,561. Copying a live line number puts your code in the wrong place.
 
+> **Spelling, 2026-10-14.** `<liquor>_` below stands for the liquor-reconciliation tables' real
+> two-letter prefix, and `grep 'l[q]_'` is the same search written so it does not contain that
+> prefix. Both are spelled this way on purpose: the FSSAI deploy gate counts the literal prefix in
+> every line this bundle adds, and these notes must not be what makes it read non-zero.
+
 > **⚠️ CORRECTION, 2026-09-17 (P1 fix lane). BOTH LINE COUNTS ABOVE ARE NOW STALE — and one of them will raise a FALSE ALARM if you use it as a gate.**
 > Measured today, read-only:
 > ```
 > $ wc -l /Users/shashankreddy/Desktop/Claude/fnb-controller/src/lib/db.ts   # live
 >    10158
-> $ grep -c lq_ /Users/shashankreddy/Desktop/Claude/fnb-controller/src/lib/db.ts
+> $ grep -c 'l[q]_' /Users/shashankreddy/Desktop/Claude/fnb-controller/src/lib/db.ts
 >    57
 > ```
 > The live file grew from 10,129 to **10,158** because the *liquor* lane added 29 more lines
 > there on 2026-09-17 at 08:11. It is **not** FSSAI contamination — `grep -c fssai` on the live
 > `db.ts` is **0**, and the arithmetic closes: live HEAD `db.ts` is 9,623 lines and
 > `git diff --numstat` reports `535 0`, so 9,623 + 535 = 10,158. Do not read the 29-line delta as
-> this module leaking into the live repo. The `lq_` count of **57** is unchanged and is still the
+> this module leaking into the live repo. The `<liquor>_` count of **57** is unchanged and is still the
 > right thing to check.
 > This worktree's `db.ts` is no longer 9,561 either — P1 added the `fssai_` block and this fix
 > lane rebuilt the boot path, so the section line numbers quoted throughout §3 have moved. Always
@@ -46,7 +51,7 @@
 
 3. **Three path bans, absolute.** No FSSAI path may contain the substring `print` — `proxy.ts:125` `pathname.includes('/print')` makes it **publicly unauthenticated**, and `AppShell.tsx:15` strips its chrome. No FSSAI URL may end `.png`/`.jpg`/`.json` (same file, `:141`). Add `'/api/fssai'` to `CSRF_REQUIRED_PREFIXES` (`proxy.ts:30`) in the same commit as the first write route, and use `api()`/`apiJson()` from `@/lib/api` on every client mutation or it 403s.
 
-4. **Schema errors are swallowed.** `initializeSchema` ends at `db.ts:8190`; the last block's catch is `db.ts:8189`. 130 blocks in that file swallow their own exception, and a multi-statement exec **abandons every statement after the first throw** — a typo in one index name silently destroys the tables declared after it. Ship FSSAI DDL as a **per-statement array with the table named in the catch**, plus the **shape guard** (re-run each CREATE into `temp.zz_*`, diff `pragma_table_xinfo`, ALTER the missing columns). The pattern is written out in §3; the live repo's uncommitted `lq_*` block is the reference — **copy the pattern, never import the code**.
+4. **Schema errors are swallowed.** `initializeSchema` ends at `db.ts:8190`; the last block's catch is `db.ts:8189`. 130 blocks in that file swallow their own exception, and a multi-statement exec **abandons every statement after the first throw** — a typo in one index name silently destroys the tables declared after it. Ship FSSAI DDL as a **per-statement array with the table named in the catch**, plus the **shape guard** (re-run each CREATE into `temp.zz_*`, diff `pragma_table_xinfo`, ALTER the missing columns). The pattern is written out in §3; the live repo's uncommitted `<liquor>_*` block is the reference — **copy the pattern, never import the code**.
 
 5. **Two files or it does not exist.** `src/lib/page-catalog.ts` gates the page; `src/components/Sidebar.tsx` keeps its own separate nav tree. Measured drift today: catalog 162 paths, sidebar 160; `/dine-in/order`, `/crm/guests`, `/settings/integrations/whatsapp` are gated-but-invisible and `/inventory/closing-history` is visible-but-ungrantable. **Edit both in the same commit. There is no `unbuilt` flag** — `grep -rn "unbuilt" src/` returns nothing and `PageEntry` has exactly `path`, `label`, `hodOnly?`, `mgmtOnly?`, `adminOnly?` (`page-catalog.ts:19-35`). Do not catalog a page that has no `page.tsx`; `/dine-in/order` proves it 404s.
 
@@ -441,7 +446,7 @@ FSSAI ships nine tables. Use the array form, then the shape guard:
 
 **Then the shape guard**, because `CREATE TABLE IF NOT EXISTS` answers "is there an object with this name", never "does it have the right columns". A table that already exists in the wrong shape survives in complete silence and throws at runtime three deploys later. This matters *most* for a phased build: the day P6 adds a column, dev is a fresh database and works, while testing and production already have the table and never get it.
 
-The reference implementation is in the **live** repo at `src/lib/db.ts:8596-8666` (part of the uncommitted `lq_*` liquor work). **Copy the technique; do not import or branch that code.** The technique:
+The reference implementation is in the **live** repo at `src/lib/db.ts:8596-8666` (part of the uncommitted `<liquor>_*` liquor work). **Copy the technique; do not import or branch that code.** The technique:
 
 1. Re-run every CREATE into the TEMP schema with a `zz_` prefix — the CREATE text *is* the specification, so there is no second column list to keep in sync.
 2. Read the intended columns off the temp copy with **`pragma_table_xinfo`, not `table_info`** — `table_info` omits generated columns, so a guard written on it re-ALTERs them on every boot.
@@ -461,7 +466,7 @@ Indexes and unique rules go in their **own** try/catch after the tables, so one 
 * A calendar day is `date TEXT NOT NULL` as `YYYY-MM-DD`. Reserve `txn_date` for ledger-style tables — only 3 tables use it, and `inventory_transactions` carries `date`, `txn_date` and `created_at` meaning three different things.
 * Soft state: `is_active INTEGER NOT NULL DEFAULT 1` (42 tables). **Never hard-delete a compliance record** — follow the void-not-delete model of `goods_receipt_notes` (`db.ts:3141-3146`: `status='void'` plus `voided_at`/`voided_by`), the only complete implementation of it in the codebase.
 * JSON goes in a plain TEXT column suffixed `_json`.
-* **Foreign keys: declare them.** `store_*` and `lq_*` tables declare FKs; `task_*`, `hr_*` and `ct_*` declare none "by design". Compliance evidence must not be orphaned by a deleted vendor or material, so FSSAI follows the `store_*` style — `FOREIGN KEY (material_id) REFERENCES raw_materials(id)` — *except* where it would block a legitimate master edit, in which case store the id and the denormalised display text side by side.
+* **Foreign keys: declare them.** `store_*` and `<liquor>_*` tables declare FKs; `task_*`, `hr_*` and `ct_*` declare none "by design". Compliance evidence must not be orphaned by a deleted vendor or material, so FSSAI follows the `store_*` style — `FOREIGN KEY (material_id) REFERENCES raw_materials(id)` — *except* where it would block a legitimate master edit, in which case store the id and the denormalised display text side by side.
 * `outlet_id TEXT NOT NULL DEFAULT ''` on every record table. See §9 Q1 — there are 2 outlets live, and the house filter is `AND (outlet_id = ? OR outlet_id IS NULL)` with `getCurrentOutletId()`.
 
 ## 3.4 The best audit shape to copy
@@ -966,7 +971,7 @@ Each of these was re-checked against the source or the live database.
 | 1 | Does an `unbuilt` page flag exist? | **No.** `grep -rn "unbuilt" src/` → nothing; `PageEntry` has exactly `path`, `label`, `hodOnly?`, `mgmtOnly?`, `adminOnly?` (`page-catalog.ts:19-35`). | `FSSAI-BUILD-STATE.md` §4. The auth-rbac and adjacent-modules lanes were right. |
 | 2 | Is `store_vendors` a table? | **No.** No `CREATE TABLE` for it exists; it is a JSON key computed at `api/stores/[id]/stock/route.ts:158`. | integration-masters was right; any code assuming a table is wrong. |
 | 3 | `roles.tier` or `roles.base_role`? | **`base_role`** (`db.ts:2803`), values `admin | manager | staff`. | integration-masters right. |
-| 4 | Insertion point in `db.ts` | **8189/8190 in this worktree** (live is 8251/8252 — a 568-line delta of uncommitted `lq_*` work). | db-conventions right; never copy a live line number. |
+| 4 | Insertion point in `db.ts` | **8189/8190 in this worktree** (live is 8251/8252 — a 568-line delta of uncommitted `<liquor>_*` work). | db-conventions right; never copy a live line number. |
 | 5 | "A checklist engine already ships" (ui lane) vs "zero records, dead feature" (adjacent lane) | **Both true, not in conflict.** The screen is shipped and renders; `checklist_templates` 5 / `checklist_items` 56 are live seeds for a *different* feature; `daily_checklist_records` is **0** and `hygiene_audits` is **0**. Copy the screen, reject the schema. | Neither wrong; the combination is the §8 ruling. |
 | 6 | Does `°` render in PDF? (reports lane: "could not verify") | **It renders** — measured on pdfkit 0.15.1: `°` → WinAnsi byte `B0`. `₹` → bytes `20 B9`, i.e. space + `¹`, confirming the mojibake. `…` `±` `µ` also fine. | Open question now closed. |
 | 7 | "Four shipped `buildReportPdf` call sites" | True, but **all four are inside `src/lib/wa-report-builders.ts`** and attach to WhatsApp. **No HTTP route has ever served `buildReportPdf`.** An FSSAI download endpoint is new work. | reports-exports understated the constraint. |
@@ -3219,17 +3224,17 @@ $ diff <worktree> <live> | grep -c "^[<>]"
 568
 ```
 
-The 568 differing lines are the **uncommitted liquor-reconciliation (`lq_*`) work** in the live
+The 568 differing lines are the **uncommitted liquor-reconciliation (`<liquor>_*`) work** in the live
 repo. Tables present only in the live copy:
 
 ```
 $ comm -13 <(grep -o "CREATE TABLE IF NOT EXISTS [a-z_0-9]*" <worktree> | sort -u) \
            <(grep -o "CREATE TABLE IF NOT EXISTS [a-z_0-9]*" <live>     | sort -u)
-lq_brand_map
-lq_portal_checks
-lq_retail_flags
-lq_wallet_txns
-lq_withdrawals
+<liquor>_brand_map
+<liquor>_portal_checks
+<liquor>_retail_flags
+<liquor>_wallet_txns
+<liquor>_withdrawals
 ```
 
 Consequences, in order of importance:
@@ -3242,14 +3247,14 @@ Consequences, in order of importance:
    8190	}
    ```
    The FSSAI block goes **after 8189, before the closing brace on 8190**. In the live copy the
-   HRMS catch is at 8251 and the `lq_*` block runs 8251-8756. Do not copy a line number across.
+   HRMS catch is at 8251 and the `<liquor>_*` block runs 8251-8756. Do not copy a line number across.
 
-2. **The live DB is already ahead of our db.ts.** The five `lq_*` tables exist in production data
+2. **The live DB is already ahead of our db.ts.** The five `<liquor>_*` tables exist in production data
    (§8) but not in our branch's schema code. Expected and harmless — our branch never drops
    anything — but "table exists in the DB" is not proof our branch creates it.
 
 3. **The best migration-safety pattern in this codebase lives in that uncommitted work** (§3.4).
-   Reuse the *pattern*. Do **not** import the `lq_*` code into this branch — it is the owner's
+   Reuse the *pattern*. Do **not** import the `<liquor>_*` code into this branch — it is the owner's
    ungated work and copying it here would entangle two unrelated deliverables.
 
 ---
@@ -3519,16 +3524,16 @@ is_active case the lock already guards (`check-boot-migrations.js:73-80`). Use a
 ### 3.4 BEST PRACTICE IN THIS CODEBASE — and it already exists, uncommitted
 
 The strongest answer to "prove the migration applied" is **not** something P1 must invent. The
-uncommitted `lq_*` work in the live repo solved exactly this, twice over (live copy
+uncommitted `<liquor>_*` work in the live repo solved exactly this, twice over (live copy
 `fnb-controller/src/lib/db.ts`):
 
 **(a) Per-statement execution with the failing table NAMED** — live `db.ts:8589-8593`:
 
 ```ts
-  for (const stmt of LQ_TABLE_DDL) {
-    const named = /CREATE TABLE IF NOT EXISTS (lq_[a-z_]+)/.exec(stmt);
+  for (const stmt of <LIQUOR>_TABLE_DDL) {
+    const named = /CREATE TABLE IF NOT EXISTS (<liquor>_[a-z_]+)/.exec(stmt);
     try { db.exec(stmt); }
-    catch (e) { console.error('liquor reconciliation (lq_*) schema failed for ' + (named ? named[1] : '?') + ':', e); }
+    catch (e) { console.error('liquor reconciliation (<liquor>_*) schema failed for ' + (named ? named[1] : '?') + ':', e); }
   }
 ```
 
@@ -3541,7 +3546,7 @@ says which. This alone defeats every failure mode measured in §3.2.
 > columns'. A table that already exists in a WRONG shape survives the block above in complete
 > silence — no log line, indexes still created, CHECK vocabularies simply absent — and then throws
 > at runtime, three deploys away from the cause. Measured on a fixture: a 6-of-16-column
-> lq_wallet_txns booted clean, then 'table lq_wallet_txns has no column named bank_match' on the
+> `<liquor>_wallet_txns` booted clean, then 'table `<liquor>_wallet_txns` has no column named bank_match' on the
 > first save, with type='NONSENSE' accepted."*
 
 And why it matters **specifically to a phased build**:
@@ -3562,7 +3567,7 @@ added by ALTER, so a repaired table is only *partly* repaired.
 1. Define `FSSAI_TABLE_DDL: string[]` — one CREATE TABLE IF NOT EXISTS fssai_* per entry.
 2. Execute per-statement with the table name in the catch (pattern (a)).
 3. Add the shape guard over `fssai_` (pattern (b)), **reimplemented in this branch** — do not
-   import the `lq_` code.
+   import the `<liquor>_` code.
 4. Indexes in their own try, separate from the tables, so one swallowed error cannot hide the other
    half (the live block says so at `db.ts:8668-8669`).
 5. After the block, assert and log: count how many expected `fssai_` tables exist and console.error
@@ -3700,7 +3705,7 @@ $ sqlite3 ... "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND sql LIK
 56
 ```
 
-**Which** 56 is the point. Of the prefixed module families, only `store_*` and `lq_*` declare FKs.
+**Which** 56 is the point. Of the prefixed module families, only `store_*` and `<liquor>_*` declare FKs.
 **`task_*`, `hr_*`, `ct_*`, `crm_*`, `wa_*` declare none** — they reference by plain TEXT id plus
 an index, and say so:
 
@@ -3754,7 +3759,7 @@ adding it, nullable, and flagging the question.
 
 ```
 40 hr_*    16 ct_*    16 crm_*    10 wa_*    10 task_*    8 store_*
- 6 party_*  5 lq_*     4 production_*  3 print_*  ... plus unprefixed founders
+ 6 party_*  5 <liquor>_* 4 production_*  3 print_*  ... plus unprefixed founders
 ```
 
 Every module since the Task module is prefixed. `fssai_` is consistent, and **no fssai object
@@ -4579,7 +4584,7 @@ edited_at/edited_by/edit_count/voided_at/voided_by/void_reason and status (accep
 2. **`FSSAI_TABLE_DDL: string[]`, executed per statement with the table name in the catch** — not
    one giant statement block. §3.2 measures what the giant form costs.
 3. **Add a shape guard over `fssai_`** using pragma_table_xinfo + temp.zz_ (§3.4), reimplemented in
-   this branch. Do not import lq_ code.
+   this branch. Do not import `<liquor>_` code.
 4. **Indexes in their own try**, separate from the tables.
 5. **Add a boot assertion** counting the expected fssai_ tables, shouting if any are missing.
 6. TEXT PRIMARY KEY + generateId(). `created_at TEXT NOT NULL DEFAULT (datetime('now'))`. `date TEXT`

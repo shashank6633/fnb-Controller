@@ -53,10 +53,19 @@ export async function GET(request: Request) {
 }
 
 /** GET ?register=1 — every vendor with its approval and the supplier licence on
- *  file, as one list. Read by /vendors (the register view and its download). */
+ *  file, as one list. Read by /vendors (the register view and its download).
+ *
+ *  SIGNED-IN ONLY. The proxy checks only that a session cookie is PRESENT on a
+ *  GET, so a forged or expired cookie reaches this handler, and the register
+ *  carries staff data (approval_by is the approving manager's login email) and
+ *  compliance data (licence number, expiry, document id). A failed session
+ *  lookup refuses too: it is never read as "no user, carry on". The ordinary
+ *  vendor GETs above are unchanged (they are what every purchasing screen reads,
+ *  and they carry none of the register's columns). */
 async function registerList(db: ReturnType<typeof getDb>) {
   const today = fssaiToday();
   const me = await getCurrentUser().catch(() => null);
+  if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
   if (!vendorRegisterReady(db)) {
     // Said, never shown as an empty register: an empty list here would read as
     // "nobody is approved" when the truth is "the columns did not migrate".

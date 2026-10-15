@@ -169,10 +169,10 @@ export async function GET(request: Request) {
         const holders = fssaiDocumentHolders(db, rows
           .filter((r) => fssaiDocType(r.doc_type)?.scope === 'person')
           .map((r) => ({ id: String(r.id), handler_id: r.handler_id, person_email: r.person_email })));
-        let valid = 0; let expiring = 0; let expired = 0;
-        const shaped = rows.map((r) => {
+        let valid = 0; let expiring = 0;
+        const shapedAll = rows.map((r) => {
           const state = fssaiDocState(r.expiry_date, today, intOr(r.reminder_days, 30));
-          if (state === 'expired') expired++; else if (state === 'expiring') expiring++; else valid++;
+          if (state === 'expiring') expiring++; else if (state !== 'expired') valid++;
           const scope = fssaiDocType(r.doc_type)?.scope || 'outlet';
           return {
             id: String(r.id),
@@ -192,20 +192,29 @@ export async function GET(request: Request) {
             copies: intOr(r.copies),
           };
         });
+        // AN EXPIRED PAPER IS NOT HANDED OVER (§7 Q11). A line reading EXPIRED
+        // is a sentence about a lapse, and for a person's certificate it names
+        // someone whose certificate is not in order — the very name the food
+        // handlers section keeps off this screen. So the handover lists the
+        // documents in force (the audit-file PDF's cover says the same: "those
+        // in force"), and the lapsed ones are named to management in prepare.
+        const shaped = shapedAll.filter((d) => d.state !== 'expired');
+        const lapsed = shapedAll.filter((d) => d.state === 'expired');
         sections.push({
           key: 'documents',
           title: 'Licence and certificates',
-          lead: 'The licences, certificates and reports held on file, with the validity worked out against today.',
+          lead: 'The licences, certificates and reports in force today, with the validity worked out against today.',
           available: true,
           summary: [
-            { label: 'On file', value: String(rows.length) },
+            { label: 'In force', value: String(shaped.length) },
             { label: 'Valid', value: String(valid) },
             { label: 'Within renewal window', value: String(expiring) },
-            { label: 'Past their date', value: String(expired) },
           ],
           rows: shaped,
-          prepare_note: expired
-            ? `${expired} document${expired === 1 ? '' : 's'} on file ${expired === 1 ? 'is' : 'are'} past its date and will show as such on the handover.`
+          prepare_note: lapsed.length
+            ? `${lapsed.length} document${lapsed.length === 1 ? ' is' : 's are'} past ${lapsed.length === 1 ? 'its' : 'their'} date and left off the handover: ` +
+              `${lapsed.map((d) => `${d.holder ? `${d.holder} — ` : ''}${d.title || d.type_label}${d.reference_no ? ` (no. ${d.reference_no})` : ''}, expired ${d.expiry_date}`).join('; ')}. ` +
+              'Renew each on Documents & Certificates (or void one filed by mistake).'
             : '',
         });
       } catch (e: any) {
