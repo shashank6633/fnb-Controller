@@ -44,7 +44,10 @@ import { packFactor } from '@/lib/pack-units';
  * anchor forward by three days while keeping the older quantity, and every
  * issue and consumption in between silently drops out of the balance. So adopt
  * refuses any pair that has moved since its count and names the count. The fix
- * is a fresh count, not a looser guard.
+ * is a fresh count, not a looser guard. The trap is measured from the count
+ * being ADOPTED, and refuses outright when a NEWER count exists for the pair
+ * (COUNT_NOT_CURRENT) — see adoptTrap() for what windowing from the current
+ * anchor instead let through.
  *
  * ── IDEMPOTENT, BY REFUSING ────────────────────────────────────────────────
  * One opening row per (department, material), ever. A second attempt is
@@ -119,6 +122,101 @@ function openingDate(row: { reference_id?: string | null; event_date?: string | 
  * stamp is the trap: 'T' (0x54) > ' ' (0x20) shifts a whole day of movement.
  */
 const LEDGER_TS_SQL = `REPLACE(SUBSTR(created_at, 1, 19), 'T', ' ')`;
+
+/**
+ * WHERE A CLOSING COUNT ANCHORS — a literal mirror of dept-ledger.ts's
+ * countAnchorAt() (not exported), for the same reason LEDGER_TS_SQL is one:
+ * MIN(IST day-end of the count date, when the count was saved), 19 chars.
+ * It is never trusted alone: adoptTrap() cross-checks the result against
+ * deptOnHand() and refuses on any disagreement, so if the two ever drift the
+ * adopt fails CLOSED instead of writing an opening.
+ */
+function countAnchorAt(date: string, createdAt: string): string {
+  const dayEnd = `${String(date || '').slice(0, 10)} 18:29:59`;
+  const s = String(createdAt ?? '').trim();
+  const saved = !s ? '' : /^\d{4}-\d{2}-\d{2}$/.test(s) ? `${s} 00:00:00` : s.slice(0, 19).replace('T', ' ');
+  return saved && saved < dayEnd ? saved : dayEnd;
+}
+
+/** One adopt refusal. `newer_count` and `not_the_anchor` mean the count being
+ *  adopted is not the one the balance stands on; `moved` means it is, but the
+ *  pair has moved since it. */
+type AdoptRefusal =
+  | { kind: 'newer_count'; newest_count_date: string; newest_count_qty: number; newest_count_at: string }
+  | { kind: 'not_the_anchor'; anchor_source: string; anchor_at: string | null; anchor_qty: number | null }
+  | { kind: 'moved'; moved_rows: number };
+
+/**
+ * THE ADOPT TRAP, measured from the ADOPTED count — never from whatever count
+ * currently anchors the pair.
+ *
+ * An opening row is stamped when it is WRITTEN (now) and carries the adopted
+ * count's quantity. The balance is unchanged by that only if (a) the adopted
+ * count IS the pair's anchor, and (b) nothing the balance counts has moved
+ * since it. Each refusal below is one way an adopt silently rewrites a balance:
+ *
+ *   newer_count — a later count exists. The opening would re-assert the OLDER
+ *     figure on top of it and drop every movement since the older count. When
+ *     one of those movements is a transfer leg, its twin stays on the other
+ *     department: measured before this check (scratchpad conserve-adopt,
+ *     adopt-x.cjs) — receiver side 4 kg in no ledger (K 5 + T 1 from 10
+ *     physical), sender side 4 kg in two (K 10 + M 4 from 10, after which the
+ *     send check let 10 kg leave a 6 kg shelf). The old trap could not see it
+ *     because it windowed from deptOnHand's CURRENT anchor — the newer count —
+ *     and nothing had moved since THAT.
+ *   not_the_anchor — the resolver the balance uses disagrees about which count
+ *     anchors the pair (duplicate same-date rows, or drift between this file's
+ *     countAnchorAt and dept-ledger's). Refused rather than guessed.
+ *   moved — the adopted count anchors the pair, but the ledger moved after it.
+ *     The window is the ledger's own rule ("A TRANSFER PAIR IS NEVER SPLIT",
+ *     dept-ledger deptOnHand): every movement after MAX(count, cutover floor),
+ *     and transfer legs after the count itself, never the floor. A movement
+ *     that rule leaves out of the balance today stays out after the opening, so
+ *     it cannot be dropped and is not counted here.
+ *
+ * Run twice: while planning (so every refusal is answered in one list), and
+ * again inside the IMMEDIATE write transaction, so nothing that posts between
+ * the plan and the write can be swallowed by the opening.
+ */
+function adoptTrap(
+  db: Db, departmentId: string, materialId: string,
+  adopted: { at: string; qty: number },
+): AdoptRefusal | null {
+  const counts = db.prepare(`
+    SELECT date, physical_stock, created_at FROM closing_stock
+     WHERE department_id = ? AND material_id = ?
+  `).all(departmentId, materialId) as Array<{ date: string; physical_stock: number; created_at: string }>;
+  let newest: { date: string; qty: number; at: string } | null = null;
+  for (const c of counts) {
+    const at = countAnchorAt(c.date, c.created_at);
+    if (at > adopted.at && (!newest || at >= newest.at)) newest = { date: String(c.date), qty: Number(c.physical_stock) || 0, at };
+  }
+  if (newest) return { kind: 'newer_count', newest_count_date: newest.date, newest_count_qty: r6(newest.qty), newest_count_at: newest.at };
+
+  const bal = deptOnHand(db, departmentId, materialId);
+  if (bal.anchorSource !== 'count' || bal.anchorAt !== adopted.at || r6(Number(bal.anchorQty)) !== r6(adopted.qty)) {
+    return { kind: 'not_the_anchor', anchor_source: bal.anchorSource, anchor_at: bal.anchorAt, anchor_qty: bal.anchorQty };
+  }
+
+  const floor = cutoverAt(db);
+  const windowFrom = floor && floor > adopted.at ? floor : adopted.at;
+  const moved = db.prepare(`
+    SELECT COUNT(*) AS n FROM department_material_transactions
+     WHERE department_id = ? AND material_id = ? AND type <> 'opening'
+       AND (${LEDGER_TS_SQL} > ?
+            OR (type IN ('transfer_out', 'transfer_in') AND ${LEDGER_TS_SQL} > ?))
+  `).get(departmentId, materialId, windowFrom, adopted.at) as { n: number } | undefined;
+  const n = Number(moved?.n) || 0;
+  return n > 0 ? { kind: 'moved', moved_rows: n } : null;
+}
+
+/** Thrown inside the write transaction when the re-run trap refuses — rolls
+ *  the whole cutover back; the route answers 409. */
+class AdoptRaced extends Error {
+  constructor(readonly materialId: string, readonly refusal: AdoptRefusal) {
+    super(`adopt refused at write time for ${materialId}: ${refusal.kind}`);
+  }
+}
 
 /* ────────────────────────────────────────────────────────────────────────────
  * GET — the runbook's checklist
@@ -339,6 +437,13 @@ export async function POST(request: Request) {
     ).get(departmentId) as { id: string; name: string; is_active: number } | undefined;
     if (!dept) return Response.json({ error: 'Unknown department' }, { status: 404 });
 
+    /* Resolved HERE, before the first ledger read, so nothing between the
+     * checks below and the write transaction awaits. An await in that gap
+     * (it used to sit just before the write) lets another request post a
+     * movement after the adopt trap passed and before the opening lands — and
+     * the opening, stamped later, would then swallow it. */
+    const outletId = await getCurrentOutletId();
+
     const warnings: string[] = [];
     if (!Number(dept.is_active)) {
       warnings.push(`${dept.name} is switched off — its opening balance will not be visible on the active-department screens.`);
@@ -394,26 +499,43 @@ export async function POST(request: Request) {
      * exists to prevent. */
     let intended: Array<{ material_id: string; quantity: number; unit: string | null; note: string }> = [];
     let adoptedCountIds: string[] = [];
+    /* adopt only: where each adopted count anchors (the ledger's count rule),
+     * which is what the adopt trap measures from. */
+    const adoptedAt = new Map<string, { at: string; qty: number }>();
     if (adopt) {
       const rows = db.prepare(`
-        SELECT id, material_id, physical_stock, notes
+        SELECT id, material_id, physical_stock, notes, created_at
           FROM closing_stock
          WHERE department_id = ? AND date = ?
          ORDER BY created_at
-      `).all(departmentId, cutoverDate) as Array<{ id: string; material_id: string; physical_stock: number; notes: string | null }>;
+      `).all(departmentId, cutoverDate) as Array<{ id: string; material_id: string; physical_stock: number; notes: string | null; created_at: string }>;
       if (rows.length === 0) {
         return Response.json(
           { error: `No closing count recorded for ${dept.name} on ${cutoverDate}. Record the count first (Inventory → Closing Stock), or send lines[].` },
           { status: 400 },
         );
       }
-      adoptedCountIds = rows.map(r => r.id);
-      intended = rows.map(r => ({
-        material_id: String(r.material_id),
-        quantity: Number(r.physical_stock) || 0,
-        unit: null,                     // already recipe units — see above
-        note: String(r.notes ?? ''),
-      }));
+      /* ONE line per material. The closing-stock writers upsert per
+       * (date, material, department), but nothing in the schema enforces it,
+       * and two rows for one material here would plan TWO opening rows for one
+       * pair. The later-anchoring row is the one the ledger anchors on; if the
+       * resolver disagrees, adoptTrap refuses (not_the_anchor). */
+      const byMat = new Map<string, (typeof rows)[number] & { at: string }>();
+      for (const r of rows) {
+        const at = countAnchorAt(cutoverDate, r.created_at);   // every row is dated cutoverDate (WHERE above)
+        const seen = byMat.get(String(r.material_id));
+        if (!seen || at >= seen.at) byMat.set(String(r.material_id), { ...r, at });
+      }
+      adoptedCountIds = [...byMat.values()].map(r => r.id);
+      intended = [...byMat.values()].map(r => {
+        adoptedAt.set(String(r.material_id), { at: r.at, qty: Number(r.physical_stock) || 0 });
+        return {
+          material_id: String(r.material_id),
+          quantity: Number(r.physical_stock) || 0,
+          unit: null,                     // already recipe units — see above
+          note: String(r.notes ?? ''),
+        };
+      });
     } else {
       const seen = new Set<string>();
       for (const l of rawLines) {
@@ -453,6 +575,7 @@ export async function POST(request: Request) {
     const badQty: Refused[] = [];
     const already: Array<{ material_id: string; name: string; cutover_date: string; quantity: number }> = [];
     const movedSinceCount: Array<{ material_id: string; name: string; moved_rows: number; count_at: string }> = [];
+    const notCurrent: Array<{ material_id: string; name: string; adopted_count_at: string } & Exclude<AdoptRefusal, { kind: 'moved' }>> = [];
 
     for (const it of intended) {
       const m = getMat.get(it.material_id) as Mat | undefined;
@@ -510,11 +633,18 @@ export async function POST(request: Request) {
        * refused. Owner rule says purchase/inventory screens LEAD with the
        * purchase unit, so a bare number is genuinely ambiguous on those very
        * materials — and the wrong guess on a 1,000 g/kg pack is the 1,000×
-       * error that has already bitten this database once. */
+       * error that has already bitten this database once.
+       *
+       * ADOPT IS NOT A BARE NUMBER. closing_stock.physical_stock is RECIPE
+       * units by contract (see the gather above, and dept-sheet/route.ts), and
+       * deptOnHand anchors on that same figure verbatim — so the basis is
+       * known, not guessed. Without this, adopt refused EVERY packed material
+       * with 'unit_required', a refusal the admin could not answer: adopt mode
+       * takes no lines, so there is nowhere to say the unit. */
       const pf = packFactor(m);
       const ru = norm(m.unit);
       const pu = norm(m.purchase_unit || m.unit);
-      const given = norm(it.unit);
+      const given = adopt ? ru : norm(it.unit);
       let basis: 'recipe' | 'purchase';
       if (!given) {
         if (pf > 1) {
@@ -539,32 +669,25 @@ export async function POST(request: Request) {
       const recipeQty = r6(basis === 'purchase' ? qty * pf : qty);
 
       /* ── the adopt trap ──────────────────────────────────────────────────
-       * Only in adopt mode, and only when a COUNT is what currently anchors
-       * this pair: if the department has moved since that count, writing the
-       * opening now would re-anchor forward and drop those movements out of the
-       * balance for good. windowFrom comes from deptOnHand — the SAME resolver
-       * the balance uses — so this guard and the balance can never disagree
-       * about where the window starts. */
-      /* TRANSFER LEGS count from the COUNT itself, not the window: a
-       * transfer_out / transfer_in is never cut by the cutover floor
-       * (dept-ledger deptOnHand, "A TRANSFER PAIR IS NEVER SPLIT"), so a leg
-       * between an old count and the floor IS in this pair's balance — and an
-       * opening written now would drop it while its twin stays on the other
-       * department. Same rule, fourth place it is implemented. */
+       * Measured from the ADOPTED count (adoptTrap, above): it must be the
+       * count the balance stands on, and the pair must not have moved since
+       * it — transfer legs from the count itself, never the floor (dept-ledger
+       * deptOnHand, "A TRANSFER PAIR IS NEVER SPLIT"; this is the fourth place
+       * that rule is implemented). It used to window from deptOnHand's CURRENT
+       * anchor, so adopting an older count after a newer one passed: the
+       * opening re-asserted the older figure and dropped every movement since. */
       if (adopt) {
-        const bal = deptOnHand(db, departmentId, m.id);
-        if (bal.anchorSource === 'count' && bal.windowFrom) {
-          const moved = db.prepare(`
-            SELECT COUNT(*) AS n FROM department_material_transactions
-             WHERE department_id = ? AND material_id = ? AND type <> 'opening'
-               AND (${LEDGER_TS_SQL} > ?
-                    OR (type IN ('transfer_out', 'transfer_in') AND ${LEDGER_TS_SQL} > ?))
-          `).get(departmentId, m.id, bal.windowFrom, bal.anchorAt || bal.windowFrom) as { n: number } | undefined;
-          const n = Number(moved?.n) || 0;
-          if (n > 0) {
-            movedSinceCount.push({ material_id: m.id, name: m.name, moved_rows: n, count_at: bal.windowFrom });
-            continue;
+        const a = adoptedAt.get(m.id);
+        const ref: AdoptRefusal | null = a
+          ? adoptTrap(db, departmentId, m.id, a)
+          : { kind: 'not_the_anchor', anchor_source: 'none', anchor_at: null, anchor_qty: null };
+        if (ref) {
+          if (ref.kind === 'moved') {
+            movedSinceCount.push({ material_id: m.id, name: m.name, moved_rows: ref.moved_rows, count_at: a ? a.at : '' });
+          } else {
+            notCurrent.push({ material_id: m.id, name: m.name, adopted_count_at: a ? a.at : '', ...ref });
           }
+          continue;
         }
       }
 
@@ -606,6 +729,33 @@ export async function POST(request: Request) {
           invalid: [...badQty, ...badUnit],
         },
         { status: 400 },
+      );
+    }
+    /* The count being adopted is not the one the balance stands on. Adopting
+     * it would put an OLDER figure on top of a newer count and drop every
+     * movement since — the kilos-in-two-ledgers / in-none case. Named, with the
+     * count date that WOULD be adoptable, and answered before MOVED_SINCE_COUNT
+     * because the admin's next step differs (adopt the newer date, not
+     * recount). */
+    if (notCurrent.length) {
+      const newerDates = [...new Set(notCurrent
+        .map(n => (n.kind === 'newer_count' ? n.newest_count_date : ''))
+        .filter(Boolean))].sort();
+      const latest = newerDates[newerDates.length - 1] || '';
+      return Response.json(
+        {
+          error:
+            `${notCurrent.length} material(s) in ${dept.name} are not standing on the ${cutoverDate} count` +
+            `${latest ? ` — a newer count exists (latest ${latest})` : ''}. Adopting the older count would overwrite the newer one and drop ` +
+            `every movement since it out of the balance. ` +
+            `${latest ? `Adopt the latest count date instead (cutover_date ${latest})` : 'Take a fresh count dated today and adopt that'}, ` +
+            `or send lines[] with the quantities on the shelf right now. Nothing was written.`,
+          code: 'COUNT_NOT_CURRENT',
+          latest_count_date: latest || null,
+          materials: notCurrent,
+          moved_since_count: movedSinceCount,
+        },
+        { status: 409 },
       );
     }
     if (movedSinceCount.length) {
@@ -651,7 +801,8 @@ export async function POST(request: Request) {
       );
     }
 
-    const outletId = await getCurrentOutletId();
+    /* outletId was resolved before the first ledger read — see above. From
+     * the trap to the write below there is deliberately no await. */
     const refId = `cutover:${cutoverDate}`;
     const noteBits = [
       countSheetId ? `count sheet ${countSheetId}` : '',
@@ -681,11 +832,23 @@ export async function POST(request: Request) {
      * One transaction. postDeptLedger is the ONLY writer of department stock —
      * it inserts the ledger row and maintains the department_materials cache as
      * one pair, and it throws on anything it will not accept, which rolls this
-     * whole cutover back rather than leaving a department half-opened. */
+     * whole cutover back rather than leaving a department half-opened.
+     *
+     * IMMEDIATE, and in adopt mode the trap runs AGAIN inside it, per pair,
+     * just before that pair's opening is posted. IMMEDIATE takes the write lock
+     * before the re-check reads, so no other connection can post a movement
+     * between the check and the opening that would then swallow it. */
     let stampedNow = '';
     const run = db.transaction(() => {
       const postedIds: string[] = [];
       for (const p of planned) {
+        if (adopt) {
+          const a = adoptedAt.get(p.material_id);
+          const ref: AdoptRefusal | null = a
+            ? adoptTrap(db, departmentId, p.material_id, a)
+            : { kind: 'not_the_anchor', anchor_source: 'none', anchor_at: null, anchor_qty: null };
+          if (ref) throw new AdoptRaced(p.material_id, ref);
+        }
         const res = postDeptLedger(db, {
           departmentId,
           materialId: p.material_id,
@@ -736,7 +899,23 @@ export async function POST(request: Request) {
         note: `Department cutover: ${dept.name} — ${planned.length} opening row(s) dated ${cutoverDate}`,
       });
     });
-    run();
+    try {
+      run.immediate();
+    } catch (e: unknown) {
+      if (!(e instanceof AdoptRaced)) throw e;
+      const name = mats.get(e.materialId)?.name || e.materialId;
+      return Response.json(
+        {
+          error:
+            `${name} in ${dept.name} changed while the cutover was being written ` +
+            `(${e.refusal.kind === 'moved' ? 'it moved after the ' + cutoverDate + ' count' : 'its ' + cutoverDate + ' count is no longer the latest'}). ` +
+            `Nothing was written. Run the cutover again.`,
+          code: e.refusal.kind === 'moved' ? 'MOVED_SINCE_COUNT' : 'COUNT_NOT_CURRENT',
+          materials: [{ material_id: e.materialId, name, ...e.refusal }],
+        },
+        { status: 409 },
+      );
+    }
 
     /* Read the balance back through deptOnHand — the same function every screen
      * uses — so the response PROVES the opening landed rather than asserting

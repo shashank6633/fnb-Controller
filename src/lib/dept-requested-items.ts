@@ -91,24 +91,34 @@ import { resolveDeptSet } from './dept-stock';
  * arm contributes nothing; it is what makes the escape hatch stick from the
  * first dept-tagged count onwards.)
  *
- * THE LEDGER-ARRIVAL UNION (2026-10-14 — direct receipts and transfers)
- * ---------------------------------------------------------------------
- * Two rails put stock on a department's shelf WITHOUT a requisition line:
- *   · 'direct_receipt' — a vendor delivery routed straight to the department by
- *     Settings → Direct Issue (meat / poultry / seafood land on Kitchen);
- *   · 'transfer_in'    — another department handed it over (Kitchen → Akan
- *     Tandoori).
- * Before this arm a material that only ever arrived that way could never be
- * COUNTED by the department holding it: Kitchen raises no requisitions, so its
- * routed meat was on no sheet at all, and a child department that received
- * chicken by transfer had no row to count it on. The arm adds every material a
- * department has ever RECEIVED on either rail — "ever", the same no-window rule
- * as the requisition arm above. Both types are positive by postDeptLedger's
- * sign contract, and the undo of each is a type of its own that is NOT in the
- * list, so no quantity test is needed (one could never fire). It can only
- * WIDEN a set, never narrow one, so the superset property
- * over dept-stock.DEPT_ITEM_SET_SQL still holds. A department with neither kind
- * of row gets exactly the set it had before.
+ * THE TRANSFER-ARRIVAL UNION (2026-10-14 — department → department transfers)
+ * --------------------------------------------------------------------------
+ * A transfer puts stock on the receiving department's shelf WITHOUT a
+ * requisition line: 'transfer_in', another department handed it over (Kitchen
+ * → Akan Tandoori). Without this arm a child department that received chicken
+ * only by transfer would have no row to count it on. The arm adds every
+ * material a department has ever RECEIVED BY TRANSFER — "ever", the same
+ * no-window rule as the requisition arm above. 'transfer_in' is positive by
+ * postDeptLedger's sign contract and has no undo type (a correction is a
+ * reverse TRANSFER, which writes a transfer_out on the receiver), so no
+ * quantity test is needed. It can only WIDEN a set, never narrow one, so the
+ * superset property over dept-stock.DEPT_ITEM_SET_SQL still holds.
+ *
+ * NO-TRANSFER PARITY — WHY 'direct_receipt' IS *NOT* IN THE LIST
+ * Production at 6cd5615 has no 'transfer_in' anywhere (code or data), so until
+ * the first transfer is SENT this arm returns nothing and every closing sheet
+ * is byte-identical to production. 'direct_receipt' (a Settings → Direct Issue
+ * vendor delivery landing on Kitchen) was in this list for one round and was
+ * taken out: Direct Issue is already deployed, so including it changed
+ * production Kitchen's dept-sheet on deploy with no transfer at all (+CHICKEN
+ * CURRY CUT, +NORWEGIAN SALMON, Kitchen 3 → 5 items, proven through the real
+ * route on a post-flow DB copy). Whether a department should count what it
+ * received ONLY by Direct Issue is the OWNER'S call, not this branch's — the
+ * POST already accepts such a count, and the "not on this list" escape hatch +
+ * the closing_stock arm above keep it on the sheet once counted. To widen it,
+ * add 'direct_receipt' to DEPT_LEDGER_ARRIVAL_TYPES_SQL below (both surfaces
+ * follow) after the owner rules. A department with no transfer_in row gets
+ * exactly the set it had before.
  *
  * LINE OWNERSHIP
  * --------------
@@ -122,11 +132,14 @@ import { resolveDeptSet } from './dept-stock';
 
 /**
  * The ledger types that ARRIVE stock on a department without a requisition
- * line — see "THE LEDGER-ARRIVAL UNION" above. Exported so the department
- * closing sheet (src/app/api/closing-stock/dept-sheet) builds its pair set from
- * the SAME list and the two surfaces cannot disagree about what is countable.
+ * line and so put a material on its closing sheet — see "THE TRANSFER-ARRIVAL
+ * UNION" above. ONLY 'transfer_in': 'direct_receipt' is deliberately absent
+ * (no-transfer parity with production; owner's call — see above). Exported so
+ * the department closing sheet (src/app/api/closing-stock/dept-sheet) builds
+ * its pair set from the SAME list and the two surfaces cannot disagree about
+ * what is countable.
  */
-export const DEPT_LEDGER_ARRIVAL_TYPES_SQL = `'direct_receipt', 'transfer_in'`;
+export const DEPT_LEDGER_ARRIVAL_TYPES_SQL = `'transfer_in'`;
 
 /**
  * SQL fragment restricting a `raw_materials rm` alias to one department set's

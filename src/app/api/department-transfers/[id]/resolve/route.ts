@@ -10,13 +10,19 @@ import { loadDepartments, canSeeTransfer, canDismissDispute, presentTransfer, tr
  * answer is …/reverse, not this.
  *
  * Body: { note, dispute_ids? }  — omit dispute_ids to close every open dispute
- * on the document that the caller may close.
+ * on the document that the caller may close. An EMPTY dispute_ids is refused
+ * (400): it names nothing, so it must never mean "all".
  *
  * Who (../access.ts canDismissDispute): the person who raised the dispute
  * (withdrawing their own claim), managers and admin. The sender's head alone
  * may not close a claim against their own department — they reverse it, or a
- * manager closes it.
+ * manager closes it — UNTIL both departments have counted the disputed line
+ * since it moved: then the take-back is refused (it would correct the books
+ * twice) and either department's head may close it.
  */
+
+const CLOSE_WHO = 'Only the person who raised a dispute, a manager or an admin can close it — or, once both ' +
+  'departments have counted it since the transfer, the head of either department.';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -45,19 +51,34 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     let target = open;
     if (body.dispute_ids !== undefined) {
       if (!Array.isArray(body.dispute_ids)) return Response.json({ error: 'dispute_ids must be an array' }, { status: 400 });
+      // An EMPTY list names nothing, so it closes nothing. It used to pass every
+      // check below vacuously (0 === 0, and .some() of nothing is false) and then
+      // reach the ledger as "no filter" = EVERY open dispute — so anyone who could
+      // see the transfer (the sender's own HOD and staff, an unrelated HOD, a
+      // visible_department_ids grantee) could silence the receiver's claim with a
+      // hand-made `dispute_ids: []`. Measured: 6 such callers got 200. The screen
+      // never sends [] (it sends dismissable_dispute_ids, and only when non-empty).
+      if (body.dispute_ids.length === 0) {
+        return Response.json({ error: 'dispute_ids is empty — name the disputes to close, or leave the field out to close every open dispute you may close.' }, { status: 400 });
+      }
       const want = new Set(body.dispute_ids.map((x: unknown) => String(x)));
       target = open.filter((d) => want.has(d.id));
       if (target.length !== want.size) {
         return Response.json({ error: `One or more of those disputes is not open on ${doc.transfer_no}` }, { status: 409 });
       }
-      if (target.some((d) => !canDismissDispute(me, d))) {
-        return Response.json({ error: 'Only the person who raised a dispute, a manager or an admin can close it.' }, { status: 403 });
+      if (target.some((d) => !canDismissDispute(me, d, doc, depts))) {
+        return Response.json({ error: CLOSE_WHO }, { status: 403 });
       }
     } else {
-      target = open.filter((d) => canDismissDispute(me, d));
+      target = open.filter((d) => canDismissDispute(me, d, doc, depts));
       if (open.length > 0 && target.length === 0) {
-        return Response.json({ error: 'Only the person who raised a dispute, a manager or an admin can close it.' }, { status: 403 });
+        return Response.json({ error: CLOSE_WHO }, { status: 403 });
       }
+    }
+    // Nothing open: say so here rather than hand the ledger an empty list (which
+    // it now refuses as naming nothing). Same 409 and words the ledger gave before.
+    if (target.length === 0) {
+      return Response.json({ error: `${doc.transfer_no} has no open dispute to close.` }, { status: 409 });
     }
 
     const updated = resolveDeptTransferDisputes(db, {

@@ -2,7 +2,8 @@ import type Database from 'better-sqlite3';
 import type { SessionUser } from '@/lib/auth';
 import { allowedDeptIds, canSeeAllDeptStock } from '@/lib/dept-stock';
 import {
-  isDeptTransferBlocked, type DeptTransferWithLines, type DeptTransferDisputeRow, type TransferEntryUnit,
+  isDeptTransferBlocked, deptTransferCountedSinceMessage,
+  type DeptTransferWithLines, type DeptTransferDisputeRow, type TransferEntryUnit,
 } from '@/lib/dept-ledger';
 import { toPurchaseQty } from '@/lib/pack-units';
 import { resolveDirectIssueBulk } from '@/lib/direct-issue';
@@ -75,7 +76,10 @@ export function bodyNumber(v: unknown): number {
  *   (withdrawing their own claim), managers and admin. NOT the sender's head
  *   or HOD — a claim against your own department is not yours to close, and
  *   the Head Chef role being manager tier does not make its holder a
- *   "manager" here (isAdminOrManager).
+ *   "manager" here (isAdminOrManager). ONE exception: once BOTH departments
+ *   have counted the disputed line since it moved, the claim can no longer
+ *   change any book (the take-back is refused, counted_since), and the head of
+ *   either department may close it too — see canDismissDispute.
  */
 
 export interface DeptLite {
@@ -149,10 +153,38 @@ export function canFlagDispute(user: SessionUser, doc: DeptTransferWithLines, al
   return canSendFrom(user, all.get(doc.to_department_id));
 }
 
-export function canDismissDispute(user: SessionUser, d: Pick<DeptTransferDisputeRow, 'raised_by' | 'status'>): boolean {
+/**
+ * Who may CLOSE one open dispute (moves nothing): the person who raised it,
+ * managers and admin — and, ONLY ONCE BOTH ENDS HAVE COUNTED the disputed
+ * line's material since it moved (dept-ledger line.counted_since.sender AND
+ * .receiver), the head of either department too.
+ *
+ * Why that one extra arm. A claim against your own department is not yours to
+ * close while it can still change the books — that is the rule above. Once both
+ * shelves have been counted since the transfer, it cannot: both books already
+ * say what is on each shelf, and the take-back is REFUSED (reason
+ * 'counted_since', or it would correct the books twice). The server's own words
+ * then say "close the dispute with a note"; without this arm the Kitchen head
+ * was told that and refused it (403), with the dispute sat in his "to settle"
+ * list and no button that worked. Measured (the-real-case order.cjs, ORDER=both,
+ * re-run as rc-fix order-fix.cjs).
+ *
+ * `doc` / `all` omitted = the strict rule only (fail closed for any caller that
+ * does not pass the document).
+ */
+export function canDismissDispute(
+  user: SessionUser,
+  d: Pick<DeptTransferDisputeRow, 'raised_by' | 'status' | 'line_id'>,
+  doc?: DeptTransferWithLines,
+  all?: Map<string, DeptLite>,
+): boolean {
   if (d.status !== 'open') return false;
   if (isAdminOrManager(user)) return true;
-  return String(d.raised_by || '').trim().toLowerCase() === String(user.email || '').trim().toLowerCase();
+  if (String(d.raised_by || '').trim().toLowerCase() === String(user.email || '').trim().toLowerCase()) return true;
+  if (!doc || !all) return false;
+  const c = doc.lines.find((l) => l.id === d.line_id)?.counted_since;
+  if (!c || !c.sender || !c.receiver) return false;
+  return canSendFrom(user, all.get(doc.from_department_id)) || canSendFrom(user, all.get(doc.to_department_id));
 }
 
 export type ReverseAuthority = 'receiver' | 'disputed_only';
@@ -165,13 +197,15 @@ export function reverseAuthority(user: SessionUser, doc: DeptTransferWithLines, 
 }
 
 /** The quantities a ONE-TAP reverse would move for this caller — exactly what
- *  dept-ledger's reverseDeptTransfer() uses when `lines` is omitted. */
+ *  dept-ledger's reverseDeptTransfer() uses when `lines` is omitted, including
+ *  leaving out a disputed line that was COUNTED since it moved (reversing it
+ *  would correct it twice — dept-ledger "a correction must not correct twice"). */
 function reversePrefill(doc: DeptTransferWithLines, authority: ReverseAuthority | null) {
   if (!authority) return [];
   const anyOpen = doc.lines.some((l) => l.qty_open_disputed > 1e-9);
   return doc.lines
     .map((l) => {
-      const q = anyOpen ? l.qty_open_disputed : (authority === 'receiver' ? l.qty_net : 0);
+      const q = anyOpen ? (l.counted_since ? 0 : l.qty_open_disputed) : (authority === 'receiver' ? l.qty_net : 0);
       const meta = { unit: l.unit, purchase_unit: l.purchase_unit, pack_size: l.pack_factor };
       return {
         line_id: l.id,
@@ -199,7 +233,11 @@ export function permissionsFor(user: SessionUser, doc: DeptTransferWithLines, al
     can_reverse: doc.status === 'posted' && prefill.length > 0,
     reverse_authority: authority,
     reverse_prefill: prefill,
-    dismissable_dispute_ids: doc.disputes.filter((d) => canDismissDispute(user, d)).map((d) => d.id),
+    /** For someone who could otherwise take a disputed line back: why one or
+     *  more disputed lines CANNOT be — counted since it moved — and what to do
+     *  instead. The same words the reverse refusal prints. null = nothing blocked. */
+    reverse_blocked: authority && doc.status === 'posted' ? deptTransferCountedSinceMessage(doc) : null,
+    dismissable_dispute_ids: doc.disputes.filter((d) => canDismissDispute(user, d, doc, all)).map((d) => d.id),
   };
 }
 

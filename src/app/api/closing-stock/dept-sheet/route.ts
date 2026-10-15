@@ -35,9 +35,10 @@ import { DEPT_LEDGER_ARRIVAL_TYPES_SQL } from '@/lib/dept-requested-items';
  * The house definition, shared with /api/department-stock: materials ever
  * ISSUED to that department, UNION materials ever COUNTED by it
  * (dept-stock.DEPT_ITEM_SET_SQL), UNION materials that ever ARRIVED on its
- * ledger with no requisition line — a Direct Issue delivery or a transfer from
- * another department (see the LEDGER ARRIVALS arm in the query). Deliberately
- * NOT rolled up to the parent —
+ * ledger BY TRANSFER from another department (see the TRANSFER ARRIVALS arm in
+ * the query; a Direct Issue delivery is deliberately NOT in it — no-transfer
+ * parity with production, owner's call). Deliberately NOT rolled up to the
+ * parent —
  * see above. Store-mapped (liquor) materials are excluded: they are counted in
  * their own store's closing, and the POST here rejects them too. A line the
  * STORE rejected is excluded only when it delivered nothing — see the long
@@ -239,15 +240,18 @@ export async function GET(request: Request) {
         SELECT cs.department_id AS dept_id, cs.material_id AS material_id
           FROM closing_stock cs
          WHERE cs.department_id IN (SELECT value FROM json_each(?))
-        -- LEDGER ARRIVALS (2026-10-14). Stock that reached THIS department with
-        -- no requisition line: a Direct Issue vendor delivery, or a transfer
-        -- from another department. Without this arm Kitchen could never count
-        -- the routed meat it holds (it raises no requisitions) and a child
-        -- department could never count chicken it received by transfer. Same
-        -- type list as DEPT_REQUESTED_ITEM_SQL (imported, never re-spelled),
-        -- no time window (the house "ever" rule). Both types are positive by
-        -- the ledger's sign contract and their undo types are not in the list.
-        -- It only ever ADDS pairs.
+        -- TRANSFER ARRIVALS (2026-10-14). Stock that reached THIS department
+        -- by transfer from another department ('transfer_in'), with no
+        -- requisition line. Without this arm a child department could never
+        -- count chicken it received by transfer. Same type list as
+        -- DEPT_REQUESTED_ITEM_SQL (imported, never re-spelled), no time window
+        -- (the house "ever" rule). 'transfer_in' is positive by the ledger's
+        -- sign contract and has no undo type. It only ever ADDS pairs, and
+        -- returns nothing until the first transfer is sent, so a database
+        -- without transfers gets production's sheet byte for byte.
+        -- 'direct_receipt' (Direct Issue deliveries, already deployed) is NOT
+        -- in the list on purpose: it changed production Kitchen's sheet with
+        -- no transfer at all. See dept-requested-items.ts "NO-TRANSFER PARITY".
         UNION
         SELECT dmt.department_id AS dept_id, dmt.material_id AS material_id
           FROM department_material_transactions dmt

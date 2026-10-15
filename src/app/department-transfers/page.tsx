@@ -21,7 +21,9 @@
  *
  * THIS PAGE DECIDES NOTHING. Who may send comes from `departments[].can_send`;
  * what a person may do with a document comes from its `permissions`
- * (can_flag_dispute, can_reverse + reverse_prefill, dismissable_dispute_ids);
+ * (can_flag_dispute, can_reverse + reverse_prefill, dismissable_dispute_ids,
+ * and reverse_blocked — the server's words for a disputed line that was counted
+ * since it moved and so must not be taken back, shown instead of the button);
  * the quantity that may leave is the server's `transferable`; the receivers and
  * their order are the server's (the sender's family first, then where
  * requisitions for these goods land). Every refusal is printed VERBATIM; the
@@ -101,6 +103,8 @@ interface TLine {
   unit: string; purchase_unit: string; pack_factor: number; pack_size: number;
   qty_sent: number; qty_reversed: number; qty_net: number; qty_open_disputed: number;   // RECIPE
   qty_sent_purchase: number; qty_reversed_purchase: number; qty_net_purchase: number; qty_open_disputed_purchase: number;
+  /** Disputed lines only: an end that COUNTED since it moved (a take-back would correct it twice). */
+  counted_since?: { receiver: { at: string } | null; sender: { at: string } | null } | null;
 }
 type DisputeKind = 'short' | 'wrong_item' | 'not_received';
 interface TDispute {
@@ -122,6 +126,8 @@ interface Perms {
   can_reverse: boolean;
   reverse_authority: 'receiver' | 'disputed_only' | null;
   reverse_prefill: PrefillLine[];
+  /** Why a disputed line cannot be taken back (counted since it moved), in the server's words. */
+  reverse_blocked?: string | null;
   dismissable_dispute_ids: string[];
 }
 interface Transfer {
@@ -726,6 +732,9 @@ export default function DepartmentTransfersPage() {
   /* what needs this person: open disputes they can settle (send back / close) */
   const needsMe = useMemo(() => attention.filter(t => t.dispute_status === 'open' && (
     t.permissions?.can_reverse
+    // Counted since it moved: no take-back, but the person still has to act
+    // (count the other side, or close it) — so it stays in front of them.
+    || !!t.permissions?.reverse_blocked
     || (t.permissions?.dismissable_dispute_ids || []).some(id => !isMe(t.disputes.find(d => d.id === id)?.raised_by || ''))
   )), [attention, isMe]);
   /** A document settled from the panel above carries its buttons THERE only. */
@@ -787,7 +796,9 @@ export default function DepartmentTransfersPage() {
           <div className="mt-0.5 break-words">“{d.reason}” — {whoIs(d.raised_by)}, {when(d.raised_at)}</div>
           {d.status === 'open' ? (
             <div className="mt-0.5">
-              {t.permissions?.can_reverse && t.permissions.reverse_authority === 'disputed_only'
+              {t.lines.find(l => l.id === d.line_id)?.counted_since
+                ? <>Nothing has moved. It has been counted since it was sent, so it cannot be taken back — that would correct the books twice.</>
+                : t.permissions?.can_reverse && t.permissions.reverse_authority === 'disputed_only'
                 ? <>Nothing has moved. It is with you: take it back if {clean(t.to_department_name)} is right — or a manager closes it with a note.</>
                 : <>Nothing has moved. Waiting on {clean(t.from_department_name)}: they take it back, or it is closed with a note.</>}
             </div>
@@ -828,9 +839,15 @@ export default function DepartmentTransfersPage() {
       && p.dismissable_dispute_ids.every(id => isMe(t.disputes.find(d => d.id === id)?.raised_by || ''));
     const sb = p.can_reverse && open;            // the one-tap correction of a claim
     const sbUnasked = p.can_reverse && !open && p.reverse_authority === 'receiver';
-    if (!p.can_flag_dispute && !p.can_reverse && p.dismissable_dispute_ids.length === 0) return null;
+    const blockedWhy = open ? str(p.reverse_blocked) : '';
+    if (!p.can_flag_dispute && !p.can_reverse && !blockedWhy && p.dismissable_dispute_ids.length === 0) return null;
     return (
       <div className="mt-2.5 space-y-2">
+        {blockedWhy && (
+          <div className="flex flex-nowrap items-start gap-2 text-xs text-amber-900 bg-amber-50 border border-amber-300 rounded-lg px-3 py-2">
+            <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" /> <span className="break-words">{blockedWhy}</span>
+          </div>
+        )}
         {sb && (
           <div className="rounded-lg border border-[#af4408]/30 bg-[#FFF1E3] p-2.5 space-y-2">
             <div className="text-[11px] text-[#6B5744]">

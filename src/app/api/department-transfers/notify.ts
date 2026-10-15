@@ -2,9 +2,9 @@ import type Database from 'better-sqlite3';
 import type { SessionUser } from '@/lib/auth';
 import { generateId } from '@/lib/db';
 import { sendPushToUser } from '@/lib/push';
-import type { DeptTransferWithLines, DeptTransferDisputeRow } from '@/lib/dept-ledger';
+import { countOpenDeptTransferDisputes, type DeptTransferWithLines, type DeptTransferDisputeRow } from '@/lib/dept-ledger';
 import { toPurchaseQty } from '@/lib/pack-units';
-import { canSendFrom, isAdminOrManager, type DeptLite } from './access';
+import { canSendFrom, isAdminOrManager, loadDepartments, type DeptLite } from './access';
 
 /* ══════════════════════════════════════════════════════════════════════════
  * TELLING THE SENDER'S SIDE A TRANSFER IS DISPUTED.
@@ -33,9 +33,17 @@ import { canSendFrom, isAdminOrManager, type DeptLite } from './access';
  *     themselves (alert_recipients), inside the flag's own transaction, so the
  *     record of who was told cannot be lost to a failed send.
  *  2. WEB PUSH, best-effort, per recipient.
- * The live count (GET /api/department-transfers → open_disputes_to_act, and
- * dept-ledger countOpenDeptTransferDisputes for a bell) is computed from
- * dispute_status, so it can never disagree with the screen.
+ *  3. THE BELL — the rail people actually see. Neither rail above reaches a
+ *     screen on its own: push needs a device subscription (this database has
+ *     none) and nothing renders the durable row. So the global bell
+ *     (/api/notifications/inbox, bucket 'dept_transfer_disputes') carries a
+ *     LIVE COUNT from openDisputesToActFor() below — the same shape as
+ *     grn-qc-notify's row + 'grn_qc_pending' bucket. It counts from
+ *     dispute_status, exactly as GET /api/department-transfers'
+ *     open_disputes_to_act does, so the badge and the page cannot disagree,
+ *     and it falls the moment the dispute is reversed or closed.
+ *     Measured before it existed (xfer-rulings-v probe §9): a fresh flag
+ *     reached 0 devices and 0 bells.
  *
  * SERVER ONLY, FIRE-AND-FORGET, NEVER THROWS: call AFTER the flag's
  * transaction has committed. A notification that fails must not fail — or
@@ -86,6 +94,23 @@ export function transferAlertRecipients(
     console.error('[department-transfers notify] recipient lookup failed (non-fatal):', e);
   }
   return [...out.values()];
+}
+
+/**
+ * Open disputes THIS PERSON is the one to act on: transfers with an open
+ * dispute out of every department they may send from (canSendFrom — its head,
+ * an HOD posted there; managers and admin: every department). The SAME figure
+ * as GET /api/department-transfers → open_disputes_to_act, from the same
+ * predicates, for the bell. Never throws (0 on any failure).
+ */
+export function openDisputesToActFor(
+  db: Database.Database, user: Pick<SessionUser, 'id' | 'role' | 'is_head_chef' | 'department_id'>,
+): number {
+  try {
+    const all = loadDepartments(db);
+    const actOn = isAdminOrManager(user) ? null : [...all.values()].filter((d) => canSendFrom(user, d)).map((d) => d.id);
+    return countOpenDeptTransferDisputes(db, actOn);
+  } catch { return 0; }
 }
 
 const KIND_WORDS: Record<string, string> = {

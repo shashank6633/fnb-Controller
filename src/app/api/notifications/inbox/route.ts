@@ -29,6 +29,8 @@ import { canApproveTasks } from '@/lib/tasks';
  *                        live pending state; see its own block for why.
  *   - plain staff      : their OWN requisitions by stage (with HOD / being
  *                        issued / fulfilled today)
+ *   - sending head/mgr : department transfers the RECEIVING department has
+ *                        disputed (the transfer dispute alert's visible rail)
  *
  * Bill discounts: the synchronous flow (POST /api/dine-in/orders/[id]/discount)
  * still verifies the approving Manager's login on the spot and never persists
@@ -310,6 +312,42 @@ export async function GET() {
       }
     } catch (qcErr) {
       console.error('[/api/notifications/inbox] grn-qc bucket failed:', qcErr);
+    }
+
+    // ── Department transfers DISPUTED by the receiving department ────────
+    // The owner's ruling: a dispute flag "records the dispute and alerts the
+    // sender's head and managers". The flag wrote a durable notifications row
+    // and tried web push — and NEITHER reached a screen: push needs a device
+    // subscription (none on this database) and nothing renders the row.
+    // Measured (xfer-rulings-v probe §9): a fresh flag, four people who should
+    // know, zero bells. This bucket is that alert's visible rail, built like
+    // grn_qc_pending above (row written at the event, LIVE COUNT here).
+    //
+    // WHO: exactly the people who can act — those who may send from the
+    // transfer's SENDING department (its head_user_id, an HOD posted there,
+    // managers, admin), through openDisputesToActFor(), which is the SAME
+    // figure GET /api/department-transfers returns as open_disputes_to_act.
+    // COUNT ≡ DESTINATION: it falls the moment the dispute is reversed or
+    // closed, and an HOD of another department is never badged.
+    //
+    // canAccessPage IS consulted, as for /grn/qc above: nobody is badged into
+    // a page the proxy would bounce them from. The real Head Chef role carries
+    // an explicit page list without /department-transfers, so until the owner
+    // ticks it in Settings → Roles a Head Chef gets no badge here — and could
+    // not have opened the page to act on one. A badge, not a permission.
+    //
+    // ONE item, count = transfers with an open dispute (never one per line).
+    // Isolated behind its own try/catch + dynamic import like every other
+    // additive bucket, so a transfer-schema fault can never darken the bell.
+    try {
+      const { canAccessPage } = await import('@/lib/page-catalog');
+      if (canAccessPage('/department-transfers', me)) {
+        const { openDisputesToActFor } = await import('@/app/api/department-transfers/notify');
+        push('dept_transfer_disputes', 'Department transfers disputed by the receiving side',
+          openDisputesToActFor(db, me), '/department-transfers');
+      }
+    } catch (dtErr) {
+      console.error('[/api/notifications/inbox] dept-transfer dispute bucket failed:', dtErr);
     }
 
     // ── Deliveries that came in OFF the purchase order ────────────────────

@@ -1465,6 +1465,7 @@ export type DeptTransferBlockReason =
   | 'insufficient'          // the sender does not hold enough
   | 'window'                // a leg would fall outside its pair's balance window
   | 'state'                 // not found / not posted / already disputed / nothing left
+  | 'counted_since'         // a disputed line was COUNTED since it moved — a reverse would correct it twice
   | 'idempotency_conflict'; // a client key reused for a DIFFERENT request
 
 /** Thrown by every transfer function below. Routes answer `httpStatus` with
@@ -1688,12 +1689,21 @@ function postDeptTransferInTxn(db: Database.Database, t: DeptTransferPost): Dept
     const basisNote = fromBefore.basis === 'counted'
       ? 'by its last count and the movements since'
       : 'by its ledger (it has never been counted)';
+    const avail = Math.max(0, fromBefore.available);
+    // Holding NOTHING is its own sentence: "Send 0 kg or less" told the Kitchen
+    // head to send nothing without saying why nothing was there (measured: the
+    // owner's three category rules miss category 'non-veg', so the chicken went
+    // to the central shelf and Kitchen's ledger got 0 — the-real-case ROUTE=none).
     throw blocked(
       'insufficient',
-      `${from.name} holds only ${fmtDual(Math.max(0, fromBefore.available), m)} of ${m.name} ${basisNote}; ` +
-      `cannot hand over ${fmtDual(q, m)}. Send ${fmtDual(Math.max(0, fromBefore.available), m)} or less, ` +
-      `or record a count for ${from.name} first.`,
-      { materialId: matId, requested: q, available: Math.max(0, fromBefore.available) },
+      avail > EPS
+        ? `${from.name} holds only ${fmtDual(avail, m)} of ${m.name} ${basisNote}; ` +
+          `cannot hand over ${fmtDual(q, m)}. Send ${fmtDual(avail, m)} or less, ` +
+          `or record a count for ${from.name} first.`
+        : `${from.name} holds none of ${m.name} ${basisNote}, so it cannot hand over ${fmtDual(q, m)}. ` +
+          `Goods reach ${from.name}'s books when a delivery is routed to ${from.name} (Direct Issue), ` +
+          `the store issues them, or ${from.name} records a count.`,
+      { materialId: matId, requested: q, available: avail },
     );
   }
   const toBefore = deptSendableFor(db, toId, matId);
@@ -1832,6 +1842,30 @@ export interface DeptTransferLineRow {
   qty_net: number;
   /** Computed: RECIPE units under an OPEN dispute and not yet reversed. */
   qty_open_disputed: number;
+  /**
+   * Computed, and ONLY for a line with an open dispute (null otherwise): which
+   * end has COUNTED this material since the line's legs posted — its count or
+   * cutover opening row now sits at/after its own leg, so that leg is absorbed
+   * and the department's books already say what is on its shelf. Either end
+   * set means a reverse would correct the disputed amount a SECOND time; see
+   * transferCountedSince().
+   */
+  counted_since: DeptTransferCountedSince | null;
+}
+
+/** Where a department's balance re-started after a transfer leg: its anchor. */
+export interface DeptTransferAnchorAfterLeg {
+  /** The anchor's normalised timestamp (UTC, 'YYYY-MM-DD HH:MM:SS'). */
+  at: string;
+  source: 'count' | 'opening';
+}
+
+/** Per disputed line: the anchor that absorbed each end's leg, or null. */
+export interface DeptTransferCountedSince {
+  /** The ORIGINAL RECEIVER (to_department) counted since its transfer_in. */
+  receiver: DeptTransferAnchorAfterLeg | null;
+  /** The ORIGINAL SENDER (from_department) counted since its transfer_out. */
+  sender: DeptTransferAnchorAfterLeg | null;
 }
 
 export interface DeptTransferDisputeRow {
@@ -2203,7 +2237,9 @@ export function flagDeptTransferDispute(
 /**
  * CLOSE open disputes WITHOUT moving stock — the claim was withdrawn or found
  * wrong ("it was in the walk-in"). A note is required and kept. The ROUTE
- * decides who may (the person who raised it, managers, admin).
+ * decides who may (the person who raised it, managers, admin) and passes the
+ * ids it authorised. disputeIds OMITTED = every open dispute; GIVEN = exactly
+ * those, and a given-but-EMPTY list is refused (it names nothing).
  */
 export function resolveDeptTransferDisputes(
   db: Database.Database, input: { transferId: string; user: string; note: string; disputeIds?: string[] },
@@ -2218,7 +2254,15 @@ export function resolveDeptTransferDisputes(
     const doc = getDeptTransfer(db, id);
     if (!doc) throw blocked('state', `Transfer ${id} does not exist.`, { httpStatus: 404 });
     const open = doc.disputes.filter((d) => d.status === 'open');
-    const want = input.disputeIds && input.disputeIds.length > 0 ? new Set(input.disputeIds.map(String)) : null;
+    // GIVEN means "exactly these", and an empty list names NOTHING — it must
+    // never fall through to "every open dispute". Only an OMITTED list means
+    // all open disputes (the route always passes the ids it authorised).
+    const want = input.disputeIds !== undefined && input.disputeIds !== null
+      ? new Set((Array.isArray(input.disputeIds) ? input.disputeIds : []).map(String))
+      : null;
+    if (want && want.size === 0) {
+      throw blocked('invalid', 'No dispute named — an empty list closes nothing.');
+    }
     const target = want ? open.filter((d) => want.has(d.id)) : open;
     if (want && target.length !== want.size) {
       throw blocked('state', `One or more of those disputes is not open on ${doc.transfer_no}.`);
@@ -2279,6 +2323,9 @@ export interface ReverseDeptTransferInput {
  * Each reverse line carries reverses_line_id; a line can never be reversed by
  * more than it moved. Open disputes on the reversed lines are settled oldest
  * first; a dispute is resolved once what was reversed covers what was claimed.
+ * A disputed line that either end has COUNTED since it moved is refused
+ * ('counted_since', 409) and left out of the prefill — the count already
+ * corrected that book (see "a correction must not correct twice").
  */
 export function reverseDeptTransfer(
   db: Database.Database, input: ReverseDeptTransferInput,
@@ -2330,10 +2377,27 @@ export function reverseDeptTransfer(
       // THE PREFILL. With an open dispute on the document: exactly the
       // disputed quantities, and nothing on an undisputed line. With none (a
       // receiver sending back of its own accord): everything still standing.
+      // A disputed line COUNTED since it moved is left out — reversing it would
+      // correct it twice (see "a correction must not correct twice" below);
+      // access.ts reversePrefill() leaves out exactly the same lines.
       const anyOpen = orig.lines.some((l) => l.qty_open_disputed > EPS);
       for (const line of orig.lines) {
-        const q = anyOpen ? line.qty_open_disputed : (authority === 'receiver' ? line.qty_net : 0);
+        const q = anyOpen ? (line.counted_since ? 0 : line.qty_open_disputed) : (authority === 'receiver' ? line.qty_net : 0);
         if (q > EPS) plan.push({ line, qty: r6(q), entryQty: null, entryUnit: '' });
+      }
+    }
+    // ── a correction must not correct twice ───────────────────────────────
+    // Any planned line that answers an OPEN dispute and was counted since it
+    // moved is refused outright (explicit lines), and a prefill left with
+    // nothing BECAUSE of that says why rather than "no open dispute".
+    {
+      const counted = (input.lines && input.lines.length > 0 ? plan.map((p) => p.line) : orig.lines)
+        .filter((l) => l.qty_open_disputed > EPS && !!l.counted_since);
+      if (counted.length > 0 && (plan.length === 0 || plan.some((p) => counted.some((c) => c.id === p.line.id)))) {
+        const msg = deptTransferCountedSinceMessage({ ...orig, lines: counted });
+        throw blocked('counted_since', msg || `${orig.transfer_no} was counted since it moved; reversing it would correct it twice.`, {
+          materialId: counted[0].material_id, requested: counted[0].qty_open_disputed, available: 0,
+        });
       }
     }
     if (plan.length === 0) {
@@ -2421,6 +2485,102 @@ export function reverseDeptTransfer(
   return run.immediate();
 }
 
+/* ── a correction must not correct twice ─────────────────────────────────────
+ * A reverse that ANSWERS A DISPUTE is a paper correction: the disputed goods
+ * never reached the receiver's shelf (short / not received / the wrong item
+ * came), so moving them back puts the books where the shelves already are.
+ * That is only true while both books still carry the original legs.
+ *
+ * A COUNT ENDS THAT. Under "A TRANSFER PAIR IS NEVER SPLIT" (deptOnHand) a leg
+ * dated before its own department's anchor is ABSORBED: the count measured the
+ * shelf with the goods already on (or already off) it. So:
+ *   · the RECEIVER counted after the send → its count holds only what arrived;
+ *     the shortfall is ALREADY off its books, and a reverse takes it off again.
+ *     Measured (xfer-rulings-v countrev.cjs): Kitchen sends 1 kg, Tandoori
+ *     counts 0.8, flags 0.2 short, Kitchen's HOD takes back 0.2 → Tandoori's
+ *     books 0.6 against 0.8 on the shelf; 0.2 kg in no ledger at all.
+ *   · the SENDER counted after the send → its count already holds whatever
+ *     never left; a reverse adds it again.
+ * Either way one physical kilo would no longer live in exactly one ledger, so
+ * the reverse is refused (reason 'counted_since') and the prefill leaves the
+ * line out. The fix is the count on the side that has NOT counted (when the
+ * goods are still somewhere), then closing the dispute with a note — nothing
+ * moves; deptTransferCountedSinceMessage() says exactly that.
+ *
+ * A send-back with NO open dispute is a PHYSICAL return — the goods are on the
+ * receiver's shelf now and move now — so a count in between is right and is
+ * not checked. Only the disputed (paper) part of a reverse is guarded.
+ *
+ * The window test is the ledger's own (anchorWindow: legFrom, and the rowid
+ * tie-break for an opening anchor), so this cannot disagree with a balance.
+ */
+
+/** The anchor that ABSORBED this ledger row (its department's count / opening
+ *  row is at or after it, by the transfer-leg window), or null when the row
+ *  still stands in its balance — or does not exist. */
+function legAbsorbedBy(db: Database.Database, txnId: string): DeptTransferAnchorAfterLeg | null {
+  const id = String(txnId || '').trim();
+  if (!id) return null;
+  try {
+    const row = db.prepare(`
+      SELECT rowid AS rid, department_id, material_id, ${LEDGER_TS_SQL} AS at
+        FROM department_material_transactions WHERE id = ?
+    `).get(id) as { rid: number; department_id: string; material_id: string; at: string } | undefined;
+    if (!row) return null;
+    const w = anchorWindow(db, String(row.department_id), String(row.material_id));
+    if (!w.anchor || !w.legFrom) return null;            // never counted: every leg stands
+    const at = String(row.at);
+    const stands = at > w.legFrom || (w.legTieRowid != null && at === w.legFrom && Number(row.rid) > w.legTieRowid);
+    return stands ? null : { at: w.legFrom, source: w.anchor.source };
+  } catch { return null; }
+}
+
+/** Both ends of one transfer line: which (if either) has counted since it moved. */
+export function transferCountedSince(db: Database.Database, outTxnId: string, inTxnId: string): DeptTransferCountedSince | null {
+  const sender = legAbsorbedBy(db, outTxnId);
+  const receiver = legAbsorbedBy(db, inTxnId);
+  return sender || receiver ? { sender, receiver } : null;
+}
+
+/**
+ * The words for a refused correction — ONE sentence per disputed line that was
+ * counted since it moved, saying what is already true and what to do instead.
+ * The reverse refusal and the screen (permissions.reverse_blocked) both print
+ * this, so they cannot disagree. null when no disputed line is affected.
+ */
+export function deptTransferCountedSinceMessage(doc: DeptTransferWithLines): string | null {
+  const parts: string[] = [];
+  const from = doc.from_department_name;
+  const to = doc.to_department_name;
+  const did = (a: DeptTransferAnchorAfterLeg) => (a.source === 'opening' ? 'took its cutover opening count of' : 'counted');
+  for (const l of doc.lines) {
+    const c = l.counted_since;
+    if (!c || l.qty_open_disputed <= EPS) continue;
+    const q = fmtDual(l.qty_open_disputed, { unit: l.unit, purchase_unit: l.purchase_unit, pack_size: l.pack_factor });
+    if (c.receiver && c.sender) {
+      parts.push(
+        `${from} and ${to} have both counted ${l.material_name} since ${doc.transfer_no} was sent, so both books ` +
+        `already match their shelves and the disputed ${q} is already accounted for. Taking it back would correct it ` +
+        `a second time. Close the dispute with a note — nothing needs to move.`);
+    } else if (c.receiver) {
+      parts.push(
+        `${to} ${did(c.receiver)} ${l.material_name} after ${doc.transfer_no} was sent, so its books already hold only ` +
+        `what reached its shelf: the disputed ${q} is already off them. Taking it back would take it off a second time. ` +
+        `If the ${q} is still at ${from}, record a count for ${from}; then close the dispute with a note — nothing moves.`);
+    } else if (c.sender) {
+      parts.push(
+        `${from} ${did(c.sender)} ${l.material_name} after ${doc.transfer_no} was sent, so its books already hold what is ` +
+        `on its shelf, including the disputed ${q} if it never left. Taking it back would add it a second time. ` +
+        `Record a count for ${to} so its books come down to what arrived; then close the dispute with a note — nothing moves.`);
+    }
+  }
+  if (parts.length === 0) return null;
+  // Who closes it — access.ts canDismissDispute: the flagger, a manager or an
+  // admin at any time; the head of either department once BOTH have counted.
+  return `${parts.join(' ')} The person who flagged it, a manager or an admin can close it; once both ` +
+    `${from} and ${to} have counted it, either department's head can close it too.`;
+}
+
 /* ── reading ────────────────────────────────────────────────────────────── */
 
 /** One transfer document with its lines (reversed / net / disputed figures
@@ -2438,7 +2598,7 @@ export function getDeptTransfer(db: Database.Database, transferId: string): Dept
       SELECT id, transfer_id, material_id, material_name, unit, purchase_unit, pack_factor, qty_sent,
              entry_qty, entry_unit, out_txn_id, in_txn_id, reverses_line_id, notes, created_at
         FROM department_transfer_lines WHERE transfer_id = ? ORDER BY created_at ASC, rowid ASC
-    `).all(doc.id) as Array<Omit<DeptTransferLineRow, 'qty_reversed' | 'qty_net' | 'qty_open_disputed'>>;
+    `).all(doc.id) as Array<Omit<DeptTransferLineRow, 'qty_reversed' | 'qty_net' | 'qty_open_disputed' | 'counted_since'>>;
     const disputes = db.prepare(`
       SELECT id, transfer_id, line_id, kind, qty_disputed, entry_qty, entry_unit, reason, raised_by, raised_at,
              status, resolution, resolution_note, resolved_by, resolved_at, qty_reversed, reverse_transfer_id,
@@ -2461,7 +2621,13 @@ export function getDeptTransfer(db: Database.Database, transferId: string): Dept
         .filter((d) => d.line_id === l.id && d.status === 'open')
         .reduce((s, d) => s + Math.max(0, (Number(d.qty_disputed) || 0) - (Number(d.qty_reversed) || 0)), 0);
       const net = r6(l.qty_sent - rev);
-      return { ...l, qty_reversed: rev, qty_net: net, qty_open_disputed: r6(Math.min(openDisputed, Math.max(0, net))) };
+      const qtyOpenDisputed = r6(Math.min(openDisputed, Math.max(0, net)));
+      return {
+        ...l, qty_reversed: rev, qty_net: net, qty_open_disputed: qtyOpenDisputed,
+        // Only a disputed line can be reversed as a CORRECTION, so only it pays
+        // for the two anchor look-ups (lists stay cheap).
+        counted_since: qtyOpenDisputed > EPS ? transferCountedSince(db, l.out_txn_id, l.in_txn_id) : null,
+      };
     });
     const reversedBy = db.prepare(`
       SELECT id, transfer_no, created_at, created_by FROM department_transfers
