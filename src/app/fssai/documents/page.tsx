@@ -54,6 +54,9 @@ interface FileRow {
   id: string; kind: string; kind_label: string; data_uri: string; has_image: boolean;
   filename: string; caption: string; size_bytes: number; image_dropped_at: string;
   created_by: string; created_at: string;
+  /** 'void' = voided as filed in error: kept, image and all, and never a copy. */
+  status?: 'active' | 'void'; is_void?: boolean;
+  voided_at?: string; voided_by?: string; void_reason?: string;
 }
 interface Doc {
   id: string; doc_code: string; doc_type: string; doc_type_label: string;
@@ -65,13 +68,20 @@ interface Doc {
   days_to_expiry: number | null;
   owner_email: string; department_id: string; department_name: string;
   vendor_id: string; vendor_name: string; person_email: string; equipment_id: string;
+  /** The food handler a person's certificate is filed against (login or not). */
+  handler_id?: string; handler_status?: string;
+  /** Whose paper this is, in words, for a person's certificate ('' otherwise). */
+  holder_label?: string;
   supersedes_id: string;
   supersedes: { id: string; title: string; expiry_date: string; reference_no: string } | null;
   superseded_by_id: string; version: number; notes: string;
   status: string; status_label: string; is_active: boolean;
   voided_at: string; voided_by: string; void_reason: string;
   created_by: string; created_at: string; updated_at: string;
+  /** LIVE scans only. A voided scan is not a copy of the document. */
   file_count: number; files: FileRow[]; file_limit: number; is_editable: boolean;
+  /** Voided scans: kept, image and all, and shown apart, marked VOID. */
+  void_file_count?: number; voided_files?: FileRow[];
 }
 interface Counts { expired: number; expiring: number; valid: number; no_expiry: number; all: number }
 
@@ -174,6 +184,27 @@ function expiryWords(d: Doc): string {
   if (d.days_to_expiry < 0) return `Lapsed ${Math.abs(d.days_to_expiry)} day${Math.abs(d.days_to_expiry) === 1 ? '' : 's'} ago`;
   if (d.days_to_expiry === 0) return 'Expires today';
   return `Expires in ${d.days_to_expiry} day${d.days_to_expiry === 1 ? '' : 's'}`;
+}
+
+/**
+ * Whose paper this is, in words.
+ *
+ * A person's certificate (medical fitness, FoSTaC, training) names the PERSON,
+ * using the register's name and number from the route's holder_label. A cook with
+ * no login has no email, and this cell used to fall through to the department or
+ * "the restaurant", as if the kitchen held the certificate. A holder who has left
+ * or was voided on the register is said so, because their paper no longer covers
+ * anybody working here.
+ */
+function whoseWords(d: Doc): string {
+  if (d.doc_scope === 'person' || d.handler_id || d.person_email) {
+    const who = d.holder_label || d.person_email;
+    if (!who) return 'nobody on the register';
+    if (d.handler_status === 'left') return `${who} (left)`;
+    if (d.handler_status === 'void') return `${who} (voided on the register)`;
+    return who;
+  }
+  return d.vendor_name || d.equipment_id || d.department_name || 'the restaurant';
 }
 
 /* ══════════════════════════════════════════════════════════════════════════ */
@@ -419,16 +450,18 @@ export default function FssaiDocumentsPage() {
                         </td>
                         <td className="px-3 py-2 text-[#6B5744]">{d.doc_type_label}</td>
                         <td className="px-3 py-2 text-[#6B5744]">{d.reference_no || '—'}</td>
-                        <td className="px-3 py-2 text-[#6B5744]">
-                          {d.vendor_name || d.person_email || d.equipment_id || d.department_name || 'the restaurant'}
-                        </td>
+                        <td className="px-3 py-2 text-[#6B5744]">{whoseWords(d)}</td>
                         {/* The red is on the DATE CELL, which is the house
                             treatment for overdue (RECON §1.5) — not a new badge. */}
                         <td className={`px-3 py-2 whitespace-nowrap ${d.state === 'expired' ? 'text-red-700 font-semibold' : d.state === 'expiring' ? 'text-amber-700' : 'text-[#6B5744]'}`}>
                           {d.expiry_date ? `${fmtISTDate(d.expiry_date)} · ${expiryWords(d)}` : '—'}
                         </td>
                         <td className="px-3 py-2"><Badge label={d.state_label} color={d.state_color} /></td>
-                        <td className="px-3 py-2 text-right text-[#6B5744]">{d.file_count || '—'}</td>
+                        <td className="px-3 py-2 text-right text-[#6B5744] whitespace-nowrap">
+                          {d.file_count || '—'}
+                          {/* Voided scans are kept and counted apart, never as a copy. */}
+                          {d.void_file_count ? <span className="text-xs text-[#8B7355]"> · {d.void_file_count} void</span> : null}
+                        </td>
                       </tr>
                     ))}
                   </tbody>
@@ -864,10 +897,7 @@ function DocDetail({
             <F k="Valid from" v={row.valid_from ? fmtISTDate(row.valid_from) : 'not recorded'} />
             <F k="Expires" v={row.expiry_date ? `${fmtISTDate(row.expiry_date)} — ${expiryWords(row)}` : 'no expiry recorded'} />
             <F k="Warning window" v={`${row.reminder_days} days before`} />
-            <F
-              k="Whose"
-              v={row.vendor_name || row.person_email || row.equipment_id || row.department_name || 'the restaurant'}
-            />
+            <F k="Whose" v={whoseWords(row)} />
             <F k="Responsible for renewing" v={row.owner_email || 'nobody named'} />
             <F k="Filed by" v={`${row.created_by} · ${fmtIST(row.created_at)}`} />
             <F k="Reminder last sent" v={row.last_reminder_at ? fmtIST(row.last_reminder_at) : 'never — nothing sends one yet'} />
@@ -904,48 +934,19 @@ function DocDetail({
             <p className="text-xs text-[#8B7355]">A newer version of this document has been filed.</p>
           )}
 
-          <div>
-            <p className={`${LABEL} mb-1`}>The document itself</p>
-            <div className="flex flex-wrap items-center gap-2">
-              {row.files.map((f) => (
-                <div key={f.id} className="relative">
-                  {f.has_image ? (
-                    <ImageThumb src={f.data_uri} alt={f.filename || row.title} size={72} />
-                  ) : (
-                    <div
-                      className="w-[72px] h-[72px] rounded-lg border border-[#E8D5C4] bg-[#FFF1E3] flex items-center justify-center text-[10px] text-center text-[#8B7355] px-1"
-                      title={`Image removed ${fmtIST(f.image_dropped_at)}. The record of it remains.`}
-                    >
-                      image kept 12 months
-                    </div>
-                  )}
-                  {canVoid && f.has_image && (
-                    <button
-                      onClick={() => {
-                        const reason = window.prompt('Why is this scan being removed? The record of it stays either way.');
-                        if (!reason || reason.trim().length < 4) { say('A reason of at least four characters is needed.'); return; }
-                        post({ action: 'remove_file', attachment_id: f.id, reason }, 'Scan removed; the record of it stays.');
-                      }}
-                      aria-label="Remove this scan"
-                      className="absolute -top-1.5 -right-1.5 w-6 h-6 rounded-full bg-white border border-[#E8D5C4] shadow text-red-600"
-                    >
-                      <Trash2 size={11} className="mx-auto" />
-                    </button>
-                  )}
-                </div>
-              ))}
-              {!row.voided_at && row.files.length < row.file_limit && (
-                <ImageUpload
-                  value={[]} thumbSize={72} label="Add a page" disabled={busy}
-                  onAdd={(uri) => post({ action: 'attach', data_uri: uri, kind: 'certificate' }, 'Page attached.')}
-                />
-              )}
-            </div>
-            <p className="text-[11px] text-[#8B7355] mt-1">
-              {row.files.length} of {row.file_limit} pages. The picture is kept for twelve months; the record that it
-              existed, its size and its fingerprint are kept for good.
-            </p>
-          </div>
+          <DocScans
+            row={row} canVoid={canVoid} busy={busy}
+            onVoid={(f) => {
+              const reason = window.prompt(
+                'Void this scan? Do this only for a scan filed by mistake (the wrong paper, an unreadable photo).\n\n'
+                + 'It is NOT deleted: it stays on this document, marked void, with your reason, and stops counting as a copy.\n\n'
+                + 'Why is it being voided?',
+              );
+              if (!reason || reason.trim().length < 4) { say('A reason of at least four characters is needed.'); return; }
+              post({ action: 'void_file', attachment_id: f.id, reason: reason.trim() }, 'Scan voided. It stays on the document, marked void, with your reason.');
+            }}
+            onAttach={(uri) => post({ action: 'attach', data_uri: uri, kind: 'certificate' }, 'Page attached.')}
+          />
 
           <div className="flex flex-wrap gap-2 pt-2 border-t border-[#E8D5C4]">
             {row.is_editable && (
@@ -982,6 +983,94 @@ function DocDetail({
         </>
       )}
     </Modal>
+  );
+}
+
+/**
+ * THE SCANS ON ONE DOCUMENT: the live pages first, then the VOIDED ones.
+ *
+ * FSSAI evidence is voided, never deleted. A scan filed by mistake is marked void
+ * with who, when and why; the route keeps it, image and all, and returns it under
+ * voided_files. Before 2026-10-15 this panel listed only `files`, so a voided scan
+ * vanished from the screen although the database still held it. It is now shown
+ * here, apart from the live pages and marked VOID. It is not a copy of the
+ * document, and nothing counts it as one.
+ *
+ * Document scans are never deleted automatically (owner ruling Q22, 2026-10-14;
+ * only checklist photographs follow the 12-month sweep), so nothing here says
+ * "kept 12 months".
+ */
+function DocScans({
+  row, canVoid, busy, onVoid, onAttach,
+}: {
+  row: Doc; canVoid: boolean; busy: boolean;
+  onVoid: (f: FileRow) => void; onAttach: (dataUri: string) => void;
+}) {
+  const voided = row.voided_files || [];
+  const noImage = (f: FileRow, size: number) => (
+    <div
+      className="rounded-lg border border-[#E8D5C4] bg-[#FFF1E3] flex items-center justify-center text-[10px] text-center text-[#8B7355] px-1"
+      style={{ width: size, height: size }}
+      title={f.image_dropped_at
+        ? `The image was dropped on ${fmtIST(f.image_dropped_at)}. The record that it existed, its size and its fingerprint remain.`
+        : 'No image is held for this file. The record that it existed remains.'}
+    >
+      no image held
+    </div>
+  );
+  return (
+    <div>
+      <p className={`${LABEL} mb-1`}>The document itself</p>
+      <div className="flex flex-wrap items-center gap-2">
+        {row.files.map((f) => (
+          <div key={f.id} className="relative">
+            {f.has_image ? <ImageThumb src={f.data_uri} alt={f.filename || row.title} size={72} /> : noImage(f, 72)}
+            {canVoid && f.has_image && !row.voided_at && (
+              <button
+                onClick={() => onVoid(f)}
+                aria-label="Void this scan"
+                title="Void this scan (filed by mistake). It stays on the document, marked void."
+                className="absolute -top-1.5 -right-1.5 w-6 h-6 rounded-full bg-white border border-[#E8D5C4] shadow text-red-600"
+              >
+                <Trash2 size={11} className="mx-auto" />
+              </button>
+            )}
+          </div>
+        ))}
+        {!row.voided_at && row.files.length < row.file_limit && (
+          <ImageUpload value={[]} thumbSize={72} label="Add a page" disabled={busy} onAdd={onAttach} />
+        )}
+      </div>
+      <p className="text-[11px] text-[#8B7355] mt-1">
+        {row.files.length} of {row.file_limit} pages. Scans are never deleted. A scan filed by mistake is voided: it
+        stays on this document, marked void, with the reason.
+      </p>
+
+      {voided.length > 0 && (
+        <div className="mt-3">
+          <p className={`${LABEL} mb-1`}>
+            Voided scans ({voided.length}). Kept as filed, and not counted as a copy of the document.
+          </p>
+          <ul className="space-y-2">
+            {voided.map((f) => (
+              <li key={f.id} className="flex flex-nowrap items-start gap-2">
+                <div className="shrink-0 opacity-60">
+                  {f.has_image ? <ImageThumb src={f.data_uri} alt={`Voided scan: ${f.filename || row.title}`} size={56} /> : noImage(f, 56)}
+                </div>
+                <div className="min-w-0 text-xs text-[#6B5744]">
+                  <Badge label="VOID" color="bg-gray-100 text-gray-700 border-gray-300" />
+                  <p className="mt-1 text-sm text-[#2D1B0E] break-words">{f.void_reason || 'No reason recorded'}</p>
+                  <p className="text-[11px] text-[#8B7355] mt-0.5">
+                    Voided {f.voided_at ? fmtIST(f.voided_at) : 'at an unrecorded time'} by {f.voided_by || 'an unrecorded person'}
+                    {' · '}filed {fmtIST(f.created_at)} by {f.created_by || 'an unrecorded person'}
+                  </p>
+                </div>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </div>
   );
 }
 

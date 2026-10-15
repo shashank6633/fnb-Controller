@@ -534,6 +534,9 @@ export function buildAuditFilePdf(spec: AuditPdfSpec): Promise<Buffer> {
       para(`${sa.counts.lines} lines: ${sa.counts.yes} YES · ${sa.counts.no} NO${sa.counts.na ? ` · ${sa.counts.na} not applicable` : ''}${sa.counts.unanswered ? ` · ${sa.counts.unanswered} not answered` : ''}.` +
         (readiness && sa.rounds_in_window ? ` ${sa.rounds_in_window} round${sa.rounds_in_window === 1 ? '' : 's'} of this page in the file's dates.` : ''),
       { size: 9.5, color: MUTED, gap: 8 });
+      // Management copy only: an answer whose stored question no longer reads as
+      // the authority's line with its code — laid by its words, or listed apart.
+      if (readiness) for (const d of sa.drift || []) para(`•  ${d}`, { size: 9, color: TONE.warn });
     }
 
     const cw = [W * 0.6, W * 0.07, W * 0.07, W * 0.26];

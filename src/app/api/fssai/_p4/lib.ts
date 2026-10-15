@@ -669,14 +669,83 @@ export function fssaiCurveMembers(
     .map((x) => x.m);
 }
 
-/** Has any live reading on this curve reached its goal? */
-export function fssaiCurveReached(members: FssaiCurveMember[], logKind: string): FssaiCurveMember | null {
+/** Has any live reading on this curve reached its goal?
+ *
+ *  `fallbackGoal` is the BATCH's goal (fssaiCurveRule), for a reading that carries
+ *  none of its own — one filed before cooling or reheating was switched on, which
+ *  froze no target. Closing round 2026-10-15: without it a batch whose 4 °C was
+ *  filed before the rule existed read as never having got there. */
+export function fssaiCurveReached(
+  members: FssaiCurveMember[],
+  logKind: string,
+  fallbackGoal: number | null = null,
+): FssaiCurveMember | null {
   const dir = fssaiTempDirection(logKind);
   for (const m of members) {
-    if (m.status === 'void' || m.value === null || m.goal === null) continue;
-    if (dir === 'hot' ? m.value >= m.goal : m.value <= m.goal) return m;
+    const goal = m.goal ?? fallbackGoal;
+    if (m.status === 'void' || m.value === null || goal === null) continue;
+    if (dir === 'hot' ? m.value >= goal : m.value <= goal) return m;
   }
   return null;
+}
+
+/** The rule one batch is judged on — see fssaiCurveRule. */
+export interface FssaiCurveRule {
+  /** Minutes allowed to reach the target; null = no clock. */
+  limit: number | null;
+  goal: number | null;
+  /**
+   * 'batch'   — frozen on the batch's FIRST READING JUDGED ON A CLOCK (its first
+   *             reading, unless that one was filed before the rule existed).
+   * 'current' — no reading on the batch was ever judged on a clock (all filed
+   *             before the rule existed): the rule as it stands now, which is what
+   *             the next reading on it would be judged on.
+   * 'none'    — no rule then and none now.
+   */
+  source: 'batch' | 'current' | 'none';
+  /** The reading the rule is frozen on ('batch' only). */
+  member: FssaiCurveMember | null;
+  /** The current rule's starting temperature ('current' only), for the line. */
+  anchor: number | null;
+}
+
+/**
+ * THE RULE A BATCH IS JUDGED ON — its time limit and its target — for the overdue
+ * jobs, the batch's summary and the write path alike.
+ *
+ * SWITCHED ON HALF-WAY (closing round 2026-10-15). A batch whose first reading was
+ * filed before the administrator created the cooling (or reheating) rule froze no
+ * time limit on that reading. Its later readings WERE judged on the rule — but the
+ * overdue jobs and the batch summary read the limit off the first reading only, so
+ * such a batch counted as "unjudged" for ever: abandoned, never raised, "in
+ * progress" twelve hours in. The rule is therefore read off the batch's first
+ * reading that was judged on a clock; and when none was, off the rule as it stands
+ * now — the same rule the route applies to the next reading on that batch.
+ */
+export function fssaiCurveRule(db: Database.Database, logKind: string, members: FssaiCurveMember[]): FssaiCurveRule {
+  const none: FssaiCurveRule = { limit: null, goal: null, source: 'none', member: null, anchor: null };
+  const live = members.filter((m) => m.status !== 'void');
+  const ruled = live.find((m) => m.max_minutes !== null) || null;
+  if (ruled) return { limit: ruled.max_minutes, goal: ruled.goal, source: 'batch', member: ruled, anchor: null };
+  const first = live[0];
+  if (!first) return none;
+  let row: any = null;
+  try {
+    row = db.prepare(`SELECT equipment_id, equipment_kind, material_id, uom FROM fssai_temperature_logs WHERE id = ?`).get(first.id);
+  } catch { row = null; }
+  if (!row) return none;
+  const range = resolveFssaiRange(db, {
+    logKind, equipmentId: str(row.equipment_id), equipmentKind: str(row.equipment_kind),
+    materialId: str(row.material_id), uom: str(row.uom) || 'C',
+  });
+  if (range.source === 'none' || range.max_minutes === null || !(range.max_minutes > 0)) return none;
+  /* A rule written in another unit than the batch was read in is not applied —
+   * the route refuses such a reading rather than converting it. */
+  if ((range.uom === 'C' || range.uom === 'F') && range.uom !== (str(row.uom) || 'C')) return none;
+  const dir = fssaiTempDirection(logKind);
+  const goal = range.target !== null ? range.target : (dir === 'hot' ? range.min : range.max);
+  if (goal === null) return none;
+  return { limit: range.max_minutes, goal, source: 'current', member: null, anchor: range.start_value };
 }
 
 export type FssaiCurveResolution =
@@ -696,8 +765,21 @@ export type FssaiCurveResolution =
        *  before this one — null when none has. The verdict then judges "still
        *  there" or "gone back past it", never the schedule line. */
       reached: FssaiCurveMember | null;
+      /** The batch's first reading JUDGED ON A CLOCK — the rule (time limit,
+       *  target, bounds) and the schedule line are frozen on it. Its first
+       *  reading, unless that one was filed before the rule existed; null when
+       *  none was (the reading is then judged on the rule as it is now). */
+      rule: FssaiCurveMember | null;
     }
-  | { ok: false; status: number; error: string; code: string };
+  | {
+      ok: false; status: number; error: string; code: string;
+      /** The batch the refusal is about (its curve key), when there is one — so
+       *  the form can offer "it is that pot" beside "A new batch" instead of
+       *  leaving the cook only the second (closing round 2026-10-15: the refusal
+       *  said "pick that batch", and the picker did not list it). */
+      curve_id?: string;
+      curve_label?: string;
+    };
 
 /**
  * How far minutes TYPED on a reading may run ahead of an open batch's counted
@@ -717,11 +799,21 @@ type FssaiCurveSubject = { equipmentId: string; materialId: string; itemLabel: s
  * A batch is ONE FOOD: when its first reading names an item or a material, a
  * reading put on it must name the same one (or none — the route then takes the
  * batch's). The PLACE may change, because a pot is moved from the stove to the
- * blast chiller half-way down. A batch that names no food is a PLACE or a UNIT,
- * and then the place must match. 2026-10-15: a curve picked by id was never
- * checked, and "Chicken curry" at Banquet was judged on "Dal"'s clock.
+ * blast chiller half-way down. A batch that names no food is a PLACE or a UNIT:
+ * the place must match, and a reading that names a food does not go onto it
+ * ('food'). 2026-10-15: a curve picked by id was never checked, and "Chicken
+ * curry" at Banquet was judged on "Dal"'s clock.
  */
-export function fssaiCurveSubjectMismatch(first: FssaiCurveMember, s: FssaiCurveSubject): '' | 'outlet' | 'food' | 'place' {
+export function fssaiCurveSubjectMismatch(
+  first: FssaiCurveMember,
+  s: FssaiCurveSubject,
+  opts: {
+    /** The batch's latest reading before this one — WHERE THE POT IS NOW. */
+    last?: FssaiCurveMember | null;
+    /** The cook said the pot was moved here (the form's "moved here" tick). */
+    moved?: boolean;
+  } = {},
+): '' | 'outlet' | 'food' | 'place' | 'moved' {
   const norm = (v: unknown) => str(v).toLowerCase();
   if (first.outlet_id && str(s.outletId) && first.outlet_id !== str(s.outletId)) return 'outlet';
   const batchItem = norm(first.item_label);
@@ -729,15 +821,50 @@ export function fssaiCurveSubjectMismatch(first: FssaiCurveMember, s: FssaiCurve
   const item = norm(s.itemLabel);
   const mat = str(s.materialId);
   if (batchItem || batchMat) {
-    if (!item && !mat) return '';
-    let compared = false;
-    if (batchMat && mat) { if (batchMat !== mat) return 'food'; compared = true; }
-    if (batchItem && item) { if (batchItem !== item) return 'food'; compared = true; }
-    return compared ? '' : 'food';
+    if (item || mat) {
+      let compared = false;
+      if (batchMat && mat) { if (batchMat !== mat) return 'food'; compared = true; }
+      if (batchItem && item) { if (batchItem !== item) return 'food'; compared = true; }
+      if (!compared) return 'food';
+    }
+    /* THE PLACE, TOO (closing round 2026-10-15). A food batch may move — off
+     * the stove into the blast chiller — but only when the cook SAYS it moved:
+     * a reading naming another place than where the batch was last read is
+     * otherwise a different pot of the same dish, and judging it on this batch's
+     * clock is the mis-pick the verifier measured. A reading that names no place
+     * is read where the batch is (the route fills it in). */
+    const named = !!(str(s.equipmentId) || str(s.areaLabel));
+    const at = opts.last || first;
+    if (named && !opts.moved
+      && (str(at.equipment_id) !== str(s.equipmentId) || norm(at.area_label) !== norm(s.areaLabel))) return 'moved';
+    return '';
   }
+  /* A BATCH THAT NAMES NO FOOD takes no food (closing round 2026-10-15). It is a
+   * place or a unit, and its clock is whatever was put in it first: measured,
+   * Chicken picked onto the blast chiller's unnamed batch was judged on that
+   * batch's 61 minutes and passed, while on its own batch (180 minutes) it failed.
+   * A reading that names a dish goes onto that dish's batch, or starts one. */
+  if (item || mat) return 'food';
   if (str(first.equipment_id) !== str(s.equipmentId)) return 'place';
   if (norm(first.area_label) !== norm(s.areaLabel)) return 'place';
   return '';
+}
+
+/**
+ * THE CURVE KEY A PICKED BATCH REFERS TO — given a reading's id or the batch's
+ * own key. A batch keyed on a kitchen production batch has no reading whose id
+ * IS the key, so a picker that sends the key (`fssaiOpenCurves` id) used to get
+ * "That batch is not in the file". '' when neither matches this kind.
+ */
+export function fssaiCurveKeyOf(db: Database.Database, logKind: string, ref: string): { key: string; kind: string } | null {
+  const r = str(ref);
+  if (!r) return null;
+  const byId = db.prepare(`SELECT id, batch_id, log_kind FROM fssai_temperature_logs WHERE id = ?`).get(r) as any;
+  if (byId) return { key: String(byId.batch_id || '') || String(byId.id), kind: String(byId.log_kind) };
+  const byKey = db.prepare(
+    `SELECT batch_id, log_kind FROM fssai_temperature_logs WHERE batch_id = ? AND log_kind = ? LIMIT 1`,
+  ).get(r, str(logKind)) as any;
+  return byKey ? { key: String(byKey.batch_id), kind: String(byKey.log_kind) } : null;
 }
 
 /**
@@ -745,39 +872,100 @@ export function fssaiCurveSubjectMismatch(first: FssaiCurveMember, s: FssaiCurve
  * server from the curve's first reading, never typed per reading.
  *
  * In order:
- *   1. `curveId` — any reading already on the curve. The kitchen said which batch.
- *      It must be the same food (fssaiCurveSubjectMismatch).
- *   2. `batchId` — a batch already on file (same food check), or a kitchen
- *      production batch (production_batches id or barcode) that has no reading
- *      yet. Anything else is refused: an unknown id used to start a fresh batch
- *      that passed at minute 0.
- *   3. `newCurve`, or minutes typed as 0 — "this has just started".
+ *   1. `curveId` — any reading already on the curve, or the curve's key. The
+ *      kitchen said which batch. It must be the same food, and — unless the cook
+ *      says the pot was MOVED here (`moved`) — the same place the batch was last
+ *      read at (fssaiCurveSubjectMismatch).
+ *   2. `batchId` — a batch already on file, named by any reading on it or by its
+ *      key, and NORMALISED TO THAT KEY exactly as `curveId` is (closing round
+ *      2026-10-15: the id of a reading in the MIDDLE of a batch made a curve of
+ *      that one reading, so a re-warmed pot and a backfill both passed on the
+ *      fork); or a kitchen production batch (production_batches id or barcode)
+ *      that has no reading yet. Anything else is refused: an unknown id used to
+ *      start a fresh batch that passed at minute 0.
+ *   3. `newCurve` — "A new batch", said in so many words. The ONLY way a reading
+ *      starts a batch while another batch of the same thing could be its pot.
+ *      (Minutes typed as 0 used to be a second way: 45 °C "at 0 minutes" beside
+ *      a batch an hour in started a fresh batch and passed as its first reading.
+ *      Typed 0 is now one more figure for the checks below.)
  *   4. Otherwise the batches of the same thing (same unit, item, place, outlet)
  *      from this date and the day before, sorted into:
  *        OPEN    — not at its target, within twice its window, nothing filed after
  *                  this reading's time. One → joined. Several → the one whose clock
  *                  matches the minutes typed; with no minutes typed, REFUSED
  *                  (`ambiguous_batch`) — the server does not guess which pot.
- *                  A batch whose clock is shorter than the minutes typed (beyond
- *                  FSSAI_CURVE_TYPED_TOLERANCE_MINUTES) is not this pot.
- *        STALE   — not at its target and past twice its window, with no newer
- *                  batch of the same thing since. REFUSED (`stale_batch_open`):
- *                  the cook picks it (judged late on its own clock) or says
- *                  "a new batch". 2026-10-15: such a reading silently started a
- *                  new batch at minute 0 and passed.
+ *                  Minutes typed LONGER than every open batch's clock (beyond
+ *                  FSSAI_CURVE_TYPED_TOLERANCE_MINUTES) are REFUSED
+ *                  (`minutes_longer`): the cook's figure says an older pot than
+ *                  any on file, the batch says this one — he chooses. Closing
+ *                  round 2026-10-15: such a reading started a new batch at the
+ *                  typed minute, measured from the rule's 60 °C, and passed where
+ *                  on its own batch (begun at 40 °C) it failed. Minutes typed
+ *                  SHORTER than the matching batch's clock (beyond the same
+ *                  tolerance) are REFUSED (`minutes_disagree`) for the same reason
+ *                  the other way round.
+ *        SPANNING — a reading already filed on it AFTER this reading's time:
+ *                  REFUSED (`out_of_order`), reached or not. Closing round
+ *                  2026-10-15: a reading slipped in between the readings of a
+ *                  batch that had reached its target started a new batch at
+ *                  minute 0 and passed. Only a fresh start (at or beyond the
+ *                  rule's starting temperature) beside a REACHED batch is let
+ *                  through as a new pot.
+ *        STALE   — not at its target and past twice its window, and not replaced
+ *                  by a newer batch of the same thing that is still in play (open,
+ *                  spanning, stale, or reached within its own twice-the-window).
+ *                  REFUSED (`stale_batch_open`): the cook picks it (judged late on
+ *                  its own clock) or says "a new batch". 2026-10-15: such a reading
+ *                  silently started a new batch at minute 0 and passed — and,
+ *                  closing round, still did whenever a later batch of the dish had
+ *                  been filed, even one long finished. A finished newer batch no
+ *                  longer hides it; beside one, only a FRESH start goes through.
  *        REACHED — already at its target, within twice its window. A reading
  *                  still at the target joins it; one back past the target that is
  *                  not a fresh start (at or beyond the rule's starting
  *                  temperature) is REFUSED (`after_target`) — same pot warming up
  *                  again (pick it: filed as a failure) or a new pot (say so).
- *   5. Nothing of the same thing: this reading starts a curve.
+ *      THE MINUTES TYPED ARE NO WAY PAST ANY OF THESE (closing round 2026-10-15).
+ *      They tell OPEN batches apart and nothing else: a spanning, stale or reached
+ *      batch is weighed whatever was typed. Typing 11 minutes more than a reached
+ *      batch's clock took a re-warmed reading out of the check, and it passed.
+ *      A post-midnight reading entered under the old date lands BEFORE a batch
+ *      begun late that evening: REFUSED (`before_curve_start`, naming the date it
+ *      needs) beside an open batch, and — closing round 2026-10-15 — beside a
+ *      reached one when it is back past that batch's target and not a fresh start
+ *      (it passed at minute 0; dated correctly it is `after_target`).
+ *   5. The SAME FOOD at ANOTHER PLACE (a pot moved to the blast chiller):
+ *        SPANNING — REFUSED (`out_of_order`), as at the same place (closing round
+ *                  2026-10-15: it was skipped, and a backfill naming another place
+ *                  started a new batch at minute 0 and passed).
+ *        OPEN    — a reading that is not a fresh start is REFUSED
+ *                  (`same_food_elsewhere`): the cook picks that batch ("moved
+ *                  here") or says "A new batch".
+ *        REACHED — a reading back past that batch's target that is not a fresh
+ *                  start is REFUSED (`same_food_elsewhere`): that pot, moved and
+ *                  warming up again (pick it, "moved here": filed as a failure),
+ *                  or a new pot (say so). Closing round 2026-10-15: it started a
+ *                  new batch at minute 0 and passed, its next reading at the target
+ *                  closed that batch "in time", and no job ever saw it. A reading
+ *                  still at the target starts its own batch — it is a pass on
+ *                  either batch.
+ *   6. Nothing of the same thing: this reading starts a curve.
  *
  * THE CLOCK. A curve's first reading sits at minute 0 — or at the minutes typed on
  * it, which can only move the start EARLIER (a cook saying "it has been cooling
  * 30 minutes already"), so the deadline can only get stricter. Every later
- * reading is that plus the time between the two readings. A minutes figure typed
- * on a later reading is not used for the clock; the response says when it
- * differed.
+ * reading is that plus the time between the two readings. MINUTES TYPED ARE
+ * NEVER THROWN AWAY (closing round 2026-10-15): a reading joined to a batch is
+ * judged at the LONGER of the batch's counted clock and the minutes the cook
+ * typed — the stricter of the two, both directions (a later minute is a lower
+ * line for cooling and a higher one for reheating) — and the response says
+ * which one decided.
+ *
+ * THE RULE. A batch is judged on the rule frozen on its first reading judged on a
+ * clock (fssaiCurveRule) — normally its first reading. A batch begun before the
+ * rule existed takes the rule as it is now for its first judged reading, and
+ * "has it got there" reads the batch's target onto readings filed before the rule
+ * (`goal`), so a pre-rule 4 °C still counts as reached.
  *
  * REFUSED: a reading timed before its curve's first reading, or in the middle of
  * readings already filed — the verdicts already frozen on that curve were judged
@@ -803,6 +991,12 @@ export function resolveFssaiCurve(
     value?: number | null;
     /** The rule's starting temperature (FssaiResolvedRange.start_value). */
     anchor?: number | null;
+    /** The rule's target now (target, else the bound on the reached side) — the
+     *  goal of a batch none of whose readings was judged on a clock. */
+    goal?: number | null;
+    /** The cook said this pot was MOVED here from where its batch was last
+     *  read — the only way a picked batch takes a reading at another place. */
+    moved?: boolean;
   },
 ): FssaiCurveResolution {
   const logKind = str(p.logKind);
@@ -815,14 +1009,31 @@ export function resolveFssaiCurve(
   }
   const value = num(p.value);
   const anchor = num(p.anchor);
+  const goalNow = num(p.goal);
   const s = p.subject;
   const norm = (v: unknown) => str(v).toLowerCase();
   const batchWords = (m: FssaiCurveMember) => [m.item_label, m.equipment_label || m.area_label].filter(Boolean).join(' · ') || 'an unnamed batch';
   const readingWords = [str(s.itemLabel), str(s.areaLabel)].filter(Boolean).join(' · ') || 'this reading';
   const deg = (u: string) => (u === 'C' || u === 'F' ? ` °${u}` : ` ${u}`);
 
+  /* ONE RULE PER BATCH (fssaiCurveRule): the first reading judged on a clock
+   * carries it; "has it got there" reads that rule's target onto readings filed
+   * before the rule existed. */
+  const ruleOf = (members: FssaiCurveMember[]): FssaiCurveMember | null =>
+    members.find((m) => m.status !== 'void' && m.max_minutes !== null) || null;
+  const reachedOf = (members: FssaiCurveMember[]): FssaiCurveMember | null => {
+    const r = ruleOf(members);
+    return fssaiCurveReached(members, logKind, r ? r.goal : goalNow);
+  };
+  const limitOf = (members: FssaiCurveMember[]): number | null => {
+    const r = ruleOf(members);
+    return (r ? r.max_minutes : null) ?? num(p.maxMinutes);
+  };
+  const horizonOf = (limit: number | null): number => (limit !== null && limit > 0 ? limit * 2 : 24 * 60);
+  const backPast = (v: number, goal: number): boolean => (dir === 'hot' ? v < goal : v > goal);
+
   const start = (note = '', key?: string): FssaiCurveResolution => ({
-    ok: true, key: key ?? str(p.batchId), mode: 'new', start: null, reached: null,
+    ok: true, key: key ?? str(p.batchId), mode: 'new', start: null, reached: null, rule: null,
     elapsed: typed !== null && typed > 0 ? Math.trunc(typed) : 0, typed,
     how: (typed !== null && typed > 0
       ? `This starts a new batch, ${Math.trunc(typed)} minutes after it began — the time you gave. Later readings on it are counted from here.`
@@ -845,6 +1056,13 @@ export function resolveFssaiCurve(
   };
 
   const counted = (first: FssaiCurveMember): number => (first.elapsed ?? 0) + ((now as number) - (first.minute as number));
+  const tol = FSSAI_CURVE_TYPED_TOLERANCE_MINUTES;
+  /* A refusal about one batch carries that batch's key, so the form can offer it. */
+  const about = (key: string, m: FssaiCurveMember) => ({ curve_id: key, curve_label: batchWords(m) });
+  /* A FRESH START of a pot — at or beyond the rule's starting temperature (or
+   * the other batch's own start when the rule has none). Anything between that
+   * and the target could be the same pot read late, and is asked about. */
+  const isFresh = (ref: number | null): boolean => value !== null && ref !== null && (dir === 'hot' ? value <= ref : value >= ref);
 
   const join = (members: FssaiCurveMember[], key: string, said: string, explicit: boolean): FssaiCurveResolution => {
     const first = members[0];
@@ -867,41 +1085,60 @@ export function resolveFssaiCurve(
     if (first.uom !== p.uom) {
       return { ok: false, status: 400, code: 'uom_mismatch', error: `This batch was started in °${first.uom}. Enter the reading in °${first.uom}.`, };
     }
+    /* Where the pot is NOW: the batch's latest reading before this one (a later
+     * one was refused just above). */
+    const lastBefore = [...members].reverse().find((m) => m.minute !== null && (m.minute as number) <= now) || first;
     if (explicit) {
-      const mm = fssaiCurveSubjectMismatch(first, s);
+      const mm = fssaiCurveSubjectMismatch(first, s, { last: lastBefore, moved: !!p.moved });
       if (mm) {
+        const wasAt = lastBefore.equipment_label || lastBefore.area_label || 'another place';
+        const batchHasFood = !!(first.item_label || first.material_id);
         return {
-          ok: false, status: 409, code: 'curve_subject_mismatch',
+          ok: false, status: 409, code: mm === 'moved' ? 'moved_unconfirmed' : 'curve_subject_mismatch',
           error: mm === 'outlet'
             ? 'That batch belongs to another outlet. Pick a batch from this outlet, or start a new batch.'
-            : mm === 'food'
-              ? `That batch is ${batchWords(first)}, and this reading is for ${readingWords}. A reading can only go onto the batch of the same food — one dish cannot be judged on another dish's clock. Pick the batch of ${readingWords}, or start a new batch.`
-              : `That batch is ${batchWords(first)}, and this reading is for ${readingWords}. Pick the batch of the same place or unit, or start a new batch.`,
+            : mm === 'food' && !batchHasFood
+              ? `That batch names no food — it is the batch of ${batchWords(first)} — and this reading is for ${readingWords}. A dish is judged on its own batch's clock, never on whatever was put in a unit first. Pick the batch of ${str(s.itemLabel) || 'this dish'}, or start a new batch.`
+              : mm === 'food'
+                ? `That batch is ${batchWords(first)}, and this reading is for ${readingWords}. A reading can only go onto the batch of the same food — one dish cannot be judged on another dish's clock. Pick the batch of ${readingWords}, or start a new batch.`
+                : mm === 'moved'
+                  ? `That batch of ${first.item_label || 'this food'} was last read at ${wasAt} (${lastBefore.reading_at}), and this reading is at ${str(s.equipmentId) ? 'another unit' : (str(s.areaLabel) || 'another place')}. If the pot was moved here, tick "moved here" and it stays on its batch and its clock. If it is a different pot, pick its own batch or start a new batch.`
+                  : `That batch is ${batchWords(first)}, and this reading is for ${readingWords}. Pick the batch of the same place or unit, or start a new batch.`,
+          ...about(key, first),
         };
       }
     }
-    const elapsed = counted(first);
-    const reached = fssaiCurveReached(members, logKind);
-    const moved = explicit && (norm(first.area_label) !== norm(s.areaLabel) || str(first.equipment_id) !== str(s.equipmentId))
-      && (first.item_label || first.material_id);
+    const countedMin = counted(first);
+    /* NEVER THROWN AWAY: judged at the longer of the counted clock and the
+     * minutes typed — the stricter of the two (see THE CLOCK above). */
+    const elapsed = typed !== null && typed > countedMin ? Math.trunc(typed) : countedMin;
+    const reached = reachedOf(members);
+    const moved = explicit && !!p.moved
+      && (norm(lastBefore.area_label) !== norm(s.areaLabel) || str(lastBefore.equipment_id) !== str(s.equipmentId))
+      && !!(first.item_label || first.material_id);
     return {
-      ok: true, key, mode: 'joined', start: first, elapsed, typed, reached,
-      how: `${said} — the batch started at ${first.reading_at}${first.business_date !== p.businessDate ? ` on ${first.business_date}` : ''} at ${first.value ?? '?'} °${first.uom}. ${elapsed} minutes in, counted from that reading.`
-        + (typed !== null && typed !== elapsed ? ` You entered ${typed} minutes; the counted ${elapsed} is what is recorded.` : '')
-        + (moved ? ` It was at ${first.equipment_label || first.area_label || 'another place'} then; it is recorded here at ${readingWords}.` : '')
+      ok: true, key, mode: 'joined', start: first, elapsed, typed, reached, rule: ruleOf(members),
+      how: `${said} — the batch started at ${first.reading_at}${first.business_date !== p.businessDate ? ` on ${first.business_date}` : ''} at ${first.value ?? '?'} °${first.uom}. ${countedMin} minutes in, counted from that reading.`
+        + (typed !== null && typed > countedMin
+          ? ` You entered ${typed} minutes — longer than the ${countedMin} counted — so it is judged at ${elapsed}, the stricter of the two.`
+          : typed !== null && typed !== countedMin
+            ? ` You entered ${typed} minutes; the ${countedMin} counted from the batch's first reading is longer, so it is judged at ${countedMin}.`
+            : '')
+        + (moved ? ` It was at ${lastBefore.equipment_label || lastBefore.area_label || 'another place'} until then and was moved; it is recorded here at ${readingWords}.` : '')
         + (reached ? ` It already reached its target at ${reached.elapsed ?? '?'} minutes (${reached.reading_at}), so this reading is judged on whether it is still there.` : ''),
     };
   };
 
-  /* 1. Named by a reading on the curve. */
+  /* 1. Named by a reading on the curve (or by the curve's own key — a batch
+   *    keyed on a production batch has no reading whose id IS the key). */
   const curveId = str(p.curveId);
   if (curveId) {
-    const row = db.prepare(`SELECT id, batch_id, log_kind FROM fssai_temperature_logs WHERE id = ?`).get(curveId) as any;
-    if (!row) return { ok: false, status: 400, code: 'curve_unknown', error: 'That batch is not in the file.' };
-    if (String(row.log_kind) !== logKind) {
-      return { ok: false, status: 400, code: 'curve_kind', error: `That batch is a ${String(row.log_kind)} curve, not ${logKind}.` };
+    const ref = fssaiCurveKeyOf(db, logKind, curveId);
+    if (!ref) return { ok: false, status: 400, code: 'curve_unknown', error: 'That batch is not in the file.' };
+    if (ref.kind !== logKind) {
+      return { ok: false, status: 400, code: 'curve_kind', error: `That batch is a ${ref.kind} curve, not ${logKind}.` };
     }
-    const key = String(row.batch_id || '') || String(row.id);
+    const key = ref.key;
     const members = fssaiCurveMembers(db, logKind, key);
     if (!members.length) {
       return { ok: false, status: 409, code: 'curve_voided', error: 'Every reading on that batch has been voided. Start a new batch.' };
@@ -909,13 +1146,17 @@ export function resolveFssaiCurve(
     return join(members, key, 'Added to the batch you picked', true);
   }
 
-  /* 2. A batch named by its id: one already on file, or a kitchen production
-   *    batch that has no reading yet. Nothing else — an id nobody can trace
-   *    would start a batch that passes at minute 0 (2026-10-15). */
+  /* 2. A batch named by its id: one already on file — by any reading on it or by
+   *    its key, NORMALISED to the key as a picked curve is — or a kitchen
+   *    production batch that has no reading yet. Nothing else — an id nobody can
+   *    trace would start a batch that passes at minute 0 (2026-10-15). */
   const batchId = str(p.batchId);
   if (batchId) {
-    const members = fssaiCurveMembers(db, logKind, batchId);
-    if (members.length) return join(members, batchId, 'Added to this batch', true);
+    const ref = fssaiCurveKeyOf(db, logKind, batchId);
+    if (ref && ref.kind === logKind) {
+      const members = fssaiCurveMembers(db, logKind, ref.key);
+      if (members.length) return join(members, ref.key, 'Added to this batch', true);
+    }
     let prod: any = null;
     try {
       prod = db.prepare(`SELECT id, material_id, item_name FROM production_batches WHERE id = ? OR barcode = ? LIMIT 1`).get(batchId, batchId);
@@ -943,12 +1184,15 @@ export function resolveFssaiCurve(
     return start(`It is kitchen production batch ${str(prod.item_name) ? `"${str(prod.item_name)}"` : batchId}.`, prodKey);
   }
 
-  /* 3. Said to be a new one. */
-  if (p.newCurve || typed === 0) return start();
+  /* 3. Said to be a new one — in so many words ("A new batch"). Minutes typed
+   *    as 0 are NOT that any more: they go through the checks below like any
+   *    other figure, and start a batch only when nothing of the same thing could
+   *    be this pot. */
+  if (p.newCurve) return start();
 
   /* 4. The batches of the same thing. */
   const pLimit = num(p.maxMinutes);
-  const defaultHorizon = pLimit !== null && pLimit > 0 ? pLimit * 2 : 24 * 60;
+  const defaultHorizon = horizonOf(pLimit);
   const lookbackDays = Math.max(1, Math.ceil(defaultHorizon / (24 * 60)));
   const rows = db.prepare(
     `SELECT id, batch_id, item_label, area_label
@@ -966,47 +1210,89 @@ export function resolveFssaiCurve(
     keys.add(String(r.batch_id || '') || String(r.id));
   }
   type Cand = { key: string; members: FssaiCurveMember[]; first: FssaiCurveMember; counted: number; limit: number | null; reached: FssaiCurveMember | null };
+  /* One batch as this reading sees it: its clock now, and whether it had got to
+   * its target BY THIS READING'S TIME (a reading after it does not count). */
+  const candOf = (key: string, members: FssaiCurveMember[]): Cand => {
+    const first = members[0];
+    return {
+      key, members, first, counted: counted(first), limit: limitOf(members),
+      reached: reachedOf(members.filter((m) => m.minute !== null && (m.minute as number) <= now)),
+    };
+  };
+  const spans = (c: Cand) => c.members.some((m) => m.minute !== null && (m.minute as number) > now);
+  const newestFirst = (a: Cand, b: Cand) => (b.first.minute as number) - (a.first.minute as number);
   const all: Cand[] = [];
   const open: Cand[] = [];
   const stale: Cand[] = [];
   const reachedRecent: Cand[] = [];
   const blocked: Cand[] = [];
   let startsLater: FssaiCurveMember | null = null;
+  /* The same, for a batch beginning later that had already reached its target. */
+  let startsLaterReached: { first: FssaiCurveMember; reached: FssaiCurveMember; members: FssaiCurveMember[] } | null = null;
   for (const key of keys) {
     const members = fssaiCurveMembers(db, logKind, key);
     if (!members.length) continue;
     const first = members[0];
     if (first.minute === null) continue;
     if (first.minute > now) {
-      /* An open batch of the same thing that began AFTER this reading's time,
-       * on the same date and within a day: almost always a post-midnight
-       * reading entered under the old date (see midnightHint). */
-      if (!fssaiCurveReached(members, logKind) && midnightHint(first)) startsLater = first;
+      /* A batch of the same thing that began AFTER this reading's time, on the
+       * same date and within a day: almost always a post-midnight reading
+       * entered under the old date (see midnightHint). */
+      if (midnightHint(first)) {
+        const rm = reachedOf(members);
+        if (!rm) startsLater = first;
+        else if (!startsLaterReached || (first.minute as number) > (startsLaterReached.first.minute as number)) {
+          startsLaterReached = { first, reached: rm, members };
+        }
+      }
       continue;
     }
-    const limit = first.max_minutes ?? pLimit;
-    const horizon = limit !== null && limit > 0 ? limit * 2 : 24 * 60;
-    const c: Cand = {
-      key, members, first, counted: counted(first), limit,
-      reached: fssaiCurveReached(members.filter((m) => m.minute !== null && (m.minute as number) <= now), logKind),
-    };
+    const c = candOf(key, members);
+    const horizon = horizonOf(c.limit);
     all.push(c);
-    const isBlocked = members.some((m) => m.minute !== null && (m.minute as number) > now);
-    if (isBlocked) { if (!c.reached && c.counted <= horizon) blocked.push(c); continue; }
+    if (spans(c)) {
+      /* SPANNING (closing round 2026-10-15): readings of this batch on BOTH
+       * sides of this one's time. It cannot be slipped in, and it must not
+       * silently become a new batch either — measured: 25 °C at 11:00, between
+       * a reached batch's 4 °C at 10:00 and 3 °C at 12:00, started a new batch
+       * at minute 0 and passed as its first reading. Reached or not, inside its
+       * window or past it, it is refused — unless this is a FRESH start beside
+       * a batch that already reached its target: a new pot, not a backfill. */
+      if (!(c.reached && isFresh(anchor ?? first.value))) blocked.push(c);
+      continue;
+    }
     if (c.reached) { if (c.counted <= horizon) reachedRecent.push(c); continue; }
     if (c.counted <= horizon) open.push(c); else stale.push(c);
   }
-  const fits = (c: Cand) => typed === null || typed <= c.counted + FSSAI_CURVE_TYPED_TOLERANCE_MINUTES;
+  const fits = (c: Cand) => typed === null || typed <= c.counted + tol;
   const startedWords = (c: Cand) => `${c.first.reading_at}${c.first.business_date !== p.businessDate ? ` on ${c.first.business_date}` : ''} at ${c.first.value ?? '?'}${deg(c.first.uom)}`;
+  /* MINUTES TYPED SHORTER THAN THE BATCH'S CLOCK (closing round 2026-10-15).
+   * The cook's figure says a newer pot; the clock says this one. Joining would
+   * judge him on a clock he says is wrong, and starting a batch on his figure
+   * would judge him on the shorter, lenient one — so neither is guessed. */
+  const disagrees = (c: Cand) => typed !== null && c.counted - typed > tol;
+  const minutesDisagree = (cs: Cand[]): FssaiCurveResolution => {
+    const list = [...cs].sort((a, b) => (a.first.minute as number) - (b.first.minute as number))
+      .map((c) => `started ${startedWords(c)}, ${c.counted} minutes ago`).join('; ');
+    return {
+      ok: false, status: 409, code: 'minutes_disagree',
+      error: `You entered ${typed} minutes, but ${cs.length === 1 ? 'the open batch' : `each of the ${cs.length} open batches`} of ${batchWords(cs[0].first)} has been ${going} longer (${list}). If this reading is from ${cs.length === 1 ? 'that pot' : 'one of those pots'}, pick its batch — it is judged on the batch's own clock. If it is a different pot, choose "A new batch" and give its minutes there.`,
+      ...about(cs[0].key, cs[0].first),
+    };
+  };
 
   /* OPEN */
   const openFit = open.filter(fits);
-  if (openFit.length === 1) return join(openFit[0].members, openFit[0].key, 'Added to the open batch of the same thing', false);
+  if (openFit.length === 1) {
+    if (disagrees(openFit[0])) return minutesDisagree(openFit);
+    return join(openFit[0].members, openFit[0].key, 'Added to the open batch of the same thing', false);
+  }
   if (openFit.length > 1) {
     if (typed !== null) {
       /* The batch whose clock is closest to the minutes typed; a tie goes to the
        * OLDER batch, whose longer clock is the stricter one. */
       const best = [...openFit].sort((a, b) => (Math.abs(a.counted - typed) - Math.abs(b.counted - typed)) || (b.counted - a.counted))[0];
+      if (disagrees(best)) return minutesDisagree(openFit);
       return join(best.members, best.key, `Added to the open batch of the same thing whose clock is closest to the ${typed} minutes you gave`, false);
     }
     const list = [...openFit].sort((a, b) => (a.first.minute as number) - (b.first.minute as number)).map(startedWords).join('; ');
@@ -1015,38 +1301,67 @@ export function resolveFssaiCurve(
       error: `${openFit.length} batches of ${batchWords(openFit[0].first)} are still ${going} (started ${list}). Pick the batch this reading belongs to, or enter how many minutes this pot has been ${going}.`,
     };
   }
+  if (open.length) {
+    /* MINUTES TYPED LONGER THAN EVERY OPEN BATCH'S CLOCK (closing round
+     * 2026-10-15). Measured: 30 °C typed "115 minutes" beside a batch begun at
+     * 40 °C 100 minutes earlier started a new batch at minute 115, measured from
+     * the rule's 60 °C — and passed, where on its own batch it failed. The cook's
+     * figure says an older pot than any on file; the batch says this one. Neither
+     * is guessed: the longest-running open batch is named, and picking it judges
+     * the reading at the minutes typed — the longer, stricter figure. */
+    const cs = [...open].sort((a, b) => b.counted - a.counted);
+    const list = cs.map((c) => `started ${startedWords(c)}, ${c.counted} minutes ago`).join('; ');
+    return {
+      ok: false, status: 409, code: 'minutes_longer',
+      error: `You entered ${typed} minutes, but ${cs.length === 1 ? 'the open batch' : `each of the ${cs.length} open batches`} of ${batchWords(cs[0].first)} has been ${going} for less than that (${list}). If this reading is from ${cs.length === 1 ? 'that pot' : 'one of those pots'}, pick its batch — it is judged at your ${typed} minutes, the longer and stricter figure. If it is a different pot that was already ${going} before any reading of it was filed, choose "A new batch" and keep its minutes there.`,
+      ...about(cs[0].key, cs[0].first),
+    };
+  }
   if (blocked.length) {
-    const f = blocked[0].first;
-    const later = blocked[0].members[blocked[0].members.length - 1];
+    const b = blocked[0];
+    const f = b.first;
+    const later = b.members.find((m) => m.minute !== null && (m.minute as number) > now) || b.members[b.members.length - 1];
     return {
       ok: false, status: 409, code: 'out_of_order',
-      error: `The open batch of this started at ${f.reading_at} and already has a reading at ${later.reading_at}, after the time given for this one (${p.readingAt}). Readings go onto a batch in the order they were taken. If this is a different pot, enter 0 minutes to start a new batch.`,
+      error: `The batch of ${batchWords(f)} started at ${startedWords(b)} and already has a reading at ${later.reading_at}${later.business_date !== p.businessDate ? ` on ${later.business_date}` : ''}, after the time given for this one (${p.readingAt}). Readings go onto a batch in the order they were taken, so this cannot be slipped in between. Check the time; if this is a different pot, choose "A new batch".`,
+      ...about(b.key, f),
     };
   }
 
-  /* STALE — the newest one that no later batch of the same thing has replaced. */
-  const staleFit = stale
-    .filter(fits)
-    .filter((c) => !all.some((o) => o.key !== c.key && (o.first.minute as number) > (c.first.minute as number)))
-    .sort((a, b) => (b.first.minute as number) - (a.first.minute as number));
-  if (staleFit.length) {
-    const st = staleFit[0];
-    const goal = st.first.goal;
-    return {
-      ok: false, status: 409, code: 'stale_batch_open',
-      error: `A batch of ${batchWords(st.first)} started at ${startedWords(st)}, ${st.counted} minutes ago, and no reading on it has reached ${goal ?? 'its target'}${goal !== null ? deg(st.first.uom) : ''} — its ${st.limit ?? '?'} minutes ran out long ago. If this reading is from that pot, pick that batch: it is judged on its own clock, as late. If it is a different pot, choose "A new batch".`,
-    };
+  /* STALE — the newest one that no newer batch of the same thing STILL IN PLAY
+   * has replaced. A newer batch that has finished (reached its target and past
+   * twice its window) replaces nothing: measured, an abandoned pot read at 525
+   * minutes started a new batch at minute 0 and passed because a later pot of the
+   * dish had been filed and finished. Beside such a finished batch only a FRESH
+   * start (a new pot, plainly) goes through. */
+  const inPlay = new Set([...open, ...blocked, ...stale, ...reachedRecent].map((c) => c.key));
+  const newerThan = (c: Cand) => all.filter((o) => o.key !== c.key && (o.first.minute as number) > (c.first.minute as number));
+  const staleLive = stale
+    .filter((c) => !newerThan(c).some((o) => inPlay.has(o.key)))
+    .sort(newestFirst);
+  if (staleLive.length) {
+    const st = staleLive[0];
+    const replacedByFinished = newerThan(st).length > 0;
+    if (!(replacedByFinished && isFresh(anchor ?? st.first.value))) {
+      const goal = st.first.goal ?? (ruleOf(st.members)?.goal ?? goalNow);
+      return {
+        ok: false, status: 409, code: 'stale_batch_open',
+        error: `A batch of ${batchWords(st.first)} started at ${startedWords(st)}, ${st.counted} minutes ago, and no reading on it has reached ${goal ?? 'its target'}${goal !== null ? deg(st.first.uom) : ''} — its ${st.limit ?? '?'} minutes ran out long ago. If this reading is from that pot, pick that batch: it is judged on its own clock, as late. If it is a different pot, choose "A new batch".`,
+        ...about(st.key, st.first),
+      };
+    }
   }
 
-  /* REACHED — the newest batch of the same thing that already got there. */
-  const reachedFit = reachedRecent.filter(fits).sort((a, b) => (b.first.minute as number) - (a.first.minute as number));
+  /* REACHED — the newest batch of the same thing that already got there,
+   * whatever minutes were typed. */
+  const reachedNewest = [...reachedRecent].sort(newestFirst);
   let note = '';
-  if (reachedFit.length) {
-    const R = reachedFit[0];
+  if (reachedNewest.length) {
+    const R = reachedNewest[0];
     const reachedM = R.reached as FssaiCurveMember;
-    const goal = reachedM.goal;
+    const goal = reachedM.goal ?? (ruleOf(R.members)?.goal ?? goalNow);
     if (value !== null && goal !== null) {
-      const atTarget = dir === 'hot' ? value >= goal : value <= goal;
+      const atTarget = !backPast(value, goal);
       if (atTarget) return join(R.members, R.key, 'Added to the batch of the same thing, which has already reached its target', false);
       /* Back past the target. A FRESH pot starts at or beyond the rule's
        * starting temperature (or the last batch's own start when the rule has
@@ -1059,6 +1374,7 @@ export function resolveFssaiCurve(
         return {
           ok: false, status: 409, code: 'after_target',
           error: `The batch of ${batchWords(R.first)} that started at ${startedWords(R)} reached ${goal}${deg(reachedM.uom)} at ${reachedM.reading_at}. This reading of ${value}${deg(p.uom)} is back ${dir === 'hot' ? 'below' : 'above'} that. If it is the same pot ${dir === 'hot' ? 'cooling down again' : 'warming up again'}, pick that batch — it is filed as a failure. If it is a new pot, choose "A new batch" (and give its minutes if it has already been ${going} a while).`,
+          ...about(R.key, R.first),
         };
       }
     } else if (goal !== null) {
@@ -1071,10 +1387,119 @@ export function resolveFssaiCurve(
       error: `An open batch of the same thing started at ${startsLater.reading_at} on ${startsLater.business_date}, after the time given for this reading (${p.readingAt} on ${p.businessDate}).${midnightHint(startsLater)} If this really is a different pot, start a new batch.`,
     };
   }
-  if (typed !== null && open.length) {
-    const newest = [...open].sort((a, b) => a.counted - b.counted)[0];
-    note = `${note ? `${note} ` : ''}No open batch of this has been ${going} that long (the newest is ${newest.counted} minutes in), so it is not added to one.`;
+  /* MIDNIGHT, BESIDE A BATCH THAT REACHED ITS TARGET (closing round 2026-10-15).
+   * Measured: 20 °C at 00:30 entered under yesterday's date, beside a batch begun
+   * at 22:00 that reached 4 °C at 23:50, started a new batch at minute 0 and
+   * passed; dated correctly it is refused `after_target`. Back past that batch's
+   * target and not a fresh start, it is refused the same way an open batch's is. */
+  if (startsLaterReached) {
+    const L = startsLaterReached;
+    const goal = L.reached.goal ?? (ruleOf(L.members)?.goal ?? goalNow);
+    if (value !== null && goal !== null) {
+      if (backPast(value, goal) && !isFresh(anchor ?? L.first.value)) {
+        return {
+          ok: false, status: 409, code: 'before_curve_start',
+          error: `A batch of the same thing started at ${L.first.reading_at} on ${L.first.business_date}, after the time given for this reading (${p.readingAt} on ${p.businessDate}), and reached ${goal}${deg(L.reached.uom)} at ${L.reached.reading_at}. This reading of ${value}${deg(p.uom)} is back ${dir === 'hot' ? 'below' : 'above'} that.${midnightHint(L.first)} If this really is a different pot, start a new batch.`,
+          curve_id: L.first.key, curve_label: batchWords(L.first),
+        };
+      }
+    } else if (value === null) {
+      note = `${note ? `${note} ` : ''}A batch of this started at ${L.first.reading_at} on ${L.first.business_date}, after this reading's time — if this was taken after midnight, it needs the next day's date.`;
+    }
   }
+
+  /* 5. THE SAME FOOD AT ANOTHER PLACE (closing round 2026-10-15). A pot moved
+   *    from the stove to the blast chiller is read at a new place, so it matches
+   *    no batch of "the same thing" above — and it used to start a new batch at
+   *    minute 0 and pass as its first reading, whatever its clock really was.
+   *    A batch spanning this reading's time is refused as out of order; an open
+   *    one, or one that reached its target and this reading is back past it, is
+   *    asked about unless this is a FRESH start (a new pot). */
+  if (str(s.itemLabel) || str(s.materialId)) {
+    const foodRows = db.prepare(
+      `SELECT id, batch_id, item_label, material_id
+         FROM fssai_temperature_logs
+        WHERE log_kind = ? AND status <> 'void' AND outlet_id = ?
+          AND business_date >= ? AND business_date <= ?`,
+    ).all(
+      logKind, str(s.outletId),
+      addDaysISO(p.businessDate, -lookbackDays) || p.businessDate, p.businessDate,
+    ) as any[];
+    const foodKeys = new Set<string>();
+    for (const r of foodRows) {
+      const sameMat = !!str(r.material_id) && !!str(s.materialId) && str(r.material_id) === str(s.materialId);
+      const sameItem = !!norm(r.item_label) && !!norm(s.itemLabel) && norm(r.item_label) === norm(s.itemLabel);
+      const k = String(r.batch_id || '') || String(r.id);
+      /* The batches of the same thing at THIS place were weighed above. */
+      if ((sameMat || sameItem) && !keys.has(k)) foodKeys.add(k);
+    }
+    const elsewhere: Cand[] = [];
+    const reachedElsewhere: Cand[] = [];
+    const blockedElsewhere: Cand[] = [];
+    for (const key of foodKeys) {
+      const members = fssaiCurveMembers(db, logKind, key);
+      if (!members.length) continue;
+      const first = members[0];
+      if (first.minute === null || first.minute > now) continue;
+      if (fssaiCurveSubjectMismatch(first, { ...s, equipmentId: first.equipment_id, areaLabel: first.area_label }) === 'food') continue;
+      const c = candOf(key, members);
+      /* WHATEVER MINUTES WERE TYPED — they tell open batches apart, they are not
+       * a way past this check (closing round 2026-10-15). */
+      if (spans(c)) {
+        /* A FRESH start at another place is another pot of the dish, as beside
+         * an open batch there below; anything else is a backfill. */
+        if (!isFresh(anchor ?? first.value)) blockedElsewhere.push(c);
+        continue;
+      }
+      if (c.counted > horizonOf(c.limit)) continue;
+      if (c.reached) reachedElsewhere.push(c); else elsewhere.push(c);
+    }
+    const placeOf = (c: Cand) => {
+      const lastE = [...c.members].reverse().find((m) => m.minute !== null && (m.minute as number) <= now) || c.first;
+      return lastE.equipment_label || lastE.area_label || 'another place';
+    };
+    if (blockedElsewhere.length) {
+      const b = [...blockedElsewhere].sort(newestFirst)[0];
+      const later = b.members.find((m) => m.minute !== null && (m.minute as number) > now) || b.members[b.members.length - 1];
+      return {
+        ok: false, status: 409, code: 'out_of_order',
+        error: `A batch of ${b.first.item_label || 'this food'} at ${placeOf(b)} started at ${startedWords(b)} and already has a reading at ${later.reading_at}${later.business_date !== p.businessDate ? ` on ${later.business_date}` : ''}, after the time given for this one (${p.readingAt}) — and this reading names ${readingWords}. Readings go onto a batch in the order they were taken, so this cannot be slipped in between. Check the time and the place; if this is a different pot, choose "A new batch".`,
+        ...about(b.key, b.first),
+      };
+    }
+    if (elsewhere.length) {
+      const e = [...elsewhere].sort(newestFirst)[0];
+      const at = placeOf(e);
+      if (value !== null && !isFresh(anchor ?? e.first.value)) {
+        return {
+          ok: false, status: 409, code: 'same_food_elsewhere',
+          error: `A batch of ${e.first.item_label || 'this food'} is still ${going} at ${at} (started ${startedWords(e)}, ${e.counted} minutes ago). If this is that pot, moved here, pick that batch and tick "moved here" — it stays on its own clock. If it is a different pot, choose "A new batch".`,
+          ...about(e.key, e.first),
+        };
+      }
+      if (value === null) {
+        note = `${note ? `${note} ` : ''}A batch of ${e.first.item_label || 'this food'} is still ${going} at ${at}: unless this reading is a fresh start, you will be asked whether it is that pot, moved here.`;
+      }
+    }
+    if (reachedElsewhere.length) {
+      const e = [...reachedElsewhere].sort(newestFirst)[0];
+      const rm = e.reached as FssaiCurveMember;
+      const goal = rm.goal ?? (ruleOf(e.members)?.goal ?? goalNow);
+      const at = placeOf(e);
+      if (value !== null && goal !== null) {
+        if (backPast(value, goal) && !isFresh(anchor ?? e.first.value)) {
+          return {
+            ok: false, status: 409, code: 'same_food_elsewhere',
+            error: `A batch of ${e.first.item_label || 'this food'} at ${at} (started ${startedWords(e)}) reached ${goal}${deg(rm.uom)} at ${rm.reading_at}. This reading of ${value}${deg(p.uom)} is back ${dir === 'hot' ? 'below' : 'above'} that. If it is that pot, moved here and ${dir === 'hot' ? 'cooling down again' : 'warming up again'}, pick that batch and tick "moved here" — it is filed as a failure. If it is a different pot, choose "A new batch".`,
+            ...about(e.key, e.first),
+          };
+        }
+      } else if (value === null && goal !== null) {
+        note = `${note ? `${note} ` : ''}A batch of ${e.first.item_label || 'this food'} at ${at} reached ${goal}${deg(rm.uom)} at ${rm.reading_at}: a reading back past that is asked about before it is filed.`;
+      }
+    }
+  }
+
   return start(note);
 }
 
@@ -1129,10 +1554,23 @@ export interface FssaiCurveStart {
  * administrator editing the rule's starting temperature half-way through a batch
  * cannot move it. Readings filed before the line was frozen keep the old rule
  * (their first reading's own value), which is what their verdicts used.
+ *
+ * SWITCHED ON HALF-WAY (closing round 2026-10-15). A batch whose first reading
+ * was filed before the rule existed froze its line with NO starting temperature
+ * to compare against — so a pot off the heat at 95 °C kept 95, and 48 °C at 120
+ * minutes after the rule was switched on passed, while the same batch begun a
+ * minute after the rule failed (needed ≤ 32.5 from 60). Such a first reading was
+ * never judged on a clock (no time limit on it), so nothing was measured from
+ * its line: the line is the one the batch's first reading JUDGED on a clock froze
+ * (`ruled`), and for that reading itself the same rule a batch begun now gets —
+ * the stricter of its 0-minute reading and the rule's starting temperature.
  */
 export function fssaiCurveLineStart(p: {
   /** The batch's first LIVE reading; null when this reading starts the batch. */
   first: FssaiCurveMember | null;
+  /** The batch's first reading judged on a clock (FssaiCurveResolution.rule),
+   *  when that is not `first`. */
+  ruled?: FssaiCurveMember | null;
   /** This reading: its value and the minutes counted for it. */
   self: { value: number | null; elapsed: number | null };
   /** The rule's `start_value` (FssaiResolvedRange.start_value). */
@@ -1152,6 +1590,15 @@ export function fssaiCurveLineStart(p: {
     const e = num(p.self.elapsed) ?? 0;
     const v = num(p.self.value);
     if (e === 0 && v !== null) return { value: stricter(v), minute: 0, source: 'first_reading' };
+  } else if (p.first.max_minutes === null) {
+    /* The first reading was filed before the rule existed (see SWITCHED ON
+     * HALF-WAY): the line its first judged reading froze, else the rule now. */
+    const r = p.ruled && p.ruled.max_minutes !== null ? p.ruled : null;
+    if (r && r.start_source && r.start_used !== null) {
+      return { value: r.start_used, minute: r.start_minute ?? 0, source: r.start_source };
+    }
+    const fe = p.first.elapsed ?? 0;
+    if (fe === 0 && p.first.value !== null) return { value: stricter(p.first.value), minute: 0, source: 'first_reading' };
   } else {
     /* The batch's line, as frozen on its first reading. */
     if (p.first.start_source && p.first.start_used !== null) {
@@ -1352,9 +1799,15 @@ export function fssaiCurveSummary(
   const live = all.filter((m) => m.status !== 'void');
   const dir = fssaiTempDirection(logKind);
   const start = live[0] || null;
-  const limit = start ? start.max_minutes : null;
-  const goal = start ? start.goal : null;
-  const reached = fssaiCurveReached(live, logKind);
+  /* THE BATCH'S RULE, not its first reading's (closing round 2026-10-15): a
+   * batch begun before cooling was switched on froze no limit on its first
+   * reading and read "in progress, no time limit" twelve hours in, while its
+   * later readings were judged on 240 minutes. fssaiCurveRule is the one rule
+   * the overdue jobs read too. */
+  const rule = fssaiCurveRule(db, logKind, live);
+  const limit = rule.limit;
+  const goal = rule.goal;
+  const reached = fssaiCurveReached(live, logKind, goal);
   const last = live[live.length - 1] || null;
   const elapsedNow = start && start.minute !== null && nowMinute !== null
     ? (start.elapsed ?? 0) + (nowMinute - start.minute) : null;
@@ -1366,13 +1819,19 @@ export function fssaiCurveSummary(
       ? (limit !== null && reached.elapsed !== null && reached.elapsed > limit ? 'reached_late' : 'reached_in_time')
       : (limit !== null && elapsedNow !== null && elapsedNow > limit ? 'overdue' : 'in_progress');
   /* The batch's line: from its newest live reading's frozen start when it has
-   * one, else the same rule the write path uses on the first reading. */
-  const frozen = [...live].reverse().find((m) => m.start_source && m.start_used !== null) || null;
+   * one, else the same rule the write path uses on the first reading. A start
+   * frozen on a reading filed before the rule existed (no time limit on it) was
+   * drawn with no rule to compare against, and is not the batch's line: the one a
+   * reading judged on a clock froze is, and with none yet, the line the next
+   * reading would get (fssaiCurveLineStart, SWITCHED ON HALF-WAY). */
+  const frozen = [...live].reverse().find((m) => m.start_source && m.start_used !== null && (m.max_minutes !== null || rule.source === 'none')) || null;
   const lineStart = frozen
     ? { value: frozen.start_used as number, minute: frozen.start_minute ?? 0, source: frozen.start_source as FssaiCurveStartSource }
-    : (start && (start.elapsed ?? 0) === 0 && start.value !== null
-      ? { value: start.value, minute: 0, source: 'first_reading' as const }
-      : null);
+    : rule.source === 'current' && start
+      ? fssaiCurveLineStart({ first: start, ruled: null, self: { value: null, elapsed: null }, anchor: rule.anchor, direction: dir })
+      : (start && (start.elapsed ?? 0) === 0 && start.value !== null
+        ? { value: start.value, minute: 0, source: 'first_reading' as const }
+        : null);
   const lineFor = (elapsed: number | null): number | null => {
     if (lineStart) {
       return fssaiCurveExpected({ startValue: lineStart.value, startElapsed: lineStart.minute, goal, maxMinutes: limit, elapsed });
@@ -1480,15 +1939,22 @@ export function fssaiOpenCurves(
       ).get(...liveIds) as any)?.n) || 0
       : 0;
     const item = String(r.item_label || '');
-    const place = String(r.equipment_label || r.area_label || '');
+    /* WHERE THE POT IS NOW — its latest live reading's place, not its first
+     * (closing round 2026-10-15): a picked batch is checked against where it
+     * was last read, and a pot moved to the blast chiller is filled in there. */
+    const lastLive = [...s.members].reverse().find((m) => m.status !== 'void') || null;
+    const eqId = lastLive ? lastLive.equipment_id : String(r.equipment_id || '');
+    const eqLabel = lastLive ? lastLive.equipment_label : String(r.equipment_label || '');
+    const area = lastLive ? lastLive.area_label : String(r.area_label || '');
+    const place = eqLabel || area;
     out.push({
       ...s.summary,
       label: [item, place].filter(Boolean).join(' · ') || 'Unnamed',
       item_label: item,
       place_label: place,
-      equipment_id: String(r.equipment_id || ''),
-      equipment_label: String(r.equipment_label || ''),
-      area_label: String(r.area_label || ''),
+      equipment_id: eqId,
+      equipment_label: eqLabel,
+      area_label: area,
       material_id: String(r.material_id || ''),
       department_id: String(r.department_id || ''),
       open_ca: openCa,

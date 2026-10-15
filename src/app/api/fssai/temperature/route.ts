@@ -19,7 +19,7 @@ import {
   resolveFssaiCurve, fssaiCurveExpectedShown, fssaiTempDirection,
   fssaiCurveLineStart, fssaiCurveExpected, fssaiReadingScheduleValue, fssaiTempVerdictWord,
   fssaiTempMinutesWords, fssaiCurveSummary, fssaiOpenCurves, fssaiNowMinuteIST,
-  fssaiClockMinute, fssaiCurveMembers, fssaiFailKindWords, fssaiTempImplausible,
+  fssaiClockMinute, fssaiCurveMembers, fssaiFailKindWords, fssaiTempImplausible, fssaiCurveKeyOf,
   type FssaiCurveResolution, type FssaiCurveStart,
 } from '../_p4/lib';
 
@@ -300,13 +300,17 @@ export async function GET(request: Request) {
             },
             value: pvValue,
             anchor: range.start_value,
+            goal,
+            moved: url.searchParams.get('moved') === '1',
           });
         if (!c.ok) {
-          curvePreview = { ok: false, error: c.error, code: c.code };
+          /* The batch the refusal is about rides along, so the form can offer
+           * "it is that pot" beside "A new batch". */
+          curvePreview = { ok: false, error: c.error, code: c.code, curve_id: c.curve_id || '', curve_label: c.curve_label || '' };
         } else {
           /* A JOINED batch is judged on the rule frozen on its first reading —
            * the same numbers the write path will use. */
-          const frozen = c.start && c.start.max_minutes !== null ? c.start : null;
+          const frozen = c.rule && c.rule.max_minutes !== null ? c.rule : null;
           const limitUsed = frozen ? frozen.max_minutes : range.max_minutes;
           const goalUsed = frozen ? frozen.goal : goal;
           /* A new batch at 0 minutes starts its own line from the number about to
@@ -314,7 +318,7 @@ export async function GET(request: Request) {
           const startsLine = !c.start && c.elapsed === 0;
           const line = startsLine
             ? null
-            : fssaiCurveLineStart({ first: c.start, self: { value: null, elapsed: c.elapsed }, anchor: range.start_value, direction: dir });
+            : fssaiCurveLineStart({ first: c.start, ruled: c.rule, self: { value: null, elapsed: c.elapsed }, anchor: range.start_value, direction: dir });
           const needed = c.reached
             ? goalUsed
             : line
@@ -413,15 +417,23 @@ export async function GET(request: Request) {
       /* ONE DEFINITION of "open" and "overdue" — fssaiOpenCurves in _p4/lib,
        * shared with the scheduled jobs. This route only adds who may see what. */
       const vis = fssaiRecordVisibility(me, { department: 't.department_id', recordedBy: 't.recorded_by' }, mgmt, FSSAI_NO_MATCH);
+      /* `include_reached=1` also lists the batches that already reached their
+       * target (today or yesterday) — the form's picker needs them: a pot that
+       * warmed up again is filed on ITS batch, as a failure, and the refusal that
+       * says "pick that batch" is useless if the list does not hold it
+       * (closing round 2026-10-15). The panel and the overdue count read the
+       * unreached ones only. */
+      const withReached = url.searchParams.get('include_reached') === '1';
       const open = fssaiOpenCurves(db, {
         today: fssaiToday(),
         nowMinute: fssaiNowMinuteIST(),
         logKind: kindParam || undefined,
         where: vis.sql ? vis : null,
+        includeReached: withReached,
       });
       return Response.json({
         curves: open,
-        overdue: open.filter((c) => c.outcome === 'overdue').length,
+        overdue: open.filter((c) => c.outcome === 'overdue' && !c.reached).length,
       });
     }
 
@@ -730,9 +742,10 @@ export async function POST(request: Request) {
        * (fssaiCurveSubjectMismatch) has something to compare. A reading that DOES
        * name a food keeps it, and is refused there if it is a different one. */
       if (kindMeta.window_minutes && str(body?.curve_id)) {
-        const pick = db.prepare(`SELECT id, batch_id, log_kind FROM fssai_temperature_logs WHERE id = ?`).get(str(body.curve_id)) as any;
-        if (pick && String(pick.log_kind) === logKind) {
-          const batchMembers = fssaiCurveMembers(db, logKind, String(pick.batch_id || '') || String(pick.id));
+        /* By a reading's id or by the batch's own key (fssaiCurveKeyOf). */
+        const pick = fssaiCurveKeyOf(db, logKind, str(body.curve_id));
+        if (pick && pick.kind === logKind) {
+          const batchMembers = fssaiCurveMembers(db, logKind, pick.key);
           const bFirst = batchMembers[0];
           const bLast = batchMembers[batchMembers.length - 1];
           if (bFirst && bLast) {
@@ -891,9 +904,16 @@ export async function POST(request: Request) {
           subject: { equipmentId, materialId, itemLabel, areaLabel, outletId },
           value,
           anchor: range.start_value,
+          /* The rule's target now — the goal of a batch begun before the rule. */
+          goal: range.target !== null ? range.target : (kindMeta.direction === 'hot' ? range.min : range.max),
+          /* "Moved here" — the only way a picked batch takes a reading at another place. */
+          moved: body?.moved === true,
         });
         if (!curve.ok) {
-          return Response.json({ error: curve.error, code: curve.code }, { status: curve.status });
+          return Response.json(
+            { error: curve.error, code: curve.code, ...(curve.curve_id ? { curve_id: curve.curve_id, curve_label: curve.curve_label || '' } : {}) },
+            { status: curve.status },
+          );
         }
       }
       const placed = curve && curve.ok ? curve : null;
@@ -905,8 +925,10 @@ export async function POST(request: Request) {
        * cooling from 240 to 480 minutes half-way through a batch, and 10 °C at
        * minute 300 then passed, while the batch's own summary and the overdue job
        * still used 240. A batch whose first reading was never judged on a clock
-       * (no rule then) takes the rule as it is now. */
-      const batchRule = placed && placed.start && placed.start.max_minutes !== null ? placed.start : null;
+       * (no rule then) takes the rule as it is now for its first reading that IS,
+       * and every later reading copies THAT one (`placed.rule`, closing round
+       * 2026-10-15 — the jobs and the batch summary read the same reading). */
+      const batchRule = placed && placed.rule && placed.rule.max_minutes !== null ? placed.rule : null;
       const ruleUsed = batchRule
         ? {
           standard_id: batchRule.standard_id || range.standard_id,
@@ -928,7 +950,7 @@ export async function POST(request: Request) {
        * line. fssaiCurveLineStart is the one rule; see it for why a part-way
        * first reading can never be its own start. */
       const lineStart: FssaiCurveStart | null = placed
-        ? fssaiCurveLineStart({ first: placed.start, self: { value, elapsed: placed.elapsed }, anchor: range.start_value, direction: kindMeta.direction })
+        ? fssaiCurveLineStart({ first: placed.start, ruled: placed.rule, self: { value, elapsed: placed.elapsed }, anchor: range.start_value, direction: kindMeta.direction })
         : null;
       /* The batch's own 0-minute reading, for the verdict's words only (its line
        * may start from the rule's stricter figure instead). */
@@ -1065,6 +1087,7 @@ export async function POST(request: Request) {
             ...(placed ? {
               batch_id: batchIdToStore, curve_mode: placed.mode, elapsed_minutes: elapsed,
               elapsed_typed: typedElapsed, max_minutes_used: limitUsed,
+              moved_here: body?.moved === true,
               rule_frozen_from_batch: !!batchRule,
               ...(batchRule && (range.max_minutes !== batchRule.max_minutes || range.target !== batchRule.target_used)
                 ? { rule_now: { max_minutes: range.max_minutes, target: range.target, min: range.min, max: range.max } } : {}),

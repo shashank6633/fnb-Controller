@@ -423,7 +423,10 @@ function SectionRows({ sectionKey, rows, today }: { sectionKey: string; rows: an
             </div>
             <div className="text-right shrink-0">
               <Badge meta={fssaiDocStateMeta(r.state)} />
-              <p className="text-xs text-[#8B7355] mt-0.5">{r.expiry_date || 'does not expire'}</p>
+              {/* A paper with no expiry of its own that stands for a period (a
+                  water bill, a food lab report) says until when — never "does
+                  not expire". */}
+              <p className="text-xs text-[#8B7355] mt-0.5">{r.expiry_date || (r.until ? `good until ${r.until}` : 'does not expire')}</p>
               {r.copies > 0 && <p className="text-xs text-[#8B7355]">{r.copies} cop{r.copies === 1 ? 'y' : 'ies'} on file</p>}
             </div>
           </li>

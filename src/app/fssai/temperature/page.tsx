@@ -124,6 +124,8 @@ interface CurveSummary {
   start: { id: string; business_date: string; reading_at: string; value_num: number | null; elapsed_minutes: number | null } | null;
   line_start: { value: number; minute: number; source: string } | null;
   last: { reading_at: string; value_num: number | null; elapsed_minutes: number | null } | null;
+  /** The first reading at the target; null while it is still on its way. */
+  reached?: { id: string; reading_at: string; value_num: number | null; elapsed_minutes: number | null } | null;
   elapsed_now: number | null;
   needed_now: number | null;
   outcome: string;
@@ -156,6 +158,44 @@ function subjectFromBatch(
     if (c.area_label) out.area_label = c.area_label;
   }
   return out;
+}
+
+/** The place a form names: a unit, or a place typed by name. */
+type PlaceForm = { equipment_id?: string; area_label?: string } | null | undefined;
+
+/** Is this batch where the form says the reading was taken? A form that names
+ *  no place is anywhere. The batch's place is where it was LAST read. */
+function batchAtPlace(c: CurveSummary, f: PlaceForm): boolean {
+  const eq = String(f?.equipment_id || '');
+  const area = String(f?.area_label || '').trim();
+  if (!eq && !area) return true;
+  return String(c.equipment_id || '') === eq && sameText(c.area_label, area);
+}
+
+/**
+ * THE BATCH PICKER: batches of THIS kind, of THIS dish, at THIS place (closing
+ * round 2026-10-15 — it filtered on the kind and the dish only, and the server
+ * now checks both). Once a dish is named only that dish's batches are offered;
+ * once a place is named, only the batches last read there (`here`). A batch of
+ * the same dish last read at ANOTHER place is offered apart (`moved`), for a pot
+ * moved here — picking it needs the "moved here" tick, which the server also
+ * requires. A batch that names no dish is a place or a unit, so its place must
+ * match — and once a dish is named it is not offered at all (closing round
+ * 2026-10-15: it was listed first for any dish, and a dish picked onto it was
+ * judged on its shorter clock; the server now refuses that too). The batch
+ * already chosen stays listed.
+ */
+function pickerBatches(
+  form: { log_kind?: string; item_label?: string; equipment_id?: string; area_label?: string; curve_choice?: string } | null | undefined,
+  curves: CurveSummary[],
+): { here: CurveSummary[]; moved: CurveSummary[] } {
+  if (!form || !isRateKind(form.log_kind)) return { here: [], moved: [] };
+  const item = String(form.item_label || '').trim();
+  const kindOk = curves.filter((c) => c.log_kind === form.log_kind);
+  const sameDish = (c: CurveSummary) => !item || (!!c.item_label && sameText(c.item_label, item));
+  const here = kindOk.filter((c) => c.id === form.curve_choice || (sameDish(c) && batchAtPlace(c, form)));
+  const moved = kindOk.filter((c) => !here.includes(c) && !!item && !!c.item_label && sameText(c.item_label, item) && !batchAtPlace(c, form));
+  return { here, moved };
 }
 
 /** Cooling and reheating — judged on a clock, kept as a batch. */
@@ -229,7 +269,10 @@ export default function FssaiTemperaturePage() {
       const [j, u, oc] = await Promise.all([
         apiJson<any>(`/api/fssai/temperature?${p}`),
         apiJson<any>('/api/fssai/equipment?with_latest=0'),
-        apiJson<any>('/api/fssai/temperature?curves=open').catch(() => ({ curves: [] })),
+        /* include_reached: the picker also needs the batches that already reached
+         * their target — a pot that warmed up again goes on ITS batch, as a
+         * failure. The panel below shows only the unreached ones. */
+        apiJson<any>('/api/fssai/temperature?curves=open&include_reached=1').catch(() => ({ curves: [] })),
       ]);
       setOpenCurves(oc.curves || []);
       setRows(j.readings || []);
@@ -272,9 +315,15 @@ export default function FssaiTemperaturePage() {
         if (f.business_date) p.set('business_date', f.business_date);
         const joining = !!f.curve_choice && f.curve_choice !== 'new';
         if (f.curve_choice === 'new') p.set('new_curve', '1');
-        else if (joining) p.set('curve_id', f.curve_choice);
-        // On a picked batch the minutes are COUNTED by the server; a typed figure is not sent.
-        if (!joining && f.elapsed_minutes !== '' && f.elapsed_minutes !== undefined && f.elapsed_minutes !== null) {
+        else if (joining) {
+          p.set('curve_id', f.curve_choice);
+          if (f.moved === true) p.set('moved', '1');
+        }
+        /* On a picked batch the minutes are COUNTED by the server. Minutes the cook
+         * typed before a refusal sent him to that batch ride along, and the server
+         * judges at the longer of the two — never the shorter (closing round
+         * 2026-10-15). Choosing a batch from the list clears them. */
+        if (f.elapsed_minutes !== '' && f.elapsed_minutes !== undefined && f.elapsed_minutes !== null) {
           p.set('elapsed_minutes', String(f.elapsed_minutes));
         }
         if (f.item_label) p.set('item_label', f.item_label);
@@ -294,22 +343,17 @@ export default function FssaiTemperaturePage() {
     const t = setTimeout(() => { void refreshPreview(form); }, 250);
     return () => clearTimeout(t);
   }, [form?.log_kind, form?.equipment_id, form?.uom, form?.reading_at, form?.business_date,
-    form?.curve_choice, form?.elapsed_minutes, form?.item_label, form?.area_label, form?.value_num, refreshPreview]);
+    form?.curve_choice, form?.elapsed_minutes, form?.item_label, form?.area_label, form?.value_num, form?.moved, refreshPreview]);
 
-  /* The open batches of THIS kind — and, once a dish is named, only that dish's
-   * (2026-10-15: the list offered every dish, and one mis-pick judged a curry on
-   * a dal's clock; the server now refuses a different food on a picked batch).
-   * A batch that names no dish (a place or unit only) is always offered, and the
-   * batch already chosen stays in the list. */
-  const pickable = useMemo(
-    () => {
-      if (!form || !isRateKind(form.log_kind)) return [];
-      const item = String(form.item_label || '').trim();
-      return openCurves.filter((c) => c.log_kind === form.log_kind
-        && (c.id === form.curve_choice || !item || !c.item_label || sameText(c.item_label, item)));
-    },
-    [form, openCurves],
-  );
+  /* The batches still cooling or reheating — the panel lists only these. */
+  const panelCurves = useMemo(() => openCurves.filter((c) => !c.reached), [openCurves]);
+
+  const pickable = useMemo(() => pickerBatches(form, openCurves), [form, openCurves]);
+  /* The picked batch, and whether this reading names another place than where it
+   * was last read — then the "moved here" tick is shown, and required. */
+  const pickedCurve = form && form.curve_choice && form.curve_choice !== 'new'
+    ? openCurves.find((c) => c.id === form.curve_choice) : undefined;
+  const pickedElsewhere = !!pickedCurve && !!pickedCurve.item_label && !batchAtPlace(pickedCurve, form);
 
   /** Open the form already pointed at a batch (from the panel or a reading) —
    *  with the batch's dish and place filled in. */
@@ -436,14 +480,14 @@ export default function FssaiTemperaturePage() {
       {/* ── batches still cooling or heating — the list a cook adds the next
        * reading from, and the one a manager reads for a pot left unfinished. A
        * batch past its time with nothing at the target is in red. ───────────── */}
-      {openCurves.length > 0 && (
+      {panelCurves.length > 0 && (
         <div className="bg-white border border-[#E8D5C4] rounded-xl p-3">
           <p className="text-xs font-semibold text-[#6B5744] mb-2">
-            Batches still cooling or reheating ({openCurves.length}
-            {openCurves.some((c) => c.outcome === 'overdue') ? `, ${openCurves.filter((c) => c.outcome === 'overdue').length} past their time` : ''})
+            Batches still cooling or reheating ({panelCurves.length}
+            {panelCurves.some((c) => c.outcome === 'overdue') ? `, ${panelCurves.filter((c) => c.outcome === 'overdue').length} past their time` : ''})
           </p>
           <div className="space-y-1.5">
-            {openCurves.map((c) => {
+            {panelCurves.map((c) => {
               const late = c.outcome === 'overdue';
               const hot = c.direction === 'hot';
               return (
@@ -595,20 +639,54 @@ export default function FssaiTemperaturePage() {
                   <label className={labelCls}>Which batch</label>
                   <select className={inputCls} value={form.curve_choice ?? ''}
                     onChange={(e) => setForm({
-                      ...form, curve_choice: e.target.value, elapsed_minutes: '',
+                      ...form, curve_choice: e.target.value, elapsed_minutes: '', moved: false, curve_choice_label: '',
                       ...subjectFromBatch(form, openCurves.find((c) => c.id === e.target.value)),
                     })}>
                     <option value="">Match it to the open batch of the same dish and place</option>
                     <option value="new">A new batch — this is its first reading</option>
-                    {pickable.map((c) => (
+                    {pickable.here.map((c) => (
                       <option key={c.id} value={c.id}>
                         {c.label} — started {c.start?.reading_at} at {c.start?.value_num ?? '?'} °C
-                        {c.elapsed_now !== null ? `, ${c.elapsed_now} min ago` : ''}
+                        {c.reached ? ` (reached ${c.goal ?? '?'} °C at ${c.reached.reading_at})` : c.elapsed_now !== null ? `, ${c.elapsed_now} min ago` : ''}
                         {c.outcome === 'overdue' ? ' (PAST ITS TIME)' : ''}
                       </option>
                     ))}
+                    {pickable.moved.length > 0 && (
+                      <optgroup label="Same dish, last read at another place — only if the pot was moved here">
+                        {pickable.moved.map((c) => (
+                          <option key={c.id} value={c.id}>
+                            {c.label} — started {c.start?.reading_at} at {c.start?.value_num ?? '?'} °C
+                            {c.reached ? ` (reached ${c.goal ?? '?'} °C at ${c.reached.reading_at})` : c.elapsed_now !== null ? `, ${c.elapsed_now} min ago` : ''}
+                          </option>
+                        ))}
+                      </optgroup>
+                    )}
+                    {/* A batch named by a refusal ("it is that pot") that the list
+                     * does not hold — e.g. another department's. */}
+                    {form.curve_choice && form.curve_choice !== 'new'
+                      && !pickable.here.some((c) => c.id === form.curve_choice) && !pickable.moved.some((c) => c.id === form.curve_choice) && (
+                      <option value={form.curve_choice}>{form.curve_choice_label || 'The batch named above'}</option>
+                    )}
                   </select>
                 </div>
+                {pickedElsewhere && (
+                  <label className="flex flex-nowrap items-start gap-2 text-[12px] text-[#3D2614] bg-amber-50 border border-amber-200 rounded-lg p-2.5">
+                    <input type="checkbox" className="mt-0.5" checked={form.moved === true}
+                      onChange={(e) => setForm({ ...form, moved: e.target.checked })} />
+                    <span>
+                      <strong>Moved here.</strong> This batch was last read at {pickedCurve?.place_label || 'another place'}.
+                      Tick this only if this is that same pot, moved here — it stays on its batch and its clock.
+                      A different pot of {pickedCurve?.item_label || 'this dish'} needs its own batch.
+                    </span>
+                  </label>
+                )}
+                {form.curve_choice && form.curve_choice !== 'new'
+                  && form.elapsed_minutes !== '' && form.elapsed_minutes !== undefined && form.elapsed_minutes !== null && (
+                  <p className="text-[12px] text-[#3D2614] bg-amber-50 border border-amber-200 rounded-lg p-2.5">
+                    You entered {String(form.elapsed_minutes)} minutes. On this batch the reading is judged at the longer
+                    of that and the batch&apos;s own clock — the stricter of the two.
+                  </p>
+                )}
                 {(!form.curve_choice || form.curve_choice === 'new') && (
                   <div>
                     <label className={labelCls}>Minutes it has already been {FSSAI_TEMP_LOG_KINDS.find((k) => k.key === form.log_kind)?.direction === 'hot' ? 'heating' : 'cooling'} (leave empty if it has just started)</label>
@@ -633,7 +711,36 @@ export default function FssaiTemperaturePage() {
                         : 'bg-sky-50 border-sky-200 text-sky-900'
                   }`}>
                     {!preview.curve_preview.ok
-                      ? preview.curve_preview.error
+                      ? (
+                        <>
+                          {preview.curve_preview.error}
+                          {/* "Pick that batch" used to be advice with nothing to press —
+                           * and for a batch that had reached its target, nothing in the
+                           * list to pick. Both answers are offered here. */}
+                          {['stale_batch_open', 'after_target', 'minutes_disagree', 'minutes_longer', 'same_food_elsewhere', 'out_of_order', 'ambiguous_batch'].includes(preview.curve_preview.code) && (
+                            <span className="flex flex-wrap gap-2 mt-2">
+                              {preview.curve_preview.curve_id && preview.curve_preview.code !== 'out_of_order' && (
+                                <button type="button"
+                                  onClick={() => setForm({
+                                    /* The minutes typed are KEPT: on the batch the reading is
+                                     * judged at the longer of them and its own clock. */
+                                    ...form, curve_choice: preview.curve_preview.curve_id,
+                                    curve_choice_label: preview.curve_preview.curve_label || '',
+                                    moved: preview.curve_preview.code === 'same_food_elsewhere',
+                                  })}
+                                  className="px-2.5 py-1.5 rounded-lg bg-white border border-red-300 text-red-800 text-[12px] font-semibold">
+                                  {preview.curve_preview.code === 'same_food_elsewhere' ? 'It is that pot, moved here' : 'It is that pot — put it on that batch'}
+                                </button>
+                              )}
+                              <button type="button"
+                                onClick={() => setForm({ ...form, curve_choice: 'new', moved: false, curve_choice_label: '' })}
+                                className="px-2.5 py-1.5 rounded-lg bg-white border border-red-300 text-red-800 text-[12px] font-semibold">
+                                It is a different pot — a new batch
+                              </button>
+                            </span>
+                          )}
+                        </>
+                      )
                       : preview.curve_preview.after_target
                         ? `This batch has already reached ${preview.curve_preview.goal} °C. This reading has to be ${preview.direction === 'hot' ? 'at or above' : 'at or below'} it still — one back past it is filed as a failure.`
                       : preview.curve_preview.starts_line
@@ -708,11 +815,19 @@ export default function FssaiTemperaturePage() {
             <button
               disabled={busy || form.value_num === '' || form.value_num === undefined}
               onClick={async () => {
-                const { curve_choice: choice, ...rest } = form;
+                const { curve_choice: choice, curve_choice_label: _label, moved, ...rest } = form;
+                void _label;
                 const body: any = { ...rest, action: 'record' };
                 if (isRateKind(form.log_kind)) {
                   if (choice === 'new') body.new_curve = true;
-                  else if (choice) { body.curve_id = choice; delete body.elapsed_minutes; }
+                  else if (choice) {
+                    body.curve_id = choice;
+                    /* Typed minutes carried from a refusal are sent; the server
+                     * judges at the longer of them and the batch's own clock. */
+                    if (body.elapsed_minutes === '' || body.elapsed_minutes === undefined || body.elapsed_minutes === null) delete body.elapsed_minutes;
+                    /* "Moved here" — sent only for a picked batch, and only when ticked. */
+                    if (moved === true) body.moved = true;
+                  }
                 } else {
                   delete body.elapsed_minutes;
                 }

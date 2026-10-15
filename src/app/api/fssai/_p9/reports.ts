@@ -8,7 +8,8 @@ import {
   fssaiPestServiceStatusMeta, fssaiPestSeverityMeta,
   fssaiTempLogKindLabel, fssaiWaterTestKind, FSSAI_TEMP_LOG_KINDS,
 } from '@/lib/fssai';
-import { dateClause, deptLabel, intOr, intOrBlank, numOrBlank, whereAll, type DateWindow } from './lib';
+import { dateClause, deptLabel, fssaiTablesPresent, intOr, intOrBlank, numOrBlank, whereAll, type DateWindow } from './lib';
+import { fssaiPaperInForce } from '../audit-file/lib';
 import {
   fssaiCurveMembers, fssaiCurveReached, fssaiCurveExpectedShown, fssaiTempDirection,
   fssaiReadingScheduleValue, fssaiTempVerdictWord, fssaiTempMinutesWords, fssaiNowMinuteIST,
@@ -1364,6 +1365,7 @@ export const FSSAI_REPORTS: FssaiReportDef[] = [
       { key: 'expiry', label: 'Expires', width: 1 },
       { key: 'days', label: 'Days left', align: 'right', width: 0.9 },
       { key: 'state', label: 'State', width: 1.1 },
+      { key: 'copy', label: 'Copy', width: 0.9 },
       { key: 'owner', label: 'Who renews it', width: 1.6 },
     ],
     run(ctx) {
@@ -1382,8 +1384,19 @@ export const FSSAI_REPORTS: FssaiReportDef[] = [
        * handler's name likewise (handler_id, 2026-10-14): a certificate for a cook
        * with no app login has no person_email, and would otherwise belong to
        * nobody on this sheet. */
+      /* THE COPY — counted the audit file's way (audit-file/lib readScans): a
+       * LIVE scan only. A voided scan (attached by mistake — kept, with who, when
+       * and why) is never a copy, nor an image an earlier build blanked; a
+       * document whose only scan was voided reads "voided only". */
+      const hasAtt = fssaiTablesPresent(ctx.db).has('fssai_attachments');
+      const copySql = hasAtt
+        ? `(SELECT COUNT(*) FROM fssai_attachments a WHERE a.entity_table = 'fssai_documents' AND a.entity_id = d.id
+              AND a.data_uri <> '' AND a.status <> 'void' AND a.voided_at = '') AS live_copies,
+           (SELECT COUNT(*) FROM fssai_attachments a WHERE a.entity_table = 'fssai_documents' AND a.entity_id = d.id
+              AND (a.status = 'void' OR a.voided_at <> '')) AS voided_copies`
+        : `0 AS live_copies, 0 AS voided_copies`;
       const rows = ctx.db.prepare(
-        `SELECT d.*, IFNULL(v.name, '') AS vendor_name, IFNULL(fh.full_name, '') AS handler_name
+        `SELECT d.*, IFNULL(v.name, '') AS vendor_name, IFNULL(fh.full_name, '') AS handler_name, ${copySql}
            FROM fssai_documents d
            LEFT JOIN vendors v ON v.id = d.vendor_id
            LEFT JOIN fssai_food_handlers fh ON fh.id = d.handler_id AND d.handler_id <> '' ${w.sql}
@@ -1401,9 +1414,18 @@ export const FSSAI_REPORTS: FssaiReportDef[] = [
         const isVoid = String(r.status || '') === 'void' || !!String(r.voided_at || '');
         const isSuperseded = !isVoid && Number(r.is_active) === 0;
         const state = fssaiDocState(r.expiry_date, ctx.today, intOr(r.reminder_days, 30));
+        /* A paper that stands for a PERIOD and carries no expiry date of its own
+         * (a water bill: its quarter; a food lab report: a year) lapses by that
+         * period — the same rule the audit file and Inspection Mode hand over by
+         * (fssaiPaperInForce). It reads "Lapsed <date>" and counts as expired. */
+        const force = fssaiPaperInForce({
+          doc_type: String(r.doc_type || ''), expiry_date: String(r.expiry_date || ''), valid_from: String(r.valid_from || ''),
+          issued_on: String(r.issued_on || ''), created_on: String(r.created_at || '').slice(0, 10),
+        }, state, ctx.today);
+        const lapsedByPeriod = state !== 'expired' && !force.in_force;
         if (isVoid) voided++;
         else if (isSuperseded) superseded++;
-        else if (state === 'expired') expired++;
+        else if (state === 'expired' || lapsedByPeriod) expired++;
         else if (state === 'expiring') expiring++;
         const exp = String(r.expiry_date || '');
         const days = exp
@@ -1424,7 +1446,9 @@ export const FSSAI_REPORTS: FssaiReportDef[] = [
           ? `Voided${String(r.void_reason || '') ? ` — ${String(r.void_reason)}` : ''}`
           : isSuperseded
             ? 'Superseded — renewed'
-            : fssaiDocStateMeta(state).label;
+            : lapsedByPeriod ? force.state_words : fssaiDocStateMeta(state).label;
+        const live = intOr(r.live_copies);
+        const copy = live ? `${live} scan${live === 1 ? '' : 's'}` : intOr(r.voided_copies) ? 'voided only' : 'none';
         return [
           fssaiDocType(r.doc_type)?.label || String(r.doc_type || ''),
           String(r.title || ''),
@@ -1436,6 +1460,7 @@ export const FSSAI_REPORTS: FssaiReportDef[] = [
           /* Days left means nothing on a document that no longer counts. */
           isVoid || isSuperseded ? '' : days,
           stateWords,
+          copy,
           String(r.owner_email || ''),
         ];
       });
@@ -1444,7 +1469,7 @@ export const FSSAI_REPORTS: FssaiReportDef[] = [
         truncated,
         kpis: [
           { label: 'Documents', value: String(page.length) },
-          { label: 'Expired', value: String(expired), sub: 'live documents only' },
+          { label: 'Expired', value: String(expired), sub: 'live documents only, incl. lapsed by period' },
           { label: 'Expiring soon', value: String(expiring) },
           { label: 'Superseded or voided', value: String(superseded + voided), sub: 'kept on file, not counted' },
         ],
@@ -1452,7 +1477,9 @@ export const FSSAI_REPORTS: FssaiReportDef[] = [
           `The state is worked out against ${ctx.today} every time this is read, never stored — a document cannot read ` +
           '"Valid" the day after it lapsed. A blank expiry means the document does not expire. ' +
           'A document replaced by its renewal reads "Superseded — renewed" and a voided one "Voided": both stay on the sheet ' +
-          'and neither is counted as expired.',
+          'and neither is counted as expired. A water bill, water test, waste record or food lab report with no expiry date ' +
+          'stands for its period from its date (a quarter for a bill, a year for a lab report) and reads "Lapsed" after it. ' +
+          'Copy counts live scans only — a voided scan is kept, never a copy.',
       };
     },
   },

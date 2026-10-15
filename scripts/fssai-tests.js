@@ -59,7 +59,9 @@
  * to it. Every test runs inside a SAVEPOINT that is rolled back, so fixtures never
  * accumulate. The real database is only ever opened READ-ONLY, to VACUUM INTO a
  * temp copy (which folds the WAL in), and only for the upgrade-path boot check.
- * See assertSandboxed().
+ * See assertSandboxed(). Sections 7 and 14 file readings at fixed times of today,
+ * so they run on a clock pinned at 19:05 IST today; the answer does not depend
+ * on the hour the suite is run. See THE PINNED CLOCK.
  *
  * HOW IT AVOIDS BEING INERT. Every guard here is exercised by CONSTRUCTING the
  * case it exists for and watching it fire (a tampered sheet, a retired checklist,
@@ -260,6 +262,35 @@ async function test(name, fn) {
     catch (e) { bad(`${name} — savepoint unwind failed`, String(e)); }
   }
 }
+
+/* ── THE PINNED CLOCK (sections 7 and 14) ──────────────────────────────────────
+ * Those two sections file temperature readings at fixed times of TODAY (05:00 to
+ * 13:00, and a batch across midnight that ends at 03:30), and the temperature
+ * route refuses a time later than now (code future_time). On the real clock the
+ * suite therefore failed before about 13:00 IST: measured 2026-10-15 at 08:08,
+ * 5 failed, and at 09:13, 4 failed. So while they run, "now" is TODAY at 19:05
+ * IST. It is today's IST date, so fssaiToday() is the same answer, and it keeps
+ * ticking in real time. Every other section runs on the real clock.
+ * SQLite's own datetime('now') is not moved; nothing those two sections judge
+ * reads it. Section 7 also checks that a time after 19:05 is still refused, so
+ * the pin cannot hide the guard it works around. */
+const REAL_DATE = Date;
+let CLOCK_SHIFT_MS = 0;
+class SuiteDate extends REAL_DATE {
+  constructor(...a) { if (a.length === 0) super(REAL_DATE.now() + CLOCK_SHIFT_MS); else super(...a); }
+  static now() { return REAL_DATE.now() + CLOCK_SHIFT_MS; }
+}
+const CLOCK = {
+  PINNED_AT: '19:05',
+  /** From here on, "now" is today (IST) at hh:mm IST, ticking. */
+  pin(hhmm = CLOCK.PINNED_AT) {
+    const today = F.fssaiToday(new REAL_DATE(REAL_DATE.now()));
+    CLOCK_SHIFT_MS = REAL_DATE.parse(`${today}T${hhmm}:00+05:30`) - REAL_DATE.now();
+    global.Date = SuiteDate;
+  },
+  /** Back to the real clock. */
+  real() { CLOCK_SHIFT_MS = 0; global.Date = REAL_DATE; },
+};
 
 const uid = () => 'fssaitest-' + Math.random().toString(36).slice(2, 12);
 const IDENT = /^[a-z_][a-z0-9_]*$/;
@@ -1044,6 +1075,7 @@ function pdfTextOf(buf) {
 
   /* ─────────────────────────────────────────────────────────────────────── */
   section(7, 'THE COOLING CURVE — anchored, fail-closed, both directions, across midnight');
+  CLOCK.pin(); // the readings below are at fixed times of today (see THE PINNED CLOCK)
 
   const TEMP = route('temperature');
   const STD = route('temp-standards');
@@ -1124,9 +1156,15 @@ function pdfTextOf(buf) {
     await suggest();
     let r = await reading({ log_kind: 'reheating', value_num: 4, area_label: 'Line', item_label: 'Dal E1', reading_at: '10:00' });
     const e1 = r.j.reading;
-    expectSame([e1.is_fail, e1.curve_start_source, e1.verdict_word], [0, 'first_reading', 'On schedule'], 'a reheat batch starts from its own 0-minute reading');
+    /* THE STRICTER START (2026-10-15, fssaiCurveLineStart): a batch with its own
+     * 0-minute reading draws its line from that reading OR the rule's starting
+     * temperature, whichever is stricter. For reheating that is the HIGHER one,
+     * so a 4 °C pot is measured from the rule's 5 °C, not from 4 °C. */
+    expectSame([e1.is_fail, e1.curve_start_source, e1.curve_start_used, e1.verdict_word], [0, 'first_reading', 5, 'On schedule'],
+      'a reheat batch starts at its own 0-minute reading, and its line starts at the rule’s 5 °C (stricter than its 4 °C)');
     r = await reading({ log_kind: 'reheating', value_num: 35, area_label: 'Line', item_label: 'Dal E1', reading_at: '11:00', action_taken: 'Turned the burner up' });
-    expectSame([r.j.reading.curve_id, r.j.reading.is_fail, r.j.reading.schedule_value], [e1.id, 1, 39.5], '35 °C at 60 min is BELOW the rising line (needed ≥ 39.5) → FAIL');
+    expectSame([r.j.reading.curve_id, r.j.reading.is_fail, r.j.reading.schedule_value], [e1.id, 1, 40],
+      '35 °C at 60 min is BELOW the rising line from 5 °C (needed ≥ 40; from the 4 °C reading it would have been 39.5) → FAIL');
     expectTrue(/^Reheating behind schedule/.test((caOf(r.j.reading.id) || {}).title || ''), 'and raises "Reheating behind schedule"');
     r = await reading({ log_kind: 'reheating', value_num: 76, area_label: 'Line', item_label: 'Dal E1', reading_at: '12:00' });
     expectSame([r.j.reading.is_fail, r.j.reading.elapsed_minutes, r.j.reading.verdict_word], [0, 120, 'In range'], '76 °C at 120 min reached 75 °C in time');
@@ -1145,8 +1183,16 @@ function pdfTextOf(buf) {
     await suggest();
     let r = await reading({ log_kind: 'cooling', value_num: 72, area_label: 'Kitchen', item_label: 'Biryani F1', business_date: T_YDAY, reading_at: '23:30', backdate_reason: 'Last night’s batch' });
     const f1 = r.j.reading;
+    /* THE STRICTER START: for cooling it is the LOWER of the first reading and the
+     * rule's starting temperature, so a 72 °C pot is measured from 60 °C. */
+    expectSame([f1.is_fail, f1.curve_start_source, f1.curve_start_used], [0, 'first_reading', 60],
+      'a 72 °C pot starts its batch, and its line starts at the rule’s 60 °C (stricter than its 72 °C)');
     r = await reading({ log_kind: 'cooling', value_num: 55, area_label: 'Kitchen', item_label: 'Biryani F1', reading_at: '00:30' });
-    expectSame([r.j.reading.curve_id, r.j.reading.elapsed_minutes, r.j.reading.is_fail, r.j.reading.schedule_value], [f1.id, 60, 0, 55.2], 'after midnight it JOINS the batch: 60 minutes counted across the date change');
+    expectSame([r.status, r.j.code], [400, 'action_taken_required'],
+      '55 °C at 60 min is behind the line from 60 °C (needed ≤ 46.2; from the 72 °C reading it would have passed at ≤ 55.2) — refused until the action is said');
+    r = await reading({ log_kind: 'cooling', value_num: 45, area_label: 'Kitchen', item_label: 'Biryani F1', reading_at: '00:30' });
+    expectSame([r.j.reading.curve_id, r.j.reading.elapsed_minutes, r.j.reading.is_fail, r.j.reading.schedule_value], [f1.id, 60, 0, 46.2],
+      'after midnight it JOINS the batch: 60 minutes counted across the date change, on schedule (needed ≤ 46.2)');
     r = await reading({ log_kind: 'cooling', value_num: 4, area_label: 'Kitchen', item_label: 'Biryani F1', reading_at: '03:30' });
     expectSame([r.j.reading.elapsed_minutes, r.j.reading.is_fail], [240, 0], 'reached 4 °C at minute 240: in time');
     signIn(MANAGER);
@@ -1157,8 +1203,9 @@ function pdfTextOf(buf) {
     r = await reading({ log_kind: 'cooling', value_num: 60, area_label: 'Kitchen', item_label: 'Pulao F2', business_date: T_YDAY, reading_at: '00:40', backdate_reason: 'Last night’s batch' });
     expectSame([r.status, r.j.code], [409, 'before_curve_start'], 'dated yesterday at 00:40 → refused (it used to start a new batch that passed at minute 0)');
     expectTrue(String(r.j.error).includes(`date it ${T_TODAY}`), 'and the refusal names the date it needs');
-    r = await reading({ log_kind: 'cooling', value_num: 50, area_label: 'Kitchen', item_label: 'Pulao F2', curve_id: f2.id, reading_at: '00:40' });
-    expectSame([r.status, r.j.reading.elapsed_minutes, r.j.reading.curve_id, r.j.reading.is_fail], [200, 60, f2.id, 0], 'dated today, it joins its batch at 60 minutes, on schedule');
+    r = await reading({ log_kind: 'cooling', value_num: 45, area_label: 'Kitchen', item_label: 'Pulao F2', curve_id: f2.id, reading_at: '00:40' });
+    expectSame([r.status, r.j.reading && r.j.reading.elapsed_minutes, r.j.reading && r.j.reading.curve_id, r.j.reading && r.j.reading.is_fail], [200, 60, f2.id, 0],
+      'dated today, it joins its batch at 60 minutes, on schedule (45 °C; the line starts at 60 °C)');
   });
 
   await test('an ABANDONED batch reads as overdue (fssaiOpenCurves, which the escalation job reads)', async () => {
@@ -1173,6 +1220,16 @@ function pdfTextOf(buf) {
     expectTrue(g.status === 200 && g.j.curves.some((c) => c.id === g1.id), 'GET ?curves=open lists it');
     expectSame(P4.fssaiTempVerdictWord({ log_kind: 'cooling', is_judged: 1, is_fail: 0, value_num: 68, max_used: 5 }), 'On schedule', 'fssaiTempVerdictWord never says "In range" for a cooling reading above its target');
   });
+
+  await test('THE PINNED CLOCK does not hide the future-time guard: a time after it is still refused', async () => {
+    await suggest();
+    expect(P4.fssaiNowMinuteIST(), P4.fssaiClockMinute(T_TODAY, CLOCK.PINNED_AT), `the route reads "now" as ${CLOCK.PINNED_AT} IST today`);
+    let r = await reading({ log_kind: 'cooling', value_num: 70, area_label: 'Kitchen', item_label: 'Future H1', reading_at: '21:00' });
+    expectSame([r.status, r.j.code, count('fssai_temperature_logs')], [400, 'future_time', 0], '21:00 today is refused as future_time, and nothing is filed');
+    r = await reading({ log_kind: 'cooling', value_num: 70, area_label: 'Kitchen', item_label: 'Future H1', reading_at: '19:00' });
+    expectSame([r.status, r.j.reading && r.j.reading.is_fail], [200, 0], '19:00 today (before the pinned 19:05) is filed');
+  });
+  CLOCK.real(); // sections 8 to 13 run on the real clock
 
   /* ─────────────────────────────────────────────────────────────────────── */
   section(8, 'THE FOOD-HANDLER REGISTER — who is covered, who is NOT, by name (#55 #56 #106 #107)');
@@ -1961,6 +2018,7 @@ function pdfTextOf(buf) {
 
   /* ─────────────────────────────────────────────────────────────────────── */
   section(14, 'THE AUDIT-FILE PDF — what the inspector’s copy SAYS it holds, and what it never prints');
+  CLOCK.pin(); // its cooking and cooling readings are at 12:00 and 13:00 today (see THE PINNED CLOCK)
 
   const AF = route('audit-file');
   const AF_PDF = route('audit-file/pdf');
@@ -2029,6 +2087,8 @@ function pdfTextOf(buf) {
     expectTrue(mt.includes('Mallesh Yadav'), 'and names the food handler with no certificate');
     expectTrue(/days with no handover/i.test(mt) && j.items.every((i) => mt.includes(i.title)), 'and carries the management-only figures and every one of the 20 records');
   });
+
+  CLOCK.real(); // section 15 runs on the real clock
 
   /* ─────────────────────────────────────────────────────────────────────── */
   section(15, 'MISSED CHECKS ON WHATSAPP — DORMANT (bell only) with no approved template and no app secret');

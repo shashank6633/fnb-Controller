@@ -8,7 +8,7 @@ import {
 import {
   requireFssaiUser, requireFssaiAdmin, fssaiCsrfGuard, fssaiAudit, str,
 } from '@/lib/fssai-server';
-import { fssaiNum, fssaiInt } from '../_p4/lib';
+import { fssaiNum, fssaiInt, fssaiTempImplausible } from '../_p4/lib';
 
 /**
  * WAS THIS A UNIQUE-INDEX REFUSAL?
@@ -340,6 +340,20 @@ function validateStandard(body: any, existing: any | null): { error: string } | 
         ? `Reheating starts below the temperature it has to reach. A starting temperature of ${startValue} with a target of ${goal} would draw no schedule at all.`
         : `Cooling starts above the temperature it has to come down to. A starting temperature of ${startValue} with a target of ${goal} would draw no schedule at all.`,
     };
+  }
+  /* THE OTHER SIDE, TOO (closing round 2026-10-15). Only the side of the target
+   * was checked, so a cooling anchor of 300 °C was stored, and every part-way
+   * reading on a batch with no 0-minute reading was then measured from it —
+   * 150 °C at 120 minutes "on schedule". The anchor has to be a temperature a
+   * reading of that kind could physically be (the same bounds that refuse a
+   * typed reading, fssaiTempImplausible). */
+  if (startValue !== null && rate && (uom === 'C' || uom === 'F')) {
+    const bad = fssaiTempImplausible(appliesTo, startValue, uom);
+    if (bad) {
+      return {
+        error: `A starting temperature of ${startValue} °${bad.uom} is not one a ${dir === 'hot' ? 'reheating' : 'cooling'} reading could be — it has to be between ${bad.min} and ${bad.max} °${bad.uom}. Every batch with no 0-minute reading would be measured from it.`,
+      };
+    }
   }
 
   const decimals = body?.decimals !== undefined ? fssaiInt(body.decimals) : fssaiInt(existing?.decimals);

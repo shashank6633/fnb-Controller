@@ -452,6 +452,13 @@ function SelfAuditPage({ pg }: { pg: AuditFileSelfAudit }) {
       </summary>
       <div className="px-4 pb-4 space-y-2">
         {!pg.run && <p className="text-sm text-red-800">{pg.problem}</p>}
+        {/* An answer whose stored question no longer reads as the authority's
+            line with its code: laid by its words, or listed apart. */}
+        {(pg.drift || []).length > 0 && (
+          <ul className="text-xs text-amber-900 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 list-disc pl-5 space-y-0.5">
+            {(pg.drift || []).map((d, i) => <li key={i}>{d}</li>)}
+          </ul>
+        )}
         {pg.run && (
           <p className="text-xs text-[#6B5744]">
             {pg.run.status === 'verified' ? 'Verified' : 'Submitted'} round of {pg.run.business_date}

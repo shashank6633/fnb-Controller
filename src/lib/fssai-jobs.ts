@@ -108,7 +108,7 @@ import { sendPushToUser } from '@/lib/push';
 import { isWaConfigured, sendWhatsAppTemplate } from '@/lib/whatsapp';
 import { templateSendability, webhookAppSecretLookup } from '@/lib/wa-template-authoring';
 import { numberForUser } from '@/lib/wa-report-recipients';
-import { fssaiCurveMembers, fssaiCurveReached, fssaiClockMinute } from '@/app/api/fssai/_p4/lib';
+import { fssaiCurveMembers, fssaiCurveReached, fssaiClockMinute, fssaiCurveRule } from '@/app/api/fssai/_p4/lib';
 
 type Db = Database.Database;
 
@@ -1327,8 +1327,10 @@ export function runFssaiReheatingOverdueJob(db: Db, opts: { now?: Date } = {}): 
  * which batch is overdue.
  *
  * A BATCH IS RAISED WHEN ALL OF:
- *   · its first live reading carries a time limit and a target (otherwise it
- *     was never judged on the clock — counted as `unjudged`, not raised);
+ *   · it has a time limit and a target — frozen on its first reading judged on
+ *     a clock, or, for a batch none of whose readings was (all filed before the
+ *     rule existed), the rule as it stands now (fssaiCurveRule). With neither it
+ *     was never judged on the clock — counted as `unjudged`, not raised;
  *   · EITHER no live reading on it is at the target and the time limit plus
  *     FSSAI_COOLING_OVERDUE_GRACE_MINUTES has passed ('overdue'),
  *     OR its first reading at the target came after the time limit
@@ -1409,10 +1411,18 @@ export function runFssaiCurveOverdueJob(
       if (!members.length) continue;
       res.scanned_curves += 1;
       const start = members[0];
-      const limit = start.max_minutes;
-      const goal = start.goal;
+      /* THE BATCH'S RULE (fssaiCurveRule), not its first reading's — closing
+       * round 2026-10-15: a batch begun before cooling or reheating was switched
+       * on froze no limit on its first reading, so it counted as "unjudged" here
+       * for ever while its later readings were judged on the clock. Abandoned,
+       * it was never raised. The rule is read off the batch's first reading
+       * judged on a clock; when none was, off the rule as it stands now — what
+       * the next reading on it would be judged on. */
+      const rule = fssaiCurveRule(db, logKind, members);
+      const limit = rule.limit;
+      const goal = rule.goal;
       if (start.minute === null || limit === null || !(limit > 0) || goal === null) { res.unjudged += 1; continue; }
-      const reachedM = fssaiCurveReached(members, logKind);
+      const reachedM = fssaiCurveReached(members, logKind, goal);
       const reachedLate = !!reachedM && !(reachedM.elapsed !== null && reachedM.elapsed <= limit);
       if (reachedM && !reachedLate) { res.reached += 1; continue; }
       const elapsedNow = (start.elapsed ?? 0) + (nowMinute - start.minute);
