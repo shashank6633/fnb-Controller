@@ -357,7 +357,15 @@ export interface PartyEventKey {
  * orphan claim below, so they can never pick different parties for the same key.
  * -1 = not cached.
  *
- *   1. party_unique_id, when the key carries one (unchanged).
+ *   1. party_unique_id, when the key carries one — and, when the key ALSO carries
+ *      an fp_id, the row holding BOTH. WHY: one AKAN id can sit on two F&P rows
+ *      (Party Manager creates an F&P without checking whether the party already
+ *      has one, and pm_fp_records is unique on fp_id only), and the claim below
+ *      gives each of those rows its OWN requisitions. Taking the first row with
+ *      the id showed the second row's modal the first row's requisition lines and
+ *      orphan share, and ran its 409 gate on them. The page sends fp_id for every
+ *      row. If no row holds both (the F&P was re-keyed since the page loaded), the
+ *      first row with the id is taken, as before.
  *   2. else fp_id, when the key carries one. The /party-pnl page sends it for
  *      every party without an id. WHY: the display name (event_name) is NOT
  *      unique. Two parties without an id can share it ("Twin Name" / "Twin Name"
@@ -374,9 +382,16 @@ export interface PartyEventKey {
  *      and have no id cannot be told apart this way; that is what fp_id is for.
  */
 export function findPnlPartyIndex(parties: CachedPnlParty[], key: PartyEventKey): number {
-  if (key.party_unique_id) return parties.findIndex(x => x.party_unique_id === key.party_unique_id);
   const fp = String(key.fp_id || '').trim();
-  if (fp) return parties.findIndex(x => String(x.fp_id || '').trim() === fp);
+  const fpOf = (x: CachedPnlParty) => String(x.fp_id || '').trim();
+  if (key.party_unique_id) {
+    if (fp) {
+      const both = parties.findIndex(x => x.party_unique_id === key.party_unique_id && fpOf(x) === fp);
+      if (both >= 0) return both;
+    }
+    return parties.findIndex(x => x.party_unique_id === key.party_unique_id);
+  }
+  if (fp) return parties.findIndex(x => fpOf(x) === fp);
   const byName = (x: CachedPnlParty) => x.event_name === key.event_name && x.event_date === key.event_date;
   const noId = parties.findIndex(x => !x.party_unique_id && byName(x));
   return noId >= 0 ? noId : parties.findIndex(byName);
@@ -390,6 +405,9 @@ export function findPnlPartyIndex(parties: CachedPnlParty[], key: PartyEventKey)
  *       (requisitions.party_unique_id, filled by Raise Req). Name + date
  *       matching is a FALLBACK for a requisition with no id, and then only when
  *       EXACTLY ONE party that evening matches — the orphan-liquor rule below.
+ *       When the cache lists the id on two or more F&P rows, the requisition's
+ *       date picks the row, under the same exactly-one rule (see "WHOSE
+ *       REQUISITION IS IT").
  *   (b) A party with no AKAN id matches by name ONLY rows with no party id. Its
  *       P&L used to count every ID-BEARING party_consumption row recorded under
  *       its display name — i.e. another party's bottles — and the release batch
@@ -590,6 +608,16 @@ export function orphanShareOf(claims: OrphanClaims, index: number):
  *     (the single-party GET for that id still does); if a party on the list
  *     matched it by name, it is listed as 'id_not_listed' so the money is not
  *     silently gone from the board.
+ *       ONE ID ON TWO OR MORE CACHED ROWS (Party Manager can create a second F&P
+ *     for a party that already has one — two functions of one booking on two
+ *     dates, or a re-created F&P beside the cancelled one): the id alone does
+ *     not say which row the requisition is for, and giving it to every holder
+ *     costed each rupee on two rows — production, matching by name + date, had
+ *     put each requisition on its own date's row only. So among the holders of
+ *     the id, the one whose date equals the requisition's event_date owns it;
+ *     if no holder, or two or more, are on that date, it is costed on NONE of
+ *     them and listed ('id_on_several_parties', candidates = the holders on its
+ *     date, else every holder) — the same exactly-one rule as below.
  *   · CARRIES NO ID — the orphan-liquor rule: EXACTLY ONE claimant that evening
  *     whose candidate names include the requisition's event_name owns it; two or
  *     more → costed on NONE of them and listed ('several_parties'); none →
@@ -620,6 +648,10 @@ export interface ReqClaims {
   owned: Map<number, string[]>;
   /** No id, and two or more claimants match its name that evening: costed on none. */
   ambiguous: { req: PartyReqRef; candidates: number[] }[];
+  /** Carries an id two or more claimants hold, and the date does not pick exactly
+   *  one of them: costed on none. candidates = the holders on its date when there
+   *  are two or more, else every holder of the id. */
+  idShared: { req: PartyReqRef; candidates: number[] }[];
   /** Carries an id no claimant has, while at least one claimant matches its name
    *  that evening (production costed it there): costed on no listed party. */
   idNotListed: { req: PartyReqRef; nameMatches: number[] }[];
@@ -627,7 +659,7 @@ export interface ReqClaims {
 
 /** THE RULE for requisitions. See the block comment above. */
 export function claimPartyRequisitions(db: DB, claimants: OrphanClaimant[]): ReqClaims {
-  const out: ReqClaims = { owned: new Map(), ambiguous: [], idNotListed: [] };
+  const out: ReqClaims = { owned: new Map(), ambiguous: [], idShared: [], idNotListed: [] };
   const rows = db.prepare(`
     SELECT r.id,
            COALESCE(r.req_number, '')                 AS req_number,
@@ -661,7 +693,15 @@ export function claimPartyRequisitions(db: DB, claimants: OrphanClaimant[]): Req
       : [];
     if (req.party_unique_id) {
       const owners = byId.get(req.party_unique_id) || [];
-      if (owners.length) owners.forEach(i => give(i, req.id));
+      if (owners.length === 1) give(owners[0], req.id);
+      else if (owners.length >= 2) {
+        // One id on several rows: the requisition's date picks the row (dates
+        // compared as the name index compares them — the claimant's trimmed date
+        // against the requisition's date as stored).
+        const onDate = owners.filter(i => String(claimants[i].date || '').trim() === req.event_date);
+        if (onDate.length === 1) give(onDate[0], req.id);
+        else out.idShared.push({ req, candidates: onDate.length ? onDate : [...owners] });
+      }
       else if (nameMatches.length) out.idNotListed.push({ req, nameMatches });
       continue;
     }
@@ -671,15 +711,25 @@ export function claimPartyRequisitions(db: DB, claimants: OrphanClaimant[]): Req
   return out;
 }
 
+/** Why a requisition that names a party is costed on nobody. */
+export type ReqAwaitingReason = 'several_parties' | 'id_on_several_parties';
+
 /** One party's view of the requisition claim: the requisitions it is costed on,
- *  and the id-less ones that name it AND another party that evening — costed on
- *  nobody, counted only so the badge and the modal can say so. */
+ *  and the ones costed on nobody that list it as a candidate — id-less ones that
+ *  name it AND another party that evening ('several_parties'), and ones carrying
+ *  an id it shares with another cached row when the date does not pick one
+ *  ('id_on_several_parties'). Counted only so the badge and the modal can say so. */
 export function partyReqShareOf(claims: ReqClaims, index: number):
-  { reqIds: string[]; awaiting: { req: PartyReqRef; candidates: number[] }[] } {
+  { reqIds: string[]; awaiting: { req: PartyReqRef; candidates: number[]; reason: ReqAwaitingReason }[] } {
   if (index < 0) return { reqIds: [], awaiting: [] };
   return {
     reqIds: claims.owned.get(index) || [],
-    awaiting: claims.ambiguous.filter(a => a.candidates.includes(index)),
+    awaiting: [
+      ...claims.ambiguous.filter(a => a.candidates.includes(index))
+        .map(a => ({ ...a, reason: 'several_parties' as const })),
+      ...claims.idShared.filter(a => a.candidates.includes(index))
+        .map(a => ({ ...a, reason: 'id_on_several_parties' as const })),
+    ],
   };
 }
 

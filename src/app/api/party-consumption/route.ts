@@ -34,11 +34,12 @@ import {
  * every requisition raised under a name it shares. A party with no AKAN id shows
  * no id-bearing rows at all — only the orphan rows the claim gave it.
  *
- * GET    /api/party-consumption?party_unique_id=...
+ * GET    /api/party-consumption?party_unique_id=...[&fp_id=...]
  * GET    /api/party-consumption?event_name=...&event_date=YYYY-MM-DD[&fp_id=...]
  *        -> { entries, requisition_items, unassigned_entries, unassigned_requisitions }
- *        fp_id names WHICH party without an id is meant when two parties share
- *        the display name that evening (findPnlPartyIndex); the page sends it.
+ *        fp_id names WHICH party is meant when two parties share the display
+ *        name that evening, or when one AKAN id sits on two F&P rows
+ *        (findPnlPartyIndex); the page sends it for every row.
  * POST   /api/party-consumption
  *        body: { party_unique_id?, fp_id?, event_name, event_date,
  *                items: [{ material_id, qty, notes? }], confirm_duplicates? }
@@ -68,8 +69,9 @@ export async function GET(request: Request) {
     // Resolve the key ONCE, through the very call /api/party-events/pnl's
     // single-party GET makes (partyScope): the requisitions, the orphan share and
     // the party id below are then exactly the ones counted in liquor_items there.
-    // fp_id picks the right party WITHOUT an id when its display name is shared
-    // (findPnlPartyIndex); without it the first party of that name was taken.
+    // fp_id picks the right party when its display name is shared, or when its
+    // AKAN id sits on two F&P rows (findPnlPartyIndex); without it the first
+    // party of that name — or with that id — was taken.
     const key = {
       party_unique_id: partyUniqueId || undefined,
       fp_id: fpId || undefined,
@@ -139,14 +141,18 @@ export async function GET(request: Request) {
     // requisition(s) — the ones the P&L costs on THIS party (ruling 34a); shown
     // so the modal accounts for the whole liquor figure instead of half of it.
     const requisitionItems = partyLiquorReqItems(db, scope.reqIds);
-    // Requisitions with no id raised under a name this party shares with another
-    // that evening: costed on NEITHER (ruling 34a). Listed, never summed, so the
+    // Requisitions costed on NEITHER party (ruling 34a): no id, raised under a
+    // name this party shares with another that evening ('several_parties'), or
+    // carrying an id this party's row shares with another F&P row when the date
+    // does not pick one ('id_on_several_parties'). Listed, never summed, so the
     // modal matches the badge's count and nobody reads the gap as missing liquor.
     const unassignedReqs = scope.reqAwaiting.map(a => ({
       req_id: a.req.id,
       req_number: a.req.req_number,
       event_name: a.req.event_name,
       event_date: a.req.event_date,
+      party_unique_id: a.req.party_unique_id || null,
+      reason: a.reason,
       candidates: a.candidates.map(i => candidateOf(i)),
     }));
     return Response.json({
@@ -190,8 +196,9 @@ export async function POST(request: Request) {
     // the material is already costed on, and let the caller confirm. The double
     // count becomes a decision somebody made, never a silent accident.
     // fp_id (sent by the page for every party) identifies a party WITHOUT an id
-    // whose display name another party shares that evening — without it the gate
-    // checked the FIRST party of that name, i.e. somebody else's requisitions.
+    // whose display name another party shares that evening, and the F&P row
+    // meant when one AKAN id sits on two rows — without it the gate checked the
+    // FIRST such party, i.e. somebody else's requisitions.
     // The set checked is the modal's requisition_items and the P&L's liquor
     // requisition lines for this party — the same partyScope() requisitions
     // (ruling 34a): another party's requisition raised under a shared name is

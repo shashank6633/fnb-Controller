@@ -19,8 +19,10 @@ import {
  *   Revenue    = Party Bookings sheet "Final Total Amount" (matched by party_unique_id)
  *   Food Cost  = Σ (party requisition issued qty × material avg price), non-liquor
  *                categories, over the requisitions THIS party is costed on
- *                (owner ruling 34, 2026-10-14): those carrying its id, plus those
- *                carrying no id that only it matches by name + date
+ *                (owner ruling 34, 2026-10-14): those carrying its id (when the
+ *                id is on two or more rows, only those dated on this row's date,
+ *                if no other holder shares that date), plus those carrying no id
+ *                that only it matches by name + date
  *   Liquor Cost= Σ the same for liquor/beverage categories (the Bar requisition)
  *              + Σ party_consumption cost_at_time (snapshotted) for the party's id,
  *              + the orphan rows (no id) that ONLY this party matches by name
@@ -29,10 +31,10 @@ import {
  *   Profit     = Revenue − (Food + Liquor)
  *   Margin     = Profit / Revenue
  *
- * GET /api/party-events/pnl?party_unique_id=...
+ * GET /api/party-events/pnl?party_unique_id=...[&fp_id=...]
  *   OR /api/party-events/pnl?event_name=...&event_date=YYYY-MM-DD[&fp_id=...]
- *      (fp_id names which party without an id is meant when the display name is
- *       shared that evening — see findPnlPartyIndex)
+ *      (fp_id names which party is meant when the display name is shared that
+ *       evening, or when one AKAN id sits on two F&P rows — see findPnlPartyIndex)
  *   OR /api/party-events/pnl                 (returns array for all known past events)
  *
  * Booking revenue is read from the cached 'party_bookings_cache' setting so
@@ -222,9 +224,10 @@ function pnlFor(db: ReturnType<typeof getDb>, bookings: Map<string, number>,
     liquor_matched_by_name_cost: orphan.matchedCost,
     liquor_unassigned_items: orphan.awaitingN,
     // Requisitions with NO id raised under a name this party shares with another
-    // party that evening: costed on NEITHER (ruling 34a). Not included in
-    // food_* / liquor_* above; a count so the row can say so — the money is in
-    // the top-level unassigned_requisitions list.
+    // party that evening, or carrying an id this party shares with another row
+    // when the date does not pick one: costed on NEITHER (ruling 34a). Not
+    // included in food_* / liquor_* above; a count so the row can say so — the
+    // money is in the top-level unassigned_requisitions list.
     requisitions_unassigned: reqAwaitingN,
     total_cost: totalCost,
     profit,
@@ -299,6 +302,9 @@ function describeUnassigned(db: ReturnType<typeof getDb>, claims: OrphanClaims, 
  *   reason 'id_not_listed'   — it carries an AKAN id no party on the list has,
  *     while a listed party matches its name that evening (candidates), where
  *     production costed it. The single-party P&L for that id still costs it.
+ *   reason 'id_on_several_parties' — it carries an AKAN id that two or more rows
+ *     on the list hold (one booking, two F&Ps), and its date matches none of
+ *     them or more than one (candidates: the holders on its date, else all).
  * Its food / liquor split is computed by the same partyReqSplit() the rows use,
  * and is returned only to the audience that sees party financials.
  */
@@ -306,6 +312,7 @@ function describeUnassignedReqs(db: ReturnType<typeof getDb>, claims: ReqClaims,
                                 parties: CachedPnlParty[], financialsAllowed: boolean) {
   const items = [
     ...claims.ambiguous.map(a => ({ req: a.req, reason: 'several_parties' as const, candidates: a.candidates })),
+    ...claims.idShared.map(a => ({ req: a.req, reason: 'id_on_several_parties' as const, candidates: a.candidates })),
     ...claims.idNotListed.map(a => ({ req: a.req, reason: 'id_not_listed' as const, candidates: a.nameMatches })),
   ];
   return items.map(({ req, reason, candidates }) => {
@@ -387,8 +394,9 @@ export async function GET(request: Request) {
     const party_unique_id = url.searchParams.get('party_unique_id') || undefined;
     const event_name      = url.searchParams.get('event_name') || undefined;
     const event_date      = url.searchParams.get('event_date') || undefined;
-    // Which party WITHOUT an id is meant when its display name is shared that
-    // evening (findPnlPartyIndex). Without it the first party of that name won.
+    // Which party is meant when its display name is shared that evening, or when
+    // its AKAN id sits on two F&P rows (findPnlPartyIndex). Without it the first
+    // party of that name — or with that id — won.
     const fp_id           = url.searchParams.get('fp_id') || undefined;
     const bookings = loadBookingsCache();
     const today = new Date().toISOString().slice(0, 10);

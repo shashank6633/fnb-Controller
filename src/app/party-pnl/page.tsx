@@ -187,7 +187,8 @@ interface UnassignedLiquor {
 
 /** A COSTED party requisition on no party's P&L (owner ruling 34): it has no
  *  party id and two or more parties that evening carry its name, or it carries
- *  an id no listed party has. Read-only. Costs only for the financial audience. */
+ *  an id no listed party has, or an id two or more listed rows share when its
+ *  date does not pick one. Read-only. Costs only for the financial audience. */
 interface UnassignedRequisition {
   req_id: string;
   req_number: string;
@@ -195,7 +196,7 @@ interface UnassignedRequisition {
   event_date: string;
   party_unique_id: string | null;
   fp_id: string | null;
-  reason: 'several_parties' | 'id_not_listed';
+  reason: 'several_parties' | 'id_not_listed' | 'id_on_several_parties';
   food_items: number;
   liquor_items: number;
   food_cost?: number;
@@ -366,13 +367,14 @@ export default function PartyPnLPage() {
                         </button>
                       )}
                       {/* A requisition raised under a name this party shares with
-                          another that evening, carrying no party id: costed on
-                          NEITHER (owner ruling 34). Said here so the gap is not
-                          read as missing liquor. */}
+                          another that evening, carrying no party id — or carrying
+                          an id this row shares with another F&P when its date does
+                          not pick one: costed on NEITHER (owner ruling 34). Said
+                          here so the gap is not read as missing liquor. */}
                       {(r.requisitions_unassigned || 0) > 0 && (
                         <button onClick={() => setRecordFor(r)}
                                 className="block text-[10px] text-red-700 hover:underline text-left"
-                                title="A requisition with no party id, raised under a name that matches more than one party that evening — costed on none of them.">
+                                title="A requisition with no party id raised under a name that matches more than one party that evening, or with a party id that is on more than one F&P whose date does not pick one — costed on none of them.">
                           {r.requisitions_unassigned} requisition{r.requisitions_unassigned === 1 ? '' : 's'} shared with another party — not costed
                         </button>
                       )}
@@ -537,8 +539,9 @@ function UnassignedRequisitionsPanel({ items }: { items: UnassignedRequisition[]
         </div>
         <div className="text-[11px] text-red-700 mt-0.5">
           A requisition counts only on the party whose AKAN id it carries; without an id, only when exactly one party
-          that evening has the name it was raised under. These match more than one party (or carry an id no listed
-          party has), so none of the P&amp;Ls above includes them.
+          that evening has the name it was raised under. When its id is on more than one F&amp;P, only on the one dated
+          on its date. These match more than one party (or carry an id no listed party has), so none of the P&amp;Ls
+          above includes them.
         </div>
       </div>
       <div className="overflow-x-auto">
@@ -565,6 +568,9 @@ function UnassignedRequisitionsPanel({ items }: { items: UnassignedRequisition[]
                   {x.event_name}
                   {x.reason === 'id_not_listed' && x.party_unique_id && (
                     <div className="text-[10px] text-[#8B7355]">carries id {x.party_unique_id} — not on the party list</div>
+                  )}
+                  {x.reason === 'id_on_several_parties' && x.party_unique_id && (
+                    <div className="text-[10px] text-[#8B7355]">carries id {x.party_unique_id} — on more than one F&amp;P; its date does not pick one</div>
                   )}
                 </td>
                 <td className="py-1.5 px-3 text-right font-mono whitespace-nowrap">
@@ -615,12 +621,16 @@ interface UnassignedEntry extends ConsumptionEntry {
   candidates: { party_unique_id: string | null; fp_id?: string | null; event_name: string; event_date: string }[];
 }
 
-/** A requisition with no party id raised under a name this party shares with
- *  another that evening — costed on NEITHER (owner ruling 34). Never summed. */
+/** A requisition costed on NEITHER party (owner ruling 34): no party id and
+ *  raised under a name this party shares with another that evening, or carrying
+ *  an id this row shares with another F&P when its date does not pick one.
+ *  Never summed. */
 interface UnassignedReqHere {
   req_id: string;
   req_number: string;
   event_name: string;
+  reason?: 'several_parties' | 'id_on_several_parties';
+  party_unique_id?: string | null;
   candidates: { party_unique_id: string | null; fp_id?: string | null; event_name: string; event_date: string }[];
 }
 
@@ -685,13 +695,15 @@ function RecordConsumptionModal({ target, onClose, onChanged }: {
 
   // Fetch what's already recorded for THIS event so the user sees it before
   // adding more — prevents punching the same bottle twice.
-  // A party WITHOUT an id also sends its fp_id: its display name is not unique
-  // (two such parties, or one with an id, can share it that evening), and the
-  // server took the FIRST party of that name — showing this modal another party's
-  // requisition lines and orphan share. fp_id names the row that was clicked.
-  const existingQs = target.party_unique_id
+  // EVERY row also sends its fp_id. A party WITHOUT an id needs it because its
+  // display name is not unique (two such parties, or one with an id, can share it
+  // that evening); a party WITH an id needs it because one AKAN id can sit on two
+  // F&P rows, each costed on its own requisitions. Without it the server took the
+  // FIRST party of that name / id — showing this modal another row's requisition
+  // lines and orphan share. fp_id names the row that was clicked.
+  const existingQs = (target.party_unique_id
     ? `party_unique_id=${encodeURIComponent(target.party_unique_id)}`
-    : `event_name=${encodeURIComponent(target.event_name)}&event_date=${encodeURIComponent(target.event_date)}`
+    : `event_name=${encodeURIComponent(target.event_name)}&event_date=${encodeURIComponent(target.event_date)}`)
       + (target.fp_id ? `&fp_id=${encodeURIComponent(target.fp_id)}` : '');
 
   const loadExisting = () => {
@@ -993,10 +1005,12 @@ function RecordConsumptionModal({ target, onClose, onChanged }: {
                 <span key={q.req_id}>
                   {qi > 0 && '; '}
                   <span className="font-mono">{q.req_number || q.req_id}</span> under &ldquo;{q.event_name}&rdquo;
+                  {q.reason === 'id_on_several_parties' && q.party_unique_id && <> (id {q.party_unique_id})</>}
                   {' '}matches {q.candidates.map(candidateLabel).join(', ')}
                 </span>
               ))}
-              . A requisition without a party id is costed only when exactly one party that evening has its name.
+              . A requisition without a party id is costed only when exactly one party that evening has its name;
+              one whose id is on more than one F&amp;P, only when exactly one of them is on its date.
             </div>
           )}
 
