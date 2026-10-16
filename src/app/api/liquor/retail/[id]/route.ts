@@ -1,10 +1,9 @@
 import { getDb } from '@/lib/db';
-import { isManagement } from '@/lib/auth';
 import { LQ_REIMBURSEMENT_STATUS, type LqReimbursementStatus } from '@/lib/liquor-recon';
 import {
   backfillDepotLanded, setReimbursementStatus, retailErrorResponse,
 } from '@/lib/liquor-retail';
-import { requireRetailRecord, requireSignedInWrite, gateResponse } from '../_lib/guard';
+import { requireRetailRecord, requireSignedInWrite, gateResponse, canReadRetailRegister } from '../_lib/guard';
 
 /**
  * PATCH /api/liquor/retail/[id] — the rest of a wine-shop record's lifecycle.
@@ -40,7 +39,8 @@ import { requireRetailRecord, requireSignedInWrite, gateResponse } from '../_lib
  *
  * What it SAYS is narrower than who may call it: a frozen rate is refused
  * without being quoted (backfillDepotLanded), and the recomputed excess is
- * returned to management only — see the hasRate branch.
+ * returned only to a viewer the register admits (canReadRetailRegister) —
+ * see the hasRate branch.
  */
 export const dynamic = 'force-dynamic';
 
@@ -105,9 +105,10 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ id
       // over SOMEONE ELSE'S retail price (measured: a can_procure bartender
       // outside management priced a colleague's buy at ₹90 and was told excess
       // ₹60/bottle — paid ₹150). Reading the money behind a buy is a management
-      // authority, never a can_procure one (requireRetailView), so only
-      // management — who see the rate paid on the register already — get it.
-      if (isManagement(gate.user)) out.excess = res.excess;
+      // authority, never a can_procure one (requireRetailView), so only a
+      // viewer the register itself admits — who sees the rate paid there
+      // already — gets it. The POST duplicate refusal uses the same predicate.
+      if (canReadRetailRegister(db, gate.user)) out.excess = res.excess;
     }
 
     if (hasStatus) {

@@ -126,24 +126,46 @@ export const LIQUOR_STORE_PAGE = '/inventory/liquor-store';
 export async function requireRetailView(db: Database): Promise<Gate | GateFail> {
   const user = await getCurrentUser();
   if (!user) return { ok: false, status: 401, error: 'Sign in required' };
-  if (!isManagement(user)) {
+  const why = retailRegisterRefusal(db, user);
+  if (why === 'not_management') {
     return {
       ok: false, status: 403,
       error: 'Only managers, HODs and admins can view the wine-shop register — it carries depot spend and the money owed to named staff.',
     };
   }
-  const viaSummary = canAccessPage(LQ_RECON_PAGE, user);
-  const store = viaSummary ? null : liquorStore(db);
-  const viaStorePage = !viaSummary && !!store
-    && canAccessPage(LIQUOR_STORE_PAGE, user)
-    && userStoreAccess(db, user, store.id).can_view;
-  if (!viaSummary && !viaStorePage) {
+  if (why === 'no_page') {
     return {
       ok: false, status: 403,
       error: 'Your page access does not include the wine-shop register — it is shown on the Liquor Reconciliation Summary and on the Liquor Store page\'s Wine-shop buys tab.',
     };
   }
   return { ok: true, user };
+}
+
+/** Why requireRetailView would refuse this user, or null when it admits them. */
+function retailRegisterRefusal(db: Database, user: SessionUser): 'not_management' | 'no_page' | null {
+  if (!isManagement(user)) return 'not_management';
+  const viaSummary = canAccessPage(LQ_RECON_PAGE, user);
+  const store = viaSummary ? null : liquorStore(db);
+  const viaStorePage = !viaSummary && !!store
+    && canAccessPage(LIQUOR_STORE_PAGE, user)
+    && userStoreAccess(db, user, store.id).can_view;
+  return viaSummary || viaStorePage ? null : 'no_page';
+}
+
+/**
+ * May this user read the money behind SOMEONE ELSE'S wine-shop buy — its rate
+ * paid, its bottles, its excess? Exactly when they may open the register that
+ * shows it (requireRetailView: management AND a page that shows it). The write
+ * routes answer to can_procure, which is a STOCK authority, so anything they
+ * say about another person's buy is filtered through this: the POST duplicate
+ * refusal and the PATCH recomputed excess. isManagement alone was softer than
+ * the register itself — a manager whose page map is only ['/recipes'] is 403 on
+ * GET and was still quoted a colleague's rate on a duplicate retry. Fail closed.
+ */
+export function canReadRetailRegister(db: Database, user: SessionUser | null | undefined): boolean {
+  if (!user) return false;
+  return retailRegisterRefusal(db, user) === null;
 }
 
 /**

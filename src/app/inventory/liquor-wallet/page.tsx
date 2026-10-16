@@ -256,7 +256,9 @@ export default function LiquorWalletPage() {
 
             <RecordPanel data={data} onSaved={(m) => { setNotice(m); reload(); }} onError={setErr} />
 
-            <IntegrityPanel integrity={data.integrity} onSaved={(m) => { setNotice(m); reload(); }} onError={setErr} />
+            <IntegrityPanel integrity={data.integrity}
+                            openingDate={data.rows.find(r => r.type === 'opening')?.date || null}
+                            onSaved={(m) => { setNotice(m); reload(); }} onError={setErr} />
 
             <Ledger data={data} from={from} to={to} setFrom={setFrom} setTo={setTo} onApply={() => load(from, to, planned)} />
           </>
@@ -897,8 +899,22 @@ function RecordPanel(
 
 /* ── wallet vs recorded indents ───────────────────────────────────────────── */
 function IntegrityPanel(
-  { integrity, onSaved, onError }: { integrity: Integrity; onSaved: (m: string) => void; onError: (m: string) => void },
+  { integrity, openingDate, onSaved, onError }: {
+    integrity: Integrity;
+    /** The opening row's date when it is inside the window on screen; null when
+     *  it is not (the panel then cannot tell, and says the general rule). */
+    openingDate: string | null;
+    onSaved: (m: string) => void; onError: (m: string) => void;
+  },
 ) {
+  /* An indent with no failure on record, dated BEFORE the opening: the opening
+     is a portal balance read on that day, so it already reflects this spend
+     (finding: a healed debit dated before the opening took ₹22,251 out twice
+     and failed check A by the whole indent). The server now leaves such an
+     indent off missing[] and refuses its retry (409 before_opening); should
+     one still be listed, the page says why by date and offers no button. */
+  const beforeOpening = (m: { failure?: string | null; date: string }) =>
+    !m.failure && !!openingDate && !!m.date && m.date < openingDate;
   // The heal path for a debit that could not be written when its bill was
   // saved: re-runs it from the RECORDED indent (POST action retry_auto_debit).
   // Re-saving the bill cannot do it — a recorded invoice is refused as a duplicate.
@@ -943,16 +959,27 @@ function IntegrityPanel(
             {integrity.missing.slice(0, 8).map(m => (
               <li key={m.source_ref} className="flex flex-wrap items-start gap-x-2 gap-y-0.5">
                 <span>{m.invoice_ref} · {m.date || 'no date'} · {rs(m.net_indent_value)} · {m.store}</span>
-                <button onClick={() => writeDebit(m.source_ref, m.invoice_ref, m.failure, m.date)} disabled={!!busyRef}
-                  className="px-2 py-0.5 rounded border border-amber-500 text-amber-900 hover:bg-amber-100 disabled:opacity-50">
-                  {busyRef === m.source_ref ? 'Writing…' : 'Write the debit'}
-                </button>
+                {/* Not offered for an indent dated before the opening: the
+                    server refuses that write (409 before_opening — the opening
+                    already includes it), so a button would only promise it. */}
+                {!beforeOpening(m) && (
+                  <button onClick={() => writeDebit(m.source_ref, m.invoice_ref, m.failure, m.date)} disabled={!!busyRef}
+                    className="px-2 py-0.5 rounded border border-amber-500 text-amber-900 hover:bg-amber-100 disabled:opacity-50">
+                    {busyRef === m.source_ref ? 'Writing…' : 'Write the debit'}
+                  </button>
+                )}
                 {m.failure
                   ? <span className="basis-full text-[11px] text-amber-800">Why it was not written: {m.failure}</span>
-                  : <span className="basis-full text-[11px] text-amber-800">
-                      No failure on record — most likely recorded before this ledger existed. If the opening balance
-                      already includes it, do not write it.
-                    </span>}
+                  : beforeOpening(m)
+                    ? <span className="basis-full text-[11px] font-medium text-red-800" data-missing="before-opening">
+                        Dated before the wallet&apos;s opening balance ({openingDate}) — that opening was read off the
+                        portal, so it already includes this indent. A debit for it would count it twice, so the wallet
+                        does not write one: nothing to do.
+                      </span>
+                    : <span className="basis-full text-[11px] text-amber-800">
+                        No failure on record — most likely recorded before this ledger existed. If the opening balance
+                        already includes it, do not write it.
+                      </span>}
               </li>
             ))}
           </ul>

@@ -17,11 +17,17 @@
  *   · wallet_debit 'failed'  → the bill was saved, the debit was NOT (fail);
  *   · wallet_debit 'adopted' → a hand-entered debit was taken over (info);
  *   · wallet_debit 'removed' → the Net Indent is ₹0 or less, no debit (info);
+ *   · wallet_debit 'none'    → no debit, and the server's note says why: ₹0
+ *                              Net Indent, a kept hand-entered debit, or an
+ *                              indent dated before the wallet's opening (info);
  *   · covers.error           → a register upload's inward numbers were not
  *                              linked to its charges (warn);
  *   · covers.also_covered_by → an inward number another register already
- *                              covers (warn).
- * 'inserted' / 'updated' / 'none' are the ordinary outcome and say nothing.
+ *                              covers (warn);
+ *   · covers.register        → a register header re-totalled over every inward
+ *                              linked to it (info); its wallet_debit, when
+ *                              present, is the outcome the notices above read.
+ * 'inserted' / 'updated' are the ordinary outcome and say nothing.
  *
  * Every sentence the SERVER wrote is shown verbatim (`note`, `error`) — this
  * file adds only who-to-tell, never a paraphrase of what happened. The server
@@ -59,7 +65,16 @@ export function billWalletNotices(billCharges: unknown, invoiceRef: string): Bil
   if (!bc) return [];
   const ref = s(invoiceRef) || s(bc.invoice_ref) || 'this bill';
   const out: BillWalletNotice[] = [];
-  const wd = bc.wallet_debit && typeof bc.wallet_debit === 'object' ? bc.wallet_debit : null;
+  const cv = bc.covers && typeof bc.covers === 'object' ? bc.covers : null;
+  /* A register upload can WIDEN its header after the links are written
+     (liquor-wallet.ts settleRegisterHeader): the header's invoice value grows to
+     span every inward linked to it and the debit is re-derived. The re-derived
+     outcome is covers.register.wallet_debit; the server also restates the
+     top-level one to match, but the register's is read first so a reply that
+     carries only one of them still reports what the wallet finally holds. */
+  const reg = cv && cv.register && typeof cv.register === 'object' ? cv.register : null;
+  const wd = (reg && reg.wallet_debit && typeof reg.wallet_debit === 'object') ? reg.wallet_debit
+    : (bc.wallet_debit && typeof bc.wallet_debit === 'object' ? bc.wallet_debit : null);
   if (wd) {
     const action = s(wd.action);
     if (action === 'failed') {
@@ -68,10 +83,20 @@ export function billWalletNotices(billCharges: unknown, invoiceRef: string): Bil
         tone: 'fail',
         title: `Bill ${ref} was saved — but its TGBCL wallet debit was NOT written`,
         lines: [s(wd.note) || s(wd.error?.message) || 'The wallet debit could not be written.'],
-        hint: 'The stock and the Net Indent are recorded; only the wallet line is missing. If you cannot open the '
-          + 'Liquor Wallet page (it is for managers), tell a manager or an admin — it is also on the admin errors bell.',
+        /* The fix is NEVER a re-save of this bill: /procure-bill refuses a
+           recorded invoice as a duplicate (409), and the server's sentence above
+           can still end "then re-save" (liquor-wallet.ts). Said here so the
+           saver is not sent round that loop. */
+        hint: 'The stock and the Net Indent are recorded; only the wallet line is missing. Do not save this bill again — '
+          + 'a recorded invoice is refused as a duplicate, so a re-save cannot write the debit. Once the cause is fixed, '
+          + '"Write the debit" on the Liquor Wallet page writes it from this recorded indent. If you cannot open that page '
+          + '(it is for managers), tell a manager or an admin — it is also on the admin errors bell.',
       });
-    } else if (action === 'adopted' || action === 'removed') {
+    } else if (action === 'adopted' || action === 'removed' || action === 'none') {
+      /* 'none' is never the ordinary outcome: the server returns it only with a
+         reason — the Net Indent is ₹0 or less, a hand-entered debit was kept,
+         or the indent is dated before the wallet's opening balance (which
+         already includes it). Each is something the saver should know. */
       const note = s(wd.note);
       if (note) {
         out.push({
@@ -79,13 +104,24 @@ export function billWalletNotices(billCharges: unknown, invoiceRef: string): Bil
           tone: 'info',
           title: action === 'adopted'
             ? `Bill ${ref}: an earlier hand-entered wallet debit was taken over`
-            : `Bill ${ref}: no wallet debit`,
+            : `Bill ${ref}: no wallet debit written`,
           lines: [note],
         });
       }
     }
   }
-  const cv = bc.covers && typeof bc.covers === 'object' ? bc.covers : null;
+  if (reg) {
+    const n = (v: unknown) => '₹' + (Number(v) || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    out.push({
+      key: `${ref}|register_widened`,
+      tone: 'info',
+      title: `Register ${ref}: its Net Indent now covers every inward linked to it`,
+      /* The bill's OWN figures — what the saver typed and the register holds —
+         never a wallet-ledger figure. */
+      lines: [`Invoice value ${n(reg.previous_invoice_value)} → ${n(reg.invoice_value)}; Net Indent ${n(reg.previous_net_indent_value)} → ${n(reg.net_indent_value)}. `
+        + 'The header is totalled over every inward number linked to it across the uploads of this register, not only the rows in this file.'],
+    });
+  }
   if (cv) {
     if (s(cv.error)) {
       out.push({

@@ -48,8 +48,10 @@ import { requireAuditedWrite } from '../brand-map/_lib/guard';
  * (brand-map/_lib/guard.ts: admin on every verb, GET included). A non-admin gets
  * §G with the master rate and every figure it can be re-derived from withheld —
  * see LqSummaryOpts.revealMasterRates. The same switch withholds §E's depot
- * rate and excess figures, which re-derive that master (LqSectionE). The CSV is
- * built from the same result, so it carries the same redaction.
+ * rate and excess figures, which re-derive that master (LqSectionE), and §H's
+ * frozen landed values with every recoverable that is one (LqSectionH) — for a
+ * brand never indented, a withdrawal's landed value IS the master per bottle.
+ * The CSV is built from the same result, so it carries the same redaction.
  *
  * READ-ONLY. It builds the summary with buildLiquorSummary, which only SELECTs —
  * no lq_ row is written, no stock or money moves, and landed cost never touches
@@ -134,7 +136,8 @@ export async function GET(request: Request) {
       storeName: store.name,
       from, to,
       plannedIndent,
-      // Fail closed: only an admin sees the brand master's rates in §G.
+      // Fail closed: only an admin sees the brand master's rates in §G, and the
+      // figures that re-derive them in §E and §H.
       revealMasterRates: me.role === 'admin',
       valueBasis,
       valueBasisDefault,

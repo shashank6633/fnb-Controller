@@ -133,6 +133,8 @@ export async function POST(request: Request) {
     // save would have keyed it. No amount is accepted from the form — it is the
     // recorded Net Indent — and source_ref here NAMES the indent; it is never
     // written from the body. Same gate and CSRF as every other wallet write.
+    // An indent dated BEFORE the wallet's opening balance is refused with 409
+    // before_opening: the opening already includes it (retryAutoDebit).
     if (b.action !== undefined) {
       if (b.action !== 'retry_auto_debit') {
         return Response.json({ error: `Unknown action "${String(b.action).slice(0, 40)}" — the only action is retry_auto_debit.` }, { status: 400 });

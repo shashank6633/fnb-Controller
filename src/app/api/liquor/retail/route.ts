@@ -1,5 +1,5 @@
 import { getDb } from '@/lib/db';
-import { getCurrentOutletId, isManagement } from '@/lib/auth';
+import { getCurrentOutletId } from '@/lib/auth';
 import { checkPurchaseDate } from '@/lib/purchase-guard';
 import { LQ_REIMBURSEMENT_STATUS, type LqReimbursementStatus } from '@/lib/liquor-recon';
 import {
@@ -8,6 +8,7 @@ import {
 } from '@/lib/liquor-retail';
 import {
   requireRetailRecord, requireRetailView, gateResponse, liquorStore, revealDepotFigures,
+  canReadRetailRegister,
 } from './_lib/guard';
 
 /**
@@ -165,9 +166,10 @@ export async function POST(request: Request) {
       notes: String(b.notes || '').trim(),
       outletId,
       storeId,
-      // A colleague's bottles and rate paid are quoted on a duplicate refusal to
-      // management only — the PATCH path's rule (retail/[id]/route.ts).
-      revealOtherBuyFigures: isManagement(gate.user),
+      // A colleague's bottles and rate paid are quoted on a duplicate refusal
+      // only to someone who may open the register that shows them — the PATCH
+      // path's rule (retail/[id]/route.ts), one predicate for both.
+      revealOtherBuyFigures: canReadRetailRegister(db, gate.user),
       // BLIND COUNTS: a count's status and variance are admin-only everywhere
       // (stores/[id]/closing nulls them for everyone else).
       revealCountFigures: gate.user.role === 'admin',

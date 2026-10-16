@@ -2029,19 +2029,36 @@ export function upsertBillCharges(
   // production store-engine inserts it, unchanged, above the final return.
   //
   // WHY HERE: every store_bill_charges row is a TGBCL indent, this function is
-  // the ONE place net_indent_value is computed or written, and both callers
+  // where net_indent_value is computed and written, and both callers
   // (/procure-bill and /procure-bulk) run it INSIDE their own db.transaction().
   // So the debit is attempted in the bill's own transaction, and there is no
   // second door an indent could be recorded through.
+  //
+  // A REGISTER HEADER COVERS EVERY INWARD LINKED TO IT. A /procure-bulk
+  // register upload keys its levies on a header ref whose lines sit under each
+  // row's own inward number, and the caller sums `invoice_value` over the refs
+  // of THIS upload only — so a balance re-upload of one fixed row shrank the
+  // header's Net Indent, and the debit with it, to that row (measured: ₹6,704.08
+  // recorded for a ₹39,306.04 register). settleRegisterHeader widens the row
+  // just written to the header's own ref plus every inward number already
+  // linked to it, BEFORE the debit is derived, and never lowers it; an ordinary
+  // bill (nothing linked) keeps the caller's figure exactly. An inward number
+  // this upload brings for the first time is linked by the route only after
+  // this returns, so linkIndentMembers settles the header once more after the
+  // links (and restates this reply, held for it — holdHeaderReply). Those two
+  // are the only other writes of net_indent_value, both in liquor-wallet.ts,
+  // both inside the bill's own transaction.
   //
   // A WALLET PROBLEM NEVER TAKES THE BILL DOWN. autoDebitForIndent writes the
   // debit in a SAVEPOINT nested in that transaction. On success it commits with
   // the bill. On any wallet-side error only the wallet's own writes roll back,
   // the bill commits, wallet_debit says action 'failed', and the gap is filed in
-  // audit_events (the wallet page's "missing" list) and error_reports. The one
-  // exception is SQLite abandoning the outer transaction itself (disk full, I/O
-  // error): that re-throws and the bill route answers 500, as it would anyway.
-  // See the contract above autoDebitForIndent in liquor-wallet.ts.
+  // audit_events (the wallet page's "missing" list) and error_reports. The
+  // header widening has its own SAVEPOINT on the same terms: if it fails the
+  // bill keeps the caller's figure. The one exception is SQLite abandoning the
+  // outer transaction itself (disk full, I/O error): that re-throws and the bill
+  // route answers 500, as it would anyway. See the contracts above
+  // autoDebitForIndent and settleRegisterHeader in liquor-wallet.ts.
   //
   // THE ROW ID IS READ BACK rather than kept from the INSERT: on the UPDATE half
   // of the upsert the generateId() above is discarded and the ORIGINAL id
@@ -2059,16 +2076,19 @@ export function upsertBillCharges(
     const invoiceRef = String(args.invoice_ref || '').trim();
     if (invoiceRef) {
       // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const { autoDebitForIndent } = require('./liquor-wallet') as typeof import('./liquor-wallet');
+      const { autoDebitForIndent, settleRegisterHeader, holdHeaderReply } = require('./liquor-wallet') as typeof import('./liquor-wallet');
       const stored = db.prepare(
         'SELECT id FROM store_bill_charges WHERE store_id = ? AND invoice_ref = ?',
       ).get(args.store_id, invoiceRef) as { id: string } | undefined;
+      const header = stored?.id ? settleRegisterHeader(db, { charges_id: stored.id, created_by: args.created_by }) : null;
+      const headerInvoice = header ? header.invoice_value : invoiceValue;
+      const headerNet = header ? header.net_indent_value : netIndent;
       const wallet = stored?.id
         ? autoDebitForIndent(db, {
           source_ref: stored.id,
           reference: invoiceRef,
           date: String(args.date || '').trim(),
-          net_indent_value: netIndent,
+          net_indent_value: headerNet,
           store_id: args.store_id,
           supplier: String(args.supplier || '').trim(),
           created_by: String(args.created_by || '').trim(),
@@ -2076,8 +2096,10 @@ export function upsertBillCharges(
         : null;
       // Built as a variable, not returned as a literal: the declared return type
       // is production's, and these two extra keys ride along at runtime into the
-      // bill response (bill_charges.id / bill_charges.wallet_debit).
-      const withDebit = { id: stored?.id || '', invoice_value: invoiceValue, net_indent_value: netIndent, wallet_debit: wallet, ...c };
+      // bill response (bill_charges.id / bill_charges.wallet_debit). The figures
+      // are the header's as recorded — the caller's own unless it was widened.
+      const withDebit = { id: stored?.id || '', invoice_value: headerInvoice, net_indent_value: headerNet, wallet_debit: wallet, ...c };
+      if (stored?.id) holdHeaderReply(stored.id, withDebit);
       return withDebit;
     }
   }

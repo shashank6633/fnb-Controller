@@ -554,6 +554,18 @@ Where the code stands:
 Precise, so it can be worked straight through. Nothing on this list was changed while writing this
 document.
 
+> **Status, 2026-10-15 (Liquor Reconciliation is still build-only — it ships only on "Deploy Liqour
+> Reconcilation").** The list below was written before the fix rounds and is kept as written, except
+> item 7, which is corrected in place. Since then: **1** (Value at Recorded | Landed, default
+> recorded), **3** (landed cost on the rate paid), **4** (vendor near-duplicate flags) and **6** (CSV
+> spelling warnings) were verified PASS in round 2; **2** — a wine-shop buy writes no `purchases`
+> row (one store-ledger Inward row at no cost, or none at all when a saved count already holds the
+> bottles: cost only, owner ruling 39); **5** — the Liquor Wallet page has a "Check B — one indent"
+> form that records a `kind = 'indent_value'` reading, and the Summary's check B reads it;
+> **8** — `DELETE /api/wastage` now refuses a co-written liquor row with a 409, so the co-write no
+> longer invents Central stock; **9** — the stale note is gone (`liquor-retail.ts` now says L5 calls
+> `retailExcessSummary`).
+
 1. **The landed/recorded toggle does not exist (Decision 1).** The module's only setting is
    `lq_wallet_topup_step`. There is no setting and no report-level switch; §B always shows
    recorded bill figures and §C/§D/§F always show landed. *Work:* one setting, default = existing
@@ -605,12 +617,18 @@ document.
    preview warning whenever the stored value differs from what the file typed
    ("row 14: product type 'Beer' stored as 'BEER'", "row 14: code '9740/pp' stored as '9740/PP'").
 
-7. **The four pages are still flagged `unbuilt: true` in `src/lib/page-catalog.ts`** (lines 244,
-   248, 253, 257) although all four `page.tsx` files exist. Consequence: they are skipped by the
-   automatic landing-page resolution, so a user whose only granted page is one of these lands on
-   `/login` instead of the page. The sidebar shows them and clicking works. *Work:* delete the four
-   `unbuilt: true` flags (and the caveat paragraph above them) in the same commit that ships the
-   pages.
+7. **Done — the four pages are no longer flagged `unbuilt`** (corrected 2026-10-15; this item
+   used to say they were). The four `unbuilt: true` flags, and the two skips that read them in
+   `homePathFor` / `firstAllowedPath`, were deleted from `src/lib/page-catalog.ts` in the WIP
+   rebuild (7bced47); no line of code in that file mentions `unbuilt` any more, and the comment
+   above the four rows now says they are built. Measured on a copy of the database through the
+   real `page-catalog` module, a **manager** whose only grant is `/inventory/liquor-wallet` (or
+   `/inventory/liquor-reconciliation`) is sent by `firstAllowedPath` — the proxy's forbidden
+   bounce — straight to that page, not to `/login`. `homePathFor` still answers the first page in
+   display order the user can open (`/feedback` for a manager), exactly as for any other page.
+   The two **admin-only** pages (Brand Map, Withdrawals) still resolve to `/login` for a manager
+   with an explicit grant: that is their `adminOnly` tier flag doing its job, not an `unbuilt`
+   flag. Nothing is left to do here except ship the catalog rows with the pages.
 
 8. **The wastage co-write has a live hazard, so it stays off.** `DELETE /api/wastage` credits stock
    back for any row with a blank department — right for rows that rail created, wrong for a

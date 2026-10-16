@@ -362,7 +362,12 @@ export default function LiquorBrandMapPage() {
       `Accept ${money4(r.indentRate)} per bottle as the new TGBCL master rate for ${label} (${r.materialName})?\n\n`
       + `The master goes from ${money4(r.masterRate)} to ${money4(r.indentRate)} per bottle `
       + `(${money(r.proposedRatePerCase)} per case).\n\n`
-      + 'Every later variance and landed cost is measured against the new figure. '
+      // Owner decision 2: landed cost is the rate PAID + levies; the master is
+      // only the yardstick, and prices a landed cost just when there is no
+      // recorded line or the line recorded no rate (liquor-recon.ts L1).
+      + 'Every later rate variance for this pack is measured against the new figure. Landed cost stays on the rate '
+      + 'paid on each indent line — the master prices it only for a pack with no recorded indent or a line that '
+      + 'recorded no rate. Wine-shop buys and withdrawals already recorded keep the figure they were frozen at. '
       + 'Stock values, average price and recipe costs are NOT affected. This is recorded in the audit log.',
     )) return;
     setAccepting(r.ledgerId);
@@ -438,8 +443,9 @@ export default function LiquorBrandMapPage() {
           <Lock className="w-10 h-10 mx-auto mb-3 text-[#af4408]" />
           <h1 className="text-lg font-bold text-[#2D1B0E]">Admins only</h1>
           <p className="text-sm mt-1">
-            One row here re-prices a TGBCL brand for every future indent, every landed cost and the
-            rate-movement watch, so the brand master is restricted to admin accounts.
+            One row here sets the TGBCL master rate every future indent of a brand is measured against
+            (the rate-movement watch), and prices the landed cost of a pack with no indent rate on record, so the
+            brand master is restricted to admin accounts.
           </p>
         </div>
       </div>

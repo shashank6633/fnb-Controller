@@ -56,7 +56,9 @@
  *
  * §G's MASTER RATES ARE ADMIN-ONLY (LqSummaryOpts.revealMasterRates, LqSectionG),
  * and so is every §E figure built on a wine-shop buy's depot rate (LqSectionE) —
- * that rate is the master per bottle plus an indent's levies.
+ * that rate is the master per bottle plus an indent's levies — and every §H
+ * figure built on a withdrawal's frozen landed value (LqSectionH), which for a
+ * brand never indented is the master per bottle itself.
  *
  * NOTHING HERE CRASHES A PAGE. A section with no rows degrades to a CLEARLY
  * LABELLED "pending" state naming the phase that will populate it, and a section
@@ -1338,7 +1340,7 @@ export function buildLiquorSummary(db: Database, opts: LqSummaryOpts): LqSummary
   // ledger row a withdrawal posts carries unit_cost 0 by L0 rule 1, so the
   // recorded value is read off the store's own inflows, never off that row.
   const wdRead = readOr<any[]>(() => db.prepare(`
-    SELECT w.category, w.qty_recipe_units,
+    SELECT w.category, w.qty_recipe_units, w.recovery_basis,
            w.landed_value, w.mrp_value, w.recoverable, w.recovered,
            (SELECT SUM(l.quantity * l.unit_cost) / SUM(l.quantity)
               FROM store_stock_ledger l
@@ -1348,11 +1350,17 @@ export function buildLiquorSummary(db: Database, opts: LqSummaryOpts): LqSummary
     FROM lq_withdrawals w
     WHERE w.store_id = ? AND w.date >= ? AND w.date <= ?
   `).all(storeId, from, to) as any[], []);
+  // THE LANDED FIGURES ARE ADMIN-ONLY — §G's switch, exactly as §E's depot rate
+  // (see LqSectionH). Computed in full, withheld on the way out. Fail closed:
+  // anything but an explicit true withholds them.
+  const revealLanded = revealMaster;
   const byCat = new Map<string, { count: number; rec: number; unpriced: number; landed: number; mrp: number;
-    recoverable: number; recovered: number }>();
+    recoverable: number; recovered: number; landedRecoveries: number;
+    shownRecoverable: number; shownRecovered: number }>();
   for (const r of wdRead.value) {
     const k = String(r.category || '');
-    const b = byCat.get(k) ?? { count: 0, rec: 0, unpriced: 0, landed: 0, mrp: 0, recoverable: 0, recovered: 0 };
+    const b = byCat.get(k) ?? { count: 0, rec: 0, unpriced: 0, landed: 0, mrp: 0, recoverable: 0, recovered: 0,
+      landedRecoveries: 0, shownRecoverable: 0, shownRecovered: 0 };
     const uc = Number(r.rec_unit_cost);
     b.count += 1;
     if (Number.isFinite(uc) && uc > 0) b.rec += (Number(r.qty_recipe_units) || 0) * uc;
@@ -1361,26 +1369,41 @@ export function buildLiquorSummary(db: Database, opts: LqSummaryOpts): LqSummary
     b.mrp += Number(r.mrp_value) || 0;
     b.recoverable += Number(r.recoverable) || 0;
     b.recovered += Number(r.recovered) || 0;
+    // A withdrawal recovered AT LANDED COST: its recoverable IS its frozen
+    // landed value (L4 sets it so), and recovered / outstanding re-derive it.
+    if (String(r.recovery_basis || '') === 'landed') b.landedRecoveries += 1;
+    else { b.shownRecoverable += Number(r.recoverable) || 0; b.shownRecovered += Number(r.recovered) || 0; }
     byCat.set(k, b);
   }
-  const wdBuckets: LqWithdrawalBucket[] = [...byCat].map(([category, b]) => ({
-    category,
-    count: b.count,
-    recorded_value: r2(b.rec),
-    recorded_unpriced: b.unpriced,
-    landed_value: landed ? r2(b.landed) : null,
-    mrp_value: r2(b.mrp),
-    recoverable: r2(b.recoverable),
-    recovered: r2(b.recovered),
-    outstanding: r2(b.recoverable - b.recovered),
-  }))
-    // Largest first ON THE BASIS SHOWN, so the order never ranks by a hidden figure.
-    .sort((x, y) => (landed ? (y.landed_value ?? 0) - (x.landed_value ?? 0) : y.recorded_value - x.recorded_value)
+  const wdBuckets: LqWithdrawalBucket[] = [...byCat].map(([category, b]) => {
+    // A bucket holding a landed-cost recovery: its three debt cells are
+    // withheld whole from a non-admin — a partial sum under the same heading
+    // would read as the whole debt.
+    const withhold = !revealLanded && b.landedRecoveries > 0;
+    return {
+      category,
+      count: b.count,
+      recorded_value: r2(b.rec),
+      recorded_unpriced: b.unpriced,
+      landed_value: landed && revealLanded ? r2(b.landed) : null,
+      mrp_value: r2(b.mrp),
+      recoverable: withhold ? null : r2(b.recoverable),
+      recovered: withhold ? null : r2(b.recovered),
+      outstanding: withhold ? null : r2(b.recoverable - b.recovered),
+      landed_recovery_withheld: revealLanded ? 0 : b.landedRecoveries,
+    };
+  })
+    // Largest first ON THE BASIS SHOWN, so the order never ranks by a hidden
+    // figure — for a non-admin on the landed basis that is the recorded value.
+    .sort((x, y) => (landed && revealLanded ? (y.landed_value ?? 0) - (x.landed_value ?? 0) : y.recorded_value - x.recorded_value)
       || x.category.localeCompare(y.category));
   const wdRecorded = r2(wdBuckets.reduce((s, b) => s + b.recorded_value, 0));
   const wdUnpriced = wdBuckets.reduce((s, b) => s + b.recorded_unpriced, 0);
   const wdLanded = r2([...byCat.values()].reduce((s, b) => s + b.landed, 0));
-  const wdOutstanding = r2(wdBuckets.reduce((s, b) => s + b.outstanding, 0));
+  const wdOutstandingAll = r2([...byCat.values()].reduce((s, b) => s + (b.recoverable - b.recovered), 0));
+  const wdOutstandingShown = r2([...byCat.values()].reduce((s, b) => s + (b.shownRecoverable - b.shownRecovered), 0));
+  const wdLandedWithheld = revealLanded ? 0 : [...byCat.values()].reduce((s, b) => s + b.landedRecoveries, 0);
+  const wdOutstanding: number | null = wdLandedWithheld > 0 ? null : wdOutstandingAll;
   // L4's own summary, for the RECORDED denominator it uses — one definition of
   // "recorded purchase value in range".
   const wdSumRead = readOr<WithdrawalSummary | null>(
@@ -1389,32 +1412,53 @@ export function buildLiquorSummary(db: Database, opts: LqSummaryOpts): LqSummary
   const purchasesValue = r2(wdSum?.purchases_value ?? 0);
   const pctRecorded = purchasesValue > 0 ? r2((wdRecorded / purchasesValue) * 100) : null;
   const pctLanded = depotNetIndent > 0 ? r4((wdLanded / depotNetIndent) * 100) : null;
+  const landedNote = revealLanded
+    ? null
+    : 'Landed values on withdrawals are admin-only: a withdrawal\'s landed value is the landed cost frozen when it '
+      + 'was issued, which for a brand never indented is the TGBCL master rate per bottle itself. So the landed '
+      + 'values, the landed basis\'s total and %, and the recoverable / recovered / outstanding of any category '
+      + 'holding a withdrawal recovered at landed cost are withheld here'
+      + (wdLandedWithheld > 0
+        ? ` (${wdLandedWithheld} withdrawal(s) recovered at landed cost in this range — the outstanding shown leaves them out)`
+        : '')
+      + '. An admin sees them here and on the Withdrawals page.';
   const H: LqSectionH = {
     value_basis: valueBasis,
     buckets: wdBuckets,
     total_recorded_value: wdRecorded,
     recorded_unpriced_count: wdUnpriced,
-    total_landed_value: landed ? wdLanded : null,
-    total_value: landed ? wdLanded : wdRecorded,
+    total_landed_value: landed && revealLanded ? wdLanded : null,
+    total_value: landed ? (revealLanded ? wdLanded : null) : wdRecorded,
     total_outstanding: wdOutstanding,
+    total_outstanding_shown: wdLandedWithheld > 0 ? wdOutstandingShown : wdOutstandingAll,
+    landed_recovery_withheld_count: wdLandedWithheld,
+    landed_figures_visible: revealLanded,
+    landed_figures_note: landedNote,
     purchases_value: purchasesValue,
     pct_of_purchases: pctRecorded,
-    pct_of_net_indent: landed ? pctLanded : null,
-    pct: landed ? pctLanded : pctRecorded,
+    pct_of_net_indent: landed && revealLanded ? pctLanded : null,
+    pct: landed ? (revealLanded ? pctLanded : null) : pctRecorded,
     pct_basis: (landed
-      ? `LANDED (opt-in): the landed value frozen on each withdrawal (${rs(wdLanded)}) ÷ the §B Net Indent `
-        + `${rs(depotNetIndent)} — the bills' landed value, so both halves include the TGBCL levies.`
+      ? (revealLanded
+        ? `LANDED (opt-in): the landed value frozen on each withdrawal (${rs(wdLanded)}) ÷ the §B Net Indent `
+          + `${rs(depotNetIndent)} — the bills' landed value, so both halves include the TGBCL levies.`
+        : `LANDED (opt-in): the landed value frozen on each withdrawal ÷ the §B Net Indent — withheld from this view.`)
       : `RECORDED basis (the default): withdrawn stock at the store's recorded average cost on each withdrawal's date `
         + `(${rs(wdRecorded)}) ÷ the recorded purchase value in range ${rs(purchasesValue)} (store-ledger purchase and `
         + `inward lines, IST day) — both halves at the store ledger's recorded cost, no levies. The frozen landed `
-        + `values are opt-in — switch Value at to Landed.`)
+        + (revealLanded ? `values are opt-in — switch Value at to Landed.` : `values are opt-in, and admin-only.`))
       + (wdUnpriced > 0
         ? ` ${wdUnpriced} withdrawal(s) had no recorded store cost on their date and are left out of the recorded value, not counted as ₹0.`
         : '')
-      + (wdSum && wdSum.pct_of_purchases != null
+      // The L4 ratio is landed ÷ the recorded purchase value this card prints,
+      // so quoting it would hand back the withheld landed total — admin only.
+      + (revealLanded && wdSum && wdSum.pct_of_purchases != null
         ? ` The Withdrawals page's "% of purchases" (${wdSum.pct_of_purchases}%) divides the frozen LANDED value by the `
           + 'RECORDED purchase value — a landed numerator over a recorded denominator — so it differs from this card.'
-        : ''),
+        : '')
+      // The page prints pct_basis under the card, so the withholding is said
+      // where the blanks are, not only in landed_figures_note.
+      + (landedNote ? ` ${landedNote}` : ''),
     pending: wdRead.error
       ? unavailable('L4', 'The stock-withdrawal register')
       : (wdBuckets.length === 0
@@ -1865,25 +1909,32 @@ export function liquorSummaryCsv(res: LqSummaryResult, section: LqCsvSection): s
       lines.push(row([head, `Section H — Non-sale issues (withdrawals) — value at ${h.value_basis.toUpperCase()}`]));
       // ONE BASIS PER BLOCK (owner decision 1): the value column and the % are
       // the same basis, and the file says which.
+      // Withheld cells (admin-only landed figures — see LqSectionH) export as
+      // blanks, never as 0, and the BASIS row says why.
       if (h.value_basis === 'landed') {
         lines.push(row(['Category', 'Count', 'Landed value', 'MRP value', 'Recoverable', 'Recovered', 'Outstanding']));
         for (const b of h.buckets) {
-          lines.push(row([b.category, b.count, num(b.landed_value), b.mrp_value, b.recoverable, b.recovered, b.outstanding]));
+          lines.push(row([b.category, b.count, num(b.landed_value), b.mrp_value, num(b.recoverable), num(b.recovered), num(b.outstanding)]));
         }
-        lines.push(row(['TOTAL', '', num(h.total_landed_value), '', '', '', h.total_outstanding]));
+        lines.push(row(['TOTAL', '', num(h.total_landed_value), '', '', '', num(h.total_outstanding)]));
         lines.push(row(['Depot net indent in range (Rs) — the landed denominator', res.sections.F.depot_net_indent]));
         lines.push(row(['% of Net Indent (landed ÷ landed)', num(h.pct)]));
       } else {
         lines.push(row(['Category', 'Count', 'Recorded value', 'Not priced (no store cost on the date)', 'MRP value',
           'Recoverable', 'Recovered', 'Outstanding']));
         for (const b of h.buckets) {
-          lines.push(row([b.category, b.count, b.recorded_value, b.recorded_unpriced, b.mrp_value, b.recoverable,
-            b.recovered, b.outstanding]));
+          lines.push(row([b.category, b.count, b.recorded_value, b.recorded_unpriced, b.mrp_value, num(b.recoverable),
+            num(b.recovered), num(b.outstanding)]));
         }
-        lines.push(row(['TOTAL', '', h.total_recorded_value, h.recorded_unpriced_count, '', '', '', h.total_outstanding]));
+        lines.push(row(['TOTAL', '', h.total_recorded_value, h.recorded_unpriced_count, '', '', '', num(h.total_outstanding)]));
         lines.push(row(['Recorded purchase value in range (Rs)', h.purchases_value]));
         lines.push(row(['% of purchases (recorded ÷ recorded)', num(h.pct)]));
       }
+      if (h.landed_recovery_withheld_count > 0) {
+        lines.push(row(['Outstanding shown (Rs) — withdrawals recovered at MRP or a typed amount', h.total_outstanding_shown]));
+        lines.push(row(['Withdrawals recovered at landed cost — figures withheld', h.landed_recovery_withheld_count]));
+      }
+      // pct_basis already ends with landed_figures_note when figures are withheld.
       lines.push(row(['BASIS', h.pct_basis]));
       break;
     }

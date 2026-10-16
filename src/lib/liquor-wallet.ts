@@ -340,6 +340,28 @@ export function walletBalanceAsOf(
   };
 }
 
+/**
+ * THE OPENING LINE — the wallet's one opening balance (uq_lq_wallet_opening),
+ * or null when none has been recorded yet.
+ *
+ * An opening dated D is the TGBCL portal balance at the START of D, so it
+ * already contains every deposit and every indent debit dated BEFORE D. A
+ * movement dated before the opening is therefore counted twice — once inside
+ * the opening, once as itself. measured: a September indent recorded before
+ * this module existed, healed with "Write the debit" after the owner opened the
+ * wallet on 1 October at the portal's ₹1,50,000 → a debit dated 20 September,
+ * the balance ₹1,27,749 and check A failing by exactly that indent. The rule
+ * is strict (date < D): the opening sorts first on its own day
+ * (ORDER BY date, created_at), so a movement dated D itself is after it.
+ */
+export function walletOpening(db: Database): { id: string; date: string; amount: number } | null {
+  const row = db.prepare(`
+    SELECT id, date, amount FROM lq_wallet_txns WHERE type = 'opening'
+     ORDER BY date ASC, created_at ASC, rowid ASC LIMIT 1
+  `).get() as { id: string; date: string; amount: number } | undefined;
+  return row && isDate(row.date) ? row : null;
+}
+
 export interface WalletRow {
   id: string;
   date: string;
@@ -374,10 +396,18 @@ const ORDER_SQL = 'ORDER BY date ASC, created_at ASC, rowid ASC';
 function rowAnomaly(
   r: { type: string; amount: number; reference: string; bank_match: string; bank_amount: number; date: string },
   today?: string,
+  openingDate?: string,
 ): string | null {
   if (r.type === 'indent_debit' && r.amount > 0) return 'An indent debit recorded POSITIVE — it is ADDING to the wallet.';
   if ((r.type === 'deposit' || r.type === 'opening') && r.amount < 0) return 'Recorded negative — it is REDUCING the wallet.';
   if (r.type === 'indent_debit' && !String(r.reference || '').trim()) return 'Indent debit with no indent reference.';
+  // See walletOpening(): the opening already holds everything dated before it.
+  // Nothing writes one of these any more (writeAutoDebit and retryAutoDebit
+  // both stop at the opening), so a row here was typed by hand, written before
+  // the opening was recorded, or is an opening entered later than the history.
+  if (openingDate && r.type !== 'opening' && r.date < openingDate) {
+    return `Dated ${r.date}, BEFORE the wallet's opening balance (${openingDate}). The opening already includes every movement before it, so this row counts that money a second time.`;
+  }
   // A movement dated ahead of today is in the headline balance but outside every
   // as-of figure — including the portal check, which is the one comparison built
   // to catch a wallet disagreement. insertWalletTxn refuses one; a bill route
@@ -455,6 +485,9 @@ export function buildWalletView(db: Database, from: string, to: string, today?: 
   `).all() as any[];
 
   const todayStr = isDate(today) ? today : '';
+  // The opening's date, read off the same rows (ledger order, first opening) —
+  // what walletOpening() returns, without a second query.
+  const openingDate = String(all.find(r => r.type === 'opening' && isDate(r.date))?.date || '');
   let runP = 0;
   let openingP = 0;
   const rows: WalletRow[] = [];
@@ -494,7 +527,7 @@ export function buildWalletView(db: Database, from: string, to: string, today?: 
         outlet_id: r.outlet_id ?? null,
         running_balance: toRupees(runP),
         auto: !!String(r.source_ref || '').trim(),
-        anomaly: rowAnomaly(r, todayStr || undefined),
+        anomaly: rowAnomaly(r, todayStr || undefined, openingDate || undefined),
       });
     }
   }
@@ -858,9 +891,12 @@ export const LQ_AUTO_DEBIT_FAILED_EVENT = 'liquor_wallet.auto_debit_failed';
  * AUTO-CREATE (or re-derive) THE WALLET DEBIT FOR ONE RECORDED INDENT — AND
  * NEVER TAKE THE BILL DOWN WITH IT.
  *
- * Called from upsertBillCharges() in src/lib/store-engine.ts, which is the ONE
- * place a Net Indent is ever written and which is itself called inside the
- * indent's own db.transaction() (/procure-bill and /procure-bulk).
+ * Called from upsertBillCharges() in src/lib/store-engine.ts, which is where a
+ * Net Indent is written and which is itself called inside the indent's own
+ * db.transaction() (/procure-bill and /procure-bulk) — and, for a register
+ * header, from linkIndentMembers in that same transaction, when linking the
+ * upload's inward numbers widened the header (settleRegisterHeader, the only
+ * other writer of a Net Indent). Also from retryAutoDebit, the heal path.
  *
  * ── THE DECISION (2026-10-14): A WALLET-SIDE PROBLEM NEVER BLOCKS A BILL ──────
  * The TGBCL bill save is a DEPLOYED stock flow: it puts bottles on the Liquor
@@ -1050,6 +1086,30 @@ function writeAutoDebit(db: Database, args: AutoDebitArgs): AutoDebitResult {
     return { action: 'none', id: null, amount: 0, note: `Net Indent is ₹${toRupees(netP).toFixed(2)} — nothing to debit.` };
   }
 
+  // AN INDENT DATED BEFORE THE WALLET'S OPENING IS ALREADY INSIDE IT (see
+  // walletOpening). A September bill keyed in after the owner opened the wallet
+  // on 1 October at the portal's figure was spent BEFORE that figure was read,
+  // so a debit for it would take the same money out twice — and check A would
+  // fail by exactly that indent. No row is written and the indent is not listed
+  // as "missing" (indentIntegrity reports it under before_opening instead).
+  // Only for an indent with no debit of its own yet: a row already written
+  // under this source_ref keeps being re-derived as before, and if it sits
+  // before the opening the ledger flags it (rowAnomaly) rather than this save
+  // deleting a movement.
+  if (!existing) {
+    const opening = walletOpening(db);
+    if (opening && date < opening.date) {
+      return {
+        action: 'none',
+        id: null,
+        amount: 0,
+        // No wallet figure: this reply reaches the bill saver (see 'adopted').
+        note: `Indent ${reference} is dated ${date}, before the TGBCL wallet's opening balance (${opening.date}). `
+          + 'The opening already includes it, so no wallet debit was written.',
+      };
+    }
+  }
+
   const amount = toRupees(-netP);            // SIGNED, negative. assertSign is the belt.
   assertSign('indent_debit', amount);
   const remarks = `Auto: indent ${reference}${args.supplier ? ' — ' + String(args.supplier).trim() : ''}`.slice(0, 500);
@@ -1217,6 +1277,30 @@ export function retryAutoDebit(
   if (!c) {
     throw new WalletWriteError('unknown_indent', 'No recorded indent has that id — reload the wallet page and try again.', 404);
   }
+  // REFUSED, not healed, when the indent is dated before the wallet's opening
+  // (see walletOpening): the opening portal balance already reflects it, so
+  // "Write the debit" would count it twice (measured before this guard: a
+  // 20 Sep indent written under a 1 Oct opening, check A failing by the whole
+  // ₹22,251). Said in words, and checked here rather than left to
+  // writeAutoDebit's 'none' so the button press gets a refusal it can show —
+  // and so nothing lands in audit_events or the errors bell as a "failure".
+  // An indent that already has its debit is re-derived as before.
+  const opening = walletOpening(db);
+  const effDate = String(c.eff_date || '');
+  if (opening && isDate(effDate) && effDate < opening.date) {
+    const own = db.prepare(`
+      SELECT 1 FROM lq_wallet_txns WHERE type = 'indent_debit' AND source_ref = ? LIMIT 1
+    `).get(c.id);
+    if (!own) {
+      throw new WalletWriteError(
+        'before_opening',
+        `Indent ${String(c.invoice_ref || '').trim()} is dated ${effDate}, before this wallet's opening balance `
+        + `(₹${r2(opening.amount).toFixed(2)} on ${opening.date}). The opening portal balance already includes it, `
+        + 'so a debit for it would take the same money out twice. Nothing was written.',
+        409,
+      );
+    }
+  }
   const res = autoDebitForIndent(db, {
     source_ref: c.id,
     reference: String(c.invoice_ref || '').trim(),
@@ -1234,8 +1318,9 @@ export function retryAutoDebit(
 /**
  * A REGISTER CSV (/procure-bulk with a per-row inward_no) posts each line under
  * its OWN inward number, but its four TGBCL levies are typed once and keyed on
- * the HEADER ref — whose invoice_value spans every inward the upload touched —
- * so the Net Indent and the wallet debit sit on the header. linkIndentMembers
+ * the HEADER ref — whose invoice_value spans every inward linked to it, across
+ * every upload of the register (settleRegisterHeader, run here after the links)
+ * — so the Net Indent and the wallet debit sit on the header. linkIndentMembers
  * records which inward numbers that header covers (lq_indent_members), and the
  * three readers that key on a line's own ref use it: indentIntegrity().undebited
  * (a covered inward is debited, inside its header), the Summary's §B (the
@@ -1252,7 +1337,175 @@ export interface IndentMemberLinkResult {
   /** Inward numbers ANOTHER recorded indent already covers as well (the same
    *  inward number in two register uploads). Linked anyway; named so it is seen. */
   also_covered_by: Array<{ ref: string; header_ref: string }>;
+  /** Present when linking this upload's inward numbers WIDENED the header's
+   *  invoice value to cover them (see settleRegisterHeader): the figures the
+   *  header now records, what it held before, and the re-derived debit. */
+  register?: {
+    invoice_value: number;
+    net_indent_value: number;
+    previous_invoice_value: number;
+    previous_net_indent_value: number;
+    wallet_debit: AutoDebitResult | null;
+  };
   error?: string;
+}
+
+/* ── the register HEADER: its invoice value spans every inward it covers ───── */
+
+/**
+ * A REGISTER'S HEADER ROW MUST COVER EVERY INWARD LINKED TO IT.
+ *
+ * /procure-bulk (deployed) computes the header's invoice_value over the refs IN
+ * THE CURRENT UPLOAD only. That is right for the first upload of a register and
+ * wrong for every balance re-upload, which is the route's own designed workflow
+ * ("fix the skipped rows and re-upload just those"): the header's Net Indent —
+ * and so the wallet debit — SHRANK to the re-uploaded rows. measured (skipfix):
+ * register TGBCL-REG-20OCT, inwards 0801 + 0802 posted, 0803 skipped and then
+ * re-uploaded alone → header invoice ₹4,402.08 / Net Indent ₹6,704.08 / debit
+ * −₹6,704.08 against a true ₹37,004.04 / ₹39,306.04, short by ₹32,601.96 — and
+ * because lq_indent_members marks 0801/0802/0803 as covered, the wallet's
+ * integrity panel and §B−§A both read clean. Production's own Net Indent on the
+ * Liquor Store page shrinks the same way; it is the links that hid it.
+ *
+ * So the register's value is DEFINED the way the route defines one upload's —
+ * Σ quantity × unit_cost over the store's 'purchase' lines — but over the
+ * header's own ref PLUS every inward number linked to it (lq_indent_members),
+ * across every upload. Widen-only: a header is never lowered here (its value
+ * can only be short of its lines, never over them, by the route's own sum),
+ * so a header written by any other door keeps what it recorded.
+ *
+ * Two callers, because the route links AFTER it writes the header:
+ *   · upsertBillCharges' liquor block (store-engine.ts), before the debit —
+ *     covers /procure-bill on a register header and every re-upload whose rows
+ *     are already linked;
+ *   · linkIndentMembers, after it links this upload's inward numbers — covers a
+ *     re-upload that brings an inward number the header did not cover yet.
+ * ANALYTICS NEVER BLOCK A BILL: its own SAVEPOINT, any failure logged and
+ * answered with the header's figures as they stand, and re-thrown only when
+ * SQLite dropped the bill's own transaction (as autoDebitForIndent does).
+ */
+export interface RegisterHeaderSettle {
+  charges_id: string;
+  store_id: string;
+  invoice_ref: string;
+  date: string;
+  supplier: string;
+  invoice_value: number;
+  net_indent_value: number;
+  previous_invoice_value: number;
+  previous_net_indent_value: number;
+  /** Inward numbers linked to the header (0 = an ordinary bill, never widened). */
+  members: number;
+  widened: boolean;
+  error?: string;
+}
+export function settleRegisterHeader(
+  db: Database, args: { charges_id: string; created_by?: string },
+): RegisterHeaderSettle | null {
+  const chargesId = String(args.charges_id || '').trim();
+  if (!chargesId) return null;
+  const outerTxn = db.inTransaction;
+  let row: {
+    id: string; store_id: string; invoice_ref: string; date: string; supplier: string; invoice_value: number;
+    mrp_rounding: number; excise_turnover_tax: number; special_excise_cess: number; tcs: number; net_indent_value: number;
+  } | undefined;
+  try {
+    return db.transaction((): RegisterHeaderSettle | null => {
+      row = db.prepare(`
+        SELECT id, store_id, invoice_ref, COALESCE(date,'') AS date, COALESCE(supplier,'') AS supplier, invoice_value,
+               mrp_rounding, excise_turnover_tax, special_excise_cess, tcs, net_indent_value
+          FROM store_bill_charges WHERE id = ?
+      `).get(chargesId) as typeof row;
+      if (!row) return null;
+      const base: RegisterHeaderSettle = {
+        charges_id: row.id, store_id: row.store_id, invoice_ref: String(row.invoice_ref || '').trim(),
+        date: String(row.date || '').trim(), supplier: String(row.supplier || '').trim(),
+        invoice_value: r2(Number(row.invoice_value) || 0), net_indent_value: r2(Number(row.net_indent_value) || 0),
+        previous_invoice_value: r2(Number(row.invoice_value) || 0),
+        previous_net_indent_value: r2(Number(row.net_indent_value) || 0),
+        members: 0, widened: false,
+      };
+      const memberKeys = (db.prepare(`
+        SELECT ref_key FROM lq_indent_members WHERE charges_id = ? AND store_id = ?
+      `).all(row.id, row.store_id) as Array<{ ref_key: string }>).map(m => m.ref_key);
+      base.members = memberKeys.length;
+      if (memberKeys.length === 0) return base;          // an ordinary bill: the route's figure stands
+      const keys = Array.from(new Set([walletIndentKey(row.invoice_ref), ...memberKeys])).filter(Boolean);
+      // The route's own expression (procure-bulk: SUM(quantity * unit_cost) over
+      // txn_type 'purchase', LOWER(TRIM(ref)) IN …), so the two can only differ
+      // by WHICH refs are summed — never by how.
+      const v = db.prepare(`
+        SELECT COALESCE(SUM(quantity * unit_cost), 0) AS v FROM store_stock_ledger
+         WHERE store_id = ? AND txn_type = 'purchase'
+           AND LOWER(TRIM(ref)) IN (${keys.map(() => '?').join(',')})
+      `).get(row.store_id, ...keys) as { v: number };
+      const invoiceValue = Math.round((Number(v?.v) || 0) * 100) / 100;
+      if (!(toPaise(invoiceValue) > toPaise(row.invoice_value))) return base;   // widen-only
+      // upsertBillCharges' own formula: invoice value + the four levies.
+      const netIndent = Math.round((invoiceValue + (Number(row.mrp_rounding) || 0) + (Number(row.excise_turnover_tax) || 0)
+        + (Number(row.special_excise_cess) || 0) + (Number(row.tcs) || 0)) * 100) / 100;
+      db.prepare(`
+        UPDATE store_bill_charges SET invoice_value = ?, net_indent_value = ?, updated_at = datetime('now') WHERE id = ?
+      `).run(invoiceValue, netIndent, row.id);
+      logAuditEvent(db, {
+        event_type: 'liquor_wallet.register_header_widened',
+        entity_type: 'store_bill_charges',
+        entity_id: row.id,
+        actor_email: String(args.created_by || '').trim(),
+        before: { invoice_value: base.previous_invoice_value, net_indent_value: base.previous_net_indent_value },
+        after: { invoice_value: invoiceValue, net_indent_value: netIndent, inward_numbers: keys.length - 1 },
+        note: `TGBCL register ${base.invoice_ref}: invoice value ₹${base.previous_invoice_value.toFixed(2)} → ₹${invoiceValue.toFixed(2)} `
+          + `(Net Indent ₹${netIndent.toFixed(2)}) — it now spans all ${keys.length - 1} inward number(s) linked to it, not just this upload's.`,
+      });
+      return { ...base, invoice_value: invoiceValue, net_indent_value: netIndent, widened: true };
+    })();
+  } catch (e: any) {
+    if (outerTxn && !db.inTransaction) throw e;   // SQLite dropped the bill's own transaction
+    const msg = String(e?.message || e || 'unknown error');
+    try { console.error(`[liquor-wallet] register header ${chargesId} NOT widened (bill saved): ${msg}`); } catch { /* never fail a bill */ }
+    if (!row) return null;
+    return {
+      charges_id: row.id, store_id: row.store_id, invoice_ref: String(row.invoice_ref || '').trim(),
+      date: String(row.date || '').trim(), supplier: String(row.supplier || '').trim(),
+      invoice_value: r2(Number(row.invoice_value) || 0), net_indent_value: r2(Number(row.net_indent_value) || 0),
+      previous_invoice_value: r2(Number(row.invoice_value) || 0),
+      previous_net_indent_value: r2(Number(row.net_indent_value) || 0),
+      members: 0, widened: false, error: msg,
+    };
+  }
+}
+
+/**
+ * THE BILL-SAVE REPLY, HELD FOR ONE SYNCHRONOUS STEP.
+ *
+ * upsertBillCharges' liquor block builds the reply object /procure-bulk returns
+ * as bill_charges, and the route then calls linkIndentMembers — in the same
+ * db.transaction(), with nothing in between that can yield. When linking widens
+ * the header (an upload that brings an inward number the header did not yet
+ * cover), the reply would otherwise carry the pre-link Net Indent and debit to
+ * the person who saved the bill, while the row and the wallet hold the settled
+ * ones. So the block hands its reply here, and linkIndentMembers restates the
+ * figures on that same object before the route serialises it. Keyed on the
+ * charges id and consumed once; a reply nobody links (every /procure-bill) is
+ * simply replaced by the next bill's.
+ */
+let heldHeaderReply: { chargesId: string; reply: Record<string, unknown> } | null = null;
+export function holdHeaderReply(chargesId: string, reply: Record<string, unknown>): void {
+  heldHeaderReply = chargesId ? { chargesId, reply } : null;
+}
+
+/** What the saver is told about the debit when a second write in the same save
+ *  re-derived it: the second result, under the first one's action (the row was
+ *  inserted or adopted by THIS save — 'updated' would say otherwise). */
+function restateDebit(prev: AutoDebitResult | null | undefined, next: AutoDebitResult, reference: string): AutoDebitResult {
+  if (!prev || next.action !== 'updated') return next;
+  if (prev.action === 'inserted') {
+    return { ...next, action: 'inserted', note: `Wallet debited ₹${next.amount.toFixed(2)} for indent ${reference}.` };
+  }
+  if (prev.action === 'adopted') {
+    return { ...next, action: 'adopted', note: prev.note.replace(/\(₹-?[\d.]+\)/, `(₹${next.amount.toFixed(2)})`) };
+  }
+  return next;
 }
 export function linkIndentMembers(
   db: Database,
@@ -1301,7 +1554,40 @@ export function linkIndentMembers(
       after: { header_ref: args.header_ref, refs: (args.refs || []).slice(0, 50), message: msg },
       note: `TGBCL register ${args.header_ref}: the inward numbers its charges cover were NOT recorded — the wallet page will list them as purchases with no indent record. ${msg}`,
     });
+    if (heldHeaderReply?.chargesId === chargesId) heldHeaderReply = null;
     return { linked: [], also_covered_by: [], error: msg };
+  }
+
+  // THE HEADER NOW SPANS WHAT WAS JUST LINKED (see settleRegisterHeader). The
+  // route summed only this upload's refs; an inward number this upload brought
+  // for the first time is linked only now, so the header — and the debit — are
+  // settled here, after the links, and the held reply is restated to match.
+  const held = heldHeaderReply?.chargesId === chargesId ? heldHeaderReply : null;
+  heldHeaderReply = null;
+  const settled = settleRegisterHeader(db, { charges_id: chargesId, created_by: args.created_by });
+  if (settled?.widened) {
+    const debit = autoDebitForIndent(db, {
+      source_ref: settled.charges_id,
+      reference: settled.invoice_ref,
+      date: settled.date,
+      net_indent_value: settled.net_indent_value,
+      store_id: settled.store_id,
+      supplier: settled.supplier,
+      created_by: String(args.created_by || '').trim(),
+    });
+    const shown = restateDebit(held?.reply?.wallet_debit as AutoDebitResult | null | undefined, debit, settled.invoice_ref);
+    out.register = {
+      invoice_value: settled.invoice_value,
+      net_indent_value: settled.net_indent_value,
+      previous_invoice_value: settled.previous_invoice_value,
+      previous_net_indent_value: settled.previous_net_indent_value,
+      wallet_debit: shown,
+    };
+    if (held) Object.assign(held.reply, {
+      invoice_value: settled.invoice_value,
+      net_indent_value: settled.net_indent_value,
+      wallet_debit: shown,
+    });
   }
   return out;
 }
@@ -1405,8 +1691,30 @@ export interface IndentIntegrity {
    *  recorded before this module existed, its debit was deleted by hand, or the
    *  debit could not be written when the bill was saved. In that last case
    *  `failure` carries the reason (the newest LQ_AUTO_DEBIT_FAILED_EVENT for the
-   *  indent); it is null otherwise. */
+   *  indent); it is null otherwise. An indent dated BEFORE the wallet's opening
+   *  balance is not here: the opening already includes it (see before_opening). */
   missing: Array<{ source_ref: string; invoice_ref: string; date: string; net_indent_value: number; store: string; failure: string | null }>;
+  /** Recorded indents with a positive Net Indent and no debit, dated before the
+   *  wallet's opening balance (walletOpening). They are INSIDE the opening — the
+   *  portal balance it was read from had already paid them — so they are not
+   *  missing, and nothing debits them: writeAutoDebit writes no row and
+   *  retryAutoDebit refuses. Counted, so deploy day's history is accounted for
+   *  rather than offered a "Write the debit" button that would count each one
+   *  twice (measured before: −₹22,251 under a ₹1,50,000 opening, check A failing
+   *  by exactly that indent). opening_date is null when no opening is recorded —
+   *  then nothing is before it and every undebited indent is `missing`. */
+  before_opening: { opening_date: string | null; count: number; total: number };
+  /** REGISTER HEADERS RECORDED SHORT of their own lines: the header's invoice
+   *  value is less than the 'purchase' lines under its own ref plus every inward
+   *  number linked to it (see settleRegisterHeader, which widens a header on
+   *  every save). Nothing the module writes now leaves one short; a row here was
+   *  written before that rule, or by a save whose widening failed. Its linked
+   *  inward numbers are then listed in `undebited` as well — a debit that does
+   *  not cover them cannot be said to cover them. Should be empty. */
+  register_short: Array<{
+    source_ref: string; invoice_ref: string; store: string; invoice_value: number;
+    register_value: number; shortfall: number; inward_numbers: number;
+  }>;
   /** Debits whose amount no longer matches their indent's Net Indent.
    *  hand_entered: the debit was typed by a person (no source_ref) and stands in
    *  for the indent under its number — see HAND_STANDS_IN in indentIntegrity. */
@@ -1421,7 +1729,8 @@ export interface IndentIntegrity {
    *  /procure-bulk only writes a charges row when a levy is non-zero, so a
    *  register uploaded with the four levy fields blank spends real TGBCL money
    *  and moves nothing here. An inward number a register upload's header row
-   *  covers (lq_indent_members) is NOT listed: it is inside that debit. */
+   *  covers (lq_indent_members) is NOT listed: it is inside that debit — unless
+   *  the header is recorded short of its lines (register_short), when it is. */
   undebited: Array<{ invoice_ref: string; store: string; date: string; recorded_value: number }>;
   /** Wallet debits whose indent belongs to a store that is NOT the liquor store.
    *  upsertBillCharges is generic over stores and the Liquor Store page is a
@@ -1449,8 +1758,27 @@ function liquorStoreIds(db: Database): string[] {
  * same-transaction auto-debit keeps going forward. This is how the page PROVES
  * it, over history it did not write: every recorded indent should have exactly
  * one debit, of exactly its Net Indent.
+ *
+ * LINEAR IN THE HISTORY. It runs synchronously on better-sqlite3 on every
+ * wallet page GET, so a query that grows with indents × debits blocks the whole
+ * Node process while it runs. Every join below is keyed: an equality on a
+ * primary key, an IN against a set SQLite builds ONCE (NOT IN (SELECT …) /
+ * json_each), or a Map in JS. Nothing is a correlated scan over another table
+ * per row. measured before this shape (perf.cjs: N recorded indents each stood
+ * in for by a hand-entered debit — the deploy-day history import): N=1,000
+ * 626 ms, N=2,000 2,573 ms, N=4,000 10.3 s — quadratic.
  */
 export function indentIntegrity(db: Database): IndentIntegrity {
+  const opening = walletOpening(db);
+  const openingDate = opening ? opening.date : '';
+
+  // Every recorded indent that has a machine debit of its own (source_ref).
+  // Materialised once as an IN-set: the old per-indent NOT EXISTS could only
+  // use idx_lq_wallet_type (type = ?) and so scanned EVERY indent debit for
+  // EVERY recorded indent.
+  const MACHINE_SET = `SELECT source_ref FROM lq_wallet_txns
+                        WHERE type = 'indent_debit' AND COALESCE(source_ref,'') <> ''`;
+
   // HAND_STANDS_IN — a debit typed BY HAND (source_ref '') under a recorded
   // indent's number is that indent's debit, here as in autoDebitForIndent, which
   // ADOPTS exactly such a row on the indent's next save. Matching only on
@@ -1462,20 +1790,46 @@ export function indentIntegrity(db: Database): IndentIntegrity {
   // machine debit of its own, and matched ignoring case as walletIndentKey is.
   // insertWalletTxn refuses a second debit under a number already debited, so a
   // hand row and a machine row cannot both stand for one indent.
-  const HAND_STANDS_IN = `
-    SELECT w.id, w.reference, w.amount, w.date, c.id AS charges_id, c.net_indent_value
-      FROM lq_wallet_txns w
-      JOIN store_bill_charges c ON LOWER(TRIM(c.invoice_ref)) = LOWER(TRIM(w.reference))
-     WHERE w.type = 'indent_debit' AND COALESCE(w.source_ref,'') = ''
-       AND (SELECT COUNT(*) FROM store_bill_charges c2
-             WHERE LOWER(TRIM(c2.invoice_ref)) = LOWER(TRIM(c.invoice_ref))) = 1
-       AND NOT EXISTS (SELECT 1 FROM lq_wallet_txns w2
-                        WHERE w2.type = 'indent_debit' AND w2.source_ref = c.id)`;
+  //
+  // Built in JS from three straight reads, joined on Maps — the same rule the
+  // old CTE stated, without its LOWER(TRIM()) nested-loop join (no index can
+  // serve one) and its correlated COUNT per matched pair, which ran once for
+  // `missing` and again for `mismatched`. Both keys are computed by SQLite's own
+  // LOWER(TRIM()), exactly as before, so the match is byte-for-byte the old one.
+  const handRows = db.prepare(`
+    SELECT id, reference, amount, date, LOWER(TRIM(reference)) AS k
+      FROM lq_wallet_txns
+     WHERE type = 'indent_debit' AND COALESCE(source_ref,'') = ''
+  `).all() as Array<{ id: string; reference: string; amount: number; date: string; k: string }>;
+  const hand: Array<{ id: string; reference: string; amount: number; date: string; charges_id: string; net_indent_value: number }> = [];
+  if (handRows.length > 0) {
+    const byKey = new Map<string, { charges_id: string; n: number; net: number }>();
+    for (const r of db.prepare(`
+      SELECT LOWER(TRIM(invoice_ref)) AS k, MIN(id) AS charges_id, COUNT(*) AS n, MIN(net_indent_value) AS net
+        FROM store_bill_charges GROUP BY LOWER(TRIM(invoice_ref))
+    `).all() as Array<{ k: string; charges_id: string; n: number; net: number }>) {
+      byKey.set(r.k, { charges_id: r.charges_id, n: Number(r.n) || 0, net: Number(r.net) || 0 });
+    }
+    const machine = new Set((db.prepare(MACHINE_SET).all() as Array<{ source_ref: string }>).map(r => r.source_ref));
+    for (const w of handRows) {
+      const c = byKey.get(w.k);
+      if (!c || c.n !== 1 || machine.has(c.charges_id)) continue;
+      hand.push({ id: w.id, reference: w.reference, amount: Number(w.amount) || 0, date: w.date, charges_id: c.charges_id, net_indent_value: c.net });
+    }
+  }
+  const handIds = JSON.stringify(hand.map(h => h.charges_id));
+
+  // The indent's own date, else the IST day its charges row was written — the
+  // date retryAutoDebit would debit it on, and so the one compared to the opening.
+  const EFF_DATE = `COALESCE(NULLIF(TRIM(c.date), ''), date(c.created_at, '+330 minutes'))`;
+  const UNDEBITED_INDENT = `
+         c.net_indent_value > 0
+     AND c.id NOT IN (${MACHINE_SET})
+     AND c.id NOT IN (SELECT value FROM json_each(?))`;
 
   // `failure` is a correlated read of audit_events, served by idx_audit_entity
-  // (entity_type, entity_id) and run at most 200 times (the LIMIT).
+  // (entity_type, entity_id) — one indexed probe per listed indent.
   const missing = db.prepare(`
-    WITH hand AS (${HAND_STANDS_IN})
     SELECT c.id AS source_ref, c.invoice_ref, COALESCE(c.date,'') AS date,
            c.net_indent_value, COALESCE(s.name,'') AS store,
            (SELECT a.note FROM audit_events a
@@ -1484,36 +1838,47 @@ export function indentIntegrity(db: Database): IndentIntegrity {
              ORDER BY a.created_at DESC, a.rowid DESC LIMIT 1) AS failure
       FROM store_bill_charges c
       LEFT JOIN store_locations s ON s.id = c.store_id
-     WHERE c.net_indent_value > 0
-       AND NOT EXISTS (SELECT 1 FROM lq_wallet_txns w
-                        WHERE w.type = 'indent_debit' AND w.source_ref = c.id)
-       AND NOT EXISTS (SELECT 1 FROM hand h WHERE h.charges_id = c.id)
+     WHERE ${UNDEBITED_INDENT}
+       AND (? = '' OR ${EFF_DATE} >= ?)
      ORDER BY c.date DESC, c.invoice_ref
      LIMIT 200
-  `).all(LQ_AUTO_DEBIT_FAILED_EVENT) as IndentIntegrity['missing'];
+  `).all(LQ_AUTO_DEBIT_FAILED_EVENT, handIds, openingDate, openingDate) as IndentIntegrity['missing'];
 
-  // The machine debits by their source_ref, plus the hand-entered ones standing
-  // in for an indent (above) — a typed amount that is not the Net Indent is the
-  // same disagreement, and is now where the owner looks for it.
-  const mismatched = (db.prepare(`
-    WITH hand AS (${HAND_STANDS_IN})
-    SELECT id, reference, debit, net_indent_value, diff, hand_entered FROM (
-      SELECT w.id, w.reference, w.amount AS debit, c.net_indent_value,
-             ROUND(w.amount + c.net_indent_value, 2) AS diff, 0 AS hand_entered, w.date AS d
-        FROM lq_wallet_txns w
-        JOIN store_bill_charges c ON c.id = w.source_ref
-       WHERE w.type = 'indent_debit'
-         AND CAST(ROUND(w.amount * 100) AS INTEGER) <> -CAST(ROUND(c.net_indent_value * 100) AS INTEGER)
-      UNION ALL
-      SELECT h.id, h.reference, h.amount AS debit, h.net_indent_value,
-             ROUND(h.amount + h.net_indent_value, 2) AS diff, 1 AS hand_entered, h.date AS d
-        FROM hand h
-       WHERE CAST(ROUND(h.amount * 100) AS INTEGER) <> -CAST(ROUND(h.net_indent_value * 100) AS INTEGER)
-    )
-     ORDER BY d DESC
+  const pre = openingDate
+    ? db.prepare(`
+        SELECT COUNT(*) AS n, COALESCE(SUM(CAST(ROUND(c.net_indent_value * 100) AS INTEGER)), 0) AS p
+          FROM store_bill_charges c
+         WHERE ${UNDEBITED_INDENT}
+           AND ${EFF_DATE} < ?
+      `).get(handIds, openingDate) as { n: number; p: number }
+    : { n: 0, p: 0 };
+  const before_opening = { opening_date: openingDate || null, count: Number(pre.n) || 0, total: toRupees(Number(pre.p) || 0) };
+
+  // The machine debits by their source_ref (a primary-key join), plus the
+  // hand-entered ones standing in for an indent (above) — a typed amount that
+  // is not the Net Indent is the same disagreement, and is now where the owner
+  // looks for it. Newest first, 200 at most, as before.
+  const machineMismatch = (db.prepare(`
+    SELECT w.id, w.reference, w.amount AS debit, c.net_indent_value,
+           ROUND(w.amount + c.net_indent_value, 2) AS diff, w.date AS d
+      FROM lq_wallet_txns w
+      JOIN store_bill_charges c ON c.id = w.source_ref
+     WHERE w.type = 'indent_debit' AND COALESCE(w.source_ref,'') <> ''
+       AND CAST(ROUND(w.amount * 100) AS INTEGER) <> -CAST(ROUND(c.net_indent_value * 100) AS INTEGER)
+     ORDER BY w.date DESC
      LIMIT 200
-  `).all() as Array<Omit<IndentIntegrity['mismatched'][number], 'hand_entered'> & { hand_entered: number }>)
-    .map(r => ({ ...r, hand_entered: Number(r.hand_entered) === 1 }));
+  `).all() as Array<{ id: string; reference: string; debit: number; net_indent_value: number; diff: number; d: string }>)
+    .map(r => ({ ...r, hand_entered: false }));
+  const handMismatch = hand
+    .filter(h => toPaise(h.amount) !== -toPaise(h.net_indent_value))
+    .map(h => ({
+      id: h.id, reference: h.reference, debit: h.amount, net_indent_value: h.net_indent_value,
+      diff: r2(h.amount + h.net_indent_value), d: h.date, hand_entered: true,
+    }));
+  const mismatched = [...machineMismatch, ...handMismatch]
+    .sort((a, b) => (a.d < b.d ? 1 : a.d > b.d ? -1 : 0))
+    .slice(0, 200)
+    .map(({ d: _d, ...r }) => r);
 
   const orphaned = db.prepare(`
     SELECT w.id, w.reference, w.amount
@@ -1529,6 +1894,53 @@ export function indentIntegrity(db: Database): IndentIntegrity {
       FROM store_bill_charges WHERE net_indent_value <= 0
      ORDER BY date DESC LIMIT 200
   `).all() as IndentIntegrity['non_positive'];
+
+  // REGISTER HEADERS SHORT OF THEIR LINES (see register_short). The register's
+  // value is settleRegisterHeader's: Σ quantity × unit_cost over the store's
+  // 'purchase' lines under the header's own ref and every inward number linked
+  // to it. Linear: the links and the header refs form one key set, the ledger is
+  // read ONCE against it (an IN-set) and grouped, and the per-header sums join
+  // on those materialised keys. A 1-paisa tolerance, as the route rounds its own
+  // sum to paise before it writes it.
+  const register_short = db.prepare(`
+    WITH links AS MATERIALIZED (
+      SELECT m.charges_id, m.store_id, m.ref_key AS k
+        FROM lq_indent_members m
+        JOIN store_bill_charges c ON c.id = m.charges_id AND c.store_id = m.store_id
+    ),
+    regkeys AS MATERIALIZED (
+      SELECT charges_id, store_id, k, MAX(is_header) AS is_header FROM (
+        SELECT charges_id, store_id, k, 0 AS is_header FROM links
+        UNION ALL
+        SELECT c.id, c.store_id, LOWER(TRIM(c.invoice_ref)), 1 FROM store_bill_charges c
+         WHERE c.id IN (SELECT charges_id FROM links)
+      )
+       GROUP BY charges_id, store_id, k
+    ),
+    led AS MATERIALIZED (
+      SELECT l.store_id, LOWER(TRIM(l.ref)) AS k, SUM(l.quantity * l.unit_cost) AS v
+        FROM store_stock_ledger l
+       WHERE l.txn_type = 'purchase'
+         AND LOWER(TRIM(l.ref)) IN (SELECT k FROM regkeys)
+       GROUP BY l.store_id, LOWER(TRIM(l.ref))
+    ),
+    reg AS (
+      SELECT rk.charges_id, COALESCE(SUM(led.v), 0) AS v, SUM(1 - rk.is_header) AS inward_numbers
+        FROM regkeys rk
+        LEFT JOIN led ON led.store_id = rk.store_id AND led.k = rk.k
+       GROUP BY rk.charges_id
+    )
+    SELECT c.id AS source_ref, c.invoice_ref, COALESCE(s.name,'') AS store,
+           ROUND(c.invoice_value, 2) AS invoice_value, ROUND(reg.v, 2) AS register_value,
+           ROUND(reg.v - c.invoice_value, 2) AS shortfall, reg.inward_numbers
+      FROM reg
+      JOIN store_bill_charges c ON c.id = reg.charges_id
+      LEFT JOIN store_locations s ON s.id = c.store_id
+     WHERE CAST(ROUND(reg.v * 100) AS INTEGER) > CAST(ROUND(c.invoice_value * 100) AS INTEGER) + 1
+     ORDER BY shortfall DESC
+     LIMIT 200
+  `).all() as IndentIntegrity['register_short'];
+  const shortIds = JSON.stringify(register_short.map(r => r.source_ref));
 
   // The two store-scoped checks. Both go quiet when no store is named LIQUOR
   // STORE rather than guessing — a wrong guess here would either flag every
@@ -1555,7 +1967,7 @@ export function indentIntegrity(db: Database): IndentIntegrity {
          AND TRIM(COALESCE(l.ref,'')) <> ''
        GROUP BY l.store_id, LOWER(TRIM(l.ref))
     ),
-    chg AS (
+    chg AS MATERIALIZED (
       SELECT store_id, LOWER(TRIM(invoice_ref)) AS k
         FROM store_bill_charges
        WHERE store_id IN (${inList})
@@ -1563,12 +1975,15 @@ export function indentIntegrity(db: Database): IndentIntegrity {
     -- An inward number a REGISTER upload's header charges row covers (see
     -- linkIndentMembers): its lines are inside that header's invoice value,
     -- Net Indent and debit, so it is debited — not "no indent record". Live
-    -- links only: the header row must still be recorded in the same store.
-    covered AS (
+    -- links only: the header row must still be recorded in the same store, and
+    -- must not be recorded SHORT of its lines (register_short) — a header that
+    -- does not cover an inward's value cannot be said to cover the inward.
+    covered AS MATERIALIZED (
       SELECT m.store_id, m.ref_key AS k
         FROM lq_indent_members m
         JOIN store_bill_charges c ON c.id = m.charges_id AND c.store_id = m.store_id
        WHERE m.store_id IN (${inList})
+         AND m.charges_id NOT IN (SELECT value FROM json_each(?))
     )
     SELECT led.invoice_ref, COALESCE(s.name,'') AS store, led.date,
            ROUND(led.recorded_value, 2) AS recorded_value
@@ -1579,7 +1994,7 @@ export function indentIntegrity(db: Database): IndentIntegrity {
        AND NOT EXISTS (SELECT 1 FROM covered cv WHERE cv.store_id = led.store_id AND cv.k = led.k)
      ORDER BY led.date DESC
      LIMIT 200
-  `).all(...liqIds, ...liqIds, ...liqIds) as IndentIntegrity['undebited'] : [];
+  `).all(...liqIds, ...liqIds, ...liqIds, shortIds) as IndentIntegrity['undebited'] : [];
 
   const foreign_store = liqIds.length ? db.prepare(`
     SELECT w.id, w.reference, w.amount, COALESCE(s.name, c.store_id) AS store
@@ -1592,7 +2007,7 @@ export function indentIntegrity(db: Database): IndentIntegrity {
      LIMIT 200
   `).all(...liqIds) as IndentIntegrity['foreign_store'] : [];
 
-  return { missing, mismatched, orphaned, non_positive, undebited, foreign_store };
+  return { missing, before_opening, mismatched, orphaned, non_positive, undebited, register_short, foreign_store };
 }
 
 /* ── the portal check (Summary check A) — an OBSERVATION, not a movement ───── */

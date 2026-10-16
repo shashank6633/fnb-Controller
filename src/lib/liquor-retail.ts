@@ -285,12 +285,13 @@ export interface RecordWineShopInput {
   storeId: string;
   /**
    * May the DUPLICATE refusal quote the earlier buy's bottles and rate paid?
-   * Pass true for management only (the route passes isManagement). A colleague's
-   * retail rate is §E money, read on the management-only register, and the
-   * duplicate key (material, shop, bill no., date) is on the store ledger every
-   * can_procure user reads — so quoting it handed that money to bar staff.
-   * Fail closed: anything but true withholds, except that a caller is always
-   * told the figures of a buy THEY recorded (their own input).
+   * Pass true only for a viewer the register admits (the route passes
+   * canReadRetailRegister — management AND a page that shows it, the GET
+   * gate's own test). A colleague's retail rate is §E money, read on that
+   * register, and the duplicate key (material, shop, bill no., date) is on the
+   * store ledger every can_procure user reads — so quoting it handed that money
+   * to bar staff. Fail closed: anything but true withholds, except that a
+   * caller is always told the figures of a buy THEY recorded (their own input).
    */
   revealOtherBuyFigures?: boolean;
   /**
@@ -516,9 +517,10 @@ export function recordWineShopPurchase(
     // store ledger (material, shop = supplier, bill = ref, date), so quoting the
     // matched row's bottles and rate paid handed a COLLEAGUE's retail price to
     // bar staff outside management — the same leak the PATCH path closed by
-    // returning the excess to management only (retail/[id]/route.ts). The rate
-    // paid is §E money, shown on the management-only register. The caller's OWN
-    // earlier buy is still quoted: those figures are their own input.
+    // returning the excess only to a viewer the register admits
+    // (retail/[id]/route.ts; both use canReadRetailRegister). The rate paid is
+    // §E money, shown on that register. The caller's OWN earlier buy is still
+    // quoted: those figures are their own input.
     // (The blank-bill branch below quotes only the caller's own figures — its
     // match requires the same bottles and rate the caller just sent.)
     const ownBuy = String(dupe.recorded_by || '').trim().toLowerCase() === String(actorEmail || '').trim().toLowerCase()
@@ -647,15 +649,22 @@ export function recordWineShopPurchase(
         created_by: actorEmail,
         ...movementRecord,
       });
-      // BACKDATE, IST-exact. Every IST-day reader of this ledger (floor
-      // reconciliation, the §H denominator, depot spend) buckets on
-      // date(created_at, '+330 minutes'). A buy keyed in today for yesterday must
-      // land on yesterday: the instant is the buy's date at the current IST
-      // time-of-day, converted back to UTC, so its IST day is exactly input.date.
+      // BACKDATE, on BOTH day boundaries. Every IST-day reader of this ledger
+      // (floor reconciliation, the §H denominator, depot spend) buckets on
+      // date(created_at, '+330 minutes'); the closing count's system figure is
+      // date(created_at) <= count date — the UTC day (stores/[id]/closing
+      // asOfStats). A buy keyed in today for yesterday must land on yesterday
+      // on both: the instant is the buy's date at the current IST time-of-day,
+      // but never earlier than 05:30 IST (00:00 UTC) — the withdrawal's rule
+      // (liquor-withdrawals.ts postWithdrawalStock). Without the floor, a buy
+      // keyed in between 00:00 and 05:30 IST (right after close, the natural
+      // time to key last night's run) sat on the PREVIOUS UTC day, inside the
+      // earlier day's count window, and a re-saved count of that day read a
+      // false shortage. A buy for TODAY keeps `now`, like every other writer.
       if (input.date !== today) {
         db.prepare(`
           UPDATE store_stock_ledger
-             SET created_at = datetime(? || ' ' || strftime('%H:%M:%S', 'now', '+330 minutes'), '-330 minutes')
+             SET created_at = datetime(? || ' ' || MAX('05:30:00', strftime('%H:%M:%S', 'now', '+330 minutes')), '-330 minutes')
            WHERE id = ?
         `).run(input.date, ledgerId);
       }

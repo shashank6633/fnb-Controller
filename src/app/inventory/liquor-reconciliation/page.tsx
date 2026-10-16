@@ -62,15 +62,31 @@ interface RateRow { ledgerId: string; invoiceRef: string; inwardDate: string; ma
 interface WdBucket { category: string; count: number;
   /** Recorded basis: qty × the store's recorded average cost on the withdrawal's date. */
   recorded_value: number; recorded_unpriced: number;
-  /** null on the recorded basis. */
-  landed_value: number | null; mrp_value: number; recoverable: number; recovered: number; outstanding: number; }
+  /** null on the recorded basis, and for a non-admin on either basis (liquor-summary.ts LqSectionH). */
+  landed_value: number | null; mrp_value: number;
+  /** null for a non-admin when the bucket holds a withdrawal recovered AT LANDED
+   *  COST — that recoverable IS its frozen landed value (the admin-only master
+   *  for a brand never indented). Withheld whole, never shrunk. */
+  recoverable: number | null; recovered: number | null; outstanding: number | null;
+  /** How many landed-cost recoveries in this bucket are withheld from this viewer (0 for an admin). */
+  landed_recovery_withheld?: number; }
 /** §F — the card's total and share are ONE basis (owner decision 1). */
 interface SectionF { value_basis: ValueBasis; depot_net_indent: number; retail_spend: number; depot_recorded_value: number;
   total_recorded: number; total_landed: number | null; total: number; retail_share_pct: number | null;
   retail_share_pct_of_total: number | null; share_pct: number | null; retail_share_basis: string; pending: Pending; }
 /** §H — the card's value and % are ONE basis (owner decision 1). */
 interface SectionH { value_basis: ValueBasis; buckets: WdBucket[]; total_recorded_value: number; recorded_unpriced_count: number;
-  total_landed_value: number | null; total_value: number; total_outstanding: number; purchases_value: number;
+  total_landed_value: number | null;
+  /** null only for a non-admin on the LANDED basis (landed values are admin-only). */
+  total_value: number | null;
+  /** null for a non-admin when any withdrawal in range is recovered at landed cost. */
+  total_outstanding: number | null;
+  /** What is still owed on withdrawals recovered at MRP or a typed amount — shown to everyone. */
+  total_outstanding_shown?: number;
+  landed_recovery_withheld_count?: number;
+  /** false → every landed-derived figure is null for this viewer, and landed_figures_note says why. */
+  landed_figures_visible?: boolean; landed_figures_note?: string | null;
+  purchases_value: number;
   pct_of_purchases: number | null; pct_of_net_indent: number | null; pct: number | null; pct_basis: string; pending: Pending; }
 /** Owner decision 3 — near-duplicate vendor names, FLAGS ONLY. */
 interface VendorRef { name: string; source: 'vendor' | 'purchase' | 'store_bill' | 'wine_shop'; vendor_id: string | null; is_active: boolean | null; uses: number; }
@@ -267,6 +283,13 @@ export default function LiquorReconciliationPage() {
      TGBCL master is admin-only — liquor-summary.ts LqSectionG). Read off the
      payload, never off `me`: the server decides, the page only labels it. */
   const gWithheld = S.G.master_rates_visible === false;
+  /* §H: the same switch for the withdrawals' frozen LANDED values, and for every
+     recoverable that is one (liquor-summary.ts LqSectionH). Read off the
+     payload too. A server that predates the field sends no flag and nothing
+     null, so this stays false and the card renders exactly as before. */
+  const hWithheld = S.H.landed_figures_visible === false;
+  const hOutstandingHeld = S.H.total_outstanding == null;
+  const hHeldCount = S.H.landed_recovery_withheld_count ?? 0;
 
   return (
     <div className="p-4 sm:p-6 max-w-7xl mx-auto space-y-5">
@@ -516,7 +539,9 @@ export default function LiquorReconciliationPage() {
                           ? <span className="text-[#8B7355]">{r.priced === false ? 'unknown' : 'admin-only'}</span>
                           : inr(r.depot_landed_per_bottle, 2)}</td>
                         <td className="px-2 py-1.5 text-right tabular-nums text-amber-700">{r.excess_total == null
-                          ? <span className="text-[#8B7355]">—</span>
+                          ? (r.priced === false
+                            ? <span className="text-[#8B7355]" title="No depot rate on record — the excess was not computed">—</span>
+                            : <AdminOnly title="The excess re-derives the admin-only TGBCL master rate" />)
                           : inr(r.excess_total)}</td>
                         <td className="px-2 py-1.5 text-[#6B5744]">{REIMB_LABEL[r.reimbursement_status] || r.reimbursement_status}</td>
                       </tr>
@@ -555,9 +580,15 @@ export default function LiquorReconciliationPage() {
         </div>
         {/* The server withholds the master-derived figures from a non-admin
             (the TGBCL master is admin-only) and says so in its own sentence. */}
-        {S.G.master_rates_note && (
-          <p className="text-[11px] text-[#8B7355] mb-2">{S.G.master_rates_note}</p>
-        )}
+        {S.G.master_rates_note
+          ? <p className="text-[11px] text-[#8B7355] mb-2">{S.G.master_rates_note}</p>
+          : gWithheld && (
+            /* A server that withholds but sends no sentence: the cells still say why. */
+            <p className="text-[11px] text-[#8B7355] mb-2">
+              Master rate, Variance and Value read “admin-only”: the TGBCL master rate is admin-only, and each of those
+              figures gives it back. The arrow says which way the indent moved.
+            </p>
+          )}
         {S.G.moved_lines > 0 && (canMovement
           ? <ActLink href={MOVEMENT_HREF} text="Review each drift and accept a new rate into the master — Liquor Brand Map · Rate Movement" />
           : (
@@ -582,7 +613,7 @@ export default function LiquorReconciliationPage() {
                     <td className="px-2 py-1.5 text-right tabular-nums">{n2(r.bottles)}</td>
                     <td className="px-2 py-1.5 text-right tabular-nums">{inr(r.indentRate, 2)}</td>
                     <td className="px-2 py-1.5 text-right tabular-nums">{gWithheld && r.masterRate == null
-                      ? <span className="text-[#8B7355]" title="TGBCL master rates are admin-only">admin-only</span>
+                      ? <AdminOnly title="TGBCL master rates are admin-only" />
                       : inr(r.masterRate, 2)}</td>
                     <td className={`px-2 py-1.5 text-right tabular-nums ${(r.variance != null ? r.variance > 0 : r.direction === 'above_master') ? 'text-red-700' : 'text-emerald-700'}`}>
                       {r.variance != null ? inr(r.variance, 2)
@@ -590,7 +621,7 @@ export default function LiquorReconciliationPage() {
                           : r.direction === 'below_master' ? '↓ below master' : '—'}
                     </td>
                     <td className="px-2 py-1.5 text-right tabular-nums">{gWithheld && r.varianceValue == null
-                      ? <span className="text-[#8B7355]" title="Derived from the admin-only TGBCL master rate">admin-only</span>
+                      ? <AdminOnly title="Derived from the admin-only TGBCL master rate" />
                       : inr(r.varianceValue)}</td>
                   </tr>
                 ))}
@@ -604,11 +635,25 @@ export default function LiquorReconciliationPage() {
       <Panel icon={<PackageX className="w-4 h-4" />} title="H · Non-sale issues (withdrawals)" onCsv={() => downloadCsv('H')} pending={S.H.pending}>
         {/* ONE BASIS PER CARD (owner decision 1): value and % on the same basis. */}
         <div className="grid grid-cols-2 sm:grid-cols-3 gap-2.5 mb-3">
-          <Stat label={isLanded ? 'Total landed value (frozen at issue)' : 'Total value (recorded store cost)'} value={inr(S.H.total_value)} />
-          <Stat label={isLanded ? '% of Net Indent (landed ÷ landed)' : '% of purchases (recorded ÷ recorded)'} value={pct(S.H.pct)} />
-          <Stat label="Outstanding recoverable" value={inr(S.H.total_outstanding)} tone={S.H.total_outstanding > 0 ? 'warn' : 'muted'} />
+          <Stat label={isLanded ? 'Total landed value (frozen at issue)' : 'Total value (recorded store cost)'}
+                value={hWithheld && S.H.total_value == null ? 'admin-only' : inr(S.H.total_value)} />
+          <Stat label={isLanded ? '% of Net Indent (landed ÷ landed)' : '% of purchases (recorded ÷ recorded)'}
+                value={hWithheld && S.H.pct == null && isLanded ? 'admin-only' : pct(S.H.pct)} />
+          {/* A withheld total is not a smaller total: when any recovery in range
+              is at landed cost, a non-admin sees what is owed on the rest, and
+              how many recoveries are held back — never a sum read as the whole debt. */}
+          {hOutstandingHeld
+            ? <Stat label={`Outstanding — MRP / typed recoveries only${hHeldCount > 0 ? ` (+ ${hHeldCount} at landed cost, admin-only)` : ''}`}
+                    value={inr(S.H.total_outstanding_shown ?? null)} tone={(S.H.total_outstanding_shown ?? 0) > 0 || hHeldCount > 0 ? 'warn' : 'muted'} />
+            : <Stat label="Outstanding recoverable" value={inr(S.H.total_outstanding)} tone={(S.H.total_outstanding ?? 0) > 0 ? 'warn' : 'muted'} />}
         </div>
         {S.H.pct_basis && <p className="text-[11px] text-[#8B7355] mb-2">{S.H.pct_basis}</p>}
+        {/* The server's own sentence when the landed figures are withheld from
+            this viewer — printed once: the server may already end pct_basis
+            with it (liquor-summary.ts), and then it is not repeated. */}
+        {S.H.landed_figures_note && !(S.H.pct_basis || '').includes(S.H.landed_figures_note) && (
+          <p className="text-[11px] text-[#8B7355] mb-2">{S.H.landed_figures_note}</p>
+        )}
         {S.H.buckets.length > 0 && (
           <Scroll>
             <table className="w-full text-xs border-collapse">
@@ -622,13 +667,21 @@ export default function LiquorReconciliationPage() {
                     <td className="px-2 py-1.5 text-[#2D1B0E]">{b.category}</td>
                     <td className="px-2 py-1.5 text-right tabular-nums">{b.count}</td>
                     <td className="px-2 py-1.5 text-right tabular-nums">
-                      {isLanded ? inr(b.landed_value) : inr(b.recorded_value)}
+                      {isLanded
+                        ? (hWithheld && b.landed_value == null
+                          ? <AdminOnly title="The frozen landed value is admin-only — for a brand never indented it IS the TGBCL master per bottle" />
+                          : inr(b.landed_value))
+                        : inr(b.recorded_value)}
                       {!isLanded && b.recorded_unpriced > 0 && <span className="block text-[10px] text-amber-700">{b.recorded_unpriced} not priced</span>}
                     </td>
                     <td className="px-2 py-1.5 text-right tabular-nums">{inr(b.mrp_value)}</td>
-                    <td className="px-2 py-1.5 text-right tabular-nums">{inr(b.recoverable)}</td>
-                    <td className="px-2 py-1.5 text-right tabular-nums">{inr(b.recovered)}</td>
-                    <td className="px-2 py-1.5 text-right tabular-nums font-semibold">{inr(b.outstanding)}</td>
+                    {([b.recoverable, b.recovered, b.outstanding] as const).map((v, k) => (
+                      <td key={k} className={`px-2 py-1.5 text-right tabular-nums ${k === 2 ? 'font-semibold' : ''}`}>
+                        {v == null
+                          ? <AdminOnly title={`Holds ${b.landed_recovery_withheld || 'a'} withdrawal(s) recovered at landed cost — that recoverable IS the frozen landed value, which is admin-only`} />
+                          : inr(v)}
+                      </td>
+                    ))}
                   </tr>
                 ))}
               </tbody>
@@ -771,6 +824,12 @@ function CheckCard({ c }: { c: Check }) {
       )}
     </div>
   );
+}
+
+/** A figure the server withheld from this viewer — said as such, never as a bare
+ *  "—" (which reads as "no data") or ₹0. The tooltip says why. */
+function AdminOnly({ title }: { title: string }) {
+  return <span className="text-[#8B7355]" title={title} data-admin-only="1">admin-only</span>;
 }
 
 function ActLink({ href, text }: { href: string; text: string }) {

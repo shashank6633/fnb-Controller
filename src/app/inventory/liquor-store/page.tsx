@@ -2720,6 +2720,13 @@ function MigrateModal({ storeId, storeName, candidates, blockedCount, onClose, o
    owed it back (Summary §E). No central `purchases` row, no current_stock move,
    no price column. See src/lib/liquor-retail.ts for why it is shaped that way.
 
+   COST ONLY (owner ruling 39, 2026-10-14). A buy dated on or before a saved
+   closing count of the same item whose variance is pending or applied writes
+   NO ledger row — the count already holds those bottles — and is kept on the
+   register for its money alone (still 201; ledger_id null, stock_booked false,
+   stock_refused names the count). The receipt and the flash read that off the
+   reply (wineShopStockAdded) and never say "added" for it.
+
    FOUR THINGS THIS FORM MUST NOT GET WRONG — all decided in that library, not
    here, and all enforced again server-side:
      · 'Reimbursed' is NOT offered. That state means "a real petty-cash payout
@@ -3079,6 +3086,18 @@ function WineShopModal({ materials, onClose, onSaved, onRefresh }: {
         liquor store&apos;s own ledger as one <b>Inward</b>{' '}row, so on-hand, withdrawals and
         closing counts see it. It is <b>not</b>{' '}a TGBCL indent: the depot record the excess is
         measured against is left alone.
+      </p>
+      {/* OWNER RULING 39 (2026-10-14), said BEFORE saving, not only on the
+          receipt: a buy dated on or before a saved closing count of the same
+          item (its variance pending or applied) books NO stock — that count
+          already found these bottles on the shelf — and is kept as COST ONLY.
+          The same rule the withdrawal form follows (count_pending /
+          count_applied). Whether a count exists, and what it found, is the
+          server's to say (blind counts), so nothing is pre-judged here. */}
+      <p className="text-[11px] text-[#8B7355] -mt-1" data-retail-rule="cost-only">
+        <b>Already counted?</b>{' '}If a closing count of this item has been saved for the buy&apos;s
+        date or later, the count already includes these bottles: the buy is recorded for its
+        <b> cost only</b>{' '}and adds no stock. The receipt says which count.
       </p>
       {/* WHAT THIS FORM PROMISES ABOUT VALUATION — owner decision 1: the retail
           price is ANALYTICS ONLY. It is now true by construction, so it is
