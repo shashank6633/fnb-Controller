@@ -176,6 +176,83 @@ export function fssaiNotYetWords(startsOn: string): string {
   return `Not yet in force (from ${startsOn})`;
 }
 
+/**
+ * SUPERSEDED, BUT STILL THE PAPER IN FORCE (owner ruling 2026-10-15: a paper is
+ * in force only from its valid_from date). The Documents screen's Renew retires
+ * the old paper (is_active = 0) the moment the renewal is FILED — but a renewal
+ * filed early is not in force until its valid_from, so until then the paper in
+ * force is the OLD one. Dropping it left "no licence is in force", which is
+ * false.
+ *
+ * Returns the ids of the superseded papers that still count today: every live
+ * renewal after it in its chain (supersedes_id, walked down) is NOT YET IN FORCE
+ * (fssaiPaperStartsOn — the one test). Each reader that keeps "is_active = 1"
+ * (the audit file's papers, Inspection Mode's documents, the food-handler
+ * coverage) keeps these too, and judges each exactly like a current paper: by
+ * its own dates and its own scans, until its own expiry. The day a renewal's
+ * valid_from arrives — or a renewal carries none — it is in force, and the
+ * superseded paper stops counting. A renewal that was voided or is a draft is
+ * not a renewal on file: it neither starts nor keeps the old one counting (a
+ * superseded paper with no live renewal stays out, as before). The superseded
+ * row's OWN liveness (voided / void / draft) is left to each reader's WHERE.
+ * Never throws: [] leaves every superseded paper out, as before.
+ */
+export function fssaiSupersededStillInForce(db: Database.Database, today: string): string[] {
+  try {
+    const rows = db.prepare(
+      `SELECT nx.id AS id, nx.supersedes_id AS prev_id, nx.valid_from AS valid_from,
+              CASE WHEN nx.voided_at = '' AND nx.status NOT IN ('void','draft') THEN 1 ELSE 0 END AS live,
+              p.is_active AS prev_active
+         FROM fssai_documents nx
+         JOIN fssai_documents p ON p.id = nx.supersedes_id
+        WHERE nx.supersedes_id <> ''`,
+    ).all() as any[];
+    const next = new Map<string, { id: string; live: boolean; pending: boolean }[]>();
+    const retired = new Set<string>();
+    for (const r of rows) {
+      const prev = s(r.prev_id);
+      const l = next.get(prev) || [];
+      l.push({ id: s(r.id), live: Number(r.live) === 1, pending: !!fssaiPaperStartsOn(r.valid_from, today) });
+      next.set(prev, l);
+      if (Number(r.prev_active) === 0) retired.add(prev);
+    }
+    const out: string[] = [];
+    for (const id of retired) {
+      // Every renewal after it, bounded (the documents route bounds its chain
+      // walk too: a column with no FK is a loop waiting to happen).
+      const seen = new Set<string>([id]);
+      const queue = [id];
+      let live = 0;
+      let started = false;
+      while (queue.length && seen.size <= 50 && !started) {
+        for (const n of next.get(queue.shift()!) || []) {
+          if (seen.has(n.id)) continue;
+          seen.add(n.id);
+          queue.push(n.id);
+          if (!n.live) continue;
+          live++;
+          if (!n.pending) started = true;
+        }
+      }
+      if (live > 0 && !started) out.push(id);
+    }
+    return out;
+  } catch (e: any) {
+    console.error('[fssai] superseded papers still in force could not be read:', e?.message || e);
+    return [];
+  }
+}
+
+/**
+ * SQL for "a current paper, or a superseded one still in force today"
+ * (fssaiSupersededStillInForce) on fssai_documents alias `a`, with its params.
+ */
+export function fssaiDocCountsSql(a: string, stillInForce: string[]): { sql: string; args: string[] } {
+  return stillInForce.length
+    ? { sql: `(${a}.is_active = 1 OR ${a}.id IN (${stillInForce.map(() => '?').join(',')}))`, args: stillInForce }
+    : { sql: `${a}.is_active = 1`, args: [] };
+}
+
 export function fssaiHandlerVerdictMeta(v: string | null | undefined): FssaiStatusMeta {
   return FSSAI_HANDLER_VERDICTS.find((x) => x.key === v) || { key: String(v || ''), label: String(v || ''), color: 'bg-gray-100 text-gray-600 border-gray-200' };
 }
@@ -521,8 +598,10 @@ function judgeRequirement(
  * Read-only. Never throws for a missing table: `available: false` says so.
  * A person's certificate is matched by fssai_documents.handler_id first, then —
  * only for a row whose handler_id is '' — by person_email (Q18 fallback).
- * Superseded (is_active = 0) and voided documents never count. A scan counts as a
- * copy only if it is still readable and NOT voided.
+ * Voided documents never count. A superseded one (is_active = 0) counts only
+ * while every renewal after it is still not yet in force — it is then the
+ * certificate in force (fssaiSupersededStillInForce); otherwise never. A scan
+ * counts as a copy only if it is still readable and NOT voided.
  */
 export function readFssaiFoodHandlerCoverage(db: Database.Database, opts: FssaiHandlerCoverageOptions): FssaiHandlerCoverage {
   const today = opts.today;
@@ -563,11 +642,14 @@ export function readFssaiFoodHandlerCoverage(db: Database.Database, opts: FssaiH
   const byEmail = new Map<string, string>();
   for (const r of keyRows) if (s(r.em)) byEmail.set(s(r.em), s(r.id));
 
-  /* Certificates: live, current versions of the three person types. The copy
-   * count excludes voided files and blanked images — a voided scan is kept as
-   * evidence of the mistake, never as a copy of the certificate. */
+  /* Certificates: live, current versions of the three person types — and a
+   * superseded one whose renewal is not yet in force, which is the certificate
+   * in force today (fssaiSupersededStillInForce). The copy count excludes voided
+   * files and blanked images — a voided scan is kept as evidence of the mistake,
+   * never as a copy of the certificate. */
   const hasAttStatus = !!db.prepare(`SELECT 1 FROM pragma_table_xinfo('fssai_attachments') WHERE name = 'status'`).get();
   const types = [...FSSAI_HANDLER_DOC_TYPES];
+  const counts = fssaiDocCountsSql('d', fssaiSupersededStillInForce(db, today));
   const docs = db.prepare(
     `SELECT d.id, d.doc_type, d.title, d.reference_no, d.issued_on, d.valid_from, d.expiry_date, d.reminder_days,
             d.handler_id, lower(d.person_email) AS person_email,
@@ -576,8 +658,8 @@ export function readFssaiFoodHandlerCoverage(db: Database.Database, opts: FssaiH
                 ${hasAttStatus ? `AND a.status <> 'void'` : ''}) AS copies
        FROM fssai_documents d
       WHERE d.doc_type IN (${types.map(() => '?').join(',')})
-        AND d.is_active = 1 AND d.voided_at = '' AND d.status <> 'void'`,
-  ).all(...types) as any[];
+        AND ${counts.sql} AND d.voided_at = '' AND d.status <> 'void'`,
+  ).all(...types, ...counts.args) as any[];
 
   const evidenceBy = new Map<string, FssaiHandlerEvidence[]>();
   const push = (hid: string, e: FssaiHandlerEvidence) => {
@@ -726,7 +808,8 @@ export function readFssaiFoodHandlerCoverage(db: Database.Database, opts: FssaiH
       'one dated to start on a day still to come (a renewal filed early) is Not yet in force, and the person is judged on what is in force today. ' +
       'A medical or FoSTaC certificate with no expiry date is ' +
       'not in order (nobody can say it still counts); a training record with no expiry is. HRMS training completions count ' +
-      'when an HRMS training is mapped on this screen. Voided and superseded certificates, and voided scans, never count. ' +
+      'when an HRMS training is mapped on this screen. Voided certificates and voided scans never count, nor does a superseded ' +
+      'certificate once its renewal is in force (until then it is the one in force). ' +
       `At least one certified FoSTaC supervisor is needed for every ${FSSAI_FOSTAC_HANDLERS_PER_SUPERVISOR} food handlers.`,
   };
 }

@@ -4,7 +4,7 @@ import { getCurrentOutletId, isManagement } from '@/lib/auth';
 import { addDaysISO, fssaiDocType, fssaiToday, fssaiTempLogKindLabel } from '@/lib/fssai';
 import { requireFssaiUser, fssaiCsrfGuard, fssaiAuditBestEffort, fssaiAppAudit, str } from '@/lib/fssai-server';
 import { businessName, fssaiTablesPresent, intOr, numOrBlank } from '../_p9/lib';
-import { fssaiDocumentHolders, readFssaiFoodHandlerCoverage } from '@/lib/fssai-food-handlers';
+import { fssaiDocCountsSql, fssaiDocumentHolders, fssaiSupersededStillInForce, readFssaiFoodHandlerCoverage } from '@/lib/fssai-food-handlers';
 import { fssaiReadingScheduleValue, fssaiTempMinutesWords, fssaiTempVerdictWord } from '../_p4/lib';
 import { readPestChemicals } from '../pest/_pest/chemicals';
 import { readPestMonitoringSheet } from '../pest/_pest/monitoring';
@@ -163,9 +163,13 @@ export async function GET(request: Request) {
     } else {
       try {
         const hasHandler = !!db.prepare(`SELECT 1 FROM pragma_table_xinfo('fssai_documents') WHERE name = 'handler_id'`).get();
-        // Live, current versions only — a voided or superseded paper is not on
-        // file — and every live copy counted the audit file's way: a voided
+        // Live, current versions only — a voided paper is not on file, nor is a
+        // superseded one once its renewal is in force; until the renewal's
+        // valid_from the superseded paper IS the one in force (owner ruling
+        // 2026-10-15, fssaiSupersededStillInForce — the audit file reads the
+        // same set) — and every live copy counted the audit file's way: a voided
         // scan (kept, with its reason) is never a copy, nor a blanked image.
+        const counts = fssaiDocCountsSql('d', fssaiSupersededStillInForce(db, today));
         const rows = db.prepare(
           `SELECT d.id, d.doc_code, d.doc_type, d.title, d.reference_no, d.issuer, d.issued_on, d.valid_from,
                   d.expiry_date, d.reminder_days, d.person_email, d.vendor_id, d.equipment_id, d.created_at,
@@ -177,9 +181,9 @@ export async function GET(request: Request) {
                          AND a.data_uri <> '' AND a.status <> 'void' AND a.voided_at = '')`
                     : '0'} AS copies
              FROM fssai_documents d
-            WHERE d.voided_at = '' AND d.status NOT IN ('void','draft') AND d.is_active = 1
+            WHERE d.voided_at = '' AND d.status NOT IN ('void','draft') AND ${counts.sql}
             ORDER BY (CASE WHEN d.expiry_date = '' THEN 1 ELSE 0 END) ASC, d.expiry_date ASC`,
-        ).all() as any[];
+        ).all(...counts.args) as any[];
         // WHOSE certificate — the food-handler register first (a cook with no
         // login has a name only there), then the login. Person scope only.
         const holders = fssaiDocumentHolders(db, rows

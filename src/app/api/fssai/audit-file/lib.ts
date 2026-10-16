@@ -5,7 +5,8 @@ import {
   FSSAI_DOC_REMINDER_DAYS, type FssaiDocState,
 } from '@/lib/fssai';
 import {
-  FSSAI_HANDLER_REQUIREMENTS, fssaiDocumentHolders, fssaiNotYetWords, fssaiPaperStartsOn, readFssaiFoodHandlerCoverage,
+  FSSAI_HANDLER_REQUIREMENTS, fssaiDocCountsSql, fssaiDocumentHolders, fssaiNotYetWords, fssaiPaperStartsOn,
+  fssaiSupersededStillInForce, readFssaiFoodHandlerCoverage,
   type FssaiFoodHandlerWithCoverage, type FssaiHandlerCoverage, type FssaiHandlerRequirementKey,
 } from '@/lib/fssai-food-handlers';
 import {
@@ -960,6 +961,12 @@ function closureScan(f: FssaiClosureFile, recordLabel: string): AuditFileScan {
 function readDocs(ctx: Ctx, types: string[]): DocRow[] {
   const { db, today } = ctx;
   const hasHandler = !!db.prepare(`SELECT 1 FROM pragma_table_xinfo('fssai_documents') WHERE name = 'handler_id'`).get();
+  // Current papers — and a superseded one whose renewal (the Documents screen's
+  // Renew) is NOT YET in force: until the renewal's valid_from that is the paper
+  // in force (owner ruling 2026-10-15), judged below exactly like a current one,
+  // by its own dates and its own scans. The renewal itself is read too and is
+  // "Not yet in force (from <date>)", as when the two were filed side by side.
+  const counts = fssaiDocCountsSql('d', fssaiSupersededStillInForce(db, today));
   const rows = db.prepare(
     `SELECT d.id, d.doc_type, d.title, d.reference_no, d.issuer, d.issued_on, d.valid_from, d.expiry_date,
             d.reminder_days, d.vendor_id, d.person_email, d.equipment_id, d.created_at,
@@ -969,9 +976,9 @@ function readDocs(ctx: Ctx, types: string[]): DocRow[] {
             ${ctx.present.has('fssai_equipment') ? `(SELECT e.name FROM fssai_equipment e WHERE e.id = d.equipment_id)` : `''`} AS equipment_name
        FROM fssai_documents d
       WHERE d.doc_type IN (${types.map(() => '?').join(',')})
-        AND d.is_active = 1 AND ${LIVE('d')}
+        AND ${counts.sql} AND ${LIVE('d')}
       ORDER BY (CASE WHEN d.expiry_date = '' THEN 1 ELSE 0 END) ASC, d.expiry_date DESC, d.created_at DESC`,
-  ).all(...types) as any[];
+  ).all(...types, ...counts.args) as any[];
 
   const docs: DocRow[] = rows.map((r) => {
     const reminder = Number.isFinite(Number(r.reminder_days)) ? Number(r.reminder_days) : FSSAI_DOC_REMINDER_DAYS;
@@ -1687,7 +1694,7 @@ function handlerRecord(ctx: Ctx, key: 'medical' | 'training'): Part {
       : 'and needs food-safety training on file (a FoSTaC certificate counts; an in-house record need not expire). The FoSTaC supervisor needs a FoSTaC certificate in force: ' +
         'at least one certified supervisor for every 25 food handlers. ') +
     'PRESENT when every one is in order; EXPIRING when one falls inside its renewal window; MISSING when anyone has none, it has lapsed or no copy is attached — the record names them. ' +
-    'Voided and superseded certificates, and voided scans, never count.';
+    'Voided certificates and voided scans never count, nor does a superseded certificate once its renewal is in force (until then it is the one in force).';
   const miss = absent(ctx.present, ['fssai_documents', 'fssai_food_handlers']);
   if (miss.length) { p.problems = [NOT_IN_DB(miss)]; p.todo = todo; return p; }
 
