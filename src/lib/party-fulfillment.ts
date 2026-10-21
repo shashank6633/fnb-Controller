@@ -2,6 +2,7 @@ import type Database from 'better-sqlite3';
 import { generateId, logAuditEvent } from '@/lib/db';
 import {
   assertCentralIssue, recordPartyShelfTake, stampShelfClose, centralShelfEmpty, markLedgerShelfClose,
+  lineFactor,
 } from '@/lib/issue-stock';
 // THE MOVEMENT RECORD (owner's eight fields, 2026-09-10). This module writes
 // BOTH rails with its own raw INSERTs — it maintains the department_materials
@@ -67,10 +68,10 @@ export interface PartyShelfRecord {
  * both already catch it and answer 400 with the storekeeper-phrased message
  * (store-issue/route.ts:971, store-process/route.ts:1307), so the whole gesture
  * unwinds and the requisition is left exactly as it was. It must be
- * all-or-nothing rather than a partial transfer, because the idempotency guard
- * below is per-REQUISITION: one line's party row makes the whole requisition
- * read as already-transferred, so a quietly short line could never be completed
- * later. The UNATTENDED third route (the PO-receipt / GRN-QC cascade in
+ * all-or-nothing rather than a partial transfer: a quietly short line would
+ * leave the line recording goods the books never moved. (Round 9: a later call
+ * now moves what each line holds above what already moved — see "A SECOND CALL
+ * MOVES ONLY WHAT HAS NOT MOVED" below — but a refusal is still whole.) The UNATTENDED third route (the PO-receipt / GRN-QC cascade in
  * po-requisition-fulfil.ts) deliberately does the opposite — see the judgement
  * recorded there.
  *
@@ -87,9 +88,12 @@ export interface PartyShelfRecord {
  * return 1 on the other 3 — which are exactly the blank-unit packed lines the
  * two now REFUSE rather than guess (see the carve-outs below).
  *
- * The party transfer inventory_transactions row is the single source of truth
- * for de-duplication: if one already exists for this requisition, the transfer
- * has already happened and this is a no-op. That makes the helper safe to call
+ * The party transfer inventory_transactions rows are the single source of
+ * truth for de-duplication: what they already moved for a line's material is
+ * never moved again. Until round 9 ONE such row made the whole call a no-op;
+ * now a call moves only what each line holds above what its rows already moved
+ * (a top-up after a short /store-process submit), and a call with nothing left
+ * to move is the same no-op it always was. That keeps the helper safe to call
  * from BOTH fulfilment paths (store-process batch + store-issue incremental)
  * without any risk of double-deduction. The probe matches BOTH the current
  * 'party_issue' and the legacy 'party_consumption' — see the guard below.
@@ -123,9 +127,22 @@ export interface PartyShelfRecord {
  * (recordPartyShelfTake), and the gesture is named on one audit row,
  * 'requisition.party_transfer.shelf'. An ordinary transfer writes neither.
  *
+ * ── A REFUSAL WORDED FOR THE BOX THAT ASKED (round 9) ───────────────────────
+ * The decision below never changes: the transfer moves each line's WHOLE
+ * quantity_issued, from 0. But /store-issue's box ADDS to what a line already
+ * holds, so a refusal whose cap was "Issue 14.842 kg or less on this line" —
+ * the cap on the whole line — sent the store desk to add 14.842 kg to a line
+ * already holding 14.842 kg, and be refused again "so 29.684 kg cannot be
+ * issued" (round-8 verifier, sd_party_tail). `opts.deskBeforeLineQty` is each
+ * line's quantity_issued before the gesture, as that box sees it; the floor
+ * then words the refusal and returns its cap for a box that adds to it
+ * (checkCentralIssue's deskBeforeLineQty / maxAddLineQty). /store-process, whose
+ * box IS the line's absolute figure, passes nothing and is byte-identical.
+ *
  * @param db         open better-sqlite3 database
  * @param reqId      requisition id
  * @param actorEmail the store person performing the fulfilment (stamped on dept ledger)
+ * @param opts       deskBeforeLineQty: requisition_items.id → quantity_issued before this gesture (/store-issue only)
  * @returns { transferred: Array<{material_id, issued, department_id}>, total, recorded } — issued in RECIPE
  *          units; `recorded` lists the lines whose quantity_issued was corrected to what left the shelf.
  */
@@ -133,6 +150,7 @@ export function applyPartyFulfillment(
   db: Database.Database,
   reqId: string,
   actorEmail: string,
+  opts?: { deskBeforeLineQty?: ReadonlyMap<string, number> },
 ): {
   transferred: Array<{ material_id: string; issued: number; department_id: string | null }>;
   total: number;
@@ -162,6 +180,15 @@ export function applyPartyFulfillment(
     SELECT 1 FROM inventory_transactions
     WHERE reference_id = ? AND type IN (${PARTY_TRANSFER_TYPES_SQL})
     LIMIT 1
+  `);
+  // WHAT ALREADY LEFT THE SHELF, per material (round 9 — the top-up, see
+  // "A SECOND CALL MOVES ONLY WHAT HAS NOT MOVED" below). RECIPE units, the
+  // sign flipped (the rows are debits). Same two type names as the guard.
+  const selMovedByMat = db.prepare(`
+    SELECT material_id, COALESCE(SUM(-quantity), 0) AS moved
+      FROM inventory_transactions
+     WHERE reference_id = ? AND type IN (${PARTY_TRANSFER_TYPES_SQL})
+     GROUP BY material_id
   `);
 
   // Also read INSIDE the transaction. quantity_issued is what this helper
@@ -218,17 +245,46 @@ export function applyPartyFulfillment(
     // THE GUARD, UNDER THE WRITE LOCK. Everything this function decides — has
     // the transfer already happened, and for how much — is read here, after
     // BEGIN IMMEDIATE has excluded every other writer.
-    const already = selAlready.get(reqId);
-    if (already) {
-      console.log(`[party-fulfillment] requisition ${reqId} already transferred — skip`);
-      return false;
-    }
+    const already = !!selAlready.get(reqId);
     const items = selItems.all(reqId) as any[];
+    // ── A SECOND CALL MOVES ONLY WHAT HAS NOT MOVED (round 9) ───────────────
+    // This guard used to end the function: one party row on the requisition
+    // and every later call skipped. That was the whole idempotency story, and
+    // it was right only while the transfer ran once, at the end. It does not:
+    // /store-process runs it on every submit that raises no PO, short lines
+    // included, so a 20 kg line processed at 14.842 kg moved 14,842.4 g — and
+    // when the store desk later issued the 5.158 kg tail, the requisition
+    // closed as fulfilled with 20 kg recorded, no stock check, and not a gram
+    // more moved ("already transferred — skip"), over a shelf at 0 (round-9
+    // verifier, party-tail pt_short; pt_plenty recorded 20 kg over 10,000 g
+    // moved). The store gave, on paper, what the books said it did not hold.
+    //
+    // So the guard now says HOW MUCH already moved, not merely that something
+    // did, and each line asks the floor only for what it holds above that:
+    // beforeLineQty = the part already moved (line units), afterLineQty = the
+    // line as it stands. The same floor, the same shown-figure rule, the same
+    // all-or-nothing refusal, the same department credit — on the remainder.
+    // A repeat call with nothing left to move is a no-op exactly as before
+    // (not one row written), so the double-deduction guarantee stands: what
+    // moved is never moved again. The moved figure is per MATERIAL on the
+    // party rows (reference_id + material_id), handed to the requisition's
+    // lines of that material in the order this loop walks them — the order
+    // the first run moved them in. Two lines of one material cannot be saved
+    // today (duplicateLineError), so in practice each material is one line.
+    // Measured: the live book has 2 party requisitions, both 'submitted', and
+    // 0 party transfer rows — this changes nothing that exists.
+    const movedLeft = new Map<string, number>();
+    if (already) {
+      for (const row of selMovedByMat.all(reqId) as any[]) {
+        movedLeft.set(String(row.material_id), Math.max(0, Number(row.moved) || 0));
+      }
+    }
+    let topUpLines = 0;
     // Lines this transfer DECLINED to move, for the audit row below. A declined
     // line leaves no other trace: unlike applyIssueDelta, this rail writes no
     // requisition_issue_ledger row, so without that row the skip would be
-    // invisible — and the per-requisition guard above means it can never be
-    // picked up on a later call either.
+    // invisible. (A later call — a top-up, round 9 — meets the same carve-out
+    // and declines the line again, on its own audit row.)
     const declined: Array<{
       req_item_id: string; material_id: string; material_name: string;
       reason: string; requested_line_qty: number; line_unit: string;
@@ -242,6 +298,28 @@ export function applyPartyFulfillment(
       const issuedReq = Number(it.quantity_issued) || 0; // in ri.unit
       if (issuedReq <= 0) continue;
       const prior = takenBy.get(String(it.material_id));
+      // What this line already moved (top-up only; 0 on a first run), in the
+      // line's unit through the floor's own factor. Nothing left above it — a
+      // line moved in full before, or lowered since — and the line is skipped
+      // outright: no floor call, no decline row, no write.
+      let movedLine = 0;
+      if (already) {
+        const mat = String(it.material_id);
+        const pool = movedLeft.get(mat) || 0;
+        const { factor } = lineFactor(it.req_unit, it);
+        const lineRecipe = Math.round(issuedReq * (factor || 1) * 1e6) / 1e6;
+        const movedRecipe = Math.min(pool, lineRecipe);
+        movedLeft.set(mat, Math.max(0, pool - movedRecipe));
+        if (Math.round((lineRecipe - movedRecipe) * 1e6) <= 0) continue;
+        movedLine = movedRecipe / (factor || 1);
+        topUpLines++;
+      }
+      // The desk's base is passed through only where it differs from the part
+      // already moved: when the box adds to exactly that (the ordinary top-up —
+      // the line holds what moved, and the gesture adds the tail), the floor's
+      // own before→after sentence and cap already speak for that box.
+      const deskIn = opts?.deskBeforeLineQty?.get(String(it.id));
+      const deskBase = movedLine > 0 && deskIn != null && Math.abs(deskIn - movedLine) <= 1e-9 ? undefined : deskIn;
 
       // THE FLOOR AND THE CONVERSION, FROM ONE CALL, INSIDE THIS TRANSACTION.
       //
@@ -264,13 +342,16 @@ export function applyPartyFulfillment(
       // unwound gesture left all 14,842.5 g on the shelf. The decision is the
       // same; the sentence now says the store holds 14.843 kg and all of it
       // goes to the line above.
+      //
+      // A TOP-UP (round 9) asks from the part already moved, not from 0.
       const c = assertCentralIssue(db, {
         reqItemId: String(it.id),
-        beforeLineQty: 0,
+        beforeLineQty: movedLine,
         afterLineQty: issuedReq,
         rail: 'party',
         siblingRecipe: prior?.recipe || 0,
         siblingLines: prior?.lines || 0,
+        deskBeforeLineQty: deskBase,
       });
 
       // THE OTHER TWO CARVE-OUTS, HONOURED — AND THEY GATE BOTH SIDES.
@@ -398,6 +479,12 @@ export function applyPartyFulfillment(
       }
 
       transferred.push({ material_id: it.material_id, issued, department_id: deptId });
+    }
+    if (already && topUpLines === 0) {
+      // A repeat call with nothing left above what already moved: the old skip,
+      // to the letter — not one row written.
+      console.log(`[party-fulfillment] requisition ${reqId} already transferred — skip`);
+      return false;
     }
 
     // WHAT THIS TRANSFER WOULD NOT MOVE, WHERE THE OWNER CAN SEE IT. Written

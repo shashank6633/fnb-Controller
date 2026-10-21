@@ -146,12 +146,13 @@ export async function GET(request: Request) {
     const { sql: visSql, params: visParams, me: visMe } = await visibilityFilter();
 
     if (id) {
-      // party_transferred (round 8b): has the one-shot party transfer already
-      // moved this requisition's goods? Both issue desks forecast a party
-      // gesture's take as the transfer (desk-rule.ts forecastDeskPartyTransfer),
-      // and once it has run it never runs again — a later issue moves nothing
-      // and is never refused — so a desk must not forecast a take (or a
-      // refusal) that cannot happen. Same probe as party-fulfillment.ts's guard.
+      // party_transferred (round 8b): has the party transfer already moved any
+      // of this requisition's goods? Both issue desks forecast a party
+      // gesture's take as the transfer (desk-rule.ts forecastDeskPartyTransfer).
+      // Since round 9 a later run moves only what the lines hold above what
+      // already moved (each item's party_moved_recipe, below), so the desks
+      // forecast THAT — a top-up can take, and can refuse. Same probe as
+      // party-fulfillment.ts's guard.
       const r = db.prepare(`
         SELECT r.*, d.name AS department_name, d.code AS department_code,
                po.po_number AS linked_po_number, po.status AS linked_po_status,
@@ -230,6 +231,26 @@ export async function GET(request: Request) {
         try { blocked = centralFlowBlock(db, String(it.material_id)) !== null; } catch { blocked = false; }
         it.central_flow_blocked = blocked ? 1 : 0;
       }
+      // party_moved_recipe (round 9): what the party transfer has ALREADY moved
+      // off the central shelf for this line's MATERIAL on this requisition,
+      // RECIPE units. The transfer is no longer one-shot — a later call moves
+      // what a line holds above this (party-fulfillment.ts, "A SECOND CALL
+      // MOVES ONLY WHAT HAS NOT MOVED") — so a desk forecasting it needs the
+      // figure, not just the yes/no of party_transferred. Per material, as the
+      // transfer reads it (its party rows summed by material_id); the desk
+      // hands it to that material's lines exactly as the transfer does
+      // (desk-rule.ts forecastDeskPartyTransfer). One line per material in
+      // practice — duplicateLineError refuses a second. 0 until a transfer runs.
+      const movedPool = new Map<string, number>();
+      if (Number(r.party_transferred || 0)) {
+        for (const row of db.prepare(`
+          SELECT material_id, COALESCE(SUM(-quantity), 0) AS moved
+            FROM inventory_transactions
+           WHERE reference_id = ? AND type IN (${PARTY_TRANSFER_TYPES_SQL})
+           GROUP BY material_id
+        `).all(id) as any[]) movedPool.set(String(row.material_id), Math.max(0, Number(row.moved) || 0));
+      }
+      for (const it of items) it.party_moved_recipe = movedPool.get(String(it.material_id)) || 0;
       // Approve permission for the detail view: any HOD (is_head_chef) or admin —
       // matching the chef-approve/reject API (canApproveAsChef) — OR this req's
       // main-dept head. (UI was gating only on dept-head, so is_head_chef HODs saw

@@ -27,7 +27,7 @@
 import Database from 'better-sqlite3';
 import { planCentralDebit, shownWithStep } from '../src/lib/central-debit-clamp';
 import {
-  lineIssueComplete, checkCentralIssue, stampShelfClose, centralShelfEmpty,
+  lineIssueComplete, checkCentralIssue, stampShelfClose, centralShelfEmpty, lineFactor,
 } from '../src/lib/issue-stock';
 import { packFactor, shownPurchaseQty, toPurchaseQty, type PackMeta } from '../src/lib/pack-units';
 import {
@@ -240,7 +240,7 @@ const pSelRow = pdb.prepare(`
   SELECT ri.id, ri.quantity_issued, ri.chef_approved_qty, ri.quantity_requested, ri.shelf_emptied_qty,
          ri.deferred_until, ri.unit AS line_unit, rm.unit, rm.purchase_unit, rm.pack_size, ri.material_id
     FROM requisition_items ri JOIN raw_materials rm ON rm.id = ri.material_id WHERE ri.req_id = ? ORDER BY ri.rowid`);
-let partyCases = 0, partyCertain = 0, partyCloses = 0, partyRefused = 0;
+let partyCases = 0, partyCertain = 0, partyCloses = 0, partyRefused = 0, partyTopUps = 0;
 const pMats = MATS.filter(m => ['g-kg', 'kg-kg', 'ml-btl', 'ml-can', 'pcs'].includes(m.id));
 for (const m of pMats) {
   const meta = metaOf(m);
@@ -259,10 +259,17 @@ for (const m of pMats) {
         for (const before of [0, r6(approved * 0.4), shownLine]) {
           for (const delta of [approved - before, shownLine - before, r6(shelf / factor) - before, step, r6((approved - before) * 0.5)]) {
             if (!(delta > 0)) continue;
+            // ROUND 9 — THE TOP-UP: 'moved' = a short /store-process submit
+            // already transferred what line A held (`before`) off the shelf
+            // (the shelf here is what is LEFT after it); the transfer then moves
+            // only what A holds above that. 'none' = nothing moved yet.
+            for (const movedKind of (before > 0 ? ['none', 'moved'] : ['none']) as Array<'none' | 'moved'>) {
+            const movedRecipeA = movedKind === 'moved' ? r6(before * factor) : 0;
             for (const second of ['none', 'done', 'open', 'sameMat'] as const) {
               for (const deferred of [false, true]) {
                 partyCases++;
-                const rid = `P|${m.id}|${lu}|${aPU}|${shelf}|${before}|${delta}|${second}|${deferred}`;
+                if (movedKind === 'moved') partyTopUps++;
+                const rid = `P|${m.id}|${lu}|${aPU}|${shelf}|${before}|${delta}|${movedKind}|${second}|${deferred}`;
                 pdb.prepare('DELETE FROM requisition_items').run();
                 pdb.prepare('DELETE FROM raw_materials').run();
                 pdb.prepare('DELETE FROM requisitions').run();
@@ -275,16 +282,21 @@ for (const m of pMats) {
                 if (second === 'open') ins.run('B', rid, 'other', 'kg', 2, 2, 0, null, null);
                 if (second === 'sameMat') ins.run('B', rid, m.id, lu, approved, approved, approved, null, null);
                 // THE DESK, before the gesture.
+                // The party rows' per-material sum, as api/requisitions ships it
+                // (party_moved_recipe) and as the transfer reads it.
+                const movedPool = new Map<string, number>(movedRecipeA > 0 ? [[m.id, movedRecipeA]] : []);
                 const deskLines = (pSelRow.all(rid) as any[]).map(r => ({
                   id: r.id, material_id: r.material_id, quantity_issued: r.quantity_issued,
                   current_stock: (pdb.prepare('SELECT current_stock c FROM raw_materials WHERE id=?').get(r.material_id) as any).c,
                   shelf_emptied_qty: r.shelf_emptied_qty, deferred_until: r.deferred_until,
                   unit: r.line_unit, material_unit: r.unit, material_purchase_unit: r.purchase_unit, material_pack_size: r.pack_size,
                   approved: Number(r.chef_approved_qty),
+                  party_moved_recipe: movedPool.get(String(r.material_id)) || 0,
                 }));
                 const desk = forecastDeskPartyTransfer({
                   lines: deskLines, approvedOf: l => (l as any).approved, rejectedOf: () => false,
                   after: new Map([['A', before + delta]]),
+                  transferred: movedPool.size > 0,
                 });
                 // THE SERVER: the issue entry (party: no stock), then the gate.
                 pdb.prepare('UPDATE requisition_items SET quantity_issued = ? WHERE id = ?').run(before + delta, 'A');
@@ -295,11 +307,27 @@ for (const m of pMats) {
                 if (lineIssueComplete(rows().find(r => r.id === 'A'))) {
                   pdb.prepare('UPDATE requisition_items SET deferred_until = NULL WHERE id = ?').run('A');
                 }
+                // applyPartyFulfillment's loop, top-up included (round 9): the
+                // per-material moved pool handed to lines in walk order, a line
+                // with nothing above it skipped, the floor asked from it.
+                const movedLineOf = new Map<string, number>();
                 const transfer = () => {
+                  const left = new Map(movedPool);
                   for (const r of rows()) {
                     const qty = Number(r.quantity_issued) || 0;
                     if (!(qty > 0)) continue;
-                    const c = checkCentralIssue(pdb, { reqItemId: r.id, beforeLineQty: 0, afterLineQty: qty, rail: 'party' });
+                    let movedLine = 0;
+                    if (left.size > 0) {
+                      const { factor: f } = lineFactor(r.line_unit, r);
+                      const pool = left.get(String(r.material_id)) || 0;
+                      const lineRecipe = Math.round(qty * (f || 1) * 1e6) / 1e6;
+                      const mv = Math.min(pool, lineRecipe);
+                      left.set(String(r.material_id), Math.max(0, pool - mv));
+                      if (Math.round((lineRecipe - mv) * 1e6) <= 0) continue;
+                      movedLine = mv / (f || 1);
+                    }
+                    movedLineOf.set(r.id, movedLine);
+                    const c = checkCentralIssue(pdb, { reqItemId: r.id, beforeLineQty: movedLine, afterLineQty: qty, rail: 'party' });
                     if (!c.debits) continue;
                     if (!c.ok) throw new Error('short:' + r.id);
                     if (c.recordAfterLineQty !== qty) {
@@ -351,12 +379,25 @@ for (const m of pMats) {
                   if (s) {
                     const h = deskPartyHeadroom(before, s.capTotalLine, s.exactLeftLine);
                     if (h > 0) {
-                      const c = checkCentralIssue(pdb, { reqItemId: 'A', beforeLineQty: 0, afterLineQty: before + h, rail: 'party' });
+                      const c = checkCentralIssue(pdb, {
+                        reqItemId: 'A', beforeLineQty: movedRecipeA / factor, afterLineQty: before + h, rail: 'party',
+                      });
                       check('party-headroom', c.ok && c.debits, () => fmt({ rid, h, c: { ok: c.ok, debit: c.debitRecipe } }));
+                    }
+                    // The server's own cap on the refusal (its maxIssueLineQty,
+                    // from the part already moved) is the desk's capTotalLine.
+                    const sc = checkCentralIssue(pdb, {
+                      reqItemId: 'A', beforeLineQty: movedLineOf.get('A') ?? movedRecipeA / factor,
+                      afterLineQty: before + delta, rail: 'party',
+                    });
+                    if (!sc.ok) {
+                      check('party-cap', Math.abs(sc.maxIssueLineQty - s.capTotalLine) <= 1e-9,
+                        () => fmt({ rid, server: sc.maxIssueLineQty, desk: s.capTotalLine }));
                     }
                   }
                 }
               }
+            }
             }
           }
         }
@@ -368,7 +409,7 @@ for (const m of pMats) {
 console.log(`desk-rule: ${pass} checks passed, ${fails.length} failed`
   + ` (takes run on the server: ${takes}; the shelf rule changed the record on ${takesChanged};`
   + ` closed by the shelf arm ${takesShelf}; carve-outs / holds ${nulls};`
-  + ` party gestures ${partyCases}: transfer certain ${partyCertain}, closes ${partyCloses}, refused ${partyRefused})`);
+  + ` party gestures ${partyCases} (top-ups ${partyTopUps}): transfer certain ${partyCertain}, closes ${partyCloses}, refused ${partyRefused})`);
 if (fails.length) {
   for (const f of fails) console.log('  FAIL ' + f);
   process.exit(1);

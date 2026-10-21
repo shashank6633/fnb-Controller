@@ -267,10 +267,12 @@ const fmtNum = (n: number) => (Number(n) || 0).toLocaleString('en-IN');
  *  so a figure with three decimals or fewer prints exactly as it always did. */
 const fmtQty = (n: number) => (Math.round((Number(n) || 0) * 1e6) / 1e6 || 0)
   .toLocaleString('en-IN', { maximumFractionDigits: 6 });
-/** A purchase-unit restatement: fmtQty, except a sub-display crumb (|x| below
- *  0.001, carried by the server at its grid point — issue-log.ts shownPu) is
- *  printed at the precision that names it, never as "0" (round 8: the
- *  party-shelf correction "−0.5 g" read "= 0 kg"). */
+/** A purchase-unit restatement or a still-open figure: fmtQty, except a
+ *  sub-display crumb (|x| below 0.001, carried by the server at its grid point —
+ *  issue-log.ts shownPu — or, for a remainder THE RULE leaves open below the
+ *  6-dp grid, exactly) is printed at the precision that names it, never as "0"
+ *  (round 8: the party-shelf correction "−0.5 g" read "= 0 kg"; round 9: a PART
+ *  row must never read "still open 0"). */
 const fmtPuQty = (n: number) => {
   const v = Number(n) || 0;
   if (v === 0 || Math.abs(v) >= 0.001) return fmtQty(v);
@@ -725,7 +727,7 @@ function FulfilmentCell({ r }: { r: IssueLogRow }) {
           raised in — because that is the unit the store and the chef argue in. */}
       {openQty > 0 && (
         <span className="block text-[10px] text-amber-800 mt-0.5">
-          still open {fmtQty(openQty)} {r.unit || ''}
+          still open {fmtPuQty(openQty)} {r.unit || ''}
         </span>
       )}
       {r.effective_qty != null && r.issued_qty != null && (

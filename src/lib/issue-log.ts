@@ -2,7 +2,7 @@ import type DatabaseT from 'better-sqlite3';
 import { getDb } from './db';
 import { packFactor, shownPurchaseQty, type PackMeta } from './pack-units';
 import { lineFactor, lineShownAs } from './issue-stock';
-import { issuedCoversAsk, shelfMarkHolds, type ShownAs } from './central-debit-clamp';
+import { issuedCoversAsk, shelfMarkHolds, qtyGrid, type ShownAs } from './central-debit-clamp';
 import { resolvePurchaseLogRange } from './purchase-log';
 
 /**
@@ -801,16 +801,31 @@ function probeSchema(db: DatabaseT.Database): IssueLogSchema {
  * boundary cases). A remainder below a step with no mark (the shelf still held
  * stock) is PART, as the desks say. `shownAs` is the converter the caller
  * resolves for the row's basis; without one (an ambiguous unit) the first arm
- * stands alone. The EPS arm stays first, so a row this called FULL is still
- * FULL.
+ * stands alone.
+ *
+ * THE RULE ITSELF, IN THE LINE'S OWN UNIT, AND NOTHING BESIDE IT (round 9).
+ * The caller passes the LINE-unit figures — quantity_issued / the effective
+ * quantity on a REQUISITION or pre-ledger row; the ledger row's after_line_qty
+ * / effective_line_qty on an ISSUE row, before the snapshot factor — with the
+ * line's own converter (lineShownAs(line unit)), i.e. exactly the arguments
+ * lineIssueComplete hands issuedCoversAsk. Round 8 kept a local
+ * `issued + 1e-6 >= effective` arm ahead of the rule and judged ISSUE rows in
+ * recipe units on the recipe grid: 1,130 of 6,390 rows in the clamp-r9 rule
+ * sweep (harness clamp-r9/issue-log/rule-sweep.ts), every one a remainder
+ * between 1e-9 and 1e-6 of the line unit, read FULL here while THE RULE
+ * (1e-9 slack) leaves the line open on both desks. No line or ledger row of
+ * the live book sits in that band (measured on a copy: 32,931 Issue Log rows,
+ * every verdict and figure unchanged), so no historical verdict moves.
+ * OPEN is "nothing issued" on the house grid (qtyGrid), the rule's own `0 <
+ * issued`; a negative figure is still a reversal with no verdict.
  */
 function fulfilmentOf(
   issued: number, effective: number | null, shownAs?: ShownAs | null, shelfEmptied?: boolean,
 ): 'FULL' | 'PART' | 'OPEN' | null {
   if (effective === null || effective <= 0) return null;
   if (issued < -EPS) return null;
-  if (issued <= EPS) return 'OPEN';
-  return issued + EPS >= effective || issuedCoversAsk(issued, effective, shownAs, shelfEmptied) ? 'FULL' : 'PART';
+  if (issuedCoversAsk(issued, effective, shownAs, shelfEmptied)) return 'FULL';
+  return qtyGrid(issued) <= 0 ? 'OPEN' : 'PART';
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -933,7 +948,8 @@ function buildUnion(f: {
         COALESCE(rm.purchase_unit, '')                    AS rm_purchase_unit,
         COALESCE(rm.pack_size, 1)                         AS rm_pack_size,
         ''                                                AS line_unit,
-        NULL                                              AS shelf_mark
+        NULL                                              AS shelf_mark,
+        0                                                 AS seq
       FROM purchases p
       LEFT JOIN goods_receipt_notes g ON g.id = p.grn_id
       LEFT JOIN raw_materials rm ON rm.id = p.material_id
@@ -1008,7 +1024,8 @@ function buildUnion(f: {
         COALESCE(rm.purchase_unit, '')                    AS rm_purchase_unit,
         COALESCE(rm.pack_size, 1)                         AS rm_pack_size,
         COALESCE(NULLIF(TRIM(ri.unit), ''), '')           AS line_unit,
-        ${shelfRi}                                        AS shelf_mark
+        ${shelfRi}                                        AS shelf_mark,
+        0                                                 AS seq
       FROM requisition_items ri
       JOIN requisitions r ON r.id = ri.req_id
       LEFT JOIN raw_materials rm ON rm.id = ri.material_id
@@ -1091,7 +1108,12 @@ function buildUnion(f: {
         COALESCE(rm.purchase_unit, '')                    AS rm_purchase_unit,
         COALESCE(rm.pack_size, 1)                         AS rm_pack_size,
         COALESCE(l.line_unit, '')                         AS line_unit,
-        ${shelfLedger}                                    AS shelf_mark
+        ${shelfLedger}                                    AS shelf_mark,
+        -- WRITE ORDER within one second (round 9): a take and the party
+        -- transfer's correction row share created_at, and the random row id
+        -- was the only tie-break, so the correction could print ABOVE the take
+        -- it corrects. The ledger's rowid is the order the rows were written.
+        l.rowid                                           AS seq
       FROM requisition_issue_ledger l
       LEFT JOIN requisitions r ON r.id = l.req_id
       LEFT JOIN raw_materials rm ON rm.id = l.material_id
@@ -1172,7 +1194,8 @@ function buildUnion(f: {
         COALESCE(rm.purchase_unit, '')                    AS rm_purchase_unit,
         COALESCE(rm.pack_size, 1)                         AS rm_pack_size,
         COALESCE(NULLIF(TRIM(ri.unit), ''), '')           AS line_unit,
-        ${shelfRi}                                        AS shelf_mark
+        ${shelfRi}                                        AS shelf_mark,
+        0                                                 AS seq
       FROM requisition_items ri
       JOIN requisitions r ON r.id = ri.req_id
       LEFT JOIN raw_materials rm ON rm.id = ri.material_id
@@ -1369,7 +1392,8 @@ function buildUnion(f: {
         COALESCE(rm.purchase_unit, '')                    AS rm_purchase_unit,
         COALESCE(rm.pack_size, 1)                         AS rm_pack_size,
         ''                                                AS line_unit,
-        NULL                                              AS shelf_mark
+        NULL                                              AS shelf_mark,
+        0                                                 AS seq
       FROM inventory_transactions it
       LEFT JOIN raw_materials rm ON rm.id = it.material_id
       WHERE substr(it.created_at, 1, 10) >= ? AND substr(it.created_at, 1, 10) <= ?
@@ -1478,7 +1502,8 @@ function buildUnion(f: {
         COALESCE(rm.purchase_unit, '')                    AS rm_purchase_unit,
         COALESCE(rm.pack_size, 1)                         AS rm_pack_size,
         ''                                                AS line_unit,
-        NULL                                              AS shelf_mark
+        NULL                                              AS shelf_mark,
+        0                                                 AS seq
       FROM department_material_transactions dmt
       LEFT JOIN raw_materials rm ON rm.id = dmt.material_id
       LEFT JOIN departments d ON d.id = dmt.department_id
@@ -1562,7 +1587,8 @@ function buildUnion(f: {
         COALESCE(rm.purchase_unit, '')                    AS rm_purchase_unit,
         COALESCE(rm.pack_size, 1)                         AS rm_pack_size,
         ''                                                AS line_unit,
-        NULL                                              AS shelf_mark
+        NULL                                              AS shelf_mark,
+        0                                                 AS seq
       FROM consumption_skips cs
       LEFT JOIN raw_materials rm ON rm.id = cs.material_id
       WHERE COALESCE(cs.date, substr(cs.created_at, 1, 10)) >= ?
@@ -1728,7 +1754,10 @@ export function getIssueLog(
   // ── ROWS ──────────────────────────────────────────────────────────────────
   // Ordered so one material's chain reads as a chain: by day, then by the moment
   // within the day, then by link key so a requisition line's own issues and its
-  // remainder sit together, then by the stage's natural order in the flow.
+  // remainder sit together, then by the stage's natural order in the flow, then
+  // by write order (`seq`, the ledger rowid on an ISSUE row and 0 elsewhere), so
+  // two ledger rows of one gesture — a take and the party transfer's correction
+  // of it, written in the same second — read in the order they happened.
   // row_id is the final tie-break so the cap takes a deterministic prefix rather
   // than an arbitrary one.
   const raw = db.prepare(`
@@ -1737,6 +1766,7 @@ export function getIssueLog(
              at ASC,
              link_raw ASC,
              stage_rank ASC,
+             seq ASC,
              material COLLATE NOCASE ASC,
              row_id ASC
     LIMIT ?
@@ -1774,29 +1804,36 @@ export function getIssueLog(
     const issued = r.issued_qty === null || r.issued_qty === undefined
       ? null : r6(Number(r.issued_qty) * sf);
 
-    // THE DESKS' "ISSUED IN FULL", in this row's basis (see fulfilmentOf). An
-    // ISSUE row's figures are RECIPE units (restated through sf above), so its
-    // converter is the recipe-basis one; REQUISITION and pre-ledger rows are in
-    // the LINE's unit and use the line's — lineShownAs, the very converter
-    // lineIssueComplete hands issuedCoversAsk, so a line both desks closed reads
-    // FULL here. A row flagged for unit review has no trustworthy figure to show
-    // and keeps the exact comparison only.
-    const shownAs: ShownAs | null = effective === null || issued === null
+    // THE DESKS' "COMPLETE" — THE RULE, asked exactly as lineIssueComplete asks
+    // it (see fulfilmentOf): the LINE-unit figures this row was built from,
+    // BEFORE the snapshot factor (quantity_issued / effective on a REQUISITION
+    // or pre-ledger row, after_line_qty / effective_line_qty on an ISSUE row),
+    // the line's own converter lineShownAs(line unit), and the shelf mark read
+    // against that same figure — the line's mark on a REQUISITION / pre-ledger
+    // row, the mark stamped on THIS ledger row on an ISSUE row (a later undo
+    // cannot retire it, so the take that closed a line still reads FULL after
+    // the line is undone). A row flagged for unit review has no trustworthy
+    // converter and keeps the first arm only, as the server did when it wrote
+    // it. The verdict is unit-free, so it is the same on the recipe-unit
+    // figures the row prints.
+    const effLine = r.effective_qty === null || r.effective_qty === undefined ? null : Number(r.effective_qty) || 0;
+    const issuedLine = r.issued_qty === null || r.issued_qty === undefined ? null : Number(r.issued_qty) || 0;
+    const shownAs: ShownAs | null = effLine === null || issuedLine === null
       ? null
-      : st === 'ISSUE'
-        ? (Number(r.needs_unit_review) === 1 ? null : lineShownAs(meta.unit, meta))
+      : st === 'ISSUE' && Number(r.needs_unit_review) === 1
+        ? null
         : lineShownAs(lineUnit, meta);
-    // THE RULE's shelf arm reads the line's mark against the LINE-unit figure
-    // this row's `issued` was built from, before the snapshot factor:
-    // quantity_issued on a REQUISITION / pre-ledger row, after_line_qty on an
-    // ISSUE row. The mark speaks only for the exact quantity it was stamped at.
-    const shelfEmptied = issued === null ? false
-      : shelfMarkHolds(r.shelf_mark == null ? null : Number(r.shelf_mark), Number(r.issued_qty) || 0);
-    const fulfilment = fulfilmentOf(issued ?? 0, effective, shownAs, shelfEmptied);
+    const shelfEmptied = issuedLine === null ? false
+      : shelfMarkHolds(r.shelf_mark == null ? null : Number(r.shelf_mark), issuedLine);
+    const fulfilment = issuedLine === null ? fulfilmentOf(0, effLine) : fulfilmentOf(issuedLine, effLine, shownAs, shelfEmptied);
     // A FULL line owes nothing, whichever arm closed it. Without this the row
     // printed "FULL" beside "still open 0.0005 kg" — the R1 stuck-line text.
+    // A line THE RULE leaves open never prints "still open 0" either: a
+    // remainder below the 6-dp grid is carried exactly (the page prints it at
+    // the precision that names it).
+    const owed = effLine === null || issuedLine === null ? 0 : (effLine - issuedLine) * sf;
     const stillOpen = effective === null || issued === null
-      ? null : fulfilment === 'FULL' ? 0 : Math.max(0, r6(effective - issued));
+      ? null : fulfilment === 'FULL' || !(owed > 0) ? 0 : (r6(owed) > 0 ? r6(owed) : owed);
 
     return {
       stage: st,

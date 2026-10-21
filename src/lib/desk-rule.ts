@@ -238,6 +238,10 @@ export interface DeskTakeForecast {
   /** Party rail only: the whole quantity the transfer asks for the line (LINE
    *  units) — quantity_issued after the gesture, before the shelf rule. */
   totalLine?: number;
+  /** Party rail only (round 9): the part of the line an earlier transfer
+   *  already moved (LINE units, 0 on a first transfer). The take is what the
+   *  line holds above it, so a screen says "the line's remaining …". */
+  movedLine?: number;
 }
 
 /**
@@ -298,6 +302,11 @@ export function forecastDeskTake(a: {
    the same shown-figure rule (checkCentralIssue rail 'party' → the debit →
    recordPartyShelfTake → stampShelfClose). It is all-or-nothing: one line the
    shelf cannot cover throws, and the whole gesture is refused.
+   ROUND 9 — A LATER RUN IS A TOP-UP. A short /store-process submit moves part
+   of a line; the next run moves only what each line holds above what already
+   moved for its material (`party_moved_recipe`, the transfer's own party rows
+   summed per material), from that figure rather than from 0. A line with
+   nothing above it is skipped. Everything else here is unchanged.
 
    WHEN IT RUNS ON /store-issue — the route's two branches, transcribed:
      · 'certain' — every line reads complete by THE RULE after the gesture's
@@ -309,11 +318,11 @@ export function forecastDeskTake(a: {
        dropped): the route keeps it and the requisition is fulfilled. Without
        this a party line over a short shelf could never close on this desk —
        the transfer waited for a completeness only the transfer could give;
-     · 'none'    — anything else (the savepoint is unwound, or the transfer
-       already ran): no stock moves and nothing is refused.
+     · 'none'    — anything else (the savepoint is unwound): no stock moves and
+       nothing is refused.
    /store-process runs the transfer on every submit that raises no PO, drops
-   no purchase line and holds no line — 'certain' there whenever the PO box is
-   unticked (requisitions/page.tsx asks with `always`).
+   no purchase line on a line still owed and holds no line — 'certain' there
+   whenever the PO box is unticked (requisitions/page.tsx asks with `always`).
 
    A COURTESY, like every forecast in this file: the balance is the one the
    page loaded. A liquor / store-mapped line (never floored) is declined by the
@@ -328,6 +337,10 @@ export interface DeskPartyLine extends DeskLineUnits {
   current_stock?: number | null;
   shelf_emptied_qty?: number | null;
   deferred_until?: string | null;
+  /** RECIPE units the party transfer already moved for this line's MATERIAL
+   *  on this requisition (api/requisitions ?id= `party_moved_recipe`, round 9).
+   *  A later run moves only what the line holds above it. */
+  party_moved_recipe?: number | null;
 }
 
 /** A line the transfer cannot move (the floor would throw on it). */
@@ -335,6 +348,9 @@ export interface DeskPartyShort {
   id: string;
   /** The whole quantity the transfer asks for the line, LINE units. */
   totalLine: number;
+  /** What an earlier transfer already moved for the line (round 9), LINE
+   *  units — the transfer asks totalLine − movedLine of the shelf. */
+  movedLine: number;
   /** The server's cap on the line's TOTAL — checkCentralIssue maxIssueLineQty
    *  with beforeLineQty 0: the shown figure of what is left for this line (after
    *  earlier lines of the same material), LINE units; a crumb's grid point. */
@@ -376,13 +392,16 @@ export function forecastDeskPartyTransfer(a: {
   rejectedOf: (l: DeskPartyLine) => boolean;
   after: Map<string, number>;
   deferIds?: Set<string>;
-  /** The transfer already ran on this requisition: it is one-shot and no-ops. */
+  /** The transfer already ran on this requisition. Since round 9 it is NOT
+   *  one-shot: a later run moves what each line holds above what already moved
+   *  (`party_moved_recipe` on the lines). Kept for a caller whose payload
+   *  carries no such figure: then nothing can be forecast, as before. */
   transferred?: boolean;
   /** /store-process: it runs on this submit whatever the lines read. */
   always?: boolean;
 }): DeskPartyForecast {
   const none: DeskPartyForecast = { runs: 'none', takes: {}, short: [], unknown: false };
-  if (a.transferred) return none;
+  if (a.transferred && !a.lines.some(l => l.party_moved_recipe != null)) return none;
   const deferIds = a.deferIds || new Set<string>();
   // THE LINES AS THE GESTURE'S ENTRIES LEAVE THEM, before the transfer. An
   // issue on a party line moves nothing and clears its shelf mark
@@ -412,26 +431,52 @@ export function forecastDeskPartyTransfer(a: {
   const takes: Record<string, DeskTakeForecast> = {};
   const short: DeskPartyShort[] = [];
   let unknown = false;
+  // What already moved, per material, handed to its lines in this walk's
+  // order, each line taking at most what it records (round 9 — the
+  // transfer's own allocation; 0 everywhere until a transfer has run).
+  const movedLeft = new Map<string, number>();
+  for (const p of pre) {
+    const mat = String(p.l.material_id || '');
+    if (!movedLeft.has(mat)) movedLeft.set(mat, Math.max(0, Number(p.l.party_moved_recipe) || 0));
+  }
+  const anyMoved = [...movedLeft.values()].some(v => v > 0);
   for (const p of pre) {
     if (!(p.qty > 0)) continue;
+    const mat = String(p.l.material_id || '');
+    // THE TOP-UP: the part already moved, in the line's unit (the floor's
+    // beforeLineQty); a line with nothing above it is skipped outright, as
+    // the transfer skips it — before any carve-out, so it is not declined.
+    let movedLine = 0;
+    if (anyMoved) {
+      const b = deskLineBasis(p.l);
+      const f = b ? b.factor || 1 : 1;
+      const pool = movedLeft.get(mat) || 0;
+      const lineRecipe = Math.round(p.qty * f * 1e6) / 1e6;
+      const movedRecipe = Math.min(pool, lineRecipe);
+      movedLeft.set(mat, Math.max(0, pool - movedRecipe));
+      if (Math.round((lineRecipe - movedRecipe) * 1e6) <= 0) continue;
+      movedLine = movedRecipe / f;
+    }
     const basis = deskLineBasis(p.l);
     if (!basis) continue;                       // unit_review: declined, nothing moves
     if (Number(p.l.central_flow_blocked || 0)) continue;   // store_mapped: declined too
     const raw = p.l.current_stock;
     if (raw == null || !Number.isFinite(Number(raw))) { unknown = true; continue; }
-    const mat = String(p.l.material_id || '');
     const already = claimed.get(mat) || 0;
-    const askRecipe = Math.round(p.qty * basis.factor * 1e6) / 1e6;
+    const askRecipe = Math.round((p.qty - movedLine) * basis.factor * 1e6) / 1e6;
     if (askRecipe <= DESK_RULE_EPS) continue;
     const plan = planDeskDebit((Number(raw) || 0) - already, askRecipe, basis.meta);
     if (!plan.fits) {
       const gAvail = deskGrid(plan.available);
       const shownLine = plan.shownAvailable > 0
         ? Math.round((plan.shownAvailable * basis.pf / (basis.factor || 1)) * 1e6) / 1e6 : 0;
+      // Caps on the line's TOTAL: what already moved plus what the shelf
+      // holds for it now (the server's maxIssueLineQty from beforeLineQty).
       short.push({
-        id: p.l.id, totalLine: p.qty,
-        capTotalLine: shownLine > 0 ? shownLine : gAvail > 0 ? (gAvail / 1e6) / (basis.factor || 1) : 0,
-        exactLeftLine: gAvail > 0 ? plan.available / (basis.factor || 1) : 0,
+        id: p.l.id, totalLine: p.qty, movedLine,
+        capTotalLine: shownLine > 0 ? movedLine + shownLine
+          : gAvail > 0 ? movedLine + (gAvail / 1e6) / (basis.factor || 1) : movedLine,
+        exactLeftLine: gAvail > 0 ? movedLine + plan.available / (basis.factor || 1) : 0,
         availPU: plan.shownAvailable > 0 ? plan.shownAvailable : gAvail > 0 ? (gAvail / 1e6) / basis.pf : 0,
         empty: !(gAvail > 0),
       });
@@ -439,7 +484,7 @@ export function forecastDeskPartyTransfer(a: {
     }
     claimed.set(mat, already + plan.debit);
     const changed = !plan.debitIsAsk;
-    const recordedLine = changed ? plan.debit / (basis.factor || 1) : p.qty;
+    const recordedLine = changed ? movedLine + plan.debit / (basis.factor || 1) : p.qty;
     const left = plan.available - plan.debit;
     const emptied = plan.debit > 0 && !(left > 0 && deskGrid(left) > 0);
     const inFull = deskCovers(recordedLine, p.approved, basis.step, false);
@@ -452,7 +497,7 @@ export function forecastDeskPartyTransfer(a: {
       changed, emptied, complete,
       byShelf: complete && !inFull,
       owingLine: complete ? 0 : Math.max(0, p.approved - recordedLine),
-      rail: 'party', totalLine: p.qty,
+      rail: 'party', totalLine: p.qty, movedLine,
     };
   }
   if (certain) return { runs: 'certain', takes, short, unknown };

@@ -197,7 +197,7 @@ import { postCentralTxn, deptParty } from '@/lib/movement-record';
 // the shown-figure rule the desks' purchase-unit figure obeys (round 6).
 import {
   planCentralDebit, holdsAny, qtyDown, qtyGrid, fmtGridQty, issuedCoversAsk, shownWithStep,
-  shelfMarkHolds, type ShownAs,
+  shelfMarkHolds, onGrid, type ShownAs,
 } from '@/lib/central-debit-clamp';
 
 export interface IssueDeltaInput {
@@ -541,6 +541,13 @@ export class CentralStockShort extends Error {
   /** Largest value the line's Issue box may hold, in THE LINE'S OWN unit. */
   readonly maxIssueLineQty: number;
   readonly lineUnit: string;
+  /** The most a box that ADDS to the line may hold (round 9) — line units and
+   *  exact purchase units. See CentralIssueCheck.maxAddLineQty. */
+  readonly maxAddLineQty: number;
+  readonly maxAddPurchase: number;
+  /** What the line already held, as the store desk's box saw it (party rail
+   *  inside /store-issue); 0 otherwise. */
+  readonly deskBeforeLineQty: number;
 
   constructor(c: CentralIssueCheck) {
     super(c.message);
@@ -555,6 +562,9 @@ export class CentralStockShort extends Error {
     this.purchaseUnit = c.purchaseUnit;
     this.maxIssueLineQty = c.maxIssueLineQty;
     this.lineUnit = c.lineUnit;
+    this.maxAddLineQty = c.maxAddLineQty;
+    this.maxAddPurchase = c.maxAddPurchase;
+    this.deskBeforeLineQty = c.deskBeforeLineQty;
   }
 }
 
@@ -653,6 +663,74 @@ export interface CentralIssueCheck {
   purchasePackFactor: number;
   /** '' when ok. Already phrased for a storekeeper, in PURCHASE units. */
   message: string;
+  /**
+   * THE FIGURE A BOX THAT ADDS TO THE LINE MAY HOLD (round 9), in the LINE's
+   * own unit: the most that, ADDED to the line's quantity_issued, is accepted.
+   * The store desk's box adds (/store-issue is incremental), and so does the
+   * store desk's continuation of a line the management desk held.
+   *   · internal rail: the image of `availablePurchase` (the debit IS the
+   *     increment), so it is maxIssueLineQty − beforeLineQty, computed directly;
+   *   · party rail without `deskBeforeLineQty`: the cap on the whole line (the
+   *     transfer moves the line from 0) — equal to maxIssueLineQty;
+   *   · party rail WITH `deskBeforeLineQty` (the line already holds D, typed
+   *     earlier, and the transfer will move D + the box's figure at once): the
+   *     largest add whose TOTAL the transfer accepts, proved by planCentralDebit
+   *     on the very balance and converter it decided on. 0 when nothing more fits.
+   * 0 when nothing is issuable.
+   */
+  maxAddLineQty: number;
+  /** maxAddLineQty in PURCHASE units, EXACT (never rounded to the 3-dp column
+   *  figure — 0.0004 kg is a real, typeable add). What the box shows. */
+  maxAddPurchase: number;
+  /** The line's quantity_issued as the box sees it (party rail only, when the
+   *  caller supplied it; else 0). The sentence and the two fields above are in
+   *  terms of a box that adds to THIS. */
+  deskBeforeLineQty: number;
+  /** With a desk base: the line's figure AS IT STANDS (deskBeforeLineQty) is
+   *  itself one the transfer accepts — so when nothing more fits, the way out
+   *  is to defer the rest, not to undo and retype the same total. */
+  deskLineFits: boolean;
+  /** PARTY RAIL ONLY (round 9): what the party transfer has ALREADY moved off
+   *  the shelf for this line, in the LINE's unit — the beforeLineQty the
+   *  transfer was asked with (0 on its first run; a top-up after a partial
+   *  /store-process transfer starts from it). 0 on the internal rail. The
+   *  desk sentence names it, and the desk caps are computed on top of it. */
+  transferBeforeLineQty: number;
+}
+
+/**
+ * A LINE quantity as a storekeeper reads it (round 9): the PURCHASE-unit figure
+ * LEADS (owner rule — DualQty's shape), EXACT rather than rounded to the 3-dp
+ * column figure, because the sentences that print it name differences below a
+ * step (14.8424 of 14.843 kg, 0.0006 kg still owing), and on a packed material
+ * the recipe figure follows as a declared "= …" hint. The conversion is
+ * lineFactor then packFactor — the one converter, never re-derived — on the
+ * quantity's 6-dp recipe grid point (onGrid), so float dust (3.1504999999999996)
+ * cannot move a printed figure. A line whose unit cannot be resolved
+ * (lineFactor's needsReview) is printed in its own stored unit, because nobody
+ * can say what it is in the purchase unit; the 3 such live lines say so on
+ * their face. MEASURED (round-8 verifier, r8-scope drop.ts): the defer-dropped
+ * sentence on a gram line read "14,842.4 g of 14,843 g approved … the 0.6 g
+ * still owing is below the 1 g" — no purchase unit at all.
+ */
+export function fmtLineQtyPU(
+  lineQty: number,
+  lineUnit: string | null | undefined,
+  rm: { unit?: string | null; purchase_unit?: string | null; pack_size?: number | null },
+): string {
+  const { factor, needsReview } = lineFactor(lineUnit, rm);
+  if (needsReview) {
+    const lu = String(lineUnit ?? '').trim();
+    return `${(Math.round((Number(lineQty) || 0) * 1e6) / 1e6).toLocaleString('en-IN', { maximumFractionDigits: 6 })}${lu ? ` ${lu}` : ''}`;
+  }
+  const meta = { unit: rm.unit, purchase_unit: rm.purchase_unit, pack_size: rm.pack_size };
+  const pf = packFactor(meta);
+  const recipe = qtyGrid((Number(lineQty) || 0) * factor) / 1e6;
+  const pu = String(rm.purchase_unit || rm.unit || '').trim();
+  const ru = String(rm.unit || '').trim();
+  const lead = `${puFine(recipe / pf, pf)}${pu ? ` ${pu}` : ''}`;
+  if (!(pf > 1)) return lead;
+  return `${lead} (= ${recipe.toLocaleString('en-IN', { maximumFractionDigits: 6 })}${ru ? ` ${ru}` : ''})`;
 }
 
 /* ────────────────────────────────────────────────────────────────────────────
@@ -762,6 +840,18 @@ export function checkCentralIssue(
      * po-requisition-fulfil.ts), for which the party carve-out would be inert.
      */
     rail?: 'internal' | 'party';
+    /**
+     * PARTY RAIL ONLY (round 9): the line's quantity_issued as the STORE DESK's
+     * box sees it, when the transfer runs inside a /store-issue gesture. The
+     * decision is untouched — the transfer still moves the whole line from 0 —
+     * but a refusal is then worded, and its cap returned, for a box that ADDS
+     * to this figure. MEASURED (round-8 verifier, sd_party_tail): THREE MANGO
+     * 14.842 of 14.843 kg over a 14,842.4 g shelf; Issue Now posted 0.001 and
+     * was told "Issue 14.842 kg or less on this line"; the desk added 14.842
+     * and was refused again "so 29.684 kg cannot be issued". Ignored on the
+     * internal rail (its debit already IS the increment).
+     */
+    deskBeforeLineQty?: number;
   },
 ): CentralIssueCheck {
   const nil = (over: Partial<CentralIssueCheck>): CentralIssueCheck => ({
@@ -772,7 +862,9 @@ export function checkCentralIssue(
     centralStockRecipe: 0, maxIssueLineQty: Number(a.afterLineQty) || 0,
     recordAfterLineQty: Number(a.afterLineQty) || 0,
     lineUnit: '', requestedPurchase: 0, availablePurchase: 0,
-    purchaseUnit: '', packFactor: 1, purchasePackFactor: 1, message: '', ...over,
+    purchaseUnit: '', packFactor: 1, purchasePackFactor: 1, message: '',
+    maxAddLineQty: 0, maxAddPurchase: 0, deskBeforeLineQty: 0, deskLineFits: false,
+    transferBeforeLineQty: 0, ...over,
   });
 
   const line = db.prepare(`
@@ -853,9 +945,10 @@ export function checkCentralIssue(
   // division moves it). Its `alts` keep round 7's raw toPurchaseQty figure
   // matchable, so a screen still printing that one is never refused for typing
   // it; the cap and the sentences print shownPurchaseQty.
-  const plan = planCentralDebit(stock - claimed, requestedRecipe, shownWithStep(
+  const conv = shownWithStep(
     r => shownPurchaseQty(r, meta), 0.001 * pf, [r => toPurchaseQty(r, meta)],
-  ));
+  );
+  const plan = planCentralDebit(stock - claimed, requestedRecipe, conv);
   const purchaseUnit = String(line.purchase_unit || line.unit || '').trim();
   const recipeUnit = String(line.unit || '').trim();
   const shownAvail = Number(plan.shownAvailable) || 0;
@@ -875,6 +968,50 @@ export function checkCentralIssue(
   // carried unrounded so the sentence never says "0 kg cannot be issued".
   const requestedPurchase = shownAsk > 0 ? shownAsk : requestedRecipe / pf;
   const beforeLine = Number(a.beforeLineQty) || 0;
+  // THE CAP IN THE LINE'S UNIT, from beforeLine — the image of
+  // `availablePurchase` (see maxIssueLineQty below for the rounding).
+  const capLine = shownAvail > 0
+    ? Math.round((shownAvail * pf / (factor || 1)) * 1e6) / 1e6
+    : crumb ? gridAvail / (factor || 1) : 0;
+  // ── THE STORE DESK'S BOX ADDS (round 9) ─────────────────────────────────
+  // On the party rail the transfer asks the line's WHOLE quantity (beforeLine
+  // 0), so `capLine` is a cap on the whole line. A box that ADDS to a line
+  // already holding D can take only what, added to D, the transfer accepts:
+  //   · the shown cap less D, when that is positive (14.842 cap, D = 10 → 4.842);
+  //   · else the grid point of what is left less D — the line already holds the
+  //     shown cap (14.842 kg recorded over 14,842.4 g), and the only total left
+  //     that takes everything is the shelf itself (0.0004 kg more);
+  //   · else 0: the line already holds all the shelf can give, or more.
+  // Each candidate is PROVED with planCentralDebit — the same balance, the same
+  // converter and the same 6-dp line→recipe rounding the transfer will apply to
+  // D + add — so the figure returned is accepted when typed back by construction,
+  // not by arithmetic that merely looks right. Snapped to 1e-9 line units (below
+  // the recipe grid on every pack the catalogue uses), so 14.8424 − 14.842 reads
+  // 0.0004, not 0.00039999999999907.
+  //
+  // A TOP-UP TRANSFER (round 9) starts from what the transfer already moved
+  // for the line (`beforeLine`, 0 on its first run): the transfer asks only
+  // `lineQty − beforeLine` of the shelf, so every total below is tested on
+  // that, and the two candidates sit `beforeLine` higher. With beforeLine 0
+  // each expression is the round-9 one, character for character in effect.
+  const transferBase = a.rail === 'party' ? Math.max(0, beforeLine) : 0;
+  const desk = a.rail === 'party' ? Math.max(0, Number(a.deskBeforeLineQty) || 0) : 0;
+  let maxAddLineQty = capLine;
+  let maxTotalLine = beforeLine + capLine;
+  let deskLineFits = false;
+  if (desk > 0) {
+    const snap9 = (n: number) => Math.round(n * 1e9) / 1e9;
+    const totalFits = (lineQty: number) =>
+      planCentralDebit(stock - claimed, Math.round((lineQty - transferBase) * factor * 1e6) / 1e6, conv).fits;
+    deskLineFits = totalFits(desk);
+    const fitsAt = (add: number) => add > EPS && totalFits(desk + add);
+    const found = [
+      snap9(transferBase + capLine - desk), snap9(transferBase + gridAvail / (factor || 1) - desk),
+    ].find(fitsAt);
+    maxAddLineQty = found ?? 0;
+    maxTotalLine = snap9(desk + maxAddLineQty);
+  }
+  const maxAddPurchase = maxAddLineQty > 0 ? (maxAddLineQty * (factor || 1)) / pf : 0;
   const base: CentralIssueCheck = {
     ok: true, debits: true, skipReason: '',
     reqItemId: String(line.id),
@@ -894,11 +1031,12 @@ export function checkCentralIssue(
     // figure itself); rounded at the 6 dp both desks' fromPU rounds an entry to.
     // A crumb is carried unrounded — 6 dp of a purchase-unit line would shave a
     // 0.4 g crumb on a 1000-pack to nothing.
-    maxIssueLineQty: shownAvail > 0
-      ? beforeLine + Math.round((shownAvail * pf / (factor || 1)) * 1e6) / 1e6
-      : crumb
-        ? beforeLine + gridAvail / (factor || 1)
-        : beforeLine,
+    //
+    // With a desk base (party rail inside /store-issue, round 9) it is the most
+    // the line's TOTAL may reach through a box that adds to it: D + maxAdd —
+    // D itself when nothing more fits — so "max_issue_qty − what the line
+    // holds" is the box's figure, which is how the store desk reads it.
+    maxIssueLineQty: maxTotalLine,
     // WHAT THE LINE MUST RECORD. The afterLineQty as given, untouched (so an
     // ordinary issue is byte-identical — no `before + delta` float re-sum),
     // unless the shown-figure rule took a balance that differs from the typed
@@ -911,6 +1049,8 @@ export function checkCentralIssue(
     packFactor: factor,
     purchasePackFactor: pf,
     message: '',
+    maxAddLineQty, maxAddPurchase, deskBeforeLineQty: desk, deskLineFits,
+    transferBeforeLineQty: transferBase,
   };
   // An issue of everything on the shelf — binary noise included, or the 6-dp
   // figure the desks print — fits and lands on exactly 0 (debitRecipe is then
@@ -940,26 +1080,106 @@ export function checkCentralIssue(
   return {
     ...base, ok: false,
     message: centralShortMessage(base, {
-      holds: holdsAny(plan.available), shownAvail, shownAsk, gridAvail, recipeUnit, pf,
+      holds: holdsAny(plan.available), shownAvail, shownAsk, gridAvail, recipeUnit, pf, meta,
     }),
   };
 }
 
+type ShortFigures = {
+  holds: boolean; shownAvail: number; shownAsk: number; gridAvail: number; recipeUnit: string; pf: number;
+  meta: { unit?: string | null; purchase_unit?: string | null; pack_size?: number | null };
+};
+
+/**
+ * THE PARTY LINE THE STORE DESK'S BOX ADDS TO (round 9) — the two clauses every
+ * desk-based refusal shares, so the no-sibling sentence (centralShortMessage)
+ * and the sibling one (scoreShortLine) cannot word the same cap two ways.
+ *
+ * `lead`: "this party line already holds D, and the party transfer moves the
+ * whole line at once" — the fact the box's figure depends on.
+ * `tail`: what to press. The add (c.maxAddPurchase, EXACT — 0.0004 kg is
+ * typeable and the store desk prints it at that precision) when there is one;
+ * otherwise the way out in words, never a figure that would be refused:
+ *   · the line holds no more than the shelf (it would all go): defer the rest;
+ *   · the line holds MORE than the shelf: undo it and issue the shelf's figure,
+ *     which is the cap from 0 and accepted (checked: the store desk's undo
+ *     zeroes the line, so its box then adds to 0).
+ */
+function deskPartyClauses(c: CentralIssueCheck, f: ShortFigures): { lead: string; store: string; tail: string } {
+  const pu = c.purchaseUnit ? ` ${c.purchaseUnit}` : '';
+  const ru = f.recipeUnit ? ` ${f.recipeUnit}` : '';
+  const recipeHint = (r: number) => (f.pf > 1 ? ` (= ${onGrid(r).toLocaleString('en-IN', { maximumFractionDigits: 6 })}${ru})` : '');
+  const desk = c.deskBeforeLineQty;
+  const deskFig = fmtLineQtyPU(desk, c.lineUnit, f.meta);
+  // What the store holds for THIS line — the shown figure with its exact recipe
+  // hint (14.842 kg = 14,842.4 g, which is why 0.0004 kg more still fits), or a
+  // sub-display crumb in the recipe unit, as every crumb sentence names it.
+  // On a material with no pack (kg/kg) there is no recipe hint to carry the
+  // exact figure, so it is named beside the shown one when they differ —
+  // "3.217 kg (3.2174 kg exactly)" — or the 0.0004 kg add would read as
+  // arithmetic on a shelf that shows 3.217.
+  const exactPU = f.gridAvail / (f.pf || 1);
+  const store = f.shownAvail > 0
+    ? `${fmtQtyNum(f.shownAvail)}${pu}`
+      + (f.pf > 1 ? recipeHint(f.gridAvail)
+        : qtyGrid(f.shownAvail * (f.pf || 1)) !== qtyGrid(f.gridAvail) ? ` (${puFine(exactPU, f.pf)}${pu} exactly)` : '')
+    : `${fmtGridQty(f.gridAvail)}${ru}`;
+  // A TOP-UP (round 9): part of the line already left the shelf when the
+  // transfer first ran (a short /store-process submit), and the transfer now
+  // moves only what the line holds above that — so "moves the whole line at
+  // once" would be false, and so would the undo advice below (undoing the line
+  // cannot put back what already moved).
+  const moved = Math.max(0, Number(c.transferBeforeLineQty) || 0);
+  const lead = moved > 0
+    ? `this party line already holds ${deskFig}; ${fmtLineQtyPU(moved, c.lineUnit, f.meta)} of it already left the `
+      + `central store when the party transfer first ran, and the transfer moves only what the line holds above that`
+    : `this party line already holds ${deskFig}, and the party transfer moves the whole line at once`;
+  if (c.maxAddPurchase > 0) {
+    const add = `${puFine(c.maxAddPurchase, f.pf)}${pu}`;
+    return { lead, store, tail: `Issue ${add} or less on this line (${add} takes everything the central store holds for it).` };
+  }
+  const cap = f.shownAvail > 0 ? `${fmtQtyNum(f.shownAvail)}${pu}` : `${puFine(c.availablePurchase, f.pf)}${pu}`;
+  // The line's own figure is one the transfer takes (it IS what the shelf
+  // holds, by the grid or by the shown figure): nothing to undo.
+  return {
+    lead, store,
+    tail: c.deskLineFits
+      ? `Nothing more can be issued on this line until stock arrives — it already holds everything the central `
+        + `store holds for it. Defer the rest, or receive the stock or record a closing count first.`
+      : moved > 0
+        ? `Nothing more can be issued on this line until stock arrives — what it holds above the part already `
+          + `moved is more than the central store holds for it. Defer the rest, or receive the stock or record a `
+          + `closing count first.`
+        : `Nothing more can be issued on this line — it already holds more than the central store holds for it. `
+          + `Undo the line and issue ${cap} on it, or receive the stock or record a closing count first.`,
+  };
+}
 /** The refusal sentence for a short line, in the purchase unit the desks type
  *  in. Three branches, chosen by holdsAny and the shown figure — never by a
  *  rounded display figure on its own. Shared by checkCentralIssue (so the
  *  pre-flight and the floor) and by the after-the-gesture re-score of a held
- *  line, so the sentences cannot drift. */
-function centralShortMessage(
-  c: CentralIssueCheck,
-  f: { holds: boolean; shownAvail: number; shownAsk: number; gridAvail: number; recipeUnit: string; pf: number },
-): string {
+ *  line, so the sentences cannot drift. A party line the store desk's box adds
+ *  to (c.deskBeforeLineQty, round 9) is worded for that box. */
+function centralShortMessage(c: CentralIssueCheck, f: ShortFigures): string {
   const pu = c.purchaseUnit;
   const q = (n: number) => `${fmtQtyNum(n)}${pu ? ` ${pu}` : ''}`;
   const ru = f.recipeUnit ? ` ${f.recipeUnit}` : '';
   // The ask: its shown figure when it has one, otherwise (a sub-display ask) its
   // recipe figure — never "0 kg cannot be issued".
   const askFig = f.shownAsk > 0 ? q(f.shownAsk) : `${fmtGridQty(c.requestedRecipe)}${ru}`;
+  if (c.deskBeforeLineQty > 0) {
+    // The ask is the line's TOTAL (what the transfer moves), so it is named as
+    // such — "14.843 kg in all" — beside what the line already holds. On a
+    // top-up (round 9) the ask is what is still to move, and named so.
+    const d = deskPartyClauses(c, f);
+    const asked = c.transferBeforeLineQty > 0 ? `the ${askFig} still to move` : `${askFig} in all`;
+    if (!f.holds) {
+      return `${c.materialName}: the central store holds none of it — ${d.lead} — `
+        + `so ${asked} cannot be issued. Receive the stock, or record a closing count, first.`;
+    }
+    return `${c.materialName}: ${d.lead} — the central store holds only ${d.store}, `
+      + `so ${asked} cannot be issued. ${d.tail}`;
+  }
   if (!f.holds) {
     return `${c.materialName}: the central store holds none of it, `
       + `so ${askFig} cannot be issued. Receive the stock, or record a closing count, first.`;
@@ -999,16 +1219,21 @@ export function assertCentralIssue(
      */
     siblingRecipe?: number;
     siblingLines?: number;
+    /** See `deskBeforeLineQty` on checkCentralIssue (round 9, party rail only).
+     *  Passed straight through; the decision ignores it. */
+    deskBeforeLineQty?: number;
   },
 ): CentralIssueCheck {
   const c = checkCentralIssue(db, {
     reqItemId: a.reqItemId, beforeLineQty: a.beforeLineQty, afterLineQty: a.afterLineQty, rail: a.rail,
+    deskBeforeLineQty: a.deskBeforeLineQty,
   });
   if (!c.ok) {
     const sib = Math.max(0, Number(a.siblingRecipe) || 0);
     throw new CentralStockShort(holdsAny(sib)
       ? scoreShortLine(db, {
           reqItemId: a.reqItemId, beforeLineQty: a.beforeLineQty, afterLineQty: a.afterLineQty, rail: a.rail,
+          deskBeforeLineQty: a.deskBeforeLineQty,
           // The siblings' debits are already OUT of the balance this read; adding
           // them back as a negative claim and then handing them to the siblings
           // re-states the same balance as "the pool, of which this much went to
@@ -1211,6 +1436,8 @@ function scoreShortLine(
     alreadyClaimedRecipe?: number; rail?: 'internal' | 'party';
     siblingRecipe?: number; siblingLines?: number;
     afterGesture: boolean;
+    /** Party rail inside /store-issue (round 9): see checkCentralIssue. */
+    deskBeforeLineQty?: number;
   },
 ): CentralIssueCheck {
   const already = Number(a.alreadyClaimedRecipe) || 0;
@@ -1219,6 +1446,7 @@ function scoreShortLine(
   const c = checkCentralIssue(db, {
     reqItemId: a.reqItemId, beforeLineQty: a.beforeLineQty, afterLineQty: a.afterLineQty,
     rail: a.rail, alreadyClaimedRecipe: already + (hasSib ? sib : 0),
+    deskBeforeLineQty: a.deskBeforeLineQty,
   });
   if (!c.debits) return c;
   const pu = c.purchaseUnit ? ` ${c.purchaseUnit}` : '';
@@ -1239,6 +1467,9 @@ function scoreShortLine(
     ...x,
     availablePurchase: x.requestedPurchase,
     maxIssueLineQty: Number(a.afterLineQty) || 0,
+    // The box's figure is the ask itself (round 9): what this row added.
+    maxAddLineQty: Math.max(0, (Number(a.afterLineQty) || 0) - (Number(a.beforeLineQty) || 0)),
+    maxAddPurchase: x.requestedPurchase,
   });
 
   if (!hasSib) {
@@ -1284,6 +1515,18 @@ function scoreShortLine(
       + `store held less than ${ask}. After the gesture it holds ${figRecipe(pool)}, and ${figRecipe(share)} of it `
       + `goes to ${above}; issue ${ask} again.`;
     return { ...offerAsk(c), ok: false, message };
+  } else if (holdsSome && c.deskBeforeLineQty > 0) {
+    // A party line the store desk's box adds to (round 9): the same pool
+    // sentence, then deskPartyClauses' figure for a box that adds to what the
+    // line already holds — never the cap on the whole line.
+    const raw = Math.max(0, (Number(c.centralStockRecipe) || 0) - already - sib);
+    const d = deskPartyClauses(c, {
+      holds: holdsAny(raw), shownAvail: shownPurchaseQty(onGrid(raw), meta), shownAsk: 0,
+      gridAvail: qtyDown(raw, 6), recipeUnit: String(meta.unit || '').trim(), pf: c.purchasePackFactor, meta,
+    });
+    const asked = c.transferBeforeLineQty > 0 ? `the ${ask} still to move` : `${ask} in all`;
+    message = `${c.materialName}: ${d.lead} — the central store holds only ${figRecipe(pool)}, and ${figRecipe(share)} of it `
+      + `goes to ${above}, so ${asked} cannot be issued on this line. ${d.tail}`;
   } else if (holdsSome) {
     message = `${c.materialName}: the central store holds only ${figRecipe(pool)}, and ${figRecipe(share)} of it `
       + `goes to ${above} — so ${ask} cannot be issued on this line. Issue ${fig(c.availablePurchase)} or less on this line.`;

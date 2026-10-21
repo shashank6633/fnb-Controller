@@ -5,10 +5,9 @@ import {
   applyIssueDelta, checkCentralIssue, isCentralStockShort,
   isIssueGestureRecorded, isIssueTokenReplayError,
   issueLineQtyToRecord, rescoreHeldIssue, scoreHeldAtTurn, lineIssueComplete,
-  zeroEntriesSentence, lineShownAs,
+  zeroEntriesSentence, lineShownAs, fmtLineQtyPU,
 } from '@/lib/issue-stock';
 import { isDeptReversalBlocked } from '@/lib/dept-ledger';
-import { PARTY_TRANSFER_TYPES_SQL } from '@/lib/movement-record';
 
 /**
  * A replayed POST carrying a client_token it already spent is answered 200
@@ -611,8 +610,15 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       material: string; material_id: string; req_item_id: string;
       /** PURCHASE basis — the unit every store surface leads with. */
       requested: number; available: number; purchase_unit: string;
-      /** LINE basis — what this line's Issue box may hold on a retry. */
+      /** LINE basis — the most the line's TOTAL may reach on a retry. */
       max_issue_qty: number; line_unit: string;
+      /** THE BOX'S FIGURE (round 9): the most this route's box — which ADDS to
+       *  quantity_issued — may hold and be accepted. LINE units, and the same
+       *  in PURCHASE units, exact (a 0.0004 kg add is real and typeable). On an
+       *  internal line it is `available`'s image; on a party line refused by the
+       *  transfer it is what, added to the line, the transfer accepts — which
+       *  `available` (what the store holds for the line) is not. */
+      max_add_qty: number; max_add_purchase: number;
       message: string;
     }[] = [];
     /**
@@ -753,6 +759,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           requested: h.requestedPurchase, available: h.availablePurchase,
           purchase_unit: h.purchaseUnit,
           max_issue_qty: h.maxIssueLineQty, line_unit: h.lineUnit,
+          max_add_qty: h.maxAddLineQty, max_add_purchase: h.maxAddPurchase,
           message: h.message,
         };
         centralShort.push(row);
@@ -810,24 +817,30 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     /** Lines an 'issue' entry of THIS gesture wrote or a 'defer' entry deferred
      *  — the lines whose defer the party transfer's take may drop (round 8b). */
     const touchedLines = new Set<string>();
-    const q6 = (n: number) => (Math.round((Number(n) || 0) * 1e6) / 1e6)
-      .toLocaleString('en-IN', { maximumFractionDigits: 6 });
+    // THE SENTENCE LEADS WITH THE PURCHASE UNIT (round 9, owner rule). Every
+    // figure goes through fmtLineQtyPU (issue-stock.ts): the line quantity's
+    // recipe grid point ÷ the pack, exact — these figures differ by less than a
+    // printed step, so the 3-dp column rounding would print 14.842 for 14.8424 —
+    // with the recipe figure as the declared "= …" hint. MEASURED (round-8
+    // scope lane, drop.ts): on a gram line it read "14,842.4 g of 14,843 g
+    // approved … the 0.6 g still owing is below the 1 g", no purchase unit at
+    // all, and the store desk alerts it verbatim (announceDeferDropped).
     const deferDropRow = (it: any, line: any) => {
       const issued = Number(line.quantity_issued) || 0;
       const approved = (line.chef_approved_qty != null ? Number(line.chef_approved_qty) : Number(line.quantity_requested)) || 0;
       const unit = String(line.line_unit ?? '').trim();
-      const u = unit ? ` ${unit}` : '';
       const inFull = issued + 1e-9 >= approved;
       const step = Number(lineShownAs(line.line_unit, line)?.step) || 0;
       const name = String(it?.material_name || 'a line');
+      const fig = (n: number) => fmtLineQtyPU(n, line.line_unit, line);
       return {
         line_id: String(line.id), material: name, quantity_issued: issued, approved, line_unit: unit,
         by_shelf: !inFull,
         message: inFull
-          ? `${name}: not deferred — the line is already issued in full (${q6(issued)}${u} of ${q6(approved)}${u}).`
-          : `${name}: not deferred — the issue took everything the central store held (${q6(issued)}${u} `
-            + `of ${q6(approved)}${u} approved), and the ${q6(approved - issued)}${u} still owing is below the `
-            + `${q6(step)}${u} the store desk can issue, so the line is complete.`,
+          ? `${name}: not deferred — the line is already issued in full (${fig(issued)} of ${fig(approved)}).`
+          : `${name}: not deferred — the issue took everything the central store held (${fig(issued)} `
+            + `of ${fig(approved)} approved), and the ${fig(approved - issued)} still owing is below the `
+            + `${fig(step)} the store desk can issue, so the line is complete.`,
       };
     };
 
@@ -844,6 +857,17 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         abort.statusConflict = String(rNow?.status ?? 'unknown');
         throw new Error('req_status_changed');
       }
+      // WHAT EACH LINE HELD BEFORE THIS GESTURE, as this route's box sees it
+      // (round 9). The party transfer moves a line's WHOLE quantity, but this
+      // box ADDS to quantity_issued — so a transfer refusal must name the most
+      // the box can add, not the cap on the whole line (sd_party_tail: 14.842 of
+      // 14.843 kg was told "Issue 14.842 kg or less", added it, and was refused
+      // "so 29.684 kg cannot be issued"). Read here, inside the transaction and
+      // before any entry runs; a refusal rolls the gesture back to exactly this.
+      const deskBase = new Map<string, number>(
+        (db.prepare(`SELECT id, quantity_issued FROM requisition_items WHERE req_id = ?`).all(id) as any[])
+          .map(x => [String(x.id), Number(x.quantity_issued) || 0] as [string, number]),
+      );
 
       for (let li = 0; li < lines.length; li++) {
         const ln = lines[li];
@@ -1098,11 +1122,13 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       });
       let allDone = everyLineDone();
       // Party path also TRANSFERS store → department (store deduction + dept
-      // credit). The helper is idempotent via the party_consumption ledger row,
-      // so re-fulfilment or the store-process path can never double-transfer.
+      // credit). The helper never moves a gram twice: it reads what its party
+      // rows already moved and asks only for what the lines hold above that
+      // (round 9 — a short /store-process submit moved part of a line, and the
+      // tail completed here used to move nothing at all, over any shelf).
       let pf: ReturnType<typeof applyPartyFulfillment> | null = null;
       if (allDone && r.purpose === 'party') {
-        pf = applyPartyFulfillment(db, id, me.email);
+        pf = applyPartyFulfillment(db, id, me.email, { deskBeforeLineQty: deskBase });
         allDone = everyLineDone();
       } else if (r.purpose === 'party') {
         // ── THE TRANSFER IS THIS GESTURE'S TAKE TOO (round 8b) ───────────────
@@ -1123,24 +1149,29 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         // the same as an internal issue that completes its line), and the
         // lines are scored again. Every line done → kept, and the status below
         // reads 'fulfilled'. Anything else → the savepoint is unwound, so not
-        // a gram moves and the transfer stays unfired: it is one-shot, and a
-        // transfer fired on a partial could never move the remainder. A line
+        // a gram moves and the transfer stays unfired (the requisition then
+        // moves in one lump when it does complete — the store desk's rule). A line
         // the shelf cannot cover unwinds it too — this gesture did not ask for
         // the transfer, so its refusal is not this gesture's refusal.
         const openLines = (selFresh.all(id) as any[]).filter(it =>
           !it.is_rejected && !it.store_rejected && !(lineIssueComplete(it) && !it.deferred_until));
         const couldClose = openLines.length > 0 && openLines.every(it =>
           (Number(it.quantity_issued) || 0) > 0 && (!it.deferred_until || touchedLines.has(String(it.id))));
-        const alreadyMoved = couldClose && !!db.prepare(
-          `SELECT 1 FROM inventory_transactions WHERE reference_id = ? AND type IN (${PARTY_TRANSFER_TYPES_SQL}) LIMIT 1`,
-        ).get(id);
-        if (couldClose && !alreadyMoved) {
+        // NO "already moved" GATE ANY MORE (round 9). The transfer used to be
+        // one-shot, so a requisition whose goods had moved once (a short
+        // /store-process submit) was never tried again here. It now moves what
+        // has not yet moved (applyPartyFulfillment, "A SECOND CALL MOVES ONLY
+        // WHAT HAS NOT MOVED"), so the same savepoint try serves a top-up: the
+        // tail over a short shelf can close by the shelf rule here exactly as a
+        // first transfer can, and a top-up that cannot close unwinds the same
+        // way, leaving not a gram moved.
+        if (couldClose) {
           const unwind = new Error('party_transfer_left_lines_open');
           const dropped: string[] = [];
           const kept: { t: ReturnType<typeof applyPartyFulfillment> | null } = { t: null };
           try {
             db.transaction(() => {
-              const t = applyPartyFulfillment(db, id, me.email);
+              const t = applyPartyFulfillment(db, id, me.email, { deskBeforeLineQty: deskBase });
               for (const it of selFresh.all(id) as any[]) {
                 if (!touchedLines.has(String(it.id))) continue;
                 if (!it.deferred_until && !it.defer_reason) continue;
@@ -1286,6 +1317,8 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         row.requested = c.requestedPurchase;
         row.available = c.availablePurchase;
         row.max_issue_qty = c.maxIssueLineQty;
+        row.max_add_qty = c.maxAddLineQty;
+        row.max_add_purchase = c.maxAddPurchase;
         row.message = c.message;
       }
     });
@@ -1355,11 +1388,16 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           code: e.code,
           blocked: [{
             code: 'central_stock_short',
-            line_id: failing.lineId || (lines.length === 1 ? String(lines[0]?.id || '') : ''),
+            // The line the floor refused, named by the floor (round 9). On a
+            // PARTY requisition the transfer runs after the loop, so `failing`
+            // is whichever entry the loop touched last — SALT's id on a refusal
+            // of THREE MANGO. Inside the loop the two are the same line.
+            line_id: e.reqItemId || failing.lineId || (lines.length === 1 ? String(lines[0]?.id || '') : ''),
             material: e.materialName, material_id: e.materialId, req_item_id: e.reqItemId,
             requested: e.requestedPurchase, available: e.availablePurchase,
             purchase_unit: e.purchaseUnit,
             max_issue_qty: e.maxIssueLineQty, line_unit: e.lineUnit,
+            max_add_qty: e.maxAddLineQty, max_add_purchase: e.maxAddPurchase,
             message: e.message,
           }],
           applied: 0,

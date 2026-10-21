@@ -5,7 +5,7 @@ import { mergeDuplicateLines } from '@/lib/po-helpers';
 import {
   applyIssueDelta, checkCentralIssue, isCentralStockShort,
   issueLineQtyToRecord, rescoreHeldIssue, scoreHeldAtTurn, lineIssueComplete,
-  zeroEntriesSentence,
+  zeroEntriesSentence, fmtLineQtyPU,
 } from '@/lib/issue-stock';
 import { vendorMappingError, vendorResolver } from '@/lib/vendor-mapping';
 import { centralFlowBlock } from '@/lib/store-engine';
@@ -96,6 +96,10 @@ import { centralFlowBlock } from '@/lib/store-engine';
  *                                          //        po_not_requested.
  *                                          // 'unmapped_vendor' and 'store_mapped' still
  *                                          // owe goods; the other three owe nothing.
+ *                                          // (Round 9: they hold the requisition open,
+ *                                          // and the party transfer back, only while
+ *                                          // their own line is still owed — a Buy qty
+ *                                          // on a line issued in full owes nothing.)
  *   po_skipped_note?,                      // the same list as one printable sentence
  *   po_merged_lines?: [{ …, ordered }],    // a repeated material whose 2nd line named a
  *                                          // different vendor/rate and was folded into
@@ -108,8 +112,11 @@ import { centralFlowBlock } from '@/lib/store-engine';
  *     material, material_id,               // line stays outstanding. Same row shape as the
  *     req_item_id, requested, available,   // 400's `blocked`, so one reader serves both.
  *     purchase_unit, max_issue_qty,        // Never empty-but-silent: absent = nothing held.
- *     line_unit, message                   // available / max_issue_qty / message are scored
- *   }],                                    // AFTER the gesture (what is left once every
+ *     line_unit, message,                  // available / max_issue_qty / message are scored
+ *     max_add_qty, max_add_purchase        // (round 9) the most the STORE desk's box, which
+ *   }],                                    // adds to the line, may hold and be accepted —
+ *                                          // where a held line is continued. Scored
+ *                                          // AFTER the gesture (what is left once every
  *                                          // other line has run) — round 6.
  *   stock_held_note?,                      // the same list as one printable sentence; also
  *                                          // folded into po_note, the field every shipped
@@ -125,6 +132,7 @@ import { centralFlowBlock } from '@/lib/store-engine';
  *   central_stock_short                  → { code, blocked: [{ material, material_id,
  *                                            req_item_id, requested, available,
  *                                            purchase_unit, max_issue_qty, line_unit,
+ *                                            max_add_qty, max_add_purchase,
  *                                            message }], req_item_ids, applied: 0 }
  *                                          ONLY when not one line of the gesture can
  *                                          be handed over. A gesture that CAN issue
@@ -414,6 +422,10 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       requested: number; available: number; purchase_unit: string;
       /** LINE basis — what the Issue box may hold on a retry. */
       max_issue_qty: number; line_unit: string;
+      /** The most a box that ADDS to the line may hold (round 9) — the store
+       *  desk, where a held line is continued once this route has moved the
+       *  requisition on. LINE units, and PURCHASE units exact. */
+      max_add_qty: number; max_add_purchase: number;
       message: string;
     }[] = [];
     /**
@@ -508,6 +520,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           requested: h.requestedPurchase, available: h.availablePurchase,
           purchase_unit: h.purchaseUnit,
           max_issue_qty: h.maxIssueLineQty, line_unit: h.lineUnit,
+          max_add_qty: h.maxAddLineQty, max_add_purchase: h.maxAddPurchase,
           message: h.message,
         };
         centralShort.push(row);
@@ -964,7 +977,9 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
      *  Items then Purchase Orders / the Liquor Store inward). 'no_quantity',
      *  'chef_rejected' and 'po_not_requested' are reported but owe nothing, so
      *  they must NOT hold a requisition open or block the party transfer (both
-     *  keyed on this). */
+     *  keyed on this). Round 9: a dropped line does either only while its own
+     *  requisition line still owes — see poDroppedOwing and finalStatus below;
+     *  this list itself is unchanged and still drives the response's remedy. */
     const poDropped = poSkipped.filter(s => s.code === 'unmapped_vendor' || s.code === 'store_mapped');
     if (poSkipped.length > 0) {
       // The store user is TOLD, in the same response that confirms the issue.
@@ -1084,6 +1099,10 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // so without this a 6-BTL shortfall landed verbatim in a blank-unit
       // (recipe) line and the requisition read it back as 6 ml, 750× too small.
       // The PO line is unaffected: it keeps using poQty, already purchase units.
+      // The material's pack meta, as fmtLineQtyPU reads it, from the `items` row.
+      const shelfMeta = (it: any) => ({
+        unit: it.material_unit, purchase_unit: it.material_purchase_unit, pack_size: it.material_pack_size,
+      });
       const toLineBasis = (it: any, ln: any, posted: number) => {
         const recipeUnit   = String(it.material_unit || '').toLowerCase().trim();
         const purchaseUnit = String(it.material_purchase_unit || '').toLowerCase().trim();
@@ -1196,11 +1215,16 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
               asked: issued,
               line_unit: String(it.unit ?? ''),
             },
-            // 1e-9 line units in the SENTENCE only (2,999.7 ml ÷ 750 is stored
-            // as 3.9995999999999996 BTL); the after-image keeps the stored value.
-            note: `${it.material_name}: issued what the central store held — ${Math.round(issued * 1e9) / 1e9}`
-              + `${it.unit ? ` ${it.unit}` : ''} typed (the store's shown figure for its balance), `
-              + `${Math.round(issuedToWrite * 1e9) / 1e9}${it.unit ? ` ${it.unit}` : ''} recorded as handed over`,
+            // THE PURCHASE UNIT LEADS (round 9, owner rule): both figures go
+            // through fmtLineQtyPU — the line quantity's recipe grid point ÷ the
+            // pack, exact, with the recipe figure as a declared "= …" hint — so
+            // a gram line reads "14.843 kg (= 14,843 g) typed … 14.8425 kg
+            // (= 14,842.5 g) recorded", not grams alone. The grid snap also
+            // keeps float dust (2,999.7 ml ÷ 750 stored as 3.9995999999999996
+            // BTL) out of the sentence; the after-image keeps the stored value.
+            note: `${it.material_name}: issued what the central store held — `
+              + `${fmtLineQtyPU(issued, it.unit, shelfMeta(it))} typed (the store's shown figure for its balance), `
+              + `${fmtLineQtyPU(issuedToWrite, it.unit, shelfMeta(it))} recorded as handed over`,
           });
         }
       }
@@ -1241,6 +1265,8 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         row.requested = c.requestedPurchase;
         row.available = c.availablePurchase;
         row.max_issue_qty = c.maxIssueLineQty;
+        row.max_add_qty = c.maxAddLineQty;
+        row.max_add_purchase = c.maxAddPurchase;
         row.message = c.message;
       }
 
@@ -1426,10 +1452,15 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // party_consumption ledger row makes the transfer one-shot, so a transfer
       // fired on a partial could never move the remainder afterwards.
       //
-      // THAT ONE-SHOT IS PRE-EXISTING AND IS LEFT AS IT IS (round 8): a party
-      // line processed here short, and completed later on the store desk,
-      // records the completion but the second transfer is skipped — identical
-      // on production, listed open for the owner, not changed by side effect.
+      // THE ONE-SHOT IS GONE (round 9). A party line processed here short and
+      // completed later on the store desk used to record the completion while
+      // the second transfer was skipped ("already transferred"): 20 kg recorded
+      // over 14,842.4 g moved, the tail accepted over a 0 g shelf with no stock
+      // check (round-9 verifier, party-tail pt_short; identical on production).
+      // The transfer now moves what each line holds above what already moved
+      // (party-fulfillment.ts, "A SECOND CALL MOVES ONLY WHAT HAS NOT MOVED"),
+      // so the tail is floored and moved like any transfer — and the stock this
+      // submit hands over still leaves the books today, as above.
       //
       // IT RUNS BEFORE THE STATUS IS DECIDED (round 8). The transfer is a TAKE:
       // it can take the whole shelf by the shown-figure rule and leave the line
@@ -1439,7 +1470,39 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       // 'store_processed', and then the transfer made the line complete: a
       // requisition with nothing anyone could press (round-7 verifier,
       // pmgmt-party). Status is now decided once, below, after every take.
-      if (!linkedPoId && poDropped.length === 0 && heldItemIds.size === 0 && r.purpose === 'party') {
+      //
+      // A DROPPED LINE BLOCKS IT ONLY WHILE ITS LINE STILL OWES (round 9). The
+      // reason a dropped purchase line holds the transfer back is the goods it
+      // stands for: "a shortfall that WOULD have become a PO". A Buy qty typed
+      // on a line this submit issues in full is no shortfall — it is extra
+      // stock for the store, and the department is owed nothing on that line.
+      // Blocking on it left a requisition every line of which is complete, no
+      // PO linked and no transfer run: store-process wrote 'store_processed',
+      // the store desk shows it on no tab from the next day (its tabs read
+      // lines_open / qty_outstanding, both 0), and with no PO there is no
+      // receipt to cascade from — nothing anyone could press, ever (round-9
+      // verifier, po_unmapped_party: MANGO 2/2 kg, SALT 1/1 kg, shelf
+      // untouched). So a dropped line counts here only when its own line is
+      // still owed as this submit's write loop left it — the same per-line
+      // test as `allDone` below (either rejection is done; a deferred line is
+      // never done). It is read BEFORE the transfer on purpose: a line that
+      // only the transfer's take could close is still a shortfall the buyer
+      // was trying to order, exactly the case the drop rule is for.
+      const owesNow = db.prepare(`
+        SELECT ri.is_rejected, ri.store_rejected, ri.quantity_requested, ri.chef_approved_qty,
+               ri.quantity_issued, ri.deferred_until, ri.shelf_emptied_qty,
+               ri.unit AS line_unit, rm.unit, rm.purchase_unit, rm.pack_size
+        FROM requisition_items ri
+        LEFT JOIN raw_materials rm ON rm.id = ri.material_id
+        WHERE ri.id = ? AND ri.req_id = ?
+      `);
+      const poDroppedOwing = poDropped.filter(s => {
+        const it = owesNow.get(String(s.req_item_id || ''), id) as any;
+        if (!it) return true;                       // cannot tell → still outstanding (the old reading)
+        if (it.is_rejected || it.store_rejected) return false;
+        return !(lineIssueComplete(it) && !it.deferred_until);
+      });
+      if (!linkedPoId && poDroppedOwing.length === 0 && heldItemIds.size === 0 && r.purpose === 'party') {
         applyPartyFulfillment(db, id, me.email);
       }
 
@@ -1479,18 +1542,26 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         if (it.store_rejected) return true;
         return lineIssueComplete(it) && !it.deferred_until;
       });
-      // A line left off the PO for an unmapped vendor counts as OUTSTANDING, the
-      // same as a PO that was raised. Without `poSkipped.length` here, the one
-      // case where dropping a line changes the status is a full issue plus a
-      // buy-extra line: pre-fix it raised a PO and stayed 'store_processed', and
-      // it would now close as 'fulfilled' — dropping out of the store queue with
-      // a purchase still to arrange and this requisition its only record.
-      //
-      // poDropped, NOT poSkipped: a line reported as 'no_quantity' (a vendor
-      // picked with an empty Buy box) or 'chef_rejected' orders nothing and
-      // owes nothing, so counting it here would hold a fully-issued requisition
-      // open in the store queue forever over a stray dropdown click.
-      const finalStatus = (linkedPoId || poDropped.length > 0 || !allDone) ? 'store_processed' : 'fulfilled';
+      // A DROPPED PURCHASE LINE NO LONGER HOLDS THE REQUISITION OPEN (round 9).
+      // It used to (`poDropped.length > 0` here), on the reading that a full
+      // issue plus a buy-extra line should stay 'store_processed' "with a
+      // purchase still to arrange and this requisition its only record". That
+      // reading never held: the store desk files a requisition on its tabs by
+      // what its LINES still owe (lines_open / qty_outstanding), so one whose
+      // every line is complete sat on no tab from the next day, and with no PO
+      // linked no receipt could ever cascade it to 'fulfilled' — open in name,
+      // invisible in fact, and nothing anyone could press (round-9 verifier,
+      // po_unmapped_internal; identical on production 62aa895). A dropped line
+      // whose own line still owes keeps it open through `!allDone`, exactly as
+      // before; one on a line issued in full owes the department nothing.
+      // The purchase intent is not lost: quantity_to_purchase stays on the line
+      // (the write loop never clears it), and po_skipped_lines / po_note on
+      // this response name it with its way out (Vendor Items, then Purchase
+      // Orders) — the record the old comment wanted kept is kept.
+      // A RAISED PO still holds it open: its receipt cascades the requisition
+      // to 'fulfilled' (po-requisition-fulfil.ts), so there is something to
+      // press — on Purchase Orders.
+      const finalStatus = (linkedPoId || !allDone) ? 'store_processed' : 'fulfilled';
       const fulfilledAt = finalStatus === 'fulfilled' ? new Date().toISOString() : null;
 
       db.prepare(`
@@ -1602,6 +1673,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           requested: e.requestedPurchase, available: e.availablePurchase,
           purchase_unit: e.purchaseUnit,
           max_issue_qty: e.maxIssueLineQty, line_unit: e.lineUnit,
+          max_add_qty: e.maxAddLineQty, max_add_purchase: e.maxAddPurchase,
           message: e.message,
         }],
         req_item_ids: [e.reqItemId],
