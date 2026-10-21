@@ -192,6 +192,10 @@ const GROUP_RULES: ReadonlyArray<{ group: Exclude<TableGroup, 'Other'>; prefixes
       'task', 'recurring_task_rules', 'push_', 'cron', 'notification', 'print_',
       'config_fingerprint_log', 'checklist', 'daily_checklist_records', 'maintenance',
       'hygiene_audits', 'knowledge_test', 'training_sessions',
+      // FSSAI Compliance (fssai_templates, fssai_runs, fssai_responses, ...). Without
+      // this prefix all 11 land in `Other`, because groupForTable is first-match-wins
+      // prefix matching over these arrays and nothing else here starts with 'fssai'.
+      'fssai_',
     ],
   },
 ];
