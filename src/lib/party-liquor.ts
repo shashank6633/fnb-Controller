@@ -405,9 +405,10 @@ export function findPnlPartyIndex(parties: CachedPnlParty[], key: PartyEventKey)
  *       (requisitions.party_unique_id, filled by Raise Req). Name + date
  *       matching is a FALLBACK for a requisition with no id, and then only when
  *       EXACTLY ONE party that evening matches — the orphan-liquor rule below.
- *       When the cache lists the id on two or more F&P rows, the requisition's
- *       date picks the row, under the same exactly-one rule (see "WHOSE
- *       REQUISITION IS IT").
+ *       When the cache lists the id on two or more F&P rows, the F&P it was
+ *       raised from (requisitions.fp_id) picks the row, else its date does,
+ *       under the same exactly-one rule (ruling 43; see "WHOSE REQUISITION IS
+ *       IT").
  *   (b) A party with no AKAN id matches by name ONLY rows with no party id. Its
  *       P&L used to count every ID-BEARING party_consumption row recorded under
  *       its display name — i.e. another party's bottles — and the release batch
@@ -631,9 +632,17 @@ export function orphanShareOf(claims: OrphanClaims, index: number):
  *     requisition (ruling 34): the one holder on its event_date. Otherwise it
  *     is counted on NONE of them and listed for the owner to assign
  *     (candidates = the holders on its date, else every holder).
- *   · NO cached row holds it — counted on no board row, as before (the
- *     single-party P&L for that id still counts it: partySlot appends the key
- *     as the one holder).
+ *   · An entry whose stored id matches no holder EXACTLY but does once both are
+ *     trimmed (' AK-77 ' stored by a request that sent it padded; the cache
+ *     mapper trims the sheet's id) is the trimmed id's entry, by the same two
+ *     rules. Exact matches are tried first, so every entry charged before is
+ *     charged exactly as before.
+ *   · NO cached row holds it, even trimmed (the F&P was deleted from the sheet,
+ *     or its AKAN id was changed after the entry was recorded) — counted on no
+ *     board row, as before, and now LISTED for the owner (`notListed`; owner
+ *     ruling 43: "else on none and is listed") — it used to be on no row and in
+ *     no list. The single-party P&L for that id still counts it: partySlot
+ *     appends the key as the one holder.
  * Decided across every claimant at once, like the orphan claim, because "this
  * row and no other" cannot be seen from a per-row query.
  */
@@ -650,19 +659,29 @@ export interface IdConsumptionClaims {
   /** Its id is on two or more rows and neither its F&P nor its date picks one:
    *  counted on none until the owner assigns it. */
   shared: { row: IdConsumptionRow; candidates: number[] }[];
+  /** Its id is on NO claimant, even trimmed: counted on none, listed for the
+   *  owner (read-only — there is no row of that id to assign it to). */
+  notListed: IdConsumptionRow[];
 }
 
 /** THE RULE for id-bearing entries. See the block comment above. */
 export function claimIdConsumption(db: DB, claimants: OrphanClaimant[]): IdConsumptionClaims {
-  const out: IdConsumptionClaims = { owned: new Map(), shared: [] };
+  const out: IdConsumptionClaims = { owned: new Map(), shared: [], notListed: [] };
   const byId = new Map<string, number[]>();
+  // The same holders keyed by the TRIMMED id — consulted only for an entry whose
+  // stored id matches no holder exactly.
+  const byTrimmedId = new Map<string, number[]>();
+  const add = (m: Map<string, number[]>, id: string, i: number) => {
+    const list = m.get(id);
+    if (list) list.push(i); else m.set(id, [i]);
+  };
   claimants.forEach((c, i) => {
     const id = c.party_unique_id_raw;
     if (!id) return;
-    const list = byId.get(id);
-    if (list) list.push(i); else byId.set(id, [i]);
+    add(byId, id, i);
+    const t = id.trim();
+    if (t) add(byTrimmedId, t, i);
   });
-  if (!byId.size) return out;
   const rows = db.prepare(`
     SELECT id,
            TRIM(COALESCE(event_name, '')) AS event_name,
@@ -679,8 +698,9 @@ export function claimIdConsumption(db: DB, claimants: OrphanClaimant[]): IdConsu
     if (list) list.push(row); else out.owned.set(i, [row]);
   };
   for (const row of rows) {
-    const holders = byId.get(row.party_unique_id);
-    if (!holders) continue;
+    const trimmed = String(row.party_unique_id).trim();
+    const holders = byId.get(row.party_unique_id) || (trimmed ? byTrimmedId.get(trimmed) : undefined);
+    if (!holders) { out.notListed.push(row); continue; }
     if (holders.length === 1) { give(holders[0], row); continue; }
     // The F&P it was recorded from, when that is one of the holders.
     const byFp = row.fp_id ? holders.filter(i => (claimants[i].fp_id || '') === row.fp_id) : [];
@@ -706,7 +726,7 @@ export function idConsumptionShareOf(claims: IdConsumptionClaims, index: number)
 }
 
 /** Which claimant an entry is charged to under claimIdConsumption, or -1 when
- *  it is charged to none (listed, or no listed row holds its id). */
+ *  it is charged to none (listed as shared, or no listed row holds its id). */
 export function idConsumptionOwnerOf(claims: IdConsumptionClaims, entryId: string): number {
   for (const [i, rows] of claims.owned) if (rows.some(r => r.id === entryId)) return i;
   return -1;
@@ -730,11 +750,22 @@ export function idConsumptionOwnerOf(claims: IdConsumptionClaims, entryId: strin
  *     dates, or a re-created F&P beside the cancelled one): the id alone does
  *     not say which row the requisition is for, and giving it to every holder
  *     costed each rupee on two rows — production, matching by name + date, had
- *     put each requisition on its own date's row only. So among the holders of
- *     the id, the one whose date equals the requisition's event_date owns it;
- *     if no holder, or two or more, are on that date, it is costed on NONE of
- *     them and listed ('id_on_several_parties', candidates = the holders on its
- *     date, else every holder) — the same exactly-one rule as below.
+ *     put each requisition on its own date's row only. OWNER RULING 43
+ *     (2026-10-15): it counts on the F&P it was RAISED FROM — among the holders
+ *     of the id, the one whose fp_id is the requisition's fp_id (Raise Req
+ *     stamps the clicked row's fp_id, and since ruling 43 that row's details
+ *     too), exactly as claimIdConsumption charges a bottle to the F&P it was
+ *     recorded from. So two F&Ps of one booking on the SAME date each carry
+ *     their own requisitions, a requisition stays on its F&P when the sheet
+ *     moves that F&P's date, and an admin raise whose date was edited stays on
+ *     the F&P it was raised from. Only when its fp_id names none of the holders
+ *     (none stamped, or an F&P since deleted) does its date pick: the one
+ *     holder whose date equals the requisition's event_date owns it; if no
+ *     holder, or two or more, are on that date, it is costed on NONE of them
+ *     and listed ('id_on_several_parties', candidates = the holders on its
+ *     date, else every holder) — the same exactly-one rule as below. The fp_id
+ *     is compared only among holders of the requisition's OWN id: it never
+ *     moves a requisition to another id's party (ruling 34a).
  *   · CARRIES NO ID — the orphan-liquor rule: EXACTLY ONE claimant that evening
  *     whose candidate names include the requisition's event_name owns it; two or
  *     more → costed on NONE of them and listed ('several_parties'); none →
@@ -757,7 +788,10 @@ export interface PartyReqRef {
   event_name: string;       // as stored
   event_date: string;       // as stored
   party_unique_id: string;  // trimmed; '' = no id
-  fp_id: string;            // trimmed; display only (the ruling keys on the AKAN id)
+  /** trimmed; '' = none. The F&P it was raised from (Raise Req stamps it). Picks
+   *  the row ONLY among the holders of its own id when that id is on two or more
+   *  rows (ruling 43); it never moves a requisition to another id's party. */
+  fp_id: string;
 }
 
 export interface ReqClaims {
@@ -765,9 +799,10 @@ export interface ReqClaims {
   owned: Map<number, string[]>;
   /** No id, and two or more claimants match its name that evening: costed on none. */
   ambiguous: { req: PartyReqRef; candidates: number[] }[];
-  /** Carries an id two or more claimants hold, and the date does not pick exactly
-   *  one of them: costed on none. candidates = the holders on its date when there
-   *  are two or more, else every holder of the id. */
+  /** Carries an id two or more claimants hold, and neither the F&P it was raised
+   *  from nor its date picks exactly one of them: costed on none. candidates =
+   *  the holders on its date when there are two or more, else every holder of
+   *  the id. */
   idShared: { req: PartyReqRef; candidates: number[] }[];
   /** Carries an id no claimant has, while at least one claimant matches its name
    *  that evening (production costed it there): costed on no listed party. */
@@ -812,12 +847,18 @@ export function claimPartyRequisitions(db: DB, claimants: OrphanClaimant[]): Req
       const owners = byId.get(req.party_unique_id) || [];
       if (owners.length === 1) give(owners[0], req.id);
       else if (owners.length >= 2) {
-        // One id on several rows: the requisition's date picks the row (dates
-        // compared as the name index compares them — the claimant's trimmed date
-        // against the requisition's date as stored).
-        const onDate = owners.filter(i => String(claimants[i].date || '').trim() === req.event_date);
+        // One id on several rows (ruling 43): the F&P it was RAISED FROM — the
+        // holder whose fp_id is the requisition's fp_id — exactly as
+        // claimIdConsumption charges a bottle to the F&P it was recorded from.
+        const byFp = req.fp_id ? owners.filter(i => (claimants[i].fp_id || '') === req.fp_id) : [];
+        const pool = byFp.length ? byFp : owners;
+        if (pool.length === 1) { give(pool[0], req.id); continue; }
+        // Else its date picks the row (dates compared as the name index compares
+        // them — the claimant's trimmed date against the requisition's date as
+        // stored).
+        const onDate = pool.filter(i => String(claimants[i].date || '').trim() === req.event_date);
         if (onDate.length === 1) give(onDate[0], req.id);
-        else out.idShared.push({ req, candidates: onDate.length ? onDate : [...owners] });
+        else out.idShared.push({ req, candidates: onDate.length ? onDate : [...pool] });
       }
       else if (nameMatches.length) out.idNotListed.push({ req, nameMatches });
       continue;
@@ -834,7 +875,8 @@ export type ReqAwaitingReason = 'several_parties' | 'id_on_several_parties';
 /** One party's view of the requisition claim: the requisitions it is costed on,
  *  and the ones costed on nobody that list it as a candidate — id-less ones that
  *  name it AND another party that evening ('several_parties'), and ones carrying
- *  an id it shares with another cached row when the date does not pick one
+ *  an id it shares with another cached row when neither the F&P it was raised
+ *  from nor its date picks one
  *  ('id_on_several_parties'). Counted only so the badge and the modal can say so. */
 export function partyReqShareOf(claims: ReqClaims, index: number):
   { reqIds: string[]; awaiting: { req: PartyReqRef; candidates: number[]; reason: ReqAwaitingReason }[] } {

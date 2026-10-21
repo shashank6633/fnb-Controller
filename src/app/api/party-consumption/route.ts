@@ -382,11 +382,19 @@ export async function PATCH(request: Request) {
     if (!orphan) {
       // Re-pointable ONLY while the P&L charges it to nobody (its id is on two or
       // more rows and nothing picks one) — and only to one of its candidates.
-      const listed = claimIdConsumption(db, claimants).shared.find(s => s.row.id === id);
+      const idClaims = claimIdConsumption(db, claimants);
+      const listed = idClaims.shared.find(s => s.row.id === id);
       if (!listed) {
+        // Listed because NO F&P on the party list carries its id (ruling 43):
+        // there is no row of that id to pin it to.
+        if (idClaims.notListed.some(r => r.id === id)) {
+          return Response.json({ error: `No F&P on the party list carries party id ${row.party_unique_id} — there is no row to assign this entry to.` }, { status: 409 });
+        }
         return Response.json({ error: `Already assigned to party ${row.party_unique_id}` }, { status: 409 });
       }
-      if (row.party_unique_id !== target) {
+      // Trimmed: an entry stored with stray spaces (' AK-77 ') is claimed by the
+      // trimmed id's rows, and the page sends the cached (trimmed) id.
+      if (String(row.party_unique_id).trim() !== target) {
         return Response.json({ error: `This entry carries party id ${row.party_unique_id}; choose one of its F&P rows.` }, { status: 400 });
       }
       const pick = fpWanted ? listed.candidates.find(i => fpOf(i) === fpWanted) : undefined;

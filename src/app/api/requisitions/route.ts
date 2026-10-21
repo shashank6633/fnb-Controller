@@ -403,7 +403,7 @@ export async function POST(request: Request) {
     // Sheet-origin keys persisted on the requisition so the list page can
     // re-fetch live Column P data even after the sheet row updates later.
     const fpId           = (b.fp_id           || '').toString().trim();
-    const partyUniqueId  = (b.party_unique_id || '').toString().trim();
+    let   partyUniqueId  = (b.party_unique_id || '').toString().trim();
 
     if (!Array.isArray(items) || items.length === 0) {
       return Response.json({ error: 'items array required' }, { status: 400 });
@@ -459,9 +459,20 @@ export async function POST(request: Request) {
           const cache = db.prepare(`SELECT value FROM settings WHERE key = 'upcoming_parties_cache'`).get() as { value: string } | undefined;
           if (cache) {
             const sheetParties = (JSON.parse(cache.value).parties || []) as any[];
-            const match = sheetParties.find(p =>
-              (b.party_unique_id && p.party_unique_id === b.party_unique_id) ||
-              (b.fp_id && p.fp_id === b.fp_id)
+            // THE F&P IT IS RAISED FROM WINS (owner ruling 43, 2026-10-15). One
+            // AKAN id can sit on two F&P rows (two functions of one booking), so
+            // matching the id FIRST stamped a raise from the SECOND F&P with the
+            // FIRST one's name and date — and claimPartyRequisitions (an id on
+            // several rows: the requisition's date picks the row) then costed it
+            // on the wrong F&P, and that F&P's 409 gate never fired. So the row
+            // carrying the raise's fp_id is taken, id included — what an admin's
+            // raise from that row stores. Only a raise whose fp_id the cache
+            // does not hold falls back to the id. An id on ONE F&P, raised from
+            // it, matches the very same row either way.
+            const byFp = b.fp_id ? sheetParties.find(p => p.fp_id === b.fp_id) : undefined;
+            if (byFp) partyUniqueId = (byFp.party_unique_id || '').toString().trim();
+            const match = byFp || sheetParties.find(p =>
+              b.party_unique_id && p.party_unique_id === b.party_unique_id
             );
             if (match) {
               // Force-overwrite client values with sheet truth.

@@ -179,6 +179,32 @@ const EPS = 1e-9;
 const r6 = (n: number) => Math.round((Number(n) || 0) * 1e6) / 1e6;
 const fmt = (n: number) => (Number.isInteger(r6(n)) ? String(r6(n)) : String(Math.round(n * 1000) / 1000));
 
+/**
+ * THE DEPARTMENT RAIL'S RESPONSIBLE USER: THE SESSION'S, OR NO MOVEMENT AT ALL.
+ *
+ * Owner ruling 15 fixed the department staff-meal crash by PASSING THE USER to
+ * postDeptLedger. It did not authorise a movement nobody signed for, so a blank
+ * session is refused here, never relabelled. A `system:staff-meal` stand-in
+ * used to fill the gap, and the gap is reachable: src/proxy.ts step 2c reads
+ * `s.expires_at > datetime('now')` as TEXT, while createSession() stores ISO
+ * ('…T…Z', and 'T' sorts after ' '), so a token that expired earlier the same
+ * UTC day passes the proxy while getCurrentUser() returns null. Production
+ * refused that request (postDeptLedger threw: 500, whole batch rolled back).
+ * This throws at the same point inside the same transaction, so the same
+ * nothing is written. The handlers answer 401 'Sign in required' in place of
+ * the developer-facing 500.
+ *
+ * Only the department rail calls this. The central branch never took a user
+ * and is unchanged.
+ */
+const SIGN_IN_REQUIRED = 'Sign in required';
+function deptActor(sessionEmail: string): string {
+  if (!sessionEmail) throw Object.assign(new Error(SIGN_IN_REQUIRED), { staffMealNoSession: true });
+  return sessionEmail;
+}
+/** 401 for deptActor()'s refusal; every other error keeps its 500. */
+const errorStatus = (e: any) => (e && e.staffMealNoSession === true ? 401 : 500);
+
 type DeptMove =
   | { ok: true; recipeQty: number; factor: number; departmentName: string; materialName: string; recipeUnit: string }
   | { ok: false; error: string };
@@ -314,11 +340,11 @@ export async function POST(request: Request) {
     // one ("a responsible user is required"), so without this every DEPARTMENT
     // issue 500'd and rolled the whole batch back. Read here, before the
     // synchronous transaction, and never from the body: the body is the
-    // caller's to write. /api/staff-meals is session-gated by src/proxy.ts; the
-    // `system:` fallback is the honest label if a session is ever missing, and
-    // it reads as a machine actor on the register rather than a blank.
+    // caller's to write. No session means '' here, and deptActor() then refuses
+    // the department movement (401, nothing written). No `system:` stand-in:
+    // see deptActor() for why the session-less path is reachable.
     // Only the department rail takes it; the central branch is unchanged.
-    const itemActor = String((await getCurrentUser())?.email || '').trim() || 'system:staff-meal';
+    const itemActor = String((await getCurrentUser())?.email || '').trim();
     const db = getDb();
     const body = await request.json();
     const { items, deduct_inventory } = body;
@@ -705,8 +731,9 @@ export async function POST(request: Request) {
               notes: `Staff meal ${item.meal_id} — ${item.item_name} (${fmt(issuedQuantity)} ${lineUnit})`,
               // Required by postDeptLedger. Its throw fires AFTER the
               // staff_meal_items INSERT above, so a missing user took every
-              // other line of the batch down with it.
-              user: itemActor,
+              // other line of the batch down with it. With no session,
+              // deptActor() throws here instead: same point, same rollback, 401.
+              user: deptActor(itemActor),
             });
           } else {
             // CENTRAL branch — unchanged, on purpose.
@@ -754,7 +781,7 @@ export async function POST(request: Request) {
     insertItems();
     return Response.json(results, { status: 201 });
   } catch (error: any) {
-    return Response.json({ error: error.message }, { status: 500 });
+    return Response.json({ error: error.message }, { status: errorStatus(error) });
   }
 }
 
@@ -762,8 +789,9 @@ export async function POST(request: Request) {
 export async function PATCH(request: Request) {
   try {
     // The responsible user, from the SESSION — see POST. A department return
-    // posts through postDeptLedger and failed the same way.
-    const itemActor = String((await getCurrentUser())?.email || '').trim() || 'system:staff-meal';
+    // posts through postDeptLedger and failed the same way. No session: '',
+    // and deptActor() refuses the department return (401, nothing written).
+    const itemActor = String((await getCurrentUser())?.email || '').trim();
     const db = getDb();
     const body = await request.json();
     const { returns, restore_inventory } = body;
@@ -848,8 +876,8 @@ export async function PATCH(request: Request) {
               referenceId: item.meal_id,
               source: 'staff-meals/items:PATCH',
               notes: `Staff meal ${item.meal_id} — ${item.item_name} returned unused (${fmt(returnedQty)} ${item.unit})`,
-              // Required by postDeptLedger; see POST.
-              user: itemActor,
+              // Required by postDeptLedger; see POST and deptActor().
+              user: deptActor(itemActor),
             });
           } else {
             // CENTRAL branch — unchanged. Carries the same line-unit-vs-recipe-unit
@@ -877,7 +905,7 @@ export async function PATCH(request: Request) {
     processReturns();
     return Response.json(results);
   } catch (error: any) {
-    return Response.json({ error: error.message }, { status: 500 });
+    return Response.json({ error: error.message }, { status: errorStatus(error) });
   }
 }
 
@@ -885,7 +913,9 @@ export async function DELETE(request: Request) {
   try {
     // The responsible user, from the SESSION — see POST. Restoring a deleted
     // department line posts through postDeptLedger and failed the same way.
-    const itemActor = String((await getCurrentUser())?.email || '').trim() || 'system:staff-meal';
+    // No session: '', and deptActor() refuses the restore inside the delete's
+    // transaction, so the row stays (401, nothing written).
+    const itemActor = String((await getCurrentUser())?.email || '').trim();
     const db = getDb();
     const url = new URL(request.url);
     const id = url.searchParams.get('id');
@@ -932,8 +962,8 @@ export async function DELETE(request: Request) {
             referenceId: item.meal_id,
             source: 'staff-meals/items:DELETE',
             notes: `Staff meal item deleted — restored to ${move.departmentName} (${fmt(netRemoved)} ${item.unit})`,
-            // Required by postDeptLedger; see POST.
-            user: itemActor,
+            // Required by postDeptLedger; see POST and deptActor().
+            user: deptActor(itemActor),
           });
         } else {
           // CENTRAL branch — unchanged, including its line-unit bug (see POST).
@@ -950,6 +980,6 @@ export async function DELETE(request: Request) {
 
     return Response.json({ success: true });
   } catch (error: any) {
-    return Response.json({ error: error.message }, { status: 500 });
+    return Response.json({ error: error.message }, { status: errorStatus(error) });
   }
 }

@@ -3,7 +3,10 @@
 /**
  * Party P&L page — one-stop view of per-party profit & loss.
  *
- * Revenue   = Party Bookings sheet (col U) matched by party_unique_id
+ * Revenue   = Party Bookings sheet (col U) matched by party_unique_id, once per
+ *             booking — on the latest F&P carrying the id (owner ruling 43). Not
+ *             shown on this page (the consumption modal shows no revenue either);
+ *             /parties is where it is read.
  * Food Cost = party requisition items × material avg price (by event)
  * Liquor Cost = liquor lines of the party's Bar requisition (read-only here)
  *             + party_consumption × material avg price (snapshotted), including
@@ -175,12 +178,13 @@ interface PnLRow {
  *  under a name that matches two or more parties that evening
  *  ('several_parties') or none ('no_party'); or recorded WITH an id that is on
  *  two or more F&P rows when neither the F&P it was recorded from nor its date
- *  picks one ('id_on_several_parties'). */
+ *  picks one ('id_on_several_parties'), or with an id NO F&P on the party list
+ *  carries ('id_not_listed' — read-only, nothing to assign it to; ruling 43). */
 interface UnassignedLiquor {
   id: string;
   event_name: string;
   event_date: string;
-  reason: 'several_parties' | 'no_party' | 'id_on_several_parties';
+  reason: 'several_parties' | 'no_party' | 'id_on_several_parties' | 'id_not_listed';
   /** The entry's own party id (null for one recorded without an id). */
   party_unique_id?: string | null;
   material_name: string | null;
@@ -195,8 +199,9 @@ interface UnassignedLiquor {
 
 /** A COSTED party requisition on no party's P&L (owner ruling 34): it has no
  *  party id and two or more parties that evening carry its name, or it carries
- *  an id no listed party has, or an id two or more listed rows share when its
- *  date does not pick one. Read-only. Costs only for the financial audience. */
+ *  an id no listed party has, or an id two or more listed rows share when
+ *  neither the F&P it was raised from nor its date picks one (ruling 43).
+ *  Read-only. Costs only for the financial audience. */
 interface UnassignedRequisition {
   req_id: string;
   req_number: string;
@@ -376,13 +381,14 @@ export default function PartyPnLPage() {
                       )}
                       {/* A requisition raised under a name this party shares with
                           another that evening, carrying no party id — or carrying
-                          an id this row shares with another F&P when its date does
-                          not pick one: costed on NEITHER (owner ruling 34). Said
+                          an id this row shares with another F&P when neither the
+                          F&P it was raised from nor its date picks one: costed on
+                          NEITHER (owner rulings 34, 43). Said
                           here so the gap is not read as missing liquor. */}
                       {(r.requisitions_unassigned || 0) > 0 && (
                         <button onClick={() => setRecordFor(r)}
                                 className="block text-[10px] text-red-700 hover:underline text-left"
-                                title="A requisition with no party id raised under a name that matches more than one party that evening, or with a party id that is on more than one F&P whose date does not pick one — costed on none of them.">
+                                title="A requisition with no party id raised under a name that matches more than one party that evening, or with a party id that is on more than one F&P when neither the F&P it was raised from nor its date picks one — costed on none of them.">
                           {r.requisitions_unassigned} requisition{r.requisitions_unassigned === 1 ? '' : 's'} shared with another party — not costed
                         </button>
                       )}
@@ -475,8 +481,8 @@ function UnassignedLiquorPanel({ items, canAssign, onChanged }: {
         <div className="text-[11px] text-red-700 mt-0.5">
           Recorded without a party id under a name that matches more than one party that evening (or none) — or
           recorded with a party id that is on more than one F&amp;P, when neither the F&amp;P it was recorded from nor its
-          date picks one. None of the P&amp;Ls above includes these until {canAssign ? 'you assign' : 'the owner assigns'} each
-          one to its party.
+          date picks one — or with a party id no F&amp;P on the list carries. None of the P&amp;Ls above includes these until{' '}
+          {canAssign ? 'you assign' : 'the owner assigns'} each one to its party.
         </div>
       </div>
       {err && <div className="px-4 py-2 text-xs bg-red-50 text-red-700 border-b border-red-200">{err}</div>}
@@ -500,6 +506,9 @@ function UnassignedLiquorPanel({ items, canAssign, onChanged }: {
                   {x.reason === 'id_on_several_parties' && x.party_unique_id && (
                     <div className="text-[10px] text-[#8B7355]">carries id {x.party_unique_id} — on more than one F&amp;P</div>
                   )}
+                  {x.reason === 'id_not_listed' && x.party_unique_id && (
+                    <div className="text-[10px] text-[#8B7355]">carries id {x.party_unique_id} — not on the party list</div>
+                  )}
                   {x.recorded_by && <div className="text-[10px] text-[#8B7355]">by {String(x.recorded_by).split('@')[0]}</div>}
                   {x.recorded_fp_id && (
                     <div className="text-[10px] text-[#8B7355]"
@@ -514,7 +523,9 @@ function UnassignedLiquorPanel({ items, canAssign, onChanged }: {
                 </td>
                 <td className="py-1.5 px-3 text-right font-mono">{fmt(x.cost_at_time)}</td>
                 <td className="py-1.5 px-3">
-                  {x.reason === 'no_party' || x.candidates.length === 0
+                  {x.reason === 'id_not_listed'
+                    ? <span className="text-[10px] text-[#8B7355]">No F&amp;P on the party list carries this id — nothing to assign it to.</span>
+                    : x.reason === 'no_party' || x.candidates.length === 0
                     ? <span className="text-[10px] text-[#8B7355]">No party on this date carries this name.</span>
                     : <div className="flex flex-col gap-1">
                         {x.candidates.map((c, ci) => (
@@ -562,9 +573,9 @@ function UnassignedRequisitionsPanel({ items }: { items: UnassignedRequisition[]
         </div>
         <div className="text-[11px] text-red-700 mt-0.5">
           A requisition counts only on the party whose AKAN id it carries; without an id, only when exactly one party
-          that evening has the name it was raised under. When its id is on more than one F&amp;P, only on the one dated
-          on its date. These match more than one party (or carry an id no listed party has), so none of the P&amp;Ls
-          above includes them.
+          that evening has the name it was raised under. When its id is on more than one F&amp;P, only on the F&amp;P it
+          was raised from — else on the one dated on its date. These match more than one party (or carry an id no
+          listed party has), so none of the P&amp;Ls above includes them.
         </div>
       </div>
       <div className="overflow-x-auto">
@@ -593,7 +604,7 @@ function UnassignedRequisitionsPanel({ items }: { items: UnassignedRequisition[]
                     <div className="text-[10px] text-[#8B7355]">carries id {x.party_unique_id} — not on the party list</div>
                   )}
                   {x.reason === 'id_on_several_parties' && x.party_unique_id && (
-                    <div className="text-[10px] text-[#8B7355]">carries id {x.party_unique_id} — on more than one F&amp;P; its date does not pick one</div>
+                    <div className="text-[10px] text-[#8B7355]">carries id {x.party_unique_id} — on more than one F&amp;P; neither the F&amp;P it was raised from nor its date picks one</div>
                   )}
                 </td>
                 <td className="py-1.5 px-3 text-right font-mono whitespace-nowrap">
@@ -651,8 +662,8 @@ interface UnassignedEntry extends ConsumptionEntry {
 
 /** A requisition costed on NEITHER party (owner ruling 34): no party id and
  *  raised under a name this party shares with another that evening, or carrying
- *  an id this row shares with another F&P when its date does not pick one.
- *  Never summed. */
+ *  an id this row shares with another F&P when neither the F&P it was raised
+ *  from nor its date picks one (ruling 43). Never summed. */
 interface UnassignedReqHere {
   req_id: string;
   req_number: string;
@@ -1041,7 +1052,7 @@ function RecordConsumptionModal({ target, onClose, onChanged }: {
                 </span>
               ))}
               . A requisition without a party id is costed only when exactly one party that evening has its name;
-              one whose id is on more than one F&amp;P, only when exactly one of them is on its date.
+              one whose id is on more than one F&amp;P, on the F&amp;P it was raised from — else only when exactly one of them is on its date.
             </div>
           )}
 

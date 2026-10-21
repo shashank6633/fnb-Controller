@@ -1,6 +1,6 @@
 import { getDb } from '@/lib/db';
 import { getCurrentOutletId, getCurrentUser } from '@/lib/auth';
-import { loadBookingsCache, loadUpcomingParties, resolveBookingRevenue } from '@/lib/party-revenue';
+import { loadBookingsCache, loadUpcomingParties, resolveBookingRevenue, revenueSeats, loadCreatedAt } from '@/lib/party-revenue';
 
 /**
  * Party Events P&L.
@@ -48,6 +48,11 @@ export async function GET(request: Request) {
     const today = new Date().toISOString().slice(0, 10);
     const bookings = loadBookingsCache(db);
     const cachedParties = loadUpcomingParties(db);
+    // Owner ruling 43: a booking whose AKAN id is on two or more F&P rows counts
+    // ONCE, on its latest F&P — the very seat /api/party-events/pnl uses (same
+    // rule, same cached list), so only the event row resolving to that F&P
+    // carries the Final Total. An id on one F&P has no seat: unchanged.
+    const seats = revenueSeats(cachedParties, loadCreatedAt(db, cachedParties));
 
     // Single event detail
     if (eventName && eventDate) {
@@ -101,7 +106,7 @@ export async function GET(request: Request) {
                 && i.req_unit !== i.unit && pack > 1) ? pack : 1;
       };
       const cost    = items.reduce((s, i) => s + i.quantity_requested * packFactor(i) * (i.average_price || 0), 0);
-      const br      = resolveBookingRevenue(bookings, cachedParties, eventName, eventDate, today, true);
+      const br      = resolveBookingRevenue(bookings, cachedParties, eventName, eventDate, today, true, seats);
       const revenue = br.revenue;
       const guests  = reqs[0]?.guest_count || 0;
 
@@ -203,7 +208,7 @@ export async function GET(request: Request) {
     return Response.json({
       events: events.map(e => {
         const cost = Number(e.cost) || 0;
-        const br   = resolveBookingRevenue(bookings, cachedParties, e.event_name, e.event_date, today, true);
+        const br   = resolveBookingRevenue(bookings, cachedParties, e.event_name, e.event_date, today, true, seats);
         const rev  = br.revenue;   // Party Bookings Final Total (gated), not POS sales
         return redact({
           event_name: e.event_name,
