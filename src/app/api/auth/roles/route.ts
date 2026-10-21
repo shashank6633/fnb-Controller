@@ -10,11 +10,60 @@ export const revalidate = 0;
 
 const VALID_BASE = ['admin', 'manager', 'staff'] as const;
 
-/** Keep only real catalog paths; null/empty → NULL (= all pages). */
-function cleanPages(input: unknown): string | null {
-  if (!Array.isArray(input) || input.length === 0) return null;
-  const valid = input.filter((p) => typeof p === 'string' && ALL_PAGE_PATHS.includes(p));
-  return valid.length ? JSON.stringify(valid) : null;
+/**
+ * Keep only real catalog paths. THREE outcomes, and the difference between the
+ * last two is a privilege boundary:
+ *
+ *   · nothing submitted (not an array, or an empty one) → `null`, which
+ *     canAccessPage reads as ALL PAGES (`if (!user.page_access) return true`).
+ *     That is this app's existing "the role just follows its tier" contract:
+ *     the Roles screen sends `null` for an admin-tier role and `[]` when an
+ *     admin unticks every box. UNCHANGED by this fix.
+ *   · at least one submitted path is in the catalog → store exactly those.
+ *   · paths WERE submitted but NOT ONE of them is in the catalog → REFUSED.
+ *
+ * THAT LAST CASE USED TO RETURN `null` AS WELL — i.e. it granted the ENTIRE
+ * APPLICATION to a role whose admin had just tried to restrict it. Measured on
+ * a running server before this fix: POST {base_role:'staff', page_access:[the
+ * twenty /fssai paths]} while the catalog did not yet carry them → HTTP 201 with
+ * page_access stored as NULL, and a staff user on that role then opened
+ * /settings/roles, /users and /customers among 14 of 16 pages probed. An admin
+ * who ticks pages this build has never heard of is trying to NARROW a role;
+ * silently widening it to everything is the exact opposite of what he asked for.
+ *
+ * WHY REFUSE RATHER THAN STORE "no pages": there is no way to SPELL deny-all in
+ * this column. canAccessPage grants everything for NULL, for an unparseable
+ * value, AND for `[]` — so every value this function could return for an
+ * all-unknown list means "all pages". Refusing to write is the only fail-closed
+ * answer available to it. The caller turns this into a 400 the admin can read;
+ * settings/roles/page.tsx already alerts `j.error`.
+ *
+ * A PARTIALLY known list still stores its known subset and drops the rest. That
+ * is a narrowing, so it is safe, and it is long-standing behaviour — left alone
+ * deliberately rather than widened into a second refusal.
+ *
+ * ORDERING RULE THIS DOES NOT REPLACE: catalog entries must still land BEFORE
+ * or WITH any role that references them. This fix stops a late catalog causing
+ * an escalation; it cannot make an uncatalogued page grantable.
+ */
+type CleanedPages =
+  | { ok: true; value: string | null }
+  | { ok: false; error: string };
+
+function cleanPages(input: unknown): CleanedPages {
+  if (!Array.isArray(input) || input.length === 0) return { ok: true, value: null };
+  const submitted = input.filter((p): p is string => typeof p === 'string' && p.trim() !== '');
+  const valid = submitted.filter((p) => ALL_PAGE_PATHS.includes(p));
+  if (valid.length) return { ok: true, value: JSON.stringify(valid) };
+  if (!submitted.length) {
+    return { ok: false, error: 'page_access must be a list of page paths. Refusing to save: an unrecognised page list would have granted this role every page in the app.' };
+  }
+  const shown = submitted.slice(0, 5).join(', ');
+  const more = submitted.length > 5 ? ` (+${submitted.length - 5} more)` : '';
+  return {
+    ok: false,
+    error: `None of these pages exist in this build: ${shown}${more}. Refusing to save: an unrecognised page list would have granted this role every page in the app. Re-tick the pages on this screen, or install the build that has them.`,
+  };
 }
 
 /** Coerce a max-discount-% input to a sane number in [0, 100]. Non-numeric → 0. */
@@ -51,6 +100,10 @@ export async function POST(req: Request) {
   const nm = String(name || '').trim();
   if (!nm) return Response.json({ error: 'Role name is required' }, { status: 400 });
   if (!VALID_BASE.includes(base_role)) return Response.json({ error: `tier must be one of ${VALID_BASE.join(', ')}` }, { status: 400 });
+  // Validate the page list BEFORE touching the database: an all-unknown list is
+  // refused rather than silently stored as NULL (= every page). See cleanPages.
+  const pages = cleanPages(page_access);
+  if (!pages.ok) return Response.json({ error: pages.error }, { status: 400 });
   const db = getDb();
   if (db.prepare('SELECT id FROM roles WHERE lower(name) = lower(?)').get(nm)) {
     return Response.json({ error: 'A role with that name already exists' }, { status: 409 });
@@ -66,7 +119,7 @@ export async function POST(req: Request) {
     -- better-sqlite3 rejects at PREPARE time — so creating any new role 500'd
     -- while editing existing ones (PUT, which uses named sets.push) kept working.
     VALUES (lower(hex(randomblob(16))), ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
-  `).run(nm, base_role, cleanPages(page_access), is_head_chef ? 1 : 0, is_store_manager ? 1 : 0,
+  `).run(nm, base_role, pages.value, is_head_chef ? 1 : 0, is_store_manager ? 1 : 0,
          can_approve_requisitions ? 1 : 0,
          can_void_bill_handover ? 1 : 0,
          can_view_finance_reports ? 1 : 0,
@@ -88,13 +141,19 @@ export async function PUT(req: Request) {
   const role = db.prepare('SELECT * FROM roles WHERE id = ?').get(id) as any;
   if (!role) return Response.json({ error: 'Role not found' }, { status: 404 });
 
+  // Validate the page list BEFORE the UPDATE is built, so a refusal can never
+  // leave a half-applied change behind. See cleanPages: an all-unknown list used
+  // to be stored as NULL, which means EVERY page.
+  const pages = page_access === undefined ? null : cleanPages(page_access);
+  if (pages && !pages.ok) return Response.json({ error: pages.error }, { status: 400 });
+
   const sets: string[] = [];
   const params: any[] = [];
   // System roles (Administrator/Manager/Staff): allow page/flag edits, but not a
   // rename or a tier change (those underpin enforcement defaults).
   if (name != null && !role.is_system)        { sets.push('name = ?'); params.push(String(name).trim()); }
   if (base_role != null && !role.is_system)   { sets.push('base_role = ?'); params.push(base_role); }
-  if (page_access !== undefined)              { sets.push('page_access = ?'); params.push(cleanPages(page_access)); }
+  if (pages && pages.ok)                      { sets.push('page_access = ?'); params.push(pages.value); }
   if (is_head_chef !== undefined)             { sets.push('is_head_chef = ?'); params.push(is_head_chef ? 1 : 0); }
   if (is_store_manager !== undefined)         { sets.push('is_store_manager = ?'); params.push(is_store_manager ? 1 : 0); }
   if (can_approve_requisitions !== undefined) { sets.push('can_approve_requisitions = ?'); params.push(can_approve_requisitions ? 1 : 0); }
