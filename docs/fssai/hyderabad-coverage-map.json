@@ -1,0 +1,1313 @@
+{
+  "summary": "Map every line of the Hyderabad Food Safety Authority audit checklist onto the FSSAI module (read-only)",
+  "agentCount": 4,
+  "logs": [
+    "Mapped 120 items: 42 checked, 24 recorded, 43 partial, 11 gap"
+  ],
+  "result": {
+    "total": 120,
+    "counts": {
+      "CHECKED": 42,
+      "RECORDED": 24,
+      "PARTIAL": 43,
+      "GAP": 11
+    },
+    "not_inspector_visible": 51,
+    "gaps": [
+      {
+        "section": "Licences & Display",
+        "item": "Food Safety Display Board (FSDB) displayed and readable",
+        "missing": "Add a checklist question 'Food Safety Display Board displayed at a prominent place, readable, showing the current licence number', with a photo on fail. Optionally add an FSDB doc or photo record under Documents so the board itself is on file."
+      },
+      {
+        "section": "Storage – Very Important",
+        "item": "Food-grade containers used",
+        "missing": "Add 'Food stored only in food-grade containers — no paint buckets, chemical drums, newspaper or non-food plastic; containers intact' to CHK-STORE-DRY-DAILY and CHK-STORE-COLD-DAILY."
+      },
+      {
+        "section": "Food Preparation",
+        "item": "Raw materials washed/cleaned properly",
+        "missing": "A question in a prep checklist (e.g. CHK-FQ-PRESERVICE): 'Vegetables and fruit washed in potable water (and sanitised where required) before cutting'. If the SOP uses a sanitiser dip, also a ppm/strength reading."
+      },
+      {
+        "section": "Cleaning & Sanitation",
+        "item": "Sinks",
+        "missing": "Add a daily question on CHK-CLEAN-KITCHEN-DAILY: 'Pot-wash, prep and hand-wash sinks, taps and draining boards cleaned and sanitised'."
+      },
+      {
+        "section": "Waste Management",
+        "item": "Separate wet/dry waste as applicable",
+        "missing": "Add 'Wet and dry waste kept in separate, labelled or colour-coded bins' to CHK-CLEAN-KITCHEN-DAILY (FLOORS section)."
+      },
+      {
+        "section": "Food-Grade Equipment & Packaging",
+        "item": "Food-contact equipment is food-safe",
+        "missing": "A periodic (e.g. monthly) question: 'All food-contact equipment and utensils are of food-grade material', ideally with supplier declarations filed under Documents (FSSAI_DOC_TYPES has no such type; only 'other', fssai.ts:2535-2552)."
+      },
+      {
+        "section": "Food-Grade Equipment & Packaging",
+        "item": "Containers are non-toxic and easy to clean",
+        "missing": "Add 'Food containers are non-toxic, food-grade, smooth and easy to clean (no reused chemical or paint tubs)'."
+      },
+      {
+        "section": "Food-Grade Equipment & Packaging",
+        "item": "No rusted/damaged food-contact equipment",
+        "missing": "A daily or weekly question: 'No rusted, chipped, cracked or damaged utensils, pans, boards or containers in use; damaged items withdrawn'."
+      },
+      {
+        "section": "Food-Grade Equipment & Packaging",
+        "item": "Food-grade storage containers",
+        "missing": "Add to the storage checklists: 'All food stored in food-grade, lidded containers'."
+      },
+      {
+        "section": "Food-Grade Equipment & Packaging",
+        "item": "Food-grade packaging for delivery",
+        "missing": "A dispatch/takeaway question ('Delivery packaging food-grade, clean, sealed/tamper-evident') plus the packaging supplier's food-grade declaration filed in Documents."
+      },
+      {
+        "section": "Food-Grade Equipment & Packaging",
+        "item": "No newspaper used for food wrapping",
+        "missing": "Add 'No newspaper or printed paper in contact with food (wrapping, lining, draining oil)' to a daily kitchen or service checklist."
+      }
+    ],
+    "partial": [
+      {
+        "section": "Licences & Display",
+        "item": "FSSAI licence displayed prominently",
+        "missing": "The app can prove the licence is held and valid, but nothing proves it is DISPLAYED. None of the 12 templates asks it; a grep for 'display', 'prominent' and 'FSDB' across src/lib/fssai*.ts, src/app/fssai and src/app/api/fssai finds nothing. To close it, add a recurring question such as 'FSSAI licence (original or certified copy) displayed at a prominent place in the premises, legible and in date', with a photo on fail. It fits CHK-SAFE-OPENING or a new premises checklist. Also nothing warns when no 'fssai_licence' row exists at all."
+      },
+      {
+        "section": "Licences & Display",
+        "item": "Approved vendor list maintained",
+        "missing": "An approved-supplier register is needed: per vendor an approved flag or date, FSSAI licence number and expiry, and what they supply. It should be shown as one list in Reports and Inspection Mode, and Receiving should warn when an unapproved or expired-licence vendor delivers. Also, the Reports 'Documents and certificates' 'Belongs to' column prints the raw vendor_id UUID instead of the vendor name (src/app/api/fssai/_p9/reports.ts:1203)."
+      },
+      {
+        "section": "Kitchen & Premises Hygiene",
+        "item": "Kitchen floors clean, dry and non-slippery",
+        "missing": "No question asks whether the floor surface is non-slip, such as anti-skid flooring with no worn or polished patches. Clean is asked at closing and dry at opening, in two checklists from two modules, so no single answer covers the line. Add 'Kitchen floor clean, dry and non-slippery' as one question, or add 'non-slip' to CHK-SAFE-OPENING Q10."
+      },
+      {
+        "section": "Kitchen & Premises Hygiene",
+        "item": "Walls and ceiling clean; no peeling paint/plaster",
+        "missing": "No question asks whether the KITCHEN ceiling is clean, and none asks whether kitchen walls or ceiling are free of peeling paint or plaster. Add 'Kitchen walls and ceiling clean; no peeling paint, flaking plaster, cracks or fungus' to a kitchen checklist, such as CHK-CLEAN-DEEP-WEEKLY or a new weekly premises check."
+      },
+      {
+        "section": "Kitchen & Premises Hygiene",
+        "item": "Adequate lighting",
+        "missing": "No question covers kitchen, prep or wash-up lighting. Add 'Lighting adequate in all food preparation and wash-up areas' to a kitchen checklist."
+      },
+      {
+        "section": "Kitchen & Premises Hygiene",
+        "item": "Light fittings protected against breakage",
+        "missing": "No question asks whether kitchen light fittings over food areas have shatter-proof covers or diffusers that are intact. Add one to a kitchen checklist."
+      },
+      {
+        "section": "Kitchen & Premises Hygiene",
+        "item": "Doors/windows clean and pest-proof",
+        "missing": "No question asks whether kitchen doors and windows are CLEAN, and none asks whether they are pest-proof (mesh intact, self-closing doors, no gaps, air curtain or strip curtain working) for the kitchen and other food areas. Add 'Doors and windows in food areas clean and pest-proof — mesh intact, doors self-closing, no gaps'."
+      },
+      {
+        "section": "Kitchen & Premises Hygiene",
+        "item": "No unnecessary items stored in food areas",
+        "missing": "No question covers the kitchen, prep or cold areas. Add 'No unnecessary items in food areas — no unused equipment, cartons, junk, personal belongings or non-food stock in kitchen, prep or storage areas'."
+      },
+      {
+        "section": "Storage – Very Important",
+        "item": "FEFO followed",
+        "missing": "Add a question 'Stock with the earliest expiry date is issued and used first (FEFO), in dry and cold storage'. Also extend the FEFO board to bought-in lots using the expiry dates captured at receiving, and give it a saved record or report so an inspector can see it."
+      },
+      {
+        "section": "Storage – Very Important",
+        "item": "Veg and non-veg properly segregated",
+        "missing": "No question says veg and non-veg must be kept apart. Cooked non-veg vs cooked veg, separate shelves or containers, and colour coding are not asked, and the dry store has no equivalent. Add 'Veg and non-veg stored separately — separate shelves or containers, clearly marked or colour-coded, in every cold unit and store'."
+      },
+      {
+        "section": "Storage – Very Important",
+        "item": "Personal items kept outside food-storage areas",
+        "missing": "Add 'No personal belongings (bags, phones, clothing, staff food or medicines) inside dry stores, cold rooms or fridges' to CHK-STORE-DRY-DAILY and CHK-STORE-COLD-DAILY."
+      },
+      {
+        "section": "Food Temperature Control",
+        "item": "Maintain a temperature monitoring sheet for Cooling",
+        "missing": "(1) Every reading taken while the food is still cooling is recorded as a BREACH. The level check runs before and independently of the clock (_p4/lib.ts:244-247), so 30 C at 60 min fails the 5 C maximum even though the 240-minute window is still open. Each such reading then forces an 'action taken' (temperature/route.ts:623) and raises a corrective action, so staff can only log the end point. (2) Nothing links the readings of one batch into a curve. There is no start time or start temperature, and elapsed_minutes is typed in by hand. (3) The register report and inspection mode do not print elapsed_minutes or max_minutes_used, so the inspector's sheet cannot show the food cooled within time. (4) No checklist question asks about cooling. To close it: a cooling-curve record (start time and start temperature, each reading judged only against the clock stage it belongs to), and the time column printed on the register and in inspection mode."
+      },
+      {
+        "section": "Food Preparation",
+        "item": "Raw and cooked food not cross-contaminated",
+        "missing": "No question asks about separation DURING PREPARATION: separate prep areas or surfaces for raw and cooked, no raw food handled at the cooked/ready-to-eat station, hands washed and utensils changed between raw and cooked. Q08 covers tools only, and Q01/Q02 cover storage only."
+      },
+      {
+        "section": "Food Preparation",
+        "item": "Food covered during preparation/storage",
+        "missing": "The 'during preparation' half is not asked. Add a question such as 'Food on the line and prepared mise en place kept covered when not being worked on' to CHK-FQ-PRESERVICE or CHK-FQ-HOLDING."
+      },
+      {
+        "section": "Food Preparation",
+        "item": "No direct hand contact with ready-to-eat food where avoidable",
+        "missing": "Q08 asks whether gloves are SEPARATE for raw and ready-to-eat, not whether bare hands are kept off ready-to-eat food. Add 'Ready-to-eat food handled with tongs, utensils or fresh gloves, never bare hands'."
+      },
+      {
+        "section": "Personal Hygiene – Critical",
+        "item": "Every food handler should have Appropriate apron",
+        "missing": "The question is 'uniform OR apron', so a handler in a clean uniform with no apron passes. Add a separate 'Apron worn, clean and appropriate to the task' question, or split Q04."
+      },
+      {
+        "section": "Personal Hygiene – Critical",
+        "item": "Every food handler should have Proper handwashing practice",
+        "missing": "Q10 asks once, at the start of the shift. Nothing asks about washing at the other required moments (after the toilet, after raw food, waste or breaks). The soap, drying and notice checks cover WASHROOM basins only; no question asks whether the kitchen hand-wash station is stocked with soap and drying and is used."
+      },
+      {
+        "section": "Personal Hygiene – Critical",
+        "item": "Every food handler should have Medical examination records available",
+        "missing": "(1) A person-scoped document must belong to an app user (users.email check at documents/route.ts:168-178). Locally there are 9 users and 0 hr_employees, so a cook or helper without a login cannot have a medical certificate filed under their name. (2) No list of food handlers shows who has no valid certificate. (3) Inspection mode's certificate rows drop person_email (inspection-mode/route.ts:138-147), so the officer cannot see whose certificate it is unless the title says. To close it: key person documents on the HR employee list (or allow a named handler without a login), add a coverage view, and show the holder in inspection mode."
+      },
+      {
+        "section": "Personal Hygiene – Critical",
+        "item": "Every food handler should have Food-safety training records available",
+        "missing": "The same person-key limit as medical records: only app users can hold a training document, there is no per-handler coverage list, and inspection mode does not show the holder. HRMS has hr_trainings and hr_training_assignments tables, but they are not linked to the FSSAI module, so nothing there reaches inspection mode or the FSSAI reports."
+      },
+      {
+        "section": "Cleaning & Sanitation",
+        "item": "Walls",
+        "missing": "The authority asks for walls on a DAILY cleaning checklist, and CHK-CLEAN-KITCHEN-DAILY has no wall question. Add e.g. 'Walls, splashbacks and tiles at working height wiped clean' to its SURFACES section."
+      },
+      {
+        "section": "Cleaning & Sanitation",
+        "item": "Exhaust/hood",
+        "missing": "On most days the daily sheet will read N/A for the hood, and nothing asks for a daily clean of the hood canopy or outer surfaces. Add a required daily question (e.g. 'Hood canopy and grease channel wiped, drip tray emptied') and keep filters on their own frequency."
+      },
+      {
+        "section": "Cleaning & Sanitation",
+        "item": "Crockery/cutlery",
+        "missing": "No question asks whether the crockery and cutlery themselves are washed, sanitised, dried and stored covered or inverted, or whether chipped or cracked pieces are kept out of use. Add one to the FOH round."
+      },
+      {
+        "section": "Cleaning & Sanitation",
+        "item": "Water station",
+        "missing": "Add 'Water station, dispenser or RO outlet, and glass trays cleaned and sanitised' to the FOH round."
+      },
+      {
+        "section": "Pest Control",
+        "item": "Pest-control chemicals/records maintained",
+        "missing": "Add a chemicals editor (name, batch, dilution, qty, licence) to the visit form and the complete-visit flow, and show it in the 'Pest control visits' report and Inspection Mode. Until then the chemicals are only on a photographed job sheet or typed into findings."
+      },
+      {
+        "section": "Pest Control",
+        "item": "No cockroaches",
+        "missing": "A daily kitchen pest check, either on CHK-CLEAN-KITCHEN-DAILY or in a new pest-control monitoring template: 'No cockroaches seen in kitchen, prep, wash-up, dry store or cold rooms (under equipment, drains, crevices)'."
+      },
+      {
+        "section": "Pest Control",
+        "item": "No flies",
+        "missing": "A kitchen and prep-area question 'No flies; insect light traps working and catch trays emptied', in a seeded pest-monitoring template."
+      },
+      {
+        "section": "Pest Control",
+        "item": "No rodents",
+        "missing": "A rodent check covering kitchen, stores and back areas, plus a bait-station round with each station marked checked (the 'weekly monitoring round' template the code assumes exists)."
+      },
+      {
+        "section": "Pest Control",
+        "item": "No pest droppings/eggs/larvae",
+        "missing": "A kitchen-area question naming droppings, egg cases and larvae, and an 'eggs/larvae' evidence kind on sightings."
+      },
+      {
+        "section": "Pest Control",
+        "item": "Insect-proof screens where required",
+        "missing": "A premises-wide question: 'Kitchen and prep windows, vents and exhaust openings fitted with intact insect-proof mesh'."
+      },
+      {
+        "section": "Pest Control",
+        "item": "Door gaps sealed",
+        "missing": "Cover kitchen, service and external doors: 'No gaps at door bottoms or frames; doors self-closing; strip or air curtain working'."
+      },
+      {
+        "section": "Waste Management",
+        "item": "No overflowing bins",
+        "missing": "An in-service question, e.g. on CHK-FQ-PRESERVICE or the twice-daily round: 'No bin overflowing; lids closed during service'."
+      },
+      {
+        "section": "Waste Management",
+        "item": "Waste area kept clean",
+        "missing": "Reword or add: 'Waste area washed — no spillage, leachate, smell or flies'."
+      },
+      {
+        "section": "Waste Management",
+        "item": "No food waste accumulated near preparation areas",
+        "missing": "An in-service question: 'No food scraps or waste left on or near prep tables; scrap bins emptied during service'."
+      },
+      {
+        "section": "Food-Grade Equipment & Packaging",
+        "item": "Packaging properly stored",
+        "missing": "A specific question: 'Packaging material stored clean, covered, off the floor, away from chemicals and pests'."
+      },
+      {
+        "section": "Records You Should Keep Ready in One Audit File",
+        "item": "FSSAI licence copy",
+        "missing": "(1) The scheduled retention sweep deletes the scan 12 months after upload. Path: src/lib/fssai-jobs.ts:242,726 calls src/lib/fssai-retention.ts:254-260, which has no entity_table or kind exemption, and the page says 'image kept 12 months' (documents/page.tsx:857,883). A licence valid for 1-5 years therefore loses its copy while still in force. (2) Only JPG/PNG/WebP up to 400 KB, downscaled to 1200 px, are accepted (src/lib/fssai.ts:1217,1251,1306). The FoSCoS PDF cannot be uploaded. (3) The copy cannot be opened from Inspection Mode or from any report. (4) The documents-expiry report does not filter is_active (reports.ts:1182-1191), so the licence a renewal replaced prints as 'EXPIRED' next to the current one."
+      },
+      {
+        "section": "Records You Should Keep Ready in One Audit File",
+        "item": "FSDB photograph",
+        "missing": "Add a dedicated 'fsdb_photo' document type, or a display-board question that requires a photo, so the photo is prompted, named and findable. Exempt it from the 12-month image sweep. Show the photo in Inspection Mode. Today it can only be filed as an untyped 'Other' row, and Inspection Mode shows no images."
+      },
+      {
+        "section": "Records You Should Keep Ready in One Audit File",
+        "item": "Food-handler medical certificates",
+        "missing": "person_email must be an existing users.email (src/app/api/fssai/documents/route.ts:168-178), and the local DB has only 9 users. A food handler without an app login cannot have a certificate filed, and hr_employees is not linked. There is no coverage roster showing every food handler and whether their certificate is valid, missing or expired. Inspection Mode does not show whose certificate each row is, or the scan. Scans are deleted after 12 months."
+      },
+      {
+        "section": "Records You Should Keep Ready in One Audit File",
+        "item": "Food-safety training records",
+        "missing": "The same users-only key as medical certificates (documents/route.ts:177), so food handlers without a login cannot be covered. HRMS training is not linked into FSSAI, the reports or Inspection Mode. There is no FoSTaC supervisor record or ratio, and no per-person coverage list. FoSTaC certificates last 2 years, but their scans are deleted after 12 months."
+      },
+      {
+        "section": "Records You Should Keep Ready in One Audit File",
+        "item": "Approved vendor list",
+        "missing": "There is no approved-supplier register (approved, by whom, when, for which items) and no report or export that prints the approved vendor list with licence number and validity. Neither Inspection Mode nor any of the 21 reports covers it."
+      },
+      {
+        "section": "Records You Should Keep Ready in One Audit File",
+        "item": "Pest-control monitoring sheet",
+        "missing": "Add a station-by-station monitoring record (date, device code, activity yes/no, action, initials), either the promised seeded pest-monitoring template or a device-check log, plus a report and an Inspection Mode view of it. Today a 'no activity' check of station 7 cannot be recorded at all."
+      },
+      {
+        "section": "Records You Should Keep Ready in One Audit File",
+        "item": "Waste disposal record",
+        "missing": "There is no general waste-handover log (date, wet/dry/other, quantity, collector or agency such as GHMC or an authorised vendor, receipt or vehicle, signature), no report and no Inspection Mode section."
+      },
+      {
+        "section": "Records You Should Keep Ready in One Audit File",
+        "item": "Food sampling/lab reports, where applicable",
+        "missing": "Add a 'food_lab_report' document type, or a sample register (sample, date, lab, NABL number, parameters, result). It needs a report or Inspection Mode visibility, and PDF upload, because lab reports arrive as PDFs and only images are accepted today."
+      },
+      {
+        "section": "Records You Should Keep Ready in One Audit File",
+        "item": "Previous audit report and closure evidence",
+        "missing": "The authority's report itself has no upload path. src/app/api/fssai/inspections/route.ts has no 'attach' action, the page shows only a 'report number' field (inspections/page.tsx:706) and offers no way to set document_id, and there is no 'inspection_report' document type. Closure evidence is text only: corrective actions and findings take no photo. Any scan filed as 'Other' is deleted 12 months after upload, which is about when the next annual audit asks for it. Inspection Mode shows open/total point counts but not each finding's closure detail."
+      }
+    ],
+    "summaries": [
+      {
+        "lane": "Licences & Display · Kitchen & Premises Hygiene · Storage – Very Important",
+        "summary": "29 items across my 3 sections: 10 CHECKED, 6 RECORDED, 11 PARTIAL, 2 GAP.\n\nGAPs:\n- Food Safety Display Board (FSDB): nothing in the module covers it.\n- Food-grade containers: no question asks it.\n\nPARTIALs:\n- Six of the nine Kitchen & Premises Hygiene lines. Most of the needed questions (walls/ceiling/peeling paint, lighting, covered fittings, screened windows/doors) exist only in CHK-STORE-WEEKLY, section \"The fabric of the store\", so they cover the store, not the kitchen.\n- Kitchen floors: \"non-slippery\" is not asked.\n- No unnecessary items: only the dry store is checked.\n- FSSAI licence displayed: the licence is held on file, but nothing checks it is on display.\n- Approved vendor list: no approved flag or vendor list. The pieces are scattered across supplier_licence documents and per-delivery licence numbers.\n- FEFO: the board covers kitchen-made batches only, is a live read, and is not in Inspection Mode or Reports.\n- Veg/non-veg segregation: not named.\n- Personal items: not named.\n\nA single weekly kitchen-premises checklist plus about five storage questions would close almost all PARTIALs and both GAPs.\n\nFacts the parent should know:\n1. The pack has 12 templates, not 13. CHK-COLDROOM-DAILY appears only as placeholder text (src/app/fssai/settings/checklists/[id]/page.tsx:1255; src/lib/db.ts:8933).\n2. In this worktree's fnb-controller.db, fssai_templates, fssai_questions, fssai_runs, fssai_documents, fssai_equipment, fssai_temperature_logs, fssai_expiry_items and fssai_seed_log all have 0 rows. The pack has never been applied. Every CHECKED item is live only after an admin applies the pack (fssai-seed-server.ts:18, admin-triggered, never on boot). Every RECORDED item proves something only once staff actually file the records.\n3. Inspector visibility is weak for checklist answers. Inspection Mode shows each checklist round only as name, date, status and failed count (src/app/fssai/inspection-mode/page.tsx:366-394), capped at 25 rows over 7–90 days, with no link into the run sheet. Reports show a question only when it FAILED ('Failed answers', src/app/api/fssai/_p9/reports.ts:244). So a passing answer such as \"Nothing stored directly on the floor\" is visible only on the Verify Records screen or /fssai/checklists/run/[id]. Inspection Mode has no storage, FIFO/expiry or cold-room section.\n4. Documents are well surfaced (Inspection Mode 'Licence and certificates' plus the Reports 'Documents and certificates' report). However:\n   - Nothing flags a REQUIRED document that is missing, such as no FSSAI licence, trade licence or fire NOC on file.\n   - The Inspection Mode document rows omit whose medical certificate it is (route.ts:129 vs :138-147).\n   - The Reports 'Belongs to' column prints the raw vendor_id instead of the vendor name (reports.ts:1203).\n5. The 'not read today' fridge check depends on units being registered in fssai_equipment, which has 0 rows. There is no historical report of days with no reading per unit.\n\nRead-only lane: nothing was created, edited or committed. The only scratch file is a DB copy at /tmp/fssai-lane-licstore/db.sqlite. Key files: /Users/shashankreddy/Desktop/Claude/fnb-fssai-restale/src/lib/fssai-checklist-pack.ts, src/lib/fssai.ts (FSSAI_DOC_TYPES 2535-2552), src/app/api/fssai/inspection-mode/route.ts, src/app/api/fssai/_p9/reports.ts, src/app/api/fssai/fifo/route.ts, src/lib/db.ts (fssai tables 8931-10208)."
+      },
+      {
+        "lane": "Food Temperature Control · Food Preparation · Personal Hygiene – Critical (27 items)",
+        "summary": "27 items in my three sections: 12 CHECKED, 6 RECORDED, 8 PARTIAL, 1 GAP.\n\nTemperature Control (7): Receiving, Refrigerators, Freezers, Hot holding, Cooking and Reheating are RECORDED in fssai_temperature_logs, via /fssai/temperature, /fssai/cold-rooms and /fssai/receiving. Receiving probes are also mirrored into the register. All six are visible in inspection mode 'Temperature records' and the 'Temperature register' PDF report. Cooling is PARTIAL:\n- Any reading taken while food is still cooling is recorded as a breach, because the level check ignores the clock (_p4/lib.ts:244-247). Each one forces an 'action taken' and raises a corrective action.\n- Nothing links one batch's readings into a curve: no start time or start temperature.\n- Elapsed minutes are not printed on the register or in inspection mode.\n\nDefects found:\n- CHK-STORE-COLD-DAILY Q12 asks for the 'Coldest chiller reading', which hides a warm unit (pack:527); its own help text says 'warmest'.\n- The hot-holding register standard is 60 C, but both checklists use 65 C.\n- Checklist temperature answers never reach fssai_temperature_logs (the only writers are temperature and receiving).\n- Fridge and freezer readings are judged only if the unit is in the equipment register. Otherwise they file as 'not judged'.\n- The only delivery standard is chilled (max 5 C), so frozen deliveries are not judged against freezer limits.\n\nFood Preparation (9):\n- GAP: 'Raw materials washed/cleaned properly'. No question or record anywhere.\n- PARTIAL: cross-contamination (tools and storage are asked, the prep station is not), food covered (storage only, not during prep), no bare-hand contact with ready-to-eat food (Q08 asks for separate gloves, not for avoiding bare hands).\n- CHECKED: separate boards and knives, handwashing before prep, cooking temperature, reheating, no expired ingredients.\n\nPersonal Hygiene (11): CHK-HYG-SHIFT checks uniform, hairnet/cap, nails, jewellery, wound dressing, smoking/spitting and illness. Three lines are PARTIAL:\n- Apron: Q04 says 'uniform OR apron', so a handler without an apron passes.\n- Handwashing practice: asked once at shift start; the soap and drying checks cover washroom basins only, not the kitchen hand-wash station.\n- Medical and training records: the document types exist, but a person document must belong to an app user (users.email; locally 9 users, 0 hr_employees). Handlers without a login cannot be named, there is no list of who is missing a certificate, and inspection mode does not show whose certificate it is. HRMS hr_trainings is not linked to the FSSAI module.\n\nInspector visibility: temperature records, deliveries and documents are reachable from inspection mode and the reports. Every checklist-only line is not. Inspection mode and 'Checklist records' show rounds only (name, answered n/m, failed count, signed). Only failed answers appear in a report ('Failed answers'). A passing answer such as 'nails short' can be seen only by opening /fssai/checklists/run/[id], which nothing in inspection mode or the reports links to, and no single round can be printed. Inspection mode also caps each section at the 25 most recent rows, with temperature kinds mixed together.\n\nSetup facts:\n- The pack holds 12 templates, not 13. CHK-COLDROOM-DAILY appears only as a placeholder hint in the builder (settings/checklists/[id]/page.tsx:1255).\n- The pack seeds as draft by default (fssai-seed-server.ts:300), so the owner must publish each one.\n- The local DB has 0 templates, 0 temperature standards and 0 equipment rows, so every CHECKED or RECORDED status above depends on the pack being applied and published, the standards applied, and cold units registered.\n\nRead-only lane: nothing was edited; the DB was queried from a copy in /tmp/fssai-lane-tpph."
+      },
+      {
+        "lane": "Cleaning & Sanitation · Pest Control · Waste Management · Food-Grade Equipment & Packaging",
+        "summary": "Scope: 44 authority items across my four sections. Result: CHECKED 18, RECORDED 3, PARTIAL 15, GAP 8. This was read-only; the only file created is a database snapshot at /tmp/fssai-lane-csw/snap.db.\n\nBy section:\n- Cleaning & Sanitation: well covered by CHK-CLEAN-KITCHEN-DAILY and CHK-CLEAN-WASHROOM (14 CHECKED, 1 RECORDED).\n  - GAP: Sinks.\n  - PARTIAL: Walls (weekly only), Exhaust/hood (daily question allows N/A; canopy only weekly), Crockery/cutlery (only cutlery trays), Water station (only jugs).\n- Pest Control: the monthly visit is RECORDED and visible in Inspection Mode; drains and grease traps are CHECKED. The other 7 are PARTIAL.\n  - Pest-absence questions exist only for the dry store (pack.ts:491) and the guest area (pack.ts:364). There is no kitchen or prep pest check at all.\n  - No template uses module_key 'pest-control', although pest/devices/route.ts:13-18 and db.ts:9982-9987 claim a seeded 'weekly monitoring round'. Bait stations are therefore never routinely checked.\n  - Chemicals are effectively not captured: fssai_pest_services.chemicals_json has no UI writer (the form at pest-control/page.tsx:1209-1217 never sends it), and neither the report nor Inspection Mode shows chemicals.\n- Waste Management: lids, bin cleaning and daily removal are CHECKED; used-oil disposal is RECORDED (fssai_oil_disposals, report 'oil-disposals'), though not in Inspection Mode.\n  - GAP: wet/dry segregation.\n  - PARTIAL: overflowing bins, waste area clean (Q10 asks 'cleared'), waste near prep areas. All three lack an in-service question.\n- Food-Grade Equipment & Packaging: 6 GAP, 1 PARTIAL. No template asks about food-grade material, rust or damage on equipment, delivery packaging, or newspaper. Packaging storage is only touched by generic dry-store questions.\n\nPreconditions that apply to every CHECKED item:\n1. Nothing is seeded locally. The snapshot has 0 rows in fssai_templates, fssai_seed_log, fssai_assignments and every record table.\n2. When the pack is applied it seeds DRAFTS by default, which staff cannot see until each is published (fssai-seed-server.ts:203-212).\n3. The pack seeds no assignments (pack.ts:37-42), and missed-check reminders only fire for assignments (fssai-jobs.ts runFssaiMissedCheckReminders). Without a rota, nobody is chased for a missed cleaning round.\n4. The pack applies once per pack_key/version (pack.ts:639-645). New questions need a version bump or an edit in the builder.\n\nDiscrepancy with the brief: there are 12 templates, not 13. CHK-COLDROOM-DAILY does not exist. It appears only as a placeholder hint (settings/checklists/[id]/page.tsx:1255) and a comment (db.ts:8933). The pack file is unchanged against HEAD.\n\nInspector visibility:\n- Inspection Mode shows checklist rounds only as summaries: name, pass/fail, signer. The list is capped at 25 rows (inspection-mode/route.ts:61), so per-shift hygiene rounds can push cleaning rounds off it.\n- Reports show individual answers only when they FAILED ('checklist-failures').\n- A passing answer to a specific line (e.g. 'Floors swept') is only on the run sheet, and the run sheet is not linked from Inspection Mode, reports or the module screen. Only today's own runs link to it (checklists/run/page.tsx:655-658).\n- Inspection Mode has no section for oil collections, equipment events, pest sightings detail or pest devices.\n\nSmallest fixes that would close most of this lane:\n- (a) Add to CHK-CLEAN-KITCHEN-DAILY: sinks; walls and splashbacks; hood canopy (required, not N/A); wet/dry segregation; waste area washed; no food waste near prep.\n- (b) Add to the FOH round: crockery/cutlery, water station, and in-service bins not overflowing.\n- (c) Write the missing pest-control monitoring template covering cockroaches, flies, rodents, droppings/eggs/larvae, screens and door gaps across the kitchen, plus a bait-station round.\n- (d) Add a food-grade equipment & packaging template covering all 7 lines, and a document type for the packaging supplier's food-grade declaration.\n- (e) Add a chemicals editor to the pest visit form and show chemicals in the report and Inspection Mode."
+      },
+      {
+        "lane": "Records You Should Keep Ready in One Audit File (20 items)",
+        "summary": "VERDICT ON \"KEEP READY IN ONE AUDIT FILE\": the app cannot put these 20 records in one place today.\n\nCLOSEST TODAY: Inspection Mode (/fssai/inspection-mode; API src/app/api/fssai/inspection-mode/route.ts) is the nearest thing. It is a read-only, on-screen handover for management only, with 8 sections:\n- Licence and certificates: metadata only, never the scans.\n- Food-safety checks\n- Temperature\n- Deliveries\n- Pest control\n- Water and ice\n- Corrective actions\n- Previous visits\n\nThe time window is 1 to 90 days, and most sections stop at 25 rows (RECENT_ROWS=25, line 61). It has no print, PDF or export, and no link into any record. No page under /fssai has a print view at all.\n\nWHAT INSPECTION MODE LEAVES OUT: oil/TPC, FIFO/expiry, equipment maintenance and calibration events, waste, the approved vendor list, per-person medical and training coverage, and the detail of how each finding was closed. These live in separate registers or nowhere. The 21 reports (src/app/api/fssai/_p9/reports.ts:158) download one at a time as CSV, Excel or PDF, with no combined pack.\n\nDOCUMENT TYPES (FSSAI_DOC_TYPES, src/lib/fssai.ts:2535-2552), 14 in total: fssai_licence, trade_licence, fire_noc, gst, insurance, water_test, pest_contract, supplier_licence, medical_fitness, food_handler_training, calibration_certificate, amc, lease, other.\n\nNO SLOT AT ALL (only the catch-all 'Other', or nothing):\n- FSDB photograph\n- Water bill (the alternative half of item 4)\n- Approved vendor list\n- Waste disposal record\n- Food sampling/lab reports\n- The authority's previous audit report copy. The inspection record exists, but there is no document type and no upload on the inspection.\n\nThere is also no pest station-by-station monitoring record. The code says it should be a seeded template, but none of the 12 templates provides it.\n\nTALLY: 2 CHECKED, 9 RECORDED, 9 PARTIAL, 0 GAP.\n\nSYSTEMIC DEFECTS THAT DEFEAT \"KEEP READY\":\n1. The scheduled 12-month photo retention sweep deletes every document scan 12 months after upload. The call path is src/lib/fssai-jobs.ts:242,726 to src/lib/fssai-retention.ts:254-260, and there is no exemption for fssai_documents. A 1-5 year FSSAI licence, a 2-year FoSTaC certificate and last year's audit report all lose their copy while still needed.\n2. Only JPG/PNG/WebP up to 400 KB, downscaled to 1200 px, can be uploaded (fssai.ts:1217,1251). PDF licences and lab reports cannot be attached directly.\n3. Medical and training certificates must belong to an existing users.email (documents/route.ts:177). This DB has 9 users and hr_employees is not linked, so food handlers without a login cannot be covered.\n4. The documents-expiry report includes renewed, superseded rows and prints them as EXPIRED, because there is no is_active filter (reports.ts:1182-1191). Its 'Belongs to' column prints the raw vendor id (reports.ts:1203).\n5. Equipment events and calibration certificates need fssai_equipment rows, and there are 0 in this DB.\n6. Corrective actions and inspections take no photo or attachment.\n\nNOTES ON THE BRIEF AND THIS DB:\n- The brief lists CHK-COLDROOM-DAILY as a template. src/lib/fssai-checklist-pack.ts holds only 12 templates; that code appears only in a comment at db.ts:8933.\n- Read-only queries of this worktree's DB found 0 fssai_templates, 0 fssai_documents and 0 fssai_equipment rows, 9 users and 0 hr_employees. Production was not checked.\n\nWHAT ONE AUDIT FILE NEEDS:\n- An \"Audit File\" view in the authority's 20-heading order, pulling each register for a chosen period and the current scans, with a not-on-file line for management.\n- A combined PDF or ZIP export.\n- New slots: FSDB photo, water bill, food lab report, inspection report, approved vendor register, waste disposal log, and a pest monitoring round.\n- Exempt active documents from the 12-month sweep, and allow PDF upload.\n- Key person documents to all food handlers, with a coverage roster.\n- Add oil, FIFO, equipment and waste sections to Inspection Mode, with a way to open scans and print.\n- Attachments for inspection reports and closure evidence.\n- Fix the documents report's superseded rows and vendor names."
+      }
+    ],
+    "items": [
+      {
+        "section": "Licences & Display",
+        "item": "FSSAI licence displayed prominently",
+        "status": "PARTIAL",
+        "inspector_visible": true,
+        "where": "fssai_documents doc_type 'fssai_licence' (src/lib/fssai.ts:2538; table src/lib/db.ts:10023), entered at /fssai/documents. The licence row (number, issuer, expiry, derived Valid/Expiring/EXPIRED) shows in Inspection Mode 'Licence and certificates' (src/app/api/fssai/inspection-mode/route.ts:122-169) and in Reports > 'Documents and certificates' (src/app/api/fssai/_p9/reports.ts:1158).",
+        "missing": "The app can prove the licence is held and valid, but nothing proves it is DISPLAYED. None of the 12 templates asks it; a grep for 'display', 'prominent' and 'FSDB' across src/lib/fssai*.ts, src/app/fssai and src/app/api/fssai finds nothing. To close it, add a recurring question such as 'FSSAI licence (original or certified copy) displayed at a prominent place in the premises, legible and in date', with a photo on fail. It fits CHK-SAFE-OPENING or a new premises checklist. Also nothing warns when no 'fssai_licence' row exists at all."
+      },
+      {
+        "section": "Licences & Display",
+        "item": "Food Safety Display Board (FSDB) displayed and readable",
+        "status": "GAP",
+        "inspector_visible": false,
+        "where": "Nothing in the module covers it. There is no FSDB doc type in FSSAI_DOC_TYPES (src/lib/fssai.ts:2535-2552) and no question in src/lib/fssai-checklist-pack.ts. A grep for 'FSDB' and 'display board' returns nothing.",
+        "missing": "Add a checklist question 'Food Safety Display Board displayed at a prominent place, readable, showing the current licence number', with a photo on fail. Optionally add an FSDB doc or photo record under Documents so the board itself is on file."
+      },
+      {
+        "section": "Licences & Display",
+        "item": "GHMC trade/municipal licence available",
+        "status": "RECORDED",
+        "inspector_visible": true,
+        "where": "fssai_documents doc_type 'trade_licence', label 'Trade licence', outlet scope, renews (src/lib/fssai.ts:2539). The issuer is free text and the placeholder suggests GHMC (src/app/fssai/documents/page.tsx:648). A file is attached via fssai_attachments. Shown in Inspection Mode 'Licence and certificates' and in Reports > 'Documents and certificates'. Caveat: nothing flags a missing trade licence. The dashboard only counts expired and expiring rows (src/app/api/fssai/dashboard/route.ts:280-290)."
+      },
+      {
+        "section": "Licences & Display",
+        "item": "Fire/safety documents as applicable",
+        "status": "RECORDED",
+        "inspector_visible": true,
+        "where": "fssai_documents doc_type 'fire_noc' (src/lib/fssai.ts:2540) plus 'insurance' and 'amc'. Supporting checks in CHK-SAFE-MONTHLY: Q01 'Every extinguisher within its service date' (fssai-checklist-pack.ts:617, help text says the certificate is filed under Documents), Q06 'Electrical installation test certificate current' (:622) and Q08 'Gas installation inspected by a competent person' (:624). The NOC shows in Inspection Mode 'Licence and certificates'. There is no dedicated doc type for an extinguisher service certificate (it falls to 'other' or 'amc')."
+      },
+      {
+        "section": "Licences & Display",
+        "item": "Pest-control agency agreement and latest service report",
+        "status": "RECORDED",
+        "inspector_visible": true,
+        "where": "The agreement is fssai_documents doc_type 'pest_contract' (vendor scope, src/lib/fssai.ts:2544). The service report is fssai_pest_services (src/lib/db.ts:9912), with agency_licence_no, technician, chemicals_json, findings, report_no, document_id (job sheet), contract_doc_id and next_due_date, entered at /fssai/pest-control. Inspection Mode 'Pest control' shows the latest 12 visits with agency licence and next due date (inspection-mode/route.ts:336-388). Reports > 'Pest control visits' (reports.ts:1038)."
+      },
+      {
+        "section": "Licences & Display",
+        "item": "Food-handler medical examination records",
+        "status": "RECORDED",
+        "inspector_visible": true,
+        "where": "fssai_documents doc_type 'medical_fitness', person scope, person_email, expiry (src/lib/fssai.ts:2546), at /fssai/documents. CHK-HYG-HEALTH-MONTHLY Q04 asks each person 'Medical fitness certificate on file and not expired' (fssai-checklist-pack.ts:458). Inspector caveats: (1) The Inspection Mode document rows drop person_email (selected at inspection-mode/route.ts:129, not shaped at :138-147), so the officer sees only the typed title, not whose certificate it is. (2) Nothing lists food handlers who have NO certificate on file."
+      },
+      {
+        "section": "Licences & Display",
+        "item": "Water testing report / municipal water bill records",
+        "status": "RECORDED",
+        "inspector_visible": true,
+        "where": "fssai_water_tests test_kind 'lab_report' (src/lib/fssai.ts:2427; table src/lib/db.ts:9860), with lab_name, lab_licence_no, report_no, parameters_json, result and document_id, plus fssai_documents doc_type 'water_test' (fssai.ts:2543). Entered at /fssai/water-ice. Inspection Mode 'Water and ice' shows tests and lab reports (inspection-mode/route.ts:390-432). Reports > 'Water and ice tests'. A municipal water bill has no doc type of its own and would go under 'other'. This is acceptable because the line asks for one or the other."
+      },
+      {
+        "section": "Licences & Display",
+        "item": "Approved vendor list maintained",
+        "status": "PARTIAL",
+        "inspector_visible": false,
+        "where": "The pieces exist but there is no list. Supplier licences can be filed per vendor as fssai_documents 'supplier_licence' (fssai.ts:2545). Each delivery records supplier_licence_no and supplier_licence_expiry (db.ts:9440-9441). Receiving has a reject reason 'no_supplier_licence' (fssai.ts:2201). The vendors master has no licence or approval column (id, name, contact_person, phone, email, gstin, address, payment_terms, lead_time_days, is_active, notes). Inspection Mode shows supplier licences only per delivery, not as a vendor list.",
+        "missing": "An approved-supplier register is needed: per vendor an approved flag or date, FSSAI licence number and expiry, and what they supply. It should be shown as one list in Reports and Inspection Mode, and Receiving should warn when an unapproved or expired-licence vendor delivers. Also, the Reports 'Documents and certificates' 'Belongs to' column prints the raw vendor_id UUID instead of the vendor name (src/app/api/fssai/_p9/reports.ts:1203)."
+      },
+      {
+        "section": "Kitchen & Premises Hygiene",
+        "item": "Kitchen floors clean, dry and non-slippery",
+        "status": "PARTIAL",
+        "inspector_visible": false,
+        "where": "CHK-CLEAN-KITCHEN-DAILY Q07 'Floors swept and mopped, including under equipment' (fssai-checklist-pack.ts:323). CHK-SAFE-OPENING Q10 'Floor dry, no oil or water, no trip hazard' (:592). Inspection Mode lists the round only (name, date, status, failed count; inspection-mode/page.tsx:366-394). A passing answer appears only on the run sheet (Verify Records / /fssai/checklists/run/[id]), which Inspection Mode does not link to. Reports show this question only if it FAILED ('Failed answers', reports.ts:244).",
+        "missing": "No question asks whether the floor surface is non-slip, such as anti-skid flooring with no worn or polished patches. Clean is asked at closing and dry at opening, in two checklists from two modules, so no single answer covers the line. Add 'Kitchen floor clean, dry and non-slippery' as one question, or add 'non-slip' to CHK-SAFE-OPENING Q10."
+      },
+      {
+        "section": "Kitchen & Premises Hygiene",
+        "item": "Walls and ceiling clean; no peeling paint/plaster",
+        "status": "PARTIAL",
+        "inspector_visible": false,
+        "where": "CHK-CLEAN-DEEP-WEEKLY Q10 'Walls and tiles above working height washed' (:395) and Q09 'Light fittings, fly screens and ceiling fans cleaned' (:394). CHK-STORE-WEEKLY Q06 'Walls, floor and ceiling sound — no flaking paint, no cracks, no gaps' (:555) sits in section 'The fabric of the store' of the Storage audit, so it is about the STORE, not the kitchen.",
+        "missing": "No question asks whether the KITCHEN ceiling is clean, and none asks whether kitchen walls or ceiling are free of peeling paint or plaster. Add 'Kitchen walls and ceiling clean; no peeling paint, flaking plaster, cracks or fungus' to a kitchen checklist, such as CHK-CLEAN-DEEP-WEEKLY or a new weekly premises check."
+      },
+      {
+        "section": "Kitchen & Premises Hygiene",
+        "item": "No water stagnation",
+        "status": "CHECKED",
+        "inspector_visible": false,
+        "where": "CHK-CLEAN-KITCHEN-DAILY Q08 'Drains and grease traps cleared — no standing water, no smell' (critical; fssai-checklist-pack.ts:324). Also CHK-SAFE-OPENING Q10 'Floor dry, no oil or water, no trip hazard' (:592) and CHK-CLEAN-WASHROOM Q06 'Floor dry, no standing water, drain clear' (:359). Visibility is round-level only in Inspection Mode. The answer itself is visible only if it failed (Reports > 'Failed answers')."
+      },
+      {
+        "section": "Kitchen & Premises Hygiene",
+        "item": "Proper drainage",
+        "status": "CHECKED",
+        "inspector_visible": false,
+        "where": "CHK-CLEAN-KITCHEN-DAILY Q08 'Drains and grease traps cleared — no standing water, no smell' (:324). CHK-CLEAN-DEEP-WEEKLY Q03 'Grease trap opened, emptied and flushed' (:388). Drain covers or gratings are not named. Visibility is round-level only, as above."
+      },
+      {
+        "section": "Kitchen & Premises Hygiene",
+        "item": "Exhaust/hood clean",
+        "status": "CHECKED",
+        "inspector_visible": false,
+        "where": "CHK-CLEAN-KITCHEN-DAILY Q04 'Extraction hood filters cleaned or changed' (allow N/A on days filters are not due; :320). CHK-CLEAN-DEEP-WEEKLY Q08 'Extraction ducts and canopy cleaned down' (:393). CHK-SAFE-OPENING Q05 'Extraction hood running and grease filters not clogged' (:587). Visibility is round-level only."
+      },
+      {
+        "section": "Kitchen & Premises Hygiene",
+        "item": "Adequate lighting",
+        "status": "PARTIAL",
+        "inspector_visible": false,
+        "where": "Only CHK-STORE-WEEKLY Q08 'Lighting adequate and fittings covered' (:557), in the store-fabric section of the Storage audit. CHK-SAFE-MONTHLY Q05 'Emergency lighting and exit signs working' (:621) is about emergency lighting, not working light.",
+        "missing": "No question covers kitchen, prep or wash-up lighting. Add 'Lighting adequate in all food preparation and wash-up areas' to a kitchen checklist."
+      },
+      {
+        "section": "Kitchen & Premises Hygiene",
+        "item": "Light fittings protected against breakage",
+        "status": "PARTIAL",
+        "inspector_visible": false,
+        "where": "CHK-STORE-WEEKLY Q08 'Lighting adequate and fittings covered' (:557) covers the store only. CHK-CLEAN-DEEP-WEEKLY Q09 'Light fittings, fly screens and ceiling fans cleaned' (:394) is about cleaning, not protection.",
+        "missing": "No question asks whether kitchen light fittings over food areas have shatter-proof covers or diffusers that are intact. Add one to a kitchen checklist."
+      },
+      {
+        "section": "Kitchen & Premises Hygiene",
+        "item": "Doors/windows clean and pest-proof",
+        "status": "PARTIAL",
+        "inspector_visible": false,
+        "where": "CHK-STORE-WEEKLY Q07 'Windows screened, doors closing, no gap under a door' (critical; :556) covers the store only. CHK-CLEAN-DEEP-WEEKLY Q09 '…fly screens…cleaned' (:394) covers screens only.",
+        "missing": "No question asks whether kitchen doors and windows are CLEAN, and none asks whether they are pest-proof (mesh intact, self-closing doors, no gaps, air curtain or strip curtain working) for the kitchen and other food areas. Add 'Doors and windows in food areas clean and pest-proof — mesh intact, doors self-closing, no gaps'."
+      },
+      {
+        "section": "Kitchen & Premises Hygiene",
+        "item": "No unnecessary items stored in food areas",
+        "status": "PARTIAL",
+        "inspector_visible": false,
+        "where": "Only CHK-STORE-DRY-DAILY Q05 'Non-food items and chemicals stored separately, never above food' (:489), which applies to the dry store only and allows non-food items to be kept separately rather than removed.",
+        "missing": "No question covers the kitchen, prep or cold areas. Add 'No unnecessary items in food areas — no unused equipment, cartons, junk, personal belongings or non-food stock in kitchen, prep or storage areas'."
+      },
+      {
+        "section": "Storage – Very Important",
+        "item": "FIFO followed",
+        "status": "CHECKED",
+        "inspector_visible": false,
+        "where": "CHK-STORE-DRY-DAILY Q02 'Oldest stock at the front, newest behind it' (:486). CHK-STORE-WEEKLY Q01 'First-in first-out visibly working — nothing old hidden behind new' (:550). CHK-STORE-COLD-DAILY Q08 'Prepared food used within its own shelf life, oldest first' (:523). Round-level only in Inspection Mode. /fssai/fifo has no Inspection Mode section."
+      },
+      {
+        "section": "Storage – Very Important",
+        "item": "FEFO followed",
+        "status": "PARTIAL",
+        "inspector_visible": false,
+        "where": "The /fssai/fifo 'Use first' board orders by expiry (FEFO; src/app/api/fssai/fifo/route.ts:38-44). It covers KITCHEN-MADE production_batches only. It is a live read, not a saved record, and the route itself says bought-in goods carry no expiry in stock (:296). Receiving does capture expiry_date per line (fssai_receiving_lines, db.ts:9502), but the board does not use it. Closest questions: CHK-STORE-WEEKLY Q02 'Opened-pack shelf lives being applied, not just the pack date' (:551) and CHK-STORE-COLD-DAILY Q08 '…oldest first' (:523), which is FIFO, not FEFO.",
+        "missing": "Add a question 'Stock with the earliest expiry date is issued and used first (FEFO), in dry and cold storage'. Also extend the FEFO board to bought-in lots using the expiry dates captured at receiving, and give it a saved record or report so an inspector can see it."
+      },
+      {
+        "section": "Storage – Very Important",
+        "item": "All containers properly covered",
+        "status": "CHECKED",
+        "inspector_visible": false,
+        "where": "CHK-STORE-COLD-DAILY Q05 'Every container covered or wrapped' (critical; :520). CHK-STORE-DRY-DAILY Q03 'Every opened container covered, labelled and dated' (critical; :487). Visibility is round-level only."
+      },
+      {
+        "section": "Storage – Very Important",
+        "item": "Food-grade containers used",
+        "status": "GAP",
+        "inspector_visible": false,
+        "where": "Nothing covers it. No question in src/lib/fssai-checklist-pack.ts mentions food-grade (grep 'food.grade' finds nothing). CHK-STORE-WEEKLY Q03 'Decanted items carry the original pack information' (:552) is about labels, not container material.",
+        "missing": "Add 'Food stored only in food-grade containers — no paint buckets, chemical drums, newspaper or non-food plastic; containers intact' to CHK-STORE-DRY-DAILY and CHK-STORE-COLD-DAILY."
+      },
+      {
+        "section": "Storage – Very Important",
+        "item": "No food stored directly on floor",
+        "status": "CHECKED",
+        "inspector_visible": false,
+        "where": "CHK-STORE-DRY-DAILY Q01 'Nothing stored directly on the floor — everything on a pallet or a shelf' (critical; :485). CHK-STORE-COLD-DAILY Q04 'Nothing stored on the cold room floor' (critical; :519). Visibility is round-level only."
+      },
+      {
+        "section": "Storage – Very Important",
+        "item": "Raw and cooked food separated",
+        "status": "CHECKED",
+        "inspector_visible": false,
+        "where": "CHK-STORE-COLD-DAILY Q01 'Raw meat, poultry and fish stored below and apart from ready-to-eat food' (critical, urgent; :516) and Q02 'Cooked food never stored below raw food' (critical, urgent; :517). Visibility is round-level only."
+      },
+      {
+        "section": "Storage – Very Important",
+        "item": "Veg and non-veg properly segregated",
+        "status": "PARTIAL",
+        "inspector_visible": false,
+        "where": "CHK-STORE-COLD-DAILY Q01 'Raw meat, poultry and fish stored below and apart from ready-to-eat food' (:516) and Q03 'Dairy, vegetables and prepared food each in their own place' (:518).",
+        "missing": "No question says veg and non-veg must be kept apart. Cooked non-veg vs cooked veg, separate shelves or containers, and colour coding are not asked, and the dry store has no equivalent. Add 'Veg and non-veg stored separately — separate shelves or containers, clearly marked or colour-coded, in every cold unit and store'."
+      },
+      {
+        "section": "Storage – Very Important",
+        "item": "Chemicals stored separately from food",
+        "status": "CHECKED",
+        "inspector_visible": false,
+        "where": "CHK-STORE-DRY-DAILY Q05 'Non-food items and chemicals stored separately, never above food' (critical; :489). CHK-CLEAN-KITCHEN-DAILY Q12 'Chemicals stored away from food, labelled, in their own containers' (critical; :330). Visibility is round-level only."
+      },
+      {
+        "section": "Storage – Very Important",
+        "item": "Personal items kept outside food-storage areas",
+        "status": "PARTIAL",
+        "inspector_visible": false,
+        "where": "Only CHK-STORE-DRY-DAILY Q05 'Non-food items and chemicals stored separately, never above food' (:489). It does not name personal belongings, it allows them inside the store as long as they are separate, and it does not apply to cold rooms or fridges.",
+        "missing": "Add 'No personal belongings (bags, phones, clothing, staff food or medicines) inside dry stores, cold rooms or fridges' to CHK-STORE-DRY-DAILY and CHK-STORE-COLD-DAILY."
+      },
+      {
+        "section": "Storage – Very Important",
+        "item": "Dry store clean and pest-free",
+        "status": "CHECKED",
+        "inspector_visible": false,
+        "where": "CHK-STORE-DRY-DAILY Q06 'Shelves, floor and corners clean and dust-free' (:490) and Q07 'No sign of pests — droppings, gnawing, webbing or insects' (critical, urgent; :491). Also CHK-CLEAN-DEEP-WEEKLY Q06 'Dry store shelves emptied in sections, wiped and restocked' (:391). Pest sightings (fssai_pest_sightings) are counted in Inspection Mode 'Pest control'. The answers themselves are visible at round level only."
+      },
+      {
+        "section": "Storage – Very Important",
+        "item": "Refrigerator/freezer temperature recorded daily",
+        "status": "RECORDED",
+        "inspector_visible": true,
+        "where": "Readings are stored in fssai_temperature_logs (db.ts:9549), entered at /fssai/temperature and /fssai/cold-rooms. The cold-rooms board lists units NOT read on a given day (GET /api/fssai/temperature?due=1&date=, route.ts:302-330). Inspection Mode 'Temperature records' shows readings, 7–90 days, up to 25 rows (inspection-mode/route.ts:227-281). Reports > 'Temperature register' (reports.ts:585) and 'Temperature breaches'. CHK-STORE-COLD-DAILY Q12/Q13 (:527-528) record only one 'coldest chiller' and one freezer reading per round, not one per unit. Caveats: the 'not read today' check only works once fridges and freezers are registered in fssai_equipment, which has 0 rows in this worktree's DB. There is no report of days with no reading per unit. A reading with no configured range is stored as unjudged (is_judged=0)."
+      },
+      {
+        "section": "Storage – Very Important",
+        "item": "Expired/damaged products immediately removed",
+        "status": "CHECKED",
+        "inspector_visible": true,
+        "where": "CHK-STORE-DRY-DAILY Q04 'Nothing past its use-by or best-before date on the shelves' (critical; :488) and Q10 'Any damaged, swollen, rusted or leaking pack found and set aside' (:494). CHK-STORE-COLD-DAILY Q07 'Nothing past its date and nothing unidentifiable' (critical; :522). CHK-CLEAN-DEEP-WEEKLY Q07 (:392). Also recorded in the expiry and disposal register fssai_expiry_items (db.ts:9724; /fssai/fifo): state expired/damaged, action, discard quantity and method, witness. An inspector can see the register via Reports > 'Expiry and disposal register' (reports.ts:783). It is NOT in Inspection Mode. 'Not decided yet' is an allowed action, so 'immediately' depends on the open-decision count on that screen."
+      },
+      {
+        "section": "Food Temperature Control",
+        "item": "Maintain a temperature monitoring sheet for Receiving",
+        "status": "RECORDED",
+        "where": "Table fssai_receiving_lines.temp_c with the range frozen on the line (db.ts:9504-9506), plus fssai_receiving_checks.vehicle_temp_c (db.ts:9453). On submit, each probed line is copied into fssai_temperature_logs as log_kind='delivery', source_kind='receiving' (receiving/route.ts:1210-1245). The range comes from TEMP-DELIVERY-CHILL, max 5 C (temp-standards/route.ts:174). Pages: /fssai/receiving and /fssai/temperature. Reports: 'Delivery inspections' and 'Temperature register'. Inspection mode shows it under 'Deliveries checked at the door' with the vehicle temperature. Caveat: the only delivery standard is the chilled one (max 5 C), so a frozen delivery arriving at -5 C is judged a PASS unless the owner adds an item-specific rule.",
+        "inspector_visible": true
+      },
+      {
+        "section": "Food Temperature Control",
+        "item": "Maintain a temperature monitoring sheet for Refrigerators",
+        "status": "RECORDED",
+        "where": "Table fssai_temperature_logs, log_kind='equipment', against a registered fssai_equipment unit of kind chiller or cold_room. Standards TEMP-CHILLER and TEMP-COLDROOM are 0-5 C (temp-standards/route.ts:167-168). Pages: /fssai/temperature, plus the /fssai/cold-rooms board, which lists the units NOT read today (cold-rooms/page.tsx:6-10), and /fssai/settings/equipment. Report: 'Temperature register' (reports.ts:587-656). Two conditions: (1) every equipment standard carries an equipment_kind, so a reading taken on 'Not a registered unit' matches no standard and files as NOT JUDGED (_p4/lib.ts:173-186); the local DB has 0 equipment rows and 0 standards. (2) The checklist CHK-STORE-COLD-DAILY Q12 asks for the 'Coldest chiller reading seen on this round' (pack:527). Recording the coldest unit hides a warm one, and its own help text says the opposite ('Record the warmest').",
+        "inspector_visible": true
+      },
+      {
+        "section": "Food Temperature Control",
+        "item": "Maintain a temperature monitoring sheet for Freezers",
+        "status": "RECORDED",
+        "where": "Table fssai_temperature_logs, log_kind='equipment', against a registered fssai_equipment unit of kind freezer. Standard TEMP-FREEZER is max -18 C (temp-standards/route.ts:169). Pages: /fssai/temperature and the /fssai/cold-rooms board. Report: 'Temperature register'. Same condition as refrigerators: the unit must be in the equipment register or the reading files unjudged. CHK-STORE-COLD-DAILY Q13 'Freezer reading seen on this round' is only one number per day across all freezers (pack:528).",
+        "inspector_visible": true
+      },
+      {
+        "section": "Food Temperature Control",
+        "item": "Maintain a temperature monitoring sheet for Hot holding",
+        "status": "RECORDED",
+        "where": "Table fssai_temperature_logs, log_kind='hot_holding', standard TEMP-HOTHOLD min 60 C (temp-standards/route.ts:170). Also asked in checklists: CHK-FQ-PRESERVICE Q05 'Hot holding temperature at the pass' >=65 (pack:253), CHK-FQ-HOLDING Q02 'Lowest hot-holding reading across all trays' >=65 (pack:284) and Q03 hold time <=4h (pack:285). Page: /fssai/temperature. Report: 'Temperature register'. Inconsistency: the register passes food at 60 C but the checklists fail it below 65 C, so food at 62 C passes in one record and fails in the other. Also, checklist temperature answers are never written into fssai_temperature_logs: the only writers are temperature/route.ts and receiving/route.ts, even though source_kind 'checklist' is declared (fssai.ts:2269). Hot-holding readings taken in rounds therefore do not appear on the register.",
+        "inspector_visible": true
+      },
+      {
+        "section": "Food Temperature Control",
+        "item": "Maintain a temperature monitoring sheet for Cooking",
+        "status": "RECORDED",
+        "where": "Table fssai_temperature_logs, log_kind='cooking', standard TEMP-COOKING min 75 C (temp-standards/route.ts:171), with item_label naming the dish. Also asked in CHK-FQ-PRESERVICE Q07 'Core temperature of the last item cooked from raw' >=75, critical, per shift (pack:257). Page: /fssai/temperature. Report: 'Temperature register'. Inspection mode shows it in the 'Temperature records' section.",
+        "inspector_visible": true
+      },
+      {
+        "section": "Food Temperature Control",
+        "item": "Maintain a temperature monitoring sheet for Reheating",
+        "status": "RECORDED",
+        "where": "Table fssai_temperature_logs, log_kind='reheating', standard TEMP-REHEAT min 75 C within 120 min (temp-standards/route.ts:173), with an elapsed_minutes field. Also asked in CHK-FQ-HOLDING Q06 'Core temperature reached on reheating' >=75 (pack:292). Page: /fssai/temperature. Report: 'Temperature register'. Caveat: elapsed_minutes and the time limit are not printed on the register report (reports.ts:595-606) or in inspection mode (inspection-mode/route.ts:256-272). The printed sheet shows the temperature but not how long the reheat took.",
+        "inspector_visible": true
+      },
+      {
+        "section": "Food Temperature Control",
+        "item": "Maintain a temperature monitoring sheet for Cooling",
+        "status": "PARTIAL",
+        "where": "Table fssai_temperature_logs, log_kind='cooling', standard TEMP-COOLING max 5 C within 240 min (temp-standards/route.ts:172). Page: /fssai/temperature. Report: 'Temperature register'.",
+        "missing": "(1) Every reading taken while the food is still cooling is recorded as a BREACH. The level check runs before and independently of the clock (_p4/lib.ts:244-247), so 30 C at 60 min fails the 5 C maximum even though the 240-minute window is still open. Each such reading then forces an 'action taken' (temperature/route.ts:623) and raises a corrective action, so staff can only log the end point. (2) Nothing links the readings of one batch into a curve. There is no start time or start temperature, and elapsed_minutes is typed in by hand. (3) The register report and inspection mode do not print elapsed_minutes or max_minutes_used, so the inspector's sheet cannot show the food cooled within time. (4) No checklist question asks about cooling. To close it: a cooling-curve record (start time and start temperature, each reading judged only against the clock stage it belongs to), and the time column printed on the register and in inspection mode.",
+        "inspector_visible": true
+      },
+      {
+        "section": "Food Preparation",
+        "item": "Raw materials washed/cleaned properly",
+        "status": "GAP",
+        "where": "Searched the pack, fssai.ts and every /fssai page. No question, record or field mentions washing or sanitising raw vegetables, fruit or meat. The 'washed' hits are boards, bins, shelves, walls and hands only (pack:318, 325, 389, 395, 432).",
+        "missing": "A question in a prep checklist (e.g. CHK-FQ-PRESERVICE): 'Vegetables and fruit washed in potable water (and sanitised where required) before cutting'. If the SOP uses a sanitiser dip, also a ppm/strength reading.",
+        "inspector_visible": false
+      },
+      {
+        "section": "Food Preparation",
+        "item": "Separate cutting boards/knives where required",
+        "status": "CHECKED",
+        "where": "CHK-FQ-PRESERVICE Q08 'Separate boards, knives and gloves used for raw and for ready-to-eat food', critical, per shift (pack:259). Visibility: inspection mode and the 'Checklist records' report show only the round (name, answered n/m, failed count, signed). This answer appears in a report only if it fails ('Failed answers'). A passing answer can be seen only by opening the round at /fssai/checklists/run/[id], which neither inspection mode nor any report links to.",
+        "inspector_visible": false
+      },
+      {
+        "section": "Food Preparation",
+        "item": "Raw and cooked food not cross-contaminated",
+        "status": "PARTIAL",
+        "where": "Related: CHK-FQ-PRESERVICE Q08 separate boards/knives/gloves (pack:259). Storage only: CHK-STORE-COLD-DAILY Q01 'Raw meat, poultry and fish stored below and apart from ready-to-eat food' (pack:516) and Q02 'Cooked food never stored below raw food' (pack:517).",
+        "missing": "No question asks about separation DURING PREPARATION: separate prep areas or surfaces for raw and cooked, no raw food handled at the cooked/ready-to-eat station, hands washed and utensils changed between raw and cooked. Q08 covers tools only, and Q01/Q02 cover storage only.",
+        "inspector_visible": false
+      },
+      {
+        "section": "Food Preparation",
+        "item": "Food handlers wash hands before food preparation",
+        "status": "CHECKED",
+        "where": "CHK-HYG-SHIFT Q10 'Hands washed with soap for 20 seconds before starting', critical, per shift, per person (pack:432). Caveat: the round is filed against the signed-in user's email (checklists/run/page.tsx:209-213), and the local DB has 9 users and 0 hr_employees. A handler with no login is covered only if an admin creates a schedule entry whose free-text target names them. Visible as a round summary only; the individual answer is not shown in inspection mode or any report.",
+        "inspector_visible": false
+      },
+      {
+        "section": "Food Preparation",
+        "item": "Food covered during preparation/storage",
+        "status": "PARTIAL",
+        "where": "Storage only: CHK-STORE-COLD-DAILY Q05 'Every container covered or wrapped' (pack:520) and CHK-STORE-DRY-DAILY Q03 'Every opened container covered, labelled and dated' (pack:487).",
+        "missing": "The 'during preparation' half is not asked. Add a question such as 'Food on the line and prepared mise en place kept covered when not being worked on' to CHK-FQ-PRESERVICE or CHK-FQ-HOLDING.",
+        "inspector_visible": false
+      },
+      {
+        "section": "Food Preparation",
+        "item": "No direct hand contact with ready-to-eat food where avoidable",
+        "status": "PARTIAL",
+        "where": "Closest: CHK-FQ-PRESERVICE Q08 'Separate boards, knives and gloves used for raw and for ready-to-eat food' (pack:259) and Q09 tasting spoons used once (pack:260).",
+        "missing": "Q08 asks whether gloves are SEPARATE for raw and ready-to-eat, not whether bare hands are kept off ready-to-eat food. Add 'Ready-to-eat food handled with tongs, utensils or fresh gloves, never bare hands'.",
+        "inspector_visible": false
+      },
+      {
+        "section": "Food Preparation",
+        "item": "Cooking temperature/process monitored",
+        "status": "CHECKED",
+        "where": "CHK-FQ-PRESERVICE Q07 'Core temperature of the last item cooked from raw' >=75, critical, per shift (pack:257). Also RECORDED: fssai_temperature_logs log_kind='cooking' with TEMP-COOKING (temp-standards/route.ts:171), which inspection mode 'Temperature records' and the 'Temperature register' report do show. The checklist takes one reading per shift; checking every batch relies on the temperature page.",
+        "inspector_visible": true
+      },
+      {
+        "section": "Food Preparation",
+        "item": "Reheating controlled and recorded",
+        "status": "CHECKED",
+        "where": "CHK-FQ-HOLDING Q05 'Was anything reheated this service?', which fails 'Yes — more than once' (pack:289), and Q06 'Core temperature reached on reheating' >=75 (pack:292), twice daily. Also RECORDED: fssai_temperature_logs log_kind='reheating' with TEMP-REHEAT (temp-standards/route.ts:173), shown on the register and in inspection mode. The register does not print the time taken (see the Reheating line above).",
+        "inspector_visible": true
+      },
+      {
+        "section": "Food Preparation",
+        "item": "No expired ingredients used",
+        "status": "CHECKED",
+        "where": "CHK-STORE-DRY-DAILY Q04 'Nothing past its use-by or best-before date on the shelves', critical (pack:488). CHK-STORE-COLD-DAILY Q07 'Nothing past its date and nothing unidentifiable', critical (pack:522), and Q08 prepared food used within its shelf life (pack:523). CHK-CLEAN-DEEP-WEEKLY Q07 (pack:392). Also RECORDED: fssai_expiry_items, the expiry and disposal register (db.ts:9724), on /fssai/fifo and in the 'Expiry and disposal register' report. Caveat: these are shelf checks, and nothing ties ingredient use in prep to a date. Every one of the 952 raw_materials carries a blank shelf life, so FEFO has nothing to sort on unless fssai_item_shelf_life is configured.",
+        "inspector_visible": true
+      },
+      {
+        "section": "Personal Hygiene – Critical",
+        "item": "Every food handler should have Clean uniform",
+        "status": "CHECKED",
+        "where": "CHK-HYG-SHIFT Q04 'Clean uniform or apron, changed today', per shift, per person (pack:426). Page: /fssai/hygiene. Scope caveat: rounds key on users.email, and handlers with no login need a schedule entry with a free-text target. Visible only as the round summary in inspection mode and 'Checklist records'.",
+        "inspector_visible": false
+      },
+      {
+        "section": "Personal Hygiene – Critical",
+        "item": "Every food handler should have Hairnet/cap",
+        "status": "CHECKED",
+        "where": "CHK-HYG-SHIFT Q05 'Hair fully covered — cap or hairnet on', critical (pack:427), and Q08 beard covered (pack:430). Visible as the round summary only.",
+        "inspector_visible": false
+      },
+      {
+        "section": "Personal Hygiene – Critical",
+        "item": "Every food handler should have Appropriate apron",
+        "status": "PARTIAL",
+        "where": "CHK-HYG-SHIFT Q04 'Clean uniform or apron, changed today' (pack:426).",
+        "missing": "The question is 'uniform OR apron', so a handler in a clean uniform with no apron passes. Add a separate 'Apron worn, clean and appropriate to the task' question, or split Q04.",
+        "inspector_visible": false
+      },
+      {
+        "section": "Personal Hygiene – Critical",
+        "item": "Every food handler should have Clean, trimmed nails",
+        "status": "CHECKED",
+        "where": "CHK-HYG-SHIFT Q09 'Nails short, clean and unvarnished', critical (pack:431). Visible as the round summary only.",
+        "inspector_visible": false
+      },
+      {
+        "section": "Personal Hygiene – Critical",
+        "item": "Every food handler should have No loose jewellery",
+        "status": "CHECKED",
+        "where": "CHK-HYG-SHIFT Q06 'No watch, rings, bangles, chains or earrings', critical (pack:428). Visible as the round summary only.",
+        "inspector_visible": false
+      },
+      {
+        "section": "Personal Hygiene – Critical",
+        "item": "Every food handler should have Proper handwashing practice",
+        "status": "PARTIAL",
+        "where": "CHK-HYG-SHIFT Q10 'Hands washed with soap for 20 seconds before starting' (pack:432). Washroom basins only: CHK-CLEAN-WASHROOM Q03 soap, Q04 hand drying, Q08 hand-washing notice (pack:356-361).",
+        "missing": "Q10 asks once, at the start of the shift. Nothing asks about washing at the other required moments (after the toilet, after raw food, waste or breaks). The soap, drying and notice checks cover WASHROOM basins only; no question asks whether the kitchen hand-wash station is stocked with soap and drying and is used.",
+        "inspector_visible": false
+      },
+      {
+        "section": "Personal Hygiene – Critical",
+        "item": "Every food handler should have Waterproof dressing for minor wounds",
+        "status": "CHECKED",
+        "where": "CHK-HYG-SHIFT Q03 'Any cut or wound is covered with a coloured waterproof dressing', critical, N/A allowed (pack:425). Visible as the round summary only.",
+        "inspector_visible": false
+      },
+      {
+        "section": "Personal Hygiene – Critical",
+        "item": "Every food handler should have No smoking/spitting in food areas",
+        "status": "CHECKED",
+        "where": "CHK-HYG-SHIFT Q11 'No eating, chewing, smoking or spitting in the food area', critical (pack:433). Visible as the round summary only.",
+        "inspector_visible": false
+      },
+      {
+        "section": "Personal Hygiene – Critical",
+        "item": "Every food handler should have No handling food while suffering from an illness/open wound",
+        "status": "CHECKED",
+        "where": "CHK-HYG-SHIFT Q01 'Free of fever, cough, cold, sore throat or any skin infection' (pack:423), Q02 'No vomiting or loose motions in the last 48 hours' (pack:424) and Q03 wound dressing (pack:425), all critical with an urgent corrective action. Also CHK-HYG-HEALTH-MONTHLY Q01 (pack:454) and Q02 'No skin disease, boils, sores or discharging ear, eye or nose' (pack:455). The help text says to reassign anyone unwell, but no record shows the reassignment beyond the corrective action. Visible as the round summary; a failure would appear in 'Failed answers' and 'Corrective actions'.",
+        "inspector_visible": false
+      },
+      {
+        "section": "Personal Hygiene – Critical",
+        "item": "Every food handler should have Medical examination records available",
+        "status": "PARTIAL",
+        "where": "RECORDED as fssai_documents doc_type 'medical_fitness', per person, with expiry (fssai.ts:2546), at /fssai/documents. Also CHECKED as CHK-HYG-HEALTH-MONTHLY Q04 'Medical fitness certificate on file and not expired' (pack:458). Shown in inspection mode 'Licence and certificates' and the 'Documents and certificates' report, which has a 'Belongs to' column (reports.ts:1158+).",
+        "missing": "(1) A person-scoped document must belong to an app user (users.email check at documents/route.ts:168-178). Locally there are 9 users and 0 hr_employees, so a cook or helper without a login cannot have a medical certificate filed under their name. (2) No list of food handlers shows who has no valid certificate. (3) Inspection mode's certificate rows drop person_email (inspection-mode/route.ts:138-147), so the officer cannot see whose certificate it is unless the title says. To close it: key person documents on the HR employee list (or allow a named handler without a login), add a coverage view, and show the holder in inspection mode.",
+        "inspector_visible": true
+      },
+      {
+        "section": "Personal Hygiene – Critical",
+        "item": "Every food handler should have Food-safety training records available",
+        "status": "PARTIAL",
+        "where": "RECORDED as fssai_documents doc_type 'food_handler_training', per person, with expiry (fssai.ts:2547), at /fssai/documents. Also asked as CHK-HYG-HEALTH-MONTHLY Q06 'Food-safety training (FoSTaC or in-house) completed and recorded' (pack:460), which is not critical. Shown in inspection mode 'Licence and certificates' and the 'Documents and certificates' report.",
+        "missing": "The same person-key limit as medical records: only app users can hold a training document, there is no per-handler coverage list, and inspection mode does not show the holder. HRMS has hr_trainings and hr_training_assignments tables, but they are not linked to the FSSAI module, so nothing there reaches inspection mode or the FSSAI reports.",
+        "inspector_visible": true
+      },
+      {
+        "section": "Cleaning & Sanitation",
+        "item": "Kitchen",
+        "status": "CHECKED",
+        "inspector_visible": true,
+        "where": "CHK-CLEAN-KITCHEN-DAILY 'Kitchen Cleaning — Daily' (frequency daily), src/lib/fssai-checklist-pack.ts:300-337. The whole template is the daily kitchen cleaning checklist, e.g. Q15 'Photograph of the kitchen as you left it'. Stored in fssai_runs/fssai_responses, page /fssai/cleaning. Visible as a signed round in Inspection Mode 'Food-safety checks' (inspection-mode/route.ts:171-221) and in the 'Checklist records' / 'Compliance by checklist' reports (_p9/reports.ts:161,333)."
+      },
+      {
+        "section": "Cleaning & Sanitation",
+        "item": "Floors",
+        "status": "CHECKED",
+        "inspector_visible": true,
+        "where": "CHK-CLEAN-KITCHEN-DAILY Q07 'Floors swept and mopped, including under equipment' (pack.ts:323). An inspector sees the signed round; the individual pass answer is only on the run sheet (reports show an answer only when it failed: 'checklist-failures', reports.ts:244)."
+      },
+      {
+        "section": "Cleaning & Sanitation",
+        "item": "Walls",
+        "status": "PARTIAL",
+        "inspector_visible": true,
+        "where": "Weekly only: CHK-CLEAN-DEEP-WEEKLY Q10 'Walls and tiles above working height washed' (pack.ts:395) and Q01 'Equipment moved out and the floor and wall behind it cleaned' (pack.ts:386). CHK-STORE-WEEKLY Q06 'Walls, floor and ceiling sound — no flaking paint…' (pack.ts:555) asks about condition, not cleaning.",
+        "missing": "The authority asks for walls on a DAILY cleaning checklist, and CHK-CLEAN-KITCHEN-DAILY has no wall question. Add e.g. 'Walls, splashbacks and tiles at working height wiped clean' to its SURFACES section."
+      },
+      {
+        "section": "Cleaning & Sanitation",
+        "item": "Work tables",
+        "status": "CHECKED",
+        "inspector_visible": true,
+        "where": "CHK-CLEAN-KITCHEN-DAILY Q01 'Work tables, counters and shelves cleaned and sanitised' (pack.ts:317), backed by Q11 'Sanitiser strength on food-contact surfaces' 50–100 ppm (pack.ts:327)."
+      },
+      {
+        "section": "Cleaning & Sanitation",
+        "item": "Cutting boards",
+        "status": "CHECKED",
+        "inspector_visible": true,
+        "where": "CHK-CLEAN-KITCHEN-DAILY Q02 'Chopping boards washed, sanitised and stored upright, not stacked wet' (pack.ts:318)."
+      },
+      {
+        "section": "Cleaning & Sanitation",
+        "item": "Cooking equipment",
+        "status": "CHECKED",
+        "inspector_visible": true,
+        "where": "CHK-CLEAN-KITCHEN-DAILY Q03 'Range, griddle and burners degreased' (pack.ts:319) and Q06 'Can opener, slicer, mixer and blender stripped and cleaned' (pack.ts:322). Fryers, ovens and tandoor are not named."
+      },
+      {
+        "section": "Cleaning & Sanitation",
+        "item": "Refrigerators",
+        "status": "CHECKED",
+        "inspector_visible": true,
+        "where": "CHK-CLEAN-KITCHEN-DAILY Q05 'Fridge and freezer handles, seals and interiors wiped' (pack.ts:321). Also CHK-STORE-COLD-DAILY Q10 'Interiors clean — no spills, no blood, no standing water' (pack.ts:525)."
+      },
+      {
+        "section": "Cleaning & Sanitation",
+        "item": "Freezers",
+        "status": "CHECKED",
+        "inspector_visible": true,
+        "where": "CHK-CLEAN-KITCHEN-DAILY Q05 'Fridge and freezer handles, seals and interiors wiped' (pack.ts:321), plus weekly CHK-CLEAN-DEEP-WEEKLY Q05 'Freezer defrosted or ice build-up cleared' (pack.ts:390)."
+      },
+      {
+        "section": "Cleaning & Sanitation",
+        "item": "Exhaust/hood",
+        "status": "PARTIAL",
+        "inspector_visible": true,
+        "where": "CHK-CLEAN-KITCHEN-DAILY Q04 'Extraction hood filters cleaned or changed' (pack.ts:320) allows N/A, with help text 'Mark not-applicable on a day the filters are not due.' The canopy is weekly only: CHK-CLEAN-DEEP-WEEKLY Q08 'Extraction ducts and canopy cleaned down' (pack.ts:393). CHK-SAFE-OPENING Q05 checks the hood is running and filters not clogged (pack.ts:587), which is a safety check, not cleaning.",
+        "missing": "On most days the daily sheet will read N/A for the hood, and nothing asks for a daily clean of the hood canopy or outer surfaces. Add a required daily question (e.g. 'Hood canopy and grease channel wiped, drip tray emptied') and keep filters on their own frequency."
+      },
+      {
+        "section": "Cleaning & Sanitation",
+        "item": "Sinks",
+        "status": "GAP",
+        "inspector_visible": false,
+        "where": "No question in any of the 12 templates. Nearest are CHK-CLEAN-WASHROOM Q02 'Wash basins, taps and mirrors cleaned' (pack.ts:355), which covers guest washrooms (its own authority line), and kitchen Q13 dishwasher final-rinse temperature (pack.ts:331).",
+        "missing": "Add a daily question on CHK-CLEAN-KITCHEN-DAILY: 'Pot-wash, prep and hand-wash sinks, taps and draining boards cleaned and sanitised'."
+      },
+      {
+        "section": "Cleaning & Sanitation",
+        "item": "Racks",
+        "status": "CHECKED",
+        "inspector_visible": true,
+        "where": "CHK-CLEAN-KITCHEN-DAILY Q01 'Work tables, counters and shelves cleaned and sanitised' (pack.ts:317). Also CHK-STORE-DRY-DAILY Q06 'Shelves, floor and corners clean and dust-free' (pack.ts:490, daily)."
+      },
+      {
+        "section": "Cleaning & Sanitation",
+        "item": "Tables/chairs",
+        "status": "CHECKED",
+        "inspector_visible": true,
+        "where": "FOH: CHK-CLEAN-WASHROOM Q09 'Tables, chairs and high chairs wiped' (pack.ts:362), frequency twice_daily."
+      },
+      {
+        "section": "Cleaning & Sanitation",
+        "item": "Service stations",
+        "status": "CHECKED",
+        "inspector_visible": true,
+        "where": "FOH: CHK-CLEAN-WASHROOM Q10 'Service station, cutlery trays and water jugs clean' (pack.ts:363)."
+      },
+      {
+        "section": "Cleaning & Sanitation",
+        "item": "Crockery/cutlery",
+        "status": "PARTIAL",
+        "inspector_visible": true,
+        "where": "CHK-CLEAN-WASHROOM Q10 asks only for clean 'cutlery trays' (pack.ts:363). CHK-CLEAN-KITCHEN-DAILY Q13 'Dishwasher final rinse temperature' ≥82 °C (pack.ts:331) allows N/A where washing is by hand.",
+        "missing": "No question asks whether the crockery and cutlery themselves are washed, sanitised, dried and stored covered or inverted, or whether chipped or cracked pieces are kept out of use. Add one to the FOH round."
+      },
+      {
+        "section": "Cleaning & Sanitation",
+        "item": "Water station",
+        "status": "PARTIAL",
+        "inspector_visible": true,
+        "where": "CHK-CLEAN-WASHROOM Q10 covers 'water jugs clean' only (pack.ts:363). The Water & Ice module (fssai_water_tests, /fssai/water-ice) records water quality, not cleaning of the station.",
+        "missing": "Add 'Water station, dispenser or RO outlet, and glass trays cleaned and sanitised' to the FOH round."
+      },
+      {
+        "section": "Cleaning & Sanitation",
+        "item": "Toilet",
+        "status": "CHECKED",
+        "inspector_visible": true,
+        "where": "CHK-CLEAN-WASHROOM Q01 'Pans, urinals and seats cleaned and disinfected' (pack.ts:354), twice_daily."
+      },
+      {
+        "section": "Cleaning & Sanitation",
+        "item": "Wash basin",
+        "status": "CHECKED",
+        "inspector_visible": true,
+        "where": "CHK-CLEAN-WASHROOM Q02 'Wash basins, taps and mirrors cleaned' (pack.ts:355)."
+      },
+      {
+        "section": "Cleaning & Sanitation",
+        "item": "Soap",
+        "status": "CHECKED",
+        "inspector_visible": true,
+        "where": "CHK-CLEAN-WASHROOM Q03 'Soap available at every basin' (pack.ts:356, critical)."
+      },
+      {
+        "section": "Cleaning & Sanitation",
+        "item": "Hand-drying facility",
+        "status": "CHECKED",
+        "inspector_visible": true,
+        "where": "CHK-CLEAN-WASHROOM Q04 'Hand drying available — paper or working dryer' (pack.ts:357, critical)."
+      },
+      {
+        "section": "Cleaning & Sanitation",
+        "item": "Cleaning record",
+        "status": "RECORDED",
+        "inspector_visible": true,
+        "where": "Each CHK-CLEAN-WASHROOM round (twice_daily, pack.ts:339-368) is a signed fssai_runs row with fssai_responses. Listed on /fssai/cleaning ('Recently recorded', not clickable: SeededModuleScreen.tsx:376-402) and in the 'Checklist records' report. Caveat: twice daily, not the hourly wall log many washrooms keep, and staff toilets are not separated from guest washrooms."
+      },
+      {
+        "section": "Pest Control",
+        "item": "Monthly pest-control report",
+        "status": "RECORDED",
+        "inspector_visible": true,
+        "where": "fssai_pest_services (db.ts:9912-9943) records findings, recommendations, report_no, agency_licence_no, next_due_date and a 'missed' status. The job sheet is attached as a file after saving (pest-control/page.tsx:1338,1493). Page /fssai/pest-control; report 'pest-services' (reports.ts:1037-1096); Inspection Mode 'Pest control' section, last 12 visits (inspection-mode/route.ts:336-388). Caveat: nothing enforces the monthly cadence. next_due_date is a free note, the page says 'Nothing wakes the system up to tell you a visit is due' (page.tsx:330), and the dashboard overdue flag reads only the latest row (dashboard/route.ts:463-468)."
+      },
+      {
+        "section": "Pest Control",
+        "item": "Pest-control chemicals/records maintained",
+        "status": "PARTIAL",
+        "inspector_visible": false,
+        "where": "The column fssai_pest_services.chemicals_json [{name,batch,dilution,qty,uom,licence_no}] exists (db.ts:9924) and the visit detail renders it (pest-control/page.tsx:1430-1445). However, the 'Record a pest control visit' form never sends `chemicals` (page.tsx:1209-1217), and no other screen writes it, so the field is always '[]' (an inert field). It is also absent from the pest-services report columns (reports.ts:1045-1057) and from Inspection Mode (route.ts:342-343).",
+        "missing": "Add a chemicals editor (name, batch, dilution, qty, licence) to the visit form and the complete-visit flow, and show it in the 'Pest control visits' report and Inspection Mode. Until then the chemicals are only on a photographed job sheet or typed into findings."
+      },
+      {
+        "section": "Pest Control",
+        "item": "No cockroaches",
+        "status": "PARTIAL",
+        "inspector_visible": true,
+        "where": "Only generic, location-limited questions: CHK-STORE-DRY-DAILY Q07 'No sign of pests — droppings, gnawing, webbing or insects' (pack.ts:491, dry store only) and CHK-CLEAN-WASHROOM Q11 'No pests, droppings or webbing anywhere in the guest area' (pack.ts:364). No kitchen, prep or cold-room pest question exists. No template uses module_key 'pest-control', even though pest/devices/route.ts:13-18 and db.ts:9982-9987 say 'the weekly monitoring round is a seeded template' (it was never written). The sightings register (fssai_pest_sightings, pest_type 'cockroach') records presence only, never absence.",
+        "missing": "A daily kitchen pest check, either on CHK-CLEAN-KITCHEN-DAILY or in a new pest-control monitoring template: 'No cockroaches seen in kitchen, prep, wash-up, dry store or cold rooms (under equipment, drains, crevices)'."
+      },
+      {
+        "section": "Pest Control",
+        "item": "No flies",
+        "status": "PARTIAL",
+        "inspector_visible": true,
+        "where": "Same generic questions: dry store 'insects' (pack.ts:491) and guest area 'No pests' (pack.ts:364). Insect light traps can be registered (FSSAI_PEST_DEVICE_KINDS fly_unit, fssai.ts:2516), but no round checks them.",
+        "missing": "A kitchen and prep-area question 'No flies; insect light traps working and catch trays emptied', in a seeded pest-monitoring template."
+      },
+      {
+        "section": "Pest Control",
+        "item": "No rodents",
+        "status": "PARTIAL",
+        "inspector_visible": true,
+        "where": "Dry store Q07 covers 'droppings, gnawing' (pack.ts:491) and guest area Q11 (pack.ts:364). Bait stations can be registered, but nothing checks them routinely: last_checked_at is stamped only when a sighting is filed (pest/devices/route.ts:20-23, sightings/route.ts:337-341).",
+        "missing": "A rodent check covering kitchen, stores and back areas, plus a bait-station round with each station marked checked (the 'weekly monitoring round' template the code assumes exists)."
+      },
+      {
+        "section": "Pest Control",
+        "item": "No pest droppings/eggs/larvae",
+        "status": "PARTIAL",
+        "inspector_visible": true,
+        "where": "Dry store Q07 'droppings, gnawing, webbing or insects' (pack.ts:491) and guest Q11 'No pests, droppings or webbing' (pack.ts:364). FSSAI_PEST_EVIDENCE_KINDS includes droppings and nesting but has no eggs or larvae option (fssai.ts:2463-2471).",
+        "missing": "A kitchen-area question naming droppings, egg cases and larvae, and an 'eggs/larvae' evidence kind on sightings."
+      },
+      {
+        "section": "Pest Control",
+        "item": "Insect-proof screens where required",
+        "status": "PARTIAL",
+        "inspector_visible": true,
+        "where": "CHK-STORE-WEEKLY Q07 'Windows screened, doors closing, no gap under a door' (pack.ts:556) covers the store only, weekly. CHK-CLEAN-DEEP-WEEKLY Q09 'Light fittings, fly screens and ceiling fans cleaned' (pack.ts:394) is about cleaning, not whether screens are intact.",
+        "missing": "A premises-wide question: 'Kitchen and prep windows, vents and exhaust openings fitted with intact insect-proof mesh'."
+      },
+      {
+        "section": "Pest Control",
+        "item": "Door gaps sealed",
+        "status": "PARTIAL",
+        "inspector_visible": true,
+        "where": "CHK-STORE-WEEKLY Q07 '…no gap under a door' (pack.ts:556) covers the store only.",
+        "missing": "Cover kitchen, service and external doors: 'No gaps at door bottoms or frames; doors self-closing; strip or air curtain working'."
+      },
+      {
+        "section": "Pest Control",
+        "item": "Drain/grease traps maintained",
+        "status": "CHECKED",
+        "inspector_visible": true,
+        "where": "CHK-CLEAN-KITCHEN-DAILY Q08 'Drains and grease traps cleared — no standing water, no smell' (pack.ts:324, critical), plus CHK-CLEAN-DEEP-WEEKLY Q03 'Grease trap opened, emptied and flushed' (pack.ts:388)."
+      },
+      {
+        "section": "Waste Management",
+        "item": "Separate wet/dry waste as applicable",
+        "status": "GAP",
+        "inspector_visible": false,
+        "where": "No question and no waste register anywhere in the module. The only 'wet waste' text is a placeholder on the expiry-discard method field (fifo/page.tsx:953).",
+        "missing": "Add 'Wet and dry waste kept in separate, labelled or colour-coded bins' to CHK-CLEAN-KITCHEN-DAILY (FLOORS section)."
+      },
+      {
+        "section": "Waste Management",
+        "item": "Bins have lids",
+        "status": "CHECKED",
+        "inspector_visible": true,
+        "where": "CHK-CLEAN-KITCHEN-DAILY Q09 'Bins emptied, washed and relined; lids closing properly' (pack.ts:325). CHK-CLEAN-WASHROOM Q07 'Bins emptied and lids working' (pack.ts:360)."
+      },
+      {
+        "section": "Waste Management",
+        "item": "Bins are cleaned regularly",
+        "status": "CHECKED",
+        "inspector_visible": true,
+        "where": "CHK-CLEAN-KITCHEN-DAILY Q09 'Bins emptied, washed and relined; lids closing properly' (pack.ts:325), daily."
+      },
+      {
+        "section": "Waste Management",
+        "item": "Waste removed from kitchen periodically",
+        "status": "CHECKED",
+        "inspector_visible": true,
+        "where": "CHK-CLEAN-KITCHEN-DAILY Q09 'Bins emptied…' (pack.ts:325) and Q10 'Waste area cleared and nothing left out overnight' (pack.ts:326, critical). This is once daily at close. No record exists of collection by GHMC or the waste agency (that belongs to the separate 'Waste disposal record' line)."
+      },
+      {
+        "section": "Waste Management",
+        "item": "No overflowing bins",
+        "status": "PARTIAL",
+        "inspector_visible": true,
+        "where": "Only the end-of-day emptying in Q09 (pack.ts:325), answered after the bins are emptied. No per-shift question asks about overflow during service.",
+        "missing": "An in-service question, e.g. on CHK-FQ-PRESERVICE or the twice-daily round: 'No bin overflowing; lids closed during service'."
+      },
+      {
+        "section": "Waste Management",
+        "item": "Waste area kept clean",
+        "status": "PARTIAL",
+        "inspector_visible": true,
+        "where": "CHK-CLEAN-KITCHEN-DAILY Q10 'Waste area cleared and nothing left out overnight' (pack.ts:326) asks whether the area was cleared, not whether it was cleaned.",
+        "missing": "Reword or add: 'Waste area washed — no spillage, leachate, smell or flies'."
+      },
+      {
+        "section": "Waste Management",
+        "item": "Used oil disposal records maintained",
+        "status": "RECORDED",
+        "inspector_visible": true,
+        "where": "fssai_oil_disposals (db.ts:9817-9848) records collector, agency_reg_no, vehicle, quantity, receipt_no and the scanned receipt. Recorded on /fssai/oil-quality Collections (page.tsx:1030-1063, form sends agency_reg_no/receipt_no at 1229-1233); oil checks link to it by disposal_id. Report 'oil-disposals' 'Used-oil collections' (reports.ts:917-967, also as PDF). Not in the Inspection Mode handover, which has no oil section (inspection-mode/route.ts:122-529)."
+      },
+      {
+        "section": "Waste Management",
+        "item": "No food waste accumulated near preparation areas",
+        "status": "PARTIAL",
+        "inspector_visible": true,
+        "where": "Only end-of-day Q09/Q10 (pack.ts:325-326) and CHK-FQ-HOLDING Q07 'What was discarded and why' (pack.ts:294), which records discards, not where waste sits.",
+        "missing": "An in-service question: 'No food scraps or waste left on or near prep tables; scrap bins emptied during service'."
+      },
+      {
+        "section": "Food-Grade Equipment & Packaging",
+        "item": "Food-contact equipment is food-safe",
+        "status": "GAP",
+        "inspector_visible": false,
+        "where": "No question in any template. fssai_equipment.kind covers only temperature and utility units (cold_room…water_filter, fssai.ts:226-235).",
+        "missing": "A periodic (e.g. monthly) question: 'All food-contact equipment and utensils are of food-grade material', ideally with supplier declarations filed under Documents (FSSAI_DOC_TYPES has no such type; only 'other', fssai.ts:2535-2552)."
+      },
+      {
+        "section": "Food-Grade Equipment & Packaging",
+        "item": "Containers are non-toxic and easy to clean",
+        "status": "GAP",
+        "inspector_visible": false,
+        "where": "Not asked. CHK-STORE-COLD-DAILY Q05 'Every container covered or wrapped' (pack.ts:520) is about cover, not material or cleanability.",
+        "missing": "Add 'Food containers are non-toxic, food-grade, smooth and easy to clean (no reused chemical or paint tubs)'."
+      },
+      {
+        "section": "Food-Grade Equipment & Packaging",
+        "item": "No rusted/damaged food-contact equipment",
+        "status": "GAP",
+        "inspector_visible": false,
+        "where": "Not asked. CHK-STORE-DRY-DAILY Q10 'Any damaged, swollen, rusted or leaking pack…' (pack.ts:494) is about stock packs, not equipment. Equipment events (repair/out_of_service, fssai.ts:2283-2292) are reactive and only for registered temperature units.",
+        "missing": "A daily or weekly question: 'No rusted, chipped, cracked or damaged utensils, pans, boards or containers in use; damaged items withdrawn'."
+      },
+      {
+        "section": "Food-Grade Equipment & Packaging",
+        "item": "Food-grade storage containers",
+        "status": "GAP",
+        "inspector_visible": false,
+        "where": "Not asked by any storage template (CHK-STORE-DRY-DAILY, CHK-STORE-COLD-DAILY, CHK-STORE-WEEKLY: pack.ts:470-564).",
+        "missing": "Add to the storage checklists: 'All food stored in food-grade, lidded containers'."
+      },
+      {
+        "section": "Food-Grade Equipment & Packaging",
+        "item": "Food-grade packaging for delivery",
+        "status": "GAP",
+        "inspector_visible": false,
+        "where": "Nothing covers outgoing or takeaway packaging. Receiving's chk_damage applies to incoming deliveries only (db.ts:9487-9548).",
+        "missing": "A dispatch/takeaway question ('Delivery packaging food-grade, clean, sealed/tamper-evident') plus the packaging supplier's food-grade declaration filed in Documents."
+      },
+      {
+        "section": "Food-Grade Equipment & Packaging",
+        "item": "No newspaper used for food wrapping",
+        "status": "GAP",
+        "inspector_visible": false,
+        "where": "Not asked anywhere.",
+        "missing": "Add 'No newspaper or printed paper in contact with food (wrapping, lining, draining oil)' to a daily kitchen or service checklist."
+      },
+      {
+        "section": "Food-Grade Equipment & Packaging",
+        "item": "Packaging properly stored",
+        "status": "PARTIAL",
+        "inspector_visible": true,
+        "where": "Generic dry-store questions only: CHK-STORE-DRY-DAILY Q01 'Nothing stored directly on the floor…' (pack.ts:485) and Q05 'Non-food items and chemicals stored separately, never above food' (pack.ts:489).",
+        "missing": "A specific question: 'Packaging material stored clean, covered, off the floor, away from chemicals and pests'."
+      },
+      {
+        "section": "Records You Should Keep Ready in One Audit File",
+        "item": "FSSAI licence copy",
+        "status": "PARTIAL",
+        "where": "STORE: fssai_documents doc_type 'fssai_licence' (src/lib/fssai.ts:2538; DDL src/lib/db.ts:10023), with the scan in fssai_attachments (db.ts:10080). PRODUCE: /fssai/documents detail opens the scan in a lightbox (src/app/fssai/documents/page.tsx:848-885). The 'documents-expiry' report gives CSV/Excel/PDF of the metadata only (src/app/api/fssai/_p9/reports.ts:1158). INSPECTION MODE: the 'Licence and certificates' section (src/app/api/fssai/inspection-mode/route.ts:122-169) lists type, title, number, issuer, expiry and state. It never shows the scan (src/app/fssai/inspection-mode/page.tsx:345-363).",
+        "missing": "(1) The scheduled retention sweep deletes the scan 12 months after upload. Path: src/lib/fssai-jobs.ts:242,726 calls src/lib/fssai-retention.ts:254-260, which has no entity_table or kind exemption, and the page says 'image kept 12 months' (documents/page.tsx:857,883). A licence valid for 1-5 years therefore loses its copy while still in force. (2) Only JPG/PNG/WebP up to 400 KB, downscaled to 1200 px, are accepted (src/lib/fssai.ts:1217,1251,1306). The FoSCoS PDF cannot be uploaded. (3) The copy cannot be opened from Inspection Mode or from any report. (4) The documents-expiry report does not filter is_active (reports.ts:1182-1191), so the licence a renewal replaced prints as 'EXPIRED' next to the current one.",
+        "inspector_visible": false
+      },
+      {
+        "section": "Records You Should Keep Ready in One Audit File",
+        "item": "FSDB photograph",
+        "status": "PARTIAL",
+        "where": "No slot. FSSAI_DOC_TYPES (src/lib/fssai.ts:2535-2552) has no FSDB type. The only place for it is doc_type 'other', with a photo in fssai_attachments. No checklist question in src/lib/fssai-checklist-pack.ts mentions the display board.",
+        "missing": "Add a dedicated 'fsdb_photo' document type, or a display-board question that requires a photo, so the photo is prompted, named and findable. Exempt it from the 12-month image sweep. Show the photo in Inspection Mode. Today it can only be filed as an untyped 'Other' row, and Inspection Mode shows no images.",
+        "inspector_visible": false
+      },
+      {
+        "section": "Records You Should Keep Ready in One Audit File",
+        "item": "GHMC licence",
+        "status": "RECORDED",
+        "where": "STORE: fssai_documents doc_type 'trade_licence', labelled 'Trade licence', renews (src/lib/fssai.ts:2539), with the scan in fssai_attachments. PRODUCE: /fssai/documents (filter by type) and the documents-expiry report (reports.ts:1158). INSPECTION MODE: listed in 'Licence and certificates' with number, issuer and validity (inspection-mode/route.ts:122-169).",
+        "missing": "The slot is labelled generically 'Trade licence', not GHMC. The scan is image-only and is deleted 12 months after upload (fssai-retention.ts:254), which only roughly matches an annual GHMC renewal. Inspection Mode lists it but does not show the scan.",
+        "inspector_visible": true
+      },
+      {
+        "section": "Records You Should Keep Ready in One Audit File",
+        "item": "Water test report / water bill",
+        "status": "RECORDED",
+        "where": "STORE: fssai_water_tests (db.ts:9860). test_kind 'lab_report' holds lab_name, lab_licence_no, report_no, sample_date, report_date, parameters_json, result and next_due_date (kinds at src/lib/fssai.ts:2426-2435), with attachments. There is also doc_type 'water_test' (fssai.ts:2543). PRODUCE: /fssai/water-ice and the 'water-tests' report (reports.ts:971). INSPECTION MODE: the 'Water and ice' section, last 25 rows (inspection-mode/route.ts:390-432), plus the documents section.",
+        "missing": "The water-bill alternative has no slot ('Other' only). The test report half is covered. Lab-certificate scans are image-only and are deleted after 12 months.",
+        "inspector_visible": true
+      },
+      {
+        "section": "Records You Should Keep Ready in One Audit File",
+        "item": "Pest-control agreement + reports",
+        "status": "RECORDED",
+        "where": "AGREEMENT: fssai_documents doc_type 'pest_contract', vendor-scoped (fssai.ts:2544). REPORTS: fssai_pest_services (db.ts:9912) holds agency_licence_no, technician, areas, chemicals_json, findings, recommendations, report_no, contract_doc_id and next_due_date, with job-sheet scans as attachments (pest/services/route.ts). PRODUCE: /fssai/pest-control and the 'pest-services' and 'pest-sightings' reports (reports.ts:1038,1100). INSPECTION MODE: the 'Pest control' section shows the last 12 visits (inspection-mode/route.ts:336-388), and the contract appears in the documents section.",
+        "missing": "The contract can only be filed against an agency that is already in the vendors table. Job-sheet and contract scans are deleted 12 months after upload.",
+        "inspector_visible": true
+      },
+      {
+        "section": "Records You Should Keep Ready in One Audit File",
+        "item": "Food-handler medical certificates",
+        "status": "PARTIAL",
+        "where": "STORE: fssai_documents doc_type 'medical_fitness', person-scoped (fssai.ts:2546). CHECK: CHK-HYG-HEALTH-MONTHLY RECORDS Q04 'Medical fitness certificate on file and not expired' (fssai-checklist-pack.ts:458), a self-declaration by each signed-in member. INSPECTION MODE: listed in the documents section by title and expiry only.",
+        "missing": "person_email must be an existing users.email (src/app/api/fssai/documents/route.ts:168-178), and the local DB has only 9 users. A food handler without an app login cannot have a certificate filed, and hr_employees is not linked. There is no coverage roster showing every food handler and whether their certificate is valid, missing or expired. Inspection Mode does not show whose certificate each row is, or the scan. Scans are deleted after 12 months.",
+        "inspector_visible": true
+      },
+      {
+        "section": "Records You Should Keep Ready in One Audit File",
+        "item": "Food-safety training records",
+        "status": "PARTIAL",
+        "where": "STORE: fssai_documents doc_type 'food_handler_training', person-scoped (fssai.ts:2547). CHECK: CHK-HYG-HEALTH-MONTHLY RECORDS Q06 'Food-safety training (FoSTaC or in-house) completed and recorded' (fssai-checklist-pack.ts:460). HRMS has hr_trainings and hr_training_assignments (db.ts:8473-8495), keyed on hr_employees, but nothing in /fssai reads them.",
+        "missing": "The same users-only key as medical certificates (documents/route.ts:177), so food handlers without a login cannot be covered. HRMS training is not linked into FSSAI, the reports or Inspection Mode. There is no FoSTaC supervisor record or ratio, and no per-person coverage list. FoSTaC certificates last 2 years, but their scans are deleted after 12 months.",
+        "inspector_visible": true
+      },
+      {
+        "section": "Records You Should Keep Ready in One Audit File",
+        "item": "Approved vendor list",
+        "status": "PARTIAL",
+        "where": "Related records only. The vendors table has id, name, contact_person, phone, email, gstin, address, payment_terms, lead_time_days, is_active and notes. It has no approval flag and no FSSAI licence column (live schema). doc_type 'supplier_licence' is vendor-scoped (fssai.ts:2545), and the /fssai/documents type filter lists them on screen. The supplier licence number is also typed per delivery in fssai_receiving_checks.supplier_licence_no (db.ts:9440).",
+        "missing": "There is no approved-supplier register (approved, by whom, when, for which items) and no report or export that prints the approved vendor list with licence number and validity. Neither Inspection Mode nor any of the 21 reports covers it.",
+        "inspector_visible": false
+      },
+      {
+        "section": "Records You Should Keep Ready in One Audit File",
+        "item": "Receiving checklist",
+        "status": "RECORDED",
+        "where": "STORE: fssai_receiving_checks and fssai_receiving_lines (db.ts:9429,9487), covering vehicle, vehicle temperature, supplier licence, line temperature, lot, expiry, accept or reject and reason, with photos. PRODUCE: /fssai/receiving and the 'receiving-inspections' and 'receiving-rejections' reports (reports.ts:450,523). INSPECTION MODE: the 'Deliveries checked at the door' section (inspection-mode/route.ts:283-334).",
+        "missing": "Inspection Mode shows only the 25 most recent deliveries in a window of at most 90 days.",
+        "inspector_visible": true
+      },
+      {
+        "section": "Records You Should Keep Ready in One Audit File",
+        "item": "Refrigerator/freezer temperature log",
+        "status": "RECORDED",
+        "where": "STORE: fssai_temperature_logs with log_kind 'equipment' for cold room, chiller and freezer (fssai.ts:2240; db.ts:9549). Each reading carries the frozen min/max used and a pass/fail. Related checks: CHK-STORE-COLD-DAILY Q12/Q13 (fssai-checklist-pack.ts:527-528). PRODUCE: /fssai/temperature (filters by log_kind) and /fssai/cold-rooms, plus the 'temperature-log' and 'temperature-breaches' reports (reports.ts:587,660). INSPECTION MODE: the 'Temperature records' section (inspection-mode/route.ts:227-281).",
+        "missing": "The report cannot be split by kind: its text filter covers only unit, area and item labels (reports.ts:613), so fridge and cooking readings come out on one sheet. Inspection Mode shows only 25 readings of all kinds mixed together, which would not cover a week of fridge rounds.",
+        "inspector_visible": true
+      },
+      {
+        "section": "Records You Should Keep Ready in One Audit File",
+        "item": "Cooking/reheating temperature log",
+        "status": "RECORDED",
+        "where": "STORE: fssai_temperature_logs with log_kind 'cooking', 'reheating', 'hot_holding' and 'cooling' (fssai.ts:2243-2246). Related checks: CHK-FQ-PRESERVICE Q07 core temperature (pack:257) and CHK-FQ-HOLDING Q06 reheating core temperature (pack:292). PRODUCE: /fssai/temperature and the 'temperature-log' report (reports.ts:587). INSPECTION MODE: the 'Temperature records' section.",
+        "missing": "There is no separate cooking/reheating sheet: the report mixes these readings with fridge readings and cannot filter by kind. Inspection Mode is capped at 25 readings.",
+        "inspector_visible": true
+      },
+      {
+        "section": "Records You Should Keep Ready in One Audit File",
+        "item": "Cleaning & sanitation checklist",
+        "status": "CHECKED",
+        "where": "CHK-CLEAN-KITCHEN-DAILY Q01 'Work tables, counters and shelves cleaned and sanitised', Q11 sanitiser ppm and Q13 dishwasher rinse temperature (fssai-checklist-pack.ts:301-334). CHK-CLEAN-WASHROOM (pack:340). CHK-CLEAN-DEEP-WEEKLY (pack:371). Stored in fssai_runs and fssai_responses. PRODUCE: /fssai/cleaning, run detail at /fssai/checklists/run/[id], and the 'checklist-records' report filtered by checklist name (reports.ts:161,191). INSPECTION MODE: the 'Food-safety checks' section (inspection-mode/route.ts:171-225).",
+        "missing": "No print view exists anywhere under /fssai, and no report prints a completed sheet with every answer. 'checklist-records' is one summary line per round, and 'checklist-failures' shows failed answers only. Inspection Mode lists only the 25 most recent rounds of all templates mixed, with no link to the answers, so cleaning rounds can be pushed out by shift hygiene rounds.",
+        "inspector_visible": true
+      },
+      {
+        "section": "Records You Should Keep Ready in One Audit File",
+        "item": "Pest-control monitoring sheet",
+        "status": "PARTIAL",
+        "where": "fssai_pest_devices is a register only (db.ts:9982-10006). Its own comment says routine station checks are meant to be 'a CHECKLIST ANSWER (the monitoring round is a seeded template)'. No such template exists: the 12 templates in fssai-checklist-pack.ts have no bait-station or trap round. last_checked_at is written only when a sighting is logged (src/app/api/fssai/pest/sightings/route.ts:335-343). Sightings are in fssai_pest_sightings, and contractor visits in fssai_pest_services.",
+        "missing": "Add a station-by-station monitoring record (date, device code, activity yes/no, action, initials), either the promised seeded pest-monitoring template or a device-check log, plus a report and an Inspection Mode view of it. Today a 'no activity' check of station 7 cannot be recorded at all.",
+        "inspector_visible": false
+      },
+      {
+        "section": "Records You Should Keep Ready in One Audit File",
+        "item": "Waste disposal record",
+        "status": "PARTIAL",
+        "where": "Related records only. fssai_expiry_items.discard_method and witnessed_by cover expired or spoiled stock (db.ts:9724; /fssai/fifo). fssai_oil_disposals covers used oil. CHK-FQ-HOLDING Q07/Q08 records cooked food discarded and its kg (pack:294-295). CHK-CLEAN-KITCHEN-DAILY Q09/Q10 cover bins and the waste area (pack:325-326). Nothing named 'waste' exists in /api/fssai or /fssai beyond a placeholder text.",
+        "missing": "There is no general waste-handover log (date, wet/dry/other, quantity, collector or agency such as GHMC or an authorised vendor, receipt or vehicle, signature), no report and no Inspection Mode section.",
+        "inspector_visible": false
+      },
+      {
+        "section": "Records You Should Keep Ready in One Audit File",
+        "item": "Used cooking-oil/TPC records",
+        "status": "RECORDED",
+        "where": "STORE: fssai_oil_checks (db.ts:9772) holds tpm_pct (NULL when not measured), method, the frozen max_tpm_used, oil_changed and quantities. fssai_oil_disposals (db.ts:9826) is the RUCO register: collector, agency_reg_no, vehicle, quantity and receipt_no, with scans. PRODUCE: /fssai/oil-quality and the 'oil-checks' and 'oil-disposals' reports (reports.ts:849,918).",
+        "missing": "Inspection Mode has no oil section (its 8 sections are at inspection-mode/route.ts:122-529), so these records reach the inspector only through the management Reports screen.",
+        "inspector_visible": true
+      },
+      {
+        "section": "Records You Should Keep Ready in One Audit File",
+        "item": "Equipment maintenance records",
+        "status": "RECORDED",
+        "where": "STORE: fssai_equipment_events (db.ts:9648) with kinds repair/service, breakdown, deep clean, filter change and out of / back in service (fssai.ts:2283-2292), plus performed_by, vendor, reference_no and next_due_date. Related check: CHK-SAFE-MONTHLY Q09 'Cold rooms, fryers and ovens serviced to schedule' (pack:625). There is also doc_type 'amc'. PRODUCE: /fssai/cold-rooms and the 'equipment-events' report (reports.ts:722).",
+        "missing": "An event can only be logged against a unit in fssai_equipment (equipment-events/route.ts:364), and that register has 0 rows in this DB, so nothing can be recorded until it is filled in. Inspection Mode has no equipment section, so the records are reachable only through Reports.",
+        "inspector_visible": true
+      },
+      {
+        "section": "Records You Should Keep Ready in One Audit File",
+        "item": "Calibration certificates",
+        "status": "RECORDED",
+        "where": "STORE: fssai_documents doc_type 'calibration_certificate', equipment-scoped (fssai.ts:2548). fssai_equipment_events kind 'calibration' records value_before, reference_value, value_after and the frozen deviation. Related check: CHK-SAFE-MONTHLY Q10 'Thermometers and probes calibrated and the result recorded' (pack:626). PRODUCE: /fssai/documents and the 'equipment-events' and 'documents-expiry' reports. INSPECTION MODE: certificate metadata appears in the documents section.",
+        "missing": "Filing needs an fssai_equipment row (documents/route.ts:179-188), and there are 0 rows today. The certificate scan is not shown in Inspection Mode, and scans are deleted after 12 months.",
+        "inspector_visible": true
+      },
+      {
+        "section": "Records You Should Keep Ready in One Audit File",
+        "item": "FIFO/FEFO checklist",
+        "status": "CHECKED",
+        "where": "CHK-STORE-WEEKLY ROTATION Q01 'First-in first-out visibly working — nothing old hidden behind new' and Q02 'Opened-pack shelf lives being applied, not just the pack date' (fssai-checklist-pack.ts:550-551). CHK-STORE-DRY-DAILY Q02 'Oldest stock at the front, newest behind it' (pack:486). CHK-STORE-COLD-DAILY Q08 (pack:523). Also the /fssai/fifo expiry register (fssai_expiry_items, db.ts:9724) and the 'expiry-disposals' report (reports.ts:783).",
+        "missing": "FEFO has nothing to sort on unless shelf lives are configured in fssai_item_shelf_life, because raw_materials shelf life is blank. Inspection Mode has no FIFO or expiry section, and those rounds appear only in the mixed 25-row checks list.",
+        "inspector_visible": true
+      },
+      {
+        "section": "Records You Should Keep Ready in One Audit File",
+        "item": "Food sampling/lab reports, where applicable",
+        "status": "PARTIAL",
+        "where": "No slot. FSSAI_DOC_TYPES (fssai.ts:2535-2552) has no food lab or sample report type. fssai_water_tests covers water only. The only place for a food lab report is doc_type 'other'.",
+        "missing": "Add a 'food_lab_report' document type, or a sample register (sample, date, lab, NABL number, parameters, result). It needs a report or Inspection Mode visibility, and PDF upload, because lab reports arrive as PDFs and only images are accepted today.",
+        "inspector_visible": false
+      },
+      {
+        "section": "Records You Should Keep Ready in One Audit File",
+        "item": "Previous audit report and closure evidence",
+        "status": "PARTIAL",
+        "where": "STORE: fssai_inspections (db.ts:10104) with score, grade, report_no and document_id. fssai_inspection_findings (db.ts:10147) carries clause, due date, status and a ca_id link to fssai_corrective_actions (db.ts:9306), which holds action_taken, verified_by and verify_note. PRODUCE: /fssai/inspections and the 'inspections', 'inspection-findings' and 'corrective-actions' reports (reports.ts:1299,1365,1234). INSPECTION MODE: the 'Previous visits' and 'What was found and what was done' sections (inspection-mode/route.ts:434-529).",
+        "missing": "The authority's report itself has no upload path. src/app/api/fssai/inspections/route.ts has no 'attach' action, the page shows only a 'report number' field (inspections/page.tsx:706) and offers no way to set document_id, and there is no 'inspection_report' document type. Closure evidence is text only: corrective actions and findings take no photo. Any scan filed as 'Other' is deleted 12 months after upload, which is about when the next annual audit asks for it. Inspection Mode shows open/total point counts but not each finding's closure detail.",
+        "inspector_visible": true
+      }
+    ]
+  },
+  "workflowProgress": [
+    {
+      "type": "workflow_phase",
+      "index": 1,
+      "title": "Map"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 1,
+      "label": "map:licences-premises-storage",
+      "phaseIndex": 1,
+      "phaseTitle": "Map",
+      "agentId": "a8bed5389215ce58a",
+      "model": "claude-opus-5-5",
+      "state": "done",
+      "startedAt": 1791907370925,
+      "queuedAt": 1791907370909,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "Licences & Display · Kitchen & Premises Hygiene · Storage –…",
+      "promptPreview": "STRICTLY READ-ONLY. Create, edit, delete or commit NOTHING. No git checkout/restore/stash/reset —\nanother fleet is editing this worktree right now and any of those would destroy its work.\nDo not start a dev server. Scratch notes under /tmp only.\nMake a tool call every minute or two; long silent stretches get your lane killed.\n\nWORKTREE: /Users/shashankreddy/Desktop/Claude/fnb-fssai-restale — the F…",
+      "promptFramed": true,
+      "lastProgressAt": 1791907751059,
+      "tokens": 206473,
+      "toolCalls": 51,
+      "durationMs": 380134,
+      "resultPreview": "{\"lane\":\"Licences & Display · Kitchen & Premises Hygiene · Storage – Very Important\",\"items\":[{\"section\":\"Licences & Display\",\"item\":\"FSSAI licence displayed prominently\",\"status\":\"PARTIAL\",\"inspector_visible\":true,\"where\":\"fssai_documents doc_type 'fssai_licence' (src/lib/fssai.ts:2538; table src/lib/db.ts:10023), entered at /fssai/documents. The licence row (number, issuer, expiry, derived Valid…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 2,
+      "label": "map:temperature-prep-hygiene",
+      "phaseIndex": 1,
+      "phaseTitle": "Map",
+      "agentId": "a538fec926ec4224f",
+      "model": "claude-opus-5-5",
+      "state": "done",
+      "startedAt": 1791907370925,
+      "queuedAt": 1791907370909,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "Food Temperature Control · Food Preparation · Personal Hygi…",
+      "promptPreview": "STRICTLY READ-ONLY. Create, edit, delete or commit NOTHING. No git checkout/restore/stash/reset —\nanother fleet is editing this worktree right now and any of those would destroy its work.\nDo not start a dev server. Scratch notes under /tmp only.\nMake a tool call every minute or two; long silent stretches get your lane killed.\n\nWORKTREE: /Users/shashankreddy/Desktop/Claude/fnb-fssai-restale — the F…",
+      "promptFramed": true,
+      "lastProgressAt": 1791907863740,
+      "tokens": 206393,
+      "toolCalls": 70,
+      "durationMs": 491606,
+      "resultPreview": "{\"lane\":\"Food Temperature Control · Food Preparation · Personal Hygiene – Critical (27 items)\",\"items\":[{\"section\":\"Food Temperature Control\",\"item\":\"Maintain a temperature monitoring sheet for Receiving\",\"status\":\"RECORDED\",\"where\":\"Table fssai_receiving_lines.temp_c with the range frozen on the line (db.ts:9504-9506), plus fssai_receiving_checks.vehicle_temp_c (db.ts:9453). On submit, each probe…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 3,
+      "label": "map:cleaning-pest-waste-equipment",
+      "phaseIndex": 1,
+      "phaseTitle": "Map",
+      "agentId": "adfed95fb3a0f2769",
+      "model": "claude-opus-5-5",
+      "state": "done",
+      "startedAt": 1791907370925,
+      "queuedAt": 1791907370909,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "Cleaning & Sanitation · Pest Control · Waste Management · F…",
+      "promptPreview": "STRICTLY READ-ONLY. Create, edit, delete or commit NOTHING. No git checkout/restore/stash/reset —\nanother fleet is editing this worktree right now and any of those would destroy its work.\nDo not start a dev server. Scratch notes under /tmp only.\nMake a tool call every minute or two; long silent stretches get your lane killed.\n\nWORKTREE: /Users/shashankreddy/Desktop/Claude/fnb-fssai-restale — the F…",
+      "promptFramed": true,
+      "lastProgressAt": 1791907849040,
+      "tokens": 219486,
+      "toolCalls": 60,
+      "durationMs": 476905,
+      "resultPreview": "{\"lane\":\"Cleaning & Sanitation · Pest Control · Waste Management · Food-Grade Equipment & Packaging\",\"items\":[{\"section\":\"Cleaning & Sanitation\",\"item\":\"Kitchen\",\"status\":\"CHECKED\",\"inspector_visible\":true,\"where\":\"CHK-CLEAN-KITCHEN-DAILY 'Kitchen Cleaning — Daily' (frequency daily), src/lib/fssai-checklist-pack.ts:300-337. The whole template is the daily kitchen cleaning checklist, e.g. Q15 'Phot…"
+    },
+    {
+      "type": "workflow_agent",
+      "index": 4,
+      "label": "map:audit-file",
+      "phaseIndex": 1,
+      "phaseTitle": "Map",
+      "agentId": "a6390fa9f5cb966ce",
+      "model": "claude-opus-5-5",
+      "state": "done",
+      "startedAt": 1791907370925,
+      "queuedAt": 1791907370910,
+      "attempt": 1,
+      "lastToolName": "StructuredOutput",
+      "lastToolSummary": "Records You Should Keep Ready in One Audit File (20 items)",
+      "promptPreview": "STRICTLY READ-ONLY. Create, edit, delete or commit NOTHING. No git checkout/restore/stash/reset —\nanother fleet is editing this worktree right now and any of those would destroy its work.\nDo not start a dev server. Scratch notes under /tmp only.\nMake a tool call every minute or two; long silent stretches get your lane killed.\n\nWORKTREE: /Users/shashankreddy/Desktop/Claude/fnb-fssai-restale — the F…",
+      "promptFramed": true,
+      "lastProgressAt": 1791907951959,
+      "tokens": 237077,
+      "toolCalls": 80,
+      "durationMs": 579824,
+      "resultPreview": "{\"lane\":\"Records You Should Keep Ready in One Audit File (20 items)\",\"items\":[{\"section\":\"Records You Should Keep Ready in One Audit File\",\"item\":\"FSSAI licence copy\",\"status\":\"PARTIAL\",\"where\":\"STORE: fssai_documents doc_type 'fssai_licence' (src/lib/fssai.ts:2538; DDL src/lib/db.ts:10023), with the scan in fssai_attachments (db.ts:10080). PRODUCE: /fssai/documents detail opens the scan in a ligh…"
+    }
+  ],
+  "totalTokens": 869429,
+  "totalToolCalls": 261
+}

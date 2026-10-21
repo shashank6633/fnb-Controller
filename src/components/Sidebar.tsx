@@ -76,6 +76,24 @@ import {
   Megaphone,
   Undo2,
   Star,
+  // FSSAI Compliance section. Kept as one contiguous block so a future conflict
+  // in this import list is a single-hunk resolve. The other 11 icons that
+  // section uses (LayoutDashboard, CalendarClock, Utensils, Sparkles, Boxes,
+  // Wrench, ListChecks, ClipboardList, FileText, BarChart3, Settings2) are
+  // already imported above and are reused, which is the habit in this file.
+  ShieldCheck,
+  PackageCheck,
+  Snowflake,
+  Thermometer,
+  Bug,
+  SprayCan,
+  HardHat,
+  Droplets,
+  Beaker,
+  Eye,
+  FolderCheck,
+  Recycle,
+  UserCheck,
   type LucideIcon,
 } from "lucide-react";
 
@@ -511,6 +529,63 @@ const navTree: NavEntry[] = [
       { kind: "link", label: "Geofences",    href: "/hr/geofences",  icon: Radar },
       { kind: "link", label: "Biometric & Import", href: "/hr/biometric", icon: ScanLine },
       { kind: "link", label: "HR Settings",  href: "/hr/settings",   icon: Settings2 },
+    ],
+  },
+
+  // FSSAI Compliance — food-safety records. Twin of the 'FSSAI Compliance'
+  // section in src/lib/page-catalog.ts: every row here MUST also exist there,
+  // with the href matching the path character for character, and vice versa.
+  // This file keeps its OWN nav tree and neither file reads the other — a
+  // catalog-only page is correctly gated and completely invisible, a
+  // sidebar-only page is visible and can never be granted or revoked.
+  // canAccessPage() filters per user, so the mgmtOnly / adminOnly rows hide
+  // themselves for everyone else once the catalog carries the flag; the rows
+  // still have to be listed here or those pages would be unreachable by nav.
+  {
+    kind: "section",
+    label: "FSSAI Compliance",
+    icon: ShieldCheck,
+    items: [
+      { kind: "link", label: "Dashboard",                           href: "/fssai",                    icon: LayoutDashboard },
+      { kind: "link", label: "Receiving/Receivables Quality Check", href: "/fssai/receiving",          icon: PackageCheck },
+      { kind: "link", label: "FIFO & Expiry Management",            href: "/fssai/fifo",               icon: CalendarClock },
+      { kind: "link", label: "Cold Room Climate Control",           href: "/fssai/cold-rooms",         icon: Snowflake },
+      { kind: "link", label: "Temperature Logs",                    href: "/fssai/temperature",        icon: Thermometer },
+      { kind: "link", label: "Food Quality Checks",                 href: "/fssai/food-quality",       icon: Utensils },
+      { kind: "link", label: "Pest Control Logs",                   href: "/fssai/pest-control",       icon: Bug },
+      { kind: "link", label: "Cleaning & Sanitation",               href: "/fssai/cleaning",           icon: SprayCan },
+      { kind: "link", label: "Personal Hygiene",                    href: "/fssai/hygiene",            icon: Sparkles },
+      { kind: "link", label: "Food Storage Checks",                 href: "/fssai/storage",            icon: Boxes },
+      { kind: "link", label: "Kitchen Safety Checks",               href: "/fssai/kitchen-safety",     icon: HardHat },
+      { kind: "link", label: "Water & Ice Checks",                  href: "/fssai/water-ice",          icon: Droplets },
+      { kind: "link", label: "Oil Quality Checks",                  href: "/fssai/oil-quality",        icon: Beaker },
+      // No tier flag in the catalog: porters file a handover at the back door.
+      // Hyderabad audit line #114 / audit-file record 14.
+      { kind: "link", label: "Waste Handover Log",                  href: "/fssai/waste",              icon: Recycle },
+      { kind: "link", label: "Corrective Actions",                  href: "/fssai/corrective-actions", icon: Wrench },
+      { kind: "link", label: "FSSAI Checklists",                    href: "/fssai/checklists",         icon: ListChecks },
+      // mgmtOnly in the catalog (admin | manager | HOD).
+      // Kept in step with page-catalog.ts by hand: a row here but not there is
+      // visible and UNGATED; a row there but not here is gated and INVISIBLE.
+      { kind: "link", label: "Verify Records",                      href: "/fssai/verification",       icon: ClipboardCheck },
+      { kind: "link", label: "Inspection Reports",                  href: "/fssai/inspections",        icon: ClipboardList },
+      { kind: "link", label: "Documents & Certificates",            href: "/fssai/documents",          icon: FileText },
+      // mgmtOnly in the catalog, the same set as Documents & Certificates it sits
+      // under: the food-handler register and who has no valid certificate
+      // (Hyderabad audit lines #55, #56, #106, #107; audit-file records 6 and 7).
+      { kind: "link", label: "Food Handlers",                       href: "/fssai/documents/food-handlers", icon: UserCheck },
+      { kind: "link", label: "Reports & Downloads",                 href: "/fssai/reports",            icon: BarChart3 },
+      { kind: "link", label: "Record Changes & Voids",              href: "/fssai/audit-log",          icon: History },
+      // adminOnly in the catalog.
+      { kind: "link", label: "Settings",                            href: "/fssai/settings",           icon: Settings2 },
+      // A sub-page of Settings, listed here on purpose: the equipment register is
+      // where every safe range in the module is set, and a screen reached only by
+      // a link inside another screen is a screen nobody finds. Its own catalog row
+      // carries adminOnly, so it hides itself for everyone else.
+      { kind: "link", label: "Equipment & Cold Units",              href: "/fssai/settings/equipment", icon: Snowflake },
+      { kind: "link", label: "Inspection Mode",                     href: "/fssai/inspection-mode",    icon: Eye },
+      // mgmtOnly in the catalog — the authority's 20-record audit file and its PDF.
+      { kind: "link", label: "Audit File",                          href: "/fssai/audit-file",         icon: FolderCheck },
     ],
   },
 

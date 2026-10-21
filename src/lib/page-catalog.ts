@@ -824,6 +824,124 @@ export const PAGE_CATALOG: PageSection[] = [
     ],
   },
   {
+    // FSSAI Compliance — food-safety records. Additive module; the twin section
+    // lives in src/components/Sidebar.tsx and BOTH must be edited together. A
+    // catalog-only page is correctly gated and completely INVISIBLE (that drift
+    // once hid 8 pages including /variance-approvals and read as a stock bug);
+    // a sidebar-only page is visible and can never be granted or revoked.
+    //
+    // Placed after HR and before Admin because homePathFor() and
+    // firstAllowedPath() sweep this array in DECLARATION ORDER — a
+    // compliance-only user lands on /fssai, and no existing user's landing page
+    // moves, since nothing ahead of HR changes.
+    //
+    // NO hodOnly ANYWHERE IN THIS SECTION, deliberately. hodOnly excludes
+    // MANAGERS (canAccessPage: the mgmtOnly line admits a manager, the hodOnly
+    // line above it does not), and there is no FSSAI surface where "HODs but not
+    // the Floor Manager" is the right set. It is also the only flag an admin can
+    // switch OFF at runtime with no deploy (settings key hod_only_overrides, read
+    // in proxy.ts), so it cannot hold a compliance gate.
+    //
+    // The 16 unflagged rows follow the /grn/qc precedent in this same file (the
+    // owner's own words there: NOT HOD-only, because "at 6am with a truck
+    // waiting that guarantees workarounds"). A flag that stops a porter filling
+    // in a hygiene check has broken the module. Per-record scoping — own
+    // department, own record — is the ROUTE's job: canAccessPage fails open four
+    // ways and page_access is NULL on 8 of 9 live users, so this catalog is
+    // visibility and grantability, never security.
+    //
+    // §7 Q8 (PROVISIONAL DEFAULT, owner has not ruled): Staff / Manager / Admin
+    // only for v1. §20 names Maintenance, Supervisor and F&B Controller roles
+    // that DO NOT EXIST in the live roles table, and FSSAI must never create a
+    // role — that is the owner's production config. §7 Q10 (PROVISIONAL): staff
+    // see their own department; cross-department packs are management, which is
+    // what the four mgmtOnly rows below encode.
+    label: 'FSSAI Compliance',
+    pages: [
+      { path: '/fssai',                    label: 'Dashboard' },
+      { path: '/fssai/receiving',          label: 'Receiving/Receivables Quality Check' },
+      { path: '/fssai/fifo',               label: 'FIFO & Expiry Management' },
+      { path: '/fssai/cold-rooms',         label: 'Cold Room Climate Control' },
+      { path: '/fssai/temperature',        label: 'Temperature Logs' },
+      { path: '/fssai/food-quality',       label: 'Food Quality Checks' },
+      { path: '/fssai/pest-control',       label: 'Pest Control Logs' },
+      { path: '/fssai/cleaning',           label: 'Cleaning & Sanitation' },
+      { path: '/fssai/hygiene',            label: 'Personal Hygiene' },
+      { path: '/fssai/storage',            label: 'Food Storage Checks' },
+      { path: '/fssai/kitchen-safety',     label: 'Kitchen Safety Checks' },
+      { path: '/fssai/water-ice',          label: 'Water & Ice Checks' },
+      { path: '/fssai/oil-quality',        label: 'Oil Quality Checks' },
+      // WASTE HANDOVER LOG — one line per handover of wet / dry / other waste to
+      // GHMC or an authorised collector (Hyderabad audit line #114, audit-file
+      // record 14). UNFLAGGED on purpose, like the rows above it: the porter at
+      // the back door files it. The route scopes each record itself.
+      { path: '/fssai/waste',              label: 'Waste Handover Log' },
+      { path: '/fssai/corrective-actions', label: 'Corrective Actions' },
+      { path: '/fssai/checklists',         label: 'FSSAI Checklists' },
+      // Management surfaces. mgmtOnly (admin | manager | HOD), NOT adminOnly:
+      // VERIFY RECORDS (P3). mgmtOnly because verifying IS a management act (§7 Q3
+      // provisional: any management may verify, but never the person who recorded
+      // it — that second half is enforced per row by the route, since a manager
+      // who ran the check himself must not sign it off). A staff member reaches
+      // their own submitted records through the checklist screens, not here.
+      { path: '/fssai/verification',       label: 'Verify Records',           mgmtOnly: true },
+      // adminOnly would mean the owner must be physically present before anyone
+      // could produce the licence or the inspection pack to an inspector.
+      { path: '/fssai/inspections',        label: 'Inspection Reports',       mgmtOnly: true },
+      { path: '/fssai/documents',          label: 'Documents & Certificates', mgmtOnly: true },
+      // FOOD HANDLERS — the food-handler register and, for each person, the
+      // medical, training and FoSTaC certificates (Hyderabad audit lines #55,
+      // #56, #106, #107; audit-file records 6 and 7). mgmtOnly, the SAME tier as
+      // Documents & Certificates: bestEntry()'s longest prefix already gave it
+      // that gate from /fssai/documents; the row is here so it is VISIBLE and can
+      // be granted on its own, and it states the flag rather than leaving a
+      // reader to re-derive it. The API gates itself with isManagement().
+      { path: '/fssai/documents/food-handlers', label: 'Food Handlers',     mgmtOnly: true },
+      { path: '/fssai/reports',            label: 'Reports & Downloads',      mgmtOnly: true },
+      // RECORD CHANGES & VOIDS — the owner's §19 surface: who changed a
+      // compliance record, from what to what, and the reason they gave for
+      // voiding it. Reads fssai_audit_log plus the voided_* columns on every
+      // record table.
+      //
+      // mgmtOnly, the SAME set as Verify Records, and for the same reason: this
+      // screen is a list of the moments somebody's record was overridden. It is
+      // not a staff surface, and it is not adminOnly either — a manager must be
+      // able to show an inspector what changed without the owner present, which
+      // is the whole point of keeping the trail.
+      { path: '/fssai/audit-log',          label: 'Record Changes & Voids',   mgmtOnly: true },
+      // Temperature standards, frequencies and template authoring live here. A
+      // wrong value here does not announce itself — it surfaces weeks later as a
+      // record an inspector rejects. Same reasoning as /hr/settings and
+      // /settings/qc-categories above.
+      { path: '/fssai/settings',           label: 'Settings',                 adminOnly: true },
+      // EQUIPMENT & COLD UNITS — the register of cold rooms, chillers, freezers,
+      // fryers and water filters, each with the safe range the owner sets for it.
+      // MEASURED: fssai_equipment holds 0 rows, so today an equipment-targeted
+      // checklist can only run if an admin types the unit onto the schedule by
+      // hand, and the only cold units that exist anywhere in this app are four
+      // free-text strings on production_batches.storage_location.
+      //
+      // It carries adminOnly EXPLICITLY even though bestEntry()'s longest-prefix
+      // rule would hand it down from /fssai/settings anyway. Two reasons, both
+      // practical: the Page Access matrix is built from this array, so an entry
+      // that is not here can never be granted or revoked on its own; and a reader
+      // of this file should not have to re-derive a tier gate from prefix
+      // arithmetic. A safe range is the number every temperature verdict in the
+      // module is judged against — owner §5, "never hard-coded" — so a wrong
+      // value here silently re-grades the whole file.
+      { path: '/fssai/settings/equipment', label: 'Equipment & Cold Units',   adminOnly: true },
+      { path: '/fssai/inspection-mode',    label: 'Inspection Mode',          mgmtOnly: true },
+      // AUDIT FILE — the Hyderabad authority's "Records You Should Keep Ready in
+      // One Audit File": all 20, each PRESENT / EXPIRING / MISSING, plus the one
+      // PDF of the whole file. mgmtOnly, the SAME set as Inspection Mode and for
+      // the same reason: a manager must be able to produce the file during a
+      // visit without the owner, and the page names every gap in plain words, so
+      // it is not a staff surface. /api/fssai/audit-file* gate themselves with
+      // isManagement() as well — this row is visibility, never security.
+      { path: '/fssai/audit-file',         label: 'Audit File',               mgmtOnly: true },
+    ],
+  },
+  {
     label: 'Admin',
     pages: [
       { path: '/departments',         label: 'Departments' },
@@ -1360,12 +1478,37 @@ export function canAccessPage(
  * The problem is that many catalog parents are ALSO the URL prefix of their
  * SIBLING catalog pages. /tasks is the Task Dashboard *and* the prefix of the
  * 14 other Task Management pages, so ticking the dashboard silently hands over
- * the whole module. Across the catalog 8 parents carry 43 such grants:
- *   /tasks +14, /crm-calls +10, /inventory +7, /reports +6,
- *   /kitchen-production +3, /dine-in/kitchen +1, /vendors +1,
- *   /settings/integrations +1
+ * the whole module. Across the catalog 16 parents carry 103 such grants:
+ *   /fssai +23, /hr +18, /crm-calls +16, /tasks +14, /inventory +9,
+ *   /reports +6, /feedback +3, /kitchen-production +3, /boh +2, /grn +2,
+ *   /bill-submissions +2, /dine-in/kitchen +1, /grn/qc +1,
+ *   /settings/integrations +1, /vendors +1, /fssai/settings +1
  * proxy.ts imports canAccessPage rather than duplicating it, so this is real
  * server-side reach, not just a sidebar that shows too much.
+ *
+ * THESE NUMBERS ARE MEASURED, AND THEY GO STALE SILENTLY — this figure has now
+ * been wrong three times. It read "8 parents carry 43 such grants" and was
+ * already wrong before the FSSAI section existed: re-measured it was 10 / 69,
+ * because /hr (+18) and /grn (+1) were never added to the list and /crm-calls
+ * (16, not 10) and /inventory (8, not 7) had grown. It was then written as
+ * 11 / 88 for a "20-row" FSSAI section that was in fact 21 rows. Re-measured
+ * against this array on 2026-10-06, after the record modules added
+ * 'Record Changes & Voids' and 'Equipment & Cold Units', it is
+ * **12 parents / 92 grants** — and /fssai/settings is a NEW KIND of entry in
+ * this list: a catalog parent that is itself the child of another one, so
+ * /fssai/settings/equipment inherits from it and not from /fssai. Re-measured
+ * again on 2026-10-14 when 'Audit File' (/fssai/audit-file) was added: it was
+ * already 16 / 102 before that row (/boh, /feedback, /bill-submissions and
+ * /grn/qc had arrived, /grn and /inventory had grown), and that row makes it
+ * 16 parents / 103 grants. Re-measured the same day when 'Waste Handover Log'
+ * (/fssai/waste) and 'Food Handlers' (/fssai/documents/food-handlers) were
+ * added: 16 / 103 without them (confirmed), **17 parents / 106 grants** with
+ * them — /fssai +2 (now 25) and /fssai/documents a NEW parent (+1). Neither row
+ * changes who can open either path (both resolved to the same tier before).
+ * FSSAI remains
+ * the single largest carrier. Nothing recomputes this comment, so any section
+ * added here must re-measure it. The live figure is whatever
+ * GET /api/admin/page-access-impact reports, not whatever this comment says.
  *
  * WHY IT IS NOT ENFORCED YET
  * Switching the proxy to this function TIGHTENS access. Any role configured

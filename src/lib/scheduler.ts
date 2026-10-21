@@ -23,6 +23,11 @@
  *                                    (BOH, expected date). Placed ABOVE
  *                                    refreshUpcomingParties so a Sheets failure
  *                                    can never starve the money chase.
+ *   - runFssaiScheduledJobs()      — FSSAI: corrective-action escalation ladder,
+ *                                    12-month photo-retention sweep (guarded,
+ *                                    once per IST day, always leaves an
+ *                                    fssai_retention_runs row), missed-check
+ *                                    reminders for the previous day
  *   - refreshUpcomingParties() + refreshPartyBookings()
  *   - checkDeferDueSoon()          — deferred requisition items coming due
  *   - sweepRecordingRetention()    — call recordings past the admin's window
@@ -218,6 +223,34 @@ export function startSchedulerOnce(): void {
         }
       } catch (e) {
         console.error('[scheduler] boh reminders failed:', e instanceof Error ? e.message : e);
+      }
+
+      // FSSAI FOOD SAFETY — the three jobs that had MANUAL CALLERS ONLY until
+      // this block: the corrective-action escalation ladder (it ran only when
+      // somebody opened the queue or pressed "Chase now"), the owner's 12-month
+      // photo-retention sweep (§7 Q13 — only an admin's button ever ran it), and
+      // missed-check reminders (nothing at all). src/lib/fssai-jobs.ts says what
+      // each does and guards; this is only the driver, the same in-process tick
+      // every job above rides, armed at boot from instrumentation.ts register().
+      // No /api/cron route: proxy.ts would 401 a token-only POST before it.
+      //
+      // ABOVE refreshUpcomingParties for the same reason as BOH: a Sheets failure
+      // must never decide whether a late food-safety fix gets chased.
+      //
+      // SAFE ON EVERY TICK AND ACROSS pm2 WORKERS. The chase is throttled and
+      // claims each message on notifications' UNIQUE index; the retention sweep
+      // claims its IST day atomically in settings, refuses (and records the
+      // refusal in fssai_retention_runs) unless it can prove every image it
+      // would drop is at least 12 months old; the reminders run once per IST day
+      // for the previous day and claim that day on the same UNIQUE index.
+      try {
+        const { runFssaiScheduledJobs, fssaiJobsLogLine } = await import('./fssai-jobs');
+        const { getDb } = await import('./db');
+        const fj = await runFssaiScheduledJobs(getDb());
+        const line = fssaiJobsLogLine(fj);
+        if (line) console.log(`[scheduler] fssai @ IST ${istHour()}h: ${line}`);
+      } catch (e) {
+        console.error('[scheduler] fssai jobs failed:', e instanceof Error ? e.message : e);
       }
 
       // GUARDED — AND THAT IS THE ENTIRE POINT OF THIS try.
