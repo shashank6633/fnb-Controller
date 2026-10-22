@@ -59,15 +59,20 @@
  */
 import { logAuditEvent } from '@/lib/db';
 
-/** Round DOWN to the house 6dp. Same definition and same reason as `floor6` in
- *  src/lib/issue-stock.ts: a figure that bounds a balance must never round
- *  itself up past the balance it is bounding. Used only on the REPORTED
- *  shortfall — the clamp itself needs no rounding (see `allowedDebit`). */
+/** Round DOWN to the house 6dp: a figure that bounds a balance must never round
+ *  itself up past the balance it is bounding. Used ONLY on the two figures
+ *  recordCentralDebitClamp REPORTS (wanted and debited) — this file's own
+ *  helper, the only one left (issue-stock.ts no longer has a copy). The clamp
+ *  itself needs no rounding: clampCentralDelta writes planCentralDebit's
+ *  `debit`, which is the balance itself when it bites. */
 const floor6 = (n: number) => Math.floor((Number(n) || 0) * 1e6) / 1e6;
 
 /** Below this a delta is float dust, not a movement. The same 1e-9 the sales
- *  reversal already uses on this very arithmetic. It decides only "is this a
- *  debit at all" — never "does this debit fit"; that is QTY_GRID's job below. */
+ *  reversal already uses on this very arithmetic. It never decides "does this
+ *  debit fit"; that is QTY_GRID's job below. In clampCentralDelta it marks the
+ *  debits that are written as asked when the shelf covers them — and, since
+ *  round 10, never past what the shelf holds (a dust debit over a zero balance
+ *  used to land at -1e-9). */
 export const CLAMP_EPS = 1e-9;
 
 /* ════════════════════════════════════════════════════════════════════════════
@@ -222,6 +227,14 @@ export function qtyGrid(n: number): number {
   return v === 0 ? 0 : v; // normalise -0
 }
 
+/** A quantity moved onto its own 6-dp grid point — the value every floor
+ *  decides on. Feed THIS (never the raw stored double) to a display rounding,
+ *  so float dust (3.1504999999999996 for 3.1505) cannot move a printed figure.
+ *  The identity on any figure already on the grid. */
+export function onGrid(n: number): number {
+  return qtyGrid(n) / GRID_SCALE;
+}
+
 export interface CentralDebitPlan {
   /** The raw stored balance, as read by the caller inside its transaction. */
   stock: number;
@@ -258,8 +271,31 @@ export interface CentralDebitPlan {
 }
 
 /** A display converter: a RECIPE quantity ↦ the figure the operator is shown
- *  for it. Supplied by the caller (this file converts nothing). */
-export type ShownAs = (recipeQty: number) => number;
+ *  for it. Supplied by the caller (this file converts nothing).
+ *
+ *  `step`, optional: ONE STEP OF THE SHOWN FIGURE — the smallest non-zero
+ *  figure it can print (0.001 of the purchase unit for the desks'
+ *  toPurchaseQty) — stated in the SAME units the converter takes. The caller
+ *  that builds the converter knows its precision; this file still converts
+ *  nothing. Only issuedCoversAsk reads it (THE RULE's shelf arm: "below one
+ *  printed step"); planCentralDebit ignores it, so attaching one changes no
+ *  debit. Attach with shownWithStep. */
+export type ShownAs = ((recipeQty: number) => number) & {
+  readonly step?: number;
+  /** Other renderings of the SAME balance a screen may still print (round 8):
+   *  planCentralDebit's shown-figure match accepts an ask equal to any of them
+   *  too, so a screen that has not moved to the converter's own figure is never
+   *  refused for typing what it showed. Never printed. */
+  readonly alts?: ReadonlyArray<(recipeQty: number) => number>;
+};
+
+/** A converter carrying its printed step (see ShownAs), and optionally the
+ *  other renderings of a balance its match should also accept (`alts`). */
+export function shownWithStep(
+  fn: (q: number) => number, step: number, alts?: ReadonlyArray<(q: number) => number>,
+): ShownAs {
+  return Object.assign(fn, { step: Number(step) || 0, ...(alts && alts.length ? { alts } : {}) });
+}
 
 /**
  * DOES THIS DEBIT FIT, AND WHAT EXACTLY DO WE SUBTRACT?
@@ -278,7 +314,22 @@ export function planCentralDebit(stock: number, ask: number, shownAs?: ShownAs |
   const a = Number(ask) || 0;
   const available = s > 0 ? s : 0;
   const shown = typeof shownAs === 'function' ? shownAs : null;
-  const shownAvailable = shown ? (Number(shown(available)) || 0) : null;
+  // SNAPPED TO THE GRID BEFORE THE DISPLAY ROUNDING (round 8). Both shown
+  // figures are taken of the quantity's 6-dp grid point, never of the raw
+  // double: float dust left by an earlier SQL debit must not move a printed
+  // figure. MEASURED (WHITE DAL, kg/kg): 5.0005 kg approved 5.001, 1.85 issued
+  // leaves 3.1504999999999996 stored; rounded raw to 3 dp that is 3.15, so the
+  // desk's own exact outstanding 3.151 was refused "holds only 3.15 kg" over a
+  // shelf that IS 3.1505 kg on the grid (shown 3.151). The grid point is the
+  // quantity every floor decides on (qtyGrid), so the figure printed for it now
+  // follows the decision instead of the dust. The desks' converter is
+  // pack-units.ts shownPurchaseQty, which snaps to the grid itself and then
+  // rounds in integer arithmetic (the division by the pack can move a figure
+  // too: FRESH CREAM 130,125.5 ml rounded raw is 130.125 BTL) — and the desks'
+  // "In store" column (U.stockPU on store-requisitions/page.tsx and
+  // requisitions/page.tsx) must print that same function. A converter whose
+  // input is already on the grid (every 6-dp ask) sees the identical number.
+  const shownAvailable = shown ? (Number(shown(onGrid(available))) || 0) : null;
   if (!(a > 0)) {
     // Not a debit — a credit or nothing. Not this rule's business; callers handle
     // credits on their own rails (see clampCentralDelta for why a credit is never
@@ -290,11 +341,28 @@ export function planCentralDebit(stock: number, ask: number, shownAs?: ShownAs |
   }
   const gAsk = qtyGrid(a);
   const gAvail = qtyGrid(available);
-  const shownAsk = shown ? (Number(shown(a)) || 0) : null;
+  const shownAsk = shown ? (Number(shown(onGrid(a))) || 0) : null;
   // THE SHOWN-FIGURE RULE, the only place it is written. `> 0` so a balance the
   // operator was shown as nothing is never "matched" by an ask that also shows
   // as nothing — the rule adds fits only where there is stock to take.
-  const byShownFigure = shownAvailable !== null && shownAvailable > 0 && shownAsk === shownAvailable;
+  //
+  // The grid-point figure above is the one this file PRINTS (the cap, the
+  // sentence). The match also accepts the converter's `alts` — the other
+  // renderings of the same balance a screen may still print (for the desks,
+  // the raw toPurchaseQty figure of round 7), each of the raw balance and of
+  // its grid point — so the snap only ADDS fits and never refuses an ask round
+  // 7 accepted. Every one of them is within half a printed step (and a float
+  // ulp) of the balance, so each means "all of it", and each takes exactly the
+  // balance: 4.0005000000000002 kg prints 4.001 raw and 4.001 on its grid point
+  // here, while toPurchaseQty of the grid point alone would print 4.
+  const renderings: number[] = [];
+  if (shown && shownAvailable !== null) {
+    renderings.push(shownAvailable, Number(shown(available)) || 0);
+    for (const alt of shown.alts || []) {
+      renderings.push(Number(alt(available)) || 0, Number(alt(onGrid(available))) || 0);
+    }
+  }
+  const byShownFigure = shownAsk !== null && renderings.some(v => v > 0 && v === shownAsk);
   const fits = gAsk <= gAvail || byShownFigure;
   // On the balance's own grid point or past it ⇒ take the balance itself, which
   // lands on exactly 0 (fits) or is the clamp (does not fit). Below it ⇒ the ask
@@ -314,6 +382,111 @@ export function planCentralDebit(stock: number, ask: number, shownAs?: ShownAs |
     shownAvailable, shownAsk, byShownFigure,
     debitIsAsk: qtyGrid(debit) === gAsk,
   };
+}
+
+/**
+ * THE RULE — IS THIS REQUISITION LINE COMPLETE? (round 8)
+ *
+ * Decided HERE, once. Every place that asks "is this line done?" — store-issue's
+ * defer rule and auto-advance, store-process's final status, the list's
+ * lines_owing, the defer-due alert, the Issue Log and both desks — asks this
+ * function (the server through issue-stock.ts lineIssueComplete, which feeds it
+ * a stored line; the two desks by transcription, because this file imports the
+ * database and a page cannot).
+ *
+ *     COMPLETE  ⇔  issued ≥ approved                       (within 1e-9)
+ *               ∨  ( THIS gesture's shelf-rule take emptied the central shelf
+ *                    for the material
+ *                    ∧  0 < issued
+ *                    ∧  approved − issued < ONE printed step )
+ *
+ * A remainder below one step over a shelf that STILL HOLDS STOCK is NOT
+ * complete — it is an ordinary partial issue, and the desk can serve it.
+ *
+ * ── WHY ROUNDS 6-7 KEPT LEAVING REQUISITIONS WITH NOTHING TO PRESS ──────────
+ * "Is this line complete?" was decided in several places by different rules,
+ * and every stuck requisition came from two of them disagreeing. Round 7 had
+ * three arms here; its second (the issued and approved figures SHOW as the same
+ * number) and third (anything owing less than one printed step) closed lines
+ * whether or not the shelf had been emptied, and the routes decided status
+ * BEFORE the party transfer took its share. MEASURED on the real routes and the
+ * real store page (round-7 verifier, r7v-nsl2):
+ *   · split-shelf4 — approved 14.843 kg over 14,842.4 g (shown 14.842); the
+ *     desk's own "Issue part, defer rest" took the whole shelf (14.8424 kg
+ *     recorded), the third arm closed the line, and the defer in the SAME POST
+ *     was written anyway: the auto-advance needs `complete && !deferred_until`,
+ *     so the requisition sat 'store_processed' with Outstanding 0 and only
+ *     [history, undo] to press — for good, even after a restock. WHOLE DHANIYA
+ *     (kg/kg, 3.2174 shelf, 3.218 approved) the same.
+ *   · pmgmt-party — a party line processed at 14.842 of 14.843: store-process
+ *     decided 'store_processed' from the typed figure, THEN the party transfer
+ *     took the whole 14,842.4 g and the line became complete, and nobody looked
+ *     again. Nothing to press.
+ *   · bigpack — MALA MANGO CRUSH 5 LTR approved 1,004 ml (0.2008 BTL), 0.2 BTL
+ *     issued with 49 L still on the shelf: the third arm called a deliberate
+ *     partial "Fulfilled" while the store could serve the 4 ml.
+ *
+ * ── THE SECOND ARM NEEDS A MEMORY, AND THE LINE CARRIES IT ──────────────────
+ * "This gesture's take emptied the shelf" is a fact about the gesture, not about
+ * the line's numbers — 14.8424 kg recorded of 14.843 reads the same whether the
+ * take emptied a 14,842.4 g shelf or someone typed 14.8424 over 20 kg. So the
+ * writer that took (issue-stock.ts applyIssueDelta for the internal rail, the
+ * two party rails after their own debit) decides it AT THE TAKE, from the
+ * balance it just wrote, and when THIS rule closes the line by that arm it
+ * stamps requisition_items.shelf_emptied_qty = the quantity_issued it closed at.
+ * Every later reader — the auto-advance re-scores every line on every gesture,
+ * long after a delivery has restocked the shelf — passes `shelfEmptied` as
+ * shelfMarkHolds(mark, issued): the mark speaks only for the exact quantity it
+ * was written at, so any later write of quantity_issued (an undo, a reject that
+ * zeroes, a re-process, a correction) retires it without having to know it
+ * exists. Without the memory a line closed by the shelf would re-open the day a
+ * delivery arrived, which is the stuck requisition in a new shape.
+ *
+ * ── WHAT EACH PIECE IS FOR ────────────────────────────────────────────────────
+ *   · `issued ≥ approved within 1e-9`: the predicate every desk always used,
+ *     widened by one float ulp-ish slack so 14.669999999999998 of 14.67 (a sum of
+ *     two typed figures) is done. Nothing that was complete stops being complete.
+ *   · `0 < issued`: a line nothing left the shelf for never closes by the shelf.
+ *   · ONE PRINTED STEP is 0.001 of the purchase unit (1 g of a kg line, 0.75 ml
+ *     of a 750 ml bottle, 5 ml of a 5 L can), supplied by the line's converter as
+ *     `shownAs.step` in the LINE's units, compared on the house grid (qtyGrid) so
+ *     float noise cannot move it. A remainder of a whole step or more — a figure
+ *     the desk prints and a restocked store can issue — is never closed here.
+ *
+ * WHAT IT CANNOT DO: close a line the store can still serve. The shelf arm needs
+ * the take to have left the material holding nothing (holdsAny false), so a
+ * remainder below a step over stock is an ordinary open line with Issue Now,
+ * Defer and Reject.
+ *
+ * Pure; reads nothing. `shownAs` without a step, or no `shelfEmptied`, leaves
+ * the first arm alone.
+ */
+export function issuedCoversAsk(
+  issued: number, wanted: number, shownAs?: ShownAs | null, shelfEmptied?: boolean,
+): boolean {
+  const i = Number(issued) || 0;
+  const w = Number(wanted) || 0;
+  if (i + CLAMP_EPS >= w) return true;
+  if (shelfEmptied !== true) return false;
+  const step = typeof shownAs === 'function' ? (Number(shownAs.step) || 0) : 0;
+  return step > 0 && qtyGrid(i) > 0 && qtyGrid(w - i) < qtyGrid(step);
+}
+
+/**
+ * DOES A LINE'S SHELF MARK STILL SPEAK FOR IT? — the persisted half of THE
+ * RULE's second arm (see "THE SECOND ARM NEEDS A MEMORY" above).
+ *
+ * `mark` is requisition_items.shelf_emptied_qty; `issued` the line's
+ * quantity_issued now. True only when the mark was written at exactly this
+ * quantity (within 1e-9 line units — the two are the same double, written by
+ * the same transaction), so a later write of quantity_issued by ANY writer
+ * retires it. NULL, 0 or a stale figure ⇒ false.
+ */
+export function shelfMarkHolds(mark: number | null | undefined, issued: number): boolean {
+  if (mark == null) return false;
+  const m = Number(mark);
+  if (!Number.isFinite(m) || !(m > 0)) return false;
+  return Math.abs(m - (Number(issued) || 0)) <= CLAMP_EPS;
 }
 
 /**
@@ -350,9 +523,19 @@ export function printableCap(available: number, dp: number): { value: number; dp
 
 /** A quantity at the house grid's 6 dp, trailing zeros dropped, never in
  *  exponent notation (String(1e-6) is "0.000001"; anything that holdsAny is at
- *  least that). For the sub-display figures printableCap can return. */
+ *  least that). For the sub-display figures printableCap can return.
+ *
+ *  SNAPPED THROUGH qtyGrid, NOT toFixed (round 7). toFixed rounds the double's
+ *  exact binary value, Math.round rounds the product — and at a half-grid tie
+ *  they disagree: 5e-7 is stored as 4.99999…e-7, so (5e-7).toFixed(6) is
+ *  "0.000000" while qtyGrid(5e-7) is 1 and holdsAny(5e-7) is true. Printed
+ *  through toFixed, a floor read "holds only 0 g" over a balance it had just
+ *  said was there (measured on /api/butchering). Printing the grid point the
+ *  decision was taken on cannot disagree with the decision. On any figure
+ *  already on the grid (every qtyDown / printableCap result) the string is
+ *  identical to the old one. */
 export function fmtGridQty(n: number): string {
-  return String(Number((Number(n) || 0).toFixed(6)));
+  return String(qtyGrid(n) / GRID_SCALE);
 }
 
 /**
@@ -446,6 +629,10 @@ export interface CentralDeltaClamp {
  * a debit within the house grid of the balance is covered (and takes the
  * balance itself, landing on 0), not clamped and not reported.
  *
+ * DUST IS A DEBIT TOO. A debit of CLAMP_EPS or less is written as asked when
+ * the shelf covers it and as what the shelf holds when it does not — never
+ * below zero, never clamped, never reported. See the branch below.
+ *
  * NO ROUNDING IS APPLIED TO THE CLAMPED DEBIT, deliberately. It is
  * `-Math.min(debit, cap)`, so when the cap bites the bound value is the balance
  * itself and `current_stock + (-current_stock)` is exactly 0 in IEEE 754 — the
@@ -488,14 +675,39 @@ export function clampCentralDelta(
   // the identical call on the identical reasoning.
   if (!row) return base;
 
-  // Credits, and dust, pass through untouched.
-  if (wantedDelta >= -CLAMP_EPS) return base;
+  // Credits (and nothing at all) pass through untouched.
+  if (wantedDelta >= 0) return base;
 
   // THE ONE RULE (planCentralDebit, above). `debit` is never more than
   // max(0, balance), so the write can never go below zero; when the debit is
   // "everything on the shelf" — on the balance's grid point or past it — it is
   // the balance itself and the landing is exactly 0.
   const plan = planCentralDebit(base.stockRecipe, -wantedDelta);
+
+  // DUST IS STILL A DEBIT (round 10, never-negative). A debit of CLAMP_EPS or
+  // less used to return `base` above with the credits, i.e. it was written as
+  // asked WITHOUT being weighed — and on a balance below the dust that is a
+  // write below zero. MEASURED on the real routes: /api/staff-meals/items with
+  // 0.000000001 typed on the real /staff-meals page over a shelf the floor had
+  // just emptied landed at -1e-9 (and -5e-10, -4e-10 over 0 and 1e-10); a dated
+  // /api/admin/reset whose in-range purchase rows net to 2.78e-17 (0.1 + 0.2 −
+  // 0.3) landed at -2.78e-17. Production 62aa895 does the same — it has no
+  // floor on either path.
+  // Dust is written AS ASKED wherever the shelf covers it (byte-identical to
+  // production and to round 9 on every balance at least as large as the dust,
+  // which is every balance the app can print), and never as more than
+  // planCentralDebit's `debit`, which is at most max(0, balance) — so it can no longer land below
+  // zero or dig an existing hole deeper. It always fits on the grid, so it is
+  // never `clamped` and never reported: nothing the operator could see was cut.
+  // NOT plan.debit itself: on a sub-grid crumb that is the whole crumb, and
+  // taking 4e-7 for a 1e-9 ask would change a write production makes for no
+  // floor's sake (/api/sales DELETE skips anything ≤ 1e-9 and would start
+  // writing it).
+  if (wantedDelta >= -CLAMP_EPS) {
+    const take = Math.min(plan.ask, plan.debit);
+    return take === plan.ask ? base : { ...base, deltaToWrite: take > 0 ? -take : 0 };
+  }
+
   if (plan.fits) {
     // Covered. Byte-identical to no clamp unless the debit was "everything",
     // where it takes the sub-grid crumb with it instead of leaving 1e-9 behind

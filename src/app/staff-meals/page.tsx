@@ -174,18 +174,28 @@ type IssueRowRef = { material_id?: string | null; item_name?: string | null };
  * row whose figures had just been cleared off the screen, leaving the operator
  * to retype them out of the error text.
  *
+ * ONLY THE CENTRAL FLOOR'S REFUSALS (round 10). The floor is the only reason
+ * this page needs to keep a row, so it keeps only the rows the floor refused —
+ * the route's floor sentence, `Row <n>: the Central Store holds only … / holds
+ * no …`. Every refusal production already made (a unit the material does not
+ * declare, a department that holds too little, an unconvertible quantity) is
+ * handled exactly as production handles it: the grid clears with the rest.
+ * Round 9 kept every `Row <n>:` refusal, which changed those production paths
+ * for a reason the floor does not supply.
+ *
  * DELIBERATELY FORGIVING, AND IT FAILS TOWARDS THE OLD BEHAVIOUR. An error the
- * route phrases some other way (a batch-level `No valid rows`, a future message
- * without the prefix) yields no index and keeps nothing — exactly what this page
- * did before. It never guesses a row, because keeping a row that actually
- * COMMITTED would re-issue it on the next press, and a double debit is far worse
- * than a retype.
+ * route phrases some other way (a batch-level `No valid rows`, a production
+ * refusal, a future rewording of the floor sentence) yields no index and keeps
+ * nothing — exactly what production does. It never guesses a row, because
+ * keeping a row that actually COMMITTED would re-issue it on the next press, and
+ * a double debit is far worse than a retype.
  */
+const CENTRAL_FLOOR_REFUSAL = /^Row\s+(\d+)\s*:\s*the Central Store holds (?:only|no)\b/;
 function refusedRowIndices(errors: unknown): Set<number> {
   const out = new Set<number>();
   if (!Array.isArray(errors)) return out;
   for (const e of errors) {
-    const m = String(e ?? '').match(/^Row\s+(\d+)\s*:/);
+    const m = String(e ?? '').match(CENTRAL_FLOOR_REFUSAL);
     if (!m) continue;
     const n = Number(m[1]);
     if (Number.isInteger(n) && n >= 1) out.add(n - 1); // → 0-based, as sent
@@ -498,18 +508,24 @@ export default function StaffMealsPage() {
       const json = await res.json();
       setIssueResult(json);
       if (json.success > 0) {
-        // A PARTIAL SUCCESS KEEPS THE REFUSED ROWS. See refusedRowIndices: the
-        // rows that committed are cleared (keeping one would re-issue it), the
-        // rows the server named are left standing with their figures intact, and
-        // so are rows that were never submitted at all — a half-typed row is
-        // work in progress, not a rejected line, and wiping it was collateral
-        // damage from clearing the whole grid.
+        // A FULL SUCCESS CLEARS THE WHOLE GRID, EXACTLY AS PRODUCTION DOES
+        // (round 10) — every row, including one picked but never given a
+        // quantity. Round 9 kept such unsubmitted rows on every success; that is
+        // a change the central floor does not need, so it is gone.
+        //
+        // A PARTIAL SUCCESS KEEPS THE ROWS THE CENTRAL FLOOR REFUSED AND NOTHING
+        // ELSE — the one thing the floor does need. See refusedRowIndices: the
+        // rows that committed are cleared (keeping one would re-issue it), and
+        // the rows the floor named are left standing with their figures intact,
+        // so "hold the short one" is about a row still on screen. Every other
+        // row goes, as it always did — including a row refused for a reason
+        // production already refused it for. A refusal that is not the floor's
+        // sentence maps to no row, so it clears the grid exactly as production does.
         const refused = refusedRowIndices(json.errors);
         const refusedSrc = new Set(
           submitted.filter((_, i) => refused.has(i)).map(x => x.srcIdx),
         );
-        const submittedSrc = new Set(submitted.map(x => x.srcIdx));
-        const keep = newRows.filter((_, i) => refusedSrc.has(i) || !submittedSrc.has(i));
+        const keep = newRows.filter((_, i) => refusedSrc.has(i));
         setNewRows(keep.length > 0 ? keep : [blankRow()]);
         await viewMeal(selectedMeal);
         await fetchMeals();

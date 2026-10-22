@@ -2132,6 +2132,16 @@ function initializeSchema(db: Database.Database) {
       // so a reader must not have to infer it.
       if (!has('skip_reason'))
         db.exec(`ALTER TABLE requisition_issue_ledger ADD COLUMN skip_reason TEXT NOT NULL DEFAULT ''`);
+      // THE RULE's shelf arm, stamped on the ROW of the take that closed the
+      // line by it (round 8b — issue-stock.ts markLedgerShelfClose): the
+      // after_line_qty the line was closed at, NULL on every other row. The
+      // line's own mark (requisition_items.shelf_emptied_qty) is retired by the
+      // next write of quantity_issued — an undo clears it — so the Issue Log
+      // read an issue that HAD closed its line as "PART" once the line was
+      // undone. This copy is history and is never cleared. Additive, NULL by
+      // default: every existing row reads exactly as before.
+      if (!has('shelf_mark'))
+        db.exec(`ALTER TABLE requisition_issue_ledger ADD COLUMN shelf_mark REAL`);
     }
     // Once recording is unconditional this table goes from 0 rows to roughly
     // 14,000 a year, and the end-to-end log filters by date and by department.
@@ -2893,6 +2903,24 @@ function initializeSchema(db: Database.Database) {
     if (!has('store_rejected'))      db.exec(`ALTER TABLE requisition_items ADD COLUMN store_rejected INTEGER NOT NULL DEFAULT 0`);
     if (!has('store_reject_reason')) db.exec(`ALTER TABLE requisition_items ADD COLUMN store_reject_reason TEXT DEFAULT ''`);
   } catch (e) { console.error('requisition_items store-reject migration failed:', e); }
+
+  // Migration: THE RULE's memory (requisition completeness, round 8 —
+  // src/lib/central-debit-clamp.ts issuedCoversAsk). A line is complete when
+  // issued ≥ approved, OR when the take that wrote its quantity_issued EMPTIED
+  // the central shelf and what remains owing is below one printed step. The
+  // second is a fact about that take, not about the line's numbers, so the
+  // writer that took stamps it here (issue-stock.ts stampShelfClose):
+  //   shelf_emptied_qty — the quantity_issued the line was closed at by the
+  //                       shelf; NULL otherwise. It speaks only while
+  //                       quantity_issued still equals it, so any later write
+  //                       of quantity_issued retires it.
+  // Additive and NULL by default: every existing line reads exactly as before
+  // (first arm only), and nothing an admin set is touched.
+  try {
+    const cols = db.prepare("PRAGMA table_info(requisition_items)").all() as any[];
+    const has = (n: string) => cols.some((c: any) => c.name === n);
+    if (!has('shelf_emptied_qty')) db.prepare(`ALTER TABLE requisition_items ADD COLUMN shelf_emptied_qty REAL`).run();
+  } catch (e) { console.error('requisition_items shelf-mark migration failed:', e); }
 
   // Migration: Unit-audit locks — a curated snapshot of admin-fixed unit fields
   // (recipe_unit, purchase_unit, pack_size, case_size, category) per material.

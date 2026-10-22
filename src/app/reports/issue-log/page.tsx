@@ -8,6 +8,13 @@
  *   RECEIPT  →  REQUISITION raised/approved  →  ISSUE (full or partial, with
  *   what is still open)  →  CONSUMPTION
  *
+ * plus the two legs that run the other way or not at all: GIVE-BACK (the
+ * server's REVERSAL — goods a department sent back to central: an undo or a
+ * lowered issued figure, or a department return marked reusable) and SKIPPED
+ * COOK (the server's CONSUMPTION_SKIP — a cook that moved no stock). Each has
+ * its own badge, card and filter (final pass): before, both rendered under the
+ * CONSUMPTION badge, and a give-back is not consumption.
+ *
  * Reads GET /api/reports/issue-log (isManagement-gated, same gate and same
  * wording as /api/reports/purchase-log — this page joins vendor rates and
  * purchase money onto material rows, which is exactly the content the Purchase
@@ -84,7 +91,7 @@ import { todayIST } from '@/lib/format-date';
 import MaterialTypeahead, { type MaterialLite } from '@/components/MaterialTypeahead';
 import {
   ScrollText, Download, AlertTriangle, Info, Loader2, Truck, ClipboardList,
-  ArrowRightLeft, Flame, Link2, CircleSlash, Layers, CalendarDays,
+  ArrowRightLeft, Flame, Link2, CircleSlash, Layers, CalendarDays, Undo2,
 } from 'lucide-react';
 
 /* ═══════════════════════════════ WIRE CONTRACT ═══════════════════════════════
@@ -93,13 +100,19 @@ import {
  * field names are the contract and must not drift.
  */
 
-type IssueLogStage = 'RECEIPT' | 'REQUISITION' | 'ISSUE' | 'ISSUE_PRELEDGER' | 'CONSUMPTION';
+type IssueLogStage =
+  | 'RECEIPT' | 'REQUISITION' | 'ISSUE' | 'ISSUE_PRELEDGER' | 'CONSUMPTION'
+  | 'REVERSAL' | 'CONSUMPTION_SKIP';
 
 /** '' means "stock moved, nothing was skipped". */
 type SkipReason = '' | 'flag_off' | 'party' | 'unit_review' | string;
 
 interface IssueLogRow {
   stage: IssueLogStage;
+  /** The stage token exactly as the server sent it, kept beside `stage`
+   *  (normStage maps a label or an unknown token onto a page stage) so the row
+   *  is PRINTED by what the server says it is — see printsAsProduction. */
+  server_stage?: string;
   /** YYYY-MM-DD, IST calendar date as stored. */
   date: string;
   /** Full timestamp when one genuinely exists. null on reconstructed rows. */
@@ -147,7 +160,12 @@ interface IssueLogRow {
   requested_qty: number | null;
   effective_qty: number | null;
   issued_qty: number | null;
+  /** In the row's own unit (`unit`). */
   still_open: number | null;
+  /** `still_open` in PURCHASE units, on the server's six decimals (issue-log.ts
+   *  gridPu) — server-derived only; null when the line's unit is ambiguous.
+   *  Printed FIRST (owner rule). */
+  still_open_purchase?: number | null;
   fulfilment: 'FULL' | 'PART' | 'OPEN' | null;
 
   /** ISSUE rows: did this hand-over also debit central stock? See header. */
@@ -159,6 +177,9 @@ interface IssueLogRow {
   req_item_id: string;
   actor: string;
   notes: string;
+  /** The document's own status. On a REQUISITION / pre-ledger row,
+   *  'store_rejected' / 'chef_rejected' when the LINE was rejected. */
+  status?: string;
 }
 
 interface StageTotal {
@@ -174,7 +195,12 @@ interface StageTotal {
 
 interface IssueLogResponse {
   rows: IssueLogRow[];
-  totals: { by_stage: StageTotal[]; basis: string };
+  /** `stages_present`: the stages the current filters can answer at all (the
+   *  server's own list). A stage outside it was NOT SEARCHED — a receipt has no
+   *  department, a cook no requisition — so it gets no card (its "0 lines"
+   *  would read as "none happened") and is named on a "Not searched" line, and
+   *  the empty-list sentence leaves it out. */
+  totals: { by_stage: StageTotal[]; basis: string; stages_present: string[] | null };
   truncated: boolean;
   from: string;
   to: string;
@@ -215,9 +241,38 @@ const STAGE_META: Record<IssueLogStage, {
     icon: <Flame className="w-4 h-4" />,
     blurb: 'Used up — recipe units',
   },
+  // rank 4, the rank both rows carried while they rendered under the
+  // CONSUMPTION badge, so the chain view orders every row exactly as before:
+  // a give-back after its line's issues, a skipped cook among its item's cooks
+  // by date (the two share the item's link key).
+  REVERSAL: {
+    label: 'Give-back', short: 'GIVE-BACK', rank: 4,
+    badge: 'bg-[#EAF2F8] text-[#2F5D7C] border-[#C9DCEA]',
+    icon: <Undo2 className="w-4 h-4" />,
+    blurb: 'Back to the central store — recipe units',
+  },
+  CONSUMPTION_SKIP: {
+    label: 'Skipped cook (no stock moved)', short: 'SKIPPED COOK', rank: 4,
+    badge: 'bg-[#F3F1EE] text-[#6B6259] border-[#DDD6CE]',
+    icon: <CircleSlash className="w-4 h-4" />,
+    blurb: 'A cook that moved no stock — recipe units',
+  },
 };
 
-const STAGE_ORDER: IssueLogStage[] = ['RECEIPT', 'REQUISITION', 'ISSUE', 'ISSUE_PRELEDGER', 'CONSUMPTION'];
+const STAGE_ORDER: IssueLogStage[] = [
+  'RECEIPT', 'REQUISITION', 'ISSUE', 'ISSUE_PRELEDGER', 'CONSUMPTION', 'REVERSAL', 'CONSUMPTION_SKIP',
+];
+
+/** Plural nouns for the empty-list sentence. */
+const EMPTY_NOUN: Record<IssueLogStage, string> = {
+  RECEIPT: 'receipts',
+  REQUISITION: 'requisitions',
+  ISSUE: 'issues',
+  ISSUE_PRELEDGER: 'pre-ledger issues',
+  CONSUMPTION: 'consumption',
+  REVERSAL: 'give-backs',
+  CONSUMPTION_SKIP: 'skipped cooks',
+};
 
 /**
  * The server's pre-ledger stage token. Accepting the human label as well is
@@ -229,6 +284,11 @@ const STAGE_ORDER: IssueLogStage[] = ['RECEIPT', 'REQUISITION', 'ISSUE', 'ISSUE_
 function normStage(raw: string): IssueLogStage {
   const s = String(raw || '').toUpperCase().trim();
   if (s === 'ISSUE_PRELEDGER' || s === 'ISSUE (PRE-LEDGER)' || s === 'PRE_LEDGER' || s === 'PRELEDGER') return 'ISSUE_PRELEDGER';
+  // A give-back and a skipped cook are their OWN stages (final pass). The
+  // fallback below used to catch them, and it put a department's give-back to
+  // the central store under the CONSUMPTION badge — the opposite direction.
+  if (s.startsWith('REVERSAL') || s === 'GIVE-BACK' || s === 'GIVE_BACK') return 'REVERSAL';
+  if (s === 'CONSUMPTION_SKIP' || s.startsWith('CONSUMPTION (SKIPPED') || s === 'SKIP') return 'CONSUMPTION_SKIP';
   if (s === 'RECEIPT' || s === 'REQUISITION' || s === 'ISSUE' || s === 'CONSUMPTION') return s as IssueLogStage;
   return 'CONSUMPTION';
 }
@@ -242,6 +302,10 @@ function normStage(raw: string): IssueLogStage {
  * time and the other is an arithmetic remainder with neither. Folding them into
  * one option would let a reader ask for "issues" and be handed rows that look
  * sourced but are derived.
+ *
+ * `reversal` and `consumption_skip` are separate from `issue` and
+ * `consumption` for the same reason in the other direction: a give-back is
+ * goods coming back to the store, and a skipped cook moved nothing.
  */
 const STAGE_FILTERS = [
   { k: 'all', label: 'All stages' },
@@ -250,6 +314,8 @@ const STAGE_FILTERS = [
   { k: 'issue', label: 'Issues only (recorded)' },
   { k: 'preledger', label: 'Pre-ledger issues (reconstructed)' },
   { k: 'consumption', label: 'Consumption only' },
+  { k: 'reversal', label: 'Give-backs to the store only' },
+  { k: 'consumption_skip', label: 'Skipped cooks only (no stock moved)' },
 ] as const;
 type StageFilter = (typeof STAGE_FILTERS)[number]['k'];
 
@@ -257,8 +323,60 @@ type StageFilter = (typeof STAGE_FILTERS)[number]['k'];
 
 const fmtINR = (n: number) => '₹' + (Math.round((Number(n) || 0) * 100) / 100).toLocaleString('en-IN');
 const fmtNum = (n: number) => (Number(n) || 0).toLocaleString('en-IN');
-/** Quantities are routinely fractional (0.5 CTN, 12.5 g) — never round them away. */
-const fmtQty = (n: number) => (Number(n) || 0).toLocaleString('en-IN', { maximumFractionDigits: 3 });
+/** Quantities are routinely fractional (0.5 CTN, 12.5 g) — never round them away.
+ *  Printed on the house 6-dp grid (central-debit-clamp.ts qtyGrid), not at 3 dp
+ *  (round 8b): on a material bought and cooked in one unit (kg / kg, pack 1)
+ *  the shelf rule records figures like WHITE DAL 5.0005 kg and WHOLE DHANIYA
+ *  3.2174 kg, which 3 dp printed as "FULL 5.001 of 5.001 kg", "3.151 kg
+ *  recipe units" for 3.1505, and "0 kg recipe units = 0.0004 kg" for a 0.4 g
+ *  party-shelf correction (round-8 verifier). The grid snap sheds float dust,
+ *  so a figure with three decimals or fewer prints exactly as it always did. */
+const fmtQty = (n: number) => (Math.round((Number(n) || 0) * 1e6) / 1e6 || 0)
+  .toLocaleString('en-IN', { maximumFractionDigits: 6 });
+/** A purchase-unit restatement or a still-open figure, printed AS THE SERVER
+ *  CARRIES IT — never re-rounded here. On the requisition chain the server
+ *  already put it on six decimals of the purchase unit (issue-log.ts gridPu:
+ *  14,842.4 g is 14.8424 kg, 415 ml of 60-ml bottles is 6.916667 BTL), the same
+ *  six decimals fmtQty prints, so a hand-over and its line's "issued" figure
+ *  print one string (round 10b; round 10's 15 significant digits printed
+ *  "6.91666667 BTL" beside the line's "6.916667"). A figure too small for six
+ *  decimals is never "0" (round 8: the party-shelf correction "−0.5 g" read
+ *  "= 0 kg"; round 9: a PART row must never read "still open 0"): the server
+ *  carries it at six significant digits and it prints at those, no more (round
+ *  10's 15 digits printed float dust, "0.00000000000199999999894729 kg"). */
+const fmtPuQty = (n: number) => {
+  const v = Number(n) || 0;
+  if (v === 0) return '0';
+  // ON the 6-dp grid -> fmtQty: the server rounds every figure of one millionth
+  // or more to whole millionths. Below that only its sub-grid figures exist —
+  // under half a millionth, carried at six significant digits — and they print
+  // at those, including one that lands exactly on half a millionth (THE RULE's
+  // 5e-7 kg remainder), which fmtQty would round UP to "0.000001" beside the
+  // CSV's 5e-7. 0.75 millionth splits the two cleanly.
+  if (Math.abs(v) >= 7.5e-7) return fmtQty(v);
+  return v.toLocaleString('en-IN', { maximumSignificantDigits: 6 });
+};
+/** PRODUCTION'S quantity format (62aa895), byte for byte: three decimals. */
+const fmtQtyProd = (n: number) => (Number(n) || 0).toLocaleString('en-IN', { maximumFractionDigits: 3 });
+/**
+ * The rows the clamp never touches print EXACTLY AS PRODUCTION PRINTS THEM:
+ * a receipt and a cook — CONSUMPTION and CONSUMPTION (skipped) — at
+ * production's three decimals, every quantity on the row (round 10b). The
+ * 6-dp grid above exists for figures the shelf rule records on the
+ * requisition chain; on a cook it made a pack-1 row contradict itself —
+ * "0.0004 kg recipe units = 0 kg", "0.0125 kg recipe units = 0.013 kg" — where
+ * production reads "0 kg = 0 kg" and "0.013 kg = 0.013 kg".
+ *
+ * Keyed on the stage THE SERVER SENT (server_stage, falling back to stage for
+ * a row that never went through load(), and for a stage total, which never
+ * does). A REVERSAL — the Give-back stage: an undo, a clamp-shaped figure, or
+ * a department return — is not in the set and keeps the requisition chain's
+ * six decimals.
+ */
+const PRINTED_AS_PRODUCTION = new Set(['RECEIPT', 'CONSUMPTION', 'CONSUMPTION_SKIP']);
+function printsAsProduction(r: { server_stage?: string; stage?: string }): boolean {
+  return PRINTED_AS_PRODUCTION.has(String(r.server_stage ?? r.stage ?? '').toUpperCase().trim());
+}
 
 function shiftDays(ymd: string, days: number) {
   // Parsed as UTC midnight on purpose: the input is already an IST calendar date
@@ -359,8 +477,13 @@ export default function IssueLogPage() {
       const j = (await res.json()) as IssueLogResponse;
       setData({
         ...j,
-        rows: (Array.isArray(j.rows) ? j.rows : []).map(r => ({ ...r, stage: normStage(r.stage) })),
-        totals: { by_stage: Array.isArray(j.totals?.by_stage) ? j.totals.by_stage : [], basis: j.totals?.basis || '' },
+        rows: (Array.isArray(j.rows) ? j.rows : []).map(r => ({ ...r, server_stage: String(r.stage ?? ''), stage: normStage(r.stage) })),
+        totals: {
+          by_stage: Array.isArray(j.totals?.by_stage) ? j.totals.by_stage : [],
+          basis: j.totals?.basis || '',
+          // null (an older server) = unknown, and every card reads as before.
+          stages_present: Array.isArray(j.totals?.stages_present) ? j.totals.stages_present.map(x => String(x)) : null,
+        },
       });
     } catch { setError('Network error — please try again.'); setData(null); }
     finally { setLoading(false); }
@@ -440,6 +563,18 @@ export default function IssueLogPage() {
 
   const totals = data?.totals.by_stage || [];
   const anyFilter = !!(departmentId || materialId || vendorQ || reqNumberQ || stage !== 'all');
+  // The stages the server actually searched under these filters (null = an
+  // older server that did not say, read as "all of them").
+  const present = data?.totals.stages_present ?? null;
+  const searched = (st: IssueLogStage) => present === null || present.some(x => normStage(x) === st);
+  // The empty-list sentence names only the stages that were searched: "no
+  // receipts" under a department filter would deny receipts nobody looked for.
+  const emptyWords = (() => {
+    const names = STAGE_ORDER.filter(searched).map(st => EMPTY_NOUN[st]);
+    if (names.length === 0) return 'These filters exclude every stage — clear one to see rows.';
+    const list = names.length === 1 ? names[0] : `${names.slice(0, -1).join(', ')} or ${names[names.length - 1]}`;
+    return `No ${list} in this range${anyFilter ? ' for these filters' : ''}.`;
+  })();
 
   return (
     <div className="min-h-screen bg-[#FFF8F0] text-[#2D1B0E] overflow-x-hidden">
@@ -531,23 +666,40 @@ export default function IssueLogPage() {
 
         {error && <div className="bg-amber-50 border border-amber-200 rounded-xl px-4 py-3 text-sm text-amber-800">{error}</div>}
 
-        {/* ── PER-STAGE TOTALS. Four separate cards, never a sum. ── */}
+        {/* ── PER-STAGE TOTALS. Separate cards, one per stage, never a sum. ── */}
         {totals.length > 0 && (
           <div className="space-y-2">
             <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3">
               {STAGE_ORDER.map(st => {
                 const t = totals.find(x => normStage(x.stage) === st);
-                if (!t) return null;
+                if (!t || !searched(st)) return null;
                 return <StageCard key={st} stage={st} total={t} singleMaterial={!!materialId} />;
               })}
             </div>
+            {/* A stage these filters cannot answer gets NO card: its "0 lines"
+                would read as "none happened" when nothing was looked for. */}
+            {(() => {
+              const left = STAGE_ORDER.filter(st => !searched(st) && totals.some(x => normStage(x.stage) === st));
+              if (left.length === 0) return null;
+              return (
+                <p className="text-[11px] text-[#8B7355] flex items-start gap-1.5">
+                  <Info className="w-3.5 h-3.5 shrink-0 mt-[1px]" />
+                  <span>
+                    <strong>Not searched in this view, so not a zero:</strong> {left.map(st => STAGE_META[st].label).join(', ')}.
+                    The stage filter, or a filter these stages cannot answer, leaves them out (a receipt or a skipped cook has no
+                    department, only a receipt has a vendor, a cook has no requisition).
+                  </span>
+                </p>
+              );
+            })()}
             <div className="bg-amber-50 border border-amber-200 rounded-xl px-4 py-3 text-sm text-amber-900 flex gap-2">
               <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
               <p>
                 <strong>Do not add these totals together.</strong> Each stage is measured in a different basis —
-                receipts in purchase units and rupees, requisitions in the line’s own unit, issues and consumption
-                in recipe units — and they describe different events. A sum of them is wrong in its unit and in its
-                meaning. Use the <strong>Link key</strong> column to follow one material’s chain instead.
+                receipts in purchase units and rupees, requisitions in the line’s own unit, issues, give-backs,
+                consumption and skipped cooks in recipe units — and they describe different events. A sum of them is
+                wrong in its unit and in its meaning. Use the <strong>Link key</strong> column to follow one material’s
+                chain instead.
                 {data?.totals.basis ? <> {data.totals.basis}</> : null}
               </p>
             </div>
@@ -595,7 +747,7 @@ export default function IssueLogPage() {
                   <tr><td colSpan={10} className="py-6 text-center text-[#8B7355] animate-pulse">Loading traceability log…</td></tr>
                 ) : rows.length === 0 ? (
                   <tr><td colSpan={10} className="py-6 text-center text-[#8B7355]">
-                    {error ? 'Not loaded — see the message above.' : 'No receipts, requisitions, issues or consumption in this range.'}
+                    {error ? 'Not loaded — see the message above.' : emptyWords}
                   </td></tr>
                 ) : grouped ? (
                   <GroupedBody groups={groups || []} paintLimit={paintLimit} />
@@ -623,11 +775,28 @@ export default function IssueLogPage() {
         <div className="bg-white border border-[#E8D5C4] rounded-xl p-4 text-[11px] text-[#6B5744] space-y-1.5 leading-relaxed">
           <p className="text-[11px] font-semibold text-[#8B7355] uppercase tracking-wide">How to read this log</p>
           <p><strong>Receipt</strong> quantities and rates are in <strong>purchase units</strong> (₹ per purchase unit), the way the bill reads.
-            <strong> Requisition</strong> quantities are in the requisition line’s own unit. <strong>Issue</strong> and <strong>consumption</strong> quantities
-            are in recipe units. Each row prints its own unit — nothing is converted between bases here.</p>
+            <strong> Requisition</strong> quantities are in the requisition line’s own unit. <strong>Issue</strong>, <strong>give-back</strong>,
+            <strong> consumption</strong> and <strong>skipped cook</strong> quantities are in recipe units. Each row prints its own unit first; the
+            “=” figure beneath it is the same quantity restated in purchase units, never a second amount.</p>
+          <p><strong>Give-back</strong> rows are goods a department sent back to the central store, shown as the positive quantity that went back.
+            An undo or a lowered issued figure also shows on the Issue rows as a negative row — the same event twice, so never add the two. A
+            department return marked reusable has no Issue row and shows only here. A negative Issue row on a party line — an undo, a store
+            rejection or a lowered figure, or the party transfer’s own correction of the line to what actually left the central store — moved no
+            stock and has no give-back: a party line’s stock moves only at party fulfilment.</p>
+          <p><strong>Skipped cook</strong> rows are cooks that moved no stock anywhere — the row names why (an unmapped station, a department whose
+            recipe deduction is off, liquor on its own rail, and so on). They are a data gap, not a loss.</p>
           <p><strong>FULL / PART.</strong> Measured against the effective quantity for the line (chef-approved if there is one, otherwise requested),
             <em> as it stood when the store handed the goods over</em>. A later change to the approved quantity does not rewrite what already happened.
-            <strong> Still open</strong> is the outstanding balance in the line’s own unit.</p>
+            <strong> Still open</strong> is the outstanding balance, in purchase units first, with the row’s own unit beside it
+            when that is a different unit. On a line the store or the chef rejected, its requisition and pre-ledger rows print that
+            balance as “rejected by …” instead: it is not owed. An issue row keeps “still open” as it stood at that
+            hand-over.</p>
+          <p><strong>Decimals.</strong> Requisition and issue rows, and a give-back to the central store (an undo, a lowered issued figure, or a
+            department return marked reusable), carry up to six decimals, and every purchase-unit figure on them is rounded to six decimals of the
+            purchase unit. That sixth decimal can be a rounding: always on a pack that does not divide evenly (5 ml of a 60 ml bottle reads
+            0.083333 BTL), and on any pack when the recipe figure is finer than six decimals of the purchase unit, so a hand-over and its still
+            open can differ from the line by one in the last digit. A figure too small for six decimals is still printed, to six significant
+            digits, never as 0. Receipts and cooks (consumption, or a skipped cook) print to three decimals.</p>
           <p><strong>“Recorded, stock not moved”.</strong> An issue is always recorded, whether or not it debited central stock — those are two separate
             facts. When stock did not move the row says why. Do not read a recorded issue as a stock deduction.</p>
           <p><strong>Pre-ledger rows are reconstructed</strong> from the requisition line for issues made before this log existed. They carry no actor and no exact
@@ -666,7 +835,7 @@ function StageCard({ stage, total, singleMaterial }: { stage: IssueLogStage; tot
           figure rather than print a meaningless one. */}
       <p className="text-[11px] text-[#6B5744] mt-1">
         {singleMaterial && total.qty != null
-          ? <>Qty <strong>{fmtQty(total.qty)} {total.unit}</strong></>
+          ? <>Qty <strong>{printsAsProduction(total) ? fmtQtyProd(total.qty) : fmtQty(total.qty)} {total.unit}</strong></>
           : <span className="text-[#B8A48E]">Qty total needs a single item — pick one in the Item filter.</span>}
       </p>
 
@@ -701,14 +870,37 @@ function FulfilmentCell({ r }: { r: IssueLogRow }) {
     : r.fulfilment === 'PART' ? 'bg-amber-50 text-amber-800 border-amber-200'
     : 'bg-[#F4EFE9] text-[#6B5744] border-[#E8D5C4]';
   const openQty = Number(r.still_open || 0);
+  // OWNER RULE: what is still owed LEADS with the PURCHASE unit (round 10) —
+  // the server's restatement on its six decimals (round 10b), never derived
+  // here — and the row's own
+  // figure (the line unit on a requisition, recipe units on an issue) follows
+  // it whenever that unit is a different one. A line whose unit is ambiguous
+  // has no trustworthy purchase figure (null) and keeps its own figure alone.
+  const openPu = r.still_open_purchase;
+  const pu = String(r.purchase_unit || '').trim();
+  const own = String(r.unit || '').trim();
+  const sameUnit = pu.toLowerCase() === own.toLowerCase();
+  // A REJECTED line owes nothing: the store's reject cancels the rest (nothing
+  // more will be issued unless the reject is undone), and a chef-rejected line
+  // was never to be issued. Its balance is
+  // printed as what it is, never as "still open". A requisition or pre-ledger
+  // row speaks for the line now; an ISSUE row is the stamped moment of its
+  // hand-over, when the balance WAS still open, so it keeps the words.
+  const lineRow = r.stage === 'REQUISITION' || r.stage === 'ISSUE_PRELEDGER';
+  const rejectedBy = !lineRow ? '' : r.status === 'store_rejected' ? 'the store' : r.status === 'chef_rejected' ? 'the chef' : '';
+  // "rejected by the store: X" states only what the record says — the balance
+  // was rejected — and nothing about where stock sits (a party line can be
+  // rejected after its transfer moved part of it; the line's own figure says
+  // what the record holds).
+  const openWords = rejectedBy ? `rejected by ${rejectedBy}:` : 'still open';
   return (
     <span className="inline-block">
       <span className={`inline-block px-1.5 py-0.5 rounded border text-[10px] font-bold tracking-wide ${tone}`}>{r.fulfilment}</span>
-      {/* Outstanding is stated in the LINE's own unit — the unit the line was
-          raised in — because that is the unit the store and the chef argue in. */}
       {openQty > 0 && (
         <span className="block text-[10px] text-amber-800 mt-0.5">
-          still open {fmtQty(openQty)} {r.unit || ''}
+          {openPu != null && pu
+            ? <>{openWords} {fmtPuQty(openPu)} {pu}{!sameUnit && <> (= {fmtPuQty(openQty)} {own})</>}</>
+            : <>{openWords} {fmtPuQty(openQty)} {own}</>}
         </span>
       )}
       {r.effective_qty != null && r.issued_qty != null && (
@@ -724,6 +916,11 @@ function LogRow({ r }: { r: IssueLogRow }) {
   const isReceipt = r.stage === 'RECEIPT';
   const isPreLedger = r.stage === 'ISSUE_PRELEDGER';
   const skip = r.stock_moved === false ? skipWords(r.skip_reason) : '';
+  // A receipt or a cook prints every quantity as production does (3 dp); the
+  // requisition chain prints the house 6-dp grid. See printsAsProduction.
+  const asProd = printsAsProduction(r);
+  const q = asProd ? fmtQtyProd : fmtQty;
+  const pq = asProd ? fmtQtyProd : fmtPuQty;
 
   return (
     <tr className="border-b border-[#F7EEE3] last:border-0 align-top">
@@ -755,15 +952,15 @@ function LogRow({ r }: { r: IssueLogRow }) {
             never re-computed here. */}
         {isReceipt ? (
           <>
-            <span className="font-semibold">{fmtQty(r.qty)} <span className="text-[11px] text-[#8B7355] font-normal">{r.purchase_unit || r.unit}</span></span>
+            <span className="font-semibold">{q(r.qty)} <span className="text-[11px] text-[#8B7355] font-normal">{r.purchase_unit || r.unit}</span></span>
             <span className="block text-[10px] text-[#B8A48E]">purchase units</span>
           </>
         ) : (
           <>
-            <span className="font-semibold">{fmtQty(r.qty)} <span className="text-[11px] text-[#8B7355] font-normal">{r.unit}</span></span>
+            <span className="font-semibold">{q(r.qty)} <span className="text-[11px] text-[#8B7355] font-normal">{r.unit}</span></span>
             <span className="block text-[10px] text-[#B8A48E]">{r.qty_basis === 'line' ? 'line unit' : r.qty_basis === 'recipe' ? 'recipe units' : r.qty_basis || ''}</span>
             {r.purchase_qty != null && r.purchase_unit && (
-              <span className="block text-[10px] text-[#8B7355]">= {fmtQty(r.purchase_qty)} {r.purchase_unit}</span>
+              <span className="block text-[10px] text-[#8B7355]">= {pq(r.purchase_qty)} {r.purchase_unit}</span>
             )}
           </>
         )}

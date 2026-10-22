@@ -1,7 +1,7 @@
 import { getDb, generateId } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
 import { deptOnHandBulk, deptKey } from '@/lib/dept-ledger';
-import { planCentralDebit, holdsAny } from '@/lib/central-debit-clamp';
+import { planCentralDebit, holdsAny, fmtGridQty } from '@/lib/central-debit-clamp';
 
 /**
  * Butchering — carcass breakdown into named cuts.
@@ -534,15 +534,20 @@ export async function PUT(request: Request) {
           // none", never as a negative allowance — and never gets printed back
           // at the operator as "holds only -10 kg". The branch is holdsAny()
           // (src/lib/central-debit-clamp.ts) — the one "does it hold any" test
-          // every floor shares: a grid step or more, which is exactly what the
-          // 6-dp `qty` below renders as non-zero, so it can never say "holds
-          // only 0 kg" about a balance too small to render, nor "holds none"
-          // about one that is there.
+          // every floor shares: a grid step or more.
+          //
+          // THE BALANCE IS PRINTED ON THE SAME GRID THAT TEST READS (round 7):
+          // fmtGridQty, which snaps through qtyGrid, not `qty` (toFixed). At an
+          // exact half-grid tie the two disagree — 5e-7 is stored as 4.99…e-7,
+          // toFixed(6) prints 0 while holdsAny is true — and this sentence read
+          // "holds only 0 kg" (measured). Printed this way it can never say
+          // "holds only 0" about a balance the test says is there, nor "holds
+          // none" about one that is.
           const available = Math.max(0, onHand);
           const name = fresh.source_name || 'this carcass';
           throw new CarcassShort(
             (holdsAny(available)
-              ? `The central store holds only ${qty(available)} of ${name}, so a ${qty(fresh.gross_weight)} carcass cannot be broken down.`
+              ? `The central store holds only ${fmtGridQty(available)}${unit} of ${name}, so a ${qty(fresh.gross_weight)} carcass cannot be broken down.`
               : `The central store holds none of ${name}, so a ${qty(fresh.gross_weight)} carcass cannot be broken down.`)
             + ` Nothing was posted and the batch is still open — receive the carcass, correct the gross weight, or record a closing count, then close again.`,
           );
