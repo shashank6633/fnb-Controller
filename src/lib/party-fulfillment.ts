@@ -204,7 +204,9 @@ export interface PartyShelfRecord {
  * short line was found only by the next press (round-9 recheck, two-short).
  * Every line is now scored before the transfer refuses; the first refusal is
  * thrown with the rest on CentralStockShort.others, and the routes return each
- * one's row and cap. The refusal is still whole: nothing moves.
+ * one's row and cap. The refusal is still whole: nothing moves. (Final pass:
+ * each line's sentence also names the other short lines that would refuse
+ * again, since its own cap moves nothing while they stay in the transfer.)
  *
  * ── THE SHELF MARK GOES ON THE CLOSING GESTURE'S ROW (round 10) ─────────────
  * `opts.ledgerSince` is requisition_issue_ledger's MAX(rowid) when the gesture
@@ -377,6 +379,14 @@ export function applyPartyFulfillment(
     // Every line the floor refuses, in walk order (round 10 — EVERY SHORT LINE
     // IS NAMED). Thrown together once the walk is done.
     const shorts: CentralStockShort[] = [];
+    // Which of them would refuse AGAIN on a gesture that does not touch them
+    // (final pass — see "A SHORT LINE THAT BLOCKS ANOTHER" below): a first
+    // transfer (nothing moved yet) refuses whenever the transfer runs, and on
+    // /store-process (no gestureIssuedIds) every line is the gesture's; a
+    // top-up line on /store-issue that the next gesture leaves alone instead
+    // takes what the shelf holds and stays open (A TOP-UP THE SHELF CANNOT
+    // COVER). Parallel to `shorts`.
+    const shortBlocks: boolean[] = [];
     // The gesture's start in the issue ledger (round 10 — THE SHELF MARK GOES
     // ON THE CLOSING GESTURE'S ROW), read under the write lock with the rest.
     const ledgerSince = opts?.ledgerSince != null && Number.isFinite(Number(opts.ledgerSince))
@@ -521,6 +531,7 @@ export function applyPartyFulfillment(
             if (!isCentralStockShort(e)) throw e;
             shorts.push(e as CentralStockShort);
           }
+          shortBlocks.push(!(movedLine > 0) || !opts?.gestureIssuedIds);
           continue;
         }
         // WHAT THE SHELF HOLDS, AND NO MORE. On a refusal the floor's debit is
@@ -629,6 +640,24 @@ export function applyPartyFulfillment(
     // Thrown inside the transaction, so every debit, credit and correction the
     // walk wrote for the other lines unwinds with it: not a gram moves.
     if (shorts.length > 0) {
+      // ── A SHORT LINE THAT BLOCKS ANOTHER (final pass) ──────────────────────
+      // Each refusal's own sentence offers its line's way forward — a cap, an
+      // undo-and-reissue. Taken alone, that moves nothing while another short
+      // line that would refuse again stays in the transfer (round-10 recheck,
+      // two-short: "Issue 5.158 kg or less on this line" for THREE MANGO,
+      // refused again over WHOLE DHANIYA). So each sentence names those lines
+      // (CentralStockShort.nameBlockers). Words only: the refusal, its rows and
+      // their caps are unchanged; a lone short line reads exactly as before.
+      if (shorts.length > 1) {
+        shorts.forEach((s, i) => {
+          const names = shorts
+            .filter((o, j) => j !== i && shortBlocks[j])
+            .map(o => String(o.materialId) === String(s.materialId)
+              ? (o.materialName ? `the other ${o.materialName} line` : 'the other line of this item')
+              : (o.materialName || 'another line'));
+          s.nameBlockers(names);
+        });
+      }
       const first = shorts[0];
       first.others = shorts.slice(1);
       throw first;

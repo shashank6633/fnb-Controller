@@ -594,10 +594,32 @@ export class CentralStockShort extends Error {
    * the transfer's order. [] on every single-line refusal.
    */
   others: CentralStockShort[] = [];
+  /** See CentralIssueCheck.rewordBlocked. Absent off the party rail. Held
+   *  NON-ENUMERABLY (set in the constructor), so a route that logs the error
+   *  object prints exactly the fields it always printed. */
+  private declare readonly rewordBlocked?: (blockers: readonly string[]) => string;
+
+  /**
+   * NAME THE OTHER SHORT LINES IN THIS LINE'S OWN SENTENCE (final pass). The
+   * party transfer is refused whole, so a cap printed for this line — "Issue
+   * 5.158 kg or less on this line" — is not a way forward on its own while
+   * another line it cannot cover stays in the transfer: pressed alone it met
+   * that line again (round-10 recheck, two-short: THREE MANGO's cap, refused
+   * over WHOLE DHANIYA). `names` are the lines that will still block; the
+   * sentence is rebuilt from the same figures with them named. A no-op off the
+   * party rail or with no names.
+   */
+  nameBlockers(names: readonly string[]): void {
+    if (!this.rewordBlocked || names.length === 0) return;
+    this.message = this.rewordBlocked(names);
+  }
 
   constructor(c: CentralIssueCheck) {
     super(c.message);
     this.name = 'CentralStockShort';
+    if (c.rewordBlocked) {
+      Object.defineProperty(this, 'rewordBlocked', { value: c.rewordBlocked, enumerable: false });
+    }
     this.reqItemId = c.reqItemId;
     this.materialId = c.materialId;
     this.materialName = c.materialName;
@@ -710,6 +732,15 @@ export interface CentralIssueCheck {
   /** '' when ok. Already phrased for a storekeeper, in PURCHASE units. */
   message: string;
   /**
+   * PARTY RAIL REFUSALS ONLY (final pass): `message` rebuilt from the very same
+   * figures with the OTHER short lines of the same transfer named, because the
+   * transfer moves every line at once — a cap or an undo that frees this line
+   * alone moves nothing while another line it cannot cover stays in it. The
+   * transfer calls it (CentralStockShort.nameBlockers) once its walk has found
+   * every short line. Absent on the internal rail and on every check that fits.
+   */
+  rewordBlocked?: (blockers: readonly string[]) => string;
+  /**
    * THE FIGURE A BOX THAT ADDS TO THE LINE MAY HOLD (round 9), in the LINE's
    * own unit: the most that, ADDED to the line's quantity_issued, is accepted.
    * The store desk's box adds (/store-issue is incremental), and so does the
@@ -758,7 +789,10 @@ export interface CentralIssueCheck {
    * and nothing left the store — the line then owed 5.158 kg. False otherwise.
    */
   addCloses: boolean;
-  /** What the line still owes after that add, LINE units (0 when addCloses). */
+  /** What the line still owes after that add, LINE units (0 when addCloses):
+   *  approved − (D + the add), the figure the add RECORDS — an add that does
+   *  not close the line moves nothing, so the line records the box's figure,
+   *  never the take the transfer would make were it to run. */
   addOwesLine: number;
   /**
    * WITH A DESK BASE AND NOTHING MOVED YET (round 10): would undoing the line
@@ -770,8 +804,9 @@ export interface CentralIssueCheck {
   redoCloses: boolean;
   /** What the line would still owe after that redo, LINE units. */
   redoOwesLine: number;
-  /** With a desk base: the line as the box found it still owed something
-   *  (issued below approved) — so "Defer the rest" names a real rest. */
+  /** With a desk base: the line as the box found it still owed something —
+   *  it was not complete by THE RULE (issued below approved, and no shelf mark
+   *  speaking for that figure) — so "Defer the rest" names a real rest. */
   deskOwes: boolean;
   /**
    * With a desk base, when the line's figure AS IT STANDS fits (deskLineFits):
@@ -956,7 +991,7 @@ export function checkCentralIssue(
 
   const line = db.prepare(`
     SELECT ri.id, ri.material_id, ri.unit AS line_unit, r.purpose,
-           ri.chef_approved_qty, ri.quantity_requested,
+           ri.chef_approved_qty, ri.quantity_requested, ri.shelf_emptied_qty,
            rm.name AS material_name, rm.unit, rm.purchase_unit, rm.pack_size,
            COALESCE(rm.current_stock, 0) AS current_stock
       FROM requisition_items ri
@@ -1110,7 +1145,11 @@ export function checkCentralIssue(
   let addCloses = false, addOwesLine = 0, redoCloses = false, redoOwesLine = 0, deskOwes = false, deskCloses = false;
   if (desk > 0) {
     const shownLine = lineShownAs(line.line_unit, line);
-    deskOwes = !issuedCoversAsk(desk, approvedLineQty, shownLine, false);
+    // THE LINE AS THE BOX FOUND IT, BY THE RULE — both arms: a shelf mark still
+    // speaking for D (stamped at exactly D, which only a line this gesture has
+    // not written can still carry) closes it as surely as D ≥ approved, and a
+    // complete line has no rest to defer (store-issue drops a defer on it).
+    deskOwes = !issuedCoversAsk(desk, approvedLineQty, shownLine, shelfMarkHolds(line.shelf_emptied_qty, desk));
     // The transfer's take of a line TOTAL: the same plan, the same record it
     // would write (recordAfterLineQty), the same emptied test it stamps — and
     // whether THE RULE then calls the line complete.
@@ -1124,7 +1163,17 @@ export function checkCentralIssue(
     if (maxAddLineQty > 0) {
       const t = closesAt(maxTotalLine);
       addCloses = t.closes;
-      addOwesLine = addCloses ? 0 : Math.max(0, approvedLineQty - t.recorded);
+      // AN ADD THAT DOES NOT CLOSE THE LINE MOVES NOTHING, so what the line then
+      // owes is measured from what it RECORDS — D + the add, the box's figure
+      // the route writes (maxTotalLine) — never from t.recorded, the take the
+      // transfer would make were it to run (the shelf's exact figure when the
+      // add reaches its shown one). MEASURED (round-10 recheck, c1_party_half):
+      // MANGO 10 of 20 kg over 14,842.4 g was told "Issue 4.842 kg … which then
+      // still owes 5.1576 kg"; pressed, the line recorded 14.842 kg and the row
+      // read "Outstanding 5.158 kg". (Not closing means the total stays below
+      // approved — a total at or above it is closed by its take — so the
+      // transfer cannot run on that issue.)
+      addOwesLine = addCloses ? 0 : Math.max(0, Math.round((approvedLineQty - maxTotalLine) * 1e9) / 1e9);
     }
     if (deskLineFits && deskOwes) deskCloses = closesAt(desk).closes;
     if (!(transferBase > 0) && holdsAny(plan.available)) {
@@ -1202,11 +1251,13 @@ export function checkCentralIssue(
   // "HOLDS NONE OF IT" ONLY WHEN IT HOLDS NONE — holdsAny(), the one test every
   // floor uses. A crumb the column shows as 0 is named in recipe units, with the
   // purchase figure that takes it.
+  const figs: ShortFigures = { holds: holdsAny(plan.available), shownAvail, shownAsk, gridAvail, recipeUnit, pf, meta };
   return {
     ...base, ok: false,
-    message: centralShortMessage(base, {
-      holds: holdsAny(plan.available), shownAvail, shownAsk, gridAvail, recipeUnit, pf, meta,
-    }),
+    message: centralShortMessage(base, figs),
+    // The party transfer refuses whole, so it may have to name the other short
+    // lines in this one's sentence once it has found them all (final pass).
+    ...(a.rail === 'party' ? { rewordBlocked: (b: readonly string[]) => centralShortMessage(base, figs, b) } : {}),
   };
 }
 
@@ -1214,6 +1265,32 @@ type ShortFigures = {
   holds: boolean; shownAvail: number; shownAsk: number; gridAvail: number; recipeUnit: string; pf: number;
   meta: { unit?: string | null; purchase_unit?: string | null; pack_size?: number | null };
 };
+
+/**
+ * THE OTHER SHORT LINES OF ONE PARTY TRANSFER, AS A REFUSAL NAMES THEM (final
+ * pass). The transfer moves every line at once and is refused whole, so an
+ * instruction that frees THIS line — a cap, an undo-and-reissue — moves nothing
+ * on its own while another line it cannot cover stays in the transfer. MEASURED
+ * (round-10 recheck, two-short): THREE MANGO 6 kg typed over 5,158 g beside
+ * WHOLE DHANIYA 1/1 kg over an empty shelf — MANGO's clause read "Issue 5.158 kg
+ * or less on this line.", and issued alone it was refused again over DHANIYA.
+ * `once` qualifies such an instruction ("… once WHOLE DHANIYA is resolved");
+ * `why` is the fact behind it, closing the sentence. Both '' with no blockers,
+ * so every sentence the transfer refuses with a single short line is
+ * byte-identical. The transfer decides who blocks (party-fulfillment.ts).
+ */
+function partyBlockers(blockers?: readonly string[]): { list: string; are: string; once: string; why: string } {
+  const names = Array.from(new Set((blockers || []).map(s => String(s || '').trim()).filter(Boolean)));
+  if (names.length === 0) return { list: '', are: '', once: '', why: '' };
+  const list = names.length === 1 ? names[0] : `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
+  const are = names.length === 1 ? 'is' : 'are';
+  return {
+    list, are,
+    once: ` once ${list} ${are} resolved`,
+    why: ` The party transfer moves every line at once, so while the central store cannot cover ${list} it `
+      + `moves nothing for this line either.`,
+  };
+}
 
 /**
  * THE PARTY LINE THE STORE DESK'S BOX ADDS TO (round 9) — the two clauses every
@@ -1226,8 +1303,8 @@ type ShortFigures = {
  * typeable and the store desk prints it at that precision) when there is one,
  * and what it leads to by THE RULE (round 10: "takes everything … and the line
  * closes" only when it completes the line — otherwise it is recorded and
- * nothing moves yet); otherwise the way out in words, never a figure that
- * would be refused:
+ * nothing moves yet, and what it then owes is measured from what it records);
+ * otherwise the way out in words, never a figure that would be refused:
  *   · the line holds no more than the shelf (it would all go): defer the rest —
  *     where there is a rest (c.deskOwes) the shelf cannot close; where the
  *     line's own figure closes it once the transfer takes it (c.deskCloses),
@@ -1236,15 +1313,21 @@ type ShortFigures = {
  *   · the line holds MORE than the shelf: undo it and issue the shelf's figure,
  *     which is the cap from 0 and accepted (checked: the store desk's undo
  *     zeroes the line, so its box then adds to 0) — ONLY when that redo closes
- *     the line (c.redoCloses, round 10); otherwise how far short the store
- *     leaves it, and that only stock or a count can move it.
+ *     the line (c.redoCloses, round 10); otherwise how far short everything the
+ *     store holds (named exactly, so the two figures add up to the line) leaves
+ *     it, and that only stock or a count can move it.
+ * `blockers` (final pass): the other short lines of the same transfer — see
+ * partyBlockers.
  */
-function deskPartyClauses(c: CentralIssueCheck, f: ShortFigures): { lead: string; store: string; tail: string } {
+function deskPartyClauses(
+  c: CentralIssueCheck, f: ShortFigures, blockers?: readonly string[],
+): { lead: string; store: string; tail: string } {
   const pu = c.purchaseUnit ? ` ${c.purchaseUnit}` : '';
   const ru = f.recipeUnit ? ` ${f.recipeUnit}` : '';
   const recipeHint = (r: number) => (f.pf > 1 ? ` (= ${onGrid(r).toLocaleString('en-IN', { maximumFractionDigits: 6 })}${ru})` : '');
   const desk = c.deskBeforeLineQty;
   const deskFig = fmtLineQtyPU(desk, c.lineUnit, f.meta);
+  const b = partyBlockers(blockers);
   // What the store holds for THIS line — the shown figure with its exact recipe
   // hint (14.842 kg = 14,842.4 g, which is why 0.0004 kg more still fits), or a
   // sub-display crumb in the recipe unit, as every crumb sentence names it.
@@ -1278,15 +1361,16 @@ function deskPartyClauses(c: CentralIssueCheck, f: ShortFigures): { lead: string
     return {
       lead, store,
       tail: c.addCloses
-        ? `Issue ${add} or less on this line (${add} takes everything the central store holds for it, and the line closes).`
+        ? `Issue ${add} or less on this line${b.once} (${add} ${b.list ? 'then ' : ''}takes everything the central store `
+          + `holds for it, and the line closes).${b.why}`
         : `Issue ${add} or less on this line — it is recorded on the line, which then still owes `
           + `${lineFig(c.addOwesLine)}; a party requisition's goods leave the central store only once every line is `
-          + `complete, so nothing moves yet.`,
+          + `complete, so nothing moves yet.${b.why}`,
     };
   }
   const cap = f.shownAvail > 0 ? `${fmtQtyNum(f.shownAvail)}${pu}` : `${puFine(c.availablePurchase, f.pf)}${pu}`;
   // "Defer the rest" only where there IS a rest (round 10): a line already
-  // issued in full that asked for more has nothing left to promise.
+  // complete by THE RULE that asked for more has nothing left to promise.
   const deferOr = c.deskOwes ? 'Defer the rest, or receive' : 'Receive';
   // The line's own figure is one the transfer takes (it IS what the shelf
   // holds, by the grid or by the shown figure): nothing to undo.
@@ -1295,21 +1379,22 @@ function deskPartyClauses(c: CentralIssueCheck, f: ShortFigures): { lead: string
     tail: c.deskLineFits
       ? (!c.deskOwes
           ? `Nothing more can be issued on this line — it already holds everything the central store holds for `
-            + `it, and it owes nothing more.`
+            + `it, and it owes nothing more.${b.why}`
           // ITS OWN FIGURE CLOSES IT (round 10): the line needs only the transfer
           // to run, and the transfer runs on an issue — a Defer alone never runs
           // it — so the way out is to record the same figure through one.
           : c.deskCloses
             ? `Nothing more can be issued on this line — it already holds everything the central store holds for `
               + `it, and the line closes once the party transfer takes that. The transfer runs on an issue, not on a `
-              + `defer: undo the line and issue ${deskFig} on it again once every other line is complete, or receive `
-              + `the stock or record a closing count first.`
+              + `defer: undo the line and issue ${deskFig} on it again once every other line is complete`
+              + `${b.list ? ` and ${b.list} ${b.are} resolved` : ''}, or receive the stock or record a closing count first.`
+              + b.why
             : `Nothing more can be issued on this line until stock arrives — it already holds everything the central `
-              + `store holds for it. ${deferOr} the stock or record a closing count first.`)
+              + `store holds for it. ${deferOr} the stock or record a closing count first.${b.why}`)
       : moved > 0
         ? `Nothing more can be issued on this line until stock arrives — what it holds above the part already `
           + `moved is more than the central store holds for it. ${deferOr} the stock or record a `
-          + `closing count first.`
+          + `closing count first.${b.why}`
         // THE UNDO ADVICE ONLY WHERE IT WORKS (round 10). Lowered to what the
         // store holds, the line closes only when what it then owes is below
         // one printed step (redoCloses); otherwise the advice was followed,
@@ -1319,12 +1404,16 @@ function deskPartyClauses(c: CentralIssueCheck, f: ShortFigures): { lead: string
         // (store-requisitions/page.tsx closesIfRedone).
         : c.redoCloses
           ? `Nothing more can be issued on this line — it already holds more than the central store holds for it. `
-            + `Undo the line and issue ${cap} on it (the transfer then takes everything the central store holds for `
-            + `it, and the line closes), or receive the stock or record a closing count first.`
+            + `Undo the line and issue ${cap} on it${b.once} (the transfer then takes everything the central store holds `
+            + `for it, and the line closes), or receive the stock or record a closing count first.${b.why}`
+          // How short EVERYTHING the store holds leaves the line, with both
+          // figures exact (final pass): "even 14.842 kg … would leave it
+          // 5.1576 kg short" did not add up to the 20 kg line — 5.1576 is what
+          // is owed after the exact 14,842.4 g, so that is the figure named.
           : `Nothing more can be issued on this line — it already holds more than the central store holds for it, `
-            + `and even ${cap}, everything the store holds for it, would leave it ${lineFig(c.redoOwesLine)} short. `
-            + `A party requisition's goods leave the central store only once every line is complete, so receive the `
-            + `stock or record a closing count first.`,
+            + `and even everything the store holds for it, ${lineFig(f.gridAvail / (c.packFactor || 1))}, would leave `
+            + `it ${lineFig(c.redoOwesLine)} short. A party requisition's goods leave the central store only once `
+            + `every line is complete, so receive the stock or record a closing count first.${b.why}`,
   };
 }
 /** The refusal sentence for a short line, in the purchase unit the desks type
@@ -1332,39 +1421,46 @@ function deskPartyClauses(c: CentralIssueCheck, f: ShortFigures): { lead: string
  *  rounded display figure on its own. Shared by checkCentralIssue (so the
  *  pre-flight and the floor) and by the after-the-gesture re-score of a held
  *  line, so the sentences cannot drift. A party line the store desk's box adds
- *  to (c.deskBeforeLineQty, round 9) is worded for that box. */
-function centralShortMessage(c: CentralIssueCheck, f: ShortFigures): string {
+ *  to (c.deskBeforeLineQty, round 9) is worded for that box. `blockers` (party
+ *  rail, final pass): the other short lines of the same transfer — see
+ *  partyBlockers; omitted, every sentence is as it was. */
+function centralShortMessage(c: CentralIssueCheck, f: ShortFigures, blockers?: readonly string[]): string {
   const pu = c.purchaseUnit;
   const q = (n: number) => `${fmtQtyNum(n)}${pu ? ` ${pu}` : ''}`;
   const ru = f.recipeUnit ? ` ${f.recipeUnit}` : '';
+  const b = partyBlockers(blockers);
   // The ask: its shown figure when it has one, otherwise (a sub-display ask) its
   // recipe figure — never "0 kg cannot be issued".
   const askFig = f.shownAsk > 0 ? q(f.shownAsk) : `${fmtGridQty(c.requestedRecipe)}${ru}`;
   if (c.deskBeforeLineQty > 0) {
     // The ask is the line's TOTAL (what the transfer moves), so it is named as
     // such — "14.843 kg in all" — beside what the line already holds. On a
-    // top-up (round 9) the ask is what is still to move, and named so.
-    const d = deskPartyClauses(c, f);
-    const asked = c.transferBeforeLineQty > 0 ? `the ${askFig} still to move` : `${askFig} in all`;
+    // top-up (round 9) the ask is what is still to move, and named so. EXACT
+    // (final pass), as the lead's figures are: the transfer's ask is what the
+    // line holds less what already moved, and that is rarely a printed step —
+    // "the 0.001 kg still to move" was 0.6 g, "the 1 kg still to move" 0.9996 kg.
+    const d = deskPartyClauses(c, f, blockers);
+    const askLine = fmtLineQtyPU(c.requestedRecipe / (c.packFactor || 1), c.lineUnit, f.meta);
+    const asked = c.transferBeforeLineQty > 0 ? `the ${askLine} still to move` : `${askLine} in all`;
     if (!f.holds) {
       return `${c.materialName}: the central store holds none of it — ${d.lead} — `
-        + `so ${asked} cannot be issued. Receive the stock, or record a closing count, first.`;
+        + `so ${asked} cannot be issued. Receive the stock, or record a closing count, first.${b.why}`;
     }
     return `${c.materialName}: ${d.lead} — the central store holds only ${d.store}, `
       + `so ${asked} cannot be issued. ${d.tail}`;
   }
   if (!f.holds) {
     return `${c.materialName}: the central store holds none of it, `
-      + `so ${askFig} cannot be issued. Receive the stock, or record a closing count, first.`;
+      + `so ${askFig} cannot be issued. Receive the stock, or record a closing count, first.${b.why}`;
   }
   if (f.shownAvail > 0) {
     return `${c.materialName}: the central store holds only ${q(f.shownAvail)}, `
-      + `so ${askFig} cannot be issued. Issue ${q(f.shownAvail)} or less on this line.`;
+      + `so ${askFig} cannot be issued. Issue ${q(f.shownAvail)} or less on this line${b.once}.${b.why}`;
   }
   const fine = `${puFine(c.availablePurchase, f.pf)}${pu ? ` ${pu}` : ''}`;
   return `${c.materialName}: the central store holds only ${fmtGridQty(f.gridAvail)}${ru} of it `
     + `— less than the 0.001${pu ? ` ${pu}` : ''} the store desk shows — so ${askFig} cannot be issued. `
-    + `Issue ${fine} or less on this line, or record a closing count.`;
+    + `Issue ${fine} or less on this line${b.once}, or record a closing count.${b.why}`;
 }
 
 /**
@@ -1653,6 +1749,7 @@ function scoreShortLine(
       ...offerAsk(c), ok: false,
       message: `${c.materialName}: not issued with the rest of this gesture — when its turn came the central `
         + `store held less than ${ask}. After the gesture it holds ${fig(c.availablePurchase)}; issue ${ask} again.`,
+      rewordBlocked: undefined,
     };
   }
 
@@ -1680,34 +1777,46 @@ function scoreShortLine(
   const share = Math.min(sib, pool);
   const holdsSome = holdsAny(c.availableRecipe);
 
-  let message: string;
   if (c.ok) {
     // Fits in what is left after the siblings' share (only after the gesture:
     // a credit later in it put stock back after this line's turn).
-    message = `${c.materialName}: not issued with the rest of this gesture — when its turn came the central `
+    const message = `${c.materialName}: not issued with the rest of this gesture — when its turn came the central `
       + `store held less than ${ask}. After the gesture it holds ${figRecipe(pool)}, and ${figRecipe(share)} of it `
       + `goes to ${above}; issue ${ask} again.`;
-    return { ...offerAsk(c), ok: false, message };
-  } else if (holdsSome && c.deskBeforeLineQty > 0) {
-    // A party line the store desk's box adds to (round 9): the same pool
-    // sentence, then deskPartyClauses' figure for a box that adds to what the
-    // line already holds — never the cap on the whole line.
-    const raw = Math.max(0, (Number(c.centralStockRecipe) || 0) - already - sib);
-    const d = deskPartyClauses(c, {
-      holds: holdsAny(raw), shownAvail: shownPurchaseQty(onGrid(raw), meta), shownAsk: 0,
-      gridAvail: qtyDown(raw, 6), recipeUnit: String(meta.unit || '').trim(), pf: c.purchasePackFactor, meta,
-    });
-    const asked = c.transferBeforeLineQty > 0 ? `the ${ask} still to move` : `${ask} in all`;
-    message = `${c.materialName}: ${d.lead} — the central store holds only ${figRecipe(pool)}, and ${figRecipe(share)} of it `
-      + `goes to ${above}, so ${asked} cannot be issued on this line. ${d.tail}`;
-  } else if (holdsSome) {
-    message = `${c.materialName}: the central store holds only ${figRecipe(pool)}, and ${figRecipe(share)} of it `
-      + `goes to ${above} — so ${ask} cannot be issued on this line. Issue ${fig(c.availablePurchase)} or less on this line.`;
-  } else {
-    message = `${c.materialName}: the central store holds only ${figRecipe(pool)}, and all of it goes to ${above} `
-      + `— so ${ask} cannot be issued on this line as well. Receive more stock, or record a closing count, before issuing it.`;
+    return { ...offerAsk(c), ok: false, message, rewordBlocked: undefined };
   }
-  return { ...c, ok: false, message };
+  // The refusal, as a function of the OTHER short lines of a party transfer
+  // (final pass, partyBlockers) — none for every caller but the transfer.
+  const build = (blockers?: readonly string[]): string => {
+    const b = partyBlockers(blockers);
+    if (holdsSome && c.deskBeforeLineQty > 0) {
+      // A party line the store desk's box adds to (round 9): the same pool
+      // sentence, then deskPartyClauses' figure for a box that adds to what the
+      // line already holds — never the cap on the whole line. The ask EXACT, as
+      // centralShortMessage names it (final pass).
+      const raw = Math.max(0, (Number(c.centralStockRecipe) || 0) - already - sib);
+      const d = deskPartyClauses(c, {
+        holds: holdsAny(raw), shownAvail: shownPurchaseQty(onGrid(raw), meta), shownAsk: 0,
+        gridAvail: qtyDown(raw, 6), recipeUnit: String(meta.unit || '').trim(), pf: c.purchasePackFactor, meta,
+      }, blockers);
+      const askLine = fmtLineQtyPU(c.requestedRecipe / (c.packFactor || 1), c.lineUnit, meta);
+      const asked = c.transferBeforeLineQty > 0 ? `the ${askLine} still to move` : `${askLine} in all`;
+      return `${c.materialName}: ${d.lead} — the central store holds only ${figRecipe(pool)}, and ${figRecipe(share)} of it `
+        + `goes to ${above}, so ${asked} cannot be issued on this line. ${d.tail}`;
+    }
+    if (holdsSome) {
+      return `${c.materialName}: the central store holds only ${figRecipe(pool)}, and ${figRecipe(share)} of it `
+        + `goes to ${above} — so ${ask} cannot be issued on this line. Issue ${fig(c.availablePurchase)} or less on `
+        + `this line${b.once}.${b.why}`;
+    }
+    return `${c.materialName}: the central store holds only ${figRecipe(pool)}, and all of it goes to ${above} `
+      + `— so ${ask} cannot be issued on this line as well. Receive more stock, or record a closing count, before `
+      + `issuing it.${b.why}`;
+  };
+  return {
+    ...c, ok: false, message: build(),
+    rewordBlocked: a.rail === 'party' ? (bl: readonly string[]) => build(bl) : undefined,
+  };
 }
 
 /* ────────────────────────────────────────────────────────────────────────────

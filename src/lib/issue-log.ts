@@ -273,10 +273,12 @@ export type IssueLogStage =
  * reader ask for "issues" and be handed rows that look sourced but are derived.
  *
  * `reversal` is SEPARATE from `issue` for the same reason inverted: the ISSUE
- * stage already carries a give-back as a NEGATIVE ledger row, so asking for
- * "issues" correctly nets them. The REVERSAL stage is the DEPARTMENT side of
- * that same event, and folding the two together would count one give-back
- * twice. See STAGE_BASIS.REVERSAL.
+ * stage already carries an undo or a lowered issued figure as a NEGATIVE ledger
+ * row, so asking for "issues" correctly nets them. The REVERSAL stage (the
+ * page's "Give-back") is the DEPARTMENT side of that same event, and folding
+ * the two together would count one give-back twice. Its other source, a
+ * department return marked reusable, has no ISSUE row at all and appears on
+ * this stage only. See STAGE_BASIS.REVERSAL.
  *
  * `skip` is SEPARATE from `consumption` because a skip moved NOTHING. It is a
  * cook that happened with no stock behind it, and a reader who asks for
@@ -526,11 +528,14 @@ const TOTALS_BASIS =
   + 'RECEIPT is purchase units and rupees (goods arriving). REQUISITION is the line unit '
   + '(a request, not a movement). ISSUE and ISSUE (pre-ledger) are the goods leaving the store '
   + 'and together count each hand-over exactly once. CONSUMPTION is a separate event (cooking), '
-  + 'days later, and comes out of the DEPARTMENT, not central. REVERSAL is the department side of a '
-  + 'give-back the ISSUE figure has ALREADY netted as a negative row — two views of one event, never '
-  + 'to be added. CONSUMPTION (skipped) moved no stock at all: it is a data gap (an unmapped station, '
-  + 'or liquor on its own rail), never a loss. The ISSUE rupee figure is a VALUED MEMO at average '
-  + 'price, not a spend — the spend was booked at RECEIPT. There is deliberately no grand total.';
+  + 'days later, and comes out of the DEPARTMENT, not central. REVERSAL (give-back) is goods going back '
+  + 'from a department to the central store: for an undo or a lowered issued figure it is the department '
+  + 'side of the negative row the ISSUE figure has ALREADY netted — two views of one event, never to be '
+  + 'added — and a department return marked reusable appears on this stage only. A negative ISSUE row on '
+  + 'a party line moved no stock and has no give-back. CONSUMPTION (skipped) moved no stock at all: it '
+  + 'is a data gap (an unmapped station or liquor on its own rail, for example), never a loss. The '
+  + 'ISSUE rupee figure is a VALUED MEMO at average price, not a spend — the spend was booked at '
+  + 'RECEIPT. There is deliberately no grand total.';
 
 /** The per-stage sentence printed under each card, and in the CSV totals block. */
 const STAGE_BASIS: Record<IssueLogStage, string> = {
@@ -543,8 +548,12 @@ const STAGE_BASIS: Record<IssueLogStage, string> = {
     + 'stock and carries no money; it is shown so a shortfall and an unfulfilled line are visible.',
   ISSUE:
     'Goods HANDED OVER by the store, recorded in the issue ledger, in RECIPE units. Recorded '
-    + 'is not the same as deducted: the Stock Moved column says whether central stock was also '
-    + 'debited. The rupee figure is a VALUED MEMO at average price, never a spend.',
+    + 'is not the same as moved: Stock Moved (a CSV column; on screen, a "recorded, stock not moved" '
+    + 'note on the row) says whether central stock also moved. A NEGATIVE row lowers what the line '
+    + 'records: an undo or a lowered issued figure, whose department side the Give-back stage lists '
+    + 'wherever the department ledger recorded one, or, on a party line, the party transfer\'s '
+    + 'correction to what actually left the central store (reason party_shelf), which moved no stock '
+    + 'and is not a give-back. The rupee figure is a VALUED MEMO at average price, never a spend.',
   ISSUE_PRELEDGER:
     'Hand-overs that predate the issue ledger, RECONSTRUCTED as quantity_issued minus everything '
     + 'the ledger records for the line, in the line unit. No actor and no time exist for these. '
@@ -559,17 +568,21 @@ const STAGE_BASIS: Record<IssueLogStage, string> = {
     + 'fungible, so this report will not invent that link. Rows dated before the cutover debited '
     + 'central and are shown exactly as they always were.',
   REVERSAL:
-    'Goods handed BACK by a department to the central store — the department side of an undo or a '
-    + 'lowered issued figure, in RECIPE units, from the department ledger. Shown as the positive quantity '
-    + 'that went back. THIS IS THE SAME EVENT the ISSUE stage already carries as a NEGATIVE row: two '
-    + 'views of one give-back, so never add them and never count a reversal twice. It carries no '
-    + 'money for that reason — the ISSUE memo already nets it.',
+    'GIVE-BACKS: goods handed BACK by a department to the central store, in RECIPE units, from the '
+    + 'department ledger, shown as the positive quantity that went back. Two things write one. An undo '
+    + 'or a lowered issued figure on a requisition line: THE SAME EVENT the ISSUE stage already carries '
+    + 'as a NEGATIVE row, two views of one give-back, so never add them and never count it twice. A '
+    + 'department return marked reusable: it has no ISSUE row, so this stage is its only place in this '
+    + 'log. No money on this stage: the ISSUE memo already nets an undo, and a return is valued nowhere '
+    + 'in this report.',
   CONSUMPTION_SKIP:
     'A cook that moved NO STOCK ANYWHERE, and the reason, in RECIPE units — the quantity that WOULD '
-    + 'have been deducted. Written when the sold line\'s station is blank, unmapped (sushi, '
-    + 'terracegrill), switched off, or the material is store-mapped liquor on the TGBCL rail. These '
-    + 'are a DATA GAP, not a loss: nothing was taken from any department, so nothing here may be read '
-    + 'as shrinkage. Map the station in Settings and the same cook starts deducting.',
+    + 'have been deducted. Each row names its reason: the sold line\'s station blank or unmapped '
+    + '(sushi, terracegrill), its department inactive or its recipe deduction switched off, the '
+    + 'material store-mapped liquor on the TGBCL rail, or the department post failing. These are a '
+    + 'DATA GAP, not a loss: nothing was taken from any department, so nothing here may be read as '
+    + 'shrinkage. Mapping a station in Settings makes its later cooks deduct; a skip already recorded '
+    + 'stays as it was.',
 };
 
 /**
@@ -592,8 +605,8 @@ const EPS = 1e-6;
  * which is the exact failure this whole file is built to prevent. Appended,
  * the worst an un-updated page can do is not show them.
  *
- * (The page still needs its own stages added — see the handoff. This ordering
- * is the seatbelt for the window where it has not been.)
+ * (The page now has its own Give-back and Skipped-cook stages — final pass —
+ * so this ordering is only the seatbelt for an older copy of the page.)
  *
  * ROW ordering inside the chain is stage_rank, set per branch, and it is
  * unaffected: a REVERSAL shares its link key with its ISSUE and sorts after it.
@@ -637,7 +650,7 @@ const STAGE_LABEL: Record<IssueLogStage, string> = {
   ISSUE: 'ISSUE',
   ISSUE_PRELEDGER: 'ISSUE (pre-ledger)',
   CONSUMPTION: 'CONSUMPTION',
-  REVERSAL: 'REVERSAL (department -> store)',
+  REVERSAL: 'REVERSAL / GIVE-BACK (department -> store)',
   CONSUMPTION_SKIP: 'CONSUMPTION (skipped — no stock moved)',
 };
 
@@ -859,6 +872,9 @@ interface IssueLogSchema {
    *  ROW of the take that closed the line (round 8b, issue-stock.ts
    *  markLedgerShelfClose), which a later undo cannot retire. */
   ledgerShelfMark: boolean;
+  /** material_returns exists (the returns module's tickets): a department
+   *  return's give-back row names its RET number from it. */
+  returns: boolean;
 }
 
 function probeSchema(db: DatabaseT.Database): IssueLogSchema {
@@ -890,13 +906,16 @@ function probeSchema(db: DatabaseT.Database): IssueLogSchema {
     const cols = db.prepare('PRAGMA table_info(requisition_issue_ledger)').all() as Array<{ name: string }>;
     ledgerShelfMark = cols.some(c => String(c.name) === 'shelf_mark');
   } catch { ledgerShelfMark = false; }
-  return { deptLedger, deptTrace, skips: has('consumption_skips'), shelfMark, ledgerShelfMark };
+  return {
+    deptLedger, deptTrace, skips: has('consumption_skips'), shelfMark, ledgerShelfMark,
+    returns: has('material_returns'),
+  };
 }
 
 /**
  * FULL / PART / OPEN against the effective quantity. On an ISSUE row that
  * effective quantity is the SNAPSHOT taken at issue time — see the header.
- * A negative issued figure is a reversal (undo / store reject) and gets no
+ * A negative issued figure is a reversal (an undo or a lowered issued figure) and gets no
  * fulfilment verdict at all rather than a misleading "PART".
  *
  * FULL IS THE DESKS' OWN "COMPLETE" — THE RULE (round 8). Both desks and both
@@ -1216,6 +1235,21 @@ function buildUnion(f: {
         TRIM('issue reason: ' || COALESCE(l.reason, '')
              || CASE WHEN COALESCE(l.store_mapped, 0) = 1
                      THEN ' | store-ledger material, reconcile on the liquor rail'
+                     ELSE '' END
+             -- THE PARTY TRANSFER CORRECTION (issue-stock.ts recordPartyShelfTake):
+             -- the line re-recorded to what its transfer took off the shelf. A
+             -- party line, so the row moves no stock; a NEGATIVE one (round 10: up
+             -- to the whole untaken remainder, e.g. 20 to 15 kg = minus 5,000 g, where
+             -- before it was half a gram) is a lowered record, never goods coming
+             -- back, and the department ledger has no give-back for it.
+             || CASE WHEN COALESCE(l.reason, '') = 'party_shelf' AND COALESCE(l.recorded_recipe_qty, 0) < 0
+                     THEN ' | party transfer correction, NOT a give-back: the central store could not cover what '
+                          || 'this line recorded, so the transfer took what the store had left of the item and the '
+                          || 'line was lowered to what actually left the shelf. Nothing came back from the department'
+                     WHEN COALESCE(l.reason, '') = 'party_shelf' AND COALESCE(l.recorded_recipe_qty, 0) > 0
+                     THEN ' | party transfer correction: the transfer took what the central store had left of '
+                          || 'the item, more than this line recorded, so the line was raised to what actually '
+                          || 'left the shelf'
                      ELSE '' END)                         AS notes,
         COALESCE(r.req_number, '')                        AS req_number,
         l.req_item_id                                     AS req_item_id,
@@ -1293,7 +1327,13 @@ function buildUnion(f: {
         COALESCE(ri.chef_approved_qty, ri.quantity_requested, 0) AS effective_qty,
         COALESCE(ri.quantity_issued, 0)                   AS issued_qty,
         1                                                 AS snapshot_factor,
-        ''                                                AS status,
+        -- The LINE's rejection, as on its REQUISITION row (final pass): this
+        -- row's still-open is the line's balance NOW, and on a rejected line
+        -- that balance is not owed — the page says "rejected", not "still
+        -- open". '' on every other line, as before.
+        CASE WHEN COALESCE(ri.is_rejected, 0) = 1 THEN 'chef_rejected'
+             WHEN COALESCE(ri.store_rejected, 0) = 1 THEN 'store_rejected'
+             ELSE '' END                                  AS status,
         ''                                                AS raised_at,
         ''                                                AS chef_approved_at,
         ''                                                AS mgmt_approved_at,
@@ -1554,12 +1594,31 @@ function buildUnion(f: {
   // TWO VIEWS OF ONE EVENT, THEREFORE. They must never be added, which is why
   // this stage carries no money (the ISSUE memo has already netted the rupees)
   // and why STAGE_BASIS.REVERSAL says so in the words printed under the card.
+  //
+  // AND ONE WRITER THAT IS NOT AN UNDO AT ALL. issue_reversal has exactly two
+  // writers: applyIssueDelta (an undo or a lowered issued figure, source
+  // 'requisition_issue', reference_id = the requisition) and return-stock.ts
+  // acceptInternalReturnLine (a department return accepted as reusable, source
+  // 'material-return', reference_id = the material_returns ticket). The second
+  // writes NO requisition_issue_ledger row — its central half is a positive
+  // 'requisition_issue' inventory row, which no stage here lists — so this row
+  // is the return's only appearance in the log, and the row's own words must
+  // not send the reader to an ISSUE row that does not exist. Told apart by
+  // the source column where it exists, and by whether the reference is a
+  // requisition (or a return ticket) where it does not.
   if (want('reversal', reqChain && f.schema.deptLedger)) {
     stages.push('REVERSAL');
     // req_item_id is one of the additive columns. Without it the row still
     // reports the movement honestly; it just cannot name the requisition LINE,
     // so the link key degrades to the requisition header.
     const revLine = f.schema.deptTrace ? `COALESCE(dmt.req_item_id, '')` : `''`;
+    const revSource = f.schema.deptTrace ? `COALESCE(dmt.source, '')` : `''`;
+    // The return ticket's RET number, so a return's row names its document
+    // (the ledger note carries it only when the counter typed no note).
+    const revRet = f.schema.returns
+      ? `(SELECT NULLIF(TRIM(mr.ret_number), '') FROM material_returns mr WHERE mr.id = dmt.reference_id)`
+      : `NULL`;
+    const revIsReturn = `(${revSource} = 'material-return' OR ${revRet} IS NOT NULL)`;
     parts.push(`
       SELECT
         'REVERSAL'                                        AS stage,
@@ -1567,13 +1626,16 @@ function buildUnion(f: {
         dmt.id                                            AS row_id,
         substr(dmt.created_at, 1, 10)                     AS date,
         COALESCE(dmt.created_at, '')                      AS at,
-        COALESCE(rq.req_number, '')                       AS doc_no,
+        -- The requisition on an undo; the RET ticket on a department return.
+        COALESCE(NULLIF(rq.req_number, ''), ${revRet}, '') AS doc_no,
         -- THE SAME KEY SHAPE AS ITS ISSUE, on purpose: filter or sort by the
         -- link key and a line's issue and its undo sit together, which is the
-        -- whole point of asking for the reversal in the log.
+        -- whole point of asking for the reversal in the log. A return answers
+        -- to its ticket, not to any requisition line (department stock is
+        -- pooled), so its key is the RET number.
         CASE WHEN ${revLine} <> ''
              THEN COALESCE(rq.req_number, '') || '#' || ${revLine}
-             ELSE COALESCE(rq.req_number, '') END         AS link_raw,
+             ELSE COALESCE(NULLIF(rq.req_number, ''), ${revRet}, '') END AS link_raw,
         ''                                                AS ref_no,
         COALESCE(dmt.material_id, '')                     AS material_id,
         COALESCE(rm.name, '(unknown item)')               AS material,
@@ -1595,7 +1657,8 @@ function buildUnion(f: {
         NULL                                              AS value,
         -- A reversal row is only ever written when the stock actually moved:
         -- applyIssueDelta calls postDeptLedger inside its stockQty-non-zero
-        -- branch, so there is no such thing as a recorded-but-unmoved reversal.
+        -- branch, and a reusable return credits central in the same breath, so
+        -- there is no such thing as a recorded-but-unmoved reversal.
         1                                                 AS stock_moved,
         ''                                                AS skip_reason,
         0                                                 AS needs_unit_review,
@@ -1609,8 +1672,15 @@ function buildUnion(f: {
         ''                                                AS mgmt_approved_at,
         COALESCE(dmt.user, '')                            AS actor,
         TRIM(COALESCE(dmt.notes, '')
-             || ' | returned to the central store; the ISSUE stage carries the '
-             || 'same give-back as a negative row — do not count it twice') AS notes,
+             || CASE
+                  WHEN ${revIsReturn}
+                    THEN ' | a department return marked reusable, back in the central store; '
+                         || 'it has no ISSUE row, so this is its only place in this log'
+                  WHEN rq.id IS NOT NULL OR ${revSource} = 'requisition_issue'
+                    THEN ' | returned to the central store by an undo or a lowered issued figure; '
+                         || 'the ISSUE stage carries the same give-back as a negative row — do not count it twice'
+                  ELSE ' | returned to the central store'
+                END)                                      AS notes,
         COALESCE(rq.req_number, '')                       AS req_number,
         ${revLine}                                        AS req_item_id,
         COALESCE(rm.unit, '')                             AS rm_unit,
@@ -2089,9 +2159,8 @@ export const ISSUE_LOG_COLUMNS: IssueLogColumn[] = [
   { key: 'requested_qty',     label: 'Requested', numeric: true },
   { key: 'effective_qty',     label: 'Approved / Effective', numeric: true },
   { key: 'issued_qty',        label: 'Issued To Date', numeric: true },
-  // The purchase-unit figure FIRST (owner rule, round 10), then the row's own:
   // 'Still Open' stays in the row's unit (the Unit column), as it always was.
-  { key: 'still_open_purchase', label: 'Still Open (purchase units)', numeric: true },
+  // Its purchase-unit restatement is the LAST column — see the end of the list.
   { key: 'still_open',        label: 'Still Open', numeric: true },
   { key: 'needs_unit_review', label: 'Needs Unit Review' },
   { key: 'status',            label: 'Document Status' },
@@ -2102,6 +2171,14 @@ export const ISSUE_LOG_COLUMNS: IssueLogColumn[] = [
   { key: 'mgmt_approved_at',  label: 'Mgmt Approved At' },
   { key: 'actor',             label: 'By' },
   { key: 'notes',             label: 'Notes' },
+  // APPENDED, NEVER INSERTED (final pass): every column production 62aa895
+  // writes keeps its position, so a sheet or template that reads the mailed
+  // CSV by column position reads every old column where it always was. The
+  // route's totals block looks its columns up by key (colIndex), so it is
+  // indifferent to the order. 'Still Open' above is the row's own unit; this
+  // is the same balance in PURCHASE units (owner rule), null on an ambiguous
+  // line unit.
+  { key: 'still_open_purchase', label: 'Still Open (purchase units)', numeric: true },
 ];
 
 /**
