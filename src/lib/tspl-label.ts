@@ -245,12 +245,14 @@ function layoutLabel(
   let bh = clamp(Math.round(design.barcode_height), 20, 90);
   // A name cut short beside the QR steps the title down a size first.
   while (tm > 1 && truncated(build(tm, fm, bh).nameLines)) tm--;
-  // Then shrink to stay inside the safe area: rows first, then barcode, then title.
-  let guard = 30;
+  // Then shrink to stay inside the safe area: rows first, then the barcode down to
+  // 40 dots (5 mm — the least a handheld 1-D scanner reads in one easy pass), then
+  // the title down to ×1, and only then the barcode below 5 mm as a last resort.
+  let guard = 40;
   while (build(tm, fm, bh).height > usableH && guard-- > 0) {
     if (fm > 1) fm--;
-    else if (bh > 40) bh -= 6;
-    else if (tm > 2) tm--;
+    else if (bh > 40) bh = Math.max(40, bh - 6);
+    else if (tm > 1) tm--;
     else if (bh > 24) bh -= 4;
     else break;
   }
@@ -365,7 +367,9 @@ export function buildTSPL(batch: LabelBatch, opts: BuildTSPLOptions = {}): strin
     const by = Math.min(y + 4, maxBy);
     const humanReadable = design.show_barcode_text ? 1 : 0;
     // BARCODE x,y,"128",height,human-readable,rotation,narrow,wide,"content"
-    lines.push(`BARCODE ${M},${by},"128",${barcodeH},${humanReadable},0,2,2,"${tsplEscape(barcodeVal)}"`);
+    // Starts 1 mm further in than the text so the bars get a ≥2.5 mm quiet zone
+    // (label edge + margin) — handheld scanners miss a code with no clear lead-in.
+    lines.push(`BARCODE ${M + 8},${by},"128",${barcodeH},${humanReadable},0,2,2,"${tsplEscape(barcodeVal)}"`);
   }
 
   // Optional QR on the right side, inset by the 2 mm margin (top & right).
