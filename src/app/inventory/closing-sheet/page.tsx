@@ -35,6 +35,11 @@
  * non-admin those keys never arrive, so the columns are not rendered at all.
  * `data.is_admin` (server-decided) is the only switch; there is no client-side
  * role guess anywhere on this page.
+ * "System" is the DEPARTMENT's own books, computed by the API from the
+ * department ledger (just before the count on a counted row) — not the central
+ * store's current_stock, which is a different shelf. The column used to say
+ * "(central)" and showed Kitchen +7 kg / ₹2,100 against a ledger that matched
+ * its count exactly.
  *
  * ── BULK FILE ROUND-TRIP (blank template → upload → history) ───────────────
  * Three additive controls sit in their own strip, deliberately NOT beside the
@@ -98,8 +103,15 @@ interface SheetItem {
   value: number | null;
   notes: string;
   recorded_by: string;
-  /** Admin-only — absent from the payload for everyone else. */
+  /** Admin-only — absent from the payload for everyone else. system_stock is
+   *  the DEPARTMENT's own books (RECIPE units) — just before the count on a
+   *  counted row, at the end of the day otherwise — never the central store.
+   *  NULL = nothing on this department's books for the item. */
   system_stock?: number | null;
+  /** How the books figure was reached: 'counted' (its last count or cut-over
+   *  opening plus every movement since), 'ledger_total' (never counted —
+   *  everything its ledger took in minus what it gave out), 'none'. */
+  system_basis?: 'counted' | 'ledger_total' | 'none' | string;
   variance?: number | null;
   variance_value?: number | null;
 }
@@ -183,6 +195,14 @@ const RATE_LABEL: Record<string, string> = {
 };
 
 const BLIND_NOTE = 'System stock and variance are admin-only (blind count).';
+
+/** What the admin's System column is — the department's own books, never the
+ *  central store (whose shelf a department count is not a count of). */
+const SYSTEM_TITLE =
+  "This department's own books (the same figure as Department Stock and the transfer screens): "
+  + 'on a counted row, what they held just before the count — its last count or cut-over opening '
+  + 'plus every issue, delivery, transfer and use since; on an uncounted row, what they hold at the '
+  + 'end of this day. Variance = physical count − this figure.';
 
 /**
  * Calendar arithmetic on an IST date-only string ("YYYY-MM-DD"). Built from
@@ -992,7 +1012,12 @@ export default function ClosingSheetPage() {
                       <th className="text-left font-semibold px-3 py-2 min-w-[90px]">Category</th>
                       {/* Blind count: rendered only when the API says admin. For
                           everyone else these keys never arrive at all. */}
-                      {isAdmin && <th className="text-right font-semibold px-3 py-2 min-w-[100px]">System <span className="font-normal text-[9px] text-[#B9A896]">(central)</span></th>}
+                      {isAdmin && (
+                        <th className="text-right font-semibold px-3 py-2 min-w-[100px]"
+                            title={SYSTEM_TITLE}>
+                          System <span className="font-normal text-[9px] text-[#B9A896]">(dept books)</span>
+                        </th>
+                      )}
                       <th className="text-left font-semibold px-3 py-2 min-w-[170px]">Physical count</th>
                       <th className="text-right font-semibold px-3 py-2 min-w-[110px]">Rate</th>
                       <th className="text-right font-semibold px-3 py-2 min-w-[90px] bg-[#FBE7D3]">Value</th>
@@ -1033,8 +1058,20 @@ export default function ClosingSheetPage() {
                           {isAdmin && (
                             <td className="px-3 py-1.5 text-right tabular-nums text-[#6B5744]">
                               {it.system_stock == null
-                                ? <span className="text-[#B9A896]">{EM}</span>
-                                : <Qty d={dualQty(it.system_stock, meta)} meta={meta} />}
+                                ? <span className="text-[#B9A896]" title="Nothing is on this department's books for this item.">{EM}</span>
+                                : <>
+                                    <Qty d={dualQty(it.system_stock, meta)} meta={meta} />
+                                    {/* No count or opening before this one: the
+                                        figure is the ledger's in-minus-out total,
+                                        which cannot see use booked to another
+                                        department. */}
+                                    {it.system_basis === 'ledger_total' && (
+                                      <div className="text-[9px] text-[#B8A590]"
+                                           title="This department has no earlier count or cut-over opening for this item, so its books are everything its ledger took in minus everything it gave out.">
+                                        no earlier count · ledger total
+                                      </div>
+                                    )}
+                                  </>}
                             </td>
                           )}
 
@@ -1085,7 +1122,10 @@ export default function ClosingSheetPage() {
                             <td className={`px-3 py-1.5 text-right tabular-nums ${
                               it.variance == null ? '' : it.variance < 0 ? 'text-red-700' : it.variance > 0 ? 'text-emerald-700' : 'text-[#6B5744]'}`}>
                               {it.variance == null
-                                ? <span className="text-[#B9A896]" title="Recorded once the count is saved.">{EM}</span>
+                                ? <span className="text-[#B9A896]"
+                                        title={it.counted
+                                          ? "Nothing was on this department's books for this item before the count, so there is nothing to compare it with."
+                                          : 'Shown once the count is saved.'}>{EM}</span>
                                 : <Qty d={dualQty(it.variance, meta)} meta={meta} />}
                             </td>
                           )}

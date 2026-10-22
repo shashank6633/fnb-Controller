@@ -10,6 +10,7 @@ import { packFactor, toPurchaseQty, type PackMeta } from '@/lib/pack-units';
 import { todayIST } from '@/lib/format-date';
 import { checkClosingDate } from '@/lib/closing-date';
 import { DEPT_LEDGER_ARRIVAL_TYPES_SQL } from '@/lib/dept-requested-items';
+import { cutoverAt, deptKey } from '@/lib/dept-ledger';
 
 /**
  * DEPARTMENT CLOSING SHEET — one sheet spanning every ACTIVE department, for
@@ -60,6 +61,30 @@ import { DEPT_LEDGER_ARRIVAL_TYPES_SQL } from '@/lib/dept-requested-items';
  * SERVER-SIDE for everyone else — they are never serialised into the payload,
  * so a non-admin cannot recover them from the network tab either. Rate and
  * value are COST data, not variance data, and stay visible.
+ *
+ * ── THE SYSTEM FIGURE IS THE DEPARTMENT'S OWN BOOKS (GET) ──────────────────
+ * Every row on this sheet is a DEPARTMENT row, so "System" is what that
+ * department's ledger holds — never the central store's current_stock. The
+ * stored closing_stock.system_stock / variance / variance_value of a
+ * department row ARE central figures (the POST's KNOWN LIMITATION below,
+ * unchanged — other readers depend on what a stored row means), so the GET
+ * does not print them. It reads the department ledger instead, by the same
+ * rules as dept-ledger.ts deptOnHand / deptReleasable (the figure Department
+ * Stock, Department Variance and the transfer screens show):
+ *   · a SAVED count  → the books JUST BEFORE that count: the latest earlier
+ *     count or cut-over opening, plus every movement up to the count's own
+ *     time (the floor and the transfer-leg rule exactly as deptOnHand);
+ *   · not counted    → the books as at the end of the sheet's day (today:
+ *     the books now).
+ * A pair never counted and never opened reads its all-time ledger total (what
+ * deptReleasable — the send check — uses), labelled `system_basis:
+ * 'ledger_total'`; a pair with nothing on its books at all reads NULL
+ * ('none'), never 0. variance = physical − that figure, valued by the POST's
+ * own unchanged formula (variance × average_price, ₹/recipe unit).
+ * MEASURED (owner-day, round 3): Kitchen counted 7 kg chicken against its own
+ * books of 7 kg and the sheet said "System 0 (central) · Variance +7 kg ·
+ * ₹2,100", header "Variance (admin) ₹3,510", because Direct Issue chicken never
+ * touches central. With this rule the row reads 7 / 0 / ₹0.
  *
  * GET  /api/closing-stock/dept-sheet?date=YYYY-MM-DD
  * POST /api/closing-stock/dept-sheet
@@ -127,6 +152,141 @@ interface CountRow {
   total_value: number | null;
   notes: string | null;
   recorded_by: string | null;
+  created_at: string | null;
+}
+
+/* ── THE DEPARTMENT'S BOOKS (admin "System" column) ────────────────────────
+ * See "THE SYSTEM FIGURE IS THE DEPARTMENT'S OWN BOOKS" in the header. This is
+ * deptOnHand's arithmetic with an AS-OF cut, because the sheet must show the
+ * books BEFORE a saved count and deptOnHand only answers "now, anchored on the
+ * latest count" (which, once the count is saved, IS the count).
+ *
+ * The three time helpers are BYTE-FOR-BYTE COPIES of dept-ledger.ts (normTs /
+ * istDayEndUtc / countAnchorAt), module-private there — the same copy
+ * /api/department-variance carries, under the same rule: change one, change
+ * every copy, or a count silently moves half a day.
+ * ──────────────────────────────────────────────────────────────────────────*/
+
+function normTs(v: unknown): string {
+  const s = String(v ?? '').trim();
+  if (!s) return '';
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return `${s} 00:00:00`;
+  return s.slice(0, 19).replace('T', ' ');
+}
+
+function istDayEndUtc(date: string): string {
+  return `${String(date || '').slice(0, 10)} 18:29:59`;
+}
+
+function countAnchorAt(date: string, createdAt: string): string {
+  const dayEnd = istDayEndUtc(date);
+  const saved = normTs(createdAt);
+  return saved && saved < dayEnd ? saved : dayEnd;
+}
+
+const r6 = (n: number) => Math.round((Number(n) || 0) * 1e6) / 1e6;
+
+/** How the System figure was reached. Admin-only, beside system_stock. */
+type BooksBasis = 'counted' | 'ledger_total' | 'none';
+interface BooksFigure { qty: number | null; basis: BooksBasis }
+
+interface BooksAnchor { qty: number; at: string; source: 'count' | 'opening'; rowid: number | null }
+interface BooksMove { at: string; rid: number; q: number; leg: boolean }
+
+/**
+ * Loads every count, opening row and movement of the sheet's departments ONCE
+ * (no outlet filter — the department ledger has none, exactly as
+ * deptOnHandBulk) and returns a per-pair as-of reader.
+ *
+ *   booksAt(dept, mat, cut, strict)
+ *     cut     the moment the books are read at (ledger UTC basis)
+ *     strict  true = the reading is for a SAVED count whose own anchor time is
+ *             `cut`: that count (and any count at the same instant) is not its
+ *             own baseline, so only counts strictly before `cut` anchor.
+ *
+ *   anchor  = the LATER of the newest qualifying count and the newest cut-over
+ *             opening at or before `cut`; a tie goes to the COUNT (deptOnHand).
+ *   window  = MAX(anchor, cut-over floor), strict `>`, rowid tie-break for an
+ *             opening anchor — and up to `cut` INCLUSIVE (a count absorbs what
+ *             was booked at or before its own time; deptOnHand's next window
+ *             starts strictly after it).
+ *   legs    = transfer_out / transfer_in bounded by the ANCHOR only, never the
+ *             floor ("A TRANSFER PAIR IS NEVER SPLIT", deptOnHand).
+ *   never counted, never opened → the all-time signed ledger total up to `cut`
+ *             (deptReleasable's figure for the send check); nothing on the
+ *             ledger at all → NULL, never 0.
+ */
+function departmentBooks(db: ReturnType<typeof getDb>, deptIds: string[]) {
+  const deptJson = JSON.stringify(deptIds);
+  const floor = cutoverAt(db);
+  const counts = new Map<string, BooksAnchor[]>();
+  const openings = new Map<string, BooksAnchor[]>();
+  const moves = new Map<string, BooksMove[]>();
+  const push = <T,>(m: Map<string, T[]>, k: string, v: T) => {
+    const l = m.get(k); if (l) l.push(v); else m.set(k, [v]);
+  };
+  try {
+    for (const c of db.prepare(`
+      SELECT department_id, material_id, physical_stock, date, created_at
+        FROM closing_stock
+       WHERE department_id IN (SELECT value FROM json_each(?))
+    `).all(deptJson) as Array<{ department_id: string; material_id: string; physical_stock: number; date: string; created_at: string }>) {
+      push(counts, deptKey(String(c.department_id), String(c.material_id)), {
+        qty: num(c.physical_stock), at: countAnchorAt(String(c.date || ''), String(c.created_at || '')),
+        source: 'count', rowid: null,
+      });
+    }
+  } catch { /* counts unreadable — pairs fall back to their ledger */ }
+  try {
+    for (const r of db.prepare(`
+      SELECT rowid AS rid, department_id, material_id, type, quantity,
+             REPLACE(SUBSTR(created_at, 1, 19), 'T', ' ') AS at
+        FROM department_material_transactions
+       WHERE department_id IN (SELECT value FROM json_each(?))
+    `).all(deptJson) as Array<{ rid: number; department_id: string; material_id: string; type: string; quantity: number; at: string }>) {
+      const k = deptKey(String(r.department_id), String(r.material_id));
+      const at = String(r.at || '');
+      if (r.type === 'opening') {
+        push(openings, k, { qty: num(r.quantity), at, source: 'opening', rowid: Number(r.rid) || 0 });
+      } else {
+        push(moves, k, {
+          at, rid: Number(r.rid) || 0, q: num(r.quantity),
+          leg: r.type === 'transfer_out' || r.type === 'transfer_in',
+        });
+      }
+    }
+  } catch { /* ledger unreadable — every pair reads 'none', which is honest */ }
+
+  return function booksAt(deptId: string, matId: string, cut: string, strict: boolean): BooksFigure {
+    const k = deptKey(deptId, matId);
+    let anchor: BooksAnchor | null = null;
+    for (const c of counts.get(k) || []) {
+      if (strict ? !(c.at < cut) : !(c.at <= cut)) continue;
+      if (!anchor || c.at >= anchor.at) anchor = c;
+    }
+    for (const o of openings.get(k) || []) {
+      if (!(o.at <= cut)) continue;
+      // The later anchor wins; on a tie the COUNT wins over an opening, and
+      // between two openings the later row (deptOnHand's latestOpening).
+      if (!anchor || o.at > anchor.at
+          || (o.at === anchor.at && anchor.source === 'opening' && (o.rowid ?? 0) > (anchor.rowid ?? 0))) anchor = o;
+    }
+    const ms = (moves.get(k) || []).filter(m => m.at <= cut);
+    if (!anchor) {
+      if (ms.length === 0) return { qty: null, basis: 'none' };
+      return { qty: r6(ms.reduce((s, m) => s + m.q, 0)), basis: 'ledger_total' };
+    }
+    const windowFrom = anchor.at > floor ? anchor.at : floor;
+    const tie = anchor.source === 'opening' && windowFrom === anchor.at ? anchor.rowid : null;
+    const legTie = anchor.source === 'opening' ? anchor.rowid : null;
+    let sum = 0;
+    for (const m of ms) {
+      const inWindow = m.at > windowFrom || (tie != null && m.at === windowFrom && m.rid > tie)
+        || (m.leg && (m.at > anchor.at || (legTie != null && m.at === anchor.at && m.rid > legTie)));
+      if (inWindow) sum += m.q;
+    }
+    return { qty: r6(anchor.qty + sum), basis: 'counted' };
+  };
 }
 
 /* ── GET ──────────────────────────────────────────────────────────────────── */
@@ -293,7 +453,8 @@ export async function GET(request: Request) {
              cs.rate_source                    AS rate_source,
              cs.total_value                    AS total_value,
              cs.notes                          AS notes,
-             cs.recorded_by                    AS recorded_by
+             cs.recorded_by                    AS recorded_by,
+             cs.created_at                     AS created_at
         FROM closing_stock cs
        WHERE cs.date = ? AND ${OUTLET_SCOPE}
        ORDER BY cs.created_at ASC
@@ -304,6 +465,13 @@ export async function GET(request: Request) {
 
     // ONE purchase lookup for the whole sheet (1,079 live rows today).
     const rates = rateMap(db);
+
+    // ADMIN ONLY: the department's own books, for the System / Variance
+    // columns (see the header). Never even loaded for a blind count.
+    const booksAt = isAdmin ? departmentBooks(db, depts.map(d => d.id)) : null;
+    // An uncounted row reads the books at the END of the sheet's day — for
+    // today, the books now (nothing can be booked after today's day-end).
+    const sheetCut = istDayEndUtc(date);
 
     const byDept = new Map<string, MatRow[]>();
     for (const m of matRows) {
@@ -359,11 +527,28 @@ export async function GET(request: Request) {
           if (rateSource === 'none') val = null;
         }
 
+        // ── THE DEPARTMENT'S BOOKS (admin) ── never the stored central
+        // system_stock; see the header. A saved count is measured against the
+        // books just BEFORE it; an uncounted row shows the books at day-end.
+        let books: BooksFigure = { qty: null, basis: 'none' };
+        let rowVariance: number | null = null;
+        let rowVarianceValue: number | null = null;
+        if (booksAt) {
+          books = saved
+            ? booksAt(d.id, m.material_id, countAnchorAt(date, String(saved.created_at || '')), true)
+            : booksAt(d.id, m.material_id, sheetCut, false);
+          if (saved && books.qty !== null) {
+            // The POST's own arithmetic, against the department's books.
+            rowVariance = Math.round((num(saved.physical_stock) - books.qty) * 1000) / 1000;
+            rowVarianceValue = Math.round(rowVariance * num(m.average_price) * 100) / 100;
+          }
+        }
+
         items++;
         if (saved) {
           counted++;
           if (val === null) unpriced++; else value += val;
-          variance += num(saved.variance_value);
+          variance += rowVarianceValue ?? 0;
         }
 
         return {
@@ -387,13 +572,16 @@ export async function GET(request: Request) {
           value: val,
           notes: saved?.notes || '',
           recorded_by: saved?.recorded_by || '',
-          // ── BLIND COUNT ── admin-only. For a non-admin these three keys are
+          // ── BLIND COUNT ── admin-only. For a non-admin these keys are
           // literally absent from the JSON, not merely hidden by CSS.
+          // system_stock = the DEPARTMENT's books (RECIPE units), NULL when
+          // nothing is on them; system_basis says how it was reached.
           ...(isAdmin
             ? {
-                system_stock: saved ? num(saved.system_stock) : num(m.current_stock),
-                variance: saved ? num(saved.variance) : null,
-                variance_value: saved ? num(saved.variance_value) : null,
+                system_stock: books.qty,
+                system_basis: books.basis,
+                variance: rowVariance,
+                variance_value: rowVarianceValue,
               }
             : {}),
         };
@@ -623,6 +811,10 @@ export async function POST(request: Request) {
         // directly comparable to it. Changing that would change what every
         // existing count means; approveVariance() already refuses to move
         // central stock for a departmental central count.
+        // The STORED figures stay as they always were. What THIS sheet SHOWS
+        // is different: its GET never prints the stored system/variance of a
+        // department row — it measures the count against the department's own
+        // books (see "THE SYSTEM FIGURE IS THE DEPARTMENT'S OWN BOOKS").
         const systemStock = Number(material.current_stock) || 0;
         const variance = Math.round((physicalStock - systemStock) * 1000) / 1000;
         // UNCHANGED rupee formula (variance x average_price, Rs/recipe unit).

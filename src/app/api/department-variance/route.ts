@@ -212,13 +212,22 @@ interface Buckets {
    *  POSITIVE magnitudes like every out-leg here; `net` keeps the sign. */
   transfer_in: number;
   transfer_out: number;
+  /** VENDOR → DEPARTMENT, straight past central (Settings → Direct Issue):
+   *  'direct_receipt' minus its undo 'direct_receipt_reversal' (a GRN void or a
+   *  downward bill amendment). SIGNED, like the nets — a reversal can land in
+   *  the window after its receipt fell outside it. Its OWN bucket, never
+   *  issued_in (central issued nothing; that column is the requisition rail)
+   *  and never other_net: filed under the catch-all, Kitchen's 10 kg chicken
+   *  delivery read "Issued in: 0 kg" with the 10 kg hidden in a tooltip as
+   *  "Adjustments/party (net)" — a delivery named as a correction. */
+  delivered_direct: number;
   other_net: number;
   net: number;
 }
 const emptyBuckets = (): Buckets => ({
   issued_in: 0, consumption: 0, wastage: 0, staff_meal: 0,
   reversals_out: 0, adjustments_net: 0, party_net: 0,
-  transfer_in: 0, transfer_out: 0, other_net: 0, net: 0,
+  transfer_in: 0, transfer_out: 0, delivered_direct: 0, other_net: 0, net: 0,
 });
 
 /** Not exported: a route module's export surface is validated by Next, and a
@@ -566,6 +575,10 @@ export async function GET(request: Request) {
           // Magnitudes, like the out-legs above; the sign lives in `net`.
           case 'transfer_in':    b.transfer_in     += row.q;  break;
           case 'transfer_out':   b.transfer_out    += -row.q; break;
+          // Vendor delivery booked straight onto this department, and its
+          // undo. Signed (the undo row is negative) — see Buckets.
+          case 'direct_receipt':
+          case 'direct_receipt_reversal': b.delivered_direct += row.q; break;
           default:               b.other_net       += row.q;  break;   // unknown type — visible, never dropped
         }
       }
@@ -732,6 +745,12 @@ export async function GET(request: Request) {
         ...(b.transfer_in !== 0 || b.transfer_out !== 0
           ? { transfer_in: r4(b.transfer_in), transfer_out: r4(b.transfer_out) }
           : {}),
+        // Same rule: only on a row that HAS a Direct Issue delivery (or its
+        // undo) in the window, so a building without one gets production's
+        // payload key for key. Absent means zero. It used to sit inside
+        // other_net, so other_net is lower by exactly this much and `net` is
+        // unchanged — every bucket still adds up to net_movement_since_cutover.
+        ...(b.delivered_direct !== 0 ? { delivered_direct: r4(b.delivered_direct) } : {}),
         other_net: r4(b.other_net),
         net_movement_since_cutover: r4(b.net),
 

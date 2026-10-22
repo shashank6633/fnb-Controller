@@ -67,6 +67,15 @@
  *                 or the signed-net tooltip would misname it. signedNets() below
  *                 therefore does NOT include them (the API no longer files them
  *                 under other_net either).
+ *   delivered direct  vendor deliveries booked STRAIGHT onto this department
+ *                 under a Direct Issue rule (Settings → Direct Issue), net of
+ *                 any voided or amended-back delivery. Signed, present only on a
+ *                 row that has one. Its OWN column, shown only when the table
+ *                 holds one: the store issued none of it, so it is not
+ *                 "Issued in", and it is a delivery, not an adjustment — under
+ *                 the old catch-all a 10 kg chicken delivery read "Issued in:
+ *                 0 kg" with the 10 kg named "Adjustments/party (net)" in a
+ *                 tooltip. signedNets() does NOT include it.
  *   ledger_balance the department's holding now, anchored on its latest count.
  *   last_count    the physical count the difference is measured at.
  *   difference    expected_at_count − last_count. Signed. Only when state='ok'.
@@ -154,6 +163,9 @@ interface Row {
    *  transfer (absent = 0) — read through transfersIn()/transfersOut(). */
   transfer_in?: number;
   transfer_out?: number;
+  /** Vendor → this department via Direct Issue, net of voids. SIGNED. ABSENT
+   *  on a row with none (absent = 0) — read through deliveredDirect(). */
+  delivered_direct?: number;
   other_net: number;
   net_movement_since_cutover: number;
 
@@ -260,6 +272,9 @@ const signedNets = (r: Row) => (r.adjustments_net || 0) + (r.party_net || 0) + (
 const transfersIn = (r: Row) => r.transfer_in || 0;
 const transfersOut = (r: Row) => r.transfer_out || 0;
 const hasTransfer = (r: Row) => Math.abs(transfersIn(r)) > EPS || Math.abs(transfersOut(r)) > EPS;
+/** Vendor → department via Direct Issue, net of voids; 0 when the key is absent. */
+const deliveredDirect = (r: Row) => r.delivered_direct || 0;
+const hasDirect = (r: Row) => Math.abs(deliveredDirect(r)) > EPS;
 
 /** THE SIGN, IN ONE PLACE. difference = expected − counted, so positive means
  *  the count came in BELOW what the ledger expects. Everything user-facing
@@ -441,6 +456,9 @@ export default function DepartmentVariancePage() {
    *  a column appear and vanish under the reader. A building that has never
    *  transferred sees exactly the table and the CSV it always saw. */
   const showTransfers = useMemo(() => rows.some(hasTransfer), [rows]);
+  /** The Delivered direct column — same rule: only while the selection holds a
+   *  Direct Issue delivery, so a building without one sees its usual table. */
+  const showDirect = useMemo(() => rows.some(hasDirect), [rows]);
 
   /** Stations the owner should actually act on. liquor and kitchen are unmapped
    *  BY DESIGN (liquor is the store rail; 'kitchen' is kot-fire's blank-station
@@ -506,7 +524,10 @@ export default function DepartmentVariancePage() {
   const exportCsv = () => {
     if (visible.length === 0) return;
     const headers = ['department', 'item', 'sku', 'category', 'purchase_unit',
-                     'opening', 'issued_in', 'recipe_use', 'other_out', 'signed_net_adjustments',
+                     'opening', 'issued_in',
+                     // Only when the selection holds a Direct Issue delivery — see showDirect.
+                     ...(showDirect ? ['delivered_direct'] : []),
+                     'recipe_use', 'other_out', 'signed_net_adjustments',
                      // Only when the selection holds a transfer — see showTransfers.
                      ...(showTransfers ? ['transferred_in', 'transferred_out'] : []),
                      'on_hand', 'counted', 'counted_on', 'expected_at_count',
@@ -520,7 +541,9 @@ export default function DepartmentVariancePage() {
       const comparable = r.difference_state === 'ok' && r.difference != null;
       lines.push([
         r.department_name, r.material_name, r.material_sku || '', r.category || '', puLabel(r),
-        pu(r, r.opening), pu(r, r.issued_in), pu(r, r.consumption), pu(r, otherOut(r)),
+        pu(r, r.opening), pu(r, r.issued_in),
+        ...(showDirect ? [pu(r, deliveredDirect(r))] : []),
+        pu(r, r.consumption), pu(r, otherOut(r)),
         pu(r, signedNets(r)),
         ...(showTransfers ? [pu(r, transfersIn(r)), pu(r, transfersOut(r))] : []),
         pu(r, r.ledger_balance), pu(r, r.last_count), r.last_count_date || '',
@@ -799,6 +822,10 @@ export default function DepartmentVariancePage() {
                 <div className="mt-2 grid grid-cols-2 gap-x-3 gap-y-1 text-[10px] text-[#6B5744]">
                   <span>Opening: {r.opening == null ? <Dash /> : <>{inPU(r, r.opening)} {puLabel(r)}</>}</span>
                   <span>Issued in: {inPU(r, r.issued_in)} {puLabel(r)}</span>
+                  {/* Only on a row that has one — see showDirect. */}
+                  {hasDirect(r) && (
+                    <span>Delivered direct: {inPU(r, deliveredDirect(r))} {puLabel(r)}</span>
+                  )}
                   <span>Recipe use: {inPU(r, r.consumption)} {puLabel(r)}</span>
                   <span>Other out: {inPU(r, otherOut(r))} {puLabel(r)}</span>
                   {/* Only on a row that has one — a card with no transfer
@@ -829,6 +856,12 @@ export default function DepartmentVariancePage() {
                   <th className="text-left  py-2 px-3 font-medium">Item</th>
                   <th className="text-right py-2 px-3 font-medium">Opening</th>
                   <th className="text-right py-2 px-3 font-medium">Issued in</th>
+                  {showDirect && (
+                    <th className="text-right py-2 px-3 font-medium whitespace-nowrap"
+                        title="Vendor deliveries booked straight onto this department under a Direct Issue rule (Settings → Direct Issue), less any voided or amended-back delivery. The store issued none of it.">
+                      Delivered direct
+                    </th>
+                  )}
                   <th className="text-right py-2 px-3 font-medium">Recipe use</th>
                   <th className="text-right py-2 px-3 font-medium">Other out</th>
                   {showTransfers && (
@@ -862,6 +895,16 @@ export default function DepartmentVariancePage() {
                       {inPU(r, r.issued_in)} {puLabel(r)}
                       {recipeHint(r, r.issued_in) && <span className="block text-[9px] text-[#B8A590]">{recipeHint(r, r.issued_in)}</span>}
                     </td>
+                    {/* Vendor → this department via Direct Issue, net of voids.
+                        A dash on a row with none. */}
+                    {showDirect && (
+                      <td className="py-1.5 px-3 text-right font-mono text-xs">
+                        {hasDirect(r) ? <>
+                          {inPU(r, deliveredDirect(r))} {puLabel(r)}
+                          {recipeHint(r, deliveredDirect(r)) && <span className="block text-[9px] text-[#B8A590]">{recipeHint(r, deliveredDirect(r))}</span>}
+                        </> : <Dash />}
+                      </td>
+                    )}
                     <td className="py-1.5 px-3 text-right font-mono text-xs">
                       {inPU(r, r.consumption)} {puLabel(r)}
                       {recipeHint(r, r.consumption) && <span className="block text-[9px] text-[#B8A590]">{recipeHint(r, r.consumption)}</span>}

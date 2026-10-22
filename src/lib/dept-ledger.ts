@@ -1424,6 +1424,13 @@ function sinceAnchorFigure(db: Database.Database, deptId: string, matId: string,
  * (decision D), the transfer leg stays in it ("A TRANSFER PAIR IS NEVER
  * SPLIT"), so the books read −2 kg against a 3 kg shelf until Tandoori is
  * counted again. This only EXPLAINS that figure; the rule is unchanged.
+ *
+ * Owner's ruling #59: the cutover in that story is now REFUSED, writing
+ * nothing (cutover route, checkBelowZero) — no cutover may put a department
+ * below zero. The note still has work: a first cutover that only LOWERS a
+ * figure (5 kg → 1 kg) is allowed, and a count backdated past the floor after
+ * it was stamped opens the same gap; both read here as a figure below the
+ * count plus every movement since it, and this says why.
  */
 function floorHiddenNote(db: Database.Database, deptId: string, deptName: string, m: TransferMaterial, available: number): string {
   try {

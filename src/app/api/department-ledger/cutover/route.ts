@@ -1,7 +1,7 @@
 import type Database from 'better-sqlite3';
 import { getDb, logAuditEvent } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
-import { postDeptLedger, deptOnHand, deptSendableFor, cutoverAt } from '@/lib/dept-ledger';
+import { postDeptLedger, deptOnHand, deptSendableFor, deptSendableBulk, cutoverAt } from '@/lib/dept-ledger';
 import { isStoreMappedMaterial } from '@/lib/store-engine';
 import { packFactor } from '@/lib/pack-units';
 
@@ -73,6 +73,13 @@ import { packFactor } from '@/lib/pack-units';
  * label reads. Later departments cut over later and simply anchor later; the
  * floor never moves again. Re-stamping it would retroactively delete movement
  * from every department that went first.
+ *
+ * ── NEVER BELOW ZERO (owner's ruling #59) ──────────────────────────────────
+ * A cutover that would put any department's balance or transfer send figure
+ * below zero is REFUSED (409 CUTOVER_WOULD_GO_NEGATIVE) and writes nothing.
+ * Only the FIRST cutover can do it — its stamp moves every department counted
+ * before it at once. See checkBelowZero() for the rule, the reads and the way
+ * out the refusal names.
  */
 
 export const dynamic = 'force-dynamic';
@@ -403,6 +410,252 @@ class AdoptRaced extends Error {
   constructor(readonly materialId: string, readonly refusal: AdoptRefusal) {
     super(`adopt refused at write time for ${materialId}: ${refusal.kind}`);
   }
+}
+
+/* ────────────────────────────────────────────────────────────────────────────
+ * RULING #59 — A CUTOVER NEVER PUTS A DEPARTMENT BELOW ZERO
+ * ──────────────────────────────────────────────────────────────────────────*/
+
+/**
+ * WHY ONLY THE FIRST CUTOVER CAN. The first successful cutover stamps the
+ * floor (THE STAMP, above) for every department at once. A department counted
+ * BEFORE that moment keeps its count as its anchor, and from then on its
+ * balance is the count + movements after the floor + its transfer legs since
+ * the count (dept-ledger deptOnHand, "A TRANSFER PAIR IS NEVER SPLIT"). So
+ * whatever it booked between its count and the stamp — other than transfers —
+ * drops out of its balance the moment the stamp lands. When that was stock
+ * coming IN and a transfer sent it on, the books go below zero against a shelf
+ * that is not. Measured (conservation verifier, targeted.cjs A2): Akan
+ * Tandoori counted 2 kg, +5 kg issued, 4 kg sent on to Akan Pizza, then the
+ * first cutover — of ANOTHER department — read Tandoori at −2 kg, send figure
+ * −2 kg, against a 3 kg shelf. Without transfer legs a stamp can only leave a
+ * count's own quantity standing (never below zero), so this refusal cannot
+ * fire on a ledger that has none — production's today.
+ *
+ * A later cutover writes only its own opening rows, each one a counted
+ * quantity that is never below zero, and moves nobody else; it is still
+ * checked (its own department) so the rule holds whatever an opening becomes.
+ *
+ * THE RULE (owner, 2026-10-22): such a cutover is REFUSED, writes NOTHING, and
+ * says the true way out — count that department again (a count taken now
+ * starts its books from the shelf, so the stamp leaves nothing out of it), or
+ * cut it over at its shelf figure (an opening written by the first cutover is
+ * its own anchor, so nothing drops out either).
+ *
+ * "PUT BELOW ZERO" = below zero after the cutover AND lower than before. A
+ * figure that was already negative and is left where it was is not this
+ * cutover's doing; refusing it would block a cutover that changes nothing for
+ * that department.
+ *
+ * HOW IT IS READ: inside the IMMEDIATE write transaction, after the openings
+ * and the stamp are written and before commit, with the ledger's OWN functions
+ * — deptSendableBulk gives the balance every screen shows and the send figure
+ * the transfer check uses — before and after. It never re-implements the
+ * window rule (that already lives in four places). Every cutover the check
+ * passes commits exactly what it committed before the check existed.
+ */
+
+/** One department's two figures for one material, RECIPE units: the balance
+ *  (NULL = never counted) and the transfer send figure. */
+interface PairFigure { departmentId: string; materialId: string; onHand: number | null; send: number }
+
+/** Every department that has a count or a ledger row — the only ones whose
+ *  figures a stamp can move. */
+function stockDepartments(db: Db): string[] {
+  return (db.prepare(`
+    SELECT department_id AS d FROM department_material_transactions
+    UNION
+    SELECT department_id AS d FROM closing_stock WHERE TRIM(COALESCE(department_id, '')) <> ''
+  `).all() as Array<{ d: string | null }>).map(r => String(r.d ?? '')).filter(Boolean);
+}
+
+function pairFigures(db: Db, deptIds: string[]): Map<string, PairFigure> {
+  const out = new Map<string, PairFigure>();
+  for (const d of deptIds) {
+    for (const [m, s] of deptSendableBulk(db, d)) {
+      out.set(`${d}\u0000${m}`, { departmentId: d, materialId: m, onHand: s.onHand == null ? null : r6(s.onHand), send: r6(s.available) });
+    }
+  }
+  return out;
+}
+
+/** One pair the cutover would put below zero — the refusal's JSON row. */
+interface BelowZeroRow {
+  department_id: string; department: string;
+  material_id: string; name: string;
+  /** What its books start from, and where that stands (19-char UTC). */
+  anchor_source: string; anchor_qty: number | null; anchor_at: string | null;
+  balance_now: number | null; balance_after: number | null;
+  send_now: number | null; send_after: number;
+  balance_goes_negative: boolean; send_goes_negative: boolean;
+  /** Non-transfer movements booked after the anchor and up to the new floor,
+   *  by type (signed, RECIPE units) — what the stamp would leave out. */
+  left_out: Array<{ type: string; quantity: number; rows: number }>;
+  /** Signed transfer legs since the anchor — they stay in. */
+  transfers_since: number;
+}
+
+/** Thrown inside the write transaction (ruling #59) — rolls everything back. */
+class CutoverBelowZero extends Error {
+  constructor(
+    readonly rows: BelowZeroRow[],
+    readonly mats: Map<string, Mat>,
+    readonly stamping: boolean,
+    readonly floor: string,
+  ) {
+    super(`cutover would put ${rows.length} department figure(s) below zero`);
+  }
+}
+
+/** Thrown at the end of a dry run's rehearsal so it rolls back. */
+class DryRunRehearsed extends Error {}
+
+/** The pairs whose balance or send figure is below zero AFTER and lower than
+ *  BEFORE, described from the after-state (still inside the transaction). */
+function checkBelowZero(db: Db, before: Map<string, PairFigure>, after: Map<string, PairFigure>): { rows: BelowZeroRow[]; mats: Map<string, Mat> } {
+  const rows: BelowZeroRow[] = [];
+  const mats = new Map<string, Mat>();
+  const getMat = db.prepare(`SELECT id, name, category, unit, purchase_unit, pack_size, case_size FROM raw_materials WHERE id = ?`);
+  const getDept = db.prepare(`SELECT name FROM departments WHERE id = ?`);
+  for (const [k, a] of after) {
+    const b = before.get(k);
+    const balDown = a.onHand != null && a.onHand < -EPS && (b == null || b.onHand == null || a.onHand < b.onHand - EPS);
+    const sendDown = a.send < -EPS && (b == null || a.send < b.send - EPS);
+    if (!balDown && !sendDown) continue;
+    const m = getMat.get(a.materialId) as Mat | undefined;
+    if (m) mats.set(m.id, m);
+    const dn = getDept.get(a.departmentId) as { name: string } | undefined;
+    const bal = deptOnHand(db, a.departmentId, a.materialId);
+    let leftOut: BelowZeroRow['left_out'] = [];
+    let legs = 0;
+    if (bal.anchorAt != null) {
+      if (bal.anchorAt < bal.windowFrom) {
+        leftOut = (db.prepare(`
+          SELECT type, COALESCE(SUM(quantity), 0) AS q, COUNT(*) AS n FROM department_material_transactions
+           WHERE department_id = ? AND material_id = ? AND type NOT IN ('opening', 'transfer_out', 'transfer_in')
+             AND ${LEDGER_TS_SQL} > ? AND ${LEDGER_TS_SQL} <= ?
+           GROUP BY type ORDER BY type
+        `).all(a.departmentId, a.materialId, bal.anchorAt, bal.windowFrom) as Array<{ type: string; q: number; n: number }>)
+          .filter(r => Math.abs(Number(r.q)) > EPS)
+          .map(r => ({ type: String(r.type), quantity: r6(Number(r.q)), rows: Number(r.n) || 0 }));
+      }
+      const l = db.prepare(`
+        SELECT COALESCE(SUM(quantity), 0) AS s FROM department_material_transactions
+         WHERE department_id = ? AND material_id = ? AND type IN ('transfer_out', 'transfer_in') AND ${LEDGER_TS_SQL} > ?
+      `).get(a.departmentId, a.materialId, bal.anchorAt) as { s: number } | undefined;
+      legs = r6(Number(l?.s) || 0);
+    }
+    rows.push({
+      department_id: a.departmentId, department: String(dn?.name || a.departmentId),
+      material_id: a.materialId, name: String(m?.name || a.materialId),
+      anchor_source: bal.anchorSource, anchor_qty: bal.anchorQty, anchor_at: bal.anchorAt,
+      balance_now: b ? b.onHand : null, balance_after: a.onHand,
+      send_now: b ? b.send : null, send_after: a.send,
+      balance_goes_negative: balDown, send_goes_negative: sendDown,
+      left_out: leftOut, transfers_since: legs,
+    });
+  }
+  rows.sort((x, y) => x.department.localeCompare(y.department) || x.name.localeCompare(y.name));
+  return { rows, mats };
+}
+
+/** A ledger time (19-char UTC) in IST, with seconds when asked:
+ *  '15:59:05 IST on 2026-10-22'. */
+function istAt(ts: string, seconds: boolean): string {
+  const d = new Date(`${String(ts || '').replace(' ', 'T')}Z`);
+  if (Number.isNaN(d.getTime())) return String(ts || '');
+  const ist = new Date(d.getTime() + 330 * 60_000).toISOString();
+  return `${ist.slice(11, seconds ? 19 : 16)} IST on ${ist.slice(0, 10)}`;
+}
+
+/** A signed RECIPE-unit quantity, signed on BOTH halves when it converts:
+ *  "−1 kg (= −1000 g)", never "−1 kg (= 1000 g)"; `plus` marks a positive
+ *  movement "+2 kg (= +2000 g)". */
+function signedLabel(m: Mat | undefined, n: number, plus: boolean): string {
+  const s = n < 0 ? '−' : plus ? '+' : '';
+  const a = Math.abs(n);
+  const pf = m ? packFactor(m) : 1;
+  return pf > 1 && m ? `${s}${fmt(a / pf)} ${m.purchase_unit} (= ${s}${fmt(a)} ${m.unit})` : `${s}${qtyLabel(m, a)}`;
+}
+
+/** One affected pair, physically true. With the stamp: where its books start,
+ *  what the stamp drops out and what stays in, and the before → after. */
+function belowZeroSentence(r: BelowZeroRow, m: Mat | undefined, stamping: boolean, floor: string): string {
+  const q = (n: number | null) => (n == null ? 'not counted' : signedLabel(m, n, false));
+  const moves: string[] = [];
+  const sameFigure = r.balance_goes_negative && r.send_goes_negative
+    && r.balance_after != null && Math.abs(r.balance_after - r.send_after) <= EPS
+    && r.balance_now != null && r.send_now != null && Math.abs(r.balance_now - r.send_now) <= EPS;
+  if (sameFigure) {
+    moves.push(`its books and what it can send would go from ${q(r.balance_now)} to ${q(r.balance_after)}`);
+  } else {
+    if (r.balance_goes_negative) moves.push(`its books would go from ${q(r.balance_now)} to ${q(r.balance_after)}`);
+    if (r.send_goes_negative) moves.push(`what it can send would go from ${r.send_now == null ? 'nothing on its books' : q(r.send_now)} to ${q(r.send_after)}`);
+  }
+  const head = `${r.department} — ${r.name}`;
+  if (!stamping || r.anchor_at == null || r.anchor_qty == null) return `${head}: ${moves.join(', and ')}`;
+  const what = r.anchor_source === 'opening' ? 'opening' : 'count';
+  const secs = !!floor && istAt(r.anchor_at, false) === istAt(floor, false);
+  const leftOut = r.left_out.length
+    ? r.left_out.map(x => `${signedLabel(m, x.quantity, true)} ${x.type.replace(/_/g, ' ')}`).join(', ')
+    : '';
+  const dropped = leftOut
+    ? `what it booked since then other than transfers (${leftOut}) would drop out of its balance`
+    : `what it booked since then other than transfers would drop out of its balance`;
+  const kept = Math.abs(r.transfers_since) > EPS ? ` while its transfers since then (${signedLabel(m, r.transfers_since, true)}) stay in` : '';
+  return `${head}: its books start from its ${what} of ${qtyLabel(m, r.anchor_qty)}, placed at ${istAt(r.anchor_at, secs)}; ` +
+    `starting the ledger now, ${dropped}${kept}, so ${moves.join(', and ')}`;
+}
+
+/** The 409 for ruling #59 — the pairs, then the true way out. */
+function belowZeroResponse(
+  e: CutoverBelowZero,
+  ctx: { dept: { id: string; name: string }; adopt: boolean; today: string; dryRun: boolean },
+): Response {
+  const depts = [...new Map(e.rows.map(r => [r.department_id, r.department])).entries()];
+  const names = depts.map(([, n]) => n);
+  const nameList = names.length <= 1 ? (names[0] || '') : `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
+  const matsOf = (deptId: string) => {
+    const ms = e.rows.filter(r => r.department_id === deptId).map(r => r.name);
+    return ms.length <= 3 ? ms.join(', ') : `${ms.slice(0, 3).join(', ')} and ${ms.length - 3} more`;
+  };
+  const pairs = detailSentences(e.rows.map(r => belowZeroSentence(r, e.mats.get(r.material_id), e.stamping, e.floor)));
+  const lead = e.stamping
+    ? `${ctx.dept.name}'s cutover would be the first, and the first cutover starts the department ledger for every department at once. ` +
+      `That would put ${depts.length === 1 ? nameList : `${depts.length} departments`} below zero, so nothing was written${ctx.dryRun ? ' (dry run)' : ''}.`
+    : `This cutover would put ${depts.length === 1 ? nameList : `${depts.length} departments`} below zero, so nothing was written${ctx.dryRun ? ' (dry run)' : ''}.`;
+  const recount = (lead: string) =>
+    `${lead} ${nameList} again, dated today (${ctx.today}), in Inventory → Closing Stock — a count taken now starts ` +
+    `${depts.length === 1 ? 'its' : 'their'} books from the shelf, so nothing booked before it can drop out — ` +
+    `and run this cutover again`;
+  let atShelf: string;
+  if (depts.length === 1) {
+    const [only] = depts[0];
+    if (only === ctx.dept.id) {
+      atShelf = ctx.adopt
+        ? `or cut ${ctx.dept.name} over with lines[] instead of adopt_count, at what is on its shelf now (${matsOf(only)} included).`
+        : `or add ${matsOf(only)} to this cutover's lines[] with what is on the shelf now.`;
+    } else {
+      atShelf = `or cut ${depts[0][1]} over first, with lines[] at what is on its shelf now (${matsOf(only)} included), and then run this cutover again ` +
+        `— the first cutover is always checked this way.`;
+    }
+    return Response.json(belowZeroBody(e, `${lead} ${pairs} Either ${recount('count')}; ${atShelf}`, ctx.dryRun), { status: 409 });
+  }
+  atShelf = `Cutting one of them over first, at what is on its shelf now, helps only once the others are counted again: ` +
+    `whichever cutover is first starts the ledger for every department at once.`;
+  return Response.json(belowZeroBody(e, `${lead} ${pairs} ${recount('Count')}. ${atShelf}`, ctx.dryRun), { status: 409 });
+}
+
+function belowZeroBody(e: CutoverBelowZero, error: string, dryRun: boolean) {
+  return {
+    error,
+    code: 'CUTOVER_WOULD_GO_NEGATIVE',
+    ...(dryRun ? { dry_run: true } : {}),
+    first_cutover: e.stamping,
+    /** Where the ledger would have started had the cutover been written. */
+    ledger_would_start_at: e.stamping ? (e.floor || null) : null,
+    below_zero: e.rows,
+  };
 }
 
 /* ────────────────────────────────────────────────────────────────────────────
@@ -1037,23 +1290,6 @@ export async function POST(request: Request) {
     ].filter(Boolean);
     const note = noteBits.join(' — ');
 
-    if (dryRun) {
-      return Response.json({
-        ok: true,
-        dry_run: true,
-        department: { id: dept.id, name: dept.name },
-        cutover_date: cutoverDate,
-        mode: adopt ? 'adopt' : 'lines',
-        would_open: planned,
-        would_open_count: planned.length,
-        already_open: already,
-        skipped,
-        warnings,
-        cutover_at: stamp || null,
-        would_stamp_cutover: !stamp,
-      });
-    }
-
     /* ── write ──────────────────────────────────────────────────────────────
      * One transaction. postDeptLedger is the ONLY writer of department stock —
      * it inserts the ledger row and maintains the department_materials cache as
@@ -1063,9 +1299,19 @@ export async function POST(request: Request) {
      * IMMEDIATE, and in adopt mode the trap runs AGAIN inside it, per pair,
      * just before that pair's opening is posted. IMMEDIATE takes the write lock
      * before the re-check reads, so no other connection can post a movement
-     * between the check and the opening that would then swallow it. */
+     * between the check and the opening that would then swallow it.
+     *
+     * RULING #59 runs inside it too, after the openings and the stamp and
+     * before commit (checkBelowZero): figures read before the first write and
+     * again after the last, and a cutover that would put any department below
+     * zero throws CutoverBelowZero, which rolls ALL of it back. `rehearse` is
+     * the dry run of a first cutover: the same writes and the same check, then
+     * DryRunRehearsed rolls them back — so a dry run never says yes to a
+     * cutover the real run refuses. */
     let stampedNow = '';
-    const run = db.transaction(() => {
+    const run = db.transaction((rehearse: boolean) => {
+      const stamping = !cutoverAt(db);
+      const figuresBefore = pairFigures(db, stamping ? stockDepartments(db) : [departmentId]);
       const postedIds: string[] = [];
       for (const p of planned) {
         if (adopt) {
@@ -1107,6 +1353,12 @@ export async function POST(request: Request) {
         db.prepare(`INSERT OR IGNORE INTO settings (key, value) VALUES ('dept_ledger_cutover_at', ?)`).run(stampedNow);
       }
 
+      /* RULING #59 — nothing below zero, or nothing at all. */
+      const figuresAfter = pairFigures(db, stamping ? stockDepartments(db) : [departmentId]);
+      const below = checkBelowZero(db, figuresBefore, figuresAfter);
+      if (below.rows.length) throw new CutoverBelowZero(below.rows, below.mats, stamping, cutoverAt(db));
+      if (rehearse) throw new DryRunRehearsed();
+
       logAuditEvent(db, {
         event_type: 'dept_ledger.cutover',
         entity_type: 'department',
@@ -1125,9 +1377,38 @@ export async function POST(request: Request) {
         note: `Department cutover: ${dept.name} — ${planned.length} opening row(s) dated ${cutoverDate}`,
       });
     });
+    const belowZeroCtx = { dept: { id: dept.id, name: dept.name }, adopt, today };
+
+    if (dryRun) {
+      /* Only a FIRST cutover can put anyone below zero (checkBelowZero), so
+       * only its dry run rehearses the write. Anything else the rehearsal
+       * throws is left for the real run to answer, exactly as before. */
+      if (!stamp) {
+        try { run.immediate(true); } catch (e: unknown) {
+          if (e instanceof CutoverBelowZero) return belowZeroResponse(e, { ...belowZeroCtx, dryRun: true });
+        }
+        stampedNow = '';
+      }
+      return Response.json({
+        ok: true,
+        dry_run: true,
+        department: { id: dept.id, name: dept.name },
+        cutover_date: cutoverDate,
+        mode: adopt ? 'adopt' : 'lines',
+        would_open: planned,
+        would_open_count: planned.length,
+        already_open: already,
+        skipped,
+        warnings,
+        cutover_at: stamp || null,
+        would_stamp_cutover: !stamp,
+      });
+    }
+
     try {
-      run.immediate();
+      run.immediate(false);
     } catch (e: unknown) {
+      if (e instanceof CutoverBelowZero) return belowZeroResponse(e, { ...belowZeroCtx, dryRun: false });
       if (!(e instanceof AdoptRaced)) throw e;
       const name = mats.get(e.materialId)?.name || e.materialId;
       /* floor_hidden is told the same physically-true way as at planning
