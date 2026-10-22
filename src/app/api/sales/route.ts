@@ -1,3 +1,4 @@
+import { getCurrentUser } from '@/lib/auth';
 import { getDb, generateId, deductInventoryForSale } from '@/lib/db';
 // THE CENTRAL FLOOR FOR AN UNATTENDED PATH. The restore leg of a sale deletion
 // binds a SIGNED delta and can therefore resolve to a DEBIT; a throw would
@@ -7,6 +8,9 @@ import { clampCentralDelta, recordCentralDebitClamp, type CentralDeltaClamp } fr
 
 export async function GET(request: Request) {
   try {
+    // Ruling 53: the proxy only checks that a cookie is PRESENT on an API GET.
+    const me = await getCurrentUser();
+    if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
     const db = getDb();
     const url = new URL(request.url);
     const from = url.searchParams.get('from');
@@ -65,6 +69,11 @@ export async function GET(request: Request) {
 
 export async function DELETE(request: Request) {
   try {
+    // Ruling 53: deleting a sale row reverses its stock — admin + managers only.
+    const me = await getCurrentUser();
+    if (!me || (me.role !== 'admin' && me.role !== 'manager')) {
+      return Response.json({ error: 'Admin or manager only' }, { status: 403 });
+    }
     const db = getDb();
     const url = new URL(request.url);
     const id = url.searchParams.get('id');

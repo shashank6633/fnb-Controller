@@ -462,9 +462,11 @@ export async function POST(request: Request) {
             // THE F&P IT IS RAISED FROM WINS (owner ruling 43, 2026-10-15). One
             // AKAN id can sit on two F&P rows (two functions of one booking), so
             // matching the id FIRST stamped a raise from the SECOND F&P with the
-            // FIRST one's name and date — and claimPartyRequisitions (an id on
-            // several rows: the requisition's date picks the row) then costed it
-            // on the wrong F&P, and that F&P's 409 gate never fired. So the row
+            // FIRST one's name and date — and claimPartyRequisitions, which then
+            // let the date pick the row when an id was on several, costed it on
+            // the wrong F&P, and that F&P's 409 gate never fired. (It now takes
+            // the fp_id first, then the date; a requisition whose F&P no longer
+            // carries its id is costed on neither and listed, ruling 52.) So the row
             // carrying the raise's fp_id is taken, id included — what an admin's
             // raise from that row stores. Only a raise whose fp_id the cache
             // does not hold falls back to the id. An id on ONE F&P, raised from

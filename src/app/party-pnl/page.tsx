@@ -4,7 +4,8 @@
  * Party P&L page — one-stop view of per-party profit & loss.
  *
  * Revenue   = Party Bookings sheet (col U) matched by party_unique_id, once per
- *             booking — on the latest F&P carrying the id (owner ruling 43). Not
+ *             booking — on the latest not-cancelled F&P carrying the id (owner
+ *             rulings 43 + 51). Not
  *             shown on this page (the consumption modal shows no revenue either);
  *             /parties is where it is read.
  * Food Cost = party requisition items × material avg price (by event)
@@ -12,10 +13,13 @@
  *             + party_consumption × material avg price (snapshotted), including
  *               rows with no party id that ONLY this party matches by name;
  *               a row that matches two or more parties counts on none until the
- *               owner assigns it (owner ruling 2026-10-14). A row carrying an
+ *               owner assigns it to one that has an AKAN id (owner ruling
+ *               2026-10-14). A row carrying an
  *               AKAN id that is on two or more F&P rows counts only on the F&P
  *               it was recorded from (else the one on its date, else on none
- *               until assigned) — never on every row with the id.
+ *               until assigned) — never on every row with the id. A row whose
+ *               id the F&P it was recorded from no longer carries counts on
+ *               none (ruling 52).
  * Profit    = Revenue − (Food + Liquor)
  *
  * Bar manager records bottle counts the night of / morning after the event
@@ -161,11 +165,14 @@ interface PnLRow {
   // Rows recorded with NO party id (owner ruling 2026-10-14). matched_by_name is
   // the part of liquor_consumption_items that rests on the name alone (this party
   // was the only match that evening); unassigned rows name this party AND another
-  // and are counted on neither until the owner assigns them.
+  // (or carry an id on several F&Ps, or one changed after recording — ruling 52)
+  // and are counted on neither; only a candidate with an AKAN id can take one.
   liquor_matched_by_name_items?: number;
   liquor_unassigned_items?: number;
   /** Requisitions with NO party id raised under a name this party shares with
-   *  another that evening — costed on NEITHER (owner ruling 34). A count only. */
+   *  another that evening — costed on NEITHER (owner ruling 34) — plus those
+   *  with an id on several F&Ps that nothing picks (43) or an id this F&P no
+   *  longer carries (52). A count only. */
   requisitions_unassigned?: number;
   total_cost: number;
   profit: number;
@@ -179,12 +186,15 @@ interface PnLRow {
  *  ('several_parties') or none ('no_party'); or recorded WITH an id that is on
  *  two or more F&P rows when neither the F&P it was recorded from nor its date
  *  picks one ('id_on_several_parties'), or with an id NO F&P on the party list
- *  carries ('id_not_listed' — read-only, nothing to assign it to; ruling 43). */
+ *  carries ('id_not_listed' — read-only, nothing to assign it to; ruling 43), or
+ *  with an id the F&P it was recorded from no longer carries
+ *  ('id_changed_after_recording' — ruling 52; candidates = that F&P and the rows
+ *  carrying the id). */
 interface UnassignedLiquor {
   id: string;
   event_name: string;
   event_date: string;
-  reason: 'several_parties' | 'no_party' | 'id_on_several_parties' | 'id_not_listed';
+  reason: 'several_parties' | 'no_party' | 'id_on_several_parties' | 'id_changed_after_recording' | 'id_not_listed';
   /** The entry's own party id (null for one recorded without an id). */
   party_unique_id?: string | null;
   material_name: string | null;
@@ -209,7 +219,10 @@ interface UnassignedRequisition {
   event_date: string;
   party_unique_id: string | null;
   fp_id: string | null;
-  reason: 'several_parties' | 'id_not_listed' | 'id_on_several_parties';
+  /** + 'id_changed_after_recording' (ruling 52: the F&P it was raised from no
+   *  longer carries its id) and 'no_party' (no id, no party that evening has
+   *  its name; ruling 43). */
+  reason: 'several_parties' | 'id_not_listed' | 'id_on_several_parties' | 'id_changed_after_recording' | 'no_party';
   food_items: number;
   liquor_items: number;
   food_cost?: number;
@@ -369,27 +382,33 @@ export default function PartyPnLPage() {
                           </button>
                         : <span className="text-amber-700 text-[10px]">not recorded yet</span>}
                       {/* Recorded under a name this party shares with another party
-                          that evening: counted on NEITHER until the owner assigns it.
+                          that evening (or with an id on several F&Ps, or whose id
+                          changed after recording — ruling 52): counted on NEITHER.
+                          Only an entry with a candidate that has an AKAN id can be
+                          assigned, so the badge does not promise an assignment.
                           Said here so nobody reads "not recorded yet" and types the
                           bottle in again. */}
                       {(r.liquor_unassigned_items || 0) > 0 && (
                         <button onClick={() => setRecordFor(r)}
                                 className="block text-[10px] text-red-700 hover:underline text-left"
-                                title="Recorded under a name that matches more than one party that evening, or with a party id that is on more than one F&P when nothing picks one — not counted on any P&L until the owner assigns it.">
-                          {r.liquor_unassigned_items} awaiting owner assignment — not counted
+                                title="Recorded under a name that matches more than one party that evening, or with a party id that is on more than one F&P when nothing picks one, or with a party id the F&P it was recorded from no longer carries (the id changed after recording) — not counted on any P&L. The owner can assign it only to a matching party that has an AKAN id; otherwise it stays uncounted until the party sheet changes.">
+                          {r.liquor_unassigned_items} recorded, counted on no party
                         </button>
                       )}
                       {/* A requisition raised under a name this party shares with
                           another that evening, carrying no party id — or carrying
                           an id this row shares with another F&P when neither the
-                          F&P it was raised from nor its date picks one: costed on
-                          NEITHER (owner rulings 34, 43). Said
+                          F&P it was raised from nor its date picks one — or raised
+                          from this F&P when it no longer carries the requisition's
+                          id (ruling 52; then this F&P may be its only candidate, so
+                          the badge does not say "shared"): costed on NEITHER (owner
+                          rulings 34, 43, 52). Said
                           here so the gap is not read as missing liquor. */}
                       {(r.requisitions_unassigned || 0) > 0 && (
                         <button onClick={() => setRecordFor(r)}
                                 className="block text-[10px] text-red-700 hover:underline text-left"
-                                title="A requisition with no party id raised under a name that matches more than one party that evening, or with a party id that is on more than one F&P when neither the F&P it was raised from nor its date picks one — costed on none of them.">
-                          {r.requisitions_unassigned} requisition{r.requisitions_unassigned === 1 ? '' : 's'} shared with another party — not costed
+                                title="A requisition with no party id raised under a name that matches more than one party that evening, or with a party id that is on more than one F&P when neither the F&P it was raised from nor its date picks one, or with a party id the F&P it was raised from no longer carries (the id changed after recording) — costed on none of them.">
+                          {r.requisitions_unassigned} requisition{r.requisitions_unassigned === 1 ? '' : 's'} costed on no party
                         </button>
                       )}
                     </td>
@@ -443,8 +462,12 @@ export default function PartyPnLPage() {
  * entry carrying an id, and when one AKAN id is on two F&P rows an entry counts
  * only on the F&P it belongs to). The button sends the clicked row's fp_id, so
  * the second F&P of a booking can be chosen. Entries already carrying an id
- * that is on several F&P rows, with nothing to pick one, are listed here too.
- * A party without an id cannot be chosen until the sheet gives it one;
+ * that is on several F&P rows, with nothing to pick one, are listed here too,
+ * and so are entries whose id no listed F&P carries ('id_not_listed') and
+ * entries whose id the F&P they were recorded from no longer carries (ruling
+ * 52). A party without an id cannot be chosen until the sheet gives it one, so
+ * an entry whose candidates all lack an id — or that has none — cannot be
+ * assigned at all; the intro says so instead of promising an assignment.
  * "recorded from" names the F&P whose screen the entry was typed on.
  */
 function UnassignedLiquorPanel({ items, canAssign, onChanged }: {
@@ -481,8 +504,10 @@ function UnassignedLiquorPanel({ items, canAssign, onChanged }: {
         <div className="text-[11px] text-red-700 mt-0.5">
           Recorded without a party id under a name that matches more than one party that evening (or none) — or
           recorded with a party id that is on more than one F&amp;P, when neither the F&amp;P it was recorded from nor its
-          date picks one — or with a party id no F&amp;P on the list carries. None of the P&amp;Ls above includes these until{' '}
-          {canAssign ? 'you assign' : 'the owner assigns'} each one to its party.
+          date picks one — or with a party id no F&amp;P on the list carries — or with a party id the F&amp;P it was
+          recorded from no longer carries (the id changed after recording). None of the P&amp;Ls above includes these.{' '}
+          {canAssign ? 'You can assign' : 'The owner can assign'} an entry only to one of its matching parties that has
+          an AKAN id; an entry with no such party cannot be assigned and stays uncounted until the party sheet changes.
         </div>
       </div>
       {err && <div className="px-4 py-2 text-xs bg-red-50 text-red-700 border-b border-red-200">{err}</div>}
@@ -508,6 +533,9 @@ function UnassignedLiquorPanel({ items, canAssign, onChanged }: {
                   )}
                   {x.reason === 'id_not_listed' && x.party_unique_id && (
                     <div className="text-[10px] text-[#8B7355]">carries id {x.party_unique_id} — not on the party list</div>
+                  )}
+                  {x.reason === 'id_changed_after_recording' && (
+                    <div className="text-[10px] text-[#8B7355]">carries id {x.party_unique_id} — id changed after recording: {x.recorded_fp_id || 'the F&P it was recorded from'} no longer carries it</div>
                   )}
                   {x.recorded_by && <div className="text-[10px] text-[#8B7355]">by {String(x.recorded_by).split('@')[0]}</div>}
                   {x.recorded_fp_id && (
@@ -557,8 +585,9 @@ function UnassignedLiquorPanel({ items, canAssign, onChanged }: {
  * REQUISITIONS COSTED ON NO PARTY — owner ruling 34 (2026-10-14). A requisition
  * is costed only on the party whose AKAN id it carries; one with no id only when
  * exactly ONE party that evening carries the name it was raised under. These
- * matched two or more (or carry an id no listed party has), so no P&L above
- * includes them — production costed each on every matching party. Read-only:
+ * matched two or more or none, or carry an id no listed party has, or carry an
+ * id the F&P they were raised from no longer carries (ruling 52), so no P&L
+ * above includes them — production costed each on every matching party. Read-only:
  * a requisition's party is set when it is raised (Raise Req), not here.
  */
 function UnassignedRequisitionsPanel({ items }: { items: UnassignedRequisition[] }) {
@@ -574,8 +603,9 @@ function UnassignedRequisitionsPanel({ items }: { items: UnassignedRequisition[]
         <div className="text-[11px] text-red-700 mt-0.5">
           A requisition counts only on the party whose AKAN id it carries; without an id, only when exactly one party
           that evening has the name it was raised under. When its id is on more than one F&amp;P, only on the F&amp;P it
-          was raised from — else on the one dated on its date. These match more than one party (or carry an id no
-          listed party has), so none of the P&amp;Ls above includes them.
+          was raised from — else on the one dated on its date. These match more than one party or none, or carry an id
+          no listed party has, or carry an id the F&amp;P they were raised from no longer carries (the id changed after
+          recording) — so none of the P&amp;Ls above includes them.
         </div>
       </div>
       <div className="overflow-x-auto">
@@ -606,6 +636,9 @@ function UnassignedRequisitionsPanel({ items }: { items: UnassignedRequisition[]
                   {x.reason === 'id_on_several_parties' && x.party_unique_id && (
                     <div className="text-[10px] text-[#8B7355]">carries id {x.party_unique_id} — on more than one F&amp;P; neither the F&amp;P it was raised from nor its date picks one</div>
                   )}
+                  {x.reason === 'id_changed_after_recording' && (
+                    <div className="text-[10px] text-[#8B7355]">carries id {x.party_unique_id} — id changed after recording: {x.fp_id || 'the F&P it was raised from'} no longer carries it</div>
+                  )}
                 </td>
                 <td className="py-1.5 px-3 text-right font-mono whitespace-nowrap">
                   {x.food_items} food · {x.liquor_items} liquor
@@ -616,6 +649,9 @@ function UnassignedRequisitionsPanel({ items }: { items: UnassignedRequisition[]
                   </td>
                 )}
                 <td className="py-1.5 px-3">
+                  {x.reason === 'no_party' && x.candidates.length === 0 && (
+                    <span className="text-[10px] text-[#8B7355]">No party on this date carries this name.</span>
+                  )}
                   <div className="flex flex-col gap-0.5">
                     {x.candidates.map((c, ci) => (
                       <div key={ci} className="flex items-center gap-2 flex-wrap">
@@ -651,11 +687,13 @@ interface ConsumptionEntry {
 /** Recorded without a party id under a name that matches this party AND another
  *  that evening ('several_parties'), or recorded with an id this row shares with
  *  another F&P when neither the F&P it was recorded from nor its date picks one
- *  ('id_on_several_parties') — counted on NEITHER until the owner assigns it.
- *  Never summed. */
+ *  ('id_on_several_parties'), or recorded with an id the F&P it was recorded
+ *  from no longer carries ('id_changed_after_recording', ruling 52) — counted on
+ *  NEITHER; assignable only to a candidate that has an AKAN id. Never summed. */
 interface UnassignedEntry extends ConsumptionEntry {
   event_name: string;
-  reason?: 'several_parties' | 'id_on_several_parties';
+  /** + 'id_changed_after_recording' (ruling 52). */
+  reason?: 'several_parties' | 'id_on_several_parties' | 'id_changed_after_recording';
   party_unique_id?: string | null;
   candidates: { party_unique_id: string | null; fp_id?: string | null; event_name: string; event_date: string }[];
 }
@@ -668,7 +706,8 @@ interface UnassignedReqHere {
   req_id: string;
   req_number: string;
   event_name: string;
-  reason?: 'several_parties' | 'id_on_several_parties';
+  /** + 'id_changed_after_recording' (ruling 52). */
+  reason?: 'several_parties' | 'id_on_several_parties' | 'id_changed_after_recording';
   party_unique_id?: string | null;
   candidates: { party_unique_id: string | null; fp_id?: string | null; event_name: string; event_date: string }[];
 }
@@ -995,15 +1034,21 @@ function RecordConsumptionModal({ target, onClose, onChanged }: {
 
           {/* COUNTED ON NO PARTY. Recorded without a party id under a name this
               party shares with another party that evening, so — by the owner's
-              ruling of 2026-10-14 — it is on NEITHER P&L until the owner assigns
-              it. Listed so nobody re-types it; deliberately outside the
+              ruling of 2026-10-14 — it is on NEITHER P&L (likewise an id on
+              several F&Ps with nothing to pick one, or an id changed after
+              recording — ruling 52). Only a candidate with an AKAN id can take
+              it, so the note does not promise an assignment. Listed so nobody
+              re-types it; deliberately outside the
               reconciliation sum below, which is exactly what the P&L charges. */}
           {!loadingExisting && unassignedHere.length > 0 && (
             <div className="border border-red-200 rounded-lg overflow-hidden">
               <div className="px-2 py-1.5 text-[10px] text-red-800 bg-red-50 border-b border-red-200">
-                <b>Not counted on this P&amp;L — awaiting the owner.</b> Recorded without a party id under a name that
+                <b>Not counted on this P&amp;L.</b> Recorded without a party id under a name that
                 matches more than one party on {target.event_date}, or with a party id that is on more than one F&amp;P
-                when nothing picks one. Do not record it again; the owner assigns it to one party.
+                when nothing picks one, or with a party id the F&amp;P it was recorded from no longer carries (id changed
+                after recording) — so it is counted on none of the parties it matches. Do not record it again. The owner
+                can assign it only to one of those parties that has an AKAN id; if none has one, it stays uncounted until
+                the party sheet changes.
               </div>
               <div className="overflow-x-auto">
                 <table className="w-full text-xs">
@@ -1015,6 +1060,7 @@ function RecordConsumptionModal({ target, onClose, onChanged }: {
                           <div className="text-[10px] text-[#8B7355]">
                             under &ldquo;{e.event_name}&rdquo;
                             {e.reason === 'id_on_several_parties' && e.party_unique_id && <> (id {e.party_unique_id})</>}
+                            {e.reason === 'id_changed_after_recording' && <> (id {e.party_unique_id} — id changed after recording)</>}
                             {' '}· matches {e.candidates.map(candidateLabel).join(', ')}
                           </div>
                         </td>
@@ -1048,11 +1094,13 @@ function RecordConsumptionModal({ target, onClose, onChanged }: {
                   {qi > 0 && '; '}
                   <span className="font-mono">{q.req_number || q.req_id}</span> under &ldquo;{q.event_name}&rdquo;
                   {q.reason === 'id_on_several_parties' && q.party_unique_id && <> (id {q.party_unique_id})</>}
+                  {q.reason === 'id_changed_after_recording' && <> (id {q.party_unique_id} — id changed after recording)</>}
                   {' '}matches {q.candidates.map(candidateLabel).join(', ')}
                 </span>
               ))}
               . A requisition without a party id is costed only when exactly one party that evening has its name;
-              one whose id is on more than one F&amp;P, on the F&amp;P it was raised from — else only when exactly one of them is on its date.
+              one whose id is on more than one F&amp;P, on the F&amp;P it was raised from — else only when exactly one of them is on its date;
+              one raised from an F&amp;P on the list that now carries a different id or none, on none.
             </div>
           )}
 

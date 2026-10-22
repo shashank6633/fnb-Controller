@@ -1,3 +1,4 @@
+import { getCurrentUser } from '@/lib/auth';
 import { getDb, generateId } from '@/lib/db';
 import { packFactor, toPurchaseQty, fmtQtyNum } from '@/lib/pack-units';
 import { planCentralDebit, qtyDown, printableCap, fmtGridQty } from '@/lib/central-debit-clamp';
@@ -87,6 +88,9 @@ import { planCentralDebit, qtyDown, printableCap, fmtGridQty } from '@/lib/centr
 
 export async function GET(request: Request) {
   try {
+    // Ruling 53: the proxy only checks that a cookie is PRESENT on an API GET.
+    const me = await getCurrentUser();
+    if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
     const db = getDb();
     const url = new URL(request.url);
     const partyId = url.searchParams.get('party_id');

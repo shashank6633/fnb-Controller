@@ -32,6 +32,9 @@ import {
  * uses: when one AKAN id is on two or more F&P rows, an entry is in the `entries`
  * of the row it was recorded from (fp_id), else of the one row on its date, else
  * in every candidate's `unassigned_entries` (reason 'id_on_several_parties').
+ * An entry whose F&P (fp_id) is on the list but no longer carries its id is in
+ * NO row's `entries` — it is in the `unassigned_entries` of that F&P and of every
+ * row carrying its id (reason 'id_changed_after_recording', owner ruling 52).
  *
  * OWNER RULING 34 (2026-10-14). The requisition lines shown, and the ones the
  * POST 409 gate checks, are exactly the requisitions the P&L costs on this party
@@ -52,8 +55,10 @@ import {
  *           party's requisition and confirm_duplicates is not true
  * PATCH  /api/party-consumption   body: { id, party_unique_id, fp_id? }   (admin only)
  *        assigns an orphan row to one of the parties its name + date match, or
- *        an entry whose id is on several F&P rows to one of them; fp_id names
- *        the F&P row (the page always sends it)
+ *        an entry whose id is on several F&P rows to one of them, or an entry
+ *        whose id changed after recording (ruling 52) to the F&P it was
+ *        recorded from or a row carrying its id; fp_id names the F&P row (the
+ *        page always sends it)
  * DELETE /api/party-consumption?id=<uuid>
  */
 export const dynamic = 'force-dynamic';
@@ -138,10 +143,12 @@ export async function GET(request: Request) {
     // for the owner rather than missing, and does not type it in again.
     // Then the entries CARRYING this row's id that the id claim charged to no row:
     // the id is on two or more F&P rows and neither the F&P they were recorded
-    // from nor their date picks one. Listed the same way, never summed.
+    // from nor their date picks one. Listed the same way, never summed. So are
+    // the entries recorded from this F&P, or carrying its id, whose F&P no
+    // longer carries their id ('id_changed_after_recording', ruling 52).
     const unassigned = [
       ...awaiting.map(a => ({ a, reason: 'several_parties' as const })),
-      ...scope.idShare.awaiting.map(a => ({ a, reason: 'id_on_several_parties' as const })),
+      ...scope.idShare.awaiting.map(a => ({ a, reason: a.reason ?? 'id_on_several_parties' as const })),
     ]
       .map(({ a, reason }) => {
         const r = byId.get(a.row.id) as any;
@@ -161,7 +168,9 @@ export async function GET(request: Request) {
     // Requisitions costed on NEITHER party (ruling 34a): no id, raised under a
     // name this party shares with another that evening ('several_parties'), or
     // carrying an id this party's row shares with another F&P row when the date
-    // does not pick one ('id_on_several_parties'). Listed, never summed, so the
+    // does not pick one ('id_on_several_parties'), or raised from this F&P / with
+    // its id when that F&P no longer carries the id ('id_changed_after_recording',
+    // ruling 52). Listed, never summed, so the
     // modal matches the badge's count and nobody reads the gap as missing liquor.
     const unassignedReqs = scope.reqAwaiting.map(a => ({
       req_id: a.req.id,
@@ -321,6 +330,15 @@ export async function POST(request: Request) {
  *    either; this sets its fp_id to one of the listed candidates. An entry the
  *    claim already charges to a row is refused (409 "Already assigned"), as
  *    before.
+ *  · AN ENTRY WHOSE ID CHANGED AFTER RECORDING (owner ruling 52, 2026-10-21):
+ *    the F&P it was recorded from no longer carries its id, so it is charged to
+ *    NEITHER that F&P nor the id's rows, and listed "for the owner to assign".
+ *    Its candidates are that F&P and the rows carrying its id. Choosing a row
+ *    that carries the entry's id sets its fp_id to that row (as above); choosing
+ *    the F&P it was recorded from sets its party_unique_id to the id that F&P
+ *    carries now (and keeps the fp_id) — the one assignment that changes an
+ *    entry's id, and only to the id of the very F&P it was typed on. A
+ *    candidate without an id cannot be chosen.
  *
  * ONE ID ON TWO ROWS. The row is found by id AND fp_id. It used to be the FIRST
  * cached row with the id: Assign for the second F&P of a booking was refused
@@ -379,9 +397,13 @@ export async function PATCH(request: Request) {
     const orphan = row.party_unique_id === null;
 
     let chosen: number;
+    // Set only when an entry whose id changed after recording is pinned to the
+    // F&P it was recorded from: the id that F&P carries now (ruling 52).
+    let newId: string | null = null;
     if (!orphan) {
       // Re-pointable ONLY while the P&L charges it to nobody (its id is on two or
-      // more rows and nothing picks one) — and only to one of its candidates.
+      // more rows and nothing picks one, or its id changed after recording) — and
+      // only to one of its candidates.
       const idClaims = claimIdConsumption(db, claimants);
       const listed = idClaims.shared.find(s => s.row.id === id);
       if (!listed) {
@@ -392,17 +414,34 @@ export async function PATCH(request: Request) {
         }
         return Response.json({ error: `Already assigned to party ${row.party_unique_id}` }, { status: 409 });
       }
+      // Ruling 52: the F&P it was recorded from no longer carries its id. Its
+      // candidates are that F&P and the rows carrying the id; the one chosen
+      // must carry the id the page sent.
+      const idChanged = listed.reason === 'id_changed_after_recording';
+      const ownId = String(row.party_unique_id).trim();
+      const idOf = (i: number) => String(parties[i]?.party_unique_id || '').trim();
       // Trimmed: an entry stored with stray spaces (' AK-77 ') is claimed by the
       // trimmed id's rows, and the page sends the cached (trimmed) id.
-      if (String(row.party_unique_id).trim() !== target) {
+      if (!idChanged && ownId !== target) {
         return Response.json({ error: `This entry carries party id ${row.party_unique_id}; choose one of its F&P rows.` }, { status: 400 });
       }
-      const pick = fpWanted ? listed.candidates.find(i => fpOf(i) === fpWanted) : undefined;
+      const pick = fpWanted
+        ? listed.candidates.find(i => fpOf(i) === fpWanted && (!idChanged || idOf(i) === target))
+        : undefined;
       if (pick === undefined) {
+        const assignable = listed.candidates.filter(i => idOf(i));
         return Response.json({
-          error: `Party id ${target} is on more than one F&P — choose the one this entry belongs to: ${listed.candidates.map(labelOf).join(', ')}.`,
+          error: !idChanged
+            ? `Party id ${target} is on more than one F&P — choose the one this entry belongs to: ${listed.candidates.map(labelOf).join(', ')}.`
+            : assignable.length
+            ? `This entry carries party id ${ownId}, but the F&P it was recorded from (${row.fp_id}) no longer does — choose the F&P it belongs to: ${assignable.map(labelOf).join(', ')}.`
+            : `This entry carries party id ${ownId}, but the F&P it was recorded from (${row.fp_id}) no longer carries an AKAN id, and no F&P carries ${ownId} — there is no row to assign it to yet.`,
         }, { status: 400 });
       }
+      // Pinned to the F&P it was recorded from: it takes the id that F&P carries
+      // now, exactly as the cache holds it. Pinned to a row carrying its own id:
+      // only its fp_id changes, as for an id on several rows.
+      if (idChanged && idOf(pick) !== ownId) newId = parties[pick].party_unique_id || null;
       chosen = pick;
     } else {
       // The cached rows holding the id, compared exactly as before.
@@ -445,6 +484,11 @@ export async function PATCH(request: Request) {
         ? db.prepare(
             'UPDATE party_consumption SET party_unique_id = ?, fp_id = ? WHERE id = ? AND party_unique_id IS NULL',
           ).run(target, newFp, id).changes
+        : newId
+        ? db.prepare(
+            `UPDATE party_consumption SET party_unique_id = ?, fp_id = ?
+             WHERE id = ? AND party_unique_id = ? AND COALESCE(fp_id, '') = ?`,
+          ).run(newId, newFp, id, row.party_unique_id, row.fp_id ?? '').changes
         : db.prepare(
             `UPDATE party_consumption SET fp_id = ?
              WHERE id = ? AND party_unique_id = ? AND COALESCE(fp_id, '') = ?`,
@@ -463,7 +507,9 @@ export async function PATCH(request: Request) {
       entity_id: id,
       actor_email: me.email,
       before: { party_unique_id: row.party_unique_id ?? null, fp_id: row.fp_id ?? null, event_name: name, event_date: date },
-      after: { party_unique_id: target, fp_id: newFp },
+      // What is now stored: the chosen F&P's id for an orphan or a re-keyed entry,
+      // else the entry's own id exactly as stored (only its fp_id changed).
+      after: { party_unique_id: newId ?? (orphan ? target : row.party_unique_id), fp_id: newFp },
       note: `Recorded liquor under "${name}" (${date}) assigned to party ${labelOf(chosen)}`,
     });
     return Response.json({ success: true });

@@ -5,8 +5,9 @@
  *
  *   Revenue     = Party Bookings sheet (col U) matched by party_unique_id — ONCE
  *                 per booking: when its id is on two or more F&P rows, only the
- *                 latest F&P carries it; the others show ₹0 and name that row
- *                 (owner ruling 43; the rule is in /api/party-events/pnl)
+ *                 latest F&P that is not Cancelled carries it; the others show ₹0
+ *                 and name that row (owner rulings 43 + 51; the rule is
+ *                 revenueSeats in src/lib/party-revenue.ts)
  *   Food Cost   = Σ party requisition items × material avg price (by event)
  *   Liquor Cost = Σ party_consumption × material avg price (snapshotted)
  *   Profit      = Revenue − (Food + Liquor)
@@ -23,6 +24,8 @@
 import { useEffect, useState } from 'react';
 import { TrendingUp, Loader2, RefreshCw, AlertTriangle, ShieldAlert } from 'lucide-react';
 import { api } from '@/lib/api';
+// The Cancelled test revenueSeats uses (party-revenue.ts has no runtime imports).
+import { isCancelledStatus as isCancelled } from '@/lib/party-revenue';
 
 const fmt = (v: number) => '₹' + Math.round(v || 0).toLocaleString('en-IN');
 
@@ -47,7 +50,8 @@ interface PnLRow {
   revenue_withheld_reason?: string | null;  // why revenue isn't counted yet (or null)
   status?: string;
   // Present ONLY when this row's AKAN id is on two or more F&P rows (owner
-  // ruling 43): the booking's revenue counts once, on the latest of them.
+  // rulings 43 + 51): the booking's revenue counts once, on the latest of them
+  // that is not Cancelled.
   revenue_counted_here?: boolean;           // this row carries it
   revenue_counted_on_fp_id?: string;        // the row that does
   revenue_booking_fp_ids?: string[];        // every F&P carrying the id
@@ -205,33 +209,49 @@ export default function PartyPnLAdminPage() {
                       </td>
                       <td className="py-1.5 px-3 text-right font-mono">{r.pax || '—'}</td>
                       <td className="py-1.5 px-3 text-right font-mono">
-                        {/* ONE booking on two or more F&Ps (ruling 43): its revenue
-                            counts once, on the latest of them. This row shows ₹0
-                            and names that row, so the money never reads as lost. */}
-                        {r.revenue_counted_here === false
-                          ? <span title={`This booking is also on ${(r.revenue_booking_fp_ids || []).join(', ')}. Its revenue counts once, on the latest F&P: ${r.revenue_counted_on_fp_id}.`}>
+                        {/* ONE booking on two or more F&Ps (rulings 43 + 51): its
+                            revenue counts once, on the latest of them that is not
+                            Cancelled. This row shows ₹0 and names that row, so the
+                            money never reads as lost. */}
+                        {r.revenue_counted_here === false && seatRow && isCancelled(seatRow.status)
+                          // The seat is Cancelled only when EVERY F&P of the booking
+                          // is (revenueSeats rule 0): nothing counts anywhere.
+                          ? <span title={`Every F&P carrying this booking (${(r.revenue_booking_fp_ids || []).join(', ')}) is Cancelled, so its revenue counts on none of them.`}>
+                              {fmt(0)}
+                              <span className="block text-[10px] text-[#8B7355] font-sans">every F&amp;P of this booking is cancelled — not counted</span>
+                            </span>
+                          : r.revenue_counted_here === false
+                          ? <span title={`This booking is also on ${(r.revenue_booking_fp_ids || []).join(', ')}. Its revenue counts once, on the latest F&P that is not cancelled: ${r.revenue_counted_on_fp_id}.`}>
                               {fmt(0)}
                               <span className="block text-[10px] text-[#8B7355] font-sans">revenue counted on {r.revenue_counted_on_fp_id}</span>
                               {/* That row may itself still withhold it (not Approved,
-                                  or not over yet) — say so, so ₹0 here is not read
-                                  as "already in the total". */}
+                                  or not over yet, or no Final Total) — say so, so ₹0
+                                  here is not read as "already in the total". */}
                               {seatRow && !seatRow.has_revenue && (
                                 <span className="block text-[10px] text-amber-700 font-sans">
-                                  ⏳ not counted there yet{seatRow.revenue_withheld_reason ? `: ${seatRow.revenue_withheld_reason}` : ''}
+                                  ⏳ not counted there yet: {seatRow.revenue_withheld_reason
+                                    || ((seatRow.booking_total ?? 0) > 0 ? 'pending' : 'no booking row')}
                                 </span>
                               )}
                             </span>
                           : r.has_revenue
                           ? fmt(r.revenue)
                           : (r.booking_total ?? 0) > 0
-                            ? <span className="text-amber-700 text-[10px]" title={`Final Total ${fmt(r.booking_total || 0)} is on the sheet but not counted yet`}>⏳ {r.revenue_withheld_reason || 'pending'}</span>
+                            ? (isCancelled(r.status)
+                              // A Cancelled F&P is not "awaiting confirmation" (the
+                              // gate's reason for every status but Approved).
+                              ? <span className="text-[#8B7355] text-[10px]" title={`Final Total ${fmt(r.booking_total || 0)} is on the sheet; the F&P is Cancelled, so it is not counted`}>cancelled — not counted</span>
+                              : <span className="text-amber-700 text-[10px]" title={`Final Total ${fmt(r.booking_total || 0)} is on the sheet but not counted yet`}>⏳ {r.revenue_withheld_reason || 'pending'}</span>)
                             : <span className="text-[#8B7355] text-[10px]">no booking row</span>}
-                        {r.revenue_counted_here === true && otherFps(r).length > 0 && (
-                          <span className="block text-[10px] text-[#8B7355] font-sans"
-                                title="The same booking is on more than one F&P. Its revenue counts once — on the latest F&P, this one.">
-                            booking also on {otherFps(r).join(', ')} — its revenue counts here only
-                          </span>
-                        )}
+                        {r.revenue_counted_here === true && otherFps(r).length > 0 && (isCancelled(r.status)
+                          ? <span className="block text-[10px] text-[#8B7355] font-sans"
+                                  title="Every F&P carrying this booking is Cancelled, so its revenue counts on none of them.">
+                              booking also on {otherFps(r).join(', ')} — all cancelled
+                            </span>
+                          : <span className="block text-[10px] text-[#8B7355] font-sans"
+                                  title="The same booking is on more than one F&P. Its revenue counts once — on the latest F&P that is not cancelled, this one.">
+                              booking also on {otherFps(r).join(', ')} — its revenue counts here only
+                            </span>)}
                       </td>
                       <td className="py-1.5 px-3 text-right font-mono">
                         {r.food_cost > 0 ? fmt(r.food_cost) : <span className="text-[#8B7355]">—</span>}

@@ -66,7 +66,53 @@ interface Event {
   guest_count?: number; customer?: string; req_count: number;
   cost: number; revenue: number; profit: number;
   food_cost_percent: number; per_head_cost: number; per_head_revenue: number;
+  /** Why this row's revenue is ₹0 — e.g. "revenue counted on FP-72" when the
+   *  booking is on two or more F&Ps and counts once, on another (ruling 43/51). */
+  revenue_withheld_reason?: string | null;
+  /** Only beside "revenue counted on FP-xx": whether FP-xx counts it yet —
+   *  null = it does; else why not ('awaiting confirmation', 'party not over yet',
+   *  'no booking row', 'cancelled'). */
+  revenue_seat_withheld_reason?: string | null;
+  /** A revenue-only row (ruling 51): the F&P that carries a booking's revenue
+   *  has no requisition row of its own, so the server lists it on its own
+   *  (admin/HOD only). */
+  revenue_only?: boolean;
+  fp_id?: string;
+  /** On a revenue-only row: that F&P's own requisitions, listed on this page
+   *  under rows that do not carry its revenue (empty = it has none yet). */
+  requisitions_listed_under?: ListedUnder[];
 }
+
+/** One row a revenue-only F&P's requisitions are listed under. same_name_matched_to
+ *  is set only when that row is under the F&P's OWN name and date but the page
+ *  matches it to another F&P of that name that evening (its fp_id, '' = none). */
+interface ListedUnder { event_name: string; event_date: string; same_name_matched_to?: string | null }
+const ownNameRow = (k: ListedUnder) => typeof k.same_name_matched_to === 'string';
+
+/** "Corp 57 (2026-10-13)" / "Nair (2026-10-19), a row matched to FP-9550" — where
+ *  a revenue-only F&P's requisitions are listed (the list row's short form). */
+const listedUnder = (l?: ListedUnder[]) =>
+  (l || []).map(k => `${k.event_name} (${k.event_date})`
+    + (ownNameRow(k) ? `, a row matched to ${k.same_name_matched_to || 'another F&P'}` : '')).join('; ');
+/** The drill-down's long form: says why a row under the F&P's own name and date
+ *  does not carry its revenue. */
+const listedUnderLong = (l?: ListedUnder[]) =>
+  (l || []).map(k => `${k.event_name} (${k.event_date})`
+    + (ownNameRow(k)
+      ? ` — a row under its own name and date, which this page matches to ${k.same_name_matched_to ? `${k.same_name_matched_to}, another F&P` : 'another F&P'} of that name that evening`
+      : '')).join('; ');
+
+/** "revenue counted on FP-72" — the booking counts once, on another F&P. */
+const countedElsewhere = (reason?: string | null) =>
+  typeof reason === 'string' && reason.startsWith('revenue counted on ') ? reason : null;
+/** …and when that F&P does not count it yet, say so — so ₹0 here is never read
+ *  as "already in the total there". ('cancelled' is handled by allCancelled.) */
+const seatNotCounted = (reason?: string | null) =>
+  !reason || reason === 'cancelled' ? null : `⏳ not counted there yet: ${reason}`;
+/** The seat is Cancelled only when EVERY F&P of the booking is (revenueSeats
+ *  rule 0) — then the booking counts nowhere, and the row says so instead. */
+const allCancelled = (reason?: string | null, seatReason?: string | null) =>
+  !!countedElsewhere(reason) && seatReason === 'cancelled';
 interface EventDetail {
   event_name: string; event_date: string; guest_count: number;
   customer: string; notes: string;
@@ -84,7 +130,13 @@ interface EventDetail {
   summary: {
     cost: number; revenue: number; profit: number; food_cost_percent: number;
     per_head_cost: number; per_head_revenue: number; per_head_profit: number;
+    revenue_withheld_reason?: string | null;
+    revenue_seat_withheld_reason?: string | null;
   };
+  /** Ruling 51 — see Event.revenue_only / requisitions_listed_under. */
+  revenue_only?: boolean;
+  fp_id?: string;
+  requisitions_listed_under?: ListedUnder[];
 }
 
 export default function PartyEventsPage() {
@@ -243,6 +295,31 @@ export default function PartyEventsPage() {
                     <span>· {detail.requisitions.length} requisition{detail.requisitions.length === 1 ? '' : 's'}</span>
                   </div>
                   {detail.notes && <div className="text-xs text-[#6B5744] mt-2 italic">{detail.notes}</div>}
+                  {canSeeFinancials && detail.revenue_only && (
+                    <div className="text-xs text-[#6B5744] mt-2">
+                      {listedUnder(detail.requisitions_listed_under)
+                        ? <>The requisitions of {detail.fp_id || 'this F&P'} are listed on this page under {listedUnderLong(detail.requisitions_listed_under)}. No row under its own name and date is matched to {detail.fp_id || 'it'}, so this row stands for {detail.fp_id || 'the F&P'} itself.</>
+                        : <>No requisitions raised from {detail.fp_id || 'this F&P'} yet.</>}
+                      {' '}The booking is on more than one F&amp;P and its revenue counts once — here, on the latest F&amp;P that is not cancelled.
+                    </div>
+                  )}
+                  {canSeeFinancials && allCancelled(detail.summary.revenue_withheld_reason, detail.summary.revenue_seat_withheld_reason) && (
+                    <div className="text-xs text-[#6B5744] mt-2">
+                      Revenue ₹0 here — every F&amp;P of this booking is cancelled, so its revenue counts on none of them.
+                    </div>
+                  )}
+                  {canSeeFinancials && countedElsewhere(detail.summary.revenue_withheld_reason)
+                    && !allCancelled(detail.summary.revenue_withheld_reason, detail.summary.revenue_seat_withheld_reason) && (
+                    <div className="text-xs text-[#6B5744] mt-2">
+                      {/* Not "counts once": rows are grouped by the exact typed name,
+                          so two rows of that F&P differing only by a space each
+                          carry it (an open owner item). True either way: */}
+                      Revenue ₹0 here — {countedElsewhere(detail.summary.revenue_withheld_reason)} (the booking is on more than one F&P; its revenue counts on that F&P, not on this one).
+                      {seatNotCounted(detail.summary.revenue_seat_withheld_reason) && (
+                        <span className="block text-amber-700">{seatNotCounted(detail.summary.revenue_seat_withheld_reason)}</span>
+                      )}
+                    </div>
+                  )}
                 </div>
               </div>
             </div>
@@ -254,9 +331,16 @@ export default function PartyEventsPage() {
                 <Card label="Revenue"     value={fmt(detail.summary.revenue)} sub={detail.guest_count > 0 ? `${fmt(detail.summary.per_head_revenue)}/head` : undefined} tone="green" />
                 <Card label="Profit"      value={fmt(detail.summary.profit)}  sub={detail.guest_count > 0 ? `${fmt(detail.summary.per_head_profit)}/head` : undefined}
                       tone={detail.summary.profit >= 0 ? 'green' : 'red'} />
-                <Card label="Food Cost %" value={`${detail.summary.food_cost_percent}%`}
-                      sub={detail.summary.food_cost_percent > 35 ? '⚠ above 35% target' : 'within target'}
-                      tone={detail.summary.food_cost_percent > 35 ? 'amber' : 'green'} />
+                {/* Cost ÷ revenue has no value on a row with no revenue counted
+                    (the server sends 0) or no requisitions (a revenue-only row) —
+                    show '—', never "0% within target". */}
+                {detail.summary.revenue > 0 && !detail.revenue_only
+                  ? <Card label="Food Cost %" value={`${detail.summary.food_cost_percent}%`}
+                          sub={detail.summary.food_cost_percent > 35 ? '⚠ above 35% target' : 'within target'}
+                          tone={detail.summary.food_cost_percent > 35 ? 'amber' : 'green'} />
+                  : <Card label="Food Cost %" value="—"
+                          sub={detail.revenue_only ? 'no requisitions on this row' : 'no revenue counted on this row'}
+                          tone="gray" />}
               </>)}
             </div>
 
@@ -326,17 +410,26 @@ export default function PartyEventsPage() {
               <div className="px-4 py-2.5 border-b border-[#E8D5C4] bg-[#FFF1E3]/50 flex items-center gap-2 flex-wrap">
                 <TrendingUp size={14} className="text-green-600" />
                 <h2 className="text-sm font-semibold text-[#2D1B0E]">
-                  Revenue — party sales on {detail.event_date} ({detail.sales.length})
+                  Party sales on {detail.event_date} ({detail.sales.length})
                 </h2>
                 <span className="text-[10px] text-[#6B5744] ml-2">
                   {autoCount} auto-linked + {manCount} manually-linked = {detail.sales.length} total
                 </span>
-                <div className="ml-auto">
-                  <button onClick={openLinkModal}
-                          className="inline-flex items-center gap-1 px-2.5 py-1 bg-[#af4408] hover:bg-[#933807] text-white rounded text-[11px]">
-                    <Link2 size={11} /> Attribute sales from this date
-                  </button>
-                </div>
+                {/* Sales are attributed to a requisition event; a revenue-only
+                    row has none, so the link would be refused. */}
+                {!detail.revenue_only && (
+                  <div className="ml-auto">
+                    <button onClick={openLinkModal}
+                            className="inline-flex items-center gap-1 px-2.5 py-1 bg-[#af4408] hover:bg-[#933807] text-white rounded text-[11px]">
+                      <Link2 size={11} /> Attribute sales from this date
+                    </button>
+                  </div>
+                )}
+              </div>
+              <div className="px-4 py-1.5 text-[10px] text-[#6B5744] border-b border-[#E8D5C4]/60">
+                POS sales tagged Party on this date, for reference — not this event&apos;s revenue. The Revenue figure above
+                comes from the booking&apos;s Final Total on the Party Bookings sheet, counted once the party is Approved and over.
+                {detail.revenue_only && ' Sales attach to a requisition event row; this row is not one.'}
               </div>
               {detail.sales.length === 0 ? (
                 <div className="p-6 text-sm text-[#8B7355] text-center">
@@ -388,8 +481,10 @@ export default function PartyEventsPage() {
                   </tbody>
                   <tfoot>
                     <tr className="bg-[#FFF1E3] font-semibold">
-                      <td colSpan={3} className="py-1.5 px-3 text-right text-[#2D1B0E]">Total revenue</td>
-                      <td className="py-1.5 px-3 text-right font-mono text-[#2D1B0E]">{fmt(detail.summary.revenue)}</td>
+                      {/* The sum of the lines above — not the event's revenue
+                          (the booking's Final Total, in the Revenue card). */}
+                      <td colSpan={3} className="py-1.5 px-3 text-right text-[#2D1B0E]">Total of these sales</td>
+                      <td className="py-1.5 px-3 text-right font-mono text-[#2D1B0E]">{fmt(detail.sales.reduce((a, s) => a + (Number(s.revenue) || 0), 0))}</td>
                       <td></td>
                     </tr>
                   </tfoot>
@@ -489,8 +584,28 @@ export default function PartyEventsPage() {
         <div className="flex-1">
           <h1 className="text-xl font-semibold text-[#2D1B0E]">Party Events</h1>
           <p className="text-xs text-[#8B7355]">
-            One row per banquet/party event. Cost from <a href="/party-requisitions" className="underline text-[#af4408]">party requisitions</a>;
-            revenue from sales tagged Party on the event date.
+            {/* Not "one row per event": the list groups party requisitions by
+                event_name exactly as typed, so one event raised under two names
+                (or a name with a stray space) is two rows, and an event with no
+                requisition has none. A department user's list and cost are
+                their department's lines only (deptScopeId in the route). */}
+            {/* canSeeFinancials is false until /api/auth/me answers, so the
+                department wording must stay true for an admin during that load. */}
+            One row per name and date that party requisitions were raised under, exactly as typed
+            {canSeeFinancials ? ', plus the revenue-only rows described below' : ' (a department login sees only those carrying its department’s lines)'}.
+            Cost from <a href="/party-requisitions" className="underline text-[#af4408]">party requisitions</a>
+            {!canSeeFinancials && ' (for a department login, its department’s lines only)'}
+            {/* Says how a row gets revenue, not that every booking shows once:
+                rows are matched by name + date, so a booking on one F&P with no
+                row under its own name matched to it shows none here (production
+                behaviour, an open owner decision). */}
+            {canSeeFinancials && <>; revenue from the booking&apos;s Final Total on the Party Bookings sheet, counted when the party is
+            Approved and over. A row gets the revenue of the booking whose F&amp;P has the row&apos;s name (spaces at either end
+            ignored) and date (the one higher
+            on the F&amp;P sheet if two bookings do), and only under that F&amp;P&apos;s own name; a booking on more than one F&amp;P
+            counts only on its latest F&amp;P that is not cancelled — on a revenue-only row when no row under that F&amp;P&apos;s
+            name is matched to it. A booking on one F&amp;P shows no revenue here unless a row under its F&amp;P&apos;s own name
+            is matched to it</>}.
           </p>
         </div>
         {/* Manual "New Party Requisition" button removed — parties come from the
@@ -539,16 +654,38 @@ export default function PartyEventsPage() {
                   <tr key={i} onClick={() => openEvent(e)}
                       className="border-t border-[#E8D5C4]/50 hover:bg-[#FFF8F0] cursor-pointer">
                     <td className="py-1.5 px-3 text-[#6B5744] whitespace-nowrap">{e.event_date}</td>
-                    <td className="py-1.5 px-3 font-medium text-[#2D1B0E]">{e.event_name}</td>
+                    <td className="py-1.5 px-3 font-medium text-[#2D1B0E]">
+                      {e.event_name}
+                      {canSeeFinancials && e.revenue_only && (
+                        <span className="block text-[10px] text-[#8B7355] font-normal"
+                              title={`The booking is on more than one F&P. Its revenue counts once — on the latest F&P that is not cancelled, which has ${listedUnder(e.requisitions_listed_under) ? 'no row under its own name and date matched to it' : 'no requisitions yet'}.`}>
+                          {e.fp_id ? `${e.fp_id} · ` : ''}{listedUnder(e.requisitions_listed_under)
+                            ? `its requisitions are under ${listedUnder(e.requisitions_listed_under)}`
+                            : 'no requisitions yet'} — booking revenue counts here
+                        </span>
+                      )}
+                    </td>
                     <td className="py-1.5 px-3 text-[#6B5744]">{e.customer || '—'}</td>
                     <td className="py-1.5 px-3 text-right font-mono">{e.guest_count || '—'}</td>
                     <td className="py-1.5 px-3 text-right font-mono text-[#8B7355]">{e.req_count}</td>
                     <td className="py-1.5 px-3 text-right font-mono">{fmt(e.cost)}</td>
                     {canSeeFinancials && (<>
-                      <td className="py-1.5 px-3 text-right font-mono text-green-700">{fmt(e.revenue)}</td>
+                      <td className="py-1.5 px-3 text-right font-mono text-green-700">
+                        {fmt(e.revenue)}
+                        {countedElsewhere(e.revenue_withheld_reason) && (
+                          <span className="block text-[10px] text-[#8B7355] font-sans">
+                            {allCancelled(e.revenue_withheld_reason, e.revenue_seat_withheld_reason)
+                              ? 'every F&P of this booking is cancelled — not counted'
+                              : countedElsewhere(e.revenue_withheld_reason)}
+                          </span>
+                        )}
+                        {countedElsewhere(e.revenue_withheld_reason) && seatNotCounted(e.revenue_seat_withheld_reason) && (
+                          <span className="block text-[10px] text-amber-700 font-sans">{seatNotCounted(e.revenue_seat_withheld_reason)}</span>
+                        )}
+                      </td>
                       <td className={`py-1.5 px-3 text-right font-mono font-semibold ${profitTone}`}>{fmt(e.profit)}</td>
                       <td className={`py-1.5 px-3 text-right font-mono font-semibold ${fcTone}`}>
-                        {e.revenue > 0 ? `${e.food_cost_percent.toFixed(1)}%` : '—'}
+                        {e.revenue > 0 && !e.revenue_only ? `${e.food_cost_percent.toFixed(1)}%` : '—'}
                       </td>
                       <td className="py-1.5 px-3 text-right font-mono text-[#6B5744]">
                         {(e.guest_count ?? 0) > 0 ? fmt(e.per_head_revenue - e.per_head_cost) : '—'}

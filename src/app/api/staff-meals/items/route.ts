@@ -185,14 +185,16 @@ const fmt = (n: number) => (Number.isInteger(r6(n)) ? String(r6(n)) : String(Mat
  * Owner ruling 15 fixed the department staff-meal crash by PASSING THE USER to
  * postDeptLedger. It did not authorise a movement nobody signed for, so a blank
  * session is refused here, never relabelled. A `system:staff-meal` stand-in
- * used to fill the gap, and the gap is reachable: src/proxy.ts step 2c reads
+ * used to fill the gap. The gap was reachable: src/proxy.ts step 2c read
  * `s.expires_at > datetime('now')` as TEXT, while createSession() stores ISO
  * ('…T…Z', and 'T' sorts after ' '), so a token that expired earlier the same
- * UTC day passes the proxy while getCurrentUser() returns null. Production
- * refused that request (postDeptLedger threw: 500, whole batch rolled back).
- * This throws at the same point inside the same transaction, so the same
- * nothing is written. The handlers answer 401 'Sign in required' in place of
- * the developer-facing 500.
+ * UTC day passed the proxy while getCurrentUser() returned null. Ruling 53 makes
+ * the proxy compare julianday() times, so that token now stops at the proxy's
+ * 401; this refusal stays as the handler's own floor for any session that
+ * arrives blank anyway. Production refused that request (postDeptLedger threw:
+ * 500, whole batch rolled back). This throws at the same point inside the same
+ * transaction, so the same nothing is written. The handlers answer 401 'Sign in
+ * required' in place of the developer-facing 500.
  *
  * Only the department rail calls this. The central branch never took a user
  * and is unchanged.
@@ -297,6 +299,9 @@ function normDept(v: unknown): string | null {
 
 export async function GET(request: Request) {
   try {
+    // Ruling 53: the proxy only checks that a cookie is PRESENT on an API GET.
+    const me = await getCurrentUser();
+    if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
     const db = getDb();
     const url = new URL(request.url);
     const mealId = url.searchParams.get('meal_id');

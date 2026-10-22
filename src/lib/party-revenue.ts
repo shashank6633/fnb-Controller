@@ -68,7 +68,14 @@ export function revenueGate(status: string | undefined, eventDate: string | unde
 }
 
 /** What the revenue seat reads of a cached F&P row (both loaders carry it). */
-export interface SeatParty { party_unique_id?: string; fp_id?: string; event_date?: string }
+export interface SeatParty { party_unique_id?: string; fp_id?: string; event_date?: string; status?: string }
+
+/** A Cancelled F&P (F&P Records status) — the same test the What's On board
+ *  uses (src/lib/ct/whats-on.ts isCancelled): startsWith, so "Cancelled" and
+ *  "Canceled" count, "Confirmed (cancellation waived)" does not. */
+export function isCancelledStatus(status: string | undefined): boolean {
+  return String(status || '').trim().toLowerCase().startsWith('cancel');
+}
 
 /* ────────────────────────────────────────────────────────────────────────────
  * OWNER RULING 43 (2026-10-15) — A BOOKING'S REVENUE COUNTS ONCE.
@@ -83,7 +90,14 @@ export interface SeatParty { party_unique_id?: string; fp_id?: string; event_dat
  * it once per requisition event row (event_name + date), showed it on the event
  * row of EACH F&P date.
  *
- * THE RULE: the Final Total counts on ONE row — the LATEST F&P carrying the id:
+ * THE RULE: the Final Total counts on ONE row — the LATEST NOT-CANCELLED F&P
+ * carrying the id (owner ruling 51, 2026-10-21, refining 43):
+ *   0. a Cancelled F&P never takes the seat while the booking has an F&P that is
+ *      not Cancelled (isCancelledStatus). Only when EVERY F&P of the booking is
+ *      Cancelled is the seat the latest of them — and its gate withholds the
+ *      revenue, as production's gate did on each such row. A Draft (or any other
+ *      status) is a row like any other: a future Draft still holds the revenue
+ *      until it is Approved and over (production's gate, unchanged);
  *   1. the latest Date of Event ('YYYY-MM-DD', F&P Records col H, as toIsoDate()
  *      writes it — so a string compare is a date compare);
  *   2. on the same date, the row CREATED LAST — F&P Records col C "Created At"
@@ -107,9 +121,12 @@ export interface SeatParty { party_unique_id?: string; fp_id?: string; event_dat
  *
  * WHICH ROWS ARE ROWS: every cached F&P row, whatever its status — exactly the
  * rows the requisition and consumption claims in src/lib/party-liquor.ts treat
- * as holders of an id. A Cancelled F&P is NOT skipped (that call is the owner's,
- * not this fix's): when it is the latest row carrying the id, the revenue is
- * seated on it and its gate withholds it ('awaiting confirmation').
+ * as holders of an id. A Cancelled F&P stays a row (it still shows its own
+ * costs and names the seat: "revenue counted on FP-81"); it only cannot BE the
+ * seat while a not-cancelled F&P carries the id (rule 0 above). Round 4 seated
+ * the revenue on a Cancelled latest F&P, whose gate then withheld it, so the
+ * booking counted on NO row (AK-88: FP-81 Approved 09-10, FP-82 Cancelled
+ * 10-10); now it counts once on FP-81, as production's board did.
  *
  * An id on ONE row (the normal case) gets no seat: pnlFor and
  * resolveBookingRevenue compute exactly what they did before, and the row
@@ -185,8 +202,12 @@ export function revenueSeats(parties: SeatParty[], createdAt: (string | undefine
   const dateOf = (i: number) => String(parties[i].event_date || '').trim();
   for (const holders of byId.values()) {
     if (holders.length < 2) continue;
-    const latest = holders.reduce((a, i) => (dateOf(i) > a ? dateOf(i) : a), dateOf(holders[0]));
-    const tied = holders.filter(i => dateOf(i) === latest);   // ascending sheet order
+    // Ruling 51: the seat is chosen among the F&Ps that are NOT Cancelled; only
+    // a booking whose every F&P is Cancelled falls back to all of them.
+    const live = holders.filter(i => !isCancelledStatus(parties[i].status));
+    const pool = live.length ? live : holders;
+    const latest = pool.reduce((a, i) => (dateOf(i) > a ? dateOf(i) : a), dateOf(pool[0]));
+    const tied = pool.filter(i => dateOf(i) === latest);       // ascending sheet order
     const stamps = tied.map(i => createdAtMs(createdAt[i]));
     let owner = tied[tied.length - 1];                         // the lower sheet row
     if (tied.length > 1 && stamps.every(s => s !== null)) {
@@ -209,6 +230,26 @@ export function candidateNames(p: CachedParty): string[] {
 }
 
 /**
+ * WHICH cached party a requisition event row (its trimmed event_name + date) is:
+ * the first party on that date carrying the name among its candidates — or,
+ * when that party's AKAN id is on two or more F&P rows (`seats`), the SEATED
+ * F&P of that same id if it too carries the name that evening. -1 = none.
+ * Lifted out of resolveBookingRevenue unchanged, so the seat-only rows below
+ * resolve an event row to the very party the revenue column does.
+ */
+function resolveEventParty(parties: CachedParty[], en: string, eventDate: string,
+                           seats?: Map<number, RevenueSeat>): number {
+  let idx = parties.findIndex(x => x.event_date === eventDate && candidateNames(x).includes(en));
+  if (idx >= 0 && seats && parties[idx].party_unique_id) {
+    const id = parties[idx].party_unique_id;
+    const seated = parties.findIndex((x, i) => x.party_unique_id === id && seats.get(i)?.here === true
+      && x.event_date === eventDate && candidateNames(x).includes(en));
+    if (seated >= 0) idx = seated;
+  }
+  return idx;
+}
+
+/**
  * Resolve the booking revenue for a party requisition event (event_name+date):
  * find the cached party whose date matches AND whose candidate names include the
  * event_name, then apply the gate to its booking Final Total.
@@ -222,21 +263,24 @@ export function candidateNames(p: CachedParty): string[] {
  * date would have landed on none). Only an F&P carrying the SAME id as the first
  * match is preferred, so which booking an event row resolves to never changes.
  * Without `seats`, or for an id on one row, exactly as before.
+ *
+ * On such an other-F&P row ONLY, `seat_withheld_reason` says whether the seat
+ * itself counts it yet: null = it does; 'cancelled' (every F&P of the booking is
+ * Cancelled, so the seat is a Cancelled one); 'no booking row' (no Final Total
+ * on the Party Bookings sheet); else the seat's gate reason ('awaiting
+ * confirmation', 'party not over yet'). So "revenue counted on FP-92" is never
+ * read as "already in the total" while FP-92 still withholds it. Absent on
+ * every other row, so an id on one F&P returns exactly what it did.
  */
 export function resolveBookingRevenue(
   bookings: Map<string, number>, parties: CachedParty[],
   eventName: string, eventDate: string, today: string,
   canonicalOnly = false,
   seats?: Map<number, RevenueSeat>,
-): { party_unique_id: string | null; booking_total: number; revenue: number; withheld_reason: string | null } {
+): { party_unique_id: string | null; booking_total: number; revenue: number; withheld_reason: string | null;
+     seat_withheld_reason?: string | null } {
   const en = String(eventName || '').trim();
-  let idx = parties.findIndex(x => x.event_date === eventDate && candidateNames(x).includes(en));
-  if (idx >= 0 && seats && parties[idx].party_unique_id) {
-    const id = parties[idx].party_unique_id;
-    const seated = parties.findIndex((x, i) => x.party_unique_id === id && seats.get(i)?.here === true
-      && x.event_date === eventDate && candidateNames(x).includes(en));
-    if (seated >= 0) idx = seated;
-  }
+  const idx = resolveEventParty(parties, en, eventDate, seats);
   const p = idx >= 0 ? parties[idx] : undefined;
   if (!p || !p.party_unique_id) return { party_unique_id: null, booking_total: 0, revenue: 0, withheld_reason: 'no booking row' };
   // A party can have requisitions raised under several names (contact person AND
@@ -245,10 +289,20 @@ export function resolveBookingRevenue(
   if (canonicalOnly && en !== String(p.event_name || '').trim()) {
     return { party_unique_id: p.party_unique_id, booking_total: 0, revenue: 0, withheld_reason: 'counted on the primary event row' };
   }
-  // Ruling 43: the booking counts once, on its latest F&P — not on this one.
+  // Ruling 43/51: the booking counts once, on its latest not-cancelled F&P —
+  // not on this one.
   const seat = seats?.get(idx);
   if (seat && !seat.here) {
-    return { party_unique_id: p.party_unique_id, booking_total: 0, revenue: 0, withheld_reason: `revenue counted on ${seat.fp_id}` };
+    const id = p.party_unique_id;
+    const at = parties.findIndex((x, i) => x.party_unique_id === id && seats?.get(i)?.here === true);
+    const sp = at >= 0 ? parties[at] : undefined;
+    const seatTotal = bookings.get(id) || 0;
+    const seat_withheld_reason = !sp ? null
+      : isCancelledStatus(sp.status) ? 'cancelled'
+      : !(seatTotal > 0) ? 'no booking row'
+      : revenueGate(sp.status, sp.event_date, today).reason;
+    return { party_unique_id: id, booking_total: 0, revenue: 0, withheld_reason: `revenue counted on ${seat.fp_id}`,
+             seat_withheld_reason };
   }
   const total = bookings.get(p.party_unique_id) || 0;
   const gate = revenueGate(p.status, p.event_date, today);
@@ -258,4 +312,143 @@ export function resolveBookingRevenue(
     revenue: gate.allow ? total : 0,
     withheld_reason: gate.allow ? null : gate.reason,
   };
+}
+
+/**
+ * OWNER RULING 51 ON /api/party-events — THE SEATED F&P'S OWN ROW.
+ *
+ * That page's rows are requisition events (event_name + date), so an F&P with no
+ * party requisition has no row there. Under ruling 43 the booking's revenue is
+ * carried only by the event row that resolves to its SEATED F&P, so a booking
+ * whose seat has no requisition event row of its own — a second function the
+ * store has issued nothing for, or an F&P re-created on the same date under a
+ * corrected contact name while the requisitions were raised from the old one —
+ * showed ₹0 on every row of the page while the P&L board counted it once, on
+ * the seat (production showed it on the event row of EVERY F&P of the booking
+ * that had requisitions, and on every board row).
+ *
+ * This returns ONE revenue-only row per such seat, named and dated as the seat
+ * F&P itself — its canonical name (contact_person-first, loadUpcomingParties:
+ * the event_name a requisition raised from it with Raise Req carries) on its
+ * Date of Event — so /party-events shows the booking once, on the same F&P as
+ * the board. A seat is CARRIED, and gets no extra row, when a requisition event
+ * row resolves to it (resolveEventParty) under its canonical name: exactly the
+ * row resolveBookingRevenue gives the booking to. Only a seat whose revenue
+ * COUNTS gets a row — a Final Total above 0 and the gate open (Approved and
+ * over, revenueGate): a withheld seat has nothing to count on the page, and
+ * gets its row once it has, or once a requisition is raised from it.
+ *
+ * Only an id on two or more F&Ps has a seat, so an id on ONE F&P never produces
+ * a row here — the page is exactly what it was for it.
+ *
+ * `eventKeys` = every (event_name, event_date) the page lists as a row (the
+ * list's own GROUP BY: purpose = 'party' AND event_name != ''), with the fp_id
+ * each requisition under it was raised from (one entry per distinct triple).
+ * The drill-down finds a row by name + date, so a revenue-only row takes a key
+ * no requisition event uses: the canonical name, else '<name> (<FP id>)', else
+ * the FP id. If all three are taken it gets no row — never a row that would
+ * open another party's requisitions.
+ *
+ * `listed_under` = the requisition rows that ARE the seat's, under a key that
+ * does not carry its revenue: those resolving to it under a name that is not its
+ * canonical one (raised under the company name, say); those raised from it
+ * (fp_id) whose name + date resolve elsewhere (renamed or re-dated after
+ * raising, or under its own name + date while resolveEventParty gives that row
+ * to ANOTHER F&P of that name that evening — `same_name_matched_to`); and, by ruling 43's
+ * "else the F&P on its date" (claimPartyRequisitions' rule), those carrying its
+ * id and no fp_id of a listed F&P, dated on its date while it is the one F&P of
+ * the id that evening. Empty = no party requisition is the seat's by those
+ * rules — the board costs none on it either — so the page may say "no
+ * requisitions yet". (One carrying its id that no rule gives it — another date,
+ * or two F&Ps of the id on its date — is costed on no party and listed on
+ * /party-pnl, not here.)
+ */
+export interface SeatListedUnder {
+  event_name: string;
+  event_date: string;
+  /** Set only when this row is under the seat's OWN name and date: the page
+   *  matches the row to another F&P of that name that evening (resolveEventParty)
+   *  — its fp_id ('' when it has none). null = another name or date. */
+  same_name_matched_to: string | null;
+}
+
+export interface SeatOnlyEvent {
+  /** The seated F&P, an index into `parties`. */
+  index: number;
+  event_name: string;
+  event_date: string;
+  fp_id: string;
+  party_unique_id: string;
+  booking_total: number;
+  revenue: number;
+  listed_under: SeatListedUnder[];
+}
+
+export function seatOnlyEvents(
+  bookings: Map<string, number>, parties: CachedParty[], seats: Map<number, RevenueSeat>,
+  eventKeys: { event_name: string; event_date: string; fp_id?: string | null; party_unique_id?: string | null }[],
+  today: string,
+): SeatOnlyEvent[] {
+  if (!seats.size) return [];
+  const keyOf = (name: string, date: string) => JSON.stringify([name, date]);
+  const taken = new Set<string>();
+  const carried = new Set<number>();
+  const resolved: number[] = [];
+  for (const k of eventKeys) {
+    taken.add(keyOf(String(k.event_name ?? ''), String(k.event_date ?? '')));
+    const en = String(k.event_name || '').trim();
+    const idx = resolveEventParty(parties, en, k.event_date, seats);
+    resolved.push(idx);
+    if (idx >= 0 && seats.get(idx)?.here === true && en === String(parties[idx].event_name || '').trim()) carried.add(idx);
+  }
+  const listedUnder = (i: number) => {
+    const p = parties[i];
+    const fp = String(p.fp_id || '').trim();
+    const id = String(p.party_unique_id || '').trim();
+    const name = String(p.event_name || '').trim();
+    const date = String(p.event_date || '');
+    // claimPartyRequisitions: an id-bearing requisition whose fp_id names no
+    // listed F&P goes by its date — to the ONE holder of its id on that date.
+    const listedFp = (f: string) => parties.some(x => x.fp_id === f);
+    const soleOnDate = parties.filter(x => String(x.party_unique_id || '').trim() === id
+      && String(x.event_date || '').trim() === date.trim()).length === 1;
+    const seen = new Set<string>(); const out: SeatListedUnder[] = [];
+    eventKeys.forEach((k, n) => {
+      const kfp = String(k.fp_id ?? '').trim();
+      const kid = String(k.party_unique_id ?? '').trim();
+      const mine = resolved[n] === i
+        || (!!fp && kfp === fp)
+        || (!!id && kid === id && (!kfp || !listedFp(kfp)) && soleOnDate && String(k.event_date ?? '') === date.trim());
+      if (!mine) return;
+      const key = keyOf(String(k.event_name ?? ''), String(k.event_date ?? ''));
+      if (seen.has(key)) return;
+      seen.add(key);
+      // Under its own name and date, yet not carried: the row resolves to
+      // another F&P of that name that evening (resolveEventParty takes the
+      // first on the sheet; one of the seat's own id would have been the seat).
+      const own = String(k.event_name || '').trim() === name && String(k.event_date ?? '') === date;
+      const other = resolved[n];
+      out.push({ event_name: String(k.event_name ?? ''), event_date: String(k.event_date ?? ''),
+                 same_name_matched_to: own && other >= 0 && other !== i ? String(parties[other].fp_id || '') : null });
+    });
+    return out;
+  };
+  const out: SeatOnlyEvent[] = [];
+  for (const [i, seat] of seats) {
+    if (!seat.here || carried.has(i)) continue;
+    const p = parties[i];
+    if (!p || !p.party_unique_id) continue;
+    const total = bookings.get(p.party_unique_id) || 0;
+    if (!(total > 0) || !revenueGate(p.status, p.event_date, today).allow) continue;
+    const date = String(p.event_date || '');
+    const name = String(p.event_name || '').trim();
+    const fp = String(p.fp_id || '').trim();
+    const choice = [name, name && fp ? `${name} (${fp})` : '', fp].find(n => n && !taken.has(keyOf(n, date)));
+    if (!choice) continue;
+    taken.add(keyOf(choice, date));
+    out.push({ index: i, event_name: choice, event_date: date, fp_id: p.fp_id || '',
+               party_unique_id: p.party_unique_id, booking_total: total, revenue: total,
+               listed_under: listedUnder(i) });
+  }
+  return out;
 }

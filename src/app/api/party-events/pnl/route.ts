@@ -21,8 +21,9 @@ import { revenueSeats, loadCreatedAt, type RevenueSeat } from '@/lib/party-reven
  *
  *   Revenue    = Party Bookings sheet "Final Total Amount" (matched by party_unique_id),
  *                counted ONCE per booking: when the id is on two or more F&P rows,
- *                only on the LATEST of them (owner ruling 43 — see revenueSeats());
- *                every other row with the id shows ₹0 and names the row it is on
+ *                only on the LATEST NOT-CANCELLED of them (owner rulings 43 + 51 —
+ *                see revenueSeats()); every other row with the id shows ₹0 and
+ *                names the row it is on
  *   Food Cost  = Σ (party requisition issued qty × material avg price), non-liquor
  *                categories, over the requisitions THIS party is costed on
  *                (owner ruling 34, 2026-10-14): those carrying its id (when the
@@ -94,10 +95,12 @@ function revenueGate(status: string | undefined, eventDate: string | undefined, 
 }
 
 // OWNER RULING 43 (2026-10-15) — a booking's revenue counts ONCE, on the LATEST
-// F&P carrying its id. The rule (revenueSeats: latest Date of Event, then the
-// row created last by Party Manager's Created At, else the lower sheet row) is
-// in src/lib/party-revenue.ts, moved there unchanged so /api/party-events (the
-// sales-era page) seats each booking on the very same F&P as this board.
+// F&P carrying its id; RULING 51 (2026-10-21): the latest NOT-CANCELLED one. The
+// rule (revenueSeats: a Cancelled F&P never takes the seat while the booking has
+// one that is not; then the latest Date of Event, then the row created last by
+// Party Manager's Created At, else the lower sheet row) is in
+// src/lib/party-revenue.ts, so /api/party-events (the sales-era page) seats each
+// booking on the very same F&P as this board.
 
 /**
  * A party's share of the ORPHAN consumption rows (no party_unique_id), as decided
@@ -297,6 +300,13 @@ function pnlFor(db: ReturnType<typeof getDb>, bookings: Map<string, number>,
   };
 }
 
+/** The reason a claim put on an entry it charged to nobody, when it gave one
+ *  (src/lib/party-liquor.ts) — read without depending on that field's type. */
+function claimReason(a: object): string | undefined {
+  const r = (a as { reason?: unknown }).reason;
+  return typeof r === 'string' ? r : undefined;
+}
+
 /**
  * The orphan rows the claim charged to NO party, described for the owner:
  *   reason 'several_parties' — two or more parties that evening carry the name
@@ -308,6 +318,11 @@ function pnlFor(db: ReturnType<typeof getDb>, bookings: Map<string, number>,
  *     neither the F&P the entry was recorded from nor its date picks one
  *     (claimIdConsumption; candidates = the holders on its date, else all).
  *     Assign picks the F&P (PATCH sets the entry's fp_id).
+ *   reason 'id_changed_after_recording' — owner ruling 52: the F&P it was
+ *     recorded from is on the list but no longer carries its id (the sheet
+ *     re-keyed it after the bottle was typed in), so it is counted on NEITHER
+ *     (claimIdConsumption sets this reason; candidates = that F&P and the rows
+ *     carrying the id). Assign picks one (the PATCH decides what changes).
  *   reason 'id_not_listed' — its id is on NO row of the party list, even
  *     trimmed (the F&P was deleted from the sheet, or its AKAN id was changed
  *     after the entry was recorded). Owner ruling 43: counted on none, so it is
@@ -322,11 +337,13 @@ function pnlFor(db: ReturnType<typeof getDb>, bookings: Map<string, number>,
  */
 function describeUnassigned(db: ReturnType<typeof getDb>, claims: OrphanClaims,
                             idClaims: IdConsumptionClaims, parties: CachedPnlParty[]) {
-  const items: { row: OrphanRow; reason: 'several_parties' | 'no_party' | 'id_on_several_parties' | 'id_not_listed';
+  const items: { row: OrphanRow; reason: 'several_parties' | 'no_party' | 'id_on_several_parties' | 'id_changed_after_recording' | 'id_not_listed';
                  candidates: number[]; party_unique_id: string | null }[] = [
     ...claims.ambiguous.map(a => ({ row: a.row, reason: 'several_parties' as const, candidates: a.candidates, party_unique_id: null })),
     ...claims.unmatched.map(row => ({ row, reason: 'no_party' as const, candidates: [] as number[], party_unique_id: null })),
-    ...idClaims.shared.map(a => ({ row: a.row, reason: 'id_on_several_parties' as const,
+    ...idClaims.shared.map(a => ({ row: a.row,
+                                   reason: claimReason(a) === 'id_changed_after_recording'
+                                     ? 'id_changed_after_recording' as const : 'id_on_several_parties' as const,
                                    candidates: a.candidates, party_unique_id: a.row.party_unique_id })),
     ...idClaims.notListed.map(row => ({ row, reason: 'id_not_listed' as const,
                                         candidates: [] as number[], party_unique_id: row.party_unique_id })),
@@ -384,14 +401,23 @@ function describeUnassigned(db: ReturnType<typeof getDb>, claims: OrphanClaims,
  *     on the list hold (one booking, two F&Ps), the F&P it was raised from is
  *     none of them (ruling 43), and its date matches none of them or more than
  *     one (candidates: the holders on its date, else all).
+ *   reason 'id_changed_after_recording' — owner ruling 52: the F&P it was raised
+ *     from is on the list but no longer carries its id; costed on NEITHER
+ *     (candidates: that F&P and the rows carrying the id).
+ *   reason 'no_party' — no id, and no party that evening carries its name
+ *     (ruling 43: listed; no candidates).
+ * (The last two are set by claimPartyRequisitions when it gives a reason.)
  * Its food / liquor split is computed by the same partyReqSplit() the rows use,
  * and is returned only to the audience that sees party financials.
  */
 function describeUnassignedReqs(db: ReturnType<typeof getDb>, claims: ReqClaims,
                                 parties: CachedPnlParty[], financialsAllowed: boolean) {
   const items = [
-    ...claims.ambiguous.map(a => ({ req: a.req, reason: 'several_parties' as const, candidates: a.candidates })),
-    ...claims.idShared.map(a => ({ req: a.req, reason: 'id_on_several_parties' as const, candidates: a.candidates })),
+    ...claims.ambiguous.map(a => ({ req: a.req,
+      reason: claimReason(a) === 'no_party' ? 'no_party' as const : 'several_parties' as const, candidates: a.candidates })),
+    ...claims.idShared.map(a => ({ req: a.req,
+      reason: claimReason(a) === 'id_changed_after_recording' ? 'id_changed_after_recording' as const : 'id_on_several_parties' as const,
+      candidates: a.candidates })),
     ...claims.idNotListed.map(a => ({ req: a.req, reason: 'id_not_listed' as const, candidates: a.nameMatches })),
   ];
   return items.map(({ req, reason, candidates }) => {
@@ -519,7 +545,8 @@ export async function GET(request: Request) {
     const claims = claimOrphanConsumption(db, claimants);
     const idClaims = claimIdConsumption(db, claimants);
     const reqClaims = claimPartyRequisitions(db, claimants);
-    // Ruling 43: one booking's revenue on ONE row — the latest F&P carrying its id.
+    // Ruling 43/51: one booking's revenue on ONE row — the latest not-cancelled
+    // F&P carrying its id.
     const seats = revenueSeats(parties, loadCreatedAt(db, parties));
 
     // Bulk: every cached party. Booking revenue is counted ONLY for Confirmed/Done

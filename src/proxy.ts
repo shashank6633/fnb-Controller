@@ -408,8 +408,12 @@ export function proxy(req: NextRequest) {
                r.is_head_chef AS role_head_chef
         FROM sessions s JOIN users u ON u.id = s.user_id
         LEFT JOIN roles r ON r.id = u.role_id
-        WHERE s.token = ? AND u.is_active = 1 AND s.expires_at > datetime('now')
+        WHERE s.token = ? AND u.is_active = 1 AND julianday(s.expires_at) > julianday('now')
       `).get(session) as any;
+      // ^ Ruling 53: expiry compared as TIMES, not text. createSession() stores
+      // ISO 'YYYY-MM-DDTHH:MM:SS.sssZ' and datetime('now') is 'YYYY-MM-DD HH:MM:SS';
+      // as text 'T' > ' ', so a token expired earlier the same UTC day passed.
+      // julianday() parses both (ms precision), matching getCurrentUser's Date test.
       const user = row ? {
         role: (row.role_id && row.role_base) ? row.role_base : row.role,
         page_access: row.page_access != null ? row.page_access : (row.role_id ? (row.role_page_access ?? null) : null),
@@ -588,8 +592,9 @@ export function proxy(req: NextRequest) {
                r.base_role AS role_base, r.is_head_chef AS role_head_chef
         FROM sessions s JOIN users u ON u.id = s.user_id
         LEFT JOIN roles r ON r.id = u.role_id
-        WHERE s.token = ? AND u.is_active = 1 AND s.expires_at > datetime('now')
+        WHERE s.token = ? AND u.is_active = 1 AND julianday(s.expires_at) > julianday('now')
       `).get(session) as any;
+      // Expiry as times, not text — see the page-gate SELECT above (ruling 53).
       if (!row) return NextResponse.json({ error: 'Sign in required' }, { status: 401 });
 
       // ── 🔒 GUEST FEEDBACK: the owner's READ-ONLY rule, enforced server-side.
