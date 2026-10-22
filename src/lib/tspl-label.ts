@@ -224,7 +224,7 @@ function layoutLabel(
   const qrBottom = MARGIN + QR_BOX + QR_GAP;
   const widthAt = (y: number) => (withQr && y < qrBottom ? nearW : fullW);
   const textH = design.show_barcode_text ? 22 : 0;
-  const truncated = (ls: string[]) => ls.some((l) => l.endsWith('…'));
+  const truncated = (ls: string[]) => ls.some((l) => l.endsWith('...'));
 
   const build = (tm: number, fm: number, bh: number) => {
     let y = MARGIN;
@@ -272,7 +272,7 @@ function wrap(text: string, maxChars: number, maxLines: number): string[] {
   const lines: string[] = [];
   let cur = '';
   // Anything left off the label — a word past the last line, or the tail of a
-  // word longer than a whole line — marks the last line with "…", so a cut name
+  // word longer than a whole line — marks the last line with "...", so a cut name
   // never reads as complete (and layoutLabel can step the size down instead).
   let cut = false;
   for (const w of words) {
@@ -284,8 +284,11 @@ function wrap(text: string, maxChars: number, maxLines: number): string[] {
   }
   if (cur) { if (lines.length < maxLines) lines.push(cur); else cut = true; }
   if (cut) {
+    // Plain ASCII dots: the printer's built-in bitmap fonts have no "…" glyph.
+    const ELL = '...';
     const last = lines[lines.length - 1] || '';
-    lines[lines.length - 1] = (last.length > maxChars - 1 ? last.slice(0, maxChars - 1) : last) + '…';
+    const room = Math.max(0, maxChars - ELL.length);
+    lines[lines.length - 1] = (last.length > room ? last.slice(0, room) : last) + ELL;
   }
   return lines.slice(0, maxLines);
 }
