@@ -300,7 +300,8 @@ export default function KitchenProductionPage() {
 
   // Reference data
   const [meName, setMeName] = useState('');
-  const [isAdmin, setIsAdmin] = useState(false);
+  // Admin, or a role with "Can change label printer settings" (Settings → Roles).
+  const [canEditPrinter, setCanEditPrinter] = useState(false);
   const [recipes, setRecipes] = useState<RecipeOpt[]>([]);
   const [printerCfg, setPrinterCfg] = useState<LabelPrinterConfig | null>(null);
 
@@ -362,7 +363,7 @@ export default function KitchenProductionPage() {
     fetch('/api/auth/me').then(r => r.json()).then(d => {
       const n = d?.user?.name || d?.user?.email || '';
       setMeName(n);
-      setIsAdmin(d?.user?.role === 'admin');
+      setCanEditPrinter(d?.user?.role === 'admin' || !!d?.user?.can_manage_label_printer);
       setForm(f => (f.prepared_by ? f : { ...f, prepared_by: n }));
     }).catch(() => {});
     fetch('/api/recipes').then(r => r.json()).then(d => {
@@ -596,7 +597,7 @@ export default function KitchenProductionPage() {
                   className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm flex items-center gap-2">
             <Settings className="w-4 h-4" /> <span className="hidden sm:inline">Production Settings</span>
           </button>
-          {isAdmin && (
+          {canEditPrinter && (
             <button onClick={() => setShowPrinterSettings(true)}
                     title="Label printer settings"
                     className="px-3 py-2 bg-white border border-[#E8D5C4] hover:bg-[#FFF1E3] text-[#6B5744] rounded-lg text-sm flex items-center gap-2">
