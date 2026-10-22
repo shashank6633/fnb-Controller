@@ -380,14 +380,24 @@ export default function PartyPnLPage() {
                                 </>
                               : <span className="text-emerald-700">✓ {r.liquor_items} item{r.liquor_items === 1 ? '' : 's'} recorded</span>}
                           </button>
-                        : <span className="text-amber-700 text-[10px]">not recorded yet</span>}
+                        // has_liquor_recorded is false only when NO liquor is
+                        // counted on this row. "not recorded yet" is true only when
+                        // nothing that names this row waits on no party either: a
+                        // bottle recorded (maybe on this very screen) but counted
+                        // on no party, or a requisition costed on no party, makes
+                        // it false — the badges below say "N recorded, counted on
+                        // no party" — so the cell then says what IS true: none of
+                        // it is counted here.
+                        : ((r.liquor_unassigned_items || 0) > 0 || (r.requisitions_unassigned || 0) > 0)
+                          ? <span className="text-amber-700 text-[10px]">no liquor counted</span>
+                          : <span className="text-amber-700 text-[10px]">not recorded yet</span>}
                       {/* Recorded under a name this party shares with another party
                           that evening (or with an id on several F&Ps, or whose id
                           changed after recording — ruling 52): counted on NEITHER.
                           Only an entry with a candidate that has an AKAN id can be
                           assigned, so the badge does not promise an assignment.
-                          Said here so nobody reads "not recorded yet" and types the
-                          bottle in again. */}
+                          Said here so nobody reads the empty cell as "nothing was
+                          recorded" and types the bottle in again. */}
                       {(r.liquor_unassigned_items || 0) > 0 && (
                         <button onClick={() => setRecordFor(r)}
                                 className="block text-[10px] text-red-700 hover:underline text-left"
@@ -982,10 +992,22 @@ function RecordConsumptionModal({ target, onClose, onChanged }: {
               <div className="text-xs text-[#8B7355] py-2"><Loader2 size={12} className="inline animate-spin mr-1" /> Loading…</div>
             ) : existing.length === 0 ? (
               <div className="text-xs text-[#8B7355] bg-[#FFF8F0] border border-[#E8D5C4] rounded p-2">
+                {/* `existing` is only what is COUNTED on this row. An entry in
+                    the "Not counted on this P&L" list below may have been typed on
+                    this very screen, and a requisition in the "Not costed" note
+                    was raised for a party of this name — so "nothing recorded"
+                    is said only when neither list has anything; otherwise the
+                    text says what is true: none of it is counted here. */}
                 {reqItems.length > 0
-                  ? <>Nothing recorded on this screen — this event&apos;s liquor is already costed from the Bar requisition above.
-                      Add an item here only if it was drawn from the bar <b>on top of</b> what the store issued.</>
-                  : 'Nothing recorded for this event yet.'}
+                  ? (unassignedHere.length > 0 || unassignedReqsHere.length > 0)
+                    ? <>Nothing recorded on this screen is counted on this P&amp;L. The liquor costed for this event is the
+                        Bar requisition above; the entries listed below are counted on no party. Add an item here only if it
+                        was drawn from the bar <b>on top of</b> what the store issued and is not listed below.</>
+                    : <>Nothing recorded on this screen — this event&apos;s liquor is already costed from the Bar requisition above.
+                        Add an item here only if it was drawn from the bar <b>on top of</b> what the store issued.</>
+                  : (unassignedHere.length > 0 || unassignedReqsHere.length > 0)
+                    ? 'No liquor is counted on this P&L for this event — the entries listed below are counted on no party.'
+                    : 'Nothing recorded for this event yet.'}
               </div>
             ) : (
               <div className="border border-[#E8D5C4] rounded-lg overflow-hidden">
@@ -1082,10 +1104,12 @@ function RecordConsumptionModal({ target, onClose, onChanged }: {
             </div>
           )}
 
-          {/* REQUISITIONS COSTED ON NO PARTY (owner ruling 34). Raised with no
-              party id under a name this party shares with another that evening, so
-              neither P&L carries them. Listed — never summed — so this modal shows
-              what the row's badge counts, and nobody reads the gap as missing. */}
+          {/* REQUISITIONS COSTED ON NO PARTY (owner rulings 34, 43, 52). Raised
+              with no party id under a name this party shares with another that
+              evening, or carrying an id on several F&Ps that nothing picks, or an
+              id the F&P it was raised from no longer carries — so no P&L carries
+              them. Listed — never summed — so this modal shows what the row's
+              badge counts, and nobody reads the gap as missing. */}
           {!loadingExisting && unassignedReqsHere.length > 0 && (
             <div className="border border-red-200 rounded-lg px-2 py-1.5 text-[10px] text-red-800 bg-red-50">
               <b>Not costed on this P&amp;L:</b>{' '}

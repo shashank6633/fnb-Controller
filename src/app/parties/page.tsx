@@ -46,7 +46,11 @@ interface PnLRow {
   margin_pct: number;
   has_revenue: boolean;
   has_liquor_recorded: boolean;
-  booking_total?: number;                   // raw Final Total from the sheet (before the gate)
+  /** Liquor entries / requisitions that name this row but are counted on no
+   *  party (owner rulings 34, 43, 52) — counts only; never in the figures. */
+  liquor_unassigned_items?: number;
+  requisitions_unassigned?: number;
+  booking_total?: number;                  // raw Final Total from the sheet (before the gate)
   revenue_withheld_reason?: string | null;  // why revenue isn't counted yet (or null)
   status?: string;
   // Present ONLY when this row's AKAN id is on two or more F&P rows (owner
@@ -258,9 +262,21 @@ export default function PartyPnLAdminPage() {
                         {r.food_items > 0 && <span className="text-[9px] text-[#8B7355] ml-1">({r.food_items})</span>}
                       </td>
                       <td className="py-1.5 px-3 text-right font-mono">
-                        {r.liquor_cost > 0
+                        {/* "not recorded" only when nothing is: a counted line at
+                            ₹0 shows ₹0 (its count says it is there), and a bottle
+                            or requisition that names this row but is counted on no
+                            party (rulings 34, 43, 52) is recorded — just not here. */}
+                        {r.liquor_cost > 0 || r.liquor_items > 0
                           ? <>{fmt(r.liquor_cost)} <span className="text-[9px] text-[#8B7355]">({r.liquor_items})</span></>
-                          : <span className="text-amber-700 text-[10px]">not recorded</span>}
+                          : ((r.liquor_unassigned_items || 0) > 0 || (r.requisitions_unassigned || 0) > 0)
+                            ? <span className="text-amber-700 text-[10px]"
+                                    title={[
+                                      (r.liquor_unassigned_items || 0) > 0 ? `${r.liquor_unassigned_items} liquor entr${r.liquor_unassigned_items === 1 ? 'y' : 'ies'} recorded` : '',
+                                      (r.requisitions_unassigned || 0) > 0 ? `${r.requisitions_unassigned} requisition${r.requisitions_unassigned === 1 ? '' : 's'} raised` : '',
+                                    ].filter(Boolean).join(' and ') + ' with this party among their matching parties, counted on no party — listed on Party Liquor Consumption.'}>
+                                no liquor counted
+                              </span>
+                            : <span className="text-amber-700 text-[10px]">not recorded</span>}
                       </td>
                       <td className={`py-1.5 px-3 text-right font-mono ${r.profit >= 0 ? 'text-emerald-700' : 'text-red-700'} font-semibold`}>
                         {r.has_revenue ? fmt(r.profit) : '—'}

@@ -129,8 +129,9 @@ function shareFor(claims: OrphanClaims, index: number): OrphanShare {
 
 /** awaitingN also counts the entries CARRYING an id that name this row among
  *  their candidates (the id is on several rows and neither the F&P nor the date
- *  picks one — claimIdConsumption): charged to nobody, counted so the badge
- *  says a bottle is waiting. */
+ *  picks one, or the F&P they were recorded from no longer carries their id —
+ *  ruling 52; claimIdConsumption): charged to nobody, counted so the badge
+ *  says a bottle is recorded but counted on no party. */
 function plusIdAwaiting(share: OrphanShare, idAwaitingN: number): OrphanShare {
   return { ...share, awaitingN: share.awaitingN + idAwaitingN };
 }
@@ -280,14 +281,17 @@ function pnlFor(db: ReturnType<typeof getDb>, bookings: Map<string, number>,
     // names this party and another that evening, so it is charged to nobody until
     // the owner assigns it (owner ruling 2026-10-14). It also counts entries that
     // CARRY an id this row shares with another F&P row when neither the F&P they
-    // were recorded from nor their date picks one (claimIdConsumption).
+    // were recorded from nor their date picks one, and entries whose recorded-from
+    // F&P no longer carries their id (ruling 52) — claimIdConsumption.
     liquor_matched_by_name_items: orphan.matchedN,
     liquor_matched_by_name_cost: orphan.matchedCost,
     liquor_unassigned_items: orphan.awaitingN,
     // Requisitions with NO id raised under a name this party shares with another
     // party that evening, or carrying an id this party shares with another row
-    // when neither the F&P it was raised from nor its date picks one: costed on
-    // NEITHER (ruling 34a / 43). Not
+    // when neither the F&P it was raised from nor its date picks one, or raised
+    // from this F&P when it no longer carries the requisition's id (ruling 52 —
+    // then this F&P may be its only candidate, so it is NOT necessarily shared
+    // with another party): costed on NEITHER / none (ruling 34a / 43 / 52). Not
     // included in food_* / liquor_* above; a count so the row can say so — the
     // money is in the top-level unassigned_requisitions list.
     requisitions_unassigned: reqAwaitingN,
