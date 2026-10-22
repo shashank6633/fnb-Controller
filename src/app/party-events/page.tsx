@@ -73,13 +73,16 @@ interface Event {
    *  null = it does; else why not ('awaiting confirmation', 'party not over yet',
    *  'no booking row', 'cancelled'). */
   revenue_seat_withheld_reason?: string | null;
-  /** A revenue-only row (ruling 51): the F&P that carries a booking's revenue
-   *  has no requisition row of its own, so the server lists it on its own
-   *  (admin/HOD only). */
+  /** A revenue-only row (ruling 51): the F&P a booking's revenue counts on (the
+   *  board's) has no requisition row under its own name matched to it, so the
+   *  server lists it on its own (admin/HOD only). */
   revenue_only?: boolean;
   fp_id?: string;
+  /** On a revenue-only row: how many F&Ps carry the booking's id — 1 = this is
+   *  its only F&P; 2+ = this is its latest F&P that is not cancelled. */
+  booking_fp_count?: number;
   /** On a revenue-only row: that F&P's own requisitions, listed on this page
-   *  under rows that do not carry its revenue (empty = it has none yet). */
+   *  under rows that do not carry its revenue (empty = none matched to it). */
   requisitions_listed_under?: ListedUnder[];
 }
 
@@ -101,6 +104,19 @@ const listedUnderLong = (l?: ListedUnder[]) =>
     + (ownNameRow(k)
       ? ` — a row under its own name and date, which this page matches to ${k.same_name_matched_to ? `${k.same_name_matched_to}, another F&P` : 'another F&P'} of that name that evening`
       : '')).join('; ');
+
+/** A revenue-only row of a booking whose id is on ONE F&P (this one); else it is
+ *  the seat of a booking on two or more F&Ps (its latest not cancelled). */
+const onlyFp = (n?: number) => n === 1;
+/** Why a revenue-only row stands alone, and where the booking counts — the list
+ *  row's tooltip. */
+const revenueOnlyWhy = (e: { fp_id?: string; booking_fp_count?: number; requisitions_listed_under?: ListedUnder[] }) => {
+  const has = listedUnder(e.requisitions_listed_under)
+    ? 'no row under its own name and date matched to it' : 'no requisition matched to it';
+  return onlyFp(e.booking_fp_count)
+    ? `The booking's revenue counts on its only F&P, ${e.fp_id || 'this one'}, which has ${has}.`
+    : `The booking is on more than one F&P. Its revenue counts once — on the latest F&P that is not cancelled, which has ${has}.`;
+};
 
 /** "revenue counted on FP-72" — the booking counts once, on another F&P. */
 const countedElsewhere = (reason?: string | null) =>
@@ -133,9 +149,10 @@ interface EventDetail {
     revenue_withheld_reason?: string | null;
     revenue_seat_withheld_reason?: string | null;
   };
-  /** Ruling 51 — see Event.revenue_only / requisitions_listed_under. */
+  /** Ruling 51 — see Event.revenue_only / booking_fp_count / requisitions_listed_under. */
   revenue_only?: boolean;
   fp_id?: string;
+  booking_fp_count?: number;
   requisitions_listed_under?: ListedUnder[];
 }
 
@@ -267,6 +284,9 @@ export default function PartyEventsPage() {
 
   // Detail view
   if (active) {
+    // Req # → its status, shown beside each cost line (the cost counts every
+    // status, so the line says which).
+    const reqStatus = new Map<string, string>((detail?.requisitions || []).map(r => [r.req_number, r.status]));
     return (
       <div className="p-6 space-y-4">
         <button onClick={() => { setActive(null); setDetail(null); }}
@@ -299,8 +319,10 @@ export default function PartyEventsPage() {
                     <div className="text-xs text-[#6B5744] mt-2">
                       {listedUnder(detail.requisitions_listed_under)
                         ? <>The requisitions of {detail.fp_id || 'this F&P'} are listed on this page under {listedUnderLong(detail.requisitions_listed_under)}. No row under its own name and date is matched to {detail.fp_id || 'it'}, so this row stands for {detail.fp_id || 'the F&P'} itself.</>
-                        : <>No requisitions raised from {detail.fp_id || 'this F&P'} yet.</>}
-                      {' '}The booking is on more than one F&amp;P and its revenue counts once — here, on the latest F&amp;P that is not cancelled.
+                        : <>No party requisition is matched to {detail.fp_id || 'this F&P'}, so this row stands for {detail.fp_id || 'the F&P'} itself.</>}
+                      {' '}{onlyFp(detail.booking_fp_count)
+                        ? <>The booking&apos;s revenue counts here, on its only F&amp;P.</>
+                        : <>The booking is on more than one F&amp;P and its revenue counts once — here, on the latest F&amp;P that is not cancelled.</>}
                     </div>
                   )}
                   {canSeeFinancials && allCancelled(detail.summary.revenue_withheld_reason, detail.summary.revenue_seat_withheld_reason) && (
@@ -348,15 +370,21 @@ export default function PartyEventsPage() {
             <div className="bg-white border border-[#E8D5C4] rounded-xl overflow-hidden">
               <div className="px-4 py-2.5 border-b border-[#E8D5C4] bg-[#FFF1E3]/50 flex items-center gap-2">
                 <TrendingDown size={14} className="text-red-600" />
-                <h2 className="text-sm font-semibold text-[#2D1B0E]">Cost — items issued ({detail.items.length})</h2>
+                {/* The server costs quantity_requested on EVERY line of these
+                    requisitions, whatever their status — say "requested". */}
+                <h2 className="text-sm font-semibold text-[#2D1B0E]">Cost — items requested ({detail.items.length} line{detail.items.length === 1 ? '' : 's'})</h2>
+              </div>
+              <div className="px-4 py-1.5 text-[10px] text-[#6B5744] border-b border-[#E8D5C4]/60">
+                Quantity requested × the material&apos;s current average price, on every line of these requisitions whatever
+                its status — rejected, not yet issued and issued-short lines included. It is not based on what the store issued.
               </div>
               <div className="overflow-x-auto">
               <table className="w-full text-xs min-w-[560px]">
                 <thead className="bg-[#FFF8F0] text-[#8B7355]">
                   <tr>
-                    <th className="text-left  py-2 px-3 font-medium">Req #</th>
+                    <th className="text-left  py-2 px-3 font-medium">Req # · status</th>
                     <th className="text-left  py-2 px-3 font-medium">Material</th>
-                    <th className="text-right py-2 px-3 font-medium">Qty</th>
+                    <th className="text-right py-2 px-3 font-medium">Qty requested</th>
                     <th className="text-right py-2 px-3 font-medium">Unit Price</th>
                     <th className="text-right py-2 px-3 font-medium">Line Cost</th>
                   </tr>
@@ -367,7 +395,12 @@ export default function PartyEventsPage() {
                     const U = costLineUnits(it);
                     return (
                     <tr key={i} className="border-t border-[#E8D5C4]/50 hover:bg-[#FFF8F0]">
-                      <td className="py-1.5 px-3 font-mono text-[#af4408] text-[10px]">{it.req_number}</td>
+                      <td className="py-1.5 px-3 font-mono text-[#af4408] text-[10px]">
+                        {it.req_number}
+                        {reqStatus.get(it.req_number) && (
+                          <div className="font-sans text-[9px] text-[#8B7355]">{String(reqStatus.get(it.req_number)).replace(/_/g, ' ')}</div>
+                        )}
+                      </td>
                       <td className="py-1.5 px-3">
                         <div className="font-medium text-[#2D1B0E]">{it.material}</div>
                         {it.sku && <div className="text-[9px] font-mono text-[#8B7355]">{it.sku}</div>}
@@ -409,8 +442,9 @@ export default function PartyEventsPage() {
             <div className="bg-white border border-[#E8D5C4] rounded-xl overflow-hidden">
               <div className="px-4 py-2.5 border-b border-[#E8D5C4] bg-[#FFF1E3]/50 flex items-center gap-2 flex-wrap">
                 <TrendingUp size={14} className="text-green-600" />
+                {/* Not "on <date>": a sale linked by hand may be dated another day. */}
                 <h2 className="text-sm font-semibold text-[#2D1B0E]">
-                  Party sales on {detail.event_date} ({detail.sales.length})
+                  POS party sales, for reference ({detail.sales.length})
                 </h2>
                 <span className="text-[10px] text-[#6B5744] ml-2">
                   {autoCount} auto-linked + {manCount} manually-linked = {detail.sales.length} total
@@ -427,13 +461,14 @@ export default function PartyEventsPage() {
                 )}
               </div>
               <div className="px-4 py-1.5 text-[10px] text-[#6B5744] border-b border-[#E8D5C4]/60">
-                POS sales tagged Party on this date, for reference — not this event&apos;s revenue. The Revenue figure above
+                POS party-item sales dated {detail.event_date} that are not linked to an event, plus any sale linked to this
+                event by hand — for reference, not this event&apos;s revenue. The Revenue figure above
                 comes from the booking&apos;s Final Total on the Party Bookings sheet, counted once the party is Approved and over.
                 {detail.revenue_only && ' Sales attach to a requisition event row; this row is not one.'}
               </div>
               {detail.sales.length === 0 ? (
                 <div className="p-6 text-sm text-[#8B7355] text-center">
-                  No party-tagged sales recorded for {detail.event_date}.
+                  No unlinked party-item sales dated {detail.event_date}, and no sale linked to this event.
                 </div>
               ) : (
                 <div className="overflow-x-auto">
@@ -593,19 +628,25 @@ export default function PartyEventsPage() {
                 department wording must stay true for an admin during that load. */}
             One row per name and date that party requisitions were raised under, exactly as typed
             {canSeeFinancials ? ', plus the revenue-only rows described below' : ' (a department login sees only those carrying its department’s lines)'}.
-            Cost from <a href="/party-requisitions" className="underline text-[#af4408]">party requisitions</a>
-            {!canSeeFinancials && ' (for a department login, its department’s lines only)'}
-            {/* Says how a row gets revenue, not that every booking shows once:
-                rows are matched by name + date, so a booking on one F&P with no
-                row under its own name matched to it shows none here (production
-                behaviour, an open owner decision). */}
-            {canSeeFinancials && <>; revenue from the booking&apos;s Final Total on the Party Bookings sheet, counted when the party is
-            Approved and over. A row gets the revenue of the booking whose F&amp;P has the row&apos;s name (spaces at either end
-            ignored) and date (the one higher
-            on the F&amp;P sheet if two bookings do), and only under that F&amp;P&apos;s own name; a booking on more than one F&amp;P
-            counts only on its latest F&amp;P that is not cancelled — on a revenue-only row when no row under that F&amp;P&apos;s
-            name is matched to it. A booking on one F&amp;P shows no revenue here unless a row under its F&amp;P&apos;s own name
-            is matched to it</>}.
+            {/* Cost is the route's arithmetic (production's, unchanged):
+                quantity_requested × pack factor × the CURRENT average price, on
+                every party requisition of the row whatever its status — so it
+                must never be called "issued". */}
+            Cost = quantity <em>requested</em> × the material&apos;s current average price, over every{' '}
+            <a href="/party-requisitions" className="underline text-[#af4408]">party requisition</a> of that name and date,
+            whatever its status (rejected, not yet issued and issued-short lines included, at the quantity requested)
+            {!canSeeFinancials && ' — for a department login, its department’s lines only'}.
+            {/* Ruling 51: a booking shows once, on the F&P the P&L board counts
+                it on — the requisition row matched to that F&P under its own
+                name, else a revenue-only row (seatOnlyEvents). The one exception
+                is named: rows differing only by spaces at either end. */}
+            {canSeeFinancials && <> Revenue is the booking&apos;s Final Total on the Party Bookings sheet, counted when the party is
+            Approved and over, on one F&amp;P of the booking — its only one, or its latest that is not cancelled. It shows on the
+            row under that F&amp;P&apos;s own name and date when the page matches that row to that F&amp;P, else on a revenue-only
+            row for that F&amp;P. A row is matched to the first F&amp;P on the F&amp;P sheet that carries the row&apos;s name (as
+            contact, guest, company or FP id) that evening — or to another F&amp;P of the same booking that carries it too, if the
+            booking counts there. Spaces at either end of a name are ignored, so two rows that differ only by such a space both
+            show the revenue.</>}
           </p>
         </div>
         {/* Manual "New Party Requisition" button removed — parties come from the
@@ -658,10 +699,10 @@ export default function PartyEventsPage() {
                       {e.event_name}
                       {canSeeFinancials && e.revenue_only && (
                         <span className="block text-[10px] text-[#8B7355] font-normal"
-                              title={`The booking is on more than one F&P. Its revenue counts once — on the latest F&P that is not cancelled, which has ${listedUnder(e.requisitions_listed_under) ? 'no row under its own name and date matched to it' : 'no requisitions yet'}.`}>
+                              title={revenueOnlyWhy(e)}>
                           {e.fp_id ? `${e.fp_id} · ` : ''}{listedUnder(e.requisitions_listed_under)
                             ? `its requisitions are under ${listedUnder(e.requisitions_listed_under)}`
-                            : 'no requisitions yet'} — booking revenue counts here
+                            : 'no requisition matched to it'} — booking revenue counts here
                         </span>
                       )}
                     </td>

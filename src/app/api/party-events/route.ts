@@ -6,16 +6,20 @@ import { loadBookingsCache, loadUpcomingParties, resolveBookingRevenue, revenueS
  * Party Events P&L.
  *
  * For each distinct (event_name, event_date) on requisitions where purpose='party':
- *   COST    = Σ (issued_qty × material avg_price), summed across all requisitions
- *             tagged with that event
+ *   COST    = Σ (quantity_REQUESTED × pack factor × the material's CURRENT
+ *             average_price) over EVERY party requisition tagged with that event,
+ *             whatever its status (rejected, submitted and 0-issued lines
+ *             included) — production's arithmetic, kept as is; the screen labels
+ *             it "requested", never "issued".
  *   REVENUE = the booking's Party Bookings sheet Final Total (resolveBookingRevenue:
- *             the cached F&P matched by date + name, gated to Approved + over).
- *             A booking on two or more F&Ps counts on ONE of them (owner rulings
- *             43 + 51: its latest not-cancelled F&P; seatOnlyEvents gives that F&P
- *             a revenue-only row when no requisition row carries it). A booking on
- *             ONE F&P is as in production: it shows only on a row under its F&P's
- *             own name that resolves to it, and on each row of that name that
- *             differs only by surrounding spaces (open owner items). The
+ *             the cached F&P matched by date + name, gated to Approved + over),
+ *             on the F&P the P&L board counts it on — the F&P itself for an id on
+ *             one F&P; for an id on two or more, its latest not-cancelled F&P
+ *             (owner rulings 43 + 51). When no requisition row under that F&P's
+ *             own name resolves to it, seatOnlyEvents gives that F&P a
+ *             revenue-only row (ruling 51: every page agrees). Each row of that
+ *             name that differs only by surrounding spaces also carries it (an
+ *             open owner item; the page says so). The
  *             party-tagged POS sales on event_date (item ends ' P' OR
  *             category in {Party Package, Custom}, or linked to the event) are
  *             listed on the drill-down for reference only — they are NOT revenue.
@@ -69,12 +73,13 @@ export async function GET(request: Request) {
     // event row resolving to that F&P carries the Final Total. An id on one F&P
     // has no seat: unchanged.
     const seats = revenueSeats(cachedParties, loadCreatedAt(db, cachedParties));
-    // …and when NO requisition event row resolves to the seat (it has no party
-    // requisitions of its own), the seat gets a revenue-only row of its own
-    // (seatOnlyEvents), so the booking still shows once, on the same F&P as the
-    // board. Revenue-only rows carry nothing but revenue, so only the audience
-    // that sees revenue gets them; a department user's page is unchanged.
-    const seatOnly = () => (canSeeFinancials && seats.size)
+    // …and when NO requisition event row under its own name resolves to the F&P
+    // a booking counts on (the seat, or the F&P itself for an id on one F&P),
+    // that F&P gets a revenue-only row of its own (seatOnlyEvents), so the
+    // booking still shows once, on the same F&P as the board. Revenue-only rows
+    // carry nothing but revenue, so only the audience that sees revenue gets
+    // them; a department user's page is unchanged.
+    const seatOnly = () => canSeeFinancials
       ? seatOnlyEvents(bookings, cachedParties, seats, db.prepare(`
           SELECT DISTINCT event_name, event_date, fp_id, party_unique_id FROM requisitions
           WHERE purpose = 'party' AND event_name != ''
@@ -117,8 +122,9 @@ export async function GET(request: Request) {
           link_type: s.link_type as 'manual' | 'auto',
         })) : [];
       if (reqs.length === 0) {
-        // Ruling 51: the revenue-only row of a seated F&P that has no
-        // requisitions (seatOnlyEvents) — the very row the list shows.
+        // Ruling 51: the revenue-only row of the F&P a booking counts on, when
+        // no requisition row under its own name is matched to it
+        // (seatOnlyEvents) — the very row the list shows.
         const so = seatOnly().find(x => x.event_name === eventName && x.event_date === eventDate);
         if (!so) return Response.json({ error: 'Event not found' }, { status: 404 });
         return Response.json({
@@ -144,8 +150,10 @@ export async function GET(request: Request) {
           revenue_only: true,
           fp_id: so.fp_id,
           party_unique_id: so.party_unique_id,
-          // The seat's own requisitions, listed on this page under rows that do
-          // not carry its revenue (empty = it has none) — seatOnlyEvents.listed_under.
+          // 1 = the booking's only F&P; 2+ = its seat (latest not cancelled).
+          booking_fp_count: so.fp_count,
+          // The F&P's own requisitions, listed on this page under rows that do
+          // not carry its revenue (empty = none matched) — seatOnlyEvents.listed_under.
           requisitions_listed_under: so.listed_under,
         });
       }
@@ -289,9 +297,9 @@ export async function GET(request: Request) {
           per_head_revenue: e.guest_count > 0 ? Math.round(rev / e.guest_count) : 0,
         });
     });
-    // Ruling 51: each seated F&P no requisition event row carries gets its own
-    // revenue-only row, slotted into the list's order (event_date DESC, then
-    // event_name) without moving any requisition row.
+    // Ruling 51: each F&P a booking counts on that no requisition event row
+    // carries gets its own revenue-only row, slotted into the list's order
+    // (event_date DESC, then event_name) without moving any requisition row.
     for (const so of seatOnly()) {
       const row = {
         event_name: so.event_name,
@@ -310,6 +318,7 @@ export async function GET(request: Request) {
         revenue_only: true,
         fp_id: so.fp_id,
         party_unique_id: so.party_unique_id,
+        booking_fp_count: so.fp_count,
         requisitions_listed_under: so.listed_under,
       };
       const sortsAfter = (x: Record<string, any>) => {
