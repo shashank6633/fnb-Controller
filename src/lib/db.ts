@@ -3059,6 +3059,10 @@ function initializeSchema(db: Database.Database) {
     // deploy — the exact thing scripts/check-boot-migrations.js locks — and it
     // would silently undo a revoke.
     if (!rCols.some((c: any) => c.name === 'can_view_finance_reports')) db.exec(`ALTER TABLE roles ADD COLUMN can_view_finance_reports INTEGER NOT NULL DEFAULT 0`);
+    // Who may change the Label Printer & Design settings (owner's call, 2026-10-22: a
+    // tick in Settings → Roles, so the Store Manager can run the label printer). Off on
+    // every role until the owner ticks it; an admin always may.
+    if (!rCols.some((c: any) => c.name === 'can_manage_label_printer')) db.exec(`ALTER TABLE roles ADD COLUMN can_manage_label_printer INTEGER NOT NULL DEFAULT 0`);
 
     const seedRole = db.prepare(`
       INSERT OR IGNORE INTO roles (id, name, base_role, page_access, is_head_chef, is_store_manager, is_system, sort_order, description)

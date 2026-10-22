@@ -10,7 +10,7 @@ import {
  * Label-printer (TSC TE210) configuration.
  *
  * GET  /api/settings/label-printer → { printer: LabelPrinterConfig }   (defaults if unset)
- * POST /api/settings/label-printer → { printer: LabelPrinterConfig }   (admin-only; saves)
+ * POST /api/settings/label-printer → { printer: LabelPrinterConfig }   (admin, or a role with can_manage_label_printer; saves)
  *
  * Stored as a single JSON blob in settings under key 'label_printer'.
  */
@@ -31,8 +31,10 @@ export async function POST(request: Request) {
   try {
     const me = await getCurrentUser();
     if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-    if (me.role !== 'admin') {
-      return Response.json({ error: 'Admin required to change the label printer' }, { status: 403 });
+    // Admin, or a role with "Can change label printer settings" ticked in
+    // Settings → Roles (owner's call, 2026-10-22 — the Store Manager runs it).
+    if (me.role !== 'admin' && !me.can_manage_label_printer) {
+      return Response.json({ error: 'Your role cannot change the label printer — ask an admin to tick "Can change label printer settings" for it in Settings → Roles' }, { status: 403 });
     }
 
     const body = await request.json().catch(() => ({}));

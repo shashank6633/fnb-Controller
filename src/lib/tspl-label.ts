@@ -183,17 +183,81 @@ export const LABEL_FIELD_KEYS = ['batch', 'prepared', 'expiry', 'qty', 'by', 'lo
 export type LabelFieldKey = (typeof LABEL_FIELD_KEYS)[number];
 
 /**
- * Character budgets for wrapping. They SHRINK as the scales grow so the same
- * budget drives both the printed bitmap-font wrap and the on-screen preview,
- * keeping the two visually aligned.
+ * TSC bitmap-font cell sizes in printer dots at ×1 (203 dpi). A character drawn
+ * with multiplier m is (w·m) dots wide and (h·m) dots tall, so how many fit on a
+ * line is a DOT budget, not a guess. Font "3" = item name, font "2" = detail rows.
  */
-function charBudgets(titleScale: number, fieldScale: number, withQr: boolean) {
-  const baseName = withQr ? 13 : 20;
-  const baseRow = withQr ? 30 : 46;
-  return {
-    nameChars: Math.max(6, Math.round(baseName / Math.max(0.6, titleScale))),
-    rowChars: Math.max(10, Math.round(baseRow / Math.max(0.6, fieldScale))),
+const FONT = { '2': { w: 12, h: 20 }, '3': { w: 16, h: 24 } } as const;
+/** Dots reserved for the QR symbol in the top-right corner, and the clear gap kept beside/below it (1 mm). */
+const QR_BOX = 108;
+const QR_GAP = 8;
+/** 2 mm safe margin on every side (16 dots @ 203 dpi). */
+const MARGIN = 16;
+
+interface LabelLayout {
+  titleMult: number;
+  fieldMult: number;
+  barcodeH: number;
+  nameLines: string[];
+  /** Each detail row, wrapped to the width actually free at its height (1–2 lines). */
+  rowLines: string[][];
+}
+
+/**
+ * Lay the label out in DOTS so nothing printed can overlap the QR: every text
+ * line that sits beside the QR (above its bottom edge + gap) is wrapped to the
+ * width LEFT of it; lines below the QR use the full width. The item name keeps
+ * the configured size if it fits in 2 lines there, otherwise it steps down a size
+ * (to ×1 at the smallest) before it is ever cut short. Shared by buildTSPL and
+ * labelPreview so the screen preview and the printed label wrap identically.
+ */
+function layoutLabel(
+  itemName: string, rows: string[], design: LabelDesignConfig,
+  withQr: boolean, widthMm: number, heightMm: number, hasBarcode: boolean,
+): LabelLayout {
+  const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, n));
+  const widthDots = widthMm * 8;
+  const usableH = heightMm * 8 - 2 * MARGIN;
+  const fullW = widthDots - 2 * MARGIN;
+  const qrX = widthDots - QR_BOX - MARGIN;
+  const nearW = withQr ? qrX - QR_GAP - MARGIN : fullW;
+  const qrBottom = MARGIN + QR_BOX + QR_GAP;
+  const widthAt = (y: number) => (withQr && y < qrBottom ? nearW : fullW);
+  const textH = design.show_barcode_text ? 22 : 0;
+  const truncated = (ls: string[]) => ls.some((l) => l.endsWith('...'));
+
+  const build = (tm: number, fm: number, bh: number) => {
+    let y = MARGIN;
+    const nameLines = wrap(itemName, Math.max(1, Math.floor(widthAt(y) / (FONT['3'].w * tm))), 2);
+    y += nameLines.length * (FONT['3'].h * tm + 6) + 6;
+    const rowLines: string[][] = [];
+    for (const r of rows) {
+      const ls = wrap(r, Math.max(1, Math.floor(widthAt(y) / (FONT['2'].w * fm))), 2);
+      rowLines.push(ls);
+      y += ls.length * (FONT['2'].h * fm + 2);
+    }
+    const height = (y - MARGIN) + (hasBarcode ? 8 + bh + textH : 0);
+    return { nameLines, rowLines, height };
   };
+
+  let tm = clamp(Math.round(design.title_scale * 2), 1, 5);
+  let fm = clamp(Math.round(design.field_scale * 2) - 1, 1, 4);
+  let bh = clamp(Math.round(design.barcode_height), 20, 90);
+  // A name cut short beside the QR steps the title down a size first.
+  while (tm > 1 && truncated(build(tm, fm, bh).nameLines)) tm--;
+  // Then shrink to stay inside the safe area: rows first, then the barcode down to
+  // 40 dots (5 mm — the least a handheld 1-D scanner reads in one easy pass), then
+  // the title down to ×1, and only then the barcode below 5 mm as a last resort.
+  let guard = 40;
+  while (build(tm, fm, bh).height > usableH && guard-- > 0) {
+    if (fm > 1) fm--;
+    else if (bh > 40) bh = Math.max(40, bh - 6);
+    else if (tm > 1) tm--;
+    else if (bh > 24) bh -= 4;
+    else break;
+  }
+  const out = build(tm, fm, bh);
+  return { titleMult: tm, fieldMult: fm, barcodeH: bh, nameLines: out.nameLines, rowLines: out.rowLines };
 }
 
 /** Escape a string for a TSPL quoted literal ( \ and " are the reserved chars ). */
@@ -207,22 +271,24 @@ function wrap(text: string, maxChars: number, maxLines: number): string[] {
   if (!words.length) return [''];
   const lines: string[] = [];
   let cur = '';
+  // Anything left off the label — a word past the last line, or the tail of a
+  // word longer than a whole line — marks the last line with "...", so a cut name
+  // never reads as complete (and layoutLabel can step the size down instead).
+  let cut = false;
   for (const w of words) {
     const next = cur ? `${cur} ${w}` : w;
-    if (next.length <= maxChars) {
-      cur = next;
-    } else {
-      if (cur) lines.push(cur);
-      cur = w.length > maxChars ? w.slice(0, maxChars) : w;
-      if (lines.length === maxLines) break;
-    }
+    if (next.length <= maxChars) { cur = next; continue; }
+    if (cur) lines.push(cur);
+    if (lines.length === maxLines) { cur = ''; cut = true; break; }
+    if (w.length > maxChars) { cur = w.slice(0, maxChars); cut = true; } else cur = w;
   }
-  if (cur && lines.length < maxLines) lines.push(cur);
-  // If we ran out of lines but text remains, mark the last line as truncated.
-  const joined = lines.join(' ');
-  if (joined.replace(/\s+/g, ' ') !== words.join(' ').slice(0, joined.length).replace(/\s+/g, ' ')) {
+  if (cur) { if (lines.length < maxLines) lines.push(cur); else cut = true; }
+  if (cut) {
+    // Plain ASCII dots: the printer's built-in bitmap fonts have no "…" glyph.
+    const ELL = '...';
     const last = lines[lines.length - 1] || '';
-    lines[lines.length - 1] = (last.length > maxChars - 1 ? last.slice(0, maxChars - 1) : last) + '…';
+    const room = Math.max(0, maxChars - ELL.length);
+    lines[lines.length - 1] = (last.length > room ? last.slice(0, room) : last) + ELL;
   }
   return lines.slice(0, maxLines);
 }
@@ -247,15 +313,6 @@ export function buildTSPL(batch: LabelBatch, opts: BuildTSPLOptions = {}): strin
   const gapMm = opts.gapMm != null && opts.gapMm >= 0 ? opts.gapMm : 2;
   const qrValue = (opts.scanUrl && opts.scanUrl.trim()) || batch.barcode || '';
 
-  const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, n));
-  const { nameChars, rowChars } = charBudgets(design.title_scale, design.field_scale, withQr);
-  const nameLines = wrap(batch.item_name, nameChars, 2);
-
-  // Integer bitmap-font multipliers derived from the scales (bigger than the old
-  // fixed 2/1). title_scale 1.3 → ×3 item name, field_scale 1.4 → ×2 rows.
-  let titleMult = clamp(Math.round(design.title_scale * 2), 2, 5);
-  let fieldMult = clamp(Math.round(design.field_scale * 2) - 1, 1, 4);
-  let barcodeH = clamp(Math.round(design.barcode_height), 20, 90);
   const textH = design.show_barcode_text ? 22 : 0; // human-readable line height (dots)
 
   // Detail rows honoring the field toggles, in fixed order.
@@ -272,31 +329,13 @@ export function buildTSPL(batch: LabelBatch, opts: BuildTSPLOptions = {}): strin
 
   const barcodeVal = batch.barcode || '';
 
-  // Base bitmap-font heights (dots) so line spacing tracks the font size.
-  const TITLE_FH = 24;
-  const FIELD_FH = 12;
   // 2 mm safe margin on every side: the label is a die-cut rectangle with rounded
   // corners and the print head drifts slightly, so nothing is drawn in the outer
   // 2 mm (16 dots @ 203 dpi). Content lives inside [M, size-M] on both axes.
-  const M = 16;
+  const M = MARGIN;
   const printableH = heightMm * 8;
-  const usableH = printableH - 2 * M;         // height available between top & bottom margins
-  const needed = () =>
-    nameLines.length * (TITLE_FH * titleMult + 6) +
-    6 +
-    rows.length * (FIELD_FH * fieldMult + 10) +
-    8 +
-    (barcodeVal ? barcodeH + textH : 0);
-
-  // Shrink to stay inside the safe area: rows first, then barcode, then title.
-  let guard = 30;
-  while (needed() > usableH && guard-- > 0) {
-    if (fieldMult > 1) fieldMult--;
-    else if (barcodeH > 40) barcodeH -= 6;
-    else if (titleMult > 2) titleMult--;
-    else if (barcodeH > 24) barcodeH -= 4;
-    else break;
-  }
+  const { titleMult, fieldMult, barcodeH, nameLines, rowLines } =
+    layoutLabel(batch.item_name, rows, design, withQr, widthMm, heightMm, !!barcodeVal);
 
   const T = (x: number, y: number, font: string, xm: number, ym: number, text: string) =>
     `TEXT ${x},${y},"${font}",0,${xm},${ym},"${tsplEscape(text)}"`;
@@ -312,14 +351,17 @@ export function buildTSPL(batch: LabelBatch, opts: BuildTSPLOptions = {}): strin
   let y = M;
   for (const ln of nameLines) {
     lines.push(T(M, y, '3', titleMult, titleMult, ln));
-    y += TITLE_FH * titleMult + 6;
+    y += FONT['3'].h * titleMult + 6;
   }
   y += 6; // gap after the name block
 
-  // Detail rows (font "2"; multiplier scales with field_scale).
-  for (const r of rows) {
-    lines.push(T(M, y, '2', fieldMult, fieldMult, wrap(r, rowChars, 1)[0]));
-    y += FIELD_FH * fieldMult + 10;
+  // Detail rows (font "2"; multiplier scales with field_scale), each already
+  // wrapped by layoutLabel to the width free at its height (left of the QR).
+  for (const ls of rowLines) {
+    for (const ln of ls) {
+      lines.push(T(M, y, '2', fieldMult, fieldMult, ln));
+      y += FONT['2'].h * fieldMult + 2;
+    }
   }
 
   // CODE128 barcode anchored near the bottom, clamped inside the bottom 2 mm margin.
@@ -328,7 +370,9 @@ export function buildTSPL(batch: LabelBatch, opts: BuildTSPLOptions = {}): strin
     const by = Math.min(y + 4, maxBy);
     const humanReadable = design.show_barcode_text ? 1 : 0;
     // BARCODE x,y,"128",height,human-readable,rotation,narrow,wide,"content"
-    lines.push(`BARCODE ${M},${by},"128",${barcodeH},${humanReadable},0,2,2,"${tsplEscape(barcodeVal)}"`);
+    // Starts 1 mm further in than the text so the bars get a ≥2.5 mm quiet zone
+    // (label edge + margin) — handheld scanners miss a code with no clear lead-in.
+    lines.push(`BARCODE ${M + 8},${by},"128",${barcodeH},${humanReadable},0,2,2,"${tsplEscape(barcodeVal)}"`);
   }
 
   // Optional QR on the right side, inset by the 2 mm margin (top & right).
@@ -340,8 +384,8 @@ export function buildTSPL(batch: LabelBatch, opts: BuildTSPLOptions = {}): strin
     // grow with content (auto version, byte-mode capacities at ECC M), so a longer
     // future scanUrl shrinks the cell instead of spilling past the right margin.
     const qrModules = qrValue.length <= 14 ? 21 : qrValue.length <= 26 ? 25 : qrValue.length <= 42 ? 29 : qrValue.length <= 62 ? 33 : qrValue.length <= 84 ? 37 : 41;
-    const qrCell = Math.max(2, Math.min(6, Math.floor(108 / qrModules)));
-    lines.push(`QRCODE ${widthMm * 8 - 108 - M},${M},M,${qrCell},A,0,"${tsplEscape(qrValue)}"`);
+    const qrCell = Math.max(2, Math.min(6, Math.floor(QR_BOX / qrModules)));
+    lines.push(`QRCODE ${widthMm * 8 - QR_BOX - M},${M},M,${qrCell},A,0,"${tsplEscape(qrValue)}"`);
   }
 
   lines.push(`PRINT ${copies},1`);
@@ -383,7 +427,6 @@ export function labelPreview(batch: LabelBatch, opts: BuildTSPLOptions = {}): La
   const withQr = !!opts.qr;
   const widthMm = opts.labelWidthMm && opts.labelWidthMm > 0 ? opts.labelWidthMm : 50;
   const heightMm = opts.labelHeightMm && opts.labelHeightMm > 0 ? opts.labelHeightMm : 40;
-  const { nameChars } = charBudgets(design.title_scale, design.field_scale, withQr);
   const dt = (d: string, t: string) => [d, t].filter(Boolean).join(' ');
   const qty = `${batch.quantity_produced ?? ''} ${batch.unit || ''}`.trim();
   const prepared = dt(batch.production_date, batch.production_time);
@@ -399,9 +442,12 @@ export function labelPreview(batch: LabelBatch, opts: BuildTSPLOptions = {}): La
   const rows = allRows
     .filter((r) => design.fields[r.key])
     .map(({ label, value }) => ({ label, value }));
+  // The SAME dot layout the printer gets, so the preview's name lines match the print.
+  const layout = layoutLabel(batch.item_name, rows.map((r) => `${r.label}: ${r.value}`), design,
+    withQr, widthMm, heightMm, !!batch.barcode);
   return {
     item_name: batch.item_name || '',
-    item_name_lines: wrap(batch.item_name, nameChars, 2),
+    item_name_lines: layout.nameLines,
     batch_number: batch.batch_number || '',
     barcode: batch.barcode || '',
     prepared,
