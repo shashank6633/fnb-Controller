@@ -1,12 +1,35 @@
 import { getDb } from '@/lib/db';
-import { getCurrentUser, canApproveTableOp } from '@/lib/auth';
+import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
+import { canDownloadBillCopy, BILL_COPY_REFUSED_MESSAGE } from '@/lib/bill-copy-access';
 import { buildBillPdf } from '@/lib/bill-pdf';
 
 /**
  * GET /api/dine-in/orders/[id]/bill-pdf — download a digital copy of the bill as
  * an 80mm PDF, identical to the printed thermal bill (same computeBill + the same
  * bill_design branding). For open orders it's a provisional bill; for settled
- * orders it's stamped DUPLICATE BILL (a reprint). Cashier / manager / admin.
+ * orders it's stamped DUPLICATE BILL (a reprint).
+ *
+ * THE GATE: canDownloadBillCopy() — the Cashier role, manager or admin; plain
+ * staff are refused. See src/lib/bill-copy-access.ts. It is production's own
+ * canApproveTableOp() (admin / manager tier, or the assigned role named
+ * 'Cashier'), called unchanged, so exactly the logins production admitted are
+ * admitted. A page map — NULL, empty or even an explicit '/cashier' grant — is
+ * never a pass by itself; only the Cashier role is.
+ *
+ * THE OUTLET SCOPE — owner ruling 35 (2026-10-14): "each login reprints only
+ * its own outlet's bills; admin all".
+ *   · Every login except admin: the lookup carries the SAME predicate the order
+ *     LIST uses — `(o.outlet_id = ? OR o.outlet_id IS NULL)` with
+ *     getCurrentOutletId() (api/dine-in/orders/route.ts) — so a Cashier or a
+ *     manager gets a copy of a bill they can already see on their own outlet's
+ *     screen, and nothing else. `outletId` is bound even when it resolves null,
+ *     exactly as the list route binds it, so the two surfaces never disagree.
+ *     An out-of-outlet id answers 'Order not found' (404), identical to an
+ *     unknown id, so the route is no oracle for which ids exist elsewhere.
+ *   · Admin (role === 'admin'): every outlet's bills, by id alone — production's
+ *     lookup, unchanged. (The 87df4d8 draft scoped admin too; the ruling says
+ *     admin sees all, so admin is not scoped.)
+ * The gate above is untouched: WHO may take a copy is still canDownloadBillCopy().
  */
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -15,15 +38,23 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
   try {
     const me = await getCurrentUser();
     if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
-    if (!canApproveTableOp(me)) return Response.json({ error: 'Cashier, manager or admin required' }, { status: 403 });
+    if (!canDownloadBillCopy(me)) return Response.json({ error: BILL_COPY_REFUSED_MESSAGE }, { status: 403 });
     const { id } = await params;
     const db = getDb();
 
-    const order = db.prepare(`
-      SELECT o.*, t.table_number, t.zone
-      FROM orders o LEFT JOIN restaurant_tables t ON o.table_id = t.id
-      WHERE o.id = ?
-    `).get(id) as any;
+    // Ruling 35: admin reprints any outlet's bill; every other login only its
+    // own outlet's (the order list's predicate — see the header).
+    const order = (me.role === 'admin'
+      ? db.prepare(`
+          SELECT o.*, t.table_number, t.zone
+          FROM orders o LEFT JOIN restaurant_tables t ON o.table_id = t.id
+          WHERE o.id = ?
+        `).get(id)
+      : db.prepare(`
+          SELECT o.*, t.table_number, t.zone
+          FROM orders o LEFT JOIN restaurant_tables t ON o.table_id = t.id
+          WHERE o.id = ? AND (o.outlet_id = ? OR o.outlet_id IS NULL)
+        `).get(id, await getCurrentOutletId())) as any;
     if (!order) return Response.json({ error: 'Order not found' }, { status: 404 });
     if (order.status === 'void' || order.status === 'merged') {
       return Response.json({ error: `This order was ${order.status} — no bill` }, { status: 409 });

@@ -135,6 +135,9 @@ class WastageBlocked extends Error {
 
 export async function GET(request: Request) {
   try {
+    // Ruling 53: the proxy only checks that a cookie is PRESENT on an API GET.
+    const me = await getCurrentUser();
+    if (!me) return Response.json({ error: 'Sign in required' }, { status: 401 });
     const db = getDb();
     const url = new URL(request.url);
     const from = url.searchParams.get('from');

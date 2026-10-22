@@ -1,15 +1,28 @@
 import { getDb } from '@/lib/db';
 import { getCurrentOutletId, getCurrentUser } from '@/lib/auth';
-import { loadBookingsCache, loadUpcomingParties, resolveBookingRevenue } from '@/lib/party-revenue';
+import { loadBookingsCache, loadUpcomingParties, resolveBookingRevenue, revenueSeats, loadCreatedAt, seatOnlyEvents } from '@/lib/party-revenue';
 
 /**
  * Party Events P&L.
  *
  * For each distinct (event_name, event_date) on requisitions where purpose='party':
- *   COST    = Σ (issued_qty × material avg_price), summed across all requisitions
- *             tagged with that event
- *   REVENUE = sum of sales.total_revenue for rows on event_date that look like
- *             party rows (item ends ' P' OR category in {Party Package, Custom})
+ *   COST    = Σ (quantity_REQUESTED × pack factor × the material's CURRENT
+ *             average_price) over EVERY party requisition tagged with that event,
+ *             whatever its status (rejected, submitted and 0-issued lines
+ *             included) — production's arithmetic, kept as is; the screen labels
+ *             it "requested", never "issued".
+ *   REVENUE = the booking's Party Bookings sheet Final Total (resolveBookingRevenue:
+ *             the cached F&P matched by date + name, gated to Approved + over),
+ *             on the F&P the P&L board counts it on — the F&P itself for an id on
+ *             one F&P; for an id on two or more, its latest not-cancelled F&P
+ *             (owner rulings 43 + 51). When no requisition row under that F&P's
+ *             own name resolves to it, seatOnlyEvents gives that F&P a
+ *             revenue-only row (ruling 51: every page agrees). Each row of that
+ *             name that differs only by surrounding spaces also carries it (an
+ *             open owner item; the page says so). The
+ *             party-tagged POS sales on event_date (item ends ' P' OR
+ *             category in {Party Package, Custom}, or linked to the event) are
+ *             listed on the drill-down for reference only — they are NOT revenue.
  *
  * Multiple requisitions can belong to the same event (e.g. one for kitchen, one
  * for bar). They aggregate by (event_name, event_date).
@@ -41,6 +54,12 @@ export async function GET(request: Request) {
     const deptScopeId = canSeeFinancials ? null : (me?.department_id ?? '__no_dept__');
     const redact = <T extends Record<string, any>>(o: T): T =>
       canSeeFinancials ? o : ({ ...o, revenue: 0, profit: 0, food_cost_percent: 0, per_head_revenue: 0, per_head_profit: 0, booking_total: 0 });
+    // On a row whose booking counts on ANOTHER F&P (rulings 43/51) only: whether
+    // that seat counts it yet (resolveBookingRevenue's seat_withheld_reason), for
+    // the audience that sees revenue. Absent on every other row.
+    const seatReason = (br: { seat_withheld_reason?: string | null }) =>
+      canSeeFinancials && br.seat_withheld_reason !== undefined
+        ? { revenue_seat_withheld_reason: br.seat_withheld_reason } : {};
 
     // Revenue is the Party Bookings sheet Final Total (matched to the party by
     // candidate names + date, gated to confirmed + past) — NOT POS sales, which
@@ -48,6 +67,24 @@ export async function GET(request: Request) {
     const today = new Date().toISOString().slice(0, 10);
     const bookings = loadBookingsCache(db);
     const cachedParties = loadUpcomingParties(db);
+    // Owner ruling 43/51: a booking whose AKAN id is on two or more F&P rows
+    // counts ONCE, on its latest not-cancelled F&P — the very seat
+    // /api/party-events/pnl uses (same rule, same cached list), so only the
+    // event row resolving to that F&P carries the Final Total. An id on one F&P
+    // has no seat: unchanged.
+    const seats = revenueSeats(cachedParties, loadCreatedAt(db, cachedParties));
+    // …and when NO requisition event row under its own name resolves to the F&P
+    // a booking counts on (the seat, or the F&P itself for an id on one F&P),
+    // that F&P gets a revenue-only row of its own (seatOnlyEvents), so the
+    // booking still shows once, on the same F&P as the board. Revenue-only rows
+    // carry nothing but revenue, so only the audience that sees revenue gets
+    // them; a department user's page is unchanged.
+    const seatOnly = () => canSeeFinancials
+      ? seatOnlyEvents(bookings, cachedParties, seats, db.prepare(`
+          SELECT DISTINCT event_name, event_date, fp_id, party_unique_id FROM requisitions
+          WHERE purpose = 'party' AND event_name != ''
+        `).all() as { event_name: string; event_date: string; fp_id: string | null; party_unique_id: string | null }[], today)
+      : [];
 
     // Single event detail
     if (eventName && eventDate) {
@@ -62,21 +99,8 @@ export async function GET(request: Request) {
           ${deptScopeId ? 'AND EXISTS (SELECT 1 FROM requisition_items ri WHERE ri.req_id = r.id AND ri.department_id = ?)' : ''}
         ORDER BY r.created_at
       `).all(...(deptScopeId ? [eventName, eventDate, deptScopeId] : [eventName, eventDate])) as any[];
-      if (reqs.length === 0) return Response.json({ error: 'Event not found' }, { status: 404 });
-
-      const items = db.prepare(`
-        SELECT ri.*, rm.name AS material_name, rm.sku, rm.unit, rm.average_price,
-               ri.unit AS req_unit, rm.purchase_unit AS purchase_unit, rm.pack_size AS pack_size,
-               r.req_number, r.id AS req_id
-        FROM requisitions r
-        JOIN requisition_items ri ON ri.req_id = r.id
-        JOIN raw_materials rm ON rm.id = ri.material_id
-        WHERE r.purpose = 'party' AND r.event_name = ? AND r.event_date = ?
-          ${deptScopeId ? 'AND ri.department_id = ?' : ''}
-        ORDER BY rm.name
-      `).all(...(deptScopeId ? [eventName, eventDate, deptScopeId] : [eventName, eventDate])) as any[];
-
-      const sales = db.prepare(`
+      // The sales lines on this event (linked to it, or party-tagged that day).
+      const eventSales = () => db.prepare(`
         SELECT s.item_name,
                SUM(s.quantity_sold) AS qty,
                SUM(s.total_revenue) AS revenue,
@@ -91,6 +115,62 @@ export async function GET(request: Request) {
         )
         GROUP BY s.item_name, link_type ORDER BY revenue DESC
       `).all(eventName, eventDate, eventName, eventDate, eventDate) as any[];
+      const salesOut = (sales: any[]) => canSeeFinancials ? sales.map(s => ({
+          item_name: s.item_name, qty: s.qty,
+          revenue: Math.round(s.revenue || 0),
+          category: s.category,
+          link_type: s.link_type as 'manual' | 'auto',
+        })) : [];
+      if (reqs.length === 0) {
+        // Ruling 51: the revenue-only row of the F&P a booking counts on, when
+        // no requisition row under its own name is matched to it
+        // (seatOnlyEvents) — the very row the list shows.
+        const so = seatOnly().find(x => x.event_name === eventName && x.event_date === eventDate);
+        if (!so) return Response.json({ error: 'Event not found' }, { status: 404 });
+        return Response.json({
+          event_name: eventName,
+          event_date: eventDate,
+          guest_count: 0,
+          customer: '',
+          notes: '',
+          requisitions: [],
+          items: [],
+          sales: salesOut(eventSales()),
+          summary: {
+            cost: 0,
+            revenue: Math.round(so.revenue),
+            booking_total: Math.round(so.booking_total),
+            revenue_withheld_reason: null,
+            profit: Math.round(so.revenue * 100) / 100,
+            food_cost_percent: 0,
+            per_head_cost: 0,
+            per_head_revenue: 0,
+            per_head_profit: 0,
+          },
+          revenue_only: true,
+          fp_id: so.fp_id,
+          party_unique_id: so.party_unique_id,
+          // 1 = the booking's only F&P; 2+ = its seat (latest not cancelled).
+          booking_fp_count: so.fp_count,
+          // The F&P's own requisitions, listed on this page under rows that do
+          // not carry its revenue (empty = none matched) — seatOnlyEvents.listed_under.
+          requisitions_listed_under: so.listed_under,
+        });
+      }
+
+      const items = db.prepare(`
+        SELECT ri.*, rm.name AS material_name, rm.sku, rm.unit, rm.average_price,
+               ri.unit AS req_unit, rm.purchase_unit AS purchase_unit, rm.pack_size AS pack_size,
+               r.req_number, r.id AS req_id
+        FROM requisitions r
+        JOIN requisition_items ri ON ri.req_id = r.id
+        JOIN raw_materials rm ON rm.id = ri.material_id
+        WHERE r.purpose = 'party' AND r.event_name = ? AND r.event_date = ?
+          ${deptScopeId ? 'AND ri.department_id = ?' : ''}
+        ORDER BY rm.name
+      `).all(...(deptScopeId ? [eventName, eventDate, deptScopeId] : [eventName, eventDate])) as any[];
+
+      const sales = eventSales();
 
       // Recipe-units per requested-unit: ×pack_size only when the line was
       // requested in the material's purchase unit (1 BTL = 750 ml), else ×1.
@@ -101,7 +181,7 @@ export async function GET(request: Request) {
                 && i.req_unit !== i.unit && pack > 1) ? pack : 1;
       };
       const cost    = items.reduce((s, i) => s + i.quantity_requested * packFactor(i) * (i.average_price || 0), 0);
-      const br      = resolveBookingRevenue(bookings, cachedParties, eventName, eventDate, today, true);
+      const br      = resolveBookingRevenue(bookings, cachedParties, eventName, eventDate, today, true, seats);
       const revenue = br.revenue;
       const guests  = reqs[0]?.guest_count || 0;
 
@@ -141,17 +221,13 @@ export async function GET(request: Request) {
           unit_price_exact: Number(i.average_price) || 0,
           line_cost:  Math.round(i.quantity_requested * packFactor(i) * (i.average_price || 0) * 100) / 100,
         })),
-        sales: canSeeFinancials ? sales.map(s => ({
-          item_name: s.item_name, qty: s.qty,
-          revenue: Math.round(s.revenue || 0),
-          category: s.category,
-          link_type: s.link_type as 'manual' | 'auto',
-        })) : [],
+        sales: salesOut(sales),
         summary: redact({
           cost: Math.round(cost * 100) / 100,
           revenue: Math.round(revenue),
           booking_total: Math.round(br.booking_total),
           revenue_withheld_reason: br.withheld_reason,
+          ...seatReason(br),
           profit: Math.round((revenue - cost) * 100) / 100,
           food_cost_percent: revenue > 0 ? Math.round((cost / revenue) * 10000) / 100 : 0,
           per_head_cost:     guests > 0 ? Math.round((cost / guests) * 100) / 100 : 0,
@@ -200,10 +276,9 @@ export async function GET(request: Request) {
       SELECT * FROM ev ORDER BY event_date DESC, event_name
     `).all(...(deptScopeId ? [deptScopeId, deptScopeId, deptScopeId] : [])) as any[];
 
-    return Response.json({
-      events: events.map(e => {
+    const rows: Record<string, any>[] = events.map(e => {
         const cost = Number(e.cost) || 0;
-        const br   = resolveBookingRevenue(bookings, cachedParties, e.event_name, e.event_date, today, true);
+        const br   = resolveBookingRevenue(bookings, cachedParties, e.event_name, e.event_date, today, true, seats);
         const rev  = br.revenue;   // Party Bookings Final Total (gated), not POS sales
         return redact({
           event_name: e.event_name,
@@ -215,13 +290,45 @@ export async function GET(request: Request) {
           revenue: Math.round(rev),
           booking_total: Math.round(br.booking_total),
           revenue_withheld_reason: br.withheld_reason,
+          ...seatReason(br),
           profit: Math.round((rev - cost) * 100) / 100,
           food_cost_percent: rev > 0 ? Math.round((cost / rev) * 10000) / 100 : 0,
           per_head_cost: e.guest_count > 0 ? Math.round((cost / e.guest_count) * 100) / 100 : 0,
           per_head_revenue: e.guest_count > 0 ? Math.round(rev / e.guest_count) : 0,
         });
-      }),
     });
+    // Ruling 51: each F&P a booking counts on that no requisition event row
+    // carries gets its own revenue-only row, slotted into the list's order
+    // (event_date DESC, then event_name) without moving any requisition row.
+    for (const so of seatOnly()) {
+      const row = {
+        event_name: so.event_name,
+        event_date: so.event_date,
+        guest_count: 0,
+        customer: '',
+        req_count: 0,
+        cost: 0,
+        revenue: Math.round(so.revenue),
+        booking_total: Math.round(so.booking_total),
+        revenue_withheld_reason: null,
+        profit: Math.round(so.revenue * 100) / 100,
+        food_cost_percent: 0,
+        per_head_cost: 0,
+        per_head_revenue: 0,
+        revenue_only: true,
+        fp_id: so.fp_id,
+        party_unique_id: so.party_unique_id,
+        booking_fp_count: so.fp_count,
+        requisitions_listed_under: so.listed_under,
+      };
+      const sortsAfter = (x: Record<string, any>) => {
+        const xd = String(x.event_date ?? ''), xn = String(x.event_name ?? '');
+        return xd < row.event_date || (xd === row.event_date && xn > row.event_name);
+      };
+      const at = rows.findIndex(sortsAfter);
+      if (at < 0) rows.push(row); else rows.splice(at, 0, row);
+    }
+    return Response.json({ events: rows });
   } catch (e: any) {
     console.error('[party-events]', e);
     return Response.json({ error: e.message }, { status: 500 });

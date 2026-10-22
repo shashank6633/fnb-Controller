@@ -283,8 +283,89 @@ function isStateChanging(method: string): boolean {
   return method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE';
 }
 
+/**
+ * The ONE pathname every rule in this file is decided on: req.nextUrl.pathname
+ * percent-DECODED, exactly once. Returns null when the path cannot be decoded
+ * (a malformed encoding); proxy() refuses those with 400 before any rule runs.
+ *
+ * WHY. req.nextUrl.pathname is still percent-ENCODED, and every rule here is a
+ * plain string test. Next does not route on that raw form alone: in a
+ * production build a STATIC route is also looked up by its decodeURIComponent()
+ * form (node_modules/next/dist/server/lib/router-utils/filesystem.js, "check
+ * decoded variant as well", skipped only in dev). Measured on the real proxy()
+ * before this function existed, admin session, fnb_csrf cookie, NO x-csrf-token:
+ * POST /api/wastage → 403, but POST /api/%77astage → passed with no CSRF demanded,
+ * and so did /api/petty-%63ash — two routes that move stock and cash — while
+ * that decoded lookup serves both from the very handlers the CSRF list protects.
+ * /%61pi/... was worse: not even "/api/" to the raw test, so it skipped steps 2c
+ * and 3 entirely and was gated as a PAGE.
+ *
+ * Deciding on the decoded form closes that whole class at once: the CSRF list,
+ * the /api/ floor, the page gate, the finance and feedback gates, the GRE
+ * read-only deny and the public list all see one spelling, whatever the client
+ * typed — the spelling of the route Next actually serves. Every list here is
+ * plain ASCII with no '%', so a raw path that matches one still matches it after
+ * decoding: the CSRF list, the floor and the denies can only gain matches. The
+ * one list where a gained match LOOSENS is the public list, and there it only
+ * ever reaches the public handler itself (an encoded spelling of
+ * /api/whatsapp/webhook is served BY the webhook) or nothing at all (a dynamic
+ * public route is matched on the raw literal, which the encoding broke → 404).
+ *
+ * REFUSED (null → 400): a MALFORMED encoding only (%zz, a lone '%', a truncated
+ * UTF-8 sequence) — decodeURIComponent throws. Next itself answers 400 for those
+ * in a dynamic segment (route-matcher.js DecodeError); no client sends one. That
+ * is owner ruling 38's wording: decode, refuse malformed, decide on the decoded
+ * form. Query strings are not part of the pathname and are untouched.
+ *
+ * AN ENCODED SLASH (%2F) IS DECODED LIKE ANY OTHER ESCAPE. Next resolves it two
+ * ways: the static lookup above decodes it into a real '/', so /api%2Fwastage IS
+ * /api/wastage (production's raw test let a cookie-only POST through it; decided
+ * here on /api/wastage it now needs the CSRF header). Dynamic routes are matched
+ * on the RAW path (resolve-routes.js `route.match(...)`), where %2F stays inside
+ * one segment: /grn/print/abc%2Fx is served as /grn/print/[id] with id "abc/x",
+ * while it is decided here as /grn/print/abc/x (not a print page, so it needs a
+ * session — stricter than production, and no real id contains '/'). MEASURED
+ * (2026-10-15, every %2F spelling generated from this file's lists, the page
+ * catalog and the dynamic routes, three callers, against a model of Next 16.2.2's
+ * static-then-dynamic lookup): of the spellings this decides MORE openly than
+ * production did, every one is either served by exactly the decoded route (so it
+ * gets that route's own decision) or reaches no route at all (404). None reaches
+ * a handler other than the one the decision describes.
+ *
+ * Dot segments: WHATWG URL parsing folds '..', '.%2e' and '%2e%2e' for BOTH
+ * req.nextUrl and Next's router (parse-relative-url.js uses `new URL`) — but NOT
+ * a '..' hidden between encoded slashes: /api/customer%2F..%2Fwastage decodes to
+ * /api/customer/../wastage, which the public list matches. Today every such
+ * spelling is a 404 in Next (no dynamic route sits at /api/[x], /api/customer/[x],
+ * /api/crm/[x], /api/telecmi/[x] or /quiz/[x]). A NEW DYNAMIC ROUTE DIRECTLY
+ * UNDER A PUBLIC PREFIX must re-check this; refusing %2F outright (one line:
+ * `if (/%2f/i.test(raw)) return null;` above the try) closes the class and is
+ * the owner's call — it is not in ruling 38's wording.
+ *
+ * A path with no '%' is returned untouched — the same string as before, so every
+ * ordinary request is decided exactly as it always was.
+ */
+function decodePathname(raw: string): string | null {
+  if (!raw.includes('%')) return raw;
+  try { return decodeURIComponent(raw); } catch { return null; }
+}
+
 export function proxy(req: NextRequest) {
-  const { pathname } = req.nextUrl;
+  // The client's own spelling, kept ONLY to ECHO back — the login redirect's
+  // ?next= and the page gate's informational ?forbidden= — so those carry the
+  // URL the user actually asked for (re-encoded by searchParams; echoing the
+  // decoded form instead would double-decode on the way back). Every DECISION
+  // below reads `pathname`, never this.
+  const rawPathname = req.nextUrl.pathname;
+  const pathname = decodePathname(rawPathname);
+  if (pathname === null) {
+    const body = 'Bad request: the URL path has a malformed percent-encoding.';
+    return rawPathname.startsWith('/api/')
+      ? NextResponse.json({ error: body }, { status: 400 })
+      : new NextResponse(body, {
+        status: 400, headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' },
+      });
+  }
   const session = req.cookies.get(SESSION_COOKIE)?.value;
   const isApi = pathname.startsWith('/api/');
 
@@ -308,7 +389,7 @@ export function proxy(req: NextRequest) {
     }
     const url = req.nextUrl.clone();
     url.pathname = '/login';
-    url.searchParams.set('next', pathname + req.nextUrl.search);
+    url.searchParams.set('next', rawPathname + req.nextUrl.search);
     return NextResponse.redirect(url);
   }
 
@@ -335,8 +416,12 @@ export function proxy(req: NextRequest) {
                r.is_head_chef AS role_head_chef
         FROM sessions s JOIN users u ON u.id = s.user_id
         LEFT JOIN roles r ON r.id = u.role_id
-        WHERE s.token = ? AND u.is_active = 1 AND s.expires_at > datetime('now')
+        WHERE s.token = ? AND u.is_active = 1 AND julianday(s.expires_at) > julianday('now')
       `).get(session) as any;
+      // ^ Ruling 53: expiry compared as TIMES, not text. createSession() stores
+      // ISO 'YYYY-MM-DDTHH:MM:SS.sssZ' and datetime('now') is 'YYYY-MM-DD HH:MM:SS';
+      // as text 'T' > ' ', so a token expired earlier the same UTC day passed.
+      // julianday() parses both (ms precision), matching getCurrentUser's Date test.
       const user = row ? {
         role: (row.role_id && row.role_base) ? row.role_base : row.role,
         page_access: row.page_access != null ? row.page_access : (row.role_id ? (row.role_page_access ?? null) : null),
@@ -489,7 +574,7 @@ export function proxy(req: NextRequest) {
         const url = req.nextUrl.clone();
         url.pathname = fallback;
         url.search = '';
-        url.searchParams.set('forbidden', pathname);
+        url.searchParams.set('forbidden', rawPathname);
         return NextResponse.redirect(url);
       }
     } catch { /* on DB error, fall through — fail open */ }
@@ -515,8 +600,9 @@ export function proxy(req: NextRequest) {
                r.base_role AS role_base, r.is_head_chef AS role_head_chef
         FROM sessions s JOIN users u ON u.id = s.user_id
         LEFT JOIN roles r ON r.id = u.role_id
-        WHERE s.token = ? AND u.is_active = 1 AND s.expires_at > datetime('now')
+        WHERE s.token = ? AND u.is_active = 1 AND julianday(s.expires_at) > julianday('now')
       `).get(session) as any;
+      // Expiry as times, not text — see the page-gate SELECT above (ruling 53).
       if (!row) return NextResponse.json({ error: 'Sign in required' }, { status: 401 });
 
       // ── 🔒 GUEST FEEDBACK: the owner's READ-ONLY rule, enforced server-side.

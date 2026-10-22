@@ -52,6 +52,36 @@ import {
   recordBillHandoverForReceipt,
   type BillHandoverAnswer,
 } from '@/lib/bill-handover-client';
+/* TAX ACTUALLY CHARGED — the inward register's two appended columns, on screen
+   and in this page's own CSV. ONE module owns the arithmetic, the base and the
+   blank-never-zero rule, shared with the server's csv branch in
+   src/app/api/grn/route.ts and with /reports/purchases,
+   /reports/purchase-bill-summary and the purchase log, so one bill cannot read
+   18.00% on this register and 16.20% on a report. It imports only
+   purchase-charges.ts, which imports nothing — safe in a 'use client' page.
+   Cess is NOT in the figure: it is charged on the GROSS line value and GST on
+   the post-discount value, so no single percentage covers both. */
+import {
+  TAX_VALUE_LABEL, TAX_PERCENT_LABEL, TAX_VALUE_TITLE, TAX_PERCENT_TITLE,
+  TAX_VALUE_CSV_HEADER, TAX_PERCENT_CSV_HEADER,
+  gstValue, taxAppliedPercent, fmtTaxPercent, taxCsvNumber,
+} from '@/lib/tax-applied';
+
+/* TAX % APPLIED DIVIDES BY THE VALUE GST WAS CHARGED ON (owner's ruling,
+   2026-10-14): ACCEPTED qty × rate − discount, which is what every GST writer
+   taxes. The register's SUBTOTAL is RECEIVED × rate, so on a line with a
+   rejected quantity the old base read an 18% bill as 14.21% here while
+   /reports/purchase-log printed 18.00% for it. `gst_goods_value` comes off the
+   server (src/app/api/grn/route.ts GST_GOODS_VALUE_SQL — on the register rows
+   AND the drawer's line items, one fragment), and equals `subtotal` on every
+   line that rejected nothing and on a held line that has not been decided yet.
+   Only the RATE's base moves — SUBTOTAL and TOTAL INWARD print what they did.
+   Field-for-field the server CSV's own basis, so the screen, its footer, the
+   page's export and the server's file divide by the same rupees. */
+const gstRateBasis = (r: any) => ({
+  cgst: r.cgst, sgst: r.sgst, discount: r.discount,
+  subtotal: r.gst_goods_value ?? r.subtotal,
+});
 
 const fmt = (v: number) => '₹' + Math.round(v || 0).toLocaleString('en-IN');
 /** ₹ with 2 decimals — for the inward register (taxes/charges carry paise). */
@@ -786,8 +816,21 @@ export default function GrnPage() {
       const header = ['GRN No.', 'INVOICE ID', 'INWARD DATE', 'SUPPLIER NAME', 'CATEGORY NAME', 'ITEM NAME',
         'PO QTY', 'INWARD QTY', 'PURCHASE UNIT', 'RATE', 'SUBTOTAL', 'DISCOUNT', 'CGST', 'SGST',
         'COMPENSATION CESS', 'SPECIAL EXCISE CESS', 'TCS', 'DELIVERY CHARGES', 'MRP ROUND OFF', 'TOTAL INWARD AMOUNT',
-        'ACCEPTED QTY', 'REJECTED QTY', 'REJECT REASON', 'STATUS', 'RECEIVED BY', 'INVOICE DATE', 'BILL TYPE'];
-      const lines = [header.join(',')];
+        'ACCEPTED QTY', 'REJECTED QTY', 'REJECT REASON', 'STATUS', 'RECEIVED BY', 'INVOICE DATE', 'BILL TYPE',
+        // TAX VALUE (GST) is the 28th and TAX % APPLIED (GST) the 29th, APPENDED
+        // for the same reason BILL TYPE was. Both are DERIVED from the row's own
+        // figures (CGST + SGST, over the ACCEPTED goods value − DISCOUNT, the
+        // base GST is charged on — see gstRateBasis), which is why they go AFTER TOTAL INWARD AMOUNT and
+        // not beside CGST: the total is footable from the columns to its left,
+        // and a duplicate rupee column inside that run would let a reader adding
+        // across the row count GST twice. Kept byte-identical to the server's
+        // own csv branch in src/app/api/grn/route.ts.
+        TAX_VALUE_CSV_HEADER, TAX_PERCENT_CSV_HEADER];
+      // ESCAPED WITH THE SAME `clean` THE DATA ROWS USE — the two tax headings
+      // are sentences containing commas, so a raw join would split them into
+      // extra fields. The 27 headings ahead of them carry no comma, quote or
+      // leading sign, so `clean` leaves each of them byte-identical.
+      const lines = [header.map(clean).join(',')];
       for (const r of rows) lines.push([
         r.grn_number, r.invoice_number, r.inward_date, r.supplier, r.category_name, r.item_name,
         r.po_qty, r.inward_qty, r.purchase_unit, r.rate, r.subtotal, r.discount, r.cgst, r.sgst,
@@ -796,6 +839,11 @@ export default function GrnPage() {
         // Computed by the register SQL (one CASE over g.po_id), never re-derived
         // here — one rule, one place, so the file and the screen cannot drift.
         r.bill_type,
+        // The percentage is BLANK, never 0%, when the line recorded no GST. The
+        // arithmetic comes from the shared helper, so this file and the reports
+        // that print the same figure cannot round differently.
+        taxCsvNumber(gstValue(r)),
+        taxCsvNumber(taxAppliedPercent(gstRateBasis(r))),
       ].map(clean).join(','));
       const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8;' });
       const url = URL.createObjectURL(blob); const a = document.createElement('a');
@@ -906,7 +954,7 @@ export default function GrnPage() {
         </div>
         <div className="flex items-center gap-2">
           <button onClick={downloadRegister} disabled={exporting}
-                  title="Download the inward register (one row per line, sheet column order) as CSV/Excel. It follows the filters above, including Source — and carries a BILL TYPE column (DIRECT / AGAINST PO) as its last column. A filtered download says so in its filename, so a slice is never filed as the whole register. Voided bills are left out — their stock and cost were reversed, so counting them would overstate the period. Pick the 'void' filter to export those on their own."
+                  title="Download the inward register (one row per line, sheet column order) as CSV/Excel. It follows the filters above, including Source — and carries a BILL TYPE column (DIRECT / AGAINST PO), then Tax Value (GST) and Tax % Applied (GST) as its last two columns. A filtered download says so in its filename, so a slice is never filed as the whole register. Voided bills are left out — their stock and cost were reversed, so counting them would overstate the period. Pick the 'void' filter to export those on their own."
                   className="px-3 py-2 bg-white border border-[#af4408] text-[#af4408] hover:bg-[#af4408]/10 rounded-lg text-sm flex items-center gap-2 disabled:opacity-50">
             {exporting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />} Inward Register
           </button>
@@ -1832,6 +1880,17 @@ function GrnRow({ g, expanded, onToggle, isAdmin, canAmend, dataVersion, onEdit,
                     <th className="text-right py-1 px-2 font-medium">Delivery</th>
                     <th className="text-right py-1 px-2 font-medium">MRP Round Off</th>
                     <th className="text-right py-1 px-2 font-medium text-[#af4408]">Total Inward</th>
+                    {/* THE OWNER'S TWO TAX COLUMNS ("Ship B", 98e1be7), AFTER
+                        Total Inward and not beside CGST. Both are DERIVED from
+                        this row's own figures — Tax Value is CGST + SGST, Tax %
+                        Applied is that pair over (accepted goods − Discount), the
+                        base GST is charged on (gstRateBasis; equal to Subtotal on
+                        a line that rejected nothing) — and the run of columns to the left of
+                        Total Inward has to keep adding up to it. Same position,
+                        same wording and the same shared helper as the 28th and
+                        29th columns of the register CSV. */}
+                    <th className="text-right py-1 px-2 font-medium border-l border-[#E8D5C4]" title={TAX_VALUE_TITLE}>{TAX_VALUE_LABEL}</th>
+                    <th className="text-right py-1 px-2 font-medium" title={TAX_PERCENT_TITLE}>{TAX_PERCENT_LABEL}</th>
                     <th className="text-right py-1 px-2 font-medium border-l border-[#E8D5C4]">Accepted</th>
                     <th className="text-right py-1 px-2 font-medium">Rejected</th>
                     <th className="text-left  py-1 px-2 font-medium">Reason</th>
@@ -1871,6 +1930,16 @@ function GrnRow({ g, expanded, onToggle, isAdmin, canAmend, dataVersion, onEdit,
                       {chargeCell(it.delivery_charges)}
                       {chargeCell(it.mrp_round_off)}
                       <td className="py-1 px-2 text-right font-mono font-semibold text-[#af4408]">{m2(it.total_inward_amount)}</td>
+                      {/* The rate is a DASH, never 0.00%, on a line that recorded
+                          no GST: in money the exempt line and the line nobody
+                          filled are identical, so this column must not assert a
+                          rate. The value cell reads a muted 0, like CGST/SGST. */}
+                      <td className={`py-1 px-2 text-right font-mono border-l border-[#E8D5C4] ${gstValue(it) ? 'text-[#2D1B0E]' : muted}`}>
+                        {gstValue(it) == null ? '—' : q2(gstValue(it))}
+                      </td>
+                      <td className={`py-1 px-2 text-right font-mono ${taxAppliedPercent(gstRateBasis(it)) == null ? muted : 'text-[#2D1B0E] font-semibold'}`}>
+                        {fmtTaxPercent(taxAppliedPercent(gstRateBasis(it)))}
+                      </td>
                       {/* Same rule as the list row's accepted-value cell: while
                           the receipt is held these are stored 0 because no
                           decision exists, and printing "0 kg accepted / 0 kg
@@ -1880,7 +1949,7 @@ function GrnRow({ g, expanded, onToggle, isAdmin, canAmend, dataVersion, onEdit,
                           (No currency glyph in this comment on purpose — the
                           rate-basis gate's money-column rule keys on one, and
                           this table's eight charge cells come from chargeCell()
-                          so a literal <td> count can never match its 19 <th>.) */}
+                          so a literal <td> count can never match its 21 <th>.) */}
                       <td className="py-1 px-2 text-right font-mono text-emerald-700 border-l border-[#E8D5C4]">
                         {heldNow
                           ? <span className="text-[#B8A590] font-sans" title={`${checkerName} records this when they sign off.`}>—</span>
@@ -1909,6 +1978,36 @@ function GrnRow({ g, expanded, onToggle, isAdmin, canAmend, dataVersion, onEdit,
                         figure slides left out of its own column. */}
                     <td className="py-1.5 px-2 text-right font-mono" colSpan={8}></td>
                     <td className="py-1.5 px-2 text-right font-mono text-[#af4408]">{m2(detail.items.reduce((s: number, it: any) => s + (Number(it.total_inward_amount) || 0), 0))}</td>
+                    {/* THE BILL'S OWN TAX FOOTER. Sigma(CGST+SGST), and the rate as
+                        Sigma(GST) / Sigma(taxed base) — money-weighted, and the base
+                        counts ONLY the lines that carried GST, so a bill whose
+                        exempt lines outweigh its taxed ones still reports the rate
+                        the vendor charged. An average of the lines' percentages
+                        would weight a Rs 100 line like a Rs 1,00,000 one. Same
+                        taxed_bill_value / taxed_lines shape the shipped reports
+                        hand the shared helper. */}
+                    {(() => {
+                      const foot = detail.items.reduce((a: any, it: any) => {
+                        const g = gstValue(it) || 0;
+                        a.cgst += Number(it.cgst) || 0;
+                        a.sgst += Number(it.sgst) || 0;
+                        if (g > 0) {
+                          // The value GST was CHARGED on (accepted goods −
+                          // discount), the same base as the line cell above —
+                          // not the printed Subtotal, which is what ARRIVED.
+                          const b = gstRateBasis(it);
+                          a.taxed_bill_value += (Number(b.subtotal) || 0) - (Number(b.discount) || 0);
+                          a.taxed_lines += 1;
+                        }
+                        return a;
+                      }, { cgst: 0, sgst: 0, taxed_bill_value: 0, taxed_lines: 0, count: detail.items.length });
+                      return (<>
+                        <td className="py-1.5 px-2 text-right font-mono border-l border-[#E8D5C4]">
+                          {gstValue(foot) == null ? '—' : q2(gstValue(foot))}
+                        </td>
+                        <td className="py-1.5 px-2 text-right font-mono">{fmtTaxPercent(taxAppliedPercent(foot))}</td>
+                      </>);
+                    })()}
                     <td colSpan={3}></td>
                   </tr>
                 </tfoot>

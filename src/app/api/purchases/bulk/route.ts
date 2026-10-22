@@ -225,17 +225,47 @@ export async function POST(request: Request) {
     // our auto invoice_id, which is unique per entry and would defeat the check).
     //
     // A STORED row with an EMPTY bill_no matches ANY incoming bill_no. That is
-    // load-bearing: every pre-existing row, and every row written by the single
-    // POST / opening-stock / GRN / PO-receive / inward-import paths, has
-    // bill_no ''. Comparing strictly would make them invisible the moment the
-    // user starts filling the new bill_no column — the same file re-uploaded
-    // would insert again and DOUBLE the stock. Two genuine lines that differ
-    // only by a NON-empty bill number are still both kept.
+    // load-bearing: every pre-existing row, and every row written by the
+    // opening-stock path, has bill_no ''. Comparing strictly would make them
+    // invisible the moment the user starts filling the new bill_no column — the
+    // same file re-uploaded would insert again and DOUBLE the stock. Two genuine
+    // lines that differ only by a NON-empty bill number are still both kept,
+    // EXCEPT where the stored line is an inward-imported row (next note).
+    //
+    // ── RULING 33 (owner, 2026-10-14): AN INWARD-IMPORTED ROW KEEPS THE WILDCARD,
+    // WHATEVER BILL NUMBER IT NOW CARRIES. /api/inward-import/commit used to
+    // store bill_no '' and now stores the sheet's INVOICE ID, and the admin
+    // repair (/api/admin/repair-purchase-bill-no) back-fills that number onto
+    // the 2,118 rows imported before. Judged by bill_no alone, both would have
+    // changed this guard in BOTH directions: a bulk line matching an imported
+    // line under a DIFFERENT bill number would insert and count its stock a
+    // second time, and a line on the SAME bill at another qty or rate would be
+    // refused by billLineCheck below where it used to insert. The owner ruled
+    // that an imported row blocks a matching bulk line (same vendor, day,
+    // material, qty, rate) whatever bill number either side carries, exactly as
+    // it did while it was stored blank — so for these two statements an
+    // imported row still reads as blank, and only the stored column changes.
+    //
+    // IDENTIFIED BY WHAT THE IMPORTER NEVER WRITES, NOT BY bill_no OR notes:
+    // inward-import stamps neither invoice_id nor grn_id. Every writer that
+    // stores a NAMED bill stamps one of them — POST /api/purchases and this
+    // route always mint a PINV invoice_id; GRN, QC sign-off, GRN amend and
+    // PO-receive always set grn_id — so their named-bill rule is exactly what
+    // it was. The only other rows with neither stamp (opening stock, seed,
+    // legacy test rows) have bill_no '' and were wildcards already. The repair
+    // writes only rows with BOTH stamps blank, so APPLY cannot move a row out
+    // of this set. Measured on a copy of the book, 2026-10-14: 2,121 rows have
+    // neither stamp — 2,118 inward-imported + 3 legacy, all bill_no '' — and
+    // no row carries a bill_no without one of the two stamps.
+    // A new writer that stores a vendor bill number MUST stamp invoice_id or
+    // grn_id, or its rows will be read as imported here (refused, never
+    // double-counted — the safe side, but not its rule).
+    const IMPORTED_ROW = `(TRIM(COALESCE(invoice_id, '')) = '' AND TRIM(COALESCE(grn_id, '')) = '')`;
     const dupCheck = db.prepare(`
       SELECT 1 FROM purchases
       WHERE material_id = ?
         AND LOWER(COALESCE(vendor, '')) = LOWER(?)
-        AND (COALESCE(bill_no, '') = '' OR LOWER(bill_no) = LOWER(?))
+        AND (COALESCE(bill_no, '') = '' OR ${IMPORTED_ROW} OR LOWER(bill_no) = LOWER(?))
         AND date = ?
         AND ROUND(quantity, 3)   = ROUND(?, 3)
         AND ROUND(unit_price, 2) = ROUND(?, 2)
@@ -311,6 +341,11 @@ export async function POST(request: Request) {
     // writes all of them, so the same filters would make a re-uploaded inward
     // sheet invisible to its own guard and double the stock — the one failure
     // this file exists to prevent.
+    //
+    // IMPORTED ROWS ARE LEFT OUT (ruling 33, see IMPORTED_ROW above): for this
+    // guard an imported row's bill is blank, as it was when it was stored
+    // blank, so it is never "the same named bill". It is still caught, on the
+    // exact six-part key, by dupCheck's wildcard.
     const billLineCheck = db.prepare(`
       SELECT quantity, unit_price, COALESCE(invoice_id, '') AS invoice_id
       FROM purchases
@@ -318,6 +353,7 @@ export async function POST(request: Request) {
         AND LOWER(TRIM(COALESCE(vendor, ''))) = ?
         AND LOWER(TRIM(COALESCE(bill_no, ''))) = ?
         AND date = ?
+        AND NOT ${IMPORTED_ROW}
       ORDER BY created_at ASC
       LIMIT 1
     `);

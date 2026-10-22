@@ -3,9 +3,23 @@
 /**
  * Party P&L page — one-stop view of per-party profit & loss.
  *
- * Revenue   = Party Bookings sheet (col U) matched by party_unique_id
+ * Revenue   = Party Bookings sheet (col U) matched by party_unique_id, once per
+ *             booking — on the latest not-cancelled F&P carrying the id (owner
+ *             rulings 43 + 51). Not
+ *             shown on this page (the consumption modal shows no revenue either);
+ *             /parties is where it is read.
  * Food Cost = party requisition items × material avg price (by event)
- * Liquor Cost = party_consumption × material avg price (snapshotted)
+ * Liquor Cost = liquor lines of the party's Bar requisition (read-only here)
+ *             + party_consumption × material avg price (snapshotted), including
+ *               rows with no party id that ONLY this party matches by name;
+ *               a row that matches two or more parties counts on none until the
+ *               owner assigns it to one that has an AKAN id (owner ruling
+ *               2026-10-14). A row carrying an
+ *               AKAN id that is on two or more F&P rows counts only on the F&P
+ *               it was recorded from (else the one on its date, else on none
+ *               until assigned) — never on every row with the id. A row whose
+ *               id the F&P it was recorded from no longer carries counts on
+ *               none (ruling 52).
  * Profit    = Revenue − (Food + Liquor)
  *
  * Bar manager records bottle counts the night of / morning after the event
@@ -13,7 +27,7 @@
  */
 
 import { useEffect, useState } from 'react';
-import { Wine, Loader2, RefreshCw, AlertTriangle, Plus, X, Trash2 } from 'lucide-react';
+import { Wine, Loader2, RefreshCw, AlertTriangle, Plus, X, Trash2, Lock } from 'lucide-react';
 import MaterialTypeahead from '@/components/MaterialTypeahead';
 import { api } from '@/lib/api';
 import { fmtQtyNum, packFactor, purchasePrice, type PackMeta } from '@/lib/pack-units';
@@ -122,6 +136,15 @@ function prettyQty(qty: number, unit?: string): string {
   return qty.toLocaleString('en-IN', { maximumFractionDigits: 2 }) + ' ' + (unit || '');
 }
 
+/** The two sources behind liquor_items, or null when the API predates the split
+ *  (then the caller falls back to the merged count rather than printing "0 · 0"). */
+function liquorSplit(r: PnLRow): { req: number; rec: number } | null {
+  const req = r.liquor_requisition_items;
+  const rec = r.liquor_consumption_items;
+  if (typeof req !== 'number' || typeof rec !== 'number') return null;
+  return { req, rec };
+}
+
 interface PnLRow {
   party_unique_id?: string;
   fp_id?: string;
@@ -134,6 +157,23 @@ interface PnLRow {
   food_items: number;
   liquor_cost: number;
   liquor_items: number;
+  // liquor_items is the SUM of these two sources. Optional so an older cached
+  // response (or a payload from before the split shipped) degrades to the merged
+  // count instead of rendering "0 · 0" over a non-zero cost.
+  liquor_consumption_items?: number;   // recorded on this screen
+  liquor_requisition_items?: number;   // already costed from the Bar requisition
+  // Rows recorded with NO party id (owner ruling 2026-10-14). matched_by_name is
+  // the part of liquor_consumption_items that rests on the name alone (this party
+  // was the only match that evening); unassigned rows name this party AND another
+  // (or carry an id on several F&Ps, or one changed after recording — ruling 52)
+  // and are counted on neither; only a candidate with an AKAN id can take one.
+  liquor_matched_by_name_items?: number;
+  liquor_unassigned_items?: number;
+  /** Requisitions with NO party id raised under a name this party shares with
+   *  another that evening — costed on NEITHER (owner ruling 34) — plus those
+   *  with an id on several F&Ps that nothing picks (43) or an id this F&P no
+   *  longer carries (52). A count only. */
+  requisitions_unassigned?: number;
   total_cost: number;
   profit: number;
   margin_pct: number;
@@ -141,8 +181,60 @@ interface PnLRow {
   has_liquor_recorded: boolean;
 }
 
+/** A party_consumption row charged to NO party: recorded without a party id
+ *  under a name that matches two or more parties that evening
+ *  ('several_parties') or none ('no_party'); or recorded WITH an id that is on
+ *  two or more F&P rows when neither the F&P it was recorded from nor its date
+ *  picks one ('id_on_several_parties'), or with an id NO F&P on the party list
+ *  carries ('id_not_listed' — read-only, nothing to assign it to; ruling 43), or
+ *  with an id the F&P it was recorded from no longer carries
+ *  ('id_changed_after_recording' — ruling 52; candidates = that F&P and the rows
+ *  carrying the id). */
+interface UnassignedLiquor {
+  id: string;
+  event_name: string;
+  event_date: string;
+  reason: 'several_parties' | 'no_party' | 'id_on_several_parties' | 'id_changed_after_recording' | 'id_not_listed';
+  /** The entry's own party id (null for one recorded without an id). */
+  party_unique_id?: string | null;
+  material_name: string | null;
+  material_unit: string | null;
+  qty_consumed: number | null;
+  cost_at_time: number;
+  recorded_by: string | null;
+  /** The F&P the entry was recorded from — the owner's clue to whose bottle it is. */
+  recorded_fp_id?: string | null;
+  candidates: { party_unique_id: string | null; fp_id: string | null; event_name: string; event_date: string }[];
+}
+
+/** A COSTED party requisition on no party's P&L (owner ruling 34): it has no
+ *  party id and two or more parties that evening carry its name, or it carries
+ *  an id no listed party has, or an id two or more listed rows share when
+ *  neither the F&P it was raised from nor its date picks one (ruling 43).
+ *  Read-only. Costs only for the financial audience. */
+interface UnassignedRequisition {
+  req_id: string;
+  req_number: string;
+  event_name: string;
+  event_date: string;
+  party_unique_id: string | null;
+  fp_id: string | null;
+  /** + 'id_changed_after_recording' (ruling 52: the F&P it was raised from no
+   *  longer carries its id) and 'no_party' (no id, no party that evening has
+   *  its name; ruling 43). */
+  reason: 'several_parties' | 'id_not_listed' | 'id_on_several_parties' | 'id_changed_after_recording' | 'no_party';
+  food_items: number;
+  liquor_items: number;
+  food_cost?: number;
+  liquor_cost?: number;
+  candidates: { party_unique_id: string | null; fp_id: string | null; event_name: string; event_date: string }[];
+}
+
 export default function PartyPnLPage() {
   const [rows, setRows] = useState<PnLRow[]>([]);
+  const [unassigned, setUnassigned] = useState<UnassignedLiquor[]>([]);
+  const [unassignedReqs, setUnassignedReqs] = useState<UnassignedRequisition[]>([]);
+  const [canAssign, setCanAssign] = useState(false);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -156,6 +248,9 @@ export default function PartyPnLPage() {
       const j = await r.json();
       if (!r.ok) { setError(j.error || `HTTP ${r.status}`); return; }
       setRows(j.pnl || []);
+      setUnassigned(j.unassigned_liquor || []);
+      setUnassignedReqs(j.unassigned_requisitions || []);
+      setCanAssign(j.can_assign === true);
     } catch (e: any) {
       setError(e?.message || 'Failed');
     } finally {
@@ -248,12 +343,84 @@ export default function PartyPnLPage() {
                     </td>
                     <td className="py-1.5 px-3 text-right font-mono">{r.pax || '—'}</td>
                     <td className="py-1.5 px-3">
+                      {/* SPLIT BY SOURCE, not a merged count. A party whose liquor
+                          came entirely from a bar requisition used to read
+                          "✓ 1 item recorded" and open a modal saying nothing was
+                          recorded — a green tick pointing at the wrong place, which
+                          invites re-typing a bottle that is already costed. Each
+                          source now names itself, and the tick appears only for what
+                          was actually recorded on this screen. */}
                       {r.has_liquor_recorded
-                        ? <button onClick={() => setRecordFor(r)} title="View / edit recorded items"
-                                  className="inline-flex items-center gap-1 text-emerald-700 hover:underline">
-                            ✓ {r.liquor_items} item{r.liquor_items === 1 ? '' : 's'} recorded
+                        ? <button onClick={() => setRecordFor(r)}
+                                  title="Open the liquor breakdown for this event. Requisition lines are already costed on the P&L and are read-only."
+                                  className="inline-flex flex-wrap items-center gap-x-1 text-left hover:underline">
+                            {liquorSplit(r)
+                              ? <>
+                                  <span className={liquorSplit(r)!.req > 0 ? 'text-[#af4408]' : 'text-[#8B7355]'}>
+                                    {/* "requisitions" names the SOURCE and never
+                                        agrees with the count: the owner specified
+                                        "1 from requisitions · 0 recorded here"
+                                        verbatim, and "recorded here" opposite it
+                                        does not inflect either. */}
+                                    {liquorSplit(r)!.req} from requisitions
+                                  </span>
+                                  <span className="text-[#C4B5A5]">·</span>
+                                  <span className={liquorSplit(r)!.rec > 0 ? 'text-emerald-700' : 'text-[#8B7355]'}>
+                                    {liquorSplit(r)!.rec === 0 ? '0' : `✓ ${liquorSplit(r)!.rec}`} recorded here
+                                  </span>
+                                  {/* Part of "recorded here" that rests on the NAME
+                                      alone: recorded without a party id, and this
+                                      was the only party that evening it matched. */}
+                                  {(r.liquor_matched_by_name_items || 0) > 0 && (
+                                    <span className="text-[10px] text-[#8B7355]"
+                                          title="Recorded without a party id; this is the only party that evening whose name matches, so it is counted here.">
+                                      ({r.liquor_matched_by_name_items} matched by name)
+                                    </span>
+                                  )}
+                                </>
+                              : <span className="text-emerald-700">✓ {r.liquor_items} item{r.liquor_items === 1 ? '' : 's'} recorded</span>}
                           </button>
-                        : <span className="text-amber-700 text-[10px]">not recorded yet</span>}
+                        // has_liquor_recorded is false only when NO liquor is
+                        // counted on this row. "not recorded yet" is true only when
+                        // nothing that names this row waits on no party either: a
+                        // bottle recorded (maybe on this very screen) but counted
+                        // on no party, or a requisition costed on no party, makes
+                        // it false — the badges below say "N recorded, counted on
+                        // no party" — so the cell then says what IS true: none of
+                        // it is counted here.
+                        : ((r.liquor_unassigned_items || 0) > 0 || (r.requisitions_unassigned || 0) > 0)
+                          ? <span className="text-amber-700 text-[10px]">no liquor counted</span>
+                          : <span className="text-amber-700 text-[10px]">not recorded yet</span>}
+                      {/* Recorded under a name this party shares with another party
+                          that evening (or with an id on several F&Ps, or whose id
+                          changed after recording — ruling 52): counted on NEITHER.
+                          Only an entry with a candidate that has an AKAN id can be
+                          assigned, so the badge does not promise an assignment.
+                          Said here so nobody reads the empty cell as "nothing was
+                          recorded" and types the bottle in again. */}
+                      {(r.liquor_unassigned_items || 0) > 0 && (
+                        <button onClick={() => setRecordFor(r)}
+                                className="block text-[10px] text-red-700 hover:underline text-left"
+                                title="Recorded under a name that matches more than one party that evening, or with a party id that is on more than one F&P when nothing picks one, or with a party id the F&P it was recorded from no longer carries (the id changed after recording) — not counted on any P&L. The owner can assign it only to a matching party that has an AKAN id; otherwise it stays uncounted until the party sheet changes.">
+                          {r.liquor_unassigned_items} recorded, counted on no party
+                        </button>
+                      )}
+                      {/* A requisition raised under a name this party shares with
+                          another that evening, carrying no party id — or carrying
+                          an id this row shares with another F&P when neither the
+                          F&P it was raised from nor its date picks one — or raised
+                          from this F&P when it no longer carries the requisition's
+                          id (ruling 52; then this F&P may be its only candidate, so
+                          the badge does not say "shared"): costed on NEITHER (owner
+                          rulings 34, 43, 52). Said
+                          here so the gap is not read as missing liquor. */}
+                      {(r.requisitions_unassigned || 0) > 0 && (
+                        <button onClick={() => setRecordFor(r)}
+                                className="block text-[10px] text-red-700 hover:underline text-left"
+                                title="A requisition with no party id raised under a name that matches more than one party that evening, or with a party id that is on more than one F&P when neither the F&P it was raised from nor its date picks one, or with a party id the F&P it was raised from no longer carries (the id changed after recording) — costed on none of them.">
+                          {r.requisitions_unassigned} requisition{r.requisitions_unassigned === 1 ? '' : 's'} costed on no party
+                        </button>
+                      )}
                     </td>
                     <td className="py-1.5 px-3 text-right font-mono whitespace-nowrap">
                       {r.has_liquor_recorded
@@ -274,6 +441,14 @@ export default function PartyPnLPage() {
         )}
       </div>
 
+      {!loading && unassigned.length > 0 && (
+        <UnassignedLiquorPanel items={unassigned} canAssign={canAssign} onChanged={load} />
+      )}
+
+      {!loading && unassignedReqs.length > 0 && (
+        <UnassignedRequisitionsPanel items={unassignedReqs} />
+      )}
+
       {recordFor && (
         <RecordConsumptionModal
           target={recordFor}
@@ -281,6 +456,226 @@ export default function PartyPnLPage() {
           onChanged={load}
         />
       )}
+    </div>
+  );
+}
+
+/**
+ * LIQUOR CHARGED TO NO PARTY — for the owner to assign (ruling 2026-10-14).
+ * A bottle recorded without a party id is counted only when exactly ONE party
+ * that evening matches the name it was recorded under. These matched two or
+ * more (or none), so every P&L above leaves them out; the list is what keeps
+ * them from silently disappearing. Assigning sets the row's party id and F&P
+ * (admin only, and only to a party the name and date actually match); its
+ * quantity and snapshotted cost stay exactly as recorded, and it then counts on
+ * that F&P row alone (owner ruling 34: a party without an id never counts an
+ * entry carrying an id, and when one AKAN id is on two F&P rows an entry counts
+ * only on the F&P it belongs to). The button sends the clicked row's fp_id, so
+ * the second F&P of a booking can be chosen. Entries already carrying an id
+ * that is on several F&P rows, with nothing to pick one, are listed here too,
+ * and so are entries whose id no listed F&P carries ('id_not_listed') and
+ * entries whose id the F&P they were recorded from no longer carries (ruling
+ * 52). A party without an id cannot be chosen until the sheet gives it one, so
+ * an entry whose candidates all lack an id — or that has none — cannot be
+ * assigned at all; the intro says so instead of promising an assignment.
+ * "recorded from" names the F&P whose screen the entry was typed on.
+ */
+function UnassignedLiquorPanel({ items, canAssign, onChanged }: {
+  items: UnassignedLiquor[];
+  canAssign: boolean;
+  onChanged: () => void;
+}) {
+  const [busy, setBusy] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const total = items.reduce((a, x) => a + (x.cost_at_time || 0), 0);
+
+  // fp_id names WHICH F&P row was clicked: one AKAN id can sit on two F&P rows
+  // (two functions of one booking), and the entry must count on the one chosen.
+  const assign = async (id: string, partyUniqueId: string, fpId: string | null, label: string) => {
+    if (typeof window !== 'undefined' && !window.confirm(`Assign this entry to ${label}? It will then count on that party's P&L.`)) return;
+    setBusy(id); setErr(null);
+    try {
+      const r = await api('/api/party-consumption', {
+        method: 'PATCH',
+        body: { id, party_unique_id: partyUniqueId, ...(fpId ? { fp_id: fpId } : {}) },
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) { setErr(j.error || `HTTP ${r.status}`); return; }
+      onChanged();
+    } finally { setBusy(null); }
+  };
+
+  return (
+    <div className="bg-white border border-red-200 rounded-xl overflow-hidden">
+      <div className="px-4 py-3 border-b border-red-200 bg-red-50/60">
+        <div className="text-sm font-semibold text-red-800 flex items-center gap-1.5">
+          <AlertTriangle size={14} /> Liquor counted on no party — {items.length} entr{items.length === 1 ? 'y' : 'ies'} · {fmt(total)}
+        </div>
+        <div className="text-[11px] text-red-700 mt-0.5">
+          Recorded without a party id under a name that matches more than one party that evening (or none) — or
+          recorded with a party id that is on more than one F&amp;P, when neither the F&amp;P it was recorded from nor its
+          date picks one — or with a party id no F&amp;P on the list carries — or with a party id the F&amp;P it was
+          recorded from no longer carries (the id changed after recording). None of the P&amp;Ls above includes these.{' '}
+          {canAssign ? 'You can assign' : 'The owner can assign'} an entry only to one of its matching parties that has
+          an AKAN id; an entry with no such party cannot be assigned and stays uncounted until the party sheet changes.
+        </div>
+      </div>
+      {err && <div className="px-4 py-2 text-xs bg-red-50 text-red-700 border-b border-red-200">{err}</div>}
+      <div className="overflow-x-auto">
+        <table className="w-full text-xs">
+          <thead className="bg-[#FFF1E3] text-[#6B5744]">
+            <tr>
+              <th className="text-left  py-1.5 px-3 font-medium">Date</th>
+              <th className="text-left  py-1.5 px-3 font-medium">Recorded under</th>
+              <th className="text-left  py-1.5 px-3 font-medium">Item</th>
+              <th className="text-right py-1.5 px-3 font-medium">Cost</th>
+              <th className="text-left  py-1.5 px-3 font-medium">Matching parties</th>
+            </tr>
+          </thead>
+          <tbody>
+            {items.map(x => (
+              <tr key={x.id} className="border-t border-[#E8D5C4]/50 align-top">
+                <td className="py-1.5 px-3 font-mono whitespace-nowrap">{x.event_date}</td>
+                <td className="py-1.5 px-3 text-[#2D1B0E]">
+                  {x.event_name}
+                  {x.reason === 'id_on_several_parties' && x.party_unique_id && (
+                    <div className="text-[10px] text-[#8B7355]">carries id {x.party_unique_id} — on more than one F&amp;P</div>
+                  )}
+                  {x.reason === 'id_not_listed' && x.party_unique_id && (
+                    <div className="text-[10px] text-[#8B7355]">carries id {x.party_unique_id} — not on the party list</div>
+                  )}
+                  {x.reason === 'id_changed_after_recording' && (
+                    <div className="text-[10px] text-[#8B7355]">carries id {x.party_unique_id} — id changed after recording: {x.recorded_fp_id || 'the F&P it was recorded from'} no longer carries it</div>
+                  )}
+                  {x.recorded_by && <div className="text-[10px] text-[#8B7355]">by {String(x.recorded_by).split('@')[0]}</div>}
+                  {x.recorded_fp_id && (
+                    <div className="text-[10px] text-[#8B7355]"
+                         title="The party screen this entry was recorded from. Two parties can share a name that evening; this is whose screen it was typed on.">
+                      recorded from <span className="font-mono text-[#af4408]">{x.recorded_fp_id}</span>
+                    </div>
+                  )}
+                </td>
+                <td className="py-1.5 px-3">
+                  {x.material_name || '(material removed)'}
+                  {x.qty_consumed != null && <div className="text-[10px] text-[#8B7355] font-mono">{prettyQty(x.qty_consumed, x.material_unit || '')}</div>}
+                </td>
+                <td className="py-1.5 px-3 text-right font-mono">{fmt(x.cost_at_time)}</td>
+                <td className="py-1.5 px-3">
+                  {x.reason === 'id_not_listed'
+                    ? <span className="text-[10px] text-[#8B7355]">No F&amp;P on the party list carries this id — nothing to assign it to.</span>
+                    : x.reason === 'no_party' || x.candidates.length === 0
+                    ? <span className="text-[10px] text-[#8B7355]">No party on this date carries this name.</span>
+                    : <div className="flex flex-col gap-1">
+                        {x.candidates.map((c, ci) => (
+                          <div key={ci} className="flex items-center gap-2 flex-wrap">
+                            <span className="text-[#2D1B0E]">{c.event_name || '—'}</span>
+                            {c.fp_id && <span className="text-[9px] font-mono text-[#af4408]">{c.fp_id}</span>}
+                            {canAssign && (c.party_unique_id
+                              ? <button type="button" disabled={busy === x.id}
+                                        onClick={() => assign(x.id, c.party_unique_id!, c.fp_id,
+                                          (c.event_name || c.party_unique_id!) + (c.fp_id ? ` (${c.fp_id})` : ''))}
+                                        className="px-2 py-0.5 rounded text-[10px] bg-[#af4408] hover:bg-[#933807] text-white disabled:opacity-50">
+                                  {busy === x.id ? 'Assigning…' : 'Assign here'}
+                                </button>
+                              : <span className="text-[10px] text-[#8B7355]">no AKAN id yet — cannot be assigned</span>)}
+                          </div>
+                        ))}
+                      </div>}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * REQUISITIONS COSTED ON NO PARTY — owner ruling 34 (2026-10-14). A requisition
+ * is costed only on the party whose AKAN id it carries; one with no id only when
+ * exactly ONE party that evening carries the name it was raised under. These
+ * matched two or more or none, or carry an id no listed party has, or carry an
+ * id the F&P they were raised from no longer carries (ruling 52), so no P&L
+ * above includes them — production costed each on every matching party. Read-only:
+ * a requisition's party is set when it is raised (Raise Req), not here.
+ */
+function UnassignedRequisitionsPanel({ items }: { items: UnassignedRequisition[] }) {
+  const showCost = items.some(x => typeof x.food_cost === 'number' || typeof x.liquor_cost === 'number');
+  const total = items.reduce((a, x) => a + (x.food_cost || 0) + (x.liquor_cost || 0), 0);
+  return (
+    <div className="bg-white border border-red-200 rounded-xl overflow-hidden">
+      <div className="px-4 py-3 border-b border-red-200 bg-red-50/60">
+        <div className="text-sm font-semibold text-red-800 flex items-center gap-1.5">
+          <AlertTriangle size={14} /> Requisitions costed on no party — {items.length} requisition{items.length === 1 ? '' : 's'}
+          {showCost && <> · {fmt(total)}</>}
+        </div>
+        <div className="text-[11px] text-red-700 mt-0.5">
+          A requisition counts only on the party whose AKAN id it carries; without an id, only when exactly one party
+          that evening has the name it was raised under. When its id is on more than one F&amp;P, only on the F&amp;P it
+          was raised from — else on the one dated on its date. These match more than one party or none, or carry an id
+          no listed party has, or carry an id the F&amp;P they were raised from no longer carries (the id changed after
+          recording) — so none of the P&amp;Ls above includes them.
+        </div>
+      </div>
+      <div className="overflow-x-auto">
+        <table className="w-full text-xs">
+          <thead className="bg-[#FFF1E3] text-[#6B5744]">
+            <tr>
+              <th className="text-left  py-1.5 px-3 font-medium">Date</th>
+              <th className="text-left  py-1.5 px-3 font-medium">Requisition</th>
+              <th className="text-left  py-1.5 px-3 font-medium">Raised under</th>
+              <th className="text-right py-1.5 px-3 font-medium">Lines</th>
+              {showCost && <th className="text-right py-1.5 px-3 font-medium">Cost</th>}
+              <th className="text-left  py-1.5 px-3 font-medium">Matching parties</th>
+            </tr>
+          </thead>
+          <tbody>
+            {items.map(x => (
+              <tr key={x.req_id} className="border-t border-[#E8D5C4]/50 align-top">
+                <td className="py-1.5 px-3 font-mono whitespace-nowrap">{x.event_date}</td>
+                <td className="py-1.5 px-3 font-mono whitespace-nowrap">
+                  {x.req_number || '—'}
+                  {x.fp_id && <div className="text-[9px] text-[#af4408]">{x.fp_id}</div>}
+                </td>
+                <td className="py-1.5 px-3 text-[#2D1B0E]">
+                  {x.event_name}
+                  {x.reason === 'id_not_listed' && x.party_unique_id && (
+                    <div className="text-[10px] text-[#8B7355]">carries id {x.party_unique_id} — not on the party list</div>
+                  )}
+                  {x.reason === 'id_on_several_parties' && x.party_unique_id && (
+                    <div className="text-[10px] text-[#8B7355]">carries id {x.party_unique_id} — on more than one F&amp;P; neither the F&amp;P it was raised from nor its date picks one</div>
+                  )}
+                  {x.reason === 'id_changed_after_recording' && (
+                    <div className="text-[10px] text-[#8B7355]">carries id {x.party_unique_id} — id changed after recording: {x.fp_id || 'the F&P it was raised from'} no longer carries it</div>
+                  )}
+                </td>
+                <td className="py-1.5 px-3 text-right font-mono whitespace-nowrap">
+                  {x.food_items} food · {x.liquor_items} liquor
+                </td>
+                {showCost && (
+                  <td className="py-1.5 px-3 text-right font-mono whitespace-nowrap">
+                    {fmt((x.food_cost || 0) + (x.liquor_cost || 0))}
+                  </td>
+                )}
+                <td className="py-1.5 px-3">
+                  {x.reason === 'no_party' && x.candidates.length === 0 && (
+                    <span className="text-[10px] text-[#8B7355]">No party on this date carries this name.</span>
+                  )}
+                  <div className="flex flex-col gap-0.5">
+                    {x.candidates.map((c, ci) => (
+                      <div key={ci} className="flex items-center gap-2 flex-wrap">
+                        <span className="text-[#2D1B0E]">{c.event_name || '—'}</span>
+                        {c.fp_id && <span className="text-[9px] font-mono text-[#af4408]">{c.fp_id}</span>}
+                      </div>
+                    ))}
+                  </div>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 }
@@ -294,6 +689,76 @@ interface ConsumptionEntry {
   cost_at_time: number;
   notes?: string;
   recorded_by?: string;
+  /** Recorded WITHOUT a party id and counted here because this is the only
+   *  party that evening its name matches (owner ruling 2026-10-14). */
+  matched_by_name?: boolean;
+}
+
+/** Recorded without a party id under a name that matches this party AND another
+ *  that evening ('several_parties'), or recorded with an id this row shares with
+ *  another F&P when neither the F&P it was recorded from nor its date picks one
+ *  ('id_on_several_parties'), or recorded with an id the F&P it was recorded
+ *  from no longer carries ('id_changed_after_recording', ruling 52) — counted on
+ *  NEITHER; assignable only to a candidate that has an AKAN id. Never summed. */
+interface UnassignedEntry extends ConsumptionEntry {
+  event_name: string;
+  /** + 'id_changed_after_recording' (ruling 52). */
+  reason?: 'several_parties' | 'id_on_several_parties' | 'id_changed_after_recording';
+  party_unique_id?: string | null;
+  candidates: { party_unique_id: string | null; fp_id?: string | null; event_name: string; event_date: string }[];
+}
+
+/** A requisition costed on NEITHER party (owner ruling 34): no party id and
+ *  raised under a name this party shares with another that evening, or carrying
+ *  an id this row shares with another F&P when neither the F&P it was raised
+ *  from nor its date picks one (ruling 43). Never summed. */
+interface UnassignedReqHere {
+  req_id: string;
+  req_number: string;
+  event_name: string;
+  /** + 'id_changed_after_recording' (ruling 52). */
+  reason?: 'several_parties' | 'id_on_several_parties' | 'id_changed_after_recording';
+  party_unique_id?: string | null;
+  candidates: { party_unique_id: string | null; fp_id?: string | null; event_name: string; event_date: string }[];
+}
+
+/** "Ravi Kumar (FP-103)" — the display name alone cannot tell two parties of one
+ *  name apart, which is exactly when these lists appear. */
+function candidateLabel(c: { fp_id?: string | null; event_name: string }): string {
+  return (c.event_name || '—') + (c.fp_id ? ` (${c.fp_id})` : '');
+}
+
+/** A liquor line from the party's BAR REQUISITION — already costed into the P&L
+ *  by /api/party-events/pnl. Shown read-only; there is nothing here to edit and
+ *  re-entering one of these on the form counts the same bottle twice. */
+interface ReqLiquorItem {
+  id: string;
+  material_id: string;
+  material_name: string;
+  material_unit: string;
+  material_purchase_unit?: string;
+  issued_unit: string;
+  qty_issued: number;
+  qty_issued_recipe: number;
+  /** qty_issued_recipe in the PURCHASE unit — what the row leads with. */
+  qty_issued_purchase?: number;
+  /** Blank/unrecognised line unit on a packed material: costed at ×1. */
+  needs_unit_review?: boolean;
+  cost: number;
+  req_number: string;
+  req_status: string;
+  issued_at?: string | null;
+  issued_by?: string | null;
+}
+
+/** A material the POST refused because the bar requisition already covers it. */
+interface DuplicateWarning {
+  material_id: string;
+  material_name: string;
+  req_number: string;
+  qty_issued: number;
+  issued_unit: string;
+  cost: number;
 }
 
 function RecordConsumptionModal({ target, onClose, onChanged }: {
@@ -303,6 +768,10 @@ function RecordConsumptionModal({ target, onClose, onChanged }: {
 }) {
   const [materials, setMaterials] = useState<any[]>([]);
   const [existing, setExisting] = useState<ConsumptionEntry[]>([]);
+  const [reqItems, setReqItems] = useState<ReqLiquorItem[]>([]);
+  const [unassignedHere, setUnassignedHere] = useState<UnassignedEntry[]>([]);
+  const [unassignedReqsHere, setUnassignedReqsHere] = useState<UnassignedReqHere[]>([]);
+  const [dupes, setDupes] = useState<DuplicateWarning[] | null>(null);
   const [loadingExisting, setLoadingExisting] = useState(true);
   const [lines, setLines] = useState<{ material_id: string; qty: string; notes: string; unit: string }[]>([
     { material_id: '', qty: '', notes: '', unit: '' },
@@ -314,15 +783,30 @@ function RecordConsumptionModal({ target, onClose, onChanged }: {
 
   // Fetch what's already recorded for THIS event so the user sees it before
   // adding more — prevents punching the same bottle twice.
-  const existingQs = target.party_unique_id
+  // EVERY row also sends its fp_id. A party WITHOUT an id needs it because its
+  // display name is not unique (two such parties, or one with an id, can share it
+  // that evening); a party WITH an id needs it because one AKAN id can sit on two
+  // F&P rows, each costed on its own requisitions. Without it the server took the
+  // FIRST party of that name / id — showing this modal another row's requisition
+  // lines and orphan share. fp_id names the row that was clicked.
+  const existingQs = (target.party_unique_id
     ? `party_unique_id=${encodeURIComponent(target.party_unique_id)}`
-    : `event_name=${encodeURIComponent(target.event_name)}&event_date=${encodeURIComponent(target.event_date)}`;
+    : `event_name=${encodeURIComponent(target.event_name)}&event_date=${encodeURIComponent(target.event_date)}`)
+      + (target.fp_id ? `&fp_id=${encodeURIComponent(target.fp_id)}` : '');
 
   const loadExisting = () => {
     setLoadingExisting(true);
     fetch(`/api/party-consumption?${existingQs}`)
       .then(r => r.json())
-      .then(d => setExisting(d.entries || []))
+      .then(d => {
+        setExisting(d.entries || []);
+        // The other half of this event's liquor cost. Read-only by construction:
+        // nothing in this modal can edit or delete a requisition line.
+        setReqItems(d.requisition_items || []);
+        // Charged to nobody (shared name, no party id) — shown, never summed.
+        setUnassignedHere(d.unassigned_entries || []);
+        setUnassignedReqsHere(d.unassigned_requisitions || []);
+      })
       .catch(() => {})
       .finally(() => setLoadingExisting(false));
   };
@@ -354,9 +838,14 @@ function RecordConsumptionModal({ target, onClose, onChanged }: {
   }, 0);
 
   const existingTotal = existing.reduce((a, e) => a + (e.cost_at_time || 0), 0);
+  const reqTotal      = reqItems.reduce((a, e) => a + (e.cost || 0), 0);
   const recordedMaterialIds = new Set(existing.map(e => e.material_id));
+  // Materials already costed from the bar requisition. Typing one of these on the
+  // form is how the same bottle gets counted twice — the line flags it, and the
+  // API refuses it once (409) before anything is written.
+  const reqMaterialIds = new Map(reqItems.map(e => [e.material_id, e]));
 
-  const submit = async () => {
+  const submit = async (confirmDuplicates = false) => {
     const cleaned = lines.filter(l => l.material_id && Number(l.qty) > 0);
     if (cleaned.length === 0) { setError('Add at least one item with qty > 0'); return; }
     setSaving(true); setError(null); setOk(null);
@@ -368,6 +857,9 @@ function RecordConsumptionModal({ target, onClose, onChanged }: {
           fp_id: target.fp_id,
           event_name: target.event_name,
           event_date: target.event_date,
+          // Only ever true after the user has been shown the requisition line the
+          // material is already costed on and has chosen to record it anyway.
+          confirm_duplicates: confirmDuplicates,
           items: cleaned.map(l => {
             const m = materials.find(x => x.id === l.material_id);
             // Posts RECIPE units — the API stores qty_consumed in the material's
@@ -377,9 +869,18 @@ function RecordConsumptionModal({ target, onClose, onChanged }: {
         },
       });
       const j = await r.json().catch(() => ({}));
+      if (r.status === 409 && j.needs_confirmation) {
+        // NOT an error the user should have to decode: show which bottle is
+        // already costed, on which requisition, and make recording it anyway an
+        // explicit second click.
+        setDupes(j.duplicates || []);
+        setError(null);
+        return;
+      }
       if (!r.ok) { setError(j.error || `HTTP ${r.status}`); return; }
+      setDupes(null);
       setLines([{ material_id: '', qty: '', notes: '', unit: '' }]);
-      setOk(`Recorded ${cleaned.length} item${cleaned.length === 1 ? '' : 's'} — see "Already recorded" above.`);
+      setOk(`Recorded ${cleaned.length} item${cleaned.length === 1 ? '' : 's'} — see "Recorded on this screen" above.`);
       loadExisting();
       onChanged();
     } finally { setSaving(false); }
@@ -413,10 +914,76 @@ function RecordConsumptionModal({ target, onClose, onChanged }: {
         </div>
 
         <div className="px-6 py-4 space-y-3 overflow-y-auto flex-1">
-          {/* Already recorded — so you can see what's punched and avoid duplicates */}
+          {/* ── ALREADY COSTED FROM THE BAR REQUISITION — READ-ONLY ──────────────
+              These lines are the OTHER half of this event's liquor cost. They used
+              to be invisible here, so a party whose liquor came entirely from a
+              requisition opened an empty modal under a badge saying an item was
+              recorded — and the natural response to an empty modal is to type the
+              bottle in, which charges the party twice. Nothing in this block is
+              editable or deletable: the store issued it, the P&L already counted
+              it, and there is nothing to re-enter. */}
+          {!loadingExisting && reqItems.length > 0 && (
+            <div>
+              <div className="flex items-center justify-between mb-1">
+                <h3 className="text-xs font-semibold text-[#2D1B0E] uppercase tracking-wide flex items-center gap-1">
+                  <Lock size={11} className="text-[#af4408]" /> Already costed from the Bar requisition
+                </h3>
+                <span className="text-[11px] text-[#8B7355]">{reqItems.length} item{reqItems.length === 1 ? '' : 's'} · {fmt(reqTotal)}</span>
+              </div>
+              <div className="border border-[#D4B896] rounded-lg overflow-hidden bg-[#F5EDE3]">
+                <div className="px-2 py-1.5 text-[10px] text-[#6B5744] border-b border-[#D4B896]">
+                  Issued by the store on this party&apos;s bar requisition and <b>already included in the liquor cost</b> on the P&amp;L.
+                  Read-only — re-entering any of these below would count the same bottle twice.
+                </div>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-xs">
+                    <thead className="bg-[#EDDFD0] text-[#6B5744]">
+                      <tr>
+                        <th className="text-left  py-1.5 px-2 font-medium">Item</th>
+                        <th className="text-right py-1.5 px-2 font-medium">Issued</th>
+                        <th className="text-right py-1.5 px-2 font-medium">Cost</th>
+                        <th className="text-left  py-1.5 px-2 font-medium">Requisition</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {reqItems.map(e => (
+                        <tr key={e.id} className="border-t border-[#D4B896]/60">
+                          <td className="py-1.5 px-2 text-[#2D1B0E]">
+                            {e.material_name}
+                            {e.needs_unit_review && (
+                              <div className="text-[10px] text-amber-700"
+                                   title="The requisition line has a blank or unrecognised unit on a packed material, so the store moved no stock for it and its cost is taken at ×1.">
+                                ⚠ unit unclear on the requisition — costed at ×1
+                              </div>
+                            )}
+                          </td>
+                          {/* LEADS WITH THE PURCHASE UNIT (owner rule), with the
+                              figure as issued and the recipe quantity it was costed
+                              on in the tooltip. Display only — the cost beside it
+                              is recipe qty × ₹/recipe-unit, computed server-side. */}
+                          <td className="py-1.5 px-2 text-right font-mono whitespace-nowrap"
+                              title={`Issued ${fmtQtyNum(e.qty_issued)} ${e.issued_unit} = ${prettyQty(e.qty_issued_recipe, e.material_unit)} costed at ₹/${e.material_unit}`}>
+                            {typeof e.qty_issued_purchase === 'number' && e.material_purchase_unit
+                              ? <>{fmtQtyNum(e.qty_issued_purchase)} {e.material_purchase_unit}</>
+                              : <>{fmtQtyNum(e.qty_issued)} {e.issued_unit}</>}
+                          </td>
+                          <td className="py-1.5 px-2 text-right font-mono">{fmt(e.cost)}</td>
+                          <td className="py-1.5 px-2 text-[10px] text-[#8B7355] whitespace-nowrap">
+                            {e.req_number || '—'}{e.issued_by ? ` · ${String(e.issued_by).split('@')[0]}` : ''}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Recorded here — what was punched on THIS screen, so duplicates are visible */}
           <div>
             <div className="flex items-center justify-between mb-1">
-              <h3 className="text-xs font-semibold text-[#2D1B0E] uppercase tracking-wide">Already recorded</h3>
+              <h3 className="text-xs font-semibold text-[#2D1B0E] uppercase tracking-wide">Recorded on this screen</h3>
               {!loadingExisting && existing.length > 0 && (
                 <span className="text-[11px] text-[#8B7355]">{existing.length} item{existing.length === 1 ? '' : 's'} · {fmt(existingTotal)}</span>
               )}
@@ -424,7 +991,24 @@ function RecordConsumptionModal({ target, onClose, onChanged }: {
             {loadingExisting ? (
               <div className="text-xs text-[#8B7355] py-2"><Loader2 size={12} className="inline animate-spin mr-1" /> Loading…</div>
             ) : existing.length === 0 ? (
-              <div className="text-xs text-[#8B7355] bg-[#FFF8F0] border border-[#E8D5C4] rounded p-2">Nothing recorded for this event yet.</div>
+              <div className="text-xs text-[#8B7355] bg-[#FFF8F0] border border-[#E8D5C4] rounded p-2">
+                {/* `existing` is only what is COUNTED on this row. An entry in
+                    the "Not counted on this P&L" list below may have been typed on
+                    this very screen, and a requisition in the "Not costed" note
+                    was raised for a party of this name — so "nothing recorded"
+                    is said only when neither list has anything; otherwise the
+                    text says what is true: none of it is counted here. */}
+                {reqItems.length > 0
+                  ? (unassignedHere.length > 0 || unassignedReqsHere.length > 0)
+                    ? <>Nothing recorded on this screen is counted on this P&amp;L. The liquor costed for this event is the
+                        Bar requisition above; the entries listed below are counted on no party. Add an item here only if it
+                        was drawn from the bar <b>on top of</b> what the store issued and is not listed below.</>
+                    : <>Nothing recorded on this screen — this event&apos;s liquor is already costed from the Bar requisition above.
+                        Add an item here only if it was drawn from the bar <b>on top of</b> what the store issued.</>
+                  : (unassignedHere.length > 0 || unassignedReqsHere.length > 0)
+                    ? 'No liquor is counted on this P&L for this event — the entries listed below are counted on no party.'
+                    : 'Nothing recorded for this event yet.'}
+              </div>
             ) : (
               <div className="border border-[#E8D5C4] rounded-lg overflow-hidden">
                 <div className="overflow-x-auto">
@@ -443,6 +1027,12 @@ function RecordConsumptionModal({ target, onClose, onChanged }: {
                       <tr key={e.id} className="border-t border-[#E8D5C4]/50">
                         <td className="py-1.5 px-2">
                           <div className="text-[#2D1B0E]">{e.material_name}</div>
+                          {e.matched_by_name && (
+                            <div className="text-[10px] text-[#af4408]"
+                                 title="Recorded without a party id. This is the only party that evening whose name matches, so it is counted here.">
+                              matched by name
+                            </div>
+                          )}
                           {e.notes && <div className="text-[10px] text-[#8B7355]">{e.notes}</div>}
                         </td>
                         <td className="py-1.5 px-2 text-right font-mono whitespace-nowrap">{prettyQty(e.qty_consumed, e.material_unit)}</td>
@@ -463,6 +1053,97 @@ function RecordConsumptionModal({ target, onClose, onChanged }: {
               </div>
             )}
           </div>
+
+          {/* COUNTED ON NO PARTY. Recorded without a party id under a name this
+              party shares with another party that evening, so — by the owner's
+              ruling of 2026-10-14 — it is on NEITHER P&L (likewise an id on
+              several F&Ps with nothing to pick one, or an id changed after
+              recording — ruling 52). Only a candidate with an AKAN id can take
+              it, so the note does not promise an assignment. Listed so nobody
+              re-types it; deliberately outside the
+              reconciliation sum below, which is exactly what the P&L charges. */}
+          {!loadingExisting && unassignedHere.length > 0 && (
+            <div className="border border-red-200 rounded-lg overflow-hidden">
+              <div className="px-2 py-1.5 text-[10px] text-red-800 bg-red-50 border-b border-red-200">
+                <b>Not counted on this P&amp;L.</b> Recorded without a party id under a name that
+                matches more than one party on {target.event_date}, or with a party id that is on more than one F&amp;P
+                when nothing picks one, or with a party id the F&amp;P it was recorded from no longer carries (id changed
+                after recording) — so it is counted on none of the parties it matches. Do not record it again. The owner
+                can assign it only to one of those parties that has an AKAN id; if none has one, it stays uncounted until
+                the party sheet changes.
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full text-xs">
+                  <tbody>
+                    {unassignedHere.map(e => (
+                      <tr key={e.id} className="border-t border-red-100 first:border-t-0">
+                        <td className="py-1.5 px-2">
+                          <div className="text-[#2D1B0E]">{e.material_name}</div>
+                          <div className="text-[10px] text-[#8B7355]">
+                            under &ldquo;{e.event_name}&rdquo;
+                            {e.reason === 'id_on_several_parties' && e.party_unique_id && <> (id {e.party_unique_id})</>}
+                            {e.reason === 'id_changed_after_recording' && <> (id {e.party_unique_id} — id changed after recording)</>}
+                            {' '}· matches {e.candidates.map(candidateLabel).join(', ')}
+                          </div>
+                        </td>
+                        <td className="py-1.5 px-2 text-right font-mono whitespace-nowrap">{prettyQty(e.qty_consumed, e.material_unit)}</td>
+                        <td className="py-1.5 px-2 text-right font-mono text-[#8B7355] line-through" title="Not included in this party's liquor cost">{fmt(e.cost_at_time)}</td>
+                        <td className="py-1.5 px-2 text-[10px] text-[#8B7355] whitespace-nowrap">{(e.recorded_by || '').split('@')[0]}</td>
+                        <td className="py-1.5 px-2 text-right">
+                          <button type="button" onClick={() => deleteEntry(e.id)} disabled={deletingId === e.id}
+                                  title="Remove this entry"
+                                  className="text-red-600 hover:text-red-700 disabled:opacity-40">
+                            {deletingId === e.id ? <Loader2 size={12} className="animate-spin" /> : <Trash2 size={12} />}
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {/* REQUISITIONS COSTED ON NO PARTY (owner rulings 34, 43, 52). Raised
+              with no party id under a name this party shares with another that
+              evening, or carrying an id on several F&Ps that nothing picks, or an
+              id the F&P it was raised from no longer carries — so no P&L carries
+              them. Listed — never summed — so this modal shows what the row's
+              badge counts, and nobody reads the gap as missing. */}
+          {!loadingExisting && unassignedReqsHere.length > 0 && (
+            <div className="border border-red-200 rounded-lg px-2 py-1.5 text-[10px] text-red-800 bg-red-50">
+              <b>Not costed on this P&amp;L:</b>{' '}
+              {unassignedReqsHere.map((q, qi) => (
+                <span key={q.req_id}>
+                  {qi > 0 && '; '}
+                  <span className="font-mono">{q.req_number || q.req_id}</span> under &ldquo;{q.event_name}&rdquo;
+                  {q.reason === 'id_on_several_parties' && q.party_unique_id && <> (id {q.party_unique_id})</>}
+                  {q.reason === 'id_changed_after_recording' && <> (id {q.party_unique_id} — id changed after recording)</>}
+                  {' '}matches {q.candidates.map(candidateLabel).join(', ')}
+                </span>
+              ))}
+              . A requisition without a party id is costed only when exactly one party that evening has its name;
+              one whose id is on more than one F&amp;P, on the F&amp;P it was raised from — else only when exactly one of them is on its date;
+              one raised from an F&amp;P on the list that now carries a different id or none, on none.
+            </div>
+          )}
+
+          {/* RECONCILIATION. The two blocks above are the whole liquor cost this
+              event carries on the P&L, so their sum must equal the figure printed
+              on the list. Showing the arithmetic is what proves the modal is no
+              longer hiding a source — and what tells someone the number they are
+              looking for is already here, before they reach for the form below. */}
+          {!loadingExisting && (reqItems.length > 0 || existing.length > 0) && (
+            <div className="text-[11px] bg-[#FFF8F0] border border-[#E8D5C4] rounded p-2 flex items-center justify-between gap-2 flex-wrap">
+              <span className="text-[#6B5744]">
+                Liquor cost on the P&amp;L for this event
+                <span className="text-[#8B7355]">
+                  {' '}= {fmt(reqTotal)} requisition + {fmt(existingTotal)} recorded here
+                </span>
+              </span>
+              <span className="font-mono font-semibold text-[#2D1B0E]">{fmt(reqTotal + existingTotal)}</span>
+            </div>
+          )}
 
           <div className="border-t border-[#E8D5C4] pt-3">
             <h3 className="text-xs font-semibold text-[#2D1B0E] uppercase tracking-wide">Add items</h3>
@@ -549,6 +1230,17 @@ function RecordConsumptionModal({ target, onClose, onChanged }: {
                   )}
                   {l.material_id && recordedMaterialIds.has(l.material_id) && (
                     <div className="text-[10px] text-amber-700 mt-0.5">⚠ Already recorded above — saving will add to it.</div>
+                  )}
+                  {/* The one that actually double-counts money: this material is
+                      already costed from the bar requisition, so saving it here
+                      charges the party for the same bottle twice. The API refuses
+                      it once and asks for confirmation; this is the warning before
+                      that happens. */}
+                  {l.material_id && reqMaterialIds.has(l.material_id) && (
+                    <div className="text-[10px] text-red-700 mt-0.5">
+                      ⚠ Already costed from Bar requisition {reqMaterialIds.get(l.material_id)!.req_number || '(this party)'} —
+                      saving this counts the same item twice. Only add it if it was drawn on top of what was issued.
+                    </div>
                   )}
                 </div>
                 <input type="number" step="any" value={l.qty}
@@ -663,11 +1355,49 @@ function RecordConsumptionModal({ target, onClose, onChanged }: {
 
           {ok && <div className="bg-emerald-50 border border-emerald-200 text-emerald-800 rounded p-2 text-xs">{ok}</div>}
           {error && <div className="bg-red-50 border border-red-200 text-red-700 rounded p-2 text-xs">{error}</div>}
+
+          {/* THE DOUBLE-COUNT STOP. Nothing was written: the API refused with 409
+              and named the requisition line the material is already costed on.
+              Recording it anyway stays possible — a party can genuinely drink more
+              than was issued — but it now takes a deliberate second click. */}
+          {dupes && dupes.length > 0 && (
+            <div className="bg-red-50 border border-red-300 rounded p-3 text-xs space-y-2">
+              <div className="font-semibold text-red-800 flex items-center gap-1">
+                <AlertTriangle size={13} /> Nothing was saved — this would count the same item twice
+              </div>
+              <ul className="space-y-1">
+                {dupes.map(d => (
+                  <li key={d.material_id} className="text-red-700">
+                    <b>{d.material_name}</b> is already costed at {fmt(d.cost)} from Bar requisition{' '}
+                    <span className="font-mono">{d.req_number || '(this party)'}</span>
+                    {d.qty_issued ? ` (${fmtQtyNum(d.qty_issued)} ${d.issued_unit} issued)` : ''}.
+                  </li>
+                ))}
+              </ul>
+              <div className="text-[11px] text-red-700">
+                It is already in the liquor cost on the P&amp;L. Record it here only if this is <b>extra</b> stock
+                drawn from the bar on top of what the store issued.
+              </div>
+              <div className="flex flex-wrap gap-2 pt-0.5">
+                <button type="button" onClick={() => { setDupes(null); }}
+                        className="px-3 py-1.5 rounded text-xs bg-white border border-red-300 text-red-800 hover:bg-red-100">
+                  Cancel — it is already counted
+                </button>
+                <button type="button" onClick={() => submit(true)} disabled={saving}
+                        className="px-3 py-1.5 rounded text-xs bg-red-700 hover:bg-red-800 text-white disabled:opacity-50">
+                  {saving ? 'Saving…' : 'Record anyway — this is extra stock'}
+                </button>
+              </div>
+            </div>
+          )}
         </div>
 
         <div className="flex justify-end gap-2 px-6 py-3 border-t border-[#E8D5C4] shrink-0">
           <button onClick={onClose} className="px-4 py-2 text-sm text-[#6B5744] hover:bg-[#FFF1E3] rounded">Close</button>
-          <button onClick={submit} disabled={saving}
+          {/* () => submit() — NOT onClick={submit}. Passing the click handler
+              directly would hand React's MouseEvent in as confirmDuplicates and
+              post a truthy confirm on the very first click, skipping the gate. */}
+          <button onClick={() => submit()} disabled={saving}
                   className="inline-flex items-center gap-1.5 px-4 py-2 bg-[#af4408] hover:bg-[#933807] text-white rounded text-sm disabled:opacity-50">
             {saving ? <Loader2 className="animate-spin" size={14} /> : <Plus size={14} />}
             {saving ? 'Saving…' : 'Save Consumption'}

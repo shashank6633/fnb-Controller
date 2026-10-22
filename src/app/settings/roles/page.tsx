@@ -18,6 +18,8 @@ interface Role {
   /** Lifts the management-only gate on exactly four screens: /purchases and the
    *  three vendor-money Reports. Not a tier — see page-catalog.ts financeCap. */
   can_view_finance_reports: number;
+  /** May change the Label Printer & Design settings (Kitchen Production). Admin always may. */
+  can_manage_label_printer: number;
   is_system: number;
   sort_order: number;
   description: string;
@@ -45,6 +47,7 @@ const blankDraft = () => ({
   is_head_chef: false, is_store_manager: false, can_approve_requisitions: false,
   can_void_bill_handover: false,
   can_view_finance_reports: false,
+  can_manage_label_printer: false,
   pages: new Set<string>(), is_system: 0,
   can_request_discount: false, max_discount_pct: 0,
 });
@@ -82,6 +85,8 @@ export default function RolesAdmin() {
       // capability and silently revokes it the next time anyone opens the role
       // and presses Save — a revoke nobody asked for and nobody would see.
       can_view_finance_reports: !!role.can_view_finance_reports,
+      // Seeded from the role for the same reason as the line above (save() writes the whole draft).
+      can_manage_label_printer: !!role.can_manage_label_printer,
       pages: new Set(parsePages(role.page_access)), is_system: role.is_system,
       can_request_discount: !!role.can_request_discount, max_discount_pct: Number(role.max_discount_pct) || 0,
     });
@@ -135,6 +140,7 @@ export default function RolesAdmin() {
         can_approve_requisitions: draft.can_approve_requisitions,
         can_void_bill_handover: draft.can_void_bill_handover,
         can_view_finance_reports: draft.can_view_finance_reports,
+        can_manage_label_printer: draft.can_manage_label_printer,
         page_access: draft.base_role === 'admin' ? null : Array.from(draft.pages),
         can_request_discount: draft.can_request_discount,
         max_discount_pct: draft.can_request_discount ? Number(draft.max_discount_pct) || 0 : 0,
@@ -267,6 +273,12 @@ export default function RolesAdmin() {
                     ticked in its page list below. Defaults off on every role. */}
                 <label className="flex items-center gap-2 text-sm text-[#2D1B0E]">
                   <input type="checkbox" checked={draft.can_view_finance_reports} onChange={(e) => setDraft({ ...draft, can_view_finance_reports: e.target.checked })} /> View finance &amp; purchase reports
+                </label>
+                {/* Label printer. One shared config for every production label,
+                    so changing it changes every label. Defaults off; an admin
+                    always may (owner's call, 2026-10-22). */}
+                <label className="flex items-center gap-2 text-sm text-[#2D1B0E]">
+                  <input type="checkbox" checked={draft.can_manage_label_printer} onChange={(e) => setDraft({ ...draft, can_manage_label_printer: e.target.checked })} /> Can change label printer settings
                 </label>
               </div>
               <p className="-mt-1 text-[11px] text-[#8B7355]">

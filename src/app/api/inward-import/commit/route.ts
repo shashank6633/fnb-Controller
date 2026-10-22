@@ -75,12 +75,54 @@ export async function POST(req: Request) {
       INSERT INTO vendors (id, name, is_active, created_at, updated_at)
       VALUES (?, ?, 1, datetime('now'), datetime('now'))
     `);
+    /**
+     * bill_no CARRIES THE VENDOR'S INVOICE NUMBER. Added 2026-09-10.
+     *
+     * THE BUG THIS FIXES: the sheet's INVOICE ID was parsed (recaho-inward.ts
+     * sets `invoiceId` on every row) and then thrown away — this INSERT had no
+     * bill_no column, and the number survived only as prose inside `notes`
+     * ("Invoice: 19162 · Inward: 4633"). Every bill view keys a bill by
+     * invoice_id → grn_id → bill_no and falls back to VENDOR+DAY when all three
+     * are blank, so 2,118 imported rows fell to that fallback and genuinely
+     * different invoices from one vendor on one day printed as a single line:
+     * 60 lines hiding 69 real bills worth ₹12,93,120.30. The owner reported it
+     * as "the purchase report is missing bills". It was.
+     *
+     * TWO DUPLICATE GUARDS READ THIS COLUMN; check both before touching it.
+     *  · /api/purchases scopes its (vendor, bill_no, date, outlet) dupe check
+     *    with `COALESCE(invoice_id,'') LIKE 'PINV-%'`, and rows from this
+     *    importer never mint an invoice_id, so that guard never judges them,
+     *    with or without a bill_no. (That route's comment already claimed the
+     *    inward-import commit stamps a bill_no; as of this change it does.)
+     *  · /api/purchases/bulk DOES judge them, and its dupCheck reads a STORED
+     *    blank bill_no as "matches any bill". While this column was '', a bulk
+     *    CSV line with the same item + vendor + date + qty + rate as an
+     *    imported row was refused whatever bill number it carried. With the
+     *    number stored, that line is still refused on the SAME bill number or
+     *    a BLANK one, but on a DIFFERENT bill number it is now inserted and
+     *    its stock counted again. That is the bulk route's own rule (two named
+     *    bills are two documents), no longer masked by the blank. Measured on
+     *    a copy of the book: import 3 kg on INV-OBV-19162, then bulk the same
+     *    line on VB-77: before this change it was refused; now it inserts and
+     *    stock goes 39000 → 42000. It also tightens the other way: a bulk
+     *    line naming the SAME bill for the same material at another qty or
+     *    rate is now refused (one material = one line on a named bill), where
+     *    the blank let it in. On 2026-10-14 no purchase from any other
+     *    path shared a vendor, material and day with an imported row, so no
+     *    stored row is affected; only future uploads are. bulk/route.ts's own
+     *    comment still lists this importer among the writers of bill_no ''.
+     *
+     * `notes` deliberately keeps saying "Invoice: …" too. It is what the
+     * repair path (/api/admin/repair-purchase-bill-no) reads to recover the
+     * number on rows imported BEFORE this fix, and dropping it would strand
+     * them.
+     */
     const insertPurchase = db.prepare(`
       INSERT INTO purchases (
         id, material_id, vendor, brand, quantity, unit_price, total_price, date, notes, outlet_id,
-        discount, cgst, sgst, special_excise_cess, tcs, delivery_charges, mrp_round_off, created_at
+        discount, cgst, sgst, special_excise_cess, tcs, delivery_charges, mrp_round_off, bill_no, created_at
       )
-      VALUES (?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+      VALUES (?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
     `);
     const insertTx = db.prepare(`
       INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, outlet_id, created_at)
@@ -294,6 +336,10 @@ export async function POST(req: Request) {
             purchaseId, mat.id, r.supplier, purchaseQty, purchaseRate, goods, date,
             noteBits.join(' · '), outletId,
             discountAmt, cgst, sgst, specialCess, 0, deliveryAmt, mrpRoundOff,
+            // The vendor's own invoice number, into its own column at last.
+            // Trimmed; '' when the sheet had no INVOICE ID, which keeps the
+            // vendor+day fallback for rows that genuinely have no bill number.
+            String(r.invoiceId || '').trim(),
           );
           insertTx.run(randomUUID(), mat.id, stockQty, purchaseId,
                        `Inward import — ${r.supplier || 'unknown vendor'}`, outletId);

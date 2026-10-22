@@ -1,6 +1,6 @@
 import type { Database } from 'better-sqlite3';
 import type { SessionUser } from './auth';
-import { generateId, convertToMaterialUnit } from './db';
+import { generateId, convertToMaterialUnit, logAuditEvent } from './db';
 import { packFactor } from './pack-units';
 import { planCentralDebit, qtyDown } from './central-debit-clamp';
 
@@ -372,6 +372,342 @@ export function postLedger(db: Database, entry: LedgerEntry): string {
     chg(entry.discount), chg(entry.cgst), chg(entry.sgst), chg(entry.delivery_charges),
   );
   return id;
+}
+
+// ── Central → store migration (the ONE per-material move) ───────────────────
+
+/**
+ * What one migrated material moved. The same record POST /api/stores/[id]/migrate
+ * reports per material: qty is the recipe-unit truth the ledger holds and the
+ * ONLY basis ₹ is computed from; the *_purchase fields are display companions.
+ */
+export interface CentralMigration {
+  material_id: string;
+  material: string;
+  qty: number;
+  unit: string;
+  qty_purchase: number;
+  purchase_unit: string;
+  pack_factor: number;
+  unit_cost: number;
+  unit_cost_purchase: number;
+  value: number;
+  ledger_id: string;
+}
+
+/**
+ * The ledger mark of a central → store migration: the 'opening' row the migrate
+ * route (and migrateCentralToStore) posts, ref 'central-migration'. Nothing else
+ * writes this pair — the one free-text ref a route accepts (procure's
+ * invoice_ref) is posted as txn_type 'purchase', never 'opening'.
+ */
+export const CENTRAL_MIGRATION_REF = 'central-migration';
+
+/** SQL test for "this ledger row is a central migration" (alias `l`). */
+const MIGRATION_ROW_SQL = `l.txn_type = 'opening' AND l.ref = '${CENTRAL_MIGRATION_REF}'`;
+
+/** True when `storeId` has EVER had `materialId` migrated into it from Central. */
+function hasCentralMigration(db: Database, storeId: string, materialId: string): boolean {
+  return !!db.prepare(`
+    SELECT 1 FROM store_stock_ledger l
+     WHERE l.store_id = ? AND l.material_id = ? AND ${MIGRATION_ROW_SQL}
+     LIMIT 1
+  `).get(storeId, materialId);
+}
+
+/**
+ * The CENTRAL balance a store must take over before it can count `materialId`,
+ * or 0 when there is nothing to take over. Non-zero only when ALL THREE hold:
+ *
+ *   1. THIS store OWNS the material — materialStoreId(), the same answer the
+ *      closing route already asks ("is this a <store> material?"). Active stores
+ *      only, oldest mapping wins. A receiving FLOOR owns no categories, so it is
+ *      never handed a central balance: a floor count stays exactly as it was.
+ *   2. The item was NEVER MIGRATED into this store — no 'central-migration'
+ *      opening on its ledger, ever. So an item is moved at most once.
+ *      NOT "no ledger row at all" (the migrate route's own guard, and this
+ *      function's first version). An item can pick up store history while its
+ *      old stock still sits in Central — a TGBCL procure-bill, a single procure,
+ *      an Opening Stock entry or a central → store transfer made before its
+ *      first count or Migrate — and the count then read only that new history
+ *      as the system figure, so the whole Central balance became the variance
+ *      and approving it doubled the bottles again. MEASURED (verifier, live-book
+ *      copy): procure-bill 2 BTL of ABSOLUT (central 27,000 ml) → count the
+ *      28,500 shelf → system 1,500, variance +27,000 → approve → central
+ *      27,000 + store 28,500. With the bar on, a cheap item did it with nobody
+ *      in the loop (BUDWEISER 650: shelf 36 → book 60). The migrate button
+ *      skips such an item ("already has ledger history"), so nothing else would
+ *      ever move it either.
+ *   3. raw_materials.current_stock is a positive, finite number — the migrate
+ *      route's "no central stock to migrate" skip.
+ *
+ * Read-only. Ruling 37 (2026-10): a liquor item still sitting in CENTRAL that is
+ * counted on its store reads system 0, so the whole shelf becomes a variance and
+ * approving it books the same bottles a second time on the store while central
+ * still holds them (ABSOLUT: 27,000 ml shelf → central 27,000 + store 27,000).
+ *
+ * An item migrated once and holding Central stock again (a central write after
+ * its migration) is NOT moved a second time — that is the migrated rail, and it
+ * behaves exactly as before.
+ */
+export function unmigratedCentralQty(db: Database, storeId: string, materialId: string): number {
+  const sid = String(storeId || '').trim();
+  const mid = String(materialId || '').trim();
+  if (!sid || !mid) return 0;
+  // Local names below (and in migrateCentralToStore) are used NOWHERE else in
+  // this file, on purpose: scripts/check-rate-basis.js infers a local's basis by
+  // its NAME across the whole file, so a `mat` / `qty` bound to current_stock
+  // here would silently vouch for every other `qty × avg` in store-engine.ts.
+  const centralRow = db.prepare('SELECT category, current_stock FROM raw_materials WHERE id = ?').get(mid) as
+    { category: string | null; current_stock: number | null } | undefined;
+  if (!centralRow) return 0;
+  const centralBal = Number(centralRow.current_stock);
+  if (!Number.isFinite(centralBal) || centralBal <= 0) return 0;
+  if (materialStoreId(db, centralRow) !== sid) return 0;
+  return hasCentralMigration(db, sid, mid) ? 0 : centralBal;
+}
+
+/**
+ * When a material was migrated from Central into a store, as the two facts an
+ * approval needs (the LATEST migration, should there ever be more than one —
+ * each field is the MAX, so a reader fails closed):
+ *
+ *   · booked_date — date(created_at) of the opening row: the first count date
+ *     whose as-of window holds it. The closing route's asOfStats() windows on
+ *     `date(created_at) <= date(count date)`; this is that same expression, so a
+ *     count dated before booked_date was compared with a store book that did not
+ *     hold the migrated balance.
+ *   · moved_at — when the move was really MADE (UTC 'YYYY-MM-DD HH:MM:SS'). Not
+ *     the opening's created_at alone: a count-triggered move for a backdated
+ *     count re-stamps that to the count date. The central 'adjustment' row both
+ *     writers insert beside it (reference_id = the opening id) keeps the true
+ *     moment, so moved_at is the later of the two. A count SAVED before moved_at
+ *     froze a system figure read before the balance arrived.
+ *
+ * Null when the material was never migrated into that store. Read-only.
+ */
+export interface CentralMigrationStamp {
+  ledger_id: string;
+  booked_date: string;
+  moved_at: string;
+}
+export function centralMigrationStamp(db: Database, storeId: string, materialId: string): CentralMigrationStamp | null {
+  const sid = String(storeId || '').trim();
+  const mid = String(materialId || '').trim();
+  if (!sid || !mid) return null;
+  const marks = db.prepare(`
+    SELECT l.id AS ledger_id,
+           date(l.created_at) AS booked_date,
+           REPLACE(SUBSTR(l.created_at, 1, 19), 'T', ' ') AS booked_at,
+           (SELECT MAX(REPLACE(SUBSTR(it.created_at, 1, 19), 'T', ' '))
+              FROM inventory_transactions it
+             WHERE it.material_id = l.material_id AND it.reference_id = l.id) AS central_at
+      FROM store_stock_ledger l
+     WHERE l.store_id = ? AND l.material_id = ? AND ${MIGRATION_ROW_SQL}
+  `).all(sid, mid) as { ledger_id: string; booked_date: string | null; booked_at: string | null; central_at: string | null }[];
+  if (!marks.length) return null;
+  let out: CentralMigrationStamp | null = null;
+  for (const r of marks) {
+    const booked = String(r.booked_date || '');
+    const moved = [String(r.booked_at || ''), String(r.central_at || '')].sort().pop() || '';
+    if (!out) { out = { ledger_id: r.ledger_id, booked_date: booked, moved_at: moved }; continue; }
+    if (booked > out.booked_date) { out.booked_date = booked; out.ledger_id = r.ledger_id; }
+    if (moved > out.moved_at) out.moved_at = moved;
+  }
+  return out;
+}
+
+/**
+ * Central movement of `materialId` dated AFTER the business day `countDate`
+ * (IST) — what makes today's Central balance something other than what Central
+ * held when that day was counted. A movement is "after" when EITHER of its two
+ * clocks says so (fail closed): its business date txn_date is later than the
+ * count date (and not in the future — a future-dated row cannot have happened
+ * yet), or its created_at is past the count day's IST end (18:29:59 UTC, the
+ * same day-end deptCountInstant() and dept-ledger use). inventory_transactions is
+ * the Central rail's movement log; a current_stock write that logs nothing is
+ * invisible here.
+ */
+export function centralMovementAfter(db: Database, materialId: string, countDate: string): { n: number; latest: string } {
+  const r = db.prepare(`
+    SELECT COUNT(*) AS n,
+           MAX(MAX(COALESCE(txn_date, ''),
+                   COALESCE(date(REPLACE(SUBSTR(created_at, 1, 19), 'T', ' '), '+330 minutes'), ''))) AS latest
+      FROM inventory_transactions
+     WHERE material_id = ? AND quantity <> 0
+       AND (
+             (COALESCE(txn_date, '') <> '' AND txn_date > ? AND txn_date <= date('now', '+330 minutes'))
+          OR REPLACE(SUBSTR(created_at, 1, 19), 'T', ' ') > ?
+       )
+  `).get(materialId, countDate, `${countDate} 18:29:59`) as { n: number; latest: string | null } | undefined;
+  return { n: Number(r?.n) || 0, latest: String(r?.latest || '') };
+}
+
+/**
+ * Move ONE material's whole central balance into a store — the per-material
+ * body of POST /api/stores/[id]/migrate, written here once so the closing count
+ * makes the identical movement:
+ *   1. store ledger 'opening' row — qty = central current_stock (recipe units),
+ *      unit_cost = rm.average_price (₹/recipe unit), ref 'central-migration',
+ *      the route's own notes text;
+ *   2. raw_materials.current_stock → 0;
+ *   3. inventory_transactions 'adjustment' row (NEGATIVE qty, referencing the
+ *      opening row) so the central audit trail stays truthful.
+ * All three or none: they run in their own (nested → SAVEPOINT) transaction, so
+ * a caller already inside a transaction can catch a failure and carry on with
+ * nothing half-written.
+ *
+ * GUARDED: returns null — and writes nothing — when central holds nothing
+ * positive, or when the guard says the item is not to be moved:
+ *   · guard 'no-store-history' (the DEFAULT) — the migrate route's own guard:
+ *     the store has ANY ledger row for the material.
+ *   · guard 'never-migrated' — the closing count's (unmigratedCentralQty): the
+ *     item was already migrated into this store once, or this store does not
+ *     own it. An item that picked up store history before its first count
+ *     (procure-bill, procure, Opening Stock, a central → store transfer) still
+ *     has its Central balance moved — see unmigratedCentralQty() for why.
+ * Throws what postLedger throws (deactivated store, unknown material, a
+ * negative average_price as unit cost), and the backdated refusal below.
+ *
+ * `countDate` (YYYY-MM-DD) is for a COUNT that triggers the move. The store's
+ * as-of read windows on created_at (`date(created_at) <= date(count date)`), and
+ * postLedger stamps now, so for a BACKDATED count the opening would sit outside
+ * the very window that count reads — system 0 again, and the double this exists
+ * to stop. So the opening row is re-stamped MIN(count-date 23:59:59, now): the
+ * same re-stamp approveVariance() gives its liquor correction, for the same
+ * reason. A count dated today keeps `now`, exactly what the route writes. The
+ * central inventory_transactions row is NOT re-stamped: the central rail has no
+ * as-of read, and its created_at stays the true recording moment.
+ *
+ * THE BACKDATED REFUSAL. The balance moved is TODAY's Central balance. Dating it
+ * into an earlier count is only right while that is still what Central held on
+ * the count date — i.e. nothing moved on the Central rail after that day. If
+ * anything did (a central → floor transfer, an issue, a purchase), the count
+ * would be compared with a figure off by exactly that movement, and approving
+ * its difference books it twice. MEASURED (verifier): 750 ml transferred
+ * Central → BAR FLOOR today, then a sheet dated three days back counting the
+ * 27,000 shelf it had then → system 26,250, variance +750 → approve → store
+ * 27,000 + floor 750 for 27,000 ml of bottles. So when Central moved after the
+ * count date this THROWS and moves nothing; the count still saves (its caller
+ * catches), and a count dated today moves the balance.
+ * The audit row is the caller's (logCentralMigration), after its transaction.
+ */
+export function migrateCentralToStore(
+  db: Database,
+  opts: {
+    storeId: string; materialId: string; actor: string; countDate?: string | null;
+    guard?: 'no-store-history' | 'never-migrated';
+  },
+): CentralMigration | null {
+  const storeId = String(opts.storeId || '').trim();
+  const materialId = String(opts.materialId || '').trim();
+  const store = getStoreById(db, storeId);
+  if (!store) throw new Error('Unknown store location');
+  const countDate = String(opts.countDate ?? '').trim();
+  const datedCount = /^\d{4}-\d{2}-\d{2}$/.test(countDate);
+  const run = db.transaction((): CentralMigration | null => {
+    const m = db.prepare(`
+      SELECT id, name, unit, purchase_unit, pack_size, case_size, category, current_stock, average_price
+      FROM raw_materials WHERE id = ?
+    `).get(materialId) as any;
+    if (!m) throw new Error('Unknown material');
+    if (opts.guard === 'never-migrated') {
+      if (materialStoreId(db, m) !== storeId) return null;
+      if (hasCentralMigration(db, storeId, materialId)) return null;
+    } else if (db.prepare('SELECT 1 FROM store_stock_ledger WHERE store_id = ? AND material_id = ? LIMIT 1').get(storeId, materialId)) {
+      return null;
+    }
+    if (!((Number(m.current_stock) || 0) > 0)) return null;
+    if (datedCount) {
+      const after = centralMovementAfter(db, m.id, countDate);
+      if (after.n > 0) {
+        throw new Error(
+          `Central stock of "${m.name}" moved after ${countDate} (${after.n} movement(s), the latest dated ` +
+          `${after.latest || 'later'}), so what Central holds today is not what it held on ${countDate} and ` +
+          `cannot be dated into this count. Nothing was moved. Count the item on today's date to move its ` +
+          `Central balance into ${store.name}.`,
+        );
+      }
+    }
+
+    const movedQty = Number(m.current_stock) || 0;               // recipe units
+    const centralAvg = Number(m.average_price) || 0;             // ₹/recipe unit
+    // Purchase-basis view for the notes a human reads. Storage and ₹ are
+    // untouched: value stays movedQty × centralAvg (recipe × ₹/recipe).
+    const pf = packFactor(m);
+    const qtyPU = Math.round((movedQty / pf) * 1000) / 1000;
+    const costPU = Math.round(centralAvg * pf * 100) / 100;
+    const puLabel = m.purchase_unit || m.unit;
+    const qtyLabel = `${qtyPU} ${puLabel}${pf > 1 ? ` (${movedQty} ${m.unit})` : ''}`;
+    const ledgerId = postLedger(db, {
+      store_id: storeId,
+      material_id: m.id,
+      txn_type: 'opening',
+      quantity: movedQty,
+      unit_cost: centralAvg,
+      ref: 'central-migration',
+      notes: `Migrated from Central Store (central stock ${qtyLabel} @ ₹${costPU}/${puLabel})`,
+      created_by: opts.actor,
+    });
+    db.prepare(`
+      UPDATE raw_materials SET current_stock = 0, updated_at = datetime('now') WHERE id = ?
+    `).run(m.id);
+    db.prepare(`
+      INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, created_at)
+      VALUES (?, ?, 'adjustment', ?, ?, ?, datetime('now'))
+    `).run(
+      generateId(), m.id, -movedQty, ledgerId,
+      `Migrated to ${store.name}: ${qtyLabel} moved to store ledger (opening ${ledgerId})`,
+    );
+    if (datedCount) {
+      db.prepare(`
+        UPDATE store_stock_ledger SET created_at = MIN(?, datetime('now')) WHERE id = ?
+      `).run(`${countDate} 23:59:59`, ledgerId);
+    }
+    return {
+      material_id: m.id, material: m.name, qty: movedQty, unit: m.unit,
+      qty_purchase: qtyPU, purchase_unit: puLabel, pack_factor: pf,
+      unit_cost: centralAvg, unit_cost_purchase: costPU,
+      value: Math.round(movedQty * centralAvg * 100) / 100,
+      ledger_id: ledgerId,
+    };
+  });
+  return run();
+}
+
+/**
+ * The 'store.migrate' audit row for one migrated material — the migrate route's
+ * shape. `via` (e.g. "closing count 2026-10-15") is ADDED only when the move was
+ * made by something other than the admin's Migrate button, so the trail says
+ * why the stock moved.
+ */
+export function logCentralMigration(
+  db: Database,
+  store: { id: string; name: string },
+  m: CentralMigration,
+  actorEmail: string,
+  via?: string | null,
+): void {
+  const why = String(via || '').trim();
+  logAuditEvent(db, {
+    event_type: 'store.migrate',
+    entity_type: 'store_stock_ledger',
+    entity_id: m.ledger_id,
+    actor_email: actorEmail,
+    after: {
+      store_id: store.id, store: store.name,
+      material_id: m.material_id, material: m.material,
+      qty: m.qty, unit: m.unit, unit_cost: m.unit_cost, value: m.value,
+      qty_purchase: m.qty_purchase, purchase_unit: m.purchase_unit,
+      pack_factor: m.pack_factor, unit_cost_purchase: m.unit_cost_purchase,
+      central_stock_before: m.qty, central_stock_after: 0,
+      ...(why ? { via: why } : {}),
+    },
+    note: `${store.name}: migrated ${m.qty_purchase} ${m.purchase_unit}`
+      + `${m.pack_factor > 1 ? ` (${m.qty} ${m.unit})` : ''}`
+      + ` ${m.material} from Central Store (₹${m.value})`
+      + (why ? ` — moved automatically by the ${why}` : ''),
+  });
 }
 
 // ── Consolidated board + per-store item lists (Multi-floor bar, Phase 1) ──────
