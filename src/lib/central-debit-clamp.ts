@@ -68,8 +68,11 @@ import { logAuditEvent } from '@/lib/db';
 const floor6 = (n: number) => Math.floor((Number(n) || 0) * 1e6) / 1e6;
 
 /** Below this a delta is float dust, not a movement. The same 1e-9 the sales
- *  reversal already uses on this very arithmetic. It decides only "is this a
- *  debit at all" — never "does this debit fit"; that is QTY_GRID's job below. */
+ *  reversal already uses on this very arithmetic. It never decides "does this
+ *  debit fit"; that is QTY_GRID's job below. In clampCentralDelta it marks the
+ *  debits that are written as asked when the shelf covers them — and, since
+ *  round 10, never past what the shelf holds (a dust debit over a zero balance
+ *  used to land at -1e-9). */
 export const CLAMP_EPS = 1e-9;
 
 /* ════════════════════════════════════════════════════════════════════════════
@@ -626,6 +629,10 @@ export interface CentralDeltaClamp {
  * a debit within the house grid of the balance is covered (and takes the
  * balance itself, landing on 0), not clamped and not reported.
  *
+ * DUST IS A DEBIT TOO. A debit of CLAMP_EPS or less is written as asked when
+ * the shelf covers it and as what the shelf holds when it does not — never
+ * below zero, never clamped, never reported. See the branch below.
+ *
  * NO ROUNDING IS APPLIED TO THE CLAMPED DEBIT, deliberately. It is
  * `-Math.min(debit, cap)`, so when the cap bites the bound value is the balance
  * itself and `current_stock + (-current_stock)` is exactly 0 in IEEE 754 — the
@@ -668,14 +675,39 @@ export function clampCentralDelta(
   // the identical call on the identical reasoning.
   if (!row) return base;
 
-  // Credits, and dust, pass through untouched.
-  if (wantedDelta >= -CLAMP_EPS) return base;
+  // Credits (and nothing at all) pass through untouched.
+  if (wantedDelta >= 0) return base;
 
   // THE ONE RULE (planCentralDebit, above). `debit` is never more than
   // max(0, balance), so the write can never go below zero; when the debit is
   // "everything on the shelf" — on the balance's grid point or past it — it is
   // the balance itself and the landing is exactly 0.
   const plan = planCentralDebit(base.stockRecipe, -wantedDelta);
+
+  // DUST IS STILL A DEBIT (round 10, never-negative). A debit of CLAMP_EPS or
+  // less used to return `base` above with the credits, i.e. it was written as
+  // asked WITHOUT being weighed — and on a balance below the dust that is a
+  // write below zero. MEASURED on the real routes: /api/staff-meals/items with
+  // 0.000000001 typed on the real /staff-meals page over a shelf the floor had
+  // just emptied landed at -1e-9 (and -5e-10, -4e-10 over 0 and 1e-10); a dated
+  // /api/admin/reset whose in-range purchase rows net to 2.78e-17 (0.1 + 0.2 −
+  // 0.3) landed at -2.78e-17. Production 62aa895 does the same — it has no
+  // floor on either path.
+  // Dust is written AS ASKED wherever the shelf covers it (byte-identical to
+  // production and to round 9 on every balance at least as large as the dust,
+  // which is every balance the app can print), and never as more than
+  // planCentralDebit's `debit`, which is at most max(0, balance) — so it can no longer land below
+  // zero or dig an existing hole deeper. It always fits on the grid, so it is
+  // never `clamped` and never reported: nothing the operator could see was cut.
+  // NOT plan.debit itself: on a sub-grid crumb that is the whole crumb, and
+  // taking 4e-7 for a 1e-9 ask would change a write production makes for no
+  // floor's sake (/api/sales DELETE skips anything ≤ 1e-9 and would start
+  // writing it).
+  if (wantedDelta >= -CLAMP_EPS) {
+    const take = Math.min(plan.ask, plan.debit);
+    return take === plan.ask ? base : { ...base, deltaToWrite: take > 0 ? -take : 0 };
+  }
+
   if (plan.fits) {
     // Covered. Byte-identical to no clamp unless the debit was "everything",
     // where it takes the sub-grid crumb with it instead of leaving 1e-9 behind

@@ -100,6 +100,10 @@ type SkipReason = '' | 'flag_off' | 'party' | 'unit_review' | string;
 
 interface IssueLogRow {
   stage: IssueLogStage;
+  /** The stage token exactly as the server sent it, kept beside `stage`
+   *  (normStage folds REVERSAL and CONSUMPTION_SKIP into the CONSUMPTION badge)
+   *  so the row can be PRINTED by what it really is — see printsAsProduction. */
+  server_stage?: string;
   /** YYYY-MM-DD, IST calendar date as stored. */
   date: string;
   /** Full timestamp when one genuinely exists. null on reconstructed rows. */
@@ -147,7 +151,12 @@ interface IssueLogRow {
   requested_qty: number | null;
   effective_qty: number | null;
   issued_qty: number | null;
+  /** In the row's own unit (`unit`). */
   still_open: number | null;
+  /** `still_open` in PURCHASE units, on the server's six decimals (issue-log.ts
+   *  gridPu) — server-derived only; null when the line's unit is ambiguous.
+   *  Printed FIRST (owner rule). */
+  still_open_purchase?: number | null;
   fulfilment: 'FULL' | 'PART' | 'OPEN' | null;
 
   /** ISSUE rows: did this hand-over also debit central stock? See header. */
@@ -267,17 +276,50 @@ const fmtNum = (n: number) => (Number(n) || 0).toLocaleString('en-IN');
  *  so a figure with three decimals or fewer prints exactly as it always did. */
 const fmtQty = (n: number) => (Math.round((Number(n) || 0) * 1e6) / 1e6 || 0)
   .toLocaleString('en-IN', { maximumFractionDigits: 6 });
-/** A purchase-unit restatement or a still-open figure: fmtQty, except a
- *  sub-display crumb (|x| below 0.001, carried by the server at its grid point —
- *  issue-log.ts shownPu — or, for a remainder THE RULE leaves open below the
- *  6-dp grid, exactly) is printed at the precision that names it, never as "0"
- *  (round 8: the party-shelf correction "−0.5 g" read "= 0 kg"; round 9: a PART
- *  row must never read "still open 0"). */
+/** A purchase-unit restatement or a still-open figure, printed AS THE SERVER
+ *  CARRIES IT — never re-rounded here. On the requisition chain the server
+ *  already put it on six decimals of the purchase unit (issue-log.ts gridPu:
+ *  14,842.4 g is 14.8424 kg, 415 ml of 60-ml bottles is 6.916667 BTL), the same
+ *  six decimals fmtQty prints, so a hand-over and its line's "issued" figure
+ *  print one string (round 10b; round 10's 15 significant digits printed
+ *  "6.91666667 BTL" beside the line's "6.916667"). A figure too small for six
+ *  decimals is never "0" (round 8: the party-shelf correction "−0.5 g" read
+ *  "= 0 kg"; round 9: a PART row must never read "still open 0"): the server
+ *  carries it at six significant digits and it prints at those, no more (round
+ *  10's 15 digits printed float dust, "0.00000000000199999999894729 kg"). */
 const fmtPuQty = (n: number) => {
   const v = Number(n) || 0;
-  if (v === 0 || Math.abs(v) >= 0.001) return fmtQty(v);
-  return v.toLocaleString('en-IN', { maximumFractionDigits: 12 });
+  if (v === 0) return '0';
+  // ON the 6-dp grid -> fmtQty: the server rounds every figure of one millionth
+  // or more to whole millionths. Below that only its sub-grid figures exist —
+  // under half a millionth, carried at six significant digits — and they print
+  // at those, including one that lands exactly on half a millionth (THE RULE's
+  // 5e-7 kg remainder), which fmtQty would round UP to "0.000001" beside the
+  // CSV's 5e-7. 0.75 millionth splits the two cleanly.
+  if (Math.abs(v) >= 7.5e-7) return fmtQty(v);
+  return v.toLocaleString('en-IN', { maximumSignificantDigits: 6 });
 };
+/** PRODUCTION'S quantity format (62aa895), byte for byte: three decimals. */
+const fmtQtyProd = (n: number) => (Number(n) || 0).toLocaleString('en-IN', { maximumFractionDigits: 3 });
+/**
+ * The rows the clamp never touches print EXACTLY AS PRODUCTION PRINTS THEM:
+ * a receipt and a cook — CONSUMPTION and CONSUMPTION (skipped) — at
+ * production's three decimals, every quantity on the row (round 10b). The
+ * 6-dp grid above exists for figures the shelf rule records on the
+ * requisition chain; on a cook it made a pack-1 row contradict itself —
+ * "0.0004 kg recipe units = 0 kg", "0.0125 kg recipe units = 0.013 kg" — where
+ * production reads "0 kg = 0 kg" and "0.013 kg = 0.013 kg".
+ *
+ * Keyed on the stage THE SERVER SENT (server_stage, falling back to stage for
+ * a row that never went through load(), and for a stage total, which never
+ * does): normStage folds REVERSAL — the give-back of an undo, a clamp-shaped
+ * figure — into the CONSUMPTION badge, and that row keeps the requisition
+ * chain's six decimals.
+ */
+const PRINTED_AS_PRODUCTION = new Set(['RECEIPT', 'CONSUMPTION', 'CONSUMPTION_SKIP']);
+function printsAsProduction(r: { server_stage?: string; stage?: string }): boolean {
+  return PRINTED_AS_PRODUCTION.has(String(r.server_stage ?? r.stage ?? '').toUpperCase().trim());
+}
 
 function shiftDays(ymd: string, days: number) {
   // Parsed as UTC midnight on purpose: the input is already an IST calendar date
@@ -378,7 +420,7 @@ export default function IssueLogPage() {
       const j = (await res.json()) as IssueLogResponse;
       setData({
         ...j,
-        rows: (Array.isArray(j.rows) ? j.rows : []).map(r => ({ ...r, stage: normStage(r.stage) })),
+        rows: (Array.isArray(j.rows) ? j.rows : []).map(r => ({ ...r, server_stage: String(r.stage ?? ''), stage: normStage(r.stage) })),
         totals: { by_stage: Array.isArray(j.totals?.by_stage) ? j.totals.by_stage : [], basis: j.totals?.basis || '' },
       });
     } catch { setError('Network error — please try again.'); setData(null); }
@@ -643,10 +685,18 @@ export default function IssueLogPage() {
           <p className="text-[11px] font-semibold text-[#8B7355] uppercase tracking-wide">How to read this log</p>
           <p><strong>Receipt</strong> quantities and rates are in <strong>purchase units</strong> (₹ per purchase unit), the way the bill reads.
             <strong> Requisition</strong> quantities are in the requisition line’s own unit. <strong>Issue</strong> and <strong>consumption</strong> quantities
-            are in recipe units. Each row prints its own unit — nothing is converted between bases here.</p>
+            are in recipe units. Each row prints its own unit first; the “=” figure beneath it is the same quantity restated in purchase units,
+            never a second amount.</p>
           <p><strong>FULL / PART.</strong> Measured against the effective quantity for the line (chef-approved if there is one, otherwise requested),
             <em> as it stood when the store handed the goods over</em>. A later change to the approved quantity does not rewrite what already happened.
-            <strong> Still open</strong> is the outstanding balance in the line’s own unit.</p>
+            <strong> Still open</strong> is the outstanding balance, in purchase units first, with the row’s own unit beside it
+            when that is a different unit.</p>
+          <p><strong>Decimals.</strong> Requisition and issue rows, and a give-back to the central store (an undo, a lowered issued figure, or a
+            department return marked reusable), carry up to six decimals, and every purchase-unit figure on them is rounded to six decimals of the
+            purchase unit. That sixth decimal can be a rounding: always on a pack that does not divide evenly (5 ml of a 60 ml bottle reads
+            0.083333 BTL), and on any pack when the recipe figure is finer than six decimals of the purchase unit, so a hand-over and its still
+            open can differ from the line by one in the last digit. A figure too small for six decimals is still printed, to six significant
+            digits, never as 0. Receipts and cooks (consumption, or a skipped cook) print to three decimals.</p>
           <p><strong>“Recorded, stock not moved”.</strong> An issue is always recorded, whether or not it debited central stock — those are two separate
             facts. When stock did not move the row says why. Do not read a recorded issue as a stock deduction.</p>
           <p><strong>Pre-ledger rows are reconstructed</strong> from the requisition line for issues made before this log existed. They carry no actor and no exact
@@ -685,7 +735,7 @@ function StageCard({ stage, total, singleMaterial }: { stage: IssueLogStage; tot
           figure rather than print a meaningless one. */}
       <p className="text-[11px] text-[#6B5744] mt-1">
         {singleMaterial && total.qty != null
-          ? <>Qty <strong>{fmtQty(total.qty)} {total.unit}</strong></>
+          ? <>Qty <strong>{printsAsProduction(total) ? fmtQtyProd(total.qty) : fmtQty(total.qty)} {total.unit}</strong></>
           : <span className="text-[#B8A48E]">Qty total needs a single item — pick one in the Item filter.</span>}
       </p>
 
@@ -720,14 +770,24 @@ function FulfilmentCell({ r }: { r: IssueLogRow }) {
     : r.fulfilment === 'PART' ? 'bg-amber-50 text-amber-800 border-amber-200'
     : 'bg-[#F4EFE9] text-[#6B5744] border-[#E8D5C4]';
   const openQty = Number(r.still_open || 0);
+  // OWNER RULE: what is still owed LEADS with the PURCHASE unit (round 10) —
+  // the server's restatement on its six decimals (round 10b), never derived
+  // here — and the row's own
+  // figure (the line unit on a requisition, recipe units on an issue) follows
+  // it whenever that unit is a different one. A line whose unit is ambiguous
+  // has no trustworthy purchase figure (null) and keeps its own figure alone.
+  const openPu = r.still_open_purchase;
+  const pu = String(r.purchase_unit || '').trim();
+  const own = String(r.unit || '').trim();
+  const sameUnit = pu.toLowerCase() === own.toLowerCase();
   return (
     <span className="inline-block">
       <span className={`inline-block px-1.5 py-0.5 rounded border text-[10px] font-bold tracking-wide ${tone}`}>{r.fulfilment}</span>
-      {/* Outstanding is stated in the LINE's own unit — the unit the line was
-          raised in — because that is the unit the store and the chef argue in. */}
       {openQty > 0 && (
         <span className="block text-[10px] text-amber-800 mt-0.5">
-          still open {fmtPuQty(openQty)} {r.unit || ''}
+          {openPu != null && pu
+            ? <>still open {fmtPuQty(openPu)} {pu}{!sameUnit && <> (= {fmtPuQty(openQty)} {own})</>}</>
+            : <>still open {fmtPuQty(openQty)} {own}</>}
         </span>
       )}
       {r.effective_qty != null && r.issued_qty != null && (
@@ -743,6 +803,11 @@ function LogRow({ r }: { r: IssueLogRow }) {
   const isReceipt = r.stage === 'RECEIPT';
   const isPreLedger = r.stage === 'ISSUE_PRELEDGER';
   const skip = r.stock_moved === false ? skipWords(r.skip_reason) : '';
+  // A receipt or a cook prints every quantity as production does (3 dp); the
+  // requisition chain prints the house 6-dp grid. See printsAsProduction.
+  const asProd = printsAsProduction(r);
+  const q = asProd ? fmtQtyProd : fmtQty;
+  const pq = asProd ? fmtQtyProd : fmtPuQty;
 
   return (
     <tr className="border-b border-[#F7EEE3] last:border-0 align-top">
@@ -774,15 +839,15 @@ function LogRow({ r }: { r: IssueLogRow }) {
             never re-computed here. */}
         {isReceipt ? (
           <>
-            <span className="font-semibold">{fmtQty(r.qty)} <span className="text-[11px] text-[#8B7355] font-normal">{r.purchase_unit || r.unit}</span></span>
+            <span className="font-semibold">{q(r.qty)} <span className="text-[11px] text-[#8B7355] font-normal">{r.purchase_unit || r.unit}</span></span>
             <span className="block text-[10px] text-[#B8A48E]">purchase units</span>
           </>
         ) : (
           <>
-            <span className="font-semibold">{fmtQty(r.qty)} <span className="text-[11px] text-[#8B7355] font-normal">{r.unit}</span></span>
+            <span className="font-semibold">{q(r.qty)} <span className="text-[11px] text-[#8B7355] font-normal">{r.unit}</span></span>
             <span className="block text-[10px] text-[#B8A48E]">{r.qty_basis === 'line' ? 'line unit' : r.qty_basis === 'recipe' ? 'recipe units' : r.qty_basis || ''}</span>
             {r.purchase_qty != null && r.purchase_unit && (
-              <span className="block text-[10px] text-[#8B7355]">= {fmtPuQty(r.purchase_qty)} {r.purchase_unit}</span>
+              <span className="block text-[10px] text-[#8B7355]">= {pq(r.purchase_qty)} {r.purchase_unit}</span>
             )}
           </>
         )}

@@ -455,8 +455,24 @@ export function stampShelfClose(
  * closing quantity — the party transfer's correction row, or the issue row the
  * transfer moved unchanged. A database that has not booted the column (or has
  * no ledger) is left alone: the Issue Log then reads the first arm only.
+ *
+ * `sinceRowid` (round 10): ONLY A ROW OF THE GESTURE THAT CLOSED THE LINE. The
+ * lookup above takes the latest row at the closing quantity — which is an
+ * EARLIER gesture's row whenever the gesture that closed the line wrote none
+ * for it. MEASURED (round-9 issue-log verifier, party_retro_stamp): WHOLE
+ * DHANIYA 3.2174 of 3.218 kg recorded in one gesture (PART, the transfer not
+ * yet run), then SALT issued in a second gesture, whose transfer took the
+ * 3.2174 kg shelf and closed DHANIYA — and the FIRST gesture's ISSUE row was
+ * stamped, so the Issue Log retro-read it FULL for a take that had left the
+ * line open. With `sinceRowid` (the ledger's MAX(rowid) when the closing
+ * gesture began) the lookup is limited to that gesture's own rows; when it
+ * wrote none for the line, nothing is stamped and the earlier row keeps the
+ * PART it truthfully was. Omitted ⇒ the round-8b lookup, byte for byte (the PO
+ * cascade still calls it that way).
  */
-export function markLedgerShelfClose(db: any, reqItemId: string, closedAt?: number | null, ledgerId?: string | null): void {
+export function markLedgerShelfClose(
+  db: any, reqItemId: string, closedAt?: number | null, ledgerId?: string | null, sinceRowid?: number | null,
+): void {
   if (!ledgerHasShelfMark(db)) return;
   // The quantity stampShelfClose stamped: the line's quantity_issued as it now
   // stands, unless the caller already holds it.
@@ -464,12 +480,29 @@ export function markLedgerShelfClose(db: any, reqItemId: string, closedAt?: numb
     : (Number((db.prepare(`SELECT quantity_issued FROM requisition_items WHERE id = ?`)
         .get(String(reqItemId)) as { quantity_issued?: number } | undefined)?.quantity_issued) || 0);
   if (!(q > 0)) return;
-  const id = ledgerId || (db.prepare(`
-    SELECT id FROM requisition_issue_ledger
-     WHERE req_item_id = ? AND ABS(after_line_qty - ?) <= 1e-9
-     ORDER BY rowid DESC LIMIT 1
-  `).get(String(reqItemId), q) as { id?: string } | undefined)?.id;
+  const since = sinceRowid != null && Number.isFinite(Number(sinceRowid)) ? Number(sinceRowid) : null;
+  const id = ledgerId || (since == null
+    ? (db.prepare(`
+        SELECT id FROM requisition_issue_ledger
+         WHERE req_item_id = ? AND ABS(after_line_qty - ?) <= 1e-9
+         ORDER BY rowid DESC LIMIT 1
+      `).get(String(reqItemId), q) as { id?: string } | undefined)?.id
+    : (db.prepare(`
+        SELECT id FROM requisition_issue_ledger
+         WHERE req_item_id = ? AND ABS(after_line_qty - ?) <= 1e-9 AND rowid > ?
+         ORDER BY rowid DESC LIMIT 1
+      `).get(String(reqItemId), q, since) as { id?: string } | undefined)?.id);
   if (id) db.prepare(`UPDATE requisition_issue_ledger SET shelf_mark = ? WHERE id = ?`).run(q, String(id));
+}
+
+/** The issue ledger's high-water mark — MAX(rowid), 0 when empty — read where
+ *  a gesture begins, so markLedgerShelfClose can tell that gesture's rows from
+ *  earlier ones (round 10). 0 when the table cannot be read. */
+export function issueLedgerWatermark(db: any): number {
+  try {
+    return Number((db.prepare(`SELECT COALESCE(MAX(rowid), 0) AS m FROM requisition_issue_ledger`).get() as
+      { m?: number } | undefined)?.m) || 0;
+  } catch { return 0; }
 }
 const ledgerShelfMarkProbe = new WeakMap<object, boolean>();
 function ledgerHasShelfMark(db: any): boolean {
@@ -548,6 +581,19 @@ export class CentralStockShort extends Error {
   /** What the line already held, as the store desk's box saw it (party rail
    *  inside /store-issue); 0 otherwise. */
   readonly deskBeforeLineQty: number;
+  /**
+   * EVERY OTHER LINE THE SAME FLOOR REFUSED IN THIS GESTURE (round 10). The
+   * party transfer used to throw on the FIRST short line, so the 400 named
+   * only that one and the store desk's held panel offered its cap as though
+   * it were the only obstacle — "Issuing it completes the requisition, and the
+   * party transfer then moves the line's whole 5.158 kg … and the line is
+   * issued in full" — and pressing it met the SECOND short line (round-9
+   * never-stuck recheck, two-short: MANGO 6 kg typed over 5,158 g plus WHOLE
+   * DHANIYA 1/1 recorded over a 0 kg shelf). The transfer now scores every
+   * line before it refuses, and the first refusal carries the rest here, in
+   * the transfer's order. [] on every single-line refusal.
+   */
+  others: CentralStockShort[] = [];
 
   constructor(c: CentralIssueCheck) {
     super(c.message);
@@ -696,6 +742,46 @@ export interface CentralIssueCheck {
    *  /store-process transfer starts from it). 0 on the internal rail. The
    *  desk sentence names it, and the desk caps are computed on top of it. */
   transferBeforeLineQty: number;
+  /** The line's approved quantity (chef_approved_qty, else quantity_requested),
+   *  LINE units — what THE RULE measures the line against. 0 for a line that is
+   *  not there. */
+  approvedLineQty: number;
+  /**
+   * WITH A DESK BASE ONLY (round 10): does the line's TOTAL after the box adds
+   * `maxAddLineQty` CLOSE the line by THE RULE once the transfer takes it? The
+   * add is always a figure the transfer takes in full, but a party
+   * requisition's goods move only when every line is complete — so "X takes
+   * everything the central store holds for it" is true only when X completes
+   * the line. MEASURED (round-9 store-desk verifier, c1_party_half): MANGO
+   * 10 of 20 kg recorded over a 14,842.4 g shelf, told "Issue 4.842 kg or less
+   * (4.842 kg takes everything the central store holds for it)"; pressed, 200,
+   * and nothing left the store — the line then owed 5.158 kg. False otherwise.
+   */
+  addCloses: boolean;
+  /** What the line still owes after that add, LINE units (0 when addCloses). */
+  addOwesLine: number;
+  /**
+   * WITH A DESK BASE AND NOTHING MOVED YET (round 10): would undoing the line
+   * and issuing what the store holds for it CLOSE it by THE RULE? The undo
+   * advice is printed only then (round-9 store-desk verifier,
+   * c13_party_undo_follow: "Undo the line and issue 14.842 kg on it" on a 20 kg
+   * line was followed, accepted, and the requisition still could not send).
+   */
+  redoCloses: boolean;
+  /** What the line would still owe after that redo, LINE units. */
+  redoOwesLine: number;
+  /** With a desk base: the line as the box found it still owed something
+   *  (issued below approved) — so "Defer the rest" names a real rest. */
+  deskOwes: boolean;
+  /**
+   * With a desk base, when the line's figure AS IT STANDS fits (deskLineFits):
+   * the transfer taking that figure would CLOSE the line by THE RULE (it is
+   * everything the shelf holds and what stays owing is below one printed
+   * step). Nothing more fits and nothing is left to defer — the line only
+   * needs the transfer to run, and the transfer runs on an issue (round 10:
+   * a Defer alone never runs it), so the way out is to re-issue the figure.
+   */
+  deskCloses: boolean;
 }
 
 /**
@@ -864,11 +950,13 @@ export function checkCentralIssue(
     lineUnit: '', requestedPurchase: 0, availablePurchase: 0,
     purchaseUnit: '', packFactor: 1, purchasePackFactor: 1, message: '',
     maxAddLineQty: 0, maxAddPurchase: 0, deskBeforeLineQty: 0, deskLineFits: false,
-    transferBeforeLineQty: 0, ...over,
+    transferBeforeLineQty: 0, approvedLineQty: 0,
+    addCloses: false, addOwesLine: 0, redoCloses: false, redoOwesLine: 0, deskOwes: false, deskCloses: false, ...over,
   });
 
   const line = db.prepare(`
     SELECT ri.id, ri.material_id, ri.unit AS line_unit, r.purpose,
+           ri.chef_approved_qty, ri.quantity_requested,
            rm.name AS material_name, rm.unit, rm.purchase_unit, rm.pack_size,
            COALESCE(rm.current_stock, 0) AS current_stock
       FROM requisition_items ri
@@ -1012,6 +1100,42 @@ export function checkCentralIssue(
     maxTotalLine = snap9(desk + maxAddLineQty);
   }
   const maxAddPurchase = maxAddLineQty > 0 ? (maxAddLineQty * (factor || 1)) / pf : 0;
+  // ── WHAT THE BOX'S FIGURES LEAD TO, BY THE RULE (round 10) ──────────────
+  // The sentence a desk-based refusal prints is a promise about the line, so
+  // it is decided here, from the line's own approval and the very plan the
+  // transfer will run — never assumed. Only with a desk base (a party line the
+  // store desk's box adds to); every other refusal is byte-identical.
+  const approvedLineQty = (line.chef_approved_qty != null
+    ? Number(line.chef_approved_qty) : Number(line.quantity_requested)) || 0;
+  let addCloses = false, addOwesLine = 0, redoCloses = false, redoOwesLine = 0, deskOwes = false, deskCloses = false;
+  if (desk > 0) {
+    const shownLine = lineShownAs(line.line_unit, line);
+    deskOwes = !issuedCoversAsk(desk, approvedLineQty, shownLine, false);
+    // The transfer's take of a line TOTAL: the same plan, the same record it
+    // would write (recordAfterLineQty), the same emptied test it stamps — and
+    // whether THE RULE then calls the line complete.
+    const closesAt = (total: number) => {
+      const p2 = planCentralDebit(stock - claimed,
+        Math.round((total - transferBase) * factor * 1e6) / 1e6, conv);
+      const recorded = p2.fits && !p2.debitIsAsk ? transferBase + p2.debit / (factor || 1) : total;
+      const emptied = p2.debit > 0 && !holdsAny(p2.available - p2.debit);
+      return { closes: p2.fits && issuedCoversAsk(recorded, approvedLineQty, shownLine, emptied), recorded };
+    };
+    if (maxAddLineQty > 0) {
+      const t = closesAt(maxTotalLine);
+      addCloses = t.closes;
+      addOwesLine = addCloses ? 0 : Math.max(0, approvedLineQty - t.recorded);
+    }
+    if (deskLineFits && deskOwes) deskCloses = closesAt(desk).closes;
+    if (!(transferBase > 0) && holdsAny(plan.available)) {
+      // Undone, the line holds 0; issuing what the store holds for it is a
+      // take of the whole balance (the shown figure, or the crumb's grid
+      // point), recorded as that balance in the line's unit, emptying it.
+      const exactLeft = plan.available / (factor || 1);
+      redoCloses = issuedCoversAsk(exactLeft, approvedLineQty, shownLine, true);
+      redoOwesLine = redoCloses ? 0 : Math.max(0, approvedLineQty - exactLeft);
+    }
+  }
   const base: CentralIssueCheck = {
     ok: true, debits: true, skipReason: '',
     reqItemId: String(line.id),
@@ -1050,7 +1174,8 @@ export function checkCentralIssue(
     purchasePackFactor: pf,
     message: '',
     maxAddLineQty, maxAddPurchase, deskBeforeLineQty: desk, deskLineFits,
-    transferBeforeLineQty: transferBase,
+    transferBeforeLineQty: transferBase, approvedLineQty,
+    addCloses, addOwesLine, redoCloses, redoOwesLine, deskOwes, deskCloses,
   };
   // An issue of everything on the shelf — binary noise included, or the 6-dp
   // figure the desks print — fits and lands on exactly 0 (debitRecipe is then
@@ -1098,12 +1223,21 @@ type ShortFigures = {
  * `lead`: "this party line already holds D, and the party transfer moves the
  * whole line at once" — the fact the box's figure depends on.
  * `tail`: what to press. The add (c.maxAddPurchase, EXACT — 0.0004 kg is
- * typeable and the store desk prints it at that precision) when there is one;
- * otherwise the way out in words, never a figure that would be refused:
- *   · the line holds no more than the shelf (it would all go): defer the rest;
+ * typeable and the store desk prints it at that precision) when there is one,
+ * and what it leads to by THE RULE (round 10: "takes everything … and the line
+ * closes" only when it completes the line — otherwise it is recorded and
+ * nothing moves yet); otherwise the way out in words, never a figure that
+ * would be refused:
+ *   · the line holds no more than the shelf (it would all go): defer the rest —
+ *     where there is a rest (c.deskOwes) the shelf cannot close; where the
+ *     line's own figure closes it once the transfer takes it (c.deskCloses),
+ *     re-issue that figure, because the transfer runs on an issue and never on
+ *     a defer (round 10);
  *   · the line holds MORE than the shelf: undo it and issue the shelf's figure,
  *     which is the cap from 0 and accepted (checked: the store desk's undo
- *     zeroes the line, so its box then adds to 0).
+ *     zeroes the line, so its box then adds to 0) — ONLY when that redo closes
+ *     the line (c.redoCloses, round 10); otherwise how far short the store
+ *     leaves it, and that only stock or a count can move it.
  */
 function deskPartyClauses(c: CentralIssueCheck, f: ShortFigures): { lead: string; store: string; tail: string } {
   const pu = c.purchaseUnit ? ` ${c.purchaseUnit}` : '';
@@ -1134,24 +1268,63 @@ function deskPartyClauses(c: CentralIssueCheck, f: ShortFigures): { lead: string
     ? `this party line already holds ${deskFig}; ${fmtLineQtyPU(moved, c.lineUnit, f.meta)} of it already left the `
       + `central store when the party transfer first ran, and the transfer moves only what the line holds above that`
     : `this party line already holds ${deskFig}, and the party transfer moves the whole line at once`;
+  const lineFig = (n: number) => fmtLineQtyPU(n, c.lineUnit, f.meta);
   if (c.maxAddPurchase > 0) {
     const add = `${puFine(c.maxAddPurchase, f.pf)}${pu}`;
-    return { lead, store, tail: `Issue ${add} or less on this line (${add} takes everything the central store holds for it).` };
+    // "TAKES EVERYTHING" ONLY WHEN THE ADD COMPLETES THE LINE (round 10). The
+    // add is always a total the transfer takes in full — but the transfer runs
+    // only once every line is complete, so on a line the add leaves short the
+    // truth is that it is recorded and nothing moves (c1_party_half).
+    return {
+      lead, store,
+      tail: c.addCloses
+        ? `Issue ${add} or less on this line (${add} takes everything the central store holds for it, and the line closes).`
+        : `Issue ${add} or less on this line — it is recorded on the line, which then still owes `
+          + `${lineFig(c.addOwesLine)}; a party requisition's goods leave the central store only once every line is `
+          + `complete, so nothing moves yet.`,
+    };
   }
   const cap = f.shownAvail > 0 ? `${fmtQtyNum(f.shownAvail)}${pu}` : `${puFine(c.availablePurchase, f.pf)}${pu}`;
+  // "Defer the rest" only where there IS a rest (round 10): a line already
+  // issued in full that asked for more has nothing left to promise.
+  const deferOr = c.deskOwes ? 'Defer the rest, or receive' : 'Receive';
   // The line's own figure is one the transfer takes (it IS what the shelf
   // holds, by the grid or by the shown figure): nothing to undo.
   return {
     lead, store,
     tail: c.deskLineFits
-      ? `Nothing more can be issued on this line until stock arrives — it already holds everything the central `
-        + `store holds for it. Defer the rest, or receive the stock or record a closing count first.`
+      ? (!c.deskOwes
+          ? `Nothing more can be issued on this line — it already holds everything the central store holds for `
+            + `it, and it owes nothing more.`
+          // ITS OWN FIGURE CLOSES IT (round 10): the line needs only the transfer
+          // to run, and the transfer runs on an issue — a Defer alone never runs
+          // it — so the way out is to record the same figure through one.
+          : c.deskCloses
+            ? `Nothing more can be issued on this line — it already holds everything the central store holds for `
+              + `it, and the line closes once the party transfer takes that. The transfer runs on an issue, not on a `
+              + `defer: undo the line and issue ${deskFig} on it again once every other line is complete, or receive `
+              + `the stock or record a closing count first.`
+            : `Nothing more can be issued on this line until stock arrives — it already holds everything the central `
+              + `store holds for it. ${deferOr} the stock or record a closing count first.`)
       : moved > 0
         ? `Nothing more can be issued on this line until stock arrives — what it holds above the part already `
-          + `moved is more than the central store holds for it. Defer the rest, or receive the stock or record a `
+          + `moved is more than the central store holds for it. ${deferOr} the stock or record a `
           + `closing count first.`
-        : `Nothing more can be issued on this line — it already holds more than the central store holds for it. `
-          + `Undo the line and issue ${cap} on it, or receive the stock or record a closing count first.`,
+        // THE UNDO ADVICE ONLY WHERE IT WORKS (round 10). Lowered to what the
+        // store holds, the line closes only when what it then owes is below
+        // one printed step (redoCloses); otherwise the advice was followed,
+        // accepted, and the requisition still could not send — a party
+        // requisition's goods move only once every line is complete
+        // (c13_party_undo_follow). The desk prints the same fact
+        // (store-requisitions/page.tsx closesIfRedone).
+        : c.redoCloses
+          ? `Nothing more can be issued on this line — it already holds more than the central store holds for it. `
+            + `Undo the line and issue ${cap} on it (the transfer then takes everything the central store holds for `
+            + `it, and the line closes), or receive the stock or record a closing count first.`
+          : `Nothing more can be issued on this line — it already holds more than the central store holds for it, `
+            + `and even ${cap}, everything the store holds for it, would leave it ${lineFig(c.redoOwesLine)} short. `
+            + `A party requisition's goods leave the central store only once every line is complete, so receive the `
+            + `stock or record a closing count first.`,
   };
 }
 /** The refusal sentence for a short line, in the purchase unit the desks type

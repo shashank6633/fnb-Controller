@@ -5,7 +5,8 @@ import { mergeDuplicateLines } from '@/lib/po-helpers';
 import {
   applyIssueDelta, checkCentralIssue, isCentralStockShort,
   issueLineQtyToRecord, rescoreHeldIssue, scoreHeldAtTurn, lineIssueComplete,
-  zeroEntriesSentence, fmtLineQtyPU,
+  zeroEntriesSentence, fmtLineQtyPU, issueLedgerWatermark,
+  type CentralStockShort,
 } from '@/lib/issue-stock';
 import { vendorMappingError, vendorResolver } from '@/lib/vendor-mapping';
 import { centralFlowBlock } from '@/lib/store-engine';
@@ -426,6 +427,10 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
        *  desk, where a held line is continued once this route has moved the
        *  requisition on. LINE units, and PURCHASE units exact. */
       max_add_qty: number; max_add_purchase: number;
+      /** The line's quantity_issued these figures were worked out against
+       *  (round 10, LINE units) — what a store-desk cap continuing this line
+       *  sends back as `expect_issued` (store-issue's THE STALE CAP). */
+      line_issued: number;
       message: string;
     }[] = [];
     /**
@@ -521,6 +526,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           purchase_unit: h.purchaseUnit,
           max_issue_qty: h.maxIssueLineQty, line_unit: h.lineUnit,
           max_add_qty: h.maxAddLineQty, max_add_purchase: h.maxAddPurchase,
+          line_issued: beforeIssued,
           message: h.message,
         };
         centralShort.push(row);
@@ -1062,6 +1068,11 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         err.httpStatus = 409;
         throw err;
       }
+      // WHERE THIS SUBMIT BEGINS IN THE ISSUE LEDGER (round 10): a line the
+      // party transfer closes by the shelf arm stamps only a row this submit
+      // wrote (party-fulfillment.ts, "THE SHELF MARK GOES ON THE CLOSING
+      // GESTURE'S ROW") — the store_process row it closed at, never an older one.
+      const ledgerSince = issueLedgerWatermark(db);
 
       // --- 1. Record what was issued.
       // This route itself writes NOTHING to raw_materials.current_stock or
@@ -1267,6 +1278,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         row.max_issue_qty = c.maxIssueLineQty;
         row.max_add_qty = c.maxAddLineQty;
         row.max_add_purchase = c.maxAddPurchase;
+        row.line_issued = beforeNow;
         row.message = c.message;
       }
 
@@ -1503,7 +1515,7 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         return !(lineIssueComplete(it) && !it.deferred_until);
       });
       if (!linkedPoId && poDroppedOwing.length === 0 && heldItemIds.size === 0 && r.purpose === 'party') {
-        applyPartyFulfillment(db, id, me.email);
+        applyPartyFulfillment(db, id, me.email, { ledgerSince });
       }
 
       // --- 3. Mark the requisition as processed ---
@@ -1664,19 +1676,30 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     // holds. Without this the storekeeper would get a bare 500 for a race he
     // can fix by reloading.
     if (isCentralStockShort(e)) {
+      // EVERY LINE THE TRANSFER COULD NOT MOVE (round 10): the first refusal
+      // carries the rest (CentralStockShort.others). One row otherwise.
+      const all = [e as CentralStockShort, ...(((e as CentralStockShort).others) || [])];
+      // Rolled back, so each line holds what it held before this submit.
+      const issuedNow = (rid: string) => {
+        try {
+          return Number((getDb().prepare(`SELECT quantity_issued FROM requisition_items WHERE id = ?`)
+            .get(String(rid)) as any)?.quantity_issued) || 0;
+        } catch { return 0; }
+      };
       return Response.json({
-        error: e.message,
+        error: all.map(x => x.message).join(' '),
         code: e.code,
-        blocked: [{
+        blocked: all.map(x => ({
           code: 'central_stock_short',
-          material: e.materialName, material_id: e.materialId, req_item_id: e.reqItemId,
-          requested: e.requestedPurchase, available: e.availablePurchase,
-          purchase_unit: e.purchaseUnit,
-          max_issue_qty: e.maxIssueLineQty, line_unit: e.lineUnit,
-          max_add_qty: e.maxAddLineQty, max_add_purchase: e.maxAddPurchase,
-          message: e.message,
-        }],
-        req_item_ids: [e.reqItemId],
+          material: x.materialName, material_id: x.materialId, req_item_id: x.reqItemId,
+          requested: x.requestedPurchase, available: x.availablePurchase,
+          purchase_unit: x.purchaseUnit,
+          max_issue_qty: x.maxIssueLineQty, line_unit: x.lineUnit,
+          max_add_qty: x.maxAddLineQty, max_add_purchase: x.maxAddPurchase,
+          line_issued: issuedNow(x.reqItemId),
+          message: x.message,
+        })),
+        req_item_ids: all.map(x => x.reqItemId),
         applied: 0,
       }, { status: 400 });
     }

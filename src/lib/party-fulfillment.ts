@@ -1,9 +1,10 @@
 import type Database from 'better-sqlite3';
 import { generateId, logAuditEvent } from '@/lib/db';
 import {
-  assertCentralIssue, recordPartyShelfTake, stampShelfClose, centralShelfEmpty, markLedgerShelfClose,
-  lineFactor,
+  assertCentralIssue, checkCentralIssue, recordPartyShelfTake, stampShelfClose, centralShelfEmpty,
+  markLedgerShelfClose, issueLedgerWatermark, lineFactor, CentralStockShort, isCentralStockShort,
 } from '@/lib/issue-stock';
+import { qtyGrid } from '@/lib/central-debit-clamp';
 // THE MOVEMENT RECORD (owner's eight fields, 2026-09-10). This module writes
 // BOTH rails with its own raw INSERTs — it maintains the department_materials
 // cache itself, so it deliberately does NOT route through postDeptLedger (that
@@ -28,6 +29,23 @@ export interface PartyShelfRecord {
   recorded_line_qty: number;
   /** RECIPE units the transfer debited (central) and credited (department). */
   debit_recipe: number;
+  /**
+   * WHY the line was corrected (round 10):
+   *   'shown'   — the shown-figure rule took the balance, not the typed figure
+   *               (round 7; the only kind before round 10);
+   *   'substep' — a top-up whose remainder, below one printed step, the shelf
+   *               could not cover: the transfer took what the shelf held and
+   *               the line records what left (THE RULE then closes it);
+   *   'short'   — a top-up line this gesture did not touch, whose recorded
+   *               remainder the shelf could not cover: the transfer took what
+   *               the shelf held, the line records what left, and it stays
+   *               open for the rest.
+   * See "A TOP-UP THE SHELF CANNOT COVER" below.
+   */
+  kind: 'shown' | 'substep' | 'short';
+  /** What earlier transfers had already moved for the line, LINE units (0 on
+   *  a 'shown' correction of a first transfer). */
+  moved_line_qty: number;
 }
 
 /**
@@ -71,7 +89,11 @@ export interface PartyShelfRecord {
  * all-or-nothing rather than a partial transfer: a quietly short line would
  * leave the line recording goods the books never moved. (Round 9: a later call
  * now moves what each line holds above what already moved — see "A SECOND CALL
- * MOVES ONLY WHAT HAS NOT MOVED" below — but a refusal is still whole.) The UNATTENDED third route (the PO-receipt / GRN-QC cascade in
+ * MOVES ONLY WHAT HAS NOT MOVED" below — but a refusal is still whole. Round
+ * 10: a top-up the shelf cannot cover takes what the shelf holds only where
+ * the LINE THEN RECORDS WHAT LEFT — never a quiet short — see "A TOP-UP THE
+ * SHELF CANNOT COVER"; every other short line still refuses, all of them
+ * named.) The UNATTENDED third route (the PO-receipt / GRN-QC cascade in
  * po-requisition-fulfil.ts) deliberately does the opposite — see the judgement
  * recorded there.
  *
@@ -139,10 +161,64 @@ export interface PartyShelfRecord {
  * (checkCentralIssue's deskBeforeLineQty / maxAddLineQty). /store-process, whose
  * box IS the line's absolute figure, passes nothing and is byte-identical.
  *
+ * ── A TOP-UP THE SHELF CANNOT COVER (round 10) ─────────────────────────────
+ * A top-up asks the floor for what a line holds above the part already moved,
+ * and the part already moved cannot be put back (a party undo zeroes the line;
+ * the goods stay with the department). So a top-up refusal can leave a
+ * requisition with no truthful way forward, and two shapes did (round-9
+ * never-stuck recheck):
+ *   · A REMAINDER BELOW ONE PRINTED STEP, OVER AN EMPTY SHELF. THREE MANGO
+ *     14.843 kg approved, 14,842.4 g moved by the management desk (the shelf
+ *     emptied, the line closed by THE RULE); undone and re-issued at the box's
+ *     14.843, the top-up asked 0.6 g of a 0 g shelf and was refused — and that
+ *     refusal then blocked SALT's Issue Now and SALT's Reject on the same
+ *     requisition, for good (ta_redo_full_out). THE RULE's own answer for a
+ *     line that holds everything the store gave it, owes less than one printed
+ *     step and leaves the shelf empty is "complete". So such a remainder takes
+ *     what the shelf holds (nothing, or a crumb), the line RECORDS WHAT LEFT
+ *     (14.8424 kg) and the shelf arm closes it. It never blocks.
+ *   · A LINE THIS GESTURE DID NOT TOUCH, whose recorded remainder the shelf can
+ *     no longer cover. THREE MANGO 20 kg recorded, 10 kg moved, the shelf since
+ *     drained to 5 kg by other screens; SALT's Reject — the last open line —
+ *     fired the top-up, which refused it naming MANGO, a complete line with no
+ *     rest to defer (ta_block). The storekeeper was not acting on MANGO, so the
+ *     refusal was not his to fix in that gesture, and every exit without a
+ *     receipt ended in a false record. The owner's rule for a line the store
+ *     cannot cover is "issue the 5, hold the 1": the rest of the gesture goes
+ *     ahead and the short line STAYS OUTSTANDING. So the transfer takes what
+ *     the shelf holds for that line (5 kg, landing on exactly 0), the line
+ *     records what left (15 kg) and reads open for the 5 kg still owed, and the
+ *     route names it on its 200 (party_short). Nothing goes below zero, nothing
+ *     records goods that did not move, and the line keeps Issue Now / Defer /
+ *     Reject.
+ * Both go through recordPartyShelfTake (the same correction the shown-figure
+ * rule makes, kind 'substep' / 'short') and stampShelfClose. Neither applies
+ * to a first transfer (nothing moved: an undo is still a truthful way to lower
+ * the line) nor to a line THIS gesture issued on whose remainder is a step or
+ * more (the storekeeper is asking for it now — refused, with its figures).
+ * `opts.gestureIssuedIds` names the lines this gesture issued on; without it
+ * (/store-process, whose submit writes every line) every line is the gesture's.
+ *
+ * ── EVERY SHORT LINE IS NAMED (round 10) ────────────────────────────────────
+ * The transfer used to throw on the FIRST line it could not move, so a second
+ * short line was found only by the next press (round-9 recheck, two-short).
+ * Every line is now scored before the transfer refuses; the first refusal is
+ * thrown with the rest on CentralStockShort.others, and the routes return each
+ * one's row and cap. The refusal is still whole: nothing moves.
+ *
+ * ── THE SHELF MARK GOES ON THE CLOSING GESTURE'S ROW (round 10) ─────────────
+ * `opts.ledgerSince` is requisition_issue_ledger's MAX(rowid) when the gesture
+ * began (issueLedgerWatermark). A line this transfer closes by the shelf arm
+ * stamps only a ledger row written since — the gesture's own issue row, or
+ * this transfer's correction row — never an earlier gesture's (round-9
+ * issue-log verifier, party_retro_stamp). Without it, the transfer's own start.
+ *
  * @param db         open better-sqlite3 database
  * @param reqId      requisition id
  * @param actorEmail the store person performing the fulfilment (stamped on dept ledger)
- * @param opts       deskBeforeLineQty: requisition_items.id → quantity_issued before this gesture (/store-issue only)
+ * @param opts       deskBeforeLineQty: requisition_items.id → quantity_issued before this gesture (/store-issue only);
+ *                   gestureIssuedIds: the lines this gesture issued on (/store-issue only);
+ *                   ledgerSince: the issue ledger's MAX(rowid) when the gesture began
  * @returns { transferred: Array<{material_id, issued, department_id}>, total, recorded } — issued in RECIPE
  *          units; `recorded` lists the lines whose quantity_issued was corrected to what left the shelf.
  */
@@ -150,7 +226,11 @@ export function applyPartyFulfillment(
   db: Database.Database,
   reqId: string,
   actorEmail: string,
-  opts?: { deskBeforeLineQty?: ReadonlyMap<string, number> },
+  opts?: {
+    deskBeforeLineQty?: ReadonlyMap<string, number>;
+    gestureIssuedIds?: ReadonlySet<string>;
+    ledgerSince?: number;
+  },
 ): {
   transferred: Array<{ material_id: string; issued: number; department_id: string | null }>;
   total: number;
@@ -294,6 +374,13 @@ export function applyPartyFulfillment(
     // The floor's decision needs no claim: each line re-reads a balance the
     // earlier debits have already reduced.
     const takenBy = new Map<string, { recipe: number; lines: number }>();
+    // Every line the floor refuses, in walk order (round 10 — EVERY SHORT LINE
+    // IS NAMED). Thrown together once the walk is done.
+    const shorts: CentralStockShort[] = [];
+    // The gesture's start in the issue ledger (round 10 — THE SHELF MARK GOES
+    // ON THE CLOSING GESTURE'S ROW), read under the write lock with the rest.
+    const ledgerSince = opts?.ledgerSince != null && Number.isFinite(Number(opts.ledgerSince))
+      ? Number(opts.ledgerSince) : issueLedgerWatermark(db);
     for (const it of items) {
       const issuedReq = Number(it.quantity_issued) || 0; // in ri.unit
       if (issuedReq <= 0) continue;
@@ -344,13 +431,18 @@ export function applyPartyFulfillment(
       // goes to the line above.
       //
       // A TOP-UP (round 9) asks from the part already moved, not from 0.
-      const c = assertCentralIssue(db, {
+      //
+      // ASKED, NOT ASSERTED (round 10): the decision is checkCentralIssue's —
+      // the very function assertCentralIssue throws on — so a line the floor
+      // refuses can be told apart from a top-up the shelf cannot cover (see "A
+      // TOP-UP THE SHELF CANNOT COVER" in the header) and every short line can
+      // be named before the transfer refuses. The refusal's own sentence is
+      // still assertCentralIssue's, sibling wording included.
+      const c = checkCentralIssue(db, {
         reqItemId: String(it.id),
         beforeLineQty: movedLine,
         afterLineQty: issuedReq,
         rail: 'party',
-        siblingRecipe: prior?.recipe || 0,
-        siblingLines: prior?.lines || 0,
         deskBeforeLineQty: deskBase,
       });
 
@@ -386,14 +478,60 @@ export function applyPartyFulfillment(
         continue;
       }
 
-      // RECIPE units, and the floor's own figure — never a second multiplication.
-      // debitRecipe, not requestedRecipe: the floor accepts "everything on the
-      // shelf" on the balance's 6-dp grid point, and on that ask the figure to
-      // subtract is the balance itself, so the write lands on exactly 0 rather
-      // than -4e-7 (planCentralDebit, src/lib/central-debit-clamp.ts). Identical
-      // to requestedRecipe on every other ask. The department credit and the
-      // movement row below carry the same figure, so the two rails still agree.
-      const issued = c.debitRecipe;
+      // ── A LINE THE FLOOR REFUSES ─────────────────────────────────────────
+      // Either a top-up the shelf cannot cover that must not block (the two
+      // shapes in "A TOP-UP THE SHELF CANNOT COVER": a remainder below one
+      // printed step, or a line this gesture did not touch) — which takes what
+      // the shelf holds and records what left — or a refusal, collected so
+      // every short line is named (round 10).
+      let kind: PartyShelfRecord['kind'] | null = null;
+      let issued: number;
+      let recordLine: number;
+      if (c.ok) {
+        // RECIPE units, and the floor's own figure — never a second
+        // multiplication. debitRecipe, not requestedRecipe: the floor accepts
+        // "everything on the shelf" on the balance's 6-dp grid point, and on
+        // that ask the figure to subtract is the balance itself, so the write
+        // lands on exactly 0 rather than -4e-7 (planCentralDebit,
+        // src/lib/central-debit-clamp.ts). Identical to requestedRecipe on
+        // every other ask. The department credit and the movement row below
+        // carry the same figure, so the two rails still agree.
+        issued = c.debitRecipe;
+        recordLine = c.recordAfterLineQty;
+        if (recordLine !== issuedReq) kind = 'shown';
+      } else {
+        const topUp = movedLine > 0;
+        // Below ONE PRINTED STEP: 0.001 of the purchase unit, in recipe units,
+        // on the house grid — the step THE RULE's shelf arm measures against.
+        const subStep = topUp && qtyGrid(c.requestedRecipe) < qtyGrid(0.001 * (c.purchasePackFactor || 1));
+        const untouched = topUp && !!opts?.gestureIssuedIds && !opts.gestureIssuedIds.has(String(it.id));
+        if (!subStep && !untouched) {
+          // A REFUSAL. Its sentence is the floor's own (assertCentralIssue,
+          // the sibling wording when an earlier line of the same material took
+          // from the shelf first). Nothing is debited for it; the walk goes on
+          // so the next short line is named too, and the whole transfer is
+          // refused once it is done.
+          try {
+            assertCentralIssue(db, {
+              reqItemId: String(it.id), beforeLineQty: movedLine, afterLineQty: issuedReq, rail: 'party',
+              siblingRecipe: prior?.recipe || 0, siblingLines: prior?.lines || 0, deskBeforeLineQty: deskBase,
+            });
+            shorts.push(new CentralStockShort(c));
+          } catch (e) {
+            if (!isCentralStockShort(e)) throw e;
+            shorts.push(e as CentralStockShort);
+          }
+          continue;
+        }
+        // WHAT THE SHELF HOLDS, AND NO MORE. On a refusal the floor's debit is
+        // max(0, balance) — "what an unattended rail may clamp to" (issue-stock
+        // CentralIssueCheck.debitRecipe) — so the write lands on exactly 0 and
+        // never below it; 0 when the shelf is empty. The line records the part
+        // already moved plus this, in its own unit.
+        issued = Math.max(0, Number(c.debitRecipe) || 0);
+        recordLine = movedLine + issued / (c.packFactor || 1);
+        kind = subStep ? 'substep' : 'short';
+      }
       const deptId: string | null = it.department_id || req.department_id || null;
       takenBy.set(String(it.material_id), {
         recipe: (prior?.recipe || 0) + issued, lines: (prior?.lines || 0) + 1,
@@ -402,22 +540,26 @@ export function applyPartyFulfillment(
       // THE LINE SAYS WHAT LEFT THE SHELF (round 7). recordAfterLineQty is the
       // floor's own answer: the line's figure untouched on every ordinary
       // transfer, the balance (in the line's unit) when the shown-figure rule
-      // took it instead. Written before the debit only because the debit does
-      // not read the line; both are inside this one transaction.
-      if (c.recordAfterLineQty !== issuedReq
+      // took it instead — and (round 10) the part already moved plus what the
+      // shelf held, on a top-up it could not cover. Written before the debit
+      // only because the debit does not read the line; both are inside this
+      // one transaction.
+      if (kind && recordLine !== issuedReq
           && recordPartyShelfTake(db, {
             reqItemId: String(it.id), askedLineQty: issuedReq,
-            recordLineQty: c.recordAfterLineQty, actor: actorEmail,
+            recordLineQty: recordLine, actor: actorEmail,
           })) {
         recorded.push({
           req_item_id: String(it.id), material_id: String(it.material_id),
           material_name: String(c.materialName || ''), line_unit: String(it.req_unit ?? ''),
-          asked_line_qty: issuedReq, recorded_line_qty: c.recordAfterLineQty, debit_recipe: issued,
+          asked_line_qty: issuedReq, recorded_line_qty: recordLine, debit_recipe: issued,
+          kind, moved_line_qty: movedLine,
         });
       }
 
-      // STORE: decrement current_stock + ledger row.
-      decStock.run(issued, it.material_id);
+      // STORE: decrement current_stock + ledger row. Nothing to subtract when a
+      // top-up the shelf could not cover met an empty shelf.
+      if (issued > 0) decStock.run(issued, it.material_id);
       // THE RULE'S MEMORY (round 8). Did THIS take empty the shelf? Read
       // straight after the debit: a party line it closed by the shelf — the take
       // emptied the material and what the line still owes is below one printed
@@ -427,8 +569,11 @@ export function applyPartyFulfillment(
       const stamp = stampShelfClose(db, String(it.id), centralShelfEmpty(db, String(it.material_id)));
       // And on the ledger row that now carries the line's figure (the
       // party_shelf correction, or the issue row moved unchanged), as history
-      // a later undo cannot retire (round 8b, markLedgerShelfClose).
-      if (stamp.byShelf) markLedgerShelfClose(db, String(it.id));
+      // a later undo cannot retire (round 8b, markLedgerShelfClose) — a row OF
+      // THIS GESTURE only (round 10, `ledgerSince`): when the gesture wrote
+      // none for the line, an earlier gesture's row keeps what it truly was.
+      if (stamp.byShelf) markLedgerShelfClose(db, String(it.id), null, null, ledgerSince);
+      if (!(issued > 0)) continue;
       // Same debit as before — same type, same sign, same reference, same note.
       // What is new is that the row now says WHERE the goods went (this party's
       // department, by id and by name), in WHAT unit, on WHAT business date and
@@ -480,6 +625,14 @@ export function applyPartyFulfillment(
 
       transferred.push({ material_id: it.material_id, issued, department_id: deptId });
     }
+    // THE REFUSAL, WHOLE — and naming every line it could not move (round 10).
+    // Thrown inside the transaction, so every debit, credit and correction the
+    // walk wrote for the other lines unwinds with it: not a gram moves.
+    if (shorts.length > 0) {
+      const first = shorts[0];
+      first.others = shorts.slice(1);
+      throw first;
+    }
     if (already && topUpLines === 0) {
       // A repeat call with nothing left above what already moved: the old skip,
       // to the letter — not one row written.
@@ -515,16 +668,30 @@ export function applyPartyFulfillment(
     // was corrected, so an ordinary transfer is byte-identical. Not one of the
     // cascade witness names either (see the note above), for the same reason.
     if (recorded.length > 0) {
+      const fig = (r: PartyShelfRecord) => `${r.material_name || r.material_id} ${r.asked_line_qty} → ${r.recorded_line_qty}`
+        + `${r.line_unit ? ` ${r.line_unit}` : ''}`;
+      // Every correction the shown-figure rule made reads exactly as before;
+      // a top-up the shelf could not cover (round 10) says so per line.
+      const why = (r: PartyShelfRecord) => r.kind === 'substep'
+        ? ' (less than one printed step was still to move and the central store held no more, so the line closes)'
+        : r.kind === 'short'
+          ? ' (the central store could not cover what the line held above what had already moved; the line stays open)'
+          : '';
+      const allShown = recorded.every(r => r.kind === 'shown');
       logAuditEvent(db, {
         event_type: 'requisition.party_transfer.shelf',
         entity_type: 'requisition',
         entity_id: reqId,
         actor_email: actorEmail,
-        after: { lines: recorded },
-        note: `Party transfer took what the central store held on ${recorded.length} line(s) typed at the `
-          + `store's shown figure; each line now records what left the shelf (the typed figure is kept as asked): `
-          + recorded.map(r => `${r.material_name || r.material_id} ${r.asked_line_qty} → ${r.recorded_line_qty}`
-            + `${r.line_unit ? ` ${r.line_unit}` : ''}`).join(', '),
+        // The round-7 row, field for field, when only the shown-figure rule spoke.
+        after: { lines: allShown ? recorded.map(({ kind: _k, moved_line_qty: _m, ...r }) => r) : recorded },
+        note: allShown
+          ? `Party transfer took what the central store held on ${recorded.length} line(s) typed at the `
+            + `store's shown figure; each line now records what left the shelf (the typed figure is kept as asked): `
+            + recorded.map(fig).join(', ')
+          : `Party transfer took what the central store held on ${recorded.length} line(s); each line now records `
+            + `what left the shelf (the figure it held is kept as asked): `
+            + recorded.map(r => `${fig(r)}${why(r)}`).join(', '),
       });
     }
     return true;

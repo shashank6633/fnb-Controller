@@ -6,8 +6,9 @@ import {
 } from '@/lib/movement-record';
 import {
   checkCentralIssue, recordPartyShelfTake, stampShelfClose, centralShelfEmpty, markLedgerShelfClose,
+  lineFactor,
 } from '@/lib/issue-stock';
-import { qtyGrid } from '@/lib/central-debit-clamp';
+import { qtyGrid, planCentralDebit } from '@/lib/central-debit-clamp';
 
 /* ══════════════════════════════════════════════════════════════════════════
  * THE PO → REQUISITION FULFIL CASCADE, IN ONE PLACE.
@@ -45,6 +46,14 @@ import { qtyGrid } from '@/lib/central-debit-clamp';
  * STORY (measured: a party line of 9 against a balance of 0 → −9, status
  * fulfilled). See THE UNATTENDED-PATH JUDGEMENT at the clamp below, which is
  * why this route CLAMPS where the two issue desks THROW.
+ *
+ * THE FLOOR IS THE ONLY THING THAT CHANGED WHAT MOVES (round 10). Every line
+ * production debited is still debited, by production's own figure, and is cut
+ * only where central does not hold it — including the two lines the internal
+ * floor carves out (store-mapped materials, and a blank or unrecognised line
+ * unit on a packed material). Round 9 skipped those two outright, so a PO
+ * receipt with central holding every gram asked moved less than production
+ * did; see PRODUCTION'S DEBIT ON THE TWO CARVE-OUTS in the loop.
  *
  * ── IT IS ITS OWN REPLAY GUARD ─────────────────────────────────────────────
  * Two guards, both pre-existing:
@@ -139,7 +148,7 @@ export function fulfilRequisitionFromPo(
       const shortfalls: Array<{
         req_item_id: string; material_id: string; material_name: string;
         reason: string; wanted_recipe: number; issued_recipe: number;
-        short_recipe: number; central_stock_recipe: number;
+        short_recipe: number; central_stock_recipe: number; line_kind?: string;
       }> = [];
       // Lines the shelf rule resolved to the balance, corrected to what left the
       // shelf (round 7) — see THE LINE RECORDS WHAT LEFT THE SHELF below.
@@ -190,11 +199,13 @@ export function fulfilRequisitionFromPo(
                 what central actually holds, so the floor still holds absolutely.
                 Never more, never below zero.
              2. he must be able to SEE what could not be satisfied → every
-                clamped or skipped line is recorded in audit_events as
+                clamped line is recorded in audit_events as
                 'requisition.party_consumption.short', naming the material, what
-                was wanted, what moved and what is missing. The word "silently"
-                is the part this removes; the arithmetic is the part the clamp
-                removes.
+                was wanted, what moved, what is missing and what central held.
+                The word "silently" is the part this removes; the arithmetic is
+                the part the clamp removes. ONLY a line central was actually
+                short of goes on that row (round 10): a line the floor did not
+                cut is not a shortfall, whatever kind of line it is.
 
            A CLAMPED LINE IS PERMANENT, WHICH IS WHY THE RECORD IS NOT OPTIONAL.
            Both party rails treat ONE party transfer row on the requisition as
@@ -216,35 +227,17 @@ export function fulfilRequisitionFromPo(
           rail: 'party',
         });
 
-        // The two carve-outs the internal floor respects, honoured here too, and
-        // gating BOTH the debit and the cost line. store_mapped = the material's
-        // balance lives on the TGBCL store ledger, not in central (95 of the 127
-        // store-mapped materials hold a central balance of 0, so a party draw on
-        // one went straight below zero). unit_review = ri.unit is blank or
-        // unrecognised on a PACKED material, so the old CASE above silently
-        // guessed recipe units where dept-stock reads the same blank as the
-        // purchase basis — a 750x fork decided by which screen you opened.
-        if (!c.debits) {
-          shortfalls.push({
-            req_item_id: String(it.id), material_id: String(it.material_id),
-            material_name: String(it.material_name || ''),
-            reason: c.skipReason || 'zero_delta',
-            wanted_recipe: 0, issued_recipe: 0, short_recipe: 0,
-            central_stock_recipe: c.centralStockRecipe,
-          });
-          continue;
-        }
-
         // ri.unit → RECIPE units. Requisition quantities are stored in the
         // LINE's OWN unit (option B), so a "2 BTL" line is TWO BOTTLES —
         // deducting it verbatim took 2 ml off stock instead of 1,500 ml and
         // wrote a −2 party transfer row. THE FACTOR IS THE FLOOR'S OWN: the
         // hand-rolled CASE that stood here is gone, so the quantity weighed
         // against the balance and the quantity taken off it are one number and
-        // cannot drift. Proved a no-op on quantity across all 16,353 live
-        // requisition lines (identical factor on 16,350; the other 3 are the
-        // blank-unit packed lines both now refuse instead of guessing).
-        const wanted = c.requestedRecipe;          // RECIPE units
+        // cannot drift. MEASURED a no-op on quantity: lineFactor().factor equals
+        // the old CASE on all 16,353 live requisition lines (round 10 re-check,
+        // fssai-flows/r10-probe.ts — the 3 blank-unit packed lines included,
+        // where both read ×1).
+        //
         // THE CLAMP IS THE RULE'S OWN FIGURE. debitRecipe comes from
         // planCentralDebit (src/lib/central-debit-clamp.ts), the one rule every
         // central floor shares: when the line fits it is the ask (or, on an ask
@@ -254,15 +247,92 @@ export function fulfilRequisitionFromPo(
         // fraction more than is physically there. This used to be a local
         // min(wanted, 6-dp allowance, balance) with its own 1e-9 test, which
         // logged a "short" of 0.0000004 against an ask the floor had accepted.
-        const issued = Math.max(0, c.debitRecipe);
-        if (!c.ok || issued <= 0) {
+        let wanted: number;          // RECIPE units
+        let issued: number;          // RECIPE units, what leaves central
+        let clamped: boolean;        // the floor cut this line
+        let centralStock: number;    // the raw stored balance the floor read
+        let carveOut = '';
+        if (c.debits) {
+          wanted = c.requestedRecipe;
+          issued = Math.max(0, c.debitRecipe);
+          clamped = !c.ok || issued <= 0;
+          centralStock = c.centralStockRecipe;
+        } else {
+          /* ── PRODUCTION'S DEBIT ON THE TWO CARVE-OUTS (round 10) ─────────────
+             checkCentralIssue declines to weigh two kinds of line, for reasons
+             that belong to the INTERNAL rail and the two desks, where an
+             operator types the figure:
+               · store_mapped — the material's balance lives on the TGBCL store
+                 ledger, not in central;
+               · unit_review — ri.unit is blank or unrecognised on a PACKED
+                 material, so the line's basis is ambiguous (×1 or ×pack).
+             Round 9 SKIPPED both here: no debit, no movement, no cost line.
+             PRODUCTION DEBITS BOTH, and this cascade is a production flow: the
+             skip moved less than production with central holding every gram
+             asked (measured, fssai-flows po-cascade nofloor: ABSOLUT 2 BTL over
+             27,000 ml stayed 27,000; SALT 5 blank-unit over 127,334 g stayed;
+             the party cost fell 5,816.08 → 1,468.18). That is not a floor, so
+             production's behaviour is restored.
+
+             THE FIGURE IS PRODUCTION'S. issuedReq × lineFactor().factor — the
+             shared converter, which reads ×1 on a blank or unrecognised unit
+             exactly as the old CASE did and equals it on every live line (see
+             above). NOT the 6-dp grid point checkCentralIssue weighs: the
+             carve-out is not on that rail, and production wrote this product
+             verbatim.
+
+             THE FLOOR STILL APPLIES, AND ONLY WHERE CENTRAL IS SHORT. The ask is
+             weighed by planCentralDebit — the one rule — against the balance
+             read here, inside the caller's transaction, immediately before the
+             debit (a balance read earlier races). It fits ⇒ production's figure
+             leaves, byte-identical (or, when the ask sits on the balance's own
+             6-dp grid point, the balance itself, so the landing is exactly 0
+             rather than a sub-grid crumb either side of it — the rule's
+             "takes all", the same on every floor). It does not fit ⇒ max(0, balance) leaves and
+             the line goes on the .short row with the balance central actually
+             held — 95 of the 127 store-mapped materials hold 0 in central, so
+             production drove those straight below zero and the clamp is what
+             stops it. planCentralDebit directly, not clampCentralDelta: when
+             this was written that helper passed a debit of ≤ 1e-9 through
+             untouched as dust, which on a zero balance landed at −1e-9 (round
+             10's never-negative fix closed that in the helper too, and it now
+             writes dust as at most the balance). planCentralDebit gives such an
+             ask the balance itself (0), so no line here can land below zero. No shown-figure converter is
+             passed: nobody typed this figure against a column, and on a
+             unit_review line nobody can say which column it would be.
+
+             THE SAME PATH TAKES A LINE THE RULE FOUND BELOW THE HOUSE GRID
+             (skipReason 'zero_delta': an ask under 5e-7 recipe units). Round 9
+             skipped it and listed it on the .short row with central 0; production
+             debited the dust. It is debited here too: on the grid it always
+             fits, so it is never a shortfall, and planCentralDebit gives it at
+             most the balance, so it never lands below zero. 'party' cannot arrive (rail 'party') and 'missing_line'
+             cannot either (the line was just read through the same joins). */
+          carveOut = c.skipReason;
+          const { factor } = lineFactor(it.unit, {
+            unit: it.rm_unit, purchase_unit: it.rm_purchase_unit, pack_size: it.rm_pack_size,
+          });
+          wanted = issuedReq * factor;
+          const bal = db.prepare(
+            `SELECT COALESCE(current_stock, 0) AS current_stock FROM raw_materials WHERE id = ?`,
+          ).get(it.material_id) as { current_stock: number } | undefined;
+          const plan = planCentralDebit(Number(bal?.current_stock) || 0, wanted);
+          issued = Math.max(0, plan.debit);
+          clamped = !plan.fits;
+          centralStock = plan.stock;
+        }
+        if (clamped) {
           shortfalls.push({
             req_item_id: String(it.id), material_id: String(it.material_id),
             material_name: String(it.material_name || ''),
             reason: 'central_stock_short',
             wanted_recipe: wanted, issued_recipe: issued,
             short_recipe: Math.round((wanted - issued) * 1e6) / 1e6,
-            central_stock_recipe: c.centralStockRecipe,
+            central_stock_recipe: centralStock,
+            // Which kind of line it was, when it was one the internal floor
+            // carves out — so a store-mapped bottle short in central is not read
+            // as a kitchen shortage. Absent on an ordinary line.
+            ...(carveOut ? { line_kind: carveOut } : {}),
           });
         }
         // Nothing issuable at all writes NO movement row, exactly as the
@@ -283,8 +353,10 @@ export function fulfilRequisitionFromPo(
         // party rail). Only on a FIT: a clamped line (!c.ok) is a shortfall and
         // goes on the .short row as before. Only when the line itself carried
         // the figure weighed — a line issued nothing is weighed at its approved
-        // quantity, and that is not this line's record to rewrite.
-        if (c.ok && c.recordAfterLineQty !== issuedReq
+        // quantity, and that is not this line's record to rewrite. Only on the
+        // weighed rail (c.debits): a carve-out line has no shown figure, and its
+        // debit is production's figure or the clamp, never a reading of it.
+        if (c.debits && c.ok && c.recordAfterLineQty !== issuedReq
             && recordPartyShelfTake(db, {
               reqItemId: String(it.id), askedLineQty: issuedReq,
               recordLineQty: c.recordAfterLineQty, actor: actorEmail || 'system:po-requisition-fulfil',
@@ -332,9 +404,10 @@ export function fulfilRequisitionFromPo(
         });
         /* BOTH SIDES OF THIS MULTIPLICATION ARE ON THE RECIPE BASIS.
            LEFT  — `issued` is RECIPE units (ml/g): issuedReq is in the LINE's
-                   own unit and the shared pack factor applied by
-                   checkCentralIssue above lifted a purchase-unit line into
-                   recipe units (it is `c.requestedRecipe`, possibly clamped).
+                   own unit and the shared pack factor (lineFactor, applied by
+                   checkCentralIssue or, on a carve-out line, directly above)
+                   lifted a purchase-unit line into recipe units (it is
+                   `wanted`, possibly clamped).
            RIGHT — raw_materials.average_price is ₹ per RECIPE unit by canon,
                    so it needs NO pack conversion. Dividing it by the pack size,
                    or multiplying it up, would break the trio.
@@ -358,15 +431,15 @@ export function fulfilRequisitionFromPo(
           line_cost: lineCost,
           // Stated on the line itself as well as in the shortfall event below,
           // so the consumption record cannot read as a full hand-over when the
-          // clamp reduced it. Only present when it actually bit — `!c.ok`, the
-          // rule's own verdict (round 7). A FIT that took the balance by the
-          // shown figure (4,842.5 g for 4.843 kg typed) is not a shortfall and
-          // must not read as one: it carries the typed figure as
-          // asked_quantity instead, beside the quantity that moved, and the line
-          // itself now records that quantity (above).
-          ...(!c.ok && issued < wanted - 1e-9
+          // clamp reduced it. Only present when it actually bit — `clamped`, the
+          // rule's own verdict (round 7; on a carve-out line, the plan's). A FIT
+          // that took the balance by the shown figure (4,842.5 g for 4.843 kg
+          // typed) is not a shortfall and must not read as one: it carries the
+          // typed figure as asked_quantity instead, beside the quantity that
+          // moved, and the line itself now records that quantity (above).
+          ...(clamped && issued < wanted - 1e-9
             ? { requested_quantity: wanted, short_quantity: Math.round((wanted - issued) * 1e6) / 1e6 }
-            : c.ok && qtyGrid(issued) !== qtyGrid(wanted)
+            : c.debits && c.ok && qtyGrid(issued) !== qtyGrid(wanted)
               ? { asked_quantity: wanted }
               : {}),
         });
@@ -379,8 +452,14 @@ export function fulfilRequisitionFromPo(
         after: { items: auditItems, total_cost: Math.round(totalCost * 100) / 100 },
         note: partyNote,
       });
-      // WHAT COULD NOT BE SATISFIED, ON ITS OWN ROW. Written only when the clamp
-      // or a carve-out bit, so an ordinary cascade is byte-identical to before.
+      // WHAT COULD NOT BE SATISFIED, ON ITS OWN ROW. Written only when the floor
+      // cut a line — central held less than the line asked — so an ordinary
+      // cascade is byte-identical to before. EVERY LINE ON IT IS A CLAMP
+      // (round 10): reason 'central_floor' and each line's central_stock_recipe
+      // are the balance the floor read. Round 9 also listed the two carve-outs
+      // here with central_stock_recipe 0 while central held 27,000 ml and
+      // 127,334 g — false on both counts; those lines are now debited like any
+      // other (above) and appear here only if central was actually short.
       //
       // IT IS A THIRD, SEPARATE EVENT TYPE ON PURPOSE. cascadeDeductionWitness
       // below decides what a void may undo from exactly two names —

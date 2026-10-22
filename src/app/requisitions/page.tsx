@@ -1471,9 +1471,29 @@ function RequisitionDetail({ r, materials, viewer, requireMgmt, reload, onEdit }
                 const avgPerPU = (it.average_price || 0) * U.pf;
                 // Small "= N g" recipe hint under a purchase-unit figure. no-underline
                 // keeps it legible on the struck-through rejected rows.
-                const hint = (q: number) => U.pf > 1
-                  ? <div className="text-[9px] text-[#B8A590] font-normal no-underline">= {fmtNum(U.toRecipe(q))} {U.recipeUnit}</div>
-                  : null;
+                // On an UNPACKED material (pf 1) the exact figure when the 3-dp
+                // lead hides it (round 10) — the store desk's rule (its
+                // fmtTakeHint): the shelf take records WHOLE DHANIYA 3.2174 kg and
+                // WHITE DAL 3.1504999999999996 kg, which this table printed as
+                // "Issued 3.217 kg" and "3.15 kg" (round-9 verifier,
+                // v_d_detail_dhaniya / v_d_detail_wdal). `lead` is the string
+                // printed above it, so a figure is never repeated.
+                const hint = (q: number, lead = fmtNum(U.toPU(q))) => {
+                  if (U.pf > 1) return <div className="text-[9px] text-[#B8A590] font-normal no-underline">= {fmtNum(U.toRecipe(q))} {U.recipeUnit}</div>;
+                  const r = Math.round((Number(q) || 0) * 1e6) / 1e6;
+                  const ex = r.toLocaleString('en-IN', { maximumFractionDigits: 6 });
+                  return r > 0 && ex !== lead
+                    ? <div className="text-[9px] text-[#B8A590] font-normal no-underline">= {ex} {U.recipeUnit}</div>
+                    : null;
+                };
+                // The Issued lead never reads "0" over a real crumb (round 10):
+                // the store desk's fmtHandOverPU — below 0.001 the unrounded
+                // purchase figure through fmtCapPU (0.0004 kg for 0.4 g).
+                const issuedLead = (q: number) => {
+                  const v = Number(q) || 0;
+                  const pu = U.isPU ? v : v / (U.pf || 1);
+                  return pu > 0 && pu < 0.001 ? fmtCapPU(pu, U.pf) : fmtNum(U.toPU(v));
+                };
                 // Rejected lines get strikethrough + faded; rest render normal.
                 const rowCls = `border-t border-[#E8D5C4]/50 ${rejected ? 'opacity-50 line-through bg-red-50/30' : ''}`;
                 return (
@@ -1509,7 +1529,7 @@ function RequisitionDetail({ r, materials, viewer, requireMgmt, reload, onEdit }
                     {storeHasIssued && (
                       <>
                         <td className="py-1 px-2 text-right font-mono text-emerald-700">
-                          {rejected ? '—' : <>{fmtNum(U.toPU(it.quantity_issued))} {puLbl}{hint(it.quantity_issued || 0)}</>}
+                          {rejected ? '—' : <>{issuedLead(it.quantity_issued || 0)} {puLbl}{hint(it.quantity_issued || 0, issuedLead(it.quantity_issued || 0))}</>}
                         </td>
                         <td className="py-1 px-2 text-right font-mono text-blue-700">
                           {rejected ? '—' : <>{fmtNum(U.toPU(it.quantity_to_purchase))} {puLbl}{hint(it.quantity_to_purchase || 0)}</>}
@@ -2379,8 +2399,20 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
           ? Math.round((plan.shownAvailable * pfm / reqFactor) * 1e6) / 1e6
           : gAvail > 0 ? (gAvail / 1e6) / reqFactor : 0;
       })();
+      // A LIQUOR / store-mapped INTERNAL line (round 10). The paragraph above
+      // says the screen cannot know which those are; since round 8b the payload
+      // says so (central_flow_blocked, the server's own centralFlowBlock), and
+      // the server issues such a line whatever the central figure reads
+      // (store_mapped carve-out). The floor does not govern it, so neither does
+      // this cap: it is seeded exactly as production seeds it (62aa895 — the
+      // demand when the books are at or below zero, otherwise the smaller of the
+      // demand and the books), and centralCapOf exempts it. Capped here it seeded
+      // a blank box over a line the server fulfils (round-9 verifier,
+      // v_c_int_liquor_held). The already-issued floor stays, as on every line.
+      const flowBlocked = Number((it as any).central_flow_blocked || 0) > 0;
       const issuable = isPartyReq ? partySeed
         : !stockKnown ? effective
+        : flowBlocked ? Math.max(alreadyIssued, bookStock > 0 ? Math.min(effective, stockInReqUnits) : effective)
         : Math.max(alreadyIssued, Math.min(effective, alreadyIssued + Math.max(0, stockInReqUnits)));
       // (There used to be a `const shortfall = effective - issuable` here, frozen
       //  into the Buy box below. See the note above buyInPurchaseUnit.)
@@ -2655,11 +2687,32 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
   // this figure is what the Buy box follows, and a held line's rest is issued
   // later from the shelf on Issue Requisitions — following the whole
   // outstanding would order the shelf's own stock from a vendor. What the line
-  // still owes after this submit is printed beside it instead (the Shortfall
-  // cell's held note).
+  // still owes after this submit is owedAfterOf below — the figure the
+  // Shortfall column prints (round 10), with the Buy box's own basis named in
+  // the same cell.
+  // A STALE line taking everything (round 10, staleTakesAll — the re-read
+  // after a refusal failed) that THE RULE certainly closes owes nothing, as a
+  // take forecast would have said.
   const shortOf = (ln: Line) => {
     const tk = takeOf(ln);
-    return tk ? tk.owingLine : Math.max(0, ln.requested - issuedOf(ln));
+    if (tk) return tk.owingLine;
+    if (staleTakesAll(ln) && staleCapOutcome(ln)?.kind === 'closes') return 0;
+    return Math.max(0, ln.requested - issuedOf(ln));
+  };
+  /** What this line STILL OWES once the submit has gone through — what the
+   *  Shortfall column prints and the short count counts (round 10). shortOf
+   *  everywhere except a HELD line: the server leaves it exactly as it was, so
+   *  it owes everything it owed before, not "requested − typed" (20 kg typed 15
+   *  over a 14,842.4 g shelf printed "Shortfall 5 kg" beside "20 kg stays owed";
+   *  typed at its approved 14.843 kg it printed a green "0 kg" — round-9
+   *  verifier, v_m3_held_row / v_b_held_at_approved). The Buy box keeps
+   *  following shortOf, and the cell says so on that line. */
+  // A stale line taking everything owes what the SERVER's figure leaves
+  // (staleCapOutcome), not requested − typed.
+  const owedAfterOf = (ln: Line) => {
+    if (heldOf(ln)) return Math.max(0, ln.requested - ln.already_issued);
+    const so = staleTakesAll(ln) ? staleCapOutcome(ln) : null;
+    return so ? so.owedLine : shortOf(ln);
   };
 
   /* ──────────────────────────────────────────────────────────────────────────
@@ -2730,11 +2783,16 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
     // (round 9): the PO box ticked with no Buy qty raises no PO, so the
     // transfer runs and floors the line exactly as with the box unticked. Only
     // a submit that really raises a PO leaves the transfer for a later gesture.
-    // A liquor / store-mapped PARTY line is declined by the transfer, never
-    // refused, so it is exempt too (central_flow_blocked, round 8b). An
-    // internal one keeps its round-6 advisory cap and words: its seed is
-    // capped to the books, and the banner is what explains the blank box.
-    const exempt = isPartyReq && (!transferRuns() || !!ln.central_flow_blocked);
+    // A liquor / store-mapped line is exempt on EITHER rail
+    // (central_flow_blocked, round 8b): the party transfer declines it, never
+    // refuses it, and an internal issue of it is the store_mapped carve-out —
+    // the server issues it whatever the central figure reads. Round 9 exempted
+    // only the party line, so an internal one (VODKA 2 BTL over a central 0)
+    // printed "not issued, nothing is stored on this line" and "held — … 2 BTL
+    // stays owed" over a line the server fulfilled (round-9 verifier,
+    // v_c_int_liquor_held). Its seed is production's again (see the seed), so
+    // no banner has a blank box to explain.
+    const exempt = !!ln.central_flow_blocked || (isPartyReq && !transferRuns());
     const armed = !exempt && (ln.stock_known || !!srv);
     const base = isPartyReq ? 0 : ln.already_issued;
     const availRecipe = Math.max(0, Number(ln.current_stock) || 0);
@@ -2926,11 +2984,84 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
    *  opened with — the same purchase unit and the same shown figure (the In
    *  Stock column's U.stockPU)? Only then may a take be forecast from the
    *  snapshot for a line the server has spoken about. */
-  const serverAgrees = (l: Line, srv: ServerBlock) =>
-    l.stock_known
-    && String(srv.purchase_unit || '').toLowerCase().trim() === String(l.U.pu || '').toLowerCase().trim()
-    && Number.isFinite(Number(srv.available))
-    && Number(srv.available) === l.U.stockPU(Math.max(0, Number(l.current_stock) || 0));
+  // THE SERVER'S OWN FIGURE FOR A BALANCE, built from the snapshot the way
+  // checkCentralIssue builds `availablePurchase` (round 10): the shown figure,
+  // or — below the display — the crumb's 6-dp grid point carried through the
+  // pack. Round 9 compared the shown figure alone, so a 0.4 g shelf (shown 0,
+  // the server's 0.0004 kg) never "agreed": after the server's own "use it"
+  // the row read "Shortfall 0.001 kg = 0.6 g" and "⚠ 1 line is short" over a
+  // line the server closed (round-9 verifier, v_c_crumb_close). Compared on the
+  // grid, so the two renderings of one crumb are one balance.
+  const serverAgrees = (l: Line, srv: ServerBlock) => {
+    if (!l.stock_known) return false;
+    if (String(srv.purchase_unit || '').toLowerCase().trim() !== String(l.U.pu || '').toLowerCase().trim()) return false;
+    const a = Number(srv.available);
+    if (!Number.isFinite(a)) return false;
+    const r = Math.max(0, Number(l.current_stock) || 0);
+    const shown = l.U.stockPU(r);
+    if (shown > 0 || a >= 0.001) return a === shown;
+    return grid6(a * (l.U.pf || 1)) === grid6(r);
+  };
+  /** The server's refusal row for this line while it does NOT describe this
+   *  modal's snapshot (round 10) — the re-read after the refusal failed, or the
+   *  balance moved again. The snapshot is then known to be stale, so the
+   *  SERVER's figures are what this form prints for the line (In Stock, the 🚨
+   *  books, the take); a figure only the raw balance could give is not printed
+   *  at all. Not for a row sharing its material with another line: the server's
+   *  figure there is that row's share of the pool, not the balance. */
+  const staleSrvOf = (l: Line): ServerBlock | null => {
+    const srv = blockedRows[l.id];
+    if (!srv || serverAgrees(l, srv)) return null;
+    if (lines.some(o => o.id !== l.id && o.material_id === l.material_id)) return null;
+    return srv;
+  };
+  /** On a stale line, does the figure in the box take EVERYTHING the store
+   *  holds? The server's shown-figure rule: the ask's shown figure IS the
+   *  server's (a shown figure, 0.001 or more). Then what the line records is
+   *  the raw balance, which only the server knows (the re-read failed). */
+  const staleTakesAll = (l: Line): boolean => {
+    const ss = staleSrvOf(l);
+    if (!ss) return false;
+    const a = Number(ss.available) || 0;
+    if (!(a > 0)) return false;
+    const base = isPartyReq ? 0 : l.already_issued;
+    const askRecipe = Math.round((issuedOf(l) - base) * (l.req_factor || 1) * 1e6) / 1e6;
+    if (!(askRecipe > EPSQ)) return false;
+    // A crumb (below the display) is carried at its exact grid point, so the
+    // take of it is the typed figure itself — all of it when they are equal.
+    return a >= 0.001 ? l.U.stockPU(askRecipe) === a : grid6(askRecipe) === grid6(a * (l.U.pf || 1));
+  };
+  /** A stale line taking everything the store holds: what it leaves the line
+   *  at, from the server's shown figure alone. That figure pins the raw balance
+   *  to within half a printed step, so THE RULE's answer (the take empties the
+   *  shelf; the line closes while less than one printed step is owed) is
+   *  certain unless the owed figure straddles that step — then 'unknown', and
+   *  the form says the exact figure is decided on submit. */
+  const staleCapOutcome = (l: Line): { kind: 'closes' | 'open' | 'unknown'; owedLine: number; exact: boolean } | null => {
+    const ss = staleSrvOf(l);
+    if (!ss) return null;
+    const a = Number(ss.available) || 0;
+    if (!(a > 0)) return null;
+    const pf = l.U.pf || 1, f = l.req_factor || 1;
+    const base = isPartyReq ? 0 : l.already_issued;
+    const half = 0.0005 * pf;                 // recipe: shown(B) = a ⇔ B within half a printed step
+    const step = (0.001 * pf) / f;            // one printed step, LINE unit
+    const owe = (recipe: number) => l.requested - base - recipe / f;
+    if (a < 0.001) {                          // a crumb: its exact grid point, no straddle
+      const owed = owe(grid6(a * pf) / 1e6);
+      return grid6(owed) < grid6(step)
+        ? { kind: 'closes', owedLine: 0, exact: true }
+        : { kind: 'open', owedLine: Math.max(0, owed), exact: true };
+    }
+    const mid = owe(a * pf), lo = owe(a * pf + half), hi = owe(a * pf - half);
+    if (hi < step - EPSQ) return { kind: 'closes', owedLine: 0, exact: true };
+    return { kind: lo >= step - EPSQ ? 'open' : 'unknown', owedLine: Math.max(0, mid), exact: false };
+  };
+  /** Typed down to the cap, does the line close (round 10)? capClosesLine on
+   *  the snapshot, or — on a stale line — the server-figure outcome above. */
+  const closesByCap = (l: Line): boolean => (staleSrvOf(l)
+    ? staleCapOutcome(l)?.kind === 'closes'
+    : capClosesLine(l));
   /* DOES THE PARTY TRANSFER RUN ON THIS SUBMIT? (round 9) — store-process 3a's
      own trigger, `!linkedPoId && poDropped.length === 0` (a party line is never
      held on the internal rail, so its heldItemIds clause is always empty here).
@@ -2956,7 +3087,17 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
      mapping rule); "still owes" is the server's pre-transfer reading — the
      typed figure short of the approved one, BEFORE any take (a line only the
      take could close is still the shortfall the buyer meant to order). A Buy
-     line that goes onto a PO stops it, as before. */
+     line that goes onto a PO stops it, as before.
+     "DROPPED" IS BOTH OF THE SERVER'S DROP KINDS (round 10) — its poDropped is
+     'unmapped_vendor' OR 'store_mapped', and the rail guard runs FIRST: a Buy
+     line on a liquor / store-mapped material (central_flow_blocked, the same
+     centralFlowBlock the route asks) never reaches the PO whatever vendor is
+     picked. Read as "goes onto a PO" it decided the transfer would not run, so
+     a party requisition with a liquor Buy line on a line issued in full showed
+     no over-shelf warning and promised a vendor PO, while the server dropped
+     the line, ran the transfer and refused the whole issue (never-stuck
+     recheck, md-liquor). isDroppedBuy is that predicate, shared with the
+     footer. */
   let transferMemo: boolean | null = null;
   const transferRuns = (): boolean => {
     if (!isPartyReq) return false;
@@ -2964,7 +3105,7 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
     if (transferMemo === null) {
       transferMemo = true;                       // provisional, while the Buy figures are read
       const blocks = (l: Line) => buyOf(l) > 0
-        && (!(hasVendor(l) && !!mappingWarning(l)) || issuedOf(l) + EPSQ < l.requested);
+        && (!isDroppedBuy(l) || issuedOf(l) + EPSQ < l.requested);
       if (lines.some(blocks)) {
         transferMemo = false;
         takeMemo = null;                         // built under the provisional answer — rebuild
@@ -3162,6 +3303,15 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
     }
     return null;
   };
+  /** A Buy line on a liquor / store-mapped material (round 10): store-process's
+   *  rail guard drops it as 'store_mapped' BEFORE the vendor mapping is asked —
+   *  it never goes on a Central Store PO, whatever vendor is picked. Known from
+   *  the payload (central_flow_blocked), so not advisory. */
+  const isRailBuy = (ln: Line) => !!ln.central_flow_blocked;
+  /** Will the server DROP this Buy line from the PO? Its poDropped, both kinds:
+   *  'store_mapped' (isRailBuy) or 'unmapped_vendor' (a vendor named and refused
+   *  by the mapping rule — advisory, silent until the index loads). */
+  const isDroppedBuy = (ln: Line) => isRailBuy(ln) || (hasVendor(ln) && !!mappingWarning(ln));
 
   /* Lines the central store's books cannot cover in full — the set the red
      banner is about. Derived through centralCapOf, so the banner, the row and
@@ -3169,7 +3319,10 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
   // A line THE RULE closes by the shelf on this submit (takeOf: the take
   // empties the shelf and less than one printed step is left owing) is not one
   // the books "cannot cover" — there is no rest to receive stock for (round 8b).
-  const cappedLines = lines.filter(ln => centralCapOf(ln).capped && !takeOf(ln)?.byShelf);
+  // Nor is a stale line (round 10, staleCapOutcome) the server's own figure
+  // certainly closes when it takes everything.
+  const cappedLines = lines.filter(ln => centralCapOf(ln).capped && !takeOf(ln)?.byShelf
+    && !(staleTakesAll(ln) && staleCapOutcome(ln)?.kind === 'closes'));
   /** Lines currently holding a quantity the server will hold back (not issue). */
   const overCapLines = lines.filter(ln => overCapOf(ln));
   /** Lines that clear the floor AND hand goods over on this submit — the
@@ -3199,9 +3352,14 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
   // A cross-line SUM of shortfalls mixes units (kg + BTL + pcs) and is
   // meaningless as a number — count the lines that are short instead.
   // shortOf, not a bare subtraction: a line THE RULE will close by the shelf
-  // (takeOf) is not short — nothing more can be issued on it.
-  const shortLineCount = lines.filter(ln => shortOf(ln) > 0).length;
-  const totalShortfall = lines.reduce((s, ln) => s + shortOf(ln), 0);
+  // (takeOf) is not short — nothing more can be issued on it. owedAfterOf
+  // (round 10): a HELD line is short by everything it owes, whatever was typed.
+  // A stale line the server's figure cannot settle (staleCapOutcome
+  // 'unknown') is NOT counted as short — it may close — and the short banner
+  // names it apart (round 10).
+  const unsureLines = lines.filter(ln => !overCapOf(ln) && staleTakesAll(ln) && staleCapOutcome(ln)?.kind === 'unknown');
+  const shortLineCount = lines.filter(ln => owedAfterOf(ln) > 0 && !unsureLines.includes(ln)).length;
+  const totalShortfall = lines.reduce((s, ln) => s + owedAfterOf(ln), 0);
   const poTotal = lines.reduce((s, ln) => s + (buyOf(ln) * priceOf(ln)), 0);
 
   const submit = async () => {
@@ -3341,6 +3499,32 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
         if (!rid) continue;
         if (String(b?.code || '').toLowerCase() !== 'central_stock_short') continue;
         byItem[rid] = b;
+      }
+      // RE-READ THE BALANCE (round 10). The refusal carries the balance only as
+      // its SHOWN figure, and the rest of this form reads the snapshot taken
+      // when the modal opened. When another desk moved the shelf in between,
+      // that snapshot is stale: after the server's own "use it" the row printed
+      // "= 14,842 g", "Shortfall 0.001 kg = 1 g", the 🚨 panel "(books: 20,000 g)
+      // To issue the rest, get the stock received…", In Stock "20 kg" beside the
+      // server's "holds only 14.842 kg", and "⚠ 1 line is short" — and the
+      // server took the whole 14,842.4 g and fulfilled the requisition (round-9
+      // verifier, v_a_stale_useit). The same GET the page opened the modal
+      // with refreshes current_stock — the balance ONLY: typed figures, seeds and
+      // every other field stay as they are. If it fails, the snapshot stays and
+      // the server's own figures are printed for the refused lines (staleSrvOf).
+      if (Object.keys(byItem).length > 0) {
+        try {
+          const g = await fetch(`/api/requisitions?id=${req.id}`);
+          if (g.ok) {
+            const d = await g.json();
+            const fresh = new Map<string, any>(
+              (Array.isArray(d?.requisition?.items) ? d.requisition.items : []).map((it: any) => [String(it.id), it]));
+            setLines(p => p.map(ln => {
+              const it = fresh.get(ln.id);
+              return it && stockIsKnown(it) ? { ...ln, current_stock: Number(it.current_stock), stock_known: true } : ln;
+            }));
+          }
+        } catch { /* keep the snapshot — staleSrvOf prints the server's figures */ }
       }
       setBlockedRows(byItem);
       // The rows the server named, from either field — `blocked[]` carries them
@@ -3689,9 +3873,15 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
               second half rather than "never". */}
           {req.purpose === 'party' && (
             <p className="text-[10px] px-3 py-2 bg-indigo-50 border border-indigo-200 rounded text-indigo-900">
+              {/* Round 10: the trigger is store-process's round-9 one — a dropped
+                  purchase line stops the transfer only while its own line is
+                  still owed (poDroppedOwing). "no purchase line is dropped" was
+                  false the moment a dropped Buy line sat on a line issued in
+                  full: the transfer ran on that very submit. */}
               <b>Party requisition.</b> These goods move on the party rail — store → department — not through the issue
-              debit above. That transfer runs on this submit only if no vendor PO is raised and no purchase line is
-              dropped; otherwise it runs later, when the requisition is completed on Store Requisitions.
+              debit above. That transfer runs on this submit unless a vendor PO is raised, or a purchase line is
+              dropped on a line this submit leaves short; otherwise it runs later, when the requisition is completed on
+              Store Requisitions.
             </p>
           )}
           <p className="text-[10px] text-[#8B7355] italic">
@@ -3767,19 +3957,25 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                         ? <>the books hold <b>{fmtCapPU(c.booksPU, c.pf)} {c.purchaseUnit}</b>, and all of it goes to {sharedTarget(c.sharedWith)} for the same item, so nothing can be issued on this line.</>
                         : c.empty
                         ? <>the books hold <b>none of it</b>, so nothing can be issued on this line.</>
-                        : capClosesLine(ln)
+                        : closesByCap(ln)
                         /* Round 9: typed down to that figure the take is the whole
                            shelf and THE RULE closes the line — there is no "rest"
                            for a delivery or a count to cover (md_party_typed_full
                            printed "To issue the rest, get the stock received"
-                           beside the ⛔ panel's "the line closes"). */
+                           beside the ⛔ panel's "the line closes"). Round 10: on a
+                           stale line, decided from the server's figure. */
                         ? <>the books hold <b>{fmtCapPU(c.availPU, c.pf)} {c.purchaseUnit}</b> of the {fmtNum(ln.U.toPU(ln.requested))} {ln.U.pu} asked — issue up to that, not more. That takes
                             everything the store holds and the line closes: what is still owed is below the 0.001 {ln.U.pu} the store can issue.</>
+                        : staleCapOutcome(ln)?.kind === 'unknown'
+                        ? <>the books hold <b>{fmtCapPU(c.availPU, c.pf)} {c.purchaseUnit}</b> of the {fmtNum(ln.U.toPU(ln.requested))} {ln.U.pu} asked — issue up to that, not more. That takes
+                            everything the store holds; whether the line then closes is decided by its exact balance on submit.</>
                         : <>the books hold <b>{fmtCapPU(c.availPU, c.pf)} {c.purchaseUnit}</b> of the {fmtNum(ln.U.toPU(ln.requested))} {ln.U.pu} asked — issue up to that, not more.</>}
                       {/* The exact stored figure stays visible, negative and
                           all: current_stock is a MATERIAL-level RECIPE figure,
-                          so stockPU / the raw value, never the line-basis toPU. */}
-                      {ln.U.pf > 1 && (
+                          so stockPU / the raw value, never the line-basis toPU.
+                          Not on a stale line (round 10, staleSrvOf): that figure
+                          is the snapshot the server has just contradicted. */}
+                      {ln.U.pf > 1 && !staleSrvOf(ln) && (
                         <span className="text-[10px] text-red-800"> (books: {fmtNum(ln.current_stock)} {ln.U.recipeUnit})</span>
                       )}
                     </li>
@@ -3789,7 +3985,7 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
               <div className="text-[10px]">
                 {/* Only while some listed line leaves a rest (round 9): a line
                     the cap closes owes nothing anyone can issue. */}
-                {cappedLines.some(ln => !capClosesLine(ln)) && (<>
+                {cappedLines.some(ln => !closesByCap(ln)) && (<>
                 To issue the rest, get the stock <b>received</b> or a <b>closing count recorded</b> first — that is what
                 re-bases the balance the store is measured against. A{' '}
                 <a href="/purchase-orders" className="underline">vendor PO</a> is only the answer if the material is
@@ -3901,7 +4097,7 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                       of" — it is Requested minus what you are handing over on
                       this line, which is also what the Buy box follows. */}
                   <th className="text-right py-1.5 px-2 font-medium"
-                      title="Requested (or HOD-approved) minus Issue Now — what this department is still owed after this hand-over. The Buy box follows this figure until you type over it.">Shortfall</th>
+                      title="What this department is still owed after this hand-over — requested (or HOD-approved) minus Issue Now; a line the store will NOT issue (held) still owes all of it. The Buy box follows requested minus Issue Now until you type over it.">Shortfall</th>
                   {raisePo && <>
                     <th className="text-right py-1.5 px-2 font-medium"
                         title="Quantity to put on the vendor PO. Starts at the Shortfall beside it and is fully editable — type one on any line to order it, whatever the shortfall says; clear it to leave the item off the PO.">Buy</th>
@@ -3951,7 +4147,9 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                   // by the shelf (takeOf, round 8). shortOf is 0 on a line the
                   // shelf closes; on every other row it is the subtraction below.
                   const take = takeOf(ln);
-                  const short = shortOf(ln);
+                  // What the line still owes after the submit (owedAfterOf,
+                  // round 10) — on a HELD line everything, not requested − typed.
+                  const short = owedAfterOf(ln);
                   /* OVER-ISSUE. The field is seeded with the APPROVED qty
                      (min(approved, stock)), so a store that physically handed
                      over more had no way to know it could type the real figure —
@@ -3977,6 +4175,14 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                      see), and the server refuses regardless. */
                   const cap      = centralCapOf(ln);
                   const overCap  = overCapOf(ln);
+                  /* A STALE line (round 10): the server refused it over a balance
+                     this modal's snapshot does not hold, and the re-read failed.
+                     staleAll — the box takes everything the store holds, so what
+                     the line records is the raw balance only the server knows;
+                     staleOut — what that leaves the line at, from its figure. */
+                  const staleSrv = staleSrvOf(ln);
+                  const staleAll = !overCap && staleTakesAll(ln);
+                  const staleOut = staleAll ? staleCapOutcome(ln) : null;
                   /** Recipe-unit hint under a purchase-lead figure. Takes a qty in
                    *  the LINE's stored unit — same signature as the approve grid's
                    *  hint(), so the two screens print identical equivalents. */
@@ -4039,10 +4245,19 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                           cover and the storekeeper's eye lands on the number
                           rather than only on the banner above. */}
                       <td className={`py-1.5 px-2 text-right font-mono ${negStock || cap.capped ? 'text-red-700 font-bold' : 'text-[#6B5744]'}`}
-                          title={`= ${fmtNum(ln.current_stock)} ${U.recipeUnit} (exact)`}>
+                          title={staleSrv
+                            ? `The central store's own figure when it refused this issue — the balance has moved since this window opened, and its exact figure could not be re-read. Close and reopen the window for it.`
+                            : `= ${fmtNum(ln.current_stock)} ${U.recipeUnit} (exact)`}>
                         {/* On hand is a MATERIAL-level recipe figure — stockPU,
-                            never toPU (which reads the LINE's basis). */}
-                        {U.pf > 1
+                            never toPU (which reads the LINE's basis).
+                            A STALE line (round 10, staleSrvOf) prints the
+                            server's figure instead: the snapshot is the one the
+                            server has just contradicted ("20 kg" beside "holds
+                            only 14.842 kg"). */}
+                        {staleSrv
+                          ? <>{fmtCapPU(Math.max(0, Number(staleSrv.available) || 0), U.pf)} {String(staleSrv.purchase_unit || U.pu)}
+                              <div className="text-[9px] text-[#B8A590] font-normal font-sans">the store&apos;s figure at the refusal</div></>
+                          : U.pf > 1
                           ? <>{fmtNum(U.stockPU(ln.current_stock))} {U.pu}{negStock && ' ⚠'}
                               <div className="text-[9px] text-[#B8A590] font-normal">
                                 = {fmtNum(ln.current_stock)} {U.recipeUnit}
@@ -4176,26 +4391,60 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                           ? <div className="text-[9px] text-red-700 font-normal">
                               {U.pf > 1 && <>= {fmtNum(U.toRecipe(issued))} {U.recipeUnit} asked — </>}not issued, nothing is stored on this line
                             </div>
-                          : hint(take?.changed ? take.recordedLine : issued)}
+                          : staleAll && staleOut && !staleOut.exact
+                            /* Round 10: the figure stored is the raw balance, which
+                               the failed re-read did not bring — not claimed. */
+                            ? <div className="text-[9px] text-emerald-800 font-normal font-sans max-w-[10rem] ml-auto">
+                                takes everything the store holds — the exact figure the line stores is recorded on submit
+                              </div>
+                            : hint(take?.changed ? take.recordedLine : issued)}
                       </td>
                       <td className="py-1.5 px-2 text-right font-mono">
                         {/* requested − issued: both stored-basis, printed in PU. */}
                         {short > 0
                           ? <span className="text-amber-700">{fmtNum(U.toPU(short))} {U.pu}</span>
                           : <span className="text-emerald-700">0 {U.pu}</span>}
-                        {short > 0 && hint(short)}
-                        {/* A HELD line (heldOf): the figure above is requested −
-                            typed, which the Buy box follows; what the line owes
-                            once this submit has issued the rest is everything it
-                            owed before — said here, beside it (round 9). */}
+                        {short > 0 && (staleOut && !staleOut.exact ? null : hint(short))}
+                        {/* A STALE line taking everything (round 10): the figure
+                            above is what the server's own figure leaves — exact
+                            to within half a printed step, said so. */}
+                        {staleOut && (
+                          <div className="text-[9px] font-sans text-[#8B7355] mt-0.5 text-right max-w-[14rem] ml-auto">
+                            {staleOut.kind === 'closes'
+                              ? <>takes everything the store holds and the line closes — what is left is below the 0.001 {U.pu} the store can issue</>
+                              : staleOut.kind === 'unknown'
+                                ? <>or less — takes everything the store holds; whether the line closes is decided by its exact balance on submit</>
+                                : staleOut.exact
+                                  ? <>takes everything the store holds; this stays owed</>
+                                  : <>about — takes everything the store holds; the exact figure is recorded on submit</>}
+                          </div>
+                        )}
+                        {/* A HELD line (heldOf): the figure above is everything
+                            the line owed before, because the server leaves it
+                            exactly as it was (round 10 — round 9 printed
+                            requested − typed there, beside this note). The Buy
+                            box still follows requested − typed (shortOf) — the
+                            line's rest is issued later from the shelf, so
+                            following the whole outstanding would order the
+                            shelf's own stock — and on this line that is no
+                            longer the figure above, so the cell says what the
+                            box follows. Not once he has typed in it. */}
                         {heldOf(ln) && (() => {
                           const owed = Math.max(0, ln.requested - ln.already_issued);
-                          return (
+                          const auto = autoBuyQty(ln);
+                          return (<>
                             <div className="text-[9px] font-sans text-red-800 mt-0.5 text-right max-w-[14rem] ml-auto font-semibold">
                               held — nothing goes out on this line, so {fmtNum(U.toPU(owed))} {U.pu}
                               {U.pf > 1 && <> (= {fmtNum(U.toRecipe(owed))} {U.recipeUnit})</>} stays owed
                             </div>
-                          );
+                            {raisePo && !ln.buy_touched && (
+                              <div className="text-[9px] font-sans text-[#8B7355] mt-0.5 text-right max-w-[14rem] ml-auto">
+                                {auto > 0
+                                  ? <>Buy box: {(Math.round(auto * 1e6) / 1e6).toLocaleString('en-IN', { maximumFractionDigits: 6 })} {ln.po_entry_unit} — it follows requested − the {fmtNum(U.toPU(issued))} {U.pu} typed, not the figure above</>
+                                  : <>Buy box stays empty — it follows requested − the {fmtNum(U.toPU(issued))} {U.pu} typed, which is 0</>}
+                              </div>
+                            )}
+                          </>);
                         })()}
                         {/* What leaves the shelf and what it leaves the line at —
                             only when the take is not the typed figure or THE RULE
@@ -4543,7 +4792,7 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                     return `${ln.material_name} (books: ${c.empty ? 'none' : `${fmtCapPU(c.availPU, c.pf)} ${c.purchaseUnit}`})`;
                   }).join(', ')}
                   .{' '}
-                  {refusedWhole && overCapLines.every(ln => capClosesLine(ln)) ? (
+                  {refusedWhole && overCapLines.every(ln => closesByCap(ln)) ? (
                     /* Round 8b: the cap takes everything left and closes the
                        line — there is no "rest" to receive stock for. */
                     <>Lower {one ? 'that line' : 'those lines'} to what the store can give — it then takes everything the
@@ -4596,9 +4845,30 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
             // Same predicate as submit()'s confirm — vendor named AND rejected
             // by the mapping rule. A line with no vendor yet is a different
             // problem and the footer's blocked-reason owns it.
-            const dropLines = buyLines.filter(ln => hasVendor(ln) && !!mappingWarning(ln));
-            const keepLines = buyLines.filter(ln => !dropLines.includes(ln));
+            // A liquor / store-mapped Buy line is dropped too (round 10,
+            // isRailBuy — the route's rail guard runs before the mapping rule),
+            // and it has its own remedy: the Liquor Store, never Vendor Items.
+            // PARTY REQUISITIONS ONLY: there the drop decides whether the party
+            // transfer runs (transferRuns / isDroppedBuy), which the clamp's own
+            // banner and caps forecast, so the footer has to agree with them.
+            // On any other purpose no transfer and no clamp cap is involved, and
+            // production's footer — which counts such a line onto the PO — is
+            // kept exactly as it was (round 10 suites-and-scope; the false
+            // promise there is an owner decision, not a clamp floor).
+            // With none on the grid every sentence below is the one it was.
+            const railLines = isPartyReq ? buyLines.filter(ln => isRailBuy(ln)) : [];
+            const dropLines = buyLines.filter(ln => !railLines.includes(ln) && hasVendor(ln) && !!mappingWarning(ln));
+            const keepLines = buyLines.filter(ln => !dropLines.includes(ln) && !railLines.includes(ln));
             const netTotal  = keepLines.reduce((s, ln) => s + buyOf(ln) * priceOf(ln), 0);
+            const railNames = railLines.map(ln => ln.material_name).join(', ');
+            const railOne = railLines.length === 1;
+            const railSentence = railLines.length === 0 ? null : (
+              <span className="text-amber-800 font-semibold">
+                {railNames} {railOne ? 'is a Liquor Store item' : 'are Liquor Store items'} — never a Central Store
+                purchase, so {railOne ? 'its Buy line is' : 'their Buy lines are'} DROPPED from the PO; buy{' '}
+                {railOne ? 'it' : 'them'} through Inventory → Liquor Store.
+              </span>
+            );
             return (
               <div className={`text-[11px] px-3 py-2 rounded border ${
                 buyLines.length === 0 ? 'bg-amber-50 border-amber-200 text-amber-900' : 'bg-blue-50 border-blue-200'}`}>
@@ -4614,7 +4884,17 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                      the server answers "No purchase order was raised" — so "0 of
                      1 Buy line go onto ONE vendor PO worth ₹0, created pending
                      admin approval" described a document that never exists. */
-                  keepLines.length === 0 ? (
+                  keepLines.length === 0 && railLines.length > 0 ? (
+                    <>On submit: the issue is recorded against the requisition, and <b>no vendor PO will be raised</b> —{' '}
+                      {railSentence}
+                      {dropLines.length > 0 && (
+                        <> <span className="text-amber-800 font-semibold">
+                          {dropLines.length} line{dropLines.length === 1 ? '' : 's'} will be DROPPED for an unmapped vendor
+                          ({dropLines.map(ln => ln.material_name).join(', ')}) — you will be asked to confirm.
+                        </span></>
+                      )}{' '}
+                      The Buy quantity stays recorded on the requisition.</>
+                  ) : keepLines.length === 0 ? (
                     <>On submit: the issue is recorded against the requisition, and <b>no vendor PO will be raised</b> —{' '}
                       <span className="text-amber-800 font-semibold">
                         {dropLines.length === 1 ? 'the only Buy line' : `all ${dropLines.length} Buy lines`} will be DROPPED for an
@@ -4632,13 +4912,23 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                         ({dropLines.map(ln => ln.material_name).join(', ')}) — you will be asked to confirm.
                       </span></>
                     )}
+                    {railSentence && <> {railSentence}</>}
                   </>
                 )}
               </div>
             );
           })() : totalShortfall > 0 ? (
             <div className="text-[11px] px-3 py-2 bg-amber-50 border border-amber-200 rounded">
-              ⚠ <b>{shortLineCount}</b> line{shortLineCount === 1 ? ' is' : 's are'} short of the requested qty above. To buy the rest, either tick "Also raise a vendor PO" above, or raise POs separately on the <a href="/purchase-orders" className="underline">Purchase Orders</a> page.
+              {/* Round 10: a stale line whose close the server's figure cannot
+                  settle (unsureLines) is named apart, as one that MAY be short.
+                  None ⇒ the sentence this banner always printed. */}
+              {unsureLines.length === 0 ? (
+                <>⚠ <b>{shortLineCount}</b> line{shortLineCount === 1 ? ' is' : 's are'} short of the requested qty above. To buy the rest, either tick "Also raise a vendor PO" above, or raise POs separately on the <a href="/purchase-orders" className="underline">Purchase Orders</a> page.</>
+              ) : (
+                <>⚠ {shortLineCount > 0 && <><b>{shortLineCount}</b> line{shortLineCount === 1 ? ' is' : 's are'} short of the requested qty above, and </>}
+                  {unsureLines.map(ln => ln.material_name).join(', ')} may {shortLineCount > 0 ? 'be too' : 'be short of the requested qty above'} — the
+                  store takes everything it holds, and its exact balance decides on submit. To buy the rest, either tick &quot;Also raise a vendor PO&quot; above, or raise POs separately on the <a href="/purchase-orders" className="underline">Purchase Orders</a> page.</>
+              )}
             </div>
           ) : overCapLines.length > 0 ? null : (
             <div className="text-[11px] px-3 py-2 bg-emerald-50 border border-emerald-200 rounded">
@@ -4646,7 +4936,7 @@ function StoreProcessModal({ req, onClose, onDone }: { req: Requisition; onClose
                   issued" — it owes less than one printed step the store cannot
                   give. Said so only when there is one; otherwise the original
                   sentence, byte for byte (round 8). */}
-              {lines.some(ln => takeOf(ln)?.byShelf)
+              {lines.some(ln => takeOf(ln)?.byShelf || (staleTakesAll(ln) && staleCapOutcome(ln)?.kind === 'closes'))
                 ? <>✓ Every line complete — the lines marked &quot;takes everything the store holds&quot; close below one printed step — requisition will move to <b>Fulfilled</b> on submit.</>
                 : <>✓ Every line fully issued — requisition will move to <b>Fulfilled</b> on submit.</>}
             </div>

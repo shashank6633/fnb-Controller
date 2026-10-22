@@ -1,6 +1,6 @@
 import type DatabaseT from 'better-sqlite3';
 import { getDb } from './db';
-import { packFactor, shownPurchaseQty, type PackMeta } from './pack-units';
+import { packFactor, toPurchaseQty, type PackMeta } from './pack-units';
 import { lineFactor, lineShownAs } from './issue-stock';
 import { issuedCoversAsk, shelfMarkHolds, qtyGrid, type ShownAs } from './central-debit-clamp';
 import { resolvePurchaseLogRange } from './purchase-log';
@@ -173,9 +173,12 @@ import { resolvePurchaseLogRange } from './purchase-log';
  * a basis.
  *
  * Per the owner rule (pack-units.ts), every row ALSO carries `purchase_qty`,
- * the same physical quantity in PURCHASE units. It is derived only through the
- * IMPORTED packFactor / shownPurchaseQty / lineFactor — never re-derived here — so
- * the both-halves guard holds:
+ * the same physical quantity in PURCHASE units — on the requisition chain at
+ * the six decimals its own figures carry (gridPu), production's toPurchaseQty
+ * on a cook (see STAGE_PU_RULE) — and `still_open_purchase`, what is still
+ * owed, on the same six decimals. It is derived only through the IMPORTED
+ * packFactor / toPurchaseQty / lineFactor — never re-derived here — so the
+ * both-halves guard holds:
  *
  *     pack_size > 1  AND  lower(trim(unit)) !== lower(trim(purchase_unit))
  *
@@ -359,7 +362,15 @@ export interface IssueLogRow {
    * with no basis is the exact misreading this report exists to prevent.
    */
   unit_basis: IssueLogQtyBasis;
-  /** Same physical quantity in PURCHASE units. null when the unit is ambiguous. */
+  /**
+   * Same physical quantity in PURCHASE units. null when the unit is ambiguous.
+   * On a requisition-chain row (REQUISITION, ISSUE, ISSUE_PRELEDGER, REVERSAL)
+   * it is carried to SIX DECIMALS of the purchase unit — the decimals the
+   * REQUISITION row's own figures carry, so a hand-over restates to the same
+   * figure its line's 'Issued To Date' prints, never a 3-dp rounding of it.
+   * On a cook (CONSUMPTION, CONSUMPTION_SKIP) it is production's
+   * toPurchaseQty. See STAGE_PU_RULE and gridPu.
+   */
   purchase_qty: number | null;
   purchase_unit: string;
 
@@ -373,7 +384,19 @@ export interface IssueLogRow {
   requested_qty: number | null;
   effective_qty: number | null;
   issued_qty: number | null;
+  /** In the row's own basis (`unit`): the line unit on a REQUISITION /
+   *  pre-ledger row, recipe units on an ISSUE row. */
   still_open: number | null;
+  /**
+   * `still_open` restated in PURCHASE units (`purchase_unit`), on the same six
+   * decimals as `purchase_qty` (gridPu) — the figure the page and the CSV lead
+   * with (owner rule: store screens lead with the purchase unit). Never 0 on a
+   * line still owed something: a remainder too small for six decimals is
+   * carried at six significant digits. null when `still_open` is null or the
+   * line unit is ambiguous (lineFactor needsReview), where only the row's own
+   * figure can be trusted.
+   */
+  still_open_purchase: number | null;
   fulfilment: 'FULL' | 'PART' | 'OPEN' | null;
 
   /**
@@ -537,7 +560,7 @@ const STAGE_BASIS: Record<IssueLogStage, string> = {
     + 'central and are shown exactly as they always were.',
   REVERSAL:
     'Goods handed BACK by a department to the central store — the department side of an undo or a '
-    + 'store rejection, in RECIPE units, from the department ledger. Shown as the positive quantity '
+    + 'lowered issued figure, in RECIPE units, from the department ledger. Shown as the positive quantity '
     + 'that went back. THIS IS THE SAME EVENT the ISSUE stage already carries as a NEGATIVE row: two '
     + 'views of one give-back, so never add them and never count a reversal twice. It carries no '
     + 'money for that reason — the ISSUE memo already nets it.',
@@ -624,6 +647,10 @@ const STAGE_LABEL: Record<IssueLogStage, string> = {
 
 const r2 = (n: unknown) => Math.round((Number(n) || 0) * 100) / 100;
 const r6 = (n: unknown) => Math.round((Number(n) || 0) * 1e6) / 1e6;
+/** A figure too small for the 6-dp grid, carried at SIX SIGNIFICANT DIGITS: it
+ *  keeps a real remainder from reading "0" without carrying float dust (THE
+ *  RULE's 2e-9 g remainder is 2e-9, not 1.9999999989472883e-9). */
+const sig6 = (n: number) => { const v = Number(n) || 0; return v === 0 ? 0 : Number(v.toPrecision(6)); };
 const num = (v: unknown): number => { const n = Number(v); return Number.isFinite(n) ? n : 0; };
 const nullNum = (v: unknown): number | null =>
   v === null || v === undefined ? null : (Number.isFinite(Number(v)) ? r6(Number(v)) : null);
@@ -656,54 +683,142 @@ function grnToken(raw: unknown): string | null {
 }
 
 /**
+ * WHICH purchase-unit restatement a stage gets. Two rules, one per kind of
+ * fact, and the choice is the stage's, never the row's:
+ *
+ *   grid        the REQUISITION CHAIN — REQUISITION, ISSUE, ISSUE (pre-ledger),
+ *               REVERSAL: every figure the clamp can shape (an ask, a hand-over,
+ *               a give-back, what is still owed). Restated to SIX DECIMALS of
+ *               the purchase unit (gridPu) — the decimals the REQUISITION row's
+ *               own figures carry (lineR6 of the line figure), so the rows of
+ *               one line print ONE figure for one quantity (round 10b):
+ *                 · a hand-over and its line's Issued To Date — THREE MANGO
+ *                   14,842.4 g "= 14.8424 kg" beside "Issued To Date 14.8424"
+ *                   (the round-9 HIGH: the 3-dp figure read 14.842, and 14,842.5 g
+ *                   read 14.843 — ROUNDED UP to the approved quantity on a take
+ *                   0.5 g short); SALTED BUTTER 1,000.2 g "= 2.0004 PKT"; TABASCO
+ *                   60 ML 415 ml "= 6.916667 BTL" beside "6.916667 of 7 BTL"
+ *                   (round 10 printed 6.91666667, a different rounding of the
+ *                   same 415/60); 14,842.4567 g "= 14.842457 kg" beside the kg
+ *                   line's "14.842457";
+ *                 · an ask and its own still-open lead — 14,842.6 g "= 14.8426 kg"
+ *                   and "OPEN still open 14.8426 kg" (round 10 restated the ask at
+ *                   the desks' 3-dp 14.843 beside an exact 14.8426, as if 0.0004
+ *                   kg had been handed over);
+ *                 · the same quantity on its ask and its hand-over — 14,842.4 g is
+ *                   14.8424 kg on both rows (round 10: 14.842 / 14.8424).
+ *               Identical to production's toPurchaseQty wherever the restatement
+ *               needs three decimals or fewer — every row of the live book
+ *               (measured on a copy, round 10b: 0 of 32,931 rows move a figure
+ *               against production). It differs where three decimals are not
+ *               enough: a sub-step shelf take, a gram line over a kg pack, a
+ *               1,000 ml ask of 750 ml bottles (1.333333 BTL, production 1.333).
+ *               On a pack that does not divide evenly (60, 300, 750 ml bottles)
+ *               the sixth decimal is a rounding, as the line's own figure is;
+ *               the page says so.
+ *   production  CONSUMPTION and CONSUMPTION (skipped). The clamp never touches
+ *               a cook, so these restate exactly as production does
+ *               (toPurchaseQty), and nothing on them may drift from it — the
+ *               page prints the whole row as production does, too.
+ *
+ * RECEIPT is purchase-basis already and is never divided (see toPu).
+ */
+type PuRule = 'grid' | 'production';
+const STAGE_PU_RULE: Record<IssueLogStage, PuRule> = {
+  RECEIPT: 'grid',
+  REQUISITION: 'grid',
+  ISSUE: 'grid',
+  ISSUE_PRELEDGER: 'grid',
+  REVERSAL: 'grid',
+  CONSUMPTION: 'production',
+  CONSUMPTION_SKIP: 'production',
+};
+
+/**
  * qty (in `basis`) -> purchase units, through the IMPORTED helpers only.
  *
  * DO NOT "simplify" this into a single division. Each basis needs a different
  * answer and one of the three must NOT be divided at all:
  *   purchase  purchases.quantity is ALREADY purchase units. Dividing it by the
  *             pack factor is the standing unit bug of this codebase.
- *   recipe    the honest conversion: shownPu below (packFactor, both halves,
- *             through shownPurchaseQty — the desks' own printed figure).
+ *   recipe    the honest conversion, by the stage's rule (STAGE_PU_RULE):
+ *             gridPu / toPurchaseQty, both through packFactor (both halves).
  *   line      Option B — the line is stored in its OWN unit, which may be
  *             either basis. lineFactor() decides, and refuses on a blank unit
  *             over a packed material rather than guess between g and kg.
  */
-function toPu(qty: number, basis: IssueLogQtyBasis, lineUnit: string, m: PackMeta): number | null {
+function toPu(
+  qty: number, basis: IssueLogQtyBasis, lineUnit: string, m: PackMeta, rule: PuRule,
+): number | null {
   if (basis === 'purchase') return r6(qty);
-  if (basis === 'recipe') return shownPu(qty, m);
-  const lf = lineFactor(lineUnit, m);
-  if (lf.needsReview) return null;
-  return shownPu(qty * lf.factor, m);
+  let recipe = Number(qty) || 0;
+  if (basis === 'line') {
+    const lf = lineFactor(lineUnit, m);
+    if (lf.needsReview) return null;
+    recipe *= lf.factor;
+  }
+  if (rule === 'grid') return gridPu(recipe, m);
+  return toPurchaseQty(recipe, m);
 }
 
 /**
- * A RECIPE quantity restated in the purchase unit THE WAY BOTH DESKS PRINT IT
- * (round 8) — pack-units.ts shownPurchaseQty (the 6-dp grid point, then integer
- * half-up), so this column agrees with "In store" / "In Stock" and with the
- * figure the server's shown-figure rule names:
- *   · FRESH CREAM 1 LTR 130,125.5 ml read "= 130.125 BTL" here through
- *     toPurchaseQty's division while both desks print 130.126;
- *   · SIGN-SYMMETRIC: an undo restates exactly as its issue did (−14,842.5 g
- *     read "−14.842 kg" against "14.843 kg", so a fully undone line netted
- *     +0.001 kg in this column);
- *   · NEVER 0 OVER A REAL CRUMB: the party-shelf correction row "−0.5 g" read
- *     "= 0 kg". A figure below one 0.001 step that is at least one grid step is
- *     carried at the grid, unrounded (the page prints it at that precision).
- * Identical to toPurchaseQty on every positive figure no float effect reaches.
+ * A RECIPE quantity restated in the purchase unit to SIX DECIMALS (round 10b)
+ * — the requisition chain's restatement (STAGE_PU_RULE 'grid').
+ *
+ * The quantity is snapped to its 6-dp recipe grid (an integer, which sheds the
+ * float dust an SQL debit leaves: 3.1504999999999996 is 3.1505), divided by the
+ * pack factor ONCE and rounded half-up to whole millionths of the purchase
+ * unit, in integer arithmetic — the same two steps lineR6 gives the
+ * REQUISITION row's own line figures, so a hand-over prints the figure its
+ * line prints:
+ *   14,842.4 g    -> 14.8424 kg     (the REQUISITION row's Issued To Date)
+ *   14,842.5 g    -> 14.8425 kg     (never 14.843, the approved figure)
+ *   14,842.4567 g -> 14.842457 kg   (the kg line's Issued To Date)
+ *   1,000.2 g     -> 2.0004 PKT     (500-g packs)
+ *   415 ml        -> 6.916667 BTL   (60-ml bottles: 415/60 rounded, as the
+ *                                    BTL line's 6.916667 is)
+ *   −0.5 g        -> −0.0005 kg     (the party-shelf correction; never "0 kg")
+ *   3.1505 kg     -> 3.1505 kg      (pack 1: the recipe figure IS the purchase one)
+ * SIGN-SYMMETRIC by construction: an undo restates as its issue did.
+ *
+ * NEVER 0 OVER SOMETHING REAL. A figure below half a millionth of the purchase
+ * unit (0.0004 g on a 1000-pack, or a remainder THE RULE still calls owed below
+ * the recipe grid — see getIssueLog) is carried as itself over the pack, at six
+ * significant digits, rather than rounded to 0: "still open 0" on an open line, or "= 0 kg" beside
+ * a real crumb, is the misreading this column exists to prevent.
  */
-function shownPu(recipeQty: number, m: PackMeta): number {
+function gridPu(recipeQty: number, m: PackMeta): number {
   const x = Number(recipeQty) || 0;
-  const g = Math.round(Math.abs(x) * 1e6);
-  if (g === 0) return 0;
-  // Below one printed step (0.001 purchase unit) the exact grid figure, not a
-  // rounding: 0.5 g is "0.0005 kg", never "0" and never a whole "0.001 kg".
-  const exact = (g / 1e6) / packFactor(m);
-  // No pack conversion (pack 1, or one unit for both): the recipe figure IS
-  // the purchase figure, so there is nothing to round — WHITE DAL 3.1505 kg
-  // is "= 3.1505 kg", never the "= 3.151 kg" a 3-dp restatement made of it
-  // beside its own recipe column (round 8b).
-  const v = exact < 0.001 || packFactor(m) <= 1 ? exact : shownPurchaseQty(g / 1e6, m);
+  if (x === 0) return 0;
+  const pf = packFactor(m);
+  const g = Math.round(Math.abs(x) * 1e6);   // the 6-dp recipe grid, an integer
+  const steps = Math.round(g / pf);           // whole millionths of the purchase unit
+  // Below half a millionth: the figure itself over the pack, at six significant
+  // digits — not its recipe-grid point, so a line kept in its purchase unit
+  // carries ONE figure in 'Still Open' and 'Still Open (purchase units)' (THE
+  // RULE's 2e-9 BTL remainder is 2e-9 in both, never 2.66667e-9 from 0.000002 ml).
+  const v = steps > 0 ? steps / 1e6 : sig6(Math.abs(x) / pf);
   return x < 0 ? -v : v;
+}
+
+/**
+ * A LINE-unit figure to six decimals, rounded THROUGH THE RECIPE GRID (round
+ * 10b): snapped to the 6-dp recipe grid by the line's own factor `lf` (recipe
+ * units per line unit), then half-up to whole millionths of the line unit, in
+ * integer arithmetic — exactly gridPu's two steps, so a line kept in its
+ * purchase unit carries the figure gridPu gives the same quantity on its
+ * ISSUE rows. A line in recipe units (lf <= 1) is on the grid already: r6.
+ * Identical to r6 on every figure of six decimals or fewer; it differs only
+ * at a half-millionth, where r6 of the line double rounds by its binary error
+ * (5.0000005 kg is held as 5.00000049999… and r6 reads 5) and this reads the
+ * decimal half-up, 5.000001 — as the ISSUE row's "= 5.000001 kg" does.
+ */
+function lineR6(lineQty: number, lf: number): number {
+  const x = Number(lineQty) || 0;
+  if (!(lf > 1)) return r6(x);
+  const g = Math.round(Math.abs(x) * lf * 1e6);
+  const v = Math.round(g / lf) / 1e6;
+  return v === 0 ? 0 : (x < 0 ? -v : v);
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
@@ -1780,8 +1895,18 @@ export function getIssueLog(
       pack_size: Number(r.rm_pack_size) || 1,
     };
     const basis = STAGE_QTY_BASIS[st];
-    const qty = r6(r.qty);
     const lineUnit = s(r.line_unit);
+    // A LINE-basis row (REQUISITION, pre-ledger) rounds its line figures to six
+    // decimals THROUGH THE RECIPE GRID, by the line's own factor (lineR6), so
+    // they are the very figures gridPu gives the same quantities on the line's
+    // ISSUE rows — at a half-millionth too, where a bare r6 of the line double
+    // and gridPu of the recipe one round opposite ways (round 10b, rule-sweep:
+    // 78 of 6,390 shapes, e.g. 2,413.498875 ml of 750-ml bottles read "Issued
+    // To Date 3.217998" over an ISSUE row "= 3.217999 BTL"). Identical to r6 on
+    // every figure of six decimals or fewer, so on every row of the live book.
+    const lfRow = basis === 'line' ? lineFactor(lineUnit, meta) : null;
+    const lineGrid = lfRow && !lfRow.needsReview ? lfRow.factor : 1;
+    const qty = basis === 'line' ? lineR6(Number(r.qty), lineGrid) : r6(r.qty);
 
     // RECEIPT link keys must be the SAME SHAPE purchase-log mints or the two
     // reports stop reconciling on a delivery. Requisition-chain keys name the
@@ -1798,11 +1923,14 @@ export function getIssueLog(
     // is recipe units. Restated through THAT ROW'S stored pack_factor so the row
     // reads in one basis. 1 on every other stage, so this is a no-op there.
     const sf = Number(r.snapshot_factor) || 1;
+    // Line rows through lineR6 (see `qty` above); an ISSUE row restated into
+    // recipe units by its own snapshot factor, on the recipe grid itself.
+    const rowFig = (x: number) => (basis === 'line' ? lineR6(x, lineGrid) : r6(x * sf));
     const requested = nullNum(r.requested_qty);
     const effective = r.effective_qty === null || r.effective_qty === undefined
-      ? null : r6(Number(r.effective_qty) * sf);
+      ? null : rowFig(Number(r.effective_qty));
     const issued = r.issued_qty === null || r.issued_qty === undefined
-      ? null : r6(Number(r.issued_qty) * sf);
+      ? null : rowFig(Number(r.issued_qty));
 
     // THE DESKS' "COMPLETE" — THE RULE, asked exactly as lineIssueComplete asks
     // it (see fulfilmentOf): the LINE-unit figures this row was built from,
@@ -1829,11 +1957,30 @@ export function getIssueLog(
     // A FULL line owes nothing, whichever arm closed it. Without this the row
     // printed "FULL" beside "still open 0.0005 kg" — the R1 stuck-line text.
     // A line THE RULE leaves open never prints "still open 0" either: a
-    // remainder below the 6-dp grid is carried exactly (the page prints it at
-    // the precision that names it).
+    // remainder below the 6-dp grid is carried at six significant digits (sig6:
+    // 2e-9, never float dust like 1.9999999989472883e-9), and the page prints it
+    // at the precision that names it.
     const owed = effLine === null || issuedLine === null ? 0 : (effLine - issuedLine) * sf;
+    const owedOpen = fulfilment === 'FULL' || !(owed > 0) ? 0 : owed;
+    const owedFig = owedOpen === 0 ? 0 : basis === 'line' ? lineR6(owedOpen, lineGrid) : r6(owedOpen);
     const stillOpen = effective === null || issued === null
-      ? null : fulfilment === 'FULL' || !(owed > 0) ? 0 : (r6(owed) > 0 ? r6(owed) : owed);
+      ? null : owedOpen === 0 ? 0 : (owedFig > 0 ? owedFig : sig6(owedOpen));
+    // OWNER RULE: what is still owed LEADS with the purchase unit (round 10).
+    // On the requisition chain's six decimals (gridPu, round 10b) — the figure
+    // the same line's other rows print for it: a 3-dp rounding would turn
+    // "0.6 g" into "0.001 kg" and "5.1576 kg" into "5.158 kg" beside the line's
+    // own figure, and round 10's finer exact figure printed TABASCO's 5 ml as
+    // "0.08333333 BTL" on the ISSUE row beside "0.083333 BTL" on its
+    // REQUISITION row. Restated from the UNROUNDED balance in recipe units —
+    // the line figure times the line's factor on a REQUISITION / pre-ledger
+    // row, the row's own recipe figure on an ISSUE row — so both rows round the
+    // one quantity once, the same way (a line in its purchase unit therefore
+    // carries the same figure in 'Still Open' and 'Still Open (purchase
+    // units)'). null where the line unit is ambiguous, as purchase_qty is.
+    const puRule = STAGE_PU_RULE[st];
+    const stillOpenPu = stillOpen === null || (lfRow && lfRow.needsReview) ? null
+      : owedOpen === 0 ? 0
+      : gridPu(basis === 'line' ? owedOpen * lineGrid : owedOpen, meta);
 
     return {
       stage: st,
@@ -1858,7 +2005,7 @@ export function getIssueLog(
       unit: s(r.unit),
       qty_basis: basis,
       unit_basis: basis,
-      purchase_qty: toPu(qty, basis, lineUnit, meta),
+      purchase_qty: toPu(qty, basis, lineUnit, meta, puRule),
       purchase_unit: s(r.rm_purchase_unit) || s(r.rm_unit),
       value: r.value === null || r.value === undefined ? null : r2(r.value),
       value_basis: STAGE_VALUE_BASIS[st],
@@ -1868,6 +2015,7 @@ export function getIssueLog(
       effective_qty: effective,
       issued_qty: issued,
       still_open: stillOpen,
+      still_open_purchase: stillOpenPu,
       fulfilment,
       stock_moved: r.stock_moved === null || r.stock_moved === undefined
         ? null : Number(r.stock_moved) === 1,
@@ -1941,6 +2089,9 @@ export const ISSUE_LOG_COLUMNS: IssueLogColumn[] = [
   { key: 'requested_qty',     label: 'Requested', numeric: true },
   { key: 'effective_qty',     label: 'Approved / Effective', numeric: true },
   { key: 'issued_qty',        label: 'Issued To Date', numeric: true },
+  // The purchase-unit figure FIRST (owner rule, round 10), then the row's own:
+  // 'Still Open' stays in the row's unit (the Unit column), as it always was.
+  { key: 'still_open_purchase', label: 'Still Open (purchase units)', numeric: true },
   { key: 'still_open',        label: 'Still Open', numeric: true },
   { key: 'needs_unit_review', label: 'Needs Unit Review' },
   { key: 'status',            label: 'Document Status' },

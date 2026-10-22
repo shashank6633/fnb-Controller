@@ -242,6 +242,14 @@ export interface DeskTakeForecast {
    *  already moved (LINE units, 0 on a first transfer). The take is what the
    *  line holds above it, so a screen says "the line's remaining …". */
   movedLine?: number;
+  /** Party rail only (round 10): the transfer could NOT cover what the line
+   *  holds above the part already moved, and took what the shelf held instead
+   *  (possibly nothing): a remainder below one printed step (THE RULE then
+   *  closes the line), or a line the gesture did not issue on (it stays open
+   *  for the rest — the route names it on its 200 as `party_short`).
+   *  recordedLine is then the part already moved plus that take. See
+   *  party-fulfillment.ts "A TOP-UP THE SHELF CANNOT COVER". */
+  shortTake?: boolean;
 }
 
 /**
@@ -307,17 +315,26 @@ export function forecastDeskTake(a: {
    moved for its material (`party_moved_recipe`, the transfer's own party rows
    summed per material), from that figure rather than from 0. A line with
    nothing above it is skipped. Everything else here is unchanged.
+   ROUND 10 — A TOP-UP THE SHELF CANNOT COVER DOES NOT REFUSE in two shapes
+   (party-fulfillment.ts): a remainder below one printed step, and a line the
+   gesture did not issue on. Either takes what the shelf holds (possibly
+   nothing) and records the part already moved plus that (`shortTake`); THE
+   RULE then decides the line — the first closes, the second stays open. Every
+   other line the shelf cannot cover is still a refusal, and every such line
+   is reported (`short`), as the server now names each one.
 
    WHEN IT RUNS ON /store-issue — the route's two branches, transcribed:
      · 'certain' — every line reads complete by THE RULE after the gesture's
        issue entries (and none is deferred): the transfer MUST run, and a line
        it cannot move refuses the WHOLE POST, every other line included;
-     · 'closes'  — not every line is complete yet, but the transfer, tried
+     · 'closes'  — not every line is complete yet, but the gesture ISSUED on a
+       line (round 10: a defer alone never tries it), and the transfer, tried
        inside a savepoint, takes the shelf and THE RULE then closes every line
-       (a defer on a line this gesture touched and the transfer completed is
-       dropped): the route keeps it and the requisition is fulfilled. Without
-       this a party line over a short shelf could never close on this desk —
-       the transfer waited for a completeness only the transfer could give;
+       (a defer on a line this gesture issued on that the transfer completed
+       is dropped; a deferred line it did not issue on keeps its defer): the
+       route keeps it and the requisition is fulfilled. Without this a party
+       line over a short shelf could never close on this desk — the transfer
+       waited for a completeness only the transfer could give;
      · 'none'    — anything else (the savepoint is unwound): no stock moves and
        nothing is refused.
    /store-process runs the transfer on every submit that raises no PO, drops
@@ -418,12 +435,17 @@ export function forecastDeskPartyTransfer(a: {
     return { l, approved, touched, qty, complete, deferred, rejected: !!a.rejectedOf(l) };
   });
   const certain = a.always || pre.every(p => p.rejected || (p.complete && !p.deferred));
+  // THE LINES THIS GESTURE ISSUES ON (round 10): `after`'s keys — the route's
+  // `issuedLines`. Only an issue tries the transfer, and only a line issued on
+  // may have a defer the transfer's take drops.
+  const issued = (p: { l: DeskPartyLine }) => a.after.has(p.l.id);
   if (!certain) {
-    // The route tries the transfer only where it could close every line: each
-    // open line carries a quantity, and a deferred one is touched by this
-    // gesture (its defer is dropped once the take completes it).
-    const could = pre.every(p => p.rejected || (p.complete && !p.deferred)
-      || (p.qty > 0 && (!p.deferred || p.touched)));
+    // The route tries the transfer only where the gesture issued and it could
+    // close every line: each open line carries a quantity, and a deferred one
+    // is issued on by this gesture (its defer is dropped once the take
+    // completes it).
+    const could = a.after.size > 0 && pre.every(p => p.rejected || (p.complete && !p.deferred)
+      || (p.qty > 0 && (!p.deferred || issued(p))));
     if (!could) return none;
   }
   // THE TRANSFER, LINE BY LINE (applyPartyFulfillment's loop).
@@ -466,6 +488,31 @@ export function forecastDeskPartyTransfer(a: {
     const askRecipe = Math.round((p.qty - movedLine) * basis.factor * 1e6) / 1e6;
     if (askRecipe <= DESK_RULE_EPS) continue;
     const plan = planDeskDebit((Number(raw) || 0) - already, askRecipe, basis.meta);
+    // A TOP-UP THE SHELF CANNOT COVER (round 10, party-fulfillment.ts): below
+    // one printed step, or on a line this gesture does not issue on (store-
+    // issue only — /store-process writes every line), it takes what the shelf
+    // holds and records the part already moved plus that; THE RULE decides.
+    const shortTake = !plan.fits && movedLine > 0 && (
+      deskGrid(askRecipe) < deskGrid(0.001 * (basis.pf || 1)) || (!a.always && !issued(p)));
+    if (shortTake) {
+      claimed.set(mat, already + plan.debit);
+      const recordedLine = movedLine + plan.debit / (basis.factor || 1);
+      const left = plan.available - plan.debit;
+      const emptied = !(left > 0 && deskGrid(left) > 0);
+      const inFull = deskCovers(recordedLine, p.approved, basis.step, false);
+      const complete = inFull || deskCovers(recordedLine, p.approved, basis.step, emptied);
+      const before = Number(p.l.quantity_issued) || 0;
+      takes[p.l.id] = {
+        plan, basis, askRecipe, recordedLine,
+        addedLine: recordedLine - before,
+        takeRecipe: plan.debit,
+        changed: true, emptied, complete,
+        byShelf: complete && !inFull,
+        owingLine: complete ? 0 : Math.max(0, p.approved - recordedLine),
+        rail: 'party', totalLine: p.qty, movedLine, shortTake: true,
+      };
+      continue;
+    }
     if (!plan.fits) {
       const gAvail = deskGrid(plan.available);
       const shownLine = plan.shownAvailable > 0
@@ -508,7 +555,7 @@ export function forecastDeskPartyTransfer(a: {
     if (p.rejected) return true;
     const tk = takes[p.l.id];
     const done = tk ? tk.complete : p.complete;
-    const deferred = p.deferred && !(p.touched && done);
+    const deferred = p.deferred && !(issued(p) && done);
     return done && !deferred;
   });
   return closes ? { runs: 'closes', takes, short: [], unknown } : none;
