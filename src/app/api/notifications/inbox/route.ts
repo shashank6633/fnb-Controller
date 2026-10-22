@@ -323,12 +323,15 @@ export async function GET() {
     // know, zero bells. This bucket is that alert's visible rail, built like
     // grn_qc_pending above (row written at the event, LIVE COUNT here).
     //
-    // WHO: exactly the people who can act — those who may send from the
-    // transfer's SENDING department (its head_user_id, an HOD posted there,
-    // managers, admin), through openDisputesToActFor(), which is the SAME
-    // figure GET /api/department-transfers returns as open_disputes_to_act.
+    // WHO: exactly the people who can act — those holding a control on the
+    // open dispute that the server will ACCEPT (a take-back whose prefill
+    // moves something, or a close canDismissDispute allows: access.ts
+    // hasDisputeActionFor), through openDisputesToActFor(), which is the SAME
+    // figure GET /api/department-transfers returns as open_disputes_to_act and
+    // the page lists under "Disputes for you to settle".
     // COUNT ≡ DESTINATION: it falls the moment the dispute is reversed or
-    // closed, and an HOD of another department is never badged.
+    // closed (or a count leaves nothing to press), and an HOD of another
+    // department is never badged.
     //
     // canAccessPage IS consulted, as for /grn/qc above: nobody is badged into
     // a page the proxy would bounce them from. The real Head Chef role carries

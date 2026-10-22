@@ -1,8 +1,8 @@
 import { getDb } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
-import { getDeptTransfer, reverseDeptTransfer, type TransferEntryUnit } from '@/lib/dept-ledger';
+import { getDeptTransfer, reverseDeptTransfer, deptTransferSettledNote, type TransferEntryUnit, type DeptReverseBasis } from '@/lib/dept-ledger';
 import {
-  loadDepartments, reverseAuthority, canSeeTransfer, presentTransfer, transferErrorResponse, resolveEntryUnit, bodyNumber,
+  loadDepartments, reverseAuthority, canSeeTransfer, canSendFrom, presentTransfer, transferErrorResponse, resolveEntryUnit, bodyNumber,
 } from '../../access';
 
 /**
@@ -19,6 +19,16 @@ import {
  *               is exactly `permissions.reverse_prefill` on the document: the
  *               open disputed quantities, or — sent back by the receiver's
  *               side with no dispute — everything still standing.
+ *   expect?:    [{ line_id, quantity, basis }] — the prefill the SCREEN
+ *               showed (`permissions.reverse_prefill`, its recipe-unit
+ *               `quantity` and its `basis` — 'disputed' settles the open
+ *               claim, 'standing' returns goods — echoed back unconverted).
+ *               With lines omitted, a prefill that differs from it now, in
+ *               quantity or in meaning, is refused 409 reason 'stale' and
+ *               nothing moves: a tap on a screen loaded before someone else
+ *               settled or closed the claim must not move the whole standing
+ *               line (dept-ledger "A STALE TAP MOVES NOTHING"). Omitted = no
+ *               screen: the prefill settles an OPEN dispute only.
  *   notes?:     free text, kept on the reverse document.
  *
  * Who (../access.ts reverseAuthority):
@@ -67,10 +77,23 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       const priorDoc = prior ? getDeptTransfer(db, prior.id) : null;
       if (priorDoc) {
         return Response.json({
-          transfer: presentTransfer(me, priorDoc, depts),
-          original: presentTransfer(me, doc, depts),
+          transfer: presentTransfer(me, priorDoc, depts, db),
+          original: presentTransfer(me, doc, depts, db),
           duplicate: true,
         }, { status: 200 });
+      }
+      // A take-back tapped on a screen loaded while the claim was open: the
+      // authority came from that claim, and someone else has settled it since.
+      // Say so — "only the head may" reads as a permissions fault, not as
+      // "already done".
+      const settled = doc.dispute_status === 'resolved' && canSendFrom(me, depts.get(doc.from_department_id))
+        ? deptTransferSettledNote(db, doc) : '';
+      if (settled) {
+        return Response.json({
+          error: `${doc.transfer_no} has no open dispute to settle any more. Nothing moved. Latest on its claims: ${settled}.`,
+          code: 'DEPT_TRANSFER_BLOCKED',
+          reason: 'stale',
+        }, { status: 409 });
       }
       return Response.json({
         error: `Only ${doc.to_department_name}'s head, a manager or an admin can send these goods back — or, while ` +
@@ -99,18 +122,48 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       if (lines.length === 0) lines = undefined;
     }
 
+    // What the screen showed — RECIPE units, the prefill's own figures. Read
+    // only for a prefill tap (lines omitted); dept-ledger compares it inside
+    // the reverse's own transaction, so two taps racing cannot both pass.
+    const rawExpect = body.expect ?? body.expect_prefill;
+    let expect: Array<{ lineId: string; quantity: number; basis?: DeptReverseBasis }> | undefined;
+    if (rawExpect !== undefined && rawExpect !== null && !lines) {
+      if (!Array.isArray(rawExpect)) return Response.json({ error: 'expect must be an array of { line_id, quantity, basis }' }, { status: 400 });
+      expect = [];
+      for (const e of rawExpect) {
+        const lineId = String(e?.line_id || '').trim();
+        if (!doc.lines.some((l) => l.id === lineId)) {
+          return Response.json({ error: `expect: line ${lineId || '(blank)'} is not on ${doc.transfer_no}` }, { status: 400 });
+        }
+        const q = bodyNumber(e?.quantity);
+        if (!Number.isFinite(q) || q < 0) {
+          return Response.json({ error: 'expect: quantity must be a number, 0 or more (the prefill\'s recipe-unit quantity)' }, { status: 400 });
+        }
+        // What the screen MEANT (permissions.reverse_prefill[].basis): settle
+        // the open claim ('disputed') or return goods ('standing'). Optional —
+        // when given, a different meaning now is refused like a different
+        // quantity (dept-ledger "THE QUANTITY ALONE IS NOT ENOUGH").
+        const b = e?.basis;
+        if (b !== undefined && b !== null && b !== 'disputed' && b !== 'standing') {
+          return Response.json({ error: "expect: basis must be 'disputed' or 'standing' (the prefill's own basis)" }, { status: 400 });
+        }
+        expect.push({ lineId, quantity: q, ...(b === 'disputed' || b === 'standing' ? { basis: b } : {}) });
+      }
+    }
+
     const res = reverseDeptTransfer(db, {
       transferId: doc.id,
       user: me.email,
       clientKey,
       lines,
+      expect,
       authority,
       notes: String(body.notes ?? body.note ?? '').trim(),
       outletId,
     });
     return Response.json({
-      transfer: presentTransfer(me, res.transfer, depts),
-      original: presentTransfer(me, res.original, depts),
+      transfer: presentTransfer(me, res.transfer, depts, db),
+      original: presentTransfer(me, res.original, depts, db),
       duplicate: res.duplicate,
     }, { status: res.duplicate ? 200 : 201 });
   } catch (e: any) {

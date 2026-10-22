@@ -2,9 +2,9 @@ import type Database from 'better-sqlite3';
 import type { SessionUser } from '@/lib/auth';
 import { generateId } from '@/lib/db';
 import { sendPushToUser } from '@/lib/push';
-import { countOpenDeptTransferDisputes, type DeptTransferWithLines, type DeptTransferDisputeRow } from '@/lib/dept-ledger';
+import type { DeptTransferWithLines, DeptTransferDisputeRow } from '@/lib/dept-ledger';
 import { toPurchaseQty } from '@/lib/pack-units';
-import { canSendFrom, isAdminOrManager, loadDepartments, type DeptLite } from './access';
+import { canSendFrom, countDisputesToAct, isAdminOrManager, loadDepartments, type DeptLite } from './access';
 
 /* ══════════════════════════════════════════════════════════════════════════
  * TELLING THE SENDER'S SIDE A TRANSFER IS DISPUTED.
@@ -18,7 +18,8 @@ import { canSendFrom, isAdminOrManager, loadDepartments, type DeptLite } from '.
  * house rule grn-qc-notify.ts states ("a badge that reached people who cannot
  * act, or an action nobody was told about, would each be worse than the
  * other"): everyone who may send from the ORIGINAL SENDING department
- * (access.ts canSendFrom: its head_user_id, an HOD posted there, managers —
+ * (access.ts canSendFrom: its head_user_id, an HOD posted there or to the
+ * department it is a sub-kitchen of (ruling #40), managers —
  * manager tier without the HOD flag — and admin) — exactly the people who can
  * make the one-tap reverse — plus the person who sent it. An HOD posted to
  * another department is NOT told: it is not their department's transfer.
@@ -38,12 +39,18 @@ import { canSendFrom, isAdminOrManager, loadDepartments, type DeptLite } from '.
  *     none) and nothing renders the durable row. So the global bell
  *     (/api/notifications/inbox, bucket 'dept_transfer_disputes') carries a
  *     LIVE COUNT from openDisputesToActFor() below — the same shape as
- *     grn-qc-notify's row + 'grn_qc_pending' bucket. It counts from
- *     dispute_status, exactly as GET /api/department-transfers'
- *     open_disputes_to_act does, so the badge and the page cannot disagree,
- *     and it falls the moment the dispute is reversed or closed.
+ *     grn-qc-notify's row + 'grn_qc_pending' bucket. It counts with ONE
+ *     predicate (access.ts hasDisputeActionFor: the person holds a take-back
+ *     or a close the server accepts), the same one GET
+ *     /api/department-transfers' open_disputes_to_act and the page's
+ *     "Disputes for you to settle" use, so the badge and the page cannot
+ *     disagree, and it falls the moment the dispute is reversed or closed —
+ *     or the moment a count leaves this person with nothing to press.
  *     Measured before it existed (xfer-rulings-v probe §9): a fresh flag
  *     reached 0 devices and 0 bells.
+ *     WHO IS TOLD (rails 1-2, at the flag) and WHO IS BADGED (rail 3, live)
+ *     differ on purpose: the alert goes to the sending side at once; the
+ *     badge follows who can still act as counts and closes happen.
  *
  * SERVER ONLY, FIRE-AND-FORGET, NEVER THROWS: call AFTER the flag's
  * transaction has committed. A notification that fails must not fail — or
@@ -97,19 +104,24 @@ export function transferAlertRecipients(
 }
 
 /**
- * Open disputes THIS PERSON is the one to act on: transfers with an open
- * dispute out of every department they may send from (canSendFrom — its head,
- * an HOD posted there; managers and admin: every department). The SAME figure
- * as GET /api/department-transfers → open_disputes_to_act, from the same
- * predicates, for the bell. Never throws (0 on any failure).
+ * Open disputes waiting on THIS PERSON: transfers with an open dispute on
+ * which they hold a control the server will ACCEPT — a take-back whose
+ * prefill moves something, or a close canDismissDispute allows (access.ts
+ * hasDisputeActionFor, THE predicate). The SAME function GET
+ * /api/department-transfers returns as open_disputes_to_act and the page
+ * lists under "Disputes for you to settle" (permissions.dispute_to_act).
+ *
+ * It used to count every open dispute OUT OF a department the caller may send
+ * from. That badged the Kitchen head for disputes he can never clear — a
+ * disputed line counted since it moved (take-back refused) that only the
+ * flagger, a manager or the receiving head may close — so the bell said 1 and
+ * the page showed nothing to press. And it never badged the receiving head
+ * who can close (or send back) the claim, nor the flagger who may withdraw it.
+ * Never throws (0 on any failure).
  */
-export function openDisputesToActFor(
-  db: Database.Database, user: Pick<SessionUser, 'id' | 'role' | 'is_head_chef' | 'department_id'>,
-): number {
+export function openDisputesToActFor(db: Database.Database, user: SessionUser): number {
   try {
-    const all = loadDepartments(db);
-    const actOn = isAdminOrManager(user) ? null : [...all.values()].filter((d) => canSendFrom(user, d)).map((d) => d.id);
-    return countOpenDeptTransferDisputes(db, actOn);
+    return countDisputesToAct(db, user, loadDepartments(db));
   } catch { return 0; }
 }
 

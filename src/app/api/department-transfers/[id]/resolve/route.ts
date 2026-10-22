@@ -21,11 +21,14 @@ import { loadDepartments, canSeeTransfer, canDismissDispute, presentTransfer, tr
  * manager closes it. Once both departments have counted the disputed line
  * since it moved, the take-back is refused (it would correct the books twice)
  * and the RECEIVING department's head may close it too — never the sender's
- * head, who could make "both counted" true alone by counting the receiver.
+ * head, who could make "both counted" true alone by counting the receiver,
+ * and never a person who heads BOTH ends (the Kitchen HOD also sends from its
+ * sub-kitchen Akan Tandoori, ruling #40): such a person is the sender's head.
  */
 
 const CLOSE_WHO = 'Only the person who raised a dispute, a manager or an admin can close it — or, once both ' +
-  'departments have counted it since the transfer, the receiving department\'s head.';
+  'departments have counted it since the transfer, the receiving department\'s head (not someone who also ' +
+  'heads the sending department).';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -95,7 +98,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     const updated = resolveDeptTransferDisputes(db, {
       transferId: doc.id, user: me.email, note, disputeIds: target.map((d) => d.id),
     });
-    return Response.json({ transfer: presentTransfer(me, updated, depts) });
+    return Response.json({ transfer: presentTransfer(me, updated, depts, db) });
   } catch (e: any) {
     const handled = transferErrorResponse(db, e);
     if (handled) return handled;

@@ -4,7 +4,8 @@ import {
   getDeptTransfer, flagDeptTransferDispute, DEPT_TRANSFER_DISPUTE_KINDS, type DeptTransferDisputeKind, type TransferEntryUnit,
 } from '@/lib/dept-ledger';
 import {
-  loadDepartments, canFlagDispute, canSeeTransfer, presentTransfer, transferErrorResponse, resolveEntryUnit, bodyNumber,
+  loadDepartments, canFlagDispute, canSendFrom, canSeeTransfer, presentTransfer, transferErrorResponse, resolveEntryUnit, bodyNumber,
+  reverseAuthority,
 } from '../../access';
 import { transferAlertRecipients, notifyTransferDispute } from '../../notify';
 
@@ -28,7 +29,10 @@ import { transferAlertRecipients, notifyTransferDispute } from '../../notify';
  *
  * Who: anyone POSTED to the RECEIVING department (any tier — the owner's
  * ruling lets staff flag), or whoever may send from it (its head, an HOD posted
- * there, managers, admin). ../access.ts canFlagDispute.
+ * there, managers, admin) — but not anyone except a manager / admin who may
+ * also send from the SENDING department, wherever they are posted: the first
+ * flag owns the line's one dispute slot, so a sender's token claim would
+ * block the receiver's real one. ../access.ts canFlagDispute.
  *
  * → 201 { transfer, disputes, alerted: [{ email, name, why }], notification_recorded }
  *   One open dispute per line at a time (409 while one is open).
@@ -54,8 +58,18 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     const depts = loadDepartments(db);
     if (!canSeeTransfer(me, doc, depts)) return Response.json({ error: 'Not allowed for this transfer' }, { status: 403 });
     if (!canFlagDispute(me, doc, depts)) {
+      // A sender head is refused WHEREVER posted (access.ts canFlagDispute): say
+      // what they can do instead — a send-back when they also act for the
+      // receiver, else the receiver's own people flag it.
+      const headsSender = canSendFrom(me, depts.get(doc.from_department_id));
       return Response.json({
-        error: `Only someone in ${doc.to_department_name} (or its head, a manager or an admin) can dispute what it received.`,
+        error: `Only someone in ${doc.to_department_name} (or its head, a manager or an admin) can dispute what it received` +
+          (headsSender
+            ? ` — not someone who also heads ${doc.from_department_name}, which sent it.` +
+              (reverseAuthority(me, doc, depts) === 'receiver'
+                ? ` To correct it, send back to ${doc.from_department_name} what did not arrive (Send back): a reverse transfer fixes both books.`
+                : ` Ask someone else in ${doc.to_department_name}, or a manager, to flag it.`)
+            : '.'),
       }, { status: 403 });
     }
 
@@ -103,7 +117,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       recorded = (await notifyTransferDispute(db, { doc: res.transfer, disputes: res.disputes, raisedBy: me.email, recipients })).recorded;
     } catch { /* never fails the flag */ }
 
-    const present = presentTransfer(me, res.transfer, depts);
+    const present = presentTransfer(me, res.transfer, depts, db);
     const ids = new Set(res.disputes.map((d) => d.id));
     return Response.json({
       transfer: present,

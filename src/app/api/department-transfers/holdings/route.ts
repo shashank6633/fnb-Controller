@@ -81,6 +81,18 @@ export async function GET(request: Request) {
           ` Count it to send an exact figure.`;
       } else if (r.since_anchor != null && r.since_anchor < (r.on_hand ?? 0)) {
         label = `${dept.name}'s last count plus every movement since, held to the lower reading because the count is older than the department cutover.`;
+      } else if (r.since_anchor != null && r.on_hand != null && r.since_anchor > r.on_hand + 1e-9) {
+        // The count is older than the cutover floor and the floor hides what was
+        // booked in between (an issue, say) while every transfer since the count
+        // stays in (dept-ledger "A TRANSFER PAIR IS NEVER SPLIT"). The books are
+        // then NOT "the last count plus every movement since" — say what they are
+        // (conservation verifier, targeted.cjs A2: books −2 kg, count + every
+        // movement since 3 kg, the shelf 3 kg).
+        const pf = r.pack_factor || 1;
+        label = `${dept.name} was last counted before the department cutover. Every other movement booked between that ` +
+          `count and the cutover (issues, use, waste) is left out of its books, while every transfer since the count is kept — so its books read ` +
+          `${fmtQtyNum(r.on_hand / pf)} ${pu}, although the count plus every movement since it comes to ` +
+          `${fmtQtyNum(r.since_anchor / pf)} ${pu}. Count it again and its books start from the shelf.`;
       } else {
         label = `${dept.name}'s last count plus every movement since.`;
       }

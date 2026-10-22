@@ -147,20 +147,58 @@ const LEDGER_TS_SQL = `REPLACE(SUBSTR(created_at, 1, 19), 'T', ' ')`;
  */
 function countAnchorAt(date: string, createdAt: string): string {
   const dayEnd = `${String(date || '').slice(0, 10)} 18:29:59`;
-  const s = String(createdAt ?? '').trim();
-  const saved = !s ? '' : /^\d{4}-\d{2}-\d{2}$/.test(s) ? `${s} 00:00:00` : s.slice(0, 19).replace('T', ' ');
+  const saved = countSavedAt(createdAt);
   return saved && saved < dayEnd ? saved : dayEnd;
 }
+
+/** When a closing count was SAVED, in the ledger's 19-char UTC basis ('' when
+ *  the row carries no time). countAnchorAt's own normalisation, split out so
+ *  a refusal can say when the count was typed as well as where it stands. */
+function countSavedAt(createdAt: string): string {
+  const s = String(createdAt ?? '').trim();
+  return !s ? '' : /^\d{4}-\d{2}-\d{2}$/.test(s) ? `${s} 00:00:00` : s.slice(0, 19).replace('T', ' ');
+}
+
+/** A ledger time (19-char UTC) for a message, in the house's IST:
+ *  '2026-10-13 19:30:00' → '01:00 IST on 2026-10-14'. */
+function istLabel(ts: string): string {
+  const d = new Date(`${String(ts || '').replace(' ', 'T')}Z`);
+  if (Number.isNaN(d.getTime())) return String(ts || '');
+  const ist = new Date(d.getTime() + 330 * 60_000).toISOString();
+  return `${ist.slice(11, 16)} IST on ${ist.slice(0, 10)}`;
+}
+
+/** One ledger movement inside a floor_hidden gap, for the refusal. */
+interface GapRow { type: string; quantity: number; at: string }
+
+/** A count being adopted: where it anchors (`at`, the ledger's count rule),
+ *  its quantity, the date it is labelled for and when it was saved. */
+interface AdoptedCount { at: string; qty: number; date: string; saved: string }
 
 /** One adopt refusal. `newer_count` and `not_the_anchor` mean the count being
  *  adopted is not the one the balance stands on; `moved` means it is, but the
  *  pair has moved since it; `floor_hidden` means the balance is unchanged but
- *  the SEND figure would rise (see adoptTrap). */
+ *  the SEND figure would rise (see adoptTrap). floor_hidden splits its gap by
+ *  the moment the count was SAVED, because the two halves are different
+ *  physical stories and the refusal must tell the one that happened:
+ *  booked_after_save went out after the count was typed (case W);
+ *  booked_before_save was booked before the count was typed but after the day
+ *  it is DATED had ended (case V10) — the count may already include it. */
 type AdoptRefusal =
   | { kind: 'newer_count'; newest_count_date: string; newest_count_qty: number; newest_count_at: string }
   | { kind: 'not_the_anchor'; anchor_source: string; anchor_at: string | null; anchor_qty: number | null }
   | { kind: 'moved'; moved_rows: number }
-  | { kind: 'floor_hidden'; moved_rows: number; hidden_outflow: number; send_figure_now: number; cutover_floor: string };
+  | {
+      kind: 'floor_hidden'; moved_rows: number; hidden_outflow: number; send_figure_now: number; cutover_floor: string;
+      count_date: string; count_saved_at: string;
+      /** Up to GAP_ROWS_LISTED each; *_rows and *_net (signed, RECIPE units)
+       *  are over the whole half. */
+      booked_before_save: GapRow[]; booked_before_save_rows: number; booked_before_save_net: number;
+      booked_after_save: GapRow[]; booked_after_save_rows: number; booked_after_save_net: number;
+    };
+
+/** How many gap rows a floor_hidden refusal carries per half (JSON). */
+const GAP_ROWS_LISTED = 20;
 
 /** The refusals the admin answers with a fresh count (MOVED_SINCE_COUNT), as
  *  opposed to adopting a different count date (COUNT_NOT_CURRENT). */
@@ -211,6 +249,13 @@ const isMovedRefusal = (r: AdoptRefusal): r is MovedRefusal => r.kind === 'moved
  *     exactly the count, so the adopt is refused only when the figure is
  *     LOWER than the count today. A hidden RECEIPT never trips it: the figure
  *     is already capped at the count, and stays there (prod parity, D4/W2).
+ *     THE SAME REFUSAL, A DIFFERENT STORY (case V10): a count typed at 01:00
+ *     IST on the 14th but DATED the 13th stands at the 13th's day end (the
+ *     count rule's MIN), so a KOT consumed at 00:30 IST — BEFORE the count was
+ *     typed — sits in the gap too. The rule and the status are the same (the
+ *     ledger cannot tell whether the counted figure already includes it), but
+ *     "used after the count" would be false, so the refusal splits the gap by
+ *     the count's SAVE time and the message tells each half as it happened.
  *
  * Run twice: while planning (so every refusal is answered in one list), and
  * again inside the IMMEDIATE write transaction, so nothing that posts between
@@ -218,7 +263,7 @@ const isMovedRefusal = (r: AdoptRefusal): r is MovedRefusal => r.kind === 'moved
  */
 function adoptTrap(
   db: Db, departmentId: string, materialId: string,
-  adopted: { at: string; qty: number },
+  adopted: AdoptedCount,
 ): AdoptRefusal | null {
   const counts = db.prepare(`
     SELECT date, physical_stock, created_at FROM closing_stock
@@ -252,19 +297,104 @@ function adoptTrap(
   const send = deptSendableFor(db, departmentId, materialId);
   const qty = r6(adopted.qty);
   if (r6(send.available) < qty - EPS) {
+    /* The same rows the send figure's MIN subtracts (sinceAnchorFigure: every
+     * non-opening movement after the anchor), listed so the refusal can name
+     * them. Split at the SAVE time — see the type's note: a row at or before
+     * the save was booked before the count was typed (only possible when the
+     * count is dated a day that had already ended, case V10). A count with no
+     * saved time cannot be split; its rows are told as after the dated day. */
     const gap = db.prepare(`
-      SELECT COUNT(*) AS n FROM department_material_transactions
+      SELECT type, quantity, ${LEDGER_TS_SQL} AS at FROM department_material_transactions
        WHERE department_id = ? AND material_id = ? AND type <> 'opening' AND ${LEDGER_TS_SQL} > ?
-    `).get(departmentId, materialId, adopted.at) as { n: number } | undefined;
+       ORDER BY at, rowid
+    `).all(departmentId, materialId, adopted.at) as Array<{ type: string; quantity: number; at: string }>;
+    const rows: GapRow[] = gap.map(g => ({ type: String(g.type), quantity: r6(Number(g.quantity)), at: String(g.at) }));
+    const before = adopted.saved ? rows.filter(g => g.at <= adopted.saved) : [];
+    const after = adopted.saved ? rows.filter(g => g.at > adopted.saved) : rows;
+    const net = (xs: GapRow[]) => r6(xs.reduce((s, g) => s + g.quantity, 0));
     return {
       kind: 'floor_hidden',
-      moved_rows: Number(gap?.n) || 0,
+      moved_rows: rows.length,
       hidden_outflow: r6(qty - Number(send.available)),
       send_figure_now: r6(Number(send.available)),
       cutover_floor: floor,
+      count_date: adopted.date,
+      count_saved_at: adopted.saved,
+      booked_before_save: before.slice(0, GAP_ROWS_LISTED),
+      booked_before_save_rows: before.length,
+      booked_before_save_net: net(before),
+      booked_after_save: after.slice(0, GAP_ROWS_LISTED),
+      booked_after_save_rows: after.length,
+      booked_after_save_net: net(after),
     };
   }
   return null;
+}
+
+const signedQty = (m: Mat | undefined, q: number) => `${q < 0 ? '−' : '+'}${qtyLabel(m, Math.abs(q))}`;
+
+/** A movement list for a message: "consumption −2 kg at 00:30 IST on
+ *  2026-10-14", or at most three then "+N more (−3.75 kg in all)". */
+function gapList(m: Mat | undefined, rows: GapRow[], total: number, totalNet: number): string {
+  const shown = rows.slice(0, 3).map(g => `${g.type.replace(/_/g, ' ')} ${signedQty(m, g.quantity)} at ${istLabel(g.at)}`);
+  const more = total > shown.length ? `, +${total - shown.length} more (${signedQty(m, totalNet)} in all)` : '';
+  return `${shown.join(', ')}${more}`;
+}
+const wasWere = (n: number) => (n === 1 ? 'was' : 'were');
+
+/**
+ * What a floor_hidden refusal says about ONE material — physically true for
+ * both stories (see AdoptRefusal). One sentence, no trailing full stop:
+ *   datedLate — something in the gap was booked BEFORE the count was saved:
+ *     the count is dated a day that had already ended when it was typed. Say
+ *     so, with both times; the counted figure may already include it.
+ *   otherwise — everything in the gap was booked after the count was saved
+ *     and before the rail went live: it really did leave after the count.
+ * `figures` (balance vs transfer check) are the two readings that disagree;
+ * the balance is the count itself here, because nothing else has moved.
+ */
+function floorHiddenDetail(
+  name: string, m: Mat | undefined,
+  h: Extract<AdoptRefusal, { kind: 'floor_hidden' }>, countQty: number,
+): { datedLate: boolean; savedKnown: boolean; body: string; text: string } {
+  const figures = `balance ${qtyLabel(m, countQty)}, transfer check ${qtyLabel(m, h.send_figure_now)}`;
+  const savedKnown = !!h.count_saved_at;
+  const afterList = gapList(m, h.booked_after_save, h.booked_after_save_rows, h.booked_after_save_net);
+  let datedLate = false;
+  let body: string;
+  if (h.booked_before_save_rows + h.booked_after_save_rows === 0) {
+    /* Cannot happen while this listing and the send figure read the same rows
+     * (both: every non-opening movement after the anchor). Kept so a future
+     * drift between them still produces a sentence, not an empty list. */
+    body = `the transfer check is ${qtyLabel(m, h.hidden_outflow)} below the count; ${figures}`;
+  } else if (h.booked_before_save_rows > 0) {
+    datedLate = true;
+    const afterBit = h.booked_after_save_rows > 0
+      ? `; ${afterList} ${wasWere(h.booked_after_save_rows)} booked after the save, before the department rail went live`
+      : '';
+    body =
+      `the count is dated ${h.count_date} but was saved at ${istLabel(h.count_saved_at)}, and ` +
+      `${gapList(m, h.booked_before_save, h.booked_before_save_rows, h.booked_before_save_net)} ` +
+      `${wasWere(h.booked_before_save_rows)} booked after ${h.count_date} ended, before the count was saved` +
+      `${afterBit}; ${figures}`;
+  } else {
+    body = `${afterList}; ${figures}`;
+  }
+  return { datedLate, savedKnown, body, text: `${name}: ${body}` };
+}
+
+/** Why a dated-late count is refused — the count rule (MIN of the dated day's
+ *  end and the save), said for the case where the day end wins. Exact only
+ *  for that case, which is the only one it is used for (datedLate ⇒ a row
+ *  after the anchor and at or before the save ⇒ anchor = the day end). */
+const DATED_LATE_WHY =
+  'A count saved after the day it is dated has ended stands at the end of that day (23:59 IST), so the app reads ' +
+  'anything booked between then and the save as after the count, and cannot tell whether the counted figure already includes it.';
+
+/** Up to three material sentences, then "+N more the same way". */
+function detailSentences(texts: string[]): string {
+  const shown = texts.slice(0, 3);
+  return shown.map(t => `${t}.`).join(' ') + (texts.length > shown.length ? ` +${texts.length - shown.length} more the same way.` : '');
 }
 
 /** Thrown inside the write transaction when the re-run trap refuses — rolls
@@ -557,8 +687,9 @@ export async function POST(request: Request) {
     let intended: Array<{ material_id: string; quantity: number; unit: string | null; note: string }> = [];
     let adoptedCountIds: string[] = [];
     /* adopt only: where each adopted count anchors (the ledger's count rule),
-     * which is what the adopt trap measures from. */
-    const adoptedAt = new Map<string, { at: string; qty: number }>();
+     * which is what the adopt trap measures from — plus when it was saved,
+     * which the floor_hidden refusal needs to tell its story truthfully. */
+    const adoptedAt = new Map<string, AdoptedCount>();
     if (adopt) {
       const rows = db.prepare(`
         SELECT id, material_id, physical_stock, notes, created_at
@@ -585,7 +716,9 @@ export async function POST(request: Request) {
       }
       adoptedCountIds = [...byMat.values()].map(r => r.id);
       intended = [...byMat.values()].map(r => {
-        adoptedAt.set(String(r.material_id), { at: r.at, qty: Number(r.physical_stock) || 0 });
+        adoptedAt.set(String(r.material_id), {
+          at: r.at, qty: Number(r.physical_stock) || 0, date: cutoverDate, saved: countSavedAt(r.created_at),
+        });
         return {
           material_id: String(r.material_id),
           quantity: Number(r.physical_stock) || 0,
@@ -816,25 +949,47 @@ export async function POST(request: Request) {
       );
     }
     if (movedSinceCount.length) {
-      const hidden = movedSinceCount.filter(x => x.kind === 'floor_hidden');
-      const plainN = movedSinceCount.length - hidden.length;
-      const mixed = plainN > 0 && hidden.length > 0;
-      const hiddenList = hidden.slice(0, 3)
-        .map(h => `${h.name}: ${qtyLabel(mats.get(h.material_id), h.kind === 'floor_hidden' ? h.hidden_outflow : 0)}`)
-        .join('; ') + (hidden.length > 3 ? `; +${hidden.length - 3} more` : '');
+      /* THE WORDS MUST BE PHYSICALLY TRUE. A plain move (kind 'moved') reads
+       * exactly as production always said it. A floor_hidden pair is told as
+       * what actually happened (floorHiddenDetail): stock booked out AFTER the
+       * count was saved (case W), or booked before the count was saved but
+       * after the day it is DATED had ended (case V10 — "used after the count"
+       * would be false there; the count may already include it). The rule and
+       * the status are the same for all three; only the story differs. */
+      const plainN = movedSinceCount.filter(x => x.kind === 'moved').length;
+      const details = movedSinceCount.flatMap(x => (x.kind === 'floor_hidden'
+        ? [floorHiddenDetail(x.name, mats.get(x.material_id), x, adoptedAt.get(x.material_id)?.qty ?? 0)]
+        : []));
+      const afterSave = details.filter(d => !d.datedLate);
+      const datedLate = details.filter(d => d.datedLate);
+      const sentences: string[] = [];
+      const lead = (n: number) => (sentences.length ? `${n} more` : `${n} material(s) in ${dept.name}`);
+      if (plainN > 0) {
+        sentences.push(
+          `${plainN} material(s) in ${dept.name} have moved since the ${cutoverDate} count. ` +
+          `Adopting it now would drop those movements out of the balance.`,
+        );
+      }
+      if (afterSave.length) {
+        sentences.push(
+          `For ${lead(afterSave.length)}, stock was booked out after the ${cutoverDate} count` +
+          `${afterSave.every(d => d.savedKnown) ? ' was saved' : ''} and before the department rail went live. ` +
+          `${detailSentences(afterSave.map(d => d.text))} The balance already leaves that out; the transfer check does not, ` +
+          `and adopting would let more leave the shelf than is on it.`,
+        );
+      }
+      if (datedLate.length) {
+        sentences.push(
+          `For ${lead(datedLate.length)}, the ${cutoverDate} count cannot be adopted as it stands. ` +
+          `${detailSentences(datedLate.map(d => d.text))} ${DATED_LATE_WHY}`,
+        );
+      }
+      sentences.push(details.length
+        ? `Count again dated today (${today}) and adopt that, or send lines[] with the quantities on the shelf right now. Nothing was written.`
+        : `Take a fresh count dated today and adopt that, or send lines[] with the quantities on the shelf right now.`);
       return Response.json(
         {
-          error:
-            `${movedSinceCount.length} material(s) in ${dept.name} have moved since the ${cutoverDate} count.` +
-            (plainN > 0
-              ? ` Adopting it now would drop those movements out of the balance${mixed ? ` (${plainN} of them)` : ''}.`
-              : '') +
-            (hidden.length > 0
-              ? ` ${mixed ? `For the other ${hidden.length}` : 'For these'}, stock was used or written off after the count but before the ` +
-                `department rail went live (${hiddenList}). The balance already leaves that out; the transfer check does not, and adopting ` +
-                `would let more leave the shelf than is on it.`
-              : '') +
-            ` Take a fresh count dated today and adopt that, or send lines[] with the quantities on the shelf right now.`,
+          error: sentences.join(' '),
           code: 'MOVED_SINCE_COUNT',
           materials: movedSinceCount,
         },
@@ -975,15 +1130,24 @@ export async function POST(request: Request) {
     } catch (e: unknown) {
       if (!(e instanceof AdoptRaced)) throw e;
       const name = mats.get(e.materialId)?.name || e.materialId;
+      /* floor_hidden is told the same physically-true way as at planning
+       * time (floorHiddenDetail); the other two keep their words. */
+      let why: string;
+      if (e.refusal.kind === 'floor_hidden') {
+        const d = floorHiddenDetail(name, mats.get(e.materialId), e.refusal, adoptedAt.get(e.materialId)?.qty ?? 0);
+        why = d.datedLate
+          ? `: ${d.body}. ${DATED_LATE_WHY} `
+          : `: stock was booked out after the ${cutoverDate} count${d.savedKnown ? ' was saved' : ''} and before the department rail went live — ` +
+            `${d.body}. Adopting would let more leave the shelf than is on it. `;
+      } else {
+        why = ` (${e.refusal.kind === 'moved'
+          ? 'it moved after the ' + cutoverDate + ' count'
+          : 'its ' + cutoverDate + ' count is no longer the latest'}). `;
+      }
       return Response.json(
         {
           error:
-            `${name} in ${dept.name} changed while the cutover was being written ` +
-            `(${e.refusal.kind === 'moved'
-              ? 'it moved after the ' + cutoverDate + ' count'
-              : e.refusal.kind === 'floor_hidden'
-                ? qtyLabel(mats.get(e.materialId), e.refusal.hidden_outflow) + ' was used or written off after the ' + cutoverDate + ' count, before the department rail went live'
-                : 'its ' + cutoverDate + ' count is no longer the latest'}). ` +
+            `${name} in ${dept.name} changed while the cutover was being written${why}` +
             `Nothing was written. Run the cutover again.`,
           code: isMovedRefusal(e.refusal) ? 'MOVED_SINCE_COUNT' : 'COUNT_NOT_CURRENT',
           materials: [{ material_id: e.materialId, name, ...e.refusal }],

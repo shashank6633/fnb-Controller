@@ -1411,6 +1411,49 @@ function sinceAnchorFigure(db: Database.Database, deptId: string, matId: string,
   } catch { return null; }
 }
 
+/**
+ * WHY a counted pair's send figure is lower than its count plus every movement
+ * since it — for the 'insufficient' refusal, so it never says "holds none … by
+ * its last count and the movements since" when the count and those movements
+ * say otherwise. '' when the cutover floor hides nothing for this pair (never
+ * counted, counted after the floor, or nothing booked in between).
+ *
+ * The case (conservation verifier, targeted.cjs A2): Akan Tandoori counted
+ * 2 kg, the store issued 5 kg, Tandoori sent 4 kg on, THEN the first cutover
+ * stamped the floor. The floor keeps the 5 kg issue out of the balance
+ * (decision D), the transfer leg stays in it ("A TRANSFER PAIR IS NEVER
+ * SPLIT"), so the books read −2 kg against a 3 kg shelf until Tandoori is
+ * counted again. This only EXPLAINS that figure; the rule is unchanged.
+ */
+function floorHiddenNote(db: Database.Database, deptId: string, deptName: string, m: TransferMaterial, available: number): string {
+  try {
+    const bal = deptOnHand(db, deptId, m.id);
+    if (bal.neverCounted || bal.onHand == null || bal.anchorAt == null || bal.anchorQty == null) return '';
+    if (!(bal.anchorAt < bal.windowFrom)) return '';
+    const sa = sinceAnchorFigure(db, deptId, m.id, bal);
+    if (sa == null || Math.abs(r6(sa - bal.onHand)) <= EPS) return '';
+    const rows = db.prepare(`
+      SELECT type, COALESCE(SUM(quantity), 0) AS q, COUNT(*) AS n FROM department_material_transactions
+       WHERE department_id = ? AND material_id = ? AND type NOT IN ('opening', ${TRANSFER_LEG_SQL})
+         AND ${LEDGER_TS_SQL} > ? AND ${LEDGER_TS_SQL} <= ?
+       GROUP BY type ORDER BY type
+    `).all(deptId, m.id, bal.anchorAt, bal.windowFrom) as Array<{ type: string; q: number; n: number }>;
+    const shownRows = rows.filter((r) => Math.abs(Number(r.q)) > EPS);
+    const hidden = shownRows
+      .map((r) => `${Number(r.q) > 0 ? '+' : ''}${fmtDual(Number(r.q), m)} ${String(r.type).replace(/_/g, ' ')}`).join(', ');
+    const hiddenRows = shownRows.length;
+    // Same minute → show the seconds, or "older than" reads as the same time.
+    const secs = istStamp(bal.anchorAt) === istStamp(bal.windowFrom);
+    return `${deptName}'s books for ${m.name} start from its count of ${fmtDual(bal.anchorQty, m)} ` +
+      `(${istStamp(bal.anchorAt, secs)}), which is older than the department-ledger cutover (${istStamp(bal.windowFrom, secs)}). ` +
+      `${hidden ? `${hidden} booked between the two ${hiddenRows === 1 ? 'is' : 'are'}` : 'What was booked between the two (other than transfers) is'} ` +
+      `not in its balance, while every transfer since the count is — so its books show ${fmtDual(bal.onHand, m)}, although the count plus ` +
+      `every movement since it comes to ${fmtDual(sa, m)}. ` +
+      (available > EPS ? `It can send ${fmtDual(available, m)} now. ` : 'It can send none now. ') +
+      `Count ${deptName} again (or cut it over with what is on the shelf now) and its books start from the shelf.`;
+  } catch { return ''; }
+}
+
 /** deptSendable() for one (department, material), read live. */
 export function deptSendableFor(db: Database.Database, departmentId: string, materialId: string): DeptSendable {
   const deptId = String(departmentId || '');
@@ -1466,6 +1509,7 @@ export type DeptTransferBlockReason =
   | 'window'                // a leg would fall outside its pair's balance window
   | 'state'                 // not found / not posted / already disputed / nothing left
   | 'counted_since'         // a disputed line was COUNTED since it moved — a reverse would correct it twice
+  | 'stale'                 // a one-tap reverse whose prefill changed since the screen showed it (nothing moved)
   | 'idempotency_conflict'; // a client key reused for a DIFFERENT request
 
 /** Thrown by every transfer function below. Routes answer `httpStatus` with
@@ -1690,13 +1734,20 @@ function postDeptTransferInTxn(db: Database.Database, t: DeptTransferPost): Dept
       ? 'by its last count and the movements since'
       : 'by its ledger (it has never been counted)';
     const avail = Math.max(0, fromBefore.available);
+    // The cutover floor holding the figure below the count + every movement
+    // since it is said as such — never "holds none by its last count and the
+    // movements since", which that count and those movements contradict.
+    const floorNote = fromBefore.basis === 'counted' && fromBefore.sinceAnchor != null
+      ? floorHiddenNote(db, fromId, from.name, m, fromBefore.available) : '';
     // Holding NOTHING is its own sentence: "Send 0 kg or less" told the Kitchen
     // head to send nothing without saying why nothing was there (measured: the
     // owner's three category rules miss category 'non-veg', so the chicken went
     // to the central shelf and Kitchen's ledger got 0 — the-real-case ROUTE=none).
     throw blocked(
       'insufficient',
-      avail > EPS
+      floorNote
+        ? `Cannot hand over ${fmtDual(q, m)} of ${m.name} from ${from.name}. ${floorNote}`
+        : avail > EPS
         ? `${from.name} holds only ${fmtDual(avail, m)} of ${m.name} ${basisNote}; ` +
           `cannot hand over ${fmtDual(q, m)}. Send ${fmtDual(avail, m)} or less, ` +
           `or record a count for ${from.name} first.`
@@ -2292,6 +2343,18 @@ function refreshDisputeStatus(db: Database.Database, transferId: string, at: str
 
 /* ── REVERSE — the one correction ───────────────────────────────────────── */
 
+/**
+ * What a one-tap (prefill) reverse MEANS, worked out from the document:
+ *   'disputed'  a claim is open on it — the tap settles that claim with the
+ *               disputed amounts (the goods never reached the receiver's shelf:
+ *               a correction on paper);
+ *   'standing'  no claim is open — the tap returns what the lines still have
+ *               standing (goods on the receiver's shelf, carried back).
+ * access.ts reversePrefill() stamps it on every prefill line; the screen echoes
+ * it back in `expect` (see "A STALE TAP MOVES NOTHING").
+ */
+export type DeptReverseBasis = 'disputed' | 'standing';
+
 export interface ReverseDeptTransferInput {
   /** The transfer being corrected. */
   transferId: string;
@@ -2302,9 +2365,21 @@ export interface ReverseDeptTransferInput {
   /**
    * Per line, in the unit given (default 'purchase'). OMIT = the prefill: each
    * line's OPEN disputed quantity — or, with 'receiver' authority and no open
-   * dispute, everything the line still has standing.
+   * dispute, everything the line still has standing, but ONLY when `expect`
+   * says that is what the screen showed (see "A STALE TAP MOVES NOTHING").
    */
   lines?: Array<{ lineId: string; quantity: number; unit?: TransferEntryUnit }>;
+  /**
+   * The prefill the caller's SCREEN showed when the tap was made —
+   * permissions.reverse_prefill echoed back as { lineId, quantity, basis } in
+   * RECIPE units (the prefill's own `quantity` field, never converted). Used
+   * only when `lines` is omitted. When the prefill worked out now differs from
+   * it in any line or quantity — or in what it means (`basis`, when given) —
+   * the reverse is refused ('stale', 409) and nothing moves. Omitted = the
+   * caller saw no screen: the prefill then settles an OPEN dispute only, and is
+   * refused when none is open.
+   */
+  expect?: Array<{ lineId: string; quantity: number; basis?: DeptReverseBasis }>;
   /**
    * Decided by the ROUTE from who is asking:
    *   'receiver'      may send from the ORIGINAL RECEIVER (it is a send from
@@ -2325,7 +2400,11 @@ export interface ReverseDeptTransferInput {
  * first; a dispute is resolved once what was reversed covers what was claimed.
  * A disputed line that either end has COUNTED since it moved is refused
  * ('counted_since', 409) and left out of the prefill — the count already
- * corrected that book (see "a correction must not correct twice").
+ * corrected that book (see "a correction must not correct twice"). A one-tap
+ * (prefill) reverse whose prefill differs from what the caller's screen showed
+ * (`expect`: the quantities, and whether they settle a claim or return goods),
+ * or — with no screen — finds no open dispute, is refused
+ * ('stale', 409): see "A STALE TAP MOVES NOTHING" inside.
  */
 export function reverseDeptTransfer(
   db: Database.Database, input: ReverseDeptTransferInput,
@@ -2398,6 +2477,92 @@ export function reverseDeptTransfer(
         throw blocked('counted_since', msg || `${orig.transfer_no} was counted since it moved; reversing it would correct it twice.`, {
           materialId: counted[0].material_id, requested: counted[0].qty_open_disputed, available: 0,
         });
+      }
+    }
+    // ── A STALE TAP MOVES NOTHING ─────────────────────────────────────────
+    // The one-tap prefill is worked out HERE, at tap time, and it changes
+    // meaning when the claim is settled: while a dispute is open it is the
+    // disputed amount (a PAPER correction — the goods never reached the
+    // receiver's shelf), and once none is open it is everything the line still
+    // has standing (a PHYSICAL return). A screen loaded before someone else
+    // settled the claim still says "Send back 0.5 kg"; its tap then moved the
+    // whole standing line although nobody carried anything. Measured
+    // (conservation verifier, targeted.cjs C / C2 / C3): Kitchen → Akan
+    // Tandoori 4 kg, 3.5 arrived, 0.5 flagged; the Tandoori HOD sends the 0.5
+    // back; the Kitchen HOD's stale "0.5" tap (he may send from Akan Tandoori
+    // too, ruling #40) moved 3.5 kg — books Kitchen 10 / Tandoori 0 against
+    // shelves 6.5 / 3.5. So the screen says what it showed (`expect`) and a
+    // tap whose prefill has changed since is refused, nothing written; a
+    // caller with no screen gets the disputed amounts only — a whole-line
+    // return must be asked for (`expect` showing it, or `lines`).
+    //
+    // THE QUANTITY ALONE IS NOT ENOUGH. A claim of the WHOLE line ("not
+    // received", 4 of 4 kg) offers "Send back 4 kg" while it is open; once a
+    // manager closes it ("found it in the walk-in") the standing line is 4 kg
+    // too, so the same figure is on offer with the opposite meaning — the old
+    // screen's tap would take 4 kg off a shelf that holds them, as a paper
+    // correction nobody carried. So `expect` also says what the screen meant
+    // (`basis`), and a different meaning now is refused like a different
+    // quantity.
+    if (!(input.lines && input.lines.length > 0)) {
+      const anyOpen = orig.lines.some((l) => l.qty_open_disputed > EPS);
+      const basisNow: DeptReverseBasis = anyOpen ? 'disputed' : 'standing';
+      const nowText = plan.map((p) => `${fmtDual(p.qty, { unit: p.line.unit, purchase_unit: p.line.purchase_unit, pack_size: p.line.pack_factor })} ${p.line.material_name}`).join(' + ');
+      const settled = deptTransferSettledNote(db, orig);
+      if (input.expect === undefined) {
+        if (!anyOpen) {
+          throw blocked('stale',
+            `${orig.transfer_no} has no open dispute to settle. Nothing moved.` +
+            `${settled ? ` Latest on its claims: ${settled}.` : ''} ` +
+            `To send goods back of ${orig.to_department_name}'s own accord, choose them on the transfer (Send back) ` +
+            `or name the lines.`);
+        }
+      } else {
+        const want = new Map<string, number>();
+        let basisShown: DeptReverseBasis | null = null;
+        for (const e of input.expect) {
+          const id = String(e?.lineId || '').trim();
+          const q = Number(e?.quantity);
+          if (!id || !Number.isFinite(q) || q < 0) {
+            throw blocked('invalid', 'expect must list { line_id, quantity } as the screen showed them (quantity in the recipe unit, 0 or more).');
+          }
+          if (e?.basis !== undefined && e?.basis !== null) {
+            if (e.basis !== 'disputed' && e.basis !== 'standing') {
+              throw blocked('invalid', "expect: basis must be 'disputed' or 'standing', as the screen's prefill said.");
+            }
+            if (basisShown && basisShown !== e.basis) {
+              throw blocked('invalid', 'expect: every line carries the same basis (the screen showed one send-back).');
+            }
+            basisShown = e.basis;
+          }
+          if (q > EPS) want.set(id, r6((want.get(id) || 0) + q));
+        }
+        const have = new Map(plan.map((p) => [p.line.id, r6(p.qty)]));
+        const same = want.size === have.size
+          && [...want].every(([id, q]) => have.has(id) && Math.abs((have.get(id) as number) - q) <= 1e-6)
+          && (basisShown == null || basisShown === basisNow);
+        if (!same) {
+          const shown = [...want].map(([id, q]) => {
+            const l = byId.get(id);
+            return l ? `${fmtDual(q, { unit: l.unit, purchase_unit: l.purchase_unit, pack_size: l.pack_factor })} ${l.material_name}` : `${fmt(q)} (a line not on ${orig.transfer_no})`;
+          }).join(' + ') || 'nothing';
+          const offered = basisShown === 'disputed'
+            ? `The screen offered to settle the claim by sending back ${shown}`
+            : basisShown === 'standing'
+              ? `The screen offered to return ${shown}, with no claim open`
+              : `The screen offered to send back ${shown}`;
+          const now = plan.length === 0
+            ? 'nothing is left to send back now'
+            : basisNow === 'disputed'
+              ? `a send-back now would settle the open claim with ${nowText}`
+              : `no claim is open now, so a send-back would return ${nowText} off ${orig.to_department_name}'s shelf`;
+          throw blocked('stale',
+            `${orig.transfer_no} changed after this screen was loaded. ${offered}; ${now}. Nothing moved.` +
+            `${settled ? ` Latest on its claims: ${settled}.` : ''} ` +
+            `Look at the transfer again${plan.length === 0 ? '' : basisNow === 'disputed'
+              ? ' and tap again only if the claim is right'
+              : ' and tap again only if those goods really are going back'}.`);
+        }
       }
     }
     if (plan.length === 0) {
@@ -2580,6 +2745,55 @@ export function deptTransferCountedSinceMessage(doc: DeptTransferWithLines): str
   // (never the sender's head — the claim is against his own department).
   return `${parts.join(' ')} The person who flagged it, a manager or an admin can close it; once both ` +
     `${from} and ${to} have counted it, ${to}'s head can close it too.`;
+}
+
+/** A ledger / document UTC stamp ('YYYY-MM-DD HH:MM:SS[.mmm]') as IST
+ *  'YYYY-MM-DD HH:MM IST', for an operator-facing sentence. '' for junk. */
+function istStamp(v: unknown, seconds = false): string {
+  const s = normTs(v);
+  if (!s) return '';
+  const ms = Date.parse(`${s.replace(' ', 'T')}Z`);
+  if (!Number.isFinite(ms)) return '';
+  return `${new Date(ms + 5.5 * 3600e3).toISOString().slice(0, seconds ? 19 : 16).replace('T', ' ')} IST`;
+}
+
+/**
+ * How the claims on one document were SETTLED, newest first (at most two), for
+ * the refusal a stale one-tap reverse gets: "the 0.5 kg short claim on HX
+ * CHICKEN was settled at 2026-10-21 10:31 IST: 0.5 kg went back against it
+ * (the send-back that settled it: DTR-2026-0002, by a@b)", or "… was closed at
+ * … by a@b (“found it”) with nothing sent back". Every clause is what the rows
+ * say — the amount is the claim's total sent back (one send-back or several),
+ * the document and person are the ones that settled it. '' when nothing on it
+ * has been settled. Never throws.
+ */
+export function deptTransferSettledNote(db: Database.Database, doc: DeptTransferWithLines): string {
+  try {
+    const done = doc.disputes
+      .filter((d) => d.status === 'resolved')
+      .sort((a, b) => String(b.resolved_at || '').localeCompare(String(a.resolved_at || '')))
+      .slice(0, 2);
+    const parts = done.map((d) => {
+      const l = doc.lines.find((x) => x.id === d.line_id);
+      const meta: PackMeta = { unit: l?.unit || '', purchase_unit: l?.purchase_unit || '', pack_size: l?.pack_factor || 1 };
+      const what = `the ${fmtDual(d.qty_disputed, meta)} ${String(d.kind || '').replace(/_/g, ' ')} claim on ${l?.material_name || 'a line'}`;
+      const when = istStamp(d.resolved_at);
+      const back = Number(d.qty_reversed) || 0;
+      if (d.resolution === 'reversed') {
+        const rev = d.reverse_transfer_id
+          ? db.prepare(`SELECT transfer_no FROM department_transfers WHERE id = ?`).get(d.reverse_transfer_id) as { transfer_no: string } | undefined
+          : undefined;
+        const by = d.resolved_by ? `by ${d.resolved_by}` : '';
+        const last = rev?.transfer_no ? `the send-back that settled it: ${rev.transfer_no}${by ? `, ${by}` : ''}` : by;
+        return `${what} was settled${when ? ` at ${when}` : ''}: ${fmtDual(back, meta)} went back against it` +
+          `${last ? ` (${last})` : ''}`;
+      }
+      return `${what} was closed${when ? ` at ${when}` : ''} by ${d.resolved_by || 'someone'}` +
+        `${d.resolution_note ? ` (“${d.resolution_note}”)` : ''}` +
+        (back > EPS ? ` after ${fmtDual(back, meta)} had gone back against it` : ' with nothing sent back');
+    });
+    return parts.join('; ');
+  } catch { return ''; }
 }
 
 /* ── reading ────────────────────────────────────────────────────────────── */

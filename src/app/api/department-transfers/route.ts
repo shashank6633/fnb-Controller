@@ -2,10 +2,10 @@ import { getDb } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
 import { canSeeAllDeptStock } from '@/lib/dept-stock';
 import {
-  sendDeptTransfer, getDeptTransfer, countOpenDeptTransferDisputes, type DeptTransferLineInput,
+  sendDeptTransfer, getDeptTransfer, type DeptTransferLineInput,
 } from '@/lib/dept-ledger';
 import {
-  loadDepartments, canSendFrom, canSeeDept, isAdminOrManager,
+  loadDepartments, canSendFrom, canSeeDept, countDisputesToAct,
   presentTransfer, transferErrorResponse, resolveEntryUnit, bodyNumber,
 } from './access';
 
@@ -75,7 +75,8 @@ import {
  * ── AUTH ───────────────────────────────────────────────────────────────────
  * Signed-in only (401). WHO may send / flag / reverse / dismiss / see is
  * ./access.ts — the owner's ruling: senders are the SENDING department's head
- * (head_user_id, or an HOD posted there) plus managers and admin. The proxy
+ * (head_user_id, or an HOD posted there or to the department it is a
+ * sub-kitchen of — ruling #40) plus managers and admin. The proxy
  * never checks page access on an API, so each handler authorises itself.
  * CSRF: '/api/department-transfers' is its own CSRF_REQUIRED_PREFIXES line in
  * src/proxy.ts and covers every POST below it.
@@ -118,10 +119,12 @@ export async function GET(request: Request) {
       }
     }
 
-    // Departments whose open disputes this caller can act on (reverse) — the
-    // sender side's to-do count. Managers / admin: every department.
-    const actOn = isAdminOrManager(me) ? null : [...depts.values()].filter((d) => canSendFrom(me, d)).map((d) => d.id);
-    const openToAct = countOpenDeptTransferDisputes(db, actOn);
+    // Transfers with an open dispute WAITING ON THIS CALLER — they hold a
+    // take-back or a close the server accepts (access.ts hasDisputeActionFor,
+    // THE predicate). The bell (notify.ts openDisputesToActFor) and the page's
+    // "Disputes for you to settle" (permissions.dispute_to_act) use the same
+    // one, so the three never disagree. Every open dispute, not this page.
+    const openToAct = countDisputesToAct(db, me, depts);
 
     const where: string[] = [];
     const params: string[] = [];
@@ -155,7 +158,7 @@ export async function GET(request: Request) {
     const transfers = [];
     for (const { id } of ids) {
       const doc = getDeptTransfer(db, id);
-      if (doc) transfers.push(presentTransfer(me, doc, depts));
+      if (doc) transfers.push(presentTransfer(me, doc, depts, db));
     }
 
     return Response.json({ transfers, departments: deptOptions(me, depts), open_disputes_to_act: openToAct });
@@ -211,8 +214,10 @@ export async function POST(request: Request) {
     if (!to) return Response.json({ error: 'Unknown receiving department' }, { status: 404 });
 
     if (!canSendFrom(me, from)) {
+      const parent = from.parent_id ? depts.get(from.parent_id) : undefined;
       return Response.json({
-        error: `Only ${from.name}'s head (its named head, or an HOD posted to ${from.name}), a manager or an ` +
+        error: `Only ${from.name}'s head (its named head, or an HOD posted to ${from.name}` +
+          `${parent ? ` or to ${parent.name}` : ''}), a manager or an ` +
           `admin can send its stock. You can still see transfers into and out of your department and flag a dispute.`,
       }, { status: 403 });
     }
@@ -283,7 +288,7 @@ export async function POST(request: Request) {
       outletId,
     });
     return Response.json(
-      { transfer: presentTransfer(me, res.transfer, depts), duplicate: res.duplicate },
+      { transfer: presentTransfer(me, res.transfer, depts, db), duplicate: res.duplicate },
       { status: res.duplicate ? 200 : 201 },
     );
   } catch (e: any) {

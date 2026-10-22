@@ -23,7 +23,9 @@
  * what a person may do with a document comes from its `permissions`
  * (can_flag_dispute, can_reverse + reverse_prefill, dismissable_dispute_ids,
  * and reverse_blocked — the server's words for a disputed line that was counted
- * since it moved and so must not be taken back, shown instead of the button);
+ * since it moved and so must not be taken back, shown instead of the button;
+ * dispute_to_act — whether an open dispute here is waiting on this person, the
+ * same predicate the bell counts: ./dispute-todo.ts);
  * the quantity that may leave is the server's `transferable`; the receivers and
  * their order are the server's (the sender's family first, then where
  * requisitions for these goods land). Every refusal is printed VERBATIM; the
@@ -65,6 +67,7 @@ import {
   mintClientKey, classifySend, readPendingSend, writePendingSend, clearPendingSend, findByClientKey,
   type PendingSend, type SendBody,
 } from './send-safety';
+import { disputesToSettle } from './dispute-todo';
 
 /* ── Types (the wire shapes of /api/department-transfers) ───────────────── */
 
@@ -119,6 +122,8 @@ interface TDispute {
 interface PrefillLine {
   line_id: string; material_id: string; material_name: string;
   quantity: number; quantity_purchase: number; unit: string; purchase_unit: string;
+  /** What the tap means: 'disputed' settles the open claim, 'standing' returns goods. */
+  basis?: 'disputed' | 'standing';
 }
 interface Perms {
   is_sender: boolean;
@@ -129,6 +134,8 @@ interface Perms {
   /** Why a disputed line cannot be taken back (counted since it moved), in the server's words. */
   reverse_blocked?: string | null;
   dismissable_dispute_ids: string[];
+  /** The server's ONE "waiting on you" predicate (access.ts hasDisputeActionFor). */
+  dispute_to_act?: boolean;
 }
 interface Transfer {
   id: string; transfer_no: string; client_key?: string;
@@ -242,13 +249,15 @@ export default function DepartmentTransfersPage() {
     !!me?.email && str(email).trim().toLowerCase() === me.email.trim().toLowerCase(), [me]);
   const whoIs = (email: string) => (isMe(email) ? 'you' : who(email));
 
-  /* departments + every OPEN dispute I can see (GET ?dispute=open) */
+  /* departments + every OPEN dispute I can see (GET ?dispute=open). 500 is the
+   * server's cap; the bell counts every open dispute, so the list asks for as
+   * many as the server will give rather than the newest 100. */
   const [depts, setDepts] = useState<DeptOption[]>([]);
   const [deptsLoaded, setDeptsLoaded] = useState(false);
   const [attention, setAttention] = useState<Transfer[]>([]);
   const [topError, setTopError] = useState<string | null>(null);
   const loadAttention = useCallback(async () => {
-    const r = await getJson('/api/department-transfers?dispute=open&limit=100');
+    const r = await getJson('/api/department-transfers?dispute=open&limit=500');
     if (!r.ok) {
       setTopError(r.json?.error || `Could not load transfers (HTTP ${r.status || 'no reply'})`);
       setDeptsLoaded(true);
@@ -669,12 +678,18 @@ export default function DepartmentTransfersPage() {
   };
 
   /** THE correction: the server's prefill (the disputed quantity, or — sent back
-   *  by the receiving side unasked — everything still standing). One tap. */
+   *  by the receiving side unasked — everything still standing). One tap.
+   *  The tap says what THIS screen showed (`expect`, the prefill's own recipe
+   *  quantities, unconverted, and its basis — settle the claim, or return
+   *  goods): if someone else settled or closed the claim since this page
+   *  loaded, the server's prefill has changed and it refuses (409 'stale')
+   *  instead of moving the whole standing line. */
   const sendBack = async (t: Transfer) => {
     const key = revKeys[t.id] || mintClientKey('rv');
     setOne(setRevKeys, t.id, key);
     setOne(setBusy, t.id, true); setOne(setDocErr, t.id, undefined); setOne(setRevUnknown, t.id, undefined);
-    const { status, json } = await postJson(`/api/department-transfers/${encodeURIComponent(t.id)}/reverse`, { client_key: key });
+    const expect = (t.permissions?.reverse_prefill || []).map(p => ({ line_id: p.line_id, quantity: p.quantity, basis: p.basis }));
+    const { status, json } = await postJson(`/api/department-transfers/${encodeURIComponent(t.id)}/reverse`, { client_key: key, expect });
     setOne(setBusy, t.id, undefined);
     const out = classifySend(status, json);
     if (out.kind === 'sent') {
@@ -729,26 +744,12 @@ export default function DepartmentTransfersPage() {
     refreshNow();
   };
 
-  /* what needs this person: open disputes they can settle (send back / close) */
-  const needsMe = useMemo(() => attention.filter(t => t.dispute_status === 'open' && (
-    t.permissions?.can_reverse
-    // Counted on ONE side since it moved: no take-back, but a count of the
-    // OTHER side is still owed (the server's reverse_blocked words say which),
-    // so it stays in front of whoever may be the one to count it. Only the
-    // viewer who acts for the SENDER alone (reverse_authority 'disputed_only')
-    // is left out when the sender is the side that already counted — the count
-    // owed is the receiver's. ('receiver' authority may act for both sides:
-    // managers, a head of both — kept.) Counted on BOTH sides: nothing is left
-    // to do but close it, so it is theirs only if they hold a close button (the
-    // arm below); the sender's head never does, and must not be shown a
-    // "to settle" item with no control that works.
-    || (!!t.permissions?.reverse_blocked && t.lines.some(l => {
-      const c = l.counted_since;
-      if (!(l.qty_open_disputed > EPS) || !c || (c.sender && c.receiver)) return false;
-      return !!c.receiver || t.permissions.reverse_authority === 'receiver';
-    }))
-    || (t.permissions?.dismissable_dispute_ids || []).some(id => !isMe(t.disputes.find(d => d.id === id)?.raised_by || ''))
-  )), [attention, isMe]);
+  /* what needs this person: open disputes on which they hold a control the
+   * server accepts (take back / send back, or close / withdraw) — the SERVER's
+   * predicate, permissions.dispute_to_act (./dispute-todo.ts). The bell and
+   * open_disputes_to_act count the same one, so a badge always lands here on
+   * a button that works, and nothing here lacks one. */
+  const needsMe = useMemo(() => disputesToSettle(attention), [attention]);
   /** A document settled from the panel above carries its buttons THERE only. */
   const needsMeIds = useMemo(() => new Set(needsMe.map(t => t.id)), [needsMe]);
 
@@ -812,6 +813,8 @@ export default function DepartmentTransfersPage() {
                 ? <>Nothing has moved. It has been counted since it was sent, so it cannot be taken back — that would correct the books twice.</>
                 : t.permissions?.can_reverse && t.permissions.reverse_authority === 'disputed_only'
                 ? <>Nothing has moved. It is with you: take it back if {clean(t.to_department_name)} is right — or a manager closes it with a note.</>
+                : t.permissions?.can_reverse && t.permissions.reverse_authority === 'receiver'
+                ? <>Nothing has moved. You can send the disputed amount back to {clean(t.from_department_name)} from here — or {clean(t.from_department_name)} takes it back, or it is closed with a note.</>
                 : <>Nothing has moved. Waiting on {clean(t.from_department_name)}: they take it back, or it is closed with a note.</>}
             </div>
           ) : d.resolution === 'reversed' ? (

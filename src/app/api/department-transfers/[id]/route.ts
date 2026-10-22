@@ -28,7 +28,7 @@ export async function GET(_request: Request, { params }: { params: Promise<{ id:
     if (!canSeeTransfer(me, doc, depts)) {
       return Response.json({ error: 'Not allowed for this transfer' }, { status: 403 });
     }
-    return Response.json({ transfer: presentTransfer(me, doc, depts) });
+    return Response.json({ transfer: presentTransfer(me, doc, depts, db) });
   } catch (e: any) {
     console.error('[department-transfers/[id] GET]', e);
     return Response.json({ error: e?.message || 'Failed to load transfer' }, { status: 500 });

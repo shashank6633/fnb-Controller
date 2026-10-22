@@ -2,11 +2,12 @@ import type Database from 'better-sqlite3';
 import type { SessionUser } from '@/lib/auth';
 import { allowedDeptIds, canSeeAllDeptStock } from '@/lib/dept-stock';
 import {
-  isDeptTransferBlocked, deptTransferCountedSinceMessage,
-  type DeptTransferWithLines, type DeptTransferDisputeRow, type TransferEntryUnit,
+  isDeptTransferBlocked, deptTransferCountedSinceMessage, getDeptTransfer, deptSendableFor,
+  type DeptTransferWithLines, type DeptTransferDisputeRow, type TransferEntryUnit, type DeptReverseBasis,
 } from '@/lib/dept-ledger';
 import { toPurchaseQty } from '@/lib/pack-units';
 import { resolveDirectIssueBulk } from '@/lib/direct-issue';
+import { isStoreMappedMaterial } from '@/lib/store-engine';
 
 /**
  * 'purchase' | 'recipe' | a unit's own NAME ('kg', 'g', 'btl') → the entry
@@ -51,10 +52,13 @@ export function bodyNumber(v: unknown): number {
  *
  * SEND (one step — the stock moves when the document is written):
  *   the SENDING department's head — departments.head_user_id, or an HOD
- *   (is_head_chef) POSTED to that department (users.department_id) — plus
- *   managers (manager tier, NOT an HOD — see isAdminOrManager) and admin.
+ *   (is_head_chef) POSTED to that department or to the department it is a
+ *   sub-kitchen of (ruling #40, 2026-10-15: "a head chef sends ONLY from the
+ *   department he is posted to (and its sub-kitchens)") — plus managers
+ *   (manager tier, NOT an HOD — see isAdminOrManager) and admin.
  *   Nobody else: staff, an HOD posted elsewhere (even on the manager-tier Head
- *   Chef role), the head of a parent department, can_approve_requisitions.
+ *   Chef role — a sibling sub-kitchen or a child is "elsewhere"), the NAMED
+ *   head (head_user_id) of a parent department, can_approve_requisitions.
  *
  * SEE: admin / manager / HOD / store manager see every transfer
  *   (canSeeAllDeptStock — the /api/department-stock rule). Everyone else sees
@@ -63,7 +67,10 @@ export function bodyNumber(v: unknown): number {
  *
  * FLAG A DISPUTE (records + alerts; moves nothing): anyone POSTED to the
  *   RECEIVING department, any tier — staff included, the owner's words — plus
- *   whoever may send from it (its head, managers, admin).
+ *   whoever may send from it (its head, managers, admin), except anyone but a
+ *   manager / admin who may send from the SENDING department, wherever they
+ *   are posted (canFlagDispute: the first flag owns the line's one dispute
+ *   slot; a sender corrects by reverse instead).
  *
  * REVERSE (the one correction; a one-step transfer receiver → sender):
  *   · whoever may send from the ORIGINAL RECEIVER — it is a send from there —
@@ -80,7 +87,15 @@ export function bodyNumber(v: unknown): number {
  *   have counted the disputed line since it moved, the claim can no longer
  *   change any book (the take-back is refused, counted_since), and the head of
  *   the RECEIVING department (whose claim it is) may close it too — never the
- *   sender's head: see canDismissDispute.
+ *   sender's head, and never a person who heads BOTH ends (the Kitchen HOD may
+ *   send from Akan Tandoori too, ruling #40): see canDismissDispute.
+ *
+ * "WAITING ON YOU" (the bell, open_disputes_to_act, the page's "Disputes for
+ *   you to settle"): ONE predicate, hasDisputeActionFor() — this person holds
+ *   at least one control on an open dispute that the server will ACCEPT (a
+ *   close canDismissDispute allows, or a take-back whose prefill moves
+ *   something the ledger lets move). Nothing else badges: a count owed
+ *   elsewhere is not a control.
  */
 
 export interface DeptLite {
@@ -125,6 +140,18 @@ export function isAdminOrManager(user: Pick<SessionUser, 'role' | 'is_head_chef'
   return user.role === 'manager' && !user.is_head_chef;
 }
 
+/**
+ * May this person SEND this department's stock (and so act for it)?
+ *   · admin, and managers (isAdminOrManager — the HOD flag excluded): any;
+ *   · the department's NAMED head (head_user_id): that department only;
+ *   · an HOD (is_head_chef) POSTED to it (users.department_id), or posted to
+ *     the department it is a SUB-KITCHEN of (its parent_id) — ruling #40: "a
+ *     head chef sends ONLY from the department he is posted to (and its
+ *     sub-kitchens)". So the HOD posted to Kitchen sends from Kitchen and
+ *     from Akan Tandoori, Akan Main Kitchen …; the HOD posted to Akan Tandoori
+ *     sends from Akan Tandoori only (never its parent, never a sibling).
+ * One level, as the department tree is (Settings → Departments nests once).
+ */
 export function canSendFrom(
   user: Pick<SessionUser, 'id' | 'role' | 'is_head_chef' | 'department_id'>,
   dept: DeptLite | null | undefined,
@@ -132,7 +159,8 @@ export function canSendFrom(
   if (!dept) return false;
   if (isAdminOrManager(user)) return true;
   if (dept.head_user_id && dept.head_user_id === user.id) return true;
-  return !!user.is_head_chef && !!user.department_id && user.department_id === dept.id;
+  if (!user.is_head_chef || !user.department_id) return false;
+  return user.department_id === dept.id || (!!dept.parent_id && user.department_id === dept.parent_id);
 }
 
 export function canSeeDept(user: SessionUser, deptId: string, all: Map<string, DeptLite>): boolean {
@@ -149,7 +177,36 @@ export function isSender(user: SessionUser, doc: { created_by: string }): boolea
   return String(doc.created_by || '').trim().toLowerCase() === String(user.email || '').trim().toLowerCase();
 }
 
+/**
+ * Who may FLAG: anyone POSTED to the receiving department (any tier), managers
+ * and admin, and the receiving department's head — but NOT anyone (other than
+ * a manager / admin) who may send from the SENDING department, WHEREVER they
+ * are posted: the Kitchen HOD sends from its sub-kitchen Akan Tandoori too
+ * (ruling #40), one person can be the named head of two departments, and a
+ * named head of Kitchen can be posted to Akan Tandoori. Ruling #12: senders
+ * send; the receiving side flags. A line holds ONE open dispute, so the first
+ * flag owns the slot: measured (dispute-who slot.cjs) the head of both filed a
+ * token 0.001 kg "short" on Kitchen → Tandoori and the Tandoori cook's real
+ * 0.5 kg claim was refused 409 until he chose to withdraw his own — a sender
+ * silencing the receiver by flagging first.
+ *
+ * The sender check comes BEFORE the posting. Round 3 had it after ("posted to
+ * the receiver" returned first), so the same squat stayed open through the
+ * posting (squat-fix S10 / S11, verifier silence): the HOD posted to Kitchen —
+ * a sender head of every Akan Tandoori → Kitchen transfer under #40 — and a
+ * named head of Kitchen posted to Akan Tandoori each filed 0.001 kg first
+ * (201), the cook's real claim got 409, and the squatter withdrew (200)
+ * leaving no record of the cook's loss.
+ *
+ * Such a person needs no flag. When they also act for the receiver
+ * (reverseAuthority 'receiver', e.g. the Kitchen HOD on Tandoori → Kitchen)
+ * they correct it themselves with a send-back (ruling #2: corrections by
+ * reverse). Otherwise the receiver's own people flag and the claim reaches
+ * them as the sender's head ('disputed_only' take-back).
+ */
 export function canFlagDispute(user: SessionUser, doc: DeptTransferWithLines, all: Map<string, DeptLite>): boolean {
+  if (isAdminOrManager(user)) return true;
+  if (canSendFrom(user, all.get(doc.from_department_id))) return false;
   if (!!user.department_id && user.department_id === doc.to_department_id) return true;
   return canSendFrom(user, all.get(doc.to_department_id));
 }
@@ -178,6 +235,17 @@ export function canFlagDispute(user: SessionUser, doc: DeptTransferWithLines, al
  * sender's head still sees the dispute and the server's words (who closes it);
  * a manager, the flagger or the receiver's head closes it.
  *
+ * Why NOT a person who heads BOTH ends either. "The receiver's head" is
+ * canSendFrom(to_department), and one person can pass it for BOTH ends: the
+ * HOD posted to Kitchen sends from its sub-kitchen Akan Tandoori too (ruling
+ * #40), and one user can be the named head of two departments. Such a person
+ * IS the sender's head, so the arm refuses anyone who may send from the
+ * SENDING department — whatever else they head. (Round 2 left this open: the
+ * Kitchen HOD counted both departments through /api/closing-stock and closed
+ * Tandoori's claim against Kitchen — the silence exploit by another door.)
+ * Managers and admin are not affected (they returned above), nor is the
+ * flagger withdrawing their own claim.
+ *
  * `doc` / `all` omitted = the strict rule only (fail closed for any caller that
  * does not pass the document).
  */
@@ -193,6 +261,9 @@ export function canDismissDispute(
   if (!doc || !all) return false;
   const c = doc.lines.find((l) => l.id === d.line_id)?.counted_since;
   if (!c || !c.sender || !c.receiver) return false;
+  // Never anyone who may send from the SENDING department — a head of both
+  // ends included. See "Why NOT a person who heads BOTH ends" above.
+  if (canSendFrom(user, all.get(doc.from_department_id))) return false;
   // The RECEIVER's side only — see "Why NOT the sender's head" above.
   return canSendFrom(user, all.get(doc.to_department_id));
 }
@@ -213,6 +284,14 @@ export function reverseAuthority(user: SessionUser, doc: DeptTransferWithLines, 
 function reversePrefill(doc: DeptTransferWithLines, authority: ReverseAuthority | null) {
   if (!authority) return [];
   const anyOpen = doc.lines.some((l) => l.qty_open_disputed > 1e-9);
+  // WHAT the one tap means, not only how much: 'disputed' = it settles the open
+  // claim (the goods never reached the receiver's shelf — a correction on
+  // paper); 'standing' = no claim is open, so it returns goods that are on the
+  // receiver's shelf. The page echoes it back with the quantities (`expect`):
+  // a claim of the WHOLE line that someone else closed leaves the same
+  // quantity on offer with the opposite meaning (dept-ledger "A STALE TAP
+  // MOVES NOTHING").
+  const basis: DeptReverseBasis = anyOpen ? 'disputed' : 'standing';
   return doc.lines
     .map((l) => {
       const q = anyOpen ? (l.counted_since ? 0 : l.qty_open_disputed) : (authority === 'receiver' ? l.qty_net : 0);
@@ -225,36 +304,201 @@ function reversePrefill(doc: DeptTransferWithLines, authority: ReverseAuthority 
         quantity_purchase: toPurchaseQty(q, meta),
         unit: l.unit,
         purchase_unit: l.purchase_unit || l.unit,
+        basis,
       };
     })
     .filter((p) => p.quantity > 1e-9);
 }
 
+/**
+ * THE ONE RULE FOR "THIS DISPUTE IS WAITING ON YOU".
+ *
+ * The controls this person holds on ONE document's OPEN dispute(s) that the
+ * server will ACCEPT — nothing else:
+ *   · take_back: the one-tap reverse settles the claim — reverseAuthority()
+ *     gives them authority AND reversePrefill() would actually move something
+ *     (a disputed line counted since it moved is left out of the prefill and
+ *     the reverse refuses it, 'counted_since', so it is NOT a control) AND the
+ *     ledger would let that prefill move: the original RECEIVER still holds it
+ *     by dept-ledger's own deptSendableFor() (the figure the send check
+ *     refuses on, 'insufficient') and the original sender is still switched on
+ *     ('inactive_department'). Measured without this: Tandoori sent 3.8 of
+ *     its 4 kg on, the take-back of the disputed 0.5 was refused 409, and
+ *     the Kitchen head's bell still said 1. And each material may still ride
+ *     the department rail (materialRidesDeptRail: it exists, and it is not
+ *     store-mapped NOW — 'unknown_material' / 'store_mapped');
+ *   · close_ids: the open disputes canDismissDispute() lets them close (the
+ *     flagger withdrawing, a manager / admin, the receiving head — not a head
+ *     of the sending end — once both have counted).
+ * Both POST routes first require canSeeTransfer(), so it is required here too.
+ *
+ * hasDisputeActionFor() (any control at all) is what the BELL counts
+ * (notify.ts openDisputesToActFor), what GET /api/department-transfers returns
+ * as open_disputes_to_act (countDisputesToAct) and what the page lists under
+ * "Disputes for you to settle" (permissions.dispute_to_act). One predicate, so
+ * a badge always opens a page with a button the server accepts, and a dispute
+ * someone can settle is never left unbadged. A count owed on the other shelf
+ * (the take-back refused because one side counted) is NOT a control here: the
+ * document still shows the server's words (reverse_blocked) to whoever acts
+ * for it, but it badges only the people who can close it.
+ */
+export interface DisputeActions {
+  take_back: boolean;
+  close_ids: string[];
+}
+
+/**
+ * May this material still move between departments? The two questions
+ * dept-ledger's writer (postDeptTransferInTxn, and sendDeptTransfer before it)
+ * asks of a material before it looks at any quantity, asked the same way:
+ *   · the raw material still exists (transferMaterial → 'unknown_material');
+ *   · it is NOT store-mapped NOW — store-engine isStoreMappedMaterial(), the
+ *     very function storeRailBlock() calls (→ 'store_mapped', 409).
+ * The store map is read live, so a material that BECAME store-mapped after it
+ * moved — the owner re-categorises a liquor-looking item in Raw Materials
+ * (ruling #6), or Settings → Stores maps its category — can no longer be sent
+ * back at all. Measured without this (bell-page verifier, store_mapped): every
+ * head holding only a take-back was badged 1 on a dispute whose take-back was
+ * refused 409 'store_mapped', with no other control — a badge nobody could
+ * clear. A manager, admin or the flagger still closes it (canDismissDispute).
+ * FAILS CLOSED like storeRailBlock(): if the map cannot be read the writer
+ * refuses, so the take-back is not counted as a control.
+ */
+function materialRidesDeptRail(db: Database.Database, materialId: string): boolean {
+  const id = String(materialId || '');
+  try {
+    if (!db.prepare('SELECT 1 FROM raw_materials WHERE id = ?').get(id)) return false;
+    return !isStoreMappedMaterial(db, id);
+  } catch { return false; }
+}
+
+/**
+ * Would the one-tap reverse's prefill get past the ledger's send checks? The
+ * reverse is an ordinary send from the ORIGINAL RECEIVER back to the ORIGINAL
+ * SENDER through the same writer (dept-ledger resolveEnds + the "sender must
+ * hold it" check per line), so this asks the same two questions with the same
+ * functions: both ends exist and the one receiving it back is switched on;
+ * and the original receiver can send each material's prefilled total by
+ * deptSendableFor() — the very figure the writer refuses on. Lines of one
+ * material are summed, as the writer posts them one after another. Before any
+ * quantity, the writer's material checks (materialRidesDeptRail below): one
+ * line refused refuses the whole tap, so one store-mapped line is enough.
+ */
+function prefillPassesLedger(
+  db: Database.Database, doc: DeptTransferWithLines, all: Map<string, DeptLite>,
+  prefill: ReturnType<typeof reversePrefill>,
+): boolean {
+  const backTo = all.get(doc.from_department_id);
+  if (!backTo || !all.has(doc.to_department_id) || !Number(backTo.is_active)) return false;
+  const need = new Map<string, number>();
+  for (const p of prefill) need.set(p.material_id, (need.get(p.material_id) || 0) + p.quantity);
+  for (const [materialId, q] of need) {
+    if (!materialRidesDeptRail(db, materialId)) return false;
+    const want = Math.round(q * 1e6) / 1e6;
+    if (want > deptSendableFor(db, doc.to_department_id, materialId).available + 1e-9) return false;
+  }
+  return true;
+}
+
+function disputeActions(
+  db: Database.Database, user: SessionUser, doc: DeptTransferWithLines, all: Map<string, DeptLite>,
+  authority: ReverseAuthority | null, prefill: ReturnType<typeof reversePrefill>,
+): DisputeActions {
+  const none: DisputeActions = { take_back: false, close_ids: [] };
+  if (doc.status !== 'posted' || doc.dispute_status !== 'open') return none;
+  if (!doc.disputes.some((d) => d.status === 'open')) return none;
+  if (!canSeeTransfer(user, doc, all)) return none;
+  // The reverse settles a claim only when a line has an open disputed amount —
+  // then the prefill IS the disputed amounts (never the whole line).
+  const anyOpen = doc.lines.some((l) => l.qty_open_disputed > 1e-9);
+  return {
+    take_back: anyOpen && !!authority && prefill.length > 0 && prefillPassesLedger(db, doc, all, prefill),
+    close_ids: doc.disputes.filter((d) => canDismissDispute(user, d, doc, all)).map((d) => d.id),
+  };
+}
+
+export function disputeActionsFor(
+  db: Database.Database, user: SessionUser, doc: DeptTransferWithLines, all: Map<string, DeptLite>,
+): DisputeActions {
+  const authority = reverseAuthority(user, doc, all);
+  return disputeActions(db, user, doc, all, authority, reversePrefill(doc, authority));
+}
+
+/** THE predicate: this person holds at least one control on an open dispute of
+ *  this document that the server will accept. See DisputeActions above. */
+export function hasDisputeActionFor(
+  db: Database.Database, user: SessionUser, doc: DeptTransferWithLines, all: Map<string, DeptLite>,
+): boolean {
+  const a = disputeActionsFor(db, user, doc, all);
+  return a.take_back || a.close_ids.length > 0;
+}
+
+/** Open-dispute transfers waiting on this person (hasDisputeActionFor), every
+ *  one of them — no page limit. The ids, newest first. Never throws ([] on a
+ *  failure: a bell must never break the inbox). */
+export function disputesToActIds(db: Database.Database, user: SessionUser, all?: Map<string, DeptLite>): string[] {
+  try {
+    const depts = all || loadDepartments(db);
+    const rows = db.prepare(`
+      SELECT id FROM department_transfers WHERE dispute_status = 'open' ORDER BY created_at DESC, rowid DESC
+    `).all() as Array<{ id: string }>;
+    const out: string[] = [];
+    for (const { id } of rows) {
+      const doc = getDeptTransfer(db, id);
+      if (doc && hasDisputeActionFor(db, user, doc, depts)) out.push(doc.id);
+    }
+    return out;
+  } catch { return []; }
+}
+
+/** The bell's and open_disputes_to_act's figure: transfers (not lines) with an
+ *  open dispute this person can settle. */
+export function countDisputesToAct(db: Database.Database, user: SessionUser, all?: Map<string, DeptLite>): number {
+  return disputesToActIds(db, user, all).length;
+}
+
 /** What the CALLER may do with one document — sent with every document so the
  *  screen shows exactly the buttons the server will accept. */
-export function permissionsFor(user: SessionUser, doc: DeptTransferWithLines, all: Map<string, DeptLite>) {
+export function permissionsFor(
+  user: SessionUser, doc: DeptTransferWithLines, all: Map<string, DeptLite>, db: Database.Database,
+) {
   const authority = reverseAuthority(user, doc, all);
   const prefill = reversePrefill(doc, authority);
   const flaggable = doc.lines.some((l) => l.qty_net > 1e-9
     && !doc.disputes.some((d) => d.line_id === l.id && d.status === 'open'));
+  const acts = disputeActions(db, user, doc, all, authority, prefill);
   return {
     is_sender: isSender(user, doc),
     can_flag_dispute: doc.status === 'posted' && flaggable && canFlagDispute(user, doc, all),
     can_reverse: doc.status === 'posted' && prefill.length > 0,
     reverse_authority: authority,
+    /** What the one-tap Send back / Take back moves NOW, and what it means
+     *  (`basis`: 'disputed' settles the open claim, 'standing' returns goods).
+     *  The page echoes it back on the tap as `expect` ({ line_id, quantity,
+     *  basis } — this recipe-unit `quantity`, unconverted); the reverse refuses
+     *  ('stale', 409) when either has changed since, e.g. someone else settled
+     *  or closed the claim (dept-ledger "A STALE TAP MOVES NOTHING"). */
     reverse_prefill: prefill,
     /** For someone who could otherwise take a disputed line back: why one or
      *  more disputed lines CANNOT be — counted since it moved — and what to do
      *  instead. The same words the reverse refusal prints. null = nothing blocked. */
     reverse_blocked: authority && doc.status === 'posted' ? deptTransferCountedSinceMessage(doc) : null,
     dismissable_dispute_ids: doc.disputes.filter((d) => canDismissDispute(user, d, doc, all)).map((d) => d.id),
+    /** THE predicate (hasDisputeActionFor): an open dispute here is waiting on
+     *  this person — they hold a take-back or a close the server accepts. The
+     *  page's "Disputes for you to settle" lists exactly these; the bell and
+     *  open_disputes_to_act count exactly these. */
+    dispute_to_act: acts.take_back || acts.close_ids.length > 0,
   };
 }
 
 /** A document for the wire: the stored rows (RECIPE units, as the ledger keeps
  *  them) plus each quantity in the PURCHASE unit through toPurchaseQty() with
- *  the line's own snapshotted pack factor — the screen leads with these. */
-export function presentTransfer(user: SessionUser, doc: DeptTransferWithLines, all: Map<string, DeptLite>) {
+ *  the line's own snapshotted pack factor — the screen leads with these.
+ *  `db` is for permissions.dispute_to_act (the take-back's ledger check). */
+export function presentTransfer(
+  user: SessionUser, doc: DeptTransferWithLines, all: Map<string, DeptLite>, db: Database.Database,
+) {
   const lineMeta = new Map(doc.lines.map((l) => [l.id, { unit: l.unit, purchase_unit: l.purchase_unit, pack_size: l.pack_factor }]));
   return {
     ...doc,
@@ -286,7 +530,7 @@ export function presentTransfer(user: SessionUser, doc: DeptTransferWithLines, a
         unit: line?.unit || '',
       };
     }),
-    permissions: permissionsFor(user, doc, all),
+    permissions: permissionsFor(user, doc, all, db),
   };
 }
 
