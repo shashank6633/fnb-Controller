@@ -1,9 +1,12 @@
 import { getDb } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId } from '@/lib/auth';
-import { getDeptTransfer, reverseDeptTransfer, deptTransferSettledNote, type TransferEntryUnit, type DeptReverseBasis } from '@/lib/dept-ledger';
 import {
-  loadDepartments, reverseAuthority, canSeeTransfer, canSendFrom, presentTransfer, transferErrorResponse, resolveEntryUnit, bodyNumber,
+  getDeptTransfer, reverseDeptTransfer, deptTransferSettledNote, isDeptTransferBlocked, type TransferEntryUnit, type DeptReverseBasis,
+} from '@/lib/dept-ledger';
+import {
+  loadDepartments, reverseAuthority, canSeeTransfer, canSendFrom, transferErrorResponse, resolveEntryUnit, bodyNumber,
 } from '../../access';
+import { presentChecked, whoClosesCounted } from '../../send-back-check';
 
 /**
  * POST /api/department-transfers/<id>/reverse — THE correction. One tap from
@@ -55,9 +58,11 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
 
   const outletId = await getCurrentOutletId();
   const db = getDb();
+  let seen: { to_department_name: string; from_department_name: string } | null = null;
   try {
     const doc = getDeptTransfer(db, String(id || ''));
     if (!doc) return Response.json({ error: 'Transfer not found' }, { status: 404 });
+    seen = doc;
     const depts = loadDepartments(db);
     if (!canSeeTransfer(me, doc, depts)) return Response.json({ error: 'Not allowed for this transfer' }, { status: 403 });
 
@@ -77,8 +82,8 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       const priorDoc = prior ? getDeptTransfer(db, prior.id) : null;
       if (priorDoc) {
         return Response.json({
-          transfer: presentTransfer(me, priorDoc, depts, db),
-          original: presentTransfer(me, doc, depts, db),
+          transfer: presentChecked(me, priorDoc, depts, db),
+          original: presentChecked(me, doc, depts, db),
           duplicate: true,
         }, { status: 200 });
       }
@@ -162,11 +167,14 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       outletId,
     });
     return Response.json({
-      transfer: presentTransfer(me, res.transfer, depts, db),
-      original: presentTransfer(me, res.original, depts, db),
+      transfer: presentChecked(me, res.transfer, depts, db),
+      original: presentChecked(me, res.original, depts, db),
       duplicate: res.duplicate,
     }, { status: res.duplicate ? 200 : 201 });
   } catch (e: any) {
+    // The counted-since refusal reads word-for-word what the screen showed
+    // (permissions.reverse_blocked, ../../send-back-check.ts whoClosesCounted).
+    if (seen && isDeptTransferBlocked(e) && e.reason === 'counted_since') e.message = whoClosesCounted(e.message, seen);
     const handled = transferErrorResponse(db, e);
     if (handled) return handled;
     console.error('[department-transfers/[id]/reverse POST]', e);

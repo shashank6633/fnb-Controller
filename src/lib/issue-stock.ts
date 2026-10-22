@@ -122,22 +122,91 @@
  * A THIRD mechanism now sits on top of the stock clamp, and it is not a clamp:
  * the department must actually still HOLD the goods. See assertReversible.
  *
+ * ── AND A FOURTH, ON THE OTHER DIRECTION: THE CENTRAL FLOOR ────────────────
+ * Until this change the DEBIT direction had no bound at all. Issuing a line for
+ * more than the central store holds succeeded silently and drove
+ * raw_materials.current_stock NEGATIVE — measured on a copy of the live db,
+ * central 0 kg -> -1 kg on a 1 kg issue, with nothing anywhere on the path
+ * refusing it. The owner has decided the server must refuse, so that no caller
+ * — not the two issue desks, not a direct API call, not a future writer — can
+ * take out more than is there. See assertCentralIssue / checkCentralIssue.
+ *
+ * TWO LAYERS, AND THE SPLIT IS THE WHOLE DESIGN:
+ *   1. assertCentralIssue() here is the FLOOR. It reads current_stock inside the
+ *      caller's transaction, immediately before the debit, and THROWS. It is the
+ *      only thing that can make the no-negative property structural, because it
+ *      sits on the single writer.
+ *   2. checkCentralIssue() is the same rule asked EARLY. Both routes run it over
+ *      every line BEFORE opening their transaction and refuse the whole gesture
+ *      with every short line named. That is what keeps the floor from ever being
+ *      the thing the storekeeper meets: by the time the transaction opens, the
+ *      numbers have already been agreed.
+ *
+ * WHY THE FLOOR THROWS RATHER THAN CLAMPS, which is the same reason the reversal
+ * guard throws: every caller has ALREADY written quantity_issued by the time we
+ * are called. Silently debiting less than the line claims commits a row reading
+ * "5 kg issued" against 0.4 kg that actually moved — the two rails diverge with
+ * nothing on screen to show it. A throw unwinds the caller's transaction and the
+ * line stays exactly as it was.
+ *
+ * THE FLOOR IS ON THE DEBIT ONLY. A credit (undo / reject / a reduced absolute
+ * re-process) can never drive central negative — it moves stock INTO the store —
+ * and it already has two bounds of its own above. Putting the floor on both
+ * directions would refuse every legitimate undo the moment a material's balance
+ * happened to be 0.
+ *
+ * THE THREE CARVE-OUTS ARE CARVED OUT HERE TOO, necessarily: party,
+ * store-mapped and ambiguous-unit lines debit nothing, so there is nothing for a
+ * floor to bound. Refusing them for a central balance they never touch would
+ * stop four daily operations over a rail they are not on.
+ *
+ * ── THE PARTY RAIL BORROWS THIS FLOOR; IT DOES NOT GROW ITS OWN ────────────
+ * A party line debits nothing HERE, but it is not free: the goods leave central
+ * later, in one lump, when the requisition reaches 'fulfilled'. Three writers do
+ * that — applyPartyFulfillment (both issue desks) and fulfilRequisitionFromPo
+ * (the PO-receipt / GRN-QC cascade) — and until now every one of them ran
+ * `current_stock = current_stock - ?` with no balance read of any kind. Measured
+ * over 76 material shapes at both desks: 152 attempts, 0 refused, global
+ * MIN(current_stock) −36,000.
+ *
+ * All three now ask THIS function, with rail:'party'. They do not get a floor of
+ * their own, for the two reasons this file keeps repeating: a second floor with
+ * slightly different rules is the rival-helper trap, and a second unit
+ * conversion is the 750x trap (the party rail had one of those too — see
+ * lineFactor's note on the three hand-rolled packFactor copies).
+ *
+ * WHAT "REFUSE" MEANS SPLITS BY WHETHER ANYONE IS THERE TO READ IT, and that is
+ * a deliberate decision documented at both sites: the two issue desks THROW
+ * (a storekeeper is at the counter and both routes already answer 400 with the
+ * message), while the PO/QC cascade CLAMPS and records the shortfall, because a
+ * throw there would roll back a delivery that physically arrived, in front of
+ * nobody. See the comment above the clamp in po-requisition-fulfil.ts.
+ *
  * pack_factor is stored per row so the log can reverse each row's conversion
  * with the factor ACTUALLY USED — a later Unit Audit rebase changes a
  * material's factor, and the pre-ledger remainder arithmetic in the end-to-end
  * log depends on that reversal being exact.
  */
-import { packFactor } from '@/lib/pack-units';
+import { packFactor, fmtQtyNum, toPurchaseQty, shownPurchaseQty } from '@/lib/pack-units';
 import { generateId } from '@/lib/db';
 import { centralFlowBlock } from '@/lib/store-engine';
 import { postDeptLedger, assertReversible } from '@/lib/dept-ledger';
 import { postCentralTxn, deptParty } from '@/lib/movement-record';
+// THE ONE RULE for "does this debit fit, and what do we subtract" — shared with
+// every other central floor. See its header for the grid and why 1e-6, and for
+// the shown-figure rule the desks' purchase-unit figure obeys (round 6).
+import {
+  planCentralDebit, holdsAny, qtyDown, qtyGrid, fmtGridQty, issuedCoversAsk, shownWithStep,
+  shelfMarkHolds, onGrid, type ShownAs,
+} from '@/lib/central-debit-clamp';
 
 export interface IssueDeltaInput {
   reqItemId: string;
   beforeLineQty: number;
   afterLineQty: number;
-  /** issue | store_process | undo | store_reject | admin_adjust */
+  /** issue | store_process | undo | store_reject | admin_adjust | party_shelf
+   *  (party_shelf: the party rail correcting a line to what its transfer took
+   *  off the shelf — recordPartyShelfTake). */
   reason: string;
   actor?: string;
   /** Per-gesture token. Present => a replay collides on uq_req_issue_token_item. */
@@ -254,6 +323,1582 @@ export function lineFactor(
   return { factor: 1, needsReview: true };                   // unrecognised unit — refuse
 }
 
+/**
+ * The figure a desk SHOWS for a quantity of this LINE: line units → recipe
+ * (lineFactor) → the purchase-unit figure shownPurchaseQty prints (round 8:
+ * the 6-dp grid point, then integer half-up), the arithmetic of both desks'
+ * "In store" column. The same converter checkCentralIssue hands
+ * planCentralDebit, applied to a line quantity instead of a balance.
+ *
+ * null for a line whose unit cannot be resolved (lineFactor's needsReview):
+ * nobody can say what such a line "shows", so only exact comparisons apply.
+ *
+ * It CARRIES ITS PRINTED STEP (round 7b): toPurchaseQty prints 3 dp of the
+ * purchase unit, so one step is 0.001 purchase unit = 0.001 × packFactor
+ * recipe units = that ÷ factor in the LINE's units (0.001 on a line kept in
+ * the purchase unit, 1 g on a gram line of a 1000-pack). issuedCoversAsk (THE
+ * RULE) reads it for its shelf arm — "what remains owing is below one printed
+ * step" — and only after a take that emptied the shelf; planCentralDebit
+ * ignores it.
+ */
+export function lineShownAs(
+  lineUnit: string | null | undefined,
+  rm: { unit?: string | null; purchase_unit?: string | null; pack_size?: number | null },
+): ShownAs | null {
+  const { factor, needsReview } = lineFactor(lineUnit, rm);
+  if (needsReview) return null;
+  const meta = { unit: rm.unit, purchase_unit: rm.purchase_unit, pack_size: rm.pack_size };
+  return shownWithStep(
+    (lineQty: number) => shownPurchaseQty((Number(lineQty) || 0) * factor, meta),
+    (0.001 * packFactor(meta)) / factor,
+  );
+}
+
+/** The columns lineIssueComplete reads. `line_unit` is requisition_items.unit;
+ *  unit / purchase_unit / pack_size are the material's (raw_materials).
+ *  `shelf_emptied_qty` is requisition_items.shelf_emptied_qty — THE RULE's
+ *  memory of a take that emptied the shelf (central-debit-clamp.ts). A reader
+ *  that does not select it reads every line by the first arm only, so EVERY
+ *  caller of lineIssueComplete must select it (round 8). */
+export interface LineCompletenessRow {
+  quantity_issued: number | null;
+  chef_approved_qty: number | null;
+  quantity_requested: number | null;
+  line_unit: string | null;
+  unit: string | null;
+  purchase_unit: string | null;
+  pack_size: number | null;
+  shelf_emptied_qty?: number | null;
+}
+
+/**
+ * IS THIS REQUISITION LINE COMPLETE? — THE RULE (src/lib/central-debit-clamp.ts
+ * issuedCoversAsk), read from a stored line. The ONE predicate every server
+ * reader of "this line is done" calls: store-issue's defer rule and its
+ * auto-advance, store-process's final status, the list's lines_owing and the
+ * defer-due alert.
+ *
+ *     issued ≥ approved (within 1e-9)
+ *     ∨ ( the line's shelf mark speaks for its quantity_issued — a take that
+ *         emptied the central shelf closed it there (stampShelfClose) —
+ *         ∧ what remains owing is below one printed step )
+ *
+ * The mark is written at the take, by the writer that took (applyIssueDelta;
+ * the two party rails), never inferred here: 14.8424 kg recorded of 14.843
+ * reads the same whether the take emptied the shelf or not, and only the first
+ * is complete. A remainder below a step over a shelf that still holds stock is
+ * an ordinary open line.
+ */
+export function lineIssueComplete(l: LineCompletenessRow): boolean {
+  const eff = (l.chef_approved_qty != null ? Number(l.chef_approved_qty) : Number(l.quantity_requested)) || 0;
+  const got = Number(l.quantity_issued) || 0;
+  return issuedCoversAsk(got, eff, lineShownAs(l.line_unit, l), shelfMarkHolds(l.shelf_emptied_qty, got));
+}
+
+/**
+ * THE RULE'S MEMORY, WRITTEN AT THE TAKE (round 8).
+ *
+ * Called by every writer that takes central stock for a requisition line,
+ * inside its transaction, immediately after the debit — applyIssueDelta (both
+ * desks' internal rail), applyPartyFulfillment (both desks' party rail) and
+ * fulfilRequisitionFromPo (the PO cascade) — with `emptied` = this take left
+ * the material holding nothing (holdsAny false on the balance it just wrote).
+ * applyIssueDelta also calls it on every other write of quantity_issued that
+ * moves no stock (a credit, a party or carve-out line) with `emptied` false.
+ *
+ * It applies THE RULE to the line as it now stands. When the line is complete
+ * ONLY by the shelf arm — the take emptied the shelf and what remains owing is
+ * below one printed step — it stamps requisition_items.shelf_emptied_qty with
+ * the quantity_issued it closed at; otherwise it clears any stamp. It writes
+ * nothing when the column already says the right thing, so an ordinary issue
+ * changes no row beyond what it always changed.
+ *
+ * Returns whether the line is now complete, and whether by the shelf.
+ */
+export function stampShelfClose(
+  db: any, reqItemId: string, emptied: boolean,
+): { complete: boolean; byShelf: boolean } {
+  const l = db.prepare(`
+    SELECT ri.quantity_issued, ri.chef_approved_qty, ri.quantity_requested, ri.shelf_emptied_qty,
+           ri.unit AS line_unit, rm.unit, rm.purchase_unit, rm.pack_size
+      FROM requisition_items ri
+      LEFT JOIN raw_materials rm ON rm.id = ri.material_id
+     WHERE ri.id = ?
+  `).get(String(reqItemId)) as (LineCompletenessRow & { shelf_emptied_qty: number | null }) | undefined;
+  if (!l) return { complete: false, byShelf: false };
+  const eff = (l.chef_approved_qty != null ? Number(l.chef_approved_qty) : Number(l.quantity_requested)) || 0;
+  const got = Number(l.quantity_issued) || 0;
+  const shown = lineShownAs(l.line_unit, l);
+  const inFull = issuedCoversAsk(got, eff, shown, false);
+  const byShelf = !inFull && emptied === true && issuedCoversAsk(got, eff, shown, true);
+  const want: number | null = byShelf ? got : null;
+  const have: number | null = l.shelf_emptied_qty == null ? null : Number(l.shelf_emptied_qty);
+  if (want !== have) {
+    db.prepare(`UPDATE requisition_items SET shelf_emptied_qty = ? WHERE id = ?`).run(want, String(reqItemId));
+  }
+  return { complete: inFull || byShelf, byShelf };
+}
+
+/**
+ * THE SAME FACT, KEPT AS HISTORY (round 8b). When a take closes a line by the
+ * shelf arm (stampShelfClose's `byShelf`), the ledger ROW of that take is
+ * stamped with the quantity the line closed at (requisition_issue_ledger.
+ * shelf_mark). The line's own mark is retired by the next write of
+ * quantity_issued — an undo, a later issue — which is right for "is the line
+ * complete NOW", and wrong for "was it complete after THIS issue": the Issue
+ * Log read the issue that had closed THREE MANGO (14.8424 of 14.843 kg, the
+ * 14,842.4 g shelf emptied) as "PART still open 0.6 g" once the line was undone
+ * (round-8 verifier, sd_undo_shelf). The row's copy is never cleared.
+ *
+ * `ledgerId` names the row when the caller has it (applyIssueDelta, right after
+ * inserting it); otherwise the line's latest row whose after_line_qty is the
+ * closing quantity — the party transfer's correction row, or the issue row the
+ * transfer moved unchanged. A database that has not booted the column (or has
+ * no ledger) is left alone: the Issue Log then reads the first arm only.
+ *
+ * `sinceRowid` (round 10): ONLY A ROW OF THE GESTURE THAT CLOSED THE LINE. The
+ * lookup above takes the latest row at the closing quantity — which is an
+ * EARLIER gesture's row whenever the gesture that closed the line wrote none
+ * for it. MEASURED (round-9 issue-log verifier, party_retro_stamp): WHOLE
+ * DHANIYA 3.2174 of 3.218 kg recorded in one gesture (PART, the transfer not
+ * yet run), then SALT issued in a second gesture, whose transfer took the
+ * 3.2174 kg shelf and closed DHANIYA — and the FIRST gesture's ISSUE row was
+ * stamped, so the Issue Log retro-read it FULL for a take that had left the
+ * line open. With `sinceRowid` (the ledger's MAX(rowid) when the closing
+ * gesture began) the lookup is limited to that gesture's own rows; when it
+ * wrote none for the line, nothing is stamped and the earlier row keeps the
+ * PART it truthfully was. Omitted ⇒ the round-8b lookup, byte for byte (the PO
+ * cascade still calls it that way).
+ */
+export function markLedgerShelfClose(
+  db: any, reqItemId: string, closedAt?: number | null, ledgerId?: string | null, sinceRowid?: number | null,
+): void {
+  if (!ledgerHasShelfMark(db)) return;
+  // The quantity stampShelfClose stamped: the line's quantity_issued as it now
+  // stands, unless the caller already holds it.
+  const q = closedAt != null ? (Number(closedAt) || 0)
+    : (Number((db.prepare(`SELECT quantity_issued FROM requisition_items WHERE id = ?`)
+        .get(String(reqItemId)) as { quantity_issued?: number } | undefined)?.quantity_issued) || 0);
+  if (!(q > 0)) return;
+  const since = sinceRowid != null && Number.isFinite(Number(sinceRowid)) ? Number(sinceRowid) : null;
+  const id = ledgerId || (since == null
+    ? (db.prepare(`
+        SELECT id FROM requisition_issue_ledger
+         WHERE req_item_id = ? AND ABS(after_line_qty - ?) <= 1e-9
+         ORDER BY rowid DESC LIMIT 1
+      `).get(String(reqItemId), q) as { id?: string } | undefined)?.id
+    : (db.prepare(`
+        SELECT id FROM requisition_issue_ledger
+         WHERE req_item_id = ? AND ABS(after_line_qty - ?) <= 1e-9 AND rowid > ?
+         ORDER BY rowid DESC LIMIT 1
+      `).get(String(reqItemId), q, since) as { id?: string } | undefined)?.id);
+  if (id) db.prepare(`UPDATE requisition_issue_ledger SET shelf_mark = ? WHERE id = ?`).run(q, String(id));
+}
+
+/** The issue ledger's high-water mark — MAX(rowid), 0 when empty — read where
+ *  a gesture begins, so markLedgerShelfClose can tell that gesture's rows from
+ *  earlier ones (round 10). 0 when the table cannot be read. */
+export function issueLedgerWatermark(db: any): number {
+  try {
+    return Number((db.prepare(`SELECT COALESCE(MAX(rowid), 0) AS m FROM requisition_issue_ledger`).get() as
+      { m?: number } | undefined)?.m) || 0;
+  } catch { return 0; }
+}
+const ledgerShelfMarkProbe = new WeakMap<object, boolean>();
+function ledgerHasShelfMark(db: any): boolean {
+  const k = db as object;
+  const known = ledgerShelfMarkProbe.get(k);
+  if (known !== undefined) return known;
+  let ok = false;
+  try {
+    ok = (db.prepare(`PRAGMA table_info(requisition_issue_ledger)`).all() as Array<{ name: string }>)
+      .some(c => String(c.name) === 'shelf_mark');
+  } catch { ok = false; }
+  ledgerShelfMarkProbe.set(k, ok);
+  return ok;
+}
+
+/** Did the take that just ran leave this material holding nothing? Read
+ *  inside the caller's transaction, immediately after its debit. */
+export function centralShelfEmpty(db: any, materialId: string): boolean {
+  const r = db.prepare(`SELECT current_stock FROM raw_materials WHERE id = ?`).get(String(materialId)) as any;
+  return !holdsAny(Math.max(0, Number(r?.current_stock) || 0));
+}
+
+/**
+ * THE LINES A GESTURE LEFT AT 0, IN THE HELD SENTENCE (round 7). Both issue
+ * routes close their held-line sentence with "Everything else … was issued";
+ * a line the storekeeper entered as 0 in the same gesture was not issued
+ * either (store-issue skips it, store-process writes it unchanged), so it is
+ * named first and "everything else" stops counting it. Measured: MIRCHI held,
+ * SALT entered as 0, EGGS issued — the alert said everything else was issued
+ * and SALT stayed at 0. '' when there is none, so every other held sentence is
+ * byte-identical. The desks' pre-submit banners say the same in the present
+ * tense (zeroEntrySentence in both pages).
+ */
+export function zeroEntriesSentence(names: string[]): string {
+  if (!names.length) return '';
+  const list = names.length === 1 ? names[0]
+    : `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
+  const one = names.length === 1;
+  return ` ${list} ${one ? 'was' : 'were'} entered as 0, so ${one ? 'it was' : 'they were'} not issued either.`;
+}
+
+/* ────────────────────────────────────────────────────────────────────────────
+ * THE CENTRAL FLOOR — no requisition issue may drive current_stock negative.
+ * ──────────────────────────────────────────────────────────────────────────*/
+
+/**
+ * Thrown by assertCentralIssue(). Routes answer 400 with `.message` and the
+ * structured fields, exactly as they already do for DeptReversalBlocked.
+ *
+ * EVERY QUANTITY ON THIS ERROR CARRIES ITS BASIS IN ITS NAME. The *Purchase
+ * fields are what a message may print (OWNER RULE: store and inventory surfaces
+ * lead with the purchase unit); the *Recipe fields are the stored truth. Mixing
+ * them is the 750x error this file exists to prevent.
+ */
+export class CentralStockShort extends Error {
+  readonly code = 'CENTRAL_STOCK_SHORT';
+  readonly reqItemId: string;
+  readonly materialId: string;
+  readonly materialName: string;
+  /** RECIPE units the debit wanted. */
+  readonly requestedRecipe: number;
+  /** RECIPE units issuable right now (never negative). */
+  readonly availableRecipe: number;
+  /** PURCHASE units the debit wanted — printable. */
+  readonly requestedPurchase: number;
+  /** PURCHASE units issuable right now — printable. */
+  readonly availablePurchase: number;
+  readonly purchaseUnit: string;
+  /** Largest value the line's Issue box may hold, in THE LINE'S OWN unit. */
+  readonly maxIssueLineQty: number;
+  readonly lineUnit: string;
+  /** The most a box that ADDS to the line may hold (round 9) — line units and
+   *  exact purchase units. See CentralIssueCheck.maxAddLineQty. */
+  readonly maxAddLineQty: number;
+  readonly maxAddPurchase: number;
+  /** What the line already held, as the store desk's box saw it (party rail
+   *  inside /store-issue); 0 otherwise. */
+  readonly deskBeforeLineQty: number;
+  /**
+   * EVERY OTHER LINE THE SAME FLOOR REFUSED IN THIS GESTURE (round 10). The
+   * party transfer used to throw on the FIRST short line, so the 400 named
+   * only that one and the store desk's held panel offered its cap as though
+   * it were the only obstacle — "Issuing it completes the requisition, and the
+   * party transfer then moves the line's whole 5.158 kg … and the line is
+   * issued in full" — and pressing it met the SECOND short line (round-9
+   * never-stuck recheck, two-short: MANGO 6 kg typed over 5,158 g plus WHOLE
+   * DHANIYA 1/1 recorded over a 0 kg shelf). The transfer now scores every
+   * line before it refuses, and the first refusal carries the rest here, in
+   * the transfer's order. [] on every single-line refusal.
+   */
+  others: CentralStockShort[] = [];
+  /** See CentralIssueCheck.rewordBlocked. Absent off the party rail. Held
+   *  NON-ENUMERABLY (set in the constructor), so a route that logs the error
+   *  object prints exactly the fields it always printed. */
+  private declare readonly rewordBlocked?: (blockers: readonly string[]) => string;
+
+  /**
+   * NAME THE OTHER SHORT LINES IN THIS LINE'S OWN SENTENCE (final pass). The
+   * party transfer is refused whole, so a cap printed for this line — "Issue
+   * 5.158 kg or less on this line" — is not a way forward on its own while
+   * another line it cannot cover stays in the transfer: pressed alone it met
+   * that line again (round-10 recheck, two-short: THREE MANGO's cap, refused
+   * over WHOLE DHANIYA). `names` are the lines that will still block; the
+   * sentence is rebuilt from the same figures with them named. A no-op off the
+   * party rail or with no names.
+   */
+  nameBlockers(names: readonly string[]): void {
+    if (!this.rewordBlocked || names.length === 0) return;
+    this.message = this.rewordBlocked(names);
+  }
+
+  constructor(c: CentralIssueCheck) {
+    super(c.message);
+    this.name = 'CentralStockShort';
+    if (c.rewordBlocked) {
+      Object.defineProperty(this, 'rewordBlocked', { value: c.rewordBlocked, enumerable: false });
+    }
+    this.reqItemId = c.reqItemId;
+    this.materialId = c.materialId;
+    this.materialName = c.materialName;
+    this.requestedRecipe = c.requestedRecipe;
+    this.availableRecipe = c.availableRecipe;
+    this.requestedPurchase = c.requestedPurchase;
+    this.availablePurchase = c.availablePurchase;
+    this.purchaseUnit = c.purchaseUnit;
+    this.maxIssueLineQty = c.maxIssueLineQty;
+    this.lineUnit = c.lineUnit;
+    this.maxAddLineQty = c.maxAddLineQty;
+    this.maxAddPurchase = c.maxAddPurchase;
+    this.deskBeforeLineQty = c.deskBeforeLineQty;
+  }
+}
+
+export function isCentralStockShort(e: unknown): e is CentralStockShort {
+  return e instanceof CentralStockShort
+    || (typeof e === 'object' && e !== null && (e as { code?: string }).code === 'CENTRAL_STOCK_SHORT');
+}
+
+export interface CentralIssueCheck {
+  /** false => this debit would take central below zero. */
+  ok: boolean;
+  /**
+   * Does this write debit central at all? false for the three carve-outs
+   * (party / store-mapped / ambiguous unit), for a credit, for a zero delta and
+   * for a line that no longer exists. `ok` is always true when this is false —
+   * there is nothing to bound.
+   */
+  debits: boolean;
+  /**
+   * WHY `debits` is false. '' when it is true.
+   *
+   * The same vocabulary applyIssueDelta stamps on its ledger row, deliberately,
+   * so one word means one thing on both. The internal rail never needed to read
+   * it — a carve-out there simply means "no floor applies" and the row records
+   * the reason itself. THE PARTY RAIL DOES NEED IT: party-fulfillment writes no
+   * requisition_issue_ledger row, so a line it declines to move leaves no trace
+   * unless the caller is told which reason to record, and it must gate the
+   * matching DEPARTMENT credit by the same answer — crediting a department for a
+   * gram central never gave up manufactures stock, which is the one outcome
+   * worse than a gap (see the store_mapped note in applyIssueDelta).
+   */
+  skipReason: '' | 'party' | 'store_mapped' | 'unit_review' | 'zero_delta' | 'missing_line';
+  reqItemId: string;
+  materialId: string;
+  materialName: string;
+  /** RECIPE units this write wants to remove. 0 when !debits. */
+  requestedRecipe: number;
+  /**
+   * The SIGNED recipe delta this write applies to central — positive = out of
+   * the store, negative = back into it, 0 for the three carve-outs and for a
+   * line that no longer exists. This is the field a caller accumulates across a
+   * multi-line gesture; requestedRecipe alone would count the debits and ignore
+   * the credits that pay for them.
+   */
+  netRecipe: number;
+  /**
+   * RECIPE units to actually SUBTRACT from current_stock for this line — the
+   * figure every writer on this rule must use, never requestedRecipe. Equal to
+   * requestedRecipe on an ordinary partial issue; equal to the balance ITSELF
+   * when the ask is "everything on the shelf" (on the balance's 6-dp grid point),
+   * so the landing is exactly 0 and never -4e-7 (planCentralDebit,
+   * src/lib/central-debit-clamp.ts). When !ok it is what an unattended rail may
+   * clamp to: max(0, balance). 0 when !debits.
+   */
+  debitRecipe: number;
+  /** RECIPE units issuable — max(0, stock − already claimed), 6-dp. A DISPLAY
+   *  figure: it sits on the balance's own grid point, so typing it back fits.
+   *  The comparison itself is planCentralDebit's, on the unrounded balance. */
+  availableRecipe: number;
+  /** The raw stored balance, negative included, so nothing is hidden. */
+  centralStockRecipe: number;
+  /** The afterLineQty to TYPE to issue everything the store can give this line,
+   *  in the LINE'S OWN unit: the line-unit image of the shown figure
+   *  `availablePurchase`, so typing it back is accepted (and, being the shown
+   *  balance, takes all of it). */
+  maxIssueLineQty: number;
+  /**
+   * The afterLineQty the caller must WRITE to requisition_items.quantity_issued
+   * so the line records what actually left the shelf. Equal to the afterLineQty
+   * it was given on every ordinary issue (byte-identical, no float re-sum);
+   * different ONLY when the shown-figure rule took the balance and the balance
+   * differs from the typed figure by at least one grid step — then it is
+   * beforeLineQty + debitRecipe / packFactor. See issueLineQtyToRecord.
+   */
+  recordAfterLineQty: number;
+  /** requisition_items.unit as stored ('' means the recipe basis — Option B). */
+  lineUnit: string;
+  /** The ask in PURCHASE units as the desk shows it (shownPurchaseQty, 3 dp
+   *  half-up on the 6-dp grid); unrounded only for a sub-display ask that
+   *  would show as 0. */
+  requestedPurchase: number;
+  /** The cap in PURCHASE units: the balance's SHOWN figure (shownPurchaseQty —
+   *  the "In store" column's own number), which the shown-figure rule accepts when
+   *  typed back and debits as the whole balance. For a sub-display crumb (shows
+   *  0, holds ≥ one grid step) the exact purchase image of its 6-dp recipe
+   *  figure. 0 only when holdsAny() is false. */
+  availablePurchase: number;
+  /** raw_materials.purchase_unit as stored. Never blank on any of the 952 live
+   *  materials (checked), so a message may lean on it. */
+  purchaseUnit: string;
+  /** LINE ↔ recipe factor (lineFactor) — what the debit is converted with. */
+  packFactor: number;
+  /** PURCHASE ↔ recipe factor of the material (packFactor of its pack meta) —
+   *  what the purchase-unit figures above are converted with. Equal to
+   *  packFactor on a purchase-unit line, 1 on a line already in recipe units. */
+  purchasePackFactor: number;
+  /** '' when ok. Already phrased for a storekeeper, in PURCHASE units. */
+  message: string;
+  /**
+   * PARTY RAIL REFUSALS ONLY (final pass): `message` rebuilt from the very same
+   * figures with the OTHER short lines of the same transfer named, because the
+   * transfer moves every line at once — a cap or an undo that frees this line
+   * alone moves nothing while another line it cannot cover stays in it. The
+   * transfer calls it (CentralStockShort.nameBlockers) once its walk has found
+   * every short line. Absent on the internal rail and on every check that fits.
+   */
+  rewordBlocked?: (blockers: readonly string[]) => string;
+  /**
+   * THE FIGURE A BOX THAT ADDS TO THE LINE MAY HOLD (round 9), in the LINE's
+   * own unit: the most that, ADDED to the line's quantity_issued, is accepted.
+   * The store desk's box adds (/store-issue is incremental), and so does the
+   * store desk's continuation of a line the management desk held.
+   *   · internal rail: the image of `availablePurchase` (the debit IS the
+   *     increment), so it is maxIssueLineQty − beforeLineQty, computed directly;
+   *   · party rail without `deskBeforeLineQty`: the cap on the whole line (the
+   *     transfer moves the line from 0) — equal to maxIssueLineQty;
+   *   · party rail WITH `deskBeforeLineQty` (the line already holds D, typed
+   *     earlier, and the transfer will move D + the box's figure at once): the
+   *     largest add whose TOTAL the transfer accepts, proved by planCentralDebit
+   *     on the very balance and converter it decided on. 0 when nothing more fits.
+   * 0 when nothing is issuable.
+   */
+  maxAddLineQty: number;
+  /** maxAddLineQty in PURCHASE units, EXACT (never rounded to the 3-dp column
+   *  figure — 0.0004 kg is a real, typeable add). What the box shows. */
+  maxAddPurchase: number;
+  /** The line's quantity_issued as the box sees it (party rail only, when the
+   *  caller supplied it; else 0). The sentence and the two fields above are in
+   *  terms of a box that adds to THIS. */
+  deskBeforeLineQty: number;
+  /** With a desk base: the line's figure AS IT STANDS (deskBeforeLineQty) is
+   *  itself one the transfer accepts — so when nothing more fits, the way out
+   *  is to defer the rest, not to undo and retype the same total. */
+  deskLineFits: boolean;
+  /** PARTY RAIL ONLY (round 9): what the party transfer has ALREADY moved off
+   *  the shelf for this line, in the LINE's unit — the beforeLineQty the
+   *  transfer was asked with (0 on its first run; a top-up after a partial
+   *  /store-process transfer starts from it). 0 on the internal rail. The
+   *  desk sentence names it, and the desk caps are computed on top of it. */
+  transferBeforeLineQty: number;
+  /** The line's approved quantity (chef_approved_qty, else quantity_requested),
+   *  LINE units — what THE RULE measures the line against. 0 for a line that is
+   *  not there. */
+  approvedLineQty: number;
+  /**
+   * WITH A DESK BASE ONLY (round 10): does the line's TOTAL after the box adds
+   * `maxAddLineQty` CLOSE the line by THE RULE once the transfer takes it? The
+   * add is always a figure the transfer takes in full, but a party
+   * requisition's goods move only when every line is complete — so "X takes
+   * everything the central store holds for it" is true only when X completes
+   * the line. MEASURED (round-9 store-desk verifier, c1_party_half): MANGO
+   * 10 of 20 kg recorded over a 14,842.4 g shelf, told "Issue 4.842 kg or less
+   * (4.842 kg takes everything the central store holds for it)"; pressed, 200,
+   * and nothing left the store — the line then owed 5.158 kg. False otherwise.
+   */
+  addCloses: boolean;
+  /** What the line still owes after that add, LINE units (0 when addCloses):
+   *  approved − (D + the add), the figure the add RECORDS — an add that does
+   *  not close the line moves nothing, so the line records the box's figure,
+   *  never the take the transfer would make were it to run. */
+  addOwesLine: number;
+  /**
+   * WITH A DESK BASE AND NOTHING MOVED YET (round 10): would undoing the line
+   * and issuing what the store holds for it CLOSE it by THE RULE? The undo
+   * advice is printed only then (round-9 store-desk verifier,
+   * c13_party_undo_follow: "Undo the line and issue 14.842 kg on it" on a 20 kg
+   * line was followed, accepted, and the requisition still could not send).
+   */
+  redoCloses: boolean;
+  /** What the line would still owe after that redo, LINE units. */
+  redoOwesLine: number;
+  /** With a desk base: the line as the box found it still owed something —
+   *  it was not complete by THE RULE (issued below approved, and no shelf mark
+   *  speaking for that figure) — so "Defer the rest" names a real rest. */
+  deskOwes: boolean;
+  /**
+   * With a desk base, when the line's figure AS IT STANDS fits (deskLineFits):
+   * the transfer taking that figure would CLOSE the line by THE RULE (it is
+   * everything the shelf holds and what stays owing is below one printed
+   * step). Nothing more fits and nothing is left to defer — the line only
+   * needs the transfer to run, and the transfer runs on an issue (round 10:
+   * a Defer alone never runs it), so the way out is to re-issue the figure.
+   */
+  deskCloses: boolean;
+}
+
+/**
+ * A LINE quantity as a storekeeper reads it (round 9): the PURCHASE-unit figure
+ * LEADS (owner rule — DualQty's shape), EXACT rather than rounded to the 3-dp
+ * column figure, because the sentences that print it name differences below a
+ * step (14.8424 of 14.843 kg, 0.0006 kg still owing), and on a packed material
+ * the recipe figure follows as a declared "= …" hint. The conversion is
+ * lineFactor then packFactor — the one converter, never re-derived — on the
+ * quantity's 6-dp recipe grid point (onGrid), so float dust (3.1504999999999996)
+ * cannot move a printed figure. A line whose unit cannot be resolved
+ * (lineFactor's needsReview) is printed in its own stored unit, because nobody
+ * can say what it is in the purchase unit; the 3 such live lines say so on
+ * their face. MEASURED (round-8 verifier, r8-scope drop.ts): the defer-dropped
+ * sentence on a gram line read "14,842.4 g of 14,843 g approved … the 0.6 g
+ * still owing is below the 1 g" — no purchase unit at all.
+ */
+export function fmtLineQtyPU(
+  lineQty: number,
+  lineUnit: string | null | undefined,
+  rm: { unit?: string | null; purchase_unit?: string | null; pack_size?: number | null },
+): string {
+  const { factor, needsReview } = lineFactor(lineUnit, rm);
+  if (needsReview) {
+    const lu = String(lineUnit ?? '').trim();
+    return `${(Math.round((Number(lineQty) || 0) * 1e6) / 1e6).toLocaleString('en-IN', { maximumFractionDigits: 6 })}${lu ? ` ${lu}` : ''}`;
+  }
+  const meta = { unit: rm.unit, purchase_unit: rm.purchase_unit, pack_size: rm.pack_size };
+  const pf = packFactor(meta);
+  const recipe = qtyGrid((Number(lineQty) || 0) * factor) / 1e6;
+  const pu = String(rm.purchase_unit || rm.unit || '').trim();
+  const ru = String(rm.unit || '').trim();
+  const lead = `${puFine(recipe / pf, pf)}${pu ? ` ${pu}` : ''}`;
+  if (!(pf > 1)) return lead;
+  return `${lead} (= ${recipe.toLocaleString('en-IN', { maximumFractionDigits: 6 })}${ru ? ` ${ru}` : ''})`;
+}
+
+/* ────────────────────────────────────────────────────────────────────────────
+ * THE PURCHASE-BASIS FIGURE: THE ONE THE DESK SHOWS, AND THE RULE THAT OBEYS IT.
+ *
+ * toPurchaseQty() (pack-units.ts) is the one converter every purchase-unit
+ * display goes through, and it rounds to 3 dp, half-up. Both desks print the
+ * central balance through exactly that arithmetic (U.stockPU, the "In store"
+ * column) and the storekeeper types what he reads.
+ *
+ * ROUND 5 FLOORED THE CAP AND CEILED THE ASK, and that was a trap. MEASURED on
+ * THREE MANGO RED CHILLI POWDER 500 GM (g/kg, pack 1000, 14,842.5 g; GREEN APPLE
+ * 8,368.5 g the same): the column showed 14.843 kg, typing it was refused
+ * "holds only 14.842 kg", clicking the offered 14.842 left 0.5 g behind, and the
+ * NEXT ask read "the central store holds none of it" over that 0.5 g — whose
+ * only way out was typing 0.0005 kg, a figure no screen shows. Production
+ * accepted 14.843 and went to −0.5 g.
+ *
+ * ROUND 6 OBEYS THE SHOWN FIGURE INSTEAD — the rule is planCentralDebit's
+ * `shownAs` (src/lib/central-debit-clamp.ts, "THE SHOWN FIGURE IS THE BALANCE"),
+ * decided there once; this file only hands it the converter:
+ *   · an ask whose toPurchaseQty equals the balance's (and is > 0) is "all of
+ *     it": it fits, the debit is the balance itself, the landing is exactly 0,
+ *     and the line RECORDS that balance (recordAfterLineQty) — not the typed
+ *     figure, which is up to half a 0.001 step away from what left the shelf;
+ *   · the CAP this file prints is therefore the SHOWN figure itself (14.843 kg,
+ *     the column's own number), and typing it back is accepted by construction;
+ *   · the ASK is printed through the same converter. On every refusal that
+ *     remains the two shown figures differ and the ask's is the larger, so the
+ *     sentence can never read "holds only X, so X cannot be issued".
+ *
+ * A BALANCE THE COLUMN SHOWS AS 0 BUT THE STORE STILL HOLDS (a crumb under half
+ * a step — 0.4 g on a 1000-pack — left by a floor that works in recipe units) is
+ * NOT "none of it": holdsAny() says so, and the refusal names it in recipe units
+ * with the purchase figure that, typed back, takes it (puFine below).
+ * ──────────────────────────────────────────────────────────────────────────*/
+
+/** A purchase-unit figure printed at enough decimals to carry a 6-dp RECIPE
+ *  quantity exactly (6 + log10 of the pack). Only for the sub-display crumb
+ *  case, where the 3-dp figure would read 0. Typed back through either desk's
+ *  fromPU (× pack, rounded to 6 dp) it lands on the same recipe grid point. */
+function puFine(purchaseQty: number, pf: number): string {
+  const dp = Math.min(20, 6 + Math.max(0, Math.ceil(Math.log10(pf > 1 ? pf : 1))));
+  return (Number(purchaseQty) || 0).toLocaleString('en-IN', { maximumFractionDigits: dp });
+}
+
+/**
+ * THE RULE, ASKED ONCE. Both issue routes call this before opening their
+ * transaction (to refuse with a good message) and applyIssueDelta calls it
+ * through assertCentralIssue inside the transaction (to make the bound real).
+ * One function, so the pre-flight and the floor can never disagree about what
+ * is issuable — a pre-flight that said yes where the floor says no would be a
+ * 500 at the counter, which is the failure this shape exists to avoid.
+ *
+ * UNITS. requisition_items quantities are in the LINE'S own unit; current_stock
+ * is RECIPE units. The conversion is lineFactor() — the same call applyIssueDelta
+ * makes for the debit itself, which is what guarantees the number compared here
+ * is the number subtracted there. A cap derived from a second conversion would
+ * refuse correct work and admit wrong work; packFactor is never re-derived (see
+ * lineFactor's own comment on the three hand-rolled copies in this repo).
+ *
+ * `alreadyClaimedRecipe` is for the pre-flight only, and it is SIGNED (sum the
+ * `netRecipe` of the lines already scored). One gesture can draw on the same
+ * material twice — two entries for one line, which store-issue documents and
+ * measures, or two lines for one material, which 0 of the 1,630 live
+ * requisitions currently hold — and each draw fits while the pair does not. The
+ * floor needs no equivalent: it re-reads current_stock per line, so by the time
+ * the second debit runs the first is already in the balance.
+ *
+ * WHERE THE PRE-FLIGHT CAN BE MORE GENEROUS THAN THE FLOOR, stated rather than
+ * hidden: a credit in the same gesture is assumed to land in full, while the
+ * credit clamp and assertReversible may reduce or refuse it. The floor is the
+ * authority and catches that; erring this way costs a late refusal with the same
+ * sentence, where erring the other way would refuse work the floor allows.
+ *
+ * ── `rail`: WHICH WRITER IS ASKING, AND WHY THE PARTY RAIL MUST SAY SO ───────
+ * The party carve-out below exists because on the INTERNAL rail a party line
+ * debits nothing — applyIssueDelta leaves it alone and the party rail moves the
+ * goods later, in one lump, at fulfilment. For that caller the carve-out is
+ * simply the truth.
+ *
+ * THE PARTY RAIL ITSELF IS THE OTHER CALLER, and for it that same carve-out
+ * would be a guard that reads correctly and can never fire — this codebase's
+ * recorded inert-guard pattern, 9 instances, in its purest form: a floor on the
+ * party debit that begins by excusing every party debit. So the party rail
+ * passes rail:'party' and the carve-out does not apply to it.
+ *
+ * NOTHING ELSE FORKS. The store-mapped and ambiguous-unit carve-outs, the
+ * lineFactor conversion, the comparison, the max(0, …) and the message are the
+ * same lines of code for both rails. That is the whole reason this takes a flag
+ * instead of getting a sibling function: a second floor with slightly different
+ * rules is the rival-helper trap, and a second conversion is the 750x one.
+ * rail defaults to 'internal', so every pre-existing caller is unchanged.
+ */
+export function checkCentralIssue(
+  db: any,
+  a: {
+    reqItemId: string;
+    beforeLineQty: number;
+    afterLineQty: number;
+    /** RECIPE units earlier lines of the SAME gesture have already claimed. */
+    alreadyClaimedRecipe?: number;
+    /**
+     * Who is debiting. 'internal' (default) = applyIssueDelta and the two issue
+     * desks' pre-flights, for which a party line debits nothing. 'party' = the
+     * party rail's own fulfilment debit (party-fulfillment.ts /
+     * po-requisition-fulfil.ts), for which the party carve-out would be inert.
+     */
+    rail?: 'internal' | 'party';
+    /**
+     * PARTY RAIL ONLY (round 9): the line's quantity_issued as the STORE DESK's
+     * box sees it, when the transfer runs inside a /store-issue gesture. The
+     * decision is untouched — the transfer still moves the whole line from 0 —
+     * but a refusal is then worded, and its cap returned, for a box that ADDS
+     * to this figure. MEASURED (round-8 verifier, sd_party_tail): THREE MANGO
+     * 14.842 of 14.843 kg over a 14,842.4 g shelf; Issue Now posted 0.001 and
+     * was told "Issue 14.842 kg or less on this line"; the desk added 14.842
+     * and was refused again "so 29.684 kg cannot be issued". Ignored on the
+     * internal rail (its debit already IS the increment).
+     */
+    deskBeforeLineQty?: number;
+  },
+): CentralIssueCheck {
+  const nil = (over: Partial<CentralIssueCheck>): CentralIssueCheck => ({
+    ok: true, debits: false, skipReason: 'zero_delta',
+    reqItemId: String(a.reqItemId || ''),
+    materialId: '', materialName: '', requestedRecipe: 0, netRecipe: 0,
+    debitRecipe: 0, availableRecipe: 0,
+    centralStockRecipe: 0, maxIssueLineQty: Number(a.afterLineQty) || 0,
+    recordAfterLineQty: Number(a.afterLineQty) || 0,
+    lineUnit: '', requestedPurchase: 0, availablePurchase: 0,
+    purchaseUnit: '', packFactor: 1, purchasePackFactor: 1, message: '',
+    maxAddLineQty: 0, maxAddPurchase: 0, deskBeforeLineQty: 0, deskLineFits: false,
+    transferBeforeLineQty: 0, approvedLineQty: 0,
+    addCloses: false, addOwesLine: 0, redoCloses: false, redoOwesLine: 0, deskOwes: false, deskCloses: false, ...over,
+  });
+
+  const line = db.prepare(`
+    SELECT ri.id, ri.material_id, ri.unit AS line_unit, r.purpose,
+           ri.chef_approved_qty, ri.quantity_requested, ri.shelf_emptied_qty,
+           rm.name AS material_name, rm.unit, rm.purchase_unit, rm.pack_size,
+           COALESCE(rm.current_stock, 0) AS current_stock
+      FROM requisition_items ri
+      JOIN requisitions  r  ON r.id  = ri.req_id
+      JOIN raw_materials rm ON rm.id = ri.material_id
+     WHERE ri.id = ?
+  `).get(String(a.reqItemId)) as any;
+  // A line that is not there debits nothing; applyIssueDelta answers the same
+  // way ({ skipped: 'missing_line' }) a few lines into its own body.
+  if (!line) return nil({ skipReason: 'missing_line' });
+
+  // THE SAME THREE CARVE-OUTS, RESOLVED THE SAME WAY as applyIssueDelta does
+  // below — purpose === 'party', centralFlowBlock(), and lineFactor's
+  // needsReview. None of the three moves a gram of central stock, so none of
+  // them has a central balance to be short of.
+  //
+  // THE FIRST ONE IS THE CALLER'S OWN RAIL TALKING. See `rail` in the header:
+  // for the internal rail a party line debits nothing here and the carve-out is
+  // the truth; for the party rail, which IS the writer of that later debit, the
+  // same line would excuse the very thing it is being asked to bound.
+  if (a.rail !== 'party' && String(line.purpose || '') === 'party') {
+    return nil({ materialId: String(line.material_id), skipReason: 'party' });
+  }
+  let storeMapped = false;
+  try { storeMapped = centralFlowBlock(db, String(line.material_id)) !== null; } catch { /* not fatal */ }
+  if (storeMapped) return nil({ materialId: String(line.material_id), skipReason: 'store_mapped' });
+
+  const { factor, needsReview } = lineFactor(line.line_unit, line);
+  if (needsReview) {
+    return nil({ materialId: String(line.material_id), packFactor: factor, skipReason: 'unit_review' });
+  }
+
+  const deltaLine = (Number(a.afterLineQty) || 0) - (Number(a.beforeLineQty) || 0);
+  const requestedRecipe = Math.round(deltaLine * factor * 1e6) / 1e6;
+  // CREDITS AND NO-OPS ARE NOT THIS GUARD'S BUSINESS. A give-back raises the
+  // central balance and is bounded by the credit clamp plus assertReversible; a
+  // zero delta writes nothing at all. The signed figure still goes back, so a
+  // caller accumulating across lines sees the headroom the credit creates.
+  if (requestedRecipe <= EPS) {
+    return nil({
+      materialId: String(line.material_id), packFactor: factor,
+      netRecipe: requestedRecipe < -EPS ? requestedRecipe : 0,
+    });
+  }
+
+  const meta = { unit: line.unit, purchase_unit: line.purchase_unit, pack_size: line.pack_size };
+  const stock = Number(line.current_stock) || 0;
+  // SIGNED, deliberately. A negative running claim means an earlier line of the
+  // same gesture is putting goods BACK, which genuinely raises the balance this
+  // line draws on — and that is what the floor will see when it re-reads
+  // current_stock after that credit has been written.
+  const claimed = Number(a.alreadyClaimedRecipe) || 0;
+  // max(0, …): a balance that is ALREADY negative (0 of 952 materials today,
+  // but /api/inventory/fix-negative-stock exists because it has happened) must
+  // read as "nothing issuable", never as a negative allowance that would let the
+  // next issue dig the hole deeper.
+  const availableRecipe = Math.max(0, Math.round((stock - claimed) * 1e6) / 1e6);
+  // THE DECISION — planCentralDebit, the one rule every central floor shares.
+  // It used to be `requestedRecipe <= availableRecipe + EPS` here: a 6-dp
+  // ROUNDED allowance against a 1e-9 slack. Rounding UP let 100 through against
+  // a stored 99.9999996 and the debit wrote -4e-7 (measured, both desks). The
+  // plan compares both figures on the same 6-dp grid and also says what to
+  // subtract, so the floor and the write cannot disagree. Against
+  // `stock − claimed`, so the pre-flight's running claim and the floor's
+  // per-line re-read see the same balance.
+  //
+  // THE SHOWN FIGURE (round 6): the converter is the arithmetic of both desks'
+  // "In store" column, so an ask typed from that column is matched against the
+  // very figure the storekeeper read. The rule itself is planCentralDebit's;
+  // nothing here decides "fits".
+  const pf = packFactor(meta);
+  // The converter is the desks' "In store" figure, shownPurchaseQty (round 8:
+  // the grid point, then integer half-up — so neither SQL dust nor the
+  // division moves it). Its `alts` keep round 7's raw toPurchaseQty figure
+  // matchable, so a screen still printing that one is never refused for typing
+  // it; the cap and the sentences print shownPurchaseQty.
+  const conv = shownWithStep(
+    r => shownPurchaseQty(r, meta), 0.001 * pf, [r => toPurchaseQty(r, meta)],
+  );
+  const plan = planCentralDebit(stock - claimed, requestedRecipe, conv);
+  const purchaseUnit = String(line.purchase_unit || line.unit || '').trim();
+  const recipeUnit = String(line.unit || '').trim();
+  const shownAvail = Number(plan.shownAvailable) || 0;
+  const shownAsk = Number(plan.shownAsk) || 0;
+  // THE SUB-DISPLAY CRUMB: the store holds at least one grid step, but less than
+  // half a 0.001 purchase step, so the column shows 0. Its typeable figure is the
+  // balance's own grid point, carried in purchase units without the 3-dp
+  // rounding (puFine prints it).
+  const gridAvail = qtyDown(plan.available, 6);
+  const crumb = shownAvail <= 0 && holdsAny(plan.available);
+  // THE CAP IS THE SHOWN FIGURE — the column's own number, accepted when typed
+  // back because it IS the balance's shown figure (byShownFigure). Never a
+  // floored figure: round 5's floor sent the storekeeper to 14.842, which left a
+  // 0.5 g crumb the column then showed as nothing.
+  const availablePurchase = shownAvail > 0 ? shownAvail : crumb ? gridAvail / pf : 0;
+  // The ask through the same converter. A sub-display ask (it shows as 0) is
+  // carried unrounded so the sentence never says "0 kg cannot be issued".
+  const requestedPurchase = shownAsk > 0 ? shownAsk : requestedRecipe / pf;
+  const beforeLine = Number(a.beforeLineQty) || 0;
+  // THE CAP IN THE LINE'S UNIT, from beforeLine — the image of
+  // `availablePurchase` (see maxIssueLineQty below for the rounding).
+  const capLine = shownAvail > 0
+    ? Math.round((shownAvail * pf / (factor || 1)) * 1e6) / 1e6
+    : crumb ? gridAvail / (factor || 1) : 0;
+  // ── THE STORE DESK'S BOX ADDS (round 9) ─────────────────────────────────
+  // On the party rail the transfer asks the line's WHOLE quantity (beforeLine
+  // 0), so `capLine` is a cap on the whole line. A box that ADDS to a line
+  // already holding D can take only what, added to D, the transfer accepts:
+  //   · the shown cap less D, when that is positive (14.842 cap, D = 10 → 4.842);
+  //   · else the grid point of what is left less D — the line already holds the
+  //     shown cap (14.842 kg recorded over 14,842.4 g), and the only total left
+  //     that takes everything is the shelf itself (0.0004 kg more);
+  //   · else 0: the line already holds all the shelf can give, or more.
+  // Each candidate is PROVED with planCentralDebit — the same balance, the same
+  // converter and the same 6-dp line→recipe rounding the transfer will apply to
+  // D + add — so the figure returned is accepted when typed back by construction,
+  // not by arithmetic that merely looks right. Snapped to 1e-9 line units (below
+  // the recipe grid on every pack the catalogue uses), so 14.8424 − 14.842 reads
+  // 0.0004, not 0.00039999999999907.
+  //
+  // A TOP-UP TRANSFER (round 9) starts from what the transfer already moved
+  // for the line (`beforeLine`, 0 on its first run): the transfer asks only
+  // `lineQty − beforeLine` of the shelf, so every total below is tested on
+  // that, and the two candidates sit `beforeLine` higher. With beforeLine 0
+  // each expression is the round-9 one, character for character in effect.
+  const transferBase = a.rail === 'party' ? Math.max(0, beforeLine) : 0;
+  const desk = a.rail === 'party' ? Math.max(0, Number(a.deskBeforeLineQty) || 0) : 0;
+  let maxAddLineQty = capLine;
+  let maxTotalLine = beforeLine + capLine;
+  let deskLineFits = false;
+  if (desk > 0) {
+    const snap9 = (n: number) => Math.round(n * 1e9) / 1e9;
+    const totalFits = (lineQty: number) =>
+      planCentralDebit(stock - claimed, Math.round((lineQty - transferBase) * factor * 1e6) / 1e6, conv).fits;
+    deskLineFits = totalFits(desk);
+    const fitsAt = (add: number) => add > EPS && totalFits(desk + add);
+    const found = [
+      snap9(transferBase + capLine - desk), snap9(transferBase + gridAvail / (factor || 1) - desk),
+    ].find(fitsAt);
+    maxAddLineQty = found ?? 0;
+    maxTotalLine = snap9(desk + maxAddLineQty);
+  }
+  const maxAddPurchase = maxAddLineQty > 0 ? (maxAddLineQty * (factor || 1)) / pf : 0;
+  // ── WHAT THE BOX'S FIGURES LEAD TO, BY THE RULE (round 10) ──────────────
+  // The sentence a desk-based refusal prints is a promise about the line, so
+  // it is decided here, from the line's own approval and the very plan the
+  // transfer will run — never assumed. Only with a desk base (a party line the
+  // store desk's box adds to); every other refusal is byte-identical.
+  const approvedLineQty = (line.chef_approved_qty != null
+    ? Number(line.chef_approved_qty) : Number(line.quantity_requested)) || 0;
+  let addCloses = false, addOwesLine = 0, redoCloses = false, redoOwesLine = 0, deskOwes = false, deskCloses = false;
+  if (desk > 0) {
+    const shownLine = lineShownAs(line.line_unit, line);
+    // THE LINE AS THE BOX FOUND IT, BY THE RULE — both arms: a shelf mark still
+    // speaking for D (stamped at exactly D, which only a line this gesture has
+    // not written can still carry) closes it as surely as D ≥ approved, and a
+    // complete line has no rest to defer (store-issue drops a defer on it).
+    deskOwes = !issuedCoversAsk(desk, approvedLineQty, shownLine, shelfMarkHolds(line.shelf_emptied_qty, desk));
+    // The transfer's take of a line TOTAL: the same plan, the same record it
+    // would write (recordAfterLineQty), the same emptied test it stamps — and
+    // whether THE RULE then calls the line complete.
+    const closesAt = (total: number) => {
+      const p2 = planCentralDebit(stock - claimed,
+        Math.round((total - transferBase) * factor * 1e6) / 1e6, conv);
+      const recorded = p2.fits && !p2.debitIsAsk ? transferBase + p2.debit / (factor || 1) : total;
+      const emptied = p2.debit > 0 && !holdsAny(p2.available - p2.debit);
+      return { closes: p2.fits && issuedCoversAsk(recorded, approvedLineQty, shownLine, emptied), recorded };
+    };
+    if (maxAddLineQty > 0) {
+      const t = closesAt(maxTotalLine);
+      addCloses = t.closes;
+      // AN ADD THAT DOES NOT CLOSE THE LINE MOVES NOTHING, so what the line then
+      // owes is measured from what it RECORDS — D + the add, the box's figure
+      // the route writes (maxTotalLine) — never from t.recorded, the take the
+      // transfer would make were it to run (the shelf's exact figure when the
+      // add reaches its shown one). MEASURED (round-10 recheck, c1_party_half):
+      // MANGO 10 of 20 kg over 14,842.4 g was told "Issue 4.842 kg … which then
+      // still owes 5.1576 kg"; pressed, the line recorded 14.842 kg and the row
+      // read "Outstanding 5.158 kg". (Not closing means the total stays below
+      // approved — a total at or above it is closed by its take — so the
+      // transfer cannot run on that issue.)
+      addOwesLine = addCloses ? 0 : Math.max(0, Math.round((approvedLineQty - maxTotalLine) * 1e9) / 1e9);
+    }
+    if (deskLineFits && deskOwes) deskCloses = closesAt(desk).closes;
+    if (!(transferBase > 0) && holdsAny(plan.available)) {
+      // Undone, the line holds 0; issuing what the store holds for it is a
+      // take of the whole balance (the shown figure, or the crumb's grid
+      // point), recorded as that balance in the line's unit, emptying it.
+      const exactLeft = plan.available / (factor || 1);
+      redoCloses = issuedCoversAsk(exactLeft, approvedLineQty, shownLine, true);
+      redoOwesLine = redoCloses ? 0 : Math.max(0, approvedLineQty - exactLeft);
+    }
+  }
+  const base: CentralIssueCheck = {
+    ok: true, debits: true, skipReason: '',
+    reqItemId: String(line.id),
+    materialId: String(line.material_id),
+    materialName: String(line.material_name || ''),
+    // netRecipe carries the figure the floor will actually WRITE when the line
+    // fits — the pre-flight's running claim then subtracts exactly what the
+    // floor's per-line re-read will see gone. On a refusal it stays the ask
+    // (the line does not run, so callers do not accumulate it).
+    requestedRecipe, netRecipe: plan.fits ? plan.debit : requestedRecipe,
+    debitRecipe: plan.debit,
+    availableRecipe, centralStockRecipe: stock,
+    // In the LINE's unit: the line-unit image of `availablePurchase`, so the
+    // value typed straight back into the Issue box is the shown figure and
+    // passes this very check on the retry. purchase → recipe is × pf, recipe →
+    // line is ÷ factor (a purchase-unit line has factor = pf, so it is the shown
+    // figure itself); rounded at the 6 dp both desks' fromPU rounds an entry to.
+    // A crumb is carried unrounded — 6 dp of a purchase-unit line would shave a
+    // 0.4 g crumb on a 1000-pack to nothing.
+    //
+    // With a desk base (party rail inside /store-issue, round 9) it is the most
+    // the line's TOTAL may reach through a box that adds to it: D + maxAdd —
+    // D itself when nothing more fits — so "max_issue_qty − what the line
+    // holds" is the box's figure, which is how the store desk reads it.
+    maxIssueLineQty: maxTotalLine,
+    // WHAT THE LINE MUST RECORD. The afterLineQty as given, untouched (so an
+    // ordinary issue is byte-identical — no `before + delta` float re-sum),
+    // unless the shown-figure rule took a balance that differs from the typed
+    // figure by a grid step or more: then the line says what left the shelf.
+    recordAfterLineQty: plan.fits && !plan.debitIsAsk
+      ? beforeLine + plan.debit / (factor || 1)
+      : (Number(a.afterLineQty) || 0),
+    lineUnit: String(line.line_unit ?? ''),
+    requestedPurchase, availablePurchase, purchaseUnit,
+    packFactor: factor,
+    purchasePackFactor: pf,
+    message: '',
+    maxAddLineQty, maxAddPurchase, deskBeforeLineQty: desk, deskLineFits,
+    transferBeforeLineQty: transferBase, approvedLineQty,
+    addCloses, addOwesLine, redoCloses, redoOwesLine, deskOwes, deskCloses,
+  };
+  // An issue of everything on the shelf — binary noise included, or the 6-dp
+  // figure the desks print — fits and lands on exactly 0 (debitRecipe is then
+  // the balance itself). Only an ask on a grid point PAST the balance is refused.
+  if (plan.fits) return base;
+
+  // THE MESSAGE IS WRITTEN FOR THE 508, NOT FOR THE 56. Measured over all 16,346
+  // non-party lines: 564 carry an outstanding seed this floor would refuse, and
+  // on 508 of them the central balance is ZERO — there is no "issue less"
+  // available. A single sentence offering a smaller number would therefore be
+  // nonsense on 90% of the real refusals, which is this project's inert-guard
+  // pattern (9 recorded instances) in message form. So the empty case gets its
+  // own sentence and names the way out, and only the 56 are offered a partial.
+  //
+  // AND THE PARTIAL IT OFFERS IS TYPEABLE, AND TAKES IT ALL. `availablePurchase`
+  // is the SHOWN figure (the "In store" column's own number), which the
+  // shown-figure rule accepts on the retry and debits as the whole balance —
+  // proved by typing it back on the real 14,842.5 g and 8,368.5 g balances, not
+  // by reading this code. The PURCHASE unit is the right basis because that is
+  // the unit BOTH desks' Issue boxes are entered in (requisitions/page.tsx
+  // `issued_pu` → U.fromPU, store-requisitions/page.tsx `editQty` → U.fromPU);
+  // the line unit the API takes is reached only through those converters.
+  //
+  // "HOLDS NONE OF IT" ONLY WHEN IT HOLDS NONE — holdsAny(), the one test every
+  // floor uses. A crumb the column shows as 0 is named in recipe units, with the
+  // purchase figure that takes it.
+  const figs: ShortFigures = { holds: holdsAny(plan.available), shownAvail, shownAsk, gridAvail, recipeUnit, pf, meta };
+  return {
+    ...base, ok: false,
+    message: centralShortMessage(base, figs),
+    // The party transfer refuses whole, so it may have to name the other short
+    // lines in this one's sentence once it has found them all (final pass).
+    ...(a.rail === 'party' ? { rewordBlocked: (b: readonly string[]) => centralShortMessage(base, figs, b) } : {}),
+  };
+}
+
+type ShortFigures = {
+  holds: boolean; shownAvail: number; shownAsk: number; gridAvail: number; recipeUnit: string; pf: number;
+  meta: { unit?: string | null; purchase_unit?: string | null; pack_size?: number | null };
+};
+
+/**
+ * THE OTHER SHORT LINES OF ONE PARTY TRANSFER, AS A REFUSAL NAMES THEM (final
+ * pass). The transfer moves every line at once and is refused whole, so an
+ * instruction that frees THIS line — a cap, an undo-and-reissue — moves nothing
+ * on its own while another line it cannot cover stays in the transfer. MEASURED
+ * (round-10 recheck, two-short): THREE MANGO 6 kg typed over 5,158 g beside
+ * WHOLE DHANIYA 1/1 kg over an empty shelf — MANGO's clause read "Issue 5.158 kg
+ * or less on this line.", and issued alone it was refused again over DHANIYA.
+ * `once` qualifies such an instruction ("… once WHOLE DHANIYA is resolved");
+ * `why` is the fact behind it, closing the sentence. Both '' with no blockers,
+ * so every sentence the transfer refuses with a single short line is
+ * byte-identical. The transfer decides who blocks (party-fulfillment.ts).
+ */
+function partyBlockers(blockers?: readonly string[]): { list: string; are: string; once: string; why: string } {
+  const names = Array.from(new Set((blockers || []).map(s => String(s || '').trim()).filter(Boolean)));
+  if (names.length === 0) return { list: '', are: '', once: '', why: '' };
+  const list = names.length === 1 ? names[0] : `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
+  const are = names.length === 1 ? 'is' : 'are';
+  return {
+    list, are,
+    once: ` once ${list} ${are} resolved`,
+    why: ` The party transfer moves every line at once, so while the central store cannot cover ${list} it `
+      + `moves nothing for this line either.`,
+  };
+}
+
+/**
+ * THE PARTY LINE THE STORE DESK'S BOX ADDS TO (round 9) — the two clauses every
+ * desk-based refusal shares, so the no-sibling sentence (centralShortMessage)
+ * and the sibling one (scoreShortLine) cannot word the same cap two ways.
+ *
+ * `lead`: "this party line already holds D, and the party transfer moves the
+ * whole line at once" — the fact the box's figure depends on.
+ * `tail`: what to press. The add (c.maxAddPurchase, EXACT — 0.0004 kg is
+ * typeable and the store desk prints it at that precision) when there is one,
+ * and what it leads to by THE RULE (round 10: "takes everything … and the line
+ * closes" only when it completes the line — otherwise it is recorded and
+ * nothing moves yet, and what it then owes is measured from what it records);
+ * otherwise the way out in words, never a figure that would be refused:
+ *   · the line holds no more than the shelf (it would all go): defer the rest —
+ *     where there is a rest (c.deskOwes) the shelf cannot close; where the
+ *     line's own figure closes it once the transfer takes it (c.deskCloses),
+ *     re-issue that figure, because the transfer runs on an issue and never on
+ *     a defer (round 10);
+ *   · the line holds MORE than the shelf: undo it and issue the shelf's figure,
+ *     which is the cap from 0 and accepted (checked: the store desk's undo
+ *     zeroes the line, so its box then adds to 0) — ONLY when that redo closes
+ *     the line (c.redoCloses, round 10); otherwise how far short everything the
+ *     store holds (named exactly, so the two figures add up to the line) leaves
+ *     it, and that only stock or a count can move it.
+ * `blockers` (final pass): the other short lines of the same transfer — see
+ * partyBlockers.
+ */
+function deskPartyClauses(
+  c: CentralIssueCheck, f: ShortFigures, blockers?: readonly string[],
+): { lead: string; store: string; tail: string } {
+  const pu = c.purchaseUnit ? ` ${c.purchaseUnit}` : '';
+  const ru = f.recipeUnit ? ` ${f.recipeUnit}` : '';
+  const recipeHint = (r: number) => (f.pf > 1 ? ` (= ${onGrid(r).toLocaleString('en-IN', { maximumFractionDigits: 6 })}${ru})` : '');
+  const desk = c.deskBeforeLineQty;
+  const deskFig = fmtLineQtyPU(desk, c.lineUnit, f.meta);
+  const b = partyBlockers(blockers);
+  // What the store holds for THIS line — the shown figure with its exact recipe
+  // hint (14.842 kg = 14,842.4 g, which is why 0.0004 kg more still fits), or a
+  // sub-display crumb in the recipe unit, as every crumb sentence names it.
+  // On a material with no pack (kg/kg) there is no recipe hint to carry the
+  // exact figure, so it is named beside the shown one when they differ —
+  // "3.217 kg (3.2174 kg exactly)" — or the 0.0004 kg add would read as
+  // arithmetic on a shelf that shows 3.217.
+  const exactPU = f.gridAvail / (f.pf || 1);
+  const store = f.shownAvail > 0
+    ? `${fmtQtyNum(f.shownAvail)}${pu}`
+      + (f.pf > 1 ? recipeHint(f.gridAvail)
+        : qtyGrid(f.shownAvail * (f.pf || 1)) !== qtyGrid(f.gridAvail) ? ` (${puFine(exactPU, f.pf)}${pu} exactly)` : '')
+    : `${fmtGridQty(f.gridAvail)}${ru}`;
+  // A TOP-UP (round 9): part of the line already left the shelf when the
+  // transfer first ran (a short /store-process submit), and the transfer now
+  // moves only what the line holds above that — so "moves the whole line at
+  // once" would be false, and so would the undo advice below (undoing the line
+  // cannot put back what already moved).
+  const moved = Math.max(0, Number(c.transferBeforeLineQty) || 0);
+  const lead = moved > 0
+    ? `this party line already holds ${deskFig}; ${fmtLineQtyPU(moved, c.lineUnit, f.meta)} of it already left the `
+      + `central store when the party transfer first ran, and the transfer moves only what the line holds above that`
+    : `this party line already holds ${deskFig}, and the party transfer moves the whole line at once`;
+  const lineFig = (n: number) => fmtLineQtyPU(n, c.lineUnit, f.meta);
+  if (c.maxAddPurchase > 0) {
+    const add = `${puFine(c.maxAddPurchase, f.pf)}${pu}`;
+    // "TAKES EVERYTHING" ONLY WHEN THE ADD COMPLETES THE LINE (round 10). The
+    // add is always a total the transfer takes in full — but the transfer runs
+    // only once every line is complete, so on a line the add leaves short the
+    // truth is that it is recorded and nothing moves (c1_party_half).
+    return {
+      lead, store,
+      tail: c.addCloses
+        ? `Issue ${add} or less on this line${b.once} (${add} ${b.list ? 'then ' : ''}takes everything the central store `
+          + `holds for it, and the line closes).${b.why}`
+        : `Issue ${add} or less on this line — it is recorded on the line, which then still owes `
+          + `${lineFig(c.addOwesLine)}; a party requisition's goods leave the central store only once every line is `
+          + `complete, so nothing moves yet.${b.why}`,
+    };
+  }
+  const cap = f.shownAvail > 0 ? `${fmtQtyNum(f.shownAvail)}${pu}` : `${puFine(c.availablePurchase, f.pf)}${pu}`;
+  // "Defer the rest" only where there IS a rest (round 10): a line already
+  // complete by THE RULE that asked for more has nothing left to promise.
+  const deferOr = c.deskOwes ? 'Defer the rest, or receive' : 'Receive';
+  // The line's own figure is one the transfer takes (it IS what the shelf
+  // holds, by the grid or by the shown figure): nothing to undo.
+  return {
+    lead, store,
+    tail: c.deskLineFits
+      ? (!c.deskOwes
+          ? `Nothing more can be issued on this line — it already holds everything the central store holds for `
+            + `it, and it owes nothing more.${b.why}`
+          // ITS OWN FIGURE CLOSES IT (round 10): the line needs only the transfer
+          // to run, and the transfer runs on an issue — a Defer alone never runs
+          // it — so the way out is to record the same figure through one.
+          : c.deskCloses
+            ? `Nothing more can be issued on this line — it already holds everything the central store holds for `
+              + `it, and the line closes once the party transfer takes that. The transfer runs on an issue, not on a `
+              + `defer: undo the line and issue ${deskFig} on it again once every other line is complete`
+              + `${b.list ? ` and ${b.list} ${b.are} resolved` : ''}, or receive the stock or record a closing count first.`
+              + b.why
+            : `Nothing more can be issued on this line until stock arrives — it already holds everything the central `
+              + `store holds for it. ${deferOr} the stock or record a closing count first.${b.why}`)
+      : moved > 0
+        ? `Nothing more can be issued on this line until stock arrives — what it holds above the part already `
+          + `moved is more than the central store holds for it. ${deferOr} the stock or record a `
+          + `closing count first.${b.why}`
+        // THE UNDO ADVICE ONLY WHERE IT WORKS (round 10). Lowered to what the
+        // store holds, the line closes only when what it then owes is below
+        // one printed step (redoCloses); otherwise the advice was followed,
+        // accepted, and the requisition still could not send — a party
+        // requisition's goods move only once every line is complete
+        // (c13_party_undo_follow). The desk prints the same fact
+        // (store-requisitions/page.tsx closesIfRedone).
+        : c.redoCloses
+          ? `Nothing more can be issued on this line — it already holds more than the central store holds for it. `
+            + `Undo the line and issue ${cap} on it${b.once} (the transfer then takes everything the central store holds `
+            + `for it, and the line closes), or receive the stock or record a closing count first.${b.why}`
+          // How short EVERYTHING the store holds leaves the line, with both
+          // figures exact (final pass): "even 14.842 kg … would leave it
+          // 5.1576 kg short" did not add up to the 20 kg line — 5.1576 is what
+          // is owed after the exact 14,842.4 g, so that is the figure named.
+          : `Nothing more can be issued on this line — it already holds more than the central store holds for it, `
+            + `and even everything the store holds for it, ${lineFig(f.gridAvail / (c.packFactor || 1))}, would leave `
+            + `it ${lineFig(c.redoOwesLine)} short. A party requisition's goods leave the central store only once `
+            + `every line is complete, so receive the stock or record a closing count first.${b.why}`,
+  };
+}
+/** The refusal sentence for a short line, in the purchase unit the desks type
+ *  in. Three branches, chosen by holdsAny and the shown figure — never by a
+ *  rounded display figure on its own. Shared by checkCentralIssue (so the
+ *  pre-flight and the floor) and by the after-the-gesture re-score of a held
+ *  line, so the sentences cannot drift. A party line the store desk's box adds
+ *  to (c.deskBeforeLineQty, round 9) is worded for that box. `blockers` (party
+ *  rail, final pass): the other short lines of the same transfer — see
+ *  partyBlockers; omitted, every sentence is as it was. */
+function centralShortMessage(c: CentralIssueCheck, f: ShortFigures, blockers?: readonly string[]): string {
+  const pu = c.purchaseUnit;
+  const q = (n: number) => `${fmtQtyNum(n)}${pu ? ` ${pu}` : ''}`;
+  const ru = f.recipeUnit ? ` ${f.recipeUnit}` : '';
+  const b = partyBlockers(blockers);
+  // The ask: its shown figure when it has one, otherwise (a sub-display ask) its
+  // recipe figure — never "0 kg cannot be issued".
+  const askFig = f.shownAsk > 0 ? q(f.shownAsk) : `${fmtGridQty(c.requestedRecipe)}${ru}`;
+  if (c.deskBeforeLineQty > 0) {
+    // The ask is the line's TOTAL (what the transfer moves), so it is named as
+    // such — "14.843 kg in all" — beside what the line already holds. On a
+    // top-up (round 9) the ask is what is still to move, and named so. EXACT
+    // (final pass), as the lead's figures are: the transfer's ask is what the
+    // line holds less what already moved, and that is rarely a printed step —
+    // "the 0.001 kg still to move" was 0.6 g, "the 1 kg still to move" 0.9996 kg.
+    const d = deskPartyClauses(c, f, blockers);
+    const askLine = fmtLineQtyPU(c.requestedRecipe / (c.packFactor || 1), c.lineUnit, f.meta);
+    const asked = c.transferBeforeLineQty > 0 ? `the ${askLine} still to move` : `${askLine} in all`;
+    if (!f.holds) {
+      return `${c.materialName}: the central store holds none of it — ${d.lead} — `
+        + `so ${asked} cannot be issued. Receive the stock, or record a closing count, first.${b.why}`;
+    }
+    return `${c.materialName}: ${d.lead} — the central store holds only ${d.store}, `
+      + `so ${asked} cannot be issued. ${d.tail}`;
+  }
+  if (!f.holds) {
+    return `${c.materialName}: the central store holds none of it, `
+      + `so ${askFig} cannot be issued. Receive the stock, or record a closing count, first.${b.why}`;
+  }
+  if (f.shownAvail > 0) {
+    return `${c.materialName}: the central store holds only ${q(f.shownAvail)}, `
+      + `so ${askFig} cannot be issued. Issue ${q(f.shownAvail)} or less on this line${b.once}.${b.why}`;
+  }
+  const fine = `${puFine(c.availablePurchase, f.pf)}${pu ? ` ${pu}` : ''}`;
+  return `${c.materialName}: the central store holds only ${fmtGridQty(f.gridAvail)}${ru} of it `
+    + `— less than the 0.001${pu ? ` ${pu}` : ''} the store desk shows — so ${askFig} cannot be issued. `
+    + `Issue ${fine} or less on this line${b.once}, or record a closing count.${b.why}`;
+}
+
+/**
+ * THE FLOOR. Throws CentralStockShort; it does NOT clamp — see "WHY THE FLOOR
+ * THROWS RATHER THAN CLAMPS" in this file's header.
+ *
+ * MUST be called inside the caller's transaction, immediately before the debit,
+ * for the same reason the pre-image must be: a balance read earlier races.
+ */
+export function assertCentralIssue(
+  db: any,
+  a: {
+    reqItemId: string; beforeLineQty: number; afterLineQty: number;
+    /** See `rail` on checkCentralIssue. Passed straight through. */
+    rail?: 'internal' | 'party';
+    /**
+     * RECIPE units EARLIER lines of the same material already took in this same
+     * gesture, and how many lines (round 7). The DECISION ignores it — the
+     * balance read here already has those debits subtracted, which is the whole
+     * floor. It changes only the SENTENCE on a refusal: the party rail debits a
+     * requisition naming one material twice line by line, so the second line
+     * met a shelf the first had just emptied and was told "the central store
+     * holds none of it" while the unwound gesture left 14,842.5 g on the shelf.
+     * With this the refusal names the pool and the line that took it.
+     */
+    siblingRecipe?: number;
+    siblingLines?: number;
+    /** See `deskBeforeLineQty` on checkCentralIssue (round 9, party rail only).
+     *  Passed straight through; the decision ignores it. */
+    deskBeforeLineQty?: number;
+  },
+): CentralIssueCheck {
+  const c = checkCentralIssue(db, {
+    reqItemId: a.reqItemId, beforeLineQty: a.beforeLineQty, afterLineQty: a.afterLineQty, rail: a.rail,
+    deskBeforeLineQty: a.deskBeforeLineQty,
+  });
+  if (!c.ok) {
+    const sib = Math.max(0, Number(a.siblingRecipe) || 0);
+    throw new CentralStockShort(holdsAny(sib)
+      ? scoreShortLine(db, {
+          reqItemId: a.reqItemId, beforeLineQty: a.beforeLineQty, afterLineQty: a.afterLineQty, rail: a.rail,
+          deskBeforeLineQty: a.deskBeforeLineQty,
+          // The siblings' debits are already OUT of the balance this read; adding
+          // them back as a negative claim and then handing them to the siblings
+          // re-states the same balance as "the pool, of which this much went to
+          // the lines above". The decision is unchanged (claimed nets to 0).
+          alreadyClaimedRecipe: -sib, siblingRecipe: sib, siblingLines: a.siblingLines,
+          afterGesture: false,
+        })
+      : c);
+  }
+  return c;
+}
+
+/**
+ * THE QUANTITY A ROUTE MUST WRITE TO requisition_items.quantity_issued (round 6).
+ *
+ * Both desks write quantity_issued BEFORE they call applyIssueDelta (the caller
+ * contract above). Until round 6 the figure written was always the figure typed,
+ * and that was safe because the floor's debit never differed from it by a grid
+ * step. The shown-figure rule (planCentralDebit) changes that on exactly one
+ * gesture: typing the balance's shown figure — 14.843 kg over 14,842.5 g — takes
+ * the balance, 0.5 g less than typed. Writing 14.843 would leave the line, the
+ * issue_history and the audit row claiming half a gram that never left the
+ * shelf; so the route asks HERE, writes what this returns, and passes the same
+ * figure to applyIssueDelta.
+ *
+ * CALL IT INSIDE THE TRANSACTION, IMMEDIATELY BEFORE THE UPDATE — the same rule
+ * as the pre-image: it reads current_stock, and better-sqlite3 lets nothing
+ * interleave between this read, the UPDATE and applyIssueDelta's own floor, so
+ * the floor then sees an ask on the balance's grid point and takes exactly it.
+ *
+ * `changed` is false on every ordinary issue, and then `afterLineQty` is the
+ * value passed in, untouched — so a route that keys "did the figure move" on it
+ * stays byte-identical to round 5 everywhere the rule did not fire. A line that
+ * does not debit central (party, store-mapped, unit review, a credit, a zero
+ * delta) and a line the floor would refuse are returned as given: the first
+ * moves no stock to record, the second is the floor's to refuse.
+ */
+export function issueLineQtyToRecord(
+  db: any,
+  a: { reqItemId: string; beforeLineQty: number; afterLineQty: number },
+): { afterLineQty: number; changed: boolean } {
+  const asked = Number(a.afterLineQty) || 0;
+  const c = checkCentralIssue(db, a);
+  if (!c.debits || !c.ok || c.recordAfterLineQty === asked) return { afterLineQty: asked, changed: false };
+  return { afterLineQty: c.recordAfterLineQty, changed: true };
+}
+
+/**
+ * THE PARTY RAIL KEEPS THE SAME CONTRACT (round 7): when its debit is not the
+ * ask, the LINE says what left the shelf.
+ *
+ * THE DEFECT, MEASURED. A party line typed at the balance's shown figure —
+ * THREE MANGO 14.843 kg over 14,842.5 g — is debited by the party transfer
+ * (applyPartyFulfillment on both desks, fulfilRequisitionFromPo on a PO
+ * receipt) as the balance itself, 14,842.5 g, through the shown-figure rule.
+ * Central, the movement row and the department credit all said 14,842.5 g; the
+ * requisition line said 14.843 kg and the issue ledger 14,843 g — so the Issue
+ * Log claimed half a gram that never left the shelf (and, from below, 14.842 kg
+ * typed over 14,842.4 g under-claimed 0.4 g). central-debit-clamp.ts states
+ * the contract: when debitIsAsk is false the caller MUST record the debit. The
+ * internal rail did; the party rail could not, because it debits AFTER the desk
+ * has written the line — at fulfilment, in one lump.
+ *
+ * So the party rail calls this, inside its transaction, right after its floor
+ * returned a recordAfterLineQty that differs from the line's figure:
+ *   · quantity_issued becomes that figure — what left the shelf;
+ *   · the LAST issue_history entry (the hand-over that completed the line) is
+ *     corrected by the difference, carrying the typed figure as `asked` — the
+ *     shape the internal rail writes ({qty, asked}) — when it can stay positive;
+ *   · the difference goes through applyIssueDelta like every other write of
+ *     quantity_issued (reason 'party_shelf'): for a party line that moves NO
+ *     stock (the party carve-out) and writes one ledger row whose
+ *     recorded_recipe_qty is the difference, so SUM(recorded_recipe_qty) — what
+ *     the Issue Log reads as handed over — equals what the transfer took, and
+ *     the log's pre-ledger remainder (quantity_issued − the ledger) stays 0.
+ *     The record clamp still applies: a line with no ledger history (written
+ *     before the ledger, or by a script) records nothing below zero.
+ *
+ * ONLY WHEN THE LINE STILL SAYS WHAT WAS WEIGHED. If quantity_issued is not
+ * `askedLineQty` (the PO cascade weighs min(issued, approved), and falls back
+ * to the approved figure on a line issued nothing) the line was not the figure
+ * the shelf rule resolved, so it is left exactly as it is and false is
+ * returned; the caller's own audit row still names both figures.
+ */
+export function recordPartyShelfTake(
+  db: any,
+  a: { reqItemId: string; askedLineQty: number; recordLineQty: number; actor: string },
+): boolean {
+  const cur = db.prepare(`
+    SELECT ri.quantity_issued, ri.issue_history, r.purpose
+      FROM requisition_items ri JOIN requisitions r ON r.id = ri.req_id
+     WHERE ri.id = ?
+  `).get(String(a.reqItemId)) as any;
+  // PARTY LINES ONLY. The applyIssueDelta call below moves no stock BECAUSE
+  // the line is a party line (its carve-out); on an internal line the same
+  // call would debit or credit central for a correction of the record.
+  if (!cur || String(cur.purpose || '') !== 'party') return false;
+  const before = Number(cur.quantity_issued) || 0;
+  const after = Number(a.recordLineQty) || 0;
+  if (before !== (Number(a.askedLineQty) || 0) || after === before || !(after > 0)) return false;
+  const diff = after - before;
+  let history: any[] | null = null;
+  try { const h = JSON.parse(cur.issue_history || '[]'); history = Array.isArray(h) ? h : null; } catch { history = null; }
+  if (history && history.length > 0) {
+    const last = history[history.length - 1] || {};
+    const q = Number(last.qty) || 0;
+    // Snapped to 1e-9 LINE units — below the recipe grid on every pack the
+    // catalogue uses — so the entry reads 4.8425, not 4.842499999999999.
+    const corrected = Math.round((q + diff) * 1e9) / 1e9;
+    if (corrected > 0) {
+      history[history.length - 1] = { ...last, qty: corrected, asked: last.asked != null ? last.asked : q };
+    }
+  }
+  db.prepare(`UPDATE requisition_items SET quantity_issued = ?, issue_history = ? WHERE id = ?`)
+    .run(after, history ? JSON.stringify(history) : (cur.issue_history ?? '[]'), String(a.reqItemId));
+  applyIssueDelta(db, {
+    reqItemId: String(a.reqItemId), beforeLineQty: before, afterLineQty: after,
+    reason: 'party_shelf', actor: a.actor,
+  });
+  return true;
+}
+
+/**
+ * A HELD LINE'S ROW, SCORED AGAINST WHAT IS LEFT AFTER THE GESTURE (round 6).
+ *
+ * THE DEFECT, MEASURED SHAPE. One POST names the same material twice: line A
+ * asks 1.5 kg of a 1 kg balance and is held with cap 1 kg; line B (0.4 kg) then
+ * issues. The pre-flight scored A before B ran, so the 200 told the storekeeper
+ * "issue 1 kg or less" — and typing 1 kg back was refused, because 0.6 kg was
+ * left. A cap printed after the gesture must be the cap after the gesture.
+ *
+ * So the routes keep the pre-flight's HOLD decision (it is the floor's decision
+ * in write order, and it is right), and re-score only the FIGURES of each held
+ * row here, INSIDE the transaction, after every write of the gesture — reading
+ * current_stock as it now stands, with nothing claimed, because everything the
+ * gesture took is already out of the balance. That is exactly the balance the
+ * storekeeper's next POST will meet.
+ *
+ * IF IT NOW FITS — a credit later in the same gesture (an undo, an omitted line
+ * on store-process) put stock back after this line's turn — the line was still
+ * correctly held (the floor runs in order and would have refused it at its
+ * turn), and the row says so and gives the figure that now fits, instead of a
+ * refusal sentence that is no longer true.
+ */
+export function rescoreHeldIssue(
+  db: any,
+  a: {
+    reqItemId: string; beforeLineQty: number; afterLineQty: number;
+    /** See scoreHeldAtTurn: what earlier HELD rows of the same material are
+     *  given first, re-scored after the gesture in the same order (round 7). */
+    siblingRecipe?: number; siblingLines?: number;
+  },
+): CentralIssueCheck {
+  return scoreShortLine(db, { ...a, afterGesture: true });
+}
+
+/**
+ * A HELD LINE'S ROW, SCORED AT ITS TURN — the pre-flight's twin of
+ * rescoreHeldIssue (round 7), for the figures a route prints when nothing ran
+ * (the whole-gesture 400) and as the first draft of the 200's rows.
+ *
+ * THE DEFECT, MEASURED. One POST names the same material on two short lines —
+ * MANGO-like 1,000 g, lines 1.5 kg and 1.2 kg. Each row was scored on its own
+ * and each printed "Issue 1 kg or less on this line"; typing both printed caps
+ * back in one batch (what the store desk's Issue selected sends) issued the
+ * first and held the second "holds none of it". Two caps that add up to twice
+ * the shelf are one cap too many.
+ *
+ * SO HELD ROWS OF ONE MATERIAL SHARE THE POOL IN ROW ORDER: the first is given
+ * what it can take, the next what is left, and so on — `siblingRecipe` is the
+ * running sum of the earlier held rows' own `debitRecipe` (the whole remainder
+ * for a row its cap empties, its ask for a row that now fits), so the caps
+ * printed across sibling rows add up to exactly what is there and every one of
+ * them is accepted when typed back together. A row left nothing says so, and
+ * names the line that has first call — never "holds none" over a stocked shelf.
+ *
+ * THE HOLD DECISION IS NOT THIS FUNCTION'S. The route decides with
+ * checkCentralIssue and the claims of lines that actually RUN (a held line
+ * claims nothing — see the routes); this scores only the figures of a row that
+ * decision already held. With no sibling it is checkCentralIssue's own answer,
+ * byte for byte.
+ */
+export function scoreHeldAtTurn(
+  db: any,
+  a: {
+    reqItemId: string; beforeLineQty: number; afterLineQty: number;
+    alreadyClaimedRecipe?: number; siblingRecipe?: number; siblingLines?: number;
+  },
+): CentralIssueCheck {
+  return scoreShortLine(db, { ...a, afterGesture: false });
+}
+
+/** The body behind rescoreHeldIssue, scoreHeldAtTurn and assertCentralIssue's
+ *  sibling sentence. One function, so the three can never word the same pool
+ *  three ways. */
+function scoreShortLine(
+  db: any,
+  a: {
+    reqItemId: string; beforeLineQty: number; afterLineQty: number;
+    alreadyClaimedRecipe?: number; rail?: 'internal' | 'party';
+    siblingRecipe?: number; siblingLines?: number;
+    afterGesture: boolean;
+    /** Party rail inside /store-issue (round 9): see checkCentralIssue. */
+    deskBeforeLineQty?: number;
+  },
+): CentralIssueCheck {
+  const already = Number(a.alreadyClaimedRecipe) || 0;
+  const sib = Math.max(0, Number(a.siblingRecipe) || 0);
+  const hasSib = holdsAny(sib);
+  const c = checkCentralIssue(db, {
+    reqItemId: a.reqItemId, beforeLineQty: a.beforeLineQty, afterLineQty: a.afterLineQty,
+    rail: a.rail, alreadyClaimedRecipe: already + (hasSib ? sib : 0),
+    deskBeforeLineQty: a.deskBeforeLineQty,
+  });
+  if (!c.debits) return c;
+  const pu = c.purchaseUnit ? ` ${c.purchaseUnit}` : '';
+  // >= 0.001 ⇔ it is a shown figure (checkCentralIssue carries the shown
+  // figure whenever there is one); below that it is a sub-display crumb,
+  // printed exactly so it can be typed back.
+  const fig = (n: number) => n >= 0.001 ? `${fmtQtyNum(n)}${pu}` : `${puFine(n, c.purchasePackFactor)}${pu}`;
+  const ask = fig(c.requestedPurchase);
+
+  // A ROW THAT FITS NOW (only after the gesture: a credit later in it put stock
+  // back after this line's turn) is offered ITS OWN ASK, not the pool (round
+  // 7). Its sentence already said "issue <ask> again", but its cap — the figure
+  // the store desk turns into the "Issue …" button — was the whole pool: 2 kg on
+  // a 1.5 kg line, an over-issue one click away, and with a sibling row the two
+  // caps added up to more than the shelf. The ask is what this row is given;
+  // the next sibling is given what is left after it.
+  const offerAsk = (x: CentralIssueCheck): CentralIssueCheck => ({
+    ...x,
+    availablePurchase: x.requestedPurchase,
+    maxIssueLineQty: Number(a.afterLineQty) || 0,
+    // The box's figure is the ask itself (round 9): what this row added.
+    maxAddLineQty: Math.max(0, (Number(a.afterLineQty) || 0) - (Number(a.beforeLineQty) || 0)),
+    maxAddPurchase: x.requestedPurchase,
+  });
+
+  if (!hasSib) {
+    // No sibling: a row that does not fit carries the floor's own refusal
+    // sentence, exactly round 6; a row that fits only after the gesture says so.
+    if (!c.ok || !a.afterGesture) return c;
+    return {
+      ...offerAsk(c), ok: false,
+      message: `${c.materialName}: not issued with the rest of this gesture — when its turn came the central `
+        + `store held less than ${ask}. After the gesture it holds ${fig(c.availablePurchase)}; issue ${ask} again.`,
+      rewordBlocked: undefined,
+    };
+  }
+
+  // ── SIBLINGS: the pool this line meets, and how much of it goes first ──────
+  // pool = what the store holds as this line meets it (before the siblings'
+  // share); the share is capped at the pool for the sentence.
+  const meta = db.prepare(`
+    SELECT rm.unit, rm.purchase_unit, rm.pack_size
+      FROM requisition_items ri JOIN raw_materials rm ON rm.id = ri.material_id
+     WHERE ri.id = ?
+  `).get(String(a.reqItemId)) as any || {};
+  const pool = Math.max(0, (Number(c.centralStockRecipe) || 0) - already);
+  // A pool that holds nothing is "holds none" whoever else asked — the floor's
+  // own sentence (computed against an empty remainder) is then the truth.
+  if (!holdsAny(pool)) return { ...c, ok: false };
+  const ru = String(meta.unit || '').trim() ? ` ${String(meta.unit).trim()}` : '';
+  const figRecipe = (r: number) => {
+    // The desks' "In store" figure (round 8, shownPurchaseQty) — the same
+    // figure planCentralDebit's shown-figure check prints for this balance.
+    const s = shownPurchaseQty(r, meta);
+    return s > 0 ? `${fmtQtyNum(s)}${pu}` : holdsAny(r) ? `${fmtGridQty(r)}${ru}` : `0${pu}`;
+  };
+  const n = Math.max(1, Math.round(Number(a.siblingLines) || 1));
+  const above = n === 1 ? 'the line above for the same item' : `the ${n} lines above for the same item`;
+  const share = Math.min(sib, pool);
+  const holdsSome = holdsAny(c.availableRecipe);
+
+  if (c.ok) {
+    // Fits in what is left after the siblings' share (only after the gesture:
+    // a credit later in it put stock back after this line's turn).
+    const message = `${c.materialName}: not issued with the rest of this gesture — when its turn came the central `
+      + `store held less than ${ask}. After the gesture it holds ${figRecipe(pool)}, and ${figRecipe(share)} of it `
+      + `goes to ${above}; issue ${ask} again.`;
+    return { ...offerAsk(c), ok: false, message, rewordBlocked: undefined };
+  }
+  // The refusal, as a function of the OTHER short lines of a party transfer
+  // (final pass, partyBlockers) — none for every caller but the transfer.
+  const build = (blockers?: readonly string[]): string => {
+    const b = partyBlockers(blockers);
+    if (holdsSome && c.deskBeforeLineQty > 0) {
+      // A party line the store desk's box adds to (round 9): the same pool
+      // sentence, then deskPartyClauses' figure for a box that adds to what the
+      // line already holds — never the cap on the whole line. The ask EXACT, as
+      // centralShortMessage names it (final pass).
+      const raw = Math.max(0, (Number(c.centralStockRecipe) || 0) - already - sib);
+      const d = deskPartyClauses(c, {
+        holds: holdsAny(raw), shownAvail: shownPurchaseQty(onGrid(raw), meta), shownAsk: 0,
+        gridAvail: qtyDown(raw, 6), recipeUnit: String(meta.unit || '').trim(), pf: c.purchasePackFactor, meta,
+      }, blockers);
+      const askLine = fmtLineQtyPU(c.requestedRecipe / (c.packFactor || 1), c.lineUnit, meta);
+      const asked = c.transferBeforeLineQty > 0 ? `the ${askLine} still to move` : `${askLine} in all`;
+      return `${c.materialName}: ${d.lead} — the central store holds only ${figRecipe(pool)}, and ${figRecipe(share)} of it `
+        + `goes to ${above}, so ${asked} cannot be issued on this line. ${d.tail}`;
+    }
+    if (holdsSome) {
+      return `${c.materialName}: the central store holds only ${figRecipe(pool)}, and ${figRecipe(share)} of it `
+        + `goes to ${above} — so ${ask} cannot be issued on this line. Issue ${fig(c.availablePurchase)} or less on `
+        + `this line${b.once}.${b.why}`;
+    }
+    return `${c.materialName}: the central store holds only ${figRecipe(pool)}, and all of it goes to ${above} `
+      + `— so ${ask} cannot be issued on this line as well. Receive more stock, or record a closing count, before `
+      + `issuing it.${b.why}`;
+  };
+  return {
+    ...c, ok: false, message: build(),
+    rewordBlocked: a.rail === 'party' ? (bl: readonly string[]) => build(bl) : undefined,
+  };
+}
+
+/* ────────────────────────────────────────────────────────────────────────────
+ * THE REPLAY, AND WHY IT HAS TO BE RECOGNISED HERE RATHER THAN AT THE INSERT.
+ * ──────────────────────────────────────────────────────────────────────────*/
+
+/**
+ * Layer-2 idempotency used to be recognised by ACCIDENT: a replayed gesture
+ * reached insertLedger, collided on uq_req_issue_token_item, and the route read
+ * the SQLite constraint message. That worked only while nothing else on the path
+ * could refuse first — and the central floor, added in this same change, CAN.
+ *
+ * MEASURED, and this is the whole reason this class exists. Requisition asks 5,
+ * central holds exactly 2, the storekeeper issues 2 and defers the rest, and the
+ * same gesture is POSTed twice (a dropped response on a venue LAN — the exact
+ * case the token exists for):
+ *     3be09af : POST1 200 applied=2 ; POST2 200 success=true applied=0
+ *     with the floor and the route pre-flight in front of the insert, and
+ *     NOTHING consulting the token:
+ *               POST1 200 applied=2 ; POST2 400 code=central_stock_short
+ *     "nothing was issued and the requisition is unchanged"
+ * The hand-over had completed and central was down to 0, so the floor was
+ * telling the truth about the BALANCE and the opposite of the truth about the
+ * GESTURE. Final DB state was identical on both trees — the defect was purely
+ * what the storekeeper was told, and it trapped him: the client clears its
+ * armed panel only on a 2xx, so he retried the same token forever.
+ *
+ * THE FIX IS ORDERING, NOT A SECOND MESSAGE. The question "has this gesture
+ * already been recorded" is answered from requisition_issue_ledger, which is
+ * the same table and the same (client_token, req_item_id) pair the unique index
+ * is built on — so it can be asked at ANY point, and it is now asked BEFORE
+ * either guard can refuse. The index stays exactly where it was and remains the
+ * last word (it is the only thing that is atomic against a concurrent first
+ * POST), so this is an additional, earlier reading of the same fact — never a
+ * replacement for it.
+ */
+export class IssueTokenReplay extends Error {
+  readonly code = 'ISSUE_TOKEN_REPLAY';
+  readonly reqItemId: string;
+  readonly clientToken: string;
+  constructor(reqItemId: string, clientToken: string) {
+    super(
+      `This issue has already been recorded (gesture ${clientToken} on line ${reqItemId}). ` +
+      `Nothing was changed a second time.`,
+    );
+    this.name = 'IssueTokenReplay';
+    this.reqItemId = reqItemId;
+    this.clientToken = clientToken;
+  }
+}
+
+export function isIssueTokenReplayError(e: unknown): e is IssueTokenReplay {
+  return e instanceof IssueTokenReplay
+    || (typeof e === 'object' && e !== null && (e as { code?: string }).code === 'ISSUE_TOKEN_REPLAY');
+}
+
+/**
+ * Has (clientToken, reqItemId) already been written to the issue ledger? This
+ * is the unique index's own predicate, asked as a question instead of met as a
+ * collision.
+ *
+ * SCOPED TO THE LINE, not to the token, because the index is. One token covers a
+ * whole batch, and a SECOND POST under the same token naming a DIFFERENT line
+ * genuinely is new work — on 3be09af that line's insert did not collide and the
+ * work went through. Answering on the token alone would start refusing it.
+ *
+ * A blank/absent token is never a replay: the index is partial
+ * (WHERE client_token IS NOT NULL) and the 14,149 imported issued lines carry no
+ * token at all, so a tokenless gesture must stay freely repeatable.
+ */
+export function isIssueGestureRecorded(
+  db: any, clientToken: string | null | undefined, reqItemId: string,
+): boolean {
+  const token = String(clientToken ?? '').trim();
+  if (!token) return false;
+  const row = db.prepare(
+    `SELECT 1 FROM requisition_issue_ledger
+      WHERE client_token = ? AND req_item_id = ? LIMIT 1`,
+  ).get(token, String(reqItemId)) as any;
+  return !!row;
+}
+
 export function applyIssueDelta(db: any, input: IssueDeltaInput): IssueDeltaResult {
   // quantity_requested and chef_approved_qty are read HERE rather than passed
   // in, which is what keeps store-issue — the hottest, most carefully reasoned
@@ -357,7 +2002,15 @@ export function applyIssueDelta(db: any, input: IssueDeltaInput): IssueDeltaResu
     //   SUM(delta_recipe_qty) for a req_item_id is never negative, and equals
     //   the net recipe quantity this rail has removed from the store.
     //
-    // Debits are never clamped — only the giving-back direction.
+    // DEBITS ARE STILL NEVER CLAMPED — THEY ARE NOW REFUSED. This sentence used
+    // to read "Debits are never clamped — only the giving-back direction", and
+    // it was the whole bug: the debit direction had no bound of any kind, so
+    // issuing more than the store held drove current_stock negative in silence
+    // (measured: central 0 kg -> -1 kg on a 1 kg issue). The floor below does
+    // not clamp either — a clamp here would commit a line claiming more than
+    // moved — it THROWS, and the caller's transaction unwinds. The clamp
+    // immediately after this still governs the credit direction and is
+    // untouched.
     const takenRow = db.prepare(
       `SELECT COALESCE(SUM(delta_recipe_qty), 0) AS taken FROM requisition_issue_ledger WHERE req_item_id = ?`,
     ).get(input.reqItemId) as any;
@@ -366,7 +2019,51 @@ export function applyIssueDelta(db: any, input: IssueDeltaInput): IssueDeltaResu
     if (Math.abs(stockQty) < EPS) stockQty = 0;
   }
 
+  // Would this call reach insertLedger at all? ONE expression, read twice — here
+  // and by the early return further down that uses it as its own condition.
+  // They MUST agree: the replay check below is placed early precisely so it
+  // fires in exactly the cases the unique index used to fire in, and if these
+  // two tests ever drift that equivalence quietly stops holding.
+  const writesLedgerRow = !(recordQty === 0 && stockQty === 0 && !needsReview);
+
+  // ── THE REPLAY IS RECOGNISED HERE, AHEAD OF BOTH GUARDS ───────────────────
+  // THIS IS AN ORDERING FIX, AND THE ORDER IS THE WHOLE POINT. Until now the
+  // only thing that knew about a spent token was the unique index at
+  // insertLedger, which is the LAST write this function makes. Everything that
+  // can refuse — the department-reversal guard, and now the central floor —
+  // sits in front of it, so whichever of them spoke first got to answer for a
+  // replay. The floor did: it reported "the central store holds none of it" for
+  // a hand-over that had already completed and taken the balance to zero.
+  //
+  // IT IS EQUIVALENT TO THE INDEX, NOT MERELY EARLIER THAN IT. The index fires
+  // iff a row is inserted, and a row is inserted iff the zero-delta gate above
+  // let us through AND `writesLedgerRow`. Both are already decided at this
+  // line, so this test fires on exactly the same calls — which is what lets the
+  // route keep answering a replay the way it did on 3be09af. In particular a
+  // replayed gesture that writes NO row (a reject that keeps what was handed
+  // over, an undo of one of the 14,149 pre-ledger lines, a defer) is not a
+  // replay for this purpose and still proceeds, exactly as it did before.
+  //
+  // IT THROWS, like the index did and like both guards do. Every caller has
+  // ALREADY written quantity_issued by the time we are reached (store-issue
+  // walks its lines, store-process rewrites them absolutely), so returning a
+  // quiet skip here would COMMIT that second write — an 'issue' of 2 kg
+  // replayed would read 4 kg issued against 2 kg that moved. The throw unwinds
+  // the caller's transaction, which is what makes the replay a true no-op.
+  //
+  // THE INDEX STAYS, AND STAYS THE LAST WORD. This read cannot be atomic
+  // against a first POST that has not committed yet; the index can. Both routes
+  // still recognise the constraint message.
+  if (writesLedgerRow && isIssueGestureRecorded(db, input.clientToken, input.reqItemId)) {
+    throw new IssueTokenReplay(String(input.reqItemId), String(input.clientToken || ''));
+  }
+
   let invTxnId: string | null = null;
+  // Did THIS take leave the material holding nothing? THE RULE's shelf arm
+  // (central-debit-clamp.ts) needs it, and only the writer that took can say
+  // it — read from the balance right after the debit below. False on every
+  // write that moves no central stock (a credit, a party or carve-out line).
+  let takeEmptied = false;
   if (stockQty !== 0) {
     // A DEBIT WITHOUT A CREDIT DESTROYS A GRAM SILENTLY, so the department is
     // resolved and validated BEFORE central is touched. 0 of the 14,149 issued
@@ -415,11 +2112,59 @@ export function applyIssueDelta(db: any, input: IssueDeltaInput): IssueDeltaResu
         materialId: String(line.material_id),
         qty: -stockQty,
       });
+    } else {
+      // THE CENTRAL FLOOR — THE MIRROR OF THE REVERSAL GUARD, ON THE OTHER
+      // DIRECTION. assertReversible above answers "does the department still
+      // hold what we are putting back"; this answers "does central hold what we
+      // are taking out". Before this existed the debit had no bound at all and
+      // an over-issue simply drove current_stock negative.
+      //
+      // IT READS THE BALANCE HERE, inside the caller's transaction and one
+      // statement before the UPDATE, so it cannot be raced by a concurrent
+      // issue: better-sqlite3 is synchronous and no caller awaits inside its
+      // transaction, so from this read to that write nothing interleaves.
+      //
+      // IT THROWS, exactly like assertReversible and for the identical reason —
+      // quantity_issued is already written by every caller at this point, so a
+      // silent partial debit would commit a line that claims more than moved.
+      // The throw unwinds the caller's transaction and the line is untouched.
+      //
+      // BOTH ROUTES ALREADY REFUSED THIS BEFORE OPENING THEIR TRANSACTION, with
+      // every short line named at once (checkCentralIssue, the same rule). So in
+      // ordinary use this never fires, and that is the point: it is the bound
+      // that makes the no-negative property structural rather than a promise the
+      // two routes keep. It is what answers a direct API call, a third issue
+      // desk written next year, and the pre-flight/transaction race.
+      const c = assertCentralIssue(db, {
+        reqItemId: input.reqItemId,
+        beforeLineQty: Number(input.beforeLineQty) || 0,
+        afterLineQty: Number(input.afterLineQty) || 0,
+      });
+      // WRITE THE FLOOR'S FIGURE, NOT THE ASK. Same balance read, same rule: an
+      // issue of "everything" subtracts the balance itself and lands on exactly
+      // 0 instead of -4e-7 (or a 1e-9 crumb). It differs from deltaRecipe by
+      // strictly less than one 6-dp step, and only on that "everything" issue.
+      // The ledger row, the central movement and the department credit below
+      // all carry this one figure, so SUM(delta_recipe_qty) is still exactly
+      // what central gave up and the credit clamp above stays honest. It cannot
+      // be 0 here: deltaRecipe is 6-dp rounded and > 0, so it is at least one
+      // grid step, which a zero balance does not fit.
+      stockQty = c.debitRecipe;
+      // THE HAND-OVER RECORD FOLLOWS THE SHELF, NOT THE TYPING (round 6). The
+      // shown-figure rule can take a balance up to half a 0.001 purchase step
+      // away from the figure typed (14,842.5 g for 14.843 kg). Both desks resolve
+      // the line to that figure first (issueLineQtyToRecord), so here the two
+      // agree on the grid and nothing changes; this is the backstop for a caller
+      // that did not, so recorded_recipe_qty never claims a gram the debit did
+      // not move. Only when they differ by a whole grid step — on the grid rule
+      // alone they never do, so every round-5 row is byte-identical.
+      if (qtyGrid(stockQty) !== qtyGrid(recordQty)) recordQty = stockQty;
     }
 
     // Positive delta = goods left the store.
     db.prepare(`UPDATE raw_materials SET current_stock = current_stock - ? WHERE id = ?`)
       .run(stockQty, line.material_id);
+    if (stockQty > 0) takeEmptied = centralShelfEmpty(db, String(line.material_id));
 
     // MOVEMENT RECORD: the central debit half of an issue. The RECEIVING
     // DEPARTMENT was never on this row — it lived only on the paired department
@@ -439,6 +2184,15 @@ export function applyIssueDelta(db: any, input: IssueDeltaInput): IssueDeltaResu
     });
   }
 
+  // THE RULE'S MEMORY (round 8). quantity_issued just changed (the zero-delta
+  // gate above returned on every write that did not change it), so the line's
+  // shelf mark is re-decided HERE, by the single writer, for every writer of the
+  // column: stamped when this take emptied the shelf and THE RULE closes the
+  // line by that arm, cleared otherwise. See stampShelfClose. Before the early
+  // return below on purpose — an undo of a pre-ledger line writes no row but
+  // still changes the quantity the mark spoke for.
+  const stamp = stampShelfClose(db, String(input.reqItemId), takeEmptied);
+
   // Nothing to record and nothing moved. The live case is an undo of one of the
   // 14,149 pre-ledger issues: the record clamp took it to 0, and writing a row
   // of two zeroes would only teach the log that a department gave back
@@ -454,7 +2208,7 @@ export function applyIssueDelta(db: any, input: IssueDeltaInput): IssueDeltaResu
   // above, so this cannot reintroduce the junk-row-per-process problem — the
   // old code, which had no zero-delta gate ahead of it, wrote one of these on
   // every single process.
-  if (recordQty === 0 && stockQty === 0 && !needsReview) {
+  if (!writesLedgerRow) {
     return { applied: false, skipped: 'zero_delta', packFactor: factor };
   }
 
@@ -476,6 +2230,9 @@ export function applyIssueDelta(db: any, input: IssueDeltaInput): IssueDeltaResu
     factor, deltaLine, deltaRecipe: stockQty, recordedRecipe: recordQty,
     needsReview, invTxnId, storeMapped, effectiveLineQty, skipReason,
   });
+  // This row's take closed the line by the shelf arm: say so on the row too,
+  // where a later undo cannot retire it (markLedgerShelfClose).
+  if (stamp.byShelf) markLedgerShelfClose(db, String(input.reqItemId), Number(input.afterLineQty) || 0, ledgerId);
 
   if (stockQty !== 0) {
     // THE MIRROR OF THE CENTRAL DEBIT. Signed, in RECIPE units: positive = into

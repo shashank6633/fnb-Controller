@@ -1,22 +1,44 @@
 import { getDb, generateId, logAuditEvent } from '@/lib/db';
 import { getCurrentUser, canIssueAsStore } from '@/lib/auth';
 import { applyPartyFulfillment } from '@/lib/party-fulfillment';
-import { applyIssueDelta } from '@/lib/issue-stock';
+import {
+  applyIssueDelta, checkCentralIssue, isCentralStockShort,
+  isIssueGestureRecorded, isIssueTokenReplayError,
+  issueLineQtyToRecord, rescoreHeldIssue, scoreHeldAtTurn, lineIssueComplete,
+  zeroEntriesSentence, lineShownAs, fmtLineQtyPU, issueLedgerWatermark,
+  type CentralStockShort,
+} from '@/lib/issue-stock';
 import { isDeptReversalBlocked } from '@/lib/dept-ledger';
 
 /**
- * A replayed POST carrying a client_token it already spent collides on
- * requisition_issue_ledger's partial unique index (db.ts:1271). better-sqlite3
- * rolls the WHOLE transaction back, so nothing was applied twice — the honest
- * answer is 200 "you already did this", not a 500.
+ * A replayed POST carrying a client_token it already spent is answered 200
+ * "you already did this", never a 400 and never a 500: nothing was applied a
+ * second time, so a failure is a lie about what happened.
  *
- * SQLite words the failure with the COLUMNS, not the index name
- * ("UNIQUE constraint failed: requisition_issue_ledger.client_token,
- * requisition_issue_ledger.req_item_id"), so match on that and keep the index
- * name as a fallback. Deliberately narrow: any other constraint failure is a
- * real bug and must keep surfacing as a 500.
+ * TWO SPELLINGS OF THE SAME FACT, AND BOTH ARE NEEDED.
+ *
+ *  1. IssueTokenReplay, thrown by applyIssueDelta BEFORE either of its guards
+ *     can refuse. This is the one that actually fires in ordinary use, and it
+ *     exists because of a measured trap: with the central floor in front of the
+ *     ledger insert, a replayed tight-stock issue (asks 5, central held 2,
+ *     issued 2 and deferred the rest) was answered 400 "nothing was issued and
+ *     the requisition is unchanged" WHEN THE HAND-OVER HAD COMPLETED. The floor
+ *     was right about the balance — the first POST had taken it to zero — and
+ *     backwards about the gesture. See the ordering note in issue-stock.ts.
+ *
+ *  2. The unique index uq_req_issue_token_item on requisition_issue_ledger
+ *     (client_token, req_item_id), which is still in place and is still the
+ *     LAST word: it is the only layer that is atomic against a first POST that
+ *     has not committed yet. better-sqlite3 rolls the WHOLE transaction back,
+ *     so again nothing was applied twice.
+ *     SQLite words the failure with the COLUMNS, not the index name
+ *     ("UNIQUE constraint failed: requisition_issue_ledger.client_token,
+ *     requisition_issue_ledger.req_item_id"), so match on that and keep the
+ *     index name as a fallback. Deliberately narrow: any other constraint
+ *     failure is a real bug and must keep surfacing as a 500.
  */
 function isIssueTokenReplay(e: any): boolean {
+  if (isIssueTokenReplayError(e)) return true;
   const code = String(e?.code || '');
   const msg = String(e?.message || '');
   if (!code.startsWith('SQLITE_CONSTRAINT')) return false;
@@ -39,6 +61,11 @@ function isIssueTokenReplay(e: any): boolean {
  *       id: string,                    // requisition_item id
  *       action: 'issue' | 'defer' | 'undo' | 'reject' | 'unreject',
  *       quantity?: number,             // for 'issue': how much was handed over now
+ *       expect_issued?: number,        // for 'issue' (round 10, optional): the line's quantity_issued
+ *                                      //   the figure was worked out against — a held panel's cap
+ *                                      //   sends its row's `line_issued`. A line that has moved
+ *                                      //   since is refused (code 'line_changed'), nothing written.
+ *                                      //   Absent ⇒ exactly as before. See THE STALE CAP below.
  *       defer_until?: string,          // for 'defer': ISO datetime the store will issue later
  *       reason?: string,               // for 'defer'/'reject': free-text "out of cold storage" / "discontinued"
  *     }
@@ -72,8 +99,14 @@ function isIssueTokenReplay(e: any): boolean {
  *   unreject → clears store_rejected + store_reject_reason (line becomes issuable again).
  *
  * Parent requisition status auto-advances to 'fulfilled' when every
- * non-rejected item has quantity_issued >= effective_qty (chef_approved_qty
- * if set, else quantity_requested). A line rejected by the chef (is_rejected)
+ * non-rejected item is complete — lineIssueComplete (src/lib/issue-stock.ts),
+ * THE RULE (central-debit-clamp.ts issuedCoversAsk): quantity_issued >=
+ * effective_qty (chef_approved_qty if set, else quantity_requested) within
+ * 1e-9, or a take emptied the central shelf and what remains owing is below one
+ * printed step (round 8: 14.8424 kg recorded of 14.843 approved after the issue
+ * took the whole 14,842.4 g shelf is done; the same 0.0006 kg owing over a
+ * stocked shelf is an ordinary partial). Decided ONCE, after every take of the
+ * gesture, party transfer included. A line rejected by the chef (is_rejected)
  * OR by the store (store_rejected) counts as "done" and is not required to be
  * issued. Otherwise stays 'mgmt_approved' / 'chef_approved' / 'store_processed'
  * so it remains in the store queue.
@@ -220,16 +253,23 @@ function isIssueTokenReplay(e: any): boolean {
  * An 'issue' used to blank deferred_until + defer_reason unconditionally, so
  * "requested 4, issue 2, defer the other 2" was impossible on ONE line: the
  * issue destroyed the defer the moment it landed. An issue now clears the
- * defer ONLY when the line is fully satisfied:
+ * defer ONLY when the line is complete, asked AFTER its take (round 8 — THE
+ * RULE's shelf arm is about what the take left on the shelf):
  *
- *     newQty >= (chef_approved_qty ?? quantity_requested)
+ *     lineIssueComplete(the line as the take left it)
  *
- * — character-for-character the predicate the auto-advance below uses, on
- * purpose. If the two ever disagreed, a line could satisfy the auto-advance's
+ * — the SAME FUNCTION the auto-advance below calls, on purpose (it was the
+ * same expression typed twice until round 7). If the two ever disagreed, a line could satisfy the auto-advance's
  * qty test while still carrying a deferred_until, and its `!deferred_until`
  * clause would keep the requisition out of 'fulfilled' forever. A line that is
  * not deferred is unaffected: the partial UPDATE simply leaves an already-NULL
  * deferred_until and an already-empty defer_reason alone.
+ *
+ * AND A 'defer' ON A COMPLETE LINE IS DROPPED, NEVER WRITTEN (round 8), and
+ * named on the 200 (`defer_dropped`) and on a 'req_item.store_defer_dropped'
+ * audit row. Round 7 let "Issue part, defer rest" ([issue, defer] in one POST)
+ * write the defer onto a line its own issue had just completed — a requisition
+ * with nothing to press.
  *
  * ── STOCK ──────────────────────────────────────────────────────────────────
  * Every write to quantity_issued here is mirrored to applyIssueDelta()
@@ -251,6 +291,56 @@ function isIssueTokenReplay(e: any): boolean {
  * to "keep the rest of the batch going" — quantity_issued is already written by
  * then, so the surviving lines would be committed against stock that never came
  * back. The batch is atomic; the catch below only improves the MESSAGE.
+ *
+ * ── AND CENTRAL CANNOT GO NEGATIVE EITHER (THE OVER-ISSUE CLAMP) ───────────
+ * An 'issue' for more than the central store holds is REFUSED. It used to
+ * succeed silently and drive raw_materials.current_stock negative; nothing on
+ * the path said no, in this route or in the helper.
+ *
+ * The refusal is asked TWICE, and the two are not redundant:
+ *   - BEFORE the transaction (the pre-flight block below), so the short line is
+ *     HELD — dropped from the write loop and named on the response — while
+ *     every other line of the batch is handed over. "Issue the 5, hold the 1",
+ *     the owner's call. Only when NOT ONE 'issue' entry survives the floor is
+ *     the whole gesture refused with nothing written, which is what keeps the
+ *     single-line issue-and-defer modal replayable with its typed numbers.
+ *   - INSIDE applyIssueDelta (assertCentralIssue), which throws and unwinds this
+ *     route's transaction. That is the bound that actually holds — it covers the
+ *     race the pre-flight cannot see, and it covers any future caller.
+ * A PARTIAL issue of what the store genuinely holds still works; both the
+ * refusal and the held row carry that number, in the line's own unit, as
+ * max_issue_qty.
+ *
+ * ROUND 6, TWO THINGS THE STOREKEEPER READS WERE FALSE, AND ARE NOT NOW:
+ *   - THE SHOWN FIGURE. Typing the "In store" figure (14.843 kg over 14,842.5 g)
+ *     is accepted and takes the whole balance — planCentralDebit's shown-figure
+ *     rule — and the line RECORDS what left the shelf: quantity_issued,
+ *     issue_history and the audit row all carry issueLineQtyToRecord()'s figure,
+ *     not the typed one, whenever the two differ (the typed figure rides along
+ *     as `asked`). Never below zero, never phantom stock.
+ *   - THE STALE CAP. A held row's cap was scored BEFORE the gesture ran, so a
+ *     later line of the same material spent part of it and typing the printed
+ *     cap back was refused. The rows are now re-scored inside the transaction
+ *     after every write (rescoreHeldIssue), so the 200 prints what is left.
+ *
+ * ROUND 7, THREE MORE:
+ *   - THE STUCK LINE. The shown figure took the whole shelf and recorded
+ *     14.8425 kg of 14.843 approved; `issued >= approved` then held the line
+ *     0.0005 kg outstanding forever. lineIssueComplete closes it.
+ *   - SIBLING CAPS. Two held rows of one material each printed the whole pool;
+ *     they now share it in row order (scoreHeldAtTurn / rescoreHeldIssue's
+ *     siblingRecipe), so the caps add up to the shelf.
+ *   - THE PARTY RAIL'S RECORD. A party line's transfer can take the balance
+ *     instead of the typed figure; the line, the ledger and the audit row now
+ *     say what it took (applyPartyFulfillment's `recorded`).
+ *
+ * AND NEITHER LAYER MAY ANSWER FOR A REPLAY. Both of them sit in front of the
+ * ledger insert that used to be the only thing aware of client_token, so a
+ * re-POST of an already-recorded gesture was answered "nothing was issued and
+ * the requisition is unchanged" on the very tight-stock case the token exists
+ * for. The replay is now recognised ahead of both — in the pre-flight loop's
+ * filters and, structurally, inside applyIssueDelta — and answered 200 as it
+ * always was. See isIssueTokenReplay above.
  */
 export async function POST(req: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
@@ -377,30 +467,36 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     // THIS requisition and to name the material in the audit trail. Every
     // mutable field is re-read from here INSIDE the transaction, immediately
     // before the UPDATE that changes it.
+    // line_unit + the material's pack meta ride along for lineIssueComplete
+    // (round 7) — the defer rule's "fully satisfied" reads what the desk SHOWS.
+    // LEFT JOIN, so a line whose material row is gone is still read exactly as
+    // before (its meta is NULL and only the exact comparison applies).
     const selLine = db.prepare(`
-      SELECT id, quantity_issued, issue_history, is_rejected, store_rejected,
-             store_reject_reason, deferred_until, defer_reason,
-             quantity_requested, chef_approved_qty
-      FROM requisition_items
-      WHERE id = ? AND req_id = ?
+      SELECT ri.id, ri.quantity_issued, ri.issue_history, ri.is_rejected, ri.store_rejected,
+             ri.store_reject_reason, ri.deferred_until, ri.defer_reason,
+             ri.quantity_requested, ri.chef_approved_qty, ri.shelf_emptied_qty,
+             ri.unit AS line_unit, rm.unit, rm.purchase_unit, rm.pack_size
+      FROM requisition_items ri
+      LEFT JOIN raw_materials rm ON rm.id = ri.material_id
+      WHERE ri.id = ? AND ri.req_id = ?
     `);
 
-    // Fully-satisfied issue: clears the defer. See THE DEFER RULE in the header.
-    const updIssue = db.prepare(`
-      UPDATE requisition_items
-      SET quantity_issued = ?, issued_at = ?, issued_by = ?,
-          deferred_until = NULL, defer_reason = '',
-          issue_history = ?
-      WHERE id = ?
-    `);
-    // Partial issue: identical, minus the defer wipe. On a line with no defer
-    // this writes exactly the same row as updIssue (deferred_until is already
-    // NULL and defer_reason already '' — updDefer sets the two together and
-    // undo/reject clear the two together, so they are never half-set).
+    // An issue writes the quantity and its history entry and leaves the defer
+    // pair alone; whether the line is now complete is THE RULE's answer, and
+    // THE RULE can only answer after the take (its shelf arm is about what the
+    // take left on the shelf). So the take runs first, and a line it completed
+    // has its defer cleared by updClearDefer right after — the same final row
+    // the old single "fully satisfied" UPDATE wrote. See THE DEFER RULE in the
+    // header.
     const updIssuePartial = db.prepare(`
       UPDATE requisition_items
       SET quantity_issued = ?, issued_at = ?, issued_by = ?,
           issue_history = ?
+      WHERE id = ?
+    `);
+    const updClearDefer = db.prepare(`
+      UPDATE requisition_items
+      SET deferred_until = NULL, defer_reason = ''
       WHERE id = ?
     `);
     const updDefer = db.prepare(`
@@ -456,6 +552,308 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
       WHERE id = ?
     `);
 
+    // ── THE STALE CAP (round 10) ─────────────────────────────────────────────
+    // A held panel's cap is a figure about the line AS THE STORE ANSWERED — what
+    // it can still take. If the line has moved since (the management desk
+    // issued it in full, another gesture issued part of it), the same figure is
+    // an over-issue nobody asked for. MEASURED (round-9 never-stuck verifier,
+    // stale-cap open): SALT 2 kg refused at 20 typed, then completed 2/2 on the
+    // management desk; the store desk's stale panel offered "Issue 12.842 kg …
+    // and the line is issued in full", and this route accepted it — 14.842 of
+    // 2 kg, the central shelf to 0, with the refused attempt's reason riding
+    // along and no over-issue warning ever shown. Nothing here can tell that
+    // POST from a deliberate over-issue — both are {issue, quantity, note} — so
+    // the cap says what it was worked out against: `expect_issued`, the row's
+    // `line_issued`. A line whose quantity_issued is no longer that figure is
+    // REFUSED WHOLE, nothing written, with the line's figures now. An entry
+    // without the field — every ordinary Issue Now, every typed over-issue with
+    // its reason — is exactly what it always was. Asked here before anything
+    // is scored, and again inside the transaction (the race).
+    const lineChangedRows: Array<Record<string, unknown>> = [];
+    const lineChangedRow = (ln: any, cur: any, expected: number) => {
+      const it = itemMap.get(ln.id);
+      const name = String(it?.material_name || 'a line');
+      const now = Number(cur.quantity_issued) || 0;
+      const approved = (cur.chef_approved_qty != null ? Number(cur.chef_approved_qty) : Number(cur.quantity_requested)) || 0;
+      const fig = (n: number) => fmtLineQtyPU(n, cur.line_unit, cur);
+      const done = lineIssueComplete(cur);
+      return {
+        code: 'line_changed', line_id: String(ln.id ?? ''), material: name,
+        req_item_id: String(cur.id), quantity_issued: now, expected_issued: expected, approved,
+        line_unit: String(cur.line_unit ?? ''),
+        message: `${name}: this line changed after the store answered — it now holds ${fig(now)} of `
+          + `${fig(approved)} approved${done ? ' and is complete' : ''}, not the ${fig(expected)} that figure was `
+          + `worked out for — so nothing was issued and the requisition is unchanged. Refresh to see what it still owes.`,
+      };
+    };
+    const expectOf = (ln: any): number | null => {
+      if (String(ln?.action || '').toLowerCase() !== 'issue') return null;
+      if (ln?.expect_issued == null || ln.expect_issued === '') return null;
+      const v = Number(ln.expect_issued);
+      return Number.isFinite(v) ? v : null;
+    };
+    for (const ln of lines) {
+      const exp = expectOf(ln);
+      if (exp == null || !itemMap.get(ln.id)) continue;
+      const cur = selLine.get(ln.id, id) as any;
+      if (!cur) continue;
+      if (Math.abs((Number(cur.quantity_issued) || 0) - exp) > 1e-9) lineChangedRows.push(lineChangedRow(ln, cur, exp));
+    }
+    if (lineChangedRows.length > 0) {
+      return Response.json({
+        error: lineChangedRows.map(x => x.message).join(' '),
+        code: 'line_changed',
+        blocked: lineChangedRows,
+        applied: 0,
+      }, { status: 400 });
+    }
+
+    // ── THE CENTRAL FLOOR, ASKED BEFORE THE TRANSACTION OPENS ───────────────
+    // No issue may take raw_materials.current_stock below zero. The bound that
+    // makes that structural lives on the single writer (assertCentralIssue in
+    // src/lib/issue-stock.ts, which throws inside this route's transaction);
+    // this is the same rule — literally the same function — asked early, so the
+    // lines that CAN be handed over are not held hostage by the one that cannot.
+    //
+    // ── ISSUE THE 5, HOLD THE 1 (the owner's call) ──────────────────────────
+    // A batch where ONE material is short used to answer 400 with applied:0:
+    // every line kept quantity_issued 0, no requisition_issue_ledger rows, no
+    // inventory_transactions, and the materials the storekeeper was holding in
+    // his hands stayed on the shelf. Measured on a copy of the live db — SALT
+    // 2 kg, MIRCHI 3 kg (1,000 g on hand), EGGS 100 pcs, CHICKEN 5 kg — one
+    // short line cost the other three their hand-over. The storekeeper's only
+    // answer was to retype the batch without the short line, which is work this
+    // route can do for him.
+    //
+    // SO A SHORT LINE IS HELD, NOT FATAL. Its entry is dropped from the write
+    // loop (`heldEntries` below) and every other entry runs exactly as it would
+    // have on its own. The held line keeps the quantity_issued it already had,
+    // so it stays outstanding on the requisition and in the store queue — the
+    // department is still owed it — and the response names it with the obeyable
+    // quantity, so issuing what the store really holds is one more gesture.
+    //
+    // WHY HELD RATHER THAN CLAMPED TO WHAT IS THERE. Writing 1 kg where the
+    // storekeeper typed 3 would commit a hand-over that did not happen, on the
+    // row the department is owed against. The verdict stays per line and binary
+    // — `c.ok` from checkCentralIssue, the one place that decides what is
+    // issuable — and nothing here invents a second notion of "short".
+    // store-process/route.ts:779 makes the same point about the per-line vendor
+    // verdict that drives its own drop-the-line rule.
+    //
+    // NOTHING LEFT TO ISSUE IS STILL REFUSED WHOLE, in the envelope and the
+    // words it has always had. If not one 'issue' entry survives the floor there
+    // is no hand-over to protect: the requisition is left untouched rather than
+    // written to, every short line is named, and the modal keeps the typed
+    // numbers so one corrected figure replays the gesture. The single-line
+    // issue-and-defer gesture (store-requisitions/page.tsx:676) is exactly this
+    // case, and it is unchanged — a 'defer' entry is never scored here, so a
+    // short issue beside it leaves nothing issuable.
+    //
+    // A PARTIAL ISSUE REMAINS FULLY AVAILABLE, which is the point of a per-line
+    // cap rather than a per-line veto: the message carries max_issue_qty in the
+    // LINE's own unit, and issuing that amount passes. Only the part the store
+    // does not hold is refused.
+    //
+    // THE FILTERS BELOW MIRROR THE WRITE LOOP ENTRY FOR ENTRY — unknown line,
+    // vanished line, chef-rejected, store-rejected-and-not-unrejecting, and the
+    // finite/positive quantity test. A pre-flight that scored a line the loop
+    // skips would refuse a batch that moves no stock at all.
+    //
+    // ONE FILTER IS NOT IN THE WRITE LOOP, AND IS STILL THE SAME RULE: a line
+    // whose gesture this token has ALREADY recorded. The loop does call the
+    // helper for it — and the helper throws IssueTokenReplay before debiting,
+    // which unwinds the batch and is answered 200 in the catch below. So it is
+    // a line that moves no stock, which is exactly what this filter list is for.
+    // It is spelled out at its own entry below because it is the regression this
+    // round exists to fix.
+    const centralShort: {
+      code: 'central_stock_short';
+      line_id: string;
+      material: string; material_id: string; req_item_id: string;
+      /** PURCHASE basis — the unit every store surface leads with. */
+      requested: number; available: number; purchase_unit: string;
+      /** LINE basis — the most the line's TOTAL may reach on a retry. */
+      max_issue_qty: number; line_unit: string;
+      /** THE BOX'S FIGURE (round 9): the most this route's box — which ADDS to
+       *  quantity_issued — may hold and be accepted. LINE units, and the same
+       *  in PURCHASE units, exact (a 0.0004 kg add is real and typeable). On an
+       *  internal line it is `available`'s image; on a party line refused by the
+       *  transfer it is what, added to the line, the transfer accepts — which
+       *  `available` (what the store holds for the line) is not. */
+      max_add_qty: number; max_add_purchase: number;
+      /** The line's quantity_issued these figures were worked out against
+       *  (round 10, LINE units) — what a cap pressed from this row sends back
+       *  as `expect_issued` (THE STALE CAP). */
+      line_issued: number;
+      message: string;
+    }[] = [];
+    /**
+     * INDICES INTO `lines` the write loop must not run, keyed by ENTRY and not
+     * by line id on purpose: one POST can carry two entries for the same line
+     * (the issue-and-defer gesture is exactly that), and only the entry the
+     * floor refused is dropped. The write loop walks the same array by the same
+     * index, so the two can never drift apart.
+     */
+    const heldEntries = new Set<number>();
+    /**
+     * Entry index → its row in `centralShort`, so the transaction can re-score
+     * the row's FIGURES after the gesture has run (rescoreHeldIssue). The hold
+     * decision itself is the pre-flight's and is never revisited.
+     */
+    const heldRowOf = new Map<number, (typeof centralShort)[number]>();
+    /** 'issue' entries the floor cleared. 0 with a held line ⇒ refuse whole. */
+    let issuableEntries = 0;
+    {
+      // Accumulated per MATERIAL, in the batch's own order, so two entries for
+      // one line — which this route documents and has measured — and two lines
+      // of one material are both scored the way the floor will see them.
+      const claimed = new Map<string, number>();
+      // What earlier HELD rows of the same material are given first, for the
+      // FIGURES only (round 7 — scoreHeldAtTurn). Never read by the decision:
+      // a held line runs nothing, so it must not hold a later line that fits.
+      const heldShare = new Map<string, { recipe: number; lines: number }>();
+      for (let li = 0; li < lines.length; li++) {
+        const ln = lines[li];
+        if (!itemMap.get(ln.id)) continue;
+        const cur = selLine.get(ln.id, id) as any;
+        if (!cur) continue;
+        if (cur.is_rejected) continue;
+        const action = String(ln.action || '').toLowerCase();
+        if (cur.store_rejected && action !== 'unreject') continue;
+        // 'defer' and 'unreject' write no quantity at all; the loop calls the
+        // helper for neither, so there is no delta to bound.
+        if (action !== 'issue' && action !== 'undo' && action !== 'reject') continue;
+        // ── A REPLAY IS NOT A STOCK PROBLEM, SO IT IS NOT SCORED ────────────
+        // THE DEFECT THIS CLOSES, MEASURED. Requisition asks 5, central holds
+        // exactly 2, the storekeeper issues 2 and defers the rest, and the same
+        // gesture arrives twice (a dropped response on the venue LAN — the one
+        // case the token exists for). The first POST took central to 0, so this
+        // pre-flight then scored the REPLAY against an empty store and refused
+        // it 400 "nothing was issued and the requisition is unchanged" — the
+        // opposite of the truth, about a hand-over that had completed. On
+        // 3be09af the same second POST answered 200, applied=0.
+        //
+        // A gesture already in requisition_issue_ledger under this token moves
+        // no stock on this POST: applyIssueDelta throws IssueTokenReplay before
+        // it debits anything, the transaction unwinds, and the catch below
+        // answers 200 like the unique index always made it. There is therefore
+        // no delta for a floor to bound — scoring it would refuse a no-op.
+        //
+        // SKIPPING IS WHAT 3be09af DID, exactly: it had no pre-flight at all,
+        // so no replayed line was ever weighed against a balance. Note what is
+        // deliberately NOT done here — the batch is not short-circuited and no
+        // 200 is minted at this point. Whether a row actually gets written (and
+        // so whether this IS a replay) is applyIssueDelta's decision, made from
+        // the final delta inside the transaction; deciding it here would start
+        // refusing the zero-delta cases the base tree let through (a replayed
+        // token arriving on a defer-only POST, or on a reject that keeps what
+        // was handed over — both measured identical to base).
+        //
+        // ONE DELIBERATE DIFFERENCE FROM 3be09af, AND IT IS A BETTER ANSWER,
+        // not an oversight. A batch that mixes a replayed line with a FRESH line
+        // that is genuinely short is refused here naming the fresh line, where
+        // base answered "you already did this". Both write nothing and leave
+        // byte-identical state (measured), but base's sentence was false about
+        // the line that actually could not be satisfied. No shipped client can
+        // produce the case — the only tokened POST is the single-line
+        // issue-and-defer gesture at store-requisitions/page.tsx:676.
+        if (isIssueGestureRecorded(db, clientToken, String(cur.id))) continue;
+        const beforeQty = Number(cur.quantity_issued) || 0;
+        let afterQty = beforeQty;
+        if (action === 'issue') {
+          const addQty = Number(ln.quantity);
+          if (!Number.isFinite(addQty) || addQty <= 0) continue;
+          afterQty = beforeQty + addQty;
+        } else if (action === 'undo') {
+          afterQty = 0;
+        } else {
+          // reject: keeps what was handed over unless the party rail owns the
+          // line — the same keepIssued expression the loop uses below.
+          afterQty = (!isParty && beforeQty > 0) ? beforeQty : 0;
+        }
+        const matId = String(itemMap.get(ln.id)?.material_id || '');
+        const already = claimed.get(matId) || 0;
+        const c = checkCentralIssue(db, {
+          reqItemId: String(cur.id),
+          beforeLineQty: beforeQty,
+          afterLineQty: afterQty,
+          alreadyClaimedRecipe: already,
+        });
+        // ── WHAT A HELD LINE CLAIMS: NOTHING ────────────────────────────────
+        // netRecipe, not requestedRecipe: an undo in the same batch credits
+        // stock back, and that headroom is real for a later issue of the same
+        // material.
+        //
+        // AND ONLY WHEN THE LINE IS ACTUALLY GOING TO RUN. A held line is
+        // dropped from the write loop, so it removes nothing from central and
+        // must not eat the headroom a later line of the same material draws on
+        // — accumulating its full request (what the whole-batch refusal did,
+        // harmlessly, because nothing ran afterwards) would cascade one short
+        // line into holding every later line of that material. 0 of the 1,630
+        // live requisitions name one material twice, so this changes no
+        // measured case; it stops the day one does from being wrong.
+        if (c.ok) {
+          claimed.set(matId, already + c.netRecipe);
+          // 'issue' is the only action that hands goods OVER (an 'undo' or
+          // 'reject' is a credit or a no-op — see afterQty above), so it is the
+          // only one whose survival makes a partial hand-over worth protecting.
+          if (action === 'issue') issuableEntries++;
+          continue;
+        }
+        heldEntries.add(li);
+        // ── HELD ROWS OF ONE MATERIAL SHARE THE POOL (round 7) ──────────────
+        // Each held row used to print the whole remaining pool as its cap, so
+        // two short MANGO lines over 1 kg both said "Issue 1 kg or less" and
+        // typing both back held one of them. The first held row is given what
+        // it can take, the next what is left — the caps add up to what is
+        // there. With no earlier held sibling this is `c`, byte for byte.
+        const share = heldShare.get(matId);
+        const h = share
+          ? scoreHeldAtTurn(db, {
+              reqItemId: String(cur.id), beforeLineQty: beforeQty, afterLineQty: afterQty,
+              alreadyClaimedRecipe: already, siblingRecipe: share.recipe, siblingLines: share.lines,
+            })
+          : c;
+        heldShare.set(matId, {
+          recipe: (share?.recipe || 0) + Math.max(0, Number(h.debitRecipe) || 0),
+          lines: (share?.lines || 0) + 1,
+        });
+        const row = {
+          code: 'central_stock_short' as const,
+          line_id: String(ln.id ?? ''),
+          material: h.materialName, material_id: h.materialId, req_item_id: h.reqItemId,
+          requested: h.requestedPurchase, available: h.availablePurchase,
+          purchase_unit: h.purchaseUnit,
+          max_issue_qty: h.maxIssueLineQty, line_unit: h.lineUnit,
+          max_add_qty: h.maxAddLineQty, max_add_purchase: h.maxAddPurchase,
+          line_issued: beforeQty,
+          message: h.message,
+        };
+        centralShort.push(row);
+        heldRowOf.set(li, row);
+      }
+    }
+    // NOTHING LEFT TO HAND OVER ⇒ THE WHOLE GESTURE IS REFUSED, unchanged in
+    // wording, envelope and status from the day the floor was added. Every
+    // 'issue' entry in the batch is short, so there is no partial hand-over to
+    // protect and writing the defers/unrejects that rode along with it would
+    // record half a gesture the storekeeper never completed.
+    if (centralShort.length > 0 && issuableEntries === 0) {
+      // Same envelope the department-reversal refusal uses — `code` + `blocked`
+      // — because the client already keys off those and renders the message
+      // inline against the named line instead of an alert
+      // (store-requisitions/page.tsx:232).
+      return Response.json({
+        error: `${centralShort.length} line${centralShort.length === 1 ? '' : 's'} `
+          + `${centralShort.length === 1 ? 'asks' : 'ask'} for more than the central store holds, `
+          + `so nothing was issued and the requisition is unchanged. `
+          + centralShort.map(s => s.message).join(' '),
+        code: 'central_stock_short',
+        blocked: centralShort,
+        applied: 0,
+      }, { status: 400 });
+    }
+
     const auditPerLine: any[] = [];
     const nowIso = new Date().toISOString();
     // Carried out of the rolled-back transaction. A plain `let` narrowed to
@@ -467,6 +865,61 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
     // batch that is the only thing the storekeeper needs, so the line being
     // worked on is stamped here and read after the rollback.
     const failing: { lineId?: string; material?: string } = {};
+    // 'issue' entries sent at 0 (a box typed to 0 on Issue All / Issue
+    // Selected). The loop skips them — nothing is issued on them — so the held
+    // sentence below must not say "everything else was issued" over them
+    // (round 7 verifier: MIRCHI held + SALT at 0 + EGGS).
+    const zeroEntryNames: string[] = [];
+    // DEFERS DROPPED BECAUSE THE LINE IS COMPLETE (round 8) — never written, or
+    // (when the defer came BEFORE the issue that completed the line in the same
+    // POST) cleared by that issue. Named on the 200 and on an audit row, so the
+    // storekeeper who pressed "Issue part, defer rest" reads why there is no
+    // promise to keep.
+    const droppedDefers: Array<{
+      line_id: string; material: string; quantity_issued: number; approved: number;
+      line_unit: string; by_shelf: boolean; message: string;
+    }> = [];
+    /** Lines a 'defer' entry of THIS gesture wrote, for the after-loop check. */
+    const deferWritten = new Map<string, any>();
+    /** Lines an 'issue' entry of THIS gesture wrote — the lines whose defer the
+     *  party transfer's take may drop (round 8b), and (round 10) the only thing
+     *  that may make this gesture TRY the transfer: a defer alone never does
+     *  (production simply defers), and a deferred line this gesture did not
+     *  issue on keeps its promise. Also handed to the transfer, which treats
+     *  every OTHER line as one this gesture did not touch. */
+    const issuedLines = new Set<string>();
+    /** Carried out of the transaction for the refusal and the 200 (round 10). */
+    const gestureOut: {
+      deskBase?: Map<string, number>;
+      pf?: ReturnType<typeof applyPartyFulfillment> | null;
+      lineChanged?: Record<string, unknown>;
+    } = {};
+    // THE SENTENCE LEADS WITH THE PURCHASE UNIT (round 9, owner rule). Every
+    // figure goes through fmtLineQtyPU (issue-stock.ts): the line quantity's
+    // recipe grid point ÷ the pack, exact — these figures differ by less than a
+    // printed step, so the 3-dp column rounding would print 14.842 for 14.8424 —
+    // with the recipe figure as the declared "= …" hint. MEASURED (round-8
+    // scope lane, drop.ts): on a gram line it read "14,842.4 g of 14,843 g
+    // approved … the 0.6 g still owing is below the 1 g", no purchase unit at
+    // all, and the store desk alerts it verbatim (announceDeferDropped).
+    const deferDropRow = (it: any, line: any) => {
+      const issued = Number(line.quantity_issued) || 0;
+      const approved = (line.chef_approved_qty != null ? Number(line.chef_approved_qty) : Number(line.quantity_requested)) || 0;
+      const unit = String(line.line_unit ?? '').trim();
+      const inFull = issued + 1e-9 >= approved;
+      const step = Number(lineShownAs(line.line_unit, line)?.step) || 0;
+      const name = String(it?.material_name || 'a line');
+      const fig = (n: number) => fmtLineQtyPU(n, line.line_unit, line);
+      return {
+        line_id: String(line.id), material: name, quantity_issued: issued, approved, line_unit: unit,
+        by_shelf: !inFull,
+        message: inFull
+          ? `${name}: not deferred — the line is already issued in full (${fig(issued)} of ${fig(approved)}).`
+          : `${name}: not deferred — the issue took everything the central store held (${fig(issued)} `
+            + `of ${fig(approved)} approved), and the ${fig(approved - issued)} still owing is below the `
+            + `${fig(step)} the store desk can issue, so the line is complete.`,
+      };
+    };
 
     const txn = db.transaction(() => {
       // TOCTOU. The status read at the top of this handler happened BEFORE
@@ -481,8 +934,51 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         abort.statusConflict = String(rNow?.status ?? 'unknown');
         throw new Error('req_status_changed');
       }
-
+      // WHAT EACH LINE HELD BEFORE THIS GESTURE, as this route's box sees it
+      // (round 9). The party transfer moves a line's WHOLE quantity, but this
+      // box ADDS to quantity_issued — so a transfer refusal must name the most
+      // the box can add, not the cap on the whole line (sd_party_tail: 14.842 of
+      // 14.843 kg was told "Issue 14.842 kg or less", added it, and was refused
+      // "so 29.684 kg cannot be issued"). Read here, inside the transaction and
+      // before any entry runs; a refusal rolls the gesture back to exactly this.
+      const deskBase = new Map<string, number>(
+        (db.prepare(`SELECT id, quantity_issued FROM requisition_items WHERE req_id = ?`).all(id) as any[])
+          .map(x => [String(x.id), Number(x.quantity_issued) || 0] as [string, number]),
+      );
+      gestureOut.deskBase = deskBase;
+      // WHERE THIS GESTURE BEGINS IN THE ISSUE LEDGER (round 10): a line the
+      // party transfer closes by the shelf arm stamps only a row written since —
+      // this gesture's own — never an earlier gesture's (party-fulfillment.ts,
+      // "THE SHELF MARK GOES ON THE CLOSING GESTURE'S ROW").
+      const ledgerSince = issueLedgerWatermark(db);
+      // THE STALE CAP, AGAIN, UNDER THE LOCK (round 10): the pre-flight above
+      // read the line before the transaction; another POST may have moved it
+      // since. Against the line as this gesture found it (deskBase), so a
+      // second entry for the same line is not mistaken for a change.
       for (const ln of lines) {
+        const exp = expectOf(ln);
+        if (exp == null || !itemMap.get(ln.id)) continue;
+        const was = deskBase.get(String(ln.id));
+        if (was == null || Math.abs(was - exp) <= 1e-9) continue;
+        const cur = selLine.get(ln.id, id) as any;
+        if (!cur) continue;
+        gestureOut.lineChanged = lineChangedRow(ln, cur, exp);
+        throw new Error('line_changed');
+      }
+
+      for (let li = 0; li < lines.length; li++) {
+        const ln = lines[li];
+        // ── A HELD ENTRY IS NOT RUN ─────────────────────────────────────────
+        // The floor refused this one entry before the transaction opened
+        // (centralShort above) and at least one other 'issue' entry survived,
+        // so the gesture proceeds without it: no quantity_issued, no
+        // issue_history, no applyIssueDelta call, no ledger row, no audit row
+        // and no contribution to `applied`. The line keeps whatever it already
+        // held, which is what leaves it outstanding in the store queue.
+        //
+        // FIRST, BEFORE `failing` IS STAMPED. A line this loop never touches
+        // must not be named as the one that threw.
+        if (heldEntries.has(li)) continue;
         const it = itemMap.get(ln.id);
         if (!it) continue;                          // unknown line — skip silently
         // Stamped BEFORE any work on this line, so whatever throws below is
@@ -510,35 +1006,75 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         if (cur.store_rejected && action !== 'unreject') continue;
         if (action === 'issue') {
           const addQty = Number(ln.quantity);
-          if (!Number.isFinite(addQty) || addQty <= 0) continue;
+          if (!Number.isFinite(addQty) || addQty <= 0) {
+            zeroEntryNames.push(String(it.material_name || 'a line'));
+            continue;
+          }
           const beforeQty = Number(cur.quantity_issued) || 0;   // in-txn pre-image
-          const newQty = beforeQty + addQty;
+          // WHAT LEFT THE SHELF, NOT WHAT WAS TYPED (round 6). Identical to
+          // beforeQty + addQty on every ordinary issue (`shelf.changed` false, the
+          // sum untouched); different only when the typed figure was the balance's
+          // shown figure and the shown-figure rule took the balance itself — then
+          // every record below says that balance. Asked here, inside the
+          // transaction and immediately before the UPDATE, so applyIssueDelta's
+          // floor reads the same balance and takes exactly this.
+          const shelf = issueLineQtyToRecord(db, {
+            reqItemId: cur.id, beforeLineQty: beforeQty, afterLineQty: beforeQty + addQty,
+          });
+          const newQty = shelf.afterLineQty;
+          const addedQty = shelf.changed ? newQty - beforeQty : addQty;
           const history = (() => {
             try { return JSON.parse(cur.issue_history || '[]'); } catch { return []; }
           })();
-          history.push({ qty: addQty, at: nowIso, by: me.email, note: ln.note || '' });
-          // THE DEFER RULE — half-transfer. Same expression as the auto-advance
-          // below; see the header for why they must stay identical.
-          const eff = (cur.chef_approved_qty != null
-            ? Number(cur.chef_approved_qty)
-            : Number(cur.quantity_requested)) || 0;
-          const fullySatisfied = newQty >= eff;
-          const stmt = fullySatisfied ? updIssue : updIssuePartial;
-          stmt.run(newQty, nowIso, me.email, JSON.stringify(history), cur.id);
+          history.push({
+            qty: addedQty, at: nowIso, by: me.email, note: ln.note || '',
+            ...(shelf.changed ? { asked: addQty } : {}),
+          });
+          updIssuePartial.run(newQty, nowIso, me.email, JSON.stringify(history), cur.id);
+          issuedLines.add(String(cur.id));
+          // THE TAKE. applyIssueDelta debits central and, when this take left the
+          // material holding nothing and THE RULE closes the line by that arm,
+          // stamps the line's shelf mark (issue-stock.ts stampShelfClose).
           applyIssueDelta(db, {
             reqItemId: cur.id, beforeLineQty: beforeQty, afterLineQty: newQty,
             reason: 'issue', actor: me.email, clientToken,
           });
+          // THE DEFER RULE — half-transfer, decided AFTER the take (round 8).
+          // The SAME FUNCTION as the auto-advance below (lineIssueComplete), read
+          // from the line as the take left it — shelf mark included — so the two
+          // cannot disagree. A line this issue completed (in full, or by the
+          // shelf: 14.8424 kg recorded of 14.843 after the take emptied the
+          // 14,842.4 g shelf) has its defer cleared; a partial keeps it.
+          const afterTake = selLine.get(cur.id, id) as any;
+          if (afterTake && lineIssueComplete(afterTake) && (afterTake.deferred_until || afterTake.defer_reason)) {
+            updClearDefer.run(cur.id);
+          }
           auditPerLine.push({ id: it.id, material: it.material_name, action, before, after: {
-            quantity_issued: newQty, issued_at: nowIso, issued_by: me.email, added: addQty,
+            quantity_issued: newQty, issued_at: nowIso, issued_by: me.email, added: addedQty,
+            ...(shelf.changed ? { asked: addQty } : {}),
           }});
         } else if (action === 'defer') {
           const until = String(ln.defer_until || '').trim();
           const reason = String(ln.reason || '').trim();
           if (!until) continue;
+          // A DEFER ON A COMPLETE LINE IS DROPPED, NEVER WRITTEN (round 8). There
+          // is nothing left to promise, and a deferred_until on a complete line is
+          // what kept the requisition out of 'fulfilled' for good: the
+          // auto-advance reads a deferred line as pending. MEASURED (round-7
+          // verifier, split-shelf4): the desk's "Issue part, defer rest" posted
+          // [issue 14.842, defer] over a 14,842.4 g shelf; the issue took the
+          // whole shelf and completed the line, the defer was written anyway, and
+          // the requisition sat 'store_processed' with nothing to press. `cur` is
+          // the line as the earlier entries of THIS gesture left it (re-read at
+          // the top of the loop), so an issue just before this defer is counted.
+          if (lineIssueComplete(cur)) {
+            droppedDefers.push(deferDropRow(it, cur));
+            continue;
+          }
           // NO STOCK EFFECT. defer touches neither quantity_issued nor stock —
           // it only records when the store will hand the rest over.
           updDefer.run(until, reason, cur.id);
+          deferWritten.set(String(cur.id), it);
           auditPerLine.push({ id: it.id, material: it.material_name, action, before, after: {
             deferred_until: until, defer_reason: reason,
           }});
@@ -639,21 +1175,141 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         }
       }
 
+      // A defer written by an EARLIER entry of this POST on a line a LATER issue
+      // entry then completed was cleared by that issue (the defer rule above).
+      // It is named with the dropped ones: the promise it made is not kept
+      // because there is nothing left to keep it for.
+      for (const [lineId, it] of deferWritten) {
+        const now = selLine.get(lineId, id) as any;
+        if (now && !now.deferred_until && lineIssueComplete(now)) droppedDefers.push(deferDropRow(it, now));
+      }
+
       // --- Auto-advance parent status if fully fulfilled.
       // Treat is_rejected items as "complete" (chef said no).
       // Treat store_rejected items as "complete" too (store said it can't fulfil).
       // Treat items with deferred_until in the future as still-open (don't fulfill).
-      const fresh = db.prepare(`
-        SELECT id, is_rejected, store_rejected, quantity_requested, chef_approved_qty, quantity_issued, deferred_until
-        FROM requisition_items WHERE req_id = ?
-      `).all(id) as any[];
-      const allDone = fresh.every(it => {
+      // lineIssueComplete — THE RULE (round 8, central-debit-clamp.ts
+      // issuedCoversAsk), the defer rule's own predicate, so the two cannot
+      // disagree: issued ≥ approved, OR a take emptied the central shelf and
+      // what remains owing is below one printed step (the line's shelf mark).
+      //
+      // DECIDED ONCE, AFTER EVERY TAKE (round 8). The internal takes are all
+      // done (the loop above). A PARTY requisition's take is the transfer, which
+      // runs only when every line reads complete — and which can itself take
+      // the whole shelf and leave a line recording what left it (14.843 typed
+      // over 14,842.5 g → 14.8425) — so the lines are scored, the transfer runs,
+      // and they are scored AGAIN before a single status is written. Round 7
+      // wrote 'fulfilled' first and transferred after, and store-process
+      // decided its status before its transfer: the two orders disagreed, and a
+      // line made complete by a take nobody re-read left a requisition with
+      // nothing to press.
+      const selFresh = db.prepare(`
+        SELECT ri.id, ri.is_rejected, ri.store_rejected, ri.quantity_requested, ri.chef_approved_qty,
+               ri.quantity_issued, ri.deferred_until, ri.shelf_emptied_qty,
+               ri.unit AS line_unit, rm.unit, rm.purchase_unit, rm.pack_size
+        FROM requisition_items ri
+        LEFT JOIN raw_materials rm ON rm.id = ri.material_id
+        WHERE ri.req_id = ?
+      `);
+      const everyLineDone = () => (selFresh.all(id) as any[]).every(it => {
         if (it.is_rejected) return true;
         if (it.store_rejected) return true;
-        const eff = (it.chef_approved_qty != null ? Number(it.chef_approved_qty) : Number(it.quantity_requested)) || 0;
-        const got = Number(it.quantity_issued) || 0;
-        return got >= eff && !it.deferred_until;     // deferred = still pending even if qty matches
+        return lineIssueComplete(it) && !it.deferred_until;     // deferred = still pending even if qty matches
       });
+      let allDone = everyLineDone();
+      // Party path also TRANSFERS store → department (store deduction + dept
+      // credit). The helper never moves a gram twice: it reads what its party
+      // rows already moved and asks only for what the lines hold above that
+      // (round 9 — a short /store-process submit moved part of a line, and the
+      // tail completed here used to move nothing at all, over any shelf).
+      let pf: ReturnType<typeof applyPartyFulfillment> | null = null;
+      // What the transfer is told about this gesture (round 10): the box's base
+      // per line, the lines this gesture issued on (every other line is one it
+      // did not touch — a top-up the shelf cannot cover there takes what the
+      // shelf holds and stays open, instead of refusing a gesture about another
+      // line), and where this gesture began in the issue ledger.
+      const pfOpts = { deskBeforeLineQty: deskBase, gestureIssuedIds: issuedLines, ledgerSince };
+      if (allDone && r.purpose === 'party') {
+        pf = applyPartyFulfillment(db, id, me.email, pfOpts);
+        allDone = everyLineDone();
+      } else if (r.purpose === 'party') {
+        // ── THE TRANSFER IS THIS GESTURE'S TAKE TOO (round 8b) ───────────────
+        // On a party requisition an issue moves no stock; the transfer is the
+        // take, and THE RULE's shelf arm is about what a take left on the
+        // shelf. Gating the transfer on every line reading complete FIRST made
+        // that arm unreachable here: THREE MANGO 14.843 kg over a 14,842.4 g
+        // shelf could be issued at 14.842 (the store's own cap) and then never
+        // close — the transfer would take the whole shelf and THE RULE would
+        // call the line complete, but it waited for a completeness only it
+        // could give (round-8 verifier, sd_party_tail; the management desk,
+        // which transfers on every submit, closed the same line).
+        //
+        // So the transfer is TRIED, inside a savepoint, when it could close
+        // every line: each open line carries a quantity and is either not
+        // deferred or touched by this gesture. After it, a defer on a line this
+        // gesture touched that the take completed is dropped (THE DEFER RULE,
+        // the same as an internal issue that completes its line), and the
+        // lines are scored again. Every line done → kept, and the status below
+        // reads 'fulfilled'. Anything else → the savepoint is unwound, so not
+        // a gram moves and the transfer stays unfired (the requisition then
+        // moves in one lump when it does complete — the store desk's rule). A line
+        // the shelf cannot cover unwinds it too — this gesture did not ask for
+        // the transfer, so its refusal is not this gesture's refusal.
+        //
+        // ONLY A GESTURE THAT ISSUED TRIES IT (round 10). The transfer is the
+        // take of an ISSUE; a gesture that issued nothing — a plain Defer, an
+        // undo, a reject — asked for no take, and production simply records it.
+        // MEASURED (round-9 store-desk verifier, c16_party_defer_closes): Save
+        // defer on THREE MANGO 14.842 of 14.843 kg over a 14,842.4 g shelf ran
+        // the transfer, moved the stock, fulfilled the requisition and dropped
+        // the defer, and the alert blamed "the issue" for a gesture that held
+        // none. Likewise a deferred line counts as closable only when THIS
+        // gesture issued on it ("Issue part, defer rest"); a defer it merely
+        // carries — or one this gesture wrote alone — is kept, as written.
+        const openLines = (selFresh.all(id) as any[]).filter(it =>
+          !it.is_rejected && !it.store_rejected && !(lineIssueComplete(it) && !it.deferred_until));
+        const couldClose = issuedLines.size > 0 && openLines.length > 0 && openLines.every(it =>
+          (Number(it.quantity_issued) || 0) > 0 && (!it.deferred_until || issuedLines.has(String(it.id))));
+        // NO "already moved" GATE ANY MORE (round 9). The transfer used to be
+        // one-shot, so a requisition whose goods had moved once (a short
+        // /store-process submit) was never tried again here. It now moves what
+        // has not yet moved (applyPartyFulfillment, "A SECOND CALL MOVES ONLY
+        // WHAT HAS NOT MOVED"), so the same savepoint try serves a top-up: the
+        // tail over a short shelf can close by the shelf rule here exactly as a
+        // first transfer can, and a top-up that cannot close unwinds the same
+        // way, leaving not a gram moved.
+        if (couldClose) {
+          const unwind = new Error('party_transfer_left_lines_open');
+          const dropped: string[] = [];
+          const kept: { t: ReturnType<typeof applyPartyFulfillment> | null } = { t: null };
+          try {
+            db.transaction(() => {
+              const t = applyPartyFulfillment(db, id, me.email, pfOpts);
+              for (const it of selFresh.all(id) as any[]) {
+                if (!issuedLines.has(String(it.id))) continue;
+                if (!it.deferred_until && !it.defer_reason) continue;
+                if (lineIssueComplete(it)) {
+                  updClearDefer.run(it.id);
+                  dropped.push(String(it.id));
+                }
+              }
+              if (!everyLineDone()) throw unwind;
+              kept.t = t;
+            })();
+            pf = kept.t;
+            allDone = true;
+            for (const lineId of dropped) {
+              const it = deferWritten.get(lineId);
+              const now = selLine.get(lineId, id) as any;
+              if (it && now) droppedDefers.push(deferDropRow(it, now));
+            }
+          } catch (e) {
+            if (e !== unwind && !isCentralStockShort(e)) throw e;
+            pf = null;
+          }
+        }
+      }
+      gestureOut.pf = pf;
 
       if (allDone) {
         db.prepare(`
@@ -667,13 +1323,32 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
               updated_at = datetime('now')
           WHERE id = ?
         `).run(me.email, me.email, note, note, id);
-        // Party path also TRANSFERS store → department (store deduction + dept
-        // credit). The helper is idempotent via the party_consumption ledger row,
-        // so re-fulfilment or the store-process path can never double-transfer.
-        if (r.purpose === 'party') {
-          applyPartyFulfillment(db, id, me.email);
+      }
+      if (pf) {
+        // THE AUDIT ROW SAYS WHAT LEFT THE SHELF TOO (round 7). The transfer
+        // corrected these lines to what it took (14.843 kg typed over
+        // 14,842.5 g → 14.8425 kg); the per-line after-images below were
+        // written before it ran and still carry the typed figure. Bring the
+        // LAST issue entry for each such line into line with the row, the
+        // shape the internal rail writes: quantity_issued what moved, `added`
+        // what this gesture moved, `asked` what was typed.
+        for (const rec of pf.recorded) {
+          for (let k = auditPerLine.length - 1; k >= 0; k--) {
+            const a = auditPerLine[k];
+            if (a.id !== rec.req_item_id || a.action !== 'issue') continue;
+            const typedAdded = Number(a.after?.added) || 0;
+            a.after = {
+              ...a.after,
+              quantity_issued: rec.recorded_line_qty,
+              // 1e-9 line units, as recordPartyShelfTake snaps the history entry.
+              added: Math.round((typedAdded + (rec.recorded_line_qty - rec.asked_line_qty)) * 1e9) / 1e9,
+              asked: a.after?.asked != null ? a.after.asked : typedAdded,
+            };
+            break;
+          }
         }
-      } else {
+      }
+      if (!allDone) {
         // Mark in-progress so the queue knows it's been touched.
         // rNow, not r: r.status was read before the body parse yielded.
         if (rNow.status === 'fulfilled') {
@@ -718,6 +1393,48 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
         } else if (note) {
           db.prepare(`UPDATE requisitions SET store_note = ?, updated_at = datetime('now') WHERE id = ?`).run(note, id);
         }
+      }
+
+      // ── THE HELD ROWS' FIGURES, AFTER THE GESTURE (round 6) ───────────────
+      // The pre-flight scored each held entry in write order, BEFORE any line
+      // ran — so a later line of the same material that then issued had already
+      // spent part of the cap it printed (1 kg held, 0.4 kg of the same material
+      // issued after it, the 200 said "issue 1 kg or less" and 1 kg was then
+      // refused with 0.6 kg left). Re-scored HERE, last in the transaction,
+      // against current_stock as this gesture leaves it, so the cap on the 200
+      // is the figure the storekeeper's next POST will meet. Only the figures
+      // move; the hold stands — the floor runs in order and would have refused
+      // the line at its turn.
+      //
+      // AND SIBLING HELD ROWS SHARE WHAT IS LEFT, in row order (round 7): the
+      // first held row of a material is given what it can take, the next what
+      // remains, so the caps on this 200 add up to the shelf and every one of
+      // them is accepted when typed back together (rescoreHeldIssue's
+      // siblingRecipe; the running sum is each row's own debitRecipe).
+      const heldShareAfter = new Map<string, { recipe: number; lines: number }>();
+      for (const [li, row] of heldRowOf) {
+        const ln = lines[li];
+        const cur = selLine.get(ln.id, id) as any;
+        if (!cur) continue;
+        const beforeQty = Number(cur.quantity_issued) || 0;
+        const addQty = Number(ln.quantity) || 0;
+        const share = heldShareAfter.get(String(row.material_id));
+        const c = rescoreHeldIssue(db, {
+          reqItemId: String(cur.id), beforeLineQty: beforeQty, afterLineQty: beforeQty + addQty,
+          siblingRecipe: share?.recipe || 0, siblingLines: share?.lines || 0,
+        });
+        if (!c.debits) continue;
+        heldShareAfter.set(String(row.material_id), {
+          recipe: (share?.recipe || 0) + Math.max(0, Number(c.debitRecipe) || 0),
+          lines: (share?.lines || 0) + 1,
+        });
+        row.requested = c.requestedPurchase;
+        row.available = c.availablePurchase;
+        row.max_issue_qty = c.maxIssueLineQty;
+        row.max_add_qty = c.maxAddLineQty;
+        row.max_add_purchase = c.maxAddPurchase;
+        row.line_issued = beforeQty;
+        row.message = c.message;
       }
     });
     try {
@@ -769,6 +1486,56 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           applied: 0,
         }, { status: 400 });
       }
+      // THE CENTRAL STORE WILL NOT GIVE THE GOODS. The mirror of the block
+      // above, on the other direction: assertCentralIssue() throws rather than
+      // debiting past zero, and that throw rolled this whole batch back. The
+      // pre-flight already refused this before the transaction opened, so
+      // reaching here means the balance moved between that read and the write
+      // lock — a concurrent issue, a receipt reversal, a closing count. Same
+      // envelope, same 400, so the client renders it against the named line
+      // exactly as it renders the reversal block; `failing.lineId` supplies the
+      // batch entry, since the error knows the requisition line but not which
+      // submitted row named it.
+      // The stale cap, met under the lock (round 10): the same answer as the
+      // pre-flight's, nothing written.
+      if (gestureOut.lineChanged) {
+        return Response.json({
+          error: String(gestureOut.lineChanged.message || ''),
+          code: 'line_changed',
+          blocked: [gestureOut.lineChanged],
+          applied: 0,
+        }, { status: 400 });
+      }
+      if (isCentralStockShort(e)) {
+        console.warn('[req store-issue] central stock short:', e.message);
+        // EVERY LINE THE TRANSFER COULD NOT MOVE (round 10): the first refusal
+        // carries the rest (CentralStockShort.others), each with its own cap,
+        // so the store desk's panel for one short line can know it is not the
+        // only one. One row on every refusal but a party transfer's.
+        const all = [e as CentralStockShort, ...(((e as CentralStockShort).others) || [])];
+        return Response.json({
+          error: all.map(x => x.message).join(' '),
+          code: e.code,
+          blocked: all.map(x => ({
+            code: 'central_stock_short',
+            // The line the floor refused, named by the floor (round 9). On a
+            // PARTY requisition the transfer runs after the loop, so `failing`
+            // is whichever entry the loop touched last — SALT's id on a refusal
+            // of THREE MANGO. Inside the loop the two are the same line.
+            line_id: x.reqItemId || failing.lineId || (lines.length === 1 ? String(lines[0]?.id || '') : ''),
+            material: x.materialName, material_id: x.materialId, req_item_id: x.reqItemId,
+            requested: x.requestedPurchase, available: x.availablePurchase,
+            purchase_unit: x.purchaseUnit,
+            max_issue_qty: x.maxIssueLineQty, line_unit: x.lineUnit,
+            max_add_qty: x.maxAddLineQty, max_add_purchase: x.maxAddPurchase,
+            // What the line held when this gesture began — the gesture is
+            // rolled back to exactly that, so it is what the caps add to.
+            line_issued: gestureOut.deskBase?.get(String(x.reqItemId)) ?? 0,
+            message: x.message,
+          })),
+          applied: 0,
+        }, { status: 400 });
+      }
       // Replayed gesture token. Also fully rolled back, so the earlier POST's
       // effect is the only one that exists — report success, not failure.
       // Falls through to the audit skip below deliberately: those events were
@@ -793,6 +1560,21 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
           note: `${a.material}: ${a.action}`,
         });
       }
+      // The defers this gesture did not keep, one row each (round 8): the
+      // chain of custody says a promise was asked for and why none was made.
+      for (const d of droppedDefers) {
+        logAuditEvent(db, {
+          event_type: 'req_item.store_defer_dropped',
+          entity_type: 'requisition_item',
+          entity_id: d.line_id,
+          actor_email: me.email,
+          after: {
+            quantity_issued: d.quantity_issued, approved: d.approved, line_unit: d.line_unit,
+            by_shelf: d.by_shelf, reason: 'line_complete',
+          },
+          note: d.message,
+        });
+      }
       logAuditEvent(db, {
         event_type: 'requisition.store_issue_batch',
         entity_type: 'requisition',
@@ -805,7 +1587,70 @@ export async function POST(req: Request, { params }: { params: Promise<{ id: str
 
     // Re-read final status for response
     const after = db.prepare('SELECT status FROM requisitions WHERE id = ?').get(id) as any;
-    return Response.json({ success: true, status: after?.status, applied: auditPerLine.length });
+    // ── WHAT WAS HELD BACK, ON THE SAME RESPONSE THAT CONFIRMS THE REST ─────
+    // `held`, not `blocked`: this is a 200 and the hand-over DID happen, so a
+    // reader must not mistake it for the refusal. The ROW shape is identical to
+    // `blocked` (code, line_id, material, requested/available in purchase
+    // units, max_issue_qty in the line's own unit, the sentence), so the
+    // client's existing reader can be pointed at it without a second format —
+    // store-requisitions/page.tsx:251 readBlockedReversals is keyed on exactly
+    // these fields. Until a client does, the held line staying outstanding in
+    // the store queue is the visible signal, and `held_message` is the sentence
+    // to print beside it.
+    const out: Record<string, unknown> = {
+      success: true, status: after?.status, applied: auditPerLine.length,
+    };
+    // A defer the gesture asked for and did not write, because the line is
+    // complete (round 8). Present only when one was dropped, so every other
+    // 200 is byte-identical.
+    if (droppedDefers.length > 0) {
+      out.defer_dropped = droppedDefers;
+      out.defer_dropped_message = droppedDefers.map(d => d.message).join(' ');
+    }
+    // ── A PARTY LINE THE TRANSFER COULD NOT COVER, LEFT OPEN (round 10) ──────
+    // A line this gesture did not touch, whose recorded remainder the shelf
+    // could no longer cover: the transfer took what the shelf held, the line
+    // now records what left and stays open (party-fulfillment.ts, "A TOP-UP THE
+    // SHELF CANNOT COVER"). Named here, on the same 200, because the storekeeper
+    // acted on another line and must be told this one changed. Present only
+    // when it happened, so every other 200 is byte-identical.
+    {
+      const shortRows: Array<Record<string, unknown>> = [];
+      for (const rec of gestureOut.pf?.recorded || []) {
+        if (rec.kind !== 'short') continue;
+        const now = selLine.get(rec.req_item_id, id) as any;
+        if (!now || lineIssueComplete(now)) continue;
+        const approved = (now.chef_approved_qty != null ? Number(now.chef_approved_qty) : Number(now.quantity_requested)) || 0;
+        const fig = (n: number) => fmtLineQtyPU(n, now.line_unit, now);
+        const took = Number(rec.recorded_line_qty) - Number(rec.moved_line_qty);
+        const recorded = Number(rec.recorded_line_qty) || 0;
+        shortRows.push({
+          code: 'party_short', line_id: rec.req_item_id, material: rec.material_name,
+          asked_line_qty: rec.asked_line_qty, moved_line_qty: rec.moved_line_qty, recorded_line_qty: recorded,
+          approved, line_unit: rec.line_unit,
+          message: `${rec.material_name}: ${fig(rec.asked_line_qty - rec.moved_line_qty)} of this party line had not left `
+            + `the store yet (${fig(rec.moved_line_qty)} had, earlier), and the central store held `
+            + `${took > 1e-9 ? `only ${fig(took)}, which the party transfer has now moved` : 'none of it'}. The line `
+            + `now records ${fig(recorded)} of ${fig(approved)} and stays open for ${fig(Math.max(0, approved - recorded))} — `
+            + `receive the stock, then issue the rest.`,
+        });
+      }
+      if (shortRows.length > 0) {
+        out.party_short = shortRows;
+        out.party_short_message = shortRows.map(x => x.message).join(' ');
+      }
+    }
+    if (centralShort.length > 0) {
+      const n = centralShort.length;
+      out.held = centralShort;
+      out.held_message =
+        `${n} line${n === 1 ? '' : 's'} ${n === 1 ? 'was' : 'were'} NOT issued and `
+        + `${n === 1 ? 'stays' : 'stay'} outstanding — the central store does not hold the quantity asked. `
+        + centralShort.map(s => s.message).join(' ')
+        + zeroEntriesSentence(zeroEntryNames)
+        + ` Everything else in this gesture was issued.`;
+    }
+    return Response.json(out);
   } catch (e: any) {
     console.error('[req store-issue]', e);
     return Response.json({ error: e.message }, { status: 500 });

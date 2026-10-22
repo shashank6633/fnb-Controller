@@ -15,6 +15,12 @@ import { grnPaidInCash } from './cash-purchase';
 // (which deliberately does not import this file — its diCatKey is the
 // byte-equivalent restatement of catKeyOf below).
 import { resolveDirectIssueBulk, postDirectReceipt, stampLastPurchase } from './direct-issue';
+// THE CENTRAL FLOOR FOR AN UNATTENDED PATH. A QC sign-off is one: a chef is
+// signing off perishables, and a throw would roll his signature and the whole
+// delivery back to prevent one bad debit on some other line. So the debit is
+// CLAMPED and the shortfall RECORDED, which is the owner's ruling. See that
+// module's header, and the clamp at the bump site below.
+import { clampCentralDelta, recordCentralDebitClamp, type CentralDeltaClamp } from './central-debit-clamp';
 import type { SessionUser } from './auth';
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -1577,6 +1583,11 @@ export function decideGrnQc(
     requisition_cascaded: false,
   };
   const touched = new Set<string>();
+  /* Central debits this sign-off could not make in full — see THE CENTRAL FLOOR
+   * ON A HELD BACK-CORRECTION at the bump site. Declared out here so the one
+   * audit row can name every clamped line of the receipt rather than one row per
+   * line, and reset per call because `decideGrnQc` is called once per sign-off. */
+  const centralClamps: CentralDeltaClamp[] = [];
 
   const txn = db.transaction(() => {
     // ── 1. CLAIM FIRST. The write lock, the replay guard and the void
@@ -1976,26 +1987,135 @@ export function decideGrnQc(
             : `Direct issue: Ad-hoc GRN ${grn.grn_number} released at QC sign-off`,
         });
       } else {
-        bumpStock.run(stockQty, gross, grn.date, r.item.material_id);
-        postCentralTxn(db, {
-          materialId: r.item.material_id,
-          type: 'purchase',
-          quantity: stockQty,
-          referenceId: purchaseId,
-          notes: poNumber ? `PO ${poNumber} received via GRN ${grn.grn_number}` : `Ad-hoc GRN ${grn.grn_number}`,
-          outletId: grn.outlet_id,
-          // A QC-held perishable enters stock only when the kitchen/bar signs.
-          // The movement is still a VENDOR receipt; the signer is the actor.
-          counterparty: vendorParty(grn.vendor, grn.vendor_id),
-          txnDate: grn.date,
-          actor: actorEmail,
+        /* ── THE CENTRAL FLOOR ON A HELD BACK-CORRECTION ────────────────────
+         * `stockQty` is SIGNED. The skip four blocks above keeps a NEGATIVE
+         * accepted quantity alive on purpose — `if (Math.abs(r.accepted) <= EPS)
+         * continue;`, with the reasoning that skipping a correction "would leave
+         * that overstatement on the book for ever" — so this bump can be a
+         * DEBIT, and until now it was a debit with no balance read anywhere on
+         * the path.
+         *
+         * MEASURED on a copy of the live book: an awaiting_qc GRN line with
+         * quantity_accepted −25 against a probe material at current_stock 0,
+         * decideGrnQc(mode:'sign') returned outcome "signed" and the balance
+         * went 0 → −25. POST /api/grn now refuses to CREATE that shape (its own
+         * floor, added in this same change, plus the mixed-bill refusal), so the
+         * hole is LATENT rather than reachable from today's screens — but the
+         * block ~650 lines above states the standing requirement in its own
+         * words: a row "born before this guard — or by any other route" must
+         * still be clearable here. A latent hole on the only path that is
+         * REQUIRED to accept rows it did not create is exactly the kind this
+         * round exists to close, rather than discover next round.
+         *
+         * ── IT CLAMPS; IT DOES NOT THROW, BY THE OWNER'S RULING ────────────
+         * NOBODY IS AT A SCREEN WITH THIS LINE IN FRONT OF THEM. A chef is
+         * signing off perishables that have physically arrived. A throw here
+         * rolls back the claim at the top of this transaction, so:
+         * the signature vanishes, the delivery goes back into the queue, the
+         * bell and the escalation sweep — and the refusal is addressed to
+         * someone who cannot act on it, about a correction on some other line.
+         * Destroying a correct delivery to prevent a bad debit is the worse
+         * outcome, which is the identical judgement
+         * src/lib/po-requisition-fulfil.ts makes at its own clamp on this very
+         * rail (and this file's cascade is one of the two callers it names).
+         *
+         * So both halves of the ruling are met without a throw: the debit is
+         * capped at what central holds (never below zero), and every capped
+         * line is written to audit_events as 'grn.qc.central_short' naming the
+         * material, the balance, what was wanted and what is missing. Recorded
+         * after the commit decision for the same reason the cascade's is: a
+         * clamped line is PERMANENT — nothing comes back to finish the debit —
+         * so the audit row is the only thing that will ever say so.
+         *
+         * THE VOID STAYS CORRECT FOR FREE: the reversal rails credit back
+         * ABS(the stored inventory_transactions.quantity) and never recompute,
+         * and postCentralTxn below is handed the CLAMPED figure, so a void
+         * reverses exactly what was written.
+         *
+         * ONE CONVERSION. The clamp is handed `stockQty`, already in RECIPE
+         * units via packFactor() directly above; clampCentralDelta performs no
+         * conversion of its own (its header says so) and reads the balance
+         * inside THIS transaction, immediately before the write.
+         */
+        const clamp = clampCentralDelta(db, {
+          materialId: String(r.item.material_id),
+          deltaRecipe: stockQty,
         });
+        if (clamp.clamped) centralClamps.push(clamp);
+        /* THE `purchases` ROW ABOVE IS NOT CLAMPED, AND MUST NOT BE. It is the
+         * BILL — it states what the vendor's document says, and the register,
+         * the PINV, the tax legs and updateMaterialPrice all read it as the
+         * paper. Clamping the money to match a stock cap would falsify the bill
+         * to flatter a balance. The divergence between the bill and the column
+         * IS the shortfall, and the audit row below is where it is stated.
+         *
+         * THE MOVEMENT ROW IS CLAMPED, and that is the opposite decision for a
+         * reason: inventory_transactions(type='purchase') is what
+         * collectRecordedMoves reads and what a VOID credits back, ABS() and
+         * never recomputed. Recording the unclamped figure there would let a
+         * later void give back grams that were never debited — manufacturing
+         * stock, the one outcome worse than the gap.
+         *
+         * A TOTAL CLAMP WRITES NO MOVEMENT ROW AT ALL. Central moved nothing,
+         * so there is nothing to record and nothing for a void to reverse; the
+         * cascade's clamp takes the same decision in the same words ("a
+         * zero-quantity row would be a movement that did not happen"). It also
+         * keeps the void's own arithmetic untouched: a 0-qty row would put this
+         * material into `moves` with delta 0, and assertNoNegativeStock — which
+         * the void runs WITHOUT onlyWhenDebiting — would then refuse the void
+         * outright on any already-negative balance it would otherwise not even
+         * look at.
+         *
+         * bumpStock STILL RUNS on a total clamp, bound to 0. It is not only the
+         * stock write: the same statement stamps last_purchase_price and
+         * last_purchase_date, which this path has always stamped and which seed
+         * the next PO's rate. `current_stock + 0` is a no-op on the column, so
+         * skipping the whole statement would quietly drop the price stamp as
+         * well — a second defect in the name of fixing the first. The line is
+         * also still stamped qc_applied_at and still counted as applied: it was
+         * judged, and its cost row was written. */
+        bumpStock.run(clamp.deltaToWrite, gross, grn.date, r.item.material_id);
+        if (Math.abs(clamp.deltaToWrite) > EPS) {
+          postCentralTxn(db, {
+            materialId: r.item.material_id,
+            type: 'purchase',
+            quantity: clamp.deltaToWrite,
+            referenceId: purchaseId,
+            notes: poNumber ? `PO ${poNumber} received via GRN ${grn.grn_number}` : `Ad-hoc GRN ${grn.grn_number}`,
+            outletId: grn.outlet_id,
+            // A QC-held perishable enters stock only when the kitchen/bar signs.
+            // The movement is still a VENDOR receipt; the signer is the actor.
+            counterparty: vendorParty(grn.vendor, grn.vendor_id),
+            txnDate: grn.date,
+            actor: actorEmail,
+          });
+        }
       }
       stampLine.run(r.item.id);
       touched.add(String(r.item.material_id));
       result.lines_applied++;
       result.purchases_written++;
     }
+
+    /* ── WHAT THE FLOOR WOULD NOT LET THROUGH, ON ITS OWN AUDIT ROW ─────────
+     * Written INSIDE the transaction, so the record and the clamped writes
+     * commit or roll back together: a clamp that survived while its record did
+     * not would be the "silent" this removes. Writes nothing when no clamp bit,
+     * so an ordinary sign-off is byte-identical to before.
+     *
+     * A SEPARATE EVENT TYPE, deliberately, for the reason
+     * po-requisition-fulfil.ts gives for its own: the sign-off's existing audit
+     * rows are read as DISCRIMINATORS by other code, and this one is a report to
+     * the owner. It must not be able to change any of their minds. */
+    recordCentralDebitClamp(db, {
+      eventType: 'grn.qc.central_short',
+      entityType: 'goods_receipt_note',
+      entityId: grnId,
+      actorEmail,
+      outletId: grn.outlet_id,
+      clamps: centralClamps,
+      note: `GRN ${grn.grn_number} ${outcome} — back-correction clamped at the central floor`,
+    });
 
     // ── purchase_orders.total_cost — kept true after a QC rejection ──────────
     // The receive route stamps total_cost at completion from the quantities the

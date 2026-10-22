@@ -24,6 +24,9 @@
  * (can_flag_dispute, can_reverse + reverse_prefill, dismissable_dispute_ids,
  * and reverse_blocked — the server's words for a disputed line that was counted
  * since it moved and so must not be taken back, shown instead of the button;
+ * can_reverse is false when the ledger would refuse the one tap, and then
+ * reverse_refused / take_back_refused say why and what to do instead —
+ * ../api/department-transfers/send-back-check.ts;
  * dispute_to_act — whether an open dispute here is waiting on this person, the
  * same predicate the bell counts: ./dispute-todo.ts);
  * the quantity that may leave is the server's `transferable`; the receivers and
@@ -133,6 +136,13 @@ interface Perms {
   reverse_prefill: PrefillLine[];
   /** Why a disputed line cannot be taken back (counted since it moved), in the server's words. */
   reverse_blocked?: string | null;
+  /** Why this person's one-tap send-back is NOT offered (can_reverse false): the
+   *  ledger would refuse it — e.g. the receiver no longer holds what stands.
+   *  The server's words, with what to do instead (send-back-check.ts). */
+  reverse_refused?: string | null;
+  /** With a claim open: why it cannot be taken back as things stand, for
+   *  whoever reads the card (so it never says "they take it back"). */
+  take_back_refused?: string | null;
   dismissable_dispute_ids: string[];
   /** The server's ONE "waiting on you" predicate (access.ts hasDisputeActionFor). */
   dispute_to_act?: boolean;
@@ -650,12 +660,16 @@ export default function DepartmentTransfersPage() {
       const rank: Record<string, number> = { head: 0, hod: 0, sender: 1, manager: 2, admin: 3 };
       type Alerted = { email?: string; name?: string; why?: string };
       const alerted: Alerted[] = Array.isArray(json.alerted) ? json.alerted : [];
-      const told: string[] = [...alerted].sort((a, b) => (rank[str(a?.why)] ?? 4) - (rank[str(b?.why)] ?? 4))
+      // Not the flagger: a receiver who also heads the sender (ruling #61 — the
+      // Kitchen HOD on Akan Pizza → Kitchen) is on the alert list himself.
+      const others = alerted.filter(a => !isMe(str(a?.email)));
+      const told: string[] = [...others].sort((a, b) => (rank[str(a?.why)] ?? 4) - (rank[str(b?.why)] ?? 4))
         .map(a => str(a?.name || who(str(a?.email)))).filter(Boolean);
       const toldText = told.length > 4 ? `${told.slice(0, 4).join(', ')} and ${told.length - 4} more` : told.join(', ');
       setForm(s => ({ ...s, [t.id]: undefined }));
       setDrafts(s => { const n = { ...s }; delete n[t.id]; return n; });
-      setFlash(`${t.transfer_no} flagged. Nothing has moved. ${told.length ? `Told: ${toldText}.` : `${clean(t.from_department_name)}'s head and managers are told.`} ` +
+      setFlash(`${t.transfer_no} flagged. Nothing has moved. ` +
+        `${told.length ? `Told: ${toldText}. ` : alerted.length ? '' : `${clean(t.from_department_name)}'s head and managers are told. `}` +
         `If ${clean(t.from_department_name)} agrees, they take it back from here.`);
       refreshNow();
       return;
@@ -811,10 +825,16 @@ export default function DepartmentTransfersPage() {
             <div className="mt-0.5">
               {t.lines.find(l => l.id === d.line_id)?.counted_since
                 ? <>Nothing has moved. It has been counted since it was sent, so it cannot be taken back — that would correct the books twice.</>
+                : str(t.permissions?.take_back_refused)
+                ? <>Nothing has moved. It cannot be taken back as things stand — why is below.</>
                 : t.permissions?.can_reverse && t.permissions.reverse_authority === 'disputed_only'
                 ? <>Nothing has moved. It is with you: take it back if {clean(t.to_department_name)} is right — or a manager closes it with a note.</>
                 : t.permissions?.can_reverse && t.permissions.reverse_authority === 'receiver'
-                ? <>Nothing has moved. You can send the disputed amount back to {clean(t.from_department_name)} from here — or {clean(t.from_department_name)} takes it back, or it is closed with a note.</>
+                  // Someone who may send from BOTH ends (the Kitchen HOD on Kitchen →
+                  // its sub-kitchen, ruling #40; a manager) IS the sender's side too.
+                ? (byId.get(t.from_department_id)?.can_send
+                  ? <>Nothing has moved. You can send the disputed amount back to {clean(t.from_department_name)} from here, or it is closed with a note.</>
+                  : <>Nothing has moved. You can send the disputed amount back to {clean(t.from_department_name)} from here — or {clean(t.from_department_name)} takes it back, or it is closed with a note.</>)
                 : <>Nothing has moved. Waiting on {clean(t.from_department_name)}: they take it back, or it is closed with a note.</>}
             </div>
           ) : d.resolution === 'reversed' ? (
@@ -828,6 +848,11 @@ export default function DepartmentTransfersPage() {
           )}
         </div>
       ))}
+      {t.dispute_status === 'open' && str(t.permissions?.take_back_refused) && (
+        <div className="flex flex-nowrap items-start gap-2 text-xs text-amber-900 bg-amber-50 border border-amber-300 rounded-lg px-3 py-2">
+          <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" /> <span className="break-words">{str(t.permissions?.take_back_refused)}</span>
+        </div>
+      )}
     </div>
   );
 
@@ -854,8 +879,13 @@ export default function DepartmentTransfersPage() {
       && p.dismissable_dispute_ids.every(id => isMe(t.disputes.find(d => d.id === id)?.raised_by || ''));
     const sb = p.can_reverse && open;            // the one-tap correction of a claim
     const sbUnasked = p.can_reverse && !open && p.reverse_authority === 'receiver';
+    // The receiving side could send it back, but the ledger would refuse the
+    // one tap (the server's send-back check): no "Yes, send back" — the
+    // server's words on why, and what to do instead.
+    const sbRefused = !open && !p.can_reverse && p.reverse_authority === 'receiver' ? str(p.reverse_refused) : '';
+    const sendbackGone = mode === 'sendback' && !sbUnasked && !sbRefused;
     const blockedWhy = open ? str(p.reverse_blocked) : '';
-    if (!p.can_flag_dispute && !p.can_reverse && !blockedWhy && p.dismissable_dispute_ids.length === 0) return null;
+    if (!p.can_flag_dispute && !p.can_reverse && !sbRefused && !blockedWhy && p.dismissable_dispute_ids.length === 0) return null;
     return (
       <div className="mt-2.5 space-y-2">
         {blockedWhy && (
@@ -900,6 +930,15 @@ export default function DepartmentTransfersPage() {
             </div>
           </div>
         )}
+        {mode === 'sendback' && sbRefused && (
+          <div className="rounded-lg border border-amber-300 bg-amber-50 p-2.5 space-y-2">
+            <div className="flex flex-nowrap items-start gap-2 text-xs text-amber-900">
+              <Info className="w-4 h-4 shrink-0 mt-0.5" /> <span className="break-words">{sbRefused}</span>
+            </div>
+            <button type="button" onClick={() => toggleForm(t, 'sendback')}
+                    className="min-h-[48px] px-3 rounded-lg border border-[#D4B896] bg-white text-sm text-[#6B5744]">Back</button>
+          </div>
+        )}
         {mode === 'dispute' && p.can_flag_dispute && disputeForm(t)}
         {mode === 'resolve' && p.dismissable_dispute_ids.length > 0 && (
           <div className="rounded-lg border border-[#E8D5C4] bg-[#FFF8F0] p-2.5 space-y-2">
@@ -925,7 +964,7 @@ export default function DepartmentTransfersPage() {
             <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" /> <span>{docErr[t.id]}</span>
           </div>
         )}
-        {!mode && (
+        {(!mode || sendbackGone) && (
           <div className="flex flex-wrap gap-2">
             {p.can_flag_dispute && (
               <button type="button" onClick={() => toggleForm(t, 'dispute')}
@@ -937,6 +976,12 @@ export default function DepartmentTransfersPage() {
               <button type="button" onClick={() => toggleForm(t, 'sendback')}
                       className="min-h-[48px] px-3 rounded-lg border border-[#D4B896] bg-white text-sm text-[#6B5744] hover:border-[#af4408] flex items-center gap-1.5">
                 <Undo2 className="w-4 h-4" /> Send it back…
+              </button>
+            )}
+            {sbRefused && (
+              <button type="button" onClick={() => toggleForm(t, 'sendback')}
+                      className="min-h-[48px] px-3 rounded-lg border border-[#D4B896] bg-white text-sm text-[#6B5744] hover:border-[#6B5744] flex items-center gap-1.5">
+                <Info className="w-4 h-4" /> Why it can&apos;t be sent back…
               </button>
             )}
             {p.dismissable_dispute_ids.length > 0 && (

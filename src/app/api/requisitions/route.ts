@@ -1,8 +1,10 @@
 import { getDb, generateId } from '@/lib/db';
 import { getCurrentUser, getCurrentOutletId, canApproveAsChef, canApproveAsMgmt, canProcessAsStore, canIssueAsStore } from '@/lib/auth';
 import { requisitionVisibility, isMainDeptHead, isAnyMainDeptHead, effectiveCategoriesForUser } from '@/lib/dept-hierarchy';
-import { requisitionHasMovedStock } from '@/lib/issue-stock';
+import { requisitionHasMovedStock, lineIssueComplete, type LineCompletenessRow } from '@/lib/issue-stock';
 import { duplicateLineError } from '@/lib/po-helpers';
+import { PARTY_TRANSFER_TYPES_SQL } from '@/lib/movement-record';
+import { centralFlowBlock } from '@/lib/store-engine';
 
 // Statuses at which a requisition can be edited, by whom:
 //   draft                                            → drafter or admin
@@ -55,6 +57,59 @@ const ESTIMATED_VALUE_SQL = `(SELECT COALESCE(SUM(
                 FROM requisition_items ri JOIN raw_materials rm ON rm.id = ri.material_id
                 WHERE ri.req_id = r.id)`;
 
+/**
+ * lines_owing BY THE ISSUE DESKS' OWN RULE (round 7).
+ *
+ * The list's lines_owing is a bare SQL `quantity_issued < approved`. Both issue
+ * routes now close a line by issue-stock.ts lineIssueComplete — THE RULE
+ * (central-debit-clamp.ts issuedCoversAsk) — which adds one arm this SQL does
+ * not spell: a take emptied the central shelf and what remains owing is below
+ * one printed step, remembered on the line as shelf_emptied_qty (round 8; it
+ * must be selected below, or the rule reads the first arm only). THREE MANGO
+ * approved 14.843 kg, the whole 14,842.5 g shelf taken and recorded as 14.8425
+ * kg, is COMPLETE on both desks — but this count kept it owing, so the list row's hover read
+ * "1 line(s) handed over, 2 still owed" with only SALT owed, and the Part chip
+ * (isPartIssued) would stay lit on a requisition whose every other line was
+ * done. Measured by the round-7 verifier (md_r1_detail).
+ *
+ * So the rows the SQL calls owing are re-read here, ONLY the lines that rule
+ * can close (something issued, less than approved, not rejected — the SQL's own
+ * exclusions), and each one lineIssueComplete calls complete is taken off the
+ * count. The SQL arm is untouched, so every line it calls complete stays
+ * complete, and a requisition with no such line keeps its figure exactly.
+ * Mutates `rows` in place. Census at round 7: 0 live lines change.
+ */
+function uncountShownFigureCloses(
+  db: ReturnType<typeof getDb>,
+  rows: Array<{ id: unknown; lines_owing?: unknown }>,
+): void {
+  const owing = rows.filter(r => (Number(r?.lines_owing) || 0) > 0);
+  if (owing.length === 0) return;
+  const byId = new Map(owing.map(r => [String(r.id), r] as const));
+  const ids = [...byId.keys()];
+  const CHUNK = 500;
+  for (let i = 0; i < ids.length; i += CHUNK) {
+    const part = ids.slice(i, i + CHUNK);
+    const lines = db.prepare(`
+      SELECT ri.req_id, ri.quantity_issued, ri.chef_approved_qty, ri.quantity_requested,
+             ri.shelf_emptied_qty,
+             ri.unit AS line_unit, rm.unit, rm.purchase_unit, rm.pack_size
+        FROM requisition_items ri JOIN raw_materials rm ON rm.id = ri.material_id
+       WHERE ri.req_id IN (${part.map(() => '?').join(',')})
+         AND COALESCE(ri.is_rejected, 0) = 0
+         AND COALESCE(ri.store_rejected, 0) = 0
+         AND COALESCE(ri.quantity_issued, 0) > 0
+         AND COALESCE(ri.quantity_issued, 0)
+             < COALESCE(ri.chef_approved_qty, ri.quantity_requested, 0)
+    `).all(...part) as Array<LineCompletenessRow & { req_id: string }>;
+    for (const l of lines) {
+      if (!lineIssueComplete(l)) continue;
+      const r = byId.get(String(l.req_id));
+      if (r) r.lines_owing = Math.max(0, (Number(r.lines_owing) || 0) - 1);
+    }
+  }
+}
+
 function nextReqNumber(db: ReturnType<typeof getDb>, isoDate: string): string {
   const year = isoDate.slice(0, 4);
   const lastRow = db.prepare(`
@@ -91,9 +146,19 @@ export async function GET(request: Request) {
     const { sql: visSql, params: visParams, me: visMe } = await visibilityFilter();
 
     if (id) {
+      // party_transferred (round 8b): has the party transfer already moved any
+      // of this requisition's goods? Both issue desks forecast a party
+      // gesture's take as the transfer (desk-rule.ts forecastDeskPartyTransfer).
+      // Since round 9 a later run moves only what the lines hold above what
+      // already moved (each item's party_moved_recipe, below), so the desks
+      // forecast THAT — a top-up can take, and can refuse. Same probe as
+      // party-fulfillment.ts's guard.
       const r = db.prepare(`
         SELECT r.*, d.name AS department_name, d.code AS department_code,
-               po.po_number AS linked_po_number, po.status AS linked_po_status
+               po.po_number AS linked_po_number, po.status AS linked_po_status,
+               CASE WHEN EXISTS (SELECT 1 FROM inventory_transactions it
+                                  WHERE it.reference_id = r.id AND it.type IN (${PARTY_TRANSFER_TYPES_SQL}))
+                    THEN 1 ELSE 0 END AS party_transferred
         FROM requisitions r
         JOIN departments d ON d.id = r.department_id
         LEFT JOIN purchase_orders po ON po.id = r.linked_po_id
@@ -152,7 +217,40 @@ export async function GET(request: Request) {
         LEFT JOIN departments d ON d.id = ri.department_id
         WHERE ri.req_id = ?
         ORDER BY d.name, rm.name
-      `).all(id);
+      `).all(id) as any[];
+      // central_flow_blocked (round 8b): a liquor / store-mapped material moves
+      // on its store's ledger and the central floor NEVER applies to it
+      // (issue-stock.ts checkCentralIssue: skipReason 'store_mapped', the same
+      // store-engine.ts centralFlowBlock call). Both issue desks forecast the
+      // central take before the click (desk-rule.ts) and could not tell such a
+      // line apart — so a split over a bar bottle read "the line closes, so
+      // nothing is deferred" and the server kept the defer (round-8 fuzz,
+      // 100 PIPERS). The flag lets a desk say nothing it cannot know.
+      for (const it of items) {
+        let blocked = false;
+        try { blocked = centralFlowBlock(db, String(it.material_id)) !== null; } catch { blocked = false; }
+        it.central_flow_blocked = blocked ? 1 : 0;
+      }
+      // party_moved_recipe (round 9): what the party transfer has ALREADY moved
+      // off the central shelf for this line's MATERIAL on this requisition,
+      // RECIPE units. The transfer is no longer one-shot — a later call moves
+      // what a line holds above this (party-fulfillment.ts, "A SECOND CALL
+      // MOVES ONLY WHAT HAS NOT MOVED") — so a desk forecasting it needs the
+      // figure, not just the yes/no of party_transferred. Per material, as the
+      // transfer reads it (its party rows summed by material_id); the desk
+      // hands it to that material's lines exactly as the transfer does
+      // (desk-rule.ts forecastDeskPartyTransfer). One line per material in
+      // practice — duplicateLineError refuses a second. 0 until a transfer runs.
+      const movedPool = new Map<string, number>();
+      if (Number(r.party_transferred || 0)) {
+        for (const row of db.prepare(`
+          SELECT material_id, COALESCE(SUM(-quantity), 0) AS moved
+            FROM inventory_transactions
+           WHERE reference_id = ? AND type IN (${PARTY_TRANSFER_TYPES_SQL})
+           GROUP BY material_id
+        `).all(id) as any[]) movedPool.set(String(row.material_id), Math.max(0, Number(row.moved) || 0));
+      }
+      for (const it of items) it.party_moved_recipe = movedPool.get(String(it.material_id)) || 0;
       // Approve permission for the detail view: any HOD (is_head_chef) or admin —
       // matching the chef-approve/reject API (canApproveAsChef) — OR this req's
       // main-dept head. (UI was gating only on dept-head, so is_head_chef HODs saw
@@ -281,6 +379,8 @@ export async function GET(request: Request) {
       WHERE ${where.join(' AND ')}
       ORDER BY r.date DESC, r.created_at DESC
     `).all(...params);
+    // lines_owing by the issue desks' own rule — see uncountShownFigureCloses.
+    uncountShownFigureCloses(db, rows as Array<{ id: unknown; lines_owing?: unknown }>);
 
     const me = await getCurrentUser();
     // Per-requisition approve permission: only the head of THAT requisition's

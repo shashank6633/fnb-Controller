@@ -25,6 +25,84 @@
  * cook staff food out of its own shelf, and 0 rows existed at cutover so there
  * is no history that has to pick a side.
  *
+ * ── THE CENTRAL FLOOR (2026-10-13) ────────────────────────────────────────
+ * BOTH branches are now bounded. The department branch always was (Rule 2
+ * below); the central branch was not, and the gate at the top of the dept block
+ * is why: `if (deduct_inventory && materialId && departmentId)`. Every real
+ * staff-meal issue misses it — src/app/staff-meals/page.tsx:450-452 posts
+ * `{ items: payload, deduct_inventory: true }` and sends NO department_id, on
+ * either half — so the one branch that every operator reaches was the unbounded
+ * one. A guard that reads correctly and can never fire for the live caller is
+ * this codebase's recorded inert-guard pattern; this one was merely in the wrong
+ * scope.
+ *
+ * MEASURED, against a copy of the live DB with its -wal: CURD forced to
+ * current_stock 0, then the page's own payload with issued_quantity 500 →
+ * HTTP 201 {"success":1,"errors":[]} and current_stock 0 → −500. Nothing on the
+ * path refused it. 486 of the 952 active materials sit at a balance of 0 today,
+ * so more than half the catalog went below zero on its FIRST central line.
+ *
+ * THE RULE IS THE ONE EVERY OTHER RAIL USES — READ THE BALANCE, FLOOR IT AT
+ * ZERO, AND DO NOT LET THE DEBIT GO BELOW — and it is IMPORTED, not retyped:
+ * clampCentralDelta() from src/lib/central-debit-clamp.ts. That file is the
+ * single implementation of "how far may this debit go" and its own header names
+ * staff-meals as a lane that must call it rather than add another, because this
+ * project has a recorded incident where two lanes each grew a helper of the same
+ * shape and the same name and they silently disagreed. So there is no second
+ * balance read in this route, no second max(0, …), no second epsilon and no
+ * second rounding rule — and max(0, …) is the helper's, applied for
+ * issue-stock.ts's original reason: an already-negative balance must read as
+ * "nothing issuable", never as a negative allowance that lets the next issue dig
+ * the hole deeper (0 of the 952 are negative today;
+ * /api/inventory/fix-negative-stock exists because it has happened).
+ *
+ * IT REFUSES THE LINE AND REPORTS IT; IT DOES NOT CLAMP AND IT DOES NOT THROW.
+ * The imported helper exists for the UNATTENDED writers, which clamp because a
+ * throw there would roll back a delivery or a sign-off nobody is standing next
+ * to. Its answer is used here as a QUESTION — "would this debit go below zero,
+ * and by how much" — and the clamped delta it offers is never written, because:
+ *   · Not a clamp, because staff_meal_items.issued_quantity and the debit are
+ *     the same number, and PATCH credits returns back out of issued_quantity:
+ *     a row reading "500 issued" against the 64 that actually moved would hand
+ *     500 back to a store that only ever gave up 64. That is stock manufactured
+ *     out of nothing. (The owner's clamp-instead-of-throw ruling is for
+ *     UNATTENDED paths — a PO receipt, a QC sign-off, a cascade with no operator
+ *     present — where destroying a correct delivery is the worse outcome. A
+ *     staff-meal issue is a human at /staff-meals pressing Issue, so the
+ *     refusal reaches someone who can act on it.)
+ *   · Not a throw, because POST runs ONE db.transaction() for the whole batch
+ *     and the owner's ruling is that a short line must not block its
+ *     neighbours: the error goes on results.errors[] and the loop `continue`s,
+ *     so the lines that CAN be issued still commit. Identical to how the
+ *     department branch below already reports its own refusal.
+ *
+ * THE BALANCE IS READ FRESH, PER LINE, INSIDE THE TRANSACTION — never off the
+ * `allMaterials` snapshot taken before the loop. One POST may carry two rows for
+ * the same material (the page's grid allows it), and each fits while the pair
+ * does not; re-reading means the second row sees the first row's debit already
+ * in the balance. That is what the requisition floor relies on instead of an
+ * accumulator, and it is PROVEN here (see the twice-on-one-material run in the
+ * handoff), not assumed.
+ *
+ * NO STORE-MAPPED (LIQUOR) CARVE-OUT ON THIS BRANCH, and that is not an
+ * oversight — see the asymmetry note in Rule 3. The department branch refuses a
+ * store-mapped material because it structurally has no department balance; this
+ * branch has always debited central for them and still does, so carving them
+ * out of the FLOOR while leaving the DEBIT in place would excuse exactly the
+ * materials that go negative first (95 of the 127 store-mapped materials hold a
+ * central balance of 0). They are refused by the ordinary floor instead, and the
+ * message points at the Liquor Store, which is where their balance really lives.
+ *
+ * WHAT THE FLOOR DELIBERATELY DOES NOT FIX: the pack-factor bug on this branch
+ * (the PRE-EXISTING BUG note on the debit itself). The floor weighs the number
+ * the UPDATE actually subtracts against the balance it actually subtracts it
+ * from, so it bounds that statement exactly. Bounding the lineFactor()-converted
+ * figure instead would refuse work the debit can safely do, and would apply the
+ * pack fix to the GATE while leaving the WRITE wrong — the asymmetric half-fix
+ * the PRE-EXISTING BUG note forbids. The refusal names the discrepancy out loud
+ * and tells the operator the entry that makes the whole row right; it does not
+ * paper over it.
+ *
  * ── FOUR RULES A FUTURE ENGINEER WILL WANT TO "SIMPLIFY". DO NOT ───────────
  *  1. THE PACK FACTOR ON THE DEPARTMENT BRANCH. issued_quantity is in the LINE's
  *     unit (staff_meal_items.unit, which the UI defaults to 'kg'); the ledger and
@@ -40,7 +118,10 @@
  *     clamped and never allowed to drive the balance negative. A clamp would
  *     commit a meal costing 2 kg against a ledger that only gave up 0.4 kg, and
  *     the difference would surface later as unexplained loss on the department
- *     variance report with nothing on screen to explain it.
+ *     variance report with nothing on screen to explain it. THE CENTRAL BRANCH
+ *     NOW CARRIES THE SAME GUARD, on the same terms — see THE CENTRAL FLOOR
+ *     above. Neither rail may be left bare: whichever one is, it becomes the
+ *     only one an operator can reach, which is precisely what happened here.
  *  3. THE LIQUOR CARVE-OUT. Store-mapped materials (TGBCL / store_stock_ledger)
  *     never enter the department raw-material rail. A department staff-meal line
  *     for one is REFUSED rather than quietly posted, because two rails claiming
@@ -86,6 +167,11 @@ import { lineFactor } from '@/lib/issue-stock';
 import { packFactor, purchasePrice as ratePerPurchaseUnit } from '@/lib/pack-units';
 import { postDeptLedger, deptOnHand } from '@/lib/dept-ledger';
 import { centralFlowBlock } from '@/lib/store-engine';
+// THE central cap, imported rather than retyped. Its own header names this lane
+// as one that must call it instead of growing a near-copy; see THE CENTRAL FLOOR
+// below for why this route uses its ANSWER as a refusal rather than writing the
+// clamped delta it is built for.
+import { clampCentralDelta, printableCap, fmtGridQty } from '@/lib/central-debit-clamp';
 
 /** Float noise floor, matching dept-ledger's own. */
 const EPS = 1e-9;
@@ -414,6 +500,11 @@ export async function POST(request: Request) {
         // discovered after the INSERT would take the other lines down with it.
         // Validate first, `continue`, and the batch contract is preserved.
         let deptMove: DeptMove | null = null;
+        // What the CENTRAL branch subtracts: issuedQuantity, or — on an issue of
+        // everything on the shelf — the balance itself, set by the central floor
+        // below from clampCentralDelta's own figure so the write lands on exactly
+        // 0 and never at -4e-7 (planCentralDebit, src/lib/central-debit-clamp.ts).
+        let centralDebit = issuedQuantity;
         if (deduct_inventory && materialId && departmentId) {
           deptMove = resolveDeptMove(db, { departmentId, materialId, lineUnit, qty: issuedQuantity });
           if (!deptMove.ok) {
@@ -429,6 +520,147 @@ export async function POST(request: Request) {
               (neverCounted
                 ? ' This department has no opening count for it yet; record a department count first.'
                 : ''),
+            );
+            continue;
+          }
+        } else if (deduct_inventory && materialId) {
+          // ── THE CENTRAL FLOOR ────────────────────────────────────────────
+          // See THE CENTRAL FLOOR in this file's header for the measurement,
+          // the rule and why it reports instead of throwing.
+          //
+          // THE `else` IS THE GATE, and it is the gate on purpose. The central
+          // UPDATE below runs exactly when `deduct_inventory && materialId` is
+          // true and `deptMove` is null — and deptMove is null exactly when the
+          // branch above was not taken (a resolved-but-refused deptMove has
+          // already `continue`d). So this `else if` is, by construction, the
+          // precise complement: every line that reaches the central debit
+          // passes through here first, and no line that takes the department
+          // rail is bounded twice. Re-stating the condition as a sibling `if`
+          // would be a second copy of the same predicate, free to drift.
+          // ONE IMPLEMENTATION OF "HOW FAR MAY THIS DEBIT GO", IMPORTED.
+          // clampCentralDelta() reads the balance and computes the cap, and its
+          // own header names this lane as one that must call it rather than
+          // add its own: this project has a recorded incident where two lanes
+          // each grew a helper of the same shape that silently disagreed. So
+          // there is no second balance read here, no second max(0, …), no
+          // second epsilon and no second rounding rule.
+          //
+          // WHAT THIS LANE DOES DIFFERENTLY IS THE *ANSWER*, NOT THE
+          // ARITHMETIC. That file is for the unattended paths, which clamp
+          // because a throw would roll back a delivery nobody is standing next
+          // to; it says so in its first paragraph. A staff-meal issue is a
+          // human at /staff-meals pressing Issue, so the owner's ruling for an
+          // attended path applies: REFUSE the line, name the figure, write
+          // nothing. The clamp result is therefore used as the QUESTION
+          // ("would this debit go below zero, and by how much") and the debit
+          // is never written in clamped form — which is also why
+          // recordCentralDebitClamp() is not called: nothing committed, so
+          // there is no permanent shortfall to log, only a sentence to show.
+          //
+          // The delta is NEGATIVE `issuedQuantity`, RAW AND UNCONVERTED, because
+          // that is the exact number the UPDATE below subtracts. This is the one
+          // place in this file where NOT applying lineFactor() is correct: the
+          // floor's job is to bound the statement that exists, not the statement
+          // the PRE-EXISTING BUG note says should exist. Convert here and the
+          // gate would refuse 500 kg against a 600 g balance while the debit it
+          // guards would have taken 500 g and left 100 — refusing correct work,
+          // and half-fixing the pack bug on the gate while the write stayed
+          // wrong.
+          const clamp = clampCentralDelta(db, { materialId, deltaRecipe: -issuedQuantity });
+          // When the line fits, deltaToWrite is the ask — or the balance itself on
+          // an ask of everything — and that is the figure the UPDATE below takes.
+          // When it does not fit, the line is refused just below and this is
+          // never written. A material with no row reports exists:false and
+          // deltaToWrite = the ask, so the no-op UPDATE is unchanged.
+          if (!clamp.clamped) centralDebit = -clamp.deltaToWrite;
+          // `clamped` is true exactly when the debit exceeds max(0, balance) —
+          // the helper's comparison, not a restatement of it. A material_id with
+          // no row reports exists:false and clamped:false and is deliberately
+          // let through: there is no balance to drive negative, the UPDATE below
+          // matches nothing, and refusing here would newly reject a line that
+          // today simply no-ops. The parties and wastage floors make the
+          // identical call on the identical reasoning.
+          if (clamp.clamped) {
+            // `deltaToWrite` is the helper's own cap (−max(0, balance)), so the
+            // figure this message prints is the figure the floor computed; a
+            // locally re-derived "available" is exactly the near-copy that
+            // disagrees in the sixth decimal.
+            // Rounded DOWN at the precision `fmt` prints (3 dp) — a "holds only X"
+            // that names more than the floor accepts sends the operator to retype
+            // a refused figure (99.9996 g used to print as 100 g).
+            // printableCap, not a bare qtyDown: a crumb under 0.001 would round to
+            // 0 and the sentence would say "holds no X" over a balance that is
+            // there. It falls to 6 dp instead (holdsAny decides "none").
+            const cap = printableCap(-clamp.deltaToWrite, 3);
+            const available = cap.value;
+            // The PACK SHAPE comes from the pre-loop catalog snapshot, and that
+            // is correct rather than lazy: unit / purchase_unit / pack_size are
+            // CATALOG METADATA and nothing in this loop writes them, so there is
+            // no stale-read hazard — that hazard is about the BALANCE, which is
+            // why the balance is the thing read late, inside the transaction, by
+            // the helper. Rule 4 twelve lines above already resolves this very
+            // material from this very map for this very lineFactor() call, so
+            // the floor and the rate decision cannot disagree about the
+            // material's pack shape. The NAME is taken from the clamp instead,
+            // because the helper reads it in the same statement as the balance.
+            const shape = materialById.get(materialId);
+            const matName = clamp.materialName || (shape ? String(shape.name) : materialId);
+
+            // unit-lock: RECIPE basis, both figures. `available` is the cap on
+            // raw_materials.current_stock, recipe units by canon;
+            // `issuedQuantity` is the figure the UPDATE removes from that same
+            // column, so recipe units is what it is WORTH to central whatever
+            // the row is labelled. Printing the cap in purchase units — the
+            // owner's store-display rule — would name a number this route will
+            // not accept, because the debit never divides by pack_size.
+            const ru = String(shape?.unit || '').trim();
+            const q = (n: number) => `${fmt(n)}${ru ? ` ${ru}` : ''}`;
+            const qCap = (n: number) => (cap.dp > 3 ? `${fmtGridQty(n)}${ru ? ` ${ru}` : ''}` : q(n));
+
+            // THE WAY OUT answers "what do I do now", and it is the department
+            // branch's own shape: name the figure when there is one, name the
+            // screen when there is not.
+            const wayOut = available > 0
+              ? `Issue ${qCap(available)} or less on this line.`
+              : centralFlowBlock(db, materialId)
+                // 95 of the 127 store-mapped materials hold a central balance
+                // of 0, so "receive the stock" would send the operator to a
+                // screen that is never going to hold it. This branch DEBITS
+                // store-mapped materials (see the header) — only the advice
+                // differs, never the floor.
+                ? `"${matName}" is a store-mapped (liquor) material — its balance lives on the ` +
+                  `Liquor Store, not on the Central Store.`
+                : 'Receive the stock, or record a closing count, first.';
+
+            // THE BASIS NOTE answers a DIFFERENT question — "why does your
+            // sentence say g when my row says kg" — so it is appended, not
+            // substituted. Folding the two together shadowed the Liquor Store
+            // pointer on every packed store-mapped material, which is most of
+            // them.
+            //
+            // lineFactor() is what decides whether the note applies: the same
+            // helper the department branch and Rule 4 use, never a hand-rolled
+            // pack_size test. factor > 1 means this row is counted in the
+            // PURCHASE unit while the debit it is about to be refused for
+            // counts RECIPE units — the PRE-EXISTING BUG, showing through.
+            // Saying so is the honest alternative to a sentence that looks
+            // like an app error, and "enter the row in <recipe unit>" is a
+            // real fix for the whole row: at that unit lineFactor is 1, the
+            // debit is right, and rateForUnit on the page prices the line in
+            // Rs per that same unit (Rule 4), so the money is right too.
+            const basisNote = shape && lineFactor(lineUnit, shape).factor > 1
+              ? ` This row is entered in ${shape.purchase_unit}; a central staff-meal issue comes off the `
+                + `store in ${ru} (${shape.pack_size} ${ru} per ${shape.purchase_unit}), so the quantity above `
+                + `is read as ${q(issuedQuantity)} — enter the row in ${ru} to match.`
+              : '';
+
+            results.errors.push(
+              (available > 0
+                ? `Row ${i + 1}: the Central Store holds only ${qCap(available)} of ${matName} — `
+                  + `cannot issue ${q(issuedQuantity)}. `
+                : `Row ${i + 1}: the Central Store holds no ${matName} — `
+                  + `cannot issue ${q(issuedQuantity)}. `)
+              + `Nothing was recorded for this line. ` + wayOut + basisNote,
             );
             continue;
           }
@@ -481,16 +713,21 @@ export async function POST(request: Request) {
             // total_cost is now right on this branch while current_stock is still
             // short by pack_size. One right number and one wrong one is strictly
             // better than two wrong ones, and it is the wrong one that has to move.
+            //
+            // THE FIGURE IS THE FLOOR'S (centralDebit): issuedQuantity, except on
+            // an issue of everything on the shelf, where it is the balance itself
+            // and the write lands on exactly 0 — under one 6-dp step from the
+            // ask. The basis question above is untouched by it.
             db.prepare(`
               UPDATE raw_materials SET current_stock = current_stock - ?, updated_at = datetime('now')
               WHERE id = ?
-            `).run(issuedQuantity, materialId);
+            `).run(centralDebit, materialId);
 
             db.prepare(`
               INSERT INTO inventory_transactions (id, material_id, type, quantity, reference_id, notes, created_at)
               VALUES (?, ?, 'staff_meal_issue', ?, ?, ?, datetime('now'))
             `).run(
-              generateId(), materialId, -issuedQuantity, id,
+              generateId(), materialId, -centralDebit, id,
               `Issued to staff meal ${item.meal_id}`
             );
           }

@@ -28,7 +28,8 @@ import {
  * ─────────────────────────────────────────────────────────────────────────
  * purchase-log has to refuse a grand total because one delivery is written
  * into three tables and adding them roughly doubles the spend. This report is
- * worse exposed, because its five stages are not even measured in the same
+ * worse exposed, because its seven stages (eight once a department transfer
+ * exists) are not even measured in the same
  * thing:
  *
  *   RECEIPT           purchases / GRN     PURCHASE units   and rupees spent
@@ -36,6 +37,11 @@ import {
  *   ISSUE             the issue ledger    RECIPE units     a valued MEMO only
  *   ISSUE (pre-ledger) derived remainder  the LINE's unit  no money at all
  *   CONSUMPTION       inventory_txns      RECIPE units     no money at all
+ *   REVERSAL          department ledger   RECIPE units     no money at all
+ *     (give-back: an undo / lowered issued figure, or a reusable return)
+ *   CONSUMPTION_SKIP  consumption_skips   RECIPE units     no money, no stock moved
+ *   TRANSFER          department ledger   RECIPE units     no money at all
+ *     (department -> department; present only once a transfer exists)
  *
  * Add any two of those and the result is wrong in BOTH its unit and its
  * meaning: 3 cases of oil + 4,500 ml of oil + 4,500 ml of oil is not 9,003 of
@@ -133,6 +139,13 @@ const YMD = /^\d{4}-\d{2}-\d{2}$/;
  * issues only". A silent wrong answer is the one failure mode this whole report
  * exists to avoid. If the page and the lib are ever brought onto one spelling,
  * keep the other key here anyway: bookmarked and mailed report URLs outlive it.
+ *
+ * `reversal` (the page's "Give-back") and `consumption_skip` (a cook that moved
+ * no stock) are their own stages in the lib and on the page, and are accepted
+ * here (final pass) rather than refused with a 400. `consumption_skip` and
+ * `skip` both reach the lib's one skip token ('consumption_skip' collapses to
+ * it there); neither is ever folded into `consumption`, which is real
+ * movement only.
  */
 const STAGES: Record<string, IssueLogStageFilter> = {
   all: 'all',
@@ -142,6 +155,9 @@ const STAGES: Record<string, IssueLogStageFilter> = {
   pre_ledger: 'pre_ledger',
   preledger: 'pre_ledger',
   consumption: 'consumption',
+  reversal: 'reversal',
+  consumption_skip: 'consumption_skip',
+  skip: 'skip',
   // Department → department hand-overs (the lib's TRANSFER stage).
   transfer: 'transfer',
 };
@@ -305,9 +321,14 @@ export async function GET(req: Request) {
         + `OWN unit. A request is not a movement and carries no money, so there is no value here.${qtyClause(t.requisition)}`,
         { qty: t.requisition.qty, basis: t.requisition.unit_basis, value: t.requisition.value },
       ));
+      // "moved", not "debited": a stock-moving NEGATIVE row (an undo or a
+      // lowered issued figure) CREDITED central back, and counting it under
+      // "also debited central stock" said the opposite of what it did.
       lines.push(captionRow(
-        `TOTAL — ISSUE (${lineCount(t.issue.lines)}, of which ${t.issue.stock_moved_lines ?? 0} also debited central stock): `
-        + `goods HANDED OVER by the store, in RECIPE units. The Value is a VALUED MEMO at average price, NOT a spend — `
+        `TOTAL — ISSUE (${lineCount(t.issue.lines)}, of which ${t.issue.stock_moved_lines ?? 0} also moved central stock — `
+        + `a positive row debited it, a negative row credited it back): `
+        + `goods HANDED OVER by the store, in RECIPE units, net of its negative rows (an undo, a lowered issued figure, `
+        + `or a party-transfer correction downward). The Value is a VALUED MEMO at average price, NOT a spend — `
         + `the money was already booked at RECEIPT, so DO NOT ADD this to the RECEIPT total.${qtyClause(t.issue)}`,
         { qty: t.issue.qty, basis: t.issue.unit_basis, value: t.issue.value },
       ));
@@ -322,6 +343,24 @@ export async function GET(req: Request) {
         `TOTAL — CONSUMPTION (${lineCount(t.consumption.lines)}): goods USED UP, in RECIPE units. A SEPARATE event from `
         + `the issues above, usually days later — DO NOT ADD it to any issue figure.${qtyClause(t.consumption)}`,
         { qty: t.consumption.qty, basis: t.consumption.unit_basis, value: t.consumption.value },
+      ));
+      // The two stages the lib has always returned and this block never
+      // captioned (final pass): without them a file of give-backs or skipped
+      // cooks printed five totals of 0 lines over rows none of them counted.
+      lines.push(captionRow(
+        `TOTAL — REVERSAL, give-back (${lineCount(t.reversal.lines)}): goods handed BACK by a department to the central `
+        + `store, in RECIPE units, shown as the positive quantity that went back. An undo or a lowered issued figure is `
+        + `the SAME EVENT as its negative ISSUE row above — DO NOT ADD the two. A department return marked reusable has `
+        + `no ISSUE row and appears only here. No money on this stage.${qtyClause(t.reversal)}`,
+        { qty: t.reversal.qty, basis: t.reversal.unit_basis, value: t.reversal.value },
+      ));
+      lines.push(captionRow(
+        `TOTAL — CONSUMPTION_SKIP, skipped cook (${lineCount(t.consumption_skip.lines)}): cooks that moved NO stock `
+        + `anywhere (each row names why — for example an unmapped station, a department whose recipe deduction is `
+        + `off, or liquor on its own rail), in RECIPE units — the `
+        + `quantity that WOULD have been deducted. A data gap, not a loss: DO NOT ADD it to consumption.`
+        + `${qtyClause(t.consumption_skip)}`,
+        { qty: t.consumption_skip.qty, basis: t.consumption_skip.unit_basis, value: t.consumption_skip.value },
       ));
       // Only while the lib has the TRANSFER stage in play (the ledger has held a
       // transfer, or transfers were asked for by name) — a database that has

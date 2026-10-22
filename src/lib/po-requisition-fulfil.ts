@@ -4,6 +4,11 @@ import { GrnRefused, logAuditOrThrow, r6 } from './grn-reversal';
 import {
   postCentralTxn, deptParty, PARTY_TRANSFER_TYPE, PARTY_TRANSFER_TYPES_SQL,
 } from '@/lib/movement-record';
+import {
+  checkCentralIssue, recordPartyShelfTake, stampShelfClose, centralShelfEmpty, markLedgerShelfClose,
+  lineFactor,
+} from '@/lib/issue-stock';
+import { qtyGrid, planCentralDebit } from '@/lib/central-debit-clamp';
 
 /* ══════════════════════════════════════════════════════════════════════════
  * THE PO → REQUISITION FULFIL CASCADE, IN ONE PLACE.
@@ -27,12 +32,28 @@ import {
  * One helper, two callers, one behaviour. Copying it would have been two
  * behaviours the day one of them was edited.
  *
- * ── THE BODY IS UNCHANGED ──────────────────────────────────────────────────
- * Lifted verbatim from receive/route.ts. Only three names were rewritten —
+ * ── THE BODY WAS LIFTED VERBATIM, AND HAS SINCE GAINED THE CENTRAL FLOOR ───
+ * It came from receive/route.ts with only three names rewritten —
  * po.requisition_id → requisitionId, po.outlet_id → poOutletId,
- * receivedByEmail → actorEmail. Every comment, every guard, the effective-qty
- * rule, the pack factor and the average_price basis are exactly as they were;
- * they are load-bearing and are documented in place below.
+ * receivedByEmail → actorEmail. The effective-qty rule and the average_price
+ * basis are still exactly as they were; they are load-bearing and are
+ * documented in place below.
+ *
+ * ONE THING IS NO LONGER VERBATIM: the party debit is now bounded, and its
+ * hand-rolled pack factor is gone in favour of the shared one. The debit ran as
+ * a bare `current_stock = current_stock - ?` with no balance read, so this
+ * cascade could drive central negative with NO STOREKEEPER ANYWHERE IN THE
+ * STORY (measured: a party line of 9 against a balance of 0 → −9, status
+ * fulfilled). See THE UNATTENDED-PATH JUDGEMENT at the clamp below, which is
+ * why this route CLAMPS where the two issue desks THROW.
+ *
+ * THE FLOOR IS THE ONLY THING THAT CHANGED WHAT MOVES (round 10). Every line
+ * production debited is still debited, by production's own figure, and is cut
+ * only where central does not hold it — including the two lines the internal
+ * floor carves out (store-mapped materials, and a blank or unrecognised line
+ * unit on a packed material). Round 9 skipped those two outright, so a PO
+ * receipt with central holding every gram asked moved less than production
+ * did; see PRODUCTION'S DEBIT ON THE TWO CARVE-OUTS in the loop.
  *
  * ── IT IS ITS OWN REPLAY GUARD ─────────────────────────────────────────────
  * Two guards, both pre-existing:
@@ -122,6 +143,19 @@ export function fulfilRequisitionFromPo(
       const partyOutletId = reqRow.outlet_id || poOutletId || null;
       const partyNote = `Party: ${reqRow.event_name || '(unnamed)'} @ ${reqRow.event_date || ''}`.trim();
       const auditItems: any[] = [];
+      // Every line this cascade could NOT satisfy in full, for the audit row
+      // below. See THE UNATTENDED-PATH JUDGEMENT at the clamp.
+      const shortfalls: Array<{
+        req_item_id: string; material_id: string; material_name: string;
+        reason: string; wanted_recipe: number; issued_recipe: number;
+        short_recipe: number; central_stock_recipe: number; line_kind?: string;
+      }> = [];
+      // Lines the shelf rule resolved to the balance, corrected to what left the
+      // shelf (round 7) — see THE LINE RECORDS WHAT LEFT THE SHELF below.
+      const shelfRecorded: Array<{
+        req_item_id: string; material_id: string; material_name: string; line_unit: string;
+        asked_line_qty: number; recorded_line_qty: number; debit_recipe: number;
+      }> = [];
       let totalCost = 0;
       for (const it of reqItems) {
         /* EFFECTIVE QTY — the house rule (store-issue/route.ts, dept-stock,
@@ -136,21 +170,216 @@ export function fulfilRequisitionFromPo(
           : Number(it.quantity_requested)) || 0;
         const issuedReq = Math.min(Number(it.quantity_issued) || effApproved, effApproved);
         if (issuedReq <= 0) continue;
+
+        /* ── THE UNATTENDED-PATH JUDGEMENT ──────────────────────────────────
+           THIS ROUTE CLAMPS. The two issue desks THROW, and the difference is
+           deliberate: it is about whether there is a human being to read a
+           refusal.
+
+           applyPartyFulfillment runs with a storekeeper at the counter, mid
+           hand-over, inside a request he just made. Throwing there unwinds HIS
+           gesture, puts the sentence on HIS screen and he fixes the stock. That
+           is the right answer and it is what that rail does.
+
+           NOBODY IS HERE. This cascade fires from a purchase-order receipt or a
+           GRN QC sign-off (receive/route.ts:1930, grn-qc.ts:2043) — a delivery
+           that has physically arrived and been counted, or a chef signing off
+           perishables. The party requisition is a BYSTANDER to that
+           transaction. A throw would roll the whole receipt back, so:
+             · goods that are on the premises would be recorded as not received,
+             · the QC signature would vanish,
+             · the refusal would be addressed to a person who is not there,
+             · and the thing actually at fault — a short party line on some
+               other material — would be nowhere on screen.
+           Destroying a correct delivery to prevent a bad party debit is a worse
+           outcome than the debit, and it fails closed on the wrong transaction.
+
+           SO BOTH OF THE OWNER'S REQUIREMENTS ARE MET WITHOUT A THROW:
+             1. central must not silently go negative → the debit is clamped to
+                what central actually holds, so the floor still holds absolutely.
+                Never more, never below zero.
+             2. he must be able to SEE what could not be satisfied → every
+                clamped line is recorded in audit_events as
+                'requisition.party_consumption.short', naming the material, what
+                was wanted, what moved, what is missing and what central held.
+                The word "silently" is the part this removes; the arithmetic is
+                the part the clamp removes. ONLY a line central was actually
+                short of goes on that row (round 10): a line the floor did not
+                cut is not a shortfall, whatever kind of line it is.
+
+           A CLAMPED LINE IS PERMANENT, WHICH IS WHY THE RECORD IS NOT OPTIONAL.
+           Both party rails treat ONE party transfer row on the requisition as
+           proof the whole transfer happened, so a short line will not be topped
+           up on a later call by either of them. The audit row is the only thing
+           that will ever say so.
+
+           THE VOID STAYS CORRECT FOR FREE. reverseRequisitionFulfilFromPo
+           credits back ABS(the stored inventory_transactions.quantity) and never
+           recomputes (see its header), so it reverses exactly the clamped figure
+           that was written. A line clamped to zero writes no row at all — the
+           same shape as the pre-existing `issuedReq <= 0` skip — and the void's
+           own 'party_row_shape' guard, which refuses a zero or positive row,
+           therefore still never sees one. */
+        const c = checkCentralIssue(db, {
+          reqItemId: String(it.id),
+          beforeLineQty: 0,
+          afterLineQty: issuedReq,
+          rail: 'party',
+        });
+
         // ri.unit → RECIPE units. Requisition quantities are stored in the
         // LINE's OWN unit (option B), so a "2 BTL" line is TWO BOTTLES —
-        // deducting it verbatim took 2 ml off stock instead of 1,500 ml
-        // and wrote a −2 party transfer row. Same pack-factor CASE as
-        // src/lib/party-fulfillment.ts and the department-consumption SQL;
-        // keep the three byte-equivalent.
-        const rPack = Number(it.rm_pack_size) || 1;
-        const reqPackFactor =
-          (String(it.unit ?? '').trim() !== '' &&
-           it.unit === it.rm_purchase_unit &&
-           it.unit !== it.rm_unit &&
-           rPack > 1)
-            ? rPack : 1;
-        const issued = issuedReq * reqPackFactor;   // RECIPE units
+        // deducting it verbatim took 2 ml off stock instead of 1,500 ml and
+        // wrote a −2 party transfer row. THE FACTOR IS THE FLOOR'S OWN: the
+        // hand-rolled CASE that stood here is gone, so the quantity weighed
+        // against the balance and the quantity taken off it are one number and
+        // cannot drift. MEASURED a no-op on quantity: lineFactor().factor equals
+        // the old CASE on all 16,353 live requisition lines (round 10 re-check,
+        // fssai-flows/r10-probe.ts — the 3 blank-unit packed lines included,
+        // where both read ×1).
+        //
+        // THE CLAMP IS THE RULE'S OWN FIGURE. debitRecipe comes from
+        // planCentralDebit (src/lib/central-debit-clamp.ts), the one rule every
+        // central floor shares: when the line fits it is the ask (or, on an ask
+        // of "everything", the balance itself, so the write lands on exactly 0);
+        // when it does not fit it is max(0, balance) — the clamp. Never more than
+        // the raw stored balance, so a rounding step can never hand out a
+        // fraction more than is physically there. This used to be a local
+        // min(wanted, 6-dp allowance, balance) with its own 1e-9 test, which
+        // logged a "short" of 0.0000004 against an ask the floor had accepted.
+        let wanted: number;          // RECIPE units
+        let issued: number;          // RECIPE units, what leaves central
+        let clamped: boolean;        // the floor cut this line
+        let centralStock: number;    // the raw stored balance the floor read
+        let carveOut = '';
+        if (c.debits) {
+          wanted = c.requestedRecipe;
+          issued = Math.max(0, c.debitRecipe);
+          clamped = !c.ok || issued <= 0;
+          centralStock = c.centralStockRecipe;
+        } else {
+          /* ── PRODUCTION'S DEBIT ON THE TWO CARVE-OUTS (round 10) ─────────────
+             checkCentralIssue declines to weigh two kinds of line, for reasons
+             that belong to the INTERNAL rail and the two desks, where an
+             operator types the figure:
+               · store_mapped — the material's balance lives on the TGBCL store
+                 ledger, not in central;
+               · unit_review — ri.unit is blank or unrecognised on a PACKED
+                 material, so the line's basis is ambiguous (×1 or ×pack).
+             Round 9 SKIPPED both here: no debit, no movement, no cost line.
+             PRODUCTION DEBITS BOTH, and this cascade is a production flow: the
+             skip moved less than production with central holding every gram
+             asked (measured, fssai-flows po-cascade nofloor: ABSOLUT 2 BTL over
+             27,000 ml stayed 27,000; SALT 5 blank-unit over 127,334 g stayed;
+             the party cost fell 5,816.08 → 1,468.18). That is not a floor, so
+             production's behaviour is restored.
+
+             THE FIGURE IS PRODUCTION'S. issuedReq × lineFactor().factor — the
+             shared converter, which reads ×1 on a blank or unrecognised unit
+             exactly as the old CASE did and equals it on every live line (see
+             above). NOT the 6-dp grid point checkCentralIssue weighs: the
+             carve-out is not on that rail, and production wrote this product
+             verbatim.
+
+             THE FLOOR STILL APPLIES, AND ONLY WHERE CENTRAL IS SHORT. The ask is
+             weighed by planCentralDebit — the one rule — against the balance
+             read here, inside the caller's transaction, immediately before the
+             debit (a balance read earlier races). It fits ⇒ production's figure
+             leaves, byte-identical (or, when the ask sits on the balance's own
+             6-dp grid point, the balance itself, so the landing is exactly 0
+             rather than a sub-grid crumb either side of it — the rule's
+             "takes all", the same on every floor). It does not fit ⇒ max(0, balance) leaves and
+             the line goes on the .short row with the balance central actually
+             held — 95 of the 127 store-mapped materials hold 0 in central, so
+             production drove those straight below zero and the clamp is what
+             stops it. planCentralDebit directly, not clampCentralDelta: when
+             this was written that helper passed a debit of ≤ 1e-9 through
+             untouched as dust, which on a zero balance landed at −1e-9 (round
+             10's never-negative fix closed that in the helper too, and it now
+             writes dust as at most the balance). planCentralDebit gives such an
+             ask the balance itself (0), so no line here can land below zero. No shown-figure converter is
+             passed: nobody typed this figure against a column, and on a
+             unit_review line nobody can say which column it would be.
+
+             THE SAME PATH TAKES A LINE THE RULE FOUND BELOW THE HOUSE GRID
+             (skipReason 'zero_delta': an ask under 5e-7 recipe units). Round 9
+             skipped it and listed it on the .short row with central 0; production
+             debited the dust. It is debited here too: on the grid it always
+             fits, so it is never a shortfall, and planCentralDebit gives it at
+             most the balance, so it never lands below zero. 'party' cannot arrive (rail 'party') and 'missing_line'
+             cannot either (the line was just read through the same joins). */
+          carveOut = c.skipReason;
+          const { factor } = lineFactor(it.unit, {
+            unit: it.rm_unit, purchase_unit: it.rm_purchase_unit, pack_size: it.rm_pack_size,
+          });
+          wanted = issuedReq * factor;
+          const bal = db.prepare(
+            `SELECT COALESCE(current_stock, 0) AS current_stock FROM raw_materials WHERE id = ?`,
+          ).get(it.material_id) as { current_stock: number } | undefined;
+          const plan = planCentralDebit(Number(bal?.current_stock) || 0, wanted);
+          issued = Math.max(0, plan.debit);
+          clamped = !plan.fits;
+          centralStock = plan.stock;
+        }
+        if (clamped) {
+          shortfalls.push({
+            req_item_id: String(it.id), material_id: String(it.material_id),
+            material_name: String(it.material_name || ''),
+            reason: 'central_stock_short',
+            wanted_recipe: wanted, issued_recipe: issued,
+            short_recipe: Math.round((wanted - issued) * 1e6) / 1e6,
+            central_stock_recipe: centralStock,
+            // Which kind of line it was, when it was one the internal floor
+            // carves out — so a store-mapped bottle short in central is not read
+            // as a kitchen shortage. Absent on an ordinary line.
+            ...(carveOut ? { line_kind: carveOut } : {}),
+          });
+        }
+        // Nothing issuable at all writes NO movement row, exactly as the
+        // `issuedReq <= 0` skip above does — a zero-quantity party row would be
+        // a movement that did not happen, and the void refuses rows of that shape.
+        if (issued <= 0) continue;
+
+        // ── THE LINE RECORDS WHAT LEFT THE SHELF (round 7) ──────────────────
+        // The rule above can FIT a line by taking the balance instead of its
+        // figure — the shown-figure rule: two party lines of 10 + 4.843 kg over
+        // 14,842.5 g, the second takes 4,842.5 g. The movement row and the
+        // consumption audit always carried that; the line kept 4.843 kg, the
+        // issue ledger 4,843 g, and nothing named the half gram (measured: no
+        // .short row — rightly, nothing was short). The contract in
+        // src/lib/central-debit-clamp.ts is that a caller whose debit is not the
+        // ask records the debit, so the line is corrected to recordAfterLineQty,
+        // the floor's own figure (recordPartyShelfTake, shared with the desks'
+        // party rail). Only on a FIT: a clamped line (!c.ok) is a shortfall and
+        // goes on the .short row as before. Only when the line itself carried
+        // the figure weighed — a line issued nothing is weighed at its approved
+        // quantity, and that is not this line's record to rewrite. Only on the
+        // weighed rail (c.debits): a carve-out line has no shown figure, and its
+        // debit is production's figure or the clamp, never a reading of it.
+        if (c.debits && c.ok && c.recordAfterLineQty !== issuedReq
+            && recordPartyShelfTake(db, {
+              reqItemId: String(it.id), askedLineQty: issuedReq,
+              recordLineQty: c.recordAfterLineQty, actor: actorEmail || 'system:po-requisition-fulfil',
+            })) {
+          shelfRecorded.push({
+            req_item_id: String(it.id), material_id: String(it.material_id),
+            material_name: String(it.material_name || ''), line_unit: String(it.unit ?? ''),
+            asked_line_qty: issuedReq, recorded_line_qty: c.recordAfterLineQty, debit_recipe: issued,
+          });
+        }
         decStock.run(issued, it.material_id);
+        // THE RULE'S MEMORY (round 8) — a record, not a movement: when this take
+        // emptied the shelf and the line (as corrected above) owes less than one
+        // printed step, the line is stamped complete (stampShelfClose), so the
+        // Issue Log and both desks read the line this cascade fulfilled as done.
+        // It moves nothing, credits nothing and decides no status — the
+        // cascade's own behaviour (what it debits, what it does not credit, the
+        // fulfilled stamp above) is exactly as it was.
+        // The ledger row carrying the line's figure keeps the fact as history
+        // (round 8b, markLedgerShelfClose) — still a record, nothing moves.
+        if (stampShelfClose(db, String(it.id), centralShelfEmpty(db, String(it.material_id))).byShelf) {
+          markLedgerShelfClose(db, String(it.id));
+        }
         // MOVEMENT RECORD: the party's draw on central. The destination was
         // implicit in the type; it is now the requisition's own department when
         // one is named, and the party sink otherwise.
@@ -175,12 +404,14 @@ export function fulfilRequisitionFromPo(
         });
         /* BOTH SIDES OF THIS MULTIPLICATION ARE ON THE RECIPE BASIS.
            LEFT  — `issued` is RECIPE units (ml/g): issuedReq is in the LINE's
-                   own unit and reqPackFactor above lifted a purchase-unit
-                   line into recipe units.
+                   own unit and the shared pack factor (lineFactor, applied by
+                   checkCentralIssue or, on a carve-out line, directly above)
+                   lifted a purchase-unit line into recipe units (it is
+                   `wanted`, possibly clamped).
            RIGHT — raw_materials.average_price is ₹ per RECIPE unit by canon,
-                   so it needs NO pack conversion. Dividing it by rPack, or
-                   multiplying it up, would break the trio.
-           It used to read last_purchase_price / rPack here. That column is
+                   so it needs NO pack conversion. Dividing it by the pack size,
+                   or multiplying it up, would break the trio.
+           It used to read last_purchase_price / pack_size here. That column is
            stored in MIXED bases: of the 190 packed materials that hold both a
            stored LPP and a purchase history, 71 are ALREADY ₹/recipe-unit, so
            the divide fired a second time — MALA STRAWBERRY CRUSH 5 LTR
@@ -198,6 +429,19 @@ export function fulfilRequisitionFromPo(
           quantity: issued,
           unit_cost: unitCost,
           line_cost: lineCost,
+          // Stated on the line itself as well as in the shortfall event below,
+          // so the consumption record cannot read as a full hand-over when the
+          // clamp reduced it. Only present when it actually bit — `clamped`, the
+          // rule's own verdict (round 7; on a carve-out line, the plan's). A FIT
+          // that took the balance by the shown figure (4,842.5 g for 4.843 kg
+          // typed) is not a shortfall and must not read as one: it carries the
+          // typed figure as asked_quantity instead, beside the quantity that
+          // moved, and the line itself now records that quantity (above).
+          ...(clamped && issued < wanted - 1e-9
+            ? { requested_quantity: wanted, short_quantity: Math.round((wanted - issued) * 1e6) / 1e6 }
+            : c.debits && c.ok && qtyGrid(issued) !== qtyGrid(wanted)
+              ? { asked_quantity: wanted }
+              : {}),
         });
       }
       logAuditEvent(db, {
@@ -208,6 +452,55 @@ export function fulfilRequisitionFromPo(
         after: { items: auditItems, total_cost: Math.round(totalCost * 100) / 100 },
         note: partyNote,
       });
+      // WHAT COULD NOT BE SATISFIED, ON ITS OWN ROW. Written only when the floor
+      // cut a line — central held less than the line asked — so an ordinary
+      // cascade is byte-identical to before. EVERY LINE ON IT IS A CLAMP
+      // (round 10): reason 'central_floor' and each line's central_stock_recipe
+      // are the balance the floor read. Round 9 also listed the two carve-outs
+      // here with central_stock_recipe 0 while central held 27,000 ml and
+      // 127,334 g — false on both counts; those lines are now debited like any
+      // other (above) and appear here only if central was actually short.
+      //
+      // IT IS A THIRD, SEPARATE EVENT TYPE ON PURPOSE. cascadeDeductionWitness
+      // below decides what a void may undo from exactly two names —
+      // 'requisition.party_consumption' and '…​.skipped' — and the event above is
+      // still written whenever this branch ran, so the witness answers 'deducted'
+      // exactly as it did before and this row cannot change its mind. It is a
+      // report to the owner, not a discriminator; do NOT add it to that IN list.
+      if (shortfalls.length > 0) {
+        logAuditEvent(db, {
+          event_type: 'requisition.party_consumption.short',
+          entity_type: 'requisition',
+          entity_id: requisitionId,
+          actor_email: actorEmail,
+          after: {
+            reason: 'central_floor',
+            lines: shortfalls,
+            moved_lines: auditItems.length,
+          },
+          note: `${partyNote} — ${shortfalls.length} line(s) could not be issued in full from central: `
+            + shortfalls.map(s => `${s.material_name || s.material_id} (${s.reason})`).join(', '),
+        });
+      }
+      // THE LINES THE SHELF RULE CORRECTED, on the same row the desks' party
+      // rail writes (party-fulfillment.ts). A fourth event type, and like the
+      // .short row a report to the owner, NOT a discriminator: do not add it to
+      // cascadeDeductionWitness's IN list. Written only when a line was
+      // corrected, so an ordinary cascade is byte-identical.
+      if (shelfRecorded.length > 0) {
+        logAuditEvent(db, {
+          event_type: 'requisition.party_transfer.shelf',
+          entity_type: 'requisition',
+          entity_id: requisitionId,
+          actor_email: actorEmail,
+          after: { lines: shelfRecorded, source: 'po_cascade' },
+          note: `${partyNote} — the purchase-order cascade took what the central store held on `
+            + `${shelfRecorded.length} line(s) typed at the store's shown figure; each line now records what left `
+            + `the shelf (the typed figure is kept as asked): `
+            + shelfRecorded.map(r => `${r.material_name || r.material_id} ${r.asked_line_qty} → ${r.recorded_line_qty}`
+              + `${r.line_unit ? ` ${r.line_unit}` : ''}`).join(', '),
+        });
+      }
     }
   }
 }

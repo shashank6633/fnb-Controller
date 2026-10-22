@@ -283,43 +283,13 @@ function isStateChanging(method: string): boolean {
   return method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE';
 }
 
-/**
- * The spelling the ROUTER resolves, which is not always the spelling this proxy
- * is handed.
- *
- * `req.nextUrl.pathname` keeps percent-escapes exactly as sent. Next's production
- * route lookup does not: when the raw path matches no route it tries
- * decodeURIComponent(path) ONCE (node_modules/next/dist/server/lib/router-utils/
- * filesystem.js, "check decoded variant as well", `!opts.dev` only). Measured on
- * Next 16.2.2's own resolver: '/api/department%2Dtransfers', '/api/w%61stage',
- * '/%61pi/wastage' and '/api%2Fdepartment-transfers' all resolve to the real
- * route handler. Every gate below that matched only the RAW spelling could
- * therefore be stepped round by escaping one character:
- *   · CSRF (step 3) — '/api/department%2Dtransfers' matched no prefix, so a
- *     POST with a valid session and NO x-csrf-token reached the transfer SEND;
- *   · '/%61pi/…' and '/api%2F…' are not even `isApi`, so the session-validity
- *     step (2c) and CSRF were both skipped for every API in the app.
- *
- * So the API rail judges BOTH spellings and a request passes a gate only if both
- * do. When nothing is escaped the two are identical and every check below is
- * byte-for-byte what it was. A malformed escape leaves the raw path, exactly as
- * Next does (it then matches no route and 404s).
- */
-function routerPathname(pathname: string): string {
-  try { return decodeURIComponent(pathname); } catch { return pathname; }
-}
-
 export function proxy(req: NextRequest) {
   const { pathname } = req.nextUrl;
-  const routePath = routerPathname(pathname);
   const session = req.cookies.get(SESSION_COOKIE)?.value;
-  // Either spelling under /api/ is an API request (see routerPathname).
-  const isApi = pathname.startsWith('/api/') || routePath.startsWith('/api/');
+  const isApi = pathname.startsWith('/api/');
 
-  // 1. Public bypass. An escaped spelling that the router resolves to an API is
-  // public only if that API path is itself public — the /api/ hard floor in
-  // isPublic() must hold for the spelling that is actually served, too.
-  if (isPublic(pathname) && (routePath === pathname || !routePath.startsWith('/api/') || isPublic(routePath))) {
+  // 1. Public bypass
+  if (isPublic(pathname)) {
     // Issue a CSRF cookie on the login page so the very first POST has it
     if (pathname === '/login' && !req.cookies.get(CSRF_COOKIE)?.value) {
       const res = NextResponse.next();
@@ -603,9 +573,7 @@ export function proxy(req: NextRequest) {
 
   // 3. CSRF check on sensitive state-changing API calls
   if (isApi && isStateChanging(req.method)) {
-    // Either spelling (see routerPathname): '/api/department%2Dtransfers' IS the
-    // transfer SEND once the router decodes it, so it needs the token too.
-    const required = CSRF_REQUIRED_PREFIXES.some(p => pathname.startsWith(p) || routePath.startsWith(p));
+    const required = CSRF_REQUIRED_PREFIXES.some(p => pathname.startsWith(p));
     if (required) {
       const cookieToken = req.cookies.get(CSRF_COOKIE)?.value;
       const headerToken = req.headers.get(CSRF_HEADER);

@@ -7,6 +7,7 @@ import {
   amendGrnLines, raisePoDeviationAlert, type AmendLineInput,
 } from '@/lib/grn-reversal';
 import { planPoReceiptVoid, applyPoReceiptVoid, type PoVoidPlan, type PoVoidOutcome } from '@/lib/po-void';
+import { sweepCentralCrumbs } from '@/lib/central-debit-clamp';
 // Direct-issue rail: a cost row stamped purchases.direct_issue_dept_id booked
 // its stock on a DEPARTMENT ledger with no central movement row — the void's
 // orphan test must not read that as an unidentifiable receipt.
@@ -1237,6 +1238,16 @@ export async function DELETE(request: Request, { params }: { params: Promise<{ i
       if (poVoid) {
         poResult = applyPoReceiptVoid(db, poVoid, { actorEmail: me.email, grnNumber: String(grn.grn_number) });
       }
+
+      // THE CRUMB, ONCE EVERY LEG HAS RUN. assertNoNegativeStock judged the NET
+      // (receipt debit less any party credit) on the 6-dp grid, so a void of
+      // "everything on the shelf" is accepted — and the receipt's recorded
+      // figure can sit a sub-grid hair above the balance (stored 99.9999996,
+      // receipt 100), which the unwind's bare subtraction would leave at −4e-7.
+      // Not before the party credit: a debit-then-credit void legitimately
+      // passes through a transient negative. sweepCentralCrumbs sets only a
+      // landing in (−1e-6, 0) to exactly 0 (src/lib/central-debit-clamp.ts).
+      sweepCentralCrumbs(db, moves.map(m => m.material_id));
 
       // VERIFIED, NOT BEST-EFFORT — and of the two audit writes in this file
       // this is the one that must not be allowed to fail quietly. before_json

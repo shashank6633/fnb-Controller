@@ -2,6 +2,7 @@ import type { Database } from 'better-sqlite3';
 import type { SessionUser } from './auth';
 import { generateId, convertToMaterialUnit } from './db';
 import { packFactor } from './pack-units';
+import { planCentralDebit, qtyDown } from './central-debit-clamp';
 
 /**
  * Multi-Store Inventory Engine — Phase A foundation (LIQUOR STORE first).
@@ -789,8 +790,17 @@ export function issueTransfer(
     const available = fromCentral
       ? (Number((getCentralStock.get(materialId) as { current_stock: number } | undefined)?.current_stock) || 0)
       : (onHand.get(materialId) ?? 0);
-    if (qty > available) {
-      throw new Error(`Cannot issue ${qty} of ${nameOf(materialId)} — only ${available} on hand in ${sourceName}`);
+    // CENTRAL asks THE ONE RULE — planCentralDebit (src/lib/central-debit-clamp.ts),
+    // the 6-dp-grid answer every central floor gets. A bare `qty > available`
+    // refused "issue all 2 kg" against a stored 1.9999999999999998 and against
+    // a balance the screen printed as its 6-dp rounding. The debit below takes
+    // the balance itself on such an issue, so it still cannot go below zero.
+    // A STORE ledger source keeps its own test unchanged — it is not
+    // raw_materials.current_stock and this rule does not govern it.
+    const short = fromCentral ? !planCentralDebit(available, qty).fits : qty > available;
+    if (short) {
+      const shown = fromCentral ? qtyDown(Math.max(0, available), 6) : available;
+      throw new Error(`Cannot issue ${qty} of ${nameOf(materialId)} — only ${shown} on hand in ${sourceName}`);
     }
     updates.push({ itemId: row.id, material_id: materialId, qty });
   }
@@ -803,12 +813,23 @@ export function issueTransfer(
         if (fromCentral) {
           // Debit the central grocery (recipe units) + audit trail. The bound
           // check above guarantees current_stock never goes negative.
-          db.prepare(`UPDATE raw_materials SET current_stock = current_stock - ?, updated_at = datetime('now') WHERE id = ?`).run(u.qty, u.material_id);
+          //
+          // THE FLOOR'S FIGURE, from a balance read HERE, inside the
+          // transaction: u.qty, or on an issue of everything on the shelf the
+          // balance itself, so the landing is exactly 0 rather than −4e-7. If
+          // the plan no longer fits at this read (a race past the check above,
+          // which reads before the transaction opens), u.qty is written exactly
+          // as it always was — this line removes the crumb, it does not change
+          // who refuses.
+          const bal = Number((getCentralStock.get(u.material_id) as { current_stock: number } | undefined)?.current_stock) || 0;
+          const plan = planCentralDebit(bal, u.qty);
+          const out = plan.fits ? plan.debit : u.qty;
+          db.prepare(`UPDATE raw_materials SET current_stock = current_stock - ?, updated_at = datetime('now') WHERE id = ?`).run(out, u.material_id);
           db.prepare(`
             INSERT INTO inventory_transactions
               (id, material_id, type, quantity, reference_id, notes, created_at)
             VALUES (?, ?, 'transfer', ?, ?, ?, datetime('now'))
-          `).run(generateId(), u.material_id, -u.qty, transferId, `Grocery transfer issue → ${destName}`);
+          `).run(generateId(), u.material_id, -out, transferId, `Grocery transfer issue → ${destName}`);
         } else {
           postLedger(db, {
             store_id: t.from_store_id,

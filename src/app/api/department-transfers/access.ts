@@ -65,12 +65,13 @@ export function bodyNumber(v: unknown): number {
  *   transfers INTO and OUT OF their own department (and any granted
  *   visible_department_ids), or one they could send from.
  *
- * FLAG A DISPUTE (records + alerts; moves nothing): anyone POSTED to the
- *   RECEIVING department, any tier — staff included, the owner's words — plus
- *   whoever may send from it (its head, managers, admin), except anyone but a
- *   manager / admin who may send from the SENDING department, wherever they
- *   are posted (canFlagDispute: the first flag owns the line's one dispute
- *   slot; a sender corrects by reverse instead).
+ * FLAG A DISPUTE (records + alerts; moves nothing): ruling #61 — anyone ON
+ *   the RECEIVING department ALWAYS: posted to it (any tier — staff included,
+ *   the owner's words) or its named head, even if they may also send from the
+ *   SENDING department; plus managers and admin; plus an HOD who acts for it
+ *   as head chef of its parent department, unless he may also send from the
+ *   SENDING department (then he is on the side that sent it). canFlagDispute.
+ *   Only CLOSING stays barred for anyone who may send from the sender's side.
  *
  * REVERSE (the one correction; a one-step transfer receiver → sender):
  *   · whoever may send from the ORIGINAL RECEIVER — it is a send from there —
@@ -178,37 +179,66 @@ export function isSender(user: SessionUser, doc: { created_by: string }): boolea
 }
 
 /**
- * Who may FLAG: anyone POSTED to the receiving department (any tier), managers
- * and admin, and the receiving department's head — but NOT anyone (other than
- * a manager / admin) who may send from the SENDING department, WHEREVER they
- * are posted: the Kitchen HOD sends from its sub-kitchen Akan Tandoori too
- * (ruling #40), one person can be the named head of two departments, and a
- * named head of Kitchen can be posted to Akan Tandoori. Ruling #12: senders
- * send; the receiving side flags. A line holds ONE open dispute, so the first
- * flag owns the slot: measured (dispute-who slot.cjs) the head of both filed a
- * token 0.001 kg "short" on Kitchen → Tandoori and the Tandoori cook's real
- * 0.5 kg claim was refused 409 until he chose to withdraw his own — a sender
- * silencing the receiver by flagging first.
+ * Who may FLAG — ruling #61 (2026-10-22): "anyone on the RECEIVING department
+ * can always flag a problem; only CLOSING a dispute stays barred for anyone
+ * who can send from the sender's side."
+ *   · admin and managers (isAdminOrManager);
+ *   · anyone ON the receiving department — POSTED to it (users.department_id,
+ *     any tier, staff included: ruling #12) or its NAMED head (head_user_id) —
+ *     ALWAYS, even when they may also send from the SENDING department: the
+ *     Kitchen HOD flags a short delivery from Akan Pizza although he sends from
+ *     that sub-kitchen too (ruling #40), and a parent department's HOD flags on
+ *     a child-to-parent transfer (Akan Tandoori → Kitchen, Akan Bar → Bar);
+ *   · whoever else may send from the receiving department — an HOD posted to
+ *     the department it is a sub-kitchen of (ruling #40) — unless they may also
+ *     send from the SENDING department. Such a person is not ON the receiving
+ *     department: the HOD posted to Kitchen, on Kitchen → Akan Tandoori, is
+ *     posted to the side that SENT it (ruling #12: senders send, the receiving
+ *     side flags) and may send it back himself (reverseAuthority 'receiver');
+ *     on Akan Pizza → Akan Tandoori (two of his sub-kitchens) Akan Tandoori's
+ *     own people flag it. This is the round-2/3 rule for him, unchanged.
+ * isOnReceivingDept() is the "ON the receiving department" test, shared with
+ * the dispute route's refusal words.
  *
- * The sender check comes BEFORE the posting. Round 3 had it after ("posted to
- * the receiver" returned first), so the same squat stayed open through the
- * posting (squat-fix S10 / S11, verifier silence): the HOD posted to Kitchen —
- * a sender head of every Akan Tandoori → Kitchen transfer under #40 — and a
- * named head of Kitchen posted to Akan Tandoori each filed 0.001 kg first
- * (201), the cook's real claim got 409, and the squatter withdrew (200)
- * leaving no record of the cook's loss.
+ * Round 3 put the sender check FIRST for everyone, which took "Flag a problem"
+ * away from receivers who also head the sender (dispute-who-reverify: the HOD
+ * posted to Kitchen on Akan Tandoori → Kitchen, the HOD posted to Bar on Akan
+ * Bar → Bar, a named head of Kitchen posted to Akan Tandoori on Kitchen → Akan
+ * Tandoori). #61 gives it back to them.
  *
- * Such a person needs no flag. When they also act for the receiver
- * (reverseAuthority 'receiver', e.g. the Kitchen HOD on Tandoori → Kitchen)
- * they correct it themselves with a send-back (ruling #2: corrections by
- * reverse). Otherwise the receiver's own people flag and the claim reaches
- * them as the sender's head ('disputed_only' take-back).
+ * What a sender may NOT do stays on CLOSING (canDismissDispute, unchanged):
+ * apart from managers and admin, a person who may send from the sending
+ * department never closes someone else's dispute on it — the HOD flag keeps
+ * him out of the manager arm (isAdminOrManager) and the "both counted" arm
+ * refuses him. Two consequences to know:
+ *   · a line holds ONE open dispute, so whoever flags first owns the line until
+ *     the claim is sent back, taken back or closed (a second flag is 409);
+ *   · canDismissDispute's first arm lets the person who RAISED a claim withdraw
+ *     it ("Withdraw my claim"), and that includes a receiver who also heads the
+ *     sender — his own claim, never someone else's. Measured (flag-61 silence
+ *     S10/S11): such a person can flag 0.001 kg first (201), a cook's real claim
+ *     on that line is then 409, and he can withdraw his own (200). Barring that
+ *     too is one line: the sender check above the flagger arm in
+ *     canDismissDispute (and ../resolve's CLOSE_WHO words with it).
  */
 export function canFlagDispute(user: SessionUser, doc: DeptTransferWithLines, all: Map<string, DeptLite>): boolean {
   if (isAdminOrManager(user)) return true;
+  if (isOnReceivingDept(user, doc, all)) return true;
   if (canSendFrom(user, all.get(doc.from_department_id))) return false;
-  if (!!user.department_id && user.department_id === doc.to_department_id) return true;
   return canSendFrom(user, all.get(doc.to_department_id));
+}
+
+/** ON the receiving department (ruling #61): posted to it (any tier), or its
+ *  named head (departments.head_user_id). NOT an HOD who acts for it only as
+ *  the head chef of the department it is a sub-kitchen of — see canFlagDispute. */
+export function isOnReceivingDept(
+  user: Pick<SessionUser, 'id' | 'department_id'>,
+  doc: Pick<DeptTransferWithLines, 'to_department_id'>,
+  all: Map<string, DeptLite>,
+): boolean {
+  if (!!user.department_id && user.department_id === doc.to_department_id) return true;
+  const to = all.get(doc.to_department_id);
+  return !!to?.head_user_id && to.head_user_id === user.id;
 }
 
 /**

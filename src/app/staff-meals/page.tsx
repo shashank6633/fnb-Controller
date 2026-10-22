@@ -157,6 +157,52 @@ function blankRow() {
 /** The two fields that identify which material an issue row is about. */
 type IssueRowRef = { material_id?: string | null; item_name?: string | null };
 
+/**
+ * WHICH SUBMITTED ROWS DID THE SERVER REFUSE?
+ *
+ * /api/staff-meals/items POST reports per line and commits the rest — a short
+ * line must not block its neighbours (owner's ruling), and the central floor
+ * added to that route makes a PARTIAL answer the ordinary case rather than a
+ * curiosity: 486 of the 952 active materials sit at a balance of 0, so one row
+ * of a batch being refused is now routine.
+ *
+ * Every error that route pushes is prefixed `Row <n>: ` with n 1-based over the
+ * `items` array it was sent — which is this page's `payload`, in order. So the
+ * refusals can be mapped back onto the exact rows the operator typed, and those
+ * rows KEPT in the grid instead of being wiped along with the ones that went
+ * through. Without this, "hold the short one" meant holding a sentence about a
+ * row whose figures had just been cleared off the screen, leaving the operator
+ * to retype them out of the error text.
+ *
+ * ONLY THE CENTRAL FLOOR'S REFUSALS (round 10). The floor is the only reason
+ * this page needs to keep a row, so it keeps only the rows the floor refused —
+ * the route's floor sentence, `Row <n>: the Central Store holds only … / holds
+ * no …`. Every refusal production already made (a unit the material does not
+ * declare, a department that holds too little, an unconvertible quantity) is
+ * handled exactly as production handles it: the grid clears with the rest.
+ * Round 9 kept every `Row <n>:` refusal, which changed those production paths
+ * for a reason the floor does not supply.
+ *
+ * DELIBERATELY FORGIVING, AND IT FAILS TOWARDS THE OLD BEHAVIOUR. An error the
+ * route phrases some other way (a batch-level `No valid rows`, a production
+ * refusal, a future rewording of the floor sentence) yields no index and keeps
+ * nothing — exactly what production does. It never guesses a row, because
+ * keeping a row that actually COMMITTED would re-issue it on the next press, and
+ * a double debit is far worse than a retype.
+ */
+const CENTRAL_FLOOR_REFUSAL = /^Row\s+(\d+)\s*:\s*the Central Store holds (?:only|no)\b/;
+function refusedRowIndices(errors: unknown): Set<number> {
+  const out = new Set<number>();
+  if (!Array.isArray(errors)) return out;
+  for (const e of errors) {
+    const m = String(e ?? '').match(CENTRAL_FLOOR_REFUSAL);
+    if (!m) continue;
+    const n = Number(m[1]);
+    if (Number.isInteger(n) && n >= 1) out.add(n - 1); // → 0-based, as sent
+  }
+  return out;
+}
+
 function todayString(): string {
   return new Date().toISOString().split('T')[0];
 }
@@ -398,7 +444,15 @@ export default function StaffMealsPage() {
     setIssuing(true);
     setIssueResult(null);
     try {
-      const usable = newRows.filter(r => r.item_name.trim() && parseFloat(r.quantity) > 0);
+      // The SOURCE INDEX travels with each submitted row. The server answers in
+      // terms of its own `items` positions, and those are `usable` positions,
+      // not `newRows` positions — the two differ the moment a half-typed row
+      // sits in the grid. Carrying srcIdx is what lets a refusal be put back
+      // against the row the operator is looking at rather than its neighbour.
+      const submitted = newRows
+        .map((r, srcIdx) => ({ r, srcIdx }))
+        .filter(x => x.r.item_name.trim() && parseFloat(x.r.quantity) > 0);
+      const usable = submitted.map(x => x.r);
 
       // CLOSED-LIST GUARD. The API multiplies issued_quantity × purchase_price
       // verbatim and (department branch) converts the quantity with lineFactor(),
@@ -454,7 +508,25 @@ export default function StaffMealsPage() {
       const json = await res.json();
       setIssueResult(json);
       if (json.success > 0) {
-        setNewRows([blankRow()]);
+        // A FULL SUCCESS CLEARS THE WHOLE GRID, EXACTLY AS PRODUCTION DOES
+        // (round 10) — every row, including one picked but never given a
+        // quantity. Round 9 kept such unsubmitted rows on every success; that is
+        // a change the central floor does not need, so it is gone.
+        //
+        // A PARTIAL SUCCESS KEEPS THE ROWS THE CENTRAL FLOOR REFUSED AND NOTHING
+        // ELSE — the one thing the floor does need. See refusedRowIndices: the
+        // rows that committed are cleared (keeping one would re-issue it), and
+        // the rows the floor named are left standing with their figures intact,
+        // so "hold the short one" is about a row still on screen. Every other
+        // row goes, as it always did — including a row refused for a reason
+        // production already refused it for. A refusal that is not the floor's
+        // sentence maps to no row, so it clears the grid exactly as production does.
+        const refused = refusedRowIndices(json.errors);
+        const refusedSrc = new Set(
+          submitted.filter((_, i) => refused.has(i)).map(x => x.srcIdx),
+        );
+        const keep = newRows.filter((_, i) => refusedSrc.has(i));
+        setNewRows(keep.length > 0 ? keep : [blankRow()]);
         await viewMeal(selectedMeal);
         await fetchMeals();
         await fetchMaterials();

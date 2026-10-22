@@ -6,8 +6,9 @@ import {
 } from '@/lib/dept-ledger';
 import {
   loadDepartments, canSendFrom, canSeeDept, countDisputesToAct,
-  presentTransfer, transferErrorResponse, resolveEntryUnit, bodyNumber,
+  transferErrorResponse, resolveEntryUnit, bodyNumber,
 } from './access';
+import { presentChecked, type SendableCache } from './send-back-check';
 
 /**
  * DEPARTMENT → DEPARTMENT TRANSFERS — the HTTP layer. ONE STEP (owner's ruling).
@@ -155,10 +156,14 @@ export async function GET(request: Request) {
        LIMIT ${limit}
     `).all(...params) as Array<{ id: string }>;
 
+    // Each document's one-tap send-back is checked against the ledger before
+    // it is offered (./send-back-check.ts); one sendable figure per
+    // (department, material) for the whole list.
+    const cache: SendableCache = new Map();
     const transfers = [];
     for (const { id } of ids) {
       const doc = getDeptTransfer(db, id);
-      if (doc) transfers.push(presentTransfer(me, doc, depts, db));
+      if (doc) transfers.push(presentChecked(me, doc, depts, db, cache));
     }
 
     return Response.json({ transfers, departments: deptOptions(me, depts), open_disputes_to_act: openToAct });
@@ -288,7 +293,7 @@ export async function POST(request: Request) {
       outletId,
     });
     return Response.json(
-      { transfer: presentTransfer(me, res.transfer, depts, db), duplicate: res.duplicate },
+      { transfer: presentChecked(me, res.transfer, depts, db), duplicate: res.duplicate },
       { status: res.duplicate ? 200 : 201 },
     );
   } catch (e: any) {

@@ -5,7 +5,7 @@ import {
 } from '@/lib/dept-ledger';
 import {
   loadDepartments, canFlagDispute, canSendFrom, canSeeTransfer, presentTransfer, transferErrorResponse, resolveEntryUnit, bodyNumber,
-  reverseAuthority,
+  isOnReceivingDept,
 } from '../../access';
 import { transferAlertRecipients, notifyTransferDispute } from '../../notify';
 
@@ -27,12 +27,14 @@ import { transferAlertRecipients, notifyTransferDispute } from '../../notify';
  *     purchase unit unless `unit` says 'recipe' or names the recipe unit. The
  *     dispute is the difference.
  *
- * Who: anyone POSTED to the RECEIVING department (any tier — the owner's
- * ruling lets staff flag), or whoever may send from it (its head, an HOD posted
- * there, managers, admin) — but not anyone except a manager / admin who may
- * also send from the SENDING department, wherever they are posted: the first
- * flag owns the line's one dispute slot, so a sender's token claim would
- * block the receiver's real one. ../access.ts canFlagDispute.
+ * Who (ruling #61 — ../access.ts canFlagDispute): anyone ON the RECEIVING
+ * department, ALWAYS — posted to it (any tier; the owner's ruling lets staff
+ * flag) or its named head — even if they may also send from the SENDING
+ * department (the Kitchen HOD flags a short delivery from Akan Pizza);
+ * managers and admin; and an HOD who acts for it as head chef of its parent
+ * department, unless he may also send from the sending department (then he is
+ * on the side that sent it). Only CLOSING stays barred for anyone who may send
+ * from the sender's side (../resolve, canDismissDispute).
  *
  * → 201 { transfer, disputes, alerted: [{ email, name, why }], notification_recorded }
  *   One open dispute per line at a time (409 while one is open).
@@ -58,18 +60,20 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     const depts = loadDepartments(db);
     if (!canSeeTransfer(me, doc, depts)) return Response.json({ error: 'Not allowed for this transfer' }, { status: 403 });
     if (!canFlagDispute(me, doc, depts)) {
-      // A sender head is refused WHEREVER posted (access.ts canFlagDispute): say
-      // what they can do instead — a send-back when they also act for the
-      // receiver, else the receiver's own people flag it.
-      const headsSender = canSendFrom(me, depts.get(doc.from_department_id));
+      // Refused (access.ts canFlagDispute): either no tie to the receiving
+      // department at all, or an HOD who acts for it only as head chef of its
+      // parent AND may send from the sending department. Anyone posted to the
+      // receiver, or its named head, is never refused here (ruling #61).
+      const to = depts.get(doc.to_department_id);
+      const viaParent = canSendFrom(me, to) && !isOnReceivingDept(me, doc, depts);
+      const parentName = to?.parent_id ? depts.get(to.parent_id)?.name || '' : '';
       return Response.json({
-        error: `Only someone in ${doc.to_department_name} (or its head, a manager or an admin) can dispute what it received` +
-          (headsSender
-            ? ` — not someone who also heads ${doc.from_department_name}, which sent it.` +
-              (reverseAuthority(me, doc, depts) === 'receiver'
-                ? ` To correct it, send back to ${doc.from_department_name} what did not arrive (Send back): a reverse transfer fixes both books.`
-                : ` Ask someone else in ${doc.to_department_name}, or a manager, to flag it.`)
-            : '.'),
+        error: viaParent && canSendFrom(me, depts.get(doc.from_department_id))
+          ? `${doc.to_department_name}'s own people flag what it receives: someone posted to ${doc.to_department_name}, ` +
+            `its named head, a manager or an admin. You act for ${doc.to_department_name} as an HOD posted to ` +
+            `${parentName || 'the department it belongs to'}, and you can also send from ${doc.from_department_name}, ` +
+            `which sent it — ask one of them to flag it.`
+          : `Only someone in ${doc.to_department_name} (or its head, a manager or an admin) can dispute what it received.`,
       }, { status: 403 });
     }
 
